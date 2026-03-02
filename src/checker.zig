@@ -465,14 +465,19 @@ pub const Checker = struct {
         }
     }
 
-    fn checkIfStmt(self: *Checker, if_s: ast.IfStmt, scope: *Scope) void {
-        const cond = self.checkExpr(if_s.condition, scope);
-        if (!cond.isErr() and cond != .bool) {
-            self.diagnostics.addError(if_s.condition.location, self.fmt(
+    /// emit an error if the type isn't Bool. used for if/while/elif conditions.
+    fn expectBool(self: *Checker, location: Location, actual: TypeId) void {
+        if (!actual.isErr() and actual != .bool) {
+            self.diagnostics.addError(location, self.fmt(
                 "expected Bool in condition, got {s}",
-                .{self.type_table.typeName(cond)},
+                .{self.type_table.typeName(actual)},
             )) catch {};
         }
+    }
+
+    fn checkIfStmt(self: *Checker, if_s: ast.IfStmt, scope: *Scope) void {
+        const cond = self.checkExpr(if_s.condition, scope);
+        self.expectBool(if_s.condition.location, cond);
 
         var then_scope = Scope.init(self.allocator, scope);
         defer then_scope.deinit();
@@ -480,12 +485,7 @@ pub const Checker = struct {
 
         for (if_s.elif_branches) |branch| {
             const elif_cond = self.checkExpr(branch.condition, scope);
-            if (!elif_cond.isErr() and elif_cond != .bool) {
-                self.diagnostics.addError(branch.condition.location, self.fmt(
-                    "expected Bool in condition, got {s}",
-                    .{self.type_table.typeName(elif_cond)},
-                )) catch {};
-            }
+            self.expectBool(branch.condition.location, elif_cond);
             var elif_scope = Scope.init(self.allocator, scope);
             defer elif_scope.deinit();
             self.checkBlock(branch.block, &elif_scope);
@@ -500,12 +500,7 @@ pub const Checker = struct {
 
     fn checkWhileStmt(self: *Checker, w: ast.WhileStmt, scope: *Scope) void {
         const cond = self.checkExpr(w.condition, scope);
-        if (!cond.isErr() and cond != .bool) {
-            self.diagnostics.addError(w.condition.location, self.fmt(
-                "expected Bool in condition, got {s}",
-                .{self.type_table.typeName(cond)},
-            )) catch {};
-        }
+        self.expectBool(w.condition.location, cond);
 
         var body_scope = Scope.init(self.allocator, scope);
         defer body_scope.deinit();
@@ -855,24 +850,14 @@ pub const Checker = struct {
 
     fn checkIfExpr(self: *Checker, if_e: ast.IfExpr, scope: *const Scope) TypeId {
         const cond = self.checkExpr(if_e.condition, scope);
-        if (!cond.isErr() and cond != .bool) {
-            self.diagnostics.addError(if_e.condition.location, self.fmt(
-                "expected Bool in condition, got {s}",
-                .{self.type_table.typeName(cond)},
-            )) catch {};
-        }
+        self.expectBool(if_e.condition.location, cond);
 
         const then_type = self.checkExpr(if_e.then_expr, scope);
 
         // check elif branches
         for (if_e.elif_branches) |branch| {
             const elif_cond = self.checkExpr(branch.condition, scope);
-            if (!elif_cond.isErr() and elif_cond != .bool) {
-                self.diagnostics.addError(branch.condition.location, self.fmt(
-                    "expected Bool in condition, got {s}",
-                    .{self.type_table.typeName(elif_cond)},
-                )) catch {};
-            }
+            self.expectBool(branch.condition.location, elif_cond);
 
             const elif_type = self.checkExpr(branch.expr, scope);
             if (!then_type.isErr() and !elif_type.isErr() and then_type != elif_type) {

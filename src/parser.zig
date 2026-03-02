@@ -300,6 +300,24 @@ pub const Parser = struct {
         return self.parseOrExpr();
     }
 
+    // expression precedence tower (lowest to highest):
+    //
+    //   parseOrExpr       →  or
+    //   parseAndExpr      →  and
+    //   parseNotExpr      →  not  (prefix unary)
+    //   parseComparison   →  == != < > <= >=
+    //   parsePipeExpr     →  |
+    //   parseAddExpr      →  + -
+    //   parseMulExpr      →  * / %
+    //   parseUnaryExpr    →  spawn, await, - (prefix)
+    //   parsePostfixExpr  →  .field, .method(), [index], ?, !
+    //   parsePrimary      →  literals, identifiers, grouped, etc.
+    //
+    // each binary level follows the same left-associative pattern:
+    //   parse the next-higher level, then loop consuming the operator.
+    // this repetition is intentional — a generic helper with function
+    // pointers and comptime operator maps would be cleverer, not clearer.
+
     /// or_expr = and_expr { "or" and_expr }
     fn parseOrExpr(self: *Parser) ParseError!*const ast.Expr {
         var left = try self.parseAndExpr();

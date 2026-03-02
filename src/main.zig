@@ -3,6 +3,7 @@ const Lexer = @import("lexer.zig").Lexer;
 const Parser = @import("parser.zig").Parser;
 const errors = @import("errors.zig");
 const printer = @import("printer.zig");
+const io = @import("io.zig");
 
 // compiler modules — imported here so zig build sees them
 comptime {
@@ -11,29 +12,10 @@ comptime {
     _ = @import("errors.zig");
     _ = @import("intern.zig");
     _ = @import("printer.zig");
+    _ = @import("io.zig");
 }
 
 const version = "0.1.0";
-
-// -- I/O helpers --
-// zig's buffered writer API requires a buffer + writer + flush for every
-// print. these helpers cut that ceremony down to a single call.
-
-fn write(comptime fmt: []const u8, args: anytype) void {
-    var buf: [8192]u8 = undefined;
-    var w = std.fs.File.stdout().writer(&buf);
-    const out = &w.interface;
-    out.print(fmt, args) catch {};
-    out.flush() catch {};
-}
-
-fn writeErr(comptime fmt: []const u8, args: anytype) void {
-    var buf: [4096]u8 = undefined;
-    var w = std.fs.File.stderr().writer(&buf);
-    const out = &w.interface;
-    out.print(fmt, args) catch {};
-    out.flush() catch {};
-}
 
 fn renderDiagnostics(diags: *const errors.DiagnosticList) void {
     var buf: [8192]u8 = undefined;
@@ -41,6 +23,13 @@ fn renderDiagnostics(diags: *const errors.DiagnosticList) void {
     const out = &w.interface;
     diags.render(out) catch {};
     out.flush() catch {};
+}
+
+fn readSourceFile(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    return std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024 * 10) catch |err| {
+        io.writeErr("error: could not read '{s}': {}\n", .{ path, err });
+        return null;
+    };
 }
 
 pub fn main() !void {
@@ -68,27 +57,24 @@ pub fn main() !void {
         printUsage();
     } else if (std.mem.eql(u8, cmd, "lex")) {
         const file_path = args.next() orelse {
-            writeErr("error: forge lex requires a file path\n", .{});
+            io.writeErr("error: forge lex requires a file path\n", .{});
             return;
         };
         try runLex(allocator, file_path);
     } else if (std.mem.eql(u8, cmd, "parse")) {
         const file_path = args.next() orelse {
-            writeErr("error: forge parse requires a file path\n", .{});
+            io.writeErr("error: forge parse requires a file path\n", .{});
             return;
         };
         try runParse(allocator, file_path);
     } else {
-        writeErr("error: unknown command '{s}'\n", .{cmd});
+        io.writeErr("error: unknown command '{s}'\n", .{cmd});
         printUsage();
     }
 }
 
 fn runLex(allocator: std.mem.Allocator, path: []const u8) !void {
-    const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024 * 10) catch |err| {
-        writeErr("error: could not read '{s}': {}\n", .{ path, err });
-        return;
-    };
+    const source = readSourceFile(allocator, path) orelse return;
     defer allocator.free(source);
 
     var lexer = try Lexer.init(source, allocator);
@@ -98,18 +84,18 @@ fn runLex(allocator: std.mem.Allocator, path: []const u8) !void {
         const tok = try lexer.nextToken();
 
         switch (tok.kind) {
-            .newline => write("{s:<16}  \\n\n", .{@tagName(tok.kind)}),
-            .indent => write("{s:<16}  >>>\n", .{@tagName(tok.kind)}),
-            .dedent => write("{s:<16}  <<<\n", .{@tagName(tok.kind)}),
+            .newline => io.write("{s:<16}  \\n\n", .{@tagName(tok.kind)}),
+            .indent => io.write("{s:<16}  >>>\n", .{@tagName(tok.kind)}),
+            .dedent => io.write("{s:<16}  <<<\n", .{@tagName(tok.kind)}),
             .eof => {
-                write("{s:<16}  <eof>\n", .{@tagName(tok.kind)});
+                io.write("{s:<16}  <eof>\n", .{@tagName(tok.kind)});
                 break;
             },
             else => {
                 if (tok.lexeme.len > 0) {
-                    write("{s:<16}  {s}\n", .{ @tagName(tok.kind), tok.lexeme });
+                    io.write("{s:<16}  {s}\n", .{ @tagName(tok.kind), tok.lexeme });
                 } else {
-                    write("{s:<16}\n", .{@tagName(tok.kind)});
+                    io.write("{s:<16}\n", .{@tagName(tok.kind)});
                 }
             },
         }
@@ -121,10 +107,7 @@ fn runLex(allocator: std.mem.Allocator, path: []const u8) !void {
 }
 
 fn runParse(allocator: std.mem.Allocator, path: []const u8) !void {
-    const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024 * 10) catch |err| {
-        writeErr("error: could not read '{s}': {}\n", .{ path, err });
-        return;
-    };
+    const source = readSourceFile(allocator, path) orelse return;
     defer allocator.free(source);
 
     // lex
@@ -146,7 +129,7 @@ fn runParse(allocator: std.mem.Allocator, path: []const u8) !void {
     defer parser.deinit();
 
     const module = parser.parseModule() catch {
-        writeErr("error: parse failed (out of memory)\n", .{});
+        io.writeErr("error: parse failed (out of memory)\n", .{});
         return;
     };
 
@@ -160,11 +143,11 @@ fn runParse(allocator: std.mem.Allocator, path: []const u8) !void {
 }
 
 fn printVersion() void {
-    write("forge {s}\n", .{version});
+    io.write("forge {s}\n", .{version});
 }
 
 fn printUsage() void {
-    write(
+    io.write(
         \\forge {s}
         \\
         \\usage: forge <command> [options]

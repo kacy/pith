@@ -216,15 +216,12 @@ pub const Lexer = struct {
 
         // emit queued tokens from string interpolation
         if (self.pending_tokens.items.len > 0) {
-            // pop from front — shift everything. fine for small queues.
-            const tok = self.pending_tokens.orderedRemove(0);
-            return tok;
+            return self.pending_tokens.orderedRemove(0);
         }
 
         // end of file — emit remaining dedents then EOF
         if (self.pos >= self.source.len) {
             if (!self.done) {
-                // emit dedents for all remaining indent levels
                 if (self.indent_stack.items.len > 1) {
                     const remaining = @as(u32, @intCast(self.indent_stack.items.len)) - 1;
                     self.indent_stack.shrinkRetainingCapacity(1);
@@ -234,7 +231,6 @@ pub const Lexer = struct {
                     return self.makeToken(.dedent, self.pos, 0);
                 }
                 self.done = true;
-                return self.makeToken(.eof, self.pos, 0);
             }
             return self.makeToken(.eof, self.pos, 0);
         }
@@ -302,7 +298,6 @@ pub const Lexer = struct {
 
         const ch = self.current();
 
-        // newline
         if (ch == '\n') {
             const tok = self.makeToken(.newline, self.pos, 1);
             self.advance();
@@ -310,27 +305,11 @@ pub const Lexer = struct {
             return tok;
         }
 
-        // comment
-        if (ch == '#') {
-            return self.scanComment();
-        }
+        if (ch == '#') return self.scanComment();
+        if (ch == '"') return self.scanString();
+        if (std.ascii.isDigit(ch)) return self.scanNumber();
+        if (std.ascii.isAlphabetic(ch) or ch == '_') return self.scanIdentifier();
 
-        // string
-        if (ch == '"') {
-            return self.scanString();
-        }
-
-        // number
-        if (std.ascii.isDigit(ch)) {
-            return self.scanNumber();
-        }
-
-        // identifier or keyword
-        if (std.ascii.isAlphabetic(ch) or ch == '_') {
-            return self.scanIdentifier();
-        }
-
-        // operators and punctuation
         return self.scanOperator();
     }
 

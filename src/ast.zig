@@ -481,7 +481,7 @@ test "ast types are well-formed" {
 
 test "binary op variants exist" {
     const ops = [_]BinaryOp{ .add, .sub, .mul, .div, .mod, .eq, .neq, .lt, .gt, .lte, .gte, .@"and", .@"or", .pipe };
-    try std.testing.expectEqual(@as(usize, 14), ops.len);
+    try std.testing.expectEqual(@typeInfo(BinaryOp).@"enum".fields.len, ops.len);
 }
 
 test "decl kind variants exist" {

@@ -22,6 +22,7 @@ pub const TokenKind = enum {
     string_start, // opening " up to first {
     string_mid, // text between } and next {
     string_end, // text after last } up to closing "
+    interpolation_expr, // raw expression text between { and }
 
     // identifier
     identifier,
@@ -452,11 +453,11 @@ pub const Lexer = struct {
                 self.advance();
             }
 
-            // emit the expression text as an identifier token for now.
-            // the parser will re-lex the expression content if needed.
+            // emit the raw expression text. the parser will re-lex this
+            // content to parse the actual expression.
             if (self.pos > expr_start) {
                 try self.pending_tokens.append(self.allocator, self.makeToken(
-                    .identifier,
+                    .interpolation_expr,
                     expr_start,
                     self.pos - expr_start,
                 ));
@@ -903,7 +904,7 @@ test "lex unterminated string" {
 test "lex string with interpolation" {
     try expectTokens("\"hello {name}!\"", &.{
         .string_start,
-        .identifier,
+        .interpolation_expr,
         .string_end,
         .eof,
     });
@@ -912,9 +913,9 @@ test "lex string with interpolation" {
 test "lex string with multiple interpolations" {
     try expectTokens("\"{a} and {b}\"", &.{
         .string_start,
-        .identifier,
+        .interpolation_expr,
         .string_mid,
-        .identifier,
+        .interpolation_expr,
         .string_end,
         .eof,
     });

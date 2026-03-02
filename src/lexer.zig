@@ -1244,12 +1244,11 @@ test "lex comparison operators in context" {
 test "lex multiple statements" {
     const source = "a := 1\nb := 2\nc := a + b";
     try expectTokens(source, &.{
-        .identifier, .colon_eq, .int_lit,
-        .newline,
-        .identifier, .colon_eq, .int_lit,
-        .newline,
-        .identifier, .colon_eq, .identifier, .plus, .identifier,
-        .eof,
+        .identifier, .colon_eq,   .int_lit,
+        .newline,    .identifier, .colon_eq,
+        .int_lit,    .newline,    .identifier,
+        .colon_eq,   .identifier, .plus,
+        .identifier, .eof,
     });
 }
 
@@ -1324,15 +1323,11 @@ test "lex pipe operator" {
 test "lex nested indentation" {
     const source = "a:\n    b:\n        c\n    d";
     try expectTokens(source, &.{
-        .identifier, .colon, .newline,
-        .indent,
-        .identifier, .colon, .newline,
-        .indent,
-        .identifier, .newline,
-        .dedent,
-        .identifier,
-        .dedent,
-        .eof,
+        .identifier, .colon,      .newline,
+        .indent,     .identifier, .colon,
+        .newline,    .indent,     .identifier,
+        .newline,    .dedent,     .identifier,
+        .dedent,     .eof,
     });
 }
 

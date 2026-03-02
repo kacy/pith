@@ -100,6 +100,10 @@ pub const Checker = struct {
     /// (e.g. "Pair", "Option"). instantiated on demand when a concrete
     /// use like Pair[Int, String] is encountered in type resolution.
     generic_decls: std.StringHashMap(GenericDecl),
+    /// interface declarations stored during pass 1, keyed by name.
+    /// used to distinguish interfaces from structs in the type table
+    /// and to validate impl blocks and generic bounds.
+    interface_decls: std.StringHashMap(ast.InterfaceDecl),
 
     /// create a new checker. registers builtin types and functions.
     pub fn init(allocator: std.mem.Allocator, source: []const u8) !Checker {
@@ -110,6 +114,7 @@ pub const Checker = struct {
             .arena = std.heap.ArenaAllocator.init(allocator),
             .module_scope = Scope.init(allocator, null),
             .generic_decls = std.StringHashMap(GenericDecl).init(allocator),
+            .interface_decls = std.StringHashMap(ast.InterfaceDecl).init(allocator),
         };
 
         // register builtins into the module scope
@@ -121,6 +126,7 @@ pub const Checker = struct {
     pub fn deinit(self: *Checker) void {
         self.module_scope.deinit();
         self.generic_decls.deinit();
+        self.interface_decls.deinit();
         self.arena.deinit();
         self.diagnostics.deinit();
         self.type_table.deinit();
@@ -184,7 +190,7 @@ pub const Checker = struct {
             .fn_decl => |fn_d| self.registerFnDecl(fn_d, decl.location),
             .struct_decl => |s| self.registerStructDecl(s, decl.location),
             .enum_decl => |e| self.registerEnumDecl(e, decl.location),
-            .interface_decl => {},
+            .interface_decl => |iface| self.registerInterfaceDecl(iface, decl.location),
             .impl_decl => {},
             .type_alias => |ta| self.registerTypeAlias(ta, decl.location),
             .binding => {}, // top-level bindings are checked in pass 2
@@ -309,6 +315,24 @@ pub const Checker = struct {
 
         // transparent alias — the name maps to the same TypeId as the target
         self.type_table.register(ta.name, target) catch return;
+    }
+
+    fn registerInterfaceDecl(self: *Checker, iface: ast.InterfaceDecl, location: Location) void {
+        if (iface.generic_params.len > 0) {
+            self.diagnostics.addError(location, "generic interfaces are not yet supported") catch {};
+            return;
+        }
+
+        // register the interface name as a zero-field struct in the type table
+        // so that resolveNamedType("Display") works when it appears in a bound.
+        // interface_decls distinguishes it from a real struct.
+        const type_id = self.type_table.addType(.{ .@"struct" = .{
+            .name = iface.name,
+            .fields = &.{},
+        } }) catch return;
+
+        self.type_table.register(iface.name, type_id) catch return;
+        self.interface_decls.put(iface.name, iface) catch return;
     }
 
     // ---------------------------------------------------------------
@@ -4462,4 +4486,52 @@ test "generic function call: two type params" {
     const result = checker.checkExpr(&call, &checker.module_scope);
     try std.testing.expectEqual(TypeId.string, result);
     try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "registerInterfaceDecl: registers interface name" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const decl = ast.Decl{
+        .kind = .{ .interface_decl = .{
+            .name = "Display",
+            .generic_params = &.{},
+            .methods = &.{},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    // should be in both the type table and interface_decls
+    try std.testing.expect(checker.type_table.lookup("Display") != null);
+    try std.testing.expect(checker.interface_decls.contains("Display"));
+}
+
+test "registerInterfaceDecl: generic interface errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const decl = ast.Decl{
+        .kind = .{ .interface_decl = .{
+            .name = "Iter",
+            .generic_params = &.{
+                .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+            },
+            .methods = &.{},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    try std.testing.expect(checker.diagnostics.hasErrors());
+    // should NOT be registered
+    try std.testing.expect(checker.type_table.lookup("Iter") == null);
+    try std.testing.expect(!checker.interface_decls.contains("Iter"));
 }

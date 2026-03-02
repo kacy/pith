@@ -121,10 +121,10 @@ fn renderDiagnostic(d: Diagnostic, source: []const u8, writer: anytype) !void {
 
         // underline: spaces for margin + caret for the error location
         const margin_width = digitCount(d.location.line + 1) + 4; // " N | "
-        try writeSpaces(writer, margin_width + d.location.column);
+        for (0..margin_width + d.location.column) |_| try writer.writeByte(' ');
 
         const underline_len = @max(d.location.length, 1);
-        try writeChars(writer, '^', underline_len);
+        for (0..underline_len) |_| try writer.writeByte('^');
         try writer.print("\n", .{});
     }
 
@@ -160,20 +160,6 @@ fn digitCount(n: u32) u32 {
         count += 1;
     }
     return count;
-}
-
-fn writeSpaces(writer: anytype, count: u32) !void {
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        try writer.print(" ", .{});
-    }
-}
-
-fn writeChars(writer: anytype, ch: u8, count: u32) !void {
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        try writer.writeByte(ch);
-    }
 }
 
 // -- tests --

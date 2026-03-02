@@ -1020,7 +1020,7 @@ pub const Parser = struct {
 
         // create a sub-parser for the interpolation expression
         var sub_parser = Parser.init(sub_tokens, interp_tok.lexeme, self.allocator);
-        // don't deinit sub_parser.diagnostics — we share the allocator
+        // sub_parser is arena-allocated, no deinit needed
 
         const expr = sub_parser.parseExpression() catch {
             return self.create(ast.Expr, .{
@@ -1035,8 +1035,7 @@ pub const Parser = struct {
     // patterns (forward declaration — used by match arms)
     // ---------------------------------------------------------------
 
-    /// parse a pattern. full implementation in the next commit,
-    /// but match expressions need a basic version.
+    /// parse a pattern for match arms.
     fn parsePattern(self: *Parser) ParseError!ast.Pattern {
         const tok = self.peek();
 

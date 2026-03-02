@@ -1144,8 +1144,7 @@ pub const Parser = struct {
         while (!self.check(.dedent) and !self.check(.eof)) {
             const stmt = try self.parseStatement();
             try stmts.append(self.allocator, stmt);
-            // consume trailing newlines between statements
-            while (self.check(.newline)) _ = self.advance();
+            self.skipNewlines();
         }
         const end_tok = try self.expect(.dedent);
 
@@ -1562,10 +1561,7 @@ pub const Parser = struct {
         const name_tok = try self.expect(.identifier);
 
         // optional generic params
-        const generics = if (self.check(.lbracket))
-            try self.parseGenericParams()
-        else
-            &.{};
+        const generics = try self.parseOptionalGenericParams();
 
         _ = try self.expect(.lparen);
         const params = try self.parseParamList();
@@ -1628,6 +1624,14 @@ pub const Parser = struct {
         };
     }
 
+    /// parse optional generic params: returns empty slice if no "[" is present.
+    fn parseOptionalGenericParams(self: *Parser) ParseError![]const ast.GenericParam {
+        return if (self.check(.lbracket))
+            try self.parseGenericParams()
+        else
+            &.{};
+    }
+
     /// generic_params = "[" generic_param { "," generic_param } "]"
     fn parseGenericParams(self: *Parser) ParseError![]const ast.GenericParam {
         _ = self.advance(); // skip [
@@ -1666,10 +1670,7 @@ pub const Parser = struct {
         _ = self.advance(); // skip struct
         const name_tok = try self.expect(.identifier);
 
-        const generics = if (self.check(.lbracket))
-            try self.parseGenericParams()
-        else
-            &.{};
+        const generics = try self.parseOptionalGenericParams();
 
         _ = try self.expect(.colon);
         _ = try self.expect(.newline);
@@ -1678,7 +1679,7 @@ pub const Parser = struct {
         var fields: std.ArrayList(ast.StructField) = .empty;
         while (!self.check(.dedent) and !self.check(.eof)) {
             try fields.append(self.allocator, try self.parseStructField());
-            while (self.check(.newline)) _ = self.advance();
+            self.skipNewlines();
         }
         _ = try self.expect(.dedent);
 
@@ -1720,10 +1721,7 @@ pub const Parser = struct {
         _ = self.advance(); // skip enum
         const name_tok = try self.expect(.identifier);
 
-        const generics = if (self.check(.lbracket))
-            try self.parseGenericParams()
-        else
-            &.{};
+        const generics = try self.parseOptionalGenericParams();
 
         _ = try self.expect(.colon);
         _ = try self.expect(.newline);
@@ -1732,7 +1730,7 @@ pub const Parser = struct {
         var variants: std.ArrayList(ast.EnumVariant) = .empty;
         while (!self.check(.dedent) and !self.check(.eof)) {
             try variants.append(self.allocator, try self.parseEnumVariant());
-            while (self.check(.newline)) _ = self.advance();
+            self.skipNewlines();
         }
         _ = try self.expect(.dedent);
 
@@ -1768,10 +1766,7 @@ pub const Parser = struct {
         _ = self.advance(); // skip interface
         const name_tok = try self.expect(.identifier);
 
-        const generics = if (self.check(.lbracket))
-            try self.parseGenericParams()
-        else
-            &.{};
+        const generics = try self.parseOptionalGenericParams();
 
         _ = try self.expect(.colon);
         _ = try self.expect(.newline);
@@ -1780,7 +1775,7 @@ pub const Parser = struct {
         var methods: std.ArrayList(ast.FnSig) = .empty;
         while (!self.check(.dedent) and !self.check(.eof)) {
             try methods.append(self.allocator, try self.parseFnSig());
-            while (self.check(.newline)) _ = self.advance();
+            self.skipNewlines();
         }
         _ = try self.expect(.dedent);
 
@@ -1797,10 +1792,7 @@ pub const Parser = struct {
         _ = try self.expect(.kw_fn);
         const name_tok = try self.expect(.identifier);
 
-        const generics = if (self.check(.lbracket))
-            try self.parseGenericParams()
-        else
-            &.{};
+        const generics = try self.parseOptionalGenericParams();
 
         _ = try self.expect(.lparen);
         const params = try self.parseParamList();
@@ -1844,7 +1836,7 @@ pub const Parser = struct {
                 .decl = fn_decl,
                 .location = method_loc,
             });
-            while (self.check(.newline)) _ = self.advance();
+            self.skipNewlines();
         }
         _ = try self.expect(.dedent);
 
@@ -1860,10 +1852,7 @@ pub const Parser = struct {
         _ = self.advance(); // skip type
         const name_tok = try self.expect(.identifier);
 
-        const generics = if (self.check(.lbracket))
-            try self.parseGenericParams()
-        else
-            &.{};
+        const generics = try self.parseOptionalGenericParams();
 
         _ = try self.expect(.eq);
         const type_expr = try self.parseTypeExpr();

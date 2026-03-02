@@ -129,8 +129,8 @@ pub const Checker = struct {
     fn registerDecl(self: *Checker, decl: *const ast.Decl) void {
         switch (decl.kind) {
             .fn_decl => |fn_d| self.registerFnDecl(fn_d, decl.location),
-            .struct_decl => {}, // handled in a later commit
-            .enum_decl => {},
+            .struct_decl => |s| self.registerStructDecl(s, decl.location),
+            .enum_decl => |e| self.registerEnumDecl(e, decl.location),
             .interface_decl => {},
             .impl_decl => {},
             .type_alias => {},
@@ -173,6 +173,70 @@ pub const Checker = struct {
         } }) catch return;
 
         self.module_scope.define(fn_d.name, .{ .type_id = fn_type, .is_mut = false }) catch {};
+    }
+
+    fn registerStructDecl(self: *Checker, s: ast.StructDecl, location: Location) void {
+        if (s.generic_params.len > 0) {
+            self.diagnostics.addError(location, "generic structs are not yet supported") catch {};
+            return;
+        }
+
+        // resolve field types
+        var fields = std.ArrayList(types.Field).initCapacity(self.allocator, s.fields.len) catch return;
+        defer fields.deinit(self.allocator);
+
+        for (s.fields) |field| {
+            const field_type = self.resolveTypeExpr(field.type_expr);
+            fields.append(self.allocator, .{
+                .name = field.name,
+                .type_id = field_type,
+                .is_pub = field.is_pub,
+                .is_mut = field.is_mut,
+            }) catch return;
+        }
+
+        const owned_fields = self.arena.allocator().dupe(types.Field, fields.items) catch return;
+        const struct_type = self.type_table.addType(.{ .@"struct" = .{
+            .name = s.name,
+            .fields = owned_fields,
+        } }) catch return;
+
+        self.type_table.register(s.name, struct_type) catch {};
+    }
+
+    fn registerEnumDecl(self: *Checker, e: ast.EnumDecl, location: Location) void {
+        if (e.generic_params.len > 0) {
+            self.diagnostics.addError(location, "generic enums are not yet supported") catch {};
+            return;
+        }
+
+        // resolve variant field types
+        var variants = std.ArrayList(types.Variant).initCapacity(self.allocator, e.variants.len) catch return;
+        defer variants.deinit(self.allocator);
+
+        for (e.variants) |variant| {
+            var field_types = std.ArrayList(TypeId).initCapacity(self.allocator, variant.fields.len) catch return;
+            defer field_types.deinit(self.allocator);
+
+            for (variant.fields) |field_te| {
+                const id = self.resolveTypeExpr(field_te);
+                field_types.append(self.allocator, id) catch return;
+            }
+
+            const owned = self.arena.allocator().dupe(TypeId, field_types.items) catch return;
+            variants.append(self.allocator, .{
+                .name = variant.name,
+                .fields = owned,
+            }) catch return;
+        }
+
+        const owned_variants = self.arena.allocator().dupe(types.Variant, variants.items) catch return;
+        const enum_type = self.type_table.addType(.{ .@"enum" = .{
+            .name = e.name,
+            .variants = owned_variants,
+        } }) catch return;
+
+        self.type_table.register(e.name, enum_type) catch {};
     }
 
     // ---------------------------------------------------------------
@@ -515,7 +579,7 @@ pub const Checker = struct {
 
             .call => |call| self.checkCall(call, expr.location, scope),
             .method_call => .err,
-            .field_access => .err,
+            .field_access => |fa| self.checkFieldAccess(fa, expr.location, scope),
             .index => .err,
             .unwrap => .err,
             .try_expr => .err,
@@ -753,6 +817,36 @@ pub const Checker = struct {
         }
 
         return func.return_type;
+    }
+
+    fn checkFieldAccess(self: *Checker, fa: ast.FieldAccess, location: Location, scope: *const Scope) TypeId {
+        const object_type = self.checkExpr(fa.object, scope);
+        if (object_type.isErr()) return .err;
+
+        const ty = self.type_table.get(object_type) orelse return .err;
+        const struct_data = switch (ty) {
+            .@"struct" => |s| s,
+            else => {
+                self.diagnostics.addError(location, self.fmt(
+                    "{s} has no field '{s}'",
+                    .{ self.type_table.typeName(object_type), fa.field },
+                )) catch {};
+                return .err;
+            },
+        };
+
+        // look up the field
+        for (struct_data.fields) |field| {
+            if (std.mem.eql(u8, field.name, fa.field)) {
+                return field.type_id;
+            }
+        }
+
+        self.diagnostics.addError(location, self.fmt(
+            "struct {s} has no field '{s}'",
+            .{ struct_data.name, fa.field },
+        )) catch {};
+        return .err;
     }
 
     // ---------------------------------------------------------------
@@ -1380,4 +1474,170 @@ test "checkStmt: while statement checks condition" {
 
     checker.checkStmt(&stmt, &scope);
     try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+// -- struct, enum, and field access tests --
+
+test "registerStructDecl registers type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const string_te = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+
+    const struct_decl = ast.StructDecl{
+        .name = "Point",
+        .generic_params = &.{},
+        .fields = &.{
+            .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            .{ .name = "y", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            .{ .name = "label", .type_expr = &string_te, .default = null, .is_pub = false, .is_mut = false, .is_weak = false, .location = Location.zero },
+        },
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .struct_decl = struct_decl },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+
+    // Point should be registered in the type table
+    const point_id = checker.type_table.lookup("Point").?;
+    const ty = checker.type_table.get(point_id).?;
+    const s = ty.@"struct";
+    try std.testing.expectEqualStrings("Point", s.name);
+    try std.testing.expectEqual(@as(usize, 3), s.fields.len);
+    try std.testing.expectEqual(TypeId.int, s.fields[0].type_id);
+}
+
+test "registerEnumDecl registers type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+
+    const enum_decl = ast.EnumDecl{
+        .name = "Shape",
+        .generic_params = &.{},
+        .variants = &.{
+            .{ .name = "Circle", .fields = &.{&int_te}, .location = Location.zero },
+            .{ .name = "Square", .fields = &.{ &int_te, &int_te }, .location = Location.zero },
+            .{ .name = "Point", .fields = &.{}, .location = Location.zero },
+        },
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .enum_decl = enum_decl },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+
+    const shape_id = checker.type_table.lookup("Shape").?;
+    const ty = checker.type_table.get(shape_id).?;
+    const e = ty.@"enum";
+    try std.testing.expectEqualStrings("Shape", e.name);
+    try std.testing.expectEqual(@as(usize, 3), e.variants.len);
+}
+
+test "checkFieldAccess: valid field" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // register a struct type
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const struct_decl = ast.StructDecl{
+        .name = "Point",
+        .generic_params = &.{},
+        .fields = &.{
+            .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            .{ .name = "y", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+        },
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .struct_decl = struct_decl },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    // add a binding for p: Point
+    const point_id = checker.type_table.lookup("Point").?;
+    try checker.module_scope.define("p", .{ .type_id = point_id, .is_mut = false });
+
+    // check p.x
+    const p_expr = ast.Expr{ .kind = .{ .ident = "p" }, .location = Location.zero };
+    const field_access = ast.Expr{
+        .kind = .{ .field_access = .{ .object = &p_expr, .field = "x" } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&field_access, &checker.module_scope);
+    try std.testing.expectEqual(TypeId.int, result);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "checkFieldAccess: unknown field" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const struct_decl = ast.StructDecl{
+        .name = "Point",
+        .generic_params = &.{},
+        .fields = &.{
+            .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+        },
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .struct_decl = struct_decl },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    const point_id = checker.type_table.lookup("Point").?;
+    try checker.module_scope.define("p", .{ .type_id = point_id, .is_mut = false });
+
+    // check p.z (doesn't exist)
+    const p_expr = ast.Expr{ .kind = .{ .ident = "p" }, .location = Location.zero };
+    const field_access = ast.Expr{
+        .kind = .{ .field_access = .{ .object = &p_expr, .field = "z" } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&field_access, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "checkFieldAccess: non-struct type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    try checker.module_scope.define("x", .{ .type_id = .int, .is_mut = false });
+
+    // check x.foo (Int is not a struct)
+    const x_expr = ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const field_access = ast.Expr{
+        .kind = .{ .field_access = .{ .object = &x_expr, .field = "foo" } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&field_access, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
 }

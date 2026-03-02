@@ -29,6 +29,17 @@ const Type = types.Type;
 const Location = errors.Location;
 
 // ---------------------------------------------------------------
+// generic declarations
+// ---------------------------------------------------------------
+
+/// a generic type declaration stored during pass 1. the AST node is
+/// kept around so we can instantiate it later with concrete type args.
+pub const GenericDecl = union(enum) {
+    @"struct": ast.StructDecl,
+    @"enum": ast.EnumDecl,
+};
+
+// ---------------------------------------------------------------
 // scope
 // ---------------------------------------------------------------
 
@@ -84,6 +95,10 @@ pub const Checker = struct {
     /// arena for checker-allocated data (scope storage, etc.)
     arena: std.heap.ArenaAllocator,
     module_scope: Scope,
+    /// generic type declarations stored during pass 1, keyed by base name
+    /// (e.g. "Pair", "Option"). instantiated on demand when a concrete
+    /// use like Pair[Int, String] is encountered in type resolution.
+    generic_decls: std.StringHashMap(GenericDecl),
 
     /// create a new checker. registers builtin types and functions.
     pub fn init(allocator: std.mem.Allocator, source: []const u8) !Checker {
@@ -93,6 +108,7 @@ pub const Checker = struct {
             .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
             .module_scope = Scope.init(allocator, null),
+            .generic_decls = std.StringHashMap(GenericDecl).init(allocator),
         };
 
         // register builtins into the module scope
@@ -103,6 +119,7 @@ pub const Checker = struct {
 
     pub fn deinit(self: *Checker) void {
         self.module_scope.deinit();
+        self.generic_decls.deinit();
         self.arena.deinit();
         self.diagnostics.deinit();
         self.type_table.deinit();
@@ -212,7 +229,10 @@ pub const Checker = struct {
 
     fn registerStructDecl(self: *Checker, s: ast.StructDecl, location: Location) void {
         if (s.generic_params.len > 0) {
-            self.diagnostics.addError(location, "generic structs are not yet supported") catch {};
+            // store for later instantiation — fields aren't resolved until
+            // a concrete use like Pair[Int, String] is encountered
+            self.generic_decls.put(s.name, .{ .@"struct" = s }) catch return;
+            _ = location;
             return;
         }
 
@@ -241,7 +261,8 @@ pub const Checker = struct {
 
     fn registerEnumDecl(self: *Checker, e: ast.EnumDecl, location: Location) void {
         if (e.generic_params.len > 0) {
-            self.diagnostics.addError(location, "generic enums are not yet supported") catch {};
+            self.generic_decls.put(e.name, .{ .@"enum" = e }) catch return;
+            _ = location;
             return;
         }
 
@@ -674,6 +695,11 @@ pub const Checker = struct {
 
     fn checkIdent(self: *Checker, name: []const u8, location: Location, scope: *const Scope) TypeId {
         if (scope.lookup(name)) |binding| return binding.type_id;
+
+        // generic type names used as bare identifiers (e.g. in a call like
+        // Pair(1, "hello") without type args) — suppress the diagnostic.
+        // the real type comes from a binding annotation or generic use site.
+        if (self.generic_decls.contains(name)) return .err;
 
         self.diagnostics.addError(location, self.fmt("undefined variable '{s}'", .{name})) catch {};
         return .err;
@@ -3110,4 +3136,124 @@ test "Semaphore(Int) returns Semaphore type" {
     const result = checker.checkExpr(&call, scope);
     try std.testing.expect(!result.isErr());
     try std.testing.expectEqualStrings("Semaphore", checker.type_table.typeName(result));
+}
+
+// -- generic declaration tests --
+
+test "generic struct is stored without error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "A" }, .location = Location.zero };
+    const u_te = ast.TypeExpr{ .kind = .{ .named = "B" }, .location = Location.zero };
+
+    const struct_decl = ast.StructDecl{
+        .name = "Pair",
+        .generic_params = &.{
+            .{ .name = "A", .bounds = &.{}, .location = Location.zero },
+            .{ .name = "B", .bounds = &.{}, .location = Location.zero },
+        },
+        .fields = &.{
+            .{ .name = "first", .type_expr = &t_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            .{ .name = "second", .type_expr = &u_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+        },
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .struct_decl = struct_decl },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    // no errors — generic struct stored, not rejected
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    // should be in generic_decls, not in the type table
+    try std.testing.expect(checker.generic_decls.contains("Pair"));
+    try std.testing.expect(checker.type_table.lookup("Pair") == null);
+}
+
+test "generic enum is stored without error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+
+    const enum_decl = ast.EnumDecl{
+        .name = "Option",
+        .generic_params = &.{
+            .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+        },
+        .variants = &.{
+            .{ .name = "Some", .fields = &.{&t_te}, .location = Location.zero },
+            .{ .name = "None", .fields = &.{}, .location = Location.zero },
+        },
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .enum_decl = enum_decl },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    try std.testing.expect(checker.generic_decls.contains("Option"));
+    try std.testing.expect(checker.type_table.lookup("Option") == null);
+}
+
+test "non-generic struct still registers normally" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+
+    const struct_decl = ast.StructDecl{
+        .name = "Point",
+        .generic_params = &.{},
+        .fields = &.{
+            .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+        },
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .struct_decl = struct_decl },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    // non-generic goes into the type table, not generic_decls
+    try std.testing.expect(checker.type_table.lookup("Point") != null);
+    try std.testing.expect(!checker.generic_decls.contains("Point"));
+}
+
+test "checkIdent: generic type name returns err silently" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // register a generic decl manually
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    checker.generic_decls.put("Box", .{ .@"struct" = .{
+        .name = "Box",
+        .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
+        .fields = &.{
+            .{ .name = "value", .type_expr = &t_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+        },
+    } }) catch unreachable;
+
+    const scope = &checker.module_scope;
+    const ident = ast.Expr{ .kind = .{ .ident = "Box" }, .location = Location.zero };
+    const result = checker.checkExpr(&ident, scope);
+
+    // returns err but does NOT emit a diagnostic
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(!checker.diagnostics.hasErrors());
 }

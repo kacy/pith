@@ -33,6 +33,39 @@ fn identity[T](x: T) -> T:
 fn second[A, B](x: A, y: B) -> B:
     return y
 
+# interface bounds constrain which types can be used as type arguments.
+# fn show[T: Display](x: T) means T must implement Display.
+
+interface Display:
+    fn show(x: String) -> String
+
+interface Hash:
+    fn hash(x: String) -> Int
+
+struct Point:
+    pub x: Int
+    pub y: Int
+
+impl Display for Point:
+    fn show(x: String) -> String:
+        return "point"
+
+impl Hash for Point:
+    fn hash(x: String) -> Int:
+        return 0
+
+# bounded generic function — T must implement Display
+fn show[T: Display](x: T) -> String:
+    return "shown"
+
+# multiple bounds — T must implement both Display and Hash
+fn show_and_hash[T: Display + Hash](x: T) -> String:
+    return "shown and hashed"
+
+# bounded generic struct — T must implement Display
+struct Wrapper[T: Display]:
+    pub value: T
+
 fn main():
     p: Pair[Int, String] := Pair(1, "hello")
     b: Box[Float] := Box(3.14)
@@ -41,5 +74,13 @@ fn main():
     n := identity(42)
     s := identity("hello")
     result := second(1, "world")
+
+    # bounded generic calls — Point implements Display and Hash
+    pt := Point(1, 2)
+    shown := show(pt)
+    both := show_and_hash(pt)
+
+    # bounded generic struct instantiation
+    w: Wrapper[Point] := Wrapper(pt)
 
     print("generics work")

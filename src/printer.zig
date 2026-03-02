@@ -523,13 +523,26 @@ fn printTypeExpr(te: *const ast.TypeExpr, indent: u32) void {
             printTypeExpr(r.ok_type, indent + 1);
             if (r.err_type) |et| printTypeExpr(et, indent + 1);
         },
-        .tuple => |types| {
+        .tuple => |elems| {
             printIndent(indent);
-            io.write("tuple_type ({d})\n", .{types.len});
+            io.write("tuple_type\n", .{});
+            for (elems) |elem| {
+                printTypeExpr(elem, indent + 1);
+            }
         },
         .fn_type => |f| {
             printIndent(indent);
-            io.write("fn_type ({d} params)\n", .{f.params.len});
+            io.write("fn_type\n", .{});
+            for (f.params) |p| {
+                printIndent(indent + 1);
+                io.write("param\n", .{});
+                printTypeExpr(p, indent + 2);
+            }
+            if (f.return_type) |ret| {
+                printIndent(indent + 1);
+                io.write("returns\n", .{});
+                printTypeExpr(ret, indent + 2);
+            }
         },
     }
 }

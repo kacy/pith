@@ -621,7 +621,7 @@ pub const Checker = struct {
             .unwrap => .err,
             .try_expr => .err,
             .match_expr => .err,
-            .lambda => .err,
+            .lambda => |lam| self.checkLambda(lam, scope),
             .list => .err,
             .map => .err,
             .set => .err,
@@ -932,6 +932,53 @@ pub const Checker = struct {
             .{ struct_data.name, fa.field },
         )) catch {};
         return .err;
+    }
+
+    fn checkLambda(self: *Checker, lam: ast.Lambda, scope: *const Scope) TypeId {
+        // resolve parameter types — require annotations (no inference yet)
+        var param_ids = std.ArrayList(TypeId).initCapacity(self.allocator, lam.params.len) catch return .err;
+        defer param_ids.deinit(self.allocator);
+
+        for (lam.params) |param| {
+            if (param.type_expr) |te| {
+                const id = self.resolveTypeExpr(te);
+                param_ids.append(self.allocator, id) catch return .err;
+            } else {
+                self.diagnostics.addError(param.location, self.fmt(
+                    "lambda parameter '{s}' needs a type annotation",
+                    .{param.name},
+                )) catch {};
+                return .err;
+            }
+        }
+
+        // create a child scope for the lambda body
+        var lambda_scope = Scope.init(self.allocator, @constCast(scope));
+        defer lambda_scope.deinit();
+
+        for (lam.params, param_ids.items) |param, param_type| {
+            lambda_scope.define(param.name, .{
+                .type_id = param_type,
+                .is_mut = param.is_mut,
+            }) catch return .err;
+        }
+
+        // determine return type based on body form
+        const return_type: TypeId = switch (lam.body) {
+            .expr => |body_expr| self.checkExpr(body_expr, &lambda_scope),
+            .block => |block| blk: {
+                lambda_scope.return_type = .void;
+                self.checkBlock(block, &lambda_scope);
+                break :blk .void;
+            },
+        };
+
+        // build the function type
+        const owned_params = self.arena.allocator().dupe(TypeId, param_ids.items) catch return .err;
+        return self.type_table.addType(.{ .function = .{
+            .param_types = owned_params,
+            .return_type = return_type,
+        } }) catch return .err;
     }
 
     fn checkTupleExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
@@ -1803,6 +1850,130 @@ test "break at top level is an error" {
 
     const stmt = ast.Stmt{ .kind = .break_stmt, .location = Location.zero };
     checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+// -- lambda tests --
+
+test "checkExpr: short lambda fn(x: Int) => x * 2" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const x_expr = ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const two = ast.Expr{ .kind = .{ .int_lit = "2" }, .location = Location.zero };
+    const body = ast.Expr{
+        .kind = .{ .binary = .{ .left = &x_expr, .op = .mul, .right = &two } },
+        .location = Location.zero,
+    };
+
+    const lambda = ast.Expr{
+        .kind = .{ .lambda = .{
+            .params = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+            },
+            .body = .{ .expr = &body },
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&lambda, scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    const func = ty.function;
+    try std.testing.expectEqual(@as(usize, 1), func.param_types.len);
+    try std.testing.expectEqual(TypeId.int, func.param_types[0]);
+    try std.testing.expectEqual(TypeId.int, func.return_type);
+}
+
+test "checkExpr: lambda with two params" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const a_expr = ast.Expr{ .kind = .{ .ident = "a" }, .location = Location.zero };
+    const b_expr = ast.Expr{ .kind = .{ .ident = "b" }, .location = Location.zero };
+    const body = ast.Expr{
+        .kind = .{ .binary = .{ .left = &a_expr, .op = .add, .right = &b_expr } },
+        .location = Location.zero,
+    };
+
+    const lambda = ast.Expr{
+        .kind = .{ .lambda = .{
+            .params = &.{
+                .{ .name = "a", .type_expr = &int_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                .{ .name = "b", .type_expr = &int_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+            },
+            .body = .{ .expr = &body },
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&lambda, scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    const func = ty.function;
+    try std.testing.expectEqual(@as(usize, 2), func.param_types.len);
+    try std.testing.expectEqual(TypeId.int, func.return_type);
+}
+
+test "checkExpr: block lambda returns Void" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const x_expr = ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = null } },
+        .location = Location.zero,
+    };
+    // use x in an expression statement to avoid unused variable (but we don't check that yet)
+    _ = x_expr;
+
+    const lambda = ast.Expr{
+        .kind = .{ .lambda = .{
+            .params = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+            },
+            .body = .{ .block = .{ .stmts = &.{ret_stmt}, .location = Location.zero } },
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&lambda, scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    try std.testing.expectEqual(TypeId.void, ty.function.return_type);
+}
+
+test "checkExpr: lambda param without annotation is error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const x_expr = ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const lambda = ast.Expr{
+        .kind = .{ .lambda = .{
+            .params = &.{
+                .{ .name = "x", .type_expr = null, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+            },
+            .body = .{ .expr = &x_expr },
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&lambda, scope);
+    try std.testing.expect(result.isErr());
     try std.testing.expect(checker.diagnostics.hasErrors());
 }
 

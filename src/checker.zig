@@ -884,6 +884,9 @@ pub const Checker = struct {
             subst.put(param.name, arg_id) catch return .err;
         }
 
+        // verify type arguments satisfy interface bounds
+        if (!self.checkBounds(s.generic_params, &subst, location)) return .err;
+
         // resolve each field type with substitution
         var fields = std.ArrayList(types.Field).initCapacity(self.allocator, s.fields.len) catch return .err;
         defer fields.deinit(self.allocator);
@@ -933,6 +936,9 @@ pub const Checker = struct {
         for (e.generic_params, arg_ids) |param, arg_id| {
             subst.put(param.name, arg_id) catch return .err;
         }
+
+        // verify type arguments satisfy interface bounds
+        if (!self.checkBounds(e.generic_params, &subst, location)) return .err;
 
         // resolve each variant's field types with substitution
         var variants = std.ArrayList(types.Variant).initCapacity(self.allocator, e.variants.len) catch return .err;
@@ -5069,5 +5075,138 @@ test "generic fn call: one of multiple bounds not satisfied" {
 
     const result = checker.checkExpr(&call, &checker.module_scope);
     try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "generic struct with bound: satisfied" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = &ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const t_te = &ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const printable_te = &ast.TypeExpr{ .kind = .{ .named = "Printable" }, .location = Location.zero };
+    const point_te_name = &ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    const module = ast.Module{
+        .imports = &.{},
+        .decls = &.{
+            // interface Printable:
+            ast.Decl{ .kind = .{ .interface_decl = .{ .name = "Printable", .generic_params = &.{}, .methods = &.{} } }, .is_pub = false, .location = Location.zero },
+            // struct Point: pub x: Int
+            ast.Decl{
+                .kind = .{ .struct_decl = .{
+                    .name = "Point",
+                    .generic_params = &.{},
+                    .fields = &.{
+                        .{ .name = "x", .type_expr = int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+                    },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+            // impl Printable for Point:
+            ast.Decl{ .kind = .{ .impl_decl = .{ .target = printable_te, .interface = point_te_name, .methods = &.{} } }, .is_pub = false, .location = Location.zero },
+            // struct Wrapper[T: Printable]: pub value: T
+            ast.Decl{
+                .kind = .{ .struct_decl = .{
+                    .name = "Wrapper",
+                    .generic_params = &.{
+                        .{ .name = "T", .bounds = &.{printable_te}, .location = Location.zero },
+                    },
+                    .fields = &.{
+                        .{ .name = "value", .type_expr = t_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+                    },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+            // fn use_wrapper(w: Wrapper[Point]) -> Int: return 0
+            ast.Decl{
+                .kind = .{ .fn_decl = .{
+                    .name = "use_wrapper",
+                    .generic_params = &.{},
+                    .params = &.{
+                        .{ .name = "w", .type_expr = &ast.TypeExpr{
+                            .kind = .{ .generic = .{ .name = "Wrapper", .args = &.{point_te_name} } },
+                            .location = Location.zero,
+                        }, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = int_te,
+                    .body = .{
+                        .stmts = &.{ast.Stmt{
+                            .kind = .{ .return_stmt = .{ .value = &ast.Expr{ .kind = .{ .int_lit = "0" }, .location = Location.zero } } },
+                            .location = Location.zero,
+                        }},
+                        .location = Location.zero,
+                    },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+        },
+    };
+    checker.check(&module);
+
+    // Wrapper[Point] should succeed — Point implements Printable
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    try std.testing.expect(checker.type_table.lookup("Wrapper[Point]") != null);
+}
+
+test "generic struct with bound: not satisfied" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = &ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const t_te = &ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const printable_te = &ast.TypeExpr{ .kind = .{ .named = "Printable" }, .location = Location.zero };
+
+    const module = ast.Module{
+        .imports = &.{},
+        .decls = &.{
+            // interface Printable:
+            ast.Decl{ .kind = .{ .interface_decl = .{ .name = "Printable", .generic_params = &.{}, .methods = &.{} } }, .is_pub = false, .location = Location.zero },
+            // struct Wrapper[T: Printable]: pub value: T
+            ast.Decl{
+                .kind = .{ .struct_decl = .{
+                    .name = "Wrapper",
+                    .generic_params = &.{
+                        .{ .name = "T", .bounds = &.{printable_te}, .location = Location.zero },
+                    },
+                    .fields = &.{
+                        .{ .name = "value", .type_expr = t_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+                    },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+            // fn use_wrapper(w: Wrapper[Int]) -> Int: return 0
+            // Int does NOT implement Printable
+            ast.Decl{
+                .kind = .{ .fn_decl = .{
+                    .name = "use_wrapper",
+                    .generic_params = &.{},
+                    .params = &.{
+                        .{ .name = "w", .type_expr = &ast.TypeExpr{
+                            .kind = .{ .generic = .{ .name = "Wrapper", .args = &.{int_te} } },
+                            .location = Location.zero,
+                        }, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = int_te,
+                    .body = .{
+                        .stmts = &.{ast.Stmt{
+                            .kind = .{ .return_stmt = .{ .value = &ast.Expr{ .kind = .{ .int_lit = "0" }, .location = Location.zero } } },
+                            .location = Location.zero,
+                        }},
+                        .location = Location.zero,
+                    },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+        },
+    };
+    checker.check(&module);
+
+    // Wrapper[Int] should fail — Int does not implement Printable
     try std.testing.expect(checker.diagnostics.hasErrors());
 }

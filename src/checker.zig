@@ -104,6 +104,193 @@ pub const Checker = struct {
     }
 
     // ---------------------------------------------------------------
+    // module checking — public entry point
+    // ---------------------------------------------------------------
+
+    /// check a parsed module. two passes:
+    ///   1. register all top-level declarations (names + signatures)
+    ///   2. check all function bodies and top-level bindings
+    pub fn check(self: *Checker, module: *const ast.Module) void {
+        // pass 1: register declarations
+        for (module.decls) |*decl| {
+            self.registerDecl(decl);
+        }
+
+        // pass 2: check bodies
+        for (module.decls) |*decl| {
+            self.checkDecl(decl);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // pass 1 — declaration registration
+    // ---------------------------------------------------------------
+
+    fn registerDecl(self: *Checker, decl: *const ast.Decl) void {
+        switch (decl.kind) {
+            .fn_decl => |fn_d| self.registerFnDecl(fn_d, decl.location),
+            .struct_decl => {}, // handled in a later commit
+            .enum_decl => {},
+            .interface_decl => {},
+            .impl_decl => {},
+            .type_alias => {},
+            .binding => {}, // top-level bindings are checked in pass 2
+        }
+    }
+
+    fn registerFnDecl(self: *Checker, fn_d: ast.FnDecl, location: Location) void {
+        // check for generic params — not yet supported
+        if (fn_d.generic_params.len > 0) {
+            self.diagnostics.addError(location, "generic functions are not yet supported") catch {};
+            return;
+        }
+
+        // resolve parameter types
+        var param_ids = std.ArrayList(TypeId).initCapacity(self.allocator, fn_d.params.len) catch return;
+        defer param_ids.deinit(self.allocator);
+
+        for (fn_d.params) |param| {
+            if (param.type_expr) |te| {
+                const id = self.resolveTypeExpr(te);
+                param_ids.append(self.allocator, id) catch return;
+            } else {
+                self.diagnostics.addError(param.location, self.fmt(
+                    "parameter '{s}' needs a type annotation",
+                    .{param.name},
+                )) catch {};
+                param_ids.append(self.allocator, .err) catch return;
+            }
+        }
+
+        // resolve return type
+        const return_type = if (fn_d.return_type) |rt| self.resolveTypeExpr(rt) else TypeId.void;
+
+        // store param types on the arena
+        const owned_params = self.arena.allocator().dupe(TypeId, param_ids.items) catch return;
+        const fn_type = self.type_table.addType(.{ .function = .{
+            .param_types = owned_params,
+            .return_type = return_type,
+        } }) catch return;
+
+        self.module_scope.define(fn_d.name, .{ .type_id = fn_type, .is_mut = false }) catch {};
+    }
+
+    // ---------------------------------------------------------------
+    // pass 2 — declaration bodies
+    // ---------------------------------------------------------------
+
+    fn checkDecl(self: *Checker, decl: *const ast.Decl) void {
+        switch (decl.kind) {
+            .fn_decl => |fn_d| self.checkFnDecl(fn_d),
+            .binding => |b| self.checkTopLevelBinding(b),
+            .struct_decl => {},
+            .enum_decl => {},
+            .interface_decl => {},
+            .impl_decl => {},
+            .type_alias => {},
+        }
+    }
+
+    fn checkFnDecl(self: *Checker, fn_d: ast.FnDecl) void {
+        // skip generics (already reported in pass 1)
+        if (fn_d.generic_params.len > 0) return;
+
+        // look up the function's type to get param types and return type
+        const fn_binding = self.module_scope.lookup(fn_d.name) orelse return;
+        const fn_type = self.type_table.get(fn_binding.type_id) orelse return;
+        const func = switch (fn_type) {
+            .function => |f| f,
+            else => return,
+        };
+
+        // create a scope for the function body
+        var fn_scope = Scope.init(self.allocator, &self.module_scope);
+        defer fn_scope.deinit();
+        fn_scope.return_type = func.return_type;
+
+        // define parameters in the function scope
+        for (fn_d.params, func.param_types) |param, param_type| {
+            fn_scope.define(param.name, .{
+                .type_id = param_type,
+                .is_mut = param.is_mut,
+            }) catch {};
+        }
+
+        // check the body
+        self.checkBlock(fn_d.body, &fn_scope);
+    }
+
+    fn checkTopLevelBinding(self: *Checker, b: ast.Binding) void {
+        // infer or check the binding's type, then add to module scope
+        const value_type = self.checkExpr(b.value, &self.module_scope);
+
+        if (b.type_expr) |te| {
+            const annotated = self.resolveTypeExpr(te);
+            if (!annotated.isErr() and !value_type.isErr() and annotated != value_type) {
+                self.diagnostics.addError(te.location, self.fmt(
+                    "type mismatch: declared {s}, got {s}",
+                    .{ self.type_table.typeName(annotated), self.type_table.typeName(value_type) },
+                )) catch {};
+            }
+            self.module_scope.define(b.name, .{ .type_id = annotated, .is_mut = b.is_mut }) catch {};
+        } else {
+            self.module_scope.define(b.name, .{ .type_id = value_type, .is_mut = b.is_mut }) catch {};
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // block checking
+    // ---------------------------------------------------------------
+
+    fn checkBlock(self: *Checker, block: ast.Block, scope: *Scope) void {
+        for (block.stmts) |*stmt| {
+            self.checkStmt(stmt, scope);
+        }
+    }
+
+    fn checkStmt(self: *Checker, stmt: *const ast.Stmt, scope: *Scope) void {
+        switch (stmt.kind) {
+            .expr_stmt => |expr| _ = self.checkExpr(expr, scope),
+            .return_stmt => |ret| self.checkReturnStmt(ret, stmt.location, scope),
+            // remaining statement kinds handled in next commit
+            .binding => {},
+            .assignment => {},
+            .if_stmt => {},
+            .for_stmt => {},
+            .while_stmt => {},
+            .match_stmt => {},
+            .fail_stmt => {},
+            .break_stmt => {},
+            .continue_stmt => {},
+        }
+    }
+
+    fn checkReturnStmt(self: *Checker, ret: ast.ReturnStmt, location: Location, scope: *const Scope) void {
+        const expected = scope.return_type orelse {
+            self.diagnostics.addError(location, "return statement outside of function") catch {};
+            return;
+        };
+
+        if (ret.value) |value| {
+            const actual = self.checkExpr(value, scope);
+            if (!actual.isErr() and !expected.isErr() and actual != expected) {
+                self.diagnostics.addError(value.location, self.fmt(
+                    "return type mismatch: expected {s}, got {s}",
+                    .{ self.type_table.typeName(expected), self.type_table.typeName(actual) },
+                )) catch {};
+            }
+        } else {
+            // bare return — expected type should be Void
+            if (expected != .void and !expected.isErr()) {
+                self.diagnostics.addError(location, self.fmt(
+                    "function expects return type {s}, got Void",
+                    .{self.type_table.typeName(expected)},
+                )) catch {};
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
     // type resolution — AST TypeExpr → TypeId
     // ---------------------------------------------------------------
 
@@ -208,8 +395,7 @@ pub const Checker = struct {
             .string_interp => |interp| self.checkStringInterp(interp, scope),
             .if_expr => |if_e| self.checkIfExpr(if_e, scope),
 
-            // these need further infrastructure (generics, impl blocks, etc.)
-            .call => .err,
+            .call => |call| self.checkCall(call, expr.location, scope),
             .method_call => .err,
             .field_access => .err,
             .index => .err,
@@ -409,6 +595,46 @@ pub const Checker = struct {
         }
 
         return then_type;
+    }
+
+    fn checkCall(self: *Checker, call: ast.CallExpr, location: Location, scope: *const Scope) TypeId {
+        const callee_type = self.checkExpr(call.callee, scope);
+        if (callee_type.isErr()) return .err;
+
+        // look up the function type
+        const ty = self.type_table.get(callee_type) orelse return .err;
+        const func = switch (ty) {
+            .function => |f| f,
+            else => {
+                self.diagnostics.addError(location, self.fmt(
+                    "{s} is not callable",
+                    .{self.type_table.typeName(callee_type)},
+                )) catch {};
+                return .err;
+            },
+        };
+
+        // check argument count
+        if (call.args.len != func.param_types.len) {
+            self.diagnostics.addError(location, self.fmt(
+                "expected {d} argument(s), got {d}",
+                .{ func.param_types.len, call.args.len },
+            )) catch {};
+            return .err;
+        }
+
+        // check argument types
+        for (call.args, func.param_types) |arg, expected| {
+            const actual = self.checkExpr(arg.value, scope);
+            if (!actual.isErr() and !expected.isErr() and actual != expected) {
+                self.diagnostics.addError(arg.location, self.fmt(
+                    "expected {s}, got {s}",
+                    .{ self.type_table.typeName(expected), self.type_table.typeName(actual) },
+                )) catch {};
+            }
+        }
+
+        return func.return_type;
     }
 
     // ---------------------------------------------------------------
@@ -751,4 +977,149 @@ test "checkExpr: error sentinel suppresses cascading" {
     };
     try std.testing.expect(checker.checkExpr(&add, scope).isErr());
     try std.testing.expectEqual(@as(usize, 1), checker.diagnostics.errorCount());
+}
+
+// -- function and call checking tests --
+
+test "checkCall: correct call to print" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const callee = ast.Expr{ .kind = .{ .ident = "print" }, .location = Location.zero };
+    const arg_val = ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{.{ .name = null, .value = &arg_val, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+    try std.testing.expectEqual(TypeId.void, checker.checkExpr(&call, scope));
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "checkCall: wrong argument type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const callee = ast.Expr{ .kind = .{ .ident = "print" }, .location = Location.zero };
+    const arg_val = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{.{ .name = null, .value = &arg_val, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+    _ = checker.checkExpr(&call, scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "checkCall: wrong argument count" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const callee = ast.Expr{ .kind = .{ .ident = "print" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{},
+        } },
+        .location = Location.zero,
+    };
+    _ = checker.checkExpr(&call, scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "registerFnDecl and checkFnDecl" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // build an AST for: fn add(a: Int, b: Int) -> Int: return a + b
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+
+    const a_expr = ast.Expr{ .kind = .{ .ident = "a" }, .location = Location.zero };
+    const b_expr = ast.Expr{ .kind = .{ .ident = "b" }, .location = Location.zero };
+    const add_expr = ast.Expr{
+        .kind = .{ .binary = .{ .left = &a_expr, .op = .add, .right = &b_expr } },
+        .location = Location.zero,
+    };
+    const return_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &add_expr } },
+        .location = Location.zero,
+    };
+
+    const fn_decl = ast.FnDecl{
+        .name = "add",
+        .generic_params = &.{},
+        .params = &.{
+            .{ .name = "a", .type_expr = &int_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+            .{ .name = "b", .type_expr = &int_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+        },
+        .return_type = &int_te,
+        .body = .{ .stmts = &.{return_stmt}, .location = Location.zero },
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .fn_decl = fn_decl },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{
+        .imports = &.{},
+        .decls = &.{decl},
+    };
+
+    checker.check(&module);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+
+    // the function should be registered in module scope
+    const binding = checker.module_scope.lookup("add").?;
+    const fn_type = checker.type_table.get(binding.type_id).?;
+    const func = fn_type.function;
+    try std.testing.expectEqual(@as(usize, 2), func.param_types.len);
+    try std.testing.expectEqual(TypeId.int, func.return_type);
+}
+
+test "checkFnDecl: return type mismatch" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const string_te = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+
+    // fn bad() -> String: return 42
+    const int_expr = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const return_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &int_expr } },
+        .location = Location.zero,
+    };
+
+    const fn_decl = ast.FnDecl{
+        .name = "bad",
+        .generic_params = &.{},
+        .params = &.{},
+        .return_type = &string_te,
+        .body = .{ .stmts = &.{return_stmt}, .location = Location.zero },
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .fn_decl = fn_decl },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{
+        .imports = &.{},
+        .decls = &.{decl},
+    };
+
+    checker.check(&module);
+    try std.testing.expect(checker.diagnostics.hasErrors());
 }

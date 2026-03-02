@@ -1,0 +1,22 @@
+# spawn, await, and sync primitives
+
+fn fetch(url: String) -> String:
+    return "response from {url}"
+
+fn compute(x: Int) -> Int:
+    return x * 2
+
+fn main():
+    # spawn wraps the return type in Task[T]
+    task := spawn fetch("https://example.com")
+
+    # await unwraps Task[T] back to T
+    result := await task
+
+    # spawn and await can be composed
+    value := await spawn compute(21)
+
+    # sync primitives
+    mu := Mutex()
+    wg := WaitGroup()
+    sem := Semaphore(10)

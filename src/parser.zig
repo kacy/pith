@@ -417,8 +417,24 @@ pub const Parser = struct {
         return left;
     }
 
-    /// unary_expr = "-" unary_expr | postfix_expr
+    /// unary_expr = "spawn" unary_expr | "await" unary_expr | "-" unary_expr | postfix_expr
     fn parseUnaryExpr(self: *Parser) ParseError!*const ast.Expr {
+        if (self.check(.kw_spawn)) {
+            const tok = self.advance();
+            const operand = try self.parseUnaryExpr();
+            return self.create(ast.Expr, .{
+                .kind = .{ .spawn_expr = operand },
+                .location = Location.span(tok.location, operand.location),
+            });
+        }
+        if (self.check(.kw_await)) {
+            const tok = self.advance();
+            const operand = try self.parseUnaryExpr();
+            return self.create(ast.Expr, .{
+                .kind = .{ .await_expr = operand },
+                .location = Location.span(tok.location, operand.location),
+            });
+        }
         if (self.check(.minus)) {
             const tok = self.advance();
             const operand = try self.parseUnaryExpr();
@@ -2101,6 +2117,44 @@ test "parse unary negate" {
     try testing.expect(expr.kind == .unary);
     try testing.expect(expr.kind.unary.op == .negate);
     try testing.expect(expr.kind.unary.operand.kind == .int_lit);
+}
+
+test "parse spawn expression" {
+    var result = try testParser("spawn foo()");
+    defer result.deinit();
+
+    const expr = try result.parser.parseExpression();
+    try testing.expect(expr.kind == .spawn_expr);
+    try testing.expect(expr.kind.spawn_expr.kind == .call);
+}
+
+test "parse await expression" {
+    var result = try testParser("await task");
+    defer result.deinit();
+
+    const expr = try result.parser.parseExpression();
+    try testing.expect(expr.kind == .await_expr);
+    try testing.expect(expr.kind.await_expr.kind == .ident);
+}
+
+test "parse await spawn" {
+    var result = try testParser("await spawn foo()");
+    defer result.deinit();
+
+    const expr = try result.parser.parseExpression();
+    try testing.expect(expr.kind == .await_expr);
+    try testing.expect(expr.kind.await_expr.kind == .spawn_expr);
+    try testing.expect(expr.kind.await_expr.kind.spawn_expr.kind == .call);
+}
+
+test "parse spawn in binding" {
+    var result = try testParser("x := spawn bar(1, 2)");
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    try testing.expectEqual(@as(usize, 1), module.decls.len);
+    const binding = module.decls[0].kind.binding;
+    try testing.expect(binding.value.kind == .spawn_expr);
 }
 
 test "parse function call" {

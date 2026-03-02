@@ -342,6 +342,16 @@ fn printExpr(expr: *const ast.Expr, indent: u32) void {
             io.write("try\n", .{});
             printExpr(inner, indent + 1);
         },
+        .spawn_expr => |inner| {
+            printIndent(indent);
+            io.write("spawn\n", .{});
+            printExpr(inner, indent + 1);
+        },
+        .await_expr => |inner| {
+            printIndent(indent);
+            io.write("await\n", .{});
+            printExpr(inner, indent + 1);
+        },
         .if_expr => |i| {
             printIndent(indent);
             io.write("if_expr\n", .{});

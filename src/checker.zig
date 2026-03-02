@@ -114,6 +114,27 @@ pub const Checker = struct {
             .return_type = .void,
         } });
         try self.module_scope.define("print", .{ .type_id = print_type, .is_mut = false });
+
+        // sync primitives — opaque struct types with constructors
+        try self.registerSyncType("Mutex", &.{});
+        try self.registerSyncType("WaitGroup", &.{});
+        try self.registerSyncType("Semaphore", &.{.int});
+    }
+
+    /// register an opaque struct type and a constructor function for it.
+    fn registerSyncType(self: *Checker, name: []const u8, param_types: []const TypeId) !void {
+        const type_id = try self.type_table.addType(.{ .@"struct" = .{
+            .name = name,
+            .fields = &.{},
+        } });
+        try self.type_table.register(name, type_id);
+
+        // constructor: Name(...) -> Name
+        const ctor_type = try self.type_table.addType(.{ .function = .{
+            .param_types = param_types,
+            .return_type = type_id,
+        } });
+        try self.module_scope.define(name, .{ .type_id = ctor_type, .is_mut = false });
     }
 
     // ---------------------------------------------------------------
@@ -589,7 +610,22 @@ pub const Checker = struct {
     }
 
     fn resolveGenericType(self: *Checker, g: ast.GenericType, location: Location) TypeId {
-        _ = g;
+        // Task[T] and Channel[T] are builtin generic types
+        if (g.args.len == 1) {
+            const is_task = std.mem.eql(u8, g.name, "Task");
+            const is_channel = std.mem.eql(u8, g.name, "Channel");
+
+            if (is_task or is_channel) {
+                const inner = self.resolveTypeExpr(g.args[0]);
+                if (inner.isErr()) return .err;
+
+                if (is_task) {
+                    return self.type_table.addType(.{ .task = .{ .inner = inner } }) catch return .err;
+                }
+                return self.type_table.addType(.{ .channel = .{ .inner = inner } }) catch return .err;
+            }
+        }
+
         self.diagnostics.addError(location, "generics are not yet supported") catch {};
         return .err;
     }
@@ -620,6 +656,8 @@ pub const Checker = struct {
             .index => .err,
             .unwrap => .err,
             .try_expr => .err,
+            .spawn_expr => |inner| self.checkSpawnExpr(inner, expr.location, scope),
+            .await_expr => |inner| self.checkAwaitExpr(inner, expr.location, scope),
             .match_expr => |m| self.checkMatchExpr(m, scope),
             .lambda => |lam| self.checkLambda(lam, scope),
             .list => .err,
@@ -763,6 +801,39 @@ pub const Checker = struct {
         };
     }
 
+    fn checkSpawnExpr(self: *Checker, inner: *const ast.Expr, location: Location, scope: *const Scope) TypeId {
+        const inner_type = self.checkExpr(inner, scope);
+        if (inner_type.isErr()) return .err;
+
+        // can't spawn something that's already a task
+        if (self.type_table.get(inner_type)) |ty| {
+            if (ty == .task) {
+                self.diagnostics.addError(location, "cannot spawn a Task") catch {};
+                return .err;
+            }
+        }
+
+        return self.type_table.addType(.{ .task = .{ .inner = inner_type } }) catch return .err;
+    }
+
+    fn checkAwaitExpr(self: *Checker, inner: *const ast.Expr, location: Location, scope: *const Scope) TypeId {
+        const inner_type = self.checkExpr(inner, scope);
+        if (inner_type.isErr()) return .err;
+
+        // the operand must be a Task[T]
+        if (self.type_table.get(inner_type)) |ty| {
+            if (ty == .task) {
+                return ty.task.inner;
+            }
+        }
+
+        self.diagnostics.addError(location, self.fmt(
+            "expected Task, got {s}",
+            .{self.type_table.typeName(inner_type)},
+        )) catch {};
+        return .err;
+    }
+
     fn checkStringInterp(self: *Checker, interp: ast.StringInterp, scope: *const Scope) TypeId {
         // string interpolation always produces a String.
         // we still check sub-expressions for errors though.
@@ -823,6 +894,14 @@ pub const Checker = struct {
             if (self.type_table.lookup(name)) |type_id| {
                 if (self.type_table.get(type_id)) |ty| {
                     if (ty == .@"struct") {
+                        // if arg count doesn't match field count but there's
+                        // a function binding in scope (e.g. sync type constructors),
+                        // fall through to function call checking
+                        if (ty.@"struct".fields.len != call.args.len) {
+                            if (scope.lookup(name) != null) {
+                                return self.checkFnCall(call, location, scope);
+                            }
+                        }
                         return self.checkStructConstructor(type_id, call, location, scope);
                     }
                 }
@@ -1326,6 +1405,65 @@ test "resolveTypeExpr reports generics as unsupported" {
 
     const generic = ast.TypeExpr{
         .kind = .{ .generic = .{ .name = "List", .args = &.{} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(id.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "Task[Int] resolves to task type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Task", .args = &.{&inner} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(!id.isErr());
+
+    const ty = checker.type_table.get(id).?;
+    try std.testing.expectEqual(TypeId.int, ty.task.inner);
+}
+
+test "Channel[String] resolves to channel type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Channel", .args = &.{&inner} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(!id.isErr());
+
+    const ty = checker.type_table.get(id).?;
+    try std.testing.expectEqual(TypeId.string, ty.channel.inner);
+}
+
+test "Task[Unknown] produces error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "Unknown" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Task", .args = &.{&inner} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(id.isErr());
+}
+
+test "List[Int] still reports generics unsupported" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "List", .args = &.{&inner} } },
         .location = Location.zero,
     };
     const id = checker.resolveTypeExpr(&generic);
@@ -2848,4 +2986,147 @@ test "continue in function body outside loop is an error" {
     const stmt = ast.Stmt{ .kind = .continue_stmt, .location = Location.zero };
     checker.checkStmt(&stmt, &scope);
     try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "spawn wraps expression type in Task" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    // spawn of an int literal → Task[Int]
+    const int_expr = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const spawn = ast.Expr{ .kind = .{ .spawn_expr = &int_expr }, .location = Location.zero };
+
+    const result = checker.checkExpr(&spawn, scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    try std.testing.expectEqual(TypeId.int, ty.task.inner);
+}
+
+test "spawn of error-typed expr propagates error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    // spawn of an undefined variable → err
+    const bad = ast.Expr{ .kind = .{ .ident = "undefined" }, .location = Location.zero };
+    const spawn = ast.Expr{ .kind = .{ .spawn_expr = &bad }, .location = Location.zero };
+
+    const result = checker.checkExpr(&spawn, scope);
+    try std.testing.expect(result.isErr());
+}
+
+test "nested spawn is an error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    // spawn(spawn(42)) — inner spawn produces Task[Int], outer spawn should error
+    const int_expr = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const inner_spawn = ast.Expr{ .kind = .{ .spawn_expr = &int_expr }, .location = Location.zero };
+    const outer_spawn = ast.Expr{ .kind = .{ .spawn_expr = &inner_spawn }, .location = Location.zero };
+
+    const result = checker.checkExpr(&outer_spawn, scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "await unwraps Task to inner type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    // await(spawn(42)) → Int
+    const int_expr = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const spawn = ast.Expr{ .kind = .{ .spawn_expr = &int_expr }, .location = Location.zero };
+    const await_e = ast.Expr{ .kind = .{ .await_expr = &spawn }, .location = Location.zero };
+
+    const result = checker.checkExpr(&await_e, scope);
+    try std.testing.expectEqual(TypeId.int, result);
+}
+
+test "await on non-Task is an error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    // await 42 → error (Int is not a Task)
+    const int_expr = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const await_e = ast.Expr{ .kind = .{ .await_expr = &int_expr }, .location = Location.zero };
+
+    const result = checker.checkExpr(&await_e, scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "await of error-typed expr propagates error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const bad = ast.Expr{ .kind = .{ .ident = "undefined" }, .location = Location.zero };
+    const await_e = ast.Expr{ .kind = .{ .await_expr = &bad }, .location = Location.zero };
+
+    const result = checker.checkExpr(&await_e, scope);
+    try std.testing.expect(result.isErr());
+}
+
+test "Mutex() returns Mutex type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const callee = ast.Expr{ .kind = .{ .ident = "Mutex" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{ .callee = &callee, .args = &.{} } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, scope);
+    try std.testing.expect(!result.isErr());
+    try std.testing.expectEqualStrings("Mutex", checker.type_table.typeName(result));
+}
+
+test "WaitGroup() returns WaitGroup type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const callee = ast.Expr{ .kind = .{ .ident = "WaitGroup" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{ .callee = &callee, .args = &.{} } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, scope);
+    try std.testing.expect(!result.isErr());
+    try std.testing.expectEqualStrings("WaitGroup", checker.type_table.typeName(result));
+}
+
+test "Semaphore(Int) returns Semaphore type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const callee = ast.Expr{ .kind = .{ .ident = "Semaphore" }, .location = Location.zero };
+    const arg_val = ast.Expr{ .kind = .{ .int_lit = "10" }, .location = Location.zero };
+    const arg = ast.Arg{ .name = null, .value = &arg_val, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{ .callee = &callee, .args = &.{arg} } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, scope);
+    try std.testing.expect(!result.isErr());
+    try std.testing.expectEqualStrings("Semaphore", checker.type_table.typeName(result));
 }

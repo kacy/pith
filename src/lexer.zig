@@ -40,6 +40,8 @@ pub const TokenKind = enum {
     kw_fail,
     kw_break,
     kw_continue,
+    kw_spawn,
+    kw_await,
     kw_struct,
     kw_enum,
     kw_interface,
@@ -130,6 +132,8 @@ const keyword_map = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "fail", .kw_fail },
     .{ "break", .kw_break },
     .{ "continue", .kw_continue },
+    .{ "spawn", .kw_spawn },
+    .{ "await", .kw_await },
     .{ "struct", .kw_struct },
     .{ "enum", .kw_enum },
     .{ "interface", .kw_interface },
@@ -1339,6 +1343,16 @@ test "lex number followed by dot is not float" {
         .identifier,
         .eof,
     });
+}
+
+test "lex spawn keyword" {
+    try expectTokens("spawn", &.{ .kw_spawn, .eof });
+    try expectTokens("spawner", &.{ .identifier, .eof });
+}
+
+test "lex await keyword" {
+    try expectTokens("await", &.{ .kw_await, .eof });
+    try expectTokens("awaiting", &.{ .identifier, .eof });
 }
 
 test "lex all assignment operators" {

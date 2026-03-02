@@ -74,7 +74,8 @@ KEYWORD       = "fn" | "if" | "elif" | "else" | "for" | "in" | "while"
               | "pub" | "mut" | "ref" | "weak"
               | "import" | "from" | "as"
               | "self" | "true" | "false" | "none"
-              | "and" | "or" | "not" ;
+              | "and" | "or" | "not"
+              | "spawn" | "await" ;
 
 
 (* ------------------------------------------------------------------ *)
@@ -219,7 +220,7 @@ pattern_list  = pattern , { "," , pattern } ;
 (*   |                                                                 *)
 (*   + -                                                               *)
 (*   * / %                                                             *)
-(*   unary - (prefix)                                                  *)
+(*   spawn, await, unary - (prefix)                                    *)
 (*   ? ! (postfix)                                                     *)
 (*   call, index, field access                                         *)
 
@@ -236,7 +237,10 @@ pipe_expr     = add_expr , { "|" , add_expr } ;
 
 add_expr      = mul_expr , { ( "+" | "-" ) , mul_expr } ;
 mul_expr      = unary_expr , { ( "*" | "/" | "%" ) , unary_expr } ;
-unary_expr    = "-" , unary_expr | postfix_expr ;
+unary_expr    = "spawn" , unary_expr
+              | "await" , unary_expr
+              | "-" , unary_expr
+              | postfix_expr ;
 
 postfix_expr  = primary , { postfix_op } ;
 postfix_op    = "?" | "!" | call | index | field_access | method_call ;

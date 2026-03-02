@@ -265,6 +265,10 @@ pub const ExprKind = union(enum) {
     unwrap: *const Expr, // expr?
     try_expr: *const Expr, // expr!
 
+    // concurrency
+    spawn_expr: *const Expr, // spawn <expr>
+    await_expr: *const Expr, // await <expr>
+
     // control flow expressions
     if_expr: IfExpr,
     match_expr: MatchExpr,

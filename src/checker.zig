@@ -873,6 +873,90 @@ pub const Checker = struct {
     }
 
     // ---------------------------------------------------------------
+    // generic function inference + instantiation
+    // ---------------------------------------------------------------
+
+    const InferError = error{ConflictingInference};
+
+    /// try to match a single parameter's type expression against an argument
+    /// type. if the type expr is a bare name that matches a generic param,
+    /// record the mapping. nested patterns (e.g. Option[T]) are deferred.
+    fn matchTypeParam(
+        type_expr: *const ast.TypeExpr,
+        arg_type: TypeId,
+        generic_params: []const ast.GenericParam,
+        subst: *std.StringHashMap(TypeId),
+    ) InferError!void {
+        // only match direct type parameter names
+        if (type_expr.kind != .named) return;
+        const name = type_expr.kind.named;
+
+        // check if this name is one of the generic params
+        var is_generic = false;
+        for (generic_params) |gp| {
+            if (std.mem.eql(u8, gp.name, name)) {
+                is_generic = true;
+                break;
+            }
+        }
+        if (!is_generic) return;
+
+        // record or verify the mapping
+        if (subst.get(name)) |existing| {
+            if (existing != arg_type) return error.ConflictingInference;
+        } else {
+            subst.put(name, arg_type) catch return;
+        }
+    }
+
+    /// infer type arguments for a generic function from call-site argument
+    /// types. returns a substitution map on success, or null if inference
+    /// fails (with a diagnostic emitted).
+    fn inferTypeArgs(
+        self: *Checker,
+        fn_d: ast.FnDecl,
+        arg_types: []const TypeId,
+        location: Location,
+    ) ?std.StringHashMap(TypeId) {
+        var subst = std.StringHashMap(TypeId).init(self.allocator);
+
+        for (fn_d.params, arg_types) |param, arg_type| {
+            if (param.type_expr) |te| {
+                matchTypeParam(te, arg_type, fn_d.generic_params, &subst) catch |err| switch (err) {
+                    error.ConflictingInference => {
+                        // find which param conflicted for the error message
+                        const param_name = te.kind.named;
+                        self.diagnostics.addError(location, self.fmt(
+                            "conflicting types for generic parameter '{s}': {s} vs {s}",
+                            .{
+                                param_name,
+                                self.type_table.typeName(subst.get(param_name).?),
+                                self.type_table.typeName(arg_type),
+                            },
+                        )) catch {};
+                        subst.deinit();
+                        return null;
+                    },
+                };
+            }
+        }
+
+        // verify all generic params were inferred
+        for (fn_d.generic_params) |gp| {
+            if (subst.get(gp.name) == null) {
+                self.diagnostics.addError(location, self.fmt(
+                    "could not infer type for generic parameter '{s}'",
+                    .{gp.name},
+                )) catch {};
+                subst.deinit();
+                return null;
+            }
+        }
+
+        return subst;
+    }
+
+    // ---------------------------------------------------------------
     // expression checking
     // ---------------------------------------------------------------
 
@@ -3827,4 +3911,134 @@ test "checkIdent: generic function name returns err silently" {
     const result = checker.checkExpr(&ident, &checker.module_scope);
     try std.testing.expect(result.isErr());
     try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+// -- type inference tests --
+
+test "inferTypeArgs: single type param" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // fn id[T](x: T)
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const fn_d = ast.FnDecl{
+        .name = "id",
+        .generic_params = &.{
+            .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+        },
+        .params = &.{
+            .{ .name = "x", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+        },
+        .return_type = &t_te,
+        .body = .{ .stmts = &.{}, .location = Location.zero },
+    };
+
+    var subst = checker.inferTypeArgs(fn_d, &.{TypeId.int}, Location.zero).?;
+    defer subst.deinit();
+
+    try std.testing.expectEqual(TypeId.int, subst.get("T").?);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "inferTypeArgs: two type params" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // fn swap[A, B](x: A, y: B)
+    const a_te = ast.TypeExpr{ .kind = .{ .named = "A" }, .location = Location.zero };
+    const b_te = ast.TypeExpr{ .kind = .{ .named = "B" }, .location = Location.zero };
+    const fn_d = ast.FnDecl{
+        .name = "swap",
+        .generic_params = &.{
+            .{ .name = "A", .bounds = &.{}, .location = Location.zero },
+            .{ .name = "B", .bounds = &.{}, .location = Location.zero },
+        },
+        .params = &.{
+            .{ .name = "x", .type_expr = &a_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+            .{ .name = "y", .type_expr = &b_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+        },
+        .return_type = &a_te,
+        .body = .{ .stmts = &.{}, .location = Location.zero },
+    };
+
+    var subst = checker.inferTypeArgs(fn_d, &.{ TypeId.int, TypeId.string }, Location.zero).?;
+    defer subst.deinit();
+
+    try std.testing.expectEqual(TypeId.int, subst.get("A").?);
+    try std.testing.expectEqual(TypeId.string, subst.get("B").?);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "inferTypeArgs: consistent same param" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // fn eq[T](a: T, b: T) — both args are Int, should succeed
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const fn_d = ast.FnDecl{
+        .name = "eq",
+        .generic_params = &.{
+            .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+        },
+        .params = &.{
+            .{ .name = "a", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+            .{ .name = "b", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+        },
+        .return_type = &t_te,
+        .body = .{ .stmts = &.{}, .location = Location.zero },
+    };
+
+    var subst = checker.inferTypeArgs(fn_d, &.{ TypeId.int, TypeId.int }, Location.zero).?;
+    defer subst.deinit();
+
+    try std.testing.expectEqual(TypeId.int, subst.get("T").?);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "inferTypeArgs: conflicting inference" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // fn eq[T](a: T, b: T) — Int and String should conflict
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const fn_d = ast.FnDecl{
+        .name = "eq",
+        .generic_params = &.{
+            .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+        },
+        .params = &.{
+            .{ .name = "a", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+            .{ .name = "b", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+        },
+        .return_type = &t_te,
+        .body = .{ .stmts = &.{}, .location = Location.zero },
+    };
+
+    const result = checker.inferTypeArgs(fn_d, &.{ TypeId.int, TypeId.string }, Location.zero);
+    try std.testing.expect(result == null);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "inferTypeArgs: uninferred param" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // fn foo[T, U](x: T) — U can't be inferred from args
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const fn_d = ast.FnDecl{
+        .name = "foo",
+        .generic_params = &.{
+            .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+            .{ .name = "U", .bounds = &.{}, .location = Location.zero },
+        },
+        .params = &.{
+            .{ .name = "x", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+        },
+        .return_type = &t_te,
+        .body = .{ .stmts = &.{}, .location = Location.zero },
+    };
+
+    const result = checker.inferTypeArgs(fn_d, &.{TypeId.int}, Location.zero);
+    try std.testing.expect(result == null);
+    try std.testing.expect(checker.diagnostics.hasErrors());
 }

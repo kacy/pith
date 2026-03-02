@@ -37,6 +37,7 @@ const Location = errors.Location;
 pub const GenericDecl = union(enum) {
     @"struct": ast.StructDecl,
     @"enum": ast.EnumDecl,
+    function: ast.FnDecl,
 };
 
 // ---------------------------------------------------------------
@@ -191,9 +192,11 @@ pub const Checker = struct {
     }
 
     fn registerFnDecl(self: *Checker, fn_d: ast.FnDecl, location: Location) void {
-        // check for generic params — not yet supported
+        // generic functions are stored for later instantiation —
+        // the signature isn't resolved until a call site infers the type args
         if (fn_d.generic_params.len > 0) {
-            self.diagnostics.addError(location, "generic functions are not yet supported") catch {};
+            self.generic_decls.put(fn_d.name, .{ .function = fn_d }) catch return;
+            _ = location;
             return;
         }
 
@@ -663,6 +666,10 @@ pub const Checker = struct {
         return switch (decl) {
             .@"struct" => |s| self.instantiateGenericStruct(s, arg_ids, location),
             .@"enum" => |e| self.instantiateGenericEnum(e, arg_ids, location),
+            .function => {
+                self.diagnostics.addError(location, self.fmt("'{s}' is a generic function, not a type", .{name})) catch {};
+                return .err;
+            },
         };
     }
 
@@ -3715,4 +3722,109 @@ test "nested generic: Option[Option[Int]]" {
     const inner_id = ty.@"enum".variants[0].fields[0];
     const inner_ty = checker.type_table.get(inner_id).?;
     try std.testing.expectEqualStrings("Option[Int]", inner_ty.@"enum".name);
+}
+
+// -- generic function tests --
+
+test "generic function is stored without error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // fn identity[T](x: T) -> T: return x
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const x_expr = ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const ret = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &x_expr } },
+        .location = Location.zero,
+    };
+
+    const fn_decl = ast.FnDecl{
+        .name = "identity",
+        .generic_params = &.{
+            .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+        },
+        .params = &.{
+            .{ .name = "x", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+        },
+        .return_type = &t_te,
+        .body = .{ .stmts = &.{ret}, .location = Location.zero },
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .fn_decl = fn_decl },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    // should be in generic_decls, not in module scope, no errors
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    try std.testing.expect(checker.generic_decls.contains("identity"));
+    try std.testing.expect(checker.module_scope.lookup("identity") == null);
+}
+
+test "non-generic function still registers normally" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const val = ast.Expr{ .kind = .{ .int_lit = "0" }, .location = Location.zero };
+    const ret = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &val } },
+        .location = Location.zero,
+    };
+
+    const fn_decl = ast.FnDecl{
+        .name = "zero",
+        .generic_params = &.{},
+        .params = &.{},
+        .return_type = &int_te,
+        .body = .{ .stmts = &.{ret}, .location = Location.zero },
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .fn_decl = fn_decl },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    try std.testing.expect(checker.module_scope.lookup("zero") != null);
+    try std.testing.expect(!checker.generic_decls.contains("zero"));
+}
+
+test "checkIdent: generic function name returns err silently" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // store a generic function decl directly
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const x_expr = ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const ret = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &x_expr } },
+        .location = Location.zero,
+    };
+
+    checker.generic_decls.put("identity", .{ .function = .{
+        .name = "identity",
+        .generic_params = &.{
+            .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+        },
+        .params = &.{
+            .{ .name = "x", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+        },
+        .return_type = &t_te,
+        .body = .{ .stmts = &.{ret}, .location = Location.zero },
+    } }) catch unreachable;
+
+    // looking up "identity" should return .err but not emit a diagnostic
+    const ident = ast.Expr{ .kind = .{ .ident = "identity" }, .location = Location.zero };
+    const result = checker.checkExpr(&ident, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(!checker.diagnostics.hasErrors());
 }

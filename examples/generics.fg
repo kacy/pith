@@ -24,7 +24,22 @@ fn show_pair(p: Pair[Int, String]) -> String:
 fn show_box(b: Box[Bool]) -> String:
     return "box"
 
+# generic functions — type args are inferred from call-site arguments.
+# no need to write identity[Int](42), just identity(42).
+
+fn identity[T](x: T) -> T:
+    return x
+
+fn second[A, B](x: A, y: B) -> B:
+    return y
+
 fn main():
     p: Pair[Int, String] := Pair(1, "hello")
     b: Box[Float] := Box(3.14)
+
+    # generic function calls — T is inferred
+    n := identity(42)
+    s := identity("hello")
+    result := second(1, "world")
+
     print("generics work")

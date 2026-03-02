@@ -591,8 +591,7 @@ fn printGenericParams(params: []const ast.GenericParam) void {
 }
 
 fn printIndent(level: u32) void {
-    var i: u32 = 0;
-    while (i < level) : (i += 1) {
-        io.write("  ", .{});
-    }
+    const spaces = "                                        "; // 40 spaces = 20 levels
+    const count = @min(@as(usize, level) * 2, spaces.len);
+    io.write("{s}", .{spaces[0..count]});
 }

@@ -1623,10 +1623,11 @@ test "resolveTypeExpr resolves optional types" {
     try std.testing.expectEqual(TypeId.int, ty.optional.inner);
 }
 
-test "resolveTypeExpr reports generics as unsupported" {
+test "undeclared generic type with zero args errors" {
     var checker = try Checker.init(std.testing.allocator, "");
     defer checker.deinit();
 
+    // List is not declared as a generic, so List[] should error
     const generic = ast.TypeExpr{
         .kind = .{ .generic = .{ .name = "List", .args = &.{} } },
         .location = Location.zero,
@@ -1681,10 +1682,11 @@ test "Task[Unknown] produces error" {
     try std.testing.expect(id.isErr());
 }
 
-test "List[Int] still reports generics unsupported" {
+test "undeclared generic List[Int] errors" {
     var checker = try Checker.init(std.testing.allocator, "");
     defer checker.deinit();
 
+    // List is not declared, so List[Int] should error with "unknown generic type"
     const inner = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
     const generic = ast.TypeExpr{
         .kind = .{ .generic = .{ .name = "List", .args = &.{&inner} } },

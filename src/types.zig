@@ -112,6 +112,12 @@ pub const Type = union(enum) {
     tuple: struct {
         elements: []const TypeId,
     },
+    task: struct {
+        inner: TypeId,
+    },
+    channel: struct {
+        inner: TypeId,
+    },
 };
 
 // ---------------------------------------------------------------
@@ -195,6 +201,8 @@ pub const TypeTable = struct {
                         .optional => "optional",
                         .result => "result",
                         .tuple => "tuple",
+                        .task => "Task",
+                        .channel => "Channel",
                     };
                 }
                 return "<unknown>";
@@ -310,4 +318,24 @@ test "multiple user-defined types get sequential ids" {
 
     try std.testing.expectEqual(TypeId.first_user, id1.index());
     try std.testing.expectEqual(TypeId.first_user + 1, id2.index());
+}
+
+test "task type stores inner type" {
+    var table = try TypeTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    const id = try table.addType(.{ .task = .{ .inner = .int } });
+    const ty = table.get(id).?;
+    try std.testing.expectEqual(TypeId.int, ty.task.inner);
+    try std.testing.expectEqualStrings("Task", table.typeName(id));
+}
+
+test "channel type stores inner type" {
+    var table = try TypeTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    const id = try table.addType(.{ .channel = .{ .inner = .string } });
+    const ty = table.get(id).?;
+    try std.testing.expectEqual(TypeId.string, ty.channel.inner);
+    try std.testing.expectEqualStrings("Channel", table.typeName(id));
 }

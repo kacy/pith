@@ -14,6 +14,7 @@ comptime {
     _ = @import("printer.zig");
     _ = @import("io.zig");
     _ = @import("types.zig");
+    _ = @import("checker.zig");
 }
 
 const version = "0.1.0";

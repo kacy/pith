@@ -104,6 +104,10 @@ pub const Checker = struct {
     /// used to distinguish interfaces from structs in the type table
     /// and to validate impl blocks and generic bounds.
     interface_decls: std.StringHashMap(ast.InterfaceDecl),
+    /// tracks which types implement which interfaces. key format is
+    /// "TypeName\x00InterfaceName" (null-separated, arena-allocated).
+    /// presence means the type implements the interface.
+    impl_set: std.StringHashMap(void),
 
     /// create a new checker. registers builtin types and functions.
     pub fn init(allocator: std.mem.Allocator, source: []const u8) !Checker {
@@ -115,6 +119,7 @@ pub const Checker = struct {
             .module_scope = Scope.init(allocator, null),
             .generic_decls = std.StringHashMap(GenericDecl).init(allocator),
             .interface_decls = std.StringHashMap(ast.InterfaceDecl).init(allocator),
+            .impl_set = std.StringHashMap(void).init(allocator),
         };
 
         // register builtins into the module scope
@@ -127,6 +132,7 @@ pub const Checker = struct {
         self.module_scope.deinit();
         self.generic_decls.deinit();
         self.interface_decls.deinit();
+        self.impl_set.deinit();
         self.arena.deinit();
         self.diagnostics.deinit();
         self.type_table.deinit();
@@ -191,7 +197,7 @@ pub const Checker = struct {
             .struct_decl => |s| self.registerStructDecl(s, decl.location),
             .enum_decl => |e| self.registerEnumDecl(e, decl.location),
             .interface_decl => |iface| self.registerInterfaceDecl(iface, decl.location),
-            .impl_decl => {},
+            .impl_decl => |impl_d| self.registerImplDecl(impl_d, decl.location),
             .type_alias => |ta| self.registerTypeAlias(ta, decl.location),
             .binding => {}, // top-level bindings are checked in pass 2
         }
@@ -333,6 +339,68 @@ pub const Checker = struct {
 
         self.type_table.register(iface.name, type_id) catch return;
         self.interface_decls.put(iface.name, iface) catch return;
+    }
+
+    fn registerImplDecl(self: *Checker, impl_d: ast.ImplDecl, location: Location) void {
+        // only handle `impl X for Y:` form — plain `impl X:` doesn't
+        // establish an interface relationship, just adds methods to a type.
+        const iface_type_expr = impl_d.interface orelse return;
+
+        // parser field naming is inverted:
+        //   impl Display for Point:
+        //     target    = Display (the interface)
+        //     interface = Point   (the concrete type)
+        const iface_name = switch (impl_d.target.kind) {
+            .named => |n| n,
+            else => {
+                self.diagnostics.addError(location, "expected an interface name") catch {};
+                return;
+            },
+        };
+        const type_name = switch (iface_type_expr.kind) {
+            .named => |n| n,
+            else => {
+                self.diagnostics.addError(location, "expected a type name") catch {};
+                return;
+            },
+        };
+
+        // verify the interface exists
+        if (!self.interface_decls.contains(iface_name)) {
+            self.diagnostics.addError(location, self.fmt(
+                "unknown interface '{s}'",
+                .{iface_name},
+            )) catch {};
+            return;
+        }
+
+        // verify the concrete type exists
+        if (self.type_table.lookup(type_name) == null) {
+            self.diagnostics.addError(location, self.fmt(
+                "unknown type '{s}'",
+                .{type_name},
+            )) catch {};
+            return;
+        }
+
+        const key = self.buildImplKey(type_name, iface_name);
+        self.impl_set.put(key, {}) catch return;
+    }
+
+    /// build a null-separated key for the impl_set: "TypeName\x00InterfaceName"
+    fn buildImplKey(self: *Checker, type_name: []const u8, iface_name: []const u8) []const u8 {
+        const alloc = self.arena.allocator();
+        const key = alloc.alloc(u8, type_name.len + 1 + iface_name.len) catch return "";
+        @memcpy(key[0..type_name.len], type_name);
+        key[type_name.len] = 0;
+        @memcpy(key[type_name.len + 1 ..], iface_name);
+        return key;
+    }
+
+    /// check whether a type implements a given interface.
+    fn typeImplements(self: *Checker, type_name: []const u8, iface_name: []const u8) bool {
+        const key = self.buildImplKey(type_name, iface_name);
+        return self.impl_set.contains(key);
     }
 
     // ---------------------------------------------------------------
@@ -4534,4 +4602,133 @@ test "registerInterfaceDecl: generic interface errors" {
     // should NOT be registered
     try std.testing.expect(checker.type_table.lookup("Iter") == null);
     try std.testing.expect(!checker.interface_decls.contains("Iter"));
+}
+
+test "registerImplDecl: records impl relationship" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const display_te = ast.TypeExpr{ .kind = .{ .named = "Display" }, .location = Location.zero };
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    // interface Display:
+    const iface_decl = ast.Decl{
+        .kind = .{ .interface_decl = .{
+            .name = "Display",
+            .generic_params = &.{},
+            .methods = &.{},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // struct Point: pub x: Int
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // impl Display for Point:
+    //   fn show() -> String: return "point"
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &display_te,
+            .interface = &point_te,
+            .methods = &.{},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ iface_decl, struct_decl, impl_decl } };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    try std.testing.expect(checker.typeImplements("Point", "Display"));
+    // Point should not "implement" something it doesn't
+    try std.testing.expect(!checker.typeImplements("Point", "Hash"));
+}
+
+test "registerImplDecl: unknown interface errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const unknown_te = ast.TypeExpr{ .kind = .{ .named = "Unknown" }, .location = Location.zero };
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    // struct Point: pub x: Int
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // impl Unknown for Point: — Unknown is not a declared interface
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &unknown_te,
+            .interface = &point_te,
+            .methods = &.{},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ struct_decl, impl_decl } };
+    checker.check(&module);
+
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "registerImplDecl: plain impl is ignored" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    // struct Point: pub x: Int
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // impl Point: — no interface, just methods
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &point_te,
+            .interface = null,
+            .methods = &.{},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ struct_decl, impl_decl } };
+    checker.check(&module);
+
+    // plain impl shouldn't produce errors
+    try std.testing.expect(!checker.diagnostics.hasErrors());
 }

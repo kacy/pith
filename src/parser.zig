@@ -1399,6 +1399,465 @@ pub const Parser = struct {
             .location = Location.span(tok.location, value.location),
         };
     }
+
+    // ---------------------------------------------------------------
+    // declarations
+    // ---------------------------------------------------------------
+
+    /// module = { import_decl NEWLINE } { top_level_decl } EOF
+    pub fn parseModule(self: *Parser) ParseError!ast.Module {
+        var imports: std.ArrayList(ast.ImportDecl) = .empty;
+        var decls: std.ArrayList(ast.Decl) = .empty;
+
+        self.skipNewlines();
+
+        // parse imports (must come first)
+        while (self.check(.kw_import) or self.check(.kw_from)) {
+            const imp = try self.parseImportDecl();
+            try imports.append(self.allocator, imp);
+            self.skipNewlines();
+        }
+
+        // parse top-level declarations
+        while (!self.check(.eof)) {
+            self.skipNewlines();
+            if (self.check(.eof)) break;
+            const decl = try self.parseTopLevelDecl();
+            try decls.append(self.allocator, decl);
+            self.skipNewlines();
+        }
+
+        return .{
+            .imports = try imports.toOwnedSlice(self.allocator),
+            .decls = try decls.toOwnedSlice(self.allocator),
+        };
+    }
+
+    /// import_decl = "import" path ["as" name]
+    ///             | "from" path "import" import_list
+    fn parseImportDecl(self: *Parser) ParseError!ast.ImportDecl {
+        const loc = self.peek().location;
+
+        if (self.check(.kw_from)) {
+            // from path import names
+            _ = self.advance();
+            const path = try self.parseDottedPath();
+            _ = try self.expect(.kw_import);
+
+            var names: std.ArrayList(ast.ImportName) = .empty;
+            const name = try self.parseImportName();
+            try names.append(self.allocator, name);
+            while (self.match(.comma)) {
+                try names.append(self.allocator, try self.parseImportName());
+            }
+
+            return .{
+                .kind = .{ .from = .{
+                    .path = path,
+                    .names = try names.toOwnedSlice(self.allocator),
+                } },
+                .location = loc,
+            };
+        }
+
+        // import path [as alias]
+        _ = self.advance(); // skip import
+        const path = try self.parseDottedPath();
+
+        var alias: ?[]const u8 = null;
+        if (self.match(.kw_as)) {
+            alias = (try self.expect(.identifier)).lexeme;
+        }
+
+        return .{
+            .kind = .{ .simple = .{
+                .path = path,
+                .alias = alias,
+            } },
+            .location = loc,
+        };
+    }
+
+    /// parse a dotted path: ident { "." ident }
+    fn parseDottedPath(self: *Parser) ParseError![]const []const u8 {
+        var parts: std.ArrayList([]const u8) = .empty;
+        const first = try self.expect(.identifier);
+        try parts.append(self.allocator, first.lexeme);
+        while (self.match(.dot)) {
+            const next = try self.expect(.identifier);
+            try parts.append(self.allocator, next.lexeme);
+        }
+        return parts.toOwnedSlice(self.allocator);
+    }
+
+    /// parse a single import name: ident ["as" ident]
+    fn parseImportName(self: *Parser) ParseError!ast.ImportName {
+        const name_tok = try self.expect(.identifier);
+        var alias: ?[]const u8 = null;
+        if (self.match(.kw_as)) {
+            alias = (try self.expect(.identifier)).lexeme;
+        }
+        return .{
+            .name = name_tok.lexeme,
+            .alias = alias,
+            .location = name_tok.location,
+        };
+    }
+
+    /// top_level_decl = ["pub"] (fn_decl | struct_decl | enum_decl | interface_decl | impl_decl | type_alias | binding)
+    fn parseTopLevelDecl(self: *Parser) ParseError!ast.Decl {
+        const loc = self.peek().location;
+        const is_pub = self.match(.kw_pub);
+
+        const kind: ast.DeclKind = switch (self.peek().kind) {
+            .kw_fn => .{ .fn_decl = try self.parseFnDecl() },
+            .kw_struct => .{ .struct_decl = try self.parseStructDecl() },
+            .kw_enum => .{ .enum_decl = try self.parseEnumDecl() },
+            .kw_interface => .{ .interface_decl = try self.parseInterfaceDecl() },
+            .kw_impl => .{ .impl_decl = try self.parseImplDecl() },
+            .kw_type => .{ .type_alias = try self.parseTypeAliasDecl() },
+            // binding at top level
+            .kw_mut, .identifier => blk: {
+                const stmt = try self.parseBinding();
+                break :blk .{ .binding = stmt.kind.binding };
+            },
+            else => {
+                try self.diagnostics.addError(loc, "expected declaration");
+                self.synchronize();
+                return .{
+                    .kind = .{ .binding = .{
+                        .name = "",
+                        .type_expr = null,
+                        .value = try self.create(ast.Expr, .{ .kind = .err, .location = loc }),
+                        .is_mut = false,
+                    } },
+                    .is_pub = is_pub,
+                    .location = loc,
+                };
+            },
+        };
+
+        return .{ .kind = kind, .is_pub = is_pub, .location = loc };
+    }
+
+    /// fn_decl = "fn" name [generic_params] "(" [param_list] ")" ["->" type] ":" block
+    fn parseFnDecl(self: *Parser) ParseError!ast.FnDecl {
+        _ = self.advance(); // skip fn
+        const name_tok = try self.expect(.identifier);
+
+        // optional generic params
+        const generics = if (self.check(.lbracket))
+            try self.parseGenericParams()
+        else
+            &.{};
+
+        _ = try self.expect(.lparen);
+        const params = try self.parseParamList();
+        _ = try self.expect(.rparen);
+
+        var return_type: ?*const ast.TypeExpr = null;
+        if (self.match(.arrow)) {
+            return_type = try self.parseTypeExpr();
+        }
+
+        _ = try self.expect(.colon);
+        const body = try self.parseBlock();
+
+        return .{
+            .name = name_tok.lexeme,
+            .generic_params = generics,
+            .params = params,
+            .return_type = return_type,
+            .body = body,
+        };
+    }
+
+    /// param_list = param { "," param }
+    fn parseParamList(self: *Parser) ParseError![]const ast.Param {
+        var params: std.ArrayList(ast.Param) = .empty;
+        self.skipNewlines();
+        if (self.check(.rparen)) return params.toOwnedSlice(self.allocator);
+
+        try params.append(self.allocator, try self.parseParam());
+        while (self.match(.comma)) {
+            self.skipNewlines();
+            try params.append(self.allocator, try self.parseParam());
+        }
+        self.skipNewlines();
+        return params.toOwnedSlice(self.allocator);
+    }
+
+    /// param = [mut] [ref] name ":" type ["=" expr]
+    fn parseParam(self: *Parser) ParseError!ast.Param {
+        const loc = self.peek().location;
+        const is_mut = self.match(.kw_mut);
+        const is_ref = self.match(.kw_ref);
+        const name_tok = try self.expect(.identifier);
+
+        _ = try self.expect(.colon);
+        const type_expr = try self.parseTypeExpr();
+
+        var default: ?*const ast.Expr = null;
+        if (self.match(.eq)) {
+            default = try self.parseExpression();
+        }
+
+        return .{
+            .name = name_tok.lexeme,
+            .type_expr = type_expr,
+            .default = default,
+            .is_mut = is_mut,
+            .is_ref = is_ref,
+            .location = loc,
+        };
+    }
+
+    /// generic_params = "[" generic_param { "," generic_param } "]"
+    fn parseGenericParams(self: *Parser) ParseError![]const ast.GenericParam {
+        _ = self.advance(); // skip [
+        var params: std.ArrayList(ast.GenericParam) = .empty;
+
+        try params.append(self.allocator, try self.parseGenericParam());
+        while (self.match(.comma)) {
+            try params.append(self.allocator, try self.parseGenericParam());
+        }
+        _ = try self.expect(.rbracket);
+        return params.toOwnedSlice(self.allocator);
+    }
+
+    /// generic_param = name [":" type_bound]
+    /// type_bound = type { "+" type }
+    fn parseGenericParam(self: *Parser) ParseError!ast.GenericParam {
+        const name_tok = try self.expect(.identifier);
+        var bounds: std.ArrayList(*const ast.TypeExpr) = .empty;
+
+        if (self.match(.colon)) {
+            try bounds.append(self.allocator, try self.parseTypeExpr());
+            while (self.match(.plus)) {
+                try bounds.append(self.allocator, try self.parseTypeExpr());
+            }
+        }
+
+        return .{
+            .name = name_tok.lexeme,
+            .bounds = try bounds.toOwnedSlice(self.allocator),
+            .location = name_tok.location,
+        };
+    }
+
+    /// struct_decl = "struct" name [generic_params] ":" NEWLINE INDENT { field NEWLINE } DEDENT
+    fn parseStructDecl(self: *Parser) ParseError!ast.StructDecl {
+        _ = self.advance(); // skip struct
+        const name_tok = try self.expect(.identifier);
+
+        const generics = if (self.check(.lbracket))
+            try self.parseGenericParams()
+        else
+            &.{};
+
+        _ = try self.expect(.colon);
+        _ = try self.expect(.newline);
+        _ = try self.expect(.indent);
+
+        var fields: std.ArrayList(ast.StructField) = .empty;
+        while (!self.check(.dedent) and !self.check(.eof)) {
+            try fields.append(self.allocator, try self.parseStructField());
+            while (self.check(.newline)) _ = self.advance();
+        }
+        _ = try self.expect(.dedent);
+
+        return .{
+            .name = name_tok.lexeme,
+            .generic_params = generics,
+            .fields = try fields.toOwnedSlice(self.allocator),
+        };
+    }
+
+    /// struct_field = [pub] [mut] [weak] name ":" type ["=" expr]
+    fn parseStructField(self: *Parser) ParseError!ast.StructField {
+        const loc = self.peek().location;
+        const is_pub = self.match(.kw_pub);
+        const is_mut = self.match(.kw_mut);
+        const is_weak = self.match(.kw_weak);
+        const name_tok = try self.expect(.identifier);
+        _ = try self.expect(.colon);
+        const type_expr = try self.parseTypeExpr();
+
+        var default: ?*const ast.Expr = null;
+        if (self.match(.eq)) {
+            default = try self.parseExpression();
+        }
+
+        return .{
+            .name = name_tok.lexeme,
+            .type_expr = type_expr,
+            .default = default,
+            .is_pub = is_pub,
+            .is_mut = is_mut,
+            .is_weak = is_weak,
+            .location = loc,
+        };
+    }
+
+    /// enum_decl = "enum" name [generic_params] ":" NEWLINE INDENT { variant NEWLINE } DEDENT
+    fn parseEnumDecl(self: *Parser) ParseError!ast.EnumDecl {
+        _ = self.advance(); // skip enum
+        const name_tok = try self.expect(.identifier);
+
+        const generics = if (self.check(.lbracket))
+            try self.parseGenericParams()
+        else
+            &.{};
+
+        _ = try self.expect(.colon);
+        _ = try self.expect(.newline);
+        _ = try self.expect(.indent);
+
+        var variants: std.ArrayList(ast.EnumVariant) = .empty;
+        while (!self.check(.dedent) and !self.check(.eof)) {
+            try variants.append(self.allocator, try self.parseEnumVariant());
+            while (self.check(.newline)) _ = self.advance();
+        }
+        _ = try self.expect(.dedent);
+
+        return .{
+            .name = name_tok.lexeme,
+            .generic_params = generics,
+            .variants = try variants.toOwnedSlice(self.allocator),
+        };
+    }
+
+    /// enum_variant = name ["(" type_list ")"]
+    fn parseEnumVariant(self: *Parser) ParseError!ast.EnumVariant {
+        const name_tok = try self.expect(.identifier);
+
+        var fields: std.ArrayList(*const ast.TypeExpr) = .empty;
+        if (self.match(.lparen)) {
+            try fields.append(self.allocator, try self.parseTypeExpr());
+            while (self.match(.comma)) {
+                try fields.append(self.allocator, try self.parseTypeExpr());
+            }
+            _ = try self.expect(.rparen);
+        }
+
+        return .{
+            .name = name_tok.lexeme,
+            .fields = try fields.toOwnedSlice(self.allocator),
+            .location = name_tok.location,
+        };
+    }
+
+    /// interface_decl = "interface" name [generic_params] ":" NEWLINE INDENT { fn_sig NEWLINE } DEDENT
+    fn parseInterfaceDecl(self: *Parser) ParseError!ast.InterfaceDecl {
+        _ = self.advance(); // skip interface
+        const name_tok = try self.expect(.identifier);
+
+        const generics = if (self.check(.lbracket))
+            try self.parseGenericParams()
+        else
+            &.{};
+
+        _ = try self.expect(.colon);
+        _ = try self.expect(.newline);
+        _ = try self.expect(.indent);
+
+        var methods: std.ArrayList(ast.FnSig) = .empty;
+        while (!self.check(.dedent) and !self.check(.eof)) {
+            try methods.append(self.allocator, try self.parseFnSig());
+            while (self.check(.newline)) _ = self.advance();
+        }
+        _ = try self.expect(.dedent);
+
+        return .{
+            .name = name_tok.lexeme,
+            .generic_params = generics,
+            .methods = try methods.toOwnedSlice(self.allocator),
+        };
+    }
+
+    /// fn_sig = "fn" name [generic_params] "(" [param_list] ")" ["->" type]
+    fn parseFnSig(self: *Parser) ParseError!ast.FnSig {
+        const loc = self.peek().location;
+        _ = try self.expect(.kw_fn);
+        const name_tok = try self.expect(.identifier);
+
+        const generics = if (self.check(.lbracket))
+            try self.parseGenericParams()
+        else
+            &.{};
+
+        _ = try self.expect(.lparen);
+        const params = try self.parseParamList();
+        _ = try self.expect(.rparen);
+
+        var return_type: ?*const ast.TypeExpr = null;
+        if (self.match(.arrow)) {
+            return_type = try self.parseTypeExpr();
+        }
+
+        return .{
+            .name = name_tok.lexeme,
+            .generic_params = generics,
+            .params = params,
+            .return_type = return_type,
+            .location = loc,
+        };
+    }
+
+    /// impl_decl = "impl" type ["for" type] ":" NEWLINE INDENT { [pub] fn_decl NEWLINE } DEDENT
+    fn parseImplDecl(self: *Parser) ParseError!ast.ImplDecl {
+        _ = self.advance(); // skip impl
+        const target = try self.parseTypeExpr();
+
+        var interface: ?*const ast.TypeExpr = null;
+        if (self.match(.kw_for)) {
+            interface = try self.parseTypeExpr();
+        }
+
+        _ = try self.expect(.colon);
+        _ = try self.expect(.newline);
+        _ = try self.expect(.indent);
+
+        var methods: std.ArrayList(ast.ImplMethod) = .empty;
+        while (!self.check(.dedent) and !self.check(.eof)) {
+            const method_loc = self.peek().location;
+            const method_pub = self.match(.kw_pub);
+            const fn_decl = try self.parseFnDecl();
+            try methods.append(self.allocator, .{
+                .is_pub = method_pub,
+                .decl = fn_decl,
+                .location = method_loc,
+            });
+            while (self.check(.newline)) _ = self.advance();
+        }
+        _ = try self.expect(.dedent);
+
+        return .{
+            .target = target,
+            .interface = interface,
+            .methods = try methods.toOwnedSlice(self.allocator),
+        };
+    }
+
+    /// type_alias = "type" name [generic_params] "=" type_expr
+    fn parseTypeAliasDecl(self: *Parser) ParseError!ast.TypeAlias {
+        _ = self.advance(); // skip type
+        const name_tok = try self.expect(.identifier);
+
+        const generics = if (self.check(.lbracket))
+            try self.parseGenericParams()
+        else
+            &.{};
+
+        _ = try self.expect(.eq);
+        const type_expr = try self.parseTypeExpr();
+
+        return .{
+            .name = name_tok.lexeme,
+            .generic_params = generics,
+            .type_expr = type_expr,
+        };
+    }
 };
 
 // ---------------------------------------------------------------
@@ -1981,4 +2440,178 @@ test "parse block with multiple statements" {
     const stmt = try result.parser.parseStatement();
     try testing.expect(stmt.kind == .if_stmt);
     try testing.expectEqual(@as(usize, 3), stmt.kind.if_stmt.then_block.stmts.len);
+}
+
+// -- declaration tests --
+
+test "parse simple import" {
+    var result = try testParser("import std.io\n");
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    try testing.expectEqual(@as(usize, 1), module.imports.len);
+    const imp = module.imports[0];
+    try testing.expect(imp.kind == .simple);
+    try testing.expectEqual(@as(usize, 2), imp.kind.simple.path.len);
+    try testing.expectEqualStrings("std", imp.kind.simple.path[0]);
+    try testing.expectEqualStrings("io", imp.kind.simple.path[1]);
+}
+
+test "parse import with alias" {
+    var result = try testParser("import std.io as io\n");
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    const imp = module.imports[0];
+    try testing.expect(imp.kind == .simple);
+    try testing.expectEqualStrings("io", imp.kind.simple.alias.?);
+}
+
+test "parse from import" {
+    var result = try testParser("from std.io import read_file, write_file\n");
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    const imp = module.imports[0];
+    try testing.expect(imp.kind == .from);
+    try testing.expectEqual(@as(usize, 2), imp.kind.from.names.len);
+    try testing.expectEqualStrings("read_file", imp.kind.from.names[0].name);
+}
+
+test "parse function declaration" {
+    const source =
+        \\fn add(x: Int, y: Int) -> Int:
+        \\    return x + y
+        \\
+    ;
+    var result = try testParser(source);
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    try testing.expectEqual(@as(usize, 1), module.decls.len);
+    try testing.expect(module.decls[0].kind == .fn_decl);
+    try testing.expectEqualStrings("add", module.decls[0].kind.fn_decl.name);
+    try testing.expectEqual(@as(usize, 2), module.decls[0].kind.fn_decl.params.len);
+    try testing.expect(module.decls[0].kind.fn_decl.return_type != null);
+}
+
+test "parse pub function" {
+    const source =
+        \\pub fn greet():
+        \\    print("hi")
+        \\
+    ;
+    var result = try testParser(source);
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    try testing.expect(module.decls[0].is_pub);
+    try testing.expect(module.decls[0].kind == .fn_decl);
+}
+
+test "parse struct declaration" {
+    const source =
+        \\struct Point:
+        \\    x: Float
+        \\    y: Float
+        \\
+    ;
+    var result = try testParser(source);
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    try testing.expect(module.decls[0].kind == .struct_decl);
+    try testing.expectEqualStrings("Point", module.decls[0].kind.struct_decl.name);
+    try testing.expectEqual(@as(usize, 2), module.decls[0].kind.struct_decl.fields.len);
+}
+
+test "parse enum declaration" {
+    const source =
+        \\enum Color:
+        \\    Red
+        \\    Green
+        \\    Blue
+        \\
+    ;
+    var result = try testParser(source);
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    try testing.expect(module.decls[0].kind == .enum_decl);
+    try testing.expectEqual(@as(usize, 3), module.decls[0].kind.enum_decl.variants.len);
+}
+
+test "parse enum with fields" {
+    const source =
+        \\enum Shape:
+        \\    Circle(Float)
+        \\    Rect(Float, Float)
+        \\
+    ;
+    var result = try testParser(source);
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    const variants = module.decls[0].kind.enum_decl.variants;
+    try testing.expectEqual(@as(usize, 1), variants[0].fields.len);
+    try testing.expectEqual(@as(usize, 2), variants[1].fields.len);
+}
+
+test "parse interface declaration" {
+    const source =
+        \\interface Display:
+        \\    fn to_string(self: ref Self) -> String
+        \\
+    ;
+    var result = try testParser(source);
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    try testing.expect(module.decls[0].kind == .interface_decl);
+    try testing.expectEqual(@as(usize, 1), module.decls[0].kind.interface_decl.methods.len);
+}
+
+test "parse type alias" {
+    var result = try testParser("type StringList = List[String]\n");
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    try testing.expect(module.decls[0].kind == .type_alias);
+    try testing.expectEqualStrings("StringList", module.decls[0].kind.type_alias.name);
+}
+
+test "parse generic function" {
+    const source =
+        \\fn identity[T](x: T) -> T:
+        \\    return x
+        \\
+    ;
+    var result = try testParser(source);
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    const fn_decl = module.decls[0].kind.fn_decl;
+    try testing.expectEqual(@as(usize, 1), fn_decl.generic_params.len);
+    try testing.expectEqualStrings("T", fn_decl.generic_params[0].name);
+}
+
+test "parse complete program" {
+    const source =
+        \\import std.io
+        \\
+        \\fn greet(name: String) -> String:
+        \\    return "hello, {name}!"
+        \\
+        \\fn main():
+        \\    message := greet("world")
+        \\    if message != "":
+        \\        print(message)
+        \\
+    ;
+    var result = try testParser(source);
+    defer result.deinit();
+
+    const module = try result.parser.parseModule();
+    try testing.expectEqual(@as(usize, 1), module.imports.len);
+    try testing.expectEqual(@as(usize, 2), module.decls.len);
 }

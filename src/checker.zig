@@ -387,14 +387,11 @@ pub const Checker = struct {
         self.impl_set.put(key, {}) catch return;
     }
 
-    /// build a null-separated key for the impl_set: "TypeName\x00InterfaceName"
+    /// build a null-separated key for the impl_set: "TypeName\x00InterfaceName".
+    /// uses the arena via fmt — on OOM returns a string that can't match any
+    /// valid key (valid keys always contain a null byte).
     fn buildImplKey(self: *Checker, type_name: []const u8, iface_name: []const u8) []const u8 {
-        const alloc = self.arena.allocator();
-        const key = alloc.alloc(u8, type_name.len + 1 + iface_name.len) catch return "";
-        @memcpy(key[0..type_name.len], type_name);
-        key[type_name.len] = 0;
-        @memcpy(key[type_name.len + 1 ..], iface_name);
-        return key;
+        return self.fmt("{s}\x00{s}", .{ type_name, iface_name });
     }
 
     /// check whether a type implements a given interface.

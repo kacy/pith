@@ -8,6 +8,15 @@
 //
 // uses an error sentinel pattern: when a sub-expression has type
 // TypeId.err, further checks are skipped to prevent cascading noise.
+//
+// error handling convention:
+//   - diagnostics.addError(...) catch {}  — losing a diagnostic under OOM
+//     is acceptable; the compilation will still fail on other errors.
+//   - scope.define(...) catch return  — if a name can't be registered,
+//     bail out of the current declaration. proceeding without it leads to
+//     confusing "undefined variable" cascades.
+//   - type_table.register(...) catch return  — same reasoning. a missing
+//     type makes every later reference to it an error.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -172,7 +181,7 @@ pub const Checker = struct {
             .return_type = return_type,
         } }) catch return;
 
-        self.module_scope.define(fn_d.name, .{ .type_id = fn_type, .is_mut = false }) catch {};
+        self.module_scope.define(fn_d.name, .{ .type_id = fn_type, .is_mut = false }) catch return;
     }
 
     fn registerStructDecl(self: *Checker, s: ast.StructDecl, location: Location) void {
@@ -201,7 +210,7 @@ pub const Checker = struct {
             .fields = owned_fields,
         } }) catch return;
 
-        self.type_table.register(s.name, struct_type) catch {};
+        self.type_table.register(s.name, struct_type) catch return;
     }
 
     fn registerEnumDecl(self: *Checker, e: ast.EnumDecl, location: Location) void {
@@ -236,7 +245,7 @@ pub const Checker = struct {
             .variants = owned_variants,
         } }) catch return;
 
-        self.type_table.register(e.name, enum_type) catch {};
+        self.type_table.register(e.name, enum_type) catch return;
     }
 
     // ---------------------------------------------------------------
@@ -277,7 +286,7 @@ pub const Checker = struct {
             fn_scope.define(param.name, .{
                 .type_id = param_type,
                 .is_mut = param.is_mut,
-            }) catch {};
+            }) catch return;
         }
 
         // check the body
@@ -296,9 +305,9 @@ pub const Checker = struct {
                     .{ self.type_table.typeName(annotated), self.type_table.typeName(value_type) },
                 )) catch {};
             }
-            self.module_scope.define(b.name, .{ .type_id = annotated, .is_mut = b.is_mut }) catch {};
+            self.module_scope.define(b.name, .{ .type_id = annotated, .is_mut = b.is_mut }) catch return;
         } else {
-            self.module_scope.define(b.name, .{ .type_id = value_type, .is_mut = b.is_mut }) catch {};
+            self.module_scope.define(b.name, .{ .type_id = value_type, .is_mut = b.is_mut }) catch return;
         }
     }
 
@@ -363,9 +372,9 @@ pub const Checker = struct {
                     .{ self.type_table.typeName(annotated), self.type_table.typeName(value_type) },
                 )) catch {};
             }
-            scope.define(b.name, .{ .type_id = annotated, .is_mut = b.is_mut }) catch {};
+            scope.define(b.name, .{ .type_id = annotated, .is_mut = b.is_mut }) catch return;
         } else {
-            scope.define(b.name, .{ .type_id = value_type, .is_mut = b.is_mut }) catch {};
+            scope.define(b.name, .{ .type_id = value_type, .is_mut = b.is_mut }) catch return;
         }
     }
 
@@ -463,10 +472,10 @@ pub const Checker = struct {
         // so for now we give it the error sentinel to avoid false positives
         var body_scope = Scope.init(self.allocator, scope);
         defer body_scope.deinit();
-        body_scope.define(f.binding, .{ .type_id = .err, .is_mut = false }) catch {};
+        body_scope.define(f.binding, .{ .type_id = .err, .is_mut = false }) catch return;
 
         if (f.index) |idx| {
-            body_scope.define(idx, .{ .type_id = .int, .is_mut = false }) catch {};
+            body_scope.define(idx, .{ .type_id = .int, .is_mut = false }) catch return;
         }
 
         self.checkBlock(f.body, &body_scope);

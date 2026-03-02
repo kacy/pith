@@ -538,9 +538,9 @@ pub const Lexer = struct {
         // check for hex, binary, octal prefixes
         if (self.current() == '0' and self.pos + 1 < self.source.len) {
             const next = self.source[self.pos + 1];
-            if (next == 'x' or next == 'X') return self.scanHex(start);
-            if (next == 'b' or next == 'B') return self.scanBinary(start);
-            if (next == 'o' or next == 'O') return self.scanOctal(start);
+            if (next == 'x' or next == 'X') return self.scanBaseNumber(start, isHexDigit);
+            if (next == 'b' or next == 'B') return self.scanBaseNumber(start, isBinaryDigit);
+            if (next == 'o' or next == 'O') return self.scanBaseNumber(start, isOctalDigit);
         }
 
         // decimal integer or float
@@ -569,28 +569,13 @@ pub const Lexer = struct {
         return self.makeToken(.int_lit, start, self.pos - start);
     }
 
-    fn scanHex(self: *Lexer, start: u32) Token {
+    /// scan a prefixed integer literal (0x, 0b, 0o).
+    /// skips the two-char prefix, then consumes digits matching the predicate
+    /// (plus underscores for readability).
+    fn scanBaseNumber(self: *Lexer, start: u32, isDigit: *const fn (u8) bool) Token {
         self.advance(); // skip 0
-        self.advance(); // skip x
-        while (self.pos < self.source.len and (isHexDigit(self.current()) or self.current() == '_')) {
-            self.advance();
-        }
-        return self.makeToken(.int_lit, start, self.pos - start);
-    }
-
-    fn scanBinary(self: *Lexer, start: u32) Token {
-        self.advance(); // skip 0
-        self.advance(); // skip b
-        while (self.pos < self.source.len and (self.current() == '0' or self.current() == '1' or self.current() == '_')) {
-            self.advance();
-        }
-        return self.makeToken(.int_lit, start, self.pos - start);
-    }
-
-    fn scanOctal(self: *Lexer, start: u32) Token {
-        self.advance(); // skip 0
-        self.advance(); // skip o
-        while (self.pos < self.source.len and ((self.current() >= '0' and self.current() <= '7') or self.current() == '_')) {
+        self.advance(); // skip prefix char
+        while (self.pos < self.source.len and (isDigit(self.current()) or self.current() == '_')) {
             self.advance();
         }
         return self.makeToken(.int_lit, start, self.pos - start);
@@ -693,6 +678,14 @@ pub const Lexer = struct {
 
     fn isHexDigit(ch: u8) bool {
         return (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
+    }
+
+    fn isBinaryDigit(ch: u8) bool {
+        return ch == '0' or ch == '1';
+    }
+
+    fn isOctalDigit(ch: u8) bool {
+        return ch >= '0' and ch <= '7';
     }
 
     fn skipDigitsAndUnderscores(self: *Lexer) void {

@@ -87,10 +87,7 @@ pub const DiagnosticList = struct {
     }
 
     pub fn hasErrors(self: *const DiagnosticList) bool {
-        for (self.diagnostics.items) |d| {
-            if (d.severity == .@"error") return true;
-        }
-        return false;
+        return self.errorCount() > 0;
     }
 
     pub fn errorCount(self: *const DiagnosticList) usize {

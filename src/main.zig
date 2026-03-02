@@ -3,6 +3,7 @@ const Lexer = @import("lexer.zig").Lexer;
 const Parser = @import("parser.zig").Parser;
 const errors = @import("errors.zig");
 const printer = @import("printer.zig");
+const Checker = @import("checker.zig").Checker;
 const io = @import("io.zig");
 
 // compiler modules — imported here so zig build sees them
@@ -69,6 +70,12 @@ pub fn main() !void {
             return;
         };
         try runParse(allocator, file_path);
+    } else if (std.mem.eql(u8, cmd, "check")) {
+        const file_path = args.next() orelse {
+            io.writeErr("error: forge check requires a file path\n", .{});
+            return;
+        };
+        try runCheck(allocator, file_path);
     } else {
         io.writeErr("error: unknown command '{s}'\n", .{cmd});
         printUsage();
@@ -144,6 +151,54 @@ fn runParse(allocator: std.mem.Allocator, path: []const u8) !void {
     printer.printModule(module);
 }
 
+fn runCheck(allocator: std.mem.Allocator, path: []const u8) !void {
+    const source = readSourceFile(allocator, path) orelse return;
+    defer allocator.free(source);
+
+    // lex
+    var lexer = try Lexer.init(source, allocator);
+    defer lexer.deinit();
+    const tokens = try lexer.tokenize();
+    defer allocator.free(tokens);
+
+    if (lexer.diagnostics.hasErrors()) {
+        renderDiagnostics(&lexer.diagnostics);
+        return;
+    }
+
+    // parse
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(tokens, source, arena.allocator());
+    defer parser.deinit();
+
+    const module = parser.parseModule() catch {
+        io.writeErr("error: parse failed (out of memory)\n", .{});
+        return;
+    };
+
+    if (parser.diagnostics.hasErrors()) {
+        renderDiagnostics(&parser.diagnostics);
+        return;
+    }
+
+    // check
+    var checker = Checker.init(allocator, source) catch {
+        io.writeErr("error: checker init failed (out of memory)\n", .{});
+        return;
+    };
+    defer checker.deinit();
+
+    checker.check(&module);
+
+    if (checker.diagnostics.hasErrors()) {
+        renderDiagnostics(&checker.diagnostics);
+    } else {
+        io.write("ok\n", .{});
+    }
+}
+
 fn printVersion() void {
     io.write("forge {s}\n", .{version});
 }
@@ -155,6 +210,7 @@ fn printUsage() void {
         \\usage: forge <command> [options]
         \\
         \\commands:
+        \\  check <file>   type check a source file
         \\  lex <file>     tokenize a source file
         \\  parse <file>   parse and print AST
         \\  version        print version

@@ -345,6 +345,21 @@ pub const Lexer = struct {
         return self.makeToken(.comment, start, self.pos - start);
     }
 
+    /// advance past string content, skipping escape sequences.
+    /// stops at closing quote, newline, or EOF. if stop_at_brace is true,
+    /// also stops at { (for interpolation boundaries).
+    fn skipStringContent(self: *Lexer, stop_at_brace: bool) void {
+        while (self.pos < self.source.len and self.current() != '"' and self.current() != '\n') {
+            if (stop_at_brace and self.current() == '{') break;
+            if (self.current() == '\\') {
+                self.advance(); // skip backslash
+                if (self.pos < self.source.len) self.advance(); // skip escaped char
+            } else {
+                self.advance();
+            }
+        }
+    }
+
     // string scanning has two paths:
     //   simple:       "hello world" → single STRING_LIT token
     //   interpolated: "hi {name}!"  → STRING_START, INTERPOLATION_EXPR,
@@ -375,14 +390,7 @@ pub const Lexer = struct {
 
         if (!has_interpolation) {
             // simple string — scan to closing quote
-            while (self.pos < self.source.len and self.current() != '"' and self.current() != '\n') {
-                if (self.current() == '\\') {
-                    self.advance(); // skip backslash
-                    if (self.pos < self.source.len) self.advance(); // skip escaped char
-                } else {
-                    self.advance();
-                }
-            }
+            self.skipStringContent(false);
 
             if (self.pos >= self.source.len or self.current() == '\n') {
                 try self.diagnostics.addError(
@@ -397,14 +405,7 @@ pub const Lexer = struct {
         }
 
         // interpolated string — emit string_start for text up to first {
-        while (self.pos < self.source.len and self.current() != '{' and self.current() != '"' and self.current() != '\n') {
-            if (self.current() == '\\') {
-                self.advance();
-                if (self.pos < self.source.len) self.advance();
-            } else {
-                self.advance();
-            }
-        }
+        self.skipStringContent(true);
 
         if (self.pos >= self.source.len or self.current() == '\n') {
             try self.diagnostics.addError(
@@ -487,14 +488,7 @@ pub const Lexer = struct {
 
             // scan text after } — either more text, another {, or closing "
             const mid_start = self.pos;
-            while (self.pos < self.source.len and self.current() != '{' and self.current() != '"' and self.current() != '\n') {
-                if (self.current() == '\\') {
-                    self.advance();
-                    if (self.pos < self.source.len) self.advance();
-                } else {
-                    self.advance();
-                }
-            }
+            self.skipStringContent(true);
 
             if (self.pos >= self.source.len or self.current() == '\n') {
                 try self.diagnostics.addError(

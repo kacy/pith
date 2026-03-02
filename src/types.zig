@@ -86,35 +86,45 @@ pub const Variant = struct {
     fields: []const TypeId,
 };
 
+/// a type in the forge type system. stored in the TypeTable as a flat array.
 pub const Type = union(enum) {
+    /// built-in scalar type (Int, Float, Bool, String, etc.)
     primitive: struct {
         name: []const u8,
     },
+    /// user-defined struct with named, typed fields.
     @"struct": struct {
         name: []const u8,
         fields: []const Field,
     },
+    /// algebraic data type — a set of named variants, each with optional fields.
     @"enum": struct {
         name: []const u8,
         variants: []const Variant,
     },
+    /// callable — parameter types and a return type.
     function: struct {
         param_types: []const TypeId,
         return_type: TypeId,
     },
+    /// T? — a value that may be absent (sugar for Option[T]).
     optional: struct {
         inner: TypeId,
     },
+    /// T! or T!E — a value-or-error (sugar for Result[T, Error]).
     result: struct {
         ok_type: TypeId,
         err_type: TypeId,
     },
+    /// (A, B, C) — fixed-size, heterogeneous collection.
     tuple: struct {
         elements: []const TypeId,
     },
+    /// Task[T] — a spawned concurrent computation that yields T.
     task: struct {
         inner: TypeId,
     },
+    /// Channel[T] — a typed message-passing channel.
     channel: struct {
         inner: TypeId,
     },

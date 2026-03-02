@@ -1438,6 +1438,7 @@ pub const Parser = struct {
     // declarations
     // ---------------------------------------------------------------
 
+    /// parse a complete forge source file into a module AST.
     /// module = { import_decl NEWLINE } { top_level_decl } EOF
     pub fn parseModule(self: *Parser) ParseError!ast.Module {
         var imports: std.ArrayList(ast.ImportDecl) = .empty;

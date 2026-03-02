@@ -85,6 +85,7 @@ pub const Checker = struct {
     arena: std.heap.ArenaAllocator,
     module_scope: Scope,
 
+    /// create a new checker. registers builtin types and functions.
     pub fn init(allocator: std.mem.Allocator, source: []const u8) !Checker {
         var checker = Checker{
             .type_table = try TypeTable.init(allocator),
@@ -534,6 +535,7 @@ pub const Checker = struct {
     // type resolution — AST TypeExpr → TypeId
     // ---------------------------------------------------------------
 
+    /// resolve an AST type expression to a TypeId in the type table.
     pub fn resolveTypeExpr(self: *Checker, type_expr: *const ast.TypeExpr) TypeId {
         return switch (type_expr.kind) {
             .named => |name| self.resolveNamedType(name, type_expr.location),

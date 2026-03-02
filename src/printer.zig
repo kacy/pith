@@ -6,6 +6,7 @@
 const ast = @import("ast.zig");
 const io = @import("io.zig");
 
+/// render a complete module AST as indented text to stdout.
 pub fn printModule(module: ast.Module) void {
     io.write("module\n", .{});
 

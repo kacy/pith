@@ -69,6 +69,7 @@ pub const DiagnosticList = struct {
         self.diagnostics.deinit(self.allocator);
     }
 
+    /// record an error diagnostic at the given source location.
     pub fn addError(self: *DiagnosticList, location: Location, message: []const u8) !void {
         try self.diagnostics.append(self.allocator, .{
             .severity = .@"error",
@@ -77,6 +78,7 @@ pub const DiagnosticList = struct {
         });
     }
 
+    /// record an error diagnostic with a fix suggestion.
     pub fn addErrorWithFix(self: *DiagnosticList, location: Location, message: []const u8, fix: []const u8) !void {
         try self.diagnostics.append(self.allocator, .{
             .severity = .@"error",

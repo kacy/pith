@@ -55,6 +55,7 @@ pub const Decl = struct {
     location: Location,
 };
 
+/// the kind of a top-level declaration.
 pub const DeclKind = union(enum) {
     fn_decl: FnDecl,
     struct_decl: StructDecl,
@@ -162,6 +163,7 @@ pub const Stmt = struct {
     location: Location,
 };
 
+/// the kind of a statement inside a block.
 pub const StmtKind = union(enum) {
     binding: Binding,
     assignment: Assignment,
@@ -239,6 +241,8 @@ pub const Expr = struct {
     location: Location,
 };
 
+/// the kind of an expression node. covers literals, operators, calls,
+/// control flow, collections, and the error recovery sentinel.
 pub const ExprKind = union(enum) {
     // literals
     int_lit: []const u8,
@@ -416,6 +420,7 @@ pub const TypeExpr = struct {
     location: Location,
 };
 
+/// the kind of a type annotation in source (Int, List[T], T?, T!, etc.)
 pub const TypeExprKind = union(enum) {
     named: []const u8,
     generic: GenericType,
@@ -449,6 +454,7 @@ pub const Pattern = struct {
     location: Location,
 };
 
+/// the kind of a match pattern (wildcard, literal, binding, variant, tuple).
 pub const PatternKind = union(enum) {
     wildcard,
     int_lit: []const u8,

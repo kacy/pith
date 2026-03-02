@@ -356,49 +356,115 @@ pub const Checker = struct {
     }
 
     fn registerImplDecl(self: *Checker, impl_d: ast.ImplDecl, location: Location) void {
-        // only handle `impl X for Y:` form — plain `impl X:` doesn't
-        // establish an interface relationship, just adds methods to a type.
-        const iface_type_expr = impl_d.interface orelse return;
+        // extract the concrete type name. parser field naming is inverted:
+        //   impl Display for Point:  →  target=Display, interface=Point
+        //   impl Point:              →  target=Point,   interface=null
+        const concrete_name: []const u8 = if (impl_d.interface) |iface_type_expr| blk: {
+            // `impl X for Y:` — interface form
+            const iface_name = switch (impl_d.target.kind) {
+                .named => |n| n,
+                else => {
+                    self.diagnostics.addError(location, "expected an interface name") catch {};
+                    return;
+                },
+            };
+            const type_name = switch (iface_type_expr.kind) {
+                .named => |n| n,
+                else => {
+                    self.diagnostics.addError(location, "expected a type name") catch {};
+                    return;
+                },
+            };
 
-        // parser field naming is inverted:
-        //   impl Display for Point:
-        //     target    = Display (the interface)
-        //     interface = Point   (the concrete type)
-        const iface_name = switch (impl_d.target.kind) {
-            .named => |n| n,
-            else => {
-                self.diagnostics.addError(location, "expected an interface name") catch {};
+            // verify the interface exists
+            if (!self.interface_decls.contains(iface_name)) {
+                self.diagnostics.addError(location, self.fmt(
+                    "unknown interface '{s}'",
+                    .{iface_name},
+                )) catch {};
                 return;
-            },
-        };
-        const type_name = switch (iface_type_expr.kind) {
-            .named => |n| n,
-            else => {
-                self.diagnostics.addError(location, "expected a type name") catch {};
+            }
+
+            // verify the concrete type exists
+            if (self.type_table.lookup(type_name) == null) {
+                self.diagnostics.addError(location, self.fmt(
+                    "unknown type '{s}'",
+                    .{type_name},
+                )) catch {};
                 return;
-            },
+            }
+
+            // record the interface relationship
+            const key = self.buildImplKey(type_name, iface_name);
+            self.impl_set.put(key, {}) catch return;
+
+            break :blk type_name;
+        } else blk: {
+            // `impl X:` — plain form
+            const type_name = switch (impl_d.target.kind) {
+                .named => |n| n,
+                else => {
+                    self.diagnostics.addError(location, "expected a type name") catch {};
+                    return;
+                },
+            };
+
+            if (self.type_table.lookup(type_name) == null) {
+                self.diagnostics.addError(location, self.fmt(
+                    "unknown type '{s}'",
+                    .{type_name},
+                )) catch {};
+                return;
+            }
+
+            break :blk type_name;
         };
 
-        // verify the interface exists
-        if (!self.interface_decls.contains(iface_name)) {
-            self.diagnostics.addError(location, self.fmt(
-                "unknown interface '{s}'",
-                .{iface_name},
-            )) catch {};
-            return;
+        // register methods from the impl block
+        for (impl_d.methods) |method| {
+            self.registerMethod(concrete_name, method);
+        }
+    }
+
+    /// register a single method from an impl block. resolves param types
+    /// and return type, creates a function type, and stores a MethodEntry.
+    fn registerMethod(self: *Checker, type_name: []const u8, method: ast.ImplMethod) void {
+        const fn_d = method.decl;
+
+        // resolve parameter types
+        var param_ids = std.ArrayList(TypeId).initCapacity(self.allocator, fn_d.params.len) catch return;
+        defer param_ids.deinit(self.allocator);
+
+        for (fn_d.params) |param| {
+            if (param.type_expr) |te| {
+                const id = self.resolveTypeExpr(te);
+                param_ids.append(self.allocator, id) catch return;
+            } else {
+                self.diagnostics.addError(param.location, self.fmt(
+                    "parameter '{s}' needs a type annotation",
+                    .{param.name},
+                )) catch {};
+                param_ids.append(self.allocator, .err) catch return;
+            }
         }
 
-        // verify the concrete type exists
-        if (self.type_table.lookup(type_name) == null) {
-            self.diagnostics.addError(location, self.fmt(
-                "unknown type '{s}'",
-                .{type_name},
-            )) catch {};
-            return;
-        }
+        // resolve return type
+        const return_type = if (fn_d.return_type) |rt| self.resolveTypeExpr(rt) else TypeId.void;
 
-        const key = self.buildImplKey(type_name, iface_name);
-        self.impl_set.put(key, {}) catch return;
+        // create the function type
+        const owned_params = self.arena.allocator().dupe(TypeId, param_ids.items) catch return;
+        const fn_type = self.type_table.addType(.{ .function = .{
+            .param_types = owned_params,
+            .return_type = return_type,
+        } }) catch return;
+
+        // store in method_types
+        const key = self.buildMethodKey(type_name, fn_d.name);
+        self.method_types.put(key, .{
+            .type_id = fn_type,
+            .is_pub = method.is_pub,
+            .decl = fn_d,
+        }) catch return;
     }
 
     /// build a null-separated key for the impl_set: "TypeName\x00InterfaceName".
@@ -4761,7 +4827,7 @@ test "registerImplDecl: unknown interface errors" {
     try std.testing.expect(checker.diagnostics.hasErrors());
 }
 
-test "registerImplDecl: plain impl is ignored" {
+test "registerImplDecl: plain impl with no methods" {
     var checker = try Checker.init(std.testing.allocator, "");
     defer checker.deinit();
 
@@ -4797,6 +4863,170 @@ test "registerImplDecl: plain impl is ignored" {
 
     // plain impl shouldn't produce errors
     try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "registerImplDecl: plain impl registers method" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    // struct Point: pub x: Int
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const ret_expr = ast.Expr{ .kind = .{ .ident = "a" }, .location = Location.zero };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &ret_expr } },
+        .location = Location.zero,
+    };
+
+    // impl Point:
+    //   fn magnitude(a: Int) -> Int: return a
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &point_te,
+            .interface = null,
+            .methods = &.{.{
+                .is_pub = false,
+                .decl = .{
+                    .name = "magnitude",
+                    .generic_params = &.{},
+                    .params = &.{
+                        .{ .name = "a", .type_expr = &int_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = &int_te,
+                    .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                },
+                .location = Location.zero,
+            }},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ struct_decl, impl_decl } };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    // method should be registered
+    const key = checker.buildMethodKey("Point", "magnitude");
+    const entry = checker.method_types.get(key);
+    try std.testing.expect(entry != null);
+    // method should be a function type returning Int
+    const fn_type = checker.type_table.get(entry.?.type_id).?;
+    try std.testing.expectEqual(TypeId.int, fn_type.function.return_type);
+}
+
+test "registerImplDecl: interface impl registers method" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const string_te = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const display_te = ast.TypeExpr{ .kind = .{ .named = "Display" }, .location = Location.zero };
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    const ret_expr = ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &ret_expr } },
+        .location = Location.zero,
+    };
+
+    // interface Display:
+    //   fn show(x: String) -> String
+    const iface_decl = ast.Decl{
+        .kind = .{ .interface_decl = .{
+            .name = "Display",
+            .generic_params = &.{},
+            .methods = &.{},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // struct Point: pub x: Int
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // impl Display for Point:
+    //   fn show(x: String) -> String: return x
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &display_te,
+            .interface = &point_te,
+            .methods = &.{.{
+                .is_pub = false,
+                .decl = .{
+                    .name = "show",
+                    .generic_params = &.{},
+                    .params = &.{
+                        .{ .name = "x", .type_expr = &string_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = &string_te,
+                    .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                },
+                .location = Location.zero,
+            }},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ iface_decl, struct_decl, impl_decl } };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    // impl relationship should still be tracked
+    try std.testing.expect(checker.typeImplements("Point", "Display"));
+    // method should be registered
+    const key = checker.buildMethodKey("Point", "show");
+    const entry = checker.method_types.get(key);
+    try std.testing.expect(entry != null);
+    const fn_type = checker.type_table.get(entry.?.type_id).?;
+    try std.testing.expectEqual(TypeId.string, fn_type.function.return_type);
+}
+
+test "registerImplDecl: plain impl for unknown type errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const unknown_te = ast.TypeExpr{ .kind = .{ .named = "Unknown" }, .location = Location.zero };
+
+    // impl Unknown: — Unknown is not a declared type
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &unknown_te,
+            .interface = null,
+            .methods = &.{},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{impl_decl} };
+    checker.check(&module);
+
+    try std.testing.expect(checker.diagnostics.hasErrors());
 }
 
 // helper: build a module with an interface, a struct, an impl, and a bounded generic function.

@@ -120,7 +120,9 @@ fn renderDiagnostic(d: Diagnostic, source: []const u8, writer: anytype) !void {
         try writer.print("  {d} | {s}\n", .{ d.location.line + 1, source_line });
 
         // underline: spaces for margin + caret for the error location
-        const margin_width = digitCount(d.location.line + 1) + 4; // " N | "
+        // margin format is "  N | " — digits for the line number, then
+        // space-pipe-space (3 chars), plus a leading space (1 char) = +4
+        const margin_width = digitCount(d.location.line + 1) + 4;
         for (0..margin_width + d.location.column) |_| try writer.writeByte(' ');
 
         const underline_len = @max(d.location.length, 1);

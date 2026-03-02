@@ -1218,9 +1218,13 @@ pub const Parser = struct {
     }
 
     /// heuristic: does the current position look like a typed binding?
-    /// checks for: ident ":" type ":="
-    /// scans past tokens that can appear in type expressions until we
-    /// find := (binding) or something that can't be part of a type.
+    /// when we see `ident :`, we need to distinguish:
+    ///   name: Type := value   (binding — colon starts a type annotation)
+    ///   name: other           (could be dict entry, label, etc.)
+    /// we scan forward past tokens that can appear in type expressions
+    /// (identifiers, brackets, parens, commas, ?, !, ->, fn, +) looking
+    /// for := which confirms it's a binding. if we hit a newline, dedent,
+    /// or EOF first, it's not a binding.
     fn looksLikeBinding(self: *const Parser) bool {
         // start from offset 2 (past ident and colon)
         var i: u32 = 2;

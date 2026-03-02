@@ -239,7 +239,14 @@ pub const Lexer = struct {
             return self.makeToken(.eof, self.pos, 0);
         }
 
-        // handle indentation at the start of a line
+        // indentation state machine:
+        // we maintain a stack of indent levels (starts at [0]). on each new
+        // line, measure the leading whitespace and compare to the stack top:
+        //   deeper  → push the level, emit INDENT
+        //   shallower → pop levels until we match, emit one DEDENT per pop
+        //   same    → no token, continue to content
+        // blank lines (whitespace-only or comment-only) are skipped entirely
+        // so they don't generate spurious indent/dedent noise.
         if (self.at_line_start) {
             self.at_line_start = false;
 
@@ -338,6 +345,13 @@ pub const Lexer = struct {
         return self.makeToken(.comment, start, self.pos - start);
     }
 
+    // string scanning has two paths:
+    //   simple:       "hello world" → single STRING_LIT token
+    //   interpolated: "hi {name}!"  → STRING_START, INTERPOLATION_EXPR,
+    //                                  STRING_MID (if more text), ..., STRING_END
+    // we peek ahead first to detect interpolation braces, then commit to
+    // the appropriate path. both paths skip \-escaped characters so that
+    // \" and \{ don't terminate or split the string prematurely.
     fn scanString(self: *Lexer) !Token {
         const start = self.pos;
         self.advance(); // skip opening "

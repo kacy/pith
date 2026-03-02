@@ -651,6 +651,11 @@ pub const Checker = struct {
             .if_expr => |if_e| self.checkIfExpr(if_e, scope),
 
             .call => |call| self.checkCall(call, expr.location, scope),
+
+            // method_call, index, unwrap, try_expr return .err because they
+            // require generics or method resolution that isn't implemented yet.
+            // returning .err (the error sentinel) suppresses cascading
+            // diagnostics — downstream checks skip anything typed as .err.
             .method_call => .err,
             .field_access => |fa| self.checkFieldAccess(fa, expr.location, scope),
             .index => .err,
@@ -887,6 +892,13 @@ pub const Checker = struct {
         return then_type;
     }
 
+    // call dispatch logic:
+    // if the callee is a struct type name, route to struct constructor
+    // checking. however, some struct types (Mutex, WaitGroup, Semaphore)
+    // are registered as zero-field structs but also have constructor
+    // functions in scope — when the arg count doesn't match the field
+    // count and a function binding exists, we fall through to normal
+    // function call checking instead.
     fn checkCall(self: *Checker, call: ast.CallExpr, location: Location, scope: *const Scope) TypeId {
         // check if the callee is a struct type name — route to constructor
         if (call.callee.kind == .ident) {

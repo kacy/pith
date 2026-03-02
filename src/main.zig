@@ -1,3 +1,5 @@
+// main — CLI entry point for the forge compiler
+
 const std = @import("std");
 const Lexer = @import("lexer.zig").Lexer;
 const Parser = @import("parser.zig").Parser;

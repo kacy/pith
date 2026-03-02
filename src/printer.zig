@@ -507,6 +507,10 @@ fn printPattern(pat: ast.Pattern, indent: u32) void {
     }
 }
 
+/// render a type expression as an indented tree (one node per line).
+/// used for top-level type annotations where structure matters.
+/// contrast with printTypeExprInline which renders on a single line
+/// for use inside generic args and enum variant fields.
 fn printTypeExpr(te: *const ast.TypeExpr, indent: u32) void {
     switch (te.kind) {
         .named => |name| {

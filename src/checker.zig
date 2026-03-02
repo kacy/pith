@@ -662,7 +662,7 @@ pub const Checker = struct {
 
         return switch (decl) {
             .@"struct" => |s| self.instantiateGenericStruct(s, arg_ids, location),
-            .@"enum" => .err, // enum instantiation added in next commit
+            .@"enum" => |e| self.instantiateGenericEnum(e, arg_ids, location),
         };
     }
 
@@ -803,6 +803,62 @@ pub const Checker = struct {
         const type_id = self.type_table.addType(.{ .@"struct" = .{
             .name = inst_name,
             .fields = owned_fields,
+        } }) catch return .err;
+
+        self.type_table.register(inst_name, type_id) catch return .err;
+        return type_id;
+    }
+
+    /// instantiate a generic enum with concrete type arguments.
+    /// same pattern as instantiateGenericStruct: validate, dedup, substitute.
+    fn instantiateGenericEnum(
+        self: *Checker,
+        e: ast.EnumDecl,
+        arg_ids: []const TypeId,
+        location: Location,
+    ) TypeId {
+        if (arg_ids.len != e.generic_params.len) {
+            self.diagnostics.addError(location, self.fmt(
+                "'{s}' expects {d} type argument(s), got {d}",
+                .{ e.name, e.generic_params.len, arg_ids.len },
+            )) catch {};
+            return .err;
+        }
+
+        const inst_name = self.buildInstName(e.name, arg_ids);
+        if (self.type_table.lookup(inst_name)) |existing| return existing;
+
+        // build substitution map
+        var subst = std.StringHashMap(TypeId).init(self.allocator);
+        defer subst.deinit();
+        for (e.generic_params, arg_ids) |param, arg_id| {
+            subst.put(param.name, arg_id) catch return .err;
+        }
+
+        // resolve each variant's field types with substitution
+        var variants = std.ArrayList(types.Variant).initCapacity(self.allocator, e.variants.len) catch return .err;
+        defer variants.deinit(self.allocator);
+
+        for (e.variants) |variant| {
+            var field_types = std.ArrayList(TypeId).initCapacity(self.allocator, variant.fields.len) catch return .err;
+            defer field_types.deinit(self.allocator);
+
+            for (variant.fields) |field_te| {
+                const id = self.resolveTypeExprWithSubst(field_te, &subst);
+                field_types.append(self.allocator, id) catch return .err;
+            }
+
+            const owned = self.arena.allocator().dupe(TypeId, field_types.items) catch return .err;
+            variants.append(self.allocator, .{
+                .name = variant.name,
+                .fields = owned,
+            }) catch return .err;
+        }
+
+        const owned_variants = self.arena.allocator().dupe(types.Variant, variants.items) catch return .err;
+        const type_id = self.type_table.addType(.{ .@"enum" = .{
+            .name = inst_name,
+            .variants = owned_variants,
         } }) catch return .err;
 
         self.type_table.register(inst_name, type_id) catch return .err;
@@ -3550,4 +3606,111 @@ test "Task[Int] still works after generic refactor" {
 
     const ty = checker.type_table.get(id).?;
     try std.testing.expectEqual(TypeId.int, ty.task.inner);
+}
+
+// -- generic enum instantiation tests --
+
+test "Option[Int] resolves to concrete enum" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    checker.generic_decls.put("Option", .{ .@"enum" = .{
+        .name = "Option",
+        .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
+        .variants = &.{
+            .{ .name = "Some", .fields = &.{&t_te}, .location = Location.zero },
+            .{ .name = "None", .fields = &.{}, .location = Location.zero },
+        },
+    } }) catch unreachable;
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Option", .args = &.{&int_te} } },
+        .location = Location.zero,
+    };
+
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(!id.isErr());
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+
+    const ty = checker.type_table.get(id).?;
+    const e = ty.@"enum";
+    try std.testing.expectEqualStrings("Option[Int]", e.name);
+    try std.testing.expectEqual(@as(usize, 2), e.variants.len);
+    // Some variant should have field type Int
+    try std.testing.expectEqualStrings("Some", e.variants[0].name);
+    try std.testing.expectEqual(@as(usize, 1), e.variants[0].fields.len);
+    try std.testing.expectEqual(TypeId.int, e.variants[0].fields[0]);
+    // None variant should have no fields
+    try std.testing.expectEqualStrings("None", e.variants[1].name);
+    try std.testing.expectEqual(@as(usize, 0), e.variants[1].fields.len);
+}
+
+test "generic enum deduplication" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    checker.generic_decls.put("Option", .{ .@"enum" = .{
+        .name = "Option",
+        .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
+        .variants = &.{
+            .{ .name = "Some", .fields = &.{&t_te}, .location = Location.zero },
+            .{ .name = "None", .fields = &.{}, .location = Location.zero },
+        },
+    } }) catch unreachable;
+
+    const str_te = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const g1 = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Option", .args = &.{&str_te} } },
+        .location = Location.zero,
+    };
+    const g2 = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Option", .args = &.{&str_te} } },
+        .location = Location.zero,
+    };
+
+    const id1 = checker.resolveTypeExpr(&g1);
+    const id2 = checker.resolveTypeExpr(&g2);
+    try std.testing.expectEqual(id1, id2);
+}
+
+test "nested generic: Option[Option[Int]]" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    checker.generic_decls.put("Option", .{ .@"enum" = .{
+        .name = "Option",
+        .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
+        .variants = &.{
+            .{ .name = "Some", .fields = &.{&t_te}, .location = Location.zero },
+            .{ .name = "None", .fields = &.{}, .location = Location.zero },
+        },
+    } }) catch unreachable;
+
+    // Option[Option[Int]]
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const inner_generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Option", .args = &.{&int_te} } },
+        .location = Location.zero,
+    };
+    const outer_generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Option", .args = &.{&inner_generic} } },
+        .location = Location.zero,
+    };
+
+    const id = checker.resolveTypeExpr(&outer_generic);
+    try std.testing.expect(!id.isErr());
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+
+    // the outer type should be Option[Option[Int]]
+    const ty = checker.type_table.get(id).?;
+    try std.testing.expectEqualStrings("Option[Option[Int]]", ty.@"enum".name);
+
+    // the Some variant's field should be Option[Int]
+    const inner_id = ty.@"enum".variants[0].fields[0];
+    const inner_ty = checker.type_table.get(inner_id).?;
+    try std.testing.expectEqualStrings("Option[Int]", inner_ty.@"enum".name);
 }

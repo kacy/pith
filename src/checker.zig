@@ -114,6 +114,27 @@ pub const Checker = struct {
             .return_type = .void,
         } });
         try self.module_scope.define("print", .{ .type_id = print_type, .is_mut = false });
+
+        // sync primitives — opaque struct types with constructors
+        try self.registerSyncType("Mutex", &.{});
+        try self.registerSyncType("WaitGroup", &.{});
+        try self.registerSyncType("Semaphore", &.{.int});
+    }
+
+    /// register an opaque struct type and a constructor function for it.
+    fn registerSyncType(self: *Checker, name: []const u8, param_types: []const TypeId) !void {
+        const type_id = try self.type_table.addType(.{ .@"struct" = .{
+            .name = name,
+            .fields = &.{},
+        } });
+        try self.type_table.register(name, type_id);
+
+        // constructor: Name(...) -> Name
+        const ctor_type = try self.type_table.addType(.{ .function = .{
+            .param_types = param_types,
+            .return_type = type_id,
+        } });
+        try self.module_scope.define(name, .{ .type_id = ctor_type, .is_mut = false });
     }
 
     // ---------------------------------------------------------------
@@ -873,6 +894,14 @@ pub const Checker = struct {
             if (self.type_table.lookup(name)) |type_id| {
                 if (self.type_table.get(type_id)) |ty| {
                     if (ty == .@"struct") {
+                        // if arg count doesn't match field count but there's
+                        // a function binding in scope (e.g. sync type constructors),
+                        // fall through to function call checking
+                        if (ty.@"struct".fields.len != call.args.len) {
+                            if (scope.lookup(name) != null) {
+                                return self.checkFnCall(call, location, scope);
+                            }
+                        }
                         return self.checkStructConstructor(type_id, call, location, scope);
                     }
                 }
@@ -3047,4 +3076,57 @@ test "await of error-typed expr propagates error" {
 
     const result = checker.checkExpr(&await_e, scope);
     try std.testing.expect(result.isErr());
+}
+
+test "Mutex() returns Mutex type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const callee = ast.Expr{ .kind = .{ .ident = "Mutex" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{ .callee = &callee, .args = &.{} } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, scope);
+    try std.testing.expect(!result.isErr());
+    try std.testing.expectEqualStrings("Mutex", checker.type_table.typeName(result));
+}
+
+test "WaitGroup() returns WaitGroup type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const callee = ast.Expr{ .kind = .{ .ident = "WaitGroup" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{ .callee = &callee, .args = &.{} } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, scope);
+    try std.testing.expect(!result.isErr());
+    try std.testing.expectEqualStrings("WaitGroup", checker.type_table.typeName(result));
+}
+
+test "Semaphore(Int) returns Semaphore type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const callee = ast.Expr{ .kind = .{ .ident = "Semaphore" }, .location = Location.zero };
+    const arg_val = ast.Expr{ .kind = .{ .int_lit = "10" }, .location = Location.zero };
+    const arg = ast.Arg{ .name = null, .value = &arg_val, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{ .callee = &callee, .args = &.{arg} } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, scope);
+    try std.testing.expect(!result.isErr());
+    try std.testing.expectEqualStrings("Semaphore", checker.type_table.typeName(result));
 }

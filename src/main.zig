@@ -13,6 +13,7 @@ comptime {
     _ = @import("intern.zig");
     _ = @import("printer.zig");
     _ = @import("io.zig");
+    _ = @import("types.zig");
 }
 
 const version = "0.1.0";

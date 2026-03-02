@@ -1076,41 +1076,23 @@ pub const Checker = struct {
         };
     }
 
+    /// emit an error if the subject type doesn't match the expected literal type.
+    fn checkLiteralPattern(self: *Checker, subject_type: TypeId, expected: TypeId, type_name: []const u8, location: Location) void {
+        if (!subject_type.isErr() and subject_type != expected) {
+            self.diagnostics.addError(location, self.fmt(
+                "cannot match {s} literal against {s}",
+                .{ type_name, self.type_table.typeName(subject_type) },
+            )) catch {};
+        }
+    }
+
     fn checkPattern(self: *Checker, pattern: ast.Pattern, subject_type: TypeId, scope: *Scope) void {
         switch (pattern.kind) {
             .wildcard => {},
-            .int_lit => {
-                if (!subject_type.isErr() and subject_type != .int) {
-                    self.diagnostics.addError(pattern.location, self.fmt(
-                        "cannot match Int literal against {s}",
-                        .{self.type_table.typeName(subject_type)},
-                    )) catch {};
-                }
-            },
-            .float_lit => {
-                if (!subject_type.isErr() and subject_type != .float) {
-                    self.diagnostics.addError(pattern.location, self.fmt(
-                        "cannot match Float literal against {s}",
-                        .{self.type_table.typeName(subject_type)},
-                    )) catch {};
-                }
-            },
-            .string_lit => {
-                if (!subject_type.isErr() and subject_type != .string) {
-                    self.diagnostics.addError(pattern.location, self.fmt(
-                        "cannot match String literal against {s}",
-                        .{self.type_table.typeName(subject_type)},
-                    )) catch {};
-                }
-            },
-            .bool_lit => {
-                if (!subject_type.isErr() and subject_type != .bool) {
-                    self.diagnostics.addError(pattern.location, self.fmt(
-                        "cannot match Bool literal against {s}",
-                        .{self.type_table.typeName(subject_type)},
-                    )) catch {};
-                }
-            },
+            .int_lit => self.checkLiteralPattern(subject_type, .int, "Int", pattern.location),
+            .float_lit => self.checkLiteralPattern(subject_type, .float, "Float", pattern.location),
+            .string_lit => self.checkLiteralPattern(subject_type, .string, "String", pattern.location),
+            .bool_lit => self.checkLiteralPattern(subject_type, .bool, "Bool", pattern.location),
             .none_lit => {}, // needs Optional types — skip for now
             .binding => |name| {
                 scope.define(name, .{ .type_id = subject_type, .is_mut = false }) catch {};

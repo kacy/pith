@@ -589,7 +589,22 @@ pub const Checker = struct {
     }
 
     fn resolveGenericType(self: *Checker, g: ast.GenericType, location: Location) TypeId {
-        _ = g;
+        // Task[T] and Channel[T] are builtin generic types
+        if (g.args.len == 1) {
+            const is_task = std.mem.eql(u8, g.name, "Task");
+            const is_channel = std.mem.eql(u8, g.name, "Channel");
+
+            if (is_task or is_channel) {
+                const inner = self.resolveTypeExpr(g.args[0]);
+                if (inner.isErr()) return .err;
+
+                if (is_task) {
+                    return self.type_table.addType(.{ .task = .{ .inner = inner } }) catch return .err;
+                }
+                return self.type_table.addType(.{ .channel = .{ .inner = inner } }) catch return .err;
+            }
+        }
+
         self.diagnostics.addError(location, "generics are not yet supported") catch {};
         return .err;
     }
@@ -1328,6 +1343,65 @@ test "resolveTypeExpr reports generics as unsupported" {
 
     const generic = ast.TypeExpr{
         .kind = .{ .generic = .{ .name = "List", .args = &.{} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(id.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "Task[Int] resolves to task type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Task", .args = &.{&inner} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(!id.isErr());
+
+    const ty = checker.type_table.get(id).?;
+    try std.testing.expectEqual(TypeId.int, ty.task.inner);
+}
+
+test "Channel[String] resolves to channel type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Channel", .args = &.{&inner} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(!id.isErr());
+
+    const ty = checker.type_table.get(id).?;
+    try std.testing.expectEqual(TypeId.string, ty.channel.inner);
+}
+
+test "Task[Unknown] produces error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "Unknown" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Task", .args = &.{&inner} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(id.isErr());
+}
+
+test "List[Int] still reports generics unsupported" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "List", .args = &.{&inner} } },
         .location = Location.zero,
     };
     const id = checker.resolveTypeExpr(&generic);

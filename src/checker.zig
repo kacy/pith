@@ -956,6 +956,50 @@ pub const Checker = struct {
         return subst;
     }
 
+    /// instantiate a generic function with concrete type arguments.
+    /// builds a concrete function type by resolving param types and return
+    /// type with the substitution map. deduplicates via buildInstName.
+    fn instantiateGenericFn(
+        self: *Checker,
+        fn_d: ast.FnDecl,
+        subst: *const std.StringHashMap(TypeId),
+        arg_ids: []const TypeId,
+    ) TypeId {
+        // build inst name and check dedup cache
+        const inst_name = self.buildInstName(fn_d.name, arg_ids);
+        if (self.type_table.lookup(inst_name)) |existing| return existing;
+
+        // resolve param types with substitution
+        var param_ids = std.ArrayList(TypeId).initCapacity(self.allocator, fn_d.params.len) catch return .err;
+        defer param_ids.deinit(self.allocator);
+
+        for (fn_d.params) |param| {
+            if (param.type_expr) |te| {
+                const id = self.resolveTypeExprWithSubst(te, subst);
+                param_ids.append(self.allocator, id) catch return .err;
+            } else {
+                param_ids.append(self.allocator, .err) catch return .err;
+            }
+        }
+
+        // resolve return type
+        const return_type = if (fn_d.return_type) |rt|
+            self.resolveTypeExprWithSubst(rt, subst)
+        else
+            TypeId.void;
+
+        // create the concrete function type
+        const owned_params = self.arena.allocator().dupe(TypeId, param_ids.items) catch return .err;
+        const fn_type = self.type_table.addType(.{ .function = .{
+            .param_types = owned_params,
+            .return_type = return_type,
+        } }) catch return .err;
+
+        // register for deduplication
+        self.type_table.register(inst_name, fn_type) catch return .err;
+        return fn_type;
+    }
+
     // ---------------------------------------------------------------
     // expression checking
     // ---------------------------------------------------------------
@@ -4041,4 +4085,101 @@ test "inferTypeArgs: uninferred param" {
     const result = checker.inferTypeArgs(fn_d, &.{TypeId.int}, Location.zero);
     try std.testing.expect(result == null);
     try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+// -- generic function instantiation tests --
+
+test "instantiateGenericFn: concrete function type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // fn identity[T](x: T) -> T
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const fn_d = ast.FnDecl{
+        .name = "identity",
+        .generic_params = &.{
+            .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+        },
+        .params = &.{
+            .{ .name = "x", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+        },
+        .return_type = &t_te,
+        .body = .{ .stmts = &.{}, .location = Location.zero },
+    };
+
+    var subst = std.StringHashMap(TypeId).init(std.testing.allocator);
+    defer subst.deinit();
+    try subst.put("T", TypeId.int);
+
+    const fn_type_id = checker.instantiateGenericFn(fn_d, &subst, &.{TypeId.int});
+    try std.testing.expect(!fn_type_id.isErr());
+
+    const ty = checker.type_table.get(fn_type_id).?;
+    const func = ty.function;
+    try std.testing.expectEqual(@as(usize, 1), func.param_types.len);
+    try std.testing.expectEqual(TypeId.int, func.param_types[0]);
+    try std.testing.expectEqual(TypeId.int, func.return_type);
+}
+
+test "instantiateGenericFn: deduplication" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const fn_d = ast.FnDecl{
+        .name = "identity",
+        .generic_params = &.{
+            .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+        },
+        .params = &.{
+            .{ .name = "x", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+        },
+        .return_type = &t_te,
+        .body = .{ .stmts = &.{}, .location = Location.zero },
+    };
+
+    var subst = std.StringHashMap(TypeId).init(std.testing.allocator);
+    defer subst.deinit();
+    try subst.put("T", TypeId.int);
+
+    const first = checker.instantiateGenericFn(fn_d, &subst, &.{TypeId.int});
+    const second = checker.instantiateGenericFn(fn_d, &subst, &.{TypeId.int});
+    try std.testing.expectEqual(first, second);
+}
+
+test "instantiateGenericFn: multiple type params" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // fn swap[A, B](x: A, y: B) -> B
+    const a_te = ast.TypeExpr{ .kind = .{ .named = "A" }, .location = Location.zero };
+    const b_te = ast.TypeExpr{ .kind = .{ .named = "B" }, .location = Location.zero };
+    const fn_d = ast.FnDecl{
+        .name = "swap",
+        .generic_params = &.{
+            .{ .name = "A", .bounds = &.{}, .location = Location.zero },
+            .{ .name = "B", .bounds = &.{}, .location = Location.zero },
+        },
+        .params = &.{
+            .{ .name = "x", .type_expr = &a_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+            .{ .name = "y", .type_expr = &b_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+        },
+        .return_type = &b_te,
+        .body = .{ .stmts = &.{}, .location = Location.zero },
+    };
+
+    var subst = std.StringHashMap(TypeId).init(std.testing.allocator);
+    defer subst.deinit();
+    try subst.put("A", TypeId.int);
+    try subst.put("B", TypeId.string);
+
+    const fn_type_id = checker.instantiateGenericFn(fn_d, &subst, &.{ TypeId.int, TypeId.string });
+    try std.testing.expect(!fn_type_id.isErr());
+
+    const ty = checker.type_table.get(fn_type_id).?;
+    const func = ty.function;
+    try std.testing.expectEqual(@as(usize, 2), func.param_types.len);
+    try std.testing.expectEqual(TypeId.int, func.param_types[0]);
+    try std.testing.expectEqual(TypeId.string, func.param_types[1]);
+    try std.testing.expectEqual(TypeId.string, func.return_type);
 }

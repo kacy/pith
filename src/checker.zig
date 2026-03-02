@@ -252,16 +252,14 @@ pub const Checker = struct {
         switch (stmt.kind) {
             .expr_stmt => |expr| _ = self.checkExpr(expr, scope),
             .return_stmt => |ret| self.checkReturnStmt(ret, stmt.location, scope),
-            // remaining statement kinds handled in next commit
-            .binding => {},
-            .assignment => {},
-            .if_stmt => {},
-            .for_stmt => {},
-            .while_stmt => {},
-            .match_stmt => {},
-            .fail_stmt => {},
-            .break_stmt => {},
-            .continue_stmt => {},
+            .binding => |b| self.checkBindingStmt(b, scope),
+            .assignment => |a| self.checkAssignment(a, scope),
+            .if_stmt => |if_s| self.checkIfStmt(if_s, scope),
+            .while_stmt => |w| self.checkWhileStmt(w, scope),
+            .for_stmt => |f| self.checkForStmt(f, scope),
+            .fail_stmt => |f| _ = self.checkExpr(f.value, scope),
+            .match_stmt => |m| _ = self.checkExpr(m.subject, scope),
+            .break_stmt, .continue_stmt => {},
         }
     }
 
@@ -288,6 +286,126 @@ pub const Checker = struct {
                 )) catch {};
             }
         }
+    }
+
+    fn checkBindingStmt(self: *Checker, b: ast.Binding, scope: *Scope) void {
+        const value_type = self.checkExpr(b.value, scope);
+
+        if (b.type_expr) |te| {
+            const annotated = self.resolveTypeExpr(te);
+            if (!annotated.isErr() and !value_type.isErr() and annotated != value_type) {
+                self.diagnostics.addError(te.location, self.fmt(
+                    "type mismatch: declared {s}, got {s}",
+                    .{ self.type_table.typeName(annotated), self.type_table.typeName(value_type) },
+                )) catch {};
+            }
+            scope.define(b.name, .{ .type_id = annotated, .is_mut = b.is_mut }) catch {};
+        } else {
+            scope.define(b.name, .{ .type_id = value_type, .is_mut = b.is_mut }) catch {};
+        }
+    }
+
+    fn checkAssignment(self: *Checker, a: ast.Assignment, scope: *Scope) void {
+        const target_type = self.checkExpr(a.target, scope);
+        const value_type = self.checkExpr(a.value, scope);
+
+        if (target_type.isErr() or value_type.isErr()) return;
+
+        // check mutability — the target must be a mutable binding
+        if (a.target.kind == .ident) {
+            const name = a.target.kind.ident;
+            if (scope.lookup(name)) |binding| {
+                if (!binding.is_mut) {
+                    self.diagnostics.addError(a.target.location, self.fmt(
+                        "cannot assign to immutable variable '{s}'",
+                        .{name},
+                    )) catch {};
+                    return;
+                }
+            }
+        }
+
+        // for compound assignments (+=, -=, etc.) both sides must be numeric
+        if (a.op != .assign) {
+            if (!target_type.isNumeric()) {
+                self.diagnostics.addError(a.target.location, self.fmt(
+                    "expected numeric type for compound assignment, got {s}",
+                    .{self.type_table.typeName(target_type)},
+                )) catch {};
+                return;
+            }
+        }
+
+        if (target_type != value_type) {
+            self.diagnostics.addError(a.value.*.location, self.fmt(
+                "type mismatch: expected {s}, got {s}",
+                .{ self.type_table.typeName(target_type), self.type_table.typeName(value_type) },
+            )) catch {};
+        }
+    }
+
+    fn checkIfStmt(self: *Checker, if_s: ast.IfStmt, scope: *Scope) void {
+        const cond = self.checkExpr(if_s.condition, scope);
+        if (!cond.isErr() and cond != .bool) {
+            self.diagnostics.addError(if_s.condition.location, self.fmt(
+                "expected Bool in condition, got {s}",
+                .{self.type_table.typeName(cond)},
+            )) catch {};
+        }
+
+        var then_scope = Scope.init(self.allocator, scope);
+        defer then_scope.deinit();
+        self.checkBlock(if_s.then_block, &then_scope);
+
+        for (if_s.elif_branches) |branch| {
+            const elif_cond = self.checkExpr(branch.condition, scope);
+            if (!elif_cond.isErr() and elif_cond != .bool) {
+                self.diagnostics.addError(branch.condition.location, self.fmt(
+                    "expected Bool in condition, got {s}",
+                    .{self.type_table.typeName(elif_cond)},
+                )) catch {};
+            }
+            var elif_scope = Scope.init(self.allocator, scope);
+            defer elif_scope.deinit();
+            self.checkBlock(branch.block, &elif_scope);
+        }
+
+        if (if_s.else_block) |else_block| {
+            var else_scope = Scope.init(self.allocator, scope);
+            defer else_scope.deinit();
+            self.checkBlock(else_block, &else_scope);
+        }
+    }
+
+    fn checkWhileStmt(self: *Checker, w: ast.WhileStmt, scope: *Scope) void {
+        const cond = self.checkExpr(w.condition, scope);
+        if (!cond.isErr() and cond != .bool) {
+            self.diagnostics.addError(w.condition.location, self.fmt(
+                "expected Bool in condition, got {s}",
+                .{self.type_table.typeName(cond)},
+            )) catch {};
+        }
+
+        var body_scope = Scope.init(self.allocator, scope);
+        defer body_scope.deinit();
+        self.checkBlock(w.body, &body_scope);
+    }
+
+    fn checkForStmt(self: *Checker, f: ast.ForStmt, scope: *Scope) void {
+        // check the iterable expression
+        _ = self.checkExpr(f.iterable, scope);
+
+        // the loop variable type needs generics to determine element type,
+        // so for now we give it the error sentinel to avoid false positives
+        var body_scope = Scope.init(self.allocator, scope);
+        defer body_scope.deinit();
+        body_scope.define(f.binding, .{ .type_id = .err, .is_mut = false }) catch {};
+
+        if (f.index) |idx| {
+            body_scope.define(idx, .{ .type_id = .int, .is_mut = false }) catch {};
+        }
+
+        self.checkBlock(f.body, &body_scope);
     }
 
     // ---------------------------------------------------------------
@@ -1122,4 +1240,144 @@ test "checkFnDecl: return type mismatch" {
 
     checker.check(&module);
     try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+// -- statement checking tests --
+
+test "checkStmt: binding with type annotation" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    var scope = Scope.init(std.testing.allocator, &checker.module_scope);
+    defer scope.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const val = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const stmt = ast.Stmt{
+        .kind = .{ .binding = .{ .name = "x", .type_expr = &int_te, .value = &val, .is_mut = false } },
+        .location = Location.zero,
+    };
+
+    checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    try std.testing.expectEqual(TypeId.int, scope.lookup("x").?.type_id);
+}
+
+test "checkStmt: binding type mismatch" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    var scope = Scope.init(std.testing.allocator, &checker.module_scope);
+    defer scope.deinit();
+
+    // x: String := 42
+    const str_te = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const val = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const stmt = ast.Stmt{
+        .kind = .{ .binding = .{ .name = "x", .type_expr = &str_te, .value = &val, .is_mut = false } },
+        .location = Location.zero,
+    };
+
+    checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "checkStmt: binding infers type from value" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    var scope = Scope.init(std.testing.allocator, &checker.module_scope);
+    defer scope.deinit();
+
+    // x := "hello"
+    const val = ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const stmt = ast.Stmt{
+        .kind = .{ .binding = .{ .name = "x", .type_expr = null, .value = &val, .is_mut = false } },
+        .location = Location.zero,
+    };
+
+    checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    try std.testing.expectEqual(TypeId.string, scope.lookup("x").?.type_id);
+}
+
+test "checkStmt: assignment to mutable variable" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    var scope = Scope.init(std.testing.allocator, &checker.module_scope);
+    defer scope.deinit();
+    try scope.define("x", .{ .type_id = .int, .is_mut = true });
+
+    const target = ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const val = ast.Expr{ .kind = .{ .int_lit = "10" }, .location = Location.zero };
+    const stmt = ast.Stmt{
+        .kind = .{ .assignment = .{ .target = &target, .op = .assign, .value = &val } },
+        .location = Location.zero,
+    };
+
+    checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "checkStmt: assignment to immutable variable" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    var scope = Scope.init(std.testing.allocator, &checker.module_scope);
+    defer scope.deinit();
+    try scope.define("x", .{ .type_id = .int, .is_mut = false });
+
+    const target = ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const val = ast.Expr{ .kind = .{ .int_lit = "10" }, .location = Location.zero };
+    const stmt = ast.Stmt{
+        .kind = .{ .assignment = .{ .target = &target, .op = .assign, .value = &val } },
+        .location = Location.zero,
+    };
+
+    checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "checkStmt: if statement checks condition" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    var scope = Scope.init(std.testing.allocator, &checker.module_scope);
+    defer scope.deinit();
+
+    // if 42: (should fail — condition is Int, not Bool)
+    const cond = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const stmt = ast.Stmt{
+        .kind = .{ .if_stmt = .{
+            .condition = &cond,
+            .then_block = .{ .stmts = &.{}, .location = Location.zero },
+            .elif_branches = &.{},
+            .else_block = null,
+        } },
+        .location = Location.zero,
+    };
+
+    checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "checkStmt: while statement checks condition" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    var scope = Scope.init(std.testing.allocator, &checker.module_scope);
+    defer scope.deinit();
+
+    const cond = ast.Expr{ .kind = .{ .bool_lit = true }, .location = Location.zero };
+    const stmt = ast.Stmt{
+        .kind = .{ .while_stmt = .{
+            .condition = &cond,
+            .body = .{ .stmts = &.{}, .location = Location.zero },
+        } },
+        .location = Location.zero,
+    };
+
+    checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
 }

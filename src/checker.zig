@@ -146,7 +146,7 @@ pub const Checker = struct {
             .enum_decl => |e| self.registerEnumDecl(e, decl.location),
             .interface_decl => {},
             .impl_decl => {},
-            .type_alias => {},
+            .type_alias => |ta| self.registerTypeAlias(ta, decl.location),
             .binding => {}, // top-level bindings are checked in pass 2
         }
     }
@@ -250,6 +250,19 @@ pub const Checker = struct {
         } }) catch return;
 
         self.type_table.register(e.name, enum_type) catch return;
+    }
+
+    fn registerTypeAlias(self: *Checker, ta: ast.TypeAlias, location: Location) void {
+        if (ta.generic_params.len > 0) {
+            self.diagnostics.addError(location, "generic type aliases are not yet supported") catch {};
+            return;
+        }
+
+        const target = self.resolveTypeExpr(ta.type_expr);
+        if (target.isErr()) return;
+
+        // transparent alias — the name maps to the same TypeId as the target
+        self.type_table.register(ta.name, target) catch return;
     }
 
     // ---------------------------------------------------------------
@@ -1743,6 +1756,90 @@ test "break at top level is an error" {
     const stmt = ast.Stmt{ .kind = .break_stmt, .location = Location.zero };
     checker.checkStmt(&stmt, &scope);
     try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+// -- type alias tests --
+
+test "registerTypeAlias: alias of builtin type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const alias_decl = ast.Decl{
+        .kind = .{ .type_alias = .{
+            .name = "Meters",
+            .generic_params = &.{},
+            .type_expr = &int_te,
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{alias_decl} };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    // Meters should resolve to the same TypeId as Int
+    try std.testing.expectEqual(TypeId.int, checker.type_table.lookup("Meters").?);
+}
+
+test "registerTypeAlias: alias of struct type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+    const alias_decl = ast.Decl{
+        .kind = .{ .type_alias = .{
+            .name = "P",
+            .generic_params = &.{},
+            .type_expr = &point_te,
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ struct_decl, alias_decl } };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+    const point_id = checker.type_table.lookup("Point").?;
+    const p_id = checker.type_table.lookup("P").?;
+    try std.testing.expectEqual(point_id, p_id);
+}
+
+test "registerTypeAlias: alias of unknown type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const bad_te = ast.TypeExpr{ .kind = .{ .named = "Nonexistent" }, .location = Location.zero };
+    const alias_decl = ast.Decl{
+        .kind = .{ .type_alias = .{
+            .name = "Bad",
+            .generic_params = &.{},
+            .type_expr = &bad_te,
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{alias_decl} };
+    checker.check(&module);
+
+    try std.testing.expect(checker.diagnostics.hasErrors());
+    try std.testing.expect(checker.type_table.lookup("Bad") == null);
 }
 
 // -- tuple literal tests --

@@ -1258,22 +1258,22 @@ pub const Checker = struct {
     }
 
     // call dispatch logic:
-    // if the callee is a struct type name, route to struct constructor
-    // checking. however, some struct types (Mutex, WaitGroup, Semaphore)
-    // are registered as zero-field structs but also have constructor
-    // functions in scope — when the arg count doesn't match the field
-    // count and a function binding exists, we fall through to normal
-    // function call checking instead.
+    // 1. if the callee is a struct type name, route to struct constructor
+    // 2. if the callee is a generic function name, route to generic fn call
+    // 3. otherwise fall through to normal function call checking
+    //
+    // some struct types (Mutex, WaitGroup, Semaphore) are registered as
+    // zero-field structs but also have constructor functions in scope —
+    // when the arg count doesn't match the field count and a function
+    // binding exists, we fall through to normal function call checking.
     fn checkCall(self: *Checker, call: ast.CallExpr, location: Location, scope: *const Scope) TypeId {
-        // check if the callee is a struct type name — route to constructor
         if (call.callee.kind == .ident) {
             const name = call.callee.kind.ident;
+
+            // check struct constructor first
             if (self.type_table.lookup(name)) |type_id| {
                 if (self.type_table.get(type_id)) |ty| {
                     if (ty == .@"struct") {
-                        // if arg count doesn't match field count but there's
-                        // a function binding in scope (e.g. sync type constructors),
-                        // fall through to function call checking
                         if (ty.@"struct".fields.len != call.args.len) {
                             if (scope.lookup(name) != null) {
                                 return self.checkFnCall(call, location, scope);
@@ -1283,9 +1283,84 @@ pub const Checker = struct {
                     }
                 }
             }
+
+            // check generic function call
+            if (self.generic_decls.get(name)) |decl| {
+                if (decl == .function) {
+                    return self.checkGenericFnCall(decl.function, call, location, scope);
+                }
+            }
         }
 
         return self.checkFnCall(call, location, scope);
+    }
+
+    /// check a call to a generic function. evaluates argument types,
+    /// infers type arguments, instantiates the concrete function type,
+    /// and validates the argument types against the concrete signature.
+    fn checkGenericFnCall(
+        self: *Checker,
+        fn_d: ast.FnDecl,
+        call: ast.CallExpr,
+        location: Location,
+        scope: *const Scope,
+    ) TypeId {
+        // check argument count
+        if (call.args.len != fn_d.params.len) {
+            self.diagnostics.addError(location, self.fmt(
+                "'{s}' expects {d} argument(s), got {d}",
+                .{ fn_d.name, fn_d.params.len, call.args.len },
+            )) catch {};
+            return .err;
+        }
+
+        // evaluate all arg types upfront
+        var arg_types = std.ArrayList(TypeId).initCapacity(self.allocator, call.args.len) catch return .err;
+        defer arg_types.deinit(self.allocator);
+
+        for (call.args) |arg| {
+            const t = self.checkExpr(arg.value, scope);
+            arg_types.append(self.allocator, t) catch return .err;
+        }
+
+        // bail if any arg had an error
+        for (arg_types.items) |t| {
+            if (t.isErr()) return .err;
+        }
+
+        // infer type arguments from the arg types
+        var subst = self.inferTypeArgs(fn_d, arg_types.items, location) orelse return .err;
+        defer subst.deinit();
+
+        // collect ordered arg_ids for buildInstName (same order as generic_params)
+        var ordered_ids = std.ArrayList(TypeId).initCapacity(self.allocator, fn_d.generic_params.len) catch return .err;
+        defer ordered_ids.deinit(self.allocator);
+
+        for (fn_d.generic_params) |gp| {
+            ordered_ids.append(self.allocator, subst.get(gp.name).?) catch return .err;
+        }
+
+        // instantiate the concrete function type
+        const fn_type_id = self.instantiateGenericFn(fn_d, &subst, ordered_ids.items);
+        if (fn_type_id.isErr()) return .err;
+
+        // validate arg types against the concrete signature
+        const ty = self.type_table.get(fn_type_id) orelse return .err;
+        const func = switch (ty) {
+            .function => |f| f,
+            else => return .err,
+        };
+
+        for (call.args, func.param_types, arg_types.items) |arg, expected, actual| {
+            if (!actual.isErr() and !expected.isErr() and actual != expected) {
+                self.diagnostics.addError(arg.location, self.fmt(
+                    "expected {s}, got {s}",
+                    .{ self.type_table.typeName(expected), self.type_table.typeName(actual) },
+                )) catch {};
+            }
+        }
+
+        return func.return_type;
     }
 
     fn checkFnCall(self: *Checker, call: ast.CallExpr, location: Location, scope: *const Scope) TypeId {
@@ -4182,4 +4257,209 @@ test "instantiateGenericFn: multiple type params" {
     try std.testing.expectEqual(TypeId.int, func.param_types[0]);
     try std.testing.expectEqual(TypeId.string, func.param_types[1]);
     try std.testing.expectEqual(TypeId.string, func.return_type);
+}
+
+// -- generic function call (end-to-end) tests --
+
+fn makeGenericIdentityModule() ast.Module {
+    const t_te = &ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const x_expr = &ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const ret = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = x_expr } },
+        .location = Location.zero,
+    };
+
+    return .{
+        .imports = &.{},
+        .decls = &.{ast.Decl{
+            .kind = .{ .fn_decl = .{
+                .name = "identity",
+                .generic_params = &.{
+                    .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+                },
+                .params = &.{
+                    .{ .name = "x", .type_expr = t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                },
+                .return_type = t_te,
+                .body = .{ .stmts = &.{ret}, .location = Location.zero },
+            } },
+            .is_pub = false,
+            .location = Location.zero,
+        }},
+    };
+}
+
+test "generic function call: identity(42) returns Int" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const module = makeGenericIdentityModule();
+    checker.check(&module);
+
+    const callee = ast.Expr{ .kind = .{ .ident = "identity" }, .location = Location.zero };
+    const arg_val = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{.{ .name = null, .value = &arg_val, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, &checker.module_scope);
+    try std.testing.expectEqual(TypeId.int, result);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "generic function call: identity(\"hello\") returns String" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const module = makeGenericIdentityModule();
+    checker.check(&module);
+
+    const callee = ast.Expr{ .kind = .{ .ident = "identity" }, .location = Location.zero };
+    const arg_val = ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{.{ .name = null, .value = &arg_val, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, &checker.module_scope);
+    try std.testing.expectEqual(TypeId.string, result);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "generic function call: wrong arg count" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const module = makeGenericIdentityModule();
+    checker.check(&module);
+
+    // identity(1, 2) — too many args
+    const callee = ast.Expr{ .kind = .{ .ident = "identity" }, .location = Location.zero };
+    const arg1 = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const arg2 = ast.Expr{ .kind = .{ .int_lit = "2" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{
+                .{ .name = null, .value = &arg1, .location = Location.zero },
+                .{ .name = null, .value = &arg2, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "generic function call: conflicting type params" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // fn eq[T](a: T, b: T) -> T: return a
+    const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const a_expr = ast.Expr{ .kind = .{ .ident = "a" }, .location = Location.zero };
+    const ret = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &a_expr } },
+        .location = Location.zero,
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .fn_decl = .{
+            .name = "eq",
+            .generic_params = &.{
+                .{ .name = "T", .bounds = &.{}, .location = Location.zero },
+            },
+            .params = &.{
+                .{ .name = "a", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                .{ .name = "b", .type_expr = &t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+            },
+            .return_type = &t_te,
+            .body = .{ .stmts = &.{ret}, .location = Location.zero },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    // eq(42, "hello") — T can't be both Int and String
+    const callee = ast.Expr{ .kind = .{ .ident = "eq" }, .location = Location.zero };
+    const arg1 = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const arg2 = ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{
+                .{ .name = null, .value = &arg1, .location = Location.zero },
+                .{ .name = null, .value = &arg2, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "generic function call: two type params" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // fn second[A, B](x: A, y: B) -> B: return y
+    const a_te = ast.TypeExpr{ .kind = .{ .named = "A" }, .location = Location.zero };
+    const b_te = ast.TypeExpr{ .kind = .{ .named = "B" }, .location = Location.zero };
+    const y_expr = ast.Expr{ .kind = .{ .ident = "y" }, .location = Location.zero };
+    const ret = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &y_expr } },
+        .location = Location.zero,
+    };
+
+    const decl = ast.Decl{
+        .kind = .{ .fn_decl = .{
+            .name = "second",
+            .generic_params = &.{
+                .{ .name = "A", .bounds = &.{}, .location = Location.zero },
+                .{ .name = "B", .bounds = &.{}, .location = Location.zero },
+            },
+            .params = &.{
+                .{ .name = "x", .type_expr = &a_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                .{ .name = "y", .type_expr = &b_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+            },
+            .return_type = &b_te,
+            .body = .{ .stmts = &.{ret}, .location = Location.zero },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+    const module = ast.Module{ .imports = &.{}, .decls = &.{decl} };
+    checker.check(&module);
+
+    // second(42, "hello") should return String
+    const callee = ast.Expr{ .kind = .{ .ident = "second" }, .location = Location.zero };
+    const arg1 = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const arg2 = ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{
+                .{ .name = null, .value = &arg1, .location = Location.zero },
+                .{ .name = null, .value = &arg2, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, &checker.module_scope);
+    try std.testing.expectEqual(TypeId.string, result);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
 }

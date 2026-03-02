@@ -1387,6 +1387,47 @@ pub const Checker = struct {
         return self.checkFnCall(call, location, scope);
     }
 
+    /// verify that each generic parameter's inferred type satisfies its
+    /// interface bounds. emits a diagnostic for each unsatisfied bound.
+    /// returns false if any bound check fails.
+    fn checkBounds(
+        self: *Checker,
+        generic_params: []const ast.GenericParam,
+        subst: *const std.StringHashMap(TypeId),
+        location: Location,
+    ) bool {
+        var ok = true;
+        for (generic_params) |gp| {
+            const inferred_id = subst.get(gp.name) orelse continue;
+            const type_name = self.type_table.typeName(inferred_id);
+
+            for (gp.bounds) |bound_te| {
+                const iface_name = switch (bound_te.kind) {
+                    .named => |n| n,
+                    else => continue,
+                };
+
+                if (!self.interface_decls.contains(iface_name)) {
+                    self.diagnostics.addError(location, self.fmt(
+                        "unknown interface '{s}' in bound for '{s}'",
+                        .{ iface_name, gp.name },
+                    )) catch {};
+                    ok = false;
+                    continue;
+                }
+
+                if (!self.typeImplements(type_name, iface_name)) {
+                    self.diagnostics.addError(location, self.fmt(
+                        "type '{s}' does not implement interface '{s}'",
+                        .{ type_name, iface_name },
+                    )) catch {};
+                    ok = false;
+                }
+            }
+        }
+        return ok;
+    }
+
     /// check a call to a generic function. evaluates argument types,
     /// infers type arguments, instantiates the concrete function type,
     /// and validates the argument types against the concrete signature.
@@ -1423,6 +1464,9 @@ pub const Checker = struct {
         // infer type arguments from the arg types
         var subst = self.inferTypeArgs(fn_d, arg_types.items, location) orelse return .err;
         defer subst.deinit();
+
+        // verify inferred types satisfy interface bounds
+        if (!self.checkBounds(fn_d.generic_params, &subst, location)) return .err;
 
         // collect ordered arg_ids for buildInstName (same order as generic_params)
         var ordered_ids = std.ArrayList(TypeId).initCapacity(self.allocator, fn_d.generic_params.len) catch return .err;
@@ -4731,4 +4775,299 @@ test "registerImplDecl: plain impl is ignored" {
 
     // plain impl shouldn't produce errors
     try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+// helper: build a module with an interface, a struct, an impl, and a bounded generic function.
+// interface Display:
+//   fn show(self) -> String
+// struct Point: pub x: Int
+// impl Display for Point:
+//   (methods omitted — we only track the relationship)
+// fn show[T: Display](x: T) -> String: return "shown"
+fn makeBoundedGenericModule() ast.Module {
+    const int_te = &ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const string_te = &ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const t_te = &ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const display_te = &ast.TypeExpr{ .kind = .{ .named = "Display" }, .location = Location.zero };
+    const point_te = &ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    const ret_expr = &ast.Expr{ .kind = .{ .string_lit = "shown" }, .location = Location.zero };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = ret_expr } },
+        .location = Location.zero,
+    };
+
+    return .{
+        .imports = &.{},
+        .decls = &.{
+            // interface Display:
+            ast.Decl{
+                .kind = .{ .interface_decl = .{
+                    .name = "Display",
+                    .generic_params = &.{},
+                    .methods = &.{},
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+            // struct Point: pub x: Int
+            ast.Decl{
+                .kind = .{ .struct_decl = .{
+                    .name = "Point",
+                    .generic_params = &.{},
+                    .fields = &.{
+                        .{ .name = "x", .type_expr = int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+                    },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+            // impl Display for Point:
+            ast.Decl{
+                .kind = .{ .impl_decl = .{
+                    .target = display_te,
+                    .interface = point_te,
+                    .methods = &.{},
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+            // fn show[T: Display](x: T) -> String: return "shown"
+            ast.Decl{
+                .kind = .{ .fn_decl = .{
+                    .name = "show",
+                    .generic_params = &.{
+                        .{ .name = "T", .bounds = &.{display_te}, .location = Location.zero },
+                    },
+                    .params = &.{
+                        .{ .name = "x", .type_expr = t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = string_te,
+                    .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+        },
+    };
+}
+
+test "generic fn call: bound satisfied" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const module = makeBoundedGenericModule();
+    checker.check(&module);
+
+    // show(Point(1)) — Point implements Display, so this should work
+    const callee = ast.Expr{ .kind = .{ .ident = "show" }, .location = Location.zero };
+    const arg_inner_callee = ast.Expr{ .kind = .{ .ident = "Point" }, .location = Location.zero };
+    const arg_inner_val = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const arg_val = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &arg_inner_callee,
+            .args = &.{.{ .name = null, .value = &arg_inner_val, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{.{ .name = null, .value = &arg_val, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, &checker.module_scope);
+    try std.testing.expectEqual(TypeId.string, result);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "generic fn call: bound not satisfied" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const module = makeBoundedGenericModule();
+    checker.check(&module);
+
+    // show(42) — Int does not implement Display
+    const callee = ast.Expr{ .kind = .{ .ident = "show" }, .location = Location.zero };
+    const arg_val = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{.{ .name = null, .value = &arg_val, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "generic fn call: multiple bounds satisfied" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = &ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const string_te = &ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const t_te = &ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const display_te = &ast.TypeExpr{ .kind = .{ .named = "Display" }, .location = Location.zero };
+    const hash_te = &ast.TypeExpr{ .kind = .{ .named = "Hash" }, .location = Location.zero };
+    const point_te = &ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    const ret_expr = &ast.Expr{ .kind = .{ .string_lit = "ok" }, .location = Location.zero };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = ret_expr } },
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{
+        .imports = &.{},
+        .decls = &.{
+            // interface Display:
+            ast.Decl{ .kind = .{ .interface_decl = .{ .name = "Display", .generic_params = &.{}, .methods = &.{} } }, .is_pub = false, .location = Location.zero },
+            // interface Hash:
+            ast.Decl{ .kind = .{ .interface_decl = .{ .name = "Hash", .generic_params = &.{}, .methods = &.{} } }, .is_pub = false, .location = Location.zero },
+            // struct Point: pub x: Int
+            ast.Decl{
+                .kind = .{ .struct_decl = .{
+                    .name = "Point",
+                    .generic_params = &.{},
+                    .fields = &.{
+                        .{ .name = "x", .type_expr = int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+                    },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+            // impl Display for Point:
+            ast.Decl{ .kind = .{ .impl_decl = .{ .target = display_te, .interface = point_te, .methods = &.{} } }, .is_pub = false, .location = Location.zero },
+            // impl Hash for Point:
+            ast.Decl{ .kind = .{ .impl_decl = .{ .target = hash_te, .interface = point_te, .methods = &.{} } }, .is_pub = false, .location = Location.zero },
+            // fn show_hash[T: Display + Hash](x: T) -> String: return "ok"
+            ast.Decl{
+                .kind = .{ .fn_decl = .{
+                    .name = "show_hash",
+                    .generic_params = &.{
+                        .{ .name = "T", .bounds = &.{ display_te, hash_te }, .location = Location.zero },
+                    },
+                    .params = &.{
+                        .{ .name = "x", .type_expr = t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = string_te,
+                    .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+        },
+    };
+    checker.check(&module);
+
+    // show_hash(Point(1)) — Point implements both Display and Hash
+    const callee = ast.Expr{ .kind = .{ .ident = "show_hash" }, .location = Location.zero };
+    const ctor_callee = ast.Expr{ .kind = .{ .ident = "Point" }, .location = Location.zero };
+    const ctor_arg = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const arg_val = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &ctor_callee,
+            .args = &.{.{ .name = null, .value = &ctor_arg, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{.{ .name = null, .value = &arg_val, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, &checker.module_scope);
+    try std.testing.expectEqual(TypeId.string, result);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "generic fn call: one of multiple bounds not satisfied" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = &ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const string_te = &ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const t_te = &ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
+    const display_te = &ast.TypeExpr{ .kind = .{ .named = "Display" }, .location = Location.zero };
+    const hash_te = &ast.TypeExpr{ .kind = .{ .named = "Hash" }, .location = Location.zero };
+    const point_te = &ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    const ret_expr = &ast.Expr{ .kind = .{ .string_lit = "ok" }, .location = Location.zero };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = ret_expr } },
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{
+        .imports = &.{},
+        .decls = &.{
+            // interface Display:
+            ast.Decl{ .kind = .{ .interface_decl = .{ .name = "Display", .generic_params = &.{}, .methods = &.{} } }, .is_pub = false, .location = Location.zero },
+            // interface Hash:
+            ast.Decl{ .kind = .{ .interface_decl = .{ .name = "Hash", .generic_params = &.{}, .methods = &.{} } }, .is_pub = false, .location = Location.zero },
+            // struct Point: pub x: Int
+            ast.Decl{
+                .kind = .{ .struct_decl = .{
+                    .name = "Point",
+                    .generic_params = &.{},
+                    .fields = &.{
+                        .{ .name = "x", .type_expr = int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+                    },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+            // impl Display for Point: — only Display, NOT Hash
+            ast.Decl{ .kind = .{ .impl_decl = .{ .target = display_te, .interface = point_te, .methods = &.{} } }, .is_pub = false, .location = Location.zero },
+            // fn show_hash[T: Display + Hash](x: T) -> String: return "ok"
+            ast.Decl{
+                .kind = .{ .fn_decl = .{
+                    .name = "show_hash",
+                    .generic_params = &.{
+                        .{ .name = "T", .bounds = &.{ display_te, hash_te }, .location = Location.zero },
+                    },
+                    .params = &.{
+                        .{ .name = "x", .type_expr = t_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = string_te,
+                    .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+        },
+    };
+    checker.check(&module);
+
+    // show_hash(Point(1)) — Point only implements Display, not Hash
+    const callee = ast.Expr{ .kind = .{ .ident = "show_hash" }, .location = Location.zero };
+    const ctor_callee = ast.Expr{ .kind = .{ .ident = "Point" }, .location = Location.zero };
+    const ctor_arg = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const arg_val = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &ctor_callee,
+            .args = &.{.{ .name = null, .value = &ctor_arg, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+    const call = ast.Expr{
+        .kind = .{ .call = .{
+            .callee = &callee,
+            .args = &.{.{ .name = null, .value = &arg_val, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&call, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
 }

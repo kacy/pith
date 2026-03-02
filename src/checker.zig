@@ -612,7 +612,7 @@ pub const Checker = struct {
             .list => .err,
             .map => .err,
             .set => .err,
-            .tuple => .err,
+            .tuple => |elems| self.checkTupleExpr(elems, expr.location, scope),
             .self_expr => .err,
 
             .err => .err,
@@ -871,6 +871,25 @@ pub const Checker = struct {
             .{ struct_data.name, fa.field },
         )) catch {};
         return .err;
+    }
+
+    fn checkTupleExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
+        if (elems.len == 0) {
+            self.diagnostics.addError(location, "empty tuple is not allowed") catch {};
+            return .err;
+        }
+
+        var elem_types = std.ArrayList(TypeId).initCapacity(self.allocator, elems.len) catch return .err;
+        defer elem_types.deinit(self.allocator);
+
+        for (elems) |elem| {
+            const id = self.checkExpr(elem, scope);
+            if (id.isErr()) return .err;
+            elem_types.append(self.allocator, id) catch return .err;
+        }
+
+        const owned = self.arena.allocator().dupe(TypeId, elem_types.items) catch return .err;
+        return self.type_table.addType(.{ .tuple = .{ .elements = owned } }) catch return .err;
     }
 
     // ---------------------------------------------------------------
@@ -1724,6 +1743,73 @@ test "break at top level is an error" {
     const stmt = ast.Stmt{ .kind = .break_stmt, .location = Location.zero };
     checker.checkStmt(&stmt, &scope);
     try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+// -- tuple literal tests --
+
+test "checkExpr: tuple literal" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const int_e = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const str_e = ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const tuple = ast.Expr{
+        .kind = .{ .tuple = &.{ &int_e, &str_e } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&tuple, scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    const elems = ty.tuple.elements;
+    try std.testing.expectEqual(@as(usize, 2), elems.len);
+    try std.testing.expectEqual(TypeId.int, elems[0]);
+    try std.testing.expectEqual(TypeId.string, elems[1]);
+}
+
+test "checkExpr: tuple with three elements" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const bool_e = ast.Expr{ .kind = .{ .bool_lit = true }, .location = Location.zero };
+    const int_e = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const float_e = ast.Expr{ .kind = .{ .float_lit = "3.14" }, .location = Location.zero };
+    const tuple = ast.Expr{
+        .kind = .{ .tuple = &.{ &bool_e, &int_e, &float_e } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&tuple, scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    const elems = ty.tuple.elements;
+    try std.testing.expectEqual(@as(usize, 3), elems.len);
+    try std.testing.expectEqual(TypeId.bool, elems[0]);
+    try std.testing.expectEqual(TypeId.int, elems[1]);
+    try std.testing.expectEqual(TypeId.float, elems[2]);
+}
+
+test "checkExpr: tuple with error element propagates err" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    const int_e = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const bad_e = ast.Expr{ .kind = .{ .ident = "missing" }, .location = Location.zero };
+    const tuple = ast.Expr{
+        .kind = .{ .tuple = &.{ &int_e, &bad_e } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&tuple, scope);
+    try std.testing.expect(result.isErr());
 }
 
 test "continue in function body outside loop is an error" {

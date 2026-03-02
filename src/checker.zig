@@ -635,7 +635,7 @@ pub const Checker = struct {
             .index => .err,
             .unwrap => .err,
             .try_expr => .err,
-            .spawn_expr => .err, // checked in a later commit
+            .spawn_expr => |inner| self.checkSpawnExpr(inner, expr.location, scope),
             .await_expr => .err, // checked in a later commit
             .match_expr => |m| self.checkMatchExpr(m, scope),
             .lambda => |lam| self.checkLambda(lam, scope),
@@ -778,6 +778,21 @@ pub const Checker = struct {
                 return .bool;
             },
         };
+    }
+
+    fn checkSpawnExpr(self: *Checker, inner: *const ast.Expr, location: Location, scope: *const Scope) TypeId {
+        const inner_type = self.checkExpr(inner, scope);
+        if (inner_type.isErr()) return .err;
+
+        // can't spawn something that's already a task
+        if (self.type_table.get(inner_type)) |ty| {
+            if (ty == .task) {
+                self.diagnostics.addError(location, "cannot spawn a Task") catch {};
+                return .err;
+            }
+        }
+
+        return self.type_table.addType(.{ .task = .{ .inner = inner_type } }) catch return .err;
     }
 
     fn checkStringInterp(self: *Checker, interp: ast.StringInterp, scope: *const Scope) TypeId {
@@ -2923,5 +2938,52 @@ test "continue in function body outside loop is an error" {
 
     const stmt = ast.Stmt{ .kind = .continue_stmt, .location = Location.zero };
     checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "spawn wraps expression type in Task" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    // spawn of an int literal → Task[Int]
+    const int_expr = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const spawn = ast.Expr{ .kind = .{ .spawn_expr = &int_expr }, .location = Location.zero };
+
+    const result = checker.checkExpr(&spawn, scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    try std.testing.expectEqual(TypeId.int, ty.task.inner);
+}
+
+test "spawn of error-typed expr propagates error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    // spawn of an undefined variable → err
+    const bad = ast.Expr{ .kind = .{ .ident = "undefined" }, .location = Location.zero };
+    const spawn = ast.Expr{ .kind = .{ .spawn_expr = &bad }, .location = Location.zero };
+
+    const result = checker.checkExpr(&spawn, scope);
+    try std.testing.expect(result.isErr());
+}
+
+test "nested spawn is an error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const scope = &checker.module_scope;
+
+    // spawn(spawn(42)) — inner spawn produces Task[Int], outer spawn should error
+    const int_expr = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const inner_spawn = ast.Expr{ .kind = .{ .spawn_expr = &int_expr }, .location = Location.zero };
+    const outer_spawn = ast.Expr{ .kind = .{ .spawn_expr = &inner_spawn }, .location = Location.zero };
+
+    const result = checker.checkExpr(&outer_spawn, scope);
+    try std.testing.expect(result.isErr());
     try std.testing.expect(checker.diagnostics.hasErrors());
 }

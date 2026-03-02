@@ -45,12 +45,16 @@ pub const Scope = struct {
     /// the return type of the enclosing function (if any).
     /// used to check return statements.
     return_type: ?TypeId,
+    /// true when inside a while or for loop body.
+    /// used to validate break/continue statements.
+    in_loop: bool,
 
     pub fn init(allocator: std.mem.Allocator, parent: ?*Scope) Scope {
         return .{
             .bindings = std.StringHashMap(Binding).init(allocator),
             .parent = parent,
             .return_type = if (parent) |p| p.return_type else null,
+            .in_loop = if (parent) |p| p.in_loop else false,
         };
     }
 
@@ -332,7 +336,16 @@ pub const Checker = struct {
             .for_stmt => |f| self.checkForStmt(f, scope),
             .fail_stmt => |f| _ = self.checkExpr(f.value, scope),
             .match_stmt => |m| _ = self.checkExpr(m.subject, scope),
-            .break_stmt, .continue_stmt => {},
+            .break_stmt => {
+                if (!scope.in_loop) {
+                    self.diagnostics.addError(stmt.location, "break outside of loop") catch {};
+                }
+            },
+            .continue_stmt => {
+                if (!scope.in_loop) {
+                    self.diagnostics.addError(stmt.location, "continue outside of loop") catch {};
+                }
+            },
         }
     }
 
@@ -461,6 +474,7 @@ pub const Checker = struct {
 
         var body_scope = Scope.init(self.allocator, scope);
         defer body_scope.deinit();
+        body_scope.in_loop = true;
         self.checkBlock(w.body, &body_scope);
     }
 
@@ -472,6 +486,7 @@ pub const Checker = struct {
         // so for now we give it the error sentinel to avoid false positives
         var body_scope = Scope.init(self.allocator, scope);
         defer body_scope.deinit();
+        body_scope.in_loop = true;
         body_scope.define(f.binding, .{ .type_id = .err, .is_mut = false }) catch return;
 
         if (f.index) |idx| {
@@ -1648,5 +1663,78 @@ test "checkFieldAccess: non-struct type" {
 
     const result = checker.checkExpr(&field_access, &checker.module_scope);
     try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+// -- break/continue validation tests --
+
+test "break inside while loop is ok" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // while true: break
+    const cond = ast.Expr{ .kind = .{ .bool_lit = true }, .location = Location.zero };
+    const break_stmt = ast.Stmt{ .kind = .break_stmt, .location = Location.zero };
+    const stmt = ast.Stmt{
+        .kind = .{ .while_stmt = .{
+            .condition = &cond,
+            .body = .{ .stmts = &.{break_stmt}, .location = Location.zero },
+        } },
+        .location = Location.zero,
+    };
+
+    var scope = Scope.init(std.testing.allocator, &checker.module_scope);
+    defer scope.deinit();
+    checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "continue inside for loop is ok" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // for item in items: continue
+    const items = ast.Expr{ .kind = .{ .ident = "items" }, .location = Location.zero };
+    const cont_stmt = ast.Stmt{ .kind = .continue_stmt, .location = Location.zero };
+    const stmt = ast.Stmt{
+        .kind = .{ .for_stmt = .{
+            .binding = "item",
+            .index = null,
+            .iterable = &items,
+            .body = .{ .stmts = &.{cont_stmt}, .location = Location.zero },
+        } },
+        .location = Location.zero,
+    };
+
+    // define 'items' so it doesn't error on the iterable
+    try checker.module_scope.define("items", .{ .type_id = .err, .is_mut = false });
+    var scope = Scope.init(std.testing.allocator, &checker.module_scope);
+    defer scope.deinit();
+    checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "break at top level is an error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    var scope = Scope.init(std.testing.allocator, &checker.module_scope);
+    defer scope.deinit();
+
+    const stmt = ast.Stmt{ .kind = .break_stmt, .location = Location.zero };
+    checker.checkStmt(&stmt, &scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "continue in function body outside loop is an error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    var scope = Scope.init(std.testing.allocator, &checker.module_scope);
+    defer scope.deinit();
+    scope.return_type = .void; // simulate being inside a function
+
+    const stmt = ast.Stmt{ .kind = .continue_stmt, .location = Location.zero };
+    checker.checkStmt(&stmt, &scope);
     try std.testing.expect(checker.diagnostics.hasErrors());
 }

@@ -3,6 +3,8 @@
 build:
 	zig build
 
+check: build
+
 test:
 	zig build test
 
@@ -14,6 +16,3 @@ clean:
 
 fmt:
 	zig fmt src/
-
-check:
-	zig build test 2>&1

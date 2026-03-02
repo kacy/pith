@@ -1,0 +1,294 @@
+(* ================================================================== *)
+(* forge language grammar                                              *)
+(* EBNF notation — ISO/IEC 14977                                      *)
+(*                                                                     *)
+(* conventions:                                                        *)
+(*   UPPER_CASE  = terminal / token produced by the lexer              *)
+(*   lower_case  = non-terminal / grammar rule                         *)
+(*   (* ... *)   = comment                                             *)
+(*   { x }       = zero or more repetitions of x                       *)
+(*   [ x ]       = optional (zero or one)                              *)
+(*   x | y       = alternative                                         *)
+(*   ( x )       = grouping                                            *)
+(*   "x"         = literal keyword or symbol                           *)
+(* ================================================================== *)
+
+
+(* ------------------------------------------------------------------ *)
+(* 1. lexical rules                                                    *)
+(* ------------------------------------------------------------------ *)
+
+(* the lexer produces tokens from source text. whitespace (spaces)     *)
+(* is significant only at the start of lines for indentation.          *)
+(* tabs are not allowed; the canonical indent is 4 spaces.             *)
+
+letter        = "a" | "b" | ... | "z" | "A" | "B" | ... | "Z" ;
+digit         = "0" | "1" | ... | "9" ;
+hex_digit     = digit | "a" | ... | "f" | "A" | ... | "F" ;
+bin_digit     = "0" | "1" ;
+oct_digit     = "0" | "1" | ... | "7" ;
+
+IDENT         = ( letter | "_" ) , { letter | digit | "_" } ;
+
+(* number literals — underscores allowed as visual separators *)
+INT_LIT       = decimal_lit | hex_lit | bin_lit | oct_lit ;
+decimal_lit   = digit , { digit | "_" } ;
+hex_lit       = "0x" , hex_digit , { hex_digit | "_" } ;
+bin_lit       = "0b" , bin_digit , { bin_digit | "_" } ;
+oct_lit       = "0o" , oct_digit , { oct_digit | "_" } ;
+
+FLOAT_LIT     = digit , { digit | "_" } , "." , digit , { digit | "_" }
+              , [ ( "e" | "E" ) , [ "+" | "-" ] , digit , { digit | "_" } ] ;
+
+(* string literals with escape sequences and interpolation *)
+STRING_LIT    = '"' , { string_char | escape_seq | interpolation } , '"' ;
+string_char   = (* any unicode char except '"', '\', '{', or newline *) ;
+escape_seq    = "\" , ( "n" | "r" | "t" | "\" | '"' | "{" | "0" ) ;
+interpolation = "{" , expression , "}" ;
+
+(* the lexer emits interpolated strings as a token sequence:           *)
+(*   STRING_START  text  STRING_MID  text  STRING_END                  *)
+(* where STRING_MID separates interpolation boundaries.                *)
+(* a plain string with no interpolation is just STRING_LIT.            *)
+
+(* comments — line comments only, no block comments *)
+COMMENT       = "#" , { (* any char except newline *) } ;
+
+(* indentation tokens — emitted by the lexer, not written in source *)
+NEWLINE       = (* end of logical line *) ;
+INDENT        = (* indentation level increased *) ;
+DEDENT        = (* indentation level decreased *) ;
+
+(* at end of file, the lexer emits DEDENT for each remaining level *)
+EOF           = (* end of file *) ;
+
+(* keywords *)
+KEYWORD       = "fn" | "if" | "elif" | "else" | "for" | "in" | "while"
+              | "match" | "return" | "fail" | "break" | "continue"
+              | "struct" | "enum" | "interface" | "impl" | "type"
+              | "pub" | "mut" | "ref" | "weak"
+              | "import" | "from" | "as"
+              | "self" | "true" | "false" | "none"
+              | "and" | "or" | "not" ;
+
+
+(* ------------------------------------------------------------------ *)
+(* 2. module structure                                                 *)
+(* ------------------------------------------------------------------ *)
+
+module        = { import_decl NEWLINE } , { top_level_decl } , EOF ;
+
+import_decl   = "import" , IDENT , [ "." , IDENT ] , [ "as" , IDENT ]
+              | "from" , IDENT , [ "." , IDENT ] , "import" , import_list ;
+
+import_list   = import_name , { "," , import_name }
+              | "*" ;
+
+import_name   = IDENT , [ "as" , IDENT ] ;
+
+top_level_decl = [ "pub" ] , ( fn_decl
+                              | struct_decl
+                              | enum_decl
+                              | interface_decl
+                              | impl_decl
+                              | type_alias
+                              | binding ) , NEWLINE ;
+
+
+(* ------------------------------------------------------------------ *)
+(* 3. declarations                                                     *)
+(* ------------------------------------------------------------------ *)
+
+(* functions *)
+fn_decl       = "fn" , IDENT , [ generic_params ] , "(" , [ param_list ] , ")"
+              , [ "->" , type_expr ] , ":" , block ;
+
+param_list    = param , { "," , param } ;
+param         = [ "mut" ] , [ "ref" ] , IDENT , ":" , type_expr , [ "=" , expression ] ;
+
+generic_params = "[" , generic_param , { "," , generic_param } , "]" ;
+generic_param  = IDENT , [ ":" , type_bound ] ;
+type_bound     = type_expr , { "+" , type_expr } ;
+
+(* structs *)
+struct_decl   = "struct" , IDENT , [ generic_params ] , ":" , NEWLINE
+              , INDENT , { struct_field NEWLINE } , DEDENT ;
+
+struct_field  = [ "pub" ] , [ "mut" ] , [ "weak" ] , IDENT , ":" , type_expr
+              , [ "=" , expression ] ;
+
+(* enums — algebraic data types *)
+enum_decl     = "enum" , IDENT , [ generic_params ] , ":" , NEWLINE
+              , INDENT , { enum_variant NEWLINE } , DEDENT ;
+
+enum_variant  = IDENT , [ "(" , type_list , ")" ] ;
+
+type_list     = type_expr , { "," , type_expr } ;
+
+(* interfaces — like traits *)
+interface_decl = "interface" , IDENT , [ generic_params ] , ":" , NEWLINE
+               , INDENT , { interface_member NEWLINE } , DEDENT ;
+
+interface_member = fn_sig ;
+
+fn_sig        = "fn" , IDENT , [ generic_params ] , "(" , [ param_list ] , ")"
+              , [ "->" , type_expr ] ;
+
+(* impl blocks *)
+impl_decl     = "impl" , type_expr , [ "for" , type_expr ] , ":" , NEWLINE
+              , INDENT , { [ "pub" ] , fn_decl , NEWLINE } , DEDENT ;
+
+(* type alias *)
+type_alias    = "type" , IDENT , [ generic_params ] , "=" , type_expr ;
+
+
+(* ------------------------------------------------------------------ *)
+(* 4. statements                                                       *)
+(* ------------------------------------------------------------------ *)
+
+block         = NEWLINE , INDENT , { statement , NEWLINE } , DEDENT ;
+
+statement     = binding
+              | assignment
+              | if_stmt
+              | for_stmt
+              | while_stmt
+              | match_stmt
+              | return_stmt
+              | fail_stmt
+              | break_stmt
+              | continue_stmt
+              | expression ;
+
+(* binding — immutable by default *)
+binding       = [ "mut" ] , IDENT , [ ":" , type_expr ] , ":=" , expression ;
+
+(* assignment — only for mut bindings *)
+assignment    = lvalue , assign_op , expression ;
+assign_op     = "=" | "+=" | "-=" | "*=" | "/=" ;
+lvalue        = IDENT , { "." , IDENT | "[" , expression , "]" } ;
+
+(* control flow *)
+if_stmt       = "if" , expression , ":" , block
+              , { "elif" , expression , ":" , block }
+              , [ "else" , ":" , block ] ;
+
+for_stmt      = "for" , IDENT , [ "," , IDENT ] , "in" , expression , ":" , block ;
+
+while_stmt    = "while" , expression , ":" , block ;
+
+match_stmt    = "match" , expression , ":" , NEWLINE
+              , INDENT , { match_arm , NEWLINE } , DEDENT ;
+
+match_arm     = pattern , [ "if" , expression ] , "=>" , ( expression | block ) ;
+
+return_stmt   = "return" , [ expression ] ;
+fail_stmt     = "fail" , expression ;
+break_stmt    = "break" ;
+continue_stmt = "continue" ;
+
+
+(* ------------------------------------------------------------------ *)
+(* 5. patterns                                                         *)
+(* ------------------------------------------------------------------ *)
+
+pattern       = "_"                                   (* wildcard *)
+              | literal                               (* literal match *)
+              | IDENT                                 (* binding or enum *)
+              | IDENT , "." , IDENT , [ "(" , pattern_list , ")" ]  (* qualified enum variant *)
+              | "(" , pattern , { "," , pattern } , ")"   (* tuple *)
+              ;
+
+pattern_list  = pattern , { "," , pattern } ;
+
+
+(* ------------------------------------------------------------------ *)
+(* 6. expressions                                                      *)
+(* ------------------------------------------------------------------ *)
+
+(* precedence, lowest to highest:                                      *)
+(*   or                                                                *)
+(*   and                                                               *)
+(*   not (prefix)                                                      *)
+(*   == != < > <= >=                                                   *)
+(*   |                                                                 *)
+(*   + -                                                               *)
+(*   * / %                                                             *)
+(*   unary - (prefix)                                                  *)
+(*   ? ! (postfix)                                                     *)
+(*   call, index, field access                                         *)
+
+expression    = or_expr ;
+
+or_expr       = and_expr , { "or" , and_expr } ;
+and_expr      = not_expr , { "and" , not_expr } ;
+not_expr      = "not" , not_expr | comparison ;
+
+comparison    = pipe_expr , { comp_op , pipe_expr } ;
+comp_op       = "==" | "!=" | "<" | ">" | "<=" | ">=" ;
+
+pipe_expr     = add_expr , { "|" , add_expr } ;
+
+add_expr      = mul_expr , { ( "+" | "-" ) , mul_expr } ;
+mul_expr      = unary_expr , { ( "*" | "/" | "%" ) , unary_expr } ;
+unary_expr    = "-" , unary_expr | postfix_expr ;
+
+postfix_expr  = primary , { postfix_op } ;
+postfix_op    = "?" | "!" | call | index | field_access | method_call ;
+
+call          = "(" , [ arg_list ] , ")" ;
+index         = "[" , expression , "]" ;
+field_access  = "." , IDENT ;
+method_call   = "." , IDENT , "(" , [ arg_list ] , ")" ;
+
+arg_list      = arg , { "," , arg } ;
+arg           = [ IDENT , "=" ] , expression ;    (* named or positional *)
+
+primary       = literal
+              | IDENT
+              | "self"
+              | "(" , expression , ")"            (* grouping or tuple *)
+              | "(" , expression , "," , { expression , "," } , ")"   (* tuple *)
+              | list_literal
+              | map_literal
+              | set_literal
+              | if_expr
+              | match_expr
+              | lambda ;
+
+literal       = INT_LIT | FLOAT_LIT | STRING_LIT | "true" | "false" | "none" ;
+
+(* collection literals *)
+list_literal  = "[" , [ expression , { "," , expression } , [ "," ] ] , "]" ;
+map_literal   = "{" , [ map_entry , { "," , map_entry } , [ "," ] ] , "}" ;
+map_entry     = expression , ":" , expression ;
+set_literal   = "{" , expression , { "," , expression } , [ "," ] , "}" ;
+(* note: empty {} is a map. {x} is a set. {k: v} is a map. *)
+
+(* if expression — like if statement but produces a value *)
+if_expr       = "if" , expression , ":" , expression
+              , { "elif" , expression , ":" , expression }
+              , "else" , ":" , expression ;
+
+(* match expression — like match statement but produces a value *)
+match_expr    = "match" , expression , ":" , NEWLINE
+              , INDENT , { match_arm , NEWLINE } , DEDENT ;
+
+(* lambdas *)
+lambda        = "fn" , "(" , [ param_list ] , ")" , "=>" , expression       (* short form *)
+              | "fn" , "(" , [ param_list ] , ")" , ":" , block ;           (* block form *)
+
+
+(* ------------------------------------------------------------------ *)
+(* 7. types                                                            *)
+(* ------------------------------------------------------------------ *)
+
+type_expr     = base_type , [ "?" ]          (* T? = Option[T] *)
+              | base_type , "!" , [ type_expr ]  (* T! = Result[T, Error], T!E = Result[T, E] *)
+              ;
+
+base_type     = IDENT , [ "[" , type_list , "]" ]   (* named or generic: Map[String, Int] *)
+              | "(" , type_list , ")"                (* tuple type: (Int, String) *)
+              | fn_type ;
+
+fn_type       = "fn" , "(" , [ type_list ] , ")" , [ "->" , type_expr ] ;

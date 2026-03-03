@@ -1289,7 +1289,7 @@ pub const Checker = struct {
             // generics that aren't implemented yet. returning .err
             // suppresses cascading diagnostics downstream.
             .field_access => |fa| self.checkFieldAccess(fa, expr.location, scope),
-            .index => .err,
+            .index => |idx| self.checkIndexExpr(idx, expr.location, scope),
             .unwrap => .err,
             .try_expr => .err,
             .spawn_expr => |inner| self.checkSpawnExpr(inner, expr.location, scope),
@@ -2150,6 +2150,44 @@ pub const Checker = struct {
         }
 
         return self.internCollectionType("Set", &.{first_type}, .{ .set = .{ .element = first_type } });
+    }
+
+    /// check an index expression: obj[idx]. supports List[T], Map[K, V], and tuples.
+    fn checkIndexExpr(self: *Checker, idx: ast.IndexExpr, location: Location, scope: *const Scope) TypeId {
+        const obj_type = self.checkExpr(idx.object, scope);
+        const index_type = self.checkExpr(idx.index, scope);
+        if (obj_type.isErr() or index_type.isErr()) return .err;
+
+        const ty = self.type_table.get(obj_type) orelse return .err;
+        return switch (ty) {
+            .list => |l| blk: {
+                if (!index_type.isInteger()) {
+                    self.diagnostics.addError(location, self.fmt(
+                        "list index must be an integer, got {s}",
+                        .{self.type_table.typeName(index_type)},
+                    )) catch {};
+                    break :blk .err;
+                }
+                break :blk l.element;
+            },
+            .map => |m| blk: {
+                if (index_type != m.key) {
+                    self.diagnostics.addError(location, self.fmt(
+                        "map key type mismatch: expected {s}, got {s}",
+                        .{ self.type_table.typeName(m.key), self.type_table.typeName(index_type) },
+                    )) catch {};
+                    break :blk .err;
+                }
+                break :blk m.value;
+            },
+            else => blk: {
+                self.diagnostics.addError(location, self.fmt(
+                    "type '{s}' does not support indexing",
+                    .{self.type_table.typeName(obj_type)},
+                )) catch {};
+                break :blk .err;
+            },
+        };
     }
 
     fn checkTupleExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {

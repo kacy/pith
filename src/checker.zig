@@ -226,34 +226,37 @@ pub const Checker = struct {
             return;
         }
 
-        // resolve parameter types
-        var param_ids = std.ArrayList(TypeId).initCapacity(self.allocator, fn_d.params.len) catch return;
+        const fn_type = self.resolveFnSignature(fn_d) orelse return;
+        self.module_scope.define(fn_d.name, .{ .type_id = fn_type, .is_mut = false }) catch return;
+    }
+
+    /// resolve a function's parameter and return types, returning the
+    /// function's TypeId. returns null if registration fails (OOM or
+    /// unresolvable types — diagnostics are emitted for the latter).
+    fn resolveFnSignature(self: *Checker, fn_d: ast.FnDecl) ?TypeId {
+        var param_ids = std.ArrayList(TypeId).initCapacity(self.allocator, fn_d.params.len) catch return null;
         defer param_ids.deinit(self.allocator);
 
         for (fn_d.params) |param| {
             if (param.type_expr) |te| {
                 const id = self.resolveTypeExpr(te);
-                param_ids.append(self.allocator, id) catch return;
+                param_ids.append(self.allocator, id) catch return null;
             } else {
                 self.diagnostics.addError(param.location, self.fmt(
                     "parameter '{s}' needs a type annotation",
                     .{param.name},
                 )) catch {};
-                param_ids.append(self.allocator, .err) catch return;
+                param_ids.append(self.allocator, .err) catch return null;
             }
         }
 
-        // resolve return type
         const return_type = if (fn_d.return_type) |rt| self.resolveTypeExpr(rt) else TypeId.void;
 
-        // store param types on the arena
-        const owned_params = self.arena.allocator().dupe(TypeId, param_ids.items) catch return;
-        const fn_type = self.type_table.addType(.{ .function = .{
+        const owned_params = self.arena.allocator().dupe(TypeId, param_ids.items) catch return null;
+        return self.type_table.addType(.{ .function = .{
             .param_types = owned_params,
             .return_type = return_type,
-        } }) catch return;
-
-        self.module_scope.define(fn_d.name, .{ .type_id = fn_type, .is_mut = false }) catch return;
+        } }) catch null;
     }
 
     fn registerStructDecl(self: *Checker, s: ast.StructDecl, location: Location) void {
@@ -430,35 +433,8 @@ pub const Checker = struct {
     /// and return type, creates a function type, and stores a MethodEntry.
     fn registerMethod(self: *Checker, type_name: []const u8, method: ast.ImplMethod) void {
         const fn_d = method.decl;
+        const fn_type = self.resolveFnSignature(fn_d) orelse return;
 
-        // resolve parameter types
-        var param_ids = std.ArrayList(TypeId).initCapacity(self.allocator, fn_d.params.len) catch return;
-        defer param_ids.deinit(self.allocator);
-
-        for (fn_d.params) |param| {
-            if (param.type_expr) |te| {
-                const id = self.resolveTypeExpr(te);
-                param_ids.append(self.allocator, id) catch return;
-            } else {
-                self.diagnostics.addError(param.location, self.fmt(
-                    "parameter '{s}' needs a type annotation",
-                    .{param.name},
-                )) catch {};
-                param_ids.append(self.allocator, .err) catch return;
-            }
-        }
-
-        // resolve return type
-        const return_type = if (fn_d.return_type) |rt| self.resolveTypeExpr(rt) else TypeId.void;
-
-        // create the function type
-        const owned_params = self.arena.allocator().dupe(TypeId, param_ids.items) catch return;
-        const fn_type = self.type_table.addType(.{ .function = .{
-            .param_types = owned_params,
-            .return_type = return_type,
-        } }) catch return;
-
-        // store in method_types
         const key = self.buildMethodKey(type_name, fn_d.name);
         self.method_types.put(key, .{
             .type_id = fn_type,

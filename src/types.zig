@@ -128,6 +128,19 @@ pub const Type = union(enum) {
     channel: struct {
         inner: TypeId,
     },
+    /// List[T] — ordered, growable collection.
+    list: struct {
+        element: TypeId,
+    },
+    /// Map[K, V] — key-value collection.
+    map: struct {
+        key: TypeId,
+        value: TypeId,
+    },
+    /// Set[T] — unordered collection of unique elements.
+    set: struct {
+        element: TypeId,
+    },
 };
 
 // ---------------------------------------------------------------
@@ -213,6 +226,9 @@ pub const TypeTable = struct {
                         .tuple => "tuple",
                         .task => "Task",
                         .channel => "Channel",
+                        .list => "List",
+                        .map => "Map",
+                        .set => "Set",
                     };
                 }
                 return "<unknown>";

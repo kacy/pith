@@ -444,6 +444,96 @@ static inline forge_list_t forge_string_split(forge_string_t s, forge_string_t s
 }
 
 // ---------------------------------------------------------------
+// command-line arguments
+// ---------------------------------------------------------------
+
+static int forge_argc = 0;
+static char **forge_argv = NULL;
+
+static inline void forge_set_args(int argc, char **argv) {
+    forge_argc = argc;
+    forge_argv = argv;
+}
+
+static inline forge_list_t forge_get_args(void) {
+    forge_list_t result = { .data = NULL, .len = 0 };
+    for (int i = 0; i < forge_argc; i++) {
+        forge_string_t s = forge_string_from(forge_argv[i], (int64_t)strlen(forge_argv[i]));
+        forge_list_push(&result, &s, sizeof(forge_string_t));
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------
+// file I/O helpers
+// ---------------------------------------------------------------
+
+// read an entire file into a string. returns false on error.
+static inline bool forge_read_file_impl(const char *path_data, int64_t path_len,
+                                         forge_string_t *out) {
+    // null-terminate path for fopen
+    char *path = (char *)malloc((size_t)path_len + 1);
+    if (!path) return false;
+    memcpy(path, path_data, (size_t)path_len);
+    path[path_len] = '\0';
+
+    FILE *f = fopen(path, "rb");
+    free(path);
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long file_len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (file_len < 0) { fclose(f); return false; }
+
+    char *buf = (char *)malloc((size_t)file_len + 1);
+    if (!buf) { fclose(f); return false; }
+
+    size_t read = fread(buf, 1, (size_t)file_len, f);
+    fclose(f);
+
+    buf[read] = '\0';
+    out->data = buf;
+    out->len = (int64_t)read;
+    return true;
+}
+
+// write a string to a file. returns false on error.
+static inline bool forge_write_file_impl(const char *path_data, int64_t path_len,
+                                          const char *data, int64_t data_len) {
+    char *path = (char *)malloc((size_t)path_len + 1);
+    if (!path) return false;
+    memcpy(path, path_data, (size_t)path_len);
+    path[path_len] = '\0';
+
+    FILE *f = fopen(path, "wb");
+    free(path);
+    if (!f) return false;
+
+    size_t written = fwrite(data, 1, (size_t)data_len, f);
+    fclose(f);
+    return written == (size_t)data_len;
+}
+
+// environment variable lookup. returns false if not set.
+static inline bool forge_env_impl(const char *name_data, int64_t name_len,
+                                   forge_string_t *out) {
+    char *name = (char *)malloc((size_t)name_len + 1);
+    if (!name) return false;
+    memcpy(name, name_data, (size_t)name_len);
+    name[name_len] = '\0';
+
+    const char *val = getenv(name);
+    free(name);
+    if (!val) return false;
+
+    out->data = val;
+    out->len = (int64_t)strlen(val);
+    return true;
+}
+
+// ---------------------------------------------------------------
 // built-in functions
 // ---------------------------------------------------------------
 

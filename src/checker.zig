@@ -194,6 +194,51 @@ pub const Checker = struct {
         } });
         try self.module_scope.define("parse_float", .{ .type_id = parse_float_type, .is_mut = false });
 
+        // read_file(String) -> String!
+        const str_result = try self.type_table.addType(.{ .result = .{
+            .ok_type = .string,
+            .err_type = .err,
+        } });
+        const read_file_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = str_result,
+        } });
+        try self.module_scope.define("read_file", .{ .type_id = read_file_type, .is_mut = false });
+
+        // write_file(String, String) -> Bool!
+        const bool_result = try self.type_table.addType(.{ .result = .{
+            .ok_type = .bool,
+            .err_type = .err,
+        } });
+        const write_file_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .string, .string },
+            .return_type = bool_result,
+        } });
+        try self.module_scope.define("write_file", .{ .type_id = write_file_type, .is_mut = false });
+
+        // args() -> List[String]
+        const list_string = self.type_table.lookup("List[String]") orelse return error.OutOfMemory;
+        const args_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{},
+            .return_type = list_string,
+        } });
+        try self.module_scope.define("args", .{ .type_id = args_type, .is_mut = false });
+
+        // env(String) -> String?
+        const opt_string = try self.type_table.addType(.{ .optional = .{ .inner = .string } });
+        const env_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = opt_string,
+        } });
+        try self.module_scope.define("env", .{ .type_id = env_type, .is_mut = false });
+
+        // exit(Int) -> Void
+        const exit_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = .void,
+        } });
+        try self.module_scope.define("exit", .{ .type_id = exit_type, .is_mut = false });
+
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});
         try self.registerSyncType("WaitGroup", &.{});

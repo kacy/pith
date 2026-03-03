@@ -639,6 +639,49 @@ pub const CEmitter = struct {
             \\
         );
 
+        // read_file(String) -> String!
+        try self.writeStr(
+            \\static forge_result_forge_string_t forge_read_file(forge_string_t path) {
+            \\    forge_string_t content;
+            \\    if (forge_read_file_impl(path.data, path.len, &content)) {
+            \\        forge_result_forge_string_t r; r.is_ok = true; r.ok = content;
+            \\        return r;
+            \\    }
+            \\    forge_result_forge_string_t r; r.is_ok = false;
+            \\    r.err = FORGE_STRING_LIT("failed to read file");
+            \\    return r;
+            \\}
+            \\
+        );
+
+        // write_file(String, String) -> Bool!
+        try self.writeStr(
+            \\static forge_result_bool forge_write_file(forge_string_t path, forge_string_t data) {
+            \\    if (forge_write_file_impl(path.data, path.len, data.data, data.len)) {
+            \\        forge_result_bool r; r.is_ok = true; r.ok = true;
+            \\        return r;
+            \\    }
+            \\    forge_result_bool r; r.is_ok = false;
+            \\    r.err = FORGE_STRING_LIT("failed to write file");
+            \\    return r;
+            \\}
+            \\
+        );
+
+        // env(String) -> String?
+        try self.writeStr(
+            \\static forge_optional_forge_string_t forge_env(forge_string_t name) {
+            \\    forge_string_t val;
+            \\    if (forge_env_impl(name.data, name.len, &val)) {
+            \\        forge_optional_forge_string_t r; r.has_value = true; r.value = val;
+            \\        return r;
+            \\    }
+            \\    forge_optional_forge_string_t r; r.has_value = false;
+            \\    return r;
+            \\}
+            \\
+        );
+
         try self.writeByte('\n');
     }
 
@@ -868,9 +911,9 @@ pub const CEmitter = struct {
         // skip generic (uninstantiated) functions
         if (fd.generic_params.len > 0) return;
 
-        // main is special — we emit it as int main(void)
+        // main is special — accepts argc/argv for command-line arguments
         if (std.mem.eql(u8, fd.name, "main")) {
-            try self.writeStr("int main(void);\n");
+            try self.writeStr("int main(int __argc, char **__argv);\n");
             return;
         }
 
@@ -1033,7 +1076,11 @@ pub const CEmitter = struct {
         }
 
         if (std.mem.eql(u8, fd.name, "main")) {
-            try self.writeStr("int main(void) {\n");
+            try self.writeStr("int main(int __argc, char **__argv) {\n");
+            self.indent_level += 1;
+            try self.writeIndent();
+            try self.writeStr("forge_set_args(__argc, __argv);\n");
+            self.indent_level -= 1;
         } else {
             try self.emitReturnType(fd.return_type);
             try self.writeByte(' ');
@@ -1798,11 +1845,28 @@ pub const CEmitter = struct {
             return;
         }
 
-        // built-in failable functions: parse_int, parse_float
-        if (std.mem.eql(u8, name, "parse_int") or std.mem.eql(u8, name, "parse_float")) {
+        // built-in functions with forge_ prefix
+        if (std.mem.eql(u8, name, "parse_int") or
+            std.mem.eql(u8, name, "parse_float") or
+            std.mem.eql(u8, name, "read_file") or
+            std.mem.eql(u8, name, "write_file") or
+            std.mem.eql(u8, name, "env"))
+        {
             try self.writeStr("forge_");
             try self.writeStr(name);
-            try self.writeByte('(');
+            try self.emitArgList(call.args);
+            return;
+        }
+
+        // args() → forge_get_args()
+        if (std.mem.eql(u8, name, "args")) {
+            try self.writeStr("forge_get_args()");
+            return;
+        }
+
+        // exit(Int) → exit()
+        if (std.mem.eql(u8, name, "exit")) {
+            try self.writeStr("exit(");
             if (call.args.len > 0) {
                 try self.emitExpr(call.args[0].value);
             }
@@ -3366,7 +3430,7 @@ test "full pipeline emits valid C for simple program" {
     const output = emitter.getOutput();
 
     // verify key elements in the output
-    try std.testing.expect(std.mem.indexOf(u8, output, "int main(void)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "int main(int __argc, char **__argv)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "int64_t x = 42") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "forge_print(FORGE_STRING_LIT(\"hello\"))") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "return 0;") != null);

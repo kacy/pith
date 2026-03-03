@@ -39,6 +39,49 @@ pub const Severity = enum {
     }
 };
 
+/// stable error codes for machine-readable diagnostics.
+/// category-based: E0xx = lexer, E1xx = parser, E2xx = type checker.
+/// codes are stable across versions — never reuse a retired code.
+pub const ErrorCode = enum {
+    // -- lexer (E0xx) --
+    E001, // unexpected character
+    E002, // unterminated string
+    E003, // invalid escape sequence
+    E004, // invalid number literal
+
+    // -- parser (E1xx) --
+    E100, // unexpected token
+    E101, // expected expression
+    E102, // expected type annotation
+    E103, // expected identifier
+    E104, // expected block
+
+    // -- type checker (E2xx) --
+    E200, // type mismatch
+    E201, // undefined variable
+    E202, // undefined type
+    E203, // duplicate definition
+    E204, // non-exhaustive match
+    E205, // unreachable pattern
+    E206, // missing return type
+    E207, // wrong number of arguments
+    E208, // not callable
+    E209, // field not found
+    E210, // not a struct type
+    E211, // not an enum type
+    E212, // unknown variant
+    E213, // wrong field count in pattern
+    E214, // break/continue outside loop
+    E215, // match arm type mismatch
+    E216, // assignment to immutable binding
+    E217, // invalid operand types
+    E218, // match guard must be Bool
+
+    pub fn label(self: ErrorCode) []const u8 {
+        return @tagName(self);
+    }
+};
+
 /// a compiler diagnostic — an error, warning, or note with location info.
 pub const Diagnostic = struct {
     severity: Severity,
@@ -47,6 +90,9 @@ pub const Diagnostic = struct {
 
     /// optional suggestion for how to fix the error.
     fix: ?[]const u8 = null,
+
+    /// optional stable error code for machine-readable output.
+    code: ?ErrorCode = null,
 };
 
 /// accumulates diagnostics during a compilation phase.
@@ -81,6 +127,22 @@ pub const DiagnosticList = struct {
             .location = location,
             .message = message,
             .fix = fix,
+        });
+    }
+
+    /// record an error diagnostic with a stable error code.
+    pub fn addCodedError(self: *DiagnosticList, code: ErrorCode, location: Location, message: []const u8) !void {
+        try self.addCodedErrorWithFix(code, location, message, null);
+    }
+
+    /// record an error diagnostic with a stable error code and fix suggestion.
+    pub fn addCodedErrorWithFix(self: *DiagnosticList, code: ErrorCode, location: Location, message: []const u8, fix: ?[]const u8) !void {
+        try self.diagnostics.append(self.allocator, .{
+            .severity = .@"error",
+            .location = location,
+            .message = message,
+            .fix = fix,
+            .code = code,
         });
     }
 

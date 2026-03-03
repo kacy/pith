@@ -255,7 +255,7 @@ pub const CEmitter = struct {
 
         try self.emitReturnType(fd.return_type);
         try self.writeByte(' ');
-        try self.writeStr(fd.name);
+        try self.emitUserFnName(fd.name);
         try self.emitParamList(fd.params);
         try self.writeStr(";\n");
     }
@@ -280,7 +280,7 @@ pub const CEmitter = struct {
         } else {
             try self.emitReturnType(fd.return_type);
             try self.writeByte(' ');
-            try self.writeStr(fd.name);
+            try self.emitUserFnName(fd.name);
             try self.emitParamList(fd.params);
             try self.writeStr(" {\n");
         }
@@ -296,6 +296,13 @@ pub const CEmitter = struct {
 
         self.indent_level -= 1;
         try self.writeStr("}\n\n");
+    }
+
+    /// emit a user-defined function name, prefixed to avoid collisions
+    /// with C standard library names (abs, div, etc).
+    fn emitUserFnName(self: *CEmitter, name: []const u8) EmitError!void {
+        try self.writeStr("fg_");
+        try self.writeStr(name);
     }
 
     fn emitReturnType(self: *CEmitter, return_type: ?*const ast.TypeExpr) EmitError!void {
@@ -627,9 +634,13 @@ pub const CEmitter = struct {
     }
 
     fn emitBinary(self: *CEmitter, bin: *const ast.BinaryExpr) EmitError!void {
-        // pipe operator: x |> f  →  f(x)
+        // pipe operator: x |> f  →  fg_f(x)
         if (bin.op == .pipe) {
-            try self.emitExpr(bin.right);
+            // the right side should be a function name
+            switch (bin.right.kind) {
+                .ident => |name| try self.emitUserFnName(name),
+                else => try self.emitExpr(bin.right),
+            }
             try self.writeByte('(');
             try self.emitExpr(bin.left);
             try self.writeByte(')');
@@ -757,8 +768,8 @@ pub const CEmitter = struct {
             }
         }
 
-        // regular function call
-        try self.writeStr(name);
+        // regular function call — prefixed to avoid C stdlib collisions
+        try self.emitUserFnName(name);
         try self.emitArgList(call.args);
     }
 

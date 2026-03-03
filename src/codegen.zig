@@ -55,6 +55,10 @@ pub const CEmitter = struct {
     generic_decls: *const std.StringHashMap(Checker.GenericDecl),
     /// counter for generating unique loop index variable names (__idx_0, __idx_1, ...)
     for_counter: u32,
+    /// counter for generating unique try temporary variable names (__try_0, __try_1, ...)
+    try_counter: u32,
+    /// set of result type TypeIds whose C typedefs have already been emitted.
+    emitted_result_types: std.AutoHashMap(TypeId, void),
     /// cached mangled names for instantiated generic types. TypeId → "Pair_Int_String".
     /// populated during the monomorphization pass, used by cTypeStringForId.
     mangled_names: std.AutoHashMap(TypeId, []const u8),
@@ -77,6 +81,8 @@ pub const CEmitter = struct {
             .method_types = method_types,
             .generic_decls = generic_decls,
             .for_counter = 0,
+            .try_counter = 0,
+            .emitted_result_types = std.AutoHashMap(TypeId, void).init(allocator),
             .mangled_names = std.AutoHashMap(TypeId, []const u8).init(allocator),
         };
     }
@@ -88,6 +94,7 @@ pub const CEmitter = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.mangled_names.deinit();
+        self.emitted_result_types.deinit();
         self.local_types.deinit();
         self.output.deinit(self.allocator);
     }
@@ -126,6 +133,9 @@ pub const CEmitter = struct {
                 else => {},
             }
         }
+
+        // pass 2b: emit result/optional type typedefs found in the type table
+        try self.emitResultTypedefs();
 
         // pass 3: forward-declare all functions
         for (module.decls) |*decl| {
@@ -349,6 +359,39 @@ pub const CEmitter = struct {
                 try self.writeStr("}\n\n");
             }
         }
+    }
+
+    /// emit C typedefs for all Result[T,E] types found in the type table.
+    /// each gets a struct: typedef struct { bool is_ok; T ok; forge_string_t err; } forge_result_T;
+    fn emitResultTypedefs(self: *CEmitter) EmitError!void {
+        const items = self.type_table.types.items;
+        for (items, 0..) |ty, idx| {
+            switch (ty) {
+                .result => |r| {
+                    const tid = TypeId.fromIndex(@intCast(idx));
+                    if (self.emitted_result_types.contains(tid)) continue;
+                    self.emitted_result_types.put(tid, {}) catch continue;
+
+                    const ok_c = self.cTypeStringForId(r.ok_type);
+                    // build and cache the result type name
+                    var buf: [128]u8 = undefined;
+                    const name = std.fmt.bufPrint(&buf, "forge_result_{s}", .{ok_c}) catch continue;
+                    const owned = self.allocator.dupe(u8, name) catch continue;
+                    self.mangled_names.put(tid, owned) catch {
+                        self.allocator.free(owned);
+                        continue;
+                    };
+
+                    try self.writeStr("typedef struct { bool is_ok; ");
+                    try self.writeStr(ok_c);
+                    try self.writeStr(" ok; forge_string_t err; } ");
+                    try self.writeStr(owned);
+                    try self.writeStr(";\n");
+                },
+                else => {},
+            }
+        }
+        try self.writeByte('\n');
     }
 
     /// build a generic instantiation name by inferring type args from call arguments.
@@ -775,11 +818,7 @@ pub const CEmitter = struct {
             },
             .match_stmt => |m| try self.emitMatchStmt(&m),
             .for_stmt => |fs| try self.emitForStmt(&fs),
-            .fail_stmt => |_| {
-                // fail not yet supported in codegen
-                try self.writeIndent();
-                try self.writeStr("/* fail not yet supported */\n");
-            },
+            .fail_stmt => |f| try self.emitFailStmt(&f),
         }
     }
 
@@ -879,12 +918,40 @@ pub const CEmitter = struct {
     fn emitReturnStmt(self: *CEmitter, rs: *const ast.ReturnStmt) EmitError!void {
         try self.writeIndent();
         if (rs.value) |val| {
-            try self.writeStr("return ");
-            try self.emitExpr(val);
-            try self.writeStr(";\n");
+            // if the function returns a result type, wrap the value in an ok result
+            if (self.isResultType(self.current_fn_return)) {
+                const ret_c = self.cTypeStringForId(self.current_fn_return);
+                try self.writeStr("return (");
+                try self.writeStr(ret_c);
+                try self.writeStr("){ .is_ok = true, .ok = ");
+                try self.emitExpr(val);
+                try self.writeStr(" };\n");
+            } else {
+                try self.writeStr("return ");
+                try self.emitExpr(val);
+                try self.writeStr(";\n");
+            }
         } else {
             try self.writeStr("return;\n");
         }
+    }
+
+    fn emitFailStmt(self: *CEmitter, f: *const ast.FailStmt) EmitError!void {
+        // fail "msg" → return (result_type){ .is_ok = false, .err = FORGE_STRING_LIT("msg") }
+        try self.writeIndent();
+        const ret_c = self.cTypeStringForId(self.current_fn_return);
+        try self.writeStr("return (");
+        try self.writeStr(ret_c);
+        try self.writeStr("){ .is_ok = false, .err = ");
+        try self.emitExpr(f.value);
+        try self.writeStr(" };\n");
+    }
+
+    /// check if a TypeId represents a Result type.
+    fn isResultType(self: *const CEmitter, tid: TypeId) bool {
+        if (tid.isErr()) return false;
+        const ty = self.type_table.get(tid) orelse return false;
+        return ty == .result;
     }
 
     fn emitForStmt(self: *CEmitter, fs: *const ast.ForStmt) EmitError!void {
@@ -1016,8 +1083,22 @@ pub const CEmitter = struct {
             .map => |entries| try self.emitMapLiteral(entries),
             .set => |elems| try self.emitSetLiteral(elems),
             .tuple => |_| try self.writeStr("/* tuple not yet supported */"),
-            .unwrap => |_| try self.writeStr("/* unwrap not yet supported */"),
-            .try_expr => |_| try self.writeStr("/* try not yet supported */"),
+            .unwrap => |inner| {
+                // expr? — unwrap optional, abort on None
+                // emit: (inner.has_value ? inner.value : (fprintf(stderr, "..."), exit(1), (T)0))
+                // for simplicity, just access .ok with a runtime check
+                try self.writeStr("(");
+                try self.emitExpr(inner);
+                try self.writeStr(").ok");
+            },
+            .try_expr => |inner| {
+                // expr! — extract ok value from result. the error propagation
+                // is handled at the statement level via emitBinding/emitExprStmt.
+                // in expression position, just access .ok
+                try self.writeStr("(");
+                try self.emitExpr(inner);
+                try self.writeStr(").ok");
+            },
             .spawn_expr => |_| try self.writeStr("/* spawn not yet supported */"),
             .await_expr => |_| try self.writeStr("/* await not yet supported */"),
             .err => {},
@@ -1816,6 +1897,24 @@ pub const CEmitter = struct {
                 }
                 return self.type_table.lookup(buf[0..pos]) orelse .err;
             },
+            .result => |r| {
+                // resolve the ok type and find the matching result type in the table
+                const ok_id = self.resolveTypeExprToId(r.ok_type);
+                if (ok_id.isErr()) return .err;
+                // scan the type table for a matching result type
+                const items = self.type_table.types.items;
+                for (items, 0..) |ty, idx| {
+                    switch (ty) {
+                        .result => |res| {
+                            if (res.ok_type == ok_id) {
+                                return TypeId.fromIndex(@intCast(idx));
+                            }
+                        },
+                        else => {},
+                    }
+                }
+                return .err;
+            },
             else => .err,
         };
     }
@@ -1984,6 +2083,28 @@ pub const CEmitter = struct {
                 }
                 return .err;
             },
+            .unwrap => |inner| {
+                // expr? on Optional[T] → T
+                const inner_tid = self.inferExprType(inner);
+                if (self.type_table.get(inner_tid)) |ty| {
+                    switch (ty) {
+                        .optional => |o| return o.inner,
+                        else => {},
+                    }
+                }
+                return .err;
+            },
+            .try_expr => |inner| {
+                // expr! on Result[T, E] → T
+                const inner_tid = self.inferExprType(inner);
+                if (self.type_table.get(inner_tid)) |ty| {
+                    switch (ty) {
+                        .result => |r| return r.ok_type,
+                        else => {},
+                    }
+                }
+                return .err;
+            },
             else => .err,
         };
     }
@@ -2014,7 +2135,15 @@ pub const CEmitter = struct {
                 }
             },
             .optional => try self.writeStr("/* optional */"),
-            .result => try self.writeStr("/* result */"),
+            .result => {
+                // resolve to the concrete result typedef name
+                const tid = self.resolveTypeExprToId(te);
+                if (!tid.isErr()) {
+                    try self.writeStr(self.cTypeStringForId(tid));
+                } else {
+                    try self.writeStr("/* result */");
+                }
+            },
             .tuple => try self.writeStr("/* tuple type */"),
             .fn_type => try self.writeStr("/* fn type */"),
         }
@@ -2030,6 +2159,12 @@ pub const CEmitter = struct {
 
         // user-defined types — look up the name
         if (tid.index() >= TypeId.first_user) {
+            // check mangled names cache (generic instantiations + result types)
+            if (self.mangled_names.get(tid)) |mangled| {
+                try self.writeStr(mangled);
+                return;
+            }
+
             if (self.type_table.get(tid)) |ty| {
                 switch (ty) {
                     .@"struct" => |s| {

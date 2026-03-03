@@ -348,3 +348,99 @@ test "diagnostic renders with source context" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "x := @bad") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "^") != null);
 }
+
+test "error code label" {
+    try std.testing.expectEqualStrings("E200", ErrorCode.E200.label());
+    try std.testing.expectEqualStrings("E204", ErrorCode.E204.label());
+}
+
+test "coded error renders with code in header" {
+    var list = DiagnosticList.init(std.testing.allocator, "x := 42");
+    defer list.deinit();
+
+    try list.addCodedError(.E200, .{ .line = 0, .column = 0, .offset = 0, .length = 1 }, "type mismatch");
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try list.render(output.writer(std.testing.allocator));
+
+    const rendered = output.items;
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "error[E200]: type mismatch") != null);
+}
+
+test "uncoded error renders without brackets" {
+    var list = DiagnosticList.init(std.testing.allocator, "x := 42");
+    defer list.deinit();
+
+    try list.addError(.{ .line = 0, .column = 0, .offset = 0, .length = 1 }, "some error");
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try list.render(output.writer(std.testing.allocator));
+
+    const rendered = output.items;
+    // should be "error: some error", not "error[null]: some error"
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "error: some error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[") == null);
+}
+
+test "renderJson: empty diagnostics" {
+    var list = DiagnosticList.init(std.testing.allocator, "");
+    defer list.deinit();
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try list.renderJson(output.writer(std.testing.allocator));
+
+    try std.testing.expectEqualStrings("[]\n", output.items);
+}
+
+test "renderJson: single coded error" {
+    var list = DiagnosticList.init(std.testing.allocator, "x := 42");
+    defer list.deinit();
+
+    try list.addCodedErrorWithFix(
+        .E204,
+        .{ .line = 9, .column = 4, .offset = 50, .length = 5 },
+        "non-exhaustive match",
+        "add a wildcard '_' catch-all",
+    );
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try list.renderJson(output.writer(std.testing.allocator));
+
+    const json = output.items;
+    // check key fields are present and correctly formatted
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"severity\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"code\":\"E204\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"message\":\"non-exhaustive match\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"line\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"col\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"fix\":\"add a wildcard") != null);
+}
+
+test "renderJson: uncoded error has null code" {
+    var list = DiagnosticList.init(std.testing.allocator, "x");
+    defer list.deinit();
+
+    try list.addError(Location.zero, "test error");
+
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    try list.renderJson(output.writer(std.testing.allocator));
+
+    const json = output.items;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"code\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"fix\":null") != null);
+}
+
+test "writeJsonEscaped: special characters" {
+    var output: std.ArrayList(u8) = .empty;
+    defer output.deinit(std.testing.allocator);
+    const w = output.writer(std.testing.allocator);
+
+    try writeJsonEscaped(&w, "hello \"world\"\nnew\\line");
+
+    try std.testing.expectEqualStrings("hello \\\"world\\\"\\nnew\\\\line", output.items);
+}

@@ -27,6 +27,7 @@ const TypeId = types.TypeId;
 const TypeTable = types.TypeTable;
 const Type = types.Type;
 const Location = errors.Location;
+const ErrorCode = errors.ErrorCode;
 
 // ---------------------------------------------------------------
 // generic declarations
@@ -597,12 +598,12 @@ pub const Checker = struct {
             .match_stmt => |m| self.checkMatchStmt(m, stmt.location, scope),
             .break_stmt => {
                 if (!scope.in_loop) {
-                    self.diagnostics.addError(stmt.location, "break outside of loop") catch {};
+                    self.diagnostics.addCodedError(.E214, stmt.location, "break outside of loop") catch {};
                 }
             },
             .continue_stmt => {
                 if (!scope.in_loop) {
-                    self.diagnostics.addError(stmt.location, "continue outside of loop") catch {};
+                    self.diagnostics.addCodedError(.E214, stmt.location, "continue outside of loop") catch {};
                 }
             },
         }
@@ -617,7 +618,7 @@ pub const Checker = struct {
         if (ret.value) |value| {
             const actual = self.checkExpr(value, scope);
             if (!actual.isErr() and !expected.isErr() and actual != expected) {
-                self.diagnostics.addError(value.location, self.fmt(
+                self.diagnostics.addCodedError(.E200, value.location, self.fmt(
                     "return type mismatch: expected {s}, got {s}",
                     .{ self.type_table.typeName(expected), self.type_table.typeName(actual) },
                 )) catch {};
@@ -625,7 +626,7 @@ pub const Checker = struct {
         } else {
             // bare return — expected type should be Void
             if (expected != .void and !expected.isErr()) {
-                self.diagnostics.addError(location, self.fmt(
+                self.diagnostics.addCodedError(.E200, location, self.fmt(
                     "function expects return type {s}, got Void",
                     .{self.type_table.typeName(expected)},
                 )) catch {};
@@ -639,7 +640,7 @@ pub const Checker = struct {
         if (b.type_expr) |te| {
             const annotated = self.resolveTypeExpr(te);
             if (!annotated.isErr() and !value_type.isErr() and annotated != value_type) {
-                self.diagnostics.addError(te.location, self.fmt(
+                self.diagnostics.addCodedError(.E200, te.location, self.fmt(
                     "type mismatch: declared {s}, got {s}",
                     .{ self.type_table.typeName(annotated), self.type_table.typeName(value_type) },
                 )) catch {};
@@ -661,7 +662,7 @@ pub const Checker = struct {
             const name = a.target.kind.ident;
             if (scope.lookup(name)) |binding| {
                 if (!binding.is_mut) {
-                    self.diagnostics.addError(a.target.location, self.fmt(
+                    self.diagnostics.addCodedError(.E216, a.target.location, self.fmt(
                         "cannot assign to immutable variable '{s}'",
                         .{name},
                     )) catch {};
@@ -682,7 +683,7 @@ pub const Checker = struct {
         }
 
         if (target_type != value_type) {
-            self.diagnostics.addError(a.value.*.location, self.fmt(
+            self.diagnostics.addCodedError(.E200, a.value.*.location, self.fmt(
                 "type mismatch: expected {s}, got {s}",
                 .{ self.type_table.typeName(target_type), self.type_table.typeName(value_type) },
             )) catch {};
@@ -1229,7 +1230,7 @@ pub const Checker = struct {
         // the real type comes from a binding annotation or generic use site.
         if (self.generic_decls.contains(name)) return .err;
 
-        self.diagnostics.addError(location, self.fmt("undefined variable '{s}'", .{name})) catch {};
+        self.diagnostics.addCodedError(.E201, location, self.fmt("undefined variable '{s}'", .{name})) catch {};
         return .err;
     }
 
@@ -1887,7 +1888,7 @@ pub const Checker = struct {
                 // first non-error arm establishes the expected type
                 expected_type = arm_type;
             } else if (arm_type != expected_type) {
-                self.diagnostics.addError(arm.location, self.fmt(
+                self.diagnostics.addCodedError(.E215, arm.location, self.fmt(
                     "match arm type mismatch: expected {s}, got {s}",
                     .{ self.type_table.typeName(expected_type), self.type_table.typeName(arm_type) },
                 )) catch {};
@@ -1944,7 +1945,8 @@ pub const Checker = struct {
             .@"enum" => |e| self.checkEnumExhaustiveness(m, e.variants, location),
             else => {
                 // Int, Float, String, etc. — infinite domain, require catch-all
-                self.diagnostics.addErrorWithFix(
+                self.diagnostics.addCodedErrorWithFix(
+                    .E204,
                     location,
                     self.fmt(
                         "non-exhaustive match on {s}: add a wildcard '_' or binding pattern to cover all values",
@@ -1997,7 +1999,8 @@ pub const Checker = struct {
             }
 
             const names = self.arena.allocator().dupe(u8, buf.items) catch "<format error>";
-            self.diagnostics.addErrorWithFix(
+            self.diagnostics.addCodedErrorWithFix(
+                .E204,
                 location,
                 self.fmt("non-exhaustive match: missing variant(s) {s}", .{names}),
                 "add missing variant patterns or a wildcard '_' catch-all",
@@ -2028,7 +2031,8 @@ pub const Checker = struct {
             else
                 "false";
 
-            self.diagnostics.addErrorWithFix(
+            self.diagnostics.addCodedErrorWithFix(
+                .E204,
                 location,
                 self.fmt("non-exhaustive match on Bool: missing {s}", .{missing}),
                 "add missing Bool patterns or a wildcard '_' catch-all",
@@ -2047,7 +2051,7 @@ pub const Checker = struct {
         if (arm.guard) |guard| {
             const guard_type = self.checkExpr(guard, &arm_scope);
             if (!guard_type.isErr() and guard_type != .bool) {
-                self.diagnostics.addError(guard.location, self.fmt(
+                self.diagnostics.addCodedError(.E218, guard.location, self.fmt(
                     "match guard must be Bool, got {s}",
                     .{self.type_table.typeName(guard_type)},
                 )) catch {};

@@ -566,6 +566,15 @@ pub const Checker = struct {
         defer method_scope.deinit();
         method_scope.return_type = func.return_type;
 
+        // bind `self` to the impl target type so method bodies can
+        // access fields and call other methods on the receiver.
+        if (self.type_table.lookup(type_name)) |self_type| {
+            method_scope.define("self", .{
+                .type_id = self_type,
+                .is_mut = false,
+            }) catch return;
+        }
+
         // define parameters
         for (fn_d.params, func.param_types) |param, param_type| {
             method_scope.define(param.name, .{
@@ -1266,7 +1275,7 @@ pub const Checker = struct {
             .map => .err,
             .set => .err,
             .tuple => |elems| self.checkTupleExpr(elems, expr.location, scope),
-            .self_expr => .err,
+            .self_expr => self.checkSelfExpr(expr.location, scope),
 
             .err => .err,
         };
@@ -1281,6 +1290,14 @@ pub const Checker = struct {
         if (self.generic_decls.contains(name)) return .err;
 
         self.diagnostics.addError(location, self.fmt("undefined variable '{s}'", .{name})) catch {};
+        return .err;
+    }
+
+    /// check `self` — valid only inside a method body where `self` is bound.
+    fn checkSelfExpr(self: *Checker, location: Location, scope: *const Scope) TypeId {
+        if (scope.lookup("self")) |binding| return binding.type_id;
+
+        self.diagnostics.addError(location, "'self' can only be used inside a method body") catch {};
         return .err;
     }
 
@@ -6011,5 +6028,141 @@ test "generic struct with bound: not satisfied" {
     checker.check(&module);
 
     // Wrapper[Int] should fail — Int does not implement Printable
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "self in method body resolves to impl target type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = &ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const point_te = &ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    // self.x — field access on self
+    const self_e = &ast.Expr{ .kind = .self_expr, .location = Location.zero };
+    const field = &ast.Expr{
+        .kind = .{ .field_access = .{ .object = self_e, .field = "x" } },
+        .location = Location.zero,
+    };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = field } },
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{
+        .imports = &.{},
+        .decls = &.{
+            // struct Point: pub x: Int
+            ast.Decl{
+                .kind = .{ .struct_decl = .{
+                    .name = "Point",
+                    .generic_params = &.{},
+                    .fields = &.{
+                        .{ .name = "x", .type_expr = int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+                    },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+            // impl Point:
+            //   fn get_x() -> Int:
+            //     return self.x
+            ast.Decl{
+                .kind = .{ .impl_decl = .{
+                    .target = point_te,
+                    .interface = null,
+                    .methods = &.{.{
+                        .is_pub = false,
+                        .decl = .{
+                            .name = "get_x",
+                            .generic_params = &.{},
+                            .params = &.{},
+                            .return_type = int_te,
+                            .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                        },
+                        .location = Location.zero,
+                    }},
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+        },
+    };
+    checker.check(&module);
+
+    // no errors — self.x resolves to Int, matching return type
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "self outside method body errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const self_e = ast.Expr{ .kind = .self_expr, .location = Location.zero };
+    const result = checker.checkExpr(&self_e, &checker.module_scope);
+
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "self field access type mismatch in method body" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = &ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const string_te = &ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const point_te = &ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    // method returns self.x (Int) but declares return type String — mismatch
+    const self_e = &ast.Expr{ .kind = .self_expr, .location = Location.zero };
+    const field = &ast.Expr{
+        .kind = .{ .field_access = .{ .object = self_e, .field = "x" } },
+        .location = Location.zero,
+    };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = field } },
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{
+        .imports = &.{},
+        .decls = &.{
+            ast.Decl{
+                .kind = .{ .struct_decl = .{
+                    .name = "Point",
+                    .generic_params = &.{},
+                    .fields = &.{
+                        .{ .name = "x", .type_expr = int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+                    },
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+            // impl Point:
+            //   fn get_x() -> String:
+            //     return self.x    ← type mismatch: self.x is Int, not String
+            ast.Decl{
+                .kind = .{ .impl_decl = .{
+                    .target = point_te,
+                    .interface = null,
+                    .methods = &.{.{
+                        .is_pub = false,
+                        .decl = .{
+                            .name = "get_x",
+                            .generic_params = &.{},
+                            .params = &.{},
+                            .return_type = string_te,
+                            .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                        },
+                        .location = Location.zero,
+                    }},
+                } },
+                .is_pub = false,
+                .location = Location.zero,
+            },
+        },
+    };
+    checker.check(&module);
+
     try std.testing.expect(checker.diagnostics.hasErrors());
 }

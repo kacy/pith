@@ -169,6 +169,9 @@ pub const Checker = struct {
         } });
         try self.module_scope.define("print", .{ .type_id = print_type, .is_mut = false });
 
+        // pre-register List[String] — used by String.split() and args()
+        _ = self.internCollectionType("List", &.{.string}, .{ .list = .{ .element = .string } });
+
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});
         try self.registerSyncType("WaitGroup", &.{});
@@ -1847,6 +1850,11 @@ pub const Checker = struct {
         const receiver_type = self.checkExpr(mc.receiver, scope);
         if (receiver_type.isErr()) return .err;
 
+        // built-in string methods
+        if (receiver_type == .string) {
+            return self.checkStringMethod(mc, location, scope);
+        }
+
         // check for built-in collection methods before user-defined lookup
         if (self.type_table.get(receiver_type)) |ty| {
             switch (ty) {
@@ -1866,6 +1874,9 @@ pub const Checker = struct {
                             )) catch {};
                         }
                         return .void;
+                    }
+                    if (std.mem.eql(u8, mc.method, "len")) {
+                        return self.checkNoArgs(mc, location, "List.len", .int);
                     }
                 },
                 .map => |m| {
@@ -1892,6 +1903,9 @@ pub const Checker = struct {
                         }
                         return .void;
                     }
+                    if (std.mem.eql(u8, mc.method, "len")) {
+                        return self.checkNoArgs(mc, location, "Map.len", .int);
+                    }
                 },
                 .set => |s| {
                     if (std.mem.eql(u8, mc.method, "add")) {
@@ -1909,6 +1923,9 @@ pub const Checker = struct {
                             )) catch {};
                         }
                         return .void;
+                    }
+                    if (std.mem.eql(u8, mc.method, "len")) {
+                        return self.checkNoArgs(mc, location, "Set.len", .int);
                     }
                 },
                 else => {},
@@ -1956,6 +1973,93 @@ pub const Checker = struct {
         }
 
         return func.return_type;
+    }
+
+    /// validate a built-in method that takes no arguments.
+    fn checkNoArgs(self: *Checker, mc: ast.MethodCallExpr, location: Location, label: []const u8, ret: TypeId) TypeId {
+        if (mc.args.len != 0) {
+            self.diagnostics.addCodedError(.E207, location, self.fmt(
+                "'{s}' expects 0 arguments, got {d}", .{ label, mc.args.len },
+            )) catch {};
+            return .err;
+        }
+        return ret;
+    }
+
+    /// validate a built-in method that takes exactly one string argument.
+    fn checkOneStringArg(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, label: []const u8, ret: TypeId) TypeId {
+        if (mc.args.len != 1) {
+            self.diagnostics.addCodedError(.E207, location, self.fmt(
+                "'{s}' expects 1 argument, got {d}", .{ label, mc.args.len },
+            )) catch {};
+            return .err;
+        }
+        const arg_type = self.checkExpr(mc.args[0].value, scope);
+        if (!arg_type.isErr() and arg_type != .string) {
+            self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
+                "expected String, got {s}", .{self.type_table.typeName(arg_type)},
+            )) catch {};
+        }
+        return ret;
+    }
+
+    /// type-check a method call on a String receiver.
+    fn checkStringMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope) TypeId {
+        const method = mc.method;
+
+        // no-arg methods
+        if (std.mem.eql(u8, method, "len")) return self.checkNoArgs(mc, location, "String.len", .int);
+        if (std.mem.eql(u8, method, "trim")) return self.checkNoArgs(mc, location, "String.trim", .string);
+        if (std.mem.eql(u8, method, "to_upper")) return self.checkNoArgs(mc, location, "String.to_upper", .string);
+        if (std.mem.eql(u8, method, "to_lower")) return self.checkNoArgs(mc, location, "String.to_lower", .string);
+
+        // one-string-arg methods
+        if (std.mem.eql(u8, method, "contains")) return self.checkOneStringArg(mc, location, scope, "String.contains", .bool);
+        if (std.mem.eql(u8, method, "starts_with")) return self.checkOneStringArg(mc, location, scope, "String.starts_with", .bool);
+        if (std.mem.eql(u8, method, "ends_with")) return self.checkOneStringArg(mc, location, scope, "String.ends_with", .bool);
+
+        // split(String) -> List[String]
+        if (std.mem.eql(u8, method, "split")) {
+            if (mc.args.len != 1) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'String.split' expects 1 argument, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            const arg_type = self.checkExpr(mc.args[0].value, scope);
+            if (!arg_type.isErr() and arg_type != .string) {
+                self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
+                    "expected String, got {s}", .{self.type_table.typeName(arg_type)},
+                )) catch {};
+            }
+            // List[String] was pre-registered in registerBuiltinFunctions
+            return self.type_table.lookup("List[String]") orelse .err;
+        }
+
+        // substring(Int, Int) -> String
+        if (std.mem.eql(u8, method, "substring")) {
+            if (mc.args.len != 2) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'String.substring' expects 2 arguments, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            for (mc.args) |arg| {
+                const arg_type = self.checkExpr(arg.value, scope);
+                if (!arg_type.isErr() and arg_type != .int) {
+                    self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
+                        "expected Int, got {s}", .{self.type_table.typeName(arg_type)},
+                    )) catch {};
+                }
+            }
+            return .string;
+        }
+
+        // unknown string method
+        self.diagnostics.addCodedError(.E227, location, self.fmt(
+            "type 'String' has no method '{s}'", .{method},
+        )) catch {};
+        return .err;
     }
 
     fn checkFieldAccess(self: *Checker, fa: ast.FieldAccess, location: Location, scope: *const Scope) TypeId {

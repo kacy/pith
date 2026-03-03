@@ -84,6 +84,77 @@ static inline bool forge_string_gte(forge_string_t a, forge_string_t b) {
 }
 
 // ---------------------------------------------------------------
+// string methods
+// ---------------------------------------------------------------
+
+static inline bool forge_string_contains(forge_string_t haystack, forge_string_t needle) {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    for (int64_t i = 0; i <= haystack.len - needle.len; i++) {
+        if (memcmp(haystack.data + i, needle.data, (size_t)needle.len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static inline bool forge_string_starts_with(forge_string_t s, forge_string_t prefix) {
+    if (prefix.len > s.len) return false;
+    return memcmp(s.data, prefix.data, (size_t)prefix.len) == 0;
+}
+
+static inline bool forge_string_ends_with(forge_string_t s, forge_string_t suffix) {
+    if (suffix.len > s.len) return false;
+    return memcmp(s.data + s.len - suffix.len, suffix.data, (size_t)suffix.len) == 0;
+}
+
+static inline forge_string_t forge_string_trim(forge_string_t s) {
+    const char *start = s.data;
+    const char *end = s.data + s.len;
+    while (start < end && (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r'))
+        start++;
+    while (end > start && (*(end - 1) == ' ' || *(end - 1) == '\t' || *(end - 1) == '\n' || *(end - 1) == '\r'))
+        end--;
+    return forge_string_from(start, (int64_t)(end - start));
+}
+
+static inline forge_string_t forge_string_to_upper(forge_string_t s) {
+    char *buf = (char *)malloc((size_t)s.len + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    for (int64_t i = 0; i < s.len; i++) {
+        char c = s.data[i];
+        buf[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    }
+    buf[s.len] = '\0';
+    return (forge_string_t){ .data = buf, .len = s.len };
+}
+
+static inline forge_string_t forge_string_to_lower(forge_string_t s) {
+    char *buf = (char *)malloc((size_t)s.len + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    for (int64_t i = 0; i < s.len; i++) {
+        char c = s.data[i];
+        buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    buf[s.len] = '\0';
+    return (forge_string_t){ .data = buf, .len = s.len };
+}
+
+static inline forge_string_t forge_string_substring(forge_string_t s, int64_t start, int64_t end) {
+    if (start < 0) start = 0;
+    if (end > s.len) end = s.len;
+    if (start >= end) return forge_string_empty;
+    int64_t new_len = end - start;
+    char *buf = (char *)malloc((size_t)new_len + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, s.data + start, (size_t)new_len);
+    buf[new_len] = '\0';
+    return (forge_string_t){ .data = buf, .len = new_len };
+}
+
+// split uses a forward-declared list type — defined after collection types
+// (see forge_string_split below)
+
+// ---------------------------------------------------------------
 // conversions to string
 // ---------------------------------------------------------------
 
@@ -327,6 +398,49 @@ static inline void forge_set_add(forge_set_t *set, const void *elem, int64_t ele
         }
     }
     forge_list_push(set, elem, elem_size);
+}
+
+// ---------------------------------------------------------------
+// string split (after collections, since it returns forge_list_t)
+// ---------------------------------------------------------------
+
+static inline forge_list_t forge_string_split(forge_string_t s, forge_string_t sep) {
+    forge_list_t result = { .data = NULL, .len = 0 };
+    if (sep.len == 0) {
+        // split on empty separator: return each character
+        for (int64_t i = 0; i < s.len; i++) {
+            char *ch = (char *)malloc(2);
+            if (!ch) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+            ch[0] = s.data[i];
+            ch[1] = '\0';
+            forge_string_t part = { .data = ch, .len = 1 };
+            forge_list_push(&result, &part, sizeof(forge_string_t));
+        }
+        return result;
+    }
+    int64_t start = 0;
+    for (int64_t i = 0; i <= s.len - sep.len; i++) {
+        if (memcmp(s.data + i, sep.data, (size_t)sep.len) == 0) {
+            int64_t part_len = i - start;
+            char *buf = (char *)malloc((size_t)part_len + 1);
+            if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+            memcpy(buf, s.data + start, (size_t)part_len);
+            buf[part_len] = '\0';
+            forge_string_t part = { .data = buf, .len = part_len };
+            forge_list_push(&result, &part, sizeof(forge_string_t));
+            i += sep.len - 1;
+            start = i + 1;
+        }
+    }
+    // remaining part after last separator
+    int64_t part_len = s.len - start;
+    char *buf = (char *)malloc((size_t)part_len + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, s.data + start, (size_t)part_len);
+    buf[part_len] = '\0';
+    forge_string_t part = { .data = buf, .len = part_len };
+    forge_list_push(&result, &part, sizeof(forge_string_t));
+    return result;
 }
 
 // ---------------------------------------------------------------

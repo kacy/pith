@@ -44,6 +44,9 @@ pub const CEmitter = struct {
     /// tracks variable types in the current function scope so we can
     /// choose the right C type for bindings and string operations.
     local_types: std.StringHashMap(TypeId),
+    /// the return type of the current function being emitted. used to
+    /// determine when match arms need `return` prepended.
+    current_fn_return: TypeId,
 
     pub fn init(allocator: std.mem.Allocator, type_table: *const TypeTable, module_scope: *const Scope) CEmitter {
         return .{
@@ -53,6 +56,7 @@ pub const CEmitter = struct {
             .module_scope = module_scope,
             .allocator = allocator,
             .local_types = std.StringHashMap(TypeId).init(allocator),
+            .current_fn_return = .void,
         };
     }
 
@@ -267,6 +271,12 @@ pub const CEmitter = struct {
 
         // clear local type tracking for each function
         self.local_types.clearRetainingCapacity();
+
+        // track the function's return type so match arms can emit `return`
+        self.current_fn_return = if (fd.return_type) |rt|
+            self.resolveTypeExprToId(rt)
+        else
+            .void;
 
         // register parameters as local variables
         for (fd.params) |param| {
@@ -577,8 +587,10 @@ pub const CEmitter = struct {
     }
 
     fn emitMatchStmt(self: *CEmitter, m: *const ast.MatchExpr) EmitError!void {
-        // match as statement — emit as if/else chain for now
-        try self.emitMatchAsIfChain(m, true);
+        // when a match statement is in a function that returns non-void,
+        // the arms need `return` so the value gets returned to the caller.
+        const needs_return = self.current_fn_return != .void;
+        try self.emitMatchAsIfChain(m, true, needs_return);
     }
 
     // ---------------------------------------------------------------
@@ -610,7 +622,7 @@ pub const CEmitter = struct {
                 try self.writeByte(')');
             },
             .if_expr => |if_e| try self.emitIfExpr(&if_e),
-            .match_expr => |m| try self.emitMatchAsIfChain(&m, false),
+            .match_expr => |m| try self.emitMatchAsIfChain(&m, false, false),
             .string_interp => |interp| try self.emitStringInterp(&interp),
             .lambda => |_| try self.writeStr("/* lambda not yet supported */"),
             .list => |_| try self.writeStr("/* list not yet supported */"),
@@ -939,11 +951,11 @@ pub const CEmitter = struct {
         }
     }
 
-    fn emitMatchAsIfChain(self: *CEmitter, m: *const ast.MatchExpr, is_stmt: bool) EmitError!void {
+    fn emitMatchAsIfChain(self: *CEmitter, m: *const ast.MatchExpr, is_stmt: bool, needs_return: bool) EmitError!void {
         if (m.arms.len == 0) return;
 
         if (is_stmt) {
-            // emit subject into a temp variable
+            // open a scoped block
             try self.writeIndent();
             try self.writeStr("{\n");
             self.indent_level += 1;
@@ -976,10 +988,15 @@ pub const CEmitter = struct {
                     self.indent_level += 1;
                 }
 
-                // emit binding if present
+                // emit binding if present — use subject's type
                 if (arm.pattern.kind == .binding) {
+                    const subject_type = self.inferExprType(m.subject);
                     try self.writeIndent();
-                    try self.emitInferredType(m.subject);
+                    if (!subject_type.isErr()) {
+                        try self.emitCType(subject_type);
+                    } else {
+                        try self.emitInferredType(m.subject);
+                    }
                     try self.writeByte(' ');
                     try self.writeStr(arm.pattern.kind.binding);
                     try self.writeStr(" = ");
@@ -990,6 +1007,7 @@ pub const CEmitter = struct {
                 switch (arm.body) {
                     .expr => |e| {
                         try self.writeIndent();
+                        if (needs_return) try self.writeStr("return ");
                         try self.emitExpr(e);
                         try self.writeStr(";\n");
                     },
@@ -1013,7 +1031,18 @@ pub const CEmitter = struct {
                 }
                 switch (arm.body) {
                     .expr => |e| try self.emitExpr(e),
-                    .block => try self.writeStr("/* block in match expr */"),
+                    .block => |*blk| {
+                        // block arm in expression context — emit last statement
+                        if (blk.stmts.len > 0) {
+                            const last_stmt = blk.stmts[blk.stmts.len - 1];
+                            switch (last_stmt.kind) {
+                                .expr_stmt => |e| try self.emitExpr(e),
+                                else => try self.writeStr("0 /* block */"),
+                            }
+                        } else {
+                            try self.writeStr("0 /* empty block */");
+                        }
+                    },
                 }
                 if (!is_wildcard or !is_last) {
                     try self.writeByte(')');

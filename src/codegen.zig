@@ -74,16 +74,8 @@ pub const CEmitter = struct {
     pub fn emitModule(self: *CEmitter, module: *const ast.Module) EmitError!void {
         try self.emitPreamble();
 
-        // pass 1: forward-declare all functions
-        for (module.decls) |*decl| {
-            switch (decl.kind) {
-                .fn_decl => |*fd| try self.emitFnForwardDecl(fd),
-                else => {},
-            }
-        }
-        try self.writeByte('\n');
-
-        // pass 2: struct type definitions
+        // pass 1: struct type definitions (must come before function decls
+        // since functions may use struct types in signatures)
         for (module.decls) |*decl| {
             switch (decl.kind) {
                 .struct_decl => |*sd| try self.emitStructDef(sd),
@@ -91,13 +83,22 @@ pub const CEmitter = struct {
             }
         }
 
-        // pass 3: enum type definitions
+        // pass 2: enum type definitions
         for (module.decls) |*decl| {
             switch (decl.kind) {
                 .enum_decl => |*ed| try self.emitEnumDef(ed),
                 else => {},
             }
         }
+
+        // pass 3: forward-declare all functions
+        for (module.decls) |*decl| {
+            switch (decl.kind) {
+                .fn_decl => |*fd| try self.emitFnForwardDecl(fd),
+                else => {},
+            }
+        }
+        try self.writeByte('\n');
 
         // pass 4: function definitions
         for (module.decls) |*decl| {
@@ -384,7 +385,7 @@ pub const CEmitter = struct {
         if (b.type_expr) |te| {
             try self.emitTypeExpr(te);
         } else if (!tid.isErr()) {
-            try self.writeStr(mapTypeId(tid));
+            try self.emitCType(tid);
         } else {
             // fallback: infer from expression structure
             try self.emitInferredType(b.value);
@@ -478,11 +479,8 @@ pub const CEmitter = struct {
             if (self.type_table.get(binding.type_id)) |ty| {
                 switch (ty) {
                     .function => |f| {
-                        const c_type = mapTypeId(f.return_type);
-                        if (c_type.len > 0) {
-                            try self.writeStr(c_type);
-                            return;
-                        }
+                        try self.emitCType(f.return_type);
+                        return;
                     },
                     else => {},
                 }
@@ -1071,7 +1069,7 @@ pub const CEmitter = struct {
 
     /// resolve the TypeId for an AST type expression. used to track
     /// parameter and binding types during emission.
-    fn resolveTypeExprToId(_: *const CEmitter, te: *const ast.TypeExpr) TypeId {
+    fn resolveTypeExprToId(self: *const CEmitter, te: *const ast.TypeExpr) TypeId {
         return switch (te.kind) {
             .named => |name| {
                 if (std.mem.eql(u8, name, "Int")) return .int;
@@ -1081,7 +1079,8 @@ pub const CEmitter = struct {
                 if (std.mem.eql(u8, name, "String")) return .string;
                 if (std.mem.eql(u8, name, "Void")) return .void;
                 if (std.mem.eql(u8, name, "Bytes")) return .bytes;
-                return .err; // user-defined — we don't track these yet
+                // user-defined — look up in the type table
+                return self.type_table.lookup(name) orelse .err;
             },
             else => .err,
         };
@@ -1135,6 +1134,22 @@ pub const CEmitter = struct {
                             .@"struct" => return binding.type_id,
                             else => {},
                         }
+                    }
+                }
+                return .err;
+            },
+            .field_access => |fa| {
+                // resolve the struct type and look up the field
+                const obj_type = self.inferExprType(fa.object);
+                if (self.type_table.get(obj_type)) |ty| {
+                    switch (ty) {
+                        .@"struct" => |s| {
+                            for (s.fields) |field| {
+                                if (std.mem.eql(u8, field.name, fa.field))
+                                    return field.type_id;
+                            }
+                        },
+                        else => {},
                     }
                 }
                 return .err;

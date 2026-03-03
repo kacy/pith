@@ -109,7 +109,8 @@ pub const Parser = struct {
         if (tok.kind == kind) {
             return self.advance();
         }
-        try self.diagnostics.addError(
+        try self.diagnostics.addCodedError(
+            .E100,
             tok.location,
             try std.fmt.allocPrint(self.allocator, "expected {s}, got {s}", .{
                 @tagName(kind),
@@ -239,7 +240,7 @@ pub const Parser = struct {
         }
 
         // unexpected token
-        try self.diagnostics.addError(tok.location, "expected type");
+        try self.diagnostics.addCodedError(.E102, tok.location, "expected type");
         self.synchronize();
         return self.create(ast.TypeExpr, .{
             .kind = .{ .named = "" },
@@ -304,7 +305,7 @@ pub const Parser = struct {
     /// entry point for expression parsing.
     pub fn parseExpression(self: *Parser) ParseError!*const ast.Expr {
         if (self.depth >= max_depth) {
-            try self.diagnostics.addError(self.peek().location, "expression nesting exceeds maximum depth");
+            try self.diagnostics.addCodedError(.E105, self.peek().location, "expression nesting exceeds maximum depth");
             return self.create(ast.Expr, .{
                 .kind = .err,
                 .location = self.peek().location,
@@ -691,7 +692,7 @@ pub const Parser = struct {
                 return self.parseLambda();
             },
             else => {
-                try self.diagnostics.addError(tok.location, "expected expression");
+                try self.diagnostics.addCodedError(.E101, tok.location, "expected expression");
                 self.synchronize();
                 return self.create(ast.Expr, .{
                     .kind = .err,
@@ -953,7 +954,7 @@ pub const Parser = struct {
             });
         }
 
-        try self.diagnostics.addError(self.peek().location, "expected '=>' or ':' after lambda parameters");
+        try self.diagnostics.addCodedError(.E106, self.peek().location, "expected '=>' or ':' after lambda parameters");
         return self.create(ast.Expr, .{
             .kind = .err,
             .location = fn_tok.location,
@@ -1037,7 +1038,7 @@ pub const Parser = struct {
             }
 
             // unexpected token — emit diagnostic and stop
-            try self.diagnostics.addError(self.peek().location, "unexpected token in string interpolation");
+            try self.diagnostics.addCodedError(.E100, self.peek().location, "unexpected token in string interpolation");
             break;
         }
 
@@ -1172,7 +1173,7 @@ pub const Parser = struct {
                 };
             },
             else => {
-                try self.diagnostics.addError(tok.location, "expected pattern");
+                try self.diagnostics.addCodedError(.E107, tok.location, "expected pattern");
                 self.synchronize();
                 return .{ .kind = .wildcard, .location = tok.location };
             },
@@ -1591,7 +1592,7 @@ pub const Parser = struct {
                 break :blk .{ .binding = stmt.kind.binding };
             },
             else => {
-                try self.diagnostics.addError(loc, "expected declaration");
+                try self.diagnostics.addCodedError(.E100, loc, "expected declaration");
                 self.synchronize();
                 return .{
                     .kind = .{ .binding = .{

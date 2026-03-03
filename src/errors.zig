@@ -57,6 +57,9 @@ pub const ErrorCode = enum {
     E102, // expected type annotation
     E103, // expected identifier
     E104, // expected block
+    E105, // expression nesting too deep
+    E106, // invalid lambda syntax
+    E107, // expected pattern
 
     // -- type checker (E2xx) --
     E200, // type mismatch

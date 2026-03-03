@@ -47,8 +47,16 @@ pub const CEmitter = struct {
     /// the return type of the current function being emitted. used to
     /// determine when match arms need `return` prepended.
     current_fn_return: TypeId,
+    /// method type information from the checker. key is "TypeName.methodName",
+    /// value has the function type id and original AST decl.
+    method_types: *const std.StringHashMap(Checker.MethodEntry),
 
-    pub fn init(allocator: std.mem.Allocator, type_table: *const TypeTable, module_scope: *const Scope) CEmitter {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        type_table: *const TypeTable,
+        module_scope: *const Scope,
+        method_types: *const std.StringHashMap(Checker.MethodEntry),
+    ) CEmitter {
         return .{
             .output = .empty,
             .indent_level = 0,
@@ -57,6 +65,7 @@ pub const CEmitter = struct {
             .allocator = allocator,
             .local_types = std.StringHashMap(TypeId).init(allocator),
             .current_fn_return = .void,
+            .method_types = method_types,
         };
     }
 
@@ -1388,7 +1397,10 @@ test "emitter init and deinit" {
     var scope = Scope.init(std.testing.allocator, null);
     defer scope.deinit();
 
-    var emitter = CEmitter.init(std.testing.allocator, &table, &scope);
+    var methods = std.StringHashMap(Checker.MethodEntry).init(std.testing.allocator);
+    defer methods.deinit();
+
+    var emitter = CEmitter.init(std.testing.allocator, &table, &scope, &methods);
     defer emitter.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), emitter.getOutput().len);
@@ -1401,7 +1413,10 @@ test "emitPreamble writes includes" {
     var scope = Scope.init(std.testing.allocator, null);
     defer scope.deinit();
 
-    var emitter = CEmitter.init(std.testing.allocator, &table, &scope);
+    var methods = std.StringHashMap(Checker.MethodEntry).init(std.testing.allocator);
+    defer methods.deinit();
+
+    var emitter = CEmitter.init(std.testing.allocator, &table, &scope, &methods);
     defer emitter.deinit();
 
     try emitter.emitPreamble();
@@ -1448,7 +1463,7 @@ test "full pipeline emits valid C for simple program" {
     try std.testing.expect(!checker.diagnostics.hasErrors());
 
     // emit
-    var emitter = CEmitter.init(allocator, &checker.type_table, &checker.module_scope);
+    var emitter = CEmitter.init(allocator, &checker.type_table, &checker.module_scope, &checker.method_types);
     defer emitter.deinit();
     try emitter.emitModule(&module);
 

@@ -270,7 +270,7 @@ fn runBuild(allocator: std.mem.Allocator, path: []const u8, run_after: bool, jso
     }
 
     // generate C
-    var emitter = CEmitter.init(allocator, &checker.type_table, &checker.module_scope);
+    var emitter = CEmitter.init(allocator, &checker.type_table, &checker.module_scope, &checker.method_types);
     defer emitter.deinit();
 
     emitter.emitModule(&result.module) catch {

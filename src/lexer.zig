@@ -265,7 +265,8 @@ pub const Lexer = struct {
 
             const indent_result = self.measureIndent();
             if (indent_result.has_tab) {
-                try self.diagnostics.addErrorWithFix(
+                try self.diagnostics.addCodedErrorWithFix(
+                    .E005,
                     self.currentLocation(1),
                     "tabs are not allowed for indentation, use spaces",
                     "replace tabs with spaces (4 spaces per indent level)",
@@ -277,7 +278,8 @@ pub const Lexer = struct {
 
             if (indent_result.level > current_indent) {
                 if (self.indent_stack.items.len >= max_indent_level) {
-                    try self.diagnostics.addError(
+                    try self.diagnostics.addCodedError(
+                        .E005,
                         self.currentLocation(1),
                         "indentation nesting exceeds maximum depth",
                     );
@@ -298,7 +300,8 @@ pub const Lexer = struct {
                 // check that we landed on a valid indent level
                 const new_top = self.indent_stack.items[self.indent_stack.items.len - 1];
                 if (new_top != indent_result.level) {
-                    try self.diagnostics.addError(
+                    try self.diagnostics.addCodedError(
+                        .E005,
                         self.currentLocation(1),
                         "inconsistent indentation",
                     );
@@ -406,7 +409,8 @@ pub const Lexer = struct {
             self.skipStringContent(false);
 
             if (self.pos >= self.source.len or self.current() == '\n') {
-                try self.diagnostics.addError(
+                try self.diagnostics.addCodedError(
+                    .E002,
                     self.locationAt(start, self.pos - start),
                     "unterminated string literal",
                 );
@@ -421,7 +425,8 @@ pub const Lexer = struct {
         self.skipStringContent(true);
 
         if (self.pos >= self.source.len or self.current() == '\n') {
-            try self.diagnostics.addError(
+            try self.diagnostics.addCodedError(
+                .E002,
                 self.locationAt(start, self.pos - start),
                 "unterminated string literal",
             );
@@ -451,7 +456,8 @@ pub const Lexer = struct {
 
             interpolation_count += 1;
             if (interpolation_count > max_interpolation_depth) {
-                try self.diagnostics.addError(
+                try self.diagnostics.addCodedError(
+                    .E006,
                     self.currentLocation(1),
                     "string interpolation nesting exceeds maximum depth",
                 );
@@ -484,7 +490,8 @@ pub const Lexer = struct {
                     self.pos - expr_start,
                 ));
             } else {
-                try self.diagnostics.addError(
+                try self.diagnostics.addCodedError(
+                    .E006,
                     self.locationAt(lbrace_pos, 1),
                     "empty interpolation expression",
                 );
@@ -496,7 +503,8 @@ pub const Lexer = struct {
             }
 
             if (self.pos >= self.source.len) {
-                try self.diagnostics.addError(
+                try self.diagnostics.addCodedError(
+                    .E006,
                     self.locationAt(lbrace_pos, 1),
                     "unterminated string interpolation",
                 );
@@ -515,7 +523,8 @@ pub const Lexer = struct {
             self.skipStringContent(true);
 
             if (self.pos >= self.source.len or self.current() == '\n') {
-                try self.diagnostics.addError(
+                try self.diagnostics.addCodedError(
+                    .E002,
                     self.locationAt(mid_start, self.pos - mid_start),
                     "unterminated string literal",
                 );
@@ -647,7 +656,8 @@ pub const Lexer = struct {
             '}' => .rbrace,
             '|' => .pipe,
             else => {
-                try self.diagnostics.addError(
+                try self.diagnostics.addCodedError(
+                    .E001,
                     self.locationAt(start, 1),
                     "unexpected character",
                 );

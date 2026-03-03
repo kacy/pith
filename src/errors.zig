@@ -48,6 +48,8 @@ pub const ErrorCode = enum {
     E002, // unterminated string
     E003, // invalid escape sequence
     E004, // invalid number literal
+    E005, // indentation error
+    E006, // string interpolation error
 
     // -- parser (E1xx) --
     E100, // unexpected token

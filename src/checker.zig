@@ -594,7 +594,7 @@ pub const Checker = struct {
             .while_stmt => |w| self.checkWhileStmt(w, scope),
             .for_stmt => |f| self.checkForStmt(f, scope),
             .fail_stmt => |f| _ = self.checkExpr(f.value, scope),
-            .match_stmt => |m| self.checkMatchStmt(m, scope),
+            .match_stmt => |m| self.checkMatchStmt(m, stmt.location, scope),
             .break_stmt => {
                 if (!scope.in_loop) {
                     self.diagnostics.addError(stmt.location, "break outside of loop") catch {};
@@ -1209,7 +1209,7 @@ pub const Checker = struct {
             .try_expr => |inner| self.checkTryExpr(inner, expr.location, scope),
             .spawn_expr => |inner| self.checkSpawnExpr(inner, expr.location, scope),
             .await_expr => |inner| self.checkAwaitExpr(inner, expr.location, scope),
-            .match_expr => |m| self.checkMatchExpr(m, scope),
+            .match_expr => |m| self.checkMatchExpr(m, expr.location, scope),
             .lambda => |lam| self.checkLambda(lam, scope),
             .list => |elems| self.checkListExpr(elems, expr.location, scope),
             .map => |entries| self.checkMapExpr(entries, expr.location, scope),
@@ -1873,7 +1873,7 @@ pub const Checker = struct {
         return .err;
     }
 
-    fn checkMatchExpr(self: *Checker, m: ast.MatchExpr, scope: *const Scope) TypeId {
+    fn checkMatchExpr(self: *Checker, m: ast.MatchExpr, location: Location, scope: *const Scope) TypeId {
         const subject_type = self.checkExpr(m.subject, scope);
         if (subject_type.isErr()) return .err;
 
@@ -1894,16 +1894,145 @@ pub const Checker = struct {
             }
         }
 
+        self.checkExhaustiveness(m, subject_type, location);
+
         return expected_type;
     }
 
-    fn checkMatchStmt(self: *Checker, m: ast.MatchExpr, scope: *const Scope) void {
+    fn checkMatchStmt(self: *Checker, m: ast.MatchExpr, location: Location, scope: *const Scope) void {
         const subject_type = self.checkExpr(m.subject, scope);
         if (subject_type.isErr()) return;
 
         // match statement — no arm type agreement needed
         for (m.arms) |arm| {
             _ = self.checkMatchArm(arm, subject_type, scope);
+        }
+
+        self.checkExhaustiveness(m, subject_type, location);
+    }
+
+    // ---------------------------------------------------------------
+    // match exhaustiveness
+    // ---------------------------------------------------------------
+
+    /// verify that a match expression covers all possible values of
+    /// the subject type. rules:
+    ///   - wildcard or binding pattern (without guard) → always exhaustive
+    ///   - enum subject → all variants must be covered
+    ///   - Bool subject → both true and false must be covered
+    ///   - Int/Float/String → infinite domain, require wildcard or binding
+    ///   - guarded arms don't count (guard can fail at runtime)
+    fn checkExhaustiveness(self: *Checker, m: ast.MatchExpr, subject_type: TypeId, location: Location) void {
+        // scan for a catch-all pattern (wildcard or binding) without a guard
+        for (m.arms) |arm| {
+            if (arm.guard != null) continue;
+            switch (arm.pattern.kind) {
+                .wildcard, .binding => return, // exhaustive
+                else => {},
+            }
+        }
+
+        // no catch-all — dispatch to type-specific checks
+        if (subject_type == .bool) {
+            self.checkBoolExhaustiveness(m, location);
+            return;
+        }
+
+        // look up the type to see if it's an enum
+        const ty = self.type_table.get(subject_type) orelse return;
+        switch (ty) {
+            .@"enum" => |e| self.checkEnumExhaustiveness(m, e.variants, location),
+            else => {
+                // Int, Float, String, etc. — infinite domain, require catch-all
+                self.diagnostics.addErrorWithFix(
+                    location,
+                    self.fmt(
+                        "non-exhaustive match on {s}: add a wildcard '_' or binding pattern to cover all values",
+                        .{self.type_table.typeName(subject_type)},
+                    ),
+                    "add a wildcard '_' catch-all arm",
+                ) catch {};
+            },
+        }
+    }
+
+    /// check that every variant of an enum is covered by at least one arm.
+    fn checkEnumExhaustiveness(
+        self: *Checker,
+        m: ast.MatchExpr,
+        variants: []const types.Variant,
+        location: Location,
+    ) void {
+        // collect which variants are covered (by unguarded arms)
+        var missing: std.ArrayList([]const u8) = .empty;
+        defer missing.deinit(self.allocator);
+
+        for (variants) |variant| {
+            var covered = false;
+            for (m.arms) |arm| {
+                if (arm.guard != null) continue;
+                switch (arm.pattern.kind) {
+                    .variant => |v| {
+                        if (std.mem.eql(u8, v.variant, variant.name)) {
+                            covered = true;
+                            break;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            if (!covered) {
+                missing.append(self.allocator, variant.name) catch {};
+            }
+        }
+
+        if (missing.items.len > 0) {
+            // format the list of missing variants
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(self.allocator);
+            const w = buf.writer(self.allocator);
+            for (missing.items, 0..) |name, i| {
+                if (i > 0) w.writeAll(", ") catch {};
+                w.writeAll(name) catch {};
+            }
+
+            const names = self.arena.allocator().dupe(u8, buf.items) catch "<format error>";
+            self.diagnostics.addErrorWithFix(
+                location,
+                self.fmt("non-exhaustive match: missing variant(s) {s}", .{names}),
+                "add missing variant patterns or a wildcard '_' catch-all",
+            ) catch {};
+        }
+    }
+
+    /// check that a Bool match covers both true and false.
+    fn checkBoolExhaustiveness(self: *Checker, m: ast.MatchExpr, location: Location) void {
+        var has_true = false;
+        var has_false = false;
+
+        for (m.arms) |arm| {
+            if (arm.guard != null) continue;
+            switch (arm.pattern.kind) {
+                .bool_lit => |val| {
+                    if (val) has_true = true else has_false = true;
+                },
+                else => {},
+            }
+        }
+
+        if (!has_true or !has_false) {
+            const missing = if (!has_true and !has_false)
+                "true, false"
+            else if (!has_true)
+                "true"
+            else
+                "false";
+
+            self.diagnostics.addErrorWithFix(
+                location,
+                self.fmt("non-exhaustive match on Bool: missing {s}", .{missing}),
+                "add missing Bool patterns or a wildcard '_' catch-all",
+            ) catch {};
         }
     }
 
@@ -3244,10 +3373,11 @@ test "checkMatchExpr: literal patterns with type agreement" {
 
     const scope = &checker.module_scope;
 
-    // match 1: 1 => "one", 2 => "two"
+    // match 1: 1 => "one", 2 => "two", _ => "other"
     const subject = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
     const one_result = ast.Expr{ .kind = .{ .string_lit = "one" }, .location = Location.zero };
     const two_result = ast.Expr{ .kind = .{ .string_lit = "two" }, .location = Location.zero };
+    const other_result = ast.Expr{ .kind = .{ .string_lit = "other" }, .location = Location.zero };
 
     const match_expr = ast.Expr{
         .kind = .{ .match_expr = .{
@@ -3263,6 +3393,12 @@ test "checkMatchExpr: literal patterns with type agreement" {
                     .pattern = .{ .kind = .{ .int_lit = "2" }, .location = Location.zero },
                     .guard = null,
                     .body = .{ .expr = &two_result },
+                    .location = Location.zero,
+                },
+                .{
+                    .pattern = .{ .kind = .wildcard, .location = Location.zero },
+                    .guard = null,
+                    .body = .{ .expr = &other_result },
                     .location = Location.zero,
                 },
             },
@@ -3395,9 +3531,10 @@ test "checkMatchExpr: variant pattern binds field" {
     const shape_id = checker.type_table.lookup("Shape").?;
     try checker.module_scope.define("s", .{ .type_id = shape_id, .is_mut = false });
 
-    // match s: Shape.Circle(r) => r
+    // match s: Shape.Circle(r) => r, Shape.Point => 0.0
     const subject = ast.Expr{ .kind = .{ .ident = "s" }, .location = Location.zero };
     const r_expr = ast.Expr{ .kind = .{ .ident = "r" }, .location = Location.zero };
+    const zero_expr = ast.Expr{ .kind = .{ .float_lit = "0.0" }, .location = Location.zero };
 
     const match_expr = ast.Expr{
         .kind = .{ .match_expr = .{
@@ -3416,6 +3553,19 @@ test "checkMatchExpr: variant pattern binds field" {
                     },
                     .guard = null,
                     .body = .{ .expr = &r_expr },
+                    .location = Location.zero,
+                },
+                .{
+                    .pattern = .{
+                        .kind = .{ .variant = .{
+                            .type_name = "Shape",
+                            .variant = "Point",
+                            .fields = &.{},
+                        } },
+                        .location = Location.zero,
+                    },
+                    .guard = null,
+                    .body = .{ .expr = &zero_expr },
                     .location = Location.zero,
                 },
             },
@@ -3516,10 +3666,11 @@ test "checkMatchStmt: no arm type agreement needed" {
     var checker = try Checker.init(std.testing.allocator, "");
     defer checker.deinit();
 
-    // match 1: 1 => "string", 2 => 42 (as statement, no type agreement needed)
+    // match 1: 1 => "string", 2 => 42, _ => 0 (as statement, no type agreement needed)
     const subject = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
     const str_result = ast.Expr{ .kind = .{ .string_lit = "one" }, .location = Location.zero };
     const int_result = ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const fallback = ast.Expr{ .kind = .{ .int_lit = "0" }, .location = Location.zero };
 
     const stmt = ast.Stmt{
         .kind = .{ .match_stmt = .{
@@ -3537,6 +3688,12 @@ test "checkMatchStmt: no arm type agreement needed" {
                     .body = .{ .expr = &int_result },
                     .location = Location.zero,
                 },
+                .{
+                    .pattern = .{ .kind = .wildcard, .location = Location.zero },
+                    .guard = null,
+                    .body = .{ .expr = &fallback },
+                    .location = Location.zero,
+                },
             },
         } },
         .location = Location.zero,
@@ -3546,6 +3703,295 @@ test "checkMatchStmt: no arm type agreement needed" {
     defer scope.deinit();
     checker.checkStmt(&stmt, &scope);
     try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+// -- exhaustiveness tests --
+
+test "exhaustiveness: enum with all variants covered" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // register enum Direction { North, South, East, West }
+    const enum_decl = ast.Decl{
+        .kind = .{ .enum_decl = .{
+            .name = "Direction",
+            .generic_params = &.{},
+            .variants = &.{
+                .{ .name = "North", .fields = &.{}, .location = Location.zero },
+                .{ .name = "South", .fields = &.{}, .location = Location.zero },
+                .{ .name = "East", .fields = &.{}, .location = Location.zero },
+                .{ .name = "West", .fields = &.{}, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+    const module = ast.Module{ .imports = &.{}, .decls = &.{enum_decl} };
+    checker.check(&module);
+
+    const dir_id = checker.type_table.lookup("Direction").?;
+    try checker.module_scope.define("d", .{ .type_id = dir_id, .is_mut = false });
+
+    const subject = ast.Expr{ .kind = .{ .ident = "d" }, .location = Location.zero };
+    const result_expr = ast.Expr{ .kind = .{ .string_lit = "ok" }, .location = Location.zero };
+
+    const match_expr = ast.Expr{
+        .kind = .{ .match_expr = .{
+            .subject = &subject,
+            .arms = &.{
+                .{ .pattern = .{ .kind = .{ .variant = .{ .type_name = "Direction", .variant = "North", .fields = &.{} } }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+                .{ .pattern = .{ .kind = .{ .variant = .{ .type_name = "Direction", .variant = "South", .fields = &.{} } }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+                .{ .pattern = .{ .kind = .{ .variant = .{ .type_name = "Direction", .variant = "East", .fields = &.{} } }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+                .{ .pattern = .{ .kind = .{ .variant = .{ .type_name = "Direction", .variant = "West", .fields = &.{} } }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    _ = checker.checkExpr(&match_expr, &checker.module_scope);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "exhaustiveness: enum missing variant produces error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // register enum Direction { North, South, East, West }
+    const enum_decl = ast.Decl{
+        .kind = .{ .enum_decl = .{
+            .name = "Direction",
+            .generic_params = &.{},
+            .variants = &.{
+                .{ .name = "North", .fields = &.{}, .location = Location.zero },
+                .{ .name = "South", .fields = &.{}, .location = Location.zero },
+                .{ .name = "East", .fields = &.{}, .location = Location.zero },
+                .{ .name = "West", .fields = &.{}, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+    const module = ast.Module{ .imports = &.{}, .decls = &.{enum_decl} };
+    checker.check(&module);
+
+    const dir_id = checker.type_table.lookup("Direction").?;
+    try checker.module_scope.define("d2", .{ .type_id = dir_id, .is_mut = false });
+
+    const subject = ast.Expr{ .kind = .{ .ident = "d2" }, .location = Location.zero };
+    const result_expr = ast.Expr{ .kind = .{ .string_lit = "ok" }, .location = Location.zero };
+
+    // only North and South — missing East and West
+    const match_expr = ast.Expr{
+        .kind = .{ .match_expr = .{
+            .subject = &subject,
+            .arms = &.{
+                .{ .pattern = .{ .kind = .{ .variant = .{ .type_name = "Direction", .variant = "North", .fields = &.{} } }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+                .{ .pattern = .{ .kind = .{ .variant = .{ .type_name = "Direction", .variant = "South", .fields = &.{} } }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    _ = checker.checkExpr(&match_expr, &checker.module_scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "exhaustiveness: wildcard makes enum match exhaustive" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const enum_decl = ast.Decl{
+        .kind = .{ .enum_decl = .{
+            .name = "Color",
+            .generic_params = &.{},
+            .variants = &.{
+                .{ .name = "Red", .fields = &.{}, .location = Location.zero },
+                .{ .name = "Green", .fields = &.{}, .location = Location.zero },
+                .{ .name = "Blue", .fields = &.{}, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+    const module = ast.Module{ .imports = &.{}, .decls = &.{enum_decl} };
+    checker.check(&module);
+
+    const color_id = checker.type_table.lookup("Color").?;
+    try checker.module_scope.define("c", .{ .type_id = color_id, .is_mut = false });
+
+    const subject = ast.Expr{ .kind = .{ .ident = "c" }, .location = Location.zero };
+    const result_expr = ast.Expr{ .kind = .{ .int_lit = "0" }, .location = Location.zero };
+
+    // only Red + wildcard — should be exhaustive
+    const match_expr = ast.Expr{
+        .kind = .{ .match_expr = .{
+            .subject = &subject,
+            .arms = &.{
+                .{ .pattern = .{ .kind = .{ .variant = .{ .type_name = "Color", .variant = "Red", .fields = &.{} } }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+                .{ .pattern = .{ .kind = .wildcard, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    _ = checker.checkExpr(&match_expr, &checker.module_scope);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "exhaustiveness: binding pattern makes match exhaustive" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const subject = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const x_expr = ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+
+    // match 1: x => x (binding pattern catches everything)
+    const match_expr = ast.Expr{
+        .kind = .{ .match_expr = .{
+            .subject = &subject,
+            .arms = &.{
+                .{ .pattern = .{ .kind = .{ .binding = "x" }, .location = Location.zero }, .guard = null, .body = .{ .expr = &x_expr }, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    _ = checker.checkExpr(&match_expr, &checker.module_scope);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "exhaustiveness: bool with both true and false" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    try checker.module_scope.define("flag", .{ .type_id = .bool, .is_mut = false });
+    const subject = ast.Expr{ .kind = .{ .ident = "flag" }, .location = Location.zero };
+    const result_expr = ast.Expr{ .kind = .{ .string_lit = "ok" }, .location = Location.zero };
+
+    const match_expr = ast.Expr{
+        .kind = .{ .match_expr = .{
+            .subject = &subject,
+            .arms = &.{
+                .{ .pattern = .{ .kind = .{ .bool_lit = true }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+                .{ .pattern = .{ .kind = .{ .bool_lit = false }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    _ = checker.checkExpr(&match_expr, &checker.module_scope);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "exhaustiveness: bool missing one value produces error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    try checker.module_scope.define("flag2", .{ .type_id = .bool, .is_mut = false });
+    const subject = ast.Expr{ .kind = .{ .ident = "flag2" }, .location = Location.zero };
+    const result_expr = ast.Expr{ .kind = .{ .string_lit = "yes" }, .location = Location.zero };
+
+    // only true — missing false
+    const match_expr = ast.Expr{
+        .kind = .{ .match_expr = .{
+            .subject = &subject,
+            .arms = &.{
+                .{ .pattern = .{ .kind = .{ .bool_lit = true }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    _ = checker.checkExpr(&match_expr, &checker.module_scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "exhaustiveness: int with only literals requires wildcard" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const subject = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const result_expr = ast.Expr{ .kind = .{ .string_lit = "ok" }, .location = Location.zero };
+
+    // only literal arms — no wildcard
+    const match_expr = ast.Expr{
+        .kind = .{ .match_expr = .{
+            .subject = &subject,
+            .arms = &.{
+                .{ .pattern = .{ .kind = .{ .int_lit = "1" }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+                .{ .pattern = .{ .kind = .{ .int_lit = "2" }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    _ = checker.checkExpr(&match_expr, &checker.module_scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "exhaustiveness: guarded arms don't count toward coverage" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const subject = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const result_expr = ast.Expr{ .kind = .{ .string_lit = "ok" }, .location = Location.zero };
+    const guard = ast.Expr{ .kind = .{ .bool_lit = true }, .location = Location.zero };
+
+    // wildcard with guard — doesn't count as exhaustive
+    const match_expr = ast.Expr{
+        .kind = .{ .match_expr = .{
+            .subject = &subject,
+            .arms = &.{
+                .{ .pattern = .{ .kind = .wildcard, .location = Location.zero }, .guard = &guard, .body = .{ .expr = &result_expr }, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    _ = checker.checkExpr(&match_expr, &checker.module_scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "exhaustiveness: guarded enum variant doesn't count" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const enum_decl = ast.Decl{
+        .kind = .{ .enum_decl = .{
+            .name = "AB",
+            .generic_params = &.{},
+            .variants = &.{
+                .{ .name = "A", .fields = &.{}, .location = Location.zero },
+                .{ .name = "B", .fields = &.{}, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+    const module = ast.Module{ .imports = &.{}, .decls = &.{enum_decl} };
+    checker.check(&module);
+
+    const ab_id = checker.type_table.lookup("AB").?;
+    try checker.module_scope.define("ab", .{ .type_id = ab_id, .is_mut = false });
+
+    const subject = ast.Expr{ .kind = .{ .ident = "ab" }, .location = Location.zero };
+    const result_expr = ast.Expr{ .kind = .{ .string_lit = "ok" }, .location = Location.zero };
+    const guard = ast.Expr{ .kind = .{ .bool_lit = true }, .location = Location.zero };
+
+    // A (unguarded) + B (guarded) — B doesn't count
+    const match_expr = ast.Expr{
+        .kind = .{ .match_expr = .{
+            .subject = &subject,
+            .arms = &.{
+                .{ .pattern = .{ .kind = .{ .variant = .{ .type_name = "AB", .variant = "A", .fields = &.{} } }, .location = Location.zero }, .guard = null, .body = .{ .expr = &result_expr }, .location = Location.zero },
+                .{ .pattern = .{ .kind = .{ .variant = .{ .type_name = "AB", .variant = "B", .fields = &.{} } }, .location = Location.zero }, .guard = &guard, .body = .{ .expr = &result_expr }, .location = Location.zero },
+            },
+        } },
+        .location = Location.zero,
+    };
+
+    _ = checker.checkExpr(&match_expr, &checker.module_scope);
+    try std.testing.expect(checker.diagnostics.hasErrors());
 }
 
 // -- lambda tests --

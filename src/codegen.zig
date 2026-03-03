@@ -650,6 +650,27 @@ pub const CEmitter = struct {
                     try self.writeStr("/* empty match */");
                 }
             },
+            .list => try self.writeStr("forge_list_t"),
+            .map => try self.writeStr("forge_map_t"),
+            .set => try self.writeStr("forge_set_t"),
+            .index => |idx| {
+                // infer the element/value type from the object's collection type
+                const obj_tid = self.inferExprType(idx.object);
+                if (self.type_table.get(obj_tid)) |ty| {
+                    switch (ty) {
+                        .list => |l| {
+                            try self.writeStr(self.cTypeStringForId(l.element));
+                            return;
+                        },
+                        .map => |m| {
+                            try self.writeStr(self.cTypeStringForId(m.value));
+                            return;
+                        },
+                        else => {},
+                    }
+                }
+                try self.writeStr("/* unknown index type */");
+            },
             else => try self.writeStr("/* unknown */"),
         }
     }
@@ -771,11 +792,7 @@ pub const CEmitter = struct {
             .call => |call| try self.emitCall(&call),
             .method_call => |mc| try self.emitMethodCall(&mc),
             .field_access => |fa| try self.emitFieldAccess(&fa),
-            .index => |idx| {
-                // index expressions on collections — not yet supported
-                _ = idx;
-                try self.writeStr("/* index not yet supported */");
-            },
+            .index => |idx| try self.emitIndexExpr(&idx),
             .grouped => |inner| {
                 try self.writeByte('(');
                 try self.emitExpr(inner);
@@ -785,9 +802,9 @@ pub const CEmitter = struct {
             .match_expr => |m| try self.emitMatchAsIfChain(&m, false, false),
             .string_interp => |interp| try self.emitStringInterp(&interp),
             .lambda => |_| try self.writeStr("/* lambda not yet supported */"),
-            .list => |_| try self.writeStr("/* list not yet supported */"),
-            .map => |_| try self.writeStr("/* map not yet supported */"),
-            .set => |_| try self.writeStr("/* set not yet supported */"),
+            .list => |elems| try self.emitListLiteral(elems),
+            .map => |entries| try self.emitMapLiteral(entries),
+            .set => |elems| try self.emitSetLiteral(elems),
             .tuple => |_| try self.writeStr("/* tuple not yet supported */"),
             .unwrap => |_| try self.writeStr("/* unwrap not yet supported */"),
             .try_expr => |_| try self.writeStr("/* try not yet supported */"),
@@ -1004,6 +1021,120 @@ pub const CEmitter = struct {
         try self.emitExpr(fa.object);
         try self.writeByte('.');
         try self.writeStr(fa.field);
+    }
+
+    // ---------------------------------------------------------------
+    // collection literals
+    // ---------------------------------------------------------------
+
+    fn emitListLiteral(self: *CEmitter, elems: []const *const ast.Expr) EmitError!void {
+        if (elems.len == 0) {
+            try self.writeStr("forge_list_create(0, 0, NULL)");
+            return;
+        }
+        const elem_tid = self.inferExprType(elems[0]);
+        const c_type = self.cTypeStringForId(elem_tid);
+        try self.writeFmt("forge_list_create({d}, sizeof(", .{@as(i64, @intCast(elems.len))});
+        try self.writeStr(c_type);
+        try self.writeStr("), (");
+        try self.writeStr(c_type);
+        try self.writeStr("[]){");
+        for (elems, 0..) |elem, i| {
+            if (i > 0) try self.writeStr(", ");
+            try self.emitExpr(elem);
+        }
+        try self.writeStr("})");
+    }
+
+    fn emitMapLiteral(self: *CEmitter, entries: []const ast.MapEntry) EmitError!void {
+        if (entries.len == 0) {
+            try self.writeStr("(forge_map_t){.keys = NULL, .values = NULL, .len = 0}");
+            return;
+        }
+        const key_tid = self.inferExprType(entries[0].key);
+        const val_tid = self.inferExprType(entries[0].value);
+        const key_c = self.cTypeStringForId(key_tid);
+        const val_c = self.cTypeStringForId(val_tid);
+
+        try self.writeFmt("forge_map_create({d}, sizeof(", .{@as(i64, @intCast(entries.len))});
+        try self.writeStr(key_c);
+        try self.writeStr("), sizeof(");
+        try self.writeStr(val_c);
+        try self.writeStr("), (");
+        try self.writeStr(key_c);
+        try self.writeStr("[]){");
+        for (entries, 0..) |entry, i| {
+            if (i > 0) try self.writeStr(", ");
+            try self.emitExpr(entry.key);
+        }
+        try self.writeStr("}, (");
+        try self.writeStr(val_c);
+        try self.writeStr("[]){");
+        for (entries, 0..) |entry, i| {
+            if (i > 0) try self.writeStr(", ");
+            try self.emitExpr(entry.value);
+        }
+        try self.writeStr("})");
+    }
+
+    fn emitSetLiteral(self: *CEmitter, elems: []const *const ast.Expr) EmitError!void {
+        if (elems.len == 0) {
+            try self.writeStr("forge_set_create(0, 0, NULL)");
+            return;
+        }
+        const elem_tid = self.inferExprType(elems[0]);
+        const c_type = self.cTypeStringForId(elem_tid);
+        try self.writeFmt("forge_set_create({d}, sizeof(", .{@as(i64, @intCast(elems.len))});
+        try self.writeStr(c_type);
+        try self.writeStr("), (");
+        try self.writeStr(c_type);
+        try self.writeStr("[]){");
+        for (elems, 0..) |elem, i| {
+            if (i > 0) try self.writeStr(", ");
+            try self.emitExpr(elem);
+        }
+        try self.writeStr("})");
+    }
+
+    fn emitIndexExpr(self: *CEmitter, idx: *const ast.IndexExpr) EmitError!void {
+        const obj_tid = self.inferExprType(idx.object);
+        if (self.type_table.get(obj_tid)) |ty| {
+            switch (ty) {
+                .list => |l| {
+                    const elem_c = self.cTypeStringForId(l.element);
+                    try self.writeStr("FORGE_LIST_GET(");
+                    try self.emitExpr(idx.object);
+                    try self.writeStr(", ");
+                    try self.writeStr(elem_c);
+                    try self.writeStr(", ");
+                    try self.emitExpr(idx.index);
+                    try self.writeByte(')');
+                },
+                .map => |m| {
+                    const val_c = self.cTypeStringForId(m.value);
+                    try self.writeStr("*(");
+                    try self.writeStr(val_c);
+                    try self.writeStr("*)");
+                    // dispatch on key type
+                    if (m.key == .string) {
+                        try self.writeStr("forge_map_get_by_string(");
+                    } else {
+                        try self.writeStr("forge_map_get_by_int(");
+                    }
+                    try self.emitExpr(idx.object);
+                    try self.writeStr(", ");
+                    try self.emitExpr(idx.index);
+                    try self.writeStr(", sizeof(");
+                    try self.writeStr(val_c);
+                    try self.writeStr("))");
+                },
+                else => {
+                    try self.writeStr("/* index on unsupported type */");
+                },
+            }
+        } else {
+            try self.writeStr("/* index: unknown obj type */");
+        }
     }
 
     fn emitArgList(self: *CEmitter, args: []const ast.Arg) EmitError!void {
@@ -1437,6 +1568,44 @@ pub const CEmitter = struct {
             },
             .grouped => |inner| return self.inferExprType(inner),
             .if_expr => |if_e| return self.inferExprType(if_e.then_expr),
+            .list => |elems| {
+                if (elems.len == 0) return .err;
+                const elem_tid = self.inferExprType(elems[0]);
+                const elem_name = self.type_table.typeName(elem_tid);
+                // look up "List[ElemType]" in the type table
+                var buf: [128]u8 = undefined;
+                const inst = std.fmt.bufPrint(&buf, "List[{s}]", .{elem_name}) catch return .err;
+                return self.type_table.lookup(inst) orelse .err;
+            },
+            .map => |entries| {
+                if (entries.len == 0) return .err;
+                const key_tid = self.inferExprType(entries[0].key);
+                const val_tid = self.inferExprType(entries[0].value);
+                const key_name = self.type_table.typeName(key_tid);
+                const val_name = self.type_table.typeName(val_tid);
+                var buf: [128]u8 = undefined;
+                const inst = std.fmt.bufPrint(&buf, "Map[{s},{s}]", .{ key_name, val_name }) catch return .err;
+                return self.type_table.lookup(inst) orelse .err;
+            },
+            .set => |elems| {
+                if (elems.len == 0) return .err;
+                const elem_tid = self.inferExprType(elems[0]);
+                const elem_name = self.type_table.typeName(elem_tid);
+                var buf: [128]u8 = undefined;
+                const inst = std.fmt.bufPrint(&buf, "Set[{s}]", .{elem_name}) catch return .err;
+                return self.type_table.lookup(inst) orelse .err;
+            },
+            .index => |idx| {
+                const obj_tid = self.inferExprType(idx.object);
+                if (self.type_table.get(obj_tid)) |ty| {
+                    return switch (ty) {
+                        .list => |l| l.element,
+                        .map => |m| m.value,
+                        else => .err,
+                    };
+                }
+                return .err;
+            },
             else => .err,
         };
     }
@@ -1477,6 +1646,18 @@ pub const CEmitter = struct {
                     },
                     .@"enum" => |e| {
                         try self.writeStr(e.name);
+                        return;
+                    },
+                    .list => {
+                        try self.writeStr("forge_list_t");
+                        return;
+                    },
+                    .map => {
+                        try self.writeStr("forge_map_t");
+                        return;
+                    },
+                    .set => {
+                        try self.writeStr("forge_set_t");
                         return;
                     },
                     else => {},
@@ -1532,6 +1713,28 @@ pub const CEmitter = struct {
             .err => "/* error */",
             _ => "", // user-defined — caller handles
         };
+    }
+
+    /// return the C type string for any TypeId — builtins and user-defined.
+    /// for collection types returns the runtime struct name; for structs/enums
+    /// returns the forge type name (which is typedef'd in emitted C).
+    fn cTypeStringForId(self: *CEmitter, tid: TypeId) []const u8 {
+        // builtins have a direct mapping
+        const builtin = mapTypeId(tid);
+        if (builtin.len > 0) return builtin;
+
+        // user-defined — look up in the type table
+        if (self.type_table.get(tid)) |ty| {
+            return switch (ty) {
+                .@"struct" => |s| s.name,
+                .@"enum" => |e| e.name,
+                .list => "forge_list_t",
+                .map => "forge_map_t",
+                .set => "forge_set_t",
+                else => "/* unknown */",
+            };
+        }
+        return "/* unknown */";
     }
 
     // ---------------------------------------------------------------

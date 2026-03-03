@@ -4336,13 +4336,13 @@ test "checkIdent: generic type name returns err silently" {
 
     // register a generic decl manually
     const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
-    checker.generic_decls.put("Box", .{ .@"struct" = .{
+    try checker.generic_decls.put("Box", .{ .@"struct" = .{
         .name = "Box",
         .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
         .fields = &.{
             .{ .name = "value", .type_expr = &t_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     const scope = &checker.module_scope;
     const ident = ast.Expr{ .kind = .{ .ident = "Box" }, .location = Location.zero };
@@ -4362,7 +4362,7 @@ test "Pair[Int,String] resolves to concrete struct" {
     // register a generic Pair[A, B] struct
     const a_te = ast.TypeExpr{ .kind = .{ .named = "A" }, .location = Location.zero };
     const b_te = ast.TypeExpr{ .kind = .{ .named = "B" }, .location = Location.zero };
-    checker.generic_decls.put("Pair", .{ .@"struct" = .{
+    try checker.generic_decls.put("Pair", .{ .@"struct" = .{
         .name = "Pair",
         .generic_params = &.{
             .{ .name = "A", .bounds = &.{}, .location = Location.zero },
@@ -4372,7 +4372,7 @@ test "Pair[Int,String] resolves to concrete struct" {
             .{ .name = "first", .type_expr = &a_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
             .{ .name = "second", .type_expr = &b_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     // resolve Pair[Int, String]
     const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
@@ -4400,13 +4400,13 @@ test "generic struct deduplication" {
     defer checker.deinit();
 
     const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
-    checker.generic_decls.put("Box", .{ .@"struct" = .{
+    try checker.generic_decls.put("Box", .{ .@"struct" = .{
         .name = "Box",
         .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
         .fields = &.{
             .{ .name = "value", .type_expr = &t_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
     const g1 = ast.TypeExpr{
@@ -4431,7 +4431,7 @@ test "generic struct wrong arg count" {
 
     const a_te = ast.TypeExpr{ .kind = .{ .named = "A" }, .location = Location.zero };
     const b_te = ast.TypeExpr{ .kind = .{ .named = "B" }, .location = Location.zero };
-    checker.generic_decls.put("Pair", .{ .@"struct" = .{
+    try checker.generic_decls.put("Pair", .{ .@"struct" = .{
         .name = "Pair",
         .generic_params = &.{
             .{ .name = "A", .bounds = &.{}, .location = Location.zero },
@@ -4441,7 +4441,7 @@ test "generic struct wrong arg count" {
             .{ .name = "first", .type_expr = &a_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
             .{ .name = "second", .type_expr = &b_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     // only provide 1 arg for a 2-param generic
     const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
@@ -4493,14 +4493,14 @@ test "Option[Int] resolves to concrete enum" {
     defer checker.deinit();
 
     const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
-    checker.generic_decls.put("Option", .{ .@"enum" = .{
+    try checker.generic_decls.put("Option", .{ .@"enum" = .{
         .name = "Option",
         .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
         .variants = &.{
             .{ .name = "Some", .fields = &.{&t_te}, .location = Location.zero },
             .{ .name = "None", .fields = &.{}, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
     const generic = ast.TypeExpr{
@@ -4530,14 +4530,14 @@ test "generic enum deduplication" {
     defer checker.deinit();
 
     const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
-    checker.generic_decls.put("Option", .{ .@"enum" = .{
+    try checker.generic_decls.put("Option", .{ .@"enum" = .{
         .name = "Option",
         .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
         .variants = &.{
             .{ .name = "Some", .fields = &.{&t_te}, .location = Location.zero },
             .{ .name = "None", .fields = &.{}, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     const str_te = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
     const g1 = ast.TypeExpr{
@@ -4559,14 +4559,14 @@ test "nested generic: Option[Option[Int]]" {
     defer checker.deinit();
 
     const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
-    checker.generic_decls.put("Option", .{ .@"enum" = .{
+    try checker.generic_decls.put("Option", .{ .@"enum" = .{
         .name = "Option",
         .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
         .variants = &.{
             .{ .name = "Some", .fields = &.{&t_te}, .location = Location.zero },
             .{ .name = "None", .fields = &.{}, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     // Option[Option[Int]]
     const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
@@ -4679,7 +4679,7 @@ test "checkIdent: generic function name returns err silently" {
         .location = Location.zero,
     };
 
-    checker.generic_decls.put("identity", .{ .function = .{
+    try checker.generic_decls.put("identity", .{ .function = .{
         .name = "identity",
         .generic_params = &.{
             .{ .name = "T", .bounds = &.{}, .location = Location.zero },
@@ -4689,7 +4689,7 @@ test "checkIdent: generic function name returns err silently" {
         },
         .return_type = &t_te,
         .body = .{ .stmts = &.{ret}, .location = Location.zero },
-    } }) catch unreachable;
+    } });
 
     // looking up "identity" should return .err but not emit a diagnostic
     const ident = ast.Expr{ .kind = .{ .ident = "identity" }, .location = Location.zero };

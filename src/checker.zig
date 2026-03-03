@@ -587,21 +587,7 @@ pub const Checker = struct {
     }
 
     fn checkTopLevelBinding(self: *Checker, b: ast.Binding) void {
-        // infer or check the binding's type, then add to module scope
-        const value_type = self.checkExpr(b.value, &self.module_scope);
-
-        if (b.type_expr) |te| {
-            const annotated = self.resolveTypeExpr(te);
-            if (!annotated.isErr() and !value_type.isErr() and annotated != value_type) {
-                self.diagnostics.addError(te.location, self.fmt(
-                    "type mismatch: declared {s}, got {s}",
-                    .{ self.type_table.typeName(annotated), self.type_table.typeName(value_type) },
-                )) catch {};
-            }
-            self.module_scope.define(b.name, .{ .type_id = annotated, .is_mut = b.is_mut }) catch return;
-        } else {
-            self.module_scope.define(b.name, .{ .type_id = value_type, .is_mut = b.is_mut }) catch return;
-        }
+        self.checkBindingStmt(b, &self.module_scope);
     }
 
     // ---------------------------------------------------------------

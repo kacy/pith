@@ -6234,6 +6234,99 @@ test "generic struct with bound: not satisfied" {
     try std.testing.expect(checker.diagnostics.hasErrors());
 }
 
+test "index list with integer returns element type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // create a List[String] value in scope
+    const list_type = checker.internCollectionType("List", &.{TypeId.string}, .{ .list = .{ .element = .string } });
+    try checker.module_scope.define("names", .{ .type_id = list_type, .is_mut = false });
+
+    const obj = &ast.Expr{ .kind = .{ .ident = "names" }, .location = Location.zero };
+    const idx = &ast.Expr{ .kind = .{ .int_lit = "0" }, .location = Location.zero };
+    const expr = ast.Expr{
+        .kind = .{ .index = .{ .object = obj, .index = idx } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&expr, &checker.module_scope);
+    try std.testing.expectEqual(TypeId.string, result);
+}
+
+test "index list with non-integer errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const list_type = checker.internCollectionType("List", &.{TypeId.int}, .{ .list = .{ .element = .int } });
+    try checker.module_scope.define("nums", .{ .type_id = list_type, .is_mut = false });
+
+    const obj = &ast.Expr{ .kind = .{ .ident = "nums" }, .location = Location.zero };
+    const idx = &ast.Expr{ .kind = .{ .string_lit = "bad" }, .location = Location.zero };
+    const expr = ast.Expr{
+        .kind = .{ .index = .{ .object = obj, .index = idx } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "index map with correct key type returns value type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const map_type = checker.internCollectionType("Map", &.{ TypeId.string, TypeId.int }, .{ .map = .{ .key = .string, .value = .int } });
+    try checker.module_scope.define("ages", .{ .type_id = map_type, .is_mut = false });
+
+    const obj = &ast.Expr{ .kind = .{ .ident = "ages" }, .location = Location.zero };
+    const idx = &ast.Expr{ .kind = .{ .string_lit = "alice" }, .location = Location.zero };
+    const expr = ast.Expr{
+        .kind = .{ .index = .{ .object = obj, .index = idx } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&expr, &checker.module_scope);
+    try std.testing.expectEqual(TypeId.int, result);
+}
+
+test "index map with wrong key type errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const map_type = checker.internCollectionType("Map", &.{ TypeId.string, TypeId.int }, .{ .map = .{ .key = .string, .value = .int } });
+    try checker.module_scope.define("ages", .{ .type_id = map_type, .is_mut = false });
+
+    const obj = &ast.Expr{ .kind = .{ .ident = "ages" }, .location = Location.zero };
+    const idx = &ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const expr = ast.Expr{
+        .kind = .{ .index = .{ .object = obj, .index = idx } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "index non-indexable type errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    try checker.module_scope.define("x", .{ .type_id = .int, .is_mut = false });
+
+    const obj = &ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const idx = &ast.Expr{ .kind = .{ .int_lit = "0" }, .location = Location.zero };
+    const expr = ast.Expr{
+        .kind = .{ .index = .{ .object = obj, .index = idx } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
 test "list literal: homogeneous elements" {
     var checker = try Checker.init(std.testing.allocator, "");
     defer checker.deinit();

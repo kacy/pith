@@ -349,15 +349,14 @@ static inline void forge_map_set_by_string(forge_map_t *map, forge_string_t key,
             return;
         }
     }
-    // new key — grow both arrays
+    // new key — grow both arrays. realloc into temporaries so we don't
+    // lose the original pointers if one allocation fails.
     int64_t new_len = map->len + 1;
     void *new_keys = realloc(map->keys, (size_t)(new_len * key_size));
-    void *new_vals = realloc(map->values, (size_t)(new_len * val_size));
-    if (!new_keys || !new_vals) {
-        fprintf(stderr, "forge: out of memory\n");
-        exit(1);
-    }
+    if (!new_keys) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
     map->keys = new_keys;
+    void *new_vals = realloc(map->values, (size_t)(new_len * val_size));
+    if (!new_vals) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
     map->values = new_vals;
     memcpy((char *)map->keys + map->len * key_size, &key, (size_t)key_size);
     memcpy((char *)map->values + map->len * val_size, val, (size_t)val_size);
@@ -376,12 +375,10 @@ static inline void forge_map_set_by_int(forge_map_t *map, int64_t key,
     }
     int64_t new_len = map->len + 1;
     void *new_keys = realloc(map->keys, (size_t)(new_len * key_size));
-    void *new_vals = realloc(map->values, (size_t)(new_len * val_size));
-    if (!new_keys || !new_vals) {
-        fprintf(stderr, "forge: out of memory\n");
-        exit(1);
-    }
+    if (!new_keys) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
     map->keys = new_keys;
+    void *new_vals = realloc(map->values, (size_t)(new_len * val_size));
+    if (!new_vals) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
     map->values = new_vals;
     memcpy((char *)map->keys + map->len * key_size, &key, (size_t)key_size);
     memcpy((char *)map->values + map->len * val_size, val, (size_t)val_size);
@@ -437,7 +434,10 @@ static inline bool forge_list_contains_string(forge_list_t list, forge_string_t 
 // list — reverse in place
 static inline void forge_list_reverse(forge_list_t *list, int64_t elem_size) {
     if (list->len < 2) return;
-    char tmp[64]; // stack buffer for swap (large enough for any forge type)
+    // use stack buffer for small elements, heap for large ones
+    char stack_buf[64];
+    char *tmp = (elem_size <= 64) ? stack_buf : (char *)malloc((size_t)elem_size);
+    if (!tmp) return;
     for (int64_t i = 0; i < list->len / 2; i++) {
         int64_t j = list->len - 1 - i;
         char *a = (char *)list->data + i * elem_size;
@@ -446,6 +446,7 @@ static inline void forge_list_reverse(forge_list_t *list, int64_t elem_size) {
         memcpy(a, b, (size_t)elem_size);
         memcpy(b, tmp, (size_t)elem_size);
     }
+    if (tmp != stack_buf) free(tmp);
 }
 
 // list — clear (free data and reset)
@@ -607,7 +608,7 @@ static inline forge_list_t forge_string_split(forge_string_t s, forge_string_t s
         return result;
     }
     int64_t start = 0;
-    for (int64_t i = 0; i <= s.len - sep.len; i++) {
+    for (int64_t i = 0; i + sep.len <= s.len; i++) {
         if (memcmp(s.data + i, sep.data, (size_t)sep.len) == 0) {
             int64_t part_len = i - start;
             char *buf = (char *)malloc((size_t)part_len + 1);
@@ -716,8 +717,15 @@ static inline bool forge_env_impl(const char *name_data, int64_t name_len,
     free(name);
     if (!val) return false;
 
-    out->data = val;
-    out->len = (int64_t)strlen(val);
+    // copy the value — getenv() returns process-owned memory that can
+    // be invalidated by subsequent setenv/putenv calls.
+    size_t val_len = strlen(val);
+    char *copy = (char *)malloc(val_len + 1);
+    if (!copy) return false;
+    memcpy(copy, val, val_len + 1);
+
+    out->data = copy;
+    out->len = (int64_t)val_len;
     return true;
 }
 

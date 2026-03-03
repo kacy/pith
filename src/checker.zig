@@ -566,6 +566,15 @@ pub const Checker = struct {
         defer method_scope.deinit();
         method_scope.return_type = func.return_type;
 
+        // bind `self` to the impl target type so method bodies can
+        // access fields and call other methods on the receiver.
+        if (self.type_table.lookup(type_name)) |self_type| {
+            method_scope.define("self", .{
+                .type_id = self_type,
+                .is_mut = false,
+            }) catch return;
+        }
+
         // define parameters
         for (fn_d.params, func.param_types) |param, param_type| {
             method_scope.define(param.name, .{
@@ -1266,7 +1275,7 @@ pub const Checker = struct {
             .map => .err,
             .set => .err,
             .tuple => |elems| self.checkTupleExpr(elems, expr.location, scope),
-            .self_expr => .err,
+            .self_expr => self.checkSelfExpr(expr.location, scope),
 
             .err => .err,
         };
@@ -1281,6 +1290,14 @@ pub const Checker = struct {
         if (self.generic_decls.contains(name)) return .err;
 
         self.diagnostics.addError(location, self.fmt("undefined variable '{s}'", .{name})) catch {};
+        return .err;
+    }
+
+    /// check `self` — valid only inside a method body where `self` is bound.
+    fn checkSelfExpr(self: *Checker, location: Location, scope: *const Scope) TypeId {
+        if (scope.lookup("self")) |binding| return binding.type_id;
+
+        self.diagnostics.addError(location, "'self' can only be used inside a method body") catch {};
         return .err;
     }
 

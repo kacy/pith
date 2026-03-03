@@ -1966,9 +1966,9 @@ pub const Checker = struct {
 
         // built-in methods on primitive types
         if (receiver_type == .string) return self.checkStringMethod(mc, location, scope);
-        if (receiver_type == .int) return self.checkIntMethod(mc, location);
-        if (receiver_type == .float) return self.checkFloatMethod(mc, location);
-        if (receiver_type == .bool) return self.checkBoolMethod(mc, location);
+        if (receiver_type == .int) return self.checkPrimitiveMethod(mc, location, "Int", &int_methods);
+        if (receiver_type == .float) return self.checkPrimitiveMethod(mc, location, "Float", &float_methods);
+        if (receiver_type == .bool) return self.checkPrimitiveMethod(mc, location, "Bool", &bool_methods);
 
         // check for built-in collection methods before user-defined lookup
         if (self.type_table.get(receiver_type)) |ty| {
@@ -2116,34 +2116,43 @@ pub const Checker = struct {
         return .err;
     }
 
-    /// type-check a method call on an Int receiver.
-    fn checkIntMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location) TypeId {
-        if (std.mem.eql(u8, mc.method, "to_string")) return self.checkNoArgs(mc, location, "Int.to_string", .string);
-        if (std.mem.eql(u8, mc.method, "to_float")) return self.checkNoArgs(mc, location, "Int.to_float", .float);
+    /// method table entry for primitive types.
+    const PrimitiveMethod = struct {
+        name: []const u8,
+        return_type: TypeId,
+    };
 
+    const int_methods = [_]PrimitiveMethod{
+        .{ .name = "to_string", .return_type = .string },
+        .{ .name = "to_float", .return_type = .float },
+    };
+
+    const float_methods = [_]PrimitiveMethod{
+        .{ .name = "to_string", .return_type = .string },
+        .{ .name = "to_int", .return_type = .int },
+    };
+
+    const bool_methods = [_]PrimitiveMethod{
+        .{ .name = "to_string", .return_type = .string },
+    };
+
+    /// type-check a method call on a primitive type (Int, Float, Bool).
+    /// uses a table-driven lookup instead of per-type functions.
+    fn checkPrimitiveMethod(
+        self: *Checker,
+        mc: ast.MethodCallExpr,
+        location: Location,
+        type_name: []const u8,
+        methods: []const PrimitiveMethod,
+    ) TypeId {
+        for (methods) |m| {
+            if (std.mem.eql(u8, mc.method, m.name)) {
+                const label = self.fmt("{s}.{s}", .{ type_name, m.name });
+                return self.checkNoArgs(mc, location, label, m.return_type);
+            }
+        }
         self.diagnostics.addCodedError(.E227, location, self.fmt(
-            "type 'Int' has no method '{s}'", .{mc.method},
-        )) catch {};
-        return .err;
-    }
-
-    /// type-check a method call on a Float receiver.
-    fn checkFloatMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location) TypeId {
-        if (std.mem.eql(u8, mc.method, "to_string")) return self.checkNoArgs(mc, location, "Float.to_string", .string);
-        if (std.mem.eql(u8, mc.method, "to_int")) return self.checkNoArgs(mc, location, "Float.to_int", .int);
-
-        self.diagnostics.addCodedError(.E227, location, self.fmt(
-            "type 'Float' has no method '{s}'", .{mc.method},
-        )) catch {};
-        return .err;
-    }
-
-    /// type-check a method call on a Bool receiver.
-    fn checkBoolMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location) TypeId {
-        if (std.mem.eql(u8, mc.method, "to_string")) return self.checkNoArgs(mc, location, "Bool.to_string", .string);
-
-        self.diagnostics.addCodedError(.E227, location, self.fmt(
-            "type 'Bool' has no method '{s}'", .{mc.method},
+            "type '{s}' has no method '{s}'", .{ type_name, mc.method },
         )) catch {};
         return .err;
     }

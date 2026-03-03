@@ -2109,6 +2109,25 @@ pub const Checker = struct {
             return .string;
         }
 
+        // replace(String, String) -> String
+        if (std.mem.eql(u8, method, "replace")) {
+            if (mc.args.len != 2) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'String.replace' expects 2 arguments, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            for (mc.args) |arg| {
+                const arg_type = self.checkExpr(arg.value, scope);
+                if (!arg_type.isErr() and arg_type != .string) {
+                    self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
+                        "expected String, got {s}", .{self.type_table.typeName(arg_type)},
+                    )) catch {};
+                }
+            }
+            return .string;
+        }
+
         // unknown string method
         self.diagnostics.addCodedError(.E227, location, self.fmt(
             "type 'String' has no method '{s}'", .{method},
@@ -2805,6 +2824,18 @@ pub const Checker = struct {
         const obj_type = self.checkExpr(idx.object, scope);
         const index_type = self.checkExpr(idx.index, scope);
         if (obj_type.isErr() or index_type.isErr()) return .err;
+
+        // string indexing: s[n] returns a single-character string
+        if (obj_type == .string) {
+            if (!index_type.isInteger()) {
+                self.diagnostics.addCodedError(.E217, location, self.fmt(
+                    "string index must be an integer, got {s}",
+                    .{self.type_table.typeName(index_type)},
+                )) catch {};
+                return .err;
+            }
+            return .string;
+        }
 
         const ty = self.type_table.get(obj_type) orelse return .err;
         return switch (ty) {

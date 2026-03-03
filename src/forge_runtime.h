@@ -151,6 +151,62 @@ static inline forge_string_t forge_string_substring(forge_string_t s, int64_t st
     return (forge_string_t){ .data = buf, .len = new_len };
 }
 
+// index a single character by position. returns a 1-char string.
+static inline forge_string_t forge_string_char_at(forge_string_t s, int64_t index) {
+    if (index < 0 || index >= s.len) {
+        fprintf(stderr, "forge: string index out of bounds (index %" PRId64 ", length %" PRId64 ")\n", index, s.len);
+        exit(1);
+    }
+    char *buf = (char *)malloc(2);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    buf[0] = s.data[index];
+    buf[1] = '\0';
+    return (forge_string_t){ .data = buf, .len = 1 };
+}
+
+// replace all occurrences of `old` with `new_s` in `s`.
+static inline forge_string_t forge_string_replace(forge_string_t s, forge_string_t old, forge_string_t new_s) {
+    if (old.len == 0) {
+        // empty pattern — return a copy
+        char *buf = (char *)malloc((size_t)s.len + 1);
+        if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        memcpy(buf, s.data, (size_t)s.len);
+        buf[s.len] = '\0';
+        return (forge_string_t){ .data = buf, .len = s.len };
+    }
+    // first pass: count occurrences
+    int64_t count = 0;
+    for (int64_t i = 0; i + old.len <= s.len; i++) {
+        if (memcmp(s.data + i, old.data, (size_t)old.len) == 0) {
+            count++;
+            i += old.len - 1;
+        }
+    }
+    if (count == 0) {
+        char *buf = (char *)malloc((size_t)s.len + 1);
+        if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        memcpy(buf, s.data, (size_t)s.len);
+        buf[s.len] = '\0';
+        return (forge_string_t){ .data = buf, .len = s.len };
+    }
+    // second pass: build result
+    int64_t new_len = s.len + count * (new_s.len - old.len);
+    char *buf = (char *)malloc((size_t)new_len + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    int64_t pos = 0;
+    for (int64_t i = 0; i < s.len; ) {
+        if (i + old.len <= s.len && memcmp(s.data + i, old.data, (size_t)old.len) == 0) {
+            memcpy(buf + pos, new_s.data, (size_t)new_s.len);
+            pos += new_s.len;
+            i += old.len;
+        } else {
+            buf[pos++] = s.data[i++];
+        }
+    }
+    buf[new_len] = '\0';
+    return (forge_string_t){ .data = buf, .len = new_len };
+}
+
 // split uses a forward-declared list type — defined after collection types
 // (see forge_string_split below)
 

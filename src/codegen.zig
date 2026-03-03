@@ -47,8 +47,16 @@ pub const CEmitter = struct {
     /// the return type of the current function being emitted. used to
     /// determine when match arms need `return` prepended.
     current_fn_return: TypeId,
+    /// method type information from the checker. key is "TypeName.methodName",
+    /// value has the function type id and original AST decl.
+    method_types: *const std.StringHashMap(Checker.MethodEntry),
 
-    pub fn init(allocator: std.mem.Allocator, type_table: *const TypeTable, module_scope: *const Scope) CEmitter {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        type_table: *const TypeTable,
+        module_scope: *const Scope,
+        method_types: *const std.StringHashMap(Checker.MethodEntry),
+    ) CEmitter {
         return .{
             .output = .empty,
             .indent_level = 0,
@@ -57,6 +65,7 @@ pub const CEmitter = struct {
             .allocator = allocator,
             .local_types = std.StringHashMap(TypeId).init(allocator),
             .current_fn_return = .void,
+            .method_types = method_types,
         };
     }
 
@@ -102,12 +111,28 @@ pub const CEmitter = struct {
                 else => {},
             }
         }
+
+        // pass 3b: forward-declare methods from impl blocks
+        for (module.decls) |*decl| {
+            switch (decl.kind) {
+                .impl_decl => |impl_d| try self.emitImplForwardDecls(&impl_d),
+                else => {},
+            }
+        }
         try self.writeByte('\n');
 
         // pass 4: function definitions
         for (module.decls) |*decl| {
             switch (decl.kind) {
                 .fn_decl => |*fd| try self.emitFnDef(fd),
+                else => {},
+            }
+        }
+
+        // pass 5: method definitions from impl blocks
+        for (module.decls) |*decl| {
+            switch (decl.kind) {
+                .impl_decl => |impl_d| try self.emitImplMethodDefs(&impl_d),
                 else => {},
             }
         }
@@ -263,6 +288,126 @@ pub const CEmitter = struct {
         try self.emitUserFnName(fd.name);
         try self.emitParamList(fd.params);
         try self.writeStr(";\n");
+    }
+
+    // ---------------------------------------------------------------
+    // impl block emission
+    // ---------------------------------------------------------------
+
+    /// extract the concrete type name from an impl decl. the parser's
+    /// naming is inverted: `impl Display for Point:` has target=Display,
+    /// interface=Point. `impl Point:` has target=Point, interface=null.
+    fn implTypeName(impl_d: *const ast.ImplDecl) ?[]const u8 {
+        if (impl_d.interface) |iface_type_expr| {
+            // `impl X for Y:` — Y is the concrete type
+            return switch (iface_type_expr.kind) {
+                .named => |n| n,
+                else => null,
+            };
+        } else {
+            // `impl X:` — X is the concrete type
+            return switch (impl_d.target.kind) {
+                .named => |n| n,
+                else => null,
+            };
+        }
+    }
+
+    /// emit forward declarations for all methods in an impl block.
+    fn emitImplForwardDecls(self: *CEmitter, impl_d: *const ast.ImplDecl) EmitError!void {
+        const type_name = implTypeName(impl_d) orelse return;
+        for (impl_d.methods) |method| {
+            try self.emitMethodForwardDecl(type_name, &method.decl);
+        }
+    }
+
+    /// emit a single method forward declaration.
+    /// `fn distance_from_origin() -> Int` on Point becomes:
+    /// `int64_t Point_distance_from_origin(Point self);`
+    fn emitMethodForwardDecl(self: *CEmitter, type_name: []const u8, fd: *const ast.FnDecl) EmitError!void {
+        if (fd.generic_params.len > 0) return;
+        try self.emitReturnType(fd.return_type);
+        try self.writeByte(' ');
+        try self.writeStr(type_name);
+        try self.writeByte('_');
+        try self.writeStr(fd.name);
+        // emit param list with `self` as first parameter
+        try self.writeByte('(');
+        try self.writeStr(type_name);
+        try self.writeStr(" self");
+        for (fd.params) |param| {
+            try self.writeStr(", ");
+            if (param.type_expr) |te| {
+                try self.emitTypeExpr(te);
+            } else {
+                try self.writeStr("/* unknown */");
+            }
+            try self.writeByte(' ');
+            try self.writeStr(param.name);
+        }
+        try self.writeByte(')');
+        try self.writeStr(";\n");
+    }
+
+    /// emit method definitions for all methods in an impl block.
+    fn emitImplMethodDefs(self: *CEmitter, impl_d: *const ast.ImplDecl) EmitError!void {
+        const type_name = implTypeName(impl_d) orelse return;
+        for (impl_d.methods) |method| {
+            try self.emitMethodDef(type_name, &method.decl);
+        }
+    }
+
+    /// emit a single method definition as a C function.
+    /// `self` becomes the first explicit parameter of the struct type.
+    fn emitMethodDef(self: *CEmitter, type_name: []const u8, fd: *const ast.FnDecl) EmitError!void {
+        if (fd.generic_params.len > 0) return;
+
+        // clear local type tracking
+        self.local_types.clearRetainingCapacity();
+
+        // track return type for match tail-position returns
+        self.current_fn_return = if (fd.return_type) |rt|
+            self.resolveTypeExprToId(rt)
+        else
+            .void;
+
+        // register `self` as local with the struct's type
+        const self_tid = self.type_table.lookup(type_name) orelse .err;
+        self.local_types.put("self", self_tid) catch {};
+
+        // register method parameters
+        for (fd.params) |param| {
+            if (param.type_expr) |te| {
+                const tid = self.resolveTypeExprToId(te);
+                self.local_types.put(param.name, tid) catch {};
+            }
+        }
+
+        // emit signature
+        try self.emitReturnType(fd.return_type);
+        try self.writeByte(' ');
+        try self.writeStr(type_name);
+        try self.writeByte('_');
+        try self.writeStr(fd.name);
+        try self.writeByte('(');
+        try self.writeStr(type_name);
+        try self.writeStr(" self");
+        for (fd.params) |param| {
+            try self.writeStr(", ");
+            if (param.type_expr) |te| {
+                try self.emitTypeExpr(te);
+            } else {
+                try self.writeStr("/* unknown */");
+            }
+            try self.writeByte(' ');
+            try self.writeStr(param.name);
+        }
+        try self.writeStr(") {\n");
+
+        self.indent_level += 1;
+        try self.emitBlock(&fd.body);
+        self.indent_level -= 1;
+        try self.writeStr("}\n\n");
     }
 
     fn emitFnDef(self: *CEmitter, fd: *const ast.FnDecl) EmitError!void {
@@ -471,8 +616,23 @@ pub const CEmitter = struct {
                     else => try self.writeStr("/* unknown */"),
                 }
             },
-            .method_call => |_| {
-                // method calls are harder to infer — emit a placeholder
+            .method_call => |mc| {
+                // resolve receiver type and look up method return type
+                const receiver_tid = self.inferExprType(mc.receiver);
+                const type_name = self.typeNameFromId(receiver_tid);
+                if (type_name) |tn| {
+                    if (self.lookupMethodKey(tn, mc.method)) |method_tid| {
+                        if (self.type_table.get(method_tid)) |ty| {
+                            switch (ty) {
+                                .function => |f| {
+                                    try self.emitCType(f.return_type);
+                                    return;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }
                 try self.writeStr("/* method_result */");
             },
             .field_access => |_| {
@@ -795,12 +955,49 @@ pub const CEmitter = struct {
     }
 
     fn emitMethodCall(self: *CEmitter, mc: *const ast.MethodCallExpr) EmitError!void {
-        // methods are emitted as TypeName_method(receiver, args...)
-        // we need the receiver's type name — for now, emit a placeholder
-        // until PR 5 adds proper method support
-        try self.writeStr("/* method call: ");
-        try self.writeStr(mc.method);
-        try self.writeStr(" */");
+        // methods are emitted as TypeName_methodname(receiver, args...)
+        // resolve the receiver's type to get the type name
+        const receiver_tid = self.inferExprType(mc.receiver);
+        const type_name = self.typeNameFromId(receiver_tid);
+
+        if (type_name) |name| {
+            try self.writeStr(name);
+            try self.writeByte('_');
+            try self.writeStr(mc.method);
+            try self.writeByte('(');
+            try self.emitExpr(mc.receiver);
+            for (mc.args) |arg| {
+                try self.writeStr(", ");
+                try self.emitExpr(arg.value);
+            }
+            try self.writeByte(')');
+        } else {
+            // fallback — can't resolve receiver type
+            try self.writeStr("/* method call: ");
+            try self.writeStr(mc.method);
+            try self.writeStr(" */");
+        }
+    }
+
+    /// get the type name string for a TypeId by looking it up in the type table.
+    fn typeNameFromId(self: *const CEmitter, tid: TypeId) ?[]const u8 {
+        if (tid.isErr()) return null;
+        const ty = self.type_table.get(tid) orelse return null;
+        return switch (ty) {
+            .@"struct" => |s| s.name,
+            .@"enum" => |e| e.name,
+            else => null,
+        };
+    }
+
+    /// look up a method's function type id from the checker's method_types.
+    /// key format is "TypeName.methodName".
+    fn lookupMethodKey(self: *const CEmitter, type_name: []const u8, method_name: []const u8) ?TypeId {
+        // build the key in a stack buffer to avoid allocation
+        var buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}.{s}", .{ type_name, method_name }) catch return null;
+        const entry = self.method_types.get(key) orelse return null;
+        return entry.type_id;
     }
 
     fn emitFieldAccess(self: *CEmitter, fa: *const ast.FieldAccess) EmitError!void {
@@ -1135,6 +1332,11 @@ pub const CEmitter = struct {
             .string_lit, .string_interp => .string,
             .bool_lit => .bool,
             .none_lit => .void,
+            .self_expr => {
+                // `self` is registered as a local variable in method bodies
+                if (self.local_types.get("self")) |tid| return tid;
+                return .err;
+            },
             .ident => |name| {
                 // check local variables first
                 if (self.local_types.get(name)) |tid| return tid;
@@ -1183,6 +1385,7 @@ pub const CEmitter = struct {
                     .ident => |n| n,
                     else => return .err,
                 };
+                // check module scope first (functions, builtins)
                 if (self.module_scope.lookup(name)) |binding| {
                     if (self.type_table.get(binding.type_id)) |ty| {
                         switch (ty) {
@@ -1190,6 +1393,28 @@ pub const CEmitter = struct {
                             .@"struct" => return binding.type_id,
                             else => {},
                         }
+                    }
+                }
+                // check type table for struct/enum constructors
+                if (self.type_table.lookup(name)) |tid| {
+                    if (self.type_table.get(tid)) |ty| {
+                        switch (ty) {
+                            .@"struct", .@"enum" => return tid,
+                            else => {},
+                        }
+                    }
+                }
+                return .err;
+            },
+            .method_call => |mc| {
+                // resolve the receiver's type, then look up the method
+                const receiver_tid = self.inferExprType(mc.receiver);
+                const type_name = self.typeNameFromId(receiver_tid) orelse return .err;
+                const key = self.lookupMethodKey(type_name, mc.method) orelse return .err;
+                if (self.type_table.get(key)) |ty| {
+                    switch (ty) {
+                        .function => |f| return f.return_type,
+                        else => {},
                     }
                 }
                 return .err;
@@ -1388,7 +1613,10 @@ test "emitter init and deinit" {
     var scope = Scope.init(std.testing.allocator, null);
     defer scope.deinit();
 
-    var emitter = CEmitter.init(std.testing.allocator, &table, &scope);
+    var methods = std.StringHashMap(Checker.MethodEntry).init(std.testing.allocator);
+    defer methods.deinit();
+
+    var emitter = CEmitter.init(std.testing.allocator, &table, &scope, &methods);
     defer emitter.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), emitter.getOutput().len);
@@ -1401,7 +1629,10 @@ test "emitPreamble writes includes" {
     var scope = Scope.init(std.testing.allocator, null);
     defer scope.deinit();
 
-    var emitter = CEmitter.init(std.testing.allocator, &table, &scope);
+    var methods = std.StringHashMap(Checker.MethodEntry).init(std.testing.allocator);
+    defer methods.deinit();
+
+    var emitter = CEmitter.init(std.testing.allocator, &table, &scope, &methods);
     defer emitter.deinit();
 
     try emitter.emitPreamble();
@@ -1448,7 +1679,7 @@ test "full pipeline emits valid C for simple program" {
     try std.testing.expect(!checker.diagnostics.hasErrors());
 
     // emit
-    var emitter = CEmitter.init(allocator, &checker.type_table, &checker.module_scope);
+    var emitter = CEmitter.init(allocator, &checker.type_table, &checker.module_scope, &checker.method_types);
     defer emitter.deinit();
     try emitter.emitModule(&module);
 

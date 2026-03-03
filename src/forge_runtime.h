@@ -112,6 +112,106 @@ static inline forge_string_t forge_bool_to_string(bool b) {
 }
 
 // ---------------------------------------------------------------
+// collection types
+// ---------------------------------------------------------------
+
+// List[T] — ordered collection backed by a contiguous array.
+// stores elements as raw bytes; callers use typed macros to access.
+typedef struct {
+    void *data;
+    int64_t len;
+} forge_list_t;
+
+// Map[K,V] — key-value collection backed by parallel arrays.
+// linear scan for lookups — fine for small maps, which is all we need now.
+typedef struct {
+    void *keys;
+    void *values;
+    int64_t len;
+} forge_map_t;
+
+// Set[T] — unique element collection. same layout as list for now.
+typedef forge_list_t forge_set_t;
+
+// ---------------------------------------------------------------
+// collection creation
+// ---------------------------------------------------------------
+
+// create a list from an initializer array. copies the data.
+static inline forge_list_t forge_list_create(int64_t len, int64_t elem_size, const void *init) {
+    forge_list_t list;
+    list.len = len;
+    if (len == 0 || !init) {
+        list.data = NULL;
+        return list;
+    }
+    list.data = malloc((size_t)(len * elem_size));
+    if (!list.data) {
+        fprintf(stderr, "forge: out of memory\n");
+        exit(1);
+    }
+    memcpy(list.data, init, (size_t)(len * elem_size));
+    return list;
+}
+
+// create a map from parallel key/value arrays. copies both.
+static inline forge_map_t forge_map_create(int64_t len, int64_t key_size, int64_t val_size,
+                                           const void *init_keys, const void *init_vals) {
+    forge_map_t map;
+    map.len = len;
+    if (len == 0) {
+        map.keys = NULL;
+        map.values = NULL;
+        return map;
+    }
+    map.keys = malloc((size_t)(len * key_size));
+    map.values = malloc((size_t)(len * val_size));
+    if (!map.keys || !map.values) {
+        fprintf(stderr, "forge: out of memory\n");
+        exit(1);
+    }
+    memcpy(map.keys, init_keys, (size_t)(len * key_size));
+    memcpy(map.values, init_vals, (size_t)(len * val_size));
+    return map;
+}
+
+// create a set (same as list — just unique elements).
+static inline forge_set_t forge_set_create(int64_t len, int64_t elem_size, const void *init) {
+    return forge_list_create(len, elem_size, init);
+}
+
+// ---------------------------------------------------------------
+// collection access
+// ---------------------------------------------------------------
+
+// typed element access for lists: FORGE_LIST_GET(list, int64_t, 0)
+#define FORGE_LIST_GET(list, type, idx) (((type *)(list).data)[(idx)])
+
+// look up a value in a map by integer key. returns pointer to the value slot,
+// or NULL if not found. caller casts to the value type.
+static inline void *forge_map_get_by_int(forge_map_t map, int64_t key, int64_t val_size) {
+    int64_t *keys = (int64_t *)map.keys;
+    for (int64_t i = 0; i < map.len; i++) {
+        if (keys[i] == key) {
+            return (char *)map.values + i * val_size;
+        }
+    }
+    return NULL;
+}
+
+// look up a value in a map by string key. returns pointer to the value slot,
+// or NULL if not found.
+static inline void *forge_map_get_by_string(forge_map_t map, forge_string_t key, int64_t val_size) {
+    forge_string_t *keys = (forge_string_t *)map.keys;
+    for (int64_t i = 0; i < map.len; i++) {
+        if (forge_string_eq(keys[i], key)) {
+            return (char *)map.values + i * val_size;
+        }
+    }
+    return NULL;
+}
+
+// ---------------------------------------------------------------
 // built-in functions
 // ---------------------------------------------------------------
 

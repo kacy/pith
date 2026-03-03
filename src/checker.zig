@@ -877,7 +877,7 @@ pub const Checker = struct {
     /// resolve a generic type by name with already-resolved type arguments.
     /// handles builtin generics (Task, Channel) and user-defined generics.
     fn resolveGenericTypeWithArgs(self: *Checker, name: []const u8, arg_ids: []const TypeId, location: Location) TypeId {
-        // Task[T] and Channel[T] — builtin semantic types
+        // builtin generic types
         if (arg_ids.len == 1) {
             if (std.mem.eql(u8, name, "Task")) {
                 return self.type_table.addType(.{ .task = .{ .inner = arg_ids[0] } }) catch return .err;
@@ -885,6 +885,18 @@ pub const Checker = struct {
             if (std.mem.eql(u8, name, "Channel")) {
                 return self.type_table.addType(.{ .channel = .{ .inner = arg_ids[0] } }) catch return .err;
             }
+            if (std.mem.eql(u8, name, "List")) {
+                return self.type_table.addType(.{ .list = .{ .element = arg_ids[0] } }) catch return .err;
+            }
+            if (std.mem.eql(u8, name, "Set")) {
+                return self.type_table.addType(.{ .set = .{ .element = arg_ids[0] } }) catch return .err;
+            }
+        }
+        if (arg_ids.len == 2 and std.mem.eql(u8, name, "Map")) {
+            return self.type_table.addType(.{ .map = .{
+                .key = arg_ids[0],
+                .value = arg_ids[1],
+            } }) catch return .err;
         }
 
         // look up user-defined generic
@@ -1271,9 +1283,9 @@ pub const Checker = struct {
             .await_expr => |inner| self.checkAwaitExpr(inner, expr.location, scope),
             .match_expr => |m| self.checkMatchExpr(m, scope),
             .lambda => |lam| self.checkLambda(lam, scope),
-            .list => .err,
-            .map => .err,
-            .set => .err,
+            .list => |elems| self.checkListExpr(elems, expr.location, scope),
+            .map => |entries| self.checkMapExpr(entries, expr.location, scope),
+            .set => |elems| self.checkSetExpr(elems, expr.location, scope),
             .tuple => |elems| self.checkTupleExpr(elems, expr.location, scope),
             .self_expr => self.checkSelfExpr(expr.location, scope),
 
@@ -2036,6 +2048,97 @@ pub const Checker = struct {
         } }) catch return .err;
     }
 
+    /// check a list literal [a, b, c]. all elements must have the same type.
+    /// an empty list produces an error — the type can't be inferred without context.
+    fn checkListExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
+        if (elems.len == 0) {
+            self.diagnostics.addError(location, "cannot infer element type of empty list") catch {};
+            return .err;
+        }
+
+        const first_type = self.checkExpr(elems[0], scope);
+        if (first_type.isErr()) return .err;
+
+        for (elems[1..]) |elem| {
+            const elem_type = self.checkExpr(elem, scope);
+            if (elem_type.isErr()) return .err;
+            if (elem_type != first_type) {
+                self.diagnostics.addError(elem.location, self.fmt(
+                    "list element type mismatch: expected {s}, got {s}",
+                    .{ self.type_table.typeName(first_type), self.type_table.typeName(elem_type) },
+                )) catch {};
+                return .err;
+            }
+        }
+
+        return self.type_table.addType(.{ .list = .{ .element = first_type } }) catch return .err;
+    }
+
+    /// check a map literal {k: v, ...}. all keys must share a type, all values must share a type.
+    /// an empty map {} is allowed — but the type can't be inferred, so we return err.
+    fn checkMapExpr(self: *Checker, entries: []const ast.MapEntry, location: Location, scope: *const Scope) TypeId {
+        if (entries.len == 0) {
+            self.diagnostics.addError(location, "cannot infer types of empty map") catch {};
+            return .err;
+        }
+
+        const first_key_type = self.checkExpr(entries[0].key, scope);
+        const first_val_type = self.checkExpr(entries[0].value, scope);
+        if (first_key_type.isErr() or first_val_type.isErr()) return .err;
+
+        for (entries[1..]) |entry| {
+            const key_type = self.checkExpr(entry.key, scope);
+            if (!key_type.isErr() and key_type != first_key_type) {
+                self.diagnostics.addError(entry.location, self.fmt(
+                    "map key type mismatch: expected {s}, got {s}",
+                    .{ self.type_table.typeName(first_key_type), self.type_table.typeName(key_type) },
+                )) catch {};
+                return .err;
+            }
+
+            const val_type = self.checkExpr(entry.value, scope);
+            if (!val_type.isErr() and val_type != first_val_type) {
+                self.diagnostics.addError(entry.location, self.fmt(
+                    "map value type mismatch: expected {s}, got {s}",
+                    .{ self.type_table.typeName(first_val_type), self.type_table.typeName(val_type) },
+                )) catch {};
+                return .err;
+            }
+        }
+
+        return self.type_table.addType(.{ .map = .{
+            .key = first_key_type,
+            .value = first_val_type,
+        } }) catch return .err;
+    }
+
+    /// check a set literal {a, b, c}. all elements must have the same type.
+    fn checkSetExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
+        if (elems.len == 0) {
+            // the parser emits empty {} as a map, not a set, so this shouldn't
+            // happen in practice — but guard against it.
+            self.diagnostics.addError(location, "cannot infer element type of empty set") catch {};
+            return .err;
+        }
+
+        const first_type = self.checkExpr(elems[0], scope);
+        if (first_type.isErr()) return .err;
+
+        for (elems[1..]) |elem| {
+            const elem_type = self.checkExpr(elem, scope);
+            if (elem_type.isErr()) return .err;
+            if (elem_type != first_type) {
+                self.diagnostics.addError(elem.location, self.fmt(
+                    "set element type mismatch: expected {s}, got {s}",
+                    .{ self.type_table.typeName(first_type), self.type_table.typeName(elem_type) },
+                )) catch {};
+                return .err;
+            }
+        }
+
+        return self.type_table.addType(.{ .set = .{ .element = first_type } }) catch return .err;
+    }
+
     fn checkTupleExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
         if (elems.len == 0) {
             self.diagnostics.addError(location, "empty tuple is not allowed") catch {};
@@ -2228,14 +2331,63 @@ test "Task[Unknown] produces error" {
     try std.testing.expect(id.isErr());
 }
 
-test "undeclared generic List[Int] errors" {
+test "List[Int] resolves to list type" {
     var checker = try Checker.init(std.testing.allocator, "");
     defer checker.deinit();
 
-    // List is not declared, so List[Int] should error with "unknown generic type"
     const inner = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
     const generic = ast.TypeExpr{
         .kind = .{ .generic = .{ .name = "List", .args = &.{&inner} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(!id.isErr());
+
+    const ty = checker.type_table.get(id).?;
+    try std.testing.expectEqual(TypeId.int, ty.list.element);
+}
+
+test "Map[String, Int] resolves to map type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const key_te = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const val_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Map", .args = &.{ &key_te, &val_te } } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(!id.isErr());
+
+    const ty = checker.type_table.get(id).?;
+    try std.testing.expectEqual(TypeId.string, ty.map.key);
+    try std.testing.expectEqual(TypeId.int, ty.map.value);
+}
+
+test "Set[Bool] resolves to set type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "Bool" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Set", .args = &.{&inner} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(!id.isErr());
+
+    const ty = checker.type_table.get(id).?;
+    try std.testing.expectEqual(TypeId.bool, ty.set.element);
+}
+
+test "undeclared generic Foo[Int] errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Foo", .args = &.{&inner} } },
         .location = Location.zero,
     };
     const id = checker.resolveTypeExpr(&generic);

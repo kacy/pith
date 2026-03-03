@@ -147,6 +147,17 @@ pub const Type = union(enum) {
 // type table
 // ---------------------------------------------------------------
 
+/// all builtin type names, indexed by TypeId ordinal. this is the single
+/// source of truth — both registerBuiltins and typeName use this array.
+/// if you add a new builtin to TypeId, add its name here and update
+/// first_user. the array length is checked at comptime.
+const builtin_names = [TypeId.first_user][]const u8{
+    "Int", "UInt", "Float", "Bool", "String", "Bytes", "Void",
+    "Int8", "Int16", "Int32", "Int64",
+    "UInt8", "UInt16", "UInt32", "UInt64",
+    "<error>",
+};
+
 /// the central type registry. all types in a program live here as a flat
 /// array indexed by TypeId. builtins are pre-registered at init.
 pub const TypeTable = struct {
@@ -195,73 +206,37 @@ pub const TypeTable = struct {
 
     /// get a human-readable name for a type (used in error messages).
     pub fn typeName(self: *const TypeTable, id: TypeId) []const u8 {
-        // builtins have well-known names
-        return switch (id) {
-            .int => "Int",
-            .uint => "UInt",
-            .float => "Float",
-            .bool => "Bool",
-            .string => "String",
-            .bytes => "Bytes",
-            .void => "Void",
-            .int8 => "Int8",
-            .int16 => "Int16",
-            .int32 => "Int32",
-            .int64 => "Int64",
-            .uint8 => "UInt8",
-            .uint16 => "UInt16",
-            .uint32 => "UInt32",
-            .uint64 => "UInt64",
-            .err => "<error>",
-            _ => {
-                // user-defined type — look up in the table
-                if (self.get(id)) |ty| {
-                    return switch (ty) {
-                        .primitive => |p| p.name,
-                        .@"struct" => |s| s.name,
-                        .@"enum" => |e| e.name,
-                        .function => "fn",
-                        .optional => "optional",
-                        .result => "result",
-                        .tuple => "tuple",
-                        .task => "Task",
-                        .channel => "Channel",
-                        .list => "List",
-                        .map => "Map",
-                        .set => "Set",
-                    };
-                }
-                return "<unknown>";
-            },
-        };
+        const idx = id.index();
+
+        // builtins use the shared name table — single source of truth
+        if (idx < TypeId.first_user) return builtin_names[idx];
+
+        // user-defined type — look up in the table
+        if (self.get(id)) |ty| {
+            return switch (ty) {
+                .primitive => |p| p.name,
+                .@"struct" => |s| s.name,
+                .@"enum" => |e| e.name,
+                .function => "fn",
+                .optional => "optional",
+                .result => "result",
+                .tuple => "tuple",
+                .task => "Task",
+                .channel => "Channel",
+                .list => "List",
+                .map => "Map",
+                .set => "Set",
+            };
+        }
+        return "<unknown>";
     }
 
     // -- builtin registration --
 
     fn registerBuiltins(self: *TypeTable) !void {
-        // the order here must match the TypeId enum values exactly
-        const builtins = [_]struct { name: []const u8 }{
-            .{ .name = "Int" },
-            .{ .name = "UInt" },
-            .{ .name = "Float" },
-            .{ .name = "Bool" },
-            .{ .name = "String" },
-            .{ .name = "Bytes" },
-            .{ .name = "Void" },
-            .{ .name = "Int8" },
-            .{ .name = "Int16" },
-            .{ .name = "Int32" },
-            .{ .name = "Int64" },
-            .{ .name = "UInt8" },
-            .{ .name = "UInt16" },
-            .{ .name = "UInt32" },
-            .{ .name = "UInt64" },
-            .{ .name = "<error>" },
-        };
-
-        for (builtins) |b| {
-            const id = try self.addType(.{ .primitive = .{ .name = b.name } });
-            try self.name_map.put(b.name, id);
+        for (builtin_names) |name| {
+            const id = try self.addType(.{ .primitive = .{ .name = name } });
+            try self.name_map.put(name, id);
         }
 
         // sanity check: the first user slot is right after the builtins

@@ -611,16 +611,19 @@ pub const Checker = struct {
 
     fn checkReturnStmt(self: *Checker, ret: ast.ReturnStmt, location: Location, scope: *const Scope) void {
         const expected = scope.return_type orelse {
-            self.diagnostics.addCodedError(.E231, location, "return statement outside of function") catch {};
+            self.diagnostics.addCodedErrorWithFix(.E231, location, "return statement outside of function", "'return' can only be used inside a function body") catch {};
             return;
         };
 
         if (ret.value) |value| {
             const actual = self.checkExpr(value, scope);
             if (!actual.isErr() and !expected.isErr() and actual != expected) {
-                self.diagnostics.addCodedError(.E200, value.location, self.fmt(
+                self.diagnostics.addCodedErrorWithFix(.E200, value.location, self.fmt(
                     "return type mismatch: expected {s}, got {s}",
                     .{ self.type_table.typeName(expected), self.type_table.typeName(actual) },
+                ), self.fmt(
+                    "change the return type to {s}",
+                    .{self.type_table.typeName(actual)},
                 )) catch {};
             }
         } else {
@@ -662,8 +665,11 @@ pub const Checker = struct {
             const name = a.target.kind.ident;
             if (scope.lookup(name)) |binding| {
                 if (!binding.is_mut) {
-                    self.diagnostics.addCodedError(.E216, a.target.location, self.fmt(
+                    self.diagnostics.addCodedErrorWithFix(.E216, a.target.location, self.fmt(
                         "cannot assign to immutable variable '{s}'",
+                        .{name},
+                    ), self.fmt(
+                        "declare with 'mut' to make it mutable: mut {s} := ...",
                         .{name},
                     )) catch {};
                     return;
@@ -1238,7 +1244,7 @@ pub const Checker = struct {
     fn checkSelfExpr(self: *Checker, location: Location, scope: *const Scope) TypeId {
         if (scope.lookup("self")) |binding| return binding.type_id;
 
-        self.diagnostics.addCodedError(.E229, location, "'self' can only be used inside a method body") catch {};
+        self.diagnostics.addCodedErrorWithFix(.E229, location, "'self' can only be used inside a method body", "define methods inside an 'impl' block with 'self' as the first parameter") catch {};
         return .err;
     }
 
@@ -1478,10 +1484,10 @@ pub const Checker = struct {
             }
         }
 
-        self.diagnostics.addCodedError(.E224, location, self.fmt(
+        self.diagnostics.addCodedErrorWithFix(.E224, location, self.fmt(
             "cannot unwrap non-optional type {s}",
             .{self.type_table.typeName(inner_type)},
-        )) catch {};
+        ), "'?' can only unwrap Optional types (T?)") catch {};
         return .err;
     }
 
@@ -1517,10 +1523,10 @@ pub const Checker = struct {
             }
         }
 
-        self.diagnostics.addCodedError(.E224, location, self.fmt(
+        self.diagnostics.addCodedErrorWithFix(.E224, location, self.fmt(
             "cannot use '!' on non-result type {s}",
             .{self.type_table.typeName(inner_type)},
-        )) catch {};
+        ), "'!' can only propagate errors from Result types (T!)") catch {};
         return .err;
     }
 

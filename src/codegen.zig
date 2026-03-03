@@ -2122,9 +2122,11 @@ pub const CEmitter = struct {
             return;
         }
 
-        // substring(start, end) — two int args
-        if (std.mem.eql(u8, method, "substring")) {
-            try self.writeStr("forge_string_substring(");
+        // two-arg string methods: substring(start, end), replace(old, new)
+        if (std.mem.eql(u8, method, "substring") or std.mem.eql(u8, method, "replace")) {
+            try self.writeStr("forge_string_");
+            try self.writeStr(method);
+            try self.writeByte('(');
             try self.emitExpr(mc.receiver);
             try self.writeStr(", ");
             try self.emitExpr(mc.args[0].value);
@@ -2442,6 +2444,7 @@ pub const CEmitter = struct {
         if (std.mem.eql(u8, method, "to_upper")) return .string;
         if (std.mem.eql(u8, method, "to_lower")) return .string;
         if (std.mem.eql(u8, method, "substring")) return .string;
+        if (std.mem.eql(u8, method, "replace")) return .string;
         if (std.mem.eql(u8, method, "split")) {
             return self.type_table.lookup("List[String]") orelse .err;
         }
@@ -2611,6 +2614,17 @@ pub const CEmitter = struct {
 
     fn emitIndexExpr(self: *CEmitter, idx: *const ast.IndexExpr) EmitError!void {
         const obj_tid = self.inferExprType(idx.object);
+
+        // string indexing: s[n] → forge_string_char_at(s, n)
+        if (obj_tid == .string) {
+            try self.writeStr("forge_string_char_at(");
+            try self.emitExpr(idx.object);
+            try self.writeStr(", ");
+            try self.emitExpr(idx.index);
+            try self.writeByte(')');
+            return;
+        }
+
         if (self.type_table.get(obj_tid)) |ty| {
             switch (ty) {
                 .list => |l| {
@@ -3267,6 +3281,7 @@ pub const CEmitter = struct {
             },
             .index => |idx| {
                 const obj_tid = self.inferExprType(idx.object);
+                if (obj_tid == .string) return .string;
                 if (self.type_table.get(obj_tid)) |ty| {
                     return switch (ty) {
                         .list => |l| l.element,

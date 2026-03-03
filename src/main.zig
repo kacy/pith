@@ -7,7 +7,9 @@ const Token = lexer_mod.Token;
 const Parser = @import("parser.zig").Parser;
 const errors = @import("errors.zig");
 const printer = @import("printer.zig");
-const Checker = @import("checker.zig").Checker;
+const checker_mod = @import("checker.zig");
+const Checker = checker_mod.Checker;
+const CEmitter = @import("codegen.zig").CEmitter;
 const ast = @import("ast.zig");
 const io = @import("io.zig");
 
@@ -143,6 +145,18 @@ pub fn main() !void {
             return;
         };
         try runCheck(allocator, file_path);
+    } else if (std.mem.eql(u8, cmd, "build")) {
+        const file_path = args.next() orelse {
+            io.writeErr("error: forge build requires a file path\n", .{});
+            return;
+        };
+        try runBuild(allocator, file_path, false);
+    } else if (std.mem.eql(u8, cmd, "run")) {
+        const file_path = args.next() orelse {
+            io.writeErr("error: forge run requires a file path\n", .{});
+            return;
+        };
+        try runBuild(allocator, file_path, true);
     } else {
         io.writeErr("error: unknown command '{s}'\n", .{cmd});
         printUsage();
@@ -217,6 +231,150 @@ fn runCheck(allocator: std.mem.Allocator, path: []const u8) !void {
     }
 }
 
+/// the forge runtime header, embedded at compile time. written to the
+/// build directory so the C compiler can find it via #include.
+const runtime_header = @embedFile("forge_runtime.h");
+
+/// lex, parse, type-check, generate C, and compile a forge source file.
+/// if `run_after` is true, also executes the resulting binary.
+fn runBuild(allocator: std.mem.Allocator, path: []const u8, run_after: bool) !void {
+    const source = readSourceFile(allocator, path) orelse return;
+    defer allocator.free(source);
+
+    var result = try lexAndParse(allocator, source) orelse return;
+    defer result.deinit(allocator);
+
+    var checker = Checker.init(allocator, source) catch {
+        io.writeErr("error: checker init failed (out of memory)\n", .{});
+        return;
+    };
+    defer checker.deinit();
+
+    checker.check(&result.module);
+
+    if (checker.diagnostics.hasErrors()) {
+        renderDiagnostics(&checker.diagnostics);
+        return;
+    }
+
+    // generate C
+    var emitter = CEmitter.init(allocator, &checker.type_table, &checker.module_scope);
+    defer emitter.deinit();
+
+    emitter.emitModule(&result.module) catch {
+        io.writeErr("error: code generation failed (out of memory)\n", .{});
+        return;
+    };
+
+    // determine output paths
+    const stem = stripExtension(std.fs.path.basename(path));
+
+    // create a build directory next to the source
+    const dir = std.fs.path.dirname(path) orelse ".";
+    const build_dir = std.fs.path.join(allocator, &.{ dir, ".forge-build" }) catch {
+        io.writeErr("error: out of memory\n", .{});
+        return;
+    };
+    defer allocator.free(build_dir);
+
+    std.fs.cwd().makePath(build_dir) catch |err| {
+        io.writeErr("error: could not create build directory: {}\n", .{err});
+        return;
+    };
+
+    // write the runtime header
+    const header_path = std.fs.path.join(allocator, &.{ build_dir, "forge_runtime.h" }) catch {
+        io.writeErr("error: out of memory\n", .{});
+        return;
+    };
+    defer allocator.free(header_path);
+    writeFile(header_path, runtime_header) catch |err| {
+        io.writeErr("error: could not write runtime header: {}\n", .{err});
+        return;
+    };
+
+    // write the generated C source
+    const c_filename = std.fmt.allocPrint(allocator, "{s}.c", .{stem}) catch {
+        io.writeErr("error: out of memory\n", .{});
+        return;
+    };
+    defer allocator.free(c_filename);
+    const c_path = std.fs.path.join(allocator, &.{ build_dir, c_filename }) catch {
+        io.writeErr("error: out of memory\n", .{});
+        return;
+    };
+    defer allocator.free(c_path);
+    writeFile(c_path, emitter.getOutput()) catch |err| {
+        io.writeErr("error: could not write generated C: {}\n", .{err});
+        return;
+    };
+
+    // compile with zig cc
+    const out_path = std.fs.path.join(allocator, &.{ dir, stem }) catch {
+        io.writeErr("error: out of memory\n", .{});
+        return;
+    };
+    defer allocator.free(out_path);
+
+    const cc_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "zig", "cc", "-o", out_path, "-I", build_dir, c_path },
+    }) catch |err| {
+        io.writeErr("error: could not run zig cc: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(cc_result.stdout);
+    defer allocator.free(cc_result.stderr);
+
+    if (cc_result.term.Exited != 0) {
+        io.writeErr("error: C compilation failed:\n{s}", .{cc_result.stderr});
+        return;
+    }
+
+    if (!run_after) {
+        io.write("built {s}\n", .{out_path});
+        return;
+    }
+
+    // run the binary
+    const run_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{out_path},
+    }) catch |err| {
+        io.writeErr("error: could not run binary: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(run_result.stdout);
+    defer allocator.free(run_result.stderr);
+
+    // print stdout directly
+    if (run_result.stdout.len > 0) {
+        var buf: [io.write_buf_size]u8 = undefined;
+        var w = std.fs.File.stdout().writer(&buf);
+        w.interface.writeAll(run_result.stdout) catch {};
+        w.interface.flush() catch {};
+    }
+    if (run_result.stderr.len > 0) {
+        var buf: [io.write_buf_size]u8 = undefined;
+        var w = std.fs.File.stderr().writer(&buf);
+        w.interface.writeAll(run_result.stderr) catch {};
+        w.interface.flush() catch {};
+    }
+}
+
+fn writeFile(path: []const u8, content: []const u8) !void {
+    const file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+    try file.writeAll(content);
+}
+
+fn stripExtension(filename: []const u8) []const u8 {
+    if (std.mem.lastIndexOf(u8, filename, ".")) |dot| {
+        return filename[0..dot];
+    }
+    return filename;
+}
+
 fn printVersion() void {
     io.write("forge {s}\n", .{version});
 }
@@ -228,6 +386,8 @@ fn printUsage() void {
         \\usage: forge <command> [options]
         \\
         \\commands:
+        \\  build <file>   compile to native binary
+        \\  run <file>     compile and run
         \\  check <file>   type check a source file
         \\  lex <file>     tokenize a source file
         \\  parse <file>   parse and print AST

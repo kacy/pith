@@ -1978,34 +1978,13 @@ pub const CEmitter = struct {
             if (self.type_table.get(receiver_tid)) |ty| {
                 switch (ty) {
                     .list => |l| {
-                        if (std.mem.eql(u8, mc.method, "push") and mc.args.len == 1) {
-                            return self.emitCollectionPush(mc.receiver, mc.args[0].value, l.element);
-                        }
-                        if (std.mem.eql(u8, mc.method, "len")) {
-                            try self.emitExpr(mc.receiver);
-                            try self.writeStr(".len");
-                            return;
-                        }
+                        if (try self.emitListMethod(mc, l.element)) return;
                     },
                     .map => |m| {
-                        if (std.mem.eql(u8, mc.method, "insert") and mc.args.len == 2) {
-                            return self.emitMapInsert(mc.receiver, mc.args[0].value, mc.args[1].value, m.key, m.value);
-                        }
-                        if (std.mem.eql(u8, mc.method, "len")) {
-                            try self.emitExpr(mc.receiver);
-                            try self.writeStr(".len");
-                            return;
-                        }
+                        if (try self.emitMapMethod(mc, m.key, m.value)) return;
                     },
                     .set => |s| {
-                        if (std.mem.eql(u8, mc.method, "add") and mc.args.len == 1) {
-                            return self.emitSetAdd(mc.receiver, mc.args[0].value, s.element);
-                        }
-                        if (std.mem.eql(u8, mc.method, "len")) {
-                            try self.emitExpr(mc.receiver);
-                            try self.writeStr(".len");
-                            return;
-                        }
+                        if (try self.emitSetMethod(mc, s.element)) return;
                     },
                     else => {},
                 }
@@ -2174,6 +2153,216 @@ pub const CEmitter = struct {
         try self.writeStr("))");
     }
 
+    /// emit a built-in list method call. returns true if handled.
+    fn emitListMethod(self: *CEmitter, mc: *const ast.MethodCallExpr, elem_type: TypeId) EmitError!bool {
+        const method = mc.method;
+        const c_type = self.cTypeStringForId(elem_type);
+
+        if (std.mem.eql(u8, method, "push") and mc.args.len == 1) {
+            try self.emitCollectionPush(mc.receiver, mc.args[0].value, elem_type);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "len") or std.mem.eql(u8, method, "is_empty")) {
+            if (std.mem.eql(u8, method, "is_empty")) {
+                try self.writeByte('(');
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(".len == 0)");
+            } else {
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(".len");
+            }
+            return true;
+        }
+        if (std.mem.eql(u8, method, "remove")) {
+            try self.writeStr("forge_list_remove(&");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[0].value);
+            try self.writeStr(", sizeof(");
+            try self.writeStr(c_type);
+            try self.writeStr("))");
+            return true;
+        }
+        if (std.mem.eql(u8, method, "contains")) {
+            if (elem_type == .string) {
+                try self.writeStr("forge_list_contains_string(");
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(", ");
+                try self.emitExpr(mc.args[0].value);
+                try self.writeByte(')');
+            } else {
+                try self.writeStr("forge_list_contains(");
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(", &(");
+                try self.writeStr(c_type);
+                try self.writeStr("){");
+                try self.emitExpr(mc.args[0].value);
+                try self.writeStr("}, sizeof(");
+                try self.writeStr(c_type);
+                try self.writeStr("))");
+            }
+            return true;
+        }
+        if (std.mem.eql(u8, method, "reverse")) {
+            try self.writeStr("forge_list_reverse(&");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", sizeof(");
+            try self.writeStr(c_type);
+            try self.writeStr("))");
+            return true;
+        }
+        if (std.mem.eql(u8, method, "clear")) {
+            try self.writeStr("forge_list_clear(&");
+            try self.emitExpr(mc.receiver);
+            try self.writeByte(')');
+            return true;
+        }
+        return false;
+    }
+
+    /// emit a built-in map method call. returns true if handled.
+    fn emitMapMethod(self: *CEmitter, mc: *const ast.MethodCallExpr, key_type: TypeId, val_type: TypeId) EmitError!bool {
+        const method = mc.method;
+        const key_c = self.cTypeStringForId(key_type);
+        const val_c = self.cTypeStringForId(val_type);
+
+        if (std.mem.eql(u8, method, "insert") and mc.args.len == 2) {
+            try self.emitMapInsert(mc.receiver, mc.args[0].value, mc.args[1].value, key_type, val_type);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "len")) {
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(".len");
+            return true;
+        }
+        if (std.mem.eql(u8, method, "is_empty")) {
+            try self.writeByte('(');
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(".len == 0)");
+            return true;
+        }
+        if (std.mem.eql(u8, method, "contains_key")) {
+            if (key_type == .string) {
+                try self.writeStr("forge_map_contains_key_string(");
+            } else {
+                try self.writeStr("forge_map_contains_key_int(");
+            }
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[0].value);
+            try self.writeByte(')');
+            return true;
+        }
+        if (std.mem.eql(u8, method, "remove")) {
+            if (key_type == .string) {
+                try self.writeStr("forge_map_remove_by_string(&");
+            } else {
+                try self.writeStr("forge_map_remove_by_int(&");
+            }
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[0].value);
+            try self.writeStr(", sizeof(");
+            try self.writeStr(key_c);
+            try self.writeStr("), sizeof(");
+            try self.writeStr(val_c);
+            try self.writeStr("))");
+            return true;
+        }
+        if (std.mem.eql(u8, method, "keys")) {
+            try self.writeStr("forge_map_keys(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", sizeof(");
+            try self.writeStr(key_c);
+            try self.writeStr("))");
+            return true;
+        }
+        if (std.mem.eql(u8, method, "values")) {
+            try self.writeStr("forge_map_values(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", sizeof(");
+            try self.writeStr(val_c);
+            try self.writeStr("))");
+            return true;
+        }
+        if (std.mem.eql(u8, method, "clear")) {
+            try self.writeStr("forge_map_clear(&");
+            try self.emitExpr(mc.receiver);
+            try self.writeByte(')');
+            return true;
+        }
+        return false;
+    }
+
+    /// emit a built-in set method call. returns true if handled.
+    fn emitSetMethod(self: *CEmitter, mc: *const ast.MethodCallExpr, elem_type: TypeId) EmitError!bool {
+        const method = mc.method;
+        const c_type = self.cTypeStringForId(elem_type);
+
+        if (std.mem.eql(u8, method, "add") and mc.args.len == 1) {
+            try self.emitSetAdd(mc.receiver, mc.args[0].value, elem_type);
+            return true;
+        }
+        if (std.mem.eql(u8, method, "len")) {
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(".len");
+            return true;
+        }
+        if (std.mem.eql(u8, method, "is_empty")) {
+            try self.writeByte('(');
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(".len == 0)");
+            return true;
+        }
+        if (std.mem.eql(u8, method, "contains")) {
+            if (elem_type == .string) {
+                try self.writeStr("forge_set_contains_string(");
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(", ");
+                try self.emitExpr(mc.args[0].value);
+                try self.writeByte(')');
+            } else {
+                try self.writeStr("forge_set_contains(");
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(", &(");
+                try self.writeStr(c_type);
+                try self.writeStr("){");
+                try self.emitExpr(mc.args[0].value);
+                try self.writeStr("}, sizeof(");
+                try self.writeStr(c_type);
+                try self.writeStr("))");
+            }
+            return true;
+        }
+        if (std.mem.eql(u8, method, "remove")) {
+            if (elem_type == .string) {
+                try self.writeStr("forge_set_remove_string(&");
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(", ");
+                try self.emitExpr(mc.args[0].value);
+                try self.writeByte(')');
+            } else {
+                try self.writeStr("forge_set_remove(&");
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(", &(");
+                try self.writeStr(c_type);
+                try self.writeStr("){");
+                try self.emitExpr(mc.args[0].value);
+                try self.writeStr("}, sizeof(");
+                try self.writeStr(c_type);
+                try self.writeStr("))");
+            }
+            return true;
+        }
+        if (std.mem.eql(u8, method, "clear")) {
+            try self.writeStr("forge_set_clear(&");
+            try self.emitExpr(mc.receiver);
+            try self.writeByte(')');
+            return true;
+        }
+        return false;
+    }
+
     /// return type inference for built-in String methods.
     fn inferStringMethodType(self: *const CEmitter, method: []const u8) TypeId {
         if (std.mem.eql(u8, method, "len")) return .int;
@@ -2202,6 +2391,53 @@ pub const CEmitter = struct {
         if (std.mem.eql(u8, method, "to_string")) return .string;
         if (std.mem.eql(u8, method, "to_int")) return .int;
         return .err;
+    }
+
+    /// return type inference for built-in List methods.
+    fn inferListMethodType(self: *const CEmitter, method: []const u8, elem_type: TypeId) ?TypeId {
+        if (std.mem.eql(u8, method, "len")) return .int;
+        if (std.mem.eql(u8, method, "is_empty")) return .bool;
+        if (std.mem.eql(u8, method, "contains")) return .bool;
+        if (std.mem.eql(u8, method, "push") or
+            std.mem.eql(u8, method, "remove") or
+            std.mem.eql(u8, method, "reverse") or
+            std.mem.eql(u8, method, "clear")) return .void;
+        _ = self;
+        _ = elem_type;
+        return null;
+    }
+
+    /// return type inference for built-in Map methods.
+    fn inferMapMethodType(self: *const CEmitter, method: []const u8, key_type: TypeId, val_type: TypeId) ?TypeId {
+        if (std.mem.eql(u8, method, "len")) return .int;
+        if (std.mem.eql(u8, method, "is_empty")) return .bool;
+        if (std.mem.eql(u8, method, "contains_key")) return .bool;
+        if (std.mem.eql(u8, method, "insert") or
+            std.mem.eql(u8, method, "remove") or
+            std.mem.eql(u8, method, "clear")) return .void;
+        if (std.mem.eql(u8, method, "keys")) {
+            // look up List[K] type
+            var buf: [128]u8 = undefined;
+            const lookup_name = std.fmt.bufPrint(&buf, "List[{s}]", .{self.type_table.typeName(key_type)}) catch return null;
+            return self.type_table.lookup(lookup_name);
+        }
+        if (std.mem.eql(u8, method, "values")) {
+            var buf: [128]u8 = undefined;
+            const lookup_name = std.fmt.bufPrint(&buf, "List[{s}]", .{self.type_table.typeName(val_type)}) catch return null;
+            return self.type_table.lookup(lookup_name);
+        }
+        return null;
+    }
+
+    /// return type inference for built-in Set methods.
+    fn inferSetMethodType(_: *const CEmitter, method: []const u8) ?TypeId {
+        if (std.mem.eql(u8, method, "len")) return .int;
+        if (std.mem.eql(u8, method, "is_empty")) return .bool;
+        if (std.mem.eql(u8, method, "contains")) return .bool;
+        if (std.mem.eql(u8, method, "add") or
+            std.mem.eql(u8, method, "remove") or
+            std.mem.eql(u8, method, "clear")) return .void;
+        return null;
     }
 
     /// get the type name string for a TypeId by looking it up in the type table.
@@ -2904,12 +3140,18 @@ pub const CEmitter = struct {
                 if (receiver_tid == .float) return self.inferFloatMethodType(mc.method);
                 if (receiver_tid == .bool and std.mem.eql(u8, mc.method, "to_string")) return .string;
 
-                // built-in collection methods (.len)
+                // built-in collection methods
                 if (!receiver_tid.isErr()) {
                     if (self.type_table.get(receiver_tid)) |ty| {
                         switch (ty) {
-                            .list, .map, .set => {
-                                if (std.mem.eql(u8, mc.method, "len")) return .int;
+                            .list => |l| {
+                                if (self.inferListMethodType(mc.method, l.element)) |tid| return tid;
+                            },
+                            .map => |m| {
+                                if (self.inferMapMethodType(mc.method, m.key, m.value)) |tid| return tid;
+                            },
+                            .set => {
+                                if (self.inferSetMethodType(mc.method)) |tid| return tid;
                             },
                             else => {},
                         }

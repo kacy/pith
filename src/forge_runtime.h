@@ -401,6 +401,194 @@ static inline void forge_set_add(forge_set_t *set, const void *elem, int64_t ele
 }
 
 // ---------------------------------------------------------------
+// collection methods
+// ---------------------------------------------------------------
+
+// list — remove element at index
+static inline void forge_list_remove(forge_list_t *list, int64_t idx, int64_t elem_size) {
+    forge_bounds_check(idx, list->len);
+    int64_t remaining = list->len - idx - 1;
+    if (remaining > 0) {
+        memmove((char *)list->data + idx * elem_size,
+                (char *)list->data + (idx + 1) * elem_size,
+                (size_t)(remaining * elem_size));
+    }
+    list->len--;
+}
+
+// list — linear scan for element (generic, uses memcmp)
+static inline bool forge_list_contains(forge_list_t list, const void *elem, int64_t elem_size) {
+    for (int64_t i = 0; i < list.len; i++) {
+        if (memcmp((char *)list.data + i * elem_size, elem, (size_t)elem_size) == 0)
+            return true;
+    }
+    return false;
+}
+
+// list — linear scan for string element
+static inline bool forge_list_contains_string(forge_list_t list, forge_string_t s) {
+    forge_string_t *items = (forge_string_t *)list.data;
+    for (int64_t i = 0; i < list.len; i++) {
+        if (forge_string_eq(items[i], s)) return true;
+    }
+    return false;
+}
+
+// list — reverse in place
+static inline void forge_list_reverse(forge_list_t *list, int64_t elem_size) {
+    if (list->len < 2) return;
+    char tmp[64]; // stack buffer for swap (large enough for any forge type)
+    for (int64_t i = 0; i < list->len / 2; i++) {
+        int64_t j = list->len - 1 - i;
+        char *a = (char *)list->data + i * elem_size;
+        char *b = (char *)list->data + j * elem_size;
+        memcpy(tmp, a, (size_t)elem_size);
+        memcpy(a, b, (size_t)elem_size);
+        memcpy(b, tmp, (size_t)elem_size);
+    }
+}
+
+// list — clear (free data and reset)
+static inline void forge_list_clear(forge_list_t *list) {
+    free(list->data);
+    list->data = NULL;
+    list->len = 0;
+}
+
+// map — remove by string key
+static inline void forge_map_remove_by_string(forge_map_t *map, forge_string_t key,
+                                                int64_t key_size, int64_t val_size) {
+    forge_string_t *keys = (forge_string_t *)map->keys;
+    for (int64_t i = 0; i < map->len; i++) {
+        if (forge_string_eq(keys[i], key)) {
+            int64_t remaining = map->len - i - 1;
+            if (remaining > 0) {
+                memmove((char *)map->keys + i * key_size,
+                        (char *)map->keys + (i + 1) * key_size,
+                        (size_t)(remaining * key_size));
+                memmove((char *)map->values + i * val_size,
+                        (char *)map->values + (i + 1) * val_size,
+                        (size_t)(remaining * val_size));
+            }
+            map->len--;
+            return;
+        }
+    }
+}
+
+// map — remove by integer key
+static inline void forge_map_remove_by_int(forge_map_t *map, int64_t key,
+                                            int64_t key_size, int64_t val_size) {
+    int64_t *keys = (int64_t *)map->keys;
+    for (int64_t i = 0; i < map->len; i++) {
+        if (keys[i] == key) {
+            int64_t remaining = map->len - i - 1;
+            if (remaining > 0) {
+                memmove((char *)map->keys + i * key_size,
+                        (char *)map->keys + (i + 1) * key_size,
+                        (size_t)(remaining * key_size));
+                memmove((char *)map->values + i * val_size,
+                        (char *)map->values + (i + 1) * val_size,
+                        (size_t)(remaining * val_size));
+            }
+            map->len--;
+            return;
+        }
+    }
+}
+
+// map — check key existence (string keys)
+static inline bool forge_map_contains_key_string(forge_map_t map, forge_string_t key) {
+    forge_string_t *keys = (forge_string_t *)map.keys;
+    for (int64_t i = 0; i < map.len; i++) {
+        if (forge_string_eq(keys[i], key)) return true;
+    }
+    return false;
+}
+
+// map — check key existence (integer keys)
+static inline bool forge_map_contains_key_int(forge_map_t map, int64_t key) {
+    int64_t *keys = (int64_t *)map.keys;
+    for (int64_t i = 0; i < map.len; i++) {
+        if (keys[i] == key) return true;
+    }
+    return false;
+}
+
+// map — get all keys as a list
+static inline forge_list_t forge_map_keys(forge_map_t map, int64_t key_size) {
+    forge_list_t result;
+    result.len = map.len;
+    if (map.len == 0) {
+        result.data = NULL;
+        return result;
+    }
+    result.data = malloc((size_t)(map.len * key_size));
+    if (!result.data) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(result.data, map.keys, (size_t)(map.len * key_size));
+    return result;
+}
+
+// map — get all values as a list
+static inline forge_list_t forge_map_values(forge_map_t map, int64_t val_size) {
+    forge_list_t result;
+    result.len = map.len;
+    if (map.len == 0) {
+        result.data = NULL;
+        return result;
+    }
+    result.data = malloc((size_t)(map.len * val_size));
+    if (!result.data) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(result.data, map.values, (size_t)(map.len * val_size));
+    return result;
+}
+
+// map — clear (free data and reset)
+static inline void forge_map_clear(forge_map_t *map) {
+    free(map->keys);
+    free(map->values);
+    map->keys = NULL;
+    map->values = NULL;
+    map->len = 0;
+}
+
+// set — remove by generic element
+static inline void forge_set_remove(forge_set_t *set, const void *elem, int64_t elem_size) {
+    for (int64_t i = 0; i < set->len; i++) {
+        if (memcmp((char *)set->data + i * elem_size, elem, (size_t)elem_size) == 0) {
+            forge_list_remove(set, i, elem_size);
+            return;
+        }
+    }
+}
+
+// set — remove by string element
+static inline void forge_set_remove_string(forge_set_t *set, forge_string_t s) {
+    forge_string_t *items = (forge_string_t *)set->data;
+    for (int64_t i = 0; i < set->len; i++) {
+        if (forge_string_eq(items[i], s)) {
+            forge_list_remove(set, i, sizeof(forge_string_t));
+            return;
+        }
+    }
+}
+
+// set — check membership (generic, uses memcmp)
+static inline bool forge_set_contains(forge_set_t set, const void *elem, int64_t elem_size) {
+    return forge_list_contains(set, elem, elem_size);
+}
+
+// set — check membership (string element)
+static inline bool forge_set_contains_string(forge_set_t set, forge_string_t s) {
+    return forge_list_contains_string(set, s);
+}
+
+// set — clear (same as list clear)
+static inline void forge_set_clear(forge_set_t *set) {
+    forge_list_clear(set);
+}
+
+// ---------------------------------------------------------------
 // string split (after collections, since it returns forge_list_t)
 // ---------------------------------------------------------------
 

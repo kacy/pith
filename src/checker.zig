@@ -1927,74 +1927,13 @@ pub const Checker = struct {
         if (self.type_table.get(receiver_type)) |ty| {
             switch (ty) {
                 .list => |l| {
-                    if (std.mem.eql(u8, mc.method, "push")) {
-                        if (mc.args.len != 1) {
-                            self.diagnostics.addCodedError(.E207, location, self.fmt(
-                                "'List.push' expects 1 argument, got {d}", .{mc.args.len},
-                            )) catch {};
-                            return .err;
-                        }
-                        const arg_type = self.checkExpr(mc.args[0].value, scope);
-                        if (!arg_type.isErr() and arg_type != l.element) {
-                            self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
-                                "expected {s}, got {s}",
-                                .{ self.type_table.typeName(l.element), self.type_table.typeName(arg_type) },
-                            )) catch {};
-                        }
-                        return .void;
-                    }
-                    if (std.mem.eql(u8, mc.method, "len")) {
-                        return self.checkNoArgs(mc, location, "List.len", .int);
-                    }
+                    if (self.checkListMethod(mc, location, scope, l.element, receiver_type)) |tid| return tid;
                 },
                 .map => |m| {
-                    if (std.mem.eql(u8, mc.method, "insert")) {
-                        if (mc.args.len != 2) {
-                            self.diagnostics.addCodedError(.E207, location, self.fmt(
-                                "'Map.insert' expects 2 arguments, got {d}", .{mc.args.len},
-                            )) catch {};
-                            return .err;
-                        }
-                        const key_type = self.checkExpr(mc.args[0].value, scope);
-                        if (!key_type.isErr() and key_type != m.key) {
-                            self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
-                                "expected {s}, got {s}",
-                                .{ self.type_table.typeName(m.key), self.type_table.typeName(key_type) },
-                            )) catch {};
-                        }
-                        const val_type = self.checkExpr(mc.args[1].value, scope);
-                        if (!val_type.isErr() and val_type != m.value) {
-                            self.diagnostics.addCodedError(.E219, mc.args[1].location, self.fmt(
-                                "expected {s}, got {s}",
-                                .{ self.type_table.typeName(m.value), self.type_table.typeName(val_type) },
-                            )) catch {};
-                        }
-                        return .void;
-                    }
-                    if (std.mem.eql(u8, mc.method, "len")) {
-                        return self.checkNoArgs(mc, location, "Map.len", .int);
-                    }
+                    if (self.checkMapMethod(mc, location, scope, m.key, m.value, receiver_type)) |tid| return tid;
                 },
                 .set => |s| {
-                    if (std.mem.eql(u8, mc.method, "add")) {
-                        if (mc.args.len != 1) {
-                            self.diagnostics.addCodedError(.E207, location, self.fmt(
-                                "'Set.add' expects 1 argument, got {d}", .{mc.args.len},
-                            )) catch {};
-                            return .err;
-                        }
-                        const arg_type = self.checkExpr(mc.args[0].value, scope);
-                        if (!arg_type.isErr() and arg_type != s.element) {
-                            self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
-                                "expected {s}, got {s}",
-                                .{ self.type_table.typeName(s.element), self.type_table.typeName(arg_type) },
-                            )) catch {};
-                        }
-                        return .void;
-                    }
-                    if (std.mem.eql(u8, mc.method, "len")) {
-                        return self.checkNoArgs(mc, location, "Set.len", .int);
-                    }
+                    if (self.checkSetMethod(mc, location, scope, s.element)) |tid| return tid;
                 },
                 else => {},
             }
@@ -2160,6 +2099,142 @@ pub const Checker = struct {
             "type 'Bool' has no method '{s}'", .{mc.method},
         )) catch {};
         return .err;
+    }
+
+    /// type-check a method call on a List receiver. returns null if the method
+    /// is not a built-in list method (falls through to user-defined lookup).
+    fn checkListMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, elem_type: TypeId, receiver_type: TypeId) ?TypeId {
+        const method = mc.method;
+        _ = receiver_type;
+
+        if (std.mem.eql(u8, method, "push")) {
+            return self.checkOneTypedArg(mc, location, scope, "List.push", elem_type, .void);
+        }
+        if (std.mem.eql(u8, method, "len")) return self.checkNoArgs(mc, location, "List.len", .int);
+        if (std.mem.eql(u8, method, "is_empty")) return self.checkNoArgs(mc, location, "List.is_empty", .bool);
+        if (std.mem.eql(u8, method, "clear")) return self.checkNoArgs(mc, location, "List.clear", .void);
+        if (std.mem.eql(u8, method, "reverse")) return self.checkNoArgs(mc, location, "List.reverse", .void);
+        if (std.mem.eql(u8, method, "remove")) return self.checkNoArgs1Int(mc, location, scope, "List.remove", .void);
+        if (std.mem.eql(u8, method, "contains")) {
+            return self.checkOneTypedArg(mc, location, scope, "List.contains", elem_type, .bool);
+        }
+        return null;
+    }
+
+    /// type-check a method call on a Map receiver.
+    fn checkMapMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, key_type: TypeId, val_type: TypeId, receiver_type: TypeId) ?TypeId {
+        const method = mc.method;
+        _ = receiver_type;
+
+        if (std.mem.eql(u8, method, "insert")) {
+            if (mc.args.len != 2) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'Map.insert' expects 2 arguments, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            const kt = self.checkExpr(mc.args[0].value, scope);
+            if (!kt.isErr() and kt != key_type) {
+                self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
+                    "expected {s}, got {s}",
+                    .{ self.type_table.typeName(key_type), self.type_table.typeName(kt) },
+                )) catch {};
+            }
+            const vt = self.checkExpr(mc.args[1].value, scope);
+            if (!vt.isErr() and vt != val_type) {
+                self.diagnostics.addCodedError(.E219, mc.args[1].location, self.fmt(
+                    "expected {s}, got {s}",
+                    .{ self.type_table.typeName(val_type), self.type_table.typeName(vt) },
+                )) catch {};
+            }
+            return .void;
+        }
+        if (std.mem.eql(u8, method, "len")) return self.checkNoArgs(mc, location, "Map.len", .int);
+        if (std.mem.eql(u8, method, "is_empty")) return self.checkNoArgs(mc, location, "Map.is_empty", .bool);
+        if (std.mem.eql(u8, method, "clear")) return self.checkNoArgs(mc, location, "Map.clear", .void);
+        if (std.mem.eql(u8, method, "contains_key")) {
+            return self.checkOneTypedArg(mc, location, scope, "Map.contains_key", key_type, .bool);
+        }
+        if (std.mem.eql(u8, method, "remove")) {
+            return self.checkOneTypedArg(mc, location, scope, "Map.remove", key_type, .void);
+        }
+        if (std.mem.eql(u8, method, "keys")) {
+            if (mc.args.len != 0) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'Map.keys' expects 0 arguments, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            // register List[K] and return it
+            const list_k = self.internCollectionType("List", &.{key_type}, .{ .list = .{ .element = key_type } });
+            return list_k;
+        }
+        if (std.mem.eql(u8, method, "values")) {
+            if (mc.args.len != 0) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'Map.values' expects 0 arguments, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            // register List[V] and return it
+            const list_v = self.internCollectionType("List", &.{val_type}, .{ .list = .{ .element = val_type } });
+            return list_v;
+        }
+        return null;
+    }
+
+    /// type-check a method call on a Set receiver.
+    fn checkSetMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, elem_type: TypeId) ?TypeId {
+        const method = mc.method;
+
+        if (std.mem.eql(u8, method, "add")) {
+            return self.checkOneTypedArg(mc, location, scope, "Set.add", elem_type, .void);
+        }
+        if (std.mem.eql(u8, method, "len")) return self.checkNoArgs(mc, location, "Set.len", .int);
+        if (std.mem.eql(u8, method, "is_empty")) return self.checkNoArgs(mc, location, "Set.is_empty", .bool);
+        if (std.mem.eql(u8, method, "clear")) return self.checkNoArgs(mc, location, "Set.clear", .void);
+        if (std.mem.eql(u8, method, "contains")) {
+            return self.checkOneTypedArg(mc, location, scope, "Set.contains", elem_type, .bool);
+        }
+        if (std.mem.eql(u8, method, "remove")) {
+            return self.checkOneTypedArg(mc, location, scope, "Set.remove", elem_type, .void);
+        }
+        return null;
+    }
+
+    /// validate a built-in method that takes one argument of a specific type.
+    fn checkOneTypedArg(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, label: []const u8, expected: TypeId, ret: TypeId) TypeId {
+        if (mc.args.len != 1) {
+            self.diagnostics.addCodedError(.E207, location, self.fmt(
+                "'{s}' expects 1 argument, got {d}", .{ label, mc.args.len },
+            )) catch {};
+            return .err;
+        }
+        const arg_type = self.checkExpr(mc.args[0].value, scope);
+        if (!arg_type.isErr() and arg_type != expected) {
+            self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
+                "expected {s}, got {s}",
+                .{ self.type_table.typeName(expected), self.type_table.typeName(arg_type) },
+            )) catch {};
+        }
+        return ret;
+    }
+
+    /// validate a built-in method that takes one Int argument.
+    fn checkNoArgs1Int(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, label: []const u8, ret: TypeId) TypeId {
+        if (mc.args.len != 1) {
+            self.diagnostics.addCodedError(.E207, location, self.fmt(
+                "'{s}' expects 1 argument, got {d}", .{ label, mc.args.len },
+            )) catch {};
+            return .err;
+        }
+        const arg_type = self.checkExpr(mc.args[0].value, scope);
+        if (!arg_type.isErr() and arg_type != .int) {
+            self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
+                "expected Int, got {s}", .{self.type_table.typeName(arg_type)},
+            )) catch {};
+        }
+        return ret;
     }
 
     fn checkFieldAccess(self: *Checker, fa: ast.FieldAccess, location: Location, scope: *const Scope) TypeId {

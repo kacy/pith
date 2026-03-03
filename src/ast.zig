@@ -64,6 +64,12 @@ pub const DeclKind = union(enum) {
     impl_decl: ImplDecl,
     type_alias: TypeAlias,
     binding: Binding,
+    test_decl: TestDecl,
+};
+
+pub const TestDecl = struct {
+    name: []const u8, // the test name (string literal content, with quotes)
+    body: Block,
 };
 
 pub const FnDecl = struct {

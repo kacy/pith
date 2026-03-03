@@ -1587,7 +1587,7 @@ pub const Parser = struct {
         };
     }
 
-    /// top_level_decl = ["pub"] (fn_decl | struct_decl | enum_decl | interface_decl | impl_decl | type_alias | binding)
+    /// top_level_decl = ["pub"] (fn_decl | struct_decl | enum_decl | interface_decl | impl_decl | type_alias | test_decl | binding)
     fn parseTopLevelDecl(self: *Parser) ParseError!ast.Decl {
         const loc = self.peek().location;
         const is_pub = self.match(.kw_pub);
@@ -1599,6 +1599,12 @@ pub const Parser = struct {
             .kw_interface => .{ .interface_decl = try self.parseInterfaceDecl() },
             .kw_impl => .{ .impl_decl = try self.parseImplDecl() },
             .kw_type => .{ .type_alias = try self.parseTypeAliasDecl() },
+            .kw_test => blk: {
+                if (is_pub) {
+                    try self.diagnostics.addCodedError(.E100, loc, "tests cannot be pub");
+                }
+                break :blk .{ .test_decl = try self.parseTestDecl() };
+            },
             // binding at top level
             .kw_mut, .identifier => blk: {
                 const stmt = try self.parseBinding();
@@ -1648,6 +1654,18 @@ pub const Parser = struct {
             .generic_params = generics,
             .params = params,
             .return_type = return_type,
+            .body = body,
+        };
+    }
+
+    /// test_decl = "test" STRING_LIT ":" block
+    fn parseTestDecl(self: *Parser) ParseError!ast.TestDecl {
+        _ = self.advance(); // skip test
+        const name_tok = try self.expect(.string_lit);
+        _ = try self.expect(.colon);
+        const body = try self.parseBlock();
+        return .{
+            .name = name_tok.lexeme,
             .body = body,
         };
     }

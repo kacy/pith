@@ -69,6 +69,11 @@ fn printDecl(decl: ast.Decl, indent: u32) void {
             printTypeExpr(t.type_expr, indent + 1);
         },
         .binding => |b| printBinding(b, indent),
+        .test_decl => |t| {
+            printIndent(indent);
+            io.write("test {s}\n", .{t.name});
+            printBlock(t.body, indent + 1);
+        },
     }
 }
 

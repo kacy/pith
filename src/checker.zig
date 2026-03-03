@@ -239,6 +239,23 @@ pub const Checker = struct {
         } });
         try self.module_scope.define("exit", .{ .type_id = exit_type, .is_mut = false });
 
+        // assert(Bool) -> Void
+        const assert_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.bool},
+            .return_type = .void,
+        } });
+        try self.module_scope.define("assert", .{ .type_id = assert_type, .is_mut = false });
+
+        // assert_eq and assert_ne are special-cased in checkCall to accept
+        // any two args of the same type. registered here as (Int, Int) -> Void
+        // as a placeholder — the actual type checking happens in checkFnCall.
+        const assert_eq_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .int },
+            .return_type = .void,
+        } });
+        try self.module_scope.define("assert_eq", .{ .type_id = assert_eq_type, .is_mut = false });
+        try self.module_scope.define("assert_ne", .{ .type_id = assert_eq_type, .is_mut = false });
+
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});
         try self.registerSyncType("WaitGroup", &.{});
@@ -293,6 +310,7 @@ pub const Checker = struct {
             .impl_decl => |impl_d| self.registerImplDecl(impl_d, decl.location),
             .type_alias => |ta| self.registerTypeAlias(ta, decl.location),
             .binding => {}, // top-level bindings are checked in pass 2
+            .test_decl => {}, // tests don't register names
         }
     }
 
@@ -553,7 +571,16 @@ pub const Checker = struct {
             .interface_decl => {},
             .impl_decl => |impl_d| self.checkImplDecl(impl_d),
             .type_alias => {},
+            .test_decl => |td| self.checkTestDecl(td),
         }
+    }
+
+    fn checkTestDecl(self: *Checker, td: ast.TestDecl) void {
+        var test_scope = Scope.init(self.allocator, &self.module_scope);
+        defer test_scope.deinit();
+        // tests have no return type — they just run statements
+        test_scope.return_type = .void;
+        self.checkBlock(td.body, &test_scope);
     }
 
     fn checkFnDecl(self: *Checker, fn_d: ast.FnDecl) void {
@@ -1692,6 +1719,26 @@ pub const Checker = struct {
             .ident => |n| n,
             else => return self.checkFnCall(call, location, scope),
         };
+
+        // assert_eq/assert_ne: accept any two args of the same type
+        if (std.mem.eql(u8, name, "assert_eq") or std.mem.eql(u8, name, "assert_ne")) {
+            if (call.args.len != 2) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'{s}' expects 2 argument(s), got {d}",
+                    .{ name, call.args.len },
+                )) catch {};
+                return .err;
+            }
+            const lhs = self.checkExpr(call.args[0].value, scope);
+            const rhs = self.checkExpr(call.args[1].value, scope);
+            if (!lhs.isErr() and !rhs.isErr() and lhs != rhs) {
+                self.diagnostics.addCodedError(.E219, location, self.fmt(
+                    "both arguments to '{s}' must be the same type, got {s} and {s}",
+                    .{ name, self.type_table.typeName(lhs), self.type_table.typeName(rhs) },
+                )) catch {};
+            }
+            return .void;
+        }
 
         // struct constructor: Name(field1, field2, ...)
         if (self.type_table.lookup(name)) |type_id| {

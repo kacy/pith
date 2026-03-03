@@ -496,7 +496,7 @@ pub const Checker = struct {
             .struct_decl => {},
             .enum_decl => {},
             .interface_decl => {},
-            .impl_decl => {},
+            .impl_decl => |impl_d| self.checkImplDecl(impl_d),
             .type_alias => {},
         }
     }
@@ -528,6 +528,53 @@ pub const Checker = struct {
 
         // check the body
         self.checkBlock(fn_d.body, &fn_scope);
+    }
+
+    /// check method bodies in an impl block. extracts the concrete type name,
+    /// then delegates each method to checkMethodBody.
+    fn checkImplDecl(self: *Checker, impl_d: ast.ImplDecl) void {
+        // extract the concrete type name (same inversion as registerImplDecl)
+        const concrete_name: []const u8 = if (impl_d.interface) |iface_type_expr|
+            switch (iface_type_expr.kind) {
+                .named => |n| n,
+                else => return,
+            }
+        else switch (impl_d.target.kind) {
+            .named => |n| n,
+            else => return,
+        };
+
+        for (impl_d.methods) |method| {
+            self.checkMethodBody(concrete_name, method.decl);
+        }
+    }
+
+    /// check a single method body. mirrors checkFnDecl: looks up the
+    /// MethodEntry, creates a scope with params, checks the block.
+    fn checkMethodBody(self: *Checker, type_name: []const u8, fn_d: ast.FnDecl) void {
+        const key = self.buildMethodKey(type_name, fn_d.name);
+        const entry = self.method_types.get(key) orelse return;
+
+        const fn_type = self.type_table.get(entry.type_id) orelse return;
+        const func = switch (fn_type) {
+            .function => |f| f,
+            else => return,
+        };
+
+        // create a scope for the method body
+        var method_scope = Scope.init(self.allocator, &self.module_scope);
+        defer method_scope.deinit();
+        method_scope.return_type = func.return_type;
+
+        // define parameters
+        for (fn_d.params, func.param_types) |param, param_type| {
+            method_scope.define(param.name, .{
+                .type_id = param_type,
+                .is_mut = param.is_mut,
+            }) catch return;
+        }
+
+        self.checkBlock(fn_d.body, &method_scope);
     }
 
     fn checkTopLevelBinding(self: *Checker, b: ast.Binding) void {
@@ -5425,6 +5472,115 @@ test "checkMethodCall: wrong arg type errors" {
     };
 
     const module = ast.Module{ .imports = &.{}, .decls = &.{ struct_decl, impl_decl, fn_decl } };
+    checker.check(&module);
+
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "checkImplDecl: method body type checks correctly" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    // method body: return a (where a is Int, return type is Int) — valid
+    const ret_expr = ast.Expr{ .kind = .{ .ident = "a" }, .location = Location.zero };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &ret_expr } },
+        .location = Location.zero,
+    };
+
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &point_te,
+            .interface = null,
+            .methods = &.{.{
+                .is_pub = false,
+                .decl = .{
+                    .name = "magnitude",
+                    .generic_params = &.{},
+                    .params = &.{
+                        .{ .name = "a", .type_expr = &int_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = &int_te,
+                    .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                },
+                .location = Location.zero,
+            }},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ struct_decl, impl_decl } };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "checkImplDecl: method body return type mismatch errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const string_te = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    // method body: return "hello" (String) but return type is Int — mismatch
+    const ret_expr = ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &ret_expr } },
+        .location = Location.zero,
+    };
+
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &point_te,
+            .interface = null,
+            .methods = &.{.{
+                .is_pub = false,
+                .decl = .{
+                    .name = "magnitude",
+                    .generic_params = &.{},
+                    .params = &.{
+                        .{ .name = "a", .type_expr = &string_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = &int_te,
+                    .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                },
+                .location = Location.zero,
+            }},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ struct_decl, impl_decl } };
     checker.check(&module);
 
     try std.testing.expect(checker.diagnostics.hasErrors());

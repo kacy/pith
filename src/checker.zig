@@ -877,7 +877,8 @@ pub const Checker = struct {
     /// resolve a generic type by name with already-resolved type arguments.
     /// handles builtin generics (Task, Channel) and user-defined generics.
     fn resolveGenericTypeWithArgs(self: *Checker, name: []const u8, arg_ids: []const TypeId, location: Location) TypeId {
-        // Task[T] and Channel[T] — builtin semantic types
+        // builtin generic types — deduplicated via name_map so that e.g.
+        // two List[Int] occurrences share the same TypeId.
         if (arg_ids.len == 1) {
             if (std.mem.eql(u8, name, "Task")) {
                 return self.type_table.addType(.{ .task = .{ .inner = arg_ids[0] } }) catch return .err;
@@ -885,6 +886,18 @@ pub const Checker = struct {
             if (std.mem.eql(u8, name, "Channel")) {
                 return self.type_table.addType(.{ .channel = .{ .inner = arg_ids[0] } }) catch return .err;
             }
+            if (std.mem.eql(u8, name, "List")) {
+                return self.internCollectionType(name, arg_ids, .{ .list = .{ .element = arg_ids[0] } });
+            }
+            if (std.mem.eql(u8, name, "Set")) {
+                return self.internCollectionType(name, arg_ids, .{ .set = .{ .element = arg_ids[0] } });
+            }
+        }
+        if (arg_ids.len == 2 and std.mem.eql(u8, name, "Map")) {
+            return self.internCollectionType(name, arg_ids, .{ .map = .{
+                .key = arg_ids[0],
+                .value = arg_ids[1],
+            } });
         }
 
         // look up user-defined generic
@@ -901,6 +914,18 @@ pub const Checker = struct {
                 return .err;
             },
         };
+    }
+
+    /// deduplicate a builtin collection type (List, Map, Set) by registering
+    /// it under a canonical name like "List[Int]". returns the existing TypeId
+    /// if already registered, otherwise creates and registers a new one.
+    fn internCollectionType(self: *Checker, name: []const u8, arg_ids: []const TypeId, ty: types.Type) TypeId {
+        const inst_name = self.buildInstName(name, arg_ids);
+        if (self.type_table.lookup(inst_name)) |existing| return existing;
+
+        const id = self.type_table.addType(ty) catch return .err;
+        self.type_table.register(inst_name, id) catch {};
+        return id;
     }
 
     /// build an instantiated name like "Pair[Int,String]" on the arena.
@@ -1264,16 +1289,16 @@ pub const Checker = struct {
             // generics that aren't implemented yet. returning .err
             // suppresses cascading diagnostics downstream.
             .field_access => |fa| self.checkFieldAccess(fa, expr.location, scope),
-            .index => .err,
+            .index => |idx| self.checkIndexExpr(idx, expr.location, scope),
             .unwrap => .err,
             .try_expr => .err,
             .spawn_expr => |inner| self.checkSpawnExpr(inner, expr.location, scope),
             .await_expr => |inner| self.checkAwaitExpr(inner, expr.location, scope),
             .match_expr => |m| self.checkMatchExpr(m, scope),
             .lambda => |lam| self.checkLambda(lam, scope),
-            .list => .err,
-            .map => .err,
-            .set => .err,
+            .list => |elems| self.checkListExpr(elems, expr.location, scope),
+            .map => |entries| self.checkMapExpr(entries, expr.location, scope),
+            .set => |elems| self.checkSetExpr(elems, expr.location, scope),
             .tuple => |elems| self.checkTupleExpr(elems, expr.location, scope),
             .self_expr => self.checkSelfExpr(expr.location, scope),
 
@@ -2036,6 +2061,135 @@ pub const Checker = struct {
         } }) catch return .err;
     }
 
+    /// check a list literal [a, b, c]. all elements must have the same type.
+    /// an empty list produces an error — the type can't be inferred without context.
+    fn checkListExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
+        if (elems.len == 0) {
+            self.diagnostics.addError(location, "cannot infer element type of empty list") catch {};
+            return .err;
+        }
+
+        const first_type = self.checkExpr(elems[0], scope);
+        if (first_type.isErr()) return .err;
+
+        for (elems[1..]) |elem| {
+            const elem_type = self.checkExpr(elem, scope);
+            if (elem_type.isErr()) return .err;
+            if (elem_type != first_type) {
+                self.diagnostics.addError(elem.location, self.fmt(
+                    "list element type mismatch: expected {s}, got {s}",
+                    .{ self.type_table.typeName(first_type), self.type_table.typeName(elem_type) },
+                )) catch {};
+                return .err;
+            }
+        }
+
+        return self.internCollectionType("List", &.{first_type}, .{ .list = .{ .element = first_type } });
+    }
+
+    /// check a map literal {k: v, ...}. all keys must share a type, all values must share a type.
+    /// an empty map {} is allowed — but the type can't be inferred, so we return err.
+    fn checkMapExpr(self: *Checker, entries: []const ast.MapEntry, location: Location, scope: *const Scope) TypeId {
+        if (entries.len == 0) {
+            self.diagnostics.addError(location, "cannot infer types of empty map") catch {};
+            return .err;
+        }
+
+        const first_key_type = self.checkExpr(entries[0].key, scope);
+        const first_val_type = self.checkExpr(entries[0].value, scope);
+        if (first_key_type.isErr() or first_val_type.isErr()) return .err;
+
+        for (entries[1..]) |entry| {
+            const key_type = self.checkExpr(entry.key, scope);
+            if (!key_type.isErr() and key_type != first_key_type) {
+                self.diagnostics.addError(entry.location, self.fmt(
+                    "map key type mismatch: expected {s}, got {s}",
+                    .{ self.type_table.typeName(first_key_type), self.type_table.typeName(key_type) },
+                )) catch {};
+                return .err;
+            }
+
+            const val_type = self.checkExpr(entry.value, scope);
+            if (!val_type.isErr() and val_type != first_val_type) {
+                self.diagnostics.addError(entry.location, self.fmt(
+                    "map value type mismatch: expected {s}, got {s}",
+                    .{ self.type_table.typeName(first_val_type), self.type_table.typeName(val_type) },
+                )) catch {};
+                return .err;
+            }
+        }
+
+        return self.internCollectionType("Map", &.{ first_key_type, first_val_type }, .{ .map = .{
+            .key = first_key_type,
+            .value = first_val_type,
+        } });
+    }
+
+    /// check a set literal {a, b, c}. all elements must have the same type.
+    fn checkSetExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
+        if (elems.len == 0) {
+            // the parser emits empty {} as a map, not a set, so this shouldn't
+            // happen in practice — but guard against it.
+            self.diagnostics.addError(location, "cannot infer element type of empty set") catch {};
+            return .err;
+        }
+
+        const first_type = self.checkExpr(elems[0], scope);
+        if (first_type.isErr()) return .err;
+
+        for (elems[1..]) |elem| {
+            const elem_type = self.checkExpr(elem, scope);
+            if (elem_type.isErr()) return .err;
+            if (elem_type != first_type) {
+                self.diagnostics.addError(elem.location, self.fmt(
+                    "set element type mismatch: expected {s}, got {s}",
+                    .{ self.type_table.typeName(first_type), self.type_table.typeName(elem_type) },
+                )) catch {};
+                return .err;
+            }
+        }
+
+        return self.internCollectionType("Set", &.{first_type}, .{ .set = .{ .element = first_type } });
+    }
+
+    /// check an index expression: obj[idx]. supports List[T], Map[K, V], and tuples.
+    fn checkIndexExpr(self: *Checker, idx: ast.IndexExpr, location: Location, scope: *const Scope) TypeId {
+        const obj_type = self.checkExpr(idx.object, scope);
+        const index_type = self.checkExpr(idx.index, scope);
+        if (obj_type.isErr() or index_type.isErr()) return .err;
+
+        const ty = self.type_table.get(obj_type) orelse return .err;
+        return switch (ty) {
+            .list => |l| blk: {
+                if (!index_type.isInteger()) {
+                    self.diagnostics.addError(location, self.fmt(
+                        "list index must be an integer, got {s}",
+                        .{self.type_table.typeName(index_type)},
+                    )) catch {};
+                    break :blk .err;
+                }
+                break :blk l.element;
+            },
+            .map => |m| blk: {
+                if (index_type != m.key) {
+                    self.diagnostics.addError(location, self.fmt(
+                        "map key type mismatch: expected {s}, got {s}",
+                        .{ self.type_table.typeName(m.key), self.type_table.typeName(index_type) },
+                    )) catch {};
+                    break :blk .err;
+                }
+                break :blk m.value;
+            },
+            else => blk: {
+                self.diagnostics.addError(location, self.fmt(
+                    "type '{s}' does not support indexing",
+                    .{self.type_table.typeName(obj_type)},
+                )) catch {};
+                break :blk .err;
+            },
+        };
+    }
+
     fn checkTupleExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
         if (elems.len == 0) {
             self.diagnostics.addError(location, "empty tuple is not allowed") catch {};
@@ -2228,14 +2382,63 @@ test "Task[Unknown] produces error" {
     try std.testing.expect(id.isErr());
 }
 
-test "undeclared generic List[Int] errors" {
+test "List[Int] resolves to list type" {
     var checker = try Checker.init(std.testing.allocator, "");
     defer checker.deinit();
 
-    // List is not declared, so List[Int] should error with "unknown generic type"
     const inner = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
     const generic = ast.TypeExpr{
         .kind = .{ .generic = .{ .name = "List", .args = &.{&inner} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(!id.isErr());
+
+    const ty = checker.type_table.get(id).?;
+    try std.testing.expectEqual(TypeId.int, ty.list.element);
+}
+
+test "Map[String, Int] resolves to map type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const key_te = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
+    const val_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Map", .args = &.{ &key_te, &val_te } } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(!id.isErr());
+
+    const ty = checker.type_table.get(id).?;
+    try std.testing.expectEqual(TypeId.string, ty.map.key);
+    try std.testing.expectEqual(TypeId.int, ty.map.value);
+}
+
+test "Set[Bool] resolves to set type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "Bool" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Set", .args = &.{&inner} } },
+        .location = Location.zero,
+    };
+    const id = checker.resolveTypeExpr(&generic);
+    try std.testing.expect(!id.isErr());
+
+    const ty = checker.type_table.get(id).?;
+    try std.testing.expectEqual(TypeId.bool, ty.set.element);
+}
+
+test "undeclared generic Foo[Int] errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const inner = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const generic = ast.TypeExpr{
+        .kind = .{ .generic = .{ .name = "Foo", .args = &.{&inner} } },
         .location = Location.zero,
     };
     const id = checker.resolveTypeExpr(&generic);
@@ -6028,6 +6231,226 @@ test "generic struct with bound: not satisfied" {
     checker.check(&module);
 
     // Wrapper[Int] should fail — Int does not implement Printable
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "index list with integer returns element type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // create a List[String] value in scope
+    const list_type = checker.internCollectionType("List", &.{TypeId.string}, .{ .list = .{ .element = .string } });
+    try checker.module_scope.define("names", .{ .type_id = list_type, .is_mut = false });
+
+    const obj = &ast.Expr{ .kind = .{ .ident = "names" }, .location = Location.zero };
+    const idx = &ast.Expr{ .kind = .{ .int_lit = "0" }, .location = Location.zero };
+    const expr = ast.Expr{
+        .kind = .{ .index = .{ .object = obj, .index = idx } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&expr, &checker.module_scope);
+    try std.testing.expectEqual(TypeId.string, result);
+}
+
+test "index list with non-integer errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const list_type = checker.internCollectionType("List", &.{TypeId.int}, .{ .list = .{ .element = .int } });
+    try checker.module_scope.define("nums", .{ .type_id = list_type, .is_mut = false });
+
+    const obj = &ast.Expr{ .kind = .{ .ident = "nums" }, .location = Location.zero };
+    const idx = &ast.Expr{ .kind = .{ .string_lit = "bad" }, .location = Location.zero };
+    const expr = ast.Expr{
+        .kind = .{ .index = .{ .object = obj, .index = idx } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "index map with correct key type returns value type" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const map_type = checker.internCollectionType("Map", &.{ TypeId.string, TypeId.int }, .{ .map = .{ .key = .string, .value = .int } });
+    try checker.module_scope.define("ages", .{ .type_id = map_type, .is_mut = false });
+
+    const obj = &ast.Expr{ .kind = .{ .ident = "ages" }, .location = Location.zero };
+    const idx = &ast.Expr{ .kind = .{ .string_lit = "alice" }, .location = Location.zero };
+    const expr = ast.Expr{
+        .kind = .{ .index = .{ .object = obj, .index = idx } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&expr, &checker.module_scope);
+    try std.testing.expectEqual(TypeId.int, result);
+}
+
+test "index map with wrong key type errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const map_type = checker.internCollectionType("Map", &.{ TypeId.string, TypeId.int }, .{ .map = .{ .key = .string, .value = .int } });
+    try checker.module_scope.define("ages", .{ .type_id = map_type, .is_mut = false });
+
+    const obj = &ast.Expr{ .kind = .{ .ident = "ages" }, .location = Location.zero };
+    const idx = &ast.Expr{ .kind = .{ .int_lit = "42" }, .location = Location.zero };
+    const expr = ast.Expr{
+        .kind = .{ .index = .{ .object = obj, .index = idx } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "index non-indexable type errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    try checker.module_scope.define("x", .{ .type_id = .int, .is_mut = false });
+
+    const obj = &ast.Expr{ .kind = .{ .ident = "x" }, .location = Location.zero };
+    const idx = &ast.Expr{ .kind = .{ .int_lit = "0" }, .location = Location.zero };
+    const expr = ast.Expr{
+        .kind = .{ .index = .{ .object = obj, .index = idx } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "list literal: homogeneous elements" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const a = &ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const b = &ast.Expr{ .kind = .{ .int_lit = "2" }, .location = Location.zero };
+    const c = &ast.Expr{ .kind = .{ .int_lit = "3" }, .location = Location.zero };
+    const list_expr = ast.Expr{
+        .kind = .{ .list = &.{ a, b, c } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&list_expr, &checker.module_scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    try std.testing.expectEqual(TypeId.int, ty.list.element);
+}
+
+test "list literal: mixed types error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const a = &ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const b = &ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const list_expr = ast.Expr{
+        .kind = .{ .list = &.{ a, b } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&list_expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "list literal: empty list errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const list_expr = ast.Expr{
+        .kind = .{ .list = &.{} },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&list_expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+}
+
+test "map literal: homogeneous entries" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const k1 = &ast.Expr{ .kind = .{ .string_lit = "a" }, .location = Location.zero };
+    const v1 = &ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const k2 = &ast.Expr{ .kind = .{ .string_lit = "b" }, .location = Location.zero };
+    const v2 = &ast.Expr{ .kind = .{ .int_lit = "2" }, .location = Location.zero };
+    const map_expr = ast.Expr{
+        .kind = .{ .map = &.{
+            .{ .key = k1, .value = v1, .location = Location.zero },
+            .{ .key = k2, .value = v2, .location = Location.zero },
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&map_expr, &checker.module_scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    try std.testing.expectEqual(TypeId.string, ty.map.key);
+    try std.testing.expectEqual(TypeId.int, ty.map.value);
+}
+
+test "map literal: mixed value types error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const k1 = &ast.Expr{ .kind = .{ .string_lit = "a" }, .location = Location.zero };
+    const v1 = &ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const k2 = &ast.Expr{ .kind = .{ .string_lit = "b" }, .location = Location.zero };
+    const v2 = &ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const map_expr = ast.Expr{
+        .kind = .{ .map = &.{
+            .{ .key = k1, .value = v1, .location = Location.zero },
+            .{ .key = k2, .value = v2, .location = Location.zero },
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&map_expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "set literal: homogeneous elements" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const a = &ast.Expr{ .kind = .{ .string_lit = "x" }, .location = Location.zero };
+    const b = &ast.Expr{ .kind = .{ .string_lit = "y" }, .location = Location.zero };
+    const set_expr = ast.Expr{
+        .kind = .{ .set = &.{ a, b } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&set_expr, &checker.module_scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    try std.testing.expectEqual(TypeId.string, ty.set.element);
+}
+
+test "set literal: mixed types error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const a = &ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const b = &ast.Expr{ .kind = .{ .bool_lit = true }, .location = Location.zero };
+    const set_expr = ast.Expr{
+        .kind = .{ .set = &.{ a, b } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&set_expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
     try std.testing.expect(checker.diagnostics.hasErrors());
 }
 

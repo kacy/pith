@@ -120,6 +120,13 @@ pub const Checker = struct {
     /// (arena-allocated). used for method call resolution and pass 2
     /// body checking.
     method_types: std.StringHashMap(MethodEntry),
+    /// tracks recursion depth in resolveTypeExpr to prevent stack overflow
+    /// from deeply nested types like Int??????...
+    resolve_depth: u32,
+
+    /// maximum depth for type resolution. prevents stack overflow from
+    /// pathological inputs like deeply nested optionals or generics.
+    const max_resolve_depth: u32 = 128;
 
     /// create a new checker. registers builtin types and functions.
     pub fn init(allocator: std.mem.Allocator, source: []const u8) !Checker {
@@ -133,6 +140,7 @@ pub const Checker = struct {
             .interface_decls = std.StringHashMap(ast.InterfaceDecl).init(allocator),
             .impl_set = std.StringHashMap(void).init(allocator),
             .method_types = std.StringHashMap(MethodEntry).init(allocator),
+            .resolve_depth = 0,
         };
 
         // register builtins into the module scope
@@ -748,6 +756,13 @@ pub const Checker = struct {
 
     /// resolve an AST type expression to a TypeId in the type table.
     pub fn resolveTypeExpr(self: *Checker, type_expr: *const ast.TypeExpr) TypeId {
+        if (self.resolve_depth >= max_resolve_depth) {
+            self.diagnostics.addError(type_expr.location, "type nesting exceeds maximum depth") catch {};
+            return .err;
+        }
+        self.resolve_depth += 1;
+        defer self.resolve_depth -= 1;
+
         return switch (type_expr.kind) {
             .named => |name| self.resolveNamedType(name, type_expr.location),
             .optional => |inner| self.resolveOptionalType(inner),
@@ -2378,6 +2393,23 @@ test "resolveTypeExpr resolves named types" {
         .location = Location.zero,
     };
     try std.testing.expectEqual(TypeId.string, checker.resolveTypeExpr(&string_type_expr));
+}
+
+test "resolveTypeExpr rejects deeply nested types" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // build a chain of 200 optional wrappings: Int?????...
+    const depth = 200;
+    var nodes: [depth + 1]ast.TypeExpr = undefined;
+    nodes[0] = .{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    for (1..depth + 1) |i| {
+        nodes[i] = .{ .kind = .{ .optional = &nodes[i - 1] }, .location = Location.zero };
+    }
+
+    const id = checker.resolveTypeExpr(&nodes[depth]);
+    try std.testing.expect(id.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
 }
 
 test "resolveTypeExpr reports unknown types" {

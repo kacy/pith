@@ -152,10 +152,9 @@ pub const Type = union(enum) {
 /// if you add a new builtin to TypeId, add its name here and update
 /// first_user. the array length is checked at comptime.
 const builtin_names = [TypeId.first_user][]const u8{
-    "Int", "UInt", "Float", "Bool", "String", "Bytes", "Void",
-    "Int8", "Int16", "Int32", "Int64",
-    "UInt8", "UInt16", "UInt32", "UInt64",
-    "<error>",
+    "Int",    "UInt",    "Float", "Bool",  "String", "Bytes",  "Void",
+    "Int8",   "Int16",   "Int32", "Int64", "UInt8",  "UInt16", "UInt32",
+    "UInt64", "<error>",
 };
 
 /// the central type registry. all types in a program live here as a flat

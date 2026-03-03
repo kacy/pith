@@ -1,0 +1,33 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: check formatting
+        run: zig fmt --check src/
+
+      - name: build
+        run: zig build
+
+      - name: test
+        run: zig build test
+
+      - name: check examples
+        run: |
+          for f in examples/*.fg; do
+            result=$(./zig-out/bin/forge check "$f" 2>&1)
+            if [ "$result" != "ok" ]; then
+              echo "FAIL $f"
+              echo "$result"
+              exit 1
+            fi
+            echo "ok   $f"
+          done

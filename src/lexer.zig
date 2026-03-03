@@ -160,6 +160,12 @@ const keyword_map = std.StaticStringMap(TokenKind).initComptime(.{
 // ---------------------------------------------------------------
 
 pub const Lexer = struct {
+    /// maximum nesting depth for string interpolation expressions.
+    const max_interpolation_depth: u32 = 64;
+    /// maximum indentation levels. prevents unbounded stack growth
+    /// from pathological inputs with ever-increasing indentation.
+    const max_indent_level: u32 = 256;
+
     source: []const u8,
     pos: u32,
     line: u32,
@@ -270,6 +276,13 @@ pub const Lexer = struct {
             const current_indent = self.indent_stack.items[self.indent_stack.items.len - 1];
 
             if (indent_result.level > current_indent) {
+                if (self.indent_stack.items.len >= max_indent_level) {
+                    try self.diagnostics.addError(
+                        self.currentLocation(1),
+                        "indentation nesting exceeds maximum depth",
+                    );
+                    return self.makeToken(.err, self.pos, 1);
+                }
                 try self.indent_stack.append(self.allocator, indent_result.level);
                 return self.makeToken(.indent, self.pos, 0);
             } else if (indent_result.level < current_indent) {
@@ -432,8 +445,19 @@ pub const Lexer = struct {
     }
 
     fn scanInterpolationParts(self: *Lexer) !void {
+        var interpolation_count: u32 = 0;
         while (self.pos < self.source.len) {
             if (self.current() != '{') break;
+
+            interpolation_count += 1;
+            if (interpolation_count > max_interpolation_depth) {
+                try self.diagnostics.addError(
+                    self.currentLocation(1),
+                    "string interpolation nesting exceeds maximum depth",
+                );
+                try self.pending_tokens.append(self.allocator, self.makeToken(.err, self.pos, 0));
+                return;
+            }
 
             self.advance(); // skip {
             const lbrace_pos = self.pos - 1;

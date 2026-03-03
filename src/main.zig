@@ -38,10 +38,18 @@ fn renderDiagnostics(diags: *const errors.DiagnosticList) void {
 }
 
 fn readSourceFile(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
-    return std.fs.cwd().readFileAlloc(allocator, path, max_source_size) catch |err| {
+    const source = std.fs.cwd().readFileAlloc(allocator, path, max_source_size) catch |err| {
         io.writeErr("error: could not read '{s}': {}\n", .{ path, err });
         return null;
     };
+
+    if (!std.unicode.utf8ValidateSlice(source)) {
+        io.writeErr("error: '{s}' contains invalid UTF-8\n", .{path});
+        allocator.free(source);
+        return null;
+    }
+
+    return source;
 }
 
 /// bundles the outputs of lexing + parsing so callers can clean up

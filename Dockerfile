@@ -17,6 +17,9 @@ RUN zig build -Doptimize=ReleaseSafe
 
 FROM alpine:3.21
 
+RUN addgroup -g 1000 forge && adduser -D -u 1000 -G forge forge
+
 COPY --from=builder /src/zig-out/bin/forge /usr/local/bin/forge
 
+USER forge
 ENTRYPOINT ["forge"]

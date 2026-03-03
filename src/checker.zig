@@ -120,6 +120,13 @@ pub const Checker = struct {
     /// (arena-allocated). used for method call resolution and pass 2
     /// body checking.
     method_types: std.StringHashMap(MethodEntry),
+    /// tracks recursion depth in resolveTypeExpr to prevent stack overflow
+    /// from deeply nested types like Int??????...
+    resolve_depth: u32,
+
+    /// maximum depth for type resolution. prevents stack overflow from
+    /// pathological inputs like deeply nested optionals or generics.
+    const max_resolve_depth: u32 = 128;
 
     /// create a new checker. registers builtin types and functions.
     pub fn init(allocator: std.mem.Allocator, source: []const u8) !Checker {
@@ -133,6 +140,7 @@ pub const Checker = struct {
             .interface_decls = std.StringHashMap(ast.InterfaceDecl).init(allocator),
             .impl_set = std.StringHashMap(void).init(allocator),
             .method_types = std.StringHashMap(MethodEntry).init(allocator),
+            .resolve_depth = 0,
         };
 
         // register builtins into the module scope
@@ -748,6 +756,13 @@ pub const Checker = struct {
 
     /// resolve an AST type expression to a TypeId in the type table.
     pub fn resolveTypeExpr(self: *Checker, type_expr: *const ast.TypeExpr) TypeId {
+        if (self.resolve_depth >= max_resolve_depth) {
+            self.diagnostics.addError(type_expr.location, "type nesting exceeds maximum depth") catch {};
+            return .err;
+        }
+        self.resolve_depth += 1;
+        defer self.resolve_depth -= 1;
+
         return switch (type_expr.kind) {
             .named => |name| self.resolveNamedType(name, type_expr.location),
             .optional => |inner| self.resolveOptionalType(inner),
@@ -1149,11 +1164,15 @@ pub const Checker = struct {
                     error.ConflictingInference => {
                         // find which param conflicted for the error message
                         const param_name = te.kind.named;
+                        const prev_name = if (subst.get(param_name)) |prev|
+                            self.type_table.typeName(prev)
+                        else
+                            "unknown";
                         self.diagnostics.addError(location, self.fmt(
                             "conflicting types for generic parameter '{s}': {s} vs {s}",
                             .{
                                 param_name,
-                                self.type_table.typeName(subst.get(param_name).?),
+                                prev_name,
                                 self.type_table.typeName(arg_type),
                             },
                         )) catch {};
@@ -1310,7 +1329,13 @@ pub const Checker = struct {
             // logical: both sides must be Bool
             .@"and", .@"or" => self.checkLogical(left, right, location),
 
-            .pipe => unreachable, // handled above
+            .pipe => {
+                // pipe is handled by the early return above. if we reach
+                // here, the dispatch logic has a bug — return an error
+                // instead of crashing.
+                self.diagnostics.addError(location, "internal: unexpected pipe in binary dispatch") catch {};
+                return .err;
+            },
         };
     }
 
@@ -1322,7 +1347,8 @@ pub const Checker = struct {
         const rhs_name = switch (bin.right.kind) {
             .ident => |name| name,
             else => {
-                self.diagnostics.addError(location,
+                self.diagnostics.addError(
+                    location,
                     "pipe operator requires a function name on the right-hand side",
                 ) catch {};
                 return .err;
@@ -1537,14 +1563,16 @@ pub const Checker = struct {
                             return ty.result.ok_type;
                         }
                     }
-                    self.diagnostics.addError(location,
+                    self.diagnostics.addError(
+                        location,
                         "'!' can only be used in a function that returns a result type",
                     ) catch {};
                     return .err;
                 }
 
                 // no return type at all (top-level expression)
-                self.diagnostics.addError(location,
+                self.diagnostics.addError(
+                    location,
                     "'!' can only be used in a function that returns a result type",
                 ) catch {};
                 return .err;
@@ -1725,7 +1753,7 @@ pub const Checker = struct {
         defer ordered_ids.deinit(self.allocator);
 
         for (fn_d.generic_params) |gp| {
-            ordered_ids.append(self.allocator, subst.get(gp.name).?) catch return .err;
+            ordered_ids.append(self.allocator, subst.get(gp.name) orelse return .err) catch return .err;
         }
 
         // instantiate the concrete function type
@@ -1798,7 +1826,14 @@ pub const Checker = struct {
         location: Location,
         scope: *const Scope,
     ) TypeId {
-        const struct_data = self.type_table.get(type_id).?.@"struct";
+        const type_info = self.type_table.get(type_id) orelse return .err;
+        const struct_data = switch (type_info) {
+            .@"struct" => |s| s,
+            else => {
+                self.diagnostics.addError(location, "expected struct type in constructor") catch {};
+                return .err;
+            },
+        };
 
         // check argument count matches field count
         if (call.args.len != struct_data.fields.len) {
@@ -2364,6 +2399,23 @@ test "resolveTypeExpr resolves named types" {
         .location = Location.zero,
     };
     try std.testing.expectEqual(TypeId.string, checker.resolveTypeExpr(&string_type_expr));
+}
+
+test "resolveTypeExpr rejects deeply nested types" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    // build a chain of 200 optional wrappings: Int?????...
+    const depth = 200;
+    var nodes: [depth + 1]ast.TypeExpr = undefined;
+    nodes[0] = .{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    for (1..depth + 1) |i| {
+        nodes[i] = .{ .kind = .{ .optional = &nodes[i - 1] }, .location = Location.zero };
+    }
+
+    const id = checker.resolveTypeExpr(&nodes[depth]);
+    try std.testing.expect(id.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
 }
 
 test "resolveTypeExpr reports unknown types" {
@@ -4284,13 +4336,13 @@ test "checkIdent: generic type name returns err silently" {
 
     // register a generic decl manually
     const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
-    checker.generic_decls.put("Box", .{ .@"struct" = .{
+    try checker.generic_decls.put("Box", .{ .@"struct" = .{
         .name = "Box",
         .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
         .fields = &.{
             .{ .name = "value", .type_expr = &t_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     const scope = &checker.module_scope;
     const ident = ast.Expr{ .kind = .{ .ident = "Box" }, .location = Location.zero };
@@ -4310,7 +4362,7 @@ test "Pair[Int,String] resolves to concrete struct" {
     // register a generic Pair[A, B] struct
     const a_te = ast.TypeExpr{ .kind = .{ .named = "A" }, .location = Location.zero };
     const b_te = ast.TypeExpr{ .kind = .{ .named = "B" }, .location = Location.zero };
-    checker.generic_decls.put("Pair", .{ .@"struct" = .{
+    try checker.generic_decls.put("Pair", .{ .@"struct" = .{
         .name = "Pair",
         .generic_params = &.{
             .{ .name = "A", .bounds = &.{}, .location = Location.zero },
@@ -4320,7 +4372,7 @@ test "Pair[Int,String] resolves to concrete struct" {
             .{ .name = "first", .type_expr = &a_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
             .{ .name = "second", .type_expr = &b_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     // resolve Pair[Int, String]
     const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
@@ -4348,13 +4400,13 @@ test "generic struct deduplication" {
     defer checker.deinit();
 
     const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
-    checker.generic_decls.put("Box", .{ .@"struct" = .{
+    try checker.generic_decls.put("Box", .{ .@"struct" = .{
         .name = "Box",
         .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
         .fields = &.{
             .{ .name = "value", .type_expr = &t_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
     const g1 = ast.TypeExpr{
@@ -4379,7 +4431,7 @@ test "generic struct wrong arg count" {
 
     const a_te = ast.TypeExpr{ .kind = .{ .named = "A" }, .location = Location.zero };
     const b_te = ast.TypeExpr{ .kind = .{ .named = "B" }, .location = Location.zero };
-    checker.generic_decls.put("Pair", .{ .@"struct" = .{
+    try checker.generic_decls.put("Pair", .{ .@"struct" = .{
         .name = "Pair",
         .generic_params = &.{
             .{ .name = "A", .bounds = &.{}, .location = Location.zero },
@@ -4389,7 +4441,7 @@ test "generic struct wrong arg count" {
             .{ .name = "first", .type_expr = &a_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
             .{ .name = "second", .type_expr = &b_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     // only provide 1 arg for a 2-param generic
     const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
@@ -4441,14 +4493,14 @@ test "Option[Int] resolves to concrete enum" {
     defer checker.deinit();
 
     const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
-    checker.generic_decls.put("Option", .{ .@"enum" = .{
+    try checker.generic_decls.put("Option", .{ .@"enum" = .{
         .name = "Option",
         .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
         .variants = &.{
             .{ .name = "Some", .fields = &.{&t_te}, .location = Location.zero },
             .{ .name = "None", .fields = &.{}, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
     const generic = ast.TypeExpr{
@@ -4478,14 +4530,14 @@ test "generic enum deduplication" {
     defer checker.deinit();
 
     const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
-    checker.generic_decls.put("Option", .{ .@"enum" = .{
+    try checker.generic_decls.put("Option", .{ .@"enum" = .{
         .name = "Option",
         .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
         .variants = &.{
             .{ .name = "Some", .fields = &.{&t_te}, .location = Location.zero },
             .{ .name = "None", .fields = &.{}, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     const str_te = ast.TypeExpr{ .kind = .{ .named = "String" }, .location = Location.zero };
     const g1 = ast.TypeExpr{
@@ -4507,14 +4559,14 @@ test "nested generic: Option[Option[Int]]" {
     defer checker.deinit();
 
     const t_te = ast.TypeExpr{ .kind = .{ .named = "T" }, .location = Location.zero };
-    checker.generic_decls.put("Option", .{ .@"enum" = .{
+    try checker.generic_decls.put("Option", .{ .@"enum" = .{
         .name = "Option",
         .generic_params = &.{.{ .name = "T", .bounds = &.{}, .location = Location.zero }},
         .variants = &.{
             .{ .name = "Some", .fields = &.{&t_te}, .location = Location.zero },
             .{ .name = "None", .fields = &.{}, .location = Location.zero },
         },
-    } }) catch unreachable;
+    } });
 
     // Option[Option[Int]]
     const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
@@ -4627,7 +4679,7 @@ test "checkIdent: generic function name returns err silently" {
         .location = Location.zero,
     };
 
-    checker.generic_decls.put("identity", .{ .function = .{
+    try checker.generic_decls.put("identity", .{ .function = .{
         .name = "identity",
         .generic_params = &.{
             .{ .name = "T", .bounds = &.{}, .location = Location.zero },
@@ -4637,7 +4689,7 @@ test "checkIdent: generic function name returns err silently" {
         },
         .return_type = &t_te,
         .body = .{ .stmts = &.{ret}, .location = Location.zero },
-    } }) catch unreachable;
+    } });
 
     // looking up "identity" should return .err but not emit a diagnostic
     const ident = ast.Expr{ .kind = .{ .ident = "identity" }, .location = Location.zero };
@@ -5649,11 +5701,13 @@ test "checkMethodCall: wrong arg count errors" {
 
     const p_ref = ast.Expr{ .kind = .{ .ident = "p" }, .location = Location.zero };
     const method_call = ast.Expr{
-        .kind = .{ .method_call = .{
-            .receiver = &p_ref,
-            .method = "magnitude",
-            .args = &.{}, // no args — should be 1
-        } },
+        .kind = .{
+            .method_call = .{
+                .receiver = &p_ref,
+                .method = "magnitude",
+                .args = &.{}, // no args — should be 1
+            },
+        },
         .location = Location.zero,
     };
     const call_stmt = ast.Stmt{

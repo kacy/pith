@@ -38,7 +38,7 @@ fn main():
 ## what works today
 
 the bootstrap compiler handles the full pipeline: lex → parse → check → codegen.
-9 example programs compile to native binaries via C transpilation.
+21 example programs, 19 compile to native binaries via C transpilation.
 
 **checked and compiling:**
 - function declarations, typed parameters, return types, calls
@@ -46,7 +46,7 @@ the bootstrap compiler handles the full pipeline: lex → parse → check → co
 - enum declarations with variant data
 - variable bindings with type inference (`x := 42`)
 - mutability enforcement (`mut` required for reassignment)
-- if/elif/else, while, for loops with scoping
+- if/elif/else, while, for loops over collections with scoping
 - binary operators: arithmetic, comparison, logical, string concatenation
 - unary operators: negate, not
 - string interpolation
@@ -55,13 +55,22 @@ the bootstrap compiler handles the full pipeline: lex → parse → check → co
 - method calls and impl blocks
 - pipe operator (`x | f`)
 - collection literals: List, Map, Set with index expressions
-- generics (checked, codegen pending)
+- generics with monomorphization
+- lambdas (non-capturing)
+- result types (`T!`) with try propagation (`expr!`) and `fail`
+- optional types (`T?`)
+- tuples with field access (`t.0`, `t.1`)
+- string methods (len, contains, split, trim, etc.)
+- type conversions (to_string, to_int, to_float, parse_int, parse_float)
+- file I/O (read_file, write_file), env, args, exit
+- collection methods (push, remove, contains, keys, values, reverse, etc.)
 
 **not yet implemented in codegen** (parses and type-checks fine):
-lambdas, concurrency, type aliases, for loops over collections.
+concurrency (spawn/await), type aliases, closures (capturing lambdas).
 
 **error codes:** every diagnostic has a stable code — E0xx (lexer),
-E1xx (parser), E2xx (checker). see `docs/errors.md` for the full reference.
+E1xx (parser), E2xx (checker), E3xx (lint). see `docs/errors.md` for the
+full reference.
 
 ## cli commands
 
@@ -72,6 +81,11 @@ forge check <file>        # type check and report errors
 forge check --json <file> # machine-readable JSON diagnostics
 forge build <file>        # compile to native binary (via C transpilation)
 forge run <file>          # compile and run
+forge test <file>         # run test declarations
+forge fmt <file>          # format source code (canonical style)
+forge fmt --check <file>  # check if file is formatted (exit 1 if not)
+forge lint <file>         # check conventions and best practices
+forge lint --json <file>  # machine-readable lint output
 ```
 
 ## building
@@ -81,7 +95,7 @@ requires [zig 0.15.2](https://ziglang.org/download/).
 ```
 zig build          # compile
 zig build run      # compile and run
-zig build test     # run 347 tests
+zig build test     # run 360 tests
 ```
 
 or with make:
@@ -98,7 +112,7 @@ make clean         # remove build artifacts
 
 ```
 src/
-  main.zig           CLI entry point (lex, parse, check, build, run)
+  main.zig           CLI entry point (lex, parse, check, build, run, test, fmt, lint)
   lexer.zig          tokenizer with indentation tracking
   parser.zig         recursive descent parser
   ast.zig            AST node types
@@ -106,14 +120,16 @@ src/
   types.zig          type representation and type table
   codegen.zig        C transpilation backend
   forge_runtime.h    C runtime header (embedded via @embedFile)
+  formatter.zig      source code formatter (forge fmt)
+  lint.zig           convention linter (forge lint)
   printer.zig        AST pretty-printer
   errors.zig         diagnostics, error codes, and source context
   intern.zig         string interning (arena-backed)
   io.zig             buffered I/O helpers
 
-examples/            .fg programs (9 compile to native binaries)
+examples/            .fg programs (19 compile to native binaries)
 docs/grammar.ebnf    complete EBNF for the language
-docs/errors.md       error code reference
+docs/errors.md       error code reference (E0xx–E3xx)
 ```
 
 ## license

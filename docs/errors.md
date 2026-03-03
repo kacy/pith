@@ -3,8 +3,9 @@
 forge diagnostics use stable error codes grouped by compiler phase.
 codes are never reused — if a code is retired, it stays retired.
 
-use `forge check --json <file>` for machine-readable output that includes
-the error code, location, message, and fix suggestion (if available).
+use `forge check --json <file>` or `forge lint --json <file>` for
+machine-readable output that includes the error code, location, message,
+and fix suggestion (if available).
 
 ---
 
@@ -349,3 +350,61 @@ a `spawn` or `await` expression has a type error.
 ### E233 — not yet supported
 
 a language feature is recognized but not yet implemented in the checker.
+
+---
+
+## lint errors (E3xx)
+
+reported by `forge lint`. naming violations are errors; style issues are warnings.
+
+### E300 — snake_case required (error)
+
+function names, variable names, and method names must use `snake_case`.
+
+```
+error[E300]: function name 'GetUser' should be snake_case
+  1 | fn GetUser():
+       ^^^^^^^
+```
+
+### E301 — PascalCase required (error)
+
+type names (structs, enums, interfaces, type aliases) must use `PascalCase`.
+
+```
+error[E301]: struct name 'my_point' should be PascalCase
+  1 | struct my_point:
+            ^^^^^^^^
+```
+
+### E302 — unused variable (warning)
+
+a local variable is bound but never referenced in its scope.
+
+```
+warning[E302]: unused variable 'x' in 'main'
+  3 |     x := 42
+        ^
+```
+
+### E304 — missing doc comment (warning)
+
+a public function or method has no doc comment. every `pub fn` should have
+a `///` doc comment explaining its purpose.
+
+```
+warning[E304]: public function 'serve' is missing a doc comment
+  5 | pub fn serve():
+            ^^^^^
+```
+
+### E305 — deep nesting (warning)
+
+code is indented more than 4 levels deep. consider extracting a helper
+function to reduce complexity.
+
+```
+warning[E305]: indentation depth 5 exceeds maximum of 4
+  12 |                     if x > 0:
+                            ^^
+```

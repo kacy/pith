@@ -28,6 +28,11 @@ pub const Parser = struct {
     allocator: std.mem.Allocator,
     diagnostics: errors.DiagnosticList,
     source: []const u8,
+    depth: u32,
+
+    /// maximum nesting depth for expressions. prevents stack overflow
+    /// from deeply nested input like `(((((...`.
+    const max_depth: u32 = 256;
 
     pub fn init(tokens: []const Token, source: []const u8, allocator: std.mem.Allocator) Parser {
         return .{
@@ -36,6 +41,7 @@ pub const Parser = struct {
             .allocator = allocator,
             .diagnostics = errors.DiagnosticList.init(allocator, source),
             .source = source,
+            .depth = 0,
         };
     }
 
@@ -297,6 +303,16 @@ pub const Parser = struct {
 
     /// entry point for expression parsing.
     pub fn parseExpression(self: *Parser) ParseError!*const ast.Expr {
+        if (self.depth >= max_depth) {
+            try self.diagnostics.addError(self.peek().location, "expression nesting exceeds maximum depth");
+            return self.create(ast.Expr, .{
+                .kind = .err,
+                .location = self.peek().location,
+            });
+        }
+        self.depth += 1;
+        defer self.depth -= 1;
+
         return self.parseOrExpr();
     }
 
@@ -2937,4 +2953,25 @@ test "parse generic with bounds" {
     const gp = module.decls[0].kind.fn_decl.generic_params;
     try testing.expectEqual(@as(usize, 1), gp.len);
     try testing.expectEqual(@as(usize, 1), gp[0].bounds.len);
+}
+
+test "deeply nested expressions produce error, not crash" {
+    // build a source string with 300 levels of nesting: (((((...1...)))))
+    var source_buf: [601]u8 = undefined;
+    for (0..300) |i| {
+        source_buf[i] = '(';
+    }
+    source_buf[300] = '1';
+    for (0..300) |i| {
+        source_buf[301 + i] = ')';
+    }
+    const source = source_buf[0..601];
+
+    var result = try testParser(source);
+    defer result.deinit();
+
+    _ = try result.parser.parseExpression();
+
+    // should have a depth error, not a stack overflow
+    try testing.expect(result.parser.diagnostics.hasErrors());
 }

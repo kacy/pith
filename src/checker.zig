@@ -172,6 +172,28 @@ pub const Checker = struct {
         // pre-register List[String] — used by String.split() and args()
         _ = self.internCollectionType("List", &.{.string}, .{ .list = .{ .element = .string } });
 
+        // parse_int(String) -> Int!
+        const int_result = try self.type_table.addType(.{ .result = .{
+            .ok_type = .int,
+            .err_type = .err,
+        } });
+        const parse_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = int_result,
+        } });
+        try self.module_scope.define("parse_int", .{ .type_id = parse_int_type, .is_mut = false });
+
+        // parse_float(String) -> Float!
+        const float_result = try self.type_table.addType(.{ .result = .{
+            .ok_type = .float,
+            .err_type = .err,
+        } });
+        const parse_float_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = float_result,
+        } });
+        try self.module_scope.define("parse_float", .{ .type_id = parse_float_type, .is_mut = false });
+
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});
         try self.registerSyncType("WaitGroup", &.{});
@@ -1850,10 +1872,11 @@ pub const Checker = struct {
         const receiver_type = self.checkExpr(mc.receiver, scope);
         if (receiver_type.isErr()) return .err;
 
-        // built-in string methods
-        if (receiver_type == .string) {
-            return self.checkStringMethod(mc, location, scope);
-        }
+        // built-in methods on primitive types
+        if (receiver_type == .string) return self.checkStringMethod(mc, location, scope);
+        if (receiver_type == .int) return self.checkIntMethod(mc, location);
+        if (receiver_type == .float) return self.checkFloatMethod(mc, location);
+        if (receiver_type == .bool) return self.checkBoolMethod(mc, location);
 
         // check for built-in collection methods before user-defined lookup
         if (self.type_table.get(receiver_type)) |ty| {
@@ -2058,6 +2081,38 @@ pub const Checker = struct {
         // unknown string method
         self.diagnostics.addCodedError(.E227, location, self.fmt(
             "type 'String' has no method '{s}'", .{method},
+        )) catch {};
+        return .err;
+    }
+
+    /// type-check a method call on an Int receiver.
+    fn checkIntMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location) TypeId {
+        if (std.mem.eql(u8, mc.method, "to_string")) return self.checkNoArgs(mc, location, "Int.to_string", .string);
+        if (std.mem.eql(u8, mc.method, "to_float")) return self.checkNoArgs(mc, location, "Int.to_float", .float);
+
+        self.diagnostics.addCodedError(.E227, location, self.fmt(
+            "type 'Int' has no method '{s}'", .{mc.method},
+        )) catch {};
+        return .err;
+    }
+
+    /// type-check a method call on a Float receiver.
+    fn checkFloatMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location) TypeId {
+        if (std.mem.eql(u8, mc.method, "to_string")) return self.checkNoArgs(mc, location, "Float.to_string", .string);
+        if (std.mem.eql(u8, mc.method, "to_int")) return self.checkNoArgs(mc, location, "Float.to_int", .int);
+
+        self.diagnostics.addCodedError(.E227, location, self.fmt(
+            "type 'Float' has no method '{s}'", .{mc.method},
+        )) catch {};
+        return .err;
+    }
+
+    /// type-check a method call on a Bool receiver.
+    fn checkBoolMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location) TypeId {
+        if (std.mem.eql(u8, mc.method, "to_string")) return self.checkNoArgs(mc, location, "Bool.to_string", .string);
+
+        self.diagnostics.addCodedError(.E227, location, self.fmt(
+            "type 'Bool' has no method '{s}'", .{mc.method},
         )) catch {};
         return .err;
     }

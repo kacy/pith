@@ -154,6 +154,10 @@ pub const CEmitter = struct {
         try self.emitOptionalTypedefs();
         try self.emitTupleTypedefs();
 
+        // pass 2c: emit C wrapper functions for built-in failable functions.
+        // these must come after result/optional typedefs since they return those types.
+        try self.emitBuiltinHelpers();
+
         // pass 3: forward-declare all functions
         for (module.decls) |*decl| {
             switch (decl.kind) {
@@ -588,6 +592,53 @@ pub const CEmitter = struct {
                 else => {},
             }
         }
+        try self.writeByte('\n');
+    }
+
+    /// emit C wrapper functions for built-in failable functions.
+    /// must be called after emitResultTypedefs/emitOptionalTypedefs so the
+    /// result/optional struct types are already defined.
+    fn emitBuiltinHelpers(self: *CEmitter) EmitError!void {
+        // parse_int(String) -> Int! — wraps strtoll
+        try self.writeStr(
+            \\static forge_result_int64_t forge_parse_int(forge_string_t s) {
+            \\    char buf[64];
+            \\    int64_t slen = s.len < 63 ? s.len : 63;
+            \\    memcpy(buf, s.data, (size_t)slen);
+            \\    buf[slen] = '\0';
+            \\    char *end;
+            \\    int64_t val = strtoll(buf, &end, 10);
+            \\    if (end == buf || *end != '\0') {
+            \\        forge_result_int64_t r; r.is_ok = false;
+            \\        r.err = FORGE_STRING_LIT("invalid integer");
+            \\        return r;
+            \\    }
+            \\    forge_result_int64_t r; r.is_ok = true; r.ok = val;
+            \\    return r;
+            \\}
+            \\
+        );
+
+        // parse_float(String) -> Float! — wraps strtod
+        try self.writeStr(
+            \\static forge_result_double forge_parse_float(forge_string_t s) {
+            \\    char buf[128];
+            \\    int64_t slen = s.len < 127 ? s.len : 127;
+            \\    memcpy(buf, s.data, (size_t)slen);
+            \\    buf[slen] = '\0';
+            \\    char *end;
+            \\    double val = strtod(buf, &end);
+            \\    if (end == buf || *end != '\0') {
+            \\        forge_result_double r; r.is_ok = false;
+            \\        r.err = FORGE_STRING_LIT("invalid float");
+            \\        return r;
+            \\    }
+            \\    forge_result_double r; r.is_ok = true; r.ok = val;
+            \\    return r;
+            \\}
+            \\
+        );
+
         try self.writeByte('\n');
     }
 
@@ -1747,6 +1798,18 @@ pub const CEmitter = struct {
             return;
         }
 
+        // built-in failable functions: parse_int, parse_float
+        if (std.mem.eql(u8, name, "parse_int") or std.mem.eql(u8, name, "parse_float")) {
+            try self.writeStr("forge_");
+            try self.writeStr(name);
+            try self.writeByte('(');
+            if (call.args.len > 0) {
+                try self.emitExpr(call.args[0].value);
+            }
+            try self.writeByte(')');
+            return;
+        }
+
         // struct constructor: Name(args) → (Name){ .field1 = arg1, ... }
         if (self.type_table.lookup(name)) |tid| {
             if (self.type_table.get(tid)) |ty| {
@@ -1840,9 +1903,10 @@ pub const CEmitter = struct {
     fn emitMethodCall(self: *CEmitter, mc: *const ast.MethodCallExpr) EmitError!void {
         const receiver_tid = self.inferExprType(mc.receiver);
 
-        // built-in string methods
-        if (receiver_tid == .string) {
-            return self.emitStringMethod(mc);
+        // built-in methods on primitive types
+        if (receiver_tid == .string) return self.emitStringMethod(mc);
+        if (receiver_tid == .int or receiver_tid == .float or receiver_tid == .bool) {
+            return self.emitPrimitiveMethod(mc, receiver_tid);
         }
 
         // built-in collection methods
@@ -1959,6 +2023,42 @@ pub const CEmitter = struct {
         }
     }
 
+    /// emit method calls on Int, Float, Bool.
+    fn emitPrimitiveMethod(self: *CEmitter, mc: *const ast.MethodCallExpr, receiver_tid: TypeId) EmitError!void {
+        const method = mc.method;
+
+        // to_string() — use existing runtime conversion functions
+        if (std.mem.eql(u8, method, "to_string")) {
+            const fn_name = switch (receiver_tid) {
+                .int => "forge_int_to_string",
+                .float => "forge_float_to_string",
+                .bool => "forge_bool_to_string",
+                else => unreachable,
+            };
+            try self.writeStr(fn_name);
+            try self.writeByte('(');
+            try self.emitExpr(mc.receiver);
+            try self.writeByte(')');
+            return;
+        }
+
+        // Int.to_float() → (double)(receiver)
+        if (receiver_tid == .int and std.mem.eql(u8, method, "to_float")) {
+            try self.writeStr("(double)(");
+            try self.emitExpr(mc.receiver);
+            try self.writeByte(')');
+            return;
+        }
+
+        // Float.to_int() → (int64_t)(receiver)
+        if (receiver_tid == .float and std.mem.eql(u8, method, "to_int")) {
+            try self.writeStr("(int64_t)(");
+            try self.emitExpr(mc.receiver);
+            try self.writeByte(')');
+            return;
+        }
+    }
+
     /// emit forge_list_push(&list, &(T){value}, sizeof(T))
     fn emitCollectionPush(self: *CEmitter, receiver: *const ast.Expr, value: *const ast.Expr, elem_type: TypeId) EmitError!void {
         const c_type = self.cTypeStringForId(elem_type);
@@ -2023,6 +2123,20 @@ pub const CEmitter = struct {
         if (std.mem.eql(u8, method, "split")) {
             return self.type_table.lookup("List[String]") orelse .err;
         }
+        return .err;
+    }
+
+    /// return type inference for built-in Int methods.
+    fn inferIntMethodType(_: *const CEmitter, method: []const u8) TypeId {
+        if (std.mem.eql(u8, method, "to_string")) return .string;
+        if (std.mem.eql(u8, method, "to_float")) return .float;
+        return .err;
+    }
+
+    /// return type inference for built-in Float methods.
+    fn inferFloatMethodType(_: *const CEmitter, method: []const u8) TypeId {
+        if (std.mem.eql(u8, method, "to_string")) return .string;
+        if (std.mem.eql(u8, method, "to_int")) return .int;
         return .err;
     }
 
@@ -2720,10 +2834,11 @@ pub const CEmitter = struct {
             .method_call => |mc| {
                 const receiver_tid = self.inferExprType(mc.receiver);
 
-                // built-in string methods
-                if (receiver_tid == .string) {
-                    return self.inferStringMethodType(mc.method);
-                }
+                // built-in methods on primitive types
+                if (receiver_tid == .string) return self.inferStringMethodType(mc.method);
+                if (receiver_tid == .int) return self.inferIntMethodType(mc.method);
+                if (receiver_tid == .float) return self.inferFloatMethodType(mc.method);
+                if (receiver_tid == .bool and std.mem.eql(u8, mc.method, "to_string")) return .string;
 
                 // built-in collection methods (.len)
                 if (!receiver_tid.isErr()) {

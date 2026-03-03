@@ -1202,11 +1202,11 @@ pub const Checker = struct {
 
             .call => |call| self.checkCall(call, expr.location, scope),
 
-            // method_call, index, unwrap, try_expr return .err because they
-            // require generics or method resolution that isn't implemented yet.
-            // returning .err (the error sentinel) suppresses cascading
-            // diagnostics — downstream checks skip anything typed as .err.
-            .method_call => .err,
+            .method_call => |mc| self.checkMethodCall(mc, expr.location, scope),
+
+            // index, unwrap, try_expr return .err because they require
+            // generics that aren't implemented yet. returning .err
+            // suppresses cascading diagnostics downstream.
             .field_access => |fa| self.checkFieldAccess(fa, expr.location, scope),
             .index => .err,
             .unwrap => .err,
@@ -1657,6 +1657,54 @@ pub const Checker = struct {
         }
 
         return type_id;
+    }
+
+    fn checkMethodCall(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope) TypeId {
+        // evaluate the receiver to get its type
+        const receiver_type = self.checkExpr(mc.receiver, scope);
+        if (receiver_type.isErr()) return .err;
+
+        // get the type name for method lookup
+        const type_name = self.type_table.typeName(receiver_type);
+
+        // look up the method
+        const key = self.buildMethodKey(type_name, mc.method);
+        const entry = self.method_types.get(key) orelse {
+            self.diagnostics.addError(location, self.fmt(
+                "type '{s}' has no method '{s}'",
+                .{ type_name, mc.method },
+            )) catch {};
+            return .err;
+        };
+
+        // get the function type for arg validation
+        const ty = self.type_table.get(entry.type_id) orelse return .err;
+        const func = switch (ty) {
+            .function => |f| f,
+            else => return .err,
+        };
+
+        // check argument count
+        if (mc.args.len != func.param_types.len) {
+            self.diagnostics.addError(location, self.fmt(
+                "'{s}.{s}' expects {d} argument(s), got {d}",
+                .{ type_name, mc.method, func.param_types.len, mc.args.len },
+            )) catch {};
+            return .err;
+        }
+
+        // check argument types
+        for (mc.args, func.param_types) |arg, expected| {
+            const actual = self.checkExpr(arg.value, scope);
+            if (!actual.isErr() and !expected.isErr() and actual != expected) {
+                self.diagnostics.addError(arg.location, self.fmt(
+                    "expected {s}, got {s}",
+                    .{ self.type_table.typeName(expected), self.type_table.typeName(actual) },
+                )) catch {};
+            }
+        }
+
+        return func.return_type;
     }
 
     fn checkFieldAccess(self: *Checker, fa: ast.FieldAccess, location: Location, scope: *const Scope) TypeId {
@@ -5024,6 +5072,359 @@ test "registerImplDecl: plain impl for unknown type errors" {
     };
 
     const module = ast.Module{ .imports = &.{}, .decls = &.{impl_decl} };
+    checker.check(&module);
+
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "checkMethodCall: resolves correctly" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    const ret_expr = ast.Expr{ .kind = .{ .ident = "a" }, .location = Location.zero };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &ret_expr } },
+        .location = Location.zero,
+    };
+
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // impl Point: fn magnitude(a: Int) -> Int: return a
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &point_te,
+            .interface = null,
+            .methods = &.{.{
+                .is_pub = false,
+                .decl = .{
+                    .name = "magnitude",
+                    .generic_params = &.{},
+                    .params = &.{
+                        .{ .name = "a", .type_expr = &int_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = &int_te,
+                    .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                },
+                .location = Location.zero,
+            }},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // fn main(): p := Point(1) \n m := p.magnitude(5)
+    const one = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const five = ast.Expr{ .kind = .{ .int_lit = "5" }, .location = Location.zero };
+    const p_ident = ast.Expr{ .kind = .{ .ident = "Point" }, .location = Location.zero };
+    const p_call = ast.Expr{
+        .kind = .{ .call = .{ .callee = &p_ident, .args = &.{.{ .name = null, .value = &one, .location = Location.zero }} } },
+        .location = Location.zero,
+    };
+    const p_bind = ast.Stmt{
+        .kind = .{ .binding = .{ .name = "p", .type_expr = null, .value = &p_call, .is_mut = false } },
+        .location = Location.zero,
+    };
+
+    const p_ref = ast.Expr{ .kind = .{ .ident = "p" }, .location = Location.zero };
+    const method_call = ast.Expr{
+        .kind = .{ .method_call = .{
+            .receiver = &p_ref,
+            .method = "magnitude",
+            .args = &.{.{ .name = null, .value = &five, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+    const m_bind = ast.Stmt{
+        .kind = .{ .binding = .{ .name = "m", .type_expr = null, .value = &method_call, .is_mut = false } },
+        .location = Location.zero,
+    };
+
+    const fn_decl = ast.Decl{
+        .kind = .{ .fn_decl = .{
+            .name = "main",
+            .generic_params = &.{},
+            .params = &.{},
+            .return_type = null,
+            .body = .{ .stmts = &.{ p_bind, m_bind }, .location = Location.zero },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ struct_decl, impl_decl, fn_decl } };
+    checker.check(&module);
+
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+}
+
+test "checkMethodCall: unknown method errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // impl Point: (no methods)
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &point_te,
+            .interface = null,
+            .methods = &.{},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // fn main(): p := Point(1) \n p.nonexistent(5)
+    const one = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const five = ast.Expr{ .kind = .{ .int_lit = "5" }, .location = Location.zero };
+    const p_ident = ast.Expr{ .kind = .{ .ident = "Point" }, .location = Location.zero };
+    const p_call = ast.Expr{
+        .kind = .{ .call = .{ .callee = &p_ident, .args = &.{.{ .name = null, .value = &one, .location = Location.zero }} } },
+        .location = Location.zero,
+    };
+    const p_bind = ast.Stmt{
+        .kind = .{ .binding = .{ .name = "p", .type_expr = null, .value = &p_call, .is_mut = false } },
+        .location = Location.zero,
+    };
+
+    const p_ref = ast.Expr{ .kind = .{ .ident = "p" }, .location = Location.zero };
+    const method_call = ast.Expr{
+        .kind = .{ .method_call = .{
+            .receiver = &p_ref,
+            .method = "nonexistent",
+            .args = &.{.{ .name = null, .value = &five, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+    const call_stmt = ast.Stmt{
+        .kind = .{ .expr_stmt = &method_call },
+        .location = Location.zero,
+    };
+
+    const fn_decl = ast.Decl{
+        .kind = .{ .fn_decl = .{
+            .name = "main",
+            .generic_params = &.{},
+            .params = &.{},
+            .return_type = null,
+            .body = .{ .stmts = &.{ p_bind, call_stmt }, .location = Location.zero },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ struct_decl, impl_decl, fn_decl } };
+    checker.check(&module);
+
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "checkMethodCall: wrong arg count errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    const ret_expr = ast.Expr{ .kind = .{ .ident = "a" }, .location = Location.zero };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &ret_expr } },
+        .location = Location.zero,
+    };
+
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // impl Point: fn magnitude(a: Int) -> Int: return a
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &point_te,
+            .interface = null,
+            .methods = &.{.{
+                .is_pub = false,
+                .decl = .{
+                    .name = "magnitude",
+                    .generic_params = &.{},
+                    .params = &.{
+                        .{ .name = "a", .type_expr = &int_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = &int_te,
+                    .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                },
+                .location = Location.zero,
+            }},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // p.magnitude() — missing argument
+    const one = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const p_ident = ast.Expr{ .kind = .{ .ident = "Point" }, .location = Location.zero };
+    const p_call = ast.Expr{
+        .kind = .{ .call = .{ .callee = &p_ident, .args = &.{.{ .name = null, .value = &one, .location = Location.zero }} } },
+        .location = Location.zero,
+    };
+    const p_bind = ast.Stmt{
+        .kind = .{ .binding = .{ .name = "p", .type_expr = null, .value = &p_call, .is_mut = false } },
+        .location = Location.zero,
+    };
+
+    const p_ref = ast.Expr{ .kind = .{ .ident = "p" }, .location = Location.zero };
+    const method_call = ast.Expr{
+        .kind = .{ .method_call = .{
+            .receiver = &p_ref,
+            .method = "magnitude",
+            .args = &.{}, // no args — should be 1
+        } },
+        .location = Location.zero,
+    };
+    const call_stmt = ast.Stmt{
+        .kind = .{ .expr_stmt = &method_call },
+        .location = Location.zero,
+    };
+
+    const fn_decl = ast.Decl{
+        .kind = .{ .fn_decl = .{
+            .name = "main",
+            .generic_params = &.{},
+            .params = &.{},
+            .return_type = null,
+            .body = .{ .stmts = &.{ p_bind, call_stmt }, .location = Location.zero },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ struct_decl, impl_decl, fn_decl } };
+    checker.check(&module);
+
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "checkMethodCall: wrong arg type errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const int_te = ast.TypeExpr{ .kind = .{ .named = "Int" }, .location = Location.zero };
+    const point_te = ast.TypeExpr{ .kind = .{ .named = "Point" }, .location = Location.zero };
+
+    const ret_expr = ast.Expr{ .kind = .{ .ident = "a" }, .location = Location.zero };
+    const ret_stmt = ast.Stmt{
+        .kind = .{ .return_stmt = .{ .value = &ret_expr } },
+        .location = Location.zero,
+    };
+
+    const struct_decl = ast.Decl{
+        .kind = .{ .struct_decl = .{
+            .name = "Point",
+            .generic_params = &.{},
+            .fields = &.{
+                .{ .name = "x", .type_expr = &int_te, .default = null, .is_pub = true, .is_mut = false, .is_weak = false, .location = Location.zero },
+            },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // impl Point: fn magnitude(a: Int) -> Int: return a
+    const impl_decl = ast.Decl{
+        .kind = .{ .impl_decl = .{
+            .target = &point_te,
+            .interface = null,
+            .methods = &.{.{
+                .is_pub = false,
+                .decl = .{
+                    .name = "magnitude",
+                    .generic_params = &.{},
+                    .params = &.{
+                        .{ .name = "a", .type_expr = &int_te, .default = null, .is_mut = false, .is_ref = false, .location = Location.zero },
+                    },
+                    .return_type = &int_te,
+                    .body = .{ .stmts = &.{ret_stmt}, .location = Location.zero },
+                },
+                .location = Location.zero,
+            }},
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    // p.magnitude("hello") — String instead of Int
+    const one = ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const wrong_arg = ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const p_ident = ast.Expr{ .kind = .{ .ident = "Point" }, .location = Location.zero };
+    const p_call = ast.Expr{
+        .kind = .{ .call = .{ .callee = &p_ident, .args = &.{.{ .name = null, .value = &one, .location = Location.zero }} } },
+        .location = Location.zero,
+    };
+    const p_bind = ast.Stmt{
+        .kind = .{ .binding = .{ .name = "p", .type_expr = null, .value = &p_call, .is_mut = false } },
+        .location = Location.zero,
+    };
+
+    const p_ref = ast.Expr{ .kind = .{ .ident = "p" }, .location = Location.zero };
+    const method_call = ast.Expr{
+        .kind = .{ .method_call = .{
+            .receiver = &p_ref,
+            .method = "magnitude",
+            .args = &.{.{ .name = null, .value = &wrong_arg, .location = Location.zero }},
+        } },
+        .location = Location.zero,
+    };
+    const call_stmt = ast.Stmt{
+        .kind = .{ .expr_stmt = &method_call },
+        .location = Location.zero,
+    };
+
+    const fn_decl = ast.Decl{
+        .kind = .{ .fn_decl = .{
+            .name = "main",
+            .generic_params = &.{},
+            .params = &.{},
+            .return_type = null,
+            .body = .{ .stmts = &.{ p_bind, call_stmt }, .location = Location.zero },
+        } },
+        .is_pub = false,
+        .location = Location.zero,
+    };
+
+    const module = ast.Module{ .imports = &.{}, .decls = &.{ struct_decl, impl_decl, fn_decl } };
     checker.check(&module);
 
     try std.testing.expect(checker.diagnostics.hasErrors());

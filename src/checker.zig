@@ -740,15 +740,27 @@ pub const Checker = struct {
     }
 
     fn checkForStmt(self: *Checker, f: ast.ForStmt, scope: *Scope) void {
-        // check the iterable expression
-        _ = self.checkExpr(f.iterable, scope);
+        // check the iterable and infer the element type from its collection type
+        const iter_type = self.checkExpr(f.iterable, scope);
+        var binding_type: TypeId = .err;
+        if (!iter_type.isErr()) {
+            if (self.type_table.get(iter_type)) |ty| {
+                switch (ty) {
+                    .list => |l| binding_type = l.element,
+                    .map => |m| binding_type = m.key,
+                    .set => |s| binding_type = s.element,
+                    else => {
+                        self.diagnostics.addCodedError(.E200, f.iterable.location,
+                            "for loop requires an iterable collection (List, Map, or Set)") catch {};
+                    },
+                }
+            }
+        }
 
-        // the loop variable type needs generics to determine element type,
-        // so for now we give it the error sentinel to avoid false positives
         var body_scope = Scope.init(self.allocator, scope);
         defer body_scope.deinit();
         body_scope.in_loop = true;
-        body_scope.define(f.binding, .{ .type_id = .err, .is_mut = false }) catch return;
+        body_scope.define(f.binding, .{ .type_id = binding_type, .is_mut = false }) catch return;
 
         if (f.index) |idx| {
             body_scope.define(idx, .{ .type_id = .int, .is_mut = false }) catch return;

@@ -50,6 +50,8 @@ pub const CEmitter = struct {
     /// method type information from the checker. key is "TypeName.methodName",
     /// value has the function type id and original AST decl.
     method_types: *const std.StringHashMap(Checker.MethodEntry),
+    /// counter for generating unique loop index variable names (__idx_0, __idx_1, ...)
+    for_counter: u32,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -66,6 +68,7 @@ pub const CEmitter = struct {
             .local_types = std.StringHashMap(TypeId).init(allocator),
             .current_fn_return = .void,
             .method_types = method_types,
+            .for_counter = 0,
         };
     }
 
@@ -633,11 +636,93 @@ pub const CEmitter = struct {
     }
 
     fn emitForStmt(self: *CEmitter, fs: *const ast.ForStmt) EmitError!void {
-        // for loops over collections — not yet fully supported
-        // emit a comment placeholder
-        _ = fs;
-        try self.writeIndent();
-        try self.writeStr("/* for loop not yet supported in codegen */\n");
+        const iter_tid = self.inferExprType(fs.iterable);
+        const collection_type = if (!iter_tid.isErr()) self.type_table.get(iter_tid) else null;
+
+        // determine the index variable name — user-provided or generated
+        var idx_buf: [32]u8 = undefined;
+        const idx_name = if (fs.index) |idx| idx else blk: {
+            const name = std.fmt.bufPrint(&idx_buf, "__idx_{d}", .{self.for_counter}) catch return;
+            self.for_counter += 1;
+            break :blk name;
+        };
+
+        if (collection_type) |ct| {
+            switch (ct) {
+                .list => |l| {
+                    // for item in list:  →  for (i = 0; i < list.len; i++) { T item = ...; }
+                    const elem_c = self.cTypeStringForId(l.element);
+                    try self.writeIndent();
+                    try self.writeFmt("for (int64_t {s} = 0; {s} < ", .{ idx_name, idx_name });
+                    try self.emitExpr(fs.iterable);
+                    try self.writeFmt(".len; {s}++) {{\n", .{idx_name});
+                    self.indent_level += 1;
+                    try self.writeIndent();
+                    try self.writeStr(elem_c);
+                    try self.writeFmt(" {s} = FORGE_LIST_GET(", .{fs.binding});
+                    try self.emitExpr(fs.iterable);
+                    try self.writeStr(", ");
+                    try self.writeStr(elem_c);
+                    try self.writeFmt(", {s});\n", .{idx_name});
+                    // track the binding type so the body can use it
+                    self.local_types.put(fs.binding, l.element) catch {};
+                    if (fs.index != null) self.local_types.put(idx_name, .int) catch {};
+                    try self.emitBlock(&fs.body);
+                    self.indent_level -= 1;
+                    try self.writeIndent();
+                    try self.writeStr("}\n");
+                },
+                .map => |m| {
+                    // for key in map:  →  for (i = 0; i < map.len; i++) { K key = ...; }
+                    const key_c = self.cTypeStringForId(m.key);
+                    try self.writeIndent();
+                    try self.writeFmt("for (int64_t {s} = 0; {s} < ", .{ idx_name, idx_name });
+                    try self.emitExpr(fs.iterable);
+                    try self.writeFmt(".len; {s}++) {{\n", .{idx_name});
+                    self.indent_level += 1;
+                    try self.writeIndent();
+                    try self.writeStr(key_c);
+                    try self.writeFmt(" {s} = (({s} *)", .{ fs.binding, key_c });
+                    try self.emitExpr(fs.iterable);
+                    try self.writeFmt(".keys)[{s}];\n", .{idx_name});
+                    self.local_types.put(fs.binding, m.key) catch {};
+                    if (fs.index != null) self.local_types.put(idx_name, .int) catch {};
+                    try self.emitBlock(&fs.body);
+                    self.indent_level -= 1;
+                    try self.writeIndent();
+                    try self.writeStr("}\n");
+                },
+                .set => |s| {
+                    // set is typedef'd to list — same iteration pattern
+                    const elem_c = self.cTypeStringForId(s.element);
+                    try self.writeIndent();
+                    try self.writeFmt("for (int64_t {s} = 0; {s} < ", .{ idx_name, idx_name });
+                    try self.emitExpr(fs.iterable);
+                    try self.writeFmt(".len; {s}++) {{\n", .{idx_name});
+                    self.indent_level += 1;
+                    try self.writeIndent();
+                    try self.writeStr(elem_c);
+                    try self.writeFmt(" {s} = FORGE_LIST_GET(", .{fs.binding});
+                    try self.emitExpr(fs.iterable);
+                    try self.writeStr(", ");
+                    try self.writeStr(elem_c);
+                    try self.writeFmt(", {s});\n", .{idx_name});
+                    self.local_types.put(fs.binding, s.element) catch {};
+                    if (fs.index != null) self.local_types.put(idx_name, .int) catch {};
+                    try self.emitBlock(&fs.body);
+                    self.indent_level -= 1;
+                    try self.writeIndent();
+                    try self.writeStr("}\n");
+                },
+                else => {
+                    try self.writeIndent();
+                    try self.writeStr("/* for loop: unsupported iterable type */\n");
+                },
+            }
+        } else {
+            try self.writeIndent();
+            try self.writeStr("/* for loop: could not resolve iterable type */\n");
+        }
     }
 
     fn emitMatchStmt(self: *CEmitter, m: *const ast.MatchExpr) EmitError!void {

@@ -618,13 +618,21 @@ pub const Checker = struct {
         if (ret.value) |value| {
             const actual = self.checkExpr(value, scope);
             if (!actual.isErr() and !expected.isErr() and actual != expected) {
-                self.diagnostics.addCodedErrorWithFix(.E200, value.location, self.fmt(
-                    "return type mismatch: expected {s}, got {s}",
-                    .{ self.type_table.typeName(expected), self.type_table.typeName(actual) },
-                ), self.fmt(
-                    "change the return type to {s}",
-                    .{self.type_table.typeName(actual)},
-                )) catch {};
+                // allow returning the ok-type from a result-returning function
+                const ok_match = if (self.type_table.get(expected)) |ty| switch (ty) {
+                    .result => |r| actual == r.ok_type,
+                    else => false,
+                } else false;
+
+                if (!ok_match) {
+                    self.diagnostics.addCodedErrorWithFix(.E200, value.location, self.fmt(
+                        "return type mismatch: expected {s}, got {s}",
+                        .{ self.type_table.typeName(expected), self.type_table.typeName(actual) },
+                    ), self.fmt(
+                        "change the return type to {s}",
+                        .{self.type_table.typeName(actual)},
+                    )) catch {};
+                }
             }
         } else {
             // bare return — expected type should be Void

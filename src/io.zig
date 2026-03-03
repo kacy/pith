@@ -5,8 +5,12 @@
 
 const std = @import("std");
 
+/// buffer size for stdout/stderr writers. 8 KiB is enough for any single
+/// print in the compiler — diagnostics, AST nodes, usage text, etc.
+pub const write_buf_size = 8192;
+
 pub fn write(comptime fmt: []const u8, args: anytype) void {
-    var buf: [8192]u8 = undefined;
+    var buf: [write_buf_size]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
     const out = &w.interface;
     out.print(fmt, args) catch {};
@@ -14,7 +18,7 @@ pub fn write(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn writeErr(comptime fmt: []const u8, args: anytype) void {
-    var buf: [4096]u8 = undefined;
+    var buf: [write_buf_size]u8 = undefined;
     var w = std.fs.File.stderr().writer(&buf);
     const out = &w.interface;
     out.print(fmt, args) catch {};

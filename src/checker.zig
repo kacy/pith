@@ -877,7 +877,8 @@ pub const Checker = struct {
     /// resolve a generic type by name with already-resolved type arguments.
     /// handles builtin generics (Task, Channel) and user-defined generics.
     fn resolveGenericTypeWithArgs(self: *Checker, name: []const u8, arg_ids: []const TypeId, location: Location) TypeId {
-        // builtin generic types
+        // builtin generic types — deduplicated via name_map so that e.g.
+        // two List[Int] occurrences share the same TypeId.
         if (arg_ids.len == 1) {
             if (std.mem.eql(u8, name, "Task")) {
                 return self.type_table.addType(.{ .task = .{ .inner = arg_ids[0] } }) catch return .err;
@@ -886,17 +887,17 @@ pub const Checker = struct {
                 return self.type_table.addType(.{ .channel = .{ .inner = arg_ids[0] } }) catch return .err;
             }
             if (std.mem.eql(u8, name, "List")) {
-                return self.type_table.addType(.{ .list = .{ .element = arg_ids[0] } }) catch return .err;
+                return self.internCollectionType(name, arg_ids, .{ .list = .{ .element = arg_ids[0] } });
             }
             if (std.mem.eql(u8, name, "Set")) {
-                return self.type_table.addType(.{ .set = .{ .element = arg_ids[0] } }) catch return .err;
+                return self.internCollectionType(name, arg_ids, .{ .set = .{ .element = arg_ids[0] } });
             }
         }
         if (arg_ids.len == 2 and std.mem.eql(u8, name, "Map")) {
-            return self.type_table.addType(.{ .map = .{
+            return self.internCollectionType(name, arg_ids, .{ .map = .{
                 .key = arg_ids[0],
                 .value = arg_ids[1],
-            } }) catch return .err;
+            } });
         }
 
         // look up user-defined generic
@@ -913,6 +914,18 @@ pub const Checker = struct {
                 return .err;
             },
         };
+    }
+
+    /// deduplicate a builtin collection type (List, Map, Set) by registering
+    /// it under a canonical name like "List[Int]". returns the existing TypeId
+    /// if already registered, otherwise creates and registers a new one.
+    fn internCollectionType(self: *Checker, name: []const u8, arg_ids: []const TypeId, ty: types.Type) TypeId {
+        const inst_name = self.buildInstName(name, arg_ids);
+        if (self.type_table.lookup(inst_name)) |existing| return existing;
+
+        const id = self.type_table.addType(ty) catch return .err;
+        self.type_table.register(inst_name, id) catch {};
+        return id;
     }
 
     /// build an instantiated name like "Pair[Int,String]" on the arena.
@@ -2071,7 +2084,7 @@ pub const Checker = struct {
             }
         }
 
-        return self.type_table.addType(.{ .list = .{ .element = first_type } }) catch return .err;
+        return self.internCollectionType("List", &.{first_type}, .{ .list = .{ .element = first_type } });
     }
 
     /// check a map literal {k: v, ...}. all keys must share a type, all values must share a type.
@@ -2106,10 +2119,10 @@ pub const Checker = struct {
             }
         }
 
-        return self.type_table.addType(.{ .map = .{
+        return self.internCollectionType("Map", &.{ first_key_type, first_val_type }, .{ .map = .{
             .key = first_key_type,
             .value = first_val_type,
-        } }) catch return .err;
+        } });
     }
 
     /// check a set literal {a, b, c}. all elements must have the same type.
@@ -2136,7 +2149,7 @@ pub const Checker = struct {
             }
         }
 
-        return self.type_table.addType(.{ .set = .{ .element = first_type } }) catch return .err;
+        return self.internCollectionType("Set", &.{first_type}, .{ .set = .{ .element = first_type } });
     }
 
     fn checkTupleExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
@@ -6180,6 +6193,133 @@ test "generic struct with bound: not satisfied" {
     checker.check(&module);
 
     // Wrapper[Int] should fail — Int does not implement Printable
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "list literal: homogeneous elements" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const a = &ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const b = &ast.Expr{ .kind = .{ .int_lit = "2" }, .location = Location.zero };
+    const c = &ast.Expr{ .kind = .{ .int_lit = "3" }, .location = Location.zero };
+    const list_expr = ast.Expr{
+        .kind = .{ .list = &.{ a, b, c } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&list_expr, &checker.module_scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    try std.testing.expectEqual(TypeId.int, ty.list.element);
+}
+
+test "list literal: mixed types error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const a = &ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const b = &ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const list_expr = ast.Expr{
+        .kind = .{ .list = &.{ a, b } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&list_expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "list literal: empty list errors" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const list_expr = ast.Expr{
+        .kind = .{ .list = &.{} },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&list_expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+}
+
+test "map literal: homogeneous entries" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const k1 = &ast.Expr{ .kind = .{ .string_lit = "a" }, .location = Location.zero };
+    const v1 = &ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const k2 = &ast.Expr{ .kind = .{ .string_lit = "b" }, .location = Location.zero };
+    const v2 = &ast.Expr{ .kind = .{ .int_lit = "2" }, .location = Location.zero };
+    const map_expr = ast.Expr{
+        .kind = .{ .map = &.{
+            .{ .key = k1, .value = v1, .location = Location.zero },
+            .{ .key = k2, .value = v2, .location = Location.zero },
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&map_expr, &checker.module_scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    try std.testing.expectEqual(TypeId.string, ty.map.key);
+    try std.testing.expectEqual(TypeId.int, ty.map.value);
+}
+
+test "map literal: mixed value types error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const k1 = &ast.Expr{ .kind = .{ .string_lit = "a" }, .location = Location.zero };
+    const v1 = &ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const k2 = &ast.Expr{ .kind = .{ .string_lit = "b" }, .location = Location.zero };
+    const v2 = &ast.Expr{ .kind = .{ .string_lit = "hello" }, .location = Location.zero };
+    const map_expr = ast.Expr{
+        .kind = .{ .map = &.{
+            .{ .key = k1, .value = v1, .location = Location.zero },
+            .{ .key = k2, .value = v2, .location = Location.zero },
+        } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&map_expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
+    try std.testing.expect(checker.diagnostics.hasErrors());
+}
+
+test "set literal: homogeneous elements" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const a = &ast.Expr{ .kind = .{ .string_lit = "x" }, .location = Location.zero };
+    const b = &ast.Expr{ .kind = .{ .string_lit = "y" }, .location = Location.zero };
+    const set_expr = ast.Expr{
+        .kind = .{ .set = &.{ a, b } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&set_expr, &checker.module_scope);
+    try std.testing.expect(!result.isErr());
+
+    const ty = checker.type_table.get(result).?;
+    try std.testing.expectEqual(TypeId.string, ty.set.element);
+}
+
+test "set literal: mixed types error" {
+    var checker = try Checker.init(std.testing.allocator, "");
+    defer checker.deinit();
+
+    const a = &ast.Expr{ .kind = .{ .int_lit = "1" }, .location = Location.zero };
+    const b = &ast.Expr{ .kind = .{ .bool_lit = true }, .location = Location.zero };
+    const set_expr = ast.Expr{
+        .kind = .{ .set = &.{ a, b } },
+        .location = Location.zero,
+    };
+
+    const result = checker.checkExpr(&set_expr, &checker.module_scope);
+    try std.testing.expect(result.isErr());
     try std.testing.expect(checker.diagnostics.hasErrors());
 }
 

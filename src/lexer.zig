@@ -61,6 +61,7 @@ pub const TokenKind = enum {
     kw_and,
     kw_or,
     kw_not,
+    kw_test,
 
     // operators
     plus, // +
@@ -153,6 +154,7 @@ const keyword_map = std.StaticStringMap(TokenKind).initComptime(.{
     .{ "and", .kw_and },
     .{ "or", .kw_or },
     .{ "not", .kw_not },
+    .{ "test", .kw_test },
 });
 
 // ---------------------------------------------------------------

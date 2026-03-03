@@ -61,7 +61,7 @@ pub const Binding = struct {
 /// lookups walk the parent chain until a match is found.
 pub const Scope = struct {
     bindings: std.StringHashMap(Binding),
-    parent: ?*Scope,
+    parent: ?*const Scope,
     /// the return type of the enclosing function (if any).
     /// used to check return statements.
     return_type: ?TypeId,
@@ -69,7 +69,7 @@ pub const Scope = struct {
     /// used to validate break/continue statements.
     in_loop: bool,
 
-    pub fn init(allocator: std.mem.Allocator, parent: ?*Scope) Scope {
+    pub fn init(allocator: std.mem.Allocator, parent: ?*const Scope) Scope {
         return .{
             .bindings = std.StringHashMap(Binding).init(allocator),
             .parent = parent,
@@ -756,6 +756,28 @@ pub const Checker = struct {
 
     /// resolve an AST type expression to a TypeId in the type table.
     pub fn resolveTypeExpr(self: *Checker, type_expr: *const ast.TypeExpr) TypeId {
+        return self.resolveTypeImpl(type_expr, null);
+    }
+
+    /// resolve a type expression with a substitution map for type parameters.
+    /// used during generic instantiation to replace type parameter names
+    /// (e.g. T, K, V) with their concrete types.
+    fn resolveTypeExprWithSubst(
+        self: *Checker,
+        type_expr: *const ast.TypeExpr,
+        subst: *const std.StringHashMap(TypeId),
+    ) TypeId {
+        return self.resolveTypeImpl(type_expr, subst);
+    }
+
+    /// shared implementation for type expression resolution. when subst is
+    /// non-null, named types are checked against the substitution map first
+    /// (used during generic instantiation).
+    fn resolveTypeImpl(
+        self: *Checker,
+        type_expr: *const ast.TypeExpr,
+        subst: ?*const std.StringHashMap(TypeId),
+    ) TypeId {
         if (self.resolve_depth >= max_resolve_depth) {
             self.diagnostics.addError(type_expr.location, "type nesting exceeds maximum depth") catch {};
             return .err;
@@ -764,12 +786,66 @@ pub const Checker = struct {
         defer self.resolve_depth -= 1;
 
         return switch (type_expr.kind) {
-            .named => |name| self.resolveNamedType(name, type_expr.location),
-            .optional => |inner| self.resolveOptionalType(inner),
-            .result => |r| self.resolveResultType(r),
-            .tuple => |elems| self.resolveTupleType(elems),
-            .fn_type => |f| self.resolveFnType(f),
-            .generic => |g| self.resolveGenericType(g, type_expr.location),
+            .named => |name| {
+                if (subst) |s| {
+                    if (s.get(name)) |id| return id;
+                }
+                return self.resolveNamedType(name, type_expr.location);
+            },
+            .optional => |inner| {
+                const inner_id = self.resolveTypeImpl(inner, subst);
+                if (inner_id.isErr()) return .err;
+                return self.type_table.addType(.{ .optional = .{ .inner = inner_id } }) catch return .err;
+            },
+            .result => |r| {
+                const ok_id = self.resolveTypeImpl(r.ok_type, subst);
+                if (ok_id.isErr()) return .err;
+                const err_id = if (r.err_type) |err_type|
+                    self.resolveTypeImpl(err_type, subst)
+                else
+                    TypeId.err; // default error type — will be refined later
+                return self.type_table.addType(.{ .result = .{
+                    .ok_type = ok_id,
+                    .err_type = err_id,
+                } }) catch return .err;
+            },
+            .tuple => |elems| {
+                var ids = std.ArrayList(TypeId).initCapacity(self.allocator, elems.len) catch return .err;
+                defer ids.deinit(self.allocator);
+                for (elems) |elem| {
+                    const id = self.resolveTypeImpl(elem, subst);
+                    if (id.isErr()) return .err;
+                    ids.append(self.allocator, id) catch return .err;
+                }
+                const owned = self.arena.allocator().dupe(TypeId, ids.items) catch return .err;
+                return self.type_table.addType(.{ .tuple = .{ .elements = owned } }) catch return .err;
+            },
+            .fn_type => |f| {
+                var param_ids = std.ArrayList(TypeId).initCapacity(self.allocator, f.params.len) catch return .err;
+                defer param_ids.deinit(self.allocator);
+                for (f.params) |param| {
+                    const id = self.resolveTypeImpl(param, subst);
+                    if (id.isErr()) return .err;
+                    param_ids.append(self.allocator, id) catch return .err;
+                }
+                const ret_id = if (f.return_type) |rt| self.resolveTypeImpl(rt, subst) else TypeId.void;
+                if (ret_id.isErr()) return .err;
+                const owned_params = self.arena.allocator().dupe(TypeId, param_ids.items) catch return .err;
+                return self.type_table.addType(.{ .function = .{
+                    .param_types = owned_params,
+                    .return_type = ret_id,
+                } }) catch return .err;
+            },
+            .generic => |g| {
+                var arg_ids = std.ArrayList(TypeId).initCapacity(self.allocator, g.args.len) catch return .err;
+                defer arg_ids.deinit(self.allocator);
+                for (g.args) |arg| {
+                    const id = self.resolveTypeImpl(arg, subst);
+                    if (id.isErr()) return .err;
+                    arg_ids.append(self.allocator, id) catch return .err;
+                }
+                return self.resolveGenericTypeWithArgs(g.name, arg_ids.items, type_expr.location);
+            },
         };
     }
 
@@ -778,77 +854,6 @@ pub const Checker = struct {
 
         self.diagnostics.addError(location, self.fmt("unknown type '{s}'", .{name})) catch {};
         return .err;
-    }
-
-    fn resolveOptionalType(self: *Checker, inner: *const ast.TypeExpr) TypeId {
-        const inner_id = self.resolveTypeExpr(inner);
-        if (inner_id.isErr()) return .err;
-
-        return self.type_table.addType(.{ .optional = .{ .inner = inner_id } }) catch return .err;
-    }
-
-    fn resolveResultType(self: *Checker, r: ast.ResultType) TypeId {
-        const ok_id = self.resolveTypeExpr(r.ok_type);
-        if (ok_id.isErr()) return .err;
-
-        const err_id = if (r.err_type) |err_type|
-            self.resolveTypeExpr(err_type)
-        else
-            TypeId.err; // default error type — will be refined later
-
-        return self.type_table.addType(.{ .result = .{
-            .ok_type = ok_id,
-            .err_type = err_id,
-        } }) catch return .err;
-    }
-
-    fn resolveTupleType(self: *Checker, elems: []const *const ast.TypeExpr) TypeId {
-        var ids = std.ArrayList(TypeId).initCapacity(self.allocator, elems.len) catch return .err;
-        defer ids.deinit(self.allocator);
-
-        for (elems) |elem| {
-            const id = self.resolveTypeExpr(elem);
-            if (id.isErr()) return .err;
-            ids.append(self.allocator, id) catch return .err;
-        }
-
-        // copy to arena so it outlives this call
-        const owned = self.arena.allocator().dupe(TypeId, ids.items) catch return .err;
-        return self.type_table.addType(.{ .tuple = .{ .elements = owned } }) catch return .err;
-    }
-
-    fn resolveFnType(self: *Checker, f: ast.FnType) TypeId {
-        var param_ids = std.ArrayList(TypeId).initCapacity(self.allocator, f.params.len) catch return .err;
-        defer param_ids.deinit(self.allocator);
-
-        for (f.params) |param| {
-            const id = self.resolveTypeExpr(param);
-            if (id.isErr()) return .err;
-            param_ids.append(self.allocator, id) catch return .err;
-        }
-
-        const ret_id = if (f.return_type) |rt| self.resolveTypeExpr(rt) else TypeId.void;
-        if (ret_id.isErr()) return .err;
-
-        const owned_params = self.arena.allocator().dupe(TypeId, param_ids.items) catch return .err;
-        return self.type_table.addType(.{ .function = .{
-            .param_types = owned_params,
-            .return_type = ret_id,
-        } }) catch return .err;
-    }
-
-    fn resolveGenericType(self: *Checker, g: ast.GenericType, location: Location) TypeId {
-        // resolve all type arguments first
-        var arg_ids = std.ArrayList(TypeId).initCapacity(self.allocator, g.args.len) catch return .err;
-        defer arg_ids.deinit(self.allocator);
-
-        for (g.args) |arg| {
-            const id = self.resolveTypeExpr(arg);
-            if (id.isErr()) return .err;
-            arg_ids.append(self.allocator, id) catch return .err;
-        }
-
-        return self.resolveGenericTypeWithArgs(g.name, arg_ids.items, location);
     }
 
     /// resolve a generic type by name with already-resolved type arguments.
@@ -922,77 +927,6 @@ pub const Checker = struct {
 
         // copy to arena for stable lifetime
         return self.arena.allocator().dupe(u8, buf.items) catch base;
-    }
-
-    /// resolve a type expression with a substitution map for type parameters.
-    /// mirrors resolveTypeExpr but checks the map for named types first.
-    fn resolveTypeExprWithSubst(
-        self: *Checker,
-        type_expr: *const ast.TypeExpr,
-        subst: *const std.StringHashMap(TypeId),
-    ) TypeId {
-        return switch (type_expr.kind) {
-            .named => |name| {
-                // check substitution map before normal resolution
-                if (subst.get(name)) |id| return id;
-                return self.resolveNamedType(name, type_expr.location);
-            },
-            .optional => |inner| {
-                const inner_id = self.resolveTypeExprWithSubst(inner, subst);
-                if (inner_id.isErr()) return .err;
-                return self.type_table.addType(.{ .optional = .{ .inner = inner_id } }) catch return .err;
-            },
-            .result => |r| {
-                const ok_id = self.resolveTypeExprWithSubst(r.ok_type, subst);
-                if (ok_id.isErr()) return .err;
-                const err_id = if (r.err_type) |err_type|
-                    self.resolveTypeExprWithSubst(err_type, subst)
-                else
-                    TypeId.err;
-                return self.type_table.addType(.{ .result = .{
-                    .ok_type = ok_id,
-                    .err_type = err_id,
-                } }) catch return .err;
-            },
-            .tuple => |elems| {
-                var ids = std.ArrayList(TypeId).initCapacity(self.allocator, elems.len) catch return .err;
-                defer ids.deinit(self.allocator);
-                for (elems) |elem| {
-                    const id = self.resolveTypeExprWithSubst(elem, subst);
-                    if (id.isErr()) return .err;
-                    ids.append(self.allocator, id) catch return .err;
-                }
-                const owned = self.arena.allocator().dupe(TypeId, ids.items) catch return .err;
-                return self.type_table.addType(.{ .tuple = .{ .elements = owned } }) catch return .err;
-            },
-            .fn_type => |f| {
-                var param_ids = std.ArrayList(TypeId).initCapacity(self.allocator, f.params.len) catch return .err;
-                defer param_ids.deinit(self.allocator);
-                for (f.params) |param| {
-                    const id = self.resolveTypeExprWithSubst(param, subst);
-                    if (id.isErr()) return .err;
-                    param_ids.append(self.allocator, id) catch return .err;
-                }
-                const ret_id = if (f.return_type) |rt| self.resolveTypeExprWithSubst(rt, subst) else TypeId.void;
-                if (ret_id.isErr()) return .err;
-                const owned_params = self.arena.allocator().dupe(TypeId, param_ids.items) catch return .err;
-                return self.type_table.addType(.{ .function = .{
-                    .param_types = owned_params,
-                    .return_type = ret_id,
-                } }) catch return .err;
-            },
-            .generic => |g| {
-                // resolve type args with substitution, then delegate
-                var arg_ids = std.ArrayList(TypeId).initCapacity(self.allocator, g.args.len) catch return .err;
-                defer arg_ids.deinit(self.allocator);
-                for (g.args) |arg| {
-                    const id = self.resolveTypeExprWithSubst(arg, subst);
-                    if (id.isErr()) return .err;
-                    arg_ids.append(self.allocator, id) catch return .err;
-                }
-                return self.resolveGenericTypeWithArgs(g.name, arg_ids.items, type_expr.location);
-            },
-        };
     }
 
     /// instantiate a generic struct with concrete type arguments.
@@ -1639,28 +1573,31 @@ pub const Checker = struct {
     // when the arg count doesn't match the field count and a function
     // binding exists, we fall through to normal function call checking.
     fn checkCall(self: *Checker, call: ast.CallExpr, location: Location, scope: *const Scope) TypeId {
-        if (call.callee.kind == .ident) {
-            const name = call.callee.kind.ident;
+        // dispatch only applies to named callees (e.g. Point(...), identity(...))
+        const name = switch (call.callee.kind) {
+            .ident => |n| n,
+            else => return self.checkFnCall(call, location, scope),
+        };
 
-            // check struct constructor first
-            if (self.type_table.lookup(name)) |type_id| {
-                if (self.type_table.get(type_id)) |ty| {
-                    if (ty == .@"struct") {
-                        if (ty.@"struct".fields.len != call.args.len) {
-                            if (scope.lookup(name) != null) {
-                                return self.checkFnCall(call, location, scope);
-                            }
-                        }
+        // struct constructor: Name(field1, field2, ...)
+        if (self.type_table.lookup(name)) |type_id| {
+            if (self.type_table.get(type_id)) |ty| {
+                if (ty == .@"struct") {
+                    // some struct types (Mutex, etc.) also have constructor functions
+                    // in scope — when arg count doesn't match fields and a function
+                    // binding exists, fall through to normal call checking
+                    const fields_match = ty.@"struct".fields.len == call.args.len;
+                    if (fields_match or scope.lookup(name) == null) {
                         return self.checkStructConstructor(type_id, call, location, scope);
                     }
                 }
             }
+        }
 
-            // check generic function call
-            if (self.generic_decls.get(name)) |decl| {
-                if (decl == .function) {
-                    return self.checkGenericFnCall(decl.function, call, location, scope);
-                }
+        // generic function call: infer type args from arguments
+        if (self.generic_decls.get(name)) |decl| {
+            if (decl == .function) {
+                return self.checkGenericFnCall(decl.function, call, location, scope);
             }
         }
 
@@ -1972,7 +1909,7 @@ pub const Checker = struct {
 
     fn checkMatchArm(self: *Checker, arm: ast.MatchArm, subject_type: TypeId, scope: *const Scope) TypeId {
         // each arm gets its own scope for pattern bindings
-        var arm_scope = Scope.init(self.allocator, @constCast(scope));
+        var arm_scope = Scope.init(self.allocator, scope);
         defer arm_scope.deinit();
 
         self.checkPattern(arm.pattern, subject_type, &arm_scope);
@@ -2143,7 +2080,7 @@ pub const Checker = struct {
         }
 
         // create a child scope for the lambda body
-        var lambda_scope = Scope.init(self.allocator, @constCast(scope));
+        var lambda_scope = Scope.init(self.allocator, scope);
         defer lambda_scope.deinit();
 
         for (lam.params, param_ids.items) |param, param_type| {

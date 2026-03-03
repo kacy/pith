@@ -21,6 +21,7 @@ comptime {
     _ = @import("io.zig");
     _ = @import("types.zig");
     _ = @import("checker.zig");
+    _ = @import("codegen.zig");
 }
 
 const version = "0.1.0";

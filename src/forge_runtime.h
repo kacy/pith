@@ -246,6 +246,90 @@ static inline void *forge_map_get_checked(void *ptr) {
 }
 
 // ---------------------------------------------------------------
+// collection mutation
+// ---------------------------------------------------------------
+
+// append an element to a list. grows the backing array via realloc.
+static inline void forge_list_push(forge_list_t *list, const void *elem, int64_t elem_size) {
+    int64_t new_len = list->len + 1;
+    if (elem_size > 0 && new_len > (int64_t)(SIZE_MAX / (size_t)elem_size)) {
+        fprintf(stderr, "forge: list too large\n");
+        exit(1);
+    }
+    void *new_data = realloc(list->data, (size_t)(new_len * elem_size));
+    if (!new_data) {
+        fprintf(stderr, "forge: out of memory\n");
+        exit(1);
+    }
+    list->data = new_data;
+    memcpy((char *)list->data + list->len * elem_size, elem, (size_t)elem_size);
+    list->len = new_len;
+}
+
+// insert or update a key-value pair in a map (string keys).
+// if the key already exists, updates the value in place.
+static inline void forge_map_set_by_string(forge_map_t *map, forge_string_t key,
+                                            const void *val, int64_t key_size, int64_t val_size) {
+    // check for existing key
+    forge_string_t *keys = (forge_string_t *)map->keys;
+    for (int64_t i = 0; i < map->len; i++) {
+        if (forge_string_eq(keys[i], key)) {
+            memcpy((char *)map->values + i * val_size, val, (size_t)val_size);
+            return;
+        }
+    }
+    // new key — grow both arrays
+    int64_t new_len = map->len + 1;
+    void *new_keys = realloc(map->keys, (size_t)(new_len * key_size));
+    void *new_vals = realloc(map->values, (size_t)(new_len * val_size));
+    if (!new_keys || !new_vals) {
+        fprintf(stderr, "forge: out of memory\n");
+        exit(1);
+    }
+    map->keys = new_keys;
+    map->values = new_vals;
+    memcpy((char *)map->keys + map->len * key_size, &key, (size_t)key_size);
+    memcpy((char *)map->values + map->len * val_size, val, (size_t)val_size);
+    map->len = new_len;
+}
+
+// insert or update a key-value pair in a map (integer keys).
+static inline void forge_map_set_by_int(forge_map_t *map, int64_t key,
+                                         const void *val, int64_t key_size, int64_t val_size) {
+    int64_t *keys = (int64_t *)map->keys;
+    for (int64_t i = 0; i < map->len; i++) {
+        if (keys[i] == key) {
+            memcpy((char *)map->values + i * val_size, val, (size_t)val_size);
+            return;
+        }
+    }
+    int64_t new_len = map->len + 1;
+    void *new_keys = realloc(map->keys, (size_t)(new_len * key_size));
+    void *new_vals = realloc(map->values, (size_t)(new_len * val_size));
+    if (!new_keys || !new_vals) {
+        fprintf(stderr, "forge: out of memory\n");
+        exit(1);
+    }
+    map->keys = new_keys;
+    map->values = new_vals;
+    memcpy((char *)map->keys + map->len * key_size, &key, (size_t)key_size);
+    memcpy((char *)map->values + map->len * val_size, val, (size_t)val_size);
+    map->len = new_len;
+}
+
+// add an element to a set (no-op if already present).
+// uses linear scan for deduplication — fine for small sets.
+static inline void forge_set_add(forge_set_t *set, const void *elem, int64_t elem_size) {
+    // check if element already exists
+    for (int64_t i = 0; i < set->len; i++) {
+        if (memcmp((char *)set->data + i * elem_size, elem, (size_t)elem_size) == 0) {
+            return; // already present
+        }
+    }
+    forge_list_push(set, elem, elem_size);
+}
+
+// ---------------------------------------------------------------
 // built-in functions
 // ---------------------------------------------------------------
 

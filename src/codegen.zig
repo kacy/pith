@@ -930,9 +930,32 @@ pub const CEmitter = struct {
     }
 
     fn emitMethodCall(self: *CEmitter, mc: *const ast.MethodCallExpr) EmitError!void {
-        // methods are emitted as TypeName_methodname(receiver, args...)
-        // resolve the receiver's type to get the type name
+        // check for built-in collection methods first
         const receiver_tid = self.inferExprType(mc.receiver);
+        if (!receiver_tid.isErr()) {
+            if (self.type_table.get(receiver_tid)) |ty| {
+                switch (ty) {
+                    .list => |l| {
+                        if (std.mem.eql(u8, mc.method, "push") and mc.args.len == 1) {
+                            return self.emitCollectionPush(mc.receiver, mc.args[0].value, l.element);
+                        }
+                    },
+                    .map => |m| {
+                        if (std.mem.eql(u8, mc.method, "insert") and mc.args.len == 2) {
+                            return self.emitMapInsert(mc.receiver, mc.args[0].value, mc.args[1].value, m.key, m.value);
+                        }
+                    },
+                    .set => |s| {
+                        if (std.mem.eql(u8, mc.method, "add") and mc.args.len == 1) {
+                            return self.emitSetAdd(mc.receiver, mc.args[0].value, s.element);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // user-defined methods: TypeName_methodname(receiver, args...)
         const type_name = self.typeNameFromId(receiver_tid);
 
         if (type_name) |name| {
@@ -952,6 +975,57 @@ pub const CEmitter = struct {
             try self.writeStr(mc.method);
             try self.writeStr(" */");
         }
+    }
+
+    /// emit forge_list_push(&list, &(T){value}, sizeof(T))
+    fn emitCollectionPush(self: *CEmitter, receiver: *const ast.Expr, value: *const ast.Expr, elem_type: TypeId) EmitError!void {
+        const c_type = self.cTypeStringForId(elem_type);
+        try self.writeStr("forge_list_push(&");
+        try self.emitExpr(receiver);
+        try self.writeStr(", &(");
+        try self.writeStr(c_type);
+        try self.writeStr("){");
+        try self.emitExpr(value);
+        try self.writeStr("}, sizeof(");
+        try self.writeStr(c_type);
+        try self.writeStr("))");
+    }
+
+    /// emit forge_map_set_by_{string,int}(&map, key, &(V){val}, sizeof(K), sizeof(V))
+    fn emitMapInsert(self: *CEmitter, receiver: *const ast.Expr, key: *const ast.Expr, value: *const ast.Expr, key_type: TypeId, val_type: TypeId) EmitError!void {
+        const key_c = self.cTypeStringForId(key_type);
+        const val_c = self.cTypeStringForId(val_type);
+        if (key_type == .string) {
+            try self.writeStr("forge_map_set_by_string(&");
+        } else {
+            try self.writeStr("forge_map_set_by_int(&");
+        }
+        try self.emitExpr(receiver);
+        try self.writeStr(", ");
+        try self.emitExpr(key);
+        try self.writeStr(", &(");
+        try self.writeStr(val_c);
+        try self.writeStr("){");
+        try self.emitExpr(value);
+        try self.writeStr("}, sizeof(");
+        try self.writeStr(key_c);
+        try self.writeStr("), sizeof(");
+        try self.writeStr(val_c);
+        try self.writeStr("))");
+    }
+
+    /// emit forge_set_add(&set, &(T){value}, sizeof(T))
+    fn emitSetAdd(self: *CEmitter, receiver: *const ast.Expr, value: *const ast.Expr, elem_type: TypeId) EmitError!void {
+        const c_type = self.cTypeStringForId(elem_type);
+        try self.writeStr("forge_set_add(&");
+        try self.emitExpr(receiver);
+        try self.writeStr(", &(");
+        try self.writeStr(c_type);
+        try self.writeStr("){");
+        try self.emitExpr(value);
+        try self.writeStr("}, sizeof(");
+        try self.writeStr(c_type);
+        try self.writeStr("))");
     }
 
     /// get the type name string for a TypeId by looking it up in the type table.
@@ -1408,6 +1482,42 @@ pub const CEmitter = struct {
                 // user-defined — look up in the type table
                 return self.type_table.lookup(name) orelse .err;
             },
+            .generic => |g| {
+                // build the instantiated name: "List[Int]", "Map[String,Int]"
+                var buf: [128]u8 = undefined;
+                var pos: usize = 0;
+                for (g.name) |c| {
+                    if (pos < buf.len) {
+                        buf[pos] = c;
+                        pos += 1;
+                    }
+                }
+                if (pos < buf.len) {
+                    buf[pos] = '[';
+                    pos += 1;
+                }
+                for (g.args, 0..) |arg, i| {
+                    if (i > 0 and pos < buf.len) {
+                        buf[pos] = ',';
+                        pos += 1;
+                    }
+                    const arg_name = switch (arg.kind) {
+                        .named => |n| n,
+                        else => continue,
+                    };
+                    for (arg_name) |c| {
+                        if (pos < buf.len) {
+                            buf[pos] = c;
+                            pos += 1;
+                        }
+                    }
+                }
+                if (pos < buf.len) {
+                    buf[pos] = ']';
+                    pos += 1;
+                }
+                return self.type_table.lookup(buf[0..pos]) orelse .err;
+            },
             else => .err,
         };
     }
@@ -1576,8 +1686,16 @@ pub const CEmitter = struct {
         switch (te.kind) {
             .named => |name| try self.emitNamedType(name),
             .generic => |g| {
-                // generic types — emit the base name (should be instantiated)
-                try self.writeStr(g.name);
+                // collection types map to runtime C types
+                if (std.mem.eql(u8, g.name, "List")) {
+                    try self.writeStr("forge_list_t");
+                } else if (std.mem.eql(u8, g.name, "Map")) {
+                    try self.writeStr("forge_map_t");
+                } else if (std.mem.eql(u8, g.name, "Set")) {
+                    try self.writeStr("forge_set_t");
+                } else {
+                    try self.writeStr(g.name);
+                }
             },
             .optional => try self.writeStr("/* optional */"),
             .result => try self.writeStr("/* result */"),

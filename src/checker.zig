@@ -1822,6 +1822,74 @@ pub const Checker = struct {
         const receiver_type = self.checkExpr(mc.receiver, scope);
         if (receiver_type.isErr()) return .err;
 
+        // check for built-in collection methods before user-defined lookup
+        if (self.type_table.get(receiver_type)) |ty| {
+            switch (ty) {
+                .list => |l| {
+                    if (std.mem.eql(u8, mc.method, "push")) {
+                        if (mc.args.len != 1) {
+                            self.diagnostics.addCodedError(.E207, location, self.fmt(
+                                "'List.push' expects 1 argument, got {d}", .{mc.args.len},
+                            )) catch {};
+                            return .err;
+                        }
+                        const arg_type = self.checkExpr(mc.args[0].value, scope);
+                        if (!arg_type.isErr() and arg_type != l.element) {
+                            self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
+                                "expected {s}, got {s}",
+                                .{ self.type_table.typeName(l.element), self.type_table.typeName(arg_type) },
+                            )) catch {};
+                        }
+                        return .void;
+                    }
+                },
+                .map => |m| {
+                    if (std.mem.eql(u8, mc.method, "insert")) {
+                        if (mc.args.len != 2) {
+                            self.diagnostics.addCodedError(.E207, location, self.fmt(
+                                "'Map.insert' expects 2 arguments, got {d}", .{mc.args.len},
+                            )) catch {};
+                            return .err;
+                        }
+                        const key_type = self.checkExpr(mc.args[0].value, scope);
+                        if (!key_type.isErr() and key_type != m.key) {
+                            self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
+                                "expected {s}, got {s}",
+                                .{ self.type_table.typeName(m.key), self.type_table.typeName(key_type) },
+                            )) catch {};
+                        }
+                        const val_type = self.checkExpr(mc.args[1].value, scope);
+                        if (!val_type.isErr() and val_type != m.value) {
+                            self.diagnostics.addCodedError(.E219, mc.args[1].location, self.fmt(
+                                "expected {s}, got {s}",
+                                .{ self.type_table.typeName(m.value), self.type_table.typeName(val_type) },
+                            )) catch {};
+                        }
+                        return .void;
+                    }
+                },
+                .set => |s| {
+                    if (std.mem.eql(u8, mc.method, "add")) {
+                        if (mc.args.len != 1) {
+                            self.diagnostics.addCodedError(.E207, location, self.fmt(
+                                "'Set.add' expects 1 argument, got {d}", .{mc.args.len},
+                            )) catch {};
+                            return .err;
+                        }
+                        const arg_type = self.checkExpr(mc.args[0].value, scope);
+                        if (!arg_type.isErr() and arg_type != s.element) {
+                            self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
+                                "expected {s}, got {s}",
+                                .{ self.type_table.typeName(s.element), self.type_table.typeName(arg_type) },
+                            )) catch {};
+                        }
+                        return .void;
+                    }
+                },
+                else => {},
+            }
+        }
+
         // get the type name for method lookup
         const type_name = self.type_table.typeName(receiver_type);
 
@@ -2265,8 +2333,10 @@ pub const Checker = struct {
     /// check a list literal [a, b, c]. all elements must have the same type.
     /// an empty list produces an error — the type can't be inferred without context.
     fn checkListExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
+        _ = location;
         if (elems.len == 0) {
-            self.diagnostics.addCodedError(.E223, location, "cannot infer element type of empty list") catch {};
+            // empty list — type will come from the binding's type annotation.
+            // no error here; checkBindingStmt will use the declared type.
             return .err;
         }
 
@@ -2291,8 +2361,9 @@ pub const Checker = struct {
     /// check a map literal {k: v, ...}. all keys must share a type, all values must share a type.
     /// an empty map {} is allowed — but the type can't be inferred, so we return err.
     fn checkMapExpr(self: *Checker, entries: []const ast.MapEntry, location: Location, scope: *const Scope) TypeId {
+        _ = location;
         if (entries.len == 0) {
-            self.diagnostics.addCodedError(.E223, location, "cannot infer types of empty map") catch {};
+            // empty map — type will come from the binding's type annotation.
             return .err;
         }
 

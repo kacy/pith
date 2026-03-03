@@ -1441,7 +1441,7 @@ pub const Checker = struct {
         // can't spawn something that's already a task
         if (self.type_table.get(inner_type)) |ty| {
             if (ty == .task) {
-                self.diagnostics.addError(location, "cannot spawn a Task") catch {};
+                self.diagnostics.addCodedError(.E232, location, "cannot spawn a Task") catch {};
                 return .err;
             }
         }
@@ -1460,7 +1460,7 @@ pub const Checker = struct {
             }
         }
 
-        self.diagnostics.addError(location, self.fmt(
+        self.diagnostics.addCodedError(.E232, location, self.fmt(
             "expected Task, got {s}",
             .{self.type_table.typeName(inner_type)},
         )) catch {};
@@ -1478,7 +1478,7 @@ pub const Checker = struct {
             }
         }
 
-        self.diagnostics.addError(location, self.fmt(
+        self.diagnostics.addCodedError(.E224, location, self.fmt(
             "cannot unwrap non-optional type {s}",
             .{self.type_table.typeName(inner_type)},
         )) catch {};
@@ -1499,7 +1499,8 @@ pub const Checker = struct {
                             return ty.result.ok_type;
                         }
                     }
-                    self.diagnostics.addError(
+                    self.diagnostics.addCodedError(
+                        .E224,
                         location,
                         "'!' can only be used in a function that returns a result type",
                     ) catch {};
@@ -1507,7 +1508,8 @@ pub const Checker = struct {
                 }
 
                 // no return type at all (top-level expression)
-                self.diagnostics.addError(
+                self.diagnostics.addCodedError(
+                    .E224,
                     location,
                     "'!' can only be used in a function that returns a result type",
                 ) catch {};
@@ -1515,7 +1517,7 @@ pub const Checker = struct {
             }
         }
 
-        self.diagnostics.addError(location, self.fmt(
+        self.diagnostics.addCodedError(.E224, location, self.fmt(
             "cannot use '!' on non-result type {s}",
             .{self.type_table.typeName(inner_type)},
         )) catch {};
@@ -1547,7 +1549,7 @@ pub const Checker = struct {
 
             const elif_type = self.checkExpr(branch.expr, scope);
             if (!then_type.isErr() and !elif_type.isErr() and then_type != elif_type) {
-                self.diagnostics.addError(branch.location, self.fmt(
+                self.diagnostics.addCodedError(.E225, branch.location, self.fmt(
                     "branch type mismatch: expected {s}, got {s}",
                     .{ self.type_table.typeName(then_type), self.type_table.typeName(elif_type) },
                 )) catch {};
@@ -1556,7 +1558,7 @@ pub const Checker = struct {
 
         const else_type = self.checkExpr(if_e.else_expr, scope);
         if (!then_type.isErr() and !else_type.isErr() and then_type != else_type) {
-            self.diagnostics.addError(if_e.else_expr.location, self.fmt(
+            self.diagnostics.addCodedError(.E225, if_e.else_expr.location, self.fmt(
                 "branch type mismatch: expected {s}, got {s}",
                 .{ self.type_table.typeName(then_type), self.type_table.typeName(else_type) },
             )) catch {};
@@ -1627,7 +1629,7 @@ pub const Checker = struct {
                 };
 
                 if (!self.interface_decls.contains(iface_name)) {
-                    self.diagnostics.addError(location, self.fmt(
+                    self.diagnostics.addCodedError(.E226, location, self.fmt(
                         "unknown interface '{s}' in bound for '{s}'",
                         .{ iface_name, gp.name },
                     )) catch {};
@@ -1636,7 +1638,7 @@ pub const Checker = struct {
                 }
 
                 if (!self.typeImplements(type_name, iface_name)) {
-                    self.diagnostics.addError(location, self.fmt(
+                    self.diagnostics.addCodedError(.E226, location, self.fmt(
                         "type '{s}' does not implement interface '{s}'",
                         .{ type_name, iface_name },
                     )) catch {};
@@ -2074,7 +2076,7 @@ pub const Checker = struct {
     /// emit an error if the subject type doesn't match the expected literal type.
     fn checkLiteralPattern(self: *Checker, subject_type: TypeId, expected: TypeId, type_name: []const u8, location: Location) void {
         if (!subject_type.isErr() and subject_type != expected) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E228, location, self.fmt(
                 "cannot match {s} literal against {s}",
                 .{ type_name, self.type_table.typeName(subject_type) },
             )) catch {};
@@ -2108,7 +2110,7 @@ pub const Checker = struct {
 
         // look up the enum type by name
         const enum_type_id = self.type_table.lookup(v.type_name) orelse {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E202, location, self.fmt(
                 "unknown type '{s}'",
                 .{v.type_name},
             )) catch {};
@@ -2116,7 +2118,7 @@ pub const Checker = struct {
         };
 
         if (enum_type_id != subject_type) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E228, location, self.fmt(
                 "pattern type {s} does not match subject type {s}",
                 .{ v.type_name, self.type_table.typeName(subject_type) },
             )) catch {};
@@ -2127,7 +2129,7 @@ pub const Checker = struct {
         const enum_data = switch (ty) {
             .@"enum" => |e| e,
             else => {
-                self.diagnostics.addError(location, self.fmt(
+                self.diagnostics.addCodedError(.E211, location, self.fmt(
                     "{s} is not an enum type",
                     .{v.type_name},
                 )) catch {};
@@ -2140,7 +2142,7 @@ pub const Checker = struct {
             if (std.mem.eql(u8, variant.name, v.variant)) {
                 // check field count
                 if (v.fields.len != variant.fields.len) {
-                    self.diagnostics.addError(location, self.fmt(
+                    self.diagnostics.addCodedError(.E213, location, self.fmt(
                         "variant {s}.{s} has {d} field(s), pattern has {d}",
                         .{ v.type_name, v.variant, variant.fields.len, v.fields.len },
                     )) catch {};
@@ -2155,7 +2157,7 @@ pub const Checker = struct {
             }
         }
 
-        self.diagnostics.addError(location, self.fmt(
+        self.diagnostics.addCodedError(.E212, location, self.fmt(
             "enum {s} has no variant '{s}'",
             .{ v.type_name, v.variant },
         )) catch {};
@@ -2174,7 +2176,7 @@ pub const Checker = struct {
         const tuple_data = switch (ty) {
             .tuple => |t| t,
             else => {
-                self.diagnostics.addError(location, self.fmt(
+                self.diagnostics.addCodedError(.E228, location, self.fmt(
                     "cannot match tuple pattern against {s}",
                     .{self.type_table.typeName(subject_type)},
                 )) catch {};
@@ -2183,7 +2185,7 @@ pub const Checker = struct {
         };
 
         if (elems.len != tuple_data.elements.len) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E213, location, self.fmt(
                 "tuple has {d} element(s), pattern has {d}",
                 .{ tuple_data.elements.len, elems.len },
             )) catch {};
@@ -2205,7 +2207,7 @@ pub const Checker = struct {
                 const id = self.resolveTypeExpr(te);
                 param_ids.append(self.allocator, id) catch return .err;
             } else {
-                self.diagnostics.addError(param.location, self.fmt(
+                self.diagnostics.addCodedError(.E230, param.location, self.fmt(
                     "lambda parameter '{s}' needs a type annotation",
                     .{param.name},
                 )) catch {};
@@ -2246,7 +2248,7 @@ pub const Checker = struct {
     /// an empty list produces an error — the type can't be inferred without context.
     fn checkListExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
         if (elems.len == 0) {
-            self.diagnostics.addError(location, "cannot infer element type of empty list") catch {};
+            self.diagnostics.addCodedError(.E223, location, "cannot infer element type of empty list") catch {};
             return .err;
         }
 
@@ -2257,7 +2259,7 @@ pub const Checker = struct {
             const elem_type = self.checkExpr(elem, scope);
             if (elem_type.isErr()) return .err;
             if (elem_type != first_type) {
-                self.diagnostics.addError(elem.location, self.fmt(
+                self.diagnostics.addCodedError(.E223, elem.location, self.fmt(
                     "list element type mismatch: expected {s}, got {s}",
                     .{ self.type_table.typeName(first_type), self.type_table.typeName(elem_type) },
                 )) catch {};
@@ -2272,7 +2274,7 @@ pub const Checker = struct {
     /// an empty map {} is allowed — but the type can't be inferred, so we return err.
     fn checkMapExpr(self: *Checker, entries: []const ast.MapEntry, location: Location, scope: *const Scope) TypeId {
         if (entries.len == 0) {
-            self.diagnostics.addError(location, "cannot infer types of empty map") catch {};
+            self.diagnostics.addCodedError(.E223, location, "cannot infer types of empty map") catch {};
             return .err;
         }
 
@@ -2283,7 +2285,7 @@ pub const Checker = struct {
         for (entries[1..]) |entry| {
             const key_type = self.checkExpr(entry.key, scope);
             if (!key_type.isErr() and key_type != first_key_type) {
-                self.diagnostics.addError(entry.location, self.fmt(
+                self.diagnostics.addCodedError(.E223, entry.location, self.fmt(
                     "map key type mismatch: expected {s}, got {s}",
                     .{ self.type_table.typeName(first_key_type), self.type_table.typeName(key_type) },
                 )) catch {};
@@ -2292,7 +2294,7 @@ pub const Checker = struct {
 
             const val_type = self.checkExpr(entry.value, scope);
             if (!val_type.isErr() and val_type != first_val_type) {
-                self.diagnostics.addError(entry.location, self.fmt(
+                self.diagnostics.addCodedError(.E223, entry.location, self.fmt(
                     "map value type mismatch: expected {s}, got {s}",
                     .{ self.type_table.typeName(first_val_type), self.type_table.typeName(val_type) },
                 )) catch {};
@@ -2311,7 +2313,7 @@ pub const Checker = struct {
         if (elems.len == 0) {
             // the parser emits empty {} as a map, not a set, so this shouldn't
             // happen in practice — but guard against it.
-            self.diagnostics.addError(location, "cannot infer element type of empty set") catch {};
+            self.diagnostics.addCodedError(.E223, location, "cannot infer element type of empty set") catch {};
             return .err;
         }
 
@@ -2322,7 +2324,7 @@ pub const Checker = struct {
             const elem_type = self.checkExpr(elem, scope);
             if (elem_type.isErr()) return .err;
             if (elem_type != first_type) {
-                self.diagnostics.addError(elem.location, self.fmt(
+                self.diagnostics.addCodedError(.E223, elem.location, self.fmt(
                     "set element type mismatch: expected {s}, got {s}",
                     .{ self.type_table.typeName(first_type), self.type_table.typeName(elem_type) },
                 )) catch {};
@@ -2343,7 +2345,7 @@ pub const Checker = struct {
         return switch (ty) {
             .list => |l| blk: {
                 if (!index_type.isInteger()) {
-                    self.diagnostics.addError(location, self.fmt(
+                    self.diagnostics.addCodedError(.E217, location, self.fmt(
                         "list index must be an integer, got {s}",
                         .{self.type_table.typeName(index_type)},
                     )) catch {};
@@ -2353,7 +2355,7 @@ pub const Checker = struct {
             },
             .map => |m| blk: {
                 if (index_type != m.key) {
-                    self.diagnostics.addError(location, self.fmt(
+                    self.diagnostics.addCodedError(.E217, location, self.fmt(
                         "map key type mismatch: expected {s}, got {s}",
                         .{ self.type_table.typeName(m.key), self.type_table.typeName(index_type) },
                     )) catch {};
@@ -2362,7 +2364,7 @@ pub const Checker = struct {
                 break :blk m.value;
             },
             else => blk: {
-                self.diagnostics.addError(location, self.fmt(
+                self.diagnostics.addCodedError(.E217, location, self.fmt(
                     "type '{s}' does not support indexing",
                     .{self.type_table.typeName(obj_type)},
                 )) catch {};
@@ -2373,7 +2375,7 @@ pub const Checker = struct {
 
     fn checkTupleExpr(self: *Checker, elems: []const *const ast.Expr, location: Location, scope: *const Scope) TypeId {
         if (elems.len == 0) {
-            self.diagnostics.addError(location, "empty tuple is not allowed") catch {};
+            self.diagnostics.addCodedError(.E233, location, "empty tuple is not allowed") catch {};
             return .err;
         }
 

@@ -22,8 +22,12 @@ comptime {
 
 const version = "0.1.0";
 
+/// max source file size the compiler will read (10 MiB). prevents
+/// accidental reads of large binary files.
+const max_source_size = 10 * 1024 * 1024;
+
 fn renderDiagnostics(diags: *const errors.DiagnosticList) void {
-    var buf: [8192]u8 = undefined;
+    var buf: [io.write_buf_size]u8 = undefined;
     var w = std.fs.File.stderr().writer(&buf);
     const out = &w.interface;
     diags.render(out) catch {};
@@ -31,7 +35,7 @@ fn renderDiagnostics(diags: *const errors.DiagnosticList) void {
 }
 
 fn readSourceFile(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
-    return std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024 * 10) catch |err| {
+    return std.fs.cwd().readFileAlloc(allocator, path, max_source_size) catch |err| {
         io.writeErr("error: could not read '{s}': {}\n", .{ path, err });
         return null;
     };

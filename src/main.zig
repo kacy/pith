@@ -1,11 +1,14 @@
 // main — CLI entry point for the forge compiler
 
 const std = @import("std");
-const Lexer = @import("lexer.zig").Lexer;
+const lexer_mod = @import("lexer.zig");
+const Lexer = lexer_mod.Lexer;
+const Token = lexer_mod.Token;
 const Parser = @import("parser.zig").Parser;
 const errors = @import("errors.zig");
 const printer = @import("printer.zig");
 const Checker = @import("checker.zig").Checker;
+const ast = @import("ast.zig");
 const io = @import("io.zig");
 
 // compiler modules — imported here so zig build sees them
@@ -39,6 +42,55 @@ fn readSourceFile(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
         io.writeErr("error: could not read '{s}': {}\n", .{ path, err });
         return null;
     };
+}
+
+/// bundles the outputs of lexing + parsing so callers can clean up
+/// with a single deinit call.
+const ParseResult = struct {
+    module: ast.Module,
+    tokens: []const Token,
+    arena: std.heap.ArenaAllocator,
+
+    fn deinit(self: *ParseResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.tokens);
+        self.arena.deinit();
+    }
+};
+
+/// lex and parse source code. returns null if there are errors
+/// (diagnostics are rendered to stderr before returning).
+fn lexAndParse(allocator: std.mem.Allocator, source: []const u8) !?ParseResult {
+    // lex
+    var lexer = try Lexer.init(source, allocator);
+    defer lexer.deinit();
+    const tokens = try lexer.tokenize();
+
+    if (lexer.diagnostics.hasErrors()) {
+        renderDiagnostics(&lexer.diagnostics);
+        allocator.free(tokens);
+        return null;
+    }
+
+    // parse
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    var parser = Parser.init(tokens, source, arena.allocator());
+    defer parser.deinit();
+
+    const module = parser.parseModule() catch {
+        io.writeErr("error: parse failed (out of memory)\n", .{});
+        arena.deinit();
+        allocator.free(tokens);
+        return null;
+    };
+
+    if (parser.diagnostics.hasErrors()) {
+        renderDiagnostics(&parser.diagnostics);
+        arena.deinit();
+        allocator.free(tokens);
+        return null;
+    }
+
+    return .{ .module = module, .tokens = tokens, .arena = arena };
 }
 
 pub fn main() !void {
@@ -127,36 +179,10 @@ fn runParse(allocator: std.mem.Allocator, path: []const u8) !void {
     const source = readSourceFile(allocator, path) orelse return;
     defer allocator.free(source);
 
-    // lex
-    var lexer = try Lexer.init(source, allocator);
-    defer lexer.deinit();
-    const tokens = try lexer.tokenize();
-    defer allocator.free(tokens);
+    var result = try lexAndParse(allocator, source) orelse return;
+    defer result.deinit(allocator);
 
-    if (lexer.diagnostics.hasErrors()) {
-        renderDiagnostics(&lexer.diagnostics);
-        return;
-    }
-
-    // parse
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    var parser = Parser.init(tokens, source, arena.allocator());
-    defer parser.deinit();
-
-    const module = parser.parseModule() catch {
-        io.writeErr("error: parse failed (out of memory)\n", .{});
-        return;
-    };
-
-    if (parser.diagnostics.hasErrors()) {
-        renderDiagnostics(&parser.diagnostics);
-        return;
-    }
-
-    // print the AST
-    printer.printModule(module);
+    printer.printModule(result.module);
 }
 
 /// lex, parse, and type-check a source file. prints "ok" on success.
@@ -164,42 +190,16 @@ fn runCheck(allocator: std.mem.Allocator, path: []const u8) !void {
     const source = readSourceFile(allocator, path) orelse return;
     defer allocator.free(source);
 
-    // lex
-    var lexer = try Lexer.init(source, allocator);
-    defer lexer.deinit();
-    const tokens = try lexer.tokenize();
-    defer allocator.free(tokens);
+    var result = try lexAndParse(allocator, source) orelse return;
+    defer result.deinit(allocator);
 
-    if (lexer.diagnostics.hasErrors()) {
-        renderDiagnostics(&lexer.diagnostics);
-        return;
-    }
-
-    // parse
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    var parser = Parser.init(tokens, source, arena.allocator());
-    defer parser.deinit();
-
-    const module = parser.parseModule() catch {
-        io.writeErr("error: parse failed (out of memory)\n", .{});
-        return;
-    };
-
-    if (parser.diagnostics.hasErrors()) {
-        renderDiagnostics(&parser.diagnostics);
-        return;
-    }
-
-    // check
     var checker = Checker.init(allocator, source) catch {
         io.writeErr("error: checker init failed (out of memory)\n", .{});
         return;
     };
     defer checker.deinit();
 
-    checker.check(&module);
+    checker.check(&result.module);
 
     if (checker.diagnostics.hasErrors()) {
         renderDiagnostics(&checker.diagnostics);

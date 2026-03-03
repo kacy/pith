@@ -1838,8 +1838,14 @@ pub const CEmitter = struct {
     }
 
     fn emitMethodCall(self: *CEmitter, mc: *const ast.MethodCallExpr) EmitError!void {
-        // check for built-in collection methods first
         const receiver_tid = self.inferExprType(mc.receiver);
+
+        // built-in string methods
+        if (receiver_tid == .string) {
+            return self.emitStringMethod(mc);
+        }
+
+        // built-in collection methods
         if (!receiver_tid.isErr()) {
             if (self.type_table.get(receiver_tid)) |ty| {
                 switch (ty) {
@@ -1847,15 +1853,30 @@ pub const CEmitter = struct {
                         if (std.mem.eql(u8, mc.method, "push") and mc.args.len == 1) {
                             return self.emitCollectionPush(mc.receiver, mc.args[0].value, l.element);
                         }
+                        if (std.mem.eql(u8, mc.method, "len")) {
+                            try self.emitExpr(mc.receiver);
+                            try self.writeStr(".len");
+                            return;
+                        }
                     },
                     .map => |m| {
                         if (std.mem.eql(u8, mc.method, "insert") and mc.args.len == 2) {
                             return self.emitMapInsert(mc.receiver, mc.args[0].value, mc.args[1].value, m.key, m.value);
                         }
+                        if (std.mem.eql(u8, mc.method, "len")) {
+                            try self.emitExpr(mc.receiver);
+                            try self.writeStr(".len");
+                            return;
+                        }
                     },
                     .set => |s| {
                         if (std.mem.eql(u8, mc.method, "add") and mc.args.len == 1) {
                             return self.emitSetAdd(mc.receiver, mc.args[0].value, s.element);
+                        }
+                        if (std.mem.eql(u8, mc.method, "len")) {
+                            try self.emitExpr(mc.receiver);
+                            try self.writeStr(".len");
+                            return;
                         }
                     },
                     else => {},
@@ -1882,6 +1903,59 @@ pub const CEmitter = struct {
             try self.writeStr("/* method call: ");
             try self.writeStr(mc.method);
             try self.writeStr(" */");
+        }
+    }
+
+    /// emit a built-in string method call.
+    fn emitStringMethod(self: *CEmitter, mc: *const ast.MethodCallExpr) EmitError!void {
+        const method = mc.method;
+
+        // .len() → direct field access (zero overhead)
+        if (std.mem.eql(u8, method, "len")) {
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(".len");
+            return;
+        }
+
+        // one-arg runtime functions: contains, starts_with, ends_with, split
+        if (std.mem.eql(u8, method, "contains") or
+            std.mem.eql(u8, method, "starts_with") or
+            std.mem.eql(u8, method, "ends_with") or
+            std.mem.eql(u8, method, "split"))
+        {
+            try self.writeStr("forge_string_");
+            try self.writeStr(method);
+            try self.writeByte('(');
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[0].value);
+            try self.writeByte(')');
+            return;
+        }
+
+        // no-arg runtime functions: trim, to_upper, to_lower
+        if (std.mem.eql(u8, method, "trim") or
+            std.mem.eql(u8, method, "to_upper") or
+            std.mem.eql(u8, method, "to_lower"))
+        {
+            try self.writeStr("forge_string_");
+            try self.writeStr(method);
+            try self.writeByte('(');
+            try self.emitExpr(mc.receiver);
+            try self.writeByte(')');
+            return;
+        }
+
+        // substring(start, end) — two int args
+        if (std.mem.eql(u8, method, "substring")) {
+            try self.writeStr("forge_string_substring(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[0].value);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[1].value);
+            try self.writeByte(')');
+            return;
         }
     }
 
@@ -1934,6 +2008,22 @@ pub const CEmitter = struct {
         try self.writeStr("}, sizeof(");
         try self.writeStr(c_type);
         try self.writeStr("))");
+    }
+
+    /// return type inference for built-in String methods.
+    fn inferStringMethodType(self: *const CEmitter, method: []const u8) TypeId {
+        if (std.mem.eql(u8, method, "len")) return .int;
+        if (std.mem.eql(u8, method, "contains")) return .bool;
+        if (std.mem.eql(u8, method, "starts_with")) return .bool;
+        if (std.mem.eql(u8, method, "ends_with")) return .bool;
+        if (std.mem.eql(u8, method, "trim")) return .string;
+        if (std.mem.eql(u8, method, "to_upper")) return .string;
+        if (std.mem.eql(u8, method, "to_lower")) return .string;
+        if (std.mem.eql(u8, method, "substring")) return .string;
+        if (std.mem.eql(u8, method, "split")) {
+            return self.type_table.lookup("List[String]") orelse .err;
+        }
+        return .err;
     }
 
     /// get the type name string for a TypeId by looking it up in the type table.
@@ -2628,8 +2718,26 @@ pub const CEmitter = struct {
                 return .err;
             },
             .method_call => |mc| {
-                // resolve the receiver's type, then look up the method
                 const receiver_tid = self.inferExprType(mc.receiver);
+
+                // built-in string methods
+                if (receiver_tid == .string) {
+                    return self.inferStringMethodType(mc.method);
+                }
+
+                // built-in collection methods (.len)
+                if (!receiver_tid.isErr()) {
+                    if (self.type_table.get(receiver_tid)) |ty| {
+                        switch (ty) {
+                            .list, .map, .set => {
+                                if (std.mem.eql(u8, mc.method, "len")) return .int;
+                            },
+                            else => {},
+                        }
+                    }
+                }
+
+                // user-defined methods
                 const type_name = self.typeNameFromId(receiver_tid) orelse return .err;
                 const key = self.lookupMethodKey(type_name, mc.method) orelse return .err;
                 if (self.type_table.get(key)) |ty| {

@@ -39,6 +39,10 @@ static const forge_string_t forge_string_empty = { .data = "", .len = 0 };
 // ---------------------------------------------------------------
 
 static inline forge_string_t forge_string_concat(forge_string_t a, forge_string_t b) {
+    if (a.len > INT64_MAX - b.len) {
+        fprintf(stderr, "forge: string too large\n");
+        exit(1);
+    }
     int64_t new_len = a.len + b.len;
     char *buf = (char *)malloc((size_t)new_len + 1);
     if (!buf) {
@@ -145,6 +149,10 @@ static inline forge_list_t forge_list_create(int64_t len, int64_t elem_size, con
         list.data = NULL;
         return list;
     }
+    if (elem_size > 0 && len > (int64_t)(SIZE_MAX / (size_t)elem_size)) {
+        fprintf(stderr, "forge: list too large\n");
+        exit(1);
+    }
     list.data = malloc((size_t)(len * elem_size));
     if (!list.data) {
         fprintf(stderr, "forge: out of memory\n");
@@ -163,6 +171,14 @@ static inline forge_map_t forge_map_create(int64_t len, int64_t key_size, int64_
         map.keys = NULL;
         map.values = NULL;
         return map;
+    }
+    if (key_size > 0 && len > (int64_t)(SIZE_MAX / (size_t)key_size)) {
+        fprintf(stderr, "forge: map too large\n");
+        exit(1);
+    }
+    if (val_size > 0 && len > (int64_t)(SIZE_MAX / (size_t)val_size)) {
+        fprintf(stderr, "forge: map too large\n");
+        exit(1);
     }
     map.keys = malloc((size_t)(len * key_size));
     map.values = malloc((size_t)(len * val_size));
@@ -184,8 +200,17 @@ static inline forge_set_t forge_set_create(int64_t len, int64_t elem_size, const
 // collection access
 // ---------------------------------------------------------------
 
+// bounds check — exits with a clear error on out-of-range index
+static inline void forge_bounds_check(int64_t idx, int64_t len) {
+    if (idx < 0 || idx >= len) {
+        fprintf(stderr, "forge: index out of bounds (index %" PRId64 ", length %" PRId64 ")\n", idx, len);
+        exit(1);
+    }
+}
+
 // typed element access for lists: FORGE_LIST_GET(list, int64_t, 0)
-#define FORGE_LIST_GET(list, type, idx) (((type *)(list).data)[(idx)])
+#define FORGE_LIST_GET(list, type, idx) \
+    (forge_bounds_check((idx), (list).len), ((type *)(list).data)[(idx)])
 
 // look up a value in a map by integer key. returns pointer to the value slot,
 // or NULL if not found. caller casts to the value type.
@@ -209,6 +234,15 @@ static inline void *forge_map_get_by_string(forge_map_t map, forge_string_t key,
         }
     }
     return NULL;
+}
+
+// checked dereference for map lookups — exits if key was not found
+static inline void *forge_map_get_checked(void *ptr) {
+    if (!ptr) {
+        fprintf(stderr, "forge: map key not found\n");
+        exit(1);
+    }
+    return ptr;
 }
 
 // ---------------------------------------------------------------

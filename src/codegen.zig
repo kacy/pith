@@ -1114,7 +1114,7 @@ pub const CEmitter = struct {
                     const val_c = self.cTypeStringForId(m.value);
                     try self.writeStr("*(");
                     try self.writeStr(val_c);
-                    try self.writeStr("*)");
+                    try self.writeStr("*)forge_map_get_checked(");
                     // dispatch on key type
                     if (m.key == .string) {
                         try self.writeStr("forge_map_get_by_string(");
@@ -1126,7 +1126,7 @@ pub const CEmitter = struct {
                     try self.emitExpr(idx.index);
                     try self.writeStr(", sizeof(");
                     try self.writeStr(val_c);
-                    try self.writeStr("))");
+                    try self.writeStr(")))");
                 },
                 else => {
                     try self.writeStr("/* index on unsupported type */");

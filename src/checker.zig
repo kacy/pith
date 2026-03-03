@@ -674,7 +674,7 @@ pub const Checker = struct {
         // for compound assignments (+=, -=, etc.) both sides must be numeric
         if (a.op != .assign) {
             if (!target_type.isNumeric()) {
-                self.diagnostics.addError(a.target.location, self.fmt(
+                self.diagnostics.addCodedError(.E217, a.target.location, self.fmt(
                     "expected numeric type for compound assignment, got {s}",
                     .{self.type_table.typeName(target_type)},
                 )) catch {};
@@ -693,7 +693,7 @@ pub const Checker = struct {
     /// emit an error if the type isn't Bool. used for if/while/elif conditions.
     fn expectBool(self: *Checker, location: Location, actual: TypeId) void {
         if (!actual.isErr() and actual != .bool) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E200, location, self.fmt(
                 "expected Bool in condition, got {s}",
                 .{self.type_table.typeName(actual)},
             )) catch {};
@@ -1268,7 +1268,7 @@ pub const Checker = struct {
                 // pipe is handled by the early return above. if we reach
                 // here, the dispatch logic has a bug — return an error
                 // instead of crashing.
-                self.diagnostics.addError(location, "internal: unexpected pipe in binary dispatch") catch {};
+                self.diagnostics.addCodedError(.E220, location, "internal: unexpected pipe in binary dispatch") catch {};
                 return .err;
             },
         };
@@ -1282,7 +1282,8 @@ pub const Checker = struct {
         const rhs_name = switch (bin.right.kind) {
             .ident => |name| name,
             else => {
-                self.diagnostics.addError(
+                self.diagnostics.addCodedError(
+                    .E220,
                     location,
                     "pipe operator requires a function name on the right-hand side",
                 ) catch {};
@@ -1292,7 +1293,7 @@ pub const Checker = struct {
 
         // look up the function in scope
         const binding = scope.lookup(rhs_name) orelse {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E201, location, self.fmt(
                 "undefined variable '{s}'",
                 .{rhs_name},
             )) catch {};
@@ -1304,7 +1305,7 @@ pub const Checker = struct {
         const func = switch (ty) {
             .function => |f| f,
             else => {
-                self.diagnostics.addError(location, self.fmt(
+                self.diagnostics.addCodedError(.E208, location, self.fmt(
                     "'{s}' is not a function",
                     .{rhs_name},
                 )) catch {};
@@ -1314,7 +1315,7 @@ pub const Checker = struct {
 
         // verify it takes exactly 1 parameter
         if (func.param_types.len != 1) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E220, location, self.fmt(
                 "pipe requires a function that takes 1 argument, '{s}' takes {d}",
                 .{ rhs_name, func.param_types.len },
             )) catch {};
@@ -1323,7 +1324,7 @@ pub const Checker = struct {
 
         // verify the LHS type matches the parameter type
         if (lhs_type != func.param_types[0]) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E220, location, self.fmt(
                 "type mismatch in pipe: expected {s}, got {s}",
                 .{ self.type_table.typeName(func.param_types[0]), self.type_table.typeName(lhs_type) },
             )) catch {};
@@ -1342,14 +1343,14 @@ pub const Checker = struct {
 
     fn checkNumericBinary(self: *Checker, left: TypeId, right: TypeId, location: Location) TypeId {
         if (!left.isNumeric()) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E217, location, self.fmt(
                 "expected numeric type, got {s}",
                 .{self.type_table.typeName(left)},
             )) catch {};
             return .err;
         }
         if (left != right) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E217, location, self.fmt(
                 "type mismatch: {s} and {s}",
                 .{ self.type_table.typeName(left), self.type_table.typeName(right) },
             )) catch {};
@@ -1360,7 +1361,7 @@ pub const Checker = struct {
 
     fn checkEquality(self: *Checker, left: TypeId, right: TypeId, location: Location) TypeId {
         if (left != right) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E217, location, self.fmt(
                 "cannot compare {s} and {s}",
                 .{ self.type_table.typeName(left), self.type_table.typeName(right) },
             )) catch {};
@@ -1371,14 +1372,14 @@ pub const Checker = struct {
 
     fn checkOrdering(self: *Checker, left: TypeId, right: TypeId, location: Location) TypeId {
         if (!left.isNumeric() and left != .string) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E217, location, self.fmt(
                 "type {s} does not support ordering",
                 .{self.type_table.typeName(left)},
             )) catch {};
             return .err;
         }
         if (left != right) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E217, location, self.fmt(
                 "cannot compare {s} and {s}",
                 .{ self.type_table.typeName(left), self.type_table.typeName(right) },
             )) catch {};
@@ -1389,14 +1390,14 @@ pub const Checker = struct {
 
     fn checkLogical(self: *Checker, left: TypeId, right: TypeId, location: Location) TypeId {
         if (left != .bool) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E217, location, self.fmt(
                 "expected Bool, got {s}",
                 .{self.type_table.typeName(left)},
             )) catch {};
             return .err;
         }
         if (right != .bool) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E217, location, self.fmt(
                 "expected Bool, got {s}",
                 .{self.type_table.typeName(right)},
             )) catch {};
@@ -1412,7 +1413,7 @@ pub const Checker = struct {
         return switch (un.op) {
             .negate => {
                 if (!operand.isNumeric()) {
-                    self.diagnostics.addError(location, self.fmt(
+                    self.diagnostics.addCodedError(.E217, location, self.fmt(
                         "cannot negate {s}",
                         .{self.type_table.typeName(operand)},
                     )) catch {};
@@ -1422,7 +1423,7 @@ pub const Checker = struct {
             },
             .not => {
                 if (operand != .bool) {
-                    self.diagnostics.addError(location, self.fmt(
+                    self.diagnostics.addCodedError(.E217, location, self.fmt(
                         "expected Bool for 'not', got {s}",
                         .{self.type_table.typeName(operand)},
                     )) catch {};
@@ -1658,7 +1659,7 @@ pub const Checker = struct {
     ) TypeId {
         // check argument count
         if (call.args.len != fn_d.params.len) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E207, location, self.fmt(
                 "'{s}' expects {d} argument(s), got {d}",
                 .{ fn_d.name, fn_d.params.len, call.args.len },
             )) catch {};
@@ -1707,7 +1708,7 @@ pub const Checker = struct {
 
         for (call.args, func.param_types, arg_types.items) |arg, expected, actual| {
             if (!actual.isErr() and !expected.isErr() and actual != expected) {
-                self.diagnostics.addError(arg.location, self.fmt(
+                self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
                     "expected {s}, got {s}",
                     .{ self.type_table.typeName(expected), self.type_table.typeName(actual) },
                 )) catch {};
@@ -1726,7 +1727,7 @@ pub const Checker = struct {
         const func = switch (ty) {
             .function => |f| f,
             else => {
-                self.diagnostics.addError(location, self.fmt(
+                self.diagnostics.addCodedError(.E208, location, self.fmt(
                     "{s} is not callable",
                     .{self.type_table.typeName(callee_type)},
                 )) catch {};
@@ -1736,7 +1737,7 @@ pub const Checker = struct {
 
         // check argument count
         if (call.args.len != func.param_types.len) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E207, location, self.fmt(
                 "expected {d} argument(s), got {d}",
                 .{ func.param_types.len, call.args.len },
             )) catch {};
@@ -1747,7 +1748,7 @@ pub const Checker = struct {
         for (call.args, func.param_types) |arg, expected| {
             const actual = self.checkExpr(arg.value, scope);
             if (!actual.isErr() and !expected.isErr() and actual != expected) {
-                self.diagnostics.addError(arg.location, self.fmt(
+                self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
                     "expected {s}, got {s}",
                     .{ self.type_table.typeName(expected), self.type_table.typeName(actual) },
                 )) catch {};
@@ -1768,14 +1769,14 @@ pub const Checker = struct {
         const struct_data = switch (type_info) {
             .@"struct" => |s| s,
             else => {
-                self.diagnostics.addError(location, "expected struct type in constructor") catch {};
+                self.diagnostics.addCodedError(.E210, location, "expected struct type in constructor") catch {};
                 return .err;
             },
         };
 
         // check argument count matches field count
         if (call.args.len != struct_data.fields.len) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E207, location, self.fmt(
                 "{s} has {d} field(s), got {d} argument(s)",
                 .{ struct_data.name, struct_data.fields.len, call.args.len },
             )) catch {};
@@ -1786,7 +1787,7 @@ pub const Checker = struct {
         for (call.args, struct_data.fields) |arg, field| {
             const actual = self.checkExpr(arg.value, scope);
             if (!actual.isErr() and !field.type_id.isErr() and actual != field.type_id) {
-                self.diagnostics.addError(arg.location, self.fmt(
+                self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
                     "expected {s} for field '{s}', got {s}",
                     .{ self.type_table.typeName(field.type_id), field.name, self.type_table.typeName(actual) },
                 )) catch {};
@@ -1807,7 +1808,7 @@ pub const Checker = struct {
         // look up the method
         const key = self.buildMethodKey(type_name, mc.method);
         const entry = self.method_types.get(key) orelse {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E227, location, self.fmt(
                 "type '{s}' has no method '{s}'",
                 .{ type_name, mc.method },
             )) catch {};
@@ -1823,7 +1824,7 @@ pub const Checker = struct {
 
         // check argument count
         if (mc.args.len != func.param_types.len) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E207, location, self.fmt(
                 "'{s}.{s}' expects {d} argument(s), got {d}",
                 .{ type_name, mc.method, func.param_types.len, mc.args.len },
             )) catch {};
@@ -1834,7 +1835,7 @@ pub const Checker = struct {
         for (mc.args, func.param_types) |arg, expected| {
             const actual = self.checkExpr(arg.value, scope);
             if (!actual.isErr() and !expected.isErr() and actual != expected) {
-                self.diagnostics.addError(arg.location, self.fmt(
+                self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
                     "expected {s}, got {s}",
                     .{ self.type_table.typeName(expected), self.type_table.typeName(actual) },
                 )) catch {};
@@ -1852,7 +1853,7 @@ pub const Checker = struct {
         const struct_data = switch (ty) {
             .@"struct" => |s| s,
             else => {
-                self.diagnostics.addError(location, self.fmt(
+                self.diagnostics.addCodedError(.E209, location, self.fmt(
                     "{s} has no field '{s}'",
                     .{ self.type_table.typeName(object_type), fa.field },
                 )) catch {};
@@ -1867,7 +1868,7 @@ pub const Checker = struct {
             }
         }
 
-        self.diagnostics.addError(location, self.fmt(
+        self.diagnostics.addCodedError(.E209, location, self.fmt(
             "struct {s} has no field '{s}'",
             .{ struct_data.name, fa.field },
         )) catch {};

@@ -81,6 +81,21 @@ pub const ErrorCode = enum {
     E216, // assignment to immutable binding
     E217, // invalid operand types
     E218, // match guard must be Bool
+    E219, // argument type mismatch
+    E220, // pipe operator error
+    E221, // generic type argument count mismatch
+    E222, // generic type inference failure
+    E223, // collection type inference error
+    E224, // invalid unwrap/try target
+    E225, // branch type mismatch (if/elif)
+    E226, // interface constraint violation
+    E227, // method not found
+    E228, // pattern type mismatch
+    E229, // invalid self usage
+    E230, // missing type annotation
+    E231, // return outside function
+    E232, // spawn/await type error
+    E233, // not yet supported
 
     pub fn label(self: ErrorCode) []const u8 {
         return @tagName(self);

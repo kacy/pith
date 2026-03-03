@@ -251,7 +251,7 @@ pub const Checker = struct {
                 const id = self.resolveTypeExpr(te);
                 param_ids.append(self.allocator, id) catch return null;
             } else {
-                self.diagnostics.addError(param.location, self.fmt(
+                self.diagnostics.addCodedError(.E230, param.location, self.fmt(
                     "parameter '{s}' needs a type annotation",
                     .{param.name},
                 )) catch {};
@@ -338,7 +338,7 @@ pub const Checker = struct {
 
     fn registerTypeAlias(self: *Checker, ta: ast.TypeAlias, location: Location) void {
         if (ta.generic_params.len > 0) {
-            self.diagnostics.addError(location, "generic type aliases are not yet supported") catch {};
+            self.diagnostics.addCodedError(.E233, location, "generic type aliases are not yet supported") catch {};
             return;
         }
 
@@ -351,7 +351,7 @@ pub const Checker = struct {
 
     fn registerInterfaceDecl(self: *Checker, iface: ast.InterfaceDecl, location: Location) void {
         if (iface.generic_params.len > 0) {
-            self.diagnostics.addError(location, "generic interfaces are not yet supported") catch {};
+            self.diagnostics.addCodedError(.E233, location, "generic interfaces are not yet supported") catch {};
             return;
         }
 
@@ -376,21 +376,21 @@ pub const Checker = struct {
             const iface_name = switch (impl_d.target.kind) {
                 .named => |n| n,
                 else => {
-                    self.diagnostics.addError(location, "expected an interface name") catch {};
+                    self.diagnostics.addCodedError(.E202, location, "expected an interface name") catch {};
                     return;
                 },
             };
             const type_name = switch (iface_type_expr.kind) {
                 .named => |n| n,
                 else => {
-                    self.diagnostics.addError(location, "expected a type name") catch {};
+                    self.diagnostics.addCodedError(.E202, location, "expected a type name") catch {};
                     return;
                 },
             };
 
             // verify the interface exists
             if (!self.interface_decls.contains(iface_name)) {
-                self.diagnostics.addError(location, self.fmt(
+                self.diagnostics.addCodedError(.E202, location, self.fmt(
                     "unknown interface '{s}'",
                     .{iface_name},
                 )) catch {};
@@ -399,7 +399,7 @@ pub const Checker = struct {
 
             // verify the concrete type exists
             if (self.type_table.lookup(type_name) == null) {
-                self.diagnostics.addError(location, self.fmt(
+                self.diagnostics.addCodedError(.E202, location, self.fmt(
                     "unknown type '{s}'",
                     .{type_name},
                 )) catch {};
@@ -416,13 +416,13 @@ pub const Checker = struct {
             const type_name = switch (impl_d.target.kind) {
                 .named => |n| n,
                 else => {
-                    self.diagnostics.addError(location, "expected a type name") catch {};
+                    self.diagnostics.addCodedError(.E202, location, "expected a type name") catch {};
                     return;
                 },
             };
 
             if (self.type_table.lookup(type_name) == null) {
-                self.diagnostics.addError(location, self.fmt(
+                self.diagnostics.addCodedError(.E202, location, self.fmt(
                     "unknown type '{s}'",
                     .{type_name},
                 )) catch {};
@@ -611,7 +611,7 @@ pub const Checker = struct {
 
     fn checkReturnStmt(self: *Checker, ret: ast.ReturnStmt, location: Location, scope: *const Scope) void {
         const expected = scope.return_type orelse {
-            self.diagnostics.addError(location, "return statement outside of function") catch {};
+            self.diagnostics.addCodedError(.E231, location, "return statement outside of function") catch {};
             return;
         };
 
@@ -780,7 +780,7 @@ pub const Checker = struct {
         subst: ?*const std.StringHashMap(TypeId),
     ) TypeId {
         if (self.resolve_depth >= max_resolve_depth) {
-            self.diagnostics.addError(type_expr.location, "type nesting exceeds maximum depth") catch {};
+            self.diagnostics.addCodedError(.E233, type_expr.location, "type nesting exceeds maximum depth") catch {};
             return .err;
         }
         self.resolve_depth += 1;
@@ -853,7 +853,7 @@ pub const Checker = struct {
     fn resolveNamedType(self: *Checker, name: []const u8, location: Location) TypeId {
         if (self.type_table.lookup(name)) |id| return id;
 
-        self.diagnostics.addError(location, self.fmt("unknown type '{s}'", .{name})) catch {};
+        self.diagnostics.addCodedError(.E202, location, self.fmt("unknown type '{s}'", .{name})) catch {};
         return .err;
     }
 
@@ -885,7 +885,7 @@ pub const Checker = struct {
 
         // look up user-defined generic
         const decl = self.generic_decls.get(name) orelse {
-            self.diagnostics.addError(location, self.fmt("unknown generic type '{s}'", .{name})) catch {};
+            self.diagnostics.addCodedError(.E222, location, self.fmt("unknown generic type '{s}'", .{name})) catch {};
             return .err;
         };
 
@@ -893,7 +893,7 @@ pub const Checker = struct {
             .@"struct" => |s| self.instantiateGenericStruct(s, arg_ids, location),
             .@"enum" => |e| self.instantiateGenericEnum(e, arg_ids, location),
             .function => {
-                self.diagnostics.addError(location, self.fmt("'{s}' is a generic function, not a type", .{name})) catch {};
+                self.diagnostics.addCodedError(.E200, location, self.fmt("'{s}' is a generic function, not a type", .{name})) catch {};
                 return .err;
             },
         };
@@ -941,7 +941,7 @@ pub const Checker = struct {
     ) TypeId {
         // validate argument count
         if (arg_ids.len != s.generic_params.len) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E221, location, self.fmt(
                 "'{s}' expects {d} type argument(s), got {d}",
                 .{ s.name, s.generic_params.len, arg_ids.len },
             )) catch {};
@@ -995,7 +995,7 @@ pub const Checker = struct {
         location: Location,
     ) TypeId {
         if (arg_ids.len != e.generic_params.len) {
-            self.diagnostics.addError(location, self.fmt(
+            self.diagnostics.addCodedError(.E221, location, self.fmt(
                 "'{s}' expects {d} type argument(s), got {d}",
                 .{ e.name, e.generic_params.len, arg_ids.len },
             )) catch {};
@@ -1103,7 +1103,7 @@ pub const Checker = struct {
                             self.type_table.typeName(prev)
                         else
                             "unknown";
-                        self.diagnostics.addError(location, self.fmt(
+                        self.diagnostics.addCodedError(.E222, location, self.fmt(
                             "conflicting types for generic parameter '{s}': {s} vs {s}",
                             .{
                                 param_name,
@@ -1121,7 +1121,7 @@ pub const Checker = struct {
         // verify all generic params were inferred
         for (fn_d.generic_params) |gp| {
             if (subst.get(gp.name) == null) {
-                self.diagnostics.addError(location, self.fmt(
+                self.diagnostics.addCodedError(.E222, location, self.fmt(
                     "could not infer type for generic parameter '{s}'",
                     .{gp.name},
                 )) catch {};
@@ -1238,7 +1238,7 @@ pub const Checker = struct {
     fn checkSelfExpr(self: *Checker, location: Location, scope: *const Scope) TypeId {
         if (scope.lookup("self")) |binding| return binding.type_id;
 
-        self.diagnostics.addError(location, "'self' can only be used inside a method body") catch {};
+        self.diagnostics.addCodedError(.E229, location, "'self' can only be used inside a method body") catch {};
         return .err;
     }
 

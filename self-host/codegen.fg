@@ -872,3 +872,174 @@ fn g_emit_builtin_helpers():
     g_write("    forge_optional_forge_string_t r; r.has_value = false;\n")
     g_write("    return r;\n")
     g_write("}\n\n")
+
+# ---------------------------------------------------------------
+# function forward declarations
+# ---------------------------------------------------------------
+
+fn g_emit_fn_forward_decl(node_idx: Int, skip_main: Bool):
+    node := get_node(node_idx)
+    name := node.value
+    # skip generic functions
+    if g_is_generic(name):
+        return
+    # main is special
+    if name == "main":
+        if g_test_mode:
+            return
+        if skip_main:
+            return
+        g_write("int main(int __argc, char **__argv);\n")
+        return
+    g_emit_return_type(node_idx)
+    g_write(" fg_")
+    g_write(name)
+    g_emit_param_list(node_idx)
+    g_write(";\n")
+
+fn g_emit_param_list(node_idx: Int):
+    node := get_node(node_idx)
+    g_write("(")
+    mut has_params := false
+    mut first := true
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            has_params = true
+            if first == false:
+                g_write(", ")
+            first = false
+            if cn.children.len() > 0:
+                type_node := get_node(cn.children[0])
+                if type_node.kind == "fn_type":
+                    g_emit_fn_ptr_param(cn.children[0], cn.value)
+                else:
+                    g_emit_type_expr(cn.children[0])
+                    g_write(" ")
+                    g_write(cn.value)
+            else:
+                g_write("/* unknown */ ")
+                g_write(cn.value)
+    if has_params == false:
+        g_write("void")
+    g_write(")")
+
+# ---------------------------------------------------------------
+# impl block forward declarations
+# ---------------------------------------------------------------
+
+# extract concrete type name from impl block AST
+fn g_impl_type_name(node_idx: Int) -> String:
+    node := get_node(node_idx)
+    # node.children[0] is the type being impl'd
+    # if node.children[1].kind == "for_type", it's "impl Interface for Type:"
+    if node.children.len() < 1:
+        return ""
+    first_type := get_node(node.children[0])
+    if node.children.len() > 1:
+        second := get_node(node.children[1])
+        if second.kind == "for_type":
+            # impl Interface for Type: → concrete is the for_type's child
+            if second.children.len() > 0:
+                for_inner := get_node(second.children[0])
+                if for_inner.kind == "type":
+                    return for_inner.value
+            return ""
+    # impl Type: → concrete is the first type
+    if first_type.kind == "type":
+        return first_type.value
+    return ""
+
+# count how many children to skip before methods (1 for type, +1 for for_type)
+fn g_impl_method_start(node_idx: Int) -> Int:
+    node := get_node(node_idx)
+    if node.children.len() > 1:
+        second := get_node(node.children[1])
+        if second.kind == "for_type":
+            return 2
+    return 1
+
+fn g_emit_impl_forward_decls(node_idx: Int):
+    type_name := g_impl_type_name(node_idx)
+    if type_name == "":
+        return
+    node := get_node(node_idx)
+    method_start := g_impl_method_start(node_idx)
+    mut skip := method_start
+    for child in node.children:
+        if skip > 0:
+            skip = skip - 1
+            continue
+        mut cn := get_node(child)
+        mut method_idx := child
+        if cn.kind == "pub":
+            method_idx = cn.children[0]
+            cn = get_node(method_idx)
+        if cn.kind == "fn_decl":
+            g_emit_method_forward_decl(type_name, method_idx)
+
+fn g_emit_method_forward_decl(type_name: String, node_idx: Int):
+    node := get_node(node_idx)
+    if g_is_generic(node.value):
+        return
+    g_emit_return_type(node_idx)
+    g_write(" ")
+    g_write(type_name)
+    g_write("_")
+    g_write(node.value)
+    # emit params with self as first parameter
+    g_write("(")
+    g_write(type_name)
+    g_write(" self")
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            g_write(", ")
+            if cn.children.len() > 0:
+                type_node := get_node(cn.children[0])
+                if type_node.kind == "fn_type":
+                    g_emit_fn_ptr_param(cn.children[0], cn.value)
+                else:
+                    g_emit_type_expr(cn.children[0])
+                    g_write(" ")
+                    g_write(cn.value)
+            else:
+                g_write("/* unknown */ ")
+                g_write(cn.value)
+    g_write(");\n")
+
+# ---------------------------------------------------------------
+# instantiated generic function forward declarations
+# ---------------------------------------------------------------
+
+fn g_emit_instantiated_fn_forward_decls():
+    # iterate generic function declarations
+    # for each, scan the type table for instantiations
+    # we need to iterate the generic_decls keys
+    # since we can't iterate Map keys directly, scan type table for function types
+    # whose names match "base[..."
+    mut tid := TID_FIRST_USER
+    while tid < tt_count():
+        info := tt_get(tid)
+        if info.kind == "function":
+            # check if this function type is registered with a name containing "["
+            # we need to find the name for this tid
+            # scan the type table name map by trying known generic decl bases
+            tid = tid + 1
+            continue
+        tid = tid + 1
+    # alternative approach: for each generic_decl, find its instantiations
+    # by scanning the type table for names starting with "base["
+    # since we can't iterate Map keys in forge, use the AST to find generic fn names
+    # and then scan tt_lookup for matches
+    # This is a known limitation — we'll handle it by scanning the AST
+    g_emit_generic_fn_fwd_from_ast()
+
+fn g_emit_generic_fn_fwd_from_ast():
+    # for each generic decl that's a function, scan type table for instantiations
+    # we know generic fn bases from c_generic_decls
+    # but we can't iterate a map in forge — we need to scan the AST instead
+    # the root AST has fn_decl nodes with names like "swap[T]"
+    # we extract the base name and scan the type table
+    # This is handled in g_emit_module by iterating root children
+    return

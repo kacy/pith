@@ -570,3 +570,305 @@ fn g_emit_fn_ptr_binding(fn_tid: Int, name: String):
             first = false
             g_write(g_c_type_string(pt))
     g_write(")")
+
+# ---------------------------------------------------------------
+# struct definitions
+# ---------------------------------------------------------------
+
+fn g_emit_struct_def(node_idx: Int):
+    node := get_node(node_idx)
+    name := node.value
+    # skip generic (uninstantiated) structs
+    if g_is_generic(name):
+        return
+    base := g_extract_base_name(name)
+    g_write("typedef struct {\n")
+    g_indent = g_indent + 1
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "field":
+            fname := g_extract_field_name(cn.value)
+            g_write_indent()
+            ftid := g_resolve_field_type(base, fname)
+            g_emit_c_type(ftid)
+            g_write(" ")
+            g_write(fname)
+            g_write(";\n")
+    g_indent = g_indent - 1
+    g_write("} ")
+    g_write(base)
+    g_write(";\n\n")
+
+# ---------------------------------------------------------------
+# instantiated generic struct definitions
+# ---------------------------------------------------------------
+
+fn g_emit_instantiated_structs(root_idx: Int):
+    root := get_node(root_idx)
+    # find all generic struct base names
+    for child in root.children:
+        mut node := get_node(child)
+        mut decl_idx := child
+        if node.kind == "pub":
+            decl_idx = node.children[0]
+            node = get_node(decl_idx)
+        if node.kind == "struct_decl":
+            name := node.value
+            if g_is_generic(name) == false:
+                continue
+            base := g_extract_base_name(name)
+            # scan type table for instantiations of this struct
+            g_emit_struct_instantiations(base)
+
+fn g_emit_struct_instantiations(base: String):
+    # scan the entire type table for struct types whose names start with "base["
+    prefix := base + "["
+    mut tid := TID_FIRST_USER
+    while tid < tt_count():
+        info := tt_get(tid)
+        if info.kind == "struct":
+            if info.name.starts_with(prefix):
+                # this is an instantiation — emit typedef
+                mangled := g_mangle_name(info.name)
+                g_mangled_names.insert(tid, mangled)
+                g_write("typedef struct {\n")
+                g_indent = g_indent + 1
+                mut fi := 0
+                for f in info.fields:
+                    g_write_indent()
+                    g_write(g_c_type_string(info.field_types[fi]))
+                    g_write(" ")
+                    g_write(f)
+                    g_write(";\n")
+                    fi = fi + 1
+                g_indent = g_indent - 1
+                g_write("} ")
+                g_write(mangled)
+                g_write(";\n\n")
+        tid = tid + 1
+
+# ---------------------------------------------------------------
+# enum definitions
+# ---------------------------------------------------------------
+
+fn g_emit_enum_def(node_idx: Int):
+    node := get_node(node_idx)
+    name := node.value
+    # skip generic enums
+    if g_is_generic(name):
+        return
+    base := g_extract_base_name(name)
+
+    # tag enum
+    g_write("typedef enum {\n")
+    g_indent = g_indent + 1
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "variant":
+            g_write_indent()
+            g_write(base)
+            g_write("_TAG_")
+            g_write(cn.value)
+            g_write(",\n")
+    g_indent = g_indent - 1
+    g_write("} ")
+    g_write(base)
+    g_write("_Tag;\n\n")
+
+    # tagged union struct
+    g_write("typedef struct {\n")
+    g_indent = g_indent + 1
+    g_write_indent()
+    g_write(base)
+    g_write("_Tag tag;\n")
+
+    # check if any variant has data
+    mut has_data := false
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "variant":
+            if cn.children.len() > 0:
+                has_data = true
+
+    if has_data:
+        g_write_indent()
+        g_write("union {\n")
+        g_indent = g_indent + 1
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "variant":
+                if cn.children.len() > 0:
+                    g_write_indent()
+                    g_write("struct {\n")
+                    g_indent = g_indent + 1
+                    mut fi := 0
+                    for vc in cn.children:
+                        g_write_indent()
+                        ftid := g_resolve_enum_field_type(base, cn.value, fi)
+                        g_emit_c_type(ftid)
+                        g_write(" _")
+                        g_write(fi.to_string())
+                        g_write(";\n")
+                        fi = fi + 1
+                    g_indent = g_indent - 1
+                    g_write_indent()
+                    g_write("} ")
+                    g_write(cn.value)
+                    g_write(";\n")
+        g_indent = g_indent - 1
+        g_write_indent()
+        g_write("} data;\n")
+
+    g_indent = g_indent - 1
+    g_write("} ")
+    g_write(base)
+    g_write(";\n\n")
+
+# ---------------------------------------------------------------
+# result/optional/tuple typedefs
+# ---------------------------------------------------------------
+
+fn g_emit_result_typedefs():
+    mut tid := 0
+    while tid < tt_count():
+        info := tt_get(tid)
+        if info.kind == "result":
+            ok_c := g_c_type_string(info.inner)
+            name := "forge_result_" + ok_c
+            if g_emitted_results.contains_key(name):
+                # still cache mangled name for this TypeId
+                if g_mangled_names.contains_key(tid) == false:
+                    g_mangled_names.insert(tid, name)
+            else:
+                g_mangled_names.insert(tid, name)
+                g_emitted_results.insert(name, true)
+                g_write("typedef struct { bool is_ok; ")
+                g_write(ok_c)
+                g_write(" ok; forge_string_t err; } ")
+                g_write(name)
+                g_write(";\n")
+        tid = tid + 1
+    g_write("\n")
+
+fn g_emit_optional_typedefs():
+    mut tid := 0
+    while tid < tt_count():
+        info := tt_get(tid)
+        if info.kind == "optional":
+            inner_c := g_c_type_string(info.inner)
+            name := "forge_optional_" + inner_c
+            if g_emitted_optionals.contains_key(name):
+                if g_mangled_names.contains_key(tid) == false:
+                    g_mangled_names.insert(tid, name)
+            else:
+                g_mangled_names.insert(tid, name)
+                g_emitted_optionals.insert(name, true)
+                g_write("typedef struct { bool has_value; ")
+                g_write(inner_c)
+                g_write(" value; } ")
+                g_write(name)
+                g_write(";\n")
+        tid = tid + 1
+    g_write("\n")
+
+fn g_emit_tuple_typedefs():
+    mut tid := 0
+    while tid < tt_count():
+        info := tt_get(tid)
+        if info.kind == "tuple":
+            # build name from element types
+            mut name := "forge_tuple"
+            for elem in info.elements:
+                name = name + "_" + g_c_type_string(elem)
+            if g_emitted_tuples.contains_key(name):
+                if g_mangled_names.contains_key(tid) == false:
+                    g_mangled_names.insert(tid, name)
+            else:
+                g_mangled_names.insert(tid, name)
+                g_emitted_tuples.insert(name, true)
+                g_write("typedef struct { ")
+                mut ei := 0
+                for elem in info.elements:
+                    g_write(g_c_type_string(elem))
+                    g_write(" _")
+                    g_write(ei.to_string())
+                    g_write("; ")
+                    ei = ei + 1
+                g_write("} ")
+                g_write(name)
+                g_write(";\n")
+        tid = tid + 1
+    g_write("\n")
+
+# ---------------------------------------------------------------
+# builtin helper functions
+# ---------------------------------------------------------------
+
+fn g_emit_builtin_helpers():
+    # parse_int(String) -> Int!
+    g_write("static forge_result_int64_t forge_parse_int(forge_string_t s) {\n")
+    g_write("    char buf[64];\n")
+    g_write("    int64_t slen = s.len < 63 ? s.len : 63;\n")
+    g_write("    memcpy(buf, s.data, (size_t)slen);\n")
+    g_write("    buf[slen] = '\\0';\n")
+    g_write("    char *end;\n")
+    g_write("    int64_t val = strtoll(buf, &end, 10);\n")
+    g_write("    if (end == buf || *end != '\\0') {\n")
+    g_write("        forge_result_int64_t r; r.is_ok = false;\n")
+    g_write("        r.err = FORGE_STRING_LIT(\"invalid integer\");\n")
+    g_write("        return r;\n")
+    g_write("    }\n")
+    g_write("    forge_result_int64_t r; r.is_ok = true; r.ok = val;\n")
+    g_write("    return r;\n")
+    g_write("}\n\n")
+
+    # parse_float(String) -> Float!
+    g_write("static forge_result_double forge_parse_float(forge_string_t s) {\n")
+    g_write("    char buf[128];\n")
+    g_write("    int64_t slen = s.len < 127 ? s.len : 127;\n")
+    g_write("    memcpy(buf, s.data, (size_t)slen);\n")
+    g_write("    buf[slen] = '\\0';\n")
+    g_write("    char *end;\n")
+    g_write("    double val = strtod(buf, &end);\n")
+    g_write("    if (end == buf || *end != '\\0') {\n")
+    g_write("        forge_result_double r; r.is_ok = false;\n")
+    g_write("        r.err = FORGE_STRING_LIT(\"invalid float\");\n")
+    g_write("        return r;\n")
+    g_write("    }\n")
+    g_write("    forge_result_double r; r.is_ok = true; r.ok = val;\n")
+    g_write("    return r;\n")
+    g_write("}\n\n")
+
+    # read_file(String) -> String!
+    g_write("static forge_result_forge_string_t forge_read_file(forge_string_t path) {\n")
+    g_write("    forge_string_t content;\n")
+    g_write("    if (forge_read_file_impl(path.data, path.len, &content)) {\n")
+    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = content;\n")
+    g_write("        return r;\n")
+    g_write("    }\n")
+    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
+    g_write("    r.err = FORGE_STRING_LIT(\"failed to read file\");\n")
+    g_write("    return r;\n")
+    g_write("}\n\n")
+
+    # write_file(String, String) -> Bool!
+    g_write("static forge_result_bool forge_write_file(forge_string_t path, forge_string_t data) {\n")
+    g_write("    if (forge_write_file_impl(path.data, path.len, data.data, data.len)) {\n")
+    g_write("        forge_result_bool r; r.is_ok = true; r.ok = true;\n")
+    g_write("        return r;\n")
+    g_write("    }\n")
+    g_write("    forge_result_bool r; r.is_ok = false;\n")
+    g_write("    r.err = FORGE_STRING_LIT(\"failed to write file\");\n")
+    g_write("    return r;\n")
+    g_write("}\n\n")
+
+    # env(String) -> String?
+    g_write("static forge_optional_forge_string_t forge_env(forge_string_t name) {\n")
+    g_write("    forge_string_t val;\n")
+    g_write("    if (forge_env_impl(name.data, name.len, &val)) {\n")
+    g_write("        forge_optional_forge_string_t r; r.has_value = true; r.value = val;\n")
+    g_write("        return r;\n")
+    g_write("    }\n")
+    g_write("    forge_optional_forge_string_t r; r.has_value = false;\n")
+    g_write("    return r;\n")
+    g_write("}\n\n")

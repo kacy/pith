@@ -2261,6 +2261,16 @@ pub const CEmitter = struct {
             return;
         }
 
+        // exec(String) → forge_exec()
+        if (std.mem.eql(u8, name, "exec")) {
+            try self.writeStr("forge_exec(");
+            if (call.args.len > 0) {
+                try self.emitExpr(call.args[0].value);
+            }
+            try self.writeByte(')');
+            return;
+        }
+
         // assert(Bool) — test assertion
         if (std.mem.eql(u8, name, "assert")) {
             try self.writeStr("do { if (!(");

@@ -576,7 +576,15 @@ pub const Checker = struct {
             if (!decl.is_pub) continue;
             const decl_name = getDeclName(decl) orelse continue;
             if (std.mem.eql(u8, decl_name, name)) {
-                return self.module_scope.lookup(name);
+                // functions and bindings are in module_scope
+                if (self.module_scope.lookup(name)) |binding| return binding;
+
+                // structs and enums are registered in type_table, not module_scope.
+                // synthesize a binding from the type table lookup.
+                if (self.type_table.lookup(name)) |type_id| {
+                    return Binding{ .type_id = type_id, .is_mut = false };
+                }
+                return null;
             }
         }
         return null;

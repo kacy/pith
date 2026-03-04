@@ -2288,6 +2288,14 @@ pub const CEmitter = struct {
             try self.writeByte(')');
             return true;
         }
+        if (std.mem.eql(u8, method, "join") and mc.args.len == 1) {
+            try self.writeStr("forge_list_join(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[0].value);
+            try self.writeByte(')');
+            return true;
+        }
         return false;
     }
 
@@ -2474,6 +2482,7 @@ pub const CEmitter = struct {
             std.mem.eql(u8, method, "remove") or
             std.mem.eql(u8, method, "reverse") or
             std.mem.eql(u8, method, "clear")) return .void;
+        if (std.mem.eql(u8, method, "join")) return .string;
         _ = self;
         _ = elem_type;
         return null;

@@ -2193,6 +2193,15 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "contains")) {
             return self.checkOneTypedArg(mc, location, scope, "List.contains", elem_type, .bool);
         }
+        if (std.mem.eql(u8, method, "join")) {
+            if (elem_type != .string) {
+                self.diagnostics.addCodedError(.E227, location,
+                    "'join' requires List[String]",
+                ) catch {};
+                return .err;
+            }
+            return self.checkOneStringArg(mc, location, scope, "List.join", .string);
+        }
         return null;
     }
 

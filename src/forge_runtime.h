@@ -688,6 +688,38 @@ static inline forge_list_t forge_string_split(forge_string_t s, forge_string_t s
     return result;
 }
 
+// join a List[String] with a separator. returns a new string.
+static inline forge_string_t forge_list_join(forge_list_t list, forge_string_t sep) {
+    if (list.len == 0) return forge_string_empty;
+    forge_string_t *items = (forge_string_t *)list.data;
+    if (list.len == 1) {
+        char *buf = (char *)malloc((size_t)items[0].len + 1);
+        if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        memcpy(buf, items[0].data, (size_t)items[0].len);
+        buf[items[0].len] = '\0';
+        return (forge_string_t){ .data = buf, .len = items[0].len };
+    }
+    // compute total length
+    int64_t total = 0;
+    for (int64_t i = 0; i < list.len; i++) {
+        total += items[i].len;
+    }
+    total += (list.len - 1) * sep.len;
+    char *buf = (char *)malloc((size_t)total + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    int64_t pos = 0;
+    for (int64_t i = 0; i < list.len; i++) {
+        if (i > 0) {
+            memcpy(buf + pos, sep.data, (size_t)sep.len);
+            pos += sep.len;
+        }
+        memcpy(buf + pos, items[i].data, (size_t)items[i].len);
+        pos += items[i].len;
+    }
+    buf[total] = '\0';
+    return (forge_string_t){ .data = buf, .len = total };
+}
+
 // ---------------------------------------------------------------
 // command-line arguments
 // ---------------------------------------------------------------

@@ -22,6 +22,8 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const errors = @import("errors.zig");
 const types = @import("types.zig");
+const Lexer = @import("lexer.zig").Lexer;
+const Parser = @import("parser.zig").Parser;
 
 const TypeId = types.TypeId;
 const TypeTable = types.TypeTable;
@@ -95,6 +97,19 @@ pub const Scope = struct {
 };
 
 // ---------------------------------------------------------------
+// imported module data
+// ---------------------------------------------------------------
+
+/// an imported module's declarations — passed to codegen so it can
+/// emit the imported functions/types into the output.
+pub const ImportedModule = struct {
+    /// the parsed module AST (owned by the arena in parsed_arenas)
+    module: ast.Module,
+    /// path used for dedup (arena-allocated)
+    path: []const u8,
+};
+
+// ---------------------------------------------------------------
 // checker
 // ---------------------------------------------------------------
 
@@ -124,6 +139,12 @@ pub const Checker = struct {
     /// tracks recursion depth in resolveTypeExpr to prevent stack overflow
     /// from deeply nested types like Int??????...
     resolve_depth: u32,
+    /// path to the source file being checked (used for resolving relative imports)
+    source_path: ?[]const u8,
+    /// tracks files currently being checked to detect import cycles
+    checking_files: ?*std.StringHashMap(void),
+    /// declarations from imported modules (for codegen)
+    imported_modules: std.ArrayList(ImportedModule),
 
     /// maximum depth for type resolution. prevents stack overflow from
     /// pathological inputs like deeply nested optionals or generics.
@@ -142,6 +163,9 @@ pub const Checker = struct {
             .impl_set = std.StringHashMap(void).init(allocator),
             .method_types = std.StringHashMap(MethodEntry).init(allocator),
             .resolve_depth = 0,
+            .source_path = null,
+            .checking_files = null,
+            .imported_modules = .empty,
         };
 
         // register builtins into the module scope
@@ -156,6 +180,7 @@ pub const Checker = struct {
         self.interface_decls.deinit();
         self.impl_set.deinit();
         self.method_types.deinit();
+        self.imported_modules.deinit(self.allocator);
         self.arena.deinit();
         self.diagnostics.deinit();
         self.type_table.deinit();
@@ -282,10 +307,14 @@ pub const Checker = struct {
     // module checking — public entry point
     // ---------------------------------------------------------------
 
-    /// check a parsed module. two passes:
+    /// check a parsed module. three passes:
+    ///   0. resolve imports (load, parse, check imported files)
     ///   1. register all top-level declarations (names + signatures)
     ///   2. check all function bodies and top-level bindings
     pub fn check(self: *Checker, module: *const ast.Module) void {
+        // pass 0: resolve imports
+        self.resolveImports(module);
+
         // pass 1: register declarations
         for (module.decls) |*decl| {
             self.registerDecl(decl);
@@ -294,6 +323,289 @@ pub const Checker = struct {
         // pass 2: check bodies
         for (module.decls) |*decl| {
             self.checkDecl(decl);
+        }
+    }
+
+    /// resolve imports: read, lex, parse, and type-check imported modules.
+    /// injects public names into the current module's scope.
+    fn resolveImports(self: *Checker, module: *const ast.Module) void {
+        if (module.imports.len == 0) return;
+
+        const base_path = self.source_path orelse {
+            // no source path — can't resolve relative imports
+            for (module.imports) |imp| {
+                self.diagnostics.addCodedError(.E234, imp.location,
+                    "cannot resolve imports without a source file path",
+                ) catch {};
+            }
+            return;
+        };
+
+        // set up cycle detection
+        var owned_checking: std.StringHashMap(void) = undefined;
+        const need_cleanup = self.checking_files == null;
+        if (need_cleanup) {
+            owned_checking = std.StringHashMap(void).init(self.allocator);
+            self.checking_files = &owned_checking;
+            // mark the current file as being checked
+            owned_checking.put(base_path, {}) catch return;
+        }
+        defer if (need_cleanup) {
+            owned_checking.deinit();
+            self.checking_files = null;
+        };
+
+        const dir = std.fs.path.dirname(base_path) orelse ".";
+
+        for (module.imports) |imp| {
+            switch (imp.kind) {
+                .simple => |simple| {
+                    self.resolveSimpleImport(simple.path, simple.alias, imp.location, dir);
+                },
+                .from => |from| {
+                    self.resolveFromImport(from.path, from.names, imp.location, dir);
+                },
+            }
+        }
+    }
+
+    /// resolve `import foo` or `import foo.bar as baz`
+    fn resolveSimpleImport(
+        self: *Checker,
+        path_parts: []const []const u8,
+        alias: ?[]const u8,
+        location: Location,
+        dir: []const u8,
+    ) void {
+        const import_path = self.resolveImportPath(path_parts, dir) orelse {
+            const path_str = self.joinPath(path_parts);
+            self.diagnostics.addCodedError(.E234, location, self.fmt(
+                "module not found: '{s}'", .{path_str},
+            )) catch {};
+            return;
+        };
+        defer self.allocator.free(import_path);
+
+        const imported = self.loadAndCheckModule(import_path, location) orelse return;
+
+        // determine the name to use in the current scope
+        const mod_name = alias orelse path_parts[path_parts.len - 1];
+
+        // create a namespace scope with all public declarations
+        self.injectNamespaceImport(imported, mod_name, location);
+    }
+
+    /// resolve `from foo import bar, baz`
+    fn resolveFromImport(
+        self: *Checker,
+        path_parts: []const []const u8,
+        names: []const ast.ImportName,
+        location: Location,
+        dir: []const u8,
+    ) void {
+        const import_path = self.resolveImportPath(path_parts, dir) orelse {
+            const path_str = self.joinPath(path_parts);
+            self.diagnostics.addCodedError(.E234, location, self.fmt(
+                "module not found: '{s}'", .{path_str},
+            )) catch {};
+            return;
+        };
+        defer self.allocator.free(import_path);
+
+        const imported = self.loadAndCheckModule(import_path, location) orelse return;
+
+        // inject specific named exports into the current scope
+        for (names) |name| {
+            const use_name = name.alias orelse name.name;
+            if (self.findPublicDecl(imported, name.name)) |binding| {
+                self.module_scope.define(use_name, binding) catch {};
+            } else {
+                // check if it exists but is not public
+                if (self.findAnyDecl(imported, name.name)) {
+                    self.diagnostics.addCodedError(.E237, name.location, self.fmt(
+                        "'{s}' is not public in the imported module", .{name.name},
+                    )) catch {};
+                } else {
+                    self.diagnostics.addCodedError(.E236, name.location, self.fmt(
+                        "name '{s}' not found in the imported module", .{name.name},
+                    )) catch {};
+                }
+            }
+        }
+    }
+
+    /// build a file path from import path parts relative to a directory.
+    /// returns null if the file doesn't exist.
+    fn resolveImportPath(self: *Checker, path_parts: []const []const u8, dir: []const u8) ?[]const u8 {
+        // build "dir/part1/part2/.../partN.fg"
+        var parts: std.ArrayList([]const u8) = .empty;
+        defer parts.deinit(self.allocator);
+        parts.append(self.allocator, dir) catch return null;
+        for (path_parts) |p| {
+            parts.append(self.allocator, p) catch return null;
+        }
+
+        const joined = std.fs.path.join(self.allocator, parts.items) catch return null;
+        defer self.allocator.free(joined);
+
+        const full = std.fmt.allocPrint(self.allocator, "{s}.fg", .{joined}) catch return null;
+
+        // check if the file exists
+        std.fs.cwd().access(full, .{}) catch {
+            self.allocator.free(full);
+            return null;
+        };
+
+        return full;
+    }
+
+    /// join path parts with dots for error messages
+    fn joinPath(self: *Checker, parts: []const []const u8) []const u8 {
+        if (parts.len == 1) return parts[0];
+        var result: std.ArrayList(u8) = .empty;
+        for (parts, 0..) |p, i| {
+            if (i > 0) result.append(self.allocator, '.') catch {};
+            result.appendSlice(self.allocator, p) catch {};
+        }
+        return result.toOwnedSlice(self.allocator) catch return parts[parts.len - 1];
+    }
+
+    /// load, lex, parse, and type-check an imported module file.
+    /// returns the checked module, or null on error.
+    fn loadAndCheckModule(self: *Checker, path: []const u8, location: Location) ?*const ast.Module {
+        // cycle detection
+        if (self.checking_files) |cf| {
+            if (cf.get(path) != null) {
+                self.diagnostics.addCodedError(.E235, location, self.fmt(
+                    "import cycle detected: '{s}' is already being checked", .{path},
+                )) catch {};
+                return null;
+            }
+            cf.put(path, {}) catch {};
+        }
+
+        // check if already imported (dedup)
+        for (self.imported_modules.items) |*im| {
+            if (std.mem.eql(u8, im.path, path)) {
+                return &im.module;
+            }
+        }
+
+        // read the file
+        const source = std.fs.cwd().readFileAlloc(self.allocator, path, 10 * 1024 * 1024) catch {
+            self.diagnostics.addCodedError(.E234, location, self.fmt(
+                "could not read '{s}'", .{path},
+            )) catch {};
+            return null;
+        };
+        // store source in arena so it lives as long as checker
+        const arena_source = self.arena.allocator().dupe(u8, source) catch {
+            self.allocator.free(source);
+            return null;
+        };
+        self.allocator.free(source);
+
+        // lex
+        var lexer = Lexer.init(arena_source, self.allocator) catch return null;
+        defer lexer.deinit();
+        const tokens = lexer.tokenize() catch return null;
+        defer self.allocator.free(tokens);
+
+        if (lexer.diagnostics.hasErrors()) {
+            // propagate lexer errors
+            for (lexer.diagnostics.diagnostics.items) |diag| {
+                self.diagnostics.diagnostics.append(self.allocator, diag) catch {};
+            }
+            return null;
+        }
+
+        // parse
+        var parser = Parser.init(tokens, arena_source, self.arena.allocator());
+        defer parser.deinit();
+        const module = parser.parseModule() catch return null;
+
+        if (parser.diagnostics.hasErrors()) {
+            for (parser.diagnostics.diagnostics.items) |diag| {
+                self.diagnostics.diagnostics.append(self.allocator, diag) catch {};
+            }
+            return null;
+        }
+
+        // store path in arena for dedup
+        const arena_path = self.arena.allocator().dupe(u8, path) catch return null;
+
+        // add to imported_modules before checking (allows dedup for diamond imports)
+        self.imported_modules.append(self.allocator, .{
+            .module = module,
+            .path = arena_path,
+        }) catch return null;
+
+        const idx = self.imported_modules.items.len - 1;
+
+        // type-check the imported module (reuses this checker's type table + scope)
+        // save and restore source_path
+        const prev_path = self.source_path;
+        self.source_path = path;
+        defer self.source_path = prev_path;
+
+        // resolve any imports in the imported module (recursive)
+        self.resolveImports(&module);
+
+        // register declarations from imported module (pass 1)
+        for (module.decls) |*decl| {
+            self.registerDecl(decl);
+        }
+        // check bodies (pass 2)
+        for (module.decls) |*decl| {
+            self.checkDecl(decl);
+        }
+
+        return &self.imported_modules.items[idx].module;
+    }
+
+    /// find a public declaration's binding in an imported module.
+    fn findPublicDecl(self: *Checker, module: *const ast.Module, name: []const u8) ?Binding {
+        for (module.decls) |*decl| {
+            if (!decl.is_pub) continue;
+            const decl_name = getDeclName(decl) orelse continue;
+            if (std.mem.eql(u8, decl_name, name)) {
+                return self.module_scope.lookup(name);
+            }
+        }
+        return null;
+    }
+
+    /// check if any declaration (pub or not) has this name.
+    fn findAnyDecl(_: *Checker, module: *const ast.Module, name: []const u8) bool {
+        for (module.decls) |*decl| {
+            const decl_name = getDeclName(decl) orelse continue;
+            if (std.mem.eql(u8, decl_name, name)) return true;
+        }
+        return false;
+    }
+
+    /// extract the name from a declaration, if it has one.
+    fn getDeclName(decl: *const ast.Decl) ?[]const u8 {
+        return switch (decl.kind) {
+            .fn_decl => |fd| fd.name,
+            .struct_decl => |sd| sd.name,
+            .enum_decl => |ed| ed.name,
+            .binding => |b| b.name,
+            .interface_decl => |id| id.name,
+            else => null,
+        };
+    }
+
+    /// inject all public names from a module as accessible via `mod_name.symbol`
+    fn injectNamespaceImport(self: *Checker, module: *const ast.Module, mod_name: []const u8, location: Location) void {
+        _ = location;
+        for (module.decls) |*decl| {
+            if (!decl.is_pub) continue;
+            const decl_name = getDeclName(decl) orelse continue;
+            const qualified = self.fmt("{s}.{s}", .{ mod_name, decl_name });
+            if (self.module_scope.lookup(decl_name)) |binding| {
+                self.module_scope.define(qualified, binding) catch {};
+            }
         }
     }
 

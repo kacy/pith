@@ -79,6 +79,8 @@ pub const CEmitter = struct {
     test_mode: bool,
     /// test names collected during emission (for the test runner summary).
     test_names: std.ArrayList([]const u8),
+    /// imported module declarations to emit alongside the main module.
+    imported_modules: []const Checker.ImportedModule,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -105,6 +107,7 @@ pub const CEmitter = struct {
             .hoisted_lambdas = .empty,
             .test_mode = false,
             .test_names = .empty,
+            .imported_modules = &.{},
         };
     }
 
@@ -135,12 +138,22 @@ pub const CEmitter = struct {
     pub fn emitModule(self: *CEmitter, module: *const ast.Module) EmitError!void {
         try self.emitPreamble();
 
+        // collect all modules to emit: imported modules first, then main
+        var all_modules: std.ArrayList(*const ast.Module) = .empty;
+        defer all_modules.deinit(self.allocator);
+        for (self.imported_modules) |*im| {
+            all_modules.append(self.allocator, &im.module) catch {};
+        }
+        all_modules.append(self.allocator, module) catch {};
+
         // pass 1: struct type definitions (must come before function decls
         // since functions may use struct types in signatures)
-        for (module.decls) |*decl| {
-            switch (decl.kind) {
-                .struct_decl => |*sd| try self.emitStructDef(sd),
-                else => {},
+        for (all_modules.items) |mod| {
+            for (mod.decls) |*decl| {
+                switch (decl.kind) {
+                    .struct_decl => |*sd| try self.emitStructDef(sd),
+                    else => {},
+                }
             }
         }
 
@@ -150,10 +163,12 @@ pub const CEmitter = struct {
         try self.emitInstantiatedStructs(module);
 
         // pass 2: enum type definitions
-        for (module.decls) |*decl| {
-            switch (decl.kind) {
-                .enum_decl => |*ed| try self.emitEnumDef(ed),
-                else => {},
+        for (all_modules.items) |mod| {
+            for (mod.decls) |*decl| {
+                switch (decl.kind) {
+                    .enum_decl => |*ed| try self.emitEnumDef(ed),
+                    else => {},
+                }
             }
         }
 
@@ -167,18 +182,22 @@ pub const CEmitter = struct {
         try self.emitBuiltinHelpers();
 
         // pass 3: forward-declare all functions
-        for (module.decls) |*decl| {
-            switch (decl.kind) {
-                .fn_decl => |*fd| try self.emitFnForwardDecl(fd),
-                else => {},
+        for (all_modules.items) |mod| {
+            for (mod.decls) |*decl| {
+                switch (decl.kind) {
+                    .fn_decl => |*fd| try self.emitFnForwardDecl(fd),
+                    else => {},
+                }
             }
         }
 
         // pass 3b: forward-declare methods from impl blocks
-        for (module.decls) |*decl| {
-            switch (decl.kind) {
-                .impl_decl => |impl_d| try self.emitImplForwardDecls(&impl_d),
-                else => {},
+        for (all_modules.items) |mod| {
+            for (mod.decls) |*decl| {
+                switch (decl.kind) {
+                    .impl_decl => |impl_d| try self.emitImplForwardDecls(&impl_d),
+                    else => {},
+                }
             }
         }
 
@@ -191,18 +210,22 @@ pub const CEmitter = struct {
         const lambda_fwd_insert_pos = self.output.items.len;
 
         // pass 4: function definitions
-        for (module.decls) |*decl| {
-            switch (decl.kind) {
-                .fn_decl => |*fd| try self.emitFnDef(fd),
-                else => {},
+        for (all_modules.items) |mod| {
+            for (mod.decls) |*decl| {
+                switch (decl.kind) {
+                    .fn_decl => |*fd| try self.emitFnDef(fd),
+                    else => {},
+                }
             }
         }
 
         // pass 5: method definitions from impl blocks
-        for (module.decls) |*decl| {
-            switch (decl.kind) {
-                .impl_decl => |impl_d| try self.emitImplMethodDefs(&impl_d),
-                else => {},
+        for (all_modules.items) |mod| {
+            for (mod.decls) |*decl| {
+                switch (decl.kind) {
+                    .impl_decl => |impl_d| try self.emitImplMethodDefs(&impl_d),
+                    else => {},
+                }
             }
         }
 

@@ -264,6 +264,7 @@ fn runCheck(allocator: std.mem.Allocator, path: []const u8, json: bool) !void {
         return;
     };
     defer checker.deinit();
+    checker.source_path = path;
 
     checker.check(&result.module);
 
@@ -319,6 +320,7 @@ fn runLint(allocator: std.mem.Allocator, path: []const u8, json: bool) !void {
         return;
     };
     defer checker.deinit();
+    checker.source_path = path;
 
     checker.check(&result.module);
 
@@ -360,6 +362,7 @@ fn runTest(allocator: std.mem.Allocator, path: []const u8, json: bool) !void {
         return;
     };
     defer checker.deinit();
+    checker.source_path = path;
 
     checker.check(&result.module);
 
@@ -372,6 +375,7 @@ fn runTest(allocator: std.mem.Allocator, path: []const u8, json: bool) !void {
     var emitter = CEmitter.init(allocator, &checker.type_table, &checker.module_scope, &checker.method_types, &checker.generic_decls);
     defer emitter.deinit();
     emitter.test_mode = true;
+    emitter.imported_modules = checker.imported_modules.items;
 
     emitter.emitModule(&result.module) catch {
         io.writeErr("error: code generation failed (out of memory)\n", .{});
@@ -495,6 +499,7 @@ fn runBuild(allocator: std.mem.Allocator, path: []const u8, run_after: bool, jso
         return;
     };
     defer checker.deinit();
+    checker.source_path = path;
 
     checker.check(&result.module);
 
@@ -506,6 +511,7 @@ fn runBuild(allocator: std.mem.Allocator, path: []const u8, run_after: bool, jso
     // generate C
     var emitter = CEmitter.init(allocator, &checker.type_table, &checker.module_scope, &checker.method_types, &checker.generic_decls);
     defer emitter.deinit();
+    emitter.imported_modules = checker.imported_modules.items;
 
     emitter.emitModule(&result.module) catch {
         io.writeErr("error: code generation failed (out of memory)\n", .{});

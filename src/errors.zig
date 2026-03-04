@@ -96,6 +96,10 @@ pub const ErrorCode = enum {
     E231, // return outside function
     E232, // spawn/await type error
     E233, // not yet supported
+    E234, // import not found
+    E235, // import cycle detected
+    E236, // imported name not found
+    E237, // imported name is not public
 
     // -- linter (E3xx) --
     E300, // naming: function/variable not snake_case

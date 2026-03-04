@@ -51,6 +51,13 @@ mut g_lambda_indices: List[Int] := []
 mut g_lambda_nodes: List[Int] := []
 mut g_lambda_fn_types: List[Int] := []
 
+# captures for hoisted lambdas — per-lambda capture lists stored as flat arrays
+# with a count per lambda to index into them
+mut g_lambda_cap_names: List[String] := []   # flat list of captured var names
+mut g_lambda_cap_tids: List[Int] := []       # flat list of captured var type ids
+mut g_lambda_cap_counts: List[Int] := []     # how many captures per lambda
+mut g_lambda_cap_offsets: List[Int] := []    # starting offset into flat lists
+
 # lambda forward declaration buffering
 mut g_lambda_fwd_buf: List[String] := []
 mut g_lambda_fwd_pos := 0
@@ -60,6 +67,10 @@ mut g_test_names: List[String] := []
 
 # local variable types in current function
 mut g_local_types: Map[String, Int] := {}
+
+# temporary storage for capture detection (global because maps passed to
+# functions are copies — mutations don't propagate back)
+mut g_capture_idents: Map[String, Bool] := {}
 
 # generic function instantiation tracking — parallel lists
 # collected during pre-scan, used for forward decls + definitions
@@ -88,10 +99,15 @@ pub fn g_init():
     g_lambda_indices = []
     g_lambda_nodes = []
     g_lambda_fn_types = []
+    g_lambda_cap_names = []
+    g_lambda_cap_tids = []
+    g_lambda_cap_counts = []
+    g_lambda_cap_offsets = []
     g_lambda_fwd_buf = []
     g_lambda_fwd_pos = 0
     g_test_names = []
     g_local_types = {}
+    g_capture_idents = {}
     g_generic_fn_insts = []
     g_generic_fn_nodes = []
 
@@ -215,6 +231,8 @@ fn g_c_type_string(tid: Int) -> String:
                 return "forge_map_t"
             if info.kind == "set":
                 return "forge_set_t"
+            if info.kind == "function":
+                return "forge_closure_t"
             if info.kind == "result":
                 ok_c := g_c_type_string(info.inner)
                 return "forge_result_" + ok_c
@@ -609,33 +627,7 @@ fn g_emit_type_expr(node_idx: Int):
         g_write(g_c_type_string(tid))
         return
     if node.kind == "fn_type":
-        # C function pointer syntax: ret (*)(params)
-        # find return type and params from children
-        mut ret_idx := -1
-        mut param_indices: List[Int] := []
-        for child in node.children:
-            cn := get_node(child)
-            if cn.kind == "param":
-                if cn.children.len() > 0:
-                    param_indices.push(cn.children[0])
-            elif cn.kind == "returns":
-                if cn.children.len() > 0:
-                    ret_idx = cn.children[0]
-        if ret_idx >= 0:
-            g_emit_type_expr(ret_idx)
-        else:
-            g_write("void")
-        g_write(" (*)(")
-        if param_indices.len() == 0:
-            g_write("void")
-        else:
-            mut first := true
-            for pi in param_indices:
-                if first == false:
-                    g_write(", ")
-                first = false
-                g_emit_type_expr(pi)
-        g_write(")")
+        g_write("forge_closure_t")
         return
     # fallback
     g_write("/* unknown type */")
@@ -652,61 +644,15 @@ fn g_emit_return_type(node_idx: Int):
                 return
     g_write("void")
 
-# emit function pointer parameter: ret (*name)(params)
+# emit closure-typed parameter: forge_closure_t name
 fn g_emit_fn_ptr_param(type_node_idx: Int, name: String):
-    node := get_node(type_node_idx)
-    # find return type and params
-    mut ret_idx := -1
-    mut param_indices: List[Int] := []
-    for child in node.children:
-        cn := get_node(child)
-        if cn.kind == "param":
-            if cn.children.len() > 0:
-                param_indices.push(cn.children[0])
-        elif cn.kind == "returns":
-            if cn.children.len() > 0:
-                ret_idx = cn.children[0]
-    if ret_idx >= 0:
-        g_emit_type_expr(ret_idx)
-    else:
-        g_write("void")
-    g_write(" (*")
+    g_write("forge_closure_t ")
     g_write(name)
-    g_write(")(")
-    if param_indices.len() == 0:
-        g_write("void")
-    else:
-        mut first := true
-        for pi in param_indices:
-            if first == false:
-                g_write(", ")
-            first = false
-            g_emit_type_expr(pi)
-    g_write(")")
 
-# emit function pointer binding from a TypeId: ret (*name)(params)
+# emit closure-typed binding from a TypeId: forge_closure_t name
 fn g_emit_fn_ptr_binding(fn_tid: Int, name: String):
-    if fn_tid < 0:
-        return
-    if fn_tid >= tt_count():
-        return
-    info := tt_get(fn_tid)
-    if info.kind != "function":
-        return
-    g_write(g_c_type_string(info.return_type))
-    g_write(" (*")
+    g_write("forge_closure_t ")
     g_write(name)
-    g_write(")(")
-    if info.param_types.len() == 0:
-        g_write("void")
-    else:
-        mut first := true
-        for pt in info.param_types:
-            if first == false:
-                g_write(", ")
-            first = false
-            g_write(g_c_type_string(pt))
-    g_write(")")
 
 # ---------------------------------------------------------------
 # struct definitions
@@ -1281,6 +1227,12 @@ fn g_emit_binding(node_idx: Int):
     if tid == TID_ERR:
         if has_type_expr == false:
             tid = c_get_expr_type(value_idx)
+    # for lambda values, c_get_expr_type may return TID_ERR because it
+    # doesn't temporarily register params — fall back to g_find_lambda_type
+    if tid == TID_ERR:
+        val_node := get_node(value_idx)
+        if val_node.kind == "lambda":
+            tid = g_find_lambda_type(value_idx)
     g_local_types.insert(name, tid)
 
     # try propagation: x := foo()! → hoist result to temp
@@ -1884,16 +1836,38 @@ fn g_emit_call(node_idx: Int):
                 g_emit_arg_list(node_idx)
                 g_write(")")
                 return
-    # check if local fn pointer variable
+    # check if local closure variable
     if g_local_types.contains_key(name):
         local_tid := g_local_types[name]
         if local_tid >= 0:
             if local_tid < tt_count():
                 local_info := tt_get(local_tid)
                 if local_info.kind == "function":
+                    # closure call: cast fn_ptr and invoke with env_ptr
+                    g_write("((")
+                    g_write(g_c_type_string(local_info.return_type))
+                    g_write(" (*)(void*")
+                    for pt in local_info.param_types:
+                        g_write(", ")
+                        g_write(g_c_type_string(pt))
+                    g_write("))")
                     g_write(name)
-                    g_write("(")
-                    g_emit_arg_list(node_idx)
+                    g_write(".fn_ptr)(")
+                    g_write(name)
+                    g_write(".env_ptr")
+                    # emit actual arguments
+                    mut skip := 1
+                    for child in node.children:
+                        if skip > 0:
+                            skip = skip - 1
+                            continue
+                        cn := get_node(child)
+                        g_write(", ")
+                        if cn.kind == "arg":
+                            if cn.children.len() > 0:
+                                g_emit_expr(cn.children[0])
+                        else:
+                            g_emit_expr(child)
                     g_write(")")
                     return
     # regular user function
@@ -3063,6 +3037,83 @@ fn g_emit_variant_bindings(subject_idx: Int, pattern_idx: Int, body_idx: Int):
         fi = fi + 1
 
 # ---------------------------------------------------------------
+# capture detection
+# ---------------------------------------------------------------
+
+# detect variables captured from the enclosing scope by a lambda.
+# pushes results into g_lambda_cap_names/g_lambda_cap_tids and
+# returns the count of captures found.
+fn g_detect_captures(node_idx: Int) -> Int:
+    node := get_node(node_idx)
+    # build set of param names
+    mut param_names: Map[String, Bool] := {}
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            mut pname := cn.value
+            # strip "mut " prefix if present
+            if pname.starts_with("mut "):
+                pname = pname.substring(4, pname.len())
+            param_names.insert(pname, true)
+    # collect identifiers from the body using the global map
+    g_capture_idents = {}
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "body":
+            if cn.children.len() > 0:
+                body_child := get_node(cn.children[0])
+                if body_child.kind == "block":
+                    g_collect_block_idents(cn.children[0])
+                else:
+                    g_collect_expr_idents(cn.children[0])
+    # filter: keep idents in g_local_types but not in params or module scope
+    mut count := 0
+    for name in g_capture_idents.keys():
+        if param_names.contains_key(name):
+            continue
+        # skip module-scope names (functions, types, globals)
+        if sc_lookup(0, name) >= 0:
+            continue
+        if g_local_types.contains_key(name):
+            tid := g_local_types[name]
+            if tid != TID_ERR:
+                g_lambda_cap_names.push(name)
+                g_lambda_cap_tids.push(tid)
+                count = count + 1
+    return count
+
+# recursively collect all identifier names from an expression tree.
+# uses the global g_capture_idents map (can't pass mutable maps to functions).
+fn g_collect_expr_idents(node_idx: Int):
+    node := get_node(node_idx)
+    if node.kind == "ident":
+        g_capture_idents.insert(node.value, true)
+        return
+    # don't descend into nested lambdas — they have their own scope
+    if node.kind == "lambda":
+        return
+    for child in node.children:
+        g_collect_expr_idents(child)
+
+# collect identifiers from a block (list of statements).
+fn g_collect_block_idents(node_idx: Int):
+    node := get_node(node_idx)
+    for child in node.children:
+        g_collect_stmt_idents(child)
+
+# collect identifiers from a single statement.
+fn g_collect_stmt_idents(node_idx: Int):
+    node := get_node(node_idx)
+    # don't descend into nested lambdas
+    if node.kind == "lambda":
+        return
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "lambda":
+            continue
+        g_collect_expr_idents(child)
+
+# ---------------------------------------------------------------
 # lambda
 # ---------------------------------------------------------------
 
@@ -3072,12 +3123,48 @@ fn g_emit_lambda(node_idx: Int):
     g_lambda_counter = g_lambda_counter + 1
     # find the function type for this lambda
     fn_tid := g_find_lambda_type(node_idx)
+    # detect captures from enclosing scope
+    cap_offset := g_lambda_cap_names.len()
+    cap_count := g_detect_captures(node_idx)
     # record for hoisting
     g_lambda_indices.push(idx)
     g_lambda_nodes.push(node_idx)
     g_lambda_fn_types.push(fn_tid)
-    g_write("__lambda_")
-    g_write(idx.to_string())
+    g_lambda_cap_counts.push(cap_count)
+    g_lambda_cap_offsets.push(cap_offset)
+    if cap_count > 0:
+        # capturing lambda: heap-allocate env struct, build closure
+        g_write("(__extension__(" + LB + " __closure_env_")
+        g_write(idx.to_string())
+        g_write(" *__env_")
+        g_write(idx.to_string())
+        g_write(" = (__closure_env_")
+        g_write(idx.to_string())
+        g_write(" *)malloc(sizeof(__closure_env_")
+        g_write(idx.to_string())
+        g_write(")); ")
+        # fill in captured variable values
+        mut ci := 0
+        while ci < cap_count:
+            cap_name := g_lambda_cap_names[cap_offset + ci]
+            g_write("__env_")
+            g_write(idx.to_string())
+            g_write("->")
+            g_write(cap_name)
+            g_write(" = ")
+            g_write(cap_name)
+            g_write("; ")
+            ci = ci + 1
+        g_write("(forge_closure_t)" + LB + " (void*)__lambda_")
+        g_write(idx.to_string())
+        g_write(", (void*)__env_")
+        g_write(idx.to_string())
+        g_write(" " + RB + "; " + RB + "))")
+    else:
+        # non-capturing: closure with NULL env
+        g_write("(forge_closure_t)" + LB + " (void*)__lambda_")
+        g_write(idx.to_string())
+        g_write(", NULL " + RB)
 
 fn g_find_lambda_type(node_idx: Int) -> Int:
     node := get_node(node_idx)
@@ -3547,6 +3634,8 @@ fn g_emit_hoisted_lambdas():
         idx := g_lambda_indices[li]
         lam_node_idx := g_lambda_nodes[li]
         fn_tid := g_lambda_fn_types[li]
+        cap_count := g_lambda_cap_counts[li]
+        cap_offset := g_lambda_cap_offsets[li]
         if fn_tid < 0:
             li = li + 1
             continue
@@ -3558,30 +3647,46 @@ fn g_emit_hoisted_lambdas():
             li = li + 1
             continue
         lam_node := get_node(lam_node_idx)
-        # emit: static return_type __lambda_N(params) { body }
+        # emit: static return_type __lambda_N(void *__env, params...) { body }
         g_write("static ")
         g_write(g_c_type_string(info.return_type))
         g_write(" __lambda_")
         g_write(idx.to_string())
-        g_write("(")
+        g_write("(void *__env")
         # collect params from lambda node
-        mut params_emitted := false
         mut pi := 0
         for child in lam_node.children:
             cn := get_node(child)
             if cn.kind == "param":
-                if params_emitted:
-                    g_write(", ")
-                params_emitted = true
+                g_write(", ")
                 if pi < info.param_types.len():
                     g_write(g_c_type_string(info.param_types[pi]))
                 g_write(" ")
                 g_write(cn.value)
                 pi = pi + 1
-        if params_emitted == false:
-            g_write("void")
         g_write(") " + LB + "\n")
         g_indent = g_indent + 1
+        # for capturing lambdas, unpack the env struct
+        if cap_count > 0:
+            g_write_indent()
+            g_write("__closure_env_")
+            g_write(idx.to_string())
+            g_write(" *__captures = (__closure_env_")
+            g_write(idx.to_string())
+            g_write(" *)__env;\n")
+            # create local aliases for captured variables
+            mut ci := 0
+            while ci < cap_count:
+                cap_name := g_lambda_cap_names[cap_offset + ci]
+                cap_tid := g_lambda_cap_tids[cap_offset + ci]
+                g_write_indent()
+                g_write(g_c_type_string(cap_tid))
+                g_write(" ")
+                g_write(cap_name)
+                g_write(" = __captures->")
+                g_write(cap_name)
+                g_write(";\n")
+                ci = ci + 1
         # emit body
         g_emit_lambda_body(lam_node_idx, info.return_type)
         g_indent = g_indent - 1
@@ -3610,6 +3715,8 @@ fn g_build_lambda_fwd_decls():
         idx := g_lambda_indices[li]
         fn_tid := g_lambda_fn_types[li]
         lam_node_idx := g_lambda_nodes[li]
+        cap_count := g_lambda_cap_counts[li]
+        cap_offset := g_lambda_cap_offsets[li]
         if fn_tid < 0:
             li = li + 1
             continue
@@ -3621,26 +3728,33 @@ fn g_build_lambda_fwd_decls():
             li = li + 1
             continue
         lam_node := get_node(lam_node_idx)
+        # emit env struct typedef for capturing lambdas
+        if cap_count > 0:
+            mut env_decl := "typedef struct " + LB + " "
+            mut ci := 0
+            while ci < cap_count:
+                cap_name := g_lambda_cap_names[cap_offset + ci]
+                cap_tid := g_lambda_cap_tids[cap_offset + ci]
+                env_decl = env_decl + g_c_type_string(cap_tid) + " " + cap_name + "; "
+                ci = ci + 1
+            env_decl = env_decl + RB + " __closure_env_" + idx.to_string() + ";\n"
+            g_lambda_fwd_buf.push(env_decl)
+        # all lambdas take void* __env as first param (uniform closure ABI)
         mut fwd := "static "
         fwd = fwd + g_c_type_string(info.return_type)
         fwd = fwd + " __lambda_"
         fwd = fwd + idx.to_string()
-        fwd = fwd + "("
-        mut params_emitted := false
+        fwd = fwd + "(void *__env"
         mut pi := 0
         for child in lam_node.children:
             cn := get_node(child)
             if cn.kind == "param":
-                if params_emitted:
-                    fwd = fwd + ", "
-                params_emitted = true
+                fwd = fwd + ", "
                 if pi < info.param_types.len():
                     fwd = fwd + g_c_type_string(info.param_types[pi])
                 fwd = fwd + " "
                 fwd = fwd + cn.value
                 pi = pi + 1
-        if params_emitted == false:
-            fwd = fwd + "void"
         fwd = fwd + ");\n"
         g_lambda_fwd_buf.push(fwd)
         li = li + 1

@@ -13,7 +13,7 @@
 # globals in the flat C namespace.
 
 from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, tt_add, tt_register, tt_lookup, tt_get, tt_type_name, tt_is_numeric, tt_is_integer, tt_is_err, tt_init, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
-from scope import Binding, ScopeEntry, sc_reset, sc_new, sc_define, sc_lookup, sc_is_mut, sc_return_type, sc_in_loop, sc_new_fn, sc_new_loop
+from scope import sc_reset, sc_new, sc_define, sc_lookup, sc_is_mut, sc_return_type, sc_in_loop, sc_new_fn, sc_new_loop
 from ast import Node, get_node, add_node, add_leaf
 
 # ---------------------------------------------------------------
@@ -134,6 +134,27 @@ fn c_register_builtins():
     aeq_tid := tt_add(ti_function(aeq_params, TID_VOID))
     sc_define(c_scope, "assert_eq", aeq_tid, false)
     sc_define(c_scope, "assert_ne", aeq_tid, false)
+
+    # concurrency primitives (stub types)
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mutex_tid := tt_add(ti_struct("Mutex", empty_s, empty_i, empty_b, empty_b))
+    tt_register("Mutex", mutex_tid)
+    sc_define(c_scope, "Mutex", mutex_tid, false)
+    mut empty_s2: List[String] := []
+    mut empty_i2: List[Int] := []
+    mut empty_b2: List[Bool] := []
+    wg_tid := tt_add(ti_struct("WaitGroup", empty_s2, empty_i2, empty_b2, empty_b2))
+    tt_register("WaitGroup", wg_tid)
+    sc_define(c_scope, "WaitGroup", wg_tid, false)
+    mut sem_fields: List[String] := ["limit"]
+    mut sem_ftypes: List[Int] := [TID_INT]
+    mut sem_pub: List[Bool] := [false]
+    mut sem_mut: List[Bool] := [false]
+    sem_tid := tt_add(ti_struct("Semaphore", sem_fields, sem_ftypes, sem_pub, sem_mut))
+    tt_register("Semaphore", sem_tid)
+    sc_define(c_scope, "Semaphore", sem_tid, false)
 
 # ---------------------------------------------------------------
 # intern collection types
@@ -380,7 +401,7 @@ fn c_register_fn_decl(node_idx: Int, node: Node):
     if name.contains("["):
         # store as generic decl for later instantiation
         base := c_extract_base_name(name)
-        c_generic_decls[base] = node_idx
+        c_generic_decls.insert(base, node_idx)
         return
     # resolve function signature
     fn_tid := c_resolve_fn_signature(node)
@@ -409,12 +430,13 @@ fn c_resolve_fn_signature(node: Node) -> Int:
 
 fn c_register_struct_decl(node_idx: Int, node: Node):
     name := node.value
-    # check for generic params — struct names don't have them
-    # embedded, but we check generic_decls from parser's generic params
-    # the parser discards generic params for structs, so we check
-    # if any field uses undefined type names later
-    # actually, we need to detect generics from the parser
-    # for now: register non-generic structs only
+    base_name := c_extract_base_name(name)
+    # if name contains generic params (e.g., "Pair[A, B]"), store as generic
+    if name.contains("["):
+        c_generic_decls.insert(base_name, node_idx)
+        sc_define(c_scope, base_name, TID_ERR, false)
+        return
+    # non-generic: resolve field types immediately
     mut field_names: List[String] := []
     mut field_types: List[Int] := []
     mut field_pub: List[Bool] := []
@@ -433,10 +455,9 @@ fn c_register_struct_decl(node_idx: Int, node: Node):
                 field_types.push(TID_ERR)
             field_pub.push(is_pub)
             field_mut.push(is_mut)
-    tid := tt_add(ti_struct(name, field_names, field_types, field_pub, field_mut))
-    tt_register(name, tid)
-    # also register as a constructor function
-    sc_define(c_scope, name, tid, false)
+    tid := tt_add(ti_struct(base_name, field_names, field_types, field_pub, field_mut))
+    tt_register(base_name, tid)
+    sc_define(c_scope, base_name, tid, false)
 
 # ---------------------------------------------------------------
 # pass 1 — enum declarations
@@ -444,6 +465,13 @@ fn c_register_struct_decl(node_idx: Int, node: Node):
 
 fn c_register_enum_decl(node_idx: Int, node: Node):
     name := node.value
+    base_name := c_extract_base_name(name)
+    # if name contains generic params, store as generic
+    if name.contains("["):
+        c_generic_decls.insert(base_name, node_idx)
+        sc_define(c_scope, base_name, TID_ERR, false)
+        return
+    # non-generic: resolve variant types immediately
     mut variant_names: List[String] := []
     mut variant_types: List[List[Int]] := []
     for child in node.children:
@@ -454,9 +482,9 @@ fn c_register_enum_decl(node_idx: Int, node: Node):
             for vc in cn.children:
                 vtypes.push(c_resolve_type_impl(vc))
             variant_types.push(vtypes)
-    tid := tt_add(ti_enum(name, variant_names, variant_types))
-    tt_register(name, tid)
-    sc_define(c_scope, name, tid, false)
+    tid := tt_add(ti_enum(base_name, variant_names, variant_types))
+    tt_register(base_name, tid)
+    sc_define(c_scope, base_name, tid, false)
 
 # ---------------------------------------------------------------
 # pass 1 — interface declarations
@@ -470,7 +498,7 @@ fn c_register_interface_decl(node_idx: Int, node: Node):
     mut empty_b: List[Bool] := []
     tid := tt_add(ti_struct(name, empty_s, empty_i, empty_b, empty_b))
     tt_register(name, tid)
-    c_interface_decls[name] = node_idx
+    c_interface_decls.insert(name, node_idx)
 
 # ---------------------------------------------------------------
 # pass 1 — impl declarations
@@ -496,7 +524,7 @@ fn c_register_impl_decl(node_idx: Int, node: Node):
             method_start = 2
             # record in impl set
             key := concrete_name + "\t" + interface_name
-            c_impl_set[key] = 1
+            c_impl_set.insert(key, 1)
         else:
             concrete_name = c_type_node_name(first_type_node)
     else:
@@ -525,8 +553,8 @@ fn c_register_method(type_name: String, node: Node, is_pub: Bool):
     method_name := node.value
     fn_tid := c_resolve_fn_signature(node)
     key := type_name + "." + method_name
-    c_method_types[key] = fn_tid
-    c_method_pub[key] = is_pub
+    c_method_types.insert(key, fn_tid)
+    c_method_pub.insert(key, is_pub)
 
 # ---------------------------------------------------------------
 # pass 1 — type alias
@@ -888,13 +916,12 @@ fn c_check_if_stmt(node: Node, scope_id: Int):
             block := get_node(then_node.children[0])
             if block.kind == "block":
                 c_check_block(block, then_scope)
-    # check elif and else branches
-    mut i := 2
+    # check elif and else branches (skip first 2: condition + then)
+    mut skip_if := 2
     for child in node.children:
-        if i <= 0:
-            i = i + 1
+        if skip_if > 0:
+            skip_if = skip_if - 1
             continue
-        i = i + 1
         cn := get_node(child)
         if cn.kind == "elif":
             elif_scope := sc_new(scope_id)
@@ -1267,12 +1294,11 @@ fn c_check_call(node: Node, scope_id: Int) -> Int:
 
     # get argument nodes (children after callee)
     mut arg_indices: List[Int] := []
-    mut i := 1
+    mut skip_callee := 1
     for child in node.children:
-        if i <= 0:
-            i = i + 1
+        if skip_callee > 0:
+            skip_callee = skip_callee - 1
             continue
-        i = i + 1
         arg_indices.push(child)
 
     if callee_node.kind == "ident":
@@ -1292,8 +1318,11 @@ fn c_check_call(node: Node, scope_id: Int) -> Int:
                 # enum variant constructor (qualified as EnumName.Variant)
                 # — this case shouldn't happen for plain ident calls
                 return c_check_fn_call(callee_idx, arg_indices, scope_id)
-        # check if it's a generic function
+        # check if it's a generic declaration
         if c_generic_decls.contains_key(name):
+            gdecl := get_node(c_generic_decls[name])
+            if gdecl.kind == "struct_decl":
+                return c_check_generic_struct_constructor(name, arg_indices, scope_id)
             return c_check_generic_fn_call(name, arg_indices, scope_id)
         # normal function call
         return c_check_fn_call(callee_idx, arg_indices, scope_id)
@@ -1353,6 +1382,55 @@ fn c_check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg
         idx = idx + 1
     return struct_tid
 
+fn c_check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_id: Int) -> Int:
+    decl_idx := c_generic_decls[name]
+    decl_node := get_node(decl_idx)
+    generic_params := c_extract_generic_params(decl_node.value)
+    # evaluate all argument types
+    mut arg_types: List[Int] := []
+    for ai in arg_indices:
+        arg_node := get_node(ai)
+        mut arg_expr := ai
+        if arg_node.kind == "arg":
+            if arg_node.children.len() > 0:
+                arg_expr = arg_node.children[0]
+        arg_types.push(c_check_expr(arg_expr, scope_id))
+    # collect field type nodes from the struct declaration
+    mut field_type_nodes: List[Int] := []
+    for child in decl_node.children:
+        cn := get_node(child)
+        if cn.kind == "field":
+            if cn.children.len() > 0:
+                field_type_nodes.push(cn.children[0])
+            else:
+                field_type_nodes.push(-1)
+    # check field count
+    if arg_types.len() != field_type_nodes.len():
+        c_error("E207", name + " expects " + field_type_nodes.len().to_string() + " fields, got " + arg_types.len().to_string())
+        return TID_ERR
+    # infer type args from argument types
+    mut subst_map: Map[String, Int] := {}
+    mut fidx := 0
+    for ftn in field_type_nodes:
+        if ftn >= 0:
+            fnode := get_node(ftn)
+            if fnode.kind == "type":
+                for gp in generic_params:
+                    if gp == fnode.value:
+                        if fidx < arg_types.len():
+                            if subst_map.contains_key(gp) == false:
+                                subst_map.insert(gp, arg_types[fidx])
+        fidx = fidx + 1
+    # build type_args list in order of generic_params
+    mut type_args: List[Int] := []
+    for gp in generic_params:
+        if subst_map.contains_key(gp):
+            type_args.push(subst_map[gp])
+        else:
+            type_args.push(TID_ERR)
+    # instantiate the struct
+    return c_instantiate_generic_struct(decl_node, type_args)
+
 fn c_check_assert_eq(arg_indices: List[Int], scope_id: Int) -> Int:
     if arg_indices.len() != 2:
         c_error("E207", "assert_eq expects 2 arguments, got " + arg_indices.len().to_string())
@@ -1408,33 +1486,30 @@ fn c_check_generic_fn_call(name: String, arg_indices: List[Int], scope_id: Int) 
     if arg_types.len() != param_type_nodes.len():
         c_error("E207", "expected " + param_type_nodes.len().to_string() + " arguments, got " + arg_types.len().to_string())
         return TID_ERR
-    # infer type args from argument types
-    mut subst_args: List[Int] := []
-    for p in generic_params:
-        subst_args.push(-1)
+    # infer type args from argument types using a map
+    mut subst_map: Map[String, Int] := {}
     mut pidx := 0
     for ptn in param_type_nodes:
         if ptn >= 0:
             pnode := get_node(ptn)
             if pnode.kind == "type":
                 # check if this is a generic param name
-                mut gidx := 0
                 for gp in generic_params:
                     if gp == pnode.value:
                         if pidx < arg_types.len():
-                            if subst_args[gidx] < 0:
-                                subst_args[gidx] = arg_types[pidx]
-                    gidx = gidx + 1
+                            if subst_map.contains_key(gp) == false:
+                                subst_map.insert(gp, arg_types[pidx])
         pidx = pidx + 1
-    # verify all generic params were inferred
+    # verify all generic params were inferred, build subst_args list
+    mut subst_args: List[Int] := []
     mut all_inferred := true
-    mut check_idx := 0
-    for sa in subst_args:
-        if sa < 0:
+    for gp in generic_params:
+        if subst_map.contains_key(gp):
+            subst_args.push(subst_map[gp])
+        else:
             all_inferred = false
-            if check_idx < generic_params.len():
-                c_error("E222", "cannot infer type parameter " + generic_params[check_idx])
-        check_idx = check_idx + 1
+            c_error("E222", "cannot infer type parameter " + gp)
+            subst_args.push(TID_ERR)
     if all_inferred == false:
         return TID_ERR
     # resolve return type with substitution
@@ -1452,7 +1527,8 @@ fn c_check_generic_fn_call(name: String, arg_indices: List[Int], scope_id: Int) 
                 if tt_is_err(concrete) == false:
                     if tt_is_err(arg_types[vidx]) == false:
                         if arg_types[vidx] != concrete:
-                            c_error("E219", "argument type mismatch: expected " + tt_type_name(concrete) + ", got " + tt_type_name(arg_types[vidx]))
+                            if c_types_structurally_equal(arg_types[vidx], concrete) == false:
+                                c_error("E219", "argument type mismatch: expected " + tt_type_name(concrete) + ", got " + tt_type_name(arg_types[vidx]))
         vidx = vidx + 1
     return ret_type
 
@@ -1492,14 +1568,13 @@ fn c_check_method_call(node: Node, scope_id: Int) -> Int:
     if tt_is_err(receiver_type):
         return TID_ERR
 
-    # get argument nodes
+    # get argument nodes (skip receiver)
     mut arg_indices: List[Int] := []
-    mut i := 1
+    mut skip_recv := 1
     for child in node.children:
-        if i <= 0:
-            i = i + 1
+        if skip_recv > 0:
+            skip_recv = skip_recv - 1
             continue
-        i = i + 1
         arg_indices.push(child)
 
     # string methods
@@ -1551,7 +1626,8 @@ fn c_check_method_call(node: Node, scope_id: Int) -> Int:
                 if tt_is_err(atype) == false:
                     if aidx < fn_info.param_types.len():
                         if atype != fn_info.param_types[aidx]:
-                            c_error("E219", "argument type mismatch: expected " + tt_type_name(fn_info.param_types[aidx]) + ", got " + tt_type_name(atype))
+                            if c_types_structurally_equal(atype, fn_info.param_types[aidx]) == false:
+                                c_error("E219", "argument type mismatch: expected " + tt_type_name(fn_info.param_types[aidx]) + ", got " + tt_type_name(atype))
                 aidx = aidx + 1
             return fn_info.return_type
     c_error("E209", tt_type_name(receiver_type) + " has no method '" + method_name + "'")
@@ -1766,7 +1842,8 @@ fn c_check_arg_type(arg_idx: Int, expected: Int, scope_id: Int):
     actual := c_check_expr(expr_idx, scope_id)
     if tt_is_err(actual) == false:
         if actual != expected:
-            c_error("E219", "argument type mismatch: expected " + tt_type_name(expected) + ", got " + tt_type_name(actual))
+            if c_types_structurally_equal(actual, expected) == false:
+                c_error("E219", "argument type mismatch: expected " + tt_type_name(expected) + ", got " + tt_type_name(actual))
 
 # ---------------------------------------------------------------
 # field access
@@ -1926,13 +2003,12 @@ fn c_check_if_expr(node: Node, scope_id: Int) -> Int:
     # check then branch
     then_type := c_check_expr(node.children[1], scope_id)
     mut result_type := then_type
-    # check remaining branches
-    mut i := 2
+    # check remaining branches (skip first 2: condition + then)
+    mut skip_br := 2
     for child in node.children:
-        if i <= 0:
-            i = i + 1
+        if skip_br > 0:
+            skip_br = skip_br - 1
             continue
-        i = i + 1
         cn := get_node(child)
         if cn.kind == "elif_branch":
             if cn.children.len() >= 2:
@@ -1971,19 +2047,20 @@ fn c_check_match_expr(node_idx: Int, scope_id: Int) -> Int:
         return TID_ERR
     mut result_type := TID_ERR
     mut arm_values: List[String] := []
-    mut i := 1
+    mut skip_subj := 1
     for child in node.children:
-        if i <= 0:
-            i = i + 1
+        if skip_subj > 0:
+            skip_subj = skip_subj - 1
             continue
-        i = i + 1
         arm_node := get_node(child)
         if arm_node.kind == "arm":
             arm_type := c_check_match_arm(arm_node, subject_type, scope_id)
             # collect pattern values for exhaustiveness
             if arm_node.children.len() > 0:
                 pat := get_node(arm_node.children[0])
-                c_collect_arm_pattern(pat, arm_values)
+                pv := c_collect_arm_pattern(pat)
+                if pv.len() > 0:
+                    arm_values.push(pv)
             if tt_is_err(result_type):
                 result_type = arm_type
             elif tt_is_err(arm_type) == false:
@@ -2120,22 +2197,24 @@ fn c_check_tuple_pattern(pat: Node, expected_type: Int, scope_id: Int):
 # exhaustiveness checking
 # ---------------------------------------------------------------
 
-fn c_collect_arm_pattern(pat: Node, values: List[String]):
+fn c_collect_arm_pattern(pat: Node) -> String:
     if pat.kind == "pat_wildcard":
-        values.push("_")
-    elif pat.kind == "pat_binding":
-        values.push("_")
-    elif pat.kind == "pat_bool":
-        values.push(pat.value)
-    elif pat.kind == "pat_variant":
+        return "_"
+    if pat.kind == "pat_binding":
+        return "_"
+    if pat.kind == "pat_bool":
+        return pat.value
+    if pat.kind == "pat_variant":
         # extract variant name from "EnumName.VariantName"
         parts := pat.value.split(".")
         if parts.len() >= 2:
-            values.push(parts[1])
-    elif pat.kind == "pat_int":
-        values.push(pat.value)
-    elif pat.kind == "pat_string":
-        values.push(pat.value)
+            return parts[1]
+        return pat.value
+    if pat.kind == "pat_int":
+        return pat.value
+    if pat.kind == "pat_string":
+        return pat.value
+    return ""
 
 fn c_check_exhaustiveness(subject_type: Int, arm_values: List[String], node_idx: Int):
     # if any wildcard or binding pattern, it's exhaustive
@@ -2205,7 +2284,11 @@ fn c_check_lambda(node: Node, scope_id: Int) -> Int:
     if body_idx >= 0:
         body_node := get_node(body_idx)
         if body_node.kind == "body":
-            c_check_body(body_idx, lambda_scope)
+            # short-form lambda: body wraps a single expression
+            if body_node.children.len() > 0:
+                ret_type = c_check_expr(body_node.children[0], lambda_scope)
+        elif body_node.kind == "block":
+            c_check_block(body_node, lambda_scope)
         else:
             ret_type = c_check_expr(body_idx, lambda_scope)
     return tt_add(ti_function(params, ret_type))
@@ -2318,15 +2401,13 @@ fn c_instantiate_generic(decl_idx: Int, type_args: List[Int]) -> Int:
 
 fn c_instantiate_generic_struct(decl: Node, type_args: List[Int]) -> Int:
     name := decl.value
-    inst_name := c_build_inst_name(name, type_args)
+    base_name := c_extract_base_name(name)
+    inst_name := c_build_inst_name(base_name, type_args)
     existing := tt_lookup(inst_name)
     if existing >= 0:
         return existing
-    # extract generic params (need to re-parse from the parse tree context)
-    # for structs, generic params were parsed but discarded by the parser
-    # we need to infer them from usage — this is a simplification
-    # for now, just register the raw struct type without substitution
-    # TODO: proper generic struct instantiation with field type substitution
+    # extract generic params from name: "Pair[A, B]" -> ["A", "B"]
+    generic_params := c_extract_generic_params(name)
     mut field_names: List[String] := []
     mut field_types: List[Int] := []
     mut field_pub: List[Bool] := []
@@ -2341,9 +2422,8 @@ fn c_instantiate_generic_struct(decl: Node, type_args: List[Int]) -> Int:
             field_pub.push(is_pub)
             field_mut.push(is_mut)
             if cn.children.len() > 0:
-                # try to substitute type args
-                # this is simplified — only handles direct type param references
-                field_types.push(c_resolve_type_impl(cn.children[0]))
+                ftid := c_resolve_type_with_map(cn.children[0], generic_params, type_args)
+                field_types.push(ftid)
             else:
                 field_types.push(TID_ERR)
     tid := tt_add(ti_struct(inst_name, field_names, field_types, field_pub, field_mut))
@@ -2352,10 +2432,12 @@ fn c_instantiate_generic_struct(decl: Node, type_args: List[Int]) -> Int:
 
 fn c_instantiate_generic_enum(decl: Node, type_args: List[Int]) -> Int:
     name := decl.value
-    inst_name := c_build_inst_name(name, type_args)
+    base_name := c_extract_base_name(name)
+    inst_name := c_build_inst_name(base_name, type_args)
     existing := tt_lookup(inst_name)
     if existing >= 0:
         return existing
+    generic_params := c_extract_generic_params(name)
     mut variant_names: List[String] := []
     mut variant_types: List[List[Int]] := []
     for child in decl.children:
@@ -2364,7 +2446,7 @@ fn c_instantiate_generic_enum(decl: Node, type_args: List[Int]) -> Int:
             variant_names.push(cn.value)
             mut vtypes: List[Int] := []
             for vc in cn.children:
-                vtypes.push(c_resolve_type_impl(vc))
+                vtypes.push(c_resolve_type_with_map(vc, generic_params, type_args))
             variant_types.push(vtypes)
     tid := tt_add(ti_enum(inst_name, variant_names, variant_types))
     tt_register(inst_name, tid)
@@ -2391,10 +2473,10 @@ fn c_types_structurally_equal(a: Int, b: Int) -> Bool:
             mut i := 0
             for ap in ai.param_types:
                 if i < bi.param_types.len():
-                    if ap != bi.param_types[i]:
+                    if c_types_structurally_equal(ap, bi.param_types[i]) == false:
                         return false
                 i = i + 1
-            if ai.return_type != bi.return_type:
+            if c_types_structurally_equal(ai.return_type, bi.return_type) == false:
                 return false
             return true
     # tuple structural equality
@@ -2405,7 +2487,7 @@ fn c_types_structurally_equal(a: Int, b: Int) -> Bool:
             mut i := 0
             for ae in ai.elements:
                 if i < bi.elements.len():
-                    if ae != bi.elements[i]:
+                    if c_types_structurally_equal(ae, bi.elements[i]) == false:
                         return false
                 i = i + 1
             return true
@@ -2424,6 +2506,8 @@ pub fn c_run(root_idx: Int) -> List[Diagnostic]:
 pub fn c_diagnostics_to_json(diags: List[Diagnostic]) -> String:
     if diags.len() == 0:
         return "[]"
+    lb := chr(123)
+    rb := chr(125)
     mut result := "["
     mut first := true
     for d in diags:
@@ -2433,7 +2517,13 @@ pub fn c_diagnostics_to_json(diags: List[Diagnostic]) -> String:
         mut fix_part := ""
         if d.fix.len() > 0:
             fix_part = ",\"fix\":\"" + c_json_escape(d.fix) + "\""
-        result = result + "{\"severity\":\"" + d.severity + "\",\"code\":\"" + d.code + "\",\"message\":\"" + c_json_escape(d.message) + "\",\"line\":" + d.line.to_string() + ",\"col\":" + d.col.to_string() + fix_part + "}"
+        mut entry := lb + "\"severity\":\"" + d.severity + "\""
+        entry = entry + ",\"code\":\"" + d.code + "\""
+        entry = entry + ",\"message\":\"" + c_json_escape(d.message) + "\""
+        entry = entry + ",\"line\":" + d.line.to_string()
+        entry = entry + ",\"col\":" + d.col.to_string()
+        entry = entry + fix_part + rb
+        result = result + entry
     result = result + "]"
     return result
 

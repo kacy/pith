@@ -6,8 +6,9 @@ no panics, no null, no data races. automatic memory management via ARC with
 compile-time cycle prevention. result types everywhere. designed so that AI
 coding agents can read the errors, apply fixes, and iterate — fast.
 
-**status:** early bootstrap. the compiler is being written in zig and will
-self-host once the language is expressive enough.
+**status:** the compiler self-hosts. forge is written in forge — the
+self-hosted compiler compiles itself and produces identical output. the zig
+bootstrap is still maintained for testing and toolchain commands.
 
 ## what it looks like
 
@@ -38,7 +39,11 @@ fn main():
 ## what works today
 
 the bootstrap compiler handles the full pipeline: lex → parse → check → codegen.
-21 example programs, 19 compile to native binaries via C transpilation.
+all 21 example programs compile to native binaries via C transpilation.
+
+the self-hosted compiler (`self-host/codegen_main.fg`) can compile any forge
+program — including itself. it reaches a fixed point: the self-compiled
+compiler produces identical output to the zig-compiled one.
 
 **checked and compiling:**
 - function declarations, typed parameters, return types, calls
@@ -64,6 +69,7 @@ the bootstrap compiler handles the full pipeline: lex → parse → check → co
 - type conversions (to_string, to_int, to_float, parse_int, parse_float)
 - file I/O (read_file, write_file), env, args, exit
 - collection methods (push, remove, contains, keys, values, reverse, etc.)
+- multi-module imports
 
 **not yet implemented in codegen** (parses and type-checks fine):
 concurrency (spawn/await), type aliases, closures (capturing lambdas).
@@ -88,6 +94,12 @@ forge lint <file>         # check conventions and best practices
 forge lint --json <file>  # machine-readable lint output
 ```
 
+self-hosted compiler:
+
+```
+forge run self-host/codegen_main.fg <file>  # compile using the forge-written compiler
+```
+
 ## building
 
 requires [zig 0.15.2](https://ziglang.org/download/).
@@ -95,13 +107,14 @@ requires [zig 0.15.2](https://ziglang.org/download/).
 ```
 zig build          # compile
 zig build run      # compile and run
-zig build test     # run 360 tests
+zig build test     # run ~360 tests
 ```
 
 or with make:
 
 ```
-make build         # compile
+make build         # compile (debug)
+make release       # compile (release — ~30x faster compilation)
 make test          # run tests
 make check         # build + forge check all examples
 make fmt           # format source
@@ -127,7 +140,18 @@ src/
   intern.zig         string interning (arena-backed)
   io.zig             buffered I/O helpers
 
-examples/            .fg programs (19 compile to native binaries)
+self-host/
+  codegen_main.fg    entry point — compiles .fg files using the forge-written compiler
+  lexer.fg           tokenizer (port of lexer.zig)
+  parser.fg          recursive descent parser (port of parser.zig)
+  ast.fg             AST node representation
+  printer.fg         AST pretty-printer
+  checker.fg         type checker
+  types.fg           type representation
+  scope.fg           scope management for checker
+  codegen.fg         C transpilation backend (~3,950 lines)
+
+examples/            .fg programs (21 compile to native binaries)
 docs/grammar.ebnf    complete EBNF for the language
 docs/errors.md       error code reference (E0xx–E3xx)
 ```

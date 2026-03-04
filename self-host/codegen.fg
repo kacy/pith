@@ -20,6 +20,10 @@ mut g_buf: List[String] := []
 fn g_write(s: String):
     g_buf.push(s)
 
+# brace characters — can't use { } in forge string literals
+LB := chr(123)
+RB := chr(125)
+
 # ---------------------------------------------------------------
 # global state
 # ---------------------------------------------------------------
@@ -582,7 +586,7 @@ fn g_emit_struct_def(node_idx: Int):
     if g_is_generic(name):
         return
     base := g_extract_base_name(name)
-    g_write("typedef struct {\n")
+    g_write("typedef struct " + LB + "\n")
     g_indent = g_indent + 1
     for child in node.children:
         cn := get_node(child)
@@ -595,7 +599,7 @@ fn g_emit_struct_def(node_idx: Int):
             g_write(fname)
             g_write(";\n")
     g_indent = g_indent - 1
-    g_write("} ")
+    g_write(RB + " ")
     g_write(base)
     g_write(";\n\n")
 
@@ -631,7 +635,7 @@ fn g_emit_struct_instantiations(base: String):
                 # this is an instantiation — emit typedef
                 mangled := g_mangle_name(info.name)
                 g_mangled_names.insert(tid, mangled)
-                g_write("typedef struct {\n")
+                g_write("typedef struct " + LB + "\n")
                 g_indent = g_indent + 1
                 mut fi := 0
                 for f in info.fields:
@@ -642,7 +646,7 @@ fn g_emit_struct_instantiations(base: String):
                     g_write(";\n")
                     fi = fi + 1
                 g_indent = g_indent - 1
-                g_write("} ")
+                g_write(RB + " ")
                 g_write(mangled)
                 g_write(";\n\n")
         tid = tid + 1
@@ -660,7 +664,7 @@ fn g_emit_enum_def(node_idx: Int):
     base := g_extract_base_name(name)
 
     # tag enum
-    g_write("typedef enum {\n")
+    g_write("typedef enum " + LB + "\n")
     g_indent = g_indent + 1
     for child in node.children:
         cn := get_node(child)
@@ -671,12 +675,12 @@ fn g_emit_enum_def(node_idx: Int):
             g_write(cn.value)
             g_write(",\n")
     g_indent = g_indent - 1
-    g_write("} ")
+    g_write(RB + " ")
     g_write(base)
     g_write("_Tag;\n\n")
 
     # tagged union struct
-    g_write("typedef struct {\n")
+    g_write("typedef struct " + LB + "\n")
     g_indent = g_indent + 1
     g_write_indent()
     g_write(base)
@@ -692,14 +696,14 @@ fn g_emit_enum_def(node_idx: Int):
 
     if has_data:
         g_write_indent()
-        g_write("union {\n")
+        g_write("union " + LB + "\n")
         g_indent = g_indent + 1
         for child in node.children:
             cn := get_node(child)
             if cn.kind == "variant":
                 if cn.children.len() > 0:
                     g_write_indent()
-                    g_write("struct {\n")
+                    g_write("struct " + LB + "\n")
                     g_indent = g_indent + 1
                     mut fi := 0
                     for vc in cn.children:
@@ -712,15 +716,15 @@ fn g_emit_enum_def(node_idx: Int):
                         fi = fi + 1
                     g_indent = g_indent - 1
                     g_write_indent()
-                    g_write("} ")
+                    g_write(RB + " ")
                     g_write(cn.value)
                     g_write(";\n")
         g_indent = g_indent - 1
         g_write_indent()
-        g_write("} data;\n")
+        g_write(RB + " data;\n")
 
     g_indent = g_indent - 1
-    g_write("} ")
+    g_write(RB + " ")
     g_write(base)
     g_write(";\n\n")
 
@@ -742,9 +746,9 @@ fn g_emit_result_typedefs():
             else:
                 g_mangled_names.insert(tid, name)
                 g_emitted_results.insert(name, true)
-                g_write("typedef struct { bool is_ok; ")
+                g_write("typedef struct " + LB + " bool is_ok; ")
                 g_write(ok_c)
-                g_write(" ok; forge_string_t err; } ")
+                g_write(" ok; forge_string_t err; " + RB + " ")
                 g_write(name)
                 g_write(";\n")
         tid = tid + 1
@@ -763,9 +767,9 @@ fn g_emit_optional_typedefs():
             else:
                 g_mangled_names.insert(tid, name)
                 g_emitted_optionals.insert(name, true)
-                g_write("typedef struct { bool has_value; ")
+                g_write("typedef struct " + LB + " bool has_value; ")
                 g_write(inner_c)
-                g_write(" value; } ")
+                g_write(" value; " + RB + " ")
                 g_write(name)
                 g_write(";\n")
         tid = tid + 1
@@ -786,7 +790,7 @@ fn g_emit_tuple_typedefs():
             else:
                 g_mangled_names.insert(tid, name)
                 g_emitted_tuples.insert(name, true)
-                g_write("typedef struct { ")
+                g_write("typedef struct " + LB + " ")
                 mut ei := 0
                 for elem in info.elements:
                     g_write(g_c_type_string(elem))
@@ -794,7 +798,7 @@ fn g_emit_tuple_typedefs():
                     g_write(ei.to_string())
                     g_write("; ")
                     ei = ei + 1
-                g_write("} ")
+                g_write(RB + " ")
                 g_write(name)
                 g_write(";\n")
         tid = tid + 1
@@ -806,72 +810,72 @@ fn g_emit_tuple_typedefs():
 
 fn g_emit_builtin_helpers():
     # parse_int(String) -> Int!
-    g_write("static forge_result_int64_t forge_parse_int(forge_string_t s) {\n")
+    g_write("static forge_result_int64_t forge_parse_int(forge_string_t s) " + LB + "\n")
     g_write("    char buf[64];\n")
     g_write("    int64_t slen = s.len < 63 ? s.len : 63;\n")
     g_write("    memcpy(buf, s.data, (size_t)slen);\n")
     g_write("    buf[slen] = '\\0';\n")
     g_write("    char *end;\n")
     g_write("    int64_t val = strtoll(buf, &end, 10);\n")
-    g_write("    if (end == buf || *end != '\\0') {\n")
+    g_write("    if (end == buf || *end != '\\0') " + LB + "\n")
     g_write("        forge_result_int64_t r; r.is_ok = false;\n")
     g_write("        r.err = FORGE_STRING_LIT(\"invalid integer\");\n")
     g_write("        return r;\n")
-    g_write("    }\n")
+    g_write("    " + RB + "\n")
     g_write("    forge_result_int64_t r; r.is_ok = true; r.ok = val;\n")
     g_write("    return r;\n")
-    g_write("}\n\n")
+    g_write(RB + "\n\n")
 
     # parse_float(String) -> Float!
-    g_write("static forge_result_double forge_parse_float(forge_string_t s) {\n")
+    g_write("static forge_result_double forge_parse_float(forge_string_t s) " + LB + "\n")
     g_write("    char buf[128];\n")
     g_write("    int64_t slen = s.len < 127 ? s.len : 127;\n")
     g_write("    memcpy(buf, s.data, (size_t)slen);\n")
     g_write("    buf[slen] = '\\0';\n")
     g_write("    char *end;\n")
     g_write("    double val = strtod(buf, &end);\n")
-    g_write("    if (end == buf || *end != '\\0') {\n")
+    g_write("    if (end == buf || *end != '\\0') " + LB + "\n")
     g_write("        forge_result_double r; r.is_ok = false;\n")
     g_write("        r.err = FORGE_STRING_LIT(\"invalid float\");\n")
     g_write("        return r;\n")
-    g_write("    }\n")
+    g_write("    " + RB + "\n")
     g_write("    forge_result_double r; r.is_ok = true; r.ok = val;\n")
     g_write("    return r;\n")
-    g_write("}\n\n")
+    g_write(RB + "\n\n")
 
     # read_file(String) -> String!
-    g_write("static forge_result_forge_string_t forge_read_file(forge_string_t path) {\n")
+    g_write("static forge_result_forge_string_t forge_read_file(forge_string_t path) " + LB + "\n")
     g_write("    forge_string_t content;\n")
-    g_write("    if (forge_read_file_impl(path.data, path.len, &content)) {\n")
+    g_write("    if (forge_read_file_impl(path.data, path.len, &content)) " + LB + "\n")
     g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = content;\n")
     g_write("        return r;\n")
-    g_write("    }\n")
+    g_write("    " + RB + "\n")
     g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
     g_write("    r.err = FORGE_STRING_LIT(\"failed to read file\");\n")
     g_write("    return r;\n")
-    g_write("}\n\n")
+    g_write(RB + "\n\n")
 
     # write_file(String, String) -> Bool!
-    g_write("static forge_result_bool forge_write_file(forge_string_t path, forge_string_t data) {\n")
-    g_write("    if (forge_write_file_impl(path.data, path.len, data.data, data.len)) {\n")
+    g_write("static forge_result_bool forge_write_file(forge_string_t path, forge_string_t data) " + LB + "\n")
+    g_write("    if (forge_write_file_impl(path.data, path.len, data.data, data.len)) " + LB + "\n")
     g_write("        forge_result_bool r; r.is_ok = true; r.ok = true;\n")
     g_write("        return r;\n")
-    g_write("    }\n")
+    g_write("    " + RB + "\n")
     g_write("    forge_result_bool r; r.is_ok = false;\n")
     g_write("    r.err = FORGE_STRING_LIT(\"failed to write file\");\n")
     g_write("    return r;\n")
-    g_write("}\n\n")
+    g_write(RB + "\n\n")
 
     # env(String) -> String?
-    g_write("static forge_optional_forge_string_t forge_env(forge_string_t name) {\n")
+    g_write("static forge_optional_forge_string_t forge_env(forge_string_t name) " + LB + "\n")
     g_write("    forge_string_t val;\n")
-    g_write("    if (forge_env_impl(name.data, name.len, &val)) {\n")
+    g_write("    if (forge_env_impl(name.data, name.len, &val)) " + LB + "\n")
     g_write("        forge_optional_forge_string_t r; r.has_value = true; r.value = val;\n")
     g_write("        return r;\n")
-    g_write("    }\n")
+    g_write("    " + RB + "\n")
     g_write("    forge_optional_forge_string_t r; r.has_value = false;\n")
     g_write("    return r;\n")
-    g_write("}\n\n")
+    g_write(RB + "\n\n")
 
 # ---------------------------------------------------------------
 # function forward declarations
@@ -1043,3 +1047,406 @@ fn g_emit_generic_fn_fwd_from_ast():
     # we extract the base name and scan the type table
     # This is handled in g_emit_module by iterating root children
     return
+
+# ---------------------------------------------------------------
+# block and statements
+# ---------------------------------------------------------------
+
+fn g_emit_block(node_idx: Int):
+    node := get_node(node_idx)
+    for child in node.children:
+        g_emit_stmt(child)
+
+fn g_emit_stmt(node_idx: Int):
+    node := get_node(node_idx)
+    if node.kind == "binding":
+        g_emit_binding(node_idx)
+        return
+    if node.kind == "assignment":
+        g_emit_assignment(node_idx)
+        return
+    if node.kind == "if":
+        g_emit_if_stmt(node_idx)
+        return
+    if node.kind == "while":
+        g_emit_while_stmt(node_idx)
+        return
+    if node.kind == "for":
+        g_emit_for_stmt(node_idx)
+        return
+    if node.kind == "return":
+        g_emit_return_stmt(node_idx)
+        return
+    if node.kind == "break":
+        g_write_indent()
+        g_write("break;\n")
+        return
+    if node.kind == "continue":
+        g_write_indent()
+        g_write("continue;\n")
+        return
+    if node.kind == "match":
+        g_emit_match_stmt(node_idx)
+        return
+    if node.kind == "fail":
+        g_emit_fail_stmt(node_idx)
+        return
+    # expression statement
+    if node.kind == "expr_stmt":
+        if node.children.len() > 0:
+            inner := get_node(node.children[0])
+            if inner.kind == "try":
+                g_emit_try_expr_stmt(node.children[0])
+                return
+            g_write_indent()
+            g_emit_expr(node.children[0])
+            g_write(";\n")
+        return
+    # fallback — try to emit as expression
+    g_write_indent()
+    g_emit_expr(node_idx)
+    g_write(";\n")
+
+fn g_emit_binding(node_idx: Int):
+    node := get_node(node_idx)
+    name := g_extract_binding_name(node.value)
+    is_mut := node.value.contains(" mut")
+    # determine the type
+    mut tid := TID_ERR
+    mut has_type_expr := false
+    mut type_expr_idx := -1
+    mut value_idx := -1
+    # children: [type_expr?, value_expr]
+    # if there's a type annotation, first child is the type, second is the value
+    # if no type annotation, only child is the value
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "type":
+            has_type_expr = true
+            type_expr_idx = child
+            tid = c_resolve_type(child)
+        elif cn.kind == "generic_type":
+            has_type_expr = true
+            type_expr_idx = child
+            tid = c_resolve_type(child)
+        elif cn.kind == "optional_type":
+            has_type_expr = true
+            type_expr_idx = child
+            tid = c_resolve_type(child)
+        elif cn.kind == "result_type":
+            has_type_expr = true
+            type_expr_idx = child
+            tid = c_resolve_type(child)
+        elif cn.kind == "tuple_type":
+            has_type_expr = true
+            type_expr_idx = child
+            tid = c_resolve_type(child)
+        elif cn.kind == "fn_type":
+            has_type_expr = true
+            type_expr_idx = child
+            tid = c_resolve_type(child)
+        else:
+            value_idx = child
+
+    if value_idx < 0:
+        return
+    if tid == TID_ERR:
+        if has_type_expr == false:
+            tid = c_get_expr_type(value_idx)
+    g_local_types.insert(name, tid)
+
+    # try propagation: x := foo()! → hoist result to temp
+    inner_node := get_node(value_idx)
+    if inner_node.kind == "try":
+        g_emit_try_binding(node_idx, name, tid, value_idx)
+        return
+
+    # function pointer bindings need special C syntax
+    if has_type_expr:
+        type_node := get_node(type_expr_idx)
+        if type_node.kind == "fn_type":
+            g_write_indent()
+            g_emit_fn_ptr_param(type_expr_idx, name)
+            g_write(" = ")
+            g_emit_expr(value_idx)
+            g_write(";\n")
+            return
+    elif tid != TID_ERR:
+        if tid >= 0:
+            if tid < tt_count():
+                info := tt_get(tid)
+                if info.kind == "function":
+                    g_write_indent()
+                    g_emit_fn_ptr_binding(tid, name)
+                    g_write(" = ")
+                    g_emit_expr(value_idx)
+                    g_write(";\n")
+                    return
+
+    g_write_indent()
+    if has_type_expr:
+        g_emit_type_expr(type_expr_idx)
+    elif tid != TID_ERR:
+        g_emit_c_type(tid)
+    else:
+        g_write("/* unknown */")
+    g_write(" ")
+    g_write(name)
+    g_write(" = ")
+    g_emit_expr(value_idx)
+    g_write(";\n")
+
+# extract binding name from "x" or "x mut"
+fn g_extract_binding_name(value: String) -> String:
+    mut i := 0
+    while i < value.len():
+        if value[i] == " ":
+            return value.substring(0, i)
+        i = i + 1
+    return value
+
+fn g_emit_assignment(node_idx: Int):
+    node := get_node(node_idx)
+    # children: [target, value]
+    # node.value is the operator: "=", "+=", "-=", "*=", "/="
+    g_write_indent()
+    g_emit_expr(node.children[0])
+    if node.value == "=":
+        g_write(" = ")
+    elif node.value == "+=":
+        g_write(" += ")
+    elif node.value == "-=":
+        g_write(" -= ")
+    elif node.value == "*=":
+        g_write(" *= ")
+    elif node.value == "/=":
+        g_write(" /= ")
+    else:
+        g_write(" = ")
+    g_emit_expr(node.children[1])
+    g_write(";\n")
+
+fn g_emit_if_stmt(node_idx: Int):
+    node := get_node(node_idx)
+    # children: [condition, then_block, elif*, else?]
+    g_write_indent()
+    g_write("if (")
+    g_emit_expr(node.children[0])
+    g_write(") " + LB + "\n")
+    g_indent = g_indent + 1
+    g_emit_block(node.children[1])
+    g_indent = g_indent - 1
+    # process remaining children as elif/else
+    mut i := 2
+    while i < node.children.len():
+        g_emit_if_branch(node.children[i])
+        i = i + 1
+    g_write_indent()
+    g_write(RB + "\n")
+
+fn g_emit_if_branch(node_idx: Int):
+    cn := get_node(node_idx)
+    if cn.kind == "elif":
+        g_write_indent()
+        g_write(RB + " else if (")
+        g_emit_expr(cn.children[0])
+        g_write(") " + LB + "\n")
+        g_indent = g_indent + 1
+        g_emit_block(cn.children[1])
+        g_indent = g_indent - 1
+        return
+    if cn.kind == "else":
+        g_write_indent()
+        g_write(RB + " else " + LB + "\n")
+        g_indent = g_indent + 1
+        g_emit_block(cn.children[0])
+        g_indent = g_indent - 1
+
+fn g_emit_while_stmt(node_idx: Int):
+    node := get_node(node_idx)
+    # children: [condition, body]
+    g_write_indent()
+    g_write("while (")
+    g_emit_expr(node.children[0])
+    g_write(") " + LB + "\n")
+    g_indent = g_indent + 1
+    g_emit_block(node.children[1])
+    g_indent = g_indent - 1
+    g_write_indent()
+    g_write(RB + "\n")
+
+fn g_emit_for_stmt(node_idx: Int):
+    node := get_node(node_idx)
+    # node.value is the binding name (e.g., "item" or "item,idx")
+    # children: [iterable, body]
+    binding := node.value
+    mut idx_name := ""
+    # check for index variable: "item,idx"
+    mut comma_pos := -1
+    mut ci := 0
+    while ci < binding.len():
+        if binding[ci] == ",":
+            comma_pos = ci
+        ci = ci + 1
+    mut elem_name := binding
+    if comma_pos >= 0:
+        elem_name = binding.substring(0, comma_pos)
+        idx_name = binding.substring(comma_pos + 1, binding.len())
+
+    if idx_name == "":
+        idx_name = "__idx_" + g_for_counter.to_string()
+        g_for_counter = g_for_counter + 1
+
+    iter_tid := c_get_expr_type(node.children[0])
+    if iter_tid < 0:
+        g_write_indent()
+        g_write("/* for loop: could not resolve iterable type */\n")
+        return
+    if iter_tid >= tt_count():
+        g_write_indent()
+        g_write("/* for loop: could not resolve iterable type */\n")
+        return
+    iter_info := tt_get(iter_tid)
+
+    if iter_info.kind == "list":
+        elem_c := g_c_type_string(iter_info.inner)
+        g_write_indent()
+        g_write("for (int64_t ")
+        g_write(idx_name)
+        g_write(" = 0; ")
+        g_write(idx_name)
+        g_write(" < ")
+        g_emit_expr(node.children[0])
+        g_write(".len; ")
+        g_write(idx_name)
+        g_write("++) " + LB + "\n")
+        g_indent = g_indent + 1
+        g_write_indent()
+        g_write(elem_c)
+        g_write(" ")
+        g_write(elem_name)
+        g_write(" = FORGE_LIST_GET(")
+        g_emit_expr(node.children[0])
+        g_write(", ")
+        g_write(elem_c)
+        g_write(", ")
+        g_write(idx_name)
+        g_write(");\n")
+        g_local_types.insert(elem_name, iter_info.inner)
+        if comma_pos >= 0:
+            g_local_types.insert(idx_name, TID_INT)
+        g_emit_block(node.children[1])
+        g_indent = g_indent - 1
+        g_write_indent()
+        g_write(RB + "\n")
+        return
+
+    if iter_info.kind == "map":
+        key_c := g_c_type_string(iter_info.key_type)
+        g_write_indent()
+        g_write("for (int64_t ")
+        g_write(idx_name)
+        g_write(" = 0; ")
+        g_write(idx_name)
+        g_write(" < ")
+        g_emit_expr(node.children[0])
+        g_write(".len; ")
+        g_write(idx_name)
+        g_write("++) " + LB + "\n")
+        g_indent = g_indent + 1
+        g_write_indent()
+        g_write(key_c)
+        g_write(" ")
+        g_write(elem_name)
+        g_write(" = ((")
+        g_write(key_c)
+        g_write(" *)")
+        g_emit_expr(node.children[0])
+        g_write(".keys)[")
+        g_write(idx_name)
+        g_write("];\n")
+        g_local_types.insert(elem_name, iter_info.key_type)
+        if comma_pos >= 0:
+            g_local_types.insert(idx_name, TID_INT)
+        g_emit_block(node.children[1])
+        g_indent = g_indent - 1
+        g_write_indent()
+        g_write(RB + "\n")
+        return
+
+    if iter_info.kind == "set":
+        elem_c := g_c_type_string(iter_info.inner)
+        g_write_indent()
+        g_write("for (int64_t ")
+        g_write(idx_name)
+        g_write(" = 0; ")
+        g_write(idx_name)
+        g_write(" < ")
+        g_emit_expr(node.children[0])
+        g_write(".len; ")
+        g_write(idx_name)
+        g_write("++) " + LB + "\n")
+        g_indent = g_indent + 1
+        g_write_indent()
+        g_write(elem_c)
+        g_write(" ")
+        g_write(elem_name)
+        g_write(" = FORGE_LIST_GET(")
+        g_emit_expr(node.children[0])
+        g_write(", ")
+        g_write(elem_c)
+        g_write(", ")
+        g_write(idx_name)
+        g_write(");\n")
+        g_local_types.insert(elem_name, iter_info.inner)
+        if comma_pos >= 0:
+            g_local_types.insert(idx_name, TID_INT)
+        g_emit_block(node.children[1])
+        g_indent = g_indent - 1
+        g_write_indent()
+        g_write(RB + "\n")
+        return
+
+    g_write_indent()
+    g_write("/* for loop: unsupported iterable type */\n")
+
+fn g_emit_return_stmt(node_idx: Int):
+    node := get_node(node_idx)
+    g_write_indent()
+    if node.children.len() > 0:
+        if g_is_result_type(g_current_fn_return):
+            ret_c := g_c_type_string(g_current_fn_return)
+            g_write("return (")
+            g_write(ret_c)
+            g_write(")" + LB + " .is_ok = true, .ok = ")
+            g_emit_expr(node.children[0])
+            g_write(" " + RB + ";\n")
+        elif g_is_optional_type(g_current_fn_return):
+            val_node := get_node(node.children[0])
+            ret_c := g_c_type_string(g_current_fn_return)
+            if val_node.kind == "none":
+                g_write("return (")
+                g_write(ret_c)
+                g_write(")" + LB + " .has_value = false " + RB + ";\n")
+            else:
+                g_write("return (")
+                g_write(ret_c)
+                g_write(")" + LB + " .has_value = true, .value = ")
+                g_emit_expr(node.children[0])
+                g_write(" " + RB + ";\n")
+        else:
+            g_write("return ")
+            g_emit_expr(node.children[0])
+            g_write(";\n")
+    else:
+        g_write("return;\n")
+
+fn g_emit_fail_stmt(node_idx: Int):
+    node := get_node(node_idx)
+    g_write_indent()
+    ret_c := g_c_type_string(g_current_fn_return)
+    g_write("return (")
+    g_write(ret_c)
+    g_write(")" + LB + " .is_ok = false, .err = ")
+    g_emit_expr(node.children[0])
+    g_write(" " + RB + ";\n")

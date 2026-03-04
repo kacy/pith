@@ -31,3 +31,18 @@ jobs:
             fi
             echo "ok   $f"
           done
+
+      - name: build (release)
+        run: zig build release
+
+      - name: check examples (release)
+        run: |
+          for f in examples/*.fg; do
+            result=$(./zig-out/bin/forge check "$f" 2>&1)
+            if [ "$result" != "ok" ]; then
+              echo "FAIL $f (release)"
+              echo "$result"
+              exit 1
+            fi
+            echo "ok   $f"
+          done

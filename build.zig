@@ -17,6 +17,18 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // zig build release — optimized binary for day-to-day use
+    const release_exe = b.addExecutable(.{
+        .name = "forge",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const release_step = b.step("release", "build optimized forge binary");
+    release_step.dependOn(&b.addInstallArtifact(release_exe, .{}).step);
+
     // zig build run -- <args>
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

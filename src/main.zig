@@ -114,10 +114,19 @@ fn lexAndParse(allocator: std.mem.Allocator, source: []const u8, json: bool) !?P
     return .{ .module = module, .tokens = tokens, .arena = arena };
 }
 
+const builtin = @import("builtin");
+
 pub fn main() !void {
+    // in debug builds, use GPA for leak detection and memory safety checks.
+    // in release builds, use smp_allocator — no wrapper overhead.
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    defer if (builtin.mode == .Debug) {
+        _ = gpa.deinit();
+    };
+    const allocator = if (builtin.mode == .Debug)
+        gpa.allocator()
+    else
+        std.heap.smp_allocator;
 
     var args = std.process.argsWithAllocator(allocator) catch {
         printUsage();

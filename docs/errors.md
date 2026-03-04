@@ -351,6 +351,42 @@ a `spawn` or `await` expression has a type error.
 
 a language feature is recognized but not yet implemented in the checker.
 
+### E234 — import not found
+
+the imported module file could not be found. imports are resolved relative
+to the importing file's directory.
+
+```
+error[E234]: module not found: 'utils'
+  1 | import utils
+      ^^^^^^
+```
+
+### E235 — import cycle detected
+
+two or more modules import each other, forming a cycle. break the cycle
+by restructuring the code or extracting shared types into a third module.
+
+### E236 — imported name not found
+
+a `from ... import` refers to a name that doesn't exist in the module.
+
+```
+error[E236]: name 'subtract' not found in the imported module
+  1 | from math import subtract
+                       ^^^^^^^^
+```
+
+### E237 — imported name is not public
+
+a `from ... import` refers to a name that exists but isn't marked `pub`.
+
+```
+error[E237]: 'secret' is not public in the imported module
+  1 | from math import secret
+                       ^^^^^^
+```
+
 ---
 
 ## lint errors (E3xx)

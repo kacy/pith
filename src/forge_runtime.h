@@ -1041,4 +1041,17 @@ static inline void forge_print(forge_string_t s) {
     fputc('\n', stdout);
 }
 
+static inline int64_t forge_exec(forge_string_t cmd) {
+    char *cstr = (char *)malloc((size_t)cmd.len + 1);
+    memcpy(cstr, cmd.data, (size_t)cmd.len);
+    cstr[cmd.len] = '\0';
+    int result = system(cstr);
+    free(cstr);
+#ifdef _WIN32
+    return (int64_t)result;
+#else
+    return (int64_t)WEXITSTATUS(result);
+#endif
+}
+
 #endif // FORGE_RUNTIME_H

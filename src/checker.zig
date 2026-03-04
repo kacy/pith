@@ -288,6 +288,13 @@ pub const Checker = struct {
         try self.module_scope.define("assert_eq", .{ .type_id = assert_eq_type, .is_mut = false });
         try self.module_scope.define("assert_ne", .{ .type_id = assert_eq_type, .is_mut = false });
 
+        // exec(String) -> Int
+        const exec_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("exec", .{ .type_id = exec_type, .is_mut = false });
+
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});
         try self.registerSyncType("WaitGroup", &.{});

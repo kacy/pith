@@ -421,14 +421,17 @@ pub const Checker = struct {
 
         const imported = self.loadAndCheckModule(import_path, location) orelse return;
 
-        // inject specific named exports into the current scope
+        // build decl index once, then look up each imported name in O(1)
+        var decl_index = buildDeclIndex(imported, self.allocator);
+        defer decl_index.deinit();
+
         for (names) |name| {
             const use_name = name.alias orelse name.name;
-            if (self.findPublicDecl(imported, name.name)) |binding| {
+            if (self.findPublicDeclIndexed(&decl_index, name.name)) |binding| {
                 self.module_scope.define(use_name, binding) catch {};
             } else {
                 // check if it exists but is not public
-                if (self.findAnyDecl(imported, name.name)) {
+                if (decl_index.contains(name.name)) {
                     self.diagnostics.addCodedError(.E237, name.location, self.fmt(
                         "'{s}' is not public in the imported module", .{name.name},
                     )) catch {};
@@ -573,28 +576,45 @@ pub const Checker = struct {
         return &self.imported_modules.items[idx].module;
     }
 
+    /// metadata about a declaration: whether it's public.
+    const DeclMeta = struct { is_pub: bool };
+
+    /// build a name -> DeclMeta index for a module's declarations.
+    /// used to avoid repeated linear scans when resolving multiple imports.
+    fn buildDeclIndex(module: *const ast.Module, allocator: std.mem.Allocator) std.StringHashMap(DeclMeta) {
+        var index = std.StringHashMap(DeclMeta).init(allocator);
+        for (module.decls) |*decl| {
+            const name = getDeclName(decl) orelse continue;
+            index.put(name, .{ .is_pub = decl.is_pub }) catch {};
+        }
+        return index;
+    }
+
     /// find a public declaration's binding in an imported module.
     fn findPublicDecl(self: *Checker, module: *const ast.Module, name: []const u8) ?Binding {
-        for (module.decls) |*decl| {
-            if (!decl.is_pub) continue;
-            const decl_name = getDeclName(decl) orelse continue;
-            if (std.mem.eql(u8, decl_name, name)) {
-                // functions and bindings are in module_scope
-                if (self.module_scope.lookup(name)) |binding| return binding;
+        var index = buildDeclIndex(module, self.allocator);
+        defer index.deinit();
+        return self.findPublicDeclIndexed(&index, name);
+    }
 
-                // structs and enums are registered in type_table, not module_scope.
-                // synthesize a binding from the type table lookup.
-                if (self.type_table.lookup(name)) |type_id| {
-                    return Binding{ .type_id = type_id, .is_mut = false };
-                }
-                return null;
-            }
+    /// find a public declaration using a pre-built decl index.
+    fn findPublicDeclIndexed(self: *Checker, index: *const std.StringHashMap(DeclMeta), name: []const u8) ?Binding {
+        const meta = index.get(name) orelse return null;
+        if (!meta.is_pub) return null;
+
+        // functions and bindings are in module_scope
+        if (self.module_scope.lookup(name)) |binding| return binding;
+
+        // structs and enums are registered in type_table, not module_scope.
+        if (self.type_table.lookup(name)) |type_id| {
+            return Binding{ .type_id = type_id, .is_mut = false };
         }
         return null;
     }
 
     /// check if any declaration (pub or not) has this name.
     fn findAnyDecl(_: *Checker, module: *const ast.Module, name: []const u8) bool {
+        // small linear scan is fine here — only called on error paths
         for (module.decls) |*decl| {
             const decl_name = getDeclName(decl) orelse continue;
             if (std.mem.eql(u8, decl_name, name)) return true;

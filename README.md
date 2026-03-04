@@ -7,8 +7,10 @@ compile-time cycle prevention. result types everywhere. designed so that AI
 coding agents can read the errors, apply fixes, and iterate — fast.
 
 **status:** the compiler self-hosts. forge is written in forge — the
-self-hosted compiler compiles itself and produces identical output. the zig
-bootstrap is still maintained for testing and toolchain commands.
+self-hosted compiler compiles itself and produces identical output. the
+self-hosted CLI (`self-host/forge_main.fg`) handles `build`, `run`, and
+`test` end-to-end. the zig bootstrap is still maintained for toolchain
+commands (lex, parse, check, fmt, lint).
 
 ## what it looks like
 
@@ -61,18 +63,18 @@ compiler produces identical output to the zig-compiled one.
 - pipe operator (`x | f`)
 - collection literals: List, Map, Set with index expressions
 - generics with monomorphization
-- lambdas (non-capturing)
+- lambdas and closures (capturing lambdas with uniform closure ABI)
 - result types (`T!`) with try propagation (`expr!`) and `fail`
 - optional types (`T?`)
 - tuples with field access (`t.0`, `t.1`)
 - string methods (len, contains, split, trim, etc.)
 - type conversions (to_string, to_int, to_float, parse_int, parse_float)
-- file I/O (read_file, write_file), env, args, exit
+- file I/O (read_file, write_file), env, args, exit, exec
 - collection methods (push, remove, contains, keys, values, reverse, etc.)
 - multi-module imports
 
 **not yet implemented in codegen** (parses and type-checks fine):
-concurrency (spawn/await), type aliases, closures (capturing lambdas).
+concurrency (spawn/await), type aliases.
 
 **error codes:** every diagnostic has a stable code — E0xx (lexer),
 E1xx (parser), E2xx (checker), E3xx (lint). see `docs/errors.md` for the
@@ -94,10 +96,18 @@ forge lint <file>         # check conventions and best practices
 forge lint --json <file>  # machine-readable lint output
 ```
 
-self-hosted compiler:
+self-hosted compiler (full build/run/test, no bootstrap needed):
 
 ```
-forge run self-host/codegen_main.fg <file>  # compile using the forge-written compiler
+self-host/forge_main build <file>           # compile to native binary
+self-host/forge_main run <file>             # compile and execute
+self-host/forge_main test <file>            # compile and run tests
+```
+
+codegen-only (outputs C to stdout):
+
+```
+forge run self-host/codegen_main.fg <file>  # emit C code using the forge-written compiler
 ```
 
 ## building
@@ -119,6 +129,7 @@ make test          # run tests
 make check         # build + forge check all examples
 make fmt           # format source
 make clean         # remove build artifacts
+make self-host     # build the self-hosted compiler CLI
 ```
 
 ## project layout
@@ -141,7 +152,8 @@ src/
   io.zig             buffered I/O helpers
 
 self-host/
-  codegen_main.fg    entry point — compiles .fg files using the forge-written compiler
+  forge_main.fg      CLI entry point — build/run/test via the self-hosted compiler
+  codegen_main.fg    codegen entry point — emits C to stdout
   lexer.fg           tokenizer (port of lexer.zig)
   parser.fg          recursive descent parser (port of parser.zig)
   ast.fg             AST node representation

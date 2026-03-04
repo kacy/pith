@@ -480,7 +480,15 @@ pub const Checker = struct {
     /// load, lex, parse, and type-check an imported module file.
     /// returns the checked module, or null on error.
     fn loadAndCheckModule(self: *Checker, path: []const u8, location: Location) ?*const ast.Module {
-        // cycle detection
+        // check if already imported (dedup) — must come before cycle detection
+        // to handle diamond imports (A imports B and C, both import D)
+        for (self.imported_modules.items) |*im| {
+            if (std.mem.eql(u8, im.path, path)) {
+                return &im.module;
+            }
+        }
+
+        // cycle detection — only triggers for genuine cycles (A → B → A)
         if (self.checking_files) |cf| {
             if (cf.get(path) != null) {
                 self.diagnostics.addCodedError(.E235, location, self.fmt(
@@ -488,14 +496,9 @@ pub const Checker = struct {
                 )) catch {};
                 return null;
             }
-            cf.put(path, {}) catch {};
-        }
-
-        // check if already imported (dedup)
-        for (self.imported_modules.items) |*im| {
-            if (std.mem.eql(u8, im.path, path)) {
-                return &im.module;
-            }
+            // store path in arena so it survives after the caller frees import_path
+            const stable_path = self.arena.allocator().dupe(u8, path) catch return null;
+            cf.put(stable_path, {}) catch {};
         }
 
         // read the file
@@ -576,7 +579,15 @@ pub const Checker = struct {
             if (!decl.is_pub) continue;
             const decl_name = getDeclName(decl) orelse continue;
             if (std.mem.eql(u8, decl_name, name)) {
-                return self.module_scope.lookup(name);
+                // functions and bindings are in module_scope
+                if (self.module_scope.lookup(name)) |binding| return binding;
+
+                // structs and enums are registered in type_table, not module_scope.
+                // synthesize a binding from the type table lookup.
+                if (self.type_table.lookup(name)) |type_id| {
+                    return Binding{ .type_id = type_id, .is_mut = false };
+                }
+                return null;
             }
         }
         return null;

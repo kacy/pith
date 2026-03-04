@@ -1,0 +1,35 @@
+# ast.fg — arena-indexed AST nodes
+#
+# stores all AST nodes in a flat list. nodes reference each other
+# by integer index, avoiding the need for pointers.
+#
+# node.kind is a string tag (e.g. "int_lit", "binary", "fn_decl").
+# node.value holds associated data (e.g. the literal value, operator name).
+# node.children holds indices of sub-nodes.
+
+pub struct Node:
+    pub kind: String
+    pub value: String
+    pub children: List[Int]
+
+# global node arena — all nodes live here
+mut nodes: List[Node] := []
+
+# add a node with children, return its index
+pub fn add_node(kind: String, value: String, children: List[Int]) -> Int:
+    nodes.push(Node(kind, value, children))
+    return nodes.len() - 1
+
+# add a leaf node (no children), return its index
+pub fn add_leaf(kind: String, value: String) -> Int:
+    mut empty: List[Int] := []
+    nodes.push(Node(kind, value, empty))
+    return nodes.len() - 1
+
+# retrieve a node by index
+pub fn get_node(idx: Int) -> Node:
+    return nodes[idx]
+
+# clear the arena for reuse
+pub fn reset_arena():
+    nodes = []

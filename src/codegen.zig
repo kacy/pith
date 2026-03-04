@@ -187,11 +187,18 @@ pub const CEmitter = struct {
         // these must come after result/optional typedefs since they return those types.
         try self.emitBuiltinHelpers();
 
-        // pass 3: forward-declare all functions
-        for (all_modules.items) |mod| {
+        // pass 3: forward-declare all functions.
+        // skip main() from imported modules — each module may have its own
+        // main() for standalone use, but only the entry module's main is emitted.
+        const imported_count = self.imported_modules.len;
+        for (all_modules.items, 0..) |mod, mod_idx| {
+            const is_imported = mod_idx < imported_count;
             for (mod.decls) |*decl| {
                 switch (decl.kind) {
-                    .fn_decl => |*fd| try self.emitFnForwardDecl(fd),
+                    .fn_decl => |*fd| {
+                        if (is_imported and std.mem.eql(u8, fd.name, "main")) continue;
+                        try self.emitFnForwardDecl(fd);
+                    },
                     else => {},
                 }
             }
@@ -218,11 +225,16 @@ pub const CEmitter = struct {
         // after all function bodies have been emitted and lambdas discovered
         const lambda_fwd_insert_pos = self.output.items.len;
 
-        // pass 4: function definitions
-        for (all_modules.items) |mod| {
+        // pass 4: function definitions.
+        // same filtering as pass 3 — skip main() from imported modules.
+        for (all_modules.items, 0..) |mod, mod_idx| {
+            const is_imported = mod_idx < imported_count;
             for (mod.decls) |*decl| {
                 switch (decl.kind) {
-                    .fn_decl => |*fd| try self.emitFnDef(fd),
+                    .fn_decl => |*fd| {
+                        if (is_imported and std.mem.eql(u8, fd.name, "main")) continue;
+                        try self.emitFnDef(fd);
+                    },
                     else => {},
                 }
             }

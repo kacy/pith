@@ -1,0 +1,27 @@
+# parse_main.fg — self-hosted parser entry point
+#
+# reads a .fg source file, tokenizes it, parses it into an AST,
+# and prints the AST in the same format as `forge parse`.
+#
+# usage: forge run self-host/parse_main.fg <file.fg>
+
+from lexer import lex_all
+from parser import parse
+from printer import print_ast
+
+fn parse_and_print() -> String!:
+    a := args()
+    if a.len() < 2:
+        print("usage: forge run self-host/parse_main.fg <file.fg>")
+        exit(1)
+
+    path := a[1]
+    content := read_file(path)!
+
+    tokens := lex_all(content)
+    root := parse(tokens)
+    print_ast(root)
+    return ""
+
+fn main():
+    parse_and_print()

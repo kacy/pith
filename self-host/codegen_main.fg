@@ -1,0 +1,31 @@
+# codegen_main.fg — self-hosted codegen entry point
+#
+# reads a .fg source file, tokenizes it, parses it into an AST,
+# runs the type checker, then generates C code.
+#
+# usage: forge run self-host/codegen_main.fg <file.fg>
+
+from lexer import lex_all
+from parser import parse
+from checker import c_run
+from codegen import g_init, g_emit_module, g_get_output
+
+fn codegen_and_print() -> String!:
+    a := args()
+    if a.len() < 2:
+        print("usage: forge run self-host/codegen_main.fg <file.fg>")
+        exit(1)
+
+    path := a[1]
+    content := read_file(path)!
+
+    tokens := lex_all(content)
+    root := parse(tokens)
+    diags := c_run(root)
+    g_init()
+    g_emit_module(root)
+    print(g_get_output())
+    return ""
+
+fn main():
+    codegen_and_print()

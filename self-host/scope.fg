@@ -1,0 +1,103 @@
+# scope.fg — lexical scope arena for the self-hosted type checker
+#
+# scopes are stored in a flat list (arena-indexed), with parent
+# links as integer indices (-1 for root). bindings are stored in
+# separate flat lists tagged with scope_id, avoiding nested structs.
+
+# ---------------------------------------------------------------
+# scope entry — a single lexical scope (no nested collections)
+# ---------------------------------------------------------------
+
+pub struct ScopeEntry:
+    pub parent: Int
+    pub return_type: Int
+    pub in_loop: Bool
+
+# ---------------------------------------------------------------
+# bindings stored flat — parallel lists tagged by scope_id
+# ---------------------------------------------------------------
+
+mut sc_entries: List[ScopeEntry] := []
+mut sc_bind_scope: List[Int] := []
+mut sc_bind_name: List[String] := []
+mut sc_bind_type: List[Int] := []
+mut sc_bind_mut: List[Bool] := []
+
+# reset the arena (for reuse between files)
+pub fn sc_reset():
+    sc_entries = []
+    sc_bind_scope = []
+    sc_bind_name = []
+    sc_bind_type = []
+    sc_bind_mut = []
+
+# create a new scope, return its index
+pub fn sc_new(parent: Int) -> Int:
+    mut ret_type := -1
+    mut in_lp := false
+    if parent >= 0:
+        p := sc_entries[parent]
+        ret_type = p.return_type
+        in_lp = p.in_loop
+    sc_entries.push(ScopeEntry(parent, ret_type, in_lp))
+    return sc_entries.len() - 1
+
+# define a binding in a scope
+pub fn sc_define(scope_id: Int, name: String, type_id: Int, is_mut: Bool):
+    sc_bind_scope.push(scope_id)
+    sc_bind_name.push(name)
+    sc_bind_type.push(type_id)
+    sc_bind_mut.push(is_mut)
+
+# look up a binding by name, walking the parent chain
+# returns the type id, or -1 if not found
+pub fn sc_lookup(scope_id: Int, name: String) -> Int:
+    # search bindings in reverse order (latest first) for this scope
+    mut i := sc_bind_scope.len() - 1
+    while i >= 0:
+        if sc_bind_scope[i] == scope_id:
+            if sc_bind_name[i] == name:
+                return sc_bind_type[i]
+        i = i - 1
+    # walk parent chain
+    entry := sc_entries[scope_id]
+    if entry.parent >= 0:
+        return sc_lookup(entry.parent, name)
+    return -1
+
+# check if a binding is mutable, walking the parent chain
+pub fn sc_is_mut(scope_id: Int, name: String) -> Bool:
+    mut i := sc_bind_scope.len() - 1
+    while i >= 0:
+        if sc_bind_scope[i] == scope_id:
+            if sc_bind_name[i] == name:
+                return sc_bind_mut[i]
+        i = i - 1
+    entry := sc_entries[scope_id]
+    if entry.parent >= 0:
+        return sc_is_mut(entry.parent, name)
+    return false
+
+# get the return type for the enclosing function (-1 if none)
+pub fn sc_return_type(scope_id: Int) -> Int:
+    return sc_entries[scope_id].return_type
+
+# check if we're inside a loop
+pub fn sc_in_loop(scope_id: Int) -> Bool:
+    return sc_entries[scope_id].in_loop
+
+# create a child scope with a specific return type
+pub fn sc_new_fn(parent: Int, return_type: Int) -> Int:
+    mut in_lp := false
+    if parent >= 0:
+        in_lp = sc_entries[parent].in_loop
+    sc_entries.push(ScopeEntry(parent, return_type, in_lp))
+    return sc_entries.len() - 1
+
+# create a child scope marked as inside a loop
+pub fn sc_new_loop(parent: Int) -> Int:
+    mut ret_type := -1
+    if parent >= 0:
+        ret_type = sc_entries[parent].return_type
+    sc_entries.push(ScopeEntry(parent, ret_type, true))
+    return sc_entries.len() - 1

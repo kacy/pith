@@ -285,7 +285,7 @@ static inline forge_list_t forge_list_create(int64_t len, int64_t elem_size, con
         list.data = NULL;
         return list;
     }
-    if (elem_size > 0 && len > (int64_t)(SIZE_MAX / (size_t)elem_size)) {
+    if (elem_size > 0 && (size_t)len > SIZE_MAX / (size_t)elem_size) {
         fprintf(stderr, "forge: list too large\n");
         exit(1);
     }
@@ -388,7 +388,7 @@ static inline void *forge_map_get_checked(void *ptr) {
 // append an element to a list. grows the backing array via realloc.
 static inline void forge_list_push(forge_list_t *list, const void *elem, int64_t elem_size) {
     int64_t new_len = list->len + 1;
-    if (elem_size > 0 && new_len > (int64_t)(SIZE_MAX / (size_t)elem_size)) {
+    if (elem_size > 0 && (size_t)new_len > SIZE_MAX / (size_t)elem_size) {
         fprintf(stderr, "forge: list too large\n");
         exit(1);
     }

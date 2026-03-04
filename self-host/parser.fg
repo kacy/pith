@@ -1214,7 +1214,19 @@ fn parse_generic_param() -> Int:
 fn parse_struct_decl() -> Int:
     p_advance()
     name_tok := expect("identifier")
-    parse_optional_generic_params()
+    generics := parse_optional_generic_params()
+
+    mut name := name_tok.value
+    if generics.len() > 0:
+        name = name + "["
+        mut first := true
+        for g in generics:
+            gnode := get_node(g)
+            if not first:
+                name = name + ", "
+            name = name + gnode.value
+            first = false
+        name = name + "]"
 
     expect("colon")
     expect("newline")
@@ -1228,7 +1240,7 @@ fn parse_struct_decl() -> Int:
         skip_newlines()
     expect("dedent")
 
-    return add_node("struct_decl", name_tok.value, fields)
+    return add_node("struct_decl", name, fields)
 
 fn parse_struct_field() -> Int:
     mut modifiers := ""
@@ -1253,7 +1265,19 @@ fn parse_struct_field() -> Int:
 fn parse_enum_decl() -> Int:
     p_advance()
     name_tok := expect("identifier")
-    parse_optional_generic_params()
+    generics := parse_optional_generic_params()
+
+    mut name := name_tok.value
+    if generics.len() > 0:
+        name = name + "["
+        mut first := true
+        for g in generics:
+            gnode := get_node(g)
+            if not first:
+                name = name + ", "
+            name = name + gnode.value
+            first = false
+        name = name + "]"
 
     expect("colon")
     expect("newline")
@@ -1267,7 +1291,7 @@ fn parse_enum_decl() -> Int:
         skip_newlines()
     expect("dedent")
 
-    return add_node("enum_decl", name_tok.value, variants)
+    return add_node("enum_decl", name, variants)
 
 fn parse_enum_variant() -> Int:
     name_tok := expect("identifier")

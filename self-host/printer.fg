@@ -34,6 +34,15 @@ fn print_line(indent: Int, text: String):
     line_buf = line_buf + text
     flush_line()
 
+fn strip_generic_params(name: String) -> String:
+    # "Pair[A, B]" -> "Pair"
+    mut i := 0
+    while i < name.len():
+        if name[i] == "[":
+            return name.substring(0, i)
+        i = i + 1
+    return name
+
 # ---------------------------------------------------------------
 # main entry point
 # ---------------------------------------------------------------
@@ -151,7 +160,7 @@ fn print_param(idx: Int, indent: Int):
 
 fn print_struct_decl(idx: Int, indent: Int):
     node := get_node(idx)
-    print_line(indent, "struct " + node.value)
+    print_line(indent, "struct " + strip_generic_params(node.value))
     for child in node.children:
         print_struct_field(child, indent + 1)
 
@@ -168,7 +177,7 @@ fn print_struct_field(idx: Int, indent: Int):
 
 fn print_enum_decl(idx: Int, indent: Int):
     node := get_node(idx)
-    print_line(indent, "enum " + node.value)
+    print_line(indent, "enum " + strip_generic_params(node.value))
     for child in node.children:
         print_enum_variant(child, indent + 1)
 

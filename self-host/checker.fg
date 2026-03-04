@@ -1,0 +1,2558 @@
+# checker.fg — semantic analysis and type checking
+#
+# two-pass approach:
+#   pass 1 (register): walk top-level declarations, record names and
+#     type signatures in the module scope.
+#   pass 2 (check): walk function bodies and top-level bindings,
+#     creating child scopes for functions and blocks.
+#
+# uses an error sentinel pattern: when a sub-expression has type
+# TID_ERR, further checks are skipped to prevent cascading noise.
+#
+# all globals use c_ prefix to avoid collisions with lexer/parser
+# globals in the flat C namespace.
+
+from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, tt_add, tt_register, tt_lookup, tt_get, tt_type_name, tt_is_numeric, tt_is_integer, tt_is_err, tt_init, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
+from scope import sc_reset, sc_new, sc_define, sc_lookup, sc_is_mut, sc_return_type, sc_in_loop, sc_new_fn, sc_new_loop
+from ast import Node, get_node, add_node, add_leaf
+
+# ---------------------------------------------------------------
+# diagnostics
+# ---------------------------------------------------------------
+
+pub struct Diagnostic:
+    pub severity: String
+    pub code: String
+    pub message: String
+    pub line: Int
+    pub col: Int
+    pub fix: String
+
+mut c_diagnostics: List[Diagnostic] := []
+
+fn c_error(code: String, message: String):
+    c_diagnostics.push(Diagnostic("error", code, message, 0, 0, ""))
+
+fn c_error_fix(code: String, message: String, fix: String):
+    c_diagnostics.push(Diagnostic("error", code, message, 0, 0, fix))
+
+fn c_warning(code: String, message: String):
+    c_diagnostics.push(Diagnostic("warning", code, message, 0, 0, ""))
+
+# ---------------------------------------------------------------
+# checker state
+# ---------------------------------------------------------------
+
+pub mut c_scope := -1
+pub mut c_method_types: Map[String, Int] := {}
+pub mut c_method_pub: Map[String, Bool] := {}
+# generic declarations: name -> node index in AST
+pub mut c_generic_decls: Map[String, Int] := {}
+# interface declarations: name -> 1 (just existence tracking)
+mut c_interface_decls: Map[String, Int] := {}
+# impl set: "Type\tInterface" -> 1
+mut c_impl_set: Map[String, Int] := {}
+# expression type cache — populated by c_check_expr, queried by codegen
+pub mut c_expr_cache: Map[Int, Int] := {}
+
+# ---------------------------------------------------------------
+# initialization
+# ---------------------------------------------------------------
+
+pub fn c_init():
+    tt_init()
+    sc_reset()
+    c_diagnostics = []
+    c_method_types = {}
+    c_method_pub = {}
+    c_generic_decls = {}
+    c_interface_decls = {}
+    c_impl_set = {}
+    c_expr_cache = {}
+    c_scope = sc_new(-1)
+    c_register_builtins()
+
+fn c_register_builtins():
+    # print(String) -> Void
+    mut print_params: List[Int] := [TID_STRING]
+    print_tid := tt_add(ti_function(print_params, TID_VOID))
+    sc_define(c_scope, "print", print_tid, false)
+
+    # pre-register List[String] for args() and String.split()
+    c_intern_collection("List", TID_STRING, -1)
+
+    # parse_int(String) -> Int!
+    int_result := tt_add(ti_result(TID_INT, TID_ERR))
+    mut pi_params: List[Int] := [TID_STRING]
+    pi_tid := tt_add(ti_function(pi_params, int_result))
+    sc_define(c_scope, "parse_int", pi_tid, false)
+
+    # parse_float(String) -> Float!
+    float_result := tt_add(ti_result(TID_FLOAT, TID_ERR))
+    mut pf_params: List[Int] := [TID_STRING]
+    pf_tid := tt_add(ti_function(pf_params, float_result))
+    sc_define(c_scope, "parse_float", pf_tid, false)
+
+    # read_file(String) -> String!
+    str_result := tt_add(ti_result(TID_STRING, TID_ERR))
+    mut rf_params: List[Int] := [TID_STRING]
+    rf_tid := tt_add(ti_function(rf_params, str_result))
+    sc_define(c_scope, "read_file", rf_tid, false)
+
+    # write_file(String, String) -> Bool!
+    bool_result := tt_add(ti_result(TID_BOOL, TID_ERR))
+    mut wf_params: List[Int] := [TID_STRING, TID_STRING]
+    wf_tid := tt_add(ti_function(wf_params, bool_result))
+    sc_define(c_scope, "write_file", wf_tid, false)
+
+    # args() -> List[String]
+    list_string := tt_lookup("List[String]")
+    mut args_params: List[Int] := []
+    args_tid := tt_add(ti_function(args_params, list_string))
+    sc_define(c_scope, "args", args_tid, false)
+
+    # env(String) -> String?
+    opt_string := tt_add(ti_optional(TID_STRING))
+    mut env_params: List[Int] := [TID_STRING]
+    env_tid := tt_add(ti_function(env_params, opt_string))
+    sc_define(c_scope, "env", env_tid, false)
+
+    # chr(Int) -> String
+    mut chr_params: List[Int] := [TID_INT]
+    chr_tid := tt_add(ti_function(chr_params, TID_STRING))
+    sc_define(c_scope, "chr", chr_tid, false)
+
+    # exit(Int) -> Void
+    mut exit_params: List[Int] := [TID_INT]
+    exit_tid := tt_add(ti_function(exit_params, TID_VOID))
+    sc_define(c_scope, "exit", exit_tid, false)
+
+    # assert(Bool) -> Void
+    mut assert_params: List[Int] := [TID_BOOL]
+    assert_tid := tt_add(ti_function(assert_params, TID_VOID))
+    sc_define(c_scope, "assert", assert_tid, false)
+
+    # assert_eq/assert_ne — placeholder (Int, Int), special-cased in checkCall
+    mut aeq_params: List[Int] := [TID_INT, TID_INT]
+    aeq_tid := tt_add(ti_function(aeq_params, TID_VOID))
+    sc_define(c_scope, "assert_eq", aeq_tid, false)
+    sc_define(c_scope, "assert_ne", aeq_tid, false)
+
+    # concurrency primitives (stub types)
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mutex_tid := tt_add(ti_struct("Mutex", empty_s, empty_i, empty_b, empty_b))
+    tt_register("Mutex", mutex_tid)
+    sc_define(c_scope, "Mutex", mutex_tid, false)
+    mut empty_s2: List[String] := []
+    mut empty_i2: List[Int] := []
+    mut empty_b2: List[Bool] := []
+    wg_tid := tt_add(ti_struct("WaitGroup", empty_s2, empty_i2, empty_b2, empty_b2))
+    tt_register("WaitGroup", wg_tid)
+    sc_define(c_scope, "WaitGroup", wg_tid, false)
+    mut sem_fields: List[String] := ["limit"]
+    mut sem_ftypes: List[Int] := [TID_INT]
+    mut sem_pub: List[Bool] := [false]
+    mut sem_mut: List[Bool] := [false]
+    sem_tid := tt_add(ti_struct("Semaphore", sem_fields, sem_ftypes, sem_pub, sem_mut))
+    tt_register("Semaphore", sem_tid)
+    sc_define(c_scope, "Semaphore", sem_tid, false)
+
+# ---------------------------------------------------------------
+# intern collection types
+# ---------------------------------------------------------------
+
+# intern a collection type, returning its type id
+# for List/Set: key_or_elem is the element type, val is -1
+# for Map: key_or_elem is the key type, val is the value type
+fn c_intern_collection(base: String, key_or_elem: Int, val: Int) -> Int:
+    name := c_build_collection_name(base, key_or_elem, val)
+    existing := tt_lookup(name)
+    if existing >= 0:
+        return existing
+    mut tid := -1
+    if base == "List":
+        tid = tt_add(ti_list(key_or_elem))
+    elif base == "Set":
+        tid = tt_add(ti_set(key_or_elem))
+    elif base == "Map":
+        tid = tt_add(ti_map(key_or_elem, val))
+    else:
+        return TID_ERR
+    tt_register(name, tid)
+    return tid
+
+fn c_build_collection_name(base: String, key_or_elem: Int, val: Int) -> String:
+    if val < 0:
+        return base + "[" + tt_type_name(key_or_elem) + "]"
+    return base + "[" + tt_type_name(key_or_elem) + "," + tt_type_name(val) + "]"
+
+# build an instantiation name like "Pair[Int,String]"
+fn c_build_inst_name(base: String, type_args: List[Int]) -> String:
+    mut result := base + "["
+    for i in type_args:
+        if result.len() > base.len() + 1:
+            result = result + ","
+        result = result + tt_type_name(i)
+    result = result + "]"
+    return result
+
+# ---------------------------------------------------------------
+# type resolution — resolve AST type expression nodes to TypeIds
+# ---------------------------------------------------------------
+
+mut c_resolve_depth := 0
+
+pub fn c_resolve_type(node_idx: Int) -> Int:
+    return c_resolve_type_with_subst(node_idx, false, "")
+
+# resolve a type expression node, with optional generic substitution
+# subst_active: if true, subst_params/subst_args provide substitution
+fn c_resolve_type_impl(node_idx: Int) -> Int:
+    if node_idx < 0:
+        return TID_ERR
+    c_resolve_depth = c_resolve_depth + 1
+    if c_resolve_depth > 128:
+        c_resolve_depth = c_resolve_depth - 1
+        c_error("E233", "type nesting too deep")
+        return TID_ERR
+    node := get_node(node_idx)
+    mut result := TID_ERR
+    if node.kind == "type":
+        result = c_resolve_named_type(node.value)
+    elif node.kind == "generic_type":
+        result = c_resolve_generic_type_node(node)
+    elif node.kind == "optional_type":
+        inner := c_resolve_type_impl(node.children[0])
+        if tt_is_err(inner):
+            result = TID_ERR
+        else:
+            result = tt_add(ti_optional(inner))
+    elif node.kind == "result_type":
+        ok := c_resolve_type_impl(node.children[0])
+        mut err_tid := TID_ERR
+        if node.children.len() > 1:
+            err_tid = c_resolve_type_impl(node.children[1])
+        result = tt_add(ti_result(ok, err_tid))
+    elif node.kind == "tuple_type":
+        mut elems: List[Int] := []
+        for child in node.children:
+            elems.push(c_resolve_type_impl(child))
+        result = tt_add(ti_tuple(elems))
+    elif node.kind == "fn_type":
+        mut params: List[Int] := []
+        mut ret := TID_VOID
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "param":
+                params.push(c_resolve_type_impl(cn.children[0]))
+            elif cn.kind == "returns":
+                ret = c_resolve_type_impl(cn.children[0])
+        result = tt_add(ti_function(params, ret))
+    c_resolve_depth = c_resolve_depth - 1
+    return result
+
+fn c_resolve_named_type(name: String) -> Int:
+    tid := tt_lookup(name)
+    if tid < 0:
+        c_error("E202", "unknown type: " + name)
+        return TID_ERR
+    return tid
+
+fn c_resolve_generic_type_node(node: Node) -> Int:
+    base := node.value
+    mut type_args: List[Int] := []
+    for child in node.children:
+        type_args.push(c_resolve_type_impl(child))
+    return c_resolve_generic_type(base, type_args)
+
+fn c_resolve_generic_type(base: String, type_args: List[Int]) -> Int:
+    # builtin generic types
+    if base == "List":
+        if type_args.len() != 1:
+            c_error("E221", "List expects 1 type argument, got " + type_args.len().to_string())
+            return TID_ERR
+        return c_intern_collection("List", type_args[0], -1)
+    if base == "Set":
+        if type_args.len() != 1:
+            c_error("E221", "Set expects 1 type argument, got " + type_args.len().to_string())
+            return TID_ERR
+        return c_intern_collection("Set", type_args[0], -1)
+    if base == "Map":
+        if type_args.len() != 2:
+            c_error("E221", "Map expects 2 type arguments, got " + type_args.len().to_string())
+            return TID_ERR
+        return c_intern_collection("Map", type_args[0], type_args[1])
+    if base == "Task":
+        if type_args.len() != 1:
+            c_error("E221", "Task expects 1 type argument, got " + type_args.len().to_string())
+            return TID_ERR
+        return tt_add(ti_task(type_args[0]))
+    if base == "Channel":
+        if type_args.len() != 1:
+            c_error("E221", "Channel expects 1 type argument, got " + type_args.len().to_string())
+            return TID_ERR
+        return tt_add(ti_channel(type_args[0]))
+    # user-defined generic types
+    if c_generic_decls.contains_key(base):
+        decl_idx := c_generic_decls[base]
+        return c_instantiate_generic(decl_idx, type_args)
+    c_error("E202", "unknown generic type: " + base)
+    return TID_ERR
+
+# resolve with substitution map (for generic instantiation)
+fn c_resolve_type_with_subst(node_idx: Int, subst_active: Bool, subst_key: String) -> Int:
+    # no substitution — use the normal path
+    return c_resolve_type_impl(node_idx)
+
+# resolve with a substitution map for generic params
+fn c_resolve_type_with_map(node_idx: Int, subst_params: List[String], subst_args: List[Int]) -> Int:
+    if node_idx < 0:
+        return TID_ERR
+    node := get_node(node_idx)
+    if node.kind == "type":
+        # check if this type name is a generic param that should be substituted
+        mut i := 0
+        for p in subst_params:
+            if p == node.value:
+                return subst_args[i]
+            i = i + 1
+        return c_resolve_named_type(node.value)
+    if node.kind == "generic_type":
+        mut type_args: List[Int] := []
+        for child in node.children:
+            type_args.push(c_resolve_type_with_map(child, subst_params, subst_args))
+        return c_resolve_generic_type(node.value, type_args)
+    if node.kind == "optional_type":
+        inner := c_resolve_type_with_map(node.children[0], subst_params, subst_args)
+        if tt_is_err(inner):
+            return TID_ERR
+        return tt_add(ti_optional(inner))
+    if node.kind == "result_type":
+        ok := c_resolve_type_with_map(node.children[0], subst_params, subst_args)
+        mut err_tid := TID_ERR
+        if node.children.len() > 1:
+            err_tid = c_resolve_type_with_map(node.children[1], subst_params, subst_args)
+        return tt_add(ti_result(ok, err_tid))
+    if node.kind == "tuple_type":
+        mut elems: List[Int] := []
+        for child in node.children:
+            elems.push(c_resolve_type_with_map(child, subst_params, subst_args))
+        return tt_add(ti_tuple(elems))
+    if node.kind == "fn_type":
+        mut params: List[Int] := []
+        mut ret := TID_VOID
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "param":
+                params.push(c_resolve_type_with_map(cn.children[0], subst_params, subst_args))
+            elif cn.kind == "returns":
+                ret = c_resolve_type_with_map(cn.children[0], subst_params, subst_args)
+        return tt_add(ti_function(params, ret))
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# pass 1 — declaration registration
+# ---------------------------------------------------------------
+
+pub fn c_register_all(root_idx: Int):
+    root := get_node(root_idx)
+    for child in root.children:
+        c_register_top_level(child)
+
+fn c_register_top_level(node_idx: Int):
+    node := get_node(node_idx)
+    if node.kind == "pub":
+        c_register_decl(node.children[0], true)
+    elif node.kind == "from_import":
+        # imports not handled in single-file mode
+        return
+    elif node.kind == "import":
+        return
+    else:
+        c_register_decl(node_idx, false)
+
+fn c_register_decl(node_idx: Int, is_pub: Bool):
+    node := get_node(node_idx)
+    if node.kind == "fn_decl":
+        c_register_fn_decl(node_idx, node)
+    elif node.kind == "struct_decl":
+        c_register_struct_decl(node_idx, node)
+    elif node.kind == "enum_decl":
+        c_register_enum_decl(node_idx, node)
+    elif node.kind == "interface_decl":
+        c_register_interface_decl(node_idx, node)
+    elif node.kind == "impl_decl":
+        c_register_impl_decl(node_idx, node)
+    elif node.kind == "type_alias":
+        c_register_type_alias(node)
+    elif node.kind == "binding":
+        # handled in pass 2
+        return
+    elif node.kind == "test_decl":
+        # no names to register
+        return
+
+# ---------------------------------------------------------------
+# pass 1 — function declarations
+# ---------------------------------------------------------------
+
+fn c_register_fn_decl(node_idx: Int, node: Node):
+    name := node.value
+    # check for generic params in name (e.g. "swap[T]")
+    if name.contains("["):
+        # store as generic decl for later instantiation
+        base := c_extract_base_name(name)
+        c_generic_decls.insert(base, node_idx)
+        return
+    # resolve function signature
+    fn_tid := c_resolve_fn_signature(node)
+    if fn_tid >= 0:
+        sc_define(c_scope, name, fn_tid, false)
+
+fn c_resolve_fn_signature(node: Node) -> Int:
+    mut params: List[Int] := []
+    mut ret := TID_VOID
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if cn.children.len() > 0:
+                ptid := c_resolve_type_impl(cn.children[0])
+                params.push(ptid)
+            else:
+                c_error("E230", "parameter requires a type annotation")
+                params.push(TID_ERR)
+        elif cn.kind == "returns":
+            ret = c_resolve_type_impl(cn.children[0])
+    return tt_add(ti_function(params, ret))
+
+# ---------------------------------------------------------------
+# pass 1 — struct declarations
+# ---------------------------------------------------------------
+
+fn c_register_struct_decl(node_idx: Int, node: Node):
+    name := node.value
+    base_name := c_extract_base_name(name)
+    # if name contains generic params (e.g., "Pair[A, B]"), store as generic
+    if name.contains("["):
+        c_generic_decls.insert(base_name, node_idx)
+        sc_define(c_scope, base_name, TID_ERR, false)
+        return
+    # non-generic: resolve field types immediately
+    mut field_names: List[String] := []
+    mut field_types: List[Int] := []
+    mut field_pub: List[Bool] := []
+    mut field_mut: List[Bool] := []
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "field":
+            fname := c_extract_field_name(cn.value)
+            is_pub := cn.value.contains(" pub")
+            is_mut := cn.value.contains(" mut")
+            field_names.push(fname)
+            if cn.children.len() > 0:
+                ftid := c_resolve_type_impl(cn.children[0])
+                field_types.push(ftid)
+            else:
+                field_types.push(TID_ERR)
+            field_pub.push(is_pub)
+            field_mut.push(is_mut)
+    tid := tt_add(ti_struct(base_name, field_names, field_types, field_pub, field_mut))
+    tt_register(base_name, tid)
+    sc_define(c_scope, base_name, tid, false)
+
+# ---------------------------------------------------------------
+# pass 1 — enum declarations
+# ---------------------------------------------------------------
+
+fn c_register_enum_decl(node_idx: Int, node: Node):
+    name := node.value
+    base_name := c_extract_base_name(name)
+    # if name contains generic params, store as generic
+    if name.contains("["):
+        c_generic_decls.insert(base_name, node_idx)
+        sc_define(c_scope, base_name, TID_ERR, false)
+        return
+    # non-generic: resolve variant types immediately
+    mut variant_names: List[String] := []
+    mut variant_types: List[List[Int]] := []
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "variant":
+            variant_names.push(cn.value)
+            mut vtypes: List[Int] := []
+            for vc in cn.children:
+                vtypes.push(c_resolve_type_impl(vc))
+            variant_types.push(vtypes)
+    tid := tt_add(ti_enum(base_name, variant_names, variant_types))
+    tt_register(base_name, tid)
+    sc_define(c_scope, base_name, tid, false)
+
+# ---------------------------------------------------------------
+# pass 1 — interface declarations
+# ---------------------------------------------------------------
+
+fn c_register_interface_decl(node_idx: Int, node: Node):
+    name := node.value
+    # register as a zero-field struct in type table (so it's resolvable)
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    tid := tt_add(ti_struct(name, empty_s, empty_i, empty_b, empty_b))
+    tt_register(name, tid)
+    c_interface_decls.insert(name, node_idx)
+
+# ---------------------------------------------------------------
+# pass 1 — impl declarations
+# ---------------------------------------------------------------
+
+fn c_register_impl_decl(node_idx: Int, node: Node):
+    # children[0] is the target type (or interface type if "impl X for Y:")
+    # optional for_type node follows
+    # then method fn_decls
+    first_type_node := get_node(node.children[0])
+    mut concrete_name := ""
+    mut interface_name := ""
+    mut method_start := 1
+
+    # check if there's a for_type node
+    if node.children.len() > 1:
+        second_node := get_node(node.children[1])
+        if second_node.kind == "for_type":
+            # impl Interface for Type:
+            interface_name = c_type_node_name(first_type_node)
+            for_inner := get_node(second_node.children[0])
+            concrete_name = c_type_node_name(for_inner)
+            method_start = 2
+            # record in impl set
+            key := concrete_name + "\t" + interface_name
+            c_impl_set.insert(key, 1)
+        else:
+            concrete_name = c_type_node_name(first_type_node)
+    else:
+        concrete_name = c_type_node_name(first_type_node)
+
+    if concrete_name == "":
+        return
+
+    # register each method (skip first method_start children)
+    mut skip := method_start
+    for child in node.children:
+        if skip > 0:
+            skip = skip - 1
+            continue
+        mut cn := get_node(child)
+        mut method_node_idx := child
+        mut method_is_pub := false
+        if cn.kind == "pub":
+            method_is_pub = true
+            method_node_idx = cn.children[0]
+            cn = get_node(method_node_idx)
+        if cn.kind == "fn_decl":
+            c_register_method(concrete_name, cn, method_is_pub)
+
+fn c_register_method(type_name: String, node: Node, is_pub: Bool):
+    method_name := node.value
+    fn_tid := c_resolve_fn_signature(node)
+    key := type_name + "." + method_name
+    c_method_types.insert(key, fn_tid)
+    c_method_pub.insert(key, is_pub)
+
+# ---------------------------------------------------------------
+# pass 1 — type alias
+# ---------------------------------------------------------------
+
+fn c_register_type_alias(node: Node):
+    name := node.value
+    if node.children.len() > 0:
+        target := c_resolve_type_impl(node.children[0])
+        tt_register(name, target)
+
+# ---------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------
+
+fn c_extract_base_name(name: String) -> String:
+    # "swap[T]" -> "swap", "Pair[A, B]" -> "Pair"
+    mut i := 0
+    while i < name.len():
+        if name[i] == "[":
+            return name.substring(0, i)
+        i = i + 1
+    return name
+
+fn c_extract_field_name(value: String) -> String:
+    # "name pub mut" -> "name"
+    mut i := 0
+    while i < value.len():
+        if value[i] == " ":
+            return value.substring(0, i)
+        i = i + 1
+    return value
+
+fn c_type_node_name(node: Node) -> String:
+    # extract the type name from a type expression node
+    if node.kind == "type":
+        return node.value
+    return ""
+
+# extract the binding name from a binding value like "x" or "x mut"
+fn c_extract_binding_name(value: String) -> String:
+    mut i := 0
+    while i < value.len():
+        if value[i] == " ":
+            return value.substring(0, i)
+        i = i + 1
+    return value
+
+fn c_binding_is_mut(value: String) -> Bool:
+    return value.contains(" mut")
+
+# ---------------------------------------------------------------
+# pass 2 — check declarations
+# ---------------------------------------------------------------
+
+pub fn c_check_all(root_idx: Int):
+    root := get_node(root_idx)
+    for child in root.children:
+        c_check_top_level(child)
+
+fn c_check_top_level(node_idx: Int):
+    node := get_node(node_idx)
+    if node.kind == "pub":
+        c_check_decl(node.children[0])
+    elif node.kind == "from_import":
+        return
+    elif node.kind == "import":
+        return
+    else:
+        c_check_decl(node_idx)
+
+fn c_check_decl(node_idx: Int):
+    node := get_node(node_idx)
+    if node.kind == "fn_decl":
+        c_check_fn_decl(node)
+    elif node.kind == "binding":
+        c_check_binding_stmt(node_idx, c_scope)
+    elif node.kind == "impl_decl":
+        c_check_impl_decl(node)
+    elif node.kind == "test_decl":
+        c_check_test_decl(node)
+
+# ---------------------------------------------------------------
+# pass 2 — function checking
+# ---------------------------------------------------------------
+
+fn c_check_fn_decl(node: Node):
+    name := node.value
+    # skip generics
+    if name.contains("["):
+        return
+    # skip main — it may not be registered if it's the entry point
+    fn_tid := sc_lookup(c_scope, name)
+    if fn_tid < 0:
+        return
+    fn_info := tt_get(fn_tid)
+    if fn_info.kind != "function":
+        return
+    # create function scope with return type
+    fn_scope := sc_new_fn(c_scope, fn_info.return_type)
+    # define parameters
+    mut param_idx := 0
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            pname := c_extract_binding_name(cn.value)
+            if param_idx < fn_info.param_types.len():
+                sc_define(fn_scope, pname, fn_info.param_types[param_idx], cn.value.contains("mut"))
+            param_idx = param_idx + 1
+        elif cn.kind == "body":
+            c_check_body(child, fn_scope)
+
+fn c_check_body(node_idx: Int, scope_id: Int):
+    node := get_node(node_idx)
+    if node.children.len() > 0:
+        block := get_node(node.children[0])
+        if block.kind == "block":
+            c_check_block(block, scope_id)
+
+fn c_check_block(node: Node, scope_id: Int):
+    for child in node.children:
+        c_check_stmt(child, scope_id)
+
+# ---------------------------------------------------------------
+# pass 2 — impl checking
+# ---------------------------------------------------------------
+
+fn c_check_impl_decl(node: Node):
+    first_type_node := get_node(node.children[0])
+    mut concrete_name := ""
+    mut method_start := 1
+
+    if node.children.len() > 1:
+        second_node := get_node(node.children[1])
+        if second_node.kind == "for_type":
+            for_inner := get_node(second_node.children[0])
+            concrete_name = c_type_node_name(for_inner)
+            method_start = 2
+        else:
+            concrete_name = c_type_node_name(first_type_node)
+    else:
+        concrete_name = c_type_node_name(first_type_node)
+
+    if concrete_name == "":
+        return
+
+    concrete_tid := tt_lookup(concrete_name)
+    if concrete_tid < 0:
+        return
+
+    # check each method body (skip first method_start children)
+    mut skip := method_start
+    for child in node.children:
+        if skip > 0:
+            skip = skip - 1
+            continue
+        mut cn := get_node(child)
+        if cn.kind == "pub":
+            cn = get_node(cn.children[0])
+        if cn.kind == "fn_decl":
+            c_check_method_body(concrete_name, concrete_tid, cn)
+
+fn c_check_method_body(type_name: String, type_tid: Int, node: Node):
+    method_name := node.value
+    key := type_name + "." + method_name
+    if c_method_types.contains_key(key) == false:
+        return
+    fn_tid := c_method_types[key]
+    fn_info := tt_get(fn_tid)
+    if fn_info.kind != "function":
+        return
+
+    method_scope := sc_new_fn(c_scope, fn_info.return_type)
+    # bind self
+    sc_define(method_scope, "self", type_tid, false)
+
+    # define parameters (skipping self — it's implicit)
+    mut param_idx := 0
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            pname := c_extract_binding_name(cn.value)
+            if param_idx < fn_info.param_types.len():
+                sc_define(method_scope, pname, fn_info.param_types[param_idx], cn.value.contains("mut"))
+            param_idx = param_idx + 1
+        elif cn.kind == "body":
+            c_check_body(child, method_scope)
+
+# ---------------------------------------------------------------
+# pass 2 — test checking
+# ---------------------------------------------------------------
+
+fn c_check_test_decl(node: Node):
+    test_scope := sc_new_fn(c_scope, TID_VOID)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "body":
+            c_check_body(child, test_scope)
+
+# ---------------------------------------------------------------
+# statement checking
+# ---------------------------------------------------------------
+
+fn c_check_stmt(node_idx: Int, scope_id: Int):
+    node := get_node(node_idx)
+    if node.kind == "binding":
+        c_check_binding_stmt(node_idx, scope_id)
+    elif node.kind == "assignment":
+        c_check_assignment(node, scope_id)
+    elif node.kind == "return":
+        c_check_return_stmt(node, scope_id)
+    elif node.kind == "fail":
+        c_check_fail_stmt(node, scope_id)
+    elif node.kind == "if_stmt":
+        c_check_if_stmt(node, scope_id)
+    elif node.kind == "while_stmt":
+        c_check_while_stmt(node, scope_id)
+    elif node.kind == "for_stmt":
+        c_check_for_stmt(node, scope_id)
+    elif node.kind == "break":
+        if sc_in_loop(scope_id) == false:
+            c_error("E215", "break outside of loop")
+    elif node.kind == "continue":
+        if sc_in_loop(scope_id) == false:
+            c_error("E215", "continue outside of loop")
+    elif node.kind == "match_expr":
+        c_check_match_expr(node_idx, scope_id)
+    else:
+        # expression statement
+        c_check_expr(node_idx, scope_id)
+
+# ---------------------------------------------------------------
+# binding statement
+# ---------------------------------------------------------------
+
+fn c_check_binding_stmt(node_idx: Int, scope_id: Int):
+    node := get_node(node_idx)
+    name := c_extract_binding_name(node.value)
+    is_mut := c_binding_is_mut(node.value)
+    # children: [type_expr?, value_expr]
+    # if 2 children -> first is type annotation, second is value
+    # if 1 child -> no annotation, child is value
+    if node.children.len() == 2:
+        # has type annotation
+        annotated := c_resolve_type_impl(node.children[0])
+        val_type := c_check_expr(node.children[1], scope_id)
+        if tt_is_err(annotated) == false:
+            if tt_is_err(val_type) == false:
+                if annotated != val_type:
+                    # special case: allow empty collections with annotations
+                    val_node := get_node(node.children[1])
+                    if val_node.kind != "list":
+                        if val_node.kind != "map":
+                            if val_node.kind != "set":
+                                c_error("E200", "type mismatch: expected " + tt_type_name(annotated) + ", got " + tt_type_name(val_type))
+        sc_define(scope_id, name, annotated, is_mut)
+    elif node.children.len() == 1:
+        val_type := c_check_expr(node.children[0], scope_id)
+        sc_define(scope_id, name, val_type, is_mut)
+
+# ---------------------------------------------------------------
+# assignment statement
+# ---------------------------------------------------------------
+
+fn c_check_assignment(node: Node, scope_id: Int):
+    # node.value is the operator: "=", "+=", "-=", "*=", "/="
+    # children[0] is target, children[1] is value
+    if node.children.len() < 2:
+        return
+    target_idx := node.children[0]
+    value_idx := node.children[1]
+    target_node := get_node(target_idx)
+    # check target mutability
+    if target_node.kind == "ident":
+        if sc_is_mut(scope_id, target_node.value) == false:
+            c_error_fix("E216", "cannot assign to immutable variable '" + target_node.value + "'", "declare with 'mut': mut " + target_node.value)
+            return
+    target_type := c_check_expr(target_idx, scope_id)
+    val_type := c_check_expr(value_idx, scope_id)
+    if tt_is_err(target_type):
+        return
+    if tt_is_err(val_type):
+        return
+    op := node.value
+    if op == "=" :
+        if target_type != val_type:
+            c_error("E200", "type mismatch: expected " + tt_type_name(target_type) + ", got " + tt_type_name(val_type))
+    else:
+        # compound assignment: +=, -=, *=, /=
+        if tt_is_numeric(target_type) == false:
+            c_error("E217", "operator " + op + " requires numeric type, got " + tt_type_name(target_type))
+        elif target_type != val_type:
+            c_error("E200", "type mismatch: expected " + tt_type_name(target_type) + ", got " + tt_type_name(val_type))
+
+# ---------------------------------------------------------------
+# return statement
+# ---------------------------------------------------------------
+
+fn c_check_return_stmt(node: Node, scope_id: Int):
+    expected := sc_return_type(scope_id)
+    if expected < 0:
+        c_error("E231", "return outside of function")
+        return
+    if node.children.len() == 0:
+        # bare return
+        if expected != TID_VOID:
+            c_error("E200", "return type mismatch: expected " + tt_type_name(expected) + ", got Void")
+        return
+    actual := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(actual):
+        return
+    if actual == expected:
+        return
+    # allow returning inner type from result-returning function
+    exp_info := tt_get(expected)
+    if exp_info.kind == "result":
+        if actual == exp_info.inner:
+            return
+    # allow returning inner type from optional-returning function
+    if exp_info.kind == "optional":
+        if actual == exp_info.inner:
+            return
+    # check structural equality (tuples)
+    if c_types_structurally_equal(actual, expected):
+        return
+    c_error_fix("E200", "return type mismatch: expected " + tt_type_name(expected) + ", got " + tt_type_name(actual), "change the return type to " + tt_type_name(actual))
+
+# ---------------------------------------------------------------
+# fail statement
+# ---------------------------------------------------------------
+
+fn c_check_fail_stmt(node: Node, scope_id: Int):
+    ret_type := sc_return_type(scope_id)
+    if ret_type < 0:
+        c_error("E231", "fail outside of function")
+        return
+    ret_info := tt_get(ret_type)
+    if ret_info.kind != "result":
+        c_error("E224", "fail requires function to return a result type")
+
+# ---------------------------------------------------------------
+# if statement
+# ---------------------------------------------------------------
+
+fn c_check_if_stmt(node: Node, scope_id: Int):
+    # children: [condition, then, elif..., else?]
+    if node.children.len() < 2:
+        return
+    # check condition
+    cond_type := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(cond_type) == false:
+        if cond_type != TID_BOOL:
+            c_error("E200", "condition must be Bool, got " + tt_type_name(cond_type))
+    # check then branch
+    then_node := get_node(node.children[1])
+    if then_node.kind == "then":
+        then_scope := sc_new(scope_id)
+        if then_node.children.len() > 0:
+            block := get_node(then_node.children[0])
+            if block.kind == "block":
+                c_check_block(block, then_scope)
+    # check elif and else branches (skip first 2: condition + then)
+    mut skip_if := 2
+    for child in node.children:
+        if skip_if > 0:
+            skip_if = skip_if - 1
+            continue
+        cn := get_node(child)
+        if cn.kind == "elif":
+            elif_scope := sc_new(scope_id)
+            if cn.children.len() > 0:
+                econd := c_check_expr(cn.children[0], elif_scope)
+                if tt_is_err(econd) == false:
+                    if econd != TID_BOOL:
+                        c_error("E200", "condition must be Bool, got " + tt_type_name(econd))
+            if cn.children.len() > 1:
+                ebody := get_node(cn.children[1])
+                if ebody.kind == "block":
+                    c_check_block(ebody, elif_scope)
+                elif ebody.kind == "then":
+                    if ebody.children.len() > 0:
+                        eblock := get_node(ebody.children[0])
+                        if eblock.kind == "block":
+                            c_check_block(eblock, elif_scope)
+        elif cn.kind == "else":
+            else_scope := sc_new(scope_id)
+            if cn.children.len() > 0:
+                eblock := get_node(cn.children[0])
+                if eblock.kind == "block":
+                    c_check_block(eblock, else_scope)
+
+# ---------------------------------------------------------------
+# while statement
+# ---------------------------------------------------------------
+
+fn c_check_while_stmt(node: Node, scope_id: Int):
+    if node.children.len() < 2:
+        return
+    cond_type := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(cond_type) == false:
+        if cond_type != TID_BOOL:
+            c_error("E200", "condition must be Bool, got " + tt_type_name(cond_type))
+    loop_scope := sc_new_loop(scope_id)
+    body_node := get_node(node.children[1])
+    if body_node.kind == "body":
+        c_check_body(node.children[1], loop_scope)
+    elif body_node.kind == "block":
+        c_check_block(body_node, loop_scope)
+
+# ---------------------------------------------------------------
+# for statement
+# ---------------------------------------------------------------
+
+fn c_check_for_stmt(node: Node, scope_id: Int):
+    # node.value: "x" or "x, i" (binding names)
+    # children[0]: iterable expression
+    # children[1]: body
+    if node.children.len() < 2:
+        return
+    iter_type := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(iter_type):
+        return
+    # infer element type from collection
+    mut elem_type := TID_ERR
+    iter_info := tt_get(iter_type)
+    if iter_type == TID_STRING:
+        elem_type = TID_STRING
+    elif iter_info.kind == "list":
+        elem_type = iter_info.inner
+    elif iter_info.kind == "map":
+        elem_type = iter_info.key_type
+    elif iter_info.kind == "set":
+        elem_type = iter_info.inner
+    else:
+        c_error("E217", "cannot iterate over " + tt_type_name(iter_type))
+        return
+    # create loop scope
+    loop_scope := sc_new_loop(scope_id)
+    # bind the loop variable
+    binding_names := node.value
+    if binding_names.contains(","):
+        # "elem, idx" — bind both
+        parts := binding_names.split(",")
+        elem_name := parts[0].trim()
+        idx_name := parts[1].trim()
+        sc_define(loop_scope, elem_name, elem_type, false)
+        sc_define(loop_scope, idx_name, TID_INT, false)
+    else:
+        sc_define(loop_scope, binding_names.trim(), elem_type, false)
+    # check body
+    body_node := get_node(node.children[1])
+    if body_node.kind == "body":
+        c_check_body(node.children[1], loop_scope)
+    elif body_node.kind == "block":
+        c_check_block(body_node, loop_scope)
+
+# ---------------------------------------------------------------
+# expression checking
+# ---------------------------------------------------------------
+
+pub fn c_check_expr(node_idx: Int, scope_id: Int) -> Int:
+    result := c_check_expr_impl(node_idx, scope_id)
+    c_expr_cache.insert(node_idx, result)
+    return result
+
+# look up cached expression type (returns TID_ERR if not found)
+pub fn c_get_expr_type(node_idx: Int) -> Int:
+    if c_expr_cache.contains_key(node_idx):
+        return c_expr_cache[node_idx]
+    return TID_ERR
+
+fn c_check_expr_impl(node_idx: Int, scope_id: Int) -> Int:
+    node := get_node(node_idx)
+    if node.kind == "int_lit":
+        return TID_INT
+    if node.kind == "float_lit":
+        return TID_FLOAT
+    if node.kind == "string_lit":
+        return TID_STRING
+    if node.kind == "bool_lit":
+        return TID_BOOL
+    if node.kind == "none_lit":
+        return TID_ERR
+    if node.kind == "ident":
+        return c_check_ident(node.value, scope_id)
+    if node.kind == "self":
+        return c_check_ident("self", scope_id)
+    if node.kind == "binary":
+        return c_check_binary(node, scope_id)
+    if node.kind == "unary":
+        return c_check_unary(node, scope_id)
+    if node.kind == "grouped":
+        if node.children.len() > 0:
+            return c_check_expr(node.children[0], scope_id)
+        return TID_ERR
+    if node.kind == "string_interp":
+        # check all interpolated expressions
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind != "lit":
+                c_check_expr(child, scope_id)
+        return TID_STRING
+    if node.kind == "if_expr":
+        return c_check_if_expr(node, scope_id)
+    if node.kind == "call":
+        return c_check_call(node, scope_id)
+    if node.kind == "method_call":
+        return c_check_method_call(node, scope_id)
+    if node.kind == "field_access":
+        return c_check_field_access(node, scope_id)
+    if node.kind == "index":
+        return c_check_index_expr(node, scope_id)
+    if node.kind == "unwrap":
+        return c_check_unwrap_expr(node, scope_id)
+    if node.kind == "try":
+        return c_check_try_expr(node, scope_id)
+    if node.kind == "match_expr":
+        return c_check_match_expr(node_idx, scope_id)
+    if node.kind == "lambda":
+        return c_check_lambda(node, scope_id)
+    if node.kind == "list":
+        return c_check_list_expr(node, scope_id)
+    if node.kind == "map":
+        return c_check_map_expr(node, scope_id)
+    if node.kind == "set":
+        return c_check_set_expr(node, scope_id)
+    if node.kind == "tuple":
+        return c_check_tuple_expr(node, scope_id)
+    if node.kind == "spawn":
+        return c_check_spawn_expr(node, scope_id)
+    if node.kind == "await":
+        return c_check_await_expr(node, scope_id)
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# identifier lookup
+# ---------------------------------------------------------------
+
+fn c_check_ident(name: String, scope_id: Int) -> Int:
+    tid := sc_lookup(scope_id, name)
+    if tid >= 0:
+        return tid
+    # check if it's a generic decl name — suppress false "undefined" errors
+    if c_generic_decls.contains_key(name):
+        return TID_ERR
+    c_error("E201", "undefined variable: " + name)
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# binary expression checking
+# ---------------------------------------------------------------
+
+fn c_check_binary(node: Node, scope_id: Int) -> Int:
+    if node.children.len() < 2:
+        return TID_ERR
+    op := node.value
+    # pipe operator: special handling
+    if op == "pipe":
+        return c_check_pipe_expr(node, scope_id)
+
+    left := c_check_expr(node.children[0], scope_id)
+    right := c_check_expr(node.children[1], scope_id)
+
+    if tt_is_err(left):
+        return TID_ERR
+    if tt_is_err(right):
+        return TID_ERR
+
+    # string concatenation
+    if op == "add":
+        if left == TID_STRING:
+            if right == TID_STRING:
+                return TID_STRING
+
+    # arithmetic operators: add, sub, mul, div, mod
+    if op == "add":
+        if tt_is_numeric(left) == false:
+            c_error("E217", "operator + requires numeric type, got " + tt_type_name(left))
+            return TID_ERR
+        if left != right:
+            c_error("E217", "operator + type mismatch: " + tt_type_name(left) + " vs " + tt_type_name(right))
+            return TID_ERR
+        return left
+    if op == "sub":
+        if tt_is_numeric(left) == false:
+            c_error("E217", "operator - requires numeric type, got " + tt_type_name(left))
+            return TID_ERR
+        if left != right:
+            c_error("E217", "operator - type mismatch: " + tt_type_name(left) + " vs " + tt_type_name(right))
+            return TID_ERR
+        return left
+    if op == "mul":
+        if tt_is_numeric(left) == false:
+            c_error("E217", "operator * requires numeric type, got " + tt_type_name(left))
+            return TID_ERR
+        if left != right:
+            c_error("E217", "operator * type mismatch: " + tt_type_name(left) + " vs " + tt_type_name(right))
+            return TID_ERR
+        return left
+    if op == "div":
+        if tt_is_numeric(left) == false:
+            c_error("E217", "operator / requires numeric type, got " + tt_type_name(left))
+            return TID_ERR
+        if left != right:
+            c_error("E217", "operator / type mismatch: " + tt_type_name(left) + " vs " + tt_type_name(right))
+            return TID_ERR
+        return left
+    if op == "mod":
+        if tt_is_integer(left) == false:
+            c_error("E217", "operator % requires integer type, got " + tt_type_name(left))
+            return TID_ERR
+        if left != right:
+            c_error("E217", "operator % type mismatch: " + tt_type_name(left) + " vs " + tt_type_name(right))
+            return TID_ERR
+        return left
+
+    # comparison operators: eq, neq
+    if op == "eq":
+        if left != right:
+            c_error("E217", "operator == type mismatch: " + tt_type_name(left) + " vs " + tt_type_name(right))
+            return TID_ERR
+        return TID_BOOL
+    if op == "neq":
+        if left != right:
+            c_error("E217", "operator != type mismatch: " + tt_type_name(left) + " vs " + tt_type_name(right))
+            return TID_ERR
+        return TID_BOOL
+
+    # ordering: lt, gt, lte, gte
+    if op == "lt":
+        if tt_is_numeric(left) == false:
+            if left != TID_STRING:
+                c_error("E217", "operator < requires numeric or string type, got " + tt_type_name(left))
+                return TID_ERR
+        if left != right:
+            c_error("E217", "operator < type mismatch: " + tt_type_name(left) + " vs " + tt_type_name(right))
+            return TID_ERR
+        return TID_BOOL
+    if op == "gt":
+        if tt_is_numeric(left) == false:
+            if left != TID_STRING:
+                c_error("E217", "operator > requires numeric or string type, got " + tt_type_name(left))
+                return TID_ERR
+        if left != right:
+            c_error("E217", "operator > type mismatch: " + tt_type_name(left) + " vs " + tt_type_name(right))
+            return TID_ERR
+        return TID_BOOL
+    if op == "lte":
+        if tt_is_numeric(left) == false:
+            if left != TID_STRING:
+                c_error("E217", "operator <= requires numeric or string type, got " + tt_type_name(left))
+                return TID_ERR
+        if left != right:
+            c_error("E217", "operator <= type mismatch: " + tt_type_name(left) + " vs " + tt_type_name(right))
+            return TID_ERR
+        return TID_BOOL
+    if op == "gte":
+        if tt_is_numeric(left) == false:
+            if left != TID_STRING:
+                c_error("E217", "operator >= requires numeric or string type, got " + tt_type_name(left))
+                return TID_ERR
+        if left != right:
+            c_error("E217", "operator >= type mismatch: " + tt_type_name(left) + " vs " + tt_type_name(right))
+            return TID_ERR
+        return TID_BOOL
+
+    # logical: and, or
+    if op == "and":
+        if left != TID_BOOL:
+            c_error("E217", "operator 'and' requires Bool, got " + tt_type_name(left))
+            return TID_ERR
+        if right != TID_BOOL:
+            c_error("E217", "operator 'and' requires Bool, got " + tt_type_name(right))
+            return TID_ERR
+        return TID_BOOL
+    if op == "or":
+        if left != TID_BOOL:
+            c_error("E217", "operator 'or' requires Bool, got " + tt_type_name(left))
+            return TID_ERR
+        if right != TID_BOOL:
+            c_error("E217", "operator 'or' requires Bool, got " + tt_type_name(right))
+            return TID_ERR
+        return TID_BOOL
+
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# pipe expression: value | fn_name
+# ---------------------------------------------------------------
+
+fn c_check_pipe_expr(node: Node, scope_id: Int) -> Int:
+    left := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(left):
+        return TID_ERR
+    rhs_node := get_node(node.children[1])
+    if rhs_node.kind != "ident":
+        c_error("E208", "pipe operator requires a function name on the right")
+        return TID_ERR
+    fn_name := rhs_node.value
+    fn_tid := sc_lookup(scope_id, fn_name)
+    if fn_tid < 0:
+        c_error("E201", "undefined function: " + fn_name)
+        return TID_ERR
+    fn_info := tt_get(fn_tid)
+    if fn_info.kind != "function":
+        c_error("E208", "'" + fn_name + "' is not a function")
+        return TID_ERR
+    if fn_info.param_types.len() != 1:
+        c_error("E207", "pipe target '" + fn_name + "' must take exactly 1 parameter")
+        return TID_ERR
+    if left != fn_info.param_types[0]:
+        c_error("E200", "pipe type mismatch: function expects " + tt_type_name(fn_info.param_types[0]) + ", got " + tt_type_name(left))
+        return TID_ERR
+    return fn_info.return_type
+
+# ---------------------------------------------------------------
+# unary expression
+# ---------------------------------------------------------------
+
+fn c_check_unary(node: Node, scope_id: Int) -> Int:
+    if node.children.len() < 1:
+        return TID_ERR
+    operand := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(operand):
+        return TID_ERR
+    op := node.value
+    if op == "neg":
+        if tt_is_numeric(operand) == false:
+            c_error("E217", "unary - requires numeric type, got " + tt_type_name(operand))
+            return TID_ERR
+        return operand
+    if op == "not":
+        if operand != TID_BOOL:
+            c_error("E217", "unary 'not' requires Bool, got " + tt_type_name(operand))
+            return TID_ERR
+        return TID_BOOL
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# call expression
+# ---------------------------------------------------------------
+
+fn c_check_call(node: Node, scope_id: Int) -> Int:
+    if node.children.len() < 1:
+        return TID_ERR
+    callee_idx := node.children[0]
+    callee_node := get_node(callee_idx)
+
+    # get argument nodes (children after callee)
+    mut arg_indices: List[Int] := []
+    mut skip_callee := 1
+    for child in node.children:
+        if skip_callee > 0:
+            skip_callee = skip_callee - 1
+            continue
+        arg_indices.push(child)
+
+    if callee_node.kind == "ident":
+        name := callee_node.value
+        # special case: assert_eq / assert_ne
+        if name == "assert_eq":
+            return c_check_assert_eq(arg_indices, scope_id)
+        if name == "assert_ne":
+            return c_check_assert_eq(arg_indices, scope_id)
+        # check if it's a struct constructor
+        struct_tid := tt_lookup(name)
+        if struct_tid >= 0:
+            info := tt_get(struct_tid)
+            if info.kind == "struct":
+                return c_check_struct_constructor(name, struct_tid, info, arg_indices, scope_id)
+            if info.kind == "enum":
+                # enum variant constructor (qualified as EnumName.Variant)
+                # — this case shouldn't happen for plain ident calls
+                return c_check_fn_call(callee_idx, arg_indices, scope_id)
+        # check if it's a generic declaration
+        if c_generic_decls.contains_key(name):
+            gdecl := get_node(c_generic_decls[name])
+            if gdecl.kind == "struct_decl":
+                return c_check_generic_struct_constructor(name, arg_indices, scope_id)
+            return c_check_generic_fn_call(name, arg_indices, scope_id)
+        # normal function call
+        return c_check_fn_call(callee_idx, arg_indices, scope_id)
+
+    # non-ident callee (e.g. lambda call)
+    return c_check_fn_call(callee_idx, arg_indices, scope_id)
+
+fn c_check_fn_call(callee_idx: Int, arg_indices: List[Int], scope_id: Int) -> Int:
+    callee_type := c_check_expr(callee_idx, scope_id)
+    if tt_is_err(callee_type):
+        return TID_ERR
+    fn_info := tt_get(callee_type)
+    if fn_info.kind != "function":
+        c_error("E208", "expression is not callable")
+        return TID_ERR
+    # check arg count
+    if arg_indices.len() != fn_info.param_types.len():
+        c_error("E207", "expected " + fn_info.param_types.len().to_string() + " arguments, got " + arg_indices.len().to_string())
+        return TID_ERR
+    # check arg types
+    mut idx := 0
+    for ai in arg_indices:
+        arg_node := get_node(ai)
+        mut arg_expr_idx := ai
+        if arg_node.kind == "arg":
+            if arg_node.children.len() > 0:
+                arg_expr_idx = arg_node.children[0]
+        arg_type := c_check_expr(arg_expr_idx, scope_id)
+        if tt_is_err(arg_type) == false:
+            if idx < fn_info.param_types.len():
+                expected := fn_info.param_types[idx]
+                if arg_type != expected:
+                    if c_types_structurally_equal(arg_type, expected) == false:
+                        c_error("E219", "argument type mismatch: expected " + tt_type_name(expected) + ", got " + tt_type_name(arg_type))
+        idx = idx + 1
+    return fn_info.return_type
+
+fn c_check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_indices: List[Int], scope_id: Int) -> Int:
+    # check field count
+    if arg_indices.len() != info.fields.len():
+        c_error("E207", name + " expects " + info.fields.len().to_string() + " fields, got " + arg_indices.len().to_string())
+        return TID_ERR
+    # check field types
+    mut idx := 0
+    for ai in arg_indices:
+        arg_node := get_node(ai)
+        mut arg_expr_idx := ai
+        if arg_node.kind == "arg":
+            if arg_node.children.len() > 0:
+                arg_expr_idx = arg_node.children[0]
+        arg_type := c_check_expr(arg_expr_idx, scope_id)
+        if tt_is_err(arg_type) == false:
+            if idx < info.field_types.len():
+                expected := info.field_types[idx]
+                if arg_type != expected:
+                    c_error("E219", "field '" + info.fields[idx] + "' type mismatch: expected " + tt_type_name(expected) + ", got " + tt_type_name(arg_type))
+        idx = idx + 1
+    return struct_tid
+
+fn c_check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_id: Int) -> Int:
+    decl_idx := c_generic_decls[name]
+    decl_node := get_node(decl_idx)
+    generic_params := c_extract_generic_params(decl_node.value)
+    # evaluate all argument types
+    mut arg_types: List[Int] := []
+    for ai in arg_indices:
+        arg_node := get_node(ai)
+        mut arg_expr := ai
+        if arg_node.kind == "arg":
+            if arg_node.children.len() > 0:
+                arg_expr = arg_node.children[0]
+        arg_types.push(c_check_expr(arg_expr, scope_id))
+    # collect field type nodes from the struct declaration
+    mut field_type_nodes: List[Int] := []
+    for child in decl_node.children:
+        cn := get_node(child)
+        if cn.kind == "field":
+            if cn.children.len() > 0:
+                field_type_nodes.push(cn.children[0])
+            else:
+                field_type_nodes.push(-1)
+    # check field count
+    if arg_types.len() != field_type_nodes.len():
+        c_error("E207", name + " expects " + field_type_nodes.len().to_string() + " fields, got " + arg_types.len().to_string())
+        return TID_ERR
+    # infer type args from argument types
+    mut subst_map: Map[String, Int] := {}
+    mut fidx := 0
+    for ftn in field_type_nodes:
+        if ftn >= 0:
+            fnode := get_node(ftn)
+            if fnode.kind == "type":
+                for gp in generic_params:
+                    if gp == fnode.value:
+                        if fidx < arg_types.len():
+                            if subst_map.contains_key(gp) == false:
+                                subst_map.insert(gp, arg_types[fidx])
+        fidx = fidx + 1
+    # build type_args list in order of generic_params
+    mut type_args: List[Int] := []
+    for gp in generic_params:
+        if subst_map.contains_key(gp):
+            type_args.push(subst_map[gp])
+        else:
+            type_args.push(TID_ERR)
+    # instantiate the struct
+    return c_instantiate_generic_struct(decl_node, type_args)
+
+fn c_check_assert_eq(arg_indices: List[Int], scope_id: Int) -> Int:
+    if arg_indices.len() != 2:
+        c_error("E207", "assert_eq expects 2 arguments, got " + arg_indices.len().to_string())
+        return TID_VOID
+    first_idx := arg_indices[0]
+    second_idx := arg_indices[1]
+    first_node := get_node(first_idx)
+    second_node := get_node(second_idx)
+    mut first_expr := first_idx
+    mut second_expr := second_idx
+    if first_node.kind == "arg":
+        if first_node.children.len() > 0:
+            first_expr = first_node.children[0]
+    if second_node.kind == "arg":
+        if second_node.children.len() > 0:
+            second_expr = second_node.children[0]
+    t1 := c_check_expr(first_expr, scope_id)
+    t2 := c_check_expr(second_expr, scope_id)
+    if tt_is_err(t1) == false:
+        if tt_is_err(t2) == false:
+            if t1 != t2:
+                c_error("E219", "assert_eq arguments must be the same type: " + tt_type_name(t1) + " vs " + tt_type_name(t2))
+    return TID_VOID
+
+# ---------------------------------------------------------------
+# generic function call
+# ---------------------------------------------------------------
+
+fn c_check_generic_fn_call(name: String, arg_indices: List[Int], scope_id: Int) -> Int:
+    decl_idx := c_generic_decls[name]
+    decl_node := get_node(decl_idx)
+    # extract generic params from the name: "swap[T]" -> ["T"]
+    generic_params := c_extract_generic_params(decl_node.value)
+    # evaluate all argument types
+    mut arg_types: List[Int] := []
+    for ai in arg_indices:
+        arg_node := get_node(ai)
+        mut arg_expr := ai
+        if arg_node.kind == "arg":
+            if arg_node.children.len() > 0:
+                arg_expr = arg_node.children[0]
+        arg_types.push(c_check_expr(arg_expr, scope_id))
+    # collect param type nodes from the declaration
+    mut param_type_nodes: List[Int] := []
+    for child in decl_node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if cn.children.len() > 0:
+                param_type_nodes.push(cn.children[0])
+            else:
+                param_type_nodes.push(-1)
+    # check arg count
+    if arg_types.len() != param_type_nodes.len():
+        c_error("E207", "expected " + param_type_nodes.len().to_string() + " arguments, got " + arg_types.len().to_string())
+        return TID_ERR
+    # infer type args from argument types using a map
+    mut subst_map: Map[String, Int] := {}
+    mut pidx := 0
+    for ptn in param_type_nodes:
+        if ptn >= 0:
+            pnode := get_node(ptn)
+            if pnode.kind == "type":
+                # check if this is a generic param name
+                for gp in generic_params:
+                    if gp == pnode.value:
+                        if pidx < arg_types.len():
+                            if subst_map.contains_key(gp) == false:
+                                subst_map.insert(gp, arg_types[pidx])
+        pidx = pidx + 1
+    # verify all generic params were inferred, build subst_args list
+    mut subst_args: List[Int] := []
+    mut all_inferred := true
+    for gp in generic_params:
+        if subst_map.contains_key(gp):
+            subst_args.push(subst_map[gp])
+        else:
+            all_inferred = false
+            c_error("E222", "cannot infer type parameter " + gp)
+            subst_args.push(TID_ERR)
+    if all_inferred == false:
+        return TID_ERR
+    # resolve return type with substitution
+    mut ret_type := TID_VOID
+    for child in decl_node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            ret_type = c_resolve_type_with_map(cn.children[0], generic_params, subst_args)
+    # validate arg types against concrete param types
+    mut vidx := 0
+    for ptn in param_type_nodes:
+        if ptn >= 0:
+            if vidx < arg_types.len():
+                concrete := c_resolve_type_with_map(ptn, generic_params, subst_args)
+                if tt_is_err(concrete) == false:
+                    if tt_is_err(arg_types[vidx]) == false:
+                        if arg_types[vidx] != concrete:
+                            if c_types_structurally_equal(arg_types[vidx], concrete) == false:
+                                c_error("E219", "argument type mismatch: expected " + tt_type_name(concrete) + ", got " + tt_type_name(arg_types[vidx]))
+        vidx = vidx + 1
+    return ret_type
+
+fn c_extract_generic_params(name: String) -> List[String]:
+    # "swap[T]" -> ["T"], "merge[K, V]" -> ["K", "V"]
+    mut params: List[String] := []
+    # find the bracket content
+    mut bracket_start := -1
+    mut i := 0
+    while i < name.len():
+        if name[i] == "[":
+            bracket_start = i + 1
+        i = i + 1
+    if bracket_start < 0:
+        return params
+    # extract content between brackets, removing trailing "]"
+    content := name.substring(bracket_start, name.len() - 1)
+    parts := content.split(",")
+    for p in parts:
+        trimmed := p.trim()
+        if trimmed.len() > 0:
+            params.push(trimmed)
+    return params
+
+# ---------------------------------------------------------------
+# method call
+# ---------------------------------------------------------------
+
+fn c_check_method_call(node: Node, scope_id: Int) -> Int:
+    # node.value = method name
+    # children[0] = receiver
+    # children[1..] = arguments
+    if node.children.len() < 1:
+        return TID_ERR
+    method_name := node.value
+    receiver_type := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(receiver_type):
+        return TID_ERR
+
+    # get argument nodes (skip receiver)
+    mut arg_indices: List[Int] := []
+    mut skip_recv := 1
+    for child in node.children:
+        if skip_recv > 0:
+            skip_recv = skip_recv - 1
+            continue
+        arg_indices.push(child)
+
+    # string methods
+    if receiver_type == TID_STRING:
+        return c_check_string_method(method_name, arg_indices, scope_id)
+    # primitive methods
+    if receiver_type == TID_INT:
+        return c_check_int_method(method_name, arg_indices, scope_id)
+    if receiver_type == TID_FLOAT:
+        return c_check_float_method(method_name, arg_indices, scope_id)
+    if receiver_type == TID_BOOL:
+        return c_check_bool_method(method_name, arg_indices, scope_id)
+
+    # collection methods
+    recv_info := tt_get(receiver_type)
+    if recv_info.kind == "list":
+        result := c_check_list_method(method_name, recv_info, arg_indices, scope_id)
+        if result >= 0:
+            return result
+    if recv_info.kind == "map":
+        result := c_check_map_method(method_name, recv_info, arg_indices, scope_id)
+        if result >= 0:
+            return result
+    if recv_info.kind == "set":
+        result := c_check_set_method(method_name, recv_info, arg_indices, scope_id)
+        if result >= 0:
+            return result
+
+    # user-defined methods
+    type_name := tt_type_name(receiver_type)
+    key := type_name + "." + method_name
+    if c_method_types.contains_key(key):
+        fn_tid := c_method_types[key]
+        fn_info := tt_get(fn_tid)
+        if fn_info.kind == "function":
+            # check arg count
+            if arg_indices.len() != fn_info.param_types.len():
+                c_error("E207", method_name + " expects " + fn_info.param_types.len().to_string() + " arguments, got " + arg_indices.len().to_string())
+                return TID_ERR
+            # check arg types
+            mut aidx := 0
+            for ai in arg_indices:
+                arg_node := get_node(ai)
+                mut arg_expr := ai
+                if arg_node.kind == "arg":
+                    if arg_node.children.len() > 0:
+                        arg_expr = arg_node.children[0]
+                atype := c_check_expr(arg_expr, scope_id)
+                if tt_is_err(atype) == false:
+                    if aidx < fn_info.param_types.len():
+                        if atype != fn_info.param_types[aidx]:
+                            if c_types_structurally_equal(atype, fn_info.param_types[aidx]) == false:
+                                c_error("E219", "argument type mismatch: expected " + tt_type_name(fn_info.param_types[aidx]) + ", got " + tt_type_name(atype))
+                aidx = aidx + 1
+            return fn_info.return_type
+    c_error("E209", tt_type_name(receiver_type) + " has no method '" + method_name + "'")
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# string methods
+# ---------------------------------------------------------------
+
+fn c_check_string_method(method: String, args: List[Int], scope_id: Int) -> Int:
+    if method == "len":
+        c_expect_no_args(method, args)
+        return TID_INT
+    if method == "trim":
+        c_expect_no_args(method, args)
+        return TID_STRING
+    if method == "to_upper":
+        c_expect_no_args(method, args)
+        return TID_STRING
+    if method == "to_lower":
+        c_expect_no_args(method, args)
+        return TID_STRING
+    if method == "contains":
+        c_expect_one_string_arg(method, args, scope_id)
+        return TID_BOOL
+    if method == "starts_with":
+        c_expect_one_string_arg(method, args, scope_id)
+        return TID_BOOL
+    if method == "ends_with":
+        c_expect_one_string_arg(method, args, scope_id)
+        return TID_BOOL
+    if method == "split":
+        c_expect_one_string_arg(method, args, scope_id)
+        return c_intern_collection("List", TID_STRING, -1)
+    if method == "substring":
+        c_expect_two_int_args(method, args, scope_id)
+        return TID_STRING
+    if method == "replace":
+        c_expect_two_string_args(method, args, scope_id)
+        return TID_STRING
+    c_error("E209", "String has no method '" + method + "'")
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# primitive methods
+# ---------------------------------------------------------------
+
+fn c_check_int_method(method: String, args: List[Int], scope_id: Int) -> Int:
+    if method == "to_string":
+        c_expect_no_args(method, args)
+        return TID_STRING
+    if method == "to_float":
+        c_expect_no_args(method, args)
+        return TID_FLOAT
+    c_error("E209", "Int has no method '" + method + "'")
+    return TID_ERR
+
+fn c_check_float_method(method: String, args: List[Int], scope_id: Int) -> Int:
+    if method == "to_string":
+        c_expect_no_args(method, args)
+        return TID_STRING
+    if method == "to_int":
+        c_expect_no_args(method, args)
+        return TID_INT
+    c_error("E209", "Float has no method '" + method + "'")
+    return TID_ERR
+
+fn c_check_bool_method(method: String, args: List[Int], scope_id: Int) -> Int:
+    if method == "to_string":
+        c_expect_no_args(method, args)
+        return TID_STRING
+    c_error("E209", "Bool has no method '" + method + "'")
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# list methods
+# ---------------------------------------------------------------
+
+fn c_check_list_method(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
+    elem := info.inner
+    if method == "push":
+        c_expect_one_typed_arg(method, args, elem, scope_id)
+        return TID_VOID
+    if method == "len":
+        c_expect_no_args(method, args)
+        return TID_INT
+    if method == "is_empty":
+        c_expect_no_args(method, args)
+        return TID_BOOL
+    if method == "clear":
+        c_expect_no_args(method, args)
+        return TID_VOID
+    if method == "reverse":
+        c_expect_no_args(method, args)
+        return TID_VOID
+    if method == "remove":
+        c_expect_one_typed_arg(method, args, TID_INT, scope_id)
+        return TID_VOID
+    if method == "contains":
+        c_expect_one_typed_arg(method, args, elem, scope_id)
+        return TID_BOOL
+    if method == "join":
+        c_expect_one_typed_arg(method, args, TID_STRING, scope_id)
+        return TID_STRING
+    # not a built-in list method
+    return -1
+
+# ---------------------------------------------------------------
+# map methods
+# ---------------------------------------------------------------
+
+fn c_check_map_method(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
+    key_t := info.key_type
+    val_t := info.value_type
+    if method == "insert":
+        if args.len() != 2:
+            c_error("E207", "insert expects 2 arguments, got " + args.len().to_string())
+            return TID_VOID
+        # check key type
+        c_check_arg_type(args[0], key_t, scope_id)
+        c_check_arg_type(args[1], val_t, scope_id)
+        return TID_VOID
+    if method == "len":
+        c_expect_no_args(method, args)
+        return TID_INT
+    if method == "is_empty":
+        c_expect_no_args(method, args)
+        return TID_BOOL
+    if method == "clear":
+        c_expect_no_args(method, args)
+        return TID_VOID
+    if method == "contains_key":
+        c_expect_one_typed_arg(method, args, key_t, scope_id)
+        return TID_BOOL
+    if method == "remove":
+        c_expect_one_typed_arg(method, args, key_t, scope_id)
+        return TID_VOID
+    if method == "keys":
+        c_expect_no_args(method, args)
+        return c_intern_collection("List", key_t, -1)
+    if method == "values":
+        c_expect_no_args(method, args)
+        return c_intern_collection("List", val_t, -1)
+    return -1
+
+# ---------------------------------------------------------------
+# set methods
+# ---------------------------------------------------------------
+
+fn c_check_set_method(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
+    elem := info.inner
+    if method == "add":
+        c_expect_one_typed_arg(method, args, elem, scope_id)
+        return TID_VOID
+    if method == "len":
+        c_expect_no_args(method, args)
+        return TID_INT
+    if method == "is_empty":
+        c_expect_no_args(method, args)
+        return TID_BOOL
+    if method == "clear":
+        c_expect_no_args(method, args)
+        return TID_VOID
+    if method == "contains":
+        c_expect_one_typed_arg(method, args, elem, scope_id)
+        return TID_BOOL
+    if method == "remove":
+        c_expect_one_typed_arg(method, args, elem, scope_id)
+        return TID_VOID
+    return -1
+
+# ---------------------------------------------------------------
+# method arg validators
+# ---------------------------------------------------------------
+
+fn c_expect_no_args(method: String, args: List[Int]):
+    if args.len() != 0:
+        c_error("E207", method + " takes no arguments, got " + args.len().to_string())
+
+fn c_expect_one_string_arg(method: String, args: List[Int], scope_id: Int):
+    if args.len() != 1:
+        c_error("E207", method + " expects 1 argument, got " + args.len().to_string())
+        return
+    c_check_arg_type(args[0], TID_STRING, scope_id)
+
+fn c_expect_two_string_args(method: String, args: List[Int], scope_id: Int):
+    if args.len() != 2:
+        c_error("E207", method + " expects 2 arguments, got " + args.len().to_string())
+        return
+    c_check_arg_type(args[0], TID_STRING, scope_id)
+    c_check_arg_type(args[1], TID_STRING, scope_id)
+
+fn c_expect_two_int_args(method: String, args: List[Int], scope_id: Int):
+    if args.len() != 2:
+        c_error("E207", method + " expects 2 arguments, got " + args.len().to_string())
+        return
+    c_check_arg_type(args[0], TID_INT, scope_id)
+    c_check_arg_type(args[1], TID_INT, scope_id)
+
+fn c_expect_one_typed_arg(method: String, args: List[Int], expected: Int, scope_id: Int):
+    if args.len() != 1:
+        c_error("E207", method + " expects 1 argument, got " + args.len().to_string())
+        return
+    c_check_arg_type(args[0], expected, scope_id)
+
+fn c_check_arg_type(arg_idx: Int, expected: Int, scope_id: Int):
+    arg_node := get_node(arg_idx)
+    mut expr_idx := arg_idx
+    if arg_node.kind == "arg":
+        if arg_node.children.len() > 0:
+            expr_idx = arg_node.children[0]
+    actual := c_check_expr(expr_idx, scope_id)
+    if tt_is_err(actual) == false:
+        if actual != expected:
+            if c_types_structurally_equal(actual, expected) == false:
+                c_error("E219", "argument type mismatch: expected " + tt_type_name(expected) + ", got " + tt_type_name(actual))
+
+# ---------------------------------------------------------------
+# field access
+# ---------------------------------------------------------------
+
+fn c_check_field_access(node: Node, scope_id: Int) -> Int:
+    if node.children.len() < 1:
+        return TID_ERR
+    obj_type := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(obj_type):
+        return TID_ERR
+    field_name := node.value
+    obj_info := tt_get(obj_type)
+    if obj_info.kind == "struct":
+        # linear search through fields
+        mut fidx := 0
+        for f in obj_info.fields:
+            if f == field_name:
+                return obj_info.field_types[fidx]
+            fidx = fidx + 1
+        c_error("E209", tt_type_name(obj_type) + " has no field '" + field_name + "'")
+        return TID_ERR
+    if obj_info.kind == "tuple":
+        # parse field name as integer index
+        idx := c_parse_int(field_name)
+        if idx < 0:
+            c_error("E209", "tuple field must be a numeric index")
+            return TID_ERR
+        if idx >= obj_info.elements.len():
+            c_error("E209", "tuple index " + field_name + " out of bounds (tuple has " + obj_info.elements.len().to_string() + " elements)")
+            return TID_ERR
+        return obj_info.elements[idx]
+    # enum variant access (e.g. Shape.Circle) — for match patterns
+    if obj_info.kind == "enum":
+        # this is typically used in patterns, not field access
+        # but allow it for enum variant references
+        return obj_type
+    c_error("E209", tt_type_name(obj_type) + " has no field '" + field_name + "'")
+    return TID_ERR
+
+fn c_parse_int(s: String) -> Int:
+    # simple integer parser for tuple field indices
+    if s.len() == 0:
+        return -1
+    mut result := 0
+    mut i := 0
+    while i < s.len():
+        ch := s[i]
+        if ch == "0":
+            result = result * 10
+        elif ch == "1":
+            result = result * 10 + 1
+        elif ch == "2":
+            result = result * 10 + 2
+        elif ch == "3":
+            result = result * 10 + 3
+        elif ch == "4":
+            result = result * 10 + 4
+        elif ch == "5":
+            result = result * 10 + 5
+        elif ch == "6":
+            result = result * 10 + 6
+        elif ch == "7":
+            result = result * 10 + 7
+        elif ch == "8":
+            result = result * 10 + 8
+        elif ch == "9":
+            result = result * 10 + 9
+        else:
+            return -1
+        i = i + 1
+    return result
+
+# ---------------------------------------------------------------
+# index expression
+# ---------------------------------------------------------------
+
+fn c_check_index_expr(node: Node, scope_id: Int) -> Int:
+    if node.children.len() < 2:
+        return TID_ERR
+    obj_type := c_check_expr(node.children[0], scope_id)
+    idx_type := c_check_expr(node.children[1], scope_id)
+    if tt_is_err(obj_type):
+        return TID_ERR
+    if tt_is_err(idx_type):
+        return TID_ERR
+    # string indexing
+    if obj_type == TID_STRING:
+        if tt_is_integer(idx_type) == false:
+            c_error("E217", "string index must be integer, got " + tt_type_name(idx_type))
+            return TID_ERR
+        return TID_STRING
+    obj_info := tt_get(obj_type)
+    if obj_info.kind == "list":
+        if tt_is_integer(idx_type) == false:
+            c_error("E217", "list index must be integer, got " + tt_type_name(idx_type))
+            return TID_ERR
+        return obj_info.inner
+    if obj_info.kind == "map":
+        if idx_type != obj_info.key_type:
+            c_error("E217", "map key type mismatch: expected " + tt_type_name(obj_info.key_type) + ", got " + tt_type_name(idx_type))
+            return TID_ERR
+        return obj_info.value_type
+    c_error("E217", tt_type_name(obj_type) + " does not support indexing")
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# unwrap expression (value!)
+# ---------------------------------------------------------------
+
+fn c_check_unwrap_expr(node: Node, scope_id: Int) -> Int:
+    if node.children.len() < 1:
+        return TID_ERR
+    inner := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(inner):
+        return TID_ERR
+    info := tt_get(inner)
+    if info.kind == "optional":
+        return info.inner
+    c_error_fix("E224", "unwrap requires an optional type, got " + tt_type_name(inner), "use ? for error propagation on Result types")
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# try expression (value?)
+# ---------------------------------------------------------------
+
+fn c_check_try_expr(node: Node, scope_id: Int) -> Int:
+    if node.children.len() < 1:
+        return TID_ERR
+    inner := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(inner):
+        return TID_ERR
+    info := tt_get(inner)
+    if info.kind == "result":
+        # verify enclosing function also returns a result
+        ret := sc_return_type(scope_id)
+        if ret >= 0:
+            ret_info := tt_get(ret)
+            if ret_info.kind != "result":
+                c_error("E224", "try (?) can only be used in functions that return a result type")
+        return info.inner
+    c_error_fix("E224", "try requires a result type, got " + tt_type_name(inner), "use ! for unwrapping optional types")
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# if expression
+# ---------------------------------------------------------------
+
+fn c_check_if_expr(node: Node, scope_id: Int) -> Int:
+    # children: [condition, then_expr, elif_branches..., else_expr]
+    if node.children.len() < 2:
+        return TID_ERR
+    cond := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(cond) == false:
+        if cond != TID_BOOL:
+            c_error("E200", "condition must be Bool, got " + tt_type_name(cond))
+    # check then branch
+    then_type := c_check_expr(node.children[1], scope_id)
+    mut result_type := then_type
+    # check remaining branches (skip first 2: condition + then)
+    mut skip_br := 2
+    for child in node.children:
+        if skip_br > 0:
+            skip_br = skip_br - 1
+            continue
+        cn := get_node(child)
+        if cn.kind == "elif_branch":
+            if cn.children.len() >= 2:
+                econd := c_check_expr(cn.children[0], scope_id)
+                if tt_is_err(econd) == false:
+                    if econd != TID_BOOL:
+                        c_error("E200", "condition must be Bool, got " + tt_type_name(econd))
+                etype := c_check_expr(cn.children[1], scope_id)
+                if tt_is_err(result_type):
+                    result_type = etype
+                elif tt_is_err(etype) == false:
+                    if etype != result_type:
+                        c_error("E225", "if expression branches have different types: " + tt_type_name(result_type) + " vs " + tt_type_name(etype))
+        else:
+            # else branch
+            etype := c_check_expr(child, scope_id)
+            if tt_is_err(result_type):
+                result_type = etype
+            elif tt_is_err(etype) == false:
+                if etype != result_type:
+                    c_error("E225", "if expression branches have different types: " + tt_type_name(result_type) + " vs " + tt_type_name(etype))
+    return result_type
+
+# ---------------------------------------------------------------
+# match expression
+# ---------------------------------------------------------------
+
+fn c_check_match_expr(node_idx: Int, scope_id: Int) -> Int:
+    node := get_node(node_idx)
+    # children[0] is the subject expression
+    # children[1..] are arm nodes
+    if node.children.len() < 2:
+        return TID_ERR
+    subject_type := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(subject_type):
+        return TID_ERR
+    mut result_type := TID_ERR
+    mut arm_values: List[String] := []
+    mut skip_subj := 1
+    for child in node.children:
+        if skip_subj > 0:
+            skip_subj = skip_subj - 1
+            continue
+        arm_node := get_node(child)
+        if arm_node.kind == "arm":
+            arm_type := c_check_match_arm(arm_node, subject_type, scope_id)
+            # collect pattern values for exhaustiveness
+            if arm_node.children.len() > 0:
+                pat := get_node(arm_node.children[0])
+                pv := c_collect_arm_pattern(pat)
+                if pv.len() > 0:
+                    arm_values.push(pv)
+            if tt_is_err(result_type):
+                result_type = arm_type
+            elif tt_is_err(arm_type) == false:
+                if arm_type != result_type:
+                    if arm_type != TID_VOID:
+                        if result_type != TID_VOID:
+                            c_error("E225", "match arms have different types: " + tt_type_name(result_type) + " vs " + tt_type_name(arm_type))
+    # exhaustiveness checking
+    c_check_exhaustiveness(subject_type, arm_values, node_idx)
+    return result_type
+
+fn c_check_match_arm(arm: Node, subject_type: Int, scope_id: Int) -> Int:
+    # children: [pattern, guard?, body]
+    if arm.children.len() < 2:
+        return TID_ERR
+    arm_scope := sc_new(scope_id)
+    # check pattern
+    c_check_pattern(arm.children[0], subject_type, arm_scope)
+    # find body (may have guard between pattern and body)
+    mut body_idx := 1
+    if arm.children.len() > 2:
+        guard_node := get_node(arm.children[1])
+        if guard_node.kind == "guard":
+            if guard_node.children.len() > 0:
+                guard_type := c_check_expr(guard_node.children[0], arm_scope)
+                if tt_is_err(guard_type) == false:
+                    if guard_type != TID_BOOL:
+                        c_error("E218", "match guard must be Bool, got " + tt_type_name(guard_type))
+            body_idx = 2
+    if body_idx >= arm.children.len():
+        return TID_VOID
+    body_node := get_node(arm.children[body_idx])
+    if body_node.kind == "body":
+        c_check_body(arm.children[body_idx], arm_scope)
+        return TID_VOID
+    if body_node.kind == "block":
+        c_check_block(body_node, arm_scope)
+        return TID_VOID
+    # expression arm
+    return c_check_expr(arm.children[body_idx], arm_scope)
+
+# ---------------------------------------------------------------
+# pattern checking
+# ---------------------------------------------------------------
+
+fn c_check_pattern(pat_idx: Int, expected_type: Int, scope_id: Int):
+    pat := get_node(pat_idx)
+    if pat.kind == "pat_wildcard":
+        return
+    if pat.kind == "pat_binding":
+        sc_define(scope_id, pat.value, expected_type, false)
+        return
+    if pat.kind == "pat_int":
+        if tt_is_integer(expected_type) == false:
+            c_error("E228", "integer pattern cannot match " + tt_type_name(expected_type))
+        return
+    if pat.kind == "pat_float":
+        if expected_type != TID_FLOAT:
+            c_error("E228", "float pattern cannot match " + tt_type_name(expected_type))
+        return
+    if pat.kind == "pat_string":
+        if expected_type != TID_STRING:
+            c_error("E228", "string pattern cannot match " + tt_type_name(expected_type))
+        return
+    if pat.kind == "pat_bool":
+        if expected_type != TID_BOOL:
+            c_error("E228", "bool pattern cannot match " + tt_type_name(expected_type))
+        return
+    if pat.kind == "pat_none":
+        return
+    if pat.kind == "pat_variant":
+        c_check_variant_pattern(pat, expected_type, scope_id)
+        return
+    if pat.kind == "pat_tuple":
+        c_check_tuple_pattern(pat, expected_type, scope_id)
+        return
+
+fn c_check_variant_pattern(pat: Node, expected_type: Int, scope_id: Int):
+    # value: "EnumName.VariantName"
+    # children: sub-patterns for variant fields
+    parts := pat.value.split(".")
+    if parts.len() < 2:
+        return
+    type_name := parts[0]
+    variant_name := parts[1]
+    enum_tid := tt_lookup(type_name)
+    if enum_tid < 0:
+        c_error("E202", "unknown type: " + type_name)
+        return
+    if enum_tid != expected_type:
+        c_error("E228", "variant pattern type " + type_name + " does not match expected type " + tt_type_name(expected_type))
+        return
+    enum_info := tt_get(enum_tid)
+    if enum_info.kind != "enum":
+        c_error("E228", type_name + " is not an enum")
+        return
+    # find the variant
+    mut found := false
+    mut vidx := 0
+    for v in enum_info.variants:
+        if v == variant_name:
+            found = true
+            # check sub-pattern count
+            if vidx < enum_info.variant_types.len():
+                variant_fields := enum_info.variant_types[vidx]
+                if pat.children.len() != variant_fields.len():
+                    c_error("E213", variant_name + " has " + variant_fields.len().to_string() + " fields, but pattern has " + pat.children.len().to_string())
+                    return
+                # check each sub-pattern
+                mut fidx := 0
+                for sub_pat in pat.children:
+                    if fidx < variant_fields.len():
+                        c_check_pattern(sub_pat, variant_fields[fidx], scope_id)
+                    fidx = fidx + 1
+        vidx = vidx + 1
+    if found == false:
+        c_error("E212", type_name + " has no variant '" + variant_name + "'")
+
+fn c_check_tuple_pattern(pat: Node, expected_type: Int, scope_id: Int):
+    info := tt_get(expected_type)
+    if info.kind != "tuple":
+        c_error("E228", "tuple pattern cannot match " + tt_type_name(expected_type))
+        return
+    if pat.children.len() != info.elements.len():
+        c_error("E213", "tuple pattern has " + pat.children.len().to_string() + " elements, expected " + info.elements.len().to_string())
+        return
+    mut i := 0
+    for sub_pat in pat.children:
+        if i < info.elements.len():
+            c_check_pattern(sub_pat, info.elements[i], scope_id)
+        i = i + 1
+
+# ---------------------------------------------------------------
+# exhaustiveness checking
+# ---------------------------------------------------------------
+
+fn c_collect_arm_pattern(pat: Node) -> String:
+    if pat.kind == "pat_wildcard":
+        return "_"
+    if pat.kind == "pat_binding":
+        return "_"
+    if pat.kind == "pat_bool":
+        return pat.value
+    if pat.kind == "pat_variant":
+        # extract variant name from "EnumName.VariantName"
+        parts := pat.value.split(".")
+        if parts.len() >= 2:
+            return parts[1]
+        return pat.value
+    if pat.kind == "pat_int":
+        return pat.value
+    if pat.kind == "pat_string":
+        return pat.value
+    return ""
+
+fn c_check_exhaustiveness(subject_type: Int, arm_values: List[String], node_idx: Int):
+    # if any wildcard or binding pattern, it's exhaustive
+    for v in arm_values:
+        if v == "_":
+            return
+    # check by type
+    if subject_type == TID_BOOL:
+        c_check_bool_exhaustiveness(arm_values)
+        return
+    subj_info := tt_get(subject_type)
+    if subj_info.kind == "enum":
+        c_check_enum_exhaustiveness(subj_info, arm_values)
+        return
+    # infinite domain (Int, String, Float) — need wildcard
+    c_error("E204", "non-exhaustive match: add a wildcard (_) pattern")
+
+fn c_check_bool_exhaustiveness(arm_values: List[String]):
+    mut has_true := false
+    mut has_false := false
+    for v in arm_values:
+        if v == "true":
+            has_true = true
+        if v == "false":
+            has_false = true
+    if has_true == false:
+        c_error("E204", "non-exhaustive match: missing 'true' case")
+    if has_false == false:
+        c_error("E204", "non-exhaustive match: missing 'false' case")
+
+fn c_check_enum_exhaustiveness(info: TypeInfo, arm_values: List[String]):
+    mut missing: List[String] := []
+    for variant in info.variants:
+        mut found := false
+        for v in arm_values:
+            if v == variant:
+                found = true
+        if found == false:
+            missing.push(variant)
+    if missing.len() > 0:
+        c_error("E204", "non-exhaustive match: missing variants: " + missing.join(", "))
+
+# ---------------------------------------------------------------
+# lambda expression
+# ---------------------------------------------------------------
+
+fn c_check_lambda(node: Node, scope_id: Int) -> Int:
+    # children: params..., body (last child is the expression body or body node)
+    mut params: List[Int] := []
+    lambda_scope := sc_new(scope_id)
+    mut body_idx := -1
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if cn.children.len() > 0:
+                ptid := c_resolve_type_impl(cn.children[0])
+                params.push(ptid)
+                pname := c_extract_binding_name(cn.value)
+                sc_define(lambda_scope, pname, ptid, false)
+            else:
+                c_error("E230", "lambda parameter requires a type annotation")
+                params.push(TID_ERR)
+        else:
+            body_idx = child
+    # check body
+    mut ret_type := TID_VOID
+    if body_idx >= 0:
+        body_node := get_node(body_idx)
+        if body_node.kind == "body":
+            # short-form lambda: body wraps a single expression
+            if body_node.children.len() > 0:
+                ret_type = c_check_expr(body_node.children[0], lambda_scope)
+        elif body_node.kind == "block":
+            c_check_block(body_node, lambda_scope)
+        else:
+            ret_type = c_check_expr(body_idx, lambda_scope)
+    return tt_add(ti_function(params, ret_type))
+
+# ---------------------------------------------------------------
+# collection literal expressions
+# ---------------------------------------------------------------
+
+fn c_check_list_expr(node: Node, scope_id: Int) -> Int:
+    if node.children.len() == 0:
+        # empty list — type comes from annotation context
+        return TID_ERR
+    # check all elements
+    mut elem_type := TID_ERR
+    for child in node.children:
+        t := c_check_expr(child, scope_id)
+        if tt_is_err(elem_type):
+            elem_type = t
+        elif tt_is_err(t) == false:
+            if t != elem_type:
+                c_error("E223", "list elements must be the same type: expected " + tt_type_name(elem_type) + ", got " + tt_type_name(t))
+    if tt_is_err(elem_type):
+        return TID_ERR
+    return c_intern_collection("List", elem_type, -1)
+
+fn c_check_map_expr(node: Node, scope_id: Int) -> Int:
+    if node.children.len() == 0:
+        return TID_ERR
+    mut key_type := TID_ERR
+    mut val_type := TID_ERR
+    for child in node.children:
+        entry := get_node(child)
+        if entry.kind == "entry":
+            if entry.children.len() >= 2:
+                kt := c_check_expr(entry.children[0], scope_id)
+                vt := c_check_expr(entry.children[1], scope_id)
+                if tt_is_err(key_type):
+                    key_type = kt
+                elif tt_is_err(kt) == false:
+                    if kt != key_type:
+                        c_error("E223", "map keys must be the same type")
+                if tt_is_err(val_type):
+                    val_type = vt
+                elif tt_is_err(vt) == false:
+                    if vt != val_type:
+                        c_error("E223", "map values must be the same type")
+    if tt_is_err(key_type):
+        return TID_ERR
+    if tt_is_err(val_type):
+        return TID_ERR
+    return c_intern_collection("Map", key_type, val_type)
+
+fn c_check_set_expr(node: Node, scope_id: Int) -> Int:
+    # sets look like {a, b, c} — distinguish from map by no entries
+    if node.children.len() == 0:
+        return TID_ERR
+    mut elem_type := TID_ERR
+    for child in node.children:
+        t := c_check_expr(child, scope_id)
+        if tt_is_err(elem_type):
+            elem_type = t
+        elif tt_is_err(t) == false:
+            if t != elem_type:
+                c_error("E223", "set elements must be the same type")
+    if tt_is_err(elem_type):
+        return TID_ERR
+    return c_intern_collection("Set", elem_type, -1)
+
+fn c_check_tuple_expr(node: Node, scope_id: Int) -> Int:
+    mut elems: List[Int] := []
+    for child in node.children:
+        elems.push(c_check_expr(child, scope_id))
+    return tt_add(ti_tuple(elems))
+
+# ---------------------------------------------------------------
+# spawn/await
+# ---------------------------------------------------------------
+
+fn c_check_spawn_expr(node: Node, scope_id: Int) -> Int:
+    if node.children.len() < 1:
+        return TID_ERR
+    inner := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(inner):
+        return TID_ERR
+    return tt_add(ti_task(inner))
+
+fn c_check_await_expr(node: Node, scope_id: Int) -> Int:
+    if node.children.len() < 1:
+        return TID_ERR
+    inner := c_check_expr(node.children[0], scope_id)
+    if tt_is_err(inner):
+        return TID_ERR
+    info := tt_get(inner)
+    if info.kind == "task":
+        return info.inner
+    c_error("E224", "await requires a Task type, got " + tt_type_name(inner))
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# generic instantiation
+# ---------------------------------------------------------------
+
+fn c_instantiate_generic(decl_idx: Int, type_args: List[Int]) -> Int:
+    decl := get_node(decl_idx)
+    if decl.kind == "struct_decl":
+        return c_instantiate_generic_struct(decl, type_args)
+    if decl.kind == "enum_decl":
+        return c_instantiate_generic_enum(decl, type_args)
+    return TID_ERR
+
+fn c_instantiate_generic_struct(decl: Node, type_args: List[Int]) -> Int:
+    name := decl.value
+    base_name := c_extract_base_name(name)
+    inst_name := c_build_inst_name(base_name, type_args)
+    existing := tt_lookup(inst_name)
+    if existing >= 0:
+        return existing
+    # extract generic params from name: "Pair[A, B]" -> ["A", "B"]
+    generic_params := c_extract_generic_params(name)
+    mut field_names: List[String] := []
+    mut field_types: List[Int] := []
+    mut field_pub: List[Bool] := []
+    mut field_mut: List[Bool] := []
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "field":
+            fname := c_extract_field_name(cn.value)
+            is_pub := cn.value.contains(" pub")
+            is_mut := cn.value.contains(" mut")
+            field_names.push(fname)
+            field_pub.push(is_pub)
+            field_mut.push(is_mut)
+            if cn.children.len() > 0:
+                ftid := c_resolve_type_with_map(cn.children[0], generic_params, type_args)
+                field_types.push(ftid)
+            else:
+                field_types.push(TID_ERR)
+    tid := tt_add(ti_struct(inst_name, field_names, field_types, field_pub, field_mut))
+    tt_register(inst_name, tid)
+    return tid
+
+fn c_instantiate_generic_enum(decl: Node, type_args: List[Int]) -> Int:
+    name := decl.value
+    base_name := c_extract_base_name(name)
+    inst_name := c_build_inst_name(base_name, type_args)
+    existing := tt_lookup(inst_name)
+    if existing >= 0:
+        return existing
+    generic_params := c_extract_generic_params(name)
+    mut variant_names: List[String] := []
+    mut variant_types: List[List[Int]] := []
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "variant":
+            variant_names.push(cn.value)
+            mut vtypes: List[Int] := []
+            for vc in cn.children:
+                vtypes.push(c_resolve_type_with_map(vc, generic_params, type_args))
+            variant_types.push(vtypes)
+    tid := tt_add(ti_enum(inst_name, variant_names, variant_types))
+    tt_register(inst_name, tid)
+    return tid
+
+# ---------------------------------------------------------------
+# structural equality
+# ---------------------------------------------------------------
+
+fn c_types_structurally_equal(a: Int, b: Int) -> Bool:
+    if a == b:
+        return true
+    if a < 0:
+        return false
+    if b < 0:
+        return false
+    ai := tt_get(a)
+    bi := tt_get(b)
+    # function type structural equality
+    if ai.kind == "function":
+        if bi.kind == "function":
+            if ai.param_types.len() != bi.param_types.len():
+                return false
+            mut i := 0
+            for ap in ai.param_types:
+                if i < bi.param_types.len():
+                    if c_types_structurally_equal(ap, bi.param_types[i]) == false:
+                        return false
+                i = i + 1
+            if c_types_structurally_equal(ai.return_type, bi.return_type) == false:
+                return false
+            return true
+    # tuple structural equality
+    if ai.kind == "tuple":
+        if bi.kind == "tuple":
+            if ai.elements.len() != bi.elements.len():
+                return false
+            mut i := 0
+            for ae in ai.elements:
+                if i < bi.elements.len():
+                    if c_types_structurally_equal(ae, bi.elements[i]) == false:
+                        return false
+                i = i + 1
+            return true
+    return false
+
+# ---------------------------------------------------------------
+# public API — run checker and return diagnostics as JSON
+# ---------------------------------------------------------------
+
+pub fn c_run(root_idx: Int) -> List[Diagnostic]:
+    c_init()
+    c_register_all(root_idx)
+    c_check_all(root_idx)
+    return c_diagnostics
+
+pub fn c_diagnostics_to_json(diags: List[Diagnostic]) -> String:
+    if diags.len() == 0:
+        return "[]"
+    lb := chr(123)
+    rb := chr(125)
+    mut result := "["
+    mut first := true
+    for d in diags:
+        if first == false:
+            result = result + ","
+        first = false
+        mut fix_part := ""
+        if d.fix.len() > 0:
+            fix_part = ",\"fix\":\"" + c_json_escape(d.fix) + "\""
+        mut entry := lb + "\"severity\":\"" + d.severity + "\""
+        entry = entry + ",\"code\":\"" + d.code + "\""
+        entry = entry + ",\"message\":\"" + c_json_escape(d.message) + "\""
+        entry = entry + ",\"line\":" + d.line.to_string()
+        entry = entry + ",\"col\":" + d.col.to_string()
+        entry = entry + fix_part + rb
+        result = result + entry
+    result = result + "]"
+    return result
+
+fn c_json_escape(s: String) -> String:
+    mut result := ""
+    mut i := 0
+    while i < s.len():
+        ch := s[i]
+        if ch == "\"":
+            result = result + "\\\""
+        elif ch == "\\":
+            result = result + "\\\\"
+        elif ch == "\n":
+            result = result + "\\n"
+        else:
+            result = result + ch
+        i = i + 1
+    return result

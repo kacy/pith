@@ -2579,10 +2579,17 @@ pub const CEmitter = struct {
         }
     }
 
-    /// emit forge_map_set_by_{string,int}(&map, key, &(V){val}, sizeof(K), sizeof(V))
+    /// emit forge_map_set_by_{string,int}(&map, key, &val, sizeof(K), sizeof(V))
+    /// uses a temp variable to avoid compound literal issues with struct types
     fn emitMapInsert(self: *CEmitter, receiver: *const ast.Expr, key: *const ast.Expr, value: *const ast.Expr, key_type: TypeId, val_type: TypeId) EmitError!void {
         const key_c = self.cTypeStringForId(key_type);
         const val_c = self.cTypeStringForId(val_type);
+        // use a temp variable so &val works for both scalars and structs
+        try self.writeStr("{ ");
+        try self.writeStr(val_c);
+        try self.writeStr(" __mv = ");
+        try self.emitExpr(value);
+        try self.writeStr("; ");
         if (key_type == .string) {
             try self.writeStr("forge_map_set_by_string(&");
         } else {
@@ -2591,29 +2598,26 @@ pub const CEmitter = struct {
         try self.emitExpr(receiver);
         try self.writeStr(", ");
         try self.emitExpr(key);
-        try self.writeStr(", &(");
-        try self.writeStr(val_c);
-        try self.writeStr("){");
-        try self.emitExpr(value);
-        try self.writeStr("}, sizeof(");
+        try self.writeStr(", &__mv, sizeof(");
         try self.writeStr(key_c);
         try self.writeStr("), sizeof(");
         try self.writeStr(val_c);
-        try self.writeStr("))");
+        try self.writeStr(")); }");
     }
 
-    /// emit forge_set_add(&set, &(T){value}, sizeof(T))
+    /// emit forge_set_add(&set, &val, sizeof(T))
+    /// uses a temp variable to avoid compound literal issues with struct types
     fn emitSetAdd(self: *CEmitter, receiver: *const ast.Expr, value: *const ast.Expr, elem_type: TypeId) EmitError!void {
         const c_type = self.cTypeStringForId(elem_type);
-        try self.writeStr("forge_set_add(&");
-        try self.emitExpr(receiver);
-        try self.writeStr(", &(");
+        try self.writeStr("{ ");
         try self.writeStr(c_type);
-        try self.writeStr("){");
+        try self.writeStr(" __sv = ");
         try self.emitExpr(value);
-        try self.writeStr("}, sizeof(");
+        try self.writeStr("; forge_set_add(&");
+        try self.emitExpr(receiver);
+        try self.writeStr(", &__sv, sizeof(");
         try self.writeStr(c_type);
-        try self.writeStr("))");
+        try self.writeStr(")); }");
     }
 
     /// emit a built-in list method call. returns true if handled.

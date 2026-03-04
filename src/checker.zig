@@ -257,6 +257,13 @@ pub const Checker = struct {
         } });
         try self.module_scope.define("env", .{ .type_id = env_type, .is_mut = false });
 
+        // chr(Int) -> String
+        const chr_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = .string,
+        } });
+        try self.module_scope.define("chr", .{ .type_id = chr_type, .is_mut = false });
+
         // exit(Int) -> Void
         const exit_type = try self.type_table.addType(.{ .function = .{
             .param_types = &.{.int},

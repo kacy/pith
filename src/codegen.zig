@@ -81,6 +81,10 @@ pub const CEmitter = struct {
     test_names: std.ArrayList([]const u8),
     /// imported module declarations to emit alongside the main module.
     imported_modules: []const Checker.ImportedModule,
+    /// whether any top-level global bindings were emitted.
+    has_globals: bool,
+    /// counter for unique push temp variable names.
+    push_counter: u32,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -108,6 +112,8 @@ pub const CEmitter = struct {
             .test_mode = false,
             .test_names = .empty,
             .imported_modules = &.{},
+            .has_globals = false,
+            .push_counter = 0,
         };
     }
 
@@ -204,6 +210,9 @@ pub const CEmitter = struct {
         // pass 3c: forward-declare instantiated generic functions
         try self.emitInstantiatedFnForwardDecls(module);
         try self.writeByte('\n');
+
+        // pass 3d: top-level global variable declarations and init function
+        try self.emitGlobalBindings(all_modules.items);
 
         // mark position for lambda forward declarations — we'll insert them
         // after all function bodies have been emitted and lambdas discovered
@@ -659,6 +668,59 @@ pub const CEmitter = struct {
     /// emit C wrapper functions for built-in failable functions.
     /// must be called after emitResultTypedefs/emitOptionalTypedefs so the
     /// result/optional struct types are already defined.
+    /// emit top-level mutable bindings as C global variables and an init function.
+    /// globals are declared uninitialized at file scope, then assigned their initial
+    /// values in __forge_init_globals() which main() calls on startup.
+    fn emitGlobalBindings(self: *CEmitter, modules: []const *const ast.Module) EmitError!void {
+        // collect all top-level bindings across modules
+        var has_any = false;
+        for (modules) |mod| {
+            for (mod.decls) |*decl| {
+                switch (decl.kind) {
+                    .binding => |*b| {
+                        has_any = true;
+                        // emit C global variable declaration
+                        const tid = if (b.type_expr) |te|
+                            self.resolveTypeExprToId(te)
+                        else
+                            self.inferExprType(b.value);
+                        try self.emitCType(tid);
+                        try self.writeByte(' ');
+                        try self.writeStr(b.name);
+                        try self.writeStr(";\n");
+                        self.local_types.put(b.name, tid) catch return error.OutOfMemory;
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        if (!has_any) return;
+
+        self.has_globals = true;
+        try self.writeByte('\n');
+
+        // emit init function that assigns initial values
+        try self.writeStr("void __forge_init_globals(void) {\n");
+        self.indent_level += 1;
+        for (modules) |mod| {
+            for (mod.decls) |*decl| {
+                switch (decl.kind) {
+                    .binding => |*b| {
+                        try self.writeIndent();
+                        try self.writeStr(b.name);
+                        try self.writeStr(" = ");
+                        try self.emitExpr(b.value);
+                        try self.writeStr(";\n");
+                    },
+                    else => {},
+                }
+            }
+        }
+        self.indent_level -= 1;
+        try self.writeStr("}\n\n");
+    }
+
     fn emitBuiltinHelpers(self: *CEmitter) EmitError!void {
         // parse_int(String) -> Int! — wraps strtoll
         try self.writeStr(
@@ -1130,6 +1192,10 @@ pub const CEmitter = struct {
             self.indent_level += 1;
             try self.writeIndent();
             try self.writeStr("forge_set_args(__argc, __argv);\n");
+            if (self.has_globals) {
+                try self.writeIndent();
+                try self.writeStr("__forge_init_globals();\n");
+            }
             self.indent_level -= 1;
         } else {
             try self.emitReturnType(fd.return_type);
@@ -1900,7 +1966,8 @@ pub const CEmitter = struct {
             std.mem.eql(u8, name, "parse_float") or
             std.mem.eql(u8, name, "read_file") or
             std.mem.eql(u8, name, "write_file") or
-            std.mem.eql(u8, name, "env"))
+            std.mem.eql(u8, name, "env") or
+            std.mem.eql(u8, name, "chr"))
         {
             try self.writeStr("forge_");
             try self.writeStr(name);
@@ -2199,15 +2266,31 @@ pub const CEmitter = struct {
     /// emit forge_list_push(&list, &(T){value}, sizeof(T))
     fn emitCollectionPush(self: *CEmitter, receiver: *const ast.Expr, value: *const ast.Expr, elem_type: TypeId) EmitError!void {
         const c_type = self.cTypeStringForId(elem_type);
-        try self.writeStr("forge_list_push(&");
-        try self.emitExpr(receiver);
-        try self.writeStr(", &(");
-        try self.writeStr(c_type);
-        try self.writeStr("){");
-        try self.emitExpr(value);
-        try self.writeStr("}, sizeof(");
-        try self.writeStr(c_type);
-        try self.writeStr("))");
+        // for struct types (e.g. forge_string_t), compound literal init
+        // (Type){value} doesn't work — use a temp variable instead
+        if (elem_type == .string or elem_type.index() >= TypeId.first_user) {
+            const n = self.push_counter;
+            self.push_counter += 1;
+            try self.writeStr("{ ");
+            try self.writeStr(c_type);
+            try self.writeFmt(" __push_{d} = ", .{n});
+            try self.emitExpr(value);
+            try self.writeStr("; forge_list_push(&");
+            try self.emitExpr(receiver);
+            try self.writeFmt(", &__push_{d}, sizeof(", .{n});
+            try self.writeStr(c_type);
+            try self.writeStr(")); }");
+        } else {
+            try self.writeStr("forge_list_push(&");
+            try self.emitExpr(receiver);
+            try self.writeStr(", &(");
+            try self.writeStr(c_type);
+            try self.writeStr("){");
+            try self.emitExpr(value);
+            try self.writeStr("}, sizeof(");
+            try self.writeStr(c_type);
+            try self.writeStr("))");
+        }
     }
 
     /// emit forge_map_set_by_{string,int}(&map, key, &(V){val}, sizeof(K), sizeof(V))
@@ -3633,9 +3716,31 @@ pub const CEmitter = struct {
     }
 
     fn writeEscapedString(self: *CEmitter, s: []const u8) EmitError!void {
-        for (s) |c| {
+        // the forge lexer preserves escape sequences in their raw form:
+        // "\n" in source is stored as bytes '\' 'n', not as byte 0x0A.
+        // since C uses the same escape sequences, pass them through as-is.
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            const c = s[i];
             switch (c) {
-                '\\' => try self.output.appendSlice(self.allocator, "\\\\"),
+                '\\' => {
+                    if (i + 1 < s.len) {
+                        const next = s[i + 1];
+                        switch (next) {
+                            'n', 't', 'r', '\\', '"', '0', '\'' => {
+                                // recognized escape sequence — pass through to C
+                                try self.output.append(self.allocator, '\\');
+                                try self.output.append(self.allocator, next);
+                                i += 1;
+                            },
+                            else => {
+                                try self.output.appendSlice(self.allocator, "\\\\");
+                            },
+                        }
+                    } else {
+                        try self.output.appendSlice(self.allocator, "\\\\");
+                    }
+                },
                 '"' => try self.output.appendSlice(self.allocator, "\\\""),
                 '\n' => try self.output.appendSlice(self.allocator, "\\n"),
                 '\r' => try self.output.appendSlice(self.allocator, "\\r"),

@@ -1,0 +1,802 @@
+# lexer.fg — forge lexer written in forge
+#
+# the first self-hosted component. reads a .fg source file and prints
+# the token stream in the same format as `forge lex`.
+#
+# usage: forge run self-host/lexer.fg <file.fg>
+
+# ---------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------
+
+fn is_alpha(c: String) -> Bool:
+    if c >= "a":
+        if c <= "z":
+            return true
+    if c >= "A":
+        if c <= "Z":
+            return true
+    if c == "_":
+        return true
+    return false
+
+fn is_digit(c: String) -> Bool:
+    if c >= "0":
+        if c <= "9":
+            return true
+    return false
+
+fn is_alnum(c: String) -> Bool:
+    return is_alpha(c) or is_digit(c)
+
+fn is_hex_digit(c: String) -> Bool:
+    if is_digit(c):
+        return true
+    if c >= "a":
+        if c <= "f":
+            return true
+    if c >= "A":
+        if c <= "F":
+            return true
+    return false
+
+fn is_keyword(word: String) -> Bool:
+    if word == "fn":
+        return true
+    if word == "if":
+        return true
+    if word == "elif":
+        return true
+    if word == "else":
+        return true
+    if word == "for":
+        return true
+    if word == "in":
+        return true
+    if word == "while":
+        return true
+    if word == "match":
+        return true
+    if word == "return":
+        return true
+    if word == "fail":
+        return true
+    if word == "break":
+        return true
+    if word == "continue":
+        return true
+    if word == "spawn":
+        return true
+    if word == "await":
+        return true
+    if word == "struct":
+        return true
+    if word == "enum":
+        return true
+    if word == "interface":
+        return true
+    if word == "impl":
+        return true
+    if word == "type":
+        return true
+    if word == "pub":
+        return true
+    if word == "mut":
+        return true
+    if word == "ref":
+        return true
+    if word == "weak":
+        return true
+    if word == "import":
+        return true
+    if word == "from":
+        return true
+    if word == "as":
+        return true
+    if word == "self":
+        return true
+    if word == "true":
+        return true
+    if word == "false":
+        return true
+    if word == "none":
+        return true
+    if word == "and":
+        return true
+    if word == "or":
+        return true
+    if word == "not":
+        return true
+    if word == "test":
+        return true
+    return false
+
+fn keyword_token_kind(word: String) -> String:
+    if word == "fn":
+        return "kw_fn"
+    if word == "if":
+        return "kw_if"
+    if word == "elif":
+        return "kw_elif"
+    if word == "else":
+        return "kw_else"
+    if word == "for":
+        return "kw_for"
+    if word == "in":
+        return "kw_in"
+    if word == "while":
+        return "kw_while"
+    if word == "match":
+        return "kw_match"
+    if word == "return":
+        return "kw_return"
+    if word == "fail":
+        return "kw_fail"
+    if word == "break":
+        return "kw_break"
+    if word == "continue":
+        return "kw_continue"
+    if word == "spawn":
+        return "kw_spawn"
+    if word == "await":
+        return "kw_await"
+    if word == "struct":
+        return "kw_struct"
+    if word == "enum":
+        return "kw_enum"
+    if word == "interface":
+        return "kw_interface"
+    if word == "impl":
+        return "kw_impl"
+    if word == "type":
+        return "kw_type"
+    if word == "pub":
+        return "kw_pub"
+    if word == "mut":
+        return "kw_mut"
+    if word == "ref":
+        return "kw_ref"
+    if word == "weak":
+        return "kw_weak"
+    if word == "import":
+        return "kw_import"
+    if word == "from":
+        return "kw_from"
+    if word == "as":
+        return "kw_as"
+    if word == "self":
+        return "kw_self"
+    if word == "true":
+        return "kw_true"
+    if word == "false":
+        return "kw_false"
+    if word == "none":
+        return "kw_none"
+    if word == "and":
+        return "kw_and"
+    if word == "or":
+        return "kw_or"
+    if word == "not":
+        return "kw_not"
+    if word == "test":
+        return "kw_test"
+    return "identifier"
+
+# pad a string to 16 chars with spaces
+fn pad16(s: String) -> String:
+    mut result := s
+    while result.len() < 16:
+        result = result + " "
+    return result
+
+# ---------------------------------------------------------------
+# lexer state
+# ---------------------------------------------------------------
+
+# brace characters — can't write "{" or "}" as string literals in forge
+# because { triggers string interpolation. use chr() to construct them.
+mut LBRACE := ""
+mut RBRACE := ""
+
+# global mutable state — the lexer modifies these as it scans
+mut source := ""
+mut pos := 0
+mut at_line_start := true
+mut done := false
+
+# indent stack — tracks indentation levels
+mut indent_stack: List[Int] := [0]
+mut pending_dedents := 0
+
+# pending tokens from string interpolation
+mut pending_kinds: List[String] := []
+mut pending_values: List[String] := []
+
+# ---------------------------------------------------------------
+# lexer core
+# ---------------------------------------------------------------
+
+fn peek() -> String:
+    if pos >= source.len():
+        return ""
+    return source[pos]
+
+fn advance() -> String:
+    c := source[pos]
+    pos = pos + 1
+    return c
+
+fn is_blank_line() -> Bool:
+    mut i := pos
+    while i < source.len():
+        c := source[i]
+        if c == "\n":
+            return true
+        if c == "#":
+            return true
+        if c != " ":
+            if c != "\t":
+                return false
+        i = i + 1
+    return true
+
+fn skip_to_next_line():
+    while pos < source.len():
+        c := source[pos]
+        pos = pos + 1
+        if c == "\n":
+            return
+
+fn measure_indent() -> Int:
+    mut level := 0
+    mut i := pos
+    while i < source.len():
+        c := source[i]
+        if c == " ":
+            level = level + 1
+            i = i + 1
+        elif c == "\t":
+            level = level + 1
+            i = i + 1
+        else:
+            return level
+    return level
+
+fn skip_spaces():
+    while pos < source.len():
+        if source[pos] == " ":
+            pos = pos + 1
+        else:
+            return
+
+# the main lexer function. returns (kind, value) by setting globals.
+# callers should read tok_kind and tok_value after calling.
+mut tok_kind := ""
+mut tok_value := ""
+
+fn emit(kind: String, value: String):
+    tok_kind = kind
+    tok_value = value
+
+fn next_token():
+    # step 1: drain pending dedents
+    if pending_dedents > 0:
+        pending_dedents = pending_dedents - 1
+        emit("dedent", "")
+        return
+
+    # step 2: drain pending interpolation tokens
+    if pending_kinds.len() > 0:
+        k := pending_kinds[0]
+        v := pending_values[0]
+        pending_kinds.remove(0)
+        pending_values.remove(0)
+        emit(k, v)
+        return
+
+    # step 3: handle EOF
+    if pos >= source.len():
+        if not done:
+            if indent_stack.len() > 1:
+                remaining := indent_stack.len() - 1
+                # pop all but first level
+                while indent_stack.len() > 1:
+                    indent_stack.remove(indent_stack.len() - 1)
+                if remaining > 1:
+                    pending_dedents = remaining - 1
+                emit("dedent", "")
+                return
+            done = true
+        emit("eof", "")
+        return
+
+    # step 4: handle indentation at start of line
+    if at_line_start:
+        at_line_start = false
+
+        if is_blank_line():
+            skip_to_next_line()
+            at_line_start = true
+            next_token()
+            return
+
+        level := measure_indent()
+        current_indent := indent_stack[indent_stack.len() - 1]
+
+        if level > current_indent:
+            indent_stack.push(level)
+            emit("indent", "")
+            return
+        elif level < current_indent:
+            mut dedents := 0
+            while indent_stack.len() > 1:
+                if indent_stack[indent_stack.len() - 1] <= level:
+                    break
+                indent_stack.remove(indent_stack.len() - 1)
+                dedents = dedents + 1
+            if dedents > 0:
+                pending_dedents = dedents - 1
+                emit("dedent", "")
+                return
+
+    # step 5: skip spaces
+    skip_spaces()
+
+    # step 6: re-check EOF after skipping spaces
+    if pos >= source.len():
+        next_token()
+        return
+
+    c := peek()
+
+    # step 7: dispatch on character
+
+    # newline
+    if c == "\n":
+        pos = pos + 1
+        at_line_start = true
+        emit("newline", "")
+        return
+
+    # comment
+    if c == "#":
+        start := pos
+        while pos < source.len():
+            if source[pos] == "\n":
+                break
+            pos = pos + 1
+        emit("comment", source.substring(start, pos))
+        return
+
+    # string
+    if c == "\"":
+        scan_string()
+        return
+
+    # number
+    if is_digit(c):
+        scan_number()
+        return
+
+    # identifier or keyword
+    if is_alpha(c):
+        scan_identifier()
+        return
+
+    # operators and punctuation
+    scan_operator()
+
+fn scan_identifier():
+    start := pos
+    while pos < source.len():
+        if is_alnum(source[pos]):
+            pos = pos + 1
+        else:
+            break
+    word := source.substring(start, pos)
+
+    # check for lone underscore
+    if word == "_":
+        emit("underscore", "_")
+        return
+
+    # check if it's a keyword
+    if is_keyword(word):
+        emit(keyword_token_kind(word), word)
+    else:
+        emit("identifier", word)
+
+fn scan_number():
+    start := pos
+
+    # check for hex, binary, octal prefixes
+    if source[pos] == "0":
+        if pos + 1 < source.len():
+            next_c := source[pos + 1]
+            if next_c == "x" or next_c == "X":
+                pos = pos + 2
+                while pos < source.len():
+                    ch := source[pos]
+                    if is_hex_digit(ch) or ch == "_":
+                        pos = pos + 1
+                    else:
+                        break
+                emit("int_lit", source.substring(start, pos))
+                return
+            if next_c == "b" or next_c == "B":
+                pos = pos + 2
+                while pos < source.len():
+                    ch := source[pos]
+                    if ch == "0" or ch == "1" or ch == "_":
+                        pos = pos + 1
+                    else:
+                        break
+                emit("int_lit", source.substring(start, pos))
+                return
+            if next_c == "o" or next_c == "O":
+                pos = pos + 2
+                while pos < source.len():
+                    ch := source[pos]
+                    if ch >= "0":
+                        if ch <= "7":
+                            pos = pos + 1
+                            continue
+                    if ch == "_":
+                        pos = pos + 1
+                        continue
+                    break
+                emit("int_lit", source.substring(start, pos))
+                return
+
+    # decimal digits
+    while pos < source.len():
+        ch := source[pos]
+        if is_digit(ch) or ch == "_":
+            pos = pos + 1
+        else:
+            break
+
+    # check for decimal point (must be followed by a digit)
+    mut is_float := false
+    if pos < source.len():
+        if source[pos] == ".":
+            if pos + 1 < source.len():
+                if is_digit(source[pos + 1]):
+                    is_float = true
+                    pos = pos + 1
+                    while pos < source.len():
+                        ch := source[pos]
+                        if is_digit(ch) or ch == "_":
+                            pos = pos + 1
+                        else:
+                            break
+
+    # check for exponent
+    if pos < source.len():
+        ec := source[pos]
+        if ec == "e" or ec == "E":
+            is_float = true
+            pos = pos + 1
+            if pos < source.len():
+                sc := source[pos]
+                if sc == "+" or sc == "-":
+                    pos = pos + 1
+            while pos < source.len():
+                ch := source[pos]
+                if is_digit(ch) or ch == "_":
+                    pos = pos + 1
+                else:
+                    break
+
+    if is_float:
+        emit("float_lit", source.substring(start, pos))
+    else:
+        emit("int_lit", source.substring(start, pos))
+
+fn scan_string():
+    start := pos
+    pos = pos + 1
+
+    # check for interpolation by peeking ahead
+    mut has_interp := false
+    mut i := pos
+    while i < source.len():
+        sc := source[i]
+        if sc == "\\":
+            i = i + 2
+            continue
+        if sc == LBRACE:
+            has_interp = true
+            break
+        if sc == "\"" or sc == "\n":
+            break
+        i = i + 1
+
+    if not has_interp:
+        # simple string
+        while pos < source.len():
+            sc := source[pos]
+            if sc == "\\":
+                pos = pos + 2
+                continue
+            if sc == "\"":
+                pos = pos + 1
+                emit("string_lit", source.substring(start, pos))
+                return
+            if sc == "\n":
+                emit("err", "")
+                return
+            pos = pos + 1
+        emit("err", "")
+        return
+
+    # interpolated string — scan to first {
+    while pos < source.len():
+        sc := source[pos]
+        if sc == "\\":
+            pos = pos + 2
+            continue
+        if sc == LBRACE:
+            break
+        if sc == "\"" or sc == "\n":
+            break
+        pos = pos + 1
+
+    # emit string_start (from opening " to the {)
+    string_start_val := source.substring(start, pos)
+
+    # now scan interpolation parts into pending tokens
+    scan_interpolation_parts()
+
+    emit("string_start", string_start_val)
+
+fn scan_interpolation_parts():
+    while pos < source.len():
+        if source[pos] != LBRACE:
+            return
+
+        # skip the {
+        pos = pos + 1
+
+        # scan expression inside {}
+        mut depth := 1
+        expr_start := pos
+        while pos < source.len():
+            ic := source[pos]
+            if ic == LBRACE:
+                depth = depth + 1
+                pos = pos + 1
+            elif ic == RBRACE:
+                depth = depth - 1
+                if depth == 0:
+                    break
+                pos = pos + 1
+            else:
+                pos = pos + 1
+
+        expr_text := source.substring(expr_start, pos)
+        if expr_text.len() > 0:
+            pending_kinds.push("interpolation_expr")
+            pending_values.push(expr_text)
+
+        if pos >= source.len():
+            return
+
+        # skip the }
+        pos = pos + 1
+
+        # scan string content after the }
+        mid_start := pos
+        while pos < source.len():
+            sc := source[pos]
+            if sc == "\\":
+                pos = pos + 2
+                continue
+            if sc == LBRACE:
+                break
+            if sc == "\"" or sc == "\n":
+                break
+            pos = pos + 1
+
+        if pos >= source.len():
+            return
+
+        if source[pos] == "\"":
+            pos = pos + 1
+            pending_kinds.push("string_end")
+            pending_values.push(source.substring(mid_start, pos))
+            return
+
+        if source[pos] == "\n":
+            return
+
+        # another { — emit string_mid and continue
+        pending_kinds.push("string_mid")
+        pending_values.push(source.substring(mid_start, pos))
+
+fn scan_operator():
+    c := advance()
+
+    if c == "+":
+        if pos < source.len():
+            if source[pos] == "=":
+                pos = pos + 1
+                emit("plus_eq", "+=")
+                return
+        emit("plus", "+")
+        return
+
+    if c == "-":
+        if pos < source.len():
+            if source[pos] == ">":
+                pos = pos + 1
+                emit("arrow", "->")
+                return
+            if source[pos] == "=":
+                pos = pos + 1
+                emit("minus_eq", "-=")
+                return
+        emit("minus", "-")
+        return
+
+    if c == "*":
+        if pos < source.len():
+            if source[pos] == "=":
+                pos = pos + 1
+                emit("star_eq", "*=")
+                return
+        emit("star", "*")
+        return
+
+    if c == "/":
+        if pos < source.len():
+            if source[pos] == "=":
+                pos = pos + 1
+                emit("slash_eq", "/=")
+                return
+        emit("slash", "/")
+        return
+
+    if c == "%":
+        emit("percent", "%")
+        return
+
+    if c == "=":
+        if pos < source.len():
+            if source[pos] == "=":
+                pos = pos + 1
+                emit("eq_eq", "==")
+                return
+            if source[pos] == ">":
+                pos = pos + 1
+                emit("fat_arrow", "=>")
+                return
+        emit("eq", "=")
+        return
+
+    if c == "!":
+        if pos < source.len():
+            if source[pos] == "=":
+                pos = pos + 1
+                emit("bang_eq", "!=")
+                return
+        emit("bang", "!")
+        return
+
+    if c == "<":
+        if pos < source.len():
+            if source[pos] == "=":
+                pos = pos + 1
+                emit("less_eq", "<=")
+                return
+        emit("less", "<")
+        return
+
+    if c == ">":
+        if pos < source.len():
+            if source[pos] == "=":
+                pos = pos + 1
+                emit("greater_eq", ">=")
+                return
+        emit("greater", ">")
+        return
+
+    if c == ":":
+        if pos < source.len():
+            if source[pos] == "=":
+                pos = pos + 1
+                emit("colon_eq", ":=")
+                return
+        emit("colon", ":")
+        return
+
+    if c == "?":
+        emit("question", "?")
+        return
+
+    if c == ".":
+        emit("dot", ".")
+        return
+
+    if c == ",":
+        emit("comma", ",")
+        return
+
+    if c == "(":
+        emit("lparen", "(")
+        return
+
+    if c == ")":
+        emit("rparen", ")")
+        return
+
+    if c == "[":
+        emit("lbracket", "[")
+        return
+
+    if c == "]":
+        emit("rbracket", "]")
+        return
+
+    if c == LBRACE:
+        emit("lbrace", LBRACE)
+        return
+
+    if c == RBRACE:
+        emit("rbrace", RBRACE)
+        return
+
+    if c == "|":
+        emit("pipe", "|")
+        return
+
+    emit("err", c)
+
+# ---------------------------------------------------------------
+# main
+# ---------------------------------------------------------------
+
+fn run() -> String!:
+    # init brace characters via chr() since we can't write them as literals
+    LBRACE = chr(123)
+    RBRACE = chr(125)
+
+    a := args()
+    if a.len() < 2:
+        print("usage: forge run self-host/lexer.fg <file.fg>")
+        exit(1)
+
+    path := a[1]
+    content := read_file(path)!
+
+    source = content
+    pos = 0
+    at_line_start = true
+    done = false
+    indent_stack = [0]
+    pending_kinds = []
+    pending_values = []
+    pending_dedents = 0
+
+    while true:
+        next_token()
+
+        if tok_kind == "newline":
+            print("{pad16(tok_kind)}  \\n")
+        elif tok_kind == "indent":
+            print("{pad16(tok_kind)}  >>>")
+        elif tok_kind == "dedent":
+            print("{pad16(tok_kind)}  <<<")
+        elif tok_kind == "eof":
+            print("{pad16(tok_kind)}  <eof>")
+            break
+        else:
+            if tok_value.len() > 0:
+                print("{pad16(tok_kind)}  {tok_value}")
+            else:
+                print("{pad16(tok_kind)}")
+
+    return ""
+
+fn main():
+    run()

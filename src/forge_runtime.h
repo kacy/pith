@@ -164,6 +164,15 @@ static inline forge_string_t forge_string_char_at(forge_string_t s, int64_t inde
     return (forge_string_t){ .data = buf, .len = 1 };
 }
 
+// chr(Int) -> String: return a single-character string for the given ASCII code.
+static inline forge_string_t forge_chr(int64_t code) {
+    char *buf = (char *)malloc(2);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    buf[0] = (char)(code & 0xFF);
+    buf[1] = '\0';
+    return (forge_string_t){ .data = buf, .len = 1 };
+}
+
 // replace all occurrences of `old` with `new_s` in `s`.
 static inline forge_string_t forge_string_replace(forge_string_t s, forge_string_t old, forge_string_t new_s) {
     if (old.len == 0) {

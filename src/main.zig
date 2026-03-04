@@ -162,14 +162,19 @@ pub fn main() !void {
             return;
         };
         const json = hasFlag(&args, "--json");
-        try runBuild(allocator, file_path, false, json);
+        try runBuild(allocator, file_path, false, json, &.{});
     } else if (std.mem.eql(u8, cmd, "run")) {
         const file_path = args.next() orelse {
             io.writeErr("error: forge run requires a file path\n", .{});
             return;
         };
-        const json = hasFlag(&args, "--json");
-        try runBuild(allocator, file_path, true, json);
+        // collect remaining args to forward to the compiled program
+        var run_args: std.ArrayList([]const u8) = .empty;
+        defer run_args.deinit(allocator);
+        while (args.next()) |a| {
+            run_args.append(allocator, a) catch {};
+        }
+        try runBuild(allocator, file_path, true, false, run_args.items);
     } else if (std.mem.eql(u8, cmd, "test")) {
         const file_path = args.next() orelse {
             io.writeErr("error: forge test requires a file path\n", .{});
@@ -487,7 +492,7 @@ const runtime_header = @embedFile("forge_runtime.h");
 
 /// lex, parse, type-check, generate C, and compile a forge source file.
 /// if `run_after` is true, also executes the resulting binary.
-fn runBuild(allocator: std.mem.Allocator, path: []const u8, run_after: bool, json: bool) !void {
+fn runBuild(allocator: std.mem.Allocator, path: []const u8, run_after: bool, json: bool, extra_args: []const []const u8) !void {
     const source = readSourceFile(allocator, path) orelse return;
     defer allocator.free(source);
 
@@ -588,10 +593,16 @@ fn runBuild(allocator: std.mem.Allocator, path: []const u8, run_after: bool, jso
         return;
     }
 
-    // run the binary
+    // run the binary with any extra args forwarded
+    var run_argv: std.ArrayList([]const u8) = .empty;
+    defer run_argv.deinit(allocator);
+    run_argv.append(allocator, out_path) catch {};
+    for (extra_args) |a| {
+        run_argv.append(allocator, a) catch {};
+    }
     const run_result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{out_path},
+        .argv = run_argv.items,
     }) catch |err| {
         io.writeErr("error: could not run binary: {}\n", .{err});
         return;

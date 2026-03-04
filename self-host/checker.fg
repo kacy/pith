@@ -1284,7 +1284,7 @@ fn c_check_unary(node: Node, scope_id: Int) -> Int:
     if tt_is_err(operand):
         return TID_ERR
     op := node.value
-    if op == "neg":
+    if op == "negate":
         if tt_is_numeric(operand) == false:
             c_error("E217", "unary - requires numeric type, got " + tt_type_name(operand))
             return TID_ERR
@@ -2513,6 +2513,13 @@ fn c_types_structurally_equal(a: Int, b: Int) -> Bool:
 
 pub fn c_run(root_idx: Int) -> List[Diagnostic]:
     c_init()
+    c_register_all(root_idx)
+    c_check_all(root_idx)
+    return c_diagnostics
+
+# run checker passes on a single module without re-initializing.
+# call c_init() once, then c_run_module() for each module in order.
+pub fn c_run_module(root_idx: Int) -> List[Diagnostic]:
     c_register_all(root_idx)
     c_check_all(root_idx)
     return c_diagnostics

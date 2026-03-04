@@ -2347,7 +2347,7 @@ fn g_emit_collection_push(node_idx: Int, elem_tid: Int, elem_c: String):
     node := get_node(node_idx)
     receiver_idx := node.children[0]
     value_idx := g_call_arg(node_idx, 0)
-    # for struct/string types, use temp variable to avoid compound literal issues
+    # for struct/string/collection types, use temp variable to avoid compound literal issues
     mut is_complex := elem_tid == TID_STRING
     if is_complex == false:
         if elem_tid >= TID_FIRST_USER:
@@ -2356,6 +2356,12 @@ fn g_emit_collection_push(node_idx: Int, elem_tid: Int, elem_c: String):
                 if ei.kind == "struct":
                     is_complex = true
                 if ei.kind == "enum":
+                    is_complex = true
+                if ei.kind == "list":
+                    is_complex = true
+                if ei.kind == "map":
+                    is_complex = true
+                if ei.kind == "set":
                     is_complex = true
     if is_complex:
         temp := "__push_" + g_push_counter.to_string()
@@ -3259,6 +3265,42 @@ fn g_emit_global_bindings(root_idx: Int):
     g_indent = g_indent - 1
     g_write(RB + "\n\n")
 
+# emit only global variable declarations (no init function)
+fn g_emit_global_decls(root_idx: Int) -> Bool:
+    root := get_node(root_idx)
+    mut has_any := false
+    for child in root.children:
+        mut node := get_node(child)
+        if node.kind == "pub":
+            node = get_node(node.children[0])
+        if node.kind == "binding":
+            has_any = true
+            name := g_extract_binding_name(node.value)
+            tid := g_get_binding_type(node)
+            g_emit_c_type(tid)
+            g_write(" ")
+            g_write(name)
+            g_write(";\n")
+            g_local_types.insert(name, tid)
+    return has_any
+
+# emit init body for one module's globals (inside __forge_init_globals)
+fn g_emit_global_init_body(root_idx: Int):
+    root := get_node(root_idx)
+    for child in root.children:
+        mut node := get_node(child)
+        if node.kind == "pub":
+            node = get_node(node.children[0])
+        if node.kind == "binding":
+            name := g_extract_binding_name(node.value)
+            value_idx := g_get_binding_value(node)
+            if value_idx >= 0:
+                g_write_indent()
+                g_write(name)
+                g_write(" = ")
+                g_emit_expr(value_idx)
+                g_write(";\n")
+
 fn g_get_binding_type(node: Node) -> Int:
     # check for type annotation, otherwise infer from value
     for child in node.children:
@@ -3653,10 +3695,12 @@ pub fn g_emit_module(root_idx: Int):
     # pass 1: struct definitions
     for child in root.children:
         mut node := get_node(child)
+        mut decl_idx := child
         if node.kind == "pub":
-            node = get_node(node.children[0])
+            decl_idx = node.children[0]
+            node = get_node(decl_idx)
         if node.kind == "struct_decl":
-            g_emit_struct_def(child)
+            g_emit_struct_def(decl_idx)
 
     # pass 1b: instantiated generic structs
     g_emit_instantiated_structs(root_idx)
@@ -3664,10 +3708,12 @@ pub fn g_emit_module(root_idx: Int):
     # pass 2: enum definitions
     for child in root.children:
         mut node := get_node(child)
+        mut decl_idx := child
         if node.kind == "pub":
-            node = get_node(node.children[0])
+            decl_idx = node.children[0]
+            node = get_node(decl_idx)
         if node.kind == "enum_decl":
-            g_emit_enum_def(child)
+            g_emit_enum_def(decl_idx)
 
     # pass 2b: result/optional/tuple typedefs
     g_emit_result_typedefs()
@@ -3743,6 +3789,150 @@ pub fn g_emit_module(root_idx: Int):
         g_build_lambda_fwd_decls()
         g_emit_hoisted_lambdas()
         # insert forward declarations at the marked position
+        g_insert_lambda_fwd_decls()
+
+    # pass 8: test runner main
+    if g_test_mode:
+        g_emit_test_runner_main()
+
+# emit C for multiple module roots (multi-module compilation).
+# roots should be in dependency order — imported modules first, main last.
+pub fn g_emit_modules(roots: List[Int]):
+    main_root := roots[roots.len() - 1]
+    g_root_idx = main_root
+
+    # pre-scan all modules for generic function instantiations
+    for root in roots:
+        g_collect_generic_fn_instances(root)
+
+    g_emit_preamble()
+
+    # pass 1: struct definitions from all modules
+    for root in roots:
+        r := get_node(root)
+        for child in r.children:
+            mut node := get_node(child)
+            mut decl_idx := child
+            if node.kind == "pub":
+                decl_idx = node.children[0]
+                node = get_node(decl_idx)
+            if node.kind == "struct_decl":
+                g_emit_struct_def(decl_idx)
+
+    # pass 1b: instantiated generic structs from all modules
+    for root in roots:
+        g_emit_instantiated_structs(root)
+
+    # pass 2: enum definitions from all modules
+    for root in roots:
+        r := get_node(root)
+        for child in r.children:
+            mut node := get_node(child)
+            mut decl_idx := child
+            if node.kind == "pub":
+                decl_idx = node.children[0]
+                node = get_node(decl_idx)
+            if node.kind == "enum_decl":
+                g_emit_enum_def(decl_idx)
+
+    # pass 2b: result/optional/tuple typedefs (once, covers all modules)
+    g_emit_result_typedefs()
+    g_emit_optional_typedefs()
+    g_emit_tuple_typedefs()
+
+    # pass 2c: builtin helpers (once)
+    g_emit_builtin_helpers()
+
+    # pass 3: function forward declarations from all modules
+    for root in roots:
+        is_import := root != main_root
+        r := get_node(root)
+        for child in r.children:
+            mut node := get_node(child)
+            mut decl_idx := child
+            if node.kind == "pub":
+                decl_idx = node.children[0]
+                node = get_node(decl_idx)
+            if node.kind == "fn_decl":
+                g_emit_fn_forward_decl(decl_idx, is_import)
+
+    # pass 3b: method forward declarations from all modules
+    for root in roots:
+        r := get_node(root)
+        for child in r.children:
+            mut node := get_node(child)
+            mut decl_idx := child
+            if node.kind == "pub":
+                decl_idx = node.children[0]
+                node = get_node(decl_idx)
+            if node.kind == "impl_decl":
+                g_emit_impl_forward_decls(decl_idx)
+
+    # pass 3c: instantiated generic function forward declarations
+    g_emit_instantiated_fn_forward_decls()
+    g_write("\n")
+
+    # pass 3d: global declarations from all modules
+    mut has_globals := false
+    for root in roots:
+        if g_emit_global_decls(root):
+            has_globals = true
+    # combined __forge_init_globals for all modules
+    if has_globals:
+        g_has_globals = true
+        g_write("\n")
+        g_write("void __forge_init_globals(void) " + LB + "\n")
+        g_indent = g_indent + 1
+        for root in roots:
+            g_emit_global_init_body(root)
+        g_indent = g_indent - 1
+        g_write(RB + "\n\n")
+
+    # mark position for lambda forward declarations
+    g_lambda_fwd_pos = g_buf.len()
+
+    # pass 4: function definitions from all modules
+    for root in roots:
+        is_import := root != main_root
+        r := get_node(root)
+        for child in r.children:
+            mut node := get_node(child)
+            mut decl_idx := child
+            if node.kind == "pub":
+                decl_idx = node.children[0]
+                node = get_node(decl_idx)
+            if node.kind == "fn_decl":
+                g_emit_fn_def(decl_idx, is_import)
+
+    # pass 5: method definitions from all modules
+    for root in roots:
+        r := get_node(root)
+        for child in r.children:
+            mut node := get_node(child)
+            mut decl_idx := child
+            if node.kind == "pub":
+                decl_idx = node.children[0]
+                node = get_node(decl_idx)
+            if node.kind == "impl_decl":
+                g_emit_impl_method_defs(decl_idx)
+
+    # pass 6: instantiated generic function definitions
+    for root in roots:
+        g_emit_instantiated_fns_from_root(root)
+
+    # pass 6b: test definitions (main module only)
+    if g_test_mode:
+        g_write("int __current_test_failed = 0;\n\n")
+        r := get_node(main_root)
+        for child in r.children:
+            mut node := get_node(child)
+            if node.kind == "test_decl":
+                g_emit_test_def(child)
+
+    # pass 7: hoisted lambda functions
+    if g_lambda_indices.len() > 0:
+        g_build_lambda_fwd_decls()
+        g_emit_hoisted_lambdas()
         g_insert_lambda_fwd_decls()
 
     # pass 8: test runner main

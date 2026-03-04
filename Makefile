@@ -1,4 +1,4 @@
-.PHONY: build release test run clean fmt check
+.PHONY: build release test run clean fmt check self-host
 
 build:
 	zig build
@@ -26,3 +26,6 @@ clean:
 
 fmt:
 	zig fmt src/
+
+self-host: build
+	./zig-out/bin/forge build self-host/forge_main.fg

@@ -1,8 +1,27 @@
-# lambdas (non-capturing)
+# lambdas — non-capturing and capturing (closures)
 
 fn apply(x: Int, f: fn(Int) -> Int) -> Int:
     return f(x)
 
 fn main():
+    # non-capturing lambda
     result := apply(5, fn(x: Int) => x * 2)
+    print(result.to_string())
+
+    # capturing lambda — single variable
+    y := 10
+    result2 := apply(5, fn(x: Int) => x + y)
+    print(result2.to_string())
+
+    # capturing lambda — multiple variables
+    a := 3
+    b := 7
+    result3 := apply(1, fn(x: Int) => x + a + b)
+    print(result3.to_string())
+
+    # closure stored in a binding
+    offset := 100
+    add_offset := fn(x: Int) => x + offset
+    print(apply(42, add_offset).to_string())
+
     print("lambdas work")

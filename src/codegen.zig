@@ -35,11 +35,19 @@ const Scope = Checker.Scope;
 /// failures since we're just building a string buffer.
 pub const EmitError = std.mem.Allocator.Error;
 
+/// a variable captured from an enclosing scope by a closure.
+const CapturedVar = struct {
+    name: []const u8,
+    type_id: TypeId,
+};
+
 /// a lambda body recorded for hoisting as a top-level C function.
 const HoistedLambda = struct {
     index: u32,
     lambda: ast.Lambda,
     fn_type_id: TypeId,
+    /// variables captured from the enclosing scope. empty for non-capturing lambdas.
+    captures: []const CapturedVar,
 };
 
 /// key for looking up function types by signature (for lambda type inference).
@@ -331,23 +339,37 @@ pub const CEmitter = struct {
                     else => continue,
                 } else continue;
 
-                const decl = std.fmt.allocPrint(self.allocator, "static {s} __lambda_{d}(", .{
+                // emit env struct forward declaration for capturing lambdas
+                if (lam.captures.len > 0) {
+                    const env_decl = std.fmt.allocPrint(self.allocator,
+                        "typedef struct {{ ", .{}) catch continue;
+                    fwd_buf.appendSlice(self.allocator, env_decl) catch continue;
+                    for (lam.captures) |cap| {
+                        const field = std.fmt.allocPrint(self.allocator,
+                            "{s} {s}; ", .{ self.cTypeStringForId(cap.type_id), cap.name }) catch continue;
+                        fwd_buf.appendSlice(self.allocator, field) catch continue;
+                    }
+                    const env_end = std.fmt.allocPrint(self.allocator,
+                        "}} __closure_env_{d};\n", .{lam.index}) catch continue;
+                    fwd_buf.appendSlice(self.allocator, env_end) catch continue;
+                }
+
+                // all lambdas take void* __env as first param (uniform closure ABI)
+                const decl = std.fmt.allocPrint(self.allocator, "static {s} __lambda_{d}(void *__env", .{
                     self.cTypeStringForId(func.return_type),
                     lam.index,
                 }) catch continue;
                 fwd_buf.appendSlice(self.allocator, decl) catch continue;
 
-                if (lam.lambda.params.len == 0) {
-                    fwd_buf.appendSlice(self.allocator, "void") catch continue;
-                } else {
-                    for (lam.lambda.params, 0..) |param, i| {
-                        if (i > 0) fwd_buf.appendSlice(self.allocator, ", ") catch continue;
-                        if (i < func.param_types.len) {
-                            fwd_buf.appendSlice(self.allocator, self.cTypeStringForId(func.param_types[i])) catch continue;
-                        }
-                        fwd_buf.append(self.allocator, ' ') catch continue;
-                        fwd_buf.appendSlice(self.allocator, param.name) catch continue;
+                for (lam.lambda.params, 0..) |param, i| {
+                    _ = i;
+                    fwd_buf.appendSlice(self.allocator, ", ") catch continue;
+                    if (param.type_expr) |te| {
+                        const ptid = self.resolveTypeExprToId(te);
+                        fwd_buf.appendSlice(self.allocator, self.cTypeStringForId(ptid)) catch continue;
                     }
+                    fwd_buf.append(self.allocator, ' ') catch continue;
+                    fwd_buf.appendSlice(self.allocator, param.name) catch continue;
                 }
                 fwd_buf.appendSlice(self.allocator, ");\n") catch continue;
             }
@@ -874,6 +896,7 @@ pub const CEmitter = struct {
     /// emit all hoisted lambda function bodies.
     /// lambdas are accumulated during expression emission and emitted as
     /// static top-level C functions after all other function definitions.
+    /// all lambdas take `void* __env` as the first parameter (uniform closure ABI).
     fn emitHoistedLambdas(self: *CEmitter) EmitError!void {
         for (self.hoisted_lambdas.items) |lam| {
             // resolve the function type to get param/return types
@@ -882,26 +905,40 @@ pub const CEmitter = struct {
                 else => continue,
             } else continue;
 
-            // emit: static return_type __lambda_N(param_types...) { body }
+            // env struct typedefs are emitted in forward declarations
+            // emit: static return_type __lambda_N(void* __env, param_types...) { body }
             try self.writeStr("static ");
             try self.writeStr(self.cTypeStringForId(func.return_type));
-            try self.writeFmt(" __lambda_{d}(", .{lam.index});
+            try self.writeFmt(" __lambda_{d}(void *__env", .{lam.index});
 
-            if (lam.lambda.params.len == 0) {
-                try self.writeStr("void");
-            } else {
-                for (lam.lambda.params, 0..) |param, i| {
-                    if (i > 0) try self.writeStr(", ");
-                    if (i < func.param_types.len) {
-                        try self.writeStr(self.cTypeStringForId(func.param_types[i]));
-                    }
-                    try self.writeByte(' ');
-                    try self.writeStr(param.name);
+            for (lam.lambda.params, 0..) |param, i| {
+                _ = i;
+                try self.writeStr(", ");
+                if (param.type_expr) |te| {
+                    const ptid = self.resolveTypeExprToId(te);
+                    try self.writeStr(self.cTypeStringForId(ptid));
+                } else {
+                    try self.writeStr("/* unknown */");
                 }
+                try self.writeByte(' ');
+                try self.writeStr(param.name);
             }
             try self.writeStr(") {\n");
 
             self.indent_level += 1;
+
+            // for capturing lambdas, unpack the env struct
+            if (lam.captures.len > 0) {
+                try self.writeIndent();
+                try self.writeFmt("__closure_env_{d} *__captures = (__closure_env_{d} *)__env;\n", .{ lam.index, lam.index });
+                // create local aliases for captured variables
+                for (lam.captures) |cap| {
+                    try self.writeIndent();
+                    try self.writeStr(self.cTypeStringForId(cap.type_id));
+                    try self.writeFmt(" {s} = __captures->{s};\n", .{ cap.name, cap.name });
+                }
+            }
+
             switch (lam.lambda.body) {
                 .expr => |body_expr| {
                     try self.writeIndent();
@@ -1316,46 +1353,18 @@ pub const CEmitter = struct {
         try self.writeByte(')');
     }
 
-    /// emit a function pointer binding from a TypeId: `ret_type (*name)(param_types)`
+    /// emit a closure-typed binding from a TypeId: `forge_closure_t name`
     fn emitFnPtrBindingFromTypeId(self: *CEmitter, fn_tid: TypeId, name: []const u8) EmitError!void {
-        const func = switch (self.type_table.get(fn_tid) orelse return) {
-            .function => |f| f,
-            else => return,
-        };
-        try self.writeStr(self.cTypeStringForId(func.return_type));
-        try self.writeStr(" (*");
+        _ = fn_tid;
+        try self.writeStr("forge_closure_t ");
         try self.writeStr(name);
-        try self.writeStr(")(");
-        if (func.param_types.len == 0) {
-            try self.writeStr("void");
-        } else {
-            for (func.param_types, 0..) |pt, i| {
-                if (i > 0) try self.writeStr(", ");
-                try self.writeStr(self.cTypeStringForId(pt));
-            }
-        }
-        try self.writeByte(')');
     }
 
-    /// emit a function pointer parameter: `ret_type (*name)(param_types)`
+    /// emit a closure-typed parameter: `forge_closure_t name`
     fn emitFnPtrParam(self: *CEmitter, ft: ast.FnType, name: []const u8) EmitError!void {
-        if (ft.return_type) |rt| {
-            try self.emitTypeExpr(rt);
-        } else {
-            try self.writeStr("void");
-        }
-        try self.writeStr(" (*");
+        _ = ft;
+        try self.writeStr("forge_closure_t ");
         try self.writeStr(name);
-        try self.writeStr(")(");
-        if (ft.params.len == 0) {
-            try self.writeStr("void");
-        } else {
-            for (ft.params, 0..) |param, i| {
-                if (i > 0) try self.writeStr(", ");
-                try self.emitTypeExpr(param);
-            }
-        }
-        try self.writeByte(')');
     }
 
     // ---------------------------------------------------------------
@@ -1400,11 +1409,16 @@ pub const CEmitter = struct {
     }
 
     fn emitBinding(self: *CEmitter, b: *const ast.Binding) EmitError!void {
-        // determine the type and track it for later lookups
-        const tid = if (b.type_expr) |te|
+        // determine the type and track it for later lookups.
+        // for lambda values, inferExprType may return .err (it doesn't
+        // temporarily register params), so fall back to findLambdaType.
+        var tid = if (b.type_expr) |te|
             self.resolveTypeExprToId(te)
         else
             self.inferExprType(b.value);
+        if (tid.isErr() and b.value.kind == .lambda) {
+            tid = self.findLambdaType(b.value.kind.lambda);
+        }
         self.local_types.put(b.name, tid) catch return error.OutOfMemory;
 
         // try propagation: x := foo()! → hoist result to temp, check, early return
@@ -1413,7 +1427,7 @@ pub const CEmitter = struct {
             return;
         }
 
-        // function pointer bindings need special C syntax: ret (*name)(params) = value
+        // closure bindings: forge_closure_t name = value
         if (b.type_expr) |te| {
             if (te.kind == .fn_type) {
                 try self.writeIndent();
@@ -1696,6 +1710,191 @@ pub const CEmitter = struct {
         return .err;
     }
 
+    /// detect variables captured from the enclosing scope by a lambda.
+    /// walks the lambda body's expression tree and finds identifiers that
+    /// are in local_types (enclosing function locals) but not lambda params.
+    fn detectCaptures(self: *const CEmitter, lam: ast.Lambda) EmitError![]const CapturedVar {
+        // build a set of lambda parameter names
+        var param_names = std.StringHashMap(void).init(self.allocator);
+        defer param_names.deinit();
+        for (lam.params) |param| {
+            param_names.put(param.name, {}) catch return error.OutOfMemory;
+        }
+
+        // collect all identifiers used in the lambda body
+        var idents = std.StringHashMap(void).init(self.allocator);
+        defer idents.deinit();
+        switch (lam.body) {
+            .expr => |body_expr| self.collectIdents(body_expr, &idents),
+            .block => |blk| {
+                for (blk.stmts) |*stmt| {
+                    self.collectStmtIdents(stmt, &idents);
+                }
+            },
+        }
+
+        // filter: keep identifiers that are in local_types but not in params
+        // and not top-level functions (module_scope)
+        var captures: std.ArrayList(CapturedVar) = .empty;
+        var iter = idents.iterator();
+        while (iter.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (param_names.contains(name)) continue;
+            if (self.module_scope.lookup(name) != null) continue;
+            if (self.local_types.get(name)) |tid| {
+                if (!tid.isErr()) {
+                    captures.append(self.allocator, .{
+                        .name = name,
+                        .type_id = tid,
+                    }) catch return error.OutOfMemory;
+                }
+            }
+        }
+        return captures.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+    }
+
+    /// recursively collect all identifier names from an expression tree.
+    fn collectIdents(self: *const CEmitter, expr: *const ast.Expr, out: *std.StringHashMap(void)) void {
+        switch (expr.kind) {
+            .ident => |name| {
+                out.put(name, {}) catch {};
+            },
+            .binary => |bin| {
+                self.collectIdents(bin.left, out);
+                self.collectIdents(bin.right, out);
+            },
+            .unary => |un| {
+                self.collectIdents(un.operand, out);
+            },
+            .call => |call| {
+                self.collectIdents(call.callee, out);
+                for (call.args) |arg| {
+                    self.collectIdents(arg.value, out);
+                }
+            },
+            .method_call => |mc| {
+                self.collectIdents(mc.receiver, out);
+                for (mc.args) |arg| {
+                    self.collectIdents(arg.value, out);
+                }
+            },
+            .field_access => |fa| {
+                self.collectIdents(fa.object, out);
+            },
+            .index => |idx| {
+                self.collectIdents(idx.object, out);
+                self.collectIdents(idx.index, out);
+            },
+            .grouped => |inner| {
+                self.collectIdents(inner, out);
+            },
+            .if_expr => |if_e| {
+                self.collectIdents(if_e.condition, out);
+                self.collectIdents(if_e.then_expr, out);
+                for (if_e.elif_branches) |elif| {
+                    self.collectIdents(elif.condition, out);
+                    self.collectIdents(elif.expr, out);
+                }
+                self.collectIdents(if_e.else_expr, out);
+            },
+            .string_interp => |interp| {
+                for (interp.parts) |part| {
+                    switch (part) {
+                        .expr => |e| self.collectIdents(e, out),
+                        .literal => {},
+                    }
+                }
+            },
+            .lambda => |inner_lam| {
+                // don't descend into nested lambdas — they have their own scope
+                _ = inner_lam;
+            },
+            .list => |elems| {
+                for (elems) |e| self.collectIdents(e, out);
+            },
+            .map => |entries| {
+                for (entries) |entry| {
+                    self.collectIdents(entry.key, out);
+                    self.collectIdents(entry.value, out);
+                }
+            },
+            .set => |elems| {
+                for (elems) |e| self.collectIdents(e, out);
+            },
+            .tuple => |elems| {
+                for (elems) |e| self.collectIdents(e, out);
+            },
+            .try_expr => |inner| {
+                self.collectIdents(inner, out);
+            },
+            .unwrap => |inner| {
+                self.collectIdents(inner, out);
+            },
+            .match_expr => |m| {
+                self.collectIdents(m.subject, out);
+                for (m.arms) |arm| {
+                    switch (arm.body) {
+                        .expr => |e| self.collectIdents(e, out),
+                        .block => |blk| {
+                            for (blk.stmts) |*stmt| self.collectStmtIdents(stmt, out);
+                        },
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// collect identifiers from a statement.
+    fn collectStmtIdents(self: *const CEmitter, stmt: *const ast.Stmt, out: *std.StringHashMap(void)) void {
+        switch (stmt.kind) {
+            .binding => |b| {
+                self.collectIdents(b.value, out);
+            },
+            .assignment => |a| {
+                self.collectIdents(a.target, out);
+                self.collectIdents(a.value, out);
+            },
+            .expr_stmt => |e| {
+                self.collectIdents(e, out);
+            },
+            .return_stmt => |r| {
+                if (r.value) |v| self.collectIdents(v, out);
+            },
+            .if_stmt => |if_s| {
+                self.collectIdents(if_s.condition, out);
+                for (if_s.then_block.stmts) |*s| self.collectStmtIdents(s, out);
+                for (if_s.elif_branches) |elif| {
+                    self.collectIdents(elif.condition, out);
+                    for (elif.block.stmts) |*s| self.collectStmtIdents(s, out);
+                }
+                if (if_s.else_block) |eb| {
+                    for (eb.stmts) |*s| self.collectStmtIdents(s, out);
+                }
+            },
+            .while_stmt => |ws| {
+                self.collectIdents(ws.condition, out);
+                for (ws.body.stmts) |*s| self.collectStmtIdents(s, out);
+            },
+            .for_stmt => |fs| {
+                self.collectIdents(fs.iterable, out);
+                for (fs.body.stmts) |*s| self.collectStmtIdents(s, out);
+            },
+            .match_stmt => |m| {
+                self.collectIdents(m.subject, out);
+                for (m.arms) |arm| {
+                    switch (arm.body) {
+                        .expr => |e| self.collectIdents(e, out),
+                        .block => |blk| {
+                            for (blk.stmts) |*s| self.collectStmtIdents(s, out);
+                        },
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
     /// check if a TypeId represents a Result type.
     fn isResultType(self: *const CEmitter, tid: TypeId) bool {
         if (tid.isErr()) return false;
@@ -1840,19 +2039,32 @@ pub const CEmitter = struct {
             .match_expr => |m| try self.emitMatchAsIfChain(&m, false, false),
             .string_interp => |interp| try self.emitStringInterp(&interp),
             .lambda => |lam| {
-                // non-capturing lambda: hoist body to a top-level C function,
-                // emit the function name as the reference at use site.
+                // hoist body to a top-level C function, emit a closure struct
+                // at the use site. captures are detected by walking the lambda
+                // body and finding identifiers from the enclosing scope.
                 const idx = self.lambda_counter;
                 self.lambda_counter += 1;
-                // find the function type for this lambda in the type table.
-                // we match by param types — the checker has already created the type.
                 const fn_tid = self.findLambdaType(lam);
+                const captures = self.detectCaptures(lam) catch &.{};
                 try self.hoisted_lambdas.append(self.allocator, .{
                     .index = idx,
                     .lambda = lam,
                     .fn_type_id = fn_tid,
+                    .captures = captures,
                 });
-                try self.writeFmt("__lambda_{d}", .{idx});
+                if (captures.len > 0) {
+                    // capturing lambda: heap-allocate env struct, build closure.
+                    // uses a statement-expression so it can appear in expression context.
+                    try self.writeFmt("(__extension__({{ __closure_env_{d} *__env_{d} = ", .{ idx, idx });
+                    try self.writeFmt("(__closure_env_{d} *)malloc(sizeof(__closure_env_{d})); ", .{ idx, idx });
+                    for (captures) |cap| {
+                        try self.writeFmt("__env_{d}->{s} = {s}; ", .{ idx, cap.name, cap.name });
+                    }
+                    try self.writeFmt("(forge_closure_t){{ (void*)__lambda_{d}, (void*)__env_{d} }}; }}))", .{ idx, idx });
+                } else {
+                    // non-capturing: closure with NULL env
+                    try self.writeFmt("(forge_closure_t){{ (void*)__lambda_{d}, NULL }}", .{idx});
+                }
             },
             .list => |elems| try self.emitListLiteral(elems),
             .map => |entries| try self.emitMapLiteral(entries),
@@ -2162,14 +2374,30 @@ pub const CEmitter = struct {
             }
         }
 
-        // check if this is a local function pointer variable (e.g., lambda binding)
+        // check if this is a closure variable (e.g., lambda binding or fn parameter)
         if (self.local_types.get(name)) |tid| {
             if (!tid.isErr()) {
                 if (self.type_table.get(tid)) |ty| {
                     if (ty == .function) {
-                        // function pointer call — emit name directly, no fg_ prefix
+                        // closure call: cast fn_ptr and invoke with env_ptr
+                        const func = ty.function;
+                        try self.writeStr("((");
+                        try self.writeStr(self.cTypeStringForId(func.return_type));
+                        try self.writeStr(" (*)(void*");
+                        for (func.param_types) |pt| {
+                            try self.writeStr(", ");
+                            try self.writeStr(self.cTypeStringForId(pt));
+                        }
+                        try self.writeStr("))");
                         try self.writeStr(name);
-                        try self.emitArgList(call.args);
+                        try self.writeStr(".fn_ptr)(");
+                        try self.writeStr(name);
+                        try self.writeStr(".env_ptr");
+                        for (call.args) |arg| {
+                            try self.writeStr(", ");
+                            try self.emitExpr(arg.value);
+                        }
+                        try self.writeByte(')');
                         return;
                     }
                 }
@@ -3570,24 +3798,8 @@ pub const CEmitter = struct {
                     try self.writeStr("/* tuple type */");
                 }
             },
-            .fn_type => |ft| {
-                // emit C function pointer type: return_type (*)(param_types)
-                // note: without a name, we can only emit the unnamed pointer type
-                if (ft.return_type) |rt| {
-                    try self.emitTypeExpr(rt);
-                } else {
-                    try self.writeStr("void");
-                }
-                try self.writeStr(" (*)(");
-                if (ft.params.len == 0) {
-                    try self.writeStr("void");
-                } else {
-                    for (ft.params, 0..) |param, i| {
-                        if (i > 0) try self.writeStr(", ");
-                        try self.emitTypeExpr(param);
-                    }
-                }
-                try self.writeByte(')');
+            .fn_type => {
+                try self.writeStr("forge_closure_t");
             },
         }
     }
@@ -3628,6 +3840,10 @@ pub const CEmitter = struct {
                     },
                     .set => {
                         try self.writeStr("forge_set_t");
+                        return;
+                    },
+                    .function => {
+                        try self.writeStr("forge_closure_t");
                         return;
                     },
                     else => {},
@@ -3704,6 +3920,7 @@ pub const CEmitter = struct {
                 .list => "forge_list_t",
                 .map => "forge_map_t",
                 .set => "forge_set_t",
+                .function => "forge_closure_t",
                 // optional and result types should have been registered in mangled_names
                 // during emitOptionalTypedefs/emitResultTypedefs — fall through to unknown
                 else => "/* unknown */",

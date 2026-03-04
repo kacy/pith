@@ -4,13 +4,13 @@
 # resolves imports recursively, runs the type checker on all modules,
 # then generates C code.
 #
-# usage: forge run self-host/codegen_main.fg <file.fg>
+# usage: forge run self-host/codegen_main.fg [--test] <file.fg>
 
 from lexer import lex_all
 from parser import parse
 from ast import get_node
 from checker import c_init, c_run_module
-from codegen import g_init, g_emit_module, g_emit_modules, g_get_output
+from codegen import g_init, g_set_test_mode, g_emit_module, g_emit_modules, g_get_output
 
 # extract directory from a file path.
 # "foo/bar/baz.fg" -> "foo/bar", "baz.fg" -> "."
@@ -89,10 +89,20 @@ fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
 fn codegen_and_print() -> String!:
     a := args()
     if a.len() < 2:
-        print("usage: forge run self-host/codegen_main.fg <file.fg>")
+        print("usage: forge run self-host/codegen_main.fg [--test] <file.fg>")
         exit(1)
 
-    path := a[1]
+    # parse --test flag
+    mut path_idx := 1
+    mut test_mode := false
+    if a[1] == "--test":
+        test_mode = true
+        path_idx = 2
+        if a.len() < 3:
+            print("usage: forge run self-host/codegen_main.fg --test <file.fg>")
+            exit(1)
+
+    path := a[path_idx]
     content := read_file(path)!
     tokens := lex_all(content)
     root := parse(tokens)
@@ -109,6 +119,8 @@ fn codegen_and_print() -> String!:
 
     # emit all modules as one C file
     g_init()
+    if test_mode:
+        g_set_test_mode()
     if import_roots.len() == 0:
         # single-file — use existing path
         g_emit_module(root)

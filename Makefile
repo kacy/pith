@@ -1,7 +1,10 @@
-.PHONY: build test run clean fmt check
+.PHONY: build release test run clean fmt check
 
 build:
 	zig build
+
+release:
+	zig build release
 
 check: build
 	@for f in examples/*.fg; do \

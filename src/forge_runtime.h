@@ -1256,6 +1256,38 @@ static inline double forge_random_float(void) {
     return drand48();
 }
 
+// random_seed(Int) -> Void — set RNG seed for reproducible output
+static inline void forge_random_seed(int64_t seed) {
+    srand48((long)seed);
+    __forge_rng_seeded = 1;
+}
+
+// random_string(Int) -> String — N random alphanumeric chars
+static inline forge_string_t forge_random_string(int64_t n) {
+    static const char alphanum[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    __forge_seed_rng();
+    if (n < 0) n = 0;
+    char *buf = forge_str_alloc(n);
+    for (int64_t i = 0; i < n; i++)
+        buf[i] = alphanum[lrand48() % 62];
+    buf[n] = '\0';
+    return (forge_string_t){ .data = buf, .len = n };
+}
+
+// format_time(epoch_ms, format_string) -> String — strftime wrapper
+static inline forge_string_t forge_format_time(int64_t epoch_ms, forge_string_t fmt) {
+    time_t secs = (time_t)(epoch_ms / 1000);
+    struct tm *t = localtime(&secs);
+    char *fmt_cstr = forge_cstr(fmt);
+    char buf[256];
+    size_t len = strftime(buf, sizeof(buf), fmt_cstr, t);
+    free(fmt_cstr);
+    char *result = forge_str_alloc((int64_t)len);
+    memcpy(result, buf, len);
+    result[len] = '\0';
+    return (forge_string_t){ .data = result, .len = (int64_t)len };
+}
+
 // exec_output — internal impl, returns false on error.
 // codegen emits a wrapper that returns forge_result_forge_string_t.
 static inline bool forge_exec_output_impl(forge_string_t cmd, forge_string_t *out) {

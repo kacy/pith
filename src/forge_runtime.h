@@ -2124,6 +2124,117 @@ static inline void forge_log_error(forge_string_t msg) { forge_log_impl("ERROR",
 static inline void forge_log_debug(forge_string_t msg) { forge_log_impl("DEBUG", msg); }
 
 // ---------------------------------------------------------------
+// encoding — base64 and hex
+// ---------------------------------------------------------------
+
+static const char forge_b64_enc[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static inline forge_string_t forge_base64_encode(forge_string_t input) {
+    int64_t out_len = 4 * ((input.len + 2) / 3);
+    char *buf = forge_str_alloc(out_len);
+    int64_t i = 0, j = 0;
+    while (i + 2 < input.len) {
+        uint8_t a = (uint8_t)input.data[i], b = (uint8_t)input.data[i+1], c = (uint8_t)input.data[i+2];
+        buf[j++] = forge_b64_enc[a >> 2];
+        buf[j++] = forge_b64_enc[((a & 3) << 4) | (b >> 4)];
+        buf[j++] = forge_b64_enc[((b & 15) << 2) | (c >> 6)];
+        buf[j++] = forge_b64_enc[c & 63];
+        i += 3;
+    }
+    if (i < input.len) {
+        uint8_t a = (uint8_t)input.data[i];
+        buf[j++] = forge_b64_enc[a >> 2];
+        if (i + 1 < input.len) {
+            uint8_t b = (uint8_t)input.data[i+1];
+            buf[j++] = forge_b64_enc[((a & 3) << 4) | (b >> 4)];
+            buf[j++] = forge_b64_enc[(b & 15) << 2];
+        } else {
+            buf[j++] = forge_b64_enc[(a & 3) << 4];
+            buf[j++] = '=';
+        }
+        buf[j++] = '=';
+    }
+    buf[j] = '\0';
+    return (forge_string_t){ .data = buf, .len = j };
+}
+
+// decode table: maps ASCII byte to 6-bit value, 255 = invalid
+static const uint8_t forge_b64_dec[256] = {
+    ['A']=0,['B']=1,['C']=2,['D']=3,['E']=4,['F']=5,['G']=6,['H']=7,
+    ['I']=8,['J']=9,['K']=10,['L']=11,['M']=12,['N']=13,['O']=14,['P']=15,
+    ['Q']=16,['R']=17,['S']=18,['T']=19,['U']=20,['V']=21,['W']=22,['X']=23,
+    ['Y']=24,['Z']=25,['a']=26,['b']=27,['c']=28,['d']=29,['e']=30,['f']=31,
+    ['g']=32,['h']=33,['i']=34,['j']=35,['k']=36,['l']=37,['m']=38,['n']=39,
+    ['o']=40,['p']=41,['q']=42,['r']=43,['s']=44,['t']=45,['u']=46,['v']=47,
+    ['w']=48,['x']=49,['y']=50,['z']=51,['0']=52,['1']=53,['2']=54,['3']=55,
+    ['4']=56,['5']=57,['6']=58,['7']=59,['8']=60,['9']=61,['+']=62,['/']=63,
+};
+
+// returns false on invalid input, true on success
+static inline bool forge_base64_decode_impl(forge_string_t input, forge_string_t *out) {
+    // strip whitespace and count padding
+    if (input.len % 4 != 0) return false;
+    int64_t pad = 0;
+    if (input.len > 0 && input.data[input.len-1] == '=') pad++;
+    if (input.len > 1 && input.data[input.len-2] == '=') pad++;
+    int64_t out_len = (input.len / 4) * 3 - pad;
+    char *buf = forge_str_alloc(out_len);
+    int64_t i = 0, j = 0;
+    while (i < input.len) {
+        uint8_t a = forge_b64_dec[(uint8_t)input.data[i]];
+        uint8_t b = forge_b64_dec[(uint8_t)input.data[i+1]];
+        uint8_t c = (input.data[i+2] == '=') ? 0 : forge_b64_dec[(uint8_t)input.data[i+2]];
+        uint8_t d = (input.data[i+3] == '=') ? 0 : forge_b64_dec[(uint8_t)input.data[i+3]];
+        buf[j++] = (char)((a << 2) | (b >> 4));
+        if (input.data[i+2] != '=') buf[j++] = (char)(((b & 15) << 4) | (c >> 2));
+        if (input.data[i+3] != '=') buf[j++] = (char)(((c & 3) << 6) | d);
+        i += 4;
+    }
+    buf[j] = '\0';
+    *out = (forge_string_t){ .data = buf, .len = out_len };
+    return true;
+}
+
+static const char forge_hex_chars[] = "0123456789abcdef";
+
+static inline forge_string_t forge_hex_encode(forge_string_t input) {
+    int64_t out_len = input.len * 2;
+    char *buf = forge_str_alloc(out_len);
+    for (int64_t i = 0; i < input.len; i++) {
+        uint8_t byte = (uint8_t)input.data[i];
+        buf[i * 2] = forge_hex_chars[byte >> 4];
+        buf[i * 2 + 1] = forge_hex_chars[byte & 15];
+    }
+    buf[out_len] = '\0';
+    return (forge_string_t){ .data = buf, .len = out_len };
+}
+
+// returns false on invalid input (odd length or non-hex chars)
+static inline bool forge_hex_decode_impl(forge_string_t input, forge_string_t *out) {
+    if (input.len % 2 != 0) return false;
+    int64_t out_len = input.len / 2;
+    char *buf = forge_str_alloc(out_len);
+    for (int64_t i = 0; i < out_len; i++) {
+        uint8_t hi, lo;
+        char ch = input.data[i * 2];
+        char cl = input.data[i * 2 + 1];
+        if (ch >= '0' && ch <= '9') hi = (uint8_t)(ch - '0');
+        else if (ch >= 'a' && ch <= 'f') hi = (uint8_t)(ch - 'a' + 10);
+        else if (ch >= 'A' && ch <= 'F') hi = (uint8_t)(ch - 'A' + 10);
+        else { free(buf); return false; }
+        if (cl >= '0' && cl <= '9') lo = (uint8_t)(cl - '0');
+        else if (cl >= 'a' && cl <= 'f') lo = (uint8_t)(cl - 'a' + 10);
+        else if (cl >= 'A' && cl <= 'F') lo = (uint8_t)(cl - 'A' + 10);
+        else { free(buf); return false; }
+        buf[i] = (char)((hi << 4) | lo);
+    }
+    buf[out_len] = '\0';
+    *out = (forge_string_t){ .data = buf, .len = out_len };
+    return true;
+}
+
+// ---------------------------------------------------------------
 // concurrency — task header and sync primitives
 // ---------------------------------------------------------------
 

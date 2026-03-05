@@ -1012,6 +1012,30 @@ fn g_emit_builtin_helpers():
     g_write("    return r;\n")
     g_write(RB + "\n\n")
 
+    # base64_decode(String) -> String!
+    g_write("static forge_result_forge_string_t forge_base64_decode(forge_string_t input) " + LB + "\n")
+    g_write("    forge_string_t decoded;\n")
+    g_write("    if (forge_base64_decode_impl(input, &decoded)) " + LB + "\n")
+    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = decoded;\n")
+    g_write("        return r;\n")
+    g_write("    " + RB + "\n")
+    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
+    g_write("    r.err = FORGE_STRING_LIT(\"invalid base64 input\");\n")
+    g_write("    return r;\n")
+    g_write(RB + "\n\n")
+
+    # hex_decode(String) -> String!
+    g_write("static forge_result_forge_string_t forge_hex_decode(forge_string_t input) " + LB + "\n")
+    g_write("    forge_string_t decoded;\n")
+    g_write("    if (forge_hex_decode_impl(input, &decoded)) " + LB + "\n")
+    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = decoded;\n")
+    g_write("        return r;\n")
+    g_write("    " + RB + "\n")
+    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
+    g_write("    r.err = FORGE_STRING_LIT(\"invalid hex input\");\n")
+    g_write("    return r;\n")
+    g_write(RB + "\n\n")
+
 # ---------------------------------------------------------------
 # function forward declarations
 # ---------------------------------------------------------------
@@ -1907,6 +1931,8 @@ fn g_is_forge_builtin(name: String) -> Bool:
     if name == "json_new_null" or name == "json_new_bool" or name == "json_new_int" or name == "json_new_float":
         return true
     if name == "json_new_string" or name == "json_new_array" or name == "json_new_object":
+        return true
+    if name == "base64_encode" or name == "base64_decode" or name == "hex_encode" or name == "hex_decode":
         return true
     return false
 

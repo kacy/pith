@@ -227,7 +227,7 @@ pub const Checker = struct {
             try self.registerBuiltin(n, int_to_void);
         // (Int) -> Int
         const int_to_int = try self.addFnType(&.{.int}, .int);
-        for ([_][]const u8{ "json_get_int", "json_array_len", "json_new_int" }) |n|
+        for ([_][]const u8{ "json_get_int", "json_array_len", "json_new_int", "url_port" }) |n|
             try self.registerBuiltin(n, int_to_int);
         // (Int) -> Float
         try self.registerBuiltin("json_get_float", try self.addFnType(&.{.int}, .float));
@@ -235,7 +235,7 @@ pub const Checker = struct {
         try self.registerBuiltin("json_get_bool", try self.addFnType(&.{.int}, .bool));
         // (Int) -> String
         const int_to_str = try self.addFnType(&.{.int}, .string);
-        for ([_][]const u8{ "chr", "fmt_hex", "fmt_oct", "fmt_bin", "json_type", "json_get_string", "json_encode", "random_string" }) |n|
+        for ([_][]const u8{ "chr", "fmt_hex", "fmt_oct", "fmt_bin", "json_type", "json_get_string", "json_encode", "random_string", "url_scheme", "url_host", "url_path", "url_query", "url_fragment", "url_to_string" }) |n|
             try self.registerBuiltin(n, int_to_str);
         // (Int) -> List[String]
         try self.registerBuiltin("json_object_keys", try self.addFnType(&.{.int}, list_string));
@@ -279,7 +279,7 @@ pub const Checker = struct {
             try self.registerBuiltin(n, str_to_void);
         // (String) -> Int
         const str_to_int = try self.addFnType(&.{.string}, .int);
-        for ([_][]const u8{ "exec", "json_parse", "json_new_string", "hash_fnv1a" }) |n|
+        for ([_][]const u8{ "exec", "json_parse", "json_new_string", "hash_fnv1a", "url_parse" }) |n|
             try self.registerBuiltin(n, str_to_int);
         // (String) -> Bool
         const str_to_bool = try self.addFnType(&.{.string}, .bool);
@@ -287,7 +287,7 @@ pub const Checker = struct {
             try self.registerBuiltin(n, str_to_bool);
         // (String) -> String
         const str_to_str = try self.addFnType(&.{.string}, .string);
-        for ([_][]const u8{ "path_dir", "path_base", "path_ext", "path_stem", "base64_encode", "hex_encode", "hash_sha256" }) |n|
+        for ([_][]const u8{ "path_dir", "path_base", "path_ext", "path_stem", "base64_encode", "hex_encode", "hash_sha256", "percent_encode", "percent_decode" }) |n|
             try self.registerBuiltin(n, str_to_str);
         // (String) -> String?
         try self.registerBuiltin("env", try self.addFnType(&.{.string}, opt_string));

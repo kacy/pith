@@ -1,0 +1,32 @@
+# url parsing and percent-encoding
+
+fn main():
+    # parse a full URL
+    u := url_parse("https://example.com:8080/api/v1?key=value#section")
+    print("scheme: " + url_scheme(u))
+    print("host: " + url_host(u))
+    print("port: " + url_port(u).to_string())
+    print("path: " + url_path(u))
+    print("query: " + url_query(u))
+    print("fragment: " + url_fragment(u))
+
+    # reconstruct
+    print("full: " + url_to_string(u))
+
+    # simple URL without port/query/fragment
+    u2 := url_parse("http://localhost/index.html")
+    print("scheme2: " + url_scheme(u2))
+    print("host2: " + url_host(u2))
+    print("port2: " + url_port(u2).to_string())
+    print("path2: " + url_path(u2))
+
+    # percent encode/decode
+    encoded := percent_encode("hello world & more")
+    print("encoded: " + encoded)
+    decoded := percent_decode(encoded)
+    print("decoded: " + decoded)
+
+    # round-trip
+    original := "foo=bar baz&x=1+2"
+    rt := percent_decode(percent_encode(original))
+    print("round-trip: " + rt)

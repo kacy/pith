@@ -97,6 +97,16 @@ const forge_prefix_builtins = std.StaticStringMap(void).initComptime(.{
     .{ "format_time", {} },
     .{ "random_seed", {} },
     .{ "random_string", {} },
+    .{ "url_parse", {} },
+    .{ "url_scheme", {} },
+    .{ "url_host", {} },
+    .{ "url_port", {} },
+    .{ "url_path", {} },
+    .{ "url_query", {} },
+    .{ "url_fragment", {} },
+    .{ "url_to_string", {} },
+    .{ "percent_encode", {} },
+    .{ "percent_decode", {} },
 });
 
 // ---------------------------------------------------------------

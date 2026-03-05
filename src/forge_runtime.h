@@ -2343,6 +2343,263 @@ static inline int64_t forge_hash_fnv1a(forge_string_t input) {
 }
 
 // ---------------------------------------------------------------
+// URL parsing
+// ---------------------------------------------------------------
+
+typedef struct {
+    forge_string_t scheme;
+    forge_string_t host;
+    int64_t port;
+    forge_string_t path;
+    forge_string_t query;
+    forge_string_t fragment;
+} forge_url_t;
+
+static forge_url_t *forge_url_pool = NULL;
+static int64_t forge_url_pool_len = 0;
+static int64_t forge_url_pool_cap = 0;
+
+static inline int64_t forge_url_alloc(void) {
+    if (forge_url_pool_len >= forge_url_pool_cap) {
+        int64_t new_cap = forge_url_pool_cap == 0 ? 16 : forge_url_pool_cap * 2;
+        forge_url_t *p = (forge_url_t *)realloc(forge_url_pool, (size_t)new_cap * sizeof(forge_url_t));
+        if (!p) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        forge_url_pool = p;
+        forge_url_pool_cap = new_cap;
+    }
+    int64_t idx = forge_url_pool_len++;
+    memset(&forge_url_pool[idx], 0, sizeof(forge_url_t));
+    return idx;
+}
+
+// parse URL: scheme://host:port/path?query#fragment
+static inline int64_t forge_url_parse(forge_string_t input) {
+    int64_t idx = forge_url_alloc();
+    forge_url_t *u = &forge_url_pool[idx];
+    u->port = -1;
+    const char *s = input.data;
+    int64_t len = input.len;
+    int64_t pos = 0;
+
+    // scheme: everything before "://"
+    int64_t scheme_end = -1;
+    for (int64_t i = 0; i + 2 < len; i++) {
+        if (s[i] == ':' && s[i+1] == '/' && s[i+2] == '/') { scheme_end = i; break; }
+    }
+    if (scheme_end > 0) {
+        char *buf = forge_str_alloc(scheme_end);
+        memcpy(buf, s, (size_t)scheme_end);
+        buf[scheme_end] = '\0';
+        u->scheme = (forge_string_t){ .data = buf, .len = scheme_end };
+        pos = scheme_end + 3;
+    }
+
+    // host (and optional port)
+    int64_t host_start = pos;
+    int64_t host_end = len;
+    for (int64_t i = pos; i < len; i++) {
+        if (s[i] == '/' || s[i] == '?' || s[i] == '#') { host_end = i; break; }
+    }
+    // check for port in host part
+    int64_t colon = -1;
+    for (int64_t i = host_start; i < host_end; i++) {
+        if (s[i] == ':') { colon = i; break; }
+    }
+    if (colon >= 0) {
+        int64_t hlen = colon - host_start;
+        char *hbuf = forge_str_alloc(hlen);
+        memcpy(hbuf, s + host_start, (size_t)hlen);
+        hbuf[hlen] = '\0';
+        u->host = (forge_string_t){ .data = hbuf, .len = hlen };
+        // parse port
+        int64_t port = 0;
+        for (int64_t i = colon + 1; i < host_end; i++) {
+            if (s[i] >= '0' && s[i] <= '9') port = port * 10 + (s[i] - '0');
+            else break;
+        }
+        u->port = port;
+    } else {
+        int64_t hlen = host_end - host_start;
+        char *hbuf = forge_str_alloc(hlen);
+        memcpy(hbuf, s + host_start, (size_t)hlen);
+        hbuf[hlen] = '\0';
+        u->host = (forge_string_t){ .data = hbuf, .len = hlen };
+    }
+    pos = host_end;
+
+    // path: everything before ? or #
+    int64_t path_start = pos;
+    int64_t path_end = len;
+    for (int64_t i = pos; i < len; i++) {
+        if (s[i] == '?' || s[i] == '#') { path_end = i; break; }
+    }
+    int64_t plen = path_end - path_start;
+    if (plen > 0) {
+        char *pbuf = forge_str_alloc(plen);
+        memcpy(pbuf, s + path_start, (size_t)plen);
+        pbuf[plen] = '\0';
+        u->path = (forge_string_t){ .data = pbuf, .len = plen };
+    }
+    pos = path_end;
+
+    // query: after ? before #
+    if (pos < len && s[pos] == '?') {
+        pos++;
+        int64_t qstart = pos;
+        int64_t qend = len;
+        for (int64_t i = pos; i < len; i++) {
+            if (s[i] == '#') { qend = i; break; }
+        }
+        int64_t qlen = qend - qstart;
+        char *qbuf = forge_str_alloc(qlen);
+        memcpy(qbuf, s + qstart, (size_t)qlen);
+        qbuf[qlen] = '\0';
+        u->query = (forge_string_t){ .data = qbuf, .len = qlen };
+        pos = qend;
+    }
+
+    // fragment: after #
+    if (pos < len && s[pos] == '#') {
+        pos++;
+        int64_t flen = len - pos;
+        char *fbuf = forge_str_alloc(flen);
+        memcpy(fbuf, s + pos, (size_t)flen);
+        fbuf[flen] = '\0';
+        u->fragment = (forge_string_t){ .data = fbuf, .len = flen };
+    }
+
+    return idx;
+}
+
+static inline forge_string_t forge_url_scheme(int64_t handle) {
+    if (handle < 0 || handle >= forge_url_pool_len) return forge_string_empty;
+    return forge_url_pool[handle].scheme;
+}
+
+static inline forge_string_t forge_url_host(int64_t handle) {
+    if (handle < 0 || handle >= forge_url_pool_len) return forge_string_empty;
+    return forge_url_pool[handle].host;
+}
+
+static inline int64_t forge_url_port(int64_t handle) {
+    if (handle < 0 || handle >= forge_url_pool_len) return -1;
+    return forge_url_pool[handle].port;
+}
+
+static inline forge_string_t forge_url_path(int64_t handle) {
+    if (handle < 0 || handle >= forge_url_pool_len) return forge_string_empty;
+    return forge_url_pool[handle].path;
+}
+
+static inline forge_string_t forge_url_query(int64_t handle) {
+    if (handle < 0 || handle >= forge_url_pool_len) return forge_string_empty;
+    return forge_url_pool[handle].query;
+}
+
+static inline forge_string_t forge_url_fragment(int64_t handle) {
+    if (handle < 0 || handle >= forge_url_pool_len) return forge_string_empty;
+    return forge_url_pool[handle].fragment;
+}
+
+// reconstruct URL from components
+static inline forge_string_t forge_url_to_string(int64_t handle) {
+    if (handle < 0 || handle >= forge_url_pool_len) return forge_string_empty;
+    forge_url_t *u = &forge_url_pool[handle];
+    // calculate total length
+    int64_t total = 0;
+    if (u->scheme.len > 0) total += u->scheme.len + 3; // scheme://
+    total += u->host.len;
+    char port_buf[16] = {0};
+    int port_len = 0;
+    if (u->port >= 0) {
+        port_len = snprintf(port_buf, sizeof(port_buf), "%" PRId64, u->port);
+        total += 1 + port_len; // :port
+    }
+    total += u->path.len;
+    if (u->query.len > 0) total += 1 + u->query.len; // ?query
+    if (u->fragment.len > 0) total += 1 + u->fragment.len; // #fragment
+    char *buf = forge_str_alloc(total);
+    int64_t pos = 0;
+    if (u->scheme.len > 0) {
+        memcpy(buf + pos, u->scheme.data, (size_t)u->scheme.len); pos += u->scheme.len;
+        memcpy(buf + pos, "://", 3); pos += 3;
+    }
+    memcpy(buf + pos, u->host.data, (size_t)u->host.len); pos += u->host.len;
+    if (u->port >= 0) {
+        buf[pos++] = ':';
+        memcpy(buf + pos, port_buf, (size_t)port_len); pos += port_len;
+    }
+    memcpy(buf + pos, u->path.data, (size_t)u->path.len); pos += u->path.len;
+    if (u->query.len > 0) {
+        buf[pos++] = '?';
+        memcpy(buf + pos, u->query.data, (size_t)u->query.len); pos += u->query.len;
+    }
+    if (u->fragment.len > 0) {
+        buf[pos++] = '#';
+        memcpy(buf + pos, u->fragment.data, (size_t)u->fragment.len); pos += u->fragment.len;
+    }
+    buf[pos] = '\0';
+    return (forge_string_t){ .data = buf, .len = pos };
+}
+
+// percent-encode: encodes non-unreserved chars (RFC 3986)
+static inline forge_string_t forge_percent_encode(forge_string_t input) {
+    // count how many bytes need encoding
+    int64_t count = 0;
+    for (int64_t i = 0; i < input.len; i++) {
+        uint8_t c = (uint8_t)input.data[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~')
+            count += 1;
+        else
+            count += 3;
+    }
+    char *buf = forge_str_alloc(count);
+    int64_t j = 0;
+    for (int64_t i = 0; i < input.len; i++) {
+        uint8_t c = (uint8_t)input.data[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+            buf[j++] = (char)c;
+        } else {
+            buf[j++] = '%';
+            buf[j++] = forge_hex_chars[c >> 4];
+            buf[j++] = forge_hex_chars[c & 15];
+        }
+    }
+    buf[j] = '\0';
+    return (forge_string_t){ .data = buf, .len = count };
+}
+
+// percent-decode: decode %XX sequences
+static inline forge_string_t forge_percent_decode(forge_string_t input) {
+    char *buf = forge_str_alloc(input.len); // output <= input length
+    int64_t j = 0;
+    for (int64_t i = 0; i < input.len; i++) {
+        if (input.data[i] == '%' && i + 2 < input.len) {
+            uint8_t hi, lo;
+            char ch = input.data[i+1], cl = input.data[i+2];
+            if (ch >= '0' && ch <= '9') hi = (uint8_t)(ch - '0');
+            else if (ch >= 'a' && ch <= 'f') hi = (uint8_t)(ch - 'a' + 10);
+            else if (ch >= 'A' && ch <= 'F') hi = (uint8_t)(ch - 'A' + 10);
+            else { buf[j++] = input.data[i]; continue; }
+            if (cl >= '0' && cl <= '9') lo = (uint8_t)(cl - '0');
+            else if (cl >= 'a' && cl <= 'f') lo = (uint8_t)(cl - 'a' + 10);
+            else if (cl >= 'A' && cl <= 'F') lo = (uint8_t)(cl - 'A' + 10);
+            else { buf[j++] = input.data[i]; continue; }
+            buf[j++] = (char)((hi << 4) | lo);
+            i += 2;
+        } else if (input.data[i] == '+') {
+            buf[j++] = ' ';
+        } else {
+            buf[j++] = input.data[i];
+        }
+    }
+    buf[j] = '\0';
+    return (forge_string_t){ .data = buf, .len = j };
+}
+
+// ---------------------------------------------------------------
 // concurrency — task header and sync primitives
 // ---------------------------------------------------------------
 

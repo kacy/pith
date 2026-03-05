@@ -224,11 +224,9 @@ pub const Checker = struct {
             try self.registerBuiltin(n, int_to_void);
         // (Int) -> Int
         const int_to_int = try self.addFnType(&.{.int}, .int);
-        for ([_][]const u8{"url_port"}) |n|
-            try self.registerBuiltin(n, int_to_int);
         // (Int) -> String
         const int_to_str = try self.addFnType(&.{.int}, .string);
-        for ([_][]const u8{ "chr", "random_string", "url_scheme", "url_host", "url_path", "url_query", "url_fragment", "url_to_string" }) |n|
+        for ([_][]const u8{ "chr", "random_string" }) |n|
             try self.registerBuiltin(n, int_to_str);
         // (Int) -> Int (bitwise unary)
         try self.registerBuiltin("bit_not", int_to_int);
@@ -265,7 +263,7 @@ pub const Checker = struct {
             try self.registerBuiltin(n, str_to_void);
         // (String) -> Int
         const str_to_int = try self.addFnType(&.{.string}, .int);
-        for ([_][]const u8{ "exec", "ord", "hash_fnv1a", "url_parse" }) |n|
+        for ([_][]const u8{ "exec", "ord", "hash_fnv1a" }) |n|
             try self.registerBuiltin(n, str_to_int);
         // (String) -> Bool
         const str_to_bool = try self.addFnType(&.{.string}, .bool);
@@ -273,7 +271,7 @@ pub const Checker = struct {
             try self.registerBuiltin(n, str_to_bool);
         // (String) -> String
         const str_to_str = try self.addFnType(&.{.string}, .string);
-        for ([_][]const u8{ "base64_encode", "hex_encode", "hash_sha256", "percent_encode", "percent_decode" }) |n|
+        for ([_][]const u8{ "base64_encode", "hex_encode", "hash_sha256" }) |n|
             try self.registerBuiltin(n, str_to_str);
         // (String) -> String?
         try self.registerBuiltin("env", try self.addFnType(&.{.string}, opt_string));

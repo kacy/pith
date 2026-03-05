@@ -435,6 +435,101 @@ pub const Checker = struct {
         } });
         try self.module_scope.define("fmt_float", .{ .type_id = fmt_float_type, .is_mut = false });
 
+        // json builtins — opaque handle-based API
+        // json_parse(String) -> Int
+        const str_to_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_parse", .{ .type_id = str_to_int_type, .is_mut = false });
+        // json_type(Int) -> String
+        try self.module_scope.define("json_type", .{ .type_id = int_to_str_type, .is_mut = false });
+        // json_get_bool(Int) -> Bool
+        const int_to_bool_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = .bool,
+        } });
+        try self.module_scope.define("json_get_bool", .{ .type_id = int_to_bool_type, .is_mut = false });
+        // json_get_int(Int) -> Int
+        const int_to_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_get_int", .{ .type_id = int_to_int_type, .is_mut = false });
+        // json_get_float(Int) -> Float
+        const int_to_float_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = .float,
+        } });
+        try self.module_scope.define("json_get_float", .{ .type_id = int_to_float_type, .is_mut = false });
+        // json_get_string(Int) -> String (already have int_to_str_type)
+        try self.module_scope.define("json_get_string", .{ .type_id = int_to_str_type, .is_mut = false });
+        // json_array_len(Int) -> Int
+        try self.module_scope.define("json_array_len", .{ .type_id = int_to_int_type, .is_mut = false });
+        // json_array_get(Int, Int) -> Int
+        const two_int_to_int = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .int },
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_array_get", .{ .type_id = two_int_to_int, .is_mut = false });
+        // json_object_get(Int, String) -> Int
+        const int_str_to_int = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .string },
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_object_get", .{ .type_id = int_str_to_int, .is_mut = false });
+        // json_object_has(Int, String) -> Bool
+        const int_str_to_bool = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .string },
+            .return_type = .bool,
+        } });
+        try self.module_scope.define("json_object_has", .{ .type_id = int_str_to_bool, .is_mut = false });
+        // json_object_keys(Int) -> List[String]
+        const int_to_list_str = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = list_string,
+        } });
+        try self.module_scope.define("json_object_keys", .{ .type_id = int_to_list_str, .is_mut = false });
+        // json_encode(Int) -> String
+        try self.module_scope.define("json_encode", .{ .type_id = int_to_str_type, .is_mut = false });
+        // json constructor builtins
+        // json_new_null() -> Int, json_new_array() -> Int, json_new_object() -> Int
+        const void_to_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_new_null", .{ .type_id = void_to_int_type, .is_mut = false });
+        try self.module_scope.define("json_new_array", .{ .type_id = void_to_int_type, .is_mut = false });
+        try self.module_scope.define("json_new_object", .{ .type_id = void_to_int_type, .is_mut = false });
+        // json_new_bool(Bool) -> Int
+        const bool_to_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.bool},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_new_bool", .{ .type_id = bool_to_int_type, .is_mut = false });
+        // json_new_int(Int) -> Int
+        try self.module_scope.define("json_new_int", .{ .type_id = int_to_int_type, .is_mut = false });
+        // json_new_float(Float) -> Int
+        const float_to_int_type2 = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.float},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_new_float", .{ .type_id = float_to_int_type2, .is_mut = false });
+        // json_new_string(String) -> Int
+        try self.module_scope.define("json_new_string", .{ .type_id = str_to_int_type, .is_mut = false });
+        // json_array_push(Int, Int) -> Void
+        const two_int_to_void = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .int },
+            .return_type = .void,
+        } });
+        try self.module_scope.define("json_array_push", .{ .type_id = two_int_to_void, .is_mut = false });
+        // json_object_set(Int, String, Int) -> Void
+        const int_str_int_to_void = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .string, .int },
+            .return_type = .void,
+        } });
+        try self.module_scope.define("json_object_set", .{ .type_id = int_str_int_to_void, .is_mut = false });
+
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});
         try self.registerSyncType("WaitGroup", &.{});

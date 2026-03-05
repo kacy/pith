@@ -259,6 +259,87 @@ fn c_register_builtins():
     fmtf_tid := tt_add(ti_function(fmtf_params, TID_STRING))
     sc_define(c_scope, "fmt_float", fmtf_tid, false)
 
+    # json builtins — opaque handle-based API
+    # json_parse(String) -> Int
+    mut jp_params: List[Int] := [TID_STRING]
+    jp_tid := tt_add(ti_function(jp_params, TID_INT))
+    sc_define(c_scope, "json_parse", jp_tid, false)
+
+    # json_type(Int) -> String, json_get_string(Int) -> String, json_encode(Int) -> String
+    sc_define(c_scope, "json_type", fmti_tid, false)
+    sc_define(c_scope, "json_get_string", fmti_tid, false)
+    sc_define(c_scope, "json_encode", fmti_tid, false)
+
+    # json_get_bool(Int) -> Bool
+    mut jgb_params: List[Int] := [TID_INT]
+    jgb_tid := tt_add(ti_function(jgb_params, TID_BOOL))
+    sc_define(c_scope, "json_get_bool", jgb_tid, false)
+
+    # json_get_int(Int) -> Int, json_array_len(Int) -> Int
+    mut jgi_params: List[Int] := [TID_INT]
+    jgi_tid := tt_add(ti_function(jgi_params, TID_INT))
+    sc_define(c_scope, "json_get_int", jgi_tid, false)
+    sc_define(c_scope, "json_array_len", jgi_tid, false)
+
+    # json_get_float(Int) -> Float
+    mut jgf_params: List[Int] := [TID_INT]
+    jgf_tid := tt_add(ti_function(jgf_params, TID_FLOAT))
+    sc_define(c_scope, "json_get_float", jgf_tid, false)
+
+    # json_array_get(Int, Int) -> Int
+    mut jag_params: List[Int] := [TID_INT, TID_INT]
+    jag_tid := tt_add(ti_function(jag_params, TID_INT))
+    sc_define(c_scope, "json_array_get", jag_tid, false)
+
+    # json_object_get(Int, String) -> Int
+    mut jog_params: List[Int] := [TID_INT, TID_STRING]
+    jog_tid := tt_add(ti_function(jog_params, TID_INT))
+    sc_define(c_scope, "json_object_get", jog_tid, false)
+
+    # json_object_has(Int, String) -> Bool
+    mut joh_params: List[Int] := [TID_INT, TID_STRING]
+    joh_tid := tt_add(ti_function(joh_params, TID_BOOL))
+    sc_define(c_scope, "json_object_has", joh_tid, false)
+
+    # json_object_keys(Int) -> List[String]
+    mut jok_params: List[Int] := [TID_INT]
+    jok_tid := tt_add(ti_function(jok_params, list_string))
+    sc_define(c_scope, "json_object_keys", jok_tid, false)
+
+    # json constructors
+    # json_new_null() -> Int, json_new_array() -> Int, json_new_object() -> Int
+    mut jnn_params: List[Int] := []
+    jnn_tid := tt_add(ti_function(jnn_params, TID_INT))
+    sc_define(c_scope, "json_new_null", jnn_tid, false)
+    sc_define(c_scope, "json_new_array", jnn_tid, false)
+    sc_define(c_scope, "json_new_object", jnn_tid, false)
+
+    # json_new_bool(Bool) -> Int
+    mut jnb_params: List[Int] := [TID_BOOL]
+    jnb_tid := tt_add(ti_function(jnb_params, TID_INT))
+    sc_define(c_scope, "json_new_bool", jnb_tid, false)
+
+    # json_new_int(Int) -> Int
+    sc_define(c_scope, "json_new_int", jgi_tid, false)
+
+    # json_new_float(Float) -> Int
+    mut jnf_params: List[Int] := [TID_FLOAT]
+    jnf_tid := tt_add(ti_function(jnf_params, TID_INT))
+    sc_define(c_scope, "json_new_float", jnf_tid, false)
+
+    # json_new_string(String) -> Int
+    sc_define(c_scope, "json_new_string", jp_tid, false)
+
+    # json_array_push(Int, Int) -> Void
+    mut jap_params: List[Int] := [TID_INT, TID_INT]
+    jap_tid := tt_add(ti_function(jap_params, TID_VOID))
+    sc_define(c_scope, "json_array_push", jap_tid, false)
+
+    # json_object_set(Int, String, Int) -> Void
+    mut jos_params: List[Int] := [TID_INT, TID_STRING, TID_INT]
+    jos_tid := tt_add(ti_function(jos_params, TID_VOID))
+    sc_define(c_scope, "json_object_set", jos_tid, false)
+
     # concurrency primitives (stub types)
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []

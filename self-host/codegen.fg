@@ -2011,6 +2011,40 @@ fn g_emit_call(node_idx: Int):
         g_emit_expr(g_call_arg(node_idx, 1))
         g_write(")")
         return
+    # json builtins — single-arg (forge_ prefix pattern)
+    if name == "json_parse" or name == "json_type" or name == "json_get_bool" or name == "json_get_int" or name == "json_get_float" or name == "json_get_string" or name == "json_array_len" or name == "json_object_keys" or name == "json_encode" or name == "json_new_bool" or name == "json_new_int" or name == "json_new_float" or name == "json_new_string":
+        g_write("forge_")
+        g_write(name)
+        g_write("(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(")")
+        return
+    # json builtins — zero-arg
+    if name == "json_new_null" or name == "json_new_array" or name == "json_new_object":
+        g_write("forge_")
+        g_write(name)
+        g_write("()")
+        return
+    # json builtins — two-arg
+    if name == "json_array_get" or name == "json_object_get" or name == "json_object_has" or name == "json_array_push":
+        g_write("forge_")
+        g_write(name)
+        g_write("(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 1))
+        g_write(")")
+        return
+    # json_object_set — three-arg
+    if name == "json_object_set":
+        g_write("forge_json_object_set(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 1))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 2))
+        g_write(")")
+        return
     if name == "rename_file":
         g_write("forge_rename_file(")
         g_emit_expr(g_call_arg(node_idx, 0))

@@ -2536,7 +2536,28 @@ pub const CEmitter = struct {
             std.mem.eql(u8, name, "fmt_hex") or
             std.mem.eql(u8, name, "fmt_oct") or
             std.mem.eql(u8, name, "fmt_bin") or
-            std.mem.eql(u8, name, "fmt_float"))
+            std.mem.eql(u8, name, "fmt_float") or
+            std.mem.eql(u8, name, "json_parse") or
+            std.mem.eql(u8, name, "json_type") or
+            std.mem.eql(u8, name, "json_get_bool") or
+            std.mem.eql(u8, name, "json_get_int") or
+            std.mem.eql(u8, name, "json_get_float") or
+            std.mem.eql(u8, name, "json_get_string") or
+            std.mem.eql(u8, name, "json_array_len") or
+            std.mem.eql(u8, name, "json_array_get") or
+            std.mem.eql(u8, name, "json_object_get") or
+            std.mem.eql(u8, name, "json_object_has") or
+            std.mem.eql(u8, name, "json_object_keys") or
+            std.mem.eql(u8, name, "json_encode") or
+            std.mem.eql(u8, name, "json_new_null") or
+            std.mem.eql(u8, name, "json_new_bool") or
+            std.mem.eql(u8, name, "json_new_int") or
+            std.mem.eql(u8, name, "json_new_float") or
+            std.mem.eql(u8, name, "json_new_string") or
+            std.mem.eql(u8, name, "json_new_array") or
+            std.mem.eql(u8, name, "json_new_object") or
+            std.mem.eql(u8, name, "json_array_push") or
+            std.mem.eql(u8, name, "json_object_set"))
         {
             try self.writeStr("forge_");
             try self.writeStr(name);

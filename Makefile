@@ -44,7 +44,7 @@ run-examples: build
 		fi; \
 	done; \
 	echo "--- non-deterministic examples (exit code only) ---"; \
-	for name in stdlib_new file_io iteration operators fs_ops time_rand tcp_echo; do \
+	for name in stdlib_new file_io iteration operators fs_ops time_rand tcp_echo channels; do \
 		timeout 10 ./zig-out/bin/forge run "examples/$$name.fg" >/dev/null 2>&1; \
 		if [ $$? -eq 0 ]; then \
 			echo "ok   $$name"; \

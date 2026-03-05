@@ -526,11 +526,16 @@ pub const CEmitter = struct {
 
             for (self.hoisted_spawns.items) |sp| {
                 // per-spawn struct typedef
-                const struct_begin = std.fmt.allocPrint(self.allocator,
-                    "typedef struct {{ forge_task_header_t __header; {s} __value; ",
-                    .{self.cTypeStringForId(sp.return_type)}) catch continue;
-                fwd_buf.appendSlice(self.allocator, struct_begin) catch continue;
-                self.allocator.free(struct_begin);
+                if (sp.return_type == .void) {
+                    fwd_buf.appendSlice(self.allocator,
+                        "typedef struct { forge_task_header_t __header; ") catch continue;
+                } else {
+                    const struct_begin = std.fmt.allocPrint(self.allocator,
+                        "typedef struct {{ forge_task_header_t __header; {s} __value; ",
+                        .{self.cTypeStringForId(sp.return_type)}) catch continue;
+                    fwd_buf.appendSlice(self.allocator, struct_begin) catch continue;
+                    self.allocator.free(struct_begin);
+                }
                 for (sp.arg_types, 0..) |arg_tid, i| {
                     const field = std.fmt.allocPrint(self.allocator,
                         "{s} __arg_{d}; ", .{ self.cTypeStringForId(arg_tid), i }) catch continue;
@@ -956,7 +961,11 @@ pub const CEmitter = struct {
             // }
             try self.writeFmt("static void *__spawn_wrapper_{d}(void *__arg) {{\n", .{sp.index});
             try self.writeFmt("    __spawn_data_{d} *__data = (__spawn_data_{d} *)__arg;\n", .{ sp.index, sp.index });
-            try self.writeStr("    __data->__value = fg_");
+            if (sp.return_type == .void) {
+                try self.writeStr("    fg_");
+            } else {
+                try self.writeStr("    __data->__value = fg_");
+            }
             try self.writeStr(sp.fn_name);
             try self.writeByte('(');
             for (sp.arg_types, 0..) |_, i| {
@@ -2702,6 +2711,25 @@ pub const CEmitter = struct {
     fn emitCall(self: *CEmitter, call: *const ast.CallExpr) EmitError!void {
         const name = switch (call.callee.kind) {
             .ident => |n| n,
+            .index => |idx| {
+                // Channel[T]() constructor
+                if (idx.object.kind == .ident and std.mem.eql(u8, idx.object.kind.ident, "Channel")) {
+                    const inner_name = switch (idx.index.kind) {
+                        .ident => |n| n,
+                        else => "",
+                    };
+                    const inner_tid = self.type_table.lookup(inner_name) orelse TypeId.err;
+                    const c_type = self.cTypeStringForId(inner_tid);
+                    try self.writeStr("forge_channel_create(sizeof(");
+                    try self.writeStr(c_type);
+                    try self.writeStr("))");
+                    return;
+                }
+                // indirect calls — emit as-is
+                try self.emitExpr(call.callee);
+                try self.emitArgList(call.args);
+                return;
+            },
             else => {
                 // indirect calls — emit as-is
                 try self.emitExpr(call.callee);
@@ -2944,6 +2972,9 @@ pub const CEmitter = struct {
                     },
                     .@"struct" => |st| {
                         if (try self.emitSyncMethod(mc, st.name)) return;
+                    },
+                    .channel => |c| {
+                        if (try self.emitChannelMethod(mc, c.inner)) return;
                     },
                     else => {},
                 }
@@ -3476,6 +3507,52 @@ pub const CEmitter = struct {
         return false;
     }
 
+    fn emitChannelMethod(self: *CEmitter, mc: *const ast.MethodCallExpr, inner: TypeId) EmitError!bool {
+        const method = mc.method;
+        const inner_c = self.cTypeStringForId(inner);
+
+        if (std.mem.eql(u8, method, "send")) {
+            // ({ C_TYPE __ch_v = (val); forge_channel_send(ch, &__ch_v); })
+            try self.writeStr("({ ");
+            try self.writeStr(inner_c);
+            try self.writeStr(" __ch_v = ");
+            try self.emitExpr(mc.args[0].value);
+            try self.writeStr("; forge_channel_send(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", &__ch_v); })");
+            return true;
+        }
+        if (std.mem.eql(u8, method, "recv")) {
+            // ({ C_TYPE __ch_v; OPT_TYPE __ch_r;
+            //    __ch_r.has_value = forge_channel_recv(ch, &__ch_v);
+            //    if (__ch_r.has_value) __ch_r.value = __ch_v; __ch_r; })
+            // build optional type name on the stack
+            var opt_buf: [128]u8 = undefined;
+            const opt_name = std.fmt.bufPrint(&opt_buf, "forge_optional_{s}", .{inner_c}) catch return false;
+            try self.writeStr("({ ");
+            try self.writeStr(inner_c);
+            try self.writeStr(" __ch_v; ");
+            try self.writeStr(opt_name);
+            try self.writeStr(" __ch_r; __ch_r.has_value = forge_channel_recv(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", &__ch_v); if (__ch_r.has_value) __ch_r.value = __ch_v; __ch_r; })");
+            return true;
+        }
+        if (std.mem.eql(u8, method, "close")) {
+            try self.writeStr("forge_channel_close(");
+            try self.emitExpr(mc.receiver);
+            try self.writeByte(')');
+            return true;
+        }
+        if (std.mem.eql(u8, method, "len")) {
+            try self.writeStr("forge_channel_len(");
+            try self.emitExpr(mc.receiver);
+            try self.writeByte(')');
+            return true;
+        }
+        return false;
+    }
+
     /// return type inference for built-in String methods.
     fn inferStringMethodType(self: *const CEmitter, method: []const u8) TypeId {
         if (std.mem.eql(u8, method, "len")) return .int;
@@ -3574,6 +3651,26 @@ pub const CEmitter = struct {
         } else if (std.mem.eql(u8, type_name, "Semaphore")) {
             if (std.mem.eql(u8, method, "acquire") or std.mem.eql(u8, method, "release")) return .void;
         }
+        return null;
+    }
+
+    fn inferChannelMethodType(self: *const CEmitter, method: []const u8, inner: TypeId) ?TypeId {
+        if (std.mem.eql(u8, method, "send")) return .void;
+        if (std.mem.eql(u8, method, "recv")) {
+            // recv returns T? — find the optional type for inner in the type table
+            const items = self.type_table.types.items;
+            for (items, 0..) |ty, idx| {
+                switch (ty) {
+                    .optional => |o| {
+                        if (o.inner == inner) return TypeId.fromIndex(@intCast(idx));
+                    },
+                    else => {},
+                }
+            }
+            return .err;
+        }
+        if (std.mem.eql(u8, method, "close")) return .void;
+        if (std.mem.eql(u8, method, "len")) return .int;
         return null;
     }
 
@@ -4223,6 +4320,21 @@ pub const CEmitter = struct {
                 // look up the function's return type
                 const name = switch (call.callee.kind) {
                     .ident => |n| n,
+                    .index => |idx| {
+                        // Channel[T]() constructor → Channel type
+                        if (idx.object.kind == .ident and std.mem.eql(u8, idx.object.kind.ident, "Channel")) {
+                            const inner_name = switch (idx.index.kind) {
+                                .ident => |n| n,
+                                else => return .err,
+                            };
+                            const inner_tid = self.type_table.lookup(inner_name) orelse return .err;
+                            // look up the interned Channel[T] type
+                            var buf: [64]u8 = undefined;
+                            const inst = std.fmt.bufPrint(&buf, "Channel[{s}]", .{self.type_table.typeName(inner_tid)}) catch return .err;
+                            return self.type_table.lookup(inst) orelse .err;
+                        }
+                        return .err;
+                    },
                     else => return .err,
                 };
                 // check module scope first (functions, builtins)
@@ -4282,6 +4394,9 @@ pub const CEmitter = struct {
                             },
                             .@"struct" => |st| {
                                 if (self.inferSyncMethodType(st.name, mc.method)) |tid| return tid;
+                            },
+                            .channel => |c| {
+                                if (self.inferChannelMethodType(mc.method, c.inner)) |tid| return tid;
                             },
                             else => {},
                         }
@@ -4456,6 +4571,10 @@ pub const CEmitter = struct {
                     try self.writeStr("forge_map_t");
                 } else if (std.mem.eql(u8, g.name, "Set")) {
                     try self.writeStr("forge_set_t");
+                } else if (std.mem.eql(u8, g.name, "Task")) {
+                    try self.writeStr("void*");
+                } else if (std.mem.eql(u8, g.name, "Channel")) {
+                    try self.writeStr("forge_channel_t*");
                 } else {
                     // user-defined generic — resolve to mangled name via type table
                     const tid = self.resolveTypeExprToId(te);
@@ -4552,6 +4671,10 @@ pub const CEmitter = struct {
                         try self.writeStr("void*");
                         return;
                     },
+                    .channel => {
+                        try self.writeStr("forge_channel_t*");
+                        return;
+                    },
                     else => {},
                 }
             }
@@ -4634,6 +4757,7 @@ pub const CEmitter = struct {
                 .set => "forge_set_t",
                 .function => "forge_closure_t",
                 .task => "void*",
+                .channel => "forge_channel_t*",
                 // optional and result types should have been registered in mangled_names
                 // during emitOptionalTypedefs/emitResultTypedefs — fall through to unknown
                 else => "/* unknown */",

@@ -313,6 +313,10 @@ fn c_intern_collection(base: String, key_or_elem: Int, val: Int) -> Int:
         tid = tt_add(ti_set(key_or_elem))
     elif base == "Map":
         tid = tt_add(ti_map(key_or_elem, val))
+    elif base == "Task":
+        tid = tt_add(ti_task(key_or_elem))
+    elif base == "Channel":
+        tid = tt_add(ti_channel(key_or_elem))
     else:
         return TID_ERR
     tt_register(name, tid)
@@ -423,12 +427,12 @@ fn c_resolve_generic_type(base: String, type_args: List[Int]) -> Int:
         if type_args.len() != 1:
             c_error("E221", "Task expects 1 type argument, got " + type_args.len().to_string())
             return TID_ERR
-        return tt_add(ti_task(type_args[0]))
+        return c_intern_collection("Task", type_args[0], -1)
     if base == "Channel":
         if type_args.len() != 1:
             c_error("E221", "Channel expects 1 type argument, got " + type_args.len().to_string())
             return TID_ERR
-        return tt_add(ti_channel(type_args[0]))
+        return c_intern_collection("Channel", type_args[0], -1)
     # user-defined generic types
     if c_generic_decls.contains_key(base):
         decl_idx := c_generic_decls[base]
@@ -1450,6 +1454,15 @@ fn c_check_call(node: Node, scope_id: Int) -> Int:
             continue
         arg_indices.push(child)
 
+    # Channel[T]() constructor — callee is an index expr like Channel[Int]
+    if callee_node.kind == "index":
+        if callee_node.children.len() >= 2:
+            obj_node := get_node(callee_node.children[0])
+            if obj_node.kind == "ident":
+                if obj_node.value == "Channel":
+                    return c_check_channel_constructor(callee_node, arg_indices, scope_id)
+        return c_check_fn_call(callee_idx, arg_indices, scope_id)
+
     if callee_node.kind == "ident":
         name := callee_node.value
         # special case: assert_eq / assert_ne
@@ -1478,6 +1491,24 @@ fn c_check_call(node: Node, scope_id: Int) -> Int:
 
     # non-ident callee (e.g. lambda call)
     return c_check_fn_call(callee_idx, arg_indices, scope_id)
+
+# check a Channel[T]() constructor call — resolves the type argument
+# and returns the channel type id
+fn c_check_channel_constructor(index_node: Node, arg_indices: List[Int], scope_id: Int) -> Int:
+    # index_node.children[1] is the type argument (e.g. "Int" in Channel[Int])
+    type_arg_node := get_node(index_node.children[1])
+    if type_arg_node.kind != "ident":
+        c_error("E210", "Channel type argument must be a type name")
+        return TID_ERR
+    inner_tid := c_resolve_named_type(type_arg_node.value)
+    if tt_is_err(inner_tid):
+        return TID_ERR
+    if arg_indices.len() != 0:
+        c_error("E207", "Channel constructor takes 0 arguments, got " + arg_indices.len().to_string())
+        return TID_ERR
+    mut type_args: List[Int] := []
+    type_args.push(inner_tid)
+    return c_resolve_generic_type("Channel", type_args)
 
 fn c_check_fn_call(callee_idx: Int, arg_indices: List[Int], scope_id: Int) -> Int:
     callee_type := c_check_expr(callee_idx, scope_id)
@@ -1752,6 +1783,12 @@ fn c_check_method_call(node: Node, scope_id: Int) -> Int:
         if result >= 0:
             return result
 
+    # channel methods
+    if recv_info.kind == "channel":
+        ch_result := c_check_channel_method(method_name, recv_info, arg_indices, scope_id)
+        if ch_result >= 0:
+            return ch_result
+
     # sync primitive methods
     if recv_info.kind == "struct":
         sync_result := c_check_sync_method(recv_info.name, method_name, arg_indices, scope_id)
@@ -2013,6 +2050,23 @@ fn c_check_sync_method(type_name: String, method: String, args: List[Int], scope
         if method == "release":
             c_expect_no_args("Semaphore.release", args)
             return TID_VOID
+    return TID_ERR
+
+fn c_check_channel_method(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
+    inner := info.inner
+    if method == "send":
+        c_expect_one_typed_arg("Channel.send", args, inner, scope_id)
+        return TID_VOID
+    if method == "recv":
+        # recv() returns T? (optional of inner type)
+        c_expect_no_args("Channel.recv", args)
+        return tt_add(ti_optional(inner))
+    if method == "close":
+        c_expect_no_args("Channel.close", args)
+        return TID_VOID
+    if method == "len":
+        c_expect_no_args("Channel.len", args)
+        return TID_INT
     return TID_ERR
 
 fn c_expect_no_args(method: String, args: List[Int]):

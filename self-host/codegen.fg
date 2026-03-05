@@ -253,6 +253,8 @@ fn g_c_type_string(tid: Int) -> String:
                 return info.name
             if info.kind == "task":
                 return "void*"
+            if info.kind == "channel":
+                return "forge_channel_t*"
             if info.kind == "list":
                 return "forge_list_t"
             if info.kind == "map":
@@ -637,6 +639,12 @@ fn g_emit_type_expr(node_idx: Int):
             return
         if base == "Set":
             g_write("forge_set_t")
+            return
+        if base == "Channel":
+            g_write("forge_channel_t*")
+            return
+        if base == "Task":
+            g_write("void*")
             return
         # user-defined generic — resolve and emit mangled name
         tid := c_resolve_type(node_idx)
@@ -2044,6 +2052,22 @@ fn g_emit_call_args(node_idx: Int):
 
 fn g_emit_call(node_idx: Int):
     node := get_node(node_idx)
+    # Channel[T]() constructor — callee is an index node like Channel[Int]
+    if node.children.len() > 0:
+        callee_node := get_node(node.children[0])
+        if callee_node.kind == "index":
+            if callee_node.children.len() >= 2:
+                obj_node := get_node(callee_node.children[0])
+                if obj_node.kind == "ident":
+                    if obj_node.value == "Channel":
+                        inner_node := get_node(callee_node.children[1])
+                        inner_name := inner_node.value
+                        inner_tid := tt_lookup(inner_name)
+                        inner_c := g_c_type_string(inner_tid)
+                        g_write("forge_channel_create(sizeof(")
+                        g_write(inner_c)
+                        g_write("))")
+                        return
     # in self-hosted AST, call has ident child as first element
     name := g_call_name(node_idx)
     # builtins
@@ -2386,6 +2410,9 @@ fn g_emit_method_call(node_idx: Int):
             if info.kind == "struct":
                 if g_emit_sync_method(node_idx, method, info.name):
                     return
+            if info.kind == "channel":
+                g_emit_channel_method(node_idx, method, info.inner)
+                return
     # user-defined method: TypeName_method(receiver, args...)
     type_name := g_type_name_for_method(receiver_tid)
     if type_name != "":
@@ -2465,6 +2492,48 @@ fn g_emit_sync_method(node_idx: Int, method: String, type_name: String) -> Bool:
             g_write(")")
             return true
     return false
+
+# ---------------------------------------------------------------
+# channel methods
+# ---------------------------------------------------------------
+
+fn g_emit_channel_method(node_idx: Int, method: String, inner_tid: Int):
+    node := get_node(node_idx)
+    receiver_idx := node.children[0]
+    inner_c := g_c_type_string(inner_tid)
+    if method == "send":
+        # ({ C_TYPE __ch_v = val; forge_channel_send(ch, &__ch_v); })
+        g_write("(" + LB + " ")
+        g_write(inner_c)
+        g_write(" __ch_v = ")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write("; forge_channel_send(")
+        g_emit_expr(receiver_idx)
+        g_write(", &__ch_v); " + RB + ")")
+        return
+    if method == "recv":
+        # ({ C_TYPE __ch_v; OPT_TYPE __ch_r;
+        #    __ch_r.has_value = forge_channel_recv(ch, &__ch_v);
+        #    if (__ch_r.has_value) __ch_r.value = __ch_v; __ch_r; })
+        opt_c := "forge_optional_" + inner_c
+        g_write("(" + LB + " ")
+        g_write(inner_c)
+        g_write(" __ch_v; ")
+        g_write(opt_c)
+        g_write(" __ch_r; __ch_r.has_value = forge_channel_recv(")
+        g_emit_expr(receiver_idx)
+        g_write(", &__ch_v); if (__ch_r.has_value) __ch_r.value = __ch_v; __ch_r; " + RB + ")")
+        return
+    if method == "close":
+        g_write("forge_channel_close(")
+        g_emit_expr(receiver_idx)
+        g_write(")")
+        return
+    if method == "len":
+        g_write("forge_channel_len(")
+        g_emit_expr(receiver_idx)
+        g_write(")")
+        return
 
 # ---------------------------------------------------------------
 # string methods
@@ -4499,9 +4568,10 @@ fn g_build_spawn_fwd_decls():
         arg_count := g_spawn_arg_counts[si]
         arg_offset := g_spawn_arg_offsets[si]
         ret_c := g_c_type_string(ret_type)
-        # struct typedef: typedef struct { forge_task_header_t __header; ret_type __value; arg_types... } __spawn_data_N;
+        # struct typedef: typedef struct { forge_task_header_t __header; [ret_type __value;] arg_types... } __spawn_data_N;
         mut s := "typedef struct " + LB + " forge_task_header_t __header; "
-        s = s + ret_c + " __value; "
+        if ret_type != TID_VOID:
+            s = s + ret_c + " __value; "
         mut ai := 0
         while ai < arg_count:
             s = s + g_c_type_string(g_spawn_arg_tids[arg_offset + ai]) + " __arg_" + ai.to_string() + "; "
@@ -4518,10 +4588,11 @@ fn g_emit_hoisted_spawns():
     while si < g_spawn_indices.len():
         idx := g_spawn_indices[si]
         fn_name := g_spawn_fn_names[si]
+        ret_type := g_spawn_return_types[si]
         arg_count := g_spawn_arg_counts[si]
         # static void *__spawn_wrapper_N(void *__arg) {
         #     __spawn_data_N *__data = (__spawn_data_N *)__arg;
-        #     __data->__value = fg_funcname(__data->__arg_0, ...);
+        #     __data->__value = fg_funcname(__data->__arg_0, ...);  // or just call if void
         #     return NULL;
         # }
         g_write("static void *__spawn_wrapper_")
@@ -4532,7 +4603,10 @@ fn g_emit_hoisted_spawns():
         g_write(" *__data = (__spawn_data_")
         g_write(idx.to_string())
         g_write(" *)__arg;\n")
-        g_write("    __data->__value = fg_")
+        if ret_type == TID_VOID:
+            g_write("    fg_")
+        else:
+            g_write("    __data->__value = fg_")
         g_write(fn_name)
         g_write("(")
         mut ai := 0

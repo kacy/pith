@@ -1,0 +1,31 @@
+# channel communication between tasks
+
+fn producer(ch: Channel[Int], count: Int):
+    mut i := 0
+    while i < count:
+        ch.send(i)
+        i = i + 1
+
+fn main():
+    ch := Channel[Int]()
+
+    # send values from a spawned task
+    t := spawn producer(ch, 5)
+
+    # receive the known number of values
+    mut total := 0
+    mut i := 0
+    while i < 5:
+        val := ch.recv()
+        total = total + val?
+        i = i + 1
+
+    await t
+
+    print("received: 5")
+    print("total: " + total.to_string())
+    print("len after recv: " + ch.len().to_string())
+
+    # test close
+    ch.close()
+    print("channel closed")

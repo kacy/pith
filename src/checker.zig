@@ -1431,10 +1431,10 @@ pub const Checker = struct {
         // two List[Int] occurrences share the same TypeId.
         if (arg_ids.len == 1) {
             if (std.mem.eql(u8, name, "Task")) {
-                return self.type_table.addType(.{ .task = .{ .inner = arg_ids[0] } }) catch return .err;
+                return self.internCollectionType(name, arg_ids, .{ .task = .{ .inner = arg_ids[0] } });
             }
             if (std.mem.eql(u8, name, "Channel")) {
-                return self.type_table.addType(.{ .channel = .{ .inner = arg_ids[0] } }) catch return .err;
+                return self.internCollectionType(name, arg_ids, .{ .channel = .{ .inner = arg_ids[0] } });
             }
             if (std.mem.eql(u8, name, "List")) {
                 return self.internCollectionType(name, arg_ids, .{ .list = .{ .element = arg_ids[0] } });
@@ -2147,6 +2147,13 @@ pub const Checker = struct {
         // dispatch only applies to named callees (e.g. Point(...), identity(...))
         const name = switch (call.callee.kind) {
             .ident => |n| n,
+            .index => |idx| {
+                // Channel[T]() constructor
+                if (idx.object.kind == .ident and std.mem.eql(u8, idx.object.kind.ident, "Channel")) {
+                    return self.checkChannelConstructor(idx, call, location);
+                }
+                return self.checkFnCall(call, location, scope);
+            },
             else => return self.checkFnCall(call, location, scope),
         };
 
@@ -2193,6 +2200,29 @@ pub const Checker = struct {
         }
 
         return self.checkFnCall(call, location, scope);
+    }
+
+    /// check a Channel[T]() constructor call. the callee must be an index
+    /// expression like Channel[Int]. resolves the inner type and returns
+    /// the channel type id.
+    fn checkChannelConstructor(self: *Checker, idx: ast.IndexExpr, call: ast.CallExpr, location: Location) TypeId {
+        const inner_name = switch (idx.index.kind) {
+            .ident => |n| n,
+            else => {
+                self.diagnostics.addCodedError(.E210, location, "Channel type argument must be a type name") catch {};
+                return .err;
+            },
+        };
+        const inner_tid = self.resolveNamedType(inner_name, location);
+        if (inner_tid.isErr()) return .err;
+        if (call.args.len != 0) {
+            self.diagnostics.addCodedError(.E207, location, self.fmt(
+                "Channel constructor takes 0 arguments, got {d}",
+                .{call.args.len},
+            )) catch {};
+            return .err;
+        }
+        return self.resolveGenericTypeWithArgs("Channel", &[_]TypeId{inner_tid}, location);
     }
 
     /// verify that each generic parameter's inferred type satisfies its
@@ -2414,6 +2444,9 @@ pub const Checker = struct {
                 },
                 .@"struct" => |st| {
                     if (self.checkSyncMethod(mc, location, scope, st.name)) |tid| return tid;
+                },
+                .channel => |c| {
+                    if (self.checkChannelMethod(mc, location, scope, c.inner)) |tid| return tid;
                 },
                 else => {},
             }
@@ -2812,6 +2845,24 @@ pub const Checker = struct {
         } else if (std.mem.eql(u8, type_name, "Semaphore")) {
             if (std.mem.eql(u8, mc.method, "acquire")) return self.checkNoArgs(mc, location, "Semaphore.acquire", .void);
             if (std.mem.eql(u8, mc.method, "release")) return self.checkNoArgs(mc, location, "Semaphore.release", .void);
+        }
+        return null;
+    }
+
+    fn checkChannelMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, inner: TypeId) ?TypeId {
+        if (std.mem.eql(u8, mc.method, "send")) {
+            return self.checkOneTypedArg(mc, location, scope, "Channel.send", inner, .void);
+        }
+        if (std.mem.eql(u8, mc.method, "recv")) {
+            // recv() returns T? (optional of inner type)
+            const opt_tid = self.type_table.addType(.{ .optional = .{ .inner = inner } }) catch return null;
+            return self.checkNoArgs(mc, location, "Channel.recv", opt_tid);
+        }
+        if (std.mem.eql(u8, mc.method, "close")) {
+            return self.checkNoArgs(mc, location, "Channel.close", .void);
+        }
+        if (std.mem.eql(u8, mc.method, "len")) {
+            return self.checkNoArgs(mc, location, "Channel.len", .int);
         }
         return null;
     }

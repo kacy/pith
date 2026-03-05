@@ -2606,6 +2606,97 @@ static inline forge_string_t forge_percent_decode(forge_string_t input) {
 }
 
 // ---------------------------------------------------------------
+// channels — typed message-passing with unbounded buffer
+// ---------------------------------------------------------------
+
+typedef struct {
+    void *buffer;           // dynamic array of elements
+    int64_t elem_size;
+    int64_t len;            // current number of elements
+    int64_t cap;            // buffer capacity
+    int64_t read_pos;       // next read position
+    int64_t write_pos;      // next write position
+    bool closed;
+    pthread_mutex_t mu;
+    pthread_cond_t not_empty;
+} forge_channel_t;
+
+static inline forge_channel_t* forge_channel_create(int64_t elem_size) {
+    forge_channel_t *ch = (forge_channel_t *)malloc(sizeof(forge_channel_t));
+    if (!ch) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    ch->elem_size = elem_size;
+    ch->len = 0;
+    ch->cap = 16;
+    ch->buffer = malloc((size_t)(ch->cap * elem_size));
+    if (!ch->buffer) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    ch->read_pos = 0;
+    ch->write_pos = 0;
+    ch->closed = false;
+    pthread_mutex_init(&ch->mu, NULL);
+    pthread_cond_init(&ch->not_empty, NULL);
+    return ch;
+}
+
+// send: enqueue element (unbounded — grows buffer if needed, never blocks)
+static inline void forge_channel_send(forge_channel_t *ch, const void *elem) {
+    pthread_mutex_lock(&ch->mu);
+    if (ch->closed) { pthread_mutex_unlock(&ch->mu); return; }
+    // grow if full
+    if (ch->len >= ch->cap) {
+        int64_t new_cap = ch->cap * 2;
+        void *new_buf = malloc((size_t)(new_cap * ch->elem_size));
+        if (!new_buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        // copy elements in order
+        for (int64_t i = 0; i < ch->len; i++) {
+            int64_t src = ((ch->read_pos + i) % ch->cap) * ch->elem_size;
+            int64_t dst = i * ch->elem_size;
+            memcpy((char *)new_buf + dst, (char *)ch->buffer + src, (size_t)ch->elem_size);
+        }
+        free(ch->buffer);
+        ch->buffer = new_buf;
+        ch->read_pos = 0;
+        ch->write_pos = ch->len;
+        ch->cap = new_cap;
+    }
+    memcpy((char *)ch->buffer + ch->write_pos * ch->elem_size, elem, (size_t)ch->elem_size);
+    ch->write_pos = (ch->write_pos + 1) % ch->cap;
+    ch->len++;
+    pthread_cond_signal(&ch->not_empty);
+    pthread_mutex_unlock(&ch->mu);
+}
+
+// recv: dequeue element, blocks until available. returns false when closed and empty.
+static inline bool forge_channel_recv(forge_channel_t *ch, void *out) {
+    pthread_mutex_lock(&ch->mu);
+    while (ch->len == 0 && !ch->closed) {
+        pthread_cond_wait(&ch->not_empty, &ch->mu);
+    }
+    if (ch->len == 0) {
+        pthread_mutex_unlock(&ch->mu);
+        return false;
+    }
+    memcpy(out, (char *)ch->buffer + ch->read_pos * ch->elem_size, (size_t)ch->elem_size);
+    ch->read_pos = (ch->read_pos + 1) % ch->cap;
+    ch->len--;
+    pthread_mutex_unlock(&ch->mu);
+    return true;
+}
+
+static inline void forge_channel_close(forge_channel_t *ch) {
+    pthread_mutex_lock(&ch->mu);
+    ch->closed = true;
+    pthread_cond_broadcast(&ch->not_empty);
+    pthread_mutex_unlock(&ch->mu);
+}
+
+static inline int64_t forge_channel_len(forge_channel_t *ch) {
+    pthread_mutex_lock(&ch->mu);
+    int64_t n = ch->len;
+    pthread_mutex_unlock(&ch->mu);
+    return n;
+}
+
+// ---------------------------------------------------------------
 // TOML parsing — mirrors the JSON API shape
 // ---------------------------------------------------------------
 

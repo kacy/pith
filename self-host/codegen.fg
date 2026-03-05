@@ -2458,6 +2458,18 @@ fn g_emit_channel_method(node_idx: Int, method: String, inner_tid: Int):
 # string methods
 # ---------------------------------------------------------------
 
+fn g_emit_simple_method(node_idx: Int, c_fn: String, nargs: Int):
+    # emit a straightforward method call: c_fn(receiver, arg0, arg1, ...)
+    node := get_node(node_idx)
+    g_write(c_fn + "(")
+    g_emit_expr(node.children[0])
+    mut i := 0
+    while i < nargs:
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, i))
+        i = i + 1
+    g_write(")")
+
 fn g_emit_string_method(node_idx: Int, method: String):
     node := get_node(node_idx)
     receiver_idx := node.children[0]
@@ -2470,110 +2482,53 @@ fn g_emit_string_method(node_idx: Int, method: String):
         g_emit_expr(receiver_idx)
         g_write(".len == 0)")
         return
-    if method == "contains":
-        g_write("forge_string_contains(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if method == "starts_with":
-        g_write("forge_string_starts_with(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if method == "ends_with":
-        g_write("forge_string_ends_with(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if method == "index_of":
-        g_write("forge_string_index_of(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if method == "last_index_of":
-        g_write("forge_string_last_index_of(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if method == "split":
-        g_write("forge_string_split(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
+    # 0-arg passthrough methods
     if method == "trim":
-        g_write("forge_string_trim(")
-        g_emit_expr(receiver_idx)
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_trim", 0)
         return
     if method == "to_upper":
-        g_write("forge_string_to_upper(")
-        g_emit_expr(receiver_idx)
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_to_upper", 0)
         return
     if method == "to_lower":
-        g_write("forge_string_to_lower(")
-        g_emit_expr(receiver_idx)
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_to_lower", 0)
         return
     if method == "chars":
-        g_write("forge_string_chars(")
-        g_emit_expr(receiver_idx)
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_chars", 0)
+        return
+    # 1-arg passthrough methods
+    if method == "contains":
+        g_emit_simple_method(node_idx, "forge_string_contains", 1)
+        return
+    if method == "starts_with":
+        g_emit_simple_method(node_idx, "forge_string_starts_with", 1)
+        return
+    if method == "ends_with":
+        g_emit_simple_method(node_idx, "forge_string_ends_with", 1)
+        return
+    if method == "index_of":
+        g_emit_simple_method(node_idx, "forge_string_index_of", 1)
+        return
+    if method == "last_index_of":
+        g_emit_simple_method(node_idx, "forge_string_last_index_of", 1)
+        return
+    if method == "split":
+        g_emit_simple_method(node_idx, "forge_string_split", 1)
         return
     if method == "repeat":
-        g_write("forge_string_repeat(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_repeat", 1)
         return
+    # 2-arg passthrough methods
     if method == "substring":
-        g_write("forge_string_substring(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_substring", 2)
         return
     if method == "replace":
-        g_write("forge_string_replace(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_replace", 2)
         return
     if method == "pad_left":
-        g_write("forge_string_pad_left(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_pad_left", 2)
         return
     if method == "pad_right":
-        g_write("forge_string_pad_right(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_pad_right", 2)
         return
 
 # ---------------------------------------------------------------
@@ -2662,19 +2617,11 @@ fn g_emit_list_method(node_idx: Int, method: String, elem_tid: Int):
         g_write(")")
         return
     if method == "join":
-        g_write("forge_list_join(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_list_join", 1)
         return
     if method == "index_of":
         if elem_tid == TID_STRING:
-            g_write("forge_list_index_of_string(")
-            g_emit_expr(receiver_idx)
-            g_write(", ")
-            g_emit_expr(g_call_arg(node_idx, 0))
-            g_write(")")
+            g_emit_simple_method(node_idx, "forge_list_index_of_string", 1)
         else:
             g_write("forge_list_index_of(")
             g_emit_expr(receiver_idx)

@@ -227,8 +227,83 @@ static inline forge_string_t forge_string_replace(forge_string_t s, forge_string
     return (forge_string_t){ .data = buf, .len = new_len };
 }
 
+// index_of: find first occurrence of needle in haystack. returns -1 if not found.
+static inline int64_t forge_string_index_of(forge_string_t haystack, forge_string_t needle) {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return -1;
+    for (int64_t i = 0; i <= haystack.len - needle.len; i++) {
+        if (memcmp(haystack.data + i, needle.data, (size_t)needle.len) == 0)
+            return i;
+    }
+    return -1;
+}
+
+// last_index_of: find last occurrence of needle in haystack. returns -1 if not found.
+static inline int64_t forge_string_last_index_of(forge_string_t haystack, forge_string_t needle) {
+    if (needle.len == 0) return haystack.len;
+    if (needle.len > haystack.len) return -1;
+    for (int64_t i = haystack.len - needle.len; i >= 0; i--) {
+        if (memcmp(haystack.data + i, needle.data, (size_t)needle.len) == 0)
+            return i;
+    }
+    return -1;
+}
+
+// repeat: repeat string n times.
+static inline forge_string_t forge_string_repeat(forge_string_t s, int64_t n) {
+    if (n <= 0 || s.len == 0) return forge_string_empty;
+    int64_t new_len = s.len * n;
+    char *buf = (char *)malloc((size_t)new_len + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    for (int64_t i = 0; i < n; i++) {
+        memcpy(buf + i * s.len, s.data, (size_t)s.len);
+    }
+    buf[new_len] = '\0';
+    return (forge_string_t){ .data = buf, .len = new_len };
+}
+
+// pad_left: pad string to given width with fill character (left-padded).
+static inline forge_string_t forge_string_pad_left(forge_string_t s, int64_t width, forge_string_t fill) {
+    if (s.len >= width || fill.len == 0) {
+        char *buf = (char *)malloc((size_t)s.len + 1);
+        if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        memcpy(buf, s.data, (size_t)s.len);
+        buf[s.len] = '\0';
+        return (forge_string_t){ .data = buf, .len = s.len };
+    }
+    int64_t pad_len = width - s.len;
+    char *buf = (char *)malloc((size_t)width + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    for (int64_t i = 0; i < pad_len; i++) {
+        buf[i] = fill.data[i % fill.len];
+    }
+    memcpy(buf + pad_len, s.data, (size_t)s.len);
+    buf[width] = '\0';
+    return (forge_string_t){ .data = buf, .len = width };
+}
+
+// pad_right: pad string to given width with fill character (right-padded).
+static inline forge_string_t forge_string_pad_right(forge_string_t s, int64_t width, forge_string_t fill) {
+    if (s.len >= width || fill.len == 0) {
+        char *buf = (char *)malloc((size_t)s.len + 1);
+        if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        memcpy(buf, s.data, (size_t)s.len);
+        buf[s.len] = '\0';
+        return (forge_string_t){ .data = buf, .len = s.len };
+    }
+    int64_t pad_len = width - s.len;
+    char *buf = (char *)malloc((size_t)width + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, s.data, (size_t)s.len);
+    for (int64_t i = 0; i < pad_len; i++) {
+        buf[s.len + i] = fill.data[i % fill.len];
+    }
+    buf[width] = '\0';
+    return (forge_string_t){ .data = buf, .len = width };
+}
+
 // split uses a forward-declared list type — defined after collection types
-// (see forge_string_split below)
+// (see forge_string_split below and forge_string_chars below)
 
 // ---------------------------------------------------------------
 // conversions to string
@@ -935,6 +1010,100 @@ static inline forge_string_t forge_list_join(forge_list_t list, forge_string_t s
     }
     buf[total] = '\0';
     return (forge_string_t){ .data = buf, .len = total };
+}
+
+// string — chars(): split into a list of single-character strings.
+static inline forge_list_t forge_string_chars(forge_string_t s) {
+    forge_list_t result = { .data = NULL, .len = 0 };
+    for (int64_t i = 0; i < s.len; i++) {
+        char *ch = (char *)malloc(2);
+        if (!ch) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        ch[0] = s.data[i];
+        ch[1] = '\0';
+        forge_string_t part = { .data = ch, .len = 1 };
+        forge_list_push(&result, &part, sizeof(forge_string_t));
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------
+// list — index_of, slice, sort
+// ---------------------------------------------------------------
+
+// list — find first occurrence of element. returns -1 if not found.
+static inline int64_t forge_list_index_of(forge_list_t list, const void *elem, int64_t elem_size) {
+    for (int64_t i = 0; i < list.len; i++) {
+        if (memcmp((char *)list.data + i * elem_size, elem, (size_t)elem_size) == 0)
+            return i;
+    }
+    return -1;
+}
+
+// list — find first occurrence of string element. returns -1 if not found.
+static inline int64_t forge_list_index_of_string(forge_list_t list, forge_string_t s) {
+    forge_string_t *items = (forge_string_t *)list.data;
+    for (int64_t i = 0; i < list.len; i++) {
+        if (forge_string_eq(items[i], s)) return i;
+    }
+    return -1;
+}
+
+// list — slice: return a new list from start to end (exclusive).
+static inline forge_list_t forge_list_slice(forge_list_t list, int64_t start, int64_t end, int64_t elem_size) {
+    if (start < 0) start = 0;
+    if (end > list.len) end = list.len;
+    if (start >= end) return (forge_list_t){ .data = NULL, .len = 0 };
+    int64_t new_len = end - start;
+    int64_t total = new_len * elem_size;
+    void *buf = malloc((size_t)total);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, (char *)list.data + start * elem_size, (size_t)total);
+    return (forge_list_t){ .data = buf, .len = new_len };
+}
+
+// qsort comparators for sort
+static int forge_cmp_int(const void *a, const void *b) {
+    int64_t va = *(const int64_t *)a;
+    int64_t vb = *(const int64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+static int forge_cmp_float(const void *a, const void *b) {
+    double va = *(const double *)a;
+    double vb = *(const double *)b;
+    return (va > vb) - (va < vb);
+}
+
+static int forge_cmp_string(const void *a, const void *b) {
+    const forge_string_t *sa = (const forge_string_t *)a;
+    const forge_string_t *sb = (const forge_string_t *)b;
+    int64_t min_len = sa->len < sb->len ? sa->len : sb->len;
+    int cmp = memcmp(sa->data, sb->data, (size_t)min_len);
+    if (cmp != 0) return cmp;
+    return (sa->len > sb->len) - (sa->len < sb->len);
+}
+
+// list — sort: return a new sorted copy. type_tag: 0=int, 1=float, 2=string.
+static inline forge_list_t forge_list_sort(forge_list_t list, int64_t elem_size, int type_tag) {
+    if (list.len <= 1) {
+        forge_list_t copy = { .data = NULL, .len = list.len };
+        if (list.len == 1) {
+            copy.data = malloc((size_t)elem_size);
+            if (!copy.data) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+            memcpy(copy.data, list.data, (size_t)elem_size);
+        }
+        return copy;
+    }
+    int64_t total = list.len * elem_size;
+    void *buf = malloc((size_t)total);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, list.data, (size_t)total);
+    int (*cmp)(const void *, const void *) = NULL;
+    if (type_tag == 0) cmp = forge_cmp_int;
+    else if (type_tag == 1) cmp = forge_cmp_float;
+    else cmp = forge_cmp_string;
+    qsort(buf, (size_t)list.len, (size_t)elem_size, cmp);
+    return (forge_list_t){ .data = buf, .len = list.len };
 }
 
 // ---------------------------------------------------------------

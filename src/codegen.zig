@@ -2795,11 +2795,13 @@ pub const CEmitter = struct {
             return;
         }
 
-        // one-arg runtime functions: contains, starts_with, ends_with, split
+        // one-arg string->string/bool: contains, starts_with, ends_with, split, index_of, last_index_of
         if (std.mem.eql(u8, method, "contains") or
             std.mem.eql(u8, method, "starts_with") or
             std.mem.eql(u8, method, "ends_with") or
-            std.mem.eql(u8, method, "split"))
+            std.mem.eql(u8, method, "split") or
+            std.mem.eql(u8, method, "index_of") or
+            std.mem.eql(u8, method, "last_index_of"))
         {
             try self.writeStr("forge_string_");
             try self.writeStr(method);
@@ -2811,10 +2813,11 @@ pub const CEmitter = struct {
             return;
         }
 
-        // no-arg runtime functions: trim, to_upper, to_lower
+        // no-arg runtime functions: trim, to_upper, to_lower, chars
         if (std.mem.eql(u8, method, "trim") or
             std.mem.eql(u8, method, "to_upper") or
-            std.mem.eql(u8, method, "to_lower"))
+            std.mem.eql(u8, method, "to_lower") or
+            std.mem.eql(u8, method, "chars"))
         {
             try self.writeStr("forge_string_");
             try self.writeStr(method);
@@ -2824,8 +2827,28 @@ pub const CEmitter = struct {
             return;
         }
 
-        // two-arg string methods: substring(start, end), replace(old, new)
-        if (std.mem.eql(u8, method, "substring") or std.mem.eql(u8, method, "replace")) {
+        // is_empty() → inline check
+        if (std.mem.eql(u8, method, "is_empty")) {
+            try self.writeByte('(');
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(".len == 0)");
+            return;
+        }
+
+        // repeat(Int) -> String
+        if (std.mem.eql(u8, method, "repeat")) {
+            try self.writeStr("forge_string_repeat(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[0].value);
+            try self.writeByte(')');
+            return;
+        }
+
+        // two-arg string methods: substring, replace, pad_left, pad_right
+        if (std.mem.eql(u8, method, "substring") or std.mem.eql(u8, method, "replace") or
+            std.mem.eql(u8, method, "pad_left") or std.mem.eql(u8, method, "pad_right"))
+        {
             try self.writeStr("forge_string_");
             try self.writeStr(method);
             try self.writeByte('(');
@@ -3015,6 +3038,52 @@ pub const CEmitter = struct {
             try self.emitExpr(mc.receiver);
             try self.writeStr(", ");
             try self.emitExpr(mc.args[0].value);
+            try self.writeByte(')');
+            return true;
+        }
+        // index_of(T) -> Int
+        if (std.mem.eql(u8, method, "index_of") and mc.args.len == 1) {
+            if (elem_type == .string) {
+                try self.writeStr("forge_list_index_of_string(");
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(", ");
+                try self.emitExpr(mc.args[0].value);
+                try self.writeByte(')');
+            } else {
+                try self.writeStr("forge_list_index_of(");
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(", &(");
+                try self.writeStr(c_type);
+                try self.writeStr("){");
+                try self.emitExpr(mc.args[0].value);
+                try self.writeStr("}, sizeof(");
+                try self.writeStr(c_type);
+                try self.writeStr("))");
+            }
+            return true;
+        }
+        // slice(Int, Int) -> List[T]
+        if (std.mem.eql(u8, method, "slice") and mc.args.len == 2) {
+            try self.writeStr("forge_list_slice(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[0].value);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[1].value);
+            try self.writeStr(", sizeof(");
+            try self.writeStr(c_type);
+            try self.writeStr("))");
+            return true;
+        }
+        // sort() -> List[T]
+        if (std.mem.eql(u8, method, "sort")) {
+            const tag: []const u8 = if (elem_type == .int) "0" else if (elem_type == .float) "1" else "2";
+            try self.writeStr("forge_list_sort(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", sizeof(");
+            try self.writeStr(c_type);
+            try self.writeStr("), ");
+            try self.writeStr(tag);
             try self.writeByte(')');
             return true;
         }
@@ -3225,12 +3294,18 @@ pub const CEmitter = struct {
         if (std.mem.eql(u8, method, "contains")) return .bool;
         if (std.mem.eql(u8, method, "starts_with")) return .bool;
         if (std.mem.eql(u8, method, "ends_with")) return .bool;
+        if (std.mem.eql(u8, method, "is_empty")) return .bool;
+        if (std.mem.eql(u8, method, "index_of")) return .int;
+        if (std.mem.eql(u8, method, "last_index_of")) return .int;
         if (std.mem.eql(u8, method, "trim")) return .string;
         if (std.mem.eql(u8, method, "to_upper")) return .string;
         if (std.mem.eql(u8, method, "to_lower")) return .string;
         if (std.mem.eql(u8, method, "substring")) return .string;
         if (std.mem.eql(u8, method, "replace")) return .string;
-        if (std.mem.eql(u8, method, "split")) {
+        if (std.mem.eql(u8, method, "repeat")) return .string;
+        if (std.mem.eql(u8, method, "pad_left")) return .string;
+        if (std.mem.eql(u8, method, "pad_right")) return .string;
+        if (std.mem.eql(u8, method, "split") or std.mem.eql(u8, method, "chars")) {
             return self.type_table.lookup("List[String]") orelse .err;
         }
         return .err;
@@ -3255,13 +3330,19 @@ pub const CEmitter = struct {
         if (std.mem.eql(u8, method, "len")) return .int;
         if (std.mem.eql(u8, method, "is_empty")) return .bool;
         if (std.mem.eql(u8, method, "contains")) return .bool;
+        if (std.mem.eql(u8, method, "index_of")) return .int;
         if (std.mem.eql(u8, method, "push") or
             std.mem.eql(u8, method, "remove") or
             std.mem.eql(u8, method, "reverse") or
             std.mem.eql(u8, method, "clear")) return .void;
         if (std.mem.eql(u8, method, "join")) return .string;
-        _ = self;
-        _ = elem_type;
+        // slice and sort return the same list type
+        if (std.mem.eql(u8, method, "slice") or std.mem.eql(u8, method, "sort")) {
+            const elem_name = self.type_table.typeName(elem_type);
+            var buf: [128]u8 = undefined;
+            const lookup_name = std.fmt.bufPrint(&buf, "List[{s}]", .{elem_name}) catch return null;
+            return self.type_table.lookup(lookup_name);
+        }
         return null;
     }
 

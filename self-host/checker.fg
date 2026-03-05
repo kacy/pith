@@ -1779,6 +1779,9 @@ fn c_check_string_method(method: String, args: List[Int], scope_id: Int) -> Int:
     if method == "to_lower":
         c_expect_no_args(method, args)
         return TID_STRING
+    if method == "is_empty":
+        c_expect_no_args(method, args)
+        return TID_BOOL
     if method == "contains":
         c_expect_one_string_arg(method, args, scope_id)
         return TID_BOOL
@@ -1788,6 +1791,12 @@ fn c_check_string_method(method: String, args: List[Int], scope_id: Int) -> Int:
     if method == "ends_with":
         c_expect_one_string_arg(method, args, scope_id)
         return TID_BOOL
+    if method == "index_of":
+        c_expect_one_string_arg(method, args, scope_id)
+        return TID_INT
+    if method == "last_index_of":
+        c_expect_one_string_arg(method, args, scope_id)
+        return TID_INT
     if method == "split":
         c_expect_one_string_arg(method, args, scope_id)
         return c_intern_collection("List", TID_STRING, -1)
@@ -1797,6 +1806,18 @@ fn c_check_string_method(method: String, args: List[Int], scope_id: Int) -> Int:
     if method == "replace":
         c_expect_two_string_args(method, args, scope_id)
         return TID_STRING
+    if method == "repeat":
+        c_expect_one_typed_arg(method, args, TID_INT, scope_id)
+        return TID_STRING
+    if method == "pad_left":
+        c_expect_int_string_args(method, args, scope_id)
+        return TID_STRING
+    if method == "pad_right":
+        c_expect_int_string_args(method, args, scope_id)
+        return TID_STRING
+    if method == "chars":
+        c_expect_no_args(method, args)
+        return c_intern_collection("List", TID_STRING, -1)
     c_error("E209", "String has no method '" + method + "'")
     return TID_ERR
 
@@ -1861,6 +1882,15 @@ fn c_check_list_method(method: String, info: TypeInfo, args: List[Int], scope_id
     if method == "join":
         c_expect_one_typed_arg(method, args, TID_STRING, scope_id)
         return TID_STRING
+    if method == "index_of":
+        c_expect_one_typed_arg(method, args, elem, scope_id)
+        return TID_INT
+    if method == "slice":
+        c_expect_two_int_args(method, args, scope_id)
+        return c_intern_collection("List", elem, -1)
+    if method == "sort":
+        c_expect_no_args(method, args)
+        return c_intern_collection("List", elem, -1)
     # not a built-in list method
     return -1
 
@@ -1982,6 +2012,13 @@ fn c_expect_two_int_args(method: String, args: List[Int], scope_id: Int):
         return
     c_check_arg_type(args[0], TID_INT, scope_id)
     c_check_arg_type(args[1], TID_INT, scope_id)
+
+fn c_expect_int_string_args(method: String, args: List[Int], scope_id: Int):
+    if args.len() != 2:
+        c_error("E207", method + " expects 2 arguments, got " + args.len().to_string())
+        return
+    c_check_arg_type(args[0], TID_INT, scope_id)
+    c_check_arg_type(args[1], TID_STRING, scope_id)
 
 fn c_expect_one_typed_arg(method: String, args: List[Int], expected: Int, scope_id: Int):
     if args.len() != 1:

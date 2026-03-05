@@ -2419,6 +2419,11 @@ fn g_emit_string_method(node_idx: Int, method: String):
         g_emit_expr(receiver_idx)
         g_write(".len")
         return
+    if method == "is_empty":
+        g_write("(")
+        g_emit_expr(receiver_idx)
+        g_write(".len == 0)")
+        return
     if method == "contains":
         g_write("forge_string_contains(")
         g_emit_expr(receiver_idx)
@@ -2435,6 +2440,20 @@ fn g_emit_string_method(node_idx: Int, method: String):
         return
     if method == "ends_with":
         g_write("forge_string_ends_with(")
+        g_emit_expr(receiver_idx)
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(")")
+        return
+    if method == "index_of":
+        g_write("forge_string_index_of(")
+        g_emit_expr(receiver_idx)
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(")")
+        return
+    if method == "last_index_of":
+        g_write("forge_string_last_index_of(")
         g_emit_expr(receiver_idx)
         g_write(", ")
         g_emit_expr(g_call_arg(node_idx, 0))
@@ -2462,6 +2481,18 @@ fn g_emit_string_method(node_idx: Int, method: String):
         g_emit_expr(receiver_idx)
         g_write(")")
         return
+    if method == "chars":
+        g_write("forge_string_chars(")
+        g_emit_expr(receiver_idx)
+        g_write(")")
+        return
+    if method == "repeat":
+        g_write("forge_string_repeat(")
+        g_emit_expr(receiver_idx)
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(")")
+        return
     if method == "substring":
         g_write("forge_string_substring(")
         g_emit_expr(receiver_idx)
@@ -2473,6 +2504,24 @@ fn g_emit_string_method(node_idx: Int, method: String):
         return
     if method == "replace":
         g_write("forge_string_replace(")
+        g_emit_expr(receiver_idx)
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 1))
+        g_write(")")
+        return
+    if method == "pad_left":
+        g_write("forge_string_pad_left(")
+        g_emit_expr(receiver_idx)
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 1))
+        g_write(")")
+        return
+    if method == "pad_right":
+        g_write("forge_string_pad_right(")
         g_emit_expr(receiver_idx)
         g_write(", ")
         g_emit_expr(g_call_arg(node_idx, 0))
@@ -2571,6 +2620,49 @@ fn g_emit_list_method(node_idx: Int, method: String, elem_tid: Int):
         g_emit_expr(receiver_idx)
         g_write(", ")
         g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(")")
+        return
+    if method == "index_of":
+        if elem_tid == TID_STRING:
+            g_write("forge_list_index_of_string(")
+            g_emit_expr(receiver_idx)
+            g_write(", ")
+            g_emit_expr(g_call_arg(node_idx, 0))
+            g_write(")")
+        else:
+            g_write("forge_list_index_of(")
+            g_emit_expr(receiver_idx)
+            g_write(", &(")
+            g_write(elem_c)
+            g_write(")" + LB)
+            g_emit_expr(g_call_arg(node_idx, 0))
+            g_write(RB + ", sizeof(")
+            g_write(elem_c)
+            g_write("))")
+        return
+    if method == "slice":
+        g_write("forge_list_slice(")
+        g_emit_expr(receiver_idx)
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 1))
+        g_write(", sizeof(")
+        g_write(elem_c)
+        g_write("))")
+        return
+    if method == "sort":
+        mut tag := "0"
+        if elem_tid == TID_FLOAT:
+            tag = "1"
+        elif elem_tid == TID_STRING:
+            tag = "2"
+        g_write("forge_list_sort(")
+        g_emit_expr(receiver_idx)
+        g_write(", sizeof(")
+        g_write(elem_c)
+        g_write("), ")
+        g_write(tag)
         g_write(")")
         return
 

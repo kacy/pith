@@ -2572,11 +2572,19 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "trim")) return self.checkNoArgs(mc, location, "String.trim", .string);
         if (std.mem.eql(u8, method, "to_upper")) return self.checkNoArgs(mc, location, "String.to_upper", .string);
         if (std.mem.eql(u8, method, "to_lower")) return self.checkNoArgs(mc, location, "String.to_lower", .string);
+        if (std.mem.eql(u8, method, "is_empty")) return self.checkNoArgs(mc, location, "String.is_empty", .bool);
 
         // one-string-arg methods
         if (std.mem.eql(u8, method, "contains")) return self.checkOneStringArg(mc, location, scope, "String.contains", .bool);
         if (std.mem.eql(u8, method, "starts_with")) return self.checkOneStringArg(mc, location, scope, "String.starts_with", .bool);
         if (std.mem.eql(u8, method, "ends_with")) return self.checkOneStringArg(mc, location, scope, "String.ends_with", .bool);
+
+        // index_of(String) -> Int, last_index_of(String) -> Int
+        if (std.mem.eql(u8, method, "index_of")) return self.checkOneStringArg(mc, location, scope, "String.index_of", .int);
+        if (std.mem.eql(u8, method, "last_index_of")) return self.checkOneStringArg(mc, location, scope, "String.last_index_of", .int);
+
+        // repeat(Int) -> String
+        if (std.mem.eql(u8, method, "repeat")) return self.checkNoArgs1Int(mc, location, scope, "String.repeat", .string);
 
         // split(String) -> List[String]
         if (std.mem.eql(u8, method, "split")) {
@@ -2634,6 +2642,41 @@ pub const Checker = struct {
             return .string;
         }
 
+        // pad_left(Int, String) -> String, pad_right(Int, String) -> String
+        if (std.mem.eql(u8, method, "pad_left") or std.mem.eql(u8, method, "pad_right")) {
+            const label = if (std.mem.eql(u8, method, "pad_left")) "String.pad_left" else "String.pad_right";
+            if (mc.args.len != 2) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'{s}' expects 2 arguments, got {d}", .{ label, mc.args.len },
+                )) catch {};
+                return .err;
+            }
+            const a0 = self.checkExpr(mc.args[0].value, scope);
+            if (!a0.isErr() and a0 != .int) {
+                self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
+                    "expected Int, got {s}", .{self.type_table.typeName(a0)},
+                )) catch {};
+            }
+            const a1 = self.checkExpr(mc.args[1].value, scope);
+            if (!a1.isErr() and a1 != .string) {
+                self.diagnostics.addCodedError(.E219, mc.args[1].location, self.fmt(
+                    "expected String, got {s}", .{self.type_table.typeName(a1)},
+                )) catch {};
+            }
+            return .string;
+        }
+
+        // chars() -> List[String]
+        if (std.mem.eql(u8, method, "chars")) {
+            if (mc.args.len != 0) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'String.chars' expects 0 arguments, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            return self.type_table.lookup("List[String]") orelse .err;
+        }
+
         // unknown string method
         self.diagnostics.addCodedError(.E227, location, self.fmt(
             "type 'String' has no method '{s}'", .{method},
@@ -2686,7 +2729,6 @@ pub const Checker = struct {
     /// is not a built-in list method (falls through to user-defined lookup).
     fn checkListMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, elem_type: TypeId, receiver_type: TypeId) ?TypeId {
         const method = mc.method;
-        _ = receiver_type;
 
         if (std.mem.eql(u8, method, "push")) {
             return self.checkOneTypedArg(mc, location, scope, "List.push", elem_type, .void);
@@ -2707,6 +2749,44 @@ pub const Checker = struct {
                 return .err;
             }
             return self.checkOneStringArg(mc, location, scope, "List.join", .string);
+        }
+        // index_of(T) -> Int
+        if (std.mem.eql(u8, method, "index_of")) {
+            return self.checkOneTypedArg(mc, location, scope, "List.index_of", elem_type, .int);
+        }
+        // slice(Int, Int) -> List[T]
+        if (std.mem.eql(u8, method, "slice")) {
+            if (mc.args.len != 2) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'List.slice' expects 2 arguments, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            for (mc.args) |arg| {
+                const arg_type = self.checkExpr(arg.value, scope);
+                if (!arg_type.isErr() and arg_type != .int) {
+                    self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
+                        "expected Int, got {s}", .{self.type_table.typeName(arg_type)},
+                    )) catch {};
+                }
+            }
+            return receiver_type;
+        }
+        // sort() -> List[T] (only Int, Float, String)
+        if (std.mem.eql(u8, method, "sort")) {
+            if (mc.args.len != 0) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'List.sort' expects 0 arguments, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            if (elem_type != .int and elem_type != .float and elem_type != .string) {
+                self.diagnostics.addCodedError(.E227, location,
+                    "'sort' requires List[Int], List[Float], or List[String]",
+                ) catch {};
+                return .err;
+            }
+            return receiver_type;
         }
         return null;
     }

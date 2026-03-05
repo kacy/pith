@@ -759,6 +759,22 @@ fn g_emit_struct_instantiations(base: String):
         tid = tid + 1
 
 # ---------------------------------------------------------------
+# type alias typedefs
+# ---------------------------------------------------------------
+
+fn g_emit_type_alias(node_idx: Int):
+    node := get_node(node_idx)
+    name := node.value
+    if node.children.len() > 0:
+        target_tid := c_resolve_type(node.children[0])
+        if target_tid >= 0:
+            g_write("typedef ")
+            g_emit_c_type(target_tid)
+            g_write(" ")
+            g_write(name)
+            g_write(";\n")
+
+# ---------------------------------------------------------------
 # enum definitions
 # ---------------------------------------------------------------
 
@@ -3987,6 +4003,7 @@ pub fn g_emit_module(root_idx: Int):
     # pre-bucket children by kind in a single pass (avoids 6 repeated scans)
     mut struct_decls: List[Int] := []
     mut enum_decls: List[Int] := []
+    mut type_alias_decls: List[Int] := []
     mut fn_decls: List[Int] := []
     mut impl_decls: List[Int] := []
     mut test_decls: List[Int] := []
@@ -4000,6 +4017,8 @@ pub fn g_emit_module(root_idx: Int):
             struct_decls.push(decl_idx)
         elif node.kind == "enum_decl":
             enum_decls.push(decl_idx)
+        elif node.kind == "type_alias":
+            type_alias_decls.push(decl_idx)
         elif node.kind == "fn_decl":
             fn_decls.push(decl_idx)
         elif node.kind == "impl_decl":
@@ -4025,6 +4044,10 @@ pub fn g_emit_module(root_idx: Int):
 
     # pass 2c: builtin helpers
     g_emit_builtin_helpers()
+
+    # pass 2d: type alias typedefs
+    for decl_idx in type_alias_decls:
+        g_emit_type_alias(decl_idx)
 
     # pass 3: function forward declarations
     for decl_idx in fn_decls:
@@ -4125,6 +4148,18 @@ pub fn g_emit_modules(roots: List[Int]):
 
     # pass 2c: builtin helpers (once)
     g_emit_builtin_helpers()
+
+    # pass 2d: type alias typedefs from all modules
+    for root in roots:
+        r := get_node(root)
+        for child in r.children:
+            mut node := get_node(child)
+            mut decl_idx := child
+            if node.kind == "pub":
+                decl_idx = node.children[0]
+                node = get_node(decl_idx)
+            if node.kind == "type_alias":
+                g_emit_type_alias(decl_idx)
 
     # pass 3: function forward declarations from all modules
     for root in roots:

@@ -106,6 +106,5 @@ docs/errors.md       error code reference (E0xx–E3xx)
 
 ## known limitations
 
-- type aliases parsed but not codegen'd
 - collections passed to functions are copies — mutations don't propagate back
 - `{`/`}` in string literals trigger interpolation — use `chr(123)`/`chr(125)`

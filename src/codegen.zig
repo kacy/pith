@@ -271,6 +271,16 @@ pub const CEmitter = struct {
         // these must come after result/optional typedefs since they return those types.
         try self.emitBuiltinHelpers();
 
+        // pass 2d: type alias typedefs
+        for (all_modules.items) |mod| {
+            for (mod.decls) |*decl| {
+                switch (decl.kind) {
+                    .type_alias => |ta| try self.emitTypeAlias(&ta),
+                    else => {},
+                }
+            }
+        }
+
         // pass 3: forward-declare all functions.
         // skip main() from imported modules — each module may have its own
         // main() for standalone use, but only the entry module's main is emitted.
@@ -1233,6 +1243,24 @@ pub const CEmitter = struct {
             if (std.mem.eql(u8, field.name, field_name)) return field.type_id;
         }
         return .err;
+    }
+
+    // ---------------------------------------------------------------
+    // type alias typedefs
+    // ---------------------------------------------------------------
+
+    fn emitTypeAlias(self: *CEmitter, ta: *const ast.TypeAlias) EmitError!void {
+        // skip generic type aliases (not supported yet, E233)
+        if (ta.generic_params.len > 0) return;
+
+        const target_tid = self.resolveTypeExprToId(ta.type_expr);
+        if (target_tid.isErr()) return;
+
+        try self.writeStr("typedef ");
+        try self.emitCType(target_tid);
+        try self.writeByte(' ');
+        try self.writeStr(ta.name);
+        try self.writeStr(";\n");
     }
 
     // ---------------------------------------------------------------
@@ -4440,6 +4468,46 @@ test "stripQuotes strips surrounding double quotes" {
     try std.testing.expectEqualStrings("", CEmitter.stripQuotes("\"\""));
     try std.testing.expectEqualStrings("no quotes", CEmitter.stripQuotes("no quotes"));
     try std.testing.expectEqualStrings("a", CEmitter.stripQuotes("a"));
+}
+
+test "type alias emits typedef" {
+    const allocator = std.testing.allocator;
+    const Lexer = @import("lexer.zig").Lexer;
+    const Parser = @import("parser.zig").Parser;
+
+    const source =
+        \\type Meters = Int
+        \\type Name = String
+        \\fn main():
+        \\    d: Meters := 42
+        \\    print(d.to_string())
+        \\
+    ;
+
+    var lexer = try Lexer.init(source, allocator);
+    defer lexer.deinit();
+    const tokens = try lexer.tokenize();
+    defer allocator.free(tokens);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var parser = Parser.init(tokens, source, arena.allocator());
+    defer parser.deinit();
+    const module = try parser.parseModule();
+
+    var checker = try Checker.Checker.init(allocator, source);
+    defer checker.deinit();
+    checker.check(&module);
+    try std.testing.expect(!checker.diagnostics.hasErrors());
+
+    var emitter = CEmitter.init(allocator, &checker.type_table, &checker.module_scope, &checker.method_types, &checker.generic_decls);
+    defer emitter.deinit();
+    try emitter.emitModule(&module);
+
+    const output = emitter.getOutput();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "typedef int64_t Meters;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "typedef forge_string_t Name;") != null);
 }
 
 test "full pipeline emits valid C for simple program" {

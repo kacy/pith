@@ -126,6 +126,13 @@ const forge_prefix_builtins = std.StaticStringMap(void).initComptime(.{
     .{ "toml_array_get", {} },
     .{ "toml_keys", {} },
     .{ "toml_has", {} },
+    .{ "process_spawn", {} },
+    .{ "process_write", {} },
+    .{ "process_read", {} },
+    .{ "process_read_err", {} },
+    .{ "process_wait", {} },
+    .{ "process_kill", {} },
+    .{ "process_close", {} },
 });
 
 // ---------------------------------------------------------------
@@ -1358,6 +1365,66 @@ pub const CEmitter = struct {
             \\    }
             \\    forge_result_forge_string_t r; r.is_ok = false;
             \\    r.err = FORGE_STRING_LIT("failed to resolve hostname");
+            \\    return r;
+            \\}
+            \\
+        );
+
+        // process_spawn(String) -> Int!
+        try self.writeStr(
+            \\static forge_result_int64_t forge_process_spawn(forge_string_t cmd) {
+            \\    int64_t handle;
+            \\    if (forge_process_spawn_impl(cmd, &handle)) {
+            \\        forge_result_int64_t r; r.is_ok = true; r.ok = handle;
+            \\        return r;
+            \\    }
+            \\    forge_result_int64_t r; r.is_ok = false;
+            \\    r.err = FORGE_STRING_LIT("failed to spawn process");
+            \\    return r;
+            \\}
+            \\
+        );
+
+        // process_write(Int, String) -> Int!
+        try self.writeStr(
+            \\static forge_result_int64_t forge_process_write(int64_t handle, forge_string_t data) {
+            \\    int64_t n;
+            \\    if (forge_process_write_impl(handle, data, &n)) {
+            \\        forge_result_int64_t r; r.is_ok = true; r.ok = n;
+            \\        return r;
+            \\    }
+            \\    forge_result_int64_t r; r.is_ok = false;
+            \\    r.err = FORGE_STRING_LIT("failed to write to process");
+            \\    return r;
+            \\}
+            \\
+        );
+
+        // process_read(Int, Int) -> String!
+        try self.writeStr(
+            \\static forge_result_forge_string_t forge_process_read(int64_t handle, int64_t max_bytes) {
+            \\    forge_string_t data;
+            \\    if (forge_process_read_impl(handle, max_bytes, &data)) {
+            \\        forge_result_forge_string_t r; r.is_ok = true; r.ok = data;
+            \\        return r;
+            \\    }
+            \\    forge_result_forge_string_t r; r.is_ok = false;
+            \\    r.err = FORGE_STRING_LIT("failed to read from process");
+            \\    return r;
+            \\}
+            \\
+        );
+
+        // process_read_err(Int, Int) -> String!
+        try self.writeStr(
+            \\static forge_result_forge_string_t forge_process_read_err(int64_t handle, int64_t max_bytes) {
+            \\    forge_string_t data;
+            \\    if (forge_process_read_err_impl(handle, max_bytes, &data)) {
+            \\        forge_result_forge_string_t r; r.is_ok = true; r.ok = data;
+            \\        return r;
+            \\    }
+            \\    forge_result_forge_string_t r; r.is_ok = false;
+            \\    r.err = FORGE_STRING_LIT("failed to read stderr from process");
             \\    return r;
             \\}
             \\

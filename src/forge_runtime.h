@@ -21,6 +21,8 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
+#include <sys/wait.h>
+#include <signal.h>
 
 // ---------------------------------------------------------------
 // closure type (function pointer + captured environment)
@@ -3348,6 +3350,151 @@ static inline void forge_semaphore_release(forge_semaphore_t *s) {
     s->__permits++;
     pthread_cond_signal(&s->__cond);
     pthread_mutex_unlock(&s->__mutex);
+}
+
+// --- process management ---
+// opaque handle pool: each handle stores pid + pipe file descriptors.
+
+typedef struct {
+    pid_t pid;
+    int stdin_fd;   // write end — parent writes to child's stdin
+    int stdout_fd;  // read end — parent reads child's stdout
+    int stderr_fd;  // read end — parent reads child's stderr
+    bool alive;
+} forge_process_t;
+
+#define FORGE_MAX_PROCESSES 64
+static forge_process_t forge_process_pool[FORGE_MAX_PROCESSES];
+static int64_t forge_process_count = 0;
+
+// spawn a child process. returns handle index, or -1 on error.
+// the command string is split on spaces (no shell interpretation).
+static inline bool forge_process_spawn_impl(forge_string_t cmd, int64_t *out_handle) {
+    if (forge_process_count >= FORGE_MAX_PROCESSES) {
+        *out_handle = -1;
+        return false;
+    }
+
+    int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
+    if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
+        *out_handle = -1;
+        return false;
+    }
+
+    // parse command into argv (simple space split)
+    char *cstr = forge_cstr(cmd);
+    char *argv[128];
+    int argc = 0;
+    char *tok = strtok(cstr, " ");
+    while (tok && argc < 127) {
+        argv[argc++] = tok;
+        tok = strtok(NULL, " ");
+    }
+    argv[argc] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        free(cstr);
+        close(stdin_pipe[0]); close(stdin_pipe[1]);
+        close(stdout_pipe[0]); close(stdout_pipe[1]);
+        close(stderr_pipe[0]); close(stderr_pipe[1]);
+        *out_handle = -1;
+        return false;
+    }
+
+    if (pid == 0) {
+        // child
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+
+    // parent
+    free(cstr);
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+
+    int64_t handle = forge_process_count++;
+    forge_process_pool[handle].pid = pid;
+    forge_process_pool[handle].stdin_fd = stdin_pipe[1];
+    forge_process_pool[handle].stdout_fd = stdout_pipe[0];
+    forge_process_pool[handle].stderr_fd = stderr_pipe[0];
+    forge_process_pool[handle].alive = true;
+    *out_handle = handle;
+    return true;
+}
+
+// write string to child's stdin. returns bytes written or -1 on error.
+static inline bool forge_process_write_impl(int64_t handle, forge_string_t data, int64_t *out) {
+    if (handle < 0 || handle >= forge_process_count) { *out = -1; return false; }
+    forge_process_t *p = &forge_process_pool[handle];
+    ssize_t n = write(p->stdin_fd, data.data, (size_t)data.len);
+    if (n < 0) { *out = -1; return false; }
+    *out = (int64_t)n;
+    return true;
+}
+
+// read from child's stdout. reads up to max_bytes.
+static inline bool forge_process_read_impl(int64_t handle, int64_t max_bytes, forge_string_t *out) {
+    if (handle < 0 || handle >= forge_process_count) { *out = forge_string_empty; return false; }
+    forge_process_t *p = &forge_process_pool[handle];
+    char *buf = (char *)malloc((size_t)max_bytes + 1);
+    if (!buf) { *out = forge_string_empty; return false; }
+    ssize_t n = read(p->stdout_fd, buf, (size_t)max_bytes);
+    if (n < 0) { free(buf); *out = forge_string_empty; return false; }
+    buf[n] = '\0';
+    *out = forge_string_from(buf, (int64_t)n);
+    return true;
+}
+
+// read from child's stderr. reads up to max_bytes.
+static inline bool forge_process_read_err_impl(int64_t handle, int64_t max_bytes, forge_string_t *out) {
+    if (handle < 0 || handle >= forge_process_count) { *out = forge_string_empty; return false; }
+    forge_process_t *p = &forge_process_pool[handle];
+    char *buf = (char *)malloc((size_t)max_bytes + 1);
+    if (!buf) { *out = forge_string_empty; return false; }
+    ssize_t n = read(p->stderr_fd, buf, (size_t)max_bytes);
+    if (n < 0) { free(buf); *out = forge_string_empty; return false; }
+    buf[n] = '\0';
+    *out = forge_string_from(buf, (int64_t)n);
+    return true;
+}
+
+// wait for child to exit. returns exit code.
+static inline int64_t forge_process_wait(int64_t handle) {
+    if (handle < 0 || handle >= forge_process_count) return -1;
+    forge_process_t *p = &forge_process_pool[handle];
+    int status = 0;
+    waitpid(p->pid, &status, 0);
+    p->alive = false;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
+
+// kill the child process. returns true if signal sent successfully.
+static inline bool forge_process_kill(int64_t handle) {
+    if (handle < 0 || handle >= forge_process_count) return false;
+    forge_process_t *p = &forge_process_pool[handle];
+    if (!p->alive) return false;
+    return kill(p->pid, SIGTERM) == 0;
+}
+
+// close all pipe file descriptors for this process.
+static inline void forge_process_close(int64_t handle) {
+    if (handle < 0 || handle >= forge_process_count) return;
+    forge_process_t *p = &forge_process_pool[handle];
+    if (p->stdin_fd >= 0) { close(p->stdin_fd); p->stdin_fd = -1; }
+    if (p->stdout_fd >= 0) { close(p->stdout_fd); p->stdout_fd = -1; }
+    if (p->stderr_fd >= 0) { close(p->stderr_fd); p->stderr_fd = -1; }
 }
 
 #endif // FORGE_RUNTIME_H

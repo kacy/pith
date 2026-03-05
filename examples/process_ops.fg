@@ -1,0 +1,22 @@
+# process management
+
+fn run() -> String!:
+    # spawn echo command
+    p := process_spawn("echo hello from child")!
+    output := process_read(p, 4096)!
+    code := process_wait(p)
+    process_close(p)
+    print("output: " + output.trim())
+    print("exit code: " + code.to_string())
+
+    # spawn a command that produces stderr
+    p2 := process_spawn("ls /nonexistent_path_xyz")!
+    err_out := process_read_err(p2, 4096)!
+    code2 := process_wait(p2)
+    process_close(p2)
+    print("stderr: " + (err_out.len() > 0).to_string())
+    print("ls failed: " + (code2 != 0).to_string())
+    return ""
+
+fn main():
+    run()

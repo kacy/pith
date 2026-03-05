@@ -1116,6 +1116,54 @@ fn g_emit_builtin_helpers():
     g_write("    return r;\n")
     g_write(RB + "\n\n")
 
+    # process_spawn(String) -> Int!
+    g_write("static forge_result_int64_t forge_process_spawn(forge_string_t cmd) " + LB + "\n")
+    g_write("    int64_t handle;\n")
+    g_write("    if (forge_process_spawn_impl(cmd, &handle)) " + LB + "\n")
+    g_write("        forge_result_int64_t r; r.is_ok = true; r.ok = handle;\n")
+    g_write("        return r;\n")
+    g_write("    " + RB + "\n")
+    g_write("    forge_result_int64_t r; r.is_ok = false;\n")
+    g_write("    r.err = FORGE_STRING_LIT(\"failed to spawn process\");\n")
+    g_write("    return r;\n")
+    g_write(RB + "\n\n")
+
+    # process_write(Int, String) -> Int!
+    g_write("static forge_result_int64_t forge_process_write(int64_t handle, forge_string_t data) " + LB + "\n")
+    g_write("    int64_t n;\n")
+    g_write("    if (forge_process_write_impl(handle, data, &n)) " + LB + "\n")
+    g_write("        forge_result_int64_t r; r.is_ok = true; r.ok = n;\n")
+    g_write("        return r;\n")
+    g_write("    " + RB + "\n")
+    g_write("    forge_result_int64_t r; r.is_ok = false;\n")
+    g_write("    r.err = FORGE_STRING_LIT(\"failed to write to process\");\n")
+    g_write("    return r;\n")
+    g_write(RB + "\n\n")
+
+    # process_read(Int, Int) -> String!
+    g_write("static forge_result_forge_string_t forge_process_read(int64_t handle, int64_t max_bytes) " + LB + "\n")
+    g_write("    forge_string_t data;\n")
+    g_write("    if (forge_process_read_impl(handle, max_bytes, &data)) " + LB + "\n")
+    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = data;\n")
+    g_write("        return r;\n")
+    g_write("    " + RB + "\n")
+    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
+    g_write("    r.err = FORGE_STRING_LIT(\"failed to read from process\");\n")
+    g_write("    return r;\n")
+    g_write(RB + "\n\n")
+
+    # process_read_err(Int, Int) -> String!
+    g_write("static forge_result_forge_string_t forge_process_read_err(int64_t handle, int64_t max_bytes) " + LB + "\n")
+    g_write("    forge_string_t data;\n")
+    g_write("    if (forge_process_read_err_impl(handle, max_bytes, &data)) " + LB + "\n")
+    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = data;\n")
+    g_write("        return r;\n")
+    g_write("    " + RB + "\n")
+    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
+    g_write("    r.err = FORGE_STRING_LIT(\"failed to read stderr from process\");\n")
+    g_write("    return r;\n")
+    g_write(RB + "\n\n")
+
 # ---------------------------------------------------------------
 # function forward declarations
 # ---------------------------------------------------------------
@@ -2029,6 +2077,10 @@ fn g_is_forge_builtin(name: String) -> Bool:
     if name == "tcp_read" or name == "tcp_write" or name == "tcp_close":
         return true
     if name == "dns_resolve":
+        return true
+    if name == "process_spawn" or name == "process_write" or name == "process_read" or name == "process_read_err":
+        return true
+    if name == "process_wait" or name == "process_kill" or name == "process_close":
         return true
     if name == "toml_parse" or name == "toml_type" or name == "toml_get_string":
         return true

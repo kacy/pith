@@ -258,6 +258,21 @@ fn c_register_builtins():
     # (Int, String) -> Int!
     c_def_builtin("tcp_write", c_make_fn_type([TID_INT, TID_STRING], int_result))
 
+    # process management builtins
+    # (String) -> Int!
+    c_def_builtin("process_spawn", c_make_fn_type([TID_STRING], int_result))
+    # (Int, String) -> Int!
+    c_def_builtin("process_write", c_make_fn_type([TID_INT, TID_STRING], int_result))
+    # (Int, Int) -> String!
+    c_def_builtin("process_read", c_make_fn_type([TID_INT, TID_INT], str_result))
+    c_def_builtin("process_read_err", c_make_fn_type([TID_INT, TID_INT], str_result))
+    # (Int) -> Int
+    c_def_builtin("process_wait", int_to_int)
+    # (Int) -> Bool
+    c_def_builtin("process_kill", c_make_fn_type([TID_INT], TID_BOOL))
+    # (Int) -> Void
+    c_def_builtin("process_close", int_to_void)
+
     # concurrency primitives (stub types)
     c_register_sync_type("Mutex", [])
     c_register_sync_type("WaitGroup", [])

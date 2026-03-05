@@ -335,6 +335,20 @@ pub const Checker = struct {
         try self.registerBuiltin("tcp_write", try self.addFnType(&.{ .int, .string }, int_result));
         // (String) -> String! (dns_resolve already covered by str_to_str_result group)
         try self.registerBuiltin("dns_resolve", str_to_str_result);
+        // (String) -> Int! (process_spawn)
+        try self.registerBuiltin("process_spawn", try self.addFnType(&.{.string}, int_result));
+        // (Int, String) -> Int! (process_write already matches tcp_write sig)
+        try self.registerBuiltin("process_write", try self.addFnType(&.{ .int, .string }, int_result));
+        // (Int, Int) -> String! (process_read, process_read_err)
+        const int_int_to_str_result = try self.addFnType(&.{ .int, .int }, str_result);
+        for ([_][]const u8{ "process_read", "process_read_err" }) |n|
+            try self.registerBuiltin(n, int_int_to_str_result);
+        // (Int) -> Int (process_wait)
+        try self.registerBuiltin("process_wait", int_to_int);
+        // (Int) -> Bool (process_kill)
+        try self.registerBuiltin("process_kill", try self.addFnType(&.{.int}, .bool));
+        // (Int) -> Void (process_close)
+        try self.registerBuiltin("process_close", int_to_void);
 
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});

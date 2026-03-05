@@ -1,0 +1,32 @@
+# std.process — child process management
+#
+# uses opaque Int handles into a C-side process pool.
+# each process has stdin/stdout/stderr pipe access.
+
+# spawn a child process by command string. returns handle or error.
+pub fn spawn(cmd: String) -> Int!:
+    return process_spawn(cmd)
+
+# write to the child's stdin. returns bytes written or error.
+pub fn write_stdin(handle: Int, data: String) -> Int!:
+    return process_write(handle, data)
+
+# read from the child's stdout (up to max_bytes).
+pub fn read_stdout(handle: Int, max_bytes: Int) -> String!:
+    return process_read(handle, max_bytes)
+
+# read from the child's stderr (up to max_bytes).
+pub fn read_stderr(handle: Int, max_bytes: Int) -> String!:
+    return process_read_err(handle, max_bytes)
+
+# wait for the child to exit. returns exit code.
+pub fn wait(handle: Int) -> Int:
+    return process_wait(handle)
+
+# send SIGTERM to the child. returns true if signal sent.
+pub fn kill(handle: Int) -> Bool:
+    return process_kill(handle)
+
+# close all pipe file descriptors for this process.
+pub fn close(handle: Int):
+    process_close(handle)

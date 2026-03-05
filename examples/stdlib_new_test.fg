@@ -1,0 +1,26 @@
+# tests for new stdlib builtins
+
+fn test_exec_output() -> String!:
+    out := exec_output("echo hello")!
+    return out
+
+test "time returns positive epoch ms":
+    t := time()
+    assert(t > 0)
+
+test "sleep does not crash":
+    sleep(1)
+    assert(true)
+
+test "random_int in range":
+    r := random_int(1, 100)
+    assert(r >= 1)
+    assert(r <= 100)
+
+test "random_float in unit range":
+    f := random_float()
+    assert(f >= 0.0)
+    assert(f < 1.0)
+
+test "exec_output captures stdout":
+    result := test_exec_output()

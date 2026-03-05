@@ -295,6 +295,48 @@ pub const Checker = struct {
         } });
         try self.module_scope.define("exec", .{ .type_id = exec_type, .is_mut = false });
 
+        // time() -> Int
+        const time_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("time", .{ .type_id = time_type, .is_mut = false });
+
+        // sleep(Int) -> Void
+        const sleep_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = .void,
+        } });
+        try self.module_scope.define("sleep", .{ .type_id = sleep_type, .is_mut = false });
+
+        // random_int(Int, Int) -> Int
+        const random_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .int },
+            .return_type = .int,
+        } });
+        try self.module_scope.define("random_int", .{ .type_id = random_int_type, .is_mut = false });
+
+        // random_float() -> Float
+        const random_float_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{},
+            .return_type = .float,
+        } });
+        try self.module_scope.define("random_float", .{ .type_id = random_float_type, .is_mut = false });
+
+        // exec_output(String) -> String!
+        const exec_output_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = str_result,
+        } });
+        try self.module_scope.define("exec_output", .{ .type_id = exec_output_type, .is_mut = false });
+
+        // input() -> String
+        const input_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{},
+            .return_type = .string,
+        } });
+        try self.module_scope.define("input", .{ .type_id = input_type, .is_mut = false });
+
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});
         try self.registerSyncType("WaitGroup", &.{});

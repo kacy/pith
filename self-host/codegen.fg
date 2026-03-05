@@ -959,6 +959,18 @@ fn g_emit_builtin_helpers():
     g_write("    return r;\n")
     g_write(RB + "\n\n")
 
+    # exec_output(String) -> String!
+    g_write("static forge_result_forge_string_t forge_exec_output(forge_string_t cmd) " + LB + "\n")
+    g_write("    forge_string_t output;\n")
+    g_write("    if (forge_exec_output_impl(cmd, &output)) " + LB + "\n")
+    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = output;\n")
+    g_write("        return r;\n")
+    g_write("    " + RB + "\n")
+    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
+    g_write("    r.err = FORGE_STRING_LIT(\"failed to execute command\");\n")
+    g_write("    return r;\n")
+    g_write(RB + "\n\n")
+
 # ---------------------------------------------------------------
 # function forward declarations
 # ---------------------------------------------------------------
@@ -1790,6 +1802,32 @@ fn g_emit_call(node_idx: Int):
         g_write("forge_exec(")
         g_emit_expr(g_call_arg(node_idx, 0))
         g_write(")")
+        return
+    if name == "time":
+        g_write("forge_time()")
+        return
+    if name == "sleep":
+        g_write("forge_sleep(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(")")
+        return
+    if name == "random_int":
+        g_write("forge_random_int(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 1))
+        g_write(")")
+        return
+    if name == "random_float":
+        g_write("forge_random_float()")
+        return
+    if name == "exec_output":
+        g_write("forge_exec_output(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(")")
+        return
+    if name == "input":
+        g_write("forge_input()")
         return
     if name == "assert":
         g_emit_assert(node_idx)

@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
+#include <time.h>
 
 // ---------------------------------------------------------------
 // closure type (function pointer + captured environment)
@@ -1053,6 +1054,103 @@ static inline int64_t forge_exec(forge_string_t cmd) {
 #else
     return (int64_t)WEXITSTATUS(result);
 #endif
+}
+
+// ---------------------------------------------------------------
+// time, sleep, random, exec_output, input
+// ---------------------------------------------------------------
+
+// time() -> epoch milliseconds
+static inline int64_t forge_time(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+}
+
+// sleep(ms) -> Void
+static inline void forge_sleep(int64_t ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000;
+    nanosleep(&ts, NULL);
+}
+
+// random — lazy seed on first call
+static int __forge_rng_seeded = 0;
+static inline void __forge_seed_rng(void) {
+    if (!__forge_rng_seeded) {
+        srand48((long)time(NULL));
+        __forge_rng_seeded = 1;
+    }
+}
+
+// random_int(min, max) -> Int (inclusive range)
+static inline int64_t forge_random_int(int64_t min, int64_t max) {
+    __forge_seed_rng();
+    if (min >= max) return min;
+    int64_t range = max - min + 1;
+    return min + (lrand48() % range);
+}
+
+// random_float() -> Float in [0.0, 1.0)
+static inline double forge_random_float(void) {
+    __forge_seed_rng();
+    return drand48();
+}
+
+// exec_output — internal impl, returns false on error.
+// codegen emits a wrapper that returns forge_result_forge_string_t.
+static inline bool forge_exec_output_impl(forge_string_t cmd, forge_string_t *out) {
+    char *cstr = (char *)malloc((size_t)cmd.len + 1);
+    if (!cstr) return false;
+    memcpy(cstr, cmd.data, (size_t)cmd.len);
+    cstr[cmd.len] = '\0';
+
+    FILE *fp = popen(cstr, "r");
+    free(cstr);
+    if (!fp) return false;
+
+    // read all output into a dynamic buffer
+    int64_t cap = 1024;
+    int64_t len = 0;
+    char *buf = (char *)malloc((size_t)cap);
+    if (!buf) { pclose(fp); return false; }
+
+    while (1) {
+        size_t n = fread(buf + len, 1, (size_t)(cap - len), fp);
+        if (n == 0) break;
+        len += (int64_t)n;
+        if (len >= cap) {
+            cap *= 2;
+            char *newbuf = (char *)realloc(buf, (size_t)cap);
+            if (!newbuf) { free(buf); pclose(fp); return false; }
+            buf = newbuf;
+        }
+    }
+    pclose(fp);
+
+    // trim trailing newline (like shell $() does)
+    if (len > 0 && buf[len - 1] == '\n') len--;
+
+    buf[len] = '\0';
+    out->data = buf;
+    out->len = len;
+    return true;
+}
+
+// input() -> String — read a line from stdin
+static inline forge_string_t forge_input(void) {
+    char buf[4096];
+    if (!fgets(buf, sizeof(buf), stdin)) {
+        return forge_string_from("", 0);
+    }
+    int64_t len = (int64_t)strlen(buf);
+    if (len > 0 && buf[len - 1] == '\n') len--;
+    char *copy = (char *)malloc((size_t)len + 1);
+    if (!copy) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(copy, buf, (size_t)len);
+    copy[len] = '\0';
+    return (forge_string_t){ .data = copy, .len = len };
 }
 
 #endif // FORGE_RUNTIME_H

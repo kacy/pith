@@ -1,28 +1,44 @@
 # std.fs — file system operations
+#
+# read and write return Result types because I/O can fail.
+# exists, is_dir, remove, rename, make_dir, and list always succeed.
+#
+#   from std.fs import read, write
+#   content := read("config.toml")!
+#   write("output.txt", content)!
 
+# check if a file exists at path.
 pub fn exists(path: String) -> Bool:
     return file_exists(path)
 
+# check if a directory exists at path.
 pub fn is_dir(path: String) -> Bool:
     return dir_exists(path)
 
+# read the entire file at path as a string.
 pub fn read(path: String) -> String!:
     return read_file(path)
 
+# write data to a file, creating or overwriting it.
 pub fn write(path: String, data: String) -> Bool!:
     return write_file(path, data)
 
+# append data to a file, creating it if needed.
 pub fn append(path: String, data: String) -> Bool!:
     return append_file(path, data)
 
+# delete a file. returns true if removed.
 pub fn remove(path: String) -> Bool:
     return remove_file(path)
 
+# rename or move a file. returns true on success.
 pub fn rename(old_path: String, new_path: String) -> Bool:
     return rename_file(old_path, new_path)
 
+# create a directory. returns true on success.
 pub fn make_dir(path: String) -> Bool:
     return mkdir(path)
 
+# list entries in a directory.
 pub fn list(path: String) -> List[String]:
     return list_dir(path)

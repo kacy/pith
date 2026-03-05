@@ -63,10 +63,6 @@ const forge_prefix_builtins = std.StaticStringMap(void).initComptime(.{
     .{ "math_ceil", {} },
     .{ "math_round", {} },
     .{ "fmt_float", {} },
-    .{ "base64_encode", {} },
-    .{ "base64_decode", {} },
-    .{ "hex_encode", {} },
-    .{ "hex_decode", {} },
     .{ "hash_sha256", {} },
     .{ "hash_fnv1a", {} },
     .{ "format_time", {} },
@@ -1184,36 +1180,6 @@ pub const CEmitter = struct {
             \\    }
             \\    forge_result_forge_string_t r; r.is_ok = false;
             \\    r.err = FORGE_STRING_LIT("failed to execute command");
-            \\    return r;
-            \\}
-            \\
-        );
-
-        // base64_decode(String) -> String!
-        try self.writeStr(
-            \\static forge_result_forge_string_t forge_base64_decode(forge_string_t input) {
-            \\    forge_string_t decoded;
-            \\    if (forge_base64_decode_impl(input, &decoded)) {
-            \\        forge_result_forge_string_t r; r.is_ok = true; r.ok = decoded;
-            \\        return r;
-            \\    }
-            \\    forge_result_forge_string_t r; r.is_ok = false;
-            \\    r.err = FORGE_STRING_LIT("invalid base64 input");
-            \\    return r;
-            \\}
-            \\
-        );
-
-        // hex_decode(String) -> String!
-        try self.writeStr(
-            \\static forge_result_forge_string_t forge_hex_decode(forge_string_t input) {
-            \\    forge_string_t decoded;
-            \\    if (forge_hex_decode_impl(input, &decoded)) {
-            \\        forge_result_forge_string_t r; r.is_ok = true; r.ok = decoded;
-            \\        return r;
-            \\    }
-            \\    forge_result_forge_string_t r; r.is_ok = false;
-            \\    r.err = FORGE_STRING_LIT("invalid hex input");
             \\    return r;
             \\}
             \\

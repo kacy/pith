@@ -1020,30 +1020,6 @@ fn g_emit_builtin_helpers():
     g_write("    return r;\n")
     g_write(RB + "\n\n")
 
-    # base64_decode(String) -> String!
-    g_write("static forge_result_forge_string_t forge_base64_decode(forge_string_t input) " + LB + "\n")
-    g_write("    forge_string_t decoded;\n")
-    g_write("    if (forge_base64_decode_impl(input, &decoded)) " + LB + "\n")
-    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = decoded;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"invalid base64 input\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # hex_decode(String) -> String!
-    g_write("static forge_result_forge_string_t forge_hex_decode(forge_string_t input) " + LB + "\n")
-    g_write("    forge_string_t decoded;\n")
-    g_write("    if (forge_hex_decode_impl(input, &decoded)) " + LB + "\n")
-    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = decoded;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"invalid hex input\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
     # tcp_connect(String, Int) -> Int!
     g_write("static forge_result_int64_t forge_tcp_connect(forge_string_t host, int64_t port) " + LB + "\n")
     g_write("    int64_t fd;\n")
@@ -2047,8 +2023,6 @@ fn g_is_forge_builtin(name: String) -> Bool:
     if name == "file_exists" or name == "dir_exists" or name == "mkdir" or name == "remove_file" or name == "rename_file" or name == "list_dir":
         return true
     if name == "fmt_float":
-        return true
-    if name == "base64_encode" or name == "base64_decode" or name == "hex_encode" or name == "hex_decode":
         return true
     if name == "hash_sha256" or name == "hash_fnv1a":
         return true

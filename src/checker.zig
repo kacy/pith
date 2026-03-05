@@ -271,7 +271,7 @@ pub const Checker = struct {
             try self.registerBuiltin(n, str_to_bool);
         // (String) -> String
         const str_to_str = try self.addFnType(&.{.string}, .string);
-        for ([_][]const u8{ "base64_encode", "hex_encode", "hash_sha256" }) |n|
+        for ([_][]const u8{"hash_sha256"}) |n|
             try self.registerBuiltin(n, str_to_str);
         // (String) -> String?
         try self.registerBuiltin("env", try self.addFnType(&.{.string}, opt_string));
@@ -284,7 +284,7 @@ pub const Checker = struct {
         try self.registerBuiltin("parse_float", try self.addFnType(&.{.string}, float_result));
         // (String) -> String!
         const str_to_str_result = try self.addFnType(&.{.string}, str_result);
-        for ([_][]const u8{ "read_file", "exec_output", "base64_decode", "hex_decode" }) |n|
+        for ([_][]const u8{ "read_file", "exec_output" }) |n|
             try self.registerBuiltin(n, str_to_str_result);
 
         // (String, String) -> Bool

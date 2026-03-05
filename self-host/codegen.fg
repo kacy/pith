@@ -1976,6 +1976,27 @@ fn g_emit_call(node_idx: Int):
         g_emit_expr(g_call_arg(node_idx, 0))
         g_write(")")
         return
+    if name == "file_exists" or name == "dir_exists" or name == "mkdir" or name == "remove_file" or name == "list_dir":
+        g_write("forge_")
+        g_write(name)
+        g_write("(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(")")
+        return
+    if name == "rename_file":
+        g_write("forge_rename_file(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 1))
+        g_write(")")
+        return
+    if name == "append_file":
+        g_write("forge_append_file(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 1))
+        g_write(")")
+        return
     # sync primitive constructors
     if name == "Mutex":
         g_write("forge_mutex_create()")

@@ -206,6 +206,30 @@ fn c_register_builtins():
     ld_tid := tt_add(ti_function(ld_params, TID_VOID))
     sc_define(c_scope, "log_debug", ld_tid, false)
 
+    # file_exists(String) -> Bool, dir_exists(String) -> Bool
+    # mkdir(String) -> Bool, remove_file(String) -> Bool
+    mut fe_params: List[Int] := [TID_STRING]
+    fe_tid := tt_add(ti_function(fe_params, TID_BOOL))
+    sc_define(c_scope, "file_exists", fe_tid, false)
+    sc_define(c_scope, "dir_exists", fe_tid, false)
+    sc_define(c_scope, "mkdir", fe_tid, false)
+    sc_define(c_scope, "remove_file", fe_tid, false)
+
+    # rename_file(String, String) -> Bool
+    mut ren_params: List[Int] := [TID_STRING, TID_STRING]
+    ren_tid := tt_add(ti_function(ren_params, TID_BOOL))
+    sc_define(c_scope, "rename_file", ren_tid, false)
+
+    # append_file(String, String) -> Bool!
+    mut af_params: List[Int] := [TID_STRING, TID_STRING]
+    af_tid := tt_add(ti_function(af_params, bool_result))
+    sc_define(c_scope, "append_file", af_tid, false)
+
+    # list_dir(String) -> List[String]
+    mut lsd_params: List[Int] := [TID_STRING]
+    lsd_tid := tt_add(ti_function(lsd_params, list_string))
+    sc_define(c_scope, "list_dir", lsd_tid, false)
+
     # concurrency primitives (stub types)
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []

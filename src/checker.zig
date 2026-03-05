@@ -368,6 +368,34 @@ pub const Checker = struct {
         try self.module_scope.define("log_error", .{ .type_id = log_type, .is_mut = false });
         try self.module_scope.define("log_debug", .{ .type_id = log_type, .is_mut = false });
 
+        // file_exists(String) -> Bool, dir_exists(String) -> Bool
+        // mkdir(String) -> Bool, remove_file(String) -> Bool
+        const str_to_bool_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = .bool,
+        } });
+        try self.module_scope.define("file_exists", .{ .type_id = str_to_bool_type, .is_mut = false });
+        try self.module_scope.define("dir_exists", .{ .type_id = str_to_bool_type, .is_mut = false });
+        try self.module_scope.define("mkdir", .{ .type_id = str_to_bool_type, .is_mut = false });
+        try self.module_scope.define("remove_file", .{ .type_id = str_to_bool_type, .is_mut = false });
+
+        // rename_file(String, String) -> Bool
+        const two_str_to_bool_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .string, .string },
+            .return_type = .bool,
+        } });
+        try self.module_scope.define("rename_file", .{ .type_id = two_str_to_bool_type, .is_mut = false });
+
+        // append_file(String, String) -> Bool!
+        try self.module_scope.define("append_file", .{ .type_id = write_file_type, .is_mut = false });
+
+        // list_dir(String) -> List[String]
+        const list_dir_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = list_string,
+        } });
+        try self.module_scope.define("list_dir", .{ .type_id = list_dir_type, .is_mut = false });
+
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});
         try self.registerSyncType("WaitGroup", &.{});
@@ -1162,7 +1190,15 @@ pub const Checker = struct {
                 // allow returning the inner type from a result- or optional-returning function,
                 // and structurally equivalent tuples (may have different TypeIds)
                 const ok_match = if (self.type_table.get(expected)) |ety| switch (ety) {
-                    .result => |r| actual == r.ok_type,
+                    .result => |r| actual == r.ok_type or blk: {
+                        // also allow returning a result with matching ok/err types
+                        const act_ty = self.type_table.get(actual) orelse break :blk false;
+                        const act_r = switch (act_ty) {
+                            .result => |ar| ar,
+                            else => break :blk false,
+                        };
+                        break :blk act_r.ok_type == r.ok_type and act_r.err_type == r.err_type;
+                    },
                     .optional => |o| actual == o.inner,
                     .tuple => |exp_tup| blk: {
                         const act_ty = self.type_table.get(actual) orelse break :blk false;

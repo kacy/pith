@@ -1,0 +1,33 @@
+# fs_ops.fg — test std.fs module
+
+from std.fs import exists, is_dir, write, remove, make_dir, list
+
+fn do_test() -> String!:
+    # write a temp file
+    write("/tmp/forge_fs_test.txt", "hello from forge")!
+
+    # check existence
+    print("exists: " + exists("/tmp/forge_fs_test.txt").to_string())
+    print("is_dir: " + is_dir("/tmp/forge_fs_test.txt").to_string())
+    print("is_dir /tmp: " + is_dir("/tmp").to_string())
+
+    # read it back
+    content := read_file("/tmp/forge_fs_test.txt")!
+    print("content: " + content)
+
+    # list directory
+    entries := list("/tmp")
+    print("tmp has entries: " + (entries.len() > 0).to_string())
+
+    # make a directory
+    make_dir("/tmp/forge_fs_test_dir")
+    print("dir created: " + is_dir("/tmp/forge_fs_test_dir").to_string())
+
+    # clean up
+    remove("/tmp/forge_fs_test.txt")
+    print("removed: " + (exists("/tmp/forge_fs_test.txt") == false).to_string())
+    exec("rmdir /tmp/forge_fs_test_dir")
+    return ""
+
+fn main():
+    do_test()

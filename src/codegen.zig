@@ -1119,6 +1119,20 @@ pub const CEmitter = struct {
             \\
         );
 
+        // append_file(String, String) -> Bool!
+        try self.writeStr(
+            \\static forge_result_bool forge_append_file(forge_string_t path, forge_string_t data) {
+            \\    if (forge_append_file_impl(path.data, path.len, data.data, data.len)) {
+            \\        forge_result_bool r; r.is_ok = true; r.ok = true;
+            \\        return r;
+            \\    }
+            \\    forge_result_bool r; r.is_ok = false;
+            \\    r.err = FORGE_STRING_LIT("failed to append to file");
+            \\    return r;
+            \\}
+            \\
+        );
+
         try self.writeByte('\n');
     }
 
@@ -1861,13 +1875,22 @@ pub const CEmitter = struct {
         try self.writeIndent();
         if (rs.value) |val| {
             if (self.isResultType(self.current_fn_return)) {
-                // result-returning function: wrap in ok result
-                const ret_c = self.cTypeStringForId(self.current_fn_return);
-                try self.writeStr("return (");
-                try self.writeStr(ret_c);
-                try self.writeStr("){ .is_ok = true, .ok = ");
-                try self.emitExpr(val);
-                try self.writeStr(" };\n");
+                // check if the expression already returns the same result type —
+                // if so, return it directly without wrapping
+                const val_type = self.inferExprType(val);
+                if (val_type == self.current_fn_return) {
+                    try self.writeStr("return ");
+                    try self.emitExpr(val);
+                    try self.writeStr(";\n");
+                } else {
+                    // result-returning function: wrap in ok result
+                    const ret_c = self.cTypeStringForId(self.current_fn_return);
+                    try self.writeStr("return (");
+                    try self.writeStr(ret_c);
+                    try self.writeStr("){ .is_ok = true, .ok = ");
+                    try self.emitExpr(val);
+                    try self.writeStr(" };\n");
+                }
             } else if (self.isOptionalType(self.current_fn_return)) {
                 // optional-returning function: check if returning None or a value
                 if (val.kind == .none_lit) {
@@ -2497,7 +2520,14 @@ pub const CEmitter = struct {
             std.mem.eql(u8, name, "log_info") or
             std.mem.eql(u8, name, "log_warn") or
             std.mem.eql(u8, name, "log_error") or
-            std.mem.eql(u8, name, "log_debug"))
+            std.mem.eql(u8, name, "log_debug") or
+            std.mem.eql(u8, name, "file_exists") or
+            std.mem.eql(u8, name, "dir_exists") or
+            std.mem.eql(u8, name, "mkdir") or
+            std.mem.eql(u8, name, "remove_file") or
+            std.mem.eql(u8, name, "rename_file") or
+            std.mem.eql(u8, name, "append_file") or
+            std.mem.eql(u8, name, "list_dir"))
         {
             try self.writeStr("forge_");
             try self.writeStr(name);

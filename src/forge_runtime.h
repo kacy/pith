@@ -1155,6 +1155,117 @@ static inline forge_string_t forge_input(void) {
 }
 
 // ---------------------------------------------------------------
+// file system operations
+// ---------------------------------------------------------------
+
+#include <sys/stat.h>
+#include <unistd.h>
+#include <dirent.h>
+
+// file_exists(path) -> Bool
+static inline bool forge_file_exists(forge_string_t path) {
+    char *cpath = (char *)malloc((size_t)path.len + 1);
+    if (!cpath) return false;
+    memcpy(cpath, path.data, (size_t)path.len);
+    cpath[path.len] = '\0';
+    int r = access(cpath, F_OK);
+    free(cpath);
+    return r == 0;
+}
+
+// dir_exists(path) -> Bool
+static inline bool forge_dir_exists(forge_string_t path) {
+    char *cpath = (char *)malloc((size_t)path.len + 1);
+    if (!cpath) return false;
+    memcpy(cpath, path.data, (size_t)path.len);
+    cpath[path.len] = '\0';
+    struct stat st;
+    int r = stat(cpath, &st);
+    free(cpath);
+    return r == 0 && S_ISDIR(st.st_mode);
+}
+
+// mkdir(path) -> Bool
+static inline bool forge_mkdir(forge_string_t path) {
+    char *cpath = (char *)malloc((size_t)path.len + 1);
+    if (!cpath) return false;
+    memcpy(cpath, path.data, (size_t)path.len);
+    cpath[path.len] = '\0';
+    int r = mkdir(cpath, 0755);
+    free(cpath);
+    return r == 0;
+}
+
+// remove_file(path) -> Bool
+static inline bool forge_remove_file(forge_string_t path) {
+    char *cpath = (char *)malloc((size_t)path.len + 1);
+    if (!cpath) return false;
+    memcpy(cpath, path.data, (size_t)path.len);
+    cpath[path.len] = '\0';
+    int r = unlink(cpath);
+    free(cpath);
+    return r == 0;
+}
+
+// rename_file(old, new) -> Bool
+static inline bool forge_rename_file(forge_string_t old_path, forge_string_t new_path) {
+    char *cold = (char *)malloc((size_t)old_path.len + 1);
+    char *cnew = (char *)malloc((size_t)new_path.len + 1);
+    if (!cold || !cnew) { free(cold); free(cnew); return false; }
+    memcpy(cold, old_path.data, (size_t)old_path.len);
+    cold[old_path.len] = '\0';
+    memcpy(cnew, new_path.data, (size_t)new_path.len);
+    cnew[new_path.len] = '\0';
+    int r = rename(cold, cnew);
+    free(cold);
+    free(cnew);
+    return r == 0;
+}
+
+// append_file(path, data) -> Bool
+static inline bool forge_append_file_impl(const char *path_data, int64_t path_len,
+                                           const char *data, int64_t data_len) {
+    char *path = (char *)malloc((size_t)path_len + 1);
+    if (!path) return false;
+    memcpy(path, path_data, (size_t)path_len);
+    path[path_len] = '\0';
+    FILE *f = fopen(path, "ab");
+    free(path);
+    if (!f) return false;
+    size_t written = fwrite(data, 1, (size_t)data_len, f);
+    fclose(f);
+    return written == (size_t)data_len;
+}
+
+// list_dir(path) -> List[String]
+static inline forge_list_t forge_list_dir(forge_string_t path) {
+    forge_list_t result = { .data = NULL, .len = 0 };
+    char *cpath = (char *)malloc((size_t)path.len + 1);
+    if (!cpath) return result;
+    memcpy(cpath, path.data, (size_t)path.len);
+    cpath[path.len] = '\0';
+    DIR *d = opendir(cpath);
+    free(cpath);
+    if (!d) return result;
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        // skip . and ..
+        if (entry->d_name[0] == '.' &&
+            (entry->d_name[1] == '\0' ||
+             (entry->d_name[1] == '.' && entry->d_name[2] == '\0')))
+            continue;
+        int64_t nlen = (int64_t)strlen(entry->d_name);
+        char *buf = (char *)malloc((size_t)nlen + 1);
+        if (!buf) continue;
+        memcpy(buf, entry->d_name, (size_t)nlen + 1);
+        forge_string_t s = { .data = buf, .len = nlen };
+        forge_list_push(&result, &s, sizeof(forge_string_t));
+    }
+    closedir(d);
+    return result;
+}
+
+// ---------------------------------------------------------------
 // path manipulation — pure string operations
 // ---------------------------------------------------------------
 

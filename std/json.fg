@@ -1,7 +1,12 @@
-# std.json — JSON parse and encode (native forge)
+# std.json — JSON parser and encoder
 #
-# uses opaque Int handles into a node pool.
-# supports: null, bool, int, float, string, array, object.
+# uses opaque Int handles into a node pool. call parse() to get a
+# handle, then use accessor functions to read values. use make_*
+# functions to build JSON and encode() to serialize.
+#
+#   from std.json import parse, get_string, object_get, encode
+#   root := parse(data)
+#   name := get_string(object_get(root, "name"))
 
 # node pool — maps indexed by handle
 mut g_next: Int := 0
@@ -242,6 +247,7 @@ fn p_parse_value() -> Int:
 
 # --- public API ---
 
+# parse a JSON string. returns a handle, or -1 on error.
 pub fn parse(input: String) -> Int:
     p_data = input
     p_pos = 0
@@ -251,11 +257,13 @@ pub fn parse(input: String) -> Int:
         return 0 - 1
     return result
 
+# return the type of a node: "null", "bool", "int", "float", "string", "array", or "object".
 pub fn type_of(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return "invalid"
     return g_types[handle]
 
+# get a boolean value from a node.
 pub fn get_bool(handle: Int) -> Bool:
     if handle < 0 or handle >= g_next:
         return false
@@ -263,6 +271,7 @@ pub fn get_bool(handle: Int) -> Bool:
         return false
     return g_bool_vals[handle]
 
+# get an integer value from a node.
 pub fn get_int(handle: Int) -> Int:
     if handle < 0 or handle >= g_next:
         return 0
@@ -270,6 +279,7 @@ pub fn get_int(handle: Int) -> Int:
         return g_int_vals[handle]
     return 0
 
+# get a float value from a node.
 pub fn get_float(handle: Int) -> Float:
     if handle < 0 or handle >= g_next:
         return 0.0
@@ -277,6 +287,7 @@ pub fn get_float(handle: Int) -> Float:
         return g_float_vals[handle]
     return 0.0
 
+# get a string value from a node.
 pub fn get_string(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return ""
@@ -284,11 +295,13 @@ pub fn get_string(handle: Int) -> String:
         return ""
     return g_str_vals[handle]
 
+# return the number of elements in an array node.
 pub fn array_len(handle: Int) -> Int:
     if handle < 0 or handle >= g_next:
         return 0
     return g_acnt[handle]
 
+# get the handle of an array element by index. returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
     if handle < 0 or handle >= g_next:
         return 0 - 1
@@ -296,6 +309,7 @@ pub fn array_get(handle: Int, index: Int) -> Int:
         return 0 - 1
     return g_aitems[g_aoff[handle] + index]
 
+# get the handle of an object value by key. returns -1 if not found.
 pub fn object_get(handle: Int, key: String) -> Int:
     if handle < 0 or handle >= g_next:
         return 0 - 1
@@ -309,9 +323,11 @@ pub fn object_get(handle: Int, key: String) -> Int:
         i = i - 1
     return 0 - 1
 
+# check if an object contains a key.
 pub fn object_has(handle: Int, key: String) -> Bool:
     return object_get(handle, key) >= 0
 
+# return the list of keys in an object (deduplicated, insertion order).
 pub fn object_keys(handle: Int) -> List[String]:
     mut result: List[String] := []
     if handle < 0 or handle >= g_next:
@@ -334,38 +350,47 @@ pub fn object_keys(handle: Int) -> List[String]:
 
 # --- constructors ---
 
+# create a JSON null node.
 pub fn make_null() -> Int:
     return j_alloc("null")
 
+# create a JSON boolean node.
 pub fn make_bool(val: Bool) -> Int:
     idx := j_alloc("bool")
     g_bool_vals.insert(idx, val)
     return idx
 
+# create a JSON integer node.
 pub fn make_int(val: Int) -> Int:
     idx := j_alloc("int")
     g_int_vals.insert(idx, val)
     return idx
 
+# create a JSON float node.
 pub fn make_float(val: Float) -> Int:
     idx := j_alloc("float")
     g_float_vals.insert(idx, val)
     return idx
 
+# create a JSON string node.
 pub fn make_string(val: String) -> Int:
     idx := j_alloc("string")
     g_str_vals.insert(idx, val)
     return idx
 
+# create an empty JSON array node.
 pub fn make_array() -> Int:
     return j_alloc("array")
 
+# append a value to an array node.
 pub fn array_push(arr: Int, val: Int):
     j_arr_push(arr, val)
 
+# create an empty JSON object node.
 pub fn make_object() -> Int:
     return j_alloc("object")
 
+# set a key-value pair on an object node.
 pub fn object_set(obj: Int, key: String, val: Int):
     j_obj_set(obj, key, val)
 
@@ -392,6 +417,7 @@ fn j_encode_string(s: String) -> String:
     result = result + chr(34)
     return result
 
+# serialize a node tree to a JSON string.
 pub fn encode(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return "null"

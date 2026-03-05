@@ -1,5 +1,13 @@
-# std.os.path — file path manipulation (pure string operations)
+# std.os.path — file path manipulation
+#
+# pure string operations — no filesystem access.
+# handles forward slashes only (unix paths).
+#
+#   from std.os.path import join, ext
+#   join("src", "main.fg")  # "src/main.fg"
+#   ext("main.fg")          # ".fg"
 
+# join two path segments with a slash.
 pub fn join(a: String, b: String) -> String:
     if a.len() == 0:
         return b
@@ -15,6 +23,7 @@ pub fn join(a: String, b: String) -> String:
         bstart = bstart + 1
     return a.substring(0, alen) + "/" + b.substring(bstart, b.len())
 
+# return the directory portion of a path.
 pub fn dir(path: String) -> String:
     mut i := path.len() - 1
     while i >= 0:
@@ -25,6 +34,7 @@ pub fn dir(path: String) -> String:
         i = i - 1
     return "."
 
+# return the last component of a path (filename).
 pub fn base(path: String) -> String:
     mut i := path.len() - 1
     while i >= 0:
@@ -33,6 +43,7 @@ pub fn base(path: String) -> String:
         i = i - 1
     return path
 
+# return the file extension including the dot, or "" if none.
 pub fn ext(path: String) -> String:
     mut i := path.len() - 1
     while i >= 0:
@@ -43,6 +54,7 @@ pub fn ext(path: String) -> String:
         i = i - 1
     return ""
 
+# return the filename without extension.
 pub fn stem(path: String) -> String:
     b := base(path)
     mut i := b.len() - 1

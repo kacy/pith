@@ -1,7 +1,12 @@
-# std.toml — TOML v1.0 parser (native forge)
+# std.toml — TOML v1.0 parser
 #
-# uses opaque Int handles into a node pool.
+# uses opaque Int handles into a node pool. call parse() to get
+# a root table handle, then use typed accessors to read values.
 # supports: strings, ints, floats, bools, tables, arrays.
+#
+#   from std.toml import parse, get_string, get_table
+#   root := parse(data)
+#   name := get_string(root, "name")
 
 # node pool — maps indexed by handle (maps support .insert for update)
 mut g_next: Int := 0
@@ -271,6 +276,7 @@ fn t_ensure_table(root: Int, path: String) -> Int:
         i = i + 1
     return current
 
+# parse a TOML string. returns a root table handle, or -1 on error.
 pub fn parse(input: String) -> Int:
     p_data = input
     p_pos = 0
@@ -318,11 +324,13 @@ pub fn parse(input: String) -> Int:
         return 0 - 1
     return root
 
+# return the type of a node: "string", "int", "float", "bool", "table", or "array".
 pub fn type_of(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return "invalid"
     return g_types[handle]
 
+# get a string value by key from a table.
 pub fn get_string(handle: Int, key: String) -> String:
     if handle < 0 or handle >= g_next:
         return ""
@@ -337,6 +345,7 @@ pub fn get_string(handle: Int, key: String) -> String:
         i = i + 1
     return ""
 
+# get an integer value by key from a table.
 pub fn get_int(handle: Int, key: String) -> Int:
     if handle < 0 or handle >= g_next:
         return 0
@@ -351,6 +360,7 @@ pub fn get_int(handle: Int, key: String) -> Int:
         i = i + 1
     return 0
 
+# get a float value by key from a table.
 pub fn get_float(handle: Int, key: String) -> Float:
     if handle < 0 or handle >= g_next:
         return 0.0
@@ -365,6 +375,7 @@ pub fn get_float(handle: Int, key: String) -> Float:
         i = i + 1
     return 0.0
 
+# get a boolean value by key from a table.
 pub fn get_bool(handle: Int, key: String) -> Bool:
     if handle < 0 or handle >= g_next:
         return false
@@ -379,6 +390,7 @@ pub fn get_bool(handle: Int, key: String) -> Bool:
         i = i + 1
     return false
 
+# get a sub-table handle by key. returns -1 if not found.
 pub fn get_table(handle: Int, key: String) -> Int:
     if handle < 0 or handle >= g_next:
         return 0 - 1
@@ -393,6 +405,7 @@ pub fn get_table(handle: Int, key: String) -> Int:
         i = i + 1
     return 0 - 1
 
+# get an array handle by key. returns -1 if not found.
 pub fn get_array(handle: Int, key: String) -> Int:
     if handle < 0 or handle >= g_next:
         return 0 - 1
@@ -407,11 +420,13 @@ pub fn get_array(handle: Int, key: String) -> Int:
         i = i + 1
     return 0 - 1
 
+# return the number of elements in an array.
 pub fn array_len(handle: Int) -> Int:
     if handle < 0 or handle >= g_next:
         return 0
     return g_acnt[handle]
 
+# get the handle of an array element by index. returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
     if handle < 0 or handle >= g_next:
         return 0 - 1
@@ -419,6 +434,7 @@ pub fn array_get(handle: Int, index: Int) -> Int:
         return 0 - 1
     return g_aitems[g_aoff[handle] + index]
 
+# return the list of keys in a table (insertion order).
 pub fn keys(handle: Int) -> List[String]:
     mut result: List[String] := []
     if handle < 0 or handle >= g_next:
@@ -431,6 +447,7 @@ pub fn keys(handle: Int) -> List[String]:
         i = i + 1
     return result
 
+# check if a table contains a key.
 pub fn has(handle: Int, key: String) -> Bool:
     if handle < 0 or handle >= g_next:
         return false

@@ -287,7 +287,7 @@ pub const Checker = struct {
 
         // (String) -> Void
         const str_to_void = try self.addFnType(&.{.string}, .void);
-        for ([_][]const u8{ "print", "print_err", "log_info", "log_warn", "log_error", "log_debug" }) |n|
+        for ([_][]const u8{ "print", "print_err" }) |n|
             try self.registerBuiltin(n, str_to_void);
         // (String) -> Int
         const str_to_int = try self.addFnType(&.{.string}, .int);

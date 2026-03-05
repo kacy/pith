@@ -2,74 +2,63 @@
 
 ## build & test loop
 
-run these as you work. fix issues before moving on.
+the self-hosted compiler is the primary tool. run these as you work:
 
 ```
-zig build              # compile the bootstrap compiler
-zig build test         # run all tests (~360 tests)
-make check             # build + forge check all examples
-forge check <file>     # type check a single file
-forge check --json <f> # machine-readable diagnostics (for parsing)
-forge build <file>     # compile .fg to native binary
-forge run <file>       # compile and run
-forge test <file>      # run test declarations
-forge fmt <file>       # format source code
-forge lint <file>      # check conventions
+./self-host/forge_main build <file>    # compile .fg to native binary
+./self-host/forge_main run <file>      # compile and run
+./self-host/forge_main test <file>     # run test declarations
+./self-host/forge_main check <file>    # type check (human-readable)
+./self-host/forge_main check --json <f> # machine-readable diagnostics
+./self-host/forge_main fmt <file>      # format source code
+./self-host/forge_main fmt --check <f> # check formatting
+./self-host/forge_main lint <file>     # check conventions
+./self-host/forge_main lint --json <f> # lint (JSON output)
+./self-host/forge_main lex <file>      # print token stream
+./self-host/forge_main parse <file>    # print AST
 ```
 
-## self-hosted compiler
+## bootstrapping
 
-the compiler is self-hosting — forge compiles itself. use the self-hosted
-CLI for build/run/test without the zig bootstrap:
-
-```
-make self-host                            # build the self-hosted compiler
-self-host/forge_main build <file>         # compile to native binary
-self-host/forge_main run <file>           # compile and execute
-self-host/forge_main test <file>          # compile and run tests
-```
-
-codegen-only (outputs C to stdout):
+the compiler is self-hosting — forge compiles itself.
 
 ```
-forge run self-host/codegen_main.fg <file>        # emit C code
-forge run self-host/codegen_main.fg -- --test <f>  # emit C with test runner
+make self-host           # build self-hosted compiler (requires zig bootstrap)
+make bootstrap           # rebuild self-hosted compiler using itself
+make bootstrap-verify    # verify fixed-point (C output identical)
+make run-examples-self   # run all examples through self-hosted compiler
 ```
+
+the zig bootstrap (`zig build`) is only needed for the initial build or
+running zig-level unit tests. after `make self-host`, the self-hosted
+compiler can rebuild itself indefinitely.
 
 ## project structure
 
-bootstrap compiler in zig, self-hosted compiler in forge.
-pipeline: lexer → parser → checker → codegen (C transpilation).
-
 ```
-src/
-  main.zig           CLI entry point (lex, parse, check, build, run, test, fmt, lint)
-  lexer.zig          tokenizer with indentation tracking
-  parser.zig         recursive descent parser
-  ast.zig            AST node types
-  types.zig          type representation and type table
-  checker.zig        semantic analysis and type checking
-  codegen.zig        C transpilation backend
-  forge_runtime.h    C runtime header (embedded via @embedFile)
-  formatter.zig      source code formatter
-  lint.zig           convention linter
-  errors.zig         error formatting, codes, and suggestions
-  printer.zig        AST pretty-printer
-  intern.zig         string interning
-
 self-host/
-  forge_main.fg      CLI entry point — build/run/test
+  forge_main.fg      unified CLI — build/run/test/check/fmt/lint/lex/parse
   codegen_main.fg    codegen entry point — emits C to stdout
-  lexer.fg           tokenizer (port of lexer.zig)
-  parser.fg          recursive descent parser (port of parser.zig)
+  lexer.fg           tokenizer with indentation tracking
+  parser.fg          recursive descent parser
   ast.fg             AST node representation
   printer.fg         AST pretty-printer
-  checker.fg         type checker
+  checker.fg         type checker (~2,700 lines)
   types.fg           type representation
   scope.fg           scope management
   codegen.fg         C transpilation backend (~4,000 lines)
+  driver.fg          compile pipeline and import resolution
+  formatter.fg       source code formatter
+  linter.fg          convention linter
+  errors.fg          human-readable error rendering
 
-examples/            21 .fg programs — all compile to native binaries
+runtime/
+  forge_runtime.h    C runtime header — memory, strings, collections, I/O
+
+bootstrap/           zig bootstrap compiler (archived, for reference)
+  main.zig, lexer.zig, parser.zig, checker.zig, codegen.zig, etc.
+
+examples/            40+ .fg programs — all compile to native binaries
 docs/grammar.ebnf    complete EBNF for the language
 docs/errors.md       error code reference (E0xx–E3xx)
 ```
@@ -80,31 +69,35 @@ docs/errors.md       error code reference (E0xx–E3xx)
 - **error codes.** every diagnostic has a stable code: E0xx (lexer), E1xx (parser), E2xx (checker), E3xx (lint).
 - **fg_ prefix.** user functions are prefixed `fg_` in generated C to avoid collisions.
 - **g_ prefix.** self-hosted codegen uses `g_` prefix for globals (flat C namespace).
+- **module prefixes.** all modules prefix private functions to avoid C namespace collisions
+  (e.g., `f_` for formatter, `l_` for linter, `c_` for checker, `e_` for errors).
 - **method keys.** method types use `TypeName.method_name` format in the method_types map.
 - **C transpilation.** codegen emits C, compiles with `zig cc`. output goes to `.forge-build/`.
 - **string literals** from the lexer include surrounding quotes — codegen strips them.
-- **snake_case** for functions/variables, **PascalCase** for types, in both zig and forge.
+- **snake_case** for functions/variables, **PascalCase** for types.
 - **closures.** all `fn(X) -> Y` parameters use `forge_closure_t` (uniform closure ABI).
 - **concurrency.** `spawn`, `await`, `Task[T]`, `Mutex`, `WaitGroup`, `Semaphore` — all fully implemented.
 
 ## testing
 
-- unit tests live alongside source in each `.zig` file
-- run `zig build test` — all tests must pass before committing
-- `make check` runs `forge check` on every example — ensures no regressions
-- after codegen changes, verify examples still compile: `forge run examples/hello.fg`
-- all 21 examples compile to native binaries (including closures, generics, collections, etc.)
+- `make run-examples-self` runs all examples through the self-hosted compiler
+- `make bootstrap-verify` checks that the compiler reaches a fixed point
+- `zig build test` runs the zig bootstrap's ~360 unit tests
+- `make check` runs `forge check` on every example
+- after codegen changes, verify examples still compile: `./self-host/forge_main run examples/hello.fg`
 
 ## working on the compiler
 
 1. read the relevant source file before modifying — understand existing patterns
-2. check after every change: `zig build test && make check`
+2. check after every change: `./self-host/forge_main check <file>`
 3. keep commits atomic and focused
-4. if adding a new diagnostic, assign an error code (see `src/errors.zig`)
+4. if adding a new diagnostic, assign an error code (see `docs/errors.md`)
 5. if adding codegen for a new construct, test with a `.fg` example
-6. mirror changes in both bootstrap (src/) and self-hosted (self-host/) compilers
+6. use `make bootstrap` to verify the compiler can still build itself
 
 ## known limitations
 
 - collections passed to functions are copies — mutations don't propagate back
 - `{`/`}` in string literals trigger interpolation — use `chr(123)`/`chr(125)`
+- `for c in string` not supported — use `while i < s.len(): s[i]`
+- methods.fg and concurrency.fg have known codegen issues with return type inference

@@ -1,11 +1,46 @@
 # forge_main.fg — self-hosted compiler CLI
 #
 # usage:
-#   forge run self-host/forge_main.fg -- build <file.fg>
-#   forge run self-host/forge_main.fg -- run <file.fg>
-#   forge run self-host/forge_main.fg -- test <file.fg>
+#   forge build <file.fg>      compile to native binary
+#   forge run <file.fg>        compile and run
+#   forge test <file.fg>       run test declarations
+#   forge check <file.fg>      type check (human-readable output)
+#   forge check --json <file>  machine-readable diagnostics
+#   forge fmt <file.fg>        format source code
+#   forge fmt --check <file>   check if already formatted
+#   forge lint <file.fg>       lint for convention violations
+#   forge lint --json <file>   lint with JSON output
+#   forge lex <file.fg>        print token stream
+#   forge parse <file.fg>      print AST
+#   forge version              print version
+#   forge help                 print usage
 
-from driver import get_directory, get_stem, compile_to_c
+from driver import get_directory, get_stem, compile_to_c, resolve_imports, mark_visited, find_imports
+from lexer import lex_all, Token
+from parser import parse
+from ast import get_node
+from checker import c_init, c_run, c_run_module, c_diagnostics_to_json, Diagnostic
+from printer import print_ast
+from formatter import fmt_source
+from linter import lint_module
+from errors import render_diagnostics, render_diagnostics_json, count_errors, has_errors
+
+# ---------------------------------------------------------------
+# compile pipeline (build/run/test)
+# ---------------------------------------------------------------
+
+fn find_runtime_header() -> String!:
+    # try common locations for forge_runtime.h
+    # 1. runtime/ (post-archive layout)
+    # 2. src/ (pre-archive layout, zig bootstrap)
+    if file_exists("runtime/forge_runtime.h"):
+        return read_file("runtime/forge_runtime.h")!
+    if file_exists("src/forge_runtime.h"):
+        return read_file("src/forge_runtime.h")!
+    print("error: cannot find forge_runtime.h")
+    print("  looked in: runtime/forge_runtime.h, src/forge_runtime.h")
+    exit(1)
+    return ""
 
 fn compile(path: String, test_mode: Bool) -> String!:
     c_code := compile_to_c(path, test_mode)!
@@ -16,7 +51,7 @@ fn compile(path: String, test_mode: Bool) -> String!:
     exec("mkdir -p " + build_dir)
 
     # copy runtime header
-    runtime := read_file("src/forge_runtime.h")!
+    runtime := find_runtime_header()!
     write_file(build_dir + "/forge_runtime.h", runtime)!
 
     # write C source
@@ -39,13 +74,182 @@ fn compile(path: String, test_mode: Bool) -> String!:
 
     return out_path
 
+# ---------------------------------------------------------------
+# check command
+# ---------------------------------------------------------------
+
+fn cmd_check(path: String, json_mode: Bool) -> String!:
+    source := read_file(path)!
+    tokens := lex_all(source)
+    root := parse(tokens)
+    diags := c_run(root)
+
+    if json_mode:
+        print(c_diagnostics_to_json(diags))
+    else:
+        if has_errors(diags):
+            print(render_diagnostics(diags, source))
+            exit(1)
+        else:
+            print("ok")
+    return ""
+
+# ---------------------------------------------------------------
+# fmt command
+# ---------------------------------------------------------------
+
+fn cmd_fmt(path: String, check_mode: Bool) -> String!:
+    source := read_file(path)!
+    formatted := fmt_source(source)
+
+    if check_mode:
+        if source != formatted:
+            print(path + " needs formatting")
+            exit(1)
+        return ""
+
+    if source != formatted:
+        write_file(path, formatted)!
+        print("formatted " + path)
+    return ""
+
+# ---------------------------------------------------------------
+# lint command
+# ---------------------------------------------------------------
+
+fn cmd_lint(path: String, json_mode: Bool) -> String!:
+    source := read_file(path)!
+    tokens := lex_all(source)
+    root := parse(tokens)
+    # run checker first (linter needs type info)
+    c_run(root)
+    diags := lint_module(root, source)
+
+    if json_mode:
+        print(render_diagnostics_json(diags))
+    else:
+        if diags.len() > 0:
+            print(render_diagnostics(diags, source))
+            if has_errors(diags):
+                exit(1)
+        else:
+            print("ok")
+    return ""
+
+# ---------------------------------------------------------------
+# lex command
+# ---------------------------------------------------------------
+
+fn cmd_lex(path: String) -> String!:
+    source := read_file(path)!
+    tokens := lex_all(source)
+    for tok in tokens:
+        print(tok.kind + " " + tok.value)
+    return ""
+
+# ---------------------------------------------------------------
+# parse command
+# ---------------------------------------------------------------
+
+fn cmd_parse(path: String) -> String!:
+    source := read_file(path)!
+    tokens := lex_all(source)
+    root := parse(tokens)
+    print_ast(root)
+    return ""
+
+# ---------------------------------------------------------------
+# help / version
+# ---------------------------------------------------------------
+
+fn print_version():
+    print("forge 0.1.0 (self-hosted)")
+
+fn print_help():
+    print("forge — the forge programming language compiler")
+    print("")
+    print("usage: forge <command> [options] [file]")
+    print("")
+    print("commands:")
+    print("  build <file.fg>        compile to native binary")
+    print("  run <file.fg>          compile and run")
+    print("  test <file.fg>         run test declarations")
+    print("  check <file.fg>        type check (human-readable)")
+    print("  check --json <file>    type check (JSON output)")
+    print("  fmt <file.fg>          format source code")
+    print("  fmt --check <file>     check formatting")
+    print("  lint <file.fg>         lint for conventions")
+    print("  lint --json <file>     lint (JSON output)")
+    print("  lex <file.fg>          print token stream")
+    print("  parse <file.fg>        print AST")
+    print("  version                print version")
+    print("  help                   print this help")
+
+# ---------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------
+
 fn run_cli() -> String!:
     a := args()
-    if a.len() < 3:
-        print("usage: forge_main build|run|test <file.fg>")
+    if a.len() < 2:
+        print_help()
         exit(1)
 
     command := a[1]
+
+    # commands that don't need a file argument
+    if command == "version" or command == "--version":
+        print_version()
+        return ""
+    if command == "help" or command == "--help":
+        print_help()
+        return ""
+
+    # commands with optional flags
+    if command == "check":
+        if a.len() < 3:
+            print("usage: forge check [--json] <file.fg>")
+            exit(1)
+        if a[2] == "--json":
+            if a.len() < 4:
+                print("usage: forge check --json <file.fg>")
+                exit(1)
+            cmd_check(a[3], true)!
+        else:
+            cmd_check(a[2], false)!
+        return ""
+
+    if command == "fmt":
+        if a.len() < 3:
+            print("usage: forge fmt [--check] <file.fg>")
+            exit(1)
+        if a[2] == "--check":
+            if a.len() < 4:
+                print("usage: forge fmt --check <file.fg>")
+                exit(1)
+            cmd_fmt(a[3], true)!
+        else:
+            cmd_fmt(a[2], false)!
+        return ""
+
+    if command == "lint":
+        if a.len() < 3:
+            print("usage: forge lint [--json] <file.fg>")
+            exit(1)
+        if a[2] == "--json":
+            if a.len() < 4:
+                print("usage: forge lint --json <file.fg>")
+                exit(1)
+            cmd_lint(a[3], true)!
+        else:
+            cmd_lint(a[2], false)!
+        return ""
+
+    # commands that need exactly one file argument
+    if a.len() < 3:
+        print("usage: forge " + command + " <file.fg>")
+        exit(1)
+
     path := a[2]
 
     if command == "build":
@@ -62,9 +266,15 @@ fn run_cli() -> String!:
         result := exec(out)
         exit(result)
 
+    elif command == "lex":
+        cmd_lex(path)!
+
+    elif command == "parse":
+        cmd_parse(path)!
+
     else:
         print("unknown command: " + command)
-        print("usage: forge_main build|run|test <file.fg>")
+        print_help()
         exit(1)
 
     return ""

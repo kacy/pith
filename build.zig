@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "forge",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("bootstrap/main.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     const release_exe = b.addExecutable(.{
         .name = "forge",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("bootstrap/main.zig"),
             .target = target,
             .optimize = .ReleaseFast,
         }),
@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
     // zig build test
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("bootstrap/main.zig"),
             .target = target,
             .optimize = optimize,
         }),

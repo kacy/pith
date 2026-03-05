@@ -1,0 +1,115 @@
+# errors.fg — human-readable error rendering for forge diagnostics
+#
+# renders diagnostics with source context, underlines, and fix
+# suggestions. mirrors the output format of src/errors.zig.
+
+from checker import Diagnostic
+
+# render all diagnostics as human-readable text with source context.
+pub fn render_diagnostics(diags: List[Diagnostic], source: String) -> String:
+    mut output := ""
+    mut i := 0
+    while i < diags.len():
+        d := diags[i]
+        output = output + e_render_one(d, source)
+        i = i + 1
+    return output
+
+# render a single diagnostic with source context and underline.
+fn e_render_one(d: Diagnostic, source: String) -> String:
+    mut output := ""
+
+    # header: severity and message (with error code if present)
+    if d.code != "":
+        output = output + d.severity + "[" + d.code + "]: " + d.message + "\n"
+    else:
+        output = output + d.severity + ": " + d.message + "\n"
+
+    # source line + underline (only if we have line info)
+    if d.line > 0:
+        lines := source.split("\n")
+        line_idx := d.line - 1
+        if line_idx >= 0 and line_idx < lines.len():
+            source_line := lines[line_idx]
+            line_num := d.line.to_string()
+            output = output + "  " + line_num + " | " + source_line + "\n"
+
+            # underline: spaces for margin + carets
+            margin_width := line_num.len() + 4
+            mut j := 0
+            while j < margin_width + d.col:
+                output = output + " "
+                j = j + 1
+            output = output + "^\n"
+
+    # fix suggestion
+    if d.fix != "":
+        output = output + "  fix: " + d.fix + "\n"
+
+    output = output + "\n"
+    return output
+
+# render diagnostics as JSON (same format as check_main.fg).
+pub fn render_diagnostics_json(diags: List[Diagnostic]) -> String:
+    mut output := "["
+    mut i := 0
+    while i < diags.len():
+        if i > 0:
+            output = output + ","
+        output = output + e_render_json_one(diags[i])
+        i = i + 1
+    output = output + "]\n"
+    return output
+
+# render a single diagnostic as a JSON object.
+fn e_render_json_one(d: Diagnostic) -> String:
+    mut output := chr(123)
+    output = output + "\"severity\":\"" + e_json_escape(d.severity) + "\""
+    output = output + ",\"code\":"
+    if d.code != "":
+        output = output + "\"" + e_json_escape(d.code) + "\""
+    else:
+        output = output + "null"
+    output = output + ",\"message\":\"" + e_json_escape(d.message) + "\""
+    output = output + ",\"line\":" + d.line.to_string()
+    output = output + ",\"col\":" + d.col.to_string()
+    output = output + ",\"fix\":"
+    if d.fix != "":
+        output = output + "\"" + e_json_escape(d.fix) + "\""
+    else:
+        output = output + "null"
+    output = output + chr(125)
+    return output
+
+# escape a string for JSON output.
+fn e_json_escape(s: String) -> String:
+    mut output := ""
+    mut i := 0
+    while i < s.len():
+        ch := s[i]
+        if ch == "\"":
+            output = output + "\\\""
+        elif ch == "\\":
+            output = output + "\\\\"
+        elif ch == "\n":
+            output = output + "\\n"
+        elif ch == "\t":
+            output = output + "\\t"
+        else:
+            output = output + ch
+        i = i + 1
+    return output
+
+# count errors in a diagnostic list.
+pub fn count_errors(diags: List[Diagnostic]) -> Int:
+    mut count := 0
+    mut i := 0
+    while i < diags.len():
+        if diags[i].severity == "error":
+            count = count + 1
+        i = i + 1
+    return count
+
+# check if a diagnostic list has any errors (not just warnings).
+pub fn has_errors(diags: List[Diagnostic]) -> Bool:
+    return count_errors(diags) > 0

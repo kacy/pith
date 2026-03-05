@@ -1240,6 +1240,23 @@ static inline forge_string_t forge_path_stem(forge_string_t path) {
 }
 
 // ---------------------------------------------------------------
+// structured logging — level-prefixed stderr output with timestamps
+// ---------------------------------------------------------------
+
+static inline void forge_log_impl(const char *level, forge_string_t msg) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char ts[20];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", t);
+    fprintf(stderr, "%s [%s] %.*s\n", ts, level, (int)msg.len, msg.data);
+}
+
+static inline void forge_log_info(forge_string_t msg)  { forge_log_impl("INFO",  msg); }
+static inline void forge_log_warn(forge_string_t msg)  { forge_log_impl("WARN",  msg); }
+static inline void forge_log_error(forge_string_t msg) { forge_log_impl("ERROR", msg); }
+static inline void forge_log_debug(forge_string_t msg) { forge_log_impl("DEBUG", msg); }
+
+// ---------------------------------------------------------------
 // concurrency — task header and sync primitives
 // ---------------------------------------------------------------
 

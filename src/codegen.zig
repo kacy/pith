@@ -2493,7 +2493,11 @@ pub const CEmitter = struct {
             std.mem.eql(u8, name, "path_dir") or
             std.mem.eql(u8, name, "path_base") or
             std.mem.eql(u8, name, "path_ext") or
-            std.mem.eql(u8, name, "path_stem"))
+            std.mem.eql(u8, name, "path_stem") or
+            std.mem.eql(u8, name, "log_info") or
+            std.mem.eql(u8, name, "log_warn") or
+            std.mem.eql(u8, name, "log_error") or
+            std.mem.eql(u8, name, "log_debug"))
         {
             try self.writeStr("forge_");
             try self.writeStr(name);

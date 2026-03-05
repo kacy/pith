@@ -1423,6 +1423,10 @@ fn c_check_call(node: Node, scope_id: Int) -> Int:
         if struct_tid >= 0:
             info := tt_get(struct_tid)
             if info.kind == "struct":
+                # opaque types (0 fields) with args use a constructor function
+                # e.g. Semaphore(10) — registered via c_register_sync_type
+                if info.fields.len() == 0 and arg_indices.len() > 0:
+                    return c_check_fn_call(callee_idx, arg_indices, scope_id)
                 return c_check_struct_constructor(name, struct_tid, info, arg_indices, scope_id)
             if info.kind == "enum":
                 # enum variant constructor (qualified as EnumName.Variant)

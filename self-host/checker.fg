@@ -121,6 +121,9 @@ fn c_register_builtins():
     c_def_builtin("json_get_float", c_make_fn_type([TID_INT], TID_FLOAT))
     # (Int) -> Bool
     c_def_builtin("json_get_bool", c_make_fn_type([TID_INT], TID_BOOL))
+    # (Int) -> Int (bitwise unary)
+    c_def_builtin("bit_not", int_to_int)
+
     # (Int) -> String
     int_to_str := c_make_fn_type([TID_INT], TID_STRING)
     c_def_builtin("chr", int_to_str)
@@ -154,6 +157,11 @@ fn c_register_builtins():
     c_def_builtin("random_int", two_int_to_int)
     c_def_builtin("json_array_get", two_int_to_int)
     c_def_builtin("toml_array_get", two_int_to_int)
+    c_def_builtin("bit_and", two_int_to_int)
+    c_def_builtin("bit_or", two_int_to_int)
+    c_def_builtin("bit_xor", two_int_to_int)
+    c_def_builtin("bit_shl", two_int_to_int)
+    c_def_builtin("bit_shr", two_int_to_int)
 
     # (Int, String) -> String
     int_str_to_str := c_make_fn_type([TID_INT, TID_STRING], TID_STRING)
@@ -191,6 +199,7 @@ fn c_register_builtins():
     # (String) -> Void
     str_to_void := c_make_fn_type([TID_STRING], TID_VOID)
     c_def_builtin("print", str_to_void)
+    c_def_builtin("print_err", str_to_void)
     c_def_builtin("log_info", str_to_void)
     c_def_builtin("log_warn", str_to_void)
     c_def_builtin("log_error", str_to_void)
@@ -198,6 +207,7 @@ fn c_register_builtins():
     # (String) -> Int
     str_to_int := c_make_fn_type([TID_STRING], TID_INT)
     c_def_builtin("exec", str_to_int)
+    c_def_builtin("ord", str_to_int)
     c_def_builtin("json_parse", str_to_int)
     c_def_builtin("json_new_string", str_to_int)
     c_def_builtin("hash_fnv1a", str_to_int)

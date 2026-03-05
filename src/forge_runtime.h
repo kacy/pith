@@ -207,6 +207,20 @@ static inline forge_string_t forge_chr(int64_t code) {
     return (forge_string_t){ .data = buf, .len = 1 };
 }
 
+// ord(String) -> Int: return the byte value of the first character.
+static inline int64_t forge_ord(forge_string_t s) {
+    if (s.len <= 0) return 0;
+    return (int64_t)(unsigned char)s.data[0];
+}
+
+// bitwise operations on integers
+static inline int64_t forge_bit_and(int64_t a, int64_t b) { return a & b; }
+static inline int64_t forge_bit_or(int64_t a, int64_t b)  { return a | b; }
+static inline int64_t forge_bit_xor(int64_t a, int64_t b) { return a ^ b; }
+static inline int64_t forge_bit_not(int64_t a)             { return ~a; }
+static inline int64_t forge_bit_shl(int64_t a, int64_t b) { return a << b; }
+static inline int64_t forge_bit_shr(int64_t a, int64_t b) { return (int64_t)((uint64_t)a >> b); }
+
 // replace all occurrences of `old` with `new_s` in `s`.
 static inline forge_string_t forge_string_replace(forge_string_t s, forge_string_t old, forge_string_t new_s) {
     if (old.len == 0) {
@@ -1209,6 +1223,11 @@ static inline bool forge_env_impl(const char *name_data, int64_t name_len,
 static inline void forge_print(forge_string_t s) {
     fwrite(s.data, 1, (size_t)s.len, stdout);
     fputc('\n', stdout);
+}
+
+static inline void forge_print_err(forge_string_t s) {
+    fwrite(s.data, 1, (size_t)s.len, stderr);
+    fputc('\n', stderr);
 }
 
 static inline int64_t forge_exec(forge_string_t cmd) {

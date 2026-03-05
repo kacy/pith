@@ -237,6 +237,8 @@ pub const Checker = struct {
         const int_to_str = try self.addFnType(&.{.int}, .string);
         for ([_][]const u8{ "chr", "fmt_hex", "fmt_oct", "fmt_bin", "json_type", "json_get_string", "json_encode", "random_string", "url_scheme", "url_host", "url_path", "url_query", "url_fragment", "url_to_string", "toml_type" }) |n|
             try self.registerBuiltin(n, int_to_str);
+        // (Int) -> Int (bitwise unary)
+        try self.registerBuiltin("bit_not", int_to_int);
         // (Int) -> List[String]
         const int_to_list_str = try self.addFnType(&.{.int}, list_string);
         for ([_][]const u8{ "json_object_keys", "toml_keys" }) |n|
@@ -252,7 +254,7 @@ pub const Checker = struct {
             try self.registerBuiltin(n, two_int_to_void);
         // (Int, Int) -> Int
         const two_int_to_int = try self.addFnType(&.{ .int, .int }, .int);
-        for ([_][]const u8{ "random_int", "json_array_get", "toml_array_get" }) |n|
+        for ([_][]const u8{ "random_int", "json_array_get", "toml_array_get", "bit_and", "bit_or", "bit_xor", "bit_shl", "bit_shr" }) |n|
             try self.registerBuiltin(n, two_int_to_int);
 
         // (Int, String) -> String
@@ -285,11 +287,11 @@ pub const Checker = struct {
 
         // (String) -> Void
         const str_to_void = try self.addFnType(&.{.string}, .void);
-        for ([_][]const u8{ "print", "log_info", "log_warn", "log_error", "log_debug" }) |n|
+        for ([_][]const u8{ "print", "print_err", "log_info", "log_warn", "log_error", "log_debug" }) |n|
             try self.registerBuiltin(n, str_to_void);
         // (String) -> Int
         const str_to_int = try self.addFnType(&.{.string}, .int);
-        for ([_][]const u8{ "exec", "json_parse", "json_new_string", "hash_fnv1a", "url_parse", "toml_parse" }) |n|
+        for ([_][]const u8{ "exec", "ord", "json_parse", "json_new_string", "hash_fnv1a", "url_parse", "toml_parse" }) |n|
             try self.registerBuiltin(n, str_to_int);
         // (String) -> Bool
         const str_to_bool = try self.addFnType(&.{.string}, .bool);

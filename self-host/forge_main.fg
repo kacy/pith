@@ -29,6 +29,19 @@ from errors import render_diagnostics, render_diagnostics_json, count_errors, ha
 # compile pipeline (build/run/test)
 # ---------------------------------------------------------------
 
+fn find_runtime_header() -> String!:
+    # try common locations for forge_runtime.h
+    # 1. runtime/ (post-archive layout)
+    # 2. src/ (pre-archive layout, zig bootstrap)
+    if file_exists("runtime/forge_runtime.h"):
+        return read_file("runtime/forge_runtime.h")!
+    if file_exists("src/forge_runtime.h"):
+        return read_file("src/forge_runtime.h")!
+    print("error: cannot find forge_runtime.h")
+    print("  looked in: runtime/forge_runtime.h, src/forge_runtime.h")
+    exit(1)
+    return ""
+
 fn compile(path: String, test_mode: Bool) -> String!:
     c_code := compile_to_c(path, test_mode)!
 
@@ -38,7 +51,7 @@ fn compile(path: String, test_mode: Bool) -> String!:
     exec("mkdir -p " + build_dir)
 
     # copy runtime header
-    runtime := read_file("src/forge_runtime.h")!
+    runtime := find_runtime_header()!
     write_file(build_dir + "/forge_runtime.h", runtime)!
 
     # write C source

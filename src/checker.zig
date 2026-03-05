@@ -141,6 +141,9 @@ pub const Checker = struct {
     resolve_depth: u32,
     /// path to the source file being checked (used for resolving relative imports)
     source_path: ?[]const u8,
+    /// root directory for stdlib modules (std/). when an import path starts
+    /// with "std", resolve relative to this directory instead of the source file.
+    stdlib_root: ?[]const u8,
     /// tracks files currently being checked to detect import cycles
     checking_files: ?*std.StringHashMap(void),
     /// declarations from imported modules (for codegen)
@@ -164,6 +167,7 @@ pub const Checker = struct {
             .method_types = std.StringHashMap(MethodEntry).init(allocator),
             .resolve_depth = 0,
             .source_path = null,
+            .stdlib_root = null,
             .checking_files = null,
             .imported_modules = .empty,
         };
@@ -364,6 +368,168 @@ pub const Checker = struct {
         try self.module_scope.define("log_error", .{ .type_id = log_type, .is_mut = false });
         try self.module_scope.define("log_debug", .{ .type_id = log_type, .is_mut = false });
 
+        // math_pow(Float, Float) -> Float
+        const math_pow_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .float, .float },
+            .return_type = .float,
+        } });
+        try self.module_scope.define("math_pow", .{ .type_id = math_pow_type, .is_mut = false });
+
+        // math_sqrt(Float) -> Float
+        const math_sqrt_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.float},
+            .return_type = .float,
+        } });
+        try self.module_scope.define("math_sqrt", .{ .type_id = math_sqrt_type, .is_mut = false });
+
+        // math_floor, math_ceil, math_round: (Float) -> Int
+        const float_to_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.float},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("math_floor", .{ .type_id = float_to_int_type, .is_mut = false });
+        try self.module_scope.define("math_ceil", .{ .type_id = float_to_int_type, .is_mut = false });
+        try self.module_scope.define("math_round", .{ .type_id = float_to_int_type, .is_mut = false });
+
+        // file_exists(String) -> Bool, dir_exists(String) -> Bool
+        // mkdir(String) -> Bool, remove_file(String) -> Bool
+        const str_to_bool_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = .bool,
+        } });
+        try self.module_scope.define("file_exists", .{ .type_id = str_to_bool_type, .is_mut = false });
+        try self.module_scope.define("dir_exists", .{ .type_id = str_to_bool_type, .is_mut = false });
+        try self.module_scope.define("mkdir", .{ .type_id = str_to_bool_type, .is_mut = false });
+        try self.module_scope.define("remove_file", .{ .type_id = str_to_bool_type, .is_mut = false });
+
+        // rename_file(String, String) -> Bool
+        const two_str_to_bool_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .string, .string },
+            .return_type = .bool,
+        } });
+        try self.module_scope.define("rename_file", .{ .type_id = two_str_to_bool_type, .is_mut = false });
+
+        // append_file(String, String) -> Bool!
+        try self.module_scope.define("append_file", .{ .type_id = write_file_type, .is_mut = false });
+
+        // list_dir(String) -> List[String]
+        const list_dir_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = list_string,
+        } });
+        try self.module_scope.define("list_dir", .{ .type_id = list_dir_type, .is_mut = false });
+
+        // fmt_hex(Int) -> String, fmt_oct(Int) -> String, fmt_bin(Int) -> String
+        const int_to_str_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = .string,
+        } });
+        try self.module_scope.define("fmt_hex", .{ .type_id = int_to_str_type, .is_mut = false });
+        try self.module_scope.define("fmt_oct", .{ .type_id = int_to_str_type, .is_mut = false });
+        try self.module_scope.define("fmt_bin", .{ .type_id = int_to_str_type, .is_mut = false });
+
+        // fmt_float(Float, Int) -> String
+        const fmt_float_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .float, .int },
+            .return_type = .string,
+        } });
+        try self.module_scope.define("fmt_float", .{ .type_id = fmt_float_type, .is_mut = false });
+
+        // json builtins — opaque handle-based API
+        // json_parse(String) -> Int
+        const str_to_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_parse", .{ .type_id = str_to_int_type, .is_mut = false });
+        // json_type(Int) -> String
+        try self.module_scope.define("json_type", .{ .type_id = int_to_str_type, .is_mut = false });
+        // json_get_bool(Int) -> Bool
+        const int_to_bool_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = .bool,
+        } });
+        try self.module_scope.define("json_get_bool", .{ .type_id = int_to_bool_type, .is_mut = false });
+        // json_get_int(Int) -> Int
+        const int_to_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_get_int", .{ .type_id = int_to_int_type, .is_mut = false });
+        // json_get_float(Int) -> Float
+        const int_to_float_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = .float,
+        } });
+        try self.module_scope.define("json_get_float", .{ .type_id = int_to_float_type, .is_mut = false });
+        // json_get_string(Int) -> String (already have int_to_str_type)
+        try self.module_scope.define("json_get_string", .{ .type_id = int_to_str_type, .is_mut = false });
+        // json_array_len(Int) -> Int
+        try self.module_scope.define("json_array_len", .{ .type_id = int_to_int_type, .is_mut = false });
+        // json_array_get(Int, Int) -> Int
+        const two_int_to_int = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .int },
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_array_get", .{ .type_id = two_int_to_int, .is_mut = false });
+        // json_object_get(Int, String) -> Int
+        const int_str_to_int = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .string },
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_object_get", .{ .type_id = int_str_to_int, .is_mut = false });
+        // json_object_has(Int, String) -> Bool
+        const int_str_to_bool = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .string },
+            .return_type = .bool,
+        } });
+        try self.module_scope.define("json_object_has", .{ .type_id = int_str_to_bool, .is_mut = false });
+        // json_object_keys(Int) -> List[String]
+        const int_to_list_str = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = list_string,
+        } });
+        try self.module_scope.define("json_object_keys", .{ .type_id = int_to_list_str, .is_mut = false });
+        // json_encode(Int) -> String
+        try self.module_scope.define("json_encode", .{ .type_id = int_to_str_type, .is_mut = false });
+        // json constructor builtins
+        // json_new_null() -> Int, json_new_array() -> Int, json_new_object() -> Int
+        const void_to_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_new_null", .{ .type_id = void_to_int_type, .is_mut = false });
+        try self.module_scope.define("json_new_array", .{ .type_id = void_to_int_type, .is_mut = false });
+        try self.module_scope.define("json_new_object", .{ .type_id = void_to_int_type, .is_mut = false });
+        // json_new_bool(Bool) -> Int
+        const bool_to_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.bool},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_new_bool", .{ .type_id = bool_to_int_type, .is_mut = false });
+        // json_new_int(Int) -> Int
+        try self.module_scope.define("json_new_int", .{ .type_id = int_to_int_type, .is_mut = false });
+        // json_new_float(Float) -> Int
+        const float_to_int_type2 = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.float},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("json_new_float", .{ .type_id = float_to_int_type2, .is_mut = false });
+        // json_new_string(String) -> Int
+        try self.module_scope.define("json_new_string", .{ .type_id = str_to_int_type, .is_mut = false });
+        // json_array_push(Int, Int) -> Void
+        const two_int_to_void = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .int },
+            .return_type = .void,
+        } });
+        try self.module_scope.define("json_array_push", .{ .type_id = two_int_to_void, .is_mut = false });
+        // json_object_set(Int, String, Int) -> Void
+        const int_str_int_to_void = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .int, .string, .int },
+            .return_type = .void,
+        } });
+        try self.module_scope.define("json_object_set", .{ .type_id = int_str_int_to_void, .is_mut = false });
+
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});
         try self.registerSyncType("WaitGroup", &.{});
@@ -522,11 +688,25 @@ pub const Checker = struct {
 
     /// build a file path from import path parts relative to a directory.
     /// returns null if the file doesn't exist.
+    ///
+    /// when the first path part is "std" and a stdlib_root is set, resolves
+    /// relative to the stdlib root directory. for example, `from std.math import abs`
+    /// with stdlib_root="/project" resolves to "/project/std/math.fg".
     fn resolveImportPath(self: *Checker, path_parts: []const []const u8, dir: []const u8) ?[]const u8 {
-        // build "dir/part1/part2/.../partN.fg"
+        // determine the base directory for resolution.
+        // if the import starts with "std" and we have a stdlib root, use that
+        // instead of the source file's directory.
+        var base_dir = dir;
+        if (path_parts.len > 0 and std.mem.eql(u8, path_parts[0], "std")) {
+            if (self.stdlib_root) |root| {
+                base_dir = root;
+            }
+        }
+
+        // build "base_dir/part1/part2/.../partN.fg"
         var parts: std.ArrayList([]const u8) = .empty;
         defer parts.deinit(self.allocator);
-        parts.append(self.allocator, dir) catch return null;
+        parts.append(self.allocator, base_dir) catch return null;
         for (path_parts) |p| {
             parts.append(self.allocator, p) catch return null;
         }
@@ -1144,7 +1324,15 @@ pub const Checker = struct {
                 // allow returning the inner type from a result- or optional-returning function,
                 // and structurally equivalent tuples (may have different TypeIds)
                 const ok_match = if (self.type_table.get(expected)) |ety| switch (ety) {
-                    .result => |r| actual == r.ok_type,
+                    .result => |r| actual == r.ok_type or blk: {
+                        // also allow returning a result with matching ok/err types
+                        const act_ty = self.type_table.get(actual) orelse break :blk false;
+                        const act_r = switch (act_ty) {
+                            .result => |ar| ar,
+                            else => break :blk false,
+                        };
+                        break :blk act_r.ok_type == r.ok_type and act_r.err_type == r.err_type;
+                    },
                     .optional => |o| actual == o.inner,
                     .tuple => |exp_tup| blk: {
                         const act_ty = self.type_table.get(actual) orelse break :blk false;
@@ -2495,11 +2683,19 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "trim")) return self.checkNoArgs(mc, location, "String.trim", .string);
         if (std.mem.eql(u8, method, "to_upper")) return self.checkNoArgs(mc, location, "String.to_upper", .string);
         if (std.mem.eql(u8, method, "to_lower")) return self.checkNoArgs(mc, location, "String.to_lower", .string);
+        if (std.mem.eql(u8, method, "is_empty")) return self.checkNoArgs(mc, location, "String.is_empty", .bool);
 
         // one-string-arg methods
         if (std.mem.eql(u8, method, "contains")) return self.checkOneStringArg(mc, location, scope, "String.contains", .bool);
         if (std.mem.eql(u8, method, "starts_with")) return self.checkOneStringArg(mc, location, scope, "String.starts_with", .bool);
         if (std.mem.eql(u8, method, "ends_with")) return self.checkOneStringArg(mc, location, scope, "String.ends_with", .bool);
+
+        // index_of(String) -> Int, last_index_of(String) -> Int
+        if (std.mem.eql(u8, method, "index_of")) return self.checkOneStringArg(mc, location, scope, "String.index_of", .int);
+        if (std.mem.eql(u8, method, "last_index_of")) return self.checkOneStringArg(mc, location, scope, "String.last_index_of", .int);
+
+        // repeat(Int) -> String
+        if (std.mem.eql(u8, method, "repeat")) return self.checkNoArgs1Int(mc, location, scope, "String.repeat", .string);
 
         // split(String) -> List[String]
         if (std.mem.eql(u8, method, "split")) {
@@ -2557,6 +2753,41 @@ pub const Checker = struct {
             return .string;
         }
 
+        // pad_left(Int, String) -> String, pad_right(Int, String) -> String
+        if (std.mem.eql(u8, method, "pad_left") or std.mem.eql(u8, method, "pad_right")) {
+            const label = if (std.mem.eql(u8, method, "pad_left")) "String.pad_left" else "String.pad_right";
+            if (mc.args.len != 2) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'{s}' expects 2 arguments, got {d}", .{ label, mc.args.len },
+                )) catch {};
+                return .err;
+            }
+            const a0 = self.checkExpr(mc.args[0].value, scope);
+            if (!a0.isErr() and a0 != .int) {
+                self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
+                    "expected Int, got {s}", .{self.type_table.typeName(a0)},
+                )) catch {};
+            }
+            const a1 = self.checkExpr(mc.args[1].value, scope);
+            if (!a1.isErr() and a1 != .string) {
+                self.diagnostics.addCodedError(.E219, mc.args[1].location, self.fmt(
+                    "expected String, got {s}", .{self.type_table.typeName(a1)},
+                )) catch {};
+            }
+            return .string;
+        }
+
+        // chars() -> List[String]
+        if (std.mem.eql(u8, method, "chars")) {
+            if (mc.args.len != 0) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'String.chars' expects 0 arguments, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            return self.type_table.lookup("List[String]") orelse .err;
+        }
+
         // unknown string method
         self.diagnostics.addCodedError(.E227, location, self.fmt(
             "type 'String' has no method '{s}'", .{method},
@@ -2609,7 +2840,6 @@ pub const Checker = struct {
     /// is not a built-in list method (falls through to user-defined lookup).
     fn checkListMethod(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, elem_type: TypeId, receiver_type: TypeId) ?TypeId {
         const method = mc.method;
-        _ = receiver_type;
 
         if (std.mem.eql(u8, method, "push")) {
             return self.checkOneTypedArg(mc, location, scope, "List.push", elem_type, .void);
@@ -2630,6 +2860,44 @@ pub const Checker = struct {
                 return .err;
             }
             return self.checkOneStringArg(mc, location, scope, "List.join", .string);
+        }
+        // index_of(T) -> Int
+        if (std.mem.eql(u8, method, "index_of")) {
+            return self.checkOneTypedArg(mc, location, scope, "List.index_of", elem_type, .int);
+        }
+        // slice(Int, Int) -> List[T]
+        if (std.mem.eql(u8, method, "slice")) {
+            if (mc.args.len != 2) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'List.slice' expects 2 arguments, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            for (mc.args) |arg| {
+                const arg_type = self.checkExpr(arg.value, scope);
+                if (!arg_type.isErr() and arg_type != .int) {
+                    self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
+                        "expected Int, got {s}", .{self.type_table.typeName(arg_type)},
+                    )) catch {};
+                }
+            }
+            return receiver_type;
+        }
+        // sort() -> List[T] (only Int, Float, String)
+        if (std.mem.eql(u8, method, "sort")) {
+            if (mc.args.len != 0) {
+                self.diagnostics.addCodedError(.E207, location, self.fmt(
+                    "'List.sort' expects 0 arguments, got {d}", .{mc.args.len},
+                )) catch {};
+                return .err;
+            }
+            if (elem_type != .int and elem_type != .float and elem_type != .string) {
+                self.diagnostics.addCodedError(.E227, location,
+                    "'sort' requires List[Int], List[Float], or List[String]",
+                ) catch {};
+                return .err;
+            }
+            return receiver_type;
         }
         return null;
     }

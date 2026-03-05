@@ -206,6 +206,140 @@ fn c_register_builtins():
     ld_tid := tt_add(ti_function(ld_params, TID_VOID))
     sc_define(c_scope, "log_debug", ld_tid, false)
 
+    # math_pow(Float, Float) -> Float
+    mut mp_params: List[Int] := [TID_FLOAT, TID_FLOAT]
+    mp_tid := tt_add(ti_function(mp_params, TID_FLOAT))
+    sc_define(c_scope, "math_pow", mp_tid, false)
+
+    # math_sqrt(Float) -> Float
+    mut ms_params: List[Int] := [TID_FLOAT]
+    ms_tid := tt_add(ti_function(ms_params, TID_FLOAT))
+    sc_define(c_scope, "math_sqrt", ms_tid, false)
+
+    # math_floor, math_ceil, math_round: (Float) -> Int
+    mut mf_params: List[Int] := [TID_FLOAT]
+    mf_tid := tt_add(ti_function(mf_params, TID_INT))
+    sc_define(c_scope, "math_floor", mf_tid, false)
+    sc_define(c_scope, "math_ceil", mf_tid, false)
+    sc_define(c_scope, "math_round", mf_tid, false)
+
+    # file_exists(String) -> Bool, dir_exists(String) -> Bool
+    # mkdir(String) -> Bool, remove_file(String) -> Bool
+    mut fe_params: List[Int] := [TID_STRING]
+    fe_tid := tt_add(ti_function(fe_params, TID_BOOL))
+    sc_define(c_scope, "file_exists", fe_tid, false)
+    sc_define(c_scope, "dir_exists", fe_tid, false)
+    sc_define(c_scope, "mkdir", fe_tid, false)
+    sc_define(c_scope, "remove_file", fe_tid, false)
+
+    # rename_file(String, String) -> Bool
+    mut ren_params: List[Int] := [TID_STRING, TID_STRING]
+    ren_tid := tt_add(ti_function(ren_params, TID_BOOL))
+    sc_define(c_scope, "rename_file", ren_tid, false)
+
+    # append_file(String, String) -> Bool!
+    mut af_params: List[Int] := [TID_STRING, TID_STRING]
+    af_tid := tt_add(ti_function(af_params, bool_result))
+    sc_define(c_scope, "append_file", af_tid, false)
+
+    # list_dir(String) -> List[String]
+    mut lsd_params: List[Int] := [TID_STRING]
+    lsd_tid := tt_add(ti_function(lsd_params, list_string))
+    sc_define(c_scope, "list_dir", lsd_tid, false)
+
+    # fmt_hex(Int) -> String, fmt_oct(Int) -> String, fmt_bin(Int) -> String
+    mut fmti_params: List[Int] := [TID_INT]
+    fmti_tid := tt_add(ti_function(fmti_params, TID_STRING))
+    sc_define(c_scope, "fmt_hex", fmti_tid, false)
+    sc_define(c_scope, "fmt_oct", fmti_tid, false)
+    sc_define(c_scope, "fmt_bin", fmti_tid, false)
+
+    # fmt_float(Float, Int) -> String
+    mut fmtf_params: List[Int] := [TID_FLOAT, TID_INT]
+    fmtf_tid := tt_add(ti_function(fmtf_params, TID_STRING))
+    sc_define(c_scope, "fmt_float", fmtf_tid, false)
+
+    # json builtins — opaque handle-based API
+    # json_parse(String) -> Int
+    mut jp_params: List[Int] := [TID_STRING]
+    jp_tid := tt_add(ti_function(jp_params, TID_INT))
+    sc_define(c_scope, "json_parse", jp_tid, false)
+
+    # json_type(Int) -> String, json_get_string(Int) -> String, json_encode(Int) -> String
+    sc_define(c_scope, "json_type", fmti_tid, false)
+    sc_define(c_scope, "json_get_string", fmti_tid, false)
+    sc_define(c_scope, "json_encode", fmti_tid, false)
+
+    # json_get_bool(Int) -> Bool
+    mut jgb_params: List[Int] := [TID_INT]
+    jgb_tid := tt_add(ti_function(jgb_params, TID_BOOL))
+    sc_define(c_scope, "json_get_bool", jgb_tid, false)
+
+    # json_get_int(Int) -> Int, json_array_len(Int) -> Int
+    mut jgi_params: List[Int] := [TID_INT]
+    jgi_tid := tt_add(ti_function(jgi_params, TID_INT))
+    sc_define(c_scope, "json_get_int", jgi_tid, false)
+    sc_define(c_scope, "json_array_len", jgi_tid, false)
+
+    # json_get_float(Int) -> Float
+    mut jgf_params: List[Int] := [TID_INT]
+    jgf_tid := tt_add(ti_function(jgf_params, TID_FLOAT))
+    sc_define(c_scope, "json_get_float", jgf_tid, false)
+
+    # json_array_get(Int, Int) -> Int
+    mut jag_params: List[Int] := [TID_INT, TID_INT]
+    jag_tid := tt_add(ti_function(jag_params, TID_INT))
+    sc_define(c_scope, "json_array_get", jag_tid, false)
+
+    # json_object_get(Int, String) -> Int
+    mut jog_params: List[Int] := [TID_INT, TID_STRING]
+    jog_tid := tt_add(ti_function(jog_params, TID_INT))
+    sc_define(c_scope, "json_object_get", jog_tid, false)
+
+    # json_object_has(Int, String) -> Bool
+    mut joh_params: List[Int] := [TID_INT, TID_STRING]
+    joh_tid := tt_add(ti_function(joh_params, TID_BOOL))
+    sc_define(c_scope, "json_object_has", joh_tid, false)
+
+    # json_object_keys(Int) -> List[String]
+    mut jok_params: List[Int] := [TID_INT]
+    jok_tid := tt_add(ti_function(jok_params, list_string))
+    sc_define(c_scope, "json_object_keys", jok_tid, false)
+
+    # json constructors
+    # json_new_null() -> Int, json_new_array() -> Int, json_new_object() -> Int
+    mut jnn_params: List[Int] := []
+    jnn_tid := tt_add(ti_function(jnn_params, TID_INT))
+    sc_define(c_scope, "json_new_null", jnn_tid, false)
+    sc_define(c_scope, "json_new_array", jnn_tid, false)
+    sc_define(c_scope, "json_new_object", jnn_tid, false)
+
+    # json_new_bool(Bool) -> Int
+    mut jnb_params: List[Int] := [TID_BOOL]
+    jnb_tid := tt_add(ti_function(jnb_params, TID_INT))
+    sc_define(c_scope, "json_new_bool", jnb_tid, false)
+
+    # json_new_int(Int) -> Int
+    sc_define(c_scope, "json_new_int", jgi_tid, false)
+
+    # json_new_float(Float) -> Int
+    mut jnf_params: List[Int] := [TID_FLOAT]
+    jnf_tid := tt_add(ti_function(jnf_params, TID_INT))
+    sc_define(c_scope, "json_new_float", jnf_tid, false)
+
+    # json_new_string(String) -> Int
+    sc_define(c_scope, "json_new_string", jp_tid, false)
+
+    # json_array_push(Int, Int) -> Void
+    mut jap_params: List[Int] := [TID_INT, TID_INT]
+    jap_tid := tt_add(ti_function(jap_params, TID_VOID))
+    sc_define(c_scope, "json_array_push", jap_tid, false)
+
+    # json_object_set(Int, String, Int) -> Void
+    mut jos_params: List[Int] := [TID_INT, TID_STRING, TID_INT]
+    jos_tid := tt_add(ti_function(jos_params, TID_VOID))
+    sc_define(c_scope, "json_object_set", jos_tid, false)
+
     # concurrency primitives (stub types)
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -1738,6 +1872,9 @@ fn c_check_string_method(method: String, args: List[Int], scope_id: Int) -> Int:
     if method == "to_lower":
         c_expect_no_args(method, args)
         return TID_STRING
+    if method == "is_empty":
+        c_expect_no_args(method, args)
+        return TID_BOOL
     if method == "contains":
         c_expect_one_string_arg(method, args, scope_id)
         return TID_BOOL
@@ -1747,6 +1884,12 @@ fn c_check_string_method(method: String, args: List[Int], scope_id: Int) -> Int:
     if method == "ends_with":
         c_expect_one_string_arg(method, args, scope_id)
         return TID_BOOL
+    if method == "index_of":
+        c_expect_one_string_arg(method, args, scope_id)
+        return TID_INT
+    if method == "last_index_of":
+        c_expect_one_string_arg(method, args, scope_id)
+        return TID_INT
     if method == "split":
         c_expect_one_string_arg(method, args, scope_id)
         return c_intern_collection("List", TID_STRING, -1)
@@ -1756,6 +1899,18 @@ fn c_check_string_method(method: String, args: List[Int], scope_id: Int) -> Int:
     if method == "replace":
         c_expect_two_string_args(method, args, scope_id)
         return TID_STRING
+    if method == "repeat":
+        c_expect_one_typed_arg(method, args, TID_INT, scope_id)
+        return TID_STRING
+    if method == "pad_left":
+        c_expect_int_string_args(method, args, scope_id)
+        return TID_STRING
+    if method == "pad_right":
+        c_expect_int_string_args(method, args, scope_id)
+        return TID_STRING
+    if method == "chars":
+        c_expect_no_args(method, args)
+        return c_intern_collection("List", TID_STRING, -1)
     c_error("E209", "String has no method '" + method + "'")
     return TID_ERR
 
@@ -1820,6 +1975,15 @@ fn c_check_list_method(method: String, info: TypeInfo, args: List[Int], scope_id
     if method == "join":
         c_expect_one_typed_arg(method, args, TID_STRING, scope_id)
         return TID_STRING
+    if method == "index_of":
+        c_expect_one_typed_arg(method, args, elem, scope_id)
+        return TID_INT
+    if method == "slice":
+        c_expect_two_int_args(method, args, scope_id)
+        return c_intern_collection("List", elem, -1)
+    if method == "sort":
+        c_expect_no_args(method, args)
+        return c_intern_collection("List", elem, -1)
     # not a built-in list method
     return -1
 
@@ -1941,6 +2105,13 @@ fn c_expect_two_int_args(method: String, args: List[Int], scope_id: Int):
         return
     c_check_arg_type(args[0], TID_INT, scope_id)
     c_check_arg_type(args[1], TID_INT, scope_id)
+
+fn c_expect_int_string_args(method: String, args: List[Int], scope_id: Int):
+    if args.len() != 2:
+        c_error("E207", method + " expects 2 arguments, got " + args.len().to_string())
+        return
+    c_check_arg_type(args[0], TID_INT, scope_id)
+    c_check_arg_type(args[1], TID_STRING, scope_id)
 
 fn c_expect_one_typed_arg(method: String, args: List[Int], expected: Int, scope_id: Int):
     if args.len() != 1:

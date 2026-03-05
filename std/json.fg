@@ -1,0 +1,84 @@
+# std.json — JSON parse and encode
+#
+# uses opaque Int handles into a C-side node pool.
+# a handle of -1 indicates an invalid/missing value.
+
+# parse a JSON string into a handle. returns -1 on parse error.
+pub fn parse(input: String) -> Int:
+    return json_parse(input)
+
+# get the type of a JSON value: "null", "bool", "int", "float",
+# "string", "array", "object", or "invalid".
+pub fn type_of(handle: Int) -> String:
+    if handle < 0:
+        return "invalid"
+    return json_type(handle)
+
+# extract a Bool from a JSON value.
+pub fn get_bool(handle: Int) -> Bool:
+    return json_get_bool(handle)
+
+# extract an Int from a JSON value.
+pub fn get_int(handle: Int) -> Int:
+    return json_get_int(handle)
+
+# extract a Float from a JSON value.
+pub fn get_float(handle: Int) -> Float:
+    return json_get_float(handle)
+
+# extract a String from a JSON value.
+pub fn get_string(handle: Int) -> String:
+    return json_get_string(handle)
+
+# get the length of a JSON array.
+pub fn array_len(handle: Int) -> Int:
+    return json_array_len(handle)
+
+# get element at index from a JSON array. returns -1 if out of bounds.
+pub fn array_get(handle: Int, index: Int) -> Int:
+    return json_array_get(handle, index)
+
+# get value for key from a JSON object. returns -1 if key not found.
+pub fn object_get(handle: Int, key: String) -> Int:
+    return json_object_get(handle, key)
+
+# check if a JSON object contains a key.
+pub fn object_has(handle: Int, key: String) -> Bool:
+    return json_object_has(handle, key)
+
+# get all keys from a JSON object.
+pub fn object_keys(handle: Int) -> List[String]:
+    return json_object_keys(handle)
+
+# encode a JSON value to a string.
+pub fn encode(handle: Int) -> String:
+    return json_encode(handle)
+
+# --- constructors for building JSON ---
+
+pub fn make_null() -> Int:
+    return json_new_null()
+
+pub fn make_bool(val: Bool) -> Int:
+    return json_new_bool(val)
+
+pub fn make_int(val: Int) -> Int:
+    return json_new_int(val)
+
+pub fn make_float(val: Float) -> Int:
+    return json_new_float(val)
+
+pub fn make_string(val: String) -> Int:
+    return json_new_string(val)
+
+pub fn make_array() -> Int:
+    return json_new_array()
+
+pub fn array_push(arr: Int, val: Int):
+    json_array_push(arr, val)
+
+pub fn make_object() -> Int:
+    return json_new_object()
+
+pub fn object_set(obj: Int, key: String, val: Int):
+    json_object_set(obj, key, val)

@@ -279,6 +279,9 @@ fn runCheck(allocator: std.mem.Allocator, path: []const u8, json: bool) !void {
     };
     defer checker.deinit();
     checker.source_path = path;
+    const stdlib_root = findStdlibRoot(allocator, path);
+    defer if (stdlib_root) |r| allocator.free(r);
+    checker.stdlib_root = stdlib_root;
 
     checker.check(&result.module);
 
@@ -335,6 +338,9 @@ fn runLint(allocator: std.mem.Allocator, path: []const u8, json: bool) !void {
     };
     defer checker.deinit();
     checker.source_path = path;
+    const lint_stdlib_root = findStdlibRoot(allocator, path);
+    defer if (lint_stdlib_root) |r| allocator.free(r);
+    checker.stdlib_root = lint_stdlib_root;
 
     checker.check(&result.module);
 
@@ -377,6 +383,9 @@ fn runTest(allocator: std.mem.Allocator, path: []const u8, json: bool) !void {
     };
     defer checker.deinit();
     checker.source_path = path;
+    const test_stdlib_root = findStdlibRoot(allocator, path);
+    defer if (test_stdlib_root) |r| allocator.free(r);
+    checker.stdlib_root = test_stdlib_root;
 
     checker.check(&result.module);
 
@@ -451,7 +460,7 @@ fn runTest(allocator: std.mem.Allocator, path: []const u8, json: bool) !void {
 
     const cc_result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "zig", "cc", "-w", "-o", out_path, "-I", build_dir, c_path, "-lpthread" },
+        .argv = &.{ "zig", "cc", "-w", "-o", out_path, "-I", build_dir, c_path, "-lpthread", "-lm" },
     }) catch |err| {
         io.writeErr("error: could not run zig cc: {}\n", .{err});
         return;
@@ -499,6 +508,60 @@ fn runTest(allocator: std.mem.Allocator, path: []const u8, json: bool) !void {
 /// build directory so the C compiler can find it via #include.
 const runtime_header = @embedFile("forge_runtime.h");
 
+/// find the stdlib root directory. checks:
+///   1. FORGE_ROOT environment variable
+///   2. walk up from the source file's directory looking for a `std/` dir
+///   3. relative to the executable's directory (exe_dir/../std/ or exe_dir/../../std/)
+/// returns the parent directory containing `std/`, or null if not found.
+fn findStdlibRoot(allocator: std.mem.Allocator, source_path: []const u8) ?[]const u8 {
+    // 1. check FORGE_ROOT env var
+    if (std.process.getEnvVarOwned(allocator, "FORGE_ROOT")) |root| {
+        // verify std/ exists under it
+        const std_dir = std.fs.path.join(allocator, &.{ root, "std" }) catch {
+            allocator.free(root);
+            return null;
+        };
+        std.fs.cwd().access(std_dir, .{}) catch {
+            allocator.free(std_dir);
+            allocator.free(root);
+            // fall through to other methods
+            return findStdlibRootFromPath(allocator, source_path);
+        };
+        allocator.free(std_dir);
+        return root;
+    } else |_| {}
+
+    return findStdlibRootFromPath(allocator, source_path);
+}
+
+/// walk up from the source file looking for a directory containing `std/`.
+fn findStdlibRootFromPath(allocator: std.mem.Allocator, source_path: []const u8) ?[]const u8 {
+    // resolve to an absolute path so we can walk up reliably
+    const abs_path = std.fs.cwd().realpathAlloc(allocator, source_path) catch return null;
+    defer allocator.free(abs_path);
+
+    var dir: []const u8 = std.fs.path.dirname(abs_path) orelse return null;
+
+    // walk up the directory tree (max 20 levels to avoid infinite loops)
+    var depth: u32 = 0;
+    while (depth < 20) : (depth += 1) {
+        const std_dir = std.fs.path.join(allocator, &.{ dir, "std" }) catch return null;
+        std.fs.cwd().access(std_dir, .{}) catch {
+            allocator.free(std_dir);
+            // go up one level
+            const parent = std.fs.path.dirname(dir) orelse break;
+            if (std.mem.eql(u8, parent, dir)) break; // at filesystem root
+            dir = parent;
+            continue;
+        };
+        allocator.free(std_dir);
+        // found it — return an owned copy
+        return allocator.dupe(u8, dir) catch return null;
+    }
+
+    return null;
+}
+
 /// lex, parse, type-check, generate C, and compile a forge source file.
 /// if `run_after` is true, also executes the resulting binary.
 fn runBuild(allocator: std.mem.Allocator, path: []const u8, run_after: bool, json: bool, extra_args: []const []const u8) !void {
@@ -514,6 +577,9 @@ fn runBuild(allocator: std.mem.Allocator, path: []const u8, run_after: bool, jso
     };
     defer checker.deinit();
     checker.source_path = path;
+    const build_stdlib_root = findStdlibRoot(allocator, path);
+    defer if (build_stdlib_root) |r| allocator.free(r);
+    checker.stdlib_root = build_stdlib_root;
 
     checker.check(&result.module);
 
@@ -584,7 +650,7 @@ fn runBuild(allocator: std.mem.Allocator, path: []const u8, run_after: bool, jso
 
     const cc_result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "zig", "cc", "-w", "-o", out_path, "-I", build_dir, c_path, "-lpthread" },
+        .argv = &.{ "zig", "cc", "-w", "-o", out_path, "-I", build_dir, c_path, "-lpthread", "-lm" },
     }) catch |err| {
         io.writeErr("error: could not run zig cc: {}\n", .{err});
         return;

@@ -71,6 +71,40 @@ pub fn find_imports(root_idx: Int) -> List[String]:
 # must be global because collections are passed by copy in forge.
 mut dr_visited: Map[String, Bool] := {}
 
+# stdlib root — set by compile_to_c before resolving imports
+mut dr_stdlib_root: String := ""
+
+# convert a dotted module path to a file path segment.
+# "std.math" -> "std/math", "foo" -> "foo"
+fn dots_to_slashes(mod_path: String) -> String:
+    mut result := ""
+    mut i := 0
+    while i < mod_path.len():
+        if mod_path[i] == ".":
+            result = result + "/"
+        else:
+            result = result + mod_path[i]
+        i = i + 1
+    return result
+
+# find the stdlib root by walking up from source file directory.
+# uses exec to test for std/ directory existence.
+fn find_stdlib_root(source_path: String) -> String:
+    mut dir := get_directory(source_path)
+    mut depth := 0
+    while depth < 20:
+        test_path := dir + "/std"
+        result := exec("test -d " + test_path)
+        if result == 0:
+            return dir
+        # go up one level
+        parent := get_directory(dir)
+        if parent == dir:
+            break
+        dir = parent
+        depth = depth + 1
+    return ""
+
 # resolve imports recursively via DFS.
 # returns module roots in dependency order (leaves first).
 pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
@@ -78,11 +112,21 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
     dir := get_directory(source_path)
     imports := find_imports(root_idx)
     for mod_path in imports:
+        # convert dots to slashes for file path
+        rel_path := dots_to_slashes(mod_path)
         mut file_path := ""
-        if dir == ".":
-            file_path = mod_path + ".fg"
+        # if module starts with "std.", resolve relative to stdlib root
+        if mod_path.starts_with("std.") or mod_path == "std":
+            if dr_stdlib_root != "":
+                file_path = dr_stdlib_root + "/" + rel_path + ".fg"
+            elif dir == ".":
+                file_path = rel_path + ".fg"
+            else:
+                file_path = dir + "/" + rel_path + ".fg"
+        elif dir == ".":
+            file_path = rel_path + ".fg"
         else:
-            file_path = dir + "/" + mod_path + ".fg"
+            file_path = dir + "/" + rel_path + ".fg"
         if dr_visited.contains_key(file_path):
             continue
         dr_visited.insert(file_path, true)
@@ -105,6 +149,9 @@ pub fn compile_to_c(path: String, test_mode: Bool) -> String!:
     content := read_file(path)!
     tokens := lex_all(content)
     root := parse(tokens)
+
+    # find stdlib root for std.* imports
+    dr_stdlib_root = find_stdlib_root(path)
 
     # resolve imports
     mark_visited(path)

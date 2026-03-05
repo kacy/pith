@@ -1,0 +1,64 @@
+# json_ops.fg — test std.json parse and encode
+
+from std.json import parse, type_of, get_bool, get_int, get_float, get_string
+from std.json import array_len, array_get, object_get, object_has, object_keys
+from std.json import encode, make_int, make_string, make_array, array_push
+from std.json import make_object, object_set
+
+fn main():
+    # note: use chr(123)/chr(125) for curly braces in string literals
+    lb := chr(123)
+    rb := chr(125)
+
+    # parse a simple object
+    input := lb + "\"name\":\"forge\",\"version\":1,\"active\":true,\"tags\":[\"lang\",\"fast\"]" + rb
+    root := parse(input)
+    print("type = " + type_of(root))
+
+    # extract fields
+    name_h := object_get(root, "name")
+    print("name = " + get_string(name_h))
+
+    ver := object_get(root, "version")
+    print("version = " + get_int(ver).to_string())
+
+    active := object_get(root, "active")
+    print("active = " + get_bool(active).to_string())
+
+    # array access
+    tags := object_get(root, "tags")
+    print("tags.len = " + array_len(tags).to_string())
+    print("tags[0] = " + get_string(array_get(tags, 0)))
+    print("tags[1] = " + get_string(array_get(tags, 1)))
+
+    # object_has / object_keys
+    print("has name = " + object_has(root, "name").to_string())
+    print("has missing = " + object_has(root, "missing").to_string())
+
+    keys := object_keys(root)
+    print("keys = " + keys.join(", "))
+
+    # parse numbers
+    nums := parse("[42, 3.14, -7, 0]")
+    print("nums type = " + type_of(nums))
+    print("nums[0] = " + get_int(array_get(nums, 0)).to_string())
+    print("nums[1] = " + get_float(array_get(nums, 1)).to_string())
+
+    # build and encode JSON
+    obj := make_object()
+    object_set(obj, "tool", make_string("forge"))
+    object_set(obj, "year", make_int(2026))
+    arr := make_array()
+    array_push(arr, make_int(1))
+    array_push(arr, make_int(2))
+    array_push(arr, make_int(3))
+    object_set(obj, "items", arr)
+    print("encoded = " + encode(obj))
+
+    # null and bool
+    print("null type = " + type_of(parse("null")))
+    print("true type = " + type_of(parse("true")))
+
+    # invalid parse
+    bad := parse("not json")
+    print("bad parse = " + bad.to_string())

@@ -227,8 +227,83 @@ static inline forge_string_t forge_string_replace(forge_string_t s, forge_string
     return (forge_string_t){ .data = buf, .len = new_len };
 }
 
+// index_of: find first occurrence of needle in haystack. returns -1 if not found.
+static inline int64_t forge_string_index_of(forge_string_t haystack, forge_string_t needle) {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return -1;
+    for (int64_t i = 0; i <= haystack.len - needle.len; i++) {
+        if (memcmp(haystack.data + i, needle.data, (size_t)needle.len) == 0)
+            return i;
+    }
+    return -1;
+}
+
+// last_index_of: find last occurrence of needle in haystack. returns -1 if not found.
+static inline int64_t forge_string_last_index_of(forge_string_t haystack, forge_string_t needle) {
+    if (needle.len == 0) return haystack.len;
+    if (needle.len > haystack.len) return -1;
+    for (int64_t i = haystack.len - needle.len; i >= 0; i--) {
+        if (memcmp(haystack.data + i, needle.data, (size_t)needle.len) == 0)
+            return i;
+    }
+    return -1;
+}
+
+// repeat: repeat string n times.
+static inline forge_string_t forge_string_repeat(forge_string_t s, int64_t n) {
+    if (n <= 0 || s.len == 0) return forge_string_empty;
+    int64_t new_len = s.len * n;
+    char *buf = (char *)malloc((size_t)new_len + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    for (int64_t i = 0; i < n; i++) {
+        memcpy(buf + i * s.len, s.data, (size_t)s.len);
+    }
+    buf[new_len] = '\0';
+    return (forge_string_t){ .data = buf, .len = new_len };
+}
+
+// pad_left: pad string to given width with fill character (left-padded).
+static inline forge_string_t forge_string_pad_left(forge_string_t s, int64_t width, forge_string_t fill) {
+    if (s.len >= width || fill.len == 0) {
+        char *buf = (char *)malloc((size_t)s.len + 1);
+        if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        memcpy(buf, s.data, (size_t)s.len);
+        buf[s.len] = '\0';
+        return (forge_string_t){ .data = buf, .len = s.len };
+    }
+    int64_t pad_len = width - s.len;
+    char *buf = (char *)malloc((size_t)width + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    for (int64_t i = 0; i < pad_len; i++) {
+        buf[i] = fill.data[i % fill.len];
+    }
+    memcpy(buf + pad_len, s.data, (size_t)s.len);
+    buf[width] = '\0';
+    return (forge_string_t){ .data = buf, .len = width };
+}
+
+// pad_right: pad string to given width with fill character (right-padded).
+static inline forge_string_t forge_string_pad_right(forge_string_t s, int64_t width, forge_string_t fill) {
+    if (s.len >= width || fill.len == 0) {
+        char *buf = (char *)malloc((size_t)s.len + 1);
+        if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        memcpy(buf, s.data, (size_t)s.len);
+        buf[s.len] = '\0';
+        return (forge_string_t){ .data = buf, .len = s.len };
+    }
+    int64_t pad_len = width - s.len;
+    char *buf = (char *)malloc((size_t)width + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, s.data, (size_t)s.len);
+    for (int64_t i = 0; i < pad_len; i++) {
+        buf[s.len + i] = fill.data[i % fill.len];
+    }
+    buf[width] = '\0';
+    return (forge_string_t){ .data = buf, .len = width };
+}
+
 // split uses a forward-declared list type — defined after collection types
-// (see forge_string_split below)
+// (see forge_string_split below and forge_string_chars below)
 
 // ---------------------------------------------------------------
 // conversions to string
@@ -937,6 +1012,100 @@ static inline forge_string_t forge_list_join(forge_list_t list, forge_string_t s
     return (forge_string_t){ .data = buf, .len = total };
 }
 
+// string — chars(): split into a list of single-character strings.
+static inline forge_list_t forge_string_chars(forge_string_t s) {
+    forge_list_t result = { .data = NULL, .len = 0 };
+    for (int64_t i = 0; i < s.len; i++) {
+        char *ch = (char *)malloc(2);
+        if (!ch) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        ch[0] = s.data[i];
+        ch[1] = '\0';
+        forge_string_t part = { .data = ch, .len = 1 };
+        forge_list_push(&result, &part, sizeof(forge_string_t));
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------
+// list — index_of, slice, sort
+// ---------------------------------------------------------------
+
+// list — find first occurrence of element. returns -1 if not found.
+static inline int64_t forge_list_index_of(forge_list_t list, const void *elem, int64_t elem_size) {
+    for (int64_t i = 0; i < list.len; i++) {
+        if (memcmp((char *)list.data + i * elem_size, elem, (size_t)elem_size) == 0)
+            return i;
+    }
+    return -1;
+}
+
+// list — find first occurrence of string element. returns -1 if not found.
+static inline int64_t forge_list_index_of_string(forge_list_t list, forge_string_t s) {
+    forge_string_t *items = (forge_string_t *)list.data;
+    for (int64_t i = 0; i < list.len; i++) {
+        if (forge_string_eq(items[i], s)) return i;
+    }
+    return -1;
+}
+
+// list — slice: return a new list from start to end (exclusive).
+static inline forge_list_t forge_list_slice(forge_list_t list, int64_t start, int64_t end, int64_t elem_size) {
+    if (start < 0) start = 0;
+    if (end > list.len) end = list.len;
+    if (start >= end) return (forge_list_t){ .data = NULL, .len = 0 };
+    int64_t new_len = end - start;
+    int64_t total = new_len * elem_size;
+    void *buf = malloc((size_t)total);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, (char *)list.data + start * elem_size, (size_t)total);
+    return (forge_list_t){ .data = buf, .len = new_len };
+}
+
+// qsort comparators for sort
+static int forge_cmp_int(const void *a, const void *b) {
+    int64_t va = *(const int64_t *)a;
+    int64_t vb = *(const int64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+static int forge_cmp_float(const void *a, const void *b) {
+    double va = *(const double *)a;
+    double vb = *(const double *)b;
+    return (va > vb) - (va < vb);
+}
+
+static int forge_cmp_string(const void *a, const void *b) {
+    const forge_string_t *sa = (const forge_string_t *)a;
+    const forge_string_t *sb = (const forge_string_t *)b;
+    int64_t min_len = sa->len < sb->len ? sa->len : sb->len;
+    int cmp = memcmp(sa->data, sb->data, (size_t)min_len);
+    if (cmp != 0) return cmp;
+    return (sa->len > sb->len) - (sa->len < sb->len);
+}
+
+// list — sort: return a new sorted copy. type_tag: 0=int, 1=float, 2=string.
+static inline forge_list_t forge_list_sort(forge_list_t list, int64_t elem_size, int type_tag) {
+    if (list.len <= 1) {
+        forge_list_t copy = { .data = NULL, .len = list.len };
+        if (list.len == 1) {
+            copy.data = malloc((size_t)elem_size);
+            if (!copy.data) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+            memcpy(copy.data, list.data, (size_t)elem_size);
+        }
+        return copy;
+    }
+    int64_t total = list.len * elem_size;
+    void *buf = malloc((size_t)total);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, list.data, (size_t)total);
+    int (*cmp)(const void *, const void *) = NULL;
+    if (type_tag == 0) cmp = forge_cmp_int;
+    else if (type_tag == 1) cmp = forge_cmp_float;
+    else cmp = forge_cmp_string;
+    qsort(buf, (size_t)list.len, (size_t)elem_size, cmp);
+    return (forge_list_t){ .data = buf, .len = list.len };
+}
+
 // ---------------------------------------------------------------
 // command-line arguments
 // ---------------------------------------------------------------
@@ -1152,6 +1321,749 @@ static inline forge_string_t forge_input(void) {
     memcpy(copy, buf, (size_t)len);
     copy[len] = '\0';
     return (forge_string_t){ .data = copy, .len = len };
+}
+
+// ---------------------------------------------------------------
+// math functions
+// ---------------------------------------------------------------
+
+#include <math.h>
+
+static inline double forge_math_pow(double base, double exp) {
+    return pow(base, exp);
+}
+
+static inline double forge_math_sqrt(double x) {
+    return sqrt(x);
+}
+
+static inline int64_t forge_math_floor(double x) {
+    return (int64_t)floor(x);
+}
+
+static inline int64_t forge_math_ceil(double x) {
+    return (int64_t)ceil(x);
+}
+
+static inline int64_t forge_math_round(double x) {
+    return (int64_t)round(x);
+}
+
+// ---------------------------------------------------------------
+// formatting functions
+// ---------------------------------------------------------------
+
+// fmt_hex(Int) -> String: format integer as hexadecimal
+static inline forge_string_t forge_fmt_hex(int64_t n) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%" PRIx64, (uint64_t)n);
+    char *result = (char *)malloc((size_t)len + 1);
+    if (!result) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(result, buf, (size_t)len + 1);
+    return (forge_string_t){ .data = result, .len = len };
+}
+
+// fmt_oct(Int) -> String: format integer as octal
+static inline forge_string_t forge_fmt_oct(int64_t n) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%" PRIo64, (uint64_t)n);
+    char *result = (char *)malloc((size_t)len + 1);
+    if (!result) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(result, buf, (size_t)len + 1);
+    return (forge_string_t){ .data = result, .len = len };
+}
+
+// fmt_bin(Int) -> String: format integer as binary
+static inline forge_string_t forge_fmt_bin(int64_t n) {
+    if (n == 0) {
+        char *z = (char *)malloc(2);
+        if (!z) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        z[0] = '0'; z[1] = '\0';
+        return (forge_string_t){ .data = z, .len = 1 };
+    }
+    char buf[65];
+    int pos = 64;
+    buf[pos] = '\0';
+    uint64_t v = (uint64_t)n;
+    while (v > 0) {
+        buf[--pos] = '0' + (char)(v & 1);
+        v >>= 1;
+    }
+    int len = 64 - pos;
+    char *result = (char *)malloc((size_t)len + 1);
+    if (!result) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(result, buf + pos, (size_t)len + 1);
+    return (forge_string_t){ .data = result, .len = len };
+}
+
+// fmt_float(Float, Int) -> String: format float with fixed decimal places
+static inline forge_string_t forge_fmt_float(double n, int64_t decimals) {
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "%.*f", (int)decimals, n);
+    char *result = (char *)malloc((size_t)len + 1);
+    if (!result) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(result, buf, (size_t)len + 1);
+    return (forge_string_t){ .data = result, .len = len };
+}
+
+// ---------------------------------------------------------------
+// JSON — opaque handle-based API
+// ---------------------------------------------------------------
+
+typedef enum {
+    FORGE_JSON_NULL,
+    FORGE_JSON_BOOL,
+    FORGE_JSON_INT,
+    FORGE_JSON_FLOAT,
+    FORGE_JSON_STRING,
+    FORGE_JSON_ARRAY,
+    FORGE_JSON_OBJECT
+} forge_json_type_t;
+
+typedef struct {
+    forge_json_type_t type;
+    union {
+        bool bool_val;
+        int64_t int_val;
+        double float_val;
+        forge_string_t string_val;
+        struct { int64_t *items; int64_t len; } array_val;
+        struct { forge_string_t *keys; int64_t *vals; int64_t len; } object_val;
+    };
+} forge_json_node_t;
+
+// global node pool
+static forge_json_node_t *forge_json_pool = NULL;
+static int64_t forge_json_pool_len = 0;
+static int64_t forge_json_pool_cap = 0;
+
+static inline int64_t forge_json_alloc(void) {
+    if (forge_json_pool_len >= forge_json_pool_cap) {
+        int64_t new_cap = forge_json_pool_cap == 0 ? 64 : forge_json_pool_cap * 2;
+        forge_json_node_t *new_pool = (forge_json_node_t *)realloc(
+            forge_json_pool, (size_t)new_cap * sizeof(forge_json_node_t));
+        if (!new_pool) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        forge_json_pool = new_pool;
+        forge_json_pool_cap = new_cap;
+    }
+    int64_t idx = forge_json_pool_len++;
+    memset(&forge_json_pool[idx], 0, sizeof(forge_json_node_t));
+    return idx;
+}
+
+// --- json parser ---
+
+typedef struct {
+    const char *data;
+    int64_t len;
+    int64_t pos;
+    bool error;
+} forge_json_parser_t;
+
+static inline void forge_json_skip_ws(forge_json_parser_t *p) {
+    while (p->pos < p->len) {
+        char c = p->data[p->pos];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') p->pos++;
+        else break;
+    }
+}
+
+static inline char forge_json_peek(forge_json_parser_t *p) {
+    forge_json_skip_ws(p);
+    if (p->pos >= p->len) return '\0';
+    return p->data[p->pos];
+}
+
+static inline bool forge_json_match(forge_json_parser_t *p, const char *s, int64_t slen) {
+    if (p->pos + slen > p->len) return false;
+    if (memcmp(p->data + p->pos, s, (size_t)slen) != 0) return false;
+    p->pos += slen;
+    return true;
+}
+
+// forward declaration
+static int64_t forge_json_parse_value(forge_json_parser_t *p);
+
+static inline forge_string_t forge_json_parse_string_raw(forge_json_parser_t *p) {
+    if (p->data[p->pos] != '"') { p->error = true; return forge_string_empty; }
+    p->pos++; // skip opening quote
+    // first pass: compute length
+    int64_t start = p->pos;
+    int64_t escaped_len = 0;
+    while (p->pos < p->len && p->data[p->pos] != '"') {
+        if (p->data[p->pos] == '\\') { p->pos++; escaped_len++; }
+        p->pos++;
+        escaped_len++;
+    }
+    if (p->pos >= p->len) { p->error = true; return forge_string_empty; }
+    // build the string with escape handling
+    char *buf = (char *)malloc((size_t)escaped_len + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    int64_t out = 0;
+    int64_t i = start;
+    while (i < p->pos) {
+        if (p->data[i] == '\\') {
+            i++;
+            if (i < p->pos) {
+                switch (p->data[i]) {
+                    case '"': buf[out++] = '"'; break;
+                    case '\\': buf[out++] = '\\'; break;
+                    case '/': buf[out++] = '/'; break;
+                    case 'n': buf[out++] = '\n'; break;
+                    case 'r': buf[out++] = '\r'; break;
+                    case 't': buf[out++] = '\t'; break;
+                    case 'b': buf[out++] = '\b'; break;
+                    case 'f': buf[out++] = '\f'; break;
+                    default: buf[out++] = p->data[i]; break;
+                }
+                i++;
+            }
+        } else {
+            buf[out++] = p->data[i++];
+        }
+    }
+    buf[out] = '\0';
+    p->pos++; // skip closing quote
+    return (forge_string_t){ .data = buf, .len = out };
+}
+
+static inline int64_t forge_json_parse_number(forge_json_parser_t *p) {
+    int64_t start = p->pos;
+    bool is_float = false;
+    if (p->data[p->pos] == '-') p->pos++;
+    while (p->pos < p->len && p->data[p->pos] >= '0' && p->data[p->pos] <= '9') p->pos++;
+    if (p->pos < p->len && p->data[p->pos] == '.') {
+        is_float = true;
+        p->pos++;
+        while (p->pos < p->len && p->data[p->pos] >= '0' && p->data[p->pos] <= '9') p->pos++;
+    }
+    if (p->pos < p->len && (p->data[p->pos] == 'e' || p->data[p->pos] == 'E')) {
+        is_float = true;
+        p->pos++;
+        if (p->pos < p->len && (p->data[p->pos] == '+' || p->data[p->pos] == '-')) p->pos++;
+        while (p->pos < p->len && p->data[p->pos] >= '0' && p->data[p->pos] <= '9') p->pos++;
+    }
+    // extract the number string
+    int64_t nlen = p->pos - start;
+    char tmp[64];
+    if (nlen >= 64) nlen = 63;
+    memcpy(tmp, p->data + start, (size_t)nlen);
+    tmp[nlen] = '\0';
+
+    int64_t idx = forge_json_alloc();
+    if (is_float) {
+        forge_json_pool[idx].type = FORGE_JSON_FLOAT;
+        forge_json_pool[idx].float_val = strtod(tmp, NULL);
+    } else {
+        forge_json_pool[idx].type = FORGE_JSON_INT;
+        forge_json_pool[idx].int_val = strtoll(tmp, NULL, 10);
+    }
+    return idx;
+}
+
+static int64_t forge_json_parse_value(forge_json_parser_t *p) {
+    if (p->error) return -1;
+    char c = forge_json_peek(p);
+    if (c == '\0') { p->error = true; return -1; }
+
+    // string
+    if (c == '"') {
+        forge_string_t s = forge_json_parse_string_raw(p);
+        if (p->error) return -1;
+        int64_t idx = forge_json_alloc();
+        forge_json_pool[idx].type = FORGE_JSON_STRING;
+        forge_json_pool[idx].string_val = s;
+        return idx;
+    }
+    // number
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        return forge_json_parse_number(p);
+    }
+    // true
+    if (c == 't') {
+        if (!forge_json_match(p, "true", 4)) { p->error = true; return -1; }
+        int64_t idx = forge_json_alloc();
+        forge_json_pool[idx].type = FORGE_JSON_BOOL;
+        forge_json_pool[idx].bool_val = true;
+        return idx;
+    }
+    // false
+    if (c == 'f') {
+        if (!forge_json_match(p, "false", 5)) { p->error = true; return -1; }
+        int64_t idx = forge_json_alloc();
+        forge_json_pool[idx].type = FORGE_JSON_BOOL;
+        forge_json_pool[idx].bool_val = false;
+        return idx;
+    }
+    // null
+    if (c == 'n') {
+        if (!forge_json_match(p, "null", 4)) { p->error = true; return -1; }
+        int64_t idx = forge_json_alloc();
+        forge_json_pool[idx].type = FORGE_JSON_NULL;
+        return idx;
+    }
+    // array
+    if (c == '[') {
+        p->pos++;
+        int64_t idx = forge_json_alloc();
+        forge_json_pool[idx].type = FORGE_JSON_ARRAY;
+        forge_json_pool[idx].array_val.items = NULL;
+        forge_json_pool[idx].array_val.len = 0;
+        if (forge_json_peek(p) == ']') { p->pos++; return idx; }
+        while (1) {
+            int64_t val = forge_json_parse_value(p);
+            if (p->error) return -1;
+            // grow items array
+            int64_t new_len = forge_json_pool[idx].array_val.len + 1;
+            int64_t *new_items = (int64_t *)realloc(
+                forge_json_pool[idx].array_val.items, (size_t)new_len * sizeof(int64_t));
+            if (!new_items) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+            new_items[new_len - 1] = val;
+            forge_json_pool[idx].array_val.items = new_items;
+            forge_json_pool[idx].array_val.len = new_len;
+            if (forge_json_peek(p) == ',') { p->pos++; continue; }
+            if (forge_json_peek(p) == ']') { p->pos++; break; }
+            p->error = true; return -1;
+        }
+        return idx;
+    }
+    // object
+    if (c == '{') {
+        p->pos++;
+        int64_t idx = forge_json_alloc();
+        forge_json_pool[idx].type = FORGE_JSON_OBJECT;
+        forge_json_pool[idx].object_val.keys = NULL;
+        forge_json_pool[idx].object_val.vals = NULL;
+        forge_json_pool[idx].object_val.len = 0;
+        if (forge_json_peek(p) == '}') { p->pos++; return idx; }
+        while (1) {
+            forge_json_skip_ws(p);
+            forge_string_t key = forge_json_parse_string_raw(p);
+            if (p->error) return -1;
+            forge_json_skip_ws(p);
+            if (p->pos >= p->len || p->data[p->pos] != ':') { p->error = true; return -1; }
+            p->pos++;
+            int64_t val = forge_json_parse_value(p);
+            if (p->error) return -1;
+            // grow parallel arrays
+            int64_t new_len = forge_json_pool[idx].object_val.len + 1;
+            forge_string_t *new_keys = (forge_string_t *)realloc(
+                forge_json_pool[idx].object_val.keys, (size_t)new_len * sizeof(forge_string_t));
+            int64_t *new_vals = (int64_t *)realloc(
+                forge_json_pool[idx].object_val.vals, (size_t)new_len * sizeof(int64_t));
+            if (!new_keys || !new_vals) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+            new_keys[new_len - 1] = key;
+            new_vals[new_len - 1] = val;
+            forge_json_pool[idx].object_val.keys = new_keys;
+            forge_json_pool[idx].object_val.vals = new_vals;
+            forge_json_pool[idx].object_val.len = new_len;
+            if (forge_json_peek(p) == ',') { p->pos++; continue; }
+            if (forge_json_peek(p) == '}') { p->pos++; break; }
+            p->error = true; return -1;
+        }
+        return idx;
+    }
+
+    p->error = true;
+    return -1;
+}
+
+// --- public API ---
+
+// json_parse(String) -> Int (handle, -1 on error)
+static inline int64_t forge_json_parse(forge_string_t input) {
+    forge_json_parser_t p = { .data = input.data, .len = input.len, .pos = 0, .error = false };
+    int64_t result = forge_json_parse_value(&p);
+    if (p.error) return -1;
+    return result;
+}
+
+// json_type(handle) -> String
+static inline forge_string_t forge_json_type(int64_t handle) {
+    if (handle < 0 || handle >= forge_json_pool_len) return FORGE_STRING_LIT("invalid");
+    switch (forge_json_pool[handle].type) {
+        case FORGE_JSON_NULL:   return FORGE_STRING_LIT("null");
+        case FORGE_JSON_BOOL:   return FORGE_STRING_LIT("bool");
+        case FORGE_JSON_INT:    return FORGE_STRING_LIT("int");
+        case FORGE_JSON_FLOAT:  return FORGE_STRING_LIT("float");
+        case FORGE_JSON_STRING: return FORGE_STRING_LIT("string");
+        case FORGE_JSON_ARRAY:  return FORGE_STRING_LIT("array");
+        case FORGE_JSON_OBJECT: return FORGE_STRING_LIT("object");
+    }
+    return FORGE_STRING_LIT("unknown");
+}
+
+// json_get_bool(handle) -> Bool
+static inline bool forge_json_get_bool(int64_t handle) {
+    if (handle < 0 || handle >= forge_json_pool_len) return false;
+    if (forge_json_pool[handle].type != FORGE_JSON_BOOL) return false;
+    return forge_json_pool[handle].bool_val;
+}
+
+// json_get_int(handle) -> Int
+static inline int64_t forge_json_get_int(int64_t handle) {
+    if (handle < 0 || handle >= forge_json_pool_len) return 0;
+    if (forge_json_pool[handle].type == FORGE_JSON_INT)
+        return forge_json_pool[handle].int_val;
+    if (forge_json_pool[handle].type == FORGE_JSON_FLOAT)
+        return (int64_t)forge_json_pool[handle].float_val;
+    return 0;
+}
+
+// json_get_float(handle) -> Float
+static inline double forge_json_get_float(int64_t handle) {
+    if (handle < 0 || handle >= forge_json_pool_len) return 0.0;
+    if (forge_json_pool[handle].type == FORGE_JSON_FLOAT)
+        return forge_json_pool[handle].float_val;
+    if (forge_json_pool[handle].type == FORGE_JSON_INT)
+        return (double)forge_json_pool[handle].int_val;
+    return 0.0;
+}
+
+// json_get_string(handle) -> String
+static inline forge_string_t forge_json_get_string(int64_t handle) {
+    if (handle < 0 || handle >= forge_json_pool_len) return forge_string_empty;
+    if (forge_json_pool[handle].type != FORGE_JSON_STRING) return forge_string_empty;
+    return forge_json_pool[handle].string_val;
+}
+
+// json_array_len(handle) -> Int
+static inline int64_t forge_json_array_len(int64_t handle) {
+    if (handle < 0 || handle >= forge_json_pool_len) return 0;
+    if (forge_json_pool[handle].type != FORGE_JSON_ARRAY) return 0;
+    return forge_json_pool[handle].array_val.len;
+}
+
+// json_array_get(handle, index) -> Int (handle)
+static inline int64_t forge_json_array_get(int64_t handle, int64_t index) {
+    if (handle < 0 || handle >= forge_json_pool_len) return -1;
+    if (forge_json_pool[handle].type != FORGE_JSON_ARRAY) return -1;
+    if (index < 0 || index >= forge_json_pool[handle].array_val.len) return -1;
+    return forge_json_pool[handle].array_val.items[index];
+}
+
+// json_object_get(handle, key) -> Int (handle, -1 if not found)
+static inline int64_t forge_json_object_get(int64_t handle, forge_string_t key) {
+    if (handle < 0 || handle >= forge_json_pool_len) return -1;
+    if (forge_json_pool[handle].type != FORGE_JSON_OBJECT) return -1;
+    for (int64_t i = 0; i < forge_json_pool[handle].object_val.len; i++) {
+        if (forge_string_eq(forge_json_pool[handle].object_val.keys[i], key))
+            return forge_json_pool[handle].object_val.vals[i];
+    }
+    return -1;
+}
+
+// json_object_has(handle, key) -> Bool
+static inline bool forge_json_object_has(int64_t handle, forge_string_t key) {
+    return forge_json_object_get(handle, key) >= 0;
+}
+
+// json_object_keys(handle) -> List[String]
+static inline forge_list_t forge_json_object_keys(int64_t handle) {
+    forge_list_t result = { .data = NULL, .len = 0 };
+    if (handle < 0 || handle >= forge_json_pool_len) return result;
+    if (forge_json_pool[handle].type != FORGE_JSON_OBJECT) return result;
+    for (int64_t i = 0; i < forge_json_pool[handle].object_val.len; i++) {
+        forge_list_push(&result, &forge_json_pool[handle].object_val.keys[i], sizeof(forge_string_t));
+    }
+    return result;
+}
+
+// --- json encoder ---
+
+static void forge_json_encode_impl(int64_t handle, char **buf, int64_t *len, int64_t *cap) {
+    // helper to append a character
+    #define JAPPEND_CHAR(ch) do { \
+        if (*len >= *cap) { \
+            *cap = *cap == 0 ? 256 : *cap * 2; \
+            *buf = (char *)realloc(*buf, (size_t)*cap); \
+            if (!*buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); } \
+        } \
+        (*buf)[(*len)++] = (ch); \
+    } while(0)
+    #define JAPPEND_STR(s, slen) do { \
+        while (*len + (slen) > *cap) { \
+            *cap = *cap == 0 ? 256 : *cap * 2; \
+            *buf = (char *)realloc(*buf, (size_t)*cap); \
+            if (!*buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); } \
+        } \
+        memcpy(*buf + *len, (s), (size_t)(slen)); \
+        *len += (slen); \
+    } while(0)
+
+    if (handle < 0 || handle >= forge_json_pool_len) {
+        JAPPEND_STR("null", 4);
+        return;
+    }
+    forge_json_node_t *node = &forge_json_pool[handle];
+    switch (node->type) {
+        case FORGE_JSON_NULL:
+            JAPPEND_STR("null", 4);
+            break;
+        case FORGE_JSON_BOOL:
+            if (node->bool_val) JAPPEND_STR("true", 4);
+            else JAPPEND_STR("false", 5);
+            break;
+        case FORGE_JSON_INT: {
+            char tmp[32];
+            int n = snprintf(tmp, sizeof(tmp), "%" PRId64, node->int_val);
+            JAPPEND_STR(tmp, n);
+            break;
+        }
+        case FORGE_JSON_FLOAT: {
+            char tmp[64];
+            int n = snprintf(tmp, sizeof(tmp), "%g", node->float_val);
+            JAPPEND_STR(tmp, n);
+            break;
+        }
+        case FORGE_JSON_STRING:
+            JAPPEND_CHAR('"');
+            for (int64_t i = 0; i < node->string_val.len; i++) {
+                char c = node->string_val.data[i];
+                switch (c) {
+                    case '"':  JAPPEND_CHAR('\\'); JAPPEND_CHAR('"'); break;
+                    case '\\': JAPPEND_CHAR('\\'); JAPPEND_CHAR('\\'); break;
+                    case '\n': JAPPEND_CHAR('\\'); JAPPEND_CHAR('n'); break;
+                    case '\r': JAPPEND_CHAR('\\'); JAPPEND_CHAR('r'); break;
+                    case '\t': JAPPEND_CHAR('\\'); JAPPEND_CHAR('t'); break;
+                    default: JAPPEND_CHAR(c); break;
+                }
+            }
+            JAPPEND_CHAR('"');
+            break;
+        case FORGE_JSON_ARRAY:
+            JAPPEND_CHAR('[');
+            for (int64_t i = 0; i < node->array_val.len; i++) {
+                if (i > 0) JAPPEND_CHAR(',');
+                forge_json_encode_impl(node->array_val.items[i], buf, len, cap);
+            }
+            JAPPEND_CHAR(']');
+            break;
+        case FORGE_JSON_OBJECT:
+            JAPPEND_CHAR('{');
+            for (int64_t i = 0; i < node->object_val.len; i++) {
+                if (i > 0) JAPPEND_CHAR(',');
+                JAPPEND_CHAR('"');
+                JAPPEND_STR(node->object_val.keys[i].data, node->object_val.keys[i].len);
+                JAPPEND_CHAR('"');
+                JAPPEND_CHAR(':');
+                forge_json_encode_impl(node->object_val.vals[i], buf, len, cap);
+            }
+            JAPPEND_CHAR('}');
+            break;
+    }
+    #undef JAPPEND_CHAR
+    #undef JAPPEND_STR
+}
+
+// json_encode(handle) -> String
+static inline forge_string_t forge_json_encode(int64_t handle) {
+    char *buf = NULL;
+    int64_t len = 0, cap = 0;
+    forge_json_encode_impl(handle, &buf, &len, &cap);
+    if (!buf) return forge_string_empty;
+    buf = (char *)realloc(buf, (size_t)len + 1);
+    buf[len] = '\0';
+    return (forge_string_t){ .data = buf, .len = len };
+}
+
+// --- json constructors (for building JSON from Forge) ---
+
+static inline int64_t forge_json_new_null(void) {
+    int64_t idx = forge_json_alloc();
+    forge_json_pool[idx].type = FORGE_JSON_NULL;
+    return idx;
+}
+
+static inline int64_t forge_json_new_bool(bool val) {
+    int64_t idx = forge_json_alloc();
+    forge_json_pool[idx].type = FORGE_JSON_BOOL;
+    forge_json_pool[idx].bool_val = val;
+    return idx;
+}
+
+static inline int64_t forge_json_new_int(int64_t val) {
+    int64_t idx = forge_json_alloc();
+    forge_json_pool[idx].type = FORGE_JSON_INT;
+    forge_json_pool[idx].int_val = val;
+    return idx;
+}
+
+static inline int64_t forge_json_new_float(double val) {
+    int64_t idx = forge_json_alloc();
+    forge_json_pool[idx].type = FORGE_JSON_FLOAT;
+    forge_json_pool[idx].float_val = val;
+    return idx;
+}
+
+static inline int64_t forge_json_new_string(forge_string_t val) {
+    int64_t idx = forge_json_alloc();
+    forge_json_pool[idx].type = FORGE_JSON_STRING;
+    forge_json_pool[idx].string_val = val;
+    return idx;
+}
+
+static inline int64_t forge_json_new_array(void) {
+    int64_t idx = forge_json_alloc();
+    forge_json_pool[idx].type = FORGE_JSON_ARRAY;
+    forge_json_pool[idx].array_val.items = NULL;
+    forge_json_pool[idx].array_val.len = 0;
+    return idx;
+}
+
+static inline void forge_json_array_push(int64_t handle, int64_t val) {
+    if (handle < 0 || handle >= forge_json_pool_len) return;
+    if (forge_json_pool[handle].type != FORGE_JSON_ARRAY) return;
+    int64_t new_len = forge_json_pool[handle].array_val.len + 1;
+    int64_t *new_items = (int64_t *)realloc(
+        forge_json_pool[handle].array_val.items, (size_t)new_len * sizeof(int64_t));
+    if (!new_items) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    new_items[new_len - 1] = val;
+    forge_json_pool[handle].array_val.items = new_items;
+    forge_json_pool[handle].array_val.len = new_len;
+}
+
+static inline int64_t forge_json_new_object(void) {
+    int64_t idx = forge_json_alloc();
+    forge_json_pool[idx].type = FORGE_JSON_OBJECT;
+    forge_json_pool[idx].object_val.keys = NULL;
+    forge_json_pool[idx].object_val.vals = NULL;
+    forge_json_pool[idx].object_val.len = 0;
+    return idx;
+}
+
+static inline void forge_json_object_set(int64_t handle, forge_string_t key, int64_t val) {
+    if (handle < 0 || handle >= forge_json_pool_len) return;
+    if (forge_json_pool[handle].type != FORGE_JSON_OBJECT) return;
+    // check if key already exists
+    for (int64_t i = 0; i < forge_json_pool[handle].object_val.len; i++) {
+        if (forge_string_eq(forge_json_pool[handle].object_val.keys[i], key)) {
+            forge_json_pool[handle].object_val.vals[i] = val;
+            return;
+        }
+    }
+    int64_t new_len = forge_json_pool[handle].object_val.len + 1;
+    forge_string_t *new_keys = (forge_string_t *)realloc(
+        forge_json_pool[handle].object_val.keys, (size_t)new_len * sizeof(forge_string_t));
+    int64_t *new_vals = (int64_t *)realloc(
+        forge_json_pool[handle].object_val.vals, (size_t)new_len * sizeof(int64_t));
+    if (!new_keys || !new_vals) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    new_keys[new_len - 1] = key;
+    new_vals[new_len - 1] = val;
+    forge_json_pool[handle].object_val.keys = new_keys;
+    forge_json_pool[handle].object_val.vals = new_vals;
+    forge_json_pool[handle].object_val.len = new_len;
+}
+
+// ---------------------------------------------------------------
+// file system operations
+// ---------------------------------------------------------------
+
+#include <sys/stat.h>
+#include <unistd.h>
+#include <dirent.h>
+
+// file_exists(path) -> Bool
+static inline bool forge_file_exists(forge_string_t path) {
+    char *cpath = (char *)malloc((size_t)path.len + 1);
+    if (!cpath) return false;
+    memcpy(cpath, path.data, (size_t)path.len);
+    cpath[path.len] = '\0';
+    int r = access(cpath, F_OK);
+    free(cpath);
+    return r == 0;
+}
+
+// dir_exists(path) -> Bool
+static inline bool forge_dir_exists(forge_string_t path) {
+    char *cpath = (char *)malloc((size_t)path.len + 1);
+    if (!cpath) return false;
+    memcpy(cpath, path.data, (size_t)path.len);
+    cpath[path.len] = '\0';
+    struct stat st;
+    int r = stat(cpath, &st);
+    free(cpath);
+    return r == 0 && S_ISDIR(st.st_mode);
+}
+
+// mkdir(path) -> Bool
+static inline bool forge_mkdir(forge_string_t path) {
+    char *cpath = (char *)malloc((size_t)path.len + 1);
+    if (!cpath) return false;
+    memcpy(cpath, path.data, (size_t)path.len);
+    cpath[path.len] = '\0';
+    int r = mkdir(cpath, 0755);
+    free(cpath);
+    return r == 0;
+}
+
+// remove_file(path) -> Bool
+static inline bool forge_remove_file(forge_string_t path) {
+    char *cpath = (char *)malloc((size_t)path.len + 1);
+    if (!cpath) return false;
+    memcpy(cpath, path.data, (size_t)path.len);
+    cpath[path.len] = '\0';
+    int r = unlink(cpath);
+    free(cpath);
+    return r == 0;
+}
+
+// rename_file(old, new) -> Bool
+static inline bool forge_rename_file(forge_string_t old_path, forge_string_t new_path) {
+    char *cold = (char *)malloc((size_t)old_path.len + 1);
+    char *cnew = (char *)malloc((size_t)new_path.len + 1);
+    if (!cold || !cnew) { free(cold); free(cnew); return false; }
+    memcpy(cold, old_path.data, (size_t)old_path.len);
+    cold[old_path.len] = '\0';
+    memcpy(cnew, new_path.data, (size_t)new_path.len);
+    cnew[new_path.len] = '\0';
+    int r = rename(cold, cnew);
+    free(cold);
+    free(cnew);
+    return r == 0;
+}
+
+// append_file(path, data) -> Bool
+static inline bool forge_append_file_impl(const char *path_data, int64_t path_len,
+                                           const char *data, int64_t data_len) {
+    char *path = (char *)malloc((size_t)path_len + 1);
+    if (!path) return false;
+    memcpy(path, path_data, (size_t)path_len);
+    path[path_len] = '\0';
+    FILE *f = fopen(path, "ab");
+    free(path);
+    if (!f) return false;
+    size_t written = fwrite(data, 1, (size_t)data_len, f);
+    fclose(f);
+    return written == (size_t)data_len;
+}
+
+// list_dir(path) -> List[String]
+static inline forge_list_t forge_list_dir(forge_string_t path) {
+    forge_list_t result = { .data = NULL, .len = 0 };
+    char *cpath = (char *)malloc((size_t)path.len + 1);
+    if (!cpath) return result;
+    memcpy(cpath, path.data, (size_t)path.len);
+    cpath[path.len] = '\0';
+    DIR *d = opendir(cpath);
+    free(cpath);
+    if (!d) return result;
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        // skip . and ..
+        if (entry->d_name[0] == '.' &&
+            (entry->d_name[1] == '\0' ||
+             (entry->d_name[1] == '.' && entry->d_name[2] == '\0')))
+            continue;
+        int64_t nlen = (int64_t)strlen(entry->d_name);
+        char *buf = (char *)malloc((size_t)nlen + 1);
+        if (!buf) continue;
+        memcpy(buf, entry->d_name, (size_t)nlen + 1);
+        forge_string_t s = { .data = buf, .len = nlen };
+        forge_list_push(&result, &s, sizeof(forge_string_t));
+    }
+    closedir(d);
+    return result;
 }
 
 // ---------------------------------------------------------------

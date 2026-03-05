@@ -1119,6 +1119,20 @@ pub const CEmitter = struct {
             \\
         );
 
+        // append_file(String, String) -> Bool!
+        try self.writeStr(
+            \\static forge_result_bool forge_append_file(forge_string_t path, forge_string_t data) {
+            \\    if (forge_append_file_impl(path.data, path.len, data.data, data.len)) {
+            \\        forge_result_bool r; r.is_ok = true; r.ok = true;
+            \\        return r;
+            \\    }
+            \\    forge_result_bool r; r.is_ok = false;
+            \\    r.err = FORGE_STRING_LIT("failed to append to file");
+            \\    return r;
+            \\}
+            \\
+        );
+
         try self.writeByte('\n');
     }
 
@@ -1861,13 +1875,22 @@ pub const CEmitter = struct {
         try self.writeIndent();
         if (rs.value) |val| {
             if (self.isResultType(self.current_fn_return)) {
-                // result-returning function: wrap in ok result
-                const ret_c = self.cTypeStringForId(self.current_fn_return);
-                try self.writeStr("return (");
-                try self.writeStr(ret_c);
-                try self.writeStr("){ .is_ok = true, .ok = ");
-                try self.emitExpr(val);
-                try self.writeStr(" };\n");
+                // check if the expression already returns the same result type —
+                // if so, return it directly without wrapping
+                const val_type = self.inferExprType(val);
+                if (val_type == self.current_fn_return) {
+                    try self.writeStr("return ");
+                    try self.emitExpr(val);
+                    try self.writeStr(";\n");
+                } else {
+                    // result-returning function: wrap in ok result
+                    const ret_c = self.cTypeStringForId(self.current_fn_return);
+                    try self.writeStr("return (");
+                    try self.writeStr(ret_c);
+                    try self.writeStr("){ .is_ok = true, .ok = ");
+                    try self.emitExpr(val);
+                    try self.writeStr(" };\n");
+                }
             } else if (self.isOptionalType(self.current_fn_return)) {
                 // optional-returning function: check if returning None or a value
                 if (val.kind == .none_lit) {
@@ -2497,7 +2520,44 @@ pub const CEmitter = struct {
             std.mem.eql(u8, name, "log_info") or
             std.mem.eql(u8, name, "log_warn") or
             std.mem.eql(u8, name, "log_error") or
-            std.mem.eql(u8, name, "log_debug"))
+            std.mem.eql(u8, name, "log_debug") or
+            std.mem.eql(u8, name, "file_exists") or
+            std.mem.eql(u8, name, "dir_exists") or
+            std.mem.eql(u8, name, "mkdir") or
+            std.mem.eql(u8, name, "remove_file") or
+            std.mem.eql(u8, name, "rename_file") or
+            std.mem.eql(u8, name, "append_file") or
+            std.mem.eql(u8, name, "list_dir") or
+            std.mem.eql(u8, name, "math_pow") or
+            std.mem.eql(u8, name, "math_sqrt") or
+            std.mem.eql(u8, name, "math_floor") or
+            std.mem.eql(u8, name, "math_ceil") or
+            std.mem.eql(u8, name, "math_round") or
+            std.mem.eql(u8, name, "fmt_hex") or
+            std.mem.eql(u8, name, "fmt_oct") or
+            std.mem.eql(u8, name, "fmt_bin") or
+            std.mem.eql(u8, name, "fmt_float") or
+            std.mem.eql(u8, name, "json_parse") or
+            std.mem.eql(u8, name, "json_type") or
+            std.mem.eql(u8, name, "json_get_bool") or
+            std.mem.eql(u8, name, "json_get_int") or
+            std.mem.eql(u8, name, "json_get_float") or
+            std.mem.eql(u8, name, "json_get_string") or
+            std.mem.eql(u8, name, "json_array_len") or
+            std.mem.eql(u8, name, "json_array_get") or
+            std.mem.eql(u8, name, "json_object_get") or
+            std.mem.eql(u8, name, "json_object_has") or
+            std.mem.eql(u8, name, "json_object_keys") or
+            std.mem.eql(u8, name, "json_encode") or
+            std.mem.eql(u8, name, "json_new_null") or
+            std.mem.eql(u8, name, "json_new_bool") or
+            std.mem.eql(u8, name, "json_new_int") or
+            std.mem.eql(u8, name, "json_new_float") or
+            std.mem.eql(u8, name, "json_new_string") or
+            std.mem.eql(u8, name, "json_new_array") or
+            std.mem.eql(u8, name, "json_new_object") or
+            std.mem.eql(u8, name, "json_array_push") or
+            std.mem.eql(u8, name, "json_object_set"))
         {
             try self.writeStr("forge_");
             try self.writeStr(name);
@@ -2760,11 +2820,13 @@ pub const CEmitter = struct {
             return;
         }
 
-        // one-arg runtime functions: contains, starts_with, ends_with, split
+        // one-arg string->string/bool: contains, starts_with, ends_with, split, index_of, last_index_of
         if (std.mem.eql(u8, method, "contains") or
             std.mem.eql(u8, method, "starts_with") or
             std.mem.eql(u8, method, "ends_with") or
-            std.mem.eql(u8, method, "split"))
+            std.mem.eql(u8, method, "split") or
+            std.mem.eql(u8, method, "index_of") or
+            std.mem.eql(u8, method, "last_index_of"))
         {
             try self.writeStr("forge_string_");
             try self.writeStr(method);
@@ -2776,10 +2838,11 @@ pub const CEmitter = struct {
             return;
         }
 
-        // no-arg runtime functions: trim, to_upper, to_lower
+        // no-arg runtime functions: trim, to_upper, to_lower, chars
         if (std.mem.eql(u8, method, "trim") or
             std.mem.eql(u8, method, "to_upper") or
-            std.mem.eql(u8, method, "to_lower"))
+            std.mem.eql(u8, method, "to_lower") or
+            std.mem.eql(u8, method, "chars"))
         {
             try self.writeStr("forge_string_");
             try self.writeStr(method);
@@ -2789,8 +2852,28 @@ pub const CEmitter = struct {
             return;
         }
 
-        // two-arg string methods: substring(start, end), replace(old, new)
-        if (std.mem.eql(u8, method, "substring") or std.mem.eql(u8, method, "replace")) {
+        // is_empty() → inline check
+        if (std.mem.eql(u8, method, "is_empty")) {
+            try self.writeByte('(');
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(".len == 0)");
+            return;
+        }
+
+        // repeat(Int) -> String
+        if (std.mem.eql(u8, method, "repeat")) {
+            try self.writeStr("forge_string_repeat(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[0].value);
+            try self.writeByte(')');
+            return;
+        }
+
+        // two-arg string methods: substring, replace, pad_left, pad_right
+        if (std.mem.eql(u8, method, "substring") or std.mem.eql(u8, method, "replace") or
+            std.mem.eql(u8, method, "pad_left") or std.mem.eql(u8, method, "pad_right"))
+        {
             try self.writeStr("forge_string_");
             try self.writeStr(method);
             try self.writeByte('(');
@@ -2980,6 +3063,52 @@ pub const CEmitter = struct {
             try self.emitExpr(mc.receiver);
             try self.writeStr(", ");
             try self.emitExpr(mc.args[0].value);
+            try self.writeByte(')');
+            return true;
+        }
+        // index_of(T) -> Int
+        if (std.mem.eql(u8, method, "index_of") and mc.args.len == 1) {
+            if (elem_type == .string) {
+                try self.writeStr("forge_list_index_of_string(");
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(", ");
+                try self.emitExpr(mc.args[0].value);
+                try self.writeByte(')');
+            } else {
+                try self.writeStr("forge_list_index_of(");
+                try self.emitExpr(mc.receiver);
+                try self.writeStr(", &(");
+                try self.writeStr(c_type);
+                try self.writeStr("){");
+                try self.emitExpr(mc.args[0].value);
+                try self.writeStr("}, sizeof(");
+                try self.writeStr(c_type);
+                try self.writeStr("))");
+            }
+            return true;
+        }
+        // slice(Int, Int) -> List[T]
+        if (std.mem.eql(u8, method, "slice") and mc.args.len == 2) {
+            try self.writeStr("forge_list_slice(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[0].value);
+            try self.writeStr(", ");
+            try self.emitExpr(mc.args[1].value);
+            try self.writeStr(", sizeof(");
+            try self.writeStr(c_type);
+            try self.writeStr("))");
+            return true;
+        }
+        // sort() -> List[T]
+        if (std.mem.eql(u8, method, "sort")) {
+            const tag: []const u8 = if (elem_type == .int) "0" else if (elem_type == .float) "1" else "2";
+            try self.writeStr("forge_list_sort(");
+            try self.emitExpr(mc.receiver);
+            try self.writeStr(", sizeof(");
+            try self.writeStr(c_type);
+            try self.writeStr("), ");
+            try self.writeStr(tag);
             try self.writeByte(')');
             return true;
         }
@@ -3190,12 +3319,18 @@ pub const CEmitter = struct {
         if (std.mem.eql(u8, method, "contains")) return .bool;
         if (std.mem.eql(u8, method, "starts_with")) return .bool;
         if (std.mem.eql(u8, method, "ends_with")) return .bool;
+        if (std.mem.eql(u8, method, "is_empty")) return .bool;
+        if (std.mem.eql(u8, method, "index_of")) return .int;
+        if (std.mem.eql(u8, method, "last_index_of")) return .int;
         if (std.mem.eql(u8, method, "trim")) return .string;
         if (std.mem.eql(u8, method, "to_upper")) return .string;
         if (std.mem.eql(u8, method, "to_lower")) return .string;
         if (std.mem.eql(u8, method, "substring")) return .string;
         if (std.mem.eql(u8, method, "replace")) return .string;
-        if (std.mem.eql(u8, method, "split")) {
+        if (std.mem.eql(u8, method, "repeat")) return .string;
+        if (std.mem.eql(u8, method, "pad_left")) return .string;
+        if (std.mem.eql(u8, method, "pad_right")) return .string;
+        if (std.mem.eql(u8, method, "split") or std.mem.eql(u8, method, "chars")) {
             return self.type_table.lookup("List[String]") orelse .err;
         }
         return .err;
@@ -3220,13 +3355,19 @@ pub const CEmitter = struct {
         if (std.mem.eql(u8, method, "len")) return .int;
         if (std.mem.eql(u8, method, "is_empty")) return .bool;
         if (std.mem.eql(u8, method, "contains")) return .bool;
+        if (std.mem.eql(u8, method, "index_of")) return .int;
         if (std.mem.eql(u8, method, "push") or
             std.mem.eql(u8, method, "remove") or
             std.mem.eql(u8, method, "reverse") or
             std.mem.eql(u8, method, "clear")) return .void;
         if (std.mem.eql(u8, method, "join")) return .string;
-        _ = self;
-        _ = elem_type;
+        // slice and sort return the same list type
+        if (std.mem.eql(u8, method, "slice") or std.mem.eql(u8, method, "sort")) {
+            const elem_name = self.type_table.typeName(elem_type);
+            var buf: [128]u8 = undefined;
+            const lookup_name = std.fmt.bufPrint(&buf, "List[{s}]", .{elem_name}) catch return null;
+            return self.type_table.lookup(lookup_name);
+        }
         return null;
     }
 

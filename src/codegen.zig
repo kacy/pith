@@ -890,6 +890,21 @@ pub const CEmitter = struct {
             \\
         );
 
+        // exec_output(String) -> String!
+        try self.writeStr(
+            \\static forge_result_forge_string_t forge_exec_output(forge_string_t cmd) {
+            \\    forge_string_t output;
+            \\    if (forge_exec_output_impl(cmd, &output)) {
+            \\        forge_result_forge_string_t r; r.is_ok = true; r.ok = output;
+            \\        return r;
+            \\    }
+            \\    forge_result_forge_string_t r; r.is_ok = false;
+            \\    r.err = FORGE_STRING_LIT("failed to execute command");
+            \\    return r;
+            \\}
+            \\
+        );
+
         try self.writeByte('\n');
     }
 
@@ -2235,7 +2250,13 @@ pub const CEmitter = struct {
             std.mem.eql(u8, name, "read_file") or
             std.mem.eql(u8, name, "write_file") or
             std.mem.eql(u8, name, "env") or
-            std.mem.eql(u8, name, "chr"))
+            std.mem.eql(u8, name, "chr") or
+            std.mem.eql(u8, name, "exec_output") or
+            std.mem.eql(u8, name, "time") or
+            std.mem.eql(u8, name, "sleep") or
+            std.mem.eql(u8, name, "random_int") or
+            std.mem.eql(u8, name, "random_float") or
+            std.mem.eql(u8, name, "input"))
         {
             try self.writeStr("forge_");
             try self.writeStr(name);

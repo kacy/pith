@@ -46,6 +46,30 @@ static inline forge_string_t forge_string_from(const char *data, int64_t len) {
 static const forge_string_t forge_string_empty = { .data = "", .len = 0 };
 
 // ---------------------------------------------------------------
+// string helpers — reduce malloc+memcpy+null-terminate boilerplate
+// ---------------------------------------------------------------
+
+// allocate a string buffer of the given length (+1 for null).
+// exits on OOM — safe to use without checking the return value.
+static inline char *forge_str_alloc(int64_t len) {
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) {
+        fprintf(stderr, "forge: out of memory\n");
+        exit(1);
+    }
+    return buf;
+}
+
+// convert a forge_string_t to a null-terminated C string.
+// the caller is responsible for freeing the returned pointer.
+static inline char *forge_cstr(forge_string_t s) {
+    char *buf = forge_str_alloc(s.len);
+    memcpy(buf, s.data, (size_t)s.len);
+    buf[s.len] = '\0';
+    return buf;
+}
+
+// ---------------------------------------------------------------
 // string operations
 // ---------------------------------------------------------------
 
@@ -55,11 +79,7 @@ static inline forge_string_t forge_string_concat(forge_string_t a, forge_string_
         exit(1);
     }
     int64_t new_len = a.len + b.len;
-    char *buf = (char *)malloc((size_t)new_len + 1);
-    if (!buf) {
-        fprintf(stderr, "forge: out of memory\n");
-        exit(1);
-    }
+    char *buf = forge_str_alloc(new_len);
     memcpy(buf, a.data, (size_t)a.len);
     memcpy(buf + a.len, b.data, (size_t)b.len);
     buf[new_len] = '\0';
@@ -129,8 +149,7 @@ static inline forge_string_t forge_string_trim(forge_string_t s) {
 }
 
 static inline forge_string_t forge_string_to_upper(forge_string_t s) {
-    char *buf = (char *)malloc((size_t)s.len + 1);
-    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    char *buf = forge_str_alloc(s.len);
     for (int64_t i = 0; i < s.len; i++) {
         char c = s.data[i];
         buf[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
@@ -140,8 +159,7 @@ static inline forge_string_t forge_string_to_upper(forge_string_t s) {
 }
 
 static inline forge_string_t forge_string_to_lower(forge_string_t s) {
-    char *buf = (char *)malloc((size_t)s.len + 1);
-    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    char *buf = forge_str_alloc(s.len);
     for (int64_t i = 0; i < s.len; i++) {
         char c = s.data[i];
         buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
@@ -155,8 +173,7 @@ static inline forge_string_t forge_string_substring(forge_string_t s, int64_t st
     if (end > s.len) end = s.len;
     if (start >= end) return forge_string_empty;
     int64_t new_len = end - start;
-    char *buf = (char *)malloc((size_t)new_len + 1);
-    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    char *buf = forge_str_alloc(new_len);
     memcpy(buf, s.data + start, (size_t)new_len);
     buf[new_len] = '\0';
     return (forge_string_t){ .data = buf, .len = new_len };
@@ -168,8 +185,7 @@ static inline forge_string_t forge_string_char_at(forge_string_t s, int64_t inde
         fprintf(stderr, "forge: string index out of bounds (index %" PRId64 ", length %" PRId64 ")\n", index, s.len);
         exit(1);
     }
-    char *buf = (char *)malloc(2);
-    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    char *buf = forge_str_alloc(1);
     buf[0] = s.data[index];
     buf[1] = '\0';
     return (forge_string_t){ .data = buf, .len = 1 };
@@ -177,8 +193,7 @@ static inline forge_string_t forge_string_char_at(forge_string_t s, int64_t inde
 
 // chr(Int) -> String: return a single-character string for the given ASCII code.
 static inline forge_string_t forge_chr(int64_t code) {
-    char *buf = (char *)malloc(2);
-    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    char *buf = forge_str_alloc(1);
     buf[0] = (char)(code & 0xFF);
     buf[1] = '\0';
     return (forge_string_t){ .data = buf, .len = 1 };
@@ -188,8 +203,7 @@ static inline forge_string_t forge_chr(int64_t code) {
 static inline forge_string_t forge_string_replace(forge_string_t s, forge_string_t old, forge_string_t new_s) {
     if (old.len == 0) {
         // empty pattern — return a copy
-        char *buf = (char *)malloc((size_t)s.len + 1);
-        if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        char *buf = forge_str_alloc(s.len);
         memcpy(buf, s.data, (size_t)s.len);
         buf[s.len] = '\0';
         return (forge_string_t){ .data = buf, .len = s.len };
@@ -203,16 +217,14 @@ static inline forge_string_t forge_string_replace(forge_string_t s, forge_string
         }
     }
     if (count == 0) {
-        char *buf = (char *)malloc((size_t)s.len + 1);
-        if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        char *buf = forge_str_alloc(s.len);
         memcpy(buf, s.data, (size_t)s.len);
         buf[s.len] = '\0';
         return (forge_string_t){ .data = buf, .len = s.len };
     }
     // second pass: build result
     int64_t new_len = s.len + count * (new_s.len - old.len);
-    char *buf = (char *)malloc((size_t)new_len + 1);
-    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    char *buf = forge_str_alloc(new_len);
     int64_t pos = 0;
     for (int64_t i = 0; i < s.len; ) {
         if (i + old.len <= s.len && memcmp(s.data + i, old.data, (size_t)old.len) == 0) {
@@ -312,11 +324,7 @@ static inline forge_string_t forge_string_pad_right(forge_string_t s, int64_t wi
 static inline forge_string_t forge_int_to_string(int64_t n) {
     char buf[32];
     int len = snprintf(buf, sizeof(buf), "%" PRId64, n);
-    char *result = (char *)malloc((size_t)len + 1);
-    if (!result) {
-        fprintf(stderr, "forge: out of memory\n");
-        exit(1);
-    }
+    char *result = forge_str_alloc(len);
     memcpy(result, buf, (size_t)len + 1);
     return (forge_string_t){ .data = result, .len = len };
 }
@@ -324,11 +332,7 @@ static inline forge_string_t forge_int_to_string(int64_t n) {
 static inline forge_string_t forge_float_to_string(double n) {
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "%g", n);
-    char *result = (char *)malloc((size_t)len + 1);
-    if (!result) {
-        fprintf(stderr, "forge: out of memory\n");
-        exit(1);
-    }
+    char *result = forge_str_alloc(len);
     memcpy(result, buf, (size_t)len + 1);
     return (forge_string_t){ .data = result, .len = len };
 }
@@ -1134,12 +1138,7 @@ static inline forge_list_t forge_get_args(void) {
 // read an entire file into a string. returns false on error.
 static inline bool forge_read_file_impl(const char *path_data, int64_t path_len,
                                          forge_string_t *out) {
-    // null-terminate path for fopen
-    char *path = (char *)malloc((size_t)path_len + 1);
-    if (!path) return false;
-    memcpy(path, path_data, (size_t)path_len);
-    path[path_len] = '\0';
-
+    char *path = forge_cstr((forge_string_t){ .data = path_data, .len = path_len });
     FILE *f = fopen(path, "rb");
     free(path);
     if (!f) return false;
@@ -1165,11 +1164,7 @@ static inline bool forge_read_file_impl(const char *path_data, int64_t path_len,
 // write a string to a file. returns false on error.
 static inline bool forge_write_file_impl(const char *path_data, int64_t path_len,
                                           const char *data, int64_t data_len) {
-    char *path = (char *)malloc((size_t)path_len + 1);
-    if (!path) return false;
-    memcpy(path, path_data, (size_t)path_len);
-    path[path_len] = '\0';
-
+    char *path = forge_cstr((forge_string_t){ .data = path_data, .len = path_len });
     FILE *f = fopen(path, "wb");
     free(path);
     if (!f) return false;
@@ -1182,11 +1177,7 @@ static inline bool forge_write_file_impl(const char *path_data, int64_t path_len
 // environment variable lookup. returns false if not set.
 static inline bool forge_env_impl(const char *name_data, int64_t name_len,
                                    forge_string_t *out) {
-    char *name = (char *)malloc((size_t)name_len + 1);
-    if (!name) return false;
-    memcpy(name, name_data, (size_t)name_len);
-    name[name_len] = '\0';
-
+    char *name = forge_cstr((forge_string_t){ .data = name_data, .len = name_len });
     const char *val = getenv(name);
     free(name);
     if (!val) return false;
@@ -1213,10 +1204,7 @@ static inline void forge_print(forge_string_t s) {
 }
 
 static inline int64_t forge_exec(forge_string_t cmd) {
-    char *cstr = (char *)malloc((size_t)cmd.len + 1);
-    if (!cstr) return -1;
-    memcpy(cstr, cmd.data, (size_t)cmd.len);
-    cstr[cmd.len] = '\0';
+    char *cstr = forge_cstr(cmd);
     int result = system(cstr);
     free(cstr);
 #ifdef _WIN32
@@ -1271,11 +1259,7 @@ static inline double forge_random_float(void) {
 // exec_output — internal impl, returns false on error.
 // codegen emits a wrapper that returns forge_result_forge_string_t.
 static inline bool forge_exec_output_impl(forge_string_t cmd, forge_string_t *out) {
-    char *cstr = (char *)malloc((size_t)cmd.len + 1);
-    if (!cstr) return false;
-    memcpy(cstr, cmd.data, (size_t)cmd.len);
-    cstr[cmd.len] = '\0';
-
+    char *cstr = forge_cstr(cmd);
     FILE *fp = popen(cstr, "r");
     free(cstr);
     if (!fp) return false;
@@ -1959,10 +1943,7 @@ static inline void forge_json_object_set(int64_t handle, forge_string_t key, int
 
 // file_exists(path) -> Bool
 static inline bool forge_file_exists(forge_string_t path) {
-    char *cpath = (char *)malloc((size_t)path.len + 1);
-    if (!cpath) return false;
-    memcpy(cpath, path.data, (size_t)path.len);
-    cpath[path.len] = '\0';
+    char *cpath = forge_cstr(path);
     int r = access(cpath, F_OK);
     free(cpath);
     return r == 0;
@@ -1970,10 +1951,7 @@ static inline bool forge_file_exists(forge_string_t path) {
 
 // dir_exists(path) -> Bool
 static inline bool forge_dir_exists(forge_string_t path) {
-    char *cpath = (char *)malloc((size_t)path.len + 1);
-    if (!cpath) return false;
-    memcpy(cpath, path.data, (size_t)path.len);
-    cpath[path.len] = '\0';
+    char *cpath = forge_cstr(path);
     struct stat st;
     int r = stat(cpath, &st);
     free(cpath);
@@ -1982,10 +1960,7 @@ static inline bool forge_dir_exists(forge_string_t path) {
 
 // mkdir(path) -> Bool
 static inline bool forge_mkdir(forge_string_t path) {
-    char *cpath = (char *)malloc((size_t)path.len + 1);
-    if (!cpath) return false;
-    memcpy(cpath, path.data, (size_t)path.len);
-    cpath[path.len] = '\0';
+    char *cpath = forge_cstr(path);
     int r = mkdir(cpath, 0755);
     free(cpath);
     return r == 0;
@@ -1993,10 +1968,7 @@ static inline bool forge_mkdir(forge_string_t path) {
 
 // remove_file(path) -> Bool
 static inline bool forge_remove_file(forge_string_t path) {
-    char *cpath = (char *)malloc((size_t)path.len + 1);
-    if (!cpath) return false;
-    memcpy(cpath, path.data, (size_t)path.len);
-    cpath[path.len] = '\0';
+    char *cpath = forge_cstr(path);
     int r = unlink(cpath);
     free(cpath);
     return r == 0;
@@ -2004,13 +1976,8 @@ static inline bool forge_remove_file(forge_string_t path) {
 
 // rename_file(old, new) -> Bool
 static inline bool forge_rename_file(forge_string_t old_path, forge_string_t new_path) {
-    char *cold = (char *)malloc((size_t)old_path.len + 1);
-    char *cnew = (char *)malloc((size_t)new_path.len + 1);
-    if (!cold || !cnew) { free(cold); free(cnew); return false; }
-    memcpy(cold, old_path.data, (size_t)old_path.len);
-    cold[old_path.len] = '\0';
-    memcpy(cnew, new_path.data, (size_t)new_path.len);
-    cnew[new_path.len] = '\0';
+    char *cold = forge_cstr(old_path);
+    char *cnew = forge_cstr(new_path);
     int r = rename(cold, cnew);
     free(cold);
     free(cnew);
@@ -2020,10 +1987,7 @@ static inline bool forge_rename_file(forge_string_t old_path, forge_string_t new
 // append_file(path, data) -> Bool
 static inline bool forge_append_file_impl(const char *path_data, int64_t path_len,
                                            const char *data, int64_t data_len) {
-    char *path = (char *)malloc((size_t)path_len + 1);
-    if (!path) return false;
-    memcpy(path, path_data, (size_t)path_len);
-    path[path_len] = '\0';
+    char *path = forge_cstr((forge_string_t){ .data = path_data, .len = path_len });
     FILE *f = fopen(path, "ab");
     free(path);
     if (!f) return false;
@@ -2035,10 +1999,7 @@ static inline bool forge_append_file_impl(const char *path_data, int64_t path_le
 // list_dir(path) -> List[String]
 static inline forge_list_t forge_list_dir(forge_string_t path) {
     forge_list_t result = { .data = NULL, .len = 0 };
-    char *cpath = (char *)malloc((size_t)path.len + 1);
-    if (!cpath) return result;
-    memcpy(cpath, path.data, (size_t)path.len);
-    cpath[path.len] = '\0';
+    char *cpath = forge_cstr(path);
     DIR *d = opendir(cpath);
     free(cpath);
     if (!d) return result;

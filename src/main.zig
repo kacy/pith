@@ -25,6 +25,7 @@ comptime {
     _ = @import("io.zig");
     _ = @import("types.zig");
     _ = @import("checker.zig");
+    _ = @import("checker_test.zig");
     _ = @import("codegen.zig");
     _ = @import("formatter.zig");
     _ = @import("lint.zig");

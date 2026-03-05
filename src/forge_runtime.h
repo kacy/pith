@@ -1155,6 +1155,91 @@ static inline forge_string_t forge_input(void) {
 }
 
 // ---------------------------------------------------------------
+// path manipulation — pure string operations
+// ---------------------------------------------------------------
+
+// join two path segments with /
+static inline forge_string_t forge_path_join(forge_string_t a, forge_string_t b) {
+    if (a.len == 0) return b;
+    if (b.len == 0) return a;
+    // strip trailing / from a
+    int64_t alen = a.len;
+    while (alen > 0 && a.data[alen - 1] == '/') alen--;
+    // strip leading / from b
+    const char *bdata = b.data;
+    int64_t blen = b.len;
+    while (blen > 0 && *bdata == '/') { bdata++; blen--; }
+    int64_t total = alen + 1 + blen;
+    char *buf = (char *)malloc((size_t)total + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, a.data, (size_t)alen);
+    buf[alen] = '/';
+    memcpy(buf + alen + 1, bdata, (size_t)blen);
+    buf[total] = '\0';
+    return (forge_string_t){ .data = buf, .len = total };
+}
+
+// directory component: "/foo/bar.txt" -> "/foo"
+static inline forge_string_t forge_path_dir(forge_string_t path) {
+    int64_t i = path.len - 1;
+    while (i >= 0 && path.data[i] != '/') i--;
+    if (i < 0) return FORGE_STRING_LIT(".");
+    if (i == 0) return FORGE_STRING_LIT("/");
+    char *buf = (char *)malloc((size_t)i + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, path.data, (size_t)i);
+    buf[i] = '\0';
+    return (forge_string_t){ .data = buf, .len = i };
+}
+
+// base name: "/foo/bar.txt" -> "bar.txt"
+static inline forge_string_t forge_path_base(forge_string_t path) {
+    int64_t i = path.len - 1;
+    while (i >= 0 && path.data[i] != '/') i--;
+    int64_t start = i + 1;
+    int64_t len = path.len - start;
+    if (len == 0) return FORGE_STRING_LIT("");
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, path.data + start, (size_t)len);
+    buf[len] = '\0';
+    return (forge_string_t){ .data = buf, .len = len };
+}
+
+// file extension: "/foo/bar.txt" -> ".txt"
+static inline forge_string_t forge_path_ext(forge_string_t path) {
+    // search from end, stop at / boundary
+    int64_t i = path.len - 1;
+    while (i >= 0 && path.data[i] != '.' && path.data[i] != '/') i--;
+    if (i < 0 || path.data[i] == '/') return FORGE_STRING_LIT("");
+    int64_t len = path.len - i;
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, path.data + i, (size_t)len);
+    buf[len] = '\0';
+    return (forge_string_t){ .data = buf, .len = len };
+}
+
+// stem: "/foo/bar.txt" -> "bar"
+static inline forge_string_t forge_path_stem(forge_string_t path) {
+    // find base first
+    int64_t slash = path.len - 1;
+    while (slash >= 0 && path.data[slash] != '/') slash--;
+    int64_t start = slash + 1;
+    // find last dot in base
+    int64_t dot = path.len - 1;
+    while (dot > start && path.data[dot] != '.') dot--;
+    int64_t end = (dot > start) ? dot : path.len;
+    int64_t len = end - start;
+    if (len == 0) return FORGE_STRING_LIT("");
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(buf, path.data + start, (size_t)len);
+    buf[len] = '\0';
+    return (forge_string_t){ .data = buf, .len = len };
+}
+
+// ---------------------------------------------------------------
 // concurrency — task header and sync primitives
 // ---------------------------------------------------------------
 

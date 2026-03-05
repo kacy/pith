@@ -1955,6 +1955,20 @@ fn g_emit_call(node_idx: Int):
     if name == "input":
         g_write("forge_input()")
         return
+    if name == "path_join":
+        g_write("forge_path_join(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 1))
+        g_write(")")
+        return
+    if name == "path_dir" or name == "path_base" or name == "path_ext" or name == "path_stem":
+        g_write("forge_")
+        g_write(name)
+        g_write("(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(")")
+        return
     # sync primitive constructors
     if name == "Mutex":
         g_write("forge_mutex_create()")

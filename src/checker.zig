@@ -337,6 +337,23 @@ pub const Checker = struct {
         } });
         try self.module_scope.define("input", .{ .type_id = input_type, .is_mut = false });
 
+        // path_join(String, String) -> String
+        const path_join_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .string, .string },
+            .return_type = .string,
+        } });
+        try self.module_scope.define("path_join", .{ .type_id = path_join_type, .is_mut = false });
+
+        // path_dir, path_base, path_ext, path_stem: (String) -> String
+        const path_str_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.string},
+            .return_type = .string,
+        } });
+        try self.module_scope.define("path_dir", .{ .type_id = path_str_type, .is_mut = false });
+        try self.module_scope.define("path_base", .{ .type_id = path_str_type, .is_mut = false });
+        try self.module_scope.define("path_ext", .{ .type_id = path_str_type, .is_mut = false });
+        try self.module_scope.define("path_stem", .{ .type_id = path_str_type, .is_mut = false });
+
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});
         try self.registerSyncType("WaitGroup", &.{});

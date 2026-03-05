@@ -2488,7 +2488,12 @@ pub const CEmitter = struct {
             std.mem.eql(u8, name, "sleep") or
             std.mem.eql(u8, name, "random_int") or
             std.mem.eql(u8, name, "random_float") or
-            std.mem.eql(u8, name, "input"))
+            std.mem.eql(u8, name, "input") or
+            std.mem.eql(u8, name, "path_join") or
+            std.mem.eql(u8, name, "path_dir") or
+            std.mem.eql(u8, name, "path_base") or
+            std.mem.eql(u8, name, "path_ext") or
+            std.mem.eql(u8, name, "path_stem"))
         {
             try self.writeStr("forge_");
             try self.writeStr(name);

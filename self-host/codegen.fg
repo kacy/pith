@@ -1542,6 +1542,32 @@ fn g_emit_while_stmt(node_idx: Int):
     g_write_indent()
     g_write(RB + "\n")
 
+fn g_emit_for_loop_body(node: Node, idx_name: String, elem_name: String, comma_pos: Int, elem_c: String, elem_tid: Int, is_map: Bool):
+    # shared loop structure for list, map, and set iteration.
+    # list/set use FORGE_LIST_GET; map uses cast into .keys array.
+    g_write_indent()
+    g_write("for (int64_t " + idx_name + " = 0; " + idx_name + " < ")
+    g_emit_expr(node.children[0])
+    g_write(".len; " + idx_name + "++) " + LB + "\n")
+    g_indent = g_indent + 1
+    g_write_indent()
+    g_write(elem_c + " " + elem_name + " = ")
+    if is_map:
+        g_write("((" + elem_c + " *)")
+        g_emit_expr(node.children[0])
+        g_write(".keys)[" + idx_name + "];\n")
+    else:
+        g_write("FORGE_LIST_GET(")
+        g_emit_expr(node.children[0])
+        g_write(", " + elem_c + ", " + idx_name + ");\n")
+    g_local_types.insert(elem_name, elem_tid)
+    if comma_pos >= 0:
+        g_local_types.insert(idx_name, TID_INT)
+    g_emit_block(node.children[1])
+    g_indent = g_indent - 1
+    g_write_indent()
+    g_write(RB + "\n")
+
 fn g_emit_for_stmt(node_idx: Int):
     node := get_node(node_idx)
     # node.value is the binding name (e.g., "item" or "item,idx")
@@ -1576,102 +1602,15 @@ fn g_emit_for_stmt(node_idx: Int):
     iter_info := tt_get(iter_tid)
 
     if iter_info.kind == "list":
-        elem_c := g_c_type_string(iter_info.inner)
-        g_write_indent()
-        g_write("for (int64_t ")
-        g_write(idx_name)
-        g_write(" = 0; ")
-        g_write(idx_name)
-        g_write(" < ")
-        g_emit_expr(node.children[0])
-        g_write(".len; ")
-        g_write(idx_name)
-        g_write("++) " + LB + "\n")
-        g_indent = g_indent + 1
-        g_write_indent()
-        g_write(elem_c)
-        g_write(" ")
-        g_write(elem_name)
-        g_write(" = FORGE_LIST_GET(")
-        g_emit_expr(node.children[0])
-        g_write(", ")
-        g_write(elem_c)
-        g_write(", ")
-        g_write(idx_name)
-        g_write(");\n")
-        g_local_types.insert(elem_name, iter_info.inner)
-        if comma_pos >= 0:
-            g_local_types.insert(idx_name, TID_INT)
-        g_emit_block(node.children[1])
-        g_indent = g_indent - 1
-        g_write_indent()
-        g_write(RB + "\n")
+        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.inner), iter_info.inner, false)
         return
 
     if iter_info.kind == "map":
-        key_c := g_c_type_string(iter_info.key_type)
-        g_write_indent()
-        g_write("for (int64_t ")
-        g_write(idx_name)
-        g_write(" = 0; ")
-        g_write(idx_name)
-        g_write(" < ")
-        g_emit_expr(node.children[0])
-        g_write(".len; ")
-        g_write(idx_name)
-        g_write("++) " + LB + "\n")
-        g_indent = g_indent + 1
-        g_write_indent()
-        g_write(key_c)
-        g_write(" ")
-        g_write(elem_name)
-        g_write(" = ((")
-        g_write(key_c)
-        g_write(" *)")
-        g_emit_expr(node.children[0])
-        g_write(".keys)[")
-        g_write(idx_name)
-        g_write("];\n")
-        g_local_types.insert(elem_name, iter_info.key_type)
-        if comma_pos >= 0:
-            g_local_types.insert(idx_name, TID_INT)
-        g_emit_block(node.children[1])
-        g_indent = g_indent - 1
-        g_write_indent()
-        g_write(RB + "\n")
+        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.key_type), iter_info.key_type, true)
         return
 
     if iter_info.kind == "set":
-        elem_c := g_c_type_string(iter_info.inner)
-        g_write_indent()
-        g_write("for (int64_t ")
-        g_write(idx_name)
-        g_write(" = 0; ")
-        g_write(idx_name)
-        g_write(" < ")
-        g_emit_expr(node.children[0])
-        g_write(".len; ")
-        g_write(idx_name)
-        g_write("++) " + LB + "\n")
-        g_indent = g_indent + 1
-        g_write_indent()
-        g_write(elem_c)
-        g_write(" ")
-        g_write(elem_name)
-        g_write(" = FORGE_LIST_GET(")
-        g_emit_expr(node.children[0])
-        g_write(", ")
-        g_write(elem_c)
-        g_write(", ")
-        g_write(idx_name)
-        g_write(");\n")
-        g_local_types.insert(elem_name, iter_info.inner)
-        if comma_pos >= 0:
-            g_local_types.insert(idx_name, TID_INT)
-        g_emit_block(node.children[1])
-        g_indent = g_indent - 1
-        g_write_indent()
-        g_write(RB + "\n")
+        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.inner), iter_info.inner, false)
         return
 
     g_write_indent()

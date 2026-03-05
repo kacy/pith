@@ -207,7 +207,7 @@ pub const Checker = struct {
         // () -> Void (none currently, but kept for consistency)
         // () -> Int
         const void_to_int = try self.addFnType(&.{}, .int);
-        for ([_][]const u8{ "time", "json_new_null", "json_new_array", "json_new_object" }) |n|
+        for ([_][]const u8{"time"}) |n|
             try self.registerBuiltin(n, void_to_int);
         // () -> Float
         try self.registerBuiltin("random_float", try self.addFnType(&.{}, .float));
@@ -218,33 +218,20 @@ pub const Checker = struct {
 
         // (Bool) -> Void
         try self.registerBuiltin("assert", try self.addFnType(&.{.bool}, .void));
-        // (Bool) -> Int
-        try self.registerBuiltin("json_new_bool", try self.addFnType(&.{.bool}, .int));
-
         // (Int) -> Void
         const int_to_void = try self.addFnType(&.{.int}, .void);
         for ([_][]const u8{ "exit", "sleep", "random_seed", "tcp_close" }) |n|
             try self.registerBuiltin(n, int_to_void);
         // (Int) -> Int
         const int_to_int = try self.addFnType(&.{.int}, .int);
-        for ([_][]const u8{ "json_get_int", "json_array_len", "json_new_int", "url_port", "toml_array_len" }) |n|
-            try self.registerBuiltin(n, int_to_int);
-        // (Int) -> Float
-        try self.registerBuiltin("json_get_float", try self.addFnType(&.{.int}, .float));
-        // (Int) -> Bool
-        try self.registerBuiltin("json_get_bool", try self.addFnType(&.{.int}, .bool));
         // (Int) -> String
         const int_to_str = try self.addFnType(&.{.int}, .string);
-        for ([_][]const u8{ "chr", "fmt_hex", "fmt_oct", "fmt_bin", "json_type", "json_get_string", "json_encode", "random_string", "url_scheme", "url_host", "url_path", "url_query", "url_fragment", "url_to_string", "toml_type" }) |n|
+        for ([_][]const u8{ "chr", "random_string" }) |n|
             try self.registerBuiltin(n, int_to_str);
-        // (Int) -> List[String]
-        const int_to_list_str = try self.addFnType(&.{.int}, list_string);
-        for ([_][]const u8{ "json_object_keys", "toml_keys" }) |n|
-            try self.registerBuiltin(n, int_to_list_str);
-
+        // (Int) -> Int (bitwise unary)
+        try self.registerBuiltin("bit_not", int_to_int);
         // (Int, Int) -> Void
         const two_int_to_void = try self.addFnType(&.{ .int, .int }, .void);
-        try self.registerBuiltin("json_array_push", two_int_to_void);
         // assert_eq/ne are special-cased in checkFnCall to accept any two
         // args of the same type. registered here as (Int, Int) -> Void
         // as a placeholder — the actual type checking happens in checkFnCall.
@@ -252,31 +239,18 @@ pub const Checker = struct {
             try self.registerBuiltin(n, two_int_to_void);
         // (Int, Int) -> Int
         const two_int_to_int = try self.addFnType(&.{ .int, .int }, .int);
-        for ([_][]const u8{ "random_int", "json_array_get", "toml_array_get" }) |n|
+        for ([_][]const u8{ "random_int", "bit_and", "bit_or", "bit_xor", "bit_shl", "bit_shr" }) |n|
             try self.registerBuiltin(n, two_int_to_int);
 
         // (Int, String) -> String
         const int_str_to_str = try self.addFnType(&.{ .int, .string }, .string);
-        for ([_][]const u8{ "format_time", "toml_get_string" }) |n|
+        for ([_][]const u8{"format_time"}) |n|
             try self.registerBuiltin(n, int_str_to_str);
-        // (Int, String) -> Int
-        const int_str_to_int = try self.addFnType(&.{ .int, .string }, .int);
-        for ([_][]const u8{ "json_object_get", "toml_get_int", "toml_get_table", "toml_get_array" }) |n|
-            try self.registerBuiltin(n, int_str_to_int);
-        // (Int, String) -> Float
-        try self.registerBuiltin("toml_get_float", try self.addFnType(&.{ .int, .string }, .float));
-        // (Int, String) -> Bool
-        const int_str_to_bool = try self.addFnType(&.{ .int, .string }, .bool);
-        for ([_][]const u8{ "json_object_has", "toml_has", "toml_get_bool" }) |n|
-            try self.registerBuiltin(n, int_str_to_bool);
-        // (Int, String, Int) -> Void
-        try self.registerBuiltin("json_object_set", try self.addFnType(&.{ .int, .string, .int }, .void));
-
         // (Float) -> Float
         try self.registerBuiltin("math_sqrt", try self.addFnType(&.{.float}, .float));
         // (Float) -> Int
         const float_to_int = try self.addFnType(&.{.float}, .int);
-        for ([_][]const u8{ "math_floor", "math_ceil", "math_round", "json_new_float" }) |n|
+        for ([_][]const u8{ "math_floor", "math_ceil", "math_round" }) |n|
             try self.registerBuiltin(n, float_to_int);
         // (Float, Float) -> Float
         try self.registerBuiltin("math_pow", try self.addFnType(&.{ .float, .float }, .float));
@@ -285,20 +259,16 @@ pub const Checker = struct {
 
         // (String) -> Void
         const str_to_void = try self.addFnType(&.{.string}, .void);
-        for ([_][]const u8{ "print", "log_info", "log_warn", "log_error", "log_debug" }) |n|
+        for ([_][]const u8{ "print", "print_err" }) |n|
             try self.registerBuiltin(n, str_to_void);
         // (String) -> Int
         const str_to_int = try self.addFnType(&.{.string}, .int);
-        for ([_][]const u8{ "exec", "json_parse", "json_new_string", "hash_fnv1a", "url_parse", "toml_parse" }) |n|
+        for ([_][]const u8{ "exec", "ord" }) |n|
             try self.registerBuiltin(n, str_to_int);
         // (String) -> Bool
         const str_to_bool = try self.addFnType(&.{.string}, .bool);
         for ([_][]const u8{ "file_exists", "dir_exists", "mkdir", "remove_file" }) |n|
             try self.registerBuiltin(n, str_to_bool);
-        // (String) -> String
-        const str_to_str = try self.addFnType(&.{.string}, .string);
-        for ([_][]const u8{ "path_dir", "path_base", "path_ext", "path_stem", "base64_encode", "hex_encode", "hash_sha256", "percent_encode", "percent_decode" }) |n|
-            try self.registerBuiltin(n, str_to_str);
         // (String) -> String?
         try self.registerBuiltin("env", try self.addFnType(&.{.string}, opt_string));
         // (String) -> List[String]
@@ -310,11 +280,9 @@ pub const Checker = struct {
         try self.registerBuiltin("parse_float", try self.addFnType(&.{.string}, float_result));
         // (String) -> String!
         const str_to_str_result = try self.addFnType(&.{.string}, str_result);
-        for ([_][]const u8{ "read_file", "exec_output", "base64_decode", "hex_decode" }) |n|
+        for ([_][]const u8{ "read_file", "exec_output" }) |n|
             try self.registerBuiltin(n, str_to_str_result);
 
-        // (String, String) -> String
-        try self.registerBuiltin("path_join", try self.addFnType(&.{ .string, .string }, .string));
         // (String, String) -> Bool
         try self.registerBuiltin("rename_file", try self.addFnType(&.{ .string, .string }, .bool));
         // (String, String) -> Bool!

@@ -89,9 +89,6 @@ fn c_register_builtins():
     # () -> Int
     void_to_int := c_make_fn_type([], TID_INT)
     c_def_builtin("time", void_to_int)
-    c_def_builtin("json_new_null", void_to_int)
-    c_def_builtin("json_new_array", void_to_int)
-    c_def_builtin("json_new_object", void_to_int)
     # () -> Float
     c_def_builtin("random_float", c_make_fn_type([], TID_FLOAT))
     # () -> String
@@ -101,8 +98,6 @@ fn c_register_builtins():
 
     # (Bool) -> Void
     c_def_builtin("assert", c_make_fn_type([TID_BOOL], TID_VOID))
-    # (Bool) -> Int
-    c_def_builtin("json_new_bool", c_make_fn_type([TID_BOOL], TID_INT))
 
     # (Int) -> Void
     int_to_void := c_make_fn_type([TID_INT], TID_VOID)
@@ -112,69 +107,30 @@ fn c_register_builtins():
     c_def_builtin("tcp_close", int_to_void)
     # (Int) -> Int
     int_to_int := c_make_fn_type([TID_INT], TID_INT)
-    c_def_builtin("json_get_int", int_to_int)
-    c_def_builtin("json_array_len", int_to_int)
-    c_def_builtin("json_new_int", int_to_int)
-    c_def_builtin("url_port", int_to_int)
-    c_def_builtin("toml_array_len", int_to_int)
-    # (Int) -> Float
-    c_def_builtin("json_get_float", c_make_fn_type([TID_INT], TID_FLOAT))
-    # (Int) -> Bool
-    c_def_builtin("json_get_bool", c_make_fn_type([TID_INT], TID_BOOL))
+    # (Int) -> Int (bitwise unary)
+    c_def_builtin("bit_not", int_to_int)
+
     # (Int) -> String
     int_to_str := c_make_fn_type([TID_INT], TID_STRING)
     c_def_builtin("chr", int_to_str)
-    c_def_builtin("fmt_hex", int_to_str)
-    c_def_builtin("fmt_oct", int_to_str)
-    c_def_builtin("fmt_bin", int_to_str)
-    c_def_builtin("json_type", int_to_str)
-    c_def_builtin("json_get_string", int_to_str)
-    c_def_builtin("json_encode", int_to_str)
     c_def_builtin("random_string", int_to_str)
-    c_def_builtin("url_scheme", int_to_str)
-    c_def_builtin("url_host", int_to_str)
-    c_def_builtin("url_path", int_to_str)
-    c_def_builtin("url_query", int_to_str)
-    c_def_builtin("url_fragment", int_to_str)
-    c_def_builtin("url_to_string", int_to_str)
-    c_def_builtin("toml_type", int_to_str)
-    # (Int) -> List[String]
-    int_to_list_str := c_make_fn_type([TID_INT], list_string)
-    c_def_builtin("json_object_keys", int_to_list_str)
-    c_def_builtin("toml_keys", int_to_list_str)
-
     # (Int, Int) -> Void
     two_int_to_void := c_make_fn_type([TID_INT, TID_INT], TID_VOID)
-    c_def_builtin("json_array_push", two_int_to_void)
     # assert_eq/ne — placeholder (Int, Int), special-cased in checkCall
     c_def_builtin("assert_eq", two_int_to_void)
     c_def_builtin("assert_ne", two_int_to_void)
     # (Int, Int) -> Int
     two_int_to_int := c_make_fn_type([TID_INT, TID_INT], TID_INT)
     c_def_builtin("random_int", two_int_to_int)
-    c_def_builtin("json_array_get", two_int_to_int)
-    c_def_builtin("toml_array_get", two_int_to_int)
+    c_def_builtin("bit_and", two_int_to_int)
+    c_def_builtin("bit_or", two_int_to_int)
+    c_def_builtin("bit_xor", two_int_to_int)
+    c_def_builtin("bit_shl", two_int_to_int)
+    c_def_builtin("bit_shr", two_int_to_int)
 
     # (Int, String) -> String
     int_str_to_str := c_make_fn_type([TID_INT, TID_STRING], TID_STRING)
     c_def_builtin("format_time", int_str_to_str)
-    c_def_builtin("toml_get_string", int_str_to_str)
-    # (Int, String) -> Int
-    int_str_to_int := c_make_fn_type([TID_INT, TID_STRING], TID_INT)
-    c_def_builtin("json_object_get", int_str_to_int)
-    c_def_builtin("toml_get_int", int_str_to_int)
-    c_def_builtin("toml_get_table", int_str_to_int)
-    c_def_builtin("toml_get_array", int_str_to_int)
-    # (Int, String) -> Float
-    c_def_builtin("toml_get_float", c_make_fn_type([TID_INT, TID_STRING], TID_FLOAT))
-    # (Int, String) -> Bool
-    int_str_to_bool := c_make_fn_type([TID_INT, TID_STRING], TID_BOOL)
-    c_def_builtin("json_object_has", int_str_to_bool)
-    c_def_builtin("toml_has", int_str_to_bool)
-    c_def_builtin("toml_get_bool", int_str_to_bool)
-    # (Int, String, Int) -> Void
-    c_def_builtin("json_object_set", c_make_fn_type([TID_INT, TID_STRING, TID_INT], TID_VOID))
-
     # (Float) -> Float
     c_def_builtin("math_sqrt", c_make_fn_type([TID_FLOAT], TID_FLOAT))
     # (Float) -> Int
@@ -182,7 +138,6 @@ fn c_register_builtins():
     c_def_builtin("math_floor", float_to_int)
     c_def_builtin("math_ceil", float_to_int)
     c_def_builtin("math_round", float_to_int)
-    c_def_builtin("json_new_float", float_to_int)
     # (Float, Float) -> Float
     c_def_builtin("math_pow", c_make_fn_type([TID_FLOAT, TID_FLOAT], TID_FLOAT))
     # (Float, Int) -> String
@@ -191,35 +146,17 @@ fn c_register_builtins():
     # (String) -> Void
     str_to_void := c_make_fn_type([TID_STRING], TID_VOID)
     c_def_builtin("print", str_to_void)
-    c_def_builtin("log_info", str_to_void)
-    c_def_builtin("log_warn", str_to_void)
-    c_def_builtin("log_error", str_to_void)
-    c_def_builtin("log_debug", str_to_void)
+    c_def_builtin("print_err", str_to_void)
     # (String) -> Int
     str_to_int := c_make_fn_type([TID_STRING], TID_INT)
     c_def_builtin("exec", str_to_int)
-    c_def_builtin("json_parse", str_to_int)
-    c_def_builtin("json_new_string", str_to_int)
-    c_def_builtin("hash_fnv1a", str_to_int)
-    c_def_builtin("url_parse", str_to_int)
-    c_def_builtin("toml_parse", str_to_int)
+    c_def_builtin("ord", str_to_int)
     # (String) -> Bool
     str_to_bool := c_make_fn_type([TID_STRING], TID_BOOL)
     c_def_builtin("file_exists", str_to_bool)
     c_def_builtin("dir_exists", str_to_bool)
     c_def_builtin("mkdir", str_to_bool)
     c_def_builtin("remove_file", str_to_bool)
-    # (String) -> String
-    str_to_str := c_make_fn_type([TID_STRING], TID_STRING)
-    c_def_builtin("path_dir", str_to_str)
-    c_def_builtin("path_base", str_to_str)
-    c_def_builtin("path_ext", str_to_str)
-    c_def_builtin("path_stem", str_to_str)
-    c_def_builtin("base64_encode", str_to_str)
-    c_def_builtin("hex_encode", str_to_str)
-    c_def_builtin("hash_sha256", str_to_str)
-    c_def_builtin("percent_encode", str_to_str)
-    c_def_builtin("percent_decode", str_to_str)
     # (String) -> String?
     c_def_builtin("env", c_make_fn_type([TID_STRING], opt_string))
     # (String) -> List[String]
@@ -233,12 +170,8 @@ fn c_register_builtins():
     str_to_str_result := c_make_fn_type([TID_STRING], str_result)
     c_def_builtin("read_file", str_to_str_result)
     c_def_builtin("exec_output", str_to_str_result)
-    c_def_builtin("base64_decode", str_to_str_result)
-    c_def_builtin("hex_decode", str_to_str_result)
     c_def_builtin("dns_resolve", str_to_str_result)
 
-    # (String, String) -> String
-    c_def_builtin("path_join", c_make_fn_type([TID_STRING, TID_STRING], TID_STRING))
     # (String, String) -> Bool
     c_def_builtin("rename_file", c_make_fn_type([TID_STRING, TID_STRING], TID_BOOL))
     # (String, String) -> Bool!

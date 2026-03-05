@@ -1,42 +1,43 @@
 # toml parsing
+from std.toml import parse, type_of, get_string, get_int, get_float, get_bool, has, get_array, array_len, array_get, get_table, keys
 
 fn main():
     # build a TOML document
     nl := chr(10)
-    mut doc := "title = \"forge\"" + nl
+    mut doc := "title = " + chr(34) + "forge" + chr(34) + nl
     doc = doc + "version = 42" + nl
     doc = doc + "pi = 3.14" + nl
     doc = doc + "enabled = true" + nl
-    doc = doc + "tags = [\"lang\", \"fast\"]" + nl
+    doc = doc + "tags = [" + chr(34) + "lang" + chr(34) + ", " + chr(34) + "fast" + chr(34) + "]" + nl
     doc = doc + nl
     doc = doc + "[server]" + nl
-    doc = doc + "host = \"localhost\"" + nl
+    doc = doc + "host = " + chr(34) + "localhost" + chr(34) + nl
     doc = doc + "port = 8080" + nl
 
-    root := toml_parse(doc)
-    print("type: " + toml_type(root))
+    root := parse(doc)
+    print("type: " + type_of(root))
 
     # basic values
-    print("title: " + toml_get_string(root, "title"))
-    print("version: " + toml_get_int(root, "version").to_string())
-    print("pi: " + toml_get_float(root, "pi").to_string())
-    print("enabled: " + toml_get_bool(root, "enabled").to_string())
+    print("title: " + get_string(root, "title"))
+    print("version: " + get_int(root, "version").to_string())
+    print("pi: " + get_float(root, "pi").to_string())
+    print("enabled: " + get_bool(root, "enabled").to_string())
 
     # has key
-    print("has title: " + toml_has(root, "title").to_string())
-    print("has missing: " + toml_has(root, "missing").to_string())
+    print("has title: " + has(root, "title").to_string())
+    print("has missing: " + has(root, "missing").to_string())
 
     # array
-    tags := toml_get_array(root, "tags")
-    print("tags count: " + toml_array_len(tags).to_string())
-    tag0 := toml_array_get(tags, 0)
-    print("tag 0 type: " + toml_type(tag0))
+    tags := get_array(root, "tags")
+    print("tags count: " + array_len(tags).to_string())
+    tag0 := array_get(tags, 0)
+    print("tag 0 type: " + type_of(tag0))
 
     # sub-table
-    server := toml_get_table(root, "server")
-    print("server host: " + toml_get_string(server, "host"))
-    print("server port: " + toml_get_int(server, "port").to_string())
+    server := get_table(root, "server")
+    print("server host: " + get_string(server, "host"))
+    print("server port: " + get_int(server, "port").to_string())
 
     # keys
-    k := toml_keys(root)
+    k := keys(root)
     print("key count: " + k.len().to_string())

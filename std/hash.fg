@@ -1,12 +1,204 @@
-# std.hash — cryptographic and non-cryptographic hashing
+# std.hash — SHA-256 and FNV-1a (native forge)
 #
 # sha256 returns a 64-char hex string (lowercase).
-# fnv1a returns a 64-bit integer hash.
+# fnv1a returns a 64-bit integer hash (32-bit FNV-1a).
+
+# 32-bit mask for SHA-256
+fn m(x: Int) -> Int:
+    return bit_and(x, 4294967295)
+
+# 32-bit right-rotate
+fn rotr(x: Int, n: Int) -> Int:
+    return m(bit_or(bit_shr(x, n), bit_shl(x, 32 - n)))
+
+# SHA-256 round constants (FIPS 180-4)
+mut g_k: List[Int] := []
+mut g_k_ready: Bool := false
+
+fn sha_init():
+    if g_k_ready:
+        return
+    g_k_ready = true
+    g_k.push(1116352408)
+    g_k.push(1899447441)
+    g_k.push(3049323471)
+    g_k.push(3921009573)
+    g_k.push(961987163)
+    g_k.push(1508970993)
+    g_k.push(2453635748)
+    g_k.push(2870763221)
+    g_k.push(3624381080)
+    g_k.push(310598401)
+    g_k.push(607225278)
+    g_k.push(1426881987)
+    g_k.push(1925078388)
+    g_k.push(2162078206)
+    g_k.push(2614888103)
+    g_k.push(3248222580)
+    g_k.push(3835390401)
+    g_k.push(4022224774)
+    g_k.push(264347078)
+    g_k.push(604807628)
+    g_k.push(770255983)
+    g_k.push(1249150122)
+    g_k.push(1555081692)
+    g_k.push(1996064986)
+    g_k.push(2554220882)
+    g_k.push(2821834349)
+    g_k.push(2952996808)
+    g_k.push(3210313671)
+    g_k.push(3336571891)
+    g_k.push(3584528711)
+    g_k.push(113926993)
+    g_k.push(338241895)
+    g_k.push(666307205)
+    g_k.push(773529912)
+    g_k.push(1294757372)
+    g_k.push(1396182291)
+    g_k.push(1695183700)
+    g_k.push(1986661051)
+    g_k.push(2177026350)
+    g_k.push(2456956037)
+    g_k.push(2730485921)
+    g_k.push(2820302411)
+    g_k.push(3259730800)
+    g_k.push(3345764771)
+    g_k.push(3516065817)
+    g_k.push(3600352804)
+    g_k.push(4094571909)
+    g_k.push(275423344)
+    g_k.push(430227734)
+    g_k.push(506948616)
+    g_k.push(659060556)
+    g_k.push(883997877)
+    g_k.push(958139571)
+    g_k.push(1322822218)
+    g_k.push(1537002063)
+    g_k.push(1747873779)
+    g_k.push(1955562222)
+    g_k.push(2024104815)
+    g_k.push(2227730452)
+    g_k.push(2361852424)
+    g_k.push(2428436474)
+    g_k.push(2756734187)
+    g_k.push(3204031479)
+    g_k.push(3329325298)
+
+fn word32_to_hex(val: Int) -> String:
+    hex := "0123456789abcdef"
+    mut result := ""
+    mut i := 0
+    while i < 8:
+        nibble := bit_and(bit_shr(val, (28 - i * 4)), 15)
+        result = result + hex[nibble]
+        i = i + 1
+    return result
 
 # compute SHA-256 hash of a string, returned as 64-char hex.
 pub fn sha256(input: String) -> String:
-    return hash_sha256(input)
+    sha_init()
 
-# compute FNV-1a hash of a string, returned as Int.
+    # initial hash values
+    mut h0 := 1779033703
+    mut h1 := 3144134277
+    mut h2 := 1013904242
+    mut h3 := 2773480762
+    mut h4 := 1359893119
+    mut h5 := 2600822924
+    mut h6 := 528734635
+    mut h7 := 1541459225
+
+    # build padded message as list of bytes
+    mut msg: List[Int] := []
+    mut i := 0
+    while i < input.len():
+        msg.push(ord(input[i]))
+        i = i + 1
+
+    # append 0x80
+    msg.push(128)
+
+    # pad with zeros until length is 56 mod 64
+    while msg.len() % 64 != 56:
+        msg.push(0)
+
+    # append 8-byte big-endian bit length
+    bit_len := input.len() * 8
+    msg.push(bit_and(bit_shr(bit_len, 56), 255))
+    msg.push(bit_and(bit_shr(bit_len, 48), 255))
+    msg.push(bit_and(bit_shr(bit_len, 40), 255))
+    msg.push(bit_and(bit_shr(bit_len, 32), 255))
+    msg.push(bit_and(bit_shr(bit_len, 24), 255))
+    msg.push(bit_and(bit_shr(bit_len, 16), 255))
+    msg.push(bit_and(bit_shr(bit_len, 8), 255))
+    msg.push(bit_and(bit_len, 255))
+
+    # process each 64-byte block
+    mut block := 0
+    while block < msg.len():
+        # build message schedule (16 words from block + 48 extended)
+        mut w: List[Int] := []
+        i = 0
+        while i < 16:
+            off := block + i * 4
+            word := msg[off] * 16777216 + msg[off + 1] * 65536 + msg[off + 2] * 256 + msg[off + 3]
+            w.push(word)
+            i = i + 1
+        while i < 64:
+            s0 := bit_xor(bit_xor(rotr(w[i - 15], 7), rotr(w[i - 15], 18)), bit_shr(w[i - 15], 3))
+            s1 := bit_xor(bit_xor(rotr(w[i - 2], 17), rotr(w[i - 2], 19)), bit_shr(w[i - 2], 10))
+            w.push(m(w[i - 16] + s0 + w[i - 7] + s1))
+            i = i + 1
+
+        # working variables
+        mut a := h0
+        mut b := h1
+        mut c := h2
+        mut d := h3
+        mut e := h4
+        mut f := h5
+        mut g := h6
+        mut h := h7
+
+        # 64 rounds
+        i = 0
+        while i < 64:
+            s1 := bit_xor(bit_xor(rotr(e, 6), rotr(e, 11)), rotr(e, 25))
+            ch := bit_xor(bit_and(e, f), bit_and(m(bit_not(e)), g))
+            temp1 := m(h + s1 + ch + g_k[i] + w[i])
+            s0 := bit_xor(bit_xor(rotr(a, 2), rotr(a, 13)), rotr(a, 22))
+            maj := bit_xor(bit_xor(bit_and(a, b), bit_and(a, c)), bit_and(b, c))
+            temp2 := m(s0 + maj)
+            h = g
+            g = f
+            f = e
+            e = m(d + temp1)
+            d = c
+            c = b
+            b = a
+            a = m(temp1 + temp2)
+            i = i + 1
+
+        h0 = m(h0 + a)
+        h1 = m(h1 + b)
+        h2 = m(h2 + c)
+        h3 = m(h3 + d)
+        h4 = m(h4 + e)
+        h5 = m(h5 + f)
+        h6 = m(h6 + g)
+        h7 = m(h7 + h)
+
+        block = block + 64
+
+    # produce 64-char hex string
+    return word32_to_hex(h0) + word32_to_hex(h1) + word32_to_hex(h2) + word32_to_hex(h3) + word32_to_hex(h4) + word32_to_hex(h5) + word32_to_hex(h6) + word32_to_hex(h7)
+
+# compute FNV-1a hash (32-bit) of a string, returned as Int.
 pub fn fnv1a(input: String) -> Int:
-    return hash_fnv1a(input)
+    mut h := 2166136261
+    mut i := 0
+    while i < input.len():
+        h = bit_xor(h, ord(input[i]))
+        h = bit_and(h * 16777619, 4294967295)
+        i = i + 1
+    return h

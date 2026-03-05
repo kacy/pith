@@ -36,21 +36,20 @@ const forge_prefix_builtins = std.StaticStringMap(void).initComptime(.{
     .{ "write_file", {} },
     .{ "env", {} },
     .{ "chr", {} },
+    .{ "ord", {} },
+    .{ "bit_and", {} },
+    .{ "bit_or", {} },
+    .{ "bit_xor", {} },
+    .{ "bit_not", {} },
+    .{ "bit_shl", {} },
+    .{ "bit_shr", {} },
+    .{ "print_err", {} },
     .{ "exec_output", {} },
     .{ "time", {} },
     .{ "sleep", {} },
     .{ "random_int", {} },
     .{ "random_float", {} },
     .{ "input", {} },
-    .{ "path_join", {} },
-    .{ "path_dir", {} },
-    .{ "path_base", {} },
-    .{ "path_ext", {} },
-    .{ "path_stem", {} },
-    .{ "log_info", {} },
-    .{ "log_warn", {} },
-    .{ "log_error", {} },
-    .{ "log_debug", {} },
     .{ "file_exists", {} },
     .{ "dir_exists", {} },
     .{ "mkdir", {} },
@@ -63,50 +62,10 @@ const forge_prefix_builtins = std.StaticStringMap(void).initComptime(.{
     .{ "math_floor", {} },
     .{ "math_ceil", {} },
     .{ "math_round", {} },
-    .{ "fmt_hex", {} },
-    .{ "fmt_oct", {} },
-    .{ "fmt_bin", {} },
     .{ "fmt_float", {} },
-    .{ "json_parse", {} },
-    .{ "json_type", {} },
-    .{ "json_get_bool", {} },
-    .{ "json_get_int", {} },
-    .{ "json_get_float", {} },
-    .{ "json_get_string", {} },
-    .{ "json_array_len", {} },
-    .{ "json_array_get", {} },
-    .{ "json_object_get", {} },
-    .{ "json_object_has", {} },
-    .{ "json_object_keys", {} },
-    .{ "json_encode", {} },
-    .{ "json_new_null", {} },
-    .{ "json_new_bool", {} },
-    .{ "json_new_int", {} },
-    .{ "json_new_float", {} },
-    .{ "json_new_string", {} },
-    .{ "json_new_array", {} },
-    .{ "json_new_object", {} },
-    .{ "json_array_push", {} },
-    .{ "json_object_set", {} },
-    .{ "base64_encode", {} },
-    .{ "base64_decode", {} },
-    .{ "hex_encode", {} },
-    .{ "hex_decode", {} },
-    .{ "hash_sha256", {} },
-    .{ "hash_fnv1a", {} },
     .{ "format_time", {} },
     .{ "random_seed", {} },
     .{ "random_string", {} },
-    .{ "url_parse", {} },
-    .{ "url_scheme", {} },
-    .{ "url_host", {} },
-    .{ "url_port", {} },
-    .{ "url_path", {} },
-    .{ "url_query", {} },
-    .{ "url_fragment", {} },
-    .{ "url_to_string", {} },
-    .{ "percent_encode", {} },
-    .{ "percent_decode", {} },
     .{ "tcp_connect", {} },
     .{ "tcp_listen", {} },
     .{ "tcp_accept", {} },
@@ -114,18 +73,6 @@ const forge_prefix_builtins = std.StaticStringMap(void).initComptime(.{
     .{ "tcp_write", {} },
     .{ "tcp_close", {} },
     .{ "dns_resolve", {} },
-    .{ "toml_parse", {} },
-    .{ "toml_type", {} },
-    .{ "toml_get_string", {} },
-    .{ "toml_get_int", {} },
-    .{ "toml_get_float", {} },
-    .{ "toml_get_bool", {} },
-    .{ "toml_get_table", {} },
-    .{ "toml_get_array", {} },
-    .{ "toml_array_len", {} },
-    .{ "toml_array_get", {} },
-    .{ "toml_keys", {} },
-    .{ "toml_has", {} },
     .{ "process_spawn", {} },
     .{ "process_write", {} },
     .{ "process_read", {} },
@@ -1231,36 +1178,6 @@ pub const CEmitter = struct {
             \\    }
             \\    forge_result_forge_string_t r; r.is_ok = false;
             \\    r.err = FORGE_STRING_LIT("failed to execute command");
-            \\    return r;
-            \\}
-            \\
-        );
-
-        // base64_decode(String) -> String!
-        try self.writeStr(
-            \\static forge_result_forge_string_t forge_base64_decode(forge_string_t input) {
-            \\    forge_string_t decoded;
-            \\    if (forge_base64_decode_impl(input, &decoded)) {
-            \\        forge_result_forge_string_t r; r.is_ok = true; r.ok = decoded;
-            \\        return r;
-            \\    }
-            \\    forge_result_forge_string_t r; r.is_ok = false;
-            \\    r.err = FORGE_STRING_LIT("invalid base64 input");
-            \\    return r;
-            \\}
-            \\
-        );
-
-        // hex_decode(String) -> String!
-        try self.writeStr(
-            \\static forge_result_forge_string_t forge_hex_decode(forge_string_t input) {
-            \\    forge_string_t decoded;
-            \\    if (forge_hex_decode_impl(input, &decoded)) {
-            \\        forge_result_forge_string_t r; r.is_ok = true; r.ok = decoded;
-            \\        return r;
-            \\    }
-            \\    forge_result_forge_string_t r; r.is_ok = false;
-            \\    r.err = FORGE_STRING_LIT("invalid hex input");
             \\    return r;
             \\}
             \\

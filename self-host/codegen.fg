@@ -863,46 +863,28 @@ fn g_emit_enum_def(node_idx: Int):
 # result/optional/tuple typedefs
 # ---------------------------------------------------------------
 
-fn g_emit_result_typedefs():
+fn g_emit_wrapper_typedefs(kind: String, prefix: String, dedup: Map[String, Bool]):
+    # shared emitter for result and optional typedefs — both iterate all
+    # type IDs, build a name from the inner type, dedup, and emit a typedef.
+    # the only difference is the struct body.
     mut tid := 0
     while tid < tt_count():
         info := tt_get(tid)
-        if info.kind == "result":
-            ok_c := g_c_type_string(info.inner)
-            name := "forge_result_" + ok_c
-            if g_emitted_results.contains_key(name):
-                # still cache mangled name for this TypeId
-                if g_mangled.contains_key(tid) == false:
-                    g_mangled.insert(tid, name)
-            else:
-                g_mangled.insert(tid, name)
-                g_emitted_results.insert(name, true)
-                g_write("typedef struct " + LB + " bool is_ok; ")
-                g_write(ok_c)
-                g_write(" ok; forge_string_t err; " + RB + " ")
-                g_write(name)
-                g_write(";\n")
-        tid = tid + 1
-    g_write("\n")
-
-fn g_emit_optional_typedefs():
-    mut tid := 0
-    while tid < tt_count():
-        info := tt_get(tid)
-        if info.kind == "optional":
+        if info.kind == kind:
             inner_c := g_c_type_string(info.inner)
-            name := "forge_optional_" + inner_c
-            if g_emitted_optionals.contains_key(name):
+            name := prefix + inner_c
+            if dedup.contains_key(name):
                 if g_mangled.contains_key(tid) == false:
                     g_mangled.insert(tid, name)
             else:
                 g_mangled.insert(tid, name)
-                g_emitted_optionals.insert(name, true)
-                g_write("typedef struct " + LB + " bool has_value; ")
-                g_write(inner_c)
-                g_write(" value; " + RB + " ")
-                g_write(name)
-                g_write(";\n")
+                dedup.insert(name, true)
+                g_write("typedef struct " + LB + " ")
+                if kind == "result":
+                    g_write("bool is_ok; " + inner_c + " ok; forge_string_t err; ")
+                else:
+                    g_write("bool has_value; " + inner_c + " value; ")
+                g_write(RB + " " + name + ";\n")
         tid = tid + 1
     g_write("\n")
 
@@ -939,8 +921,32 @@ fn g_emit_tuple_typedefs():
 # builtin helper functions
 # ---------------------------------------------------------------
 
+fn g_emit_result_helper(name: String, ret_c: String, impl_call: String, params: String, err_msg: String):
+    # emit a result-wrapping helper: call _impl, wrap success in forge_result_X.
+    # the impl_call string should reference &__v for the output parameter.
+    result_c := "forge_result_" + ret_c
+    g_write("static " + result_c + " forge_" + name + "(" + params + ") " + LB + "\n")
+    g_write("    " + ret_c + " __v;\n")
+    g_write("    if (" + impl_call + ") " + LB + "\n")
+    g_write("        " + result_c + " r; r.is_ok = true; r.ok = __v; return r;\n")
+    g_write("    " + RB + "\n")
+    g_write("    " + result_c + " r; r.is_ok = false;\n")
+    g_write("    r.err = FORGE_STRING_LIT(\"" + err_msg + "\"); return r;\n")
+    g_write(RB + "\n")
+
+fn g_emit_optional_helper(name: String, ret_c: String, impl_call: String, params: String):
+    # emit an optional-wrapping helper: call _impl, wrap in forge_optional_X.
+    opt_c := "forge_optional_" + ret_c
+    g_write("static " + opt_c + " forge_" + name + "(" + params + ") " + LB + "\n")
+    g_write("    " + ret_c + " __v;\n")
+    g_write("    if (" + impl_call + ") " + LB + "\n")
+    g_write("        " + opt_c + " r; r.has_value = true; r.value = __v; return r;\n")
+    g_write("    " + RB + "\n")
+    g_write("    " + opt_c + " r; r.has_value = false; return r;\n")
+    g_write(RB + "\n")
+
 fn g_emit_builtin_helpers():
-    # parse_int(String) -> Int!
+    # parse_int and parse_float are unique (libc strtoll/strtod with buffer setup)
     g_write("static forge_result_int64_t forge_parse_int(forge_string_t s) " + LB + "\n")
     g_write("    char buf[64];\n")
     g_write("    int64_t slen = s.len < 63 ? s.len : 63;\n")
@@ -957,7 +963,6 @@ fn g_emit_builtin_helpers():
     g_write("    return r;\n")
     g_write(RB + "\n")
 
-    # parse_float(String) -> Float!
     g_write("static forge_result_double forge_parse_float(forge_string_t s) " + LB + "\n")
     g_write("    char buf[128];\n")
     g_write("    int64_t slen = s.len < 127 ? s.len : 127;\n")
@@ -974,195 +979,31 @@ fn g_emit_builtin_helpers():
     g_write("    return r;\n")
     g_write(RB + "\n")
 
-    # read_file(String) -> String!
-    g_write("static forge_result_forge_string_t forge_read_file(forge_string_t path) " + LB + "\n")
-    g_write("    forge_string_t content;\n")
-    g_write("    if (forge_read_file_impl(path.data, path.len, &content)) " + LB + "\n")
-    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = content;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to read file\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n")
-
-    # write_file(String, String) -> Bool!
+    # write_file is unique — no output value, just success/fail -> Bool!
     g_write("static forge_result_bool forge_write_file(forge_string_t path, forge_string_t data) " + LB + "\n")
     g_write("    if (forge_write_file_impl(path.data, path.len, data.data, data.len)) " + LB + "\n")
-    g_write("        forge_result_bool r; r.is_ok = true; r.ok = true;\n")
-    g_write("        return r;\n")
+    g_write("        forge_result_bool r; r.is_ok = true; r.ok = true; return r;\n")
     g_write("    " + RB + "\n")
     g_write("    forge_result_bool r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to write file\");\n")
-    g_write("    return r;\n")
+    g_write("    r.err = FORGE_STRING_LIT(\"failed to write file\"); return r;\n")
     g_write(RB + "\n")
 
-    # env(String) -> String?
-    g_write("static forge_optional_forge_string_t forge_env(forge_string_t name) " + LB + "\n")
-    g_write("    forge_string_t val;\n")
-    g_write("    if (forge_env_impl(name.data, name.len, &val)) " + LB + "\n")
-    g_write("        forge_optional_forge_string_t r; r.has_value = true; r.value = val;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_optional_forge_string_t r; r.has_value = false;\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
+    # result wrappers — all follow the same template: call _impl, wrap in result
+    g_emit_result_helper("read_file", "forge_string_t", "forge_read_file_impl(path.data, path.len, &__v)", "forge_string_t path", "failed to read file")
+    g_emit_result_helper("exec_output", "forge_string_t", "forge_exec_output_impl(cmd, &__v)", "forge_string_t cmd", "failed to execute command")
+    g_emit_result_helper("tcp_connect", "int64_t", "forge_tcp_connect_impl(host, port, &__v)", "forge_string_t host, int64_t port", "failed to connect")
+    g_emit_result_helper("tcp_listen", "int64_t", "forge_tcp_listen_impl(host, port, &__v)", "forge_string_t host, int64_t port", "failed to listen")
+    g_emit_result_helper("tcp_accept", "int64_t", "forge_tcp_accept_impl(server_fd, &__v)", "int64_t server_fd", "failed to accept")
+    g_emit_result_helper("tcp_read", "forge_string_t", "forge_tcp_read_impl(fd, max_bytes, &__v)", "int64_t fd, int64_t max_bytes", "failed to read")
+    g_emit_result_helper("tcp_write", "int64_t", "forge_tcp_write_impl(fd, data, &__v)", "int64_t fd, forge_string_t data", "failed to write")
+    g_emit_result_helper("dns_resolve", "forge_string_t", "forge_dns_resolve_impl(hostname, &__v)", "forge_string_t hostname", "failed to resolve hostname")
+    g_emit_result_helper("process_spawn", "int64_t", "forge_process_spawn_impl(cmd, &__v)", "forge_string_t cmd", "failed to spawn process")
+    g_emit_result_helper("process_write", "int64_t", "forge_process_write_impl(handle, data, &__v)", "int64_t handle, forge_string_t data", "failed to write to process")
+    g_emit_result_helper("process_read", "forge_string_t", "forge_process_read_impl(handle, max_bytes, &__v)", "int64_t handle, int64_t max_bytes", "failed to read from process")
+    g_emit_result_helper("process_read_err", "forge_string_t", "forge_process_read_err_impl(handle, max_bytes, &__v)", "int64_t handle, int64_t max_bytes", "failed to read stderr from process")
 
-    # exec_output(String) -> String!
-    g_write("static forge_result_forge_string_t forge_exec_output(forge_string_t cmd) " + LB + "\n")
-    g_write("    forge_string_t output;\n")
-    g_write("    if (forge_exec_output_impl(cmd, &output)) " + LB + "\n")
-    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = output;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to execute command\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # base64_decode(String) -> String!
-    g_write("static forge_result_forge_string_t forge_base64_decode(forge_string_t input) " + LB + "\n")
-    g_write("    forge_string_t decoded;\n")
-    g_write("    if (forge_base64_decode_impl(input, &decoded)) " + LB + "\n")
-    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = decoded;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"invalid base64 input\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # hex_decode(String) -> String!
-    g_write("static forge_result_forge_string_t forge_hex_decode(forge_string_t input) " + LB + "\n")
-    g_write("    forge_string_t decoded;\n")
-    g_write("    if (forge_hex_decode_impl(input, &decoded)) " + LB + "\n")
-    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = decoded;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"invalid hex input\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # tcp_connect(String, Int) -> Int!
-    g_write("static forge_result_int64_t forge_tcp_connect(forge_string_t host, int64_t port) " + LB + "\n")
-    g_write("    int64_t fd;\n")
-    g_write("    if (forge_tcp_connect_impl(host, port, &fd)) " + LB + "\n")
-    g_write("        forge_result_int64_t r; r.is_ok = true; r.ok = fd;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_int64_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to connect\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # tcp_listen(String, Int) -> Int!
-    g_write("static forge_result_int64_t forge_tcp_listen(forge_string_t host, int64_t port) " + LB + "\n")
-    g_write("    int64_t fd;\n")
-    g_write("    if (forge_tcp_listen_impl(host, port, &fd)) " + LB + "\n")
-    g_write("        forge_result_int64_t r; r.is_ok = true; r.ok = fd;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_int64_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to listen\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # tcp_accept(Int) -> Int!
-    g_write("static forge_result_int64_t forge_tcp_accept(int64_t server_fd) " + LB + "\n")
-    g_write("    int64_t client_fd;\n")
-    g_write("    if (forge_tcp_accept_impl(server_fd, &client_fd)) " + LB + "\n")
-    g_write("        forge_result_int64_t r; r.is_ok = true; r.ok = client_fd;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_int64_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to accept\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # tcp_read(Int, Int) -> String!
-    g_write("static forge_result_forge_string_t forge_tcp_read(int64_t fd, int64_t max_bytes) " + LB + "\n")
-    g_write("    forge_string_t data;\n")
-    g_write("    if (forge_tcp_read_impl(fd, max_bytes, &data)) " + LB + "\n")
-    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = data;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to read\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # tcp_write(Int, String) -> Int!
-    g_write("static forge_result_int64_t forge_tcp_write(int64_t fd, forge_string_t data) " + LB + "\n")
-    g_write("    int64_t written;\n")
-    g_write("    if (forge_tcp_write_impl(fd, data, &written)) " + LB + "\n")
-    g_write("        forge_result_int64_t r; r.is_ok = true; r.ok = written;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_int64_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to write\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # dns_resolve(String) -> String!
-    g_write("static forge_result_forge_string_t forge_dns_resolve(forge_string_t hostname) " + LB + "\n")
-    g_write("    forge_string_t ip;\n")
-    g_write("    if (forge_dns_resolve_impl(hostname, &ip)) " + LB + "\n")
-    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = ip;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to resolve hostname\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # process_spawn(String) -> Int!
-    g_write("static forge_result_int64_t forge_process_spawn(forge_string_t cmd) " + LB + "\n")
-    g_write("    int64_t handle;\n")
-    g_write("    if (forge_process_spawn_impl(cmd, &handle)) " + LB + "\n")
-    g_write("        forge_result_int64_t r; r.is_ok = true; r.ok = handle;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_int64_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to spawn process\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # process_write(Int, String) -> Int!
-    g_write("static forge_result_int64_t forge_process_write(int64_t handle, forge_string_t data) " + LB + "\n")
-    g_write("    int64_t n;\n")
-    g_write("    if (forge_process_write_impl(handle, data, &n)) " + LB + "\n")
-    g_write("        forge_result_int64_t r; r.is_ok = true; r.ok = n;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_int64_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to write to process\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # process_read(Int, Int) -> String!
-    g_write("static forge_result_forge_string_t forge_process_read(int64_t handle, int64_t max_bytes) " + LB + "\n")
-    g_write("    forge_string_t data;\n")
-    g_write("    if (forge_process_read_impl(handle, max_bytes, &data)) " + LB + "\n")
-    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = data;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to read from process\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
-
-    # process_read_err(Int, Int) -> String!
-    g_write("static forge_result_forge_string_t forge_process_read_err(int64_t handle, int64_t max_bytes) " + LB + "\n")
-    g_write("    forge_string_t data;\n")
-    g_write("    if (forge_process_read_err_impl(handle, max_bytes, &data)) " + LB + "\n")
-    g_write("        forge_result_forge_string_t r; r.is_ok = true; r.ok = data;\n")
-    g_write("        return r;\n")
-    g_write("    " + RB + "\n")
-    g_write("    forge_result_forge_string_t r; r.is_ok = false;\n")
-    g_write("    r.err = FORGE_STRING_LIT(\"failed to read stderr from process\");\n")
-    g_write("    return r;\n")
-    g_write(RB + "\n\n")
+    # optional wrapper
+    g_emit_optional_helper("env", "forge_string_t", "forge_env_impl(name.data, name.len, &__v)", "forge_string_t name")
 
 # ---------------------------------------------------------------
 # function forward declarations
@@ -1566,6 +1407,32 @@ fn g_emit_while_stmt(node_idx: Int):
     g_write_indent()
     g_write(RB + "\n")
 
+fn g_emit_for_loop_body(node: Node, idx_name: String, elem_name: String, comma_pos: Int, elem_c: String, elem_tid: Int, is_map: Bool):
+    # shared loop structure for list, map, and set iteration.
+    # list/set use FORGE_LIST_GET; map uses cast into .keys array.
+    g_write_indent()
+    g_write("for (int64_t " + idx_name + " = 0; " + idx_name + " < ")
+    g_emit_expr(node.children[0])
+    g_write(".len; " + idx_name + "++) " + LB + "\n")
+    g_indent = g_indent + 1
+    g_write_indent()
+    g_write(elem_c + " " + elem_name + " = ")
+    if is_map:
+        g_write("((" + elem_c + " *)")
+        g_emit_expr(node.children[0])
+        g_write(".keys)[" + idx_name + "];\n")
+    else:
+        g_write("FORGE_LIST_GET(")
+        g_emit_expr(node.children[0])
+        g_write(", " + elem_c + ", " + idx_name + ");\n")
+    g_local_types.insert(elem_name, elem_tid)
+    if comma_pos >= 0:
+        g_local_types.insert(idx_name, TID_INT)
+    g_emit_block(node.children[1])
+    g_indent = g_indent - 1
+    g_write_indent()
+    g_write(RB + "\n")
+
 fn g_emit_for_stmt(node_idx: Int):
     node := get_node(node_idx)
     # node.value is the binding name (e.g., "item" or "item,idx")
@@ -1600,102 +1467,15 @@ fn g_emit_for_stmt(node_idx: Int):
     iter_info := tt_get(iter_tid)
 
     if iter_info.kind == "list":
-        elem_c := g_c_type_string(iter_info.inner)
-        g_write_indent()
-        g_write("for (int64_t ")
-        g_write(idx_name)
-        g_write(" = 0; ")
-        g_write(idx_name)
-        g_write(" < ")
-        g_emit_expr(node.children[0])
-        g_write(".len; ")
-        g_write(idx_name)
-        g_write("++) " + LB + "\n")
-        g_indent = g_indent + 1
-        g_write_indent()
-        g_write(elem_c)
-        g_write(" ")
-        g_write(elem_name)
-        g_write(" = FORGE_LIST_GET(")
-        g_emit_expr(node.children[0])
-        g_write(", ")
-        g_write(elem_c)
-        g_write(", ")
-        g_write(idx_name)
-        g_write(");\n")
-        g_local_types.insert(elem_name, iter_info.inner)
-        if comma_pos >= 0:
-            g_local_types.insert(idx_name, TID_INT)
-        g_emit_block(node.children[1])
-        g_indent = g_indent - 1
-        g_write_indent()
-        g_write(RB + "\n")
+        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.inner), iter_info.inner, false)
         return
 
     if iter_info.kind == "map":
-        key_c := g_c_type_string(iter_info.key_type)
-        g_write_indent()
-        g_write("for (int64_t ")
-        g_write(idx_name)
-        g_write(" = 0; ")
-        g_write(idx_name)
-        g_write(" < ")
-        g_emit_expr(node.children[0])
-        g_write(".len; ")
-        g_write(idx_name)
-        g_write("++) " + LB + "\n")
-        g_indent = g_indent + 1
-        g_write_indent()
-        g_write(key_c)
-        g_write(" ")
-        g_write(elem_name)
-        g_write(" = ((")
-        g_write(key_c)
-        g_write(" *)")
-        g_emit_expr(node.children[0])
-        g_write(".keys)[")
-        g_write(idx_name)
-        g_write("];\n")
-        g_local_types.insert(elem_name, iter_info.key_type)
-        if comma_pos >= 0:
-            g_local_types.insert(idx_name, TID_INT)
-        g_emit_block(node.children[1])
-        g_indent = g_indent - 1
-        g_write_indent()
-        g_write(RB + "\n")
+        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.key_type), iter_info.key_type, true)
         return
 
     if iter_info.kind == "set":
-        elem_c := g_c_type_string(iter_info.inner)
-        g_write_indent()
-        g_write("for (int64_t ")
-        g_write(idx_name)
-        g_write(" = 0; ")
-        g_write(idx_name)
-        g_write(" < ")
-        g_emit_expr(node.children[0])
-        g_write(".len; ")
-        g_write(idx_name)
-        g_write("++) " + LB + "\n")
-        g_indent = g_indent + 1
-        g_write_indent()
-        g_write(elem_c)
-        g_write(" ")
-        g_write(elem_name)
-        g_write(" = FORGE_LIST_GET(")
-        g_emit_expr(node.children[0])
-        g_write(", ")
-        g_write(elem_c)
-        g_write(", ")
-        g_write(idx_name)
-        g_write(");\n")
-        g_local_types.insert(elem_name, iter_info.inner)
-        if comma_pos >= 0:
-            g_local_types.insert(idx_name, TID_INT)
-        g_emit_block(node.children[1])
-        g_indent = g_indent - 1
-        g_write_indent()
-        g_write(RB + "\n")
+        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.inner), iter_info.inner, false)
         return
 
     g_write_indent()
@@ -2032,45 +1812,23 @@ fn g_is_forge_builtin(name: String) -> Bool:
         return true
     if name == "read_file" or name == "write_file" or name == "append_file":
         return true
-    if name == "env" or name == "chr" or name == "exec" or name == "exec_output":
+    if name == "env" or name == "chr" or name == "ord" or name == "exec" or name == "exec_output":
+        return true
+    if name == "bit_and" or name == "bit_or" or name == "bit_xor" or name == "bit_not" or name == "bit_shl" or name == "bit_shr":
+        return true
+    if name == "print_err":
         return true
     if name == "time" or name == "sleep" or name == "input":
         return true
     if name == "random_int" or name == "random_float":
         return true
-    if name == "path_join" or name == "path_dir" or name == "path_base" or name == "path_ext" or name == "path_stem":
-        return true
-    if name == "log_info" or name == "log_warn" or name == "log_error" or name == "log_debug":
-        return true
     if name == "math_pow" or name == "math_sqrt" or name == "math_floor" or name == "math_ceil" or name == "math_round":
         return true
     if name == "file_exists" or name == "dir_exists" or name == "mkdir" or name == "remove_file" or name == "rename_file" or name == "list_dir":
         return true
-    if name == "fmt_hex" or name == "fmt_oct" or name == "fmt_bin" or name == "fmt_float":
-        return true
-    if name == "json_parse" or name == "json_type" or name == "json_encode":
-        return true
-    if name == "json_get_bool" or name == "json_get_int" or name == "json_get_float" or name == "json_get_string":
-        return true
-    if name == "json_array_len" or name == "json_array_get" or name == "json_array_push":
-        return true
-    if name == "json_object_get" or name == "json_object_has" or name == "json_object_keys" or name == "json_object_set":
-        return true
-    if name == "json_new_null" or name == "json_new_bool" or name == "json_new_int" or name == "json_new_float":
-        return true
-    if name == "json_new_string" or name == "json_new_array" or name == "json_new_object":
-        return true
-    if name == "base64_encode" or name == "base64_decode" or name == "hex_encode" or name == "hex_decode":
-        return true
-    if name == "hash_sha256" or name == "hash_fnv1a":
+    if name == "fmt_float":
         return true
     if name == "format_time" or name == "random_seed" or name == "random_string":
-        return true
-    if name == "url_parse" or name == "url_scheme" or name == "url_host" or name == "url_port":
-        return true
-    if name == "url_path" or name == "url_query" or name == "url_fragment" or name == "url_to_string":
-        return true
-    if name == "percent_encode" or name == "percent_decode":
         return true
     if name == "tcp_connect" or name == "tcp_listen" or name == "tcp_accept":
         return true
@@ -2081,14 +1839,6 @@ fn g_is_forge_builtin(name: String) -> Bool:
     if name == "process_spawn" or name == "process_write" or name == "process_read" or name == "process_read_err":
         return true
     if name == "process_wait" or name == "process_kill" or name == "process_close":
-        return true
-    if name == "toml_parse" or name == "toml_type" or name == "toml_get_string":
-        return true
-    if name == "toml_get_int" or name == "toml_get_float" or name == "toml_get_bool":
-        return true
-    if name == "toml_get_table" or name == "toml_get_array" or name == "toml_array_len":
-        return true
-    if name == "toml_array_get" or name == "toml_keys" or name == "toml_has":
         return true
     return false
 
@@ -2591,6 +2341,18 @@ fn g_emit_channel_method(node_idx: Int, method: String, inner_tid: Int):
 # string methods
 # ---------------------------------------------------------------
 
+fn g_emit_simple_method(node_idx: Int, c_fn: String, nargs: Int):
+    # emit a straightforward method call: c_fn(receiver, arg0, arg1, ...)
+    node := get_node(node_idx)
+    g_write(c_fn + "(")
+    g_emit_expr(node.children[0])
+    mut i := 0
+    while i < nargs:
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, i))
+        i = i + 1
+    g_write(")")
+
 fn g_emit_string_method(node_idx: Int, method: String):
     node := get_node(node_idx)
     receiver_idx := node.children[0]
@@ -2603,110 +2365,53 @@ fn g_emit_string_method(node_idx: Int, method: String):
         g_emit_expr(receiver_idx)
         g_write(".len == 0)")
         return
-    if method == "contains":
-        g_write("forge_string_contains(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if method == "starts_with":
-        g_write("forge_string_starts_with(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if method == "ends_with":
-        g_write("forge_string_ends_with(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if method == "index_of":
-        g_write("forge_string_index_of(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if method == "last_index_of":
-        g_write("forge_string_last_index_of(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if method == "split":
-        g_write("forge_string_split(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
+    # 0-arg passthrough methods
     if method == "trim":
-        g_write("forge_string_trim(")
-        g_emit_expr(receiver_idx)
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_trim", 0)
         return
     if method == "to_upper":
-        g_write("forge_string_to_upper(")
-        g_emit_expr(receiver_idx)
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_to_upper", 0)
         return
     if method == "to_lower":
-        g_write("forge_string_to_lower(")
-        g_emit_expr(receiver_idx)
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_to_lower", 0)
         return
     if method == "chars":
-        g_write("forge_string_chars(")
-        g_emit_expr(receiver_idx)
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_chars", 0)
+        return
+    # 1-arg passthrough methods
+    if method == "contains":
+        g_emit_simple_method(node_idx, "forge_string_contains", 1)
+        return
+    if method == "starts_with":
+        g_emit_simple_method(node_idx, "forge_string_starts_with", 1)
+        return
+    if method == "ends_with":
+        g_emit_simple_method(node_idx, "forge_string_ends_with", 1)
+        return
+    if method == "index_of":
+        g_emit_simple_method(node_idx, "forge_string_index_of", 1)
+        return
+    if method == "last_index_of":
+        g_emit_simple_method(node_idx, "forge_string_last_index_of", 1)
+        return
+    if method == "split":
+        g_emit_simple_method(node_idx, "forge_string_split", 1)
         return
     if method == "repeat":
-        g_write("forge_string_repeat(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_repeat", 1)
         return
+    # 2-arg passthrough methods
     if method == "substring":
-        g_write("forge_string_substring(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_substring", 2)
         return
     if method == "replace":
-        g_write("forge_string_replace(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_replace", 2)
         return
     if method == "pad_left":
-        g_write("forge_string_pad_left(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_pad_left", 2)
         return
     if method == "pad_right":
-        g_write("forge_string_pad_right(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_string_pad_right", 2)
         return
 
 # ---------------------------------------------------------------
@@ -2795,19 +2500,11 @@ fn g_emit_list_method(node_idx: Int, method: String, elem_tid: Int):
         g_write(")")
         return
     if method == "join":
-        g_write("forge_list_join(")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
+        g_emit_simple_method(node_idx, "forge_list_join", 1)
         return
     if method == "index_of":
         if elem_tid == TID_STRING:
-            g_write("forge_list_index_of_string(")
-            g_emit_expr(receiver_idx)
-            g_write(", ")
-            g_emit_expr(g_call_arg(node_idx, 0))
-            g_write(")")
+            g_emit_simple_method(node_idx, "forge_list_index_of_string", 1)
         else:
             g_write("forge_list_index_of(")
             g_emit_expr(receiver_idx)
@@ -4365,8 +4062,8 @@ pub fn g_emit_module(root_idx: Int):
         g_emit_enum_def(decl_idx)
 
     # pass 2b: result/optional/tuple typedefs
-    g_emit_result_typedefs()
-    g_emit_optional_typedefs()
+    g_emit_wrapper_typedefs("result", "forge_result_", g_emitted_results)
+    g_emit_wrapper_typedefs("optional", "forge_optional_", g_emitted_optionals)
     g_emit_tuple_typedefs()
 
     # pass 2c: builtin helpers
@@ -4469,8 +4166,8 @@ pub fn g_emit_modules(roots: List[Int]):
                 g_emit_enum_def(decl_idx)
 
     # pass 2b: result/optional/tuple typedefs (once, covers all modules)
-    g_emit_result_typedefs()
-    g_emit_optional_typedefs()
+    g_emit_wrapper_typedefs("result", "forge_result_", g_emitted_results)
+    g_emit_wrapper_typedefs("optional", "forge_optional_", g_emitted_optionals)
     g_emit_tuple_typedefs()
 
     # pass 2c: builtin helpers (once)

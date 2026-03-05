@@ -1,13 +1,35 @@
 # std.fmt — number formatting utilities
 
 pub fn hex(n: Int) -> String:
-    return fmt_hex(n)
+    if n == 0:
+        return "0"
+    digits := "0123456789abcdef"
+    mut val := n
+    mut result := ""
+    while val > 0:
+        result = digits[val % 16] + result
+        val = val / 16
+    return result
 
 pub fn oct(n: Int) -> String:
-    return fmt_oct(n)
+    if n == 0:
+        return "0"
+    mut val := n
+    mut result := ""
+    while val > 0:
+        result = chr(48 + val % 8) + result
+        val = val / 8
+    return result
 
 pub fn bin(n: Int) -> String:
-    return fmt_bin(n)
+    if n == 0:
+        return "0"
+    mut val := n
+    mut result := ""
+    while val > 0:
+        result = chr(48 + val % 2) + result
+        val = val / 2
+    return result
 
 pub fn float_fixed(n: Float, decimals: Int) -> String:
     return fmt_float(n, decimals)

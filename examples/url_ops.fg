@@ -1,32 +1,33 @@
 # url parsing and percent-encoding
+from std.url import parse, scheme, host, port, path, query, fragment, to_string, encode, decode
 
 fn main():
     # parse a full URL
-    u := url_parse("https://example.com:8080/api/v1?key=value#section")
-    print("scheme: " + url_scheme(u))
-    print("host: " + url_host(u))
-    print("port: " + url_port(u).to_string())
-    print("path: " + url_path(u))
-    print("query: " + url_query(u))
-    print("fragment: " + url_fragment(u))
+    u := parse("https://example.com:8080/api/v1?key=value#section")
+    print("scheme: " + scheme(u))
+    print("host: " + host(u))
+    print("port: " + port(u).to_string())
+    print("path: " + path(u))
+    print("query: " + query(u))
+    print("fragment: " + fragment(u))
 
     # reconstruct
-    print("full: " + url_to_string(u))
+    print("full: " + to_string(u))
 
     # simple URL without port/query/fragment
-    u2 := url_parse("http://localhost/index.html")
-    print("scheme2: " + url_scheme(u2))
-    print("host2: " + url_host(u2))
-    print("port2: " + url_port(u2).to_string())
-    print("path2: " + url_path(u2))
+    u2 := parse("http://localhost/index.html")
+    print("scheme2: " + scheme(u2))
+    print("host2: " + host(u2))
+    print("port2: " + port(u2).to_string())
+    print("path2: " + path(u2))
 
     # percent encode/decode
-    encoded := percent_encode("hello world & more")
+    encoded := encode("hello world & more")
     print("encoded: " + encoded)
-    decoded := percent_decode(encoded)
+    decoded := decode(encoded)
     print("decoded: " + decoded)
 
     # round-trip
     original := "foo=bar baz&x=1+2"
-    rt := percent_decode(percent_encode(original))
+    rt := decode(encode(original))
     print("round-trip: " + rt)

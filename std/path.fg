@@ -1,0 +1,53 @@
+# std.path — file path manipulation (pure string operations)
+
+pub fn join(a: String, b: String) -> String:
+    if a.len() == 0:
+        return b
+    if b.len() == 0:
+        return a
+    # strip trailing slashes from a
+    mut alen := a.len()
+    while alen > 0 and a[alen - 1] == "/":
+        alen = alen - 1
+    # strip leading slashes from b
+    mut bstart := 0
+    while bstart < b.len() and b[bstart] == "/":
+        bstart = bstart + 1
+    return a.substring(0, alen) + "/" + b.substring(bstart, b.len())
+
+pub fn dir(path: String) -> String:
+    mut i := path.len() - 1
+    while i >= 0:
+        if path[i] == "/":
+            if i == 0:
+                return "/"
+            return path.substring(0, i)
+        i = i - 1
+    return "."
+
+pub fn base(path: String) -> String:
+    mut i := path.len() - 1
+    while i >= 0:
+        if path[i] == "/":
+            return path.substring(i + 1, path.len())
+        i = i - 1
+    return path
+
+pub fn ext(path: String) -> String:
+    mut i := path.len() - 1
+    while i >= 0:
+        if path[i] == "/":
+            return ""
+        if path[i] == ".":
+            return path.substring(i, path.len())
+        i = i - 1
+    return ""
+
+pub fn stem(path: String) -> String:
+    b := base(path)
+    mut i := b.len() - 1
+    while i > 0:
+        if b[i] == ".":
+            return b.substring(0, i)
+        i = i - 1
+    return b

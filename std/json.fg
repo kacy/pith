@@ -1,82 +1,432 @@
-# std.json — JSON parse and encode
+# std.json — JSON parse and encode (native forge)
 #
-# uses opaque Int handles into a C-side node pool.
-# a handle of -1 indicates an invalid/missing value.
+# uses opaque Int handles into a node pool.
+# supports: null, bool, int, float, string, array, object.
 
-# parse a JSON string into a handle. returns -1 on parse error.
+# node pool — maps indexed by handle
+mut g_next: Int := 0
+mut g_types: Map[Int, String] := {}
+mut g_str_vals: Map[Int, String] := {}
+mut g_int_vals: Map[Int, Int] := {}
+mut g_float_vals: Map[Int, Float] := {}
+mut g_bool_vals: Map[Int, Bool] := {}
+
+# object children — flat append-only lists, offsets/counts in maps
+mut g_okeys: List[String] := []
+mut g_ovals: List[Int] := []
+mut g_ooff: Map[Int, Int] := {}
+mut g_ocnt: Map[Int, Int] := {}
+
+# array children — flat append-only list, offsets/counts in maps
+mut g_aitems: List[Int] := []
+mut g_aoff: Map[Int, Int] := {}
+mut g_acnt: Map[Int, Int] := {}
+
+fn j_alloc(kind: String) -> Int:
+    idx := g_next
+    g_next = g_next + 1
+    g_types.insert(idx, kind)
+    g_str_vals.insert(idx, "")
+    g_int_vals.insert(idx, 0)
+    g_float_vals.insert(idx, 0.0)
+    g_bool_vals.insert(idx, false)
+    g_ooff.insert(idx, 0)
+    g_ocnt.insert(idx, 0)
+    g_aoff.insert(idx, 0)
+    g_acnt.insert(idx, 0)
+    return idx
+
+fn j_obj_set(handle: Int, key: String, val: Int):
+    cnt := g_ocnt[handle]
+    if cnt == 0:
+        g_ooff.insert(handle, g_okeys.len())
+    g_okeys.push(key)
+    g_ovals.push(val)
+    g_ocnt.insert(handle, cnt + 1)
+
+fn j_arr_push(handle: Int, val: Int):
+    cnt := g_acnt[handle]
+    if cnt == 0:
+        g_aoff.insert(handle, g_aitems.len())
+    g_aitems.push(val)
+    g_acnt.insert(handle, cnt + 1)
+
+# parser state
+mut p_data: String := ""
+mut p_pos: Int := 0
+mut p_err: Bool := false
+
+fn p_at(i: Int) -> String:
+    if i >= p_data.len():
+        return ""
+    return p_data[i]
+
+fn p_skip_ws():
+    while p_pos < p_data.len() and (p_at(p_pos) == " " or p_at(p_pos) == chr(9) or p_at(p_pos) == chr(10) or p_at(p_pos) == chr(13)):
+        p_pos = p_pos + 1
+
+fn j_parse_int_manual(s: String) -> Int:
+    mut val := 0
+    mut neg := false
+    mut i := 0
+    if s.len() > 0 and s[0] == "-":
+        neg = true
+        i = 1
+    if s.len() > 0 and s[0] == "+":
+        i = 1
+    while i < s.len():
+        c := s[i]
+        if c >= "0" and c <= "9":
+            val = val * 10 + (ord(c) - 48)
+        i = i + 1
+    if neg:
+        return 0 - val
+    return val
+
+fn j_parse_float_manual(s: String) -> Float:
+    mut int_part := 0
+    mut frac_part := 0.0
+    mut frac_div := 1.0
+    mut neg := false
+    mut i := 0
+    mut in_frac := false
+    if s.len() > 0 and s[0] == "-":
+        neg = true
+        i = 1
+    if s.len() > 0 and s[0] == "+":
+        i = 1
+    while i < s.len():
+        c := s[i]
+        if c == ".":
+            in_frac = true
+        if c >= "0" and c <= "9" and not in_frac:
+            int_part = int_part * 10 + (ord(c) - 48)
+        if c >= "0" and c <= "9" and in_frac:
+            frac_div = frac_div * 10.0
+            frac_part = frac_part + (ord(c) - 48).to_float() / frac_div
+        i = i + 1
+    result := int_part.to_float() + frac_part
+    if neg:
+        return 0.0 - result
+    return result
+
+fn p_is_num_char(c: String) -> Bool:
+    if c >= "0" and c <= "9":
+        return true
+    if c == "." or c == "e" or c == "E" or c == "+" or c == "-":
+        return true
+    return false
+
+fn p_parse_string_raw() -> String:
+    # skip opening quote
+    p_pos = p_pos + 1
+    start := p_pos
+    while p_pos < p_data.len() and p_at(p_pos) != chr(34):
+        if p_at(p_pos) == chr(92):
+            p_pos = p_pos + 1
+        p_pos = p_pos + 1
+    val := p_data.substring(start, p_pos)
+    if p_pos < p_data.len():
+        p_pos = p_pos + 1
+    return val
+
+fn p_parse_value() -> Int:
+    p_skip_ws()
+    if p_pos >= p_data.len():
+        p_err = true
+        return 0 - 1
+    c := p_at(p_pos)
+
+    # string
+    if c == chr(34):
+        val := p_parse_string_raw()
+        idx := j_alloc("string")
+        g_str_vals.insert(idx, val)
+        return idx
+
+    # boolean true
+    if p_pos + 4 <= p_data.len() and p_data.substring(p_pos, p_pos + 4) == "true":
+        p_pos = p_pos + 4
+        idx := j_alloc("bool")
+        g_bool_vals.insert(idx, true)
+        return idx
+
+    # boolean false
+    if p_pos + 5 <= p_data.len() and p_data.substring(p_pos, p_pos + 5) == "false":
+        p_pos = p_pos + 5
+        idx := j_alloc("bool")
+        return idx
+
+    # null
+    if p_pos + 4 <= p_data.len() and p_data.substring(p_pos, p_pos + 4) == "null":
+        p_pos = p_pos + 4
+        idx := j_alloc("null")
+        return idx
+
+    # array
+    if c == "[":
+        p_pos = p_pos + 1
+        arr := j_alloc("array")
+        p_skip_ws()
+        if p_pos < p_data.len() and p_at(p_pos) == "]":
+            p_pos = p_pos + 1
+            return arr
+        while p_pos < p_data.len() and p_at(p_pos) != "]":
+            val := p_parse_value()
+            if p_err:
+                return 0 - 1
+            j_arr_push(arr, val)
+            p_skip_ws()
+            if p_pos < p_data.len() and p_at(p_pos) == ",":
+                p_pos = p_pos + 1
+            p_skip_ws()
+        if p_pos < p_data.len():
+            p_pos = p_pos + 1
+        return arr
+
+    # object
+    if c == chr(123):
+        p_pos = p_pos + 1
+        obj := j_alloc("object")
+        p_skip_ws()
+        if p_pos < p_data.len() and p_at(p_pos) == chr(125):
+            p_pos = p_pos + 1
+            return obj
+        mut done := false
+        while p_pos < p_data.len() and not done and not p_err:
+            p_skip_ws()
+            if p_pos >= p_data.len() or p_at(p_pos) != chr(34):
+                p_err = true
+                return 0 - 1
+            key := p_parse_string_raw()
+            p_skip_ws()
+            if p_pos < p_data.len() and p_at(p_pos) == ":":
+                p_pos = p_pos + 1
+            val := p_parse_value()
+            if p_err:
+                return 0 - 1
+            j_obj_set(obj, key, val)
+            p_skip_ws()
+            if p_pos < p_data.len() and p_at(p_pos) == ",":
+                p_pos = p_pos + 1
+            p_skip_ws()
+            if p_pos < p_data.len() and p_at(p_pos) == chr(125):
+                done = true
+        if p_pos < p_data.len() and p_at(p_pos) == chr(125):
+            p_pos = p_pos + 1
+        return obj
+
+    # number (int or float)
+    if (c >= "0" and c <= "9") or c == "-" or c == "+":
+        start := p_pos
+        mut is_float := false
+        if c == "-" or c == "+":
+            p_pos = p_pos + 1
+        while p_pos < p_data.len() and p_is_num_char(p_at(p_pos)):
+            d := p_at(p_pos)
+            if d == "." or d == "e" or d == "E":
+                is_float = true
+            p_pos = p_pos + 1
+        num_str := p_data.substring(start, p_pos)
+        if is_float:
+            idx := j_alloc("float")
+            g_float_vals.insert(idx, j_parse_float_manual(num_str))
+            return idx
+        if not is_float:
+            idx := j_alloc("int")
+            g_int_vals.insert(idx, j_parse_int_manual(num_str))
+            return idx
+
+    p_err = true
+    return 0 - 1
+
+# --- public API ---
+
 pub fn parse(input: String) -> Int:
-    return json_parse(input)
+    p_data = input
+    p_pos = 0
+    p_err = false
+    result := p_parse_value()
+    if p_err:
+        return 0 - 1
+    return result
 
-# get the type of a JSON value: "null", "bool", "int", "float",
-# "string", "array", "object", or "invalid".
 pub fn type_of(handle: Int) -> String:
-    return json_type(handle)
+    if handle < 0 or handle >= g_next:
+        return "invalid"
+    return g_types[handle]
 
-# extract a Bool from a JSON value.
 pub fn get_bool(handle: Int) -> Bool:
-    return json_get_bool(handle)
+    if handle < 0 or handle >= g_next:
+        return false
+    if g_types[handle] != "bool":
+        return false
+    return g_bool_vals[handle]
 
-# extract an Int from a JSON value.
 pub fn get_int(handle: Int) -> Int:
-    return json_get_int(handle)
+    if handle < 0 or handle >= g_next:
+        return 0
+    if g_types[handle] == "int":
+        return g_int_vals[handle]
+    return 0
 
-# extract a Float from a JSON value.
 pub fn get_float(handle: Int) -> Float:
-    return json_get_float(handle)
+    if handle < 0 or handle >= g_next:
+        return 0.0
+    if g_types[handle] == "float":
+        return g_float_vals[handle]
+    return 0.0
 
-# extract a String from a JSON value.
 pub fn get_string(handle: Int) -> String:
-    return json_get_string(handle)
+    if handle < 0 or handle >= g_next:
+        return ""
+    if g_types[handle] != "string":
+        return ""
+    return g_str_vals[handle]
 
-# get the length of a JSON array.
 pub fn array_len(handle: Int) -> Int:
-    return json_array_len(handle)
+    if handle < 0 or handle >= g_next:
+        return 0
+    return g_acnt[handle]
 
-# get element at index from a JSON array. returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
-    return json_array_get(handle, index)
+    if handle < 0 or handle >= g_next:
+        return 0 - 1
+    if index < 0 or index >= g_acnt[handle]:
+        return 0 - 1
+    return g_aitems[g_aoff[handle] + index]
 
-# get value for key from a JSON object. returns -1 if key not found.
 pub fn object_get(handle: Int, key: String) -> Int:
-    return json_object_get(handle, key)
+    if handle < 0 or handle >= g_next:
+        return 0 - 1
+    off := g_ooff[handle]
+    cnt := g_ocnt[handle]
+    # scan from end for latest value (handles duplicate keys from object_set)
+    mut i := cnt - 1
+    while i >= 0:
+        if g_okeys[off + i] == key:
+            return g_ovals[off + i]
+        i = i - 1
+    return 0 - 1
 
-# check if a JSON object contains a key.
 pub fn object_has(handle: Int, key: String) -> Bool:
-    return json_object_has(handle, key)
+    return object_get(handle, key) >= 0
 
-# get all keys from a JSON object.
 pub fn object_keys(handle: Int) -> List[String]:
-    return json_object_keys(handle)
+    mut result: List[String] := []
+    if handle < 0 or handle >= g_next:
+        return result
+    off := g_ooff[handle]
+    cnt := g_ocnt[handle]
+    mut i := 0
+    while i < cnt:
+        # skip duplicates — keep first occurrence only
+        mut is_dup := false
+        mut j := 0
+        while j < i:
+            if g_okeys[off + j] == g_okeys[off + i]:
+                is_dup = true
+            j = j + 1
+        if not is_dup:
+            result.push(g_okeys[off + i])
+        i = i + 1
+    return result
 
-# encode a JSON value to a string.
-pub fn encode(handle: Int) -> String:
-    return json_encode(handle)
-
-# --- constructors for building JSON ---
+# --- constructors ---
 
 pub fn make_null() -> Int:
-    return json_new_null()
+    return j_alloc("null")
 
 pub fn make_bool(val: Bool) -> Int:
-    return json_new_bool(val)
+    idx := j_alloc("bool")
+    g_bool_vals.insert(idx, val)
+    return idx
 
 pub fn make_int(val: Int) -> Int:
-    return json_new_int(val)
+    idx := j_alloc("int")
+    g_int_vals.insert(idx, val)
+    return idx
 
 pub fn make_float(val: Float) -> Int:
-    return json_new_float(val)
+    idx := j_alloc("float")
+    g_float_vals.insert(idx, val)
+    return idx
 
 pub fn make_string(val: String) -> Int:
-    return json_new_string(val)
+    idx := j_alloc("string")
+    g_str_vals.insert(idx, val)
+    return idx
 
 pub fn make_array() -> Int:
-    return json_new_array()
+    return j_alloc("array")
 
 pub fn array_push(arr: Int, val: Int):
-    json_array_push(arr, val)
+    j_arr_push(arr, val)
 
 pub fn make_object() -> Int:
-    return json_new_object()
+    return j_alloc("object")
 
 pub fn object_set(obj: Int, key: String, val: Int):
-    json_object_set(obj, key, val)
+    j_obj_set(obj, key, val)
+
+# --- encoder ---
+
+fn j_encode_string(s: String) -> String:
+    mut result := chr(34)
+    mut i := 0
+    while i < s.len():
+        c := s[i]
+        if c == chr(34):
+            result = result + chr(92) + chr(34)
+        if c == chr(92):
+            result = result + chr(92) + chr(92)
+        if c == chr(10):
+            result = result + chr(92) + "n"
+        if c == chr(13):
+            result = result + chr(92) + "r"
+        if c == chr(9):
+            result = result + chr(92) + "t"
+        if c != chr(34) and c != chr(92) and c != chr(10) and c != chr(13) and c != chr(9):
+            result = result + c
+        i = i + 1
+    result = result + chr(34)
+    return result
+
+pub fn encode(handle: Int) -> String:
+    if handle < 0 or handle >= g_next:
+        return "null"
+    kind := g_types[handle]
+    if kind == "null":
+        return "null"
+    if kind == "bool":
+        if g_bool_vals[handle]:
+            return "true"
+        return "false"
+    if kind == "int":
+        return g_int_vals[handle].to_string()
+    if kind == "float":
+        return g_float_vals[handle].to_string()
+    if kind == "string":
+        return j_encode_string(g_str_vals[handle])
+    if kind == "array":
+        mut result := "["
+        off := g_aoff[handle]
+        cnt := g_acnt[handle]
+        mut i := 0
+        while i < cnt:
+            if i > 0:
+                result = result + ","
+            result = result + encode(g_aitems[off + i])
+            i = i + 1
+        return result + "]"
+    if kind == "object":
+        mut result := chr(123)
+        k := object_keys(handle)
+        mut i := 0
+        while i < k.len():
+            if i > 0:
+                result = result + ","
+            result = result + j_encode_string(k[i]) + ":" + encode(object_get(handle, k[i]))
+            i = i + 1
+        return result + chr(125)
+    return "null"

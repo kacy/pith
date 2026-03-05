@@ -73,293 +73,175 @@ pub fn c_init():
     c_register_builtins()
 
 fn c_register_builtins():
-    # print(String) -> Void
-    mut print_params: List[Int] := [TID_STRING]
-    print_tid := tt_add(ti_function(print_params, TID_VOID))
-    sc_define(c_scope, "print", print_tid, false)
-
-    # pre-register List[String] for args() and String.split()
+    # pre-register List[String] — used by String.split() and args()
     c_intern_collection("List", TID_STRING, -1)
-
-    # parse_int(String) -> Int!
-    int_result := tt_add(ti_result(TID_INT, TID_ERR))
-    mut pi_params: List[Int] := [TID_STRING]
-    pi_tid := tt_add(ti_function(pi_params, int_result))
-    sc_define(c_scope, "parse_int", pi_tid, false)
-
-    # parse_float(String) -> Float!
-    float_result := tt_add(ti_result(TID_FLOAT, TID_ERR))
-    mut pf_params: List[Int] := [TID_STRING]
-    pf_tid := tt_add(ti_function(pf_params, float_result))
-    sc_define(c_scope, "parse_float", pf_tid, false)
-
-    # read_file(String) -> String!
-    str_result := tt_add(ti_result(TID_STRING, TID_ERR))
-    mut rf_params: List[Int] := [TID_STRING]
-    rf_tid := tt_add(ti_function(rf_params, str_result))
-    sc_define(c_scope, "read_file", rf_tid, false)
-
-    # write_file(String, String) -> Bool!
-    bool_result := tt_add(ti_result(TID_BOOL, TID_ERR))
-    mut wf_params: List[Int] := [TID_STRING, TID_STRING]
-    wf_tid := tt_add(ti_function(wf_params, bool_result))
-    sc_define(c_scope, "write_file", wf_tid, false)
-
-    # args() -> List[String]
     list_string := tt_lookup("List[String]")
-    mut args_params: List[Int] := []
-    args_tid := tt_add(ti_function(args_params, list_string))
-    sc_define(c_scope, "args", args_tid, false)
 
-    # env(String) -> String?
+    # result types used by multiple builtins
+    int_result := tt_add(ti_result(TID_INT, TID_ERR))
+    float_result := tt_add(ti_result(TID_FLOAT, TID_ERR))
+    str_result := tt_add(ti_result(TID_STRING, TID_ERR))
+    bool_result := tt_add(ti_result(TID_BOOL, TID_ERR))
     opt_string := tt_add(ti_optional(TID_STRING))
-    mut env_params: List[Int] := [TID_STRING]
-    env_tid := tt_add(ti_function(env_params, opt_string))
-    sc_define(c_scope, "env", env_tid, false)
 
-    # chr(Int) -> String
-    mut chr_params: List[Int] := [TID_INT]
-    chr_tid := tt_add(ti_function(chr_params, TID_STRING))
-    sc_define(c_scope, "chr", chr_tid, false)
+    # --- shared function signatures, one type per group ---
 
-    # exit(Int) -> Void
-    mut exit_params: List[Int] := [TID_INT]
-    exit_tid := tt_add(ti_function(exit_params, TID_VOID))
-    sc_define(c_scope, "exit", exit_tid, false)
+    # () -> Int
+    void_to_int := c_make_fn_type([], TID_INT)
+    c_def_builtin("time", void_to_int)
+    c_def_builtin("json_new_null", void_to_int)
+    c_def_builtin("json_new_array", void_to_int)
+    c_def_builtin("json_new_object", void_to_int)
+    # () -> Float
+    c_def_builtin("random_float", c_make_fn_type([], TID_FLOAT))
+    # () -> String
+    c_def_builtin("input", c_make_fn_type([], TID_STRING))
+    # () -> List[String]
+    c_def_builtin("args", c_make_fn_type([], list_string))
 
-    # exec(String) -> Int
-    mut exec_params: List[Int] := [TID_STRING]
-    exec_tid := tt_add(ti_function(exec_params, TID_INT))
-    sc_define(c_scope, "exec", exec_tid, false)
+    # (Bool) -> Void
+    c_def_builtin("assert", c_make_fn_type([TID_BOOL], TID_VOID))
+    # (Bool) -> Int
+    c_def_builtin("json_new_bool", c_make_fn_type([TID_BOOL], TID_INT))
 
-    # time() -> Int
-    mut time_params: List[Int] := []
-    time_tid := tt_add(ti_function(time_params, TID_INT))
-    sc_define(c_scope, "time", time_tid, false)
+    # (Int) -> Void
+    int_to_void := c_make_fn_type([TID_INT], TID_VOID)
+    c_def_builtin("exit", int_to_void)
+    c_def_builtin("sleep", int_to_void)
+    # (Int) -> Int
+    int_to_int := c_make_fn_type([TID_INT], TID_INT)
+    c_def_builtin("json_get_int", int_to_int)
+    c_def_builtin("json_array_len", int_to_int)
+    c_def_builtin("json_new_int", int_to_int)
+    # (Int) -> Float
+    c_def_builtin("json_get_float", c_make_fn_type([TID_INT], TID_FLOAT))
+    # (Int) -> Bool
+    c_def_builtin("json_get_bool", c_make_fn_type([TID_INT], TID_BOOL))
+    # (Int) -> String
+    int_to_str := c_make_fn_type([TID_INT], TID_STRING)
+    c_def_builtin("chr", int_to_str)
+    c_def_builtin("fmt_hex", int_to_str)
+    c_def_builtin("fmt_oct", int_to_str)
+    c_def_builtin("fmt_bin", int_to_str)
+    c_def_builtin("json_type", int_to_str)
+    c_def_builtin("json_get_string", int_to_str)
+    c_def_builtin("json_encode", int_to_str)
+    # (Int) -> List[String]
+    c_def_builtin("json_object_keys", c_make_fn_type([TID_INT], list_string))
 
-    # sleep(Int) -> Void
-    mut sleep_params: List[Int] := [TID_INT]
-    sleep_tid := tt_add(ti_function(sleep_params, TID_VOID))
-    sc_define(c_scope, "sleep", sleep_tid, false)
+    # (Int, Int) -> Void
+    two_int_to_void := c_make_fn_type([TID_INT, TID_INT], TID_VOID)
+    c_def_builtin("json_array_push", two_int_to_void)
+    # assert_eq/ne — placeholder (Int, Int), special-cased in checkCall
+    c_def_builtin("assert_eq", two_int_to_void)
+    c_def_builtin("assert_ne", two_int_to_void)
+    # (Int, Int) -> Int
+    two_int_to_int := c_make_fn_type([TID_INT, TID_INT], TID_INT)
+    c_def_builtin("random_int", two_int_to_int)
+    c_def_builtin("json_array_get", two_int_to_int)
 
-    # random_int(Int, Int) -> Int
-    mut ri_params: List[Int] := [TID_INT, TID_INT]
-    ri_tid := tt_add(ti_function(ri_params, TID_INT))
-    sc_define(c_scope, "random_int", ri_tid, false)
+    # (Int, String) -> Int
+    c_def_builtin("json_object_get", c_make_fn_type([TID_INT, TID_STRING], TID_INT))
+    # (Int, String) -> Bool
+    c_def_builtin("json_object_has", c_make_fn_type([TID_INT, TID_STRING], TID_BOOL))
+    # (Int, String, Int) -> Void
+    c_def_builtin("json_object_set", c_make_fn_type([TID_INT, TID_STRING, TID_INT], TID_VOID))
 
-    # random_float() -> Float
-    mut rflt_params: List[Int] := []
-    rflt_tid := tt_add(ti_function(rflt_params, TID_FLOAT))
-    sc_define(c_scope, "random_float", rflt_tid, false)
+    # (Float) -> Float
+    c_def_builtin("math_sqrt", c_make_fn_type([TID_FLOAT], TID_FLOAT))
+    # (Float) -> Int
+    float_to_int := c_make_fn_type([TID_FLOAT], TID_INT)
+    c_def_builtin("math_floor", float_to_int)
+    c_def_builtin("math_ceil", float_to_int)
+    c_def_builtin("math_round", float_to_int)
+    c_def_builtin("json_new_float", float_to_int)
+    # (Float, Float) -> Float
+    c_def_builtin("math_pow", c_make_fn_type([TID_FLOAT, TID_FLOAT], TID_FLOAT))
+    # (Float, Int) -> String
+    c_def_builtin("fmt_float", c_make_fn_type([TID_FLOAT, TID_INT], TID_STRING))
 
-    # exec_output(String) -> String!
-    mut eo_params: List[Int] := [TID_STRING]
-    eo_tid := tt_add(ti_function(eo_params, str_result))
-    sc_define(c_scope, "exec_output", eo_tid, false)
+    # (String) -> Void
+    str_to_void := c_make_fn_type([TID_STRING], TID_VOID)
+    c_def_builtin("print", str_to_void)
+    c_def_builtin("log_info", str_to_void)
+    c_def_builtin("log_warn", str_to_void)
+    c_def_builtin("log_error", str_to_void)
+    c_def_builtin("log_debug", str_to_void)
+    # (String) -> Int
+    str_to_int := c_make_fn_type([TID_STRING], TID_INT)
+    c_def_builtin("exec", str_to_int)
+    c_def_builtin("json_parse", str_to_int)
+    c_def_builtin("json_new_string", str_to_int)
+    # (String) -> Bool
+    str_to_bool := c_make_fn_type([TID_STRING], TID_BOOL)
+    c_def_builtin("file_exists", str_to_bool)
+    c_def_builtin("dir_exists", str_to_bool)
+    c_def_builtin("mkdir", str_to_bool)
+    c_def_builtin("remove_file", str_to_bool)
+    # (String) -> String
+    str_to_str := c_make_fn_type([TID_STRING], TID_STRING)
+    c_def_builtin("path_dir", str_to_str)
+    c_def_builtin("path_base", str_to_str)
+    c_def_builtin("path_ext", str_to_str)
+    c_def_builtin("path_stem", str_to_str)
+    # (String) -> String?
+    c_def_builtin("env", c_make_fn_type([TID_STRING], opt_string))
+    # (String) -> List[String]
+    c_def_builtin("list_dir", c_make_fn_type([TID_STRING], list_string))
 
-    # input() -> String
-    mut inp_params: List[Int] := []
-    inp_tid := tt_add(ti_function(inp_params, TID_STRING))
-    sc_define(c_scope, "input", inp_tid, false)
+    # (String) -> Int!
+    c_def_builtin("parse_int", c_make_fn_type([TID_STRING], int_result))
+    # (String) -> Float!
+    c_def_builtin("parse_float", c_make_fn_type([TID_STRING], float_result))
+    # (String) -> String!
+    str_to_str_result := c_make_fn_type([TID_STRING], str_result)
+    c_def_builtin("read_file", str_to_str_result)
+    c_def_builtin("exec_output", str_to_str_result)
 
-    # assert(Bool) -> Void
-    mut assert_params: List[Int] := [TID_BOOL]
-    assert_tid := tt_add(ti_function(assert_params, TID_VOID))
-    sc_define(c_scope, "assert", assert_tid, false)
-
-    # assert_eq/assert_ne — placeholder (Int, Int), special-cased in checkCall
-    mut aeq_params: List[Int] := [TID_INT, TID_INT]
-    aeq_tid := tt_add(ti_function(aeq_params, TID_VOID))
-    sc_define(c_scope, "assert_eq", aeq_tid, false)
-    sc_define(c_scope, "assert_ne", aeq_tid, false)
-
-    # path_join(String, String) -> String
-    mut pj_params: List[Int] := [TID_STRING, TID_STRING]
-    pj_tid := tt_add(ti_function(pj_params, TID_STRING))
-    sc_define(c_scope, "path_join", pj_tid, false)
-
-    # path_dir, path_base, path_ext, path_stem: (String) -> String
-    mut pd_params: List[Int] := [TID_STRING]
-    pd_tid := tt_add(ti_function(pd_params, TID_STRING))
-    sc_define(c_scope, "path_dir", pd_tid, false)
-    mut pb_params: List[Int] := [TID_STRING]
-    pb_tid := tt_add(ti_function(pb_params, TID_STRING))
-    sc_define(c_scope, "path_base", pb_tid, false)
-    mut pe_params: List[Int] := [TID_STRING]
-    pe_tid := tt_add(ti_function(pe_params, TID_STRING))
-    sc_define(c_scope, "path_ext", pe_tid, false)
-    mut ps_params: List[Int] := [TID_STRING]
-    ps_tid := tt_add(ti_function(ps_params, TID_STRING))
-    sc_define(c_scope, "path_stem", ps_tid, false)
-
-    # log_info, log_warn, log_error, log_debug: (String) -> Void
-    mut li_params: List[Int] := [TID_STRING]
-    li_tid := tt_add(ti_function(li_params, TID_VOID))
-    sc_define(c_scope, "log_info", li_tid, false)
-    mut lw_params: List[Int] := [TID_STRING]
-    lw_tid := tt_add(ti_function(lw_params, TID_VOID))
-    sc_define(c_scope, "log_warn", lw_tid, false)
-    mut le_params: List[Int] := [TID_STRING]
-    le_tid := tt_add(ti_function(le_params, TID_VOID))
-    sc_define(c_scope, "log_error", le_tid, false)
-    mut ld_params: List[Int] := [TID_STRING]
-    ld_tid := tt_add(ti_function(ld_params, TID_VOID))
-    sc_define(c_scope, "log_debug", ld_tid, false)
-
-    # math_pow(Float, Float) -> Float
-    mut mp_params: List[Int] := [TID_FLOAT, TID_FLOAT]
-    mp_tid := tt_add(ti_function(mp_params, TID_FLOAT))
-    sc_define(c_scope, "math_pow", mp_tid, false)
-
-    # math_sqrt(Float) -> Float
-    mut ms_params: List[Int] := [TID_FLOAT]
-    ms_tid := tt_add(ti_function(ms_params, TID_FLOAT))
-    sc_define(c_scope, "math_sqrt", ms_tid, false)
-
-    # math_floor, math_ceil, math_round: (Float) -> Int
-    mut mf_params: List[Int] := [TID_FLOAT]
-    mf_tid := tt_add(ti_function(mf_params, TID_INT))
-    sc_define(c_scope, "math_floor", mf_tid, false)
-    sc_define(c_scope, "math_ceil", mf_tid, false)
-    sc_define(c_scope, "math_round", mf_tid, false)
-
-    # file_exists(String) -> Bool, dir_exists(String) -> Bool
-    # mkdir(String) -> Bool, remove_file(String) -> Bool
-    mut fe_params: List[Int] := [TID_STRING]
-    fe_tid := tt_add(ti_function(fe_params, TID_BOOL))
-    sc_define(c_scope, "file_exists", fe_tid, false)
-    sc_define(c_scope, "dir_exists", fe_tid, false)
-    sc_define(c_scope, "mkdir", fe_tid, false)
-    sc_define(c_scope, "remove_file", fe_tid, false)
-
-    # rename_file(String, String) -> Bool
-    mut ren_params: List[Int] := [TID_STRING, TID_STRING]
-    ren_tid := tt_add(ti_function(ren_params, TID_BOOL))
-    sc_define(c_scope, "rename_file", ren_tid, false)
-
-    # append_file(String, String) -> Bool!
-    mut af_params: List[Int] := [TID_STRING, TID_STRING]
-    af_tid := tt_add(ti_function(af_params, bool_result))
-    sc_define(c_scope, "append_file", af_tid, false)
-
-    # list_dir(String) -> List[String]
-    mut lsd_params: List[Int] := [TID_STRING]
-    lsd_tid := tt_add(ti_function(lsd_params, list_string))
-    sc_define(c_scope, "list_dir", lsd_tid, false)
-
-    # fmt_hex(Int) -> String, fmt_oct(Int) -> String, fmt_bin(Int) -> String
-    mut fmti_params: List[Int] := [TID_INT]
-    fmti_tid := tt_add(ti_function(fmti_params, TID_STRING))
-    sc_define(c_scope, "fmt_hex", fmti_tid, false)
-    sc_define(c_scope, "fmt_oct", fmti_tid, false)
-    sc_define(c_scope, "fmt_bin", fmti_tid, false)
-
-    # fmt_float(Float, Int) -> String
-    mut fmtf_params: List[Int] := [TID_FLOAT, TID_INT]
-    fmtf_tid := tt_add(ti_function(fmtf_params, TID_STRING))
-    sc_define(c_scope, "fmt_float", fmtf_tid, false)
-
-    # json builtins — opaque handle-based API
-    # json_parse(String) -> Int
-    mut jp_params: List[Int] := [TID_STRING]
-    jp_tid := tt_add(ti_function(jp_params, TID_INT))
-    sc_define(c_scope, "json_parse", jp_tid, false)
-
-    # json_type(Int) -> String, json_get_string(Int) -> String, json_encode(Int) -> String
-    sc_define(c_scope, "json_type", fmti_tid, false)
-    sc_define(c_scope, "json_get_string", fmti_tid, false)
-    sc_define(c_scope, "json_encode", fmti_tid, false)
-
-    # json_get_bool(Int) -> Bool
-    mut jgb_params: List[Int] := [TID_INT]
-    jgb_tid := tt_add(ti_function(jgb_params, TID_BOOL))
-    sc_define(c_scope, "json_get_bool", jgb_tid, false)
-
-    # json_get_int(Int) -> Int, json_array_len(Int) -> Int
-    mut jgi_params: List[Int] := [TID_INT]
-    jgi_tid := tt_add(ti_function(jgi_params, TID_INT))
-    sc_define(c_scope, "json_get_int", jgi_tid, false)
-    sc_define(c_scope, "json_array_len", jgi_tid, false)
-
-    # json_get_float(Int) -> Float
-    mut jgf_params: List[Int] := [TID_INT]
-    jgf_tid := tt_add(ti_function(jgf_params, TID_FLOAT))
-    sc_define(c_scope, "json_get_float", jgf_tid, false)
-
-    # json_array_get(Int, Int) -> Int
-    mut jag_params: List[Int] := [TID_INT, TID_INT]
-    jag_tid := tt_add(ti_function(jag_params, TID_INT))
-    sc_define(c_scope, "json_array_get", jag_tid, false)
-
-    # json_object_get(Int, String) -> Int
-    mut jog_params: List[Int] := [TID_INT, TID_STRING]
-    jog_tid := tt_add(ti_function(jog_params, TID_INT))
-    sc_define(c_scope, "json_object_get", jog_tid, false)
-
-    # json_object_has(Int, String) -> Bool
-    mut joh_params: List[Int] := [TID_INT, TID_STRING]
-    joh_tid := tt_add(ti_function(joh_params, TID_BOOL))
-    sc_define(c_scope, "json_object_has", joh_tid, false)
-
-    # json_object_keys(Int) -> List[String]
-    mut jok_params: List[Int] := [TID_INT]
-    jok_tid := tt_add(ti_function(jok_params, list_string))
-    sc_define(c_scope, "json_object_keys", jok_tid, false)
-
-    # json constructors
-    # json_new_null() -> Int, json_new_array() -> Int, json_new_object() -> Int
-    mut jnn_params: List[Int] := []
-    jnn_tid := tt_add(ti_function(jnn_params, TID_INT))
-    sc_define(c_scope, "json_new_null", jnn_tid, false)
-    sc_define(c_scope, "json_new_array", jnn_tid, false)
-    sc_define(c_scope, "json_new_object", jnn_tid, false)
-
-    # json_new_bool(Bool) -> Int
-    mut jnb_params: List[Int] := [TID_BOOL]
-    jnb_tid := tt_add(ti_function(jnb_params, TID_INT))
-    sc_define(c_scope, "json_new_bool", jnb_tid, false)
-
-    # json_new_int(Int) -> Int
-    sc_define(c_scope, "json_new_int", jgi_tid, false)
-
-    # json_new_float(Float) -> Int
-    mut jnf_params: List[Int] := [TID_FLOAT]
-    jnf_tid := tt_add(ti_function(jnf_params, TID_INT))
-    sc_define(c_scope, "json_new_float", jnf_tid, false)
-
-    # json_new_string(String) -> Int
-    sc_define(c_scope, "json_new_string", jp_tid, false)
-
-    # json_array_push(Int, Int) -> Void
-    mut jap_params: List[Int] := [TID_INT, TID_INT]
-    jap_tid := tt_add(ti_function(jap_params, TID_VOID))
-    sc_define(c_scope, "json_array_push", jap_tid, false)
-
-    # json_object_set(Int, String, Int) -> Void
-    mut jos_params: List[Int] := [TID_INT, TID_STRING, TID_INT]
-    jos_tid := tt_add(ti_function(jos_params, TID_VOID))
-    sc_define(c_scope, "json_object_set", jos_tid, false)
+    # (String, String) -> String
+    c_def_builtin("path_join", c_make_fn_type([TID_STRING, TID_STRING], TID_STRING))
+    # (String, String) -> Bool
+    c_def_builtin("rename_file", c_make_fn_type([TID_STRING, TID_STRING], TID_BOOL))
+    # (String, String) -> Bool!
+    two_str_to_bool_result := c_make_fn_type([TID_STRING, TID_STRING], bool_result)
+    c_def_builtin("write_file", two_str_to_bool_result)
+    c_def_builtin("append_file", two_str_to_bool_result)
 
     # concurrency primitives (stub types)
-    mut empty_s: List[String] := []
-    mut empty_i: List[Int] := []
-    mut empty_b: List[Bool] := []
-    mutex_tid := tt_add(ti_struct("Mutex", empty_s, empty_i, empty_b, empty_b))
-    tt_register("Mutex", mutex_tid)
-    sc_define(c_scope, "Mutex", mutex_tid, false)
-    mut empty_s2: List[String] := []
-    mut empty_i2: List[Int] := []
-    mut empty_b2: List[Bool] := []
-    wg_tid := tt_add(ti_struct("WaitGroup", empty_s2, empty_i2, empty_b2, empty_b2))
-    tt_register("WaitGroup", wg_tid)
-    sc_define(c_scope, "WaitGroup", wg_tid, false)
-    mut sem_fields: List[String] := ["limit"]
-    mut sem_ftypes: List[Int] := [TID_INT]
-    mut sem_pub: List[Bool] := [false]
-    mut sem_mut: List[Bool] := [false]
-    sem_tid := tt_add(ti_struct("Semaphore", sem_fields, sem_ftypes, sem_pub, sem_mut))
-    tt_register("Semaphore", sem_tid)
-    sc_define(c_scope, "Semaphore", sem_tid, false)
+    c_register_sync_type("Mutex", [])
+    c_register_sync_type("WaitGroup", [])
+    c_register_sync_type("Semaphore", [TID_INT])
+
+# create a function type from param list and return type
+fn c_make_fn_type(params: List[Int], ret: Int) -> Int:
+    # ti_function takes a mutable list, so copy the input
+    mut p: List[Int] := []
+    mut i := 0
+    while i < params.len():
+        p.push(params[i])
+        i = i + 1
+    return tt_add(ti_function(p, ret))
+
+# register a builtin function name with a pre-computed function type
+fn c_def_builtin(name: String, fn_tid: Int):
+    sc_define(c_scope, name, fn_tid, false)
+
+# register an opaque sync primitive type with a constructor
+fn c_register_sync_type(name: String, param_tids: List[Int]):
+    mut fields: List[String] := []
+    mut ftypes: List[Int] := []
+    mut fpub: List[Bool] := []
+    mut fmut: List[Bool] := []
+    tid := tt_add(ti_struct(name, fields, ftypes, fpub, fmut))
+    tt_register(name, tid)
+    # constructor: create function type with param_tids -> tid
+    mut ctor_params: List[Int] := []
+    mut j := 0
+    while j < param_tids.len():
+        ctor_params.push(param_tids[j])
+        j = j + 1
+    ctor_tid := tt_add(ti_function(ctor_params, tid))
+    sc_define(c_scope, name, ctor_tid, false)
 
 # ---------------------------------------------------------------
 # intern collection types

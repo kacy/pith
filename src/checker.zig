@@ -368,6 +368,29 @@ pub const Checker = struct {
         try self.module_scope.define("log_error", .{ .type_id = log_type, .is_mut = false });
         try self.module_scope.define("log_debug", .{ .type_id = log_type, .is_mut = false });
 
+        // math_pow(Float, Float) -> Float
+        const math_pow_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .float, .float },
+            .return_type = .float,
+        } });
+        try self.module_scope.define("math_pow", .{ .type_id = math_pow_type, .is_mut = false });
+
+        // math_sqrt(Float) -> Float
+        const math_sqrt_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.float},
+            .return_type = .float,
+        } });
+        try self.module_scope.define("math_sqrt", .{ .type_id = math_sqrt_type, .is_mut = false });
+
+        // math_floor, math_ceil, math_round: (Float) -> Int
+        const float_to_int_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.float},
+            .return_type = .int,
+        } });
+        try self.module_scope.define("math_floor", .{ .type_id = float_to_int_type, .is_mut = false });
+        try self.module_scope.define("math_ceil", .{ .type_id = float_to_int_type, .is_mut = false });
+        try self.module_scope.define("math_round", .{ .type_id = float_to_int_type, .is_mut = false });
+
         // file_exists(String) -> Bool, dir_exists(String) -> Bool
         // mkdir(String) -> Bool, remove_file(String) -> Bool
         const str_to_bool_type = try self.type_table.addType(.{ .function = .{

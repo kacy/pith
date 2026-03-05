@@ -460,7 +460,7 @@ fn runTest(allocator: std.mem.Allocator, path: []const u8, json: bool) !void {
 
     const cc_result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "zig", "cc", "-w", "-o", out_path, "-I", build_dir, c_path, "-lpthread" },
+        .argv = &.{ "zig", "cc", "-w", "-o", out_path, "-I", build_dir, c_path, "-lpthread", "-lm" },
     }) catch |err| {
         io.writeErr("error: could not run zig cc: {}\n", .{err});
         return;
@@ -650,7 +650,7 @@ fn runBuild(allocator: std.mem.Allocator, path: []const u8, run_after: bool, jso
 
     const cc_result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "zig", "cc", "-w", "-o", out_path, "-I", build_dir, c_path, "-lpthread" },
+        .argv = &.{ "zig", "cc", "-w", "-o", out_path, "-I", build_dir, c_path, "-lpthread", "-lm" },
     }) catch |err| {
         io.writeErr("error: could not run zig cc: {}\n", .{err});
         return;

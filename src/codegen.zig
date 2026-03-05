@@ -2527,7 +2527,12 @@ pub const CEmitter = struct {
             std.mem.eql(u8, name, "remove_file") or
             std.mem.eql(u8, name, "rename_file") or
             std.mem.eql(u8, name, "append_file") or
-            std.mem.eql(u8, name, "list_dir"))
+            std.mem.eql(u8, name, "list_dir") or
+            std.mem.eql(u8, name, "math_pow") or
+            std.mem.eql(u8, name, "math_sqrt") or
+            std.mem.eql(u8, name, "math_floor") or
+            std.mem.eql(u8, name, "math_ceil") or
+            std.mem.eql(u8, name, "math_round"))
         {
             try self.writeStr("forge_");
             try self.writeStr(name);

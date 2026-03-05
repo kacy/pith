@@ -1976,6 +1976,20 @@ fn g_emit_call(node_idx: Int):
         g_emit_expr(g_call_arg(node_idx, 0))
         g_write(")")
         return
+    if name == "math_pow":
+        g_write("forge_math_pow(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 1))
+        g_write(")")
+        return
+    if name == "math_sqrt" or name == "math_floor" or name == "math_ceil" or name == "math_round":
+        g_write("forge_")
+        g_write(name)
+        g_write("(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(")")
+        return
     if name == "file_exists" or name == "dir_exists" or name == "mkdir" or name == "remove_file" or name == "list_dir":
         g_write("forge_")
         g_write(name)

@@ -1155,6 +1155,32 @@ static inline forge_string_t forge_input(void) {
 }
 
 // ---------------------------------------------------------------
+// math functions
+// ---------------------------------------------------------------
+
+#include <math.h>
+
+static inline double forge_math_pow(double base, double exp) {
+    return pow(base, exp);
+}
+
+static inline double forge_math_sqrt(double x) {
+    return sqrt(x);
+}
+
+static inline int64_t forge_math_floor(double x) {
+    return (int64_t)floor(x);
+}
+
+static inline int64_t forge_math_ceil(double x) {
+    return (int64_t)ceil(x);
+}
+
+static inline int64_t forge_math_round(double x) {
+    return (int64_t)round(x);
+}
+
+// ---------------------------------------------------------------
 // file system operations
 // ---------------------------------------------------------------
 

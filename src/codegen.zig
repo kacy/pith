@@ -2532,7 +2532,11 @@ pub const CEmitter = struct {
             std.mem.eql(u8, name, "math_sqrt") or
             std.mem.eql(u8, name, "math_floor") or
             std.mem.eql(u8, name, "math_ceil") or
-            std.mem.eql(u8, name, "math_round"))
+            std.mem.eql(u8, name, "math_round") or
+            std.mem.eql(u8, name, "fmt_hex") or
+            std.mem.eql(u8, name, "fmt_oct") or
+            std.mem.eql(u8, name, "fmt_bin") or
+            std.mem.eql(u8, name, "fmt_float"))
         {
             try self.writeStr("forge_");
             try self.writeStr(name);

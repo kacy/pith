@@ -1997,6 +1997,20 @@ fn g_emit_call(node_idx: Int):
         g_emit_expr(g_call_arg(node_idx, 0))
         g_write(")")
         return
+    if name == "fmt_hex" or name == "fmt_oct" or name == "fmt_bin":
+        g_write("forge_")
+        g_write(name)
+        g_write("(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(")")
+        return
+    if name == "fmt_float":
+        g_write("forge_fmt_float(")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, 1))
+        g_write(")")
+        return
     if name == "rename_file":
         g_write("forge_rename_file(")
         g_emit_expr(g_call_arg(node_idx, 0))

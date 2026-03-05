@@ -419,6 +419,22 @@ pub const Checker = struct {
         } });
         try self.module_scope.define("list_dir", .{ .type_id = list_dir_type, .is_mut = false });
 
+        // fmt_hex(Int) -> String, fmt_oct(Int) -> String, fmt_bin(Int) -> String
+        const int_to_str_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{.int},
+            .return_type = .string,
+        } });
+        try self.module_scope.define("fmt_hex", .{ .type_id = int_to_str_type, .is_mut = false });
+        try self.module_scope.define("fmt_oct", .{ .type_id = int_to_str_type, .is_mut = false });
+        try self.module_scope.define("fmt_bin", .{ .type_id = int_to_str_type, .is_mut = false });
+
+        // fmt_float(Float, Int) -> String
+        const fmt_float_type = try self.type_table.addType(.{ .function = .{
+            .param_types = &.{ .float, .int },
+            .return_type = .string,
+        } });
+        try self.module_scope.define("fmt_float", .{ .type_id = fmt_float_type, .is_mut = false });
+
         // sync primitives — opaque struct types with constructors
         try self.registerSyncType("Mutex", &.{});
         try self.registerSyncType("WaitGroup", &.{});

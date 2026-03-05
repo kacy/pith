@@ -1350,6 +1350,63 @@ static inline int64_t forge_math_round(double x) {
 }
 
 // ---------------------------------------------------------------
+// formatting functions
+// ---------------------------------------------------------------
+
+// fmt_hex(Int) -> String: format integer as hexadecimal
+static inline forge_string_t forge_fmt_hex(int64_t n) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%" PRIx64, (uint64_t)n);
+    char *result = (char *)malloc((size_t)len + 1);
+    if (!result) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(result, buf, (size_t)len + 1);
+    return (forge_string_t){ .data = result, .len = len };
+}
+
+// fmt_oct(Int) -> String: format integer as octal
+static inline forge_string_t forge_fmt_oct(int64_t n) {
+    char buf[32];
+    int len = snprintf(buf, sizeof(buf), "%" PRIo64, (uint64_t)n);
+    char *result = (char *)malloc((size_t)len + 1);
+    if (!result) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(result, buf, (size_t)len + 1);
+    return (forge_string_t){ .data = result, .len = len };
+}
+
+// fmt_bin(Int) -> String: format integer as binary
+static inline forge_string_t forge_fmt_bin(int64_t n) {
+    if (n == 0) {
+        char *z = (char *)malloc(2);
+        if (!z) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        z[0] = '0'; z[1] = '\0';
+        return (forge_string_t){ .data = z, .len = 1 };
+    }
+    char buf[65];
+    int pos = 64;
+    buf[pos] = '\0';
+    uint64_t v = (uint64_t)n;
+    while (v > 0) {
+        buf[--pos] = '0' + (char)(v & 1);
+        v >>= 1;
+    }
+    int len = 64 - pos;
+    char *result = (char *)malloc((size_t)len + 1);
+    if (!result) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(result, buf + pos, (size_t)len + 1);
+    return (forge_string_t){ .data = result, .len = len };
+}
+
+// fmt_float(Float, Int) -> String: format float with fixed decimal places
+static inline forge_string_t forge_fmt_float(double n, int64_t decimals) {
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "%.*f", (int)decimals, n);
+    char *result = (char *)malloc((size_t)len + 1);
+    if (!result) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    memcpy(result, buf, (size_t)len + 1);
+    return (forge_string_t){ .data = result, .len = len };
+}
+
+// ---------------------------------------------------------------
 // file system operations
 // ---------------------------------------------------------------
 

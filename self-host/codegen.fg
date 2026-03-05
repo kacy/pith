@@ -1873,6 +1873,53 @@ fn g_emit_unary(node_idx: Int):
         return
     g_emit_expr(node.children[0])
 
+# check if a builtin follows the forge_<name>(<args>) pattern.
+# these builtins need no special emit logic — just prefix and args.
+fn g_is_forge_builtin(name: String) -> Bool:
+    if name == "parse_int" or name == "parse_float":
+        return true
+    if name == "read_file" or name == "write_file" or name == "append_file":
+        return true
+    if name == "env" or name == "chr" or name == "exec" or name == "exec_output":
+        return true
+    if name == "time" or name == "sleep" or name == "input":
+        return true
+    if name == "random_int" or name == "random_float":
+        return true
+    if name == "path_join" or name == "path_dir" or name == "path_base" or name == "path_ext" or name == "path_stem":
+        return true
+    if name == "log_info" or name == "log_warn" or name == "log_error" or name == "log_debug":
+        return true
+    if name == "math_pow" or name == "math_sqrt" or name == "math_floor" or name == "math_ceil" or name == "math_round":
+        return true
+    if name == "file_exists" or name == "dir_exists" or name == "mkdir" or name == "remove_file" or name == "rename_file" or name == "list_dir":
+        return true
+    if name == "fmt_hex" or name == "fmt_oct" or name == "fmt_bin" or name == "fmt_float":
+        return true
+    if name == "json_parse" or name == "json_type" or name == "json_encode":
+        return true
+    if name == "json_get_bool" or name == "json_get_int" or name == "json_get_float" or name == "json_get_string":
+        return true
+    if name == "json_array_len" or name == "json_array_get" or name == "json_array_push":
+        return true
+    if name == "json_object_get" or name == "json_object_has" or name == "json_object_keys" or name == "json_object_set":
+        return true
+    if name == "json_new_null" or name == "json_new_bool" or name == "json_new_int" or name == "json_new_float":
+        return true
+    if name == "json_new_string" or name == "json_new_array" or name == "json_new_object":
+        return true
+    return false
+
+# emit call arguments as comma-separated expressions (no parens)
+fn g_emit_call_args(node_idx: Int):
+    count := g_call_arg_count(node_idx)
+    mut i := 0
+    while i < count:
+        if i > 0:
+            g_write(", ")
+        g_emit_expr(g_call_arg(node_idx, i))
+        i = i + 1
+
 fn g_emit_call(node_idx: Int):
     node := get_node(node_idx)
     # in self-hosted AST, call has ident child as first element
@@ -1884,36 +1931,12 @@ fn g_emit_call(node_idx: Int):
             g_emit_expr(g_call_arg(node_idx, 0))
         g_write(")")
         return
-    if name == "parse_int":
-        g_write("forge_parse_int(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "parse_float":
-        g_write("forge_parse_float(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "read_file":
-        g_write("forge_read_file(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "write_file":
-        g_write("forge_write_file(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
-        return
-    if name == "env":
-        g_write("forge_env(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "chr":
-        g_write("forge_chr(")
-        g_emit_expr(g_call_arg(node_idx, 0))
+    # builtins that emit as forge_<name>(<args>)
+    if g_is_forge_builtin(name):
+        g_write("forge_")
+        g_write(name)
+        g_write("(")
+        g_emit_call_args(node_idx)
         g_write(")")
         return
     if name == "args":
@@ -1922,141 +1945,6 @@ fn g_emit_call(node_idx: Int):
     if name == "exit":
         g_write("exit((int)")
         g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "exec":
-        g_write("forge_exec(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "time":
-        g_write("forge_time()")
-        return
-    if name == "sleep":
-        g_write("forge_sleep(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "random_int":
-        g_write("forge_random_int(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
-        return
-    if name == "random_float":
-        g_write("forge_random_float()")
-        return
-    if name == "exec_output":
-        g_write("forge_exec_output(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "input":
-        g_write("forge_input()")
-        return
-    if name == "path_join":
-        g_write("forge_path_join(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
-        return
-    if name == "path_dir" or name == "path_base" or name == "path_ext" or name == "path_stem":
-        g_write("forge_")
-        g_write(name)
-        g_write("(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "log_info" or name == "log_warn" or name == "log_error" or name == "log_debug":
-        g_write("forge_")
-        g_write(name)
-        g_write("(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "math_pow":
-        g_write("forge_math_pow(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
-        return
-    if name == "math_sqrt" or name == "math_floor" or name == "math_ceil" or name == "math_round":
-        g_write("forge_")
-        g_write(name)
-        g_write("(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "file_exists" or name == "dir_exists" or name == "mkdir" or name == "remove_file" or name == "list_dir":
-        g_write("forge_")
-        g_write(name)
-        g_write("(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "fmt_hex" or name == "fmt_oct" or name == "fmt_bin":
-        g_write("forge_")
-        g_write(name)
-        g_write("(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    if name == "fmt_float":
-        g_write("forge_fmt_float(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
-        return
-    # json builtins — single-arg (forge_ prefix pattern)
-    if name == "json_parse" or name == "json_type" or name == "json_get_bool" or name == "json_get_int" or name == "json_get_float" or name == "json_get_string" or name == "json_array_len" or name == "json_object_keys" or name == "json_encode" or name == "json_new_bool" or name == "json_new_int" or name == "json_new_float" or name == "json_new_string":
-        g_write("forge_")
-        g_write(name)
-        g_write("(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(")")
-        return
-    # json builtins — zero-arg
-    if name == "json_new_null" or name == "json_new_array" or name == "json_new_object":
-        g_write("forge_")
-        g_write(name)
-        g_write("()")
-        return
-    # json builtins — two-arg
-    if name == "json_array_get" or name == "json_object_get" or name == "json_object_has" or name == "json_array_push":
-        g_write("forge_")
-        g_write(name)
-        g_write("(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
-        return
-    # json_object_set — three-arg
-    if name == "json_object_set":
-        g_write("forge_json_object_set(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 2))
-        g_write(")")
-        return
-    if name == "rename_file":
-        g_write("forge_rename_file(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(")")
-        return
-    if name == "append_file":
-        g_write("forge_append_file(")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 1))
         g_write(")")
         return
     # sync primitive constructors

@@ -27,6 +27,69 @@ const TypeTable = types.TypeTable;
 const Type = types.Type;
 const Scope = Checker.Scope;
 
+// builtins that emit as forge_<name>(<args>) with no special logic.
+// checked via a comptime perfect-hash set for O(1) lookup.
+const forge_prefix_builtins = std.StaticStringMap(void).initComptime(.{
+    .{ "parse_int", {} },
+    .{ "parse_float", {} },
+    .{ "read_file", {} },
+    .{ "write_file", {} },
+    .{ "env", {} },
+    .{ "chr", {} },
+    .{ "exec_output", {} },
+    .{ "time", {} },
+    .{ "sleep", {} },
+    .{ "random_int", {} },
+    .{ "random_float", {} },
+    .{ "input", {} },
+    .{ "path_join", {} },
+    .{ "path_dir", {} },
+    .{ "path_base", {} },
+    .{ "path_ext", {} },
+    .{ "path_stem", {} },
+    .{ "log_info", {} },
+    .{ "log_warn", {} },
+    .{ "log_error", {} },
+    .{ "log_debug", {} },
+    .{ "file_exists", {} },
+    .{ "dir_exists", {} },
+    .{ "mkdir", {} },
+    .{ "remove_file", {} },
+    .{ "rename_file", {} },
+    .{ "append_file", {} },
+    .{ "list_dir", {} },
+    .{ "math_pow", {} },
+    .{ "math_sqrt", {} },
+    .{ "math_floor", {} },
+    .{ "math_ceil", {} },
+    .{ "math_round", {} },
+    .{ "fmt_hex", {} },
+    .{ "fmt_oct", {} },
+    .{ "fmt_bin", {} },
+    .{ "fmt_float", {} },
+    .{ "json_parse", {} },
+    .{ "json_type", {} },
+    .{ "json_get_bool", {} },
+    .{ "json_get_int", {} },
+    .{ "json_get_float", {} },
+    .{ "json_get_string", {} },
+    .{ "json_array_len", {} },
+    .{ "json_array_get", {} },
+    .{ "json_object_get", {} },
+    .{ "json_object_has", {} },
+    .{ "json_object_keys", {} },
+    .{ "json_encode", {} },
+    .{ "json_new_null", {} },
+    .{ "json_new_bool", {} },
+    .{ "json_new_int", {} },
+    .{ "json_new_float", {} },
+    .{ "json_new_string", {} },
+    .{ "json_new_array", {} },
+    .{ "json_new_object", {} },
+    .{ "json_array_push", {} },
+    .{ "json_object_set", {} },
+});
+
 // ---------------------------------------------------------------
 // C emitter
 // ---------------------------------------------------------------
@@ -2499,66 +2562,8 @@ pub const CEmitter = struct {
             return;
         }
 
-        // built-in functions with forge_ prefix
-        if (std.mem.eql(u8, name, "parse_int") or
-            std.mem.eql(u8, name, "parse_float") or
-            std.mem.eql(u8, name, "read_file") or
-            std.mem.eql(u8, name, "write_file") or
-            std.mem.eql(u8, name, "env") or
-            std.mem.eql(u8, name, "chr") or
-            std.mem.eql(u8, name, "exec_output") or
-            std.mem.eql(u8, name, "time") or
-            std.mem.eql(u8, name, "sleep") or
-            std.mem.eql(u8, name, "random_int") or
-            std.mem.eql(u8, name, "random_float") or
-            std.mem.eql(u8, name, "input") or
-            std.mem.eql(u8, name, "path_join") or
-            std.mem.eql(u8, name, "path_dir") or
-            std.mem.eql(u8, name, "path_base") or
-            std.mem.eql(u8, name, "path_ext") or
-            std.mem.eql(u8, name, "path_stem") or
-            std.mem.eql(u8, name, "log_info") or
-            std.mem.eql(u8, name, "log_warn") or
-            std.mem.eql(u8, name, "log_error") or
-            std.mem.eql(u8, name, "log_debug") or
-            std.mem.eql(u8, name, "file_exists") or
-            std.mem.eql(u8, name, "dir_exists") or
-            std.mem.eql(u8, name, "mkdir") or
-            std.mem.eql(u8, name, "remove_file") or
-            std.mem.eql(u8, name, "rename_file") or
-            std.mem.eql(u8, name, "append_file") or
-            std.mem.eql(u8, name, "list_dir") or
-            std.mem.eql(u8, name, "math_pow") or
-            std.mem.eql(u8, name, "math_sqrt") or
-            std.mem.eql(u8, name, "math_floor") or
-            std.mem.eql(u8, name, "math_ceil") or
-            std.mem.eql(u8, name, "math_round") or
-            std.mem.eql(u8, name, "fmt_hex") or
-            std.mem.eql(u8, name, "fmt_oct") or
-            std.mem.eql(u8, name, "fmt_bin") or
-            std.mem.eql(u8, name, "fmt_float") or
-            std.mem.eql(u8, name, "json_parse") or
-            std.mem.eql(u8, name, "json_type") or
-            std.mem.eql(u8, name, "json_get_bool") or
-            std.mem.eql(u8, name, "json_get_int") or
-            std.mem.eql(u8, name, "json_get_float") or
-            std.mem.eql(u8, name, "json_get_string") or
-            std.mem.eql(u8, name, "json_array_len") or
-            std.mem.eql(u8, name, "json_array_get") or
-            std.mem.eql(u8, name, "json_object_get") or
-            std.mem.eql(u8, name, "json_object_has") or
-            std.mem.eql(u8, name, "json_object_keys") or
-            std.mem.eql(u8, name, "json_encode") or
-            std.mem.eql(u8, name, "json_new_null") or
-            std.mem.eql(u8, name, "json_new_bool") or
-            std.mem.eql(u8, name, "json_new_int") or
-            std.mem.eql(u8, name, "json_new_float") or
-            std.mem.eql(u8, name, "json_new_string") or
-            std.mem.eql(u8, name, "json_new_array") or
-            std.mem.eql(u8, name, "json_new_object") or
-            std.mem.eql(u8, name, "json_array_push") or
-            std.mem.eql(u8, name, "json_object_set"))
-        {
+        // built-in functions that emit as forge_<name>(<args>)
+        if (forge_prefix_builtins.has(name)) {
             try self.writeStr("forge_");
             try self.writeStr(name);
             try self.emitArgList(call.args);

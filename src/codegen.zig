@@ -1354,15 +1354,13 @@ pub const CEmitter = struct {
     }
 
     /// emit a closure-typed binding from a TypeId: `forge_closure_t name`
-    fn emitFnPtrBindingFromTypeId(self: *CEmitter, fn_tid: TypeId, name: []const u8) EmitError!void {
-        _ = fn_tid;
+    fn emitFnPtrBindingFromTypeId(self: *CEmitter, _: TypeId, name: []const u8) EmitError!void {
         try self.writeStr("forge_closure_t ");
         try self.writeStr(name);
     }
 
     /// emit a closure-typed parameter: `forge_closure_t name`
-    fn emitFnPtrParam(self: *CEmitter, ft: ast.FnType, name: []const u8) EmitError!void {
-        _ = ft;
+    fn emitFnPtrParam(self: *CEmitter, _: ast.FnType, name: []const u8) EmitError!void {
         try self.writeStr("forge_closure_t ");
         try self.writeStr(name);
     }

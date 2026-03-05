@@ -1043,6 +1043,7 @@ static inline void forge_print(forge_string_t s) {
 
 static inline int64_t forge_exec(forge_string_t cmd) {
     char *cstr = (char *)malloc((size_t)cmd.len + 1);
+    if (!cstr) return -1;
     memcpy(cstr, cmd.data, (size_t)cmd.len);
     cstr[cmd.len] = '\0';
     int result = system(cstr);

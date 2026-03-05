@@ -1,90 +1,11 @@
 # codegen_main.fg — self-hosted codegen entry point
 #
-# reads a .fg source file, tokenizes it, parses it into an AST,
-# resolves imports recursively, runs the type checker on all modules,
-# then generates C code.
+# reads a .fg source file, runs the full compile pipeline,
+# then prints the generated C code to stdout.
 #
 # usage: forge run self-host/codegen_main.fg [--test] <file.fg>
 
-from lexer import lex_all
-from parser import parse
-from ast import get_node
-from checker import c_init, c_run_module
-from codegen import g_init, g_set_test_mode, g_emit_module, g_emit_modules, g_get_output
-
-# extract directory from a file path.
-# "foo/bar/baz.fg" -> "foo/bar", "baz.fg" -> "."
-fn get_directory(path: String) -> String:
-    mut last_slash := 0 - 1
-    mut i := 0
-    while i < path.len():
-        if path[i] == "/":
-            last_slash = i
-        i = i + 1
-    if last_slash < 0:
-        return "."
-    return path.substring(0, last_slash)
-
-# scan an AST root for from_import nodes and return the module paths.
-# each from_import value is "path name1 name2 ..." — we extract the path.
-fn find_imports(root_idx: Int) -> List[String]:
-    root := get_node(root_idx)
-    mut imports: List[String] := []
-    for child in root.children:
-        node := get_node(child)
-        mut kind := node.kind
-        mut value := node.value
-        if kind == "pub":
-            inner := get_node(node.children[0])
-            kind = inner.kind
-            value = inner.value
-        if kind == "from_import":
-            # value is "path name1 name2 ..."
-            # extract just the module path (first space-separated token)
-            mut space_pos := 0 - 1
-            mut si := 0
-            while si < value.len():
-                if value[si] == " ":
-                    space_pos = si
-                    break
-                si = si + 1
-            mut mod_path := value
-            if space_pos >= 0:
-                mod_path = value.substring(0, space_pos)
-            imports.push(mod_path)
-    return imports
-
-# global visited map for diamond import dedup.
-# must be global because collections are passed by copy in forge.
-mut cm_visited: Map[String, Bool] := {}
-
-# resolve imports recursively via DFS.
-# returns module roots in dependency order (leaves first).
-fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
-    mut roots: List[Int] := []
-    dir := get_directory(source_path)
-    imports := find_imports(root_idx)
-    for mod_path in imports:
-        # build file path: dir/mod_path.fg
-        mut file_path := ""
-        if dir == ".":
-            file_path = mod_path + ".fg"
-        else:
-            file_path = dir + "/" + mod_path + ".fg"
-        # dedup — skip if already visited
-        if cm_visited.contains_key(file_path):
-            continue
-        cm_visited.insert(file_path, true)
-        # read, lex, parse the imported module
-        content := read_file(file_path)!
-        tokens := lex_all(content)
-        mod_root := parse(tokens)
-        # recurse into this module's imports
-        sub_roots := resolve_imports(mod_root, file_path)!
-        for sr in sub_roots:
-            roots.push(sr)
-        roots.push(mod_root)
-    return roots
+from driver import compile_to_c
 
 fn codegen_and_print() -> String!:
     a := args()
@@ -103,34 +24,8 @@ fn codegen_and_print() -> String!:
             exit(1)
 
     path := a[path_idx]
-    content := read_file(path)!
-    tokens := lex_all(content)
-    root := parse(tokens)
-
-    # resolve imports recursively
-    cm_visited.insert(path, true)
-    import_roots := resolve_imports(root, path)!
-
-    # check all modules: imports first, then main
-    c_init()
-    for imp_root in import_roots:
-        c_run_module(imp_root)
-    c_run_module(root)
-
-    # emit all modules as one C file
-    g_init()
-    if test_mode:
-        g_set_test_mode()
-    if import_roots.len() == 0:
-        # single-file — use existing path
-        g_emit_module(root)
-    else:
-        mut all_roots: List[Int] := []
-        for imp_root in import_roots:
-            all_roots.push(imp_root)
-        all_roots.push(root)
-        g_emit_modules(all_roots)
-    print(g_get_output())
+    c_code := compile_to_c(path, test_mode)!
+    print(c_code)
     return ""
 
 fn main():

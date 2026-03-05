@@ -2402,34 +2402,26 @@ fn g_emit_map_method(node_idx: Int, method: String, key_tid: Int, val_tid: Int):
         return
 
 fn g_emit_map_insert(node_idx: Int, key_tid: Int, key_c: String, val_c: String):
+    # use a temp variable so &val works for both scalars and structs
     node := get_node(node_idx)
     receiver_idx := node.children[0]
+    g_write("{ ")
+    g_write(val_c)
+    g_write(" __mv = ")
+    g_emit_expr(g_call_arg(node_idx, 1))
+    g_write("; ")
     if key_tid == TID_STRING:
         g_write("forge_map_set_by_string(&")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", &(")
-        g_write(val_c)
-        g_write(")" + LB)
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(RB + ", sizeof(forge_string_t), sizeof(")
-        g_write(val_c)
-        g_write("))")
     else:
         g_write("forge_map_set_by_int(&")
-        g_emit_expr(receiver_idx)
-        g_write(", ")
-        g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(", &(")
-        g_write(val_c)
-        g_write(")" + LB)
-        g_emit_expr(g_call_arg(node_idx, 1))
-        g_write(RB + ", sizeof(")
-        g_write(key_c)
-        g_write("), sizeof(")
-        g_write(val_c)
-        g_write("))")
+    g_emit_expr(receiver_idx)
+    g_write(", ")
+    g_emit_expr(g_call_arg(node_idx, 0))
+    g_write(", &__mv, sizeof(")
+    g_write(key_c)
+    g_write("), sizeof(")
+    g_write(val_c)
+    g_write(")); }")
 
 # ---------------------------------------------------------------
 # set methods
@@ -2440,15 +2432,16 @@ fn g_emit_set_method(node_idx: Int, method: String, elem_tid: Int):
     receiver_idx := node.children[0]
     elem_c := g_c_type_string(elem_tid)
     if method == "add":
-        g_write("forge_set_add(&")
-        g_emit_expr(receiver_idx)
-        g_write(", &(")
+        # use a temp variable to avoid compound literal issues with struct types
+        g_write("{ ")
         g_write(elem_c)
-        g_write(")" + LB)
+        g_write(" __sv = ")
         g_emit_expr(g_call_arg(node_idx, 0))
-        g_write(RB + ", sizeof(")
+        g_write("; forge_set_add(&")
+        g_emit_expr(receiver_idx)
+        g_write(", &__sv, sizeof(")
         g_write(elem_c)
-        g_write("))")
+        g_write(")); }")
         return
     if method == "len":
         g_emit_expr(receiver_idx)

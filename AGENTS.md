@@ -85,6 +85,7 @@ docs/errors.md       error code reference (E0xx–E3xx)
 - **string literals** from the lexer include surrounding quotes — codegen strips them.
 - **snake_case** for functions/variables, **PascalCase** for types, in both zig and forge.
 - **closures.** all `fn(X) -> Y` parameters use `forge_closure_t` (uniform closure ABI).
+- **concurrency.** `spawn`, `await`, `Task[T]`, `Mutex`, `WaitGroup`, `Semaphore` — all fully implemented.
 
 ## testing
 
@@ -105,7 +106,6 @@ docs/errors.md       error code reference (E0xx–E3xx)
 
 ## known limitations
 
-- concurrency (spawn/await) parsed but not codegen'd
 - type aliases parsed but not codegen'd
 - collections passed to functions are copies — mutations don't propagate back
 - `{`/`}` in string literals trigger interpolation — use `chr(123)`/`chr(125)`

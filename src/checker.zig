@@ -277,7 +277,7 @@ pub const Checker = struct {
             try self.registerBuiltin(n, str_to_void);
         // (String) -> Int
         const str_to_int = try self.addFnType(&.{.string}, .int);
-        for ([_][]const u8{ "exec", "json_parse", "json_new_string" }) |n|
+        for ([_][]const u8{ "exec", "json_parse", "json_new_string", "hash_fnv1a" }) |n|
             try self.registerBuiltin(n, str_to_int);
         // (String) -> Bool
         const str_to_bool = try self.addFnType(&.{.string}, .bool);
@@ -285,7 +285,7 @@ pub const Checker = struct {
             try self.registerBuiltin(n, str_to_bool);
         // (String) -> String
         const str_to_str = try self.addFnType(&.{.string}, .string);
-        for ([_][]const u8{ "path_dir", "path_base", "path_ext", "path_stem", "base64_encode", "hex_encode" }) |n|
+        for ([_][]const u8{ "path_dir", "path_base", "path_ext", "path_stem", "base64_encode", "hex_encode", "hash_sha256" }) |n|
             try self.registerBuiltin(n, str_to_str);
         // (String) -> String?
         try self.registerBuiltin("env", try self.addFnType(&.{.string}, opt_string));

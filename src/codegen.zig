@@ -92,6 +92,8 @@ const forge_prefix_builtins = std.StaticStringMap(void).initComptime(.{
     .{ "base64_decode", {} },
     .{ "hex_encode", {} },
     .{ "hex_decode", {} },
+    .{ "hash_sha256", {} },
+    .{ "hash_fnv1a", {} },
 });
 
 // ---------------------------------------------------------------

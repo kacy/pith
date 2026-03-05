@@ -509,12 +509,8 @@ pub const Checker = struct {
         try self.module_scope.define("json_new_bool", .{ .type_id = bool_to_int_type, .is_mut = false });
         // json_new_int(Int) -> Int
         try self.module_scope.define("json_new_int", .{ .type_id = int_to_int_type, .is_mut = false });
-        // json_new_float(Float) -> Int
-        const float_to_int_type2 = try self.type_table.addType(.{ .function = .{
-            .param_types = &.{.float},
-            .return_type = .int,
-        } });
-        try self.module_scope.define("json_new_float", .{ .type_id = float_to_int_type2, .is_mut = false });
+        // json_new_float(Float) -> Int — reuse float_to_int_type from math builtins
+        try self.module_scope.define("json_new_float", .{ .type_id = float_to_int_type, .is_mut = false });
         // json_new_string(String) -> Int
         try self.module_scope.define("json_new_string", .{ .type_id = str_to_int_type, .is_mut = false });
         // json_array_push(Int, Int) -> Void

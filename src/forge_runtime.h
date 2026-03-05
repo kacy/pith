@@ -1481,8 +1481,9 @@ static inline bool forge_json_match(forge_json_parser_t *p, const char *s, int64
     return true;
 }
 
-// forward declaration
+// forward declarations
 static int64_t forge_json_parse_value(forge_json_parser_t *p);
+static inline void forge_json_array_push(int64_t handle, int64_t val);
 
 static inline forge_string_t forge_json_parse_string_raw(forge_json_parser_t *p) {
     if (p->data[p->pos] != '"') { p->error = true; return forge_string_empty; }
@@ -1613,14 +1614,7 @@ static int64_t forge_json_parse_value(forge_json_parser_t *p) {
         while (1) {
             int64_t val = forge_json_parse_value(p);
             if (p->error) return -1;
-            // grow items array
-            int64_t new_len = forge_json_pool[idx].array_val.len + 1;
-            int64_t *new_items = (int64_t *)realloc(
-                forge_json_pool[idx].array_val.items, (size_t)new_len * sizeof(int64_t));
-            if (!new_items) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
-            new_items[new_len - 1] = val;
-            forge_json_pool[idx].array_val.items = new_items;
-            forge_json_pool[idx].array_val.len = new_len;
+            forge_json_array_push(idx, val);
             if (forge_json_peek(p) == ',') { p->pos++; continue; }
             if (forge_json_peek(p) == ']') { p->pos++; break; }
             p->error = true; return -1;

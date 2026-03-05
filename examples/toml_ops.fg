@@ -1,0 +1,42 @@
+# toml parsing
+
+fn main():
+    # build a TOML document
+    nl := chr(10)
+    mut doc := "title = \"forge\"" + nl
+    doc = doc + "version = 42" + nl
+    doc = doc + "pi = 3.14" + nl
+    doc = doc + "enabled = true" + nl
+    doc = doc + "tags = [\"lang\", \"fast\"]" + nl
+    doc = doc + nl
+    doc = doc + "[server]" + nl
+    doc = doc + "host = \"localhost\"" + nl
+    doc = doc + "port = 8080" + nl
+
+    root := toml_parse(doc)
+    print("type: " + toml_type(root))
+
+    # basic values
+    print("title: " + toml_get_string(root, "title"))
+    print("version: " + toml_get_int(root, "version").to_string())
+    print("pi: " + toml_get_float(root, "pi").to_string())
+    print("enabled: " + toml_get_bool(root, "enabled").to_string())
+
+    # has key
+    print("has title: " + toml_has(root, "title").to_string())
+    print("has missing: " + toml_has(root, "missing").to_string())
+
+    # array
+    tags := toml_get_array(root, "tags")
+    print("tags count: " + toml_array_len(tags).to_string())
+    tag0 := toml_array_get(tags, 0)
+    print("tag 0 type: " + toml_type(tag0))
+
+    # sub-table
+    server := toml_get_table(root, "server")
+    print("server host: " + toml_get_string(server, "host"))
+    print("server port: " + toml_get_int(server, "port").to_string())
+
+    # keys
+    k := toml_keys(root)
+    print("key count: " + k.len().to_string())

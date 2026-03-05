@@ -2606,6 +2606,434 @@ static inline forge_string_t forge_percent_decode(forge_string_t input) {
 }
 
 // ---------------------------------------------------------------
+// TOML parsing — mirrors the JSON API shape
+// ---------------------------------------------------------------
+
+enum forge_toml_type {
+    FORGE_TOML_STRING = 0,
+    FORGE_TOML_INT,
+    FORGE_TOML_FLOAT,
+    FORGE_TOML_BOOL,
+    FORGE_TOML_TABLE,
+    FORGE_TOML_ARRAY,
+    FORGE_TOML_INVALID,
+};
+
+typedef struct {
+    enum forge_toml_type type;
+    forge_string_t str_val;
+    int64_t int_val;
+    double float_val;
+    bool bool_val;
+    // table: parallel arrays of keys and value handles
+    forge_string_t *keys;
+    int64_t *values;
+    int64_t count;
+    int64_t cap;
+    // array: handles
+    int64_t *elements;
+    int64_t elem_count;
+    int64_t elem_cap;
+} forge_toml_node_t;
+
+static forge_toml_node_t *forge_toml_pool = NULL;
+static int64_t forge_toml_pool_len = 0;
+static int64_t forge_toml_pool_cap = 0;
+
+static inline int64_t forge_toml_alloc(void) {
+    if (forge_toml_pool_len >= forge_toml_pool_cap) {
+        int64_t new_cap = forge_toml_pool_cap == 0 ? 64 : forge_toml_pool_cap * 2;
+        forge_toml_node_t *p = (forge_toml_node_t *)realloc(
+            forge_toml_pool, (size_t)new_cap * sizeof(forge_toml_node_t));
+        if (!p) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        forge_toml_pool = p;
+        forge_toml_pool_cap = new_cap;
+    }
+    int64_t idx = forge_toml_pool_len++;
+    memset(&forge_toml_pool[idx], 0, sizeof(forge_toml_node_t));
+    return idx;
+}
+
+static inline void forge_toml_table_set(int64_t handle, forge_string_t key, int64_t val) {
+    forge_toml_node_t *n = &forge_toml_pool[handle];
+    // check for existing key
+    for (int64_t i = 0; i < n->count; i++) {
+        if (n->keys[i].len == key.len && memcmp(n->keys[i].data, key.data, (size_t)key.len) == 0) {
+            n->values[i] = val;
+            return;
+        }
+    }
+    if (n->count >= n->cap) {
+        int64_t new_cap = n->cap == 0 ? 8 : n->cap * 2;
+        n->keys = (forge_string_t *)realloc(n->keys, (size_t)new_cap * sizeof(forge_string_t));
+        n->values = (int64_t *)realloc(n->values, (size_t)new_cap * sizeof(int64_t));
+        n->cap = new_cap;
+    }
+    n->keys[n->count] = key;
+    n->values[n->count] = val;
+    n->count++;
+}
+
+static inline void forge_toml_array_push(int64_t handle, int64_t val) {
+    forge_toml_node_t *n = &forge_toml_pool[handle];
+    if (n->elem_count >= n->elem_cap) {
+        int64_t new_cap = n->elem_cap == 0 ? 8 : n->elem_cap * 2;
+        n->elements = (int64_t *)realloc(n->elements, (size_t)new_cap * sizeof(int64_t));
+        n->elem_cap = new_cap;
+    }
+    n->elements[n->elem_count++] = val;
+}
+
+typedef struct {
+    const char *data;
+    int64_t len;
+    int64_t pos;
+    bool error;
+} forge_toml_parser_t;
+
+static inline void forge_toml_skip_ws(forge_toml_parser_t *p) {
+    while (p->pos < p->len) {
+        char c = p->data[p->pos];
+        if (c == ' ' || c == '\t' || c == '\r') p->pos++;
+        else break;
+    }
+}
+
+static inline void forge_toml_skip_comment(forge_toml_parser_t *p) {
+    if (p->pos < p->len && p->data[p->pos] == '#') {
+        while (p->pos < p->len && p->data[p->pos] != '\n') p->pos++;
+    }
+}
+
+static inline void forge_toml_skip_line(forge_toml_parser_t *p) {
+    forge_toml_skip_ws(p);
+    forge_toml_skip_comment(p);
+    if (p->pos < p->len && p->data[p->pos] == '\n') p->pos++;
+}
+
+static inline forge_string_t forge_toml_parse_key(forge_toml_parser_t *p) {
+    forge_toml_skip_ws(p);
+    if (p->pos < p->len && p->data[p->pos] == '"') {
+        p->pos++; // skip opening quote
+        int64_t start = p->pos;
+        while (p->pos < p->len && p->data[p->pos] != '"') p->pos++;
+        int64_t klen = p->pos - start;
+        if (p->pos < p->len) p->pos++; // skip closing quote
+        char *buf = forge_str_alloc(klen);
+        memcpy(buf, p->data + start, (size_t)klen);
+        buf[klen] = '\0';
+        return (forge_string_t){ .data = buf, .len = klen };
+    }
+    int64_t start = p->pos;
+    while (p->pos < p->len) {
+        char c = p->data[p->pos];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_')
+            p->pos++;
+        else break;
+    }
+    int64_t klen = p->pos - start;
+    char *buf = forge_str_alloc(klen);
+    memcpy(buf, p->data + start, (size_t)klen);
+    buf[klen] = '\0';
+    return (forge_string_t){ .data = buf, .len = klen };
+}
+
+static inline int64_t forge_toml_parse_value(forge_toml_parser_t *p) {
+    forge_toml_skip_ws(p);
+    if (p->pos >= p->len) { p->error = true; return -1; }
+    char c = p->data[p->pos];
+
+    // string
+    if (c == '"') {
+        p->pos++;
+        int64_t start = p->pos;
+        while (p->pos < p->len && p->data[p->pos] != '"') {
+            if (p->data[p->pos] == '\\') p->pos++; // skip escape
+            p->pos++;
+        }
+        int64_t slen = p->pos - start;
+        if (p->pos < p->len) p->pos++; // closing quote
+        char *buf = forge_str_alloc(slen);
+        memcpy(buf, p->data + start, (size_t)slen);
+        buf[slen] = '\0';
+        int64_t idx = forge_toml_alloc();
+        forge_toml_pool[idx].type = FORGE_TOML_STRING;
+        forge_toml_pool[idx].str_val = (forge_string_t){ .data = buf, .len = slen };
+        return idx;
+    }
+
+    // boolean
+    if (p->pos + 4 <= p->len && memcmp(p->data + p->pos, "true", 4) == 0) {
+        p->pos += 4;
+        int64_t idx = forge_toml_alloc();
+        forge_toml_pool[idx].type = FORGE_TOML_BOOL;
+        forge_toml_pool[idx].bool_val = true;
+        return idx;
+    }
+    if (p->pos + 5 <= p->len && memcmp(p->data + p->pos, "false", 5) == 0) {
+        p->pos += 5;
+        int64_t idx = forge_toml_alloc();
+        forge_toml_pool[idx].type = FORGE_TOML_BOOL;
+        forge_toml_pool[idx].bool_val = false;
+        return idx;
+    }
+
+    // array
+    if (c == '[') {
+        p->pos++;
+        int64_t arr = forge_toml_alloc();
+        forge_toml_pool[arr].type = FORGE_TOML_ARRAY;
+        forge_toml_skip_ws(p);
+        while (p->pos < p->len && p->data[p->pos] != ']') {
+            forge_toml_skip_ws(p);
+            if (p->pos < p->len && p->data[p->pos] == '\n') { p->pos++; continue; }
+            if (p->pos < p->len && p->data[p->pos] == '#') { forge_toml_skip_comment(p); continue; }
+            int64_t val = forge_toml_parse_value(p);
+            if (p->error) return -1;
+            forge_toml_array_push(arr, val);
+            forge_toml_skip_ws(p);
+            if (p->pos < p->len && p->data[p->pos] == ',') p->pos++;
+            forge_toml_skip_ws(p);
+            while (p->pos < p->len && p->data[p->pos] == '\n') p->pos++;
+        }
+        if (p->pos < p->len) p->pos++; // skip ]
+        return arr;
+    }
+
+    // number (int or float)
+    if ((c >= '0' && c <= '9') || c == '-' || c == '+') {
+        int64_t start = p->pos;
+        bool is_float = false;
+        if (c == '-' || c == '+') p->pos++;
+        while (p->pos < p->len) {
+            char d = p->data[p->pos];
+            if (d == '.' || d == 'e' || d == 'E') is_float = true;
+            if ((d >= '0' && d <= '9') || d == '.' || d == 'e' || d == 'E' || d == '+' || d == '-' || d == '_')
+                p->pos++;
+            else break;
+        }
+        char tmp[128];
+        int64_t nlen = p->pos - start;
+        if (nlen > 127) nlen = 127;
+        // copy, skipping underscores
+        int64_t j = 0;
+        for (int64_t i = 0; i < nlen && j < 127; i++) {
+            if (p->data[start + i] != '_') tmp[j++] = p->data[start + i];
+        }
+        tmp[j] = '\0';
+        int64_t idx = forge_toml_alloc();
+        if (is_float) {
+            forge_toml_pool[idx].type = FORGE_TOML_FLOAT;
+            forge_toml_pool[idx].float_val = strtod(tmp, NULL);
+        } else {
+            forge_toml_pool[idx].type = FORGE_TOML_INT;
+            forge_toml_pool[idx].int_val = strtoll(tmp, NULL, 10);
+        }
+        return idx;
+    }
+
+    p->error = true;
+    return -1;
+}
+
+// find or create a nested table from a dotted key path within root
+static inline int64_t forge_toml_ensure_table(int64_t root, const char *path, int64_t path_len) {
+    int64_t current = root;
+    int64_t start = 0;
+    for (int64_t i = 0; i <= path_len; i++) {
+        if (i == path_len || path[i] == '.') {
+            int64_t klen = i - start;
+            forge_string_t key = { .data = path + start, .len = klen };
+            // look up existing
+            forge_toml_node_t *n = &forge_toml_pool[current];
+            int64_t found = -1;
+            for (int64_t j = 0; j < n->count; j++) {
+                if (n->keys[j].len == klen && memcmp(n->keys[j].data, key.data, (size_t)klen) == 0) {
+                    found = n->values[j]; break;
+                }
+            }
+            if (found < 0) {
+                found = forge_toml_alloc();
+                forge_toml_pool[found].type = FORGE_TOML_TABLE;
+                char *kbuf = forge_str_alloc(klen);
+                memcpy(kbuf, key.data, (size_t)klen);
+                kbuf[klen] = '\0';
+                forge_toml_table_set(current, (forge_string_t){ .data = kbuf, .len = klen }, found);
+            }
+            current = found;
+            start = i + 1;
+        }
+    }
+    return current;
+}
+
+static inline int64_t forge_toml_parse(forge_string_t input) {
+    forge_toml_parser_t p = { .data = input.data, .len = input.len, .pos = 0, .error = false };
+    int64_t root = forge_toml_alloc();
+    forge_toml_pool[root].type = FORGE_TOML_TABLE;
+    int64_t current_table = root;
+
+    while (p.pos < p.len) {
+        forge_toml_skip_ws(&p);
+        if (p.pos >= p.len) break;
+        char c = p.data[p.pos];
+
+        // skip blank lines and comments
+        if (c == '\n') { p.pos++; continue; }
+        if (c == '#') { forge_toml_skip_comment(&p); continue; }
+
+        // table header [name] or [a.b.c]
+        if (c == '[') {
+            p.pos++;
+            forge_toml_skip_ws(&p);
+            int64_t start = p.pos;
+            while (p.pos < p.len && p.data[p.pos] != ']') p.pos++;
+            int64_t klen = p.pos - start;
+            if (p.pos < p.len) p.pos++; // skip ]
+            current_table = forge_toml_ensure_table(root, p.data + start, klen);
+            forge_toml_skip_line(&p);
+            continue;
+        }
+
+        // key = value
+        forge_string_t key = forge_toml_parse_key(&p);
+        forge_toml_skip_ws(&p);
+        if (p.pos < p.len && p.data[p.pos] == '=') p.pos++;
+        else { p.error = true; break; }
+        int64_t val = forge_toml_parse_value(&p);
+        if (p.error) return -1;
+        forge_toml_table_set(current_table, key, val);
+        forge_toml_skip_line(&p);
+    }
+
+    if (p.error) return -1;
+    return root;
+}
+
+static inline forge_string_t forge_toml_type(int64_t handle) {
+    if (handle < 0 || handle >= forge_toml_pool_len) return FORGE_STRING_LIT("invalid");
+    switch (forge_toml_pool[handle].type) {
+        case FORGE_TOML_STRING: return FORGE_STRING_LIT("string");
+        case FORGE_TOML_INT:    return FORGE_STRING_LIT("int");
+        case FORGE_TOML_FLOAT:  return FORGE_STRING_LIT("float");
+        case FORGE_TOML_BOOL:   return FORGE_STRING_LIT("bool");
+        case FORGE_TOML_TABLE:  return FORGE_STRING_LIT("table");
+        case FORGE_TOML_ARRAY:  return FORGE_STRING_LIT("array");
+        default:                return FORGE_STRING_LIT("invalid");
+    }
+}
+
+static inline forge_string_t forge_toml_get_string(int64_t handle, forge_string_t key) {
+    if (handle < 0 || handle >= forge_toml_pool_len) return forge_string_empty;
+    forge_toml_node_t *n = &forge_toml_pool[handle];
+    for (int64_t i = 0; i < n->count; i++) {
+        if (n->keys[i].len == key.len && memcmp(n->keys[i].data, key.data, (size_t)key.len) == 0) {
+            int64_t v = n->values[i];
+            if (v >= 0 && v < forge_toml_pool_len && forge_toml_pool[v].type == FORGE_TOML_STRING)
+                return forge_toml_pool[v].str_val;
+        }
+    }
+    return forge_string_empty;
+}
+
+static inline int64_t forge_toml_get_int(int64_t handle, forge_string_t key) {
+    if (handle < 0 || handle >= forge_toml_pool_len) return 0;
+    forge_toml_node_t *n = &forge_toml_pool[handle];
+    for (int64_t i = 0; i < n->count; i++) {
+        if (n->keys[i].len == key.len && memcmp(n->keys[i].data, key.data, (size_t)key.len) == 0) {
+            int64_t v = n->values[i];
+            if (v >= 0 && v < forge_toml_pool_len && forge_toml_pool[v].type == FORGE_TOML_INT)
+                return forge_toml_pool[v].int_val;
+        }
+    }
+    return 0;
+}
+
+static inline double forge_toml_get_float(int64_t handle, forge_string_t key) {
+    if (handle < 0 || handle >= forge_toml_pool_len) return 0.0;
+    forge_toml_node_t *n = &forge_toml_pool[handle];
+    for (int64_t i = 0; i < n->count; i++) {
+        if (n->keys[i].len == key.len && memcmp(n->keys[i].data, key.data, (size_t)key.len) == 0) {
+            int64_t v = n->values[i];
+            if (v >= 0 && v < forge_toml_pool_len && forge_toml_pool[v].type == FORGE_TOML_FLOAT)
+                return forge_toml_pool[v].float_val;
+        }
+    }
+    return 0.0;
+}
+
+static inline bool forge_toml_get_bool(int64_t handle, forge_string_t key) {
+    if (handle < 0 || handle >= forge_toml_pool_len) return false;
+    forge_toml_node_t *n = &forge_toml_pool[handle];
+    for (int64_t i = 0; i < n->count; i++) {
+        if (n->keys[i].len == key.len && memcmp(n->keys[i].data, key.data, (size_t)key.len) == 0) {
+            int64_t v = n->values[i];
+            if (v >= 0 && v < forge_toml_pool_len && forge_toml_pool[v].type == FORGE_TOML_BOOL)
+                return forge_toml_pool[v].bool_val;
+        }
+    }
+    return false;
+}
+
+static inline int64_t forge_toml_get_table(int64_t handle, forge_string_t key) {
+    if (handle < 0 || handle >= forge_toml_pool_len) return -1;
+    forge_toml_node_t *n = &forge_toml_pool[handle];
+    for (int64_t i = 0; i < n->count; i++) {
+        if (n->keys[i].len == key.len && memcmp(n->keys[i].data, key.data, (size_t)key.len) == 0) {
+            int64_t v = n->values[i];
+            if (v >= 0 && v < forge_toml_pool_len && forge_toml_pool[v].type == FORGE_TOML_TABLE)
+                return v;
+        }
+    }
+    return -1;
+}
+
+static inline int64_t forge_toml_get_array(int64_t handle, forge_string_t key) {
+    if (handle < 0 || handle >= forge_toml_pool_len) return -1;
+    forge_toml_node_t *n = &forge_toml_pool[handle];
+    for (int64_t i = 0; i < n->count; i++) {
+        if (n->keys[i].len == key.len && memcmp(n->keys[i].data, key.data, (size_t)key.len) == 0) {
+            int64_t v = n->values[i];
+            if (v >= 0 && v < forge_toml_pool_len && forge_toml_pool[v].type == FORGE_TOML_ARRAY)
+                return v;
+        }
+    }
+    return -1;
+}
+
+static inline int64_t forge_toml_array_len(int64_t handle) {
+    if (handle < 0 || handle >= forge_toml_pool_len) return 0;
+    return forge_toml_pool[handle].elem_count;
+}
+
+static inline int64_t forge_toml_array_get(int64_t handle, int64_t index) {
+    if (handle < 0 || handle >= forge_toml_pool_len) return -1;
+    if (index < 0 || index >= forge_toml_pool[handle].elem_count) return -1;
+    return forge_toml_pool[handle].elements[index];
+}
+
+static inline forge_list_t forge_toml_keys(int64_t handle) {
+    forge_list_t list = forge_list_create(0, sizeof(forge_string_t), NULL);
+    if (handle < 0 || handle >= forge_toml_pool_len) return list;
+    forge_toml_node_t *n = &forge_toml_pool[handle];
+    for (int64_t i = 0; i < n->count; i++) {
+        forge_list_push(&list, &n->keys[i], sizeof(forge_string_t));
+    }
+    return list;
+}
+
+static inline bool forge_toml_has(int64_t handle, forge_string_t key) {
+    if (handle < 0 || handle >= forge_toml_pool_len) return false;
+    forge_toml_node_t *n = &forge_toml_pool[handle];
+    for (int64_t i = 0; i < n->count; i++) {
+        if (n->keys[i].len == key.len && memcmp(n->keys[i].data, key.data, (size_t)key.len) == 0)
+            return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------
 // networking — TCP and DNS (POSIX sockets, blocking I/O)
 // ---------------------------------------------------------------
 

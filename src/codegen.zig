@@ -114,6 +114,18 @@ const forge_prefix_builtins = std.StaticStringMap(void).initComptime(.{
     .{ "tcp_write", {} },
     .{ "tcp_close", {} },
     .{ "dns_resolve", {} },
+    .{ "toml_parse", {} },
+    .{ "toml_type", {} },
+    .{ "toml_get_string", {} },
+    .{ "toml_get_int", {} },
+    .{ "toml_get_float", {} },
+    .{ "toml_get_bool", {} },
+    .{ "toml_get_table", {} },
+    .{ "toml_get_array", {} },
+    .{ "toml_array_len", {} },
+    .{ "toml_array_get", {} },
+    .{ "toml_keys", {} },
+    .{ "toml_has", {} },
 });
 
 // ---------------------------------------------------------------

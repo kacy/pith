@@ -1,0 +1,54 @@
+# std.toml — TOML v1.0 parse (basics)
+#
+# uses opaque Int handles into a C-side node pool.
+# supports: strings, ints, floats, bools, tables, arrays.
+# skips: datetime types, multiline strings, [[array_of_tables]].
+
+# parse a TOML string into a handle. returns -1 on parse error.
+pub fn parse(input: String) -> Int:
+    return toml_parse(input)
+
+# get the type of a TOML value: "string", "int", "float", "bool",
+# "table", "array", or "invalid".
+pub fn type_of(handle: Int) -> String:
+    return toml_type(handle)
+
+# extract a string value by key from a table.
+pub fn get_string(handle: Int, key: String) -> String:
+    return toml_get_string(handle, key)
+
+# extract an int value by key from a table.
+pub fn get_int(handle: Int, key: String) -> Int:
+    return toml_get_int(handle, key)
+
+# extract a float value by key from a table.
+pub fn get_float(handle: Int, key: String) -> Float:
+    return toml_get_float(handle, key)
+
+# extract a bool value by key from a table.
+pub fn get_bool(handle: Int, key: String) -> Bool:
+    return toml_get_bool(handle, key)
+
+# get a sub-table by key. returns -1 if not found.
+pub fn get_table(handle: Int, key: String) -> Int:
+    return toml_get_table(handle, key)
+
+# get an array by key. returns -1 if not found.
+pub fn get_array(handle: Int, key: String) -> Int:
+    return toml_get_array(handle, key)
+
+# get array length.
+pub fn array_len(handle: Int) -> Int:
+    return toml_array_len(handle)
+
+# get array element at index. returns -1 if out of bounds.
+pub fn array_get(handle: Int, index: Int) -> Int:
+    return toml_array_get(handle, index)
+
+# get all keys from a table.
+pub fn keys(handle: Int) -> List[String]:
+    return toml_keys(handle)
+
+# check if a table contains a key.
+pub fn has(handle: Int, key: String) -> Bool:
+    return toml_has(handle, key)

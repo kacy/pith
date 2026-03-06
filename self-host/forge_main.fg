@@ -19,7 +19,7 @@
 #   forge version              print version
 #   forge help                 print usage
 
-from driver import get_directory, get_stem, compile_to_c, resolve_imports, mark_visited, find_imports
+from driver import get_directory, get_stem, compile_to_c, init_driver, resolve_imports, mark_visited, find_imports
 from lexer import lex_all, Token
 from parser import parse
 from ast import get_node
@@ -87,7 +87,15 @@ fn cmd_check(path: String, json_mode: Bool) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
     root := parse(tokens)
-    diags := c_run(root)
+
+    # resolve imports for multi-module type checking
+    init_driver(path)
+    import_roots := resolve_imports(root, path)!
+
+    c_init()
+    for imp_root in import_roots:
+        c_run_module(imp_root)
+    diags := c_run_module(root)
 
     if json_mode:
         print(c_diagnostics_to_json(diags))
@@ -126,8 +134,15 @@ fn cmd_lint(path: String, json_mode: Bool) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
     root := parse(tokens)
-    # run checker first (linter needs type info)
-    c_run(root)
+
+    # resolve imports for type info (linter needs checker to run first)
+    init_driver(path)
+    import_roots := resolve_imports(root, path)!
+    c_init()
+    for imp_root in import_roots:
+        c_run_module(imp_root)
+    c_run_module(root)
+
     diags := lint_module(root, source)
 
     if json_mode:

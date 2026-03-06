@@ -143,6 +143,13 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
 pub fn mark_visited(path: String):
     dr_visited.insert(path, true)
 
+# initialize driver state for import resolution.
+# sets up stdlib root and resets the visited map.
+pub fn init_driver(source_path: String):
+    dr_stdlib_root = find_stdlib_root(source_path)
+    dr_visited = {}
+    mark_visited(source_path)
+
 # run the full compile pipeline: lex, parse, resolve imports, check, codegen.
 # returns the generated C code as a string.
 pub fn compile_to_c(path: String, test_mode: Bool) -> String!:
@@ -150,11 +157,8 @@ pub fn compile_to_c(path: String, test_mode: Bool) -> String!:
     tokens := lex_all(content)
     root := parse(tokens)
 
-    # find stdlib root for std.* imports
-    dr_stdlib_root = find_stdlib_root(path)
-
     # resolve imports
-    mark_visited(path)
+    init_driver(path)
     import_roots := resolve_imports(root, path)!
 
     # type check

@@ -2759,6 +2759,14 @@ fn c_types_structurally_equal(a: Int, b: Int) -> Bool:
                         return false
                 i = i + 1
             return true
+    # result structural equality
+    if ai.kind == "result":
+        if bi.kind == "result":
+            return c_types_structurally_equal(ai.inner, bi.inner)
+    # optional structural equality
+    if ai.kind == "optional":
+        if bi.kind == "optional":
+            return c_types_structurally_equal(ai.inner, bi.inner)
     return false
 
 # ---------------------------------------------------------------

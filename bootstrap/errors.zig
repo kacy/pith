@@ -118,9 +118,11 @@ pub const Diagnostic = struct {
     severity: Severity,
     location: Location,
     message: []const u8,
+    owns_message: bool = false,
 
     /// optional suggestion for how to fix the error.
     fix: ?[]const u8 = null,
+    owns_fix: bool = false,
 
     /// optional stable error code for machine-readable output.
     code: ?ErrorCode = null,
@@ -132,18 +134,27 @@ pub const Diagnostic = struct {
 pub const DiagnosticList = struct {
     diagnostics: std.ArrayList(Diagnostic),
     allocator: std.mem.Allocator,
+    message_arena: std.heap.ArenaAllocator,
     source: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8) DiagnosticList {
         return .{
             .diagnostics = .empty,
             .allocator = allocator,
+            .message_arena = std.heap.ArenaAllocator.init(allocator),
             .source = source,
         };
     }
 
     pub fn deinit(self: *DiagnosticList) void {
+        for (self.diagnostics.items) |diag| {
+            if (diag.owns_message) self.allocator.free(diag.message);
+            if (diag.owns_fix) {
+                if (diag.fix) |fix| self.allocator.free(fix);
+            }
+        }
         self.diagnostics.deinit(self.allocator);
+        self.message_arena.deinit();
     }
 
     /// record an error diagnostic at the given source location.
@@ -156,8 +167,24 @@ pub const DiagnosticList = struct {
         try self.diagnostics.append(self.allocator, .{
             .severity = .@"error",
             .location = location,
+            .message = try self.message_arena.allocator().dupe(u8, message),
+            .fix = if (fix) |value| try self.message_arena.allocator().dupe(u8, value) else null,
+        });
+    }
+
+    pub fn addOwnedErrorWithFix(
+        self: *DiagnosticList,
+        location: Location,
+        message: []const u8,
+        fix: ?[]const u8,
+    ) !void {
+        try self.diagnostics.append(self.allocator, .{
+            .severity = .@"error",
+            .location = location,
             .message = message,
+            .owns_message = true,
             .fix = fix,
+            .owns_fix = fix != null,
         });
     }
 
@@ -171,8 +198,8 @@ pub const DiagnosticList = struct {
         try self.diagnostics.append(self.allocator, .{
             .severity = .@"error",
             .location = location,
-            .message = message,
-            .fix = fix,
+            .message = try self.message_arena.allocator().dupe(u8, message),
+            .fix = if (fix) |value| try self.message_arena.allocator().dupe(u8, value) else null,
             .code = code,
         });
     }
@@ -187,8 +214,8 @@ pub const DiagnosticList = struct {
         try self.diagnostics.append(self.allocator, .{
             .severity = .warning,
             .location = location,
-            .message = message,
-            .fix = fix,
+            .message = try self.message_arena.allocator().dupe(u8, message),
+            .fix = if (fix) |value| try self.message_arena.allocator().dupe(u8, value) else null,
             .code = code,
         });
     }
@@ -348,6 +375,26 @@ fn digitCount(n: u32) u32 {
     return count;
 }
 
+pub fn locationFromOffset(source: []const u8, offset: u32, length: u32) Location {
+    const bounded = @min(offset, @as(u32, @intCast(source.len)));
+    var line: u32 = 0;
+    var line_start: u32 = 0;
+    var i: u32 = 0;
+    while (i < bounded) : (i += 1) {
+        if (source[i] == '\n') {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+
+    return .{
+        .line = line,
+        .column = bounded - line_start,
+        .offset = bounded,
+        .length = length,
+    };
+}
+
 // -- tests --
 
 test "location span" {
@@ -490,4 +537,14 @@ test "writeJsonEscaped: special characters" {
     try writeJsonEscaped(&w, "hello \"world\"\nnew\\line");
 
     try std.testing.expectEqualStrings("hello \\\"world\\\"\\nnew\\\\line", output.items);
+}
+
+test "owned diagnostics free allocated messages" {
+    var list = DiagnosticList.init(std.testing.allocator, "");
+    defer list.deinit();
+
+    const message = try std.fmt.allocPrint(std.testing.allocator, "dynamic {d}", .{42});
+    try list.addOwnedErrorWithFix(Location.zero, message, null);
+
+    try std.testing.expect(list.hasErrors());
 }

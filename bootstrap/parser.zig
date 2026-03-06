@@ -1081,10 +1081,17 @@ pub const Parser = struct {
                 .location = interp_tok.location,
             });
         };
+        if (lex.diagnostics.hasErrors()) {
+            try self.appendRemappedDiagnostics(&lex.diagnostics, interp_tok.location.offset);
+            return self.create(ast.Expr, .{
+                .kind = .err,
+                .location = interp_tok.location,
+            });
+        }
 
         // create a sub-parser for the interpolation expression
         var sub_parser = Parser.init(sub_tokens, interp_tok.lexeme, self.allocator);
-        // sub_parser is arena-allocated, no deinit needed
+        defer sub_parser.deinit();
 
         const expr = sub_parser.parseExpression() catch {
             return self.create(ast.Expr, .{
@@ -1092,7 +1099,28 @@ pub const Parser = struct {
                 .location = interp_tok.location,
             });
         };
+        if (!sub_parser.check(.eof)) {
+            try sub_parser.diagnostics.addError(sub_parser.peek().location, "unexpected trailing tokens in string interpolation");
+        }
+        if (sub_parser.diagnostics.hasErrors()) {
+            try self.appendRemappedDiagnostics(&sub_parser.diagnostics, interp_tok.location.offset);
+            return self.create(ast.Expr, .{
+                .kind = .err,
+                .location = interp_tok.location,
+            });
+        }
         return expr;
+    }
+
+    fn appendRemappedDiagnostics(self: *Parser, child_diags: *const errors.DiagnosticList, offset_base: u32) ParseError!void {
+        for (child_diags.diagnostics.items) |diag| {
+            const remapped = errors.locationFromOffset(
+                self.source,
+                offset_base + diag.location.offset,
+                diag.location.length,
+            );
+            try self.diagnostics.addErrorWithFix(remapped, diag.message, diag.fix);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -2403,6 +2431,34 @@ test "parse string interpolation" {
     try testing.expect(expr.kind.string_interp.parts[0] == .literal);
     try testing.expect(expr.kind.string_interp.parts[1] == .expr);
     try testing.expect(expr.kind.string_interp.parts[2] == .literal);
+}
+
+test "parse malformed string interpolation surfaces nested diagnostics" {
+    var result = try testParser("\"hello {foo(}\"");
+    defer result.deinit();
+
+    const expr = try result.parser.parseExpression();
+    try testing.expect(expr.kind == .string_interp);
+    try testing.expect(result.parser.diagnostics.hasErrors());
+}
+
+test "parse string interpolation rejects trailing tokens" {
+    var result = try testParser("\"hello {foo bar}\"");
+    defer result.deinit();
+
+    const expr = try result.parser.parseExpression();
+    try testing.expect(expr.kind == .string_interp);
+    try testing.expect(result.parser.diagnostics.hasErrors());
+}
+
+test "parse nested string interpolation preserves parent locations" {
+    var result = try testParser("\"first line\\n{foo(}\\nlast\"");
+    defer result.deinit();
+
+    _ = try result.parser.parseExpression();
+    try testing.expect(result.parser.diagnostics.hasErrors());
+    const diag = result.parser.diagnostics.diagnostics.items[0];
+    try testing.expect(diag.location.offset >= 13);
 }
 
 test "parse self" {

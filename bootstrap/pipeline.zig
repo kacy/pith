@@ -125,10 +125,12 @@ fn lexAndParse(allocator: std.mem.Allocator, source: []const u8, json: bool) !?P
     }
 
     var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-
     var parser = Parser.init(tokens, source, arena.allocator());
-    defer parser.deinit();
+    var keep_arena = false;
+    defer {
+        parser.deinit();
+        if (!keep_arena) arena.deinit();
+    }
 
     const module = parser.parseModule() catch {
         io.writeErr("error: parse failed (out of memory)\n", .{});
@@ -142,6 +144,7 @@ fn lexAndParse(allocator: std.mem.Allocator, source: []const u8, json: bool) !?P
         return null;
     }
 
+    keep_arena = true;
     return .{
         .allocator = allocator,
         .module = module,

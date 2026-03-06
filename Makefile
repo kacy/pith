@@ -1,4 +1,4 @@
-.PHONY: build release test run clean fmt check run-examples self-host bootstrap bootstrap-verify
+.PHONY: build release test run clean fmt check run-examples self-host bootstrap bootstrap-verify lint-examples lint-self-host
 
 # --- zig bootstrap (will be retired) ---
 
@@ -138,3 +138,15 @@ run-examples-self: self-host
 	done; \
 	if [ $$fail -eq 1 ]; then exit 1; fi; \
 	echo "all examples passed (self-hosted)"
+
+# --- lint ---
+
+lint-examples:
+	@for f in examples/*.fg; do \
+		./self-host/forge_main lint "$$f" || exit 1; \
+	done
+
+lint-self-host:
+	@for f in self-host/*.fg; do \
+		./self-host/forge_main lint "$$f" || exit 1; \
+	done

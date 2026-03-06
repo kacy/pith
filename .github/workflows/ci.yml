@@ -59,6 +59,44 @@ jobs:
       - name: verify bootstrap fixed point
         run: make bootstrap-verify
 
+      - name: lint examples
+        run: |
+          for f in examples/*.fg; do
+            ./self-host/forge_main lint "$f"
+            if [ $? -ne 0 ]; then
+              echo "FAIL lint $f"
+              exit 1
+            fi
+          done
+
+      - name: lint self-host
+        run: |
+          for f in self-host/*.fg; do
+            ./self-host/forge_main lint "$f"
+            if [ $? -ne 0 ]; then
+              echo "FAIL lint $f"
+              exit 1
+            fi
+          done
+
+      - name: check examples (self-hosted)
+        run: |
+          skip="encoding.fg formatting.fg fs_ops.fg hashing.fg json_ops.fg logging.fg path_ops.fg stdlib_import.fg toml_ops.fg url_ops.fg"
+          for f in examples/*.fg; do
+            name=$(basename "$f")
+            if echo "$skip" | grep -qw "$name"; then
+              echo "skip $f (stdlib builtins not in self-hosted checker)"
+              continue
+            fi
+            result=$(./self-host/forge_main check "$f" 2>&1)
+            if [ "$result" != "ok" ]; then
+              echo "FAIL $f (self-hosted check)"
+              echo "$result"
+              exit 1
+            fi
+            echo "ok   $f"
+          done
+
       - name: check forge formatting
         run: |
           for f in self-host/*.fg; do

@@ -1519,20 +1519,33 @@ fn g_emit_while_stmt(node_idx: Int):
     g_write_indent()
     g_write(RB + "\n")
 
-fn g_emit_for_loop_body(node: Node, idx_name: String, elem_name: String, comma_pos: Int, elem_c: String, elem_tid: Int, is_map: Bool):
-    # shared loop structure for list, map, and set iteration.
-    # list/set use FORGE_LIST_GET; map uses cast into .keys array.
+fn g_emit_for_loop_body(node: Node, idx_name: String, elem_name: String, comma_pos: Int, elem_c: String, elem_tid: Int, iter_kind: String):
+    # shared loop structure for list, map, set, and string iteration.
     g_write_indent()
     g_write("for (int64_t " + idx_name + " = 0; " + idx_name + " < ")
-    g_emit_expr(node.children[0])
-    g_write(".len; " + idx_name + "++) " + LB + "\n")
+    if iter_kind == "map":
+        g_write("forge_map_len(")
+        g_emit_expr(node.children[0])
+        g_write(")")
+    elif iter_kind == "string":
+        g_emit_expr(node.children[0])
+        g_write(".len")
+    else:
+        g_write("forge_list_len(")
+        g_emit_expr(node.children[0])
+        g_write(")")
+    g_write("; " + idx_name + "++) " + LB + "\n")
     g_indent = g_indent + 1
     g_write_indent()
     g_write(elem_c + " " + elem_name + " = ")
-    if is_map:
-        g_write("((" + elem_c + " *)")
+    if iter_kind == "map":
+        g_write("FORGE_MAP_KEY_AT(")
         g_emit_expr(node.children[0])
-        g_write(".keys)[" + idx_name + "];\n")
+        g_write(", " + elem_c + ", " + idx_name + ");\n")
+    elif iter_kind == "string":
+        g_write("forge_string_char_at(")
+        g_emit_expr(node.children[0])
+        g_write(", " + idx_name + ");\n")
     else:
         g_write("FORGE_LIST_GET(")
         g_emit_expr(node.children[0])
@@ -1579,19 +1592,23 @@ fn g_emit_for_stmt(node_idx: Int):
     iter_info := tt_get(iter_tid)
 
     if iter_info.kind == "list":
-        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.inner), iter_info.inner, false)
+        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.inner), iter_info.inner, "list")
+        return
+
+    if iter_tid == TID_STRING:
+        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, "forge_string_t", TID_STRING, "string")
         return
 
     if iter_info.kind == "map":
-        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.key_type), iter_info.key_type, true)
+        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.key_type), iter_info.key_type, "map")
         return
 
     if iter_info.kind == "set":
-        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.inner), iter_info.inner, false)
+        g_emit_for_loop_body(node, idx_name, elem_name, comma_pos, g_c_type_string(iter_info.inner), iter_info.inner, "set")
         return
 
     g_write_indent()
-    g_write("/* for loop: unsupported iterable type */\n")
+    g_write("/* unreachable: checker rejected unsupported iterable type */\n")
 
 fn g_emit_return_stmt(node_idx: Int):
     node := get_node(node_idx)
@@ -2576,13 +2593,14 @@ fn g_emit_list_method(node_idx: Int, method: String, elem_tid: Int):
         g_emit_collection_push(node_idx, elem_tid, elem_c)
         return
     if method == "len":
+        g_write("forge_list_len(")
         g_emit_expr(receiver_idx)
-        g_write(".len")
+        g_write(")")
         return
     if method == "is_empty":
-        g_write("(")
+        g_write("(forge_list_len(")
         g_emit_expr(receiver_idx)
-        g_write(".len == 0)")
+        g_write(") == 0)")
         return
     if method == "remove":
         g_write("forge_list_remove(&")
@@ -2722,13 +2740,14 @@ fn g_emit_map_method(node_idx: Int, method: String, key_tid: Int, val_tid: Int):
         g_emit_map_insert(node_idx, key_tid, key_c, val_c)
         return
     if method == "len":
+        g_write("forge_map_len(")
         g_emit_expr(receiver_idx)
-        g_write(".len")
+        g_write(")")
         return
     if method == "is_empty":
-        g_write("(")
+        g_write("(forge_map_len(")
         g_emit_expr(receiver_idx)
-        g_write(".len == 0)")
+        g_write(") == 0)")
         return
     if method == "contains_key":
         if key_tid == TID_STRING:
@@ -2817,13 +2836,14 @@ fn g_emit_set_method(node_idx: Int, method: String, elem_tid: Int):
         g_write(")); " + RB)
         return
     if method == "len":
+        g_write("forge_list_len(")
         g_emit_expr(receiver_idx)
-        g_write(".len")
+        g_write(")")
         return
     if method == "is_empty":
-        g_write("(")
+        g_write("(forge_list_len(")
         g_emit_expr(receiver_idx)
-        g_write(".len == 0)")
+        g_write(") == 0)")
         return
     if method == "contains":
         if elem_tid == TID_STRING:
@@ -2939,7 +2959,7 @@ fn g_emit_index_expr(node_idx: Int):
 fn g_emit_list_literal(node_idx: Int):
     node := get_node(node_idx)
     if node.children.len() == 0:
-        g_write("forge_list_create(0, 0, NULL)")
+        g_write("forge_list_empty()")
         return
     elem_tid := c_get_expr_type(node.children[0])
     elem_c := g_c_type_string(elem_tid)
@@ -2962,7 +2982,7 @@ fn g_emit_list_literal(node_idx: Int):
 fn g_emit_map_literal(node_idx: Int):
     node := get_node(node_idx)
     if node.children.len() == 0:
-        g_write("(forge_map_t)" + LB + ".keys = NULL, .values = NULL, .len = 0" + RB)
+        g_write("forge_map_empty()")
         return
     # each child is a map_entry with [key, value]
     first_entry := get_node(node.children[0])
@@ -3002,7 +3022,7 @@ fn g_emit_map_literal(node_idx: Int):
 fn g_emit_set_literal(node_idx: Int):
     node := get_node(node_idx)
     if node.children.len() == 0:
-        g_write("forge_set_create(0, 0, NULL)")
+        g_write("forge_list_empty()")
         return
     elem_tid := c_get_expr_type(node.children[0])
     elem_c := g_c_type_string(elem_tid)

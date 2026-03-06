@@ -1,0 +1,25 @@
+# generic interfaces participate in bounds
+
+interface Renderer[T]:
+    fn render(value: T) -> String
+
+struct Point:
+    pub x: Int
+    pub y: Int
+
+impl Renderer[Point] for Point:
+    fn render(value: Point) -> String:
+        return "point"
+
+fn show[T: Renderer[T]](value: T) -> String:
+    return "shown"
+
+struct Wrapper[T: Renderer[T]]:
+    pub value: T
+
+fn main():
+    pt := Point(3, 4)
+    wrapped: Wrapper[Point] := Wrapper(pt)
+    print(show(pt))
+    print(wrapped.value.x.to_string())
+    print("generic interfaces work")

@@ -97,6 +97,23 @@ run-examples: build
 			fail=1; \
 		fi; \
 	done; \
+	echo "--- negative diagnostics (bootstrap) ---"; \
+	for spec in \
+		"examples/invalid/invalid_iterable.fg:E217" \
+		"examples/invalid/invalid_spawn.fg:E232" \
+		"examples/invalid/invalid_await.fg:E232" \
+		"examples/invalid/generic_interface_bound_fail.fg:E226"; do \
+		file=$${spec%%:*}; \
+		code=$${spec##*:}; \
+		output=$$(./zig-out/bin/forge check "$$file" 2>&1 || true); \
+		if echo "$$output" | grep -q "$$code"; then \
+			echo "ok   $$(basename "$$file" .fg)"; \
+		else \
+			echo "FAIL $$(basename "$$file" .fg)"; \
+			echo "$$output" | head -20; \
+			fail=1; \
+		fi; \
+	done; \
 	if [ $$fail -eq 1 ]; then exit 1; fi; \
 	echo "all examples passed"
 
@@ -133,6 +150,23 @@ run-examples-self: self-host
 			echo "ok   $$name"; \
 		else \
 			echo "FAIL $$name (tests failed)"; \
+			fail=1; \
+		fi; \
+	done; \
+	echo "--- negative diagnostics (self-hosted) ---"; \
+	for spec in \
+		"examples/invalid/invalid_iterable.fg:E217" \
+		"examples/invalid/invalid_spawn.fg:E232" \
+		"examples/invalid/invalid_await.fg:E232" \
+		"examples/invalid/generic_interface_bound_fail.fg:E226"; do \
+		file=$${spec%%:*}; \
+		code=$${spec##*:}; \
+		output=$$(./self-host/forge_main check "$$file" 2>&1 || true); \
+		if echo "$$output" | grep -q "$$code"; then \
+			echo "ok   $$(basename "$$file" .fg)"; \
+		else \
+			echo "FAIL $$(basename "$$file" .fg)"; \
+			echo "$$output" | head -20; \
 			fail=1; \
 		fi; \
 	done; \

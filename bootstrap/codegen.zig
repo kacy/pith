@@ -1406,6 +1406,7 @@ pub const CEmitter = struct {
     /// returns null if type inference fails.
     fn buildGenericInstName(self: *const CEmitter, base_name: []const u8, args: []const ast.Arg) ?[]const u8 {
         var parts: std.ArrayList(u8) = .empty;
+        defer parts.deinit(self.allocator);
         parts.appendSlice(self.allocator, base_name) catch return null;
         parts.append(self.allocator, '[') catch return null;
 
@@ -1418,6 +1419,7 @@ pub const CEmitter = struct {
         parts.append(self.allocator, ']') catch return null;
 
         const lookup = parts.toOwnedSlice(self.allocator) catch return null;
+        defer self.allocator.free(lookup);
 
         // look up in type table — the checker must have registered this name
         // for it to be valid. return the type table key for stable lifetime.
@@ -3596,11 +3598,13 @@ pub const CEmitter = struct {
             std.mem.eql(u8, method, "clear")) return .void;
         if (std.mem.eql(u8, method, "keys")) {
             // look up List[K] type
-            const lookup_name = std.fmt.allocPrint(self.allocator, "List[{s}]", .{self.type_table.typeName(key_type)}) catch return null;
+            var buf: [128]u8 = undefined;
+            const lookup_name = std.fmt.bufPrint(&buf, "List[{s}]", .{self.type_table.typeName(key_type)}) catch return null;
             return self.type_table.lookup(lookup_name);
         }
         if (std.mem.eql(u8, method, "values")) {
-            const lookup_name = std.fmt.allocPrint(self.allocator, "List[{s}]", .{self.type_table.typeName(val_type)}) catch return null;
+            var buf: [128]u8 = undefined;
+            const lookup_name = std.fmt.bufPrint(&buf, "List[{s}]", .{self.type_table.typeName(val_type)}) catch return null;
             return self.type_table.lookup(lookup_name);
         }
         return null;
@@ -4119,6 +4123,7 @@ pub const CEmitter = struct {
             .generic => |g| {
                 // build the instantiated name: "List[Int]", "Map[String,Int]"
                 var parts: std.ArrayList(u8) = .empty;
+                defer parts.deinit(self.allocator);
                 parts.appendSlice(self.allocator, g.name) catch return .err;
                 parts.append(self.allocator, '[') catch return .err;
                 for (g.args, 0..) |arg, i| {
@@ -4131,6 +4136,7 @@ pub const CEmitter = struct {
                 }
                 parts.append(self.allocator, ']') catch return .err;
                 const lookup = parts.toOwnedSlice(self.allocator) catch return .err;
+                defer self.allocator.free(lookup);
                 return self.type_table.lookup(lookup) orelse .err;
             },
             .result => |r| {

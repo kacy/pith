@@ -372,6 +372,11 @@ static inline forge_string_t forge_bool_to_string(bool b) {
 typedef struct {
     void *data;
     int64_t len;
+    int64_t cap;
+} forge_list_impl_t;
+
+typedef struct {
+    forge_list_impl_t *impl;
 } forge_list_t;
 
 // Map[K,V] — hash-indexed key-value collection.
@@ -384,10 +389,54 @@ typedef struct {
     int32_t *buckets;     // hash index: bucket -> dense array index, -1 = empty
     int32_t cap;          // bucket count (power of 2)
     int32_t _pad;         // alignment padding
+} forge_map_impl_t;
+
+typedef struct {
+    forge_map_impl_t *impl;
 } forge_map_t;
 
 // Set[T] — unique element collection. same layout as list for now.
 typedef forge_list_t forge_set_t;
+
+static inline forge_list_t forge_list_empty(void) {
+    forge_list_impl_t *impl = (forge_list_impl_t *)calloc(1, sizeof(forge_list_impl_t));
+    if (!impl) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    return (forge_list_t){ .impl = impl };
+}
+
+static inline forge_map_t forge_map_empty(void) {
+    forge_map_impl_t *impl = (forge_map_impl_t *)calloc(1, sizeof(forge_map_impl_t));
+    if (!impl) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    return (forge_map_t){ .impl = impl };
+}
+
+static inline int64_t forge_list_len(forge_list_t list) {
+    return list.impl ? list.impl->len : 0;
+}
+
+static inline void *forge_list_data(forge_list_t list) {
+    return list.impl ? list.impl->data : NULL;
+}
+
+static inline int64_t forge_map_len(forge_map_t map) {
+    return map.impl ? map.impl->len : 0;
+}
+
+static inline void *forge_map_keys_data(forge_map_t map) {
+    return map.impl ? map.impl->keys : NULL;
+}
+
+static inline void *forge_map_values_data(forge_map_t map) {
+    return map.impl ? map.impl->values : NULL;
+}
+
+static inline int32_t *forge_map_buckets_data(forge_map_t map) {
+    return map.impl ? map.impl->buckets : NULL;
+}
+
+static inline int32_t forge_map_cap(forge_map_t map) {
+    return map.impl ? map.impl->cap : 0;
+}
 
 // ---------------------------------------------------------------
 // hash functions (for map hash index)
@@ -433,60 +482,72 @@ static inline int32_t *forge_map_alloc_buckets(int32_t cap) {
 
 // rebuild the bucket index from the dense arrays (string keys)
 static inline void forge_map_rebuild_string(forge_map_t *map) {
-    int32_t mask = map->cap - 1;
-    for (int32_t i = 0; i < map->cap; i++) map->buckets[i] = -1;
-    forge_string_t *keys = (forge_string_t *)map->keys;
-    for (int32_t i = 0; i < (int32_t)map->len; i++) {
+    forge_map_impl_t *impl = map->impl;
+    int32_t mask = impl->cap - 1;
+    for (int32_t i = 0; i < impl->cap; i++) impl->buckets[i] = -1;
+    forge_string_t *keys = (forge_string_t *)impl->keys;
+    for (int32_t i = 0; i < (int32_t)impl->len; i++) {
         uint64_t h = forge_hash_string(keys[i]);
         int32_t slot = (int32_t)(h & (uint64_t)mask);
-        while (map->buckets[slot] != -1) slot = (slot + 1) & mask;
-        map->buckets[slot] = i;
+        while (impl->buckets[slot] != -1) slot = (slot + 1) & mask;
+        impl->buckets[slot] = i;
     }
 }
 
 // rebuild the bucket index from the dense arrays (integer keys)
 static inline void forge_map_rebuild_int(forge_map_t *map) {
-    int32_t mask = map->cap - 1;
-    for (int32_t i = 0; i < map->cap; i++) map->buckets[i] = -1;
-    int64_t *keys = (int64_t *)map->keys;
-    for (int32_t i = 0; i < (int32_t)map->len; i++) {
+    forge_map_impl_t *impl = map->impl;
+    int32_t mask = impl->cap - 1;
+    for (int32_t i = 0; i < impl->cap; i++) impl->buckets[i] = -1;
+    int64_t *keys = (int64_t *)impl->keys;
+    for (int32_t i = 0; i < (int32_t)impl->len; i++) {
         uint64_t h = forge_hash_int(keys[i]);
         int32_t slot = (int32_t)(h & (uint64_t)mask);
-        while (map->buckets[slot] != -1) slot = (slot + 1) & mask;
-        map->buckets[slot] = i;
+        while (impl->buckets[slot] != -1) slot = (slot + 1) & mask;
+        impl->buckets[slot] = i;
     }
 }
 
 // ensure the map has a hash index with room for at least one more entry.
 // string key variant — grows at 75% load.
 static inline void forge_map_ensure_index_string(forge_map_t *map) {
-    if (map->cap == 0) {
-        map->cap = 8;
-        map->buckets = forge_map_alloc_buckets(8);
+    if (!map->impl) {
+        map->impl = (forge_map_impl_t *)calloc(1, sizeof(forge_map_impl_t));
+        if (!map->impl) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    }
+    forge_map_impl_t *impl = map->impl;
+    if (impl->cap == 0) {
+        impl->cap = 8;
+        impl->buckets = forge_map_alloc_buckets(8);
         forge_map_rebuild_string(map);
         return;
     }
     // grow at 75% load: len * 4 >= cap * 3
-    if ((int32_t)map->len * 4 >= map->cap * 3) {
-        free(map->buckets);
-        map->cap *= 2;
-        map->buckets = forge_map_alloc_buckets(map->cap);
+    if ((int32_t)impl->len * 4 >= impl->cap * 3) {
+        free(impl->buckets);
+        impl->cap *= 2;
+        impl->buckets = forge_map_alloc_buckets(impl->cap);
         forge_map_rebuild_string(map);
     }
 }
 
 // integer key variant
 static inline void forge_map_ensure_index_int(forge_map_t *map) {
-    if (map->cap == 0) {
-        map->cap = 8;
-        map->buckets = forge_map_alloc_buckets(8);
+    if (!map->impl) {
+        map->impl = (forge_map_impl_t *)calloc(1, sizeof(forge_map_impl_t));
+        if (!map->impl) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    }
+    forge_map_impl_t *impl = map->impl;
+    if (impl->cap == 0) {
+        impl->cap = 8;
+        impl->buckets = forge_map_alloc_buckets(8);
         forge_map_rebuild_int(map);
         return;
     }
-    if ((int32_t)map->len * 4 >= map->cap * 3) {
-        free(map->buckets);
-        map->cap *= 2;
-        map->buckets = forge_map_alloc_buckets(map->cap);
+    if ((int32_t)impl->len * 4 >= impl->cap * 3) {
+        free(impl->buckets);
+        impl->cap *= 2;
+        impl->buckets = forge_map_alloc_buckets(impl->cap);
         forge_map_rebuild_int(map);
     }
 }
@@ -497,22 +558,22 @@ static inline void forge_map_ensure_index_int(forge_map_t *map) {
 
 // create a list from an initializer array. copies the data.
 static inline forge_list_t forge_list_create(int64_t len, int64_t elem_size, const void *init) {
-    forge_list_t list;
-    list.len = len;
-    if (len == 0 || !init) {
-        list.data = NULL;
-        return list;
-    }
+    forge_list_impl_t *impl = (forge_list_impl_t *)calloc(1, sizeof(forge_list_impl_t));
+    if (!impl) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    forge_list_t list = { .impl = impl };
+    impl->len = len;
+    impl->cap = len;
+    if (len == 0 || !init) return list;
     if (elem_size > 0 && (size_t)len > SIZE_MAX / (size_t)elem_size) {
         fprintf(stderr, "forge: list too large\n");
         exit(1);
     }
-    list.data = malloc((size_t)(len * elem_size));
-    if (!list.data) {
+    impl->data = malloc((size_t)(len * elem_size));
+    if (!impl->data) {
         fprintf(stderr, "forge: out of memory\n");
         exit(1);
     }
-    memcpy(list.data, init, (size_t)(len * elem_size));
+    memcpy(impl->data, init, (size_t)(len * elem_size));
     return list;
 }
 
@@ -520,16 +581,11 @@ static inline forge_list_t forge_list_create(int64_t len, int64_t elem_size, con
 // key_size is used to distinguish string keys (sizeof(forge_string_t)) from int keys.
 static inline forge_map_t forge_map_create(int64_t len, int64_t key_size, int64_t val_size,
                                            const void *init_keys, const void *init_vals) {
-    forge_map_t map;
-    map.len = len;
-    map.buckets = NULL;
-    map.cap = 0;
-    map._pad = 0;
-    if (len == 0) {
-        map.keys = NULL;
-        map.values = NULL;
-        return map;
-    }
+    forge_map_impl_t *impl = (forge_map_impl_t *)calloc(1, sizeof(forge_map_impl_t));
+    if (!impl) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    forge_map_t map = { .impl = impl };
+    impl->len = len;
+    if (len == 0) return map;
     if (key_size > 0 && len > (int64_t)(SIZE_MAX / (size_t)key_size)) {
         fprintf(stderr, "forge: map too large\n");
         exit(1);
@@ -538,20 +594,20 @@ static inline forge_map_t forge_map_create(int64_t len, int64_t key_size, int64_
         fprintf(stderr, "forge: map too large\n");
         exit(1);
     }
-    map.keys = malloc((size_t)(len * key_size));
-    map.values = malloc((size_t)(len * val_size));
-    if (!map.keys || !map.values) {
+    impl->keys = malloc((size_t)(len * key_size));
+    impl->values = malloc((size_t)(len * val_size));
+    if (!impl->keys || !impl->values) {
         fprintf(stderr, "forge: out of memory\n");
         exit(1);
     }
-    memcpy(map.keys, init_keys, (size_t)(len * key_size));
-    memcpy(map.values, init_vals, (size_t)(len * val_size));
+    memcpy(impl->keys, init_keys, (size_t)(len * key_size));
+    memcpy(impl->values, init_vals, (size_t)(len * val_size));
     // pick initial capacity: next power of 2 that keeps load < 75%
     int32_t needed = (int32_t)((len * 4 + 2) / 3); // ceil(len / 0.75)
     int32_t cap = 8;
     while (cap < needed) cap *= 2;
-    map.cap = cap;
-    map.buckets = forge_map_alloc_buckets(cap);
+    impl->cap = cap;
+    impl->buckets = forge_map_alloc_buckets(cap);
     if (key_size == (int64_t)sizeof(forge_string_t)) {
         forge_map_rebuild_string(&map);
     } else {
@@ -579,20 +635,23 @@ static inline void forge_bounds_check(int64_t idx, int64_t len) {
 
 // typed element access for lists: FORGE_LIST_GET(list, int64_t, 0)
 #define FORGE_LIST_GET(list, type, idx) \
-    (forge_bounds_check((idx), (list).len), ((type *)(list).data)[(idx)])
+    (forge_bounds_check((idx), forge_list_len(list)), ((type *)forge_list_data(list))[(idx)])
+
+#define FORGE_MAP_KEY_AT(map, type, idx) \
+    (forge_bounds_check((idx), forge_map_len(map)), ((type *)forge_map_keys_data(map))[(idx)])
 
 // look up a value in a map by integer key. returns pointer to the value slot,
 // or NULL if not found. O(1) average via hash probing.
 static inline void *forge_map_get_by_int(forge_map_t map, int64_t key, int64_t val_size) {
-    if (map.cap == 0) return NULL;
-    int32_t mask = map.cap - 1;
+    if (!map.impl || map.impl->cap == 0) return NULL;
+    int32_t mask = map.impl->cap - 1;
     uint64_t h = forge_hash_int(key);
     int32_t slot = (int32_t)(h & (uint64_t)mask);
-    int64_t *keys = (int64_t *)map.keys;
+    int64_t *keys = (int64_t *)map.impl->keys;
     while (1) {
-        int32_t idx = map.buckets[slot];
+        int32_t idx = map.impl->buckets[slot];
         if (idx == -1) return NULL;
-        if (keys[idx] == key) return (char *)map.values + idx * val_size;
+        if (keys[idx] == key) return (char *)map.impl->values + idx * val_size;
         slot = (slot + 1) & mask;
     }
 }
@@ -600,15 +659,15 @@ static inline void *forge_map_get_by_int(forge_map_t map, int64_t key, int64_t v
 // look up a value in a map by string key. returns pointer to the value slot,
 // or NULL if not found. O(1) average via hash probing.
 static inline void *forge_map_get_by_string(forge_map_t map, forge_string_t key, int64_t val_size) {
-    if (map.cap == 0) return NULL;
-    int32_t mask = map.cap - 1;
+    if (!map.impl || map.impl->cap == 0) return NULL;
+    int32_t mask = map.impl->cap - 1;
     uint64_t h = forge_hash_string(key);
     int32_t slot = (int32_t)(h & (uint64_t)mask);
-    forge_string_t *keys = (forge_string_t *)map.keys;
+    forge_string_t *keys = (forge_string_t *)map.impl->keys;
     while (1) {
-        int32_t idx = map.buckets[slot];
+        int32_t idx = map.impl->buckets[slot];
         if (idx == -1) return NULL;
-        if (forge_string_eq(keys[idx], key)) return (char *)map.values + idx * val_size;
+        if (forge_string_eq(keys[idx], key)) return (char *)map.impl->values + idx * val_size;
         slot = (slot + 1) & mask;
     }
 }
@@ -628,19 +687,25 @@ static inline void *forge_map_get_checked(void *ptr) {
 
 // append an element to a list. grows the backing array via realloc.
 static inline void forge_list_push(forge_list_t *list, const void *elem, int64_t elem_size) {
-    int64_t new_len = list->len + 1;
+    if (!list->impl) {
+        list->impl = (forge_list_impl_t *)calloc(1, sizeof(forge_list_impl_t));
+        if (!list->impl) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    }
+    forge_list_impl_t *impl = list->impl;
+    int64_t new_len = impl->len + 1;
     if (elem_size > 0 && (size_t)new_len > SIZE_MAX / (size_t)elem_size) {
         fprintf(stderr, "forge: list too large\n");
         exit(1);
     }
-    void *new_data = realloc(list->data, (size_t)(new_len * elem_size));
+    void *new_data = realloc(impl->data, (size_t)(new_len * elem_size));
     if (!new_data) {
         fprintf(stderr, "forge: out of memory\n");
         exit(1);
     }
-    list->data = new_data;
-    memcpy((char *)list->data + list->len * elem_size, elem, (size_t)elem_size);
-    list->len = new_len;
+    impl->data = new_data;
+    impl->cap = new_len;
+    memcpy((char *)impl->data + impl->len * elem_size, elem, (size_t)elem_size);
+    impl->len = new_len;
 }
 
 // insert or update a key-value pair in a map (string keys).
@@ -648,17 +713,22 @@ static inline void forge_list_push(forge_list_t *list, const void *elem, int64_t
 // O(1) average via hash probing.
 static inline void forge_map_set_by_string(forge_map_t *map, forge_string_t key,
                                             const void *val, int64_t key_size, int64_t val_size) {
+    if (!map->impl) {
+        map->impl = (forge_map_impl_t *)calloc(1, sizeof(forge_map_impl_t));
+        if (!map->impl) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    }
+    forge_map_impl_t *impl = map->impl;
     // check for existing key via hash probe
-    if (map->cap > 0) {
-        int32_t mask = map->cap - 1;
+    if (impl->cap > 0) {
+        int32_t mask = impl->cap - 1;
         uint64_t h = forge_hash_string(key);
         int32_t slot = (int32_t)(h & (uint64_t)mask);
-        forge_string_t *keys = (forge_string_t *)map->keys;
+        forge_string_t *keys = (forge_string_t *)impl->keys;
         while (1) {
-            int32_t idx = map->buckets[slot];
+            int32_t idx = impl->buckets[slot];
             if (idx == -1) break;
             if (forge_string_eq(keys[idx], key)) {
-                memcpy((char *)map->values + idx * val_size, val, (size_t)val_size);
+                memcpy((char *)impl->values + idx * val_size, val, (size_t)val_size);
                 return;
             }
             slot = (slot + 1) & mask;
@@ -667,39 +737,44 @@ static inline void forge_map_set_by_string(forge_map_t *map, forge_string_t key,
     // ensure hash index has room
     forge_map_ensure_index_string(map);
     // grow dense arrays
-    int64_t new_len = map->len + 1;
-    void *new_keys = realloc(map->keys, (size_t)(new_len * key_size));
+    int64_t new_len = impl->len + 1;
+    void *new_keys = realloc(impl->keys, (size_t)(new_len * key_size));
     if (!new_keys) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
-    map->keys = new_keys;
-    void *new_vals = realloc(map->values, (size_t)(new_len * val_size));
+    impl->keys = new_keys;
+    void *new_vals = realloc(impl->values, (size_t)(new_len * val_size));
     if (!new_vals) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
-    map->values = new_vals;
-    memcpy((char *)map->keys + map->len * key_size, &key, (size_t)key_size);
-    memcpy((char *)map->values + map->len * val_size, val, (size_t)val_size);
+    impl->values = new_vals;
+    memcpy((char *)impl->keys + impl->len * key_size, &key, (size_t)key_size);
+    memcpy((char *)impl->values + impl->len * val_size, val, (size_t)val_size);
     // insert into hash index
-    int32_t mask = map->cap - 1;
+    int32_t mask = impl->cap - 1;
     uint64_t h = forge_hash_string(key);
     int32_t slot = (int32_t)(h & (uint64_t)mask);
-    while (map->buckets[slot] != -1) slot = (slot + 1) & mask;
-    map->buckets[slot] = (int32_t)map->len;
-    map->len = new_len;
+    while (impl->buckets[slot] != -1) slot = (slot + 1) & mask;
+    impl->buckets[slot] = (int32_t)impl->len;
+    impl->len = new_len;
 }
 
 // insert or update a key-value pair in a map (integer keys).
 // O(1) average via hash probing.
 static inline void forge_map_set_by_int(forge_map_t *map, int64_t key,
                                          const void *val, int64_t key_size, int64_t val_size) {
+    if (!map->impl) {
+        map->impl = (forge_map_impl_t *)calloc(1, sizeof(forge_map_impl_t));
+        if (!map->impl) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    }
+    forge_map_impl_t *impl = map->impl;
     // check for existing key via hash probe
-    if (map->cap > 0) {
-        int32_t mask = map->cap - 1;
+    if (impl->cap > 0) {
+        int32_t mask = impl->cap - 1;
         uint64_t h = forge_hash_int(key);
         int32_t slot = (int32_t)(h & (uint64_t)mask);
-        int64_t *keys = (int64_t *)map->keys;
+        int64_t *keys = (int64_t *)impl->keys;
         while (1) {
-            int32_t idx = map->buckets[slot];
+            int32_t idx = impl->buckets[slot];
             if (idx == -1) break;
             if (keys[idx] == key) {
-                memcpy((char *)map->values + idx * val_size, val, (size_t)val_size);
+                memcpy((char *)impl->values + idx * val_size, val, (size_t)val_size);
                 return;
             }
             slot = (slot + 1) & mask;
@@ -708,30 +783,32 @@ static inline void forge_map_set_by_int(forge_map_t *map, int64_t key,
     // ensure hash index has room
     forge_map_ensure_index_int(map);
     // grow dense arrays
-    int64_t new_len = map->len + 1;
-    void *new_keys = realloc(map->keys, (size_t)(new_len * key_size));
+    int64_t new_len = impl->len + 1;
+    void *new_keys = realloc(impl->keys, (size_t)(new_len * key_size));
     if (!new_keys) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
-    map->keys = new_keys;
-    void *new_vals = realloc(map->values, (size_t)(new_len * val_size));
+    impl->keys = new_keys;
+    void *new_vals = realloc(impl->values, (size_t)(new_len * val_size));
     if (!new_vals) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
-    map->values = new_vals;
-    memcpy((char *)map->keys + map->len * key_size, &key, (size_t)key_size);
-    memcpy((char *)map->values + map->len * val_size, val, (size_t)val_size);
+    impl->values = new_vals;
+    memcpy((char *)impl->keys + impl->len * key_size, &key, (size_t)key_size);
+    memcpy((char *)impl->values + impl->len * val_size, val, (size_t)val_size);
     // insert into hash index
-    int32_t mask = map->cap - 1;
+    int32_t mask = impl->cap - 1;
     uint64_t h = forge_hash_int(key);
     int32_t slot = (int32_t)(h & (uint64_t)mask);
-    while (map->buckets[slot] != -1) slot = (slot + 1) & mask;
-    map->buckets[slot] = (int32_t)map->len;
-    map->len = new_len;
+    while (impl->buckets[slot] != -1) slot = (slot + 1) & mask;
+    impl->buckets[slot] = (int32_t)impl->len;
+    impl->len = new_len;
 }
 
 // add an element to a set (no-op if already present).
 // uses linear scan for deduplication — fine for small sets.
 static inline void forge_set_add(forge_set_t *set, const void *elem, int64_t elem_size) {
     // check if element already exists
-    for (int64_t i = 0; i < set->len; i++) {
-        if (memcmp((char *)set->data + i * elem_size, elem, (size_t)elem_size) == 0) {
+    int64_t len = forge_list_len(*set);
+    void *data = forge_list_data(*set);
+    for (int64_t i = 0; i < len; i++) {
+        if (memcmp((char *)data + i * elem_size, elem, (size_t)elem_size) == 0) {
             return; // already present
         }
     }
@@ -744,20 +821,24 @@ static inline void forge_set_add(forge_set_t *set, const void *elem, int64_t ele
 
 // list — remove element at index
 static inline void forge_list_remove(forge_list_t *list, int64_t idx, int64_t elem_size) {
-    forge_bounds_check(idx, list->len);
-    int64_t remaining = list->len - idx - 1;
+    if (!list->impl) return;
+    forge_list_impl_t *impl = list->impl;
+    forge_bounds_check(idx, impl->len);
+    int64_t remaining = impl->len - idx - 1;
     if (remaining > 0) {
-        memmove((char *)list->data + idx * elem_size,
-                (char *)list->data + (idx + 1) * elem_size,
+        memmove((char *)impl->data + idx * elem_size,
+                (char *)impl->data + (idx + 1) * elem_size,
                 (size_t)(remaining * elem_size));
     }
-    list->len--;
+    impl->len--;
 }
 
 // list — linear scan for element (generic, uses memcmp)
 static inline bool forge_list_contains(forge_list_t list, const void *elem, int64_t elem_size) {
-    for (int64_t i = 0; i < list.len; i++) {
-        if (memcmp((char *)list.data + i * elem_size, elem, (size_t)elem_size) == 0)
+    int64_t len = forge_list_len(list);
+    void *data = forge_list_data(list);
+    for (int64_t i = 0; i < len; i++) {
+        if (memcmp((char *)data + i * elem_size, elem, (size_t)elem_size) == 0)
             return true;
     }
     return false;
@@ -765,8 +846,8 @@ static inline bool forge_list_contains(forge_list_t list, const void *elem, int6
 
 // list — linear scan for string element
 static inline bool forge_list_contains_string(forge_list_t list, forge_string_t s) {
-    forge_string_t *items = (forge_string_t *)list.data;
-    for (int64_t i = 0; i < list.len; i++) {
+    forge_string_t *items = (forge_string_t *)forge_list_data(list);
+    for (int64_t i = 0; i < forge_list_len(list); i++) {
         if (forge_string_eq(items[i], s)) return true;
     }
     return false;
@@ -774,15 +855,16 @@ static inline bool forge_list_contains_string(forge_list_t list, forge_string_t 
 
 // list — reverse in place
 static inline void forge_list_reverse(forge_list_t *list, int64_t elem_size) {
-    if (list->len < 2) return;
+    if (!list->impl || list->impl->len < 2) return;
+    forge_list_impl_t *impl = list->impl;
     // use stack buffer for small elements, heap for large ones
     char stack_buf[64];
     char *tmp = (elem_size <= 64) ? stack_buf : (char *)malloc((size_t)elem_size);
     if (!tmp) return;
-    for (int64_t i = 0; i < list->len / 2; i++) {
-        int64_t j = list->len - 1 - i;
-        char *a = (char *)list->data + i * elem_size;
-        char *b = (char *)list->data + j * elem_size;
+    for (int64_t i = 0; i < impl->len / 2; i++) {
+        int64_t j = impl->len - 1 - i;
+        char *a = (char *)impl->data + i * elem_size;
+        char *b = (char *)impl->data + j * elem_size;
         memcpy(tmp, a, (size_t)elem_size);
         memcpy(a, b, (size_t)elem_size);
         memcpy(b, tmp, (size_t)elem_size);
@@ -792,35 +874,38 @@ static inline void forge_list_reverse(forge_list_t *list, int64_t elem_size) {
 
 // list — clear (free data and reset)
 static inline void forge_list_clear(forge_list_t *list) {
-    free(list->data);
-    list->data = NULL;
-    list->len = 0;
+    if (!list->impl) return;
+    free(list->impl->data);
+    list->impl->data = NULL;
+    list->impl->len = 0;
+    list->impl->cap = 0;
 }
 
 // map — remove by string key. shifts dense arrays and rebuilds hash index.
 static inline void forge_map_remove_by_string(forge_map_t *map, forge_string_t key,
                                                 int64_t key_size, int64_t val_size) {
-    if (map->cap == 0) return;
+    if (!map->impl || map->impl->cap == 0) return;
+    forge_map_impl_t *impl = map->impl;
     // find via hash probe
-    int32_t mask = map->cap - 1;
+    int32_t mask = impl->cap - 1;
     uint64_t h = forge_hash_string(key);
     int32_t slot = (int32_t)(h & (uint64_t)mask);
-    forge_string_t *keys = (forge_string_t *)map->keys;
+    forge_string_t *keys = (forge_string_t *)impl->keys;
     while (1) {
-        int32_t idx = map->buckets[slot];
+        int32_t idx = impl->buckets[slot];
         if (idx == -1) return; // not found
         if (forge_string_eq(keys[idx], key)) {
             // shift dense arrays to preserve insertion order
-            int64_t remaining = map->len - idx - 1;
+            int64_t remaining = impl->len - idx - 1;
             if (remaining > 0) {
-                memmove((char *)map->keys + idx * key_size,
-                        (char *)map->keys + (idx + 1) * key_size,
+                memmove((char *)impl->keys + idx * key_size,
+                        (char *)impl->keys + (idx + 1) * key_size,
                         (size_t)(remaining * key_size));
-                memmove((char *)map->values + idx * val_size,
-                        (char *)map->values + (idx + 1) * val_size,
+                memmove((char *)impl->values + idx * val_size,
+                        (char *)impl->values + (idx + 1) * val_size,
                         (size_t)(remaining * val_size));
             }
-            map->len--;
+            impl->len--;
             forge_map_rebuild_string(map);
             return;
         }
@@ -831,25 +916,26 @@ static inline void forge_map_remove_by_string(forge_map_t *map, forge_string_t k
 // map — remove by integer key. shifts dense arrays and rebuilds hash index.
 static inline void forge_map_remove_by_int(forge_map_t *map, int64_t key,
                                             int64_t key_size, int64_t val_size) {
-    if (map->cap == 0) return;
-    int32_t mask = map->cap - 1;
+    if (!map->impl || map->impl->cap == 0) return;
+    forge_map_impl_t *impl = map->impl;
+    int32_t mask = impl->cap - 1;
     uint64_t h = forge_hash_int(key);
     int32_t slot = (int32_t)(h & (uint64_t)mask);
-    int64_t *keys = (int64_t *)map->keys;
+    int64_t *keys = (int64_t *)impl->keys;
     while (1) {
-        int32_t idx = map->buckets[slot];
+        int32_t idx = impl->buckets[slot];
         if (idx == -1) return; // not found
         if (keys[idx] == key) {
-            int64_t remaining = map->len - idx - 1;
+            int64_t remaining = impl->len - idx - 1;
             if (remaining > 0) {
-                memmove((char *)map->keys + idx * key_size,
-                        (char *)map->keys + (idx + 1) * key_size,
+                memmove((char *)impl->keys + idx * key_size,
+                        (char *)impl->keys + (idx + 1) * key_size,
                         (size_t)(remaining * key_size));
-                memmove((char *)map->values + idx * val_size,
-                        (char *)map->values + (idx + 1) * val_size,
+                memmove((char *)impl->values + idx * val_size,
+                        (char *)impl->values + (idx + 1) * val_size,
                         (size_t)(remaining * val_size));
             }
-            map->len--;
+            impl->len--;
             forge_map_rebuild_int(map);
             return;
         }
@@ -859,13 +945,13 @@ static inline void forge_map_remove_by_int(forge_map_t *map, int64_t key,
 
 // map — check key existence (string keys). O(1) average.
 static inline bool forge_map_contains_key_string(forge_map_t map, forge_string_t key) {
-    if (map.cap == 0) return false;
-    int32_t mask = map.cap - 1;
+    if (!map.impl || map.impl->cap == 0) return false;
+    int32_t mask = map.impl->cap - 1;
     uint64_t h = forge_hash_string(key);
     int32_t slot = (int32_t)(h & (uint64_t)mask);
-    forge_string_t *keys = (forge_string_t *)map.keys;
+    forge_string_t *keys = (forge_string_t *)map.impl->keys;
     while (1) {
-        int32_t idx = map.buckets[slot];
+        int32_t idx = map.impl->buckets[slot];
         if (idx == -1) return false;
         if (forge_string_eq(keys[idx], key)) return true;
         slot = (slot + 1) & mask;
@@ -874,13 +960,13 @@ static inline bool forge_map_contains_key_string(forge_map_t map, forge_string_t
 
 // map — check key existence (integer keys). O(1) average.
 static inline bool forge_map_contains_key_int(forge_map_t map, int64_t key) {
-    if (map.cap == 0) return false;
-    int32_t mask = map.cap - 1;
+    if (!map.impl || map.impl->cap == 0) return false;
+    int32_t mask = map.impl->cap - 1;
     uint64_t h = forge_hash_int(key);
     int32_t slot = (int32_t)(h & (uint64_t)mask);
-    int64_t *keys = (int64_t *)map.keys;
+    int64_t *keys = (int64_t *)map.impl->keys;
     while (1) {
-        int32_t idx = map.buckets[slot];
+        int32_t idx = map.impl->buckets[slot];
         if (idx == -1) return false;
         if (keys[idx] == key) return true;
         slot = (slot + 1) & mask;
@@ -889,48 +975,37 @@ static inline bool forge_map_contains_key_int(forge_map_t map, int64_t key) {
 
 // map — get all keys as a list
 static inline forge_list_t forge_map_keys(forge_map_t map, int64_t key_size) {
-    forge_list_t result;
-    result.len = map.len;
-    if (map.len == 0) {
-        result.data = NULL;
-        return result;
-    }
-    result.data = malloc((size_t)(map.len * key_size));
-    if (!result.data) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
-    memcpy(result.data, map.keys, (size_t)(map.len * key_size));
-    return result;
+    int64_t len = forge_map_len(map);
+    if (len == 0) return forge_list_empty();
+    return forge_list_create(len, key_size, forge_map_keys_data(map));
 }
 
 // map — get all values as a list
 static inline forge_list_t forge_map_values(forge_map_t map, int64_t val_size) {
-    forge_list_t result;
-    result.len = map.len;
-    if (map.len == 0) {
-        result.data = NULL;
-        return result;
-    }
-    result.data = malloc((size_t)(map.len * val_size));
-    if (!result.data) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
-    memcpy(result.data, map.values, (size_t)(map.len * val_size));
-    return result;
+    int64_t len = forge_map_len(map);
+    if (len == 0) return forge_list_empty();
+    return forge_list_create(len, val_size, forge_map_values_data(map));
 }
 
 // map — clear (free data, hash index, and reset)
 static inline void forge_map_clear(forge_map_t *map) {
-    free(map->keys);
-    free(map->values);
-    free(map->buckets);
-    map->keys = NULL;
-    map->values = NULL;
-    map->buckets = NULL;
-    map->len = 0;
-    map->cap = 0;
+    if (!map->impl) return;
+    free(map->impl->keys);
+    free(map->impl->values);
+    free(map->impl->buckets);
+    map->impl->keys = NULL;
+    map->impl->values = NULL;
+    map->impl->buckets = NULL;
+    map->impl->len = 0;
+    map->impl->cap = 0;
 }
 
 // set — remove by generic element
 static inline void forge_set_remove(forge_set_t *set, const void *elem, int64_t elem_size) {
-    for (int64_t i = 0; i < set->len; i++) {
-        if (memcmp((char *)set->data + i * elem_size, elem, (size_t)elem_size) == 0) {
+    int64_t len = forge_list_len(*set);
+    void *data = forge_list_data(*set);
+    for (int64_t i = 0; i < len; i++) {
+        if (memcmp((char *)data + i * elem_size, elem, (size_t)elem_size) == 0) {
             forge_list_remove(set, i, elem_size);
             return;
         }
@@ -939,8 +1014,8 @@ static inline void forge_set_remove(forge_set_t *set, const void *elem, int64_t 
 
 // set — remove by string element
 static inline void forge_set_remove_string(forge_set_t *set, forge_string_t s) {
-    forge_string_t *items = (forge_string_t *)set->data;
-    for (int64_t i = 0; i < set->len; i++) {
+    forge_string_t *items = (forge_string_t *)forge_list_data(*set);
+    for (int64_t i = 0; i < forge_list_len(*set); i++) {
         if (forge_string_eq(items[i], s)) {
             forge_list_remove(set, i, sizeof(forge_string_t));
             return;
@@ -968,7 +1043,7 @@ static inline void forge_set_clear(forge_set_t *set) {
 // ---------------------------------------------------------------
 
 static inline forge_list_t forge_string_split(forge_string_t s, forge_string_t sep) {
-    forge_list_t result = { .data = NULL, .len = 0 };
+    forge_list_t result = forge_list_empty();
     if (sep.len == 0) {
         // split on empty separator: return each character
         for (int64_t i = 0; i < s.len; i++) {
@@ -1008,9 +1083,10 @@ static inline forge_list_t forge_string_split(forge_string_t s, forge_string_t s
 
 // join a List[String] with a separator. returns a new string.
 static inline forge_string_t forge_list_join(forge_list_t list, forge_string_t sep) {
-    if (list.len == 0) return forge_string_empty;
-    forge_string_t *items = (forge_string_t *)list.data;
-    if (list.len == 1) {
+    int64_t len = forge_list_len(list);
+    if (len == 0) return forge_string_empty;
+    forge_string_t *items = (forge_string_t *)forge_list_data(list);
+    if (len == 1) {
         char *buf = (char *)malloc((size_t)items[0].len + 1);
         if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
         memcpy(buf, items[0].data, (size_t)items[0].len);
@@ -1019,14 +1095,14 @@ static inline forge_string_t forge_list_join(forge_list_t list, forge_string_t s
     }
     // compute total length
     int64_t total = 0;
-    for (int64_t i = 0; i < list.len; i++) {
+    for (int64_t i = 0; i < len; i++) {
         total += items[i].len;
     }
-    total += (list.len - 1) * sep.len;
+    total += (len - 1) * sep.len;
     char *buf = (char *)malloc((size_t)total + 1);
     if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
     int64_t pos = 0;
-    for (int64_t i = 0; i < list.len; i++) {
+    for (int64_t i = 0; i < len; i++) {
         if (i > 0) {
             memcpy(buf + pos, sep.data, (size_t)sep.len);
             pos += sep.len;
@@ -1040,7 +1116,7 @@ static inline forge_string_t forge_list_join(forge_list_t list, forge_string_t s
 
 // string — chars(): split into a list of single-character strings.
 static inline forge_list_t forge_string_chars(forge_string_t s) {
-    forge_list_t result = { .data = NULL, .len = 0 };
+    forge_list_t result = forge_list_empty();
     for (int64_t i = 0; i < s.len; i++) {
         char *ch = (char *)malloc(2);
         if (!ch) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
@@ -1058,8 +1134,10 @@ static inline forge_list_t forge_string_chars(forge_string_t s) {
 
 // list — find first occurrence of element. returns -1 if not found.
 static inline int64_t forge_list_index_of(forge_list_t list, const void *elem, int64_t elem_size) {
-    for (int64_t i = 0; i < list.len; i++) {
-        if (memcmp((char *)list.data + i * elem_size, elem, (size_t)elem_size) == 0)
+    int64_t len = forge_list_len(list);
+    void *data = forge_list_data(list);
+    for (int64_t i = 0; i < len; i++) {
+        if (memcmp((char *)data + i * elem_size, elem, (size_t)elem_size) == 0)
             return i;
     }
     return -1;
@@ -1067,8 +1145,8 @@ static inline int64_t forge_list_index_of(forge_list_t list, const void *elem, i
 
 // list — find first occurrence of string element. returns -1 if not found.
 static inline int64_t forge_list_index_of_string(forge_list_t list, forge_string_t s) {
-    forge_string_t *items = (forge_string_t *)list.data;
-    for (int64_t i = 0; i < list.len; i++) {
+    forge_string_t *items = (forge_string_t *)forge_list_data(list);
+    for (int64_t i = 0; i < forge_list_len(list); i++) {
         if (forge_string_eq(items[i], s)) return i;
     }
     return -1;
@@ -1076,15 +1154,12 @@ static inline int64_t forge_list_index_of_string(forge_list_t list, forge_string
 
 // list — slice: return a new list from start to end (exclusive).
 static inline forge_list_t forge_list_slice(forge_list_t list, int64_t start, int64_t end, int64_t elem_size) {
+    int64_t len = forge_list_len(list);
     if (start < 0) start = 0;
-    if (end > list.len) end = list.len;
-    if (start >= end) return (forge_list_t){ .data = NULL, .len = 0 };
+    if (end > len) end = len;
+    if (start >= end) return forge_list_empty();
     int64_t new_len = end - start;
-    int64_t total = new_len * elem_size;
-    void *buf = malloc((size_t)total);
-    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
-    memcpy(buf, (char *)list.data + start * elem_size, (size_t)total);
-    return (forge_list_t){ .data = buf, .len = new_len };
+    return forge_list_create(new_len, elem_size, (char *)forge_list_data(list) + start * elem_size);
 }
 
 // qsort comparators for sort
@@ -1111,25 +1186,22 @@ static int forge_cmp_string(const void *a, const void *b) {
 
 // list — sort: return a new sorted copy. type_tag: 0=int, 1=float, 2=string.
 static inline forge_list_t forge_list_sort(forge_list_t list, int64_t elem_size, int type_tag) {
-    if (list.len <= 1) {
-        forge_list_t copy = { .data = NULL, .len = list.len };
-        if (list.len == 1) {
-            copy.data = malloc((size_t)elem_size);
-            if (!copy.data) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
-            memcpy(copy.data, list.data, (size_t)elem_size);
-        }
-        return copy;
+    int64_t len = forge_list_len(list);
+    if (len <= 1) {
+        return forge_list_create(len, elem_size, forge_list_data(list));
     }
-    int64_t total = list.len * elem_size;
+    int64_t total = len * elem_size;
     void *buf = malloc((size_t)total);
     if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
-    memcpy(buf, list.data, (size_t)total);
+    memcpy(buf, forge_list_data(list), (size_t)total);
     int (*cmp)(const void *, const void *) = NULL;
     if (type_tag == 0) cmp = forge_cmp_int;
     else if (type_tag == 1) cmp = forge_cmp_float;
     else cmp = forge_cmp_string;
-    qsort(buf, (size_t)list.len, (size_t)elem_size, cmp);
-    return (forge_list_t){ .data = buf, .len = list.len };
+    qsort(buf, (size_t)len, (size_t)elem_size, cmp);
+    forge_list_t sorted = forge_list_create(len, elem_size, buf);
+    free(buf);
+    return sorted;
 }
 
 // ---------------------------------------------------------------
@@ -1145,7 +1217,7 @@ static inline void forge_set_args(int argc, char **argv) {
 }
 
 static inline forge_list_t forge_get_args(void) {
-    forge_list_t result = { .data = NULL, .len = 0 };
+    forge_list_t result = forge_list_empty();
     for (int i = 0; i < forge_argc; i++) {
         forge_string_t s = forge_string_from(forge_argv[i], (int64_t)strlen(forge_argv[i]));
         forge_list_push(&result, &s, sizeof(forge_string_t));
@@ -1469,7 +1541,7 @@ static inline bool forge_append_file_impl(const char *path_data, int64_t path_le
 
 // list_dir(path) -> List[String]
 static inline forge_list_t forge_list_dir(forge_string_t path) {
-    forge_list_t result = { .data = NULL, .len = 0 };
+    forge_list_t result = forge_list_empty();
     char *cpath = forge_cstr(path);
     DIR *d = opendir(cpath);
     free(cpath);

@@ -581,19 +581,24 @@ fn c_register_enum_decl(node_idx: Int, node: Node):
 # ---------------------------------------------------------------
 
 fn c_register_interface_decl(node_idx: Int, node: Node):
-    name := node.value
-    # check for generic params — generic interfaces are not supported (E233)
+    base_name := node.value
+    mut name := base_name
+    mut generic_names: List[String] := []
     for child in node.children:
         cn := get_node(child)
         if cn.kind == "generic_param":
-            c_error("E233", "generic interfaces are not supported: " + name)
-            return
+            generic_names.push(cn.value)
+    if generic_names.len() > 0:
+        name = c_build_interface_name(name, generic_names)
     # register as a zero-field struct in type table (so it's resolvable)
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
     mut empty_b: List[Bool] := []
     tid := tt_add(ti_struct(name, empty_s, empty_i, empty_b, empty_b))
     tt_register(name, tid)
+    if generic_names.len() > 0:
+        tt_register(base_name, tid)
+        c_interface_decls.insert(base_name, node_idx)
     c_interface_decls.insert(name, node_idx)
 
 # ---------------------------------------------------------------
@@ -656,6 +661,24 @@ fn c_type_implements(type_name: String, iface_name: String) -> Bool:
     key := type_name + "\t" + iface_name
     return c_impl_set.contains_key(key)
 
+fn c_has_interface_decl(name: String) -> Bool:
+    if c_interface_decls.contains_key(name):
+        return true
+    base := c_extract_base_name(name)
+    if base != name:
+        return c_interface_decls.contains_key(base)
+    return false
+
+fn c_build_interface_name(base: String, args: List[String]) -> String:
+    mut result := base + "["
+    mut first := true
+    for arg in args:
+        if first == false:
+            result = result + ","
+        first = false
+        result = result + arg
+    return result + "]"
+
 # ---------------------------------------------------------------
 # pass 1 — type alias
 # ---------------------------------------------------------------
@@ -691,7 +714,50 @@ fn c_extract_field_name(value: String) -> String:
 fn c_type_node_name(node: Node) -> String:
     # extract the type name from a type expression node
     if node.kind == "type":
+        if node.value.contains("["):
+            base := c_extract_base_name(node.value)
+            inner := node.value.substring(base.len() + 1, node.value.len() - 1)
+            parts := inner.split(",")
+            mut args: List[String] := []
+            for part in parts:
+                args.push(part.trim())
+            return c_build_interface_name(base, args)
         return node.value
+    if node.kind == "generic_type":
+        mut parts: List[String] := []
+        for child in node.children:
+            child_name := c_type_node_name(get_node(child))
+            if child_name == "":
+                return ""
+            parts.push(child_name)
+        return c_build_interface_name(node.value, parts)
+    return ""
+
+fn c_type_node_name_with_subst(node: Node, subst_map: Map[String, Int]) -> String:
+    if node.kind == "type":
+        if node.value.contains("["):
+            base := c_extract_base_name(node.value)
+            inner := node.value.substring(base.len() + 1, node.value.len() - 1)
+            raw_parts := inner.split(",")
+            mut args: List[String] := []
+            for raw in raw_parts:
+                part := raw.trim()
+                if subst_map.contains_key(part):
+                    args.push(tt_type_name(subst_map[part]))
+                else:
+                    args.push(part)
+            return c_build_interface_name(base, args)
+        if subst_map.contains_key(node.value):
+            return tt_type_name(subst_map[node.value])
+        return node.value
+    if node.kind == "generic_type":
+        mut parts: List[String] := []
+        for child in node.children:
+            child_name := c_type_node_name_with_subst(get_node(child), subst_map)
+            if child_name == "":
+                return ""
+            parts.push(child_name)
+        return c_build_interface_name(node.value, parts)
     return ""
 
 # extract the binding name from a binding value like "x" or "x mut"
@@ -1617,8 +1683,8 @@ fn c_check_bounds(decl_node_idx: Int, subst_map: Map[String, Int]) -> Bool:
                 # walk bound children (each is a type node for an interface)
                 for bound_idx in cn.children:
                     bound_node := get_node(bound_idx)
-                    iface_name := bound_node.value
-                    if c_interface_decls.contains_key(iface_name) == false:
+                    iface_name := c_type_node_name_with_subst(bound_node, subst_map)
+                    if c_has_interface_decl(iface_name) == false:
                         c_error("E226", "unknown interface '" + iface_name + "' in bound for '" + param_name + "'")
                         ok = false
                     else:
@@ -2637,6 +2703,11 @@ fn c_check_tuple_expr(node: Node, scope_id: Int) -> Int:
 
 fn c_check_spawn_expr(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
+        c_error("E232", "spawn requires a function call")
+        return TID_ERR
+    inner_node := get_node(node.children[0])
+    if inner_node.kind != "call":
+        c_error("E232", "spawn requires a function call")
         return TID_ERR
     inner := c_check_expr(node.children[0], scope_id)
     if tt_is_err(inner):
@@ -2645,6 +2716,7 @@ fn c_check_spawn_expr(node: Node, scope_id: Int) -> Int:
 
 fn c_check_await_expr(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
+        c_error("E232", "await requires a Task expression")
         return TID_ERR
     inner := c_check_expr(node.children[0], scope_id)
     if tt_is_err(inner):
@@ -2652,7 +2724,7 @@ fn c_check_await_expr(node: Node, scope_id: Int) -> Int:
     info := tt_get(inner)
     if info.kind == "task":
         return info.inner
-    c_error("E224", "await requires a Task type, got " + tt_type_name(inner))
+    c_error("E232", "await requires a Task type, got " + tt_type_name(inner))
     return TID_ERR
 
 # ---------------------------------------------------------------

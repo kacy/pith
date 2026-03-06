@@ -381,7 +381,9 @@ pub const Checker = struct {
         const base_path = self.source_path orelse {
             // no source path — can't resolve relative imports
             for (module.imports) |imp| {
-                self.diagnostics.addCodedError(.E234, imp.location,
+                self.diagnostics.addCodedError(
+                    .E234,
+                    imp.location,
                     "cannot resolve imports without a source file path",
                 ) catch {};
             }
@@ -427,7 +429,8 @@ pub const Checker = struct {
         const import_path = self.resolveImportPath(path_parts, dir) orelse {
             const path_str = self.joinPath(path_parts);
             self.diagnostics.addCodedError(.E234, location, self.fmt(
-                "module not found: '{s}'", .{path_str},
+                "module not found: '{s}'",
+                .{path_str},
             )) catch {};
             return;
         };
@@ -453,7 +456,8 @@ pub const Checker = struct {
         const import_path = self.resolveImportPath(path_parts, dir) orelse {
             const path_str = self.joinPath(path_parts);
             self.diagnostics.addCodedError(.E234, location, self.fmt(
-                "module not found: '{s}'", .{path_str},
+                "module not found: '{s}'",
+                .{path_str},
             )) catch {};
             return;
         };
@@ -473,11 +477,13 @@ pub const Checker = struct {
                 // check if it exists but is not public
                 if (decl_index.contains(name.name)) {
                     self.diagnostics.addCodedError(.E237, name.location, self.fmt(
-                        "'{s}' is not public in the imported module", .{name.name},
+                        "'{s}' is not public in the imported module",
+                        .{name.name},
                     )) catch {};
                 } else {
                     self.diagnostics.addCodedError(.E236, name.location, self.fmt(
-                        "name '{s}' not found in the imported module", .{name.name},
+                        "name '{s}' not found in the imported module",
+                        .{name.name},
                     )) catch {};
                 }
             }
@@ -549,7 +555,8 @@ pub const Checker = struct {
         if (self.checking_files) |cf| {
             if (cf.get(path) != null) {
                 self.diagnostics.addCodedError(.E235, location, self.fmt(
-                    "import cycle detected: '{s}' is already being checked", .{path},
+                    "import cycle detected: '{s}' is already being checked",
+                    .{path},
                 )) catch {};
                 return null;
             }
@@ -561,7 +568,8 @@ pub const Checker = struct {
         // read the file
         const source = std.fs.cwd().readFileAlloc(self.allocator, path, 10 * 1024 * 1024) catch {
             self.diagnostics.addCodedError(.E234, location, self.fmt(
-                "could not read '{s}'", .{path},
+                "could not read '{s}'",
+                .{path},
             )) catch {};
             return null;
         };
@@ -1281,8 +1289,7 @@ pub const Checker = struct {
                     .map => |m| binding_type = m.key,
                     .set => |s| binding_type = s.element,
                     else => {
-                        self.diagnostics.addCodedError(.E200, f.iterable.location,
-                            "for loop requires an iterable collection (List, Map, or Set)") catch {};
+                        self.diagnostics.addCodedError(.E200, f.iterable.location, "for loop requires an iterable collection (List, Map, or Set)") catch {};
                     },
                 }
             }
@@ -2481,7 +2488,8 @@ pub const Checker = struct {
     fn checkNoArgs(self: *Checker, mc: ast.MethodCallExpr, location: Location, label: []const u8, ret: TypeId) TypeId {
         if (mc.args.len != 0) {
             self.diagnostics.addCodedError(.E207, location, self.fmt(
-                "'{s}' expects 0 arguments, got {d}", .{ label, mc.args.len },
+                "'{s}' expects 0 arguments, got {d}",
+                .{ label, mc.args.len },
             )) catch {};
             return .err;
         }
@@ -2492,14 +2500,16 @@ pub const Checker = struct {
     fn checkOneStringArg(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, label: []const u8, ret: TypeId) TypeId {
         if (mc.args.len != 1) {
             self.diagnostics.addCodedError(.E207, location, self.fmt(
-                "'{s}' expects 1 argument, got {d}", .{ label, mc.args.len },
+                "'{s}' expects 1 argument, got {d}",
+                .{ label, mc.args.len },
             )) catch {};
             return .err;
         }
         const arg_type = self.checkExpr(mc.args[0].value, scope);
         if (!arg_type.isErr() and arg_type != .string) {
             self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
-                "expected String, got {s}", .{self.type_table.typeName(arg_type)},
+                "expected String, got {s}",
+                .{self.type_table.typeName(arg_type)},
             )) catch {};
         }
         return ret;
@@ -2532,14 +2542,16 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "split")) {
             if (mc.args.len != 1) {
                 self.diagnostics.addCodedError(.E207, location, self.fmt(
-                    "'String.split' expects 1 argument, got {d}", .{mc.args.len},
+                    "'String.split' expects 1 argument, got {d}",
+                    .{mc.args.len},
                 )) catch {};
                 return .err;
             }
             const arg_type = self.checkExpr(mc.args[0].value, scope);
             if (!arg_type.isErr() and arg_type != .string) {
                 self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
-                    "expected String, got {s}", .{self.type_table.typeName(arg_type)},
+                    "expected String, got {s}",
+                    .{self.type_table.typeName(arg_type)},
                 )) catch {};
             }
             // List[String] was pre-registered in registerBuiltinFunctions
@@ -2550,7 +2562,8 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "substring")) {
             if (mc.args.len != 2) {
                 self.diagnostics.addCodedError(.E207, location, self.fmt(
-                    "'String.substring' expects 2 arguments, got {d}", .{mc.args.len},
+                    "'String.substring' expects 2 arguments, got {d}",
+                    .{mc.args.len},
                 )) catch {};
                 return .err;
             }
@@ -2558,7 +2571,8 @@ pub const Checker = struct {
                 const arg_type = self.checkExpr(arg.value, scope);
                 if (!arg_type.isErr() and arg_type != .int) {
                     self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
-                        "expected Int, got {s}", .{self.type_table.typeName(arg_type)},
+                        "expected Int, got {s}",
+                        .{self.type_table.typeName(arg_type)},
                     )) catch {};
                 }
             }
@@ -2569,7 +2583,8 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "replace")) {
             if (mc.args.len != 2) {
                 self.diagnostics.addCodedError(.E207, location, self.fmt(
-                    "'String.replace' expects 2 arguments, got {d}", .{mc.args.len},
+                    "'String.replace' expects 2 arguments, got {d}",
+                    .{mc.args.len},
                 )) catch {};
                 return .err;
             }
@@ -2577,7 +2592,8 @@ pub const Checker = struct {
                 const arg_type = self.checkExpr(arg.value, scope);
                 if (!arg_type.isErr() and arg_type != .string) {
                     self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
-                        "expected String, got {s}", .{self.type_table.typeName(arg_type)},
+                        "expected String, got {s}",
+                        .{self.type_table.typeName(arg_type)},
                     )) catch {};
                 }
             }
@@ -2589,20 +2605,23 @@ pub const Checker = struct {
             const label = if (std.mem.eql(u8, method, "pad_left")) "String.pad_left" else "String.pad_right";
             if (mc.args.len != 2) {
                 self.diagnostics.addCodedError(.E207, location, self.fmt(
-                    "'{s}' expects 2 arguments, got {d}", .{ label, mc.args.len },
+                    "'{s}' expects 2 arguments, got {d}",
+                    .{ label, mc.args.len },
                 )) catch {};
                 return .err;
             }
             const a0 = self.checkExpr(mc.args[0].value, scope);
             if (!a0.isErr() and a0 != .int) {
                 self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
-                    "expected Int, got {s}", .{self.type_table.typeName(a0)},
+                    "expected Int, got {s}",
+                    .{self.type_table.typeName(a0)},
                 )) catch {};
             }
             const a1 = self.checkExpr(mc.args[1].value, scope);
             if (!a1.isErr() and a1 != .string) {
                 self.diagnostics.addCodedError(.E219, mc.args[1].location, self.fmt(
-                    "expected String, got {s}", .{self.type_table.typeName(a1)},
+                    "expected String, got {s}",
+                    .{self.type_table.typeName(a1)},
                 )) catch {};
             }
             return .string;
@@ -2612,7 +2631,8 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "chars")) {
             if (mc.args.len != 0) {
                 self.diagnostics.addCodedError(.E207, location, self.fmt(
-                    "'String.chars' expects 0 arguments, got {d}", .{mc.args.len},
+                    "'String.chars' expects 0 arguments, got {d}",
+                    .{mc.args.len},
                 )) catch {};
                 return .err;
             }
@@ -2621,7 +2641,8 @@ pub const Checker = struct {
 
         // unknown string method
         self.diagnostics.addCodedError(.E227, location, self.fmt(
-            "type 'String' has no method '{s}'", .{method},
+            "type 'String' has no method '{s}'",
+            .{method},
         )) catch {};
         return .err;
     }
@@ -2662,7 +2683,8 @@ pub const Checker = struct {
             }
         }
         self.diagnostics.addCodedError(.E227, location, self.fmt(
-            "type '{s}' has no method '{s}'", .{ type_name, mc.method },
+            "type '{s}' has no method '{s}'",
+            .{ type_name, mc.method },
         )) catch {};
         return .err;
     }
@@ -2685,7 +2707,9 @@ pub const Checker = struct {
         }
         if (std.mem.eql(u8, method, "join")) {
             if (elem_type != .string) {
-                self.diagnostics.addCodedError(.E227, location,
+                self.diagnostics.addCodedError(
+                    .E227,
+                    location,
                     "'join' requires List[String]",
                 ) catch {};
                 return .err;
@@ -2700,7 +2724,8 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "slice")) {
             if (mc.args.len != 2) {
                 self.diagnostics.addCodedError(.E207, location, self.fmt(
-                    "'List.slice' expects 2 arguments, got {d}", .{mc.args.len},
+                    "'List.slice' expects 2 arguments, got {d}",
+                    .{mc.args.len},
                 )) catch {};
                 return .err;
             }
@@ -2708,7 +2733,8 @@ pub const Checker = struct {
                 const arg_type = self.checkExpr(arg.value, scope);
                 if (!arg_type.isErr() and arg_type != .int) {
                     self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
-                        "expected Int, got {s}", .{self.type_table.typeName(arg_type)},
+                        "expected Int, got {s}",
+                        .{self.type_table.typeName(arg_type)},
                     )) catch {};
                 }
             }
@@ -2718,12 +2744,15 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "sort")) {
             if (mc.args.len != 0) {
                 self.diagnostics.addCodedError(.E207, location, self.fmt(
-                    "'List.sort' expects 0 arguments, got {d}", .{mc.args.len},
+                    "'List.sort' expects 0 arguments, got {d}",
+                    .{mc.args.len},
                 )) catch {};
                 return .err;
             }
             if (elem_type != .int and elem_type != .float and elem_type != .string) {
-                self.diagnostics.addCodedError(.E227, location,
+                self.diagnostics.addCodedError(
+                    .E227,
+                    location,
                     "'sort' requires List[Int], List[Float], or List[String]",
                 ) catch {};
                 return .err;
@@ -2741,7 +2770,8 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "insert")) {
             if (mc.args.len != 2) {
                 self.diagnostics.addCodedError(.E207, location, self.fmt(
-                    "'Map.insert' expects 2 arguments, got {d}", .{mc.args.len},
+                    "'Map.insert' expects 2 arguments, got {d}",
+                    .{mc.args.len},
                 )) catch {};
                 return .err;
             }
@@ -2773,7 +2803,8 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "keys")) {
             if (mc.args.len != 0) {
                 self.diagnostics.addCodedError(.E207, location, self.fmt(
-                    "'Map.keys' expects 0 arguments, got {d}", .{mc.args.len},
+                    "'Map.keys' expects 0 arguments, got {d}",
+                    .{mc.args.len},
                 )) catch {};
                 return .err;
             }
@@ -2784,7 +2815,8 @@ pub const Checker = struct {
         if (std.mem.eql(u8, method, "values")) {
             if (mc.args.len != 0) {
                 self.diagnostics.addCodedError(.E207, location, self.fmt(
-                    "'Map.values' expects 0 arguments, got {d}", .{mc.args.len},
+                    "'Map.values' expects 0 arguments, got {d}",
+                    .{mc.args.len},
                 )) catch {};
                 return .err;
             }
@@ -2853,7 +2885,8 @@ pub const Checker = struct {
     fn checkOneTypedArg(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, label: []const u8, expected: TypeId, ret: TypeId) TypeId {
         if (mc.args.len != 1) {
             self.diagnostics.addCodedError(.E207, location, self.fmt(
-                "'{s}' expects 1 argument, got {d}", .{ label, mc.args.len },
+                "'{s}' expects 1 argument, got {d}",
+                .{ label, mc.args.len },
             )) catch {};
             return .err;
         }
@@ -2871,14 +2904,16 @@ pub const Checker = struct {
     fn checkNoArgs1Int(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope, label: []const u8, ret: TypeId) TypeId {
         if (mc.args.len != 1) {
             self.diagnostics.addCodedError(.E207, location, self.fmt(
-                "'{s}' expects 1 argument, got {d}", .{ label, mc.args.len },
+                "'{s}' expects 1 argument, got {d}",
+                .{ label, mc.args.len },
             )) catch {};
             return .err;
         }
         const arg_type = self.checkExpr(mc.args[0].value, scope);
         if (!arg_type.isErr() and arg_type != .int) {
             self.diagnostics.addCodedError(.E219, mc.args[0].location, self.fmt(
-                "expected Int, got {s}", .{self.type_table.typeName(arg_type)},
+                "expected Int, got {s}",
+                .{self.type_table.typeName(arg_type)},
             )) catch {};
         }
         return ret;

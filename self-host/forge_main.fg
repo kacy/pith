@@ -14,6 +14,7 @@
 #   forge doc --json <file>    documentation as JSON
 #   forge doc --check <file>   check all pub items documented
 #   forge doc search <query>   search stdlib docs
+#   forge new <name>           scaffold new package
 #   forge lex <file.fg>        print token stream
 #   forge parse <file.fg>      print AST
 #   forge version              print version
@@ -184,6 +185,107 @@ fn cmd_doc_search(query: String) -> String!:
     return ""
 
 # ---------------------------------------------------------------
+# new command — scaffold a new package
+# ---------------------------------------------------------------
+
+fn cmd_new(name: String) -> String!:
+    if dir_exists(name):
+        print("error: directory '" + name + "' already exists")
+        exit(1)
+
+    mkdir(name)
+
+    # forge.toml
+    mut toml := "[package]\n"
+    toml = toml + "name = " + chr(34) + name + chr(34) + "\n"
+    toml = toml + "version = " + chr(34) + "0.1.0" + chr(34) + "\n"
+    toml = toml + "description = " + chr(34) + "a short description of " + name + chr(34) + "\n"
+    toml = toml + "license = " + chr(34) + "MIT" + chr(34) + "\n"
+    write_file(name + "/forge.toml", toml)!
+
+    # AGENTS.md
+    mut agents := "# AGENTS.md\n"
+    agents = agents + "\n"
+    agents = agents + "## build & test loop\n"
+    agents = agents + "\n"
+    agents = agents + "run these as you work. fix issues before moving on.\n"
+    agents = agents + "\n"
+    agents = agents + "    forge check lib.fg        type check (run after every change)\n"
+    agents = agents + "    forge lint lib.fg         convention violations\n"
+    agents = agents + "    forge test lib.fg         run tests\n"
+    agents = agents + "    forge fmt lib.fg          format code\n"
+    agents = agents + "\n"
+    agents = agents + "## conventions\n"
+    agents = agents + "\n"
+    agents = agents + "`forge lint` catches all of these, but here's the gist:\n"
+    agents = agents + "\n"
+    agents = agents + "- functions that can fail return `T!`. use `?` to propagate errors.\n"
+    agents = agents + "- no panics. every failure is a Result.\n"
+    agents = agents + "- function names: snake_case (e.g., fetch_user, parse_command)\n"
+    agents = agents + "- types: PascalCase (e.g., HttpClient, ParseError)\n"
+    agents = agents + "- private by default. `pub` to export.\n"
+    agents = agents + "- one file = one module. directory = namespace.\n"
+    agents = agents + "\n"
+    agents = agents + "## finding things\n"
+    agents = agents + "\n"
+    agents = agents + "    forge doc search " + chr(34) + "query" + chr(34) + "         search the standard library\n"
+    agents = agents + "    forge inspect <package>          read a published package's source\n"
+    agents = agents + "    forge inspect <package> --api    see just the public API\n"
+    agents = agents + "\n"
+    agents = agents + "## publishing\n"
+    agents = agents + "\n"
+    agents = agents + "`forge publish` enforces: type check, lint, tests, docs, coverage.\n"
+    agents = agents + "fix what it flags.\n"
+    write_file(name + "/AGENTS.md", agents)!
+
+    # .gitignore
+    mut gi := ".forge-build/\n"
+    gi = gi + "zig-out/\n"
+    gi = gi + ".zig-cache/\n"
+    write_file(name + "/.gitignore", gi)!
+
+    # Makefile
+    mut mk := ".PHONY: build test check fmt lint\n"
+    mk = mk + "\n"
+    mk = mk + "build:\n"
+    mk = mk + "\tforge build lib.fg\n"
+    mk = mk + "\n"
+    mk = mk + "test:\n"
+    mk = mk + "\tforge test lib.fg\n"
+    mk = mk + "\n"
+    mk = mk + "check:\n"
+    mk = mk + "\tforge check lib.fg\n"
+    mk = mk + "\n"
+    mk = mk + "fmt:\n"
+    mk = mk + "\tforge fmt lib.fg\n"
+    mk = mk + "\n"
+    mk = mk + "lint:\n"
+    mk = mk + "\tforge lint lib.fg\n"
+    write_file(name + "/Makefile", mk)!
+
+    # Dockerfile
+    mut df := "FROM ubuntu:latest\n"
+    df = df + "COPY . /app\n"
+    df = df + "WORKDIR /app\n"
+    write_file(name + "/Dockerfile", df)!
+
+    # README.md
+    mut readme := "# " + name + "\n"
+    readme = readme + "\n"
+    readme = readme + "a short description of " + name + ".\n"
+    write_file(name + "/README.md", readme)!
+
+    # lib.fg
+    mut lib := "# " + name + "\n"
+    lib = lib + "\n"
+    lib = lib + "pub fn hello() -> String:\n"
+    lib = lib + "    return " + chr(34) + "hello from " + name + chr(34) + "\n"
+    write_file(name + "/lib.fg", lib)!
+
+    print("created " + name + "/")
+    return ""
+
+# ---------------------------------------------------------------
 # lex command
 # ---------------------------------------------------------------
 
@@ -231,6 +333,7 @@ fn print_help():
     print("  doc --json <file>      documentation (JSON output)")
     print("  doc --check <file>     check all pub items documented")
     print("  doc search <query>     search stdlib documentation")
+    print("  new <name>             scaffold new package")
     print("  lex <file.fg>          print token stream")
     print("  parse <file.fg>        print AST")
     print("  version                print version")
@@ -319,6 +422,14 @@ fn run_cli() -> String!:
             cmd_doc(a[3], true, false)!
         else:
             cmd_doc(a[2], false, false)!
+        return ""
+
+    # scaffold new package
+    if command == "new":
+        if a.len() < 3:
+            print("usage: forge new <name>")
+            exit(1)
+        cmd_new(a[2])!
         return ""
 
     # commands that need exactly one file argument

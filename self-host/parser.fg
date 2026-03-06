@@ -1127,6 +1127,10 @@ fn parse_fn_decl() -> Int:
             first = false
         name = name + "]"
 
+    # store generic_param nodes so checker can access bounds
+    for g in generics:
+        children.push(g)
+
     for p in params:
         children.push(p)
 
@@ -1232,15 +1236,18 @@ fn parse_struct_decl() -> Int:
     expect("newline")
     expect("indent")
 
-    mut fields: List[Int] := []
+    mut children: List[Int] := []
+    # store generic_param nodes so checker can access bounds
+    for g in generics:
+        children.push(g)
     while not check("dedent"):
         if check("eof"):
             break
-        fields.push(parse_struct_field())
+        children.push(parse_struct_field())
         skip_newlines()
     expect("dedent")
 
-    return add_node("struct_decl", name, fields)
+    return add_node("struct_decl", name, children)
 
 fn parse_struct_field() -> Int:
     mut modifiers := ""
@@ -1283,15 +1290,18 @@ fn parse_enum_decl() -> Int:
     expect("newline")
     expect("indent")
 
-    mut variants: List[Int] := []
+    mut children: List[Int] := []
+    # store generic_param nodes so checker can access bounds
+    for g in generics:
+        children.push(g)
     while not check("dedent"):
         if check("eof"):
             break
-        variants.push(parse_enum_variant())
+        children.push(parse_enum_variant())
         skip_newlines()
     expect("dedent")
 
-    return add_node("enum_decl", name, variants)
+    return add_node("enum_decl", name, children)
 
 fn parse_enum_variant() -> Int:
     name_tok := expect("identifier")
@@ -1307,21 +1317,24 @@ fn parse_enum_variant() -> Int:
 fn parse_interface_decl() -> Int:
     p_advance()
     name_tok := expect("identifier")
-    parse_optional_generic_params()
+    generics := parse_optional_generic_params()
 
     expect("colon")
     expect("newline")
     expect("indent")
 
-    mut methods: List[Int] := []
+    mut children: List[Int] := []
+    # store generic_param nodes so checker can detect E233
+    for g in generics:
+        children.push(g)
     while not check("dedent"):
         if check("eof"):
             break
-        methods.push(parse_fn_sig())
+        children.push(parse_fn_sig())
         skip_newlines()
     expect("dedent")
 
-    return add_node("interface_decl", name_tok.value, methods)
+    return add_node("interface_decl", name_tok.value, children)
 
 fn parse_fn_sig() -> Int:
     expect("kw_fn")

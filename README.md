@@ -49,18 +49,22 @@ the bootstrap compiler handles lexing, parsing, and type checking.
 - binary operators: arithmetic, comparison, logical, string concatenation
 - unary operators: negate, not
 - string interpolation
+- imports for `forge check` (`import foo.bar`, `import foo.bar as baz`, `from foo.bar import Name`)
+- method calls, match expressions/statements, lambdas
+- collection literals and indexing (`List`, `Map`, `Set`)
+- generics, interfaces, impl blocks, type aliases
+- spawn/await task typing
 - return type checking
 
 **not yet checked** (parses fine, returns error sentinel in the checker):
-method calls, match, lambdas, collection literals, generics, interfaces,
-impl blocks, type aliases, try/unwrap, pipe operator.
+try/unwrap, pipe operator.
 
 ## cli commands
 
 ```
 forge lex <file>     # print token stream
 forge parse <file>   # print AST
-forge check <file>   # type check and report errors
+forge check <file>   # type check a root file, loading local imports recursively
 ```
 
 ## building

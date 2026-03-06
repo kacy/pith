@@ -55,6 +55,52 @@ pub const MethodEntry = struct {
 pub const Binding = struct {
     type_id: TypeId,
     is_mut: bool,
+    namespace: ?*const ModuleNamespace = null,
+};
+
+pub const Export = union(enum) {
+    binding: ast.Binding,
+    fn_decl: ast.FnDecl,
+    struct_decl: ast.StructDecl,
+    enum_decl: ast.EnumDecl,
+    interface_decl: ast.InterfaceDecl,
+    type_alias: ast.TypeAlias,
+};
+
+pub const ModuleExports = struct {
+    symbols: std.StringHashMap(Export),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) ModuleExports {
+        return .{
+            .symbols = std.StringHashMap(Export).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *ModuleExports) void {
+        self.symbols.deinit();
+    }
+
+    pub fn put(self: *ModuleExports, name: []const u8, symbol_export: Export) !void {
+        try self.symbols.put(name, symbol_export);
+    }
+
+    pub fn get(self: *const ModuleExports, name: []const u8) ?Export {
+        return self.symbols.get(name);
+    }
+};
+
+pub const ImportedSymbol = union(enum) {
+    value: Binding,
+    generic_function: ast.FnDecl,
+    struct_ctor: TypeId,
+    type_id: TypeId,
+    generic_type: GenericDecl,
+};
+
+pub const ModuleNamespace = struct {
+    symbols: std.StringHashMap(ImportedSymbol),
 };
 
 /// a lexical scope. linked-list: each scope has an optional parent.
@@ -84,6 +130,10 @@ pub const Scope = struct {
 
     pub fn define(self: *Scope, name: []const u8, binding: Binding) !void {
         try self.bindings.put(name, binding);
+    }
+
+    pub fn lookupLocal(self: *const Scope, name: []const u8) ?Binding {
+        return self.bindings.get(name);
     }
 
     pub fn lookup(self: *const Scope, name: []const u8) ?Binding {
@@ -120,6 +170,7 @@ pub const Checker = struct {
     /// (arena-allocated). used for method call resolution and pass 2
     /// body checking.
     method_types: std.StringHashMap(MethodEntry),
+    next_hidden_type_id: usize,
 
     /// create a new checker. registers builtin types and functions.
     pub fn init(allocator: std.mem.Allocator, source: []const u8) !Checker {
@@ -133,6 +184,7 @@ pub const Checker = struct {
             .interface_decls = std.StringHashMap(ast.InterfaceDecl).init(allocator),
             .impl_set = std.StringHashMap(void).init(allocator),
             .method_types = std.StringHashMap(MethodEntry).init(allocator),
+            .next_hidden_type_id = 0,
         };
 
         // register builtins into the module scope
@@ -166,6 +218,62 @@ pub const Checker = struct {
         try self.registerSyncType("Semaphore", &.{.int});
     }
 
+    pub fn collectExports(module: *const ast.Module, allocator: std.mem.Allocator) !ModuleExports {
+        var exports = ModuleExports.init(allocator);
+        errdefer exports.deinit();
+
+        for (module.decls) |decl| {
+            if (!decl.is_pub) continue;
+
+            switch (decl.kind) {
+                .fn_decl => |fn_d| try exports.put(fn_d.name, .{ .fn_decl = fn_d }),
+                .struct_decl => |struct_d| try exports.put(struct_d.name, .{ .struct_decl = struct_d }),
+                .enum_decl => |enum_d| try exports.put(enum_d.name, .{ .enum_decl = enum_d }),
+                .interface_decl => |iface_d| try exports.put(iface_d.name, .{ .interface_decl = iface_d }),
+                .type_alias => |alias_d| try exports.put(alias_d.name, .{ .type_alias = alias_d }),
+                .binding => |binding_d| try exports.put(binding_d.name, .{ .binding = binding_d }),
+                .impl_decl => {},
+            }
+        }
+
+        return exports;
+    }
+
+    pub fn importNamespace(self: *Checker, alias: []const u8, exports: *const ModuleExports, location: Location) void {
+        if (self.module_scope.lookupLocal(alias) != null) {
+            self.diagnostics.addError(location, self.fmt("duplicate import '{s}'", .{alias})) catch {};
+            return;
+        }
+
+        const namespace = self.arena.allocator().create(ModuleNamespace) catch return;
+        namespace.* = .{
+            .symbols = std.StringHashMap(ImportedSymbol).init(self.arena.allocator()),
+        };
+
+        var it = exports.symbols.iterator();
+        while (it.next()) |entry| {
+            if (self.materializeExport(entry.key_ptr.*, entry.value_ptr.*, .namespace)) |symbol| {
+                namespace.symbols.put(entry.key_ptr.*, symbol) catch return;
+            }
+        }
+
+        self.module_scope.define(alias, .{
+            .type_id = .err,
+            .is_mut = false,
+            .namespace = namespace,
+        }) catch return;
+    }
+
+    pub fn importSymbol(self: *Checker, local_name: []const u8, imported_export: Export, location: Location) void {
+        if (self.module_scope.lookupLocal(local_name) != null or self.generic_decls.contains(local_name) or self.type_table.lookup(local_name) != null) {
+            self.diagnostics.addError(location, self.fmt("duplicate import '{s}'", .{local_name})) catch {};
+            return;
+        }
+
+        const symbol = self.materializeExport(local_name, imported_export, .direct) orelse return;
+        self.installImportedSymbol(local_name, symbol);
+    }
+
     /// register an opaque struct type and a constructor function for it.
     fn registerSyncType(self: *Checker, name: []const u8, param_types: []const TypeId) !void {
         const type_id = try self.type_table.addType(.{ .@"struct" = .{
@@ -180,6 +288,206 @@ pub const Checker = struct {
             .return_type = type_id,
         } });
         try self.module_scope.define(name, .{ .type_id = ctor_type, .is_mut = false });
+    }
+
+    const ImportMode = enum {
+        direct,
+        namespace,
+    };
+
+    fn materializeExport(self: *Checker, local_name: []const u8, imported_export: Export, mode: ImportMode) ?ImportedSymbol {
+        return switch (imported_export) {
+            .binding => |binding_d| blk: {
+                const value_type = self.resolveImportedBindingType(binding_d);
+                if (value_type.isErr()) break :blk null;
+                break :blk .{ .value = .{
+                    .type_id = value_type,
+                    .is_mut = false,
+                } };
+            },
+            .fn_decl => |fn_d| blk: {
+                if (fn_d.generic_params.len > 0) {
+                    break :blk .{ .generic_function = self.renameFnDecl(fn_d, local_name) };
+                }
+
+                const fn_type = self.resolveFnSignature(self.renameFnDecl(fn_d, local_name)) orelse break :blk null;
+                break :blk .{ .value = .{
+                    .type_id = fn_type,
+                    .is_mut = false,
+                } };
+            },
+            .struct_decl => |struct_d| blk: {
+                const imported_name = switch (mode) {
+                    .direct => local_name,
+                    .namespace => self.buildHiddenTypeName(local_name, struct_d.name),
+                };
+
+                if (struct_d.generic_params.len > 0) {
+                    break :blk .{ .generic_type = .{ .@"struct" = self.renameStructDecl(struct_d, imported_name) } };
+                }
+
+                const type_id = self.registerImportedStruct(self.renameStructDecl(struct_d, imported_name), struct_d.name);
+                if (type_id.isErr()) break :blk null;
+                break :blk switch (mode) {
+                    .direct => .{ .type_id = type_id },
+                    .namespace => .{ .struct_ctor = type_id },
+                };
+            },
+            .enum_decl => |enum_d| blk: {
+                const imported_name = switch (mode) {
+                    .direct => local_name,
+                    .namespace => self.buildHiddenTypeName(local_name, enum_d.name),
+                };
+
+                if (enum_d.generic_params.len > 0) {
+                    break :blk .{ .generic_type = .{ .@"enum" = self.renameEnumDecl(enum_d, imported_name) } };
+                }
+
+                const type_id = self.registerImportedEnum(self.renameEnumDecl(enum_d, imported_name), enum_d.name);
+                if (type_id.isErr()) break :blk null;
+                break :blk .{ .type_id = type_id };
+            },
+            .interface_decl => |iface_d| blk: {
+                const imported_name = switch (mode) {
+                    .direct => local_name,
+                    .namespace => self.buildHiddenTypeName(local_name, iface_d.name),
+                };
+                const type_id = self.registerImportedInterface(self.renameInterfaceDecl(iface_d, imported_name), iface_d.name);
+                if (type_id.isErr()) break :blk null;
+                break :blk .{ .type_id = type_id };
+            },
+            .type_alias => |alias_d| blk: {
+                const imported_alias = self.renameTypeAlias(alias_d, local_name);
+                const type_id = self.registerImportedAlias(imported_alias);
+                if (type_id.isErr()) break :blk null;
+                break :blk .{ .type_id = type_id };
+            },
+        };
+    }
+
+    fn installImportedSymbol(self: *Checker, local_name: []const u8, symbol: ImportedSymbol) void {
+        switch (symbol) {
+            .value => |binding| {
+                self.module_scope.define(local_name, binding) catch return;
+            },
+            .generic_function => |fn_d| {
+                self.generic_decls.put(local_name, .{ .function = fn_d }) catch return;
+            },
+            .struct_ctor, .type_id => |type_id| {
+                self.type_table.register(local_name, type_id) catch return;
+            },
+            .generic_type => |decl| {
+                self.generic_decls.put(local_name, decl) catch return;
+            },
+        }
+    }
+
+    fn resolveImportedBindingType(self: *Checker, binding_d: ast.Binding) TypeId {
+        const value_type = self.checkExpr(binding_d.value, &self.module_scope);
+        if (binding_d.type_expr) |te| {
+            const annotated = self.resolveTypeExpr(te);
+            if (!annotated.isErr() and !value_type.isErr() and annotated != value_type) {
+                self.diagnostics.addError(te.location, self.fmt(
+                    "type mismatch: declared {s}, got {s}",
+                    .{ self.type_table.typeName(annotated), self.type_table.typeName(value_type) },
+                )) catch {};
+            }
+            return annotated;
+        }
+        return value_type;
+    }
+
+    fn renameFnDecl(self: *Checker, fn_d: ast.FnDecl, local_name: []const u8) ast.FnDecl {
+        _ = self;
+        var renamed = fn_d;
+        renamed.name = local_name;
+        return renamed;
+    }
+
+    fn renameStructDecl(self: *Checker, struct_d: ast.StructDecl, local_name: []const u8) ast.StructDecl {
+        _ = self;
+        var renamed = struct_d;
+        renamed.name = local_name;
+        return renamed;
+    }
+
+    fn renameEnumDecl(self: *Checker, enum_d: ast.EnumDecl, local_name: []const u8) ast.EnumDecl {
+        _ = self;
+        var renamed = enum_d;
+        renamed.name = local_name;
+        return renamed;
+    }
+
+    fn renameInterfaceDecl(self: *Checker, iface_d: ast.InterfaceDecl, local_name: []const u8) ast.InterfaceDecl {
+        _ = self;
+        var renamed = iface_d;
+        renamed.name = local_name;
+        return renamed;
+    }
+
+    fn renameTypeAlias(self: *Checker, alias_d: ast.TypeAlias, local_name: []const u8) ast.TypeAlias {
+        _ = self;
+        var renamed = alias_d;
+        renamed.name = local_name;
+        return renamed;
+    }
+
+    fn buildHiddenTypeName(self: *Checker, namespace_name: []const u8, export_name: []const u8) []const u8 {
+        const hidden_name = self.fmt("__import_{d}_{s}_{s}", .{ self.next_hidden_type_id, namespace_name, export_name });
+        self.next_hidden_type_id += 1;
+        return hidden_name;
+    }
+
+    fn registerImportedStruct(self: *Checker, struct_d: ast.StructDecl, original_name: []const u8) TypeId {
+        const existing = self.type_table.lookup(struct_d.name);
+        if (existing) |type_id| return type_id;
+
+        self.registerStructDecl(struct_d, Location.zero);
+        return self.type_table.lookup(struct_d.name) orelse blk: {
+            self.diagnostics.addError(Location.zero, self.fmt("failed to import struct '{s}'", .{original_name})) catch {};
+            break :blk .err;
+        };
+    }
+
+    fn registerImportedEnum(self: *Checker, enum_d: ast.EnumDecl, original_name: []const u8) TypeId {
+        const existing = self.type_table.lookup(enum_d.name);
+        if (existing) |type_id| return type_id;
+
+        self.registerEnumDecl(enum_d, Location.zero);
+        return self.type_table.lookup(enum_d.name) orelse blk: {
+            self.diagnostics.addError(Location.zero, self.fmt("failed to import enum '{s}'", .{original_name})) catch {};
+            break :blk .err;
+        };
+    }
+
+    fn registerImportedInterface(self: *Checker, iface_d: ast.InterfaceDecl, original_name: []const u8) TypeId {
+        const existing = self.type_table.lookup(iface_d.name);
+        if (existing) |type_id| return type_id;
+
+        self.registerInterfaceDecl(iface_d, Location.zero);
+        return self.type_table.lookup(iface_d.name) orelse blk: {
+            self.diagnostics.addError(Location.zero, self.fmt("failed to import interface '{s}'", .{original_name})) catch {};
+            break :blk .err;
+        };
+    }
+
+    fn registerImportedAlias(self: *Checker, alias_d: ast.TypeAlias) TypeId {
+        if (self.type_table.lookup(alias_d.name)) |type_id| return type_id;
+
+        self.registerTypeAlias(alias_d, Location.zero);
+        return self.type_table.lookup(alias_d.name) orelse .err;
+    }
+
+    fn namespaceSymbol(self: *Checker, expr: *const ast.Expr, field: []const u8, location: Location, scope: *const Scope) ?ImportedSymbol {
+        _ = self;
+        _ = location;
+        const namespace_binding = switch (expr.kind) {
+            .ident => |name| scope.lookup(name),
+            else => null,
+        } orelse return null;
+
+        const namespace = namespace_binding.namespace orelse return null;
+        return namespace.symbols.get(field);
     }
 
     // ---------------------------------------------------------------
@@ -652,6 +960,13 @@ pub const Checker = struct {
         if (a.target.kind == .ident) {
             const name = a.target.kind.ident;
             if (scope.lookup(name)) |binding| {
+                if (binding.namespace != null) {
+                    self.diagnostics.addError(a.target.location, self.fmt(
+                        "cannot assign to module namespace '{s}'",
+                        .{name},
+                    )) catch {};
+                    return;
+                }
                 if (!binding.is_mut) {
                     self.diagnostics.addError(a.target.location, self.fmt(
                         "cannot assign to immutable variable '{s}'",
@@ -1269,7 +1584,12 @@ pub const Checker = struct {
     }
 
     fn checkIdent(self: *Checker, name: []const u8, location: Location, scope: *const Scope) TypeId {
-        if (scope.lookup(name)) |binding| return binding.type_id;
+        if (scope.lookup(name)) |binding| {
+            if (binding.namespace != null) {
+                return .err;
+            }
+            return binding.type_id;
+        }
 
         // generic type names used as bare identifiers (e.g. in a call like
         // Pair(1, "hello") without type args) — suppress the diagnostic.
@@ -1498,6 +1818,31 @@ pub const Checker = struct {
     // when the arg count doesn't match the field count and a function
     // binding exists, we fall through to normal function call checking.
     fn checkCall(self: *Checker, call: ast.CallExpr, location: Location, scope: *const Scope) TypeId {
+        if (call.callee.kind == .field_access) {
+            const fa = call.callee.kind.field_access;
+            if (self.namespaceSymbol(fa.object, fa.field, location, scope)) |symbol| {
+                return switch (symbol) {
+                    .value => |binding| self.checkCallableType(binding.type_id, call.args, location, scope),
+                    .generic_function => |fn_d| self.checkGenericFnCall(fn_d, call, location, scope),
+                    .struct_ctor => |type_id| self.checkStructConstructor(type_id, call, location, scope),
+                    .type_id => {
+                        self.diagnostics.addError(location, self.fmt(
+                            "'{s}' is a type, not a callable export",
+                            .{fa.field},
+                        )) catch {};
+                        return .err;
+                    },
+                    .generic_type => {
+                        self.diagnostics.addError(location, self.fmt(
+                            "'{s}' is a generic type, not a callable export",
+                            .{fa.field},
+                        )) catch {};
+                        return .err;
+                    },
+                };
+            }
+        }
+
         if (call.callee.kind == .ident) {
             const name = call.callee.kind.ident;
 
@@ -1642,6 +1987,10 @@ pub const Checker = struct {
         const callee_type = self.checkExpr(call.callee, scope);
         if (callee_type.isErr()) return .err;
 
+        return self.checkCallableType(callee_type, call.args, location, scope);
+    }
+
+    fn checkCallableType(self: *Checker, callee_type: TypeId, args: []const ast.Arg, location: Location, scope: *const Scope) TypeId {
         // look up the function type
         const ty = self.type_table.get(callee_type) orelse return .err;
         const func = switch (ty) {
@@ -1656,16 +2005,16 @@ pub const Checker = struct {
         };
 
         // check argument count
-        if (call.args.len != func.param_types.len) {
+        if (args.len != func.param_types.len) {
             self.diagnostics.addError(location, self.fmt(
                 "expected {d} argument(s), got {d}",
-                .{ func.param_types.len, call.args.len },
+                .{ func.param_types.len, args.len },
             )) catch {};
             return .err;
         }
 
         // check argument types
-        for (call.args, func.param_types) |arg, expected| {
+        for (args, func.param_types) |arg, expected| {
             const actual = self.checkExpr(arg.value, scope);
             if (!actual.isErr() and !expected.isErr() and actual != expected) {
                 self.diagnostics.addError(arg.location, self.fmt(
@@ -1711,6 +2060,33 @@ pub const Checker = struct {
     }
 
     fn checkMethodCall(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope) TypeId {
+        if (self.namespaceSymbol(mc.receiver, mc.method, location, scope)) |symbol| {
+            const call = ast.CallExpr{
+                .callee = mc.receiver,
+                .args = mc.args,
+            };
+
+            return switch (symbol) {
+                .value => self.checkFnCall(call, location, scope),
+                .generic_function => |fn_d| self.checkGenericFnCall(fn_d, call, location, scope),
+                .struct_ctor => |type_id| self.checkStructConstructor(type_id, call, location, scope),
+                .type_id => {
+                    self.diagnostics.addError(location, self.fmt(
+                        "'{s}' is a type, not a callable export",
+                        .{mc.method},
+                    )) catch {};
+                    return .err;
+                },
+                .generic_type => {
+                    self.diagnostics.addError(location, self.fmt(
+                        "'{s}' is a generic type, not a callable export",
+                        .{mc.method},
+                    )) catch {};
+                    return .err;
+                },
+            };
+        }
+
         // evaluate the receiver to get its type
         const receiver_type = self.checkExpr(mc.receiver, scope);
         if (receiver_type.isErr()) return .err;
@@ -1759,6 +2135,27 @@ pub const Checker = struct {
     }
 
     fn checkFieldAccess(self: *Checker, fa: ast.FieldAccess, location: Location, scope: *const Scope) TypeId {
+        if (self.namespaceSymbol(fa.object, fa.field, location, scope)) |symbol| {
+            return switch (symbol) {
+                .value => |binding| binding.type_id,
+                .generic_function => |fn_d| self.resolveFnSignature(fn_d) orelse .err,
+                .struct_ctor, .type_id => {
+                    self.diagnostics.addError(location, self.fmt(
+                        "'{s}' is a type export, not a value",
+                        .{fa.field},
+                    )) catch {};
+                    return .err;
+                },
+                .generic_type => {
+                    self.diagnostics.addError(location, self.fmt(
+                        "'{s}' is a generic type export, not a value",
+                        .{fa.field},
+                    )) catch {};
+                    return .err;
+                },
+            };
+        }
+
         const object_type = self.checkExpr(fa.object, scope);
         if (object_type.isErr()) return .err;
 

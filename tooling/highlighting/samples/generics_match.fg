@@ -1,0 +1,15 @@
+interface Display:
+    fn to_string(self: Self) -> String
+
+struct Box[T]:
+    pub value: T
+
+enum Result[T, E]:
+    Ok(T)
+    Err(E)
+
+fn unwrap_or[T](r: Result[T, String], fallback: T) -> T:
+    return match r:
+        Result.Ok(v) => v
+        Result.Err(e) if e != "" => fallback
+        _ => fallback

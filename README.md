@@ -136,6 +136,13 @@ make fmt                   # format zig source
 make clean                 # remove build artifacts
 ```
 
+## syntax highlighting on github
+
+`.fg` files are temporarily mapped to python highlighting through `.gitattributes`.
+this is a stopgap until forge is added to `github-linguist` with native support.
+see `tooling/highlighting/` for the forge TextMate grammar, sample files, and
+the upstream submission checklist.
+
 ## project layout
 
 ```

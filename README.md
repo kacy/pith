@@ -13,6 +13,47 @@ build, run, test, check, fmt, lint, lex, parse, doc, and more. 13 standard
 library modules cover I/O, networking, encoding, hashing, JSON, TOML, and
 process management.
 
+## quick start
+
+requires [zig 0.15.2](https://ziglang.org/download/) for the bootstrap build.
+
+```
+zig build test
+zig build run -- check examples/hello.fg
+make self-host
+./self-host/forge_main check examples/hello.fg
+```
+
+for day-to-day product work, treat the self-hosted compiler in `self-host/`
+as the primary implementation. use the zig bootstrap in `bootstrap/` as the
+reference implementation for bootstrapping, unit tests, and lower-risk refactors.
+
+## where to read first
+
+- `README.md` for the high-level map
+- `docs/architecture.md` for the compiler pipeline and subsystem boundaries
+- `docs/contributing.md` for the development loop and smoke checks
+- `bootstrap/main.zig` for the bootstrap CLI entrypoint
+- `bootstrap/pipeline.zig` for lex/parse/check orchestration
+- `self-host/forge_main.fg` for the self-hosted CLI entrypoint
+
+## contributor fast path
+
+if you are new to the codebase, the shortest useful path is:
+
+1. run `zig build test`
+2. run `zig build run -- check examples/hello.fg`
+3. run `make self-host`
+4. run `./self-host/forge_main check examples/hello.fg`
+5. read `docs/architecture.md`
+
+common starting points:
+
+- add a token or keyword: `bootstrap/lexer.zig`, `self-host/lexer.fg`
+- add syntax: `bootstrap/parser.zig`, `self-host/parser.fg`, `docs/grammar.ebnf`
+- add type rules: `bootstrap/checker.zig`, `self-host/checker.fg`
+- add code generation: `bootstrap/codegen.zig`, `self-host/codegen.fg`
+
 ## what it looks like
 
 ```
@@ -107,8 +148,6 @@ forge help                     # print usage
 
 ## building
 
-requires [zig 0.15.2](https://ziglang.org/download/) for the initial bootstrap.
-
 ```
 make self-host             # build the self-hosted compiler (via zig bootstrap)
 make bootstrap             # rebuild the compiler using itself
@@ -167,7 +206,11 @@ runtime/
   forge_runtime.h    C runtime header — memory, strings, collections, I/O
 
 bootstrap/           zig bootstrap compiler (archived, for reference and unit tests)
-  main.zig, lexer.zig, parser.zig, checker.zig, codegen.zig, etc.
+  main.zig           thin CLI entrypoint and dispatch
+  cli/               command parsing and per-command handlers
+  pipeline.zig       shared lex/parse/check pipeline helpers
+  build_support.zig  generated C/build directory/process helpers
+  lexer.zig, parser.zig, checker.zig, codegen.zig, etc.
 
 std/                 standard library (13 native forge modules)
   encoding.fg        base64/hex encoding
@@ -187,6 +230,8 @@ std/                 standard library (13 native forge modules)
 examples/            40 .fg programs — all compile to native binaries
 docs/grammar.ebnf    complete EBNF for the language
 docs/errors.md       error code reference (E0xx–E3xx)
+docs/architecture.md compiler and ownership overview
+docs/contributing.md contributor setup and validation loop
 ```
 
 ## license

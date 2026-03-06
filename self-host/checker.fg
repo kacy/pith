@@ -582,6 +582,12 @@ fn c_register_enum_decl(node_idx: Int, node: Node):
 
 fn c_register_interface_decl(node_idx: Int, node: Node):
     name := node.value
+    # check for generic params — generic interfaces are not supported (E233)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "generic_param":
+            c_error("E233", "generic interfaces are not supported: " + name)
+            return
     # register as a zero-field struct in type table (so it's resolvable)
     mut empty_s: List[String] := []
     mut empty_i: List[Int] := []
@@ -645,6 +651,10 @@ fn c_register_method(type_name: String, node: Node, is_pub: Bool):
     key := type_name + "." + method_name
     c_method_types.insert(key, fn_tid)
     c_method_pub.insert(key, is_pub)
+
+fn c_type_implements(type_name: String, iface_name: String) -> Bool:
+    key := type_name + "\t" + iface_name
+    return c_impl_set.contains_key(key)
 
 # ---------------------------------------------------------------
 # pass 1 — type alias
@@ -1553,6 +1563,9 @@ fn c_check_generic_struct_constructor(name: String, arg_indices: List[Int], scop
                             if subst_map.contains_key(gp) == false:
                                 subst_map.insert(gp, arg_types[fidx])
         fidx = fidx + 1
+    # check interface bounds
+    if c_check_bounds(decl_idx, subst_map) == false:
+        return TID_ERR
     # build type_args list in order of generic_params
     mut type_args: List[Int] := []
     for gp in generic_params:
@@ -1586,6 +1599,33 @@ fn c_check_assert_eq(arg_indices: List[Int], scope_id: Int) -> Int:
             if t1 != t2:
                 c_error("E219", "assert_eq arguments must be the same type: " + tt_type_name(t1) + " vs " + tt_type_name(t2))
     return TID_VOID
+
+# ---------------------------------------------------------------
+# interface bounds checking
+# ---------------------------------------------------------------
+
+fn c_check_bounds(decl_node_idx: Int, subst_map: Map[String, Int]) -> Bool:
+    decl_node := get_node(decl_node_idx)
+    mut ok := true
+    for child in decl_node.children:
+        cn := get_node(child)
+        if cn.kind == "generic_param":
+            param_name := cn.value
+            if subst_map.contains_key(param_name):
+                inferred_tid := subst_map[param_name]
+                type_name := tt_type_name(inferred_tid)
+                # walk bound children (each is a type node for an interface)
+                for bound_idx in cn.children:
+                    bound_node := get_node(bound_idx)
+                    iface_name := bound_node.value
+                    if c_interface_decls.contains_key(iface_name) == false:
+                        c_error("E226", "unknown interface '" + iface_name + "' in bound for '" + param_name + "'")
+                        ok = false
+                    else:
+                        if c_type_implements(type_name, iface_name) == false:
+                            c_error("E226", "type '" + type_name + "' does not implement interface '" + iface_name + "'")
+                            ok = false
+    return ok
 
 # ---------------------------------------------------------------
 # generic function call
@@ -1643,6 +1683,9 @@ fn c_check_generic_fn_call(name: String, arg_indices: List[Int], scope_id: Int) 
             c_error("E222", "cannot infer type parameter " + gp)
             subst_args.push(TID_ERR)
     if all_inferred == false:
+        return TID_ERR
+    # check interface bounds
+    if c_check_bounds(decl_idx, subst_map) == false:
         return TID_ERR
     # resolve return type with substitution
     mut ret_type := TID_VOID

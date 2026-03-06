@@ -182,6 +182,7 @@ pub const Lexer = struct {
 
     /// pending tokens from string interpolation.
     pending_tokens: std.ArrayList(Token),
+    pending_tokens_index: usize,
 
     /// true if we're at the very start of a line and need to check indentation.
     at_line_start: bool,
@@ -204,6 +205,7 @@ pub const Lexer = struct {
             .allocator = allocator,
             .pending_dedents = 0,
             .pending_tokens = .empty,
+            .pending_tokens_index = 0,
             .at_line_start = true,
             .done = false,
             .diagnostics = errors.DiagnosticList.init(allocator, source),
@@ -227,8 +229,14 @@ pub const Lexer = struct {
         }
 
         // emit queued tokens from string interpolation
-        if (self.pending_tokens.items.len > 0) {
-            return self.pending_tokens.orderedRemove(0);
+        if (self.pending_tokens_index < self.pending_tokens.items.len) {
+            const tok = self.pending_tokens.items[self.pending_tokens_index];
+            self.pending_tokens_index += 1;
+            if (self.pending_tokens_index == self.pending_tokens.items.len) {
+                self.pending_tokens.clearRetainingCapacity();
+                self.pending_tokens_index = 0;
+            }
+            return tok;
         }
 
         // end of file — emit remaining dedents then EOF
@@ -1397,6 +1405,30 @@ test "lex spawn keyword" {
 test "lex await keyword" {
     try expectTokens("await", &.{ .kw_await, .eof });
     try expectTokens("awaiting", &.{ .identifier, .eof });
+}
+
+test "lex many interpolation parts without quadratic queue behavior" {
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(testing.allocator);
+
+    try source.append(testing.allocator, '"');
+    for (0..32) |i| {
+        try source.writer(testing.allocator).print("{{value{d}}}", .{i});
+    }
+    try source.append(testing.allocator, '"');
+
+    var lexer = try Lexer.init(source.items, testing.allocator);
+    defer lexer.deinit();
+
+    var interpolation_count: usize = 0;
+    while (true) {
+        const tok = try lexer.nextToken();
+        if (tok.kind == .interpolation_expr) interpolation_count += 1;
+        if (tok.kind == .eof) break;
+    }
+
+    try testing.expectEqual(@as(usize, 32), interpolation_count);
+    try testing.expect(!lexer.diagnostics.hasErrors());
 }
 
 test "lex all assignment operators" {

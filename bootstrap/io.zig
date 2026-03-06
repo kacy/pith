@@ -9,18 +9,26 @@ const std = @import("std");
 /// print in the compiler — diagnostics, AST nodes, usage text, etc.
 pub const write_buf_size = 8192;
 
-pub fn write(comptime fmt: []const u8, args: anytype) void {
+pub fn writeChecked(comptime fmt: []const u8, args: anytype) !void {
     var buf: [write_buf_size]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
     const out = &w.interface;
-    out.print(fmt, args) catch {};
-    out.flush() catch {};
+    try out.print(fmt, args);
+    try out.flush();
 }
 
-pub fn writeErr(comptime fmt: []const u8, args: anytype) void {
+pub fn writeErrChecked(comptime fmt: []const u8, args: anytype) !void {
     var buf: [write_buf_size]u8 = undefined;
     var w = std.fs.File.stderr().writer(&buf);
     const out = &w.interface;
-    out.print(fmt, args) catch {};
-    out.flush() catch {};
+    try out.print(fmt, args);
+    try out.flush();
+}
+
+pub fn write(comptime fmt: []const u8, args: anytype) void {
+    writeChecked(fmt, args) catch {};
+}
+
+pub fn writeErr(comptime fmt: []const u8, args: anytype) void {
+    writeErrChecked(fmt, args) catch {};
 }

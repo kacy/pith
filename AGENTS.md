@@ -16,6 +16,10 @@ the self-hosted compiler is the primary tool. run these as you work:
 ./self-host/forge_main lint --json <f> # lint (JSON output)
 ./self-host/forge_main lex <file>      # print token stream
 ./self-host/forge_main parse <file>    # print AST
+./self-host/forge_main doc <file>     # generate documentation
+./self-host/forge_main doc --json <f> # machine-readable doc output
+./self-host/forge_main doc --check <f> # verify pub items documented
+./self-host/forge_main doc search <q> # search stdlib by keyword
 ```
 
 ## bootstrapping
@@ -51,6 +55,7 @@ self-host/
   formatter.fg       source code formatter
   linter.fg          convention linter
   errors.fg          human-readable error rendering
+  docgen.fg          documentation generator and search
 
 runtime/
   forge_runtime.h    C runtime header — memory, strings, collections, I/O
@@ -85,7 +90,7 @@ docs/errors.md       error code reference (E0xx–E3xx)
 - **fg_ prefix.** user functions are prefixed `fg_` in generated C to avoid collisions.
 - **g_ prefix.** self-hosted codegen uses `g_` prefix for globals (flat C namespace).
 - **module prefixes.** all modules prefix private functions to avoid C namespace collisions
-  (e.g., `f_` for formatter, `l_` for linter, `c_` for checker, `e_` for errors).
+  (e.g., `f_` for formatter, `l_` for linter, `c_` for checker, `e_` for errors, `d_` for docgen).
 - **method keys.** method types use `TypeName.method_name` format in the method_types map.
 - **C transpilation.** codegen emits C, compiles with `zig cc`. output goes to `.forge-build/`.
 - **string literals** from the lexer include surrounding quotes — codegen strips them.
@@ -115,4 +120,3 @@ docs/errors.md       error code reference (E0xx–E3xx)
 - collections passed to functions are copies — mutations don't propagate back
 - `{`/`}` in string literals trigger interpolation — use `chr(123)`/`chr(125)`
 - `for c in string` not supported — use `while i < s.len(): s[i]`
-- methods.fg and concurrency.fg have known codegen issues with return type inference

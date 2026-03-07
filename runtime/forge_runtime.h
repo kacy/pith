@@ -1768,7 +1768,12 @@ static inline bool forge_tcp_accept_impl(int64_t server_fd, int64_t *client_fd) 
 
 // tcp_read(fd, max_bytes) -> String!
 static inline bool forge_tcp_read_impl(int64_t fd, int64_t max_bytes, forge_string_t *out) {
-    if (max_bytes <= 0) max_bytes = 4096;
+    // Security fix: validate buffer size to prevent overflow
+    // Reject negative values and limit to 1MB max
+    if (max_bytes <= 0 || max_bytes > 1048576) {
+        *out = forge_string_empty;
+        return false;
+    }
     char *buf = forge_str_alloc(max_bytes);
     ssize_t n = read((int)fd, buf, (size_t)max_bytes);
     if (n < 0) { free(buf); return false; }

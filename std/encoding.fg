@@ -100,13 +100,13 @@ fn hex_nibble(c: String) -> Int:
 # Encodes a string as lowercase hexadecimal (two hex chars per byte).
 # Example: to_hex("hello") -> "68656c6c6f"
 pub fn to_hex(input: String) -> String:
-    hex := "0123456789abcdef"
+    hex_digits := "0123456789abcdef"
     mut result := ""
-    mut i := 0
-    while i < input.len():
-        v := ord(input[i])
-        result = result + hex[v / 16] + hex[v % 16]
-        i = i + 1
+    mut position := 0
+    while position < input.len():
+        byte_value := ord(input[position])
+        result = result + hex_digits[byte_value / 16] + hex_digits[byte_value % 16]
+        position = position + 1
     return result
 
 # Decodes a hex string back to the original data.
@@ -115,12 +115,12 @@ pub fn from_hex(input: String) -> String!:
     if input.len() % 2 != 0:
         fail "invalid hex: odd length"
     mut result := ""
-    mut i := 0
-    while i < input.len():
-        hi := hex_nibble(input[i])
-        lo := hex_nibble(input[i + 1])
-        if hi < 0 or lo < 0:
+    mut position := 0
+    while position < input.len():
+        high_nibble := hex_nibble(input[position])
+        low_nibble := hex_nibble(input[position + 1])
+        if high_nibble < 0 or low_nibble < 0:
             fail "invalid hex character"
-        result = result + chr(hi * 16 + lo)
-        i = i + 2
+        result = result + chr(high_nibble * 16 + low_nibble)
+        position = position + 2
     return result

@@ -14,86 +14,86 @@
 # ===============================================================
 
 # 32-bit mask for SHA-256 word operations
-fn m(x: Int) -> Int:
-    return bit_and(x, 4294967295)
+fn mask32(value: Int) -> Int:
+    return bit_and(value, 4294967295)
 
 # 32-bit right rotation for SHA-256
-fn rotr(x: Int, n: Int) -> Int:
-    return m(bit_or(bit_shr(x, n), bit_shl(x, 32 - n)))
+fn rotate_right(value: Int, bits: Int) -> Int:
+    return mask32(bit_or(bit_shr(value, bits), bit_shl(value, 32 - bits)))
 
 # SHA-256 round constants (first 32 bits of fractional cube roots of first 64 primes)
-mut g_k: List[Int] := []
-mut g_k_ready: Bool := false
+mut sha256_round_constants: List[Int] := []
+mut constants_initialized: Bool := false
 
 # Lazy initialization of SHA-256 constants
 fn sha_init():
-    if g_k_ready:
+    if constants_initialized:
         return
-    g_k_ready = true
-    g_k.push(1116352408)
-    g_k.push(1899447441)
-    g_k.push(3049323471)
-    g_k.push(3921009573)
-    g_k.push(961987163)
-    g_k.push(1508970993)
-    g_k.push(2453635748)
-    g_k.push(2870763221)
-    g_k.push(3624381080)
-    g_k.push(310598401)
-    g_k.push(607225278)
-    g_k.push(1426881987)
-    g_k.push(1925078388)
-    g_k.push(2162078206)
-    g_k.push(2614888103)
-    g_k.push(3248222580)
-    g_k.push(3835390401)
-    g_k.push(4022224774)
-    g_k.push(264347078)
-    g_k.push(604807628)
-    g_k.push(770255983)
-    g_k.push(1249150122)
-    g_k.push(1555081692)
-    g_k.push(1996064986)
-    g_k.push(2554220882)
-    g_k.push(2821834349)
-    g_k.push(2952996808)
-    g_k.push(3210313671)
-    g_k.push(3336571891)
-    g_k.push(3584528711)
-    g_k.push(113926993)
-    g_k.push(338241895)
-    g_k.push(666307205)
-    g_k.push(773529912)
-    g_k.push(1294757372)
-    g_k.push(1396182291)
-    g_k.push(1695183700)
-    g_k.push(1986661051)
-    g_k.push(2177026350)
-    g_k.push(2456956037)
-    g_k.push(2730485921)
-    g_k.push(2820302411)
-    g_k.push(3259730800)
-    g_k.push(3345764771)
-    g_k.push(3516065817)
-    g_k.push(3600352804)
-    g_k.push(4094571909)
-    g_k.push(275423344)
-    g_k.push(430227734)
-    g_k.push(506948616)
-    g_k.push(659060556)
-    g_k.push(883997877)
-    g_k.push(958139571)
-    g_k.push(1322822218)
-    g_k.push(1537002063)
-    g_k.push(1747873779)
-    g_k.push(1955562222)
-    g_k.push(2024104815)
-    g_k.push(2227730452)
-    g_k.push(2361852424)
-    g_k.push(2428436474)
-    g_k.push(2756734187)
-    g_k.push(3204031479)
-    g_k.push(3329325298)
+    constants_initialized = true
+    sha256_round_constants.push(1116352408)
+    sha256_round_constants.push(1899447441)
+    sha256_round_constants.push(3049323471)
+    sha256_round_constants.push(3921009573)
+    sha256_round_constants.push(961987163)
+    sha256_round_constants.push(1508970993)
+    sha256_round_constants.push(2453635748)
+    sha256_round_constants.push(2870763221)
+    sha256_round_constants.push(3624381080)
+    sha256_round_constants.push(310598401)
+    sha256_round_constants.push(607225278)
+    sha256_round_constants.push(1426881987)
+    sha256_round_constants.push(1925078388)
+    sha256_round_constants.push(2162078206)
+    sha256_round_constants.push(2614888103)
+    sha256_round_constants.push(3248222580)
+    sha256_round_constants.push(3835390401)
+    sha256_round_constants.push(4022224774)
+    sha256_round_constants.push(264347078)
+    sha256_round_constants.push(604807628)
+    sha256_round_constants.push(770255983)
+    sha256_round_constants.push(1249150122)
+    sha256_round_constants.push(1555081692)
+    sha256_round_constants.push(1996064986)
+    sha256_round_constants.push(2554220882)
+    sha256_round_constants.push(2821834349)
+    sha256_round_constants.push(2952996808)
+    sha256_round_constants.push(3210313671)
+    sha256_round_constants.push(3336571891)
+    sha256_round_constants.push(3584528711)
+    sha256_round_constants.push(113926993)
+    sha256_round_constants.push(338241895)
+    sha256_round_constants.push(666307205)
+    sha256_round_constants.push(773529912)
+    sha256_round_constants.push(1294757372)
+    sha256_round_constants.push(1396182291)
+    sha256_round_constants.push(1695183700)
+    sha256_round_constants.push(1986661051)
+    sha256_round_constants.push(2177026350)
+    sha256_round_constants.push(2456956037)
+    sha256_round_constants.push(2730485921)
+    sha256_round_constants.push(2820302411)
+    sha256_round_constants.push(3259730800)
+    sha256_round_constants.push(3345764771)
+    sha256_round_constants.push(3516065817)
+    sha256_round_constants.push(3600352804)
+    sha256_round_constants.push(4094571909)
+    sha256_round_constants.push(275423344)
+    sha256_round_constants.push(430227734)
+    sha256_round_constants.push(506948616)
+    sha256_round_constants.push(659060556)
+    sha256_round_constants.push(883997877)
+    sha256_round_constants.push(958139571)
+    sha256_round_constants.push(1322822218)
+    sha256_round_constants.push(1537002063)
+    sha256_round_constants.push(1747873779)
+    sha256_round_constants.push(1955562222)
+    sha256_round_constants.push(2024104815)
+    sha256_round_constants.push(2227730452)
+    sha256_round_constants.push(2361852424)
+    sha256_round_constants.push(2428436474)
+    sha256_round_constants.push(2756734187)
+    sha256_round_constants.push(3204031479)
+    sha256_round_constants.push(3329325298)
 
 # Converts a 32-bit word to an 8-character hex string
 fn word32_to_hex(val: Int) -> String:
@@ -158,9 +158,9 @@ pub fn sha256(input: String) -> String:
             w.push(word)
             i = i + 1
         while i < 64:
-            s0 := bit_xor(bit_xor(rotr(w[i - 15], 7), rotr(w[i - 15], 18)), bit_shr(w[i - 15], 3))
-            s1 := bit_xor(bit_xor(rotr(w[i - 2], 17), rotr(w[i - 2], 19)), bit_shr(w[i - 2], 10))
-            w.push(m(w[i - 16] + s0 + w[i - 7] + s1))
+            s0 := bit_xor(bit_xor(rotate_right(w[i - 15], 7), rotate_right(w[i - 15], 18)), bit_shr(w[i - 15], 3))
+            s1 := bit_xor(bit_xor(rotate_right(w[i - 2], 17), rotate_right(w[i - 2], 19)), bit_shr(w[i - 2], 10))
+            w.push(mask32(w[i - 16] + s0 + w[i - 7] + s1))
             i = i + 1
 
         # working variables
@@ -176,30 +176,30 @@ pub fn sha256(input: String) -> String:
         # 64 rounds
         i = 0
         while i < 64:
-            s1 := bit_xor(bit_xor(rotr(e, 6), rotr(e, 11)), rotr(e, 25))
-            ch := bit_xor(bit_and(e, f), bit_and(m(bit_not(e)), g))
-            temp1 := m(h + s1 + ch + g_k[i] + w[i])
-            s0 := bit_xor(bit_xor(rotr(a, 2), rotr(a, 13)), rotr(a, 22))
+            s1 := bit_xor(bit_xor(rotate_right(e, 6), rotate_right(e, 11)), rotate_right(e, 25))
+            ch := bit_xor(bit_and(e, f), bit_and(mask32(bit_not(e)), g))
+            temp1 := mask32(h + s1 + ch + sha256_round_constants[i] + w[i])
+            s0 := bit_xor(bit_xor(rotate_right(a, 2), rotate_right(a, 13)), rotate_right(a, 22))
             maj := bit_xor(bit_xor(bit_and(a, b), bit_and(a, c)), bit_and(b, c))
-            temp2 := m(s0 + maj)
+            temp2 := mask32(s0 + maj)
             h = g
             g = f
             f = e
-            e = m(d + temp1)
+            e = mask32(d + temp1)
             d = c
             c = b
             b = a
-            a = m(temp1 + temp2)
+            a = mask32(temp1 + temp2)
             i = i + 1
 
-        h0 = m(h0 + a)
-        h1 = m(h1 + b)
-        h2 = m(h2 + c)
-        h3 = m(h3 + d)
-        h4 = m(h4 + e)
-        h5 = m(h5 + f)
-        h6 = m(h6 + g)
-        h7 = m(h7 + h)
+        h0 = mask32(h0 + a)
+        h1 = mask32(h1 + b)
+        h2 = mask32(h2 + c)
+        h3 = mask32(h3 + d)
+        h4 = mask32(h4 + e)
+        h5 = mask32(h5 + f)
+        h6 = mask32(h6 + g)
+        h7 = mask32(h7 + h)
 
         block = block + 64
 

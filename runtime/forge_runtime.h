@@ -1926,14 +1926,19 @@ typedef struct {
 #define FORGE_MAX_PROCESSES 64
 static forge_process_t forge_process_pool[FORGE_MAX_PROCESSES];
 static int64_t forge_process_count = 0;
+static pthread_mutex_t forge_process_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // spawn a child process. returns handle index, or -1 on error.
 // the command string is split on spaces (no shell interpretation).
 static inline bool forge_process_spawn_impl(forge_string_t cmd, int64_t *out_handle) {
+    // check capacity under lock
+    pthread_mutex_lock(&forge_process_mutex);
     if (forge_process_count >= FORGE_MAX_PROCESSES) {
+        pthread_mutex_unlock(&forge_process_mutex);
         *out_handle = -1;
         return false;
     }
+    pthread_mutex_unlock(&forge_process_mutex);
 
     int stdin_pipe[2], stdout_pipe[2], stderr_pipe[2];
     if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
@@ -1983,12 +1988,15 @@ static inline bool forge_process_spawn_impl(forge_string_t cmd, int64_t *out_han
     close(stdout_pipe[1]);
     close(stderr_pipe[1]);
 
+    // increment counter and store under lock
+    pthread_mutex_lock(&forge_process_mutex);
     int64_t handle = forge_process_count++;
     forge_process_pool[handle].pid = pid;
     forge_process_pool[handle].stdin_fd = stdin_pipe[1];
     forge_process_pool[handle].stdout_fd = stdout_pipe[0];
     forge_process_pool[handle].stderr_fd = stderr_pipe[0];
     forge_process_pool[handle].alive = true;
+    pthread_mutex_unlock(&forge_process_mutex);
     *out_handle = handle;
     return true;
 }

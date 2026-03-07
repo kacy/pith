@@ -343,6 +343,10 @@ fn next_token():
                     break
                 indent_stack.remove(indent_stack.len() - 1)
                 dedents = dedents + 1
+            # verify the target indentation level exists in the stack
+            if indent_stack[indent_stack.len() - 1] != level:
+                emit("err", "invalid dedent: indentation level does not match any outer block")
+                return
             if dedents > 0:
                 pending_dedents = dedents - 1
                 emit("dedent", "")
@@ -526,6 +530,9 @@ fn scan_string():
         while pos < source.len():
             sc := source[pos]
             if sc == "\\":
+                if pos + 1 >= source.len():
+                    emit("err", "unterminated escape sequence")
+                    return
                 pos = pos + 2
                 continue
             if sc == "\"":
@@ -533,16 +540,19 @@ fn scan_string():
                 emit("string_lit", source.substring(start, pos))
                 return
             if sc == "\n":
-                emit("err", "")
+                emit("err", "newline in string literal")
                 return
             pos = pos + 1
-        emit("err", "")
+        emit("err", "unterminated string literal")
         return
 
     # interpolated string — scan to first {
     while pos < source.len():
         sc := source[pos]
         if sc == "\\":
+            if pos + 1 >= source.len():
+                emit("err", "unterminated escape sequence in string interpolation")
+                return
             pos = pos + 2
             continue
         if sc == LBRACE:
@@ -599,6 +609,8 @@ fn scan_interpolation_parts():
         while pos < source.len():
             sc := source[pos]
             if sc == "\\":
+                if pos + 1 >= source.len():
+                    return
                 pos = pos + 2
                 continue
             if sc == LBRACE:

@@ -1061,7 +1061,7 @@ fn c_check_fail_stmt(node: Node, scope_id: Int):
         return
     ret_info := tt_get(ret_type)
     if ret_info.kind != "result":
-        c_error("E224", "fail requires function to return a result type")
+        c_error("E234", "fail requires function to return a result type")
 
 # ---------------------------------------------------------------
 # if statement
@@ -2299,7 +2299,7 @@ fn c_check_unwrap_expr(node: Node, scope_id: Int) -> Int:
     info := tt_get(inner)
     if info.kind == "optional":
         return info.inner
-    c_error_fix("E224", "unwrap requires an optional type, got " + tt_type_name(inner), "use ? for error propagation on Result types")
+    c_error_fix("E224", "unwrap requires an optional type, got " + tt_type_name(inner), "use ! for unwrapping optional types")
     return TID_ERR
 
 # ---------------------------------------------------------------
@@ -2319,9 +2319,9 @@ fn c_check_try_expr(node: Node, scope_id: Int) -> Int:
         if ret >= 0:
             ret_info := tt_get(ret)
             if ret_info.kind != "result":
-                c_error("E224", "try (?) can only be used in functions that return a result type")
+                c_error("E235", "try (?) can only be used in functions that return a result type")
         return info.inner
-    c_error_fix("E224", "try requires a result type, got " + tt_type_name(inner), "use ! for unwrapping optional types")
+    c_error_fix("E236", "try requires a result type, got " + tt_type_name(inner), "use ! for unwrapping optional types")
     return TID_ERR
 
 # ---------------------------------------------------------------
@@ -2841,6 +2841,60 @@ fn c_types_structurally_equal(a: Int, b: Int) -> Bool:
     if ai.kind == "optional":
         if bi.kind == "optional":
             return c_types_structurally_equal(ai.inner, bi.inner)
+    # list structural equality
+    if ai.kind == "list":
+        if bi.kind == "list":
+            return c_types_structurally_equal(ai.inner, bi.inner)
+    # map structural equality
+    if ai.kind == "map":
+        if bi.kind == "map":
+            if c_types_structurally_equal(ai.key_type, bi.key_type) == false:
+                return false
+            return c_types_structurally_equal(ai.value_type, bi.value_type)
+    # set structural equality
+    if ai.kind == "set":
+        if bi.kind == "set":
+            return c_types_structurally_equal(ai.inner, bi.inner)
+    # task structural equality
+    if ai.kind == "task":
+        if bi.kind == "task":
+            return c_types_structurally_equal(ai.inner, bi.inner)
+    # channel structural equality
+    if ai.kind == "channel":
+        if bi.kind == "channel":
+            return c_types_structurally_equal(ai.inner, bi.inner)
+    # struct structural equality
+    if ai.kind == "struct":
+        if bi.kind == "struct":
+            if ai.fields.len() != bi.fields.len():
+                return false
+            mut i := 0
+            while i < ai.fields.len():
+                if ai.fields[i] != bi.fields[i]:
+                    return false
+                if c_types_structurally_equal(ai.field_types[i], bi.field_types[i]) == false:
+                    return false
+                i = i + 1
+            return true
+    # enum structural equality
+    if ai.kind == "enum":
+        if bi.kind == "enum":
+            if ai.variants.len() != bi.variants.len():
+                return false
+            mut i := 0
+            while i < ai.variants.len():
+                if ai.variants[i] != bi.variants[i]:
+                    return false
+                # compare variant field types
+                if ai.variant_types[i].len() != bi.variant_types[i].len():
+                    return false
+                mut j := 0
+                while j < ai.variant_types[i].len():
+                    if c_types_structurally_equal(ai.variant_types[i][j], bi.variant_types[i][j]) == false:
+                        return false
+                    j = j + 1
+                i = i + 1
+            return true
     return false
 
 # ---------------------------------------------------------------

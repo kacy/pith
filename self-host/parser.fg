@@ -17,11 +17,20 @@ mut p_pos := 0
 mut depth := 0
 mut max_depth := 256
 
+# safe EOF token for empty token list cases
+fn make_eof_token() -> Token:
+    mut tok: Token
+    tok.kind = "eof"
+    tok.value = ""
+    return tok
+
 # ---------------------------------------------------------------
 # token navigation
 # ---------------------------------------------------------------
 
 fn p_peek() -> Token:
+    if tokens.len() == 0:
+        return make_eof_token()
     mut i := p_pos
     while i < tokens.len():
         t := tokens[i]
@@ -32,6 +41,8 @@ fn p_peek() -> Token:
     return tokens[tokens.len() - 1]
 
 fn peek_ahead(offset: Int) -> Token:
+    if tokens.len() == 0:
+        return make_eof_token()
     mut i := p_pos
     mut skipped := 0
     while i < tokens.len():
@@ -44,6 +55,8 @@ fn peek_ahead(offset: Int) -> Token:
     return tokens[tokens.len() - 1]
 
 fn p_advance() -> Token:
+    if tokens.len() == 0:
+        return make_eof_token()
     while p_pos < tokens.len():
         t := tokens[p_pos]
         p_pos = p_pos + 1
@@ -64,7 +77,9 @@ fn expect(kind: String) -> Token:
     t := p_peek()
     if t.kind == kind:
         return p_advance()
-    # error — return current token and move on
+    # error — create error node and return current token
+    # TODO: add proper error reporting with line/column info
+    add_leaf("error", "expected " + kind + " but found " + t.kind)
     return t
 
 fn skip_newlines():
@@ -1339,13 +1354,16 @@ fn parse_interface_decl() -> Int:
 fn parse_fn_sig() -> Int:
     expect("kw_fn")
     name_tok := expect("identifier")
-    parse_optional_generic_params()
+    generics := parse_optional_generic_params()
 
     expect("lparen")
     params := parse_param_list()
     expect("rparen")
 
     mut children: List[Int] := []
+    # store generic_param nodes so checker can detect E233
+    for g in generics:
+        children.push(g)
     for p in params:
         children.push(p)
 
@@ -1392,8 +1410,11 @@ fn parse_impl_decl() -> Int:
 fn parse_type_alias_decl() -> Int:
     p_advance()
     name_tok := expect("identifier")
-    parse_optional_generic_params()
+    generics := parse_optional_generic_params()
     expect("eq")
     type_node := parse_type_expr()
     mut children: List[Int] := [type_node]
+    # store generic_param nodes for generic type aliases
+    for g in generics:
+        children.push(g)
     return add_node("type_alias", name_tok.value, children)

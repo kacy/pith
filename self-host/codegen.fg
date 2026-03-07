@@ -1842,12 +1842,16 @@ fn g_emit_await_expr(node_idx: Int):
     # emit gcc statement expression:
     # ({ void *__aw = expr;
     #    pthread_join(((forge_task_header_t *)__aw)->thread, NULL);
-    #    *(ret_type *)((char *)__aw + sizeof(forge_task_header_t)); })
+    #    ret_type result = *(ret_type *)((char *)__aw + sizeof(forge_task_header_t));
+    #    free(__aw);
+    #    result; })
     g_write("(" + LB + " void *__aw = ")
     g_emit_expr(inner_idx)
-    g_write("; pthread_join(((forge_task_header_t *)__aw)->thread, NULL); *(")
+    g_write("; pthread_join(((forge_task_header_t *)__aw)->thread, NULL); ")
     g_write(ret_c)
-    g_write(" *)((char *)__aw + sizeof(forge_task_header_t)); " + RB + ")")
+    g_write(" __result = *(")
+    g_write(ret_c)
+    g_write(" *)((char *)__aw + sizeof(forge_task_header_t)); free(__aw); __result; " + RB + ")")
 
 fn g_emit_binary(node_idx: Int):
     node := get_node(node_idx)

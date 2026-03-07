@@ -255,6 +255,14 @@ pub fn parse(input: String) -> Int:
     result := p_parse_value()
     if p_err:
         return 0 - 1
+    # skip trailing whitespace and verify no garbage remains
+    while p_pos < p_data.len():
+        c := p_data[p_pos]
+        if c == " " or c == "\t" or c == "\n" or c == "\r":
+            p_pos = p_pos + 1
+        else:
+            # trailing non-whitespace characters = error
+            return 0 - 1
     return result
 
 # return the type of a node: "null", "bool", "int", "float", "string", "array", or "object".

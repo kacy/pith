@@ -399,6 +399,27 @@ fn parse_postfix() -> Int:
                 expr = p_add_node("field_access", name_tok.value, children)
             continue
 
+        # struct initialization: TypeName{field1, field2, ...}
+        if t.kind == "lbrace":
+            # Only valid if expr is an identifier (the struct type name)
+            expr_node := get_node(expr)
+            if expr_node.kind == "ident":
+                p_advance()  # skip {
+                mut args: List[Int] := []
+                skip_newlines()
+                if check("rbrace") == false:
+                    args.push(parse_expression())
+                    while match_tok("comma"):
+                        skip_newlines()
+                        if check("rbrace"):
+                            break
+                        args.push(parse_expression())
+                skip_newlines()
+                expect("rbrace")
+                # Store type name in value, args as children
+                expr = p_add_node("struct_init", expr_node.value, args)
+                continue
+
         break
 
     return expr

@@ -4597,6 +4597,10 @@ pub const CEmitter = struct {
                 }
                 return self.tuple_type_cache.get(key) orelse .err;
             },
+            .struct_init => |si| {
+                // struct_init carries the type name directly
+                return self.type_table.lookup(si.type_name) orelse .err;
+            },
             else => .err,
         };
     }

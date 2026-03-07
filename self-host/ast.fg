@@ -11,19 +11,21 @@ pub struct Node:
     pub kind: String
     pub value: String
     pub children: List[Int]
+    pub line: Int
+    pub col: Int
 
 # global node arena — all nodes live here
 mut nodes: List[Node] := []
 
 # add a node with children, return its index
-pub fn add_node(kind: String, value: String, children: List[Int]) -> Int:
-    nodes.push(Node(kind, value, children))
+pub fn add_node(kind: String, value: String, children: List[Int], line: Int, col: Int) -> Int:
+    nodes.push(Node(kind, value, children, line, col))
     return nodes.len() - 1
 
 # add a leaf node (no children), return its index
-pub fn add_leaf(kind: String, value: String) -> Int:
+pub fn add_leaf(kind: String, value: String, line: Int, col: Int) -> Int:
     mut empty: List[Int] := []
-    nodes.push(Node(kind, value, empty))
+    nodes.push(Node(kind, value, empty, line, col))
     return nodes.len() - 1
 
 # retrieve a node by index

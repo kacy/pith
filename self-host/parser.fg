@@ -17,6 +17,36 @@ mut p_pos := 0
 mut depth := 0
 mut max_depth := 256
 
+# -------------------------------------------------------------
+# position-aware AST helpers (must come after state declarations)
+# -------------------------------------------------------------
+
+# Get line and column from current token position
+fn get_current_position() -> (Int, Int):
+    if tokens.len() == 0:
+        return (0, 0)
+    mut i := p_pos
+    while i < tokens.len():
+        t := tokens[i]
+        if t.kind != "comment":
+            return (t.line, t.col)
+        i = i + 1
+    # Return position of last token
+    if tokens.len() > 0:
+        mut last := tokens[tokens.len() - 1]
+        return (last.line, last.col)
+    return (0, 0)
+
+# Wrapper that adds node with current position
+fn p_add_node(kind: String, value: String, children: List[Int]) -> Int:
+    mut pos := get_current_position()
+    return add_node(kind, value, children, pos.0, pos.1)
+
+# Wrapper that adds leaf with current position
+fn p_add_leaf(kind: String, value: String) -> Int:
+    mut pos := get_current_position()
+    return add_leaf(kind, value, pos.0, pos.1)
+
 # safe EOF token for empty token list cases
 fn make_eof_token() -> Token:
     mut tok: Token
@@ -79,7 +109,7 @@ fn expect(kind: String) -> Token:
         return p_advance()
     # error — create error node and return current token
     # TODO: add proper error reporting with line/column info
-    add_leaf("error", "expected " + kind + " but found " + t.kind)
+    p_add_leaf("error", "expected " + kind + " but found " + t.kind)
     return t
 
 fn skip_newlines():
@@ -97,7 +127,7 @@ fn parse_type_expr() -> Int:
     if check("question"):
         p_advance()
         mut children: List[Int] := [base]
-        return add_node("optional_type", "", children)
+        return p_add_node("optional_type", "", children)
 
     # result: T! or T!E
     if check("bang"):
@@ -106,9 +136,9 @@ fn parse_type_expr() -> Int:
         if next_kind == "identifier" or next_kind == "kw_fn" or next_kind == "lparen":
             err_type := parse_type_expr()
             mut children: List[Int] := [base, err_type]
-            return add_node("result_type", "", children)
+            return p_add_node("result_type", "", children)
         mut children: List[Int] := [base]
-        return add_node("result_type", "", children)
+        return p_add_node("result_type", "", children)
 
     return base
 
@@ -136,12 +166,12 @@ fn parse_base_type() -> Int:
             expect("rbracket")
 
             # build inline representation: "Name[Arg1, Arg2]"
-            return add_node("generic_type", name_tok.value, args)
+            return p_add_node("generic_type", name_tok.value, args)
 
-        return add_leaf("type", name_tok.value)
+        return p_add_leaf("type", name_tok.value)
 
     # unexpected
-    return add_leaf("type", "")
+    return p_add_leaf("type", "")
 
 fn parse_fn_type() -> Int:
     p_advance()
@@ -157,16 +187,16 @@ fn parse_fn_type() -> Int:
     mut param_nodes: List[Int] := []
     for p in params:
         mut children: List[Int] := [p]
-        param_nodes.push(add_node("param", "", children))
+        param_nodes.push(p_add_node("param", "", children))
 
     if match_tok("arrow"):
         ret := parse_type_expr()
         mut ret_node_children: List[Int] := [ret]
-        ret_node := add_node("returns", "", ret_node_children)
+        ret_node := p_add_node("returns", "", ret_node_children)
         param_nodes.push(ret_node)
-        return add_node("fn_type", "", param_nodes)
+        return p_add_node("fn_type", "", param_nodes)
 
-    return add_node("fn_type", "", param_nodes)
+    return p_add_node("fn_type", "", param_nodes)
 
 fn parse_tuple_type() -> Int:
     p_advance()
@@ -178,7 +208,7 @@ fn parse_tuple_type() -> Int:
                 break
             types.push(parse_type_expr())
     expect("rparen")
-    return add_node("tuple_type", "", types)
+    return p_add_node("tuple_type", "", types)
 
 # ---------------------------------------------------------------
 # expressions — precedence tower
@@ -186,7 +216,7 @@ fn parse_tuple_type() -> Int:
 
 pub fn parse_expression() -> Int:
     if depth >= max_depth:
-        return add_leaf("error", "max depth exceeded")
+        return p_add_leaf("error", "max depth exceeded")
     depth = depth + 1
     result := parse_or()
     depth = depth - 1
@@ -198,7 +228,7 @@ fn parse_or() -> Int:
         p_advance()
         right := parse_and()
         mut children: List[Int] := [left, right]
-        left = add_node("binary", "or", children)
+        left = p_add_node("binary", "or", children)
     return left
 
 fn parse_and() -> Int:
@@ -207,7 +237,7 @@ fn parse_and() -> Int:
         p_advance()
         right := parse_not()
         mut children: List[Int] := [left, right]
-        left = add_node("binary", "and", children)
+        left = p_add_node("binary", "and", children)
     return left
 
 fn parse_not() -> Int:
@@ -215,7 +245,7 @@ fn parse_not() -> Int:
         p_advance()
         operand := parse_not()
         mut children: List[Int] := [operand]
-        return add_node("unary", "not", children)
+        return p_add_node("unary", "not", children)
     return parse_comparison()
 
 fn parse_comparison() -> Int:
@@ -240,7 +270,7 @@ fn parse_comparison() -> Int:
         p_advance()
         right := parse_pipe()
         mut children: List[Int] := [left, right]
-        left = add_node("binary", op, children)
+        left = p_add_node("binary", op, children)
     return left
 
 fn parse_pipe() -> Int:
@@ -249,7 +279,7 @@ fn parse_pipe() -> Int:
         p_advance()
         right := parse_add()
         mut children: List[Int] := [left, right]
-        left = add_node("binary", "pipe", children)
+        left = p_add_node("binary", "pipe", children)
     return left
 
 fn parse_add() -> Int:
@@ -266,7 +296,7 @@ fn parse_add() -> Int:
         p_advance()
         right := parse_mul()
         mut children: List[Int] := [left, right]
-        left = add_node("binary", op, children)
+        left = p_add_node("binary", op, children)
     return left
 
 fn parse_mul() -> Int:
@@ -285,7 +315,7 @@ fn parse_mul() -> Int:
         p_advance()
         right := parse_unary()
         mut children: List[Int] := [left, right]
-        left = add_node("binary", op, children)
+        left = p_add_node("binary", op, children)
     return left
 
 fn parse_unary() -> Int:
@@ -293,19 +323,19 @@ fn parse_unary() -> Int:
         p_advance()
         operand := parse_unary()
         mut children: List[Int] := [operand]
-        return add_node("spawn", "", children)
+        return p_add_node("spawn", "", children)
 
     if check("kw_await"):
         p_advance()
         operand := parse_unary()
         mut children: List[Int] := [operand]
-        return add_node("await", "", children)
+        return p_add_node("await", "", children)
 
     if check("minus"):
         p_advance()
         operand := parse_unary()
         mut children: List[Int] := [operand]
-        return add_node("unary", "negate", children)
+        return p_add_node("unary", "negate", children)
 
     return parse_postfix()
 
@@ -319,14 +349,14 @@ fn parse_postfix() -> Int:
         if t.kind == "question":
             p_advance()
             mut children: List[Int] := [expr]
-            expr = add_node("unwrap", "", children)
+            expr = p_add_node("unwrap", "", children)
             continue
 
         # try: expr!
         if t.kind == "bang":
             p_advance()
             mut children: List[Int] := [expr]
-            expr = add_node("try", "", children)
+            expr = p_add_node("try", "", children)
             continue
 
         # call: expr(args)
@@ -340,7 +370,7 @@ fn parse_postfix() -> Int:
             idx := parse_expression()
             expect("rbracket")
             mut children: List[Int] := [expr, idx]
-            expr = add_node("index", "", children)
+            expr = p_add_node("index", "", children)
             continue
 
         # field access or method call: expr.name or expr.name(args) or expr.0
@@ -351,7 +381,7 @@ fn parse_postfix() -> Int:
             if check("int_lit"):
                 idx_tok := p_advance()
                 mut children: List[Int] := [expr]
-                expr = add_node("field_access", idx_tok.value, children)
+                expr = p_add_node("field_access", idx_tok.value, children)
                 continue
 
             name_tok := expect("identifier")
@@ -364,11 +394,11 @@ fn parse_postfix() -> Int:
                 mut children: List[Int] := [expr]
                 for a in call_args:
                     children.push(a)
-                expr = add_node("method_call", name_tok.value, children)
+                expr = p_add_node("method_call", name_tok.value, children)
             else:
                 # field access: expr.name
                 mut children: List[Int] := [expr]
-                expr = add_node("field_access", name_tok.value, children)
+                expr = p_add_node("field_access", name_tok.value, children)
             continue
 
         break
@@ -382,7 +412,7 @@ fn parse_call_expr(callee: Int) -> Int:
     mut children: List[Int] := [callee]
     for a in call_args:
         children.push(a)
-    return add_node("call", "", children)
+    return p_add_node("call", "", children)
 
 fn parse_arg_list() -> List[Int]:
     mut args: List[Int] := []
@@ -406,49 +436,49 @@ fn parse_arg() -> Int:
             p_advance()
             val := parse_expression()
             mut children: List[Int] := [val]
-            return add_node("arg", name, children)
+            return p_add_node("arg", name, children)
 
     val := parse_expression()
     mut children: List[Int] := [val]
-    return add_node("arg", "", children)
+    return p_add_node("arg", "", children)
 
 fn parse_primary() -> Int:
     t := p_peek()
 
     if t.kind == "int_lit":
         p_advance()
-        return add_leaf("int_lit", t.value)
+        return p_add_leaf("int_lit", t.value)
 
     if t.kind == "float_lit":
         p_advance()
-        return add_leaf("float_lit", t.value)
+        return p_add_leaf("float_lit", t.value)
 
     if t.kind == "string_lit":
         p_advance()
-        return add_leaf("string_lit", t.value)
+        return p_add_leaf("string_lit", t.value)
 
     if t.kind == "string_start":
         return parse_string_interpolation()
 
     if t.kind == "kw_true":
         p_advance()
-        return add_leaf("bool_lit", "true")
+        return p_add_leaf("bool_lit", "true")
 
     if t.kind == "kw_false":
         p_advance()
-        return add_leaf("bool_lit", "false")
+        return p_add_leaf("bool_lit", "false")
 
     if t.kind == "kw_none":
         p_advance()
-        return add_leaf("none_lit", "")
+        return p_add_leaf("none_lit", "")
 
     if t.kind == "kw_self":
         p_advance()
-        return add_leaf("self", "")
+        return p_add_leaf("self", "")
 
     if t.kind == "identifier":
         p_advance()
-        return add_leaf("ident", t.value)
+        return p_add_leaf("ident", t.value)
 
     if t.kind == "lparen":
         return parse_grouped_or_tuple()
@@ -470,7 +500,7 @@ fn parse_primary() -> Int:
 
     # unexpected token — skip it
     p_advance()
-    return add_leaf("error", t.value)
+    return p_add_leaf("error", t.value)
 
 fn parse_grouped_or_tuple() -> Int:
     p_advance()
@@ -480,7 +510,7 @@ fn parse_grouped_or_tuple() -> Int:
     if check("rparen"):
         p_advance()
         mut children: List[Int] := []
-        return add_node("tuple", "", children)
+        return p_add_node("tuple", "", children)
 
     first := parse_expression()
     skip_newlines()
@@ -495,12 +525,12 @@ fn parse_grouped_or_tuple() -> Int:
             elements.push(parse_expression())
             skip_newlines()
         expect("rparen")
-        return add_node("tuple", "", elements)
+        return p_add_node("tuple", "", elements)
 
     # grouped: (expr)
     expect("rparen")
     mut children: List[Int] := [first]
-    return add_node("grouped", "", children)
+    return p_add_node("grouped", "", children)
 
 fn parse_list_literal() -> Int:
     p_advance()
@@ -515,7 +545,7 @@ fn parse_list_literal() -> Int:
             elements.push(parse_expression())
     skip_newlines()
     expect("rbracket")
-    return add_node("list", "", elements)
+    return p_add_node("list", "", elements)
 
 fn parse_map_or_set_literal() -> Int:
     p_advance()
@@ -525,7 +555,7 @@ fn parse_map_or_set_literal() -> Int:
     if check("rbrace"):
         p_advance()
         mut children: List[Int] := []
-        return add_node("map", "", children)
+        return p_add_node("map", "", children)
 
     first := parse_expression()
     skip_newlines()
@@ -536,7 +566,7 @@ fn parse_map_or_set_literal() -> Int:
         mut entries: List[Int] := []
         first_val := parse_expression()
         mut entry_children: List[Int] := [first, first_val]
-        entries.push(add_node("entry", "", entry_children))
+        entries.push(p_add_node("entry", "", entry_children))
 
         while match_tok("comma"):
             skip_newlines()
@@ -546,10 +576,10 @@ fn parse_map_or_set_literal() -> Int:
             expect("colon")
             val := parse_expression()
             mut ec: List[Int] := [key, val]
-            entries.push(add_node("entry", "", ec))
+            entries.push(p_add_node("entry", "", ec))
         skip_newlines()
         expect("rbrace")
-        return add_node("map", "", entries)
+        return p_add_node("map", "", entries)
 
     # set: {x} or {x, y, ...}
     mut elements: List[Int] := [first]
@@ -560,7 +590,7 @@ fn parse_map_or_set_literal() -> Int:
         elements.push(parse_expression())
     skip_newlines()
     expect("rbrace")
-    return add_node("set", "", elements)
+    return p_add_node("set", "", elements)
 
 fn parse_if_expr() -> Int:
     p_advance()
@@ -577,14 +607,14 @@ fn parse_if_expr() -> Int:
         expect("colon")
         elif_expr := parse_expression()
         mut elif_children: List[Int] := [elif_cond, elif_expr]
-        children.push(add_node("elif_branch", "", elif_children))
+        children.push(p_add_node("elif_branch", "", elif_children))
 
     expect("kw_else")
     expect("colon")
     else_expr := parse_expression()
     children.push(else_expr)
 
-    return add_node("if_expr", "", children)
+    return p_add_node("if_expr", "", children)
 
 fn parse_match_expr() -> Int:
     p_advance()
@@ -603,7 +633,7 @@ fn parse_match_expr() -> Int:
             p_advance()
     expect("dedent")
 
-    return add_node("match_expr", "", children)
+    return p_add_node("match_expr", "", children)
 
 fn parse_match_arm() -> Int:
     pattern := parse_pattern()
@@ -615,7 +645,7 @@ fn parse_match_arm() -> Int:
         p_advance()
         guard_expr := parse_expression()
         mut guard_children: List[Int] := [guard_expr]
-        children.push(add_node("guard", "", guard_children))
+        children.push(p_add_node("guard", "", guard_children))
 
     expect("fat_arrow")
 
@@ -626,9 +656,9 @@ fn parse_match_arm() -> Int:
     else:
         body_expr := parse_expression()
         mut body_children: List[Int] := [body_expr]
-        children.push(add_node("body", "", body_children))
+        children.push(p_add_node("body", "", body_children))
 
-    return add_node("arm", "", children)
+    return p_add_node("arm", "", children)
 
 fn parse_lambda() -> Int:
     p_advance()
@@ -644,8 +674,8 @@ fn parse_lambda() -> Int:
         mut children: List[Int] := []
         for p in params:
             children.push(p)
-        children.push(add_node("body", "", body_children))
-        return add_node("lambda", "", children)
+        children.push(p_add_node("body", "", body_children))
+        return p_add_node("lambda", "", children)
 
     # block form: fn(x): block
     if check("colon"):
@@ -654,9 +684,9 @@ fn parse_lambda() -> Int:
         for p in params:
             children.push(p)
         children.push(body)
-        return add_node("lambda", "", children)
+        return p_add_node("lambda", "", children)
 
-    return add_leaf("error", "expected => or : after lambda params")
+    return p_add_leaf("error", "expected => or : after lambda params")
 
 fn parse_lambda_params() -> List[Int]:
     mut params: List[Int] := []
@@ -685,15 +715,15 @@ fn parse_lambda_param() -> Int:
         children.push(parse_type_expr())
 
     if modifiers.len() > 0:
-        return add_node("param", name_tok.value + " " + modifiers, children)
-    return add_node("param", name_tok.value, children)
+        return p_add_node("param", name_tok.value + " " + modifiers, children)
+    return p_add_node("param", name_tok.value, children)
 
 fn parse_string_interpolation() -> Int:
     start_tok := p_advance()
     mut parts: List[Int] := []
 
     if start_tok.value.len() > 0:
-        parts.push(add_leaf("lit", start_tok.value))
+        parts.push(p_add_leaf("lit", start_tok.value))
 
     while true:
         # interpolation expression
@@ -706,20 +736,20 @@ fn parse_string_interpolation() -> Int:
         if check("string_mid"):
             mid_tok := p_advance()
             if mid_tok.value.len() > 0:
-                parts.push(add_leaf("lit", mid_tok.value))
+                parts.push(p_add_leaf("lit", mid_tok.value))
             continue
 
         # string_end — done
         if check("string_end"):
             end_tok := p_advance()
             if end_tok.value.len() > 0:
-                parts.push(add_leaf("lit", end_tok.value))
+                parts.push(p_add_leaf("lit", end_tok.value))
             break
 
         # unexpected
         break
 
-    return add_node("string_interp", "", parts)
+    return p_add_node("string_interp", "", parts)
 
 fn parse_interp_expr(text: String) -> Int:
     # sub-lex and sub-parse the interpolation expression
@@ -752,31 +782,31 @@ fn parse_pattern() -> Int:
 
     if t.kind == "underscore":
         p_advance()
-        return add_leaf("pat_wildcard", "_")
+        return p_add_leaf("pat_wildcard", "_")
 
     if t.kind == "int_lit":
         p_advance()
-        return add_leaf("pat_int", t.value)
+        return p_add_leaf("pat_int", t.value)
 
     if t.kind == "float_lit":
         p_advance()
-        return add_leaf("pat_float", t.value)
+        return p_add_leaf("pat_float", t.value)
 
     if t.kind == "string_lit":
         p_advance()
-        return add_leaf("pat_string", t.value)
+        return p_add_leaf("pat_string", t.value)
 
     if t.kind == "kw_true":
         p_advance()
-        return add_leaf("pat_bool", "true")
+        return p_add_leaf("pat_bool", "true")
 
     if t.kind == "kw_false":
         p_advance()
-        return add_leaf("pat_bool", "false")
+        return p_add_leaf("pat_bool", "false")
 
     if t.kind == "kw_none":
         p_advance()
-        return add_leaf("pat_none", "")
+        return p_add_leaf("pat_none", "")
 
     if t.kind == "identifier":
         p_advance()
@@ -793,12 +823,12 @@ fn parse_pattern() -> Int:
                     while match_tok("comma"):
                         fields.push(parse_pattern())
                 expect("rparen")
-                return add_node("pat_variant", t.value + "." + variant_tok.value, fields)
+                return p_add_node("pat_variant", t.value + "." + variant_tok.value, fields)
 
             mut empty: List[Int] := []
-            return add_node("pat_variant", t.value + "." + variant_tok.value, empty)
+            return p_add_node("pat_variant", t.value + "." + variant_tok.value, empty)
 
-        return add_leaf("pat_binding", t.value)
+        return p_add_leaf("pat_binding", t.value)
 
     if t.kind == "lparen":
         p_advance()
@@ -808,11 +838,11 @@ fn parse_pattern() -> Int:
             while match_tok("comma"):
                 patterns.push(parse_pattern())
         expect("rparen")
-        return add_node("pat_tuple", "", patterns)
+        return p_add_node("pat_tuple", "", patterns)
 
     # unexpected — advance to avoid infinite loop
     p_advance()
-    return add_leaf("pat_wildcard", "_")
+    return p_add_leaf("pat_wildcard", "_")
 
 # ---------------------------------------------------------------
 # blocks and statements
@@ -830,7 +860,7 @@ fn parse_block() -> Int:
         skip_newlines()
     expect("dedent")
 
-    return add_node("block", "", stmts)
+    return p_add_node("block", "", stmts)
 
 fn parse_statement() -> Int:
     t := p_peek()
@@ -863,10 +893,10 @@ fn parse_statement() -> Int:
 
     if t.kind == "kw_break":
         p_advance()
-        return add_leaf("break", "")
+        return p_add_leaf("break", "")
     if t.kind == "kw_continue":
         p_advance()
-        return add_leaf("continue", "")
+        return p_add_leaf("continue", "")
 
     return parse_expr_stmt_or_assignment()
 
@@ -901,7 +931,7 @@ fn parse_binding() -> Int:
     mut mod := ""
     if is_mut:
         mod = " mut"
-    return add_node("binding", name_tok.value + mod, children)
+    return p_add_node("binding", name_tok.value + mod, children)
 
 fn parse_expr_stmt_or_assignment() -> Int:
     expr := parse_expression()
@@ -923,7 +953,7 @@ fn parse_expr_stmt_or_assignment() -> Int:
         p_advance()
         val := parse_expression()
         mut children: List[Int] := [expr, val]
-        return add_node("assignment", op, children)
+        return p_add_node("assignment", op, children)
 
     return expr
 
@@ -935,7 +965,7 @@ fn parse_if_stmt() -> Int:
 
     mut children: List[Int] := [condition]
     mut then_children: List[Int] := [then_block]
-    children.push(add_node("then", "", then_children))
+    children.push(p_add_node("then", "", then_children))
 
     # elif branches
     while check("kw_elif"):
@@ -944,7 +974,7 @@ fn parse_if_stmt() -> Int:
         expect("colon")
         elif_block := parse_block()
         mut elif_children: List[Int] := [elif_cond, elif_block]
-        children.push(add_node("elif", "", elif_children))
+        children.push(p_add_node("elif", "", elif_children))
 
     # else
     if check("kw_else"):
@@ -952,9 +982,9 @@ fn parse_if_stmt() -> Int:
         expect("colon")
         else_block := parse_block()
         mut else_children: List[Int] := [else_block]
-        children.push(add_node("else", "", else_children))
+        children.push(p_add_node("else", "", else_children))
 
-    return add_node("if_stmt", "", children)
+    return p_add_node("if_stmt", "", children)
 
 fn parse_for_stmt() -> Int:
     p_advance()
@@ -971,7 +1001,7 @@ fn parse_for_stmt() -> Int:
     body := parse_block()
 
     mut children: List[Int] := [iterable, body]
-    return add_node("for_stmt", label, children)
+    return p_add_node("for_stmt", label, children)
 
 fn parse_while_stmt() -> Int:
     p_advance()
@@ -980,7 +1010,7 @@ fn parse_while_stmt() -> Int:
     body := parse_block()
 
     mut children: List[Int] := [condition, body]
-    return add_node("while_stmt", "", children)
+    return p_add_node("while_stmt", "", children)
 
 fn parse_match_stmt() -> Int:
     # reuse match_expr parsing
@@ -991,16 +1021,16 @@ fn parse_return_stmt() -> Int:
     next_kind := p_peek().kind
     if next_kind == "newline" or next_kind == "dedent" or next_kind == "eof":
         mut children: List[Int] := []
-        return add_node("return", "", children)
+        return p_add_node("return", "", children)
     val := parse_expression()
     mut children: List[Int] := [val]
-    return add_node("return", "", children)
+    return p_add_node("return", "", children)
 
 fn parse_fail_stmt() -> Int:
     p_advance()
     val := parse_expression()
     mut children: List[Int] := [val]
-    return add_node("fail", "", children)
+    return p_add_node("fail", "", children)
 
 # ---------------------------------------------------------------
 # declarations
@@ -1035,7 +1065,7 @@ pub fn parse(token_list: List[Token]) -> Int:
     for d in decls:
         children.push(d)
 
-    return add_node("module", "", children)
+    return p_add_node("module", "", children)
 
 fn parse_import_decl() -> Int:
     if check("kw_from"):
@@ -1063,7 +1093,7 @@ fn parse_import_decl() -> Int:
         mut label := path
         for nm in names:
             label = label + " " + nm
-        return add_leaf("from_import", label)
+        return p_add_leaf("from_import", label)
 
     # import path [as alias]
     p_advance()
@@ -1073,7 +1103,7 @@ fn parse_import_decl() -> Int:
         alias_tok := expect("identifier")
         label = label + " as " + alias_tok.value
 
-    return add_leaf("import", label)
+    return p_add_leaf("import", label)
 
 fn parse_dotted_path() -> String:
     first := expect("identifier")
@@ -1109,11 +1139,11 @@ fn parse_top_level_decl() -> Int:
         decl = parse_binding()
     else:
         p_advance()
-        decl = add_leaf("error", "expected declaration")
+        decl = p_add_leaf("error", "expected declaration")
 
     if is_pub:
         mut children: List[Int] := [decl]
-        return add_node("pub", "", children)
+        return p_add_node("pub", "", children)
     return decl
 
 fn parse_fn_decl() -> Int:
@@ -1152,14 +1182,14 @@ fn parse_fn_decl() -> Int:
     if match_tok("arrow"):
         ret := parse_type_expr()
         mut ret_children: List[Int] := [ret]
-        children.push(add_node("returns", "", ret_children))
+        children.push(p_add_node("returns", "", ret_children))
 
     expect("colon")
     body := parse_block()
     mut body_children: List[Int] := [body]
-    children.push(add_node("body", "", body_children))
+    children.push(p_add_node("body", "", body_children))
 
-    return add_node("fn_decl", name, children)
+    return p_add_node("fn_decl", name, children)
 
 fn parse_test_decl() -> Int:
     p_advance()
@@ -1168,8 +1198,8 @@ fn parse_test_decl() -> Int:
     body := parse_block()
     mut body_children: List[Int] := [body]
     mut children: List[Int] := []
-    children.push(add_node("body", "", body_children))
-    return add_node("test_decl", name_tok.value, children)
+    children.push(p_add_node("body", "", body_children))
+    return p_add_node("test_decl", name_tok.value, children)
 
 fn parse_param_list() -> List[Int]:
     mut params: List[Int] := []
@@ -1202,7 +1232,7 @@ fn parse_param() -> Int:
     if match_tok("eq"):
         children.push(parse_expression())
 
-    return add_node("param", name_tok.value + modifiers, children)
+    return p_add_node("param", name_tok.value + modifiers, children)
 
 fn parse_optional_generic_params() -> List[Int]:
     if check("lbracket"):
@@ -1226,9 +1256,9 @@ fn parse_generic_param() -> Int:
         mut bounds: List[Int] := [parse_type_expr()]
         while match_tok("plus"):
             bounds.push(parse_type_expr())
-        return add_node("generic_param", name_tok.value, bounds)
+        return p_add_node("generic_param", name_tok.value, bounds)
     mut empty: List[Int] := []
-    return add_node("generic_param", name_tok.value, empty)
+    return p_add_node("generic_param", name_tok.value, empty)
 
 fn parse_struct_decl() -> Int:
     p_advance()
@@ -1262,7 +1292,7 @@ fn parse_struct_decl() -> Int:
         skip_newlines()
     expect("dedent")
 
-    return add_node("struct_decl", name, children)
+    return p_add_node("struct_decl", name, children)
 
 fn parse_struct_field() -> Int:
     mut modifiers := ""
@@ -1282,7 +1312,7 @@ fn parse_struct_field() -> Int:
     if match_tok("eq"):
         children.push(parse_expression())
 
-    return add_node("field", name_tok.value + modifiers, children)
+    return p_add_node("field", name_tok.value + modifiers, children)
 
 fn parse_enum_decl() -> Int:
     p_advance()
@@ -1316,7 +1346,7 @@ fn parse_enum_decl() -> Int:
         skip_newlines()
     expect("dedent")
 
-    return add_node("enum_decl", name, children)
+    return p_add_node("enum_decl", name, children)
 
 fn parse_enum_variant() -> Int:
     name_tok := expect("identifier")
@@ -1327,7 +1357,7 @@ fn parse_enum_variant() -> Int:
             fields.push(parse_type_expr())
         expect("rparen")
 
-    return add_node("variant", name_tok.value, fields)
+    return p_add_node("variant", name_tok.value, fields)
 
 fn parse_interface_decl() -> Int:
     p_advance()
@@ -1349,7 +1379,7 @@ fn parse_interface_decl() -> Int:
         skip_newlines()
     expect("dedent")
 
-    return add_node("interface_decl", name_tok.value, children)
+    return p_add_node("interface_decl", name_tok.value, children)
 
 fn parse_fn_sig() -> Int:
     expect("kw_fn")
@@ -1370,9 +1400,9 @@ fn parse_fn_sig() -> Int:
     if match_tok("arrow"):
         ret := parse_type_expr()
         mut ret_children: List[Int] := [ret]
-        children.push(add_node("returns", "", ret_children))
+        children.push(p_add_node("returns", "", ret_children))
 
-    return add_node("fn_sig", name_tok.value, children)
+    return p_add_node("fn_sig", name_tok.value, children)
 
 fn parse_impl_decl() -> Int:
     p_advance()
@@ -1384,7 +1414,7 @@ fn parse_impl_decl() -> Int:
     if match_tok("kw_for"):
         iface := parse_type_expr()
         mut for_children: List[Int] := [iface]
-        children.push(add_node("for_type", "", for_children))
+        children.push(p_add_node("for_type", "", for_children))
 
     expect("colon")
     expect("newline")
@@ -1399,13 +1429,13 @@ fn parse_impl_decl() -> Int:
         method := parse_fn_decl()
         if method_pub:
             mut pub_children: List[Int] := [method]
-            children.push(add_node("pub", "", pub_children))
+            children.push(p_add_node("pub", "", pub_children))
         else:
             children.push(method)
         skip_newlines()
     expect("dedent")
 
-    return add_node("impl_decl", "", children)
+    return p_add_node("impl_decl", "", children)
 
 fn parse_type_alias_decl() -> Int:
     p_advance()
@@ -1417,4 +1447,4 @@ fn parse_type_alias_decl() -> Int:
     # store generic_param nodes for generic type aliases
     for g in generics:
         children.push(g)
-    return add_node("type_alias", name_tok.value, children)
+    return p_add_node("type_alias", name_tok.value, children)

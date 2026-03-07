@@ -32,11 +32,34 @@ pub struct Diagnostic:
 mut c_diagnostics: List[Diagnostic] := []
 mut c_current_file: String := ""
 
+# Get position from AST node
+fn c_get_node_position(node_idx: Int) -> (Int, Int):
+    if node_idx < 0:
+        return (0, 0)
+    node := get_node(node_idx)
+    return (node.line, node.col)
+
+# Report error with position from node
+fn c_error_at(node_idx: Int, code: String, message: String):
+    mut pos := c_get_node_position(node_idx)
+    c_diagnostics.push(Diagnostic("error", code, message, c_current_file, pos.0, pos.1, ""))
+
+# Report error without specific node (uses 0,0)
 fn c_error(code: String, message: String):
     c_diagnostics.push(Diagnostic("error", code, message, c_current_file, 0, 0, ""))
 
+# Report error with fix suggestion
+fn c_error_fix_at(node_idx: Int, code: String, message: String, fix: String):
+    mut pos := c_get_node_position(node_idx)
+    c_diagnostics.push(Diagnostic("error", code, message, c_current_file, pos.0, pos.1, fix))
+
 fn c_error_fix(code: String, message: String, fix: String):
     c_diagnostics.push(Diagnostic("error", code, message, c_current_file, 0, 0, fix))
+
+# Report warning with position from node
+fn c_warning_at(node_idx: Int, code: String, message: String):
+    mut pos := c_get_node_position(node_idx)
+    c_diagnostics.push(Diagnostic("warning", code, message, c_current_file, pos.0, pos.1, ""))
 
 fn c_warning(code: String, message: String):
     c_diagnostics.push(Diagnostic("warning", code, message, c_current_file, 0, 0, ""))

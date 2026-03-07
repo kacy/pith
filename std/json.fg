@@ -12,78 +12,78 @@
 # ===============================================================
 
 # Global node counter and type storage
-mut g_next: Int := 0
-mut g_types: Map[Int, String] := {}
-mut g_str_vals: Map[Int, String] := {}
-mut g_int_vals: Map[Int, Int] := {}
-mut g_float_vals: Map[Int, Float] := {}
-mut g_bool_vals: Map[Int, Bool] := {}
+mut next_node_id: Int := 0
+mut node_types: Map[Int, String] := {}
+mut string_values: Map[Int, String] := {}
+mut integer_values: Map[Int, Int] := {}
+mut float_values: Map[Int, Float] := {}
+mut boolean_values: Map[Int, Bool] := {}
 
 # Object children: flat append-only storage with offset/count
-mut g_okeys: List[String] := []
-mut g_ovals: List[Int] := {}
-mut g_ooff: Map[Int, Int] := {}
-mut g_ocnt: Map[Int, Int] := {}
+mut object_keys_flat: List[String] := []
+mut object_values_flat: List[Int] := {}
+mut object_key_offsets: Map[Int, Int] := {}
+mut object_key_counts: Map[Int, Int] := {}
 
 # Array children: flat append-only storage with offset/count
-mut g_aitems: List[Int] := []
-mut g_aoff: Map[Int, Int] := {}
-mut g_acnt: Map[Int, Int] := {}
+mut array_items_flat: List[Int] := []
+mut array_item_offsets: Map[Int, Int] := {}
+mut array_item_counts: Map[Int, Int] := {}
 
 # Allocates a new node of the specified type and returns its handle
-fn j_alloc(kind: String) -> Int:
-    idx := g_next
-    g_next = g_next + 1
-    g_types.insert(idx, kind)
-    g_str_vals.insert(idx, "")
-    g_int_vals.insert(idx, 0)
-    g_float_vals.insert(idx, 0.0)
-    g_bool_vals.insert(idx, false)
-    g_ooff.insert(idx, 0)
-    g_ocnt.insert(idx, 0)
-    g_aoff.insert(idx, 0)
-    g_acnt.insert(idx, 0)
-    return idx
+fn allocate_node(kind: String) -> Int:
+    node_id := next_node_id
+    next_node_id = next_node_id + 1
+    node_types.insert(node_id, kind)
+    string_values.insert(node_id, "")
+    integer_values.insert(node_id, 0)
+    float_values.insert(node_id, 0.0)
+    boolean_values.insert(node_id, false)
+    object_key_offsets.insert(node_id, 0)
+    object_key_counts.insert(node_id, 0)
+    array_item_offsets.insert(node_id, 0)
+    array_item_counts.insert(node_id, 0)
+    return node_id
 
 # Sets a key-value pair on an object node
-fn j_obj_set(handle: Int, key: String, val: Int):
-    cnt := g_ocnt[handle]
-    if cnt == 0:
-        g_ooff.insert(handle, g_okeys.len())
-    g_okeys.push(key)
-    g_ovals.push(val)
-    g_ocnt.insert(handle, cnt + 1)
+fn set_object_property(handle: Int, key: String, value: Int):
+    count := object_key_counts[handle]
+    if count == 0:
+        object_key_offsets.insert(handle, object_keys_flat.len())
+    object_keys_flat.push(key)
+    object_values_flat.push(value)
+    object_key_counts.insert(handle, count + 1)
 
 # Appends a value to an array node
-fn j_arr_push(handle: Int, val: Int):
-    cnt := g_acnt[handle]
-    if cnt == 0:
-        g_aoff.insert(handle, g_aitems.len())
-    g_aitems.push(val)
-    g_acnt.insert(handle, cnt + 1)
+fn push_array_element(handle: Int, value: Int):
+    count := array_item_counts[handle]
+    if count == 0:
+        array_item_offsets.insert(handle, array_items_flat.len())
+    array_items_flat.push(value)
+    array_item_counts.insert(handle, count + 1)
 
 # ===============================================================
 # Parser (Internal)
 # ===============================================================
 
 # Parser state
-mut p_data: String := ""
-mut p_pos: Int := 0
-mut p_err: Bool := false
+mut parser_input: String := ""
+mut parser_position: Int := 0
+mut parser_error: Bool := false
 
-# Returns character at position i or empty string if out of bounds
-fn p_at(i: Int) -> String:
-    if i >= p_data.len():
+# Returns character at position or empty string if out of bounds
+fn get_char_at(position: Int) -> String:
+    if position >= parser_input.len():
         return ""
-    return p_data[i]
+    return parser_input[position]
 
 # Skips whitespace characters (space, tab, newline, carriage return)
-fn p_skip_ws():
-    while p_pos < p_data.len() and (p_at(p_pos) == " " or p_at(p_pos) == chr(9) or p_at(p_pos) == chr(10) or p_at(p_pos) == chr(13)):
-        p_pos = p_pos + 1
+fn skip_whitespace():
+    while parser_position < parser_input.len() and (get_char_at(parser_position) == " " or get_char_at(parser_position) == chr(9) or get_char_at(parser_position) == chr(10) or get_char_at(parser_position) == chr(13)):
+        parser_position = parser_position + 1
 
 # Parses an integer from a string manually (handles negative numbers)
-fn j_parse_int_manual(s: String) -> Int:
+fn parse_integer_manual(s: String) -> Int:
     mut val := 0
     mut neg := false
     mut i := 0
@@ -106,7 +106,7 @@ fn j_parse_int_manual(s: String) -> Int:
     return val
 
 # Parses a float from a string manually (handles decimal and negative)
-fn j_parse_float_manual(s: String) -> Float:
+fn parse_float_manual(s: String) -> Float:
     mut int_part := 0
     mut frac_part := 0.0
     mut frac_div := 1.0
@@ -134,7 +134,7 @@ fn j_parse_float_manual(s: String) -> Float:
     return result
 
 # Returns true if character is valid in a number (digit, dot, e, E, +, -)
-fn p_is_num_char(c: String) -> Bool:
+fn is_number_char(c: String) -> Bool:
     if c >= "0" and c <= "9":
         return true
     if c == "." or c == "e" or c == "E" or c == "+" or c == "-":
@@ -142,128 +142,128 @@ fn p_is_num_char(c: String) -> Bool:
     return false
 
 # Parses a JSON string value (double-quoted)
-fn p_parse_string_raw() -> String:
+fn parse_string_raw() -> String:
     # skip opening quote
-    p_pos = p_pos + 1
-    start := p_pos
-    while p_pos < p_data.len() and p_at(p_pos) != chr(34):
-        if p_at(p_pos) == chr(92):
-            p_pos = p_pos + 1
-        p_pos = p_pos + 1
-    val := p_data.substring(start, p_pos)
-    if p_pos < p_data.len():
-        p_pos = p_pos + 1
+    parser_position = parser_position + 1
+    start := parser_position
+    while parser_position < parser_input.len() and get_char_at(parser_position) != chr(34):
+        if get_char_at(parser_position) == chr(92):
+            parser_position = parser_position + 1
+        parser_position = parser_position + 1
+    val := parser_input.substring(start, parser_position)
+    if parser_position < parser_input.len():
+        parser_position = parser_position + 1
     return val
 
 # Main recursive value parser - handles all JSON types
-fn p_parse_value() -> Int:
-    p_skip_ws()
-    if p_pos >= p_data.len():
-        p_err = true
+fn parse_value() -> Int:
+    skip_whitespace()
+    if parser_position >= parser_input.len():
+        parser_error = true
         return 0 - 1
-    c := p_at(p_pos)
+    c := get_char_at(parser_position)
 
     # string
     if c == chr(34):
-        val := p_parse_string_raw()
-        idx := j_alloc("string")
-        g_str_vals.insert(idx, val)
+        val := parse_string_raw()
+        idx := allocate_node("string")
+        string_values.insert(idx, val)
         return idx
 
     # boolean true
-    if p_pos + 4 <= p_data.len() and p_data.substring(p_pos, p_pos + 4) == "true":
-        p_pos = p_pos + 4
-        idx := j_alloc("bool")
-        g_bool_vals.insert(idx, true)
+    if parser_position + 4 <= parser_input.len() and parser_input.substring(parser_position, parser_position + 4) == "true":
+        parser_position = parser_position + 4
+        idx := allocate_node("bool")
+        boolean_values.insert(idx, true)
         return idx
 
     # boolean false
-    if p_pos + 5 <= p_data.len() and p_data.substring(p_pos, p_pos + 5) == "false":
-        p_pos = p_pos + 5
-        idx := j_alloc("bool")
+    if parser_position + 5 <= parser_input.len() and parser_input.substring(parser_position, parser_position + 5) == "false":
+        parser_position = parser_position + 5
+        idx := allocate_node("bool")
         return idx
 
     # null
-    if p_pos + 4 <= p_data.len() and p_data.substring(p_pos, p_pos + 4) == "null":
-        p_pos = p_pos + 4
-        idx := j_alloc("null")
+    if parser_position + 4 <= parser_input.len() and parser_input.substring(parser_position, parser_position + 4) == "null":
+        parser_position = parser_position + 4
+        idx := allocate_node("null")
         return idx
 
     # array
     if c == "[":
-        p_pos = p_pos + 1
-        arr := j_alloc("array")
-        p_skip_ws()
-        if p_pos < p_data.len() and p_at(p_pos) == "]":
-            p_pos = p_pos + 1
+        parser_position = parser_position + 1
+        arr := allocate_node("array")
+        skip_whitespace()
+        if parser_position < parser_input.len() and get_char_at(parser_position) == "]":
+            parser_position = parser_position + 1
             return arr
-        while p_pos < p_data.len() and p_at(p_pos) != "]":
-            val := p_parse_value()
-            if p_err:
+        while parser_position < parser_input.len() and get_char_at(parser_position) != "]":
+            val := parse_value()
+            if parser_error:
                 return 0 - 1
-            j_arr_push(arr, val)
-            p_skip_ws()
-            if p_pos < p_data.len() and p_at(p_pos) == ",":
-                p_pos = p_pos + 1
-            p_skip_ws()
-        if p_pos < p_data.len():
-            p_pos = p_pos + 1
+            push_array_element(arr, val)
+            skip_whitespace()
+            if parser_position < parser_input.len() and get_char_at(parser_position) == ",":
+                parser_position = parser_position + 1
+            skip_whitespace()
+        if parser_position < parser_input.len():
+            parser_position = parser_position + 1
         return arr
 
     # object
     if c == chr(123):
-        p_pos = p_pos + 1
-        obj := j_alloc("object")
-        p_skip_ws()
-        if p_pos < p_data.len() and p_at(p_pos) == chr(125):
-            p_pos = p_pos + 1
+        parser_position = parser_position + 1
+        obj := allocate_node("object")
+        skip_whitespace()
+        if parser_position < parser_input.len() and get_char_at(parser_position) == chr(125):
+            parser_position = parser_position + 1
             return obj
         mut done := false
-        while p_pos < p_data.len() and not done and not p_err:
-            p_skip_ws()
-            if p_pos >= p_data.len() or p_at(p_pos) != chr(34):
-                p_err = true
+        while parser_position < parser_input.len() and not done and not parser_error:
+            skip_whitespace()
+            if parser_position >= parser_input.len() or get_char_at(parser_position) != chr(34):
+                parser_error = true
                 return 0 - 1
-            key := p_parse_string_raw()
-            p_skip_ws()
-            if p_pos < p_data.len() and p_at(p_pos) == ":":
-                p_pos = p_pos + 1
-            val := p_parse_value()
-            if p_err:
+            key := parse_string_raw()
+            skip_whitespace()
+            if parser_position < parser_input.len() and get_char_at(parser_position) == ":":
+                parser_position = parser_position + 1
+            val := parse_value()
+            if parser_error:
                 return 0 - 1
-            j_obj_set(obj, key, val)
-            p_skip_ws()
-            if p_pos < p_data.len() and p_at(p_pos) == ",":
-                p_pos = p_pos + 1
-            p_skip_ws()
-            if p_pos < p_data.len() and p_at(p_pos) == chr(125):
+            set_object_property(obj, key, val)
+            skip_whitespace()
+            if parser_position < parser_input.len() and get_char_at(parser_position) == ",":
+                parser_position = parser_position + 1
+            skip_whitespace()
+            if parser_position < parser_input.len() and get_char_at(parser_position) == chr(125):
                 done = true
-        if p_pos < p_data.len() and p_at(p_pos) == chr(125):
-            p_pos = p_pos + 1
+        if parser_position < parser_input.len() and get_char_at(parser_position) == chr(125):
+            parser_position = parser_position + 1
         return obj
 
     # number (int or float)
     if (c >= "0" and c <= "9") or c == "-" or c == "+":
-        start := p_pos
+        start := parser_position
         mut is_float := false
         if c == "-" or c == "+":
-            p_pos = p_pos + 1
-        while p_pos < p_data.len() and p_is_num_char(p_at(p_pos)):
-            d := p_at(p_pos)
+            parser_position = parser_position + 1
+        while parser_position < parser_input.len() and is_number_char(get_char_at(parser_position)):
+            d := get_char_at(parser_position)
             if d == "." or d == "e" or d == "E":
                 is_float = true
-            p_pos = p_pos + 1
-        num_str := p_data.substring(start, p_pos)
+            parser_position = parser_position + 1
+        num_str := parser_input.substring(start, parser_position)
         if is_float:
-            idx := j_alloc("float")
-            g_float_vals.insert(idx, j_parse_float_manual(num_str))
+            idx := allocate_node("float")
+            float_values.insert(idx, parse_float_manual(num_str))
             return idx
         if not is_float:
-            idx := j_alloc("int")
-            g_int_vals.insert(idx, j_parse_int_manual(num_str))
+            idx := allocate_node("int")
+            integer_values.insert(idx, parse_integer_manual(num_str))
             return idx
 
-    p_err = true
+    parser_error = true
     return 0 - 1
 
 # ===============================================================
@@ -273,17 +273,17 @@ fn p_parse_value() -> Int:
 # Parses a JSON string and returns a handle to the root node.
 # Returns -1 on parse error. Use type_of() to inspect the result.
 pub fn parse(input: String) -> Int:
-    p_data = input
-    p_pos = 0
-    p_err = false
-    result := p_parse_value()
-    if p_err:
+    parser_input = input
+    parser_position = 0
+    parser_error = false
+    result := parse_value()
+    if parser_error:
         return 0 - 1
     # skip trailing whitespace and verify no garbage remains
-    while p_pos < p_data.len():
-        c := p_data[p_pos]
+    while parser_position < parser_input.len():
+        c := parser_input[parser_position]
         if c == " " or c == "\t" or c == "\n" or c == "\r":
-            p_pos = p_pos + 1
+            parser_position = parser_position + 1
         else:
             # trailing non-whitespace characters = error
             return 0 - 1
@@ -296,41 +296,41 @@ pub fn parse(input: String) -> Int:
 # Returns the type of a node as a string: "null", "bool", "int", "float", 
 # "string", "array", or "object". Returns "invalid" for invalid handles.
 pub fn type_of(handle: Int) -> String:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return "invalid"
-    return g_types[handle]
+    return node_types[handle]
 
 # Returns the boolean value from a node. Returns false if not a boolean.
 pub fn get_bool(handle: Int) -> Bool:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return false
-    if g_types[handle] != "bool":
+    if node_types[handle] != "bool":
         return false
-    return g_bool_vals[handle]
+    return boolean_values[handle]
 
 # Returns the integer value from a node. Returns 0 if not an integer.
 pub fn get_int(handle: Int) -> Int:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return 0
-    if g_types[handle] == "int":
-        return g_int_vals[handle]
+    if node_types[handle] == "int":
+        return integer_values[handle]
     return 0
 
 # Returns the float value from a node. Returns 0.0 if not a float.
 pub fn get_float(handle: Int) -> Float:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return 0.0
-    if g_types[handle] == "float":
-        return g_float_vals[handle]
+    if node_types[handle] == "float":
+        return float_values[handle]
     return 0.0
 
 # Returns the string value from a node. Returns empty string if not a string.
 pub fn get_string(handle: Int) -> String:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return ""
-    if g_types[handle] != "string":
+    if node_types[handle] != "string":
         return ""
-    return g_str_vals[handle]
+    return string_values[handle]
 
 # ===============================================================
 # Public API — Array Operations
@@ -338,17 +338,17 @@ pub fn get_string(handle: Int) -> String:
 
 # Returns the number of elements in an array node. Returns 0 for non-arrays.
 pub fn array_len(handle: Int) -> Int:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return 0
-    return g_acnt[handle]
+    return array_item_counts[handle]
 
 # Returns the handle of an array element by index. Returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return 0 - 1
-    if index < 0 or index >= g_acnt[handle]:
+    if index < 0 or index >= array_item_counts[handle]:
         return 0 - 1
-    return g_aitems[g_aoff[handle] + index]
+    return array_items_flat[array_item_offsets[handle] + index]
 
 # ===============================================================
 # Public API — Object Operations
@@ -357,15 +357,15 @@ pub fn array_get(handle: Int, index: Int) -> Int:
 # Returns the handle of an object value by key. Returns -1 if key not found.
 # Scans from end for latest value (handles duplicate keys).
 pub fn object_get(handle: Int, key: String) -> Int:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return 0 - 1
-    off := g_ooff[handle]
-    cnt := g_ocnt[handle]
+    off := object_key_offsets[handle]
+    cnt := object_key_counts[handle]
     # scan from end for latest value (handles duplicate keys from object_set)
     mut i := cnt - 1
     while i >= 0:
-        if g_okeys[off + i] == key:
-            return g_ovals[off + i]
+        if object_keys_flat[off + i] == key:
+            return object_values_flat[off + i]
         i = i - 1
     return 0 - 1
 
@@ -376,21 +376,21 @@ pub fn object_has(handle: Int, key: String) -> Bool:
 # Returns the list of keys in an object (deduplicated, insertion order).
 pub fn object_keys(handle: Int) -> List[String]:
     mut result: List[String] := []
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return result
-    off := g_ooff[handle]
-    cnt := g_ocnt[handle]
+    off := object_key_offsets[handle]
+    cnt := object_key_counts[handle]
     mut i := 0
     while i < cnt:
         # skip duplicates — keep first occurrence only
         mut is_dup := false
         mut j := 0
         while j < i:
-            if g_okeys[off + j] == g_okeys[off + i]:
+            if object_keys_flat[off + j] == object_keys_flat[off + i]:
                 is_dup = true
             j = j + 1
         if not is_dup:
-            result.push(g_okeys[off + i])
+            result.push(object_keys_flat[off + i])
         i = i + 1
     return result
 
@@ -400,54 +400,54 @@ pub fn object_keys(handle: Int) -> List[String]:
 
 # Creates a JSON null node.
 pub fn make_null() -> Int:
-    return j_alloc("null")
+    return allocate_node("null")
 
 # Creates a JSON boolean node with the given value.
 pub fn make_bool(val: Bool) -> Int:
-    idx := j_alloc("bool")
-    g_bool_vals.insert(idx, val)
+    idx := allocate_node("bool")
+    boolean_values.insert(idx, val)
     return idx
 
 # Creates a JSON integer node with the given value.
 pub fn make_int(val: Int) -> Int:
-    idx := j_alloc("int")
-    g_int_vals.insert(idx, val)
+    idx := allocate_node("int")
+    integer_values.insert(idx, val)
     return idx
 
 # Creates a JSON float node with the given value.
 pub fn make_float(val: Float) -> Int:
-    idx := j_alloc("float")
-    g_float_vals.insert(idx, val)
+    idx := allocate_node("float")
+    float_values.insert(idx, val)
     return idx
 
 # Creates a JSON string node with the given value.
 pub fn make_string(val: String) -> Int:
-    idx := j_alloc("string")
-    g_str_vals.insert(idx, val)
+    idx := allocate_node("string")
+    string_values.insert(idx, val)
     return idx
 
 # Creates an empty JSON array node.
 pub fn make_array() -> Int:
-    return j_alloc("array")
+    return allocate_node("array")
 
 # Appends a value handle to an array node.
 pub fn array_push(arr: Int, val: Int):
-    j_arr_push(arr, val)
+    push_array_element(arr, val)
 
 # Creates an empty JSON object node.
 pub fn make_object() -> Int:
-    return j_alloc("object")
+    return allocate_node("object")
 
 # Sets a key-value pair on an object node (key is string, val is node handle).
 pub fn object_set(obj: Int, key: String, val: Int):
-    j_obj_set(obj, key, val)
+    set_object_property(obj, key, val)
 
 # ===============================================================
 # Public API — Encoder
 # ===============================================================
 
 # Escapes special characters in a string for JSON encoding
-fn j_encode_string(s: String) -> String:
+fn encode_string(s: String) -> String:
     mut result := chr(34)
     mut i := 0
     while i < s.len():
@@ -471,30 +471,30 @@ fn j_encode_string(s: String) -> String:
 # Serializes a node tree to a JSON string.
 # Returns "null" for invalid handles.
 pub fn encode(handle: Int) -> String:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return "null"
-    kind := g_types[handle]
+    kind := node_types[handle]
     if kind == "null":
         return "null"
     if kind == "bool":
-        if g_bool_vals[handle]:
+        if boolean_values[handle]:
             return "true"
         return "false"
     if kind == "int":
-        return g_int_vals[handle].to_string()
+        return integer_values[handle].to_string()
     if kind == "float":
-        return g_float_vals[handle].to_string()
+        return float_values[handle].to_string()
     if kind == "string":
-        return j_encode_string(g_str_vals[handle])
+        return encode_string(string_values[handle])
     if kind == "array":
         mut result := "["
-        off := g_aoff[handle]
-        cnt := g_acnt[handle]
+        off := array_item_offsets[handle]
+        cnt := array_item_counts[handle]
         mut i := 0
         while i < cnt:
             if i > 0:
                 result = result + ","
-            result = result + encode(g_aitems[off + i])
+            result = result + encode(array_items_flat[off + i])
             i = i + 1
         return result + "]"
     if kind == "object":
@@ -504,7 +504,7 @@ pub fn encode(handle: Int) -> String:
         while i < k.len():
             if i > 0:
                 result = result + ","
-            result = result + j_encode_string(k[i]) + ":" + encode(object_get(handle, k[i]))
+            result = result + encode_string(k[i]) + ":" + encode(object_get(handle, k[i]))
             i = i + 1
         return result + chr(125)
     return "null"

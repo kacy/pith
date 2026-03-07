@@ -34,7 +34,63 @@ typedef struct {
 } forge_closure_t;
 
 // ---------------------------------------------------------------
-// string type
+// reference counting (ARC) infrastructure
+// ---------------------------------------------------------------
+
+// RC header stored before each heap-allocated object
+typedef struct {
+    int64_t ref_count;
+    int32_t type_tag;
+} forge_rc_header_t;
+
+// Type tags for cycle detection
+typedef enum {
+    FORGE_TYPE_STRING = 1,
+    FORGE_TYPE_LIST = 2,
+    FORGE_TYPE_MAP = 3,
+    FORGE_TYPE_CLOSURE = 4,
+    FORGE_TYPE_TASK = 5
+} forge_type_tag_t;
+
+// Get pointer to RC header from object pointer
+#define FORGE_RC_HEADER(ptr) ((forge_rc_header_t *)((char *)(ptr) - sizeof(forge_rc_header_t)))
+
+// Allocate with reference counting header
+static inline void *forge_rc_alloc(size_t size, int32_t type_tag) {
+    size_t total_size = sizeof(forge_rc_header_t) + size;
+    forge_rc_header_t *header = (forge_rc_header_t *)malloc(total_size);
+    if (!header) {
+        fprintf(stderr, "forge: out of memory\n");
+        exit(1);
+    }
+    header->ref_count = 1;
+    header->type_tag = type_tag;
+    return (char *)header + sizeof(forge_rc_header_t);
+}
+
+// Increment reference count
+static inline void forge_rc_retain(void *ptr) {
+    if (ptr) {
+        FORGE_RC_HEADER(ptr)->ref_count++;
+    }
+}
+
+// Decrement reference count, free if zero
+static inline void forge_rc_release(void *ptr, void (*destructor)(void *)) {
+    if (ptr) {
+        forge_rc_header_t *header = FORGE_RC_HEADER(ptr);
+        header->ref_count--;
+        if (header->ref_count <= 0) {
+            if (destructor) {
+                destructor(ptr);
+            }
+            free(header);
+        }
+    }
+}
+
+// ---------------------------------------------------------------
+// string type (with RC support)
 // ---------------------------------------------------------------
 
 typedef struct {
@@ -53,6 +109,30 @@ static inline forge_string_t forge_string_from(const char *data, int64_t len) {
 // empty string constant
 static const forge_string_t forge_string_empty = { .data = "", .len = 0 };
 
+// String destructor (frees the data buffer)
+static inline void forge_string_destroy(void *ptr) {
+    forge_string_t *s = (forge_string_t *)ptr;
+    if (s->data && s->len > 0) {
+        // Data was heap-allocated with the string struct
+        free((void *)s->data);
+    }
+}
+
+// Retain a string (increment RC)
+static inline void forge_string_retain(forge_string_t s) {
+    // Only retain if heap-allocated (data comes after header)
+    if (s.data && s.len > 0) {
+        forge_rc_retain((void *)s.data);
+    }
+}
+
+// Release a string (decrement RC, free if zero)
+static inline void forge_string_release(forge_string_t s) {
+    if (s.data && s.len > 0) {
+        forge_rc_release((void *)s.data, NULL);
+    }
+}
+
 // ---------------------------------------------------------------
 // string helpers — reduce malloc+memcpy+null-terminate boilerplate
 // ---------------------------------------------------------------
@@ -66,6 +146,12 @@ static inline char *forge_str_alloc(int64_t len) {
         exit(1);
     }
     return buf;
+}
+
+// allocate a string buffer with RC header (for heap-allocated strings)
+// returns pointer to data (after header)
+static inline char *forge_str_alloc_rc(int64_t len) {
+    return (char *)forge_rc_alloc((size_t)len + 1, FORGE_TYPE_STRING);
 }
 
 // convert a forge_string_t to a null-terminated C string.
@@ -87,7 +173,7 @@ static inline forge_string_t forge_string_concat(forge_string_t a, forge_string_
         exit(1);
     }
     int64_t new_len = a.len + b.len;
-    char *buf = forge_str_alloc(new_len);
+    char *buf = forge_str_alloc_rc(new_len);
     memcpy(buf, a.data, (size_t)a.len);
     memcpy(buf + a.len, b.data, (size_t)b.len);
     buf[new_len] = '\0';
@@ -157,7 +243,7 @@ static inline forge_string_t forge_string_trim(forge_string_t s) {
 }
 
 static inline forge_string_t forge_string_to_upper(forge_string_t s) {
-    char *buf = forge_str_alloc(s.len);
+    char *buf = forge_str_alloc_rc(s.len);
     for (int64_t i = 0; i < s.len; i++) {
         char c = s.data[i];
         buf[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
@@ -167,7 +253,7 @@ static inline forge_string_t forge_string_to_upper(forge_string_t s) {
 }
 
 static inline forge_string_t forge_string_to_lower(forge_string_t s) {
-    char *buf = forge_str_alloc(s.len);
+    char *buf = forge_str_alloc_rc(s.len);
     for (int64_t i = 0; i < s.len; i++) {
         char c = s.data[i];
         buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
@@ -181,7 +267,7 @@ static inline forge_string_t forge_string_substring(forge_string_t s, int64_t st
     if (end > s.len) end = s.len;
     if (start >= end) return forge_string_empty;
     int64_t new_len = end - start;
-    char *buf = forge_str_alloc(new_len);
+    char *buf = forge_str_alloc_rc(new_len);
     memcpy(buf, s.data + start, (size_t)new_len);
     buf[new_len] = '\0';
     return (forge_string_t){ .data = buf, .len = new_len };
@@ -193,7 +279,7 @@ static inline forge_string_t forge_string_char_at(forge_string_t s, int64_t inde
         fprintf(stderr, "forge: string index out of bounds (index %" PRId64 ", length %" PRId64 ")\n", index, s.len);
         exit(1);
     }
-    char *buf = forge_str_alloc(1);
+    char *buf = forge_str_alloc_rc(1);
     buf[0] = s.data[index];
     buf[1] = '\0';
     return (forge_string_t){ .data = buf, .len = 1 };
@@ -201,7 +287,7 @@ static inline forge_string_t forge_string_char_at(forge_string_t s, int64_t inde
 
 // chr(Int) -> String: return a single-character string for the given ASCII code.
 static inline forge_string_t forge_chr(int64_t code) {
-    char *buf = forge_str_alloc(1);
+    char *buf = forge_str_alloc_rc(1);
     buf[0] = (char)(code & 0xFF);
     buf[1] = '\0';
     return (forge_string_t){ .data = buf, .len = 1 };
@@ -225,7 +311,7 @@ static inline int64_t forge_bit_shr(int64_t a, int64_t b) { return (int64_t)((ui
 static inline forge_string_t forge_string_replace(forge_string_t s, forge_string_t old, forge_string_t new_s) {
     if (old.len == 0) {
         // empty pattern — return a copy
-        char *buf = forge_str_alloc(s.len);
+        char *buf = forge_str_alloc_rc(s.len);
         memcpy(buf, s.data, (size_t)s.len);
         buf[s.len] = '\0';
         return (forge_string_t){ .data = buf, .len = s.len };
@@ -239,7 +325,7 @@ static inline forge_string_t forge_string_replace(forge_string_t s, forge_string
         }
     }
     if (count == 0) {
-        char *buf = forge_str_alloc(s.len);
+        char *buf = forge_str_alloc_rc(s.len);
         memcpy(buf, s.data, (size_t)s.len);
         buf[s.len] = '\0';
         return (forge_string_t){ .data = buf, .len = s.len };
@@ -256,7 +342,7 @@ static inline forge_string_t forge_string_replace(forge_string_t s, forge_string
         exit(1);
     }
     int64_t new_len = s.len + growth;
-    char *buf = forge_str_alloc(new_len);
+    char *buf = forge_str_alloc_rc(new_len);
     int64_t pos = 0;
     for (int64_t i = 0; i < s.len; ) {
         if (i + old.len <= s.len && memcmp(s.data + i, old.data, (size_t)old.len) == 0) {
@@ -362,7 +448,7 @@ static inline forge_string_t forge_string_pad_right(forge_string_t s, int64_t wi
 static inline forge_string_t forge_int_to_string(int64_t n) {
     char buf[32];
     int len = snprintf(buf, sizeof(buf), "%" PRId64, n);
-    char *result = forge_str_alloc(len);
+    char *result = forge_str_alloc_rc(len);
     memcpy(result, buf, (size_t)len + 1);
     return (forge_string_t){ .data = result, .len = len };
 }
@@ -370,7 +456,7 @@ static inline forge_string_t forge_int_to_string(int64_t n) {
 static inline forge_string_t forge_float_to_string(double n) {
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "%g", n);
-    char *result = forge_str_alloc(len);
+    char *result = forge_str_alloc_rc(len);
     memcpy(result, buf, (size_t)len + 1);
     return (forge_string_t){ .data = result, .len = len };
 }
@@ -1382,7 +1468,7 @@ static inline forge_string_t forge_random_string(int64_t n) {
     static const char alphanum[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     __forge_seed_rng();
     if (n < 0) n = 0;
-    char *buf = forge_str_alloc(n);
+    char *buf = forge_str_alloc_rc(n);
     for (int64_t i = 0; i < n; i++)
         buf[i] = alphanum[lrand48() % 62];
     buf[n] = '\0';
@@ -1397,7 +1483,7 @@ static inline forge_string_t forge_format_time(int64_t epoch_ms, forge_string_t 
     char buf[256];
     size_t len = strftime(buf, sizeof(buf), fmt_cstr, t);
     free(fmt_cstr);
-    char *result = forge_str_alloc((int64_t)len);
+    char *result = forge_str_alloc_rc((int64_t)len);
     memcpy(result, buf, len);
     result[len] = '\0';
     return (forge_string_t){ .data = result, .len = (int64_t)len };
@@ -1774,9 +1860,9 @@ static inline bool forge_tcp_read_impl(int64_t fd, int64_t max_bytes, forge_stri
         *out = forge_string_empty;
         return false;
     }
-    char *buf = forge_str_alloc(max_bytes);
+    char *buf = forge_str_alloc_rc(max_bytes);
     ssize_t n = read((int)fd, buf, (size_t)max_bytes);
-    if (n < 0) { free(buf); return false; }
+    if (n < 0) { free(FORGE_RC_HEADER(buf)); return false; }
     buf[n] = '\0';
     *out = (forge_string_t){ .data = buf, .len = (int64_t)n };
     return true;
@@ -1818,7 +1904,7 @@ static inline bool forge_dns_resolve_impl(forge_string_t hostname, forge_string_
     freeaddrinfo(res);
 
     int64_t len = (int64_t)strlen(ip_buf);
-    char *buf = forge_str_alloc(len);
+    char *buf = forge_str_alloc_rc(len);
     memcpy(buf, ip_buf, (size_t)len);
     buf[len] = '\0';
     *out = (forge_string_t){ .data = buf, .len = len };

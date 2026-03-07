@@ -13,41 +13,41 @@
 pub struct Token:
     pub kind: String
     pub value: String
-    pub line: Int
-    pub col: Int
+    pub current_line: Int
+    pub current_column: Int
 
 # ---------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------
 
-fn is_alpha(c: String) -> Bool:
-    if c >= "a":
-        if c <= "z":
+fn is_alpha(character: String) -> Bool:
+    if character >= "a":
+        if character <= "z":
             return true
-    if c >= "A":
-        if c <= "Z":
+    if character >= "A":
+        if character <= "Z":
             return true
-    if c == "_":
+    if character == "_":
         return true
     return false
 
-fn is_digit(c: String) -> Bool:
-    if c >= "0":
-        if c <= "9":
+fn is_digit(character: String) -> Bool:
+    if character >= "0":
+        if character <= "9":
             return true
     return false
 
-fn is_alnum(c: String) -> Bool:
-    return is_alpha(c) or is_digit(c)
+fn is_alnum(character: String) -> Bool:
+    return is_alpha(character) or is_digit(character)
 
-fn is_hex_digit(c: String) -> Bool:
-    if is_digit(c):
+fn is_hex_digit(character: String) -> Bool:
+    if is_digit(character):
         return true
-    if c >= "a":
-        if c <= "f":
+    if character >= "a":
+        if character <= "f":
             return true
-    if c >= "A":
-        if c <= "F":
+    if character >= "A":
+        if character <= "F":
             return true
     return false
 
@@ -211,9 +211,9 @@ mut RBRACE := ""
 
 # global mutable state — the lexer modifies these as it scans
 mut source := ""
-mut pos := 0
-mut line := 1
-mut col := 0
+mut current_position := 0
+mut current_line := 1
+mut current_column := 0
 mut at_line_start := true
 mut done := false
 
@@ -222,66 +222,66 @@ mut indent_stack: List[Int] := [0]
 mut pending_dedents := 0
 
 # pending tokens from string interpolation
-mut pending_kinds: List[String] := []
-mut pending_values: List[String] := []
-mut pending_lines: List[Int] := []
-mut pending_cols: List[Int] := []
+mut pending_token_kinds: List[String] := []
+mut pending_token_values: List[String] := []
+mut pending_token_lines: List[Int] := []
+mut pending_token_columns: List[Int] := []
 
 # ---------------------------------------------------------------
 # lexer core
 # ---------------------------------------------------------------
 
 fn peek() -> String:
-    if pos >= source.len():
+    if current_position >= source.len():
         return ""
-    return source[pos]
+    return source[current_position]
 
 fn advance() -> String:
-    c := source[pos]
-    pos = pos + 1
-    col = col + 1
-    # Track line and column position
-    if c == "\n":
-        line = line + 1
-        col = 0
+    character := source[current_position]
+    current_position = current_position + 1
+    current_column = current_column + 1
+    # Track current_line and column position
+    if character == "\n":
+        current_line = current_line + 1
+        current_column = 0
     else:
-        col = col + 1
-    return c
+        current_column = current_column + 1
+    return character
 
 fn is_blank_line() -> Bool:
-    mut i := pos
+    mut i := current_position
     while i < source.len():
-        c := source[i]
-        if c == "\n":
+        character := source[i]
+        if character == "\n":
             return true
-        if c == "#":
+        if character == "#":
             return true
-        if c != " ":
-            if c != "\t":
+        if character != " ":
+            if character != "\t":
                 return false
         i = i + 1
     return true
 
 fn skip_to_next_line():
-    while pos < source.len():
-        c := source[pos]
-        pos = pos + 1
-        if c == "\n":
-            line = line + 1
-            col = 0
+    while current_position < source.len():
+        character := source[current_position]
+        current_position = current_position + 1
+        if character == "\n":
+            current_line = current_line + 1
+            current_column = 0
             return
         else:
-            col = col + 1
+            current_column = current_column + 1
 
 fn measure_indent() -> Int:
     mut level := 0
-    mut i := pos
+    mut i := current_position
     while i < source.len():
-        c := source[i]
-        if c == " ":
+        character := source[i]
+        if character == " ":
             level = level + 1
             i = i + 1
-        elif c == "\t":
+        elif character == "\t":
             level = level + 1
             i = i + 1
         else:
@@ -289,25 +289,25 @@ fn measure_indent() -> Int:
     return level
 
 fn skip_spaces():
-    while pos < source.len():
-        if source[pos] == " ":
-            pos = pos + 1
-            col = col + 1
+    while current_position < source.len():
+        if source[current_position] == " ":
+            current_position = current_position + 1
+            current_column = current_column + 1
         else:
             return
 
 # the main lexer function. returns (kind, value) by setting globals.
-# callers should read tok_kind, tok_value, tok_line, tok_col after calling.
-mut tok_kind := ""
-mut tok_value := ""
-mut tok_line := 0
-mut tok_col := 0
+# callers should read current_token_kind, current_token_value, current_token_line, current_token_column after calling.
+mut current_token_kind := ""
+mut current_token_value := ""
+mut current_token_line := 0
+mut current_token_column := 0
 
 fn emit(kind: String, value: String):
-    tok_kind = kind
-    tok_value = value
-    tok_line = line
-    tok_col = col
+    current_token_kind = kind
+    current_token_value = value
+    current_token_line = current_line
+    current_token_column = current_column
 
 fn next_token():
     # step 1: drain pending dedents
@@ -317,16 +317,16 @@ fn next_token():
         return
 
     # step 2: drain pending interpolation tokens
-    if pending_kinds.len() > 0:
-        k := pending_kinds[0]
-        v := pending_values[0]
-        pending_kinds.remove(0)
-        pending_values.remove(0)
-        emit(k, v)
+    if pending_token_kinds.len() > 0:
+        kind := pending_token_kinds[0]
+        value := pending_token_values[0]
+        pending_token_kinds.remove(0)
+        pending_token_values.remove(0)
+        emit(kind, value)
         return
 
     # step 3: handle EOF
-    if pos >= source.len():
+    if current_position >= source.len():
         if not done:
             if indent_stack.len() > 1:
                 remaining := indent_stack.len() - 1
@@ -341,7 +341,7 @@ fn next_token():
         emit("eof", "")
         return
 
-    # step 4: handle indentation at start of line
+    # step 4: handle indentation at start of current_line
     if at_line_start:
         at_line_start = false
 
@@ -378,46 +378,46 @@ fn next_token():
     skip_spaces()
 
     # step 6: re-check EOF after skipping spaces
-    if pos >= source.len():
+    if current_position >= source.len():
         next_token()
         return
 
-    c := peek()
+    character := peek()
 
     # step 7: dispatch on character
 
     # newline
-    if c == "\n":
-        pos = pos + 1
-        line = line + 1
-        col = 0
+    if character == "\n":
+        current_position = current_position + 1
+        current_line = current_line + 1
+        current_column = 0
         at_line_start = true
         emit("newline", "")
         return
 
     # comment
-    if c == "#":
-        start := pos
-        while pos < source.len():
-            if source[pos] == "\n":
+    if character == "#":
+        start := current_position
+        while current_position < source.len():
+            if source[current_position] == "\n":
                 break
-            pos = pos + 1
-            col = col + 1
-        emit("comment", source.substring(start, pos))
+            current_position = current_position + 1
+            current_column = current_column + 1
+        emit("comment", source.substring(start, current_position))
         return
 
     # string
-    if c == "\"":
+    if character == "\"":
         scan_string()
         return
 
     # number
-    if is_digit(c):
+    if is_digit(character):
         scan_number()
         return
 
     # identifier or keyword
-    if is_alpha(c):
+    if is_alpha(character):
         scan_identifier()
         return
 
@@ -425,14 +425,14 @@ fn next_token():
     scan_operator()
 
 fn scan_identifier():
-    start := pos
-    while pos < source.len():
-        if is_alnum(source[pos]):
-            pos = pos + 1
-            col = col + 1
+    start := current_position
+    while current_position < source.len():
+        if is_alnum(source[current_position]):
+            current_position = current_position + 1
+            current_column = current_column + 1
         else:
             break
-    word := source.substring(start, pos)
+    word := source.substring(start, current_position)
 
     # check for lone underscore
     if word == "_":
@@ -446,396 +446,396 @@ fn scan_identifier():
         emit("identifier", word)
 
 fn scan_number():
-    start := pos
+    start := current_position
 
     # check for hex, binary, octal prefixes
-    if source[pos] == "0":
-        if pos + 1 < source.len():
-            next_c := source[pos + 1]
-            if next_c == "x" or next_c == "X":
-                pos = pos + 2
-                col = col + 2
-                while pos < source.len():
-                    ch := source[pos]
-                    if is_hex_digit(ch) or ch == "_":
-                        pos = pos + 1
-                        col = col + 1
+    if source[current_position] == "0":
+        if current_position + 1 < source.len():
+            next_char := source[current_position + 1]
+            if next_char == "x" or next_char == "X":
+                current_position = current_position + 2
+                current_column = current_column + 2
+                while current_position < source.len():
+                    current_char := source[current_position]
+                    if is_hex_digit(current_char) or current_char == "_":
+                        current_position = current_position + 1
+                        current_column = current_column + 1
                     else:
                         break
-                emit("int_lit", source.substring(start, pos))
+                emit("int_lit", source.substring(start, current_position))
                 return
-            if next_c == "b" or next_c == "B":
-                pos = pos + 2
-                col = col + 2
-                while pos < source.len():
-                    ch := source[pos]
-                    if ch == "0" or ch == "1" or ch == "_":
-                        pos = pos + 1
-                        col = col + 1
+            if next_char == "b" or next_char == "B":
+                current_position = current_position + 2
+                current_column = current_column + 2
+                while current_position < source.len():
+                    current_char := source[current_position]
+                    if current_char == "0" or current_char == "1" or current_char == "_":
+                        current_position = current_position + 1
+                        current_column = current_column + 1
                     else:
                         break
-                emit("int_lit", source.substring(start, pos))
+                emit("int_lit", source.substring(start, current_position))
                 return
-            if next_c == "o" or next_c == "O":
-                pos = pos + 2
-                col = col + 2
-                while pos < source.len():
-                    ch := source[pos]
-                    if ch >= "0":
-                        if ch <= "7":
-                            pos = pos + 1
-                            col = col + 1
+            if next_char == "o" or next_char == "O":
+                current_position = current_position + 2
+                current_column = current_column + 2
+                while current_position < source.len():
+                    current_char := source[current_position]
+                    if current_char >= "0":
+                        if current_char <= "7":
+                            current_position = current_position + 1
+                            current_column = current_column + 1
                             continue
-                    if ch == "_":
-                        pos = pos + 1
-                        col = col + 1
+                    if current_char == "_":
+                        current_position = current_position + 1
+                        current_column = current_column + 1
                         continue
                     break
-                emit("int_lit", source.substring(start, pos))
+                emit("int_lit", source.substring(start, current_position))
                 return
 
     # decimal digits
-    while pos < source.len():
-        ch := source[pos]
-        if is_digit(ch) or ch == "_":
-            pos = pos + 1
-            col = col + 1
+    while current_position < source.len():
+        current_char := source[current_position]
+        if is_digit(current_char) or current_char == "_":
+            current_position = current_position + 1
+            current_column = current_column + 1
         else:
             break
 
     # check for decimal point (must be followed by a digit)
     mut is_float := false
-    if pos < source.len():
-        if source[pos] == ".":
-            if pos + 1 < source.len():
-                if is_digit(source[pos + 1]):
+    if current_position < source.len():
+        if source[current_position] == ".":
+            if current_position + 1 < source.len():
+                if is_digit(source[current_position + 1]):
                     is_float = true
-                    pos = pos + 1
-                    col = col + 1
-                    while pos < source.len():
-                        ch := source[pos]
-                        if is_digit(ch) or ch == "_":
-                            pos = pos + 1
-                            col = col + 1
+                    current_position = current_position + 1
+                    current_column = current_column + 1
+                    while current_position < source.len():
+                        current_char := source[current_position]
+                        if is_digit(current_char) or current_char == "_":
+                            current_position = current_position + 1
+                            current_column = current_column + 1
                         else:
                             break
 
     # check for exponent
-    if pos < source.len():
-        ec := source[pos]
-        if ec == "e" or ec == "E":
+    if current_position < source.len():
+        exp_char := source[current_position]
+        if exp_char == "e" or exp_char == "E":
             is_float = true
-            pos = pos + 1
-            col = col + 1
-            if pos < source.len():
-                sc := source[pos]
-                if sc == "+" or sc == "-":
-                    pos = pos + 1
-                    col = col + 1
-            while pos < source.len():
-                ch := source[pos]
-                if is_digit(ch) or ch == "_":
-                    pos = pos + 1
-                    col = col + 1
+            current_position = current_position + 1
+            current_column = current_column + 1
+            if current_position < source.len():
+                scan_char := source[current_position]
+                if scan_char == "+" or scan_char == "-":
+                    current_position = current_position + 1
+                    current_column = current_column + 1
+            while current_position < source.len():
+                current_char := source[current_position]
+                if is_digit(current_char) or current_char == "_":
+                    current_position = current_position + 1
+                    current_column = current_column + 1
                 else:
                     break
 
     if is_float:
-        emit("float_lit", source.substring(start, pos))
+        emit("float_lit", source.substring(start, current_position))
     else:
-        emit("int_lit", source.substring(start, pos))
+        emit("int_lit", source.substring(start, current_position))
 
 fn scan_string():
-    start := pos
-    pos = pos + 1
-    col = col + 1
+    start := current_position
+    current_position = current_position + 1
+    current_column = current_column + 1
 
     # check for interpolation by peeking ahead
-    mut has_interp := false
-    mut i := pos
+    mut has_interpolation := false
+    mut i := current_position
     while i < source.len():
-        sc := source[i]
-        if sc == "\\":
+        scan_char := source[i]
+        if scan_char == "\\":
             i = i + 2
             continue
-        if sc == LBRACE:
-            has_interp = true
+        if scan_char == LBRACE:
+            has_interpolation = true
             break
-        if sc == "\"" or sc == "\n":
+        if scan_char == "\"" or scan_char == "\n":
             break
         i = i + 1
 
-    if not has_interp:
+    if not has_interpolation:
         # simple string
-        while pos < source.len():
-            sc := source[pos]
-            if sc == "\\":
-                if pos + 1 >= source.len():
+        while current_position < source.len():
+            scan_char := source[current_position]
+            if scan_char == "\\":
+                if current_position + 1 >= source.len():
                     emit("err", "unterminated escape sequence")
                     return
-                pos = pos + 2
-                col = col + 2
+                current_position = current_position + 2
+                current_column = current_column + 2
                 continue
-            if sc == "\"":
-                pos = pos + 1
-                col = col + 1
-                emit("string_lit", source.substring(start, pos))
+            if scan_char == "\"":
+                current_position = current_position + 1
+                current_column = current_column + 1
+                emit("string_lit", source.substring(start, current_position))
                 return
-            if sc == "\n":
+            if scan_char == "\n":
                 emit("err", "newline in string literal")
                 return
-            pos = pos + 1
-            col = col + 1
+            current_position = current_position + 1
+            current_column = current_column + 1
         emit("err", "unterminated string literal")
         return
 
     # interpolated string — scan to first {
-    while pos < source.len():
-        sc := source[pos]
-        if sc == "\\":
-            if pos + 1 >= source.len():
+    while current_position < source.len():
+        scan_char := source[current_position]
+        if scan_char == "\\":
+            if current_position + 1 >= source.len():
                 emit("err", "unterminated escape sequence in string interpolation")
                 return
-            pos = pos + 2
-            col = col + 2
+            current_position = current_position + 2
+            current_column = current_column + 2
             continue
-        if sc == LBRACE:
+        if scan_char == LBRACE:
             break
-        if sc == "\"" or sc == "\n":
+        if scan_char == "\"" or scan_char == "\n":
             break
-        pos = pos + 1
-        col = col + 1
+        current_position = current_position + 1
+        current_column = current_column + 1
 
     # emit string_start (from opening " to the {)
-    string_start_val := source.substring(start, pos)
+    string_start_value := source.substring(start, current_position)
 
     # now scan interpolation parts into pending tokens
     scan_interpolation_parts()
 
-    emit("string_start", string_start_val)
+    emit("string_start", string_start_value)
 
 fn scan_interpolation_parts():
-    while pos < source.len():
-        if source[pos] != LBRACE:
+    while current_position < source.len():
+        if source[current_position] != LBRACE:
             return
 
         # skip the {
-        pos = pos + 1
-        col = col + 1
+        current_position = current_position + 1
+        current_column = current_column + 1
 
         # scan expression inside {}
-        mut depth := 1
-        expr_start := pos
-        while pos < source.len():
-            ic := source[pos]
-            if ic == LBRACE:
-                depth = depth + 1
-                pos = pos + 1
-                col = col + 1
-            elif ic == RBRACE:
-                depth = depth - 1
-                if depth == 0:
+        mut brace_depth := 1
+        expression_start := current_position
+        while current_position < source.len():
+            input_char := source[current_position]
+            if input_char == LBRACE:
+                brace_depth = brace_depth + 1
+                current_position = current_position + 1
+                current_column = current_column + 1
+            elif input_char == RBRACE:
+                brace_depth = brace_depth - 1
+                if brace_depth == 0:
                     break
-                pos = pos + 1
-                col = col + 1
+                current_position = current_position + 1
+                current_column = current_column + 1
             else:
-                pos = pos + 1
-                col = col + 1
+                current_position = current_position + 1
+                current_column = current_column + 1
 
-        expr_text := source.substring(expr_start, pos)
+        expr_text := source.substring(expression_start, current_position)
         if expr_text.len() > 0:
-            pending_kinds.push("interpolation_expr")
-            pending_values.push(expr_text)
+            pending_token_kinds.push("interpolation_expr")
+            pending_token_values.push(expr_text)
 
-        if pos >= source.len():
+        if current_position >= source.len():
             return
 
         # skip the }
-        pos = pos + 1
-        col = col + 1
+        current_position = current_position + 1
+        current_column = current_column + 1
 
         # scan string content after the }
-        mid_start := pos
-        while pos < source.len():
-            sc := source[pos]
-            if sc == "\\":
-                if pos + 1 >= source.len():
+        middle_start := current_position
+        while current_position < source.len():
+            scan_char := source[current_position]
+            if scan_char == "\\":
+                if current_position + 1 >= source.len():
                     return
-                pos = pos + 2
-                col = col + 2
+                current_position = current_position + 2
+                current_column = current_column + 2
                 continue
-            if sc == LBRACE:
+            if scan_char == LBRACE:
                 break
-            if sc == "\"" or sc == "\n":
+            if scan_char == "\"" or scan_char == "\n":
                 break
-            pos = pos + 1
-            col = col + 1
+            current_position = current_position + 1
+            current_column = current_column + 1
 
-        if pos >= source.len():
+        if current_position >= source.len():
             return
 
-        if source[pos] == "\"":
-            pos = pos + 1
-            col = col + 1
-            pending_kinds.push("string_end")
-            pending_values.push(source.substring(mid_start, pos))
+        if source[current_position] == "\"":
+            current_position = current_position + 1
+            current_column = current_column + 1
+            pending_token_kinds.push("string_end")
+            pending_token_values.push(source.substring(middle_start, current_position))
             return
 
-        if source[pos] == "\n":
+        if source[current_position] == "\n":
             return
 
         # another { — emit string_mid and continue
-        pending_kinds.push("string_mid")
-        pending_values.push(source.substring(mid_start, pos))
+        pending_token_kinds.push("string_mid")
+        pending_token_values.push(source.substring(middle_start, current_position))
 
 fn scan_operator():
-    c := advance()
+    character := advance()
 
-    if c == "+":
-        if pos < source.len():
-            if source[pos] == "=":
-                pos = pos + 1
-                col = col + 1
+    if character == "+":
+        if current_position < source.len():
+            if source[current_position] == "=":
+                current_position = current_position + 1
+                current_column = current_column + 1
                 emit("plus_eq", "+=")
                 return
         emit("plus", "+")
         return
 
-    if c == "-":
-        if pos < source.len():
-            if source[pos] == ">":
-                pos = pos + 1
-                col = col + 1
+    if character == "-":
+        if current_position < source.len():
+            if source[current_position] == ">":
+                current_position = current_position + 1
+                current_column = current_column + 1
                 emit("arrow", "->")
                 return
-            if source[pos] == "=":
-                pos = pos + 1
-                col = col + 1
+            if source[current_position] == "=":
+                current_position = current_position + 1
+                current_column = current_column + 1
                 emit("minus_eq", "-=")
                 return
         emit("minus", "-")
         return
 
-    if c == "*":
-        if pos < source.len():
-            if source[pos] == "=":
-                pos = pos + 1
-                col = col + 1
+    if character == "*":
+        if current_position < source.len():
+            if source[current_position] == "=":
+                current_position = current_position + 1
+                current_column = current_column + 1
                 emit("star_eq", "*=")
                 return
         emit("star", "*")
         return
 
-    if c == "/":
-        if pos < source.len():
-            if source[pos] == "=":
-                pos = pos + 1
-                col = col + 1
+    if character == "/":
+        if current_position < source.len():
+            if source[current_position] == "=":
+                current_position = current_position + 1
+                current_column = current_column + 1
                 emit("slash_eq", "/=")
                 return
         emit("slash", "/")
         return
 
-    if c == "%":
+    if character == "%":
         emit("percent", "%")
         return
 
-    if c == "=":
-        if pos < source.len():
-            if source[pos] == "=":
-                pos = pos + 1
-                col = col + 1
+    if character == "=":
+        if current_position < source.len():
+            if source[current_position] == "=":
+                current_position = current_position + 1
+                current_column = current_column + 1
                 emit("eq_eq", "==")
                 return
-            if source[pos] == ">":
-                pos = pos + 1
-                col = col + 1
+            if source[current_position] == ">":
+                current_position = current_position + 1
+                current_column = current_column + 1
                 emit("fat_arrow", "=>")
                 return
         emit("eq", "=")
         return
 
-    if c == "!":
-        if pos < source.len():
-            if source[pos] == "=":
-                pos = pos + 1
-                col = col + 1
+    if character == "!":
+        if current_position < source.len():
+            if source[current_position] == "=":
+                current_position = current_position + 1
+                current_column = current_column + 1
                 emit("bang_eq", "!=")
                 return
         emit("bang", "!")
         return
 
-    if c == "<":
-        if pos < source.len():
-            if source[pos] == "=":
-                pos = pos + 1
-                col = col + 1
+    if character == "<":
+        if current_position < source.len():
+            if source[current_position] == "=":
+                current_position = current_position + 1
+                current_column = current_column + 1
                 emit("less_eq", "<=")
                 return
         emit("less", "<")
         return
 
-    if c == ">":
-        if pos < source.len():
-            if source[pos] == "=":
-                pos = pos + 1
-                col = col + 1
+    if character == ">":
+        if current_position < source.len():
+            if source[current_position] == "=":
+                current_position = current_position + 1
+                current_column = current_column + 1
                 emit("greater_eq", ">=")
                 return
         emit("greater", ">")
         return
 
-    if c == ":":
-        if pos < source.len():
-            if source[pos] == "=":
-                pos = pos + 1
-                col = col + 1
+    if character == ":":
+        if current_position < source.len():
+            if source[current_position] == "=":
+                current_position = current_position + 1
+                current_column = current_column + 1
                 emit("colon_eq", ":=")
                 return
         emit("colon", ":")
         return
 
-    if c == "?":
+    if character == "?":
         emit("question", "?")
         return
 
-    if c == ".":
+    if character == ".":
         emit("dot", ".")
         return
 
-    if c == ",":
+    if character == ",":
         emit("comma", ",")
         return
 
-    if c == "(":
+    if character == "(":
         emit("lparen", "(")
         return
 
-    if c == ")":
+    if character == ")":
         emit("rparen", ")")
         return
 
-    if c == "[":
+    if character == "[":
         emit("lbracket", "[")
         return
 
-    if c == "]":
+    if character == "]":
         emit("rbracket", "]")
         return
 
-    if c == LBRACE:
+    if character == LBRACE:
         emit("lbrace", LBRACE)
         return
 
-    if c == RBRACE:
+    if character == RBRACE:
         emit("rbrace", RBRACE)
         return
 
-    if c == "|":
+    if character == "|":
         emit("pipe", "|")
         return
 
-    emit("err", c)
+    emit("err", character)
 
 # ---------------------------------------------------------------
 # public api for module use
@@ -846,16 +846,16 @@ pub fn init_lexer(src: String):
     LBRACE = chr(123)
     RBRACE = chr(125)
     source = src
-    pos = 0
-    line = 1
-    col = 0
+    current_position = 0
+    current_line = 1
+    current_column = 0
     at_line_start = true
     done = false
     indent_stack = [0]
-    pending_kinds = []
-    pending_values = []
-    pending_lines = []
-    pending_cols = []
+    pending_token_kinds = []
+    pending_token_values = []
+    pending_token_lines = []
+    pending_token_columns = []
     pending_dedents = 0
 
 pub fn lex_all(src: String) -> List[Token]:
@@ -863,8 +863,8 @@ pub fn lex_all(src: String) -> List[Token]:
     mut tokens: List[Token] := []
     while true:
         next_token()
-        tokens.push(Token(tok_kind, tok_value, tok_line, tok_col))
-        if tok_kind == "eof":
+        tokens.push(Token(current_token_kind, current_token_value, current_token_line, current_token_column))
+        if current_token_kind == "eof":
             break
     return tokens
 
@@ -877,40 +877,40 @@ fn run() -> String!:
     LBRACE = chr(123)
     RBRACE = chr(125)
 
-    a := args()
-    if a.len() < 2:
+    cli_args := args()
+    if cli_args.len() < 2:
         print("usage: forge run self-host/lexer.fg <file.fg>")
         exit(1)
 
-    path := a[1]
+    path := cli_args[1]
     content := read_file(path)!
 
     source = content
-    pos = 0
+    current_position = 0
     at_line_start = true
     done = false
     indent_stack = [0]
-    pending_kinds = []
-    pending_values = []
+    pending_token_kinds = []
+    pending_token_values = []
     pending_dedents = 0
 
     while true:
         next_token()
 
-        if tok_kind == "newline":
-            print("{pad16(tok_kind)}  \\n")
-        elif tok_kind == "indent":
-            print("{pad16(tok_kind)}  >>>")
-        elif tok_kind == "dedent":
-            print("{pad16(tok_kind)}  <<<")
-        elif tok_kind == "eof":
-            print("{pad16(tok_kind)}  <eof>")
+        if current_token_kind == "newline":
+            print("{pad16(current_token_kind)}  \\n")
+        elif current_token_kind == "indent":
+            print("{pad16(current_token_kind)}  >>>")
+        elif current_token_kind == "dedent":
+            print("{pad16(current_token_kind)}  <<<")
+        elif current_token_kind == "eof":
+            print("{pad16(current_token_kind)}  <eof>")
             break
         else:
-            if tok_value.len() > 0:
-                print("{pad16(tok_kind)}  {tok_value}")
+            if current_token_value.len() > 0:
+                print("{pad16(current_token_kind)}  {current_token_value}")
             else:
-                print("{pad16(tok_kind)}")
+                print("{pad16(current_token_kind)}")
 
     return ""
 

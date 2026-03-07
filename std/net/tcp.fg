@@ -1,33 +1,51 @@
 # std.net.tcp — TCP networking
 #
-# all I/O is blocking. use spawn for concurrency.
-# connections are represented as plain Int file descriptors.
+# TCP client and server functionality. All I/O is blocking — use spawn for concurrency.
+# Connections are represented as plain Int file descriptors.
 #
 #   from std.net.tcp import connect, read, write, close
 #   fd := connect("127.0.0.1", 8080)!
 #   write(fd, "hello")!
+#   data := read(fd, 1024)!
 #   close(fd)
 
-# connect to a TCP server. returns a file descriptor.
+# ===============================================================
+# Client Operations
+# ===============================================================
+
+# Connects to a TCP server at the specified host and port.
+# Returns a file descriptor or fails if connection fails.
 pub fn connect(host: String, port: Int) -> Int!:
     return tcp_connect(host, port)
 
-# start a TCP server listening on host:port. returns a server fd.
+# ===============================================================
+# Server Operations
+# ===============================================================
+
+# Starts a TCP server listening on the specified host and port.
+# Returns a server file descriptor or fails if bind fails.
 pub fn listen(host: String, port: Int) -> Int!:
     return tcp_listen(host, port)
 
-# accept a connection on a server fd. returns a client fd.
+# Accepts an incoming connection on a server file descriptor.
+# Blocks until a client connects. Returns a client file descriptor.
 pub fn accept(server_fd: Int) -> Int!:
     return tcp_accept(server_fd)
 
-# read up to max_bytes from a connection.
+# ===============================================================
+# Connection I/O
+# ===============================================================
+
+# Reads up to max_bytes from a connection.
+# Returns the data read or fails on error (e.g., connection closed).
 pub fn read(fd: Int, max_bytes: Int) -> String!:
     return tcp_read(fd, max_bytes)
 
-# write data to a connection. returns bytes written.
+# Writes data to a connection.
+# Returns the number of bytes written or fails on error.
 pub fn write(fd: Int, data: String) -> Int!:
     return tcp_write(fd, data)
 
-# close a connection.
+# Closes a TCP connection.
 pub fn close(fd: Int):
     tcp_close(fd)

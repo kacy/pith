@@ -1433,8 +1433,12 @@ fn g_emit_binding(node_idx: Int):
         g_write("/* unknown */")
     g_write(" ")
     g_write(name)
-    g_write(" = ")
-    g_emit_expr(value_idx)
+    # Only emit " = " and value if there's an actual initialization expression
+    if value_idx >= 0:
+        val_node := get_node(value_idx)
+        if val_node.kind != "none":
+            g_write(" = ")
+            g_emit_expr(value_idx)
     g_write(";\n")
 
 # extract binding name from "x" or "x mut"

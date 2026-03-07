@@ -1,14 +1,17 @@
 # std.json — JSON parser and encoder
 #
-# uses opaque Int handles into a node pool. call parse() to get a
-# handle, then use accessor functions to read values. use make_*
-# functions to build JSON and encode() to serialize.
+# Parse JSON strings into a node tree, access values, and build/encode JSON.
+# Uses opaque Int handles into a node pool.
 #
 #   from std.json import parse, get_string, object_get, encode
 #   root := parse(data)
 #   name := get_string(object_get(root, "name"))
 
-# node pool — maps indexed by handle
+# ===============================================================
+# Node Pool
+# ===============================================================
+
+# Global node counter and type storage
 mut g_next: Int := 0
 mut g_types: Map[Int, String] := {}
 mut g_str_vals: Map[Int, String] := {}
@@ -16,17 +19,18 @@ mut g_int_vals: Map[Int, Int] := {}
 mut g_float_vals: Map[Int, Float] := {}
 mut g_bool_vals: Map[Int, Bool] := {}
 
-# object children — flat append-only lists, offsets/counts in maps
+# Object children: flat append-only storage with offset/count
 mut g_okeys: List[String] := []
-mut g_ovals: List[Int] := []
+mut g_ovals: List[Int] := {}
 mut g_ooff: Map[Int, Int] := {}
 mut g_ocnt: Map[Int, Int] := {}
 
-# array children — flat append-only list, offsets/counts in maps
+# Array children: flat append-only storage with offset/count
 mut g_aitems: List[Int] := []
 mut g_aoff: Map[Int, Int] := {}
 mut g_acnt: Map[Int, Int] := {}
 
+# Allocates a new node of the specified type and returns its handle
 fn j_alloc(kind: String) -> Int:
     idx := g_next
     g_next = g_next + 1
@@ -41,6 +45,7 @@ fn j_alloc(kind: String) -> Int:
     g_acnt.insert(idx, 0)
     return idx
 
+# Sets a key-value pair on an object node
 fn j_obj_set(handle: Int, key: String, val: Int):
     cnt := g_ocnt[handle]
     if cnt == 0:
@@ -49,6 +54,7 @@ fn j_obj_set(handle: Int, key: String, val: Int):
     g_ovals.push(val)
     g_ocnt.insert(handle, cnt + 1)
 
+# Appends a value to an array node
 fn j_arr_push(handle: Int, val: Int):
     cnt := g_acnt[handle]
     if cnt == 0:
@@ -56,20 +62,27 @@ fn j_arr_push(handle: Int, val: Int):
     g_aitems.push(val)
     g_acnt.insert(handle, cnt + 1)
 
-# parser state
+# ===============================================================
+# Parser (Internal)
+# ===============================================================
+
+# Parser state
 mut p_data: String := ""
 mut p_pos: Int := 0
 mut p_err: Bool := false
 
+# Returns character at position i or empty string if out of bounds
 fn p_at(i: Int) -> String:
     if i >= p_data.len():
         return ""
     return p_data[i]
 
+# Skips whitespace characters (space, tab, newline, carriage return)
 fn p_skip_ws():
     while p_pos < p_data.len() and (p_at(p_pos) == " " or p_at(p_pos) == chr(9) or p_at(p_pos) == chr(10) or p_at(p_pos) == chr(13)):
         p_pos = p_pos + 1
 
+# Parses an integer from a string manually (handles negative numbers)
 fn j_parse_int_manual(s: String) -> Int:
     mut val := 0
     mut neg := false
@@ -83,16 +96,16 @@ fn j_parse_int_manual(s: String) -> Int:
         c := s[i]
         if c >= "0" and c <= "9":
             digit := ord(c) - 48
-            # Overflow detection: check before multiplication
-            # INT64_MAX is approximately 9.2e18
+            # Overflow detection
             if val > 922337203685477580 / 10:
-                return 0  # Overflow - return 0 as sentinel
+                return 0  # Overflow sentinel
             val = val * 10 + digit
         i = i + 1
     if neg:
         return 0 - val
     return val
 
+# Parses a float from a string manually (handles decimal and negative)
 fn j_parse_float_manual(s: String) -> Float:
     mut int_part := 0
     mut frac_part := 0.0
@@ -120,6 +133,7 @@ fn j_parse_float_manual(s: String) -> Float:
         return 0.0 - result
     return result
 
+# Returns true if character is valid in a number (digit, dot, e, E, +, -)
 fn p_is_num_char(c: String) -> Bool:
     if c >= "0" and c <= "9":
         return true
@@ -127,6 +141,7 @@ fn p_is_num_char(c: String) -> Bool:
         return true
     return false
 
+# Parses a JSON string value (double-quoted)
 fn p_parse_string_raw() -> String:
     # skip opening quote
     p_pos = p_pos + 1
@@ -140,6 +155,7 @@ fn p_parse_string_raw() -> String:
         p_pos = p_pos + 1
     return val
 
+# Main recursive value parser - handles all JSON types
 fn p_parse_value() -> Int:
     p_skip_ws()
     if p_pos >= p_data.len():
@@ -250,9 +266,12 @@ fn p_parse_value() -> Int:
     p_err = true
     return 0 - 1
 
-# --- public API ---
+# ===============================================================
+# Public API — Parsing
+# ===============================================================
 
-# parse a JSON string. returns a handle, or -1 on error.
+# Parses a JSON string and returns a handle to the root node.
+# Returns -1 on parse error. Use type_of() to inspect the result.
 pub fn parse(input: String) -> Int:
     p_data = input
     p_pos = 0
@@ -270,13 +289,18 @@ pub fn parse(input: String) -> Int:
             return 0 - 1
     return result
 
-# return the type of a node: "null", "bool", "int", "float", "string", "array", or "object".
+# ===============================================================
+# Public API — Type and Value Accessors
+# ===============================================================
+
+# Returns the type of a node as a string: "null", "bool", "int", "float", 
+# "string", "array", or "object". Returns "invalid" for invalid handles.
 pub fn type_of(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return "invalid"
     return g_types[handle]
 
-# get a boolean value from a node.
+# Returns the boolean value from a node. Returns false if not a boolean.
 pub fn get_bool(handle: Int) -> Bool:
     if handle < 0 or handle >= g_next:
         return false
@@ -284,7 +308,7 @@ pub fn get_bool(handle: Int) -> Bool:
         return false
     return g_bool_vals[handle]
 
-# get an integer value from a node.
+# Returns the integer value from a node. Returns 0 if not an integer.
 pub fn get_int(handle: Int) -> Int:
     if handle < 0 or handle >= g_next:
         return 0
@@ -292,7 +316,7 @@ pub fn get_int(handle: Int) -> Int:
         return g_int_vals[handle]
     return 0
 
-# get a float value from a node.
+# Returns the float value from a node. Returns 0.0 if not a float.
 pub fn get_float(handle: Int) -> Float:
     if handle < 0 or handle >= g_next:
         return 0.0
@@ -300,7 +324,7 @@ pub fn get_float(handle: Int) -> Float:
         return g_float_vals[handle]
     return 0.0
 
-# get a string value from a node.
+# Returns the string value from a node. Returns empty string if not a string.
 pub fn get_string(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return ""
@@ -308,13 +332,17 @@ pub fn get_string(handle: Int) -> String:
         return ""
     return g_str_vals[handle]
 
-# return the number of elements in an array node.
+# ===============================================================
+# Public API — Array Operations
+# ===============================================================
+
+# Returns the number of elements in an array node. Returns 0 for non-arrays.
 pub fn array_len(handle: Int) -> Int:
     if handle < 0 or handle >= g_next:
         return 0
     return g_acnt[handle]
 
-# get the handle of an array element by index. returns -1 if out of bounds.
+# Returns the handle of an array element by index. Returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
     if handle < 0 or handle >= g_next:
         return 0 - 1
@@ -322,7 +350,12 @@ pub fn array_get(handle: Int, index: Int) -> Int:
         return 0 - 1
     return g_aitems[g_aoff[handle] + index]
 
-# get the handle of an object value by key. returns -1 if not found.
+# ===============================================================
+# Public API — Object Operations
+# ===============================================================
+
+# Returns the handle of an object value by key. Returns -1 if key not found.
+# Scans from end for latest value (handles duplicate keys).
 pub fn object_get(handle: Int, key: String) -> Int:
     if handle < 0 or handle >= g_next:
         return 0 - 1
@@ -336,11 +369,11 @@ pub fn object_get(handle: Int, key: String) -> Int:
         i = i - 1
     return 0 - 1
 
-# check if an object contains a key.
+# Returns true if an object contains the specified key.
 pub fn object_has(handle: Int, key: String) -> Bool:
     return object_get(handle, key) >= 0
 
-# return the list of keys in an object (deduplicated, insertion order).
+# Returns the list of keys in an object (deduplicated, insertion order).
 pub fn object_keys(handle: Int) -> List[String]:
     mut result: List[String] := []
     if handle < 0 or handle >= g_next:
@@ -361,54 +394,59 @@ pub fn object_keys(handle: Int) -> List[String]:
         i = i + 1
     return result
 
-# --- constructors ---
+# ===============================================================
+# Public API — Constructors
+# ===============================================================
 
-# create a JSON null node.
+# Creates a JSON null node.
 pub fn make_null() -> Int:
     return j_alloc("null")
 
-# create a JSON boolean node.
+# Creates a JSON boolean node with the given value.
 pub fn make_bool(val: Bool) -> Int:
     idx := j_alloc("bool")
     g_bool_vals.insert(idx, val)
     return idx
 
-# create a JSON integer node.
+# Creates a JSON integer node with the given value.
 pub fn make_int(val: Int) -> Int:
     idx := j_alloc("int")
     g_int_vals.insert(idx, val)
     return idx
 
-# create a JSON float node.
+# Creates a JSON float node with the given value.
 pub fn make_float(val: Float) -> Int:
     idx := j_alloc("float")
     g_float_vals.insert(idx, val)
     return idx
 
-# create a JSON string node.
+# Creates a JSON string node with the given value.
 pub fn make_string(val: String) -> Int:
     idx := j_alloc("string")
     g_str_vals.insert(idx, val)
     return idx
 
-# create an empty JSON array node.
+# Creates an empty JSON array node.
 pub fn make_array() -> Int:
     return j_alloc("array")
 
-# append a value to an array node.
+# Appends a value handle to an array node.
 pub fn array_push(arr: Int, val: Int):
     j_arr_push(arr, val)
 
-# create an empty JSON object node.
+# Creates an empty JSON object node.
 pub fn make_object() -> Int:
     return j_alloc("object")
 
-# set a key-value pair on an object node.
+# Sets a key-value pair on an object node (key is string, val is node handle).
 pub fn object_set(obj: Int, key: String, val: Int):
     j_obj_set(obj, key, val)
 
-# --- encoder ---
+# ===============================================================
+# Public API — Encoder
+# ===============================================================
 
+# Escapes special characters in a string for JSON encoding
 fn j_encode_string(s: String) -> String:
     mut result := chr(34)
     mut i := 0
@@ -430,7 +468,8 @@ fn j_encode_string(s: String) -> String:
     result = result + chr(34)
     return result
 
-# serialize a node tree to a JSON string.
+# Serializes a node tree to a JSON string.
+# Returns "null" for invalid handles.
 pub fn encode(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return "null"

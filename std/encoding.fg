@@ -1,12 +1,20 @@
 # std.encoding — base64 and hex encoding/decoding
 #
-# encode functions always succeed. decode functions return String!
+# Encode and decode data using base64 (RFC 4648) and hexadecimal representations.
+# Encoding functions always succeed. Decoding functions return Result types
 # because invalid input is an error.
 #
-#   from std.encoding import b64_encode, b64_decode
+#   from std.encoding import b64_encode, b64_decode, to_hex, from_hex
 #   encoded := b64_encode("hello world")
 #   decoded := b64_decode(encoded)!
+#   hex_str := to_hex("hello")  # "68656c6c6f"
 
+# ===============================================================
+# Base64 Encoding and Decoding
+# ===============================================================
+
+# Converts a base64 character to its 6-bit value (0-63).
+# Returns -1 for invalid characters.
 fn b64_char_val(c: String) -> Int:
     if c >= "A" and c <= "Z":
         return ord(c) - 65
@@ -20,7 +28,8 @@ fn b64_char_val(c: String) -> Int:
         return 63
     return 0 - 1
 
-# encode a string to base64 (RFC 4648).
+# Encodes a string to base64 (RFC 4648 standard alphabet).
+# Handles padding automatically for inputs not divisible by 3.
 pub fn b64_encode(input: String) -> String:
     table := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     mut result := ""
@@ -49,7 +58,8 @@ pub fn b64_encode(input: String) -> String:
         result = result + "="
     return result
 
-# decode a base64 string. fails on invalid input.
+# Decodes a base64 string back to the original data.
+# Fails if the input length is not a multiple of 4 or contains invalid characters.
 pub fn b64_decode(input: String) -> String!:
     if input.len() % 4 != 0:
         fail "invalid base64: length not multiple of 4"
@@ -72,6 +82,12 @@ pub fn b64_decode(input: String) -> String!:
         i = i + 4
     return result
 
+# ===============================================================
+# Hexadecimal Encoding and Decoding
+# ===============================================================
+
+# Converts a hex character to its 4-bit value (0-15).
+# Returns -1 for invalid characters.
 fn hex_nibble(c: String) -> Int:
     if c >= "0" and c <= "9":
         return ord(c) - 48
@@ -81,7 +97,8 @@ fn hex_nibble(c: String) -> Int:
         return ord(c) - 65 + 10
     return 0 - 1
 
-# encode a string as lowercase hex (two hex chars per byte).
+# Encodes a string as lowercase hexadecimal (two hex chars per byte).
+# Example: to_hex("hello") -> "68656c6c6f"
 pub fn to_hex(input: String) -> String:
     hex := "0123456789abcdef"
     mut result := ""
@@ -92,7 +109,8 @@ pub fn to_hex(input: String) -> String:
         i = i + 1
     return result
 
-# decode a hex string to bytes. fails on odd length or non-hex chars.
+# Decodes a hex string back to the original data.
+# Fails if the input has odd length or contains non-hex characters.
 pub fn from_hex(input: String) -> String!:
     if input.len() % 2 != 0:
         fail "invalid hex: odd length"

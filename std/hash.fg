@@ -1,24 +1,31 @@
-# std.hash — SHA-256 and FNV-1a hashing
+# std.hash — cryptographic and non-cryptographic hashing
 #
-# sha256 returns a 64-char lowercase hex string (FIPS 180-4).
-# fnv1a returns a 32-bit integer hash.
+# Provides SHA-256 (FIPS 180-4), SHA-1 (RFC 3174), and FNV-1a hash functions.
+# SHA-256 returns a 64-character lowercase hex string.
+# SHA-1 returns a 40-character lowercase hex string.
+# FNV-1a returns a 32-bit integer suitable for hash tables.
 #
 #   from std.hash import sha256, fnv1a
-#   digest := sha256("hello")
+#   digest := sha256("hello world")
 #   bucket := fnv1a("key") % 64
 
-# 32-bit mask for SHA-256
+# ===============================================================
+# SHA-256 Implementation (FIPS 180-4)
+# ===============================================================
+
+# 32-bit mask for SHA-256 word operations
 fn m(x: Int) -> Int:
     return bit_and(x, 4294967295)
 
-# 32-bit right-rotate
+# 32-bit right rotation for SHA-256
 fn rotr(x: Int, n: Int) -> Int:
     return m(bit_or(bit_shr(x, n), bit_shl(x, 32 - n)))
 
-# SHA-256 round constants (FIPS 180-4)
+# SHA-256 round constants (first 32 bits of fractional cube roots of first 64 primes)
 mut g_k: List[Int] := []
 mut g_k_ready: Bool := false
 
+# Lazy initialization of SHA-256 constants
 fn sha_init():
     if g_k_ready:
         return
@@ -88,6 +95,7 @@ fn sha_init():
     g_k.push(3204031479)
     g_k.push(3329325298)
 
+# Converts a 32-bit word to an 8-character hex string
 fn word32_to_hex(val: Int) -> String:
     hex := "0123456789abcdef"
     mut result := ""
@@ -98,11 +106,12 @@ fn word32_to_hex(val: Int) -> String:
         i = i + 1
     return result
 
-# compute SHA-256 hash of a string, returned as 64-char hex.
+# Computes SHA-256 hash of a string, returned as 64-char lowercase hex.
+# Implements FIPS 180-4 standard for cryptographic hashing.
 pub fn sha256(input: String) -> String:
     sha_init()
 
-    # initial hash values
+    # Initial hash values (first 32 bits of fractional square roots of first 8 primes)
     mut h0 := 1779033703
     mut h1 := 3144134277
     mut h2 := 1013904242
@@ -197,7 +206,12 @@ pub fn sha256(input: String) -> String:
     # produce 64-char hex string
     return word32_to_hex(h0) + word32_to_hex(h1) + word32_to_hex(h2) + word32_to_hex(h3) + word32_to_hex(h4) + word32_to_hex(h5) + word32_to_hex(h6) + word32_to_hex(h7)
 
-# compute FNV-1a hash (32-bit) of a string, returned as Int.
+# ===============================================================
+# FNV-1a Hash (32-bit)
+# ===============================================================
+
+# Computes FNV-1a hash (32-bit) of a string, returned as Int.
+# Fast, non-cryptographic hash suitable for hash tables and checksums.
 pub fn fnv1a(input: String) -> Int:
     mut h := 2166136261
     mut i := 0
@@ -207,26 +221,28 @@ pub fn fnv1a(input: String) -> Int:
         i = i + 1
     return h
 
-# ---------------------------------------------------------------
-# SHA-1 implementation (RFC 3174)
-# Required for WebSocket handshake
-# ---------------------------------------------------------------
+# ===============================================================
+# SHA-1 Implementation (RFC 3174)
+# ===============================================================
+# Note: SHA-1 is cryptographically broken. Provided for compatibility
+# with legacy protocols (e.g., WebSocket handshake).
 
-# SHA-1 constants
+# SHA-1 round constants
 K0 := 1518500249   # 0x5A827999 for rounds 0-19
 K1 := 1859775393   # 0x6ED9EBA1 for rounds 20-39
 K2 := 2400959708   # 0x8F1BBCDC for rounds 40-59
 K3 := 3395469782   # 0xCA62C1D6 for rounds 60-79
 
-# 32-bit left rotate
+# 32-bit left rotation
 fn rotl32(x: Int, n: Int) -> Int:
     return bit_or(bit_shl(x, n), bit_shr(x, 32 - n))
 
-# 32-bit safe add
+# 32-bit addition with overflow protection
 fn add32(a: Int, b: Int) -> Int:
     return bit_and(a + b, 4294967295)
 
-# compute SHA-1 hash of a string, returned as 40-char hex.
+# Computes SHA-1 hash of a string, returned as 40-char hex.
+# Legacy algorithm - prefer SHA-256 for new applications.
 pub fn sha1(input: String) -> String:
     # Initial hash values
     mut h0 := 1732584193   # 0x67452301

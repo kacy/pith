@@ -1,28 +1,37 @@
 # std.log — structured logging to stderr
 #
-# logs to stderr with timestamps in YYYY-MM-DD HH:MM:SS format.
-# four levels: info, warn, error, debug.
+# Provides timestamped log messages to stderr with four severity levels.
+# Timestamps are formatted as YYYY-MM-DD HH:MM:SS.
 #
 #   from std.log import info, error
 #   info("server started on port 8080")
 #   error("connection refused")
 
+# ===============================================================
+# Logging Functions
+# ===============================================================
+
+# Internal function to format and output a log line.
 fn log_line(level: String, msg: String):
     ts := format_time(time(), "%Y-%m-%d %H:%M:%S")
     print_err(ts + " [" + level + "] " + msg)
 
-# log an informational message.
+# Logs an informational message to stderr.
+# Use for general status updates and successful operations.
 pub fn info(msg: String):
     log_line("INFO", msg)
 
-# log a warning message.
+# Logs a warning message to stderr.
+# Use for potential issues that don't prevent operation.
 pub fn warn(msg: String):
     log_line("WARN", msg)
 
-# log an error message.
+# Logs an error message to stderr.
+# Use for failures and exceptional conditions.
 pub fn error(msg: String):
     log_line("ERROR", msg)
 
-# log a debug message.
+# Logs a debug message to stderr.
+# Use for detailed diagnostic information during development.
 pub fn debug(msg: String):
     log_line("DEBUG", msg)

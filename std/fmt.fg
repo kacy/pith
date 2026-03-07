@@ -1,13 +1,19 @@
 # std.fmt — number formatting utilities
 #
-# format integers as hex, octal, or binary strings.
-# format floats with a fixed number of decimal places.
+# Format integers as hexadecimal, octal, or binary strings.
+# Format floats with a fixed number of decimal places.
 #
-#   from std.fmt import hex, float_fixed
+#   from std.fmt import hex, bin, float_fixed
 #   hex(255)             # "ff"
-#   float_fixed(3.14, 2) # "3.14"
+#   bin(42)              # "101010"
+#   float_fixed(3.14159, 2)  # "3.14"
 
-# format an integer as lowercase hexadecimal.
+# ===============================================================
+# Integer Formatting
+# ===============================================================
+
+# Formats an integer as a lowercase hexadecimal string.
+# Example: hex(255) -> "ff", hex(0) -> "0", hex(-16) -> "-10"
 pub fn hex(n: Int) -> String:
     if n == 0:
         return "0"
@@ -21,7 +27,8 @@ pub fn hex(n: Int) -> String:
         val = val / 16
     return result
 
-# format an integer as octal.
+# Formats an integer as an octal string (base 8).
+# Example: oct(8) -> "10", oct(64) -> "100"
 pub fn oct(n: Int) -> String:
     if n == 0:
         return "0"
@@ -34,7 +41,8 @@ pub fn oct(n: Int) -> String:
         val = val / 8
     return result
 
-# format an integer as binary.
+# Formats an integer as a binary string (base 2).
+# Example: bin(5) -> "101", bin(255) -> "11111111"
 pub fn bin(n: Int) -> String:
     if n == 0:
         return "0"
@@ -47,6 +55,12 @@ pub fn bin(n: Int) -> String:
         val = val / 2
     return result
 
-# format a float with a fixed number of decimal places.
+# ===============================================================
+# Float Formatting
+# ===============================================================
+
+# Formats a float with a fixed number of decimal places.
+# Rounds to the specified precision.
+# Example: float_fixed(3.14159, 2) -> "3.14"
 pub fn float_fixed(n: Float, decimals: Int) -> String:
     return fmt_float(n, decimals)

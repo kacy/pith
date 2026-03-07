@@ -1,13 +1,21 @@
 # std.os.path — file path manipulation
 #
-# pure string operations — no filesystem access.
-# handles forward slashes only (unix paths).
+# Pure string operations for manipulating file paths — no filesystem access.
+# Handles forward slashes only (Unix-style paths).
 #
-#   from std.os.path import join, ext
-#   join("src", "main.fg")  # "src/main.fg"
-#   ext("main.fg")          # ".fg"
+#   from std.os.path import join, ext, base, dir
+#   join("src", "main.fg")     # "src/main.fg"
+#   ext("main.fg")            # ".fg"
+#   base("/home/user/file.txt")  # "file.txt"
+#   dir("/home/user/file.txt")   # "/home/user"
 
-# join two path segments with a slash.
+# ===============================================================
+# Path Joining
+# ===============================================================
+
+# Joins two path segments with a slash, handling edge cases.
+# Strips trailing slashes from the first segment and leading slashes from the second.
+# Returns the second segment if the first is empty, and vice versa.
 pub fn join(a: String, b: String) -> String:
     if a.len() == 0:
         return b
@@ -23,7 +31,12 @@ pub fn join(a: String, b: String) -> String:
         bstart = bstart + 1
     return a.substring(0, alen) + "/" + b.substring(bstart, b.len())
 
-# return the directory portion of a path.
+# ===============================================================
+# Path Components
+# ===============================================================
+
+# Returns the directory portion of a path (everything before the last slash).
+# Returns "/" for root paths, "." for paths with no directory.
 pub fn dir(path: String) -> String:
     mut i := path.len() - 1
     while i >= 0:
@@ -34,7 +47,8 @@ pub fn dir(path: String) -> String:
         i = i - 1
     return "."
 
-# return the last component of a path (filename).
+# Returns the last component of a path (the filename).
+# Returns the full path if no slashes are present.
 pub fn base(path: String) -> String:
     mut i := path.len() - 1
     while i >= 0:
@@ -43,7 +57,8 @@ pub fn base(path: String) -> String:
         i = i - 1
     return path
 
-# return the file extension including the dot, or "" if none.
+# Returns the file extension including the leading dot.
+# Returns empty string if no extension or if the path ends in a slash.
 pub fn ext(path: String) -> String:
     mut i := path.len() - 1
     while i >= 0:
@@ -54,7 +69,8 @@ pub fn ext(path: String) -> String:
         i = i - 1
     return ""
 
-# return the filename without extension.
+# Returns the filename without its extension.
+# Returns the full base name if no extension is found.
 pub fn stem(path: String) -> String:
     b := base(path)
     mut i := b.len() - 1

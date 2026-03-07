@@ -1,31 +1,44 @@
-# std.math — basic math functions
+# std.math — mathematical functions
 #
-# integer ops (abs, min, max, clamp) are pure forge.
-# float ops (pow, sqrt, floor, ceil, round) delegate to libc.
+# Basic mathematical operations including integer utilities (abs, min, max, clamp)
+# and floating-point operations (power, square root, rounding).
 #
-#   from std.math import clamp, sqrt
-#   val := clamp(x, 0, 100)
+# Integer operations are implemented in pure Forge.
+# Float operations delegate to the C math library.
+#
+#   from std.math import clamp, sqrt, pow
+#   bounded := clamp(x, 0, 100)
 #   root := sqrt(2.0)
+#   squared := pow(3.0, 2.0)  # 9.0
 
-# return the absolute value of x.
+# ===============================================================
+# Integer Operations
+# ===============================================================
+
+# Returns the absolute value of an integer.
+# Example: abs(-5) -> 5, abs(5) -> 5
 pub fn abs(x: Int) -> Int:
     if x < 0:
         return 0 - x
     return x
 
-# return the smaller of a and b.
+# Returns the smaller of two integers.
+# Example: min(3, 7) -> 3
 pub fn min(a: Int, b: Int) -> Int:
     if a < b:
         return a
     return b
 
-# return the larger of a and b.
+# Returns the larger of two integers.
+# Example: max(3, 7) -> 7
 pub fn max(a: Int, b: Int) -> Int:
     if a > b:
         return a
     return b
 
-# clamp x to the range [lo, hi].
+# Clamps an integer to the inclusive range [lo, hi].
+# Returns lo if x < lo, hi if x > hi, otherwise x.
+# Example: clamp(50, 0, 100) -> 50, clamp(150, 0, 100) -> 100
 pub fn clamp(x: Int, lo: Int, hi: Int) -> Int:
     if x < lo:
         return lo
@@ -33,22 +46,31 @@ pub fn clamp(x: Int, lo: Int, hi: Int) -> Int:
         return hi
     return x
 
-# raise base to the power of exp.
+# ===============================================================
+# Floating-Point Operations
+# ===============================================================
+
+# Raises a base to the power of an exponent.
+# Example: pow(2.0, 3.0) -> 8.0
 pub fn pow(base: Float, exp: Float) -> Float:
     return math_pow(base, exp)
 
-# return the square root of x.
+# Returns the square root of a number.
+# Example: sqrt(9.0) -> 3.0
 pub fn sqrt(x: Float) -> Float:
     return math_sqrt(x)
 
-# round x down to the nearest integer.
+# Rounds a float down to the nearest integer (floor).
+# Example: floor(3.7) -> 3, floor(-1.2) -> -2
 pub fn floor(x: Float) -> Int:
     return math_floor(x)
 
-# round x up to the nearest integer.
+# Rounds a float up to the nearest integer (ceiling).
+# Example: ceil(3.2) -> 4, ceil(-1.7) -> -1
 pub fn ceil(x: Float) -> Int:
     return math_ceil(x)
 
-# round x to the nearest integer.
+# Rounds a float to the nearest integer.
+# Example: round(3.5) -> 4, round(3.4) -> 3
 pub fn round(x: Float) -> Int:
     return math_round(x)

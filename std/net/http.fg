@@ -1,21 +1,49 @@
 # std.net.http — HTTP protocol utilities
 #
-# Simple HTTP constants and utilities.
+# HTTP constants and helper functions for building HTTP responses.
+# Useful for implementing simple HTTP servers.
+#
+#   from std.net.http import MIME_HTML, STATUS_OK, html_response
+#   response := html_response("<h1>Hello World</h1>")
 
+# ===============================================================
 # Content Type Constants
+# ===============================================================
+
+# Plain text content type
 pub MIME_TEXT := "text/plain"
+
+# HTML content type
 pub MIME_HTML := "text/html"
+
+# JSON content type
 pub MIME_JSON := "application/json"
+
+# JavaScript content type
 pub MIME_JS := "application/javascript"
+
+# CSS content type
 pub MIME_CSS := "text/css"
 
+# ===============================================================
 # HTTP Status Codes
+# ===============================================================
+
+# 200 OK - successful request
 pub STATUS_OK := 200
+
+# 404 Not Found - resource not found
 pub STATUS_NOT_FOUND := 404
+
+# 500 Internal Server Error - server error
 pub STATUS_SERVER_ERROR := 500
 
-# Build simple HTTP response
-# Usage: build_response(200, "text/html", "<h1>Hello</h1>")
+# ===============================================================
+# HTTP Response Builders
+# ===============================================================
+
+# Builds a complete HTTP response with status, content type, and body.
+# Automatically sets Content-Length header.
 pub fn build_response(status: Int, content_type: String, body: String) -> String:
     mut response := "HTTP/1.1 "
     response = response + status.to_string()
@@ -30,10 +58,10 @@ pub fn build_response(status: Int, content_type: String, body: String) -> String
     response = response + body
     return response
 
-# Simple HTTP 200 OK response with HTML
+# Builds a simple HTTP 200 OK response with HTML content.
 pub fn html_response(html: String) -> String:
     return build_response(200, MIME_HTML, html)
 
-# Simple HTTP 200 OK response with JSON
+# Builds a simple HTTP 200 OK response with JSON content.
 pub fn json_response(json: String) -> String:
     return build_response(200, MIME_JSON, json)

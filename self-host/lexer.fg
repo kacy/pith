@@ -238,7 +238,13 @@ fn peek() -> String:
 
 fn advance() -> String:
     c := source[pos]
-    pos = pos + 1
+    pos = pos + 1; col = col + 1
+    # Track line and column position
+    if c == "\n":
+        line = line + 1
+        col = 0
+    else:
+        col = col + 1
     return c
 
 fn is_blank_line() -> Bool:
@@ -260,7 +266,11 @@ fn skip_to_next_line():
         c := source[pos]
         pos = pos + 1
         if c == "\n":
+            line = line + 1
+            col = 0
             return
+        else:
+            col = col + 1
 
 fn measure_indent() -> Int:
     mut level := 0
@@ -280,7 +290,7 @@ fn measure_indent() -> Int:
 fn skip_spaces():
     while pos < source.len():
         if source[pos] == " ":
-            pos = pos + 1
+            pos = pos + 1; col = col + 1
         else:
             return
 
@@ -377,6 +387,8 @@ fn next_token():
     # newline
     if c == "\n":
         pos = pos + 1
+        line = line + 1
+        col = 0
         at_line_start = true
         emit("newline", "")
         return
@@ -387,7 +399,7 @@ fn next_token():
         while pos < source.len():
             if source[pos] == "\n":
                 break
-            pos = pos + 1
+            pos = pos + 1; col = col + 1
         emit("comment", source.substring(start, pos))
         return
 
@@ -413,7 +425,7 @@ fn scan_identifier():
     start := pos
     while pos < source.len():
         if is_alnum(source[pos]):
-            pos = pos + 1
+            pos = pos + 1; col = col + 1
         else:
             break
     word := source.substring(start, pos)
@@ -437,35 +449,35 @@ fn scan_number():
         if pos + 1 < source.len():
             next_c := source[pos + 1]
             if next_c == "x" or next_c == "X":
-                pos = pos + 2
+                pos = pos + 2; col = col + 2
                 while pos < source.len():
                     ch := source[pos]
                     if is_hex_digit(ch) or ch == "_":
-                        pos = pos + 1
+                        pos = pos + 1; col = col + 1
                     else:
                         break
                 emit("int_lit", source.substring(start, pos))
                 return
             if next_c == "b" or next_c == "B":
-                pos = pos + 2
+                pos = pos + 2; col = col + 2
                 while pos < source.len():
                     ch := source[pos]
                     if ch == "0" or ch == "1" or ch == "_":
-                        pos = pos + 1
+                        pos = pos + 1; col = col + 1
                     else:
                         break
                 emit("int_lit", source.substring(start, pos))
                 return
             if next_c == "o" or next_c == "O":
-                pos = pos + 2
+                pos = pos + 2; col = col + 2
                 while pos < source.len():
                     ch := source[pos]
                     if ch >= "0":
                         if ch <= "7":
-                            pos = pos + 1
+                            pos = pos + 1; col = col + 1
                             continue
                     if ch == "_":
-                        pos = pos + 1
+                        pos = pos + 1; col = col + 1
                         continue
                     break
                 emit("int_lit", source.substring(start, pos))
@@ -475,7 +487,7 @@ fn scan_number():
     while pos < source.len():
         ch := source[pos]
         if is_digit(ch) or ch == "_":
-            pos = pos + 1
+            pos = pos + 1; col = col + 1
         else:
             break
 
@@ -486,11 +498,11 @@ fn scan_number():
             if pos + 1 < source.len():
                 if is_digit(source[pos + 1]):
                     is_float = true
-                    pos = pos + 1
+                    pos = pos + 1; col = col + 1
                     while pos < source.len():
                         ch := source[pos]
                         if is_digit(ch) or ch == "_":
-                            pos = pos + 1
+                            pos = pos + 1; col = col + 1
                         else:
                             break
 
@@ -499,15 +511,15 @@ fn scan_number():
         ec := source[pos]
         if ec == "e" or ec == "E":
             is_float = true
-            pos = pos + 1
+            pos = pos + 1; col = col + 1
             if pos < source.len():
                 sc := source[pos]
                 if sc == "+" or sc == "-":
-                    pos = pos + 1
+                    pos = pos + 1; col = col + 1
             while pos < source.len():
                 ch := source[pos]
                 if is_digit(ch) or ch == "_":
-                    pos = pos + 1
+                    pos = pos + 1; col = col + 1
                 else:
                     break
 
@@ -518,7 +530,7 @@ fn scan_number():
 
 fn scan_string():
     start := pos
-    pos = pos + 1
+    pos = pos + 1; col = col + 1
 
     # check for interpolation by peeking ahead
     mut has_interp := false
@@ -543,16 +555,16 @@ fn scan_string():
                 if pos + 1 >= source.len():
                     emit("err", "unterminated escape sequence")
                     return
-                pos = pos + 2
+                pos = pos + 2; col = col + 2
                 continue
             if sc == "\"":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("string_lit", source.substring(start, pos))
                 return
             if sc == "\n":
                 emit("err", "newline in string literal")
                 return
-            pos = pos + 1
+            pos = pos + 1; col = col + 1
         emit("err", "unterminated string literal")
         return
 
@@ -563,13 +575,13 @@ fn scan_string():
             if pos + 1 >= source.len():
                 emit("err", "unterminated escape sequence in string interpolation")
                 return
-            pos = pos + 2
+            pos = pos + 2; col = col + 2
             continue
         if sc == LBRACE:
             break
         if sc == "\"" or sc == "\n":
             break
-        pos = pos + 1
+        pos = pos + 1; col = col + 1
 
     # emit string_start (from opening " to the {)
     string_start_val := source.substring(start, pos)
@@ -585,7 +597,7 @@ fn scan_interpolation_parts():
             return
 
         # skip the {
-        pos = pos + 1
+        pos = pos + 1; col = col + 1
 
         # scan expression inside {}
         mut depth := 1
@@ -594,14 +606,14 @@ fn scan_interpolation_parts():
             ic := source[pos]
             if ic == LBRACE:
                 depth = depth + 1
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
             elif ic == RBRACE:
                 depth = depth - 1
                 if depth == 0:
                     break
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
             else:
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
 
         expr_text := source.substring(expr_start, pos)
         if expr_text.len() > 0:
@@ -612,7 +624,7 @@ fn scan_interpolation_parts():
             return
 
         # skip the }
-        pos = pos + 1
+        pos = pos + 1; col = col + 1
 
         # scan string content after the }
         mid_start := pos
@@ -621,19 +633,19 @@ fn scan_interpolation_parts():
             if sc == "\\":
                 if pos + 1 >= source.len():
                     return
-                pos = pos + 2
+                pos = pos + 2; col = col + 2
                 continue
             if sc == LBRACE:
                 break
             if sc == "\"" or sc == "\n":
                 break
-            pos = pos + 1
+            pos = pos + 1; col = col + 1
 
         if pos >= source.len():
             return
 
         if source[pos] == "\"":
-            pos = pos + 1
+            pos = pos + 1; col = col + 1
             pending_kinds.push("string_end")
             pending_values.push(source.substring(mid_start, pos))
             return
@@ -651,7 +663,7 @@ fn scan_operator():
     if c == "+":
         if pos < source.len():
             if source[pos] == "=":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("plus_eq", "+=")
                 return
         emit("plus", "+")
@@ -660,11 +672,11 @@ fn scan_operator():
     if c == "-":
         if pos < source.len():
             if source[pos] == ">":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("arrow", "->")
                 return
             if source[pos] == "=":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("minus_eq", "-=")
                 return
         emit("minus", "-")
@@ -673,7 +685,7 @@ fn scan_operator():
     if c == "*":
         if pos < source.len():
             if source[pos] == "=":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("star_eq", "*=")
                 return
         emit("star", "*")
@@ -682,7 +694,7 @@ fn scan_operator():
     if c == "/":
         if pos < source.len():
             if source[pos] == "=":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("slash_eq", "/=")
                 return
         emit("slash", "/")
@@ -695,11 +707,11 @@ fn scan_operator():
     if c == "=":
         if pos < source.len():
             if source[pos] == "=":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("eq_eq", "==")
                 return
             if source[pos] == ">":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("fat_arrow", "=>")
                 return
         emit("eq", "=")
@@ -708,7 +720,7 @@ fn scan_operator():
     if c == "!":
         if pos < source.len():
             if source[pos] == "=":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("bang_eq", "!=")
                 return
         emit("bang", "!")
@@ -717,7 +729,7 @@ fn scan_operator():
     if c == "<":
         if pos < source.len():
             if source[pos] == "=":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("less_eq", "<=")
                 return
         emit("less", "<")
@@ -726,7 +738,7 @@ fn scan_operator():
     if c == ">":
         if pos < source.len():
             if source[pos] == "=":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("greater_eq", ">=")
                 return
         emit("greater", ">")
@@ -735,7 +747,7 @@ fn scan_operator():
     if c == ":":
         if pos < source.len():
             if source[pos] == "=":
-                pos = pos + 1
+                pos = pos + 1; col = col + 1
                 emit("colon_eq", ":=")
                 return
         emit("colon", ":")

@@ -1233,9 +1233,9 @@ fn c_check_expr_impl(node_idx: Int, scope_id: Int) -> Int:
     if node.kind == "none_lit":
         return TID_ERR
     if node.kind == "ident":
-        return c_check_ident(node.value, scope_id)
+        return c_check_ident(node_idx, node.value, scope_id)
     if node.kind == "self":
-        return c_check_ident("self", scope_id)
+        return c_check_ident(node_idx, "self", scope_id)
     if node.kind == "binary":
         return c_check_binary(node, scope_id)
     if node.kind == "unary":
@@ -1287,14 +1287,14 @@ fn c_check_expr_impl(node_idx: Int, scope_id: Int) -> Int:
 # identifier lookup
 # ---------------------------------------------------------------
 
-fn c_check_ident(name: String, scope_id: Int) -> Int:
+fn c_check_ident(node_idx: Int, name: String, scope_id: Int) -> Int:
     tid := sc_lookup(scope_id, name)
     if tid >= 0:
         return tid
     # check if it's a generic decl name — suppress false "undefined" errors
     if c_generic_decls.contains_key(name):
         return TID_ERR
-    c_error("E201", "undefined variable: " + name)
+    c_error_at(node_idx, "E201", "undefined variable: " + name)
     return TID_ERR
 
 # ---------------------------------------------------------------

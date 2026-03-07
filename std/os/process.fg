@@ -1,7 +1,7 @@
 # std.os.process — child process management
 #
-# uses opaque Int handles into a C-side process pool.
-# each process has stdin/stdout/stderr pipe access.
+# Spawn and manage child processes with stdin/stdout/stderr access.
+# Uses opaque Int handles into a C-side process pool.
 #
 #   from std.os.process import spawn, read_stdout, wait, close
 #   h := spawn("ls -la")!
@@ -9,30 +9,46 @@
 #   code := wait(h)
 #   close(h)
 
-# spawn a child process by command string. returns handle or error.
+# ===============================================================
+# Process Lifecycle
+# ===============================================================
+
+# Spawns a child process by command string.
+# The command is passed to the shell for execution.
+# Returns a handle to the process or fails if spawn fails.
 pub fn spawn(cmd: String) -> Int!:
     return process_spawn(cmd)
 
-# write to the child's stdin. returns bytes written or error.
-pub fn write_stdin(handle: Int, data: String) -> Int!:
-    return process_write(handle, data)
-
-# read from the child's stdout (up to max_bytes).
-pub fn read_stdout(handle: Int, max_bytes: Int) -> String!:
-    return process_read(handle, max_bytes)
-
-# read from the child's stderr (up to max_bytes).
-pub fn read_stderr(handle: Int, max_bytes: Int) -> String!:
-    return process_read_err(handle, max_bytes)
-
-# wait for the child to exit. returns exit code.
+# Waits for the child process to exit and returns its exit code.
+# Blocks until the process terminates.
 pub fn wait(handle: Int) -> Int:
     return process_wait(handle)
 
-# send SIGTERM to the child. returns true if signal sent.
+# Sends SIGTERM to the child process to request termination.
+# Returns true if the signal was successfully sent.
 pub fn kill(handle: Int) -> Bool:
     return process_kill(handle)
 
-# close all pipe file descriptors for this process.
+# Closes all pipe file descriptors for this process.
+# Should be called after the process completes to free resources.
 pub fn close(handle: Int):
     process_close(handle)
+
+# ===============================================================
+# Process I/O
+# ===============================================================
+
+# Writes data to the child's stdin.
+# Returns the number of bytes written or fails on error.
+pub fn write_stdin(handle: Int, data: String) -> Int!:
+    return process_write(handle, data)
+
+# Reads up to max_bytes from the child's stdout.
+# Returns the data read or fails on error.
+pub fn read_stdout(handle: Int, max_bytes: Int) -> String!:
+    return process_read(handle, max_bytes)
+
+# Reads up to max_bytes from the child's stderr.
+# Returns the data read or fails on error.
+pub fn read_stderr(handle: Int, max_bytes: Int) -> String!:
+    return process_read_err(handle, max_bytes)

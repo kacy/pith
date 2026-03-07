@@ -1,23 +1,39 @@
 # std.net.websocket — WebSocket protocol (RFC 6455)
 #
-# WebSocket implementation with proper SHA1+base64 handshake.
+# WebSocket handshake implementation using SHA-1 hashing and base64 encoding.
+# This module provides the server-side handshake response computation.
+#
+#   from std.net.websocket import compute_accept, handshake_response
+#   accept_value := compute_accept(client_key)
+#   response := handshake_response(client_key)
 
+# Dependencies for WebSocket handshake computation
 from std.hash import sha1
 from std.encoding import b64_encode
 
-# Magic GUID for WebSocket handshake
+# ===============================================================
+# WebSocket Constants
+# ===============================================================
+
+# Magic GUID defined in RFC 6455 for handshake key computation
 WS_MAGIC := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-# Opcodes
-OP_TEXT := 1
-OP_BINARY := 2
-OP_CLOSE := 8
-OP_PING := 9
-OP_PONG := 10
+# WebSocket frame opcodes
+OP_TEXT := 1     # Text frame
+OP_BINARY := 2   # Binary frame
+OP_CLOSE := 8    # Connection close
+OP_PING := 9     # Ping frame
+OP_PONG := 10    # Pong frame
 
-# Perform WebSocket handshake key computation (RFC 6455)
-# Input: Sec-WebSocket-Key from client (24-char base64)
-# Output: Sec-WebSocket-Accept value (base64 of SHA1)
+# ===============================================================
+# Handshake Computation
+# ===============================================================
+
+# Computes the Sec-WebSocket-Accept value from the client's Sec-WebSocket-Key.
+# Implements the RFC 6455 handshake algorithm:
+# 1. Concatenate key with magic GUID
+# 2. Compute SHA-1 hash
+# 3. Base64 encode the hash
 pub fn compute_accept(key: String) -> String:
     # Concatenate key with magic GUID
     combined := key + WS_MAGIC
@@ -34,7 +50,7 @@ pub fn compute_accept(key: String) -> String:
         i = i + 2
     return b64_encode(hash_bytes)
 
-# Helper: convert hex char to value
+# Converts a hexadecimal character to its numeric value.
 fn hex_val(c: String) -> Int:
     if c >= "0" and c <= "9":
         return ord(c) - 48
@@ -44,7 +60,8 @@ fn hex_val(c: String) -> Int:
         return ord(c) - 55
     return 0
 
-# Build WebSocket handshake response
+# Builds a complete HTTP 101 Switching Protocols response for WebSocket upgrade.
+# Takes the client's Sec-WebSocket-Key and returns the full HTTP response.
 pub fn handshake_response(key: String) -> String:
     mut accept := compute_accept(key)
     mut response := "HTTP/1.1 101 Switching Protocols\r\n"

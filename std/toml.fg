@@ -1,14 +1,19 @@
 # std.toml — TOML v1.0 parser
 #
-# uses opaque Int handles into a node pool. call parse() to get
-# a root table handle, then use typed accessors to read values.
-# supports: strings, ints, floats, bools, tables, arrays.
+# Parse TOML configuration files into a tree structure.
+# Uses opaque Int handles into a node pool.
 #
 #   from std.toml import parse, get_string, get_table
 #   root := parse(data)
 #   name := get_string(root, "name")
+#   db := get_table(root, "database")
+#   host := get_string(db, "host")
 
-# node pool — maps indexed by handle (maps support .insert for update)
+# ===============================================================
+# Node Pool
+# ===============================================================
+
+# Global node storage indexed by handle
 mut g_next: Int := 0
 mut g_types: Map[Int, String] := {}
 mut g_str_vals: Map[Int, String] := {}
@@ -16,17 +21,18 @@ mut g_int_vals: Map[Int, Int] := {}
 mut g_float_vals: Map[Int, Float] := {}
 mut g_bool_vals: Map[Int, Bool] := {}
 
-# table children — flat append-only lists, offsets/counts in maps
+# Table children: flat append-only storage with offset/count
 mut g_tkeys: List[String] := []
-mut g_tvals: List[Int] := []
+mut g_tvals: List[Int] := {}
 mut g_toff: Map[Int, Int] := {}
 mut g_tcnt: Map[Int, Int] := {}
 
-# array children — flat append-only list, offsets/counts in maps
+# Array children: flat append-only storage with offset/count
 mut g_aitems: List[Int] := []
 mut g_aoff: Map[Int, Int] := {}
 mut g_acnt: Map[Int, Int] := {}
 
+# Allocates a new node of the specified type
 fn t_alloc(kind: String) -> Int:
     idx := g_next
     g_next = g_next + 1
@@ -41,6 +47,7 @@ fn t_alloc(kind: String) -> Int:
     g_acnt.insert(idx, 0)
     return idx
 
+# Sets a key-value pair in a table
 fn t_table_set(handle: Int, key: String, val: Int):
     off := g_toff[handle]
     cnt := g_tcnt[handle]
@@ -51,6 +58,7 @@ fn t_table_set(handle: Int, key: String, val: Int):
     g_tvals.push(val)
     g_tcnt.insert(handle, cnt + 1)
 
+# Appends a value to an array
 fn t_array_push(handle: Int, val: Int):
     cnt := g_acnt[handle]
     if cnt == 0:
@@ -58,31 +66,40 @@ fn t_array_push(handle: Int, val: Int):
     g_aitems.push(val)
     g_acnt.insert(handle, cnt + 1)
 
-# parser state
+# ===============================================================
+# Parser (Internal)
+# ===============================================================
+
+# Parser state
 mut p_data: String := ""
 mut p_pos: Int := 0
 mut p_err: Bool := false
 
+# Returns character at position i or empty string if out of bounds
 fn p_at(i: Int) -> String:
     if i >= p_data.len():
         return ""
     return p_data[i]
 
+# Skips whitespace (space, tab, carriage return)
 fn p_skip_ws():
     while p_pos < p_data.len() and (p_at(p_pos) == " " or p_at(p_pos) == chr(9) or p_at(p_pos) == chr(13)):
         p_pos = p_pos + 1
 
+# Skips a comment from # to end of line
 fn p_skip_comment():
     if p_pos < p_data.len() and p_at(p_pos) == "#":
         while p_pos < p_data.len() and p_at(p_pos) != chr(10):
             p_pos = p_pos + 1
 
+# Skips the rest of the current line (ws, comment, newline)
 fn p_skip_line():
     p_skip_ws()
     p_skip_comment()
     if p_pos < p_data.len() and p_at(p_pos) == chr(10):
         p_pos = p_pos + 1
 
+# Returns true if character is valid in a bare key
 fn p_is_key_char(c: String) -> Bool:
     if c >= "a" and c <= "z":
         return true
@@ -94,6 +111,7 @@ fn p_is_key_char(c: String) -> Bool:
         return true
     return false
 
+# Parses a key (quoted or bare)
 fn p_parse_key() -> String:
     p_skip_ws()
     # quoted key
@@ -112,6 +130,7 @@ fn p_parse_key() -> String:
         p_pos = p_pos + 1
     return p_data.substring(start, p_pos)
 
+# Returns true if character is valid in a number
 fn p_is_num_char(c: String) -> Bool:
     if c >= "0" and c <= "9":
         return true
@@ -119,6 +138,7 @@ fn p_is_num_char(c: String) -> Bool:
         return true
     return false
 
+# Parses an integer from a string manually
 fn t_parse_int_manual(s: String) -> Int:
     mut val := 0
     mut neg := false
@@ -137,6 +157,7 @@ fn t_parse_int_manual(s: String) -> Int:
         return 0 - val
     return val
 
+# Parses a float from a string manually
 fn t_parse_float_manual(s: String) -> Float:
     # split on decimal point, compute integer + fractional parts
     mut int_part := 0
@@ -165,6 +186,7 @@ fn t_parse_float_manual(s: String) -> Float:
         return 0.0 - result
     return result
 
+# Main recursive value parser
 fn p_parse_value() -> Int:
     p_skip_ws()
     if p_pos >= p_data.len():
@@ -261,6 +283,8 @@ fn p_parse_value() -> Int:
     p_err = true
     return 0 - 1
 
+# Ensures a nested table path exists, creating intermediate tables as needed.
+# Takes a dot-separated path like "database.connection" and returns the table handle.
 fn t_ensure_table(root: Int, path: String) -> Int:
     mut current := root
     mut start := 0
@@ -288,7 +312,12 @@ fn t_ensure_table(root: Int, path: String) -> Int:
         i = i + 1
     return current
 
-# parse a TOML string. returns a root table handle, or -1 on error.
+# ===============================================================
+# Public API — Parsing
+# ===============================================================
+
+# Parses a TOML string and returns a root table handle.
+# Returns -1 on parse error. The root is a table containing all top-level keys.
 pub fn parse(input: String) -> Int:
     p_data = input
     p_pos = 0
@@ -336,13 +365,22 @@ pub fn parse(input: String) -> Int:
         return 0 - 1
     return root
 
-# return the type of a node: "string", "int", "float", "bool", "table", or "array".
+# ===============================================================
+# Public API — Type and Introspection
+# ===============================================================
+
+# Returns the type of a node: "string", "int", "float", "bool", "table", or "array".
+# Returns "invalid" for invalid handles.
 pub fn type_of(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return "invalid"
     return g_types[handle]
 
-# get a string value by key from a table.
+# ===============================================================
+# Public API — Table Value Accessors
+# ===============================================================
+
+# Gets a string value by key from a table. Returns empty string if not found or wrong type.
 pub fn get_string(handle: Int, key: String) -> String:
     if handle < 0 or handle >= g_next:
         return ""
@@ -357,7 +395,7 @@ pub fn get_string(handle: Int, key: String) -> String:
         i = i + 1
     return ""
 
-# get an integer value by key from a table.
+# Gets an integer value by key from a table. Returns 0 if not found or wrong type.
 pub fn get_int(handle: Int, key: String) -> Int:
     if handle < 0 or handle >= g_next:
         return 0
@@ -372,7 +410,7 @@ pub fn get_int(handle: Int, key: String) -> Int:
         i = i + 1
     return 0
 
-# get a float value by key from a table.
+# Gets a float value by key from a table. Returns 0.0 if not found or wrong type.
 pub fn get_float(handle: Int, key: String) -> Float:
     if handle < 0 or handle >= g_next:
         return 0.0
@@ -387,7 +425,7 @@ pub fn get_float(handle: Int, key: String) -> Float:
         i = i + 1
     return 0.0
 
-# get a boolean value by key from a table.
+# Gets a boolean value by key from a table. Returns false if not found or wrong type.
 pub fn get_bool(handle: Int, key: String) -> Bool:
     if handle < 0 or handle >= g_next:
         return false
@@ -402,7 +440,7 @@ pub fn get_bool(handle: Int, key: String) -> Bool:
         i = i + 1
     return false
 
-# get a sub-table handle by key. returns -1 if not found.
+# Gets a sub-table handle by key. Returns -1 if not found or not a table.
 pub fn get_table(handle: Int, key: String) -> Int:
     if handle < 0 or handle >= g_next:
         return 0 - 1
@@ -417,7 +455,7 @@ pub fn get_table(handle: Int, key: String) -> Int:
         i = i + 1
     return 0 - 1
 
-# get an array handle by key. returns -1 if not found.
+# Gets an array handle by key. Returns -1 if not found or not an array.
 pub fn get_array(handle: Int, key: String) -> Int:
     if handle < 0 or handle >= g_next:
         return 0 - 1
@@ -432,13 +470,17 @@ pub fn get_array(handle: Int, key: String) -> Int:
         i = i + 1
     return 0 - 1
 
-# return the number of elements in an array.
+# ===============================================================
+# Public API — Array Operations
+# ===============================================================
+
+# Returns the number of elements in an array. Returns 0 for non-arrays.
 pub fn array_len(handle: Int) -> Int:
     if handle < 0 or handle >= g_next:
         return 0
     return g_acnt[handle]
 
-# get the handle of an array element by index. returns -1 if out of bounds.
+# Gets the handle of an array element by index. Returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
     if handle < 0 or handle >= g_next:
         return 0 - 1
@@ -446,7 +488,11 @@ pub fn array_get(handle: Int, index: Int) -> Int:
         return 0 - 1
     return g_aitems[g_aoff[handle] + index]
 
-# return the list of keys in a table (insertion order).
+# ===============================================================
+# Public API — Table Introspection
+# ===============================================================
+
+# Returns the list of keys in a table (insertion order).
 pub fn keys(handle: Int) -> List[String]:
     mut result: List[String] := []
     if handle < 0 or handle >= g_next:
@@ -459,7 +505,7 @@ pub fn keys(handle: Int) -> List[String]:
         i = i + 1
     return result
 
-# check if a table contains a key.
+# Returns true if a table contains the specified key.
 pub fn has(handle: Int, key: String) -> Bool:
     if handle < 0 or handle >= g_next:
         return false

@@ -1,15 +1,22 @@
 # std.net.url — URL parsing and percent-encoding
 #
-# uses opaque Int handles into a node pool. call parse() to get
-# a handle, then use accessor functions to read components.
-# also provides encode/decode for percent-encoding (RFC 3986).
+# Parse URLs into components (scheme, host, port, path, query, fragment)
+# and perform percent-encoding/decoding per RFC 3986.
 #
-#   from std.net.url import parse, host, path
+# Uses opaque Int handles into a node pool. Call parse() to get
+# a handle, then use accessor functions to read components.
+#
+#   from std.net.url import parse, host, path, encode, decode
 #   u := parse("https://example.com/api?q=1")
-#   host(u)  # "example.com"
-#   path(u)  # "/api"
+#   host(u)        # "example.com"
+#   path(u)        # "/api"
+#   encode("hello world")  # "hello%20world"
 
-# node pool — maps indexed by handle
+# ===============================================================
+# URL Node Pool
+# ===============================================================
+
+# Pool of parsed URL components indexed by handle
 mut g_next: Int := 0
 mut g_schemes: Map[Int, String] := {}
 mut g_hosts: Map[Int, String] := {}
@@ -18,6 +25,7 @@ mut g_paths: Map[Int, String] := {}
 mut g_queries: Map[Int, String] := {}
 mut g_fragments: Map[Int, String] := {}
 
+# Allocates a new URL node and returns its handle
 fn u_alloc() -> Int:
     idx := g_next
     g_next = g_next + 1
@@ -29,7 +37,13 @@ fn u_alloc() -> Int:
     g_fragments.insert(idx, "")
     return idx
 
-# parse a URL string into its components. returns a handle.
+# ===============================================================
+# URL Parsing
+# ===============================================================
+
+# Parses a URL string into its components.
+# Returns a handle that can be used with accessor functions.
+# Supports: scheme://host:port/path?query#fragment
 pub fn parse(input: String) -> Int:
     idx := u_alloc()
     mut pos := 0
@@ -112,43 +126,53 @@ pub fn parse(input: String) -> Int:
 
     return idx
 
-# return the URL scheme (e.g. "https").
+# ===============================================================
+# URL Component Accessors
+# ===============================================================
+
+# Returns the URL scheme (e.g., "https", "http", "ftp").
+# Returns empty string if no scheme was present.
 pub fn scheme(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return ""
     return g_schemes[handle]
 
-# return the hostname.
+# Returns the hostname (e.g., "example.com").
+# Returns empty string if parse failed or no host.
 pub fn host(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return ""
     return g_hosts[handle]
 
-# return the port number, or -1 if not specified.
+# Returns the port number, or -1 if not specified in the URL.
 pub fn port(handle: Int) -> Int:
     if handle < 0 or handle >= g_next:
         return 0 - 1
     return g_ports[handle]
 
-# return the path component.
+# Returns the path component (e.g., "/api/v1/users").
+# Returns empty string if no path.
 pub fn path(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return ""
     return g_paths[handle]
 
-# return the query string (without the leading ?).
+# Returns the query string without the leading "?".
+# Returns empty string if no query.
 pub fn query(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return ""
     return g_queries[handle]
 
-# return the fragment (without the leading #).
+# Returns the fragment without the leading "#".
+# Returns empty string if no fragment.
 pub fn fragment(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return ""
     return g_fragments[handle]
 
-# reconstruct the full URL string from its components.
+# Reconstructs the full URL string from its components.
+# Returns empty string if handle is invalid.
 pub fn to_string(handle: Int) -> String:
     if handle < 0 or handle >= g_next:
         return ""
@@ -169,6 +193,12 @@ pub fn to_string(handle: Int) -> String:
         result = result + "#" + f
     return result
 
+# ===============================================================
+# Percent-Encoding (RFC 3986)
+# ===============================================================
+
+# Returns true if character is unreserved per RFC 3986.
+# Unreserved chars: A-Z a-z 0-9 - _ . ~
 fn is_unreserved(c: String) -> Bool:
     if c >= "A" and c <= "Z":
         return true
@@ -180,7 +210,8 @@ fn is_unreserved(c: String) -> Bool:
         return true
     return false
 
-# percent-encode non-unreserved characters (RFC 3986).
+# Percent-encodes a string per RFC 3986.
+# Unreserved characters are left as-is, all others become %XX.
 pub fn encode(input: String) -> String:
     hex := "0123456789abcdef"
     mut result := ""
@@ -195,6 +226,7 @@ pub fn encode(input: String) -> String:
         i = i + 1
     return result
 
+# Converts a hex digit character to its numeric value.
 fn hex_digit(c: String) -> Int:
     if c >= "0" and c <= "9":
         return ord(c) - 48
@@ -204,7 +236,8 @@ fn hex_digit(c: String) -> Int:
         return ord(c) - 65 + 10
     return 0 - 1
 
-# percent-decode %XX sequences. also decodes + as space.
+# Percent-decodes a string, converting %XX sequences to characters.
+# Also converts "+" to space (application/x-www-form-urlencoded).
 pub fn decode(input: String) -> String:
     mut result := ""
     mut i := 0

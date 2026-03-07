@@ -1,44 +1,69 @@
 # std.fs — file system operations
 #
-# read and write return Result types because I/O can fail.
-# exists, is_dir, remove, rename, make_dir, and list always succeed.
+# File system utilities for checking existence, reading, writing,
+# and managing files and directories. All paths are strings.
 #
-#   from std.fs import read, write
-#   content := read("config.toml")!
-#   write("output.txt", content)!
+# Note: read() and write() return Result types because I/O can fail.
+#       exists(), is_dir(), remove(), etc. return Bool for success check.
+#
+#   from std.fs import read, write, exists
+#   if exists("config.txt"):
+#       content := read("config.txt")!
+#       write("backup.txt", content)!
 
-# check if a file exists at path.
+# ===============================================================
+# File Existence and Type
+# ===============================================================
+
+# Returns true if a file exists at the given path.
+# Returns false if the path doesn't exist or is a directory.
 pub fn exists(path: String) -> Bool:
     return file_exists(path)
 
-# check if a directory exists at path.
+# Returns true if a directory exists at the given path.
+# Returns false if the path doesn't exist or is a file.
 pub fn is_dir(path: String) -> Bool:
     return dir_exists(path)
 
-# read the entire file at path as a string.
+# ===============================================================
+# File Reading and Writing
+# ===============================================================
+
+# Reads the entire file at path and returns its contents as a string.
+# Fails if the file doesn't exist or can't be read.
 pub fn read(path: String) -> String!:
     return read_file(path)
 
-# write data to a file, creating or overwriting it.
+# Writes data to a file, creating the file if it doesn't exist
+# or overwriting it if it does. Fails if the file can't be written.
 pub fn write(path: String, data: String) -> Bool!:
     return write_file(path, data)
 
-# append data to a file, creating it if needed.
+# Appends data to a file, creating the file if it doesn't exist.
+# Fails if the file can't be written to.
 pub fn append(path: String, data: String) -> Bool!:
     return append_file(path, data)
 
-# delete a file. returns true if removed.
+# ===============================================================
+# File and Directory Management
+# ===============================================================
+
+# Deletes a file at the given path. Returns true if the file was
+# successfully removed, false otherwise.
 pub fn remove(path: String) -> Bool:
     return remove_file(path)
 
-# rename or move a file. returns true on success.
+# Renames or moves a file from old_path to new_path.
+# Returns true on success, false if the operation failed.
 pub fn rename(old_path: String, new_path: String) -> Bool:
     return rename_file(old_path, new_path)
 
-# create a directory. returns true on success.
+# Creates a directory at the given path. Returns true on success.
+# Parent directories must already exist.
 pub fn make_dir(path: String) -> Bool:
     return mkdir(path)
 
-# list entries in a directory.
+# Lists all entries in a directory. Returns a list of file and
+# directory names (not full paths). Returns empty list on error.
 pub fn list(path: String) -> List[String]:
     return list_dir(path)

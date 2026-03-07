@@ -24,7 +24,7 @@ from driver import get_directory, get_stem, compile_to_c, init_driver, resolve_i
 from lexer import lex_all, Token
 from parser import parse
 from ast import get_node, reset_arena
-from checker import c_init, c_run, c_run_module, c_diagnostics_to_json, Diagnostic
+from checker import initialize_checker, c_run, c_run_module, c_diagnostics_to_json, Diagnostic
 from printer import print_ast
 from formatter import fmt_source
 from linter import lint_module
@@ -94,7 +94,7 @@ fn cmd_check(path: String, json_mode: Bool) -> String!:
     init_driver(path)
     import_roots := resolve_imports(root, path)!
 
-    c_init(path)
+    initialize_checker(path)
     for imp_root in import_roots:
         c_run_module(imp_root)
     diags := c_run_module(root)
@@ -141,7 +141,7 @@ fn cmd_lint(path: String, json_mode: Bool) -> String!:
     # resolve imports for type info (linter needs checker to run first)
     init_driver(path)
     import_roots := resolve_imports(root, path)!
-    c_init(path)
+    initialize_checker(path)
     for imp_root in import_roots:
         c_run_module(imp_root)
     c_run_module(root)

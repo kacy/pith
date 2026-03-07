@@ -60,7 +60,7 @@ fn lint_top_level(node_idx: Int, source: String):
     elif inner.kind == "impl_decl":
         lint_impl_decl(inner, source)
     elif inner.kind == "binding":
-        name := extract_binding_name(inner.value)
+        name := l_extract_binding_name(inner.value)
         check_snake_case(name, "variable")
     elif inner.kind == "test_decl":
         lint_block_depth(inner, 1)
@@ -228,7 +228,7 @@ fn lint_stmt_depth(node_idx: Int, depth: Int):
 # ---------------------------------------------------------------
 
 # extract the plain binding name from a value like "mut x" or "x"
-fn extract_binding_name(value: String) -> String:
+fn l_extract_binding_name(value: String) -> String:
     if value.starts_with("mut "):
         return value.substring(4, value.len())
     return value

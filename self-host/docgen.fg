@@ -23,7 +23,7 @@ mut d_header_end: Int := 0
 # --- helpers ---
 
 # trim leading whitespace from a string.
-fn trim_left(s: String) -> String:
+fn d_trim_left(s: String) -> String:
     mut i := 0
     while i < s.len():
         if s[i] == " " or s[i] == "\t":
@@ -33,7 +33,7 @@ fn trim_left(s: String) -> String:
     return s.substring(i, s.len())
 
 # trim trailing whitespace from a string.
-fn trim_right(s: String) -> String:
+fn d_trim_right(s: String) -> String:
     mut end := s.len()
     while end > 0:
         ch := s[end - 1]
@@ -45,7 +45,7 @@ fn trim_right(s: String) -> String:
 
 # trim both ends.
 fn trim_whitespace(s: String) -> String:
-    return trim_left(trim_right(s))
+    return d_trim_left(d_trim_right(s))
 
 # check if a string starts with a prefix.
 fn string_starts_with(s: String, prefix: String) -> Bool:
@@ -86,7 +86,7 @@ fn contains_case_insensitive(haystack: String, needle: String) -> Bool:
     return false
 
 # escape a string for JSON output.
-fn escape_json_string(s: String) -> String:
+fn d_escape_json_string(s: String) -> String:
     mut output := ""
     mut i := 0
     while i < s.len():
@@ -106,7 +106,7 @@ fn escape_json_string(s: String) -> String:
 
 # strip the "# " prefix from a comment line.
 fn strip_comment_markers(line: String) -> String:
-    trimmed := trim_left(line)
+    trimmed := d_trim_left(line)
     if trimmed.len() >= 2:
         if trimmed[0] == "#" and trimmed[1] == " ":
             return trimmed.substring(2, trimmed.len())
@@ -200,7 +200,7 @@ pub fn doc_extract(source: String):
 
     # collect module header — leading comment block
     # first line should be "# module.name — description"
-    if lines.len() > 0 and string_starts_with(trim_left(lines[0]), "#"):
+    if lines.len() > 0 and string_starts_with(d_trim_left(lines[0]), "#"):
         first := strip_comment_markers(lines[0])
         # parse "std.math — basic math functions" or "std.math - description"
         # em dash is 3 bytes in UTF-8, so " — " is 5 bytes; " - " is 3 bytes
@@ -218,7 +218,7 @@ pub fn doc_extract(source: String):
         # trigger the stop condition. a truly empty line separates the header
         # from per-item doc comments.
         while i < lines.len():
-            trimmed := trim_left(lines[i])
+            trimmed := d_trim_left(lines[i])
             if trimmed.len() == 0:
                 break
             if trimmed[0] == "#":
@@ -244,7 +244,7 @@ pub fn doc_extract(source: String):
             mut doc := ""
             mut back := i - 1
             while back >= d_header_end:
-                prev := trim_left(lines[back])
+                prev := d_trim_left(lines[back])
                 if prev.len() > 0 and prev[0] == "#":
                     comment_text := strip_comment_markers(lines[back])
                     if doc == "":
@@ -311,18 +311,18 @@ pub fn doc_format_json() -> String:
     LB := chr(123)
     RB := chr(125)
     mut output := LB
-    output = output + "\"module\":\"" + escape_json_string(d_mod_name) + "\""
-    output = output + ",\"description\":\"" + escape_json_string(d_mod_desc) + "\""
+    output = output + "\"module\":\"" + d_escape_json_string(d_mod_name) + "\""
+    output = output + ",\"description\":\"" + d_escape_json_string(d_mod_desc) + "\""
     output = output + ",\"items\":["
     mut i := 0
     while i < d_count:
         if i > 0:
             output = output + ","
         output = output + LB
-        output = output + "\"name\":\"" + escape_json_string(d_names[i]) + "\""
-        output = output + ",\"kind\":\"" + escape_json_string(d_kinds[i]) + "\""
-        output = output + ",\"signature\":\"" + escape_json_string(d_sigs[i]) + "\""
-        output = output + ",\"doc\":\"" + escape_json_string(d_docs[i]) + "\""
+        output = output + "\"name\":\"" + d_escape_json_string(d_names[i]) + "\""
+        output = output + ",\"kind\":\"" + d_escape_json_string(d_kinds[i]) + "\""
+        output = output + ",\"signature\":\"" + d_escape_json_string(d_sigs[i]) + "\""
+        output = output + ",\"doc\":\"" + d_escape_json_string(d_docs[i]) + "\""
         output = output + RB
         i = i + 1
     output = output + "]"
@@ -348,7 +348,7 @@ pub fn doc_check() -> Int:
 mut d_file_list: List[String] := []
 
 # find the stdlib root by walking up from a starting directory.
-fn find_stdlib_root(start_dir: String) -> String:
+fn d_find_stdlib_root(start_dir: String) -> String:
     mut dir := start_dir
     mut depth := 0
     while depth < 20:
@@ -421,7 +421,7 @@ fn scan_stdlib_documentation(stdlib_root: String):
 # search stdlib documentation for a query string.
 # returns formatted results or a "no results" message.
 pub fn doc_search(query: String, start_dir: String) -> String!:
-    stdlib_root := find_stdlib_root(start_dir)
+    stdlib_root := d_find_stdlib_root(start_dir)
     if stdlib_root == "":
         return "error: cannot find std/ directory"
 

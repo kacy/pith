@@ -1749,9 +1749,8 @@ fn c_check_generic_fn_call(name: String, arg_indices: List[Int], scope_id: Int) 
         else:
             all_inferred = false
             c_error("E222", "cannot infer type parameter " + gp)
-            subst_args.push(TID_ERR)
-    if all_inferred == false:
-        return TID_ERR
+            # Return immediately to prevent cascading errors
+            return TID_ERR
     # check interface bounds
     if c_check_bounds(decl_idx, subst_map) == false:
         return TID_ERR

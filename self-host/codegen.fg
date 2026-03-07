@@ -78,6 +78,11 @@ mut g_test_names: List[String] := []
 # local variable types in current function
 mut g_local_types: Map[String, Int] := {}
 
+# scope level tracking for proper cleanup
+# scope_level starts at 0 (function level), increases for nested blocks
+mut g_scope_level: Int := 0
+mut g_local_scopes: Map[String, Int] := {}  # variable name -> scope level
+
 # temporary storage for capture detection (global because maps passed to
 # functions are copies — mutations don't propagate back)
 mut g_capture_idents: Map[String, Bool] := {}
@@ -124,6 +129,8 @@ pub fn g_init():
     g_spawn_arg_offsets = []
     g_test_names = []
     g_local_types = {}
+    g_scope_level = 0
+    g_local_scopes = {}
     g_capture_idents = {}
     g_generic_fn_insts = []
     g_generic_fn_nodes = []
@@ -260,15 +267,25 @@ fn g_emit_release(name: String, tid: Int):
         g_write(name)
         g_write(");\n")
 
-# emit cleanup for local variables that need RC
-# NOTE: This currently emits cleanup for ALL tracked variables, but should only
-# cleanup variables in the current scope. For now, we only emit cleanup at the
-# end of functions without early returns, which prevents use-after-scope issues.
-fn g_emit_scope_cleanup():
+# emit cleanup for local variables at a specific scope level that need RC
+fn g_emit_scope_cleanup_at_level(level: Int):
     for name in g_local_types.keys():
-        tid := g_local_types[name]
-        if g_type_needs_rc(tid):
-            g_emit_release(name, tid)
+        if g_local_scopes.contains_key(name):
+            if g_local_scopes[name] == level:
+                tid := g_local_types[name]
+                if g_type_needs_rc(tid):
+                    g_emit_release(name, tid)
+
+# emit cleanup for local variables at current scope level that need RC
+fn g_emit_scope_cleanup():
+    g_emit_scope_cleanup_at_level(g_scope_level)
+
+# emit cleanup for all scope levels from current down to 0 (for returns)
+fn g_emit_full_scope_cleanup():
+    mut level := g_scope_level
+    while level >= 0:
+        g_emit_scope_cleanup_at_level(level)
+        level = level - 1
 
 # master type resolution: TypeId -> C type string
 fn g_c_type_string(tid: Int) -> String:
@@ -1235,8 +1252,26 @@ fn g_emit_instantiated_fn_forward_decls():
 
 fn g_emit_block(node_idx: Int):
     node := get_node(node_idx)
+    # Enter new scope level for this block
+    g_scope_level = g_scope_level + 1
+    # Track which variables are created in this scope
+    mut vars_in_scope: List[String] := []
     for child in node.children:
+        # Track bindings created in this scope
+        child_node := get_node(child)
+        if child_node.kind == "binding":
+            name := g_extract_binding_name(child_node.value)
+            vars_in_scope.push(name)
         g_emit_stmt(child)
+    # Exit scope - cleanup variables at this level
+    g_emit_scope_cleanup()
+    # Remove variables from tracking
+    for name in vars_in_scope:
+        if g_local_types.contains_key(name):
+            g_local_types.remove(name)
+        if g_local_scopes.contains_key(name):
+            g_local_scopes.remove(name)
+    g_scope_level = g_scope_level - 1
 
 fn g_emit_stmt(node_idx: Int):
     node := get_node(node_idx)
@@ -1437,6 +1472,7 @@ fn g_emit_binding(node_idx: Int):
     if tid == TID_ERR:
         tid = g_infer_expr_type(value_idx)
     g_local_types.insert(name, tid)
+    g_local_scopes.insert(name, g_scope_level)
 
     # try propagation: x := foo()! → hoist result to temp
     inner_node := get_node(value_idx)
@@ -1690,6 +1726,8 @@ fn g_emit_for_stmt(node_idx: Int):
 
 fn g_emit_return_stmt(node_idx: Int):
     node := get_node(node_idx)
+    # ARC: cleanup all local variables before return
+    g_emit_full_scope_cleanup()
     g_write_indent()
     if node.children.len() > 0:
         if g_is_result_type(g_current_fn_return):
@@ -3953,6 +3991,8 @@ fn g_emit_fn_def(node_idx: Int, skip_main: Bool):
     g_indent = g_indent + 1
     # emit body
     g_emit_fn_body(node_idx)
+    # ARC: cleanup function-level locals before return (for functions without explicit return)
+    g_emit_scope_cleanup_at_level(0)
     if name == "main":
         g_write_indent()
         g_write("return 0;\n")

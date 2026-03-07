@@ -41,17 +41,17 @@ pub fn compute_accept(key: String) -> String:
     hash_hex := sha1(combined)
     # Convert hex to bytes then base64 encode
     mut hash_bytes := ""
-    mut i := 0
-    while i < hash_hex.len():
+    mut position := 0
+    while position < hash_hex.len():
         # Convert 2 hex chars to 1 byte
-        mut high := hex_val(hash_hex[i])
-        mut low := hex_val(hash_hex[i + 1])
+        mut high := hex_character_value(hash_hex[position])
+        mut low := hex_character_value(hash_hex[position + 1])
         hash_bytes = hash_bytes + chr(high * 16 + low)
-        i = i + 2
+        position = position + 2
     return b64_encode(hash_bytes)
 
 # Converts a hexadecimal character to its numeric value.
-fn hex_val(c: String) -> Int:
+fn hex_character_value(c: String) -> Int:
     if c >= "0" and c <= "9":
         return ord(c) - 48
     if c >= "a" and c <= "f":

@@ -17,24 +17,24 @@
 # ===============================================================
 
 # Pool of parsed URL components indexed by handle
-mut g_next: Int := 0
-mut g_schemes: Map[Int, String] := {}
-mut g_hosts: Map[Int, String] := {}
-mut g_ports: Map[Int, Int] := {}
-mut g_paths: Map[Int, String] := {}
-mut g_queries: Map[Int, String] := {}
-mut g_fragments: Map[Int, String] := {}
+mut next_url_id: Int := 0
+mut url_schemes: Map[Int, String] := {}
+mut url_hosts: Map[Int, String] := {}
+mut url_ports: Map[Int, Int] := {}
+mut url_paths: Map[Int, String] := {}
+mut url_queries: Map[Int, String] := {}
+mut url_fragments: Map[Int, String] := {}
 
 # Allocates a new URL node and returns its handle
-fn u_alloc() -> Int:
-    idx := g_next
-    g_next = g_next + 1
-    g_schemes.insert(idx, "")
-    g_hosts.insert(idx, "")
-    g_ports.insert(idx, 0 - 1)
-    g_paths.insert(idx, "")
-    g_queries.insert(idx, "")
-    g_fragments.insert(idx, "")
+fn allocate_url() -> Int:
+    idx := next_url_id
+    next_url_id = next_url_id + 1
+    url_schemes.insert(idx, "")
+    url_hosts.insert(idx, "")
+    url_ports.insert(idx, 0 - 1)
+    url_paths.insert(idx, "")
+    url_queries.insert(idx, "")
+    url_fragments.insert(idx, "")
     return idx
 
 # ===============================================================
@@ -45,7 +45,7 @@ fn u_alloc() -> Int:
 # Returns a handle that can be used with accessor functions.
 # Supports: scheme://host:port/path?query#fragment
 pub fn parse(input: String) -> Int:
-    idx := u_alloc()
+    idx := allocate_url()
     mut pos := 0
 
     # scheme: find "://"
@@ -57,7 +57,7 @@ pub fn parse(input: String) -> Int:
             i = input.len()
         i = i + 1
     if scheme_end > 0:
-        g_schemes.insert(idx, input.substring(0, scheme_end))
+        url_schemes.insert(idx, input.substring(0, scheme_end))
         pos = scheme_end + 3
 
     # host: up to : / ? # or end
@@ -79,7 +79,7 @@ pub fn parse(input: String) -> Int:
             i = host_end
         i = i + 1
     if colon >= 0:
-        g_hosts.insert(idx, input.substring(host_start, colon))
+        url_hosts.insert(idx, input.substring(host_start, colon))
         # parse port number
         mut port_val := 0
         i = colon + 1
@@ -88,9 +88,9 @@ pub fn parse(input: String) -> Int:
             if c >= "0" and c <= "9":
                 port_val = port_val * 10 + (ord(c) - 48)
             i = i + 1
-        g_ports.insert(idx, port_val)
+        url_ports.insert(idx, port_val)
     if colon < 0:
-        g_hosts.insert(idx, input.substring(host_start, host_end))
+        url_hosts.insert(idx, input.substring(host_start, host_end))
     pos = host_end
 
     # path: up to ? # or end
@@ -103,7 +103,7 @@ pub fn parse(input: String) -> Int:
             path_end = i
         i = i + 1
     if path_end > path_start:
-        g_paths.insert(idx, input.substring(path_start, path_end))
+        url_paths.insert(idx, input.substring(path_start, path_end))
     pos = path_end
 
     # query: after ? before #
@@ -116,13 +116,13 @@ pub fn parse(input: String) -> Int:
             if input[i] == "#":
                 qend = i
             i = i + 1
-        g_queries.insert(idx, input.substring(qstart, qend))
+        url_queries.insert(idx, input.substring(qstart, qend))
         pos = qend
 
     # fragment: after #
     if pos < input.len() and input[pos] == "#":
         pos = pos + 1
-        g_fragments.insert(idx, input.substring(pos, input.len()))
+        url_fragments.insert(idx, input.substring(pos, input.len()))
 
     return idx
 
@@ -133,62 +133,62 @@ pub fn parse(input: String) -> Int:
 # Returns the URL scheme (e.g., "https", "http", "ftp").
 # Returns empty string if no scheme was present.
 pub fn scheme(handle: Int) -> String:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_url_id:
         return ""
-    return g_schemes[handle]
+    return url_schemes[handle]
 
 # Returns the hostname (e.g., "example.com").
 # Returns empty string if parse failed or no host.
 pub fn host(handle: Int) -> String:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_url_id:
         return ""
-    return g_hosts[handle]
+    return url_hosts[handle]
 
 # Returns the port number, or -1 if not specified in the URL.
 pub fn port(handle: Int) -> Int:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_url_id:
         return 0 - 1
-    return g_ports[handle]
+    return url_ports[handle]
 
 # Returns the path component (e.g., "/api/v1/users").
 # Returns empty string if no path.
 pub fn path(handle: Int) -> String:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_url_id:
         return ""
-    return g_paths[handle]
+    return url_paths[handle]
 
 # Returns the query string without the leading "?".
 # Returns empty string if no query.
 pub fn query(handle: Int) -> String:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_url_id:
         return ""
-    return g_queries[handle]
+    return url_queries[handle]
 
 # Returns the fragment without the leading "#".
 # Returns empty string if no fragment.
 pub fn fragment(handle: Int) -> String:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_url_id:
         return ""
-    return g_fragments[handle]
+    return url_fragments[handle]
 
 # Reconstructs the full URL string from its components.
 # Returns empty string if handle is invalid.
 pub fn to_string(handle: Int) -> String:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_url_id:
         return ""
     mut result := ""
-    s := g_schemes[handle]
+    s := url_schemes[handle]
     if s.len() > 0:
         result = result + s + "://"
-    result = result + g_hosts[handle]
-    p := g_ports[handle]
+    result = result + url_hosts[handle]
+    p := url_ports[handle]
     if p >= 0:
         result = result + ":" + p.to_string()
-    result = result + g_paths[handle]
-    q := g_queries[handle]
+    result = result + url_paths[handle]
+    q := url_queries[handle]
     if q.len() > 0:
         result = result + "?" + q
-    f := g_fragments[handle]
+    f := url_fragments[handle]
     if f.len() > 0:
         result = result + "#" + f
     return result
@@ -213,17 +213,17 @@ fn is_unreserved(c: String) -> Bool:
 # Percent-encodes a string per RFC 3986.
 # Unreserved characters are left as-is, all others become %XX.
 pub fn encode(input: String) -> String:
-    hex := "0123456789abcdef"
+    hex_digits := "0123456789abcdef"
     mut result := ""
-    mut i := 0
-    while i < input.len():
-        c := input[i]
-        if is_unreserved(c):
-            result = result + c
-        if not is_unreserved(c):
-            v := ord(c)
-            result = result + "%" + hex[v / 16] + hex[v % 16]
-        i = i + 1
+    mut position := 0
+    while position < input.len():
+        character := input[position]
+        if is_unreserved(character):
+            result = result + character
+        if not is_unreserved(character):
+            char_value := ord(character)
+            result = result + "%" + hex_digits[char_value / 16] + hex_digits[char_value % 16]
+        position = position + 1
     return result
 
 # Converts a hex digit character to its numeric value.
@@ -240,21 +240,21 @@ fn hex_digit(c: String) -> Int:
 # Also converts "+" to space (application/x-www-form-urlencoded).
 pub fn decode(input: String) -> String:
     mut result := ""
-    mut i := 0
-    while i < input.len():
-        if input[i] == "%" and i + 2 < input.len():
-            hi := hex_digit(input[i + 1])
-            lo := hex_digit(input[i + 2])
-            if hi >= 0 and lo >= 0:
-                result = result + chr(hi * 16 + lo)
-                i = i + 3
-            if hi < 0 or lo < 0:
-                result = result + input[i]
-                i = i + 1
-        if input[i] != "%" or i + 2 >= input.len():
-            if input[i] == "+":
+    mut position := 0
+    while position < input.len():
+        if input[position] == "%" and position + 2 < input.len():
+            high_nibble := hex_digit(input[position + 1])
+            low_nibble := hex_digit(input[position + 2])
+            if high_nibble >= 0 and low_nibble >= 0:
+                result = result + chr(high_nibble * 16 + low_nibble)
+                position = position + 3
+            if high_nibble < 0 or low_nibble < 0:
+                result = result + input[position]
+                position = position + 1
+        if input[position] != "%" or position + 2 >= input.len():
+            if input[position] == "+":
                 result = result + " "
-            if input[i] != "+":
-                result = result + input[i]
-            i = i + 1
+            if input[position] != "+":
+                result = result + input[position]
+            position = position + 1
     return result

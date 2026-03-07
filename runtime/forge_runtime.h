@@ -1295,21 +1295,19 @@ static inline forge_list_t forge_string_split(forge_string_t s, forge_string_t s
     if (sep.len == 0) {
         // split on empty separator: return each character
         for (int64_t i = 0; i < s.len; i++) {
-            char *ch = (char *)malloc(2);
-            if (!ch) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+            char *ch = forge_str_alloc_rc(1);
             ch[0] = s.data[i];
             ch[1] = '\0';
-        forge_string_t part = { .data = ch, .len = 1, .is_heap = true };
-        forge_list_push(&result, &part, sizeof(forge_string_t));
-    }
-    return result;
+            forge_string_t part = { .data = ch, .len = 1, .is_heap = true };
+            forge_list_push(&result, &part, sizeof(forge_string_t));
+        }
+        return result;
     }
     int64_t start = 0;
     for (int64_t i = 0; i + sep.len <= s.len; i++) {
         if (memcmp(s.data + i, sep.data, (size_t)sep.len) == 0) {
             int64_t part_len = i - start;
-            char *buf = (char *)malloc((size_t)part_len + 1);
-            if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+            char *buf = forge_str_alloc_rc(part_len);
             memcpy(buf, s.data + start, (size_t)part_len);
             buf[part_len] = '\0';
             forge_string_t part = { .data = buf, .len = part_len, .is_heap = true };
@@ -1320,8 +1318,7 @@ static inline forge_list_t forge_string_split(forge_string_t s, forge_string_t s
     }
     // remaining part after last separator
     int64_t part_len = s.len - start;
-    char *buf = (char *)malloc((size_t)part_len + 1);
-    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    char *buf = forge_str_alloc_rc(part_len);
     memcpy(buf, s.data + start, (size_t)part_len);
     buf[part_len] = '\0';
     forge_string_t part = { .data = buf, .len = part_len, .is_heap = true };
@@ -1335,8 +1332,7 @@ static inline forge_string_t forge_list_join(forge_list_t list, forge_string_t s
     if (len == 0) return forge_string_empty;
     forge_string_t *items = (forge_string_t *)forge_list_data(list);
     if (len == 1) {
-        char *buf = (char *)malloc((size_t)items[0].len + 1);
-        if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        char *buf = forge_str_alloc_rc(items[0].len);
         memcpy(buf, items[0].data, (size_t)items[0].len);
         buf[items[0].len] = '\0';
         return (forge_string_t){ .data = buf, .len = items[0].len, .is_heap = true };
@@ -1347,8 +1343,7 @@ static inline forge_string_t forge_list_join(forge_list_t list, forge_string_t s
         total += items[i].len;
     }
     total += (len - 1) * sep.len;
-    char *buf = (char *)malloc((size_t)total + 1);
-    if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+    char *buf = forge_str_alloc_rc(total);
     int64_t pos = 0;
     for (int64_t i = 0; i < len; i++) {
         if (i > 0) {
@@ -1366,8 +1361,7 @@ static inline forge_string_t forge_list_join(forge_list_t list, forge_string_t s
 static inline forge_list_t forge_string_chars(forge_string_t s) {
     forge_list_t result = forge_list_empty();
     for (int64_t i = 0; i < s.len; i++) {
-        char *ch = (char *)malloc(2);
-        if (!ch) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
+        char *ch = forge_str_alloc_rc(1);
         ch[0] = s.data[i];
         ch[1] = '\0';
         forge_string_t part = { .data = ch, .len = 1, .is_heap = true };

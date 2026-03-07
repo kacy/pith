@@ -3,31 +3,31 @@ from std.net.url import parse, scheme, host, port, path, query, fragment, to_str
 
 fn main():
     # parse a full URL
-    u := parse("https://example.com:8080/api/v1?key=value#section")
-    print("scheme: " + scheme(u))
-    print("host: " + host(u))
-    print("port: " + port(u).to_string())
-    print("path: " + path(u))
-    print("query: " + query(u))
-    print("fragment: " + fragment(u))
+    full_url := parse("https://example.com:8080/api/v1?key=value#section")
+    print("scheme: " + scheme(full_url))
+    print("host: " + host(full_url))
+    print("port: " + port(full_url).to_string())
+    print("path: " + path(full_url))
+    print("query: " + query(full_url))
+    print("fragment: " + fragment(full_url))
 
     # reconstruct
-    print("full: " + to_string(u))
+    print("full: " + to_string(full_url))
 
     # simple URL without port/query/fragment
-    u2 := parse("http://localhost/index.html")
-    print("scheme2: " + scheme(u2))
-    print("host2: " + host(u2))
-    print("port2: " + port(u2).to_string())
-    print("path2: " + path(u2))
+    simple_url := parse("http://localhost/index.html")
+    print("scheme2: " + scheme(simple_url))
+    print("host2: " + host(simple_url))
+    print("port2: " + port(simple_url).to_string())
+    print("path2: " + path(simple_url))
 
     # percent encode/decode
-    encoded := encode("hello world & more")
-    print("encoded: " + encoded)
-    decoded := decode(encoded)
-    print("decoded: " + decoded)
+    encoded_string := encode("hello world & more")
+    print("encoded: " + encoded_string)
+    decoded_string := decode(encoded_string)
+    print("decoded: " + decoded_string)
 
     # round-trip
-    original := "foo=bar baz&x=1+2"
-    rt := decode(encode(original))
-    print("round-trip: " + rt)
+    original_text := "foo=bar baz&x=1+2"
+    roundtrip_result := decode(encode(original_text))
+    print("round-trip: " + roundtrip_result)

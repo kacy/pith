@@ -1,4 +1,5 @@
 # bitwise operations and ord/chr round-tripping
+# demonstrates: ord/chr conversion, bit manipulation, byte extraction
 
 fn main():
     # ord and chr are inverses
@@ -27,16 +28,16 @@ fn main():
     print("shl 1 4: " + bit_shl(1, 4).to_string())
     print("shr 256 4: " + bit_shr(256, 4).to_string())
 
-    # practical: extract bytes from 0xDEAD
-    val := 0xDEAD
-    low := bit_and(val, 0xFF)
-    high := bit_and(bit_shr(val, 8), 0xFF)
-    print("low byte: " + low.to_string())
-    print("high byte: " + high.to_string())
+    # practical: extract bytes from a 16-bit value
+    original_value := 0xDEAD
+    low_byte := bit_and(original_value, 0xFF)
+    high_byte := bit_and(bit_shr(original_value, 8), 0xFF)
+    print("low byte: " + low_byte.to_string())
+    print("high byte: " + high_byte.to_string())
 
-    # reassemble
-    built := bit_or(bit_shl(high, 8), low)
-    print("reassembled: " + (built == 0xDEAD).to_string())
+    # reassemble the original value from its bytes
+    reassembled_value := bit_or(bit_shl(high_byte, 8), low_byte)
+    print("reassembled: " + (reassembled_value == 0xDEAD).to_string())
 
     # print_err goes to stderr (not captured in stdout diff)
     print_err("this goes to stderr")

@@ -1,35 +1,37 @@
 # encoding — base64 and hex encode/decode
+# demonstrates: encoding round-trips and error handling
+
 from std.encoding import b64_encode, b64_decode, to_hex, from_hex
 
 fn run() -> String!:
     # base64 encode
-    encoded := b64_encode("hello world")
-    print("base64 encode: " + encoded)
+    encoded_base64 := b64_encode("hello world")
+    print("base64 encode: " + encoded_base64)
 
     # base64 decode
-    decoded := b64_decode(encoded)!
-    print("base64 decode: " + decoded)
+    decoded_string := b64_decode(encoded_base64)!
+    print("base64 decode: " + decoded_string)
 
-    # base64 padding cases
+    # base64 padding cases - different input lengths produce different padding
     print("base64 'a': " + b64_encode("a"))
     print("base64 'ab': " + b64_encode("ab"))
     print("base64 'abc': " + b64_encode("abc"))
 
     # hex encode
-    hex := to_hex("Hello")
-    print("hex encode: " + hex)
+    hex_encoded := to_hex("Hello")
+    print("hex encode: " + hex_encoded)
 
     # hex decode
-    hex_decoded := from_hex(hex)!
+    hex_decoded := from_hex(hex_encoded)!
     print("hex decode: " + hex_decoded)
 
     # hex single byte
     print("hex 0xff: " + to_hex(chr(255)))
 
-    # round-trip
-    original := "forge programming language"
-    rt := b64_decode(b64_encode(original))!
-    print("round-trip: " + rt)
+    # round-trip: encode then decode should return original
+    original_text := "forge programming language"
+    roundtrip_result := b64_decode(b64_encode(original_text))!
+    print("round-trip: " + roundtrip_result)
     return ""
 
 fn main():

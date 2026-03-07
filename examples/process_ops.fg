@@ -2,20 +2,20 @@
 
 fn run() -> String!:
     # spawn echo command
-    p := process_spawn("echo hello from child")!
-    output := process_read(p, 4096)!
-    code := process_wait(p)
-    process_close(p)
+    child_process := process_spawn("echo hello from child")!
+    output := process_read(child_process, 4096)!
+    exit_code := process_wait(child_process)
+    process_close(child_process)
     print("output: " + output.trim())
-    print("exit code: " + code.to_string())
+    print("exit code: " + exit_code.to_string())
 
     # spawn a command that produces stderr
-    p2 := process_spawn("ls /nonexistent_path_xyz")!
-    err_out := process_read_err(p2, 4096)!
-    code2 := process_wait(p2)
-    process_close(p2)
-    print("stderr: " + (err_out.len() > 0).to_string())
-    print("ls failed: " + (code2 != 0).to_string())
+    failing_process := process_spawn("ls /nonexistent_path_xyz")!
+    error_output := process_read_err(failing_process, 4096)!
+    failing_exit_code := process_wait(failing_process)
+    process_close(failing_process)
+    print("stderr: " + (error_output.len() > 0).to_string())
+    print("ls failed: " + (failing_exit_code != 0).to_string())
     return ""
 
 fn main():

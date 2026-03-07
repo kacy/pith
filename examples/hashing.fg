@@ -1,4 +1,6 @@
-# hashing — SHA-256 and FNV-1a
+# hashing — SHA-256 and FNV-1a hash functions
+# demonstrates: hash consistency, determinism, and input sensitivity
+
 from std.hash import sha256, fnv1a
 
 fn main():
@@ -7,14 +9,14 @@ fn main():
     print("sha256 hello: " + sha256("hello"))
     print("sha256 abc: " + sha256("abc"))
 
-    # FNV-1a
-    h1 := fnv1a("hello")
-    h2 := fnv1a("hello")
-    h3 := fnv1a("world")
-    print("fnv1a consistent: " + (h1 == h2).to_string())
-    print("fnv1a differs: " + (h1 != h3).to_string())
+    # FNV-1a hash consistency - same input produces same output
+    hash_hello_first := fnv1a("hello")
+    hash_hello_second := fnv1a("hello")
+    hash_world := fnv1a("world")
+    print("fnv1a consistent: " + (hash_hello_first == hash_hello_second).to_string())
+    print("fnv1a differs: " + (hash_hello_first != hash_world).to_string())
 
-    # SHA-256 is deterministic
-    s1 := sha256("forge")
-    s2 := sha256("forge")
-    print("sha256 consistent: " + (s1 == s2).to_string())
+    # SHA-256 is deterministic - same input always produces same hash
+    hash_forge_first := sha256("forge")
+    hash_forge_second := sha256("forge")
+    print("sha256 consistent: " + (hash_forge_first == hash_forge_second).to_string())

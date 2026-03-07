@@ -11,24 +11,24 @@ fn server(port: Int) -> String!:
 
 fn run() -> String!:
     # dns resolve
-    ip := dns_resolve("localhost")!
-    print("resolved localhost: " + ip)
+    resolved_ip := dns_resolve("localhost")!
+    print("resolved localhost: " + resolved_ip)
 
     # start server in background
     port := 19876
-    s := spawn server(port)
+    server_task := spawn server(port)
 
     # small delay to let server bind
     sleep(100)
 
     # connect and exchange data
-    fd := tcp_connect("127.0.0.1", port)!
-    tcp_write(fd, "hello from forge")!
-    response := tcp_read(fd, 1024)!
+    connection_fd := tcp_connect("127.0.0.1", port)!
+    tcp_write(connection_fd, "hello from forge")!
+    response := tcp_read(connection_fd, 1024)!
     print("echo response: " + response)
-    tcp_close(fd)
+    tcp_close(connection_fd)
 
-    await s
+    await server_task
     return ""
 
 fn main():

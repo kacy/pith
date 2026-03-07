@@ -1,0 +1,39 @@
+# std.net.http — HTTP protocol utilities
+#
+# Simple HTTP constants and utilities.
+
+# Content Type Constants
+pub MIME_TEXT := "text/plain"
+pub MIME_HTML := "text/html"
+pub MIME_JSON := "application/json"
+pub MIME_JS := "application/javascript"
+pub MIME_CSS := "text/css"
+
+# HTTP Status Codes
+pub STATUS_OK := 200
+pub STATUS_NOT_FOUND := 404
+pub STATUS_SERVER_ERROR := 500
+
+# Build simple HTTP response
+# Usage: build_response(200, "text/html", "<h1>Hello</h1>")
+pub fn build_response(status: Int, content_type: String, body: String) -> String:
+    mut response := "HTTP/1.1 "
+    response = response + status.to_string()
+    response = response + " OK\r\n"
+    response = response + "Content-Type: "
+    response = response + content_type
+    response = response + "\r\n"
+    response = response + "Content-Length: "
+    response = response + body.len().to_string()
+    response = response + "\r\n"
+    response = response + "\r\n"
+    response = response + body
+    return response
+
+# Simple HTTP 200 OK response with HTML
+pub fn html_response(html: String) -> String:
+    return build_response(200, MIME_HTML, html)
+
+# Simple HTTP 200 OK response with JSON
+pub fn json_response(json: String) -> String:
+    return build_response(200, MIME_JSON, json)

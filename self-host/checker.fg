@@ -2565,6 +2565,20 @@ fn c_check_exhaustiveness(subject_type: Int, arm_values: List[String], node_idx:
     if subj_info.kind == "enum":
         c_check_enum_exhaustiveness(subj_info, arm_values)
         return
+    if subj_info.kind == "optional":
+        # Optional needs both Some and None patterns (or wildcard)
+        mut has_some := false
+        mut has_none := false
+        for v in arm_values:
+            if v == "Some" or v == "_":
+                has_some = true
+            if v == "None" or v == "_":
+                has_none = true
+        if not has_some:
+            c_error("E204", "non-exhaustive match on Optional: add 'Some' case or wildcard (_)")
+        if not has_none:
+            c_error("E204", "non-exhaustive match on Optional: add 'None' case or wildcard (_)")
+        return
     # infinite domain (Int, String, Float) — need wildcard
     c_error("E204", "non-exhaustive match: add a wildcard (_) pattern")
 

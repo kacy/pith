@@ -204,7 +204,19 @@ fn p_parse_value() -> Int:
         p_pos = p_pos + 1
         arr := t_alloc("array")
         p_skip_ws()
+        mut iterations := 0
+        mut last_pos := p_pos
         while p_pos < p_data.len() and p_at(p_pos) != "]":
+            iterations = iterations + 1
+            # Safety: prevent infinite loops on malformed input
+            if iterations > 10000:
+                p_err = true
+                return 0 - 1
+            # Ensure we're making progress
+            if p_pos == last_pos and iterations > 1:
+                p_err = true
+                return 0 - 1
+            last_pos = p_pos
             p_skip_ws()
             if p_pos < p_data.len() and p_at(p_pos) == chr(10):
                 p_pos = p_pos + 1

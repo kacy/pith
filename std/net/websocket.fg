@@ -1,28 +1,55 @@
-# std.net.websocket — WebSocket protocol constants
+# std.net.websocket — WebSocket protocol (RFC 6455)
 #
-# WebSocket opcodes and constants.
-# Handshake and frame handling must be implemented using tcp primitives.
+# WebSocket implementation with proper SHA1+base64 handshake.
+
+from std.hash import sha1
+from std.encoding import b64_encode
+
+# Magic GUID for WebSocket handshake
+WS_MAGIC := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # Opcodes
-pub OP_CONTINUATION := 0
-pub OP_TEXT := 1
-pub OP_BINARY := 2
-pub OP_CLOSE := 8
-pub OP_PING := 9
-pub OP_PONG := 10
+OP_TEXT := 1
+OP_BINARY := 2
+OP_CLOSE := 8
+OP_PING := 9
+OP_PONG := 10
 
-# Magic GUID for handshake
-pub WS_GUID := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# Perform WebSocket handshake key computation (RFC 6455)
+# Input: Sec-WebSocket-Key from client (24-char base64)
+# Output: Sec-WebSocket-Accept value (base64 of SHA1)
+pub fn compute_accept(key: String) -> String:
+    # Concatenate key with magic GUID
+    combined := key + WS_MAGIC
+    # SHA1 hash (returns 40-char hex)
+    hash_hex := sha1(combined)
+    # Convert hex to bytes then base64 encode
+    mut hash_bytes := ""
+    mut i := 0
+    while i < hash_hex.len():
+        # Convert 2 hex chars to 1 byte
+        mut high := hex_val(hash_hex[i])
+        mut low := hex_val(hash_hex[i + 1])
+        hash_bytes = hash_bytes + chr(high * 16 + low)
+        i = i + 2
+    return b64_encode(hash_bytes)
 
-# Build WebSocket handshake response (simplified)
-# In real implementation, would compute SHA1 + base64
+# Helper: convert hex char to value
+fn hex_val(c: String) -> Int:
+    if c >= "0" and c <= "9":
+        return ord(c) - 48
+    if c >= "a" and c <= "f":
+        return ord(c) - 87
+    if c >= "A" and c <= "F":
+        return ord(c) - 55
+    return 0
+
+# Build WebSocket handshake response
 pub fn handshake_response(key: String) -> String:
+    mut accept := compute_accept(key)
     mut response := "HTTP/1.1 101 Switching Protocols\r\n"
     response = response + "Upgrade: websocket\r\n"
     response = response + "Connection: Upgrade\r\n"
-    response = response + "Sec-WebSocket-Accept: "
-    response = response + key
-    response = response + WS_GUID
-    response = response + "\r\n"
+    response = response + "Sec-WebSocket-Accept: " + accept + "\r\n"
     response = response + "\r\n"
     return response

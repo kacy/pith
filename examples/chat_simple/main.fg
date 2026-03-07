@@ -1,0 +1,190 @@
+# Simple Chat Server with WebSocket
+#
+# A minimal chat server demonstrating:
+# - HTTP request parsing
+# - WebSocket handshake
+# - WebSocket frame handling
+# - spawn/await for concurrent clients
+# - Channel-based broadcast
+
+from std.net.tcp import listen, accept, read, write, close
+from std.net.http import parse_request, build_response, MIME_HTML, MIME_JSON
+from std.net.websocket import handshake, read_frame, send_text, send_close, frame_is_text, frame_is_close, frame_is_ping, frame_text
+from std.json import parse, encode, set_string
+from std.sync import Mutex
+
+# Global client list - protected by mutex
+mut clients := List[Int]{}  # List of connected client file descriptors
+mut clients_mutex := Mutex{}
+
+# Broadcast message to all connected clients
+fn broadcast(sender_fd: Int, message: String):
+    clients_mutex.lock()
+    for fd in clients:
+        if fd != sender_fd:  # Don't echo back to sender
+            # Non-critical: don't fail if one client errors
+            send_text(fd, message)
+    clients_mutex.unlock()
+
+# Handle a single client connection
+fn handle_client(fd: Int) -> Task[Void]:
+    # Step 1: Read HTTP request for WebSocket upgrade
+    http_data := read(fd, 4096)
+    if http_data.is_err():
+        close(fd)
+        return
+    
+    req := parse_request(http_data.ok)
+    if req.is_none():
+        # Not a valid request, close connection
+        close(fd)
+        return
+    
+    # Step 2: Perform WebSocket handshake
+    accept_response := handshake(req.ok)
+    if accept_response.is_none():
+        # Not a WebSocket upgrade, serve static HTML
+        serve_client_html(fd)
+        return
+    
+    # Send handshake response
+    if write(fd, accept_response.ok).is_err():
+        close(fd)
+        return
+    
+    # Step 3: Add to client list
+    clients_mutex.lock()
+    clients.push(fd)
+    clients_mutex.unlock()
+    
+    # Step 4: Handle WebSocket frames
+    try:
+        while true:
+            frame_opt := read_frame(fd, 65536)  # Max 64KB per frame
+            
+            if frame_opt.is_none():
+                break  # Connection closed or error
+            
+            frame := frame_opt.ok
+            
+            # Handle different frame types
+            if frame_is_close(frame):
+                break  # Client requested close
+            
+            if frame_is_ping(frame):
+                # Auto-reply with pong
+                send_pong(fd, frame.payload)
+                continue
+            
+            if frame_is_text(frame):
+                # Parse JSON message
+                text := frame_text(frame)
+                doc := parse(text)
+                
+                if doc >= 0:
+                    # Build response with timestamp
+                    response := Map[String, String]{}
+                    response.insert("text", text)
+                    response.insert("time", now().to_string())
+                    json_response := encode(response)
+                    
+                    # Broadcast to all clients
+                    broadcast(fd, json_response)
+    
+    except:
+        pass  # Client disconnected unexpectedly
+    
+    finally:
+        # Cleanup
+        clients_mutex.lock()
+        clients.remove(fd)
+        clients_mutex.unlock()
+        
+        send_close(fd, None, None)
+        close(fd)
+
+# Serve the HTML client for browsers
+fn serve_client_html(fd: Int):
+    html := "<!DOCTYPE html>"
+    html := html + "<html><head><title>Chat</title></head><body>"
+    html := html + "<h1>Forge Chat</h1>"
+    html := html + "<div id=\"messages\" style=\"border:1px solid #ccc;height:300px;overflow-y:scroll\"></div>"
+    html := html + "<input type=\"text\" id=\"input\" placeholder=\"Type message...\" style=\"width:80%\">"
+    html := html + "<button onclick=\"send()\">Send</button>"
+    html := html + "<script>"
+    html := html + "const ws = new WebSocket('ws://localhost:8080');"
+    html := html + "ws.onmessage = (e) => {"
+    html := html + "  const msg = JSON.parse(e.data);"
+    html := html + "  const div = document.createElement('div');"
+    html := html + "  div.textContent = msg.text;"
+    html := html + "  document.getElementById('messages').appendChild(div);"
+    html := html + "};"
+    html := html + "function send() {"
+    html := html + "  const input = document.getElementById('input');"
+    html := html + "  ws.send(JSON.stringify({text: input.value}));"
+    html := html + "  input.value = '';"
+    html := html + "}"
+    html := html + "document.getElementById('input').onkeypress = (e) => { if(e.key==='Enter') send(); };"
+    html := html + "</script></body></html>"
+    
+    response := build_response(200, {"Content-Type": MIME_HTML}, html)
+    write(fd, response)
+    close(fd)
+
+# Get current timestamp (simplified)
+fn now() -> Int:
+    # Would use actual time function
+    return 0
+
+# Main server loop
+fn main():
+    port := 8080
+    print("Starting chat server on port " + port.to_string())
+    print("Open http://localhost:" + port.to_string() + " in your browser")
+    
+    server_fd := listen("0.0.0.0", port)
+    if server_fd < 0:
+        print("Failed to start server")
+        return
+    
+    print("Server running...")
+    
+    while true:
+        client_fd := accept(server_fd)
+        if client_fd >= 0:
+            # Spawn handler for this client
+            spawn handle_client(client_fd)
+
+@test
+fn test_websocket_handshake():
+    # Test that handshake produces valid response
+    req := Request{
+        method: "GET",
+        path: "/",
+        query: Map[String, String]{},
+        version: "HTTP/1.1",
+        headers: {
+            "upgrade": "websocket",
+            "connection": "Upgrade",
+            "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ=="
+        },
+        body: ""
+    }
+    
+    response := handshake(req)
+    assert(response.is_some(), "Handshake should succeed with valid WebSocket headers")
+    
+    # Response should contain Sec-WebSocket-Accept
+    assert(response.ok.find("Sec-WebSocket-Accept") >= 0, "Response should contain accept header")
+
+@test  
+fn test_frame_text_extraction():
+    # Create a text frame with "hello"
+    payload := Bytes{}
+    for c in "hello":
+        payload.push(ord(c))
+    
+    frame := Frame{opcode: 0x1, payload: payload, is_final: true}
+    
+    assert(frame_is_text(frame), "Frame with opcode 1 should be text")
+    assert(frame_text(frame) == "hello", "Frame text should match payload")

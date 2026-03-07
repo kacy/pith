@@ -1795,6 +1795,39 @@ static inline void forge_tcp_close(int64_t fd) {
     close((int)fd);
 }
 
+// -------------------------------------------------------------
+// WebSocket utilities
+// -------------------------------------------------------------
+
+#include <openssl/sha.h>  // For SHA1
+
+// WebSocket key acceptance computation
+// Concatenate key with magic GUID, SHA1 hash, then base64 encode
+static inline forge_string_t forge_ws_accept_key(forge_string_t key) {
+    const char *magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    size_t combined_len = (size_t)key.len + strlen(magic);
+    char *combined = (char *)malloc(combined_len + 1);
+    memcpy(combined, key.data, (size_t)key.len);
+    memcpy(combined + key.len, magic, strlen(magic));
+    combined[combined_len] = '\0';
+    
+    // SHA1 hash
+    unsigned char hash[SHA_DIGEST_LENGTH];
+    SHA1((unsigned char *)combined, combined_len, hash);
+    free(combined);
+    
+    // Base64 encode
+    // Simplified: use existing base64 if available, or inline implementation
+    // For now, return as hex (proper base64 needs implementation)
+    char *buf = forge_str_alloc(SHA_DIGEST_LENGTH * 2);
+    for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+        sprintf(buf + i * 2, "%02x", hash[i]);
+    }
+    buf[SHA_DIGEST_LENGTH * 2] = '\0';
+    
+    return (forge_string_t){ .data = buf, .len = SHA_DIGEST_LENGTH * 2 };
+}
+
 // dns_resolve(hostname) -> String! (first IP address)
 static inline bool forge_dns_resolve_impl(forge_string_t hostname, forge_string_t *out) {
     char *host_cstr = forge_cstr(hostname);

@@ -206,3 +206,122 @@ pub fn fnv1a(input: String) -> Int:
         h = bit_and(h * 16777619, 4294967295)
         i = i + 1
     return h
+
+# ---------------------------------------------------------------
+# SHA-1 implementation (RFC 3174)
+# Required for WebSocket handshake
+# ---------------------------------------------------------------
+
+# SHA-1 constants
+K0 := 1518500249   # 0x5A827999 for rounds 0-19
+K1 := 1859775393   # 0x6ED9EBA1 for rounds 20-39
+K2 := 2400959708   # 0x8F1BBCDC for rounds 40-59
+K3 := 3395469782   # 0xCA62C1D6 for rounds 60-79
+
+# 32-bit left rotate
+fn rotl32(x: Int, n: Int) -> Int:
+    return bit_or(bit_shl(x, n), bit_shr(x, 32 - n))
+
+# 32-bit safe add
+fn add32(a: Int, b: Int) -> Int:
+    return bit_and(a + b, 4294967295)
+
+# compute SHA-1 hash of a string, returned as 40-char hex.
+pub fn sha1(input: String) -> String:
+    # Initial hash values
+    mut h0 := 1732584193   # 0x67452301
+    mut h1 := 4023233417   # 0xEFCDAB89
+    mut h2 := 2562383102   # 0x98BADCFE
+    mut h3 := 271733878    # 0x10325476
+    mut h4 := 3285377520   # 0xC3D2E1F0
+    
+    # Build padded message
+    mut msg: List[Int] := []
+    mut i := 0
+    while i < input.len():
+        msg.push(ord(input[i]))
+        i = i + 1
+    
+    # Append 0x80
+    msg.push(128)
+    
+    # Pad with zeros until length is 56 mod 64
+    while msg.len() % 64 != 56:
+        msg.push(0)
+    
+    # Append 8-byte big-endian bit length
+    bit_len := input.len() * 8
+    msg.push(bit_and(bit_shr(bit_len, 56), 255))
+    msg.push(bit_and(bit_shr(bit_len, 48), 255))
+    msg.push(bit_and(bit_shr(bit_len, 40), 255))
+    msg.push(bit_and(bit_shr(bit_len, 32), 255))
+    msg.push(bit_and(bit_shr(bit_len, 24), 255))
+    msg.push(bit_and(bit_shr(bit_len, 16), 255))
+    msg.push(bit_and(bit_shr(bit_len, 8), 255))
+    msg.push(bit_and(bit_len, 255))
+    
+    # Process each 64-byte block
+    mut block := 0
+    while block < msg.len():
+        # Prepare message schedule W[0..79]
+        mut w: List[Int] := []
+        
+        # First 16 words from block
+        i = 0
+        while i < 16:
+            word := msg[block + i * 4] * 16777216 + msg[block + i * 4 + 1] * 65536 + msg[block + i * 4 + 2] * 256 + msg[block + i * 4 + 3]
+            w.push(word)
+            i = i + 1
+        
+        # Extend to 80 words
+        i = 16
+        while i < 80:
+            w.push(rotl32(bit_xor(bit_xor(bit_xor(w[i - 3], w[i - 8]), w[i - 14]), w[i - 16]), 1))
+            i = i + 1
+        
+        # Initialize working variables
+        mut a := h0
+        mut b := h1
+        mut c := h2
+        mut d := h3
+        mut e := h4
+        
+        # Main loop
+        i = 0
+        while i < 80:
+            mut f := 0
+            mut k := 0
+            
+            if i < 20:
+                f = bit_or(bit_and(b, c), bit_and(bit_not(b), d))
+                k = K0
+            elif i < 40:
+                f = bit_xor(bit_xor(b, c), d)
+                k = K1
+            elif i < 60:
+                f = bit_or(bit_or(bit_and(b, c), bit_and(b, d)), bit_and(c, d))
+                k = K2
+            else:
+                f = bit_xor(bit_xor(b, c), d)
+                k = K3
+            
+            temp := add32(add32(add32(add32(rotl32(a, 5), f), e), k), w[i])
+            e = d
+            d = c
+            c = rotl32(b, 30)
+            b = a
+            a = temp
+            
+            i = i + 1
+        
+        # Add to hash
+        h0 = add32(h0, a)
+        h1 = add32(h1, b)
+        h2 = add32(h2, c)
+        h3 = add32(h3, d)
+        h4 = add32(h4, e)
+        
+        block = block + 64
+    
+    # Produce 40-char hex string
+    return word32_to_hex(h0) + word32_to_hex(h1) + word32_to_hex(h2) + word32_to_hex(h3) + word32_to_hex(h4)

@@ -1,9 +1,10 @@
 # Simple HTTP Server Example
 #
 # A basic HTTP server demonstrating the std.net.http module
+# and proper Result type handling.
 
 from std.net.tcp import listen, accept, read, write, close
-from std.net.http import html_response, json_response
+from std.net.http import html_response, json_response, MIME_HTML
 
 # Serve a simple HTML page
 fn serve_root(fd: Int):
@@ -16,15 +17,17 @@ fn serve_root(fd: Int):
     html = html + "</body></html>"
     
     mut response := html_response(html)
-    write(fd, response)
-    close(fd)
+    mut write_result := write(fd, response)
+    if write_result.is_ok:
+        close(fd)
 
 # Serve JSON response  
 fn serve_json(fd: Int):
     mut json := "{\"message\":\"Hello from Forge!\",\"status\":\"ok\"}"
     mut response := json_response(json)
-    write(fd, response)
-    close(fd)
+    mut write_result := write(fd, response)
+    if write_result.is_ok:
+        close(fd)
 
 # Serve 404
 fn serve_not_found(fd: Int):
@@ -38,30 +41,37 @@ fn serve_not_found(fd: Int):
     response = response + "\r\n"
     response = response + html
     
-    write(fd, response)
-    close(fd)
+    mut write_result := write(fd, response)
+    if write_result.is_ok:
+        close(fd)
 
 # Handle a single HTTP request
 fn handle_request(fd: Int):
-    # Read HTTP request
-    mut request_data := read(fd, 4096)
+    # Read HTTP request - returns Result[String]
+    mut read_result := read(fd, 4096)
     
-    # Simple routing
-    if request_data.len() > 0:
-        # Extract path from request line
-        mut parts := request_data.split(" ")
-        if parts.len() >= 2:
-            mut path := parts[1]
-            
-            if path == "/" or path == "/index.html":
-                serve_root(fd)
-            elif path == "/json":
-                serve_json(fd)
+    if read_result.is_ok:
+        mut request_data := read_result.ok
+        
+        # Simple routing
+        if request_data.len() > 0:
+            # Extract path from request line
+            mut parts := request_data.split(" ")
+            if parts.len() >= 2:
+                mut path := parts[1]
+                
+                if path == "/" or path == "/index.html":
+                    serve_root(fd)
+                elif path == "/json":
+                    serve_json(fd)
+                else:
+                    serve_not_found(fd)
             else:
-                serve_not_found(fd)
+                close(fd)
         else:
             close(fd)
     else:
+        # Read failed
         close(fd)
 
 # Main server
@@ -70,17 +80,19 @@ fn main():
     print("Starting HTTP server on port " + port.to_string())
     print("Visit http://localhost:" + port.to_string())
     
-    # Bind to port
-    mut server_fd := listen("0.0.0.0", port)
-    if server_fd < 0:
+    # Bind to port - returns Result[Int]
+    mut listen_result := listen("0.0.0.0", port)
+    if listen_result.is_err:
         print("Failed to start server")
         return
     
+    mut server_fd := listen_result.ok
     print("Server running...")
     
     while true:
-        # Accept connections
-        mut client_fd := accept(server_fd)
-        if client_fd >= 0:
+        # Accept connections - returns Result[Int]
+        mut accept_result := accept(server_fd)
+        if accept_result.is_ok:
+            mut client_fd := accept_result.ok
             # Handle client in background
             spawn handle_request(client_fd)

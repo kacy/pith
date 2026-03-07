@@ -14,93 +14,93 @@
 # ===============================================================
 
 # Global node storage indexed by handle
-mut g_next: Int := 0
-mut g_types: Map[Int, String] := {}
-mut g_str_vals: Map[Int, String] := {}
-mut g_int_vals: Map[Int, Int] := {}
-mut g_float_vals: Map[Int, Float] := {}
-mut g_bool_vals: Map[Int, Bool] := {}
+mut next_node_id: Int := 0
+mut node_types: Map[Int, String] := {}
+mut string_values: Map[Int, String] := {}
+mut integer_values: Map[Int, Int] := {}
+mut float_values: Map[Int, Float] := {}
+mut boolean_values: Map[Int, Bool] := {}
 
 # Table children: flat append-only storage with offset/count
-mut g_tkeys: List[String] := []
-mut g_tvals: List[Int] := {}
-mut g_toff: Map[Int, Int] := {}
-mut g_tcnt: Map[Int, Int] := {}
+mut table_keys_flat: List[String] := []
+mut table_values_flat: List[Int] := {}
+mut table_key_offsets: Map[Int, Int] := {}
+mut table_key_counts: Map[Int, Int] := {}
 
 # Array children: flat append-only storage with offset/count
-mut g_aitems: List[Int] := []
-mut g_aoff: Map[Int, Int] := {}
-mut g_acnt: Map[Int, Int] := {}
+mut array_items_flat: List[Int] := []
+mut array_item_offsets: Map[Int, Int] := {}
+mut array_item_counts: Map[Int, Int] := {}
 
 # Allocates a new node of the specified type
-fn t_alloc(kind: String) -> Int:
-    idx := g_next
-    g_next = g_next + 1
-    g_types.insert(idx, kind)
-    g_str_vals.insert(idx, "")
-    g_int_vals.insert(idx, 0)
-    g_float_vals.insert(idx, 0.0)
-    g_bool_vals.insert(idx, false)
-    g_toff.insert(idx, 0)
-    g_tcnt.insert(idx, 0)
-    g_aoff.insert(idx, 0)
-    g_acnt.insert(idx, 0)
+fn allocate_node(kind: String) -> Int:
+    idx := next_node_id
+    next_node_id = next_node_id + 1
+    node_types.insert(idx, kind)
+    string_values.insert(idx, "")
+    integer_values.insert(idx, 0)
+    float_values.insert(idx, 0.0)
+    boolean_values.insert(idx, false)
+    table_key_offsets.insert(idx, 0)
+    table_key_counts.insert(idx, 0)
+    array_item_offsets.insert(idx, 0)
+    array_item_counts.insert(idx, 0)
     return idx
 
 # Sets a key-value pair in a table
-fn t_table_set(handle: Int, key: String, val: Int):
-    off := g_toff[handle]
-    cnt := g_tcnt[handle]
+fn set_table_property(handle: Int, key: String, val: Int):
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
     # for well-formed TOML, duplicates don't occur — just append
     if cnt == 0:
-        g_toff.insert(handle, g_tkeys.len())
-    g_tkeys.push(key)
-    g_tvals.push(val)
-    g_tcnt.insert(handle, cnt + 1)
+        table_key_offsets.insert(handle, table_keys_flat.len())
+    table_keys_flat.push(key)
+    table_values_flat.push(val)
+    table_key_counts.insert(handle, cnt + 1)
 
 # Appends a value to an array
-fn t_array_push(handle: Int, val: Int):
-    cnt := g_acnt[handle]
+fn push_array_element(handle: Int, val: Int):
+    cnt := array_item_counts[handle]
     if cnt == 0:
-        g_aoff.insert(handle, g_aitems.len())
-    g_aitems.push(val)
-    g_acnt.insert(handle, cnt + 1)
+        array_item_offsets.insert(handle, array_items_flat.len())
+    array_items_flat.push(val)
+    array_item_counts.insert(handle, cnt + 1)
 
 # ===============================================================
 # Parser (Internal)
 # ===============================================================
 
 # Parser state
-mut p_data: String := ""
-mut p_pos: Int := 0
-mut p_err: Bool := false
+mut parser_input: String := ""
+mut parser_position: Int := 0
+mut parser_error: Bool := false
 
 # Returns character at position i or empty string if out of bounds
-fn p_at(i: Int) -> String:
-    if i >= p_data.len():
+fn get_char_at(i: Int) -> String:
+    if i >= parser_input.len():
         return ""
-    return p_data[i]
+    return parser_input[i]
 
 # Skips whitespace (space, tab, carriage return)
-fn p_skip_ws():
-    while p_pos < p_data.len() and (p_at(p_pos) == " " or p_at(p_pos) == chr(9) or p_at(p_pos) == chr(13)):
-        p_pos = p_pos + 1
+fn skip_whitespace():
+    while parser_position < parser_input.len() and (get_char_at(parser_position) == " " or get_char_at(parser_position) == chr(9) or get_char_at(parser_position) == chr(13)):
+        parser_position = parser_position + 1
 
 # Skips a comment from # to end of line
-fn p_skip_comment():
-    if p_pos < p_data.len() and p_at(p_pos) == "#":
-        while p_pos < p_data.len() and p_at(p_pos) != chr(10):
-            p_pos = p_pos + 1
+fn skip_comment():
+    if parser_position < parser_input.len() and get_char_at(parser_position) == "#":
+        while parser_position < parser_input.len() and get_char_at(parser_position) != chr(10):
+            parser_position = parser_position + 1
 
 # Skips the rest of the current line (ws, comment, newline)
-fn p_skip_line():
-    p_skip_ws()
-    p_skip_comment()
-    if p_pos < p_data.len() and p_at(p_pos) == chr(10):
-        p_pos = p_pos + 1
+fn skip_line():
+    skip_whitespace()
+    skip_comment()
+    if parser_position < parser_input.len() and get_char_at(parser_position) == chr(10):
+        parser_position = parser_position + 1
 
 # Returns true if character is valid in a bare key
-fn p_is_key_char(c: String) -> Bool:
+fn is_key_char(c: String) -> Bool:
     if c >= "a" and c <= "z":
         return true
     if c >= "A" and c <= "Z":
@@ -112,26 +112,26 @@ fn p_is_key_char(c: String) -> Bool:
     return false
 
 # Parses a key (quoted or bare)
-fn p_parse_key() -> String:
-    p_skip_ws()
+fn parse_key() -> String:
+    skip_whitespace()
     # quoted key
-    if p_pos < p_data.len() and p_at(p_pos) == chr(34):
-        p_pos = p_pos + 1
-        start := p_pos
-        while p_pos < p_data.len() and p_at(p_pos) != chr(34):
-            p_pos = p_pos + 1
-        result := p_data.substring(start, p_pos)
-        if p_pos < p_data.len():
-            p_pos = p_pos + 1
+    if parser_position < parser_input.len() and get_char_at(parser_position) == chr(34):
+        parser_position = parser_position + 1
+        start := parser_position
+        while parser_position < parser_input.len() and get_char_at(parser_position) != chr(34):
+            parser_position = parser_position + 1
+        result := parser_input.substring(start, parser_position)
+        if parser_position < parser_input.len():
+            parser_position = parser_position + 1
         return result
     # bare key
-    start := p_pos
-    while p_pos < p_data.len() and p_is_key_char(p_at(p_pos)):
-        p_pos = p_pos + 1
-    return p_data.substring(start, p_pos)
+    start := parser_position
+    while parser_position < parser_input.len() and is_key_char(get_char_at(parser_position)):
+        parser_position = parser_position + 1
+    return parser_input.substring(start, parser_position)
 
 # Returns true if character is valid in a number
-fn p_is_num_char(c: String) -> Bool:
+fn is_number_char(c: String) -> Bool:
     if c >= "0" and c <= "9":
         return true
     if c == "." or c == "e" or c == "E" or c == "+" or c == "-" or c == "_":
@@ -139,7 +139,7 @@ fn p_is_num_char(c: String) -> Bool:
     return false
 
 # Parses an integer from a string manually
-fn t_parse_int_manual(s: String) -> Int:
+fn parse_integer_manual(s: String) -> Int:
     mut val := 0
     mut neg := false
     mut i := 0
@@ -158,7 +158,7 @@ fn t_parse_int_manual(s: String) -> Int:
     return val
 
 # Parses a float from a string manually
-fn t_parse_float_manual(s: String) -> Float:
+fn parse_float_manual(s: String) -> Float:
     # split on decimal point, compute integer + fractional parts
     mut int_part := 0
     mut frac_part := 0.0
@@ -187,105 +187,105 @@ fn t_parse_float_manual(s: String) -> Float:
     return result
 
 # Main recursive value parser
-fn p_parse_value() -> Int:
-    p_skip_ws()
-    if p_pos >= p_data.len():
-        p_err = true
+fn parse_value() -> Int:
+    skip_whitespace()
+    if parser_position >= parser_input.len():
+        parser_error = true
         return 0 - 1
-    c := p_at(p_pos)
+    c := get_char_at(parser_position)
 
     # string
     if c == chr(34):
-        p_pos = p_pos + 1
-        start := p_pos
-        while p_pos < p_data.len() and p_at(p_pos) != chr(34):
-            if p_at(p_pos) == chr(92):
-                p_pos = p_pos + 1
-            p_pos = p_pos + 1
-        val := p_data.substring(start, p_pos)
-        if p_pos < p_data.len():
-            p_pos = p_pos + 1
-        idx := t_alloc("string")
-        g_str_vals.insert(idx, val)
+        parser_position = parser_position + 1
+        start := parser_position
+        while parser_position < parser_input.len() and get_char_at(parser_position) != chr(34):
+            if get_char_at(parser_position) == chr(92):
+                parser_position = parser_position + 1
+            parser_position = parser_position + 1
+        val := parser_input.substring(start, parser_position)
+        if parser_position < parser_input.len():
+            parser_position = parser_position + 1
+        idx := allocate_node("string")
+        string_values.insert(idx, val)
         return idx
 
     # boolean true
-    if p_pos + 4 <= p_data.len() and p_data.substring(p_pos, p_pos + 4) == "true":
-        p_pos = p_pos + 4
-        idx := t_alloc("bool")
-        g_bool_vals.insert(idx, true)
+    if parser_position + 4 <= parser_input.len() and parser_input.substring(parser_position, parser_position + 4) == "true":
+        parser_position = parser_position + 4
+        idx := allocate_node("bool")
+        boolean_values.insert(idx, true)
         return idx
     # boolean false
-    if p_pos + 5 <= p_data.len() and p_data.substring(p_pos, p_pos + 5) == "false":
-        p_pos = p_pos + 5
-        idx := t_alloc("bool")
+    if parser_position + 5 <= parser_input.len() and parser_input.substring(parser_position, parser_position + 5) == "false":
+        parser_position = parser_position + 5
+        idx := allocate_node("bool")
         return idx
 
     # array
     if c == "[":
-        p_pos = p_pos + 1
-        arr := t_alloc("array")
-        p_skip_ws()
+        parser_position = parser_position + 1
+        arr := allocate_node("array")
+        skip_whitespace()
         mut iterations := 0
-        mut last_pos := p_pos
-        while p_pos < p_data.len() and p_at(p_pos) != "]":
+        mut last_pos := parser_position
+        while parser_position < parser_input.len() and get_char_at(parser_position) != "]":
             iterations = iterations + 1
             # Safety: prevent infinite loops on malformed input
             if iterations > 10000:
-                p_err = true
+                parser_error = true
                 return 0 - 1
             # Ensure we're making progress
-            if p_pos == last_pos and iterations > 1:
-                p_err = true
+            if parser_position == last_pos and iterations > 1:
+                parser_error = true
                 return 0 - 1
-            last_pos = p_pos
-            p_skip_ws()
-            if p_pos < p_data.len() and p_at(p_pos) == chr(10):
-                p_pos = p_pos + 1
-            if p_pos < p_data.len() and p_at(p_pos) == "#":
-                p_skip_comment()
-            if p_pos < p_data.len() and p_at(p_pos) != "]" and p_at(p_pos) != chr(10) and p_at(p_pos) != "#":
-                val := p_parse_value()
-                if p_err:
+            last_pos = parser_position
+            skip_whitespace()
+            if parser_position < parser_input.len() and get_char_at(parser_position) == chr(10):
+                parser_position = parser_position + 1
+            if parser_position < parser_input.len() and get_char_at(parser_position) == "#":
+                skip_comment()
+            if parser_position < parser_input.len() and get_char_at(parser_position) != "]" and get_char_at(parser_position) != chr(10) and get_char_at(parser_position) != "#":
+                val := parse_value()
+                if parser_error:
                     return 0 - 1
-                t_array_push(arr, val)
-                p_skip_ws()
-                if p_pos < p_data.len() and p_at(p_pos) == ",":
-                    p_pos = p_pos + 1
-                p_skip_ws()
-                while p_pos < p_data.len() and p_at(p_pos) == chr(10):
-                    p_pos = p_pos + 1
-        if p_pos < p_data.len():
-            p_pos = p_pos + 1
+                push_array_element(arr, val)
+                skip_whitespace()
+                if parser_position < parser_input.len() and get_char_at(parser_position) == ",":
+                    parser_position = parser_position + 1
+                skip_whitespace()
+                while parser_position < parser_input.len() and get_char_at(parser_position) == chr(10):
+                    parser_position = parser_position + 1
+        if parser_position < parser_input.len():
+            parser_position = parser_position + 1
         return arr
 
     # number (int or float)
     if (c >= "0" and c <= "9") or c == "-" or c == "+":
-        start := p_pos
+        start := parser_position
         mut is_float := false
         if c == "-" or c == "+":
-            p_pos = p_pos + 1
-        while p_pos < p_data.len() and p_is_num_char(p_at(p_pos)):
-            d := p_at(p_pos)
+            parser_position = parser_position + 1
+        while parser_position < parser_input.len() and is_number_char(get_char_at(parser_position)):
+            d := get_char_at(parser_position)
             if d == "." or d == "e" or d == "E":
                 is_float = true
-            p_pos = p_pos + 1
-        num_str := p_data.substring(start, p_pos)
+            parser_position = parser_position + 1
+        num_str := parser_input.substring(start, parser_position)
         if is_float:
-            idx := t_alloc("float")
-            g_float_vals.insert(idx, t_parse_float_manual(num_str))
+            idx := allocate_node("float")
+            float_values.insert(idx, parse_float_manual(num_str))
             return idx
         if not is_float:
-            idx := t_alloc("int")
-            g_int_vals.insert(idx, t_parse_int_manual(num_str))
+            idx := allocate_node("int")
+            integer_values.insert(idx, parse_integer_manual(num_str))
             return idx
 
-    p_err = true
+    parser_error = true
     return 0 - 1
 
 # Ensures a nested table path exists, creating intermediate tables as needed.
 # Takes a dot-separated path like "database.connection" and returns the table handle.
-fn t_ensure_table(root: Int, path: String) -> Int:
+fn ensure_table_path(root: Int, path: String) -> Int:
     mut current := root
     mut start := 0
     mut i := 0
@@ -296,17 +296,17 @@ fn t_ensure_table(root: Int, path: String) -> Int:
         if is_sep:
             key := path.substring(start, i)
             # look up existing child in current table
-            off := g_toff[current]
-            cnt := g_tcnt[current]
+            off := table_key_offsets[current]
+            cnt := table_key_counts[current]
             mut found := 0 - 1
             mut j := 0
             while j < cnt:
-                if g_tkeys[off + j] == key:
-                    found = g_tvals[off + j]
+                if table_keys_flat[off + j] == key:
+                    found = table_values_flat[off + j]
                 j = j + 1
             if found < 0:
-                found = t_alloc("table")
-                t_table_set(current, key, found)
+                found = allocate_node("table")
+                set_table_property(current, key, found)
             current = found
             start = i + 1
         i = i + 1
@@ -319,49 +319,49 @@ fn t_ensure_table(root: Int, path: String) -> Int:
 # Parses a TOML string and returns a root table handle.
 # Returns -1 on parse error. The root is a table containing all top-level keys.
 pub fn parse(input: String) -> Int:
-    p_data = input
-    p_pos = 0
-    p_err = false
-    root := t_alloc("table")
+    parser_input = input
+    parser_position = 0
+    parser_error = false
+    root := allocate_node("table")
     mut current_table := root
 
-    while p_pos < p_data.len():
-        p_skip_ws()
-        if p_pos >= p_data.len():
+    while parser_position < parser_input.len():
+        skip_whitespace()
+        if parser_position >= parser_input.len():
             return root
-        c := p_at(p_pos)
+        c := get_char_at(parser_position)
 
         # skip blank lines
         if c == chr(10):
-            p_pos = p_pos + 1
+            parser_position = parser_position + 1
         # skip comments
         if c == "#":
-            p_skip_comment()
+            skip_comment()
         # table header [name]
         if c == "[":
-            p_pos = p_pos + 1
-            p_skip_ws()
-            start := p_pos
-            while p_pos < p_data.len() and p_at(p_pos) != "]":
-                p_pos = p_pos + 1
-            section := p_data.substring(start, p_pos)
-            if p_pos < p_data.len():
-                p_pos = p_pos + 1
-            current_table = t_ensure_table(root, section)
-            p_skip_line()
+            parser_position = parser_position + 1
+            skip_whitespace()
+            start := parser_position
+            while parser_position < parser_input.len() and get_char_at(parser_position) != "]":
+                parser_position = parser_position + 1
+            section := parser_input.substring(start, parser_position)
+            if parser_position < parser_input.len():
+                parser_position = parser_position + 1
+            current_table = ensure_table_path(root, section)
+            skip_line()
         # key = value
         if c != chr(10) and c != "#" and c != "[":
-            key := p_parse_key()
-            p_skip_ws()
-            if p_pos < p_data.len() and p_at(p_pos) == "=":
-                p_pos = p_pos + 1
-            val := p_parse_value()
-            if p_err:
+            key := parse_key()
+            skip_whitespace()
+            if parser_position < parser_input.len() and get_char_at(parser_position) == "=":
+                parser_position = parser_position + 1
+            val := parse_value()
+            if parser_error:
                 return 0 - 1
-            t_table_set(current_table, key, val)
-            p_skip_line()
+            set_table_property(current_table, key, val)
+            skip_line()
 
-    if p_err:
+    if parser_error:
         return 0 - 1
     return root
 
@@ -372,9 +372,9 @@ pub fn parse(input: String) -> Int:
 # Returns the type of a node: "string", "int", "float", "bool", "table", or "array".
 # Returns "invalid" for invalid handles.
 pub fn type_of(handle: Int) -> String:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return "invalid"
-    return g_types[handle]
+    return node_types[handle]
 
 # ===============================================================
 # Public API — Table Value Accessors
@@ -382,90 +382,90 @@ pub fn type_of(handle: Int) -> String:
 
 # Gets a string value by key from a table. Returns empty string if not found or wrong type.
 pub fn get_string(handle: Int, key: String) -> String:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return ""
-    off := g_toff[handle]
-    cnt := g_tcnt[handle]
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
     mut i := 0
     while i < cnt:
-        if g_tkeys[off + i] == key:
-            v := g_tvals[off + i]
-            if v >= 0 and v < g_next and g_types[v] == "string":
-                return g_str_vals[v]
+        if table_keys_flat[off + i] == key:
+            v := table_values_flat[off + i]
+            if v >= 0 and v < next_node_id and node_types[v] == "string":
+                return string_values[v]
         i = i + 1
     return ""
 
 # Gets an integer value by key from a table. Returns 0 if not found or wrong type.
 pub fn get_int(handle: Int, key: String) -> Int:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return 0
-    off := g_toff[handle]
-    cnt := g_tcnt[handle]
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
     mut i := 0
     while i < cnt:
-        if g_tkeys[off + i] == key:
-            v := g_tvals[off + i]
-            if v >= 0 and v < g_next and g_types[v] == "int":
-                return g_int_vals[v]
+        if table_keys_flat[off + i] == key:
+            v := table_values_flat[off + i]
+            if v >= 0 and v < next_node_id and node_types[v] == "int":
+                return integer_values[v]
         i = i + 1
     return 0
 
 # Gets a float value by key from a table. Returns 0.0 if not found or wrong type.
 pub fn get_float(handle: Int, key: String) -> Float:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return 0.0
-    off := g_toff[handle]
-    cnt := g_tcnt[handle]
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
     mut i := 0
     while i < cnt:
-        if g_tkeys[off + i] == key:
-            v := g_tvals[off + i]
-            if v >= 0 and v < g_next and g_types[v] == "float":
-                return g_float_vals[v]
+        if table_keys_flat[off + i] == key:
+            v := table_values_flat[off + i]
+            if v >= 0 and v < next_node_id and node_types[v] == "float":
+                return float_values[v]
         i = i + 1
     return 0.0
 
 # Gets a boolean value by key from a table. Returns false if not found or wrong type.
 pub fn get_bool(handle: Int, key: String) -> Bool:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return false
-    off := g_toff[handle]
-    cnt := g_tcnt[handle]
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
     mut i := 0
     while i < cnt:
-        if g_tkeys[off + i] == key:
-            v := g_tvals[off + i]
-            if v >= 0 and v < g_next and g_types[v] == "bool":
-                return g_bool_vals[v]
+        if table_keys_flat[off + i] == key:
+            v := table_values_flat[off + i]
+            if v >= 0 and v < next_node_id and node_types[v] == "bool":
+                return boolean_values[v]
         i = i + 1
     return false
 
 # Gets a sub-table handle by key. Returns -1 if not found or not a table.
 pub fn get_table(handle: Int, key: String) -> Int:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return 0 - 1
-    off := g_toff[handle]
-    cnt := g_tcnt[handle]
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
     mut i := 0
     while i < cnt:
-        if g_tkeys[off + i] == key:
-            v := g_tvals[off + i]
-            if v >= 0 and v < g_next and g_types[v] == "table":
+        if table_keys_flat[off + i] == key:
+            v := table_values_flat[off + i]
+            if v >= 0 and v < next_node_id and node_types[v] == "table":
                 return v
         i = i + 1
     return 0 - 1
 
 # Gets an array handle by key. Returns -1 if not found or not an array.
 pub fn get_array(handle: Int, key: String) -> Int:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return 0 - 1
-    off := g_toff[handle]
-    cnt := g_tcnt[handle]
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
     mut i := 0
     while i < cnt:
-        if g_tkeys[off + i] == key:
-            v := g_tvals[off + i]
-            if v >= 0 and v < g_next and g_types[v] == "array":
+        if table_keys_flat[off + i] == key:
+            v := table_values_flat[off + i]
+            if v >= 0 and v < next_node_id and node_types[v] == "array":
                 return v
         i = i + 1
     return 0 - 1
@@ -476,17 +476,17 @@ pub fn get_array(handle: Int, key: String) -> Int:
 
 # Returns the number of elements in an array. Returns 0 for non-arrays.
 pub fn array_len(handle: Int) -> Int:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return 0
-    return g_acnt[handle]
+    return array_item_counts[handle]
 
 # Gets the handle of an array element by index. Returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return 0 - 1
-    if index < 0 or index >= g_acnt[handle]:
+    if index < 0 or index >= array_item_counts[handle]:
         return 0 - 1
-    return g_aitems[g_aoff[handle] + index]
+    return array_items_flat[array_item_offsets[handle] + index]
 
 # ===============================================================
 # Public API — Table Introspection
@@ -495,25 +495,25 @@ pub fn array_get(handle: Int, index: Int) -> Int:
 # Returns the list of keys in a table (insertion order).
 pub fn keys(handle: Int) -> List[String]:
     mut result: List[String] := []
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return result
-    off := g_toff[handle]
-    cnt := g_tcnt[handle]
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
     mut i := 0
     while i < cnt:
-        result.push(g_tkeys[off + i])
+        result.push(table_keys_flat[off + i])
         i = i + 1
     return result
 
 # Returns true if a table contains the specified key.
 pub fn has(handle: Int, key: String) -> Bool:
-    if handle < 0 or handle >= g_next:
+    if handle < 0 or handle >= next_node_id:
         return false
-    off := g_toff[handle]
-    cnt := g_tcnt[handle]
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
     mut i := 0
     while i < cnt:
-        if g_tkeys[off + i] == key:
+        if table_keys_flat[off + i] == key:
             return true
         i = i + 1
     return false

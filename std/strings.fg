@@ -1,0 +1,597 @@
+# std/strings — Comprehensive string manipulation utilities
+#
+# This module provides string operations beyond the built-in String methods,
+# including character classification, advanced trimming, splitting variants,
+# case conversions, and more.
+#
+# The built-in String type already provides:
+#   len(), trim(), to_upper(), to_lower(), contains(), starts_with(),
+#   ends_with(), index_of(), last_index_of(), split(), substring(),
+#   replace(), repeat(), pad_left(), pad_right(), chars()
+#
+# This module adds:
+#   - Character classification (is_digit, is_alpha, etc.)
+#   - Trim variants (left, right, with custom chars)
+#   - Splitting variants (lines, limited splits, partition)
+#   - Case conversions (capitalize, title, swap_case)
+#   - Counting and searching (count occurrences, find all)
+#   - Removal operations (remove_prefix, remove_suffix)
+#   - Reversal and slicing
+#   - Safe indexing and extraction
+
+# ===============================================================
+# Phase 1: Core Utilities
+# ===============================================================
+
+# ---------------------------------------------------------------
+# Character Classification
+# ---------------------------------------------------------------
+#
+# These functions test single-character strings.
+# A "character" in Forge is a String with len() == 1.
+#
+# Examples:
+#   is_digit("5")     -> true
+#   is_digit("a")     -> false
+#   is_alpha("A")     -> true
+#   is_space(" ")     -> true
+#   is_space("\t")    -> true
+
+# Tests if a single-character string is a decimal digit (0-9)
+pub fn is_digit(c: String) -> Bool:
+    if c.len() != 1:
+        return false
+    mut code := ord(c)
+    return code >= 48 and code <= 57
+
+# Tests if a single-character string is an alphabetic letter (a-z, A-Z)
+pub fn is_alpha(c: String) -> Bool:
+    if c.len() != 1:
+        return false
+    mut code := ord(c)
+    # Check lowercase a-z (97-122) or uppercase A-Z (65-90)
+    return (code >= 97 and code <= 122) or (code >= 65 and code <= 90)
+
+# Tests if a single-character string is alphanumeric (letter or digit)
+pub fn is_alnum(c: String) -> Bool:
+    return is_alpha(c) or is_digit(c)
+
+# Tests if a single-character string is whitespace
+# Includes: space (32), tab (9), newline (10), carriage return (13), form feed (12)
+pub fn is_space(c: String) -> Bool:
+    if c.len() != 1:
+        return false
+    mut code := ord(c)
+    return code == 32 or code == 9 or code == 10 or code == 13 or code == 12
+
+# Tests if a single-character string is an uppercase letter
+pub fn is_upper(c: String) -> Bool:
+    if c.len() != 1:
+        return false
+    mut code := ord(c)
+    return code >= 65 and code <= 90
+
+# Tests if a single-character string is a lowercase letter
+pub fn is_lower(c: String) -> Bool:
+    if c.len() != 1:
+        return false
+    mut code := ord(c)
+    return code >= 97 and code <= 122
+
+# ---------------------------------------------------------------
+# Whitespace Detection for Strings
+# ---------------------------------------------------------------
+#
+# These functions test if an entire string consists of whitespace characters.
+#
+# Examples:
+#   is_whitespace("   ")     -> true
+#   is_whitespace("\t\n  ")  -> true
+#   is_whitespace("hello")   -> false
+#   is_whitespace("")        -> true (empty is considered whitespace)
+
+# Returns true if the string contains only whitespace characters (or is empty)
+pub fn is_whitespace(s: String) -> Bool:
+    mut i := 0
+    while i < s.len():
+        if not is_space(s[i]):
+            return false
+        i = i + 1
+    return true
+
+# Returns true if the string is empty or contains only whitespace
+pub fn is_blank(s: String) -> Bool:
+    return is_whitespace(s)
+
+# ---------------------------------------------------------------
+# Trim Variants
+# ---------------------------------------------------------------
+#
+# The built-in trim() removes whitespace from both ends.
+# These variants provide more control.
+#
+# Examples:
+#   trim_left("  hello  ")           -> "hello  "
+#   trim_right("  hello  ")          -> "  hello"
+#   trim_left_chars("xxhelloxx", "x") -> "helloxx"
+
+# Removes leading whitespace characters
+pub fn trim_left(s: String) -> String:
+    mut start := 0
+    while start < s.len():
+        if not is_space(s[start]):
+            break
+        start = start + 1
+    return s.substring(start, s.len())
+
+# Removes trailing whitespace characters  
+pub fn trim_right(s: String) -> String:
+    mut end := s.len()
+    while end > 0:
+        if not is_space(s[end - 1]):
+            break
+        end = end - 1
+    return s.substring(0, end)
+
+# Removes leading characters that appear in the chars string
+# Example: trim_left_chars("xxhelloxx", "x") -> "helloxx"
+pub fn trim_left_chars(s: String, chars: String) -> String:
+    mut start := 0
+    while start < s.len():
+        mut found := false
+        mut i := 0
+        while i < chars.len():
+            if s[start] == chars[i]:
+                found = true
+                i = chars.len()
+            i = i + 1
+        if not found:
+            break
+        start = start + 1
+    return s.substring(start, s.len())
+
+# Removes trailing characters that appear in the chars string
+# Example: trim_right_chars("xxhelloxx", "x") -> "xxhello"
+pub fn trim_right_chars(s: String, chars: String) -> String:
+    mut end := s.len()
+    while end > 0:
+        mut found := false
+        mut i := 0
+        while i < chars.len():
+            if s[end - 1] == chars[i]:
+                found = true
+                i = chars.len()
+            i = i + 1
+        if not found:
+            break
+        end = end - 1
+    return s.substring(0, end)
+
+# ---------------------------------------------------------------
+# Counting
+# ---------------------------------------------------------------
+#
+# Count occurrences of a substring within a string.
+#
+# Examples:
+#   count("hello hello", "hello")  -> 2
+#   count("aaa", "aa")             -> 1 (overlapping not counted)
+#   count("hello", "xyz")            -> 0
+
+# Counts non-overlapping occurrences of substr in s
+pub fn count(s: String, substr: String) -> Int:
+    if substr.len() == 0:
+        return 0
+    mut result := 0
+    mut pos := 0
+    while pos < s.len():
+        mut found_pos := s.index_of(substr)
+        if found_pos < pos:
+            # No more occurrences
+            break
+        result = result + 1
+        pos = found_pos + substr.len()
+    return result
+
+# ---------------------------------------------------------------
+# Case Conversions
+# ---------------------------------------------------------------
+#
+# Beyond the built-in to_upper() and to_lower().
+#
+# Examples:
+#   capitalize("hello world")  -> "Hello world"
+#   title("hello world")       -> "Hello World"
+#   swap_case("Hello")         -> "hELLO"
+
+# Capitalizes the first character, lowercases the rest
+# Example: capitalize("hello") -> "Hello", capitalize("HELLO") -> "Hello"
+pub fn capitalize(s: String) -> String:
+    if s.len() == 0:
+        return s
+    mut first := s[0].to_upper()
+    mut rest := s.substring(1, s.len()).to_lower()
+    return first + rest
+
+# Capitalizes the first character of each word (whitespace-separated)
+# Example: title("hello world") -> "Hello World"
+pub fn title(s: String) -> String:
+    if s.len() == 0:
+        return s
+    mut words := s.split(" ")
+    mut result: List[String] := []
+    for word in words:
+        if word.len() > 0:
+            result.push(capitalize(word))
+        else:
+            result.push(word)
+    return result.join(" ")
+
+# Swaps the case of each alphabetic character
+# Example: swap_case("Hello") -> "hELLO", swap_case("123") -> "123"
+pub fn swap_case(s: String) -> String:
+    mut result := ""
+    mut i := 0
+    while i < s.len():
+        mut c := s[i]
+        if is_upper(c):
+            result = result + c.to_lower()
+        elif is_lower(c):
+            result = result + c.to_upper()
+        else:
+            result = result + c
+        i = i + 1
+    return result
+
+# ---------------------------------------------------------------
+# Case-Insensitive Comparison
+# ---------------------------------------------------------------
+#
+# Compare strings ignoring case differences.
+#
+# Examples:
+#   equals_ignore_case("Hello", "hello") -> true
+#   equals_ignore_case("Hello", "world") -> false
+
+# Compares two strings for equality, ignoring case
+pub fn equals_ignore_case(a: String, b: String) -> Bool:
+    return a.to_lower() == b.to_lower()
+
+# ===============================================================
+# Phase 2: Advanced Operations
+# ===============================================================
+
+# ---------------------------------------------------------------
+# Splitting Variants
+# ---------------------------------------------------------------
+#
+# Beyond the built-in split(sep).
+#
+# Examples:
+#   split_lines("a\nb\nc")              -> ["a", "b", "c"]
+#   split_n("a,b,c,d", ",", 2)         -> ["a", "b,c,d"] (max 2 parts)
+#   partition("hello=world", "=")      -> ["hello", "=", "world"]
+
+# Splits a string by line breaks (\n, \r\n, \r)
+# Handles all common line ending styles
+pub fn split_lines(s: String) -> List[String]:
+    mut result: List[String] := []
+    mut current := ""
+    mut i := 0
+    while i < s.len():
+        mut c := s[i]
+        if c == "\n":
+            result.push(current)
+            current = ""
+        elif c == "\r":
+            # Check for \r\n (Windows line ending)
+            result.push(current)
+            current = ""
+            if i + 1 < s.len() and s[i + 1] == "\n":
+                i = i + 1  # Skip the \n
+        else:
+            current = current + c
+        i = i + 1
+    # Don't forget the last line (even if empty)
+    result.push(current)
+    return result
+
+# Splits a string by separator, at most max_splits times
+# The last element contains the remainder of the string
+# Example: split_n("a,b,c,d", ",", 2) -> ["a", "b", "c,d"]
+pub fn split_n(s: String, sep: String, max_splits: Int) -> List[String]:
+    if max_splits <= 0:
+        return [s]
+    if sep.len() == 0:
+        return [s]
+    
+    mut result: List[String] := []
+    mut current := ""
+    mut i := 0
+    mut splits := 0
+    
+    while i < s.len():
+        # Check if we're at a separator
+        mut is_sep := true
+        mut j := 0
+        while j < sep.len():
+            if i + j >= s.len() or s[i + j] != sep[j]:
+                is_sep = false
+                j = sep.len()
+            j = j + 1
+        
+        if is_sep and splits < max_splits:
+            result.push(current)
+            current = ""
+            splits = splits + 1
+            i = i + sep.len()
+        else:
+            current = current + s[i]
+            i = i + 1
+    
+    result.push(current)
+    return result
+
+# Partitions the string into three parts around the first occurrence of separator
+# Returns: [head, separator, tail]
+# If separator not found: [s, "", ""]
+# Example: partition("key=value", "=") -> ["key", "=", "value"]
+pub fn partition(s: String, sep: String) -> List[String]:
+    if sep.len() == 0:
+        return [s, "", ""]
+    mut pos := s.index_of(sep)
+    if pos < 0:
+        return [s, "", ""]
+    mut head := s.substring(0, pos)
+    mut tail := s.substring(pos + sep.len(), s.len())
+    return [head, sep, tail]
+
+# Partitions from the right (last occurrence of separator)
+# Returns: [head, separator, tail]
+# Example: rpartition("a/b/c", "/") -> ["a/b", "/", "c"]
+pub fn rpartition(s: String, sep: String) -> List[String]:
+    if sep.len() == 0:
+        return [s, "", ""]
+    mut pos := s.last_index_of(sep)
+    if pos < 0:
+        return [s, "", ""]
+    mut head := s.substring(0, pos)
+    mut tail := s.substring(pos + sep.len(), s.len())
+    return [head, sep, tail]
+
+# ---------------------------------------------------------------
+# Removal Operations
+# ---------------------------------------------------------------
+#
+# Remove prefixes and suffixes if they exist.
+#
+# Examples:
+#   remove_prefix("hello.txt", "hello.") -> "txt"
+#   remove_suffix("image.png", ".png")    -> "image"
+#   remove_prefix("test", "xyz")          -> "test" (unchanged)
+
+# Removes a prefix from the string if it exists
+# Returns the string unchanged if it doesn't start with the prefix
+pub fn remove_prefix(s: String, prefix: String) -> String:
+    if s.starts_with(prefix):
+        return s.substring(prefix.len(), s.len())
+    return s
+
+# Removes a suffix from the string if it exists
+# Returns the string unchanged if it doesn't end with the suffix
+pub fn remove_suffix(s: String, suffix: String) -> String:
+    if s.ends_with(suffix):
+        return s.substring(0, s.len() - suffix.len())
+    return s
+
+# ---------------------------------------------------------------
+# Padding and Centering
+# ---------------------------------------------------------------
+#
+# Beyond the built-in pad_left() and pad_right().
+#
+# Examples:
+#   center("hi", 6)           -> "  hi  "
+#   center("hi", 6, "-")      -> "--hi--"
+#   zfill("42", 5)            -> "00042"
+
+# Centers the string in a field of given width
+# Pads with spaces on both sides (extra space on right if odd)
+pub fn center(s: String, width: Int) -> String:
+    return center_with(s, width, " ")
+
+# Centers the string with custom fill character
+# Example: center_with("hi", 6, "-") -> "--hi--"
+pub fn center_with(s: String, width: Int, fill: String) -> String:
+    if s.len() >= width:
+        return s
+    mut total_pad := width - s.len()
+    mut left_pad := total_pad / 2
+    mut right_pad := total_pad - left_pad
+    mut result := ""
+    mut i := 0
+    while i < left_pad:
+        result = result + fill
+        i = i + 1
+    result = result + s
+    i = 0
+    while i < right_pad:
+        result = result + fill
+        i = i + 1
+    return result
+
+# Pads the string with zeros on the left to reach given width
+# Commonly used for numbers: zfill("42", 5) -> "00042"
+pub fn zfill(s: String, width: Int) -> String:
+    return s.pad_left(width, "0")
+
+# ---------------------------------------------------------------
+# Reversal
+# ---------------------------------------------------------------
+#
+# Reverse the order of characters in a string.
+#
+# Examples:
+#   reverse("hello") -> "olleh"
+#   reverse("12345") -> "54321"
+
+# Returns a new string with characters in reverse order
+pub fn reverse(s: String) -> String:
+    mut result := ""
+    mut i := s.len() - 1
+    while i >= 0:
+        result = result + s[i]
+        i = i - 1
+    return result
+
+# ---------------------------------------------------------------
+# Safe Indexing and Extraction
+# ---------------------------------------------------------------
+#
+# Safe ways to access parts of strings without panicking.
+#
+# Examples:
+#   get("hello", 1)        -> Some("e")
+#   get("hello", 100)      -> None (out of bounds)
+#   first_n("hello", 3)    -> "hel"
+#   last_n("hello", 2)     -> "lo"
+
+# Safely gets a character at index, returns none if out of bounds
+pub fn get(s: String, index: Int) -> String?:
+    if index < 0 or index >= s.len():
+        return none
+    return s[index]
+
+# Returns the first n characters (or the whole string if shorter)
+pub fn first_n(s: String, n: Int) -> String:
+    if n <= 0:
+        return ""
+    if n >= s.len():
+        return s
+    return s.substring(0, n)
+
+# Returns the last n characters (or the whole string if shorter)
+pub fn last_n(s: String, n: Int) -> String:
+    if n <= 0:
+        return ""
+    if n >= s.len():
+        return s
+    return s.substring(s.len() - n, s.len())
+
+# ---------------------------------------------------------------
+# Find All Occurrences
+# ---------------------------------------------------------------
+#
+# Find all starting positions of a substring.
+#
+# Examples:
+#   find_all("hello hello", "hello") -> [0, 6]
+#   find_all("aaaa", "aa")           -> [0, 2] (non-overlapping)
+
+# Returns a list of all starting positions of substr in s
+pub fn find_all(s: String, substr: String) -> List[Int]:
+    if substr.len() == 0:
+        return []
+    mut result: List[Int] := []
+    mut pos := 0
+    while pos < s.len():
+        mut found := s.index_of(substr)
+        if found < pos:
+            break
+        result.push(found)
+        pos = found + substr.len()
+    return result
+
+# ---------------------------------------------------------------
+# Dedent and Indent (for multi-line strings)
+# ---------------------------------------------------------------
+#
+# Useful for cleaning up indented string literals.
+#
+# Examples:
+#   dedent("  line1\n  line2")  -> "line1\nline2"
+#   indent("line1\nline2", "  ") -> "  line1\n  line2"
+
+# Removes common leading whitespace from all lines
+# Similar to Python's textwrap.dedent()
+pub fn dedent(s: String) -> String:
+    mut lines := split_lines(s)
+    if lines.len() == 0:
+        return s
+    
+    # Find minimum indentation (ignoring empty lines)
+    mut min_indent := -1
+    for line in lines:
+        if line.len() > 0:
+            mut indent := 0
+            while indent < line.len() and is_space(line[indent]):
+                indent = indent + 1
+            if min_indent < 0 or indent < min_indent:
+                min_indent = indent
+    
+    if min_indent <= 0:
+        return s
+    
+    # Remove common indentation from each line
+    mut result: List[String] := []
+    for line in lines:
+        if line.len() >= min_indent:
+            result.push(line.substring(min_indent, line.len()))
+        else:
+            result.push(line)
+    
+    return result.join("\n")
+
+# Adds a prefix to the beginning of each line
+# Useful for adding indentation or comment markers
+pub fn indent(s: String, prefix: String) -> String:
+    mut lines := split_lines(s)
+    mut result: List[String] := []
+    for line in lines:
+        result.push(prefix + line)
+    return result.join("\n")
+
+# ---------------------------------------------------------------
+# Replace with Count Limit
+# ---------------------------------------------------------------
+#
+# Replace only the first N occurrences.
+#
+# Examples:
+#   replace_n("a a a a", "a", "b", 2) -> "b b a a"
+
+# Replaces at most count occurrences of old with new
+pub fn replace_n(s: String, old: String, new: String, count: Int) -> String:
+    if count <= 0 or old.len() == 0:
+        return s
+    
+    mut result := ""
+    mut pos := 0
+    mut replacements := 0
+    
+    while pos < s.len() and replacements < count:
+        # Check if old matches at current position
+        mut matches := true
+        mut i := 0
+        while i < old.len():
+            if pos + i >= s.len() or s[pos + i] != old[i]:
+                matches = false
+                i = old.len()
+            i = i + 1
+        
+        if matches:
+            result = result + new
+            pos = pos + old.len()
+            replacements = replacements + 1
+        else:
+            result = result + s[pos]
+            pos = pos + 1
+    
+    # Append remainder
+    while pos < s.len():
+        result = result + s[pos]
+        pos = pos + 1
+    
+    return result
+
+# End of std/strings.fg

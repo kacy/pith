@@ -245,7 +245,17 @@ static inline forge_string_t forge_string_replace(forge_string_t s, forge_string
         return (forge_string_t){ .data = buf, .len = s.len };
     }
     // second pass: build result
-    int64_t new_len = s.len + count * (new_s.len - old.len);
+    int64_t delta = new_s.len - old.len;
+    if (delta > 0 && count > INT64_MAX / delta) {
+        fprintf(stderr, "forge: string replace overflow\n");
+        exit(1);
+    }
+    int64_t growth = count * delta;
+    if (growth > 0 && s.len > INT64_MAX - growth) {
+        fprintf(stderr, "forge: string replace overflow\n");
+        exit(1);
+    }
+    int64_t new_len = s.len + growth;
     char *buf = forge_str_alloc(new_len);
     int64_t pos = 0;
     for (int64_t i = 0; i < s.len; ) {
@@ -286,6 +296,10 @@ static inline int64_t forge_string_last_index_of(forge_string_t haystack, forge_
 // repeat: repeat string n times.
 static inline forge_string_t forge_string_repeat(forge_string_t s, int64_t n) {
     if (n <= 0 || s.len == 0) return forge_string_empty;
+    if (s.len > INT64_MAX / n) {
+        fprintf(stderr, "forge: string repeat overflow\n");
+        exit(1);
+    }
     int64_t new_len = s.len * n;
     char *buf = (char *)malloc((size_t)new_len + 1);
     if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
@@ -298,6 +312,7 @@ static inline forge_string_t forge_string_repeat(forge_string_t s, int64_t n) {
 
 // pad_left: pad string to given width with fill character (left-padded).
 static inline forge_string_t forge_string_pad_left(forge_string_t s, int64_t width, forge_string_t fill) {
+    if (width < 0) width = 0;
     if (s.len >= width || fill.len == 0) {
         char *buf = (char *)malloc((size_t)s.len + 1);
         if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
@@ -318,6 +333,7 @@ static inline forge_string_t forge_string_pad_left(forge_string_t s, int64_t wid
 
 // pad_right: pad string to given width with fill character (right-padded).
 static inline forge_string_t forge_string_pad_right(forge_string_t s, int64_t width, forge_string_t fill) {
+    if (width < 0) width = 0;
     if (s.len >= width || fill.len == 0) {
         char *buf = (char *)malloc((size_t)s.len + 1);
         if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
@@ -568,12 +584,12 @@ static inline forge_list_t forge_list_create(int64_t len, int64_t elem_size, con
         fprintf(stderr, "forge: list too large\n");
         exit(1);
     }
-    impl->data = malloc((size_t)(len * elem_size));
+    impl->data = malloc((size_t)len * (size_t)elem_size);
     if (!impl->data) {
         fprintf(stderr, "forge: out of memory\n");
         exit(1);
     }
-    memcpy(impl->data, init, (size_t)(len * elem_size));
+    memcpy(impl->data, init, (size_t)len * (size_t)elem_size);
     return list;
 }
 
@@ -594,14 +610,14 @@ static inline forge_map_t forge_map_create(int64_t len, int64_t key_size, int64_
         fprintf(stderr, "forge: map too large\n");
         exit(1);
     }
-    impl->keys = malloc((size_t)(len * key_size));
-    impl->values = malloc((size_t)(len * val_size));
+    impl->keys = malloc((size_t)len * (size_t)key_size);
+    impl->values = malloc((size_t)len * (size_t)val_size);
     if (!impl->keys || !impl->values) {
         fprintf(stderr, "forge: out of memory\n");
         exit(1);
     }
-    memcpy(impl->keys, init_keys, (size_t)(len * key_size));
-    memcpy(impl->values, init_vals, (size_t)(len * val_size));
+    memcpy(impl->keys, init_keys, (size_t)len * (size_t)key_size);
+    memcpy(impl->values, init_vals, (size_t)len * (size_t)val_size);
     // pick initial capacity: next power of 2 that keeps load < 75%
     int32_t needed = (int32_t)((len * 4 + 2) / 3); // ceil(len / 0.75)
     int32_t cap = 8;
@@ -1608,7 +1624,11 @@ static inline void forge_channel_send(forge_channel_t *ch, const void *elem) {
     // grow if full
     if (ch->len >= ch->cap) {
         int64_t new_cap = ch->cap * 2;
-        void *new_buf = malloc((size_t)(new_cap * ch->elem_size));
+        if (new_cap > (int64_t)(SIZE_MAX / (size_t)ch->elem_size)) {
+            fprintf(stderr, "forge: channel buffer overflow\n");
+            exit(1);
+        }
+        void *new_buf = malloc((size_t)new_cap * (size_t)ch->elem_size);
         if (!new_buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
         // copy elements in order
         for (int64_t i = 0; i < ch->len; i++) {
@@ -1842,6 +1862,10 @@ static inline void forge_waitgroup_add(forge_waitgroup_t *wg, int64_t n) {
 
 static inline void forge_waitgroup_done(forge_waitgroup_t *wg) {
     pthread_mutex_lock(&wg->__mutex);
+    if (wg->__count <= 0) {
+        pthread_mutex_unlock(&wg->__mutex);
+        return;
+    }
     wg->__count--;
     if (wg->__count <= 0) {
         pthread_cond_broadcast(&wg->__cond);
@@ -1982,6 +2006,7 @@ static inline bool forge_process_write_impl(int64_t handle, forge_string_t data,
 // read from child's stdout. reads up to max_bytes.
 static inline bool forge_process_read_impl(int64_t handle, int64_t max_bytes, forge_string_t *out) {
     if (handle < 0 || handle >= forge_process_count) { *out = forge_string_empty; return false; }
+    if (max_bytes <= 0) max_bytes = 4096;
     forge_process_t *p = &forge_process_pool[handle];
     char *buf = (char *)malloc((size_t)max_bytes + 1);
     if (!buf) { *out = forge_string_empty; return false; }
@@ -1995,6 +2020,7 @@ static inline bool forge_process_read_impl(int64_t handle, int64_t max_bytes, fo
 // read from child's stderr. reads up to max_bytes.
 static inline bool forge_process_read_err_impl(int64_t handle, int64_t max_bytes, forge_string_t *out) {
     if (handle < 0 || handle >= forge_process_count) { *out = forge_string_empty; return false; }
+    if (max_bytes <= 0) max_bytes = 4096;
     forge_process_t *p = &forge_process_pool[handle];
     char *buf = (char *)malloc((size_t)max_bytes + 1);
     if (!buf) { *out = forge_string_empty; return false; }

@@ -1,0 +1,28 @@
+# std.net.websocket — WebSocket protocol constants
+#
+# WebSocket opcodes and constants.
+# Handshake and frame handling must be implemented using tcp primitives.
+
+# Opcodes
+pub OP_CONTINUATION := 0
+pub OP_TEXT := 1
+pub OP_BINARY := 2
+pub OP_CLOSE := 8
+pub OP_PING := 9
+pub OP_PONG := 10
+
+# Magic GUID for handshake
+pub WS_GUID := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# Build WebSocket handshake response (simplified)
+# In real implementation, would compute SHA1 + base64
+pub fn handshake_response(key: String) -> String:
+    mut response := "HTTP/1.1 101 Switching Protocols\r\n"
+    response = response + "Upgrade: websocket\r\n"
+    response = response + "Connection: Upgrade\r\n"
+    response = response + "Sec-WebSocket-Accept: "
+    response = response + key
+    response = response + WS_GUID
+    response = response + "\r\n"
+    response = response + "\r\n"
+    return response

@@ -1,0 +1,86 @@
+# Simple HTTP Server Example
+#
+# A basic HTTP server demonstrating the std.net.http module
+
+from std.net.tcp import listen, accept, read, write, close
+from std.net.http import html_response, json_response
+
+# Serve a simple HTML page
+fn serve_root(fd: Int):
+    mut html := "<!DOCTYPE html><html><head><title>Forge Server</title></head><body>"
+    html = html + "<h1>Hello from Forge!</h1>"
+    html = html + "<p>This server is written in the Forge programming language.</p>"
+    html = html + "<ul>"
+    html = html + "<li><a href=/json>JSON API</a></li>"
+    html = html + "</ul>"
+    html = html + "</body></html>"
+    
+    mut response := html_response(html)
+    write(fd, response)
+    close(fd)
+
+# Serve JSON response  
+fn serve_json(fd: Int):
+    mut json := "{\"message\":\"Hello from Forge!\",\"status\":\"ok\"}"
+    mut response := json_response(json)
+    write(fd, response)
+    close(fd)
+
+# Serve 404
+fn serve_not_found(fd: Int):
+    mut html := "<!DOCTYPE html><html><head><title>404</title></head><body>"
+    html = html + "<h1>404 - Not Found</h1>"
+    html = html + "</body></html>"
+    
+    mut response := "HTTP/1.1 404 Not Found\r\n"
+    response = response + "Content-Type: text/html\r\n"
+    response = response + "Content-Length: " + html.len().to_string() + "\r\n"
+    response = response + "\r\n"
+    response = response + html
+    
+    write(fd, response)
+    close(fd)
+
+# Handle a single HTTP request
+fn handle_request(fd: Int):
+    # Read HTTP request
+    mut request_data := read(fd, 4096)
+    
+    # Simple routing
+    if request_data.len() > 0:
+        # Extract path from request line
+        mut parts := request_data.split(" ")
+        if parts.len() >= 2:
+            mut path := parts[1]
+            
+            if path == "/" or path == "/index.html":
+                serve_root(fd)
+            elif path == "/json":
+                serve_json(fd)
+            else:
+                serve_not_found(fd)
+        else:
+            close(fd)
+    else:
+        close(fd)
+
+# Main server
+fn main():
+    mut port := 8080
+    print("Starting HTTP server on port " + port.to_string())
+    print("Visit http://localhost:" + port.to_string())
+    
+    # Bind to port
+    mut server_fd := listen("0.0.0.0", port)
+    if server_fd < 0:
+        print("Failed to start server")
+        return
+    
+    print("Server running...")
+    
+    while true:
+        # Accept connections
+        mut client_fd := accept(server_fd)
+        if client_fd >= 0:
+            # Handle client in background
+            spawn handle_request(client_fd)

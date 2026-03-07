@@ -96,18 +96,19 @@ static inline void forge_rc_release(void *ptr, void (*destructor)(void *)) {
 typedef struct {
     const char *data;
     int64_t len;
+    bool is_heap;  // true if data was heap-allocated (needs RC)
 } forge_string_t;
 
 // create a string from a C string literal (compile-time known length)
-#define FORGE_STRING_LIT(s) ((forge_string_t){ .data = (s), .len = sizeof(s) - 1 })
+#define FORGE_STRING_LIT(s) ((forge_string_t){ .data = (s), .len = sizeof(s) - 1, .is_heap = false })
 
-// create a string from a pointer and length
+// create a string from a pointer and length (heap-allocated)
 static inline forge_string_t forge_string_from(const char *data, int64_t len) {
-    return (forge_string_t){ .data = data, .len = len };
+    return (forge_string_t){ .data = data, .len = len, .is_heap = true };
 }
 
 // empty string constant
-static const forge_string_t forge_string_empty = { .data = "", .len = 0 };
+static const forge_string_t forge_string_empty = { .data = "", .len = 0, .is_heap = false };
 
 // String destructor (frees the data buffer)
 static inline void forge_string_destroy(void *ptr) {
@@ -120,15 +121,15 @@ static inline void forge_string_destroy(void *ptr) {
 
 // Retain a string (increment RC)
 static inline void forge_string_retain(forge_string_t s) {
-    // Only retain if heap-allocated (data comes after header)
-    if (s.data && s.len > 0) {
+    // Only retain if heap-allocated
+    if (s.is_heap && s.data) {
         forge_rc_retain((void *)s.data);
     }
 }
 
 // Release a string (decrement RC, free if zero)
 static inline void forge_string_release(forge_string_t s) {
-    if (s.data && s.len > 0) {
+    if (s.is_heap && s.data) {
         forge_rc_release((void *)s.data, NULL);
     }
 }
@@ -177,7 +178,7 @@ static inline forge_string_t forge_string_concat(forge_string_t a, forge_string_
     memcpy(buf, a.data, (size_t)a.len);
     memcpy(buf + a.len, b.data, (size_t)b.len);
     buf[new_len] = '\0';
-    return (forge_string_t){ .data = buf, .len = new_len };
+    return (forge_string_t){ .data = buf, .len = new_len, .is_heap = true };
 }
 
 static inline bool forge_string_eq(forge_string_t a, forge_string_t b) {
@@ -249,7 +250,7 @@ static inline forge_string_t forge_string_to_upper(forge_string_t s) {
         buf[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
     }
     buf[s.len] = '\0';
-    return (forge_string_t){ .data = buf, .len = s.len };
+    return (forge_string_t){ .data = buf, .len = s.len, .is_heap = true };
 }
 
 static inline forge_string_t forge_string_to_lower(forge_string_t s) {
@@ -259,7 +260,7 @@ static inline forge_string_t forge_string_to_lower(forge_string_t s) {
         buf[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
     }
     buf[s.len] = '\0';
-    return (forge_string_t){ .data = buf, .len = s.len };
+    return (forge_string_t){ .data = buf, .len = s.len, .is_heap = true };
 }
 
 static inline forge_string_t forge_string_substring(forge_string_t s, int64_t start, int64_t end) {
@@ -270,7 +271,7 @@ static inline forge_string_t forge_string_substring(forge_string_t s, int64_t st
     char *buf = forge_str_alloc_rc(new_len);
     memcpy(buf, s.data + start, (size_t)new_len);
     buf[new_len] = '\0';
-    return (forge_string_t){ .data = buf, .len = new_len };
+    return (forge_string_t){ .data = buf, .len = new_len, .is_heap = true };
 }
 
 // index a single character by position. returns a 1-char string.
@@ -282,7 +283,7 @@ static inline forge_string_t forge_string_char_at(forge_string_t s, int64_t inde
     char *buf = forge_str_alloc_rc(1);
     buf[0] = s.data[index];
     buf[1] = '\0';
-    return (forge_string_t){ .data = buf, .len = 1 };
+    return (forge_string_t){ .data = buf, .len = 1, .is_heap = true };
 }
 
 // chr(Int) -> String: return a single-character string for the given ASCII code.
@@ -290,12 +291,12 @@ static inline forge_string_t forge_chr(int64_t code) {
     char *buf = forge_str_alloc_rc(1);
     buf[0] = (char)(code & 0xFF);
     buf[1] = '\0';
-    return (forge_string_t){ .data = buf, .len = 1 };
+    return (forge_string_t){ .data = buf, .len = 1, .is_heap = true };
 }
 
 // ord(String) -> Int: return the byte value of the first character.
 static inline int64_t forge_ord(forge_string_t s) {
-    if (s.len <= 0) return 0;
+    if (s.len == 0) return 0;
     return (int64_t)(unsigned char)s.data[0];
 }
 
@@ -314,7 +315,7 @@ static inline forge_string_t forge_string_replace(forge_string_t s, forge_string
         char *buf = forge_str_alloc_rc(s.len);
         memcpy(buf, s.data, (size_t)s.len);
         buf[s.len] = '\0';
-        return (forge_string_t){ .data = buf, .len = s.len };
+        return (forge_string_t){ .data = buf, .len = s.len, .is_heap = true };
     }
     // first pass: count occurrences
     int64_t count = 0;
@@ -328,7 +329,7 @@ static inline forge_string_t forge_string_replace(forge_string_t s, forge_string
         char *buf = forge_str_alloc_rc(s.len);
         memcpy(buf, s.data, (size_t)s.len);
         buf[s.len] = '\0';
-        return (forge_string_t){ .data = buf, .len = s.len };
+        return (forge_string_t){ .data = buf, .len = s.len, .is_heap = true };
     }
     // second pass: build result
     int64_t delta = new_s.len - old.len;
@@ -354,7 +355,7 @@ static inline forge_string_t forge_string_replace(forge_string_t s, forge_string
         }
     }
     buf[new_len] = '\0';
-    return (forge_string_t){ .data = buf, .len = new_len };
+    return (forge_string_t){ .data = buf, .len = new_len, .is_heap = true };
 }
 
 // index_of: find first occurrence of needle in haystack. returns -1 if not found.
@@ -393,7 +394,7 @@ static inline forge_string_t forge_string_repeat(forge_string_t s, int64_t n) {
         memcpy(buf + i * s.len, s.data, (size_t)s.len);
     }
     buf[new_len] = '\0';
-    return (forge_string_t){ .data = buf, .len = new_len };
+    return (forge_string_t){ .data = buf, .len = new_len, .is_heap = true };
 }
 
 // pad_left: pad string to given width with fill character (left-padded).
@@ -404,7 +405,7 @@ static inline forge_string_t forge_string_pad_left(forge_string_t s, int64_t wid
         if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
         memcpy(buf, s.data, (size_t)s.len);
         buf[s.len] = '\0';
-        return (forge_string_t){ .data = buf, .len = s.len };
+        return (forge_string_t){ .data = buf, .len = s.len, .is_heap = true };
     }
     int64_t pad_len = width - s.len;
     char *buf = (char *)malloc((size_t)width + 1);
@@ -414,7 +415,7 @@ static inline forge_string_t forge_string_pad_left(forge_string_t s, int64_t wid
     }
     memcpy(buf + pad_len, s.data, (size_t)s.len);
     buf[width] = '\0';
-    return (forge_string_t){ .data = buf, .len = width };
+    return (forge_string_t){ .data = buf, .len = width, .is_heap = true };
 }
 
 // pad_right: pad string to given width with fill character (right-padded).
@@ -425,7 +426,7 @@ static inline forge_string_t forge_string_pad_right(forge_string_t s, int64_t wi
         if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
         memcpy(buf, s.data, (size_t)s.len);
         buf[s.len] = '\0';
-        return (forge_string_t){ .data = buf, .len = s.len };
+        return (forge_string_t){ .data = buf, .len = s.len, .is_heap = true };
     }
     int64_t pad_len = width - s.len;
     char *buf = (char *)malloc((size_t)width + 1);
@@ -435,7 +436,7 @@ static inline forge_string_t forge_string_pad_right(forge_string_t s, int64_t wi
         buf[s.len + i] = fill.data[i % fill.len];
     }
     buf[width] = '\0';
-    return (forge_string_t){ .data = buf, .len = width };
+    return (forge_string_t){ .data = buf, .len = width, .is_heap = true };
 }
 
 // split uses a forward-declared list type — defined after collection types
@@ -450,7 +451,7 @@ static inline forge_string_t forge_int_to_string(int64_t n) {
     int len = snprintf(buf, sizeof(buf), "%" PRId64, n);
     char *result = forge_str_alloc_rc(len);
     memcpy(result, buf, (size_t)len + 1);
-    return (forge_string_t){ .data = result, .len = len };
+    return (forge_string_t){ .data = result, .len = len, .is_heap = true };
 }
 
 static inline forge_string_t forge_float_to_string(double n) {
@@ -458,7 +459,7 @@ static inline forge_string_t forge_float_to_string(double n) {
     int len = snprintf(buf, sizeof(buf), "%g", n);
     char *result = forge_str_alloc_rc(len);
     memcpy(result, buf, (size_t)len + 1);
-    return (forge_string_t){ .data = result, .len = len };
+    return (forge_string_t){ .data = result, .len = len, .is_heap = true };
 }
 
 static inline forge_string_t forge_bool_to_string(bool b) {
@@ -1153,10 +1154,10 @@ static inline forge_list_t forge_string_split(forge_string_t s, forge_string_t s
             if (!ch) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
             ch[0] = s.data[i];
             ch[1] = '\0';
-            forge_string_t part = { .data = ch, .len = 1 };
-            forge_list_push(&result, &part, sizeof(forge_string_t));
-        }
-        return result;
+        forge_string_t part = { .data = ch, .len = 1, .is_heap = true };
+        forge_list_push(&result, &part, sizeof(forge_string_t));
+    }
+    return result;
     }
     int64_t start = 0;
     for (int64_t i = 0; i + sep.len <= s.len; i++) {
@@ -1166,7 +1167,7 @@ static inline forge_list_t forge_string_split(forge_string_t s, forge_string_t s
             if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
             memcpy(buf, s.data + start, (size_t)part_len);
             buf[part_len] = '\0';
-            forge_string_t part = { .data = buf, .len = part_len };
+            forge_string_t part = { .data = buf, .len = part_len, .is_heap = true };
             forge_list_push(&result, &part, sizeof(forge_string_t));
             i += sep.len - 1;
             start = i + 1;
@@ -1178,7 +1179,7 @@ static inline forge_list_t forge_string_split(forge_string_t s, forge_string_t s
     if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
     memcpy(buf, s.data + start, (size_t)part_len);
     buf[part_len] = '\0';
-    forge_string_t part = { .data = buf, .len = part_len };
+    forge_string_t part = { .data = buf, .len = part_len, .is_heap = true };
     forge_list_push(&result, &part, sizeof(forge_string_t));
     return result;
 }
@@ -1193,7 +1194,7 @@ static inline forge_string_t forge_list_join(forge_list_t list, forge_string_t s
         if (!buf) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
         memcpy(buf, items[0].data, (size_t)items[0].len);
         buf[items[0].len] = '\0';
-        return (forge_string_t){ .data = buf, .len = items[0].len };
+        return (forge_string_t){ .data = buf, .len = items[0].len, .is_heap = true };
     }
     // compute total length
     int64_t total = 0;
@@ -1213,7 +1214,7 @@ static inline forge_string_t forge_list_join(forge_list_t list, forge_string_t s
         pos += items[i].len;
     }
     buf[total] = '\0';
-    return (forge_string_t){ .data = buf, .len = total };
+    return (forge_string_t){ .data = buf, .len = total, .is_heap = true };
 }
 
 // string — chars(): split into a list of single-character strings.
@@ -1224,7 +1225,7 @@ static inline forge_list_t forge_string_chars(forge_string_t s) {
         if (!ch) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
         ch[0] = s.data[i];
         ch[1] = '\0';
-        forge_string_t part = { .data = ch, .len = 1 };
+        forge_string_t part = { .data = ch, .len = 1, .is_heap = true };
         forge_list_push(&result, &part, sizeof(forge_string_t));
     }
     return result;
@@ -1472,7 +1473,7 @@ static inline forge_string_t forge_random_string(int64_t n) {
     for (int64_t i = 0; i < n; i++)
         buf[i] = alphanum[lrand48() % 62];
     buf[n] = '\0';
-    return (forge_string_t){ .data = buf, .len = n };
+    return (forge_string_t){ .data = buf, .len = n, .is_heap = true };
 }
 
 // format_time(epoch_ms, format_string) -> String — strftime wrapper
@@ -1486,7 +1487,7 @@ static inline forge_string_t forge_format_time(int64_t epoch_ms, forge_string_t 
     char *result = forge_str_alloc_rc((int64_t)len);
     memcpy(result, buf, len);
     result[len] = '\0';
-    return (forge_string_t){ .data = result, .len = (int64_t)len };
+    return (forge_string_t){ .data = result, .len = (int64_t)len, .is_heap = true };
 }
 
 // exec_output — internal impl, returns false on error.
@@ -1537,7 +1538,7 @@ static inline forge_string_t forge_input(void) {
     if (!copy) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
     memcpy(copy, buf, (size_t)len);
     copy[len] = '\0';
-    return (forge_string_t){ .data = copy, .len = len };
+    return (forge_string_t){ .data = copy, .len = len, .is_heap = true };
 }
 
 // ---------------------------------------------------------------
@@ -1575,7 +1576,7 @@ static inline forge_string_t forge_fmt_float(double n, int64_t decimals) {
     char *result = (char *)malloc((size_t)len + 1);
     if (!result) { fprintf(stderr, "forge: out of memory\n"); exit(1); }
     memcpy(result, buf, (size_t)len + 1);
-    return (forge_string_t){ .data = result, .len = len };
+    return (forge_string_t){ .data = result, .len = len, .is_heap = true };
 }
 
 // ---------------------------------------------------------------
@@ -1659,7 +1660,7 @@ static inline forge_list_t forge_list_dir(forge_string_t path) {
         char *buf = (char *)malloc((size_t)nlen + 1);
         if (!buf) continue;
         memcpy(buf, entry->d_name, (size_t)nlen + 1);
-        forge_string_t s = { .data = buf, .len = nlen };
+        forge_string_t s = { .data = buf, .len = nlen, .is_heap = true };
         forge_list_push(&result, &s, sizeof(forge_string_t));
     }
     closedir(d);
@@ -1864,7 +1865,7 @@ static inline bool forge_tcp_read_impl(int64_t fd, int64_t max_bytes, forge_stri
     ssize_t n = read((int)fd, buf, (size_t)max_bytes);
     if (n < 0) { free(FORGE_RC_HEADER(buf)); return false; }
     buf[n] = '\0';
-    *out = (forge_string_t){ .data = buf, .len = (int64_t)n };
+    *out = (forge_string_t){ .data = buf, .len = (int64_t)n, .is_heap = true };
     return true;
 }
 
@@ -1907,7 +1908,7 @@ static inline bool forge_dns_resolve_impl(forge_string_t hostname, forge_string_
     char *buf = forge_str_alloc_rc(len);
     memcpy(buf, ip_buf, (size_t)len);
     buf[len] = '\0';
-    *out = (forge_string_t){ .data = buf, .len = len };
+    *out = (forge_string_t){ .data = buf, .len = len, .is_heap = true };
     return true;
 }
 

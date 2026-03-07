@@ -1277,6 +1277,8 @@ fn c_check_expr_impl(node_idx: Int, scope_id: Int) -> Int:
         return c_check_set_expr(node, scope_id)
     if node.kind == "tuple":
         return c_check_tuple_expr(node, scope_id)
+    if node.kind == "struct_init":
+        return c_check_struct_init(node, scope_id)
     if node.kind == "spawn":
         return c_check_spawn_expr(node, scope_id)
     if node.kind == "await":
@@ -2737,6 +2739,39 @@ fn c_check_tuple_expr(node: Node, scope_id: Int) -> Int:
     for child in node.children:
         elems.push(c_check_expr(child, scope_id))
     return tt_add(ti_tuple(elems))
+
+fn c_check_struct_init(node: Node, scope_id: Int) -> Int:
+    # node.value contains the struct type name
+    struct_name := node.value
+    struct_tid := tt_lookup(struct_name)
+    if struct_tid < 0:
+        c_error("E202", "unknown type: " + struct_name)
+        return TID_ERR
+    
+    # get struct info
+    info := tt_get(struct_tid)
+    if info.kind != "struct":
+        c_error("E202", struct_name + " is not a struct type")
+        return TID_ERR
+    
+    # check field count
+    if node.children.len() != info.fields.len():
+        c_error("E207", struct_name + " expects " + info.fields.len().to_string() + " fields, got " + node.children.len().to_string())
+        return TID_ERR
+    
+    # check each field type
+    mut idx := 0
+    for child in node.children:
+        arg_node := get_node(child)
+        arg_type := c_check_expr(child, scope_id)
+        if tt_is_err(arg_type) == false:
+            if idx < info.field_types.len():
+                expected := info.field_types[idx]
+                if arg_type != expected:
+                    c_error("E219", "field '" + info.fields[idx] + "' type mismatch: expected " + tt_type_name(expected) + ", got " + tt_type_name(arg_type))
+        idx = idx + 1
+    
+    return struct_tid
 
 # ---------------------------------------------------------------
 # spawn/await

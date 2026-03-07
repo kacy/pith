@@ -436,6 +436,19 @@ fn printExpr(expr: *const ast.Expr, indent: u32) void {
         .grouped => |inner| {
             printExpr(inner, indent);
         },
+        .struct_init => |si| {
+            printIndent(indent);
+            io.write("struct_init {s}\n", .{si.type_name});
+            for (si.args) |arg| {
+                printIndent(indent + 1);
+                if (arg.name) |name| {
+                    io.write("arg {s}=\n", .{name});
+                } else {
+                    io.write("arg\n", .{});
+                }
+                printExpr(arg.value, indent + 2);
+            }
+        },
         .err => {
             printIndent(indent);
             io.write("<error>\n", .{});

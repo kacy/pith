@@ -1772,6 +1772,7 @@ pub const Checker = struct {
             .map => |entries| self.checkMapExpr(entries, expr.location, scope),
             .set => |elems| self.checkSetExpr(elems, expr.location, scope),
             .tuple => |elems| self.checkTupleExpr(elems, expr.location, scope),
+            .struct_init => |si| self.checkStructInit(si, expr.location, scope),
             .self_expr => self.checkSelfExpr(expr.location, scope),
 
             .err => .err,
@@ -2406,6 +2407,53 @@ pub const Checker = struct {
         }
 
         return type_id;
+    }
+
+    fn checkStructInit(self: *Checker, si: ast.StructInit, location: Location, scope: *const Scope) TypeId {
+        // look up the struct type
+        const struct_type = self.type_table.lookup(si.type_name) orelse {
+            self.diagnostics.addCodedError(.E202, location, self.fmt(
+                "unknown type '{s}'",
+                .{si.type_name},
+            )) catch {};
+            return .err;
+        };
+
+        // verify it's actually a struct
+        const struct_info = self.type_table.get(struct_type) orelse return .err;
+        switch (struct_info) {
+            .@"struct" => |s| {
+                // check field count
+                if (si.args.len != s.fields.len) {
+                    self.diagnostics.addCodedError(.E207, location, self.fmt(
+                        "{s} expects {d} fields, got {d}",
+                        .{ si.type_name, s.fields.len, si.args.len },
+                    )) catch {};
+                    return .err;
+                }
+
+                // check each field type
+                for (si.args, s.fields) |arg, field| {
+                    const arg_type = self.checkExpr(arg.value, scope);
+                    if (arg_type.isErr()) continue;
+                    if (arg_type != field.type_id) {
+                        self.diagnostics.addCodedError(.E219, arg.location, self.fmt(
+                            "field '{s}' type mismatch: expected {s}, got {s}",
+                            .{ field.name, self.type_table.typeName(field.type_id), self.type_table.typeName(arg_type) },
+                        )) catch {};
+                    }
+                }
+
+                return struct_type;
+            },
+            else => {
+                self.diagnostics.addCodedError(.E202, location, self.fmt(
+                    "'{s}' is not a struct type",
+                    .{si.type_name},
+                )) catch {};
+                return .err;
+            },
+        }
     }
 
     fn checkMethodCall(self: *Checker, mc: ast.MethodCallExpr, location: Location, scope: *const Scope) TypeId {

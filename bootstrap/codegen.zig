@@ -2593,6 +2593,7 @@ pub const CEmitter = struct {
             },
             .spawn_expr => |inner| try self.emitSpawn(inner),
             .await_expr => |inner| try self.emitAwait(inner),
+            .struct_init => |si| try self.emitStructInit(&si),
             .err => {},
         }
     }
@@ -3771,6 +3772,51 @@ pub const CEmitter = struct {
             try self.emitExpr(elem);
         }
         try self.writeStr("})");
+    }
+
+    fn emitStructInit(self: *CEmitter, si: *const ast.StructInit) EmitError!void {
+        // emit: (StructName){ .field1 = val1, .field2 = val2, ... }
+        try self.writeStr("(");
+        try self.writeStr(si.type_name);
+        try self.writeStr("){ ");
+
+        // get struct info to lookup field names
+        if (self.type_table.lookup(si.type_name)) |struct_tid| {
+            if (self.type_table.get(struct_tid)) |ty| {
+                switch (ty) {
+                    .@"struct" => |s| {
+                        for (si.args, s.fields, 0..) |arg, field, i| {
+                            if (i > 0) try self.writeStr(", ");
+                            try self.writeStr(".");
+                            try self.writeStr(field.name);
+                            try self.writeStr(" = ");
+                            try self.emitExpr(arg.value);
+                        }
+                    },
+                    else => {
+                        // fallback: emit args positionally
+                        for (si.args, 0..) |arg, i| {
+                            if (i > 0) try self.writeStr(", ");
+                            try self.emitExpr(arg.value);
+                        }
+                    },
+                }
+            } else {
+                // fallback: emit args positionally
+                for (si.args, 0..) |arg, i| {
+                    if (i > 0) try self.writeStr(", ");
+                    try self.emitExpr(arg.value);
+                }
+            }
+        } else {
+            // fallback: emit args positionally
+            for (si.args, 0..) |arg, i| {
+                if (i > 0) try self.writeStr(", ");
+                try self.emitExpr(arg.value);
+            }
+        }
+
+        try self.writeStr(" }");
     }
 
     fn emitIndexExpr(self: *CEmitter, idx: *const ast.IndexExpr) EmitError!void {

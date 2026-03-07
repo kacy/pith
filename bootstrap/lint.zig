@@ -379,6 +379,10 @@ fn collectUsedIdentsFromExpr(expr: *const ast.Expr, buf: [][]const u8, count: *u
             }
         },
         // literals and self don't reference variables
+        .struct_init => |si| {
+            for (si.args) |*arg| collectUsedIdentsFromExpr(arg.value, buf, count);
+        },
+        // literals and self don't reference variables
         .int_lit, .float_lit, .string_lit, .bool_lit, .none_lit, .self_expr, .err => {},
     }
 }

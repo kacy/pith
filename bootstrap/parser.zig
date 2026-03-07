@@ -559,6 +559,25 @@ pub const Parser = struct {
                         }
                     }
                 },
+                // struct initialization: TypeName{field1, field2, ...}
+                .lbrace => {
+                    // Only valid if expr is an identifier (the struct type name)
+                    switch (expr.kind) {
+                        .ident => |type_name| {
+                            _ = self.advance(); // skip {
+                            const args = try self.parseArgListBrace();
+                            const end_tok = try self.expect(.rbrace);
+                            expr = try self.create(ast.Expr, .{
+                                .kind = .{ .struct_init = .{
+                                    .type_name = type_name,
+                                    .args = args,
+                                } },
+                                .location = Location.span(expr.location, end_tok.location),
+                            });
+                        },
+                        else => break, // Not a struct init, break out
+                    }
+                },
                 else => break,
             }
         }
@@ -586,6 +605,22 @@ pub const Parser = struct {
         while (self.match(.comma)) {
             self.skipNewlines();
             if (self.check(.rparen)) break;
+            try args.append(self.allocator, try self.parseArg());
+        }
+        self.skipNewlines();
+        return args.toOwnedSlice(self.allocator);
+    }
+
+    /// parse comma-separated argument list for struct init (inside braces): [name "="] expr { "," [name "="] expr }
+    fn parseArgListBrace(self: *Parser) ParseError![]const ast.Arg {
+        var args: std.ArrayList(ast.Arg) = .empty;
+        self.skipNewlines();
+        if (self.check(.rbrace)) return args.toOwnedSlice(self.allocator);
+
+        try args.append(self.allocator, try self.parseArg());
+        while (self.match(.comma)) {
+            self.skipNewlines();
+            if (self.check(.rbrace)) break;
             try args.append(self.allocator, try self.parseArg());
         }
         self.skipNewlines();
@@ -1249,16 +1284,17 @@ pub const Parser = struct {
     fn parseStatement(self: *Parser) ParseError!ast.Stmt {
         const tok = self.peek();
 
-        // mut binding: mut name [:type] := expr
-        if (tok.kind == .kw_mut) {
+        // let/mut binding: [let | mut] name [:type] := expr
+        if (tok.kind == .kw_let or tok.kind == .kw_mut) {
             return self.parseBinding();
         }
 
-        // binding: name [:type] := expr
+        // binding: name [:type] [:]= expr
         // need to distinguish from assignment and expr-stmt.
-        // if we see ident followed by := or ident : type :=, it's a binding.
+        // if we see ident followed by = or := or ident : type =, it's a binding.
         if (tok.kind == .identifier) {
-            if (self.peekAhead(1).kind == .colon_eq) {
+            const next_kind = self.peekAhead(1).kind;
+            if (next_kind == .colon_eq or next_kind == .eq) {
                 return self.parseBinding();
             }
             if (self.peekAhead(1).kind == .colon and self.peekAhead(2).kind == .identifier) {
@@ -1306,7 +1342,7 @@ pub const Parser = struct {
         var i: u32 = 2;
         while (true) {
             const kind = self.peekAhead(i).kind;
-            if (kind == .colon_eq) return true;
+            if (kind == .colon_eq or kind == .eq) return true;
             if (kind == .eof or kind == .newline or kind == .dedent) return false;
             // tokens that can appear in type expressions
             if (kind == .identifier or kind == .lbracket or kind == .rbracket or
@@ -1321,9 +1357,10 @@ pub const Parser = struct {
         }
     }
 
-    /// parse a binding: [mut] name [: type] := expr
+    /// parse a binding: [let | mut] name [: type] := expr
     fn parseBinding(self: *Parser) ParseError!ast.Stmt {
         const loc = self.peek().location;
+        _ = self.match(.kw_let); // let means immutable
         const is_mut = self.match(.kw_mut);
         const name_tok = try self.expect(.identifier);
 
@@ -1332,7 +1369,14 @@ pub const Parser = struct {
             type_expr = try self.parseTypeExpr();
         }
 
-        _ = try self.expect(.colon_eq);
+        // accept either := or = for bindings
+        const assign_tok = self.peek();
+        if (assign_tok.kind == .colon_eq or assign_tok.kind == .eq) {
+            _ = self.advance();
+        } else {
+            try self.diagnostics.addCodedError(.E100, assign_tok.location, "expected ':=' or '=' in binding");
+            return error.OutOfMemory;
+        }
         const value = try self.parseExpression();
 
         return .{
@@ -1634,7 +1678,7 @@ pub const Parser = struct {
                 break :blk .{ .test_decl = try self.parseTestDecl() };
             },
             // binding at top level
-            .kw_mut, .identifier => blk: {
+            .kw_let, .kw_mut, .identifier => blk: {
                 const stmt = try self.parseBinding();
                 break :blk .{ .binding = stmt.kind.binding };
             },

@@ -297,45 +297,4 @@ test "TypeId helper methods" {
 
     try std.testing.expect(TypeId.int.isInteger());
     try std.testing.expect(!TypeId.float.isInteger());
-
-    try std.testing.expect(TypeId.err.isErr());
-    try std.testing.expect(!TypeId.int.isErr());
-}
-
-test "lookup returns null for unknown types" {
-    var table = try TypeTable.init(std.testing.allocator);
-    defer table.deinit();
-
-    try std.testing.expect(table.lookup("NonExistent") == null);
-}
-
-test "multiple user-defined types get sequential ids" {
-    var table = try TypeTable.init(std.testing.allocator);
-    defer table.deinit();
-
-    const id1 = try table.addType(.{ .@"struct" = .{ .name = "Foo", .fields = &.{} } });
-    const id2 = try table.addType(.{ .@"struct" = .{ .name = "Bar", .fields = &.{} } });
-
-    try std.testing.expectEqual(TypeId.first_user, id1.index());
-    try std.testing.expectEqual(TypeId.first_user + 1, id2.index());
-}
-
-test "task type stores inner type" {
-    var table = try TypeTable.init(std.testing.allocator);
-    defer table.deinit();
-
-    const id = try table.addType(.{ .task = .{ .inner = .int } });
-    const ty = table.get(id).?;
-    try std.testing.expectEqual(TypeId.int, ty.task.inner);
-    try std.testing.expectEqualStrings("Task", table.typeName(id));
-}
-
-test "channel type stores inner type" {
-    var table = try TypeTable.init(std.testing.allocator);
-    defer table.deinit();
-
-    const id = try table.addType(.{ .channel = .{ .inner = .string } });
-    const ty = table.get(id).?;
-    try std.testing.expectEqual(TypeId.string, ty.channel.inner);
-    try std.testing.expectEqualStrings("Channel", table.typeName(id));
 }

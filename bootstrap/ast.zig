@@ -298,6 +298,9 @@ pub const ExprKind = union(enum) {
     // grouped expression (parenthesized)
     grouped: *const Expr,
 
+    // struct initialization: TypeName{field1, field2, ...}
+    struct_init: StructInit,
+
     // error recovery sentinel
     err,
 };
@@ -350,6 +353,12 @@ pub const Arg = struct {
     name: ?[]const u8,
     value: *const Expr,
     location: Location,
+};
+
+/// struct initialization: TypeName{field1, field2, ...}
+pub const StructInit = struct {
+    type_name: []const u8,
+    args: []const Arg,
 };
 
 pub const FieldAccess = struct {

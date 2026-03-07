@@ -4,7 +4,8 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Default to ReleaseSafe to work around Zig 0.15.2 segfault in Debug mode.
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode") orelse .ReleaseSafe;
 
     const exe = b.addExecutable(.{
         .name = "forge",
@@ -39,6 +40,9 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // zig build test
+    // workaround for zig 0.15.2: --listen=- flag causes tests to hang
+    // manually create run step without enableTestRunnerMode
+    const test_step = b.step("test", "run unit tests");
     const exe_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("bootstrap/main.zig"),
@@ -46,7 +50,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const run_tests = b.addRunArtifact(exe_tests);
-    const test_step = b.step("test", "run unit tests");
+    const run_tests = std.Build.Step.Run.create(b, "run test");
+    run_tests.producer = exe_tests;
+    run_tests.addArtifactArg(exe_tests);
+    run_tests.has_side_effects = true;
     test_step.dependOn(&run_tests.step);
 }

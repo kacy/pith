@@ -5,7 +5,7 @@
 
 from lexer import lex_all
 from parser import parse
-from ast import get_node
+from ast import get_node, reset_arena
 from checker import c_init, c_run_module
 from codegen import g_init, g_set_test_mode, g_emit_module, g_emit_modules, g_get_output
 
@@ -133,12 +133,19 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
             file_path = dir + "/" + rel_path + ".fg"
         if dr_visited.contains_key(file_path):
             continue
-        # Check for import cycles
+        # Check for import cycles (must check this AFTER checking visited)
+        # A file in dr_checking means we're currently processing it upstream,
+        # which indicates a circular dependency
         if dr_checking.contains_key(file_path):
-            # Import cycle detected!
-            # TODO: emit proper error E235
-            # For now, skip to prevent infinite recursion
-            continue
+            # Import cycle detected - report E235 error
+            mut cycle_msg := "import cycle detected: " + file_path
+            # Build cycle path from checking map
+            for checking_path in dr_checking.keys():
+                cycle_msg = cycle_msg + " -> " + checking_path
+            print_err("error[E235]: " + cycle_msg)
+            # Return error by attempting to read non-existent file
+            # This triggers error propagation
+            read_file("__import_cycle_error__")!
         dr_checking.insert(file_path, true)
         dr_visited.insert(file_path, true)
         content := read_file(file_path)!
@@ -161,6 +168,7 @@ pub fn init_driver(source_path: String):
     dr_stdlib_root = find_stdlib_root(source_path)
     dr_visited = {}
     dr_checking = {}
+    reset_arena()
     mark_visited(source_path)
 
 # run the full compile pipeline: lex, parse, resolve imports, check, codegen.

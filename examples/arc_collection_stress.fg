@@ -5,10 +5,10 @@
 fn main():
     print("ARC Collection Stress Test")
     print("WARNING: Collections don't have RC yet - this will leak memory!")
-    
+
     # Test 1: List of strings
     print("Test 1: List[String] (100 iterations)")
-    i := 0
+    mut i := 0
     while i < 100:
         items := ["item_" + i.to_string()]
         items.push("second_" + i.to_string())
@@ -16,7 +16,7 @@ fn main():
         # BUT: Currently they leak because Collection RC is not implemented
         i = i + 1
     print("Test 1 complete (may have leaked memory)")
-    
+
     # Test 2: Collection operations
     print("Test 2: Collection operations (100 iterations)")
     i = 0
@@ -26,7 +26,7 @@ fn main():
         # joined is a new string, should be managed
         i = i + 1
     print("Test 2 complete")
-    
+
     # Test 3: String in collections
     print("Test 3: String processing (200 iterations)")
     i = 0
@@ -36,6 +36,6 @@ fn main():
         # chars is a list of strings - will leak
         i = i + 1
     print("Test 3 complete (may have leaked memory)")
-    
+
     print("Collection stress tests complete")
     print("Run with: valgrind --leak-check=full ./arc_collection_stress")

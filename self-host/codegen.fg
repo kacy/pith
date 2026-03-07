@@ -241,8 +241,8 @@ fn type_needs_reference_counting(tid: Int) -> Bool:
         return true
     # check for List[String], Map[String, _], Map[_, String], etc.
     if tid >= 0:
-        if tid < tt_count():
-            info := tt_get(tid)
+        if tid < get_type_count():
+            info := get_type_info(tid)
             if info.kind == "list":
                 return type_needs_reference_counting(info.inner)
             if info.kind == "map":
@@ -298,8 +298,8 @@ fn get_c_type_string(tid: Int) -> String:
         return mangled_type_names[tid]
     # user-defined — look up in the type table
     if tid >= 0:
-        if tid < tt_count():
-            info := tt_get(tid)
+        if tid < get_type_count():
+            info := get_type_info(tid)
             if info.kind == "struct":
                 if info.name == "Mutex":
                     return "forge_mutex_t"
@@ -459,9 +459,9 @@ fn is_result_type(tid: Int) -> Bool:
         return false
     if tid == TID_ERR:
         return false
-    if tid >= tt_count():
+    if tid >= get_type_count():
         return false
-    info := tt_get(tid)
+    info := get_type_info(tid)
     return info.kind == "result"
 
 # check if a TypeId is an optional type
@@ -470,9 +470,9 @@ fn is_optional_type(tid: Int) -> Bool:
         return false
     if tid == TID_ERR:
         return false
-    if tid >= tt_count():
+    if tid >= get_type_count():
         return false
-    info := tt_get(tid)
+    info := get_type_info(tid)
     return info.kind == "optional"
 
 # check if an expression has string type
@@ -527,7 +527,7 @@ fn build_instantiated_name(base: String, arg_tids: List[Int]) -> String:
         if first == false:
             result = result + ","
         first = false
-        result = result + tt_type_name(tid)
+        result = result + get_type_name(tid)
     result = result + "]"
     return result
 
@@ -588,7 +588,7 @@ fn build_substitution_map(fn_name: String, inst_name: String) -> Map[String, Int
     mut i := 0
     while i < params.len():
         if i < type_args.len():
-            tid := tt_lookup(type_args[i])
+            tid := lookup_type_id(type_args[i])
             if tid >= 0:
                 subst.insert(params[i], tid)
         i = i + 1
@@ -642,10 +642,10 @@ fn collect_generic_function_instances(node_idx: Int):
 
 # resolve the type of a struct field from the type table
 fn resolve_field_type(struct_name: String, field_name: String) -> Int:
-    tid := tt_lookup(struct_name)
+    tid := lookup_type_id(struct_name)
     if tid < 0:
         return TID_ERR
-    info := tt_get(tid)
+    info := get_type_info(tid)
     if info.kind != "struct":
         return TID_ERR
     mut i := 0
@@ -802,8 +802,8 @@ fn emit_struct_instantiations(base: String):
     # scan the entire type table for struct types whose names start with "base["
     prefix := base + "["
     mut tid := TID_FIRST_USER
-    while tid < tt_count():
-        info := tt_get(tid)
+    while tid < get_type_count():
+        info := get_type_info(tid)
         if info.kind == "struct":
             if info.name.starts_with(prefix):
                 # this is an instantiation — emit typedef
@@ -927,8 +927,8 @@ fn emit_wrapper_typedefs(kind: String, prefix: String, dedup: Map[String, Bool])
     # type IDs, build a name from the inner type, dedup, and emit a typedef.
     # the only difference is the struct body.
     mut tid := 0
-    while tid < tt_count():
-        info := tt_get(tid)
+    while tid < get_type_count():
+        info := get_type_info(tid)
         if info.kind == kind:
             inner_c := get_c_type_string(info.inner)
             name := prefix + inner_c
@@ -949,8 +949,8 @@ fn emit_wrapper_typedefs(kind: String, prefix: String, dedup: Map[String, Bool])
 
 fn emit_tuple_typedefs():
     mut tid := 0
-    while tid < tt_count():
-        info := tt_get(tid)
+    while tid < get_type_count():
+        info := get_type_info(tid)
         if info.kind == "tuple":
             # build name from element types
             mut name := "forge_tuple"
@@ -1343,14 +1343,14 @@ fn infer_expression_type(node_idx: Int) -> Int:
             if callee.kind == "ident":
                 fn_tid := lookup_binding(current_scope, callee.value)
                 if fn_tid >= 0:
-                    if fn_tid < tt_count():
-                        info := tt_get(fn_tid)
+                    if fn_tid < get_type_count():
+                        info := get_type_info(fn_tid)
                         if info.kind == "function":
                             return info.return_type
                         if info.kind == "struct":
                             return fn_tid
                 # struct constructor from type table
-                struct_tid := tt_lookup(callee.value)
+                struct_tid := lookup_type_id(callee.value)
                 if struct_tid >= 0:
                     return struct_tid
         return TID_ERR
@@ -1374,11 +1374,11 @@ fn infer_expression_type(node_idx: Int) -> Int:
         if receiver_tid == TID_BOOL:
             return TID_STRING
         # user-defined and collection methods
-        type_name := tt_type_name(receiver_tid)
+        type_name := get_type_name(receiver_tid)
         key := type_name + "." + node.value
         if method_type_map.contains_key(key):
             fn_tid := method_type_map[key]
-            info := tt_get(fn_tid)
+            info := get_type_info(fn_tid)
             if info.kind == "function":
                 return info.return_type
         return TID_ERR
@@ -1389,8 +1389,8 @@ fn infer_expression_type(node_idx: Int) -> Int:
         if obj_tid == TID_ERR:
             obj_tid = infer_expression_type(node.children[0])
         if obj_tid >= 0:
-            if obj_tid < tt_count():
-                info := tt_get(obj_tid)
+            if obj_tid < get_type_count():
+                info := get_type_info(obj_tid)
                 if info.kind == "struct":
                     mut fi := 0
                     while fi < info.fields.len():
@@ -1492,8 +1492,8 @@ fn emit_binding(node_idx: Int):
             return
     elif tid != TID_ERR:
         if tid >= 0:
-            if tid < tt_count():
-                info := tt_get(tid)
+            if tid < get_type_count():
+                info := get_type_info(tid)
                 if info.kind == "function":
                     write_indent()
                     emit_fn_ptr_binding(tid, name)
@@ -1714,11 +1714,11 @@ fn emit_for_stmt(node_idx: Int):
         write_indent()
         emit_code("/* for loop: could not resolve iterable type */\n")
         return
-    if iter_tid >= tt_count():
+    if iter_tid >= get_type_count():
         write_indent()
         emit_code("/* for loop: could not resolve iterable type */\n")
         return
-    iter_info := tt_get(iter_tid)
+    iter_info := get_type_info(iter_tid)
 
     if iter_info.kind == "list":
         emit_for_loop_body(node, idx_name, elem_name, comma_pos, get_c_type_string(iter_info.inner), iter_info.inner, "list")
@@ -1965,8 +1965,8 @@ fn emit_await_expr(node_idx: Int):
     inner_tid := c_get_expr_type(inner_idx)
     mut return_type := TID_ERR
     if inner_tid >= 0:
-        if inner_tid < tt_count():
-            info := tt_get(inner_tid)
+        if inner_tid < get_type_count():
+            info := get_type_info(inner_tid)
             if info.kind == "task":
                 return_type = info.inner
     ret_c := get_c_type_string(return_type)
@@ -2147,7 +2147,7 @@ fn emit_call(node_idx: Int):
                     if obj_node.value == "Channel":
                         inner_node := get_node(callee_node.children[1])
                         inner_name := inner_node.value
-                        inner_tid := tt_lookup(inner_name)
+                        inner_tid := lookup_type_id(inner_name)
                         inner_c := get_c_type_string(inner_tid)
                         emit_code("forge_channel_create(sizeof(")
                         emit_code(inner_c)
@@ -2201,9 +2201,9 @@ fn emit_call(node_idx: Int):
         emit_assert_eq(node_idx, false)
         return
     # check if struct/enum constructor
-    tid := tt_lookup(name)
+    tid := lookup_type_id(name)
     if tid >= 0:
-        info := tt_get(tid)
+        info := get_type_info(tid)
         if info.kind == "struct":
             emit_struct_constructor(node_idx, name, tid)
             return
@@ -2214,9 +2214,9 @@ fn emit_call(node_idx: Int):
     if generic_declaration_map.contains_key(name):
         inst := build_instantiated_name_from_arguments(name, node_idx)
         if inst != "":
-            inst_tid := tt_lookup(inst)
+            inst_tid := lookup_type_id(inst)
             if inst_tid >= 0:
-                inst_info := tt_get(inst_tid)
+                inst_info := get_type_info(inst_tid)
                 if inst_info.kind == "struct":
                     mangled := mangle_identifier(inst)
                     emit_generic_struct_constructor(node_idx, mangled, inst_tid)
@@ -2248,8 +2248,8 @@ fn emit_call(node_idx: Int):
     if local_variable_types.contains_key(name):
         local_tid := local_variable_types[name]
         if local_tid >= 0:
-            if local_tid < tt_count():
-                local_info := tt_get(local_tid)
+            if local_tid < get_type_count():
+                local_info := get_type_info(local_tid)
                 if local_info.kind == "function":
                     # closure call: cast fn_ptr and invoke with env_ptr
                     emit_code("((")
@@ -2353,12 +2353,12 @@ fn build_instantiated_name_from_arguments(base: String, node_idx: Int) -> String
             result = result + ","
         first = false
         arg_tid := c_get_expr_type(expr_idx)
-        result = result + tt_type_name(arg_tid)
+        result = result + get_type_name(arg_tid)
     result = result + "]"
     return result
 
 fn emit_struct_constructor(node_idx: Int, name: String, tid: Int):
-    info := tt_get(tid)
+    info := get_type_info(tid)
     emit_code("(" + name + ")" + LB + " ")
     nargs := get_call_argument_count(node_idx)
     mut fi := 0
@@ -2374,7 +2374,7 @@ fn emit_struct_constructor(node_idx: Int, name: String, tid: Int):
     emit_code(" " + RB)
 
 fn emit_generic_struct_constructor(node_idx: Int, mangled: String, tid: Int):
-    info := tt_get(tid)
+    info := get_type_info(tid)
     emit_code("(" + mangled + ")" + LB + " ")
     nargs := get_call_argument_count(node_idx)
     mut fi := 0
@@ -2481,8 +2481,8 @@ fn emit_method_call(node_idx: Int):
         return
     # collection methods
     if receiver_tid >= 0:
-        if receiver_tid < tt_count():
-            info := tt_get(receiver_tid)
+        if receiver_tid < get_type_count():
+            info := get_type_info(receiver_tid)
             if info.kind == "list":
                 emit_list_method(node_idx, method, info.inner)
                 return
@@ -2520,9 +2520,9 @@ fn emit_method_call(node_idx: Int):
 fn get_type_name_for_method(tid: Int) -> String:
     if tid < 0:
         return ""
-    if tid >= tt_count():
+    if tid >= get_type_count():
         return ""
-    info := tt_get(tid)
+    info := get_type_info(tid)
     if info.kind == "struct":
         return info.name
     if info.kind == "enum":
@@ -2834,8 +2834,8 @@ fn emit_collection_push(node_idx: Int, elem_tid: Int, elem_c: String):
     mut is_complex := elem_tid == TID_STRING
     if is_complex == false:
         if elem_tid >= TID_FIRST_USER:
-            if elem_tid < tt_count():
-                ei := tt_get(elem_tid)
+            if elem_tid < get_type_count():
+                ei := get_type_info(elem_tid)
                 if ei.kind == "struct":
                     is_complex = true
                 if ei.kind == "enum":
@@ -3100,8 +3100,8 @@ fn emit_index_expr(node_idx: Int):
         emit_code(")")
         return
     if obj_tid >= 0:
-        if obj_tid < tt_count():
-            info := tt_get(obj_tid)
+        if obj_tid < get_type_count():
+            info := get_type_info(obj_tid)
             if info.kind == "list":
                 elem_c := get_c_type_string(info.inner)
                 emit_code("FORGE_LIST_GET(")
@@ -3774,8 +3774,8 @@ fn find_lambda_function_type(node_idx: Int) -> Int:
 
 fn scan_for_function_type(param_tids: List[Int], ret_tid: Int) -> Int:
     mut tid := 0
-    while tid < tt_count():
-        info := tt_get(tid)
+    while tid < get_type_count():
+        info := get_type_info(tid)
         if info.kind == "function":
             if info.return_type == ret_tid:
                 if info.param_types.len() == param_tids.len():
@@ -4062,7 +4062,7 @@ fn emit_method_def(type_name: String, node_idx: Int):
     local_variable_types = {}
     current_function_return_type = resolve_function_return_type(node_idx)
     # register self as local
-    self_tid := tt_lookup(type_name)
+    self_tid := lookup_type_id(type_name)
     if self_tid >= 0:
         local_variable_types.insert("self", self_tid)
     # register params
@@ -4222,10 +4222,10 @@ fn emit_hoisted_lambdas():
         if fn_tid < 0:
             li = li + 1
             continue
-        if fn_tid >= tt_count():
+        if fn_tid >= get_type_count():
             li = li + 1
             continue
-        info := tt_get(fn_tid)
+        info := get_type_info(fn_tid)
         if info.kind != "function":
             li = li + 1
             continue
@@ -4315,10 +4315,10 @@ fn build_lambda_forward_declarations():
         if fn_tid < 0:
             li = li + 1
             continue
-        if fn_tid >= tt_count():
+        if fn_tid >= get_type_count():
             li = li + 1
             continue
-        info := tt_get(fn_tid)
+        info := get_type_info(fn_tid)
         if info.kind != "function":
             li = li + 1
             continue

@@ -1289,14 +1289,17 @@ pub const Parser = struct {
             return self.parseBinding();
         }
 
-        // binding: name [:type] [:]= expr
+        // binding: name [:type] := expr  OR  let/mut name = expr
         // need to distinguish from assignment and expr-stmt.
-        // if we see ident followed by = or := or ident : type =, it's a binding.
+        // if we see ident followed by := or ident : type =, it's a binding.
+        // if you see ident followed by = (without let/mut), it's an assignment.
         if (tok.kind == .identifier) {
             const next_kind = self.peekAhead(1).kind;
-            if (next_kind == .colon_eq or next_kind == .eq) {
+            if (next_kind == .colon_eq) {
                 return self.parseBinding();
             }
+            // Note: ident = expr is an ASSIGNMENT, not a binding
+            // Bindings require let/mut keyword or := operator
             if (self.peekAhead(1).kind == .colon and self.peekAhead(2).kind == .identifier) {
                 // could be binding with type annotation: name: Type := expr
                 // we need to look further to find :=
@@ -1342,7 +1345,7 @@ pub const Parser = struct {
         var i: u32 = 2;
         while (true) {
             const kind = self.peekAhead(i).kind;
-            if (kind == .colon_eq or kind == .eq) return true;
+            if (kind == .colon_eq) return true;
             if (kind == .eof or kind == .newline or kind == .dedent) return false;
             // tokens that can appear in type expressions
             if (kind == .identifier or kind == .lbracket or kind == .rbracket or

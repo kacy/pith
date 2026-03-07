@@ -23,7 +23,7 @@ mut d_header_end: Int := 0
 # --- helpers ---
 
 # trim leading whitespace from a string.
-fn d_trim_left(s: String) -> String:
+fn trim_left(s: String) -> String:
     mut i := 0
     while i < s.len():
         if s[i] == " " or s[i] == "\t":
@@ -33,7 +33,7 @@ fn d_trim_left(s: String) -> String:
     return s.substring(i, s.len())
 
 # trim trailing whitespace from a string.
-fn d_trim_right(s: String) -> String:
+fn trim_right(s: String) -> String:
     mut end := s.len()
     while end > 0:
         ch := s[end - 1]
@@ -44,24 +44,24 @@ fn d_trim_right(s: String) -> String:
     return s.substring(0, end)
 
 # trim both ends.
-fn d_trim(s: String) -> String:
-    return d_trim_left(d_trim_right(s))
+fn trim_whitespace(s: String) -> String:
+    return trim_left(trim_right(s))
 
 # check if a string starts with a prefix.
-fn d_starts_with(s: String, prefix: String) -> Bool:
+fn string_starts_with(s: String, prefix: String) -> Bool:
     if s.len() < prefix.len():
         return false
     return s.substring(0, prefix.len()) == prefix
 
 # convert a character to lowercase.
-fn d_to_lower_char(ch: String) -> String:
+fn char_to_lowercase(ch: String) -> String:
     c := ord(ch)
     if c >= 65 and c <= 90:
         return chr(c + 32)
     return ch
 
 # case-insensitive substring search.
-fn d_contains_ci(haystack: String, needle: String) -> Bool:
+fn contains_case_insensitive(haystack: String, needle: String) -> Bool:
     if needle.len() == 0:
         return true
     if haystack.len() < needle.len():
@@ -70,12 +70,12 @@ fn d_contains_ci(haystack: String, needle: String) -> Bool:
     mut lower_h := ""
     mut i := 0
     while i < haystack.len():
-        lower_h = lower_h + d_to_lower_char(haystack[i])
+        lower_h = lower_h + char_to_lowercase(haystack[i])
         i = i + 1
     mut lower_n := ""
     i = 0
     while i < needle.len():
-        lower_n = lower_n + d_to_lower_char(needle[i])
+        lower_n = lower_n + char_to_lowercase(needle[i])
         i = i + 1
     # scan for match
     mut j := 0
@@ -86,7 +86,7 @@ fn d_contains_ci(haystack: String, needle: String) -> Bool:
     return false
 
 # escape a string for JSON output.
-fn d_json_escape(s: String) -> String:
+fn escape_json_string(s: String) -> String:
     mut output := ""
     mut i := 0
     while i < s.len():
@@ -105,8 +105,8 @@ fn d_json_escape(s: String) -> String:
     return output
 
 # strip the "# " prefix from a comment line.
-fn d_strip_comment(line: String) -> String:
-    trimmed := d_trim_left(line)
+fn strip_comment_markers(line: String) -> String:
+    trimmed := trim_left(line)
     if trimmed.len() >= 2:
         if trimmed[0] == "#" and trimmed[1] == " ":
             return trimmed.substring(2, trimmed.len())
@@ -118,14 +118,14 @@ fn d_strip_comment(line: String) -> String:
 # "pub fn abs(x: Int) -> Int" -> "abs"
 # "pub struct Foo:" -> "Foo"
 # "pub enum Color:" -> "Color"
-fn d_extract_name(line: String) -> String:
-    trimmed := d_trim(line)
+fn extract_documentation_name(line: String) -> String:
+    trimmed := trim_whitespace(line)
     mut rest := ""
-    if d_starts_with(trimmed, "pub fn "):
+    if string_starts_with(trimmed, "pub fn "):
         rest = trimmed.substring(7, trimmed.len())
-    elif d_starts_with(trimmed, "pub struct "):
+    elif string_starts_with(trimmed, "pub struct "):
         rest = trimmed.substring(11, trimmed.len())
-    elif d_starts_with(trimmed, "pub enum "):
+    elif string_starts_with(trimmed, "pub enum "):
         rest = trimmed.substring(9, trimmed.len())
     else:
         return ""
@@ -139,19 +139,19 @@ fn d_extract_name(line: String) -> String:
     return rest.substring(0, end)
 
 # extract the kind from a pub declaration line.
-fn d_extract_kind(line: String) -> String:
-    trimmed := d_trim(line)
-    if d_starts_with(trimmed, "pub fn "):
+fn extract_documentation_kind(line: String) -> String:
+    trimmed := trim_whitespace(line)
+    if string_starts_with(trimmed, "pub fn "):
         return "fn"
-    if d_starts_with(trimmed, "pub struct "):
+    if string_starts_with(trimmed, "pub struct "):
         return "struct"
-    if d_starts_with(trimmed, "pub enum "):
+    if string_starts_with(trimmed, "pub enum "):
         return "enum"
     return ""
 
 # extract the signature from a pub declaration line (strip trailing colon).
-fn d_extract_sig(line: String) -> String:
-    trimmed := d_trim(line)
+fn extract_documentation_signature(line: String) -> String:
+    trimmed := trim_whitespace(line)
     if trimmed.len() > 0 and trimmed[trimmed.len() - 1] == ":":
         return trimmed.substring(0, trimmed.len() - 1)
     return trimmed
@@ -159,7 +159,7 @@ fn d_extract_sig(line: String) -> String:
 # find the position of a dash separator in a header line.
 # looks for " - " (3 bytes) or " — " (5 bytes, em dash is 3 bytes in UTF-8).
 # returns -1 if not found.
-fn d_find_separator(s: String) -> Int:
+fn find_doc_separator(s: String) -> Int:
     emdash := chr(226) + chr(128) + chr(148)
     mut j := 0
     while j < s.len():
@@ -172,7 +172,7 @@ fn d_find_separator(s: String) -> Int:
     return 0 - 1
 
 # return the byte length of the separator at position pos.
-fn d_separator_len(s: String, pos: Int) -> Int:
+fn get_separator_length(s: String, pos: Int) -> Int:
     if pos + 3 <= s.len() and s.substring(pos, pos + 3) == " - ":
         return 3
     return 5
@@ -180,7 +180,7 @@ fn d_separator_len(s: String, pos: Int) -> Int:
 # --- core ---
 
 # reset all state for a new extraction.
-fn d_reset():
+fn reset_docgen_state():
     d_count = 0
     d_names = []
     d_kinds = []
@@ -194,23 +194,23 @@ fn d_reset():
 # extract documentation from forge source text.
 # populates module-level state with items found.
 pub fn doc_extract(source: String):
-    d_reset()
+    reset_docgen_state()
     lines := source.split("\n")
     mut i := 0
 
     # collect module header — leading comment block
     # first line should be "# module.name — description"
-    if lines.len() > 0 and d_starts_with(d_trim_left(lines[0]), "#"):
-        first := d_strip_comment(lines[0])
+    if lines.len() > 0 and string_starts_with(trim_left(lines[0]), "#"):
+        first := strip_comment_markers(lines[0])
         # parse "std.math — basic math functions" or "std.math - description"
         # em dash is 3 bytes in UTF-8, so " — " is 5 bytes; " - " is 3 bytes
-        sep := d_find_separator(first)
+        sep := find_doc_separator(first)
         if sep > 0:
-            d_mod_name = d_trim(first.substring(0, sep))
-            sep_len := d_separator_len(first, sep)
-            d_mod_desc = d_trim(first.substring(sep + sep_len, first.len()))
+            d_mod_name = trim_whitespace(first.substring(0, sep))
+            sep_len := get_separator_length(first, sep)
+            d_mod_desc = trim_whitespace(first.substring(sep + sep_len, first.len()))
         else:
-            d_mod_name = d_trim(first)
+            d_mod_name = trim_whitespace(first)
         i = 1
 
         # collect remaining header lines — stop at first blank line (no #).
@@ -218,11 +218,11 @@ pub fn doc_extract(source: String):
         # trigger the stop condition. a truly empty line separates the header
         # from per-item doc comments.
         while i < lines.len():
-            trimmed := d_trim_left(lines[i])
+            trimmed := trim_left(lines[i])
             if trimmed.len() == 0:
                 break
             if trimmed[0] == "#":
-                d_header_lines.push(d_strip_comment(lines[i]))
+                d_header_lines.push(strip_comment_markers(lines[i]))
                 i = i + 1
                 continue
             break
@@ -231,22 +231,22 @@ pub fn doc_extract(source: String):
 
     # scan for pub declarations
     while i < lines.len():
-        trimmed := d_trim_left(lines[i])
+        trimmed := trim_left(lines[i])
 
         # check for pub fn/struct/enum
-        if d_starts_with(trimmed, "pub fn ") or d_starts_with(trimmed, "pub struct ") or d_starts_with(trimmed, "pub enum "):
-            name := d_extract_name(trimmed)
-            kind := d_extract_kind(trimmed)
-            sig := d_extract_sig(trimmed)
+        if string_starts_with(trimmed, "pub fn ") or string_starts_with(trimmed, "pub struct ") or string_starts_with(trimmed, "pub enum "):
+            name := extract_documentation_name(trimmed)
+            kind := extract_documentation_kind(trimmed)
+            sig := extract_documentation_signature(trimmed)
 
             # look back for doc comment on preceding line(s)
             # don't look past the module header
             mut doc := ""
             mut back := i - 1
             while back >= d_header_end:
-                prev := d_trim_left(lines[back])
+                prev := trim_left(lines[back])
                 if prev.len() > 0 and prev[0] == "#":
-                    comment_text := d_strip_comment(lines[back])
+                    comment_text := strip_comment_markers(lines[back])
                     if doc == "":
                         doc = comment_text
                     else:
@@ -311,18 +311,18 @@ pub fn doc_format_json() -> String:
     LB := chr(123)
     RB := chr(125)
     mut output := LB
-    output = output + "\"module\":\"" + d_json_escape(d_mod_name) + "\""
-    output = output + ",\"description\":\"" + d_json_escape(d_mod_desc) + "\""
+    output = output + "\"module\":\"" + escape_json_string(d_mod_name) + "\""
+    output = output + ",\"description\":\"" + escape_json_string(d_mod_desc) + "\""
     output = output + ",\"items\":["
     mut i := 0
     while i < d_count:
         if i > 0:
             output = output + ","
         output = output + LB
-        output = output + "\"name\":\"" + d_json_escape(d_names[i]) + "\""
-        output = output + ",\"kind\":\"" + d_json_escape(d_kinds[i]) + "\""
-        output = output + ",\"signature\":\"" + d_json_escape(d_sigs[i]) + "\""
-        output = output + ",\"doc\":\"" + d_json_escape(d_docs[i]) + "\""
+        output = output + "\"name\":\"" + escape_json_string(d_names[i]) + "\""
+        output = output + ",\"kind\":\"" + escape_json_string(d_kinds[i]) + "\""
+        output = output + ",\"signature\":\"" + escape_json_string(d_sigs[i]) + "\""
+        output = output + ",\"doc\":\"" + escape_json_string(d_docs[i]) + "\""
         output = output + RB
         i = i + 1
     output = output + "]"
@@ -348,14 +348,14 @@ pub fn doc_check() -> Int:
 mut d_file_list: List[String] := []
 
 # find the stdlib root by walking up from a starting directory.
-fn d_find_stdlib_root(start_dir: String) -> String:
+fn find_stdlib_root(start_dir: String) -> String:
     mut dir := start_dir
     mut depth := 0
     while depth < 20:
         test_path := dir + "/std"
         if dir_exists(test_path):
             return dir
-        parent := d_get_directory(dir)
+        parent := get_directory_path(dir)
         if parent == dir:
             break
         dir = parent
@@ -363,7 +363,7 @@ fn d_find_stdlib_root(start_dir: String) -> String:
     return ""
 
 # extract directory from a path.
-fn d_get_directory(path: String) -> String:
+fn get_directory_path(path: String) -> String:
     mut last_slash := 0 - 1
     mut i := 0
     while i < path.len():
@@ -376,7 +376,7 @@ fn d_get_directory(path: String) -> String:
 
 # derive a module name from a file path relative to the stdlib root.
 # "std/math.fg" -> "std.math", "std/net/tcp.fg" -> "std.net.tcp"
-fn d_path_to_module(path: String, root: String) -> String:
+fn convert_path_to_module(path: String, root: String) -> String:
     # strip root prefix and leading slash
     mut rel := path
     if path.len() > root.len() + 1:
@@ -396,7 +396,7 @@ fn d_path_to_module(path: String, root: String) -> String:
     return result
 
 # scan the stdlib directory for .fg files.
-fn d_scan_stdlib(stdlib_root: String):
+fn scan_stdlib_documentation(stdlib_root: String):
     d_file_list = []
     std_dir := stdlib_root + "/std"
     if not dir_exists(std_dir):
@@ -421,11 +421,11 @@ fn d_scan_stdlib(stdlib_root: String):
 # search stdlib documentation for a query string.
 # returns formatted results or a "no results" message.
 pub fn doc_search(query: String, start_dir: String) -> String!:
-    stdlib_root := d_find_stdlib_root(start_dir)
+    stdlib_root := find_stdlib_root(start_dir)
     if stdlib_root == "":
         return "error: cannot find std/ directory"
 
-    d_scan_stdlib(stdlib_root)
+    scan_stdlib_documentation(stdlib_root)
 
     mut output := "search: \"" + query + "\"\n"
     mut found := false
@@ -437,18 +437,18 @@ pub fn doc_search(query: String, start_dir: String) -> String!:
         if content == "":
             fi = fi + 1
             continue
-        mod_name := d_path_to_module(path, stdlib_root)
+        mod_name := convert_path_to_module(path, stdlib_root)
 
         doc_extract(content)
 
         # check module-level match
-        mut mod_match := d_contains_ci(d_mod_name, query) or d_contains_ci(d_mod_desc, query)
+        mut mod_match := contains_case_insensitive(d_mod_name, query) or contains_case_insensitive(d_mod_desc, query)
 
         # check item-level matches
         mut matching_items: List[Int] := []
         mut ii := 0
         while ii < d_count:
-            if d_contains_ci(d_names[ii], query) or d_contains_ci(d_docs[ii], query) or d_contains_ci(d_sigs[ii], query):
+            if contains_case_insensitive(d_names[ii], query) or contains_case_insensitive(d_docs[ii], query) or contains_case_insensitive(d_sigs[ii], query):
                 matching_items.push(ii)
             ii = ii + 1
 

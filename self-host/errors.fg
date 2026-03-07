@@ -11,12 +11,12 @@ pub fn render_diagnostics(diags: List[Diagnostic], source: String) -> String:
     mut i := 0
     while i < diags.len():
         d := diags[i]
-        output = output + e_render_one(d, source)
+        output = output + render_single_diagnostic(d, source)
         i = i + 1
     return output
 
 # render a single diagnostic with source context and underline.
-fn e_render_one(d: Diagnostic, source: String) -> String:
+fn render_single_diagnostic(d: Diagnostic, source: String) -> String:
     mut output := ""
 
     # header: file + severity + message (with error code)
@@ -65,38 +65,38 @@ pub fn render_diagnostics_json(diags: List[Diagnostic]) -> String:
     while i < diags.len():
         if i > 0:
             output = output + ","
-        output = output + e_render_json_one(diags[i])
+        output = output + render_diagnostic_json(diags[i])
         i = i + 1
     output = output + "]\n"
     return output
 
 # render a single diagnostic as a JSON object.
-fn e_render_json_one(d: Diagnostic) -> String:
+fn render_diagnostic_json(d: Diagnostic) -> String:
     mut output := chr(123)
     output = output + "\"file\":"
     if d.file != "":
-        output = output + "\"" + e_json_escape(d.file) + "\""
+        output = output + "\"" + escape_json_string(d.file) + "\""
     else:
         output = output + "null"
-    output = output + ",\"severity\":\"" + e_json_escape(d.severity) + "\""
+    output = output + ",\"severity\":\"" + escape_json_string(d.severity) + "\""
     output = output + ",\"code\":"
     if d.code != "":
-        output = output + "\"" + e_json_escape(d.code) + "\""
+        output = output + "\"" + escape_json_string(d.code) + "\""
     else:
         output = output + "null"
-    output = output + ",\"message\":\"" + e_json_escape(d.message) + "\""
+    output = output + ",\"message\":\"" + escape_json_string(d.message) + "\""
     output = output + ",\"line\":" + d.line.to_string()
     output = output + ",\"col\":" + d.col.to_string()
     output = output + ",\"fix\":"
     if d.fix != "":
-        output = output + "\"" + e_json_escape(d.fix) + "\""
+        output = output + "\"" + escape_json_string(d.fix) + "\""
     else:
         output = output + "null"
     output = output + chr(125)
     return output
 
 # escape a string for JSON output.
-fn e_json_escape(s: String) -> String:
+fn escape_json_string(s: String) -> String:
     mut output := ""
     mut i := 0
     while i < s.len():

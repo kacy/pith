@@ -7,7 +7,7 @@ from lexer import lex_all
 from parser import parse
 from ast import get_node, reset_arena
 from checker import c_init, c_run_module
-from codegen import g_init, g_set_test_mode, g_emit_module, g_emit_modules, g_get_output
+from codegen import initialize_codegen, set_test_mode, g_emit_module, g_emit_modules, get_codegen_output
 
 # extract directory from a file path.
 # "foo/bar/baz.fg" -> "foo/bar", "baz.fg" -> "."
@@ -69,14 +69,14 @@ pub fn find_imports(root_idx: Int) -> List[String]:
 
 # global visited map for diamond import dedup.
 # must be global because collections are passed by copy in forge.
-mut dr_visited: Map[String, Bool] := {}
+mut visited_files: Map[String, Bool] := {}
 
 # global checking map for cycle detection.
 # tracks files currently being processed to detect circular imports.
-mut dr_checking: Map[String, Bool] := {}
+mut files_being_checked: Map[String, Bool] := {}
 
 # stdlib root - set by compile_to_c before resolving imports
-mut dr_stdlib_root: String := ""
+mut stdlib_root_directory: String := ""
 
 # convert a dotted module path to a file path segment.
 # "std.math" -> "std/math", "foo" -> "foo"
@@ -121,8 +121,8 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
         mut file_path := ""
         # if module starts with "std.", resolve relative to stdlib root
         if mod_path.starts_with("std.") or mod_path == "std":
-            if dr_stdlib_root != "":
-                file_path = dr_stdlib_root + "/" + rel_path + ".fg"
+            if stdlib_root_directory != "":
+                file_path = stdlib_root_directory + "/" + rel_path + ".fg"
             elif dir == ".":
                 file_path = rel_path + ".fg"
             else:
@@ -131,28 +131,28 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
             file_path = rel_path + ".fg"
         else:
             file_path = dir + "/" + rel_path + ".fg"
-        if dr_visited.contains_key(file_path):
+        if visited_files.contains_key(file_path):
             continue
         # Check for import cycles (must check this AFTER checking visited)
-        # A file in dr_checking means we're currently processing it upstream,
+        # A file in files_being_checked means we're currently processing it upstream,
         # which indicates a circular dependency
-        if dr_checking.contains_key(file_path):
+        if files_being_checked.contains_key(file_path):
             # Import cycle detected - report E235 error
             mut cycle_msg := "import cycle detected: " + file_path
             # Build cycle path from checking map
-            for checking_path in dr_checking.keys():
+            for checking_path in files_being_checked.keys():
                 cycle_msg = cycle_msg + " -> " + checking_path
             print_err("error[E235]: " + cycle_msg)
             # Return error by attempting to read non-existent file
             # This triggers error propagation
             read_file("__import_cycle_error__")!
-        dr_checking.insert(file_path, true)
-        dr_visited.insert(file_path, true)
+        files_being_checked.insert(file_path, true)
+        visited_files.insert(file_path, true)
         content := read_file(file_path)!
         tokens := lex_all(content)
         mod_root := parse(tokens)
         sub_roots := resolve_imports(mod_root, file_path)!
-        dr_checking.remove(file_path)
+        files_being_checked.remove(file_path)
         for sr in sub_roots:
             roots.push(sr)
         roots.push(mod_root)
@@ -160,14 +160,14 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
 
 # mark a path as visited (call before resolve_imports for the main file).
 pub fn mark_visited(path: String):
-    dr_visited.insert(path, true)
+    visited_files.insert(path, true)
 
 # initialize driver state for import resolution.
 # sets up stdlib root and resets the visited and checking maps.
 pub fn init_driver(source_path: String):
-    dr_stdlib_root = find_stdlib_root(source_path)
-    dr_visited = {}
-    dr_checking = {}
+    stdlib_root_directory = find_stdlib_root(source_path)
+    visited_files = {}
+    files_being_checked = {}
     mark_visited(source_path)
 
 # run the full compile pipeline: lex, parse, resolve imports, check, codegen.
@@ -189,9 +189,9 @@ pub fn compile_to_c(path: String, test_mode: Bool) -> String!:
     c_run_module(root)
 
     # generate C
-    g_init()
+    initialize_codegen()
     if test_mode:
-        g_set_test_mode()
+        set_test_mode()
     if import_roots.len() == 0:
         g_emit_module(root)
     else:
@@ -201,4 +201,4 @@ pub fn compile_to_c(path: String, test_mode: Bool) -> String!:
         all_roots.push(root)
         g_emit_modules(all_roots)
 
-    return g_get_output()
+    return get_codegen_output()

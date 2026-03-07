@@ -24,7 +24,7 @@ pub fn fmt_source(source: String) -> String:
     while i < lines.len():
         raw_line := lines[i]
         # trim trailing whitespace
-        line := f_trim_right(raw_line)
+        line := trim_right(raw_line)
 
         # handle blank lines — allow at most one
         if line.len() == 0:
@@ -36,19 +36,19 @@ pub fn fmt_source(source: String) -> String:
         consecutive_blank = 0
 
         # detect if line is a comment (after indentation)
-        trimmed := f_trim_left(line)
+        trimmed := trim_left(line)
         if trimmed.len() > 0:
             if trimmed[0] == "#":
                 # preserve indentation, normalize comment spacing
                 indent_len := line.len() - trimmed.len()
                 output = output + line.substring(0, indent_len)
-                output = output + f_format_comment(trimmed)
+                output = output + format_comment(trimmed)
                 output = output + "\n"
                 i = i + 1
                 continue
 
         # for code lines, normalize spacing
-        output = output + f_format_code_line(line)
+        output = output + format_code_line(line)
         output = output + "\n"
         i = i + 1
 
@@ -68,7 +68,7 @@ pub fn fmt_source(source: String) -> String:
     return output
 
 # normalize a comment line: ensure single space after #
-fn f_format_comment(comment: String) -> String:
+fn format_comment(comment: String) -> String:
     if comment.len() == 1:
         if comment[0] == "#":
             return "#"
@@ -79,7 +79,7 @@ fn f_format_comment(comment: String) -> String:
 
 # format a code line by normalizing operator spacing.
 # preserves string contents exactly.
-fn f_format_code_line(line: String) -> String:
+fn format_code_line(line: String) -> String:
     mut output := ""
     mut i := 0
     mut in_string := false
@@ -136,9 +136,9 @@ fn f_format_code_line(line: String) -> String:
 
         # inline comment — normalize and copy rest
         if ch == "#":
-            output = f_ensure_trim_trailing(output)
+            output = ensure_trimmed_trailing(output)
             output = output + " "
-            output = output + f_format_comment(line.substring(i, line.len()))
+            output = output + format_comment(line.substring(i, line.len()))
             break
 
         # two-character operators
@@ -147,35 +147,35 @@ fn f_format_code_line(line: String) -> String:
 
             # := — space around
             if ch == ":" and next == "=":
-                output = f_ensure_space(output)
+                output = ensure_trailing_space(output)
                 output = output + ":= "
                 i = i + 2
-                i = f_skip_spaces(line, i)
+                i = skip_leading_spaces(line, i)
                 continue
 
             # ==, !=, <=, >=, +=, -=, *=, /=, =>, ->
-            if f_is_two_char_op(ch, next):
-                output = f_ensure_space(output)
+            if is_two_char_operator(ch, next):
+                output = ensure_trailing_space(output)
                 output = output + ch + next + " "
                 i = i + 2
-                i = f_skip_spaces(line, i)
+                i = skip_leading_spaces(line, i)
                 continue
 
         # single-char binary operators: + * / %
         if ch == "+" or ch == "*" or ch == "/" or ch == "%":
-            output = f_ensure_space(output)
+            output = ensure_trailing_space(output)
             output = output + ch + " "
             i = i + 1
-            i = f_skip_spaces(line, i)
+            i = skip_leading_spaces(line, i)
             continue
 
         # minus — could be binary or unary
         if ch == "-":
-            if f_is_preceded_by_operand(output):
-                output = f_ensure_space(output)
+            if is_preceded_by_operand(output):
+                output = ensure_trailing_space(output)
                 output = output + "- "
                 i = i + 1
-                i = f_skip_spaces(line, i)
+                i = skip_leading_spaces(line, i)
                 continue
             # unary — no space after
             output = output + "-"
@@ -184,80 +184,80 @@ fn f_format_code_line(line: String) -> String:
 
         # = (assignment, not ==)
         if ch == "=":
-            output = f_ensure_space(output)
+            output = ensure_trailing_space(output)
             output = output + "= "
             i = i + 1
-            i = f_skip_spaces(line, i)
+            i = skip_leading_spaces(line, i)
             continue
 
         # < and > as comparison
         if ch == "<" or ch == ">":
-            output = f_ensure_space(output)
+            output = ensure_trailing_space(output)
             output = output + ch + " "
             i = i + 1
-            i = f_skip_spaces(line, i)
+            i = skip_leading_spaces(line, i)
             continue
 
         # | (pipe operator)
         if ch == "|":
-            output = f_ensure_space(output)
+            output = ensure_trailing_space(output)
             output = output + "| "
             i = i + 1
-            i = f_skip_spaces(line, i)
+            i = skip_leading_spaces(line, i)
             continue
 
         # colon — no space before, space after
         if ch == ":":
-            output = f_trim_trailing(output)
+            output = trim_trailing_spaces(output)
             output = output + ":"
             i = i + 1
             if i < line.len():
                 if line[i] != "\n":
-                    i = f_skip_spaces(line, i)
+                    i = skip_leading_spaces(line, i)
                     if i < line.len():
                         output = output + " "
             continue
 
         # comma — no space before, space after
         if ch == ",":
-            output = f_trim_trailing(output)
+            output = trim_trailing_spaces(output)
             output = output + ","
             i = i + 1
-            i = f_skip_spaces(line, i)
+            i = skip_leading_spaces(line, i)
             if i < line.len():
                 output = output + " "
             continue
 
         # dot — no spaces around
         if ch == ".":
-            output = f_trim_trailing(output)
+            output = trim_trailing_spaces(output)
             output = output + "."
             i = i + 1
-            i = f_skip_spaces(line, i)
+            i = skip_leading_spaces(line, i)
             continue
 
         # opening delimiters — no space after
         if ch == "(" or ch == "[":
             output = output + ch
             i = i + 1
-            i = f_skip_spaces(line, i)
+            i = skip_leading_spaces(line, i)
             continue
         LB := chr(123)
         if ch == LB:
             output = output + ch
             i = i + 1
-            i = f_skip_spaces(line, i)
+            i = skip_leading_spaces(line, i)
             continue
 
         # closing delimiters — no space before
         if ch == ")" or ch == "]":
-            output = f_trim_trailing(output)
+            output = trim_trailing_spaces(output)
             output = output + ch
             i = i + 1
             continue
         RB := chr(125)
         if ch == RB:
-            output = f_trim_trailing(output)
+            output = trim_trailing_spaces(output)
             output = output + ch
             i = i + 1
             continue
@@ -273,7 +273,7 @@ fn f_format_code_line(line: String) -> String:
 # ---------------------------------------------------------------
 
 # check if two characters form a two-char operator
-fn f_is_two_char_op(ch: String, next: String) -> Bool:
+fn is_two_char_operator(ch: String, next: String) -> Bool:
     if ch == "=" and next == "=":
         return true
     if ch == "!" and next == "=":
@@ -297,7 +297,7 @@ fn f_is_two_char_op(ch: String, next: String) -> Bool:
     return false
 
 # ensure output ends with a space (unless already has one or ends with open paren)
-fn f_ensure_space(s: String) -> String:
+fn ensure_trailing_space(s: String) -> String:
     if s.len() > 0:
         last := s[s.len() - 1]
         if last != " " and last != "(" and last != "[":
@@ -305,7 +305,7 @@ fn f_ensure_space(s: String) -> String:
     return s
 
 # trim trailing spaces from a string
-fn f_trim_trailing(s: String) -> String:
+fn trim_trailing_spaces(s: String) -> String:
     mut result := s
     while result.len() > 0:
         if result[result.len() - 1] == " ":
@@ -315,11 +315,11 @@ fn f_trim_trailing(s: String) -> String:
     return result
 
 # trim trailing spaces and add space before (for inline comments)
-fn f_ensure_trim_trailing(s: String) -> String:
-    return f_trim_trailing(s)
+fn ensure_trimmed_trailing(s: String) -> String:
+    return trim_trailing_spaces(s)
 
 # skip spaces in a line starting at position i
-fn f_skip_spaces(line: String, start: Int) -> Int:
+fn skip_leading_spaces(line: String, start: Int) -> Int:
     mut i := start
     while i < line.len():
         if line[i] == " ":
@@ -329,7 +329,7 @@ fn f_skip_spaces(line: String, start: Int) -> Int:
     return i
 
 # check if the output so far ends with an operand (for binary vs unary minus)
-fn f_is_preceded_by_operand(output: String) -> Bool:
+fn is_preceded_by_operand(output: String) -> Bool:
     if output.len() == 0:
         return false
     # skip trailing spaces
@@ -342,14 +342,14 @@ fn f_is_preceded_by_operand(output: String) -> Bool:
     if idx == 0:
         return false
     last := output[idx - 1]
-    if f_is_alnum(last):
+    if is_alphanumeric(last):
         return true
     if last == ")" or last == "]" or last == "_" or last == "?" or last == "!":
         return true
     return false
 
 # check if a single character is alphanumeric
-fn f_is_alnum(ch: String) -> Bool:
+fn is_alphanumeric(ch: String) -> Bool:
     if ch.len() != 1:
         return false
     c := ord(ch)
@@ -363,7 +363,7 @@ fn f_is_alnum(ch: String) -> Bool:
     return false
 
 # trim trailing whitespace (spaces and tabs) from a string
-fn f_trim_right(s: String) -> String:
+fn trim_right(s: String) -> String:
     mut end := s.len()
     while end > 0:
         ch := s[end - 1]
@@ -374,7 +374,7 @@ fn f_trim_right(s: String) -> String:
     return s.substring(0, end)
 
 # trim leading whitespace from a string
-fn f_trim_left(s: String) -> String:
+fn trim_left(s: String) -> String:
     mut start := 0
     while start < s.len():
         if s[start] == " " or s[start] == "\t":

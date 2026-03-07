@@ -152,26 +152,26 @@ mut tt_types: List[TypeInfo] := []
 mut tt_names: Map[String, Int] := {}
 
 # add a type to the table, return its id
-pub fn tt_add(info: TypeInfo) -> Int:
+pub fn add_type_info(info: TypeInfo) -> Int:
     tt_types.push(info)
     return tt_types.len() - 1
 
 # register a name -> type id mapping
-pub fn tt_register(name: String, tid: Int):
+pub fn register_type_name(name: String, tid: Int):
     tt_names.insert(name, tid)
 
 # look up a type by name, returns -1 if not found
-pub fn tt_lookup(name: String) -> Int:
+pub fn lookup_type_id(name: String) -> Int:
     if tt_names.contains_key(name):
         return tt_names[name]
     return -1
 
 # get the number of types in the table
-pub fn tt_count() -> Int:
+pub fn get_type_count() -> Int:
     return tt_types.len()
 
 # get type info by id
-pub fn tt_get(tid: Int) -> TypeInfo:
+pub fn get_type_info(tid: Int) -> TypeInfo:
     if tid < 0:
         return TypeInfo("<error>", "", [], [], [], [], [], -1, -1, -1, -1, [], [], [])
     if tid >= tt_types.len():
@@ -179,7 +179,7 @@ pub fn tt_get(tid: Int) -> TypeInfo:
     return tt_types[tid]
 
 # get the human-readable name for a type id
-pub fn tt_type_name(tid: Int) -> String:
+pub fn get_type_name(tid: Int) -> String:
     if tid == TID_INT:
         return "Int"
     if tid == TID_UINT:
@@ -247,7 +247,7 @@ pub fn tt_type_name(tid: Int) -> String:
 # helper predicates
 # ---------------------------------------------------------------
 
-pub fn tt_is_numeric(tid: Int) -> Bool:
+pub fn is_numeric_type(tid: Int) -> Bool:
     if tid == TID_INT:
         return true
     if tid == TID_UINT:
@@ -272,7 +272,7 @@ pub fn tt_is_numeric(tid: Int) -> Bool:
         return true
     return false
 
-pub fn tt_is_integer(tid: Int) -> Bool:
+pub fn is_integer_type(tid: Int) -> Bool:
     if tid == TID_INT:
         return true
     if tid == TID_UINT:
@@ -295,47 +295,47 @@ pub fn tt_is_integer(tid: Int) -> Bool:
         return true
     return false
 
-pub fn tt_is_err(tid: Int) -> Bool:
+pub fn is_error_type(tid: Int) -> Bool:
     return tid == TID_ERR
 
 # ---------------------------------------------------------------
 # initialization — register all 16 builtin types
 # ---------------------------------------------------------------
 
-pub fn tt_init():
+pub fn initialize_type_table():
     tt_types = []
     tt_names = {}
     # primitives at known indices 0-14
-    tt_add(ti_primitive("Int"))
-    tt_register("Int", TID_INT)
-    tt_add(ti_primitive("UInt"))
-    tt_register("UInt", TID_UINT)
-    tt_add(ti_primitive("Float"))
-    tt_register("Float", TID_FLOAT)
-    tt_add(ti_primitive("Bool"))
-    tt_register("Bool", TID_BOOL)
-    tt_add(ti_primitive("String"))
-    tt_register("String", TID_STRING)
-    tt_add(ti_primitive("Bytes"))
-    tt_register("Bytes", TID_BYTES)
-    tt_add(ti_primitive("Void"))
-    tt_register("Void", TID_VOID)
-    tt_add(ti_primitive("Int8"))
-    tt_register("Int8", TID_INT8)
-    tt_add(ti_primitive("Int16"))
-    tt_register("Int16", TID_INT16)
-    tt_add(ti_primitive("Int32"))
-    tt_register("Int32", TID_INT32)
-    tt_add(ti_primitive("Int64"))
-    tt_register("Int64", TID_INT64)
-    tt_add(ti_primitive("UInt8"))
-    tt_register("UInt8", TID_UINT8)
-    tt_add(ti_primitive("UInt16"))
-    tt_register("UInt16", TID_UINT16)
-    tt_add(ti_primitive("UInt32"))
-    tt_register("UInt32", TID_UINT32)
-    tt_add(ti_primitive("UInt64"))
-    tt_register("UInt64", TID_UINT64)
+    add_type_info(ti_primitive("Int"))
+    register_type_name("Int", TID_INT)
+    add_type_info(ti_primitive("UInt"))
+    register_type_name("UInt", TID_UINT)
+    add_type_info(ti_primitive("Float"))
+    register_type_name("Float", TID_FLOAT)
+    add_type_info(ti_primitive("Bool"))
+    register_type_name("Bool", TID_BOOL)
+    add_type_info(ti_primitive("String"))
+    register_type_name("String", TID_STRING)
+    add_type_info(ti_primitive("Bytes"))
+    register_type_name("Bytes", TID_BYTES)
+    add_type_info(ti_primitive("Void"))
+    register_type_name("Void", TID_VOID)
+    add_type_info(ti_primitive("Int8"))
+    register_type_name("Int8", TID_INT8)
+    add_type_info(ti_primitive("Int16"))
+    register_type_name("Int16", TID_INT16)
+    add_type_info(ti_primitive("Int32"))
+    register_type_name("Int32", TID_INT32)
+    add_type_info(ti_primitive("Int64"))
+    register_type_name("Int64", TID_INT64)
+    add_type_info(ti_primitive("UInt8"))
+    register_type_name("UInt8", TID_UINT8)
+    add_type_info(ti_primitive("UInt16"))
+    register_type_name("UInt16", TID_UINT16)
+    add_type_info(ti_primitive("UInt32"))
+    register_type_name("UInt32", TID_UINT32)
+    add_type_info(ti_primitive("UInt64"))
+    register_type_name("UInt64", TID_UINT64)
     # error sentinel at index 15
-    tt_add(ti_primitive("<error>"))
-    tt_register("<error>", TID_ERR)
+    add_type_info(ti_primitive("<error>"))
+    register_type_name("<error>", TID_ERR)

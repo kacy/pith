@@ -19,7 +19,7 @@ from checker import Diagnostic
 
 mut l_diagnostics: List[Diagnostic] := []
 
-fn l_warning(code: String, message: String):
+fn report_linter_warning(code: String, message: String):
     l_diagnostics.push(Diagnostic("warning", code, message, "", 0, 0, ""))
 
 # ---------------------------------------------------------------
@@ -60,7 +60,7 @@ fn lint_top_level(node_idx: Int, source: String):
     elif inner.kind == "impl_decl":
         lint_impl_decl(inner, source)
     elif inner.kind == "binding":
-        name := l_extract_binding_name(inner.value)
+        name := extract_binding_name(inner.value)
         check_snake_case(name, "variable")
     elif inner.kind == "test_decl":
         lint_block_depth(inner, 1)
@@ -122,19 +122,19 @@ fn check_snake_case(name: String, kind: String):
     if name == "" or name == "_":
         return
     if not is_snake_case(name):
-        l_warning("E300", kind + " '" + name + "' should be snake_case")
+        report_linter_warning("E300", kind + " '" + name + "' should be snake_case")
 
 fn is_snake_case(name: String) -> Bool:
     if name.len() == 0:
         return true
     # must start with lowercase letter or underscore
     c := ord(name[0])
-    if not l_is_lower(c) and name[0] != "_":
+    if not is_lowercase_char(c) and name[0] != "_":
         return false
     mut i := 0
     while i < name.len():
         ch := ord(name[i])
-        if not l_is_lower(ch) and not l_is_digit(ch) and name[i] != "_":
+        if not is_lowercase_char(ch) and not is_digit_char(ch) and name[i] != "_":
             return false
         i = i + 1
     return true
@@ -147,23 +147,23 @@ fn check_pascal_case(name: String, kind: String):
     if name == "":
         return
     if not is_pascal_case(name):
-        l_warning("E301", kind + " '" + name + "' should be PascalCase")
+        report_linter_warning("E301", kind + " '" + name + "' should be PascalCase")
 
 fn is_pascal_case(name: String) -> Bool:
     if name.len() == 0:
         return true
     # must start with uppercase letter
     c := ord(name[0])
-    if not l_is_upper(c):
+    if not is_uppercase_char(c):
         return false
     # no underscores
     mut has_lower := false
     mut i := 0
     while i < name.len():
         ch := ord(name[i])
-        if not l_is_alnum(ch):
+        if not is_alphanumeric_char(ch):
             return false
-        if l_is_lower(ch):
+        if is_lowercase_char(ch):
             has_lower = true
         i = i + 1
     # must have at least one lowercase letter (HELLO is not PascalCase)
@@ -192,7 +192,7 @@ fn check_doc_comment(name: String, node_idx: Int, source: String):
     # check line before the declaration for a comment
     prev := lines[found_line - 1].trim()
     if prev.len() == 0 or prev[0] != "#":
-        l_warning("E304", "public function '" + name + "' is missing a doc comment")
+        report_linter_warning("E304", "public function '" + name + "' is missing a doc comment")
 
 # ---------------------------------------------------------------
 # E305: indentation depth exceeds 4 levels
@@ -206,7 +206,7 @@ fn lint_block_depth(node: Node, depth: Int):
                 lint_stmt_depth(stmt, depth)
         elif cn.kind == "if" or cn.kind == "while" or cn.kind == "for" or cn.kind == "match":
             if depth >= 5:
-                l_warning("E305", "nesting depth " + depth.to_string() + " exceeds 4 levels -- consider refactoring")
+                report_linter_warning("E305", "nesting depth " + depth.to_string() + " exceeds 4 levels -- consider refactoring")
             lint_block_depth(cn, depth + 1)
         else:
             lint_stmt_depth(child, depth)
@@ -215,7 +215,7 @@ fn lint_stmt_depth(node_idx: Int, depth: Int):
     node := get_node(node_idx)
     if node.kind == "if" or node.kind == "while" or node.kind == "for_in" or node.kind == "match":
         if depth >= 5:
-            l_warning("E305", "nesting depth " + depth.to_string() + " exceeds 4 levels -- consider refactoring")
+            report_linter_warning("E305", "nesting depth " + depth.to_string() + " exceeds 4 levels -- consider refactoring")
         for child in node.children:
             cn := get_node(child)
             if cn.kind == "body" or cn.kind == "block" or cn.kind == "else" or cn.kind == "elif":
@@ -228,19 +228,19 @@ fn lint_stmt_depth(node_idx: Int, depth: Int):
 # ---------------------------------------------------------------
 
 # extract the plain binding name from a value like "mut x" or "x"
-fn l_extract_binding_name(value: String) -> String:
+fn extract_binding_name(value: String) -> String:
     if value.starts_with("mut "):
         return value.substring(4, value.len())
     return value
 
-fn l_is_lower(c: Int) -> Bool:
+fn is_lowercase_char(c: Int) -> Bool:
     return c >= 97 and c <= 122
 
-fn l_is_upper(c: Int) -> Bool:
+fn is_uppercase_char(c: Int) -> Bool:
     return c >= 65 and c <= 90
 
-fn l_is_digit(c: Int) -> Bool:
+fn is_digit_char(c: Int) -> Bool:
     return c >= 48 and c <= 57
 
-fn l_is_alnum(c: Int) -> Bool:
-    return l_is_lower(c) or l_is_upper(c) or l_is_digit(c)
+fn is_alphanumeric_char(c: Int) -> Bool:
+    return is_lowercase_char(c) or is_uppercase_char(c) or is_digit_char(c)

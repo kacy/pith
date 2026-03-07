@@ -1673,6 +1673,16 @@ static inline void forge_channel_close(forge_channel_t *ch) {
     pthread_mutex_unlock(&ch->mu);
 }
 
+// Destroy a channel and free all associated memory
+static inline void forge_channel_destroy(forge_channel_t *ch) {
+    pthread_mutex_lock(&ch->mu);
+    free(ch->buffer);
+    pthread_mutex_unlock(&ch->mu);
+    pthread_mutex_destroy(&ch->mu);
+    pthread_cond_destroy(&ch->not_empty);
+    free(ch);
+}
+
 static inline int64_t forge_channel_len(forge_channel_t *ch) {
     pthread_mutex_lock(&ch->mu);
     int64_t n = ch->len;

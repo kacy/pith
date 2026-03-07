@@ -2821,15 +2821,36 @@ fn g_emit_collection_push(node_idx: Int, elem_tid: Int, elem_c: String):
             g_write(");")
         g_write(" " + RB)
     else:
-        g_write("forge_list_push(&")
-        g_emit_expr(receiver_idx)
-        g_write(", &(")
-        g_write(elem_c)
-        g_write(")" + LB)
-        g_emit_expr(value_idx)
-        g_write(RB + ", sizeof(")
-        g_write(elem_c)
-        g_write("))")
+        # ARC: for string elements, use temp to enable retain
+        if elem_tid == TID_STRING:
+            temp := "__push_" + g_push_counter.to_string()
+            g_push_counter = g_push_counter + 1
+            g_write(LB + " ")
+            g_write(elem_c)
+            g_write(" ")
+            g_write(temp)
+            g_write(" = ")
+            g_emit_expr(value_idx)
+            g_write("; forge_list_push(&")
+            g_emit_expr(receiver_idx)
+            g_write(", &")
+            g_write(temp)
+            g_write(", sizeof(")
+            g_write(elem_c)
+            g_write("));")
+            g_write(" forge_elem_retain_string(&")
+            g_write(temp)
+            g_write("); " + RB)
+        else:
+            g_write("forge_list_push(&")
+            g_emit_expr(receiver_idx)
+            g_write(", &(")
+            g_write(elem_c)
+            g_write(")" + LB)
+            g_emit_expr(value_idx)
+            g_write(RB + ", sizeof(")
+            g_write(elem_c)
+            g_write("))")
 
 # ---------------------------------------------------------------
 # map methods
@@ -2918,7 +2939,11 @@ fn g_emit_map_insert(node_idx: Int, key_tid: Int, val_tid: Int, key_c: String, v
     g_write("), sizeof(")
     g_write(val_c)
     g_write("));")
-    # ARC: retain string values when inserted to map
+    # ARC: retain string keys and values when inserted to map
+    if key_tid == TID_STRING:
+        g_write(" forge_elem_retain_string((void*)&")
+        g_emit_expr(g_call_arg(node_idx, 0))
+        g_write(");")
     if val_tid == TID_STRING:
         g_write(" forge_elem_retain_string(&__mv);")
     g_write(" " + RB)
@@ -4197,6 +4222,18 @@ fn g_emit_hoisted_lambdas():
                 ci = ci + 1
         # emit body
         g_emit_lambda_body(lam_node_idx, info.return_type)
+        # ARC: release captured string variables before returning
+        if cap_count > 0:
+            mut ci := 0
+            while ci < cap_count:
+                cap_name := g_lambda_cap_names[cap_offset + ci]
+                cap_tid := g_lambda_cap_tids[cap_offset + ci]
+                if cap_tid == TID_STRING:
+                    g_write_indent()
+                    g_write("forge_string_release(")
+                    g_write(cap_name)
+                    g_write(");\n")
+                ci = ci + 1
         g_indent = g_indent - 1
         g_write(RB + "\n\n")
         li = li + 1

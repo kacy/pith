@@ -1033,7 +1033,7 @@ fn check_assignment(node: Node, scope_id: Int):
     if is_error_type(val_type):
         return
     op := node.value
-    if op == "=" :
+    if op == "=":
         if target_type != val_type:
             report_error("E200", "type mismatch: expected " + get_type_name(target_type) + ", got " + get_type_name(val_type))
     else:
@@ -2045,7 +2045,7 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
         expect_no_arguments(method, args)
         return intern_collection_type("List", elem, -1)
     # not a built-in list method
-    return -1
+    return - 1
 
 # ---------------------------------------------------------------
 # map methods
@@ -2083,7 +2083,7 @@ fn check_map_method_call(method: String, info: TypeInfo, args: List[Int], scope_
     if method == "values":
         expect_no_arguments(method, args)
         return intern_collection_type("List", val_t, -1)
-    return -1
+    return - 1
 
 # ---------------------------------------------------------------
 # set methods
@@ -2109,7 +2109,7 @@ fn check_set_method_call(method: String, info: TypeInfo, args: List[Int], scope_
     if method == "remove":
         expect_one_typed_argument(method, args, elem, scope_id)
         return TID_VOID
-    return -1
+    return - 1
 
 # ---------------------------------------------------------------
 # method arg validators
@@ -2250,7 +2250,7 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
 fn parse_integer_string(s: String) -> Int:
     # simple integer parser for tuple field indices
     if s.len() == 0:
-        return -1
+        return - 1
     mut result := 0
     mut i := 0
     while i < s.len():
@@ -2276,7 +2276,7 @@ fn parse_integer_string(s: String) -> Int:
         elif ch == "9":
             result = result * 10 + 9
         else:
-            return -1
+            return - 1
         i = i + 1
     return result
 
@@ -2747,18 +2747,18 @@ fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
     if struct_tid < 0:
         report_error("E202", "unknown type: " + struct_name)
         return TID_ERR
-    
+
     # get struct info
     info := get_type_info(struct_tid)
     if info.kind != "struct":
         report_error("E202", struct_name + " is not a struct type")
         return TID_ERR
-    
+
     # check field count
     if node.children.len() != info.fields.len():
         report_error("E207", struct_name + " expects " + info.fields.len().to_string() + " fields, got " + node.children.len().to_string())
         return TID_ERR
-    
+
     # check each field type
     mut idx := 0
     for child in node.children:
@@ -2770,7 +2770,7 @@ fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
                 if arg_type != expected:
                     report_error("E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
-    
+
     return struct_tid
 
 # ---------------------------------------------------------------

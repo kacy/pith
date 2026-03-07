@@ -29,12 +29,12 @@ fn get_current_position() -> (Int, Int):
     while i < tokens.len():
         current_token := tokens[i]
         if current_token.kind != "comment":
-            return (current_token.line, current_token.col)
+            return (current_token.current_line, current_token.current_column)
         i = i + 1
     # Return position of last token
     if tokens.len() > 0:
         mut last := tokens[tokens.len() - 1]
-        return (last.line, last.col)
+        return (last.current_line, last.current_column)
     return (0, 0)
 
 # Wrapper that adds node with current position
@@ -404,7 +404,7 @@ fn parse_postfix() -> Int:
             # Only valid if expr is an identifier (the struct type name)
             expr_node := get_node(expr)
             if expr_node.kind == "ident":
-                advance_token()  # skip {
+                advance_token() # skip {
                 mut args: List[Int] := []
                 skip_newlines()
                 if check("rbrace") == false:

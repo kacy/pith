@@ -54,10 +54,10 @@ mut lambda_function_types: List[Int] := []
 
 # captures for hoisted lambdas — per-lambda capture lists stored as flat arrays
 # with a count per lambda to index into them
-mut lambda_capture_names: List[String] := []   # flat list of captured var names
-mut lambda_capture_type_ids: List[Int] := []       # flat list of captured var type ids
-mut lambda_capture_counts: List[Int] := []     # how many captures per lambda
-mut lambda_capture_offsets: List[Int] := []    # starting offset into flat lists
+mut lambda_capture_names: List[String] := [] # flat list of captured var names
+mut lambda_capture_type_ids: List[Int] := [] # flat list of captured var type ids
+mut lambda_capture_counts: List[Int] := [] # how many captures per lambda
+mut lambda_capture_offsets: List[Int] := [] # starting offset into flat lists
 
 # lambda forward declaration buffering
 mut lambda_forward_buffer: List[String] := []
@@ -68,9 +68,9 @@ mut spawn_node_indices: List[Int] := []
 mut spawn_function_names: List[String] := []
 mut spawn_return_types: List[Int] := []
 # spawn arg types flattened (same pattern as lambda captures)
-mut spawn_argument_type_ids: List[Int] := []      # flat list of all arg type IDs
-mut spawn_argument_counts: List[Int] := []    # number of args per spawn
-mut spawn_argument_offsets: List[Int] := []   # starting offset into spawn_argument_type_ids
+mut spawn_argument_type_ids: List[Int] := [] # flat list of all arg type IDs
+mut spawn_argument_counts: List[Int] := [] # number of args per spawn
+mut spawn_argument_offsets: List[Int] := [] # starting offset into spawn_argument_type_ids
 
 # test names collected during emission
 mut test_function_names: List[String] := []
@@ -81,7 +81,7 @@ mut local_variable_types: Map[String, Int] := {}
 # scope level tracking for proper cleanup
 # scope_level starts at 0 (function level), increases for nested blocks
 mut current_scope_level: Int := 0
-mut local_variable_scopes: Map[String, Int] := {}  # variable name -> scope level
+mut local_variable_scopes: Map[String, Int] := {} # variable name -> scope level
 
 # temporary storage for capture detection (global because maps passed to
 # functions are copies — mutations don't propagate back)
@@ -89,8 +89,8 @@ mut captured_identifiers: Map[String, Bool] := {}
 
 # generic function instantiation tracking — parallel lists
 # collected during pre-scan, used for forward decls + definitions
-mut generic_function_instances: List[String] := []    # instantiation names like "identity[Int]"
-mut generic_function_ast_nodes: List[Int] := []       # corresponding fn_decl AST node indices
+mut generic_function_instances: List[String] := [] # instantiation names like "identity[Int]"
+mut generic_function_ast_nodes: List[Int] := [] # corresponding fn_decl AST node indices
 
 # ---------------------------------------------------------------
 # initialization
@@ -145,7 +145,6 @@ pub fn get_codegen_output() -> String:
         if result[result.len() - 1] == "\n":
             return result.substring(0, result.len() - 1)
     return result
-
 
 # ---------------------------------------------------------------
 # output helpers
@@ -232,7 +231,7 @@ fn map_type_id(tid: Int) -> String:
     if tid == TID_UINT64:
         return "uint64_t"
     if tid == TID_ERR:
-        return "/* error */"
+        return "void*"  # Use void* as a safe placeholder for error types
     return ""
 
 # check if a type needs reference counting (strings, lists, maps)
@@ -259,7 +258,7 @@ fn emit_retain_call(name: String, tid: Int):
         emit_code(name)
         emit_code(");\n")
 
-# emit release call for a variable  
+# emit release call for a variable
 fn emit_release_call(name: String, tid: Int):
     if tid == TID_STRING:
         write_indent()
@@ -355,7 +354,6 @@ fn mangle_identifier(name: String) -> String:
             parts.push(ch)
         i = i + 1
     return parts.join("")
-
 
 # ---------------------------------------------------------------
 # string helpers
@@ -485,7 +483,7 @@ fn lookup_method_type(type_name: String, method_name: String) -> Int:
     key := type_name + "." + method_name
     if method_type_map.contains_key(key):
         return method_type_map[key]
-    return -1
+    return - 1
 
 # ---------------------------------------------------------------
 # AST helpers
@@ -501,7 +499,7 @@ fn extract_base_name(name: String) -> String:
     return name
 
 # extract field name from "name pub mut" -> "name"
-fn extract_field_name(value: String) -> String:
+fn g_extract_field_name(value: String) -> String:
     mut i := 0
     while i < value.len():
         if value[i] == " ":
@@ -595,7 +593,7 @@ fn build_substitution_map(fn_name: String, inst_name: String) -> Map[String, Int
     return subst
 
 # resolve a type annotation node with generic substitution
-fn resolve_type_with_substitution(type_node_idx: Int, subst: Map[String, Int]) -> Int:
+fn g_resolve_type_with_substitution(type_node_idx: Int, subst: Map[String, Int]) -> Int:
     tnode := get_node(type_node_idx)
     if tnode.kind == "type":
         if subst.contains_key(tnode.value):
@@ -609,7 +607,7 @@ fn resolve_function_return_with_substitution(fn_node_idx: Int, subst: Map[String
         cn := get_node(child)
         if cn.kind == "returns":
             if cn.children.len() > 0:
-                return resolve_type_with_substitution(cn.children[0], subst)
+                return g_resolve_type_with_substitution(cn.children[0], subst)
     return TID_VOID
 
 # pre-scan AST to collect all generic function instantiations
@@ -765,7 +763,7 @@ fn emit_struct_def(node_idx: Int):
     for child in node.children:
         cn := get_node(child)
         if cn.kind == "field":
-            fname := extract_field_name(cn.value)
+            fname := g_extract_field_name(cn.value)
             write_indent()
             ftid := resolve_field_type(base, fname)
             emit_c_type(ftid)
@@ -1237,7 +1235,7 @@ fn emit_instantiated_fn_forward_decls():
                     emit_code(", ")
                 first = false
                 if cn.children.len() > 0:
-                    ptid := resolve_type_with_substitution(cn.children[0], subst)
+                    ptid := g_resolve_type_with_substitution(cn.children[0], subst)
                     emit_code(get_c_type_string(ptid))
                 emit_code(" ")
                 emit_code(cn.value)
@@ -1260,7 +1258,7 @@ fn emit_block(node_idx: Int):
         # Track bindings created in this scope
         child_node := get_node(child)
         if child_node.kind == "binding":
-            name := extract_binding_name(child_node.value)
+            name := g_extract_binding_name(child_node.value)
             vars_in_scope.push(name)
         emit_stmt(child)
     # Exit scope - cleanup variables at this level
@@ -1418,7 +1416,7 @@ fn infer_string_method_type(method: String) -> Int:
 
 fn emit_binding(node_idx: Int):
     node := get_node(node_idx)
-    name := extract_binding_name(node.value)
+    name := g_extract_binding_name(node.value)
     is_mut := node.value.contains(" mut")
     # determine the type
     mut tid := TID_ERR
@@ -1516,7 +1514,21 @@ fn emit_binding(node_idx: Int):
         val_node := get_node(value_idx)
         if val_node.kind != "none":
             emit_code(" = ")
-            emit_expr(value_idx)
+            # For empty collection literals with type annotations, use the type to determine the correct empty initializer
+            if has_type_expr and (val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set") and val_node.children.len() == 0:
+                type_node := get_node(type_expr_idx)
+                if type_node.kind == "generic_type":
+                    base_type := type_node.value
+                    if base_type == "List" or base_type == "Set":
+                        emit_code("forge_list_empty()")
+                    elif base_type == "Map":
+                        emit_code("forge_map_empty()")
+                    else:
+                        emit_expr(value_idx)
+                else:
+                    emit_expr(value_idx)
+            else:
+                emit_expr(value_idx)
     emit_code(";\n")
     # ARC: retain the value for heap-allocated types
     if value_idx >= 0:
@@ -1534,7 +1546,7 @@ fn emit_binding(node_idx: Int):
                     emit_code(");\n")
 
 # extract binding name from "x" or "x mut"
-fn extract_binding_name(value: String) -> String:
+fn g_extract_binding_name(value: String) -> String:
     mut i := 0
     while i < value.len():
         if value[i] == " ":
@@ -2304,7 +2316,7 @@ fn get_call_argument(node_idx: Int, n: Int) -> Int:
             if arg_node.children.len() > 0:
                 return arg_node.children[0]
         return node.children[arg_idx]
-    return -1
+    return - 1
 
 # get number of arguments (excluding the callee ident)
 fn get_call_argument_count(node_idx: Int) -> Int:
@@ -3867,7 +3879,7 @@ fn emit_global_bindings(root_idx: Int):
             node = get_node(node.children[0])
         if node.kind == "binding":
             has_any = true
-            name := extract_binding_name(node.value)
+            name := g_extract_binding_name(node.value)
             tid := get_binding_type(node)
             emit_c_type(tid)
             emit_code(" ")
@@ -3886,7 +3898,7 @@ fn emit_global_bindings(root_idx: Int):
         if node.kind == "pub":
             node = get_node(node.children[0])
         if node.kind == "binding":
-            name := extract_binding_name(node.value)
+            name := g_extract_binding_name(node.value)
             value_idx := get_binding_value_node(node)
             if value_idx >= 0:
                 write_indent()
@@ -3907,7 +3919,7 @@ fn emit_global_decls(root_idx: Int) -> Bool:
             node = get_node(node.children[0])
         if node.kind == "binding":
             has_any = true
-            name := extract_binding_name(node.value)
+            name := g_extract_binding_name(node.value)
             tid := get_binding_type(node)
             emit_c_type(tid)
             emit_code(" ")
@@ -3924,13 +3936,32 @@ fn emit_global_init_body(root_idx: Int):
         if node.kind == "pub":
             node = get_node(node.children[0])
         if node.kind == "binding":
-            name := extract_binding_name(node.value)
+            name := g_extract_binding_name(node.value)
             value_idx := get_binding_value_node(node)
             if value_idx >= 0:
                 write_indent()
                 emit_code(name)
                 emit_code(" = ")
-                emit_expr(value_idx)
+                # For empty collection literals with type annotations, use the type to determine the correct empty initializer
+                val_node := get_node(value_idx)
+                if (val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set") and val_node.children.len() == 0:
+                    type_idx := get_type_annotation_idx(node)
+                    if type_idx >= 0:
+                        type_node := get_node(type_idx)
+                        if type_node.kind == "generic_type":
+                            base_type := type_node.value
+                            if base_type == "List" or base_type == "Set":
+                                emit_code("forge_list_empty()")
+                            elif base_type == "Map":
+                                emit_code("forge_map_empty()")
+                            else:
+                                emit_expr(value_idx)
+                        else:
+                            emit_expr(value_idx)
+                    else:
+                        emit_expr(value_idx)
+                else:
+                    emit_expr(value_idx)
                 emit_code(";\n")
 
 fn get_binding_type(node: Node) -> Int:
@@ -3961,7 +3992,15 @@ fn get_binding_value_node(node: Node) -> Int:
                 if cn.kind != "optional_type":
                     if cn.kind != "result_type":
                         return last
-    return -1
+    return - 1
+
+fn get_type_annotation_idx(node: Node) -> Int:
+    # return the index of the type annotation child, or -1 if none
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "type" or cn.kind == "generic_type" or cn.kind == "optional_type" or cn.kind == "result_type" or cn.kind == "tuple_type" or cn.kind == "fn_type":
+            return child
+    return - 1
 
 # ---------------------------------------------------------------
 # function definitions
@@ -4124,7 +4163,7 @@ fn emit_instantiated_fns_from_root(root_idx: Int):
             cn := get_node(child)
             if cn.kind == "param":
                 if cn.children.len() > 0:
-                    ptid := resolve_type_with_substitution(cn.children[0], subst)
+                    ptid := g_resolve_type_with_substitution(cn.children[0], subst)
                     local_variable_types.insert(cn.value, ptid)
         # emit signature
         emit_code(get_c_type_string(ret_tid))
@@ -4139,7 +4178,7 @@ fn emit_instantiated_fns_from_root(root_idx: Int):
                     emit_code(", ")
                 first = false
                 if cn.children.len() > 0:
-                    ptid := resolve_type_with_substitution(cn.children[0], subst)
+                    ptid := g_resolve_type_with_substitution(cn.children[0], subst)
                     emit_code(get_c_type_string(ptid))
                 emit_code(" ")
                 emit_code(cn.value)

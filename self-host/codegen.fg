@@ -1485,6 +1485,17 @@ fn g_emit_binding(node_idx: Int):
         if val_node.kind != "none":
             if g_type_needs_rc(tid):
                 g_emit_retain(name, tid)
+    # ARC: for list literals with string elements, retain all elements
+    if value_idx >= 0:
+        val_node := get_node(value_idx)
+        if val_node.kind == "list":
+            if val_node.children.len() > 0:
+                elem_tid := c_get_expr_type(val_node.children[0])
+                if elem_tid == TID_STRING:
+                    g_write_indent()
+                    g_write("forge_list_retain_all_strings(")
+                    g_write(name)
+                    g_write(");\n")
 
 # extract binding name from "x" or "x mut"
 fn g_extract_binding_name(value: String) -> String:
@@ -2799,7 +2810,13 @@ fn g_emit_collection_push(node_idx: Int, elem_tid: Int, elem_c: String):
         g_write(temp)
         g_write(", sizeof(")
         g_write(elem_c)
-        g_write(")); " + RB)
+        g_write("));")
+        # ARC: retain string elements when pushed to list
+        if elem_tid == TID_STRING:
+            g_write(" forge_elem_retain_string(&")
+            g_write(temp)
+            g_write(");")
+        g_write(" " + RB)
     else:
         g_write("forge_list_push(&")
         g_emit_expr(receiver_idx)
@@ -2821,7 +2838,7 @@ fn g_emit_map_method(node_idx: Int, method: String, key_tid: Int, val_tid: Int):
     key_c := g_c_type_string(key_tid)
     val_c := g_c_type_string(val_tid)
     if method == "insert":
-        g_emit_map_insert(node_idx, key_tid, key_c, val_c)
+        g_emit_map_insert(node_idx, key_tid, val_tid, key_c, val_c)
         return
     if method == "len":
         g_write("forge_map_len(")
@@ -2877,7 +2894,7 @@ fn g_emit_map_method(node_idx: Int, method: String, key_tid: Int, val_tid: Int):
         g_write(")")
         return
 
-fn g_emit_map_insert(node_idx: Int, key_tid: Int, key_c: String, val_c: String):
+fn g_emit_map_insert(node_idx: Int, key_tid: Int, val_tid: Int, key_c: String, val_c: String):
     # use a temp variable so &val works for both scalars and structs
     node := get_node(node_idx)
     receiver_idx := node.children[0]
@@ -2897,7 +2914,11 @@ fn g_emit_map_insert(node_idx: Int, key_tid: Int, key_c: String, val_c: String):
     g_write(key_c)
     g_write("), sizeof(")
     g_write(val_c)
-    g_write(")); " + RB)
+    g_write("));")
+    # ARC: retain string values when inserted to map
+    if val_tid == TID_STRING:
+        g_write(" forge_elem_retain_string(&__mv);")
+    g_write(" " + RB)
 
 # ---------------------------------------------------------------
 # set methods

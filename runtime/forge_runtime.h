@@ -503,6 +503,90 @@ typedef struct {
 // Set[T] — unique element collection. same layout as list for now.
 typedef forge_list_t forge_set_t;
 
+// ---------------------------------------------------------------
+// collection ARC helpers
+// ---------------------------------------------------------------
+
+// Retain an element at the given address (for string types)
+static inline void forge_elem_retain_string(void *elem_addr) {
+    forge_string_t *s = (forge_string_t *)elem_addr;
+    if (s->is_heap && s->data) {
+        forge_rc_retain((void *)s->data);
+    }
+}
+
+// Release an element at the given address (for string types)
+static inline void forge_elem_release_string(void *elem_addr) {
+    forge_string_t *s = (forge_string_t *)elem_addr;
+    if (s->is_heap && s->data) {
+        forge_rc_release((void *)s->data, NULL);
+    }
+}
+
+// Retain all elements in a list (for string elements)
+static inline void forge_list_retain_all_strings(forge_list_t list) {
+    if (!list.impl || !list.impl->data) return;
+    int64_t len = list.impl->len;
+    forge_string_t *items = (forge_string_t *)list.impl->data;
+    for (int64_t i = 0; i < len; i++) {
+        if (items[i].is_heap && items[i].data) {
+            forge_rc_retain((void *)items[i].data);
+        }
+    }
+}
+
+// Release all elements in a list (for string elements)
+static inline void forge_list_release_all_strings(forge_list_t list) {
+    if (!list.impl || !list.impl->data) return;
+    int64_t len = list.impl->len;
+    forge_string_t *items = (forge_string_t *)list.impl->data;
+    for (int64_t i = 0; i < len; i++) {
+        if (items[i].is_heap && items[i].data) {
+            forge_rc_release((void *)items[i].data, NULL);
+        }
+    }
+}
+
+// Retain all keys and values in a map (for string keys/values)
+static inline void forge_map_retain_all_strings(forge_map_t map) {
+    if (!map.impl) return;
+    int64_t len = map.impl->len;
+    // Retain keys
+    forge_string_t *keys = (forge_string_t *)map.impl->keys;
+    for (int64_t i = 0; i < len; i++) {
+        if (keys[i].is_heap && keys[i].data) {
+            forge_rc_retain((void *)keys[i].data);
+        }
+    }
+    // Retain values
+    forge_string_t *vals = (forge_string_t *)map.impl->values;
+    for (int64_t i = 0; i < len; i++) {
+        if (vals[i].is_heap && vals[i].data) {
+            forge_rc_retain((void *)vals[i].data);
+        }
+    }
+}
+
+// Release all keys and values in a map (for string keys/values)
+static inline void forge_map_release_all_strings(forge_map_t map) {
+    if (!map.impl) return;
+    int64_t len = map.impl->len;
+    // Release keys
+    forge_string_t *keys = (forge_string_t *)map.impl->keys;
+    for (int64_t i = 0; i < len; i++) {
+        if (keys[i].is_heap && keys[i].data) {
+            forge_rc_release((void *)keys[i].data, NULL);
+        }
+    }
+    // Release values
+    forge_string_t *vals = (forge_string_t *)map.impl->values;
+    for (int64_t i = 0; i < len; i++) {
+        if (vals[i].is_heap && vals[i].data) {
+            forge_rc_release((void *)vals[i].data, NULL);
+        }
+    }
+}
+
 static inline forge_list_t forge_list_empty(void) {
     forge_list_impl_t *impl = (forge_list_impl_t *)calloc(1, sizeof(forge_list_impl_t));
     if (!impl) { fprintf(stderr, "forge: out of memory\n"); exit(1); }

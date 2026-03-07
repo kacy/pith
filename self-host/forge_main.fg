@@ -23,7 +23,7 @@
 from driver import get_directory, get_stem, compile_to_c, init_driver, resolve_imports, mark_visited, find_imports
 from lexer import lex_all, Token
 from parser import parse
-from ast import get_node
+from ast import get_node, reset_arena
 from checker import c_init, c_run, c_run_module, c_diagnostics_to_json, Diagnostic
 from printer import print_ast
 from formatter import fmt_source
@@ -87,6 +87,7 @@ fn compile(path: String, test_mode: Bool) -> String!:
 fn cmd_check(path: String, json_mode: Bool) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
+    reset_arena()
     root := parse(tokens)
 
     # resolve imports for multi-module type checking
@@ -134,6 +135,7 @@ fn cmd_fmt(path: String, check_mode: Bool) -> String!:
 fn cmd_lint(path: String, json_mode: Bool) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
+    reset_arena()
     root := parse(tokens)
 
     # resolve imports for type info (linter needs checker to run first)
@@ -303,6 +305,7 @@ fn cmd_lex(path: String) -> String!:
 fn cmd_parse(path: String) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
+    reset_arena()
     root := parse(tokens)
     print_ast(root)
     return ""

@@ -168,7 +168,6 @@ pub fn init_driver(source_path: String):
     dr_stdlib_root = find_stdlib_root(source_path)
     dr_visited = {}
     dr_checking = {}
-    reset_arena()
     mark_visited(source_path)
 
 # run the full compile pipeline: lex, parse, resolve imports, check, codegen.
@@ -176,6 +175,7 @@ pub fn init_driver(source_path: String):
 pub fn compile_to_c(path: String, test_mode: Bool) -> String!:
     content := read_file(path)!
     tokens := lex_all(content)
+    reset_arena()
     root := parse(tokens)
 
     # resolve imports

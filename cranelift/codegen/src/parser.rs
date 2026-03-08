@@ -168,11 +168,29 @@ impl TextAstParser {
                 }
                 "returns" => {
                     self.advance();
-                    // Parse return type if present
+                    // Parse return type - can be regular type, result type, or optional
                     if let Some(type_line) = self.current() {
                         if type_line.kind == "type" {
                             return_type = type_line.value.clone();
                             self.advance();
+                        } else if type_line.kind == "result" {
+                            // Result type: result <inner_type>
+                            self.advance();
+                            if let Some(inner_line) = self.current() {
+                                if inner_line.kind == "type" {
+                                    return_type = format!("{}!", inner_line.value);
+                                    self.advance();
+                                }
+                            }
+                        } else if type_line.kind == "optional" {
+                            // Optional type: optional <inner_type>
+                            self.advance();
+                            if let Some(inner_line) = self.current() {
+                                if inner_line.kind == "type" {
+                                    return_type = format!("{}?", inner_line.value);
+                                    self.advance();
+                                }
+                            }
                         }
                     }
                 }
@@ -294,6 +312,7 @@ impl TextAstParser {
             "return" => self.parse_return(),
             "if" => self.parse_if(),
             "while" => self.parse_while(),
+            "fail" => self.parse_fail(),
             "bind" => {
                 // bind name <type>? <value> - this is a let statement
                 // Handle case where name includes "mut" marker: "bind i mut"
@@ -411,6 +430,29 @@ impl TextAstParser {
         Ok(AstNode::Return(value))
     }
 
+    /// Parse fail statement: fail <error>
+    fn parse_fail(&mut self) -> Result<AstNode, CompileError> {
+        // Current line is "fail"
+        let fail_line = self.current().unwrap();
+        let fail_indent = fail_line.indent;
+        self.advance();
+
+        // Parse the error expression (if indented more)
+        let error = if let Some(line) = self.current() {
+            if line.indent > fail_indent {
+                self.parse_expression()?
+            } else {
+                AstNode::StringLiteral("error".to_string())
+            }
+        } else {
+            AstNode::StringLiteral("error".to_string())
+        };
+
+        Ok(AstNode::Fail {
+            error: Box::new(error),
+        })
+    }
+
     /// Parse a function call
     fn parse_call(&mut self) -> Result<AstNode, CompileError> {
         let line = self.current().unwrap();
@@ -498,6 +540,7 @@ impl TextAstParser {
             "string_interp" => self.parse_string_interp(),
             "list" => self.parse_list_literal(),
             "map" => self.parse_map_literal(),
+            "try" => self.parse_try(),
             "call" => self.parse_call(),
             "ident" => {
                 let name = line
@@ -703,6 +746,19 @@ impl TextAstParser {
             entries,
             key_type: None,
             val_type: None,
+        })
+    }
+
+    /// Parse try expression: try <expr> (the ? operator for error propagation)
+    fn parse_try(&mut self) -> Result<AstNode, CompileError> {
+        // Current line is "try"
+        self.advance();
+
+        // Parse the expression that might fail
+        let expr = self.parse_expression()?;
+
+        Ok(AstNode::Try {
+            expr: Box::new(expr),
         })
     }
 

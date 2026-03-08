@@ -67,6 +67,10 @@ pub enum AstNode {
         key_type: Option<String>,
         val_type: Option<String>,
     },
+    /// Try expression: expr? (error propagation)
+    Try { expr: Box<AstNode> },
+    /// Fail statement: fail error
+    Fail { error: Box<AstNode> },
     /// Index access: list[i] or map[key]
     Index {
         expr: Box<AstNode>,

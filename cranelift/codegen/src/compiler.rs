@@ -822,6 +822,34 @@ fn compile_expr(
             Ok(map_val)
         }
 
+        AstNode::Try { expr } => {
+            // For now, just compile the inner expression
+            // Full error propagation requires complex control flow
+            compile_expr(
+                builder,
+                variables,
+                runtime_funcs,
+                declared_funcs,
+                string_funcs,
+                module,
+                expr,
+            )
+        }
+
+        AstNode::Fail { error } => {
+            // For now, just compile the error expression
+            // Full fail implementation requires return type checking
+            compile_expr(
+                builder,
+                variables,
+                runtime_funcs,
+                declared_funcs,
+                string_funcs,
+                module,
+                error,
+            )
+        }
+
         AstNode::Identifier(name) => match variables.get(name) {
             Some(var_info) => {
                 // Use Cranelift's Variable system to get the current value

@@ -226,6 +226,62 @@ pub unsafe extern "C" fn forge_chr_cstr(n: i64) -> *mut i8 {
     ptr
 }
 
+/// Test assertion helpers
+static mut TEST_FAILED: bool = false;
+
+/// Assert that condition is true
+#[no_mangle]
+pub extern "C" fn forge_assert(cond: i64) {
+    unsafe {
+        if cond == 0 {
+            TEST_FAILED = true;
+            eprintln!("Assertion failed");
+        }
+    }
+}
+
+/// Assert that two values are equal
+#[no_mangle]
+pub extern "C" fn forge_assert_eq(a: i64, b: i64) {
+    unsafe {
+        if a != b {
+            TEST_FAILED = true;
+            eprintln!("Assertion failed: {} != {}", a, b);
+        }
+    }
+}
+
+/// Assert that two values are not equal  
+#[no_mangle]
+pub extern "C" fn forge_assert_ne(a: i64, b: i64) {
+    unsafe {
+        if a == b {
+            TEST_FAILED = true;
+            eprintln!("Assertion failed: {} == {}", a, b);
+        }
+    }
+}
+
+/// Check if any test failed
+#[no_mangle]
+pub extern "C" fn forge_test_result() -> i64 {
+    unsafe {
+        if TEST_FAILED {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+/// Reset test state
+#[no_mangle]
+pub extern "C" fn forge_test_reset() {
+    unsafe {
+        TEST_FAILED = false;
+    }
+}
+
 /// Bitwise AND
 #[no_mangle]
 pub extern "C" fn forge_bit_and(a: i64, b: i64) -> i64 {

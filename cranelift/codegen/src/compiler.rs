@@ -3,10 +3,10 @@
 //! First pass: Declare all functions
 //! Second pass: Compile all function bodies
 
-use crate::{CodeGen, CompileError, forge_type_to_cranelift};
 use crate::ast::{AstNode, BinaryOp, UnaryOp};
+use crate::{forge_type_to_cranelift, CodeGen, CompileError};
 use cranelift::prelude::*;
-use cranelift_module::{Module, Linkage, FuncId};
+use cranelift_module::{FuncId, Linkage, Module};
 use std::collections::HashMap;
 
 /// Local variable slot
@@ -36,7 +36,11 @@ fn collect_strings(node: &AstNode, strings: &mut Vec<String>) {
                 collect_strings(stmt, strings);
             }
         }
-        AstNode::If { cond, then_branch, else_branch } => {
+        AstNode::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             collect_strings(cond, strings);
             collect_strings(then_branch, strings);
             if let Some(else_) = else_branch {
@@ -68,51 +72,105 @@ pub fn compile_module(
             collect_strings(body, &mut all_strings);
         }
     }
-    
+
     // Declare string data
     let mut string_funcs = HashMap::new();
     for (i, s) in all_strings.iter().enumerate() {
         let name = format!("str_{}", i);
         match crate::declare_string_data(&mut codegen.module, &name, s) {
-            Ok(func_id) => { string_funcs.insert(s.clone(), func_id); }
+            Ok(func_id) => {
+                string_funcs.insert(s.clone(), func_id);
+            }
             Err(_) => {}
         }
     }
-    
-    // Pass 1: Declare all functions
+
+    // Pass 1: Declare all functions and tests
     let mut declared_funcs = HashMap::new();
-    
+
     for node in &ast_nodes {
-        if let AstNode::Function { name, params, return_type, .. } = node {
-            let mut sig = codegen.module.make_signature();
-            
-            for (_, ty) in params {
-                let cl_ty = forge_type_to_cranelift(ty);
-                sig.params.push(AbiParam::new(cl_ty));
+        match node {
+            AstNode::Function {
+                name,
+                params,
+                return_type,
+                ..
+            } => {
+                let mut sig = codegen.module.make_signature();
+
+                for (_, ty) in params {
+                    let cl_ty = forge_type_to_cranelift(ty);
+                    sig.params.push(AbiParam::new(cl_ty));
+                }
+
+                let ret_ty = forge_type_to_cranelift(return_type);
+                sig.returns.push(AbiParam::new(ret_ty));
+
+                let func_id = codegen
+                    .module
+                    .declare_function(name, Linkage::Export, &sig)
+                    .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+
+                declared_funcs.insert(name.clone(), func_id);
             }
-            
-            let ret_ty = forge_type_to_cranelift(return_type);
-            sig.returns.push(AbiParam::new(ret_ty));
-            
-            let func_id = codegen.module.declare_function(name, Linkage::Export, &sig)
-                .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-            
-            declared_funcs.insert(name.clone(), func_id);
+            AstNode::Test { name, .. } => {
+                // Declare test functions with no params, void return
+                let mut sig = codegen.module.make_signature();
+                sig.returns.push(AbiParam::new(types::I64));
+
+                let func_id = codegen
+                    .module
+                    .declare_function(name, Linkage::Export, &sig)
+                    .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+
+                declared_funcs.insert(name.clone(), func_id);
+            }
+            _ => {}
         }
     }
-    
-    // Pass 2: Compile all function bodies
+
+    // Collect test names before consuming ast_nodes
+    let test_names: Vec<String> = ast_nodes
+        .iter()
+        .filter_map(|node| {
+            if let AstNode::Test { name, .. } = node {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Pass 2: Compile all function and test bodies
     let runtime_funcs = crate::declare_runtime_functions(&mut codegen.module)?;
-    
-    for node in ast_nodes {
-        if let AstNode::Function { name, params, return_type, body } = node {
-            if let Some(&func_id) = declared_funcs.get(&name) {
+
+    for node in &ast_nodes {
+        if let AstNode::Function {
+            name,
+            params,
+            return_type,
+            body,
+        } = node
+        {
+            if let Some(&func_id) = declared_funcs.get(name) {
                 compile_function_body(
                     codegen,
                     func_id,
-                    &params,
-                    &return_type,
-                    &body,
+                    params,
+                    return_type,
+                    body,
+                    &runtime_funcs,
+                    &declared_funcs,
+                    &string_funcs,
+                )?;
+            }
+        }
+        if let AstNode::Test { name, body } = node {
+            if let Some(&func_id) = declared_funcs.get(name) {
+                compile_test_body(
+                    codegen,
+                    func_id,
+                    body,
                     &runtime_funcs,
                     &declared_funcs,
                     &string_funcs,
@@ -120,7 +178,13 @@ pub fn compile_module(
             }
         }
     }
-    
+
+    // Check if we need to generate a test runner
+    if !declared_funcs.contains_key("main") && !test_names.is_empty() {
+        // Generate test runner main()
+        generate_test_runner(codegen, &runtime_funcs, &declared_funcs, &test_names)?;
+    }
+
     Ok(declared_funcs)
 }
 
@@ -135,32 +199,47 @@ fn compile_function_body(
     string_funcs: &HashMap<String, FuncId>,
 ) -> Result<(), CompileError> {
     let mut ctx = codegen.module.make_context();
-    
+
     for (_, ty) in params {
         let cl_ty = forge_type_to_cranelift(ty);
         ctx.func.signature.params.push(AbiParam::new(cl_ty));
     }
     let ret_ty = forge_type_to_cranelift(return_type);
     ctx.func.signature.returns.push(AbiParam::new(ret_ty));
-    
+
     let mut builder_ctx = FunctionBuilderContext::new();
     {
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
         let mut variables: HashMap<String, LocalVar> = HashMap::new();
-        
+
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
-        
+
         let block_params = builder.block_params(entry_block);
         for (i, (param_name, param_ty)) in params.iter().enumerate() {
             let param_val = block_params[i];
             let ty = forge_type_to_cranelift(param_ty);
-            variables.insert(param_name.clone(), LocalVar { value: param_val, ty });
+            variables.insert(
+                param_name.clone(),
+                LocalVar {
+                    value: param_val,
+                    ty,
+                },
+            );
         }
-        
-        let filled = compile_stmt(&mut builder, &mut variables, runtime_funcs, declared_funcs, string_funcs, &mut codegen.module, ret_ty, body)?;
-        
+
+        let filled = compile_stmt(
+            &mut builder,
+            &mut variables,
+            runtime_funcs,
+            declared_funcs,
+            string_funcs,
+            &mut codegen.module,
+            ret_ty,
+            body,
+        )?;
+
         // Try to add return if block is not filled
         // Note: If entry_block was filled (e.g., by while loop jump), this will fail silently
         if !filled {
@@ -168,10 +247,119 @@ fn compile_function_body(
             builder.ins().return_(&[zero]);
         }
     }
-    
-    codegen.module.define_function(func_id, &mut ctx)
+
+    codegen
+        .module
+        .define_function(func_id, &mut ctx)
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-    
+
+    Ok(())
+}
+
+/// Compile a test function body
+fn compile_test_body(
+    codegen: &mut CodeGen,
+    func_id: FuncId,
+    body: &AstNode,
+    runtime_funcs: &HashMap<String, FuncId>,
+    declared_funcs: &HashMap<String, FuncId>,
+    string_funcs: &HashMap<String, FuncId>,
+) -> Result<(), CompileError> {
+    let mut ctx = codegen.module.make_context();
+    ctx.func.signature.returns.push(AbiParam::new(types::I64));
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+        let mut variables: HashMap<String, LocalVar> = HashMap::new();
+
+        let entry_block = builder.create_block();
+        builder.switch_to_block(entry_block);
+
+        // Compile the test body
+        let filled = compile_stmt(
+            &mut builder,
+            &mut variables,
+            runtime_funcs,
+            declared_funcs,
+            string_funcs,
+            &mut codegen.module,
+            types::I64,
+            body,
+        )?;
+
+        // If block not filled (e.g., no explicit return), return 0 (success)
+        if !filled {
+            let zero = builder.ins().iconst(types::I64, 0);
+            builder.ins().return_(&[zero]);
+        }
+    }
+
+    codegen
+        .module
+        .define_function(func_id, &mut ctx)
+        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+
+    Ok(())
+}
+
+/// Generate a test runner main() function
+fn generate_test_runner(
+    codegen: &mut CodeGen,
+    runtime_funcs: &HashMap<String, FuncId>,
+    declared_funcs: &HashMap<String, FuncId>,
+    test_names: &[String],
+) -> Result<(), CompileError> {
+    use cranelift_module::{Linkage, Module};
+
+    let mut ctx = codegen.module.make_context();
+    ctx.func.signature.returns.push(AbiParam::new(types::I64));
+
+    // Declare the main function
+    let func_id = codegen
+        .module
+        .declare_function("main", Linkage::Export, &ctx.func.signature)
+        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+
+        let entry_block = builder.create_block();
+        builder.switch_to_block(entry_block);
+
+        // Reset test state
+        if let Some(&reset_id) = runtime_funcs.get("forge_test_reset") {
+            let reset_ref = codegen.module.declare_func_in_func(reset_id, builder.func);
+            builder.ins().call(reset_ref, &[]);
+        }
+
+        // Call each test function
+        for test_name in test_names {
+            if let Some(&test_id) = declared_funcs.get(test_name) {
+                let test_ref = codegen.module.declare_func_in_func(test_id, builder.func);
+                builder.ins().call(test_ref, &[]);
+            }
+        }
+
+        // Get test result
+        let result_val = if let Some(&result_id) = runtime_funcs.get("forge_test_result") {
+            let result_ref = codegen.module.declare_func_in_func(result_id, builder.func);
+            let call = builder.ins().call(result_ref, &[]);
+            builder.func.dfg.first_result(call)
+        } else {
+            builder.ins().iconst(types::I64, 0)
+        };
+
+        // Return test result (0 = success, 1 = failure)
+        builder.ins().return_(&[result_val]);
+    }
+
+    codegen
+        .module
+        .define_function(func_id, &mut ctx)
+        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+
     Ok(())
 }
 
@@ -187,25 +375,50 @@ fn compile_stmt(
 ) -> Result<bool, CompileError> {
     match node {
         AstNode::Let { name, value } => {
-            let val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, value)?;
+            let val = compile_expr(
+                builder,
+                variables,
+                runtime_funcs,
+                declared_funcs,
+                string_funcs,
+                module,
+                value,
+            )?;
             let ty = builder.func.dfg.value_type(val);
             variables.insert(name.clone(), LocalVar { value: val, ty });
             Ok(false)
         }
-        
+
         AstNode::Block(stmts) => {
             for stmt in stmts {
-                let filled = compile_stmt(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, return_type, stmt)?;
+                let filled = compile_stmt(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    return_type,
+                    stmt,
+                )?;
                 if filled {
                     return Ok(true);
                 }
             }
             Ok(false)
         }
-        
+
         AstNode::Return(expr) => {
             if let Some(e) = expr {
-                let val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, e)?;
+                let val = compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    e,
+                )?;
                 builder.ins().return_(&[val]);
             } else {
                 let zero = builder.ins().iconst(return_type, 0);
@@ -213,63 +426,122 @@ fn compile_stmt(
             }
             Ok(true)
         }
-        
-        AstNode::If { cond, then_branch, else_branch } => {
-            let cond_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, cond)?;
-            
+
+        AstNode::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            let cond_val = compile_expr(
+                builder,
+                variables,
+                runtime_funcs,
+                declared_funcs,
+                string_funcs,
+                module,
+                cond,
+            )?;
+
             let then_block = builder.create_block();
             let else_block = builder.create_block();
             let merge_block = builder.create_block();
-            
-            builder.ins().brif(cond_val, then_block, &[], else_block, &[]);
-            
+
+            builder
+                .ins()
+                .brif(cond_val, then_block, &[], else_block, &[]);
+
             // Then branch
             builder.switch_to_block(then_block);
-            compile_stmt(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, return_type, then_branch)?;
+            compile_stmt(
+                builder,
+                variables,
+                runtime_funcs,
+                declared_funcs,
+                string_funcs,
+                module,
+                return_type,
+                then_branch,
+            )?;
             builder.ins().jump(merge_block, &[]);
-            
+
             // Else branch
             builder.switch_to_block(else_block);
             if let Some(else_stmt) = else_branch {
-                compile_stmt(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, return_type, else_stmt)?;
+                compile_stmt(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    return_type,
+                    else_stmt,
+                )?;
             }
             builder.ins().jump(merge_block, &[]);
-            
+
             // Continue after if
             builder.switch_to_block(merge_block);
-            
+
             Ok(false)
         }
-        
+
         AstNode::While { cond, body } => {
             // Create blocks for while loop
             let header_block = builder.create_block();
             let body_block = builder.create_block();
             let exit_block = builder.create_block();
-            
+
             // Jump to header from current block
             builder.ins().jump(header_block, &[]);
-            
+
             // Header: check condition
             builder.switch_to_block(header_block);
-            let cond_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, cond)?;
-            builder.ins().brif(cond_val, body_block, &[], exit_block, &[]);
-            
+            let cond_val = compile_expr(
+                builder,
+                variables,
+                runtime_funcs,
+                declared_funcs,
+                string_funcs,
+                module,
+                cond,
+            )?;
+            builder
+                .ins()
+                .brif(cond_val, body_block, &[], exit_block, &[]);
+
             // Body: compile loop body
             builder.switch_to_block(body_block);
-            let body_filled = compile_stmt(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, return_type, body)?;
+            let body_filled = compile_stmt(
+                builder,
+                variables,
+                runtime_funcs,
+                declared_funcs,
+                string_funcs,
+                module,
+                return_type,
+                body,
+            )?;
             if !body_filled {
                 builder.ins().jump(header_block, &[]);
             }
-            
+
             // Continue at exit block
             builder.switch_to_block(exit_block);
-            
+
             Ok(false)
         }
-        
+
         AstNode::Assign { name, value } => {
-            let val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, value)?;
+            let val = compile_expr(
+                builder,
+                variables,
+                runtime_funcs,
+                declared_funcs,
+                string_funcs,
+                module,
+                value,
+            )?;
             // Update existing variable
             if let Some(var) = variables.get(name) {
                 let ty = var.ty;
@@ -279,15 +551,23 @@ fn compile_stmt(
                 Err(CompileError::UnknownVariable(name.clone()))
             }
         }
-        
+
         AstNode::Import { .. } => {
             // Import statements are handled at module level, not in function body
             // For now, just skip them
             Ok(false)
         }
-        
+
         _ => {
-            compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, node)?;
+            compile_expr(
+                builder,
+                variables,
+                runtime_funcs,
+                declared_funcs,
+                string_funcs,
+                module,
+                node,
+            )?;
             Ok(false)
         }
     }
@@ -304,9 +584,9 @@ fn compile_expr(
 ) -> Result<Value, CompileError> {
     match node {
         AstNode::IntLiteral(n) => Ok(builder.ins().iconst(types::I64, *n)),
-        
+
         AstNode::FloatLiteral(f) => Ok(builder.ins().f64const(*f)),
-        
+
         AstNode::StringLiteral(s) => {
             // Call the string data function to get the address
             if let Some(&str_func_id) = string_funcs.get(s) {
@@ -319,32 +599,62 @@ fn compile_expr(
                 Ok(builder.ins().iconst(types::I64, ptr))
             }
         }
-        
-        AstNode::Identifier(name) => {
-            match variables.get(name) {
-                Some(var) => Ok(var.value),
-                None => Err(CompileError::UnknownVariable(name.clone())),
-            }
-        }
-        
+
+        AstNode::Identifier(name) => match variables.get(name) {
+            Some(var) => Ok(var.value),
+            None => Err(CompileError::UnknownVariable(name.clone())),
+        },
+
         AstNode::BinaryOp { op, left, right } => {
             // Check if this is string concatenation
-            let is_string_op = matches!(left.as_ref(), AstNode::StringLiteral(_)) || 
-                              matches!(right.as_ref(), AstNode::StringLiteral(_));
-            
+            let is_string_op = matches!(left.as_ref(), AstNode::StringLiteral(_))
+                || matches!(right.as_ref(), AstNode::StringLiteral(_));
+
             if is_string_op && matches!(op, BinaryOp::Add) {
                 // String concatenation - for now just return left operand
                 // (Proper implementation needs struct passing)
-                let left_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, left)?;
-                let _right_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, right)?;
-                
+                let left_val = compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    left,
+                )?;
+                let _right_val = compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    right,
+                )?;
+
                 // Just return left for now
                 Ok(left_val)
             } else {
                 // Regular integer arithmetic
-                let left_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, left)?;
-                let right_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, right)?;
-                
+                let left_val = compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    left,
+                )?;
+                let right_val = compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    right,
+                )?;
+
                 Ok(match op {
                     BinaryOp::Add => builder.ins().iadd(left_val, right_val),
                     BinaryOp::Sub => builder.ins().isub(left_val, right_val),
@@ -360,26 +670,37 @@ fn compile_expr(
                         builder.ins().uextend(types::I64, cmp)
                     }
                     BinaryOp::Gt => {
-                        let cmp = builder.ins().icmp(IntCC::SignedGreaterThan, left_val, right_val);
+                        let cmp = builder
+                            .ins()
+                            .icmp(IntCC::SignedGreaterThan, left_val, right_val);
                         builder.ins().uextend(types::I64, cmp)
                     }
                     BinaryOp::Lt => {
-                        let cmp = builder.ins().icmp(IntCC::SignedLessThan, left_val, right_val);
+                        let cmp = builder
+                            .ins()
+                            .icmp(IntCC::SignedLessThan, left_val, right_val);
                         builder.ins().uextend(types::I64, cmp)
                     }
                     BinaryOp::Gte => {
-                        let cmp = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, left_val, right_val);
+                        let cmp = builder.ins().icmp(
+                            IntCC::SignedGreaterThanOrEqual,
+                            left_val,
+                            right_val,
+                        );
                         builder.ins().uextend(types::I64, cmp)
                     }
                     BinaryOp::Lte => {
-                        let cmp = builder.ins().icmp(IntCC::SignedLessThanOrEqual, left_val, right_val);
+                        let cmp =
+                            builder
+                                .ins()
+                                .icmp(IntCC::SignedLessThanOrEqual, left_val, right_val);
                         builder.ins().uextend(types::I64, cmp)
                     }
                     _ => builder.ins().iconst(types::I64, 0),
                 })
             }
         }
-        
+
         AstNode::Call { func, args } => {
             // Use forge_print_cstr for all print calls (expects just a pointer)
             let func_name = if func == "print" {
@@ -390,28 +711,37 @@ fn compile_expr(
                     _ => func,
                 }
             };
-            
-            let func_id = runtime_funcs.get(func_name)
+
+            let func_id = runtime_funcs
+                .get(func_name)
                 .copied()
                 .or_else(|| declared_funcs.get(func).copied())
                 .ok_or_else(|| CompileError::UnknownFunction(func.clone()))?;
-            
+
             let func_ref = module.declare_func_in_func(func_id, builder.func);
-            
+
             let mut arg_values = Vec::new();
             for arg in args {
-                arg_values.push(compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, arg)?);
+                arg_values.push(compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    arg,
+                )?);
             }
-            
+
             let call = builder.ins().call(func_ref, &arg_values);
-            
+
             if !builder.func.dfg.inst_results(call).is_empty() {
                 Ok(builder.func.dfg.first_result(call))
             } else {
                 Ok(builder.ins().iconst(types::I64, 0))
             }
         }
-        
+
         _ => Err(CompileError::UnsupportedFeature(format!("{:?}", node))),
     }
 }

@@ -67,6 +67,11 @@ pub enum AstNode {
         module: String,
         names: Vec<String>,
     },
+    /// Test declaration: test "name": body
+    Test {
+        name: String,
+        body: Box<AstNode>,
+    },
     /// Function declaration
     Function {
         name: String,

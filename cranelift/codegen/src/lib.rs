@@ -371,6 +371,31 @@ pub fn declare_runtime_functions(module: &mut ObjectModule) -> Result<HashMap<St
     )?;
     funcs.insert("round".to_string(), round);
     
+    // Test assertion functions
+    let assert_fn = declare_runtime_function(
+        module,
+        "forge_assert",
+        &[types::I64],
+        &[],
+    )?;
+    funcs.insert("assert".to_string(), assert_fn);
+    
+    let assert_eq = declare_runtime_function(
+        module,
+        "forge_assert_eq",
+        &[types::I64, types::I64],
+        &[],
+    )?;
+    funcs.insert("assert_eq".to_string(), assert_eq);
+    
+    let assert_ne = declare_runtime_function(
+        module,
+        "forge_assert_ne",
+        &[types::I64, types::I64],
+        &[],
+    )?;
+    funcs.insert("assert_ne".to_string(), assert_ne);
+    
     // List functions
     let list_new = declare_runtime_function(
         module,

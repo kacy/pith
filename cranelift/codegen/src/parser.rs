@@ -112,6 +112,7 @@ impl TextAstParser {
         match line.kind.as_str() {
             "fn" => self.parse_function(),
             "from" => self.parse_import(),
+            "test" => self.parse_test(),
             "pub" => {
                 self.advance();
                 self.parse_top_level()
@@ -213,6 +214,28 @@ impl TextAstParser {
             .collect();
         
         Ok(AstNode::Import { module, names })
+    }
+    
+    /// Parse a test declaration: test "name": body
+    fn parse_test(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().unwrap();
+        let test_name = line.value.clone();
+        let indent = line.indent;
+        self.advance();
+        
+        // Parse test body statements (indented)
+        let mut stmts = Vec::new();
+        while let Some(line) = self.current() {
+            if line.indent <= indent {
+                break;
+            }
+            stmts.push(self.parse_statement()?);
+        }
+        
+        Ok(AstNode::Test {
+            name: test_name,
+            body: Box::new(AstNode::Block(stmts)),
+        })
     }
     
     /// Parse function body

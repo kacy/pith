@@ -240,9 +240,17 @@ fn compile_function_body(
             body,
         )?;
 
-        // Try to add return if block is not filled
-        // Note: If entry_block was filled (e.g., by while loop jump), this will fail silently
+        // Try to add return if the body compilation didn't fill a block
+        // Note: If the entry block was filled (e.g., by a while loop jump),
+        // we need to create a new block for the return
         if !filled {
+            let current = builder.current_block().unwrap();
+
+            // Create a new block for the return to avoid filled block issues
+            let return_block = builder.create_block();
+            builder.ins().jump(return_block, &[]);
+            builder.switch_to_block(return_block);
+
             let zero = builder.ins().iconst(ret_ty, 0);
             builder.ins().return_(&[zero]);
         }
@@ -452,7 +460,7 @@ fn compile_stmt(
 
             // Then branch
             builder.switch_to_block(then_block);
-            compile_stmt(
+            let then_filled = compile_stmt(
                 builder,
                 variables,
                 runtime_funcs,
@@ -462,11 +470,13 @@ fn compile_stmt(
                 return_type,
                 then_branch,
             )?;
-            builder.ins().jump(merge_block, &[]);
+            if !then_filled {
+                builder.ins().jump(merge_block, &[]);
+            }
 
             // Else branch
             builder.switch_to_block(else_block);
-            if let Some(else_stmt) = else_branch {
+            let else_filled = if let Some(else_stmt) = else_branch {
                 compile_stmt(
                     builder,
                     variables,
@@ -476,11 +486,15 @@ fn compile_stmt(
                     module,
                     return_type,
                     else_stmt,
-                )?;
+                )?
+            } else {
+                false
+            };
+            if !else_filled {
+                builder.ins().jump(merge_block, &[]);
             }
-            builder.ins().jump(merge_block, &[]);
 
-            // Continue after if
+            // Continue after if - but only if merge block is not filled
             builder.switch_to_block(merge_block);
 
             Ok(false)
@@ -492,11 +506,37 @@ fn compile_stmt(
             let body_block = builder.create_block();
             let exit_block = builder.create_block();
 
-            // Jump to header from current block
-            builder.ins().jump(header_block, &[]);
+            // Jump to header from current block, passing current variable values
+            let current_vars: Vec<(String, LocalVar)> = variables
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        LocalVar {
+                            value: v.value,
+                            ty: v.ty,
+                        },
+                    )
+                })
+                .collect();
+            let var_values: Vec<Value> = current_vars.iter().map(|(_, v)| v.value).collect();
+            builder.ins().jump(header_block, &var_values);
 
             // Header: check condition
             builder.switch_to_block(header_block);
+            // Add block parameters for all variables
+            for (name, var) in &current_vars {
+                let param = builder.append_block_param(header_block, var.ty);
+                // Update the variable in the map to use the parameter
+                variables.insert(
+                    name.clone(),
+                    LocalVar {
+                        value: param,
+                        ty: var.ty,
+                    },
+                );
+            }
+
             let cond_val = compile_expr(
                 builder,
                 variables,
@@ -523,7 +563,17 @@ fn compile_stmt(
                 body,
             )?;
             if !body_filled {
-                builder.ins().jump(header_block, &[]);
+                // Get updated variable values and jump back to header
+                let updated_values: Vec<Value> = current_vars
+                    .iter()
+                    .map(|(name, _)| {
+                        variables
+                            .get(name)
+                            .map(|v| v.value)
+                            .unwrap_or_else(|| builder.ins().iconst(types::I64, 0))
+                    })
+                    .collect();
+                builder.ins().jump(header_block, &updated_values);
             }
 
             // Continue at exit block

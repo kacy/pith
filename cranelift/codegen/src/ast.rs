@@ -32,7 +32,11 @@ pub enum AstNode {
     /// Function call: foo(a, b)
     Call { func: String, args: Vec<AstNode> },
     /// Variable declaration: let x = value
-    Let { name: String, value: Box<AstNode> },
+    Let {
+        name: String,
+        type_annotation: Option<String>,
+        value: Box<AstNode>,
+    },
     /// Assignment: x = value
     Assign { name: String, value: Box<AstNode> },
     /// Block of statements
@@ -380,7 +384,7 @@ fn compile_stmt(
     node: &AstNode,
 ) -> Result<(), CompileError> {
     match node {
-        AstNode::Let { name, value } => {
+        AstNode::Let { name, value, .. } => {
             let val = compile_expr(builder, variables, runtime_funcs, module, value)?;
 
             // Infer type from value

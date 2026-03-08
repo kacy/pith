@@ -365,11 +365,12 @@ impl TextAstParser {
                     .next()
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| line.value.clone());
+                let name_indent = line.indent;
                 self.advance();
 
                 // Check for optional type annotation
-                let _type_annotation = if let Some(type_line) = self.current() {
-                    if type_line.kind == "type" {
+                let type_annotation = if let Some(type_line) = self.current() {
+                    if type_line.kind == "type" && type_line.indent > name_indent {
                         let ty = type_line.value.clone();
                         self.advance();
                         Some(ty)
@@ -383,6 +384,7 @@ impl TextAstParser {
                 let value = self.parse_expression()?;
                 Ok(AstNode::Let {
                     name,
+                    type_annotation,
                     value: Box::new(value),
                 })
             }
@@ -441,13 +443,28 @@ impl TextAstParser {
             .next()
             .map(|s| s.to_string())
             .unwrap_or_else(|| line.value.clone());
+        let name_indent = line.indent;
         self.advance();
+
+        // Check for optional type annotation
+        let type_annotation = if let Some(type_line) = self.current() {
+            if type_line.kind == "type" && type_line.indent > name_indent {
+                let ty = type_line.value.clone();
+                self.advance();
+                Some(ty)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Parse value
         let value = self.parse_expression()?;
 
         Ok(AstNode::Let {
             name,
+            type_annotation,
             value: Box::new(value),
         })
     }

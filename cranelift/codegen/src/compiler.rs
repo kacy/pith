@@ -71,6 +71,42 @@ fn collect_strings(node: &AstNode, strings: &mut Vec<String>) {
     }
 }
 
+/// Collect generic types used in a node and register them
+fn collect_generic_types(node: &AstNode, registry: &mut crate::GenericRegistry) {
+    match node {
+        AstNode::Let {
+            value,
+            type_annotation,
+            ..
+        } => {
+            // Register the type annotation if it contains generics
+            if let Some(ty) = type_annotation {
+                registry.register(ty);
+            }
+            collect_generic_types(value, registry);
+        }
+        AstNode::ListLiteral { .. } => {
+            // Register List with element type if available
+            registry.register("List");
+        }
+        AstNode::MapLiteral { .. } => {
+            // Register Map with key/value types if available
+            registry.register("Map");
+        }
+        AstNode::Call { args, .. } => {
+            for arg in args {
+                collect_generic_types(arg, registry);
+            }
+        }
+        AstNode::Block(stmts) => {
+            for stmt in stmts {
+                collect_generic_types(stmt, registry);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Compile all functions from AST with two-pass approach
 pub fn compile_module(
     codegen: &mut CodeGen,
@@ -93,6 +129,13 @@ pub fn compile_module(
                 string_funcs.insert(s.clone(), func_id);
             }
             Err(_) => {}
+        }
+    }
+
+    // Pre-register generic types used in the code
+    for node in &ast_nodes {
+        if let AstNode::Function { body, .. } = node {
+            collect_generic_types(body, &mut codegen.generic_registry);
         }
     }
 
@@ -400,7 +443,7 @@ fn compile_stmt(
     node: &AstNode,
 ) -> Result<bool, CompileError> {
     match node {
-        AstNode::Let { name, value } => {
+        AstNode::Let { name, value, .. } => {
             let val = compile_expr(
                 builder,
                 variables,

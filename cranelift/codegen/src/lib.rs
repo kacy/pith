@@ -31,6 +31,83 @@ pub struct StructType {
     pub alignment: usize,
 }
 
+/// Generic type instantiation (e.g., "List[Int]" -> concrete type)
+#[derive(Debug, Clone)]
+pub struct GenericInstantiation {
+    pub base_type: String,      // "List", "Map", etc.
+    pub type_args: Vec<String>, // ["Int"], ["String", "Int"], etc.
+    pub concrete_name: String,  // "List_Int", "Map_String_Int", etc.
+}
+
+/// Generic type registry for monomorphization
+#[derive(Debug, Default)]
+pub struct GenericRegistry {
+    /// Map from full type name (e.g., "List[Int]") to concrete info
+    pub instantiations: HashMap<String, GenericInstantiation>,
+    /// Counter for generating unique IDs
+    pub next_id: u64,
+}
+
+impl GenericRegistry {
+    /// Register a generic type usage and return the concrete name
+    pub fn register(&mut self, full_type_name: &str) -> String {
+        if let Some(existing) = self.instantiations.get(full_type_name) {
+            return existing.concrete_name.clone();
+        }
+
+        // Parse the type name: e.g., "List[Int]" or "Map[String, Int]"
+        let (base_type, type_args) = parse_generic_type(full_type_name);
+
+        // Generate concrete name: e.g., "List_Int", "Map_String_Int"
+        let concrete_name = if type_args.is_empty() {
+            base_type.clone()
+        } else {
+            format!("{}_{}", base_type, type_args.join("_"))
+        };
+
+        let instantiation = GenericInstantiation {
+            base_type: base_type.clone(),
+            type_args: type_args.clone(),
+            concrete_name: concrete_name.clone(),
+        };
+
+        self.instantiations
+            .insert(full_type_name.to_string(), instantiation);
+        concrete_name
+    }
+
+    /// Get all registered instantiations for a base type
+    pub fn get_for_base(&self, base: &str) -> Vec<&GenericInstantiation> {
+        self.instantiations
+            .values()
+            .filter(|inst| inst.base_type == base)
+            .collect()
+    }
+}
+
+/// Parse a generic type name into base and type arguments
+/// e.g., "List[Int]" -> ("List", vec!["Int"])
+/// e.g., "Map[String, Int]" -> ("Map", vec!["String", "Int"])
+pub fn parse_generic_type(type_name: &str) -> (String, Vec<String>) {
+    // Check if it's a generic type with [...]
+    if let Some(bracket_pos) = type_name.find('[') {
+        let base = type_name[..bracket_pos].to_string();
+        let args_part = &type_name[bracket_pos + 1..type_name.len() - 1]; // Remove trailing ']'
+
+        // Parse comma-separated type arguments
+        let args: Vec<String> = args_part
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        (base, args)
+    } else {
+        // Not a generic type
+        (type_name.to_string(), vec![])
+    }
+}
+
 /// Code generator state
 pub struct CodeGen {
     /// The Cranelift module being built
@@ -45,6 +122,8 @@ pub struct CodeGen {
     pub builder: Option<FunctionBuilder<'static>>, // Will fix lifetime issues
     /// Struct type registry (name -> struct info)
     pub struct_types: HashMap<String, StructType>,
+    /// Generic type registry for monomorphization
+    pub generic_registry: GenericRegistry,
 }
 
 /// Result of compilation
@@ -107,6 +186,7 @@ pub fn create_codegen() -> Result<CodeGen, CompileError> {
         variables: HashMap::new(),
         builder: None,
         struct_types: HashMap::new(),
+        generic_registry: GenericRegistry::default(),
     })
 }
 

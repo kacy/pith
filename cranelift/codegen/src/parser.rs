@@ -497,6 +497,7 @@ impl TextAstParser {
             }
             "string_interp" => self.parse_string_interp(),
             "list" => self.parse_list_literal(),
+            "map" => self.parse_map_literal(),
             "call" => self.parse_call(),
             "ident" => {
                 let name = line
@@ -646,6 +647,62 @@ impl TextAstParser {
         Ok(AstNode::ListLiteral {
             elements,
             elem_type: None,
+        })
+    }
+
+    /// Parse map literal: map (N entries) followed by key/value pairs
+    fn parse_map_literal(&mut self) -> Result<AstNode, CompileError> {
+        // Current line is "map (N entries)"
+        let map_line = self.current().unwrap();
+        let start_indent = map_line.indent;
+        self.advance();
+
+        let mut entries = Vec::new();
+
+        // Parse each entry until we hit a lower indentation
+        // Format: key <value> (value is indented more)
+        while let Some(line) = self.current() {
+            if line.indent <= start_indent {
+                break;
+            }
+
+            // Extract all data from line first to avoid borrow issues
+            let line_indent = line.indent;
+            let key = if line.kind == "string" {
+                let val = line.value.clone();
+                self.advance();
+                AstNode::StringLiteral(val)
+            } else if line.kind == "int" || line.kind == "integer" {
+                let val = line.value.parse().unwrap_or(0);
+                self.advance();
+                AstNode::IntLiteral(val)
+            } else if line.kind == "ident" {
+                let val = line.value.clone();
+                self.advance();
+                AstNode::Identifier(val)
+            } else {
+                // Parse as expression
+                self.parse_expression()?
+            };
+
+            // Check for value (indented more)
+            let value = if let Some(val_line) = self.current() {
+                if val_line.indent > line_indent {
+                    self.parse_expression()?
+                } else {
+                    AstNode::IntLiteral(0) // Default/no value
+                }
+            } else {
+                AstNode::IntLiteral(0)
+            };
+
+            entries.push((key, value));
+        }
+
+        Ok(AstNode::MapLiteral {
+            entries,
+            key_type: None,
+            val_type: None,
         })
     }
 

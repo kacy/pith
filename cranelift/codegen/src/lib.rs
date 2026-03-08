@@ -381,6 +381,31 @@ pub fn declare_runtime_functions(
     )?;
     funcs.insert("forge_list_len".to_string(), list_len);
 
+    // Map functions
+    let map_new = declare_runtime_function(
+        module,
+        "forge_map_new",
+        &[types::I32, types::I64, types::I8], // key_type, val_size, val_is_heap
+        &[types::I64],                        // returns ForgeMap
+    )?;
+    funcs.insert("forge_map_new".to_string(), map_new);
+
+    let map_len = declare_runtime_function(
+        module,
+        "forge_map_len",
+        &[types::I64], // map
+        &[types::I64], // returns length
+    )?;
+    funcs.insert("forge_map_len".to_string(), map_len);
+
+    let map_insert_int = declare_runtime_function(
+        module,
+        "forge_map_insert_int",
+        &[types::I64, types::I64, types::I64, types::I64], // *mut map, key, *val, val_size
+        &[],
+    )?;
+    funcs.insert("forge_map_insert_int".to_string(), map_insert_int);
+
     Ok(funcs)
 }
 

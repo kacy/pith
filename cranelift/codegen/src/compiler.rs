@@ -650,7 +650,7 @@ fn compile_expr(
 
         AstNode::StringLiteral(s) => {
             // Call the string data function to get the address
-            if let Some(&str_func_id) = string_funcs.get(s) {
+            if let Some(&str_func_id) = string_funcs.get(s.as_str()) {
                 let str_func_ref = module.declare_func_in_func(str_func_id, builder.func);
                 let call = builder.ins().call(str_func_ref, &[]);
                 Ok(builder.func.dfg.first_result(call))
@@ -731,6 +731,95 @@ fn compile_expr(
             }
 
             Ok(list_val)
+        }
+
+        AstNode::MapLiteral {
+            entries,
+            key_type: _,
+            val_type: _,
+        } => {
+            // Create a new map
+            // For simplicity, assume string keys and int values for now
+            let key_type = 1i32; // String key type
+            let val_size = 8i64; // sizeof(i64) for Int values
+            let val_is_heap = 0i8; // false
+
+            // Call forge_map_new(key_type, val_size, val_is_heap)
+            let map_new_func = runtime_funcs
+                .get("forge_map_new")
+                .ok_or_else(|| CompileError::UnknownFunction("forge_map_new".to_string()))?;
+            let map_new_ref = module.declare_func_in_func(*map_new_func, builder.func);
+            let key_type_val = builder.ins().iconst(types::I32, key_type as i64);
+            let val_size_val = builder.ins().iconst(types::I64, val_size);
+            let val_is_heap_val = builder.ins().iconst(types::I8, val_is_heap as i64);
+            let new_call = builder
+                .ins()
+                .call(map_new_ref, &[key_type_val, val_size_val, val_is_heap_val]);
+            let map_val = builder.func.dfg.first_result(new_call);
+
+            // Create a stack slot for the map so we can pass its address to insert
+            let map_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8, // ForgeMap is 8 bytes (one pointer)
+                3, // align_shift = 8 bytes
+            ));
+            let map_slot_addr = builder.ins().stack_addr(types::I64, map_slot, 0);
+            builder
+                .ins()
+                .store(MemFlags::new(), map_val, map_slot_addr, 0);
+            let map_ptr = map_slot_addr;
+
+            // Insert each entry
+            let insert_func = runtime_funcs
+                .get("forge_map_insert_int") // For now use int key version
+                .ok_or_else(|| CompileError::UnknownFunction("forge_map_insert_int".to_string()))?;
+            let insert_ref = module.declare_func_in_func(*insert_func, builder.func);
+
+            for (key, value) in entries {
+                // Compile key (for now only support string keys)
+                let key_val = match key {
+                    AstNode::StringLiteral(s) => {
+                        // Get string pointer
+                        if let Some(&str_func_id) = string_funcs.get(s.as_str()) {
+                            let str_func_ref =
+                                module.declare_func_in_func(str_func_id, builder.func);
+                            let call = builder.ins().call(str_func_ref, &[]);
+                            builder.func.dfg.first_result(call)
+                        } else {
+                            builder.ins().iconst(types::I64, 0)
+                        }
+                    }
+                    AstNode::IntLiteral(n) => builder.ins().iconst(types::I64, *n),
+                    _ => builder.ins().iconst(types::I64, 0),
+                };
+
+                // Compile value
+                let val_val = compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    value,
+                )?;
+
+                // Store value to stack
+                let val_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    3,
+                ));
+                let val_ptr = builder.ins().stack_addr(types::I64, val_slot, 0);
+                builder.ins().store(MemFlags::new(), val_val, val_ptr, 0);
+
+                // Call insert: forge_map_insert_int(map_ptr, key, val_ptr, val_size)
+                builder
+                    .ins()
+                    .call(insert_ref, &[map_ptr, key_val, val_ptr, val_size_val]);
+            }
+
+            Ok(map_val)
         }
 
         AstNode::Identifier(name) => match variables.get(name) {
@@ -924,6 +1013,48 @@ fn compile_expr(
 
                     // Compile additional args (if any)
                     let mut arg_values = vec![list_val];
+                    for arg in &args[1..] {
+                        arg_values.push(compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            arg,
+                        )?);
+                    }
+
+                    let call = builder.ins().call(func_ref, &arg_values);
+                    return if !builder.func.dfg.inst_results(call).is_empty() {
+                        Ok(builder.func.dfg.first_result(call))
+                    } else {
+                        Ok(builder.ins().iconst(types::I64, 0))
+                    };
+                }
+            }
+
+            // Check for map method calls
+            let map_methods = ["len", "contains", "keys", "values"];
+            if map_methods.contains(&func.as_str()) && !args.is_empty() {
+                // Transform map.method(args) to forge_map_method(map, args)
+                let map_arg = &args[0];
+                let map_val = compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    map_arg,
+                )?;
+
+                let runtime_func_name = format!("forge_map_{}", func);
+                if let Some(&func_id) = runtime_funcs.get(&runtime_func_name) {
+                    let func_ref = module.declare_func_in_func(func_id, builder.func);
+
+                    // Compile additional args (if any)
+                    let mut arg_values = vec![map_val];
                     for arg in &args[1..] {
                         arg_values.push(compile_expr(
                             builder,

@@ -61,6 +61,12 @@ pub enum AstNode {
         elements: Vec<AstNode>,
         elem_type: Option<String>,
     },
+    /// Map literal: {key1: val1, key2: val2}
+    MapLiteral {
+        entries: Vec<(AstNode, AstNode)>, // (key, value) pairs
+        key_type: Option<String>,
+        val_type: Option<String>,
+    },
     /// Index access: list[i] or map[key]
     Index {
         expr: Box<AstNode>,

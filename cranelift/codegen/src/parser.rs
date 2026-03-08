@@ -7,7 +7,7 @@
 //!       body
 //!         ...
 
-use crate::ast::{AstNode, BinaryOp, UnaryOp};
+use crate::ast::{AstNode, BinaryOp, StringInterpPart, UnaryOp};
 use crate::CompileError;
 use std::collections::HashMap;
 
@@ -481,6 +481,7 @@ impl TextAstParser {
                 self.advance();
                 Ok(AstNode::StringLiteral(value))
             }
+            "string_interp" => self.parse_string_interp(),
             "call" => self.parse_call(),
             "ident" => {
                 let name = line
@@ -567,6 +568,44 @@ impl TextAstParser {
         let right = Box::new(self.parse_expression()?);
 
         Ok(AstNode::BinaryOp { op, left, right })
+    }
+
+    /// Parse string interpolation: string_interp (N parts) followed by parts
+    fn parse_string_interp(&mut self) -> Result<AstNode, CompileError> {
+        // Current line is "string_interp (N parts)"
+        let interp_line = self.current().unwrap();
+        let start_indent = interp_line.indent;
+        self.advance();
+
+        let mut parts = Vec::new();
+
+        // Parse each part (lit or ident) until we hit a lower indentation
+        while let Some(line) = self.current() {
+            if line.indent <= start_indent {
+                break;
+            }
+
+            match line.kind.as_str() {
+                "lit" => {
+                    let lit_value = line.value.clone();
+                    parts.push(StringInterpPart::Literal(lit_value));
+                    self.advance();
+                }
+                "ident" => {
+                    let ident_name = line.value.clone();
+                    parts.push(StringInterpPart::Expr(Box::new(AstNode::Identifier(
+                        ident_name,
+                    ))));
+                    self.advance();
+                }
+                _ => {
+                    // Unknown part type, skip it
+                    self.advance();
+                }
+            }
+        }
+
+        Ok(AstNode::StringInterp { parts })
     }
 
     /// Parse method call: obj.method(args)

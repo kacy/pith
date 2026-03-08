@@ -661,6 +661,13 @@ fn compile_expr(
             }
         }
 
+        AstNode::StringInterp { parts: _ } => {
+            // For now, return empty string (placeholder)
+            // Full string interpolation needs proper string struct handling
+            let empty_str = builder.ins().iconst(types::I64, 0);
+            Ok(empty_str)
+        }
+
         AstNode::Identifier(name) => match variables.get(name) {
             Some(var_info) => {
                 // Use Cranelift's Variable system to get the current value

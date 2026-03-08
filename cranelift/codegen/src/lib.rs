@@ -13,6 +13,24 @@ pub mod compiler;
 pub mod linker;
 pub mod parser;
 
+/// Struct field information
+#[derive(Debug, Clone)]
+pub struct StructField {
+    pub name: String,
+    pub ty: String,
+    pub offset: usize,
+    pub size: usize,
+}
+
+/// Struct type information
+#[derive(Debug, Clone)]
+pub struct StructType {
+    pub name: String,
+    pub fields: Vec<StructField>,
+    pub total_size: usize,
+    pub alignment: usize,
+}
+
 /// Code generator state
 pub struct CodeGen {
     /// The Cranelift module being built
@@ -25,6 +43,8 @@ pub struct CodeGen {
     pub variables: HashMap<String, Value>,
     /// Current instruction builder
     pub builder: Option<FunctionBuilder<'static>>, // Will fix lifetime issues
+    /// Struct type registry (name -> struct info)
+    pub struct_types: HashMap<String, StructType>,
 }
 
 /// Result of compilation
@@ -86,6 +106,7 @@ pub fn create_codegen() -> Result<CodeGen, CompileError> {
         current_func: None,
         variables: HashMap::new(),
         builder: None,
+        struct_types: HashMap::new(),
     })
 }
 
@@ -138,6 +159,79 @@ fn declare_runtime_function(
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
 
     Ok(func_id)
+}
+
+/// Calculate the size of a type in bytes
+pub fn type_size(ty: &str) -> usize {
+    match ty {
+        "Int" | "Int64" | "UInt64" => 8,
+        "Int32" | "UInt32" => 4,
+        "Int16" | "UInt16" => 2,
+        "Int8" | "UInt8" | "Bool" => 1,
+        "Float" | "Float64" => 8,
+        "Float32" => 4,
+        "String" => 24, // ForgeString struct size (ptr + len + capacity)
+        "List" => 8,    // Pointer to list implementation
+        "Map" => 8,     // Pointer to map implementation
+        _ => {
+            // Check if it's a struct type (we'll need to look it up)
+            // For now, assume 8 bytes for unknown types
+            8
+        }
+    }
+}
+
+/// Calculate the alignment of a type in bytes
+pub fn type_alignment(ty: &str) -> usize {
+    match ty {
+        "Int" | "Int64" | "UInt64" | "Float" | "Float64" => 8,
+        "Int32" | "UInt32" | "Float32" => 4,
+        "Int16" | "UInt16" => 2,
+        "Int8" | "UInt8" | "Bool" => 1,
+        "String" => 8,
+        "List" | "Map" => 8,
+        _ => 8,
+    }
+}
+
+/// Calculate struct layout given field names and types
+pub fn calculate_struct_layout(name: String, fields: Vec<(String, String)>) -> StructType {
+    let mut struct_fields = Vec::new();
+    let mut current_offset = 0;
+    let mut max_alignment = 1;
+
+    for (field_name, field_type) in fields {
+        let field_size = type_size(&field_type);
+        let field_align = type_alignment(&field_type);
+
+        // Align current_offset to field alignment
+        let padding = (field_align - (current_offset % field_align)) % field_align;
+        current_offset += padding;
+
+        struct_fields.push(StructField {
+            name: field_name,
+            ty: field_type.clone(),
+            offset: current_offset,
+            size: field_size,
+        });
+
+        current_offset += field_size;
+        max_alignment = max_alignment.max(field_align);
+    }
+
+    // Pad struct size to its alignment
+    let total_size = if current_offset % max_alignment != 0 {
+        current_offset + (max_alignment - (current_offset % max_alignment))
+    } else {
+        current_offset
+    };
+
+    StructType {
+        name,
+        fields: struct_fields,
+        total_size,
+        alignment: max_alignment,
+    }
 }
 
 /// Declare all runtime functions needed by the compiler

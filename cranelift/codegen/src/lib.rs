@@ -8,18 +8,20 @@ use cranelift_module::{Module, Linkage, FuncId};
 use cranelift_object::{ObjectModule, ObjectBuilder};
 use std::collections::HashMap;
 
+pub mod ast;
+
 /// Code generator state
 pub struct CodeGen {
     /// The Cranelift module being built
-    module: ObjectModule,
+    pub module: ObjectModule,
     /// Function builder context
-    builder_ctx: FunctionBuilderContext,
+    pub builder_ctx: FunctionBuilderContext,
     /// Current function being compiled
-    current_func: Option<FuncId>,
+    pub current_func: Option<FuncId>,
     /// Variable map (name -> SSA value)
-    variables: HashMap<String, Value>,
+    pub variables: HashMap<String, Value>,
     /// Current instruction builder
-    builder: Option<FunctionBuilder<'static>>, // Will fix lifetime issues
+    pub builder: Option<FunctionBuilder<'static>>, // Will fix lifetime issues
 }
 
 /// Result of compilation

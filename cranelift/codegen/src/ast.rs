@@ -56,6 +56,16 @@ pub enum AstNode {
     Test { name: String, body: Box<AstNode> },
     /// String interpolation: "hello, {name}!"
     StringInterp { parts: Vec<StringInterpPart> },
+    /// List literal: [1, 2, 3]
+    ListLiteral {
+        elements: Vec<AstNode>,
+        elem_type: Option<String>,
+    },
+    /// Index access: list[i] or map[key]
+    Index {
+        expr: Box<AstNode>,
+        index: Box<AstNode>,
+    },
     /// Function declaration
     Function {
         name: String,

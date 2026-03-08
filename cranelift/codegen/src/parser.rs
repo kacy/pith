@@ -295,7 +295,7 @@ impl TextAstParser {
             "if" => self.parse_if(),
             "while" => self.parse_while(),
             "bind" => {
-                // bind name <value> - this is a let statement
+                // bind name <type>? <value> - this is a let statement
                 // Handle case where name includes "mut" marker: "bind i mut"
                 let name = line
                     .value
@@ -304,6 +304,20 @@ impl TextAstParser {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| line.value.clone());
                 self.advance();
+
+                // Check for optional type annotation
+                let _type_annotation = if let Some(type_line) = self.current() {
+                    if type_line.kind == "type" {
+                        let ty = type_line.value.clone();
+                        self.advance();
+                        Some(ty)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
                 let value = self.parse_expression()?;
                 Ok(AstNode::Let {
                     name,
@@ -482,6 +496,7 @@ impl TextAstParser {
                 Ok(AstNode::StringLiteral(value))
             }
             "string_interp" => self.parse_string_interp(),
+            "list" => self.parse_list_literal(),
             "call" => self.parse_call(),
             "ident" => {
                 let name = line
@@ -606,6 +621,32 @@ impl TextAstParser {
         }
 
         Ok(AstNode::StringInterp { parts })
+    }
+
+    /// Parse list literal: list (N items) followed by elements
+    fn parse_list_literal(&mut self) -> Result<AstNode, CompileError> {
+        // Current line is "list (N items)"
+        let list_line = self.current().unwrap();
+        let start_indent = list_line.indent;
+        self.advance();
+
+        let mut elements = Vec::new();
+
+        // Parse each element until we hit a lower indentation
+        while let Some(line) = self.current() {
+            if line.indent <= start_indent {
+                break;
+            }
+
+            // Parse the element expression
+            let elem = self.parse_expression()?;
+            elements.push(elem);
+        }
+
+        Ok(AstNode::ListLiteral {
+            elements,
+            elem_type: None,
+        })
     }
 
     /// Parse method call: obj.method(args)

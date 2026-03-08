@@ -668,6 +668,59 @@ fn compile_expr(
             Ok(empty_str)
         }
 
+        AstNode::ListLiteral {
+            elements,
+            elem_type: _,
+        } => {
+            // Create a new list and populate it with elements
+            // For simplicity, assume list of Ints (I64) for now
+            let elem_size = 8i64; // sizeof(i64)
+            let type_tag = 0i32; // Primitive type
+
+            // Call forge_list_new(elem_size, type_tag)
+            let list_new_func = runtime_funcs
+                .get("forge_list_new")
+                .ok_or_else(|| CompileError::UnknownFunction("forge_list_new".to_string()))?;
+            let list_new_ref = module.declare_func_in_func(*list_new_func, builder.func);
+            let elem_size_val = builder.ins().iconst(types::I64, elem_size);
+            let type_tag_val = builder.ins().iconst(types::I32, type_tag as i64);
+            let new_call = builder
+                .ins()
+                .call(list_new_ref, &[elem_size_val, type_tag_val]);
+            let list_val = builder.func.dfg.first_result(new_call);
+
+            // Push each element to the list
+            let push_func = runtime_funcs
+                .get("forge_list_push")
+                .ok_or_else(|| CompileError::UnknownFunction("forge_list_push".to_string()))?;
+            let push_ref = module.declare_func_in_func(*push_func, builder.func);
+
+            for elem in elements {
+                let elem_val = compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    elem,
+                )?;
+                // Store elem_val to stack and pass pointer
+                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    3, // align_shift = 8 bytes
+                ));
+                let elem_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+                builder.ins().store(MemFlags::new(), elem_val, elem_ptr, 0);
+                builder
+                    .ins()
+                    .call(push_ref, &[list_val, elem_ptr, elem_size_val]);
+            }
+
+            Ok(list_val)
+        }
+
         AstNode::Identifier(name) => match variables.get(name) {
             Some(var_info) => {
                 // Use Cranelift's Variable system to get the current value
@@ -838,6 +891,48 @@ fn compile_expr(
         }
 
         AstNode::Call { func, args } => {
+            // Check for list method calls
+            let list_methods = ["len", "push", "pop", "get", "set"];
+            if list_methods.contains(&func.as_str()) && !args.is_empty() {
+                // Transform list.method(args) to forge_list_method(list, args)
+                let list_arg = &args[0];
+                let list_val = compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    list_arg,
+                )?;
+
+                let runtime_func_name = format!("forge_list_{}", func);
+                if let Some(&func_id) = runtime_funcs.get(&runtime_func_name) {
+                    let func_ref = module.declare_func_in_func(func_id, builder.func);
+
+                    // Compile additional args (if any)
+                    let mut arg_values = vec![list_val];
+                    for arg in &args[1..] {
+                        arg_values.push(compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            arg,
+                        )?);
+                    }
+
+                    let call = builder.ins().call(func_ref, &arg_values);
+                    return if !builder.func.dfg.inst_results(call).is_empty() {
+                        Ok(builder.func.dfg.first_result(call))
+                    } else {
+                        Ok(builder.ins().iconst(types::I64, 0))
+                    };
+                }
+            }
+
             // Use forge_print_cstr for all print calls (expects just a pointer)
             let func_name = if func == "print" {
                 "forge_print_cstr"

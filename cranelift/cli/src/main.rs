@@ -53,7 +53,7 @@ fn main() {
 
 fn build_file(path: &str) {
     use forge_codegen::parser::parse_file;
-    use forge_codegen::ast::compile_function;
+    use forge_codegen::compiler::compile_module;
     use forge_codegen::create_codegen;
     use forge_codegen::finalize_module;
     use forge_codegen::linker::build_executable;
@@ -68,43 +68,33 @@ fn build_file(path: &str) {
             // Create codegen
             match create_codegen() {
                 Ok(mut codegen) => {
-                    // Compile each function
-                    let mut compiled = 0;
-                    for node in ast_nodes {
-                        if let forge_codegen::ast::AstNode::Function { name, params, return_type, body } = node {
-                            match compile_function(&mut codegen, &name, &params, &return_type, &body) {
-                                Ok(func_id) => {
-                                    println!("  Compiled function '{}' (ID: {:?})", name, func_id);
-                                    compiled += 1;
-                                }
-                                Err(e) => {
-                                    eprintln!("  Error compiling '{}': {}", name, e);
-                                }
-                            }
-                        }
-                    }
-                    
-                    println!("Compiled {} functions", compiled);
-                    
-                    // Finalize and write object file
-                    match finalize_module(codegen.module) {
-                        Ok(bytes) => {
-                            let obj_path = path.replace(".fg", ".o");
-                            match fs::write(&obj_path, &bytes) {
-                                Ok(_) => {
-                                    println!("Written {} ({} bytes)", obj_path, bytes.len());
-                                    
-                                    // Link to create executable
-                                    let exe_path = path.replace(".fg", "");
-                                    match build_executable(&obj_path, &exe_path) {
-                                        Ok(_) => println!("Created executable: {}", exe_path),
-                                        Err(e) => eprintln!("Error linking: {}", e),
+                    // Compile all functions with two-pass approach
+                    match compile_module(&mut codegen, ast_nodes) {
+                        Ok(funcs) => {
+                            println!("Compiled {} functions", funcs.len());
+                            
+                            // Finalize and write object file
+                            match finalize_module(codegen.module) {
+                                Ok(bytes) => {
+                                    let obj_path = path.replace(".fg", ".o");
+                                    match fs::write(&obj_path, &bytes) {
+                                        Ok(_) => {
+                                            println!("Written {} ({} bytes)", obj_path, bytes.len());
+                                            
+                                            // Link to create executable
+                                            let exe_path = path.replace(".fg", "");
+                                            match build_executable(&obj_path, &exe_path) {
+                                                Ok(_) => println!("Created executable: {}", exe_path),
+                                                Err(e) => eprintln!("Error linking: {}", e),
+                                            }
+                                        }
+                                        Err(e) => eprintln!("Error writing object file: {}", e),
                                     }
                                 }
-                                Err(e) => eprintln!("Error writing object file: {}", e),
+                                Err(e) => eprintln!("Error finalizing module: {}", e),
                             }
                         }
-                        Err(e) => eprintln!("Error finalizing module: {}", e),
+                        Err(e) => eprintln!("Error compiling module: {}", e),
                     }
                 }
                 Err(e) => eprintln!("Error creating codegen: {}", e),

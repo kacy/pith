@@ -9,6 +9,7 @@ use cranelift_object::{ObjectModule, ObjectBuilder};
 use std::collections::HashMap;
 
 pub mod ast;
+pub mod compiler;
 pub mod linker;
 pub mod parser;
 

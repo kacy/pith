@@ -131,6 +131,7 @@ impl TextAstParser {
         // Parse function contents
         let mut params = Vec::new();
         let mut body = None;
+        let mut return_type = "Void".to_string();
         
         while let Some(line) = self.current() {
             if line.indent <= indent {
@@ -138,6 +139,33 @@ impl TextAstParser {
             }
             
             match line.kind.as_str() {
+                "param" => {
+                    let param_name = line.value.clone();
+                    self.advance();
+                    // Parse type if present
+                    let param_type = if let Some(type_line) = self.current() {
+                        if type_line.kind == "type" {
+                            let ty = type_line.value.clone();
+                            self.advance();
+                            ty
+                        } else {
+                            "Int".to_string() // Default
+                        }
+                    } else {
+                        "Int".to_string() // Default
+                    };
+                    params.push((param_name, param_type));
+                }
+                "returns" => {
+                    self.advance();
+                    // Parse return type if present
+                    if let Some(type_line) = self.current() {
+                        if type_line.kind == "type" {
+                            return_type = type_line.value.clone();
+                            self.advance();
+                        }
+                    }
+                }
                 "body" => {
                     self.advance();
                     body = Some(self.parse_body()?);
@@ -154,7 +182,7 @@ impl TextAstParser {
         Ok(AstNode::Function {
             name,
             params,
-            return_type: "Void".to_string(),
+            return_type,
             body: Box::new(body_node),
         })
     }
@@ -197,9 +225,14 @@ impl TextAstParser {
                 }
             }
             "bind" => {
-                // This is the actual binding name, skip to value
+                // bind name <value> - this is a let statement
+                let name = line.value.clone();
                 self.advance();
-                self.parse_expression()
+                let value = self.parse_expression()?;
+                Ok(AstNode::Let {
+                    name,
+                    value: Box::new(value),
+                })
             }
             "call" => self.parse_call(),
             _ => self.parse_expression(),
@@ -313,6 +346,7 @@ impl TextAstParser {
                 self.advance();
                 Ok(AstNode::StringLiteral(value))
             }
+            "call" => self.parse_call(),
             "ident" => {
                 let name = line.value.clone();
                 self.advance();

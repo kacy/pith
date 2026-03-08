@@ -8,10 +8,10 @@ coding agents can read the errors, apply fixes, and iterate — fast.
 
 **status:** the compiler self-hosts — forge is written in forge. the
 self-hosted compiler compiles itself and produces identical output across
-stages. all 40 example programs compile and run. the CLI handles 17 commands:
-build, run, test, check, fmt, lint, lex, parse, doc, and more. 13 standard
-library modules cover I/O, networking, encoding, hashing, JSON, TOML, and
-process management.
+stages. all 51 example programs compile and run. the CLI handles 17 commands:
+build, run, test, check, fmt, lint, lex, parse, doc, and more. 16 standard
+library modules cover I/O, networking, encoding, hashing, JSON, TOML,
+process management, and more.
 
 ## quick start
 
@@ -83,19 +83,22 @@ fn main():
 ## what works today
 
 the self-hosted compiler handles the full pipeline: lex → parse → check →
-codegen. all 40 example programs compile to native binaries via C
+codegen. all 51 example programs compile to native binaries via C
 transpilation.
 
 **language features:**
 - function declarations, typed parameters, return types, calls
 - struct declarations with typed fields, field access, constructors
 - enum declarations with variant data
+- interface declarations with method signatures
+- impl blocks for structs with method implementations
+- generic types, generic functions, and generic interfaces with bounds
 - variable bindings with type inference (`x := 42`)
 - mutability enforcement (`mut` required for reassignment)
-- if/elif/else, while, for loops over collections with scoping
+- if/elif/else, while, for loops over collections and strings with scoping
 - binary operators: arithmetic, comparison, logical, string concatenation
 - unary operators: negate, not
-- string interpolation
+- string interpolation and character iteration (`for c in string`)
 - return type checking
 - match expressions with exhaustiveness checking
 - method calls and impl blocks
@@ -108,9 +111,9 @@ transpilation.
 - tuples with field access (`t.0`, `t.1`)
 - type aliases
 - concurrency: spawn/await, Task[T], Mutex, WaitGroup, Semaphore, Channel
-- multi-module imports
+- multi-module imports with `from ... import`
 
-**standard library (13 modules):**
+**standard library (16 modules):**
 - string methods, type conversions, math builtins
 - file I/O, env, args, exit, exec
 - collection methods (push, remove, contains, keys, values, reverse, etc.)
@@ -118,7 +121,14 @@ transpilation.
 - std.net.tcp, std.net.dns, std.net.url — networking
 - std.hash, std.encoding — SHA-256, FNV-1a, base64, hex
 - std.os.path, std.os.process — path manipulation, child processes
-- std.log, std.fmt, std.fs, std.math — logging, formatting, file ops
+- std.log, std.fmt, std.fs, std.math — logging, formatting, file ops, math
+
+**memory management:**
+- complete automatic reference counting (ARC) for all heap-allocated types
+- string ARC with retain/release
+- collection ARC for List, Map, Set
+- closure ARC for lambda environments
+- cycle collection with periodic mark-and-scan algorithm
 
 **error codes:** every diagnostic has a stable code — E0xx (lexer),
 E1xx (parser), E2xx (checker), E3xx (lint). see `docs/errors.md` for the

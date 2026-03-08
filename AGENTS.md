@@ -119,7 +119,6 @@ docs/errors.md       error code reference (E0xx–E3xx)
 
 - collections passed to functions are copies — mutations don't propagate back
 - `{`/`}` in string literals trigger interpolation — use `chr(123)`/`chr(125)`
-- `for c in string` not supported — use `while i < s.len(): s[i]`
 
 ## ARC (Automatic Reference Counting) status
 

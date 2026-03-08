@@ -347,9 +347,14 @@ error[E231]: return statement outside of function
 
 a `spawn` or `await` expression has a type error.
 
-### E233 — not yet supported
+### E233 — type nesting too deep
 
-a language feature is recognized but not yet implemented in the checker.
+type declarations are nested too deeply (exceeds the compiler's recursion limit).
+this usually happens with deeply nested generic types or recursive type definitions.
+
+```
+error[E233]: type nesting too deep
+```
 
 ### E234 — import not found
 

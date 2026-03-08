@@ -134,7 +134,7 @@ run-examples-self: self-host
 		fi; \
 	done; \
 	echo "--- non-deterministic examples (self-hosted, exit code only) ---"; \
-	for name in stdlib_new file_io iteration operators fs_ops time_rand tcp_echo channels process_ops arc_string_stress arc_scope_test; do \
+	for name in stdlib_new file_io iteration operators fs_ops time_rand tcp_echo channels process_ops arc_string_stress arc_scope_test arc_closure_stress; do \
 		timeout 15 ./self-host/forge_main run "examples/$$name.fg" >/dev/null 2>&1; \
 		if [ $$? -eq 0 ]; then \
 			echo "ok   $$name"; \

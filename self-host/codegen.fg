@@ -255,9 +255,15 @@ fn is_set_type(tid: Int) -> Bool:
         return info.kind == "set"
     return false
 
-# check if a type needs reference counting (strings, lists, maps)
-# For collections, we return true if the collection itself needs RC (always true for now)
-# OR if any of its element types need RC
+# check if a type is a function/closure type
+fn is_function_type(tid: Int) -> Bool:
+    if tid >= 0 and tid < get_type_count():
+        info := get_type_info(tid)
+        return info.kind == "function"
+    return false
+
+# check if a type needs reference counting (strings, lists, maps, closures)
+# For collections and closures, we return true if the type itself needs RC
 fn type_needs_reference_counting(tid: Int) -> Bool:
     if tid == TID_STRING:
         return true
@@ -267,13 +273,15 @@ fn type_needs_reference_counting(tid: Int) -> Bool:
             info := get_type_info(tid)
             if info.kind == "list":
                 # List always needs RC (it's heap allocated)
-                # Also check if inner type needs RC for element management
                 return true
             if info.kind == "map":
                 # Map always needs RC
                 return true
             if info.kind == "set":
                 # Set always needs RC
+                return true
+            if info.kind == "function":
+                # Closures need RC (capturing lambdas have heap-allocated environments)
                 return true
     return false
 
@@ -300,6 +308,12 @@ fn emit_retain_call(name: String, tid: Int):
         emit_code("forge_list_retain(&")
         emit_code(name)
         emit_code(");\n")
+    elif is_function_type(tid):
+        # Closures need RC for their captured environment
+        write_indent()
+        emit_code("forge_closure_retain(&")
+        emit_code(name)
+        emit_code(");\n")
 
 # emit release call for a variable
 fn emit_release_call(name: String, tid: Int):
@@ -322,6 +336,12 @@ fn emit_release_call(name: String, tid: Int):
         # Sets use list implementation
         write_indent()
         emit_code("forge_list_release(&")
+        emit_code(name)
+        emit_code(");\n")
+    elif is_function_type(tid):
+        # Closures need RC for their captured environment
+        write_indent()
+        emit_code("forge_closure_release(&")
         emit_code(name)
         emit_code(");\n")
 
@@ -3788,16 +3808,17 @@ fn emit_lambda(node_idx: Int):
     lambda_capture_counts.push(cap_count)
     lambda_capture_offsets.push(cap_offset)
     if cap_count > 0:
-        # capturing lambda: heap-allocate env struct, build closure
+        # capturing lambda: heap-allocate env struct with RC header, build closure
         emit_code("(__extension__(" + LB + " __closure_env_")
         emit_code(idx.to_string())
         emit_code(" *__env_")
         emit_code(idx.to_string())
         emit_code(" = (__closure_env_")
         emit_code(idx.to_string())
-        emit_code(" *)malloc(sizeof(__closure_env_")
+        # Use RC allocation instead of plain malloc
+        emit_code(" *)forge_rc_alloc(sizeof(__closure_env_")
         emit_code(idx.to_string())
-        emit_code(")); ")
+        emit_code("), FORGE_TYPE_CLOSURE); ")
         # fill in captured variable values
         mut ci := 0
         while ci < cap_count:

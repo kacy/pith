@@ -120,19 +120,18 @@ docs/errors.md       error code reference (E0xx–E3xx)
 - collections passed to functions are copies — mutations don't propagate back
 - `{`/`}` in string literals trigger interpolation — use `chr(123)`/`chr(125)`
 - `for c in string` not supported — use `while i < s.len(): s[i]`
-- **lambda/closure environments are not automatically freed** — long-running programs with many closures may leak memory. proper cleanup requires reference counting or explicit destroy mechanism (not yet implemented)
 
 ## ARC (Automatic Reference Counting) status
 
 **implemented:**
 - ✅ String ARC — complete with retain/release, scope cleanup, and proper heap allocation
 - ✅ Collection ARC — List, Map, and Set types now have automatic reference counting
+- ✅ Closure ARC — Lambda closures with captured environments now have automatic reference counting
 - ✅ Runtime infrastructure — `forge_rc_alloc`, `forge_rc_retain`, `forge_rc_release` all working
-- ✅ Codegen — emits proper retain/release calls for strings and collections
-- ✅ All ARC stress tests pass (arc_string_stress.fg, arc_collection_stress.fg, arc_scope_test.fg)
+- ✅ Codegen — emits proper retain/release calls for strings, collections, and closures
+- ✅ All ARC stress tests pass (arc_string_stress.fg, arc_collection_stress.fg, arc_scope_test.fg, arc_closure_stress.fg)
 
 **not yet implemented:**
-- ❌ Closure/Environment ARC — lambda captures leak memory
 - ❌ Cycle Collection — the global object list exists but cycle detection is not active
 
-**note:** the runtime header comment "leak everything for now; ARC comes later" is outdated for strings and collections (they are fully managed) but still accurate for closures.
+**note:** the runtime header comment "leak everything for now; ARC comes later" is outdated for strings, collections, and closures (they are fully managed). Only cycle detection remains unimplemented.

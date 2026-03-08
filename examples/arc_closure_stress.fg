@@ -1,0 +1,58 @@
+# ARC stress test: Closure churn
+# Creates and destroys closures with captured variables
+# NOTE: This uses the short lambda syntax (=>) which is currently working
+
+fn apply(x: Int, f: fn(Int) -> Int) -> Int:
+    return f(x)
+
+fn main():
+    print("ARC Closure Stress Test")
+    print("Closure ARC is now implemented!")
+
+    # Test 1: Simple lambda with Int capture using short syntax
+    print("Test 1: Int-capturing lambdas (100 iterations)")
+    mut i := 0
+    while i < 100:
+        y := 5
+        result := apply(10, fn(x: Int) => x + y)
+        # Lambda should be released when scope ends
+        i = i + 1
+    print("Test 1 complete")
+
+    # Test 2: Lambda stored in binding
+    print("Test 2: Lambda in binding (100 iterations)")
+    i = 0
+    while i < 100:
+        offset := 100
+        adder := fn(x: Int) => x + offset
+        result := apply(42, adder)
+        # adder should be released
+        i = i + 1
+    print("Test 2 complete")
+
+    # Test 3: Multiple lambdas in scope
+    print("Test 3: Multiple lambdas (50 iterations)")
+    i = 0
+    while i < 50:
+        a := 10
+        b := 20
+        add_a := fn(x: Int) => x + a
+        add_b := fn(x: Int) => x + b
+        result_a := apply(5, add_a)
+        result_b := apply(5, add_b)
+        # Both lambdas should be released
+        i = i + 1
+    print("Test 3 complete")
+
+    # Test 4: Lambda passed directly (no binding)
+    print("Test 4: Direct lambda usage (100 iterations)")
+    i = 0
+    while i < 100:
+        multiplier := 3
+        result := apply(7, fn(x: Int) => x * multiplier)
+        # Lambda should be released after call
+        i = i + 1
+    print("Test 4 complete")
+
+    print("Closure stress tests complete")
+    print("All closures should be properly freed via ARC")

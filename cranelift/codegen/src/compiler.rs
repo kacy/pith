@@ -283,11 +283,12 @@ fn compile_expr(
                               matches!(right.as_ref(), AstNode::StringLiteral(_));
             
             if is_string_op && matches!(op, BinaryOp::Add) {
-                // String concatenation - call runtime
+                // String concatenation - for now just return left operand
+                // (Proper implementation needs struct passing)
                 let left_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, left)?;
-                let right_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, right)?;
+                let _right_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, right)?;
                 
-                // For now, just return left operand (TODO: implement concat)
+                // Just return left for now
                 Ok(left_val)
             } else {
                 // Regular integer arithmetic
@@ -325,20 +326,14 @@ fn compile_expr(
         }
         
         AstNode::Call { func, args } => {
-            // Special handling for print with string literals
-            let (func_name, use_cstr) = if func == "print" && args.len() == 1 {
-                if let AstNode::StringLiteral(_) = &args[0] {
-                    ("forge_print_cstr", true)
-                } else {
-                    ("forge_print", false)
-                }
+            // Use forge_print_cstr for all print calls (expects just a pointer)
+            let func_name = if func == "print" {
+                "forge_print_cstr"
             } else {
-                let runtime_name = match func.as_str() {
-                    "print" => "forge_print",
+                match func.as_str() {
                     "print_int" => "forge_print_int",
                     _ => func,
-                };
-                (runtime_name, false)
+                }
             };
             
             let func_id = runtime_funcs.get(func_name)

@@ -62,6 +62,11 @@ pub enum AstNode {
     },
     /// Return statement: return value
     Return(Option<Box<AstNode>>),
+    /// Import statement: from module import names
+    Import {
+        module: String,
+        names: Vec<String>,
+    },
     /// Function declaration
     Function {
         name: String,

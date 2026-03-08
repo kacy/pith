@@ -297,6 +297,80 @@ pub fn declare_runtime_functions(module: &mut ObjectModule) -> Result<HashMap<St
     )?;
     funcs.insert("bit_not".to_string(), bit_not);
     
+    // Math functions
+    let abs = declare_runtime_function(
+        module,
+        "forge_abs",
+        &[types::I64],
+        &[types::I64],
+    )?;
+    funcs.insert("abs".to_string(), abs);
+    
+    let min = declare_runtime_function(
+        module,
+        "forge_min",
+        &[types::I64, types::I64],
+        &[types::I64],
+    )?;
+    funcs.insert("min".to_string(), min);
+    
+    let max = declare_runtime_function(
+        module,
+        "forge_max",
+        &[types::I64, types::I64],
+        &[types::I64],
+    )?;
+    funcs.insert("max".to_string(), max);
+    
+    let clamp = declare_runtime_function(
+        module,
+        "forge_clamp",
+        &[types::I64, types::I64, types::I64],
+        &[types::I64],
+    )?;
+    funcs.insert("clamp".to_string(), clamp);
+    
+    // Float math functions
+    let pow = declare_runtime_function(
+        module,
+        "forge_pow",
+        &[types::F64, types::F64],
+        &[types::F64],
+    )?;
+    funcs.insert("pow".to_string(), pow);
+    
+    let sqrt = declare_runtime_function(
+        module,
+        "forge_sqrt",
+        &[types::F64],
+        &[types::F64],
+    )?;
+    funcs.insert("sqrt".to_string(), sqrt);
+    
+    let floor = declare_runtime_function(
+        module,
+        "forge_floor",
+        &[types::F64],
+        &[types::F64],
+    )?;
+    funcs.insert("floor".to_string(), floor);
+    
+    let ceil = declare_runtime_function(
+        module,
+        "forge_ceil",
+        &[types::F64],
+        &[types::F64],
+    )?;
+    funcs.insert("ceil".to_string(), ceil);
+    
+    let round = declare_runtime_function(
+        module,
+        "forge_round",
+        &[types::F64],
+        &[types::F64],
+    )?;
+    funcs.insert("round".to_string(), round);
+    
     // List functions
     let list_new = declare_runtime_function(
         module,

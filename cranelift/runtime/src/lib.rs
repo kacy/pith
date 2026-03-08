@@ -262,6 +262,60 @@ pub extern "C" fn forge_bit_shr(a: i64, b: i64) -> i64 {
     a >> b
 }
 
+/// Absolute value
+#[no_mangle]
+pub extern "C" fn forge_abs(n: i64) -> i64 {
+    n.abs()
+}
+
+/// Minimum of two values
+#[no_mangle]
+pub extern "C" fn forge_min(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+/// Maximum of two values
+#[no_mangle]
+pub extern "C" fn forge_max(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+/// Clamp value between min and max
+#[no_mangle]
+pub extern "C" fn forge_clamp(n: i64, min: i64, max: i64) -> i64 {
+    if n < min { min } else if n > max { max } else { n }
+}
+
+/// Power: a^b (floating point)
+#[no_mangle]
+pub extern "C" fn forge_pow(a: f64, b: f64) -> f64 {
+    a.powf(b)
+}
+
+/// Square root
+#[no_mangle]
+pub extern "C" fn forge_sqrt(n: f64) -> f64 {
+    n.sqrt()
+}
+
+/// Floor
+#[no_mangle]
+pub extern "C" fn forge_floor(n: f64) -> f64 {
+    n.floor()
+}
+
+/// Ceiling
+#[no_mangle]
+pub extern "C" fn forge_ceil(n: f64) -> f64 {
+    n.ceil()
+}
+
+/// Round
+#[no_mangle]
+pub extern "C" fn forge_round(n: f64) -> f64 {
+    n.round()
+}
+
 /// Convert int to C string (returns pointer, caller must free with forge_free)
 #[no_mangle]
 pub unsafe extern "C" fn forge_int_to_cstr(n: i64) -> *mut i8 {

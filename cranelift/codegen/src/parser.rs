@@ -111,6 +111,7 @@ impl TextAstParser {
         
         match line.kind.as_str() {
             "fn" => self.parse_function(),
+            "from" => self.parse_import(),
             "pub" => {
                 self.advance();
                 self.parse_top_level()
@@ -185,6 +186,33 @@ impl TextAstParser {
             return_type,
             body: Box::new(body_node),
         })
+    }
+    
+    /// Parse an import declaration: from module import name1, name2, ...
+    fn parse_import(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().unwrap();
+        let content = line.value.clone();
+        self.advance();
+        
+        // Parse format: "module import name1, name2, ..."
+        let parts: Vec<&str> = content.split(" import ").collect();
+        if parts.len() != 2 {
+            return Err(CompileError::UnsupportedFeature(
+                format!("Invalid import syntax: {}", content)
+            ));
+        }
+        
+        let module = parts[0].trim().to_string();
+        let names_str = parts[1].trim();
+        
+        // Parse comma-separated names
+        let names: Vec<String> = names_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        
+        Ok(AstNode::Import { module, names })
     }
     
     /// Parse function body

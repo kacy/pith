@@ -280,6 +280,12 @@ fn compile_stmt(
             }
         }
         
+        AstNode::Import { .. } => {
+            // Import statements are handled at module level, not in function body
+            // For now, just skip them
+            Ok(false)
+        }
+        
         _ => {
             compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, node)?;
             Ok(false)
@@ -298,6 +304,8 @@ fn compile_expr(
 ) -> Result<Value, CompileError> {
     match node {
         AstNode::IntLiteral(n) => Ok(builder.ins().iconst(types::I64, *n)),
+        
+        AstNode::FloatLiteral(f) => Ok(builder.ins().f64const(*f)),
         
         AstNode::StringLiteral(s) => {
             // Call the string data function to get the address

@@ -148,6 +148,21 @@ pub unsafe extern "C" fn forge_string_release(s: ForgeString) {
     dealloc(s.ptr as *mut u8, layout);
 }
 
+/// Destructor for string elements in collections
+/// 
+/// Called by cycle collector when freeing cyclic string objects
+#[no_mangle]
+pub extern "C" fn forge_string_destructor(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    
+    unsafe {
+        let s = ptr as *const ForgeString;
+        forge_string_release(*s);
+    }
+}
+
 /// Concatenate two strings
 #[no_mangle]
 pub unsafe extern "C" fn forge_string_concat(a: ForgeString, b: ForgeString) -> ForgeString {

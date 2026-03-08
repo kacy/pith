@@ -9,8 +9,8 @@ use crate::string::{ForgeString, forge_string_retain, forge_string_release};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ForgeList {
-    /// Pointer to internal list implementation
-    ptr: *mut (),
+    /// Pointer to internal list implementation (pub for cross-module access)
+    pub ptr: *mut (),
 }
 
 /// Internal list implementation using idiomatic Rust
@@ -451,5 +451,20 @@ pub unsafe extern "C" fn forge_list_release_all_strings(list: ForgeList) {
         let elem = impl_ref.get(i).unwrap();
         let s = elem.as_ptr() as *const ForgeString;
         forge_string_release(*s);
+    }
+}
+
+/// Destructor for list elements in collections
+/// 
+/// Called by cycle collector when freeing cyclic list objects
+#[no_mangle]
+pub extern "C" fn forge_list_destructor(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    
+    unsafe {
+        let list = ptr as *const ForgeList;
+        forge_list_release(*list);
     }
 }

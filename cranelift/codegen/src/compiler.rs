@@ -1129,66 +1129,79 @@ fn compile_expr(
         }
 
         AstNode::Call { func, args } => {
-            // Check for string method calls FIRST (before list methods, since "len" overlaps)
-            let string_methods = [
-                "len",
-                "contains",
-                "substring",
-                "trim",
-                "starts_with",
-                "ends_with",
-            ];
-            if string_methods.contains(&func.as_str()) && !args.is_empty() {
-                // Transform string.method(args) to forge_string_method(string, args)
-                let string_arg = &args[0];
-                let string_val = compile_expr(
-                    builder,
-                    variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
-                    module,
-                    string_arg,
-                )?;
+            // Check if this is a method call on a list literal
+            if !args.is_empty() {
+                let first_arg = &args[0];
+                let is_list_literal = matches!(first_arg, AstNode::ListLiteral { .. });
+                let is_string_literal = matches!(
+                    first_arg,
+                    AstNode::StringLiteral(_) | AstNode::StringInterp { .. }
+                );
 
-                // Special case: use simple strlen for .len() on raw strings
-                if func == "len" {
-                    if let Some(&len_func_id) = runtime_funcs.get("forge_cstring_len") {
-                        let len_func_ref = module.declare_func_in_func(len_func_id, builder.func);
-                        let call = builder.ins().call(len_func_ref, &[string_val]);
-                        return Ok(builder.func.dfg.first_result(call));
-                    }
-                }
-
-                let runtime_func_name = format!("forge_string_{}", func);
-                if let Some(&func_id) = runtime_funcs.get(&runtime_func_name) {
-                    let func_ref = module.declare_func_in_func(func_id, builder.func);
-
-                    // Compile additional args (if any)
-                    let mut arg_values = vec![string_val];
-                    for arg in &args[1..] {
-                        let arg_val = compile_expr(
+                // If calling .len() on a list literal, use list method
+                if is_list_literal && func == "len" {
+                    // Fall through to list method check below
+                } else if is_string_literal {
+                    // Check for string method calls on string literals
+                    let string_methods = [
+                        "len",
+                        "contains",
+                        "substring",
+                        "trim",
+                        "starts_with",
+                        "ends_with",
+                    ];
+                    if string_methods.contains(&func.as_str()) {
+                        let string_arg = &args[0];
+                        let string_val = compile_expr(
                             builder,
                             variables,
                             runtime_funcs,
                             declared_funcs,
                             string_funcs,
                             module,
-                            arg,
+                            string_arg,
                         )?;
-                        arg_values.push(arg_val);
-                    }
 
-                    let call = builder.ins().call(func_ref, &arg_values);
-                    return if !builder.func.dfg.inst_results(call).is_empty() {
-                        Ok(builder.func.dfg.first_result(call))
-                    } else {
-                        Ok(builder.ins().iconst(types::I64, 0))
-                    };
+                        // Special case: use simple strlen for .len() on raw strings
+                        if func == "len" {
+                            if let Some(&len_func_id) = runtime_funcs.get("forge_cstring_len") {
+                                let len_func_ref =
+                                    module.declare_func_in_func(len_func_id, builder.func);
+                                let call = builder.ins().call(len_func_ref, &[string_val]);
+                                return Ok(builder.func.dfg.first_result(call));
+                            }
+                        }
+
+                        let runtime_func_name = format!("forge_string_{}", func);
+                        if let Some(&func_id) = runtime_funcs.get(&runtime_func_name) {
+                            let func_ref = module.declare_func_in_func(func_id, builder.func);
+
+                            let mut arg_values = vec![string_val];
+                            for arg in &args[1..] {
+                                arg_values.push(compile_expr(
+                                    builder,
+                                    variables,
+                                    runtime_funcs,
+                                    declared_funcs,
+                                    string_funcs,
+                                    module,
+                                    arg,
+                                )?);
+                            }
+
+                            let call = builder.ins().call(func_ref, &arg_values);
+                            return if !builder.func.dfg.inst_results(call).is_empty() {
+                                Ok(builder.func.dfg.first_result(call))
+                            } else {
+                                Ok(builder.ins().iconst(types::I64, 0))
+                            };
+                        }
+                    }
                 }
             }
 
-            // Check for list method calls
+            // Check for list method calls (includes fallback for variables)
             let list_methods = ["len", "push", "pop", "get", "set"];
             if list_methods.contains(&func.as_str()) && !args.is_empty() {
                 // Transform list.method(args) to forge_list_method(list, args)

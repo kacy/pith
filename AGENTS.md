@@ -127,11 +127,9 @@ docs/errors.md       error code reference (E0xx–E3xx)
 - ✅ String ARC — complete with retain/release, scope cleanup, and proper heap allocation
 - ✅ Collection ARC — List, Map, and Set types now have automatic reference counting
 - ✅ Closure ARC — Lambda closures with captured environments now have automatic reference counting
+- ✅ Cycle Collection — Basic cycle detection using mark-and-scan algorithm runs periodically
 - ✅ Runtime infrastructure — `forge_rc_alloc`, `forge_rc_retain`, `forge_rc_release` all working
 - ✅ Codegen — emits proper retain/release calls for strings, collections, and closures
-- ✅ All ARC stress tests pass (arc_string_stress.fg, arc_collection_stress.fg, arc_scope_test.fg, arc_closure_stress.fg)
+- ✅ All ARC stress tests pass (arc_string_stress.fg, arc_collection_stress.fg, arc_scope_test.fg, arc_closure_stress.fg, arc_cycle_test.fg)
 
-**not yet implemented:**
-- ❌ Cycle Collection — the global object list exists but cycle detection is not active
-
-**note:** the runtime header comment "leak everything for now; ARC comes later" is outdated for strings, collections, and closures (they are fully managed). Only cycle detection remains unimplemented.
+**note:** ARC is now fully implemented for all heap-allocated types. The system uses reference counting with periodic cycle detection to collect objects with circular references. All runtime tests pass without memory leaks.

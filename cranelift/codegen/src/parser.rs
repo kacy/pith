@@ -301,8 +301,38 @@ impl TextAstParser {
                 })
             }
             "call" => self.parse_call(),
+            "assign" => self.parse_assign(),
             _ => self.parse_expression(),
         }
+    }
+
+    /// Parse assignment: assign = <name> <value>
+    fn parse_assign(&mut self) -> Result<AstNode, CompileError> {
+        // Current line is "assign ="
+        self.advance();
+
+        // Parse variable name
+        let name_line = self.current().ok_or_else(|| {
+            CompileError::UnsupportedFeature("Expected variable name in assign".to_string())
+        })?;
+
+        if name_line.kind != "ident" {
+            return Err(CompileError::UnsupportedFeature(format!(
+                "Expected 'ident' in assign, got '{}'",
+                name_line.kind
+            )));
+        }
+
+        let name = name_line.value.clone();
+        self.advance();
+
+        // Parse value
+        let value = self.parse_expression()?;
+
+        Ok(AstNode::Assign {
+            name,
+            value: Box::new(value),
+        })
     }
 
     /// Parse let statement: let name = value

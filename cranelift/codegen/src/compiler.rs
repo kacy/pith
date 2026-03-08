@@ -9,11 +9,22 @@ use cranelift::prelude::*;
 use cranelift_module::{FuncId, Linkage, Module};
 use std::collections::HashMap;
 
-/// Local variable slot
+/// Local variable slot using Cranelift's Variable system for SSA
 #[derive(Debug)]
 pub struct LocalVar {
-    pub value: Value,
+    pub var: Variable,
     pub ty: Type,
+}
+
+/// Variable counter for generating unique variable indices
+static mut VAR_COUNTER: u32 = 0;
+
+fn next_variable() -> Variable {
+    unsafe {
+        let var = Variable::from_u32(VAR_COUNTER);
+        VAR_COUNTER += 1;
+        var
+    }
 }
 
 /// Collect all string literals from AST
@@ -216,17 +227,18 @@ fn compile_function_body(
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
 
-        let block_params = builder.block_params(entry_block);
+        // Collect block params into a Vec to avoid borrow issues
+        let block_params: Vec<Value> = builder.block_params(entry_block).to_vec();
         for (i, (param_name, param_ty)) in params.iter().enumerate() {
             let param_val = block_params[i];
             let ty = forge_type_to_cranelift(param_ty);
-            variables.insert(
-                param_name.clone(),
-                LocalVar {
-                    value: param_val,
-                    ty,
-                },
-            );
+
+            // Create a variable for this parameter
+            let var = next_variable();
+            builder.declare_var(var, ty);
+            builder.def_var(var, param_val);
+
+            variables.insert(param_name.clone(), LocalVar { var, ty });
         }
 
         let filled = compile_stmt(
@@ -254,6 +266,9 @@ fn compile_function_body(
             let zero = builder.ins().iconst(ret_ty, 0);
             builder.ins().return_(&[zero]);
         }
+
+        // Seal all blocks to complete SSA construction
+        builder.seal_all_blocks();
     }
 
     codegen
@@ -301,6 +316,9 @@ fn compile_test_body(
             let zero = builder.ins().iconst(types::I64, 0);
             builder.ins().return_(&[zero]);
         }
+
+        // Seal all blocks to complete SSA construction
+        builder.seal_all_blocks();
     }
 
     codegen
@@ -393,7 +411,13 @@ fn compile_stmt(
                 value,
             )?;
             let ty = builder.func.dfg.value_type(val);
-            variables.insert(name.clone(), LocalVar { value: val, ty });
+
+            // Create a new variable and declare it
+            let var = next_variable();
+            builder.declare_var(var, ty);
+            builder.def_var(var, val);
+
+            variables.insert(name.clone(), LocalVar { var, ty });
             Ok(false)
         }
 
@@ -473,6 +497,7 @@ fn compile_stmt(
             if !then_filled {
                 builder.ins().jump(merge_block, &[]);
             }
+            builder.seal_block(then_block);
 
             // Else branch
             builder.switch_to_block(else_block);
@@ -493,9 +518,11 @@ fn compile_stmt(
             if !else_filled {
                 builder.ins().jump(merge_block, &[]);
             }
+            builder.seal_block(else_block);
 
-            // Continue after if - but only if merge block is not filled
+            // Continue after if
             builder.switch_to_block(merge_block);
+            // Merge block will be sealed later when all predecessors are known
 
             Ok(false)
         }
@@ -506,37 +533,11 @@ fn compile_stmt(
             let body_block = builder.create_block();
             let exit_block = builder.create_block();
 
-            // Jump to header from current block, passing current variable values
-            let current_vars: Vec<(String, LocalVar)> = variables
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        LocalVar {
-                            value: v.value,
-                            ty: v.ty,
-                        },
-                    )
-                })
-                .collect();
-            let var_values: Vec<Value> = current_vars.iter().map(|(_, v)| v.value).collect();
-            builder.ins().jump(header_block, &var_values);
+            // Jump to header from current block
+            builder.ins().jump(header_block, &[]);
 
             // Header: check condition
             builder.switch_to_block(header_block);
-            // Add block parameters for all variables
-            for (name, var) in &current_vars {
-                let param = builder.append_block_param(header_block, var.ty);
-                // Update the variable in the map to use the parameter
-                variables.insert(
-                    name.clone(),
-                    LocalVar {
-                        value: param,
-                        ty: var.ty,
-                    },
-                );
-            }
-
             let cond_val = compile_expr(
                 builder,
                 variables,
@@ -549,6 +550,7 @@ fn compile_stmt(
             builder
                 .ins()
                 .brif(cond_val, body_block, &[], exit_block, &[]);
+            // Don't seal header yet - body will jump back to it
 
             // Body: compile loop body
             builder.switch_to_block(body_block);
@@ -563,18 +565,13 @@ fn compile_stmt(
                 body,
             )?;
             if !body_filled {
-                // Get updated variable values and jump back to header
-                let updated_values: Vec<Value> = current_vars
-                    .iter()
-                    .map(|(name, _)| {
-                        variables
-                            .get(name)
-                            .map(|v| v.value)
-                            .unwrap_or_else(|| builder.ins().iconst(types::I64, 0))
-                    })
-                    .collect();
-                builder.ins().jump(header_block, &updated_values);
+                builder.ins().jump(header_block, &[]);
             }
+            // Seal body block - all its predecessors are known
+            builder.seal_block(body_block);
+
+            // Now seal header block - all its predecessors (entry and body) are known
+            builder.seal_block(header_block);
 
             // Continue at exit block
             builder.switch_to_block(exit_block);
@@ -592,10 +589,9 @@ fn compile_stmt(
                 module,
                 value,
             )?;
-            // Update existing variable
-            if let Some(var) = variables.get(name) {
-                let ty = var.ty;
-                variables.insert(name.clone(), LocalVar { value: val, ty });
+            // Update existing variable using def_var (Cranelift handles SSA)
+            if let Some(var_info) = variables.get(name) {
+                builder.def_var(var_info.var, val);
                 Ok(false)
             } else {
                 Err(CompileError::UnknownVariable(name.clone()))
@@ -651,7 +647,11 @@ fn compile_expr(
         }
 
         AstNode::Identifier(name) => match variables.get(name) {
-            Some(var) => Ok(var.value),
+            Some(var_info) => {
+                // Use Cranelift's Variable system to get the current value
+                let val = builder.use_var(var_info.var);
+                Ok(val)
+            }
             None => Err(CompileError::UnknownVariable(name.clone())),
         },
 

@@ -76,6 +76,19 @@ pub enum AstNode {
         expr: Box<AstNode>,
         index: Box<AstNode>,
     },
+    /// Struct declaration: struct Name { fields... }
+    StructDecl {
+        name: String,
+        fields: Vec<(String, String)>, // (field_name, field_type)
+        is_pub: bool,
+    },
+    /// Struct initialization: TypeName { field: value, ... }
+    StructInit {
+        name: String,
+        fields: Vec<(String, AstNode)>, // (field_name, value)
+    },
+    /// Field access: obj.field
+    FieldAccess { obj: Box<AstNode>, field: String },
     /// Function declaration
     Function {
         name: String,

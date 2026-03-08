@@ -113,6 +113,7 @@ impl TextAstParser {
 
         match line.kind.as_str() {
             "fn" => self.parse_function(),
+            "struct" => self.parse_struct(),
             "from" => self.parse_import(),
             "test" => self.parse_test(),
             "pub" => {
@@ -212,6 +213,48 @@ impl TextAstParser {
             params,
             return_type,
             body: Box::new(body_node),
+        })
+    }
+
+    /// Parse a struct declaration
+    fn parse_struct(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().unwrap();
+        let name = line.value.clone();
+        let _indent = line.indent;
+        let is_pub = false; // TODO: track pub status
+        self.advance();
+
+        let mut fields = Vec::new();
+
+        // Parse fields until we hit a lower indentation
+        while let Some(field_line) = self.current() {
+            if field_line.kind != "field" {
+                break;
+            }
+
+            let field_name = field_line.value.clone();
+            self.advance();
+
+            // Parse field type
+            let field_type = if let Some(type_line) = self.current() {
+                if type_line.kind == "type" {
+                    let ty = type_line.value.clone();
+                    self.advance();
+                    ty
+                } else {
+                    "Int".to_string()
+                }
+            } else {
+                "Int".to_string()
+            };
+
+            fields.push((field_name, field_type));
+        }
+
+        Ok(AstNode::StructDecl {
+            name,
+            fields,
+            is_pub,
         })
     }
 
@@ -540,6 +583,8 @@ impl TextAstParser {
             "string_interp" => self.parse_string_interp(),
             "list" => self.parse_list_literal(),
             "map" => self.parse_map_literal(),
+            "struct_init" => self.parse_struct_init(),
+            "field" => self.parse_field_access(),
             "try" => self.parse_try(),
             "call" => self.parse_call(),
             "ident" => {
@@ -746,6 +791,65 @@ impl TextAstParser {
             entries,
             key_type: None,
             val_type: None,
+        })
+    }
+
+    /// Parse struct initialization: struct_init Name followed by fields
+    fn parse_struct_init(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().unwrap();
+        let name = line.value.clone();
+        let start_indent = line.indent;
+        self.advance();
+
+        let mut fields = Vec::new();
+
+        // Parse field assignments until lower indentation
+        while let Some(field_line) = self.current() {
+            if field_line.indent <= start_indent {
+                break;
+            }
+
+            // Extract data first to avoid borrow issues
+            let field_indent = field_line.indent;
+
+            if field_line.kind == "field" || field_line.kind == "ident" {
+                let field_name = field_line.value.clone();
+                self.advance();
+
+                // Parse value (indented more)
+                let value = if let Some(val_line) = self.current() {
+                    if val_line.indent > field_indent {
+                        self.parse_expression()?
+                    } else {
+                        AstNode::IntLiteral(0)
+                    }
+                } else {
+                    AstNode::IntLiteral(0)
+                };
+
+                fields.push((field_name, value));
+            } else {
+                // Skip unknown nodes
+                self.advance();
+            }
+        }
+
+        Ok(AstNode::StructInit { name, fields })
+    }
+
+    /// Parse field access: field .name followed by object
+    fn parse_field_access(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().unwrap();
+        let field = line.value.clone();
+        let start_indent = line.indent;
+        self.advance();
+
+        // Parse the object being accessed (should be next expression)
+        let obj = self.parse_expression()?;
+
+        Ok(AstNode::FieldAccess {
+            obj: Box::new(obj),
+            field,
         })
     }
 

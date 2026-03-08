@@ -1093,6 +1093,12 @@ fn parse_import_decl() -> Int:
         path := parse_dotted_path()
         expect("kw_import")
 
+        # Check for wildcard import: from X import *
+        if check("star"):
+            advance_token()
+            # Build label: "path *" to indicate wildcard import
+            return add_leaf_with_position("from_import", path + " *")
+
         mut names: List[String] := []
         n := expect("identifier")
         names.push(n.value)

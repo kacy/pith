@@ -35,6 +35,14 @@ mut current_file_path: String := ""
 # Module alias tracking - maps alias name to module path
 mut module_aliases: Map[String, String] := {}
 
+# Module exports tracking - maps module_path -> {export_name: type_id}
+# This enables qualified name resolution (e.g., math.abs)
+mut module_exports: Map[String, Map[String, Int]] := {}
+
+# Wildcard import tracking - which modules have been wildcard imported
+# This enables from X import * functionality
+mut wildcard_imports: List[String] := []
+
 # Get position from AST node
 fn get_node_position(node_idx: Int) -> (Int, Int):
     if node_idx < 0:
@@ -99,6 +107,8 @@ pub fn initialize_checker(file_path: String):
     implementation_set = {}
     expression_type_cache = {}
     module_aliases = {}
+    module_exports = {}
+    wildcard_imports = []
     current_scope = create_scope(-1)
     register_builtin_types()
 
@@ -133,6 +143,55 @@ pub fn process_import_aliases(root_idx: Int):
                 si = si + 1
             if has_alias:
                 register_import_alias(alias, path)
+        elif kind == "from_import":
+            # Parse "path name1 name2 ..." or "path *" for wildcard
+            mut parts: List[String] := []
+            mut part_start := 0
+            mut i := 0
+            while i <= value.len():
+                if i == value.len() or value[i] == " ":
+                    if part_start < i:
+                        parts.push(value.substring(part_start, i))
+                    part_start = i + 1
+                i = i + 1
+            
+            if parts.len() > 0:
+                mod_path := parts[0]
+                # Check for wildcard import (second part is "*")
+                if parts.len() > 1 and parts[1] == "*":
+                    wildcard_imports.push(mod_path)
+
+# Collect all pub exports from a module and store in module_exports
+pub fn collect_module_exports(module_path: String, root_idx: Int):
+    root := get_node(root_idx)
+    mut exports: Map[String, Int] := {}
+    
+    for child in root.children:
+        node := get_node(child)
+        if node.kind == "pub":
+            if node.children.len() > 0:
+                inner := get_node(node.children[0])
+                if inner.kind == "fn_decl":
+                    exports.insert(inner.value, TID_ERR)  # Will be resolved later
+                elif inner.kind == "struct_decl":
+                    exports.insert(inner.value, TID_ERR)
+                elif inner.kind == "enum_decl":
+                    exports.insert(inner.value, TID_ERR)
+                elif inner.kind == "type_alias":
+                    exports.insert(inner.value, TID_ERR)
+                elif inner.kind == "binding":
+                    # Extract binding name from value (format: "name mut" or "name")
+                    mut name_end := inner.value.len()
+                    mut si := 0
+                    while si < inner.value.len():
+                        if inner.value[si] == " ":
+                            name_end = si
+                            break
+                        si = si + 1
+                    binding_name := inner.value.substring(0, name_end)
+                    exports.insert(binding_name, TID_ERR)
+    
+    module_exports.insert(module_path, exports)
 
 fn register_builtin_types():
     # pre-register List[String] — used by String.split() and args()

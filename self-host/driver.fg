@@ -182,10 +182,12 @@ pub fn compile_to_c(path: String, test_mode: Bool) -> String!:
     init_driver(path)
     import_roots := resolve_imports(root, path)!
 
-    # type check
+    # type check - process import aliases for each module
     initialize_checker(path)
     for imp_root in import_roots:
+        process_import_aliases(imp_root)
         c_run_module(imp_root)
+    process_import_aliases(root)
     c_run_module(root)
 
     # generate C
@@ -202,3 +204,66 @@ pub fn compile_to_c(path: String, test_mode: Bool) -> String!:
         emit_modules(all_roots)
 
     return get_codegen_output()
+
+# Import alias tracking for module namespaces
+# Maps alias name -> (module_path, original_name) for from_import aliases
+# Maps alias name -> module_path for import aliases
+mut module_aliases: Map[String, String] := {}
+
+# Add a module alias mapping
+pub fn add_module_alias(alias: String, module_path: String):
+    module_aliases.insert(alias, module_path)
+
+# Lookup a module path by alias
+pub fn resolve_module_alias(name: String) -> String:
+    if module_aliases.contains_key(name):
+        return module_aliases[name]
+    return ""
+
+# Clear all aliases (call at start of compilation)
+pub fn clear_module_aliases():
+    module_aliases = {}
+
+# Parse import declarations and extract aliases
+# Returns the module path and populates the alias map
+pub fn find_imports_with_aliases(root_idx: Int) -> List[String]:
+    root := get_node(root_idx)
+    mut imports: List[String] := []
+    for child in root.children:
+        node := get_node(child)
+        mut kind := node.kind
+        mut value := node.value
+        if kind == "pub":
+            inner := get_node(node.children[0])
+            kind = inner.kind
+            value = inner.value
+        if kind == "import":
+            # Format: "path" or "path as alias"
+            mut path := value
+            mut has_alias := false
+            mut alias := ""
+            mut si := 0
+            while si < value.len() - 3:
+                if value[si] == " " and value[si + 1] == "a" and value[si + 2] == "s" and value[si + 3] == " ":
+                    path = value.substring(0, si)
+                    alias = value.substring(si + 4, value.len())
+                    has_alias = true
+                    break
+                si = si + 1
+            imports.push(path)
+            if has_alias:
+                add_module_alias(alias, path)
+        elif kind == "from_import":
+            # Format: "path name1 name2 ..."
+            mut space_pos := 0 - 1
+            mut si := 0
+            while si < value.len():
+                if value[si] == " ":
+                    space_pos = si
+                    break
+                si = si + 1
+            mut mod_path := value
+            if space_pos >= 0:
+                mod_path = value.substring(0, space_pos)
+            imports.push(mod_path)
+    return imports

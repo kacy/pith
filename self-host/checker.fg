@@ -32,6 +32,9 @@ pub struct Diagnostic:
 mut checker_diagnostics: List[Diagnostic] := []
 mut current_file_path: String := ""
 
+# Module alias tracking - maps alias name to module path
+mut module_aliases: Map[String, String] := {}
+
 # Get position from AST node
 fn get_node_position(node_idx: Int) -> (Int, Int):
     if node_idx < 0:
@@ -95,8 +98,41 @@ pub fn initialize_checker(file_path: String):
     interface_declaration_map = {}
     implementation_set = {}
     expression_type_cache = {}
+    module_aliases = {}
     current_scope = create_scope(-1)
     register_builtin_types()
+
+# Register an import alias for module namespace resolution
+pub fn register_import_alias(alias: String, module_path: String):
+    module_aliases.insert(alias, module_path)
+
+# Process import declarations from AST and register aliases
+pub fn process_import_aliases(root_idx: Int):
+    root := get_node(root_idx)
+    for child in root.children:
+        node := get_node(child)
+        mut kind := node.kind
+        mut value := node.value
+        if kind == "pub":
+            if node.children.len() > 0:
+                inner := get_node(node.children[0])
+                kind = inner.kind
+                value = inner.value
+        if kind == "import":
+            # Parse "path" or "path as alias"
+            mut path := value
+            mut has_alias := false
+            mut alias := ""
+            mut si := 0
+            while si < value.len() - 3:
+                if value[si] == " " and value[si + 1] == "a" and value[si + 2] == "s" and value[si + 3] == " ":
+                    path = value.substring(0, si)
+                    alias = value.substring(si + 4, value.len())
+                    has_alias = true
+                    break
+                si = si + 1
+            if has_alias:
+                register_import_alias(alias, path)
 
 fn register_builtin_types():
     # pre-register List[String] — used by String.split() and args()
@@ -2215,10 +2251,28 @@ fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
 fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
         return TID_ERR
-    obj_type := c_check_expr(node.children[0], scope_id)
+    field_name := node.value
+    
+    # check if this is module alias access (e.g., math.abs)
+    obj_node_idx := node.children[0]
+    obj_node := get_node(obj_node_idx)
+    if obj_node.kind == "identifier":
+        obj_name := obj_node.value
+        if module_aliases.contains_key(obj_name):
+            # this is a module alias - look up the function in the module
+            # for now, we need to construct the full function name
+            # the module system resolves functions by their simple name in the scope
+            # so we just need to look up the function name directly
+            func_tid := lookup_binding(scope_id, field_name)
+            if func_tid >= 0:
+                return func_tid
+            # function not found in module
+            report_error("E209", "module '" + obj_name + "' has no function '" + field_name + "'")
+            return TID_ERR
+    
+    obj_type := c_check_expr(obj_node_idx, scope_id)
     if is_error_type(obj_type):
         return TID_ERR
-    field_name := node.value
     obj_info := get_type_info(obj_type)
     if obj_info.kind == "struct":
         # linear search through fields

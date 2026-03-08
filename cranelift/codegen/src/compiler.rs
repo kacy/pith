@@ -208,6 +208,36 @@ fn compile_stmt(
             Ok(())
         }
         
+        AstNode::If { cond, then_branch, else_branch } => {
+            let cond_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, cond)?;
+            
+            let then_block = builder.create_block();
+            let else_block = builder.create_block();
+            let merge_block = builder.create_block();
+            
+            builder.ins().brif(cond_val, then_block, &[], else_block, &[]);
+            
+            // Then branch
+            builder.switch_to_block(then_block);
+            compile_stmt(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, return_type, then_branch)?;
+            builder.ins().jump(merge_block, &[]);
+            builder.seal_block(then_block);
+            
+            // Else branch
+            builder.switch_to_block(else_block);
+            if let Some(else_stmt) = else_branch {
+                compile_stmt(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, return_type, else_stmt)?;
+            }
+            builder.ins().jump(merge_block, &[]);
+            builder.seal_block(else_block);
+            
+            // Continue after if
+            builder.switch_to_block(merge_block);
+            builder.seal_block(merge_block);
+            
+            Ok(())
+        }
+        
         _ => {
             compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, node)?;
             Ok(())
@@ -248,20 +278,50 @@ fn compile_expr(
         }
         
         AstNode::BinaryOp { op, left, right } => {
-            let left_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, left)?;
-            let right_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, right)?;
+            // Check if this is string concatenation
+            let is_string_op = matches!(left.as_ref(), AstNode::StringLiteral(_)) || 
+                              matches!(right.as_ref(), AstNode::StringLiteral(_));
             
-            Ok(match op {
-                BinaryOp::Add => builder.ins().iadd(left_val, right_val),
-                BinaryOp::Sub => builder.ins().isub(left_val, right_val),
-                BinaryOp::Mul => builder.ins().imul(left_val, right_val),
-                BinaryOp::Div => builder.ins().sdiv(left_val, right_val),
-                BinaryOp::Eq => {
-                    let cmp = builder.ins().icmp(IntCC::Equal, left_val, right_val);
-                    builder.ins().uextend(types::I64, cmp)
-                }
-                _ => builder.ins().iconst(types::I64, 0),
-            })
+            if is_string_op && matches!(op, BinaryOp::Add) {
+                // String concatenation - call runtime
+                let left_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, left)?;
+                let right_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, right)?;
+                
+                // For now, just return left operand (TODO: implement concat)
+                Ok(left_val)
+            } else {
+                // Regular integer arithmetic
+                let left_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, left)?;
+                let right_val = compile_expr(builder, variables, runtime_funcs, declared_funcs, string_funcs, module, right)?;
+                
+                Ok(match op {
+                    BinaryOp::Add => builder.ins().iadd(left_val, right_val),
+                    BinaryOp::Sub => builder.ins().isub(left_val, right_val),
+                    BinaryOp::Mul => builder.ins().imul(left_val, right_val),
+                    BinaryOp::Div => builder.ins().sdiv(left_val, right_val),
+                    BinaryOp::Eq => {
+                        let cmp = builder.ins().icmp(IntCC::Equal, left_val, right_val);
+                        builder.ins().uextend(types::I64, cmp)
+                    }
+                    BinaryOp::Gt => {
+                        let cmp = builder.ins().icmp(IntCC::SignedGreaterThan, left_val, right_val);
+                        builder.ins().uextend(types::I64, cmp)
+                    }
+                    BinaryOp::Lt => {
+                        let cmp = builder.ins().icmp(IntCC::SignedLessThan, left_val, right_val);
+                        builder.ins().uextend(types::I64, cmp)
+                    }
+                    BinaryOp::Gte => {
+                        let cmp = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, left_val, right_val);
+                        builder.ins().uextend(types::I64, cmp)
+                    }
+                    BinaryOp::Lte => {
+                        let cmp = builder.ins().icmp(IntCC::SignedLessThanOrEqual, left_val, right_val);
+                        builder.ins().uextend(types::I64, cmp)
+                    }
+                    _ => builder.ins().iconst(types::I64, 0),
+                })
+            }
         }
         
         AstNode::Call { func, args } => {

@@ -224,6 +224,7 @@ impl TextAstParser {
                     self.parse_expression()
                 }
             }
+            "if" => self.parse_if(),
             "bind" => {
                 // bind name <value> - this is a let statement
                 let name = line.value.clone();
@@ -414,6 +415,44 @@ impl TextAstParser {
         Ok(AstNode::Call {
             func: method,
             args: vec![obj],
+        })
+    }
+    
+    /// Parse if statement
+    fn parse_if(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().unwrap();
+        let indent = line.indent;
+        self.advance();
+        
+        // Parse condition
+        let cond = self.parse_expression()?;
+        
+        // Parse then branch
+        let mut then_branch = None;
+        let mut else_branch = None;
+        
+        while let Some(line) = self.current() {
+            if line.indent <= indent {
+                break;
+            }
+            
+            match line.kind.as_str() {
+                "then" => {
+                    self.advance();
+                    then_branch = Some(self.parse_statement()?);
+                }
+                "else" => {
+                    self.advance();
+                    else_branch = Some(self.parse_statement()?);
+                }
+                _ => break,
+            }
+        }
+        
+        Ok(AstNode::If {
+            cond: Box::new(cond),
+            then_branch: Box::new(then_branch.unwrap_or_else(|| AstNode::Block(vec![]))),
+            else_branch: else_branch.map(Box::new),
         })
     }
 }

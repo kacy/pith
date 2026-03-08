@@ -175,6 +175,15 @@ pub fn declare_runtime_functions(module: &mut ObjectModule) -> Result<HashMap<St
     )?;
     funcs.insert("forge_print".to_string(), print);
     
+    // Int to string conversion
+    let int_to_string = declare_runtime_function(
+        module,
+        "forge_int_to_string",
+        &[types::I64], // Int
+        &[types::I64], // Returns ForgeString
+    )?;
+    funcs.insert("forge_int_to_string".to_string(), int_to_string);
+    
     // List functions
     let list_new = declare_runtime_function(
         module,

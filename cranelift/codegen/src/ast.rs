@@ -109,6 +109,8 @@ pub struct Variable {
 fn compile_expr(
     builder: &mut FunctionBuilder,
     variables: &mut HashMap<String, Variable>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    module: &mut dyn Module,
     node: &AstNode,
 ) -> Result<Value, CompileError> {
     match node {
@@ -127,6 +129,17 @@ fn compile_expr(
             Ok(val)
         }
         
+        AstNode::StringLiteral(s) => {
+            // Allocate a string literal
+            // For now, return a placeholder
+            // In full implementation, we'd allocate in data section
+            let ptr = builder.ins().iconst(types::I64, s.as_ptr() as i64);
+            let len = builder.ins().iconst(types::I64, s.len() as i64);
+            // Return as a tuple-like struct (ptr, len, is_heap=false)
+            // For simplicity, just return ptr for now
+            Ok(ptr)
+        }
+        
         AstNode::Identifier(name) => {
             match variables.get(name) {
                 Some(var) => Ok(var.value),
@@ -135,8 +148,8 @@ fn compile_expr(
         }
         
         AstNode::BinaryOp { op, left, right } => {
-            let left_val = compile_expr(builder, variables, left)?;
-            let right_val = compile_expr(builder, variables, right)?;
+            let left_val = compile_expr(builder, variables, runtime_funcs, module, left)?;
+            let right_val = compile_expr(builder, variables, runtime_funcs, module, right)?;
             
             let result = match op {
                 BinaryOp::Add => builder.ins().iadd(left_val, right_val),
@@ -176,7 +189,7 @@ fn compile_expr(
         }
         
         AstNode::UnaryOp { op, operand } => {
-            let val = compile_expr(builder, variables, operand)?;
+            let val = compile_expr(builder, variables, runtime_funcs, module, operand)?;
             
             let result = match op {
                 UnaryOp::Neg => builder.ins().ineg(val),
@@ -190,16 +203,15 @@ fn compile_expr(
             Ok(result)
         }
         
-        AstNode::Call { func: _func, args: _args } => {
-            // TODO: Implement function call
-            Err(CompileError::UnsupportedFeature("function call".to_string()))
+        AstNode::Call { func, args } => {
+            compile_call(builder, variables, runtime_funcs, module, func, args)
         }
         
         AstNode::Block(stmts) => {
             let mut last_val = builder.ins().iconst(types::I64, 0);
             
             for stmt in stmts {
-                last_val = compile_expr(builder, variables, stmt)?;
+                last_val = compile_expr(builder, variables, runtime_funcs, module, stmt)?;
             }
             
             Ok(last_val)
@@ -209,17 +221,97 @@ fn compile_expr(
     }
 }
 
+/// Compile a function call
+fn compile_call(
+    builder: &mut FunctionBuilder,
+    variables: &mut HashMap<String, Variable>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    module: &mut dyn Module,
+    func_name: &str,
+    args: &[AstNode],
+) -> Result<Value, CompileError> {
+    // Handle method calls like .to_string
+    if func_name.starts_with('.') {
+        let method = &func_name[1..]; // Remove the leading dot
+        
+        // Convert method call to function call with receiver as first argument
+        // obj.method() -> method(obj)
+        if args.len() != 1 {
+            return Err(CompileError::UnsupportedFeature(
+                format!("Method call {} requires exactly one receiver, got {}", func_name, args.len())
+            ));
+        }
+        
+        let receiver = &args[0];
+        
+        match method {
+            "to_string" => {
+                // Compile the receiver
+                let val = compile_expr(builder, variables, runtime_funcs, module, receiver)?;
+                
+                // Call int_to_string
+                let func_id = runtime_funcs.get("forge_int_to_string")
+                    .copied()
+                    .ok_or_else(|| CompileError::UnknownFunction("forge_int_to_string".to_string()))?;
+                
+                let func_ref = module.declare_func_in_func(func_id, builder.func);
+                let call = builder.ins().call(func_ref, &[val]);
+                
+                if !builder.func.dfg.inst_results(call).is_empty() {
+                    Ok(builder.func.dfg.first_result(call))
+                } else {
+                    Ok(builder.ins().iconst(types::I64, 0))
+                }
+            }
+            _ => Err(CompileError::UnsupportedFeature(format!("Method {}", method))),
+        }
+    } else {
+        // Regular function call
+        // Map high-level function names to runtime function names
+        let runtime_name = match func_name {
+            "print" => "forge_print",
+            _ => func_name,
+        };
+        
+        // Look up the function in runtime functions
+        let func_id = runtime_funcs.get(runtime_name)
+            .copied()
+            .ok_or_else(|| CompileError::UnknownFunction(format!("{} (mapped from {})", runtime_name, func_name)))?;
+        
+        // Get func ref in current function
+        let func_ref = module.declare_func_in_func(func_id, builder.func);
+        
+        // Compile arguments
+        let mut arg_values = Vec::new();
+        for arg in args {
+            arg_values.push(compile_expr(builder, variables, runtime_funcs, module, arg)?);
+        }
+        
+        // Make the call
+        let call = builder.ins().call(func_ref, &arg_values);
+        
+        // Get return value if any
+        if !builder.func.dfg.inst_results(call).is_empty() {
+            Ok(builder.func.dfg.first_result(call))
+        } else {
+            Ok(builder.ins().iconst(types::I64, 0))
+        }
+    }
+}
+
 /// Compile a statement
 fn compile_stmt(
     builder: &mut FunctionBuilder,
     variables: &mut HashMap<String, Variable>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    module: &mut dyn Module,
     return_type: Type,
     _current_block: Block,
     node: &AstNode,
 ) -> Result<(), CompileError> {
     match node {
         AstNode::Let { name, value } => {
-            let val = compile_expr(builder, variables, value)?;
+            let val = compile_expr(builder, variables, runtime_funcs, module, value)?;
             
             // Infer type from value
             let ty = builder.func.dfg.value_type(val);
@@ -231,7 +323,7 @@ fn compile_stmt(
         }
         
         AstNode::Assign { name, value } => {
-            let val = compile_expr(builder, variables, value)?;
+            let val = compile_expr(builder, variables, runtime_funcs, module, value)?;
             
             // Update variable
             if let Some(var) = variables.get(name) {
@@ -246,7 +338,7 @@ fn compile_stmt(
         AstNode::Return(expr) => {
             match expr {
                 Some(e) => {
-                    let val = compile_expr(builder, variables, e)?;
+                    let val = compile_expr(builder, variables, runtime_funcs, module, e)?;
                     
                     // Convert to return type if needed
                     let converted = if builder.func.dfg.value_type(val) != return_type {
@@ -271,7 +363,7 @@ fn compile_stmt(
         }
         
         AstNode::If { cond, then_branch, else_branch } => {
-            let cond_val = compile_expr(builder, variables, cond)?;
+            let cond_val = compile_expr(builder, variables, runtime_funcs, module, cond)?;
             
             // Create blocks
             let then_block = builder.create_block();
@@ -283,14 +375,14 @@ fn compile_stmt(
             
             // Compile then branch
             builder.switch_to_block(then_block);
-            compile_expr(builder, variables, then_branch)?;
+            compile_expr(builder, variables, runtime_funcs, module, then_branch)?;
             builder.ins().jump(merge_block, &[]);
             builder.seal_block(then_block);
             
             // Compile else branch if present
             builder.switch_to_block(else_block);
             if let Some(else_node) = else_branch {
-                compile_expr(builder, variables, else_node)?;
+                compile_expr(builder, variables, runtime_funcs, module, else_node)?;
             }
             builder.ins().jump(merge_block, &[]);
             builder.seal_block(else_block);
@@ -313,13 +405,13 @@ fn compile_stmt(
             
             // Compile header (condition check)
             builder.switch_to_block(header_block);
-            let cond_val = compile_expr(builder, variables, cond)?;
+            let cond_val = compile_expr(builder, variables, runtime_funcs, module, cond)?;
             builder.ins().brif(cond_val, body_block, &[], exit_block, &[]);
             builder.seal_block(header_block);
             
             // Compile body
             builder.switch_to_block(body_block);
-            compile_expr(builder, variables, body)?;
+            compile_expr(builder, variables, runtime_funcs, module, body)?;
             builder.ins().jump(header_block, &[]);
             builder.seal_block(body_block);
             
@@ -332,14 +424,14 @@ fn compile_stmt(
         
         AstNode::Block(stmts) => {
             for stmt in stmts {
-                compile_stmt(builder, variables, return_type, _current_block, stmt)?;
+                compile_stmt(builder, variables, runtime_funcs, module, return_type, _current_block, stmt)?;
             }
             Ok(())
         }
         
         _ => {
             // Expression statement - evaluate and discard
-            compile_expr(builder, variables, node)?;
+            compile_expr(builder, variables, runtime_funcs, module, node)?;
             Ok(())
         }
     }
@@ -372,6 +464,9 @@ pub fn compile_function(
     let func_id = codegen.module.declare_function(name, Linkage::Export, &ctx.func.signature)
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
     
+    // Declare runtime functions first
+    let mut runtime_funcs = crate::declare_runtime_functions(&mut codegen.module)?;
+    
     // Build the function body
     let mut builder_ctx = FunctionBuilderContext::new();
     {
@@ -393,7 +488,7 @@ pub fn compile_function(
         }
         
         // Compile the body
-        compile_stmt(&mut builder, &mut variables, ret_ty, entry_block, body)?;
+        compile_stmt(&mut builder, &mut variables, &runtime_funcs, &mut codegen.module, ret_ty, entry_block, body)?;
         
         // Ensure we have a return
         let zero = builder.ins().iconst(ret_ty, 0);

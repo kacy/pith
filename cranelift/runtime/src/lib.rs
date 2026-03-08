@@ -39,3 +39,30 @@ pub unsafe extern "C" fn forge_runtime_init() {
 pub unsafe extern "C" fn forge_runtime_shutdown() {
     arc::shutdown_cycle_collector();
 }
+
+/// Print a string to stdout
+/// 
+/// # Safety
+/// s must be a valid ForgeString
+#[no_mangle]
+pub unsafe extern "C" fn forge_print(s: string::ForgeString) {
+    use std::io::Write;
+    
+    if s.ptr.is_null() || s.len == 0 {
+        println!();
+        return;
+    }
+    
+    let slice = std::slice::from_raw_parts(s.ptr, s.len as usize);
+    if let Ok(str_ref) = std::str::from_utf8(slice) {
+        println!("{}", str_ref);
+    } else {
+        println!();
+    }
+}
+
+/// Print an integer (for testing)
+#[no_mangle]
+pub extern "C" fn forge_print_int(n: i64) {
+    println!("{}", n);
+}

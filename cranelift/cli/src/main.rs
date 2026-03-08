@@ -56,6 +56,7 @@ fn build_file(path: &str) {
     use forge_codegen::ast::compile_function;
     use forge_codegen::create_codegen;
     use forge_codegen::finalize_module;
+    use forge_codegen::linker::build_executable;
     
     println!("Building {}...", path);
     
@@ -90,7 +91,16 @@ fn build_file(path: &str) {
                         Ok(bytes) => {
                             let obj_path = path.replace(".fg", ".o");
                             match fs::write(&obj_path, &bytes) {
-                                Ok(_) => println!("Written {} ({} bytes)", obj_path, bytes.len()),
+                                Ok(_) => {
+                                    println!("Written {} ({} bytes)", obj_path, bytes.len());
+                                    
+                                    // Link to create executable
+                                    let exe_path = path.replace(".fg", "");
+                                    match build_executable(&obj_path, &exe_path) {
+                                        Ok(_) => println!("Created executable: {}", exe_path),
+                                        Err(e) => eprintln!("Error linking: {}", e),
+                                    }
+                                }
                                 Err(e) => eprintln!("Error writing object file: {}", e),
                             }
                         }

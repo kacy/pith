@@ -330,6 +330,13 @@ fn compile_stmt(
             Ok(())
         }
         
+        AstNode::Block(stmts) => {
+            for stmt in stmts {
+                compile_stmt(builder, variables, return_type, _current_block, stmt)?;
+            }
+            Ok(())
+        }
+        
         _ => {
             // Expression statement - evaluate and discard
             compile_expr(builder, variables, node)?;

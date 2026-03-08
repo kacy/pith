@@ -9,6 +9,7 @@ use cranelift_object::{ObjectModule, ObjectBuilder};
 use std::collections::HashMap;
 
 pub mod ast;
+pub mod parser;
 
 /// Code generator state
 pub struct CodeGen {

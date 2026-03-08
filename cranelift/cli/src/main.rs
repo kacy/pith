@@ -1,6 +1,7 @@
 //! Forge CLI - native compilation with Cranelift
 
 use std::env;
+use std::fs;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -11,6 +12,7 @@ fn main() {
         println!("  build <file.fg>    Compile to native binary");
         println!("  run <file.fg>      Compile and run");
         println!("  demo               Run a demo compilation");
+        println!("  parse <file.fg>    Parse and display AST");
         return;
     }
     
@@ -22,8 +24,7 @@ fn main() {
                 eprintln!("Error: build requires a file argument");
                 return;
             }
-            println!("Building {}...", args[2]);
-            // TODO: Implement build
+            build_file(&args[2]);
         }
         "run" => {
             if args.len() < 3 {
@@ -31,10 +32,18 @@ fn main() {
                 return;
             }
             println!("Running {}...", args[2]);
-            // TODO: Implement run
+            // TODO: Compile and run
         }
         "demo" => {
-            run_demo();
+            println!("Demo mode - using test_simple.fg");
+            build_file("test_simple.fg");
+        }
+        "parse" => {
+            if args.len() < 3 {
+                eprintln!("Error: parse requires a file argument");
+                return;
+            }
+            parse_file(&args[2]);
         }
         _ => {
             eprintln!("Unknown command: {}", command);
@@ -42,48 +51,71 @@ fn main() {
     }
 }
 
-fn run_demo() {
-    use forge_codegen::ast::{AstNode, BinaryOp, compile_function};
+fn build_file(path: &str) {
+    use forge_codegen::parser::parse_file;
+    use forge_codegen::ast::compile_function;
     use forge_codegen::create_codegen;
+    use forge_codegen::finalize_module;
     
-    println!("=== Forge Cranelift Demo ===");
-    println!();
+    println!("Building {}...", path);
     
-    // Create a simple function: fn add(a: Int, b: Int) -> Int { a + b }
-    let body = AstNode::BinaryOp {
-        op: BinaryOp::Add,
-        left: Box::new(AstNode::Identifier("a".to_string())),
-        right: Box::new(AstNode::Identifier("b".to_string())),
-    };
-    
-    let params = vec![
-        ("a".to_string(), "Int".to_string()),
-        ("b".to_string(), "Int".to_string()),
-    ];
-    
-    println!("Compiling: fn add(a: Int, b: Int) -> Int {{ a + b }}");
-    
-    match create_codegen() {
-        Ok(mut codegen) => {
-            match compile_function(&mut codegen, "add", &params, "Int", &body) {
-                Ok(func_id) => {
-                    println!("Successfully compiled function 'add' (ID: {:?})", func_id);
+    // Parse the file
+    match parse_file(path) {
+        Ok(ast_nodes) => {
+            println!("Parsed {} top-level declarations", ast_nodes.len());
+            
+            // Create codegen
+            match create_codegen() {
+                Ok(mut codegen) => {
+                    // Compile each function
+                    let mut compiled = 0;
+                    for node in ast_nodes {
+                        if let forge_codegen::ast::AstNode::Function { name, params, return_type, body } = node {
+                            match compile_function(&mut codegen, &name, &params, &return_type, &body) {
+                                Ok(func_id) => {
+                                    println!("  Compiled function '{}' (ID: {:?})", name, func_id);
+                                    compiled += 1;
+                                }
+                                Err(e) => {
+                                    eprintln!("  Error compiling '{}': {}", name, e);
+                                }
+                            }
+                        }
+                    }
                     
-                    // Finalize the module
-                    match forge_codegen::finalize_module(codegen.module) {
+                    println!("Compiled {} functions", compiled);
+                    
+                    // Finalize and write object file
+                    match finalize_module(codegen.module) {
                         Ok(bytes) => {
-                            println!("Generated {} bytes of object code", bytes.len());
-                            println!("First 16 bytes: {:02x?}", &bytes[..16.min(bytes.len())]);
+                            let obj_path = path.replace(".fg", ".o");
+                            match fs::write(&obj_path, &bytes) {
+                                Ok(_) => println!("Written {} ({} bytes)", obj_path, bytes.len()),
+                                Err(e) => eprintln!("Error writing object file: {}", e),
+                            }
                         }
                         Err(e) => eprintln!("Error finalizing module: {}", e),
                     }
                 }
-                Err(e) => eprintln!("Error compiling function: {}", e),
+                Err(e) => eprintln!("Error creating codegen: {}", e),
             }
         }
-        Err(e) => eprintln!("Error creating codegen: {}", e),
+        Err(e) => eprintln!("Error parsing file: {}", e),
     }
+}
+
+fn parse_file(path: &str) {
+    use forge_codegen::parser::parse_file;
     
-    println!();
-    println!("Demo complete!");
+    println!("Parsing {}...", path);
+    
+    match parse_file(path) {
+        Ok(ast_nodes) => {
+            println!("Parsed {} top-level declarations:", ast_nodes.len());
+            for (i, node) in ast_nodes.iter().enumerate() {
+                println!("  {}: {:?}", i, node);
+            }
+        }
+        Err(e) => eprintln!("Error: {}", e),
+    }
 }

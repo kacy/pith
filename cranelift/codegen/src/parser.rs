@@ -640,6 +640,12 @@ impl TextAstParser {
             }
             "string" => {
                 let value = line.value.clone();
+                // Strip surrounding quotes from string literals
+                let value = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+                    value[1..value.len() - 1].to_string()
+                } else {
+                    value
+                };
                 self.advance();
                 Ok(AstNode::StringLiteral(value))
             }
@@ -648,6 +654,7 @@ impl TextAstParser {
             "map" => self.parse_map_literal(),
             "struct_init" => self.parse_struct_init(),
             "field" => self.parse_field_access(),
+            "index" => self.parse_index(),
             "try" => self.parse_try(),
             "call" => self.parse_call(),
             "ident" => {
@@ -776,6 +783,15 @@ impl TextAstParser {
             match line.kind.as_str() {
                 "lit" => {
                     let lit_value = line.value.clone();
+                    // Strip surrounding quotes from string literals
+                    let lit_value = if lit_value.len() >= 2
+                        && lit_value.starts_with('"')
+                        && lit_value.ends_with('"')
+                    {
+                        lit_value[1..lit_value.len() - 1].to_string()
+                    } else {
+                        lit_value
+                    };
                     parts.push(StringInterpPart::Literal(lit_value));
                     self.advance();
                 }
@@ -842,6 +858,12 @@ impl TextAstParser {
             let line_indent = line.indent;
             let key = if line.kind == "string" {
                 let val = line.value.clone();
+                // Strip surrounding quotes from string literals
+                let val = if val.len() >= 2 && val.starts_with('"') && val.ends_with('"') {
+                    val[1..val.len() - 1].to_string()
+                } else {
+                    val
+                };
                 self.advance();
                 AstNode::StringLiteral(val)
             } else if line.kind == "int" || line.kind == "integer" {
@@ -925,7 +947,6 @@ impl TextAstParser {
     fn parse_field_access(&mut self) -> Result<AstNode, CompileError> {
         let line = self.current().unwrap();
         let field = line.value.clone();
-        let start_indent = line.indent;
         self.advance();
 
         // Parse the object being accessed (should be next expression)
@@ -934,6 +955,18 @@ impl TextAstParser {
         Ok(AstNode::FieldAccess {
             obj: Box::new(obj),
             field,
+        })
+    }
+
+    /// Parse index access: index <expr> <index>
+    fn parse_index(&mut self) -> Result<AstNode, CompileError> {
+        self.advance();
+        let expr = self.parse_expression()?;
+        let index = self.parse_expression()?;
+
+        Ok(AstNode::Index {
+            expr: Box::new(expr),
+            index: Box::new(index),
         })
     }
 
@@ -1060,41 +1093,89 @@ impl TextAstParser {
         // Parse condition
         let cond = self.parse_expression()?;
 
-        // Parse then branch
-        let mut then_branch = None;
+        let mut then_branch = AstNode::Block(vec![]);
         let mut else_branch = None;
 
-        while let Some(line) = self.current() {
-            if line.indent <= indent {
-                break;
+        if let Some(line) = self.current() {
+            if line.indent > indent && line.kind == "then" {
+                let branch_indent = line.indent;
+                self.advance();
+                then_branch = self.parse_branch_block(branch_indent)?;
             }
+        }
 
-            match line.kind.as_str() {
-                "then" => {
-                    self.advance();
-                    then_branch = Some(self.parse_statement()?);
-                }
-                "else" => {
-                    self.advance();
-                    else_branch = Some(self.parse_statement()?);
-                }
-                _ => break,
+        if let Some(line) = self.current() {
+            if line.indent > indent && line.kind == "elif" {
+                else_branch = Some(Box::new(self.parse_elif_chain()?));
+            } else if line.indent > indent && line.kind == "else" {
+                let branch_indent = line.indent;
+                self.advance();
+                else_branch = Some(Box::new(self.parse_branch_block(branch_indent)?));
             }
         }
 
         Ok(AstNode::If {
             cond: Box::new(cond),
-            then_branch: Box::new(then_branch.unwrap_or_else(|| AstNode::Block(vec![]))),
-            else_branch: else_branch.map(Box::new),
+            then_branch: Box::new(then_branch),
+            else_branch,
+        })
+    }
+
+    fn parse_branch_block(&mut self, branch_indent: usize) -> Result<AstNode, CompileError> {
+        let mut stmts = Vec::new();
+
+        while let Some(line) = self.current() {
+            if line.indent <= branch_indent {
+                break;
+            }
+            stmts.push(self.parse_statement()?);
+        }
+
+        Ok(if stmts.len() == 1 {
+            stmts.into_iter().next().unwrap()
+        } else {
+            AstNode::Block(stmts)
+        })
+    }
+
+    fn parse_elif_chain(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().unwrap();
+        let branch_indent = line.indent;
+        self.advance();
+
+        let cond = self.parse_expression()?;
+        let then_branch = self.parse_branch_block(branch_indent)?;
+
+        let mut else_branch = None;
+        if let Some(line) = self.current() {
+            if line.indent == branch_indent && line.kind == "elif" {
+                else_branch = Some(Box::new(self.parse_elif_chain()?));
+            } else if line.indent == branch_indent && line.kind == "else" {
+                self.advance();
+                else_branch = Some(Box::new(self.parse_branch_block(branch_indent)?));
+            }
+        }
+
+        Ok(AstNode::If {
+            cond: Box::new(cond),
+            then_branch: Box::new(then_branch),
+            else_branch,
         })
     }
 }
 
 /// Parse a .fg file and return AST
 pub fn parse_file(path: &str) -> Result<Vec<AstNode>, CompileError> {
-    // Run the self-hosted parser
-    let output = std::process::Command::new("./self-host/forge_main")
-        .args(&["parse", path])
+    // Prefer the self-hosted parser when available, otherwise fall back to the
+    // bootstrap compiler binary from `zig build`.
+    let parser_bin = if std::path::Path::new("./zig-out/bin/forge").exists() {
+        "./zig-out/bin/forge"
+    } else {
+        "./self-host/forge_main"
+    };
+
+    let output = std::process::Command::new(parser_bin)
+        .args(["parse", path])
         .output()
         .map_err(|e| CompileError::ModuleError(format!("Failed to run parser: {}", e)))?;
 

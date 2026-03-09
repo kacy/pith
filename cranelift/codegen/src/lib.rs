@@ -555,6 +555,22 @@ pub fn declare_runtime_functions(
     )?;
     funcs.insert("forge_list_push".to_string(), list_push);
 
+    let list_push_value = declare_runtime_function(
+        module,
+        "forge_list_push_value",
+        &[types::I64, types::I64], // list handle, value/pointer-sized element
+        &[],
+    )?;
+    funcs.insert("forge_list_push_value".to_string(), list_push_value);
+
+    let list_join = declare_runtime_function(
+        module,
+        "forge_list_join",
+        &[types::I64, types::I64], // list handle, separator cstr
+        &[types::I64],
+    )?;
+    funcs.insert("forge_list_join".to_string(), list_join);
+
     let list_len = declare_runtime_function(
         module,
         "forge_list_len",
@@ -694,6 +710,14 @@ pub fn declare_runtime_functions(
         &[types::I8],              // returns bool (0/1)
     )?;
     funcs.insert("rename_file".to_string(), rename_file);
+
+    let list_dir = declare_runtime_function(
+        module,
+        "forge_list_dir",
+        &[types::I64], // *const path
+        &[types::I64], // returns opaque pointer for now
+    )?;
+    funcs.insert("list_dir".to_string(), list_dir);
 
     // File I/O functions
     let read_file = declare_runtime_function(

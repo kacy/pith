@@ -1,0 +1,34 @@
+# More complex - second part of doc_extract
+
+mut d_mod_name: String := ""
+mut d_header_end: Int := 0
+
+fn doc_extract_scan():
+    lines := ["pub fn foo():", "# comment", "pub fn bar():"]
+    mut i := 1
+    
+    # This is the scan loop pattern from doc_extract lines 233-264
+    while i < lines.len():
+        trimmed := lines[i]
+        
+        # Check with multiple or conditions (using list for now)
+        if trimmed.len() > 0:
+            name := "found"
+            kind := "fn"
+            sig := trimmed
+            
+            # Inner while with back tracking
+            mut doc := ""
+            mut back := i - 1
+            while back >= 0:
+                prev := lines[back]
+                if prev.len() > 0 and prev[0] == "#":
+                    doc = prev
+                    back = back - 1
+                else:
+                    break
+        
+        i = i + 1
+
+fn main():
+    doc_extract_scan()

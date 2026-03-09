@@ -1,0 +1,34 @@
+# Minimal reproduction of doc_extract verifier error
+# Based on lines 200-228 of docgen.fg
+
+mut d_mod_name: String := ""
+mut d_header_end: Int := 0
+
+fn doc_extract_pattern():
+    lines := ["# module"]
+    mut i := 0
+    
+    # Pattern 1: if with binary and, nested if-else, then while with if-continue
+    if lines.len() > 0 and lines[0] == "#":
+        first := lines[0]
+        sep := 5
+        if sep > 0:
+            d_mod_name = "yes"
+        else:
+            d_mod_name = "no"
+        i = 1
+        
+        # This while-if-continue pattern is likely the issue
+        while i < lines.len():
+            trimmed := lines[i]
+            if trimmed.len() == 0:
+                break
+            if trimmed[0] == "#":
+                i = i + 1
+                continue
+            break
+    
+    d_header_end = i
+
+fn main():
+    doc_extract_pattern()

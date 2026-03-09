@@ -151,6 +151,83 @@ pub unsafe extern "C" fn forge_list_push(list: *mut ForgeList, elem: *const u8, 
     impl_ref.push(elem_slice);
 }
 
+/// Push an i64-sized value into a list using the list handle directly.
+/// This is a simpler ABI used by generated method calls.
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_push_value(list: ForgeList, value: i64) {
+    if list.ptr.is_null() {
+        return;
+    }
+
+    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    let bytes = value.to_ne_bytes();
+    let elem_len = impl_ref.elem_size.min(bytes.len());
+    impl_ref.push(&bytes[..elem_len]);
+}
+
+/// Join a list of C string pointers with a separator.
+/// Returns a newly allocated C string.
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_join(list: ForgeList, sep: *const i8) -> *mut i8 {
+    use std::alloc::{alloc, Layout};
+
+    if list.ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let impl_ref = &*(list.ptr as *const ListImpl);
+    if impl_ref.elements.is_empty() {
+        let ptr = alloc(Layout::from_size_align(1, 1).unwrap()) as *mut i8;
+        if !ptr.is_null() {
+            *ptr = 0;
+        }
+        return ptr;
+    }
+
+    let sep_len = if sep.is_null() {
+        0usize
+    } else {
+        crate::string::forge_cstring_len(sep) as usize
+    };
+
+    let mut total_len = 0usize;
+    for (i, elem) in impl_ref.elements.iter().enumerate() {
+        if elem.len() >= 8 {
+            let ptr_val = i64::from_ne_bytes(elem[..8].try_into().unwrap()) as *const i8;
+            if !ptr_val.is_null() {
+                total_len += crate::string::forge_cstring_len(ptr_val) as usize;
+            }
+        }
+        if i + 1 < impl_ref.elements.len() {
+            total_len += sep_len;
+        }
+    }
+
+    let out = alloc(Layout::from_size_align(total_len + 1, 1).unwrap()) as *mut i8;
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let mut write = 0usize;
+    for (i, elem) in impl_ref.elements.iter().enumerate() {
+        if elem.len() >= 8 {
+            let ptr_val = i64::from_ne_bytes(elem[..8].try_into().unwrap()) as *const i8;
+            if !ptr_val.is_null() {
+                let len = crate::string::forge_cstring_len(ptr_val) as usize;
+                std::ptr::copy_nonoverlapping(ptr_val as *const u8, out.add(write) as *mut u8, len);
+                write += len;
+            }
+        }
+        if i + 1 < impl_ref.elements.len() && sep_len > 0 {
+            std::ptr::copy_nonoverlapping(sep as *const u8, out.add(write) as *mut u8, sep_len);
+            write += sep_len;
+        }
+    }
+
+    *out.add(write) = 0;
+    out
+}
+
 /// Pop element from end of list
 ///
 /// Returns true if successful, false if list is empty

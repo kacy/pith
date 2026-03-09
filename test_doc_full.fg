@@ -1,0 +1,56 @@
+# Full doc_extract structure
+
+mut d_mod_name: String := ""
+mut d_mod_desc: String := ""
+mut d_count: Int := 0
+
+fn doc_extract_full():
+    lines := ["# module", "description", "pub fn foo():", "# comment", "pub fn bar():"]
+    mut i := 0
+    
+    # First part: header collection
+    if lines.len() > 0 and lines[0] == "#":
+        first := lines[0]
+        sep := 5
+        if sep > 0:
+            d_mod_name = first
+            sep_len := 3
+            d_mod_desc = "desc"
+        else:
+            d_mod_name = first
+        i = 1
+        
+        while i < lines.len():
+            trimmed := lines[i]
+            if trimmed.len() == 0:
+                break
+            if trimmed[0] == "#":
+                i = i + 1
+                continue
+            break
+    
+    # Second part: scan for pub declarations
+    while i < lines.len():
+        trimmed := lines[i]
+        
+        if trimmed.len() > 0:
+            name := "name"
+            kind := "kind"
+            sig := "sig"
+            
+            mut doc := ""
+            mut back := i - 1
+            while back >= 0:
+                prev := lines[back]
+                if prev.len() > 0 and prev[0] == "#":
+                    doc = prev
+                    back = back - 1
+                else:
+                    break
+            
+            d_count = d_count + 1
+        
+        i = i + 1
+
+fn main():
+    doc_extract_full()

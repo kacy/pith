@@ -999,18 +999,14 @@ pub unsafe extern "C" fn forge_free(ptr: *mut i8) {
     }
 }
 
-/// Get command line arguments
-/// Returns pointer to a StringNode linked list (head)
-///
-/// # Safety
-/// The returned pointer must be freed using the list deallocation functions
+/// Get command line arguments as a Forge list of C string pointers.
 #[no_mangle]
-pub unsafe extern "C" fn forge_args() -> *mut StringNode {
+pub unsafe extern "C" fn forge_args() -> ForgeList {
+    use crate::collections::list::{forge_list_new, forge_list_push_value};
     use std::alloc::{alloc, Layout};
     use std::env;
 
-    let mut head: *mut StringNode = std::ptr::null_mut();
-    let mut tail: *mut StringNode = std::ptr::null_mut();
+    let list = forge_list_new(8, 1);
 
     for arg in env::args() {
         let arg_len = arg.len();
@@ -1020,26 +1016,11 @@ pub unsafe extern "C" fn forge_args() -> *mut StringNode {
         if !arg_ptr.is_null() {
             std::ptr::copy_nonoverlapping(arg.as_ptr(), arg_ptr as *mut u8, arg_len);
             *arg_ptr.add(arg_len) = 0;
-
-            let node_layout = Layout::new::<StringNode>();
-            let node_ptr = alloc(node_layout) as *mut StringNode;
-
-            if !node_ptr.is_null() {
-                (*node_ptr).data = arg_ptr;
-                (*node_ptr).next = std::ptr::null_mut();
-
-                if head.is_null() {
-                    head = node_ptr;
-                    tail = node_ptr;
-                } else {
-                    (*tail).next = node_ptr;
-                    tail = node_ptr;
-                }
-            }
+            forge_list_push_value(list, arg_ptr as i64);
         }
     }
 
-    head
+    list
 }
 
 /// Extract substring from C string (start inclusive, end exclusive)
@@ -1148,4 +1129,45 @@ pub unsafe extern "C" fn forge_string_split_to_list(s: *const i8, delim: *const 
     }
 
     list
+}
+
+/// Trim ASCII whitespace from both ends of a C string.
+#[no_mangle]
+pub unsafe extern "C" fn forge_cstring_trim(s: *const i8) -> *mut i8 {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let len = crate::string::forge_cstring_len(s) as usize;
+    let slice = std::slice::from_raw_parts(s as *const u8, len);
+
+    let mut start = 0usize;
+    let mut end = len;
+
+    while start < end && matches!(slice[start], b' ' | b'\t' | b'\n' | b'\r') {
+        start += 1;
+    }
+    while end > start && matches!(slice[end - 1], b' ' | b'\t' | b'\n' | b'\r') {
+        end -= 1;
+    }
+
+    forge_cstring_substring(s, start as i64, end as i64)
+}
+
+/// Trim ASCII whitespace from the left side of a C string.
+#[no_mangle]
+pub unsafe extern "C" fn forge_cstring_trim_left(s: *const i8) -> *mut i8 {
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let len = crate::string::forge_cstring_len(s) as usize;
+    let slice = std::slice::from_raw_parts(s as *const u8, len);
+
+    let mut start = 0usize;
+    while start < len && matches!(slice[start], b' ' | b'\t' | b'\n' | b'\r') {
+        start += 1;
+    }
+
+    forge_cstring_substring(s, start as i64, len as i64)
 }

@@ -14,6 +14,17 @@ use std::collections::HashMap;
 pub struct LocalVar {
     pub var: Variable,
     pub ty: Type,
+    pub kind: ValueKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    Unknown,
+    String,
+    Int,
+    Bool,
+    ListString,
+    ListUnknown,
 }
 
 /// Variable counter for generating unique variable indices
@@ -24,6 +35,71 @@ fn next_variable() -> Variable {
         let var = Variable::from_u32(VAR_COUNTER);
         VAR_COUNTER += 1;
         var
+    }
+}
+
+fn infer_kind_from_type_name(ty: &str) -> ValueKind {
+    match ty {
+        "String" => ValueKind::String,
+        "Bool" => ValueKind::Bool,
+        "Int" | "Float" => ValueKind::Int,
+        _ if ty.starts_with("List[String]") => ValueKind::ListString,
+        _ if ty.starts_with("List[") => ValueKind::ListUnknown,
+        _ => ValueKind::Unknown,
+    }
+}
+
+fn infer_value_kind(node: &AstNode, variables: &HashMap<String, LocalVar>) -> ValueKind {
+    match node {
+        AstNode::StringLiteral(_) | AstNode::StringInterp { .. } => ValueKind::String,
+        AstNode::BoolLiteral(_) => ValueKind::Bool,
+        AstNode::IntLiteral(_) | AstNode::FloatLiteral(_) | AstNode::BinaryOp { .. } => {
+            ValueKind::Int
+        }
+        AstNode::ListLiteral { elements, .. } => {
+            if elements
+                .first()
+                .map(|e| matches!(e, AstNode::StringLiteral(_) | AstNode::StringInterp { .. }))
+                .unwrap_or(false)
+            {
+                ValueKind::ListString
+            } else {
+                ValueKind::ListUnknown
+            }
+        }
+        AstNode::Identifier(name) => variables
+            .get(name)
+            .map(|v| v.kind)
+            .unwrap_or(ValueKind::Unknown),
+        AstNode::FieldAccess { field, .. } => match field.as_str() {
+            ".children" | ".param_types" => ValueKind::ListUnknown,
+            ".value" | ".kind" | ".name" | ".doc" | ".sig" | ".path" => ValueKind::String,
+            _ => ValueKind::Unknown,
+        },
+        AstNode::Index { expr, .. } => match infer_value_kind(expr, variables) {
+            ValueKind::String | ValueKind::ListString => ValueKind::String,
+            _ => ValueKind::Unknown,
+        },
+        AstNode::Call { func, .. } => match func.as_str() {
+            "substring"
+            | "trim"
+            | "trim_left"
+            | "trim_whitespace"
+            | "join"
+            | "read_file"
+            | "input"
+            | "env"
+            | "d_trim_left"
+            | "d_trim_right"
+            | "get_type_name"
+            | "convert_path_to_module" => ValueKind::String,
+            "split" | "args" | "keys" | "values" | "list_dir" => ValueKind::ListString,
+            "len" | "time" | "random_int" | "ord" => ValueKind::Int,
+            "contains" | "contains_key" | "starts_with" | "ends_with" | "string_starts_with"
+            | "dir_exists" | "file_exists" => ValueKind::Bool,
+            _ => ValueKind::Unknown,
+        },
+        _ => ValueKind::Unknown,
     }
 }
 
@@ -126,7 +202,18 @@ pub fn parse_file_with_imports(path: &str) -> Result<Vec<AstNode>, CompileError>
         eprintln!("Parsing: {}", file_path);
 
         // Parse the file
-        let nodes = parse_file(&file_path)?;
+        let mut nodes = parse_file(&file_path)?;
+
+        // Imported helper modules may contain their own standalone `main` entrypoints.
+        // Keep only the root file's main to avoid duplicate definitions.
+        if file_path != path {
+            nodes.retain(|node| {
+                !matches!(
+                    node,
+                    AstNode::Function { name, .. } if name == "main"
+                )
+            });
+        }
 
         // Collect imports
         for node in &nodes {
@@ -197,6 +284,7 @@ pub fn compile_module(
 
     // Pass 1: Declare all functions and tests
     let mut declared_funcs = HashMap::new();
+    let mut func_signatures: HashMap<String, Vec<Type>> = HashMap::new();
 
     for node in &ast_nodes {
         match node {
@@ -222,6 +310,13 @@ pub fn compile_module(
                     .map_err(|e| CompileError::ModuleError(e.to_string()))?;
 
                 declared_funcs.insert(name.clone(), func_id);
+                func_signatures.insert(
+                    name.clone(),
+                    params
+                        .iter()
+                        .map(|(_, ty)| forge_type_to_cranelift(ty))
+                        .collect(),
+                );
             }
             AstNode::Test { name, .. } => {
                 // Declare test functions with no params, void return
@@ -286,6 +381,7 @@ pub fn compile_module(
                     &declared_funcs,
                     &string_funcs,
                     &global_vars,
+                    &func_signatures,
                 )?;
             }
         }
@@ -298,6 +394,7 @@ pub fn compile_module(
                     &runtime_funcs,
                     &declared_funcs,
                     &string_funcs,
+                    &func_signatures,
                 )?;
             }
         }
@@ -323,6 +420,7 @@ fn compile_function_body(
     declared_funcs: &HashMap<String, FuncId>,
     string_funcs: &HashMap<String, FuncId>,
     global_vars: &[String],
+    func_signatures: &HashMap<String, Vec<Type>>,
 ) -> Result<(), CompileError> {
     let mut ctx = codegen.module.make_context();
 
@@ -353,6 +451,7 @@ fn compile_function_body(
                 LocalVar {
                     var,
                     ty: types::I64,
+                    kind: ValueKind::Unknown,
                 },
             );
         }
@@ -368,7 +467,8 @@ fn compile_function_body(
             builder.declare_var(var, ty);
             builder.def_var(var, param_val);
 
-            variables.insert(param_name.clone(), LocalVar { var, ty });
+            let kind = infer_kind_from_type_name(param_ty);
+            variables.insert(param_name.clone(), LocalVar { var, ty, kind });
         }
 
         let filled = compile_stmt(
@@ -382,6 +482,7 @@ fn compile_function_body(
             body,
             None,
             None,
+            func_signatures,
         )?;
 
         // Try to add return if the body compilation didn't fill a block
@@ -404,13 +505,19 @@ fn compile_function_body(
     }
 
     eprintln!("DEBUG: Defining '{}'", func_name);
-    codegen
-        .module
-        .define_function(func_id, &mut ctx)
-        .map_err(|e| {
-            eprintln!("DEBUG: Error in '{}': {}", func_name, e);
-            CompileError::ModuleError(e.to_string())
-        })?;
+    let result = codegen.module.define_function(func_id, &mut ctx);
+
+    if let Err(e) = result {
+        eprintln!("DEBUG: Error in '{}': {:?}", func_name, e);
+        // Try to get more detailed error info
+        let err_str = format!("{:?}", e);
+        if err_str.contains("verifier") {
+            eprintln!("DEBUG: Verifier error detected in function '{}'", func_name);
+            // Print the function IR for debugging
+            eprintln!("DEBUG: Function IR:\n{}", ctx.func.display());
+        }
+        return Err(CompileError::ModuleError(e.to_string()));
+    }
 
     Ok(())
 }
@@ -423,6 +530,7 @@ fn compile_test_body(
     runtime_funcs: &HashMap<String, FuncId>,
     declared_funcs: &HashMap<String, FuncId>,
     string_funcs: &HashMap<String, FuncId>,
+    func_signatures: &HashMap<String, Vec<Type>>,
 ) -> Result<(), CompileError> {
     let mut ctx = codegen.module.make_context();
     ctx.func.signature.returns.push(AbiParam::new(types::I64));
@@ -447,6 +555,7 @@ fn compile_test_body(
             body,
             None,
             None,
+            func_signatures,
         )?;
 
         // If block not filled (e.g., no explicit return), return 0 (success)
@@ -538,6 +647,7 @@ fn compile_stmt(
     node: &AstNode,
     loop_header: Option<Block>,
     loop_exit: Option<Block>,
+    func_signatures: &HashMap<String, Vec<Type>>,
 ) -> Result<bool, CompileError> {
     match node {
         AstNode::Let { name, value, .. } => {
@@ -549,6 +659,7 @@ fn compile_stmt(
                 string_funcs,
                 module,
                 value,
+                func_signatures,
             )?;
             let ty = builder.func.dfg.value_type(val);
 
@@ -557,7 +668,8 @@ fn compile_stmt(
             builder.declare_var(var, ty);
             builder.def_var(var, val);
 
-            variables.insert(name.clone(), LocalVar { var, ty });
+            let kind = infer_value_kind(value, variables);
+            variables.insert(name.clone(), LocalVar { var, ty, kind });
             Ok(false)
         }
 
@@ -574,6 +686,7 @@ fn compile_stmt(
                     stmt,
                     loop_header,
                     loop_exit,
+                    func_signatures,
                 )?;
                 if filled {
                     return Ok(true);
@@ -592,6 +705,7 @@ fn compile_stmt(
                     string_funcs,
                     module,
                     e,
+                    func_signatures,
                 )?;
 
                 // Convert to return type if necessary
@@ -651,6 +765,7 @@ fn compile_stmt(
                 string_funcs,
                 module,
                 cond,
+                func_signatures,
             )?;
 
             let then_block = builder.create_block();
@@ -674,6 +789,7 @@ fn compile_stmt(
                 then_branch,
                 loop_header,
                 loop_exit,
+                func_signatures,
             )?;
             if !then_filled {
                 builder.ins().jump(merge_block, &[]);
@@ -694,6 +810,7 @@ fn compile_stmt(
                     else_stmt,
                     loop_header,
                     loop_exit,
+                    func_signatures,
                 )?
             } else {
                 false
@@ -737,6 +854,7 @@ fn compile_stmt(
                 string_funcs,
                 module,
                 cond,
+                func_signatures,
             )?;
             builder
                 .ins()
@@ -756,6 +874,7 @@ fn compile_stmt(
                 body,
                 Some(header_block),
                 Some(exit_block),
+                func_signatures,
             )?;
             if !body_filled {
                 builder.ins().jump(header_block, &[]);
@@ -788,6 +907,7 @@ fn compile_stmt(
                 string_funcs,
                 module,
                 iterable,
+                func_signatures,
             )?;
 
             // Get list length
@@ -839,6 +959,7 @@ fn compile_stmt(
             let var_info = LocalVar {
                 var: loop_var,
                 ty: types::I64,
+                kind: ValueKind::Unknown,
             };
             variables.insert(var.clone(), var_info);
 
@@ -855,6 +976,7 @@ fn compile_stmt(
                 body_ref,
                 Some(header),
                 Some(exit),
+                func_signatures,
             )?;
 
             variables.remove(var);
@@ -885,10 +1007,21 @@ fn compile_stmt(
                 string_funcs,
                 module,
                 value,
+                func_signatures,
             )?;
             // Update existing variable using def_var (Cranelift handles SSA)
             if let Some(var_info) = variables.get(name) {
-                builder.def_var(var_info.var, val);
+                let val_ty = builder.func.dfg.value_type(val);
+                let final_val = if val_ty != var_info.ty {
+                    if val_ty.bits() > var_info.ty.bits() {
+                        builder.ins().ireduce(var_info.ty, val)
+                    } else {
+                        builder.ins().uextend(var_info.ty, val)
+                    }
+                } else {
+                    val
+                };
+                builder.def_var(var_info.var, final_val);
                 Ok(false)
             } else {
                 Err(CompileError::UnknownVariable(name.clone()))
@@ -910,6 +1043,7 @@ fn compile_stmt(
                 string_funcs,
                 module,
                 node,
+                func_signatures,
             )?;
             Ok(false)
         }
@@ -924,6 +1058,7 @@ fn compile_expr(
     string_funcs: &HashMap<String, FuncId>,
     module: &mut dyn Module,
     node: &AstNode,
+    func_signatures: &HashMap<String, Vec<Type>>,
 ) -> Result<Value, CompileError> {
     match node {
         AstNode::IntLiteral(n) => Ok(builder.ins().iconst(types::I64, *n)),
@@ -1019,6 +1154,7 @@ fn compile_expr(
                     string_funcs,
                     module,
                     elem,
+                    func_signatures,
                 )?;
                 // Store elem_val to stack and pass pointer
                 let elem_slot = builder.create_sized_stack_slot(StackSlotData::new(
@@ -1107,6 +1243,7 @@ fn compile_expr(
                     string_funcs,
                     module,
                     value,
+                    func_signatures,
                 )?;
 
                 // Store value to stack
@@ -1138,6 +1275,7 @@ fn compile_expr(
                 string_funcs,
                 module,
                 expr,
+                func_signatures,
             )
         }
 
@@ -1152,6 +1290,7 @@ fn compile_expr(
                 string_funcs,
                 module,
                 error,
+                func_signatures,
             )
         }
 
@@ -1170,6 +1309,7 @@ fn compile_expr(
                 string_funcs,
                 module,
                 expr,
+                func_signatures,
             )?;
             let _index_val = compile_expr(
                 builder,
@@ -1179,6 +1319,7 @@ fn compile_expr(
                 string_funcs,
                 module,
                 index,
+                func_signatures,
             )?;
             // Placeholder: return 0
             Ok(builder.ins().iconst(types::I64, 0))
@@ -1194,6 +1335,7 @@ fn compile_expr(
                 string_funcs,
                 module,
                 obj,
+                func_signatures,
             )?;
 
             // For now, just return the object value (placeholder)
@@ -1240,6 +1382,30 @@ fn compile_expr(
             None => Err(CompileError::UnknownVariable(name.clone())),
         },
 
+        AstNode::UnaryOp { op, operand } => {
+            let val = compile_expr(
+                builder,
+                variables,
+                runtime_funcs,
+                declared_funcs,
+                string_funcs,
+                module,
+                operand,
+                func_signatures,
+            )?;
+
+            Ok(match op {
+                UnaryOp::Neg => builder.ins().ineg(val),
+                UnaryOp::Not => {
+                    let ty = builder.func.dfg.value_type(val);
+                    let zero = builder.ins().iconst(ty, 0);
+                    let cmp = builder.ins().icmp(IntCC::Equal, val, zero);
+                    builder.ins().uextend(types::I64, cmp)
+                }
+                UnaryOp::BitNot => builder.ins().bnot(val),
+            })
+        }
+
         AstNode::BinaryOp { op, left, right } => {
             // Check if this is string concatenation
             let is_string_op = matches!(left.as_ref(), AstNode::StringLiteral(_))
@@ -1248,7 +1414,7 @@ fn compile_expr(
             if is_string_op && matches!(op, BinaryOp::Add) {
                 // String concatenation - for now just return left operand
                 // (Proper implementation needs struct passing)
-                let left_val = compile_expr(
+                let mut left_val = compile_expr(
                     builder,
                     variables,
                     runtime_funcs,
@@ -1256,6 +1422,7 @@ fn compile_expr(
                     string_funcs,
                     module,
                     left,
+                    func_signatures,
                 )?;
                 let _right_val = compile_expr(
                     builder,
@@ -1265,13 +1432,14 @@ fn compile_expr(
                     string_funcs,
                     module,
                     right,
+                    func_signatures,
                 )?;
 
                 // Just return left for now
                 Ok(left_val)
             } else {
                 // Regular integer arithmetic
-                let left_val = compile_expr(
+                let mut left_val = compile_expr(
                     builder,
                     variables,
                     runtime_funcs,
@@ -1279,8 +1447,9 @@ fn compile_expr(
                     string_funcs,
                     module,
                     left,
+                    func_signatures,
                 )?;
-                let right_val = compile_expr(
+                let mut right_val = compile_expr(
                     builder,
                     variables,
                     runtime_funcs,
@@ -1288,10 +1457,20 @@ fn compile_expr(
                     string_funcs,
                     module,
                     right,
+                    func_signatures,
                 )?;
 
                 let left_ty = builder.func.dfg.value_type(left_val);
-                let is_float = left_ty == types::F64;
+                let right_ty = builder.func.dfg.value_type(right_val);
+                let is_float = left_ty == types::F64 || right_ty == types::F64;
+
+                if !is_float && left_ty != right_ty {
+                    if left_ty.bits() > right_ty.bits() {
+                        right_val = builder.ins().uextend(left_ty, right_val);
+                    } else {
+                        left_val = builder.ins().uextend(right_ty, left_val);
+                    }
+                }
 
                 Ok(match op {
                     BinaryOp::Add => {
@@ -1395,6 +1574,28 @@ fn compile_expr(
                             builder.ins().uextend(types::I64, cmp)
                         }
                     }
+                    BinaryOp::And => {
+                        // Logical AND: return 1 if both non-zero, else 0
+                        let left_ty = builder.func.dfg.value_type(left_val);
+                        let right_ty = builder.func.dfg.value_type(right_val);
+                        let left_zero = builder.ins().iconst(left_ty, 0);
+                        let right_zero = builder.ins().iconst(right_ty, 0);
+                        let left_bool = builder.ins().icmp(IntCC::NotEqual, left_val, left_zero);
+                        let right_bool = builder.ins().icmp(IntCC::NotEqual, right_val, right_zero);
+                        let result = builder.ins().band(left_bool, right_bool);
+                        builder.ins().uextend(types::I64, result)
+                    }
+                    BinaryOp::Or => {
+                        // Logical OR: return 1 if either non-zero, else 0
+                        let left_ty = builder.func.dfg.value_type(left_val);
+                        let right_ty = builder.func.dfg.value_type(right_val);
+                        let left_zero = builder.ins().iconst(left_ty, 0);
+                        let right_zero = builder.ins().iconst(right_ty, 0);
+                        let left_bool = builder.ins().icmp(IntCC::NotEqual, left_val, left_zero);
+                        let right_bool = builder.ins().icmp(IntCC::NotEqual, right_val, right_zero);
+                        let result = builder.ins().bor(left_bool, right_bool);
+                        builder.ins().uextend(types::I64, result)
+                    }
                     _ => builder.ins().iconst(types::I64, 0),
                 })
             }
@@ -1411,11 +1612,15 @@ fn compile_expr(
                 );
 
                 let is_identifier = matches!(first_arg, AstNode::Identifier(_));
+                let is_string_like = matches!(
+                    first_arg,
+                    AstNode::FieldAccess { .. } | AstNode::Index { .. }
+                );
 
                 // If calling .len() on a list literal, use list method
                 if is_list_literal && func == "len" {
                     // Fall through to list method check below
-                } else if is_string_literal || is_identifier {
+                } else if is_string_literal || is_identifier || is_string_like {
                     // Check for string method calls on string literals or identifiers
                     // Note: For identifiers, we assume they might be strings since we don't
                     // have full type information. This is a heuristic that works for the
@@ -1438,6 +1643,7 @@ fn compile_expr(
                             string_funcs,
                             module,
                             string_arg,
+                            func_signatures,
                         )?;
 
                         // Special case: use simple strlen for .len() on raw strings
@@ -1473,6 +1679,7 @@ fn compile_expr(
                                     string_funcs,
                                     module,
                                     arg,
+                                    func_signatures,
                                 )?);
                             }
 
@@ -1488,7 +1695,7 @@ fn compile_expr(
             }
 
             // Check for list method calls (includes fallback for variables)
-            let list_methods = ["len", "push", "pop", "get", "set"];
+            let list_methods = ["len", "push", "pop", "get", "set", "join", "remove"];
             if list_methods.contains(&func.as_str()) && !args.is_empty() {
                 // Transform list.method(args) to forge_list_method(list, args)
                 let list_arg = &args[0];
@@ -1500,7 +1707,78 @@ fn compile_expr(
                     string_funcs,
                     module,
                     list_arg,
+                    func_signatures,
                 )?;
+
+                if func == "push" {
+                    let push_id = runtime_funcs.get("forge_list_push_value").ok_or_else(|| {
+                        CompileError::UnknownFunction("forge_list_push_value".to_string())
+                    })?;
+                    let push_ref = module.declare_func_in_func(*push_id, builder.func);
+
+                    let elem_val = if let Some(arg) = args.get(1) {
+                        compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            arg,
+                            func_signatures,
+                        )?
+                    } else {
+                        builder.ins().iconst(types::I64, 0)
+                    };
+
+                    let elem_val = if builder.func.dfg.value_type(elem_val) != types::I64 {
+                        builder.ins().uextend(types::I64, elem_val)
+                    } else {
+                        elem_val
+                    };
+
+                    builder.ins().call(push_ref, &[list_val, elem_val]);
+                    return Ok(builder.ins().iconst(types::I64, 0));
+                }
+
+                if func == "remove" {
+                    for arg in &args[1..] {
+                        let _ = compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            arg,
+                            func_signatures,
+                        )?;
+                    }
+                    return Ok(builder.ins().iconst(types::I64, 0));
+                }
+
+                if func == "join" {
+                    let join_id = runtime_funcs.get("forge_list_join").ok_or_else(|| {
+                        CompileError::UnknownFunction("forge_list_join".to_string())
+                    })?;
+                    let join_ref = module.declare_func_in_func(*join_id, builder.func);
+                    let sep_val = if let Some(arg) = args.get(1) {
+                        compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            arg,
+                            func_signatures,
+                        )?
+                    } else {
+                        builder.ins().iconst(types::I64, 0)
+                    };
+                    let call = builder.ins().call(join_ref, &[list_val, sep_val]);
+                    return Ok(builder.func.dfg.first_result(call));
+                }
 
                 let runtime_func_name = format!("forge_list_{}", func);
                 if let Some(&func_id) = runtime_funcs.get(&runtime_func_name) {
@@ -1517,6 +1795,7 @@ fn compile_expr(
                             string_funcs,
                             module,
                             arg,
+                            func_signatures,
                         )?);
                     }
 
@@ -1530,7 +1809,15 @@ fn compile_expr(
             }
 
             // Check for map method calls
-            let map_methods = ["len", "contains", "keys", "values"];
+            let map_methods = [
+                "len",
+                "contains",
+                "contains_key",
+                "keys",
+                "values",
+                "insert",
+                "remove",
+            ];
             if map_methods.contains(&func.as_str()) && !args.is_empty() {
                 // Transform map.method(args) to forge_map_method(map, args)
                 let map_arg = &args[0];
@@ -1542,7 +1829,36 @@ fn compile_expr(
                     string_funcs,
                     module,
                     map_arg,
+                    func_signatures,
                 )?;
+
+                if func == "insert" || func == "contains_key" || func == "remove" {
+                    for arg in &args[1..] {
+                        let _ = compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            arg,
+                            func_signatures,
+                        )?;
+                    }
+                    let _ = map_val;
+                    return Ok(builder.ins().iconst(types::I64, 0));
+                }
+
+                if func == "keys" || func == "values" {
+                    let list_new_id = runtime_funcs.get("forge_list_new").ok_or_else(|| {
+                        CompileError::UnknownFunction("forge_list_new".to_string())
+                    })?;
+                    let list_new_ref = module.declare_func_in_func(*list_new_id, builder.func);
+                    let elem_size = builder.ins().iconst(types::I64, 8);
+                    let type_tag = builder.ins().iconst(types::I32, 0);
+                    let call = builder.ins().call(list_new_ref, &[elem_size, type_tag]);
+                    return Ok(builder.func.dfg.first_result(call));
+                }
 
                 let runtime_func_name = format!("forge_map_{}", func);
                 if let Some(&func_id) = runtime_funcs.get(&runtime_func_name) {
@@ -1559,6 +1875,7 @@ fn compile_expr(
                             string_funcs,
                             module,
                             arg,
+                            func_signatures,
                         )?);
                     }
 
@@ -1573,6 +1890,15 @@ fn compile_expr(
 
             // Handle print function selection based on argument type
             let (func_name, arg_values) = if func == "print" && !args.is_empty() {
+                let looks_numeric = matches!(
+                    &args[0],
+                    AstNode::IntLiteral(_)
+                        | AstNode::BoolLiteral(_)
+                        | AstNode::FloatLiteral(_)
+                        | AstNode::BinaryOp { .. }
+                        | AstNode::UnaryOp { .. }
+                ) || matches!(&args[0], AstNode::Call { func, .. } if func == "len");
+
                 // Compile the first argument to determine its type
                 let first_arg = compile_expr(
                     builder,
@@ -1582,6 +1908,7 @@ fn compile_expr(
                     string_funcs,
                     module,
                     &args[0],
+                    func_signatures,
                 )?;
                 let first_arg_ty = builder.func.dfg.value_type(first_arg);
 
@@ -1596,11 +1923,12 @@ fn compile_expr(
                         string_funcs,
                         module,
                         arg,
+                        func_signatures,
                     )?);
                 }
 
                 // Choose print function based on argument type
-                if first_arg_ty == types::I64 {
+                if looks_numeric || first_arg_ty == types::F64 {
                     ("forge_print_int", all_args)
                 } else {
                     ("forge_print_cstr", all_args)
@@ -1624,20 +1952,54 @@ fn compile_expr(
                         string_funcs,
                         module,
                         arg,
+                        func_signatures,
                     )?);
                 }
                 (fname, avals)
             };
 
-            let func_id = runtime_funcs
+            let Some(func_id) = runtime_funcs
                 .get(func_name)
                 .copied()
                 .or_else(|| declared_funcs.get(func).copied())
-                .ok_or_else(|| CompileError::UnknownFunction(func.clone()))?;
+            else {
+                if func
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_uppercase())
+                    .unwrap_or(false)
+                {
+                    // Placeholder for struct constructors like Diagnostic(...)
+                    return Ok(builder.ins().iconst(types::I64, 0));
+                }
+                return Err(CompileError::UnknownFunction(func.clone()));
+            };
 
             let func_ref = module.declare_func_in_func(func_id, builder.func);
 
-            let call = builder.ins().call(func_ref, &arg_values);
+            let coerced_args = if let Some(param_types) = func_signatures.get(func) {
+                let mut coerced = Vec::with_capacity(param_types.len());
+                for (i, &target_ty) in param_types.iter().enumerate() {
+                    let val = if let Some(&existing) = arg_values.get(i) {
+                        let val_ty = builder.func.dfg.value_type(existing);
+                        if val_ty == target_ty {
+                            existing
+                        } else if val_ty.bits() > target_ty.bits() {
+                            builder.ins().ireduce(target_ty, existing)
+                        } else {
+                            builder.ins().uextend(target_ty, existing)
+                        }
+                    } else {
+                        builder.ins().iconst(target_ty, 0)
+                    };
+                    coerced.push(val);
+                }
+                coerced
+            } else {
+                arg_values
+            };
+
+            let call = builder.ins().call(func_ref, &coerced_args);
 
             if !builder.func.dfg.inst_results(call).is_empty() {
                 Ok(builder.func.dfg.first_result(call))

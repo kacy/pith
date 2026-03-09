@@ -954,10 +954,23 @@ impl TextAstParser {
     fn parse_method_call(&mut self) -> Result<AstNode, CompileError> {
         let line = self.current().unwrap();
         let method = line.value.clone();
+        let base_indent = line.indent;
         self.advance();
 
         // Parse object (should be next expression)
         let obj = self.parse_expression()?;
+
+        // Parse additional arguments (arg nodes at same or higher indent)
+        let mut args = vec![obj];
+        while let Some(arg_line) = self.current() {
+            if arg_line.kind == "arg" && arg_line.indent >= base_indent {
+                self.advance();
+                let arg_val = self.parse_expression()?;
+                args.push(arg_val);
+            } else {
+                break;
+            }
+        }
 
         // Strip leading dot and map to runtime function
         let func_name = if method.starts_with('.') {
@@ -969,10 +982,10 @@ impl TextAstParser {
             method
         };
 
-        // Convert to call: func_name(obj)
+        // Convert to call: func_name(obj, args...)
         Ok(AstNode::Call {
             func: func_name,
-            args: vec![obj],
+            args,
         })
     }
 

@@ -848,9 +848,9 @@ pub fn declare_runtime_functions(
 
     let split = declare_runtime_function(
         module,
-        "forge_cstring_split",     // We'll need to implement this
+        "forge_string_split_to_list",
         &[types::I64, types::I64], // str, delimiter
-        &[types::I64],             // returns *mut StringNode (list)
+        &[types::I64],             // returns ForgeList (pointer)
     )?;
     funcs.insert("split".to_string(), split);
 

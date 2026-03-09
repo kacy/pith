@@ -16,6 +16,7 @@ pub mod collections;
 pub mod concurrency;
 pub mod string;
 
+use crate::collections::list::ForgeList;
 use std::sync::atomic::AtomicUsize;
 
 /// Global statistics for debugging
@@ -1080,4 +1081,71 @@ pub unsafe extern "C" fn forge_cstring_substring(s: *const i8, start: i64, end: 
         *ptr.add(sub_len) = 0;
     }
     ptr
+}
+
+/// Split a string by delimiter and return as a ForgeList of strings
+///
+/// # Safety
+/// Both s and delim must be valid null-terminated C strings
+#[no_mangle]
+pub unsafe extern "C" fn forge_string_split_to_list(s: *const i8, delim: *const i8) -> ForgeList {
+    use crate::collections::list::{forge_list_new, forge_list_push, ListTypeTag};
+    use std::alloc::{alloc, Layout};
+
+    if s.is_null() || delim.is_null() {
+        return forge_list_new(8, 0); // Return empty list
+    }
+
+    let s_len = crate::string::forge_cstring_len(s) as usize;
+    let delim_len = crate::string::forge_cstring_len(delim) as usize;
+
+    if s_len == 0 {
+        return forge_list_new(8, 0); // Return empty list for empty string
+    }
+
+    let s_slice = std::slice::from_raw_parts(s as *const u8, s_len);
+    let delim_slice = if delim_len == 0 {
+        &[] as &[u8]
+    } else {
+        std::slice::from_raw_parts(delim as *const u8, delim_len)
+    };
+
+    // Create a new list for strings (type_tag = 1 for strings)
+    let mut list = forge_list_new(8, 1);
+
+    let mut start = 0;
+    for i in 0..=s_len {
+        let is_delim = if delim_len == 0 {
+            false
+        } else if i + delim_len <= s_len {
+            &s_slice[i..i + delim_len] == delim_slice
+        } else {
+            false
+        };
+
+        if is_delim || i == s_len {
+            let part_len = i - start;
+            if part_len > 0 {
+                // Allocate and copy the substring
+                let part_layout = Layout::from_size_align(part_len + 1, 1).unwrap();
+                let part_ptr = alloc(part_layout) as *mut i8;
+
+                if !part_ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(&s_slice[start], part_ptr as *mut u8, part_len);
+                    *part_ptr.add(part_len) = 0;
+
+                    // Push to list (as a pointer)
+                    forge_list_push(&mut list, part_ptr as *const u8, 8);
+                }
+            }
+
+            if delim_len > 0 {
+                start = i + delim_len;
+            } else {
+                start = i + 1;
+            }
+        }
+    }
+
+    list
 }

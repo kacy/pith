@@ -1075,9 +1075,9 @@ fn compile_expr(
                 let call = builder.ins().call(str_func_ref, &[]);
                 builder.func.dfg.first_result(call)
             } else {
-                // Fallback: return pointer directly
-                let ptr = s.as_ptr() as i64;
-                builder.ins().iconst(types::I64, ptr)
+                // Fallback: return null pointer
+                // This should not happen if all strings are collected properly
+                builder.ins().iconst(types::I64, 0)
             };
 
             // Note: For full ForgeString struct support, we would:

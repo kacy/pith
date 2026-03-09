@@ -1154,6 +1154,39 @@ pub unsafe extern "C" fn forge_cstring_trim(s: *const i8) -> *mut i8 {
     forge_cstring_substring(s, start as i64, end as i64)
 }
 
+/// Get a single character from a C string at index as a new C string.
+/// Returns a newly allocated 1-character string (or empty string if out of bounds)
+#[no_mangle]
+pub unsafe extern "C" fn forge_cstring_char_at(s: *const i8, index: i64) -> *mut i8 {
+    use std::alloc::{alloc, Layout};
+
+    if s.is_null() {
+        let ptr = alloc(Layout::from_size_align(1, 1).unwrap()) as *mut i8;
+        if !ptr.is_null() {
+            *ptr = 0;
+        }
+        return ptr;
+    }
+
+    let len = crate::string::forge_cstring_len(s);
+    if index < 0 || index >= len {
+        // Out of bounds - return empty string
+        let ptr = alloc(Layout::from_size_align(1, 1).unwrap()) as *mut i8;
+        if !ptr.is_null() {
+            *ptr = 0;
+        }
+        return ptr;
+    }
+
+    // Allocate 2 bytes (1 char + null terminator)
+    let ptr = alloc(Layout::from_size_align(2, 1).unwrap()) as *mut i8;
+    if !ptr.is_null() {
+        *ptr = *s.offset(index as isize);
+        *ptr.add(1) = 0;
+    }
+    ptr
+}
+
 /// Trim ASCII whitespace from the left side of a C string.
 #[no_mangle]
 pub unsafe extern "C" fn forge_cstring_trim_left(s: *const i8) -> *mut i8 {

@@ -571,6 +571,14 @@ pub fn declare_runtime_functions(
     )?;
     funcs.insert("forge_list_join".to_string(), list_join);
 
+    let list_get_value = declare_runtime_function(
+        module,
+        "forge_list_get_value",
+        &[types::I64, types::I64], // list handle, index
+        &[types::I64],
+    )?;
+    funcs.insert("forge_list_get_value".to_string(), list_get_value);
+
     let list_len = declare_runtime_function(
         module,
         "forge_list_len",
@@ -893,6 +901,14 @@ pub fn declare_runtime_functions(
         &[types::I64],             // returns *mut cstr
     )?;
     funcs.insert("trim_left".to_string(), trim_left);
+
+    let cstring_char_at = declare_runtime_function(
+        module,
+        "forge_cstring_char_at",
+        &[types::I64, types::I64], // str, index
+        &[types::I64],             // returns *mut cstr (single char)
+    )?;
+    funcs.insert("forge_cstring_char_at".to_string(), cstring_char_at);
 
     // Note: list_dir returns a linked list - needs special handling
     // For now, declare but don't use directly

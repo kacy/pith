@@ -265,6 +265,34 @@ pub unsafe extern "C" fn forge_list_pop(
     }
 }
 
+/// Get element at index for pointer-sized elements (returns i64 directly)
+/// Returns 0 if out of bounds or on error
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_get_value(list: ForgeList, index: i64) -> i64 {
+    if list.ptr.is_null() {
+        return 0;
+    }
+
+    let impl_ref = &*(list.ptr as *const ListImpl);
+
+    if index < 0 || index >= impl_ref.len() as i64 {
+        return 0;
+    }
+
+    // For pointer-sized elements (8 bytes), read directly
+    if impl_ref.elem_size == 8 {
+        match impl_ref.get(index as usize) {
+            Some(elem_data) if elem_data.len() == 8 => {
+                let val = i64::from_ne_bytes(elem_data[..8].try_into().unwrap_or([0; 8]));
+                val
+            }
+            _ => 0,
+        }
+    } else {
+        0
+    }
+}
+
 /// Get element at index (copies to out buffer)
 ///
 /// Returns true if successful, false if index out of bounds

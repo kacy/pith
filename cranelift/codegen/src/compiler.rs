@@ -1127,23 +1127,11 @@ fn compile_expr(
                 .call(list_new_ref, &[elem_size_val, type_tag_val]);
             let list_val = builder.func.dfg.first_result(new_call);
 
-            // Push each element to the list
-            let push_func = runtime_funcs
-                .get("forge_list_push")
-                .ok_or_else(|| CompileError::UnknownFunction("forge_list_push".to_string()))?;
+            // Push each element to the list using push_value (simpler ABI)
+            let push_func = runtime_funcs.get("forge_list_push_value").ok_or_else(|| {
+                CompileError::UnknownFunction("forge_list_push_value".to_string())
+            })?;
             let push_ref = module.declare_func_in_func(*push_func, builder.func);
-
-            // Create a stack slot for the list so we can pass its address to push
-            let list_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8, // ForgeList is 8 bytes (one pointer)
-                3, // align_shift = 8 bytes
-            ));
-            let list_slot_addr = builder.ins().stack_addr(types::I64, list_slot, 0);
-            builder
-                .ins()
-                .store(MemFlags::new(), list_val, list_slot_addr, 0);
-            let list_ptr = list_slot_addr;
 
             for elem in elements {
                 let elem_val = compile_expr(
@@ -1156,21 +1144,10 @@ fn compile_expr(
                     elem,
                     func_signatures,
                 )?;
-                // Store elem_val to stack and pass pointer
-                let elem_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    8,
-                    3, // align_shift = 8 bytes
-                ));
-                let elem_ptr = builder.ins().stack_addr(types::I64, elem_slot, 0);
-                builder.ins().store(MemFlags::new(), elem_val, elem_ptr, 0);
-                builder
-                    .ins()
-                    .call(push_ref, &[list_ptr, elem_ptr, elem_size_val]);
+                builder.ins().call(push_ref, &[list_val, elem_val]);
             }
 
-            // Return the list VALUE (not pointer to stack slot)
-            // This is what gets stored in variables and passed to other functions
+            // Return the list VALUE
             Ok(list_val)
         }
 
@@ -1296,12 +1273,10 @@ fn compile_expr(
 
         AstNode::Index { expr, index } => {
             // Index access: expr[index]
-            // For now, return 0 as placeholder
-            // Full implementation requires:
-            // - For lists: bounds check and element access
-            // - For strings: character access (returns String)
-            // - For maps: key lookup
-            let _expr_val = compile_expr(
+            // Determine the type of expression to dispatch correctly
+            let expr_kind = infer_value_kind(expr, variables);
+
+            let expr_val = compile_expr(
                 builder,
                 variables,
                 runtime_funcs,
@@ -1311,7 +1286,7 @@ fn compile_expr(
                 expr,
                 func_signatures,
             )?;
-            let _index_val = compile_expr(
+            let index_val = compile_expr(
                 builder,
                 variables,
                 runtime_funcs,
@@ -1321,8 +1296,39 @@ fn compile_expr(
                 index,
                 func_signatures,
             )?;
-            // Placeholder: return 0
-            Ok(builder.ins().iconst(types::I64, 0))
+
+            match expr_kind {
+                ValueKind::String => {
+                    // String indexing: forge_cstring_char_at(str, index)
+                    if let Some(&func_id) = runtime_funcs.get("forge_cstring_char_at") {
+                        let func_ref = module.declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(func_ref, &[expr_val, index_val]);
+                        Ok(builder.func.dfg.first_result(call))
+                    } else {
+                        Ok(builder.ins().iconst(types::I64, 0))
+                    }
+                }
+                ValueKind::ListString | ValueKind::ListUnknown => {
+                    // List indexing: forge_list_get_value(list, index)
+                    if let Some(&func_id) = runtime_funcs.get("forge_list_get_value") {
+                        let func_ref = module.declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(func_ref, &[expr_val, index_val]);
+                        Ok(builder.func.dfg.first_result(call))
+                    } else {
+                        Ok(builder.ins().iconst(types::I64, 0))
+                    }
+                }
+                _ => {
+                    // Unknown type, try list get as fallback
+                    if let Some(&func_id) = runtime_funcs.get("forge_list_get_value") {
+                        let func_ref = module.declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(func_ref, &[expr_val, index_val]);
+                        Ok(builder.func.dfg.first_result(call))
+                    } else {
+                        Ok(builder.ins().iconst(types::I64, 0))
+                    }
+                }
+            }
         }
 
         AstNode::FieldAccess { obj, field } => {
@@ -1890,6 +1896,7 @@ fn compile_expr(
 
             // Handle print function selection based on argument type
             let (func_name, arg_values) = if func == "print" && !args.is_empty() {
+                let arg_kind = infer_value_kind(&args[0], variables);
                 let looks_numeric = matches!(
                     &args[0],
                     AstNode::IntLiteral(_)
@@ -1897,7 +1904,12 @@ fn compile_expr(
                         | AstNode::FloatLiteral(_)
                         | AstNode::BinaryOp { .. }
                         | AstNode::UnaryOp { .. }
-                ) || matches!(&args[0], AstNode::Call { func, .. } if func == "len");
+                        | AstNode::Index { .. }
+                ) || matches!(&args[0], AstNode::Call { func, .. } if func == "len")
+                    || matches!(
+                        arg_kind,
+                        ValueKind::Int | ValueKind::Bool | ValueKind::Unknown
+                    );
 
                 // Compile the first argument to determine its type
                 let first_arg = compile_expr(

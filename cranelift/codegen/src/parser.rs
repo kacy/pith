@@ -8,7 +8,8 @@
 //!         ...
 
 use crate::ast::{
-    AstNode, BinaryOp, EnumVariant, MatchArm, MatchPattern, StringInterpPart, UnaryOp,
+    AstNode, BinaryOp, EnumVariant, InterfaceMethod, MatchArm, MatchPattern, StringInterpPart,
+    UnaryOp,
 };
 use crate::CompileError;
 use std::collections::HashMap;
@@ -117,6 +118,8 @@ impl TextAstParser {
             "fn" => self.parse_function(),
             "struct" => self.parse_struct(),
             "enum" => self.parse_enum(),
+            "interface" => self.parse_interface(),
+            "impl" => self.parse_impl(),
             "from" => self.parse_import(),
             "test" => self.parse_test(),
             "bind" => self.parse_top_level_bind(),
@@ -311,6 +314,133 @@ impl TextAstParser {
             name,
             variants,
             is_pub,
+        })
+    }
+
+    /// Parse an interface declaration: interface Name { methods... }
+    fn parse_interface(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().unwrap();
+        let name = line.value.clone();
+        let interface_indent = line.indent;
+        let is_pub = false; // TODO: track pub status
+        self.advance();
+
+        let mut methods = Vec::new();
+
+        // Parse method signatures until we hit a lower or equal indentation
+        while let Some(method_line) = self.current() {
+            if method_line.indent <= interface_indent {
+                break;
+            }
+
+            if method_line.kind == "fn" {
+                let method_name = method_line
+                    .value
+                    .split_whitespace()
+                    .next()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| method_line.value.clone());
+                let method_indent = method_line.indent;
+                self.advance();
+
+                // Parse params
+                let mut params = Vec::new();
+                while let Some(param_line) = self.current() {
+                    if param_line.indent <= method_indent {
+                        break;
+                    }
+                    if param_line.kind == "param" {
+                        let parts: Vec<&str> = param_line.value.split(':').collect();
+                        let param_name = parts[0].trim().to_string();
+                        let param_type = if parts.len() > 1 {
+                            parts[1].trim().to_string()
+                        } else {
+                            "Int".to_string()
+                        };
+                        params.push((param_name, param_type));
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+
+                // Parse return type if present
+                let return_type = if let Some(ret_line) = self.current() {
+                    let has_return_type =
+                        ret_line.indent > method_indent && ret_line.kind == "return_type";
+                    let value = ret_line.value.clone();
+                    if has_return_type {
+                        self.advance();
+                        value
+                    } else {
+                        "Void".to_string()
+                    }
+                } else {
+                    "Void".to_string()
+                };
+
+                methods.push(crate::ast::InterfaceMethod {
+                    name: method_name,
+                    params,
+                    return_type,
+                });
+            } else {
+                // Skip unknown nodes under interface
+                self.advance();
+            }
+        }
+
+        Ok(AstNode::InterfaceDecl {
+            name,
+            methods,
+            is_pub,
+        })
+    }
+
+    /// Parse an impl block: impl Interface for Type { methods... }
+    fn parse_impl(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().unwrap();
+        let impl_spec = line.value.clone(); // Format: "Interface for Type"
+        let impl_indent = line.indent;
+        self.advance();
+
+        // Parse "Interface for Type" format
+        let parts: Vec<&str> = impl_spec.split(" for ").collect();
+        if parts.len() != 2 {
+            return Err(CompileError::UnsupportedFeature(format!(
+                "Invalid impl syntax: {}",
+                impl_spec
+            )));
+        }
+        let interface = parts[0].trim().to_string();
+        let target_type = parts[1].trim().to_string();
+
+        let mut methods = Vec::new();
+
+        // Parse method implementations until we hit a lower or equal indentation
+        loop {
+            let should_parse = if let Some(method_line) = self.current() {
+                if method_line.indent <= impl_indent {
+                    break;
+                }
+                method_line.kind == "fn"
+            } else {
+                break;
+            };
+
+            if should_parse {
+                // Parse the method as a function
+                methods.push(self.parse_function()?);
+            } else {
+                // Skip unknown nodes under impl
+                self.advance();
+            }
+        }
+
+        Ok(AstNode::ImplBlock {
+            interface,
+            target_type,
+            methods,
         })
     }
 

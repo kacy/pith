@@ -128,6 +128,18 @@ pub enum AstNode {
         body: Box<AstNode>,
         capture_vars: Vec<String>, // Variables captured from outer scope
     },
+    /// Interface declaration: interface Name { methods... }
+    InterfaceDecl {
+        name: String,
+        methods: Vec<InterfaceMethod>,
+        is_pub: bool,
+    },
+    /// Impl block: impl Interface for Type { methods... }
+    ImplBlock {
+        interface: String,
+        target_type: String,
+        methods: Vec<AstNode>, // Function definitions
+    },
     /// Function declaration
     Function {
         name: String,
@@ -142,6 +154,14 @@ pub enum AstNode {
 pub struct EnumVariant {
     pub name: String,
     pub data_types: Vec<String>, // Types of associated data (empty for simple variants)
+}
+
+/// Interface method signature
+#[derive(Debug, Clone)]
+pub struct InterfaceMethod {
+    pub name: String,
+    pub params: Vec<(String, String)>, // (param_name, param_type)
+    pub return_type: String,
 }
 
 /// Match arm: pattern => expr

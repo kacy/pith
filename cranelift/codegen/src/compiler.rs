@@ -1068,6 +1068,34 @@ fn compile_stmt(
             Ok(false)
         }
 
+        AstNode::InterfaceDecl { .. } => {
+            // Interface declarations are handled at module level
+            // They define method signatures for type checking
+            Ok(false)
+        }
+
+        AstNode::ImplBlock { methods, .. } => {
+            // Impl blocks are handled at module level
+            // They provide method implementations for types
+            // For now, compile each method as a regular function
+            for method in methods {
+                compile_stmt(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    return_type,
+                    method,
+                    loop_header,
+                    loop_exit,
+                    func_signatures,
+                )?;
+            }
+            Ok(false)
+        }
+
         _ => {
             compile_expr(
                 builder,
@@ -2293,6 +2321,16 @@ fn compile_expr(
         AstNode::EnumVariantConstruct { .. } => {
             // For now, return 0 as placeholder
             // Full implementation requires runtime support for tagged unions
+            Ok(builder.ins().iconst(types::I64, 0))
+        }
+
+        AstNode::InterfaceDecl { .. } => {
+            // Interface declarations don't generate code at expression level
+            Ok(builder.ins().iconst(types::I64, 0))
+        }
+
+        AstNode::ImplBlock { .. } => {
+            // Impl blocks don't generate code at expression level
             Ok(builder.ins().iconst(types::I64, 0))
         }
 

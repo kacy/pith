@@ -893,6 +893,7 @@ fn compile_stmt(
 
         AstNode::For {
             var,
+            index_var,
             iterable,
             body,
         } => {
@@ -949,11 +950,21 @@ fn compile_stmt(
             // Body block
             builder.switch_to_block(body_block);
 
-            // Create loop variable with current index as placeholder
+            // Get the current index
+            let cur_idx = builder.use_var(idx_var);
+
+            // Get the element at current index from the list
+            let get_func_id = runtime_funcs
+                .get("forge_list_get_value")
+                .ok_or_else(|| CompileError::UnknownFunction("forge_list_get_value".to_string()))?;
+            let get_func_ref = module.declare_func_in_func(*get_func_id, builder.func);
+            let get_call = builder.ins().call(get_func_ref, &[list_val, cur_idx]);
+            let element_val = builder.func.dfg.first_result(get_call);
+
+            // Create loop variable with the element value
             let loop_var = next_variable();
             builder.declare_var(loop_var, types::I64);
-            let cur_idx = builder.use_var(idx_var);
-            builder.def_var(loop_var, cur_idx);
+            builder.def_var(loop_var, element_val);
 
             // Add to scope
             let var_info = LocalVar {
@@ -962,6 +973,20 @@ fn compile_stmt(
                 kind: ValueKind::Unknown,
             };
             variables.insert(var.clone(), var_info);
+
+            // If there's an index variable, add it too (with the index value)
+            if let Some(idx_var_name) = index_var {
+                let idx_loop_var = next_variable();
+                builder.declare_var(idx_loop_var, types::I64);
+                builder.def_var(idx_loop_var, cur_idx);
+
+                let idx_var_info = LocalVar {
+                    var: idx_loop_var,
+                    ty: types::I64,
+                    kind: ValueKind::Unknown,
+                };
+                variables.insert(idx_var_name.clone(), idx_var_info);
+            }
 
             // Compile body
             let body_ref: &AstNode = &**body;
@@ -980,6 +1005,9 @@ fn compile_stmt(
             )?;
 
             variables.remove(var);
+            if let Some(idx_var_name) = index_var {
+                variables.remove(idx_var_name);
+            }
 
             // Loop back with incremented index
             if !filled {

@@ -52,9 +52,10 @@ pub enum AstNode {
         cond: Box<AstNode>,
         body: Box<AstNode>,
     },
-    /// For-in loop: for var in iterable { body }
+    /// For-in loop: for var[, index] in iterable { body }
     For {
         var: String,
+        index_var: Option<String>, // Optional index variable for enumeration
         iterable: Box<AstNode>,
         body: Box<AstNode>,
     },

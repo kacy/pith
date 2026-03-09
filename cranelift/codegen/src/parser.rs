@@ -1273,12 +1273,24 @@ impl TextAstParser {
         })
     }
 
-    /// Parse for-in loop: for var in iterable { body }
+    /// Parse for-in loop: for var[, index] in iterable { body }
     fn parse_for(&mut self) -> Result<AstNode, CompileError> {
         let line = self.current().unwrap();
         let indent = line.indent;
-        let var_name = line.value.clone(); // The loop variable name
+        let var_spec = line.value.clone(); // May contain "var" or "var, index"
         self.advance();
+
+        // Parse variable names (handle "name, i" syntax for index)
+        let (var_name, index_var) = if var_spec.contains(',') {
+            let parts: Vec<&str> = var_spec.split(',').map(|s| s.trim()).collect();
+            if parts.len() == 2 {
+                (parts[0].to_string(), Some(parts[1].to_string()))
+            } else {
+                (var_spec, None)
+            }
+        } else {
+            (var_spec, None)
+        };
 
         // Parse iterable expression
         let iterable = self.parse_expression()?;
@@ -1300,6 +1312,7 @@ impl TextAstParser {
 
         Ok(AstNode::For {
             var: var_name,
+            index_var,
             iterable: Box::new(iterable),
             body: Box::new(body),
         })

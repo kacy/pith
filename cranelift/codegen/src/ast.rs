@@ -121,6 +121,13 @@ pub enum AstNode {
     },
     /// Field access: obj.field
     FieldAccess { obj: Box<AstNode>, field: String },
+    /// Lambda/closure expression: fn(params) => body
+    Lambda {
+        params: Vec<(String, String)>, // (name, type)
+        return_type: Option<String>,
+        body: Box<AstNode>,
+        capture_vars: Vec<String>, // Variables captured from outer scope
+    },
     /// Function declaration
     Function {
         name: String,

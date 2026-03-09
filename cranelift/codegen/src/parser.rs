@@ -712,6 +712,7 @@ impl TextAstParser {
             "index" => self.parse_index(),
             "try" => self.parse_try(),
             "call" => self.parse_call(),
+            "lambda" => self.parse_lambda(),
             "ident" => {
                 let name = line
                     .value
@@ -1352,6 +1353,68 @@ impl TextAstParser {
             cond: Box::new(cond),
             then_branch: Box::new(then_branch),
             else_branch,
+        })
+    }
+
+    /// Parse lambda expression: fn(params) => body
+    fn parse_lambda(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().unwrap();
+        let lambda_indent = line.indent;
+        self.advance();
+
+        // Parse parameters (indented under lambda)
+        let mut params = Vec::new();
+        while let Some(param_line) = self.current() {
+            if param_line.indent <= lambda_indent {
+                break;
+            }
+            if param_line.kind == "param" {
+                // Parse "name: Type" format
+                let param_str = param_line.value.clone();
+                let parts: Vec<&str> = param_str.split(':').collect();
+                let param_name = parts[0].trim().to_string();
+                let param_type = if parts.len() > 1 {
+                    parts[1].trim().to_string()
+                } else {
+                    "Int".to_string() // Default type
+                };
+                params.push((param_name, param_type));
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        // Parse capture variables (optional, marked with "capture" kind)
+        let mut capture_vars = Vec::new();
+        while let Some(capture_line) = self.current() {
+            if capture_line.indent <= lambda_indent {
+                break;
+            }
+            if capture_line.kind == "capture" {
+                capture_vars.push(capture_line.value.clone());
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        // Parse body expression (indented under lambda)
+        let body = if let Some(body_line) = self.current() {
+            if body_line.indent > lambda_indent {
+                self.parse_expression()?
+            } else {
+                AstNode::IntLiteral(0) // Placeholder
+            }
+        } else {
+            AstNode::IntLiteral(0) // Placeholder
+        };
+
+        Ok(AstNode::Lambda {
+            params,
+            return_type: None, // Infer from body
+            body: Box::new(body),
+            capture_vars,
         })
     }
 

@@ -2181,7 +2181,7 @@ fn compile_expr(
             };
 
             let Some(func_id) = runtime_funcs
-                .get(func_name)
+                .get(func)
                 .copied()
                 .or_else(|| declared_funcs.get(func).copied())
             else {
@@ -2194,6 +2194,29 @@ fn compile_expr(
                     // Placeholder for struct constructors like Diagnostic(...)
                     return Ok(builder.ins().iconst(types::I64, 0));
                 }
+
+                // Check if this is a variable holding a lambda (closure)
+                // If so, we need to compile the call differently
+                if let Some(var_info) = variables.get(func) {
+                    // For now, compile arguments (for side effects) and return placeholder
+                    // Full closure implementation needs:
+                    // 1. Store lambda body and params in the variable
+                    // 2. At call site, substitute args into body and compile
+                    for arg in args {
+                        let _ = compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            arg,
+                            func_signatures,
+                        )?;
+                    }
+                    return Ok(builder.ins().iconst(types::I64, 0));
+                }
+
                 return Err(CompileError::UnknownFunction(func.clone()));
             };
 
@@ -2271,6 +2294,38 @@ fn compile_expr(
             // For now, return 0 as placeholder
             // Full implementation requires runtime support for tagged unions
             Ok(builder.ins().iconst(types::I64, 0))
+        }
+
+        AstNode::Lambda {
+            params,
+            body,
+            capture_vars,
+            ..
+        } => {
+            // Lambda/closure compilation
+            // For now, compile the body with captured variables available in scope
+            // Full implementation would create a closure object with:
+            // 1. A function pointer
+            // 2. An environment struct containing captured values
+
+            // Make captured variables available
+            for var_name in capture_vars {
+                if let Some(var_info) = variables.get(var_name) {
+                    // Already in scope from outer function
+                }
+            }
+
+            // Compile the body expression
+            compile_expr(
+                builder,
+                variables,
+                runtime_funcs,
+                declared_funcs,
+                string_funcs,
+                module,
+                body,
+                func_signatures,
+            )
         }
 
         _ => Err(CompileError::UnsupportedFeature(format!("{:?}", node))),

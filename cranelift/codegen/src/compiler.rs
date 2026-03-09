@@ -1095,11 +1095,63 @@ fn compile_expr(
             Ok(ptr_val)
         }
 
-        AstNode::StringInterp { parts: _ } => {
-            // For now, return empty string (placeholder)
-            // Full string interpolation needs proper string struct handling
-            let empty_str = builder.ins().iconst(types::I64, 0);
-            Ok(empty_str)
+        AstNode::StringInterp { parts } => {
+            // String interpolation: concatenate all parts
+            // Start with an empty string
+            let mut result: Option<Value> = None;
+
+            for part in parts {
+                let part_val = match part {
+                    crate::ast::StringInterpPart::Literal(s) => {
+                        // Get string pointer from string_funcs or create new
+                        if let Some(&str_func_id) = string_funcs.get(s.as_str()) {
+                            let str_func_ref =
+                                module.declare_func_in_func(str_func_id, builder.func);
+                            let call = builder.ins().call(str_func_ref, &[]);
+                            builder.func.dfg.first_result(call)
+                        } else {
+                            builder.ins().iconst(types::I64, 0)
+                        }
+                    }
+                    crate::ast::StringInterpPart::Expr(expr) => {
+                        // Compile the expression and convert to string
+                        let expr_val = compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            expr,
+                            func_signatures,
+                        )?;
+
+                        // Convert to string based on type
+                        // For now, assume int - use int_to_cstr
+                        if let Some(&int_to_str_id) = runtime_funcs.get("forge_int_to_cstr") {
+                            let int_to_str_ref =
+                                module.declare_func_in_func(int_to_str_id, builder.func);
+                            let call = builder.ins().call(int_to_str_ref, &[expr_val]);
+                            builder.func.dfg.first_result(call)
+                        } else {
+                            builder.ins().iconst(types::I64, 0)
+                        }
+                    }
+                };
+
+                // Concatenate with result
+                if let Some(curr_result) = result {
+                    if let Some(&concat_id) = runtime_funcs.get("forge_concat_cstr") {
+                        let concat_ref = module.declare_func_in_func(concat_id, builder.func);
+                        let call = builder.ins().call(concat_ref, &[curr_result, part_val]);
+                        result = Some(builder.func.dfg.first_result(call));
+                    }
+                } else {
+                    result = Some(part_val);
+                }
+            }
+
+            Ok(result.unwrap_or_else(|| builder.ins().iconst(types::I64, 0)))
         }
 
         AstNode::StructInit { name: _, fields: _ } => {

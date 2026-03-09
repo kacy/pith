@@ -669,6 +669,15 @@ pub fn declare_runtime_functions(
     )?;
     funcs.insert("forge_string_concat".to_string(), string_concat);
 
+    // C-string equality comparison (content-based, for null-terminated C strings)
+    let cstring_eq = declare_runtime_function(
+        module,
+        "forge_cstring_eq",
+        &[types::I64, types::I64], // *const a, *const b (null-terminated C strings)
+        &[types::I8],              // returns bool
+    )?;
+    funcs.insert("forge_cstring_eq".to_string(), cstring_eq);
+
     // Simple strlen-based length for null-terminated strings (debugging/workaround)
     let cstring_len = declare_runtime_function(
         module,

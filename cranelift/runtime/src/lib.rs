@@ -206,6 +206,41 @@ pub unsafe extern "C" fn forge_print_err(ptr: *const i8) {
     }
 }
 
+/// Compare two C strings for equality (content-based, null-terminated)
+///
+/// # Safety
+/// Both pointers must be valid null-terminated C strings or null
+#[no_mangle]
+pub unsafe extern "C" fn forge_cstring_eq(a: *const i8, b: *const i8) -> bool {
+    // Handle null cases
+    if a.is_null() && b.is_null() {
+        return true;
+    }
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+
+    // Compare byte by byte
+    let mut pa = a;
+    let mut pb = b;
+
+    loop {
+        let ca = *pa;
+        let cb = *pb;
+
+        if ca != cb {
+            return false;
+        }
+
+        if ca == 0 {
+            return true;
+        }
+
+        pa = pa.add(1);
+        pb = pb.add(1);
+    }
+}
+
 /// Get ASCII value of first char in C string (ord)
 #[no_mangle]
 pub unsafe extern "C" fn forge_ord_cstr(s: *const i8) -> i64 {

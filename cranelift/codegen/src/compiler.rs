@@ -1513,7 +1513,28 @@ fn compile_expr(
                     BinaryOp::Shl => builder.ins().ishl(left_val, right_val),
                     BinaryOp::Shr => builder.ins().sshr(left_val, right_val),
                     BinaryOp::Eq => {
-                        if is_float {
+                        // Check if comparing strings - if so, use content-based comparison
+                        let left_kind = infer_value_kind(left, variables);
+                        let right_kind = infer_value_kind(right, variables);
+                        let is_string_comparison =
+                            matches!(left_kind, ValueKind::String | ValueKind::ListString)
+                                || matches!(right_kind, ValueKind::String | ValueKind::ListString);
+
+                        if is_string_comparison {
+                            // Use forge_cstring_eq for content-based C-string comparison
+                            if let Some(&eq_func_id) = runtime_funcs.get("forge_cstring_eq") {
+                                let eq_func_ref =
+                                    module.declare_func_in_func(eq_func_id, builder.func);
+                                let call = builder.ins().call(eq_func_ref, &[left_val, right_val]);
+                                let result = builder.func.dfg.first_result(call);
+                                // Convert bool (I8) to I64
+                                builder.ins().uextend(types::I64, result)
+                            } else {
+                                // Fallback to pointer comparison if runtime function not found
+                                let cmp = builder.ins().icmp(IntCC::Equal, left_val, right_val);
+                                builder.ins().uextend(types::I64, cmp)
+                            }
+                        } else if is_float {
                             let cmp = builder.ins().fcmp(FloatCC::Equal, left_val, right_val);
                             builder.ins().uextend(types::I64, cmp)
                         } else {

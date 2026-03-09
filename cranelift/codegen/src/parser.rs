@@ -672,8 +672,9 @@ impl TextAstParser {
                 if let Some(line) = self.current() {
                     if line.value == "pipe" {
                         self.advance();
-                        // Parse left operand (value)
-                        let value = self.parse_expression()?;
+                        // For pipe, parse left operand as a simple expression (not full expression
+                        // to avoid infinite recursion with chained pipes)
+                        let value = self.parse_primary()?;
                         // Parse right operand (function name)
                         let func_line = self.current().ok_or_else(|| {
                             CompileError::UnsupportedFeature(
@@ -723,6 +724,71 @@ impl TextAstParser {
                 // Skip unknown nodes
                 self.advance();
                 Ok(AstNode::IntLiteral(0)) // Placeholder
+            }
+        }
+    }
+
+    /// Parse a primary expression (simple literals and identifiers, not compound expressions)
+    /// Used by pipe operator to avoid infinite recursion with chained pipes
+    fn parse_primary(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().ok_or_else(|| {
+            CompileError::UnsupportedFeature("Unexpected end of input".to_string())
+        })?;
+
+        match line.kind.as_str() {
+            "int" => {
+                let value_str = &line.value;
+                let value = if value_str.starts_with("0x") || value_str.starts_with("0X") {
+                    i64::from_str_radix(&value_str[2..], 16).map_err(|_| {
+                        CompileError::UnsupportedFeature(format!(
+                            "Invalid hex integer: {}",
+                            value_str
+                        ))
+                    })?
+                } else {
+                    value_str.parse::<i64>().map_err(|_| {
+                        CompileError::UnsupportedFeature(format!("Invalid integer: {}", value_str))
+                    })?
+                };
+                self.advance();
+                Ok(AstNode::IntLiteral(value))
+            }
+            "float" => {
+                let value = line.value.parse::<f64>().map_err(|_| {
+                    CompileError::UnsupportedFeature(format!("Invalid float: {}", line.value))
+                })?;
+                self.advance();
+                Ok(AstNode::FloatLiteral(value))
+            }
+            "bool" => {
+                let value = line.value == "true";
+                self.advance();
+                Ok(AstNode::BoolLiteral(value))
+            }
+            "string" => {
+                let value = line.value.clone();
+                let value = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+                    value[1..value.len() - 1].to_string()
+                } else {
+                    value
+                };
+                self.advance();
+                Ok(AstNode::StringLiteral(value))
+            }
+            "ident" => {
+                let name = line
+                    .value
+                    .split_whitespace()
+                    .next()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| line.value.clone());
+                self.advance();
+                Ok(AstNode::Identifier(name))
+            }
+            "call" => self.parse_call(),
+            _ => {
+                // For any other type, fall back to full expression parsing
+                self.parse_expression()
             }
         }
     }

@@ -20,11 +20,11 @@ pub struct ForgeList {
 /// For heap types (String, List, Map), we store references.
 pub struct ListImpl {
     /// Element data as byte vectors
-    elements: Vec<Vec<u8>>,
+    pub elements: Vec<Vec<u8>>,
     /// Size of each element in bytes
-    elem_size: usize,
+    pub elem_size: usize,
     /// Type tag for determining how to handle elements
-    type_tag: ListTypeTag,
+    pub type_tag: ListTypeTag,
 }
 
 /// Type tag for list elements
@@ -470,6 +470,32 @@ pub unsafe extern "C" fn forge_list_clear(list: *mut ForgeList) {
     }
 
     impl_ref.clear();
+}
+
+/// Check if list is empty
+#[no_mangle]
+pub extern "C" fn forge_list_is_empty(list: ForgeList) -> i64 {
+    if list.ptr.is_null() {
+        return 1;
+    }
+    unsafe {
+        let impl_ref = &*(list.ptr as *const ListImpl);
+        if impl_ref.len() == 0 {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+/// Reverse list elements in-place
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_reverse(list: ForgeList) {
+    if list.ptr.is_null() {
+        return;
+    }
+    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    impl_ref.elements.reverse();
 }
 
 /// Release list and free memory

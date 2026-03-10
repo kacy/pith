@@ -330,6 +330,60 @@ pub fn compile_module(
 
                 declared_funcs.insert(name.clone(), func_id);
             }
+            AstNode::ImplBlock {
+                target_type,
+                methods,
+                ..
+            } => {
+                // Register impl methods as regular functions
+                // Methods are named either "method_name" or "TypeName_method_name"
+                for method in methods {
+                    if let AstNode::Function {
+                        name,
+                        params,
+                        return_type,
+                        ..
+                    } = method
+                    {
+                        let mut sig = codegen.module.make_signature();
+
+                        // Impl methods take the struct as first param (self as i64/pointer)
+                        sig.params.push(AbiParam::new(types::I64));
+                        for (_, ty) in params {
+                            let cl_ty = forge_type_to_cranelift(ty);
+                            sig.params.push(AbiParam::new(cl_ty));
+                        }
+
+                        let ret_ty = forge_type_to_cranelift(return_type);
+                        sig.returns.push(AbiParam::new(ret_ty));
+
+                        // Register under both plain name and TypeName_method_name
+                        let plain_name = name.clone();
+                        let qualified_name = if !target_type.is_empty() {
+                            format!("{}_{}", target_type, name)
+                        } else {
+                            name.clone()
+                        };
+
+                        for reg_name in [&plain_name, &qualified_name] {
+                            if !declared_funcs.contains_key(reg_name) {
+                                if let Ok(func_id) =
+                                    codegen
+                                        .module
+                                        .declare_function(reg_name, Linkage::Export, &sig)
+                                {
+                                    declared_funcs.insert(reg_name.clone(), func_id);
+                                    let mut param_types: Vec<Type> = vec![types::I64]; // self
+                                    param_types.extend(
+                                        params.iter().map(|(_, ty)| forge_type_to_cranelift(ty)),
+                                    );
+                                    func_signatures.insert(reg_name.clone(), param_types);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -396,6 +450,53 @@ pub fn compile_module(
                     &string_funcs,
                     &func_signatures,
                 )?;
+            }
+        }
+        // Compile impl block methods
+        if let AstNode::ImplBlock {
+            target_type,
+            methods,
+            ..
+        } = node
+        {
+            for method in methods {
+                if let AstNode::Function {
+                    name,
+                    params,
+                    return_type,
+                    body,
+                } = method
+                {
+                    // Methods take `self` as first param — create augmented params list
+                    let mut method_params = vec![("self".to_string(), "Any".to_string())];
+                    method_params.extend(params.clone());
+
+                    let plain_name = name.clone();
+                    let qualified_name = if !target_type.is_empty() {
+                        format!("{}_{}", target_type, name)
+                    } else {
+                        name.clone()
+                    };
+
+                    for reg_name in [&plain_name, &qualified_name] {
+                        if let Some(&func_id) = declared_funcs.get(reg_name) {
+                            compile_function_body(
+                                codegen,
+                                func_id,
+                                reg_name,
+                                &method_params,
+                                return_type,
+                                body,
+                                &runtime_funcs,
+                                &declared_funcs,
+                                &string_funcs,
+                                &global_vars,
+                                &func_signatures,
+                            )?;
+                            break; // Only compile once (plain_name and qualified_name share same func_id if different)
+                        }
+                    }
+                }
             }
         }
     }
@@ -2135,6 +2236,32 @@ fn compile_expr(
                 }
             }
 
+            // Handle to_string type-aware dispatch
+            if func == "to_string" && !args.is_empty() {
+                let arg_val = compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    &args[0],
+                    func_signatures,
+                )?;
+                let arg_ty = builder.func.dfg.value_type(arg_val);
+                let converter = if arg_ty == types::F64 {
+                    runtime_funcs.get("forge_float_to_cstr")
+                } else {
+                    runtime_funcs.get("forge_int_to_cstr")
+                };
+                if let Some(&cid) = converter {
+                    let cref = module.declare_func_in_func(cid, builder.func);
+                    let call = builder.ins().call(cref, &[arg_val]);
+                    return Ok(builder.func.dfg.first_result(call));
+                }
+                return Ok(arg_val);
+            }
+
             // Handle print function selection based on argument type
             let (func_name, arg_values) = if func == "print" && !args.is_empty() {
                 let arg_kind = infer_value_kind(&args[0], variables);
@@ -2209,8 +2336,9 @@ fn compile_expr(
             };
 
             let Some(func_id) = runtime_funcs
-                .get(func)
+                .get(func_name)
                 .copied()
+                .or_else(|| runtime_funcs.get(func).copied())
                 .or_else(|| declared_funcs.get(func).copied())
             else {
                 if func
@@ -2250,7 +2378,10 @@ fn compile_expr(
 
             let func_ref = module.declare_func_in_func(func_id, builder.func);
 
-            let coerced_args = if let Some(param_types) = func_signatures.get(func) {
+            let coerced_args = if let Some(param_types) = func_signatures
+                .get(func_name)
+                .or_else(|| func_signatures.get(func))
+            {
                 let mut coerced = Vec::with_capacity(param_types.len());
                 for (i, &target_ty) in param_types.iter().enumerate() {
                     let val = if let Some(&existing) = arg_values.get(i) {

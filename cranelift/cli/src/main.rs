@@ -31,8 +31,7 @@ fn main() {
                 eprintln!("Error: run requires a file argument");
                 return;
             }
-            println!("Running {}...", args[2]);
-            // TODO: Compile and run
+            run_file(&args[2]);
         }
         "demo" => {
             println!("Demo mode - using test_simple.fg");
@@ -90,6 +89,74 @@ fn build_file(path: &str) {
                                             match build_executable(&obj_path, &exe_path) {
                                                 Ok(_) => {
                                                     println!("Created executable: {}", exe_path)
+                                                }
+                                                Err(e) => eprintln!("Error linking: {}", e),
+                                            }
+                                        }
+                                        Err(e) => eprintln!("Error writing object file: {}", e),
+                                    }
+                                }
+                                Err(e) => eprintln!("Error finalizing module: {}", e),
+                            }
+                        }
+                        Err(e) => eprintln!("Error compiling module: {}", e),
+                    }
+                }
+                Err(e) => eprintln!("Error creating codegen: {}", e),
+            }
+        }
+        Err(e) => eprintln!("Error parsing file: {}", e),
+    }
+}
+
+fn run_file(path: &str) {
+    use forge_codegen::compiler::compile_module;
+    use forge_codegen::compiler::parse_file_with_imports;
+    use forge_codegen::create_codegen;
+    use forge_codegen::finalize_module;
+    use forge_codegen::linker::build_executable;
+
+    // Parse the file and all imports
+    match parse_file_with_imports(path) {
+        Ok(ast_nodes) => {
+            match create_codegen() {
+                Ok(mut codegen) => {
+                    match compile_module(&mut codegen, ast_nodes) {
+                        Ok(_funcs) => {
+                            match finalize_module(codegen.module) {
+                                Ok(bytes) => {
+                                    // Write object file to a temp location
+                                    let obj_path =
+                                        format!("/tmp/forge_run_{}.o", std::process::id());
+                                    let exe_path = format!("/tmp/forge_run_{}", std::process::id());
+                                    match std::fs::write(&obj_path, &bytes) {
+                                        Ok(_) => {
+                                            match build_executable(&obj_path, &exe_path) {
+                                                Ok(_) => {
+                                                    // Run the executable
+                                                    let status =
+                                                        std::process::Command::new(&exe_path)
+                                                            .status();
+                                                    match status {
+                                                        Ok(s) => {
+                                                            // Clean up temp files
+                                                            let _ = std::fs::remove_file(&obj_path);
+                                                            let _ = std::fs::remove_file(&exe_path);
+                                                            if !s.success() {
+                                                                std::process::exit(
+                                                                    s.code().unwrap_or(1),
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            eprintln!(
+                                                                "Error running executable: {}",
+                                                                e
+                                                            );
+                                                            let _ = std::fs::remove_file(&obj_path);
+                                                            let _ = std::fs::remove_file(&exe_path);
+                                                        }
+                                                    }
                                                 }
                                                 Err(e) => eprintln!("Error linking: {}", e),
                                             }

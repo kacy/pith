@@ -84,6 +84,12 @@ impl ListImpl {
     fn clear(&mut self) {
         self.elements.clear();
     }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        if a < self.elements.len() && b < self.elements.len() {
+            self.elements.swap(a, b);
+        }
+    }
 }
 
 /// Create a new empty list
@@ -451,6 +457,63 @@ pub unsafe extern "C" fn forge_list_remove(
     true
 }
 
+/// Remove element at index (by-value variant — works with internal pointer)
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_remove_value(list: ForgeList, index: i64) -> i64 {
+    if list.ptr.is_null() {
+        return 0;
+    }
+
+    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+
+    if index < 0 || index >= impl_ref.len() as i64 {
+        return 0;
+    }
+
+    // Release string element if needed
+    if matches!(impl_ref.type_tag, ListTypeTag::String) {
+        let elem = impl_ref.get(index as usize).unwrap();
+        let s = elem.as_ptr() as *const ForgeString;
+        forge_string_release(*s);
+    }
+
+    impl_ref.remove(index as usize);
+    1
+}
+
+/// Clear all elements from list (by-value variant)
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_clear_value(list: ForgeList) {
+    if list.ptr.is_null() {
+        return;
+    }
+
+    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+
+    if matches!(impl_ref.type_tag, ListTypeTag::String) {
+        for i in 0..impl_ref.len() {
+            let elem = impl_ref.get(i).unwrap();
+            let s = elem.as_ptr() as *const ForgeString;
+            forge_string_release(*s);
+        }
+    }
+
+    impl_ref.clear();
+}
+
+/// Reverse list in-place (by-value variant — works with internal pointer)
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_reverse_value(list: ForgeList) {
+    if list.ptr.is_null() {
+        return;
+    }
+    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    let len = impl_ref.len();
+    for i in 0..len / 2 {
+        impl_ref.swap(i, len - 1 - i);
+    }
+}
+
 /// Clear all elements from list
 #[no_mangle]
 pub unsafe extern "C" fn forge_list_clear(list: *mut ForgeList) {
@@ -606,6 +669,34 @@ pub unsafe extern "C" fn forge_list_release_all_strings(list: ForgeList) {
         let s = elem.as_ptr() as *const ForgeString;
         forge_string_release(*s);
     }
+}
+
+/// Check if list contains an integer value
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_contains_int(list: ForgeList, value: i64) -> i64 {
+    if list.ptr.is_null() {
+        return 0;
+    }
+
+    let impl_ref = &*(list.ptr as *const ListImpl);
+
+    for i in 0..impl_ref.len() {
+        let elem = impl_ref.get(i).unwrap();
+        if elem.len() >= 8 {
+            let stored = i64::from_le_bytes(elem[..8].try_into().unwrap_or([0u8; 8]));
+            if stored == value {
+                return 1;
+            }
+        }
+    }
+
+    0
+}
+
+/// Check if list is empty
+#[no_mangle]
+pub extern "C" fn forge_list_is_empty_int(list: ForgeList) -> i64 {
+    forge_list_is_empty(list)
 }
 
 /// Destructor for list elements in collections

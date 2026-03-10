@@ -1162,16 +1162,12 @@ impl TextAstParser {
                     parts.push(StringInterpPart::Literal(lit_value));
                     self.advance();
                 }
-                "ident" => {
-                    let ident_name = line.value.clone();
-                    parts.push(StringInterpPart::Expr(Box::new(AstNode::Identifier(
-                        ident_name,
-                    ))));
-                    self.advance();
-                }
                 _ => {
-                    // Unknown part type, skip it
-                    self.advance();
+                    // Any expression node (ident, method_call, call, binary, etc.)
+                    // Delegate to the full expression parser so method calls like
+                    // {x.len()} and {foo()} are correctly parsed rather than dropped.
+                    let expr = self.parse_expression()?;
+                    parts.push(StringInterpPart::Expr(Box::new(expr)));
                 }
             }
         }

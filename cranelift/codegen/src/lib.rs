@@ -897,14 +897,16 @@ pub fn declare_runtime_functions(
         &[types::I64],             // returns *mut cstr
     )?;
     funcs.insert("substring".to_string(), substring);
+    funcs.insert("forge_cstring_substring".to_string(), substring);
 
     let contains = declare_runtime_function(
         module,
-        "forge_cstring_contains",  // We'll need to implement this
+        "forge_cstring_contains",
         &[types::I64, types::I64], // haystack, needle
-        &[types::I8],              // returns bool
+        &[types::I64],             // returns 0 or 1
     )?;
     funcs.insert("contains".to_string(), contains);
+    funcs.insert("forge_cstring_contains".to_string(), contains);
 
     let split = declare_runtime_function(
         module,
@@ -921,6 +923,7 @@ pub fn declare_runtime_functions(
         &[types::I64],        // returns *mut cstr
     )?;
     funcs.insert("trim".to_string(), trim);
+    funcs.insert("forge_cstring_trim".to_string(), trim);
 
     let trim_left = declare_runtime_function(
         module,
@@ -1089,34 +1092,43 @@ pub fn declare_runtime_functions(
     )?;
     funcs.insert("forge_list_is_empty".to_string(), list_is_empty);
 
-    // List: clear
+    // List: clear (by-value variant, works with internal pointer)
     let list_clear = declare_runtime_function(
         module,
-        "forge_list_clear",
-        &[types::I64], // list ptr
+        "forge_list_clear_value",
+        &[types::I64], // ForgeList (passed as i64 pointer value)
         &[],
     )?;
     funcs.insert("clear".to_string(), list_clear);
     funcs.insert("forge_list_clear".to_string(), list_clear);
 
-    // List: remove
+    // List: remove (by-value variant, works with internal pointer)
     let list_remove = declare_runtime_function(
         module,
-        "forge_list_remove",
-        &[types::I64, types::I64], // list ptr, index
-        &[],
+        "forge_list_remove_value",
+        &[types::I64, types::I64], // ForgeList, index
+        &[types::I64],
     )?;
     funcs.insert("remove".to_string(), list_remove);
     funcs.insert("forge_list_remove".to_string(), list_remove);
 
-    // List: reverse
+    // List: reverse (by-value variant, works with internal pointer)
     let list_reverse = declare_runtime_function(
         module,
-        "forge_list_reverse",
-        &[types::I64], // list ptr
+        "forge_list_reverse_value",
+        &[types::I64], // ForgeList
         &[],
     )?;
     funcs.insert("forge_list_reverse".to_string(), list_reverse);
+
+    // List: contains (integer)
+    let list_contains_int = declare_runtime_function(
+        module,
+        "forge_list_contains_int",
+        &[types::I64, types::I64], // list ptr, value
+        &[types::I64],             // returns 0 or 1
+    )?;
+    funcs.insert("forge_list_contains_int".to_string(), list_contains_int);
 
     // Type conversions
     let int_to_float = declare_runtime_function(
@@ -1169,11 +1181,32 @@ pub fn declare_runtime_functions(
     let hex_encode = declare_runtime_function(
         module,
         "forge_hex_encode",
-        &[types::I64], // str
+        &[types::I64], // str (byte string)
         &[types::I64], // hex str
     )?;
-    funcs.insert("hex".to_string(), hex_encode);
     funcs.insert("forge_hex_encode".to_string(), hex_encode);
+
+    // hex(int) → hex string (e.g., 255 → "ff")
+    let int_to_hex = declare_runtime_function(
+        module,
+        "forge_int_to_hex",
+        &[types::I64], // integer
+        &[types::I64], // hex str
+    )?;
+    funcs.insert("hex".to_string(), int_to_hex);
+    funcs.insert("forge_int_to_hex".to_string(), int_to_hex);
+
+    // oct(int) → octal string
+    let int_to_oct2 =
+        declare_runtime_function(module, "forge_int_to_oct", &[types::I64], &[types::I64])?;
+    funcs.insert("oct".to_string(), int_to_oct2);
+    funcs.insert("forge_int_to_oct2".to_string(), int_to_oct2);
+
+    // bin(int) → binary string
+    let int_to_bin2 =
+        declare_runtime_function(module, "forge_int_to_bin", &[types::I64], &[types::I64])?;
+    funcs.insert("bin".to_string(), int_to_bin2);
+    funcs.insert("forge_int_to_bin2".to_string(), int_to_bin2);
 
     // Hashing: sha256
     let sha256 = declare_runtime_function(
@@ -1302,16 +1335,7 @@ pub fn declare_runtime_functions(
     funcs.insert("fnv1a".to_string(), fnv1a);
     funcs.insert("forge_fnv1a".to_string(), fnv1a);
 
-    // oct/bin formatting
-    let int_to_oct =
-        declare_runtime_function(module, "forge_int_to_oct", &[types::I64], &[types::I64])?;
-    funcs.insert("oct".to_string(), int_to_oct);
-    funcs.insert("forge_int_to_oct".to_string(), int_to_oct);
-
-    let int_to_bin =
-        declare_runtime_function(module, "forge_int_to_bin", &[types::I64], &[types::I64])?;
-    funcs.insert("bin".to_string(), int_to_bin);
-    funcs.insert("forge_int_to_bin".to_string(), int_to_bin);
+    // (oct/bin are declared earlier with forge_int_to_oct / forge_int_to_bin)
 
     // String: index_of
     let index_of = declare_runtime_function(
@@ -1322,6 +1346,24 @@ pub fn declare_runtime_functions(
     )?;
     funcs.insert("index_of".to_string(), index_of);
     funcs.insert("forge_cstring_index_of".to_string(), index_of);
+
+    let starts_with = declare_runtime_function(
+        module,
+        "forge_cstring_starts_with",
+        &[types::I64, types::I64],
+        &[types::I64],
+    )?;
+    funcs.insert("starts_with".to_string(), starts_with);
+    funcs.insert("forge_cstring_starts_with".to_string(), starts_with);
+
+    let ends_with = declare_runtime_function(
+        module,
+        "forge_cstring_ends_with",
+        &[types::I64, types::I64],
+        &[types::I64],
+    )?;
+    funcs.insert("ends_with".to_string(), ends_with);
+    funcs.insert("forge_cstring_ends_with".to_string(), ends_with);
 
     // String: pad_left, pad_right, repeat
     let pad_left = declare_runtime_function(
@@ -1479,6 +1521,78 @@ pub fn declare_runtime_functions(
     let log_error2 = declare_runtime_function(module, "forge_log_error", &[types::I64], &[])?;
     funcs.insert("error".to_string(), log_error2);
     funcs.insert("debug".to_string(), log_error2); // stub debug as well
+
+    // to_hex (alias for hex_encode)
+    let to_hex =
+        declare_runtime_function(module, "forge_hex_encode", &[types::I64], &[types::I64])?;
+    funcs.insert("to_hex".to_string(), to_hex);
+
+    // float_fixed (format float with fixed decimal places)
+    let float_fixed = declare_runtime_function(
+        module,
+        "forge_float_fixed",
+        &[types::F64, types::I64],
+        &[types::I64],
+    )?;
+    funcs.insert("float_fixed".to_string(), float_fixed);
+
+    // is_dir
+    let is_dir = declare_runtime_function(module, "forge_is_dir", &[types::I64], &[types::I64])?;
+    funcs.insert("is_dir".to_string(), is_dir);
+
+    // show (generic display — stub, returns arg as-is)
+    let show = declare_runtime_function(module, "forge_identity", &[types::I64], &[types::I64])?;
+    funcs.insert("show".to_string(), show);
+    funcs.insert("show_and_hash".to_string(), show);
+
+    // object_get (JSON object field access — stub)
+    let object_get =
+        declare_runtime_function(module, "forge_identity", &[types::I64], &[types::I64])?;
+    funcs.insert("object_get".to_string(), object_get);
+    funcs.insert("get_string".to_string(), object_get);
+    funcs.insert("get_int".to_string(), object_get);
+    funcs.insert("get_float".to_string(), object_get);
+    funcs.insert("get_bool".to_string(), object_get);
+    funcs.insert("get_array".to_string(), object_get);
+
+    // last_index_of
+    let last_index_of = declare_runtime_function(
+        module,
+        "forge_cstring_last_index_of",
+        &[types::I64, types::I64],
+        &[types::I64],
+    )?;
+    funcs.insert("last_index_of".to_string(), last_index_of);
+
+    // process_wait
+    let process_wait =
+        declare_runtime_function(module, "forge_process_wait", &[types::I64], &[types::I64])?;
+    funcs.insert("process_wait".to_string(), process_wait);
+    funcs.insert("process_kill".to_string(), process_wait);
+
+    // URL components
+    let url_scheme =
+        declare_runtime_function(module, "forge_url_scheme", &[types::I64], &[types::I64])?;
+    funcs.insert("scheme".to_string(), url_scheme);
+    funcs.insert("host".to_string(), url_scheme);
+    funcs.insert("path".to_string(), url_scheme);
+    funcs.insert("query".to_string(), url_scheme);
+    funcs.insert("fragment".to_string(), url_scheme);
+    funcs.insert("encode".to_string(), url_scheme);
+    funcs.insert("decode".to_string(), url_scheme);
+
+    // channel close
+    let ch_close = declare_runtime_function(module, "forge_tcp_close", &[types::I64], &[])?;
+    funcs.insert("close".to_string(), ch_close);
+
+    // tcp_read with buffer size (2 args)
+    let tcp_read2 = declare_runtime_function(
+        module,
+        "forge_tcp_read2",
+        &[types::I64, types::I64],
+        &[types::I64],
+    )?;
+    funcs.insert("tcp_read".to_string(), tcp_read2);
 
     // Note: list_dir returns a linked list - needs special handling
     // For now, declare but don't use directly

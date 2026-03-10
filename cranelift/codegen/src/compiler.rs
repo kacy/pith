@@ -25,6 +25,8 @@ pub enum ValueKind {
     Bool,
     ListString,
     ListUnknown,
+    Map,
+    Set,
 }
 
 /// Variable counter for generating unique variable indices
@@ -53,7 +55,26 @@ fn infer_value_kind(node: &AstNode, variables: &HashMap<String, LocalVar>) -> Va
     match node {
         AstNode::StringLiteral(_) | AstNode::StringInterp { .. } => ValueKind::String,
         AstNode::BoolLiteral(_) => ValueKind::Bool,
-        AstNode::IntLiteral(_) | AstNode::FloatLiteral(_) | AstNode::BinaryOp { .. } => {
+        AstNode::IntLiteral(_) | AstNode::FloatLiteral(_) => ValueKind::Int,
+        AstNode::BinaryOp { op, left, right } => {
+            // String concatenation returns a String
+            if matches!(op, BinaryOp::Add) {
+                let lk = infer_value_kind(left, variables);
+                let rk = infer_value_kind(right, variables);
+                if matches!(lk, ValueKind::String)
+                    || matches!(rk, ValueKind::String)
+                    || matches!(
+                        left.as_ref(),
+                        AstNode::StringLiteral(_) | AstNode::StringInterp { .. }
+                    )
+                    || matches!(
+                        right.as_ref(),
+                        AstNode::StringLiteral(_) | AstNode::StringInterp { .. }
+                    )
+                {
+                    return ValueKind::String;
+                }
+            }
             ValueKind::Int
         }
         AstNode::ListLiteral { elements, .. } => {
@@ -67,6 +88,7 @@ fn infer_value_kind(node: &AstNode, variables: &HashMap<String, LocalVar>) -> Va
                 ValueKind::ListUnknown
             }
         }
+        AstNode::MapLiteral { .. } => ValueKind::Map,
         AstNode::Identifier(name) => variables
             .get(name)
             .map(|v| v.kind)
@@ -92,11 +114,20 @@ fn infer_value_kind(node: &AstNode, variables: &HashMap<String, LocalVar>) -> Va
             | "d_trim_left"
             | "d_trim_right"
             | "get_type_name"
-            | "convert_path_to_module" => ValueKind::String,
-            "split" | "args" | "keys" | "values" | "list_dir" => ValueKind::ListString,
+            | "convert_path_to_module"
+            | "to_upper"
+            | "to_lower"
+            | "reverse"
+            | "replace"
+            | "repeat"
+            | "pad_left"
+            | "pad_right"
+            | "to_string"
+            | "char_at" => ValueKind::String,
+            "split" | "args" | "keys" | "values" | "list_dir" | "chars" => ValueKind::ListString,
             "len" | "time" | "random_int" | "ord" => ValueKind::Int,
             "contains" | "contains_key" | "starts_with" | "ends_with" | "string_starts_with"
-            | "dir_exists" | "file_exists" => ValueKind::Bool,
+            | "dir_exists" | "file_exists" | "is_empty" => ValueKind::Bool,
             _ => ValueKind::Unknown,
         },
         _ => ValueKind::Unknown,
@@ -104,9 +135,33 @@ fn infer_value_kind(node: &AstNode, variables: &HashMap<String, LocalVar>) -> Va
 }
 
 /// Collect all string literals from AST
+/// Strip surrounding/edge double-quotes from string literals (zig parser includes them)
+fn strip_string_quotes(s: &str) -> String {
+    // String literals from the zig lexer include surrounding double-quotes as characters.
+    // StringInterp literal parts may have a leading " (first part) or trailing " (last part).
+    // Strip leading " and/or trailing " from the content.
+    let s = if s.starts_with('"') { &s[1..] } else { s };
+    let s = if s.ends_with('"') {
+        &s[..s.len() - 1]
+    } else {
+        s
+    };
+    s.to_string()
+}
+
 fn collect_strings(node: &AstNode, strings: &mut Vec<String>) {
     match node {
-        AstNode::StringLiteral(s) => strings.push(s.clone()),
+        AstNode::StringLiteral(s) => strings.push(strip_string_quotes(s)),
+        AstNode::StringInterp { parts } => {
+            for part in parts {
+                match part {
+                    crate::ast::StringInterpPart::Literal(s) => {
+                        strings.push(strip_string_quotes(s))
+                    }
+                    crate::ast::StringInterpPart::Expr(expr) => collect_strings(expr, strings),
+                }
+            }
+        }
         AstNode::BinaryOp { left, right, .. } => {
             collect_strings(left, strings);
             collect_strings(right, strings);
@@ -115,6 +170,12 @@ fn collect_strings(node: &AstNode, strings: &mut Vec<String>) {
         AstNode::Call { args, .. } => {
             for arg in args {
                 collect_strings(arg, strings);
+            }
+        }
+
+        AstNode::ListLiteral { elements, .. } => {
+            for elem in elements {
+                collect_strings(elem, strings);
             }
         }
         AstNode::Let { value, .. } => collect_strings(value, strings),
@@ -142,6 +203,12 @@ fn collect_strings(node: &AstNode, strings: &mut Vec<String>) {
             if let Some(e) = expr {
                 collect_strings(e, strings);
             }
+        }
+        AstNode::For { body, .. } => {
+            collect_strings(body, strings);
+        }
+        AstNode::Assign { value, .. } => {
+            collect_strings(value, strings);
         }
         _ => {}
     }
@@ -258,12 +325,17 @@ pub fn compile_module(
     // Collect all string literals first
     let mut all_strings = Vec::new();
     for node in &ast_nodes {
-        if let AstNode::Function { body, .. } = node {
-            collect_strings(body, &mut all_strings);
+        match node {
+            AstNode::Function { body, .. } => collect_strings(body, &mut all_strings),
+            AstNode::Test { body, .. } => collect_strings(body, &mut all_strings),
+            _ => {}
         }
     }
+    // Deduplicate (preserving order)
+    let mut seen = std::collections::HashSet::new();
+    all_strings.retain(|s| seen.insert(s.clone()));
 
-    // Declare string data
+    // Declare string data (strings are already quote-stripped by collect_strings)
     let mut string_funcs = HashMap::new();
     for (i, s) in all_strings.iter().enumerate() {
         let name = format!("str_{}", i);
@@ -1233,7 +1305,8 @@ fn compile_expr(
         AstNode::StringLiteral(s) => {
             // Call the string data function to get the address
             // For now, just return the pointer directly (using simple strlen for .len())
-            let ptr_val = if let Some(&str_func_id) = string_funcs.get(s.as_str()) {
+            let stripped_s = strip_string_quotes(s);
+            let ptr_val = if let Some(&str_func_id) = string_funcs.get(stripped_s.as_str()) {
                 let str_func_ref = module.declare_func_in_func(str_func_id, builder.func);
                 let call = builder.ins().call(str_func_ref, &[]);
                 builder.func.dfg.first_result(call)
@@ -1260,8 +1333,9 @@ fn compile_expr(
             for part in parts {
                 let part_val = match part {
                     crate::ast::StringInterpPart::Literal(s) => {
-                        // Get string pointer from string_funcs or create new
-                        if let Some(&str_func_id) = string_funcs.get(s.as_str()) {
+                        // Get string pointer from string_funcs (keys are quote-stripped)
+                        let stripped_s = strip_string_quotes(s);
+                        if let Some(&str_func_id) = string_funcs.get(stripped_s.as_str()) {
                             let str_func_ref =
                                 module.declare_func_in_func(str_func_id, builder.func);
                             let call = builder.ins().call(str_func_ref, &[]);
@@ -1283,15 +1357,32 @@ fn compile_expr(
                             func_signatures,
                         )?;
 
-                        // Convert to string based on type
-                        // For now, assume int - use int_to_cstr
-                        if let Some(&int_to_str_id) = runtime_funcs.get("forge_int_to_cstr") {
-                            let int_to_str_ref =
-                                module.declare_func_in_func(int_to_str_id, builder.func);
-                            let call = builder.ins().call(int_to_str_ref, &[expr_val]);
-                            builder.func.dfg.first_result(call)
+                        // Convert to string based on actual type
+                        let expr_ty = builder.func.dfg.value_type(expr_val);
+                        let expr_kind = infer_value_kind(expr, variables);
+                        if matches!(expr_kind, ValueKind::String) {
+                            // Already a cstring pointer — pass through directly
+                            expr_val
                         } else {
-                            builder.ins().iconst(types::I64, 0)
+                            let converter_name = if expr_ty == types::F64 {
+                                "forge_float_to_cstr"
+                            } else {
+                                "forge_int_to_cstr"
+                            };
+                            if let Some(&to_str_id) = runtime_funcs.get(converter_name) {
+                                let to_str_ref =
+                                    module.declare_func_in_func(to_str_id, builder.func);
+                                // Coerce sub-i64 integer types (e.g. i8 from bool) to i64
+                                let coerced = if expr_ty != types::I64 && expr_ty != types::F64 {
+                                    builder.ins().uextend(types::I64, expr_val)
+                                } else {
+                                    expr_val
+                                };
+                                let call = builder.ins().call(to_str_ref, &[coerced]);
+                                builder.func.dfg.first_result(call)
+                            } else {
+                                builder.ins().iconst(types::I64, 0)
+                            }
                         }
                     }
                 };
@@ -1629,13 +1720,18 @@ fn compile_expr(
 
         AstNode::BinaryOp { op, left, right } => {
             // Check if this is string concatenation
-            let is_string_op = matches!(left.as_ref(), AstNode::StringLiteral(_))
-                || matches!(right.as_ref(), AstNode::StringLiteral(_));
+            let left_kind = infer_value_kind(left, variables);
+            let right_kind = infer_value_kind(right, variables);
+            let is_string_op = matches!(left_kind, ValueKind::String)
+                || matches!(right_kind, ValueKind::String)
+                || matches!(left.as_ref(), AstNode::StringLiteral(_))
+                || matches!(right.as_ref(), AstNode::StringLiteral(_))
+                || matches!(left.as_ref(), AstNode::StringInterp { .. })
+                || matches!(right.as_ref(), AstNode::StringInterp { .. });
 
             if is_string_op && matches!(op, BinaryOp::Add) {
-                // String concatenation - for now just return left operand
-                // (Proper implementation needs struct passing)
-                let mut left_val = compile_expr(
+                // String concatenation using forge_concat_cstr
+                let left_val = compile_expr(
                     builder,
                     variables,
                     runtime_funcs,
@@ -1645,7 +1741,7 @@ fn compile_expr(
                     left,
                     func_signatures,
                 )?;
-                let _right_val = compile_expr(
+                let right_val = compile_expr(
                     builder,
                     variables,
                     runtime_funcs,
@@ -1656,8 +1752,57 @@ fn compile_expr(
                     func_signatures,
                 )?;
 
-                // Just return left for now
-                Ok(left_val)
+                // Coerce values to cstring pointers for concatenation.
+                // String values (i64 = pointer) pass through directly.
+                // Int/Bool values (i64 = number) need forge_int_to_cstr.
+                // Float values need forge_float_to_cstr.
+                macro_rules! coerce_to_cstr {
+                    ($val:expr, $kind:expr, $ty:expr) => {{
+                        let v = $val;
+                        let k = $kind;
+                        let t = $ty;
+                        if t.is_float() {
+                            if let Some(&conv_id) = runtime_funcs.get("forge_float_to_cstr") {
+                                let conv_ref = module.declare_func_in_func(conv_id, builder.func);
+                                let call = builder.ins().call(conv_ref, &[v]);
+                                builder.func.dfg.first_result(call)
+                            } else {
+                                builder.ins().iconst(types::I64, 0)
+                            }
+                        } else {
+                            let v64 = if t != types::I64 {
+                                builder.ins().uextend(types::I64, v)
+                            } else {
+                                v
+                            };
+                            if matches!(k, ValueKind::Int | ValueKind::Bool) {
+                                if let Some(&conv_id) = runtime_funcs.get("forge_int_to_cstr") {
+                                    let conv_ref =
+                                        module.declare_func_in_func(conv_id, builder.func);
+                                    let call = builder.ins().call(conv_ref, &[v64]);
+                                    builder.func.dfg.first_result(call)
+                                } else {
+                                    v64
+                                }
+                            } else {
+                                v64
+                            }
+                        }
+                    }};
+                }
+
+                let left_ty = builder.func.dfg.value_type(left_val);
+                let left_cstr = coerce_to_cstr!(left_val, left_kind, left_ty);
+                let right_ty = builder.func.dfg.value_type(right_val);
+                let right_cstr = coerce_to_cstr!(right_val, right_kind, right_ty);
+
+                if let Some(&concat_id) = runtime_funcs.get("forge_concat_cstr") {
+                    let concat_ref = module.declare_func_in_func(concat_id, builder.func);
+                    let call = builder.ins().call(concat_ref, &[left_cstr, right_cstr]);
+                    Ok(builder.func.dfg.first_result(call))
+                } else {
+                    Ok(left_val)
+                }
             } else {
                 // Regular integer arithmetic
                 let mut left_val = compile_expr(
@@ -1909,21 +2054,32 @@ fn compile_expr(
                             }
                         }
 
-                        // String methods that return strings need special handling
-                        // (they require output pointer). For now, return placeholder.
-                        let string_return_methods =
-                            ["substring", "trim", "to_upper", "to_lower", "reverse"];
-                        if string_return_methods.contains(&func.as_str()) {
-                            // These methods need proper struct return handling
-                            // For now, try to call cstring versions if available
-                            let cstring_func_name = format!("forge_cstring_{}", func);
-                            if let Some(&func_id) = runtime_funcs.get(&cstring_func_name) {
-                                let func_ref = module.declare_func_in_func(func_id, builder.func);
-                                let call = builder.ins().call(func_ref, &[string_val]);
-                                return Ok(builder.func.dfg.first_result(call));
+                        // Prefer forge_cstring_* variants for all string methods.
+                        // These use raw C-string pointers and have consistent return types.
+                        // forge_string_* variants use ForgeString structs and return i8 for
+                        // bool methods (contains, starts_with, ends_with) — avoid those.
+                        let cstring_func_name = format!("forge_cstring_{}", func);
+                        if let Some(&func_id) = runtime_funcs.get(&cstring_func_name) {
+                            let func_ref = module.declare_func_in_func(func_id, builder.func);
+                            let mut arg_values = vec![string_val];
+                            for arg in &args[1..] {
+                                arg_values.push(compile_expr(
+                                    builder,
+                                    variables,
+                                    runtime_funcs,
+                                    declared_funcs,
+                                    string_funcs,
+                                    module,
+                                    arg,
+                                    func_signatures,
+                                )?);
                             }
-                            // Fallback: return the original string as placeholder
-                            return Ok(string_val);
+                            let call = builder.ins().call(func_ref, &arg_values);
+                            return if !builder.func.dfg.inst_results(call).is_empty() {
+                                Ok(builder.func.dfg.first_result(call))
+                            } else {
+                                Ok(builder.ins().iconst(types::I64, 0))
+                            };
                         }
 
                         let runtime_func_name = format!("forge_string_{}", func);
@@ -1999,17 +2155,29 @@ fn compile_expr(
                                 }
                             }
 
-                            let string_return_methods =
-                                ["substring", "trim", "to_upper", "to_lower", "reverse"];
-                            if string_return_methods.contains(&func.as_str()) {
-                                let cstring_func_name = format!("forge_cstring_{}", func);
-                                if let Some(&func_id) = runtime_funcs.get(&cstring_func_name) {
-                                    let func_ref =
-                                        module.declare_func_in_func(func_id, builder.func);
-                                    let call = builder.ins().call(func_ref, &[string_val]);
-                                    return Ok(builder.func.dfg.first_result(call));
+                            // Prefer forge_cstring_* variants (consistent return types, no i8 bools)
+                            let cstring_func_name = format!("forge_cstring_{}", func);
+                            if let Some(&func_id) = runtime_funcs.get(&cstring_func_name) {
+                                let func_ref = module.declare_func_in_func(func_id, builder.func);
+                                let mut arg_values = vec![string_val];
+                                for arg in &args[1..] {
+                                    arg_values.push(compile_expr(
+                                        builder,
+                                        variables,
+                                        runtime_funcs,
+                                        declared_funcs,
+                                        string_funcs,
+                                        module,
+                                        arg,
+                                        func_signatures,
+                                    )?);
                                 }
-                                return Ok(string_val);
+                                let call = builder.ins().call(func_ref, &arg_values);
+                                return if !builder.func.dfg.inst_results(call).is_empty() {
+                                    Ok(builder.func.dfg.first_result(call))
+                                } else {
+                                    Ok(builder.ins().iconst(types::I64, 0))
+                                };
                             }
 
                             let runtime_func_name = format!("forge_string_{}", func);
@@ -2042,9 +2210,114 @@ fn compile_expr(
                 }
             }
 
+            // Special case: len() — dispatch based on arg type
+            if func == "len" && args.len() == 1 {
+                let arg_val = compile_expr(
+                    builder,
+                    variables,
+                    runtime_funcs,
+                    declared_funcs,
+                    string_funcs,
+                    module,
+                    &args[0],
+                    func_signatures,
+                )?;
+                let arg_kind = infer_value_kind(&args[0], variables);
+                let len_func_name = match arg_kind {
+                    ValueKind::String => "forge_cstring_len",
+                    _ => "forge_list_len",
+                };
+                if let Some(&len_id) = runtime_funcs.get(len_func_name) {
+                    let len_ref = module.declare_func_in_func(len_id, builder.func);
+                    let call = builder.ins().call(len_ref, &[arg_val]);
+                    return Ok(builder.func.dfg.first_result(call));
+                }
+            }
+
+            // Special case: contains() — dispatch based on arg type
+            if func == "contains" && args.len() == 2 {
+                let arg_kind = infer_value_kind(&args[0], variables);
+                match arg_kind {
+                    ValueKind::String => {
+                        // String contains: forge_cstring_contains(haystack, needle)
+                        let haystack = compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            &args[0],
+                            func_signatures,
+                        )?;
+                        let needle = compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            &args[1],
+                            func_signatures,
+                        )?;
+                        if let Some(&cid) = runtime_funcs.get("forge_cstring_contains") {
+                            let cref = module.declare_func_in_func(cid, builder.func);
+                            let call = builder.ins().call(cref, &[haystack, needle]);
+                            return Ok(builder.func.dfg.first_result(call));
+                        }
+                    }
+                    ValueKind::ListString | ValueKind::ListUnknown => {
+                        // List contains int: forge_list_contains_int(list, value)
+                        let list_val = compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            &args[0],
+                            func_signatures,
+                        )?;
+                        let elem_val = compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            &args[1],
+                            func_signatures,
+                        )?;
+                        let elem_val = if builder.func.dfg.value_type(elem_val) != types::I64 {
+                            builder.ins().uextend(types::I64, elem_val)
+                        } else {
+                            elem_val
+                        };
+                        if let Some(&cid) = runtime_funcs.get("forge_list_contains_int") {
+                            let cref = module.declare_func_in_func(cid, builder.func);
+                            let call = builder.ins().call(cref, &[list_val, elem_val]);
+                            return Ok(builder.func.dfg.first_result(call));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             // Check for list method calls (includes fallback for variables)
-            let list_methods = ["len", "push", "pop", "get", "set", "join", "remove"];
-            if list_methods.contains(&func.as_str()) && !args.is_empty() {
+            let list_methods = [
+                "push", "pop", "get", "set", "join", "remove", "is_empty", "clear", "reverse",
+            ];
+            // Only dispatch to list methods if the first arg is actually a list.
+            // String args (e.g. join("/home", "docs") from std.os.path) must NOT
+            // be routed here — they should fall through to the runtime_funcs lookup.
+            let first_arg_is_list = args
+                .first()
+                .map(|a| {
+                    let k = infer_value_kind(a, variables);
+                    matches!(k, ValueKind::ListString | ValueKind::ListUnknown)
+                })
+                .unwrap_or(false);
+            if list_methods.contains(&func.as_str()) && !args.is_empty() && first_arg_is_list {
                 // Transform list.method(args) to forge_list_method(list, args)
                 let list_arg = &args[0];
                 let list_val = compile_expr(
@@ -2090,8 +2363,13 @@ fn compile_expr(
                 }
 
                 if func == "remove" {
-                    for arg in &args[1..] {
-                        let _ = compile_expr(
+                    // Call forge_list_remove(list_ptr, index)
+                    let remove_id = runtime_funcs.get("forge_list_remove").ok_or_else(|| {
+                        CompileError::UnknownFunction("forge_list_remove".to_string())
+                    })?;
+                    let remove_ref = module.declare_func_in_func(*remove_id, builder.func);
+                    let idx_val = if let Some(arg) = args.get(1) {
+                        let v = compile_expr(
                             builder,
                             variables,
                             runtime_funcs,
@@ -2101,7 +2379,15 @@ fn compile_expr(
                             arg,
                             func_signatures,
                         )?;
-                    }
+                        if builder.func.dfg.value_type(v) != types::I64 {
+                            builder.ins().uextend(types::I64, v)
+                        } else {
+                            v
+                        }
+                    } else {
+                        builder.ins().iconst(types::I64, 0)
+                    };
+                    builder.ins().call(remove_ref, &[list_val, idx_val]);
                     return Ok(builder.ins().iconst(types::I64, 0));
                 }
 
@@ -2126,6 +2412,65 @@ fn compile_expr(
                     };
                     let call = builder.ins().call(join_ref, &[list_val, sep_val]);
                     return Ok(builder.func.dfg.first_result(call));
+                }
+
+                if func == "contains" {
+                    let contains_id =
+                        runtime_funcs
+                            .get("forge_list_contains_int")
+                            .ok_or_else(|| {
+                                CompileError::UnknownFunction("forge_list_contains_int".to_string())
+                            })?;
+                    let contains_ref = module.declare_func_in_func(*contains_id, builder.func);
+                    let elem_val = if let Some(arg) = args.get(1) {
+                        let v = compile_expr(
+                            builder,
+                            variables,
+                            runtime_funcs,
+                            declared_funcs,
+                            string_funcs,
+                            module,
+                            arg,
+                            func_signatures,
+                        )?;
+                        if builder.func.dfg.value_type(v) != types::I64 {
+                            builder.ins().uextend(types::I64, v)
+                        } else {
+                            v
+                        }
+                    } else {
+                        builder.ins().iconst(types::I64, 0)
+                    };
+                    let call = builder.ins().call(contains_ref, &[list_val, elem_val]);
+                    return Ok(builder.func.dfg.first_result(call));
+                }
+
+                if func == "is_empty" {
+                    let is_empty_id =
+                        runtime_funcs.get("forge_list_is_empty").ok_or_else(|| {
+                            CompileError::UnknownFunction("forge_list_is_empty".to_string())
+                        })?;
+                    let is_empty_ref = module.declare_func_in_func(*is_empty_id, builder.func);
+                    let call = builder.ins().call(is_empty_ref, &[list_val]);
+                    return Ok(builder.func.dfg.first_result(call));
+                }
+
+                if func == "clear" {
+                    let clear_id = runtime_funcs.get("forge_list_clear").ok_or_else(|| {
+                        CompileError::UnknownFunction("forge_list_clear".to_string())
+                    })?;
+                    let clear_ref = module.declare_func_in_func(*clear_id, builder.func);
+                    builder.ins().call(clear_ref, &[list_val]);
+                    return Ok(builder.ins().iconst(types::I64, 0));
+                }
+
+                if func == "reverse" {
+                    let reverse_id = runtime_funcs.get("forge_list_reverse").ok_or_else(|| {
+                        CompileError::UnknownFunction("forge_list_reverse".to_string())
+                    })?;
+                    let reverse_ref = module.declare_func_in_func(*reverse_id, builder.func);
+                    builder.ins().call(reverse_ref, &[list_val]);
+                    return Ok(builder.ins().iconst(types::I64, 0));
                 }
 
                 let runtime_func_name = format!("forge_list_{}", func);
@@ -2157,16 +2502,16 @@ fn compile_expr(
             }
 
             // Check for map method calls
-            let map_methods = [
-                "len",
-                "contains",
-                "contains_key",
-                "keys",
-                "values",
-                "insert",
-                "remove",
-            ];
-            if map_methods.contains(&func.as_str()) && !args.is_empty() {
+            let map_methods = ["contains_key", "keys", "values", "insert", "remove"];
+            // Only dispatch to map methods if the first arg is actually a map.
+            let first_arg_is_map = args
+                .first()
+                .map(|a| {
+                    let k = infer_value_kind(a, variables);
+                    matches!(k, ValueKind::Map)
+                })
+                .unwrap_or(false);
+            if map_methods.contains(&func.as_str()) && !args.is_empty() && first_arg_is_map {
                 // Transform map.method(args) to forge_map_method(map, args)
                 let map_arg = &args[0];
                 let map_val = compile_expr(
@@ -2265,16 +2610,24 @@ fn compile_expr(
             // Handle print function selection based on argument type
             let (func_name, arg_values) = if func == "print" && !args.is_empty() {
                 let arg_kind = infer_value_kind(&args[0], variables);
-                let looks_numeric = matches!(
-                    &args[0],
-                    AstNode::IntLiteral(_)
-                        | AstNode::BoolLiteral(_)
-                        | AstNode::FloatLiteral(_)
-                        | AstNode::BinaryOp { .. }
-                        | AstNode::UnaryOp { .. }
-                        | AstNode::Index { .. }
-                ) || matches!(&args[0], AstNode::Call { func, .. } if func == "len")
-                    || matches!(arg_kind, ValueKind::Int | ValueKind::Bool);
+                // A BinaryOp is numeric unless it's a string concat (Add with a string operand)
+                let is_string_binop = matches!(&args[0], AstNode::BinaryOp { op, left, right }
+                    if matches!(op, BinaryOp::Add) && (
+                        matches!(left.as_ref(), AstNode::StringLiteral(_) | AstNode::StringInterp { .. })
+                        || matches!(right.as_ref(), AstNode::StringLiteral(_) | AstNode::StringInterp { .. })
+                    )
+                );
+                let looks_numeric = !is_string_binop
+                    && (matches!(
+                        &args[0],
+                        AstNode::IntLiteral(_)
+                            | AstNode::BoolLiteral(_)
+                            | AstNode::FloatLiteral(_)
+                            | AstNode::BinaryOp { .. }
+                            | AstNode::UnaryOp { .. }
+                            | AstNode::Index { .. }
+                    ) || matches!(&args[0], AstNode::Call { func, .. } if func == "len")
+                        || matches!(arg_kind, ValueKind::Int | ValueKind::Bool));
 
                 // Compile the first argument to determine its type
                 let first_arg = compile_expr(
@@ -2305,7 +2658,17 @@ fn compile_expr(
                 }
 
                 // Choose print function based on argument type
-                if looks_numeric || first_arg_ty == types::F64 {
+                if first_arg_ty == types::F64 {
+                    // Float: convert to string first, then print as cstr
+                    if let Some(&conv_id) = runtime_funcs.get("forge_float_to_cstr") {
+                        let conv_ref = module.declare_func_in_func(conv_id, builder.func);
+                        let call = builder.ins().call(conv_ref, &[all_args[0]]);
+                        let s = builder.func.dfg.first_result(call);
+                        ("forge_print_cstr", vec![s])
+                    } else {
+                        ("forge_print_int", all_args)
+                    }
+                } else if looks_numeric {
                     ("forge_print_int", all_args)
                 } else {
                     ("forge_print_cstr", all_args)
@@ -2335,11 +2698,12 @@ fn compile_expr(
                 (fname, avals)
             };
 
-            let Some(func_id) = runtime_funcs
-                .get(func_name)
+            // User-defined functions take priority over runtime aliases
+            let Some(func_id) = declared_funcs
+                .get(func)
                 .copied()
+                .or_else(|| runtime_funcs.get(func_name).copied())
                 .or_else(|| runtime_funcs.get(func).copied())
-                .or_else(|| declared_funcs.get(func).copied())
             else {
                 if func
                     .chars()
@@ -2387,12 +2751,26 @@ fn compile_expr(
                     let val = if let Some(&existing) = arg_values.get(i) {
                         let val_ty = builder.func.dfg.value_type(existing);
                         if val_ty == target_ty {
+                            // Types already match
                             existing
-                        } else if val_ty.bits() > target_ty.bits() {
-                            builder.ins().ireduce(target_ty, existing)
+                        } else if val_ty.is_float() && target_ty.is_int() {
+                            // Float -> Int: bitcast (reinterpret bits)
+                            builder.ins().bitcast(target_ty, MemFlags::new(), existing)
+                        } else if val_ty.is_int() && target_ty.is_float() {
+                            // Int -> Float: bitcast (reinterpret bits)
+                            builder.ins().bitcast(target_ty, MemFlags::new(), existing)
+                        } else if val_ty.is_int() && target_ty.is_int() {
+                            if val_ty.bits() > target_ty.bits() {
+                                builder.ins().ireduce(target_ty, existing)
+                            } else {
+                                builder.ins().uextend(target_ty, existing)
+                            }
                         } else {
-                            builder.ins().uextend(target_ty, existing)
+                            // Float to float or other: use bitcast as fallback
+                            builder.ins().bitcast(target_ty, MemFlags::new(), existing)
                         }
+                    } else if target_ty.is_float() {
+                        builder.ins().f64const(0.0)
                     } else {
                         builder.ins().iconst(target_ty, 0)
                     };

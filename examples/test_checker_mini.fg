@@ -1,0 +1,23 @@
+# Minimal checker-like pattern: global map, init function, access
+mut type_names: Map[Int, String] := {}
+mut next_id: Int := 0
+
+fn register_type(name: String) -> Int:
+    id := next_id
+    next_id = next_id + 1
+    type_names.insert(id, name)
+    return id
+
+fn get_name(id: Int) -> String:
+    if type_names.contains_key(id):
+        return type_names[id]
+    return "unknown"
+
+fn main():
+    int_id := register_type("Int")
+    str_id := register_type("String")
+    bool_id := register_type("Bool")
+    print(get_name(int_id))
+    print(get_name(str_id))
+    print(get_name(bool_id))
+    print(get_name(99))

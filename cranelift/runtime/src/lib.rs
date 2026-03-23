@@ -23,6 +23,29 @@ use std::sync::atomic::AtomicUsize;
 pub static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 
+/// Closure environment: a fixed-size array of i64 slots for captured variables.
+/// Single-threaded programs can use this to pass captures to lambda functions
+/// compiled without a full closure ABI.
+static mut CLOSURE_ENV: [i64; 16] = [0i64; 16];
+
+/// Set a captured variable slot before calling a closure.
+#[no_mangle]
+pub unsafe extern "C" fn forge_closure_set_env(slot: i64, value: i64) {
+    if slot >= 0 && (slot as usize) < 16 {
+        CLOSURE_ENV[slot as usize] = value;
+    }
+}
+
+/// Read a captured variable from the closure environment.
+#[no_mangle]
+pub unsafe extern "C" fn forge_closure_get_env(slot: i64) -> i64 {
+    if slot >= 0 && (slot as usize) < 16 {
+        CLOSURE_ENV[slot as usize]
+    } else {
+        0
+    }
+}
+
 /// Initialize the runtime
 ///
 /// # Safety
@@ -211,13 +234,13 @@ pub unsafe extern "C" fn forge_print_err(ptr: *const i8) {
 /// # Safety
 /// Both pointers must be valid null-terminated C strings or null
 #[no_mangle]
-pub unsafe extern "C" fn forge_cstring_eq(a: *const i8, b: *const i8) -> bool {
+pub unsafe extern "C" fn forge_cstring_eq(a: *const i8, b: *const i8) -> i64 {
     // Handle null cases
     if a.is_null() && b.is_null() {
-        return true;
+        return 1;
     }
     if a.is_null() || b.is_null() {
-        return false;
+        return 0;
     }
 
     // Compare byte by byte
@@ -229,11 +252,45 @@ pub unsafe extern "C" fn forge_cstring_eq(a: *const i8, b: *const i8) -> bool {
         let cb = *pb;
 
         if ca != cb {
-            return false;
+            return 0;
         }
 
         if ca == 0 {
-            return true;
+            return 1;
+        }
+
+        pa = pa.add(1);
+        pb = pb.add(1);
+    }
+}
+
+/// Compare two C strings lexicographically (like strcmp).
+/// Returns negative if a < b, 0 if equal, positive if a > b.
+#[no_mangle]
+pub unsafe extern "C" fn forge_cstring_cmp(a: *const i8, b: *const i8) -> i64 {
+    if a.is_null() && b.is_null() {
+        return 0;
+    }
+    if a.is_null() {
+        return -1;
+    }
+    if b.is_null() {
+        return 1;
+    }
+
+    let mut pa = a;
+    let mut pb = b;
+
+    loop {
+        let ca = *pa as u8;
+        let cb = *pb as u8;
+
+        if ca != cb {
+            return (ca as i64) - (cb as i64);
+        }
+
+        if ca == 0 {
+            return 0;
         }
 
         pa = pa.add(1);
@@ -498,7 +555,7 @@ pub extern "C" fn forge_bool_to_cstr(b: i64) -> *mut i8 {
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_file_exists(path: *const i8) -> i8 {
+pub unsafe extern "C" fn forge_file_exists(path: *const i8) -> i64 {
     if path.is_null() {
         return 0;
     }
@@ -524,7 +581,7 @@ pub unsafe extern "C" fn forge_file_exists(path: *const i8) -> i8 {
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_dir_exists(path: *const i8) -> i8 {
+pub unsafe extern "C" fn forge_dir_exists(path: *const i8) -> i64 {
     if path.is_null() {
         return 0;
     }
@@ -551,7 +608,7 @@ pub unsafe extern "C" fn forge_dir_exists(path: *const i8) -> i8 {
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_mkdir(path: *const i8) -> i8 {
+pub unsafe extern "C" fn forge_mkdir(path: *const i8) -> i64 {
     use std::fs;
 
     if path.is_null() {
@@ -579,7 +636,7 @@ pub unsafe extern "C" fn forge_mkdir(path: *const i8) -> i8 {
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_remove_file(path: *const i8) -> i8 {
+pub unsafe extern "C" fn forge_remove_file(path: *const i8) -> i64 {
     use std::fs;
 
     if path.is_null() {
@@ -607,7 +664,7 @@ pub unsafe extern "C" fn forge_remove_file(path: *const i8) -> i8 {
 /// # Safety
 /// Both paths must be valid null-terminated C strings
 #[no_mangle]
-pub unsafe extern "C" fn forge_rename_file(from: *const i8, to: *const i8) -> i8 {
+pub unsafe extern "C" fn forge_rename_file(from: *const i8, to: *const i8) -> i64 {
     use std::fs;
 
     if from.is_null() || to.is_null() {
@@ -686,7 +743,7 @@ pub unsafe extern "C" fn forge_read_file(path: *const i8) -> *mut i8 {
 /// # Safety
 /// Both path and content must be valid null-terminated C strings
 #[no_mangle]
-pub unsafe extern "C" fn forge_write_file(path: *const i8, content: *const i8) -> i8 {
+pub unsafe extern "C" fn forge_write_file(path: *const i8, content: *const i8) -> i64 {
     use std::fs;
 
     if path.is_null() || content.is_null() {
@@ -727,7 +784,7 @@ pub unsafe extern "C" fn forge_write_file(path: *const i8, content: *const i8) -
 /// # Safety
 /// Both path and content must be valid null-terminated C strings
 #[no_mangle]
-pub unsafe extern "C" fn forge_append_file(path: *const i8, content: *const i8) -> i8 {
+pub unsafe extern "C" fn forge_append_file(path: *const i8, content: *const i8) -> i64 {
     use std::fs::OpenOptions;
     use std::io::Write;
 
@@ -1397,6 +1454,47 @@ pub unsafe extern "C" fn forge_cstring_chars(s: *const i8) -> i64 {
     list.ptr as i64
 }
 
+/// Sort a list of C-string pointers in-place (lexicographic order)
+///
+/// # Safety
+/// list_ptr is i64 carrying the ForgeList's internal ptr value;
+/// each 8-byte element is a *const i8 pointer to a null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_sort_strings(list_ptr: i64) {
+    use crate::collections::list::ForgeList;
+    let list = ForgeList {
+        ptr: list_ptr as *mut (),
+    };
+    if list.ptr.is_null() {
+        return;
+    }
+    let impl_ref = &mut *(list.ptr as *mut crate::collections::list::ListImpl);
+    impl_ref.elements.sort_by(|a, b| {
+        let ap = if a.len() >= 8 {
+            i64::from_ne_bytes(a[..8].try_into().unwrap_or([0; 8])) as *const i8
+        } else {
+            std::ptr::null()
+        };
+        let bp = if b.len() >= 8 {
+            i64::from_ne_bytes(b[..8].try_into().unwrap_or([0; 8])) as *const i8
+        } else {
+            std::ptr::null()
+        };
+        if ap.is_null() && bp.is_null() {
+            return std::cmp::Ordering::Equal;
+        }
+        if ap.is_null() {
+            return std::cmp::Ordering::Less;
+        }
+        if bp.is_null() {
+            return std::cmp::Ordering::Greater;
+        }
+        let a_str = std::ffi::CStr::from_ptr(ap);
+        let b_str = std::ffi::CStr::from_ptr(bp);
+        a_str.cmp(b_str)
+    });
+}
+
 /// Sort a list of i64 values in-place
 ///
 /// # Safety
@@ -1437,26 +1535,24 @@ pub unsafe extern "C" fn forge_list_slice(list_ptr: i64, start: i64, end: i64) -
     let list = ForgeList {
         ptr: list_ptr as *mut (),
     };
-    if list.ptr.is_null() {
-        let boxed = Box::new(new_list);
-        return Box::into_raw(boxed) as i64;
-    }
-    let impl_ref = &*(list.ptr as *const crate::collections::list::ListImpl);
-    let len = impl_ref.elements.len() as i64;
-    let s = start.max(0).min(len) as usize;
-    let e = end.max(0).min(len) as usize;
-    for i in s..e {
-        if let Some(elem) = impl_ref.elements.get(i) {
-            let val = if elem.len() >= 8 {
-                i64::from_ne_bytes(elem[..8].try_into().unwrap_or([0; 8]))
-            } else {
-                0
-            };
-            forge_list_push_value(new_list, val);
+    if !list.ptr.is_null() {
+        let impl_ref = &*(list.ptr as *const crate::collections::list::ListImpl);
+        let len = impl_ref.elements.len() as i64;
+        let s = start.max(0).min(len) as usize;
+        let e = end.max(0).min(len) as usize;
+        for i in s..e {
+            if let Some(elem) = impl_ref.elements.get(i) {
+                let val = if elem.len() >= 8 {
+                    i64::from_ne_bytes(elem[..8].try_into().unwrap_or([0; 8]))
+                } else {
+                    0
+                };
+                forge_list_push_value(new_list, val);
+            }
         }
     }
-    let boxed = Box::new(new_list);
-    Box::into_raw(boxed) as i64
+    // Return the internal pointer value (ForgeList.ptr), not a box pointer
+    new_list.ptr as i64
 }
 
 /// Replace all occurrences of `from` with `to` in `s`
@@ -2671,6 +2767,55 @@ pub unsafe extern "C" fn forge_url_scheme(url: i64) -> *mut i8 {
 #[no_mangle]
 pub extern "C" fn forge_tcp_read2(_conn: i64, _max_bytes: i64) -> *mut i8 {
     unsafe { forge_cstring_empty() }
+}
+
+/// Allocate a zeroed block of `num_fields * 8` bytes for struct storage.
+/// Returns the pointer as i64.
+///
+/// # Safety
+/// Caller must ensure the returned pointer is eventually freed.
+#[no_mangle]
+pub unsafe extern "C" fn forge_struct_alloc(num_fields: i64) -> i64 {
+    use std::alloc::{alloc_zeroed, Layout};
+
+    let size = (num_fields.max(0) as usize) * 8;
+    if size == 0 {
+        return 0;
+    }
+
+    let layout = Layout::from_size_align(size, 8).unwrap();
+    let ptr = alloc_zeroed(layout);
+    if ptr.is_null() {
+        return 0;
+    }
+    ptr as i64
+}
+
+/// Build a ForgeList of C-string pointers from `std::env::args()` and return
+/// the list pointer as i64.
+///
+/// # Safety
+/// Caller receives ownership of the list and its string allocations.
+#[no_mangle]
+pub unsafe extern "C" fn forge_args_to_list() -> i64 {
+    use crate::collections::list::{forge_list_new, forge_list_push_value};
+    use std::alloc::{alloc, Layout};
+
+    let list = forge_list_new(8, 0); // primitive list of i64 (cstring pointers)
+
+    for arg in std::env::args() {
+        let arg_len = arg.len();
+        let arg_layout = Layout::from_size_align(arg_len + 1, 1).unwrap();
+        let arg_ptr = alloc(arg_layout) as *mut i8;
+
+        if !arg_ptr.is_null() {
+            std::ptr::copy_nonoverlapping(arg.as_ptr(), arg_ptr as *mut u8, arg_len);
+            *arg_ptr.add(arg_len) = 0;
+            forge_list_push_value(list, arg_ptr as i64);
+        }
+    }
+
+    list.ptr as i64
 }
 
 // Re-export concurrency primitive FFI functions

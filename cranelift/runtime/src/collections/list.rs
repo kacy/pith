@@ -631,6 +631,28 @@ pub unsafe extern "C" fn forge_list_index_of_string(list: ForgeList, s: ForgeStr
     -1
 }
 
+/// Find index of integer value in list
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_index_of_int(list: ForgeList, value: i64) -> i64 {
+    if list.ptr.is_null() {
+        return -1;
+    }
+
+    let impl_ref = &*(list.ptr as *const ListImpl);
+
+    for i in 0..impl_ref.len() {
+        let elem = impl_ref.get(i).unwrap();
+        if elem.len() >= 8 {
+            let stored = i64::from_le_bytes(elem[..8].try_into().unwrap_or([0u8; 8]));
+            if stored == value {
+                return i as i64;
+            }
+        }
+    }
+
+    -1
+}
+
 /// Retain all elements (for string lists during copy)
 #[no_mangle]
 pub unsafe extern "C" fn forge_list_retain_all_strings(list: ForgeList) {

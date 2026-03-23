@@ -569,14 +569,14 @@ pub extern "C" fn forge_string_len_ptr(s_ptr: *const ForgeString) -> i64 {
 pub extern "C" fn forge_string_contains_ptr(
     haystack_ptr: *const ForgeString,
     needle_ptr: *const ForgeString,
-) -> bool {
+) -> i64 {
     if haystack_ptr.is_null() || needle_ptr.is_null() {
-        return false;
+        return 0;
     }
     unsafe {
         let haystack = &*haystack_ptr;
         let needle = &*needle_ptr;
-        forge_string_contains(*haystack, *needle)
+        if forge_string_contains(*haystack, *needle) { 1 } else { 0 }
     }
 }
 
@@ -615,11 +615,11 @@ pub unsafe extern "C" fn forge_string_trim_ptr(
 pub extern "C" fn forge_string_starts_with_ptr(
     s_ptr: *const ForgeString,
     prefix_ptr: *const ForgeString,
-) -> bool {
+) -> i64 {
     if s_ptr.is_null() || prefix_ptr.is_null() {
-        return false;
+        return 0;
     }
-    unsafe { forge_string_starts_with(*s_ptr, *prefix_ptr) }
+    unsafe { if forge_string_starts_with(*s_ptr, *prefix_ptr) { 1 } else { 0 } }
 }
 
 /// ABI wrapper for forge_string_ends_with
@@ -627,11 +627,11 @@ pub extern "C" fn forge_string_starts_with_ptr(
 pub extern "C" fn forge_string_ends_with_ptr(
     s_ptr: *const ForgeString,
     suffix_ptr: *const ForgeString,
-) -> bool {
+) -> i64 {
     if s_ptr.is_null() || suffix_ptr.is_null() {
-        return false;
+        return 0;
     }
-    unsafe { forge_string_ends_with(*s_ptr, *suffix_ptr) }
+    unsafe { if forge_string_ends_with(*s_ptr, *suffix_ptr) { 1 } else { 0 } }
 }
 
 /// ABI wrapper for forge_string_concat - returns result on stack

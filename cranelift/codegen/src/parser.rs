@@ -48,8 +48,9 @@ impl TextAstParser {
             let indent = line.len() - line.trim_start().len();
             let level = indent / 2;
 
-            // Parse the line content
-            let content = line.trim();
+            // Parse the line content (only trim leading whitespace to preserve
+            // trailing spaces in string literals like `lit "hello, `)
+            let content = line.trim_start();
             let parts: Vec<&str> = content.splitn(2, ' ').collect();
 
             let kind = parts[0].to_string();
@@ -82,6 +83,22 @@ impl TextAstParser {
     /// Advance to next line
     fn advance(&mut self) {
         self.pos += 1;
+    }
+
+    /// Skip the current line and all its children (lines at greater indent)
+    fn skip_subtree(&mut self) {
+        if let Some(line) = self.lines.get(self.pos) {
+            let parent_indent = line.indent;
+            self.pos += 1; // skip current line
+                           // skip all lines that are children (deeper indent)
+            while let Some(child) = self.lines.get(self.pos) {
+                if child.indent > parent_indent {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     /// Parse the module (root)
@@ -188,6 +205,11 @@ impl TextAstParser {
                             let ty = type_line.value.clone();
                             self.advance();
                             ty
+                        } else if type_line.kind == "fn_type" {
+                            // Function-type parameter (e.g. f: fn(Int) -> Int)
+                            // Skip the entire fn_type subtree and record as "Fn"
+                            self.skip_subtree();
+                            "Fn".to_string()
                         } else {
                             "Int".to_string() // Default
                         }
@@ -844,7 +866,7 @@ impl TextAstParser {
         })?;
 
         // Handle generic type instantiation: call / index / ident Channel / ident Int
-        // In this case, we extract the base type name (Channel) and ignore the type arg
+        // In this case, we extract the base type name and type arg, then mangle them
         let func_name = if func_line.kind == "index" {
             let index_indent = func_line.indent;
             self.advance(); // consume "index"
@@ -860,14 +882,27 @@ impl TextAstParser {
             } else {
                 "Unknown".to_string()
             };
-            // Skip type argument
+            // Get type argument
+            let type_arg = if let Some(type_line) = self.current() {
+                if type_line.kind == "ident" {
+                    let t = type_line.value.clone();
+                    self.advance();
+                    t
+                } else {
+                    "Unknown".to_string()
+                }
+            } else {
+                "Unknown".to_string()
+            };
+            // Skip any remaining children
             while let Some(l) = self.current() {
                 if l.indent <= index_indent {
                     break;
                 }
                 self.advance();
             }
-            base_name
+            // Create mangled name for monomorphization: identity_Int
+            format!("{}_{}", base_name, type_arg)
         } else if func_line.kind != "ident" {
             return Err(CompileError::UnsupportedFeature(format!(
                 "Expected function name, got '{}'",
@@ -1021,6 +1056,7 @@ impl TextAstParser {
                 })
             }
             "match" => self.parse_match(),
+            "tuple" => self.parse_tuple(),
             _ => {
                 // Skip unknown nodes
                 self.advance();
@@ -1333,6 +1369,36 @@ impl TextAstParser {
         })
     }
 
+    /// Parse tuple literal: tuple (N items) followed by N expressions
+    fn parse_tuple(&mut self) -> Result<AstNode, CompileError> {
+        let line = self.current().unwrap();
+        let tuple_indent = line.indent;
+        self.advance();
+
+        // Parse tuple elements (indented expressions)
+        let mut elements = Vec::new();
+        while let Some(line) = self.current() {
+            if line.indent <= tuple_indent {
+                break;
+            }
+            elements.push(self.parse_expression()?);
+        }
+
+        // Represent tuple as a struct initialization with numeric field names
+        // We'll use a special naming convention: "tuple_2" for 2-element tuple
+        let tuple_name = format!("tuple_{}", elements.len());
+        let fields: Vec<(String, AstNode)> = elements
+            .into_iter()
+            .enumerate()
+            .map(|(i, elem)| (i.to_string(), elem))
+            .collect();
+
+        Ok(AstNode::StructInit {
+            name: tuple_name,
+            fields,
+        })
+    }
+
     /// Parse try expression: try <expr> (the ? operator for error propagation)
     fn parse_try(&mut self) -> Result<AstNode, CompileError> {
         // Current line is "try"
@@ -1413,6 +1479,14 @@ impl TextAstParser {
                 self.advance();
                 // Parse pattern and expression for this arm
                 let pattern = self.parse_match_pattern()?;
+
+                // Skip the "body" marker if present
+                if let Some(body_line) = self.current() {
+                    if body_line.kind == "body" {
+                        self.advance();
+                    }
+                }
+
                 let arm_expr = self.parse_expression()?;
                 arms.push(crate::ast::MatchArm {
                     pattern,
@@ -1437,6 +1511,51 @@ impl TextAstParser {
         })?;
 
         match line.kind.as_str() {
+            "pattern" => {
+                // Pattern lines from self-hosted compiler have format like:
+                // "pattern bind <name>" or "pattern _" or "pattern <literal>"
+                let value = line.value.clone();
+                self.advance();
+
+                // Parse the pattern value
+                if value == "_" || value == "wildcard" {
+                    Ok(crate::ast::MatchPattern::Wildcard)
+                } else if value.starts_with("bind ") {
+                    // Binding pattern: "bind <name>"
+                    let var_name = value[5..].to_string();
+                    Ok(crate::ast::MatchPattern::Variable(var_name))
+                } else if value.contains(".") {
+                    // Enum variant pattern: EnumName.VariantName
+                    let parts: Vec<&str> = value.split('.').collect();
+                    if parts.len() == 2 {
+                        Ok(crate::ast::MatchPattern::EnumVariant {
+                            enum_name: parts[0].to_string(),
+                            variant_name: parts[1].to_string(),
+                            bind_vars: Vec::new(),
+                        })
+                    } else {
+                        Ok(crate::ast::MatchPattern::Variable(value))
+                    }
+                } else {
+                    // Try to parse as integer literal
+                    if let Ok(n) = value.parse::<i64>() {
+                        Ok(crate::ast::MatchPattern::Literal(
+                            crate::ast::AstNode::IntLiteral(n),
+                        ))
+                    } else if value == "true" {
+                        Ok(crate::ast::MatchPattern::Literal(
+                            crate::ast::AstNode::BoolLiteral(true),
+                        ))
+                    } else if value == "false" {
+                        Ok(crate::ast::MatchPattern::Literal(
+                            crate::ast::AstNode::BoolLiteral(false),
+                        ))
+                    } else {
+                        // Variable binding
+                        Ok(crate::ast::MatchPattern::Variable(value))
+                    }
+                }
+            }
             "variant" => {
                 // Enum variant pattern: EnumName.VariantName
                 let variant_str = line.value.clone();

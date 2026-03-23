@@ -1,0 +1,28 @@
+// Test Result types and error handling
+// This is what the self-hosted compiler uses extensively
+
+fn may_fail(should_fail: Bool) -> Int!:
+    if should_fail:
+        fail "Intentional failure"
+    return 42
+
+fn caller(x: Bool) -> Int!:
+    // Try operator (!) - propagates error if function fails
+    let result := may_fail(x)!
+    return result + 10
+
+fn main():
+    // Test success case
+    match caller(false):
+        case ok: Int =>
+            print_int(ok)
+            print("Success!")
+        case err: String =>
+            print("Error: " + err)
+    
+    // Test failure case  
+    match caller(true):
+        case ok: Int =>
+            print_int(ok)
+        case err: String =>
+            print("Got expected error: " + err)

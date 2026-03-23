@@ -50,15 +50,20 @@ fn find_runtime_header() -> String!:
 
 fn compile(path: String, test_mode: Bool) -> String!:
     c_code := compile_to_c(path, test_mode)!
+    print("[DEBUG] compile: got C code, len=" + to_string(c_code.len()))
 
     # set up build directory
     dir := get_directory(path)
+    print("[DEBUG] compile: dir=" + dir)
     build_dir := dir + "/.forge-build"
     exec("mkdir -p " + build_dir)
 
     # copy runtime header
+    print("[DEBUG] compile: finding runtime header")
     runtime := find_runtime_header()!
+    print("[DEBUG] compile: writing runtime header, len=" + to_string(runtime.len()))
     write_file(build_dir + "/forge_runtime.h", runtime)!
+    print("[DEBUG] compile: wrote runtime header")
 
     # write C source
     stem := get_stem(path)

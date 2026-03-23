@@ -7,10 +7,13 @@ use cranelift::prelude::*;
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 pub mod ast;
 pub mod compiler;
 pub mod linker;
+pub mod monomorphize;
 pub mod parser;
 
 /// Struct field information
@@ -82,6 +85,190 @@ impl GenericRegistry {
             .values()
             .filter(|inst| inst.base_type == base)
             .collect()
+    }
+}
+
+/// Global struct layouts: struct_name -> Vec<(field_name, field_offset)>
+/// All fields are 8 bytes, so offset = index * 8
+pub static STRUCT_LAYOUTS: OnceLock<Mutex<HashMap<String, Vec<(String, usize)>>>> = OnceLock::new();
+
+/// Global struct field types: struct_name -> Vec<(field_name, type_name)>
+static STRUCT_FIELD_TYPES: OnceLock<Mutex<HashMap<String, Vec<(String, String)>>>> =
+    OnceLock::new();
+
+/// Global variable-to-struct-type mapping: var_name -> struct_type_name
+static VAR_STRUCT_TYPES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+/// Global function return type mapping: func_name -> return_type_name
+static FUNC_RETURN_TYPES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+/// Global variable type mapping: var_name -> type_name (for type-directed dispatch)
+static GLOBAL_VAR_TYPES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+pub fn register_struct_layout(name: &str, fields: &[(String, String)]) {
+    let layouts = STRUCT_LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let ftypes = STRUCT_FIELD_TYPES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut field_info = Vec::new();
+    let mut type_info = Vec::new();
+    for (i, (fname, ftype)) in fields.iter().enumerate() {
+        // Strip "pub" suffix from field names (parser includes visibility)
+        let clean_name = fname.strip_suffix(" pub").unwrap_or(fname).to_string();
+        field_info.push((clean_name.clone(), i * 8));
+        type_info.push((clean_name, ftype.clone()));
+    }
+    if let Ok(mut map) = layouts.lock() {
+        map.insert(name.to_string(), field_info);
+    }
+    if let Ok(mut map) = ftypes.lock() {
+        map.insert(name.to_string(), type_info);
+    }
+}
+
+pub fn get_struct_layout(name: &str) -> Option<Vec<(String, usize)>> {
+    STRUCT_LAYOUTS
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|map| map.get(name).cloned())
+}
+
+pub fn get_struct_field_offset(struct_name: &str, field_name: &str) -> Option<usize> {
+    get_struct_layout(struct_name).and_then(|fields| {
+        fields
+            .iter()
+            .find(|(n, _)| n == field_name)
+            .map(|(_, off)| *off)
+    })
+}
+
+pub fn get_struct_field_type(struct_name: &str, field_name: &str) -> Option<String> {
+    STRUCT_FIELD_TYPES
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|map| {
+            map.get(struct_name).and_then(|fields| {
+                fields
+                    .iter()
+                    .find(|(n, _)| n == field_name)
+                    .map(|(_, t)| t.clone())
+            })
+        })
+}
+
+pub fn set_var_struct_type(var_name: &str, struct_type: &str) {
+    let types = VAR_STRUCT_TYPES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = types.lock() {
+        map.insert(var_name.to_string(), struct_type.to_string());
+    }
+}
+
+pub fn get_var_struct_type(var_name: &str) -> Option<String> {
+    VAR_STRUCT_TYPES
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|map| map.get(var_name).cloned())
+}
+
+pub fn set_func_return_type(func_name: &str, return_type: &str) {
+    let types = FUNC_RETURN_TYPES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = types.lock() {
+        map.insert(func_name.to_string(), return_type.to_string());
+    }
+}
+
+pub fn get_func_return_type(func_name: &str) -> Option<String> {
+    FUNC_RETURN_TYPES
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|map| map.get(func_name).cloned())
+}
+
+// Result and Optional type helpers
+
+/// Check if a type is a Result type (e.g., "Int!", "String!")
+pub fn is_result_type(ty: &str) -> bool {
+    ty.ends_with('!') && !ty.ends_with("!!") // Handle error type itself
+}
+
+/// Extract the inner type from a Result type
+/// e.g., "Int!" -> "Int"
+pub fn result_inner_type(ty: &str) -> String {
+    if is_result_type(ty) {
+        ty[..ty.len() - 1].to_string()
+    } else {
+        ty.to_string()
+    }
+}
+
+/// Check if a type is an Optional type (e.g., "Int?", "String?")
+pub fn is_optional_type(ty: &str) -> bool {
+    ty.ends_with('?')
+}
+
+/// Extract the inner type from an Optional type
+/// e.g., "Int?" -> "Int"
+pub fn optional_inner_type(ty: &str) -> String {
+    if is_optional_type(ty) {
+        ty[..ty.len() - 1].to_string()
+    } else {
+        ty.to_string()
+    }
+}
+
+/// Build a Result type string from inner type
+pub fn make_result_type(inner: &str) -> String {
+    format!("{}!", inner)
+}
+
+/// Build an Optional type string from inner type
+pub fn make_optional_type(inner: &str) -> String {
+    format!("{}?", inner)
+}
+
+/// Get the actual return type when inside a Result-returning function
+/// This is used for the try operator to know what error type to construct
+pub fn get_enclosing_result_type(func_name: &str) -> Option<String> {
+    get_func_return_type(func_name).filter(|ty| is_result_type(ty))
+}
+
+pub fn set_global_var_type(var_name: &str, type_name: &str) {
+    let types = GLOBAL_VAR_TYPES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut map) = types.lock() {
+        map.insert(var_name.to_string(), type_name.to_string());
+    }
+}
+
+pub fn get_global_var_type(var_name: &str) -> Option<String> {
+    GLOBAL_VAR_TYPES
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|map| map.get(var_name).cloned())
+}
+
+pub fn clear_struct_state() {
+    if let Some(m) = STRUCT_LAYOUTS.get() {
+        if let Ok(mut map) = m.lock() {
+            map.clear();
+        }
+    }
+    if let Some(m) = STRUCT_FIELD_TYPES.get() {
+        if let Ok(mut map) = m.lock() {
+            map.clear();
+        }
+    }
+    if let Some(m) = VAR_STRUCT_TYPES.get() {
+        if let Ok(mut map) = m.lock() {
+            map.clear();
+        }
+    }
+    if let Some(m) = FUNC_RETURN_TYPES.get() {
+        if let Ok(mut map) = m.lock() {
+            map.clear();
+        }
+    }
+    if let Some(m) = GLOBAL_VAR_TYPES.get() {
+        if let Ok(mut map) = m.lock() {
+            map.clear();
+        }
     }
 }
 
@@ -207,11 +394,19 @@ pub fn get_target_triple() -> String {
 
 /// Type mapping from Forge types to Cranelift types
 pub fn forge_type_to_cranelift(ty: &str) -> Type {
+    // Handle Result types (e.g., "Int!", "String!")
+    if is_result_type(ty) {
+        return types::I64; // Result is passed as pointer
+    }
+    // Handle Optional types (e.g., "Int?", "String?")
+    if is_optional_type(ty) {
+        return types::I64; // Optional is passed as pointer
+    }
     match ty {
         "Int" | "Int8" | "Int16" | "Int32" | "Int64" => types::I64,
         "UInt" | "UInt8" | "UInt16" | "UInt32" | "UInt64" => types::I64,
         "Float" => types::F64,
-        "Bool" => types::I8,
+        "Bool" => types::I64,
         "String" | "List" | "Map" | "Set" => types::I64, // Pointer types
         _ => types::I64,                                 // Default to pointer size
     }
@@ -243,6 +438,15 @@ fn declare_runtime_function(
 
 /// Calculate the size of a type in bytes
 pub fn type_size(ty: &str) -> usize {
+    // Handle Result types: { is_ok: i8, ok: T, err: String }
+    // For simplicity, we use: is_ok(1) + padding(7) + ok(8) + err(8) = 24
+    if is_result_type(ty) {
+        return 24;
+    }
+    // Handle Optional types: { has_value: i8, value: T }
+    if is_optional_type(ty) {
+        return 16; // has_value(1) + padding(7) + value(8) = 16
+    }
     match ty {
         "Int" | "Int64" | "UInt64" => 8,
         "Int32" | "UInt32" => 4,
@@ -434,6 +638,23 @@ pub fn declare_runtime_functions(
     )?;
     funcs.insert("forge_print_cstr".to_string(), print_cstr);
 
+    // Closure environment functions for capturing lambdas
+    let closure_set_env = declare_runtime_function(
+        module,
+        "forge_closure_set_env",
+        &[types::I64, types::I64], // slot, value
+        &[],
+    )?;
+    funcs.insert("forge_closure_set_env".to_string(), closure_set_env);
+
+    let closure_get_env = declare_runtime_function(
+        module,
+        "forge_closure_get_env",
+        &[types::I64], // slot
+        &[types::I64], // value
+    )?;
+    funcs.insert("forge_closure_get_env".to_string(), closure_get_env);
+
     // Print error function (to stderr)
     let print_err = declare_runtime_function(
         module,
@@ -610,8 +831,8 @@ pub fn declare_runtime_functions(
     let map_new = declare_runtime_function(
         module,
         "forge_map_new",
-        &[types::I32, types::I64, types::I8], // key_type, val_size, val_is_heap
-        &[types::I64],                        // returns ForgeMap
+        &[types::I32, types::I64, types::I64], // key_type, val_size, val_is_heap
+        &[types::I64],                         // returns ForgeMap
     )?;
     funcs.insert("forge_map_new".to_string(), map_new);
 
@@ -644,7 +865,7 @@ pub fn declare_runtime_functions(
         module,
         "forge_string_contains_ptr",
         &[types::I64, types::I64], // *const haystack, *const needle
-        &[types::I8],              // returns bool
+        &[types::I64],             // returns bool (i64 for uniform ABI)
     )?;
     funcs.insert("forge_string_contains".to_string(), string_contains);
 
@@ -668,7 +889,7 @@ pub fn declare_runtime_functions(
         module,
         "forge_string_starts_with_ptr",
         &[types::I64, types::I64], // *const s, *const prefix
-        &[types::I8],              // returns bool
+        &[types::I64],             // returns bool (i64 for uniform ABI)
     )?;
     funcs.insert("forge_string_starts_with".to_string(), string_starts_with);
 
@@ -676,7 +897,7 @@ pub fn declare_runtime_functions(
         module,
         "forge_string_ends_with_ptr",
         &[types::I64, types::I64], // *const s, *const suffix
-        &[types::I8],              // returns bool
+        &[types::I64],             // returns bool (i64 for uniform ABI)
     )?;
     funcs.insert("forge_string_ends_with".to_string(), string_ends_with);
 
@@ -693,9 +914,18 @@ pub fn declare_runtime_functions(
         module,
         "forge_cstring_eq",
         &[types::I64, types::I64], // *const a, *const b (null-terminated C strings)
-        &[types::I8],              // returns bool
+        &[types::I64],             // returns bool (i64 for uniform ABI)
     )?;
     funcs.insert("forge_cstring_eq".to_string(), cstring_eq);
+
+    // C-string lexicographic comparison (like strcmp)
+    let cstring_cmp = declare_runtime_function(
+        module,
+        "forge_cstring_cmp",
+        &[types::I64, types::I64], // *const a, *const b
+        &[types::I64],             // returns <0, 0, or >0
+    )?;
+    funcs.insert("forge_cstring_cmp".to_string(), cstring_cmp);
 
     // Simple strlen-based length for null-terminated strings (debugging/workaround)
     let cstring_len = declare_runtime_function(
@@ -711,7 +941,7 @@ pub fn declare_runtime_functions(
         module,
         "forge_file_exists",
         &[types::I64], // *const path
-        &[types::I8],  // returns bool (0/1)
+        &[types::I64], // returns bool (0/1)
     )?;
     funcs.insert("file_exists".to_string(), file_exists);
 
@@ -719,7 +949,7 @@ pub fn declare_runtime_functions(
         module,
         "forge_dir_exists",
         &[types::I64], // *const path
-        &[types::I8],  // returns bool (0/1)
+        &[types::I64], // returns bool (0/1)
     )?;
     funcs.insert("dir_exists".to_string(), dir_exists);
 
@@ -727,7 +957,7 @@ pub fn declare_runtime_functions(
         module,
         "forge_mkdir",
         &[types::I64], // *const path
-        &[types::I8],  // returns bool (0/1)
+        &[types::I64], // returns bool (0/1)
     )?;
     funcs.insert("mkdir".to_string(), mkdir);
 
@@ -735,7 +965,7 @@ pub fn declare_runtime_functions(
         module,
         "forge_remove_file",
         &[types::I64], // *const path
-        &[types::I8],  // returns bool (0/1)
+        &[types::I64], // returns bool (0/1)
     )?;
     funcs.insert("remove_file".to_string(), remove_file);
 
@@ -743,7 +973,7 @@ pub fn declare_runtime_functions(
         module,
         "forge_rename_file",
         &[types::I64, types::I64], // *const from, *const to
-        &[types::I8],              // returns bool (0/1)
+        &[types::I64],             // returns bool (i64 for uniform ABI) (0/1)
     )?;
     funcs.insert("rename_file".to_string(), rename_file);
 
@@ -768,7 +998,7 @@ pub fn declare_runtime_functions(
         module,
         "forge_write_file",
         &[types::I64, types::I64], // *const path, *const content
-        &[types::I8],              // returns bool (0/1)
+        &[types::I64],             // returns bool (i64 for uniform ABI) (0/1)
     )?;
     funcs.insert("write_file".to_string(), write_file);
 
@@ -776,7 +1006,7 @@ pub fn declare_runtime_functions(
         module,
         "forge_append_file",
         &[types::I64, types::I64], // *const path, *const content
-        &[types::I8],              // returns bool (0/1)
+        &[types::I64],             // returns bool (i64 for uniform ABI) (0/1)
     )?;
     funcs.insert("append_file".to_string(), append_file);
 
@@ -1130,6 +1360,42 @@ pub fn declare_runtime_functions(
     )?;
     funcs.insert("forge_list_contains_int".to_string(), list_contains_int);
 
+    // List: index_of (integer)
+    let list_index_of_int = declare_runtime_function(
+        module,
+        "forge_list_index_of_int",
+        &[types::I64, types::I64], // list ptr, value
+        &[types::I64],             // returns index or -1
+    )?;
+    funcs.insert("forge_list_index_of_int".to_string(), list_index_of_int);
+
+    // List: sort
+    let list_sort = declare_runtime_function(
+        module,
+        "forge_list_sort",
+        &[types::I64], // list.ptr as i64
+        &[],
+    )?;
+    funcs.insert("forge_list_sort".to_string(), list_sort);
+
+    // List: sort_strings (sorts C-string-pointer lists lexicographically)
+    let list_sort_strings = declare_runtime_function(
+        module,
+        "forge_list_sort_strings",
+        &[types::I64], // list.ptr as i64
+        &[],
+    )?;
+    funcs.insert("forge_list_sort_strings".to_string(), list_sort_strings);
+
+    // List: slice
+    let list_slice = declare_runtime_function(
+        module,
+        "forge_list_slice",
+        &[types::I64, types::I64, types::I64], // list.ptr, start, end
+        &[types::I64],                         // returns new list.ptr
+    )?;
+    funcs.insert("forge_list_slice".to_string(), list_slice);
+
     // Type conversions
     let int_to_float = declare_runtime_function(
         module,
@@ -1399,10 +1665,14 @@ pub fn declare_runtime_functions(
     funcs.insert("chars".to_string(), chars);
     funcs.insert("forge_cstring_chars".to_string(), chars);
 
-    // List: sort, slice
+    // List: sort, sort_strings, slice
     let list_sort = declare_runtime_function(module, "forge_list_sort", &[types::I64], &[])?;
     funcs.insert("sort".to_string(), list_sort);
     funcs.insert("forge_list_sort".to_string(), list_sort);
+
+    let list_sort_strings =
+        declare_runtime_function(module, "forge_list_sort_strings", &[types::I64], &[])?;
+    funcs.insert("forge_list_sort_strings".to_string(), list_sort_strings);
 
     let list_slice = declare_runtime_function(
         module,
@@ -1596,6 +1866,107 @@ pub fn declare_runtime_functions(
 
     // Note: list_dir returns a linked list - needs special handling
     // For now, declare but don't use directly
+
+    // Struct allocation
+    let struct_alloc = declare_runtime_function(
+        module,
+        "forge_struct_alloc",
+        &[types::I64], // num_fields
+        &[types::I64], // returns pointer
+    )?;
+    funcs.insert("forge_struct_alloc".to_string(), struct_alloc);
+
+    // Map operations with C-string keys
+    let map_insert_cstr = declare_runtime_function(
+        module,
+        "forge_map_insert_cstr",
+        &[types::I64, types::I64, types::I64], // map_handle, key_cstr, value_i64
+        &[],
+    )?;
+    funcs.insert("forge_map_insert_cstr".to_string(), map_insert_cstr);
+
+    let map_get_cstr = declare_runtime_function(
+        module,
+        "forge_map_get_cstr",
+        &[types::I64, types::I64], // map_handle, key_cstr
+        &[types::I64],             // returns value_i64
+    )?;
+    funcs.insert("forge_map_get_cstr".to_string(), map_get_cstr);
+
+    let map_contains_cstr = declare_runtime_function(
+        module,
+        "forge_map_contains_cstr",
+        &[types::I64, types::I64], // map_handle, key_cstr
+        &[types::I64],             // returns 0 or 1
+    )?;
+    funcs.insert("forge_map_contains_cstr".to_string(), map_contains_cstr);
+
+    let map_remove_cstr = declare_runtime_function(
+        module,
+        "forge_map_remove_cstr",
+        &[types::I64, types::I64], // map_handle, key_cstr
+        &[],
+    )?;
+    funcs.insert("forge_map_remove_cstr".to_string(), map_remove_cstr);
+
+    let map_keys_cstr = declare_runtime_function(
+        module,
+        "forge_map_keys_cstr",
+        &[types::I64], // map_handle
+        &[types::I64], // returns ForgeList as i64
+    )?;
+    funcs.insert("forge_map_keys_cstr".to_string(), map_keys_cstr);
+
+    // Map operations with integer keys (handle-based)
+    let map_insert_ikey = declare_runtime_function(
+        module,
+        "forge_map_insert_ikey",
+        &[types::I64, types::I64, types::I64], // map_handle, key_int, value_i64
+        &[],
+    )?;
+    funcs.insert("forge_map_insert_ikey".to_string(), map_insert_ikey);
+
+    let map_get_ikey = declare_runtime_function(
+        module,
+        "forge_map_get_ikey",
+        &[types::I64, types::I64], // map_handle, key_int
+        &[types::I64],             // returns value_i64
+    )?;
+    funcs.insert("forge_map_get_ikey".to_string(), map_get_ikey);
+
+    let map_contains_ikey = declare_runtime_function(
+        module,
+        "forge_map_contains_ikey",
+        &[types::I64, types::I64], // map_handle, key_int
+        &[types::I64],             // returns 0 or 1
+    )?;
+    funcs.insert("forge_map_contains_ikey".to_string(), map_contains_ikey);
+
+    let map_remove_ikey = declare_runtime_function(
+        module,
+        "forge_map_remove_ikey",
+        &[types::I64, types::I64], // map_handle, key_int
+        &[],
+    )?;
+    funcs.insert("forge_map_remove_ikey".to_string(), map_remove_ikey);
+
+    // Map length via handle (for codegen that only has the raw pointer)
+    let map_len_handle = declare_runtime_function(
+        module,
+        "forge_map_len_handle",
+        &[types::I64], // map_handle
+        &[types::I64], // returns length
+    )?;
+    funcs.insert("forge_map_len_handle".to_string(), map_len_handle);
+
+    // args() returning a List (ForgeList)
+    let args_to_list = declare_runtime_function(
+        module,
+        "forge_args_to_list",
+        &[],           // no args
+        &[types::I64], // returns ForgeList as i64
+    )?;
+    funcs.insert("forge_args_to_list".to_string(), args_to_list);
 
     Ok(funcs)
 }
@@ -1794,6 +2165,6 @@ mod tests {
     fn test_type_mapping() {
         assert_eq!(forge_type_to_cranelift("Int"), types::I64);
         assert_eq!(forge_type_to_cranelift("Float"), types::F64);
-        assert_eq!(forge_type_to_cranelift("Bool"), types::I8);
+        assert_eq!(forge_type_to_cranelift("Bool"), types::I64);
     }
 }

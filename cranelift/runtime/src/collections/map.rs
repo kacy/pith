@@ -114,14 +114,14 @@ impl MapImpl {
 pub unsafe extern "C" fn forge_map_new(
     key_type: i32,
     val_size: i64,
-    val_is_heap: bool,
+    val_is_heap: i64,
 ) -> ForgeMap {
     let ktype = match key_type {
         1 => KeyType::String,
         _ => KeyType::Int,
     };
 
-    let map_impl = MapImpl::new(ktype, val_size as usize, val_is_heap);
+    let map_impl = MapImpl::new(ktype, val_size as usize, val_is_heap != 0);
     let boxed = Box::new(map_impl);
 
     ForgeMap {
@@ -573,4 +573,221 @@ pub extern "C" fn forge_map_destructor(ptr: *mut u8) {
         let map = ptr as *const ForgeMap;
         forge_map_release(*map);
     }
+}
+
+// ---------------------------------------------------------------------------
+// C-string-key variants for Cranelift codegen
+//
+// These functions accept a raw map_handle (the ForgeMap.ptr cast to i64) and
+// null-terminated C string keys, providing a simpler ABI than the ForgeString
+// variants above.
+// ---------------------------------------------------------------------------
+
+/// Compute the byte length of a null-terminated C string (helper).
+unsafe fn cstr_to_map_key(key: *const i8) -> MapKey {
+    let mut len = 0usize;
+    let mut p = key;
+    while *p != 0 {
+        len += 1;
+        p = p.add(1);
+    }
+    let bytes = std::slice::from_raw_parts(key as *const u8, len);
+    MapKey::String(bytes.to_vec())
+}
+
+/// Insert an i64 value with a C-string key.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_insert_cstr(map_handle: i64, key: *const i8, value: i64) {
+    if map_handle == 0 || key.is_null() {
+        return;
+    }
+
+    let impl_ref = &mut *(map_handle as *mut MapImpl);
+    let map_key = cstr_to_map_key(key);
+    let val_bytes = value.to_le_bytes().to_vec();
+    impl_ref.insert(map_key, val_bytes);
+}
+
+/// Get an i64 value by C-string key. Returns 0 if the key is not found.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_get_cstr(map_handle: i64, key: *const i8) -> i64 {
+    if map_handle == 0 || key.is_null() {
+        return 0;
+    }
+
+    let impl_ref = &*(map_handle as *const MapImpl);
+    let map_key = cstr_to_map_key(key);
+
+    match impl_ref.get(&map_key) {
+        Some(val_data) if val_data.len() >= 8 => {
+            i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]))
+        }
+        _ => 0,
+    }
+}
+
+/// Check if a C-string key exists in the map. Returns 1 if present, 0 otherwise.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_contains_cstr(map_handle: i64, key: *const i8) -> i64 {
+    if map_handle == 0 || key.is_null() {
+        return 0;
+    }
+
+    let impl_ref = &*(map_handle as *const MapImpl);
+    let map_key = cstr_to_map_key(key);
+
+    if impl_ref.contains_key(&map_key) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Remove an entry by C-string key.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_remove_cstr(map_handle: i64, key: *const i8) {
+    if map_handle == 0 || key.is_null() {
+        return;
+    }
+
+    let impl_ref = &mut *(map_handle as *mut MapImpl);
+    let map_key = cstr_to_map_key(key);
+    impl_ref.remove(&map_key);
+}
+
+// ---------------------------------------------------------------------------
+// Integer-key variants for Cranelift codegen (handle-based, like cstr variants)
+// ---------------------------------------------------------------------------
+
+/// Insert an i64 value with an integer key (handle-based API).
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_insert_ikey(map_handle: i64, key: i64, value: i64) {
+    if map_handle == 0 {
+        return;
+    }
+
+    let impl_ref = &mut *(map_handle as *mut MapImpl);
+    let val_bytes = value.to_le_bytes().to_vec();
+    impl_ref.insert(MapKey::Int(key), val_bytes);
+}
+
+/// Get an i64 value by integer key. Returns 0 if the key is not found.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_get_ikey(map_handle: i64, key: i64) -> i64 {
+    if map_handle == 0 {
+        return 0;
+    }
+
+    let impl_ref = &*(map_handle as *const MapImpl);
+
+    match impl_ref.get(&MapKey::Int(key)) {
+        Some(val_data) if val_data.len() >= 8 => {
+            i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]))
+        }
+        _ => 0,
+    }
+}
+
+/// Check if an integer key exists in the map. Returns 1 if present, 0 otherwise.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_contains_ikey(map_handle: i64, key: i64) -> i64 {
+    if map_handle == 0 {
+        return 0;
+    }
+
+    let impl_ref = &*(map_handle as *const MapImpl);
+
+    if impl_ref.contains_key(&MapKey::Int(key)) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Remove an entry by integer key (handle-based API).
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_remove_ikey(map_handle: i64, key: i64) {
+    if map_handle == 0 {
+        return;
+    }
+
+    let impl_ref = &mut *(map_handle as *mut MapImpl);
+    impl_ref.remove(&MapKey::Int(key));
+}
+
+/// Get map length by handle (accepts raw MapImpl pointer as i64).
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_len_handle(map_handle: i64) -> i64 {
+    if map_handle == 0 {
+        return 0;
+    }
+
+    let impl_ref = &*(map_handle as *const MapImpl);
+    impl_ref.len() as i64
+}
+
+/// Return all keys as a ForgeList of C-string pointers (each element is an i64
+/// pointer to a newly allocated null-terminated string). The ForgeList pointer
+/// is returned as i64.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_keys_cstr(map_handle: i64) -> i64 {
+    use crate::collections::list::{forge_list_new, forge_list_push_value};
+    use std::alloc::{alloc, Layout};
+
+    if map_handle == 0 {
+        let empty = forge_list_new(8, 0);
+        return empty.ptr as i64;
+    }
+
+    let impl_ref = &*(map_handle as *const MapImpl);
+    let list = forge_list_new(8, 0); // list of i64 (pointer-sized primitives)
+
+    for key in impl_ref.keys() {
+        if let MapKey::String(ref bytes) = key {
+            let len = bytes.len();
+            let layout = Layout::from_size_align(len + 1, 1).unwrap();
+            let ptr = alloc(layout) as *mut i8;
+            if !ptr.is_null() {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len);
+                *ptr.add(len) = 0;
+                forge_list_push_value(list, ptr as i64);
+            }
+        }
+    }
+
+    list.ptr as i64
 }

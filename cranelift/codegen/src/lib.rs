@@ -1819,6 +1819,12 @@ pub fn declare_runtime_functions(
         declare_runtime_function(module, "forge_hex_encode", &[types::I64], &[types::I64])?;
     funcs.insert("to_hex".to_string(), to_hex);
 
+    // from_hex (hex decode)
+    let from_hex =
+        declare_runtime_function(module, "forge_from_hex", &[types::I64], &[types::I64])?;
+    funcs.insert("from_hex".to_string(), from_hex);
+    funcs.insert("forge_from_hex".to_string(), from_hex);
+
     // float_fixed (format float with fixed decimal places)
     let float_fixed = declare_runtime_function(
         module,

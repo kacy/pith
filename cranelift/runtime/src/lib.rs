@@ -1778,6 +1778,47 @@ pub unsafe extern "C" fn forge_hex_encode(s: *const i8) -> *mut i8 {
     ptr as *mut i8
 }
 
+/// Decode a hex string back to the original string
+///
+/// # Safety
+/// s must be a valid null-terminated C string of hex digits
+#[no_mangle]
+pub unsafe extern "C" fn forge_from_hex(s: *const i8) -> *mut i8 {
+    use std::alloc::{alloc, Layout};
+
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let len = crate::string::forge_cstring_len(s) as usize;
+    if len % 2 != 0 {
+        return std::ptr::null_mut();
+    }
+    let input = std::slice::from_raw_parts(s as *const u8, len);
+    let out_len = len / 2;
+    let layout = Layout::from_size_align(out_len + 1, 1).unwrap();
+    let ptr = alloc(layout) as *mut u8;
+
+    if !ptr.is_null() {
+        for i in 0..out_len {
+            let hi = hex_digit(input[i * 2]);
+            let lo = hex_digit(input[i * 2 + 1]);
+            *ptr.add(i) = (hi << 4) | lo;
+        }
+        *ptr.add(out_len) = 0;
+    }
+    ptr as *mut i8
+}
+
+fn hex_digit(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
 /// Convert an integer to hex string (e.g., 255 → "ff")
 ///
 /// # Safety
@@ -2242,16 +2283,77 @@ pub unsafe extern "C" fn forge_exec_output(cmd: *const i8) -> *mut i8 {
     }
 }
 
-/// Base64 decode — stub returning copy of input for now
+/// Base64 decode
 ///
 /// # Safety
-/// s must be a valid null-terminated C string
+/// s must be a valid null-terminated base64-encoded C string
 #[no_mangle]
 pub unsafe extern "C" fn forge_b64_decode(s: *const i8) -> *mut i8 {
+    use std::alloc::{alloc, Layout};
+
     if s.is_null() {
         return std::ptr::null_mut();
     }
-    forge_strdup(s)
+
+    let len = crate::string::forge_cstring_len(s) as usize;
+    let input = std::slice::from_raw_parts(s as *const u8, len);
+
+    // Standard base64 decoding
+    const DECODE: [u8; 256] = {
+        let mut t = [255u8; 256];
+        let mut i = 0u8;
+        while i < 26 { t[(b'A' + i) as usize] = i; i += 1; }
+        i = 0;
+        while i < 26 { t[(b'a' + i) as usize] = i + 26; i += 1; }
+        i = 0;
+        while i < 10 { t[(b'0' + i) as usize] = i + 52; i += 1; }
+        t[b'+' as usize] = 62;
+        t[b'/' as usize] = 63;
+        t
+    };
+
+    // Calculate output size (strip padding)
+    let mut in_len = len;
+    while in_len > 0 && input[in_len - 1] == b'=' {
+        in_len -= 1;
+    }
+    let out_len = in_len * 3 / 4;
+    let layout = Layout::from_size_align(out_len + 1, 1).unwrap();
+    let ptr = alloc(layout) as *mut u8;
+
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let mut si = 0;
+    let mut di = 0;
+    while si + 3 < in_len {
+        let a = DECODE[input[si] as usize] as u32;
+        let b = DECODE[input[si + 1] as usize] as u32;
+        let c = DECODE[input[si + 2] as usize] as u32;
+        let d = DECODE[input[si + 3] as usize] as u32;
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        if di < out_len { *ptr.add(di) = (n >> 16) as u8; di += 1; }
+        if di < out_len { *ptr.add(di) = (n >> 8) as u8; di += 1; }
+        if di < out_len { *ptr.add(di) = n as u8; di += 1; }
+        si += 4;
+    }
+    // Handle remaining 2 or 3 chars
+    if si + 1 < in_len {
+        let a = DECODE[input[si] as usize] as u32;
+        let b = DECODE[input[si + 1] as usize] as u32;
+        let n = (a << 18) | (b << 12);
+        if di < out_len { *ptr.add(di) = (n >> 16) as u8; di += 1; }
+        if si + 2 < in_len {
+            let c = DECODE[input[si + 2] as usize] as u32;
+            let n2 = (a << 18) | (b << 12) | (c << 6);
+            // Recalculate second byte with c included
+            if di < out_len { *ptr.add(di) = ((n2 >> 8) & 0xff) as u8; di += 1; }
+        }
+    }
+    *ptr.add(di.min(out_len)) = 0;
+
+    ptr as *mut i8
 }
 
 /// FNV-1a hash — returns hash as i64

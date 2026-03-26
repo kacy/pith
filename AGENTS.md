@@ -78,7 +78,8 @@ std/                 standard library (native forge modules)
   os/path.fg         file path manipulation
   os/process.fg      child process management
 
-examples/            40+ .fg programs — all compile to native binaries
+cranelift/           Cranelift native code backend (~18,100 lines Rust)
+examples/            43 deterministic .fg programs with verified expected output
 docs/grammar.ebnf    complete EBNF for the language
 docs/errors.md       error code reference (E0xx–E3xx)
 ```

@@ -8,10 +8,11 @@ coding agents can read the errors, apply fixes, and iterate — fast.
 
 **status:** the compiler self-hosts — forge is written in forge. the
 self-hosted compiler compiles itself and produces identical output across
-stages. all 51 example programs compile and run. the CLI handles 17 commands:
-build, run, test, check, fmt, lint, lex, parse, doc, and more. 16 standard
-library modules cover I/O, networking, encoding, hashing, JSON, TOML,
-process management, and more.
+stages (fixed-point verified). two backends: C transpilation (primary) and
+Cranelift native code generation (43/43 examples passing, identical output).
+the CLI handles build, run, test, check, fmt, lint, lex, parse, doc, and
+more. 16 standard library modules cover I/O, networking, encoding, hashing,
+JSON, TOML, process management, and more.
 
 ## quick start
 
@@ -83,8 +84,8 @@ fn main():
 ## what works today
 
 the self-hosted compiler handles the full pipeline: lex → parse → check →
-codegen. all 51 example programs compile to native binaries via C
-transpilation.
+codegen. 43 deterministic example programs compile and produce verified
+output via both C transpilation and Cranelift native backends.
 
 **language features:**
 - function declarations, typed parameters, return types, calls
@@ -137,7 +138,7 @@ full reference.
 ## cli commands
 
 ```
-forge build <file>             # compile to native binary (via C transpilation)
+forge build <file>             # compile to native binary
 forge run <file>               # compile and run
 forge test <file>              # run test declarations
 forge check <file>             # type check and report errors
@@ -222,6 +223,11 @@ bootstrap/           zig bootstrap compiler (archived, for reference and unit te
   build_support.zig  generated C/build directory/process helpers
   lexer.zig, parser.zig, checker.zig, codegen.zig, etc.
 
+cranelift/           Cranelift native code backend (~18,100 lines Rust)
+  runtime/           runtime library (ARC, collections, JSON, TOML, URL, concurrency)
+  codegen/           AST-to-IR compilation, monomorphization, type inference
+  cli/               native backend CLI
+
 std/                 standard library (13 native forge modules)
   encoding.fg        base64/hex encoding
   fmt.fg             string formatting
@@ -237,7 +243,7 @@ std/                 standard library (13 native forge modules)
   os/path.fg         file path manipulation
   os/process.fg      child process management
 
-examples/            40 .fg programs — all compile to native binaries
+examples/            43 deterministic .fg programs with verified expected output
 docs/grammar.ebnf    complete EBNF for the language
 docs/errors.md       error code reference (E0xx–E3xx)
 docs/architecture.md compiler and ownership overview

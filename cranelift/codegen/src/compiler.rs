@@ -33,25 +33,18 @@ pub enum ValueKind {
 }
 
 /// Variable counter for generating unique variable indices
-static mut VAR_COUNTER: u32 = 0;
+static VAR_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn next_variable() -> Variable {
-    unsafe {
-        let var = Variable::from_u32(VAR_COUNTER);
-        VAR_COUNTER += 1;
-        var
-    }
+    Variable::from_u32(VAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Lambda counter for generating unique lambda function names
-static mut LAMBDA_COUNTER: u32 = 0;
+static LAMBDA_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn next_lambda_name() -> String {
-    unsafe {
-        let id = LAMBDA_COUNTER;
-        LAMBDA_COUNTER += 1;
-        format!("__lambda_{}", id)
-    }
+    let id = LAMBDA_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("__lambda_{}", id)
 }
 
 /// Global map from lambda node pointer to its captured variable names.
@@ -83,6 +76,19 @@ pub struct LambdaInfo {
     pub lambda_params: Vec<(String, String)>, // (name, type)
     pub capture_vars: Vec<String>,
     pub name: String,
+}
+
+
+/// Immutable compilation context — bundles read-only state passed through recursive calls.
+/// These hashmaps are built once per compilation and never mutated during codegen.
+#[derive(Clone, Copy)]
+struct CompileCtx<'a> {
+    runtime_funcs: &'a HashMap<String, FuncId>,
+    declared_funcs: &'a HashMap<String, FuncId>,
+    string_funcs: &'a HashMap<String, FuncId>,
+    func_signatures: &'a HashMap<String, Vec<Type>>,
+    lambda_funcs: &'a HashMap<usize, FuncId>,
+    global_data_ids: &'a HashMap<String, DataId>,
 }
 
 /// Find all identifier names referenced in a node that are NOT declared within it.
@@ -655,8 +661,6 @@ pub fn parse_file_with_imports(path: &str) -> Result<Vec<AstNode>, CompileError>
             continue;
         }
 
-        eprintln!("Parsing: {}", file_path);
-
         // Parse the file
         let mut nodes = parse_file(&file_path)?;
 
@@ -699,9 +703,6 @@ pub fn parse_file_with_imports(path: &str) -> Result<Vec<AstNode>, CompileError>
         all_nodes.extend(nodes);
         parsed_files.insert(file_path);
     }
-
-    eprintln!("Total files parsed: {}", parsed_files.len());
-    eprintln!("Total AST nodes: {}", all_nodes.len());
 
     Ok(all_nodes)
 }
@@ -781,8 +782,6 @@ pub fn compile_module_from_text_with_imports(
 
     // Resolve imports (breadth-first to handle dependencies)
     while let Some((module_path, module_name)) = imports_to_resolve.pop() {
-        eprintln!("Resolving import: {} (from {})", module_name, module_path);
-
         // Get AST for imported module
         match get_ast_for_file(&module_path) {
             Ok(import_ast_text) => {
@@ -834,19 +833,14 @@ pub fn compile_module_from_text_with_imports(
                         // Add import nodes to collection
                         all_nodes.extend(import_nodes);
                     }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to parse {}: {:?}", module_path, e);
+                    Err(_e) => {
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("Warning: Failed to get AST for {}: {:?}", module_path, e);
+            Err(_e) => {
             }
         }
     }
-
-    eprintln!("Total modules resolved: {}", processed_files.len());
-    eprintln!("Total AST nodes: {}", all_nodes.len());
 
     // Compile the merged AST
     compile_module(codegen, all_nodes)
@@ -895,7 +889,6 @@ pub fn compile_module(
     for node in &ast_nodes {
         if let AstNode::StructDecl { name, fields, .. } = node {
             crate::register_struct_layout(name, fields);
-            eprintln!("Registered struct '{}' with {} fields", name, fields.len());
         }
     }
 
@@ -944,7 +937,6 @@ pub fn compile_module(
                         body: (**body).clone(),
                     };
                     monomorphizer.register_generic_decl(&base_name, decl);
-                    eprintln!("Registered generic function: {}", name);
                 }
             }
         }
@@ -956,14 +948,11 @@ pub fn compile_module(
     // Collect all generic instantiations from the AST
     let instantiations =
         crate::monomorphize::collect_generic_instantiations(&all_nodes, &monomorphizer);
-    eprintln!("Found {} generic instantiations", instantiations.len());
-
     // Generate monomorphized function variants
     let mut monomorphized_funcs: Vec<AstNode> = Vec::new();
     for (inst_name, base_name, type_args) in instantiations {
         if let Some(decl) = monomorphizer.generic_decls.get(&base_name) {
             if let Some(func_node) = monomorphizer.monomorphize_function(decl, &type_args) {
-                eprintln!("Generated monomorphized function: {}", inst_name);
                 monomorphized_funcs.push(func_node);
             }
         }
@@ -1196,21 +1185,27 @@ pub fn compile_module(
 
     // Compile lambda bodies as separate functions
     // We need to walk the original AST nodes to find lambda nodes and compile them
-    for node in &all_nodes {
-        match node {
-            AstNode::Function { body, .. } | AstNode::Test { body, .. } => {
-                compile_lambda_bodies_in_node(
-                    body,
-                    codegen,
-                    &lambda_funcs,
-                    &lambda_map,
-                    &runtime_funcs,
-                    &declared_funcs,
-                    &string_funcs,
-                    &func_signatures,
-                )?;
+    {
+        let lambda_cctx = CompileCtx {
+            runtime_funcs: &runtime_funcs,
+            declared_funcs: &declared_funcs,
+            string_funcs: &string_funcs,
+            func_signatures: &func_signatures,
+            lambda_funcs: &lambda_funcs,
+            global_data_ids: &global_data_ids,
+        };
+        for node in &all_nodes {
+            match node {
+                AstNode::Function { body, .. } | AstNode::Test { body, .. } => {
+                    compile_lambda_bodies_in_node(
+                        body,
+                        codegen,
+                        &lambda_map,
+                        &lambda_cctx,
+                    )?;
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -1226,6 +1221,14 @@ pub fn compile_module(
 
         // Build the init function body: evaluate each global's initial value and store it
         {
+            let init_cctx = CompileCtx {
+                runtime_funcs: &runtime_funcs,
+                declared_funcs: &declared_funcs,
+                string_funcs: &string_funcs,
+                func_signatures: &func_signatures,
+                lambda_funcs: &lambda_funcs,
+                global_data_ids: &global_data_ids,
+            };
             let init_body_stmts: Vec<AstNode> = global_vars
                 .iter()
                 .map(|(name, _ty, value)| AstNode::Assign {
@@ -1241,18 +1244,22 @@ pub fn compile_module(
                 &[],
                 "Void",
                 &init_body,
-                &runtime_funcs,
-                &declared_funcs,
-                &string_funcs,
-                &global_data_ids,
-                &func_signatures,
-                &lambda_funcs,
+                &init_cctx,
             )?;
         }
 
         Some(func_id)
     } else {
         None
+    };
+
+    let compile_cctx = CompileCtx {
+        runtime_funcs: &runtime_funcs,
+        declared_funcs: &declared_funcs,
+        string_funcs: &string_funcs,
+        func_signatures: &func_signatures,
+        lambda_funcs: &lambda_funcs,
+        global_data_ids: &global_data_ids,
     };
 
     for node in &all_nodes {
@@ -1271,12 +1278,7 @@ pub fn compile_module(
                     params,
                     return_type,
                     body,
-                    &runtime_funcs,
-                    &declared_funcs,
-                    &string_funcs,
-                    &global_data_ids,
-                    &func_signatures,
-                    &lambda_funcs,
+                    &compile_cctx,
                 )?;
             }
         }
@@ -1286,12 +1288,7 @@ pub fn compile_module(
                     codegen,
                     func_id,
                     body,
-                    &runtime_funcs,
-                    &declared_funcs,
-                    &string_funcs,
-                    &func_signatures,
-                    &lambda_funcs,
-                    &global_data_ids,
+                    &compile_cctx,
                 )?;
             }
         }
@@ -1330,12 +1327,7 @@ pub fn compile_module(
                                 &method_params,
                                 return_type,
                                 body,
-                                &runtime_funcs,
-                                &declared_funcs,
-                                &string_funcs,
-                                &global_data_ids,
-                                &func_signatures,
-                                &lambda_funcs,
+                                &compile_cctx,
                             )?;
                             break; // Only compile once (plain_name and qualified_name share same func_id if different)
                         }
@@ -1359,12 +1351,8 @@ pub fn compile_module(
 fn compile_lambda_bodies_in_node(
     node: &AstNode,
     codegen: &mut CodeGen,
-    lambda_funcs: &HashMap<usize, FuncId>,
     lambda_map: &HashMap<usize, (String, Vec<(String, String)>, Vec<String>)>,
-    runtime_funcs: &HashMap<String, FuncId>,
-    declared_funcs: &HashMap<String, FuncId>,
-    string_funcs: &HashMap<String, FuncId>,
-    func_signatures: &HashMap<String, Vec<Type>>,
+    cctx: &CompileCtx,
 ) -> Result<(), CompileError> {
     match node {
         AstNode::Lambda {
@@ -1375,41 +1363,31 @@ fn compile_lambda_bodies_in_node(
         } => {
             let ptr = node as *const AstNode as usize;
             if let (Some(&func_id), Some((name, full_params, captures))) =
-                (lambda_funcs.get(&ptr), lambda_map.get(&ptr))
+                (cctx.lambda_funcs.get(&ptr), lambda_map.get(&ptr))
             {
                 // Compile the lambda as a function body with its params.
                 // Captured vars are accessed via CLOSURE_ENV slots.
-                eprintln!(
-                    "DEBUG: Compiling lambda body for '{}' with {} params",
-                    name,
-                    full_params.len()
-                );
-                compile_function_body_with_captures(
-                    codegen,
-                    func_id,
-                    name,
-                    full_params,
-                    "Int", // lambdas return I64
-                    body,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
-                    &HashMap::new(), // no global vars in lambda context
-                    func_signatures,
-                    lambda_funcs,
-                    captures, // captured variable names
-                )?;
+                let lambda_ctx = CompileCtx {
+                        global_data_ids: &HashMap::new(),
+                        ..(*cctx)
+                    };
+                    compile_function_body_with_captures(
+                        codegen,
+                        func_id,
+                        name,
+                        full_params,
+                        "Int", // lambdas return I64
+                        body,
+                        &lambda_ctx,
+                        captures, // captured variable names
+                    )?;
             }
             // Recurse into lambda body for nested lambdas
             compile_lambda_bodies_in_node(
                 body,
                 codegen,
-                lambda_funcs,
                 lambda_map,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
-                func_signatures,
+                cctx,
             )?;
         }
         AstNode::Block(stmts) => {
@@ -1417,12 +1395,8 @@ fn compile_lambda_bodies_in_node(
                 compile_lambda_bodies_in_node(
                     s,
                     codegen,
-                    lambda_funcs,
                     lambda_map,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
-                    func_signatures,
+                    cctx,
                 )?;
             }
         }
@@ -1430,24 +1404,16 @@ fn compile_lambda_bodies_in_node(
             compile_lambda_bodies_in_node(
                 value,
                 codegen,
-                lambda_funcs,
                 lambda_map,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
-                func_signatures,
+                cctx,
             )?;
         }
         AstNode::Return(Some(e)) => {
             compile_lambda_bodies_in_node(
                 e,
                 codegen,
-                lambda_funcs,
                 lambda_map,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
-                func_signatures,
+                cctx,
             )?;
         }
         AstNode::Call { args, .. } => {
@@ -1455,12 +1421,8 @@ fn compile_lambda_bodies_in_node(
                 compile_lambda_bodies_in_node(
                     a,
                     codegen,
-                    lambda_funcs,
                     lambda_map,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
-                    func_signatures,
+                    cctx,
                 )?;
             }
         }
@@ -1472,33 +1434,21 @@ fn compile_lambda_bodies_in_node(
             compile_lambda_bodies_in_node(
                 cond,
                 codegen,
-                lambda_funcs,
                 lambda_map,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
-                func_signatures,
+                cctx,
             )?;
             compile_lambda_bodies_in_node(
                 then_branch,
                 codegen,
-                lambda_funcs,
                 lambda_map,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
-                func_signatures,
+                cctx,
             )?;
             if let Some(e) = else_branch {
                 compile_lambda_bodies_in_node(
                     e,
                     codegen,
-                    lambda_funcs,
                     lambda_map,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
-                    func_signatures,
+                    cctx,
                 )?;
             }
         }
@@ -1506,56 +1456,36 @@ fn compile_lambda_bodies_in_node(
             compile_lambda_bodies_in_node(
                 cond,
                 codegen,
-                lambda_funcs,
                 lambda_map,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
-                func_signatures,
+                cctx,
             )?;
             compile_lambda_bodies_in_node(
                 body,
                 codegen,
-                lambda_funcs,
                 lambda_map,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
-                func_signatures,
+                cctx,
             )?;
         }
         AstNode::BinaryOp { left, right, .. } => {
             compile_lambda_bodies_in_node(
                 left,
                 codegen,
-                lambda_funcs,
                 lambda_map,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
-                func_signatures,
+                cctx,
             )?;
             compile_lambda_bodies_in_node(
                 right,
                 codegen,
-                lambda_funcs,
                 lambda_map,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
-                func_signatures,
+                cctx,
             )?;
         }
         AstNode::For { body, .. } => {
             compile_lambda_bodies_in_node(
                 body,
                 codegen,
-                lambda_funcs,
                 lambda_map,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
-                func_signatures,
+                cctx,
             )?;
         }
         _ => {}
@@ -1570,12 +1500,7 @@ fn compile_function_body(
     params: &[(String, String)],
     return_type: &str,
     body: &AstNode,
-    runtime_funcs: &HashMap<String, FuncId>,
-    declared_funcs: &HashMap<String, FuncId>,
-    string_funcs: &HashMap<String, FuncId>,
-    global_data_ids: &HashMap<String, DataId>,
-    func_signatures: &HashMap<String, Vec<Type>>,
-    lambda_funcs: &HashMap<usize, FuncId>,
+    cctx: &CompileCtx,
 ) -> Result<(), CompileError> {
     compile_function_body_with_captures(
         codegen,
@@ -1584,12 +1509,7 @@ fn compile_function_body(
         params,
         return_type,
         body,
-        runtime_funcs,
-        declared_funcs,
-        string_funcs,
-        global_data_ids,
-        func_signatures,
-        lambda_funcs,
+        cctx,
         &[], // no captures
     )
 }
@@ -1601,12 +1521,7 @@ fn compile_function_body_with_captures(
     params: &[(String, String)],
     return_type: &str,
     body: &AstNode,
-    runtime_funcs: &HashMap<String, FuncId>,
-    declared_funcs: &HashMap<String, FuncId>,
-    string_funcs: &HashMap<String, FuncId>,
-    global_data_ids: &HashMap<String, DataId>,
-    func_signatures: &HashMap<String, Vec<Type>>,
-    lambda_funcs: &HashMap<usize, FuncId>,
+    cctx: &CompileCtx,
     captured_vars: &[String], // variable names read from CLOSURE_ENV slots 0,1,2,...
 ) -> Result<(), CompileError> {
     let mut ctx = codegen.module.make_context();
@@ -1629,12 +1544,7 @@ fn compile_function_body_with_captures(
 
         // Collect block params into a Vec to avoid borrow issues
         let block_params: Vec<Value> = builder.block_params(entry_block).to_vec();
-        eprintln!("DEBUG: Lambda {} has {} params", func_name, params.len());
         for (i, (param_name, param_ty)) in params.iter().enumerate() {
-            eprintln!(
-                "DEBUG: Binding param {}: {} of type {}",
-                i, param_name, param_ty
-            );
             let param_val = block_params[i];
             let ty = forge_type_to_cranelift(param_ty);
 
@@ -1654,7 +1564,7 @@ fn compile_function_body_with_captures(
 
         // Set up captured variables from the closure environment (CLOSURE_ENV global array)
         if !captured_vars.is_empty() {
-            if let Some(&get_env_id) = runtime_funcs.get("forge_closure_get_env") {
+            if let Some(&get_env_id) = cctx.runtime_funcs.get("forge_closure_get_env") {
                 let get_env_ref = codegen
                     .module
                     .declare_func_in_func(get_env_id, builder.func);
@@ -1680,7 +1590,7 @@ fn compile_function_body_with_captures(
 
         // Call __init_globals at the start of main (if it exists)
         if func_name == "main" {
-            if let Some(&init_id) = declared_funcs.get("__init_globals") {
+            if let Some(&init_id) = cctx.declared_funcs.get("__init_globals") {
                 let init_ref = codegen.module.declare_func_in_func(init_id, builder.func);
                 builder.ins().call(init_ref, &[]);
             }
@@ -1695,14 +1605,9 @@ fn compile_function_body_with_captures(
             let body_val = compile_expr(
                 &mut builder,
                 &mut variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 &mut codegen.module,
                 body,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
 
             // Return the body value
@@ -1712,17 +1617,12 @@ fn compile_function_body_with_captures(
             let filled = compile_stmt(
                 &mut builder,
                 &mut variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 &mut codegen.module,
                 ret_ty,
                 body,
                 None,
                 None,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
 
             // Try to add return if the body compilation didn't fill a block
@@ -1743,14 +1643,6 @@ fn compile_function_body_with_captures(
     let result = codegen.module.define_function(func_id, &mut ctx);
 
     if let Err(e) = result {
-        eprintln!("DEBUG: Error in '{}': {:?}", func_name, e);
-        // Try to get more detailed error info
-        let err_str = format!("{:?}", e);
-        if err_str.contains("verifier") {
-            eprintln!("DEBUG: Verifier error detected in function '{}'", func_name);
-            // Print the function IR for debugging
-            eprintln!("DEBUG: Function IR:\n{}", ctx.func.display());
-        }
         return Err(CompileError::ModuleError(e.to_string()));
     }
 
@@ -1762,12 +1654,7 @@ fn compile_test_body(
     codegen: &mut CodeGen,
     func_id: FuncId,
     body: &AstNode,
-    runtime_funcs: &HashMap<String, FuncId>,
-    declared_funcs: &HashMap<String, FuncId>,
-    string_funcs: &HashMap<String, FuncId>,
-    func_signatures: &HashMap<String, Vec<Type>>,
-    lambda_funcs: &HashMap<usize, FuncId>,
-    global_data_ids: &HashMap<String, DataId>,
+    cctx: &CompileCtx,
 ) -> Result<(), CompileError> {
     let mut ctx = codegen.module.make_context();
     ctx.func.signature.returns.push(AbiParam::new(types::I64));
@@ -1784,17 +1671,12 @@ fn compile_test_body(
         let filled = compile_stmt(
             &mut builder,
             &mut variables,
-            runtime_funcs,
-            declared_funcs,
-            string_funcs,
             &mut codegen.module,
             types::I64,
             body,
             None,
             None,
-            func_signatures,
-            lambda_funcs,
-            global_data_ids,
+            cctx,
         )?;
 
         // If block not filled (e.g., no explicit return), return 0 (success)
@@ -1878,17 +1760,12 @@ fn generate_test_runner(
 fn compile_stmt(
     builder: &mut FunctionBuilder,
     variables: &mut HashMap<String, LocalVar>,
-    runtime_funcs: &HashMap<String, FuncId>,
-    declared_funcs: &HashMap<String, FuncId>,
-    string_funcs: &HashMap<String, FuncId>,
     module: &mut dyn Module,
     return_type: Type,
     node: &AstNode,
     loop_header: Option<Block>,
     loop_exit: Option<Block>,
-    func_signatures: &HashMap<String, Vec<Type>>,
-    lambda_funcs: &HashMap<usize, FuncId>,
-    global_data_ids: &HashMap<String, DataId>,
+    cctx: &CompileCtx,
 ) -> Result<bool, CompileError> {
     match node {
         AstNode::Let {
@@ -1899,14 +1776,9 @@ fn compile_stmt(
             let val = compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 value,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
             let ty = builder.func.dfg.value_type(val);
 
@@ -1992,17 +1864,12 @@ fn compile_stmt(
                 let filled = compile_stmt(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     return_type,
                     stmt,
                     loop_header,
                     loop_exit,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
                 if filled {
                     return Ok(true);
@@ -2016,14 +1883,9 @@ fn compile_stmt(
                 let val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     e,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
 
                 // Convert to return type if necessary
@@ -2078,14 +1940,9 @@ fn compile_stmt(
             let cond_val = compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 cond,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
 
             let then_block = builder.create_block();
@@ -2101,17 +1958,12 @@ fn compile_stmt(
             let then_filled = compile_stmt(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 return_type,
                 then_branch,
                 loop_header,
                 loop_exit,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
             if !then_filled {
                 builder.ins().jump(merge_block, &[]);
@@ -2124,17 +1976,12 @@ fn compile_stmt(
                 compile_stmt(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     return_type,
                     else_stmt,
                     loop_header,
                     loop_exit,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?
             } else {
                 false
@@ -2173,14 +2020,9 @@ fn compile_stmt(
             let cond_val = compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 cond,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
             builder
                 .ins()
@@ -2192,17 +2034,12 @@ fn compile_stmt(
             let body_filled = compile_stmt(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 return_type,
                 body,
                 Some(header_block),
                 Some(exit_block),
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
             if !body_filled {
                 builder.ins().jump(header_block, &[]);
@@ -2235,19 +2072,14 @@ fn compile_stmt(
             let list_val = compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 iterable,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
 
             // Get length — dispatch based on iterable type
             let len_func_name = if is_string_iter { "forge_cstring_len" } else { "forge_list_len" };
-            let len_func_id = runtime_funcs
+            let len_func_id = cctx.runtime_funcs
                 .get(len_func_name)
                 .ok_or_else(|| CompileError::UnknownFunction(len_func_name.to_string()))?;
             let len_func_ref = module.declare_func_in_func(*len_func_id, builder.func);
@@ -2292,7 +2124,7 @@ fn compile_stmt(
             // Get the element at current index
             let element_val = if is_string_iter {
                 // String iteration: get char at index
-                let char_at_id = runtime_funcs
+                let char_at_id = cctx.runtime_funcs
                     .get("forge_cstring_char_at")
                     .ok_or_else(|| CompileError::UnknownFunction("forge_cstring_char_at".to_string()))?;
                 let char_at_ref = module.declare_func_in_func(*char_at_id, builder.func);
@@ -2300,7 +2132,7 @@ fn compile_stmt(
                 builder.func.dfg.first_result(get_call)
             } else {
                 // List iteration: get element by index
-                let get_func_id = runtime_funcs
+                let get_func_id = cctx.runtime_funcs
                     .get("forge_list_get_value")
                     .ok_or_else(|| CompileError::UnknownFunction("forge_list_get_value".to_string()))?;
                 let get_func_ref = module.declare_func_in_func(*get_func_id, builder.func);
@@ -2374,17 +2206,12 @@ fn compile_stmt(
             let filled = compile_stmt(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 return_type,
                 body_ref,
                 Some(increment_block),
                 Some(exit),
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
 
             variables.remove(var);
@@ -2419,14 +2246,9 @@ fn compile_stmt(
             let val = compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 value,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
 
             // Check for field assignment (e.g., "obj.field")
@@ -2463,7 +2285,6 @@ fn compile_stmt(
                     }
                 }
                 // Fall through to error if field not found
-                eprintln!("WARN: Unknown field assignment '{}'", name);
                 return Ok(false);
             }
 
@@ -2481,7 +2302,7 @@ fn compile_stmt(
                 };
                 builder.def_var(var_info.var, final_val);
                 Ok(false)
-            } else if let Some(data_id) = global_data_ids.get(name) {
+            } else if let Some(data_id) = cctx.global_data_ids.get(name) {
                 // Global variable store
                 let gv = module.declare_data_in_func(*data_id, builder.func);
                 let addr = builder
@@ -2535,17 +2356,12 @@ fn compile_stmt(
                 compile_stmt(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     return_type,
                     method,
                     loop_header,
                     loop_exit,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
             }
             Ok(false)
@@ -2555,14 +2371,9 @@ fn compile_stmt(
             compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 node,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
             Ok(false)
         }
@@ -2574,15 +2385,10 @@ fn compile_stmt(
 fn compile_pattern_check(
     builder: &mut FunctionBuilder,
     variables: &mut HashMap<String, LocalVar>,
-    runtime_funcs: &HashMap<String, FuncId>,
-    declared_funcs: &HashMap<String, FuncId>,
-    string_funcs: &HashMap<String, FuncId>,
     module: &mut dyn Module,
     pattern: &crate::ast::MatchPattern,
     subject_val: Value,
-    func_signatures: &HashMap<String, Vec<Type>>,
-    lambda_funcs: &HashMap<usize, FuncId>,
-    global_data_ids: &HashMap<String, DataId>,
+    cctx: &CompileCtx,
 ) -> Result<Value, CompileError> {
     use crate::ast::MatchPattern;
 
@@ -2612,14 +2418,9 @@ fn compile_pattern_check(
             let lit_val = compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 lit,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
 
             // Compare values for equality (icmp returns i8 which is what brif expects)
@@ -2650,14 +2451,9 @@ fn compile_pattern_check(
 fn compile_expr(
     builder: &mut FunctionBuilder,
     variables: &mut HashMap<String, LocalVar>,
-    runtime_funcs: &HashMap<String, FuncId>,
-    declared_funcs: &HashMap<String, FuncId>,
-    string_funcs: &HashMap<String, FuncId>,
     module: &mut dyn Module,
     node: &AstNode,
-    func_signatures: &HashMap<String, Vec<Type>>,
-    lambda_funcs: &HashMap<usize, FuncId>,
-    global_data_ids: &HashMap<String, DataId>,
+    cctx: &CompileCtx,
 ) -> Result<Value, CompileError> {
     match node {
         AstNode::IntLiteral(n) => Ok(builder.ins().iconst(types::I64, *n)),
@@ -2670,7 +2466,7 @@ fn compile_expr(
             // Call the string data function to get the address
             // For now, just return the pointer directly (using simple strlen for .len())
             let stripped_s = strip_string_quotes(s);
-            let ptr_val = if let Some(&str_func_id) = string_funcs.get(stripped_s.as_str()) {
+            let ptr_val = if let Some(&str_func_id) = cctx.string_funcs.get(stripped_s.as_str()) {
                 let str_func_ref = module.declare_func_in_func(str_func_id, builder.func);
                 let call = builder.ins().call(str_func_ref, &[]);
                 builder.func.dfg.first_result(call)
@@ -2697,9 +2493,9 @@ fn compile_expr(
             for part in parts {
                 let part_val = match part {
                     crate::ast::StringInterpPart::Literal(s) => {
-                        // Get string pointer from string_funcs (keys are quote-stripped)
+                        // Get string pointer from cctx.string_funcs (keys are quote-stripped)
                         let stripped_s = strip_string_quotes(s);
-                        if let Some(&str_func_id) = string_funcs.get(stripped_s.as_str()) {
+                        if let Some(&str_func_id) = cctx.string_funcs.get(stripped_s.as_str()) {
                             let str_func_ref =
                                 module.declare_func_in_func(str_func_id, builder.func);
                             let call = builder.ins().call(str_func_ref, &[]);
@@ -2713,14 +2509,9 @@ fn compile_expr(
                         let expr_val = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             expr,
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
 
                         // Convert to string based on actual type
@@ -2737,7 +2528,7 @@ fn compile_expr(
                             } else {
                                 "forge_int_to_cstr"
                             };
-                            if let Some(&to_str_id) = runtime_funcs.get(converter_name) {
+                            if let Some(&to_str_id) = cctx.runtime_funcs.get(converter_name) {
                                 let to_str_ref =
                                     module.declare_func_in_func(to_str_id, builder.func);
                                 // Coerce sub-i64 integer types (e.g. i8 from bool) to i64
@@ -2757,7 +2548,7 @@ fn compile_expr(
 
                 // Concatenate with result
                 if let Some(curr_result) = result {
-                    if let Some(&concat_id) = runtime_funcs.get("forge_concat_cstr") {
+                    if let Some(&concat_id) = cctx.runtime_funcs.get("forge_concat_cstr") {
                         let concat_ref = module.declare_func_in_func(concat_id, builder.func);
                         let call = builder.ins().call(concat_ref, &[curr_result, part_val]);
                         result = Some(builder.func.dfg.first_result(call));
@@ -2776,7 +2567,7 @@ fn compile_expr(
             let num_fields = layout.as_ref().map(|l| l.len()).unwrap_or(fields.len());
 
             // Allocate struct: forge_struct_alloc(num_fields) -> ptr
-            let alloc_func = runtime_funcs
+            let alloc_func = cctx.runtime_funcs
                 .get("forge_struct_alloc")
                 .ok_or_else(|| CompileError::UnknownFunction("forge_struct_alloc".to_string()))?;
             let alloc_ref = module.declare_func_in_func(*alloc_func, builder.func);
@@ -2789,14 +2580,9 @@ fn compile_expr(
                 let field_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     field_value,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
 
                 // Determine field offset
@@ -2848,7 +2634,7 @@ fn compile_expr(
             let type_tag = 0i32; // Primitive type
 
             // Call forge_list_new(elem_size, type_tag)
-            let list_new_func = runtime_funcs
+            let list_new_func = cctx.runtime_funcs
                 .get("forge_list_new")
                 .ok_or_else(|| CompileError::UnknownFunction("forge_list_new".to_string()))?;
             let list_new_ref = module.declare_func_in_func(*list_new_func, builder.func);
@@ -2860,7 +2646,7 @@ fn compile_expr(
             let list_val = builder.func.dfg.first_result(new_call);
 
             // Push each element to the list using push_value (simpler ABI)
-            let push_func = runtime_funcs.get("forge_list_push_value").ok_or_else(|| {
+            let push_func = cctx.runtime_funcs.get("forge_list_push_value").ok_or_else(|| {
                 CompileError::UnknownFunction("forge_list_push_value".to_string())
             })?;
             let push_ref = module.declare_func_in_func(*push_func, builder.func);
@@ -2869,14 +2655,9 @@ fn compile_expr(
                 let elem_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     elem,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
                 builder.ins().call(push_ref, &[list_val, elem_val]);
             }
@@ -2902,7 +2683,7 @@ fn compile_expr(
             let val_is_heap = 0i8; // false
 
             // Call forge_map_new(key_type, val_size, val_is_heap)
-            let map_new_func = runtime_funcs
+            let map_new_func = cctx.runtime_funcs
                 .get("forge_map_new")
                 .ok_or_else(|| CompileError::UnknownFunction("forge_map_new".to_string()))?;
             let map_new_ref = module.declare_func_in_func(*map_new_func, builder.func);
@@ -2920,7 +2701,7 @@ fn compile_expr(
             } else {
                 "forge_map_insert_cstr"
             };
-            let insert_func = runtime_funcs
+            let insert_func = cctx.runtime_funcs
                 .get(insert_func_name)
                 .ok_or_else(|| CompileError::UnknownFunction(insert_func_name.to_string()))?;
             let insert_ref = module.declare_func_in_func(*insert_func, builder.func);
@@ -2929,7 +2710,7 @@ fn compile_expr(
                 let key_val = match key {
                     AstNode::StringLiteral(s) => {
                         let stripped = strip_string_quotes(s);
-                        if let Some(&str_func_id) = string_funcs.get(stripped.as_str()) {
+                        if let Some(&str_func_id) = cctx.string_funcs.get(stripped.as_str()) {
                             let str_func_ref =
                                 module.declare_func_in_func(str_func_id, builder.func);
                             let call = builder.ins().call(str_func_ref, &[]);
@@ -2945,14 +2726,9 @@ fn compile_expr(
                 let val_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     value,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
 
                 let val_i64 = if builder.func.dfg.value_type(val_val) != types::I64 {
@@ -2977,7 +2753,7 @@ fn compile_expr(
             let elem_type = if is_int_elem { 0i32 } else { 1i32 };
 
             // Call forge_set_new_handle(elem_type) -> i64
-            let set_new_func = runtime_funcs
+            let set_new_func = cctx.runtime_funcs
                 .get("forge_set_new_handle")
                 .ok_or_else(|| CompileError::UnknownFunction("forge_set_new_handle".to_string()))?;
             let set_new_ref = module.declare_func_in_func(*set_new_func, builder.func);
@@ -2992,12 +2768,11 @@ fn compile_expr(
                 "forge_set_add_cstr"
             };
             // For now we only have cstr variant; int sets would need forge_set_add_ikey
-            if let Some(&add_id) = runtime_funcs.get(add_func_name) {
+            if let Some(&add_id) = cctx.runtime_funcs.get(add_func_name) {
                 let add_ref = module.declare_func_in_func(add_id, builder.func);
                 for elem in elements {
                     let elem_val = compile_expr(
-                        builder, variables, runtime_funcs, declared_funcs, string_funcs,
-                        module, elem, func_signatures, lambda_funcs, global_data_ids,
+                        builder, variables, module, elem, cctx,
                     )?;
                     builder.ins().call(add_ref, &[set_val, elem_val]);
                 }
@@ -3013,14 +2788,9 @@ fn compile_expr(
             compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 expr,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )
         }
 
@@ -3030,14 +2800,9 @@ fn compile_expr(
             let err_val = compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 error,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
 
             // Get the enclosing function's return type
@@ -3073,11 +2838,11 @@ fn compile_expr(
                     Ok(builder.ins().iconst(types::I64, 0))
                 } else {
                     // Enclosing function doesn't return Result - print and exit
-                    if let Some(&print_id) = runtime_funcs.get("print_err") {
+                    if let Some(&print_id) = cctx.runtime_funcs.get("print_err") {
                         let print_ref = module.declare_func_in_func(print_id, builder.func);
                         builder.ins().call(print_ref, &[err_val]);
                     }
-                    if let Some(&exit_id) = runtime_funcs.get("exit") {
+                    if let Some(&exit_id) = cctx.runtime_funcs.get("exit") {
                         let exit_ref = module.declare_func_in_func(exit_id, builder.func);
                         let exit_code = builder.ins().iconst(types::I64, 1);
                         builder.ins().call(exit_ref, &[exit_code]);
@@ -3086,11 +2851,11 @@ fn compile_expr(
                 }
             } else {
                 // No return type info - print and exit
-                if let Some(&print_id) = runtime_funcs.get("print_err") {
+                if let Some(&print_id) = cctx.runtime_funcs.get("print_err") {
                     let print_ref = module.declare_func_in_func(print_id, builder.func);
                     builder.ins().call(print_ref, &[err_val]);
                 }
-                if let Some(&exit_id) = runtime_funcs.get("exit") {
+                if let Some(&exit_id) = cctx.runtime_funcs.get("exit") {
                     let exit_ref = module.declare_func_in_func(exit_id, builder.func);
                     let exit_code = builder.ins().iconst(types::I64, 1);
                     builder.ins().call(exit_ref, &[exit_code]);
@@ -3107,32 +2872,22 @@ fn compile_expr(
             let expr_val = compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 expr,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
             let index_val = compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 index,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
 
             match expr_kind {
                 ValueKind::String => {
                     // String indexing: forge_cstring_char_at(str, index)
-                    if let Some(&func_id) = runtime_funcs.get("forge_cstring_char_at") {
+                    if let Some(&func_id) = cctx.runtime_funcs.get("forge_cstring_char_at") {
                         let func_ref = module.declare_func_in_func(func_id, builder.func);
                         let call = builder.ins().call(func_ref, &[expr_val, index_val]);
                         Ok(builder.func.dfg.first_result(call))
@@ -3142,7 +2897,7 @@ fn compile_expr(
                 }
                 ValueKind::ListString | ValueKind::ListUnknown => {
                     // List indexing: forge_list_get_value(list, index)
-                    if let Some(&func_id) = runtime_funcs.get("forge_list_get_value") {
+                    if let Some(&func_id) = cctx.runtime_funcs.get("forge_list_get_value") {
                         let func_ref = module.declare_func_in_func(func_id, builder.func);
                         let call = builder.ins().call(func_ref, &[expr_val, index_val]);
                         Ok(builder.func.dfg.first_result(call))
@@ -3152,7 +2907,7 @@ fn compile_expr(
                 }
                 ValueKind::Map => {
                     // String-key map indexing: forge_map_get_cstr(map, key)
-                    if let Some(&func_id) = runtime_funcs.get("forge_map_get_cstr") {
+                    if let Some(&func_id) = cctx.runtime_funcs.get("forge_map_get_cstr") {
                         let func_ref = module.declare_func_in_func(func_id, builder.func);
                         let call = builder.ins().call(func_ref, &[expr_val, index_val]);
                         Ok(builder.func.dfg.first_result(call))
@@ -3162,7 +2917,7 @@ fn compile_expr(
                 }
                 ValueKind::MapIntKey => {
                     // Int-key map indexing: forge_map_get_ikey(map, key)
-                    if let Some(&func_id) = runtime_funcs.get("forge_map_get_ikey") {
+                    if let Some(&func_id) = cctx.runtime_funcs.get("forge_map_get_ikey") {
                         let func_ref = module.declare_func_in_func(func_id, builder.func);
                         let call = builder.ins().call(func_ref, &[expr_val, index_val]);
                         Ok(builder.func.dfg.first_result(call))
@@ -3172,7 +2927,7 @@ fn compile_expr(
                 }
                 _ => {
                     // Unknown type, try list get as fallback
-                    if let Some(&func_id) = runtime_funcs.get("forge_list_get_value") {
+                    if let Some(&func_id) = cctx.runtime_funcs.get("forge_list_get_value") {
                         let func_ref = module.declare_func_in_func(func_id, builder.func);
                         let call = builder.ins().call(func_ref, &[expr_val, index_val]);
                         Ok(builder.func.dfg.first_result(call))
@@ -3197,14 +2952,9 @@ fn compile_expr(
                 let obj_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     obj,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
 
                 // Calculate offset: tuple fields are 8 bytes each
@@ -3267,28 +3017,18 @@ fn compile_expr(
                     compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         obj,
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?
                 }
             } else {
                 compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     obj,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?
             };
 
@@ -3316,7 +3056,7 @@ fn compile_expr(
                         // Dispatch based on object type
                         match obj_kind {
                             ValueKind::String => {
-                                if let Some(&len_id) = runtime_funcs.get("forge_cstring_len") {
+                                if let Some(&len_id) = cctx.runtime_funcs.get("forge_cstring_len") {
                                     let len_ref = module.declare_func_in_func(len_id, builder.func);
                                     let call = builder.ins().call(len_ref, &[obj_val]);
                                     Ok(builder.func.dfg.first_result(call))
@@ -3325,7 +3065,7 @@ fn compile_expr(
                                 }
                             }
                             ValueKind::Map | ValueKind::MapIntKey => {
-                                if let Some(&len_id) = runtime_funcs.get("forge_map_len_handle") {
+                                if let Some(&len_id) = cctx.runtime_funcs.get("forge_map_len_handle") {
                                     let len_ref = module.declare_func_in_func(len_id, builder.func);
                                     let call = builder.ins().call(len_ref, &[obj_val]);
                                     Ok(builder.func.dfg.first_result(call))
@@ -3334,7 +3074,7 @@ fn compile_expr(
                                 }
                             }
                             ValueKind::Set => {
-                                if let Some(&len_id) = runtime_funcs.get("forge_set_len_handle") {
+                                if let Some(&len_id) = cctx.runtime_funcs.get("forge_set_len_handle") {
                                     let len_ref = module.declare_func_in_func(len_id, builder.func);
                                     let call = builder.ins().call(len_ref, &[obj_val]);
                                     Ok(builder.func.dfg.first_result(call))
@@ -3343,7 +3083,7 @@ fn compile_expr(
                                 }
                             }
                             _ => {
-                                if let Some(&len_id) = runtime_funcs.get("forge_list_len") {
+                                if let Some(&len_id) = cctx.runtime_funcs.get("forge_list_len") {
                                     let len_ref = module.declare_func_in_func(len_id, builder.func);
                                     let call = builder.ins().call(len_ref, &[obj_val]);
                                     Ok(builder.func.dfg.first_result(call))
@@ -3355,10 +3095,6 @@ fn compile_expr(
                     }
                     _ => {
                         // Unknown field on non-struct - return 0
-                        eprintln!(
-                            "WARN: Unknown field access '.{}' on {:?} (kind={:?})",
-                            field_name, obj, obj_kind
-                        );
                         Ok(builder.ins().iconst(types::I64, 0))
                     }
                 }
@@ -3373,13 +3109,13 @@ fn compile_expr(
             }
             None => {
                 // Check if this is a declared user function (for passing as a value)
-                if let Some(&func_id) = declared_funcs.get(name) {
+                if let Some(&func_id) = cctx.declared_funcs.get(name) {
                     let func_ref = module.declare_func_in_func(func_id, builder.func);
                     let addr = builder.ins().func_addr(types::I64, func_ref);
                     return Ok(addr);
                 }
                 // Check if this is a global variable
-                if let Some(data_id) = global_data_ids.get(name) {
+                if let Some(data_id) = cctx.global_data_ids.get(name) {
                     let gv = module.declare_data_in_func(*data_id, builder.func);
                     let addr = builder
                         .ins()
@@ -3387,13 +3123,6 @@ fn compile_expr(
                     let loaded = builder.ins().load(types::I64, MemFlags::new(), addr, 0);
                     Ok(loaded)
                 } else {
-                    eprintln!(
-                        "DEBUG: Unknown variable '{}' in function, available vars: {:?}",
-                        name,
-                        variables.keys().collect::<Vec<_>>()
-                    );
-                    // Print a backtrace-like message
-                    eprintln!("DEBUG: Backtrace for unknown var '{}' lookup", name);
                     Err(CompileError::UnknownVariable(name.clone()))
                 }
             }
@@ -3403,14 +3132,9 @@ fn compile_expr(
             let val = compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 operand,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
 
             Ok(match op {
@@ -3441,26 +3165,16 @@ fn compile_expr(
                 let left_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     left,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
                 let right_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     right,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
 
                 // Coerce values to cstring pointers for concatenation.
@@ -3473,7 +3187,7 @@ fn compile_expr(
                         let k = $kind;
                         let t = $ty;
                         if t.is_float() {
-                            if let Some(&conv_id) = runtime_funcs.get("forge_float_to_cstr") {
+                            if let Some(&conv_id) = cctx.runtime_funcs.get("forge_float_to_cstr") {
                                 let conv_ref = module.declare_func_in_func(conv_id, builder.func);
                                 let call = builder.ins().call(conv_ref, &[v]);
                                 builder.func.dfg.first_result(call)
@@ -3487,7 +3201,7 @@ fn compile_expr(
                                 v
                             };
                             if matches!(k, ValueKind::Int | ValueKind::Bool) {
-                                if let Some(&conv_id) = runtime_funcs.get("forge_int_to_cstr") {
+                                if let Some(&conv_id) = cctx.runtime_funcs.get("forge_int_to_cstr") {
                                     let conv_ref =
                                         module.declare_func_in_func(conv_id, builder.func);
                                     let call = builder.ins().call(conv_ref, &[v64]);
@@ -3507,7 +3221,7 @@ fn compile_expr(
                 let right_ty = builder.func.dfg.value_type(right_val);
                 let right_cstr = coerce_to_cstr!(right_val, right_kind, right_ty);
 
-                if let Some(&concat_id) = runtime_funcs.get("forge_concat_cstr") {
+                if let Some(&concat_id) = cctx.runtime_funcs.get("forge_concat_cstr") {
                     let concat_ref = module.declare_func_in_func(concat_id, builder.func);
                     let call = builder.ins().call(concat_ref, &[left_cstr, right_cstr]);
                     Ok(builder.func.dfg.first_result(call))
@@ -3519,26 +3233,16 @@ fn compile_expr(
                 let mut left_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     left,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
                 let mut right_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     right,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
 
                 let left_ty = builder.func.dfg.value_type(left_val);
@@ -3597,7 +3301,7 @@ fn compile_expr(
 
                         if is_string_comparison {
                             // Use forge_cstring_eq for content-based C-string comparison
-                            if let Some(&eq_func_id) = runtime_funcs.get("forge_cstring_eq") {
+                            if let Some(&eq_func_id) = cctx.runtime_funcs.get("forge_cstring_eq") {
                                 let eq_func_ref =
                                     module.declare_func_in_func(eq_func_id, builder.func);
                                 let call = builder.ins().call(eq_func_ref, &[left_val, right_val]);
@@ -3623,7 +3327,7 @@ fn compile_expr(
                                 || matches!(right_kind, ValueKind::String | ValueKind::ListString);
 
                         if is_string_comparison {
-                            if let Some(&eq_func_id) = runtime_funcs.get("forge_cstring_eq") {
+                            if let Some(&eq_func_id) = cctx.runtime_funcs.get("forge_cstring_eq") {
                                 let eq_func_ref =
                                     module.declare_func_in_func(eq_func_id, builder.func);
                                 let call = builder.ins().call(eq_func_ref, &[left_val, right_val]);
@@ -3662,7 +3366,7 @@ fn compile_expr(
 
                         if is_string_cmp {
                             // Use forge_cstring_cmp for lexicographic comparison
-                            if let Some(&cmp_func_id) = runtime_funcs.get("forge_cstring_cmp") {
+                            if let Some(&cmp_func_id) = cctx.runtime_funcs.get("forge_cstring_cmp") {
                                 let cmp_func_ref =
                                     module.declare_func_in_func(cmp_func_id, builder.func);
                                 let call = builder.ins().call(cmp_func_ref, &[left_val, right_val]);
@@ -3792,19 +3496,14 @@ fn compile_expr(
                         let string_val = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             string_arg,
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
 
                         // Special case: use simple strlen for .len() on raw strings
                         if func == "len" {
-                            if let Some(&len_func_id) = runtime_funcs.get("forge_cstring_len") {
+                            if let Some(&len_func_id) = cctx.runtime_funcs.get("forge_cstring_len") {
                                 let len_func_ref =
                                     module.declare_func_in_func(len_func_id, builder.func);
                                 let call = builder.ins().call(len_func_ref, &[string_val]);
@@ -3817,21 +3516,16 @@ fn compile_expr(
                         // forge_string_* variants use ForgeString structs and return i8 for
                         // bool methods (contains, starts_with, ends_with) — avoid those.
                         let cstring_func_name = format!("forge_cstring_{}", func);
-                        if let Some(&func_id) = runtime_funcs.get(&cstring_func_name) {
+                        if let Some(&func_id) = cctx.runtime_funcs.get(&cstring_func_name) {
                             let func_ref = module.declare_func_in_func(func_id, builder.func);
                             let mut arg_values = vec![string_val];
                             for arg in &args[1..] {
                                 arg_values.push(compile_expr(
                                     builder,
                                     variables,
-                                    runtime_funcs,
-                                    declared_funcs,
-                                    string_funcs,
                                     module,
                                     arg,
-                                    func_signatures,
-                                    lambda_funcs,
-                                    global_data_ids,
+                                    cctx,
                                 )?);
                             }
                             let call = builder.ins().call(func_ref, &arg_values);
@@ -3843,7 +3537,7 @@ fn compile_expr(
                         }
 
                         let runtime_func_name = format!("forge_string_{}", func);
-                        if let Some(&func_id) = runtime_funcs.get(&runtime_func_name) {
+                        if let Some(&func_id) = cctx.runtime_funcs.get(&runtime_func_name) {
                             let func_ref = module.declare_func_in_func(func_id, builder.func);
 
                             let mut arg_values = vec![string_val];
@@ -3851,14 +3545,9 @@ fn compile_expr(
                                 arg_values.push(compile_expr(
                                     builder,
                                     variables,
-                                    runtime_funcs,
-                                    declared_funcs,
-                                    string_funcs,
                                     module,
                                     arg,
-                                    func_signatures,
-                                    lambda_funcs,
-                                    global_data_ids,
+                                    cctx,
                                 )?);
                             }
 
@@ -3912,18 +3601,13 @@ fn compile_expr(
                             let string_val = compile_expr(
                                 builder,
                                 variables,
-                                runtime_funcs,
-                                declared_funcs,
-                                string_funcs,
                                 module,
                                 string_arg,
-                                func_signatures,
-                                lambda_funcs,
-                                global_data_ids,
+                                cctx,
                             )?;
 
                             if func == "len" {
-                                if let Some(&len_func_id) = runtime_funcs.get("forge_cstring_len") {
+                                if let Some(&len_func_id) = cctx.runtime_funcs.get("forge_cstring_len") {
                                     let len_func_ref =
                                         module.declare_func_in_func(len_func_id, builder.func);
                                     let call = builder.ins().call(len_func_ref, &[string_val]);
@@ -3933,21 +3617,16 @@ fn compile_expr(
 
                             // Prefer forge_cstring_* variants (consistent return types, no i8 bools)
                             let cstring_func_name = format!("forge_cstring_{}", func);
-                            if let Some(&func_id) = runtime_funcs.get(&cstring_func_name) {
+                            if let Some(&func_id) = cctx.runtime_funcs.get(&cstring_func_name) {
                                 let func_ref = module.declare_func_in_func(func_id, builder.func);
                                 let mut arg_values = vec![string_val];
                                 for arg in &args[1..] {
                                     arg_values.push(compile_expr(
                                         builder,
                                         variables,
-                                        runtime_funcs,
-                                        declared_funcs,
-                                        string_funcs,
                                         module,
                                         arg,
-                                        func_signatures,
-                                        lambda_funcs,
-                                        global_data_ids,
+                                        cctx,
                                     )?);
                                 }
                                 let call = builder.ins().call(func_ref, &arg_values);
@@ -3959,7 +3638,7 @@ fn compile_expr(
                             }
 
                             let runtime_func_name = format!("forge_string_{}", func);
-                            if let Some(&func_id) = runtime_funcs.get(&runtime_func_name) {
+                            if let Some(&func_id) = cctx.runtime_funcs.get(&runtime_func_name) {
                                 let func_ref = module.declare_func_in_func(func_id, builder.func);
 
                                 let mut arg_values = vec![string_val];
@@ -3967,14 +3646,9 @@ fn compile_expr(
                                     arg_values.push(compile_expr(
                                         builder,
                                         variables,
-                                        runtime_funcs,
-                                        declared_funcs,
-                                        string_funcs,
                                         module,
                                         arg,
-                                        func_signatures,
-                                        lambda_funcs,
-                                        global_data_ids,
+                                        cctx,
                                     )?);
                                 }
 
@@ -3995,14 +3669,9 @@ fn compile_expr(
                 let arg_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     &args[0],
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
                 let arg_kind = infer_value_kind(&args[0], variables);
                 let len_func_name = match arg_kind {
@@ -4011,7 +3680,7 @@ fn compile_expr(
                     ValueKind::Set => "forge_set_len_handle",
                     _ => "forge_list_len",
                 };
-                if let Some(&len_id) = runtime_funcs.get(len_func_name) {
+                if let Some(&len_id) = cctx.runtime_funcs.get(len_func_name) {
                     let len_ref = module.declare_func_in_func(len_id, builder.func);
                     let call = builder.ins().call(len_ref, &[arg_val]);
                     return Ok(builder.func.dfg.first_result(call));
@@ -4027,28 +3696,18 @@ fn compile_expr(
                         let haystack = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             &args[0],
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
                         let needle = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             &args[1],
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
-                        if let Some(&cid) = runtime_funcs.get("forge_cstring_contains") {
+                        if let Some(&cid) = cctx.runtime_funcs.get("forge_cstring_contains") {
                             let cref = module.declare_func_in_func(cid, builder.func);
                             let call = builder.ins().call(cref, &[haystack, needle]);
                             return Ok(builder.func.dfg.first_result(call));
@@ -4057,14 +3716,12 @@ fn compile_expr(
                     ValueKind::Set => {
                         // Set contains: forge_set_contains_cstr(set, elem)
                         let set_val = compile_expr(
-                            builder, variables, runtime_funcs, declared_funcs, string_funcs,
-                            module, &args[0], func_signatures, lambda_funcs, global_data_ids,
+                            builder, variables, module, &args[0], cctx,
                         )?;
                         let elem_val = compile_expr(
-                            builder, variables, runtime_funcs, declared_funcs, string_funcs,
-                            module, &args[1], func_signatures, lambda_funcs, global_data_ids,
+                            builder, variables, module, &args[1], cctx,
                         )?;
-                        if let Some(&cid) = runtime_funcs.get("forge_set_contains_cstr") {
+                        if let Some(&cid) = cctx.runtime_funcs.get("forge_set_contains_cstr") {
                             let cref = module.declare_func_in_func(cid, builder.func);
                             let call = builder.ins().call(cref, &[set_val, elem_val]);
                             return Ok(builder.func.dfg.first_result(call));
@@ -4075,33 +3732,23 @@ fn compile_expr(
                         let list_val = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             &args[0],
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
                         let elem_val = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             &args[1],
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
                         let elem_val = if builder.func.dfg.value_type(elem_val) != types::I64 {
                             builder.ins().uextend(types::I64, elem_val)
                         } else {
                             elem_val
                         };
-                        if let Some(&cid) = runtime_funcs.get("forge_list_contains_int") {
+                        if let Some(&cid) = cctx.runtime_funcs.get("forge_list_contains_int") {
                             let cref = module.declare_func_in_func(cid, builder.func);
                             let call = builder.ins().call(cref, &[list_val, elem_val]);
                             return Ok(builder.func.dfg.first_result(call));
@@ -4120,28 +3767,18 @@ fn compile_expr(
                         let s = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             &args[0],
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
                         let needle = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             &args[1],
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
-                        if let Some(&cid) = runtime_funcs.get("forge_cstring_index_of") {
+                        if let Some(&cid) = cctx.runtime_funcs.get("forge_cstring_index_of") {
                             let cref = module.declare_func_in_func(cid, builder.func);
                             let call = builder.ins().call(cref, &[s, needle]);
                             return Ok(builder.func.dfg.first_result(call));
@@ -4152,33 +3789,23 @@ fn compile_expr(
                         let list_val = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             &args[0],
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
                         let elem_val = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             &args[1],
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
                         let elem_val = if builder.func.dfg.value_type(elem_val) != types::I64 {
                             builder.ins().uextend(types::I64, elem_val)
                         } else {
                             elem_val
                         };
-                        if let Some(&cid) = runtime_funcs.get("forge_list_index_of_int") {
+                        if let Some(&cid) = cctx.runtime_funcs.get("forge_list_index_of_int") {
                             let cref = module.declare_func_in_func(cid, builder.func);
                             let call = builder.ins().call(cref, &[list_val, elem_val]);
                             return Ok(builder.func.dfg.first_result(call));
@@ -4195,14 +3822,9 @@ fn compile_expr(
                     let list_val = compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         &args[0],
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?;
                     // String lists: sort by dereferencing C-string pointers
                     // Unknown/int lists: sort by i64 value
@@ -4211,7 +3833,7 @@ fn compile_expr(
                     } else {
                         "forge_list_sort"
                     };
-                    if let Some(&sort_id) = runtime_funcs.get(sort_fn) {
+                    if let Some(&sort_id) = cctx.runtime_funcs.get(sort_fn) {
                         let sort_ref = module.declare_func_in_func(sort_id, builder.func);
                         builder.ins().call(sort_ref, &[list_val]);
                     }
@@ -4226,38 +3848,23 @@ fn compile_expr(
                     let list_val = compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         &args[0],
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?;
                     let start_val = compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         &args[1],
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?;
                     let end_val = compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         &args[2],
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?;
                     let start_val = if builder.func.dfg.value_type(start_val) != types::I64 {
                         builder.ins().uextend(types::I64, start_val)
@@ -4269,7 +3876,7 @@ fn compile_expr(
                     } else {
                         end_val
                     };
-                    if let Some(&slice_id) = runtime_funcs.get("forge_list_slice") {
+                    if let Some(&slice_id) = cctx.runtime_funcs.get("forge_list_slice") {
                         let slice_ref = module.declare_func_in_func(slice_id, builder.func);
                         let call = builder
                             .ins()
@@ -4285,7 +3892,7 @@ fn compile_expr(
             ];
             // Only dispatch to list methods if the first arg is actually a list.
             // String args (e.g. join("/home", "docs") from std.os.path) must NOT
-            // be routed here — they should fall through to the runtime_funcs lookup.
+            // be routed here — they should fall through to the cctx.runtime_funcs lookup.
             let first_arg_is_list = args
                 .first()
                 .map(|a| {
@@ -4299,18 +3906,13 @@ fn compile_expr(
                 let list_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     list_arg,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
 
                 if func == "push" {
-                    let push_id = runtime_funcs.get("forge_list_push_value").ok_or_else(|| {
+                    let push_id = cctx.runtime_funcs.get("forge_list_push_value").ok_or_else(|| {
                         CompileError::UnknownFunction("forge_list_push_value".to_string())
                     })?;
                     let push_ref = module.declare_func_in_func(*push_id, builder.func);
@@ -4319,14 +3921,9 @@ fn compile_expr(
                         compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             arg,
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?
                     } else {
                         builder.ins().iconst(types::I64, 0)
@@ -4344,7 +3941,7 @@ fn compile_expr(
 
                 if func == "remove" {
                     // Call forge_list_remove(list_ptr, index)
-                    let remove_id = runtime_funcs.get("forge_list_remove").ok_or_else(|| {
+                    let remove_id = cctx.runtime_funcs.get("forge_list_remove").ok_or_else(|| {
                         CompileError::UnknownFunction("forge_list_remove".to_string())
                     })?;
                     let remove_ref = module.declare_func_in_func(*remove_id, builder.func);
@@ -4352,14 +3949,9 @@ fn compile_expr(
                         let v = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             arg,
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
                         if builder.func.dfg.value_type(v) != types::I64 {
                             builder.ins().uextend(types::I64, v)
@@ -4374,7 +3966,7 @@ fn compile_expr(
                 }
 
                 if func == "join" {
-                    let join_id = runtime_funcs.get("forge_list_join").ok_or_else(|| {
+                    let join_id = cctx.runtime_funcs.get("forge_list_join").ok_or_else(|| {
                         CompileError::UnknownFunction("forge_list_join".to_string())
                     })?;
                     let join_ref = module.declare_func_in_func(*join_id, builder.func);
@@ -4382,14 +3974,9 @@ fn compile_expr(
                         compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             arg,
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?
                     } else {
                         builder.ins().iconst(types::I64, 0)
@@ -4400,7 +3987,7 @@ fn compile_expr(
 
                 if func == "contains" {
                     let contains_id =
-                        runtime_funcs
+                        cctx.runtime_funcs
                             .get("forge_list_contains_int")
                             .ok_or_else(|| {
                                 CompileError::UnknownFunction("forge_list_contains_int".to_string())
@@ -4410,14 +3997,9 @@ fn compile_expr(
                         let v = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             arg,
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
                         if builder.func.dfg.value_type(v) != types::I64 {
                             builder.ins().uextend(types::I64, v)
@@ -4433,7 +4015,7 @@ fn compile_expr(
 
                 if func == "is_empty" {
                     let is_empty_id =
-                        runtime_funcs.get("forge_list_is_empty").ok_or_else(|| {
+                        cctx.runtime_funcs.get("forge_list_is_empty").ok_or_else(|| {
                             CompileError::UnknownFunction("forge_list_is_empty".to_string())
                         })?;
                     let is_empty_ref = module.declare_func_in_func(*is_empty_id, builder.func);
@@ -4442,7 +4024,7 @@ fn compile_expr(
                 }
 
                 if func == "clear" {
-                    let clear_id = runtime_funcs.get("forge_list_clear").ok_or_else(|| {
+                    let clear_id = cctx.runtime_funcs.get("forge_list_clear").ok_or_else(|| {
                         CompileError::UnknownFunction("forge_list_clear".to_string())
                     })?;
                     let clear_ref = module.declare_func_in_func(*clear_id, builder.func);
@@ -4451,7 +4033,7 @@ fn compile_expr(
                 }
 
                 if func == "reverse" {
-                    let reverse_id = runtime_funcs.get("forge_list_reverse").ok_or_else(|| {
+                    let reverse_id = cctx.runtime_funcs.get("forge_list_reverse").ok_or_else(|| {
                         CompileError::UnknownFunction("forge_list_reverse".to_string())
                     })?;
                     let reverse_ref = module.declare_func_in_func(*reverse_id, builder.func);
@@ -4461,14 +4043,12 @@ fn compile_expr(
 
                 if func == "slice" && args.len() >= 3 {
                     let start = compile_expr(
-                        builder, variables, runtime_funcs, declared_funcs, string_funcs,
-                        module, &args[1], func_signatures, lambda_funcs, global_data_ids,
+                        builder, variables, module, &args[1], cctx,
                     )?;
                     let end = compile_expr(
-                        builder, variables, runtime_funcs, declared_funcs, string_funcs,
-                        module, &args[2], func_signatures, lambda_funcs, global_data_ids,
+                        builder, variables, module, &args[2], cctx,
                     )?;
-                    if let Some(&slice_id) = runtime_funcs.get("forge_list_slice") {
+                    if let Some(&slice_id) = cctx.runtime_funcs.get("forge_list_slice") {
                         let slice_ref = module.declare_func_in_func(slice_id, builder.func);
                         let call = builder.ins().call(slice_ref, &[list_val, start, end]);
                         return Ok(builder.func.dfg.first_result(call));
@@ -4483,7 +4063,7 @@ fn compile_expr(
                     } else {
                         "forge_list_sort"
                     };
-                    if let Some(&sort_id) = runtime_funcs.get(sort_name) {
+                    if let Some(&sort_id) = cctx.runtime_funcs.get(sort_name) {
                         let sort_ref = module.declare_func_in_func(sort_id, builder.func);
                         builder.ins().call(sort_ref, &[list_val]);
                     }
@@ -4491,7 +4071,7 @@ fn compile_expr(
                 }
 
                 let runtime_func_name = format!("forge_list_{}", func);
-                if let Some(&func_id) = runtime_funcs.get(&runtime_func_name) {
+                if let Some(&func_id) = cctx.runtime_funcs.get(&runtime_func_name) {
                     let func_ref = module.declare_func_in_func(func_id, builder.func);
 
                     // Compile additional args (if any)
@@ -4500,14 +4080,9 @@ fn compile_expr(
                         arg_values.push(compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             arg,
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?);
                     }
 
@@ -4535,40 +4110,25 @@ fn compile_expr(
                 let map_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     map_arg,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
 
                 if func == "insert" && args.len() >= 3 {
                     let key_val = compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         &args[1],
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?;
                     let val_val = compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         &args[2],
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?;
                     let val_i64 = if builder.func.dfg.value_type(val_val) != types::I64 {
                         builder.ins().uextend(types::I64, val_val)
@@ -4580,7 +4140,7 @@ fn compile_expr(
                     } else {
                         "forge_map_insert_cstr"
                     };
-                    if let Some(&insert_id) = runtime_funcs.get(insert_name) {
+                    if let Some(&insert_id) = cctx.runtime_funcs.get(insert_name) {
                         let insert_ref = module.declare_func_in_func(insert_id, builder.func);
                         builder.ins().call(insert_ref, &[map_val, key_val, val_i64]);
                     }
@@ -4591,21 +4151,16 @@ fn compile_expr(
                     let key_val = compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         &args[1],
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?;
                     let contains_name = if is_int_key_map {
                         "forge_map_contains_ikey"
                     } else {
                         "forge_map_contains_cstr"
                     };
-                    if let Some(&contains_id) = runtime_funcs.get(contains_name) {
+                    if let Some(&contains_id) = cctx.runtime_funcs.get(contains_name) {
                         let contains_ref = module.declare_func_in_func(contains_id, builder.func);
                         let call = builder.ins().call(contains_ref, &[map_val, key_val]);
                         return Ok(builder.func.dfg.first_result(call));
@@ -4617,21 +4172,16 @@ fn compile_expr(
                     let key_val = compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         &args[1],
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?;
                     let get_name = if is_int_key_map {
                         "forge_map_get_ikey"
                     } else {
                         "forge_map_get_cstr"
                     };
-                    if let Some(&get_id) = runtime_funcs.get(get_name) {
+                    if let Some(&get_id) = cctx.runtime_funcs.get(get_name) {
                         let get_ref = module.declare_func_in_func(get_id, builder.func);
                         let call = builder.ins().call(get_ref, &[map_val, key_val]);
                         return Ok(builder.func.dfg.first_result(call));
@@ -4643,21 +4193,16 @@ fn compile_expr(
                     let key_val = compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         &args[1],
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?;
                     let remove_name = if is_int_key_map {
                         "forge_map_remove_ikey"
                     } else {
                         "forge_map_remove_cstr"
                     };
-                    if let Some(&remove_id) = runtime_funcs.get(remove_name) {
+                    if let Some(&remove_id) = cctx.runtime_funcs.get(remove_name) {
                         let remove_ref = module.declare_func_in_func(remove_id, builder.func);
                         builder.ins().call(remove_ref, &[map_val, key_val]);
                     }
@@ -4666,13 +4211,13 @@ fn compile_expr(
 
                 if func == "keys" {
                     // map.keys() → forge_map_keys_cstr(map)
-                    if let Some(&keys_id) = runtime_funcs.get("forge_map_keys_cstr") {
+                    if let Some(&keys_id) = cctx.runtime_funcs.get("forge_map_keys_cstr") {
                         let keys_ref = module.declare_func_in_func(keys_id, builder.func);
                         let call = builder.ins().call(keys_ref, &[map_val]);
                         return Ok(builder.func.dfg.first_result(call));
                     }
                     // Fallback: return empty list
-                    let list_new_id = runtime_funcs.get("forge_list_new").ok_or_else(|| {
+                    let list_new_id = cctx.runtime_funcs.get("forge_list_new").ok_or_else(|| {
                         CompileError::UnknownFunction("forge_list_new".to_string())
                     })?;
                     let list_new_ref = module.declare_func_in_func(*list_new_id, builder.func);
@@ -4683,13 +4228,13 @@ fn compile_expr(
                 }
 
                 if func == "values" {
-                    if let Some(&values_id) = runtime_funcs.get("forge_map_values_handle") {
+                    if let Some(&values_id) = cctx.runtime_funcs.get("forge_map_values_handle") {
                         let values_ref = module.declare_func_in_func(values_id, builder.func);
                         let call = builder.ins().call(values_ref, &[map_val]);
                         return Ok(builder.func.dfg.first_result(call));
                     }
                     // Fallback: return empty list
-                    let list_new_id = runtime_funcs.get("forge_list_new").ok_or_else(|| {
+                    let list_new_id = cctx.runtime_funcs.get("forge_list_new").ok_or_else(|| {
                         CompileError::UnknownFunction("forge_list_new".to_string())
                     })?;
                     let list_new_ref = module.declare_func_in_func(*list_new_id, builder.func);
@@ -4700,7 +4245,7 @@ fn compile_expr(
                 }
 
                 if func == "clear" {
-                    if let Some(&clear_id) = runtime_funcs.get("forge_map_clear_handle") {
+                    if let Some(&clear_id) = cctx.runtime_funcs.get("forge_map_clear_handle") {
                         let clear_ref = module.declare_func_in_func(clear_id, builder.func);
                         builder.ins().call(clear_ref, &[map_val]);
                     }
@@ -4708,7 +4253,7 @@ fn compile_expr(
                 }
 
                 if func == "is_empty" {
-                    if let Some(&is_empty_id) = runtime_funcs.get("forge_map_is_empty_handle") {
+                    if let Some(&is_empty_id) = cctx.runtime_funcs.get("forge_map_is_empty_handle") {
                         let is_empty_ref = module.declare_func_in_func(is_empty_id, builder.func);
                         let call = builder.ins().call(is_empty_ref, &[map_val]);
                         return Ok(builder.func.dfg.first_result(call));
@@ -4717,21 +4262,16 @@ fn compile_expr(
                 }
 
                 let runtime_func_name = format!("forge_map_{}", func);
-                if let Some(&func_id) = runtime_funcs.get(&runtime_func_name) {
+                if let Some(&func_id) = cctx.runtime_funcs.get(&runtime_func_name) {
                     let func_ref = module.declare_func_in_func(func_id, builder.func);
                     let mut arg_values = vec![map_val];
                     for arg in &args[1..] {
                         arg_values.push(compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             arg,
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?);
                     }
                     let call = builder.ins().call(func_ref, &arg_values);
@@ -4751,12 +4291,11 @@ fn compile_expr(
                 .unwrap_or(ValueKind::Unknown);
             if set_methods.contains(&func.as_str()) && !args.is_empty() && matches!(first_arg_set_kind, ValueKind::Set) {
                 let set_val = compile_expr(
-                    builder, variables, runtime_funcs, declared_funcs, string_funcs,
-                    module, &args[0], func_signatures, lambda_funcs, global_data_ids,
+                    builder, variables, module, &args[0], cctx,
                 )?;
 
                 if func == "len" {
-                    if let Some(&len_id) = runtime_funcs.get("forge_set_len_handle") {
+                    if let Some(&len_id) = cctx.runtime_funcs.get("forge_set_len_handle") {
                         let len_ref = module.declare_func_in_func(len_id, builder.func);
                         let call = builder.ins().call(len_ref, &[set_val]);
                         return Ok(builder.func.dfg.first_result(call));
@@ -4765,8 +4304,7 @@ fn compile_expr(
 
                 if (func == "contains" || func == "add" || func == "remove") && args.len() >= 2 {
                     let elem_val = compile_expr(
-                        builder, variables, runtime_funcs, declared_funcs, string_funcs,
-                        module, &args[1], func_signatures, lambda_funcs, global_data_ids,
+                        builder, variables, module, &args[1], cctx,
                     )?;
                     let rt_name = match func.as_str() {
                         "contains" => "forge_set_contains_cstr",
@@ -4774,7 +4312,7 @@ fn compile_expr(
                         "remove" => "forge_set_remove_cstr",
                         _ => unreachable!(),
                     };
-                    if let Some(&func_id) = runtime_funcs.get(rt_name) {
+                    if let Some(&func_id) = cctx.runtime_funcs.get(rt_name) {
                         let func_ref = module.declare_func_in_func(func_id, builder.func);
                         let call = builder.ins().call(func_ref, &[set_val, elem_val]);
                         return if !builder.func.dfg.inst_results(call).is_empty() {
@@ -4786,7 +4324,7 @@ fn compile_expr(
                 }
 
                 if func == "clear" {
-                    if let Some(&clear_id) = runtime_funcs.get("forge_set_clear_handle") {
+                    if let Some(&clear_id) = cctx.runtime_funcs.get("forge_set_clear_handle") {
                         let clear_ref = module.declare_func_in_func(clear_id, builder.func);
                         builder.ins().call(clear_ref, &[set_val]);
                     }
@@ -4794,7 +4332,7 @@ fn compile_expr(
                 }
 
                 if func == "is_empty" {
-                    if let Some(&ie_id) = runtime_funcs.get("forge_set_is_empty_handle") {
+                    if let Some(&ie_id) = cctx.runtime_funcs.get("forge_set_is_empty_handle") {
                         let ie_ref = module.declare_func_in_func(ie_id, builder.func);
                         let call = builder.ins().call(ie_ref, &[set_val]);
                         return Ok(builder.func.dfg.first_result(call));
@@ -4812,39 +4350,29 @@ fn compile_expr(
                     return compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         &args[0],
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     );
                 }
                 let arg_val = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     &args[0],
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
                 let arg_ty = builder.func.dfg.value_type(arg_val);
                 let converter = if arg_ty == types::F64 {
-                    runtime_funcs.get("forge_float_to_cstr")
+                    cctx.runtime_funcs.get("forge_float_to_cstr")
                 } else if matches!(arg_kind, ValueKind::Bool) {
-                    runtime_funcs.get("forge_bool_to_cstr")
+                    cctx.runtime_funcs.get("forge_bool_to_cstr")
                 } else if matches!(arg_kind, ValueKind::Unknown) {
                     // Unknown type — use smart to_string that handles both int and string pointers
-                    runtime_funcs.get("forge_smart_to_string")
-                        .or_else(|| runtime_funcs.get("forge_int_to_cstr"))
+                    cctx.runtime_funcs.get("forge_smart_to_string")
+                        .or_else(|| cctx.runtime_funcs.get("forge_int_to_cstr"))
                 } else {
-                    runtime_funcs.get("forge_int_to_cstr")
+                    cctx.runtime_funcs.get("forge_int_to_cstr")
                 };
                 if let Some(&cid) = converter {
                     let cref = module.declare_func_in_func(cid, builder.func);
@@ -4856,7 +4384,7 @@ fn compile_expr(
 
             // Special case: args() → use forge_args_to_list for proper List return
             if func == "args" && args.is_empty() {
-                if let Some(&args_list_id) = runtime_funcs.get("forge_args_to_list") {
+                if let Some(&args_list_id) = cctx.runtime_funcs.get("forge_args_to_list") {
                     let args_ref = module.declare_func_in_func(args_list_id, builder.func);
                     let call = builder.ins().call(args_ref, &[]);
                     return Ok(builder.func.dfg.first_result(call));
@@ -4890,14 +4418,9 @@ fn compile_expr(
                 let first_arg = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     &args[0],
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
                 let first_arg_ty = builder.func.dfg.value_type(first_arg);
 
@@ -4907,21 +4430,16 @@ fn compile_expr(
                     all_args.push(compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         arg,
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?);
                 }
 
                 // Choose print function based on argument type
                 if first_arg_ty == types::F64 {
                     // Float: convert to string first, then print as cstr
-                    if let Some(&conv_id) = runtime_funcs.get("forge_float_to_cstr") {
+                    if let Some(&conv_id) = cctx.runtime_funcs.get("forge_float_to_cstr") {
                         let conv_ref = module.declare_func_in_func(conv_id, builder.func);
                         let call = builder.ins().call(conv_ref, &[all_args[0]]);
                         let s = builder.func.dfg.first_result(call);
@@ -4933,7 +4451,7 @@ fn compile_expr(
                     || matches!(&args[0], AstNode::BoolLiteral(_))
                 {
                     // Bool: convert to "true"/"false" string first, then print
-                    if let Some(&conv_id) = runtime_funcs.get("forge_bool_to_cstr") {
+                    if let Some(&conv_id) = cctx.runtime_funcs.get("forge_bool_to_cstr") {
                         let conv_ref = module.declare_func_in_func(conv_id, builder.func);
                         let call = builder.ins().call(conv_ref, &[all_args[0]]);
                         let s = builder.func.dfg.first_result(call);
@@ -4967,14 +4485,9 @@ fn compile_expr(
                     avals.push(compile_expr(
                         builder,
                         variables,
-                        runtime_funcs,
-                        declared_funcs,
-                        string_funcs,
                         module,
                         arg,
-                        func_signatures,
-                        lambda_funcs,
-                        global_data_ids,
+                        cctx,
                     )?);
                 }
                 (fname, avals)
@@ -4982,7 +4495,7 @@ fn compile_expr(
 
             // User-defined functions take priority over runtime aliases
             // Also check for monomorphized generic functions (e.g., show -> show_Point)
-            let Some(func_id) = declared_funcs
+            let Some(func_id) = cctx.declared_funcs
                 .get(func)
                 .copied()
                 .or_else(|| {
@@ -4993,7 +4506,7 @@ fn compile_expr(
                         );
                         if let Some(tn) = type_name {
                             let mangled = format!("{}_{}", func, tn);
-                            declared_funcs.get(&mangled).copied()
+                            cctx.declared_funcs.get(&mangled).copied()
                         } else {
                             None
                         }
@@ -5001,8 +4514,8 @@ fn compile_expr(
                         None
                     }
                 })
-                .or_else(|| runtime_funcs.get(func_name).copied())
-                .or_else(|| runtime_funcs.get(func).copied())
+                .or_else(|| cctx.runtime_funcs.get(func_name).copied())
+                .or_else(|| cctx.runtime_funcs.get(func).copied())
             else {
                 if func
                     .chars()
@@ -5014,7 +4527,7 @@ fn compile_expr(
                     if let Some(layout) = crate::get_struct_layout(func) {
                         // Allocate struct
                         let alloc_func_id =
-                            runtime_funcs.get("forge_struct_alloc").ok_or_else(|| {
+                            cctx.runtime_funcs.get("forge_struct_alloc").ok_or_else(|| {
                                 CompileError::UnknownFunction("forge_struct_alloc".to_string())
                             })?;
                         let alloc_ref = module.declare_func_in_func(*alloc_func_id, builder.func);
@@ -5027,14 +4540,9 @@ fn compile_expr(
                             let arg_val = compile_expr(
                                 builder,
                                 variables,
-                                runtime_funcs,
-                                declared_funcs,
-                                string_funcs,
                                 module,
                                 arg,
-                                func_signatures,
-                                lambda_funcs,
-                                global_data_ids,
+                                cctx,
                             )?;
                             let offset = if i < layout.len() {
                                 layout[i].1 as i32
@@ -5070,14 +4578,9 @@ fn compile_expr(
                         let v = compile_expr(
                             builder,
                             variables,
-                            runtime_funcs,
-                            declared_funcs,
-                            string_funcs,
                             module,
                             arg,
-                            func_signatures,
-                            lambda_funcs,
-                            global_data_ids,
+                            cctx,
                         )?;
                         // Ensure all args are I64 for indirect call
                         let v64 = if builder.func.dfg.value_type(v) != types::I64 {
@@ -5110,9 +4613,9 @@ fn compile_expr(
 
             let func_ref = module.declare_func_in_func(func_id, builder.func);
 
-            let coerced_args = if let Some(param_types) = func_signatures
+            let coerced_args = if let Some(param_types) = cctx.func_signatures
                 .get(func_name)
-                .or_else(|| func_signatures.get(func))
+                .or_else(|| cctx.func_signatures.get(func))
             {
                 let mut coerced = Vec::with_capacity(param_types.len());
                 for (i, &target_ty) in param_types.iter().enumerate() {
@@ -5163,14 +4666,9 @@ fn compile_expr(
             let subject_val = compile_expr(
                 builder,
                 variables,
-                runtime_funcs,
-                declared_funcs,
-                string_funcs,
                 module,
                 expr,
-                func_signatures,
-                lambda_funcs,
-                global_data_ids,
+                cctx,
             )?;
 
             // Create the merge block that will receive the final result
@@ -5208,15 +4706,10 @@ fn compile_expr(
                 let pattern_matches = compile_pattern_check(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     &arm.pattern,
                     subject_val,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
 
                 // Branch to arm block if pattern matches, otherwise to next check
@@ -5230,14 +4723,9 @@ fn compile_expr(
                 let arm_result = compile_expr(
                     builder,
                     variables,
-                    runtime_funcs,
-                    declared_funcs,
-                    string_funcs,
                     module,
                     &arm.expr,
-                    func_signatures,
-                    lambda_funcs,
-                    global_data_ids,
+                    cctx,
                 )?;
                 builder.ins().jump(merge_block, &[arm_result]);
                 builder.seal_block(arm_block);
@@ -5284,16 +4772,10 @@ fn compile_expr(
             // 2. Return the lambda function's address as i64.
             let ptr = node as *const AstNode as usize;
             let captures = get_lambda_captures(ptr);
-            eprintln!(
-                "DEBUG: Lambda node ptr={:#x}, in lambda_funcs={}, captures={:?}",
-                ptr,
-                lambda_funcs.contains_key(&ptr),
-                captures
-            );
-            if let Some(&lambda_func_id) = lambda_funcs.get(&ptr) {
+            if let Some(&lambda_func_id) = cctx.lambda_funcs.get(&ptr) {
                 // Emit closure env setup for captured vars
                 if !captures.is_empty() {
-                    if let Some(&set_env_id) = runtime_funcs.get("forge_closure_set_env") {
+                    if let Some(&set_env_id) = cctx.runtime_funcs.get("forge_closure_set_env") {
                         let set_env_ref = module.declare_func_in_func(set_env_id, builder.func);
                         for (slot, cap_name) in captures.iter().enumerate() {
                             let slot_val = builder.ins().iconst(types::I64, slot as i64);
@@ -5325,7 +4807,7 @@ fn compile_expr(
             // The inner expression should be a Call node
             if let AstNode::Call { func, args } = expr.as_ref() {
                 // Get the function pointer
-                let fn_ptr = if let Some(&func_id) = declared_funcs.get(func.as_str()) {
+                let fn_ptr = if let Some(&func_id) = cctx.declared_funcs.get(func.as_str()) {
                     let func_ref = module.declare_func_in_func(func_id, builder.func);
                     builder.ins().func_addr(types::I64, func_ref)
                 } else {
@@ -5336,15 +4818,14 @@ fn compile_expr(
                 // Compile the first argument (spawn only supports single-arg functions for now)
                 let arg_val = if !args.is_empty() {
                     compile_expr(
-                        builder, variables, runtime_funcs, declared_funcs, string_funcs,
-                        module, &args[0], func_signatures, lambda_funcs, global_data_ids,
+                        builder, variables, module, &args[0], cctx,
                     )?
                 } else {
                     builder.ins().iconst(types::I64, 0)
                 };
 
                 // Call forge_spawn(fn_ptr, arg)
-                if let Some(&spawn_id) = runtime_funcs.get("forge_spawn") {
+                if let Some(&spawn_id) = cctx.runtime_funcs.get("forge_spawn") {
                     let spawn_ref = module.declare_func_in_func(spawn_id, builder.func);
                     let call = builder.ins().call(spawn_ref, &[fn_ptr, arg_val]);
                     Ok(builder.func.dfg.first_result(call))
@@ -5361,11 +4842,10 @@ fn compile_expr(
             // await task → forge_await(task_handle)
             // The inner expression could be an identifier (task variable) or a spawn expression
             let task_val = compile_expr(
-                builder, variables, runtime_funcs, declared_funcs, string_funcs,
-                module, expr, func_signatures, lambda_funcs, global_data_ids,
+                builder, variables, module, expr, cctx,
             )?;
 
-            if let Some(&await_id) = runtime_funcs.get("forge_await") {
+            if let Some(&await_id) = cctx.runtime_funcs.get("forge_await") {
                 let await_ref = module.declare_func_in_func(await_id, builder.func);
                 let call = builder.ins().call(await_ref, &[task_val]);
                 Ok(builder.func.dfg.first_result(call))

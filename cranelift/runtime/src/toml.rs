@@ -129,24 +129,7 @@ fn parse_array(s: &str) -> i64 {
 
 // ---- FFI ----
 
-unsafe fn cstr_to_str<'a>(s: *const i8) -> &'a str {
-    if s.is_null() { return ""; }
-    let len = crate::string::forge_cstring_len(s) as usize;
-    let slice = std::slice::from_raw_parts(s as *const u8, len);
-    std::str::from_utf8(slice).unwrap_or("")
-}
-
-unsafe fn alloc_cstring(s: &str) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-    let bytes = s.as_bytes();
-    let layout = Layout::from_size_align(bytes.len() + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        *ptr.add(bytes.len()) = 0;
-    }
-    ptr
-}
+use crate::ffi_util::{alloc_cstring, cstr_to_str};
 
 #[no_mangle]
 pub unsafe extern "C" fn forge_toml_parse(s: *const i8) -> i64 {

@@ -1798,23 +1798,9 @@ pub fn declare_runtime_functions(
     funcs.insert("chars".to_string(), chars);
     funcs.insert("forge_cstring_chars".to_string(), chars);
 
-    // List: sort, sort_strings, slice
-    let list_sort = declare_runtime_function(module, "forge_list_sort", &[types::I64], &[])?;
+    // List: sort/slice aliases (reuse earlier declarations)
     funcs.insert("sort".to_string(), list_sort);
-    funcs.insert("forge_list_sort".to_string(), list_sort);
-
-    let list_sort_strings =
-        declare_runtime_function(module, "forge_list_sort_strings", &[types::I64], &[])?;
-    funcs.insert("forge_list_sort_strings".to_string(), list_sort_strings);
-
-    let list_slice = declare_runtime_function(
-        module,
-        "forge_list_slice",
-        &[types::I64, types::I64, types::I64],
-        &[types::I64],
-    )?;
     funcs.insert("slice".to_string(), list_slice);
-    funcs.insert("forge_list_slice".to_string(), list_slice);
 
     // Path: ext, stem, join
     let path_ext =
@@ -1838,10 +1824,8 @@ pub fn declare_runtime_functions(
     funcs.insert("forge_path_join".to_string(), path_join);
 
     // Path: base (alias for basename)
-    let path_base =
-        declare_runtime_function(module, "forge_path_basename", &[types::I64], &[types::I64])?;
-    funcs.insert("base".to_string(), path_base);
-    funcs.insert("base_name".to_string(), path_base);
+    funcs.insert("base".to_string(), path_basename);
+    funcs.insert("base_name".to_string(), path_basename);
 
     // type_of (generic stub - JSON type_of takes priority from earlier declaration)
 
@@ -1917,15 +1901,12 @@ pub fn declare_runtime_functions(
     funcs.insert("recv".to_string(), channel_recv);
     funcs.insert("forge_channel_recv".to_string(), channel_recv);
 
-    // Logging: error function
-    let log_error2 = declare_runtime_function(module, "forge_log_error", &[types::I64], &[])?;
-    funcs.insert("error".to_string(), log_error2);
-    funcs.insert("debug".to_string(), log_error2); // stub debug as well
+    // Logging: error/debug aliases (reuse log_error)
+    funcs.insert("error".to_string(), log_error);
+    funcs.insert("debug".to_string(), log_error); // stub debug as well
 
     // to_hex (alias for hex_encode)
-    let to_hex =
-        declare_runtime_function(module, "forge_hex_encode", &[types::I64], &[types::I64])?;
-    funcs.insert("to_hex".to_string(), to_hex);
+    funcs.insert("to_hex".to_string(), hex_encode);
 
     // from_hex (hex decode)
     let from_hex =
@@ -1946,10 +1927,9 @@ pub fn declare_runtime_functions(
     let is_dir = declare_runtime_function(module, "forge_is_dir", &[types::I64], &[types::I64])?;
     funcs.insert("is_dir".to_string(), is_dir);
 
-    // show (generic display — stub, returns arg as-is)
-    let show = declare_runtime_function(module, "forge_identity", &[types::I64], &[types::I64])?;
-    funcs.insert("show".to_string(), show);
-    funcs.insert("show_and_hash".to_string(), show);
+    // show (generic display — stub, returns arg as-is; reuse identity)
+    funcs.insert("show".to_string(), identity);
+    funcs.insert("show_and_hash".to_string(), identity);
 
     // last_index_of
     let last_index_of = declare_runtime_function(
@@ -2012,9 +1992,8 @@ pub fn declare_runtime_functions(
         declare_runtime_function(module, "forge_url_to_string", &[types::I64], &[types::I64])?;
     funcs.insert("url_to_string".to_string(), url_to_string);
 
-    // channel close
-    let ch_close = declare_runtime_function(module, "forge_tcp_close", &[types::I64], &[])?;
-    funcs.insert("close".to_string(), ch_close);
+    // channel close (reuse tcp_close)
+    funcs.insert("close".to_string(), tcp_close);
 
     // tcp_read with buffer size (2 args)
     let tcp_read2 = declare_runtime_function(
@@ -2270,48 +2249,6 @@ pub fn declare_string_data(
 
     Ok(func_id)
 }
-pub fn generate_test_function(module: &mut ObjectModule) -> Result<FuncId, CompileError> {
-    let mut ctx = module.make_context();
-
-    // Define function signature: fn(i64, i64) -> i64
-    ctx.func.signature.params.push(AbiParam::new(types::I64));
-    ctx.func.signature.params.push(AbiParam::new(types::I64));
-    ctx.func.signature.returns.push(AbiParam::new(types::I64));
-
-    let func_id = module
-        .declare_function("add", Linkage::Local, &ctx.func.signature)
-        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    // Build the function
-    let mut builder_ctx = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
-
-        let entry_block = builder.create_block();
-        builder.append_block_params_for_function_params(entry_block);
-        builder.switch_to_block(entry_block);
-        builder.seal_block(entry_block);
-
-        // Get parameters
-        let params = builder.block_params(entry_block);
-        let a = params[0];
-        let b = params[1];
-
-        // Add them
-        let sum = builder.ins().iadd(a, b);
-
-        // Return the result
-        builder.ins().return_(&[sum]);
-    }
-
-    // Define and finalize the function
-    module
-        .define_function(func_id, &mut ctx)
-        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    Ok(func_id)
-}
-
 /// Finalize the module and return object bytes
 pub fn finalize_module(module: ObjectModule) -> Result<Vec<u8>, CompileError> {
     let object = module.finish();
@@ -2321,80 +2258,6 @@ pub fn finalize_module(module: ObjectModule) -> Result<Vec<u8>, CompileError> {
     Ok(bytes)
 }
 
-/// Compile a simple "hello world" test
-pub fn compile_hello_world() -> Result<CompileResult, CompileError> {
-    let isa_builder = cranelift_native::builder()
-        .map_err(|e| CompileError::ModuleError(format!("Unsupported target: {:?}", e)))?;
-
-    let isa = isa_builder
-        .finish(settings::Flags::new(settings::builder()))
-        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    let builder = ObjectBuilder::new(
-        isa,
-        "hello_world",
-        cranelift_module::default_libcall_names(),
-    )
-    .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    let mut module = ObjectModule::new(builder);
-
-    // Declare external printf function
-    let mut printf_sig = module.make_signature();
-    printf_sig.params.push(AbiParam::new(types::I64)); // format string pointer
-    printf_sig.returns.push(AbiParam::new(types::I32)); // return int
-
-    let printf_id = module
-        .declare_function("printf", Linkage::Import, &printf_sig)
-        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    // Create main function
-    let mut ctx = module.make_context();
-    ctx.func.signature.returns.push(AbiParam::new(types::I32));
-
-    let main_id = module
-        .declare_function("main", Linkage::Export, &ctx.func.signature)
-        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    // Build main
-    let mut builder_ctx = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
-
-        let entry_block = builder.create_block();
-        builder.switch_to_block(entry_block);
-        builder.seal_block(entry_block);
-
-        // Get pointer to format string
-        let format_str = builder.ins().iconst(types::I64, 0); // Placeholder - would need actual string data
-
-        // Get function reference for printf
-        let printf_func_ref = module.declare_func_in_func(printf_id, builder.func);
-
-        // Call printf
-        builder.ins().call(printf_func_ref, &[format_str]);
-
-        // Return 0
-        let zero = builder.ins().iconst(types::I32, 0);
-        builder.ins().return_(&[zero]);
-    }
-
-    // Define main
-    module
-        .define_function(main_id, &mut ctx)
-        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    // Finalize and return
-    let object = module.finish();
-    let bytes = object
-        .emit()
-        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    Ok(CompileResult {
-        object_bytes: bytes,
-        entry_point: "main".to_string(),
-    })
-}
 
 #[cfg(test)]
 mod tests {

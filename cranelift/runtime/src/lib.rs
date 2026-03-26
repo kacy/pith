@@ -15,6 +15,7 @@ pub mod arc;
 pub mod collections;
 pub mod concurrency;
 pub mod json;
+pub mod ffi_util;
 pub mod string;
 pub mod toml;
 
@@ -26,23 +27,25 @@ pub static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Closure environment: a fixed-size array of i64 slots for captured variables.
-/// Single-threaded programs can use this to pass captures to lambda functions
-/// compiled without a full closure ABI.
-static mut CLOSURE_ENV: [i64; 16] = [0i64; 16];
+/// Closure environment slots for passing captures to lambda functions.
+static CLOSURE_ENV: [std::sync::atomic::AtomicI64; 16] = {
+    const ZERO: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    [ZERO; 16]
+};
 
 /// Set a captured variable slot before calling a closure.
 #[no_mangle]
-pub unsafe extern "C" fn forge_closure_set_env(slot: i64, value: i64) {
+pub extern "C" fn forge_closure_set_env(slot: i64, value: i64) {
     if slot >= 0 && (slot as usize) < 16 {
-        CLOSURE_ENV[slot as usize] = value;
+        CLOSURE_ENV[slot as usize].store(value, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 /// Read a captured variable from the closure environment.
 #[no_mangle]
-pub unsafe extern "C" fn forge_closure_get_env(slot: i64) -> i64 {
+pub extern "C" fn forge_closure_get_env(slot: i64) -> i64 {
     if slot >= 0 && (slot as usize) < 16 {
-        CLOSURE_ENV[slot as usize]
+        CLOSURE_ENV[slot as usize].load(std::sync::atomic::Ordering::Relaxed)
     } else {
         0
     }
@@ -114,19 +117,8 @@ pub unsafe extern "C" fn forge_concat_cstr(a: *const i8, b: *const i8) -> *mut i
     }
 
     // Calculate lengths
-    let mut len_a = 0;
-    let mut p = a;
-    while *p != 0 {
-        len_a += 1;
-        p = p.add(1);
-    }
-
-    let mut len_b = 0;
-    let mut p = b;
-    while *p != 0 {
-        len_b += 1;
-        p = p.add(1);
-    }
+    let len_a = crate::string::forge_cstring_len(a) as usize;
+    let len_b = crate::string::forge_cstring_len(b) as usize;
 
     let total_len = len_a + len_b;
     let layout = Layout::from_size_align(total_len + 1, 1).unwrap();
@@ -158,12 +150,7 @@ pub unsafe extern "C" fn forge_strdup(ptr: *const i8) -> *mut i8 {
         return std::ptr::null_mut();
     }
 
-    let mut len = 0;
-    let mut p = ptr;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::forge_cstring_len(ptr) as usize;
 
     let layout = Layout::from_size_align(len + 1, 1).unwrap();
     let result = alloc(layout) as *mut i8;
@@ -187,12 +174,7 @@ pub unsafe extern "C" fn forge_print_cstr(ptr: *const i8) {
     }
 
     // Calculate length
-    let mut len = 0;
-    let mut p = ptr;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::forge_cstring_len(ptr) as usize;
 
     let slice = std::slice::from_raw_parts(ptr as *const u8, len);
     if let Ok(str_ref) = std::str::from_utf8(slice) {
@@ -216,12 +198,7 @@ pub unsafe extern "C" fn forge_print_err(ptr: *const i8) {
     }
 
     // Calculate length
-    let mut len = 0;
-    let mut p = ptr;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::forge_cstring_len(ptr) as usize;
 
     let slice = std::slice::from_raw_parts(ptr as *const u8, len);
     if let Ok(str_ref) = std::str::from_utf8(slice) {
@@ -326,59 +303,49 @@ pub unsafe extern "C" fn forge_chr_cstr(n: i64) -> *mut i8 {
 }
 
 /// Test assertion helpers
-static mut TEST_FAILED: bool = false;
+static TEST_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Assert that condition is true
 #[no_mangle]
 pub extern "C" fn forge_assert(cond: i64) {
-    unsafe {
-        if cond == 0 {
-            TEST_FAILED = true;
-            eprintln!("Assertion failed");
-        }
+    if cond == 0 {
+        TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("Assertion failed");
     }
 }
 
 /// Assert that two values are equal
 #[no_mangle]
 pub extern "C" fn forge_assert_eq(a: i64, b: i64) {
-    unsafe {
-        if a != b {
-            TEST_FAILED = true;
-            eprintln!("Assertion failed: {} != {}", a, b);
-        }
+    if a != b {
+        TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("Assertion failed: {} != {}", a, b);
     }
 }
 
-/// Assert that two values are not equal  
+/// Assert that two values are not equal
 #[no_mangle]
 pub extern "C" fn forge_assert_ne(a: i64, b: i64) {
-    unsafe {
-        if a == b {
-            TEST_FAILED = true;
-            eprintln!("Assertion failed: {} == {}", a, b);
-        }
+    if a == b {
+        TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("Assertion failed: {} == {}", a, b);
     }
 }
 
 /// Check if any test failed
 #[no_mangle]
 pub extern "C" fn forge_test_result() -> i64 {
-    unsafe {
-        if TEST_FAILED {
-            1
-        } else {
-            0
-        }
+    if TEST_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        1
+    } else {
+        0
     }
 }
 
 /// Reset test state
 #[no_mangle]
 pub extern "C" fn forge_test_reset() {
-    unsafe {
-        TEST_FAILED = false;
-    }
+    TEST_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Bitwise AND
@@ -562,12 +529,7 @@ pub unsafe extern "C" fn forge_file_exists(path: *const i8) -> i64 {
         return 0;
     }
 
-    let mut len = 0;
-    let mut p = path;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::forge_cstring_len(path) as usize;
 
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
@@ -588,12 +550,7 @@ pub unsafe extern "C" fn forge_dir_exists(path: *const i8) -> i64 {
         return 0;
     }
 
-    let mut len = 0;
-    let mut p = path;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::forge_cstring_len(path) as usize;
 
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
@@ -617,12 +574,7 @@ pub unsafe extern "C" fn forge_mkdir(path: *const i8) -> i64 {
         return 0;
     }
 
-    let mut len = 0;
-    let mut p = path;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::forge_cstring_len(path) as usize;
 
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
@@ -645,12 +597,7 @@ pub unsafe extern "C" fn forge_remove_file(path: *const i8) -> i64 {
         return 0;
     }
 
-    let mut len = 0;
-    let mut p = path;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::forge_cstring_len(path) as usize;
 
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
@@ -673,19 +620,8 @@ pub unsafe extern "C" fn forge_rename_file(from: *const i8, to: *const i8) -> i6
         return 0;
     }
 
-    let mut from_len = 0;
-    let mut p = from;
-    while *p != 0 {
-        from_len += 1;
-        p = p.add(1);
-    }
-
-    let mut to_len = 0;
-    let mut p = to;
-    while *p != 0 {
-        to_len += 1;
-        p = p.add(1);
-    }
+    let from_len = crate::string::forge_cstring_len(from) as usize;
+    let to_len = crate::string::forge_cstring_len(to) as usize;
 
     let from_slice = std::slice::from_raw_parts(from as *const u8, from_len);
     let to_slice = std::slice::from_raw_parts(to as *const u8, to_len);
@@ -715,12 +651,7 @@ pub unsafe extern "C" fn forge_read_file(path: *const i8) -> *mut i8 {
         return std::ptr::null_mut();
     }
 
-    let mut len = 0;
-    let mut p = path;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::forge_cstring_len(path) as usize;
 
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
@@ -752,19 +683,8 @@ pub unsafe extern "C" fn forge_write_file(path: *const i8, content: *const i8) -
         return 0;
     }
 
-    let mut path_len = 0;
-    let mut p = path;
-    while *p != 0 {
-        path_len += 1;
-        p = p.add(1);
-    }
-
-    let mut content_len = 0;
-    let mut p = content;
-    while *p != 0 {
-        content_len += 1;
-        p = p.add(1);
-    }
+    let path_len = crate::string::forge_cstring_len(path) as usize;
+    let content_len = crate::string::forge_cstring_len(content) as usize;
 
     let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
     let content_slice = std::slice::from_raw_parts(content as *const u8, content_len);
@@ -794,19 +714,8 @@ pub unsafe extern "C" fn forge_append_file(path: *const i8, content: *const i8) 
         return 0;
     }
 
-    let mut path_len = 0;
-    let mut p = path;
-    while *p != 0 {
-        path_len += 1;
-        p = p.add(1);
-    }
-
-    let mut content_len = 0;
-    let mut p = content;
-    while *p != 0 {
-        content_len += 1;
-        p = p.add(1);
-    }
+    let path_len = crate::string::forge_cstring_len(path) as usize;
+    let content_len = crate::string::forge_cstring_len(content) as usize;
 
     let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
     let content_slice = std::slice::from_raw_parts(content as *const u8, content_len);
@@ -859,12 +768,7 @@ pub unsafe extern "C" fn forge_env(name: *const i8) -> *const i8 {
         return std::ptr::null();
     }
 
-    let mut len = 0;
-    let mut p = name;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::forge_cstring_len(name) as usize;
 
     let slice = std::slice::from_raw_parts(name as *const u8, len);
     if let Ok(name_str) = std::str::from_utf8(slice) {
@@ -935,12 +839,7 @@ pub unsafe extern "C" fn forge_list_dir(path: *const i8) -> *mut StringNode {
         return std::ptr::null_mut();
     }
 
-    let mut len = 0;
-    let mut p = path;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::forge_cstring_len(path) as usize;
 
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
@@ -1000,12 +899,7 @@ pub unsafe extern "C" fn forge_exec(command: *const i8) -> i64 {
         return -1;
     }
 
-    let mut len = 0;
-    let mut p = command;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::forge_cstring_len(command) as usize;
 
     let slice = std::slice::from_raw_parts(command as *const u8, len);
     if let Ok(cmd_str) = std::str::from_utf8(slice) {
@@ -2219,24 +2113,17 @@ pub unsafe extern "C" fn forge_json_parse(s: *const i8) -> i64 {
     -1 // Use -1 as the "parse failed" sentinel (distinct from TOML handles which are <= -2)
 }
 
-/// Smart to_string for Unknown-typed values: if the value looks like a C string pointer,
-/// return it as a string. Otherwise convert as integer.
+/// Smart to_string for Unknown-typed values: distinguishes heap string pointers
+/// from small integers (JSON/TOML handles) using address range heuristics.
 #[no_mangle]
 pub unsafe extern "C" fn forge_smart_to_string(val: i64) -> *mut i8 {
-    // Negative values and small values (< 4096) are definitely integers
-    if val <= 0 || val < 4096 {
-        return forge_int_to_cstr(val);
-    }
-    // Check if it looks like a valid C string pointer
-    let ptr = val as *const u8;
-    // Try to read the first byte — if accessible and ASCII, assume it's a string
-    // This is a heuristic; in practice, JSON handles are small and string pointers are large
-    let first_byte = *ptr;
-    if first_byte > 0 && first_byte < 128 {
-        // Looks like a valid ASCII C string — return as-is
-        forge_strdup(val as *const i8)
-    } else {
+    // Negative values: TOML handles or -1 sentinel → convert as integer
+    // Small positive values (< 1_000_000): likely JSON arena handles → convert as integer
+    // Large positive values: likely heap-allocated C string pointers → strdup
+    if val <= 0 || (val > 0 && val < 1_000_000) {
         forge_int_to_cstr(val)
+    } else {
+        forge_strdup(val as *const i8)
     }
 }
 
@@ -2946,7 +2833,7 @@ pub unsafe extern "C" fn forge_url_scheme(url: i64) -> *mut i8 {
 pub unsafe extern "C" fn forge_url_host(url: i64) -> *mut i8 {
     let s = url_as_str(url);
     let host = url_extract_host(s);
-    alloc_cstr(host)
+    crate::ffi_util::alloc_cstring(host)
 }
 
 /// Extract port from a parsed URL. Returns -1 if no port specified.
@@ -2972,7 +2859,7 @@ pub unsafe extern "C" fn forge_url_path(url: i64) -> *mut i8 {
     let after_authority = after_scheme.find('/').map(|i| &after_scheme[i..]).unwrap_or("/");
     let path = after_authority.split('?').next().unwrap_or(after_authority);
     let path = path.split('#').next().unwrap_or(path);
-    alloc_cstr(path)
+    crate::ffi_util::alloc_cstring(path)
 }
 
 /// Extract query string from a parsed URL (without '?')
@@ -2985,7 +2872,7 @@ pub unsafe extern "C" fn forge_url_query(url: i64) -> *mut i8 {
     } else {
         ""
     };
-    alloc_cstr(query)
+    crate::ffi_util::alloc_cstring(query)
 }
 
 /// Extract fragment from a parsed URL (without '#')
@@ -2997,7 +2884,7 @@ pub unsafe extern "C" fn forge_url_fragment(url: i64) -> *mut i8 {
     } else {
         ""
     };
-    alloc_cstr(fragment)
+    crate::ffi_util::alloc_cstring(fragment)
 }
 
 /// Reconstruct URL string (identity since we store the raw URL)
@@ -3078,13 +2965,7 @@ pub unsafe extern "C" fn forge_url_decode(s: *const i8) -> *mut i8 {
 
 // Helper: get URL string from handle
 unsafe fn url_as_str(url: i64) -> &'static str {
-    let ptr = url as *const i8;
-    if ptr.is_null() {
-        return "";
-    }
-    let len = crate::string::forge_cstring_len(ptr) as usize;
-    let slice = std::slice::from_raw_parts(ptr as *const u8, len);
-    std::str::from_utf8(slice).unwrap_or("")
+    crate::ffi_util::cstr_to_str(url as *const i8)
 }
 
 // Helper: extract host from URL string
@@ -3093,19 +2974,6 @@ fn url_extract_host(s: &str) -> &str {
     let authority = after_scheme.split('/').next().unwrap_or("");
     let auth_no_at = authority.rsplit('@').next().unwrap_or(authority);
     auth_no_at.split(':').next().unwrap_or("")
-}
-
-// Helper: allocate a C string from a Rust &str
-unsafe fn alloc_cstr(s: &str) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-    let bytes = s.as_bytes();
-    let layout = Layout::from_size_align(bytes.len() + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        *ptr.add(bytes.len()) = 0;
-    }
-    ptr
 }
 
 /// TCP read with max-bytes argument — stub (returns empty string)

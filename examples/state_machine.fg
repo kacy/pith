@@ -1,0 +1,81 @@
+# state machine — simple HTTP request parser using integer states
+# exercises: while loops, string operations, state transitions, structs
+
+struct Request:
+    method: String
+    path: String
+    version: String
+    header_count: Int
+
+fn parse_request(input: String) -> Request:
+    mut method := ""
+    mut path := ""
+    mut version := ""
+    mut headers := 0
+    mut current := ""
+    # states: 0=start, 1=method, 2=path, 3=version, 4=header_name, 5=header_value, 6=done
+    mut state := 0
+    mut i := 0
+
+    while i < input.len():
+        c := input[i]
+        if state == 0:
+            if c != " ":
+                current = c
+                state = 1
+        elif state == 1:
+            if c == " ":
+                method = current
+                current = ""
+                state = 2
+            else:
+                current = current + c
+        elif state == 2:
+            if c == " ":
+                path = current
+                current = ""
+                state = 3
+            else:
+                current = current + c
+        elif state == 3:
+            if c == "\n":
+                version = current
+                current = ""
+                state = 4
+            else:
+                current = current + c
+        elif state == 4:
+            if c == "\n":
+                state = 6
+            elif c == ":":
+                current = ""
+                state = 5
+            else:
+                current = current + c
+        elif state == 5:
+            if c == "\n":
+                headers = headers + 1
+                current = ""
+                state = 4
+            else:
+                current = current + c
+        i = i + 1
+
+    return Request(method, path, version, headers)
+
+fn main():
+    req_str := "GET /index.html HTTP/1.1\nHost: example.com\nAccept: text/html\n\n"
+    req := parse_request(req_str)
+    print("method: " + req.method)
+    print("path: " + req.path)
+    print("version: " + req.version)
+    print("headers: " + req.header_count.to_string())
+
+    req2_str := "POST /api/data HTTP/2.0\nContent-Type: application/json\nAuth: Bearer token\nX-Custom: value\n\n"
+    req2 := parse_request(req2_str)
+    print("method: " + req2.method)
+    print("path: " + req2.path)
+    print("version: " + req2.version)
+    print("headers: " + req2.header_count.to_string())
+
+    print("state machine works")

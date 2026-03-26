@@ -1,0 +1,104 @@
+# recursive algorithms — fibonacci, sorting, tree traversal
+# exercises: recursion, lists, string building, nested function calls
+
+fn fib(n: Int) -> Int:
+    if n <= 1:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+fn factorial(n: Int) -> Int:
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+
+fn gcd(a: Int, b: Int) -> Int:
+    if b == 0:
+        return a
+    return gcd(b, a % b)
+
+fn power(base: Int, exp: Int) -> Int:
+    if exp == 0:
+        return 1
+    if exp % 2 == 0:
+        half := power(base, exp / 2)
+        return half * half
+    return base * power(base, exp - 1)
+
+# quicksort
+fn quicksort(arr: List[Int]) -> List[Int]:
+    if arr.len() <= 1:
+        return arr
+    pivot := arr[0]
+    mut less: List[Int] := []
+    mut equal: List[Int] := []
+    mut greater: List[Int] := []
+    mut i := 0
+    while i < arr.len():
+        if arr[i] < pivot:
+            less.push(arr[i])
+        elif arr[i] == pivot:
+            equal.push(arr[i])
+        else:
+            greater.push(arr[i])
+        i = i + 1
+    sorted_less := quicksort(less)
+    sorted_greater := quicksort(greater)
+    # concatenate
+    mut result: List[Int] := []
+    i = 0
+    while i < sorted_less.len():
+        result.push(sorted_less[i])
+        i = i + 1
+    i = 0
+    while i < equal.len():
+        result.push(equal[i])
+        i = i + 1
+    i = 0
+    while i < sorted_greater.len():
+        result.push(sorted_greater[i])
+        i = i + 1
+    return result
+
+fn list_to_string(arr: List[Int]) -> String:
+    mut parts: List[String] := []
+    mut i := 0
+    while i < arr.len():
+        parts.push(arr[i].to_string())
+        i = i + 1
+    return "[" + parts.join(", ") + "]"
+
+fn main():
+    # fibonacci
+    mut fibs: List[String] := []
+    mut i := 0
+    while i < 10:
+        fibs.push(fib(i).to_string())
+        i = i + 1
+    print("fib(0..9): " + fibs.join(", "))
+
+    # factorial
+    print("5! = " + factorial(5).to_string())
+    print("10! = " + factorial(10).to_string())
+
+    # gcd
+    print("gcd(48, 18) = " + gcd(48, 18).to_string())
+    print("gcd(100, 75) = " + gcd(100, 75).to_string())
+
+    # power
+    print("2^10 = " + power(2, 10).to_string())
+    print("3^5 = " + power(3, 5).to_string())
+
+    # quicksort
+    unsorted := [38, 27, 43, 3, 9, 82, 10]
+    sorted := quicksort(unsorted)
+    print("sorted: " + list_to_string(sorted))
+
+    # sort already sorted
+    already := [1, 2, 3, 4, 5]
+    print("already: " + list_to_string(quicksort(already)))
+
+    # sort reverse
+    rev := [5, 4, 3, 2, 1]
+    print("reverse: " + list_to_string(quicksort(rev)))
+
+    print("algorithms work")

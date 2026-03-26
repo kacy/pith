@@ -1,0 +1,95 @@
+# data pipeline — transform, filter, aggregate over structured data
+# exercises: structs, lists, maps, lambdas, closures, string methods, for loops
+
+struct Record:
+    name: String
+    category: String
+    score: Int
+
+fn make_records() -> List[Record]:
+    mut records: List[Record] := []
+    records.push(Record("alice", "engineering", 92))
+    records.push(Record("bob", "marketing", 78))
+    records.push(Record("carol", "engineering", 88))
+    records.push(Record("dave", "marketing", 65))
+    records.push(Record("eve", "engineering", 95))
+    records.push(Record("frank", "sales", 72))
+    records.push(Record("grace", "engineering", 81))
+    records.push(Record("henry", "sales", 90))
+    return records
+
+fn filter_by_category(records: List[Record], cat: String) -> List[Record]:
+    mut result: List[Record] := []
+    mut i := 0
+    while i < records.len():
+        r := records[i]
+        if r.category == cat:
+            result.push(r)
+        i = i + 1
+    return result
+
+fn average_score(records: List[Record]) -> Int:
+    if records.len() == 0:
+        return 0
+    mut total := 0
+    mut i := 0
+    while i < records.len():
+        total = total + records[i].score
+        i = i + 1
+    return total / records.len()
+
+fn max_score(records: List[Record]) -> Record:
+    mut best := records[0]
+    mut i := 1
+    while i < records.len():
+        if records[i].score > best.score:
+            best = records[i]
+        i = i + 1
+    return best
+
+fn count_by_category(records: List[Record]) -> Map[String, Int]:
+    mut counts: Map[String, Int] := {}
+    mut i := 0
+    while i < records.len():
+        cat := records[i].category
+        if counts.contains_key(cat):
+            counts.insert(cat, counts[cat] + 1)
+        else:
+            counts.insert(cat, 1)
+        i = i + 1
+    return counts
+
+fn names_list(records: List[Record]) -> String:
+    mut names: List[String] := []
+    mut i := 0
+    while i < records.len():
+        names.push(records[i].name)
+        i = i + 1
+    return names.join(", ")
+
+fn main():
+    records := make_records()
+    print("total records: " + records.len().to_string())
+
+    # filter
+    eng := filter_by_category(records, "engineering")
+    print("engineering count: " + eng.len().to_string())
+    print("engineering names: " + names_list(eng))
+
+    # aggregate
+    print("engineering avg: " + average_score(eng).to_string())
+    best := max_score(eng)
+    print("engineering best: " + best.name + " (" + best.score.to_string() + ")")
+
+    # count by category
+    counts := count_by_category(records)
+    print("engineering: " + counts["engineering"].to_string())
+    print("marketing: " + counts["marketing"].to_string())
+    print("sales: " + counts["sales"].to_string())
+
+    # overall
+    print("overall avg: " + average_score(records).to_string())
+    overall_best := max_score(records)
+    print("overall best: " + overall_best.name + " (" + overall_best.score.to_string() + ")")
+
+    print("pipeline works")

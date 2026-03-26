@@ -1,0 +1,59 @@
+# string parser — CSV parser and formatter
+# exercises: string splitting, loops, maps, string building
+
+fn parse_field(line: String, field_idx: Int) -> String:
+    parts := line.split(",")
+    if field_idx < parts.len():
+        return parts[field_idx].trim()
+    return ""
+
+fn count_fields(line: String) -> Int:
+    return line.split(",").len()
+
+fn main():
+    csv := "name,age,city\nalice,30,new york\nbob,25,london\ncarol,35,tokyo"
+    lines := csv.split("\n")
+    print("rows: " + lines.len().to_string())
+    print("cols: " + count_fields(lines[0]).to_string())
+
+    # extract columns
+    mut names: List[String] := []
+    mut ages: List[String] := []
+    mut cities: List[String] := []
+    mut i := 0
+    while i < lines.len():
+        line := lines[i]
+        names.push(parse_field(line, 0))
+        ages.push(parse_field(line, 1))
+        cities.push(parse_field(line, 2))
+        i = i + 1
+    print("names: " + names.join(", "))
+    print("ages: " + ages.join(", "))
+    print("cities: " + cities.join(", "))
+
+    # format as table
+    mut table_lines: List[String] := []
+    i = 0
+    while i < lines.len():
+        line := lines[i]
+        n := parse_field(line, 0)
+        a := parse_field(line, 1)
+        c := parse_field(line, 2)
+        table_lines.push(n + " | " + a + " | " + c)
+        i = i + 1
+    print(table_lines.join("\n"))
+
+    # reverse lookup via map
+    mut name_to_city: Map[String, String] := {}
+    i = 1
+    while i < lines.len():
+        n := parse_field(lines[i], 0)
+        c := parse_field(lines[i], 2)
+        name_to_city.insert(n, c)
+        i = i + 1
+    alice_key := "alice"
+    bob_key := "bob"
+    print("alice lives in: " + name_to_city[alice_key])
+    print("bob lives in: " + name_to_city[bob_key])
+
+    print("parser works")

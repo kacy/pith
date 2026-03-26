@@ -1673,6 +1673,23 @@ pub fn declare_runtime_functions(
     let toml_keys = declare_runtime_function(module, "forge_toml_keys", &[types::I64], &[types::I64])?;
     funcs.insert("toml_keys".to_string(), toml_keys);
 
+    // Spawn/await for concurrency
+    let spawn_func = declare_runtime_function(
+        module,
+        "forge_spawn",
+        &[types::I64, types::I64], // fn_ptr, arg
+        &[types::I64],             // returns task handle
+    )?;
+    funcs.insert("forge_spawn".to_string(), spawn_func);
+
+    let await_func = declare_runtime_function(
+        module,
+        "forge_await",
+        &[types::I64], // task handle
+        &[types::I64], // returns result
+    )?;
+    funcs.insert("forge_await".to_string(), await_func);
+
     // Smart to_string for Unknown-typed values
     let smart_to_string = declare_runtime_function(module, "forge_smart_to_string", &[types::I64], &[types::I64])?;
     funcs.insert("forge_smart_to_string".to_string(), smart_to_string);

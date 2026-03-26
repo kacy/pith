@@ -1006,6 +1006,20 @@ impl TextAstParser {
             "field" => self.parse_field_access(),
             "index" => self.parse_index(),
             "try" => self.parse_try(),
+            "spawn" => {
+                let line = self.current().unwrap();
+                let spawn_indent = line.indent;
+                self.advance();
+                let expr = self.parse_expression()?;
+                Ok(AstNode::Spawn { expr: Box::new(expr) })
+            }
+            "await" => {
+                let line = self.current().unwrap();
+                let await_indent = line.indent;
+                self.advance();
+                let expr = self.parse_expression()?;
+                Ok(AstNode::Await { expr: Box::new(expr) })
+            }
             "call" => self.parse_call(),
             "lambda" => self.parse_lambda(),
             "ident" => {

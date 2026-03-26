@@ -597,6 +597,8 @@ fn collect_strings(node: &AstNode, strings: &mut Vec<String>) {
         AstNode::Assign { value, .. } => {
             collect_strings(value, strings);
         }
+        AstNode::Spawn { expr } => collect_strings(expr, strings),
+        AstNode::Await { expr } => collect_strings(expr, strings),
         _ => {}
     }
 }
@@ -5315,6 +5317,60 @@ fn compile_expr(
             } else {
                 // Fallback: return 0 (lambda not compiled)
                 Ok(builder.ins().iconst(types::I64, 0))
+            }
+        }
+
+        AstNode::Spawn { expr } => {
+            // spawn func(args) → forge_spawn(fn_ptr, arg)
+            // The inner expression should be a Call node
+            if let AstNode::Call { func, args } = expr.as_ref() {
+                // Get the function pointer
+                let fn_ptr = if let Some(&func_id) = declared_funcs.get(func.as_str()) {
+                    let func_ref = module.declare_func_in_func(func_id, builder.func);
+                    builder.ins().func_addr(types::I64, func_ref)
+                } else {
+                    // Unknown function — return 0
+                    return Ok(builder.ins().iconst(types::I64, 0));
+                };
+
+                // Compile the first argument (spawn only supports single-arg functions for now)
+                let arg_val = if !args.is_empty() {
+                    compile_expr(
+                        builder, variables, runtime_funcs, declared_funcs, string_funcs,
+                        module, &args[0], func_signatures, lambda_funcs, global_data_ids,
+                    )?
+                } else {
+                    builder.ins().iconst(types::I64, 0)
+                };
+
+                // Call forge_spawn(fn_ptr, arg)
+                if let Some(&spawn_id) = runtime_funcs.get("forge_spawn") {
+                    let spawn_ref = module.declare_func_in_func(spawn_id, builder.func);
+                    let call = builder.ins().call(spawn_ref, &[fn_ptr, arg_val]);
+                    Ok(builder.func.dfg.first_result(call))
+                } else {
+                    Ok(builder.ins().iconst(types::I64, 0))
+                }
+            } else {
+                // Nested spawn/await or other expression
+                Ok(builder.ins().iconst(types::I64, 0))
+            }
+        }
+
+        AstNode::Await { expr } => {
+            // await task → forge_await(task_handle)
+            // The inner expression could be an identifier (task variable) or a spawn expression
+            let task_val = compile_expr(
+                builder, variables, runtime_funcs, declared_funcs, string_funcs,
+                module, expr, func_signatures, lambda_funcs, global_data_ids,
+            )?;
+
+            if let Some(&await_id) = runtime_funcs.get("forge_await") {
+                let await_ref = module.declare_func_in_func(await_id, builder.func);
+                let call = builder.ins().call(await_ref, &[task_val]);
+                Ok(builder.func.dfg.first_result(call))
+            } else {
+                Ok(task_val) // Fallback: just return the value
             }
         }
 

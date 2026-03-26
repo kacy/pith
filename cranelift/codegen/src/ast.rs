@@ -92,6 +92,10 @@ pub enum AstNode {
         name: String,
         target: String,
     },
+    /// Spawn expression: spawn func(args) -> Task[T]
+    Spawn { expr: Box<AstNode> },
+    /// Await expression: await task -> T
+    Await { expr: Box<AstNode> },
     /// Try expression: expr? (error propagation)
     Try { expr: Box<AstNode> },
     /// Fail statement: fail error

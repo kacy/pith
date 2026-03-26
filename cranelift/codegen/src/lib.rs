@@ -1580,8 +1580,65 @@ pub fn declare_runtime_functions(
         &[types::I64], // str
         &[types::I64], // parsed (ptr)
     )?;
+    funcs.insert("parse".to_string(), json_parse);
     funcs.insert("json_parse".to_string(), json_parse);
     funcs.insert("forge_json_parse".to_string(), json_parse);
+
+    // JSON accessor functions
+    let json_type_of = declare_runtime_function(module, "forge_json_type_of", &[types::I64], &[types::I64])?;
+    funcs.insert("type_of".to_string(), json_type_of);
+
+    let json_get_string = declare_runtime_function(module, "forge_json_get_string", &[types::I64], &[types::I64])?;
+    funcs.insert("get_string".to_string(), json_get_string);
+
+    let json_get_int = declare_runtime_function(module, "forge_json_get_int", &[types::I64], &[types::I64])?;
+    funcs.insert("get_int".to_string(), json_get_int);
+
+    let json_get_float = declare_runtime_function(module, "forge_json_get_float", &[types::I64], &[types::F64])?;
+    funcs.insert("get_float".to_string(), json_get_float);
+
+    let json_get_bool = declare_runtime_function(module, "forge_json_get_bool", &[types::I64], &[types::I64])?;
+    funcs.insert("get_bool".to_string(), json_get_bool);
+
+    let json_array_len = declare_runtime_function(module, "forge_json_array_len", &[types::I64], &[types::I64])?;
+    funcs.insert("array_len".to_string(), json_array_len);
+
+    let json_array_get = declare_runtime_function(module, "forge_json_array_get", &[types::I64, types::I64], &[types::I64])?;
+    funcs.insert("array_get".to_string(), json_array_get);
+
+    let json_object_get = declare_runtime_function(module, "forge_json_object_get", &[types::I64, types::I64], &[types::I64])?;
+    funcs.insert("object_get".to_string(), json_object_get);
+
+    let json_object_has = declare_runtime_function(module, "forge_json_object_has", &[types::I64, types::I64], &[types::I64])?;
+    funcs.insert("object_has".to_string(), json_object_has);
+
+    let json_object_keys = declare_runtime_function(module, "forge_json_object_keys", &[types::I64], &[types::I64])?;
+    funcs.insert("object_keys".to_string(), json_object_keys);
+
+    let json_make_object = declare_runtime_function(module, "forge_json_make_object", &[], &[types::I64])?;
+    funcs.insert("make_object".to_string(), json_make_object);
+
+    let json_make_array = declare_runtime_function(module, "forge_json_make_array", &[], &[types::I64])?;
+    funcs.insert("make_array".to_string(), json_make_array);
+
+    let json_make_int = declare_runtime_function(module, "forge_json_make_int", &[types::I64], &[types::I64])?;
+    funcs.insert("make_int".to_string(), json_make_int);
+
+    let json_make_string = declare_runtime_function(module, "forge_json_make_string", &[types::I64], &[types::I64])?;
+    funcs.insert("make_string".to_string(), json_make_string);
+
+    let json_array_push = declare_runtime_function(module, "forge_json_array_push", &[types::I64, types::I64], &[])?;
+    funcs.insert("array_push".to_string(), json_array_push);
+
+    let json_object_set = declare_runtime_function(module, "forge_json_object_set", &[types::I64, types::I64, types::I64], &[])?;
+    funcs.insert("object_set".to_string(), json_object_set);
+
+    let json_encode = declare_runtime_function(module, "forge_json_encode", &[types::I64], &[types::I64])?;
+    funcs.insert("forge_json_encode".to_string(), json_encode);
+
+    // Smart to_string for Unknown-typed values
+    let smart_to_string = declare_runtime_function(module, "forge_smart_to_string", &[types::I64], &[types::I64])?;
+    funcs.insert("forge_smart_to_string".to_string(), smart_to_string);
 
     // Identity function
     let identity = declare_runtime_function(
@@ -1732,10 +1789,7 @@ pub fn declare_runtime_functions(
     funcs.insert("base".to_string(), path_base);
     funcs.insert("base_name".to_string(), path_base);
 
-    // type_of
-    let type_of = declare_runtime_function(module, "forge_type_of", &[types::I64], &[types::I64])?;
-    funcs.insert("type_of".to_string(), type_of);
-    funcs.insert("forge_type_of".to_string(), type_of);
+    // type_of (generic stub - JSON type_of takes priority from earlier declaration)
 
     // second (generics)
     let second = declare_runtime_function(
@@ -1843,16 +1897,6 @@ pub fn declare_runtime_functions(
     funcs.insert("show".to_string(), show);
     funcs.insert("show_and_hash".to_string(), show);
 
-    // object_get (JSON object field access — stub)
-    let object_get =
-        declare_runtime_function(module, "forge_identity", &[types::I64], &[types::I64])?;
-    funcs.insert("object_get".to_string(), object_get);
-    funcs.insert("get_string".to_string(), object_get);
-    funcs.insert("get_int".to_string(), object_get);
-    funcs.insert("get_float".to_string(), object_get);
-    funcs.insert("get_bool".to_string(), object_get);
-    funcs.insert("get_array".to_string(), object_get);
-
     // last_index_of
     let last_index_of = declare_runtime_function(
         module,
@@ -1895,16 +1939,19 @@ pub fn declare_runtime_functions(
 
     let url_encode =
         declare_runtime_function(module, "forge_url_encode", &[types::I64], &[types::I64])?;
-    funcs.insert("encode".to_string(), url_encode);
+    // Smart encode overrides the generic "encode" — delegates to JSON or URL based on arg
+    let smart_encode =
+        declare_runtime_function(module, "forge_smart_encode", &[types::I64], &[types::I64])?;
+    funcs.insert("encode".to_string(), smart_encode);
 
     let url_decode =
         declare_runtime_function(module, "forge_url_decode", &[types::I64], &[types::I64])?;
     funcs.insert("decode".to_string(), url_decode);
 
-    // URL parse (maps the generic "parse" name to URL parse)
+    // URL parse
     let url_parse =
         declare_runtime_function(module, "forge_url_parse", &[types::I64], &[types::I64])?;
-    funcs.insert("parse".to_string(), url_parse);
+    funcs.insert("url_parse".to_string(), url_parse);
 
     // URL to_string
     let url_to_string =

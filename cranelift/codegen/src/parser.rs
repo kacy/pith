@@ -284,11 +284,12 @@ impl TextAstParser {
             }
 
             let field_name = field_line.value.clone();
+            let field_indent = field_line.indent;
             self.advance();
 
             // Parse field type
             let field_type = if let Some(type_line) = self.current() {
-                if type_line.kind == "type" {
+                if type_line.kind == "type" && type_line.indent > field_indent {
                     let ty = type_line.value.clone();
                     self.advance();
                     ty
@@ -299,7 +300,15 @@ impl TextAstParser {
                 "Int".to_string()
             };
 
-            fields.push((field_name, field_type));
+            // Skip generic type constraint fields (e.g., "T" with type "Renderer[T]")
+            // These are type parameters, not real struct fields
+            let clean_name = field_name.strip_suffix(" pub").unwrap_or(&field_name);
+            let is_type_param = clean_name.len() <= 2
+                && clean_name.chars().all(|c| c.is_ascii_uppercase())
+                && field_type.contains('[');
+            if !is_type_param {
+                fields.push((field_name, field_type));
+            }
         }
 
         Ok(AstNode::StructDecl {

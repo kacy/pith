@@ -444,16 +444,17 @@ fn infer_value_kind(node: &AstNode, variables: &HashMap<String, LocalVar>) -> Va
             | "path_base"
             | "path_ext"
             | "path_stem"
-            | "parse"
             | "scheme"
             | "host"
             | "query"
             | "fragment"
-            | "encode"
-            | "decode" => ValueKind::String,
+            | "decode"
+            | "type_of"
+            | "get_string"
+            | "encode" => ValueKind::String,
             "port" => ValueKind::Int,
             "fnv1a" => ValueKind::Int,
-            "split" | "args" | "keys" | "values" | "list_dir" | "chars" => {
+            "split" | "args" | "keys" | "values" | "list_dir" | "chars" | "object_keys" => {
                 ValueKind::ListString
             }
             "sort" | "slice" => {
@@ -464,9 +465,10 @@ fn infer_value_kind(node: &AstNode, variables: &HashMap<String, LocalVar>) -> Va
                     ValueKind::ListUnknown
                 }
             }
-            "len" | "time" | "random_int" | "ord" | "index_of" | "last_index_of" => ValueKind::Int,
+            "len" | "time" | "random_int" | "ord" | "index_of" | "last_index_of"
+            | "get_int" | "array_len" => ValueKind::Int,
             "contains" | "contains_key" | "starts_with" | "ends_with" | "string_starts_with"
-            | "dir_exists" | "file_exists" | "is_empty" => ValueKind::Bool,
+            | "dir_exists" | "file_exists" | "is_empty" | "object_has" | "get_bool" => ValueKind::Bool,
             _ => {
                 // Check registered function return types
                 if let Some(ret_type) = crate::get_func_return_type(func) {
@@ -4835,6 +4837,10 @@ fn compile_expr(
                     runtime_funcs.get("forge_float_to_cstr")
                 } else if matches!(arg_kind, ValueKind::Bool) {
                     runtime_funcs.get("forge_bool_to_cstr")
+                } else if matches!(arg_kind, ValueKind::Unknown) {
+                    // Unknown type — use smart to_string that handles both int and string pointers
+                    runtime_funcs.get("forge_smart_to_string")
+                        .or_else(|| runtime_funcs.get("forge_int_to_cstr"))
                 } else {
                     runtime_funcs.get("forge_int_to_cstr")
                 };

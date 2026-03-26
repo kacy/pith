@@ -14,6 +14,7 @@
 pub mod arc;
 pub mod collections;
 pub mod concurrency;
+pub mod json;
 pub mod string;
 
 use crate::collections::list::ForgeList;
@@ -2194,8 +2195,57 @@ pub unsafe extern "C" fn forge_path_basename(path: *const i8) -> *mut i8 {
 
 /// Stub: parse JSON — returns empty pointer (not yet implemented)
 #[no_mangle]
-pub extern "C" fn forge_json_parse(_s: *const i8) -> *mut i8 {
-    std::ptr::null_mut()
+pub unsafe extern "C" fn forge_json_parse(s: *const i8) -> i64 {
+    let result = json::forge_json_parse_real(s);
+    if result > 0 {
+        return result;
+    }
+    // Check if it looks like a URL (contains "://")
+    let input = crate::string::forge_cstring_len(s) as usize;
+    let slice = std::slice::from_raw_parts(s as *const u8, input);
+    if let Ok(str_val) = std::str::from_utf8(slice) {
+        if str_val.contains("://") {
+            // URL — return strdup'd string as handle for URL accessor functions
+            return forge_strdup(s) as i64;
+        }
+    }
+    // Invalid JSON and not a URL — return -1
+    -1
+}
+
+/// Smart to_string for Unknown-typed values: if the value looks like a C string pointer,
+/// return it as a string. Otherwise convert as integer.
+#[no_mangle]
+pub unsafe extern "C" fn forge_smart_to_string(val: i64) -> *mut i8 {
+    // Negative values and small values (< 4096) are definitely integers
+    if val <= 0 || val < 4096 {
+        return forge_int_to_cstr(val);
+    }
+    // Check if it looks like a valid C string pointer
+    let ptr = val as *const u8;
+    // Try to read the first byte — if accessible and ASCII, assume it's a string
+    // This is a heuristic; in practice, JSON handles are small and string pointers are large
+    let first_byte = *ptr;
+    if first_byte > 0 && first_byte < 128 {
+        // Looks like a valid ASCII C string — return as-is
+        forge_strdup(val as *const i8)
+    } else {
+        forge_int_to_cstr(val)
+    }
+}
+
+/// Smart encode: if arg is a JSON handle (small positive int), use JSON encode.
+/// Otherwise treat as a C string and do URL percent-encoding.
+#[no_mangle]
+pub unsafe extern "C" fn forge_smart_encode(val: i64) -> *mut i8 {
+    // JSON arena handles are small positive integers (1-based index)
+    // C string pointers are large positive integers (heap addresses)
+    // Heuristic: if val < 100000, it's likely a JSON handle
+    if val > 0 && val < 100000 {
+        json::forge_json_encode(val)
+    } else {
+        forge_url_encode(val as *const i8)
+    }
 }
 
 /// Stub: parse TOML — returns empty pointer (not yet implemented)

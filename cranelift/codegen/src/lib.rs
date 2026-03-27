@@ -10,12 +10,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-pub mod ast;
-pub mod compiler;
 pub mod ir_consumer;
 pub mod linker;
-pub mod monomorphize;
-pub mod parser;
 
 /// Struct field information
 #[derive(Debug, Clone)]

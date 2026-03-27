@@ -294,9 +294,9 @@ fn compile_ir_function(
             "fconst" if parts.len() >= 3 => {
                 let reg: usize = parts[1].parse().unwrap_or(0);
                 let fval: f64 = parts[2].parse().unwrap_or(0.0);
-                // Store float as i64 bits for uniform handling
-                let bits = fval.to_bits() as i64;
-                let v = builder.ins().iconst(types::I64, bits);
+                // Create actual f64 constant, then bitcast to i64 for uniform handling
+                let fv = builder.ins().f64const(fval);
+                let v = builder.ins().bitcast(types::I64, cranelift::codegen::ir::MemFlags::new(), fv);
                 regs.insert(reg, v);
             }
 
@@ -587,7 +587,10 @@ fn compile_ir_function(
     codegen
         .module
         .define_function(func_id, &mut ctx)
-        .map_err(|e| CompileError::ModuleError(format!("IR consumer: {}", e)))?;
+        .map_err(|e| {
+            eprintln!("IR consumer verifier error in '{}': {}\nIR:\n{}", func_name, e, ctx.func.display());
+            CompileError::ModuleError(format!("IR consumer: {}", e))
+        })?;
 
     Ok(())
 }

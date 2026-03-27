@@ -424,9 +424,29 @@ fn compile_ir_function(
 
                 if let Some(fid) = fid {
                     let fref = codegen.module.declare_func_in_func(fid, builder.func);
-                    let call = builder.ins().call(fref, &args);
+                    // Check function signature for f64 params and bitcast as needed
+                    let sig_ref = builder.func.dfg.ext_funcs[fref].signature;
+                    let sig = &builder.func.dfg.signatures[sig_ref];
+                    let param_types: Vec<types::Type> = sig.params.iter().map(|p| p.value_type).collect();
+                    let ret_types: Vec<types::Type> = sig.returns.iter().map(|r| r.value_type).collect();
+                    let mut typed_args = args.clone();
+                    for (i, arg) in typed_args.iter_mut().enumerate() {
+                        if i < param_types.len() && param_types[i] == types::F64 {
+                            // Bitcast i64 → f64 for float params
+                            *arg = builder.ins().bitcast(types::F64, cranelift::codegen::ir::MemFlags::new(), *arg);
+                        }
+                    }
+                    let call = builder.ins().call(fref, &typed_args);
                     if !builder.func.dfg.inst_results(call).is_empty() {
-                        regs.insert(reg, builder.func.dfg.first_result(call));
+                        let result = builder.func.dfg.first_result(call);
+                        let result_ty = builder.func.dfg.value_type(result);
+                        if result_ty == types::F64 {
+                            // Bitcast f64 → i64 for uniform handling
+                            let cast = builder.ins().bitcast(types::I64, cranelift::codegen::ir::MemFlags::new(), result);
+                            regs.insert(reg, cast);
+                        } else {
+                            regs.insert(reg, result);
+                        }
                     } else {
                         regs.insert(reg, builder.ins().iconst(types::I64, 0));
                     }

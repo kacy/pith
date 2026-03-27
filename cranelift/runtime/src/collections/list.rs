@@ -98,6 +98,13 @@ impl ListImpl {
 /// * `elem_size` - Size of each element in bytes
 /// * `type_tag` - Type tag for element handling (0=primitive, 1=string, 2=list, 3=map)
 #[no_mangle]
+/// Create a new list with default element size (8 bytes, primitive)
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_new_default() -> ForgeList {
+    forge_list_new(8, 0)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn forge_list_new(elem_size: i64, type_tag: i32) -> ForgeList {
     let tag = match type_tag {
         1 => ListTypeTag::String,

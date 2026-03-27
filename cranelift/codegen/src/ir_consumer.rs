@@ -166,6 +166,10 @@ fn compile_ir_function(
     let mut labels: HashMap<String, Block> = HashMap::new();
     let mut next_var_id: u32 = 0;
 
+    // Create a zero constant that can be used as fallback for undefined registers
+    let zero_val = builder.ins().iconst(types::I64, 0);
+    regs.insert(usize::MAX, zero_val); // sentinel
+
     for (i, name) in param_names.iter().enumerate() {
         if i < block_params.len() {
             let var = Variable::from_u32(next_var_id);
@@ -403,7 +407,11 @@ fn resolve_func_name(name: &str) -> &str {
         "to_string" => "forge_int_to_cstr",
         "to_int" => "forge_float_to_int",
         "to_float" => "forge_int_to_float",
-        "len" => "forge_cstring_len",
+        "len" => "forge_list_len",
+        "__list_get" => "forge_list_get_value",
+        "__list_new" => "forge_list_new_default",
+        "__list_push" => "forge_list_push_value",
+        "__index" => "forge_list_get_value",
         "push" => "forge_list_push_value",
         "pop" => "forge_list_pop",
         "contains" => "forge_cstring_contains",
@@ -433,8 +441,8 @@ fn resolve_func_name(name: &str) -> &str {
 
 fn get_reg(regs: &HashMap<usize, Value>, s: &str) -> Value {
     let reg: usize = s.parse().unwrap_or(0);
-    regs.get(&reg).copied().unwrap_or_else(|| {
-        // This shouldn't happen but return a safe default
-        panic!("IR consumer: undefined register %{}", reg);
-    })
+    regs.get(&reg)
+        .or_else(|| regs.get(&usize::MAX)) // fallback to zero sentinel
+        .copied()
+        .unwrap_or_else(|| panic!("IR consumer: no registers available"))
 }

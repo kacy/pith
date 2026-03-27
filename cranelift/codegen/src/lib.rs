@@ -810,6 +810,14 @@ pub fn declare_runtime_functions(
     )?;
     funcs.insert("forge_list_new".to_string(), list_new);
 
+    let list_new_default = declare_runtime_function(
+        module,
+        "forge_list_new_default",
+        &[],
+        &[types::I64],
+    )?;
+    funcs.insert("forge_list_new_default".to_string(), list_new_default);
+
     let list_push = declare_runtime_function(
         module,
         "forge_list_push",

@@ -110,6 +110,12 @@ impl MapImpl {
 /// * `key_type` - 0 for int keys, 1 for string keys
 /// * `val_size` - Size of each value in bytes
 /// * `val_is_heap` - Whether values are heap types (need retain/release)
+/// Create a new string-key map with default settings
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_new_default() -> ForgeMap {
+    forge_map_new(1, 8, 0) // string keys, 8-byte values, not heap
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn forge_map_new(
     key_type: i32,

@@ -39,6 +39,7 @@ mut ir_next_reg := 0
 mut ir_next_label := 0
 mut ir_strings: List[String] := []
 mut ir_var_regs: Map[String, Int] := {}
+mut ir_var_types: Map[String, String] := {}  # variable name -> type hint ("int", "bool", "string")
 
 pub fn ir_reset():
     ir_lines = []
@@ -183,6 +184,35 @@ fn ir_expr(idx: Int) -> Int:
         mname := node.value
         if mname.starts_with("."):
             mname = mname.substring(1, mname.len())
+
+        # detect object type for dispatch
+        mut obj_is_bool := false
+        mut obj_is_string := false
+        if node.children.len() > 0:
+            obj_n := get_node(node.children[0])
+            # direct comparison produces bool
+            if obj_n.kind == "binary":
+                obj_op := obj_n.value
+                if obj_op == "eq" or obj_op == "neq" or obj_op == "lt" or obj_op == "gt" or obj_op == "lte" or obj_op == "gte" or obj_op == "and" or obj_op == "or":
+                    obj_is_bool = true
+            elif obj_n.kind == "bool_lit":
+                obj_is_bool = true
+            # variable type lookup
+            elif obj_n.kind == "ident":
+                vname := obj_n.value
+                if ir_var_types.contains_key(vname):
+                    vtype := ir_var_types[vname]
+                    if vtype == "bool":
+                        obj_is_bool = true
+                    elif vtype == "string":
+                        obj_is_string = true
+            elif obj_n.kind == "string_lit" or obj_n.kind == "string" or obj_n.kind == "string_interp":
+                obj_is_string = true
+        if mname == "to_string" and obj_is_bool:
+            mname = "bool_to_string"
+        if mname == "to_string" and obj_is_string:
+            mname = "identity"  # string.to_string() is a no-op
+
         mut obj_r := 0 - 1
         mut arg_regs: List[Int] := []
         for child in node.children:
@@ -225,6 +255,18 @@ fn ir_expr(idx: Int) -> Int:
             result_r = ir_reg()
             ir_emit("strref " + result_r.to_string() + " " + ir_str("").to_string())
         return result_r
+
+    if node.kind == "map":
+        # map literal: create empty map
+        map_r := ir_reg()
+        ir_emit("call " + map_r.to_string() + " __map_new 0")
+        # TODO: insert entries
+        return map_r
+
+    if node.kind == "set":
+        set_r := ir_reg()
+        ir_emit("call " + set_r.to_string() + " __set_new 0")
+        return set_r
 
     if node.kind == "list":
         # list literal: create list, push each element
@@ -283,6 +325,16 @@ fn ir_stmt(idx: Int):
             r := ir_expr(val_idx)
             ir_var_regs.insert(name, r)
             ir_emit("store " + name + " " + r.to_string())
+            # track type from value expression
+            vn := get_node(val_idx)
+            if vn.kind == "binary":
+                vop := vn.value
+                if vop == "eq" or vop == "neq" or vop == "lt" or vop == "gt" or vop == "lte" or vop == "gte" or vop == "and" or vop == "or":
+                    ir_var_types.insert(name, "bool")
+            elif vn.kind == "string_lit" or vn.kind == "string" or vn.kind == "string_interp":
+                ir_var_types.insert(name, "string")
+            elif vn.kind == "bool_lit":
+                ir_var_types.insert(name, "bool")
 
     elif node.kind == "assign":
         name := node.value
@@ -475,6 +527,7 @@ fn ir_func(idx: Int):
 
     ir_next_reg = 0
     ir_var_regs = {}
+    ir_var_types = {}
     ir_emit("func " + name + " " + params.len().to_string() + " " + ret_type)
     mut i := 0
     while i < params.len():

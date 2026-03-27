@@ -818,6 +818,12 @@ pub fn declare_runtime_functions(
     )?;
     funcs.insert("forge_list_new_default".to_string(), list_new_default);
 
+    let map_new_default = declare_runtime_function(module, "forge_map_new_default", &[], &[types::I64])?;
+    funcs.insert("forge_map_new_default".to_string(), map_new_default);
+
+    let set_new_default = declare_runtime_function(module, "forge_set_new_default", &[], &[types::I64])?;
+    funcs.insert("forge_set_new_default".to_string(), set_new_default);
+
     let list_push = declare_runtime_function(
         module,
         "forge_list_push",

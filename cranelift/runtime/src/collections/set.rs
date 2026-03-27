@@ -415,6 +415,12 @@ unsafe fn cstr_to_set_element(s: *const i8) -> SetElement {
 }
 
 /// Create a new string set (handle-based). Returns SetImpl pointer as i64.
+/// Create a new string set with default settings
+#[no_mangle]
+pub unsafe extern "C" fn forge_set_new_default() -> i64 {
+    forge_set_new_handle(1)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn forge_set_new_handle(elem_type: i32) -> i64 {
     let etype = match elem_type {

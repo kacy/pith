@@ -1,4 +1,4 @@
-.PHONY: build self-host bootstrap bootstrap-verify run-examples clean
+.PHONY: build self-host bootstrap bootstrap-verify run-examples test clean
 
 # --- primary build (Cranelift native backend) ---
 
@@ -55,6 +55,33 @@ run-examples: build
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all examples passed"
+
+# --- full test suite ---
+
+test: build
+	@echo "=== Step 1: run all deterministic examples ==="
+	@pass=0; fail=0; \
+	for f in examples/expected/*.txt; do \
+		name=$$(basename "$$f" .txt); \
+		actual=$$(timeout 15 ./target/release/forge run "examples/$$name.fg" 2>/dev/null); \
+		expected=$$(cat "$$f"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi
+	@echo "=== Step 2: build self-hosted compiler via Cranelift ==="
+	./target/release/forge build self-host/forge_main.fg
+	@echo "=== Step 3: self-hosted compiler works ==="
+	./self-host/forge_main version
+	./self-host/forge_main lex examples/hello.fg > /dev/null
+	./self-host/forge_main parse examples/hello.fg > /dev/null
+	@echo "=== all tests passed ==="
 
 clean:
 	cargo clean

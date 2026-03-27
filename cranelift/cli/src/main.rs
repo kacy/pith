@@ -65,6 +65,9 @@ fn main() {
             println!("Forge Cranelift Compiler v0.1.0");
             println!("Using Cranelift backend for native code generation");
         }
+        "fmt" | "lint" | "doc" | "new" => {
+            delegate_to_frontend(&args[1..]);
+        }
         "help" | "--help" | "-h" => {
             print_usage();
         }
@@ -83,6 +86,10 @@ fn print_usage() {
     println!("  run <file.fg>      Compile and run immediately");
     println!("  test <file.fg>     Compile and run tests");
     println!("  check <file.fg>    Type-check without generating code");
+    println!("  fmt [args...]      Format source files (delegates to frontend)");
+    println!("  lint [args...]     Lint source files (delegates to frontend)");
+    println!("  doc [args...]      Generate or search documentation (delegates to frontend)");
+    println!("  new [args...]      Create a new project (delegates to frontend)");
     println!("  parse <file.fg>    Parse and display AST");
     println!("  lex <file.fg>      Tokenize and display token stream");
     println!("  version            Display version information");
@@ -341,5 +348,29 @@ fn lex_file(path: &str) {
     match get_tokens_from_compiler(path) {
         Ok(tokens) => println!("{}", tokens),
         Err(e) => eprintln!("{}", e),
+    }
+}
+
+/// Delegate a command to the self-hosted frontend compiler, passing all args through.
+/// Used for commands like fmt, lint, doc, new that don't need the Cranelift backend.
+fn delegate_to_frontend(args: &[String]) {
+    let compiler = match find_self_hosted_compiler() {
+        Some(c) => c,
+        None => {
+            eprintln!("Self-hosted compiler not found. Set FORGE_SELF_HOST or ensure ./self-host/forge_main exists");
+            std::process::exit(1);
+        }
+    };
+
+    let status = Command::new(&compiler)
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to run self-hosted compiler: {}", e);
+            std::process::exit(1);
+        });
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
     }
 }

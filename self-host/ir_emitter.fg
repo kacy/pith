@@ -1377,6 +1377,48 @@ pub fn emit_ir(root_idx: Int) -> String:
                         init_val = "0"
             ir_emit("global " + gname + " " + init_val)
 
+    # emit __init_globals to initialize list/map/set globals
+    mut has_collection_globals := false
+    for child in root.children:
+        cn := get_node(child)
+        if cn.kind == "pub" and cn.children.len() > 0:
+            cn = get_node(cn.children[0])
+        if cn.kind == "bind" or cn.kind == "binding":
+            for gc in cn.children:
+                gcn := get_node(gc)
+                if gcn.kind == "list" or gcn.kind == "map" or gcn.kind == "set":
+                    has_collection_globals = true
+    if has_collection_globals:
+        ir_emit("func __init_globals 0 i64")
+        for child in root.children:
+            cn := get_node(child)
+            if cn.kind == "pub" and cn.children.len() > 0:
+                cn = get_node(cn.children[0])
+            if cn.kind == "bind" or cn.kind == "binding":
+                mut gname := cn.value
+                if gname.contains(" mut"):
+                    gname = gname.substring(0, gname.len() - 4)
+                elif gname.contains(" "):
+                    gname = gname.split(" ")[0]
+                for gc in cn.children:
+                    gcn := get_node(gc)
+                    if gcn.kind == "list":
+                        r := ir_reg()
+                        ir_emit("call " + r.to_string() + " __list_new 0")
+                        ir_emit("store " + gname + " " + r.to_string())
+                    elif gcn.kind == "map":
+                        r := ir_reg()
+                        ir_emit("call " + r.to_string() + " __map_new 0")
+                        ir_emit("store " + gname + " " + r.to_string())
+                    elif gcn.kind == "set":
+                        r := ir_reg()
+                        ir_emit("call " + r.to_string() + " __set_new 0")
+                        ir_emit("store " + gname + " " + r.to_string())
+        dr := ir_reg()
+        ir_emit("iconst " + dr.to_string() + " 0")
+        ir_emit("ret " + dr.to_string())
+        ir_emit("endfunc")
+
     # emit functions (unwrap pub wrappers)
     for child in root.children:
         cn := get_node(child)

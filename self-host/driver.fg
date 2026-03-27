@@ -7,7 +7,7 @@ from lexer import lex_all
 from parser import parse
 from ast import get_node, reset_arena
 from checker import initialize_checker, c_run_module
-from codegen import initialize_codegen, set_test_mode, emit_module, emit_modules, get_codegen_output
+# note: codegen removed — compilation handled by Cranelift native backend
 
 # extract directory from a file path.
 # "foo/bar/baz.fg" -> "foo/bar", "baz.fg" -> "."
@@ -171,47 +171,8 @@ pub fn init_driver(source_path: String):
     mark_visited(source_path)
 
 # run the full compile pipeline: lex, parse, resolve imports, check, codegen.
-# returns the generated C code as a string.
-pub fn compile_to_c(path: String, test_mode: Bool) -> String!:
-    print("[DEBUG] compile_to_c: reading " + path)
-    content := read_file(path)!
-    print("[DEBUG] compile_to_c: lexing")
-    tokens := lex_all(content)
-    reset_arena()
-    print("[DEBUG] compile_to_c: parsing")
-    root := parse(tokens)
-
-    # resolve imports
-    print("[DEBUG] compile_to_c: resolving imports")
-    init_driver(path)
-    import_roots := resolve_imports(root, path)!
-
-    # type check - process import aliases for each module
-    print("[DEBUG] compile_to_c: type checking")
-    initialize_checker(path)
-    for imp_root in import_roots:
-        process_import_aliases(imp_root)
-        c_run_module(imp_root)
-    process_import_aliases(root)
-    c_run_module(root)
-
-    # generate C
-    print("[DEBUG] compile_to_c: generating C")
-    initialize_codegen()
-    if test_mode:
-        set_test_mode()
-    if import_roots.len() == 0:
-        print("[DEBUG] compile_to_c: emitting single module")
-        emit_module(root)
-    else:
-        mut all_roots: List[Int] := []
-        for imp_root in import_roots:
-            all_roots.push(imp_root)
-        all_roots.push(root)
-        emit_modules(all_roots)
-
-    print("[DEBUG] compile_to_c: getting output")
-    return get_codegen_output()
+# compile_to_c removed — compilation is now handled by the Cranelift native backend.
+# the self-hosted compiler provides the frontend: lex, parse, check, fmt, lint, doc.
 
 # Import alias tracking for module namespaces
 # Maps alias name -> (module_path, original_name) for from_import aliases

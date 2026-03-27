@@ -20,7 +20,7 @@
 #   forge version              print version
 #   forge help                 print usage
 
-from driver import get_directory, get_stem, compile_to_c, init_driver, resolve_imports, mark_visited, find_imports
+from driver import get_directory, get_stem, init_driver, resolve_imports, mark_visited, find_imports
 from lexer import lex_all, Token
 from parser import parse
 from ast import get_node, reset_arena
@@ -32,58 +32,8 @@ from errors import render_diagnostics, render_diagnostics_json, count_errors, ha
 from docgen import doc_extract, doc_format, doc_format_json, doc_check, doc_search
 
 # ---------------------------------------------------------------
-# compile pipeline (build/run/test)
-# ---------------------------------------------------------------
-
-fn find_runtime_header() -> String!:
-    # try common locations for forge_runtime.h
-    # 1. runtime/ (post-archive layout)
-    # 2. src/ (pre-archive layout, zig bootstrap)
-    if file_exists("runtime/forge_runtime.h"):
-        return read_file("runtime/forge_runtime.h")!
-    if file_exists("src/forge_runtime.h"):
-        return read_file("src/forge_runtime.h")!
-    print("error: cannot find forge_runtime.h")
-    print("  looked in: runtime/forge_runtime.h, src/forge_runtime.h")
-    exit(1)
-    return ""
-
-fn compile(path: String, test_mode: Bool) -> String!:
-    c_code := compile_to_c(path, test_mode)!
-    print("[DEBUG] compile: got C code, len=" + to_string(c_code.len()))
-
-    # set up build directory
-    dir := get_directory(path)
-    print("[DEBUG] compile: dir=" + dir)
-    build_dir := dir + "/.forge-build"
-    exec("mkdir -p " + build_dir)
-
-    # copy runtime header
-    print("[DEBUG] compile: finding runtime header")
-    runtime := find_runtime_header()!
-    print("[DEBUG] compile: writing runtime header, len=" + to_string(runtime.len()))
-    write_file(build_dir + "/forge_runtime.h", runtime)!
-    print("[DEBUG] compile: wrote runtime header")
-
-    # write C source
-    stem := get_stem(path)
-    mut c_name := stem + ".c"
-    if test_mode:
-        c_name = stem + "_test.c"
-    c_path := build_dir + "/" + c_name
-    write_file(c_path, c_code + "\n")!
-
-    # compile with zig cc
-    mut out_path := dir + "/" + stem
-    if test_mode:
-        out_path = build_dir + "/" + stem + "_test"
-    cmd := "zig cc -I" + build_dir + " -o " + out_path + " " + c_path + " -lpthread -lm"
-    result := exec(cmd)
-    if result != 0:
-        print("error: C compilation failed")
-        exit(1)
-
-    return out_path
+# note: build/run/test are handled by the Cranelift native backend (the forge binary).
+# this module provides the frontend: lex, parse, check, fmt, lint, doc.
 
 # ---------------------------------------------------------------
 # check command
@@ -447,21 +397,7 @@ fn run_cli() -> String!:
 
     path := a[2]
 
-    if command == "build":
-        out := compile(path, false)!
-        print("built " + out)
-
-    elif command == "run":
-        out := compile(path, false)!
-        result := exec("./" + out)
-        exit(result)
-
-    elif command == "test":
-        out := compile(path, true)!
-        result := exec(out)
-        exit(result)
-
-    elif command == "lex":
+    if command == "lex":
         cmd_lex(path)!
 
     elif command == "parse":

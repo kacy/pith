@@ -17,44 +17,39 @@ management, and more.
 
 ## quick start
 
-requires [zig 0.15.2](https://ziglang.org/download/) for the bootstrap build.
+requires [rust/cargo](https://rustup.rs/) for the Cranelift native backend.
 
 ```
-zig build test
-zig build run -- check examples/hello.fg
+cargo build --release
+./target/release/forge run examples/hello.fg
 make self-host
 ./self-host/forge_main check examples/hello.fg
 ```
-
-for day-to-day product work, treat the self-hosted compiler in `self-host/`
-as the primary implementation. use the zig bootstrap in `bootstrap/` as the
-reference implementation for bootstrapping, unit tests, and lower-risk refactors.
 
 ## where to read first
 
 - `README.md` for the high-level map
 - `docs/architecture.md` for the compiler pipeline and subsystem boundaries
 - `docs/contributing.md` for the development loop and smoke checks
-- `bootstrap/main.zig` for the bootstrap CLI entrypoint
-- `bootstrap/pipeline.zig` for lex/parse/check orchestration
-- `self-host/forge_main.fg` for the self-hosted CLI entrypoint
+- `self-host/forge_main.fg` for the self-hosted frontend (lex/parse/check/fmt/lint/doc)
+- `cranelift/cli/src/main.rs` for the native backend CLI (build/run)
 
 ## contributor fast path
 
 if you are new to the codebase, the shortest useful path is:
 
-1. run `zig build test`
-2. run `zig build run -- check examples/hello.fg`
+1. run `cargo build --release`
+2. run `./target/release/forge run examples/hello.fg`
 3. run `make self-host`
 4. run `./self-host/forge_main check examples/hello.fg`
 5. read `docs/architecture.md`
 
 common starting points:
 
-- add a token or keyword: `bootstrap/lexer.zig`, `self-host/lexer.fg`
-- add syntax: `bootstrap/parser.zig`, `self-host/parser.fg`, `docs/grammar.ebnf`
-- add type rules: `bootstrap/checker.zig`, `self-host/checker.fg`
-- add code generation: `bootstrap/codegen.zig`, `self-host/codegen.fg`
+- add a token or keyword: `self-host/lexer.fg`
+- add syntax: `self-host/parser.fg`, `docs/grammar.ebnf`
+- add type rules: `self-host/checker.fg`
+- native code generation: `cranelift/codegen/src/compiler.rs`
 
 ## what it looks like
 
@@ -161,29 +156,10 @@ forge help                     # print usage
 ## building
 
 ```
-make self-host             # build the self-hosted compiler (via zig bootstrap)
-make bootstrap             # rebuild the compiler using itself
-make bootstrap-verify      # verify fixed-point (C output identical across stages)
-```
-
-zig bootstrap (archived, for unit tests):
-
-```
-zig build                  # compile bootstrap
-zig build test             # run ~360 unit tests
-zig build release          # release build (~30x faster compilation)
-```
-
-other make targets:
-
-```
-make build                 # compile zig bootstrap (debug)
-make release               # compile zig bootstrap (release)
-make test                  # run zig unit tests
-make check                 # build + forge check all examples
-make run-examples          # run all examples (bootstrap)
-make run-examples-self     # run all examples (self-hosted)
-make fmt                   # format zig source
+make build                 # build the Cranelift native backend
+make self-host             # compile the self-hosted compiler via Cranelift
+make bootstrap-verify      # verify Cranelift-compiled compiler works on all examples
+make run-examples          # run all 43 deterministic examples
 make clean                 # remove build artifacts
 ```
 
@@ -197,10 +173,9 @@ the upstream submission checklist.
 ## project layout
 
 ```
-self-host/
-  forge_main.fg      unified CLI — build/run/test/check/fmt/lint/lex/parse/doc
-  codegen_main.fg    codegen entry point — emits C to stdout
-  driver.fg          compile pipeline and import resolution
+self-host/             compiler frontend — written in forge (~8,800 lines)
+  forge_main.fg      CLI — check/fmt/lint/lex/parse/doc
+  driver.fg          import resolution pipeline
   lexer.fg           tokenizer with indentation tracking
   parser.fg          recursive descent parser
   ast.fg             AST node representation
@@ -208,26 +183,15 @@ self-host/
   checker.fg         type checker
   types.fg           type representation
   scope.fg           scope management
-  codegen.fg         C transpilation backend (~4,000 lines)
   formatter.fg       source code formatter
   linter.fg          convention linter
   errors.fg          human-readable error rendering
   docgen.fg          documentation generator and search
 
-runtime/
-  forge_runtime.h    C runtime header — memory, strings, collections, I/O
-
-bootstrap/           zig bootstrap compiler (archived, for reference and unit tests)
-  main.zig           thin CLI entrypoint and dispatch
-  cli/               command parsing and per-command handlers
-  pipeline.zig       shared lex/parse/check pipeline helpers
-  build_support.zig  generated C/build directory/process helpers
-  lexer.zig, parser.zig, checker.zig, codegen.zig, etc.
-
-cranelift/           Cranelift native code backend (~18,100 lines Rust)
-  runtime/           runtime library (ARC, collections, JSON, TOML, URL, concurrency)
+cranelift/             native code backend — Rust + Cranelift (~18,100 lines)
+  cli/               CLI entry point (build/run/test + delegates to self-host)
   codegen/           AST-to-IR compilation, monomorphization, type inference
-  cli/               native backend CLI
+  runtime/           runtime library (ARC, collections, JSON, TOML, URL, concurrency)
 
 std/                 standard library (13 native forge modules)
   encoding.fg        base64/hex encoding
@@ -244,7 +208,7 @@ std/                 standard library (13 native forge modules)
   os/path.fg         file path manipulation
   os/process.fg      child process management
 
-examples/            43 deterministic .fg programs with verified expected output
+examples/              43 deterministic .fg programs with verified expected output
 docs/grammar.ebnf    complete EBNF for the language
 docs/errors.md       error code reference (E0xx–E3xx)
 docs/architecture.md compiler and ownership overview

@@ -54,9 +54,28 @@ pub fn compile_from_ir(
         match parts[0] {
             "string" if parts.len() >= 3 => {
                 let idx: usize = parts[1].parse().unwrap_or(0);
-                // Extract quoted string content
+                // Extract quoted string content and process escape sequences
                 let rest = &line[line.find('"').unwrap_or(0)..];
-                let content = rest.trim_matches('"').to_string();
+                let raw = rest.trim_matches('"');
+                let mut content = String::new();
+                let bytes = raw.as_bytes();
+                let mut j = 0;
+                while j < bytes.len() {
+                    if bytes[j] == b'\\' && j + 1 < bytes.len() {
+                        match bytes[j + 1] {
+                            b'n' => { content.push('\n'); j += 2; }
+                            b't' => { content.push('\t'); j += 2; }
+                            b'\\' => { content.push('\\'); j += 2; }
+                            b'"' => { content.push('"'); j += 2; }
+                            b'r' => { content.push('\r'); j += 2; }
+                            b'0' => { content.push('\0'); j += 2; }
+                            _ => { content.push(bytes[j] as char); j += 1; }
+                        }
+                    } else {
+                        content.push(bytes[j] as char);
+                        j += 1;
+                    }
+                }
                 string_data.push((idx, content));
             }
             "struct" if parts.len() >= 2 => {
@@ -547,6 +566,7 @@ fn resolve_func_name(name: &str) -> &str {
         "__map_new" => "forge_map_new_default",
         "__set_new" => "forge_set_new_default",
         "__struct_alloc" => "forge_struct_alloc",
+        "__str_eq" => "forge_cstring_eq",
         "push" => "forge_list_push_value",
         "pop" => "forge_list_pop",
         "contains" => "forge_cstring_contains",

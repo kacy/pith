@@ -188,9 +188,20 @@ fn ir_expr(idx: Int) -> Int:
         elif op == "mod":
             ir_emit("mod " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
         elif op == "eq":
-            ir_emit("eq " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+            if is_str_op:
+                ir_emit("call " + r.to_string() + " __str_eq 2 " + left_r.to_string() + " " + right_r.to_string())
+            else:
+                ir_emit("eq " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
         elif op == "neq":
-            ir_emit("neq " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+            if is_str_op:
+                # str_neq = 1 - str_eq
+                eq_r := ir_reg()
+                ir_emit("call " + eq_r.to_string() + " __str_eq 2 " + left_r.to_string() + " " + right_r.to_string())
+                one_r := ir_reg()
+                ir_emit("iconst " + one_r.to_string() + " 1")
+                ir_emit("sub " + r.to_string() + " " + one_r.to_string() + " " + eq_r.to_string())
+            else:
+                ir_emit("neq " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
         elif op == "lt":
             ir_emit("lt " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
         elif op == "gt":
@@ -270,6 +281,13 @@ fn ir_expr(idx: Int) -> Int:
                     obj_is_bool = true
             elif obj_n.kind == "bool_lit":
                 obj_is_bool = true
+            elif obj_n.kind == "method_call":
+                # method calls that return bools
+                mc_name := obj_n.value
+                if mc_name.starts_with("."):
+                    mc_name = mc_name.substring(1, mc_name.len())
+                if mc_name == "contains" or mc_name == "contains_key" or mc_name == "starts_with" or mc_name == "ends_with" or mc_name == "is_empty" or mc_name == "has":
+                    obj_is_bool = true
             # variable type lookup
             elif obj_n.kind == "ident":
                 vname := obj_n.value

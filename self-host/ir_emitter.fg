@@ -1,0 +1,218 @@
+# ir_emitter.fg — proof-of-concept Cranelift IR emitter
+#
+# this module reads the AST (from the parser) and emits a simple
+# intermediate representation that the Rust backend can translate
+# to Cranelift API calls. this is the first step toward moving
+# compilation logic from Rust to Forge.
+#
+# IR format:
+#   @str_N = "string content"           — string data declarations
+#   declare @func_name(i64, i64) -> i64 — external function declarations
+#   define func_name(param: i64) -> i64 { — function definitions
+#     %N = iconst VALUE                  — integer constant
+#     %N = call @func(%args)             — function call
+#     %N = add %a, %b                    — arithmetic
+#     %N = icmp eq %a, %b               — comparison
+#     brif %cond, @then, @else          — conditional branch
+#     ret %N                            — return
+#   }
+
+from ast import get_node, Node
+
+# --- IR buffer ---
+mut ir_lines: List[String] := []
+mut next_var := 0
+mut string_count := 0
+mut strings: List[String] := []
+
+pub fn ir_reset():
+    ir_lines = []
+    next_var = 0
+    string_count = 0
+    strings = []
+
+fn ir_emit(line: String):
+    ir_lines.push(line)
+
+fn ir_new_var() -> Int:
+    v := next_var
+    next_var = next_var + 1
+    return v
+
+fn register_string(s: String) -> Int:
+    # check if already registered
+    mut i := 0
+    while i < strings.len():
+        if strings[i] == s:
+            return i
+        i = i + 1
+    idx := string_count
+    strings.push(s)
+    string_count = string_count + 1
+    return idx
+
+# --- collect all strings from AST ---
+fn collect_strings_from(node_idx: Int):
+    node := get_node(node_idx)
+    if node.kind == "string_lit" or node.kind == "string":
+        register_string(node.value)
+    for child in node.children:
+        collect_strings_from(child)
+
+# --- emit string data declarations ---
+fn emit_string_data():
+    mut i := 0
+    while i < strings.len():
+        ir_emit("@str_" + i.to_string() + " = " + chr(34) + strings[i] + chr(34))
+        i = i + 1
+
+# --- emit a function ---
+fn emit_function(node_idx: Int):
+    node := get_node(node_idx)
+    name := node.value
+
+    # find params and body
+    mut params: List[String] := []
+    mut body_idx := 0 - 1
+    mut return_type := "i64"
+
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            params.push(cn.value)
+        elif cn.kind == "body":
+            body_idx = child
+
+    # emit function header
+    mut param_str := ""
+    mut i := 0
+    while i < params.len():
+        if i > 0:
+            param_str = param_str + ", "
+        param_str = param_str + params[i] + ": i64"
+        i = i + 1
+
+    ir_emit("")
+    ir_emit("define " + name + "(" + param_str + ") -> " + return_type + " {")
+
+    if body_idx >= 0:
+        emit_block(body_idx)
+
+    # default return
+    v := ir_new_var()
+    ir_emit("  %" + v.to_string() + " = iconst 0")
+    ir_emit("  ret %" + v.to_string())
+    ir_emit("}")
+
+# --- emit a block of statements ---
+fn emit_block(node_idx: Int):
+    node := get_node(node_idx)
+    for child in node.children:
+        emit_stmt(child)
+
+# --- emit a statement ---
+fn emit_stmt(node_idx: Int):
+    node := get_node(node_idx)
+
+    if node.kind == "call":
+        emit_call(node_idx)
+    elif node.kind == "return":
+        if node.children.len() > 0:
+            v := emit_expr(node.children[0])
+            ir_emit("  ret %" + v.to_string())
+    elif node.kind == "bind":
+        if node.children.len() > 0:
+            v := emit_expr(node.children[0])
+            ir_emit("  ; bind " + node.value + " = %" + v.to_string())
+
+# --- emit an expression, return the variable number ---
+fn emit_expr(node_idx: Int) -> Int:
+    node := get_node(node_idx)
+
+    if node.kind == "int_lit" or node.kind == "int" or node.kind == "integer":
+        v := ir_new_var()
+        ir_emit("  %" + v.to_string() + " = iconst " + node.value)
+        return v
+
+    elif node.kind == "string_lit" or node.kind == "string":
+        str_idx := register_string(node.value)
+        v := ir_new_var()
+        ir_emit("  %" + v.to_string() + " = call @str_" + str_idx.to_string() + "()")
+        return v
+
+    elif node.kind == "ident":
+        v := ir_new_var()
+        ir_emit("  %" + v.to_string() + " = load %" + node.value)
+        return v
+
+    elif node.kind == "call":
+        return emit_call(node_idx)
+
+    elif node.kind == "binary":
+        left := emit_expr(node.children[0])
+        right := emit_expr(node.children[1])
+        v := ir_new_var()
+        op := node.value
+        if op == "add" or op == "+":
+            ir_emit("  %" + v.to_string() + " = add %" + left.to_string() + ", %" + right.to_string())
+        elif op == "sub" or op == "-":
+            ir_emit("  %" + v.to_string() + " = sub %" + left.to_string() + ", %" + right.to_string())
+        elif op == "mul" or op == "*":
+            ir_emit("  %" + v.to_string() + " = mul %" + left.to_string() + ", %" + right.to_string())
+        else:
+            ir_emit("  %" + v.to_string() + " = " + op + " %" + left.to_string() + ", %" + right.to_string())
+        return v
+
+    v := ir_new_var()
+    ir_emit("  %" + v.to_string() + " = iconst 0 ; unhandled: " + node.kind)
+    return v
+
+# --- emit a function call ---
+fn emit_call(node_idx: Int) -> Int:
+    node := get_node(node_idx)
+
+    # first child is the function name (ident), rest are args
+    mut func_name := "unknown"
+    mut arg_vars: List[Int] := []
+
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "ident" and func_name == "unknown":
+            func_name = cn.value
+        elif cn.kind == "arg":
+            if cn.children.len() > 0:
+                av := emit_expr(cn.children[0])
+                arg_vars.push(av)
+
+    # build args string
+    mut args_str := ""
+    mut i := 0
+    while i < arg_vars.len():
+        if i > 0:
+            args_str = args_str + ", "
+        args_str = args_str + "%" + arg_vars[i].to_string()
+        i = i + 1
+
+    v := ir_new_var()
+    ir_emit("  %" + v.to_string() + " = call @" + func_name + "(" + args_str + ")")
+    return v
+
+# --- main entry point: emit IR for a module ---
+pub fn emit_ir(root_idx: Int) -> String:
+    ir_reset()
+
+    root := get_node(root_idx)
+
+    # first pass: collect strings
+    collect_strings_from(root_idx)
+
+    # emit string data
+    emit_string_data()
+
+    # emit functions
+    for child in root.children:
+        cn := get_node(child)
+        if cn.kind == "fn_decl" or cn.kind == "fn":
+            emit_function(child)
+
+    return ir_lines.join("\n")

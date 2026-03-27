@@ -42,6 +42,7 @@ mut ir_var_regs: Map[String, Int] := {}
 mut ir_var_types: Map[String, String] := {}  # variable name -> type hint ("int", "bool", "string")
 mut ir_struct_names: Map[String, Int] := {}  # struct name -> field count
 mut ir_type_aliases: Map[String, String] := {}  # alias name -> target type
+mut ir_func_returns: Map[String, String] := {}  # function name -> return type hint
 
 pub fn ir_reset():
     ir_lines = []
@@ -252,6 +253,18 @@ fn ir_expr(idx: Int) -> Int:
                 ir_emit("sstore " + r.to_string() + " " + si.to_string() + " " + arg_regs[si].to_string())
                 si = si + 1
             return r
+        # dispatch to_string based on argument type
+        if fname == "to_string" and arg_regs.len() == 1:
+            # check first arg's node type
+            first_arg_node := get_node(node.children[1])
+            if first_arg_node.kind == "arg" and first_arg_node.children.len() > 0:
+                arg_n := get_node(first_arg_node.children[0])
+                if arg_n.kind == "ident" and ir_var_types.contains_key(arg_n.value):
+                    avt := ir_var_types[arg_n.value]
+                    if avt == "string":
+                        fname = "identity"
+                    elif avt == "bool":
+                        fname = "bool_to_string"
         r := ir_reg()
         mut args_s := ""
         mut i := 0
@@ -667,8 +680,35 @@ fn ir_stmt(idx: Int):
                     mv = mv.substring(1, mv.len())
                 if mv == "split" or mv == "keys" or mv == "values" or mv == "chars":
                     ir_var_types.insert(name, "list_string")
-                elif mv == "trim" or mv == "substring" or mv == "to_upper" or mv == "to_lower" or mv == "replace" or mv == "join" or mv == "reverse":
+                elif mv == "trim" or mv == "substring" or mv == "to_upper" or mv == "to_lower" or mv == "replace" or mv == "join" or mv == "reverse" or mv == "to_string":
                     ir_var_types.insert(name, "string")
+            elif vn.kind == "call":
+                # check if calling a known string-returning function
+                if vn.children.len() > 0:
+                    cfn := get_node(vn.children[0])
+                    if cfn.kind == "ident":
+                        cf := cfn.value
+                        string_fns := "sha256,hex_encode,hex_decode,from_hex,to_hex,b64_encode,b64_decode,chr,read_file,env,path_join,path_dir,path_base,path_ext,path_stem,parse,scheme,host,query,fragment,encode,decode,exec_output,type_of,get_string"
+                        int_fns := "fnv1a,ord,port,get_int,array_len"
+                        if string_fns.contains(cf):
+                            ir_var_types.insert(name, "string")
+                        elif int_fns.contains(cf):
+                            ir_var_types.insert(name, "int")
+                        # check user-defined function return types
+                        elif ir_func_returns.contains_key(cf):
+                            frt := ir_func_returns[cf]
+                            if frt == "String":
+                                ir_var_types.insert(name, "string")
+                            elif frt == "Int":
+                                ir_var_types.insert(name, "int")
+                            elif frt == "Bool":
+                                ir_var_types.insert(name, "bool")
+                            elif frt == "Map" or frt.contains("Map"):
+                                ir_var_types.insert(name, "map")
+                            elif frt == "Set" or frt.contains("Set"):
+                                ir_var_types.insert(name, "set")
+                            elif frt == "List" or frt.contains("List"):
+                                ir_var_types.insert(name, "list")
             elif vn.kind == "map":
                 ir_var_types.insert(name, "map")
             elif vn.kind == "set":
@@ -935,6 +975,21 @@ pub fn emit_ir(root_idx: Int) -> String:
                     nfields := ir_struct_names[target]
                     ir_struct_names.insert(aname, nfields)
                     ir_emit("struct_alias " + aname + " " + target)
+
+    # collect function return types
+    ir_func_returns = {}
+    for child in root.children:
+        cn := get_node(child)
+        if cn.kind == "fn" or cn.kind == "fn_decl":
+            for fc in cn.children:
+                fcn := get_node(fc)
+                if fcn.kind == "returns":
+                    for rc in fcn.children:
+                        rn := get_node(rc)
+                        if rn.kind == "type":
+                            ir_func_returns.insert(cn.value, rn.value)
+                        elif rn.kind == "generic_type":
+                            ir_func_returns.insert(cn.value, rn.value)
 
     # emit functions
     for child in root.children:

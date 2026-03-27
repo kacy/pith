@@ -425,7 +425,30 @@ fn ir_expr(idx: Int) -> Int:
         obj_r := ir_expr(node.children[0])
         idx_r := ir_expr(node.children[1])
         r := ir_reg()
-        ir_emit("call " + r.to_string() + " __index 2 " + obj_r.to_string() + " " + idx_r.to_string())
+        # detect string indexing vs list indexing
+        obj_n := get_node(node.children[0])
+        idx_n := get_node(node.children[1])
+        mut is_str_idx := false
+        if obj_n.kind == "ident":
+            oname := obj_n.value
+            if ir_var_types.contains_key(oname):
+                if ir_var_types[oname] == "string":
+                    is_str_idx = true
+        elif obj_n.kind == "string_lit" or obj_n.kind == "string":
+            is_str_idx = true
+        # map index: if key is a string literal or string var
+        mut is_map_idx := false
+        if obj_n.kind == "ident":
+            oname := obj_n.value
+            if ir_var_types.contains_key(oname):
+                if ir_var_types[oname] == "map":
+                    is_map_idx = true
+        if is_str_idx:
+            ir_emit("call " + r.to_string() + " char_at 2 " + obj_r.to_string() + " " + idx_r.to_string())
+        elif is_map_idx:
+            ir_emit("call " + r.to_string() + " map_get 2 " + obj_r.to_string() + " " + idx_r.to_string())
+        else:
+            ir_emit("call " + r.to_string() + " __list_get 2 " + obj_r.to_string() + " " + idx_r.to_string())
         return r
 
     # fallback
@@ -459,12 +482,30 @@ fn ir_stmt(idx: Int):
             name = name.substring(0, name.len() - 4)
         elif name.contains(" "):
             name = name.split(" ")[0]
-        # skip type annotation children, find the value expression
+        # find type annotation and value expression
         mut val_idx := 0 - 1
+        mut type_ann := ""
         for child in node.children:
             cn := get_node(child)
-            if cn.kind != "type":
+            if cn.kind == "type":
+                type_ann = cn.value
+            else:
                 val_idx = child
+        # track type from annotation
+        if type_ann.contains("Map[") or type_ann.contains("Map"):
+            ir_var_types.insert(name, "map")
+        elif type_ann.contains("Set[") or type_ann.contains("Set"):
+            ir_var_types.insert(name, "set")
+        elif type_ann.contains("List[String]"):
+            ir_var_types.insert(name, "list_string")
+        elif type_ann.contains("List["):
+            ir_var_types.insert(name, "list")
+        elif type_ann == "String":
+            ir_var_types.insert(name, "string")
+        elif type_ann == "Bool":
+            ir_var_types.insert(name, "bool")
+        elif type_ann == "Int":
+            ir_var_types.insert(name, "int")
         if val_idx >= 0:
             r := ir_expr(val_idx)
             ir_var_regs.insert(name, r)
@@ -479,6 +520,12 @@ fn ir_stmt(idx: Int):
                 ir_var_types.insert(name, "string")
             elif vn.kind == "bool_lit":
                 ir_var_types.insert(name, "bool")
+            elif vn.kind == "map":
+                ir_var_types.insert(name, "map")
+            elif vn.kind == "set":
+                ir_var_types.insert(name, "set")
+            elif vn.kind == "list":
+                ir_var_types.insert(name, "list")
 
     elif node.kind == "assign":
         name := node.value

@@ -406,6 +406,8 @@ fn ir_expr(idx: Int) -> Int:
             mname = "map_clear"
         if mname == "remove" and obj_is_set:
             mname = "set_remove"
+        if mname == "add" and obj_is_set:
+            mname = "set_add"
         if mname == "clear" and obj_is_set:
             mname = "set_clear"
         # track that these methods return bools
@@ -531,7 +533,7 @@ fn ir_expr(idx: Int) -> Int:
         ir_emit("call " + set_r.to_string() + " __set_new 0")
         for child in node.children:
             elem_r := ir_expr(child)
-            ir_emit("call " + ir_reg().to_string() + " add 2 " + set_r.to_string() + " " + elem_r.to_string())
+            ir_emit("call " + ir_reg().to_string() + " set_add 2 " + set_r.to_string() + " " + elem_r.to_string())
         return set_r
 
     if node.kind == "list":

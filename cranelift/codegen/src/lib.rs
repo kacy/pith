@@ -821,6 +821,9 @@ pub fn declare_runtime_functions(
     let map_new_default = declare_runtime_function(module, "forge_map_new_default", &[], &[types::I64])?;
     funcs.insert("forge_map_new_default".to_string(), map_new_default);
 
+    let map_new_int = declare_runtime_function(module, "forge_map_new_int", &[], &[types::I64])?;
+    funcs.insert("forge_map_new_int".to_string(), map_new_int);
+
     let set_new_default = declare_runtime_function(module, "forge_set_new_default", &[], &[types::I64])?;
     funcs.insert("forge_set_new_default".to_string(), set_new_default);
 
@@ -1683,9 +1686,11 @@ pub fn declare_runtime_functions(
 
     let toml_has = declare_runtime_function(module, "forge_toml_has", &[types::I64, types::I64], &[types::I64])?;
     funcs.insert("has".to_string(), toml_has);
+    funcs.insert("toml_has".to_string(), toml_has);
 
     let toml_get_array = declare_runtime_function(module, "forge_toml_get_array", &[types::I64, types::I64], &[types::I64])?;
     funcs.insert("get_array".to_string(), toml_get_array);
+    funcs.insert("toml_get_array".to_string(), toml_get_array);
 
     let toml_array_len = declare_runtime_function(module, "forge_toml_array_len", &[types::I64], &[types::I64])?;
     funcs.insert("toml_array_len".to_string(), toml_array_len);
@@ -1695,6 +1700,7 @@ pub fn declare_runtime_functions(
 
     let toml_get_table = declare_runtime_function(module, "forge_toml_get_table", &[types::I64, types::I64], &[types::I64])?;
     funcs.insert("get_table".to_string(), toml_get_table);
+    funcs.insert("toml_get_table".to_string(), toml_get_table);
 
     let toml_keys = declare_runtime_function(module, "forge_toml_keys", &[types::I64], &[types::I64])?;
     funcs.insert("toml_keys".to_string(), toml_keys);

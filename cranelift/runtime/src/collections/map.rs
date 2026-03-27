@@ -116,6 +116,12 @@ pub unsafe extern "C" fn forge_map_new_default() -> ForgeMap {
     forge_map_new(1, 8, 0) // string keys, 8-byte values, not heap
 }
 
+/// Create a new int-key map with default settings
+#[no_mangle]
+pub unsafe extern "C" fn forge_map_new_int() -> ForgeMap {
+    forge_map_new(0, 8, 0) // int keys, 8-byte values, not heap
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn forge_map_new(
     key_type: i32,

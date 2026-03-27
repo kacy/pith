@@ -542,8 +542,18 @@ fn ir_expr(idx: Int) -> Int:
                     iname := cn.value
                     if ir_var_types.contains_key(iname):
                         vt := ir_var_types[iname]
-                        if vt == "int" or vt == "bool":
+                        if vt == "int":
                             needs_convert = true
+                        elif vt == "bool":
+                            # use bool_to_string
+                            br := ir_reg()
+                            ir_emit("call " + br.to_string() + " bool_to_string 1 " + part_r.to_string())
+                            part_r = br
+                        elif vt == "float":
+                            # use float_to_string
+                            fr := ir_reg()
+                            ir_emit("call " + fr.to_string() + " float_to_string 1 " + part_r.to_string())
+                            part_r = fr
                 elif cn.kind == "string_lit" or cn.kind == "string":
                     needs_convert = false
                 elif cn.kind == "method_call":
@@ -928,6 +938,8 @@ fn ir_stmt(idx: Int):
                 ir_var_types.insert(name, "bool")
             elif vn.kind == "float_lit" or vn.kind == "float":
                 ir_var_types.insert(name, "float")
+            elif vn.kind == "int_lit" or vn.kind == "int" or vn.kind == "integer":
+                ir_var_types.insert(name, "int")
             elif vn.kind == "method_call":
                 mv := vn.value
                 if mv.starts_with("."):

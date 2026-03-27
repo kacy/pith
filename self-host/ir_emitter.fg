@@ -262,6 +262,10 @@ fn ir_expr(idx: Int) -> Int:
                 if cn.children.len() > 0:
                     ar := ir_expr(cn.children[0])
                     arg_regs.push(ar)
+        # disambiguate function names that collide with method names
+        if fname == "join" and arg_regs.len() == 2:
+            fname = "path_join"
+
         # check if this is a struct constructor
         if ir_struct_names.contains_key(fname):
             r := ir_reg()

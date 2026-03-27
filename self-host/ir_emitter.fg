@@ -121,6 +121,24 @@ fn ir_expr(idx: Int) -> Int:
         ir_emit("load " + r.to_string() + " " + name)
         return r
 
+    if node.kind == "unary":
+        operand_r := ir_expr(node.children[0])
+        r := ir_reg()
+        if node.value == "not" or node.value == "!":
+            # boolean not: 1 - x (flips 0→1, 1→0)
+            one := ir_reg()
+            ir_emit("iconst " + one.to_string() + " 1")
+            ir_emit("sub " + r.to_string() + " " + one.to_string() + " " + operand_r.to_string())
+        elif node.value == "neg" or node.value == "-":
+            zero := ir_reg()
+            ir_emit("iconst " + zero.to_string() + " 0")
+            ir_emit("sub " + r.to_string() + " " + zero.to_string() + " " + operand_r.to_string())
+        elif node.value == "bit_not" or node.value == "~":
+            ir_emit("bnot " + r.to_string() + " " + operand_r.to_string())
+        else:
+            ir_emit("iconst " + r.to_string() + " 0")
+        return r
+
     if node.kind == "binary":
         left_r := ir_expr(node.children[0])
         right_r := ir_expr(node.children[1])
@@ -154,6 +172,20 @@ fn ir_expr(idx: Int) -> Int:
             ir_emit("lte " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
         elif op == "gte":
             ir_emit("gte " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "bit_and":
+            ir_emit("band " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "bit_or":
+            ir_emit("bor " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "bit_xor":
+            ir_emit("bxor " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "shl":
+            ir_emit("shl " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "shr":
+            ir_emit("shr " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "and":
+            ir_emit("and " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "or":
+            ir_emit("or " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
         else:
             ir_emit("binop " + r.to_string() + " " + op + " " + left_r.to_string() + " " + right_r.to_string())
         return r
@@ -214,7 +246,12 @@ fn ir_expr(idx: Int) -> Int:
         if mname == "to_string" and obj_is_bool:
             mname = "bool_to_string"
         if mname == "to_string" and obj_is_string:
-            mname = "identity"  # string.to_string() is a no-op
+            mname = "identity"
+        # dispatch len/contains based on object type
+        if mname == "len" and obj_is_string:
+            mname = "string_len"
+        if mname == "contains" and obj_is_string:
+            mname = "string_contains"
 
         mut obj_r := 0 - 1
         mut arg_regs: List[Int] := []
@@ -279,6 +316,56 @@ fn ir_expr(idx: Int) -> Int:
             elem_r := ir_expr(child)
             ir_emit("call " + ir_reg().to_string() + " __list_push 2 " + list_r.to_string() + " " + elem_r.to_string())
         return list_r
+
+    if node.kind == "tuple":
+        # tuple literal: allocate struct and store elements
+        mut elem_regs: List[Int] := []
+        for child in node.children:
+            elem_regs.push(ir_expr(child))
+        r := ir_reg()
+        nf := ir_reg()
+        ir_emit("iconst " + nf.to_string() + " " + elem_regs.len().to_string())
+        ir_emit("call " + r.to_string() + " __struct_alloc 1 " + nf.to_string())
+        mut ti := 0
+        while ti < elem_regs.len():
+            ir_emit("sstore " + r.to_string() + " " + ti.to_string() + " " + elem_regs[ti].to_string())
+            ti = ti + 1
+        return r
+
+    if node.kind == "struct_init":
+        # struct initialization: allocate struct and store fields
+        sname := node.value
+        # count fields
+        mut field_regs: List[Int] := []
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "field_init":
+                if cn.children.len() > 0:
+                    fr := ir_expr(cn.children[0])
+                    field_regs.push(fr)
+            else:
+                fr := ir_expr(child)
+                field_regs.push(fr)
+        # emit struct alloc + field stores
+        r := ir_reg()
+        ir_emit("call " + r.to_string() + " __struct_alloc 1 " + field_regs.len().to_string())
+        mut fi := 0
+        while fi < field_regs.len():
+            ir_emit("sstore " + r.to_string() + " " + fi.to_string() + " " + field_regs[fi].to_string())
+            fi = fi + 1
+        return r
+
+    if node.kind == "field_access":
+        # obj.field — emit field load instruction
+        fname := node.value
+        if node.children.len() > 0:
+            obj_r := ir_expr(node.children[0])
+            r := ir_reg()
+            ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " " + fname)
+            return r
+        r := ir_reg()
+        ir_emit("iconst " + r.to_string() + " 0")
+        return r
 
     if node.kind == "grouped":
         if node.children.len() > 0:
@@ -567,6 +654,17 @@ pub fn emit_ir(root_idx: Int) -> String:
     while i < ir_strings.len():
         ir_emit("string " + i.to_string() + " " + chr(34) + ir_strings[i] + chr(34))
         i = i + 1
+
+    # emit struct declarations
+    for child in root.children:
+        cn := get_node(child)
+        if cn.kind == "struct_decl":
+            mut field_names: List[String] := []
+            for fc in cn.children:
+                fn_node := get_node(fc)
+                if fn_node.kind == "field":
+                    field_names.push(fn_node.value)
+            ir_emit("struct " + cn.value + " " + field_names.join(" "))
 
     # emit functions
     for child in root.children:

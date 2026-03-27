@@ -43,6 +43,7 @@ pub fn compile_from_ir(
     let lines: Vec<&str> = ir_text.lines().collect();
     let mut declared_funcs: HashMap<String, FuncId> = HashMap::new();
     let mut string_data: Vec<(usize, String)> = Vec::new();
+    let mut struct_layouts: HashMap<String, Vec<String>> = HashMap::new();
 
     // Pass 1: collect string data and declare functions
     for line in &lines {
@@ -57,6 +58,17 @@ pub fn compile_from_ir(
                 let rest = &line[line.find('"').unwrap_or(0)..];
                 let content = rest.trim_matches('"').to_string();
                 string_data.push((idx, content));
+            }
+            "struct" if parts.len() >= 2 => {
+                let name = parts[1].to_string();
+                let fields: Vec<String> = parts[2..].iter().map(|s| s.to_string()).collect();
+                // Register struct layout with Cranelift backend
+                let field_pairs: Vec<(String, String)> = fields
+                    .iter()
+                    .map(|f| (f.clone(), "Int".to_string()))
+                    .collect();
+                crate::register_struct_layout(&name, &field_pairs);
+                struct_layouts.insert(name, fields);
             }
             "func" if parts.len() >= 4 => {
                 let name = parts[1];
@@ -127,6 +139,7 @@ pub fn compile_from_ir(
                 runtime_funcs,
                 &declared_funcs,
                 &string_funcs,
+                &struct_layouts,
             )?;
         }
     }
@@ -143,6 +156,7 @@ fn compile_ir_function(
     runtime_funcs: &HashMap<String, FuncId>,
     declared_funcs: &HashMap<String, FuncId>,
     string_funcs: &HashMap<usize, FuncId>,
+    struct_layouts: &HashMap<String, Vec<String>>,
 ) -> Result<(), CompileError> {
     let mut ctx = codegen.module.make_context();
 
@@ -211,7 +225,16 @@ fn compile_ir_function(
         match parts[0] {
             "iconst" if parts.len() >= 3 => {
                 let reg: usize = parts[1].parse().unwrap_or(0);
-                let val: i64 = parts[2].parse().unwrap_or(0);
+                let s = parts[2];
+                let val: i64 = if s.starts_with("0x") || s.starts_with("0X") {
+                    i64::from_str_radix(&s[2..], 16).unwrap_or(0)
+                } else if s.starts_with("0b") || s.starts_with("0B") {
+                    i64::from_str_radix(&s[2..], 2).unwrap_or(0)
+                } else if s.starts_with("0o") || s.starts_with("0O") {
+                    i64::from_str_radix(&s[2..], 8).unwrap_or(0)
+                } else {
+                    s.parse().unwrap_or(0)
+                };
                 let v = builder.ins().iconst(types::I64, val);
                 regs.insert(reg, v);
             }
@@ -227,6 +250,40 @@ fn compile_ir_function(
                 } else {
                     regs.insert(reg, builder.ins().iconst(types::I64, 0));
                 }
+            }
+
+            "band" | "bor" | "bxor" | "shl" | "shr" if parts.len() >= 4 => {
+                let reg: usize = parts[1].parse().unwrap_or(0);
+                let a = get_reg(&regs, parts[2]);
+                let b = get_reg(&regs, parts[3]);
+                let v = match parts[0] {
+                    "band" => builder.ins().band(a, b),
+                    "bor" => builder.ins().bor(a, b),
+                    "bxor" => builder.ins().bxor(a, b),
+                    "shl" => builder.ins().ishl(a, b),
+                    "shr" => builder.ins().ushr(a, b),
+                    _ => unreachable!(),
+                };
+                regs.insert(reg, v);
+            }
+
+            "bnot" if parts.len() >= 3 => {
+                let reg: usize = parts[1].parse().unwrap_or(0);
+                let a = get_reg(&regs, parts[2]);
+                let v = builder.ins().bnot(a);
+                regs.insert(reg, v);
+            }
+
+            "and" | "or" if parts.len() >= 4 => {
+                let reg: usize = parts[1].parse().unwrap_or(0);
+                let a = get_reg(&regs, parts[2]);
+                let b = get_reg(&regs, parts[3]);
+                let v = match parts[0] {
+                    "and" => builder.ins().band(a, b),
+                    "or" => builder.ins().bor(a, b),
+                    _ => unreachable!(),
+                };
+                regs.insert(reg, v);
             }
 
             "add" | "sub" | "mul" | "div" | "mod" if parts.len() >= 4 => {
@@ -343,6 +400,45 @@ fn compile_ir_function(
                 }
             }
 
+            "field" if parts.len() >= 4 => {
+                let reg: usize = parts[1].parse().unwrap_or(0);
+                let obj = get_reg(&regs, parts[2]);
+                let field_name = parts[3];
+                // Try numeric field index first (for tuples: .0, .1)
+                let offset = if let Ok(idx) = field_name.parse::<usize>() {
+                    (idx * 8) as i32
+                } else {
+                    // Look up field offset from struct layouts
+                    struct_layouts
+                        .values()
+                        .find_map(|fields| {
+                            fields.iter().position(|f| f == field_name).map(|i| (i * 8) as i32)
+                        })
+                        .unwrap_or(0)
+                };
+                let v = builder.ins().load(
+                    types::I64,
+                    cranelift::codegen::ir::MemFlags::new(),
+                    obj,
+                    offset,
+                );
+                regs.insert(reg, v);
+            }
+
+            "sstore" if parts.len() >= 4 => {
+                // Store field in struct: sstore struct_reg field_idx value_reg
+                let struct_val = get_reg(&regs, parts[1]);
+                let field_idx: i32 = parts[2].parse().unwrap_or(0);
+                let val = get_reg(&regs, parts[3]);
+                let offset = field_idx * 8;
+                builder.ins().store(
+                    cranelift::codegen::ir::MemFlags::new(),
+                    val,
+                    struct_val,
+                    offset,
+                );
+            }
+
             "ret" if parts.len() >= 2 => {
                 let val = get_reg(&regs, parts[1]);
                 builder.ins().return_(&[val]);
@@ -405,6 +501,26 @@ fn resolve_func_name(name: &str) -> &str {
         "print" => "forge_print_cstr",
         "print_err" => "forge_print_err",
         "to_string" | "int_to_string" => "forge_int_to_cstr",
+        "len" => "forge_list_len",
+        "string_len" => "forge_cstring_len",
+        "join" => "forge_list_join",
+        "substring" => "forge_cstring_substring",
+        "contains" => "forge_cstring_contains",
+        "string_contains" => "forge_cstring_contains",
+        "starts_with" => "forge_cstring_starts_with",
+        "ends_with" => "forge_cstring_ends_with",
+        "trim" => "forge_cstring_trim",
+        "split" => "forge_cstring_split",
+        "to_upper" => "forge_cstring_to_upper",
+        "to_lower" => "forge_cstring_to_lower",
+        "replace" => "forge_cstring_replace",
+        "repeat" => "forge_cstring_repeat",
+        "index_of" => "forge_cstring_index_of",
+        "last_index_of" => "forge_cstring_last_index_of",
+        "pad_left" => "forge_cstring_pad_left",
+        "pad_right" => "forge_cstring_pad_right",
+        "char_at" => "forge_cstring_char_at",
+        "chars" => "forge_cstring_chars",
         "bool_to_string" => "forge_bool_to_cstr",
         "float_to_string" => "forge_float_to_cstr",
         "insert" => "forge_map_insert_cstr",
@@ -428,6 +544,7 @@ fn resolve_func_name(name: &str) -> &str {
         "__index" => "forge_list_get_value",
         "__map_new" => "forge_map_new_default",
         "__set_new" => "forge_set_new_default",
+        "__struct_alloc" => "forge_struct_alloc",
         "push" => "forge_list_push_value",
         "pop" => "forge_list_pop",
         "contains" => "forge_cstring_contains",
@@ -450,6 +567,63 @@ fn resolve_func_name(name: &str) -> &str {
         "dir_exists" => "forge_dir_exists",
         "exec" => "forge_exec",
         "exit" => "forge_exit",
+        "bit_and" => "forge_bit_and",
+        "bit_or" => "forge_bit_or",
+        "bit_xor" => "forge_bit_xor",
+        "bit_not" => "forge_bit_not",
+        "bit_shl" => "forge_bit_shl",
+        "bit_shr" => "forge_bit_shr",
+        "abs" => "forge_abs",
+        "min" => "forge_min",
+        "max" => "forge_max",
+        "random_int" => "forge_random_int",
+        "sha256" => "forge_sha256",
+        "fnv1a" => "forge_fnv1a",
+        "b64_encode" => "forge_b64_encode",
+        "b64_decode" => "forge_b64_decode",
+        "to_hex" => "forge_hex_encode",
+        "from_hex" => "forge_from_hex",
+        "path_join" | "join_path" => "forge_path_join",
+        "path_dir" => "forge_path_dir",
+        "path_base" => "forge_path_base",
+        "path_ext" => "forge_path_ext",
+        "path_stem" => "forge_path_stem",
+        "log_info" => "forge_log_info",
+        "log_warn" => "forge_log_warn",
+        "log_error" => "forge_log_error",
+        "log_debug" => "forge_log_error",
+        "int_to_hex" => "forge_int_to_hex",
+        "int_to_oct" => "forge_int_to_oct",
+        "int_to_bin" => "forge_int_to_bin",
+        "format_int" => "forge_format_int",
+        "parse" => "forge_json_parse",
+        "type_of" => "forge_json_type_of",
+        "get_string" => "forge_json_get_string",
+        "get_int" => "forge_json_get_int",
+        "get_bool" => "forge_json_get_bool",
+        "object_get" => "forge_json_object_get",
+        "object_has" => "forge_json_object_has",
+        "object_keys" => "forge_json_object_keys",
+        "array_len" => "forge_json_array_len",
+        "array_get" => "forge_json_array_get",
+        "make_object" => "forge_json_make_object",
+        "make_array" => "forge_json_make_array",
+        "make_int" => "forge_json_make_int",
+        "make_string" => "forge_json_make_string",
+        "array_push" => "forge_json_array_push",
+        "object_set" => "forge_json_object_set",
+        "encode" => "forge_smart_encode",
+        "scheme" => "forge_url_scheme",
+        "host" => "forge_url_host",
+        "port" => "forge_url_port",
+        "path" => "forge_url_path",
+        "query" => "forge_url_query",
+        "fragment" => "forge_url_fragment",
+        "decode" => "forge_url_decode",
+        "spawn" => "forge_spawn",
+        "await" => "forge_await",
+        "identity" => "forge_identity",
+        "env" => "forge_env",
         "args" => "forge_args_to_list",
         _ => name,
     }

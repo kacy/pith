@@ -362,6 +362,17 @@ fn ir_expr(idx: Int) -> Int:
                 ovt2 := ir_var_types[on2.value]
                 if ovt2 == "list" or ovt2 == "list_string":
                     obj_is_list = true
+        # sort is in-place but callers expect the list returned
+        if mname == "sort" and obj_is_list:
+            # detect string list for sort dispatch
+            mut sort_list_type := "list"
+            if node.children.len() > 0:
+                sn := get_node(node.children[0])
+                if sn.kind == "ident" and ir_var_types.contains_key(sn.value):
+                    if ir_var_types[sn.value] == "list_string":
+                        sort_list_type = "list_string"
+            if sort_list_type == "list_string":
+                mname = "sort_strings"
         if mname == "contains" and obj_is_list:
             mname = "list_contains"
         if mname == "remove" and obj_is_list:
@@ -419,6 +430,10 @@ fn ir_expr(idx: Int) -> Int:
             i = i + 1
         nargs := arg_regs.len() + 1
         ir_emit("call " + r.to_string() + " " + mname + " " + nargs.to_string() + args_s)
+        # void methods return the object itself
+        void_methods := "sort,sort_strings,reverse,clear,push,remove,list_remove,list_clear,list_reverse,map_remove,map_clear,set_remove,set_clear"
+        if void_methods.contains(mname):
+            return obj_r
         return r
 
     if node.kind == "string_interp":

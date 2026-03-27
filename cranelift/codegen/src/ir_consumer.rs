@@ -602,6 +602,7 @@ fn resolve_func_name(name: &str) -> &str {
         "reverse" => "forge_list_reverse_value",
         "set" => "forge_list_set_value",
         "sort" => "forge_list_sort",
+        "sort_strings" => "forge_list_sort_strings",
         "slice" => "forge_list_slice",
         "map_get" => "forge_map_get_cstr",
         "map_len" => "forge_map_len_handle",

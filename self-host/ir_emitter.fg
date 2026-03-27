@@ -45,6 +45,7 @@ mut ir_type_aliases: Map[String, String] := {}  # alias name -> target type
 mut ir_func_returns: Map[String, String] := {}  # function name -> return type hint
 mut ir_lambda_count := 0
 mut ir_lambda_bodies: List[String] := []  # deferred lambda function IR
+mut ir_module_count := 0  # increments per emit_ir call for unique naming
 
 pub fn ir_reset():
     ir_lines = []
@@ -75,16 +76,16 @@ fn ir_strip_quotes(s: String) -> String:
             result = result.substring(0, result.len() - 1)
     return result
 
-fn ir_str(s: String) -> Int:
+fn ir_str(s: String) -> String:
     cleaned := ir_strip_quotes(s)
     mut i := 0
     while i < ir_strings.len():
         if ir_strings[i] == cleaned:
-            return i
+            return "m" + ir_module_count.to_string() + "s" + i.to_string()
         i = i + 1
     idx := ir_strings.len()
     ir_strings.push(cleaned)
-    return idx
+    return "m" + ir_module_count.to_string() + "s" + idx.to_string()
 
 # --- collect strings ---
 fn ir_collect_strings(idx: Int):
@@ -1086,7 +1087,8 @@ pub fn emit_ir(root_idx: Int) -> String:
     # emit string data
     mut i := 0
     while i < ir_strings.len():
-        ir_emit("string " + i.to_string() + " " + chr(34) + ir_strings[i] + chr(34))
+        sid := "m" + ir_module_count.to_string() + "s" + i.to_string()
+        ir_emit("string " + sid + " " + chr(34) + ir_strings[i] + chr(34))
         i = i + 1
 
     # collect type aliases
@@ -1157,4 +1159,5 @@ pub fn emit_ir(root_idx: Int) -> String:
         ir_lines.push(ir_lambda_bodies[li])
         li = li + 1
 
+    ir_module_count = ir_module_count + 1
     return ir_lines.join("\n")

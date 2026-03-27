@@ -42,7 +42,7 @@ pub fn compile_from_ir(
 ) -> Result<HashMap<String, FuncId>, CompileError> {
     let lines: Vec<&str> = ir_text.lines().collect();
     let mut declared_funcs: HashMap<String, FuncId> = HashMap::new();
-    let mut string_data: Vec<(usize, String)> = Vec::new();
+    let mut string_data: Vec<(String, String)> = Vec::new();
     let mut struct_layouts: HashMap<String, Vec<String>> = HashMap::new();
 
     // Pass 1: collect string data and declare functions
@@ -53,7 +53,7 @@ pub fn compile_from_ir(
         }
         match parts[0] {
             "string" if parts.len() >= 3 => {
-                let idx: usize = parts[1].parse().unwrap_or(0);
+                let idx = parts[1].to_string();
                 // Extract quoted string content and process escape sequences
                 let rest = &line[line.find('"').unwrap_or(0)..];
                 let raw = rest.trim_matches('"');
@@ -116,13 +116,13 @@ pub fn compile_from_ir(
     }
 
     // Declare string data functions
-    let mut string_funcs: HashMap<usize, FuncId> = HashMap::new();
+    let mut string_funcs: HashMap<String, FuncId> = HashMap::new();
     for (idx, content) in &string_data {
         let name = format!("__irstr_{}", idx);
         let func_id =
             crate::declare_string_data(&mut codegen.module, &name, content)
                 .map_err(|e| CompileError::ModuleError(format!("string data: {:?}", e)))?;
-        string_funcs.insert(*idx, func_id);
+        string_funcs.insert(idx.clone(), func_id);
     }
 
     // Pass 2: compile function bodies
@@ -182,7 +182,7 @@ fn compile_ir_function(
     body_lines: &[&str],
     runtime_funcs: &HashMap<String, FuncId>,
     declared_funcs: &HashMap<String, FuncId>,
-    string_funcs: &HashMap<usize, FuncId>,
+    string_funcs: &HashMap<String, FuncId>,
     struct_layouts: &HashMap<String, Vec<String>>,
 ) -> Result<(), CompileError> {
     let mut ctx = codegen.module.make_context();
@@ -268,7 +268,7 @@ fn compile_ir_function(
 
             "strref" if parts.len() >= 3 => {
                 let reg: usize = parts[1].parse().unwrap_or(0);
-                let str_idx: usize = parts[2].parse().unwrap_or(0);
+                let str_idx = parts[2].to_string();
                 if let Some(&sf_id) = string_funcs.get(&str_idx) {
                     let sf_ref = codegen.module.declare_func_in_func(sf_id, builder.func);
                     let call = builder.ins().call(sf_ref, &[]);

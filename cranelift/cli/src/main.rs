@@ -506,10 +506,10 @@ fn get_ir_from_compiler(path: &str) -> Result<String, String> {
         .unwrap_or(Path::new("."))
         .join(".forge-build/ir_driver.fg");
 
-    // Generate a tiny driver that parses the file and emits IR
+    // Generate a driver that parses the file with import resolution and emits IR
     let driver_source = format!(
-        "from lexer import lex_all\nfrom parser import parse\nfrom ast import reset_arena\nfrom ir_emitter import emit_ir\n\nfn main():\n    source := read_file(\"{}\")\n    tokens := lex_all(source)\n    reset_arena()\n    root := parse(tokens)\n    ir := emit_ir(root)\n    print(ir)\n",
-        path
+        "from lexer import lex_all\nfrom parser import parse\nfrom ast import reset_arena, get_node\nfrom ir_emitter import emit_ir\nfrom driver import init_driver, resolve_imports\n\nfn emit_module_ir(root_idx: Int):\n    ir := emit_ir(root_idx)\n    print(ir)\n\nfn main():\n    source := read_file(\"{}\")\n    tokens := lex_all(source)\n    reset_arena()\n    root := parse(tokens)\n    init_driver(\"{}\")\n    import_roots := resolve_imports(root, \"{}\")!\n    for imp_root in import_roots:\n        emit_module_ir(imp_root)\n    emit_module_ir(root)\n",
+        path, path, path
     );
 
     // Write the driver in self-host/ so imports resolve correctly

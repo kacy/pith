@@ -263,11 +263,20 @@ fn compile_ir_function(
                 let reg: usize = parts[1].parse().unwrap_or(0);
                 let a = get_reg(&regs, parts[2]);
                 let b = get_reg(&regs, parts[3]);
-                if let Some(&concat_id) = runtime_funcs.get("forge_string_concat") {
+                let concat_name = if runtime_funcs.contains_key("forge_concat_cstr") {
+                    "forge_concat_cstr"
+                } else {
+                    "forge_string_concat"
+                };
+                if let Some(&concat_id) = runtime_funcs.get(concat_name) {
                     let concat_ref =
                         codegen.module.declare_func_in_func(concat_id, builder.func);
                     let call = builder.ins().call(concat_ref, &[a, b]);
-                    regs.insert(reg, builder.func.dfg.first_result(call));
+                    if !builder.func.dfg.inst_results(call).is_empty() {
+                        regs.insert(reg, builder.func.dfg.first_result(call));
+                    } else {
+                        regs.insert(reg, a);
+                    }
                 } else {
                     regs.insert(reg, a);
                 }

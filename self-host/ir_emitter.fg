@@ -60,20 +60,30 @@ fn ir_label() -> String:
     ir_next_label = ir_next_label + 1
     return "L" + n.to_string()
 
+fn ir_strip_quotes(s: String) -> String:
+    mut result := s
+    if result.len() >= 2:
+        if result[0] == chr(34):
+            result = result.substring(1, result.len())
+        if result.len() > 0 and result[result.len() - 1] == chr(34):
+            result = result.substring(0, result.len() - 1)
+    return result
+
 fn ir_str(s: String) -> Int:
+    cleaned := ir_strip_quotes(s)
     mut i := 0
     while i < ir_strings.len():
-        if ir_strings[i] == s:
+        if ir_strings[i] == cleaned:
             return i
         i = i + 1
     idx := ir_strings.len()
-    ir_strings.push(s)
+    ir_strings.push(cleaned)
     return idx
 
 # --- collect strings ---
 fn ir_collect_strings(idx: Int):
     node := get_node(idx)
-    if node.kind == "string_lit" or node.kind == "string":
+    if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
         ir_str(node.value)
     elif node.kind == "lit":
         ir_str(node.value)
@@ -89,7 +99,7 @@ fn ir_expr(idx: Int) -> Int:
         ir_emit("iconst " + r.to_string() + " " + node.value)
         return r
 
-    if node.kind == "string_lit" or node.kind == "string":
+    if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
         si := ir_str(node.value)
         r := ir_reg()
         ir_emit("strref " + r.to_string() + " " + si.to_string())
@@ -230,6 +240,9 @@ fn ir_stmt(idx: Int):
     if node.kind == "call" or node.kind == "method_call":
         ir_expr(idx)
 
+    elif node.kind == "block":
+        ir_block(idx)
+
     elif node.kind == "return":
         if node.children.len() > 0:
             r := ir_expr(node.children[0])
@@ -259,7 +272,7 @@ fn ir_stmt(idx: Int):
             ir_var_regs.insert(name, r)
             ir_emit("store " + name + " " + r.to_string())
 
-    elif node.kind == "if":
+    elif node.kind == "if" or node.kind == "if_stmt":
         # children: condition, then block, optional else block
         mut cond_idx := 0 - 1
         mut then_idx := 0 - 1
@@ -307,14 +320,13 @@ fn ir_stmt(idx: Int):
 # --- emit block ---
 fn ir_block(idx: Int):
     node := get_node(idx)
-    if node.kind == "block":
+    if node.kind == "block" or node.kind == "then" or node.kind == "else":
         for child in node.children:
-            ir_stmt(child)
+            ir_block(child)
     elif node.kind == "body":
         for child in node.children:
             ir_block(child)
     else:
-        # single statement
         ir_stmt(idx)
 
 # --- emit function ---
@@ -340,6 +352,8 @@ fn ir_func(idx: Int):
                 if rcn.kind == "type":
                     ret_type = "i64"
 
+    ir_next_reg = 0
+    ir_var_regs = {}
     ir_emit("func " + name + " " + params.len().to_string() + " " + ret_type)
     mut i := 0
     while i < params.len():

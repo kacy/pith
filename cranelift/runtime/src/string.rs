@@ -540,6 +540,7 @@ pub extern "C" fn forge_bool_to_string(b: bool) -> ForgeString {
 
 /// Simple strlen-based length for null-terminated strings
 #[no_mangle]
+#[no_mangle]
 pub extern "C" fn forge_cstring_len(cstr: *const i8) -> i64 {
     if cstr.is_null() {
         return 0;

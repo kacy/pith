@@ -981,6 +981,9 @@ pub fn declare_runtime_functions(
     )?;
     funcs.insert("forge_cstring_len".to_string(), cstring_len);
 
+    let cstring_is_empty = declare_runtime_function(module, "forge_cstring_is_empty", &[types::I64], &[types::I64])?;
+    funcs.insert("forge_cstring_is_empty".to_string(), cstring_is_empty);
+
     // Filesystem functions
     let file_exists = declare_runtime_function(
         module,

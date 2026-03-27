@@ -77,6 +77,29 @@ fn ir_strip_quotes(s: String) -> String:
             result = result.substring(0, result.len() - 1)
     return result
 
+fn ir_find_free_vars(idx: Int, bound: List[String], free: List[String]):
+    node := get_node(idx)
+    if node.kind == "ident":
+        name := node.value
+        # check if name is bound (param or local)
+        mut is_bound := false
+        mut i := 0
+        while i < bound.len():
+            if bound[i] == name:
+                is_bound = true
+            i = i + 1
+        # check if already in free list
+        mut already_free := false
+        i = 0
+        while i < free.len():
+            if free[i] == name:
+                already_free = true
+            i = i + 1
+        if not is_bound and not already_free:
+            free.push(name)
+    for child in node.children:
+        ir_find_free_vars(child, bound, free)
+
 fn ir_str(s: String) -> String:
     cleaned := ir_strip_quotes(s)
     mut i := 0
@@ -705,6 +728,20 @@ fn ir_expr(idx: Int) -> Int:
                 lparams.push(cn.value)
             elif cn.kind == "body":
                 lbody_idx = child
+        # detect captured variables: free vars in body that aren't params
+        mut captures: List[String] := []
+        if lbody_idx >= 0:
+            ir_find_free_vars(lbody_idx, lparams, captures)
+        # emit capture setup: store captured vars in closure env
+        mut ci := 0
+        while ci < captures.len():
+            cap_val := ir_reg()
+            ir_emit("load " + cap_val.to_string() + " " + captures[ci])
+            slot := ir_reg()
+            ir_emit("iconst " + slot.to_string() + " " + ci.to_string())
+            ir_emit("call " + ir_reg().to_string() + " __closure_set_env 2 " + slot.to_string() + " " + cap_val.to_string())
+            ci = ci + 1
+
         # save current state and emit lambda to deferred buffer
         saved_regs := ir_next_reg
         saved_vars := ir_var_regs
@@ -721,6 +758,16 @@ fn ir_expr(idx: Int) -> Int:
             ir_var_regs.insert(lparams[lpi], lr)
             ir_emit("param " + lparams[lpi])
             lpi = lpi + 1
+        # load captured variables from closure env
+        mut ce := 0
+        while ce < captures.len():
+            cap_r := ir_reg()
+            slot_r := ir_reg()
+            ir_emit("iconst " + slot_r.to_string() + " " + ce.to_string())
+            ir_emit("call " + cap_r.to_string() + " __closure_get_env 1 " + slot_r.to_string())
+            ir_var_regs.insert(captures[ce], cap_r)
+            ir_emit("store " + captures[ce] + " " + cap_r.to_string())
+            ce = ce + 1
         if lbody_idx >= 0:
             body_node := get_node(lbody_idx)
             if body_node.kind == "body" and body_node.children.len() > 0:

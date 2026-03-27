@@ -716,6 +716,8 @@ fn resolve_func_name(name: &str) -> &str {
         "__map_new" => "forge_map_new_default",
         "__set_new" => "forge_set_new_default",
         "__struct_alloc" => "forge_struct_alloc",
+        "__closure_set_env" => "forge_closure_set_env",
+        "__closure_get_env" => "forge_closure_get_env",
         "__str_eq" => "forge_cstring_eq",
         "push" => "forge_list_push_value",
         "pop" => "forge_list_pop",

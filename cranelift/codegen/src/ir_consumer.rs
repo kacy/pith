@@ -89,6 +89,14 @@ pub fn compile_from_ir(
                 crate::register_struct_layout(&name, &field_pairs);
                 struct_layouts.insert(name, fields);
             }
+            "struct_alias" if parts.len() >= 3 => {
+                let alias = parts[1].to_string();
+                let target = parts[2].to_string();
+                crate::register_struct_alias(&alias, &target);
+                if let Some(fields) = struct_layouts.get(&target).cloned() {
+                    struct_layouts.insert(alias, fields);
+                }
+            }
             "func" if parts.len() >= 4 => {
                 let name = parts[1];
                 let nparam: usize = parts[2].parse().unwrap_or(0);

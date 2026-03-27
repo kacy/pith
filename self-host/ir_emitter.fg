@@ -41,6 +41,7 @@ mut ir_strings: List[String] := []
 mut ir_var_regs: Map[String, Int] := {}
 mut ir_var_types: Map[String, String] := {}  # variable name -> type hint ("int", "bool", "string")
 mut ir_struct_names: Map[String, Int] := {}  # struct name -> field count
+mut ir_type_aliases: Map[String, String] := {}  # alias name -> target type
 
 pub fn ir_reset():
     ir_lines = []
@@ -637,6 +638,15 @@ fn ir_stmt(idx: Int):
             ir_var_types.insert(name, "bool")
         elif type_ann == "Int":
             ir_var_types.insert(name, "int")
+        # resolve type aliases
+        elif ir_type_aliases.contains_key(type_ann):
+            resolved := ir_type_aliases[type_ann]
+            if resolved == "Bool":
+                ir_var_types.insert(name, "bool")
+            elif resolved == "String":
+                ir_var_types.insert(name, "string")
+            elif resolved == "Int":
+                ir_var_types.insert(name, "int")
         if val_idx >= 0:
             r := ir_expr(val_idx)
             ir_var_regs.insert(name, r)
@@ -888,6 +898,19 @@ pub fn emit_ir(root_idx: Int) -> String:
         ir_emit("string " + i.to_string() + " " + chr(34) + ir_strings[i] + chr(34))
         i = i + 1
 
+    # collect type aliases
+    ir_type_aliases = {}
+    for child in root.children:
+        cn := get_node(child)
+        if cn.kind == "type_alias":
+            mut target := ""
+            for tc in cn.children:
+                tn := get_node(tc)
+                if tn.kind == "type":
+                    target = tn.value
+            if target.len() > 0:
+                ir_type_aliases.insert(cn.value, target)
+
     # emit struct declarations and register names
     ir_struct_names = {}
     for child in root.children:
@@ -900,6 +923,18 @@ pub fn emit_ir(root_idx: Int) -> String:
                     field_names.push(fn_node.value)
             ir_struct_names.insert(cn.value, field_names.len())
             ir_emit("struct " + cn.value + " " + field_names.join(" "))
+
+    # register type aliases that point to structs
+    for child in root.children:
+        cn := get_node(child)
+        if cn.kind == "type_alias":
+            aname := cn.value
+            if ir_type_aliases.contains_key(aname):
+                target := ir_type_aliases[aname]
+                if ir_struct_names.contains_key(target):
+                    nfields := ir_struct_names[target]
+                    ir_struct_names.insert(aname, nfields)
+                    ir_emit("struct_alias " + aname + " " + target)
 
     # emit functions
     for child in root.children:

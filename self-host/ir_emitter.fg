@@ -1,80 +1,331 @@
-# ir_emitter.fg — proof-of-concept Cranelift IR emitter
+# ir_emitter.fg — Forge-to-IR compiler (Stage 2)
 #
-# this module reads the AST (from the parser) and emits a simple
-# intermediate representation that the Rust backend can translate
-# to Cranelift API calls. this is the first step toward moving
-# compilation logic from Rust to Forge.
+# reads the parsed AST and emits a simple text IR that a thin Rust
+# wrapper translates to Cranelift API calls.
 #
 # IR format:
-#   @str_N = "string content"           — string data declarations
-#   declare @func_name(i64, i64) -> i64 — external function declarations
-#   define func_name(param: i64) -> i64 { — function definitions
-#     %N = iconst VALUE                  — integer constant
-#     %N = call @func(%args)             — function call
-#     %N = add %a, %b                    — arithmetic
-#     %N = icmp eq %a, %b               — comparison
-#     brif %cond, @then, @else          — conditional branch
-#     ret %N                            — return
-#   }
+#   string N "content"                  — string data
+#   func NAME NPARAM RETTYPE            — function header
+#   param NAME                          — function parameter
+#   endfunc                             — end of function
+#   iconst REG VALUE                    — integer constant
+#   strref REG STRIDX                   — reference to string data
+#   call REG FNAME NARGS ARG...         — function call
+#   callv FNAME NARGS ARG...            — void call (no return)
+#   add REG A B                         — integer add
+#   sub REG A B                         — integer sub
+#   mul REG A B                         — integer mul
+#   div REG A B                         — integer div
+#   mod REG A B                         — integer mod
+#   eq REG A B                          — compare equal
+#   neq REG A B                         — compare not equal
+#   lt REG A B                          — compare less than
+#   gt REG A B                          — compare greater than
+#   lte REG A B                         — compare less or equal
+#   gte REG A B                         — compare greater or equal
+#   brif COND THEN_LABEL ELSE_LABEL     — conditional branch
+#   label NAME                          — label
+#   jmp LABEL                           — unconditional jump
+#   ret REG                             — return value
+#   load REG VARNAME                    — load variable
+#   store VARNAME REG                   — store variable
+#   concat REG A B                      — string concatenation
 
 from ast import get_node, Node
 
-# --- IR buffer ---
+# --- state ---
 mut ir_lines: List[String] := []
-mut next_var := 0
-mut string_count := 0
-mut strings: List[String] := []
+mut ir_next_reg := 0
+mut ir_next_label := 0
+mut ir_strings: List[String] := []
+mut ir_var_regs: Map[String, Int] := {}
 
 pub fn ir_reset():
     ir_lines = []
-    next_var = 0
-    string_count = 0
-    strings = []
+    ir_next_reg = 0
+    ir_next_label = 0
+    ir_strings = []
+    ir_var_regs = {}
 
 fn ir_emit(line: String):
     ir_lines.push(line)
 
-fn ir_new_var() -> Int:
-    v := next_var
-    next_var = next_var + 1
-    return v
+fn ir_reg() -> Int:
+    r := ir_next_reg
+    ir_next_reg = ir_next_reg + 1
+    return r
 
-fn register_string(s: String) -> Int:
-    # check if already registered
+fn ir_label() -> String:
+    n := ir_next_label
+    ir_next_label = ir_next_label + 1
+    return "L" + n.to_string()
+
+fn ir_str(s: String) -> Int:
     mut i := 0
-    while i < strings.len():
-        if strings[i] == s:
+    while i < ir_strings.len():
+        if ir_strings[i] == s:
             return i
         i = i + 1
-    idx := string_count
-    strings.push(s)
-    string_count = string_count + 1
+    idx := ir_strings.len()
+    ir_strings.push(s)
     return idx
 
-# --- collect all strings from AST ---
-fn collect_strings_from(node_idx: Int):
-    node := get_node(node_idx)
+# --- collect strings ---
+fn ir_collect_strings(idx: Int):
+    node := get_node(idx)
     if node.kind == "string_lit" or node.kind == "string":
-        register_string(node.value)
+        ir_str(node.value)
+    elif node.kind == "lit":
+        ir_str(node.value)
     for child in node.children:
-        collect_strings_from(child)
+        ir_collect_strings(child)
 
-# --- emit string data declarations ---
-fn emit_string_data():
-    mut i := 0
-    while i < strings.len():
-        ir_emit("@str_" + i.to_string() + " = " + chr(34) + strings[i] + chr(34))
-        i = i + 1
+# --- emit expression, return register ---
+fn ir_expr(idx: Int) -> Int:
+    node := get_node(idx)
 
-# --- emit a function ---
-fn emit_function(node_idx: Int):
-    node := get_node(node_idx)
+    if node.kind == "int_lit" or node.kind == "int" or node.kind == "integer":
+        r := ir_reg()
+        ir_emit("iconst " + r.to_string() + " " + node.value)
+        return r
+
+    if node.kind == "string_lit" or node.kind == "string":
+        si := ir_str(node.value)
+        r := ir_reg()
+        ir_emit("strref " + r.to_string() + " " + si.to_string())
+        return r
+
+    if node.kind == "bool" or node.kind == "bool_lit":
+        r := ir_reg()
+        if node.value == "true":
+            ir_emit("iconst " + r.to_string() + " 1")
+        else:
+            ir_emit("iconst " + r.to_string() + " 0")
+        return r
+
+    if node.kind == "ident":
+        name := node.value
+        if ir_var_regs.contains_key(name):
+            return ir_var_regs[name]
+        r := ir_reg()
+        ir_emit("load " + r.to_string() + " " + name)
+        return r
+
+    if node.kind == "binary":
+        left_r := ir_expr(node.children[0])
+        right_r := ir_expr(node.children[1])
+        r := ir_reg()
+        op := node.value
+        if op == "add":
+            ir_emit("add " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "sub":
+            ir_emit("sub " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "mul":
+            ir_emit("mul " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "div":
+            ir_emit("div " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "mod":
+            ir_emit("mod " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "eq":
+            ir_emit("eq " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "neq":
+            ir_emit("neq " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "lt":
+            ir_emit("lt " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "gt":
+            ir_emit("gt " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "lte":
+            ir_emit("lte " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        elif op == "gte":
+            ir_emit("gte " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        else:
+            ir_emit("binop " + r.to_string() + " " + op + " " + left_r.to_string() + " " + right_r.to_string())
+        return r
+
+    if node.kind == "call":
+        # children: ident (func name), then arg nodes
+        mut fname := "unknown"
+        mut arg_regs: List[Int] := []
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "ident" and fname == "unknown":
+                fname = cn.value
+            elif cn.kind == "arg":
+                if cn.children.len() > 0:
+                    ar := ir_expr(cn.children[0])
+                    arg_regs.push(ar)
+        r := ir_reg()
+        mut args_s := ""
+        mut i := 0
+        while i < arg_regs.len():
+            args_s = args_s + " " + arg_regs[i].to_string()
+            i = i + 1
+        ir_emit("call " + r.to_string() + " " + fname + " " + arg_regs.len().to_string() + args_s)
+        return r
+
+    if node.kind == "method_call":
+        # first child is object, then args. value is method_name (may have leading dot)
+        mname := node.value
+        if mname.starts_with("."):
+            mname = mname.substring(1, mname.len())
+        mut obj_r := 0 - 1
+        mut arg_regs: List[Int] := []
+        for child in node.children:
+            cn := get_node(child)
+            if obj_r < 0:
+                obj_r = ir_expr(child)
+            elif cn.kind == "arg":
+                if cn.children.len() > 0:
+                    ar := ir_expr(cn.children[0])
+                    arg_regs.push(ar)
+        r := ir_reg()
+        mut args_s := " " + obj_r.to_string()
+        mut i := 0
+        while i < arg_regs.len():
+            args_s = args_s + " " + arg_regs[i].to_string()
+            i = i + 1
+        nargs := arg_regs.len() + 1
+        ir_emit("call " + r.to_string() + " " + mname + " " + nargs.to_string() + args_s)
+        return r
+
+    if node.kind == "string_interp":
+        # concatenate literal parts and expression parts
+        mut result_r := 0 - 1
+        for child in node.children:
+            cn := get_node(child)
+            mut part_r := 0
+            if cn.kind == "lit":
+                si := ir_str(cn.value)
+                part_r = ir_reg()
+                ir_emit("strref " + part_r.to_string() + " " + si.to_string())
+            else:
+                part_r = ir_expr(child)
+            if result_r < 0:
+                result_r = part_r
+            else:
+                nr := ir_reg()
+                ir_emit("concat " + nr.to_string() + " " + result_r.to_string() + " " + part_r.to_string())
+                result_r = nr
+        if result_r < 0:
+            result_r = ir_reg()
+            ir_emit("strref " + result_r.to_string() + " " + ir_str("").to_string())
+        return result_r
+
+    if node.kind == "index":
+        obj_r := ir_expr(node.children[0])
+        idx_r := ir_expr(node.children[1])
+        r := ir_reg()
+        ir_emit("call " + r.to_string() + " __index 2 " + obj_r.to_string() + " " + idx_r.to_string())
+        return r
+
+    # fallback
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " 0")
+    return r
+
+# --- emit statement ---
+fn ir_stmt(idx: Int):
+    node := get_node(idx)
+
+    if node.kind == "call" or node.kind == "method_call":
+        ir_expr(idx)
+
+    elif node.kind == "return":
+        if node.children.len() > 0:
+            r := ir_expr(node.children[0])
+            ir_emit("ret " + r.to_string())
+        else:
+            r := ir_reg()
+            ir_emit("iconst " + r.to_string() + " 0")
+            ir_emit("ret " + r.to_string())
+
+    elif node.kind == "bind" or node.kind == "binding":
+        name := node.value
+        # skip type annotation children, find the value expression
+        mut val_idx := 0 - 1
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind != "type":
+                val_idx = child
+        if val_idx >= 0:
+            r := ir_expr(val_idx)
+            ir_var_regs.insert(name, r)
+            ir_emit("store " + name + " " + r.to_string())
+
+    elif node.kind == "assign":
+        name := node.value
+        if node.children.len() > 0:
+            r := ir_expr(node.children[0])
+            ir_var_regs.insert(name, r)
+            ir_emit("store " + name + " " + r.to_string())
+
+    elif node.kind == "if":
+        # children: condition, then block, optional else block
+        mut cond_idx := 0 - 1
+        mut then_idx := 0 - 1
+        mut else_idx := 0 - 1
+        for child in node.children:
+            cn := get_node(child)
+            if cond_idx < 0 and cn.kind != "then" and cn.kind != "else":
+                cond_idx = child
+            elif cn.kind == "then":
+                then_idx = child
+            elif cn.kind == "else":
+                else_idx = child
+        then_label := ir_label()
+        else_label := ir_label()
+        end_label := ir_label()
+        if cond_idx >= 0:
+            cr := ir_expr(cond_idx)
+            ir_emit("brif " + cr.to_string() + " " + then_label + " " + else_label)
+        ir_emit("label " + then_label)
+        if then_idx >= 0:
+            ir_block(then_idx)
+        ir_emit("jmp " + end_label)
+        ir_emit("label " + else_label)
+        if else_idx >= 0:
+            ir_block(else_idx)
+        ir_emit("label " + end_label)
+
+    elif node.kind == "while":
+        head_label := ir_label()
+        body_label := ir_label()
+        end_label := ir_label()
+        ir_emit("label " + head_label)
+        if node.children.len() >= 2:
+            cr := ir_expr(node.children[0])
+            ir_emit("brif " + cr.to_string() + " " + body_label + " " + end_label)
+            ir_emit("label " + body_label)
+            ir_block(node.children[1])
+            ir_emit("jmp " + head_label)
+        ir_emit("label " + end_label)
+
+    elif node.kind == "for":
+        # simplified: for var in iterable: body
+        ir_emit("; for loop (simplified)")
+
+# --- emit block ---
+fn ir_block(idx: Int):
+    node := get_node(idx)
+    if node.kind == "block":
+        for child in node.children:
+            ir_stmt(child)
+    elif node.kind == "body":
+        for child in node.children:
+            ir_block(child)
+    else:
+        # single statement
+        ir_stmt(idx)
+
+# --- emit function ---
+fn ir_func(idx: Int):
+    node := get_node(idx)
     name := node.value
+    ir_var_regs = {}
 
-    # find params and body
     mut params: List[String] := []
     mut body_idx := 0 - 1
-    mut return_type := "i64"
+    mut ret_type := "i64"
 
     for child in node.children:
         cn := get_node(child)
@@ -82,137 +333,47 @@ fn emit_function(node_idx: Int):
             params.push(cn.value)
         elif cn.kind == "body":
             body_idx = child
+        elif cn.kind == "returns":
+            # check for result type
+            for rc in cn.children:
+                rcn := get_node(rc)
+                if rcn.kind == "type":
+                    ret_type = "i64"
 
-    # emit function header
-    mut param_str := ""
+    ir_emit("func " + name + " " + params.len().to_string() + " " + ret_type)
     mut i := 0
     while i < params.len():
-        if i > 0:
-            param_str = param_str + ", "
-        param_str = param_str + params[i] + ": i64"
+        r := ir_reg()
+        ir_var_regs.insert(params[i], r)
+        ir_emit("param " + params[i])
         i = i + 1
-
-    ir_emit("")
-    ir_emit("define " + name + "(" + param_str + ") -> " + return_type + " {")
 
     if body_idx >= 0:
-        emit_block(body_idx)
+        ir_block(body_idx)
 
     # default return
-    v := ir_new_var()
-    ir_emit("  %" + v.to_string() + " = iconst 0")
-    ir_emit("  ret %" + v.to_string())
-    ir_emit("}")
+    dr := ir_reg()
+    ir_emit("iconst " + dr.to_string() + " 0")
+    ir_emit("ret " + dr.to_string())
+    ir_emit("endfunc")
 
-# --- emit a block of statements ---
-fn emit_block(node_idx: Int):
-    node := get_node(node_idx)
-    for child in node.children:
-        emit_stmt(child)
-
-# --- emit a statement ---
-fn emit_stmt(node_idx: Int):
-    node := get_node(node_idx)
-
-    if node.kind == "call":
-        emit_call(node_idx)
-    elif node.kind == "return":
-        if node.children.len() > 0:
-            v := emit_expr(node.children[0])
-            ir_emit("  ret %" + v.to_string())
-    elif node.kind == "bind":
-        if node.children.len() > 0:
-            v := emit_expr(node.children[0])
-            ir_emit("  ; bind " + node.value + " = %" + v.to_string())
-
-# --- emit an expression, return the variable number ---
-fn emit_expr(node_idx: Int) -> Int:
-    node := get_node(node_idx)
-
-    if node.kind == "int_lit" or node.kind == "int" or node.kind == "integer":
-        v := ir_new_var()
-        ir_emit("  %" + v.to_string() + " = iconst " + node.value)
-        return v
-
-    elif node.kind == "string_lit" or node.kind == "string":
-        str_idx := register_string(node.value)
-        v := ir_new_var()
-        ir_emit("  %" + v.to_string() + " = call @str_" + str_idx.to_string() + "()")
-        return v
-
-    elif node.kind == "ident":
-        v := ir_new_var()
-        ir_emit("  %" + v.to_string() + " = load %" + node.value)
-        return v
-
-    elif node.kind == "call":
-        return emit_call(node_idx)
-
-    elif node.kind == "binary":
-        left := emit_expr(node.children[0])
-        right := emit_expr(node.children[1])
-        v := ir_new_var()
-        op := node.value
-        if op == "add" or op == "+":
-            ir_emit("  %" + v.to_string() + " = add %" + left.to_string() + ", %" + right.to_string())
-        elif op == "sub" or op == "-":
-            ir_emit("  %" + v.to_string() + " = sub %" + left.to_string() + ", %" + right.to_string())
-        elif op == "mul" or op == "*":
-            ir_emit("  %" + v.to_string() + " = mul %" + left.to_string() + ", %" + right.to_string())
-        else:
-            ir_emit("  %" + v.to_string() + " = " + op + " %" + left.to_string() + ", %" + right.to_string())
-        return v
-
-    v := ir_new_var()
-    ir_emit("  %" + v.to_string() + " = iconst 0 ; unhandled: " + node.kind)
-    return v
-
-# --- emit a function call ---
-fn emit_call(node_idx: Int) -> Int:
-    node := get_node(node_idx)
-
-    # first child is the function name (ident), rest are args
-    mut func_name := "unknown"
-    mut arg_vars: List[Int] := []
-
-    for child in node.children:
-        cn := get_node(child)
-        if cn.kind == "ident" and func_name == "unknown":
-            func_name = cn.value
-        elif cn.kind == "arg":
-            if cn.children.len() > 0:
-                av := emit_expr(cn.children[0])
-                arg_vars.push(av)
-
-    # build args string
-    mut args_str := ""
-    mut i := 0
-    while i < arg_vars.len():
-        if i > 0:
-            args_str = args_str + ", "
-        args_str = args_str + "%" + arg_vars[i].to_string()
-        i = i + 1
-
-    v := ir_new_var()
-    ir_emit("  %" + v.to_string() + " = call @" + func_name + "(" + args_str + ")")
-    return v
-
-# --- main entry point: emit IR for a module ---
+# --- main entry ---
 pub fn emit_ir(root_idx: Int) -> String:
     ir_reset()
 
     root := get_node(root_idx)
-
-    # first pass: collect strings
-    collect_strings_from(root_idx)
+    ir_collect_strings(root_idx)
 
     # emit string data
-    emit_string_data()
+    mut i := 0
+    while i < ir_strings.len():
+        ir_emit("string " + i.to_string() + " " + chr(34) + ir_strings[i] + chr(34))
+        i = i + 1
 
     # emit functions
     for child in root.children:
         cn := get_node(child)
-        if cn.kind == "fn_decl" or cn.kind == "fn":
-            emit_function(child)
+        if cn.kind == "fn" or cn.kind == "fn_decl":
+            ir_func(child)
 
     return ir_lines.join("\n")

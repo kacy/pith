@@ -190,9 +190,12 @@ fn ir_expr(idx: Int) -> Int:
         mut obj_is_string := false
         if node.children.len() > 0:
             obj_n := get_node(node.children[0])
-            # direct comparison produces bool
-            if obj_n.kind == "binary":
-                obj_op := obj_n.value
+            # direct comparison produces bool (may be wrapped in grouped node)
+            mut check_n := obj_n
+            if check_n.kind == "grouped" and check_n.children.len() > 0:
+                check_n = get_node(check_n.children[0])
+            if check_n.kind == "binary":
+                obj_op := check_n.value
                 if obj_op == "eq" or obj_op == "neq" or obj_op == "lt" or obj_op == "gt" or obj_op == "lte" or obj_op == "gte" or obj_op == "and" or obj_op == "or":
                     obj_is_bool = true
             elif obj_n.kind == "bool_lit":
@@ -276,6 +279,13 @@ fn ir_expr(idx: Int) -> Int:
             elem_r := ir_expr(child)
             ir_emit("call " + ir_reg().to_string() + " __list_push 2 " + list_r.to_string() + " " + elem_r.to_string())
         return list_r
+
+    if node.kind == "grouped":
+        if node.children.len() > 0:
+            return ir_expr(node.children[0])
+        r := ir_reg()
+        ir_emit("iconst " + r.to_string() + " 0")
+        return r
 
     if node.kind == "index":
         obj_r := ir_expr(node.children[0])

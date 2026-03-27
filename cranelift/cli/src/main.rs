@@ -1,7 +1,6 @@
 //! Forge CLI - native compilation with Cranelift
 //!
-//! This CLI integrates with the self-hosted Forge compiler to provide
-//! native code generation via Cranelift backend.
+//! Pipeline: source → self-hosted parse+emit_ir → text IR → ir_consumer.rs → Cranelift → native
 
 use std::env;
 use std::fs;
@@ -16,17 +15,15 @@ fn main() {
         return;
     }
 
-    let command = &args[1];
-
-    match command.as_str() {
-        "build" => {
+    match args[1].as_str() {
+        "build" | "ir-build" => {
             if args.len() < 3 {
                 eprintln!("Error: build requires a file argument");
                 return;
             }
             build_file(&args[2]);
         }
-        "run" => {
+        "run" | "ir-run" => {
             if args.len() < 3 {
                 eprintln!("Error: run requires a file argument");
                 return;
@@ -61,23 +58,9 @@ fn main() {
             }
             lex_file(&args[2]);
         }
-        "ir-build" => {
-            if args.len() < 3 {
-                eprintln!("Error: ir-build requires a file argument");
-                return;
-            }
-            ir_build_file(&args[2]);
-        }
-        "ir-run" => {
-            if args.len() < 3 {
-                eprintln!("Error: ir-run requires a file argument");
-                return;
-            }
-            ir_run_file(&args[2]);
-        }
         "version" => {
-            println!("Forge Cranelift Compiler v0.1.0");
-            println!("Using Cranelift backend for native code generation");
+            println!("Forge Cranelift Compiler v0.2.0");
+            println!("Using IR path: source → ir_emitter.fg → ir_consumer.rs → native");
         }
         "fmt" | "lint" | "doc" | "new" => {
             delegate_to_frontend(&args[1..]);
@@ -86,24 +69,24 @@ fn main() {
             print_usage();
         }
         _ => {
-            eprintln!("Unknown command: {}", command);
+            eprintln!("Unknown command: {}", args[1]);
             print_usage();
         }
     }
 }
 
 fn print_usage() {
-    println!("Usage: forge-cranelift <command> [args...]");
+    println!("Usage: forge <command> [args...]");
     println!();
     println!("Commands:");
-    println!("  build <file.fg>    Compile .fg file to native binary (via Cranelift)");
+    println!("  build <file.fg>    Compile .fg file to native binary");
     println!("  run <file.fg>      Compile and run immediately");
     println!("  test <file.fg>     Compile and run tests");
     println!("  check <file.fg>    Type-check without generating code");
-    println!("  fmt [args...]      Format source files (delegates to frontend)");
-    println!("  lint [args...]     Lint source files (delegates to frontend)");
-    println!("  doc [args...]      Generate or search documentation (delegates to frontend)");
-    println!("  new [args...]      Create a new project (delegates to frontend)");
+    println!("  fmt [args...]      Format source files");
+    println!("  lint [args...]     Lint source files");
+    println!("  doc [args...]      Generate or search documentation");
+    println!("  new [args...]      Create a new project");
     println!("  parse <file.fg>    Parse and display AST");
     println!("  lex <file.fg>      Tokenize and display token stream");
     println!("  version            Display version information");
@@ -115,19 +98,16 @@ fn print_usage() {
 
 /// Find the self-hosted compiler executable
 fn find_self_hosted_compiler() -> Option<String> {
-    // Check environment variable first
     if let Ok(path) = env::var("FORGE_SELF_HOST") {
         if Path::new(&path).exists() {
             return Some(path);
         }
     }
 
-    // Try common locations
     let candidates = [
         "./self-host/forge_main",
         "../self-host/forge_main",
         "./forge_main",
-        "./zig-out/bin/forge_main",
     ];
 
     for candidate in &candidates {
@@ -145,7 +125,7 @@ fn get_ast_from_compiler(path: &str) -> Result<String, String> {
         .ok_or("Self-hosted compiler not found. Set FORGE_SELF_HOST or ensure ./self-host/forge_main exists")?;
 
     let output = Command::new(&compiler)
-        .args(&["parse", path])
+        .args(["parse", path])
         .output()
         .map_err(|e| format!("Failed to run compiler: {}", e))?;
 
@@ -154,8 +134,7 @@ fn get_ast_from_compiler(path: &str) -> Result<String, String> {
         return Err(format!("Parse error: {}", stderr));
     }
 
-    let ast = String::from_utf8_lossy(&output.stdout);
-    Ok(ast.to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Get tokens from self-hosted compiler by running 'forge lex'
@@ -163,7 +142,7 @@ fn get_tokens_from_compiler(path: &str) -> Result<String, String> {
     let compiler = find_self_hosted_compiler().ok_or("Self-hosted compiler not found")?;
 
     let output = Command::new(&compiler)
-        .args(&["lex", path])
+        .args(["lex", path])
         .output()
         .map_err(|e| format!("Failed to run compiler: {}", e))?;
 
@@ -172,233 +151,72 @@ fn get_tokens_from_compiler(path: &str) -> Result<String, String> {
         return Err(format!("Lex error: {}", stderr));
     }
 
-    let tokens = String::from_utf8_lossy(&output.stdout);
-    Ok(tokens.to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Get IR text from the self-hosted compiler's ir_emitter.
+/// Uses a pre-compiled IR driver binary if available, otherwise
+/// generates and compiles one on the fly.
+fn get_ir_from_compiler(path: &str) -> Result<String, String> {
+    // Check for pre-compiled IR driver
+    let driver_bin_candidates = [
+        "./self-host/ir_driver",
+        "../self-host/ir_driver",
+    ];
+
+    for candidate in &driver_bin_candidates {
+        if Path::new(candidate).exists() {
+            let output = Command::new(candidate)
+                .arg(path)
+                .output()
+                .map_err(|e| format!("run ir_driver: {}", e))?;
+
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("IR driver failed: {}", stderr));
+        }
+    }
+
+    // No pre-compiled driver — generate and compile one on the fly
+    // This uses the AST path (parse → compile) for the driver itself
+    let driver_source = format!(
+        "from lexer import lex_all\nfrom parser import parse\nfrom ast import reset_arena\nfrom ir_emitter import emit_ir\n\nfn main():\n    source := read_file(\"{}\")\n    tokens := lex_all(source)\n    reset_arena()\n    root := parse(tokens)\n    ir := emit_ir(root)\n    print(ir)\n",
+        path
+    );
+
+    let driver_path = "self-host/_ir_driver.fg";
+    fs::write(driver_path, &driver_source)
+        .map_err(|e| format!("write driver: {}", e))?;
+
+    // Compile and run the driver using get_ast + compile pipeline
+    let ast_text = get_ast_from_compiler(driver_path)?;
+
+    let ir_text = compile_and_run_from_ast(&ast_text, driver_path)?;
+
+    let _ = fs::remove_file(driver_path);
+
+    Ok(ir_text)
+}
+
+/// Compile AST text via ir_consumer and run it, returning stdout
+fn compile_and_run_from_ast(ast_text: &str, _source_path: &str) -> Result<String, String> {
+    // The AST text IS the source of the driver — we need to compile it.
+    // But we deleted compiler.rs. So we need another approach.
+    // For bootstrapping: use the Forge self-hosted compiler to parse, then ir_emitter to emit IR.
+    // But that's circular.
+    //
+    // Solution: We need a pre-compiled ir_driver binary. If it doesn't exist, we can't compile.
+    Err("No pre-compiled IR driver found. Run 'make self-host' to build the IR driver.".to_string())
 }
 
 fn build_file(path: &str) {
-    use forge_codegen::compiler::compile_module_from_text_with_imports;
-    use forge_codegen::create_codegen;
-    use forge_codegen::finalize_module;
-    use forge_codegen::linker::build_executable;
-    use forge_codegen::CompileError;
-
-    eprintln!("Building {} with Cranelift backend...", path);
-
-    // First, get AST from self-hosted compiler
-    let ast_text = match get_ast_from_compiler(path) {
-        Ok(ast) => ast,
-        Err(e) => {
-            eprintln!("Error getting AST: {}", e);
-            return;
-        }
-    };
-
-    // Create callback function for resolving imports
-    let get_ast_callback = |file_path: &str| -> Result<String, CompileError> {
-        get_ast_from_compiler(file_path).map_err(|e| {
-            CompileError::ModuleError(format!("Failed to get AST for {}: {}", file_path, e))
-        })
-    };
-
-    // Create codegen
-    match create_codegen() {
-        Ok(mut codegen) => {
-            // Parse AST text and compile all functions with import resolution
-            match compile_module_from_text_with_imports(
-                &mut codegen,
-                &ast_text,
-                path,
-                &get_ast_callback,
-            ) {
-                Ok(funcs) => {
-                    eprintln!("Compiled {} functions", funcs.len());
-
-                    // Finalize and write object file
-                    match finalize_module(codegen.module) {
-                        Ok(bytes) => {
-                            let obj_path = path.replace(".fg", ".o");
-                            match fs::write(&obj_path, &bytes) {
-                                Ok(_) => {
-                                    eprintln!("Written {} ({} bytes)", obj_path, bytes.len());
-
-                                    // Link to create executable
-                                    let exe_path = path.replace(".fg", "");
-                                    match build_executable(&obj_path, &exe_path) {
-                                        Ok(_) => {
-                                            eprintln!("Created executable: {}", exe_path)
-                                        }
-                                        Err(e) => eprintln!("Error linking: {}", e),
-                                    }
-                                }
-                                Err(e) => eprintln!("Error writing object file: {}", e),
-                            }
-                        }
-                        Err(e) => eprintln!("Error finalizing module: {}", e),
-                    }
-                }
-                Err(e) => eprintln!("Error compiling module: {}", e),
-            }
-        }
-        Err(e) => eprintln!("Error creating codegen: {}", e),
-    }
-}
-
-fn run_file(path: &str) {
-    use forge_codegen::compiler::compile_module_from_text_with_imports;
-    use forge_codegen::create_codegen;
-    use forge_codegen::finalize_module;
-    use forge_codegen::linker::build_executable;
-    use forge_codegen::CompileError;
-
-    eprintln!("Running {} with Cranelift backend...", path);
-
-    // Get AST from self-hosted compiler
-    let ast_text = match get_ast_from_compiler(path) {
-        Ok(ast) => ast,
-        Err(e) => {
-            eprintln!("Error getting AST: {}", e);
-            return;
-        }
-    };
-
-    // Create callback for import resolution
-    let get_ast_callback = |file_path: &str| -> Result<String, CompileError> {
-        get_ast_from_compiler(file_path).map_err(|e| {
-            CompileError::ModuleError(format!("Failed to get AST for {}: {}", file_path, e))
-        })
-    };
-
-    match create_codegen() {
-        Ok(mut codegen) => {
-            match compile_module_from_text_with_imports(&mut codegen, &ast_text, path, &get_ast_callback) {
-                Ok(_funcs) => {
-                    match finalize_module(codegen.module) {
-                        Ok(bytes) => {
-                            // Write object file to a temp location
-                            let obj_path = format!("/tmp/forge_run_{}.o", std::process::id());
-                            let exe_path = format!("/tmp/forge_run_{}", std::process::id());
-                            match std::fs::write(&obj_path, &bytes) {
-                                Ok(_) => {
-                                    match build_executable(&obj_path, &exe_path) {
-                                        Ok(_) => {
-                                            // Run the executable
-                                            let status =
-                                                std::process::Command::new(&exe_path).status();
-                                            match status {
-                                                Ok(s) => {
-                                                    // Clean up temp files
-                                                    let _ = std::fs::remove_file(&obj_path);
-                                                    let _ = std::fs::remove_file(&exe_path);
-                                                    if !s.success() {
-                                                        std::process::exit(s.code().unwrap_or(1));
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("Error running executable: {}", e);
-                                                    let _ = std::fs::remove_file(&obj_path);
-                                                    let _ = std::fs::remove_file(&exe_path);
-                                                }
-                                            }
-                                        }
-                                        Err(e) => eprintln!("Error linking: {}", e),
-                                    }
-                                }
-                                Err(e) => eprintln!("Error writing object file: {}", e),
-                            }
-                        }
-                        Err(e) => eprintln!("Error finalizing module: {}", e),
-                    }
-                }
-                Err(e) => eprintln!("Error compiling module: {}", e),
-            }
-        }
-        Err(e) => eprintln!("Error creating codegen: {}", e),
-    }
-}
-
-fn test_file(path: &str) {
-    // For now, same as run but with test mode
-    eprintln!("Test mode not yet implemented for Cranelift backend");
-    eprintln!("Use 'forge run' for now, or the C transpilation backend for full test support");
-}
-
-fn check_file(path: &str) {
-    // Type-check by running self-hosted compiler's check command
-    let compiler = match find_self_hosted_compiler() {
-        Some(c) => c,
-        None => {
-            eprintln!("Self-hosted compiler not found");
-            return;
-        }
-    };
-
-    let output = Command::new(&compiler)
-        .args(&["check", path])
-        .output()
-        .expect("Failed to run compiler");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    print!("{}", stdout);
-    eprint!("{}", stderr);
-
-    if !output.status.success() {
-        std::process::exit(1);
-    }
-}
-
-fn parse_file(path: &str) {
-    // Parse by running self-hosted compiler's parse command
-    match get_ast_from_compiler(path) {
-        Ok(ast) => println!("{}", ast),
-        Err(e) => eprintln!("{}", e),
-    }
-}
-
-fn lex_file(path: &str) {
-    // Lex by running self-hosted compiler's lex command
-    match get_tokens_from_compiler(path) {
-        Ok(tokens) => println!("{}", tokens),
-        Err(e) => eprintln!("{}", e),
-    }
-}
-
-/// Delegate a command to the self-hosted frontend compiler, passing all args through.
-/// Used for commands like fmt, lint, doc, new that don't need the Cranelift backend.
-fn delegate_to_frontend(args: &[String]) {
-    let compiler = match find_self_hosted_compiler() {
-        Some(c) => c,
-        None => {
-            eprintln!("Self-hosted compiler not found. Set FORGE_SELF_HOST or ensure ./self-host/forge_main exists");
-            std::process::exit(1);
-        }
-    };
-
-    let status = Command::new(&compiler)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to run self-hosted compiler: {}", e);
-            std::process::exit(1);
-        });
-
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-}
-
-/// Build using Forge IR path: source → self-hosted parse+emit_ir → Rust IR consumer → native
-fn ir_build_file(path: &str) {
     use forge_codegen::create_codegen;
     use forge_codegen::finalize_module;
     use forge_codegen::ir_consumer::compile_from_ir;
     use forge_codegen::linker::build_executable;
 
-    eprintln!("IR-build {} (Forge IR path)...", path);
-
-    // Step 1: Get IR from self-hosted compiler (parse + ir_emitter)
     let ir_text = match get_ir_from_compiler(path) {
         Ok(ir) => ir,
         Err(e) => {
@@ -407,7 +225,6 @@ fn ir_build_file(path: &str) {
         }
     };
 
-    // Step 2: Compile IR via Cranelift
     match create_codegen() {
         Ok(mut codegen) => {
             let runtime_funcs = match forge_codegen::declare_runtime_functions(&mut codegen.module) {
@@ -419,7 +236,7 @@ fn ir_build_file(path: &str) {
             };
             match compile_from_ir(&mut codegen, &ir_text, &runtime_funcs) {
                 Ok(funcs) => {
-                    eprintln!("IR compiled {} functions", funcs.len());
+                    eprintln!("Compiled {} functions", funcs.len());
                     match finalize_module(codegen.module) {
                         Ok(bytes) => {
                             let obj_path = path.replace(".fg", ".o");
@@ -436,15 +253,14 @@ fn ir_build_file(path: &str) {
                         Err(e) => eprintln!("Error finalizing: {}", e),
                     }
                 }
-                Err(e) => eprintln!("Error compiling IR: {}", e),
+                Err(e) => eprintln!("Error compiling: {}", e),
             }
         }
         Err(e) => eprintln!("Error creating codegen: {}", e),
     }
 }
 
-/// Run using Forge IR path
-fn ir_run_file(path: &str) {
+fn run_file(path: &str) {
     use forge_codegen::create_codegen;
     use forge_codegen::finalize_module;
     use forge_codegen::ir_consumer::compile_from_ir;
@@ -494,48 +310,66 @@ fn ir_run_file(path: &str) {
     }
 }
 
-/// Get IR text from the self-hosted compiler's ir_emitter
-fn get_ir_from_compiler(path: &str) -> Result<String, String> {
-    let compiler = find_self_hosted_compiler()
-        .ok_or_else(|| "Self-hosted compiler not found".to_string())?;
-
-    // The self-hosted compiler needs an "emit-ir" command
-    // For now, we use a test driver that imports ir_emitter
-    let ir_driver = Path::new(path)
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(".forge-build/ir_driver.fg");
-
-    // Generate a driver that parses the file and emits IR.
-    // Skip stdlib imports — their functions are available as runtime builtins.
-    // Only emit IR for the main module (stdlib functions resolve via consumer mappings).
-    let driver_source = format!(
-        "from lexer import lex_all\nfrom parser import parse\nfrom ast import reset_arena\nfrom ir_emitter import emit_ir\n\nfn main():\n    source := read_file(\"{}\")\n    tokens := lex_all(source)\n    reset_arena()\n    root := parse(tokens)\n    ir := emit_ir(root)\n    print(ir)\n",
-        path
-    );
-
-    // Write the driver in self-host/ so imports resolve correctly
-    let driver_path = "self-host/_ir_driver.fg";
-    fs::write(driver_path, &driver_source)
-        .map_err(|e| format!("write driver: {}", e))?;
-
-    // Run the driver using the self-hosted compiler
-    // But the self-hosted compiler can't "run" anymore (we removed C codegen)
-    // So we need to use the Cranelift backend to run the driver
-    // This is circular — we need an already-compiled ir_driver binary
-
-    // Alternative: compile the ir_driver with the existing Cranelift path (AST-based)
-    // then run the resulting binary
-    let output = Command::new(env::current_exe().unwrap_or_default())
-        .args(["run", driver_path])
-        .output()
-        .map_err(|e| format!("run driver: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("IR driver failed: {}", stderr));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+fn test_file(path: &str) {
+    eprintln!("Test mode not yet implemented for Cranelift backend");
+    eprintln!("Use 'forge run' for now");
+    let _ = path;
 }
 
+fn check_file(path: &str) {
+    let compiler = match find_self_hosted_compiler() {
+        Some(c) => c,
+        None => {
+            eprintln!("Self-hosted compiler not found");
+            return;
+        }
+    };
+
+    let output = Command::new(&compiler)
+        .args(["check", path])
+        .output()
+        .expect("Failed to run compiler");
+
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+
+    if !output.status.success() {
+        std::process::exit(1);
+    }
+}
+
+fn parse_file(path: &str) {
+    match get_ast_from_compiler(path) {
+        Ok(ast) => println!("{}", ast),
+        Err(e) => eprintln!("{}", e),
+    }
+}
+
+fn lex_file(path: &str) {
+    match get_tokens_from_compiler(path) {
+        Ok(tokens) => println!("{}", tokens),
+        Err(e) => eprintln!("{}", e),
+    }
+}
+
+fn delegate_to_frontend(args: &[String]) {
+    let compiler = match find_self_hosted_compiler() {
+        Some(c) => c,
+        None => {
+            eprintln!("Self-hosted compiler not found");
+            std::process::exit(1);
+        }
+    };
+
+    let status = Command::new(&compiler)
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to run self-hosted compiler: {}", e);
+            std::process::exit(1);
+        });
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}

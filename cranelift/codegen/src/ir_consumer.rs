@@ -45,6 +45,7 @@ pub fn compile_from_ir(
     let mut string_data: Vec<(String, String)> = Vec::new();
     let mut struct_layouts: HashMap<String, Vec<String>> = HashMap::new();
     let mut global_data: HashMap<String, cranelift_module::DataId> = HashMap::new();
+    let mut str_globals: Vec<(String, String)> = Vec::new(); // (global_name, string_id)
 
     // Pass 1: collect string data and declare functions
     for line in &lines {
@@ -103,14 +104,19 @@ pub fn compile_from_ir(
                     let init_val: i64 = if init_kind == "list" || init_kind == "map" || init_kind == "set" {
                         0
                     } else if init_kind.starts_with("str:") {
-                        0
+                        0 // will be patched in __init_globals
                     } else {
                         init_kind.parse().unwrap_or(0)
                     };
                     desc.define(init_val.to_le_bytes().to_vec().into_boxed_slice());
                     codegen.module.define_data(data_id, &desc)
                         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-                    global_data.insert(gname, data_id);
+                    global_data.insert(gname.clone(), data_id);
+                    // Track str: globals that need runtime initialization
+                    if init_kind.starts_with("str:") {
+                        let str_id = &init_kind[4..]; // e.g., "m0s0"
+                        str_globals.push((gname, str_id.to_string()));
+                    }
                 }
             }
             "struct_alias" if parts.len() >= 3 => {
@@ -201,6 +207,7 @@ pub fn compile_from_ir(
                 &string_funcs,
                 &struct_layouts,
                 &global_data,
+                &str_globals,
             )?;
         }
     }
@@ -219,6 +226,7 @@ fn compile_ir_function(
     string_funcs: &HashMap<String, FuncId>,
     struct_layouts: &HashMap<String, Vec<String>>,
     global_data: &HashMap<String, cranelift_module::DataId>,
+    str_globals: &[(String, String)],
 ) -> Result<(), CompileError> {
     let mut ctx = codegen.module.make_context();
 
@@ -261,6 +269,17 @@ fn compile_ir_function(
         if let Some(&init_id) = declared_funcs.get("__init_globals") {
             let init_ref = codegen.module.declare_func_in_func(init_id, builder.func);
             builder.ins().call(init_ref, &[]);
+        }
+        // Initialize str: globals — call string function and store result
+        for (gname, str_id) in str_globals.iter() {
+            if let (Some(&data_id), Some(&sfunc_id)) = (global_data.get(gname.as_str()), string_funcs.get(str_id.as_str())) {
+                let sf_ref = codegen.module.declare_func_in_func(sfunc_id, builder.func);
+                let str_val = builder.ins().call(sf_ref, &[]);
+                let str_result = builder.func.dfg.first_result(str_val);
+                let gv = codegen.module.declare_data_in_func(data_id, builder.func);
+                let addr = builder.ins().global_value(types::I64, gv);
+                builder.ins().store(cranelift::codegen::ir::MemFlags::new(), str_result, addr, 0);
+            }
         }
     }
 

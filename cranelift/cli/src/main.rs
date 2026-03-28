@@ -179,11 +179,62 @@ fn run_ir_driver(driver: &str, path: &str, module_index: usize) -> Result<String
     if module_index == 0 {
         return Ok(ir);
     }
-    // Rename m0sN → m{module_index}sN to avoid string ID collisions
-    let ir = ir.replace("m0s", &format!("m{}s", module_index));
-    // Rename __init_globals → __init_globals_N to avoid duplicate definitions
-    let ir = ir.replace("__init_globals", &format!("__init_globals_{}", module_index));
-    Ok(ir)
+    let prefix = format!("m{}_", module_index);
+
+    // Collect global names from "global NAME ..." lines
+    let global_names: Vec<String> = ir.lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && parts[0] == "global" {
+                Some(parts[1].to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Rename string IDs, __init_globals, and globals
+    let mut result = String::new();
+    for line in ir.lines() {
+        let mut new_line = line.replace("m0s", &format!("m{}s", module_index));
+
+        // Rename __init_globals
+        new_line = new_line.replace("__init_globals", &format!("__init_globals_{}", module_index));
+
+        // Rename globals in "global NAME", "store NAME", "load R NAME" lines
+        let parts: Vec<&str> = new_line.split_whitespace().collect();
+        if !parts.is_empty() {
+            match parts[0] {
+                "global" if parts.len() >= 2 => {
+                    let old = parts[1];
+                    if !old.starts_with("__for_") { // don't rename loop vars
+                        new_line = new_line.replacen(old, &format!("{}{}", prefix, old), 1);
+                    }
+                }
+                "store" if parts.len() >= 3 => {
+                    let name = parts[1];
+                    if global_names.iter().any(|g| g == name) {
+                        new_line = new_line.replacen(name, &format!("{}{}", prefix, name), 1);
+                    }
+                }
+                "load" if parts.len() >= 3 => {
+                    let name = parts[2];
+                    if global_names.iter().any(|g| g == name) {
+                        // Replace the global name (second occurrence after "load REG")
+                        let pos = new_line.rfind(name).unwrap_or(0);
+                        if pos > 0 {
+                            new_line = format!("{}{}{}{}", &new_line[..pos], prefix, name, &new_line[pos+name.len()..]);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        result.push_str(&new_line);
+        result.push('\n');
+    }
+    Ok(result)
 }
 
 /// Find the stdlib root directory by walking up from the source file and CWD

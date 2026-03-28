@@ -1,0 +1,96 @@
+## std.csv — CSV parsing and encoding
+##
+## Functions:
+##   parse(text: String) -> List[List[String]]
+##   parse_with_headers(text: String) -> List[Map[String, String]]
+##   encode(rows: List[List[String]]) -> String
+##   encode_row(row: List[String]) -> String
+
+## Parse CSV text into a list of rows, each row a list of fields
+pub fn parse(text: String) -> List[List[String]]:
+    mut rows: List[List[String]] := []
+    lines := text.split("\n")
+    mut i := 0
+    while i < lines.len():
+        line := lines[i].trim()
+        if line.len() > 0:
+            rows.push(parse_row(line))
+        i = i + 1
+    return rows
+
+## Parse CSV text with the first row as headers.
+## Returns a list of maps, one per data row.
+pub fn parse_with_headers(text: String) -> List[Map[String, String]]:
+    all_rows := parse(text)
+    mut result: List[Map[String, String]] := []
+    if all_rows.len() < 2:
+        return result
+    headers := all_rows[0]
+    mut i := 1
+    while i < all_rows.len():
+        row := all_rows[i]
+        mut record: Map[String, String] := {}
+        mut j := 0
+        while j < headers.len():
+            if j < row.len():
+                record.insert(headers[j], row[j])
+            else:
+                record.insert(headers[j], "")
+            j = j + 1
+        result.push(record)
+        i = i + 1
+    return result
+
+## Encode a list of rows into CSV text
+pub fn encode(rows: List[List[String]]) -> String:
+    mut lines: List[String] := []
+    mut i := 0
+    while i < rows.len():
+        lines.push(encode_row(rows[i]))
+        i = i + 1
+    return lines.join("\n")
+
+## Encode a single row into a CSV line
+pub fn encode_row(row: List[String]) -> String:
+    mut fields: List[String] := []
+    mut i := 0
+    while i < row.len():
+        field := row[i]
+        if field.contains(",") or field.contains(chr(34)) or field.contains("\n"):
+            # quote the field: escape internal quotes by doubling them
+            escaped := field.replace(chr(34), chr(34) + chr(34))
+            fields.push(chr(34) + escaped + chr(34))
+        else:
+            fields.push(field)
+        i = i + 1
+    return fields.join(",")
+
+# Parse a single CSV line into fields (handles quoted fields)
+fn parse_row(line: String) -> List[String]:
+    mut fields: List[String] := []
+    mut current := ""
+    mut in_quotes := false
+    mut i := 0
+    while i < line.len():
+        c := line[i]
+        if in_quotes:
+            if c == chr(34):
+                # check for escaped quote (doubled)
+                if i + 1 < line.len() and line[i + 1] == chr(34):
+                    current = current + chr(34)
+                    i = i + 1
+                else:
+                    in_quotes = false
+            else:
+                current = current + c
+        else:
+            if c == chr(34):
+                in_quotes = true
+            elif c == ",":
+                fields.push(current.trim())
+                current = ""
+            else:
+                current = current + c
+        i = i + 1
+    fields.push(current.trim())
+    return fields

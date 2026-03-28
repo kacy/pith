@@ -1,0 +1,44 @@
+# UUID v4 generation
+
+fn uuid_v4() -> String:
+    hex_chars := "0123456789abcdef"
+    mut parts: List[String] := []
+    mut i := 0
+    while i < 8:
+        parts.push(hex_chars[random_int(0, 15)])
+        i = i + 1
+    parts.push("-")
+    i = 0
+    while i < 4:
+        parts.push(hex_chars[random_int(0, 15)])
+        i = i + 1
+    parts.push("-4")
+    i = 0
+    while i < 3:
+        parts.push(hex_chars[random_int(0, 15)])
+        i = i + 1
+    parts.push("-")
+    variant := "89ab"
+    parts.push(variant[random_int(0, 3)])
+    i = 0
+    while i < 3:
+        parts.push(hex_chars[random_int(0, 15)])
+        i = i + 1
+    parts.push("-")
+    i = 0
+    while i < 12:
+        parts.push(hex_chars[random_int(0, 15)])
+        i = i + 1
+    return parts.join("")
+
+fn main():
+    random_seed(42)
+
+    id1 := uuid_v4()
+    id2 := uuid_v4()
+
+    print("len: " + id1.len().to_string())
+    print("has hyphens: " + id1.contains("-").to_string())
+    print("version: " + id1[14])
+    print("unique: " + (id1 != id2).to_string())
+    print("uuid ops work")

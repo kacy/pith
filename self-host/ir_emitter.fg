@@ -382,72 +382,24 @@ fn ir_emit_string_interp(idx: Int) -> Int:
             ir_emit("strref " + part_r.to_string() + " " + si.to_string())
         else:
             part_r = ir_expr(child)
-            # wrap non-string expressions in to_string for concat
-            # methods that return strings: trim, substring, split, join, etc.
-            needs_convert := true
-            if cn.kind == "ident":
-                # default: assume ident is a string (common in interp)
-                # only convert if we know it's non-string
-                needs_convert = false
-                iname := cn.value
-                if ir_var_types.contains_key(iname):
-                    vt := ir_var_types[iname]
-                    if vt == "int":
-                        needs_convert = true
-                    elif vt == "bool":
-                        # use bool_to_string
-                        br := ir_reg()
-                        ir_emit("call " + br.to_string() + " bool_to_string 1 " + part_r.to_string())
-                        part_r = br
-                    elif vt == "float":
-                        # use float_to_string
-                        fr := ir_reg()
-                        ir_emit("call " + fr.to_string() + " float_to_string 1 " + part_r.to_string())
-                        part_r = fr
-            elif cn.kind == "string_lit" or cn.kind == "string":
-                needs_convert = false
-            elif cn.kind == "method_call":
-                meth := cn.value
-                if meth.starts_with("."):
-                    meth = meth.substring(1, meth.len())
-                if STRING_RETURNING_METHODS.contains(meth):
-                    needs_convert = false
-                elif meth == "to_string":
-                    needs_convert = false
-                if BOOL_RETURNING_METHODS.contains(meth):
-                    needs_convert = true  # but use bool_to_string
-                    ts_r2 := ir_reg()
-                    ir_emit("call " + ts_r2.to_string() + " bool_to_string 1 " + part_r.to_string())
-                    part_r = ts_r2
-                    needs_convert = false
-            elif cn.kind == "index":
-                # list/string index in interp — often returns a string (from List[String] or s[i])
-                # check if the indexed object is a known string list
-                if cn.children.len() > 0:
-                    idx_obj := get_node(cn.children[0])
-                    if idx_obj.kind == "ident":
-                        if ir_var_types.contains_key(idx_obj.value):
-                            otype := ir_var_types[idx_obj.value]
-                            if otype == "list_string" or otype == "string":
-                                needs_convert = false
-            elif cn.kind == "call":
-                # check if it's a known string/bool-returning function
-                if cn.children.len() > 0:
-                    call_fn := get_node(cn.children[0])
-                    if call_fn.kind == "ident":
-                        fname := call_fn.value
-                        if fname == "chr" or fname == "read_file" or fname == "env":
-                            needs_convert = false
-                        # bool-returning functions need bool_to_string in interp
-                        bool_call_fns := "get_bool,object_has,has,file_exists,dir_exists"
-                        if bool_call_fns.contains(fname):
-                            br := ir_reg()
-                            ir_emit("call " + br.to_string() + " bool_to_string 1 " + part_r.to_string())
-                            part_r = br
-                            needs_convert = false
-            if needs_convert:
+            # wrap non-string expressions with appropriate to_string
+            expr_type := ir_infer_type(child)
+            if expr_type == "bool":
+                br := ir_reg()
+                ir_emit("call " + br.to_string() + " bool_to_string 1 " + part_r.to_string())
+                part_r = br
+            elif expr_type == "float":
+                fr := ir_reg()
+                ir_emit("call " + fr.to_string() + " float_to_string 1 " + part_r.to_string())
+                part_r = fr
+            elif expr_type == "int":
                 ts_r := ir_reg()
                 ir_emit("call " + ts_r.to_string() + " to_string 1 " + part_r.to_string())
+                part_r = ts_r
+            elif expr_type == "":
+                # unknown type — use smart_to_string for safety
+                ts_r := ir_reg()
+                ir_emit("call " + ts_r.to_string() + " smart_to_string 1 " + part_r.to_string())
                 part_r = ts_r
         if result_r < 0:
             result_r = part_r

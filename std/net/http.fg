@@ -1,67 +1,140 @@
-# std.net.http — HTTP protocol utilities
-#
-# HTTP constants and helper functions for building HTTP responses.
-# Useful for implementing simple HTTP servers.
-#
-#   from std.net.http import MIME_HTML, STATUS_OK, html_response
-#   response := html_response("<h1>Hello World</h1>")
+## std.net.http — HTTP request parsing, response building, and client
+##
+## Functions:
+##   parse_request(raw: String) -> Request
+##   respond(status: Int, content_type: String, body: String) -> String
+##   text_response(status: Int, body: String) -> String
+##   html_response(status: Int, body: String) -> String
+##   json_response(status: Int, body: String) -> String
+##   get(host: String, port: Int, path: String) -> String
 
-# ===============================================================
-# Content Type Constants
-# ===============================================================
-
-# Plain text content type
+# --- MIME type constants ---
 pub MIME_TEXT := "text/plain"
-
-# HTML content type
 pub MIME_HTML := "text/html"
-
-# JSON content type
 pub MIME_JSON := "application/json"
-
-# JavaScript content type
 pub MIME_JS := "application/javascript"
-
-# CSS content type
 pub MIME_CSS := "text/css"
+pub MIME_FORM := "application/x-www-form-urlencoded"
 
-# ===============================================================
-# HTTP Status Codes
-# ===============================================================
-
-# 200 OK - successful request
+# --- Status code constants ---
 pub STATUS_OK := 200
-
-# 404 Not Found - resource not found
+pub STATUS_CREATED := 201
 pub STATUS_NOT_FOUND := 404
-
-# 500 Internal Server Error - server error
+pub STATUS_BAD_REQUEST := 400
 pub STATUS_SERVER_ERROR := 500
 
-# ===============================================================
-# HTTP Response Builders
-# ===============================================================
+# --- HTTP request ---
 
-# Builds a complete HTTP response with status, content type, and body.
-# Automatically sets Content-Length header.
-pub fn build_response(status: Int, content_type: String, body: String) -> String:
-    mut response := "HTTP/1.1 "
-    response = response + status.to_string()
-    response = response + " OK\r\n"
-    response = response + "Content-Type: "
-    response = response + content_type
-    response = response + "\r\n"
-    response = response + "Content-Length: "
-    response = response + body.len().to_string()
-    response = response + "\r\n"
-    response = response + "\r\n"
-    response = response + body
+struct Request:
+    pub method: String
+    pub path: String
+    pub version: String
+    pub body: String
+    pub header_count: Int
+
+## Parse a raw HTTP request string into a Request struct
+pub fn parse_request(raw: String) -> Request:
+    # split on double newline to separate headers from body
+    nl := chr(10)
+    mut header_part := raw
+    mut body := ""
+    mut i := 0
+    while i < raw.len() - 1:
+        if raw[i] == nl:
+            # check for \n\n or \r\n\r\n
+            if i + 1 < raw.len() and raw[i + 1] == nl:
+                header_part = raw.substring(0, i)
+                body = raw.substring(i + 2, raw.len())
+                break
+            elif i + 2 < raw.len() and raw[i + 1] == chr(13) and raw[i + 2] == nl:
+                header_part = raw.substring(0, i)
+                body = raw.substring(i + 3, raw.len())
+                break
+        i = i + 1
+
+    # parse request line
+    lines := header_part.split(nl)
+    mut method := "GET"
+    mut path := "/"
+    mut version := "HTTP/1.1"
+    mut hdr_count := 0
+
+    if lines.len() > 0:
+        request_line := lines[0].trim()
+        parts := request_line.split(" ")
+        if parts.len() >= 1:
+            method = parts[0]
+        if parts.len() >= 2:
+            path = parts[1]
+        if parts.len() >= 3:
+            version = parts[2]
+        hdr_count = lines.len() - 1
+
+    return Request(method, path, version, body, hdr_count)
+
+# --- HTTP response building ---
+
+## Build a full HTTP response string
+pub fn respond(status: Int, content_type: String, body: String) -> String:
+    mut status_text := "OK"
+    if status == 201:
+        status_text = "Created"
+    elif status == 204:
+        status_text = "No Content"
+    elif status == 301:
+        status_text = "Moved Permanently"
+    elif status == 400:
+        status_text = "Bad Request"
+    elif status == 401:
+        status_text = "Unauthorized"
+    elif status == 403:
+        status_text = "Forbidden"
+    elif status == 404:
+        status_text = "Not Found"
+    elif status == 500:
+        status_text = "Internal Server Error"
+    crlf := chr(13) + chr(10)
+    mut resp := "HTTP/1.1 " + status.to_string() + " " + status_text + crlf
+    resp = resp + "Content-Type: " + content_type + crlf
+    resp = resp + "Content-Length: " + body.len().to_string() + crlf
+    resp = resp + "Connection: close" + crlf
+    resp = resp + crlf
+    resp = resp + body
+    return resp
+
+## Build a plain text response
+pub fn text_response(status: Int, body: String) -> String:
+    return respond(status, MIME_TEXT, body)
+
+## Build an HTML response
+pub fn html_response(status: Int, body: String) -> String:
+    return respond(status, MIME_HTML, body)
+
+## Build a JSON response
+pub fn json_response(status: Int, body: String) -> String:
+    return respond(status, MIME_JSON, body)
+
+# --- HTTP client ---
+
+## Make a simple HTTP GET request. Returns the response body (blocking, no TLS).
+pub fn get(host: String, port: Int, path: String) -> String:
+    conn := tcp_connect(host, port)
+    if conn < 0:
+        return ""
+    crlf := chr(13) + chr(10)
+    req := "GET " + path + " HTTP/1.1" + crlf + "Host: " + host + crlf + "Connection: close" + crlf + crlf
+    tcp_write(conn, req)
+    # read response chunks
+    mut response := ""
+    mut chunk := tcp_read(conn)
+    while chunk.len() > 0:
+        response = response + chunk
+        chunk = tcp_read(conn)
+    tcp_close(conn)
+    # strip headers — find double CRLF
+    mut hi := 0
+    while hi < response.len() - 3:
+        if response[hi] == chr(13) and response[hi + 2] == chr(13):
+            return response.substring(hi + 4, response.len())
+        hi = hi + 1
     return response
-
-# Builds a simple HTTP 200 OK response with HTML content.
-pub fn html_response(html: String) -> String:
-    return build_response(200, MIME_HTML, html)
-
-# Builds a simple HTTP 200 OK response with JSON content.
-pub fn json_response(json: String) -> String:
-    return build_response(200, MIME_JSON, json)

@@ -1,0 +1,60 @@
+# HTTP request parsing and response building (inline, no imports)
+
+struct Request:
+    method: String
+    path: String
+    version: String
+    body: String
+    header_count: Int
+
+fn parse_request(raw: String) -> Request:
+    nl := chr(10)
+    mut header_part := raw
+    mut body := ""
+    mut i := 0
+    while i < raw.len() - 1:
+        if raw[i] == nl and i + 1 < raw.len() and raw[i + 1] == nl:
+            header_part = raw.substring(0, i)
+            body = raw.substring(i + 2, raw.len())
+            break
+        i = i + 1
+    lines := header_part.split(nl)
+    mut method := "GET"
+    mut path := "/"
+    mut version := "HTTP/1.1"
+    mut hdr_count := 0
+    if lines.len() > 0:
+        request_line := lines[0].trim()
+        parts := request_line.split(" ")
+        if parts.len() >= 1:
+            method = parts[0]
+        if parts.len() >= 2:
+            path = parts[1]
+        if parts.len() >= 3:
+            version = parts[2]
+        hdr_count = lines.len() - 1
+    return Request(method, path, version, body, hdr_count)
+
+fn respond(status: Int, body: String) -> String:
+    return "HTTP/1.1 " + status.to_string() + " OK" + chr(10) + body
+
+fn main():
+    # parse a GET request
+    nl := chr(10)
+    raw := "GET /api/users HTTP/1.1" + nl + "Host: example.com" + nl + nl
+    req := parse_request(raw)
+    print("method: " + req.method)
+    print("path: " + req.path)
+    print("headers: " + req.header_count.to_string())
+
+    # parse a POST with body
+    raw2 := "POST /login HTTP/1.1" + nl + "Content-Type: json" + nl + nl + "hello body"
+    req2 := parse_request(raw2)
+    print("post method: " + req2.method)
+    print("post body: " + req2.body)
+
+    # build response
+    resp := respond(200, "hello")
+    print("has 200: " + resp.contains("200").to_string())
+
+    print("http parsing works")

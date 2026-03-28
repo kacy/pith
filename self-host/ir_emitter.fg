@@ -1057,77 +1057,11 @@ fn ir_stmt(idx: Int):
             r := ir_expr(val_idx)
             ir_var_regs.insert(name, r)
             ir_emit("store " + name + " " + r.to_string())
-            # track type from value expression
-            vn := get_node(val_idx)
-            if vn.kind == "binary":
-                vop := vn.value
-                if vop == "eq" or vop == "neq" or vop == "lt" or vop == "gt" or vop == "lte" or vop == "gte" or vop == "and" or vop == "or":
-                    ir_var_types.insert(name, "bool")
-            elif vn.kind == "string_lit" or vn.kind == "string" or vn.kind == "string_interp":
-                ir_var_types.insert(name, "string")
-            elif vn.kind == "bool_lit":
-                ir_var_types.insert(name, "bool")
-            elif vn.kind == "float_lit" or vn.kind == "float":
-                ir_var_types.insert(name, "float")
-            elif vn.kind == "int_lit" or vn.kind == "int" or vn.kind == "integer":
-                ir_var_types.insert(name, "int")
-            elif vn.kind == "method_call":
-                mv := vn.value
-                if mv.starts_with("."):
-                    mv = mv.substring(1, mv.len())
-                if mv == "split" or mv == "keys" or mv == "values" or mv == "chars":
-                    ir_var_types.insert(name, "list_string")
-                elif mv == "trim" or mv == "substring" or mv == "to_upper" or mv == "to_lower" or mv == "replace" or mv == "join" or mv == "reverse" or mv == "to_string":
-                    ir_var_types.insert(name, "string")
-                elif mv == "contains" or mv == "starts_with" or mv == "ends_with" or mv == "is_empty" or mv == "contains_key":
-                    ir_var_types.insert(name, "bool")
-                elif mv == "to_float":
-                    ir_var_types.insert(name, "float")
-            elif vn.kind == "call":
-                # check if calling a known string-returning function
-                if vn.children.len() > 0:
-                    cfn := get_node(vn.children[0])
-                    if cfn.kind == "ident":
-                        cf := cfn.value
-                        if STRING_RETURNING_FUNCS.contains(cf):
-                            ir_var_types.insert(name, "string")
-                        elif INT_RETURNING_FUNCS.contains(cf):
-                            ir_var_types.insert(name, "int")
-                        elif FLOAT_RETURNING_FUNCS.contains(cf):
-                            ir_var_types.insert(name, "float")
-                        # check user-defined function return types
-                        elif ir_func_returns.contains_key(cf):
-                            frt := ir_func_returns[cf]
-                            if frt == "String":
-                                ir_var_types.insert(name, "string")
-                            elif frt == "Int":
-                                ir_var_types.insert(name, "int")
-                            elif frt == "Bool":
-                                ir_var_types.insert(name, "bool")
-                            elif frt == "Map" or frt.contains("Map"):
-                                ir_var_types.insert(name, "map")
-                            elif frt == "Set" or frt.contains("Set"):
-                                ir_var_types.insert(name, "set")
-                            elif frt == "List" or frt.contains("List"):
-                                ir_var_types.insert(name, "list")
-            elif vn.kind == "map":
-                if not ir_var_types.contains_key(name):
-                    ir_var_types.insert(name, "map")
-            elif vn.kind == "set":
-                if not ir_var_types.contains_key(name):
-                    ir_var_types.insert(name, "set")
-            elif vn.kind == "list":
-                # check if elements are strings
-                mut is_str_list := false
-                if vn.children.len() > 0:
-                    first_elem := get_node(vn.children[0])
-                    if first_elem.kind == "string_lit" or first_elem.kind == "string":
-                        is_str_list = true
-                if not ir_var_types.contains_key(name):
-                    if is_str_list:
-                        ir_var_types.insert(name, "list_string")
-                    else:
-                        ir_var_types.insert(name, "list")
+            # track type from value expression using centralized inference
+            if not ir_var_types.contains_key(name):
+                inferred := ir_infer_type(val_idx)
+                if inferred.len() > 0:
+                    ir_var_types.insert(name, inferred)
 
     elif node.kind == "assign":
         name := node.value

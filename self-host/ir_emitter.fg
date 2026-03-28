@@ -33,6 +33,15 @@
 
 from ast import get_node, Node
 
+# --- type knowledge constants (single source of truth) ---
+FLOAT_RETURNING_FUNCS := "pow,sqrt,floor,ceil,round,to_float,get_float"
+BOOL_RETURNING_FUNCS := "file_exists,dir_exists,get_bool,object_has,has"
+INT_RETURNING_FUNCS := "abs,min,max,clamp,len,fnv1a,ord,exec"
+STRING_RETURNING_FUNCS := "sha256,hex_encode,hex_decode,from_hex,to_hex,b64_encode,b64_decode,chr,read_file,env,path_join,path_dir,path_base,path_ext,path_stem,scheme,host,query,fragment,decode,exec_output,type_of,get_string"
+BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,contains_key,map_contains_key,map_contains_ikey,set_contains,list_contains"
+VOID_METHODS := "sort,sort_strings,reverse,clear,push,remove,list_remove,list_clear,list_reverse,map_remove,map_clear,set_remove,set_clear"
+STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,split,read_file,env,chr"
+
 # --- state ---
 mut ir_lines: List[String] := []
 mut ir_next_reg := 0
@@ -396,11 +405,9 @@ fn ir_expr(idx: Int) -> Int:
                             elif frt == "String":
                                 obj_is_string = true
                         # check known stdlib functions
-                        known_float := "pow,sqrt,floor,ceil,round,to_float,get_float"
-                        known_bool := "file_exists,dir_exists,get_bool,object_has,has"
-                        if known_float.contains(cf_name):
-                            obj_is_bool = false  # override any previous detection
-                        elif known_bool.contains(cf_name):
+                        if FLOAT_RETURNING_FUNCS.contains(cf_name):
+                            obj_is_bool = false
+                        elif BOOL_RETURNING_FUNCS.contains(cf_name):
                             obj_is_bool = true
         mut obj_is_float := false
         # check call return type for float
@@ -409,8 +416,7 @@ fn ir_expr(idx: Int) -> Int:
             if check_obj.kind == "call" and check_obj.children.len() > 0:
                 check_fn := get_node(check_obj.children[0])
                 if check_fn.kind == "ident":
-                    float_check := "pow,sqrt,floor,ceil,round,to_float,get_float"
-                    if float_check.contains(check_fn.value):
+                    if FLOAT_RETURNING_FUNCS.contains(check_fn.value):
                         obj_is_float = true
                     elif ir_func_returns.contains_key(check_fn.value):
                         if ir_func_returns[check_fn.value] == "Float":
@@ -439,9 +445,7 @@ fn ir_expr(idx: Int) -> Int:
                 elif obj_check.kind == "call" and obj_check.children.len() > 0:
                     call_id := get_node(obj_check.children[0])
                     if call_id.kind == "ident" and not ir_func_returns.contains_key(call_id.value):
-                        # unknown stdlib function — might return opaque handle
-                        known_int_call := "abs,min,max,clamp,len,fnv1a,ord,exec"
-                        if not known_int_call.contains(call_id.value):
+                        if not INT_RETURNING_FUNCS.contains(call_id.value):
                             mname = "smart_to_string"
         # detect object type for map/set/list dispatch
         mut obj_is_map := false
@@ -532,9 +536,7 @@ fn ir_expr(idx: Int) -> Int:
             mname = "set_add"
         if mname == "clear" and obj_is_set:
             mname = "set_clear"
-        # track that these methods return bools
-        bool_methods := "contains,starts_with,ends_with,is_empty,string_contains"
-        if bool_methods.contains(mname):
+        if BOOL_RETURNING_METHODS.contains(mname):
             ir_var_types.insert("__last_call", "bool")
 
         # check for impl method dispatch
@@ -559,9 +561,7 @@ fn ir_expr(idx: Int) -> Int:
             i = i + 1
         nargs := arg_regs.len() + 1
         ir_emit("call " + r.to_string() + " " + mname + " " + nargs.to_string() + args_s)
-        # void methods return the object itself
-        void_methods := "sort,sort_strings,reverse,clear,push,remove,list_remove,list_clear,list_reverse,map_remove,map_clear,set_remove,set_clear"
-        if void_methods.contains(mname):
+        if VOID_METHODS.contains(mname):
             return obj_r
         return r
 
@@ -579,7 +579,6 @@ fn ir_expr(idx: Int) -> Int:
                 part_r = ir_expr(child)
                 # wrap non-string expressions in to_string for concat
                 # methods that return strings: trim, substring, split, join, etc.
-                string_methods := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,split,read_file,env,chr"
                 needs_convert := true
                 if cn.kind == "ident":
                     # default: assume ident is a string (common in interp)
@@ -606,13 +605,11 @@ fn ir_expr(idx: Int) -> Int:
                     meth := cn.value
                     if meth.starts_with("."):
                         meth = meth.substring(1, meth.len())
-                    if string_methods.contains(meth):
+                    if STRING_RETURNING_METHODS.contains(meth):
                         needs_convert = false
                     elif meth == "to_string":
                         needs_convert = false
-                    # bool-returning methods need bool_to_string
-                    bool_meths := "contains,contains_key,starts_with,ends_with,is_empty,has"
-                    if bool_meths.contains(meth):
+                    if BOOL_RETURNING_METHODS.contains(meth):
                         needs_convert = true  # but use bool_to_string
                         ts_r2 := ir_reg()
                         ir_emit("call " + ts_r2.to_string() + " bool_to_string 1 " + part_r.to_string())
@@ -1056,14 +1053,11 @@ fn ir_stmt(idx: Int):
                     cfn := get_node(vn.children[0])
                     if cfn.kind == "ident":
                         cf := cfn.value
-                        string_fns := "sha256,hex_encode,hex_decode,from_hex,to_hex,b64_encode,b64_decode,chr,read_file,env,path_join,path_dir,path_base,path_ext,path_stem,scheme,host,query,fragment,decode,exec_output,type_of,get_string"
-                        int_fns := "fnv1a,ord,port,get_int,array_len,abs,min,max,clamp"
-                        float_fns := "pow,sqrt,floor,ceil,round,to_float,get_float"
-                        if string_fns.contains(cf):
+                        if STRING_RETURNING_FUNCS.contains(cf):
                             ir_var_types.insert(name, "string")
-                        elif int_fns.contains(cf):
+                        elif INT_RETURNING_FUNCS.contains(cf):
                             ir_var_types.insert(name, "int")
-                        elif float_fns.contains(cf):
+                        elif FLOAT_RETURNING_FUNCS.contains(cf):
                             ir_var_types.insert(name, "float")
                         # check user-defined function return types
                         elif ir_func_returns.contains_key(cf):

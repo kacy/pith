@@ -1,7 +1,6 @@
 //! Cranelift code generation for Forge
 //!
-//! This module compiles Forge AST into native machine code using Cranelift.
-//! It generates object files that can be linked with the runtime library.
+//! Pipeline: Forge IR text → ir_consumer → Cranelift → native object code
 
 use cranelift::prelude::*;
 use cranelift_module::{FuncId, Linkage, Module};
@@ -13,125 +12,31 @@ use std::sync::OnceLock;
 pub mod ir_consumer;
 pub mod linker;
 
-/// Struct field information
-#[derive(Debug, Clone)]
-pub struct StructField {
-    pub name: String,
-    pub ty: String,
-    pub offset: usize,
-    pub size: usize,
-}
+// --- Struct layout registry (used by ir_consumer for field access) ---
 
-/// Struct type information
-#[derive(Debug, Clone)]
-pub struct StructType {
-    pub name: String,
-    pub fields: Vec<StructField>,
-    pub total_size: usize,
-    pub alignment: usize,
-}
-
-/// Generic type instantiation (e.g., "List[Int]" -> concrete type)
-#[derive(Debug, Clone)]
-pub struct GenericInstantiation {
-    pub base_type: String,      // "List", "Map", etc.
-    pub type_args: Vec<String>, // ["Int"], ["String", "Int"], etc.
-    pub concrete_name: String,  // "List_Int", "Map_String_Int", etc.
-}
-
-/// Generic type registry for monomorphization
-#[derive(Debug, Default)]
-pub struct GenericRegistry {
-    /// Map from full type name (e.g., "List[Int]") to concrete info
-    pub instantiations: HashMap<String, GenericInstantiation>,
-    /// Counter for generating unique IDs
-    pub next_id: u64,
-}
-
-impl GenericRegistry {
-    /// Register a generic type usage and return the concrete name
-    pub fn register(&mut self, full_type_name: &str) -> String {
-        if let Some(existing) = self.instantiations.get(full_type_name) {
-            return existing.concrete_name.clone();
-        }
-
-        // Parse the type name: e.g., "List[Int]" or "Map[String, Int]"
-        let (base_type, type_args) = parse_generic_type(full_type_name);
-
-        // Generate concrete name: e.g., "List_Int", "Map_String_Int"
-        let concrete_name = if type_args.is_empty() {
-            base_type.clone()
-        } else {
-            format!("{}_{}", base_type, type_args.join("_"))
-        };
-
-        let instantiation = GenericInstantiation {
-            base_type: base_type.clone(),
-            type_args: type_args.clone(),
-            concrete_name: concrete_name.clone(),
-        };
-
-        self.instantiations
-            .insert(full_type_name.to_string(), instantiation);
-        concrete_name
-    }
-
-    /// Get all registered instantiations for a base type
-    pub fn get_for_base(&self, base: &str) -> Vec<&GenericInstantiation> {
-        self.instantiations
-            .values()
-            .filter(|inst| inst.base_type == base)
-            .collect()
-    }
-}
-
-/// Global struct layouts: struct_name -> Vec<(field_name, field_offset)>
-/// All fields are 8 bytes, so offset = index * 8
-pub static STRUCT_LAYOUTS: OnceLock<Mutex<HashMap<String, Vec<(String, usize)>>>> = OnceLock::new();
-
-/// Global struct field types: struct_name -> Vec<(field_name, type_name)>
-static STRUCT_FIELD_TYPES: OnceLock<Mutex<HashMap<String, Vec<(String, String)>>>> =
-    OnceLock::new();
-
-/// Global variable-to-struct-type mapping: var_name -> struct_type_name
-static VAR_STRUCT_TYPES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-
-/// Global function return type mapping: func_name -> return_type_name
-static FUNC_RETURN_TYPES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-
-/// Global variable type mapping: var_name -> type_name (for type-directed dispatch)
-static GLOBAL_VAR_TYPES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static STRUCT_LAYOUTS: OnceLock<Mutex<HashMap<String, Vec<(String, usize)>>>> = OnceLock::new();
 
 pub fn register_struct_layout(name: &str, fields: &[(String, String)]) {
     let layouts = STRUCT_LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let ftypes = STRUCT_FIELD_TYPES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut field_info = Vec::new();
-    let mut type_info = Vec::new();
-    for (i, (fname, ftype)) in fields.iter().enumerate() {
-        // Strip "pub" suffix from field names (parser includes visibility)
-        let clean_name = fname.strip_suffix(" pub").unwrap_or(fname).to_string();
-        field_info.push((clean_name.clone(), i * 8));
-        type_info.push((clean_name, ftype.clone()));
-    }
+    let field_info: Vec<_> = fields.iter().enumerate()
+        .map(|(i, (fname, _))| {
+            let clean = fname.strip_suffix(" pub").unwrap_or(fname).to_string();
+            (clean, i * 8)
+        })
+        .collect();
     if let Ok(mut map) = layouts.lock() {
         map.insert(name.to_string(), field_info);
-    }
-    if let Ok(mut map) = ftypes.lock() {
-        map.insert(name.to_string(), type_info);
     }
 }
 
 pub fn get_struct_layout(name: &str) -> Option<Vec<(String, usize)>> {
-    STRUCT_LAYOUTS
-        .get()
+    STRUCT_LAYOUTS.get()
         .and_then(|m| m.lock().ok())
         .and_then(|map| map.get(name).cloned())
 }
 
-/// Register a type alias: copy the struct layout and field types from target to alias name
 pub fn register_struct_alias(alias: &str, target: &str) {
     let layouts = STRUCT_LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let ftypes = STRUCT_FIELD_TYPES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(map) = layouts.lock() {
         if let Some(layout) = map.get(target).cloned() {
             drop(map);
@@ -140,298 +45,41 @@ pub fn register_struct_alias(alias: &str, target: &str) {
             }
         }
     }
-    if let Ok(map) = ftypes.lock() {
-        if let Some(types) = map.get(target).cloned() {
-            drop(map);
-            if let Ok(mut map) = ftypes.lock() {
-                map.insert(alias.to_string(), types);
-            }
-        }
-    }
 }
 
-pub fn get_struct_field_offset(struct_name: &str, field_name: &str) -> Option<usize> {
-    get_struct_layout(struct_name).and_then(|fields| {
-        fields
-            .iter()
-            .find(|(n, _)| n == field_name)
-            .map(|(_, off)| *off)
-    })
-}
+// --- CodeGen + errors ---
 
-pub fn get_struct_field_type(struct_name: &str, field_name: &str) -> Option<String> {
-    STRUCT_FIELD_TYPES
-        .get()
-        .and_then(|m| m.lock().ok())
-        .and_then(|map| {
-            map.get(struct_name).and_then(|fields| {
-                fields
-                    .iter()
-                    .find(|(n, _)| n == field_name)
-                    .map(|(_, t)| t.clone())
-            })
-        })
-}
-
-pub fn set_var_struct_type(var_name: &str, struct_type: &str) {
-    let types = VAR_STRUCT_TYPES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut map) = types.lock() {
-        map.insert(var_name.to_string(), struct_type.to_string());
-    }
-}
-
-pub fn get_var_struct_type(var_name: &str) -> Option<String> {
-    VAR_STRUCT_TYPES
-        .get()
-        .and_then(|m| m.lock().ok())
-        .and_then(|map| map.get(var_name).cloned())
-}
-
-pub fn set_func_return_type(func_name: &str, return_type: &str) {
-    let types = FUNC_RETURN_TYPES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut map) = types.lock() {
-        map.insert(func_name.to_string(), return_type.to_string());
-    }
-}
-
-pub fn get_func_return_type(func_name: &str) -> Option<String> {
-    FUNC_RETURN_TYPES
-        .get()
-        .and_then(|m| m.lock().ok())
-        .and_then(|map| map.get(func_name).cloned())
-}
-
-// Result and Optional type helpers
-
-/// Check if a type is a Result type (e.g., "Int!", "String!")
-pub fn is_result_type(ty: &str) -> bool {
-    ty.ends_with('!') && !ty.ends_with("!!") // Handle error type itself
-}
-
-/// Extract the inner type from a Result type
-/// e.g., "Int!" -> "Int"
-pub fn result_inner_type(ty: &str) -> String {
-    if is_result_type(ty) {
-        ty[..ty.len() - 1].to_string()
-    } else {
-        ty.to_string()
-    }
-}
-
-/// Check if a type is an Optional type (e.g., "Int?", "String?")
-pub fn is_optional_type(ty: &str) -> bool {
-    ty.ends_with('?')
-}
-
-/// Extract the inner type from an Optional type
-/// e.g., "Int?" -> "Int"
-pub fn optional_inner_type(ty: &str) -> String {
-    if is_optional_type(ty) {
-        ty[..ty.len() - 1].to_string()
-    } else {
-        ty.to_string()
-    }
-}
-
-/// Build a Result type string from inner type
-pub fn make_result_type(inner: &str) -> String {
-    format!("{}!", inner)
-}
-
-/// Build an Optional type string from inner type
-pub fn make_optional_type(inner: &str) -> String {
-    format!("{}?", inner)
-}
-
-/// Get the actual return type when inside a Result-returning function
-/// This is used for the try operator to know what error type to construct
-pub fn get_enclosing_result_type(func_name: &str) -> Option<String> {
-    get_func_return_type(func_name).filter(|ty| is_result_type(ty))
-}
-
-pub fn set_global_var_type(var_name: &str, type_name: &str) {
-    let types = GLOBAL_VAR_TYPES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut map) = types.lock() {
-        map.insert(var_name.to_string(), type_name.to_string());
-    }
-}
-
-pub fn get_global_var_type(var_name: &str) -> Option<String> {
-    GLOBAL_VAR_TYPES
-        .get()
-        .and_then(|m| m.lock().ok())
-        .and_then(|map| map.get(var_name).cloned())
-}
-
-pub fn clear_struct_state() {
-    if let Some(m) = STRUCT_LAYOUTS.get() {
-        if let Ok(mut map) = m.lock() {
-            map.clear();
-        }
-    }
-    if let Some(m) = STRUCT_FIELD_TYPES.get() {
-        if let Ok(mut map) = m.lock() {
-            map.clear();
-        }
-    }
-    if let Some(m) = VAR_STRUCT_TYPES.get() {
-        if let Ok(mut map) = m.lock() {
-            map.clear();
-        }
-    }
-    if let Some(m) = FUNC_RETURN_TYPES.get() {
-        if let Ok(mut map) = m.lock() {
-            map.clear();
-        }
-    }
-    if let Some(m) = GLOBAL_VAR_TYPES.get() {
-        if let Ok(mut map) = m.lock() {
-            map.clear();
-        }
-    }
-}
-
-/// Parse a generic type name into base and type arguments
-/// e.g., "List[Int]" -> ("List", vec!["Int"])
-/// e.g., "Map[String, Int]" -> ("Map", vec!["String", "Int"])
-pub fn parse_generic_type(type_name: &str) -> (String, Vec<String>) {
-    // Check if it's a generic type with [...]
-    if let Some(bracket_pos) = type_name.find('[') {
-        let base = type_name[..bracket_pos].to_string();
-        let args_part = &type_name[bracket_pos + 1..type_name.len() - 1]; // Remove trailing ']'
-
-        // Parse comma-separated type arguments
-        let args: Vec<String> = args_part
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        (base, args)
-    } else {
-        // Not a generic type
-        (type_name.to_string(), vec![])
-    }
-}
-
-/// Code generator state
 pub struct CodeGen {
-    /// The Cranelift module being built
     pub module: ObjectModule,
-    /// Function builder context
-    pub builder_ctx: FunctionBuilderContext,
-    /// Current function being compiled
-    pub current_func: Option<FuncId>,
-    /// Variable map (name -> SSA value)
-    pub variables: HashMap<String, Value>,
-    /// Current instruction builder
-    pub builder: Option<FunctionBuilder<'static>>, // Will fix lifetime issues
-    /// Struct type registry (name -> struct info)
-    pub struct_types: HashMap<String, StructType>,
-    /// Generic type registry for monomorphization
-    pub generic_registry: GenericRegistry,
 }
 
-/// Result of compilation
-#[derive(Debug)]
-pub struct CompileResult {
-    /// The generated object file bytes
-    pub object_bytes: Vec<u8>,
-    /// Entry point function name
-    pub entry_point: String,
-}
-
-/// Error during compilation
 #[derive(Debug)]
 pub enum CompileError {
     ModuleError(String),
-    TypeError(String),
-    UnknownFunction(String),
-    UnknownVariable(String),
-    UnsupportedFeature(String),
 }
 
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CompileError::ModuleError(e) => write!(f, "Module error: {}", e),
-            CompileError::TypeError(e) => write!(f, "Type error: {}", e),
-            CompileError::UnknownFunction(name) => write!(f, "Unknown function: {}", name),
-            CompileError::UnknownVariable(name) => write!(f, "Unknown variable: {}", name),
-            CompileError::UnsupportedFeature(feat) => write!(f, "Unsupported feature: {}", feat),
         }
     }
 }
 
 impl std::error::Error for CompileError {}
 
-/// Create a new code generator
 pub fn create_codegen() -> Result<CodeGen, CompileError> {
-    // Set up the target ISA for the native host
     let isa_builder = cranelift_native::builder()
         .map_err(|e| CompileError::ModuleError(format!("Unsupported target: {:?}", e)))?;
-
     let isa = isa_builder
         .finish(settings::Flags::new(settings::builder()))
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    // Create an object module
-    let builder = ObjectBuilder::new(
-        isa,
-        "forge_module",
-        cranelift_module::default_libcall_names(),
-    )
-    .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    let module = ObjectModule::new(builder);
-
-    Ok(CodeGen {
-        module,
-        builder_ctx: FunctionBuilderContext::new(),
-        current_func: None,
-        variables: HashMap::new(),
-        builder: None,
-        struct_types: HashMap::new(),
-        generic_registry: GenericRegistry::default(),
-    })
+    let builder = ObjectBuilder::new(isa, "forge_module", cranelift_module::default_libcall_names())
+        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+    Ok(CodeGen { module: ObjectModule::new(builder) })
 }
 
-/// Compile a Forge module (placeholder for now)
-pub fn compile_module(_ast: &str) -> Result<CompileResult, CompileError> {
-    // TODO: Parse AST and compile
-    // For now, return empty result
-    Ok(CompileResult {
-        object_bytes: vec![],
-        entry_point: "main".to_string(),
-    })
-}
-
-/// Get the target triple for the current host
-pub fn get_target_triple() -> String {
-    target_lexicon::Triple::host().to_string()
-}
-
-/// Type mapping from Forge types to Cranelift types
-pub fn forge_type_to_cranelift(ty: &str) -> Type {
-    // Handle Result types (e.g., "Int!", "String!")
-    if is_result_type(ty) {
-        return types::I64; // Result is passed as pointer
-    }
-    // Handle Optional types (e.g., "Int?", "String?")
-    if is_optional_type(ty) {
-        return types::I64; // Optional is passed as pointer
-    }
-    match ty {
-        "Int" | "Int8" | "Int16" | "Int32" | "Int64" => types::I64,
-        "UInt" | "UInt8" | "UInt16" | "UInt32" | "UInt64" => types::I64,
-        "Float" => types::F64,
-        "Bool" => types::I64,
-        "String" | "List" | "Map" | "Set" => types::I64, // Pointer types
-        _ => types::I64,                                 // Default to pointer size
-    }
-}
-
-/// Declare an external runtime function
+// --- Runtime function declarations ---
 fn declare_runtime_function(
     module: &mut ObjectModule,
     name: &str,
@@ -455,89 +103,7 @@ fn declare_runtime_function(
     Ok(func_id)
 }
 
-/// Calculate the size of a type in bytes
-pub fn type_size(ty: &str) -> usize {
-    // Handle Result types: { is_ok: i8, ok: T, err: String }
-    // For simplicity, we use: is_ok(1) + padding(7) + ok(8) + err(8) = 24
-    if is_result_type(ty) {
-        return 24;
-    }
-    // Handle Optional types: { has_value: i8, value: T }
-    if is_optional_type(ty) {
-        return 16; // has_value(1) + padding(7) + value(8) = 16
-    }
-    match ty {
-        "Int" | "Int64" | "UInt64" => 8,
-        "Int32" | "UInt32" => 4,
-        "Int16" | "UInt16" => 2,
-        "Int8" | "UInt8" | "Bool" => 1,
-        "Float" | "Float64" => 8,
-        "Float32" => 4,
-        "String" => 24, // ForgeString struct size (ptr + len + capacity)
-        "List" => 8,    // Pointer to list implementation
-        "Map" => 8,     // Pointer to map implementation
-        _ => {
-            // Check if it's a struct type (we'll need to look it up)
-            // For now, assume 8 bytes for unknown types
-            8
-        }
-    }
-}
-
-/// Calculate the alignment of a type in bytes
-pub fn type_alignment(ty: &str) -> usize {
-    match ty {
-        "Int" | "Int64" | "UInt64" | "Float" | "Float64" => 8,
-        "Int32" | "UInt32" | "Float32" => 4,
-        "Int16" | "UInt16" => 2,
-        "Int8" | "UInt8" | "Bool" => 1,
-        "String" => 8,
-        "List" | "Map" => 8,
-        _ => 8,
-    }
-}
-
-/// Calculate struct layout given field names and types
-pub fn calculate_struct_layout(name: String, fields: Vec<(String, String)>) -> StructType {
-    let mut struct_fields = Vec::new();
-    let mut current_offset = 0;
-    let mut max_alignment = 1;
-
-    for (field_name, field_type) in fields {
-        let field_size = type_size(&field_type);
-        let field_align = type_alignment(&field_type);
-
-        // Align current_offset to field alignment
-        let padding = (field_align - (current_offset % field_align)) % field_align;
-        current_offset += padding;
-
-        struct_fields.push(StructField {
-            name: field_name,
-            ty: field_type.clone(),
-            offset: current_offset,
-            size: field_size,
-        });
-
-        current_offset += field_size;
-        max_alignment = max_alignment.max(field_align);
-    }
-
-    // Pad struct size to its alignment
-    let total_size = if current_offset % max_alignment != 0 {
-        current_offset + (max_alignment - (current_offset % max_alignment))
-    } else {
-        current_offset
-    };
-
-    StructType {
-        name,
-        fields: struct_fields,
-        total_size,
-        alignment: max_alignment,
-    }
-}
-
-/// Declare all runtime functions needed by the compiler
+/// Declare all runtime functions
 pub fn declare_runtime_functions(
     module: &mut ObjectModule,
 ) -> Result<HashMap<String, FuncId>, CompileError> {

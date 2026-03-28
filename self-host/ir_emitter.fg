@@ -555,44 +555,11 @@ fn ir_expr(idx: Int) -> Int:
         right_r := ir_expr(node.children[1])
         r := ir_reg()
         op := node.value
-        # detect string concatenation: if either operand is a string, use concat
-        left_node := get_node(node.children[0])
-        right_node := get_node(node.children[1])
-        mut is_str_op := left_node.kind == "string_lit" or left_node.kind == "string" or left_node.kind == "lit" or left_node.kind == "string_interp" or right_node.kind == "string_lit" or right_node.kind == "string" or right_node.kind == "lit" or right_node.kind == "string_interp"
-        # also check if either operand is a string variable
-        if not is_str_op and left_node.kind == "ident":
-            if ir_var_types.contains_key(left_node.value):
-                if ir_var_types[left_node.value] == "string":
-                    is_str_op = true
-        if not is_str_op and right_node.kind == "ident":
-            if ir_var_types.contains_key(right_node.value):
-                if ir_var_types[right_node.value] == "string":
-                    is_str_op = true
-        # method calls that return strings
-        if not is_str_op and (left_node.kind == "method_call" or right_node.kind == "method_call"):
-            # assume method_call in concat context returns string
-            # (to_string, trim, substring, join, etc.)
-            is_str_op = true
-        # call results that are known string functions
-        if not is_str_op and (left_node.kind == "call" or right_node.kind == "call"):
-            # check if the called function is known to return a string
-            mut check_call := left_node
-            if check_call.kind != "call":
-                check_call = right_node
-            if check_call.children.len() > 0:
-                cn := get_node(check_call.children[0])
-                if cn.kind == "ident":
-                    cfn := cn.value
-                    if cfn == "chr" or cfn == "read_file" or cfn == "env" or cfn == "to_string":
-                        is_str_op = true
-        # detect float operations
-        mut is_float_op := left_node.kind == "float_lit" or left_node.kind == "float" or right_node.kind == "float_lit" or right_node.kind == "float"
-        if not is_float_op and left_node.kind == "ident" and ir_var_types.contains_key(left_node.value):
-            if ir_var_types[left_node.value] == "float":
-                is_float_op = true
-        if not is_float_op and right_node.kind == "ident" and ir_var_types.contains_key(right_node.value):
-            if ir_var_types[right_node.value] == "float":
-                is_float_op = true
+        # detect operand types using centralized inference
+        left_type := ir_infer_type(node.children[0])
+        right_type := ir_infer_type(node.children[1])
+        is_str_op := left_type == "string" or right_type == "string"
+        is_float_op := left_type == "float" or right_type == "float"
         if is_float_op and (op == "add" or op == "sub" or op == "mul" or op == "div"):
             ir_emit("f" + op + " " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
             return r

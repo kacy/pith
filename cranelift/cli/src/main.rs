@@ -180,9 +180,10 @@ fn run_ir_driver(driver: &str, path: &str, module_index: usize) -> Result<String
         return Ok(ir);
     }
     // Rename m0sN → m{module_index}sN to avoid string ID collisions
-    let from = "m0s";
-    let to = format!("m{}s", module_index);
-    Ok(ir.replace(from, &to))
+    let ir = ir.replace("m0s", &format!("m{}s", module_index));
+    // Rename __init_globals → __init_globals_N to avoid duplicate definitions
+    let ir = ir.replace("__init_globals", &format!("__init_globals_{}", module_index));
+    Ok(ir)
 }
 
 /// Find the stdlib root directory by walking up from the source file and CWD

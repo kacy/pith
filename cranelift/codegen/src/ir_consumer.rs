@@ -248,8 +248,16 @@ fn compile_ir_function(
     let zero_val = builder.ins().iconst(types::I64, 0);
     regs.insert(usize::MAX, zero_val); // sentinel
 
-    // Call __init_globals at the start of main (if it exists)
+    // Call __init_globals (and module-specific __init_globals_N) at the start of main
     if func_name == "main" {
+        // Call module-specific initializers first (imported modules)
+        for (name, &fid) in declared_funcs.iter() {
+            if name.starts_with("__init_globals_") {
+                let init_ref = codegen.module.declare_func_in_func(fid, builder.func);
+                builder.ins().call(init_ref, &[]);
+            }
+        }
+        // Then the main module's __init_globals
         if let Some(&init_id) = declared_funcs.get("__init_globals") {
             let init_ref = codegen.module.declare_func_in_func(init_id, builder.func);
             builder.ins().call(init_ref, &[]);

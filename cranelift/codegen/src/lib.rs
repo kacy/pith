@@ -382,6 +382,7 @@ pub fn declare_runtime_functions(
         ("show", "forge_identity", &[I64], &[I64]),
         ("show_and_hash", "forge_identity", &[I64], &[I64]),
         ("last_index_of", "forge_cstring_last_index_of", &[I64, I64], &[I64]),
+        ("forge_cstring_last_index_of", "forge_cstring_last_index_of", &[I64, I64], &[I64]),
         ("process_wait", "forge_process_wait", &[I64], &[I64]),
         ("process_kill", "forge_process_wait", &[I64], &[I64]),
         ("scheme", "forge_url_scheme", &[I64], &[I64]),

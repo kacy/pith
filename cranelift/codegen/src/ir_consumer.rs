@@ -81,36 +81,37 @@ pub fn compile_from_ir(
             }
             "struct" if parts.len() >= 2 => {
                 let name = parts[1].to_string();
-                let fields: Vec<String> = parts[2..].iter().map(|s| s.to_string()).collect();
-                // Register struct layout with Cranelift backend
-                let field_pairs: Vec<(String, String)> = fields
-                    .iter()
-                    .map(|f| (f.clone(), "Int".to_string()))
-                    .collect();
-                crate::register_struct_layout(&name, &field_pairs);
-                struct_layouts.insert(name, fields);
+                if !struct_layouts.contains_key(&name) {
+                    let fields: Vec<String> = parts[2..].iter().map(|s| s.to_string()).collect();
+                    let field_pairs: Vec<(String, String)> = fields
+                        .iter()
+                        .map(|f| (f.clone(), "Int".to_string()))
+                        .collect();
+                    crate::register_struct_layout(&name, &field_pairs);
+                    struct_layouts.insert(name, fields);
+                }
             }
             "global" if parts.len() >= 3 => {
                 let gname = parts[1].to_string();
-                let init_kind = parts[2];
-                // Create a global data slot
-                use cranelift_module::DataDescription;
-                let data_id = codegen.module
-                    .declare_data(&gname, Linkage::Local, true, false)
-                    .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-                let mut desc = DataDescription::new();
-                // Initialize based on kind
-                let init_val: i64 = if init_kind == "list" || init_kind == "map" || init_kind == "set" {
-                    0 // will be initialized at runtime
-                } else if init_kind.starts_with("str:") {
-                    0 // string pointer, initialized at runtime
-                } else {
-                    init_kind.parse().unwrap_or(0)
-                };
-                desc.define(init_val.to_le_bytes().to_vec().into_boxed_slice());
-                codegen.module.define_data(data_id, &desc)
-                    .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-                global_data.insert(gname, data_id);
+                if !global_data.contains_key(&gname) {
+                    let init_kind = parts[2];
+                    use cranelift_module::DataDescription;
+                    let data_id = codegen.module
+                        .declare_data(&gname, Linkage::Local, true, false)
+                        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+                    let mut desc = DataDescription::new();
+                    let init_val: i64 = if init_kind == "list" || init_kind == "map" || init_kind == "set" {
+                        0
+                    } else if init_kind.starts_with("str:") {
+                        0
+                    } else {
+                        init_kind.parse().unwrap_or(0)
+                    };
+                    desc.define(init_val.to_le_bytes().to_vec().into_boxed_slice());
+                    codegen.module.define_data(data_id, &desc)
+                        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+                    global_data.insert(gname, data_id);
+                }
             }
             "struct_alias" if parts.len() >= 3 => {
                 let alias = parts[1].to_string();
@@ -122,17 +123,19 @@ pub fn compile_from_ir(
             }
             "func" if parts.len() >= 4 => {
                 let name = parts[1];
-                let nparam: usize = parts[2].parse().unwrap_or(0);
-                let mut sig = codegen.module.make_signature();
-                for _ in 0..nparam {
-                    sig.params.push(AbiParam::new(types::I64));
+                if !declared_funcs.contains_key(name) {
+                    let nparam: usize = parts[2].parse().unwrap_or(0);
+                    let mut sig = codegen.module.make_signature();
+                    for _ in 0..nparam {
+                        sig.params.push(AbiParam::new(types::I64));
+                    }
+                    sig.returns.push(AbiParam::new(types::I64));
+                    let func_id = codegen
+                        .module
+                        .declare_function(name, Linkage::Export, &sig)
+                        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+                    declared_funcs.insert(name.to_string(), func_id);
                 }
-                sig.returns.push(AbiParam::new(types::I64));
-                let func_id = codegen
-                    .module
-                    .declare_function(name, Linkage::Export, &sig)
-                    .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-                declared_funcs.insert(name.to_string(), func_id);
             }
             _ => {}
         }
@@ -141,14 +144,17 @@ pub fn compile_from_ir(
     // Declare string data functions
     let mut string_funcs: HashMap<String, FuncId> = HashMap::new();
     for (idx, content) in &string_data {
-        let name = format!("__irstr_{}", idx);
-        let func_id =
-            crate::declare_string_data(&mut codegen.module, &name, content)
-                .map_err(|e| CompileError::ModuleError(format!("string data: {:?}", e)))?;
-        string_funcs.insert(idx.clone(), func_id);
+        if !string_funcs.contains_key(idx) {
+            let name = format!("__irstr_{}", idx);
+            let func_id =
+                crate::declare_string_data(&mut codegen.module, &name, content)
+                    .map_err(|e| CompileError::ModuleError(format!("string data: {:?}", e)))?;
+            string_funcs.insert(idx.clone(), func_id);
+        }
     }
 
-    // Pass 2: compile function bodies
+    // Pass 2: compile function bodies (first definition wins for duplicates)
+    let mut compiled_funcs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut i = 0;
     while i < lines.len() {
         let parts: Vec<&str> = lines[i].split_whitespace().collect();
@@ -178,7 +184,11 @@ pub fn compile_from_ir(
             i += 1;
         }
 
-        // Compile this function
+        // Compile this function (skip if already compiled from an earlier module)
+        if compiled_funcs.contains(&func_name) {
+            continue;
+        }
+        compiled_funcs.insert(func_name.clone());
         if let Some(&func_id) = declared_funcs.get(&func_name) {
             compile_ir_function(
                 codegen,

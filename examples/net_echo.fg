@@ -1,0 +1,27 @@
+# TCP echo server/client test
+
+fn run_server(port: Int) -> Int:
+    s := tcp_listen("127.0.0.1", port)
+    c := tcp_accept(s)
+    data := tcp_read(c)
+    tcp_write(c, "echo: " + data)
+    tcp_close(c)
+    tcp_close(s)
+    return 0
+
+fn main():
+    port := 18440
+
+    # spawn server — MUST capture task handle (expression form)
+    task := spawn run_server(port)
+    sleep(200)
+
+    # connect client
+    conn := tcp_connect("127.0.0.1", port)
+    tcp_write(conn, "hello forge")
+    response := tcp_read(conn)
+    print(response)
+    tcp_close(conn)
+
+    await task
+    print("net echo works")

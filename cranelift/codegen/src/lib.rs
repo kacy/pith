@@ -366,6 +366,7 @@ pub fn declare_runtime_functions(
         ("tcp_read", "forge_tcp_read", &[I64], &[I64]),
         ("tcp_write", "forge_tcp_write", &[I64, I64], &[I64]),
         ("tcp_close", "forge_tcp_close", &[I64], &[]),
+        ("tcp_set_timeout", "forge_tcp_set_timeout", &[I64, I64], &[]),
         ("Channel", "forge_channel_new", &[I64], &[I64]),
         ("forge_channel_new", "forge_channel_new", &[I64], &[I64]),
         ("send", "forge_channel_send", &[I64, I64], &[]),

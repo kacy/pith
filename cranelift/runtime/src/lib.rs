@@ -2698,6 +2698,8 @@ pub unsafe extern "C" fn forge_tcp_connect(addr: *const i8, port: i64) -> i64 {
     let connect_addr = format!("{}:{}", host, port);
     match TcpStream::connect(&connect_addr) {
         Ok(stream) => {
+            // Set default read timeout of 5 seconds
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
             use std::os::unix::io::IntoRawFd;
             stream.into_raw_fd() as i64
         }
@@ -2787,6 +2789,22 @@ pub unsafe extern "C" fn forge_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
     use std::os::unix::io::IntoRawFd;
     let _ = stream.into_raw_fd();
     result
+}
+
+/// TCP set read timeout in milliseconds (0 = no timeout)
+#[no_mangle]
+pub extern "C" fn forge_tcp_set_timeout(fd: i64, ms: i64) {
+    if fd < 0 { return; }
+    use std::net::TcpStream;
+    use std::os::unix::io::FromRawFd;
+    let stream = unsafe { TcpStream::from_raw_fd(fd as i32) };
+    if ms <= 0 {
+        let _ = stream.set_read_timeout(None);
+    } else {
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(ms as u64)));
+    }
+    use std::os::unix::io::IntoRawFd;
+    let _ = stream.into_raw_fd();
 }
 
 /// TCP close — close the file descriptor

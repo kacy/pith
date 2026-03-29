@@ -16,14 +16,14 @@ fn main() {
     }
 
     match args[1].as_str() {
-        "build" | "ir-build" => {
+        "build" => {
             if args.len() < 3 {
                 eprintln!("Error: build requires a file argument");
                 return;
             }
             build_file(&args[2]);
         }
-        "run" | "ir-run" => {
+        "run" => {
             if args.len() < 3 {
                 eprintln!("Error: run requires a file argument");
                 return;
@@ -94,6 +94,7 @@ fn print_usage() {
     println!();
     println!("Environment:");
     println!("  FORGE_SELF_HOST    Path to self-hosted compiler (default: ./self-host/forge_main)");
+    println!("  FORGE_DUMP_IR      Path to dump combined IR text (for debugging)");
 }
 
 /// Find the self-hosted compiler executable
@@ -470,6 +471,11 @@ fn run_file(path: &str) {
             return;
         }
     };
+
+    if let Ok(dump_path) = env::var("FORGE_DUMP_IR") {
+        let _ = fs::write(&dump_path, &ir_text);
+        eprintln!("IR dumped to {} ({} bytes)", dump_path, ir_text.len());
+    }
 
     match create_codegen() {
         Ok(mut codegen) => {

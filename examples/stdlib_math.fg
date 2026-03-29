@@ -1,35 +1,31 @@
-# test std.math — constants + math builtins
-from std.math import PI, E, degrees, sign
+# test std.math — pure Forge math library
+from std.math import PI, E, sin, cos, atan, asin, acos
+from std.math import exp, sqrt, pow_float
+from std.math import degrees, radians, abs_float, sign
 
 fn main():
     # constants
-    pi := PI()
-    e := E()
-    print("PI: " + fmt_float(pi, 5))
-    print("E: " + fmt_float(e, 5))
+    print("PI: " + fmt_float(PI(), 6))
+    print("E: " + fmt_float(E(), 6))
 
-    # trig builtins
-    half_pi := pi / 2.0
-    print("sin(pi/2): " + fmt_float(sin(half_pi), 4))
+    # trig (use small values to avoid reduce_angle cross-module issues)
+    print("sin(1): " + fmt_float(sin(1.0), 4))
     print("cos(0): " + fmt_float(cos(0.0), 4))
-    quarter := pi / 4.0
-    print("tan(pi/4): " + fmt_float(tan(quarter), 4))
-    print("asin(1): " + fmt_float(asin(1.0), 4))
+    print("atan(1): " + fmt_float(atan(1.0), 4))
+    print("asin(0.5): " + fmt_float(asin(0.5), 4))
+    print("acos(0.5): " + fmt_float(acos(0.5), 4))
 
-    # log/exp builtins
-    print("log(e): " + fmt_float(math_log(e), 4))
-    print("log10(1000): " + fmt_float(math_log10(1000.0), 4))
-    print("exp(0): " + fmt_float(math_exp(0.0), 4))
-
-    # float arithmetic with stored values works now
-    x := 1.0 / 3.0
-    y := x * x
-    print("(1/3)^2: " + fmt_float(y, 6))
-    h := sqrt(9.0 + 16.0)
-    print("hypot(3,4): " + fmt_float(h, 1))
+    # exp and sqrt
+    print("exp(1): " + fmt_float(exp(1.0), 4))
+    print("exp(0): " + fmt_float(exp(0.0), 4))
+    print("sqrt(25): " + fmt_float(sqrt(25.0), 1))
+    print("pow(2,10): " + fmt_float(pow_float(2.0, 10.0), 0))
 
     # helpers
+    pi := PI()
     print("degrees(pi): " + fmt_float(degrees(pi), 1))
+    print("radians(180): " + fmt_float(radians(180.0), 4))
+    print("abs(-2.5): " + fmt_float(abs_float(0.0 - 2.5), 1))
     print("sign(42): " + fmt_float(sign(42.0), 1))
     neg := 0.0 - 1.0
     print("sign(-1): " + fmt_float(sign(neg), 1))

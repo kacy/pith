@@ -325,24 +325,55 @@ fn compile_ir_function(
                 _ => {}
             }
         }
-        // Also mark parameters used in float context: if any load of a param
-        // is used as operand in fmul/fadd/etc., mark it as float
-        for line in body_lines {
+        // If function has any float operations, mark all params as float.
+        // This is conservative but correct for math functions.
+        let has_float_ops = body_lines.iter().any(|line| {
             let p: Vec<&str> = line.split_whitespace().collect();
-            if p.len() >= 4 && matches!(p[0], "fmul" | "fadd" | "fsub" | "fdiv") {
-                // operands at p[2] and p[3] — find which loads fed them
-                for &arg_str in &[p[2], p[3]] {
-                    if let Ok(arg_reg) = arg_str.parse::<usize>() {
-                        // search for the load that produced this reg
-                        for line2 in body_lines {
-                            let p2: Vec<&str> = line2.split_whitespace().collect();
-                            if p2.len() >= 3 && p2[0] == "load" {
-                                if let Ok(r) = p2[1].parse::<usize>() {
-                                    if r == arg_reg {
-                                        float_vars.insert(p2[2].to_string());
-                                    }
-                                }
-                            }
+            !p.is_empty() && matches!(p[0], "fconst" | "fmul" | "fadd" | "fsub" | "fdiv")
+        });
+        if has_float_ops {
+            for name in param_names {
+                float_vars.insert(name.clone());
+            }
+        }
+        // Iterative propagation: if a variable is stored from a register
+        // that was loaded from a float variable, mark it as float too.
+        // Also mark registers from loads of float vars.
+        for _ in 0..3 {
+            let mut new_float_regs: Vec<usize> = Vec::new();
+            for line in body_lines.iter() {
+                let p: Vec<&str> = line.split_whitespace().collect();
+                if p.len() >= 3 && p[0] == "load" {
+                    if let Ok(r) = p[1].parse::<usize>() {
+                        if float_vars.contains(p[2]) {
+                            new_float_regs.push(r);
+                        }
+                    }
+                }
+            }
+            for r in &new_float_regs {
+                float_source_regs.insert(*r);
+            }
+            // Propagate: if mul/div/add/sub uses a float reg, its result is float
+            for line in body_lines.iter() {
+                let p: Vec<&str> = line.split_whitespace().collect();
+                if p.len() >= 4 && matches!(p[0], "mul" | "div" | "add" | "sub") {
+                    let a_float = p[2].parse::<usize>().map_or(false, |r| float_source_regs.contains(&r));
+                    let b_float = p[3].parse::<usize>().map_or(false, |r| float_source_regs.contains(&r));
+                    if a_float || b_float {
+                        if let Ok(r) = p[1].parse::<usize>() {
+                            float_source_regs.insert(r);
+                        }
+                    }
+                }
+            }
+            // Store propagation
+            for line in body_lines.iter() {
+                let p: Vec<&str> = line.split_whitespace().collect();
+                if p.len() >= 3 && p[0] == "store" {
+                    if let Ok(r) = p[2].parse::<usize>() {
+                        if float_source_regs.contains(&r) {
+                            float_vars.insert(p[1].to_string());
                         }
                     }
                 }

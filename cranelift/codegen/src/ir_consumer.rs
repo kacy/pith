@@ -395,6 +395,68 @@ fn compile_ir_function(
         }
     }
 
+    // Pre-scan: detect while-loop break targets that incorrectly loop back.
+    // Pattern: brif COND LOOP_BODY LOOP_EXIT → while header
+    //   ... jmp LABEL → break target
+    //   label LABEL → break lands here
+    //   jmp LOOP_HEADER → but this loops back instead of exiting
+    // Fix: redirect LABEL → LOOP_EXIT
+    let mut break_redirects: HashMap<String, String> = HashMap::new();
+    {
+        // Find while-loop headers: look for "label X ... brif COND BODY EXIT"
+        // where X is a loop header (targeted by a backwards jmp)
+        let mut while_exits: HashMap<String, String> = HashMap::new();
+        for (idx, line) in body_lines.iter().enumerate() {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() >= 4 && p[0] == "brif" {
+                // Find the nearest preceding label (may be 1-3 lines back)
+                let mut header_label: Option<&str> = None;
+                let mut back = idx.wrapping_sub(1);
+                while back < idx && idx - back <= 3 {
+                    let prev: Vec<&str> = body_lines[back].split_whitespace().collect();
+                    if prev.len() >= 2 && prev[0] == "label" {
+                        header_label = Some(prev[1]);
+                        break;
+                    }
+                    back = back.wrapping_sub(1);
+                }
+                if let Some(hdr) = header_label {
+                    while_exits.insert(hdr.to_string(), p[3].to_string());
+                }
+            }
+        }
+        // Find labels where: label X → jmp LOOP_HEADER (a fall-through that loops)
+        // If X is reached via a break, it should go to the exit instead
+        for (idx, line) in body_lines.iter().enumerate() {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() >= 2 && p[0] == "jmp" {
+                let target = p[1];
+                if let Some(exit_label) = while_exits.get(target) {
+                    // This jmp goes to a loop header. Find what label precedes it.
+                    // Walk backwards past any labels to find the label name
+                    let mut li = idx.wrapping_sub(1);
+                    while li < body_lines.len() {
+                        let lp: Vec<&str> = body_lines[li].split_whitespace().collect();
+                        if lp.len() >= 2 && lp[0] == "label" {
+                            // Any jmp TO this label from inside the loop is a break
+                            break_redirects.insert(lp[1].to_string(), exit_label.clone());
+                            li = li.wrapping_sub(1);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Don't redirect the loop body label itself (brif's THEN target)
+        for (_, line) in body_lines.iter().enumerate() {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() >= 4 && p[0] == "brif" {
+                break_redirects.remove(p[2]); // THEN = loop body, not a break
+            }
+        }
+    }
+
     // Compile instructions
     let mut terminated = false;
     for line in body_lines {
@@ -859,7 +921,11 @@ fn compile_ir_function(
 
             "jmp" if parts.len() >= 2 => {
                 let target = parts[1];
-                let block = labels.get(target).copied().unwrap_or(entry_block);
+                // Redirect break targets that incorrectly loop back
+                let actual_target = break_redirects.get(target)
+                    .map(|s| s.as_str())
+                    .unwrap_or(target);
+                let block = labels.get(actual_target).copied().unwrap_or(entry_block);
                 builder.ins().jump(block, &[]);
                 terminated = true;
             }

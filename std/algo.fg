@@ -33,27 +33,35 @@ pub fn sort(list: List[Int]) -> List[Int]:
 
 fn merge(a: List[Int], b: List[Int]) -> List[Int]:
     mut result: List[Int] := []
+    na := a.len()
+    nb := b.len()
     mut i := 0
     mut j := 0
-    while i < a.len() and j < b.len():
+    while i < na and j < nb:
         if a[i] <= b[j]:
             result.push(a[i])
             i = i + 1
         else:
             result.push(b[j])
             j = j + 1
-    while i < a.len():
+    while i < na:
         result.push(a[i])
         i = i + 1
-    while j < b.len():
+    while j < nb:
         result.push(b[j])
         j = j + 1
     return result
 
 # Sorts a list of integers in descending order
 pub fn sort_desc(list: List[Int]) -> List[Int]:
-    mut sorted := sort(list)
-    return reverse_list(sorted)
+    sorted := sort(list)
+    n := sorted.len()
+    mut result: List[Int] := []
+    mut i := n - 1
+    while i >= 0:
+        result.push(sorted[i])
+        i = i - 1
+    return result
 
 # Compares two strings lexicographically. Returns -1, 0, or 1.
 pub fn strcmp(a: String, b: String) -> Int:
@@ -96,19 +104,21 @@ pub fn sort_strings(list: List[String]) -> List[String]:
 
 fn merge_strings(a: List[String], b: List[String]) -> List[String]:
     mut result: List[String] := []
+    na := a.len()
+    nb := b.len()
     mut i := 0
     mut j := 0
-    while i < a.len() and j < b.len():
+    while i < na and j < nb:
         if strcmp(a[i], b[j]) <= 0:
             result.push(a[i])
             i = i + 1
         else:
             result.push(b[j])
             j = j + 1
-    while i < a.len():
+    while i < na:
         result.push(a[i])
         i = i + 1
-    while j < b.len():
+    while j < nb:
         result.push(b[j])
         j = j + 1
     return result
@@ -133,8 +143,9 @@ pub fn binary_search(list: List[Int], value: Int) -> Int:
 
 # Linear search. Returns index of first occurrence, or -1 if not found.
 pub fn index_of(list: List[Int], value: Int) -> Int:
+    n := list.len()
     mut i := 0
-    while i < list.len():
+    while i < n:
         if list[i] == value:
             return i
         i = i + 1
@@ -151,12 +162,13 @@ pub fn contains(list: List[Int], value: Int) -> Bool:
 # Returns a list with consecutive duplicates removed
 # Input should be sorted for full deduplication
 pub fn unique(list: List[Int]) -> List[Int]:
-    if list.len() == 0:
+    n := list.len()
+    if n == 0:
         return []
     mut result: List[Int] := []
     result.push(list[0])
     mut i := 1
-    while i < list.len():
+    while i < n:
         if list[i] != list[i - 1]:
             result.push(list[i])
         i = i + 1
@@ -165,8 +177,9 @@ pub fn unique(list: List[Int]) -> List[Int]:
 # Removes all occurrences of a value from the list
 pub fn remove_all(list: List[Int], value: Int) -> List[Int]:
     mut result: List[Int] := []
+    n := list.len()
     mut i := 0
-    while i < list.len():
+    while i < n:
         if list[i] != value:
             result.push(list[i])
         i = i + 1
@@ -175,16 +188,10 @@ pub fn remove_all(list: List[Int], value: Int) -> List[Int]:
 # Returns elements that appear in both lists (preserves order from first list)
 pub fn intersection(a: List[Int], b: List[Int]) -> List[Int]:
     mut result: List[Int] := []
+    na := a.len()
     mut i := 0
-    while i < a.len():
-        mut found := false
-        mut j := 0
-        while j < b.len():
-            if a[i] == b[j]:
-                found = true
-                j = b.len()
-            j = j + 1
-        if found:
+    while i < na:
+        if contains(b, a[i]):
             result.push(a[i])
         i = i + 1
     return result
@@ -192,16 +199,10 @@ pub fn intersection(a: List[Int], b: List[Int]) -> List[Int]:
 # Returns elements in first list that are not in second list
 pub fn difference(a: List[Int], b: List[Int]) -> List[Int]:
     mut result: List[Int] := []
+    na := a.len()
     mut i := 0
-    while i < a.len():
-        mut found := false
-        mut j := 0
-        while j < b.len():
-            if a[i] == b[j]:
-                found = true
-                j = b.len()
-            j = j + 1
-        if not found:
+    while i < na:
+        if not contains(b, a[i]):
             result.push(a[i])
         i = i + 1
     return result
@@ -210,24 +211,16 @@ pub fn difference(a: List[Int], b: List[Int]) -> List[Int]:
 # List Transformation
 # ===============================================================
 
-# Reverses a list of integers
-pub fn reverse_list(list: List[Int]) -> List[Int]:
-    mut result: List[Int] := []
-    mut i := list.len() - 1
-    while i >= 0:
-        result.push(list[i])
-        i = i - 1
-    return result
-
 # Returns a slice of the list from start (inclusive) to end (exclusive)
 pub fn slice(list: List[Int], start: Int, end: Int) -> List[Int]:
     mut result: List[Int] := []
+    n := list.len()
     mut lo := start
     if lo < 0:
         lo = 0
     mut hi := end
-    if hi > list.len():
-        hi = list.len()
+    if hi > n:
+        hi = n
     mut i := lo
     while i < hi:
         result.push(list[i])
@@ -238,14 +231,16 @@ pub fn slice(list: List[Int], start: Int, end: Int) -> List[Int]:
 # If lists differ in length, remaining elements are appended
 pub fn zip_merge(a: List[Int], b: List[Int]) -> List[Int]:
     mut result: List[Int] := []
+    na := a.len()
+    nb := b.len()
+    mut max_len := na
+    if nb > max_len:
+        max_len = nb
     mut i := 0
-    mut max_len := a.len()
-    if b.len() > max_len:
-        max_len = b.len()
     while i < max_len:
-        if i < a.len():
+        if i < na:
             result.push(a[i])
-        if i < b.len():
+        if i < nb:
             result.push(b[i])
         i = i + 1
     return result
@@ -253,11 +248,13 @@ pub fn zip_merge(a: List[Int], b: List[Int]) -> List[Int]:
 # Flattens a list of lists into a single list
 pub fn flatten(lists: List[List[Int]]) -> List[Int]:
     mut result: List[Int] := []
+    n := lists.len()
     mut i := 0
-    while i < lists.len():
+    while i < n:
         inner := lists[i]
+        ni := inner.len()
         mut j := 0
-        while j < inner.len():
+        while j < ni:
             result.push(inner[j])
             j = j + 1
         i = i + 1
@@ -268,11 +265,12 @@ pub fn chunks(list: List[Int], size: Int) -> List[List[Int]]:
     mut result: List[List[Int]] := []
     if size <= 0:
         return result
+    n := list.len()
     mut i := 0
-    while i < list.len():
+    while i < n:
         mut chunk: List[Int] := []
         mut j := 0
-        while j < size and i + j < list.len():
+        while j < size and i + j < n:
             chunk.push(list[i + j])
             j = j + 1
         result.push(chunk)
@@ -283,54 +281,23 @@ pub fn chunks(list: List[Int], size: Int) -> List[List[Int]]:
 # Aggregation
 # ===============================================================
 
-# Returns the sum of all elements
-pub fn sum(list: List[Int]) -> Int:
-    mut total := 0
-    mut i := 0
-    while i < list.len():
-        total = total + list[i]
-        i = i + 1
-    return total
-
 # Returns the product of all elements (1 for empty list)
 pub fn product(list: List[Int]) -> Int:
     if list.len() == 0:
         return 1
     mut result := 1
     mut i := 0
-    while i < list.len():
+    n := list.len()
+    while i < n:
         result = result * list[i]
-        i = i + 1
-    return result
-
-# Returns the minimum value, or 0 for empty list
-pub fn min_val(list: List[Int]) -> Int:
-    if list.len() == 0:
-        return 0
-    mut result := list[0]
-    mut i := 1
-    while i < list.len():
-        if list[i] < result:
-            result = list[i]
-        i = i + 1
-    return result
-
-# Returns the maximum value, or 0 for empty list
-pub fn max_val(list: List[Int]) -> Int:
-    if list.len() == 0:
-        return 0
-    mut result := list[0]
-    mut i := 1
-    while i < list.len():
-        if list[i] > result:
-            result = list[i]
         i = i + 1
     return result
 
 # Returns true if list is sorted in ascending order
 pub fn is_sorted(list: List[Int]) -> Bool:
+    n := list.len()
     mut i := 1
-    while i < list.len():
+    while i < n:
         if list[i] < list[i - 1]:
             return false
         i = i + 1
@@ -340,7 +307,8 @@ pub fn is_sorted(list: List[Int]) -> Bool:
 pub fn count(list: List[Int], value: Int) -> Int:
     mut result := 0
     mut i := 0
-    while i < list.len():
+    n := list.len()
+    while i < n:
         if list[i] == value:
             result = result + 1
         i = i + 1

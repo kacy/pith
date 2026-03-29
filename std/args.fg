@@ -11,12 +11,9 @@
 #   parse()
 
 # ===============================================================
-# State — encoded as delimited strings with counters
+# State — delimited strings because Map globals don't survive
+# cross-module access in the current runtime
 # ===============================================================
-# Each flag entry:  "name|short|desc|value" (value: "0" or "1")
-# Each option entry: "name|short|desc|value"
-# Each pos entry:   "name|desc|value"
-# Records separated by "~"
 
 mut app_name: String := ""
 mut app_desc: String := ""
@@ -102,14 +99,16 @@ fn find_by_short(data: String, count: Int, short: String) -> String:
 fn rebuild_with_update(data: String, name: String, field_idx: Int, new_val: String) -> String:
     recs := get_records(data)
     mut result := ""
+    n := recs.len()
     mut i := 0
-    while i < recs.len():
+    while i < n:
         rec := recs[i]
         if get_field(rec, 0) == name:
             parts := rec.split("|")
             mut rebuilt := ""
+            np := parts.len()
             mut j := 0
-            while j < parts.len():
+            while j < np:
                 if j > 0:
                     rebuilt = rebuilt + "|"
                 if j == field_idx:
@@ -203,14 +202,16 @@ fn find_eq(s: String) -> Int:
 fn rebuild_with_update_by_index(data: String, rec_idx: Int, field_idx: Int, new_val: String) -> String:
     recs := get_records(data)
     mut result := ""
+    n := recs.len()
     mut i := 0
-    while i < recs.len():
+    while i < n:
         rec := recs[i]
         if i == rec_idx:
             parts := rec.split("|")
             mut rebuilt := ""
+            np := parts.len()
             mut j := 0
-            while j < parts.len():
+            while j < np:
                 if j > 0:
                     rebuilt = rebuilt + "|"
                 if j == field_idx:
@@ -234,10 +235,6 @@ fn add_error(msg: String):
     else:
         error_data = msg
     error_count = error_count + 1
-
-# Strip leading dashes from an argument string
-fn strip_dashes(arg: String, count: Int) -> String:
-    return arg.substring(count, arg.len())
 
 # ===============================================================
 # Querying

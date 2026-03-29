@@ -7,6 +7,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+/// Offset added to main module's index to avoid collisions with import indices
+const MAIN_MODULE_INDEX_OFFSET: usize = 100;
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -97,6 +100,13 @@ fn print_usage() {
     println!("  FORGE_DUMP_IR      Path to dump combined IR text (for debugging)");
 }
 
+fn dump_ir_if_requested(ir_text: &str) {
+    if let Ok(dump_path) = env::var("FORGE_DUMP_IR") {
+        let _ = fs::write(&dump_path, ir_text);
+        eprintln!("IR dumped to {} ({} bytes)", dump_path, ir_text.len());
+    }
+}
+
 /// Find the self-hosted compiler executable
 fn find_self_hosted_compiler() -> Option<String> {
     if let Ok(path) = env::var("FORGE_SELF_HOST") {
@@ -177,8 +187,7 @@ fn run_ir_driver(driver: &str, path: &str, module_index: usize) -> Result<String
         return Err(format!("IR driver failed on {}: {}", path, stderr));
     }
     let ir = String::from_utf8_lossy(&output.stdout).to_string();
-    if module_index >= 100 {
-        // Main module: rename strings only (no global collisions with itself)
+    if module_index >= MAIN_MODULE_INDEX_OFFSET {
         return Ok(ir.replace("m0s", &format!("m{}s", module_index)));
     }
 
@@ -361,8 +370,7 @@ fn get_ir_from_compiler(path: &str) -> Result<String, String> {
             all_ir.push('\n');
         }
     }
-    // Main module gets highest index (after all imports) for unique string IDs
-    let main_ir = run_ir_driver(&driver, path, module_files.len() + 100)?;
+    let main_ir = run_ir_driver(&driver, path, module_files.len() + MAIN_MODULE_INDEX_OFFSET)?;
     all_ir.push_str(&main_ir);
 
     Ok(all_ir)
@@ -418,10 +426,7 @@ fn build_file(path: &str) {
         }
     };
 
-    if let Ok(dump_path) = env::var("FORGE_DUMP_IR") {
-        let _ = fs::write(&dump_path, &ir_text);
-        eprintln!("IR dumped to {} ({} bytes)", dump_path, ir_text.len());
-    }
+    dump_ir_if_requested(&ir_text);
 
     match create_codegen() {
         Ok(mut codegen) => {
@@ -472,10 +477,7 @@ fn run_file(path: &str) {
         }
     };
 
-    if let Ok(dump_path) = env::var("FORGE_DUMP_IR") {
-        let _ = fs::write(&dump_path, &ir_text);
-        eprintln!("IR dumped to {} ({} bytes)", dump_path, ir_text.len());
-    }
+    dump_ir_if_requested(&ir_text);
 
     match create_codegen() {
         Ok(mut codegen) => {

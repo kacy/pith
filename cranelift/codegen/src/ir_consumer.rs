@@ -254,6 +254,8 @@ fn compile_ir_function(
     let mut regs: HashMap<usize, Value> = HashMap::new();
     let mut string_regs: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut string_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut float_regs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut float_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut named_vars: HashMap<String, Variable> = HashMap::new();
     let mut labels: HashMap<String, Block> = HashMap::new();
     let mut next_var_id: u32 = 0;
@@ -297,6 +299,54 @@ fn compile_ir_function(
             builder.def_var(var, block_params[i]);
             named_vars.insert(name.clone(), var);
             regs.insert(i, block_params[i]);
+        }
+    }
+
+    // Pre-scan: detect float-typed variables by finding `store VAR REG`
+    // where REG was assigned by fconst/fmul/fadd/fsub/fdiv
+    {
+        let mut float_source_regs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for line in body_lines {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.is_empty() { continue; }
+            match p[0] {
+                "fconst" | "fadd" | "fsub" | "fmul" | "fdiv" if p.len() >= 2 => {
+                    if let Ok(r) = p[1].parse::<usize>() {
+                        float_source_regs.insert(r);
+                    }
+                }
+                "store" if p.len() >= 3 => {
+                    if let Ok(r) = p[2].parse::<usize>() {
+                        if float_source_regs.contains(&r) {
+                            float_vars.insert(p[1].to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Also mark parameters used in float context: if any load of a param
+        // is used as operand in fmul/fadd/etc., mark it as float
+        for line in body_lines {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() >= 4 && matches!(p[0], "fmul" | "fadd" | "fsub" | "fdiv") {
+                // operands at p[2] and p[3] — find which loads fed them
+                for &arg_str in &[p[2], p[3]] {
+                    if let Ok(arg_reg) = arg_str.parse::<usize>() {
+                        // search for the load that produced this reg
+                        for line2 in body_lines {
+                            let p2: Vec<&str> = line2.split_whitespace().collect();
+                            if p2.len() >= 3 && p2[0] == "load" {
+                                if let Ok(r) = p2[1].parse::<usize>() {
+                                    if r == arg_reg {
+                                        float_vars.insert(p2[2].to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -347,10 +397,10 @@ fn compile_ir_function(
             "fconst" if parts.len() >= 3 => {
                 let reg: usize = parts[1].parse().unwrap_or(0);
                 let fval: f64 = parts[2].parse().unwrap_or(0.0);
-                // Create actual f64 constant, then bitcast to i64 for uniform handling
                 let fv = builder.ins().f64const(fval);
                 let v = builder.ins().bitcast(types::I64, cranelift::codegen::ir::MemFlags::new(), fv);
                 regs.insert(reg, v);
+                float_regs.insert(reg);
             }
 
             "strref" if parts.len() >= 3 => {
@@ -418,6 +468,7 @@ fn compile_ir_function(
                 // Bitcast f64 → i64
                 let v = builder.ins().bitcast(types::I64, cranelift::codegen::ir::MemFlags::new(), fv);
                 regs.insert(reg, v);
+                float_regs.insert(reg);
             }
 
             "add" | "sub" | "mul" | "div" | "mod" if parts.len() >= 4 => {
@@ -449,6 +500,22 @@ fn compile_ir_function(
                         regs.insert(reg, builder.ins().iadd(a, b));
                     }
                     string_regs.insert(reg);
+                // If operands are known floats, promote to float operation
+                } else if matches!(parts[0], "add" | "sub" | "mul" | "div")
+                    && (float_regs.contains(&a_reg) || float_regs.contains(&b_reg))
+                {
+                    let fa = builder.ins().bitcast(types::F64, cranelift::codegen::ir::MemFlags::new(), a);
+                    let fb = builder.ins().bitcast(types::F64, cranelift::codegen::ir::MemFlags::new(), b);
+                    let fv = match parts[0] {
+                        "add" => builder.ins().fadd(fa, fb),
+                        "sub" => builder.ins().fsub(fa, fb),
+                        "mul" => builder.ins().fmul(fa, fb),
+                        "div" => builder.ins().fdiv(fa, fb),
+                        _ => unreachable!(),
+                    };
+                    let v = builder.ins().bitcast(types::I64, cranelift::codegen::ir::MemFlags::new(), fv);
+                    regs.insert(reg, v);
+                    float_regs.insert(reg);
                 } else {
                     let v = match parts[0] {
                         "add" => builder.ins().iadd(a, b),
@@ -489,6 +556,23 @@ fn compile_ir_function(
                         let cmp = builder.ins().icmp(IntCC::SignedLessThan, a, b);
                         regs.insert(reg, builder.ins().uextend(types::I64, cmp));
                     }
+                } else if float_regs.contains(&a_reg) || float_regs.contains(&b_reg) {
+                    // Float comparison
+                    let fa = builder.ins().bitcast(types::F64, cranelift::codegen::ir::MemFlags::new(), a);
+                    let fb = builder.ins().bitcast(types::F64, cranelift::codegen::ir::MemFlags::new(), b);
+                    use cranelift::codegen::ir::condcodes::FloatCC;
+                    let fcc = match parts[0] {
+                        "eq" => FloatCC::Equal,
+                        "neq" => FloatCC::NotEqual,
+                        "lt" => FloatCC::LessThan,
+                        "gt" => FloatCC::GreaterThan,
+                        "lte" => FloatCC::LessThanOrEqual,
+                        "gte" => FloatCC::GreaterThanOrEqual,
+                        _ => FloatCC::Equal,
+                    };
+                    let cmp = builder.ins().fcmp(fcc, fa, fb);
+                    let v = builder.ins().uextend(types::I64, cmp);
+                    regs.insert(reg, v);
                 } else {
                     let cc = match parts[0] {
                         "eq" => IntCC::Equal,
@@ -611,10 +695,13 @@ fn compile_ir_function(
             "store" if parts.len() >= 3 => {
                 let name = parts[1].to_string();
                 let val = get_reg(&regs, parts[2]);
-                // Propagate string type through store
+                // Propagate types through store
                 if let Ok(src_reg) = parts[2].parse::<usize>() {
                     if string_regs.contains(&src_reg) {
                         string_vars.insert(name.clone());
+                    }
+                    if float_regs.contains(&src_reg) {
+                        float_vars.insert(name.clone());
                     }
                 }
                 // Check if this is a global variable
@@ -651,9 +738,12 @@ fn compile_ir_function(
                 } else {
                     regs.insert(reg, builder.ins().iconst(types::I64, 0));
                 }
-                // Propagate string type through load
+                // Propagate types through load
                 if string_vars.contains(name) || string_global_names.contains(name) {
                     string_regs.insert(reg);
+                }
+                if float_vars.contains(name) {
+                    float_regs.insert(reg);
                 }
             }
 

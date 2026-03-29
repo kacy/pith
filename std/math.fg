@@ -1,13 +1,14 @@
-# std.math — math constants
+# std.math — math constants and helpers
 #
-# Builtins (always available, no import needed):
-#   abs, min, max, clamp, pow, sqrt, floor, ceil, round
-#   sin, cos, tan, asin, acos, atan, atan2
-#   math_log, math_log10, math_log2, math_exp, math_abs_float
-#   fmt_float
+# Most math functions are builtins (no import needed):
+#   sin(x), cos(x), tan(x), asin(x), acos(x), atan(x), atan2(y, x)
+#   math_log(x), math_log10(x), math_log2(x), math_exp(x)
+#   math_abs_float(x), pow(x, y), sqrt(x), floor(x), ceil(x), round(x)
+#   abs(x), min(a, b), max(a, b), clamp(x, lo, hi)
+#   fmt_float(x, decimals)
 #
-# This module provides constants:
-#   from std.math import PI, E, TAU
+# This module adds:
+#   from std.math import PI, E, degrees, radians, hypot, sign
 
 pub fn PI() -> Float:
     return acos(0.0 - 1.0)
@@ -17,3 +18,21 @@ pub fn E() -> Float:
 
 pub fn TAU() -> Float:
     return acos(0.0 - 1.0) * 2.0
+
+pub fn degrees(rad: Float) -> Float:
+    pi := acos(0.0 - 1.0)
+    return rad * 180.0 / pi
+
+pub fn radians(deg: Float) -> Float:
+    pi := acos(0.0 - 1.0)
+    return deg * pi / 180.0
+
+pub fn hypot(a: Float, b: Float) -> Float:
+    return sqrt(a * a + b * b)
+
+pub fn sign(x: Float) -> Float:
+    if x > 0.0:
+        return 1.0
+    if x < 0.0:
+        return 0.0 - 1.0
+    return 0.0

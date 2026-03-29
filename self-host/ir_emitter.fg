@@ -127,20 +127,22 @@ fn ir_str(s: String) -> String:
     ir_strings.push(cleaned)
     return "m" + ir_module_count.to_string() + "s" + idx.to_string()
 
-# --- collect strings ---
+# --- collect strings (iterative to avoid deep recursion crashes) ---
 fn ir_collect_strings(idx: Int):
-    node := get_node(idx)
-    if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
-        ir_str(node.value)
-    elif node.kind == "lit":
-        ir_str(node.value)
-    mut _fi2 := 0
-    _kids2 := node.children
-    while _fi2 < _kids2.len():
-        child := _kids2[_fi2]
-        ir_collect_strings(child)
-
-        _fi2 = _fi2 + 1
+    mut stack: List[Int] := [idx]
+    while stack.len() > 0:
+        current := stack[stack.len() - 1]
+        stack.remove(stack.len() - 1)
+        node := get_node(current)
+        if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
+            ir_str(node.value)
+        elif node.kind == "lit":
+            ir_str(node.value)
+        kids := node.children
+        mut i := 0
+        while i < kids.len():
+            stack.push(kids[i])
+            i = i + 1
 # --- centralized type inference for AST nodes ---
 # Returns: "int", "float", "bool", "string", "list", "list_string",
 #          "map", "map_int", "set", or "" (unknown)
@@ -703,6 +705,12 @@ fn ir_expr(idx: Int) -> Int:
         ir_emit("call " + r.to_string() + " " + fname + " " + arg_regs.len().to_string() + args_s)
         return r
 
+    else:
+        return ir_expr_complex(idx, node)
+    return r
+
+fn ir_expr_complex(idx: Int, node: Node) -> Int:
+    r := ir_reg()
     if node.kind == "method_call":
     if node.kind == "method_call":
         return ir_emit_method_call(idx)
@@ -838,7 +846,7 @@ fn ir_expr(idx: Int) -> Int:
                     scn := get_node(sc)
                     if scn.kind == "ident" and spawn_fname == "unknown":
                         spawn_fname = scn.value
-                    elif scn.kind == "arg" and spawn_arg_r < 0:
+                    if scn.kind == "arg" and spawn_arg_r < 0:
                         if scn.children.len() > 0:
                             spawn_arg_r = ir_expr(scn.children[0])
                     _fi12 = _fi12 + 1
@@ -1069,7 +1077,11 @@ fn ir_stmt(idx: Int):
                 ir_emit("div " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
             ir_emit("store " + name + " " + res.to_string())
 
-    elif node.kind == "if" or node.kind == "if_stmt":
+    else:
+        ir_stmt_control(idx, node)
+
+fn ir_stmt_control(idx: Int, node: Node):
+    if node.kind == "if" or node.kind == "if_stmt":
         # children: condition, then, [elif...], [else]
         # collect all branches
         mut cond_idx := 0 - 1
@@ -1240,24 +1252,25 @@ fn ir_stmt(idx: Int):
             ir_emit("label " + end_l)
 
 # --- emit block ---
+# Iterative block walker — unwinds block/body/then/else wrappers
+# and calls ir_stmt on leaf statements. Uses explicit stack to
+# avoid deep recursion crashes with the Cranelift backend.
 fn ir_block(idx: Int):
-    node := get_node(idx)
-    if node.kind == "block" or node.kind == "then" or node.kind == "else":
-        mut _fi17 := 0
-        _kids17 := node.children
-        while _fi17 < _kids17.len():
-            child := _kids17[_fi17]
-            ir_block(child)
-            _fi17 = _fi17 + 1
-    elif node.kind == "body":
-        mut _fi18 := 0
-        _kids18 := node.children
-        while _fi18 < _kids18.len():
-            child := _kids18[_fi18]
-            ir_block(child)
-            _fi18 = _fi18 + 1
-    else:
-        ir_stmt(idx)
+    mut stack: List[Int] := [idx]
+    while stack.len() > 0:
+        current := stack[stack.len() - 1]
+        stack.remove(stack.len() - 1)
+        node := get_node(current)
+        kind := node.kind
+        if kind == "block" or kind == "then" or kind == "else" or kind == "body":
+            # Push children in reverse so first child is processed first
+            kids := node.children
+            mut i := kids.len() - 1
+            while i >= 0:
+                stack.push(kids[i])
+                i = i - 1
+        else:
+            ir_stmt(current)
 
 # --- helpers for function emission ---
 

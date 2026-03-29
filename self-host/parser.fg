@@ -244,29 +244,31 @@ fn parse_not() -> Int:
         return add_node_with_position("unary", "not", children)
     return parse_comparison()
 
+fn parse_comparison_op() -> String:
+    k := peek_current_token().kind
+    if k == "eq_eq":
+        return "eq"
+    if k == "bang_eq":
+        return "neq"
+    if k == "less":
+        return "lt"
+    if k == "greater":
+        return "gt"
+    if k == "less_eq":
+        return "lte"
+    if k == "greater_eq":
+        return "gte"
+    return ""
+
 fn parse_comparison() -> Int:
     mut left := parse_pipe()
-    while true:
-        current_token := peek_current_token()
-        mut op := ""
-        if current_token.kind == "eq_eq":
-            op = "eq"
-        elif current_token.kind == "bang_eq":
-            op = "neq"
-        elif current_token.kind == "less":
-            op = "lt"
-        elif current_token.kind == "greater":
-            op = "gt"
-        elif current_token.kind == "less_eq":
-            op = "lte"
-        elif current_token.kind == "greater_eq":
-            op = "gte"
-        else:
-            break
+    mut op := parse_comparison_op()
+    while op != "":
         advance_token()
         right := parse_pipe()
         mut children: List[Int] := [left, right]
         left = add_node_with_position("binary", op, children)
+        op = parse_comparison_op()
     return left
 
 fn parse_pipe() -> Int:
@@ -278,36 +280,36 @@ fn parse_pipe() -> Int:
         left = add_node_with_position("binary", "pipe", children)
     return left
 
+fn is_additive_op() -> Bool:
+    k := peek_current_token().kind
+    return k == "plus" or k == "minus"
+
 fn parse_add() -> Int:
     mut left := parse_mul()
-    while true:
+    while is_additive_op():
         current_token := peek_current_token()
-        mut op := ""
-        if current_token.kind == "plus":
-            op = "add"
-        elif current_token.kind == "minus":
+        mut op := "add"
+        if current_token.kind == "minus":
             op = "sub"
-        else:
-            break
         advance_token()
         right := parse_mul()
         mut children: List[Int] := [left, right]
         left = add_node_with_position("binary", op, children)
     return left
 
+fn is_multiplicative_op() -> Bool:
+    k := peek_current_token().kind
+    return k == "star" or k == "slash" or k == "percent"
+
 fn parse_mul() -> Int:
     mut left := parse_unary()
-    while true:
+    while is_multiplicative_op():
         current_token := peek_current_token()
-        mut op := ""
-        if current_token.kind == "star":
-            op = "mul"
-        elif current_token.kind == "slash":
+        mut op := "mul"
+        if current_token.kind == "slash":
             op = "div"
         elif current_token.kind == "percent":
             op = "mod"
-        else:
-            break
         advance_token()
         right := parse_unary()
         mut children: List[Int] := [left, right]
@@ -338,71 +340,64 @@ fn parse_unary() -> Int:
 fn parse_postfix() -> Int:
     mut expr := parse_primary()
 
-    while true:
+    mut has_postfix := true
+    while has_postfix:
         current_token := peek_current_token()
+        kind := current_token.kind
 
-        # unwrap: expr?
-        if current_token.kind == "question":
+        if kind == "question":
+            # unwrap: expr?
             advance_token()
             mut children: List[Int] := [expr]
             expr = add_node_with_position("unwrap", "", children)
-            continue
 
-        # try: expr!
-        if current_token.kind == "bang":
+        elif kind == "bang":
+            # try: expr!
             advance_token()
             mut children: List[Int] := [expr]
             expr = add_node_with_position("try", "", children)
-            continue
 
-        # call: expr(args)
-        if current_token.kind == "lparen":
+        elif kind == "lparen":
+            # call: expr(args)
             expr = parse_call_expr(expr)
-            continue
 
-        # index: expr[index]
-        if current_token.kind == "lbracket":
+        elif kind == "lbracket":
+            # index: expr[index]
             advance_token()
             idx := parse_expression()
             expect("rbracket")
             mut children: List[Int] := [expr, idx]
             expr = add_node_with_position("index", "", children)
-            continue
 
-        # field access or method call: expr.name or expr.name(args) or expr.0
-        if current_token.kind == "dot":
+        elif kind == "dot":
+            # field access or method call
             advance_token()
-
-            # tuple field: expr.0, expr.1, etc
             if check("int_lit"):
+                # tuple field: expr.0
                 idx_tok := advance_token()
                 mut children: List[Int] := [expr]
                 expr = add_node_with_position("field_access", idx_tok.value, children)
-                continue
-
-            name_tok := expect("identifier")
-
-            # method call: expr.name(args)
-            if check("lparen"):
-                advance_token()
-                call_args := parse_arg_list()
-                expect("rparen")
-                mut children: List[Int] := [expr]
-                for a in call_args:
-                    children.push(a)
-                expr = add_node_with_position("method_call", name_tok.value, children)
             else:
-                # field access: expr.name
-                mut children: List[Int] := [expr]
-                expr = add_node_with_position("field_access", name_tok.value, children)
-            continue
+                name_tok := expect("identifier")
+                if check("lparen"):
+                    # method call: expr.name(args)
+                    advance_token()
+                    call_args := parse_arg_list()
+                    expect("rparen")
+                    mut children: List[Int] := [expr]
+                    for a in call_args:
+                        children.push(a)
+                    expr = add_node_with_position("method_call", name_tok.value, children)
+                else:
+                    # field access: expr.name
+                    mut children: List[Int] := [expr]
+                    expr = add_node_with_position("field_access", name_tok.value, children)
 
-        # struct initialization: TypeName{field1, field2, ...}
-        if current_token.kind == "lbrace":
-            # Only valid if expr is an identifier (the struct type name)
+        elif kind == "lbrace":
+            # struct init: TypeName{...}
             expr_node := get_node(expr)
             if expr_node.kind == "ident":
-                advance_token() # skip {
+                advance_token()
                 mut args: List[Int] := []
                 skip_newlines()
                 if check("rbrace") == false:
@@ -412,11 +407,11 @@ fn parse_postfix() -> Int:
                         args.push(parse_expression())
                 skip_newlines()
                 expect("rbrace")
-                # Store type name in value, args as children
                 expr = add_node_with_position("struct_init", expr_node.value, args)
-                continue
-
-        break
+            else:
+                has_postfix = false
+        else:
+            has_postfix = false
 
     return expr
 

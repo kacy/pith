@@ -415,6 +415,15 @@ fn compile_ir_function(
     // while-condition loops, to avoid false positives.
     let mut break_redirects: HashMap<String, String> = HashMap::new();
     {
+        // Build label position index
+        let mut label_positions: HashMap<&str, usize> = HashMap::new();
+        for (idx, line) in body_lines.iter().enumerate() {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() >= 2 && p[0] == "label" {
+                label_positions.insert(p[1], idx);
+            }
+        }
+
         // Find `while true` headers: iconst REG 1 → brif REG BODY EXIT
         let mut while_true_exits: HashMap<String, String> = HashMap::new();
         for (idx, line) in body_lines.iter().enumerate() {
@@ -439,7 +448,7 @@ fn compile_ir_function(
             }
         }
 
-        // Find jmps to while-true headers and mark preceding labels as breaks
+        // Find jmps to while-true headers and mark preceding labels
         for (idx, line) in body_lines.iter().enumerate() {
             let p: Vec<&str> = line.split_whitespace().collect();
             if p.len() >= 2 && p[0] == "jmp" {
@@ -457,33 +466,6 @@ fn compile_ir_function(
                 }
             }
         }
-
-        // Propagate redirects transitively: if jmp TARGET and TARGET is in
-        // break_redirects, add the labels before that jmp too. Repeat until
-        // no new entries are added.
-        for _ in 0..10 {
-            let snapshot = break_redirects.clone();
-            let before = snapshot.len();
-            for (idx, line) in body_lines.iter().enumerate() {
-                let p: Vec<&str> = line.split_whitespace().collect();
-                if p.len() >= 2 && p[0] == "jmp" {
-                    if let Some(exit) = snapshot.get(p[1]) {
-                        let mut li = idx.wrapping_sub(1);
-                        while li < body_lines.len() {
-                            let lp: Vec<&str> = body_lines[li].split_whitespace().collect();
-                            if lp.len() >= 2 && lp[0] == "label" {
-                                break_redirects.insert(lp[1].to_string(), exit.clone());
-                                li = li.wrapping_sub(1);
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if break_redirects.len() == before { break; }
-        }
-
         // Remove brif THEN targets (loop body, not break)
         for line in body_lines.iter() {
             let p: Vec<&str> = line.split_whitespace().collect();

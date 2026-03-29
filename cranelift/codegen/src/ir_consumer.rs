@@ -759,6 +759,14 @@ fn compile_ir_function(
                 if fname == "tcp_read" && nargs == 2 {
                     fname = "tcp_read2";
                 }
+                // __list_get on a string → char_at (string indexing)
+                if (fname == "__list_get" || fname == "__index") && nargs >= 1 && parts.len() > 4 {
+                    if let Ok(arg_reg) = parts[4].parse::<usize>() {
+                        if string_regs.contains(&arg_reg) {
+                            fname = "char_at";
+                        }
+                    }
+                }
                 let mut args: Vec<Value> = Vec::new();
                 for j in 0..nargs {
                     if j + 4 < parts.len() {

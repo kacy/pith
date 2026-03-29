@@ -51,6 +51,13 @@ fn is_hex_digit(character: String) -> Bool:
             return true
     return false
 
+fn is_octal_char(c: String) -> Bool:
+    if c == "_":
+        return true
+    if c >= "0" and c <= "7":
+        return true
+    return false
+
 KEYWORDS := ",fn,if,elif,else,for,in,while,match,return,fail,break,continue,spawn,await,struct,enum,interface,impl,type,pub,mut,ref,weak,import,from,as,self,true,false,none,and,or,not,test,"
 
 fn is_keyword(word: String) -> Bool:
@@ -228,9 +235,7 @@ fn next_token():
             return
         elif level < current_indent:
             mut dedents := 0
-            while indent_stack.len() > 1:
-                if indent_stack[indent_stack.len() - 1] <= level:
-                    break
+            while indent_stack.len() > 1 and indent_stack[indent_stack.len() - 1] > level:
                 indent_stack.remove(indent_stack.len() - 1)
                 dedents = dedents + 1
             # verify the target indentation level exists in the stack
@@ -266,9 +271,7 @@ fn next_token():
     # comment
     if character == "#":
         start := current_position
-        while current_position < source.len():
-            if source[current_position] == "\n":
-                break
+        while current_position < source.len() and source[current_position] != "\n":
             current_position = current_position + 1
             current_column = current_column + 1
         emit("comment", source.substring(start, current_position))
@@ -294,12 +297,9 @@ fn next_token():
 
 fn scan_identifier():
     start := current_position
-    while current_position < source.len():
-        if is_alnum(source[current_position]):
-            current_position = current_position + 1
-            current_column = current_column + 1
-        else:
-            break
+    while current_position < source.len() and is_alnum(source[current_position]):
+        current_position = current_position + 1
+        current_column = current_column + 1
     word := source.substring(start, current_position)
 
     # check for lone underscore
@@ -323,53 +323,32 @@ fn scan_number():
             if next_char == "x" or next_char == "X":
                 current_position = current_position + 2
                 current_column = current_column + 2
-                while current_position < source.len():
-                    current_char := source[current_position]
-                    if is_hex_digit(current_char) or current_char == "_":
-                        current_position = current_position + 1
-                        current_column = current_column + 1
-                    else:
-                        break
+                while current_position < source.len() and (is_hex_digit(source[current_position]) or source[current_position] == "_"):
+                    current_position = current_position + 1
+                    current_column = current_column + 1
                 emit("int_lit", source.substring(start, current_position))
                 return
             if next_char == "b" or next_char == "B":
                 current_position = current_position + 2
                 current_column = current_column + 2
-                while current_position < source.len():
-                    current_char := source[current_position]
-                    if current_char == "0" or current_char == "1" or current_char == "_":
-                        current_position = current_position + 1
-                        current_column = current_column + 1
-                    else:
-                        break
+                while current_position < source.len() and (source[current_position] == "0" or source[current_position] == "1" or source[current_position] == "_"):
+                    current_position = current_position + 1
+                    current_column = current_column + 1
                 emit("int_lit", source.substring(start, current_position))
                 return
             if next_char == "o" or next_char == "O":
                 current_position = current_position + 2
                 current_column = current_column + 2
-                while current_position < source.len():
-                    current_char := source[current_position]
-                    if current_char >= "0":
-                        if current_char <= "7":
-                            current_position = current_position + 1
-                            current_column = current_column + 1
-                            continue
-                    if current_char == "_":
-                        current_position = current_position + 1
-                        current_column = current_column + 1
-                        continue
-                    break
+                while current_position < source.len() and is_octal_char(source[current_position]):
+                    current_position = current_position + 1
+                    current_column = current_column + 1
                 emit("int_lit", source.substring(start, current_position))
                 return
 
     # decimal digits
-    while current_position < source.len():
-        current_char := source[current_position]
-        if is_digit(current_char) or current_char == "_":
-            current_position = current_position + 1
-            current_column = current_column + 1
-        else:
-            break
+    while current_position < source.len() and (is_digit(source[current_position]) or source[current_position] == "_"):
+        current_position = current_position + 1
+        current_column = current_column + 1
 
     # check for decimal point (must be followed by a digit)
     mut is_float := false
@@ -380,13 +359,9 @@ fn scan_number():
                     is_float = true
                     current_position = current_position + 1
                     current_column = current_column + 1
-                    while current_position < source.len():
-                        current_char := source[current_position]
-                        if is_digit(current_char) or current_char == "_":
-                            current_position = current_position + 1
-                            current_column = current_column + 1
-                        else:
-                            break
+                    while current_position < source.len() and (is_digit(source[current_position]) or source[current_position] == "_"):
+                        current_position = current_position + 1
+                        current_column = current_column + 1
 
     # check for exponent
     if current_position < source.len():
@@ -400,13 +375,9 @@ fn scan_number():
                 if scan_char == "+" or scan_char == "-":
                     current_position = current_position + 1
                     current_column = current_column + 1
-            while current_position < source.len():
-                current_char := source[current_position]
-                if is_digit(current_char) or current_char == "_":
-                    current_position = current_position + 1
-                    current_column = current_column + 1
-                else:
-                    break
+            while current_position < source.len() and (is_digit(source[current_position]) or source[current_position] == "_"):
+                current_position = current_position + 1
+                current_column = current_column + 1
 
     if is_float:
         emit("float_lit", source.substring(start, current_position))

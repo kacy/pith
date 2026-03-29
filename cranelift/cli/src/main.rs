@@ -176,9 +176,13 @@ fn run_ir_driver(driver: &str, path: &str, module_index: usize) -> Result<String
         return Err(format!("IR driver failed on {}: {}", path, stderr));
     }
     let ir = String::from_utf8_lossy(&output.stdout).to_string();
-    if module_index == 0 {
-        return Ok(ir);
+    if module_index >= 100 {
+        // Main module: rename strings only (no global collisions with itself)
+        return Ok(ir.replace("m0s", &format!("m{}s", module_index)));
     }
+
+    // Remove `main` function from imported modules (only main module's main should exist)
+    let ir = remove_main_from_import(&ir);
     let prefix = format!("m{}_", module_index);
 
     // Collect global names from "global NAME ..." lines
@@ -235,6 +239,28 @@ fn run_ir_driver(driver: &str, path: &str, module_index: usize) -> Result<String
         result.push('\n');
     }
     Ok(result)
+}
+
+/// Remove `func main ... endfunc` from imported module IR
+fn remove_main_from_import(ir: &str) -> String {
+    let mut result = String::new();
+    let mut skip = false;
+    for line in ir.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("func main ") {
+            skip = true;
+            continue;
+        }
+        if skip && trimmed == "endfunc" {
+            skip = false;
+            continue;
+        }
+        if !skip {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    result
 }
 
 /// Find the stdlib root directory by walking up from the source file and CWD
@@ -334,7 +360,8 @@ fn get_ir_from_compiler(path: &str) -> Result<String, String> {
             all_ir.push('\n');
         }
     }
-    let main_ir = run_ir_driver(&driver, path, module_files.len())?;
+    // Main module gets highest index (after all imports) for unique string IDs
+    let main_ir = run_ir_driver(&driver, path, module_files.len() + 100)?;
     all_ir.push_str(&main_ir);
 
     Ok(all_ir)
@@ -389,6 +416,11 @@ fn build_file(path: &str) {
             return;
         }
     };
+
+    if let Ok(dump_path) = env::var("FORGE_DUMP_IR") {
+        let _ = fs::write(&dump_path, &ir_text);
+        eprintln!("IR dumped to {} ({} bytes)", dump_path, ir_text.len());
+    }
 
     match create_codegen() {
         Ok(mut codegen) => {

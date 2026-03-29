@@ -363,14 +363,58 @@ fn get_ir_from_compiler(path: &str) -> Result<String, String> {
 
     // Generate IR: imported modules first, then main file
     let mut all_ir = String::new();
+    let mut global_renames: Vec<(String, String)> = Vec::new(); // (bare, prefixed)
     for (i, mod_file) in module_files.iter().enumerate() {
         let ir = run_ir_driver(&driver, mod_file, i)?;
         if !ir.is_empty() {
+            // Collect global name mappings for main module rewriting
+            let prefix = format!("m{}_", i);
+            for line in ir.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 && parts[0] == "global" {
+                    let prefixed = parts[1].to_string();
+                    if let Some(bare) = prefixed.strip_prefix(&prefix) {
+                        global_renames.push((bare.to_string(), prefixed.clone()));
+                    }
+                }
+            }
             all_ir.push_str(&ir);
             all_ir.push('\n');
         }
     }
-    let main_ir = run_ir_driver(&driver, path, module_files.len() + MAIN_MODULE_INDEX_OFFSET)?;
+    let main_ir_raw = run_ir_driver(&driver, path, module_files.len() + MAIN_MODULE_INDEX_OFFSET)?;
+    // Rewrite main module's load/store references to imported globals
+    let mut main_ir = String::new();
+    let global_map: std::collections::HashMap<&str, &str> = global_renames.iter()
+        .map(|(bare, prefixed)| (bare.as_str(), prefixed.as_str()))
+        .collect();
+    for line in main_ir_raw.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let mut rewritten = false;
+        if parts.len() >= 3 {
+            match parts[0] {
+                "load" => {
+                    // load REG NAME — rewrite NAME if it's an imported global
+                    if let Some(&prefixed) = global_map.get(parts[2]) {
+                        main_ir.push_str(&format!("load {} {}", parts[1], prefixed));
+                        rewritten = true;
+                    }
+                }
+                "store" => {
+                    // store NAME REG — rewrite NAME if it's an imported global
+                    if let Some(&prefixed) = global_map.get(parts[1]) {
+                        main_ir.push_str(&format!("store {} {}", prefixed, parts[2]));
+                        rewritten = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !rewritten {
+            main_ir.push_str(line);
+        }
+        main_ir.push('\n');
+    }
     all_ir.push_str(&main_ir);
 
     Ok(all_ir)

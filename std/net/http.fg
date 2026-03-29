@@ -1,140 +1,392 @@
-## std.net.http — HTTP request parsing, response building, and client
-##
-## Functions:
-##   parse_request(raw: String) -> Request
-##   respond(status: Int, content_type: String, body: String) -> String
-##   text_response(status: Int, body: String) -> String
-##   html_response(status: Int, body: String) -> String
-##   json_response(status: Int, body: String) -> String
-##   get(host: String, port: Int, path: String) -> String
+# std.net.http — HTTP server and client
+#
+# Request parsing returns a packed string; accessor functions extract fields.
+# No cross-module state needed — all operations are pure string transforms.
+#
+#   from std.net.http import parse_request, method, path, body
+#   from std.net.http import get_header, get_query_param
+#   from std.net.http import html_response, json_response, not_found
+#   from std.net.http import read_request, send_response
+#
+#   fn handle(fd: Int):
+#       req := read_request(fd)
+#       if method(req) == "GET" and path(req) == "/":
+#           send_response(fd, html_response(200, "<h1>Hello!</h1>"))
+#       else:
+#           send_response(fd, not_found())
 
-# --- MIME type constants ---
+# ===============================================================
+# MIME Types and Status Codes
+# ===============================================================
+
 pub MIME_TEXT := "text/plain"
 pub MIME_HTML := "text/html"
 pub MIME_JSON := "application/json"
-pub MIME_JS := "application/javascript"
-pub MIME_CSS := "text/css"
-pub MIME_FORM := "application/x-www-form-urlencoded"
 
-# --- Status code constants ---
-pub STATUS_OK := 200
-pub STATUS_CREATED := 201
-pub STATUS_NOT_FOUND := 404
-pub STATUS_BAD_REQUEST := 400
-pub STATUS_SERVER_ERROR := 500
+# ===============================================================
+# Request Parsing
+# ===============================================================
 
-# --- HTTP request ---
+# Internal separator for packed request fields (ASCII unit separator)
+# Format: method + SEP + route_path + SEP + query + SEP + version + SEP + headers + SEP + body
+# where SEP = chr(31)
 
-struct Request:
-    pub method: String
-    pub path: String
-    pub version: String
-    pub body: String
-    pub header_count: Int
+fn REQ_SEP() -> String:
+    return chr(31)
 
-## Parse a raw HTTP request string into a Request struct
-pub fn parse_request(raw: String) -> Request:
-    # split on double newline to separate headers from body
+# Parse a raw HTTP request string. Returns a packed string for use with accessors.
+pub fn parse_request(raw: String) -> String:
     nl := chr(10)
+    cr := chr(13)
+    sep := REQ_SEP()
     mut header_part := raw
-    mut body := ""
+    mut req_body := ""
+
+    # split headers from body on blank line
     mut i := 0
-    while i < raw.len() - 1:
+    raw_len := raw.len()
+    while i < raw_len - 1:
         if raw[i] == nl:
-            # check for \n\n or \r\n\r\n
-            if i + 1 < raw.len() and raw[i + 1] == nl:
+            if i + 1 < raw_len and raw[i + 1] == nl:
                 header_part = raw.substring(0, i)
-                body = raw.substring(i + 2, raw.len())
+                req_body = raw.substring(i + 2, raw_len)
                 break
-            elif i + 2 < raw.len() and raw[i + 1] == chr(13) and raw[i + 2] == nl:
+            elif i + 2 < raw_len and raw[i + 1] == cr and raw[i + 2] == nl:
                 header_part = raw.substring(0, i)
-                body = raw.substring(i + 3, raw.len())
+                req_body = raw.substring(i + 3, raw_len)
                 break
         i = i + 1
 
     # parse request line
     lines := header_part.split(nl)
-    mut method := "GET"
-    mut path := "/"
-    mut version := "HTTP/1.1"
-    mut hdr_count := 0
+    mut meth := "GET"
+    mut full_path := "/"
+    mut ver := "HTTP/1.1"
+    mut headers := ""
 
     if lines.len() > 0:
         request_line := lines[0].trim()
-        parts := request_line.split(" ")
-        if parts.len() >= 1:
-            method = parts[0]
-        if parts.len() >= 2:
-            path = parts[1]
-        if parts.len() >= 3:
-            version = parts[2]
-        hdr_count = lines.len() - 1
+        # find spaces manually
+        mut sp1 := -1
+        mut sp2 := -1
+        mut ri := 0
+        rl_len := request_line.len()
+        while ri < rl_len:
+            if request_line[ri] == " ":
+                if sp1 < 0:
+                    sp1 = ri
+                elif sp2 < 0:
+                    sp2 = ri
+                    break
+            ri = ri + 1
+        if sp1 > 0:
+            meth = request_line.substring(0, sp1)
+        if sp1 >= 0 and sp2 > sp1:
+            full_path = request_line.substring(sp1 + 1, sp2)
+            ver = request_line.substring(sp2 + 1, rl_len).trim()
+        elif sp1 >= 0:
+            full_path = request_line.substring(sp1 + 1, rl_len).trim()
 
-    return Request(method, path, version, body, hdr_count)
+        # collect header lines joined by nl
+        mut hi := 1
+        hdr_n := lines.len()
+        while hi < hdr_n:
+            line := lines[hi].trim()
+            if line.len() > 0:
+                if headers.len() > 0:
+                    tmp := headers + nl
+                    headers = tmp + line
+                else:
+                    headers = line
+            hi = hi + 1
 
-# --- HTTP response building ---
+    # split path from query string
+    mut route := full_path
+    mut req_query := ""
+    mut qi := 0
+    fp_len := full_path.len()
+    while qi < fp_len:
+        if full_path[qi] == "?":
+            route = full_path.substring(0, qi)
+            if qi + 1 < fp_len:
+                req_query = full_path.substring(qi + 1, fp_len)
+            break
+        qi = qi + 1
 
-## Build a full HTTP response string
-pub fn respond(status: Int, content_type: String, body: String) -> String:
-    mut status_text := "OK"
+    # pack: method SEP route SEP query SEP version SEP headers SEP body
+    mut packed := meth
+    packed = packed + sep
+    packed = packed + route
+    packed = packed + sep
+    packed = packed + req_query
+    packed = packed + sep
+    packed = packed + ver
+    packed = packed + sep
+    packed = packed + headers
+    packed = packed + sep
+    packed = packed + req_body
+    return packed
+
+# ===============================================================
+# Request Accessors (operate on packed string)
+# ===============================================================
+
+# Extract the nth field from a packed request (0-indexed)
+fn req_field(req: String, n: Int) -> String:
+    sep := REQ_SEP()
+    mut start := 0
+    mut field := 0
+    mut pos := 0
+    req_len := req.len()
+    while pos < req_len:
+        if req[pos] == sep:
+            if field == n:
+                return req.substring(start, pos)
+            field = field + 1
+            start = pos + 1
+        pos = pos + 1
+    # last field (no trailing separator)
+    if field == n:
+        return req.substring(start, req_len)
+    return ""
+
+# HTTP method (GET, POST, PUT, DELETE, etc.)
+pub fn method(req: String) -> String:
+    return req_field(req, 0)
+
+# Path without query string (e.g. "/search")
+pub fn path(req: String) -> String:
+    return req_field(req, 1)
+
+# Query string without leading ? (e.g. "q=forge&lang=en")
+pub fn query(req: String) -> String:
+    return req_field(req, 2)
+
+# HTTP version (e.g. "HTTP/1.1")
+pub fn version(req: String) -> String:
+    return req_field(req, 3)
+
+# Raw headers as a single string (lines separated by newline)
+pub fn headers(req: String) -> String:
+    return req_field(req, 4)
+
+# Request body
+pub fn body(req: String) -> String:
+    return req_field(req, 5)
+
+# Get a header value by name (case-insensitive). Returns "" if not found.
+pub fn get_header(req: String, name: String) -> String:
+    target := name.to_lower()
+    hdrs := req_field(req, 4)
+    if hdrs.len() == 0:
+        return ""
+    nl := chr(10)
+    # scan character by character to find lines
+    mut start := 0
+    mut pos := 0
+    hdr_len := hdrs.len()
+    while pos <= hdr_len:
+        mut at_end := pos == hdr_len
+        if not at_end:
+            at_end = hdrs[pos] == nl
+        if at_end and pos > start:
+            line := hdrs.substring(start, pos).trim()
+            # find the colon
+            mut colon := -1
+            mut ci := 0
+            line_len := line.len()
+            while ci < line_len:
+                if line[ci] == ":":
+                    colon = ci
+                    break
+                ci = ci + 1
+            if colon > 0:
+                hname := line.substring(0, colon).trim().to_lower()
+                if hname == target:
+                    if colon + 1 < line_len:
+                        return line.substring(colon + 1, line_len).trim()
+                    return ""
+            if at_end and pos == hdr_len:
+                break
+            start = pos + 1
+        elif at_end:
+            start = pos + 1
+        pos = pos + 1
+    return ""
+
+# Get a query parameter value by name. Returns "" if not found.
+pub fn get_query_param(req: String, name: String) -> String:
+    qs := req_field(req, 2)
+    if qs.len() == 0:
+        return ""
+    # scan for pairs separated by &
+    mut start := 0
+    mut pos := 0
+    qs_len := qs.len()
+    while pos <= qs_len:
+        mut at_end := pos == qs_len
+        if not at_end:
+            at_end = qs[pos] == "&"
+        if at_end and pos > start:
+            pair := qs.substring(start, pos)
+            # find = sign
+            mut eq := -1
+            mut ei := 0
+            pair_len := pair.len()
+            while ei < pair_len:
+                if pair[ei] == "=":
+                    eq = ei
+                    break
+                ei = ei + 1
+            if eq >= 0:
+                key := pair.substring(0, eq)
+                if key == name:
+                    if eq + 1 < pair_len:
+                        return pair.substring(eq + 1, pair_len)
+                    return ""
+            elif pair == name:
+                return ""
+            if at_end and pos == qs_len:
+                break
+            start = pos + 1
+        elif at_end:
+            start = pos + 1
+        pos = pos + 1
+    return ""
+
+# ===============================================================
+# Response Building
+# ===============================================================
+
+fn status_text(status: Int) -> String:
+    if status == 200:
+        return "OK"
     if status == 201:
-        status_text = "Created"
-    elif status == 204:
-        status_text = "No Content"
-    elif status == 301:
-        status_text = "Moved Permanently"
-    elif status == 400:
-        status_text = "Bad Request"
-    elif status == 401:
-        status_text = "Unauthorized"
-    elif status == 403:
-        status_text = "Forbidden"
-    elif status == 404:
-        status_text = "Not Found"
-    elif status == 500:
-        status_text = "Internal Server Error"
+        return "Created"
+    if status == 204:
+        return "No Content"
+    if status == 301:
+        return "Moved Permanently"
+    if status == 302:
+        return "Found"
+    if status == 400:
+        return "Bad Request"
+    if status == 401:
+        return "Unauthorized"
+    if status == 403:
+        return "Forbidden"
+    if status == 404:
+        return "Not Found"
+    if status == 405:
+        return "Method Not Allowed"
+    if status == 500:
+        return "Internal Server Error"
+    return "OK"
+
+# Build a full HTTP response with status, content type, and body
+pub fn respond(status: Int, content_type: String, body_text: String) -> String:
     crlf := chr(13) + chr(10)
-    mut resp := "HTTP/1.1 " + status.to_string() + " " + status_text + crlf
-    resp = resp + "Content-Type: " + content_type + crlf
-    resp = resp + "Content-Length: " + body.len().to_string() + crlf
-    resp = resp + "Connection: close" + crlf
+    # build status line — break chained concats to avoid IR add-vs-concat bug
+    st := status_text(status)
+    sn := status.to_string()
+    mut resp := "HTTP/1.1 " + sn
+    tmp1 := resp + " "
+    resp = tmp1 + st
     resp = resp + crlf
-    resp = resp + body
+    ct := "Content-Type: " + content_type
+    resp = resp + ct
+    resp = resp + crlf
+    bl := body_text.len().to_string()
+    cl := "Content-Length: " + bl
+    resp = resp + cl
+    resp = resp + crlf
+    resp = resp + "Connection: close"
+    resp = resp + crlf
+    resp = resp + crlf
+    resp = resp + body_text
     return resp
 
-## Build a plain text response
-pub fn text_response(status: Int, body: String) -> String:
-    return respond(status, MIME_TEXT, body)
+pub fn text_response(status: Int, body_text: String) -> String:
+    return respond(status, MIME_TEXT, body_text)
 
-## Build an HTML response
-pub fn html_response(status: Int, body: String) -> String:
-    return respond(status, MIME_HTML, body)
+pub fn html_response(status: Int, body_text: String) -> String:
+    return respond(status, MIME_HTML, body_text)
 
-## Build a JSON response
-pub fn json_response(status: Int, body: String) -> String:
-    return respond(status, MIME_JSON, body)
+pub fn json_response(status: Int, body_text: String) -> String:
+    return respond(status, MIME_JSON, body_text)
 
-# --- HTTP client ---
+# 404 Not Found
+pub fn not_found() -> String:
+    return html_response(404, "<h1>404 Not Found</h1>")
 
-## Make a simple HTTP GET request. Returns the response body (blocking, no TLS).
-pub fn get(host: String, port: Int, path: String) -> String:
+# 405 Method Not Allowed
+pub fn method_not_allowed() -> String:
+    return text_response(405, "Method Not Allowed")
+
+# 500 Internal Server Error
+pub fn server_error() -> String:
+    return html_response(500, "<h1>500 Internal Server Error</h1>")
+
+# 301 Redirect
+pub fn redirect(url: String) -> String:
+    crlf := chr(13) + chr(10)
+    mut resp := "HTTP/1.1 301 Moved Permanently"
+    resp = resp + crlf
+    loc := "Location: " + url
+    resp = resp + loc
+    resp = resp + crlf
+    resp = resp + "Content-Length: 0"
+    resp = resp + crlf
+    resp = resp + "Connection: close"
+    resp = resp + crlf
+    resp = resp + crlf
+    return resp
+
+# ===============================================================
+# Server Helpers
+# ===============================================================
+
+# Read an HTTP request from a connection fd. Returns a packed request string.
+pub fn read_request(fd: Int) -> String:
+    raw := tcp_read(fd)
+    return parse_request(raw)
+
+# Send an HTTP response and close the connection.
+pub fn send_response(fd: Int, response: String):
+    tcp_write(fd, response)
+    tcp_close(fd)
+
+# ===============================================================
+# HTTP Client
+# ===============================================================
+
+# Simple blocking HTTP GET. Returns the response body (no TLS).
+pub fn get(host: String, port: Int, url_path: String) -> String:
     conn := tcp_connect(host, port)
     if conn < 0:
         return ""
     crlf := chr(13) + chr(10)
-    req := "GET " + path + " HTTP/1.1" + crlf + "Host: " + host + crlf + "Connection: close" + crlf + crlf
+    mut req := "GET " + url_path + " HTTP/1.1"
+    req = req + crlf
+    h := "Host: " + host
+    req = req + h
+    req = req + crlf
+    req = req + "Connection: close"
+    req = req + crlf
+    req = req + crlf
     tcp_write(conn, req)
-    # read response chunks
     mut response := ""
     mut chunk := tcp_read(conn)
     while chunk.len() > 0:
-        response = response + chunk
+        tmp := response + chunk
+        response = tmp
         chunk = tcp_read(conn)
     tcp_close(conn)
     # strip headers — find double CRLF
     mut hi := 0
-    while hi < response.len() - 3:
+    resp_len := response.len()
+    while hi < resp_len - 3:
         if response[hi] == chr(13) and response[hi + 2] == chr(13):
-            return response.substring(hi + 4, response.len())
+            return response.substring(hi + 4, resp_len)
         hi = hi + 1
     return response

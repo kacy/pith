@@ -16,7 +16,7 @@
 #           send_response(fd, not_found())
 
 # ===============================================================
-# MIME Types and Status Codes
+# MIME Types
 # ===============================================================
 
 pub MIME_TEXT := "text/plain"
@@ -27,22 +27,16 @@ pub MIME_JSON := "application/json"
 # Request Parsing
 # ===============================================================
 
-# Internal separator for packed request fields (ASCII unit separator)
-# Format: method + SEP + route_path + SEP + query + SEP + version + SEP + headers + SEP + body
-# where SEP = chr(31)
-
-fn REQ_SEP() -> String:
-    return chr(31)
-
-# Parse a raw HTTP request string. Returns a packed string for use with accessors.
+# Parse a raw HTTP request. Returns a packed string (use accessors to read fields).
+# Pack format: method \x1f route \x1f query \x1f version \x1f headers \x1f body
 pub fn parse_request(raw: String) -> String:
     nl := chr(10)
     cr := chr(13)
-    sep := REQ_SEP()
+    sep := chr(31)
     mut header_part := raw
     mut req_body := ""
 
-    # split headers from body on blank line
+    # find blank line separating headers from body
     mut i := 0
     raw_len := raw.len()
     while i < raw_len - 1:
@@ -57,16 +51,14 @@ pub fn parse_request(raw: String) -> String:
                 break
         i = i + 1
 
-    # parse request line
     lines := header_part.split(nl)
     mut meth := "GET"
     mut full_path := "/"
     mut ver := "HTTP/1.1"
-    mut headers := ""
+    mut hdrs := ""
 
     if lines.len() > 0:
         request_line := lines[0].trim()
-        # find spaces manually
         mut sp1 := -1
         mut sp2 := -1
         mut ri := 0
@@ -87,20 +79,19 @@ pub fn parse_request(raw: String) -> String:
         elif sp1 >= 0:
             full_path = request_line.substring(sp1 + 1, rl_len).trim()
 
-        # collect header lines joined by nl
         mut hi := 1
         hdr_n := lines.len()
         while hi < hdr_n:
             line := lines[hi].trim()
             if line.len() > 0:
-                if headers.len() > 0:
-                    tmp := headers + nl
-                    headers = tmp + line
+                if hdrs.len() > 0:
+                    tmp := hdrs + nl
+                    hdrs = tmp + line
                 else:
-                    headers = line
+                    hdrs = line
             hi = hi + 1
 
-    # split path from query string
+    # split path?query
     mut route := full_path
     mut req_query := ""
     mut qi := 0
@@ -113,27 +104,26 @@ pub fn parse_request(raw: String) -> String:
             break
         qi = qi + 1
 
-    # pack: method SEP route SEP query SEP version SEP headers SEP body
-    mut packed := meth
-    packed = packed + sep
-    packed = packed + route
-    packed = packed + sep
-    packed = packed + req_query
-    packed = packed + sep
-    packed = packed + ver
-    packed = packed + sep
-    packed = packed + headers
-    packed = packed + sep
-    packed = packed + req_body
-    return packed
+    # pack fields
+    mut p := meth
+    p = p + sep
+    p = p + route
+    p = p + sep
+    p = p + req_query
+    p = p + sep
+    p = p + ver
+    p = p + sep
+    p = p + hdrs
+    p = p + sep
+    p = p + req_body
+    return p
 
 # ===============================================================
-# Request Accessors (operate on packed string)
+# Request Accessors
 # ===============================================================
 
-# Extract the nth field from a packed request (0-indexed)
 fn req_field(req: String, n: Int) -> String:
-    sep := REQ_SEP()
+    sep := chr(31)
     mut start := 0
     mut field := 0
     mut pos := 0
@@ -145,53 +135,43 @@ fn req_field(req: String, n: Int) -> String:
             field = field + 1
             start = pos + 1
         pos = pos + 1
-    # last field (no trailing separator)
     if field == n:
         return req.substring(start, req_len)
     return ""
 
-# HTTP method (GET, POST, PUT, DELETE, etc.)
 pub fn method(req: String) -> String:
     return req_field(req, 0)
 
-# Path without query string (e.g. "/search")
 pub fn path(req: String) -> String:
     return req_field(req, 1)
 
-# Query string without leading ? (e.g. "q=forge&lang=en")
 pub fn query(req: String) -> String:
     return req_field(req, 2)
 
-# HTTP version (e.g. "HTTP/1.1")
 pub fn version(req: String) -> String:
     return req_field(req, 3)
 
-# Raw headers as a single string (lines separated by newline)
 pub fn headers(req: String) -> String:
     return req_field(req, 4)
 
-# Request body
 pub fn body(req: String) -> String:
     return req_field(req, 5)
 
-# Get a header value by name (case-insensitive). Returns "" if not found.
 pub fn get_header(req: String, name: String) -> String:
     target := name.to_lower()
-    hdrs := req_field(req, 4)
-    if hdrs.len() == 0:
+    h := req_field(req, 4)
+    if h.len() == 0:
         return ""
     nl := chr(10)
-    # scan character by character to find lines
     mut start := 0
     mut pos := 0
-    hdr_len := hdrs.len()
-    while pos <= hdr_len:
-        mut at_end := pos == hdr_len
+    h_len := h.len()
+    while pos <= h_len:
+        mut at_end := pos == h_len
         if not at_end:
-            at_end = hdrs[pos] == nl
+            at_end = h[pos] == nl
         if at_end and pos > start:
-            line := hdrs.substring(start, pos).trim()
-            # find the colon
+            line := h.substring(start, pos).trim()
             mut colon := -1
             mut ci := 0
             line_len := line.len()
@@ -206,7 +186,7 @@ pub fn get_header(req: String, name: String) -> String:
                     if colon + 1 < line_len:
                         return line.substring(colon + 1, line_len).trim()
                     return ""
-            if at_end and pos == hdr_len:
+            if at_end and pos == h_len:
                 break
             start = pos + 1
         elif at_end:
@@ -214,12 +194,10 @@ pub fn get_header(req: String, name: String) -> String:
         pos = pos + 1
     return ""
 
-# Get a query parameter value by name. Returns "" if not found.
 pub fn get_query_param(req: String, name: String) -> String:
     qs := req_field(req, 2)
     if qs.len() == 0:
         return ""
-    # scan for pairs separated by &
     mut start := 0
     mut pos := 0
     qs_len := qs.len()
@@ -229,7 +207,6 @@ pub fn get_query_param(req: String, name: String) -> String:
             at_end = qs[pos] == "&"
         if at_end and pos > start:
             pair := qs.substring(start, pos)
-            # find = sign
             mut eq := -1
             mut ei := 0
             pair_len := pair.len()
@@ -255,51 +232,55 @@ pub fn get_query_param(req: String, name: String) -> String:
     return ""
 
 # ===============================================================
-# Response Building
+# Response Building — pre-built status lines avoid repeated formatting
 # ===============================================================
 
-fn status_text(status: Int) -> String:
+fn status_line(status: Int) -> String:
+    crlf := chr(13) + chr(10)
     if status == 200:
-        return "OK"
+        return "HTTP/1.1 200 OK" + crlf
     if status == 201:
-        return "Created"
-    if status == 204:
-        return "No Content"
+        return "HTTP/1.1 201 Created" + crlf
     if status == 301:
-        return "Moved Permanently"
-    if status == 302:
-        return "Found"
+        return "HTTP/1.1 301 Moved Permanently" + crlf
     if status == 400:
-        return "Bad Request"
-    if status == 401:
-        return "Unauthorized"
-    if status == 403:
-        return "Forbidden"
+        return "HTTP/1.1 400 Bad Request" + crlf
     if status == 404:
-        return "Not Found"
+        return "HTTP/1.1 404 Not Found" + crlf
     if status == 405:
-        return "Method Not Allowed"
+        return "HTTP/1.1 405 Method Not Allowed" + crlf
     if status == 500:
-        return "Internal Server Error"
-    return "OK"
+        return "HTTP/1.1 500 Internal Server Error" + crlf
+    # uncommon status
+    mut sl := "HTTP/1.1 " + status.to_string()
+    sl = sl + " OK"
+    sl = sl + crlf
+    return sl
 
-# Build a full HTTP response with status, content type, and body
+fn ct_header(ct: String) -> String:
+    crlf := chr(13) + chr(10)
+    if ct == "text/html":
+        return "Content-Type: text/html" + crlf
+    if ct == "application/json":
+        return "Content-Type: application/json" + crlf
+    if ct == "text/plain":
+        return "Content-Type: text/plain" + crlf
+    mut h := "Content-Type: " + ct
+    h = h + crlf
+    return h
+
+# Build a full HTTP response
 pub fn respond(status: Int, content_type: String, body_text: String) -> String:
     crlf := chr(13) + chr(10)
-    # build status line — break chained concats to avoid IR add-vs-concat bug
-    st := status_text(status)
-    sn := status.to_string()
-    mut resp := "HTTP/1.1 " + sn
-    tmp1 := resp + " "
-    resp = tmp1 + st
-    resp = resp + crlf
-    ct := "Content-Type: " + content_type
-    resp = resp + ct
-    resp = resp + crlf
     bl := body_text.len().to_string()
+    # status line + content-type (pre-built for common cases)
+    mut resp := status_line(status)
+    resp = resp + ct_header(content_type)
+    # content-length
     cl := "Content-Length: " + bl
     resp = resp + cl
     resp = resp + crlf
+    # connection close + blank line + body
     resp = resp + "Connection: close"
     resp = resp + crlf
     resp = resp + crlf
@@ -315,19 +296,15 @@ pub fn html_response(status: Int, body_text: String) -> String:
 pub fn json_response(status: Int, body_text: String) -> String:
     return respond(status, MIME_JSON, body_text)
 
-# 404 Not Found
 pub fn not_found() -> String:
     return html_response(404, "<h1>404 Not Found</h1>")
 
-# 405 Method Not Allowed
 pub fn method_not_allowed() -> String:
     return text_response(405, "Method Not Allowed")
 
-# 500 Internal Server Error
 pub fn server_error() -> String:
     return html_response(500, "<h1>500 Internal Server Error</h1>")
 
-# 301 Redirect
 pub fn redirect(url: String) -> String:
     crlf := chr(13) + chr(10)
     mut resp := "HTTP/1.1 301 Moved Permanently"
@@ -346,12 +323,10 @@ pub fn redirect(url: String) -> String:
 # Server Helpers
 # ===============================================================
 
-# Read an HTTP request from a connection fd. Returns a packed request string.
 pub fn read_request(fd: Int) -> String:
     raw := tcp_read(fd)
     return parse_request(raw)
 
-# Send an HTTP response and close the connection.
 pub fn send_response(fd: Int, response: String):
     tcp_write(fd, response)
     tcp_close(fd)
@@ -360,13 +335,13 @@ pub fn send_response(fd: Int, response: String):
 # HTTP Client
 # ===============================================================
 
-# Simple blocking HTTP GET. Returns the response body (no TLS).
 pub fn get(host: String, port: Int, url_path: String) -> String:
     conn := tcp_connect(host, port)
     if conn < 0:
         return ""
     crlf := chr(13) + chr(10)
-    mut req := "GET " + url_path + " HTTP/1.1"
+    mut req := "GET " + url_path
+    req = req + " HTTP/1.1"
     req = req + crlf
     h := "Host: " + host
     req = req + h
@@ -382,11 +357,11 @@ pub fn get(host: String, port: Int, url_path: String) -> String:
         response = tmp
         chunk = tcp_read(conn)
     tcp_close(conn)
-    # strip headers — find double CRLF
+    cr := chr(13)
     mut hi := 0
     resp_len := response.len()
     while hi < resp_len - 3:
-        if response[hi] == chr(13) and response[hi + 2] == chr(13):
+        if response[hi] == cr and response[hi + 2] == cr:
             return response.substring(hi + 4, resp_len)
         hi = hi + 1
     return response

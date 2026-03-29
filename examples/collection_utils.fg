@@ -1,73 +1,38 @@
-# collection utility functions
+# collection utilities — using std.collections and builtins
+from std.collections import range, sum, max_of, min_of, reversed, take, drop, zip
 
-fn range(start: Int, end_val: Int) -> List[Int]:
-    mut result: List[Int] := []
-    mut i := start
-    while i < end_val:
-        result.push(i)
-        i = i + 1
-    return result
-
-fn sum(list: List[Int]) -> Int:
-    mut total := 0
+fn list_str(list: List[Int]) -> String:
+    mut parts: List[String] := []
     mut i := 0
     while i < list.len():
-        total = total + list[i]
+        parts.push(list[i].to_string())
         i = i + 1
-    return total
-
-fn max_of(list: List[Int]) -> Int:
-    if list.len() == 0:
-        return 0
-    mut result := list[0]
-    mut i := 1
-    while i < list.len():
-        if list[i] > result:
-            result = list[i]
-        i = i + 1
-    return result
-
-fn min_of(list: List[Int]) -> Int:
-    if list.len() == 0:
-        return 0
-    mut result := list[0]
-    mut i := 1
-    while i < list.len():
-        if list[i] < result:
-            result = list[i]
-        i = i + 1
-    return result
-
-fn reversed(list: List[Int]) -> List[Int]:
-    mut result: List[Int] := []
-    mut i := list.len() - 1
-    while i >= 0:
-        result.push(list[i])
-        i = i - 1
-    return result
+    return parts.join(", ")
 
 fn main():
     r := range(0, 5)
-    mut r_strs: List[String] := []
-    mut i := 0
-    while i < r.len():
-        r_strs.push(r[i].to_string())
-        i = i + 1
-    print("range: " + r_strs.join(", "))
+    print("range: " + list_str(r))
 
     nums := range(1, 6)
     print("sum 1..5: " + sum(nums).to_string())
 
-    mut vals: List[Int] := [3, 1, 4, 1, 5, 9, 2, 6]
+    vals := [3, 1, 4, 1, 5, 9, 2, 6]
     print("max: " + max_of(vals).to_string())
     print("min: " + min_of(vals).to_string())
 
     rev := reversed(range(1, 4))
-    mut rev_strs: List[String] := []
-    i = 0
-    while i < rev.len():
-        rev_strs.push(rev[i].to_string())
-        i = i + 1
-    print("reversed: " + rev_strs.join(", "))
+    print("reversed: " + list_str(rev))
+
+    # new: take, drop, zip
+    print("take 3: " + list_str(take(vals, 3)))
+    print("drop 5: " + list_str(drop(vals, 5)))
+    print("zip: " + zip(range(1, 4), range(10, 13)).join(", "))
+
+    # map and filter builtins
+    doubled := map(nums, fn(x: Int) => x * 2)
+    print("doubled: " + list_str(doubled))
+
+    evens := filter(range(1, 11), fn(x: Int) => 1 - (x % 2))
+    print("evens 1..10: " + list_str(evens))
 
     print("collection utils work")

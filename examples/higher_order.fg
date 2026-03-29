@@ -1,30 +1,5 @@
-# higher-order functions — map, filter, reduce, compose, pipeline
-# exercises: lambdas, closures with captures, function params, chaining
-
-fn map_list(items: List[Int], f: fn(Int) -> Int) -> List[Int]:
-    mut result: List[Int] := []
-    mut i := 0
-    while i < items.len():
-        result.push(f(items[i]))
-        i = i + 1
-    return result
-
-fn filter_list(items: List[Int], pred: fn(Int) -> Int) -> List[Int]:
-    mut result: List[Int] := []
-    mut i := 0
-    while i < items.len():
-        if pred(items[i]) != 0:
-            result.push(items[i])
-        i = i + 1
-    return result
-
-fn reduce_list(items: List[Int], init: Int, f: fn(Int) -> Int) -> Int:
-    mut acc := init
-    mut i := 0
-    while i < items.len():
-        acc = acc + f(items[i])
-        i = i + 1
-    return acc
+# higher-order functions — map, filter, reduce with builtin support
+# exercises: lambdas, closures, function composition, chaining
 
 fn apply_twice(x: Int, f: fn(Int) -> Int) -> Int:
     return f(f(x))
@@ -40,36 +15,33 @@ fn list_to_str(items: List[Int]) -> String:
 fn main():
     nums := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
-    # map: double each element
-    doubled := map_list(nums, fn(x: Int) => x * 2)
+    # map: transform each element
+    doubled := map(nums, fn(x: Int) => x * 2)
     print("doubled: " + list_to_str(doubled))
 
-    # map: square each element
-    squared := map_list(nums, fn(x: Int) => x * x)
+    squared := map(nums, fn(x: Int) => x * x)
     print("squared: " + list_to_str(squared))
 
-    # filter: keep evens (return 1 for even, 0 for odd)
-    evens := filter_list(nums, fn(x: Int) => 1 - (x % 2))
+    # filter: keep elements matching predicate (non-zero = keep)
+    evens := filter(nums, fn(x: Int) => 1 - (x % 2))
     print("evens: " + list_to_str(evens))
 
-    # filter: keep > 5
-    big := filter_list(nums, fn(x: Int) => x / 6)
+    big := filter(nums, fn(x: Int) => x / 6)
     print("big (>5): " + list_to_str(big))
 
-    # reduce: sum
-    total := reduce_list(nums, 0, fn(x: Int) => x)
+    # reduce: fold into single value
+    total := reduce(nums, 0, fn(acc: Int, x: Int) => acc + x)
     print("sum: " + total.to_string())
 
-    # reduce: sum of squares
-    sum_sq := reduce_list(nums, 0, fn(x: Int) => x * x)
+    sum_sq := reduce(map(nums, fn(x: Int) => x * x), 0, fn(acc: Int, x: Int) => acc + x)
     print("sum of squares: " + sum_sq.to_string())
 
-    # apply_twice
+    # apply_twice: function composition
     result := apply_twice(3, fn(x: Int) => x * 2 + 1)
     print("apply_twice(3, 2x+1): " + result.to_string())
 
     # chain: filter then map
-    big_doubled := map_list(filter_list(nums, fn(x: Int) => x / 6), fn(x: Int) => x * 2)
+    big_doubled := map(filter(nums, fn(x: Int) => x / 6), fn(x: Int) => x * 2)
     print("big doubled: " + list_to_str(big_doubled))
 
     print("higher order works")

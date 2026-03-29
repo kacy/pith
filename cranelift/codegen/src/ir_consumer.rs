@@ -405,45 +405,50 @@ fn compile_ir_function(
     //   label LABEL → break lands here
     //   jmp LOOP_HEADER → but this loops back instead of exiting
     // Fix: redirect LABEL → LOOP_EXIT
+    // Detect `break` inside `while true` loops.
+    //
+    // Pattern: `while true` generates `iconst REG 1; brif REG BODY EXIT`.
+    // The `break` generates `jmp END_IF` where END_IF falls through to
+    // `jmp LOOP_HEADER`. We redirect `jmp END_IF` → EXIT.
+    //
+    // Only handles `while true` (constant-true condition), not general
+    // while-condition loops, to avoid false positives.
     let mut break_redirects: HashMap<String, String> = HashMap::new();
     {
-        // Find while-loop headers: look for "label X ... brif COND BODY EXIT"
-        // where X is a loop header (targeted by a backwards jmp)
-        let mut while_exits: HashMap<String, String> = HashMap::new();
+        // Find `while true` headers: iconst REG 1 → brif REG BODY EXIT
+        let mut while_true_exits: HashMap<String, String> = HashMap::new();
         for (idx, line) in body_lines.iter().enumerate() {
             let p: Vec<&str> = line.split_whitespace().collect();
             if p.len() >= 4 && p[0] == "brif" {
-                // Find the nearest preceding label (may be 1-3 lines back)
-                let mut header_label: Option<&str> = None;
-                let mut back = idx.wrapping_sub(1);
-                while back < idx && idx - back <= 3 {
-                    let prev: Vec<&str> = body_lines[back].split_whitespace().collect();
-                    if prev.len() >= 2 && prev[0] == "label" {
-                        header_label = Some(prev[1]);
-                        break;
+                // Check if the condition is a constant 1 (while true)
+                if idx > 0 {
+                    let prev: Vec<&str> = body_lines[idx - 1].split_whitespace().collect();
+                    if prev.len() >= 3 && prev[0] == "iconst" && prev[2] == "1" {
+                        // Find the header label (2-3 lines back)
+                        let mut back = idx.wrapping_sub(2);
+                        while back < idx && idx - back <= 4 {
+                            let lp: Vec<&str> = body_lines[back].split_whitespace().collect();
+                            if lp.len() >= 2 && lp[0] == "label" {
+                                while_true_exits.insert(lp[1].to_string(), p[3].to_string());
+                                break;
+                            }
+                            back = back.wrapping_sub(1);
+                        }
                     }
-                    back = back.wrapping_sub(1);
-                }
-                if let Some(hdr) = header_label {
-                    while_exits.insert(hdr.to_string(), p[3].to_string());
                 }
             }
         }
-        // Find labels where: label X → jmp LOOP_HEADER (a fall-through that loops)
-        // If X is reached via a break, it should go to the exit instead
+
+        // Find jmps to while-true headers and mark preceding labels as breaks
         for (idx, line) in body_lines.iter().enumerate() {
             let p: Vec<&str> = line.split_whitespace().collect();
             if p.len() >= 2 && p[0] == "jmp" {
-                let target = p[1];
-                if let Some(exit_label) = while_exits.get(target) {
-                    // This jmp goes to a loop header. Find what label precedes it.
-                    // Walk backwards past any labels to find the label name
+                if let Some(exit) = while_true_exits.get(p[1]) {
                     let mut li = idx.wrapping_sub(1);
                     while li < body_lines.len() {
                         let lp: Vec<&str> = body_lines[li].split_whitespace().collect();
                         if lp.len() >= 2 && lp[0] == "label" {
-                            // Any jmp TO this label from inside the loop is a break
-                            break_redirects.insert(lp[1].to_string(), exit_label.clone());
+                            break_redirects.insert(lp[1].to_string(), exit.clone());
                             li = li.wrapping_sub(1);
                         } else {
                             break;
@@ -452,11 +457,12 @@ fn compile_ir_function(
                 }
             }
         }
-        // Don't redirect the loop body label itself (brif's THEN target)
-        for (_, line) in body_lines.iter().enumerate() {
+
+        // Remove brif THEN targets (loop body, not break)
+        for line in body_lines.iter() {
             let p: Vec<&str> = line.split_whitespace().collect();
             if p.len() >= 4 && p[0] == "brif" {
-                break_redirects.remove(p[2]); // THEN = loop body, not a break
+                break_redirects.remove(p[2]);
             }
         }
     }

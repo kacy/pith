@@ -32,6 +32,25 @@ pub fn add_leaf(kind: String, value: String, line: Int, col: Int) -> Int:
 pub fn get_node(idx: Int) -> Node:
     return nodes[idx]
 
+# get kind of node by index (avoids struct field access in caller)
+pub fn node_kind(idx: Int) -> String:
+    return nodes[idx].kind
+
+# get value of node by index
+pub fn node_value(idx: Int) -> String:
+    return nodes[idx].value
+
+# get number of children
+pub fn node_child_count(idx: Int) -> Int:
+    n := nodes[idx]
+    return n.children.len()
+
+# get child index at position
+pub fn node_child(idx: Int, pos: Int) -> Int:
+    n := nodes[idx]
+    kids := n.children
+    return kids[pos]
+
 # clear the arena for reuse
 pub fn reset_arena():
     nodes = []

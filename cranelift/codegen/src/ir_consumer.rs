@@ -822,7 +822,10 @@ fn compile_ir_function(
                             let cast = builder.ins().bitcast(types::I64, cranelift::codegen::ir::MemFlags::new(), result);
                             regs.insert(reg, cast);
                         } else {
-                            regs.insert(reg, result);
+                            // Normalize i64 results: iadd 0 works around a Cranelift
+                            // register state issue with struct-from-list returns
+                            let zero = builder.ins().iconst(types::I64, 0);
+                            regs.insert(reg, builder.ins().iadd(result, zero));
                         }
                     } else {
                         regs.insert(reg, builder.ins().iconst(types::I64, 0));
@@ -926,12 +929,14 @@ fn compile_ir_function(
                         })
                         .unwrap_or(0)
                 };
-                let v = builder.ins().load(
+                let raw = builder.ins().load(
                     types::I64,
                     cranelift::codegen::ir::MemFlags::new(),
                     obj,
                     offset,
                 );
+                let zero = builder.ins().iconst(types::I64, 0);
+                let v = builder.ins().iadd(raw, zero);
                 regs.insert(reg, v);
             }
 

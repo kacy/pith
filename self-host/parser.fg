@@ -201,9 +201,7 @@ fn parse_tuple_type() -> Int:
     mut types: List[Int] := []
     if not check("rparen"):
         types.push(parse_type_expr())
-        while match_tok("comma"):
-            if check("rparen"):
-                break
+        while match_tok("comma") and not check("rparen"):
             types.push(parse_type_expr())
     expect("rparen")
     return add_node_with_position("tuple_type", "", types)
@@ -409,10 +407,8 @@ fn parse_postfix() -> Int:
                 skip_newlines()
                 if check("rbrace") == false:
                     args.push(parse_expression())
-                    while match_tok("comma"):
+                    while match_tok("comma") and not check("rbrace"):
                         skip_newlines()
-                        if check("rbrace"):
-                            break
                         args.push(parse_expression())
                 skip_newlines()
                 expect("rbrace")
@@ -439,10 +435,8 @@ fn parse_arg_list() -> List[Int]:
     if check("rparen"):
         return args
     args.push(parse_arg())
-    while match_tok("comma"):
+    while match_tok("comma") and not check("rparen"):
         skip_newlines()
-        if check("rparen"):
-            break
         args.push(parse_arg())
     skip_newlines()
     return args
@@ -537,10 +531,8 @@ fn parse_grouped_or_tuple() -> Int:
     # tuple with trailing comma or multiple elements
     if check("comma"):
         mut elements: List[Int] := [first]
-        while match_tok("comma"):
+        while match_tok("comma") and not check("rparen"):
             skip_newlines()
-            if check("rparen"):
-                break
             elements.push(parse_expression())
             skip_newlines()
         expect("rparen")
@@ -557,10 +549,8 @@ fn parse_list_literal() -> Int:
     skip_newlines()
     if not check("rbracket"):
         elements.push(parse_expression())
-        while match_tok("comma"):
+        while match_tok("comma") and not check("rbracket"):
             skip_newlines()
-            if check("rbracket"):
-                break
             elements.push(parse_expression())
     skip_newlines()
     expect("rbracket")
@@ -587,10 +577,8 @@ fn parse_map_or_set_literal() -> Int:
         mut entry_children: List[Int] := [first, first_val]
         entries.push(add_node_with_position("entry", "", entry_children))
 
-        while match_tok("comma"):
+        while match_tok("comma") and not check("rbrace"):
             skip_newlines()
-            if check("rbrace"):
-                break
             key := parse_expression()
             expect("colon")
             val := parse_expression()
@@ -602,10 +590,8 @@ fn parse_map_or_set_literal() -> Int:
 
     # set: {x} or {x, y, ...}
     mut elements: List[Int] := [first]
-    while match_tok("comma"):
+    while match_tok("comma") and not check("rbrace"):
         skip_newlines()
-        if check("rbrace"):
-            break
         elements.push(parse_expression())
     skip_newlines()
     expect("rbrace")
@@ -643,9 +629,7 @@ fn parse_match_expr() -> Int:
     expect("indent")
 
     mut children: List[Int] := [subject]
-    while not check("dedent"):
-        if check("eof"):
-            break
+    while not check("dedent") and not check("eof"):
         arm := parse_match_arm()
         children.push(arm)
         if check("newline"):
@@ -872,9 +856,7 @@ fn parse_block() -> Int:
     expect("indent")
 
     mut stmts: List[Int] := []
-    while not check("dedent"):
-        if check("eof"):
-            break
+    while not check("dedent") and not check("eof"):
         stmts.push(parse_statement())
         skip_newlines()
     expect("dedent")
@@ -1073,10 +1055,9 @@ pub fn parse(token_list: List[Token]) -> Int:
     # parse top-level declarations
     while not check("eof"):
         skip_newlines()
-        if check("eof"):
-            break
-        decls.push(parse_top_level_decl())
-        skip_newlines()
+        if not check("eof"):
+            decls.push(parse_top_level_decl())
+            skip_newlines()
 
     mut children: List[Int] := []
     for i in imports:
@@ -1310,9 +1291,7 @@ fn parse_struct_decl() -> Int:
     # store generic_param nodes so checker can access bounds
     for g in generics:
         children.push(g)
-    while not check("dedent"):
-        if check("eof"):
-            break
+    while not check("dedent") and not check("eof"):
         children.push(parse_struct_field())
         skip_newlines()
     expect("dedent")
@@ -1364,9 +1343,7 @@ fn parse_enum_decl() -> Int:
     # store generic_param nodes so checker can access bounds
     for g in generics:
         children.push(g)
-    while not check("dedent"):
-        if check("eof"):
-            break
+    while not check("dedent") and not check("eof"):
         children.push(parse_enum_variant())
         skip_newlines()
     expect("dedent")
@@ -1397,9 +1374,7 @@ fn parse_interface_decl() -> Int:
     # store generic_param nodes so checker can detect E233
     for g in generics:
         children.push(g)
-    while not check("dedent"):
-        if check("eof"):
-            break
+    while not check("dedent") and not check("eof"):
         children.push(parse_fn_sig())
         skip_newlines()
     expect("dedent")
@@ -1445,9 +1420,7 @@ fn parse_impl_decl() -> Int:
     expect("newline")
     expect("indent")
 
-    while not check("dedent"):
-        if check("eof"):
-            break
+    while not check("dedent") and not check("eof"):
         mut method_pub := false
         if match_tok("kw_pub"):
             method_pub = true

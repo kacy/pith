@@ -458,6 +458,32 @@ fn compile_ir_function(
             }
         }
 
+        // Propagate redirects transitively: if jmp TARGET and TARGET is in
+        // break_redirects, add the labels before that jmp too. Repeat until
+        // no new entries are added.
+        for _ in 0..10 {
+            let snapshot = break_redirects.clone();
+            let before = snapshot.len();
+            for (idx, line) in body_lines.iter().enumerate() {
+                let p: Vec<&str> = line.split_whitespace().collect();
+                if p.len() >= 2 && p[0] == "jmp" {
+                    if let Some(exit) = snapshot.get(p[1]) {
+                        let mut li = idx.wrapping_sub(1);
+                        while li < body_lines.len() {
+                            let lp: Vec<&str> = body_lines[li].split_whitespace().collect();
+                            if lp.len() >= 2 && lp[0] == "label" {
+                                break_redirects.insert(lp[1].to_string(), exit.clone());
+                                li = li.wrapping_sub(1);
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if break_redirects.len() == before { break; }
+        }
+
         // Remove brif THEN targets (loop body, not break)
         for line in body_lines.iter() {
             let p: Vec<&str> = line.split_whitespace().collect();

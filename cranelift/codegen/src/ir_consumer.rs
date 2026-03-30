@@ -179,6 +179,7 @@ pub fn compile_from_ir(
             "node_kind", "node_value", "tok_kind", "tok_value",
             "identity", "read_file", "env", "path_join",
             "path_dir", "path_base", "path_ext", "path_stem",
+            "__list_get", "__index", "join",
         ].iter().cloned().collect();
 
         let mut cur_func = String::new();
@@ -633,6 +634,8 @@ fn compile_ir_function(
                 };
                 let v = builder.ins().iconst(types::I64, val);
                 regs.insert(reg, v);
+                // iconst definitively produces an integer — clear any stale string tracking
+                string_regs.remove(&reg);
             }
 
             "fconst" if parts.len() >= 3 => {
@@ -642,6 +645,7 @@ fn compile_ir_function(
                 let v = builder.ins().bitcast(types::I64, cranelift::codegen::ir::MemFlags::new(), fv);
                 regs.insert(reg, v);
                 float_regs.insert(reg);
+                string_regs.remove(&reg);
             }
 
             "strref" if parts.len() >= 3 => {
@@ -767,6 +771,8 @@ fn compile_ir_function(
                         _ => unreachable!(),
                     };
                     regs.insert(reg, v);
+                    // Integer arithmetic — clear stale string tracking
+                    string_regs.remove(&reg);
                 }
             }
 
@@ -827,6 +833,7 @@ fn compile_ir_function(
                     let cmp = builder.ins().icmp(cc, a, b);
                     let v = builder.ins().uextend(types::I64, cmp);
                     regs.insert(reg, v);
+                    string_regs.remove(&reg); // comparison returns integer
                 }
             }
 
@@ -956,7 +963,45 @@ fn compile_ir_function(
                         regs.insert(reg, builder.ins().iconst(types::I64, 0));
                     }
                     // Track functions known to return a string value
-                    if matches!(fname,
+                    // __list_get from a List[String] returns strings.
+                    // Heuristic: if the list variable was loaded from a global whose
+                    // name suggests string content (contains "string", "kind", "value",
+                    // "line", "key"), mark the result as a string.
+                    let is_list_get_string = if (fname == "__list_get" || fname == "__index")
+                        && nargs >= 1 && parts.len() > 4
+                    {
+                        if string_regs.contains(&parts[4].parse::<usize>().unwrap_or(usize::MAX)) {
+                            true // char_at case
+                        } else {
+                            // Check the last `load` instruction for this register to get the variable name
+                            // This is a heuristic — check if recent loads suggest string list
+                            let arg_reg = parts[4].parse::<usize>().unwrap_or(usize::MAX);
+                            // Look backward in body_lines to find what was loaded into arg_reg
+                            let mut found_string_list = false;
+                            for prev_line in body_lines.iter().rev() {
+                                let pp: Vec<&str> = prev_line.split_whitespace().collect();
+                                if pp.len() >= 3 && pp[0] == "load" {
+                                    if let Ok(prev_reg) = pp[1].parse::<usize>() {
+                                        if prev_reg == arg_reg {
+                                            let var_name = pp[2].to_lowercase();
+                                            if var_name.contains("string") || var_name.contains("kind")
+                                                || var_name.contains("value") || var_name.contains("_line")
+                                                || var_name.contains("_tok_") || var_name.contains("_key")
+                                            {
+                                                found_string_list = true;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            found_string_list
+                        }
+                    } else {
+                        false
+                    };
+
+                    if is_list_get_string || matches!(fname,
                         "char_at" | "substring" | "to_upper" | "to_lower" | "trim" |
                         "replace" | "repeat" | "pad_left" | "pad_right" | "reverse" |
                         "chr" | "smart_to_string" | "to_string" | "int_to_string" |

@@ -697,12 +697,36 @@ pub fn init_lexer(src: String):
     pending_token_columns = []
     pending_dedents = 0
 
+mut _tok_kinds: List[String] := []
+mut _tok_values: List[String] := []
+mut _tok_lines: List[Int] := []
+mut _tok_cols: List[Int] := []
+
+pub fn tok_kind(i: Int) -> String:
+    return _tok_kinds[i]
+pub fn tok_value(i: Int) -> String:
+    return _tok_values[i]
+pub fn tok_line(i: Int) -> Int:
+    return _tok_lines[i]
+pub fn tok_col(i: Int) -> Int:
+    return _tok_cols[i]
+pub fn tok_count() -> Int:
+    return _tok_kinds.len()
+
 pub fn lex_all(src: String) -> List[Token]:
     init_lexer(src)
+    _tok_kinds = []
+    _tok_values = []
+    _tok_lines = []
+    _tok_cols = []
     mut tokens: List[Token] := []
     while true:
         next_token()
         tokens.push(Token(current_token_kind, current_token_value, current_token_line, current_token_column))
+        _tok_kinds.push(current_token_kind)
+        _tok_values.push(current_token_value)
+        _tok_lines.push(current_token_line)
+        _tok_cols.push(current_token_column)
         if current_token_kind == "eof":
             break
     return tokens

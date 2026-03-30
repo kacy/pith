@@ -5,7 +5,7 @@
 #
 # usage: import from parse_main.fg or call parse() directly
 
-from lexer import Token, lex_all
+from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_count
 from ast import Node, add_node, add_leaf, get_node
 
 # ---------------------------------------------------------------
@@ -23,18 +23,17 @@ mut max_depth := 256
 
 # Get line and column from current token position
 fn get_current_position() -> (Int, Int):
-    if tokens.len() == 0:
+    tc := tok_count()
+    if tc == 0:
         return (0, 0)
     mut i := current_token_position
-    while i < tokens.len():
-        current_token := tokens[i]
-        if current_token.kind != "comment":
-            return (current_token.current_line, current_token.current_column)
+    while i < tc:
+        k := tok_kind(i)
+        if k != "comment":
+            return (tok_line(i), tok_col(i))
         i = i + 1
-    # Return position of last token
-    if tokens.len() > 0:
-        mut last := tokens[tokens.len() - 1]
-        return (last.current_line, last.current_column)
+    if tc > 0:
+        return (tok_line(tc - 1), tok_col(tc - 1))
     return (0, 0)
 
 # Wrapper that adds node with current position
@@ -57,40 +56,45 @@ fn make_eof_token() -> Token:
 # ---------------------------------------------------------------
 
 fn peek_current_token() -> Token:
-    if tokens.len() == 0:
+    tc := tok_count()
+    if tc == 0:
         return make_eof_token()
     mut i := current_token_position
-    while i < tokens.len():
-        current_token := tokens[i]
-        if current_token.kind != "comment":
-            return current_token
+    while i < tc:
+        k := tok_kind(i)
+        if k != "comment":
+            return Token(k, tok_value(i), tok_line(i), tok_col(i))
         i = i + 1
-    # past the end — return last token (should be eof)
-    return tokens[tokens.len() - 1]
+    return Token(tok_kind(tc - 1), tok_value(tc - 1), tok_line(tc - 1), tok_col(tc - 1))
 
 fn peek_ahead(offset: Int) -> Token:
-    if tokens.len() == 0:
+    tc := tok_count()
+    if tc == 0:
         return make_eof_token()
     mut i := current_token_position
     mut skipped := 0
-    while i < tokens.len():
-        current_token := tokens[i]
-        if current_token.kind != "comment":
+    while i < tc:
+        k := tok_kind(i)
+        if k != "comment":
             if skipped == offset:
-                return current_token
+                return Token(k, tok_value(i), tok_line(i), tok_col(i))
             skipped = skipped + 1
         i = i + 1
-    return tokens[tokens.len() - 1]
+    return Token(tok_kind(tc - 1), tok_value(tc - 1), tok_line(tc - 1), tok_col(tc - 1))
 
 fn advance_token() -> Token:
-    if tokens.len() == 0:
+    tc := tok_count()
+    if tc == 0:
         return make_eof_token()
-    while current_token_position < tokens.len():
-        current_token := tokens[current_token_position]
+    while current_token_position < tc:
+        k := tok_kind(current_token_position)
+        v := tok_value(current_token_position)
+        l := tok_line(current_token_position)
+        c := tok_col(current_token_position)
         current_token_position = current_token_position + 1
-        if current_token.kind != "comment":
-            return current_token
-    return tokens[tokens.len() - 1]
+        if k != "comment":
+            return Token(k, v, l, c)
+    return Token(tok_kind(tc - 1), tok_value(tc - 1), tok_line(tc - 1), tok_col(tc - 1))
 
 fn check(kind: String) -> Bool:
     return peek_current_token().kind == kind

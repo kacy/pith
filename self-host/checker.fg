@@ -12,7 +12,7 @@
 # all globals use c_ prefix to avoid collisions with lexer/parser
 # globals in the flat C namespace.
 
-from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, register_type_name, lookup_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
+from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, get_type_count, register_type_name, lookup_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
 from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
 
@@ -209,7 +209,7 @@ fn register_builtin_types():
     tid_err := lookup_type_id("<error>")
 
     # pre-register List[String] — used by String.split() and args()
-    intern_collection_type("List", tid_string, -1)
+    intern_list_type(tid_string)
     list_string := lookup_type_id("List[String]")
 
     # result types used by multiple builtins
@@ -440,34 +440,67 @@ fn register_sync_primitive_type(name: String, param_tids: List[Int]):
 # intern collection types
 # ---------------------------------------------------------------
 
-# intern a collection type, returning its type id
-# for List/Set: key_or_elem is the element type, val is -1
-# for Map: key_or_elem is the key type, val is the value type
-fn intern_collection_type(base: String, key_or_elem: Int, val: Int) -> Int:
-    name := build_collection_type_name(base, key_or_elem, val)
-    existing := lookup_type_id(name)
-    if existing >= 0:
-        return existing
-    mut tid := -1
-    if base == "List":
-        tid = add_type_info(ti_list(key_or_elem))
-    elif base == "Set":
-        tid = add_type_info(ti_set(key_or_elem))
-    elif base == "Map":
-        tid = add_type_info(ti_map(key_or_elem, val))
-    elif base == "Task":
-        tid = add_type_info(ti_task(key_or_elem))
-    elif base == "Channel":
-        tid = add_type_info(ti_channel(key_or_elem))
-    else:
-        return TID_ERR
-    register_type_name(name, tid)
-    return tid
-
 fn build_collection_type_name(base: String, key_or_elem: Int, val: Int) -> String:
     if val < 0:
         return base + "[" + get_type_name(key_or_elem) + "]"
     return base + "[" + get_type_name(key_or_elem) + "," + get_type_name(val) + "]"
+
+fn intern_list_type(elem: Int) -> Int:
+    name := build_collection_type_name("List", elem, -1)
+    existing := lookup_type_id(name)
+    if existing == -1:
+        add_type_info(ti_list(elem))
+        tid := get_type_count() - 1
+        register_type_name(name, tid)
+        return tid
+    return existing
+
+fn intern_set_type(elem: Int) -> Int:
+    name := build_collection_type_name("Set", elem, -1)
+    existing := lookup_type_id(name)
+    if existing == -1:
+        add_type_info(ti_set(elem))
+        tid := get_type_count() - 1
+        register_type_name(name, tid)
+        return tid
+    return existing
+
+fn intern_map_type(key_type: Int, val_type: Int) -> Int:
+    name := build_collection_type_name("Map", key_type, val_type)
+    existing := lookup_type_id(name)
+    if existing == -1:
+        add_type_info(ti_map(key_type, val_type))
+        tid := get_type_count() - 1
+        register_type_name(name, tid)
+        return tid
+    return existing
+
+fn intern_task_type(inner: Int) -> Int:
+    name := build_collection_type_name("Task", inner, -1)
+    existing := lookup_type_id(name)
+    if existing == -1:
+        add_type_info(ti_task(inner))
+        tid := get_type_count() - 1
+        register_type_name(name, tid)
+        return tid
+    return existing
+
+fn intern_channel_type(inner: Int) -> Int:
+    name := build_collection_type_name("Channel", inner, -1)
+    existing := lookup_type_id(name)
+    if existing == -1:
+        add_type_info(ti_channel(inner))
+        tid := get_type_count() - 1
+        register_type_name(name, tid)
+        return tid
+    return existing
+
+pub fn debug_intern_list_string() -> Int:
+    return intern_list_type(lookup_type_id("String"))
+
+pub fn debug_add_list_type_direct() -> Int:
+    add_type_info(ti_list(lookup_type_id("String")))
+    return get_type_count()
 
 # build an instantiation name like "Pair[Int,String]"
 fn build_instantiated_type_name(base: String, type_args: List[Int]) -> String:
@@ -550,31 +583,31 @@ fn resolve_generic_type_from_node(node: Node) -> Int:
 
 fn resolve_generic_type(base: String, type_args: List[Int]) -> Int:
     # builtin generic types
-    if base == "List":
+    if strings_equal(base, "List"):
         if type_args.len() != 1:
             report_error("E221", "List expects 1 type argument, got " + type_args.len().to_string())
             return TID_ERR
-        return intern_collection_type("List", type_args[0], -1)
-    if base == "Set":
+        return intern_list_type(type_args[0])
+    if strings_equal(base, "Set"):
         if type_args.len() != 1:
             report_error("E221", "Set expects 1 type argument, got " + type_args.len().to_string())
             return TID_ERR
-        return intern_collection_type("Set", type_args[0], -1)
-    if base == "Map":
+        return intern_set_type(type_args[0])
+    if strings_equal(base, "Map"):
         if type_args.len() != 2:
             report_error("E221", "Map expects 2 type arguments, got " + type_args.len().to_string())
             return TID_ERR
-        return intern_collection_type("Map", type_args[0], type_args[1])
-    if base == "Task":
+        return intern_map_type(type_args[0], type_args[1])
+    if strings_equal(base, "Task"):
         if type_args.len() != 1:
             report_error("E221", "Task expects 1 type argument, got " + type_args.len().to_string())
             return TID_ERR
-        return intern_collection_type("Task", type_args[0], -1)
-    if base == "Channel":
+        return intern_task_type(type_args[0])
+    if strings_equal(base, "Channel"):
         if type_args.len() != 1:
             report_error("E221", "Channel expects 1 type argument, got " + type_args.len().to_string())
             return TID_ERR
-        return intern_collection_type("Channel", type_args[0], -1)
+        return intern_channel_type(type_args[0])
     # user-defined generic types
     if generic_declaration_map.contains_key(base):
         decl_idx := generic_declaration_map[base]
@@ -906,6 +939,24 @@ fn extract_field_name(value: String) -> String:
             return value.substring(0, i)
         i = i + 1
     return value
+
+fn strings_equal(a: String, b: String) -> Bool:
+    if a.len() != b.len():
+        return false
+    mut i := 0
+    while i < a.len():
+        if ord(a[i]) != ord(b[i]):
+            return false
+        i = i + 1
+    return true
+
+fn split_qualified_name(value: String) -> (String, String):
+    mut i := 0
+    while i < value.len():
+        if value[i] == ".":
+            return (value.substring(0, i), value.substring(i + 1, value.len()))
+        i = i + 1
+    return (value, "")
 
 fn get_type_node_name(node: Node) -> String:
     # extract the type name from a type expression node
@@ -1648,6 +1699,7 @@ fn check_pipe_expression(node: Node, scope_id: Int) -> Int:
 # ---------------------------------------------------------------
 
 fn check_unary_expression(node: Node, scope_id: Int) -> Int:
+    tid_bool := lookup_type_id("Bool")
     if node.children.len() < 1:
         return TID_ERR
     operand := c_check_expr(node.children[0], scope_id)
@@ -1660,10 +1712,10 @@ fn check_unary_expression(node: Node, scope_id: Int) -> Int:
             return TID_ERR
         return operand
     if op == "not":
-        if operand != TID_BOOL:
+        if operand != tid_bool:
             report_error("E217", "unary 'not' requires Bool, got " + get_type_name(operand))
             return TID_ERR
-        return TID_BOOL
+        return tid_bool
     return TID_ERR
 
 # ---------------------------------------------------------------
@@ -2025,15 +2077,20 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             continue
         arg_indices.push(child)
 
+    tid_string := lookup_type_id("String")
+    tid_int := lookup_type_id("Int")
+    tid_float := lookup_type_id("Float")
+    tid_bool := lookup_type_id("Bool")
+
     # string methods
-    if receiver_type == TID_STRING:
+    if receiver_type == tid_string:
         return check_string_method_call(method_name, arg_indices, scope_id)
     # primitive methods
-    if receiver_type == TID_INT:
+    if receiver_type == tid_int:
         return check_int_method_call(method_name, arg_indices, scope_id)
-    if receiver_type == TID_FLOAT:
+    if receiver_type == tid_float:
         return check_float_method_call(method_name, arg_indices, scope_id)
-    if receiver_type == TID_BOOL:
+    if receiver_type == tid_bool:
         return check_bool_method_call(method_name, arg_indices, scope_id)
 
     # collection methods
@@ -2098,57 +2155,60 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
 # ---------------------------------------------------------------
 
 fn check_string_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
+    tid_int := lookup_type_id("Int")
+    tid_string := lookup_type_id("String")
+    tid_bool := lookup_type_id("Bool")
     if method == "len":
         expect_no_arguments(method, args)
-        return TID_INT
+        return tid_int
     if method == "trim":
         expect_no_arguments(method, args)
-        return TID_STRING
+        return tid_string
     if method == "to_upper":
         expect_no_arguments(method, args)
-        return TID_STRING
+        return tid_string
     if method == "to_lower":
         expect_no_arguments(method, args)
-        return TID_STRING
+        return tid_string
     if method == "is_empty":
         expect_no_arguments(method, args)
-        return TID_BOOL
+        return tid_bool
     if method == "contains":
         expect_one_string_argument(method, args, scope_id)
-        return TID_BOOL
+        return tid_bool
     if method == "starts_with":
         expect_one_string_argument(method, args, scope_id)
-        return TID_BOOL
+        return tid_bool
     if method == "ends_with":
         expect_one_string_argument(method, args, scope_id)
-        return TID_BOOL
+        return tid_bool
     if method == "index_of":
         expect_one_string_argument(method, args, scope_id)
-        return TID_INT
+        return tid_int
     if method == "last_index_of":
         expect_one_string_argument(method, args, scope_id)
-        return TID_INT
+        return tid_int
     if method == "split":
         expect_one_string_argument(method, args, scope_id)
-        return intern_collection_type("List", TID_STRING, -1)
+        return intern_list_type(tid_string)
     if method == "substring":
         expect_two_int_arguments(method, args, scope_id)
-        return TID_STRING
+        return tid_string
     if method == "replace":
         expect_two_string_arguments(method, args, scope_id)
-        return TID_STRING
+        return tid_string
     if method == "repeat":
-        expect_one_typed_argument(method, args, TID_INT, scope_id)
-        return TID_STRING
+        expect_one_typed_argument(method, args, tid_int, scope_id)
+        return tid_string
     if method == "pad_left":
         expect_int_string_arguments(method, args, scope_id)
-        return TID_STRING
+        return tid_string
     if method == "pad_right":
         expect_int_string_arguments(method, args, scope_id)
-        return TID_STRING
+        return tid_string
     if method == "chars":
         expect_no_arguments(method, args)
-        return intern_collection_type("List", TID_STRING, -1)
+        return intern_list_type(tid_string)
     report_error("E209", "String has no method '" + method + "'")
     return TID_ERR
 
@@ -2157,29 +2217,34 @@ fn check_string_method_call(method: String, args: List[Int], scope_id: Int) -> I
 # ---------------------------------------------------------------
 
 fn check_int_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
+    tid_string := lookup_type_id("String")
+    tid_float := lookup_type_id("Float")
     if method == "to_string":
         expect_no_arguments(method, args)
-        return TID_STRING
+        return tid_string
     if method == "to_float":
         expect_no_arguments(method, args)
-        return TID_FLOAT
+        return tid_float
     report_error("E209", "Int has no method '" + method + "'")
     return TID_ERR
 
 fn check_float_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
+    tid_string := lookup_type_id("String")
+    tid_int := lookup_type_id("Int")
     if method == "to_string":
         expect_no_arguments(method, args)
-        return TID_STRING
+        return tid_string
     if method == "to_int":
         expect_no_arguments(method, args)
-        return TID_INT
+        return tid_int
     report_error("E209", "Float has no method '" + method + "'")
     return TID_ERR
 
 fn check_bool_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
+    tid_string := lookup_type_id("String")
     if method == "to_string":
         expect_no_arguments(method, args)
-        return TID_STRING
+        return tid_string
     report_error("E209", "Bool has no method '" + method + "'")
     return TID_ERR
 
@@ -2189,39 +2254,43 @@ fn check_bool_method_call(method: String, args: List[Int], scope_id: Int) -> Int
 
 fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
     elem := info.inner
+    tid_int := lookup_type_id("Int")
+    tid_string := lookup_type_id("String")
+    tid_bool := lookup_type_id("Bool")
+    tid_void := lookup_type_id("Void")
     if method == "push":
         expect_one_typed_argument(method, args, elem, scope_id)
-        return TID_VOID
+        return tid_void
     if method == "len":
         expect_no_arguments(method, args)
-        return TID_INT
+        return tid_int
     if method == "is_empty":
         expect_no_arguments(method, args)
-        return TID_BOOL
+        return tid_bool
     if method == "clear":
         expect_no_arguments(method, args)
-        return TID_VOID
+        return tid_void
     if method == "reverse":
         expect_no_arguments(method, args)
-        return TID_VOID
+        return tid_void
     if method == "remove":
-        expect_one_typed_argument(method, args, TID_INT, scope_id)
-        return TID_VOID
+        expect_one_typed_argument(method, args, tid_int, scope_id)
+        return tid_void
     if method == "contains":
         expect_one_typed_argument(method, args, elem, scope_id)
-        return TID_BOOL
+        return tid_bool
     if method == "join":
-        expect_one_typed_argument(method, args, TID_STRING, scope_id)
-        return TID_STRING
+        expect_one_typed_argument(method, args, tid_string, scope_id)
+        return tid_string
     if method == "index_of":
         expect_one_typed_argument(method, args, elem, scope_id)
-        return TID_INT
+        return tid_int
     if method == "slice":
         expect_two_int_arguments(method, args, scope_id)
-        return intern_collection_type("List", elem, -1)
+        return intern_list_type(elem)
     if method == "sort":
         expect_no_arguments(method, args)
-        return intern_collection_type("List", elem, -1)
+        return intern_list_type(elem)
     # not a built-in list method
     return - 1
 
@@ -2232,35 +2301,45 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
 fn check_map_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
     key_t := info.key_type
     val_t := info.value_type
+    tid_void := lookup_type_id("Void")
+    tid_int := lookup_type_id("Int")
+    tid_bool := lookup_type_id("Bool")
     if method == "insert":
         if args.len() != 2:
             report_error("E207", "insert expects 2 arguments, got " + args.len().to_string())
-            return TID_VOID
+            return tid_void
         # check key type
         check_argument_type(args[0], key_t, scope_id)
         check_argument_type(args[1], val_t, scope_id)
-        return TID_VOID
+        return tid_void
     if method == "len":
         expect_no_arguments(method, args)
-        return TID_INT
+        return tid_int
     if method == "is_empty":
         expect_no_arguments(method, args)
-        return TID_BOOL
+        return tid_bool
     if method == "clear":
         expect_no_arguments(method, args)
-        return TID_VOID
+        return tid_void
     if method == "contains_key":
         expect_one_typed_argument(method, args, key_t, scope_id)
-        return TID_BOOL
+        return tid_bool
+    if method == "get_default":
+        if args.len() != 2:
+            report_error("E207", "get_default expects 2 arguments, got " + args.len().to_string())
+            return val_t
+        check_argument_type(args[0], key_t, scope_id)
+        check_argument_type(args[1], val_t, scope_id)
+        return val_t
     if method == "remove":
         expect_one_typed_argument(method, args, key_t, scope_id)
-        return TID_VOID
+        return tid_void
     if method == "keys":
         expect_no_arguments(method, args)
-        return intern_collection_type("List", key_t, -1)
+        return intern_list_type(key_t)
     if method == "values":
         expect_no_arguments(method, args)
-        return intern_collection_type("List", val_t, -1)
+        return intern_list_type(val_t)
     return - 1
 
 # ---------------------------------------------------------------
@@ -2342,31 +2421,36 @@ fn expect_no_arguments(method: String, args: List[Int]):
         report_error("E207", method + " takes no arguments, got " + args.len().to_string())
 
 fn expect_one_string_argument(method: String, args: List[Int], scope_id: Int):
+    tid_string := lookup_type_id("String")
     if args.len() != 1:
         report_error("E207", method + " expects 1 argument, got " + args.len().to_string())
         return
-    check_argument_type(args[0], TID_STRING, scope_id)
+    check_argument_type(args[0], tid_string, scope_id)
 
 fn expect_two_string_arguments(method: String, args: List[Int], scope_id: Int):
+    tid_string := lookup_type_id("String")
     if args.len() != 2:
         report_error("E207", method + " expects 2 arguments, got " + args.len().to_string())
         return
-    check_argument_type(args[0], TID_STRING, scope_id)
-    check_argument_type(args[1], TID_STRING, scope_id)
+    check_argument_type(args[0], tid_string, scope_id)
+    check_argument_type(args[1], tid_string, scope_id)
 
 fn expect_two_int_arguments(method: String, args: List[Int], scope_id: Int):
+    tid_int := lookup_type_id("Int")
     if args.len() != 2:
         report_error("E207", method + " expects 2 arguments, got " + args.len().to_string())
         return
-    check_argument_type(args[0], TID_INT, scope_id)
-    check_argument_type(args[1], TID_INT, scope_id)
+    check_argument_type(args[0], tid_int, scope_id)
+    check_argument_type(args[1], tid_int, scope_id)
 
 fn expect_int_string_arguments(method: String, args: List[Int], scope_id: Int):
+    tid_int := lookup_type_id("Int")
+    tid_string := lookup_type_id("String")
     if args.len() != 2:
         report_error("E207", method + " expects 2 arguments, got " + args.len().to_string())
         return
-    check_argument_type(args[0], TID_INT, scope_id)
-    check_argument_type(args[1], TID_STRING, scope_id)
+    check_argument_type(args[0], tid_int, scope_id)
+    check_argument_type(args[1], tid_string, scope_id)
 
 fn expect_one_typed_argument(method: String, args: List[Int], expected: Int, scope_id: Int):
     if args.len() != 1:
@@ -2398,7 +2482,7 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
     # check if this is module alias access (e.g., math.abs)
     obj_node_idx := node.children[0]
     obj_node := get_node(obj_node_idx)
-    if obj_node.kind == "identifier":
+    if obj_node.kind == "ident":
         obj_name := obj_node.value
         if module_aliases.contains_key(obj_name):
             # this is a module alias - look up the function in the module
@@ -2417,11 +2501,12 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
         return TID_ERR
     obj_info := get_type_info(obj_type)
     if obj_info.kind == "struct":
-        # linear search through fields
         mut fidx := 0
-        for f in obj_info.fields:
-            if f == field_name:
-                return obj_info.field_types[fidx]
+        while fidx < obj_info.fields.len():
+            if strings_equal(obj_info.fields[fidx], field_name):
+                if fidx < obj_info.field_types.len():
+                    return obj_info.field_types[fidx]
+                return TID_ERR
             fidx = fidx + 1
         report_error("E209", get_type_name(obj_type) + " has no field '" + field_name + "'")
         return TID_ERR
@@ -2481,6 +2566,7 @@ fn parse_integer_string(s: String) -> Int:
 # ---------------------------------------------------------------
 
 fn check_index_expression(node: Node, scope_id: Int) -> Int:
+    tid_string := lookup_type_id("String")
     if node.children.len() < 2:
         return TID_ERR
     obj_type := c_check_expr(node.children[0], scope_id)
@@ -2490,11 +2576,11 @@ fn check_index_expression(node: Node, scope_id: Int) -> Int:
     if is_error_type(idx_type):
         return TID_ERR
     # string indexing
-    if obj_type == TID_STRING:
+    if obj_type == tid_string:
         if is_integer_type(idx_type) == false:
             report_error("E217", "string index must be integer, got " + get_type_name(idx_type))
             return TID_ERR
-        return TID_STRING
+        return tid_string
     obj_info := get_type_info(obj_type)
     if obj_info.kind == "list":
         if is_integer_type(idx_type) == false:
@@ -2700,11 +2786,11 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
 fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     # value: "EnumName.VariantName"
     # children: sub-patterns for variant fields
-    parts := pat.value.split(".")
-    if parts.len() < 2:
+    parts := split_qualified_name(pat.value)
+    if parts.1.len() == 0:
         return
-    type_name := parts[0]
-    variant_name := parts[1]
+    type_name := parts.0
+    variant_name := parts.1
     enum_tid := lookup_type_id(type_name)
     if enum_tid < 0:
         report_error("E202", "unknown type: " + type_name)
@@ -2720,7 +2806,7 @@ fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     mut found := false
     mut vidx := 0
     for v in enum_info.variants:
-        if v == variant_name:
+        if strings_equal(v, variant_name):
             found = true
             # check sub-pattern count
             if vidx < enum_info.variant_types.len():
@@ -2765,10 +2851,10 @@ fn collect_arm_pattern_bindings(pat: Node) -> String:
         return pat.value
     if pat.kind == "pat_variant":
         # extract variant name from "EnumName.VariantName"
-        parts := pat.value.split(".")
-        if parts.len() >= 2:
-            return parts[1]
-        return pat.value
+        parts := split_qualified_name(pat.value)
+        if parts.1.len() > 0:
+            return parts.1
+        return parts.0
     if pat.kind == "pat_int":
         return pat.value
     if pat.kind == "pat_string":
@@ -2827,7 +2913,7 @@ fn check_enum_exhaustiveness(info: TypeInfo, arm_values: List[String]):
     for variant in info.variants:
         mut found := false
         for v in arm_values:
-            if v == variant:
+            if strings_equal(v, variant):
                 found = true
         if found == false:
             missing.push(variant)
@@ -2875,11 +2961,12 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
 # ---------------------------------------------------------------
 
 fn check_list_expression(node: Node, scope_id: Int) -> Int:
+    tid_err := lookup_type_id("<error>")
     if node.children.len() == 0:
         # empty list — type comes from annotation context
-        return TID_ERR
+        return tid_err
     # check all elements
-    mut elem_type := TID_ERR
+    mut elem_type := tid_err
     for child in node.children:
         t := c_check_expr(child, scope_id)
         if is_error_type(elem_type):
@@ -2888,14 +2975,15 @@ fn check_list_expression(node: Node, scope_id: Int) -> Int:
             if t != elem_type:
                 report_error("E223", "list elements must be the same type: expected " + get_type_name(elem_type) + ", got " + get_type_name(t))
     if is_error_type(elem_type):
-        return TID_ERR
-    return intern_collection_type("List", elem_type, -1)
+        return tid_err
+    return intern_list_type(elem_type)
 
 fn check_map_expression(node: Node, scope_id: Int) -> Int:
+    tid_err := lookup_type_id("<error>")
     if node.children.len() == 0:
-        return TID_ERR
-    mut key_type := TID_ERR
-    mut val_type := TID_ERR
+        return tid_err
+    mut key_type := tid_err
+    mut val_type := tid_err
     for child in node.children:
         entry := get_node(child)
         if entry.kind == "entry":
@@ -2913,16 +3001,17 @@ fn check_map_expression(node: Node, scope_id: Int) -> Int:
                     if vt != val_type:
                         report_error("E223", "map values must be the same type")
     if is_error_type(key_type):
-        return TID_ERR
+        return tid_err
     if is_error_type(val_type):
-        return TID_ERR
-    return intern_collection_type("Map", key_type, val_type)
+        return tid_err
+    return intern_map_type(key_type, val_type)
 
 fn check_set_expression(node: Node, scope_id: Int) -> Int:
     # sets look like {a, b, c} — distinguish from map by no entries
+    tid_err := lookup_type_id("<error>")
     if node.children.len() == 0:
-        return TID_ERR
-    mut elem_type := TID_ERR
+        return tid_err
+    mut elem_type := tid_err
     for child in node.children:
         t := c_check_expr(child, scope_id)
         if is_error_type(elem_type):
@@ -2931,8 +3020,8 @@ fn check_set_expression(node: Node, scope_id: Int) -> Int:
             if t != elem_type:
                 report_error("E223", "set elements must be the same type")
     if is_error_type(elem_type):
-        return TID_ERR
-    return intern_collection_type("Set", elem_type, -1)
+        return tid_err
+    return intern_set_type(elem_type)
 
 fn check_tuple_expression(node: Node, scope_id: Int) -> Int:
     mut elems: List[Int] := []

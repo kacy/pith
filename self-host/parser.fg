@@ -264,127 +264,108 @@ pub fn parse_expression() -> Int:
     if recursion_depth >= max_depth:
         return add_leaf_with_position("error", "max recursion_depth exceeded")
     recursion_depth = recursion_depth + 1
-    # handle prefix not
-    mut not_count := 0
-    while check("kw_not"):
-        advance_token()
-        not_count = not_count + 1
-    # parse atom then binary operators by precedence
-    mut left := parse_unary()
-    # mul/div/mod (highest precedence)
-    mut tk := _cur_tok_kind()
-    while tk == "star" or tk == "slash" or tk == "percent":
-        mut op := "mul"
-        if tk == "slash":
-            op = "div"
-        elif tk == "percent":
-            op = "mod"
-        advance_token()
-        mut right := parse_unary()
-        mut c: List[Int] := [left, right]
-        left = add_node_with_position("binary", op, c)
-        tk = _cur_tok_kind()
-    # add/sub
-    tk = _cur_tok_kind()
-    while tk == "plus" or tk == "minus":
-        mut op := "add"
-        if tk == "minus":
-            op = "sub"
-        advance_token()
-        mut right := parse_unary()
-        mut tk2 := _cur_tok_kind()
-        while tk2 == "star" or tk2 == "slash" or tk2 == "percent":
-            mut op2 := "mul"
-            if tk2 == "slash":
-                op2 = "div"
-            elif tk2 == "percent":
-                op2 = "mod"
-            advance_token()
-            r2 := parse_unary()
-            mut c2: List[Int] := [right, r2]
-            right = add_node_with_position("binary", op2, c2)
-            tk2 = _cur_tok_kind()
-        mut c: List[Int] := [left, right]
-        left = add_node_with_position("binary", op, c)
-        tk = _cur_tok_kind()
-    # pipe
-    while check("pipe"):
-        advance_token()
-        mut right := parse_unary()
-        # parse higher-precedence on right
-        mut tk3 := _cur_tok_kind()
-        while tk3 == "star" or tk3 == "slash" or tk3 == "percent" or tk3 == "plus" or tk3 == "minus":
-            mut op3 := "add"
-            if tk3 == "star":
-                op3 = "mul"
-            elif tk3 == "slash":
-                op3 = "div"
-            elif tk3 == "percent":
-                op3 = "mod"
-            elif tk3 == "minus":
-                op3 = "sub"
-            advance_token()
-            r3 := parse_unary()
-            mut c3: List[Int] := [right, r3]
-            right = add_node_with_position("binary", op3, c3)
-            tk3 = _cur_tok_kind()
-        mut c: List[Int] := [left, right]
-        left = add_node_with_position("binary", "pipe", c)
-    # comparison
-    tk = _cur_tok_kind()
-    mut cmp_op := ""
-    if tk == "eq_eq":
-        cmp_op = "eq"
-    elif tk == "bang_eq":
-        cmp_op = "neq"
-    elif tk == "less":
-        cmp_op = "lt"
-    elif tk == "greater":
-        cmp_op = "gt"
-    elif tk == "less_eq":
-        cmp_op = "lte"
-    elif tk == "greater_eq":
-        cmp_op = "gte"
-    while cmp_op != "":
-        advance_token()
-        mut right := parse_expression()
-        mut c: List[Int] := [left, right]
-        left = add_node_with_position("binary", cmp_op, c)
-        tk = _cur_tok_kind()
-        cmp_op = ""
-        if tk == "eq_eq":
-            cmp_op = "eq"
-        elif tk == "bang_eq":
-            cmp_op = "neq"
-        elif tk == "less":
-            cmp_op = "lt"
-        elif tk == "greater":
-            cmp_op = "gt"
-        elif tk == "less_eq":
-            cmp_op = "lte"
-        elif tk == "greater_eq":
-            cmp_op = "gte"
-    # and
-    while check("kw_and"):
-        advance_token()
-        mut right := parse_expression()
-        mut c: List[Int] := [left, right]
-        left = add_node_with_position("binary", "and", c)
-    # or
-    while check("kw_or"):
-        advance_token()
-        mut right := parse_expression()
-        mut c: List[Int] := [left, right]
-        left = add_node_with_position("binary", "or", c)
-    # wrap not
-    while not_count > 0:
-        mut nc: List[Int] := [left]
-        left = add_node_with_position("unary", "not", nc)
-        not_count = not_count - 1
+    left := parse_or_expression()
     recursion_depth = recursion_depth - 1
     return left
 
+fn parse_or_expression() -> Int:
+    mut left := parse_and_expression()
+    while check("kw_or"):
+        advance_token()
+        right := parse_and_expression()
+        mut children: List[Int] := [left, right]
+        left = add_node_with_position("binary", "or", children)
+    return left
+
+fn parse_and_expression() -> Int:
+    mut left := parse_comparison_expression()
+    while check("kw_and"):
+        advance_token()
+        right := parse_comparison_expression()
+        mut children: List[Int] := [left, right]
+        left = add_node_with_position("binary", "and", children)
+    return left
+
+fn parse_comparison_expression() -> Int:
+    mut left := parse_pipe_expression()
+    mut keep_parsing := true
+    while keep_parsing:
+        mut op := ""
+        if check("eq_eq"):
+            op = "eq"
+        elif check("bang_eq"):
+            op = "neq"
+        elif check("less"):
+            op = "lt"
+        elif check("greater"):
+            op = "gt"
+        elif check("less_eq"):
+            op = "lte"
+        elif check("greater_eq"):
+            op = "gte"
+        if op.len() == 0:
+            keep_parsing = false
+        else:
+            advance_token()
+            right := parse_pipe_expression()
+            mut children: List[Int] := [left, right]
+            left = add_node_with_position("binary", op, children)
+    return left
+
+fn parse_pipe_expression() -> Int:
+    mut left := parse_additive_expression()
+    while check("pipe"):
+        advance_token()
+        right := parse_additive_expression()
+        mut children: List[Int] := [left, right]
+        left = add_node_with_position("binary", "pipe", children)
+    return left
+
+fn parse_additive_expression() -> Int:
+    mut left := parse_multiplicative_expression()
+    mut keep_parsing := true
+    while keep_parsing:
+        mut op := ""
+        if check("plus"):
+            op = "add"
+        elif check("minus"):
+            op = "sub"
+        if op.len() == 0:
+            keep_parsing = false
+        else:
+            advance_token()
+            right := parse_multiplicative_expression()
+            mut children: List[Int] := [left, right]
+            left = add_node_with_position("binary", op, children)
+    return left
+
+fn parse_multiplicative_expression() -> Int:
+    mut left := parse_unary()
+    mut keep_parsing := true
+    while keep_parsing:
+        mut op := ""
+        if check("star"):
+            op = "mul"
+        elif check("slash"):
+            op = "div"
+        elif check("percent"):
+            op = "mod"
+        if op.len() == 0:
+            keep_parsing = false
+        else:
+            advance_token()
+            right := parse_unary()
+            mut children: List[Int] := [left, right]
+            left = add_node_with_position("binary", op, children)
+    return left
+
 fn parse_unary() -> Int:
+    if check("kw_not"):
+        advance_token()
+        operand := parse_unary()
+        mut children: List[Int] := [operand]
+        return add_node_with_position("unary", "not", children)
+
     if check("kw_spawn"):
         advance_token()
         operand := parse_unary()
@@ -898,7 +879,7 @@ fn parse_pattern() -> Int:
         return add_leaf_with_position("pat_none", "")
 
     if _cur_tok_kind() == "identifier":
-        advance_token()
+        type_tok := advance_token()
         # variant pattern: Type.Variant or Type.Variant(fields)
         if check("dot"):
             advance_token()
@@ -912,12 +893,12 @@ fn parse_pattern() -> Int:
                     while match_tok("comma"):
                         fields.push(parse_pattern())
                 expect("rparen")
-                return add_node_with_position("pat_variant", _cur_tok_value() + "." + variant_tok.value, fields)
+                return add_node_with_position("pat_variant", type_tok.value + "." + variant_tok.value, fields)
 
             mut empty: List[Int] := []
-            return add_node_with_position("pat_variant", _cur_tok_value() + "." + variant_tok.value, empty)
+            return add_node_with_position("pat_variant", type_tok.value + "." + variant_tok.value, empty)
 
-        return add_leaf_with_position("pat_binding", _cur_tok_value())
+        return add_leaf_with_position("pat_binding", type_tok.value)
 
     if _cur_tok_kind() == "lparen":
         advance_token()

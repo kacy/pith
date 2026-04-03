@@ -293,7 +293,7 @@ fn register_builtin_types():
     define_builtin_function("mkdir", str_to_bool)
     define_builtin_function("remove_file", str_to_bool)
     # (String) -> String?
-    define_builtin_function("env", create_function_type([TID_STRING], opt_string))
+    define_builtin_function("env", create_function_type([TID_STRING], tid_string))
     # (String) -> List[String]
     define_builtin_function("list_dir", create_function_type([TID_STRING], list_string))
 
@@ -385,7 +385,7 @@ fn register_builtin_types():
     fix_builtin_binding("dir_exists", [tid_string], tid_bool)
     fix_builtin_binding("mkdir", [tid_string], tid_bool)
     fix_builtin_binding("remove_file", [tid_string], tid_bool)
-    fix_builtin_binding("env", [tid_string], opt_string)
+    fix_builtin_binding("env", [tid_string], tid_string)
     fix_builtin_binding("list_dir", [tid_string], list_string)
     fix_builtin_binding("parse_int", [tid_string], int_result)
     fix_builtin_binding("parse_float", [tid_string], float_result)
@@ -2067,6 +2067,14 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     receiver_type := c_check_expr(node.children[0], scope_id)
     if is_error_type(receiver_type):
         return TID_ERR
+    recv_info := get_type_info(receiver_type)
+    mut dispatch_type := receiver_type
+    if recv_info.kind == "optional":
+        dispatch_type = recv_info.inner
+        recv_info = get_type_info(dispatch_type)
+    elif recv_info.kind == "result":
+        dispatch_type = recv_info.inner
+        recv_info = get_type_info(dispatch_type)
 
     # get argument nodes (skip receiver)
     mut arg_indices: List[Int] := []
@@ -2083,18 +2091,17 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     tid_bool := lookup_type_id("Bool")
 
     # string methods
-    if receiver_type == tid_string:
+    if dispatch_type == tid_string:
         return check_string_method_call(method_name, arg_indices, scope_id)
     # primitive methods
-    if receiver_type == tid_int:
+    if dispatch_type == tid_int:
         return check_int_method_call(method_name, arg_indices, scope_id)
-    if receiver_type == tid_float:
+    if dispatch_type == tid_float:
         return check_float_method_call(method_name, arg_indices, scope_id)
-    if receiver_type == tid_bool:
+    if dispatch_type == tid_bool:
         return check_bool_method_call(method_name, arg_indices, scope_id)
 
     # collection methods
-    recv_info := get_type_info(receiver_type)
     if recv_info.kind == "list":
         result := check_list_method_call(method_name, recv_info, arg_indices, scope_id)
         if result >= 0:
@@ -2121,7 +2128,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             return sync_result
 
     # user-defined methods
-    type_name := get_type_name(receiver_type)
+    type_name := get_type_name(dispatch_type)
     key := type_name + "." + method_name
     if method_type_map.contains_key(key):
         fn_tid := method_type_map[key]
@@ -2575,13 +2582,19 @@ fn check_index_expression(node: Node, scope_id: Int) -> Int:
         return TID_ERR
     if is_error_type(idx_type):
         return TID_ERR
+    obj_info := get_type_info(obj_type)
+    if obj_info.kind == "optional":
+        obj_type = obj_info.inner
+        obj_info = get_type_info(obj_type)
+    elif obj_info.kind == "result":
+        obj_type = obj_info.inner
+        obj_info = get_type_info(obj_type)
     # string indexing
     if obj_type == tid_string:
         if is_integer_type(idx_type) == false:
             report_error("E217", "string index must be integer, got " + get_type_name(idx_type))
             return TID_ERR
         return tid_string
-    obj_info := get_type_info(obj_type)
     if obj_info.kind == "list":
         if is_integer_type(idx_type) == false:
             report_error("E217", "list index must be integer, got " + get_type_name(idx_type))

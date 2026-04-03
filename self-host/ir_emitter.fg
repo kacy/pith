@@ -38,9 +38,11 @@ FLOAT_RETURNING_FUNCS := "pow,sqrt,floor,ceil,round,to_float,get_float"
 BOOL_RETURNING_FUNCS := "file_exists,dir_exists,get_bool,object_has,has"
 INT_RETURNING_FUNCS := "abs,min,max,clamp,len,fnv1a,ord,exec"
 STRING_RETURNING_FUNCS := "sha256,hex_encode,hex_decode,from_hex,to_hex,b64_encode,b64_decode,chr,read_file,env,path_join,path_dir,path_base,path_ext,path_stem,scheme,host,query,fragment,decode,exec_output,type_of,get_string"
-BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,contains_key,map_contains_key,map_contains_ikey,set_contains,list_contains"
+LIST_RETURNING_FUNCS := "args,range,repeat_val,zeros,sort,sort_desc,reversed,take,drop,slice,unique,without,intersection,difference,flatten,chunks"
+LIST_STRING_RETURNING_FUNCS := "sort_strings,zip,enumerate"
+BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_is_empty,list_contains,list_is_empty"
 VOID_METHODS := "sort,sort_strings,reverse,clear,push,remove,list_remove,list_clear,list_reverse,map_remove,map_clear,set_remove,set_clear"
-STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,split,read_file,env,chr"
+STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,read_file,env,chr"
 
 # --- state ---
 mut ir_lines: List[String] := []
@@ -163,33 +165,35 @@ fn ir_resolve_type_node(type_idx: Int) -> String:
         return ir_resolve_type_hint(tn.value)
     return ""
 
-fn ir_find_free_vars(idx: Int, bound: List[String], free: List[String]):
-    node := get_node(idx)
-    if node.kind == "ident":
-        name := node.value
-        # check if name is bound (param or local)
-        mut is_bound := false
+fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
+    mut free: List[String] := []
+    mut stack: List[Int] := [idx]
+    while stack.len() > 0:
+        current := stack[stack.len() - 1]
+        stack.remove(stack.len() - 1)
+        node := get_node(current)
+        if node.kind == "ident":
+            name := node.value
+            mut is_bound := false
+            mut i := 0
+            while i < bound.len():
+                if bound[i] == name:
+                    is_bound = true
+                i = i + 1
+            mut already_free := false
+            i = 0
+            while i < free.len():
+                if free[i] == name:
+                    already_free = true
+                i = i + 1
+            if not is_bound and not already_free:
+                free.push(name)
+        kids := node.children
         mut i := 0
-        while i < bound.len():
-            if bound[i] == name:
-                is_bound = true
+        while i < kids.len():
+            stack.push(kids[i])
             i = i + 1
-        # check if already in free list
-        mut already_free := false
-        i = 0
-        while i < free.len():
-            if free[i] == name:
-                already_free = true
-            i = i + 1
-        if not is_bound and not already_free:
-            free.push(name)
-    mut _fi1 := 0
-    _kids1 := node.children
-    while _fi1 < _kids1.len():
-        child := _kids1[_fi1]
-        ir_find_free_vars(child, bound, free)
-
-        _fi1 = _fi1 + 1
+    return free
 fn ir_str(s: String) -> String:
     cleaned := ir_strip_quotes(s)
     mut i := 0
@@ -306,6 +310,10 @@ fn ir_infer_type(idx: Int) -> String:
                 return "int"
             if STRING_RETURNING_FUNCS.contains(fname):
                 return "string"
+            if LIST_RETURNING_FUNCS.contains(fname):
+                return "list"
+            if LIST_STRING_RETURNING_FUNCS.contains(fname):
+                return "list_string"
             if ir_func_returns.contains_key(fname):
                 return ir_resolve_type_hint(ir_func_returns[fname])
         return ""
@@ -314,6 +322,9 @@ fn ir_infer_type(idx: Int) -> String:
         mut meth := node_value(idx)
         if meth.starts_with("."):
             meth = meth.substring(1, meth.len())
+        mut obj_type := ""
+        if node.children.len() > 0:
+            obj_type = ir_infer_type(node.children[0])
         if BOOL_RETURNING_METHODS.contains(meth):
             return "bool"
         if STRING_RETURNING_METHODS.contains(meth):
@@ -322,6 +333,13 @@ fn ir_infer_type(idx: Int) -> String:
             return "float"
         if meth == "len":
             return "int"
+        if meth == "index_of" and (obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")):
+            return "int"
+        if meth == "slice" or meth == "sort":
+            if obj_type == "list_string":
+                return "list_string"
+            if obj_type == "list" or obj_type.starts_with("list:"):
+                return "list"
         if meth == "keys" or meth == "values" or meth == "split" or meth == "chars":
             return "list_string"
         return ""
@@ -432,6 +450,50 @@ fn ir_emit_method_call(idx: Int) -> Int:
                     emit_name = "forge_list_len"
                 else:
                     emit_name = "string_len"
+    elif mname == "contains":
+        if obj_is_list:
+            emit_name = "list_contains"
+        elif obj_is_set:
+            emit_name = "set_contains"
+    elif mname == "index_of":
+        if obj_is_list:
+            emit_name = "list_index_of"
+    elif mname == "sort":
+        if obj_type == "list_string":
+            emit_name = "sort_strings"
+    elif mname == "reverse":
+        if obj_is_list:
+            emit_name = "list_reverse"
+    elif mname == "add":
+        if obj_is_set:
+            emit_name = "set_add"
+    elif mname == "is_empty":
+        if obj_is_string:
+            emit_name = "string_is_empty"
+        elif obj_is_list:
+            emit_name = "list_is_empty"
+        elif obj_is_map:
+            emit_name = "map_is_empty"
+        elif obj_is_set:
+            emit_name = "set_is_empty"
+    elif mname == "clear":
+        if obj_is_list:
+            emit_name = "list_clear"
+        elif obj_is_map:
+            emit_name = "map_clear"
+        elif obj_is_set:
+            emit_name = "set_clear"
+    elif mname == "remove":
+        if obj_is_map:
+            emit_name = "map_remove"
+        elif obj_is_set:
+            emit_name = "set_remove"
+    elif mname == "keys":
+        if obj_is_map:
+            emit_name = "map_keys"
+    elif mname == "values":
+        if obj_is_map:
+            emit_name = "map_values"
     elif mname == "contains_key" and obj_is_map_int:
         emit_name = "map_contains_ikey"
     elif mname == "insert" and obj_is_map_int:
@@ -549,7 +611,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # detect captured variables: free vars in body that aren't params
     mut captures: List[String] := []
     if lbody_idx >= 0:
-        ir_find_free_vars(lbody_idx, lparams, captures)
+        captures = ir_find_free_vars(lbody_idx, lparams)
     # emit capture setup: store captured vars in closure env
     mut ci := 0
     while ci < captures.len():
@@ -1502,9 +1564,6 @@ fn ir_impl_func(idx: Int, impl_type: String):
 # --- collect import renames ---
 fn ir_collect_imports(root_idx: Int):
     root := get_node(root_idx)
-    # only rename imports from modules with name conflicts
-    # currently only std.toml (conflicts with std.json names)
-    needs_prefix := "std.toml"
     mut ci := 0
     while ci < root.children.len():
         cn := get_node(root.children[ci])
@@ -1512,15 +1571,20 @@ fn ir_collect_imports(root_idx: Int):
             parts := cn.value.split(" ")
             if parts.len() > 1:
                 mod_path := parts[0]
-                if mod_path == needs_prefix:
-                    rest := mod_path.substring(4, mod_path.len())
-                    mod_parts := rest.split(".")
-                    prefix := mod_parts[mod_parts.len() - 1]
+                mut prefix := ""
+                if mod_path == "std.toml":
+                    prefix = "toml"
+                elif mod_path == "std.os.path":
+                    prefix = "path"
+                if prefix.len() > 0:
                     mut pi := 1
                     while pi < parts.len():
                         iname := parts[pi]
                         if iname.len() > 0:
-                            ir_import_renames.insert(iname, prefix + "_" + iname)
+                            mut renamed := prefix + "_" + iname
+                            if mod_path == "std.os.path" and iname == "base":
+                                renamed = "forge_path_basename"
+                            ir_import_renames.insert(iname, renamed)
                         pi = pi + 1
         ci = ci + 1
 

@@ -1815,7 +1815,7 @@ fn resolve_func_name(name: &str) -> &str {
         // Path
         "path_join" | "join_path" => "forge_path_join",
         "path_dir" | "dir" => "forge_path_dir",
-        "path_base" | "base" => "forge_path_base",
+        "path_base" | "base" => "forge_path_basename",
         "path_ext" | "ext" => "forge_path_ext",
         "path_stem" | "stem" => "forge_path_stem",
         // Logging

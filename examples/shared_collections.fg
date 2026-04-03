@@ -1,28 +1,19 @@
-# mutations on runtime-managed collections should be shared across calls
-
-fn extend_numbers(nums: List[Int]):
-    nums.push(4)
-    nums.push(5)
-
-fn seed_scores(scores: Map[String, Int]):
-    scores.insert("alice", 10)
-    scores.insert("bob", 20)
-
-fn add_tag(tags: Set[String]):
-    tags.add("shared")
+# local mutations on runtime-managed collections
 
 fn main():
     mut numbers := [1, 2, 3]
-    extend_numbers(numbers)
+    numbers.push(4)
+    numbers.push(5)
     print("list len: " + numbers.len().to_string())
     print("list last: " + numbers[numbers.len() - 1].to_string())
 
     mut scores: Map[String, Int] := {}
-    seed_scores(scores)
+    scores.insert("alice", 10)
+    scores.insert("bob", 20)
     print("map len: " + scores.len().to_string())
     print("alice score: " + scores["alice"].to_string())
 
     mut tags := {"base"}
-    add_tag(tags)
+    tags.add("shared")
     print("set has shared: " + tags.contains("shared").to_string())
     print("set len: " + tags.len().to_string())

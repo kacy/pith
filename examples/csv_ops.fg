@@ -1,32 +1,7 @@
 # CSV parsing and encoding
 
 fn parse_csv_row(line: String) -> List[String]:
-    mut fields: List[String] := []
-    mut current := ""
-    mut in_quotes := false
-    mut i := 0
-    while i < line.len():
-        c := line[i]
-        if in_quotes:
-            if c == chr(34):
-                if i + 1 < line.len() and line[i + 1] == chr(34):
-                    current = current + chr(34)
-                    i = i + 1
-                else:
-                    in_quotes = false
-            else:
-                current = current + c
-        else:
-            if c == chr(34):
-                in_quotes = true
-            elif c == ",":
-                fields.push(current.trim())
-                current = ""
-            else:
-                current = current + c
-        i = i + 1
-    fields.push(current.trim())
-    return fields
+    return line.split(",")
 
 fn parse_csv(text: String) -> List[List[String]]:
     mut rows: List[List[String]] := []

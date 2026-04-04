@@ -1004,8 +1004,6 @@ fn compile_ir_function(
                         }
                         if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
                             struct_regs.insert(reg, struct_name.to_string());
-                        } else if let Some(struct_name) = known_struct_returning_fn(fname) {
-                            struct_regs.insert(reg, struct_name.to_string());
                         } else if let Some(struct_name) = struct_returning_funcs.get(fname) {
                             struct_regs.insert(reg, struct_name.clone());
                         } else {
@@ -1165,12 +1163,8 @@ fn compile_ir_function(
                     if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
                         struct_regs.insert(reg, struct_name.to_string());
                     }
-                } else if let Some(struct_name) = field_struct_name {
-                    if known_string_field(struct_name, bare_field_name) {
-                        string_regs.insert(reg);
-                    } else {
-                        string_regs.remove(&reg);
-                    }
+                } else if field_struct_name.is_some() {
+                    string_regs.remove(&reg);
                     float_regs.remove(&reg);
                 } else {
                     string_regs.remove(&reg);
@@ -1410,34 +1404,6 @@ fn call_returns_string(
     false
 }
 
-fn known_struct_returning_fn(name: &str) -> Option<&'static str> {
-    match name {
-        "get_node" => Some("Node"),
-        "advance_token" | "expect" => Some("Token"),
-        "ti_primitive" | "ti_struct" | "ti_enum" | "ti_function" | "ti_optional" | "ti_result"
-        | "ti_tuple" | "ti_list" | "ti_map" | "ti_set" | "ti_task" | "ti_channel"
-        | "get_type_info" => Some("TypeInfo"),
-        _ => None,
-    }
-}
-
-fn known_string_field(struct_name: &str, field_name: &str) -> bool {
-    matches!(
-        (struct_name, field_name),
-        ("Node", "kind")
-            | ("Node", "value")
-            | ("Token", "kind")
-            | ("Token", "value")
-            | ("TypeInfo", "kind")
-            | ("TypeInfo", "name")
-            | ("Diagnostic", "severity")
-            | ("Diagnostic", "code")
-            | ("Diagnostic", "message")
-            | ("Diagnostic", "file")
-            | ("Diagnostic", "fix")
-    )
-}
-
 fn field_offset_for_name(
     struct_layouts: &HashMap<String, Vec<String>>,
     struct_name: Option<&str>,
@@ -1514,8 +1480,6 @@ fn collect_struct_returning_funcs(lines: &[&str]) -> HashMap<String, String> {
                         let (fname, retkind, _, _) =
                             parse_call_shape(&parts).unwrap_or((parts[2], "unknown", 0, 4));
                         if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
-                            struct_regs.insert(reg, struct_name.to_string());
-                        } else if let Some(struct_name) = known_struct_returning_fn(fname) {
                             struct_regs.insert(reg, struct_name.to_string());
                         } else if let Some(struct_name) = struct_returning_funcs.get(fname) {
                             struct_regs.insert(reg, struct_name.clone());
@@ -1631,8 +1595,6 @@ fn collect_string_returning_funcs(
                         reg_source_vars.remove(&reg);
                         if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
                             struct_regs.insert(reg, struct_name.to_string());
-                        } else if let Some(struct_name) = known_struct_returning_fn(fname) {
-                            struct_regs.insert(reg, struct_name.to_string());
                         } else if let Some(struct_name) = struct_returning_funcs.get(fname) {
                             struct_regs.insert(reg, struct_name.clone());
                         } else {
@@ -1708,7 +1670,7 @@ fn collect_string_returning_funcs(
                     if let Ok(reg) = parts[1].parse::<usize>() {
                         let obj_reg = parts[2].parse::<usize>().unwrap_or(usize::MAX);
                         let obj_struct_name = struct_regs.get(&obj_reg).cloned();
-                        let (explicit_struct_name, field_retkind, bare_field_name) =
+                        let (explicit_struct_name, field_retkind, _bare_field_name) =
                             if parts.len() >= 6 && parts[3].parse::<i32>().is_ok() {
                                 (None, Some(parts[4]), parts[5])
                             } else if parts.len() >= 5 {
@@ -1727,12 +1689,8 @@ fn collect_string_returning_funcs(
                         let field_struct_name = explicit_struct_name.or(obj_struct_name.as_deref());
                         if field_is_string {
                             str_regs.insert(reg);
-                        } else if let Some(struct_name) = field_struct_name {
-                            if known_string_field(struct_name, bare_field_name) {
-                                str_regs.insert(reg);
-                            } else {
-                                str_regs.remove(&reg);
-                            }
+                        } else if field_struct_name.is_some() {
+                            str_regs.remove(&reg);
                         } else {
                             str_regs.remove(&reg);
                         }
@@ -2041,7 +1999,7 @@ mod tests {
     fn collect_string_returning_funcs_tracks_string_fields_through_calls() {
         let lines = vec![
             "func parse_dotted_path 0 i64",
-            "call 1 expect 1 0",
+            "call 1 expect Token 0",
             "store next 1",
             "strref 2 s0",
             "store path 2",
@@ -2049,12 +2007,12 @@ mod tests {
             "strref 4 s1",
             "concat 5 3 4",
             "load 6 next",
-            "field 7 6 value",
+            "field 7 6 8 string value",
             "add 8 5 7",
             "ret 8",
             "endfunc",
             "func parse_import_decl 0 i64",
-            "call 1 parse_dotted_path 0",
+            "call 1 parse_dotted_path string 0",
             "strref 2 s2",
             "add 3 1 2",
             "ret 3",

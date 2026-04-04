@@ -281,6 +281,23 @@ fn ir_unpack_field_index(meta: String) -> Int:
         i = i + 1
     return value
 
+fn ir_register_struct_layout(name: String, field_names: List[String], field_types: List[String]):
+    if ir_struct_names.contains_key(name):
+        return
+    mut i := 0
+    while i < field_names.len():
+        ir_struct_field_lookup.insert(name + "." + field_names[i], field_types[i])
+        ir_struct_field_index_lookup.insert(name + "." + field_names[i], i.to_string())
+        i = i + 1
+    ir_struct_names.insert(name, field_names.len())
+    ir_emit("struct " + name + " " + field_names.join(" "))
+
+fn ir_register_known_import_structs():
+    ir_register_struct_layout("Node", ["kind", "value", "children", "line", "col"], ["string", "string", "list", "int", "int"])
+    ir_register_struct_layout("Token", ["kind", "value", "current_line", "current_column"], ["string", "string", "int", "int"])
+    ir_register_struct_layout("TypeInfo", ["kind", "name", "fields", "field_types", "field_pub", "field_mut", "param_types", "return_type", "inner", "key_type", "value_type", "elements", "variants", "variant_types"], ["string", "string", "list_string", "list", "list", "list", "list", "int", "int", "int", "int", "list", "list_string", "list"])
+    ir_register_struct_layout("Diagnostic", ["severity", "code", "message", "file", "line", "col", "fix"], ["string", "string", "string", "string", "int", "int", "string"])
+
 # --- centralized type inference for AST nodes ---
 # Returns: "int", "float", "bool", "string", "list", "list_string",
 #          "map", "map_int", "set", or "" (unknown)
@@ -1722,6 +1739,7 @@ pub fn emit_ir(root_idx: Int) -> String:
     ir_struct_names = {}
     ir_struct_field_lookup = {}
     ir_struct_field_index_lookup = {}
+    ir_register_known_import_structs()
     mut _fi22 := 0
     kids22_children := root.children
     while _fi22 < kids22_children.len():

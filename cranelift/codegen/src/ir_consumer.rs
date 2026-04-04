@@ -861,8 +861,8 @@ fn compile_ir_function(
 
             "call" if parts.len() >= 4 => {
                 let reg: usize = parts[1].parse().unwrap_or(0);
-                let mut fname = parts[2];
-                let nargs: usize = parts[3].parse().unwrap_or(0);
+                let (mut fname, retkind, nargs, arg_start) =
+                    parse_call_shape(&parts).unwrap_or((parts[2], "unknown", 0, 4));
                 let arg_regs = parse_call_arg_regs(&parts, nargs);
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
@@ -872,8 +872,8 @@ fn compile_ir_function(
                 if struct_layouts.contains_key(fname) {
                     let mut args: Vec<Value> = Vec::new();
                     for j in 0..nargs {
-                        if j + 4 < parts.len() {
-                            args.push(get_reg(&regs, parts[j + 4]));
+                        if j + arg_start < parts.len() {
+                            args.push(get_reg(&regs, parts[j + arg_start]));
                         }
                     }
                     // Allocate struct
@@ -912,9 +912,9 @@ fn compile_ir_function(
                     // __list_get on a string → char_at (string indexing)
                     if (fname == "__list_get" || fname == "__index")
                         && nargs >= 1
-                        && parts.len() > 4
+                        && parts.len() > arg_start
                     {
-                        if let Ok(arg_reg) = parts[4].parse::<usize>() {
+                        if let Ok(arg_reg) = parts[arg_start].parse::<usize>() {
                             if string_regs.contains(&arg_reg) {
                                 fname = "char_at";
                             }
@@ -922,8 +922,8 @@ fn compile_ir_function(
                     }
                     let mut args: Vec<Value> = Vec::new();
                     for j in 0..nargs {
-                        if j + 4 < parts.len() {
-                            args.push(get_reg(&regs, parts[j + 4]));
+                        if j + arg_start < parts.len() {
+                            args.push(get_reg(&regs, parts[j + arg_start]));
                         }
                     }
                     // Note: `len` maps to forge_auto_len which handles both
@@ -982,24 +982,29 @@ fn compile_ir_function(
                         } else {
                             regs.insert(reg, builder.ins().iconst(types::I64, 0));
                         }
-                        if call_returns_string(
-                            fname,
-                            &arg_regs,
-                            &string_regs,
-                            &reg_source_vars,
-                            string_global_names,
-                            string_returning_funcs,
-                        ) {
+                        if retkind == "string"
+                            || (retkind == "unknown"
+                                && call_returns_string(
+                                    fname,
+                                    &arg_regs,
+                                    &string_regs,
+                                    &reg_source_vars,
+                                    string_global_names,
+                                    string_returning_funcs,
+                                ))
+                        {
                             string_regs.insert(reg);
                         } else {
                             string_regs.remove(&reg);
                         }
-                        if returns_float {
+                        if retkind == "float" || (retkind == "unknown" && returns_float) {
                             float_regs.insert(reg);
                         } else {
                             float_regs.remove(&reg);
                         }
-                        if let Some(struct_name) = known_struct_returning_fn(fname) {
+                        if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
+                            struct_regs.insert(reg, struct_name.to_string());
+                        } else if let Some(struct_name) = known_struct_returning_fn(fname) {
                             struct_regs.insert(reg, struct_name.to_string());
                         } else if let Some(struct_name) = struct_returning_funcs.get(fname) {
                             struct_regs.insert(reg, struct_name.clone());
@@ -1115,17 +1120,25 @@ fn compile_ir_function(
                 let obj_reg: usize = parts[2].parse().unwrap_or(usize::MAX);
                 let obj_struct_name = struct_regs.get(&obj_reg).cloned();
                 let obj = get_reg(&regs, parts[2]);
-                let (explicit_struct_name, bare_field_name) = if parts.len() >= 5 {
-                    (Some(parts[3]), parts[4])
-                } else {
-                    split_typed_field_name(parts[3])
-                };
+                let (explicit_struct_name, bare_field_name, offset, field_retkind) =
+                    if parts.len() >= 6 && parts[3].parse::<i32>().is_ok() {
+                        (None, parts[5], parts[3].parse::<i32>().unwrap_or(0), Some(parts[4]))
+                    } else if parts.len() >= 5 {
+                        (Some(parts[3]), parts[4], 0, None)
+                    } else {
+                        let (name, bare) = split_typed_field_name(parts[3]);
+                        (name, bare, 0, None)
+                    };
                 let field_struct_name = explicit_struct_name.or(obj_struct_name.as_deref());
-                // Try numeric field index first (for tuples: .0, .1)
-                let offset = if let Ok(idx) = bare_field_name.parse::<usize>() {
-                    (idx * 8) as i32
+                let offset = if field_retkind.is_some() {
+                    offset
                 } else {
-                    field_offset_for_name(struct_layouts, field_struct_name, bare_field_name)
+                    // Try numeric field index first (for tuples: .0, .1)
+                    if let Ok(idx) = bare_field_name.parse::<usize>() {
+                        (idx * 8) as i32
+                    } else {
+                        field_offset_for_name(struct_layouts, field_struct_name, bare_field_name)
+                    }
                 };
                 let raw = builder.ins().load(
                     types::I64,
@@ -1138,16 +1151,31 @@ fn compile_ir_function(
                 regs.insert(reg, v);
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
-                if let Some(struct_name) = field_struct_name {
+                if let Some(retkind) = field_retkind {
+                    if retkind == "string" {
+                        string_regs.insert(reg);
+                    } else {
+                        string_regs.remove(&reg);
+                    }
+                    if retkind == "float" {
+                        float_regs.insert(reg);
+                    } else {
+                        float_regs.remove(&reg);
+                    }
+                    if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
+                        struct_regs.insert(reg, struct_name.to_string());
+                    }
+                } else if let Some(struct_name) = field_struct_name {
                     if known_string_field(struct_name, bare_field_name) {
                         string_regs.insert(reg);
                     } else {
                         string_regs.remove(&reg);
                     }
+                    float_regs.remove(&reg);
                 } else {
                     string_regs.remove(&reg);
+                    float_regs.remove(&reg);
                 }
-                float_regs.remove(&reg);
             }
 
             "funcref" if parts.len() >= 3 => {
@@ -1304,10 +1332,44 @@ fn name_suggests_string_list(name: &str) -> bool {
         || lowered.contains("_key")
 }
 
+fn parse_call_shape<'a>(parts: &'a [&'a str]) -> Option<(&'a str, &'a str, usize, usize)> {
+    if parts.len() < 4 {
+        return None;
+    }
+
+    let fname = parts[2];
+    let looks_like_retkind = matches!(
+        parts[3],
+        "unknown"
+            | "void"
+            | "int"
+            | "float"
+            | "bool"
+            | "string"
+            | "list"
+            | "list_string"
+            | "map"
+            | "map_int"
+            | "set"
+    ) || parts[3].starts_with("struct:");
+    if looks_like_retkind && parts.len() >= 5 {
+        if let Ok(nargs) = parts[4].parse::<usize>() {
+            return Some((fname, parts[3], nargs, 5));
+        }
+    }
+
+    Some((fname, "unknown", parts[3].parse().unwrap_or(0), 4))
+}
+
+fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
+    retkind.strip_prefix("struct:")
+}
+
 fn parse_call_arg_regs(parts: &[&str], nargs: usize) -> Vec<usize> {
+    let arg_start = parse_call_shape(parts).map(|(_, _, _, start)| start).unwrap_or(4);
     let mut arg_regs = Vec::with_capacity(nargs);
     for i in 0..nargs {
-        if let Some(arg) = parts.get(4 + i) {
+        if let Some(arg) = parts.get(arg_start + i) {
             arg_regs.push(arg.parse::<usize>().unwrap_or(usize::MAX));
         }
     }
@@ -1434,11 +1496,20 @@ fn collect_struct_returning_funcs(lines: &[&str]) -> HashMap<String, String> {
                     cur_func = parts[1].to_string();
                     struct_regs.clear();
                     struct_vars.clear();
+                    if parts.len() >= 4 {
+                        if let Some(struct_name) = explicit_struct_name_from_retkind(parts[3]) {
+                            struct_returning_funcs
+                                .insert(cur_func.clone(), struct_name.to_string());
+                        }
+                    }
                 }
                 "call" if parts.len() >= 4 => {
                     if let Ok(reg) = parts[1].parse::<usize>() {
-                        let fname = parts[2];
-                        if let Some(struct_name) = known_struct_returning_fn(fname) {
+                        let (fname, retkind, _, _) =
+                            parse_call_shape(&parts).unwrap_or((parts[2], "unknown", 0, 4));
+                        if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
+                            struct_regs.insert(reg, struct_name.to_string());
+                        } else if let Some(struct_name) = known_struct_returning_fn(fname) {
                             struct_regs.insert(reg, struct_name.to_string());
                         } else if let Some(struct_name) = struct_returning_funcs.get(fname) {
                             struct_regs.insert(reg, struct_name.clone());
@@ -1530,22 +1601,31 @@ fn collect_string_returning_funcs(
                     reg_source_vars.clear();
                     struct_regs.clear();
                     struct_vars.clear();
+                    if parts.len() >= 4 && parts[3] == "string" {
+                        string_returning_funcs.insert(cur_func.clone());
+                    }
                 }
                 "call" if parts.len() >= 4 => {
                     if let Ok(reg) = parts[1].parse::<usize>() {
-                        let fname = parts[2];
-                        let nargs = parts[3].parse::<usize>().unwrap_or(0);
+                        let (fname, retkind, nargs, _) =
+                            parse_call_shape(&parts).unwrap_or((parts[2], "unknown", 0, 4));
                         let arg_regs = parse_call_arg_regs(&parts, nargs);
-                        let returns_string = call_returns_string(
-                            fname,
-                            &arg_regs,
-                            &str_regs,
-                            &reg_source_vars,
-                            string_global_names,
-                            &string_returning_funcs,
-                        );
+                        let returns_string = if retkind == "string" {
+                            true
+                        } else {
+                            call_returns_string(
+                                fname,
+                                &arg_regs,
+                                &str_regs,
+                                &reg_source_vars,
+                                string_global_names,
+                                &string_returning_funcs,
+                            )
+                        };
                         reg_source_vars.remove(&reg);
-                        if let Some(struct_name) = known_struct_returning_fn(fname) {
+                        if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
+                            struct_regs.insert(reg, struct_name.to_string());
+                        } else if let Some(struct_name) = known_struct_returning_fn(fname) {
                             struct_regs.insert(reg, struct_name.to_string());
                         } else if let Some(struct_name) = struct_returning_funcs.get(fname) {
                             struct_regs.insert(reg, struct_name.clone());
@@ -1622,15 +1702,26 @@ fn collect_string_returning_funcs(
                     if let Ok(reg) = parts[1].parse::<usize>() {
                         let obj_reg = parts[2].parse::<usize>().unwrap_or(usize::MAX);
                         let obj_struct_name = struct_regs.get(&obj_reg).cloned();
-                        let (explicit_struct_name, bare_field_name) = if parts.len() >= 5 {
-                            (Some(parts[3]), parts[4])
+                        let (explicit_struct_name, field_retkind, bare_field_name) =
+                            if parts.len() >= 6 && parts[3].parse::<i32>().is_ok() {
+                                (None, Some(parts[4]), parts[5])
+                            } else if parts.len() >= 5 {
+                                (Some(parts[3]), None, parts[4])
+                            } else {
+                                let (name, bare) = split_typed_field_name(parts[3]);
+                                (name, None, bare)
+                            };
+                        let field_is_string = if let Some(retkind) = field_retkind {
+                            retkind == "string"
                         } else {
-                            split_typed_field_name(parts[3])
+                            false
                         };
                         reg_source_vars.remove(&reg);
                         struct_regs.remove(&reg);
                         let field_struct_name = explicit_struct_name.or(obj_struct_name.as_deref());
-                        if let Some(struct_name) = field_struct_name {
+                        if field_is_string {
+                            str_regs.insert(reg);
+                        } else if let Some(struct_name) = field_struct_name {
                             if known_string_field(struct_name, bare_field_name) {
                                 str_regs.insert(reg);
                             } else {
@@ -1968,5 +2059,28 @@ mod tests {
         let string_funcs = collect_string_returning_funcs(&lines, &HashSet::new(), &struct_funcs);
         assert!(string_funcs.contains("parse_dotted_path"));
         assert!(string_funcs.contains("parse_import_decl"));
+    }
+
+    #[test]
+    fn parse_call_shape_distinguishes_old_and_new_formats() {
+        let old = vec!["call", "7", "print", "1", "3"];
+        let new = vec!["call", "8", "char_at", "string", "2", "1", "2"];
+
+        assert_eq!(parse_call_shape(&old), Some(("print", "unknown", 1, 4)));
+        assert_eq!(parse_call_shape(&new), Some(("char_at", "string", 2, 5)));
+    }
+
+    #[test]
+    fn collect_string_returning_funcs_uses_explicit_call_retkind() {
+        let lines = vec![
+            "func token_value 0 string",
+            "call 1 char_at string 2 2 3",
+            "ret 1",
+            "endfunc",
+        ];
+
+        let struct_funcs = collect_struct_returning_funcs(&lines);
+        let string_funcs = collect_string_returning_funcs(&lines, &HashSet::new(), &struct_funcs);
+        assert!(string_funcs.contains("token_value"));
     }
 }

@@ -3,7 +3,14 @@
 # renders diagnostics with source context, underlines, and fix
 # suggestions. mirrors the output format of src/errors.zig.
 
-from checker import Diagnostic
+pub struct Diagnostic:
+    pub severity: String
+    pub code: String
+    pub message: String
+    pub file: String
+    pub line: Int
+    pub col: Int
+    pub fix: String
 
 # render all diagnostics as human-readable text with source context.
 pub fn render_diagnostics(diags: List[Diagnostic], source: String) -> String:
@@ -30,9 +37,9 @@ fn render_single_diagnostic(d: Diagnostic, source: String) -> String:
         location = location + ": "
 
     if d.code != "":
-        output = output + location + d.severity + "[" + d.code + "]: " + d.message + "\n"
+        output = output + location + d.severity + "[" + d.code + "]: " + d.message + chr(10)
     else:
-        output = output + location + d.severity + ": " + d.message + "\n"
+        output = output + location + d.severity + ": " + d.message + chr(10)
 
     # source line + underline (only if we have line info)
     if d.line > 0:
@@ -41,7 +48,7 @@ fn render_single_diagnostic(d: Diagnostic, source: String) -> String:
         if line_idx >= 0 and line_idx < lines.len():
             source_line := lines[line_idx]
             line_num := d.line.to_string()
-            output = output + "  " + line_num + " | " + source_line + "\n"
+            output = output + "  " + line_num + " | " + source_line + chr(10)
 
             # underline: spaces for margin + carets
             margin_width := line_num.len() + 4
@@ -49,13 +56,13 @@ fn render_single_diagnostic(d: Diagnostic, source: String) -> String:
             while j < margin_width + d.col:
                 output = output + " "
                 j = j + 1
-            output = output + "^\n"
+            output = output + "^" + chr(10)
 
     # fix suggestion
     if d.fix != "":
-        output = output + "  fix: " + d.fix + "\n"
+        output = output + "  fix: " + d.fix + chr(10)
 
-    output = output + "\n"
+    output = output + chr(10)
     return output
 
 # render diagnostics as JSON (same format as check_main.fg).
@@ -67,29 +74,30 @@ pub fn render_diagnostics_json(diags: List[Diagnostic]) -> String:
             output = output + ","
         output = output + render_diagnostic_json(diags[i])
         i = i + 1
-    output = output + "]\n"
+    output = output + "]" + chr(10)
     return output
 
 # render a single diagnostic as a JSON object.
 fn render_diagnostic_json(d: Diagnostic) -> String:
+    quote := chr(34)
     mut output := chr(123)
-    output = output + "\"file\":"
+    output = output + quote + "file" + quote + ":"
     if d.file != "":
-        output = output + "\"" + escape_json_string(d.file) + "\""
+        output = output + quote + escape_json_string(d.file) + quote
     else:
         output = output + "null"
-    output = output + ",\"severity\":\"" + escape_json_string(d.severity) + "\""
-    output = output + ",\"code\":"
+    output = output + "," + quote + "severity" + quote + ":" + quote + escape_json_string(d.severity) + quote
+    output = output + "," + quote + "code" + quote + ":"
     if d.code != "":
-        output = output + "\"" + escape_json_string(d.code) + "\""
+        output = output + quote + escape_json_string(d.code) + quote
     else:
         output = output + "null"
-    output = output + ",\"message\":\"" + escape_json_string(d.message) + "\""
-    output = output + ",\"line\":" + d.line.to_string()
-    output = output + ",\"col\":" + d.col.to_string()
-    output = output + ",\"fix\":"
+    output = output + "," + quote + "message" + quote + ":" + quote + escape_json_string(d.message) + quote
+    output = output + "," + quote + "line" + quote + ":" + d.line.to_string()
+    output = output + "," + quote + "col" + quote + ":" + d.col.to_string()
+    output = output + "," + quote + "fix" + quote + ":"
     if d.fix != "":
-        output = output + "\"" + escape_json_string(d.fix) + "\""
+        output = output + quote + escape_json_string(d.fix) + quote
     else:
         output = output + "null"
     output = output + chr(125)
@@ -97,18 +105,20 @@ fn render_diagnostic_json(d: Diagnostic) -> String:
 
 # escape a string for JSON output.
 fn escape_json_string(s: String) -> String:
+    quote := chr(34)
+    backslash := chr(92)
     mut output := ""
     mut i := 0
     while i < s.len():
         ch := s[i]
-        if ch == "\"":
-            output = output + "\\\""
-        elif ch == chr(92):
-            output = output + "\\\\"
+        if ch == quote:
+            output = output + backslash + quote
+        elif ch == backslash:
+            output = output + backslash + backslash
         elif ch == chr(10):
-            output = output + "\\n"
+            output = output + backslash + "n"
         elif ch == chr(9):
-            output = output + "\\t"
+            output = output + backslash + "t"
         else:
             output = output + ch
         i = i + 1

@@ -30,7 +30,7 @@ pub fn fmt_source(source: String) -> String:
         if line.len() == 0:
             consecutive_blank = consecutive_blank + 1
             if consecutive_blank <= 1:
-                output = output + "\n"
+                output = output + chr(10)
             i = i + 1
             continue
         consecutive_blank = 0
@@ -43,13 +43,13 @@ pub fn fmt_source(source: String) -> String:
                 indent_len := line.len() - trimmed.len()
                 output = output + line.substring(0, indent_len)
                 output = output + format_comment(trimmed)
-                output = output + "\n"
+                output = output + chr(10)
                 i = i + 1
                 continue
 
         # for code lines, normalize spacing
         output = output + format_code_line(line)
-        output = output + "\n"
+        output = output + chr(10)
         i = i + 1
 
     # ensure exactly one trailing newline
@@ -63,7 +63,7 @@ pub fn fmt_source(source: String) -> String:
     # ensure at least one trailing newline
     if output.len() > 0:
         if output[output.len() - 1] != chr(10):
-            output = output + "\n"
+            output = output + chr(10)
 
     return output
 
@@ -95,9 +95,10 @@ fn format_code_line(line: String) -> String:
 
     while i < line.len():
         ch := line[i]
+        quote := chr(34)
 
         # string handling — preserve contents exactly
-        if ch == "\"":
+        if ch == quote:
             if not in_string:
                 in_string = true
                 output = output + ch
@@ -124,7 +125,7 @@ fn format_code_line(line: String) -> String:
                     output = output + ch
                     i = i + 1
                     continue
-            if ch == "\"":
+            if ch == quote:
                 if brace_depth == 0:
                     in_string = false
                     output = output + ch

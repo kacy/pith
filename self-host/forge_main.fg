@@ -20,15 +20,15 @@
 #   forge version              print version
 #   forge help                 print usage
 
-from driver import get_directory, get_stem, init_driver, resolve_imports, mark_visited, find_imports
+from driver import get_directory, get_stem, init_driver, resolve_imports, mark_visited, find_imports, get_driver_parse_diagnostics, driver_has_parse_errors
 from lexer import lex_all, Token
-from parser import parse
+from parser import parse, parse_with_file, parser_diagnostics, parser_has_errors
 from ast import get_node, reset_arena
-from checker import initialize_checker, c_run, c_run_module, c_diagnostics_to_json, Diagnostic
+from checker import initialize_checker, c_run, c_run_module, c_diagnostics_to_json
 from printer import print_ast
 from formatter import fmt_source
 from linter import lint_module
-from errors import render_diagnostics, render_diagnostics_json, count_errors, has_errors
+from errors import Diagnostic, render_diagnostics, render_diagnostics_json, count_errors, has_errors
 from docgen import doc_extract, doc_format, doc_format_json, doc_check, doc_search
 
 # ---------------------------------------------------------------
@@ -60,6 +60,36 @@ fn cmd_test(path: String) -> String!:
         exit(status)
     return ""
 
+fn render_diagnostics_for_path(diags: List[Diagnostic], primary_path: String, primary_source: String) -> String!:
+    mut output := ""
+    mut current_file := primary_path
+    mut current_source := primary_source
+    mut group: List[Diagnostic] := []
+
+    for d in diags:
+        mut diag_file := d.file
+        if diag_file == "":
+            diag_file = primary_path
+        if group.len() == 0:
+            current_file = diag_file
+            if current_file == primary_path:
+                current_source = primary_source
+            else:
+                current_source = read_file(current_file)!
+        elif diag_file != current_file:
+            output = output + render_diagnostics(group, current_source)
+            group = []
+            current_file = diag_file
+            if current_file == primary_path:
+                current_source = primary_source
+            else:
+                current_source = read_file(current_file)!
+        group.push(d)
+
+    if group.len() > 0:
+        output = output + render_diagnostics(group, current_source)
+    return output
+
 # ---------------------------------------------------------------
 # check command
 # ---------------------------------------------------------------
@@ -68,11 +98,26 @@ fn cmd_check(path: String, json_mode: Bool) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
     reset_arena()
-    root := parse(tokens)
+    root := parse_with_file(tokens, path)
+
+    if parser_has_errors():
+        diags := parser_diagnostics()
+        if json_mode:
+            print(render_diagnostics_json(diags))
+        else:
+            print(render_diagnostics(diags, source))
+        exit(1)
 
     # resolve imports for multi-module type checking
     init_driver(path)
     import_roots := resolve_imports(root, path)!
+    if driver_has_parse_errors():
+        diags := get_driver_parse_diagnostics()
+        if json_mode:
+            print(render_diagnostics_json(diags))
+        else:
+            print(render_diagnostics_for_path(diags, path, source)!)
+        exit(1)
 
     initialize_checker(path)
     for imp_root in import_roots:
@@ -116,11 +161,26 @@ fn cmd_lint(path: String, json_mode: Bool) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
     reset_arena()
-    root := parse(tokens)
+    root := parse_with_file(tokens, path)
+
+    if parser_has_errors():
+        diags := parser_diagnostics()
+        if json_mode:
+            print(render_diagnostics_json(diags))
+        else:
+            print(render_diagnostics(diags, source))
+        exit(1)
 
     # resolve imports for type info (linter needs checker to run first)
     init_driver(path)
     import_roots := resolve_imports(root, path)!
+    if driver_has_parse_errors():
+        diags := get_driver_parse_diagnostics()
+        if json_mode:
+            print(render_diagnostics_json(diags))
+        else:
+            print(render_diagnostics_for_path(diags, path, source)!)
+        exit(1)
     initialize_checker(path)
     for imp_root in import_roots:
         c_run_module(imp_root)
@@ -171,6 +231,8 @@ fn cmd_doc_search(query: String) -> String!:
 # ---------------------------------------------------------------
 
 fn cmd_new(name: String) -> String!:
+    nl := chr(10)
+    tab := chr(9)
     if dir_exists(name):
         print("error: directory '" + name + "' already exists")
         exit(1)
@@ -178,90 +240,90 @@ fn cmd_new(name: String) -> String!:
     mkdir(name)
 
     # forge.toml
-    mut toml := "[package]\n"
-    toml = toml + "name = " + chr(34) + name + chr(34) + "\n"
-    toml = toml + "version = " + chr(34) + "0.1.0" + chr(34) + "\n"
-    toml = toml + "description = " + chr(34) + "a short description of " + name + chr(34) + "\n"
-    toml = toml + "license = " + chr(34) + "MIT" + chr(34) + "\n"
+    mut toml := "[package]" + nl
+    toml = toml + "name = " + chr(34) + name + chr(34) + nl
+    toml = toml + "version = " + chr(34) + "0.1.0" + chr(34) + nl
+    toml = toml + "description = " + chr(34) + "a short description of " + name + chr(34) + nl
+    toml = toml + "license = " + chr(34) + "MIT" + chr(34) + nl
     write_file(name + "/forge.toml", toml)!
 
     # AGENTS.md
-    mut agents := "# AGENTS.md\n"
-    agents = agents + "\n"
-    agents = agents + "## build & test loop\n"
-    agents = agents + "\n"
-    agents = agents + "run these as you work. fix issues before moving on.\n"
-    agents = agents + "\n"
-    agents = agents + "    forge check lib.fg        type check (run after every change)\n"
-    agents = agents + "    forge lint lib.fg         convention violations\n"
-    agents = agents + "    forge test lib.fg         run tests\n"
-    agents = agents + "    forge fmt lib.fg          format code\n"
-    agents = agents + "\n"
-    agents = agents + "## conventions\n"
-    agents = agents + "\n"
-    agents = agents + "`forge lint` catches all of these, but here's the gist:\n"
-    agents = agents + "\n"
-    agents = agents + "- functions that can fail return `T!`. use `?` to propagate errors.\n"
-    agents = agents + "- no panics. every failure is a Result.\n"
-    agents = agents + "- function names: snake_case (e.g., fetch_user, parse_command)\n"
-    agents = agents + "- types: PascalCase (e.g., HttpClient, ParseError)\n"
-    agents = agents + "- private by default. `pub` to export.\n"
-    agents = agents + "- one file = one module. directory = namespace.\n"
-    agents = agents + "\n"
-    agents = agents + "## finding things\n"
-    agents = agents + "\n"
-    agents = agents + "    forge doc search " + chr(34) + "query" + chr(34) + "         search the standard library\n"
-    agents = agents + "    forge inspect <package>          read a published package's source\n"
-    agents = agents + "    forge inspect <package> --api    see just the public API\n"
-    agents = agents + "\n"
-    agents = agents + "## publishing\n"
-    agents = agents + "\n"
-    agents = agents + "`forge publish` enforces: type check, lint, tests, docs, coverage.\n"
-    agents = agents + "fix what it flags.\n"
+    mut agents := "# AGENTS.md" + nl
+    agents = agents + nl
+    agents = agents + "## build & test loop" + nl
+    agents = agents + nl
+    agents = agents + "run these as you work. fix issues before moving on." + nl
+    agents = agents + nl
+    agents = agents + "    forge check lib.fg        type check (run after every change)" + nl
+    agents = agents + "    forge lint lib.fg         convention violations" + nl
+    agents = agents + "    forge test lib.fg         run tests" + nl
+    agents = agents + "    forge fmt lib.fg          format code" + nl
+    agents = agents + nl
+    agents = agents + "## conventions" + nl
+    agents = agents + nl
+    agents = agents + "`forge lint` catches all of these, but here's the gist:" + nl
+    agents = agents + nl
+    agents = agents + "- functions that can fail return `T!`. use `?` to propagate errors." + nl
+    agents = agents + "- no panics. every failure is a Result." + nl
+    agents = agents + "- function names: snake_case (e.g., fetch_user, parse_command)" + nl
+    agents = agents + "- types: PascalCase (e.g., HttpClient, ParseError)" + nl
+    agents = agents + "- private by default. `pub` to export." + nl
+    agents = agents + "- one file = one module. directory = namespace." + nl
+    agents = agents + nl
+    agents = agents + "## finding things" + nl
+    agents = agents + nl
+    agents = agents + "    forge doc search " + chr(34) + "query" + chr(34) + "         search the standard library" + nl
+    agents = agents + "    forge inspect <package>          read a published package's source" + nl
+    agents = agents + "    forge inspect <package> --api    see just the public API" + nl
+    agents = agents + nl
+    agents = agents + "## publishing" + nl
+    agents = agents + nl
+    agents = agents + "`forge publish` enforces: type check, lint, tests, docs, coverage." + nl
+    agents = agents + "fix what it flags." + nl
     write_file(name + "/AGENTS.md", agents)!
 
     # .gitignore
-    mut gi := ".forge-build/\n"
-    gi = gi + "zig-out/\n"
-    gi = gi + ".zig-cache/\n"
+    mut gi := ".forge-build/" + nl
+    gi = gi + "zig-out/" + nl
+    gi = gi + ".zig-cache/" + nl
     write_file(name + "/.gitignore", gi)!
 
     # Makefile
-    mut mk := ".PHONY: build test check fmt lint\n"
-    mk = mk + "\n"
-    mk = mk + "build:\n"
-    mk = mk + "\tforge build lib.fg\n"
-    mk = mk + "\n"
-    mk = mk + "test:\n"
-    mk = mk + "\tforge test lib.fg\n"
-    mk = mk + "\n"
-    mk = mk + "check:\n"
-    mk = mk + "\tforge check lib.fg\n"
-    mk = mk + "\n"
-    mk = mk + "fmt:\n"
-    mk = mk + "\tforge fmt lib.fg\n"
-    mk = mk + "\n"
-    mk = mk + "lint:\n"
-    mk = mk + "\tforge lint lib.fg\n"
+    mut mk := ".PHONY: build test check fmt lint" + nl
+    mk = mk + nl
+    mk = mk + "build:" + nl
+    mk = mk + tab + "forge build lib.fg" + nl
+    mk = mk + nl
+    mk = mk + "test:" + nl
+    mk = mk + tab + "forge test lib.fg" + nl
+    mk = mk + nl
+    mk = mk + "check:" + nl
+    mk = mk + tab + "forge check lib.fg" + nl
+    mk = mk + nl
+    mk = mk + "fmt:" + nl
+    mk = mk + tab + "forge fmt lib.fg" + nl
+    mk = mk + nl
+    mk = mk + "lint:" + nl
+    mk = mk + tab + "forge lint lib.fg" + nl
     write_file(name + "/Makefile", mk)!
 
     # Dockerfile
-    mut df := "FROM ubuntu:latest\n"
-    df = df + "COPY . /app\n"
-    df = df + "WORKDIR /app\n"
+    mut df := "FROM ubuntu:latest" + nl
+    df = df + "COPY . /app" + nl
+    df = df + "WORKDIR /app" + nl
     write_file(name + "/Dockerfile", df)!
 
     # README.md
-    mut readme := "# " + name + "\n"
-    readme = readme + "\n"
-    readme = readme + "a short description of " + name + ".\n"
+    mut readme := "# " + name + nl
+    readme = readme + nl
+    readme = readme + "a short description of " + name + "." + nl
     write_file(name + "/README.md", readme)!
 
     # lib.fg
-    mut lib := "# " + name + "\n"
-    lib = lib + "\n"
-    lib = lib + "pub fn hello() -> String:\n"
-    lib = lib + "    return " + chr(34) + "hello from " + name + chr(34) + "\n"
+    mut lib := "# " + name + nl
+    lib = lib + nl
+    lib = lib + "pub fn hello() -> String:" + nl
+    lib = lib + "    return " + chr(34) + "hello from " + name + chr(34) + nl
     write_file(name + "/lib.fg", lib)!
 
     print("created " + name + "/")
@@ -286,7 +348,10 @@ fn cmd_parse(path: String) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
     reset_arena()
-    root := parse(tokens)
+    root := parse_with_file(tokens, path)
+    if parser_has_errors():
+        print(render_diagnostics(parser_diagnostics(), source))
+        exit(1)
     print_ast(root)
     return ""
 

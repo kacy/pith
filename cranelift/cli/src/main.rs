@@ -141,8 +141,13 @@ fn get_ast_from_compiler(path: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to run compiler: {}", e))?;
 
     if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Parse error: {}", stderr));
+        let combined = format!("{}{}", stdout, stderr);
+        if combined.trim().is_empty() {
+            return Err("Parse error".to_string());
+        }
+        return Err(combined);
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -596,7 +601,10 @@ fn check_file(path: &str) {
 fn parse_file(path: &str) {
     match get_ast_from_compiler(path) {
         Ok(ast) => println!("{}", ast),
-        Err(e) => eprintln!("{}", e),
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
     }
 }
 

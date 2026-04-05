@@ -83,13 +83,10 @@ fn report_warning(code: String, message: String):
 pub mut current_scope := -1
 pub mut method_type_map: Map[String, Int] := {}
 pub mut method_visibility_map: Map[String, Bool] := {}
-mut method_keys: List[String] := []
-mut method_decl_indices: List[Int] := []
-mut method_visibilities: List[Bool] := []
+mut method_decl_index_map: Map[String, Int] := {}
 # legacy map kept for probes; generic declaration lookup uses flat lists
 pub mut generic_declaration_map: Map[String, Int] := {}
 mut generic_declaration_names: List[String] := []
-mut generic_declaration_indices: List[Int] := []
 mut interface_declaration_names: List[String] := []
 # impl set: "Type\tInterface" -> 1
 mut implementation_set: Map[String, Int] := {}
@@ -107,12 +104,9 @@ pub fn initialize_checker(file_path: String):
     current_file_path = file_path
     method_type_map = {}
     method_visibility_map = {}
-    method_keys = []
-    method_decl_indices = []
-    method_visibilities = []
+    method_decl_index_map = {}
     generic_declaration_map = {}
     generic_declaration_names = []
-    generic_declaration_indices = []
     interface_declaration_names = []
     implementation_set = {}
     expression_type_cache = {}
@@ -966,15 +960,9 @@ fn collect_generic_parameter_names(node: Node) -> List[String]:
     return params
 
 fn register_generic_declaration(name: String, node_idx: Int):
+    if generic_declaration_map.contains_key(name) == false:
+        generic_declaration_names.push(name)
     generic_declaration_map.insert(name, node_idx)
-    mut i := 0
-    while i < generic_declaration_names.len():
-        if strings_equal(generic_declaration_names[i], name):
-            generic_declaration_indices[i] = node_idx
-            return
-        i = i + 1
-    generic_declaration_names.push(name)
-    generic_declaration_indices.push(node_idx)
 
 fn has_generic_declaration(name: String) -> Bool:
     for generic_name in generic_declaration_names:
@@ -983,12 +971,9 @@ fn has_generic_declaration(name: String) -> Bool:
     return false
 
 fn get_generic_declaration_index(name: String) -> Int:
-    mut i := 0
-    while i < generic_declaration_names.len():
-        if strings_equal(generic_declaration_names[i], name):
-            return generic_declaration_indices[i]
-        i = i + 1
-    return -1
+    if generic_declaration_map.contains_key(name):
+        return generic_declaration_map[name]
+    return - 1
 
 fn register_interface_declaration_name(name: String):
     for iface_name in interface_declaration_names:
@@ -997,30 +982,16 @@ fn register_interface_declaration_name(name: String):
     interface_declaration_names.push(name)
 
 fn register_method_signature(key: String, node_idx: Int, is_pub: Bool):
-    mut i := 0
-    while i < method_keys.len():
-        if strings_equal(method_keys[i], key):
-            method_decl_indices[i] = node_idx
-            method_visibilities[i] = is_pub
-            return
-        i = i + 1
-    method_keys.push(key)
-    method_decl_indices.push(node_idx)
-    method_visibilities.push(is_pub)
+    method_decl_index_map.insert(key, node_idx)
+    method_visibility_map.insert(key, is_pub)
 
 fn has_method_declaration(key: String) -> Bool:
-    for method_key in method_keys:
-        if strings_equal(method_key, key):
-            return true
-    return false
+    return method_decl_index_map.contains_key(key)
 
 fn get_method_declaration_index(key: String) -> Int:
-    mut i := 0
-    while i < method_keys.len():
-        if strings_equal(method_keys[i], key):
-            return method_decl_indices[i]
-        i = i + 1
-    return -1
+    if method_decl_index_map.contains_key(key):
+        return method_decl_index_map[key]
+    return - 1
 
 fn collect_function_param_types(node: Node) -> List[Int]:
     mut params: List[Int] := []
@@ -2148,7 +2119,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     receiver_type := c_check_expr(node.children[0], scope_id)
     if is_error_type(receiver_type):
         return TID_ERR
-    recv_info := get_type_info(receiver_type)
+    mut recv_info := get_type_info(receiver_type)
     mut dispatch_type := receiver_type
     if recv_info.kind == "optional":
         dispatch_type = recv_info.inner
@@ -2673,13 +2644,13 @@ fn check_index_expression(node: Node, scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
     if node.children.len() < 2:
         return TID_ERR
-    obj_type := c_check_expr(node.children[0], scope_id)
+    mut obj_type := c_check_expr(node.children[0], scope_id)
     idx_type := c_check_expr(node.children[1], scope_id)
     if is_error_type(obj_type):
         return TID_ERR
     if is_error_type(idx_type):
         return TID_ERR
-    obj_info := get_type_info(obj_type)
+    mut obj_info := get_type_info(obj_type)
     if obj_info.kind == "optional":
         obj_type = obj_info.inner
         obj_info = get_type_info(obj_type)

@@ -193,10 +193,6 @@ pub fn compile_from_ir(
         }
     }
 
-    let struct_returning_funcs = collect_struct_returning_funcs(&lines);
-    let string_returning_funcs =
-        collect_string_returning_funcs(&lines, &string_global_names, &struct_returning_funcs);
-
     // Declare string data functions
     let mut string_funcs: HashMap<String, FuncId> = HashMap::new();
     for (idx, content) in &string_data {
@@ -258,8 +254,6 @@ pub fn compile_from_ir(
                 &global_data,
                 &str_globals,
                 &string_global_names,
-                &struct_returning_funcs,
-                &string_returning_funcs,
             )?;
         }
     }
@@ -280,8 +274,6 @@ fn compile_ir_function(
     global_data: &HashMap<String, cranelift_module::DataId>,
     str_globals: &[(String, String)],
     string_global_names: &std::collections::HashSet<String>,
-    struct_returning_funcs: &HashMap<String, String>,
-    string_returning_funcs: &std::collections::HashSet<String>,
 ) -> Result<(), CompileError> {
     let mut ctx = codegen.module.make_context();
 
@@ -863,7 +855,6 @@ fn compile_ir_function(
                 let reg: usize = parts[1].parse().unwrap_or(0);
                 let (mut fname, retkind, nargs, arg_start) =
                     parse_call_shape(&parts).unwrap_or((parts[2], "unknown", 0, 4));
-                let arg_regs = parse_call_arg_regs(&parts, nargs);
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
 
@@ -927,8 +918,8 @@ fn compile_ir_function(
                         }
                     }
                     // Note: `len` maps to forge_auto_len which handles both
-                    // strings and lists at runtime via magic number check
-                    // Look up function: user-defined first, then runtime with name resolution
+                    // strings and lists at runtime via magic number check.
+                    // Look up function: user-defined first, then runtime with name resolution.
                     let resolved_name = resolve_func_name(fname);
                     let fid = declared_funcs
                         .get(fname)
@@ -982,17 +973,7 @@ fn compile_ir_function(
                         } else {
                             regs.insert(reg, builder.ins().iconst(types::I64, 0));
                         }
-                        if retkind == "string"
-                            || (retkind == "unknown"
-                                && call_returns_string(
-                                    fname,
-                                    &arg_regs,
-                                    &string_regs,
-                                    &reg_source_vars,
-                                    string_global_names,
-                                    string_returning_funcs,
-                                ))
-                        {
+                        if retkind == "string" {
                             string_regs.insert(reg);
                         } else {
                             string_regs.remove(&reg);
@@ -1004,8 +985,6 @@ fn compile_ir_function(
                         }
                         if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
                             struct_regs.insert(reg, struct_name.to_string());
-                        } else if let Some(struct_name) = struct_returning_funcs.get(fname) {
-                            struct_regs.insert(reg, struct_name.clone());
                         } else {
                             struct_regs.remove(&reg);
                         }
@@ -1275,57 +1254,6 @@ fn compile_ir_function(
     Ok(())
 }
 
-fn is_known_string_returning_fn(name: &str) -> bool {
-    matches!(
-        name,
-        "char_at"
-            | "substring"
-            | "to_upper"
-            | "to_lower"
-            | "trim"
-            | "replace"
-            | "repeat"
-            | "pad_left"
-            | "pad_right"
-            | "reverse"
-            | "chr"
-            | "smart_to_string"
-            | "to_string"
-            | "int_to_string"
-            | "float_to_string"
-            | "bool_to_string"
-            | "map_get"
-            | "string_replace"
-            | "string_repeat"
-            | "string_trim"
-            | "string_to_upper"
-            | "string_to_lower"
-            | "node_kind"
-            | "node_value"
-            | "tok_kind"
-            | "tok_value"
-            | "identity"
-            | "read_file"
-            | "env"
-            | "path_join"
-            | "path_dir"
-            | "path_base"
-            | "path_ext"
-            | "path_stem"
-            | "join"
-    )
-}
-
-fn name_suggests_string_list(name: &str) -> bool {
-    let lowered = name.to_ascii_lowercase();
-    lowered.contains("string")
-        || lowered.contains("kind")
-        || lowered.contains("value")
-        || lowered.contains("_line")
-        || lowered.contains("_tok_")
-        || lowered.contains("_key")
-}
-
 fn parse_call_shape<'a>(parts: &'a [&'a str]) -> Option<(&'a str, &'a str, usize, usize)> {
     if parts.len() < 4 {
         return None;
@@ -1365,45 +1293,6 @@ fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
     None
 }
 
-fn parse_call_arg_regs(parts: &[&str], nargs: usize) -> Vec<usize> {
-    let arg_start = parse_call_shape(parts).map(|(_, _, _, start)| start).unwrap_or(4);
-    let mut arg_regs = Vec::with_capacity(nargs);
-    for i in 0..nargs {
-        if let Some(arg) = parts.get(arg_start + i) {
-            arg_regs.push(arg.parse::<usize>().unwrap_or(usize::MAX));
-        }
-    }
-    arg_regs
-}
-
-fn call_returns_string(
-    fname: &str,
-    arg_regs: &[usize],
-    string_regs: &HashSet<usize>,
-    reg_source_vars: &HashMap<usize, String>,
-    string_global_names: &HashSet<String>,
-    string_returning_funcs: &HashSet<String>,
-) -> bool {
-    if is_known_string_returning_fn(fname) || string_returning_funcs.contains(fname) {
-        return true;
-    }
-
-    if matches!(fname, "__list_get" | "__index") {
-        if let Some(&list_reg) = arg_regs.first() {
-            if string_regs.contains(&list_reg) {
-                return true;
-            }
-            if let Some(var_name) = reg_source_vars.get(&list_reg) {
-                if string_global_names.contains(var_name) || name_suggests_string_list(var_name) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
 fn field_offset_for_name(
     struct_layouts: &HashMap<String, Vec<String>>,
     struct_name: Option<&str>,
@@ -1440,291 +1329,6 @@ fn split_typed_field_name(field_name: &str) -> (Option<&str>, &str) {
     (None, field_name)
 }
 
-fn collect_struct_returning_funcs(lines: &[&str]) -> HashMap<String, String> {
-    let mut struct_names: HashSet<String> = HashSet::new();
-    for line in lines {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 && parts[0] == "struct" {
-            struct_names.insert(parts[1].to_string());
-        }
-    }
-
-    let mut struct_returning_funcs: HashMap<String, String> = HashMap::new();
-
-    loop {
-        let prev_count = struct_returning_funcs.len();
-        let mut cur_func = String::new();
-        let mut struct_regs: HashMap<usize, String> = HashMap::new();
-        let mut struct_vars: HashMap<String, String> = HashMap::new();
-
-        for line in lines {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
-
-            match parts[0] {
-                "func" if parts.len() >= 2 => {
-                    cur_func = parts[1].to_string();
-                    struct_regs.clear();
-                    struct_vars.clear();
-                    if parts.len() >= 4 {
-                        if let Some(struct_name) = explicit_struct_name_from_retkind(parts[3]) {
-                            struct_returning_funcs
-                                .insert(cur_func.clone(), struct_name.to_string());
-                        }
-                    }
-                }
-                "call" if parts.len() >= 4 => {
-                    if let Ok(reg) = parts[1].parse::<usize>() {
-                        let (fname, retkind, _, _) =
-                            parse_call_shape(&parts).unwrap_or((parts[2], "unknown", 0, 4));
-                        if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
-                            struct_regs.insert(reg, struct_name.to_string());
-                        } else if let Some(struct_name) = struct_returning_funcs.get(fname) {
-                            struct_regs.insert(reg, struct_name.clone());
-                        } else if struct_names.contains(fname) {
-                            struct_regs.insert(reg, fname.to_string());
-                        } else {
-                            struct_regs.remove(&reg);
-                        }
-                    }
-                }
-                "load" if parts.len() >= 3 => {
-                    if let Ok(reg) = parts[1].parse::<usize>() {
-                        if let Some(struct_name) = struct_vars.get(parts[2]) {
-                            struct_regs.insert(reg, struct_name.clone());
-                        } else {
-                            struct_regs.remove(&reg);
-                        }
-                    }
-                }
-                "store" if parts.len() >= 3 => {
-                    if let Ok(src_reg) = parts[2].parse::<usize>() {
-                        let name = parts[1].to_string();
-                        if let Some(struct_name) = struct_regs.get(&src_reg) {
-                            struct_vars.insert(name, struct_name.clone());
-                        } else {
-                            struct_vars.remove(&name);
-                        }
-                    }
-                }
-                "field" | "iconst" | "fconst" | "strref" | "concat" | "band" | "bor" | "bxor"
-                | "shl" | "shr" | "bnot" | "and" | "or" | "fadd" | "fsub" | "fmul" | "fdiv"
-                | "add" | "sub" | "mul" | "div" | "mod" | "eq" | "neq" | "lt" | "gt" | "lte"
-                | "gte" | "funcref" => {
-                    if parts.len() >= 2 {
-                        if let Ok(reg) = parts[1].parse::<usize>() {
-                            struct_regs.remove(&reg);
-                        }
-                    }
-                }
-                "ret" if parts.len() >= 2 => {
-                    if let Ok(reg) = parts[1].parse::<usize>() {
-                        if let Some(struct_name) = struct_regs.get(&reg) {
-                            if !cur_func.is_empty() {
-                                struct_returning_funcs
-                                    .insert(cur_func.clone(), struct_name.clone());
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if struct_returning_funcs.len() == prev_count {
-            break;
-        }
-    }
-
-    struct_returning_funcs
-}
-
-fn collect_string_returning_funcs(
-    lines: &[&str],
-    string_global_names: &HashSet<String>,
-    struct_returning_funcs: &HashMap<String, String>,
-) -> HashSet<String> {
-    let mut string_returning_funcs: HashSet<String> = HashSet::new();
-
-    loop {
-        let prev_count = string_returning_funcs.len();
-        let mut cur_func = String::new();
-        let mut str_regs: HashSet<usize> = HashSet::new();
-        let mut str_vars: HashSet<String> = HashSet::new();
-        let mut reg_source_vars: HashMap<usize, String> = HashMap::new();
-        let mut struct_regs: HashMap<usize, String> = HashMap::new();
-        let mut struct_vars: HashMap<String, String> = HashMap::new();
-
-        for line in lines {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
-
-            match parts[0] {
-                "func" if parts.len() >= 2 => {
-                    cur_func = parts[1].to_string();
-                    str_regs.clear();
-                    str_vars.clear();
-                    reg_source_vars.clear();
-                    struct_regs.clear();
-                    struct_vars.clear();
-                    if parts.len() >= 4 && parts[3] == "string" {
-                        string_returning_funcs.insert(cur_func.clone());
-                    }
-                }
-                "call" if parts.len() >= 4 => {
-                    if let Ok(reg) = parts[1].parse::<usize>() {
-                        let (fname, retkind, nargs, _) =
-                            parse_call_shape(&parts).unwrap_or((parts[2], "unknown", 0, 4));
-                        let arg_regs = parse_call_arg_regs(&parts, nargs);
-                        let returns_string = if retkind == "string" {
-                            true
-                        } else {
-                            call_returns_string(
-                                fname,
-                                &arg_regs,
-                                &str_regs,
-                                &reg_source_vars,
-                                string_global_names,
-                                &string_returning_funcs,
-                            )
-                        };
-                        reg_source_vars.remove(&reg);
-                        if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
-                            struct_regs.insert(reg, struct_name.to_string());
-                        } else if let Some(struct_name) = struct_returning_funcs.get(fname) {
-                            struct_regs.insert(reg, struct_name.clone());
-                        } else {
-                            struct_regs.remove(&reg);
-                        }
-                        if returns_string {
-                            str_regs.insert(reg);
-                        } else {
-                            str_regs.remove(&reg);
-                        }
-                    }
-                }
-                "strref" if parts.len() >= 2 => {
-                    if let Ok(reg) = parts[1].parse::<usize>() {
-                        reg_source_vars.remove(&reg);
-                        struct_regs.remove(&reg);
-                        str_regs.insert(reg);
-                    }
-                }
-                "concat" if parts.len() >= 2 => {
-                    if let Ok(reg) = parts[1].parse::<usize>() {
-                        reg_source_vars.remove(&reg);
-                        struct_regs.remove(&reg);
-                        str_regs.insert(reg);
-                    }
-                }
-                "add" if parts.len() >= 4 => {
-                    if let Ok(reg) = parts[1].parse::<usize>() {
-                        let left = parts[2].parse::<usize>().unwrap_or(usize::MAX);
-                        let right = parts[3].parse::<usize>().unwrap_or(usize::MAX);
-                        let returns_string = str_regs.contains(&left) && str_regs.contains(&right);
-                        reg_source_vars.remove(&reg);
-                        struct_regs.remove(&reg);
-                        if returns_string {
-                            str_regs.insert(reg);
-                        } else {
-                            str_regs.remove(&reg);
-                        }
-                    }
-                }
-                "load" if parts.len() >= 3 => {
-                    if let Ok(reg) = parts[1].parse::<usize>() {
-                        let name = parts[2].to_string();
-                        reg_source_vars.insert(reg, name.clone());
-                        if let Some(struct_name) = struct_vars.get(&name) {
-                            struct_regs.insert(reg, struct_name.clone());
-                        } else {
-                            struct_regs.remove(&reg);
-                        }
-                        if str_vars.contains(&name) || string_global_names.contains(&name) {
-                            str_regs.insert(reg);
-                        } else {
-                            str_regs.remove(&reg);
-                        }
-                    }
-                }
-                "store" if parts.len() >= 3 => {
-                    if let Ok(src_reg) = parts[2].parse::<usize>() {
-                        let name = parts[1].to_string();
-                        if let Some(struct_name) = struct_regs.get(&src_reg) {
-                            struct_vars.insert(name.clone(), struct_name.clone());
-                        } else {
-                            struct_vars.remove(&name);
-                        }
-                        if str_regs.contains(&src_reg) {
-                            str_vars.insert(name);
-                        } else {
-                            str_vars.remove(&name);
-                        }
-                    }
-                }
-                "field" if parts.len() >= 4 => {
-                    if let Ok(reg) = parts[1].parse::<usize>() {
-                        let obj_reg = parts[2].parse::<usize>().unwrap_or(usize::MAX);
-                        let obj_struct_name = struct_regs.get(&obj_reg).cloned();
-                        let (explicit_struct_name, field_retkind, _bare_field_name) =
-                            if parts.len() >= 6 && parts[3].parse::<i32>().is_ok() {
-                                (None, Some(parts[4]), parts[5])
-                            } else if parts.len() >= 5 {
-                                (Some(parts[3]), None, parts[4])
-                            } else {
-                                let (name, bare) = split_typed_field_name(parts[3]);
-                                (name, None, bare)
-                            };
-                        let field_is_string = if let Some(retkind) = field_retkind {
-                            retkind == "string"
-                        } else {
-                            false
-                        };
-                        reg_source_vars.remove(&reg);
-                        struct_regs.remove(&reg);
-                        let field_struct_name = explicit_struct_name.or(obj_struct_name.as_deref());
-                        if field_is_string {
-                            str_regs.insert(reg);
-                        } else if field_struct_name.is_some() {
-                            str_regs.remove(&reg);
-                        } else {
-                            str_regs.remove(&reg);
-                        }
-                    }
-                }
-                "iconst" | "fconst" | "band" | "bor" | "bxor" | "shl" | "shr" | "bnot" | "and"
-                | "or" | "fadd" | "fsub" | "fmul" | "fdiv" | "sub" | "mul" | "div" | "mod"
-                | "eq" | "neq" | "lt" | "gt" | "lte" | "gte" => {
-                    if parts.len() >= 2 {
-                        if let Ok(reg) = parts[1].parse::<usize>() {
-                            reg_source_vars.remove(&reg);
-                            struct_regs.remove(&reg);
-                            str_regs.remove(&reg);
-                        }
-                    }
-                }
-                "ret" if parts.len() >= 2 => {
-                    if let Ok(reg) = parts[1].parse::<usize>() {
-                        if str_regs.contains(&reg) && !cur_func.is_empty() {
-                            string_returning_funcs.insert(cur_func.clone());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if string_returning_funcs.len() == prev_count {
-            break;
-        }
-    }
-
-    string_returning_funcs
-}
 
 /// Map IR function names to runtime_funcs keys.
 /// Returns the key that exists in the runtime_funcs HashMap.
@@ -1957,75 +1561,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn collect_string_returning_funcs_clears_stale_call_regs() {
-        let lines = vec![
-            "func ir_stmt 0 i64",
-            "call 5 node_kind 1 0",
-            "call 5 node_child_count 1 0",
-            "ret 5",
-            "endfunc",
-        ];
-
-        let struct_funcs = collect_struct_returning_funcs(&lines);
-        let string_funcs = collect_string_returning_funcs(&lines, &HashSet::new(), &struct_funcs);
-        assert!(!string_funcs.contains("ir_stmt"));
-    }
-
-    #[test]
-    fn collect_string_returning_funcs_detects_add_and_string_list_get() {
-        let lines = vec![
-            "func make_name 0 i64",
-            "strref 1 s0",
-            "strref 2 s1",
-            "add 3 1 2",
-            "ret 3",
-            "endfunc",
-            "func token_kind_at 0 i64",
-            "load 1 token_kinds",
-            "iconst 2 0",
-            "call 3 __list_get 2 1 2",
-            "ret 3",
-            "endfunc",
-        ];
-
-        let string_globals = HashSet::from([String::from("token_kinds")]);
-        let struct_funcs = collect_struct_returning_funcs(&lines);
-        let string_funcs = collect_string_returning_funcs(&lines, &string_globals, &struct_funcs);
-        assert!(string_funcs.contains("make_name"));
-        assert!(string_funcs.contains("token_kind_at"));
-    }
-
-    #[test]
-    fn collect_string_returning_funcs_tracks_string_fields_through_calls() {
-        let lines = vec![
-            "func parse_dotted_path 0 i64",
-            "call 1 expect Token 0",
-            "store next 1",
-            "strref 2 s0",
-            "store path 2",
-            "load 3 path",
-            "strref 4 s1",
-            "concat 5 3 4",
-            "load 6 next",
-            "field 7 6 8 string value",
-            "add 8 5 7",
-            "ret 8",
-            "endfunc",
-            "func parse_import_decl 0 i64",
-            "call 1 parse_dotted_path string 0",
-            "strref 2 s2",
-            "add 3 1 2",
-            "ret 3",
-            "endfunc",
-        ];
-
-        let struct_funcs = collect_struct_returning_funcs(&lines);
-        let string_funcs = collect_string_returning_funcs(&lines, &HashSet::new(), &struct_funcs);
-        assert!(string_funcs.contains("parse_dotted_path"));
-        assert!(string_funcs.contains("parse_import_decl"));
-    }
-
-    #[test]
     fn parse_call_shape_distinguishes_old_and_new_formats() {
         let old = vec!["call", "7", "print", "1", "3"];
         let new = vec!["call", "8", "char_at", "string", "2", "1", "2"];
@@ -2040,16 +1575,10 @@ mod tests {
     }
 
     #[test]
-    fn collect_string_returning_funcs_uses_explicit_call_retkind() {
-        let lines = vec![
-            "func token_value 0 string",
-            "call 1 char_at string 2 2 3",
-            "ret 1",
-            "endfunc",
-        ];
-
-        let struct_funcs = collect_struct_returning_funcs(&lines);
-        let string_funcs = collect_string_returning_funcs(&lines, &HashSet::new(), &struct_funcs);
-        assert!(string_funcs.contains("token_value"));
+    fn explicit_struct_name_from_retkind_supports_struct_prefix_and_bare_names() {
+        assert_eq!(explicit_struct_name_from_retkind("struct:Token"), Some("Token"));
+        assert_eq!(explicit_struct_name_from_retkind("Token"), Some("Token"));
+        assert_eq!(explicit_struct_name_from_retkind("string"), None);
+        assert_eq!(explicit_struct_name_from_retkind("unknown"), None);
     }
 }

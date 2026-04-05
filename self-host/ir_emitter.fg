@@ -31,7 +31,7 @@
 #   store VARNAME REG                   — store variable
 #   concat REG A B                      — string concatenation
 
-from ast import get_node, node_kind, node_value, Node
+from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
 
 # --- type knowledge constants (single source of truth) ---
 FLOAT_RETURNING_FUNCS := "pow,sqrt,floor,ceil,round,to_float,get_float,toml_get_float"
@@ -173,9 +173,9 @@ fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
     while stack.len() > 0:
         current := stack[stack.len() - 1]
         stack.remove(stack.len() - 1)
-        node := get_node(current)
-        if node.kind == "ident":
-            name := node.value
+        kind := node_kind(current)
+        if kind == "ident":
+            name := node_value(current)
             mut is_bound := false
             mut i := 0
             while i < bound.len():
@@ -190,10 +190,10 @@ fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
                 i = i + 1
             if not is_bound and not already_free:
                 free.push(name)
-        kids := node.children
         mut i := 0
-        while i < kids.len():
-            stack.push(kids[i])
+        child_count := node_child_count(current)
+        while i < child_count:
+            stack.push(node_child(current, i))
             i = i + 1
     return free
 fn ir_str(s: String) -> String:
@@ -273,6 +273,34 @@ fn ir_emit_call2(result_reg: Int, fname: String, ret_type: String, arg0: Int, ar
 fn ir_emit_call3(result_reg: Int, fname: String, ret_type: String, arg0: Int, arg1: Int, arg2: Int):
     ir_emit_call_text(result_reg, fname, ret_type, 3, " " + arg0.to_string() + " " + arg1.to_string() + " " + arg2.to_string())
 
+fn ir_copy_lines(lines: List[String]) -> List[String]:
+    mut copy: List[String] := []
+    mut i := 0
+    while i < lines.len():
+        copy.push(lines[i])
+        i = i + 1
+    return copy
+
+fn ir_copy_var_regs(src: Map[String, Int]) -> Map[String, Int]:
+    mut copy: Map[String, Int] := {}
+    keys := src.keys()
+    mut i := 0
+    while i < keys.len():
+        key := keys[i]
+        copy.insert(key, src[key])
+        i = i + 1
+    return copy
+
+fn ir_copy_var_types(src: Map[String, String]) -> Map[String, String]:
+    mut copy: Map[String, String] := {}
+    keys := src.keys()
+    mut i := 0
+    while i < keys.len():
+        key := keys[i]
+        copy.insert(key, src[key])
+        i = i + 1
+    return copy
+
 fn ir_unpack_field_index(meta: String) -> Int:
     mut value := 0
     mut i := 0
@@ -291,6 +319,24 @@ fn ir_register_struct_layout(name: String, field_names: List[String], field_type
         i = i + 1
     ir_struct_names.insert(name, field_names.len())
     ir_emit("struct " + name + " " + field_names.join(" "))
+
+fn ir_seed_global_types():
+    for name in ir_global_int_names:
+        ir_var_types.insert(name, "int")
+    for name in ir_global_string_names:
+        ir_var_types.insert(name, "string")
+    for name in ir_global_list_string_names:
+        ir_var_types.insert(name, "list_string")
+    for name in ir_global_list_names:
+        ir_var_types.insert(name, "list")
+    for name in ir_global_map_int_names:
+        ir_var_types.insert(name, "map_int")
+    for name in ir_global_map_names:
+        ir_var_types.insert(name, "map")
+    for name in ir_global_set_names:
+        ir_var_types.insert(name, "set")
+    for name in ir_global_bool_names:
+        ir_var_types.insert(name, "bool")
 
 fn ir_register_known_import_structs():
     ir_register_struct_layout("Node", ["kind", "value", "children", "line", "col"], ["string", "string", "list", "int", "int"])
@@ -523,7 +569,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
                 recv_name := recv_node.value
                 if recv_name == "source" or recv_name == "KEYWORDS" or recv_name == "LBRACE" or recv_name == "RBRACE" or recv_name.ends_with("_kind") or recv_name.ends_with("_value") or recv_name.ends_with("_text"):
                     emit_name = "string_len"
-                elif recv_name == "tokens" or recv_name == "sub_tokens" or recv_name == "items" or recv_name.ends_with("_tokens") or recv_name.ends_with("_stack") or recv_name.starts_with("pending_") or recv_name.starts_with("_tok_") or recv_name.starts_with("_kids") or recv_name == "args" or recv_name == "params" or recv_name == "param_nodes" or recv_name == "types" or recv_name == "parts" or recv_name == "fields" or recv_name == "patterns" or recv_name == "entries" or recv_name == "elements" or recv_name == "children" or recv_name == "kids" or recv_name == "stmts" or recv_name == "imports" or recv_name == "decls" or recv_name == "generics" or recv_name == "bounds" or recv_name == "names" or recv_name.ends_with("_types") or recv_name.ends_with("_fields") or recv_name.ends_with("_entries") or recv_name.ends_with("_elements") or recv_name.ends_with("_patterns") or recv_name.ends_with("_children") or recv_name.ends_with("_params") or recv_name.ends_with("_bounds") or recv_name.ends_with("_names") or recv_name.ends_with("_variants"):
+                elif recv_name == "tokens" or recv_name == "sub_tokens" or recv_name == "items" or recv_name == "nodes" or recv_name == "scopes" or recv_name.ends_with("_tokens") or recv_name.ends_with("_stack") or recv_name.starts_with("pending_") or recv_name.starts_with("_tok_") or recv_name.starts_with("_kids") or recv_name == "args" or recv_name == "params" or recv_name == "param_nodes" or recv_name == "types" or recv_name == "parts" or recv_name == "fields" or recv_name == "patterns" or recv_name == "entries" or recv_name == "elements" or recv_name == "children" or recv_name == "kids" or recv_name == "stmts" or recv_name == "imports" or recv_name == "decls" or recv_name == "generics" or recv_name == "bounds" or recv_name == "names" or recv_name.ends_with("_types") or recv_name.ends_with("_fields") or recv_name.ends_with("_entries") or recv_name.ends_with("_elements") or recv_name.ends_with("_patterns") or recv_name.ends_with("_children") or recv_name.ends_with("_params") or recv_name.ends_with("_bounds") or recv_name.ends_with("_names") or recv_name.ends_with("_variants"):
                     emit_name = "forge_list_len"
                 else:
                     emit_name = "string_len"
@@ -678,7 +724,6 @@ fn ir_emit_string_interp(idx: Int) -> Int:
 
 # --- lambda compilation (extracted from ir_expr) ---
 fn ir_emit_lambda(idx: Int) -> Int:
-    node := get_node(idx)
     # compile lambda body as a separate function
     lambda_name := "__lambda_" + ir_lambda_count.to_string()
     ir_lambda_count = ir_lambda_count + 1
@@ -686,9 +731,8 @@ fn ir_emit_lambda(idx: Int) -> Int:
     mut lparams: List[String] := []
     mut lbody_idx := 0 - 1
     mut _fi5 := 0
-    kids5_children := node.children
-    while _fi5 < kids5_children.len():
-        child := kids5_children[_fi5]
+    while _fi5 < node_child_count(idx):
+        child := node_child(idx, _fi5)
         mut cn := get_node(child)
         if cn.kind == "param":
             lparams.push(cn.value)
@@ -711,9 +755,9 @@ fn ir_emit_lambda(idx: Int) -> Int:
 
     # save current state and emit lambda to deferred buffer
     saved_regs := ir_next_reg
-    saved_vars := ir_var_regs
-    saved_types := ir_var_types
-    saved_lines := ir_lines
+    saved_vars := ir_copy_var_regs(ir_var_regs)
+    saved_types := ir_copy_var_types(ir_var_types)
+    saved_lines := ir_copy_lines(ir_lines)
     ir_next_reg = 0
     ir_var_regs = {}
     ir_var_types = {}
@@ -736,9 +780,8 @@ fn ir_emit_lambda(idx: Int) -> Int:
         ir_emit("store " + captures[ce] + " " + cap_r.to_string())
         ce = ce + 1
     if lbody_idx >= 0:
-        body_node := get_node(lbody_idx)
-        if body_node.kind == "body" and body_node.children.len() > 0:
-            br := ir_expr(body_node.children[0])
+        if node_kind(lbody_idx) == "body" and node_child_count(lbody_idx) > 0:
+            br := ir_expr(node_child(lbody_idx, 0))
             ir_emit("ret " + br.to_string())
         else:
             br := ir_expr(lbody_idx)
@@ -1464,13 +1507,12 @@ fn ir_stmt_control(idx: Int, node: Node):
 # Recursive block walker — unwrap block/body/then/else wrappers
 # and emits statements in source order.
 fn ir_block(idx: Int):
-    node := get_node(idx)
-    kind := node.kind
+    kind := node_kind(idx)
     if kind == "block" or kind == "then" or kind == "else" or kind == "body":
-        kids := node.children
         mut i := 0
-        while i < kids.len():
-            ir_block(kids[i])
+        child_count := node_child_count(idx)
+        while i < child_count:
+            ir_block(node_child(idx, i))
             i = i + 1
     else:
         if kind == "call":
@@ -1487,8 +1529,8 @@ fn ir_block(idx: Int):
                 ir_last_was_ret = true
             return
         if kind == "return":
-            if node.children.len() > 0:
-                r := ir_expr(node.children[0])
+            if node_child_count(idx) > 0:
+                r := ir_expr(node_child(idx, 0))
                 ir_emit("ret " + r.to_string())
             else:
                 r := ir_reg()
@@ -1497,7 +1539,7 @@ fn ir_block(idx: Int):
             ir_last_was_ret = true
             return
         if kind == "bind" or kind == "binding":
-            mut name := node.value
+            mut name := node_value(idx)
             if name.contains(" mut"):
                 name = name.substring(0, name.len() - 4)
             elif name.contains(" "):
@@ -1505,9 +1547,8 @@ fn ir_block(idx: Int):
             mut val_idx := 0 - 1
             mut type_ann := ""
             mut _bi1 := 0
-            bkids1_children := node.children
-            while _bi1 < bkids1_children.len():
-                child := bkids1_children[_bi1]
+            while _bi1 < node_child_count(idx):
+                child := node_child(idx, _bi1)
                 cn := get_node(child)
                 if cn.kind == "type":
                     type_ann = cn.value
@@ -1519,9 +1560,8 @@ fn ir_block(idx: Int):
             mut is_int_key_map := false
             if type_ann == "Map":
                 mut _bi2 := 0
-                bkids2_children := node.children
-                while _bi2 < bkids2_children.len():
-                    child2 := bkids2_children[_bi2]
+                while _bi2 < node_child_count(idx):
+                    child2 := node_child(idx, _bi2)
                     cn2 := get_node(child2)
                     if cn2.kind == "generic_type" and cn2.children.len() > 0:
                         first_type := get_node(cn2.children[0])
@@ -1628,6 +1668,7 @@ fn ir_func(idx: Int):
     ir_next_reg = 0
     ir_var_regs = {}
     ir_var_types = {}
+    ir_seed_global_types()
     mut ret_type := "unknown"
     if ir_func_returns.contains_key(full_name):
         ret_type = ir_func_returns[full_name]
@@ -1654,6 +1695,7 @@ fn ir_impl_func(idx: Int, impl_type: String):
     ir_next_reg = 0
     ir_var_regs = {}
     ir_var_types = {}
+    ir_seed_global_types()
     mut ret_type := "unknown"
     if ir_func_returns.contains_key(orig_name):
         ret_type = ir_func_returns[orig_name]

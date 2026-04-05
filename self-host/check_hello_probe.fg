@@ -1,0 +1,26 @@
+from ast import reset_arena
+from checker import initialize_checker, c_register_all, c_run_module, debug_lookup_current
+from lexer import lex_all
+from parser import parse
+from types import get_type_info
+
+fn main() -> String!:
+    source := read_file("examples/hello.fg")!
+    reset_arena()
+    root := parse(lex_all(source))
+    initialize_checker("examples/hello.fg")
+    c_register_all(root)
+    greet_tid := debug_lookup_current("greet")
+    print_tid := debug_lookup_current("print")
+    print(greet_tid.to_string())
+    print(print_tid.to_string())
+    greet_info := get_type_info(greet_tid)
+    print_info := get_type_info(print_tid)
+    print(greet_info.param_types.len().to_string())
+    print(print_info.param_types.len().to_string())
+    diags := c_run_module(root)
+    print(diags.len().to_string())
+    for d in diags:
+        print(d.code)
+        print(d.message)
+    return ""

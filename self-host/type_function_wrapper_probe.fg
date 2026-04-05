@@ -1,0 +1,22 @@
+from types import TID_INT, TID_STRING, TID_VOID, add_type_info, get_type_info, initialize_type_table, ti_function
+
+fn make_fn(params: List[Int], ret: Int) -> Int:
+    return add_type_info(ti_function(params, ret))
+
+fn show(label: String, tid: Int):
+    info := get_type_info(tid)
+    print(label)
+    print(tid.to_string())
+    print(info.param_types.len().to_string())
+    print(info.return_type.to_string())
+
+fn main():
+    initialize_type_table()
+    time_tid := make_fn([], TID_INT)
+    input_tid := make_fn([], TID_STRING)
+    print_tid := make_fn([TID_STRING], TID_VOID)
+    exec_tid := make_fn([TID_STRING], TID_INT)
+    show("time", time_tid)
+    show("input", input_tid)
+    show("print", print_tid)
+    show("exec", exec_tid)

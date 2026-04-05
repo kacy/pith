@@ -1,0 +1,59 @@
+from ast import reset_arena
+from checker import initialize_checker, c_register_all, current_scope, debug_current_scope, debug_lookup_current, debug_define_current, debug_register_builtin_like, debug_register_builtin_types_again, debug_binding_count_current, debug_binding_name_current, debug_binding_scope_current
+from lexer import lex_all
+from parser import parse
+from scope import lookup_binding
+
+fn main():
+    source := read_file("self-host/checker_scope_input.fg").unwrap()
+    reset_arena()
+    root := parse(lex_all(source))
+    initialize_checker("self-host/checker_scope_input.fg")
+    print(debug_binding_count_current().to_string())
+    debug_define_current("zz", 1234)
+    print(debug_lookup_current("zz").to_string())
+    print(debug_binding_count_current().to_string())
+    debug_register_builtin_like("qq")
+    print(debug_lookup_current("qq").to_string())
+    print(debug_binding_count_current().to_string())
+    debug_register_builtin_types_again()
+    print(debug_binding_count_current().to_string())
+    if debug_binding_count_current() > 0:
+        print(debug_binding_scope_current(0).to_string())
+        print(debug_binding_name_current(0))
+    mut j := 0
+    while j < 12:
+        if j < debug_binding_count_current():
+            print(j.to_string())
+            print(debug_binding_scope_current(j).to_string())
+            print(debug_binding_name_current(j))
+        j = j + 1
+    c_register_all(root)
+    print(debug_binding_count_current().to_string())
+    mut i := 0
+    while i < debug_binding_count_current():
+        name := debug_binding_name_current(i)
+        if name == "print":
+            print(i.to_string())
+            print(debug_binding_scope_current(i).to_string())
+            print(name)
+        if name == "greet":
+            print(i.to_string())
+            print(debug_binding_scope_current(i).to_string())
+            print(name)
+        if name == "main":
+            print(i.to_string())
+            print(debug_binding_scope_current(i).to_string())
+            print(name)
+        i = i + 1
+    print(debug_current_scope().to_string())
+    print(debug_lookup_current("print").to_string())
+    print(debug_lookup_current("greet").to_string())
+    print(debug_lookup_current("main").to_string())
+    print(current_scope.to_string())
+    print(lookup_binding(0, "print").to_string())
+    print(lookup_binding(0, "greet").to_string())
+    print(lookup_binding(0, "main").to_string())
+    print(lookup_binding(current_scope, "print").to_string())
+    print(lookup_binding(current_scope, "greet").to_string())
+    print(lookup_binding(current_scope, "main").to_string())

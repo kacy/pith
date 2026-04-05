@@ -1,0 +1,17 @@
+from lexer import lex_all
+from parser import parse
+from ast import get_node, reset_arena
+
+fn main() -> Int:
+    reset_arena()
+    source := read_file("self-host/pub_const_probe.fg")!
+    tokens := lex_all(source)
+    root_idx := parse(tokens)
+    root := get_node(root_idx)
+    for child_idx in root.children:
+        child := get_node(child_idx)
+        print(child.kind + ":" + child.value)
+        for inner_idx in child.children:
+            inner := get_node(inner_idx)
+            print("  " + inner.kind + ":" + inner.value)
+    return 0

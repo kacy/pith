@@ -1,0 +1,25 @@
+from types import TID_BOOL, TID_ERR, TID_FLOAT, TID_INT, TID_STRING, TID_VOID, add_type_info, get_type_info, initialize_type_table, ti_function, ti_optional, ti_result
+
+fn show(label: String, tid: Int):
+    info := get_type_info(tid)
+    print(label)
+    print(tid.to_string())
+    print(info.kind)
+    print(info.param_types.len().to_string())
+    print(info.return_type.to_string())
+
+fn main():
+    initialize_type_table()
+    _int_result := add_type_info(ti_result(TID_INT, TID_ERR))
+    _float_result := add_type_info(ti_result(TID_FLOAT, TID_ERR))
+    _str_result := add_type_info(ti_result(TID_STRING, TID_ERR))
+    _bool_result := add_type_info(ti_result(TID_BOOL, TID_ERR))
+    _opt_string := add_type_info(ti_optional(TID_STRING))
+
+    time_tid := add_type_info(ti_function([], TID_INT))
+    input_tid := add_type_info(ti_function([], TID_STRING))
+    print_tid := add_type_info(ti_function([TID_STRING], TID_VOID))
+
+    show("time", time_tid)
+    show("input", input_tid)
+    show("print", print_tid)

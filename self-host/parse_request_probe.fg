@@ -1,0 +1,64 @@
+fn parse_request(raw: String) -> String:
+    nl := chr(10)
+    cr := chr(13)
+    sep := chr(31)
+    mut header_part := raw
+    mut req_body := ""
+
+    mut i := 0
+    raw_len := raw.len()
+    while i < raw_len - 1:
+        if raw[i] == nl:
+            if i + 1 < raw_len and raw[i + 1] == nl:
+                header_part = raw.substring(0, i)
+                req_body = raw.substring(i + 2, raw_len)
+                break
+            elif i + 2 < raw_len and raw[i + 1] == cr and raw[i + 2] == nl:
+                header_part = raw.substring(0, i)
+                req_body = raw.substring(i + 3, raw_len)
+                break
+        i = i + 1
+
+    lines := header_part.split(nl)
+    mut meth := "GET"
+    mut full_path := "/"
+    mut ver := "HTTP/1.1"
+    mut hdrs := ""
+
+    if lines.len() > 0:
+        request_line := lines[0].trim()
+        mut sp1 := -1
+        mut sp2 := -1
+        mut ri := 0
+        rl_len := request_line.len()
+        while ri < rl_len:
+            if request_line[ri] == " ":
+                if sp1 < 0:
+                    sp1 = ri
+                elif sp2 < 0:
+                    sp2 = ri
+                    break
+            ri = ri + 1
+        if sp1 > 0:
+            meth = request_line.substring(0, sp1)
+        if sp1 >= 0 and sp2 > sp1:
+            full_path = request_line.substring(sp1 + 1, sp2)
+            ver = request_line.substring(sp2 + 1, rl_len).trim()
+        elif sp1 >= 0:
+            full_path = request_line.substring(sp1 + 1, rl_len).trim()
+
+    mut p := meth
+    p = p + sep
+    p = p + full_path
+    p = p + sep
+    p = p + ver
+    p = p + sep
+    p = p + hdrs
+    p = p + sep
+    p = p + req_body
+    return p
+
+fn main():
+    crlf := chr(13) + chr(10)
+    raw := "GET / HTTP/1.1" + crlf + crlf
+    print(parse_request(raw))

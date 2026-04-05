@@ -1,0 +1,62 @@
+from ast import get_node, reset_arena
+from ir_emitter import emit_ir
+from lexer import lex_all
+from parser import parse
+
+fn main() -> String!:
+    source := read_file(args()[1])!
+    mut target := "main"
+    if args().len() > 2:
+        target = args()[2]
+    tokens := lex_all(source)
+    reset_arena()
+    root := parse(tokens)
+
+    root_node := get_node(root)
+    mut main_idx := 0 - 1
+    mut i := 0
+    while i < root_node.children.len():
+        child_idx := root_node.children[i]
+        child := get_node(child_idx)
+        if (child.kind == "fn" or child.kind == "fn_decl") and child.value == target:
+            main_idx = child_idx
+        i = i + 1
+
+    print("fn_idx=" + main_idx.to_string())
+    if main_idx < 0:
+        return ""
+
+    main_node := get_node(main_idx)
+    print("main_children=" + main_node.children.len().to_string())
+
+    mut body_idx := 0 - 1
+    i = 0
+    while i < main_node.children.len():
+        child_idx := main_node.children[i]
+        child := get_node(child_idx)
+        if child.kind == "body":
+            body_idx = child_idx
+        i = i + 1
+
+    print("body_idx=" + body_idx.to_string())
+    if body_idx >= 0:
+        body := get_node(body_idx)
+        print("body_kind=" + body.kind)
+        print("body_children=" + body.children.len().to_string())
+        i = 0
+        while i < body.children.len():
+            stmt := get_node(body.children[i])
+            print("stmt " + i.to_string() + " " + stmt.kind + " " + stmt.value)
+            if stmt.kind == "block":
+                print("block_children=" + stmt.children.len().to_string())
+                mut j := 0
+                while j < stmt.children.len():
+                    inner := get_node(stmt.children[j])
+                    print("block_stmt " + j.to_string() + " " + inner.kind + " " + inner.value)
+                    j = j + 1
+            i = i + 1
+
+    ir := emit_ir(root)
+    print("ir_len=" + ir.len().to_string())
+    print(ir)
+    return ""

@@ -1,0 +1,13 @@
+from checker import initialize_checker, current_scope
+from scope import lookup_binding
+from types import get_type_info, get_type_name
+
+fn main():
+    initialize_checker("args_builtin_probe")
+    args_tid := lookup_binding(current_scope, "args")
+    args_info := get_type_info(args_tid)
+    ret_info := get_type_info(args_info.return_type)
+    print("fn kind: " + args_info.kind)
+    print("ret kind: " + ret_info.kind)
+    print("ret name: " + get_type_name(args_info.return_type))
+    print("elem name: " + get_type_name(ret_info.inner))

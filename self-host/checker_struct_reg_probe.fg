@@ -1,0 +1,23 @@
+from lexer import lex_all
+from parser import parse
+from ast import reset_arena
+from checker import initialize_checker, c_register_all
+from types import lookup_type_id, get_type_info
+
+fn main():
+    source := read_file("self-host/struct_ctor_probe.fg")!
+    tokens := lex_all(source)
+    reset_arena()
+    root := parse(tokens)
+    initialize_checker("self-host/struct_ctor_probe.fg")
+    c_register_all(root)
+    tid := lookup_type_id("Foo")
+    print(tid.to_string())
+    info := get_type_info(tid)
+    print(info.kind)
+    print(info.fields.len().to_string())
+    if info.fields.len() > 0:
+        print(info.fields[0])
+    print(info.field_types.len().to_string())
+    if info.field_types.len() > 0:
+        print(info.field_types[0].to_string())

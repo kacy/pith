@@ -1,0 +1,57 @@
+fn req_field(req: String, n: Int) -> String:
+    sep := chr(31)
+    mut start := 0
+    mut field := 0
+    mut pos := 0
+    req_len := req.len()
+    while pos < req_len:
+        if req[pos] == sep:
+            if field == n:
+                return req.substring(start, pos)
+            field = field + 1
+            start = pos + 1
+        pos = pos + 1
+    if field == n:
+        return req.substring(start, req_len)
+    return ""
+
+fn get_query_param(req: String, name: String) -> String:
+    qs := req_field(req, 2)
+    if qs.len() == 0:
+        return ""
+    mut start := 0
+    mut pos := 0
+    qs_len := qs.len()
+    while pos <= qs_len:
+        mut at_end := pos == qs_len
+        if not at_end:
+            at_end = qs[pos] == "&"
+        if at_end and pos > start:
+            pair := qs.substring(start, pos)
+            mut eq := -1
+            mut ei := 0
+            pair_len := pair.len()
+            while ei < pair_len:
+                if pair[ei] == "=":
+                    eq = ei
+                    break
+                ei = ei + 1
+            if eq >= 0:
+                key := pair.substring(0, eq)
+                if key == name:
+                    if eq + 1 < pair_len:
+                        return pair.substring(eq + 1, pair_len)
+                    return ""
+            elif pair == name:
+                return ""
+            if at_end and pos == qs_len:
+                break
+            start = pos + 1
+        elif at_end:
+            start = pos + 1
+        pos = pos + 1
+    return ""
+
+fn main():
+    req := "GET" + chr(31) + "/" + chr(31) + "q=forge&lang=en" + chr(31)
+    print(get_query_param(req, "q"))

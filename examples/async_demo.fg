@@ -1,25 +1,25 @@
-# Forge in 15 lines: async, error propagation, enums, and pattern matching
+enum Rank:
+    Prime
+    Composite(Int)
 
-enum Mood:
-    Happy(String)
-    Sad(String)
+fn classify(n: Int) -> Rank!:
+    if n < 2:
+        fail "{n} is too small"
+    mut d := 2
+    while d * d <= n:
+        if n % d == 0:
+            return Rank.Composite(d)
+        d = d + 1
+    return Rank.Prime
 
-fn analyze(name: String, score: Int) -> Mood!:
-    if score < 0 or score > 100:
-        fail "invalid score for {name}"
-    match score > 60:
-        true => return Mood.Happy(name)
-        false => return Mood.Sad(name)
-
-fn report(names: List[String], scores: List[Int]) -> String!:
-    mut lines: List[String] := []
-    for name, i in names:
-        mood := await spawn analyze(name, scores[i])!
-        line := match mood:
-            Mood.Happy(n) => "{n} is thriving"
-            Mood.Sad(n) => "{n} needs support"
-        lines.push(line)
-    return lines.join("\n")
+fn describe(nums: List[Int]) -> String!:
+    mut out: List[String] := []
+    for n in nums:
+        rank := await spawn classify(n)!
+        out.push(match rank:
+            Rank.Prime => "{n} is prime"
+            Rank.Composite(d) => "{n} = {d} x {n / d}")
+    return out.join("\n")
 
 fn main():
-    print(report(["alice", "bob"], [85, 40])!)
+    print(describe([7, 42, 97])!)

@@ -36,41 +36,39 @@ pub fn choice_string(list: List[String]) -> String:
         return ""
     return list[random_int(0, n - 1)]
 
-# Return a shuffled copy (Fisher-Yates via index rebuild)
+# Returns a copy of the list with two positions swapped.
+fn swap_copy(list: List[Int], left: Int, right: Int) -> List[Int]:
+    if left == right:
+        return list
+    mut result: List[Int] := []
+    n := list.len()
+    mut i := 0
+    while i < n:
+        if i == left:
+            result.push(list[right])
+        elif i == right:
+            result.push(list[left])
+        else:
+            result.push(list[i])
+        i = i + 1
+    return result
+
+# Return a shuffled copy (Fisher-Yates on a copied list)
 pub fn shuffle(list: List[Int]) -> List[Int]:
     n := list.len()
     if n <= 1:
         return list
-    # build index array
-    mut idx: List[Int] := []
+    mut result: List[Int] := []
     mut i := 0
     while i < n:
-        idx.push(i)
+        result.push(list[i])
         i = i + 1
-    # Fisher-Yates shuffle on indices
+    # Fisher-Yates shuffle on the copied list
     i = n - 1
     while i > 0:
         j := random_int(0, i)
-        a := idx[i]
-        b := idx[j]
-        mut new_idx: List[Int] := []
-        mut k := 0
-        while k < n:
-            if k == i:
-                new_idx.push(b)
-            elif k == j:
-                new_idx.push(a)
-            else:
-                new_idx.push(idx[k])
-            k = k + 1
-        idx = new_idx
+        result = swap_copy(result, i, j)
         i = i - 1
-    # collect by shuffled index
-    mut result: List[Int] := []
-    i = 0
-    while i < n:
-        result.push(list[idx[i]])
-        i = i + 1
     return result
 
 # Return k random elements without replacement

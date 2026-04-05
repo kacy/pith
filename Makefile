@@ -1,4 +1,4 @@
-.PHONY: build self-host bootstrap bootstrap-verify run-examples check-invalid check-invalid-only test clean
+.PHONY: build self-host bootstrap bootstrap-verify run-examples check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -100,6 +100,46 @@ check-invalid-only:
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all invalid examples passed"
 
+check-invalid-self-host: self-host check-invalid-self-host-only
+
+check-invalid-self-host-only:
+	@echo "--- invalid examples (self-hosted checker diagnostics) ---"
+	@pass=0; fail=0; \
+	for f in $(INVALID_EXAMPLES); do \
+		name=$$(basename "$$f" .fg); \
+		expected_file="examples/invalid/expected/$$name.codes"; \
+		if [ ! -f "$$expected_file" ]; then \
+			echo "FAIL $$name (missing $$expected_file)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		set +e; \
+		output=$$(timeout 15 ./self-host/forge_main check "$$f" 2>&1); \
+		status=$$?; \
+		set -e; \
+		if [ $$status -eq 0 ]; then \
+			echo "FAIL $$name (unexpected success)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		actual=$$(printf "%s\n" "$$output" | grep -o 'E[0-9][0-9][0-9]' | sort -u || true); \
+		expected=$$(sort "$$expected_file"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			echo "expected:"; \
+			printf "%s\n" "$$expected"; \
+			echo "actual:"; \
+			printf "%s\n" "$$actual"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all self-host invalid examples passed"
+
 # --- full test suite ---
 
 test: build
@@ -123,7 +163,9 @@ test: build
 	@$(MAKE) --no-print-directory check-invalid-only
 	@echo "=== Step 3: build self-hosted compiler via Cranelift ==="
 	./target/release/forge build self-host/forge_main.fg
-	@echo "=== Step 4: self-hosted compiler works ==="
+	@echo "=== Step 4: run invalid examples through self-hosted checker ==="
+	@$(MAKE) --no-print-directory check-invalid-self-host-only
+	@echo "=== Step 5: self-hosted compiler works ==="
 	./self-host/forge_main version
 	./self-host/forge_main lex examples/hello.fg > /dev/null
 	./self-host/forge_main parse examples/hello.fg > /dev/null

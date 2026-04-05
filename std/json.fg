@@ -3,9 +3,11 @@
 # Parse JSON strings into a node tree, access values, and build/encode JSON.
 # Uses opaque Int handles into a node pool.
 #
-#   from std.json import parse, get_string, object_get, encode
+#   from std.json import parse, get_string, object_get, object_has, object_keys, encode
 #   root := parse(data)
 #   name := get_string(object_get(root, "name"))
+#   if object_has(root, "name"):
+#       print(object_keys(root).join(", "))
 
 # ===============================================================
 # Node Pool
@@ -76,6 +78,14 @@ fn get_char_at(position: Int) -> String:
     if position >= parser_input.len():
         return ""
     return parser_input[position]
+
+# Returns true if a node handle points at an allocated node.
+fn is_valid_handle(handle: Int) -> Bool:
+    return handle >= 0 and handle < next_node_id
+
+# Returns true if a handle is valid and has the requested node kind.
+fn handle_has_type(handle: Int, kind: String) -> Bool:
+    return is_valid_handle(handle) and node_types[handle] == kind
 
 # Skips whitespace characters (space, tab, newline, carriage return)
 fn skip_whitespace():
@@ -296,39 +306,31 @@ pub fn parse(input: String) -> Int:
 # Returns the type of a node as a string: "null", "bool", "int", "float", 
 # "string", "array", or "object". Returns "invalid" for invalid handles.
 pub fn type_of(handle: Int) -> String:
-    if handle < 0 or handle >= next_node_id:
+    if not is_valid_handle(handle):
         return "invalid"
     return node_types[handle]
 
 # Returns the boolean value from a node. Returns false if not a boolean.
 pub fn get_bool(handle: Int) -> Bool:
-    if handle < 0 or handle >= next_node_id:
-        return false
-    if node_types[handle] != "bool":
+    if not handle_has_type(handle, "bool"):
         return false
     return boolean_values[handle]
 
 # Returns the integer value from a node. Returns 0 if not an integer.
 pub fn get_int(handle: Int) -> Int:
-    if handle < 0 or handle >= next_node_id:
-        return 0
-    if node_types[handle] == "int":
+    if handle_has_type(handle, "int"):
         return integer_values[handle]
     return 0
 
 # Returns the float value from a node. Returns 0.0 if not a float.
 pub fn get_float(handle: Int) -> Float:
-    if handle < 0 or handle >= next_node_id:
-        return 0.0
-    if node_types[handle] == "float":
+    if handle_has_type(handle, "float"):
         return float_values[handle]
     return 0.0
 
 # Returns the string value from a node. Returns empty string if not a string.
 pub fn get_string(handle: Int) -> String:
-    if handle < 0 or handle >= next_node_id:
-        return ""
-    if node_types[handle] != "string":
+    if not handle_has_type(handle, "string"):
         return ""
     return string_values[handle]
 
@@ -338,13 +340,13 @@ pub fn get_string(handle: Int) -> String:
 
 # Returns the number of elements in an array node. Returns 0 for non-arrays.
 pub fn array_len(handle: Int) -> Int:
-    if handle < 0 or handle >= next_node_id:
+    if not handle_has_type(handle, "array"):
         return 0
     return array_item_counts[handle]
 
 # Returns the handle of an array element by index. Returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
-    if handle < 0 or handle >= next_node_id:
+    if not handle_has_type(handle, "array"):
         return 0 - 1
     if index < 0 or index >= array_item_counts[handle]:
         return 0 - 1
@@ -357,7 +359,7 @@ pub fn array_get(handle: Int, index: Int) -> Int:
 # Returns the handle of an object value by key. Returns -1 if key not found.
 # Scans from end for latest value (handles duplicate keys).
 pub fn object_get(handle: Int, key: String) -> Int:
-    if handle < 0 or handle >= next_node_id:
+    if not handle_has_type(handle, "object"):
         return 0 - 1
     off := object_key_offsets[handle]
     cnt := object_key_counts[handle]
@@ -376,7 +378,7 @@ pub fn object_has(handle: Int, key: String) -> Bool:
 # Returns the list of keys in an object (deduplicated, insertion order).
 pub fn object_keys(handle: Int) -> List[String]:
     mut result: List[String] := []
-    if handle < 0 or handle >= next_node_id:
+    if not handle_has_type(handle, "object"):
         return result
     off := object_key_offsets[handle]
     cnt := object_key_counts[handle]
@@ -393,6 +395,7 @@ pub fn object_keys(handle: Int) -> List[String]:
             result.push(object_keys_flat[off + i])
         i = i + 1
     return result
+
 
 # ===============================================================
 # Public API — Constructors
@@ -471,7 +474,7 @@ fn encode_string(s: String) -> String:
 # Serializes a node tree to a JSON string.
 # Returns "null" for invalid handles.
 pub fn encode(handle: Int) -> String:
-    if handle < 0 or handle >= next_node_id:
+    if not is_valid_handle(handle):
         return "null"
     kind := node_types[handle]
     if kind == "null":

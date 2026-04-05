@@ -81,6 +81,23 @@ fn get_char_at(i: Int) -> String:
         return ""
     return parser_input[i]
 
+# Returns true if a node handle points at an allocated node.
+fn is_valid_handle(handle: Int) -> Bool:
+    return handle >= 0 and handle < next_node_id
+
+# Looks up a direct key in a table and returns the child handle, or -1.
+fn table_lookup(handle: Int, key: String) -> Int:
+    if not is_valid_handle(handle) or node_types[handle] != "table":
+        return 0 - 1
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
+    mut i := 0
+    while i < cnt:
+        if table_keys_flat[off + i] == key:
+            return table_values_flat[off + i]
+        i = i + 1
+    return 0 - 1
+
 # Skips whitespace (space, tab, carriage return)
 fn skip_whitespace():
     while parser_position < parser_input.len() and (get_char_at(parser_position) == " " or get_char_at(parser_position) == chr(9) or get_char_at(parser_position) == chr(13)):
@@ -372,7 +389,7 @@ pub fn parse(input: String) -> Int:
 # Returns the type of a node: "string", "int", "float", "bool", "table", or "array".
 # Returns "invalid" for invalid handles.
 pub fn type_of(handle: Int) -> String:
-    if handle < 0 or handle >= next_node_id:
+    if not is_valid_handle(handle):
         return "invalid"
     return node_types[handle]
 
@@ -382,92 +399,44 @@ pub fn type_of(handle: Int) -> String:
 
 # Gets a string value by key from a table. Returns empty string if not found or wrong type.
 pub fn get_string(handle: Int, key: String) -> String:
-    if handle < 0 or handle >= next_node_id:
-        return ""
-    off := table_key_offsets[handle]
-    cnt := table_key_counts[handle]
-    mut i := 0
-    while i < cnt:
-        if table_keys_flat[off + i] == key:
-            v := table_values_flat[off + i]
-            if v >= 0 and v < next_node_id and node_types[v] == "string":
-                return string_values[v]
-        i = i + 1
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "string":
+        return string_values[v]
     return ""
 
 # Gets an integer value by key from a table. Returns 0 if not found or wrong type.
 pub fn get_int(handle: Int, key: String) -> Int:
-    if handle < 0 or handle >= next_node_id:
-        return 0
-    off := table_key_offsets[handle]
-    cnt := table_key_counts[handle]
-    mut i := 0
-    while i < cnt:
-        if table_keys_flat[off + i] == key:
-            v := table_values_flat[off + i]
-            if v >= 0 and v < next_node_id and node_types[v] == "int":
-                return integer_values[v]
-        i = i + 1
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "int":
+        return integer_values[v]
     return 0
 
 # Gets a float value by key from a table. Returns 0.0 if not found or wrong type.
 pub fn get_float(handle: Int, key: String) -> Float:
-    if handle < 0 or handle >= next_node_id:
-        return 0.0
-    off := table_key_offsets[handle]
-    cnt := table_key_counts[handle]
-    mut i := 0
-    while i < cnt:
-        if table_keys_flat[off + i] == key:
-            v := table_values_flat[off + i]
-            if v >= 0 and v < next_node_id and node_types[v] == "float":
-                return float_values[v]
-        i = i + 1
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "float":
+        return float_values[v]
     return 0.0
 
 # Gets a boolean value by key from a table. Returns false if not found or wrong type.
 pub fn get_bool(handle: Int, key: String) -> Bool:
-    if handle < 0 or handle >= next_node_id:
-        return false
-    off := table_key_offsets[handle]
-    cnt := table_key_counts[handle]
-    mut i := 0
-    while i < cnt:
-        if table_keys_flat[off + i] == key:
-            v := table_values_flat[off + i]
-            if v >= 0 and v < next_node_id and node_types[v] == "bool":
-                return boolean_values[v]
-        i = i + 1
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "bool":
+        return boolean_values[v]
     return false
 
 # Gets a sub-table handle by key. Returns -1 if not found or not a table.
 pub fn get_table(handle: Int, key: String) -> Int:
-    if handle < 0 or handle >= next_node_id:
-        return 0 - 1
-    off := table_key_offsets[handle]
-    cnt := table_key_counts[handle]
-    mut i := 0
-    while i < cnt:
-        if table_keys_flat[off + i] == key:
-            v := table_values_flat[off + i]
-            if v >= 0 and v < next_node_id and node_types[v] == "table":
-                return v
-        i = i + 1
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "table":
+        return v
     return 0 - 1
 
 # Gets an array handle by key. Returns -1 if not found or not an array.
 pub fn get_array(handle: Int, key: String) -> Int:
-    if handle < 0 or handle >= next_node_id:
-        return 0 - 1
-    off := table_key_offsets[handle]
-    cnt := table_key_counts[handle]
-    mut i := 0
-    while i < cnt:
-        if table_keys_flat[off + i] == key:
-            v := table_values_flat[off + i]
-            if v >= 0 and v < next_node_id and node_types[v] == "array":
-                return v
-        i = i + 1
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "array":
+        return v
     return 0 - 1
 
 # ===============================================================
@@ -476,13 +445,13 @@ pub fn get_array(handle: Int, key: String) -> Int:
 
 # Returns the number of elements in an array. Returns 0 for non-arrays.
 pub fn array_len(handle: Int) -> Int:
-    if handle < 0 or handle >= next_node_id:
+    if not is_valid_handle(handle) or node_types[handle] != "array":
         return 0
     return array_item_counts[handle]
 
 # Gets the handle of an array element by index. Returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
-    if handle < 0 or handle >= next_node_id:
+    if not is_valid_handle(handle) or node_types[handle] != "array":
         return 0 - 1
     if index < 0 or index >= array_item_counts[handle]:
         return 0 - 1
@@ -495,7 +464,7 @@ pub fn array_get(handle: Int, index: Int) -> Int:
 # Returns the list of keys in a table (insertion order).
 pub fn keys(handle: Int) -> List[String]:
     mut result: List[String] := []
-    if handle < 0 or handle >= next_node_id:
+    if not is_valid_handle(handle) or node_types[handle] != "table":
         return result
     off := table_key_offsets[handle]
     cnt := table_key_counts[handle]
@@ -507,13 +476,4 @@ pub fn keys(handle: Int) -> List[String]:
 
 # Returns true if a table contains the specified key.
 pub fn has(handle: Int, key: String) -> Bool:
-    if handle < 0 or handle >= next_node_id:
-        return false
-    off := table_key_offsets[handle]
-    cnt := table_key_counts[handle]
-    mut i := 0
-    while i < cnt:
-        if table_keys_flat[off + i] == key:
-            return true
-        i = i + 1
-    return false
+    return table_lookup(handle, key) >= 0

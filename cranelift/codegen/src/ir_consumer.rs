@@ -215,7 +215,7 @@ pub fn compile_from_ir(
         }
 
         let func_name = parts[1].to_string();
-        let nparam: usize = parts[2].parse().unwrap_or(0);
+        let _nparam: usize = parts[2].parse().unwrap_or(0);
         i += 1;
 
         // Collect function body lines until endfunc
@@ -937,8 +937,6 @@ fn compile_ir_function(
                         let sig = &builder.func.dfg.signatures[sig_ref];
                         let param_types: Vec<types::Type> =
                             sig.params.iter().map(|p| p.value_type).collect();
-                        let ret_types: Vec<types::Type> =
-                            sig.returns.iter().map(|r| r.value_type).collect();
                         let mut typed_args = args.clone();
                         for (i, arg) in typed_args.iter_mut().enumerate() {
                             if i < param_types.len() && param_types[i] == types::F64 {
@@ -1013,7 +1011,7 @@ fn compile_ir_function(
 
             "store" if parts.len() >= 3 => {
                 let name = parts[1].to_string();
-                let mut val = get_reg(&regs, parts[2]);
+                let val = get_reg(&regs, parts[2]);
                 // Propagate types through store
                 if let Ok(src_reg) = parts[2].parse::<usize>() {
                     if let Some(struct_name) = struct_regs.get(&src_reg) {

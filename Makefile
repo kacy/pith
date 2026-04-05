@@ -1,7 +1,19 @@
-.PHONY: build self-host bootstrap bootstrap-verify run-examples test clean
+.PHONY: build self-host bootstrap bootstrap-verify run-examples parity-examples parity-examples-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
+INVALID_EXAMPLES := $(wildcard examples/invalid/*.fg)
+PARITY_EXAMPLES := \
+	hello \
+	control_flow \
+	structs \
+	collection_methods \
+	generics \
+	lambdas \
+	error_handling \
+	matrix_math \
+	self_host_patterns \
+	wildcard_import
 
 # --- primary build (Cranelift native backend) ---
 
@@ -59,6 +71,118 @@ run-examples: build
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all examples passed"
 
+parity-examples: self-host parity-examples-only
+
+parity-examples-only:
+	@echo "--- native vs self-host parity examples ---"
+	@pass=0; fail=0; \
+	for name in $(PARITY_EXAMPLES); do \
+		expected_file="examples/expected/$$name.txt"; \
+		if [ ! -f "$$expected_file" ]; then \
+			echo "FAIL $$name (missing $$expected_file)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		native=$$(timeout 15 ./target/release/forge run "examples/$$name.fg" 2>/dev/null); \
+		self_host=$$(timeout 15 ./self-host/forge_main run "examples/$$name.fg" 2>/dev/null); \
+		expected=$$(cat "$$expected_file"); \
+		if [ "$$native" = "$$self_host" ] && [ "$$native" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			if [ "$$native" != "$$self_host" ]; then \
+				echo "native/self-host mismatch"; \
+			else \
+				echo "output mismatch vs expected"; \
+			fi; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all parity examples passed"
+
+check-invalid: build check-invalid-only
+
+check-invalid-only:
+	@echo "--- invalid examples (checker diagnostics) ---"
+	@pass=0; fail=0; \
+	for f in $(INVALID_EXAMPLES); do \
+		name=$$(basename "$$f" .fg); \
+		expected_file="examples/invalid/expected/$$name.codes"; \
+		if [ ! -f "$$expected_file" ]; then \
+			echo "FAIL $$name (missing $$expected_file)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		set +e; \
+		output=$$(timeout 15 ./target/release/forge check "$$f" 2>&1); \
+		status=$$?; \
+		set -e; \
+		if [ $$status -eq 0 ]; then \
+			echo "FAIL $$name (unexpected success)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		actual=$$(printf "%s\n" "$$output" | grep -o 'E[0-9][0-9][0-9]' | sort -u || true); \
+		expected=$$(sort "$$expected_file"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			echo "expected:"; \
+			printf "%s\n" "$$expected"; \
+			echo "actual:"; \
+			printf "%s\n" "$$actual"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all invalid examples passed"
+
+check-invalid-self-host: self-host check-invalid-self-host-only
+
+check-invalid-self-host-only:
+	@echo "--- invalid examples (self-hosted checker diagnostics) ---"
+	@pass=0; fail=0; \
+	for f in $(INVALID_EXAMPLES); do \
+		name=$$(basename "$$f" .fg); \
+		expected_file="examples/invalid/expected/$$name.codes"; \
+		if [ ! -f "$$expected_file" ]; then \
+			echo "FAIL $$name (missing $$expected_file)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		set +e; \
+		output=$$(timeout 15 ./self-host/forge_main check "$$f" 2>&1); \
+		status=$$?; \
+		set -e; \
+		if [ $$status -eq 0 ]; then \
+			echo "FAIL $$name (unexpected success)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		actual=$$(printf "%s\n" "$$output" | grep -o 'E[0-9][0-9][0-9]' | sort -u || true); \
+		expected=$$(sort "$$expected_file"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			echo "expected:"; \
+			printf "%s\n" "$$expected"; \
+			echo "actual:"; \
+			printf "%s\n" "$$actual"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all self-host invalid examples passed"
+
 # --- full test suite ---
 
 test: build
@@ -78,9 +202,15 @@ test: build
 	done; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi
-	@echo "=== Step 2: build self-hosted compiler via Cranelift ==="
+	@echo "=== Step 2: run invalid checker examples ==="
+	@$(MAKE) --no-print-directory check-invalid-only
+	@echo "=== Step 3: build self-hosted compiler via Cranelift ==="
 	./target/release/forge build self-host/forge_main.fg
-	@echo "=== Step 3: self-hosted compiler works ==="
+	@echo "=== Step 4: compare native and self-hosted example outputs ==="
+	@$(MAKE) --no-print-directory parity-examples-only
+	@echo "=== Step 5: run invalid examples through self-hosted checker ==="
+	@$(MAKE) --no-print-directory check-invalid-self-host-only
+	@echo "=== Step 6: self-hosted compiler works ==="
 	./self-host/forge_main version
 	./self-host/forge_main lex examples/hello.fg > /dev/null
 	./self-host/forge_main parse examples/hello.fg > /dev/null

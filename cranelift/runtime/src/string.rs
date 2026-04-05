@@ -507,21 +507,21 @@ pub extern "C" fn forge_ord(s: ForgeString, index: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn forge_int_to_string(n: i64) -> ForgeString {
     let s = Arc::from(n.to_string());
-    unsafe { forge_from_internal(s) }
+    forge_from_internal(s)
 }
 
 /// Convert uint to string  
 #[no_mangle]
 pub extern "C" fn forge_uint_to_string(n: u64) -> ForgeString {
     let s = Arc::from(n.to_string());
-    unsafe { forge_from_internal(s) }
+    forge_from_internal(s)
 }
 
 /// Convert float to string
 #[no_mangle]
 pub extern "C" fn forge_float_to_string(n: f64) -> ForgeString {
     let s = Arc::from(format!("{:.6}", n));
-    unsafe { forge_from_internal(s) }
+    forge_from_internal(s)
 }
 
 /// Convert bool to string
@@ -539,7 +539,6 @@ pub extern "C" fn forge_bool_to_string(b: bool) -> ForgeString {
 // ============================================================================
 
 /// Simple strlen-based length for null-terminated strings
-#[no_mangle]
 #[no_mangle]
 pub extern "C" fn forge_cstring_len(cstr: *const i8) -> i64 {
     if cstr.is_null() {

@@ -5,7 +5,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 
 /// WaitGroup state
-struct WaitGroupState {
+pub struct WaitGroupState {
     count: usize,
 }
 

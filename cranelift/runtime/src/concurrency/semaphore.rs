@@ -5,7 +5,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Semaphore state
-struct SemaphoreState {
+pub struct SemaphoreState {
     count: usize,
     max: usize,
 }

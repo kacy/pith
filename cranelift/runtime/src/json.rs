@@ -3,7 +3,6 @@
 //! Uses arena-style allocation: all JSON nodes live in a global Vec,
 //! and handles are indices into this Vec cast to i64.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 static JSON_ARENA: std::sync::OnceLock<Mutex<Vec<JsonValue>>> = std::sync::OnceLock::new();

@@ -75,8 +75,6 @@ pub unsafe extern "C" fn forge_runtime_shutdown() {
 /// s must be a valid ForgeString
 #[no_mangle]
 pub unsafe extern "C" fn forge_print(s: string::ForgeString) {
-    use std::io::Write;
-
     if s.ptr.is_null() || s.len == 0 {
         println!();
         return;
@@ -190,8 +188,6 @@ pub unsafe extern "C" fn forge_print_cstr(ptr: *const i8) {
 /// ptr must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn forge_print_err(ptr: *const i8) {
-    use std::io::Write;
-
     if ptr.is_null() {
         eprintln!();
         return;
@@ -1097,7 +1093,7 @@ pub unsafe extern "C" fn forge_random_string(len: i64) -> *mut i8 {
 /// ptr must have been allocated by the runtime
 #[no_mangle]
 pub unsafe extern "C" fn forge_free(ptr: *mut i8) {
-    use std::alloc::{dealloc, Layout};
+    use std::alloc::Layout;
 
     if !ptr.is_null() {
         // We don't know the size, but we can deallocate with size 0
@@ -1177,7 +1173,7 @@ pub unsafe extern "C" fn forge_cstring_substring(s: *const i8, start: i64, end: 
 /// Both s and delim must be valid null-terminated C strings
 #[no_mangle]
 pub unsafe extern "C" fn forge_string_split_to_list(s: *const i8, delim: *const i8) -> ForgeList {
-    use crate::collections::list::{forge_list_new, forge_list_push, ListTypeTag};
+    use crate::collections::list::forge_list_new;
     use std::alloc::{alloc, Layout};
 
     if s.is_null() || delim.is_null() {
@@ -1199,7 +1195,7 @@ pub unsafe extern "C" fn forge_string_split_to_list(s: *const i8, delim: *const 
     };
 
     // Create a new list storing cstring pointers as i64 values (type_tag = 0, primitive)
-    let mut list = forge_list_new(8, 0);
+    let list = forge_list_new(8, 0);
 
     let mut start = 0;
     for i in 0..=s_len {

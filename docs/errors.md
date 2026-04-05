@@ -229,13 +229,13 @@ an enum variant name doesn't exist on the enum type.
 
 a pattern has the wrong number of fields for the enum variant.
 
-### E214 — break/continue outside loop
+### E214 — reserved
+
+reserved for future checker diagnostics. not currently emitted.
+
+### E215 — break/continue outside loop
 
 a `break` or `continue` statement was used outside of a loop body.
-
-### E215 — match arm type mismatch
-
-match arms return different types when used as an expression.
 
 ### E216 — assignment to immutable binding
 
@@ -291,14 +291,14 @@ the compiler couldn't determine the element type of a collection literal.
 
 ### E224 — invalid unwrap/try target
 
-the `?` (try) or `!` (unwrap) operator was used on a non-optional or
-non-result type. includes a fix suggestion.
+the `?` (unwrap) operator was used on a non-optional type, or the `!`
+(try) operator was used on a non-result type. includes a fix suggestion.
 
 ```
-error[E224]: '?' can only be used on Optional types, got Int
-  3 | x?
+error[E224]: try requires a result type, got Int
+  3 | x!
       ^^
-  fix: '?' propagates errors from Optional/Result types
+  fix: use ? for unwrapping optional types
 ```
 
 ### E225 — branch type mismatch
@@ -356,16 +356,9 @@ this usually happens with deeply nested generic types or recursive type definiti
 error[E233]: type nesting too deep
 ```
 
-### E234 — import not found
+### E234 — invalid fail target
 
-the imported module file could not be found. imports are resolved relative
-to the importing file's directory.
-
-```
-error[E234]: module not found: 'utils'
-  1 | import utils
-      ^^^^^^
-```
+the `fail` statement was used in a function that does not return a result type.
 
 ### E235 — import cycle detected
 
@@ -391,6 +384,14 @@ error[E237]: 'secret' is not public in the imported module
   1 | from math import secret
                        ^^^^^^
 ```
+
+### E238 — reserved
+
+reserved for future checker diagnostics. not currently emitted.
+
+### E239 — invalid try context
+
+the `!` operator was used inside a function that does not itself return a result type.
 
 ---
 

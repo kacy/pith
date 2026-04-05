@@ -1,0 +1,200 @@
+from std.json import parse, object_get, get_string, get_int
+
+struct CatalogUser:
+    pub id: Int
+    pub team: String
+    pub region: String
+    pub active: Bool
+    pub score: Int
+    pub quota: Int
+
+mut users: List[CatalogUser] := []
+mut user_index: Map[Int, Int] := {}
+
+fn init_catalog():
+    if users.len() > 0:
+        return
+    teams := ["infra", "payments", "search", "growth", "risk", "core"]
+    regions := ["us-east", "us-west", "eu-central", "ap-south"]
+    mut id := 1
+    while id <= 2048:
+        team := teams[(id * 7) % teams.len()]
+        region := regions[(id * 5) % regions.len()]
+        active := id % 3 != 0
+        score := ((id * 37) % 900) + 100
+        quota := ((id * 13) % 200) + 20
+        users.push(CatalogUser(id, team, region, active, score, quota))
+        user_index.insert(id, users.len() - 1)
+        id = id + 1
+
+fn parse_active_filter(raw: String) -> Int:
+    if raw == "1" or raw == "true":
+        return 1
+    if raw == "0" or raw == "false":
+        return 0
+    return 0 - 1
+
+fn iterations_from_args() -> Int:
+    a := args()
+    if a.len() < 2:
+        return 4000
+    parsed := parse_int(a[1])
+    if parsed.is_err:
+        return 4000
+    value := parsed.ok
+    if value <= 0:
+        return 4000
+    return value
+
+fn bool_int(value: Bool) -> Int:
+    if value:
+        return 1
+    return 0
+
+fn profile_checksum(id: Int) -> Int:
+    if not user_index.contains_key(id):
+        return 0 - 1
+    user := users[user_index[id]]
+    return user.id + user.score + user.quota + user.team.len() * 3 + user.region.len() * 7 + bool_int(user.active)
+
+fn search_checksum(team: String, region: String, active_filter: Int, min_score: Int, limit: Int) -> Int:
+    mut count := 0
+    mut total_score := 0
+    mut quota_sum := 0
+    mut id_sum := 0
+
+    for user in users:
+        if team != "" and user.team != team:
+            continue
+        if region != "" and user.region != region:
+            continue
+        if active_filter == 1 and not user.active:
+            continue
+        if active_filter == 0 and user.active:
+            continue
+        if user.score < min_score:
+            continue
+        count = count + 1
+        total_score = total_score + user.score
+        quota_sum = quota_sum + user.quota
+        if count <= limit:
+            id_sum = id_sum + user.id
+    return count + total_score + quota_sum + id_sum
+
+fn batch_checksum(req_body: String) -> Int:
+    root := parse(req_body)
+    if root < 0:
+        return 0 - 1
+    team := get_string(object_get(root, "team"))
+    region := get_string(object_get(root, "region"))
+    mut min_score := get_int(object_get(root, "min_score"))
+    mut limit := get_int(object_get(root, "limit"))
+    mut multiplier := get_int(object_get(root, "multiplier"))
+    if min_score < 0:
+        min_score = 0
+    if limit <= 0:
+        limit = 10
+    if multiplier <= 0:
+        multiplier = 3
+    active_filter := parse_active_filter(get_string(object_get(root, "active")))
+
+    mut count := 0
+    mut score_sum := 0
+    mut weighted_total := 0
+    mut id_sum := 0
+
+    for user in users:
+        if team != "" and user.team != team:
+            continue
+        if region != "" and user.region != region:
+            continue
+        if active_filter == 1 and not user.active:
+            continue
+        if active_filter == 0 and user.active:
+            continue
+        if user.score < min_score:
+            continue
+        count = count + 1
+        score_sum = score_sum + user.score
+        weighted_total = weighted_total + (user.score * multiplier) + user.quota
+        if count <= limit:
+            id_sum = id_sum + user.id
+    return count + score_sum + weighted_total + id_sum
+
+fn bench_profile(iterations: Int) -> Int:
+    mut total := 0
+    mut i := 0
+    while i < iterations:
+        id := ((i * 17) % 2048) + 1
+        total = total + profile_checksum(id)
+        i = i + 1
+    return total
+
+fn bench_search_hot(iterations: Int) -> Int:
+    mut total := 0
+    mut i := 0
+    while i < iterations:
+        threshold := 300 + ((i * 29) % 350)
+        total = total + search_checksum("infra", "us-west", 1, threshold, 8)
+        i = i + 1
+    return total
+
+fn bench_search_wide(iterations: Int) -> Int:
+    mut total := 0
+    mut i := 0
+    while i < iterations:
+        threshold := 150 + ((i * 11) % 200)
+        total = total + search_checksum("", "eu-central", 0 - 1, threshold, 24)
+        i = i + 1
+    return total
+
+fn bench_batch(iterations: Int) -> Int:
+    mut payload := chr(123) + chr(34) + "team" + chr(34) + ":" + chr(34) + "payments" + chr(34)
+    payload = payload + "," + chr(34) + "region" + chr(34) + ":" + chr(34) + "us-east" + chr(34)
+    payload = payload + "," + chr(34) + "active" + chr(34) + ":" + chr(34) + "1" + chr(34)
+    payload = payload + "," + chr(34) + "min_score" + chr(34) + ":500"
+    payload = payload + "," + chr(34) + "limit" + chr(34) + ":12"
+    payload = payload + "," + chr(34) + "multiplier" + chr(34) + ":4" + chr(125)
+
+    mut total := 0
+    mut i := 0
+    while i < iterations:
+        total = total + batch_checksum(payload)
+        i = i + 1
+    return total
+
+fn main() -> Int:
+    init_catalog()
+    iterations := iterations_from_args()
+    print("catalog workload benchmark")
+    print("users=" + users.len().to_string())
+    print("iterations=" + iterations.to_string())
+
+    total_start := time()
+
+    t0 := time()
+    profile_total := bench_profile(iterations)
+    profile_ms := time() - t0
+
+    t1 := time()
+    hot_total := bench_search_hot(iterations)
+    hot_ms := time() - t1
+
+    t2 := time()
+    wide_total := bench_search_wide(iterations)
+    wide_ms := time() - t2
+
+    t3 := time()
+    batch_total := bench_batch(iterations)
+    batch_ms := time() - t3
+
+    total_ms := time() - total_start
+    checksum := profile_total + hot_total + wide_total + batch_total
+
+    print("profile_ms=" + profile_ms.to_string())
+    print("search_hot_ms=" + hot_ms.to_string())
+    print("search_wide_ms=" + wide_ms.to_string())
+    print("batch_ms=" + batch_ms.to_string())
+    print("total_ms=" + total_ms.to_string())
+    print("checksum=" + checksum.to_string())
+    return 0

@@ -58,3 +58,86 @@ forge build bench/server.fg && mv bench/server bench/server_forge
 # run benchmark
 go run bench/bench.go
 ```
+
+## catalog service benchmark
+
+there is also a more realistic in-memory microservice benchmark:
+
+- `bench/catalog_server.go`
+- `bench/catalog_server.fg`
+- `bench/catalog_bench.go`
+
+this pair serves the same synthetic catalog dataset and exposes:
+
+- `/health` — simple readiness check
+- `/profile?id=123` — single-record lookup
+- `/search?...` — filtered scans and aggregate summaries
+- `POST /batch-score` — JSON body parsing plus aggregate scoring
+
+the goal is to benchmark something closer to a normal Go service:
+request parsing, dataset scans, query filtering, and JSON responses.
+
+running it:
+
+```
+# compile
+go build -o bench/catalog_server_go bench/catalog_server.go
+forge build bench/catalog_server.fg && mv bench/catalog_server bench/catalog_server_forge
+
+# start servers
+./bench/catalog_server_go &     # default port 9101
+./bench/catalog_server_forge &  # default port 9102
+
+# run benchmark
+go run bench/catalog_bench.go
+```
+
+you can also override the ports for ad hoc runs:
+
+```
+./bench/catalog_server_go 9201 &
+./bench/catalog_server_forge 9202 &
+go run bench/catalog_bench.go 9201 9202
+```
+
+## catalog workload benchmark
+
+for a stable service-shaped comparison without socket noise, there is also an
+in-process catalog workload benchmark:
+
+- `bench/catalog_workload.go`
+- `bench/catalog_workload.fg`
+
+this uses the same synthetic dataset and benchmark shape as the catalog service,
+but runs the handler logic directly inside one process:
+
+- profile lookups
+- hot filtered searches
+- wider aggregate scans
+- batch JSON parsing plus score aggregation
+
+running it:
+
+```
+# forge
+forge build bench/catalog_workload.fg
+./bench/catalog_workload 4000
+
+# go
+go run bench/catalog_workload.go 4000
+```
+
+this is the better comparison point today if you want to isolate runtime and
+language costs from the current long-running HTTP server behavior.
+
+a helper runner is also available once both workload binaries are built:
+
+```
+go build -o bench/catalog_workload_go bench/catalog_workload.go
+forge build bench/catalog_workload.fg
+go run bench/catalog_workload_bench.go 10000
+```
+
+note: the live HTTP catalog benchmark is still exploratory on the Forge side.
+the Forge service currently exits after its first successful request, so the
+stable comparison point today is the workload benchmark above.

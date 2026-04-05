@@ -1,0 +1,225 @@
+# forge catalog service benchmark
+#
+# this is meant to look more like a real in-memory service than the simple
+# hello/json/echo benchmark. it keeps a synthetic catalog in memory and serves:
+# - GET /health
+# - GET /profile?id=123
+# - GET /search?... query-driven scans
+# - POST /batch-score with a small JSON body
+
+from std.net.http import read_request, send_response
+from std.net.http import method, path, body, get_query_param
+from std.net.http import text_response, json_response, not_found, method_not_allowed, respond
+from std.json import parse, object_get, get_string, get_int
+from std.env import get_args
+
+struct CatalogUser:
+    pub id: Int
+    pub team: String
+    pub region: String
+    pub active: Bool
+    pub score: Int
+    pub quota: Int
+
+mut users: List[CatalogUser] := []
+mut user_index: Map[Int, Int] := {}
+
+fn bool_json(value: Bool) -> String:
+    if value:
+        return "true"
+    return "false"
+
+fn init_catalog():
+    if users.len() > 0:
+        return
+    teams := ["infra", "payments", "search", "growth", "risk", "core"]
+    regions := ["us-east", "us-west", "eu-central", "ap-south"]
+    mut id := 1
+    while id <= 2048:
+        team := teams[(id * 7) % teams.len()]
+        region := regions[(id * 5) % regions.len()]
+        active := id % 3 != 0
+        score := ((id * 37) % 900) + 100
+        quota := ((id * 13) % 200) + 20
+        users.push(CatalogUser(id, team, region, active, score, quota))
+        user_index.insert(id, users.len() - 1)
+        id = id + 1
+
+fn parse_int_or_default(raw: String, default_value: Int) -> Int:
+    if raw == "":
+        return default_value
+    parsed := parse_int(raw)
+    if parsed.is_err:
+        return default_value
+    value := parsed.ok
+    if value <= 0:
+        return default_value
+    return value
+
+fn parse_active_filter(raw: String) -> Int:
+    if raw == "1" or raw == "true":
+        return 1
+    if raw == "0" or raw == "false":
+        return 0
+    return 0 - 1
+
+fn server_port() -> Int:
+    a := get_args()
+    if a.len() < 2:
+        return 9102
+    parsed := parse_int(a[1])
+    if parsed.is_err:
+        return 9102
+    value := parsed.ok
+    if value <= 0:
+        return 9102
+    return value
+
+fn user_json(user: CatalogUser) -> String:
+    lb := chr(123)
+    rb := chr(125)
+    dq := chr(34)
+    mut body := lb + dq + "id" + dq + ":" + user.id.to_string()
+    body = body + "," + dq + "team" + dq + ":" + dq + user.team + dq
+    body = body + "," + dq + "region" + dq + ":" + dq + user.region + dq
+    body = body + "," + dq + "active" + dq + ":" + bool_json(user.active)
+    body = body + "," + dq + "score" + dq + ":" + user.score.to_string()
+    body = body + "," + dq + "quota" + dq + ":" + user.quota.to_string()
+    return body + rb
+
+fn ids_json(ids: List[Int]) -> String:
+    mut parts: List[String] := []
+    for id in ids:
+        parts.push(id.to_string())
+    return "[" + parts.join(",") + "]"
+
+fn search_json(team: String, region: String, active_filter: Int, min_score: Int, limit: Int) -> String:
+    lb := chr(123)
+    rb := chr(125)
+    dq := chr(34)
+    mut ids: List[Int] := []
+    mut count := 0
+    mut total_score := 0
+    mut quota_sum := 0
+
+    for user in users:
+        if team != "" and user.team != team:
+            continue
+        if region != "" and user.region != region:
+            continue
+        if active_filter == 1 and not user.active:
+            continue
+        if active_filter == 0 and user.active:
+            continue
+        if user.score < min_score:
+            continue
+        count = count + 1
+        total_score = total_score + user.score
+        quota_sum = quota_sum + user.quota
+        if ids.len() < limit:
+            ids.push(user.id)
+    mut body := lb + dq + "count" + dq + ":" + count.to_string()
+    body = body + "," + dq + "total_score" + dq + ":" + total_score.to_string()
+    body = body + "," + dq + "quota_sum" + dq + ":" + quota_sum.to_string()
+    body = body + "," + dq + "ids" + dq + ":" + ids_json(ids)
+    return body + rb
+
+fn batch_score_json(req_body: String) -> String:
+    root := parse(req_body)
+    if root < 0:
+        return ""
+    team := get_string(object_get(root, "team"))
+    region := get_string(object_get(root, "region"))
+    mut min_score := get_int(object_get(root, "min_score"))
+    mut limit := get_int(object_get(root, "limit"))
+    mut multiplier := get_int(object_get(root, "multiplier"))
+
+    if min_score < 0:
+        min_score = 0
+    if limit <= 0:
+        limit = 10
+    if multiplier <= 0:
+        multiplier = 3
+
+    active_filter := parse_active_filter(get_string(object_get(root, "active")))
+    mut ids: List[Int] := []
+    mut count := 0
+    mut weighted_total := 0
+    mut score_sum := 0
+
+    for user in users:
+        if team != "" and user.team != team:
+            continue
+        if region != "" and user.region != region:
+            continue
+        if active_filter == 1 and not user.active:
+            continue
+        if active_filter == 0 and user.active:
+            continue
+        if user.score < min_score:
+            continue
+        count = count + 1
+        score_sum = score_sum + user.score
+        weighted_total = weighted_total + (user.score * multiplier) + user.quota
+        if ids.len() < limit:
+            ids.push(user.id)
+    lb := chr(123)
+    rb := chr(125)
+    dq := chr(34)
+    mut body := lb + dq + "count" + dq + ":" + count.to_string()
+    body = body + "," + dq + "score_sum" + dq + ":" + score_sum.to_string()
+    body = body + "," + dq + "weighted_total" + dq + ":" + weighted_total.to_string()
+    body = body + "," + dq + "ids" + dq + ":" + ids_json(ids)
+    return body + rb
+
+fn handle(fd: Int) -> Int!:
+    tcp_set_timeout(fd, 1000)
+    req := read_request(fd)!
+    m := method(req)
+    p := path(req)
+
+    if m == "GET" and p == "/health":
+        return send_response(fd, text_response(200, "ok"))
+
+    if m == "GET" and p == "/profile":
+        id := parse_int_or_default(get_query_param(req, "id"), 1)
+        if not user_index.contains_key(id):
+            return send_response(fd, not_found())
+        idx := user_index[id]
+        return send_response(fd, json_response(200, user_json(users[idx])))
+
+    if m == "GET" and p == "/search":
+        team := get_query_param(req, "team")
+        region := get_query_param(req, "region")
+        active_filter := parse_active_filter(get_query_param(req, "active"))
+        min_score := parse_int_or_default(get_query_param(req, "min_score"), 0)
+        limit := parse_int_or_default(get_query_param(req, "limit"), 10)
+        return send_response(fd, json_response(200, search_json(team, region, active_filter, min_score, limit)))
+
+    if m == "POST" and p == "/batch-score":
+        response_body := batch_score_json(body(req))
+        if response_body == "":
+            dq := chr(34)
+            bad := chr(123) + dq + "error" + dq + ":" + dq + "bad json" + dq + chr(125)
+            return send_response(fd, respond(400, "application/json", bad))
+        return send_response(fd, json_response(200, response_body))
+
+    if p == "/batch-score":
+        return send_response(fd, method_not_allowed())
+
+    return send_response(fd, not_found())
+
+fn main() -> Int!:
+    init_catalog()
+    port := server_port()
+    print("forge catalog server on :" + port.to_string())
+    listen_result := tcp_listen("0.0.0.0", port)
+    if listen_result.is_err:
+        print("failed to listen")
+        return 1
+    fd := listen_result.ok
+    while true:
+        client := tcp_accept(fd)
+        if client.is_ok:
+            handle(client.ok)!
+    return 0

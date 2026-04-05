@@ -7,6 +7,7 @@
 
 from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_count, load_tokens, load_token_snapshot
 from ast import Node, add_node, add_leaf, get_node
+from errors import Diagnostic
 
 # ---------------------------------------------------------------
 # parser state
@@ -15,6 +16,8 @@ from ast import Node, add_node, add_leaf, get_node
 mut current_token_position := 0
 mut recursion_depth := 0
 mut max_depth := 256
+mut parser_file_path := ""
+mut parser_diag_list: List[Diagnostic] := []
 
 fn _cur_tok_kind() -> String:
     tc := tok_count()
@@ -75,6 +78,39 @@ fn get_current_position() -> (Int, Int):
     if tc > 0:
         return (tok_line(tc - 1), tok_col(tc - 1))
     return (0, 0)
+
+fn get_previous_position() -> (Int, Int):
+    tc := tok_count()
+    if tc == 0:
+        return (0, 0)
+    if current_token_position <= 0:
+        return (tok_line(0), tok_col(0))
+    mut i := current_token_position - 1
+    while i >= 0:
+        if tok_kind(i) != "comment":
+            return (tok_line(i), tok_col(i))
+        if i == 0:
+            break
+        i = i - 1
+    return (tok_line(0), tok_col(0))
+
+fn parser_report_error_at(line: Int, col: Int, code: String, message: String, fix: String):
+    parser_diag_list.push(Diagnostic("error", code, message, parser_file_path, line, col, fix))
+
+fn parser_report_error_here(code: String, message: String, fix: String):
+    mut pos := get_current_position()
+    if _cur_tok_kind() == "eof":
+        pos = get_previous_position()
+    parser_report_error_at(pos.0, pos.1, code, message, fix)
+
+fn parser_report_lexer_error_here():
+    parser_report_error_here("E243", _cur_tok_value(), "")
+
+pub fn parser_diagnostics() -> List[Diagnostic]:
+    return parser_diag_list
+
+pub fn parser_has_errors() -> Bool:
+    return parser_diag_list.len() > 0
 
 # Wrapper that adds node with current position
 fn add_node_with_position(kind: String, value: String, children: List[Int]) -> Int:
@@ -153,12 +189,20 @@ fn match_tok(kind: String) -> Bool:
 
 fn expect(kind: String) -> Token:
     # token via _cur_tok_kind/_cur_tok_value
-    if _cur_tok_kind() == kind:
+    cur_kind := _cur_tok_kind()
+    if cur_kind == kind:
         return advance_token()
-    # error — create error node and return current token
-    # TODO: add proper error reporting with line/column info
-    add_leaf_with_position("error", "expected " + kind + " but found " + _cur_tok_kind())
-    return advance_token()
+    mut pos := get_current_position()
+    if cur_kind == "eof":
+        pos = get_previous_position()
+        parser_report_error_at(pos.0, pos.1, "E241", "unexpected end of file, expected " + kind, "")
+        return Token(kind, "", pos.0, pos.1)
+    if cur_kind == "err":
+        parser_report_lexer_error_here()
+    else:
+        parser_report_error_at(pos.0, pos.1, "E240", "expected " + kind + " but found " + cur_kind, "")
+    advance_token()
+    return Token(kind, "", pos.0, pos.1)
 
 fn skip_newlines():
     while _cur_tok_kind() == "newline":
@@ -262,6 +306,7 @@ fn parse_tuple_type() -> Int:
 
 pub fn parse_expression() -> Int:
     if recursion_depth >= max_depth:
+        parser_report_error_here("E242", "expression nesting too deep", "")
         return add_leaf_with_position("error", "max recursion_depth exceeded")
     recursion_depth = recursion_depth + 1
     left := parse_or_expression()
@@ -561,6 +606,12 @@ fn parse_primary() -> Int:
         return parse_lambda()
 
     # unexpected token — skip it
+    if _cur_tok_kind() == "err":
+        parser_report_lexer_error_here()
+    elif _cur_tok_kind() == "eof":
+        parser_report_error_here("E241", "unexpected end of file while parsing expression", "")
+    else:
+        parser_report_error_here("E242", "unexpected token in expression: " + _cur_tok_kind(), "")
     _tv := _cur_tok_value()
     advance_token()
     return add_leaf_with_position("error", _tv)
@@ -739,6 +790,7 @@ fn parse_lambda() -> Int:
         children.push(body)
         return add_node_with_position("lambda", "", children)
 
+    parser_report_error_here("E240", "expected fat_arrow or colon after lambda parameters", "")
     return add_leaf_with_position("error", "expected => or : after lambda params")
 
 fn parse_lambda_params() -> List[Int]:
@@ -911,6 +963,12 @@ fn parse_pattern() -> Int:
         return add_node_with_position("pat_tuple", "", patterns)
 
     # unexpected — advance to avoid infinite loop
+    if _cur_tok_kind() == "err":
+        parser_report_lexer_error_here()
+    elif _cur_tok_kind() == "eof":
+        parser_report_error_here("E241", "unexpected end of file while parsing pattern", "")
+    else:
+        parser_report_error_here("E242", "unexpected token in pattern: " + _cur_tok_kind(), "")
     advance_token()
     return add_leaf_with_position("pat_wildcard", "_")
 
@@ -927,6 +985,7 @@ fn parse_block() -> Int:
         before := current_token_position
         stmts.push(parse_statement())
         if current_token_position == before:
+            parser_report_error_here("E242", "parser stalled in block", "")
             stmts.push(add_leaf_with_position("error", "parser stalled in block"))
             advance_token()
         skip_newlines()
@@ -1114,9 +1173,14 @@ fn parse_fail_stmt() -> Int:
 # ---------------------------------------------------------------
 
 pub fn parse(token_list: List[Token]) -> Int:
+    return parse_with_file(token_list, "")
+
+pub fn parse_with_file(token_list: List[Token], file_path: String) -> Int:
     load_tokens(token_list)
     current_token_position = 0
     recursion_depth = 0
+    parser_file_path = file_path
+    parser_diag_list = []
 
     mut imports: List[Int] := []
     mut decls: List[Int] := []
@@ -1128,6 +1192,7 @@ pub fn parse(token_list: List[Token]) -> Int:
         before := current_token_position
         imports.push(parse_import_decl())
         if current_token_position == before:
+            parser_report_error_here("E242", "parser stalled in import", "")
             imports.push(add_leaf_with_position("error", "parser stalled in import"))
             advance_token()
         skip_newlines()
@@ -1139,6 +1204,7 @@ pub fn parse(token_list: List[Token]) -> Int:
             before := current_token_position
             decls.push(parse_top_level_decl())
             if current_token_position == before:
+                parser_report_error_here("E242", "parser stalled at top level", "")
                 decls.push(add_leaf_with_position("error", "parser stalled at top level"))
                 advance_token()
             skip_newlines()
@@ -1234,9 +1300,14 @@ fn parse_top_level_decl() -> Int:
         elif _peek_ahead_kind(1) == "colon" and looks_like_binding():
             decl = parse_binding()
         else:
+            parser_report_error_here("E242", "expected declaration", "")
             advance_token()
             decl = add_leaf_with_position("error", "expected declaration")
     else:
+        if cur_kind == "err":
+            parser_report_lexer_error_here()
+        else:
+            parser_report_error_here("E242", "expected declaration", "")
         advance_token()
         decl = add_leaf_with_position("error", "expected declaration")
 

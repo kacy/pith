@@ -1,7 +1,8 @@
-.PHONY: build self-host bootstrap bootstrap-verify run-examples parity-examples parity-examples-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only test clean
+.PHONY: build self-host bootstrap bootstrap-verify run-examples parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
+PARSE_INVALID_EXAMPLES := $(wildcard examples/invalid_parse/*.fg)
 INVALID_EXAMPLES := $(wildcard examples/invalid/*.fg)
 PARITY_EXAMPLES := \
 	hello \
@@ -103,6 +104,86 @@ parity-examples-only:
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all parity examples passed"
 
+check-parse-invalid: build check-parse-invalid-only
+
+check-parse-invalid-only:
+	@echo "--- invalid parse examples (parser diagnostics) ---"
+	@pass=0; fail=0; \
+	for f in $(PARSE_INVALID_EXAMPLES); do \
+		name=$$(basename "$$f" .fg); \
+		expected_file="examples/invalid_parse/expected/$$name.codes"; \
+		if [ ! -f "$$expected_file" ]; then \
+			echo "FAIL $$name (missing $$expected_file)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		set +e; \
+		output=$$(timeout 15 ./target/release/forge parse "$$f" 2>&1); \
+		status=$$?; \
+		set -e; \
+		if [ $$status -eq 0 ]; then \
+			echo "FAIL $$name (unexpected success)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		actual=$$(printf "%s\n" "$$output" | grep -o 'E[0-9][0-9][0-9]' | sort -u || true); \
+		expected=$$(sort "$$expected_file"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			echo "expected:"; \
+			printf "%s\n" "$$expected"; \
+			echo "actual:"; \
+			printf "%s\n" "$$actual"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all invalid parse examples passed"
+
+check-parse-invalid-self-host: self-host check-parse-invalid-self-host-only
+
+check-parse-invalid-self-host-only:
+	@echo "--- invalid parse examples (self-hosted parser diagnostics) ---"
+	@pass=0; fail=0; \
+	for f in $(PARSE_INVALID_EXAMPLES); do \
+		name=$$(basename "$$f" .fg); \
+		expected_file="examples/invalid_parse/expected/$$name.codes"; \
+		if [ ! -f "$$expected_file" ]; then \
+			echo "FAIL $$name (missing $$expected_file)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		set +e; \
+		output=$$(timeout 15 ./self-host/forge_main parse "$$f" 2>&1); \
+		status=$$?; \
+		set -e; \
+		if [ $$status -eq 0 ]; then \
+			echo "FAIL $$name (unexpected success)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		actual=$$(printf "%s\n" "$$output" | grep -o 'E[0-9][0-9][0-9]' | sort -u || true); \
+		expected=$$(sort "$$expected_file"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			echo "expected:"; \
+			printf "%s\n" "$$expected"; \
+			echo "actual:"; \
+			printf "%s\n" "$$actual"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all self-host invalid parse examples passed"
+
 check-invalid: build check-invalid-only
 
 check-invalid-only:
@@ -202,15 +283,19 @@ test: build
 	done; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi
-	@echo "=== Step 2: run invalid checker examples ==="
+	@echo "=== Step 2: run invalid parse examples ==="
+	@$(MAKE) --no-print-directory check-parse-invalid-only
+	@echo "=== Step 3: run invalid checker examples ==="
 	@$(MAKE) --no-print-directory check-invalid-only
-	@echo "=== Step 3: build self-hosted compiler via Cranelift ==="
+	@echo "=== Step 4: build self-hosted compiler via Cranelift ==="
 	./target/release/forge build self-host/forge_main.fg
-	@echo "=== Step 4: compare native and self-hosted example outputs ==="
+	@echo "=== Step 5: run invalid parse examples through self-hosted parser ==="
+	@$(MAKE) --no-print-directory check-parse-invalid-self-host-only
+	@echo "=== Step 6: compare native and self-hosted example outputs ==="
 	@$(MAKE) --no-print-directory parity-examples-only
-	@echo "=== Step 5: run invalid examples through self-hosted checker ==="
+	@echo "=== Step 7: run invalid examples through self-hosted checker ==="
 	@$(MAKE) --no-print-directory check-invalid-self-host-only
-	@echo "=== Step 6: self-hosted compiler works ==="
+	@echo "=== Step 8: self-hosted compiler works ==="
 	./self-host/forge_main version
 	./self-host/forge_main lex examples/hello.fg > /dev/null
 	./self-host/forge_main parse examples/hello.fg > /dev/null

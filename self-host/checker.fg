@@ -15,19 +15,7 @@
 from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, get_type_count, register_type_name, lookup_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
 from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
-
-# ---------------------------------------------------------------
-# diagnostics
-# ---------------------------------------------------------------
-
-pub struct Diagnostic:
-    pub severity: String
-    pub code: String
-    pub message: String
-    pub file: String
-    pub line: Int
-    pub col: Int
-    pub fix: String
+from errors import Diagnostic, render_diagnostics_json
 
 mut checker_diagnostics: List[Diagnostic] := []
 mut current_file_path: String := ""
@@ -184,13 +172,13 @@ pub fn collect_module_exports(module_path: String, root_idx: Int):
             if node.children.len() > 0:
                 inner := get_node(node.children[0])
                 if inner.kind == "fn_decl":
-                    module_export_entries.push(module_path + "\t" + inner.value)
+                    module_export_entries.push(module_path + chr(9) + inner.value)
                 elif inner.kind == "struct_decl":
-                    module_export_entries.push(module_path + "\t" + inner.value)
+                    module_export_entries.push(module_path + chr(9) + inner.value)
                 elif inner.kind == "enum_decl":
-                    module_export_entries.push(module_path + "\t" + inner.value)
+                    module_export_entries.push(module_path + chr(9) + inner.value)
                 elif inner.kind == "type_alias":
-                    module_export_entries.push(module_path + "\t" + inner.value)
+                    module_export_entries.push(module_path + chr(9) + inner.value)
                 elif inner.kind == "binding":
                     # Extract binding name from value (format: "name mut" or "name")
                     mut name_end := inner.value.len()
@@ -201,7 +189,7 @@ pub fn collect_module_exports(module_path: String, root_idx: Int):
                             break
                         si = si + 1
                     binding_name := inner.value.substring(0, name_end)
-                    module_export_entries.push(module_path + "\t" + binding_name)
+                    module_export_entries.push(module_path + chr(9) + binding_name)
 
 fn register_builtin_types():
     tid_int := lookup_type_id("Int")
@@ -862,7 +850,7 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             concrete_name = get_type_node_name(for_inner)
             method_start = 2
             # record in impl set
-            key := concrete_name + "\t" + interface_name
+            key := concrete_name + chr(9) + interface_name
             implementation_set.insert(key, 1)
         else:
             concrete_name = get_type_node_name(first_type_node)
@@ -897,7 +885,7 @@ fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_
     register_method_signature(key, node_idx, is_pub)
 
 fn check_type_implements_interface(type_name: String, iface_name: String) -> Bool:
-    key := type_name + "\t" + iface_name
+    key := type_name + chr(9) + iface_name
     return implementation_set.contains_key(key)
 
 fn has_interface_declaration(name: String) -> Bool:
@@ -3358,44 +3346,4 @@ pub fn c_run_module(root_idx: Int) -> List[Diagnostic]:
     return checker_diagnostics
 
 pub fn c_diagnostics_to_json(diags: List[Diagnostic]) -> String:
-    if diags.len() == 0:
-        return "[]"
-    lb := chr(123)
-    rb := chr(125)
-    mut result := "["
-    mut first := true
-    for d in diags:
-        if first == false:
-            result = result + ","
-        first = false
-        mut fix_part := ""
-        if d.fix.len() > 0:
-            fix_part = ",\"fix\":\"" + json_string_escape(d.fix) + "\""
-        mut file_part := ""
-        if d.file.len() > 0:
-            file_part = ",\"file\":\"" + json_string_escape(d.file) + "\""
-        mut entry := lb + "\"severity\":\"" + d.severity + "\""
-        entry = entry + ",\"code\":\"" + d.code + "\""
-        entry = entry + ",\"message\":\"" + json_string_escape(d.message) + "\""
-        entry = entry + ",\"line\":" + d.line.to_string()
-        entry = entry + ",\"col\":" + d.col.to_string()
-        entry = entry + file_part + fix_part + rb
-        result = result + entry
-    result = result + "]"
-    return result
-
-fn json_string_escape(s: String) -> String:
-    mut result := ""
-    mut i := 0
-    while i < s.len():
-        ch := s[i]
-        if ch == "\"":
-            result = result + "\\\""
-        elif ch == chr(92):
-            result = result + "\\\\"
-        elif ch == chr(10):
-            result = result + "\\n"
-        else:
-            result = result + ch
-        i = i + 1
-    return result
+    return render_diagnostics_json(diags)

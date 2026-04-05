@@ -1,13 +1,18 @@
 from lexer import lex_all
-from parser import parse
+from parser import parse_with_file, parser_diagnostics, parser_has_errors
 from ast import reset_arena
 from ir_emitter import emit_ir
+from errors import render_diagnostics
 
 fn emit_file() -> String!:
-    source := read_file(args()[1])!
+    path := args()[1]
+    source := read_file(path)!
     tokens := lex_all(source)
     reset_arena()
-    root := parse(tokens)
+    root := parse_with_file(tokens, path)
+    if parser_has_errors():
+        print(render_diagnostics(parser_diagnostics(), source))
+        exit(1)
     ir := emit_ir(root)
     print(ir)
     return ""

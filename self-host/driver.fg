@@ -4,9 +4,10 @@
 # used by both codegen_main.fg and forge_main.fg.
 
 from lexer import lex_all
-from parser import parse
+from parser import parse, parse_with_file, parser_diagnostics, parser_has_errors
 from ast import get_node, reset_arena
 from checker import initialize_checker, c_run_module
+from errors import Diagnostic
 # note: codegen removed — compilation handled by Cranelift native backend
 
 # extract directory from a file path.
@@ -77,6 +78,7 @@ mut files_being_checked: Map[String, Bool] := {}
 
 # stdlib root - set by compile_to_c before resolving imports
 mut stdlib_root_directory: String := ""
+mut driver_parse_diagnostics: List[Diagnostic] := []
 
 # convert a dotted module path to a file path segment.
 # "std.math" -> "std/math", "foo" -> "foo"
@@ -113,6 +115,8 @@ fn dr_find_stdlib_root(source_path: String) -> String:
 # returns module roots in dependency order (leaves first).
 pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
     mut roots: List[Int] := []
+    if driver_parse_diagnostics.len() > 0:
+        return roots
     dir := get_directory(source_path)
     imports := find_imports(root_idx)
     for mod_path in imports:
@@ -150,8 +154,13 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
         visited_files.insert(file_path, true)
         content := read_file(file_path)!
         tokens := lex_all(content)
-        mod_root := parse(tokens)
+        mod_root := parse_with_file(tokens, file_path)
+        if parser_has_errors():
+            driver_parse_diagnostics = parser_diagnostics()
+            return roots
         sub_roots := resolve_imports(mod_root, file_path)!
+        if driver_parse_diagnostics.len() > 0:
+            return roots
         files_being_checked.remove(file_path)
         for sr in sub_roots:
             roots.push(sr)
@@ -168,7 +177,14 @@ pub fn init_driver(source_path: String):
     stdlib_root_directory = dr_find_stdlib_root(source_path)
     visited_files = {}
     files_being_checked = {}
+    driver_parse_diagnostics = []
     mark_visited(source_path)
+
+pub fn get_driver_parse_diagnostics() -> List[Diagnostic]:
+    return driver_parse_diagnostics
+
+pub fn driver_has_parse_errors() -> Bool:
+    return driver_parse_diagnostics.len() > 0
 
 # run the full compile pipeline: lex, parse, resolve imports, check, codegen.
 # compile_to_c removed — compilation is now handled by the Cranelift native backend.

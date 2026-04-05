@@ -393,6 +393,23 @@ reserved for future checker diagnostics. not currently emitted.
 
 the `!` operator was used inside a function that does not itself return a result type.
 
+### E240 — expected token
+
+the parser expected a specific token but encountered a different one.
+
+### E241 — unexpected end of file
+
+the parser reached the end of the file before a required token or block terminator appeared.
+
+### E242 — invalid syntax
+
+the parser encountered a token sequence that does not form a valid expression,
+pattern, or declaration.
+
+### E243 — lexer error
+
+the lexer produced an invalid token, such as an unterminated string literal.
+
 ---
 
 ## lint errors (E3xx)

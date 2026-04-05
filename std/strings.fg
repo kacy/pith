@@ -103,6 +103,29 @@ pub fn is_whitespace(s: String) -> Bool:
 pub fn is_blank(s: String) -> Bool:
     return is_whitespace(s)
 
+# Finds substr in s starting at the given offset. Returns -1 if not found.
+fn index_of_from(s: String, substr: String, start: Int) -> Int:
+    if substr.len() == 0:
+        return start
+    mut start := start
+    if start < 0:
+        start = 0
+    if start >= s.len():
+        return 0 - 1
+    mut i := start
+    while i + substr.len() <= s.len():
+        mut matches := true
+        mut j := 0
+        while j < substr.len():
+            if s[i + j] != substr[j]:
+                matches = false
+                j = substr.len()
+            j = j + 1
+        if matches:
+            return i
+        i = i + 1
+    return 0 - 1
+
 # ---------------------------------------------------------------
 # Trim Variants
 # ---------------------------------------------------------------
@@ -185,8 +208,8 @@ pub fn count(s: String, substr: String) -> Int:
     mut result := 0
     mut pos := 0
     while pos < s.len():
-        mut found_pos := s.index_of(substr)
-        if found_pos < pos:
+        mut found_pos := index_of_from(s, substr, pos)
+        if found_pos < 0:
             # No more occurrences
             break
         result = result + 1
@@ -495,8 +518,8 @@ pub fn find_all(s: String, substr: String) -> List[Int]:
     mut result: List[Int] := []
     mut pos := 0
     while pos < s.len():
-        mut found := s.index_of(substr)
-        if found < pos:
+        mut found := index_of_from(s, substr, pos)
+        if found < 0:
             break
         result.push(found)
         pos = found + substr.len()

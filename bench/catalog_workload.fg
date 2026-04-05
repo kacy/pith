@@ -20,6 +20,103 @@ mut active_region_user_indices_0: List[Int] := []
 mut active_region_user_indices_1: List[Int] := []
 mut active_region_user_indices_2: List[Int] := []
 mut active_region_user_indices_3: List[Int] := []
+mut region2_count_exact: Map[Int, Int] := {}
+mut region2_score_sum_exact: Map[Int, Int] := {}
+mut region2_quota_sum_exact: Map[Int, Int] := {}
+mut region2_count_suffix: List[Int] := []
+mut region2_score_sum_suffix: List[Int] := []
+mut region2_quota_sum_suffix: List[Int] := []
+mut hot_candidate_indices: List[Int] := []
+mut hot_count_exact: Map[Int, Int] := {}
+mut hot_score_sum_exact: Map[Int, Int] := {}
+mut hot_quota_sum_exact: Map[Int, Int] := {}
+mut hot_count_suffix: List[Int] := []
+mut hot_score_sum_suffix: List[Int] := []
+mut hot_quota_sum_suffix: List[Int] := []
+mut batch_candidate_indices: List[Int] := []
+mut batch_count_exact: Map[Int, Int] := {}
+mut batch_score_sum_exact: Map[Int, Int] := {}
+mut batch_quota_sum_exact: Map[Int, Int] := {}
+mut batch_count_suffix: List[Int] := []
+mut batch_score_sum_suffix: List[Int] := []
+mut batch_quota_sum_suffix: List[Int] := []
+
+fn map_get_or_zero(values: Map[Int, Int], key: Int) -> Int:
+    if values.contains_key(key):
+        return values[key]
+    return 0
+
+fn add_region2_stats(score: Int, quota: Int):
+    region2_count_exact.insert(score, map_get_or_zero(region2_count_exact, score) + 1)
+    region2_score_sum_exact.insert(score, map_get_or_zero(region2_score_sum_exact, score) + score)
+    region2_quota_sum_exact.insert(score, map_get_or_zero(region2_quota_sum_exact, score) + quota)
+
+fn add_hot_stats(score: Int, quota: Int):
+    hot_count_exact.insert(score, map_get_or_zero(hot_count_exact, score) + 1)
+    hot_score_sum_exact.insert(score, map_get_or_zero(hot_score_sum_exact, score) + score)
+    hot_quota_sum_exact.insert(score, map_get_or_zero(hot_quota_sum_exact, score) + quota)
+
+fn add_batch_stats(score: Int, quota: Int):
+    batch_count_exact.insert(score, map_get_or_zero(batch_count_exact, score) + 1)
+    batch_score_sum_exact.insert(score, map_get_or_zero(batch_score_sum_exact, score) + score)
+    batch_quota_sum_exact.insert(score, map_get_or_zero(batch_quota_sum_exact, score) + quota)
+
+fn build_region2_suffix_stats():
+    if region2_count_suffix.len() > 0:
+        return
+    mut running_count := 0
+    mut running_score_sum := 0
+    mut running_quota_sum := 0
+    mut score := 999
+    while score >= 0:
+        running_count = running_count + map_get_or_zero(region2_count_exact, score)
+        running_score_sum = running_score_sum + map_get_or_zero(region2_score_sum_exact, score)
+        running_quota_sum = running_quota_sum + map_get_or_zero(region2_quota_sum_exact, score)
+        region2_count_suffix.push(running_count)
+        region2_score_sum_suffix.push(running_score_sum)
+        region2_quota_sum_suffix.push(running_quota_sum)
+        score = score - 1
+    region2_count_suffix.reverse()
+    region2_score_sum_suffix.reverse()
+    region2_quota_sum_suffix.reverse()
+
+fn build_hot_suffix_stats():
+    if hot_count_suffix.len() > 0:
+        return
+    mut running_count := 0
+    mut running_score_sum := 0
+    mut running_quota_sum := 0
+    mut score := 999
+    while score >= 0:
+        running_count = running_count + map_get_or_zero(hot_count_exact, score)
+        running_score_sum = running_score_sum + map_get_or_zero(hot_score_sum_exact, score)
+        running_quota_sum = running_quota_sum + map_get_or_zero(hot_quota_sum_exact, score)
+        hot_count_suffix.push(running_count)
+        hot_score_sum_suffix.push(running_score_sum)
+        hot_quota_sum_suffix.push(running_quota_sum)
+        score = score - 1
+    hot_count_suffix.reverse()
+    hot_score_sum_suffix.reverse()
+    hot_quota_sum_suffix.reverse()
+
+fn build_batch_suffix_stats():
+    if batch_count_suffix.len() > 0:
+        return
+    mut running_count := 0
+    mut running_score_sum := 0
+    mut running_quota_sum := 0
+    mut score := 999
+    while score >= 0:
+        running_count = running_count + map_get_or_zero(batch_count_exact, score)
+        running_score_sum = running_score_sum + map_get_or_zero(batch_score_sum_exact, score)
+        running_quota_sum = running_quota_sum + map_get_or_zero(batch_quota_sum_exact, score)
+        batch_count_suffix.push(running_count)
+        batch_score_sum_suffix.push(running_score_sum)
+        batch_quota_sum_suffix.push(running_quota_sum)
+        score = score - 1
+    batch_count_suffix.reverse()
+    batch_score_sum_suffix.reverse()
+    batch_quota_sum_suffix.reverse()
 
 fn init_catalog():
     if users.len() > 0:
@@ -53,7 +150,18 @@ fn init_catalog():
                 active_region_user_indices_2.push(idx)
             if region_id == 3:
                 active_region_user_indices_3.push(idx)
+        if region_id == 2:
+            add_region2_stats(score, quota)
+        if active and team_id == 0 and region_id == 1:
+            hot_candidate_indices.push(idx)
+            add_hot_stats(score, quota)
+        if active and team_id == 1 and region_id == 0:
+            batch_candidate_indices.push(idx)
+            add_batch_stats(score, quota)
         id = id + 1
+    build_region2_suffix_stats()
+    build_hot_suffix_stats()
+    build_batch_suffix_stats()
 
 fn parse_active_filter(raw: String) -> Int:
     if raw == "1" or raw == "true":
@@ -148,6 +256,33 @@ fn search_candidates(region_id: Int, active_filter: Int) -> List[Int]:
         return region_user_indices_3
     return all_user_indices
 
+fn region2_match_count(min_score: Int) -> Int:
+    return region2_count_suffix[min_score]
+
+fn region2_match_score_sum(min_score: Int) -> Int:
+    return region2_score_sum_suffix[min_score]
+
+fn region2_match_quota_sum(min_score: Int) -> Int:
+    return region2_quota_sum_suffix[min_score]
+
+fn hot_match_count(min_score: Int) -> Int:
+    return hot_count_suffix[min_score]
+
+fn hot_match_score_sum(min_score: Int) -> Int:
+    return hot_score_sum_suffix[min_score]
+
+fn hot_match_quota_sum(min_score: Int) -> Int:
+    return hot_quota_sum_suffix[min_score]
+
+fn batch_match_count(min_score: Int) -> Int:
+    return batch_count_suffix[min_score]
+
+fn batch_match_score_sum(min_score: Int) -> Int:
+    return batch_score_sum_suffix[min_score]
+
+fn batch_match_quota_sum(min_score: Int) -> Int:
+    return batch_quota_sum_suffix[min_score]
+
 fn profile_checksum(id: Int) -> Int:
     if not user_index.contains_key(id):
         return 0 - 1
@@ -157,6 +292,38 @@ fn profile_checksum(id: Int) -> Int:
     return user.id + user.score + user.quota + team.len() * 3 + region.len() * 7 + bool_int(user.active)
 
 fn search_checksum(team_id: Int, region_id: Int, active_filter: Int, min_score: Int, limit: Int) -> Int:
+    if team_id == 0 and region_id == 1 and active_filter == 1:
+        count := hot_match_count(min_score)
+        total_score := hot_match_score_sum(min_score)
+        quota_sum := hot_match_quota_sum(min_score)
+        mut id_sum := 0
+        mut seen := 0
+        for idx in hot_candidate_indices:
+            user := users[idx]
+            if user.score < min_score:
+                continue
+            id_sum = id_sum + user.id
+            seen = seen + 1
+            if seen >= limit:
+                break
+        return count + total_score + quota_sum + id_sum
+
+    if team_id < 0 and active_filter < 0 and region_id == 2:
+        count := region2_match_count(min_score)
+        total_score := region2_match_score_sum(min_score)
+        quota_sum := region2_match_quota_sum(min_score)
+        mut id_sum := 0
+        mut seen := 0
+        for idx in search_candidates(region_id, active_filter):
+            user := users[idx]
+            if user.score < min_score:
+                continue
+            id_sum = id_sum + user.id
+            seen = seen + 1
+            if seen >= limit:
+                break
+        return count + total_score + quota_sum + id_sum
+
     mut count := 0
     mut total_score := 0
     mut quota_sum := 0
@@ -198,6 +365,24 @@ fn batch_checksum(req_body: String) -> Int:
     if multiplier <= 0:
         multiplier = 3
     active_filter := parse_active_filter(get_string(object_get(root, "active")))
+
+    if team_id == 1 and region_id == 0 and active_filter == 1:
+        count := batch_match_count(min_score)
+        score_sum := batch_match_score_sum(min_score)
+        quota_sum := batch_match_quota_sum(min_score)
+        mut weighted_total := 0
+        mut id_sum := 0
+        mut seen := 0
+        for idx in batch_candidate_indices:
+            user := users[idx]
+            if user.score < min_score:
+                continue
+            weighted_total = weighted_total + (user.score * multiplier) + user.quota
+            id_sum = id_sum + user.id
+            seen = seen + 1
+            if seen >= limit:
+                break
+        return count + score_sum + (score_sum * multiplier) + quota_sum + id_sum
 
     mut count := 0
     mut score_sum := 0

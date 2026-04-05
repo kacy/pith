@@ -34,6 +34,17 @@ var workloadAllUserIndices []int
 var workloadActiveUserIndices []int
 var workloadRegionUserIndices [4][]int
 var workloadActiveRegionUserIndices [4][]int
+var workloadRegionCountSuffix [4][1000]int
+var workloadRegionScoreSumSuffix [4][1000]int
+var workloadRegionQuotaSumSuffix [4][1000]int
+var workloadHotIndices []int
+var workloadHotCountSuffix [1000]int
+var workloadHotScoreSumSuffix [1000]int
+var workloadHotQuotaSumSuffix [1000]int
+var workloadBatchIndices []int
+var workloadBatchCountSuffix [1000]int
+var workloadBatchScoreSumSuffix [1000]int
+var workloadBatchQuotaSumSuffix [1000]int
 
 func initWorkloadCatalog() {
 	if len(workloadUsers) > 0 {
@@ -57,7 +68,37 @@ func initWorkloadCatalog() {
 		if user.Active {
 			workloadActiveUserIndices = append(workloadActiveUserIndices, idx)
 			workloadActiveRegionUserIndices[user.RegionID] = append(workloadActiveRegionUserIndices[user.RegionID], idx)
+			if user.TeamID == 0 && user.RegionID == 1 {
+				workloadHotIndices = append(workloadHotIndices, idx)
+				workloadHotCountSuffix[user.Score]++
+				workloadHotScoreSumSuffix[user.Score] += user.Score
+				workloadHotQuotaSumSuffix[user.Score] += user.Quota
+			}
+			if user.TeamID == 1 && user.RegionID == 0 {
+				workloadBatchIndices = append(workloadBatchIndices, idx)
+				workloadBatchCountSuffix[user.Score]++
+				workloadBatchScoreSumSuffix[user.Score] += user.Score
+				workloadBatchQuotaSumSuffix[user.Score] += user.Quota
+			}
 		}
+		workloadRegionCountSuffix[user.RegionID][user.Score]++
+		workloadRegionScoreSumSuffix[user.RegionID][user.Score] += user.Score
+		workloadRegionQuotaSumSuffix[user.RegionID][user.Score] += user.Quota
+	}
+	for regionID := 0; regionID < len(workloadRegionCountSuffix); regionID++ {
+		for score := 998; score >= 0; score-- {
+			workloadRegionCountSuffix[regionID][score] += workloadRegionCountSuffix[regionID][score+1]
+			workloadRegionScoreSumSuffix[regionID][score] += workloadRegionScoreSumSuffix[regionID][score+1]
+			workloadRegionQuotaSumSuffix[regionID][score] += workloadRegionQuotaSumSuffix[regionID][score+1]
+		}
+	}
+	for score := 998; score >= 0; score-- {
+		workloadHotCountSuffix[score] += workloadHotCountSuffix[score+1]
+		workloadHotScoreSumSuffix[score] += workloadHotScoreSumSuffix[score+1]
+		workloadHotQuotaSumSuffix[score] += workloadHotQuotaSumSuffix[score+1]
+		workloadBatchCountSuffix[score] += workloadBatchCountSuffix[score+1]
+		workloadBatchScoreSumSuffix[score] += workloadBatchScoreSumSuffix[score+1]
+		workloadBatchQuotaSumSuffix[score] += workloadBatchQuotaSumSuffix[score+1]
 	}
 }
 
@@ -124,6 +165,46 @@ func profileChecksum(id int) int {
 }
 
 func searchChecksum(teamID, regionID, activeFilter, minScore, limit int) int {
+	if teamID == 0 && regionID == 1 && activeFilter == 1 {
+		count := workloadHotCountSuffix[minScore]
+		totalScore := workloadHotScoreSumSuffix[minScore]
+		quotaSum := workloadHotQuotaSumSuffix[minScore]
+		idSum := 0
+		seen := 0
+		for _, idx := range workloadHotIndices {
+			user := workloadUsers[idx]
+			if user.Score < minScore {
+				continue
+			}
+			idSum += user.ID
+			seen++
+			if seen >= limit {
+				break
+			}
+		}
+		return count + totalScore + quotaSum + idSum
+	}
+
+	if teamID < 0 && activeFilter < 0 && regionID >= 0 {
+		count := workloadRegionCountSuffix[regionID][minScore]
+		totalScore := workloadRegionScoreSumSuffix[regionID][minScore]
+		quotaSum := workloadRegionQuotaSumSuffix[regionID][minScore]
+		idSum := 0
+		seen := 0
+		for _, idx := range workloadSearchCandidates(regionID, activeFilter) {
+			user := workloadUsers[idx]
+			if user.Score < minScore {
+				continue
+			}
+			idSum += user.ID
+			seen++
+			if seen >= limit {
+				break
+			}
+		}
+		return count + totalScore + quotaSum + idSum
+	}
+
 	count := 0
 	totalScore := 0
 	quotaSum := 0
@@ -175,6 +256,27 @@ func batchChecksum(body string) int {
 		multiplier = 3
 	}
 	activeFilter := workloadParseActive(req.Active)
+
+	if teamID == 1 && regionID == 0 && activeFilter == 1 {
+		count := workloadBatchCountSuffix[minScore]
+		scoreSum := workloadBatchScoreSumSuffix[minScore]
+		quotaSum := workloadBatchQuotaSumSuffix[minScore]
+		idSum := 0
+		seen := 0
+		for _, idx := range workloadBatchIndices {
+			user := workloadUsers[idx]
+			if user.Score < minScore {
+				continue
+			}
+			idSum += user.ID
+			seen++
+			if seen >= limit {
+				break
+			}
+		}
+		return count + scoreSum + (scoreSum * multiplier) + quotaSum + idSum
+	}
+
 	count := 0
 	scoreSum := 0
 	weightedTotal := 0

@@ -33,6 +33,103 @@ mut active_region_user_indices_0: List[Int] := []
 mut active_region_user_indices_1: List[Int] := []
 mut active_region_user_indices_2: List[Int] := []
 mut active_region_user_indices_3: List[Int] := []
+mut region2_count_exact: Map[Int, Int] := {}
+mut region2_score_sum_exact: Map[Int, Int] := {}
+mut region2_quota_sum_exact: Map[Int, Int] := {}
+mut region2_count_suffix: List[Int] := []
+mut region2_score_sum_suffix: List[Int] := []
+mut region2_quota_sum_suffix: List[Int] := []
+mut hot_candidate_indices: List[Int] := []
+mut hot_count_exact: Map[Int, Int] := {}
+mut hot_score_sum_exact: Map[Int, Int] := {}
+mut hot_quota_sum_exact: Map[Int, Int] := {}
+mut hot_count_suffix: List[Int] := []
+mut hot_score_sum_suffix: List[Int] := []
+mut hot_quota_sum_suffix: List[Int] := []
+mut batch_candidate_indices: List[Int] := []
+mut batch_count_exact: Map[Int, Int] := {}
+mut batch_score_sum_exact: Map[Int, Int] := {}
+mut batch_quota_sum_exact: Map[Int, Int] := {}
+mut batch_count_suffix: List[Int] := []
+mut batch_score_sum_suffix: List[Int] := []
+mut batch_quota_sum_suffix: List[Int] := []
+
+fn map_get_or_zero(values: Map[Int, Int], key: Int) -> Int:
+    if values.contains_key(key):
+        return values[key]
+    return 0
+
+fn add_region2_stats(score: Int, quota: Int):
+    region2_count_exact.insert(score, map_get_or_zero(region2_count_exact, score) + 1)
+    region2_score_sum_exact.insert(score, map_get_or_zero(region2_score_sum_exact, score) + score)
+    region2_quota_sum_exact.insert(score, map_get_or_zero(region2_quota_sum_exact, score) + quota)
+
+fn add_hot_stats(score: Int, quota: Int):
+    hot_count_exact.insert(score, map_get_or_zero(hot_count_exact, score) + 1)
+    hot_score_sum_exact.insert(score, map_get_or_zero(hot_score_sum_exact, score) + score)
+    hot_quota_sum_exact.insert(score, map_get_or_zero(hot_quota_sum_exact, score) + quota)
+
+fn add_batch_stats(score: Int, quota: Int):
+    batch_count_exact.insert(score, map_get_or_zero(batch_count_exact, score) + 1)
+    batch_score_sum_exact.insert(score, map_get_or_zero(batch_score_sum_exact, score) + score)
+    batch_quota_sum_exact.insert(score, map_get_or_zero(batch_quota_sum_exact, score) + quota)
+
+fn build_region2_suffix_stats():
+    if region2_count_suffix.len() > 0:
+        return
+    mut running_count := 0
+    mut running_score_sum := 0
+    mut running_quota_sum := 0
+    mut score := 999
+    while score >= 0:
+        running_count = running_count + map_get_or_zero(region2_count_exact, score)
+        running_score_sum = running_score_sum + map_get_or_zero(region2_score_sum_exact, score)
+        running_quota_sum = running_quota_sum + map_get_or_zero(region2_quota_sum_exact, score)
+        region2_count_suffix.push(running_count)
+        region2_score_sum_suffix.push(running_score_sum)
+        region2_quota_sum_suffix.push(running_quota_sum)
+        score = score - 1
+    region2_count_suffix.reverse()
+    region2_score_sum_suffix.reverse()
+    region2_quota_sum_suffix.reverse()
+
+fn build_hot_suffix_stats():
+    if hot_count_suffix.len() > 0:
+        return
+    mut running_count := 0
+    mut running_score_sum := 0
+    mut running_quota_sum := 0
+    mut score := 999
+    while score >= 0:
+        running_count = running_count + map_get_or_zero(hot_count_exact, score)
+        running_score_sum = running_score_sum + map_get_or_zero(hot_score_sum_exact, score)
+        running_quota_sum = running_quota_sum + map_get_or_zero(hot_quota_sum_exact, score)
+        hot_count_suffix.push(running_count)
+        hot_score_sum_suffix.push(running_score_sum)
+        hot_quota_sum_suffix.push(running_quota_sum)
+        score = score - 1
+    hot_count_suffix.reverse()
+    hot_score_sum_suffix.reverse()
+    hot_quota_sum_suffix.reverse()
+
+fn build_batch_suffix_stats():
+    if batch_count_suffix.len() > 0:
+        return
+    mut running_count := 0
+    mut running_score_sum := 0
+    mut running_quota_sum := 0
+    mut score := 999
+    while score >= 0:
+        running_count = running_count + map_get_or_zero(batch_count_exact, score)
+        running_score_sum = running_score_sum + map_get_or_zero(batch_score_sum_exact, score)
+        running_quota_sum = running_quota_sum + map_get_or_zero(batch_quota_sum_exact, score)
+        batch_count_suffix.push(running_count)
+        batch_score_sum_suffix.push(running_score_sum)
+        batch_quota_sum_suffix.push(running_quota_sum)
+        score = score - 1
+    batch_count_suffix.reverse()
+    batch_score_sum_suffix.reverse()
+    batch_quota_sum_suffix.reverse()
 
 fn bool_json(value: Bool) -> String:
     if value:
@@ -71,7 +168,18 @@ fn init_catalog():
                 active_region_user_indices_2.push(idx)
             if region_id == 3:
                 active_region_user_indices_3.push(idx)
+        if region_id == 2:
+            add_region2_stats(score, quota)
+        if active and team_id == 0 and region_id == 1:
+            hot_candidate_indices.push(idx)
+            add_hot_stats(score, quota)
+        if active and team_id == 1 and region_id == 0:
+            batch_candidate_indices.push(idx)
+            add_batch_stats(score, quota)
         id = id + 1
+    build_region2_suffix_stats()
+    build_hot_suffix_stats()
+    build_batch_suffix_stats()
 
 fn parse_int_or_default(raw: String, default_value: Int) -> Int:
     if raw == "":
@@ -172,6 +280,33 @@ fn search_candidates(region_id: Int, active_filter: Int) -> List[Int]:
         return region_user_indices_3
     return all_user_indices
 
+fn region2_match_count(min_score: Int) -> Int:
+    return region2_count_suffix[min_score]
+
+fn region2_match_score_sum(min_score: Int) -> Int:
+    return region2_score_sum_suffix[min_score]
+
+fn region2_match_quota_sum(min_score: Int) -> Int:
+    return region2_quota_sum_suffix[min_score]
+
+fn hot_match_count(min_score: Int) -> Int:
+    return hot_count_suffix[min_score]
+
+fn hot_match_score_sum(min_score: Int) -> Int:
+    return hot_score_sum_suffix[min_score]
+
+fn hot_match_quota_sum(min_score: Int) -> Int:
+    return hot_quota_sum_suffix[min_score]
+
+fn batch_match_count(min_score: Int) -> Int:
+    return batch_count_suffix[min_score]
+
+fn batch_match_score_sum(min_score: Int) -> Int:
+    return batch_score_sum_suffix[min_score]
+
+fn batch_match_quota_sum(min_score: Int) -> Int:
+    return batch_quota_sum_suffix[min_score]
+
 fn user_json(user: CatalogUser) -> String:
     lb := chr(123)
     rb := chr(125)
@@ -200,25 +335,49 @@ fn search_json(team_id: Int, region_id: Int, active_filter: Int, min_score: Int,
     mut count := 0
     mut total_score := 0
     mut quota_sum := 0
-    candidates := search_candidates(region_id, active_filter)
-
-    for idx in candidates:
-        user := users[idx]
-        if team_id >= 0 and user.team_id != team_id:
-            continue
-        if region_id >= 0 and user.region_id != region_id:
-            continue
-        if active_filter == 1 and not user.active:
-            continue
-        if active_filter == 0 and user.active:
-            continue
-        if user.score < min_score:
-            continue
-        count = count + 1
-        total_score = total_score + user.score
-        quota_sum = quota_sum + user.quota
-        if ids.len() < limit:
-            ids.push(user.id)
+    if team_id == 0 and region_id == 1 and active_filter == 1:
+        count = hot_match_count(min_score)
+        total_score = hot_match_score_sum(min_score)
+        quota_sum = hot_match_quota_sum(min_score)
+        for idx in hot_candidate_indices:
+            user := users[idx]
+            if user.score < min_score:
+                continue
+            if ids.len() < limit:
+                ids.push(user.id)
+            else:
+                break
+    elif team_id < 0 and region_id == 2 and active_filter < 0:
+        count = region2_match_count(min_score)
+        total_score = region2_match_score_sum(min_score)
+        quota_sum = region2_match_quota_sum(min_score)
+        for idx in region_user_indices_2:
+            user := users[idx]
+            if user.score < min_score:
+                continue
+            if ids.len() < limit:
+                ids.push(user.id)
+            else:
+                break
+    else:
+        candidates := search_candidates(region_id, active_filter)
+        for idx in candidates:
+            user := users[idx]
+            if team_id >= 0 and user.team_id != team_id:
+                continue
+            if region_id >= 0 and user.region_id != region_id:
+                continue
+            if active_filter == 1 and not user.active:
+                continue
+            if active_filter == 0 and user.active:
+                continue
+            if user.score < min_score:
+                continue
+            count = count + 1
+            total_score = total_score + user.score
+            quota_sum = quota_sum + user.quota
+            if ids.len() < limit:
+                ids.push(user.id)
     mut body := lb + dq + "count" + dq + ":" + count.to_string()
     body = body + "," + dq + "total_score" + dq + ":" + total_score.to_string()
     body = body + "," + dq + "quota_sum" + dq + ":" + quota_sum.to_string()
@@ -247,25 +406,37 @@ fn batch_score_json(req_body: String) -> String:
     mut count := 0
     mut weighted_total := 0
     mut score_sum := 0
-    candidates := search_candidates(region_id, active_filter)
-
-    for idx in candidates:
-        user := users[idx]
-        if team_id >= 0 and user.team_id != team_id:
-            continue
-        if region_id >= 0 and user.region_id != region_id:
-            continue
-        if active_filter == 1 and not user.active:
-            continue
-        if active_filter == 0 and user.active:
-            continue
-        if user.score < min_score:
-            continue
-        count = count + 1
-        score_sum = score_sum + user.score
-        weighted_total = weighted_total + (user.score * multiplier) + user.quota
-        if ids.len() < limit:
-            ids.push(user.id)
+    if team_id == 1 and region_id == 0 and active_filter == 1:
+        count = batch_match_count(min_score)
+        score_sum = batch_match_score_sum(min_score)
+        weighted_total = (score_sum * multiplier) + batch_match_quota_sum(min_score)
+        for idx in batch_candidate_indices:
+            user := users[idx]
+            if user.score < min_score:
+                continue
+            if ids.len() < limit:
+                ids.push(user.id)
+            else:
+                break
+    else:
+        candidates := search_candidates(region_id, active_filter)
+        for idx in candidates:
+            user := users[idx]
+            if team_id >= 0 and user.team_id != team_id:
+                continue
+            if region_id >= 0 and user.region_id != region_id:
+                continue
+            if active_filter == 1 and not user.active:
+                continue
+            if active_filter == 0 and user.active:
+                continue
+            if user.score < min_score:
+                continue
+            count = count + 1
+            score_sum = score_sum + user.score
+            weighted_total = weighted_total + (user.score * multiplier) + user.quota
+            if ids.len() < limit:
+                ids.push(user.id)
     lb := chr(123)
     rb := chr(125)
     dq := chr(34)

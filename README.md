@@ -159,7 +159,9 @@ forge help                     # print usage
 make build                 # build the Cranelift native backend
 make self-host             # compile the self-hosted compiler via Cranelift
 make bootstrap-verify      # verify Cranelift-compiled compiler works on all examples
-make run-examples          # run all 43 deterministic examples
+make run-examples          # run the browseable deterministic examples
+make run-regressions       # run deterministic regression cases
+make test                  # run the full native + self-hosted test suite
 make clean                 # remove build artifacts
 ```
 
@@ -207,6 +209,16 @@ std/                 standard library (13 native forge modules)
   net/url.fg         URL parsing and percent-encoding
   os/path.fg         file path manipulation
   os/process.fg      child process management
+
+examples/            user-facing demos and sample programs
+  expected/          expected output snapshots for deterministic demos
+  imports/           helper modules used by example imports
+
+tests/               regression and negative compiler fixtures
+  cases/             deterministic regression programs
+  expected/          expected output snapshots for regression cases
+  invalid/           checker-invalid programs + expected error codes
+  invalid_parse/     parser-invalid programs + expected error codes
 
 examples/              43 deterministic .fg programs with verified expected output
 docs/grammar.ebnf    complete EBNF for the language

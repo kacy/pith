@@ -1,9 +1,10 @@
-.PHONY: build self-host bootstrap bootstrap-verify run-examples parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only test clean
+.PHONY: build self-host bootstrap bootstrap-verify run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
-PARSE_INVALID_EXAMPLES := $(wildcard examples/invalid_parse/*.fg)
-INVALID_EXAMPLES := $(wildcard examples/invalid/*.fg)
+REGRESSION_EXPECTED := $(wildcard tests/expected/*.txt)
+PARSE_INVALID_EXAMPLES := $(wildcard tests/invalid_parse/*.fg)
+INVALID_EXAMPLES := $(wildcard tests/invalid/*.fg)
 PARITY_EXAMPLES := \
 	hello \
 	control_flow \
@@ -34,21 +35,10 @@ bootstrap: self-host
 
 # verify that the Cranelift-compiled compiler produces identical output
 bootstrap-verify: self-host
-	@echo "--- comparing Cranelift-compiled vs cargo-compiled on all examples ---"
-	@pass=0; fail=0; \
-	for f in $(EXPECTED_EXAMPLES); do \
-		name=$$(basename "$$f" .txt); \
-		actual=$$(timeout 15 ./self-host/forge_main run "examples/$$name.fg" 2>/dev/null | grep -v '^\[DEBUG\]'); \
-		expected=$$(cat "$$f"); \
-		if [ "$$actual" = "$$expected" ]; then \
-			pass=$$((pass+1)); \
-		else \
-			echo "FAIL $$name"; \
-			fail=$$((fail+1)); \
-		fi; \
-	done; \
-	echo "$$pass passed, $$fail failed"; \
-	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	@echo "--- verifying self-hosted compiler on deterministic examples ---"
+	@$(MAKE) --no-print-directory run-examples-self-only
+	@echo "--- verifying self-hosted compiler on regression cases ---"
+	@$(MAKE) --no-print-directory run-regressions-self-only
 	echo "bootstrap verified"
 
 # --- example validation ---
@@ -71,6 +61,69 @@ run-examples: build
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all examples passed"
+
+run-examples-self: self-host run-examples-self-only
+
+run-examples-self-only:
+	@echo "--- deterministic examples (self-hosted compiler) ---"
+	@pass=0; fail=0; \
+	for f in $(EXPECTED_EXAMPLES); do \
+		name=$$(basename "$$f" .txt); \
+		actual=$$(timeout 15 ./self-host/forge_main run "examples/$$name.fg" 2>/dev/null); \
+		expected=$$(cat "$$f"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all self-hosted examples passed"
+
+run-regressions: build run-regressions-only
+
+run-regressions-only:
+	@echo "--- regression cases (Cranelift backend) ---"
+	@pass=0; fail=0; \
+	for f in $(REGRESSION_EXPECTED); do \
+		name=$$(basename "$$f" .txt); \
+		actual=$$(timeout 15 ./target/release/forge run "tests/cases/$$name.fg" 2>/dev/null); \
+		expected=$$(cat "$$f"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all regression cases passed"
+
+run-regressions-self: self-host run-regressions-self-only
+
+run-regressions-self-only:
+	@echo "--- regression cases (self-hosted compiler) ---"
+	@pass=0; fail=0; \
+	for f in $(REGRESSION_EXPECTED); do \
+		name=$$(basename "$$f" .txt); \
+		actual=$$(timeout 15 ./self-host/forge_main run "tests/cases/$$name.fg" 2>/dev/null); \
+		expected=$$(cat "$$f"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all self-hosted regression cases passed"
 
 parity-examples: self-host parity-examples-only
 
@@ -111,7 +164,7 @@ check-parse-invalid-only:
 	@pass=0; fail=0; \
 	for f in $(PARSE_INVALID_EXAMPLES); do \
 		name=$$(basename "$$f" .fg); \
-		expected_file="examples/invalid_parse/expected/$$name.codes"; \
+		expected_file="tests/invalid_parse/expected/$$name.codes"; \
 		if [ ! -f "$$expected_file" ]; then \
 			echo "FAIL $$name (missing $$expected_file)"; \
 			fail=$$((fail+1)); \
@@ -151,7 +204,7 @@ check-parse-invalid-self-host-only:
 	@pass=0; fail=0; \
 	for f in $(PARSE_INVALID_EXAMPLES); do \
 		name=$$(basename "$$f" .fg); \
-		expected_file="examples/invalid_parse/expected/$$name.codes"; \
+		expected_file="tests/invalid_parse/expected/$$name.codes"; \
 		if [ ! -f "$$expected_file" ]; then \
 			echo "FAIL $$name (missing $$expected_file)"; \
 			fail=$$((fail+1)); \
@@ -191,7 +244,7 @@ check-invalid-only:
 	@pass=0; fail=0; \
 	for f in $(INVALID_EXAMPLES); do \
 		name=$$(basename "$$f" .fg); \
-		expected_file="examples/invalid/expected/$$name.codes"; \
+		expected_file="tests/invalid/expected/$$name.codes"; \
 		if [ ! -f "$$expected_file" ]; then \
 			echo "FAIL $$name (missing $$expected_file)"; \
 			fail=$$((fail+1)); \
@@ -231,7 +284,7 @@ check-invalid-self-host-only:
 	@pass=0; fail=0; \
 	for f in $(INVALID_EXAMPLES); do \
 		name=$$(basename "$$f" .fg); \
-		expected_file="examples/invalid/expected/$$name.codes"; \
+		expected_file="tests/invalid/expected/$$name.codes"; \
 		if [ ! -f "$$expected_file" ]; then \
 			echo "FAIL $$name (missing $$expected_file)"; \
 			fail=$$((fail+1)); \
@@ -283,19 +336,23 @@ test: build
 	done; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi
-	@echo "=== Step 2: run invalid parse examples ==="
+	@echo "=== Step 2: run regression cases ==="
+	@$(MAKE) --no-print-directory run-regressions-only
+	@echo "=== Step 3: run invalid parse examples ==="
 	@$(MAKE) --no-print-directory check-parse-invalid-only
-	@echo "=== Step 3: run invalid checker examples ==="
+	@echo "=== Step 4: run invalid checker examples ==="
 	@$(MAKE) --no-print-directory check-invalid-only
-	@echo "=== Step 4: build self-hosted compiler via Cranelift ==="
+	@echo "=== Step 5: build self-hosted compiler via Cranelift ==="
 	./target/release/forge build self-host/forge_main.fg
-	@echo "=== Step 5: run invalid parse examples through self-hosted parser ==="
+	@echo "=== Step 6: run regression cases through self-hosted compiler ==="
+	@$(MAKE) --no-print-directory run-regressions-self-only
+	@echo "=== Step 7: run invalid parse examples through self-hosted parser ==="
 	@$(MAKE) --no-print-directory check-parse-invalid-self-host-only
-	@echo "=== Step 6: compare native and self-hosted example outputs ==="
+	@echo "=== Step 8: compare native and self-hosted example outputs ==="
 	@$(MAKE) --no-print-directory parity-examples-only
-	@echo "=== Step 7: run invalid examples through self-hosted checker ==="
+	@echo "=== Step 9: run invalid examples through self-hosted checker ==="
 	@$(MAKE) --no-print-directory check-invalid-self-host-only
-	@echo "=== Step 8: self-hosted compiler works ==="
+	@echo "=== Step 10: self-hosted compiler works ==="
 	./self-host/forge_main version
 	./self-host/forge_main lex examples/hello.fg > /dev/null
 	./self-host/forge_main parse examples/hello.fg > /dev/null

@@ -15,6 +15,7 @@ the smallest useful validation loop is:
 zig build test
 ./self-host/forge_main check <file>
 make run-examples-self
+make run-regressions-self
 make bootstrap
 ```
 
@@ -32,6 +33,7 @@ zig build run -- check examples/hello.fg
 make self-host
 ./self-host/forge_main check examples/hello.fg
 make run-examples-self
+make run-regressions-self
 make bootstrap
 ```
 
@@ -61,5 +63,6 @@ zig build run -- check examples/hello.fg
 make self-host
 ./self-host/forge_main run examples/hello.fg
 make run-examples-self
+make run-regressions-self
 make bootstrap
 ```

@@ -12,48 +12,33 @@
 # Integer Formatting
 # ===============================================================
 
-# Formats an integer as a lowercase hexadecimal string.
-# Example: hex(255) -> "ff", hex(0) -> "0", hex(-16) -> "-10"
-pub fn hex(n: Int) -> String:
+fn format_int_base(n: Int, base: Int) -> String:
     if n == 0:
         return "0"
     if n < 0:
-        return "-" + hex(-n)
+        return "-" + format_int_base(-n, base)
     digits := "0123456789abcdef"
     mut val := n
     mut result := ""
     while val > 0:
-        result = digits[val % 16] + result
-        val = val / 16
+        result = digits[val % base] + result
+        val = val / base
     return result
+
+# Formats an integer as a lowercase hexadecimal string.
+# Example: hex(255) -> "ff", hex(0) -> "0", hex(-16) -> "-10"
+pub fn hex(n: Int) -> String:
+    return format_int_base(n, 16)
 
 # Formats an integer as an octal string (base 8).
 # Example: oct(8) -> "10", oct(64) -> "100"
 pub fn oct(n: Int) -> String:
-    if n == 0:
-        return "0"
-    if n < 0:
-        return "-" + oct(-n)
-    mut val := n
-    mut result := ""
-    while val > 0:
-        result = chr(48 + val % 8) + result
-        val = val / 8
-    return result
+    return format_int_base(n, 8)
 
 # Formats an integer as a binary string (base 2).
 # Example: bin(5) -> "101", bin(255) -> "11111111"
 pub fn bin(n: Int) -> String:
-    if n == 0:
-        return "0"
-    if n < 0:
-        return "-" + bin(-n)
-    mut val := n
-    mut result := ""
-    while val > 0:
-        result = chr(48 + val % 2) + result
-        val = val / 2
-    return result
+    return format_int_base(n, 2)
 
 # ===============================================================
 # Float Formatting

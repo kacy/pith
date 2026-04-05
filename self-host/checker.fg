@@ -2677,7 +2677,7 @@ fn check_index_expression(node: Node, scope_id: Int) -> Int:
     return TID_ERR
 
 # ---------------------------------------------------------------
-# unwrap expression (value!)
+# unwrap expression (value?)
 # ---------------------------------------------------------------
 
 fn check_unwrap_expression(node: Node, scope_id: Int) -> Int:
@@ -2689,11 +2689,11 @@ fn check_unwrap_expression(node: Node, scope_id: Int) -> Int:
     info := get_type_info(inner)
     if info.kind == "optional":
         return info.inner
-    report_error_with_fix("E224", "unwrap requires an optional type, got " + get_type_name(inner), "use ! for unwrapping optional types")
+    report_error_with_fix("E224", "unwrap requires an optional type, got " + get_type_name(inner), "use ? for unwrapping optional types")
     return TID_ERR
 
 # ---------------------------------------------------------------
-# try expression (value?)
+# try expression (value!)
 # ---------------------------------------------------------------
 
 fn check_try_expression(node: Node, scope_id: Int) -> Int:
@@ -2709,9 +2709,9 @@ fn check_try_expression(node: Node, scope_id: Int) -> Int:
         if ret >= 0:
             ret_info := get_type_info(ret)
             if ret_info.kind != "result":
-                report_error("E235", "try (?) can only be used in functions that return a result type")
+                report_error("E239", "try (!) can only be used in functions that return a result type")
         return info.inner
-    report_error_with_fix("E236", "try requires a result type, got " + get_type_name(inner), "use ! for unwrapping optional types")
+    report_error_with_fix("E224", "try requires a result type, got " + get_type_name(inner), "use ! for unwrapping optional types")
     return TID_ERR
 
 # ---------------------------------------------------------------

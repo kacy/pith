@@ -19,7 +19,8 @@ from std.io import BufferedStringReader, BufferedTcpStream
 from std.io import buffered_string_reader_read, buffered_string_reader_read_line
 from std.io import tcp_stream_from_fd, tcp_stream_connect, tcp_stream_close, buffered_tcp_stream
 from std.io import buffered_tcp_stream_read, buffered_tcp_stream_read_line
-from std.io import write_all_tcp_stream, read_all_tcp_stream_chunked
+from std.io import buffered_tcp_writer, buffered_tcp_writer_write, buffered_tcp_writer_flush
+from std.io import read_all_tcp_stream_chunked
 
 # ===============================================================
 # MIME Types
@@ -394,7 +395,9 @@ pub fn read_request(fd: Int) -> String!:
 
 pub fn send_response(fd: Int, response: String) -> Int!:
     stream := tcp_stream_from_fd(fd)
-    written := write_all_tcp_stream(stream, response)!
+    writer := buffered_tcp_writer(stream)
+    written := buffered_tcp_writer_write(writer, response)!
+    buffered_tcp_writer_flush(writer)!
     tcp_close(fd)
     return written
 
@@ -414,7 +417,9 @@ pub fn get(host: String, port: Int, url_path: String) -> String!:
     req = req + "Connection: close"
     req = req + crlf
     req = req + crlf
-    write_all_tcp_stream(conn, req)!
+    writer := buffered_tcp_writer(conn)
+    buffered_tcp_writer_write(writer, req)!
+    buffered_tcp_writer_flush(writer)!
     response := read_all_tcp_stream_chunked(conn, 4096)!
     tcp_stream_close(conn)
     cr := chr(13)

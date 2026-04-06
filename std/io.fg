@@ -25,10 +25,20 @@ mut buffered_string_reader_sources: Map[Int, Int] := {}
 mut buffered_string_reader_chunk_sizes: Map[Int, Int] := {}
 mut buffered_string_reader_cache: Map[Int, String] := {}
 
+mut next_buffered_string_writer_handle: Int := 1
+mut buffered_string_writer_targets: Map[Int, Int] := {}
+mut buffered_string_writer_chunk_sizes: Map[Int, Int] := {}
+mut buffered_string_writer_cache: Map[Int, String] := {}
+
 mut next_buffered_tcp_stream_handle: Int := 1
 mut buffered_tcp_stream_fds: Map[Int, Int] := {}
 mut buffered_tcp_stream_chunk_sizes: Map[Int, Int] := {}
 mut buffered_tcp_stream_cache: Map[Int, String] := {}
+
+mut next_buffered_tcp_writer_handle: Int := 1
+mut buffered_tcp_writer_fds: Map[Int, Int] := {}
+mut buffered_tcp_writer_chunk_sizes: Map[Int, Int] := {}
+mut buffered_tcp_writer_cache: Map[Int, String] := {}
 
 interface Reader:
     fn read(max_bytes: Int) -> String!
@@ -51,7 +61,13 @@ struct StringBuffer:
 struct BufferedStringReader:
     pub handle: Int
 
+struct BufferedStringWriter:
+    pub handle: Int
+
 struct BufferedTcpStream:
+    pub handle: Int
+
+struct BufferedTcpWriter:
     pub handle: Int
 
 struct TcpStream:
@@ -86,6 +102,22 @@ pub fn buffered_string_reader_chunked(reader: StringReader, chunk_size: Int) -> 
     buffered_string_reader_cache.insert(handle, "")
     return BufferedStringReader(handle)
 
+pub fn buffered_string_writer(writer: StringBuffer) -> BufferedStringWriter:
+    return buffered_string_writer_chunked(writer, DEFAULT_CHUNK_SIZE)
+
+pub fn buffered_string_writer_chunked(writer: StringBuffer, chunk_size: Int) -> BufferedStringWriter:
+    handle := next_buffered_string_writer_handle
+    next_buffered_string_writer_handle = next_buffered_string_writer_handle + 1
+
+    mut size := chunk_size
+    if size <= 0:
+        size = DEFAULT_CHUNK_SIZE
+
+    buffered_string_writer_targets.insert(handle, writer.handle)
+    buffered_string_writer_chunk_sizes.insert(handle, size)
+    buffered_string_writer_cache.insert(handle, "")
+    return BufferedStringWriter(handle)
+
 pub fn buffered_tcp_stream(stream: TcpStream) -> BufferedTcpStream:
     return buffered_tcp_stream_chunked(stream, DEFAULT_CHUNK_SIZE)
 
@@ -101,6 +133,22 @@ pub fn buffered_tcp_stream_chunked(stream: TcpStream, chunk_size: Int) -> Buffer
     buffered_tcp_stream_chunk_sizes.insert(handle, size)
     buffered_tcp_stream_cache.insert(handle, "")
     return BufferedTcpStream(handle)
+
+pub fn buffered_tcp_writer(writer: TcpStream) -> BufferedTcpWriter:
+    return buffered_tcp_writer_chunked(writer, DEFAULT_CHUNK_SIZE)
+
+pub fn buffered_tcp_writer_chunked(writer: TcpStream, chunk_size: Int) -> BufferedTcpWriter:
+    handle := next_buffered_tcp_writer_handle
+    next_buffered_tcp_writer_handle = next_buffered_tcp_writer_handle + 1
+
+    mut size := chunk_size
+    if size <= 0:
+        size = DEFAULT_CHUNK_SIZE
+
+    buffered_tcp_writer_fds.insert(handle, writer.fd)
+    buffered_tcp_writer_chunk_sizes.insert(handle, size)
+    buffered_tcp_writer_cache.insert(handle, "")
+    return BufferedTcpWriter(handle)
 
 pub fn tcp_stream_connect(host: String, port: Int) -> TcpStream!:
     return TcpStream(tcp_connect(host, port)!)
@@ -140,11 +188,23 @@ pub fn buffered_string_reader_read(reader: BufferedStringReader, max_bytes: Int)
 pub fn buffered_string_reader_read_line(reader: BufferedStringReader) -> String!:
     return buffered_string_reader_read_line_internal(reader)
 
+pub fn buffered_string_writer_write(writer: BufferedStringWriter, data: String) -> Int!:
+    return buffered_string_writer_write_internal(writer, data)
+
+pub fn buffered_string_writer_flush(writer: BufferedStringWriter) -> Int!:
+    return buffered_string_writer_flush_internal(writer)
+
 pub fn buffered_tcp_stream_read(reader: BufferedTcpStream, max_bytes: Int) -> String!:
     return buffered_tcp_stream_read_internal(reader, max_bytes)
 
 pub fn buffered_tcp_stream_read_line(reader: BufferedTcpStream) -> String!:
     return buffered_tcp_stream_read_line_internal(reader)
+
+pub fn buffered_tcp_writer_write(writer: BufferedTcpWriter, data: String) -> Int!:
+    return buffered_tcp_writer_write_internal(writer, data)
+
+pub fn buffered_tcp_writer_flush(writer: BufferedTcpWriter) -> Int!:
+    return buffered_tcp_writer_flush_internal(writer)
 
 pub fn read_all_string(reader: StringReader) -> String!:
     return read_all_string_chunked(reader, DEFAULT_CHUNK_SIZE)
@@ -306,6 +366,29 @@ fn buffered_string_reader_fill(handle: Int) -> Int!:
     buffered_string_reader_cache.insert(handle, chunk)
     return chunk.len()
 
+fn buffered_string_writer_write_internal(writer: BufferedStringWriter, data: String) -> Int!:
+    if not buffered_string_writer_targets.contains_key(writer.handle):
+        return 0
+
+    cached := buffered_string_writer_cache_get(writer.handle)
+    buffered_string_writer_cache.insert(writer.handle, cached + data)
+    if buffered_string_writer_should_flush(writer.handle):
+        buffered_string_writer_flush_internal(writer)!
+    return data.len()
+
+fn buffered_string_writer_flush_internal(writer: BufferedStringWriter) -> Int!:
+    if not buffered_string_writer_targets.contains_key(writer.handle):
+        return 0
+
+    cached := buffered_string_writer_cache_get(writer.handle)
+    if cached.len() == 0:
+        return 0
+
+    target_handle := buffered_string_writer_targets[writer.handle]
+    wrote := write_all_string(StringBuffer(target_handle), cached)!
+    buffered_string_writer_cache.insert(writer.handle, "")
+    return wrote
+
 fn buffered_tcp_stream_read_internal(reader: BufferedTcpStream, max_bytes: Int) -> String!:
     if max_bytes <= 0:
         return ""
@@ -364,6 +447,29 @@ fn buffered_tcp_stream_fill(handle: Int) -> Int!:
     buffered_tcp_stream_cache.insert(handle, chunk)
     return chunk.len()
 
+fn buffered_tcp_writer_write_internal(writer: BufferedTcpWriter, data: String) -> Int!:
+    if not buffered_tcp_writer_fds.contains_key(writer.handle):
+        return 0
+
+    cached := buffered_tcp_writer_cache_get(writer.handle)
+    buffered_tcp_writer_cache.insert(writer.handle, cached + data)
+    if buffered_tcp_writer_should_flush(writer.handle):
+        buffered_tcp_writer_flush_internal(writer)!
+    return data.len()
+
+fn buffered_tcp_writer_flush_internal(writer: BufferedTcpWriter) -> Int!:
+    if not buffered_tcp_writer_fds.contains_key(writer.handle):
+        return 0
+
+    cached := buffered_tcp_writer_cache_get(writer.handle)
+    if cached.len() == 0:
+        return 0
+
+    fd := buffered_tcp_writer_fds[writer.handle]
+    wrote := write_all_tcp_stream(TcpStream(fd), cached)!
+    buffered_tcp_writer_cache.insert(writer.handle, "")
+    return wrote
+
 fn buffered_string_reader_cache_get(handle: Int) -> String:
     if buffered_string_reader_cache.contains_key(handle):
         return buffered_string_reader_cache[handle]
@@ -396,6 +502,30 @@ fn buffered_string_reader_find_newline(data: String) -> Int:
         i = i + 1
     return -1
 
+fn buffered_string_writer_cache_get(handle: Int) -> String:
+    if buffered_string_writer_cache.contains_key(handle):
+        return buffered_string_writer_cache[handle]
+    return ""
+
+fn buffered_string_writer_should_flush(handle: Int) -> Bool:
+    cached := buffered_string_writer_cache_get(handle)
+    mut chunk_size := DEFAULT_CHUNK_SIZE
+    if buffered_string_writer_chunk_sizes.contains_key(handle):
+        chunk_size = buffered_string_writer_chunk_sizes[handle]
+    return cached.len() >= chunk_size
+
+fn buffered_tcp_writer_cache_get(handle: Int) -> String:
+    if buffered_tcp_writer_cache.contains_key(handle):
+        return buffered_tcp_writer_cache[handle]
+    return ""
+
+fn buffered_tcp_writer_should_flush(handle: Int) -> Bool:
+    cached := buffered_tcp_writer_cache_get(handle)
+    mut chunk_size := DEFAULT_CHUNK_SIZE
+    if buffered_tcp_writer_chunk_sizes.contains_key(handle):
+        chunk_size = buffered_tcp_writer_chunk_sizes[handle]
+    return cached.len() >= chunk_size
+
 impl BufferedStringReader:
     fn read(max_bytes: Int) -> String!:
         return buffered_string_reader_read(self, max_bytes)
@@ -407,6 +537,21 @@ impl Reader for BufferedStringReader:
     fn read(max_bytes: Int) -> String!:
         return buffered_string_reader_read(self, max_bytes)
 
+impl BufferedStringWriter:
+    fn write(data: String) -> Int!:
+        return buffered_string_writer_write(self, data)
+
+    fn flush() -> Int!:
+        return buffered_string_writer_flush(self)
+
+impl Writer for BufferedStringWriter:
+    fn write(data: String) -> Int!:
+        return buffered_string_writer_write(self, data)
+
+impl Flusher for BufferedStringWriter:
+    fn flush() -> Int!:
+        return buffered_string_writer_flush(self)
+
 impl BufferedTcpStream:
     fn read(max_bytes: Int) -> String!:
         return buffered_tcp_stream_read(self, max_bytes)
@@ -417,6 +562,21 @@ impl BufferedTcpStream:
 impl Reader for BufferedTcpStream:
     fn read(max_bytes: Int) -> String!:
         return buffered_tcp_stream_read(self, max_bytes)
+
+impl BufferedTcpWriter:
+    fn write(data: String) -> Int!:
+        return buffered_tcp_writer_write(self, data)
+
+    fn flush() -> Int!:
+        return buffered_tcp_writer_flush(self)
+
+impl Writer for BufferedTcpWriter:
+    fn write(data: String) -> Int!:
+        return buffered_tcp_writer_write(self, data)
+
+impl Flusher for BufferedTcpWriter:
+    fn flush() -> Int!:
+        return buffered_tcp_writer_flush(self)
 
 impl TcpStream:
     fn read(max_bytes: Int) -> String!:

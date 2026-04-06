@@ -479,7 +479,14 @@ fn ir_checked_result_kind(idx: Int) -> String:
         return "result_int"
     if inner_type == "bool":
         return "result_bool"
-    return "unknown"
+    return inner_type
+
+fn ir_call_retkind(idx: Int, uses_result_abi: Bool) -> String:
+    if uses_result_abi:
+        result_kind := ir_checked_result_kind(idx)
+        if result_kind.len() > 0:
+            return result_kind
+    return ir_infer_type(idx)
 
 fn ir_checked_index_type(idx: Int) -> String:
     node := get_node(idx)
@@ -853,7 +860,12 @@ fn ir_emit_method_call(idx: Int) -> Int:
         call_regs.push(arg_regs[ci])
         ci = ci + 1
     r := ir_reg()
-    mut ret_type := ir_infer_type(idx)
+    mut uses_result_abi := false
+    if ir_impl_methods.contains_key(emit_name):
+        uses_result_abi = true
+    elif ir_func_returns.contains_key(emit_name):
+        uses_result_abi = true
+    mut ret_type := ir_call_retkind(idx, uses_result_abi)
     if VOID_METHODS.contains(emit_name):
         ret_type = "void"
     mut call_text := " " + obj_r.to_string()
@@ -1122,6 +1134,7 @@ fn ir_expr(idx: Int) -> Int:
     if node.kind == "call":
         # children: ident (func name), then arg nodes
         mut fname := "unknown"
+        mut imported_call := false
         mut arg_regs: List[Int] := []
         mut _fi6 := 0
         kids6_children := node.children
@@ -1140,6 +1153,7 @@ fn ir_expr(idx: Int) -> Int:
         # disambiguate function names that collide with method names
         # apply import renames (e.g., parse → toml_parse when imported from std.toml)
         if ir_import_renames.contains_key(fname):
+            imported_call = true
             fname = ir_import_renames[fname]
 
         r := ir_reg()
@@ -1148,7 +1162,10 @@ fn ir_expr(idx: Int) -> Int:
         while ai < arg_regs.len():
             call_text = call_text + " " + arg_regs[ai].to_string()
             ai = ai + 1
-        ir_emit_call_text(r, fname, ir_infer_type(idx), arg_regs.len(), call_text)
+        mut uses_result_abi := imported_call
+        if ir_func_returns.contains_key(fname):
+            uses_result_abi = true
+        ir_emit_call_text(r, fname, ir_call_retkind(idx, uses_result_abi), arg_regs.len(), call_text)
         return r
 
     else:

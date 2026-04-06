@@ -360,11 +360,37 @@ fn rewrite_call_retkinds(ir: &str) -> String {
         }
     }
 
+    let builtin_kinds: std::collections::HashMap<&str, &str> = [
+        ("parse_int", "result_int"),
+        ("tcp_connect", "result_int"),
+        ("tcp_listen", "result_int"),
+        ("tcp_accept", "result_int"),
+        ("tcp_write", "result_int"),
+        ("process_spawn", "result_int"),
+        ("process_write", "result_int"),
+        ("write_file", "result_bool"),
+        ("append_file", "result_bool"),
+    ]
+    .into_iter()
+    .collect();
+
     let mut rewritten = String::new();
     for line in ir.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 5 && parts[0] == "call" && parts[3] == "unknown" {
-            if let Some(retkind) = func_kinds.get(parts[2]) {
+        if parts.len() >= 5 && parts[0] == "call" {
+            let expected = func_kinds
+                .get(parts[2])
+                .map(|s| s.as_str())
+                .or_else(|| builtin_kinds.get(parts[2]).copied());
+            let current = parts[3];
+            let should_rewrite = matches!(
+                (current, expected),
+                ("unknown", Some(_))
+                    | ("int", Some("result_int"))
+                    | ("bool", Some("result_bool"))
+            );
+            if should_rewrite {
+                let retkind = expected.unwrap();
                 rewritten.push_str(&format!("call {} {} {} {}", parts[1], parts[2], retkind, parts[4]));
                 if parts.len() > 5 {
                     rewritten.push(' ');

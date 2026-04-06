@@ -274,6 +274,22 @@ pub fn compile_from_ir(
     Ok(declared_funcs)
 }
 
+fn normalize_runtime_result(
+    builder: &mut FunctionBuilder<'_>,
+    value: Value,
+    retkind: &str,
+) -> Value {
+    if retkind != "result_int" && retkind != "result_bool" {
+        return value;
+    }
+
+    let zero = builder.ins().iconst(types::I64, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    let is_error = builder.ins().icmp(IntCC::Equal, value, zero);
+    let encoded = builder.ins().iadd(value, one);
+    builder.ins().select(is_error, zero, encoded)
+}
+
 fn compile_ir_function(
     codegen: &mut CodeGen,
     func_id: FuncId,
@@ -866,12 +882,21 @@ fn compile_ir_function(
                     // strings and lists at runtime via magic number check.
                     // Look up function: user-defined first, then runtime with name resolution.
                     let resolved_name = resolve_func_name(fname);
-                    let fid = declared_funcs
-                        .get(fname)
-                        .or_else(|| runtime_funcs.get(resolved_name))
-                        .or_else(|| runtime_funcs.get(fname))
-                        .or_else(|| runtime_funcs.get(&format!("forge_{}", fname)))
-                        .copied();
+                    let mut runtime_call = false;
+                    let fid = if let Some(&fid) = declared_funcs.get(fname) {
+                        Some(fid)
+                    } else if let Some(&fid) = runtime_funcs.get(resolved_name) {
+                        runtime_call = true;
+                        Some(fid)
+                    } else if let Some(&fid) = runtime_funcs.get(fname) {
+                        runtime_call = true;
+                        Some(fid)
+                    } else if let Some(&fid) = runtime_funcs.get(&format!("forge_{}", fname)) {
+                        runtime_call = true;
+                        Some(fid)
+                    } else {
+                        None
+                    };
 
                     if let Some(fid) = fid {
                         let fref = *func_ref_cache.entry(fid).or_insert_with(|| {
@@ -911,7 +936,12 @@ fn compile_ir_function(
                                 // Normalize i64 results: iadd 0 works around a Cranelift
                                 // register state issue with struct-from-list returns
                                 let zero = builder.ins().iconst(types::I64, 0);
-                                regs.insert(reg, builder.ins().iadd(result, zero));
+                                let mut normalized = builder.ins().iadd(result, zero);
+                                if runtime_call {
+                                    normalized =
+                                        normalize_runtime_result(&mut builder, normalized, retkind);
+                                }
+                                regs.insert(reg, normalized);
                             }
                         } else {
                             regs.insert(reg, builder.ins().iconst(types::I64, 0));

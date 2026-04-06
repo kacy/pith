@@ -40,6 +40,16 @@ mut buffered_tcp_writer_fds: Map[Int, Int] := {}
 mut buffered_tcp_writer_chunk_sizes: Map[Int, Int] := {}
 mut buffered_tcp_writer_cache: Map[Int, String] := {}
 
+mut next_buffered_process_stdout_handle: Int := 1
+mut buffered_process_stdout_handles: Map[Int, Int] := {}
+mut buffered_process_stdout_chunk_sizes: Map[Int, Int] := {}
+mut buffered_process_stdout_cache: Map[Int, String] := {}
+
+mut next_buffered_process_stderr_handle: Int := 1
+mut buffered_process_stderr_handles: Map[Int, Int] := {}
+mut buffered_process_stderr_chunk_sizes: Map[Int, Int] := {}
+mut buffered_process_stderr_cache: Map[Int, String] := {}
+
 interface Reader:
     fn read(max_bytes: Int) -> String!
 
@@ -83,6 +93,12 @@ struct ProcessStdout:
     pub handle: Int
 
 struct ProcessStderr:
+    pub handle: Int
+
+struct BufferedProcessStdout:
+    pub handle: Int
+
+struct BufferedProcessStderr:
     pub handle: Int
 
 pub fn string_reader(data: String) -> StringReader:
@@ -162,6 +178,38 @@ pub fn buffered_tcp_writer_chunked(writer: TcpStream, chunk_size: Int) -> Buffer
     buffered_tcp_writer_cache.insert(handle, "")
     return BufferedTcpWriter(handle)
 
+pub fn buffered_process_stdout(reader: ProcessStdout) -> BufferedProcessStdout:
+    return buffered_process_stdout_chunked(reader, DEFAULT_CHUNK_SIZE)
+
+pub fn buffered_process_stdout_chunked(reader: ProcessStdout, chunk_size: Int) -> BufferedProcessStdout:
+    handle := next_buffered_process_stdout_handle
+    next_buffered_process_stdout_handle = next_buffered_process_stdout_handle + 1
+
+    mut size := chunk_size
+    if size <= 0:
+        size = DEFAULT_CHUNK_SIZE
+
+    buffered_process_stdout_handles.insert(handle, reader.handle)
+    buffered_process_stdout_chunk_sizes.insert(handle, size)
+    buffered_process_stdout_cache.insert(handle, "")
+    return BufferedProcessStdout(handle)
+
+pub fn buffered_process_stderr(reader: ProcessStderr) -> BufferedProcessStderr:
+    return buffered_process_stderr_chunked(reader, DEFAULT_CHUNK_SIZE)
+
+pub fn buffered_process_stderr_chunked(reader: ProcessStderr, chunk_size: Int) -> BufferedProcessStderr:
+    handle := next_buffered_process_stderr_handle
+    next_buffered_process_stderr_handle = next_buffered_process_stderr_handle + 1
+
+    mut size := chunk_size
+    if size <= 0:
+        size = DEFAULT_CHUNK_SIZE
+
+    buffered_process_stderr_handles.insert(handle, reader.handle)
+    buffered_process_stderr_chunk_sizes.insert(handle, size)
+    buffered_process_stderr_cache.insert(handle, "")
+    return BufferedProcessStderr(handle)
+
 pub fn tcp_stream_connect(host: String, port: Int) -> TcpStream!:
     return TcpStream(tcp_connect(host, port)!)
 
@@ -238,6 +286,18 @@ pub fn buffered_tcp_writer_write(writer: BufferedTcpWriter, data: String) -> Int
 
 pub fn buffered_tcp_writer_flush(writer: BufferedTcpWriter) -> Int!:
     return buffered_tcp_writer_flush_internal(writer)
+
+pub fn buffered_process_stdout_read(reader: BufferedProcessStdout, max_bytes: Int) -> String!:
+    return buffered_process_stdout_read_internal(reader, max_bytes)
+
+pub fn buffered_process_stdout_read_line(reader: BufferedProcessStdout) -> String!:
+    return buffered_process_stdout_read_line_internal(reader)
+
+pub fn buffered_process_stderr_read(reader: BufferedProcessStderr, max_bytes: Int) -> String!:
+    return buffered_process_stderr_read_internal(reader, max_bytes)
+
+pub fn buffered_process_stderr_read_line(reader: BufferedProcessStderr) -> String!:
+    return buffered_process_stderr_read_line_internal(reader)
 
 pub fn process_stdin_write(writer: ProcessStdin, data: String) -> Int!:
     return process_write(writer.handle, data)
@@ -557,6 +617,122 @@ fn buffered_tcp_writer_flush_internal(writer: BufferedTcpWriter) -> Int!:
     buffered_tcp_writer_cache.insert(writer.handle, "")
     return wrote
 
+fn buffered_process_stdout_read_internal(reader: BufferedProcessStdout, max_bytes: Int) -> String!:
+    if max_bytes <= 0:
+        return ""
+    if not buffered_process_stdout_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while result.len() < max_bytes:
+        mut cached := buffered_process_stdout_cache_get(reader.handle)
+        if cached.len() == 0:
+            filled := buffered_process_stdout_fill(reader.handle)!
+            if filled <= 0:
+                return result
+            cached = buffered_process_stdout_cache_get(reader.handle)
+        mut take := max_bytes - result.len()
+        if take > cached.len():
+            take = cached.len()
+        result = result + cached.substring(0, take)
+        buffered_process_stdout_consume(reader.handle, take)
+    return result
+
+fn buffered_process_stdout_read_line_internal(reader: BufferedProcessStdout) -> String!:
+    if not buffered_process_stdout_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_process_stdout_cache_get(reader.handle)
+        if cached.len() == 0:
+            filled := buffered_process_stdout_fill(reader.handle)!
+            if filled <= 0:
+                return result
+            cached = buffered_process_stdout_cache_get(reader.handle)
+        newline := buffered_string_reader_find_newline(cached)
+        if newline >= 0:
+            result = result + cached.substring(0, newline)
+            buffered_process_stdout_consume(reader.handle, newline + 1)
+            if result.len() > 0:
+                end := result.len()
+                if result.substring(end - 1, end) == chr(13):
+                    return result.substring(0, end - 1)
+            return result
+        result = result + cached
+        buffered_process_stdout_cache.insert(reader.handle, "")
+
+fn buffered_process_stdout_fill(handle: Int) -> Int!:
+    if not buffered_process_stdout_handles.contains_key(handle):
+        return 0
+
+    stdout_handle := buffered_process_stdout_handles[handle]
+    mut chunk_size := DEFAULT_CHUNK_SIZE
+    if buffered_process_stdout_chunk_sizes.contains_key(handle):
+        chunk_size = buffered_process_stdout_chunk_sizes[handle]
+
+    chunk := process_stdout_read(ProcessStdout(stdout_handle), chunk_size)!
+    buffered_process_stdout_cache.insert(handle, chunk)
+    return chunk.len()
+
+fn buffered_process_stderr_read_internal(reader: BufferedProcessStderr, max_bytes: Int) -> String!:
+    if max_bytes <= 0:
+        return ""
+    if not buffered_process_stderr_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while result.len() < max_bytes:
+        mut cached := buffered_process_stderr_cache_get(reader.handle)
+        if cached.len() == 0:
+            filled := buffered_process_stderr_fill(reader.handle)!
+            if filled <= 0:
+                return result
+            cached = buffered_process_stderr_cache_get(reader.handle)
+        mut take := max_bytes - result.len()
+        if take > cached.len():
+            take = cached.len()
+        result = result + cached.substring(0, take)
+        buffered_process_stderr_consume(reader.handle, take)
+    return result
+
+fn buffered_process_stderr_read_line_internal(reader: BufferedProcessStderr) -> String!:
+    if not buffered_process_stderr_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_process_stderr_cache_get(reader.handle)
+        if cached.len() == 0:
+            filled := buffered_process_stderr_fill(reader.handle)!
+            if filled <= 0:
+                return result
+            cached = buffered_process_stderr_cache_get(reader.handle)
+        newline := buffered_string_reader_find_newline(cached)
+        if newline >= 0:
+            result = result + cached.substring(0, newline)
+            buffered_process_stderr_consume(reader.handle, newline + 1)
+            if result.len() > 0:
+                end := result.len()
+                if result.substring(end - 1, end) == chr(13):
+                    return result.substring(0, end - 1)
+            return result
+        result = result + cached
+        buffered_process_stderr_cache.insert(reader.handle, "")
+
+fn buffered_process_stderr_fill(handle: Int) -> Int!:
+    if not buffered_process_stderr_handles.contains_key(handle):
+        return 0
+
+    stderr_handle := buffered_process_stderr_handles[handle]
+    mut chunk_size := DEFAULT_CHUNK_SIZE
+    if buffered_process_stderr_chunk_sizes.contains_key(handle):
+        chunk_size = buffered_process_stderr_chunk_sizes[handle]
+
+    chunk := process_stderr_read(ProcessStderr(stderr_handle), chunk_size)!
+    buffered_process_stderr_cache.insert(handle, chunk)
+    return chunk.len()
+
 fn buffered_string_reader_cache_get(handle: Int) -> String:
     if buffered_string_reader_cache.contains_key(handle):
         return buffered_string_reader_cache[handle]
@@ -580,6 +756,30 @@ fn buffered_tcp_stream_consume(handle: Int, consumed: Int):
         buffered_tcp_stream_cache.insert(handle, "")
     else:
         buffered_tcp_stream_cache.insert(handle, cached.substring(consumed, cached.len()))
+
+fn buffered_process_stdout_cache_get(handle: Int) -> String:
+    if buffered_process_stdout_cache.contains_key(handle):
+        return buffered_process_stdout_cache[handle]
+    return ""
+
+fn buffered_process_stdout_consume(handle: Int, consumed: Int):
+    cached := buffered_process_stdout_cache_get(handle)
+    if consumed >= cached.len():
+        buffered_process_stdout_cache.insert(handle, "")
+    else:
+        buffered_process_stdout_cache.insert(handle, cached.substring(consumed, cached.len()))
+
+fn buffered_process_stderr_cache_get(handle: Int) -> String:
+    if buffered_process_stderr_cache.contains_key(handle):
+        return buffered_process_stderr_cache[handle]
+    return ""
+
+fn buffered_process_stderr_consume(handle: Int, consumed: Int):
+    cached := buffered_process_stderr_cache_get(handle)
+    if consumed >= cached.len():
+        buffered_process_stderr_cache.insert(handle, "")
+    else:
+        buffered_process_stderr_cache.insert(handle, cached.substring(consumed, cached.len()))
 
 fn buffered_string_reader_find_newline(data: String) -> Int:
     mut i := 0
@@ -649,6 +849,28 @@ impl BufferedTcpStream:
 impl Reader for BufferedTcpStream:
     fn read(max_bytes: Int) -> String!:
         return buffered_tcp_stream_read(self, max_bytes)
+
+impl BufferedProcessStdout:
+    fn read(max_bytes: Int) -> String!:
+        return buffered_process_stdout_read(self, max_bytes)
+
+    fn read_line() -> String!:
+        return buffered_process_stdout_read_line(self)
+
+impl Reader for BufferedProcessStdout:
+    fn read(max_bytes: Int) -> String!:
+        return buffered_process_stdout_read(self, max_bytes)
+
+impl BufferedProcessStderr:
+    fn read(max_bytes: Int) -> String!:
+        return buffered_process_stderr_read(self, max_bytes)
+
+    fn read_line() -> String!:
+        return buffered_process_stderr_read_line(self)
+
+impl Reader for BufferedProcessStderr:
+    fn read(max_bytes: Int) -> String!:
+        return buffered_process_stderr_read(self, max_bytes)
 
 impl BufferedTcpWriter:
     fn write(data: String) -> Int!:

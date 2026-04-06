@@ -101,6 +101,10 @@ is already shaky in the existing examples, the io branch should not hide that.
 land wrapper-level progress here, then fix the runtime path directly and expand
 the transport tests afterward.
 
+the same shape now applies to process output too. stdout and stderr can sit
+behind buffered readers, which makes line-oriented subprocess protocols feel a
+lot closer to the tcp/http path instead of being a special case.
+
 ### milestone 3
 
 add real file-handle streaming to the runtime and move `std.fs` beyond

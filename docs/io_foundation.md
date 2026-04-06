@@ -124,6 +124,10 @@ that get messy fast when every module rolls its own framing. once `std.net.http`
 reads requests through `std.io`, the same buffered layer can carry over into
 headers, clients, and later protocol code.
 
+that path is now starting to land. the request reader and client fetch path can
+share the same buffered tcp helpers instead of open-coding socket loops in
+multiple places.
+
 ## the long-term version
 
 the long-term version should be bytes-first and protocol-friendly. but the best

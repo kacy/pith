@@ -494,5 +494,7 @@ fn main() -> Int!:
     while true:
         client := tcp_accept(fd)
         if client.is_ok:
-            handle(client.ok)!
+            handled := handle(client.ok)
+            if handled.is_err:
+                tcp_close(client.ok)
     return 0

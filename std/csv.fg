@@ -10,9 +10,7 @@
 ##   save_chunked(path: String, rows: List[List[String]], chunk_size: Int) -> Int!
 ##   encode_row(row: List[String]) -> String
 
-from std.io import file_stream_open_read, file_stream_open_write, file_stream_close
-from std.io import buffered_file_reader_chunked, buffered_file_reader_read_line
-from std.io import buffered_file_writer_chunked, buffered_file_writer_write, buffered_file_writer_flush
+from std.io import FileStream
 
 CSV_FILE_CHUNK_SIZE := 4096
 
@@ -32,16 +30,16 @@ pub fn parse_file(path: String) -> List[List[String]]!:
     return parse_file_chunked(path, CSV_FILE_CHUNK_SIZE)
 
 pub fn parse_file_chunked(path: String, chunk_size: Int) -> List[List[String]]!:
-    stream := file_stream_open_read(path)!
-    reader := buffered_file_reader_chunked(stream, chunk_size)
+    stream := FileStream(file_open_read(path)!)
+    reader := stream.buffered_reader_chunked(chunk_size)
     mut rows: List[List[String]] := []
-    mut line := buffered_file_reader_read_line(reader)!
+    mut line := reader.read_line()!
     while line.len() > 0:
         trimmed := line.trim()
         if trimmed.len() > 0:
             rows.push(parse_row(trimmed))
-        line = buffered_file_reader_read_line(reader)!
-    file_stream_close(stream)
+        line = reader.read_line()!
+    stream.close()
     return rows
 
 ## Parse CSV text with the first row as headers.
@@ -88,18 +86,18 @@ pub fn save(path: String, rows: List[List[String]]) -> Int!:
     return save_chunked(path, rows, CSV_FILE_CHUNK_SIZE)
 
 pub fn save_chunked(path: String, rows: List[List[String]], chunk_size: Int) -> Int!:
-    stream := file_stream_open_write(path)!
-    writer := buffered_file_writer_chunked(stream, chunk_size)
+    stream := FileStream(file_open_write(path)!)
+    writer := stream.buffered_writer_chunked(chunk_size)
     mut total := 0
     mut i := 0
     while i < rows.len():
         line := encode_row(rows[i])
-        total = total + buffered_file_writer_write(writer, line)!
+        total = total + writer.write(line)!
         if i + 1 < rows.len():
-            total = total + buffered_file_writer_write(writer, chr(10))!
+            total = total + writer.write(chr(10))!
         i = i + 1
-    total = total + buffered_file_writer_flush(writer)!
-    file_stream_close(stream)
+    total = total + writer.flush()!
+    stream.close()
     return total
 
 ## Encode a single row into a CSV line

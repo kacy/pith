@@ -78,7 +78,12 @@ mut ir_lambda_bodies: List[String] := []  # deferred lambda function IR
 mut ir_module_count := 0  # increments per emit_ir call for unique naming
 mut ir_impl_methods: Map[String, String] := {}
 mut ir_import_renames: Map[String, String] := {}
+mut ir_module_aliases: Map[String, String] := {}
 mut ir_current_func_return_kind := ""
+mut ir_preloaded_import_roots: List[Int] := []
+
+pub fn set_import_roots(roots: List[Int]):
+    ir_preloaded_import_roots = roots
 
 pub fn ir_reset():
     ir_lines = []
@@ -102,6 +107,10 @@ pub fn ir_reset():
     ir_struct_field_index_lookup = {}
     ir_break_stack = []
     ir_continue_stack = []
+    ir_impl_methods = {}
+    ir_import_renames = {}
+    ir_func_returns = {}
+    ir_module_aliases = {}
     ir_current_func_return_kind = ""
 
 fn ir_emit(line: String):
@@ -209,15 +218,17 @@ fn ir_expr_result_kind(idx: Int) -> String:
         return checked_kind
     node := get_node(idx)
     if node.kind == "call" and node.children.len() > 0:
-        fn_node := get_node(node.children[0])
-        if fn_node.kind == "ident":
-            mut fname := fn_node.value
-            if ir_import_renames.contains_key(fname):
-                fname = ir_import_renames[fname]
-            if ir_func_returns.contains_key(fname):
-                ret_kind := ir_func_returns[fname]
-                if ret_kind == "result_int" or ret_kind == "result_bool":
-                    return ret_kind
+        fname := ir_resolve_static_callee_name(node.children[0])
+        if fname.len() > 0 and ir_func_returns.contains_key(fname):
+            ret_kind := ir_func_returns[fname]
+            if ret_kind == "result_int" or ret_kind == "result_bool":
+                return ret_kind
+    if node.kind == "method_call":
+        fname := ir_resolve_module_alias_method_call_name(idx)
+        if fname.len() > 0 and ir_func_returns.contains_key(fname):
+            ret_kind := ir_func_returns[fname]
+            if ret_kind == "result_int" or ret_kind == "result_bool":
+                return ret_kind
     return ""
 
 fn ir_encode_result_value(value_reg: Int, result_kind: String) -> Int:
@@ -339,6 +350,85 @@ fn ir_emit_call0(result_reg: Int, fname: String, ret_type: String):
 
 fn ir_emit_call1(result_reg: Int, fname: String, ret_type: String, arg0: Int):
     ir_emit_call_text(result_reg, fname, ret_type, 1, " " + arg0.to_string())
+
+fn ir_module_default_alias(module_path: String) -> String:
+    mut last_dot := 0 - 1
+    mut i := 0
+    while i < module_path.len():
+        if module_path[i] == ".":
+            last_dot = i
+        i = i + 1
+    if last_dot < 0:
+        return module_path
+    return module_path.substring(last_dot + 1, module_path.len())
+
+fn ir_import_target_name(module_path: String, name: String) -> String:
+    if module_path == "std.json":
+        return "json_" + name
+    if module_path == "std.toml":
+        return "toml_" + name
+    if module_path == "std.log":
+        return "log_" + name
+    if module_path == "std.os.path":
+        if name == "base":
+            return "forge_path_basename"
+        return "path_" + name
+    if module_path == "std.net.url":
+        return "url_" + name
+    if module_path == "std.fs":
+        return "fs_" + name
+    return name
+
+fn ir_resolve_module_alias_call_name(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind != "field_access" or node.children.len() == 0:
+        return ""
+    recv := get_node(node.children[0])
+    if recv.kind != "ident":
+        return ""
+    alias := recv.value
+    if not ir_module_aliases.contains_key(alias):
+        return ""
+    return ir_import_target_name(ir_module_aliases[alias], node.value)
+
+fn ir_resolve_module_alias_method_call_name(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind != "method_call" or node.children.len() == 0:
+        return ""
+    recv := get_node(node.children[0])
+    if recv.kind != "ident":
+        return ""
+    alias := recv.value
+    if not ir_module_aliases.contains_key(alias):
+        return ""
+    mut method_name := node.value
+    if method_name.starts_with("."):
+        method_name = method_name.substring(1, method_name.len())
+    return ir_import_target_name(ir_module_aliases[alias], method_name)
+
+fn ir_resolve_static_callee_name(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "ident":
+        fname := node.value
+        if ir_import_renames.contains_key(fname):
+            return ir_import_renames[fname]
+        return fname
+    if node.kind == "field_access":
+        return ir_resolve_module_alias_call_name(idx)
+    return ""
+
+fn ir_static_callee_uses_result_abi(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind == "ident":
+        if ir_import_renames.contains_key(node.value):
+            return true
+    if node.kind == "field_access":
+        if ir_resolve_module_alias_call_name(idx).len() > 0:
+            return true
+    fname := ir_resolve_static_callee_name(idx)
+    if fname.len() > 0 and ir_func_returns.contains_key(fname):
+        return true
+    return false
 
 fn ir_emit_call2(result_reg: Int, fname: String, ret_type: String, arg0: Int, arg1: Int):
     ir_emit_call_text(result_reg, fname, ret_type, 2, " " + arg0.to_string() + " " + arg1.to_string())
@@ -626,12 +716,43 @@ fn ir_infer_type(idx: Int) -> String:
         return ""
     # method calls
     if kind == "method_call":
+        alias_fname := ir_resolve_module_alias_method_call_name(idx)
+        if alias_fname.len() > 0:
+            if ir_struct_names.contains_key(alias_fname):
+                return alias_fname
+            if FLOAT_RETURNING_FUNCS.contains(alias_fname):
+                return "float"
+            if BOOL_RETURNING_FUNCS.contains(alias_fname):
+                return "bool"
+            if INT_RETURNING_FUNCS.contains(alias_fname):
+                return "int"
+            if STRING_RETURNING_FUNCS.contains(alias_fname):
+                return "string"
+            if LIST_RETURNING_FUNCS.contains(alias_fname):
+                return "list"
+            if LIST_STRING_RETURNING_FUNCS.contains(alias_fname):
+                return "list_string"
+            if ir_func_returns.contains_key(alias_fname):
+                ret_kind := ir_func_returns[alias_fname]
+                if ret_kind == "result_int":
+                    return "int"
+                if ret_kind == "result_bool":
+                    return "bool"
+                return ir_resolve_type_hint(ret_kind)
         mut meth := node_value(idx)
         if meth.starts_with("."):
             meth = meth.substring(1, meth.len())
         mut obj_type := ""
         if node.children.len() > 0:
             obj_type = ir_infer_type(node.children[0])
+        impl_name := ir_lookup_impl_method_name(obj_type, meth)
+        if impl_name.len() > 0 and ir_func_returns.contains_key(impl_name):
+            ret_kind := ir_func_returns[impl_name]
+            if ret_kind == "result_int":
+                return "int"
+            if ret_kind == "result_bool":
+                return "bool"
+            return ir_resolve_type_hint(ret_kind)
         if BOOL_RETURNING_METHODS.contains(meth):
             return "bool"
         if STRING_RETURNING_METHODS.contains(meth):
@@ -733,6 +854,30 @@ fn ir_emit_method_call(idx: Int) -> Int:
     if mname.starts_with("."):
         mname = mname.substring(1, mname.len())
 
+    alias_fname := ir_resolve_module_alias_method_call_name(idx)
+    if alias_fname.len() > 0:
+        mut arg_regs: List[Int] := []
+        mut arg_idx := 1
+        while arg_idx < node.children.len():
+            child := node.children[arg_idx]
+            child_kind := node_kind(child)
+            if child_kind == "arg":
+                cn := get_node(child)
+                if cn.children.len() > 0:
+                    arg_regs.push(ir_expr(cn.children[0]))
+            else:
+                arg_regs.push(ir_expr(child))
+            arg_idx = arg_idx + 1
+        r := ir_reg()
+        mut call_text := ""
+        mut ai := 0
+        while ai < arg_regs.len():
+            call_text = call_text + " " + arg_regs[ai].to_string()
+            ai = ai + 1
+        uses_result_abi := ir_func_returns.contains_key(alias_fname)
+        ir_emit_call_text(r, alias_fname, ir_call_retkind(idx, uses_result_abi), arg_regs.len(), call_text)
+        return r
+
     # infer receiver type using centralized type inference
     mut obj_type := ""
     if node.children.len() > 0:
@@ -831,9 +976,10 @@ fn ir_emit_method_call(idx: Int) -> Int:
     if BOOL_RETURNING_METHODS.contains(emit_name):
         ir_var_types.insert("__last_call", "bool")
 
-    # check for impl method dispatch
-    if ir_impl_methods.contains_key(emit_name):
-        emit_name = ir_impl_methods[emit_name]
+    impl_name := ir_lookup_impl_method_name(obj_type, mname)
+    impl_dispatch := impl_name.len() > 0
+    if impl_dispatch:
+        emit_name = impl_name
 
     mut obj_r := 0 - 1
     mut arg_regs: List[Int] := []
@@ -860,11 +1006,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
         call_regs.push(arg_regs[ci])
         ci = ci + 1
     r := ir_reg()
-    mut uses_result_abi := false
-    if ir_impl_methods.contains_key(emit_name):
-        uses_result_abi = true
-    elif ir_func_returns.contains_key(emit_name):
-        uses_result_abi = true
+    uses_result_abi := impl_dispatch or ir_func_returns.contains_key(emit_name)
     mut ret_type := ir_call_retkind(idx, uses_result_abi)
     if VOID_METHODS.contains(emit_name):
         ret_type = "void"
@@ -1132,29 +1274,24 @@ fn ir_expr(idx: Int) -> Int:
         return r
 
     if node.kind == "call":
-        # children: ident (func name), then arg nodes
-        mut fname := "unknown"
-        mut imported_call := false
+        # children: callee, then arg nodes
+        mut fname := ""
         mut arg_regs: List[Int] := []
         mut _fi6 := 0
         kids6_children := node.children
         while _fi6 < kids6_children.len():
             child := kids6_children[_fi6]
             child_kind := node_kind(child)
-            if child_kind == "ident" and fname == "unknown":
-                cn := get_node(child)
-                fname = cn.value
+            if _fi6 == 0:
+                fname = ir_resolve_static_callee_name(child)
             elif child_kind == "arg":
                 cn := get_node(child)
                 if cn.children.len() > 0:
                     ar := ir_expr(cn.children[0])
                     arg_regs.push(ar)
             _fi6 = _fi6 + 1
-        # disambiguate function names that collide with method names
-        # apply import renames (e.g., parse → toml_parse when imported from std.toml)
-        if ir_import_renames.contains_key(fname):
-            imported_call = true
-            fname = ir_import_renames[fname]
+        if fname.len() == 0:
+            fname = "unknown"
 
         r := ir_reg()
         mut call_text := ""
@@ -1162,9 +1299,7 @@ fn ir_expr(idx: Int) -> Int:
         while ai < arg_regs.len():
             call_text = call_text + " " + arg_regs[ai].to_string()
             ai = ai + 1
-        mut uses_result_abi := imported_call
-        if ir_func_returns.contains_key(fname):
-            uses_result_abi = true
+        uses_result_abi := ir_static_callee_uses_result_abi(node.children[0])
         ir_emit_call_text(r, fname, ir_call_retkind(idx, uses_result_abi), arg_regs.len(), call_text)
         return r
 
@@ -1913,6 +2048,85 @@ fn ir_emit_fn_params(fn_idx: Int):
             ir_emit_named_param(cn.value, ir_extract_param_type(nk[i]))
         i = i + 1
 
+fn ir_extract_return_type(fn_idx: Int) -> String:
+    node := get_node(fn_idx)
+    mut i := 0
+    while i < node.children.len():
+        cn := get_node(node.children[i])
+        if cn.kind == "returns":
+            mut j := 0
+            while j < cn.children.len():
+                rn := get_node(cn.children[j])
+                if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type":
+                    return ir_resolve_type_node(cn.children[j])
+                j = j + 1
+        i = i + 1
+    return "unknown"
+
+fn ir_impl_method_key(type_name: String, method_name: String) -> String:
+    return type_name + "." + method_name
+
+fn ir_lookup_impl_method_name(type_name: String, method_name: String) -> String:
+    if type_name.len() == 0:
+        return ""
+    key := ir_impl_method_key(type_name, method_name)
+    if ir_impl_methods.contains_key(key):
+        return ir_impl_methods[key]
+    resolved := ir_resolve_type_hint(type_name)
+    if resolved != type_name:
+        resolved_key := ir_impl_method_key(resolved, method_name)
+        if ir_impl_methods.contains_key(resolved_key):
+            return ir_impl_methods[resolved_key]
+    if type_name.contains("["):
+        base := type_name.substring(0, type_name.index_of("["))
+        base_key := ir_impl_method_key(base, method_name)
+        if ir_impl_methods.contains_key(base_key):
+            return ir_impl_methods[base_key]
+    return ""
+
+fn ir_collect_impl_methods(root_idx: Int):
+    root := get_node(root_idx)
+    mut i := 0
+    while i < root.children.len():
+        child := root.children[i]
+        mut cn := get_node(child)
+        if cn.kind == "pub" and cn.children.len() > 0:
+            cn = get_node(cn.children[0])
+        if cn.kind == "impl_decl":
+            mut impl_type := ""
+            mut j := 0
+            while j < cn.children.len():
+                ic := cn.children[j]
+                icn := get_node(ic)
+                if icn.kind == "type" and impl_type == "":
+                    impl_type = icn.value
+                elif icn.kind == "for_type":
+                    mut k := 0
+                    while k < icn.children.len():
+                        ftc := icn.children[k]
+                        ftn := get_node(ftc)
+                        if ftn.kind == "type" or ftn.kind == "generic_type":
+                            impl_type = ftn.value
+                        k = k + 1
+                elif icn.kind == "generic_type" and impl_type == "":
+                    impl_type = icn.value
+                elif icn.kind == "fn_decl" or icn.kind == "pub":
+                    mut method_idx := ic
+                    mut method_node := icn
+                    if icn.kind == "pub" and icn.children.len() > 0:
+                        method_idx = icn.children[0]
+                        method_node = get_node(method_idx)
+                    if method_node.kind == "fn_decl" and impl_type.len() > 0:
+                        method_name := method_node.value
+                        full_name := impl_type + "_" + method_name
+                        key := ir_impl_method_key(impl_type, method_name)
+                        ret_type := ir_extract_return_type(method_idx)
+                        ir_impl_methods.insert(key, full_name)
+                        ir_func_returns.insert(key, ret_type)
+                        ir_func_returns.insert(full_name, ret_type)
+                j = j + 1
+        i = i + 1
+
 fn ir_emit_default_return():
     dr := ir_reg()
     ir_emit("iconst " + dr.to_string() + " 0")
@@ -1954,8 +2168,9 @@ fn ir_func(idx: Int):
 fn ir_impl_func(idx: Int, impl_type: String):
     node := get_node(idx)
     orig_name := node.value
-    mut full_name := impl_type + "_" + orig_name
-    ir_impl_methods.insert(orig_name, full_name)
+    full_name := impl_type + "_" + orig_name
+    method_key := ir_impl_method_key(impl_type, orig_name)
+    ir_impl_methods.insert(method_key, full_name)
 
     body_idx := ir_find_body(idx)
     param_count := ir_param_count(idx) + 1
@@ -1965,13 +2180,12 @@ fn ir_impl_func(idx: Int, impl_type: String):
     ir_var_types = {}
     ir_map_value_types = {}
     ir_seed_global_types()
-    mut ret_type := "unknown"
-    if ir_func_returns.contains_key(orig_name):
-        ret_type = ir_func_returns[orig_name]
+    ret_type := ir_extract_return_type(idx)
     ir_current_func_return_kind = ret_type
     ir_emit_func_header(full_name, param_count, ret_type)
     ir_emit_named_param("self", impl_type)
     ir_emit_fn_params(idx)
+    ir_func_returns.insert(method_key, ret_type)
     ir_func_returns.insert(full_name, ret_type)
 
     if body_idx >= 0:
@@ -1985,33 +2199,34 @@ fn ir_collect_imports(root_idx: Int):
     mut ci := 0
     while ci < root.children.len():
         cn := get_node(root.children[ci])
+        if cn.kind == "import":
+            mut path := cn.value
+            mut alias := ""
+            mut has_alias := false
+            mut si := 0
+            while si < cn.value.len() - 3:
+                if cn.value[si] == " " and cn.value[si + 1] == "a" and cn.value[si + 2] == "s" and cn.value[si + 3] == " ":
+                    path = cn.value.substring(0, si)
+                    alias = cn.value.substring(si + 4, cn.value.len())
+                    has_alias = true
+                    break
+                si = si + 1
+            if has_alias:
+                ir_module_aliases.insert(alias, path)
+            else:
+                ir_module_aliases.insert(ir_module_default_alias(path), path)
         if cn.kind == "from_import":
             parts := cn.value.split(" ")
             if parts.len() > 1:
                 mod_path := parts[0]
-                mut prefix := ""
-                if mod_path == "std.json":
-                    prefix = "json"
-                elif mod_path == "std.toml":
-                    prefix = "toml"
-                elif mod_path == "std.log":
-                    prefix = "log"
-                elif mod_path == "std.os.path":
-                    prefix = "path"
-                elif mod_path == "std.net.url":
-                    prefix = "url"
-                elif mod_path == "std.fs":
-                    prefix = "fs"
-                if prefix.len() > 0:
-                    mut pi := 1
-                    while pi < parts.len():
-                        iname := parts[pi]
-                        if iname.len() > 0:
-                            mut renamed := prefix + "_" + iname
-                            if mod_path == "std.os.path" and iname == "base":
-                                renamed = "forge_path_basename"
+                mut pi := 1
+                while pi < parts.len():
+                    iname := parts[pi]
+                    if iname.len() > 0:
+                        renamed := ir_import_target_name(mod_path, iname)
+                        if renamed != iname:
                             ir_import_renames.insert(iname, renamed)
-                        pi = pi + 1
+                    pi = pi + 1
         ci = ci + 1
 
 # --- main entry ---
@@ -2138,6 +2353,11 @@ pub fn emit_ir(root_idx: Int) -> String:
                         _fi40 = _fi40 + 1
                 _fi35 = _fi35 + 1
         _fi24 = _fi24 + 1
+    mut preload_i := 0
+    while preload_i < ir_preloaded_import_roots.len():
+        ir_collect_impl_methods(ir_preloaded_import_roots[preload_i])
+        preload_i = preload_i + 1
+    ir_collect_impl_methods(root_idx)
     # emit global variables (unwrap pub)
     mut _fi25 := 0
     kids25_children := root.children
@@ -2334,4 +2554,5 @@ pub fn emit_ir(root_idx: Int) -> String:
         li = li + 1
 
     ir_module_count = ir_module_count + 1
+    ir_preloaded_import_roots = []
     return ir_lines.join(chr(10))

@@ -41,8 +41,9 @@ pub fn get_stem(path: String) -> String:
             return name.substring(0, name.len() - 3)
     return name
 
-# scan an AST root for from_import nodes and return the module paths.
-# each from_import value is "path name1 name2 ..." - we extract the path.
+# scan an AST root for import declarations and return the module paths.
+# from_import values are "path name1 name2 ..." - we extract the path.
+# plain import values are "path" or "path as alias" - we extract the path.
 pub fn find_imports(root_idx: Int) -> List[String]:
     root := get_node(root_idx)
     mut imports: List[String] := []
@@ -66,6 +67,15 @@ pub fn find_imports(root_idx: Int) -> List[String]:
             if space_pos >= 0:
                 mod_path = value.substring(0, space_pos)
             imports.push(mod_path)
+        elif kind == "import":
+            mut path := value
+            mut si := 0
+            while si < value.len() - 3:
+                if value[si] == " " and value[si + 1] == "a" and value[si + 2] == "s" and value[si + 3] == " ":
+                    path = value.substring(0, si)
+                    break
+                si = si + 1
+            imports.push(path)
     return imports
 
 # global visited map for diamond import dedup.

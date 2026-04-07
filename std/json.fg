@@ -1,15 +1,15 @@
 # std.json — JSON parser and encoder
 #
-# Parse JSON strings into a node tree, access values, and build/encode JSON.
-# Uses opaque Int handles into a node pool.
+# parse JSON strings into a node tree, access values, and build/encode JSON.
+# uses opaque Int handles into a node pool.
 #
-#   from std.json import parse, get_string, object_get, object_has, object_keys, encode
-#   root := parse(data)
-#   name := get_string(object_get(root, "name"))
-#   if object_has(root, "name"):
-#       print(object_keys(root).join(", "))
+#   import std.json as json
+#   root := json.parse(data)
+#   name := json.get_string(json.object_get(root, "name"))
+#   if json.object_has(root, "name"):
+#       print(json.object_keys(root).join(", "))
 
-from std.io import read_file_text_chunked, write_file_text_chunked
+import std.io as io
 
 JSON_FILE_CHUNK_SIZE := 4096
 
@@ -316,7 +316,7 @@ pub fn parse_file_chunked(path: String, chunk_size: Int) -> Int:
     return json_parse_file_chunked(path, chunk_size)
 
 fn json_parse_file_chunked(path: String, chunk_size: Int) -> Int:
-    data_result := read_file_text_chunked(path, chunk_size)
+    data_result := io.read_file_text_chunked(path, chunk_size)
     if data_result.is_err:
         return 0 - 1
     return json_parse(data_result.ok)
@@ -604,7 +604,7 @@ pub fn save_chunked(path: String, handle: Int, chunk_size: Int) -> Int:
     return json_save_chunked(path, handle, chunk_size)
 
 fn json_save_chunked(path: String, handle: Int, chunk_size: Int) -> Int:
-    write_result := write_file_text_chunked(path, json_encode(handle), chunk_size)
+    write_result := io.write_file_text_chunked(path, json_encode(handle), chunk_size)
     if write_result.is_err:
         return 0 - 1
     return write_result.ok

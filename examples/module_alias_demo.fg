@@ -1,12 +1,12 @@
 # module_alias_demo.fg — demonstrates import patterns
-# Shows: from_import, import with alias, and namespace usage
+# shows: from_import, import with alias, and namespace usage
 
-# Standard from_import - imports specific functions into current scope
+# standard from_import - imports specific functions into current scope
 from std.math import abs, min, max, clamp
 
-# Import with alias - creates module namespace (partial support)
-# Note: full module.func() syntax requires additional infrastructure
+# import with alias - creates a readable module namespace
 import std.math as math_lib
+import std.io as io
 
 fn test_direct_imports():
     # These work - functions imported directly into scope
@@ -21,12 +21,13 @@ fn test_direct_imports():
     clamped := clamp(15, 0, 10)
     print("clamp(15, 0, 10) = " + clamped.to_string())
 
-fn main():
+fn main() -> Int!:
     print("Module Import Patterns Demonstration")
     print("====================================")
     test_direct_imports()
     print("Direct import tests passed!")
     print("")
-    print("Note: import X as Y syntax is parsed but full")
-    print("module namespace resolution (Y.func()) requires")
-    print("additional infrastructure for qualified name lookup.")
+    print("math_lib.abs(-12) = " + math_lib.abs(-12).to_string())
+    reader := io.string_reader("module alias io")
+    print(reader.read_all()!)
+    return 0

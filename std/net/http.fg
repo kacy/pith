@@ -3,24 +3,17 @@
 # Request parsing returns a packed string; accessor functions extract fields.
 # No cross-module state needed — all operations are pure string transforms.
 #
-#   from std.net.http import parse_request, method, path, body
-#   from std.net.http import get_header, get_query_param
-#   from std.net.http import html_response, json_response, not_found
-#   from std.net.http import read_request, send_response
+#   import std.net.http as http
 #
 #   fn handle(fd: Int):
-#       req := read_request(fd)
-#       if method(req) == "GET" and path(req) == "/":
-#           send_response(fd, html_response(200, "<h1>Hello!</h1>"))
+#       req := http.read_request(fd)
+#       if http.method(req) == "GET" and http.path(req) == "/":
+#           http.send_response(fd, http.html_response(200, "<h1>Hello!</h1>"))
 #       else:
-#           send_response(fd, not_found())
+#           http.send_response(fd, http.not_found())
 
 from std.io import BufferedStringReader, BufferedTcpStream
-from std.io import buffered_string_reader_read, buffered_string_reader_read_line
-from std.io import tcp_stream_from_fd, tcp_stream_connect, tcp_stream_close, buffered_tcp_stream
-from std.io import buffered_tcp_stream_read, buffered_tcp_stream_read_line
-from std.io import buffered_tcp_writer, buffered_tcp_writer_write, buffered_tcp_writer_flush
-from std.io import read_all_tcp_stream_chunked
+import std.io as io
 
 # ===============================================================
 # MIME Types
@@ -351,53 +344,53 @@ fn content_length_from_head(raw_head: String) -> Int!:
 
 fn read_request_from_buffered_string(reader: BufferedStringReader) -> String!:
     crlf := chr(13) + chr(10)
-    request_line := buffered_string_reader_read_line(reader)!
+    request_line := reader.read_line()!
     if request_line == "":
         return parse_request("")
 
     mut raw := request_line + crlf
-    mut line := buffered_string_reader_read_line(reader)!
+    mut line := reader.read_line()!
     while line.len() > 0:
         raw = raw + line + crlf
-        line = buffered_string_reader_read_line(reader)!
+        line = reader.read_line()!
     raw = raw + crlf
 
     content_length := content_length_from_head(raw)!
     if content_length > 0:
-        raw = raw + buffered_string_reader_read(reader, content_length)!
+        raw = raw + reader.read(content_length)!
     return parse_request(raw)
 
 fn read_request_from_buffered_tcp(reader: BufferedTcpStream) -> String!:
     crlf := chr(13) + chr(10)
-    request_line := buffered_tcp_stream_read_line(reader)!
+    request_line := reader.read_line()!
     if request_line == "":
         return parse_request("")
 
     mut raw := request_line + crlf
-    mut line := buffered_tcp_stream_read_line(reader)!
+    mut line := reader.read_line()!
     while line.len() > 0:
         raw = raw + line + crlf
-        line = buffered_tcp_stream_read_line(reader)!
+        line = reader.read_line()!
     raw = raw + crlf
 
     content_length := content_length_from_head(raw)!
     if content_length > 0:
-        raw = raw + buffered_tcp_stream_read(reader, content_length)!
+        raw = raw + reader.read(content_length)!
     return parse_request(raw)
 
 pub fn read_request_buffered(reader: BufferedStringReader) -> String!:
     return read_request_from_buffered_string(reader)
 
 pub fn read_request(fd: Int) -> String!:
-    stream := tcp_stream_from_fd(fd)
-    reader := buffered_tcp_stream(stream)
+    stream := io.from_fd(fd)
+    reader := stream.buffered_reader()
     return read_request_from_buffered_tcp(reader)
 
 pub fn send_response(fd: Int, response: String) -> Int!:
-    stream := tcp_stream_from_fd(fd)
-    writer := buffered_tcp_writer(stream)
-    written := buffered_tcp_writer_write(writer, response)!
-    buffered_tcp_writer_flush(writer)!
+    stream := io.from_fd(fd)
+    writer := stream.buffered_writer()
+    written := writer.write(response)!
+    writer.flush()!
     tcp_close(fd)
     return written
 
@@ -406,7 +399,7 @@ pub fn send_response(fd: Int, response: String) -> Int!:
 # ===============================================================
 
 pub fn get(host: String, port: Int, url_path: String) -> String!:
-    conn := tcp_stream_connect(host, port)!
+    conn := io.connect(host, port)!
     crlf := chr(13) + chr(10)
     mut req := "GET " + url_path
     req = req + " HTTP/1.1"
@@ -417,11 +410,11 @@ pub fn get(host: String, port: Int, url_path: String) -> String!:
     req = req + "Connection: close"
     req = req + crlf
     req = req + crlf
-    writer := buffered_tcp_writer(conn)
-    buffered_tcp_writer_write(writer, req)!
-    buffered_tcp_writer_flush(writer)!
-    response := read_all_tcp_stream_chunked(conn, 4096)!
-    tcp_stream_close(conn)
+    writer := conn.buffered_writer()
+    writer.write_all(req)!
+    writer.flush()!
+    response := conn.read_all_chunked(4096)!
+    conn.close()
     cr := chr(13)
     mut hi := 0
     resp_len := response.len()

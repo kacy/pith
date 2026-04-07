@@ -30,6 +30,17 @@ too:
 that is enough to unify the common loops today without waiting for a bytes
 layer.
 
+the compiler now also supports module-qualified import aliases cleanly, so
+stdlib call sites can read like:
+- `import std.io as io`
+- `import std.json as json`
+- `reader := io.string_reader(data)`
+- `text := io.read_all(reader)!`
+- `line := buffered.read_line()!`
+- `stream.close()`
+- `conn := io.connect(host, port)!`
+- `root := json.parse(text)`
+
 ## shared pieces
 
 the io layer now includes:

@@ -1,5 +1,5 @@
-from std.json import parse, parse_file_chunked, save_chunked, type_of, object_get, get_string, get_bool, array_len
-from std.fs import exists, remove
+import std.json as json
+import std.fs as fs
 
 fn main() -> String!:
     json_path := "/tmp/forge_io_json.json"
@@ -7,15 +7,15 @@ fn main() -> String!:
     rb := chr(125)
 
     doc := lb + "\"name\":\"forge\",\"enabled\":true,\"items\":[1,2,3]" + rb
-    root := parse(doc)
-    print(save_chunked(json_path, root, 4).to_string())
+    root := json.parse(doc)
+    print(json.save_chunked(json_path, root, 4).to_string())
 
-    loaded := parse_file_chunked(json_path, 3)
-    print(type_of(loaded))
-    print(get_string(object_get(loaded, "name")))
-    print(get_bool(object_get(loaded, "enabled")).to_string())
-    print(array_len(object_get(loaded, "items")).to_string())
-    print(exists(json_path).to_string())
+    loaded := json.parse_file_chunked(json_path, 3)
+    print(json.type_of(loaded))
+    print(json.get_string(json.object_get(loaded, "name")))
+    print(json.get_bool(json.object_get(loaded, "enabled")).to_string())
+    print(json.array_len(json.object_get(loaded, "items")).to_string())
+    print(fs.exists(json_path).to_string())
 
-    remove(json_path)
+    fs.remove(json_path)
     return ""

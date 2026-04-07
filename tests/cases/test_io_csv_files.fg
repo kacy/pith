@@ -1,5 +1,5 @@
-from std.csv import save_chunked, parse_file_chunked, parse_with_headers_file_chunked
-from std.fs import exists, remove
+import std.csv as csv
+import std.fs as fs
 
 fn main() -> String!:
     csv_path := "/tmp/forge_io_csv.csv"
@@ -9,16 +9,16 @@ fn main() -> String!:
     rows.push(["alice", "30"])
     rows.push(["bob", "25"])
 
-    print(save_chunked(csv_path, rows, 3)!.to_string())
+    print(csv.save_chunked(csv_path, rows, 3)!.to_string())
 
-    parsed := parse_file_chunked(csv_path, 2)!
+    parsed := csv.parse_file_chunked(csv_path, 2)!
     print(parsed.len().to_string())
     print(parsed[1].join("|"))
 
-    with_headers := parse_with_headers_file_chunked(csv_path, 2)!
+    with_headers := csv.parse_with_headers_file_chunked(csv_path, 2)!
     print(with_headers.len().to_string())
     print(with_headers[0]["name"] + "|" + with_headers[0]["age"])
-    print(exists(csv_path).to_string())
+    print(fs.exists(csv_path).to_string())
 
-    remove(csv_path)
+    fs.remove(csv_path)
     return ""

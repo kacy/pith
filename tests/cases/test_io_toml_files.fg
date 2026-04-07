@@ -1,5 +1,5 @@
-from std.toml import parse_file, parse_file_chunked, type_of, get_string, get_bool, get_table, get_array, array_len, keys
-from std.fs import write, exists, remove
+import std.toml as toml
+import std.fs as fs
 
 fn main() -> String!:
     toml_path := "/tmp/forge_io_toml.toml"
@@ -13,20 +13,20 @@ fn main() -> String!:
     doc = doc + "host = " + chr(34) + "localhost" + chr(34) + newline
     doc = doc + "ports = [8080, 8081]" + newline
 
-    print(write(toml_path, doc)!.to_string())
+    print(fs.write(toml_path, doc)!.to_string())
 
-    root := parse_file(toml_path)
-    print(type_of(root))
-    print(get_string(root, "title"))
-    print(get_bool(root, "enabled").to_string())
+    root := toml.parse_file(toml_path)
+    print(toml.type_of(root))
+    print(toml.get_string(root, "title"))
+    print(toml.get_bool(root, "enabled").to_string())
 
-    root_chunked := parse_file_chunked(toml_path, 3)
-    server := get_table(root_chunked, "server")
-    ports := get_array(server, "ports")
-    print(get_string(server, "host"))
-    print(array_len(ports).to_string())
-    print(keys(root_chunked).len().to_string())
-    print(exists(toml_path).to_string())
+    root_chunked := toml.parse_file_chunked(toml_path, 3)
+    server := toml.get_table(root_chunked, "server")
+    ports := toml.get_array(server, "ports")
+    print(toml.get_string(server, "host"))
+    print(toml.array_len(ports).to_string())
+    print(toml.keys(root_chunked).len().to_string())
+    print(fs.exists(toml_path).to_string())
 
-    remove(toml_path)
+    fs.remove(toml_path)
     return ""

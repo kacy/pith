@@ -1,0 +1,19 @@
+import std.io as io
+
+fn main() -> Int!:
+    direct := io.string_reader("ok")
+    print(direct.read(1)!)
+    print(direct.read(1)!)
+
+    buffered := io.string_reader("alpha" + chr(10) + "beta").buffered_chunked(2)
+    print(buffered.read(3)!)
+    print(buffered.read_line()!)
+    print(buffered.read_line()!)
+
+    sink := io.string_buffer()
+    writer := sink.buffered_chunked(4)
+    print(writer.write("ab")!.to_string())
+    print(writer.write("cdef")!.to_string())
+    print(writer.flush()!.to_string())
+    print(sink.string())
+    return 0

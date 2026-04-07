@@ -1,22 +1,21 @@
 # process management
 
-from std.io import spawn_process, process_stdout, process_stderr
-from std.io import read_all_process_stdout, read_all_process_stderr, wait_process, close_process
+import std.io as io
 
 fn main() -> String!:
     # spawn echo command
-    child_process := spawn_process("echo hello from child")!
-    output := read_all_process_stdout(process_stdout(child_process))!
-    exit_code := wait_process(child_process)
-    close_process(child_process)
+    child_process := io.spawn_process("echo hello from child")!
+    output := child_process.stdout().read_all()!
+    exit_code := child_process.wait()
+    child_process.close()
     print("output: " + output.trim())
     print("exit code: " + exit_code.to_string())
 
     # spawn a command that produces stderr
-    failing_process := spawn_process("ls /nonexistent_path_xyz")!
-    error_output := read_all_process_stderr(process_stderr(failing_process))!
-    failing_exit_code := wait_process(failing_process)
-    close_process(failing_process)
+    failing_process := io.spawn_process("ls /nonexistent_path_xyz")!
+    error_output := failing_process.stderr().read_all()!
+    failing_exit_code := failing_process.wait()
+    failing_process.close()
     print("stderr: " + (error_output.len() > 0).to_string())
     print("ls failed: " + (failing_exit_code != 0).to_string())
     return ""

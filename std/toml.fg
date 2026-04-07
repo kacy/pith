@@ -1,15 +1,15 @@
 # std.toml — TOML v1.0 parser
 #
-# Parse TOML configuration files into a tree structure.
-# Uses opaque Int handles into a node pool.
+# parse TOML configuration files into a tree structure.
+# uses opaque Int handles into a node pool.
 #
-#   from std.toml import parse, get_string, get_table
-#   root := parse(data)
-#   name := get_string(root, "name")
-#   db := get_table(root, "database")
-#   host := get_string(db, "host")
+#   import std.toml as toml
+#   root := toml.parse(data)
+#   name := toml.get_string(root, "name")
+#   db := toml.get_table(root, "database")
+#   host := toml.get_string(db, "host")
 
-from std.io import read_file_text_chunked
+import std.io as io
 
 TOML_FILE_CHUNK_SIZE := 4096
 
@@ -399,7 +399,7 @@ pub fn parse_file_chunked(path: String, chunk_size: Int) -> Int:
     return toml_parse_file_chunked(path, chunk_size)
 
 fn toml_parse_file_chunked(path: String, chunk_size: Int) -> Int:
-    data_result := read_file_text_chunked(path, chunk_size)
+    data_result := io.read_file_text_chunked(path, chunk_size)
     if data_result.is_err:
         return 0 - 1
     return toml_parse(data_result.ok)

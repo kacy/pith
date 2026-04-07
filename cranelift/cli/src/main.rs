@@ -410,6 +410,11 @@ fn extract_imports(source: &str) -> Vec<String> {
                     imports.push(mod_path.to_string());
                 }
             }
+        } else if let Some(rest) = trimmed.strip_prefix("import ") {
+            let mod_path = rest.split(" as ").next().unwrap_or(rest).trim();
+            if !mod_path.is_empty() {
+                imports.push(mod_path.to_string());
+            }
         }
     }
     imports

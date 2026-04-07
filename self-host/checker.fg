@@ -108,6 +108,34 @@ pub fn initialize_checker(file_path: String):
 pub fn register_import_alias(alias: String, module_path: String):
     module_aliases.insert(alias, module_path)
 
+fn module_default_alias(module_path: String) -> String:
+    mut last_dot := 0 - 1
+    mut i := 0
+    while i < module_path.len():
+        if module_path[i] == ".":
+            last_dot = i
+        i = i + 1
+    if last_dot < 0:
+        return module_path
+    return module_path.substring(last_dot + 1, module_path.len())
+
+fn module_import_target_name(module_path: String, name: String) -> String:
+    if module_path == "std.json":
+        return "json_" + name
+    if module_path == "std.toml":
+        return "toml_" + name
+    if module_path == "std.log":
+        return "log_" + name
+    if module_path == "std.net.url":
+        return "url_" + name
+    if module_path == "std.fs":
+        return "fs_" + name
+    if module_path == "std.os.path":
+        if name == "base":
+            return "forge_path_basename"
+        return "path_" + name
+    return name
+
 # Process import declarations from AST and register aliases
 pub fn process_import_aliases(root_idx: Int):
     root := get_node(root_idx)
@@ -138,6 +166,8 @@ pub fn process_import_aliases(root_idx: Int):
                 si = si + 1
             if has_alias:
                 register_import_alias(alias, path)
+            else:
+                register_import_alias(module_default_alias(path), path)
         elif kind == "from_import":
             # Parse "path name1 name2 ..." or "path *" for wildcard
             mut parts: List[String] := []
@@ -913,7 +943,7 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             register_method_declaration(concrete_name, method_node_idx, cn, method_is_pub)
 
 fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_pub: Bool):
-    method_name := node.value
+    mut method_name := node.value
     fn_tid := resolve_function_signature(node)
     key := type_name + "." + method_name
     method_type_map.insert(key, fn_tid)
@@ -1904,6 +1934,9 @@ fn check_function_call_expression(callee_idx: Int, arg_indices: List[Int], scope
     callee_type := c_check_expr(callee_idx, scope_id)
     if is_error_type(callee_type):
         return TID_ERR
+    return check_callable_type_with_args(callee_type, arg_indices, scope_id)
+
+fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope_id: Int) -> Int:
     fn_info := get_type_info(callee_type)
     if fn_info.kind != "function":
         report_error("E208", "expression is not callable")
@@ -2143,7 +2176,32 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     # children[1..] = arguments
     if node.children.len() < 1:
         return TID_ERR
-    method_name := node.value
+    mut method_name := node.value
+    if method_name.starts_with("."):
+        method_name = method_name.substring(1, method_name.len())
+    recv_node := get_node(node.children[0])
+
+    mut arg_indices: List[Int] := []
+    mut skip_recv := 1
+    for child in node.children:
+        if skip_recv > 0:
+            skip_recv = skip_recv - 1
+            continue
+        arg_indices.push(child)
+
+    if recv_node.kind == "ident":
+        recv_name := recv_node.value
+        if module_aliases.contains_key(recv_name):
+            module_path := module_aliases[recv_name]
+            qualified_name := module_import_target_name(module_path, method_name)
+            mut callee_type := lookup_binding(scope_id, qualified_name)
+            if callee_type < 0:
+                callee_type = lookup_binding(scope_id, method_name)
+            if callee_type < 0:
+                report_error("E201", "undefined function: " + recv_name + "." + method_name)
+                return TID_ERR
+            return check_callable_type_with_args(callee_type, arg_indices, scope_id)
+
     receiver_type := c_check_expr(node.children[0], scope_id)
     if is_error_type(receiver_type):
         return TID_ERR
@@ -2155,15 +2213,6 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     elif recv_info.kind == "result":
         dispatch_type = recv_info.inner
         recv_info = get_type_info(dispatch_type)
-
-    # get argument nodes (skip receiver)
-    mut arg_indices: List[Int] := []
-    mut skip_recv := 1
-    for child in node.children:
-        if skip_recv > 0:
-            skip_recv = skip_recv - 1
-            continue
-        arg_indices.push(child)
 
     tid_string := lookup_type_id("String")
     tid_int := lookup_type_id("Int")
@@ -2578,14 +2627,14 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
     if obj_node.kind == "ident":
         obj_name := obj_node.value
         if module_aliases.contains_key(obj_name):
-            # this is a module alias - look up the function in the module
-            # for now, we need to construct the full function name
-            # the module system resolves functions by their simple name in the scope
-            # so we just need to look up the function name directly
-            func_tid := lookup_binding(scope_id, field_name)
+            module_path := module_aliases[obj_name]
+            qualified_name := module_import_target_name(module_path, field_name)
+            mut func_tid := lookup_binding(scope_id, qualified_name)
             if func_tid >= 0:
                 return func_tid
-            # function not found in module
+            func_tid = lookup_binding(scope_id, field_name)
+            if func_tid >= 0:
+                return func_tid
             report_error("E209", "module '" + obj_name + "' has no function '" + field_name + "'")
             return TID_ERR
     
@@ -3374,6 +3423,7 @@ fn types_structurally_equal(a: Int, b: Int) -> Bool:
 
 pub fn c_run(root_idx: Int, file_path: String) -> List[Diagnostic]:
     initialize_checker(file_path)
+    process_import_aliases(root_idx)
     c_register_all(root_idx)
     c_check_all(root_idx)
     return checker_diagnostics
@@ -3381,6 +3431,7 @@ pub fn c_run(root_idx: Int, file_path: String) -> List[Diagnostic]:
 # run checker passes on a single module without re-initializing.
 # call initialize_checker() once, then c_run_module() for each module in order.
 pub fn c_run_module(root_idx: Int) -> List[Diagnostic]:
+    process_import_aliases(root_idx)
     c_register_all(root_idx)
     c_check_all(root_idx)
     return checker_diagnostics

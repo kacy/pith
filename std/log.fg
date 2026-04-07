@@ -1,15 +1,15 @@
 # std.log — structured logging to stderr
 #
-# Timestamped log messages with severity levels, key-value fields,
+# timestamped log messages with severity levels, key-value fields,
 # and configurable minimum level.
 #
-#   from std.log import info, warn, error, set_level
-#   set_level(2)  # only WARN and above
-#   info("skipped")
-#   warn("this prints")
-#   error("connection failed", "host=db.local port=5432")
+#   import std.log as log
+#   log.set_level(2)  # only WARN and above
+#   log.info("skipped")
+#   log.warn("this prints")
+#   log.error("connection failed", "host=db.local port=5432")
 
-from std.io import append_file_text
+import std.io as io
 
 # Levels: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR
 mut min_level: Int := 0
@@ -61,7 +61,7 @@ fn emit_line(line: String):
     print_err(line)
     if sink_path == "":
         return
-    _wrote := append_file_text(sink_path, line + chr(10))
+    _wrote := io.append_file_text(sink_path, line + chr(10))
 
 pub fn debug(msg: String):
     log_debug(msg)

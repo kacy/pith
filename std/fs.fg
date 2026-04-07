@@ -1,18 +1,18 @@
 # file streams build on std.io's shared handle-backed surface
-from std.io import FileStream, file_stream_open_read, file_stream_open_write, file_stream_open_append
+from std.io import FileStream
 
 # std.fs — file system operations
 #
-# File system utilities for checking existence, reading, writing,
-# and managing files and directories. All paths are strings.
+# file system utilities for checking existence, reading, writing,
+# and managing files and directories. all paths are strings.
 #
-# Note: read() and write() return Result types because I/O can fail.
+# note: read() and write() return Result types because I/O can fail.
 #       exists(), is_dir(), remove(), etc. return Bool for success check.
 #
-#   from std.fs import read, write, exists
-#   if exists("config.txt"):
-#       content := read("config.txt")!
-#       write("backup.txt", content)!
+#   import std.fs as fs
+#   if fs.exists("config.txt"):
+#       content := fs.read("config.txt")!
+#       fs.write("backup.txt", content)!
 
 # ===============================================================
 # File Existence and Type
@@ -67,21 +67,21 @@ pub fn open(path: String) -> FileStream!:
     return fs_open(path)
 
 fn fs_open(path: String) -> FileStream!:
-    return file_stream_open_read(path)
+    return FileStream(file_open_read(path)!)
 
 # creates or truncates a file for streaming writes
 pub fn create(path: String) -> FileStream!:
     return fs_create(path)
 
 fn fs_create(path: String) -> FileStream!:
-    return file_stream_open_write(path)
+    return FileStream(file_open_write(path)!)
 
 # opens a file for streaming appends
 pub fn open_append(path: String) -> FileStream!:
     return fs_open_append(path)
 
 fn fs_open_append(path: String) -> FileStream!:
-    return file_stream_open_append(path)
+    return FileStream(file_open_append(path)!)
 
 # ===============================================================
 # File and Directory Management

@@ -8,15 +8,13 @@
 #       curl http://localhost:8080/api
 #       curl http://localhost:8080/greet?name=world
 
-from std.net.http import read_request, send_response
-from std.net.http import method, path, get_header, get_query_param
-from std.net.http import html_response, json_response, not_found, redirect
+import std.net.http as http
 
 fn handle(fd: Int) -> Int!:
     tcp_set_timeout(fd, 1000)
-    req := read_request(fd)!
-    m := method(req)
-    p := path(req)
+    req := http.read_request(fd)!
+    m := http.method(req)
+    p := http.path(req)
 
     if m == "GET" and p == "/":
         mut html := "<!DOCTYPE html><html><body>"
@@ -24,28 +22,30 @@ fn handle(fd: Int) -> Int!:
         html = html + "<p><a href=/api>JSON API</a></p>"
         html = html + "<p><a href=/greet?name=world>Greet</a></p>"
         html = html + "</body></html>"
-        return send_response(fd, html_response(200, html))
+        return http.send_response(fd, http.html_response(200, html))
 
     elif m == "GET" and p == "/api":
-        ua := get_header(req, "User-Agent")
+        ua := http.get_header(req, "User-Agent")
         lb := chr(123)
         rb := chr(125)
-        body := lb + "\"status\":\"ok\",\"agent\":\"" + ua + "\"" + rb
-        return send_response(fd, json_response(200, body))
+        quote := chr(34)
+        mut body := lb + quote + "status" + quote + ":" + quote + "ok" + quote
+        body = body + "," + quote + "agent" + quote + ":" + quote + ua + quote + rb
+        return http.send_response(fd, http.json_response(200, body))
 
     elif m == "GET" and p == "/greet":
-        name := get_query_param(req, "name")
+        name := http.get_query_param(req, "name")
         if name == "":
-            return send_response(fd, html_response(200, "<h1>Hello, stranger!</h1>"))
+            return http.send_response(fd, http.html_response(200, "<h1>Hello, stranger!</h1>"))
         else:
             greeting := "<h1>Hello, " + name + "!</h1>"
-            return send_response(fd, html_response(200, greeting))
+            return http.send_response(fd, http.html_response(200, greeting))
 
     elif m == "GET" and p == "/redirect":
-        return send_response(fd, redirect("/"))
+        return http.send_response(fd, http.redirect("/"))
 
     else:
-        return send_response(fd, not_found())
+        return http.send_response(fd, http.not_found())
 
 fn main() -> Int!:
     port := 8080

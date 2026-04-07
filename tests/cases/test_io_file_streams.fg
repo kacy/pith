@@ -1,27 +1,26 @@
-from std.fs import create, open, open_append, exists
-from std.io import write_all_file_stream, read_all_file_stream_chunked, file_stream_close
-from std.io import write_file_text_chunked, append_file_text_chunked, read_file_text_chunked
+import std.fs as fs
+import std.io as io
 
 fn main() -> Int!:
     path := "/tmp/forge_io_stream_test.txt"
 
-    writer := create(path)!
-    print(write_all_file_stream(writer, "hello")!.to_string())
-    file_stream_close(writer)
+    writer := fs.create(path)!
+    print(writer.write_all("hello")!.to_string())
+    writer.close()
 
-    appender := open_append(path)!
-    print(write_all_file_stream(appender, " world")!.to_string())
-    file_stream_close(appender)
+    appender := fs.open_append(path)!
+    print(appender.write_all(" world")!.to_string())
+    appender.close()
 
-    reader := open(path)!
-    print(read_all_file_stream_chunked(reader, 4)!)
-    file_stream_close(reader)
+    reader := fs.open(path)!
+    print(reader.read_all_chunked(4)!)
+    reader.close()
 
-    print(exists(path).to_string())
+    print(fs.exists(path).to_string())
 
     text_path := "/tmp/forge_io_text_test.txt"
-    print(write_file_text_chunked(text_path, "alpha", 2)!.to_string())
-    print(append_file_text_chunked(text_path, " beta", 2)!.to_string())
-    print(read_file_text_chunked(text_path, 3)!)
-    print(exists(text_path).to_string())
+    print(io.write_file_text_chunked(text_path, "alpha", 2)!.to_string())
+    print(io.append_file_text_chunked(text_path, " beta", 2)!.to_string())
+    print(io.read_file_text_chunked(text_path, 3)!)
+    print(fs.exists(text_path).to_string())
     return 0

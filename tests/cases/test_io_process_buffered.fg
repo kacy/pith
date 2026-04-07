@@ -1,23 +1,20 @@
-from std.io import spawn_process, process_stdout, process_stderr, close_process, wait_process
-from std.io import buffered_process_stdout_chunked, buffered_process_stderr_chunked
-from std.io import buffered_process_stdout_read, buffered_process_stdout_read_line
-from std.io import buffered_process_stderr_read_line
+import std.io as io
 
 fn main() -> Int!:
-    stdout_proc := spawn_process("printf 'alpha\nbeta\r\ngamma'")!
-    stdout_reader := buffered_process_stdout_chunked(process_stdout(stdout_proc), 2)
-    print(buffered_process_stdout_read(stdout_reader, 3)!)
-    print(buffered_process_stdout_read_line(stdout_reader)!)
-    print(buffered_process_stdout_read_line(stdout_reader)!)
-    print("[" + buffered_process_stdout_read_line(stdout_reader)! + "]")
-    print(wait_process(stdout_proc).to_string())
-    close_process(stdout_proc)
+    stdout_proc := io.spawn_process("printf 'alpha\nbeta\r\ngamma'")!
+    stdout_reader := stdout_proc.stdout().buffered_chunked(2)
+    print(stdout_reader.read(3)!)
+    print(stdout_reader.read_line()!)
+    print(stdout_reader.read_line()!)
+    print("[" + stdout_reader.read_line()! + "]")
+    print(stdout_proc.wait().to_string())
+    stdout_proc.close()
 
-    stderr_proc := spawn_process("printf 'warn\nfatal' >&2")!
-    stderr_reader := buffered_process_stderr_chunked(process_stderr(stderr_proc), 1)
-    print(buffered_process_stderr_read_line(stderr_reader)!)
-    print(buffered_process_stderr_read_line(stderr_reader)!)
-    print("[" + buffered_process_stderr_read_line(stderr_reader)! + "]")
-    print(wait_process(stderr_proc).to_string())
-    close_process(stderr_proc)
+    stderr_proc := io.spawn_process("printf 'warn\nfatal' >&2")!
+    stderr_reader := stderr_proc.stderr().buffered_chunked(1)
+    print(stderr_reader.read_line()!)
+    print(stderr_reader.read_line()!)
+    print("[" + stderr_reader.read_line()! + "]")
+    print(stderr_proc.wait().to_string())
+    stderr_proc.close()
     return 0

@@ -293,9 +293,7 @@ impl WebSocketFrame:
     fn payload_text() -> String!:
         return self.payload.to_string_utf8()!
     fn close_code() -> Int!:
-        if self.payload.len() < 2:
-            fail "websocket close frame missing code"
-        return bit_or(bit_shl(self.payload[0], 8), self.payload[1])
+        return validate_close_payload(self.payload)
     fn close_reason() -> String!:
         if self.payload.len() <= 2:
             return ""
@@ -357,11 +355,61 @@ fn apply_mask(payload: Bytes, mask_key: Bytes) -> Bytes!:
     return buf.bytes()
 fn frame_mask_key(data: Bytes, header_size: Int) -> Bytes:
     return data.slice(header_size - 4, header_size)
+fn has_reserved_bits(first_byte: Int) -> Bool:
+    return bit_and(first_byte, 112) != 0
+fn is_data_opcode(opcode: Int) -> Bool:
+    return opcode == OP_TEXT or opcode == OP_BINARY
+fn is_reserved_opcode(opcode: Int) -> Bool:
+    return opcode == 3 or opcode == 4 or opcode == 5 or opcode == 6 or opcode == 7 or opcode == 11 or opcode == 12 or opcode == 13 or opcode == 14 or opcode == 15
+fn is_valid_close_code(code: Int) -> Bool:
+    if code == 1000 or code == 1001 or code == 1002 or code == 1003:
+        return true
+    if code == 1007 or code == 1008 or code == 1009 or code == 1010 or code == 1011 or code == 1012 or code == 1013 or code == 1014:
+        return true
+    if code >= 3000 and code <= 4999:
+        return true
+    return false
+fn validate_close_payload(payload: Bytes) -> Int!:
+    if payload.len() == 1:
+        fail "websocket close frame payload too short"
+    if payload.len() < 2:
+        return 0
+    code := bit_or(bit_shl(payload[0], 8), payload[1])
+    if not is_valid_close_code(code):
+        fail "invalid websocket close code"
+    if payload.len() > 2:
+        payload.slice(2, payload.len()).to_string_utf8()!
+    return code
+fn validate_frame_rules(first_byte: Int, fin: Bool, opcode: Int, payload: Bytes) -> Int!:
+    if has_reserved_bits(first_byte):
+        fail "websocket reserved bits are not supported"
+    if is_reserved_opcode(opcode):
+        fail "websocket reserved opcode"
+    if is_control_opcode(opcode):
+        if not fin:
+            fail "websocket control frames must be final"
+        if payload.len() > MAX_CONTROL_PAYLOAD:
+            fail "websocket control frame payload too large"
+        if opcode == OP_CLOSE:
+            validate_close_payload(payload)!
+    elif opcode != OP_CONTINUATION and not is_data_opcode(opcode):
+        fail "unsupported websocket opcode"
+    return opcode
+fn validate_frame_direction(ws: WebSocket, frame: WebSocketFrame) -> Int!:
+    if websocket_is_client(ws):
+        if frame.masked:
+            fail "server websocket frames must not be masked"
+        return 0
+    if not frame.masked:
+        fail "client websocket frames must be masked"
+    return 0
 fn is_control_opcode(opcode: Int) -> Bool:
     return opcode == OP_CLOSE or opcode == OP_PING or opcode == OP_PONG
 pub fn parse_frame(data: Bytes) -> WebSocketFrame!:
     if data.len() < 2:
         fail "websocket frame too short"
+    if has_reserved_bits(data[0]):
+        fail "websocket reserved bits are not supported"
     fin := bit_and(data[0], 128) != 0
     opcode := bit_and(data[0], 15)
     masked := frame_is_masked(data[1])
@@ -372,9 +420,13 @@ pub fn parse_frame(data: Bytes) -> WebSocketFrame!:
     payload_start := header_size
     payload_end := payload_start + payload_len
     payload := data.slice(payload_start, payload_end)
+    mut decoded_payload := payload
     if masked:
-        return WebSocketFrame(fin, opcode, true, apply_mask(payload, frame_mask_key(data, header_size))!)
-    return WebSocketFrame(fin, opcode, false, payload)
+        decoded_payload = apply_mask(payload, frame_mask_key(data, header_size))!
+    validate_frame_rules(data[0], fin, opcode, decoded_payload)!
+    if masked:
+        return WebSocketFrame(fin, opcode, true, decoded_payload)
+    return WebSocketFrame(fin, opcode, false, decoded_payload)
 pub fn frame_bytes(opcode: Int, payload: Bytes) -> Bytes!:
     return frame_bytes_with_fin(opcode, payload, true)
 fn frame_bytes_with_fin(opcode: Int, payload: Bytes, fin: Bool) -> Bytes!:
@@ -402,6 +454,7 @@ fn close_payload(code: Int, reason: String) -> Bytes!:
     payload.write_byte(bit_and(bit_shr(code, 8), 255))!
     payload.write_byte(bit_and(code, 255))!
     payload.write(bytes.from_string_utf8(reason))!
+    validate_close_payload(payload.bytes())!
     return payload.bytes()
 pub fn masked_frame_bytes(opcode: Int, payload: Bytes, mask_key: Bytes) -> Bytes!:
     return masked_frame_bytes_with_fin(opcode, payload, mask_key, true)
@@ -468,8 +521,7 @@ fn receive_message(ws: WebSocket) -> WebSocketMessage!:
     reader := websocket_reader(ws)
     while true:
         frame := read_frame_buffered(reader)!
-        if is_control_opcode(frame.opcode) and not frame.fin:
-            fail "websocket control frames must not be fragmented"
+        validate_frame_direction(ws, frame)!
         if frame.is_ping():
             ws.pong(frame.payload)!
             continue
@@ -487,8 +539,6 @@ fn receive_message(ws: WebSocket) -> WebSocketMessage!:
             if frame.fin:
                 return WebSocketMessage(message_opcode, message_buf.bytes())
             continue
-        if frame.opcode != OP_TEXT and frame.opcode != OP_BINARY:
-            fail "unsupported websocket opcode"
         if message_opcode != OP_CONTINUATION:
             fail "websocket message interrupted by a new data frame"
         if frame.fin:

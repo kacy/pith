@@ -29,7 +29,7 @@ fn inbound_frames() -> Bytes!:
     return wire.bytes()
 fn main() -> Int!:
     outbound := bytes.buffer()
-    ws := websocket.from_buffered(io.bytes_reader(inbound_frames()!).buffered_chunked(7), outbound.buffered_chunked(5), false)
+    ws := websocket.from_buffered(io.bytes_reader(inbound_frames()!).buffered_chunked(7), outbound.buffered_chunked(5), true)
     text := ws.recv_text()!
     binary := ws.recv()!
     ws.send_text("echo:" + text)!

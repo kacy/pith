@@ -29,6 +29,48 @@ fn invalid_text_wire() -> Bytes!:
     write_fragment(wire, 1, true, payload.bytes())!
     return wire.bytes()
 
+fn reserved_bits_wire() -> Bytes!:
+    wire := bytes.buffer()
+    wire.write_byte(193)!
+    wire.write_byte(2)!
+    wire.write(bytes.from_string_utf8("ok"))!
+    return wire.bytes()
+
+fn reserved_opcode_wire() -> Bytes!:
+    wire := bytes.buffer()
+    write_fragment(wire, 3, true, bytes.from_string_utf8("ok"))!
+    return wire.bytes()
+
+fn short_close_wire() -> Bytes!:
+    wire := bytes.buffer()
+    payload := bytes.buffer()
+    payload.write_byte(3)!
+    write_fragment(wire, 8, true, payload.bytes())!
+    return wire.bytes()
+
+fn invalid_close_code_wire() -> Bytes!:
+    wire := bytes.buffer()
+    payload := bytes.buffer()
+    payload.write_byte(3)!
+    payload.write_byte(236)!
+    write_fragment(wire, 8, true, payload.bytes())!
+    return wire.bytes()
+
+fn invalid_close_reason_wire() -> Bytes!:
+    wire := bytes.buffer()
+    payload := bytes.buffer()
+    payload.write_byte(3)!
+    payload.write_byte(232)!
+    payload.write_byte(255)!
+    write_fragment(wire, 8, true, payload.bytes())!
+    return wire.bytes()
+
+fn masked_server_text() -> Bytes!:
+    return websocket.client_text_frame_bytes("nope", bytes.from_string_utf8("abcd"))
+
+fn unmasked_client_text() -> Bytes!:
+    return websocket.text_frame_bytes("nope")
+
 fn main() -> Int!:
     invalid_continuation := websocket.from_buffered(io.bytes_reader(invalid_continuation_wire()!).buffered_chunked(3), bytes.buffer().buffered_chunked(3), false)
     print(invalid_continuation.recv().is_err.to_string())
@@ -38,4 +80,25 @@ fn main() -> Int!:
 
     invalid_text := websocket.from_buffered(io.bytes_reader(invalid_text_wire()!).buffered_chunked(2), bytes.buffer().buffered_chunked(2), false)
     print(invalid_text.recv_text().is_err.to_string())
+
+    reserved_bits := websocket.parse_frame(reserved_bits_wire()!)
+    print(reserved_bits.is_err.to_string())
+
+    reserved_opcode := websocket.parse_frame(reserved_opcode_wire()!)
+    print(reserved_opcode.is_err.to_string())
+
+    short_close := websocket.parse_frame(short_close_wire()!)
+    print(short_close.is_err.to_string())
+
+    invalid_close_code := websocket.parse_frame(invalid_close_code_wire()!)
+    print(invalid_close_code.is_err.to_string())
+
+    invalid_close_reason := websocket.parse_frame(invalid_close_reason_wire()!)
+    print(invalid_close_reason.is_err.to_string())
+
+    masked_server := websocket.from_buffered(io.bytes_reader(masked_server_text()!).buffered_chunked(3), bytes.buffer().buffered_chunked(3), true)
+    print(masked_server.recv_text().is_err.to_string())
+
+    unmasked_client := websocket.from_buffered(io.bytes_reader(unmasked_client_text()!).buffered_chunked(3), bytes.buffer().buffered_chunked(3), false)
+    print(unmasked_client.recv_text().is_err.to_string())
     return 0

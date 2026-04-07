@@ -1,13 +1,25 @@
 from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
 from ast import reset_arena
-from ir_emitter import emit_ir, set_import_roots
+from ir_emitter import emit_ir, set_import_roots, set_test_mode
 from driver import init_driver, resolve_imports, get_driver_parse_diagnostics, driver_has_parse_errors
 from checker import initialize_checker, c_run_module
 from errors import render_diagnostics, has_errors
 
 fn emit_file() -> String!:
-    path := args()[1]
+    a := args()
+    if a.len() < 2:
+        print("usage: ir_driver [--tests] <file.fg>")
+        exit(1)
+
+    mut path := a[1]
+    mut emit_tests := false
+    if path == "--tests":
+        if a.len() < 3:
+            print("usage: ir_driver [--tests] <file.fg>")
+            exit(1)
+        emit_tests = true
+        path = a[2]
     source := read_file(path)!
     tokens := lex_all(source)
     reset_arena()
@@ -33,6 +45,7 @@ fn emit_file() -> String!:
         exit(1)
 
     set_import_roots(import_roots)
+    set_test_mode(emit_tests)
     ir := emit_ir(root)
     print(ir)
     return ""

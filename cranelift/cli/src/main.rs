@@ -189,8 +189,17 @@ fn find_ir_driver() -> Option<String> {
 
 /// Run the IR driver on a single file, returning its IR text.
 /// Renames string IDs to avoid collisions: m0sN → m{module_index}sN
-fn run_ir_driver(driver: &str, path: &str, module_index: usize) -> Result<String, String> {
-    let output = Command::new(driver)
+fn run_ir_driver(
+    driver: &str,
+    path: &str,
+    module_index: usize,
+    emit_tests: bool,
+) -> Result<String, String> {
+    let mut command = Command::new(driver);
+    if emit_tests {
+        command.arg("--tests");
+    }
+    let output = command
         .arg(path)
         .output()
         .map_err(|e| format!("run ir_driver: {}", e))?;
@@ -509,7 +518,7 @@ fn rewrite_call_retkinds(ir: &str) -> String {
 }
 
 /// Get IR text for a file and all its imports (recursive)
-fn get_ir_from_compiler(path: &str) -> Result<String, String> {
+fn get_ir_from_compiler(path: &str, emit_tests: bool) -> Result<String, String> {
     let driver = find_ir_driver()
         .ok_or("No IR driver found. Ensure ./self-host/ir_driver exists.")?;
 
@@ -537,7 +546,7 @@ fn get_ir_from_compiler(path: &str) -> Result<String, String> {
     let mut imported_function_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for (i, mod_file) in module_files.iter().enumerate() {
-        let mut ir = run_ir_driver(&driver, mod_file, i)?;
+        let mut ir = run_ir_driver(&driver, mod_file, i, false)?;
         if !imported_function_map.is_empty() {
             ir = rewrite_calls_with_function_map(&ir, &imported_function_map);
         }
@@ -566,7 +575,12 @@ fn get_ir_from_compiler(path: &str) -> Result<String, String> {
             all_ir.push('\n');
         }
     }
-    let main_ir_raw = run_ir_driver(&driver, path, module_files.len() + MAIN_MODULE_INDEX_OFFSET)?;
+    let main_ir_raw = run_ir_driver(
+        &driver,
+        path,
+        module_files.len() + MAIN_MODULE_INDEX_OFFSET,
+        emit_tests,
+    )?;
     // Rewrite main module's load/store references to imported globals
     let mut main_ir = String::new();
     let global_map: std::collections::HashMap<&str, &str> = global_renames.iter()
@@ -676,12 +690,12 @@ fn collect_imports_recursive(
     }
 }
 
-fn compile_to_object(path: &str) -> Result<(Vec<u8>, usize), String> {
+fn compile_to_object(path: &str, emit_tests: bool) -> Result<(Vec<u8>, usize), String> {
     use forge_codegen::create_codegen;
     use forge_codegen::finalize_module;
     use forge_codegen::ir_consumer::compile_from_ir;
 
-    let ir_text = get_ir_from_compiler(path)
+    let ir_text = get_ir_from_compiler(path, emit_tests)
         .map_err(|e| format!("Error getting IR: {}", e))?;
 
     dump_ir_if_requested(&ir_text);
@@ -700,7 +714,7 @@ fn compile_to_object(path: &str) -> Result<(Vec<u8>, usize), String> {
 fn build_file(path: &str) {
     use forge_codegen::linker::build_executable;
 
-    let (bytes, func_count) = match compile_to_object(path) {
+    let (bytes, func_count) = match compile_to_object(path, false) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("{}", e);
@@ -737,7 +751,7 @@ fn unique_run_artifact_paths() -> (std::path::PathBuf, std::path::PathBuf) {
 fn run_file(path: &str) {
     use forge_codegen::linker::build_executable;
 
-    let (bytes, _) = match compile_to_object(path) {
+    let (bytes, _) = match compile_to_object(path, false) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("{}", e);
@@ -778,10 +792,46 @@ fn run_file(path: &str) {
 }
 
 fn test_file(path: &str) {
-    eprintln!("Test mode not yet implemented for Cranelift backend");
-    eprintln!("Use 'forge run' for now");
-    let _ = path;
-    std::process::exit(1);
+    use forge_codegen::linker::build_executable;
+
+    let (bytes, _) = match compile_to_object(path, true) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let (obj_path, exe_path) = unique_run_artifact_paths();
+    let keep_artifacts = std::env::var("FORGE_KEEP_RUN_ARTIFACTS").is_ok();
+    if let Err(e) = fs::write(&obj_path, &bytes) {
+        eprintln!("Error writing object: {}", e);
+        std::process::exit(1);
+    }
+    match build_executable(&obj_path.to_string_lossy(), &exe_path.to_string_lossy()) {
+        Ok(_) => {
+            let status = Command::new(&exe_path).status();
+            if !keep_artifacts {
+                let _ = fs::remove_file(&obj_path);
+                let _ = fs::remove_file(&exe_path);
+            }
+            match status {
+                Ok(s) => {
+                    if !s.success() {
+                        std::process::exit(s.code().unwrap_or(1));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error running {}: {}", exe_path.display(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Error linking {}: {}", exe_path.display(), e);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn check_file(path: &str) {

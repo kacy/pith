@@ -81,9 +81,13 @@ mut ir_import_renames: Map[String, String] := {}
 mut ir_module_aliases: Map[String, String] := {}
 mut ir_current_func_return_kind := ""
 mut ir_preloaded_import_roots: List[Int] := []
+mut ir_emit_tests := false
 
 pub fn set_import_roots(roots: List[Int]):
     ir_preloaded_import_roots = roots
+
+pub fn set_test_mode(enabled: Bool):
+    ir_emit_tests = enabled
 
 pub fn ir_reset():
     ir_lines = []
@@ -1293,6 +1297,56 @@ fn ir_expr(idx: Int) -> Int:
         if fname.len() == 0:
             fname = "unknown"
 
+        if ir_emit_tests and fname == "assert" and arg_regs.len() >= 1:
+            ok_l := ir_label()
+            fail_l := ir_label()
+            ir_emit("brif " + arg_regs[0].to_string() + " " + ok_l + " " + fail_l)
+            ir_emit("label " + fail_l)
+            assert_r := ir_reg()
+            ir_emit_call1(assert_r, "assert", "unknown", arg_regs[0])
+            one_r := ir_reg()
+            ir_emit("iconst " + one_r.to_string() + " 1")
+            exit_r := ir_reg()
+            ir_emit_call1(exit_r, "exit", "unknown", one_r)
+            ir_emit("label " + ok_l)
+            r := ir_reg()
+            ir_emit("iconst " + r.to_string() + " 0")
+            return r
+        if ir_emit_tests and fname == "assert_eq" and arg_regs.len() >= 2:
+            cmp_r := ir_reg()
+            ir_emit("eq " + cmp_r.to_string() + " " + arg_regs[0].to_string() + " " + arg_regs[1].to_string())
+            ok_l := ir_label()
+            fail_l := ir_label()
+            ir_emit("brif " + cmp_r.to_string() + " " + ok_l + " " + fail_l)
+            ir_emit("label " + fail_l)
+            assert_r := ir_reg()
+            ir_emit_call2(assert_r, "assert_eq", "int", arg_regs[0], arg_regs[1])
+            one_r := ir_reg()
+            ir_emit("iconst " + one_r.to_string() + " 1")
+            exit_r := ir_reg()
+            ir_emit_call1(exit_r, "exit", "unknown", one_r)
+            ir_emit("label " + ok_l)
+            r := ir_reg()
+            ir_emit("iconst " + r.to_string() + " 0")
+            return r
+        if ir_emit_tests and fname == "assert_ne" and arg_regs.len() >= 2:
+            cmp_r := ir_reg()
+            ir_emit("neq " + cmp_r.to_string() + " " + arg_regs[0].to_string() + " " + arg_regs[1].to_string())
+            ok_l := ir_label()
+            fail_l := ir_label()
+            ir_emit("brif " + cmp_r.to_string() + " " + ok_l + " " + fail_l)
+            ir_emit("label " + fail_l)
+            assert_r := ir_reg()
+            ir_emit_call2(assert_r, "assert_ne", "int", arg_regs[0], arg_regs[1])
+            one_r := ir_reg()
+            ir_emit("iconst " + one_r.to_string() + " 1")
+            exit_r := ir_reg()
+            ir_emit_call1(exit_r, "exit", "unknown", one_r)
+            ir_emit("label " + ok_l)
+            r := ir_reg()
+            ir_emit("iconst " + r.to_string() + " 0")
+            return r
+
         r := ir_reg()
         mut call_text := ""
         mut ai := 0
@@ -2133,6 +2187,59 @@ fn ir_emit_default_return():
     ir_emit("ret " + dr.to_string())
     ir_emit("endfunc")
 
+fn ir_collect_test_decls(root_idx: Int) -> List[Int]:
+    root := get_node(root_idx)
+    mut tests: List[Int] := []
+    mut i := 0
+    while i < root.children.len():
+        child := root.children[i]
+        mut cn := get_node(child)
+        mut actual := child
+        if cn.kind == "pub" and cn.children.len() > 0:
+            actual = cn.children[0]
+            cn = get_node(actual)
+        if cn.kind == "test_decl":
+            tests.push(actual)
+        i = i + 1
+    return tests
+
+fn ir_emit_test_func(idx: Int, ordinal: Int):
+    body_idx := ir_find_body(idx)
+
+    ir_next_reg = 0
+    ir_var_regs = {}
+    ir_var_types = {}
+    ir_map_value_types = {}
+    ir_seed_global_types()
+    ir_current_func_return_kind = "int"
+    ir_emit_func_header("__test_" + ordinal.to_string(), 0, "int")
+
+    if body_idx >= 0:
+        ir_block(body_idx)
+
+    ir_emit_default_return()
+
+fn ir_emit_test_main(root_idx: Int):
+    tests := ir_collect_test_decls(root_idx)
+    if tests.len() == 0:
+        return
+
+    ir_next_reg = 0
+    ir_var_regs = {}
+    ir_var_types = {}
+    ir_map_value_types = {}
+    ir_seed_global_types()
+    ir_current_func_return_kind = "int"
+    ir_emit_func_header("main", 0, "int")
+
+    mut i := 0
+    while i < tests.len():
+        test_r := ir_reg()
+        ir_emit_call0(test_r, "__test_" + i.to_string(), "int")
+        i = i + 1
+
+    ir_emit_default_return()
+
 # --- emit function ---
 fn ir_func(idx: Int):
     node := get_node(idx)
@@ -2508,6 +2615,7 @@ pub fn emit_ir(root_idx: Int) -> String:
 
     # emit functions (unwrap pub wrappers)
     mut _fi28 := 0
+    mut test_ord := 0
     kids28_children := root.children
     while _fi28 < kids28_children.len():
         child := kids28_children[_fi28]
@@ -2518,7 +2626,12 @@ pub fn emit_ir(root_idx: Int) -> String:
             actual = cn.children[0]
             actual_node = get_node(actual)
         if actual_node.kind == "fn" or actual_node.kind == "fn_decl":
-            ir_func(actual)
+            if not (ir_emit_tests and actual_node.value == "main"):
+                ir_func(actual)
+        elif actual_node.kind == "test_decl":
+            if ir_emit_tests:
+                ir_emit_test_func(actual, test_ord)
+                test_ord = test_ord + 1
         elif actual_node.kind == "impl_decl":
             # emit methods from impl blocks
             mut impl_type := ""
@@ -2547,6 +2660,8 @@ pub fn emit_ir(root_idx: Int) -> String:
 
                 _fi39 = _fi39 + 1
         _fi28 = _fi28 + 1
+    if ir_emit_tests:
+        ir_emit_test_main(root_idx)
     # append deferred lambda function bodies
     mut li := 0
     while li < ir_lambda_bodies.len():
@@ -2555,4 +2670,5 @@ pub fn emit_ir(root_idx: Int) -> String:
 
     ir_module_count = ir_module_count + 1
     ir_preloaded_import_roots = []
+    ir_emit_tests = false
     return ir_lines.join(chr(10))

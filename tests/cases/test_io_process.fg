@@ -1,0 +1,23 @@
+from std.io import spawn_process, process_stdout, process_stderr, process_stdin
+from std.io import read_all_process_stdout_chunked, read_all_process_stderr_chunked
+from std.io import write_all_process_stdin, wait_process, close_process
+
+fn main() -> Int!:
+    stdout_proc := spawn_process("printf 'hello from child'")!
+    print(read_all_process_stdout_chunked(process_stdout(stdout_proc), 3)!)
+    print(wait_process(stdout_proc).to_string())
+    close_process(stdout_proc)
+
+    stderr_proc := spawn_process("printf 'problem' >&2")!
+    print(read_all_process_stderr_chunked(process_stderr(stderr_proc), 2)!)
+    print(wait_process(stderr_proc).to_string())
+    close_process(stderr_proc)
+
+    io_proc := spawn_process("head -c 5")!
+    stdin := process_stdin(io_proc)
+    stdout := process_stdout(io_proc)
+    print(write_all_process_stdin(stdin, "hello world")!.to_string())
+    print(read_all_process_stdout_chunked(stdout, 2)!)
+    print(wait_process(io_proc).to_string())
+    close_process(io_proc)
+    return 0

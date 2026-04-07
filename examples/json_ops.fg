@@ -3,9 +3,12 @@
 from std.json import parse, type_of, get_bool, get_int, get_float, get_string
 from std.json import array_len, array_get, object_get, object_has, object_keys
 from std.json import encode, make_int, make_string, make_array, array_push
-from std.json import make_object, object_set
+from std.json import make_object, object_set, save_chunked, parse_file_chunked
+from std.fs import remove
 
 fn main():
+    path := "/tmp/forge_json_ops.json"
+
     # note: use chr(123)/chr(125) for curly braces in string literals
     lb := chr(123)
     rb := chr(125)
@@ -54,6 +57,10 @@ fn main():
     array_push(arr, make_int(3))
     object_set(obj, "items", arr)
     print("encoded = " + encode(obj))
+    print("saved = " + save_chunked(path, obj, 4).to_string())
+
+    loaded := parse_file_chunked(path, 3)
+    print("file tool = " + get_string(object_get(loaded, "tool")))
 
     # null and bool
     print("null type = " + type_of(parse("null")))
@@ -62,3 +69,4 @@ fn main():
     # invalid parse
     bad := parse("not json")
     print("bad parse = " + bad.to_string())
+    remove(path)

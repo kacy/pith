@@ -1,3 +1,6 @@
+# file streams build on std.io's shared handle-backed surface
+from std.io import FileStream, file_stream_open_read, file_stream_open_write, file_stream_open_append
+
 # std.fs — file system operations
 #
 # File system utilities for checking existence, reading, writing,
@@ -18,11 +21,17 @@
 # Returns true if a file exists at the given path.
 # Returns false if the path doesn't exist or is a directory.
 pub fn exists(path: String) -> Bool:
+    return fs_exists(path)
+
+fn fs_exists(path: String) -> Bool:
     return file_exists(path)
 
 # Returns true if a directory exists at the given path.
 # Returns false if the path doesn't exist or is a file.
 pub fn is_dir(path: String) -> Bool:
+    return fs_is_dir(path)
+
+fn fs_is_dir(path: String) -> Bool:
     return dir_exists(path)
 
 # ===============================================================
@@ -32,17 +41,47 @@ pub fn is_dir(path: String) -> Bool:
 # Reads the entire file at path and returns its contents as a string.
 # Fails if the file doesn't exist or can't be read.
 pub fn read(path: String) -> String!:
+    return fs_read(path)
+
+fn fs_read(path: String) -> String!:
     return read_file(path)
 
 # Writes data to a file, creating the file if it doesn't exist
 # or overwriting it if it does. Fails if the file can't be written.
 pub fn write(path: String, data: String) -> Bool!:
+    return fs_write(path, data)
+
+fn fs_write(path: String, data: String) -> Bool!:
     return write_file(path, data)
 
 # Appends data to a file, creating the file if it doesn't exist.
 # Fails if the file can't be written to.
 pub fn append(path: String, data: String) -> Bool!:
+    return fs_append(path, data)
+
+fn fs_append(path: String, data: String) -> Bool!:
     return append_file(path, data)
+
+# opens an existing file for streaming reads
+pub fn open(path: String) -> FileStream!:
+    return fs_open(path)
+
+fn fs_open(path: String) -> FileStream!:
+    return file_stream_open_read(path)
+
+# creates or truncates a file for streaming writes
+pub fn create(path: String) -> FileStream!:
+    return fs_create(path)
+
+fn fs_create(path: String) -> FileStream!:
+    return file_stream_open_write(path)
+
+# opens a file for streaming appends
+pub fn open_append(path: String) -> FileStream!:
+    return fs_open_append(path)
+
+fn fs_open_append(path: String) -> FileStream!:
+    return file_stream_open_append(path)
 
 # ===============================================================
 # File and Directory Management
@@ -51,19 +90,31 @@ pub fn append(path: String, data: String) -> Bool!:
 # Deletes a file at the given path. Returns true if the file was
 # successfully removed, false otherwise.
 pub fn remove(path: String) -> Bool:
+    return fs_remove(path)
+
+fn fs_remove(path: String) -> Bool:
     return remove_file(path)
 
 # Renames or moves a file from old_path to new_path.
 # Returns true on success, false if the operation failed.
 pub fn rename(old_path: String, new_path: String) -> Bool:
+    return fs_rename(old_path, new_path)
+
+fn fs_rename(old_path: String, new_path: String) -> Bool:
     return rename_file(old_path, new_path)
 
 # Creates a directory at the given path. Returns true on success.
 # Parent directories must already exist.
 pub fn make_dir(path: String) -> Bool:
+    return fs_make_dir(path)
+
+fn fs_make_dir(path: String) -> Bool:
     return mkdir(path)
 
 # Lists all entries in a directory. Returns a list of file and
 # directory names (not full paths). Returns empty list on error.
 pub fn list(path: String) -> List[String]:
+    return fs_list(path)
+
+fn fs_list(path: String) -> List[String]:
     return list_dir(path)

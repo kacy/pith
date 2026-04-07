@@ -1,0 +1,33 @@
+from std.io import string_reader, buffered_string_reader, buffered_string_reader_chunked
+from std.io import buffered_string_reader_read, buffered_string_reader_read_line
+from std.io import string_buffer, string_buffer_string
+from std.io import buffered_string_writer_chunked, buffered_string_writer_write, buffered_string_writer_flush
+
+fn main() -> Int!:
+    buffered := buffered_string_reader_chunked(string_reader("abcdef"), 2)
+    print(buffered_string_reader_read(buffered, 3)!)
+    print(buffered_string_reader_read(buffered, 3)!)
+    print("[" + buffered_string_reader_read(buffered, 3)! + "]")
+
+    lines_data := "alpha" + chr(10) + "beta" + chr(13) + chr(10) + "gamma"
+    lines := buffered_string_reader_chunked(string_reader(lines_data), 2)
+    print(buffered_string_reader_read_line(lines)!)
+    print(buffered_string_reader_read_line(lines)!)
+    print(buffered_string_reader_read_line(lines)!)
+    print("[" + buffered_string_reader_read_line(lines)! + "]")
+
+    direct := buffered_string_reader(string_reader("xyz"))
+    print(buffered_string_reader_read(direct, 2)!)
+    print(buffered_string_reader_read(direct, 2)!)
+
+    sink := string_buffer()
+    writer := buffered_string_writer_chunked(sink, 4)
+    print(buffered_string_writer_write(writer, "ab")!.to_string())
+    print("[" + string_buffer_string(sink) + "]")
+    print(buffered_string_writer_write(writer, "cdef")!.to_string())
+    print(string_buffer_string(sink))
+    print(buffered_string_writer_write(writer, "gh")!.to_string())
+    print(buffered_string_writer_flush(writer)!.to_string())
+    print(string_buffer_string(sink))
+    print(buffered_string_writer_flush(writer)!.to_string())
+    return 0

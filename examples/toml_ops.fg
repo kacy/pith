@@ -1,7 +1,11 @@
 # toml parsing
-from std.toml import parse, type_of, get_string, get_int, get_float, get_bool, has, get_array, array_len, array_get, get_table, keys
+from std.toml import parse, parse_file_chunked, type_of, get_string, get_int, get_float, get_bool, has, get_array, array_len, array_get, get_table, keys
+from std.io import write_file_text
+from std.fs import remove
 
-fn main():
+fn main() -> String!:
+    path := "/tmp/forge_toml_ops.toml"
+
     # build a TOML document
     newline := chr(10)
     mut doc := "title = " + chr(34) + "forge" + chr(34) + newline
@@ -41,3 +45,9 @@ fn main():
     # keys
     root_keys := keys(root)
     print("key count: " + root_keys.len().to_string())
+
+    write_file_text(path, doc)!
+    file_root := parse_file_chunked(path, 3)
+    print("file host: " + get_string(get_table(file_root, "server"), "host"))
+    remove(path)
+    return ""

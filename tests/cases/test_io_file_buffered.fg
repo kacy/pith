@@ -1,0 +1,42 @@
+from std.fs import create, open, remove
+from std.io import file_stream_close
+from std.io import buffered_file_writer_chunked, buffered_file_writer_write, buffered_file_writer_flush
+from std.io import buffered_file_reader_chunked, buffered_file_reader_read, buffered_file_reader_read_line
+
+fn main() -> Int!:
+    data_path := "/tmp/forge_io_buffered_data.txt"
+    line_path := "/tmp/forge_io_buffered_lines.txt"
+
+    writer := create(data_path)!
+    buffered_writer := buffered_file_writer_chunked(writer, 4)
+    print(buffered_file_writer_write(buffered_writer, "ab")!.to_string())
+    print(buffered_file_writer_write(buffered_writer, "cdef")!.to_string())
+    print(buffered_file_writer_write(buffered_writer, "gh")!.to_string())
+    print(buffered_file_writer_flush(buffered_writer)!.to_string())
+    file_stream_close(writer)
+
+    reader := open(data_path)!
+    buffered_reader := buffered_file_reader_chunked(reader, 3)
+    print(buffered_file_reader_read(buffered_reader, 3)!)
+    print(buffered_file_reader_read(buffered_reader, 3)!)
+    print("[" + buffered_file_reader_read(buffered_reader, 3)! + "]")
+    file_stream_close(reader)
+
+    line_writer := create(line_path)!
+    buffered_line_writer := buffered_file_writer_chunked(line_writer, 5)
+    buffered_file_writer_write(buffered_line_writer, "alpha" + chr(10) + "beta")!
+    buffered_file_writer_write(buffered_line_writer, chr(13) + chr(10) + "gamma")!
+    buffered_file_writer_flush(buffered_line_writer)!
+    file_stream_close(line_writer)
+
+    line_reader := open(line_path)!
+    buffered_line_reader := buffered_file_reader_chunked(line_reader, 2)
+    print(buffered_file_reader_read_line(buffered_line_reader)!)
+    print(buffered_file_reader_read_line(buffered_line_reader)!)
+    print(buffered_file_reader_read_line(buffered_line_reader)!)
+    print("[" + buffered_file_reader_read_line(buffered_line_reader)! + "]")
+    file_stream_close(line_reader)
+
+    remove(data_path)
+    remove(line_path)
+    return 0

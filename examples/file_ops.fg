@@ -1,19 +1,26 @@
-# file operations — read, write, existence checks
+# file operations — stream and path-based fs helpers
 
-fn main():
+from std.fs import exists, open, create, remove
+from std.io import read_all_file_stream, write_all_file_stream, file_stream_close
+
+fn main() -> String!:
     path := "/tmp/forge_test_file_ops.txt"
 
-    # write
-    write_file(path, "hello from forge")
+    # write through the shared file stream path
+    writer := create(path)!
+    write_all_file_stream(writer, "hello from forge")!
+    file_stream_close(writer)
     print("write: ok")
 
-    # read back
-    content := read_file(path)
+    # read back through the same stream surface
+    reader := open(path)!
+    content := read_all_file_stream(reader)!
+    file_stream_close(reader)
     if content.contains("hello"):
         print("read: ok")
 
     # exists
-    if file_exists(path):
+    if exists(path):
         print("exists: ok")
 
     # read by size
@@ -21,13 +28,16 @@ fn main():
     print("size: " + size.to_string())
 
     # clean up
-    remove_file(path)
-    if not file_exists(path):
+    remove(path)
+    if not exists(path):
         print("remove: ok")
 
-    # read a known file
-    hello := read_file("examples/hello.fg")
+    # stream a known file too
+    hello_reader := open("examples/hello.fg")!
+    hello := read_all_file_stream(hello_reader)!
+    file_stream_close(hello_reader)
     if hello.contains("greet"):
         print("read hello.fg: ok")
 
     print("file ops work")
+    return ""

@@ -2,9 +2,19 @@
 ##
 ## Functions:
 ##   parse(text: String) -> List[List[String]]
+##   parse_file(path: String) -> List[List[String]]!
 ##   parse_with_headers(text: String) -> List[Map[String, String]]
+##   parse_with_headers_file(path: String) -> List[Map[String, String]]!
 ##   encode(rows: List[List[String]]) -> String
+##   save(path: String, rows: List[List[String]]) -> Int!
+##   save_chunked(path: String, rows: List[List[String]], chunk_size: Int) -> Int!
 ##   encode_row(row: List[String]) -> String
+
+from std.io import file_stream_open_read, file_stream_open_write, file_stream_close
+from std.io import buffered_file_reader_chunked, buffered_file_reader_read_line
+from std.io import buffered_file_writer_chunked, buffered_file_writer_write, buffered_file_writer_flush
+
+CSV_FILE_CHUNK_SIZE := 4096
 
 ## Parse CSV text into a list of rows, each row a list of fields
 pub fn parse(text: String) -> List[List[String]]:
@@ -18,10 +28,34 @@ pub fn parse(text: String) -> List[List[String]]:
         i = i + 1
     return rows
 
+pub fn parse_file(path: String) -> List[List[String]]!:
+    return parse_file_chunked(path, CSV_FILE_CHUNK_SIZE)
+
+pub fn parse_file_chunked(path: String, chunk_size: Int) -> List[List[String]]!:
+    stream := file_stream_open_read(path)!
+    reader := buffered_file_reader_chunked(stream, chunk_size)
+    mut rows: List[List[String]] := []
+    mut line := buffered_file_reader_read_line(reader)!
+    while line.len() > 0:
+        trimmed := line.trim()
+        if trimmed.len() > 0:
+            rows.push(parse_row(trimmed))
+        line = buffered_file_reader_read_line(reader)!
+    file_stream_close(stream)
+    return rows
+
 ## Parse CSV text with the first row as headers.
 ## Returns a list of maps, one per data row.
 pub fn parse_with_headers(text: String) -> List[Map[String, String]]:
-    all_rows := parse(text)
+    return rows_with_headers(parse(text))
+
+pub fn parse_with_headers_file(path: String) -> List[Map[String, String]]!:
+    return parse_with_headers_file_chunked(path, CSV_FILE_CHUNK_SIZE)
+
+pub fn parse_with_headers_file_chunked(path: String, chunk_size: Int) -> List[Map[String, String]]!:
+    return rows_with_headers(parse_file_chunked(path, chunk_size)!)
+
+fn rows_with_headers(all_rows: List[List[String]]) -> List[Map[String, String]]:
     mut result: List[Map[String, String]] := []
     if all_rows.len() < 2:
         return result
@@ -49,6 +83,24 @@ pub fn encode(rows: List[List[String]]) -> String:
         lines.push(encode_row(rows[i]))
         i = i + 1
     return lines.join(chr(10))
+
+pub fn save(path: String, rows: List[List[String]]) -> Int!:
+    return save_chunked(path, rows, CSV_FILE_CHUNK_SIZE)
+
+pub fn save_chunked(path: String, rows: List[List[String]], chunk_size: Int) -> Int!:
+    stream := file_stream_open_write(path)!
+    writer := buffered_file_writer_chunked(stream, chunk_size)
+    mut total := 0
+    mut i := 0
+    while i < rows.len():
+        line := encode_row(rows[i])
+        total = total + buffered_file_writer_write(writer, line)!
+        if i + 1 < rows.len():
+            total = total + buffered_file_writer_write(writer, chr(10))!
+        i = i + 1
+    total = total + buffered_file_writer_flush(writer)!
+    file_stream_close(stream)
+    return total
 
 ## Encode a single row into a CSV line
 pub fn encode_row(row: List[String]) -> String:

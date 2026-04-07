@@ -165,6 +165,13 @@ fn ir_resolve_type_node(type_idx: Int) -> String:
         if tn.value == "Set":
             return "set"
         return ir_resolve_type_hint(tn.value)
+    if tn.kind == "result_type" and tn.children.len() > 0:
+        inner_type := ir_resolve_type_node(tn.children[0])
+        if inner_type == "int":
+            return "result_int"
+        if inner_type == "bool":
+            return "result_bool"
+        return inner_type
     return ""
 
 fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
@@ -1057,11 +1064,15 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         # try expr! — evaluate and check for error
         if node.children.len() > 0:
             val_r := ir_expr(node.children[0])
+            zero_cmp := ir_reg()
+            ir_emit("iconst " + zero_cmp.to_string() + " 0")
+            cond_r := ir_reg()
+            ir_emit("neq " + cond_r.to_string() + " " + val_r.to_string() + " " + zero_cmp.to_string())
             # check if result is 0 (error sentinel)
             ok_l := ir_label()
             err_l := ir_label()
             merge_l := ir_label()
-            ir_emit("brif " + val_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
             ir_emit("label " + ok_l)
             ir_emit("jmp " + merge_l)
             ir_emit("label " + err_l)
@@ -1099,6 +1110,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         obj_r := ir_expr(node.children[0])
         idx_r := ir_expr(node.children[1])
         r := ir_reg()
+        mut value_type := ir_infer_type(idx)
         # detect string indexing vs list indexing
         obj_n := get_node(node.children[0])
         idx_n := get_node(node.children[1])
@@ -1129,9 +1141,13 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         if is_str_idx:
             ir_emit_call(r, "char_at", "string", [obj_r, idx_r])
         elif is_map_int_idx:
-            ir_emit_call(r, "map_get_ikey", "int", [obj_r, idx_r])
+            if value_type.len() == 0:
+                value_type = "unknown"
+            ir_emit_call(r, "map_get_ikey", value_type, [obj_r, idx_r])
         elif is_map_idx:
-            ir_emit_call(r, "map_get", "unknown", [obj_r, idx_r])
+            if value_type.len() == 0:
+                value_type = "unknown"
+            ir_emit_call(r, "map_get", value_type, [obj_r, idx_r])
         else:
             ir_emit_call(r, "__list_get", ir_infer_type(idx), [obj_r, idx_r])
         return r
@@ -1641,12 +1657,18 @@ fn ir_collect_imports(root_idx: Int):
             if parts.len() > 1:
                 mod_path := parts[0]
                 mut prefix := ""
-                if mod_path == "std.toml":
+                if mod_path == "std.json":
+                    prefix = "json"
+                elif mod_path == "std.toml":
                     prefix = "toml"
+                elif mod_path == "std.log":
+                    prefix = "log"
                 elif mod_path == "std.os.path":
                     prefix = "path"
                 elif mod_path == "std.net.url":
                     prefix = "url"
+                elif mod_path == "std.fs":
+                    prefix = "fs"
                 if prefix.len() > 0:
                     mut pi := 1
                     while pi < parts.len():

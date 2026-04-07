@@ -1,0 +1,36 @@
+from std.io import string_reader, buffered_string_reader_chunked
+from std.net.http import read_request_buffered
+from std.net.http import method, path, query, version, body, get_header
+
+fn main() -> Int!:
+    crlf := chr(13) + chr(10)
+
+    mut raw := "POST /submit?mode=fast HTTP/1.1" + crlf
+    raw = raw + "Host: example.com" + crlf
+    raw = raw + "Content-Length: 11" + crlf
+    raw = raw + "X-Test: chunked" + crlf
+    raw = raw + crlf
+    raw = raw + "hello world"
+
+    reader := buffered_string_reader_chunked(string_reader(raw), 3)
+    req := read_request_buffered(reader)!
+    print(method(req))
+    print(path(req))
+    print(query(req))
+    print(version(req))
+    print(get_header(req, "host"))
+    print(get_header(req, "content-length"))
+    print(get_header(req, "x-test"))
+    print(body(req))
+
+    mut raw2 := "GET /ping HTTP/1.1" + crlf
+    raw2 = raw2 + "User-Agent: io-foundation" + crlf
+    raw2 = raw2 + crlf
+
+    reader2 := buffered_string_reader_chunked(string_reader(raw2), 2)
+    req2 := read_request_buffered(reader2)!
+    print(method(req2))
+    print(path(req2))
+    print(get_header(req2, "user-agent"))
+    print("[" + body(req2) + "]")
+    return 0

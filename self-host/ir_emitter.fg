@@ -53,12 +53,14 @@ mut ir_next_label := 0
 mut ir_strings: List[String] := []
 mut ir_var_regs: Map[String, Int] := {}
 mut ir_var_types: Map[String, String] := {}  # variable name -> type hint or struct name
+mut ir_map_value_types: Map[String, String] := {}  # map variable name -> value type
 mut ir_global_int_names: List[String] := []
 mut ir_global_string_names: List[String] := []
 mut ir_global_list_string_names: List[String] := []
 mut ir_global_list_names: List[String] := []
 mut ir_global_map_names: List[String] := []
 mut ir_global_map_int_names: List[String] := []
+mut ir_global_map_value_types: Map[String, String] := {}
 mut ir_global_set_names: List[String] := []
 mut ir_global_set_int_names: List[String] := []
 mut ir_global_bool_names: List[String] := []
@@ -76,6 +78,7 @@ mut ir_lambda_bodies: List[String] := []  # deferred lambda function IR
 mut ir_module_count := 0  # increments per emit_ir call for unique naming
 mut ir_impl_methods: Map[String, String] := {}
 mut ir_import_renames: Map[String, String] := {}
+mut ir_current_func_return_kind := ""
 
 pub fn ir_reset():
     ir_lines = []
@@ -84,12 +87,14 @@ pub fn ir_reset():
     ir_strings = []
     ir_var_regs = {}
     ir_var_types = {}
+    ir_map_value_types = {}
     ir_global_int_names = []
     ir_global_string_names = []
     ir_global_list_string_names = []
     ir_global_list_names = []
     ir_global_map_names = []
     ir_global_map_int_names = []
+    ir_global_map_value_types = {}
     ir_global_set_names = []
     ir_global_set_int_names = []
     ir_global_bool_names = []
@@ -97,6 +102,7 @@ pub fn ir_reset():
     ir_struct_field_index_lookup = {}
     ir_break_stack = []
     ir_continue_stack = []
+    ir_current_func_return_kind = ""
 
 fn ir_emit(line: String):
     ir_lines.push(line)
@@ -171,7 +177,66 @@ fn ir_resolve_type_node(type_idx: Int) -> String:
         if tn.value == "Set":
             return "set"
         return ir_resolve_type_hint(tn.value)
+    if tn.kind == "result_type" and tn.children.len() > 0:
+        inner_type := ir_resolve_type_node(tn.children[0])
+        if inner_type == "int":
+            return "result_int"
+        if inner_type == "bool":
+            return "result_bool"
+        return inner_type
     return ""
+
+fn ir_resolve_map_value_type_node(type_idx: Int) -> String:
+    tn := get_node(type_idx)
+    if tn.kind == "generic_type" and tn.value == "Map" and tn.children.len() > 1:
+        return ir_resolve_type_node(tn.children[1])
+    return ""
+
+fn ir_lookup_map_value_type(name: String) -> String:
+    if ir_map_value_types.contains_key(name):
+        return ir_map_value_types[name]
+    return ""
+
+fn ir_lookup_map_value_type_for_expr(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "ident":
+        return ir_lookup_map_value_type(node.value)
+    return ""
+
+fn ir_expr_result_kind(idx: Int) -> String:
+    checked_kind := ir_checked_result_kind(idx)
+    if checked_kind.len() > 0:
+        return checked_kind
+    node := get_node(idx)
+    if node.kind == "call" and node.children.len() > 0:
+        fn_node := get_node(node.children[0])
+        if fn_node.kind == "ident":
+            mut fname := fn_node.value
+            if ir_import_renames.contains_key(fname):
+                fname = ir_import_renames[fname]
+            if ir_func_returns.contains_key(fname):
+                ret_kind := ir_func_returns[fname]
+                if ret_kind == "result_int" or ret_kind == "result_bool":
+                    return ret_kind
+    return ""
+
+fn ir_encode_result_value(value_reg: Int, result_kind: String) -> Int:
+    if result_kind == "result_int" or result_kind == "result_bool":
+        one := ir_reg()
+        ir_emit("iconst " + one.to_string() + " 1")
+        encoded := ir_reg()
+        ir_emit("add " + encoded.to_string() + " " + value_reg.to_string() + " " + one.to_string())
+        return encoded
+    return value_reg
+
+fn ir_decode_result_value(value_reg: Int, result_kind: String) -> Int:
+    if result_kind == "result_int" or result_kind == "result_bool":
+        one := ir_reg()
+        ir_emit("iconst " + one.to_string() + " 1")
+        decoded := ir_reg()
+        ir_emit("sub " + decoded.to_string() + " " + value_reg.to_string() + " " + one.to_string())
+        return decoded
+    return value_reg
 
 fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
     mut free: List[String] := []
@@ -347,6 +412,8 @@ fn ir_seed_global_types():
         ir_var_types.insert(name, "set")
     for name in ir_global_bool_names:
         ir_var_types.insert(name, "bool")
+    for name in ir_global_map_value_types.keys():
+        ir_map_value_types.insert(name, ir_global_map_value_types[name])
 
 fn ir_register_known_import_structs():
     ir_register_struct_layout("Node", ["kind", "value", "children", "line", "col"], ["string", "string", "list", "int", "int"])
@@ -354,8 +421,7 @@ fn ir_register_known_import_structs():
     ir_register_struct_layout("TypeInfo", ["kind", "name", "fields", "field_types", "field_pub", "field_mut", "param_types", "return_type", "inner", "key_type", "value_type", "elements", "variants", "variant_types"], ["string", "string", "list_string", "list", "list", "list", "list", "int", "int", "int", "int", "list", "list_string", "list"])
     ir_register_struct_layout("Diagnostic", ["severity", "code", "message", "file", "line", "col", "fix"], ["string", "string", "string", "string", "int", "int", "string"])
 
-fn ir_checked_type(idx: Int) -> String:
-    tid := c_get_expr_type(idx)
+fn ir_type_from_tid(tid: Int) -> String:
     if tid < 0:
         return ""
     mut info := get_type_info(tid)
@@ -397,6 +463,48 @@ fn ir_checked_type(idx: Int) -> String:
     if info.kind == "task":
         return "task"
     return ""
+
+fn ir_checked_type(idx: Int) -> String:
+    return ir_type_from_tid(c_get_expr_type(idx))
+
+fn ir_checked_result_kind(idx: Int) -> String:
+    tid := c_get_expr_type(idx)
+    if tid < 0:
+        return ""
+    info := get_type_info(tid)
+    if info.kind != "result":
+        return ""
+    inner_type := ir_type_from_tid(info.inner)
+    if inner_type == "int":
+        return "result_int"
+    if inner_type == "bool":
+        return "result_bool"
+    return inner_type
+
+fn ir_call_retkind(idx: Int, uses_result_abi: Bool) -> String:
+    if uses_result_abi:
+        result_kind := ir_checked_result_kind(idx)
+        if result_kind.len() > 0:
+            return result_kind
+    return ir_infer_type(idx)
+
+fn ir_checked_index_type(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind != "index" or node.children.len() == 0:
+        return ir_checked_type(idx)
+    coll_tid := c_get_expr_type(node.children[0])
+    if coll_tid < 0:
+        return ir_checked_type(idx)
+    mut coll_info := get_type_info(coll_tid)
+    if coll_info.kind == "optional" or coll_info.kind == "result":
+        if coll_info.inner < 0:
+            return ir_checked_type(idx)
+        coll_info = get_type_info(coll_info.inner)
+    if coll_info.kind == "map" and coll_info.value_type >= 0:
+        return ir_type_from_tid(coll_info.value_type)
+    if coll_info.kind == "list" and coll_info.inner >= 0:
+        return ir_type_from_tid(coll_info.inner)
+    return ir_checked_type(idx)
 
 # --- centralized type inference for AST nodes ---
 # Returns: "int", "float", "bool", "string", "list", "list_string",
@@ -509,7 +617,12 @@ fn ir_infer_type(idx: Int) -> String:
             if LIST_STRING_RETURNING_FUNCS.contains(fname):
                 return "list_string"
             if ir_func_returns.contains_key(fname):
-                return ir_resolve_type_hint(ir_func_returns[fname])
+                ret_kind := ir_func_returns[fname]
+                if ret_kind == "result_int":
+                    return "int"
+                if ret_kind == "result_bool":
+                    return "bool"
+                return ir_resolve_type_hint(ret_kind)
         return ""
     # method calls
     if kind == "method_call":
@@ -556,11 +669,16 @@ fn ir_infer_type(idx: Int) -> String:
         return ir_resolve_type_hint(node.value)
     # index — depends on collection type
     if kind == "index" and node.children.len() > 0:
+        checked_index := ir_checked_index_type(idx)
+        if checked_index.len() > 0:
+            return checked_index
         coll_type := ir_infer_type(node.children[0])
         if coll_type == "string":
             return "string"
         if coll_type == "list_string":
             return "string"
+        if coll_type == "map" or coll_type == "map_int":
+            return ir_lookup_map_value_type_for_expr(node.children[0])
         return ""
     return ""
 
@@ -742,7 +860,12 @@ fn ir_emit_method_call(idx: Int) -> Int:
         call_regs.push(arg_regs[ci])
         ci = ci + 1
     r := ir_reg()
-    mut ret_type := ir_infer_type(idx)
+    mut uses_result_abi := false
+    if ir_impl_methods.contains_key(emit_name):
+        uses_result_abi = true
+    elif ir_func_returns.contains_key(emit_name):
+        uses_result_abi = true
+    mut ret_type := ir_call_retkind(idx, uses_result_abi)
     if VOID_METHODS.contains(emit_name):
         ret_type = "void"
     mut call_text := " " + obj_r.to_string()
@@ -1011,6 +1134,7 @@ fn ir_expr(idx: Int) -> Int:
     if node.kind == "call":
         # children: ident (func name), then arg nodes
         mut fname := "unknown"
+        mut imported_call := false
         mut arg_regs: List[Int] := []
         mut _fi6 := 0
         kids6_children := node.children
@@ -1029,6 +1153,7 @@ fn ir_expr(idx: Int) -> Int:
         # disambiguate function names that collide with method names
         # apply import renames (e.g., parse → toml_parse when imported from std.toml)
         if ir_import_renames.contains_key(fname):
+            imported_call = true
             fname = ir_import_renames[fname]
 
         r := ir_reg()
@@ -1037,7 +1162,10 @@ fn ir_expr(idx: Int) -> Int:
         while ai < arg_regs.len():
             call_text = call_text + " " + arg_regs[ai].to_string()
             ai = ai + 1
-        ir_emit_call_text(r, fname, ir_infer_type(idx), arg_regs.len(), call_text)
+        mut uses_result_abi := imported_call
+        if ir_func_returns.contains_key(fname):
+            uses_result_abi = true
+        ir_emit_call_text(r, fname, ir_call_retkind(idx, uses_result_abi), arg_regs.len(), call_text)
         return r
 
     else:
@@ -1249,12 +1377,22 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
     if kind == "try" or kind == "try_expr":
         # try expr! — evaluate and check for error
         if node.children.len() > 0:
+            result_kind := ir_expr_result_kind(node.children[0])
             val_r := ir_expr(node.children[0])
+            mut cond_r := val_r
+            mut decoded_r := val_r
+            if result_kind == "result_int" or result_kind == "result_bool":
+                decoded_r = ir_decode_result_value(val_r, result_kind)
+            elif result_kind.len() > 0:
+                zero_cmp := ir_reg()
+                ir_emit("iconst " + zero_cmp.to_string() + " 0")
+                cond_r = ir_reg()
+                ir_emit("neq " + cond_r.to_string() + " " + val_r.to_string() + " " + zero_cmp.to_string())
             # check if result is 0 (error sentinel)
             ok_l := ir_label()
             err_l := ir_label()
             merge_l := ir_label()
-            ir_emit("brif " + val_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
             ir_emit("label " + ok_l)
             ir_emit("jmp " + merge_l)
             ir_emit("label " + err_l)
@@ -1262,7 +1400,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
             ir_emit("iconst " + zero.to_string() + " 0")
             ir_emit("ret " + zero.to_string())
             ir_emit("label " + merge_l)
-            return val_r
+            return decoded_r
         r := ir_reg()
         ir_emit("iconst " + r.to_string() + " 0")
         return r
@@ -1293,14 +1431,23 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         idx_r := ir_expr(node.children[1])
         r := ir_reg()
         mut obj_type := ir_checked_type(node.children[0])
+        mut value_type := ir_checked_index_type(idx)
         if obj_type.len() == 0:
             obj_type = ir_infer_type(node.children[0])
+        if value_type.len() == 0:
+            value_type = ir_lookup_map_value_type_for_expr(node.children[0])
+        if value_type.len() == 0:
+            value_type = ir_infer_type(idx)
         if obj_type == "string":
             ir_emit_call2(r, "char_at", "string", obj_r, idx_r)
         elif obj_type == "map_int":
-            ir_emit_call2(r, "map_get_ikey", "int", obj_r, idx_r)
+            if value_type.len() == 0:
+                value_type = "unknown"
+            ir_emit_call2(r, "map_get_ikey", value_type, obj_r, idx_r)
         elif obj_type == "map":
-            ir_emit_call2(r, "map_get", "unknown", obj_r, idx_r)
+            if value_type.len() == 0:
+                value_type = "unknown"
+            ir_emit_call2(r, "map_get", value_type, obj_r, idx_r)
         else:
             ir_emit_call2(r, "__list_get", ir_infer_type(idx), obj_r, idx_r)
         return r
@@ -1340,7 +1487,11 @@ fn ir_stmt(idx: Int):
 
     if kind == "return":
         if node.children.len() > 0:
-            r := ir_expr(node.children[0])
+            mut r := ir_expr(node.children[0])
+            result_kind := ir_expr_result_kind(node.children[0])
+            if ir_current_func_return_kind == "result_int" or ir_current_func_return_kind == "result_bool":
+                if result_kind != ir_current_func_return_kind:
+                    r = ir_encode_result_value(r, ir_current_func_return_kind)
             ir_emit("ret " + r.to_string())
         else:
             r := ir_reg()
@@ -1375,6 +1526,9 @@ fn ir_stmt(idx: Int):
             target_type = ir_resolve_type_node(type_idx)
             if target_type.len() > 0:
                 ir_var_types.insert(name, target_type)
+            map_value_type := ir_resolve_map_value_type_node(type_idx)
+            if map_value_type.len() > 0:
+                ir_map_value_types.insert(name, map_value_type)
         if val_idx >= 0:
             r := ir_emit_value_for_target(val_idx, target_type)
             ir_var_regs.insert(name, r)
@@ -1630,7 +1784,11 @@ fn ir_block(idx: Int):
             return
         if kind == "return":
             if node_child_count(idx) > 0:
-                r := ir_expr(node_child(idx, 0))
+                mut r := ir_expr(node_child(idx, 0))
+                result_kind := ir_expr_result_kind(node_child(idx, 0))
+                if ir_current_func_return_kind == "result_int" or ir_current_func_return_kind == "result_bool":
+                    if result_kind != ir_current_func_return_kind:
+                        r = ir_encode_result_value(r, ir_current_func_return_kind)
                 ir_emit("ret " + r.to_string())
             else:
                 r := ir_reg()
@@ -1673,6 +1831,14 @@ fn ir_block(idx: Int):
                     ir_var_types.insert(name, "map_int")
                 else:
                     ir_var_types.insert(name, "map")
+                mut _bi2v := 0
+                while _bi2v < node_child_count(idx):
+                    child2v := node_child(idx, _bi2v)
+                    if get_node(child2v).kind == "generic_type":
+                        map_value_type := ir_resolve_map_value_type_node(child2v)
+                        if map_value_type.len() > 0:
+                            ir_map_value_types.insert(name, map_value_type)
+                    _bi2v = _bi2v + 1
             else:
                 resolved_type := ir_resolve_type_hint(type_ann)
                 if resolved_type.len() > 0:
@@ -1768,12 +1934,14 @@ fn ir_func(idx: Int):
     ir_next_reg = 0
     ir_var_regs = {}
     ir_var_types = {}
+    ir_map_value_types = {}
     ir_seed_global_types()
     mut ret_type := "unknown"
     if ir_func_returns.contains_key(full_name):
         ret_type = ir_func_returns[full_name]
     elif ir_func_returns.contains_key(name):
         ret_type = ir_func_returns[name]
+    ir_current_func_return_kind = ret_type
     ir_emit_func_header(name, param_count, ret_type)
     ir_emit_fn_params(idx)
 
@@ -1795,10 +1963,12 @@ fn ir_impl_func(idx: Int, impl_type: String):
     ir_next_reg = 0
     ir_var_regs = {}
     ir_var_types = {}
+    ir_map_value_types = {}
     ir_seed_global_types()
     mut ret_type := "unknown"
     if ir_func_returns.contains_key(orig_name):
         ret_type = ir_func_returns[orig_name]
+    ir_current_func_return_kind = ret_type
     ir_emit_func_header(full_name, param_count, ret_type)
     ir_emit_named_param("self", impl_type)
     ir_emit_fn_params(idx)
@@ -1820,12 +1990,18 @@ fn ir_collect_imports(root_idx: Int):
             if parts.len() > 1:
                 mod_path := parts[0]
                 mut prefix := ""
-                if mod_path == "std.toml":
+                if mod_path == "std.json":
+                    prefix = "json"
+                elif mod_path == "std.toml":
                     prefix = "toml"
+                elif mod_path == "std.log":
+                    prefix = "log"
                 elif mod_path == "std.os.path":
                     prefix = "path"
                 elif mod_path == "std.net.url":
                     prefix = "url"
+                elif mod_path == "std.fs":
+                    prefix = "fs"
                 if prefix.len() > 0:
                     mut pi := 1
                     while pi < parts.len():
@@ -1956,7 +2132,7 @@ pub fn emit_ir(root_idx: Int) -> String:
                     while _fi40 < kids40_children.len():
                         rc := kids40_children[_fi40]
                         rn := get_node(rc)
-                        if rn.kind == "type" or rn.kind == "generic_type":
+                        if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type":
                             ir_func_returns.insert(cn.value, ir_resolve_type_node(rc))
 
                         _fi40 = _fi40 + 1
@@ -1979,6 +2155,7 @@ pub fn emit_ir(root_idx: Int) -> String:
             # find initial value
             mut init_val := "0"
             mut global_type := ""
+            mut global_map_value_type := ""
             mut _fi36 := 0
             kids36_children := cn.children
             while _fi36 < kids36_children.len():
@@ -1986,6 +2163,8 @@ pub fn emit_ir(root_idx: Int) -> String:
                 gcn := get_node(gc)
                 if gcn.kind == "type" or gcn.kind == "generic_type":
                     global_type = ir_resolve_type_node(gc)
+                    if global_map_value_type.len() == 0:
+                        global_map_value_type = ir_resolve_map_value_type_node(gc)
                 elif gcn.kind == "int_lit":
                     init_val = gcn.value
                     if global_type.len() == 0:
@@ -2038,6 +2217,8 @@ pub fn emit_ir(root_idx: Int) -> String:
                     ir_global_set_int_names.push(gname)
                 elif global_type == "bool":
                     ir_global_bool_names.push(gname)
+            if global_map_value_type.len() > 0:
+                ir_global_map_value_types.insert(gname, global_map_value_type)
             ir_emit("global " + gname + " " + init_val)
 
         _fi25 = _fi25 + 1

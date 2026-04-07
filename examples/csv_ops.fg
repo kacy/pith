@@ -1,36 +1,12 @@
-# CSV parsing and encoding
+# csv parsing and encoding
 
-fn parse_csv_row(line: String) -> List[String]:
-    return line.split(",")
+from std.csv import parse, encode_row, save_chunked, parse_file_chunked
+from std.fs import remove
 
-fn parse_csv(text: String) -> List[List[String]]:
-    mut rows: List[List[String]] := []
-    lines := text.split(chr(10))
-    mut i := 0
-    while i < lines.len():
-        line := lines[i].trim()
-        if line.len() > 0:
-            rows.push(parse_csv_row(line))
-        i = i + 1
-    return rows
-
-fn encode_field(field: String) -> String:
-    if field.contains(",") or field.contains(chr(34)):
-        escaped := field.replace(chr(34), chr(34) + chr(34))
-        return chr(34) + escaped + chr(34)
-    return field
-
-fn encode_row(row: List[String]) -> String:
-    mut fields: List[String] := []
-    mut i := 0
-    while i < row.len():
-        fields.push(encode_field(row[i]))
-        i = i + 1
-    return fields.join(",")
-
-fn main():
+fn main() -> String!:
+    path := "/tmp/forge_csv_ops.csv"
     data := "name,age,city" + chr(10) + "alice,30,nyc" + chr(10) + "bob,25,sf"
-    rows := parse_csv(data)
+    rows := parse(data)
     print("rows: " + rows.len().to_string())
     print("first: " + rows[0].join("|"))
     print("second: " + rows[1].join("|"))
@@ -44,4 +20,11 @@ fn main():
     mut r2: List[String] := ["hello, world", "plain"]
     print("quoted: " + encode_row(r2))
 
+    # file-backed helpers use the same shared io layer now
+    print("saved: " + save_chunked(path, rows, 4)!.to_string())
+    loaded := parse_file_chunked(path, 3)!
+    print("loaded: " + loaded[1].join("|"))
+    remove(path)
+
     print("csv ops work")
+    return ""

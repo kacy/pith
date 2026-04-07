@@ -1,0 +1,15 @@
+from std.io import tcp_stream_from_fd, tcp_stream_set_timeout
+from std.io import buffered_tcp_stream, buffered_tcp_stream_read
+
+fn main() -> Int!:
+    stream := tcp_stream_from_fd(7)
+    print(stream.fd.to_string())
+
+    buffered := buffered_tcp_stream(stream)
+    print(buffered.handle.to_string())
+    print("[" + buffered_tcp_stream_read(buffered, 0)! + "]")
+
+    placeholder := tcp_stream_from_fd(-1)
+    tcp_stream_set_timeout(placeholder, 10)
+    print("ok")
+    return 0

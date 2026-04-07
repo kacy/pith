@@ -309,6 +309,10 @@ fn register_builtin_types():
     define_builtin_function("read_file", str_to_str_result)
     define_builtin_function("exec_output", str_to_str_result)
     define_builtin_function("dns_resolve", str_to_str_result)
+    # (String) -> Int!
+    define_builtin_function("file_open_read", create_function_type([TID_STRING], int_result))
+    define_builtin_function("file_open_write", create_function_type([TID_STRING], int_result))
+    define_builtin_function("file_open_append", create_function_type([TID_STRING], int_result))
 
     # (String, String) -> Bool
     define_builtin_function("rename_file", create_function_type([TID_STRING, TID_STRING], TID_BOOL))
@@ -318,6 +322,12 @@ fn register_builtin_types():
     two_str_to_bool_result := create_function_type([TID_STRING, TID_STRING], bool_result)
     define_builtin_function("write_file", two_str_to_bool_result)
     define_builtin_function("append_file", two_str_to_bool_result)
+    # (Int, Int) -> String!
+    define_builtin_function("file_read", create_function_type([TID_INT, TID_INT], str_result))
+    # (Int, String) -> Int!
+    define_builtin_function("file_write", create_function_type([TID_INT, TID_STRING], int_result))
+    # (Int) -> Void
+    define_builtin_function("file_close", int_to_void)
 
     # networking builtins
     # (String, Int) -> Int!
@@ -411,11 +421,17 @@ fn register_builtin_types():
     fix_builtin_binding("read_file", [tid_string], str_result)
     fix_builtin_binding("exec_output", [tid_string], str_result)
     fix_builtin_binding("dns_resolve", [tid_string], str_result)
+    fix_builtin_binding("file_open_read", [tid_string], int_result)
+    fix_builtin_binding("file_open_write", [tid_string], int_result)
+    fix_builtin_binding("file_open_append", [tid_string], int_result)
     fix_builtin_binding("rename_file", [tid_string, tid_string], tid_bool)
     fix_builtin_binding("json_object_get", [tid_int, tid_string], tid_int)
     fix_builtin_binding("json_object_has", [tid_int, tid_string], tid_bool)
     fix_builtin_binding("write_file", [tid_string, tid_string], bool_result)
     fix_builtin_binding("append_file", [tid_string, tid_string], bool_result)
+    fix_builtin_binding("file_read", [tid_int, tid_int], str_result)
+    fix_builtin_binding("file_write", [tid_int, tid_string], int_result)
+    fix_builtin_binding("file_close", [tid_int], tid_void)
     fix_builtin_binding("tcp_connect", [tid_string, tid_int], int_result)
     fix_builtin_binding("tcp_listen", [tid_string, tid_int], int_result)
     fix_builtin_binding("tcp_accept", [tid_int], int_result)
@@ -1297,6 +1313,9 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
         if is_error_type(annotated) == false:
             if is_error_type(val_type) == false:
                 if annotated != val_type:
+                    if types_structurally_equal(annotated, val_type):
+                        define_binding(scope_id, name, annotated, is_mut)
+                        return
                     # special case: allow empty collections with annotations
                     val_node := get_node(node.children[1])
                     if val_node.kind != "list":
@@ -1334,7 +1353,8 @@ fn check_assignment(node: Node, scope_id: Int):
     op := node.value
     if op == "=":
         if target_type != val_type:
-            report_error("E200", "type mismatch: expected " + get_type_name(target_type) + ", got " + get_type_name(val_type))
+            if types_structurally_equal(target_type, val_type) == false:
+                report_error("E200", "type mismatch: expected " + get_type_name(target_type) + ", got " + get_type_name(val_type))
     else:
         # compound assignment: +=, -=, *=, /=
         if is_numeric_type(target_type) == false:

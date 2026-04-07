@@ -1,6 +1,7 @@
 # fs_ops.fg — test std.fs module
 
-from std.fs import exists, is_dir, write, remove, make_dir, list
+from std.fs import exists, is_dir, write, read, remove, make_dir, list, open
+from std.io import read_all_file_stream, file_stream_close
 
 fn do_test() -> String!:
     # write a temp file
@@ -11,9 +12,15 @@ fn do_test() -> String!:
     print("is_dir: " + is_dir("/tmp/forge_fs_test.txt").to_string())
     print("is_dir /tmp: " + is_dir("/tmp").to_string())
 
-    # read it back
-    content := read_file("/tmp/forge_fs_test.txt")!
+    # read it back with the whole-file helper
+    content := read("/tmp/forge_fs_test.txt")!
     print("content: " + content)
+
+    # stream the same file through std.io
+    reader := open("/tmp/forge_fs_test.txt")!
+    streamed := read_all_file_stream(reader)!
+    file_stream_close(reader)
+    print("streamed: " + streamed)
 
     # list directory
     entries := list("/tmp")
@@ -29,5 +36,6 @@ fn do_test() -> String!:
     exec("rmdir /tmp/forge_fs_test_dir")
     return ""
 
-fn main():
-    do_test()
+fn main() -> String!:
+    do_test()!
+    return ""

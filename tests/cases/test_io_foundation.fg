@@ -1,0 +1,38 @@
+from std.io import string_reader, string_buffer, string_buffer_string
+from std.io import string_reader_read, string_buffer_write
+from std.io import read_all_string, read_all_string_chunked
+from std.io import write_all_string, copy_string, copy_string_chunked
+
+fn main() -> Int!:
+    reader := string_reader("forge io")
+    print(read_all_string(reader)!)
+
+    chunked_reader := string_reader("abcdef")
+    print(read_all_string_chunked(chunked_reader, 2)!)
+
+    direct_reader := string_reader("xyz")
+    print(string_reader_read(direct_reader, 2)!)
+    print(string_reader_read(direct_reader, 2)!)
+
+    buf := string_buffer()
+    print(string_buffer_write(buf, "hi")!.to_string())
+    print(string_buffer_string(buf))
+
+    buf2 := string_buffer()
+    print(write_all_string(buf2, "hello")!.to_string())
+    print(string_buffer_string(buf2))
+
+    src := string_reader("copy me")
+    dst := string_buffer()
+    print(copy_string(src, dst)!.to_string())
+    print(string_buffer_string(dst))
+
+    src2 := string_reader("chunked")
+    dst2 := string_buffer()
+    print(copy_string_chunked(src2, dst2, 3)!.to_string())
+    print(string_buffer_string(dst2))
+
+    src3 := string_reader("done")
+    print(read_all_string(src3)!)
+    print(string_buffer_string(buf))
+    return 0

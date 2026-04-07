@@ -1,0 +1,68 @@
+mut next_handle: Int := 1
+mut data_by_handle: Map[Int, String] := {}
+mut offset_by_handle: Map[Int, Int] := {}
+mut cache_by_handle: Map[Int, String] := {}
+
+struct Reader:
+    pub handle: Int
+
+struct Buf:
+    pub handle: Int
+    pub chunk_size: Int
+
+fn reader(data: String) -> Reader:
+    handle := next_handle
+    next_handle = next_handle + 1
+    data_by_handle.insert(handle, data)
+    offset_by_handle.insert(handle, 0)
+    return Reader(handle)
+
+fn read_plain(r: Reader, max_bytes: Int) -> String!:
+    if max_bytes <= 0:
+        return ""
+    data := data_by_handle[r.handle]
+    offset := offset_by_handle[r.handle]
+    if offset >= data.len():
+        return ""
+    mut end := offset + max_bytes
+    if end > data.len():
+        end = data.len()
+    chunk := data.substring(offset, end)
+    offset_by_handle.insert(r.handle, end)
+    return chunk
+
+fn buf(r: Reader, chunk_size: Int) -> Buf:
+    cache_by_handle.insert(r.handle, "")
+    return Buf(r.handle, chunk_size)
+
+fn fill(b: Buf) -> Int!:
+    chunk := read_plain(Reader(b.handle), b.chunk_size)!
+    cache_by_handle.insert(b.handle, chunk)
+    return chunk.len()
+
+fn read_buf(b: Buf, max_bytes: Int) -> String!:
+    mut result := ""
+    while result.len() < max_bytes:
+        mut cached := cache_by_handle[b.handle]
+        if cached.len() == 0:
+            filled := fill(b)!
+            if filled <= 0:
+                return result
+            cached = cache_by_handle[b.handle]
+        mut take := max_bytes - result.len()
+        if take > cached.len():
+            take = cached.len()
+        result = result + cached.substring(0, take)
+        if take >= cached.len():
+            cache_by_handle.insert(b.handle, "")
+        else:
+            cache_by_handle.insert(b.handle, cached.substring(take, cached.len()))
+    return result
+
+fn main() -> String!:
+    b := buf(reader("abcdef"), 2)
+    print("a=" + read_buf(b, 3)!)
+    print("b=" + read_buf(b, 3)!)
+    print("c=[" + read_buf(b, 3)! + "]")
+    print("done")
+    return ""

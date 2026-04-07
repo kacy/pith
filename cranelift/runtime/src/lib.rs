@@ -20,11 +20,37 @@ pub mod string;
 pub mod toml;
 
 use crate::collections::list::ForgeList;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::fs::File;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::atomic::AtomicUsize;
+use std::sync::OnceLock;
 
 /// Global statistics for debugging
 pub static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
+
+struct ProcessHandle {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+}
+
+static PROCESS_HANDLES: OnceLock<Mutex<HashMap<i64, ProcessHandle>>> = OnceLock::new();
+static NEXT_PROCESS_HANDLE: AtomicI64 = AtomicI64::new(1);
+static FILE_HANDLES: OnceLock<Mutex<HashMap<i64, File>>> = OnceLock::new();
+static NEXT_FILE_HANDLE: AtomicI64 = AtomicI64::new(1);
+
+fn process_handles() -> &'static Mutex<HashMap<i64, ProcessHandle>> {
+    PROCESS_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn file_handles() -> &'static Mutex<HashMap<i64, File>> {
+    FILE_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Closure environment: a fixed-size array of i64 slots for captured variables.
 /// Closure environment slots for passing captures to lambda functions.
@@ -800,6 +826,119 @@ pub unsafe extern "C" fn forge_append_file(path: *const i8, content: *const i8) 
         }
     }
     0
+}
+
+unsafe fn forge_open_file_with(path: *const i8, create: bool, write: bool, append: bool) -> i64 {
+    use std::fs::OpenOptions;
+
+    if path.is_null() {
+        return 0;
+    }
+
+    let len = crate::string::forge_cstring_len(path) as usize;
+    let slice = std::slice::from_raw_parts(path as *const u8, len);
+    let Ok(path_str) = std::str::from_utf8(slice) else {
+        return 0;
+    };
+
+    let mut options = OpenOptions::new();
+    options.read(!write && !append);
+    options.write(write || append);
+    options.create(create || append);
+    options.truncate(write && !append);
+    options.append(append);
+
+    match options.open(path_str) {
+        Ok(file) => {
+            let handle = NEXT_FILE_HANDLE.fetch_add(1, Ordering::Relaxed);
+            file_handles().lock().insert(handle, file);
+            handle
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Open a file for reading and return a file handle
+///
+/// # Safety
+/// path must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn forge_file_open_read(path: *const i8) -> i64 {
+    forge_open_file_with(path, false, false, false)
+}
+
+/// Open a file for writing and return a file handle
+///
+/// # Safety
+/// path must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn forge_file_open_write(path: *const i8) -> i64 {
+    forge_open_file_with(path, true, true, false)
+}
+
+/// Open a file for appending and return a file handle
+///
+/// # Safety
+/// path must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn forge_file_open_append(path: *const i8) -> i64 {
+    forge_open_file_with(path, true, false, true)
+}
+
+/// Read a chunk from an open file handle
+///
+/// # Safety
+/// handle must be a valid file handle
+#[no_mangle]
+pub unsafe extern "C" fn forge_file_read(handle: i64, max_bytes: i64) -> *mut i8 {
+    use std::io::Read;
+
+    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let mut handles = file_handles().lock();
+    let Some(file) = handles.get_mut(&handle) else {
+        return std::ptr::null_mut();
+    };
+
+    let mut buf = vec![0u8; size];
+    match file.read(&mut buf) {
+        Ok(0) => forge_cstring_empty(),
+        Ok(n) => {
+            buf.truncate(n);
+            forge_copy_bytes_to_cstring(&buf)
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Write a chunk to an open file handle
+///
+/// # Safety
+/// handle must be a valid file handle and data must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn forge_file_write(handle: i64, data: *const i8) -> i64 {
+    use std::io::Write;
+
+    if data.is_null() {
+        return 0;
+    }
+
+    let len = crate::string::forge_cstring_len(data) as usize;
+    let bytes = std::slice::from_raw_parts(data as *const u8, len);
+    let mut handles = file_handles().lock();
+    let Some(file) = handles.get_mut(&handle) else {
+        return 0;
+    };
+
+    match file.write(bytes) {
+        Ok(n) => n as i64,
+        Err(_) => 0,
+    }
+}
+
+/// Close an open file handle
+#[no_mangle]
+pub extern "C" fn forge_file_close(handle: i64) {
+    file_handles().lock().remove(&handle);
 }
 
 /// Exit the program with given status code
@@ -2239,31 +2378,41 @@ pub extern "C" fn forge_identity(x: i64) -> i64 {
     x
 }
 
-/// Spawn a child process — stub, returns 0
+/// Spawn a child process and return a process handle
 ///
 /// # Safety
 /// cmd must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn forge_process_spawn(cmd: *const i8) -> i64 {
     if cmd.is_null() {
-        return -1;
+        return 0;
     }
     let len = crate::string::forge_cstring_len(cmd) as usize;
     let slice = std::slice::from_raw_parts(cmd as *const u8, len);
     if let Ok(cmd_str) = std::str::from_utf8(slice) {
-        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-        if parts.is_empty() {
-            return -1;
-        }
-        match std::process::Command::new(parts[0])
-            .args(&parts[1..])
+        match Command::new("/bin/sh")
+            .arg("-lc")
+            .arg(cmd_str)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
         {
-            Ok(_child) => 0,
-            Err(_) => -1,
+            Ok(mut child) => {
+                let handle = NEXT_PROCESS_HANDLE.fetch_add(1, Ordering::Relaxed);
+                let entry = ProcessHandle {
+                    stdin: child.stdin.take(),
+                    stdout: child.stdout.take(),
+                    stderr: child.stderr.take(),
+                    child,
+                };
+                process_handles().lock().insert(handle, entry);
+                handle
+            }
+            Err(_) => 0,
         }
     } else {
-        -1
+        0
     }
 }
 
@@ -2605,6 +2754,18 @@ unsafe fn forge_cstring_empty() -> *mut i8 {
     ptr
 }
 
+unsafe fn forge_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
+    use std::alloc::{alloc, Layout};
+
+    let layout = Layout::from_size_align(bytes.len() + 1, 1).unwrap();
+    let ptr = alloc(layout) as *mut i8;
+    if !ptr.is_null() {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        *ptr.add(bytes.len()) = 0;
+    }
+    ptr
+}
+
 /// Split string into a list of single-character strings (chars)
 /// Get path extension
 ///
@@ -2746,13 +2907,77 @@ pub unsafe extern "C" fn forge_path_exists(path: *const i8) -> i64 {
     }
 }
 
-/// Read contents of a process's stdout — stub
+fn forge_read_process_stream<R: std::io::Read>(reader: &mut R, max_bytes: i64) -> *mut i8 {
+    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let mut buf = vec![0u8; size];
+    match reader.read(&mut buf) {
+        Ok(0) => unsafe { forge_cstring_empty() },
+        Ok(n) => {
+            buf.truncate(n);
+            unsafe { forge_copy_bytes_to_cstring(&buf) }
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Read contents of a process's stdout
 ///
 /// # Safety
 /// handle must be a valid process handle
 #[no_mangle]
-pub unsafe extern "C" fn forge_process_read(_handle: i64) -> *mut i8 {
-    forge_cstring_empty()
+pub unsafe extern "C" fn forge_process_read(handle: i64, max_bytes: i64) -> *mut i8 {
+    let mut handles = process_handles().lock();
+    let Some(entry) = handles.get_mut(&handle) else {
+        return std::ptr::null_mut();
+    };
+    let Some(stdout) = entry.stdout.as_mut() else {
+        return unsafe { forge_cstring_empty() };
+    };
+    forge_read_process_stream(stdout, max_bytes)
+}
+
+/// Read contents of a process's stderr
+///
+/// # Safety
+/// handle must be a valid process handle
+#[no_mangle]
+pub unsafe extern "C" fn forge_process_read_err(handle: i64, max_bytes: i64) -> *mut i8 {
+    let mut handles = process_handles().lock();
+    let Some(entry) = handles.get_mut(&handle) else {
+        return std::ptr::null_mut();
+    };
+    let Some(stderr) = entry.stderr.as_mut() else {
+        return unsafe { forge_cstring_empty() };
+    };
+    forge_read_process_stream(stderr, max_bytes)
+}
+
+/// Write data to a process's stdin
+///
+/// # Safety
+/// handle must be a valid process handle and data must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn forge_process_write(handle: i64, data: *const i8) -> i64 {
+    use std::io::Write;
+
+    if data.is_null() {
+        return 0;
+    }
+    let mut handles = process_handles().lock();
+    let Some(entry) = handles.get_mut(&handle) else {
+        return 0;
+    };
+    let Some(stdin) = entry.stdin.as_mut() else {
+        return 0;
+    };
+    let text = std::ffi::CStr::from_ptr(data).to_str().unwrap_or("");
+    match stdin.write(text.as_bytes()) {
+        Ok(n) => {
+            let _ = stdin.flush();
+            n as i64
+        }
+        Err(_) => 0,
+    }
 }
 
 /// TCP listen — bind and listen on addr:port, return server fd
@@ -3003,8 +3228,35 @@ pub unsafe extern "C" fn forge_cstring_last_index_of(
 
 /// Wait for a spawned process to finish, returns exit code
 #[no_mangle]
-pub extern "C" fn forge_process_wait(_handle: i64) -> i64 {
-    0
+pub extern "C" fn forge_process_wait(handle: i64) -> i64 {
+    let mut handles = process_handles().lock();
+    let Some(entry) = handles.get_mut(&handle) else {
+        return -1;
+    };
+    match entry.child.wait() {
+        Ok(status) => status.code().unwrap_or(-1) as i64,
+        Err(_) => -1,
+    }
+}
+
+/// Send a kill signal to a process
+#[no_mangle]
+pub extern "C" fn forge_process_kill(handle: i64) -> i64 {
+    let mut handles = process_handles().lock();
+    let Some(entry) = handles.get_mut(&handle) else {
+        return 0;
+    };
+    match entry.child.kill() {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+}
+
+/// Close and forget a process handle
+#[no_mangle]
+pub extern "C" fn forge_process_close(handle: i64) {
+    let mut handles = process_handles().lock();
+    handles.remove(&handle);
 }
 
 /// Get the scheme component of a URL string

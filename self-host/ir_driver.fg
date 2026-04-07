@@ -2,7 +2,9 @@ from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
 from ast import reset_arena
 from ir_emitter import emit_ir
-from errors import render_diagnostics
+from driver import init_driver, resolve_imports, get_driver_parse_diagnostics, driver_has_parse_errors
+from checker import initialize_checker, c_run_module
+from errors import render_diagnostics, has_errors
 
 fn emit_file() -> String!:
     path := args()[1]
@@ -13,6 +15,23 @@ fn emit_file() -> String!:
     if parser_has_errors():
         print(render_diagnostics(parser_diagnostics(), source))
         exit(1)
+
+    init_driver(path)
+    import_roots := resolve_imports(root, path)!
+    if driver_has_parse_errors():
+        print(render_diagnostics(get_driver_parse_diagnostics(), source))
+        exit(1)
+
+    initialize_checker(path)
+    mut i := 0
+    while i < import_roots.len():
+        c_run_module(import_roots[i])
+        i = i + 1
+    diags := c_run_module(root)
+    if has_errors(diags):
+        print(render_diagnostics(diags, source))
+        exit(1)
+
     ir := emit_ir(root)
     print(ir)
     return ""

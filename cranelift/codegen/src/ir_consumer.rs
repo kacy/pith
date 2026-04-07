@@ -274,6 +274,22 @@ pub fn compile_from_ir(
     Ok(declared_funcs)
 }
 
+fn normalize_runtime_result(
+    builder: &mut FunctionBuilder<'_>,
+    value: Value,
+    retkind: &str,
+) -> Value {
+    if retkind != "result_int" && retkind != "result_bool" {
+        return value;
+    }
+
+    let zero = builder.ins().iconst(types::I64, 0);
+    let one = builder.ins().iconst(types::I64, 1);
+    let is_error = builder.ins().icmp(IntCC::Equal, value, zero);
+    let encoded = builder.ins().iadd(value, one);
+    builder.ins().select(is_error, zero, encoded)
+}
+
 fn compile_ir_function(
     codegen: &mut CodeGen,
     func_id: FuncId,
@@ -866,12 +882,21 @@ fn compile_ir_function(
                     // strings and lists at runtime via magic number check.
                     // Look up function: user-defined first, then runtime with name resolution.
                     let resolved_name = resolve_func_name(fname);
-                    let fid = declared_funcs
-                        .get(fname)
-                        .or_else(|| runtime_funcs.get(resolved_name))
-                        .or_else(|| runtime_funcs.get(fname))
-                        .or_else(|| runtime_funcs.get(&format!("forge_{}", fname)))
-                        .copied();
+                    let mut runtime_call = false;
+                    let fid = if let Some(&fid) = declared_funcs.get(fname) {
+                        Some(fid)
+                    } else if let Some(&fid) = runtime_funcs.get(resolved_name) {
+                        runtime_call = true;
+                        Some(fid)
+                    } else if let Some(&fid) = runtime_funcs.get(fname) {
+                        runtime_call = true;
+                        Some(fid)
+                    } else if let Some(&fid) = runtime_funcs.get(&format!("forge_{}", fname)) {
+                        runtime_call = true;
+                        Some(fid)
+                    } else {
+                        None
+                    };
 
                     if let Some(fid) = fid {
                         let fref = *func_ref_cache.entry(fid).or_insert_with(|| {
@@ -911,7 +936,12 @@ fn compile_ir_function(
                                 // Normalize i64 results: iadd 0 works around a Cranelift
                                 // register state issue with struct-from-list returns
                                 let zero = builder.ins().iconst(types::I64, 0);
-                                regs.insert(reg, builder.ins().iadd(result, zero));
+                                let mut normalized = builder.ins().iadd(result, zero);
+                                if runtime_call {
+                                    normalized =
+                                        normalize_runtime_result(&mut builder, normalized, retkind);
+                                }
+                                regs.insert(reg, normalized);
                             }
                         } else {
                             regs.insert(reg, builder.ins().iconst(types::I64, 0));
@@ -1128,8 +1158,13 @@ fn compile_ir_function(
             }
 
             "ret" if parts.len() >= 2 => {
-                let val = get_reg(&regs, parts[1]);
-                builder.ins().return_(&[val]);
+                if func_name == "main" {
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    builder.ins().return_(&[zero]);
+                } else {
+                    let val = get_reg(&regs, parts[1]);
+                    builder.ins().return_(&[val]);
+                }
                 terminated = true;
             }
 
@@ -1223,8 +1258,10 @@ fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
         "unknown"
             | "void"
             | "int"
+            | "result_int"
             | "float"
             | "bool"
+            | "result_bool"
             | "string"
             | "list"
             | "list_string"
@@ -1409,6 +1446,13 @@ fn resolve_func_name(name: &str) -> &str {
         // IO / system
         "read_file" => "forge_read_file",
         "write_file" => "forge_write_file",
+        "append_file" => "forge_append_file",
+        "file_open_read" => "forge_file_open_read",
+        "file_open_write" => "forge_file_open_write",
+        "file_open_append" => "forge_file_open_append",
+        "file_read" => "forge_file_read",
+        "file_write" => "forge_file_write",
+        "file_close" => "forge_file_close",
         "file_exists" => "forge_file_exists",
         "dir_exists" => "forge_dir_exists",
         "exec" => "forge_exec",
@@ -1416,6 +1460,13 @@ fn resolve_func_name(name: &str) -> &str {
         "env" => "forge_env",
         "args" => "forge_args_to_list",
         "dns_resolve" => "forge_dns_resolve",
+        "process_spawn" => "forge_process_spawn",
+        "process_write" => "forge_process_write",
+        "process_read" => "forge_process_read",
+        "process_read_err" => "forge_process_read_err",
+        "process_wait" => "forge_process_wait",
+        "process_kill" => "forge_process_kill",
+        "process_close" => "forge_process_close",
         // Crypto / encoding
         "sha256" => "forge_sha256",
         "fnv1a" => "forge_fnv1a",
@@ -1430,30 +1481,17 @@ fn resolve_func_name(name: &str) -> &str {
         "path_ext" | "ext" => "forge_path_ext",
         "path_stem" | "stem" => "forge_path_stem",
         // Logging
-        "log_info" => "forge_log_info",
-        "log_warn" => "forge_log_warn",
-        "log_error" | "log_debug" => "forge_log_error",
         // JSON
         "parse" => "forge_json_parse",
-        "json_parse" => "forge_json_parse",
         "type_of" => "forge_json_type_of",
-        "json_type_of" => "forge_json_type_of",
         "get_string" => "forge_json_get_string",
-        "json_get_string" => "forge_json_get_string",
         "get_int" => "forge_json_get_int",
-        "json_get_int" => "forge_json_get_int",
         "get_float" => "forge_json_get_float",
-        "json_get_float" => "forge_json_get_float",
         "get_bool" => "forge_json_get_bool",
-        "json_get_bool" => "forge_json_get_bool",
         "object_get" => "forge_json_object_get",
-        "json_object_get" => "forge_json_object_get",
         "object_has" => "forge_json_object_has",
-        "json_object_has" => "forge_json_object_has",
         "object_keys" => "forge_json_object_keys",
-        "json_object_keys" => "forge_json_object_keys",
         "array_len" => "forge_json_array_len",
-        "json_array_len" => "forge_json_array_len",
         "array_get" => "forge_json_array_get",
         "make_object" => "forge_json_make_object",
         "make_array" => "forge_json_make_array",
@@ -1462,19 +1500,6 @@ fn resolve_func_name(name: &str) -> &str {
         "array_push" => "forge_json_array_push",
         "object_set" => "forge_json_object_set",
         "encode" => "forge_smart_encode",
-        // TOML
-        "toml_parse" => "forge_toml_parse",
-        "toml_type_of" => "forge_toml_type_of",
-        "toml_get_string" => "forge_toml_get_string",
-        "toml_get_int" => "forge_toml_get_int",
-        "toml_get_float" => "forge_toml_get_float",
-        "toml_get_bool" => "forge_toml_get_bool",
-        "toml_has" => "forge_toml_has",
-        "toml_get_array" => "forge_toml_get_array",
-        "toml_array_len" => "forge_toml_array_len",
-        "toml_array_get" => "forge_toml_array_get",
-        "toml_get_table" => "forge_toml_get_table",
-        "toml_keys" => "forge_toml_keys",
         // URL
         "url_parse" => "forge_url_parse",
         "url_scheme" => "forge_url_scheme",

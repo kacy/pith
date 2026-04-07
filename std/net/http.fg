@@ -411,9 +411,9 @@ pub fn get(host: String, port: Int, url_path: String) -> String!:
     req = req + crlf
     req = req + crlf
     writer := conn.buffered_writer()
-    writer.write(req)!
+    writer.write_all(req)!
     writer.flush()!
-    response := io.read_all_tcp_stream_chunked(conn, 4096)!
+    response := conn.read_all_chunked(4096)!
     conn.close()
     cr := chr(13)
     mut hi := 0

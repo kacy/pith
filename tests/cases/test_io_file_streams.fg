@@ -5,15 +5,15 @@ fn main() -> Int!:
     path := "/tmp/forge_io_stream_test.txt"
 
     writer := fs.create(path)!
-    print(io.write_text(writer, "hello")!.to_string())
+    print(writer.write_all("hello")!.to_string())
     writer.close()
 
     appender := fs.open_append(path)!
-    print(io.write_text(appender, " world")!.to_string())
+    print(appender.write_all(" world")!.to_string())
     appender.close()
 
     reader := fs.open(path)!
-    print(io.read_text_chunked(reader, 4)!)
+    print(reader.read_all_chunked(4)!)
     reader.close()
 
     print(fs.exists(path).to_string())

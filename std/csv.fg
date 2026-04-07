@@ -10,7 +10,7 @@
 ##   save_chunked(path: String, rows: List[List[String]], chunk_size: Int) -> Int!
 ##   encode_row(row: List[String]) -> String
 
-import std.io as io
+from std.io import FileStream
 
 CSV_FILE_CHUNK_SIZE := 4096
 
@@ -30,7 +30,7 @@ pub fn parse_file(path: String) -> List[List[String]]!:
     return parse_file_chunked(path, CSV_FILE_CHUNK_SIZE)
 
 pub fn parse_file_chunked(path: String, chunk_size: Int) -> List[List[String]]!:
-    stream := io.file_stream_open_read(path)!
+    stream := FileStream(file_open_read(path)!)
     reader := stream.buffered_reader_chunked(chunk_size)
     mut rows: List[List[String]] := []
     mut line := reader.read_line()!
@@ -86,7 +86,7 @@ pub fn save(path: String, rows: List[List[String]]) -> Int!:
     return save_chunked(path, rows, CSV_FILE_CHUNK_SIZE)
 
 pub fn save_chunked(path: String, rows: List[List[String]], chunk_size: Int) -> Int!:
-    stream := io.file_stream_open_write(path)!
+    stream := FileStream(file_open_write(path)!)
     writer := stream.buffered_writer_chunked(chunk_size)
     mut total := 0
     mut i := 0

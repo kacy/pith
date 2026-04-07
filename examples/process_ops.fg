@@ -5,7 +5,7 @@ import std.io as io
 fn main() -> String!:
     # spawn echo command
     child_process := io.spawn_process("echo hello from child")!
-    output := io.read_stdout(child_process)!
+    output := child_process.stdout().read_all()!
     exit_code := child_process.wait()
     child_process.close()
     print("output: " + output.trim())
@@ -13,7 +13,7 @@ fn main() -> String!:
 
     # spawn a command that produces stderr
     failing_process := io.spawn_process("ls /nonexistent_path_xyz")!
-    error_output := io.read_stderr(failing_process)!
+    error_output := failing_process.stderr().read_all()!
     failing_exit_code := failing_process.wait()
     failing_process.close()
     print("stderr: " + (error_output.len() > 0).to_string())

@@ -39,6 +39,14 @@ struct ProcessHandle {
     stderr: Option<ChildStderr>,
 }
 
+struct ForgeBytes {
+    data: Vec<u8>,
+}
+
+struct ForgeByteBuffer {
+    data: Vec<u8>,
+}
+
 static PROCESS_HANDLES: OnceLock<Mutex<HashMap<i64, ProcessHandle>>> = OnceLock::new();
 static NEXT_PROCESS_HANDLE: AtomicI64 = AtomicI64::new(1);
 static FILE_HANDLES: OnceLock<Mutex<HashMap<i64, File>>> = OnceLock::new();
@@ -50,6 +58,24 @@ fn process_handles() -> &'static Mutex<HashMap<i64, ProcessHandle>> {
 
 fn file_handles() -> &'static Mutex<HashMap<i64, File>> {
     FILE_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+unsafe fn forge_bytes_ref<'a>(handle: i64) -> Option<&'a ForgeBytes> {
+    if handle == 0 {
+        return None;
+    }
+    Some(&*(handle as *const ForgeBytes))
+}
+
+unsafe fn forge_byte_buffer_mut<'a>(handle: i64) -> Option<&'a mut ForgeByteBuffer> {
+    if handle == 0 {
+        return None;
+    }
+    Some(&mut *(handle as *mut ForgeByteBuffer))
+}
+
+fn forge_bytes_from_vec(data: Vec<u8>) -> i64 {
+    Box::into_raw(Box::new(ForgeBytes { data })) as i64
 }
 
 /// Closure environment: a fixed-size array of i64 slots for captured variables.
@@ -765,6 +791,26 @@ pub unsafe extern "C" fn forge_read_file(path: *const i8) -> *mut i8 {
     std::ptr::null_mut()
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn forge_read_file_bytes(path: *const i8) -> i64 {
+    use std::fs;
+
+    if path.is_null() {
+        return 0;
+    }
+
+    let len = crate::string::forge_cstring_len(path) as usize;
+    let slice = std::slice::from_raw_parts(path as *const u8, len);
+    let Ok(path_str) = std::str::from_utf8(slice) else {
+        return 0;
+    };
+
+    match fs::read(path_str) {
+        Ok(contents) => forge_bytes_from_vec(contents),
+        Err(_) => 0,
+    }
+}
+
 /// Write string to file
 /// Returns 1 on success, 0 on failure
 ///
@@ -791,6 +837,27 @@ pub unsafe extern "C" fn forge_write_file(path: *const i8, content: *const i8) -
         if fs::write(path_str, content_str).is_ok() {
             return 1;
         }
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_write_file_bytes(path: *const i8, content: i64) -> i64 {
+    use std::fs;
+
+    if path.is_null() {
+        return 0;
+    }
+    let Some(bytes) = forge_bytes_ref(content) else {
+        return 0;
+    };
+    let path_len = crate::string::forge_cstring_len(path) as usize;
+    let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
+    let Ok(path_str) = std::str::from_utf8(path_slice) else {
+        return 0;
+    };
+    if fs::write(path_str, &bytes.data).is_ok() {
+        return 1;
     }
     0
 }
@@ -823,6 +890,30 @@ pub unsafe extern "C" fn forge_append_file(path: *const i8, content: *const i8) 
             if file.write_all(content_slice).is_ok() {
                 return 1;
             }
+        }
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_append_file_bytes(path: *const i8, content: i64) -> i64 {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    if path.is_null() {
+        return 0;
+    }
+    let Some(bytes) = forge_bytes_ref(content) else {
+        return 0;
+    };
+    let path_len = crate::string::forge_cstring_len(path) as usize;
+    let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
+    let Ok(path_str) = std::str::from_utf8(path_slice) else {
+        return 0;
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path_str) {
+        if file.write_all(&bytes.data).is_ok() {
+            return 1;
         }
     }
     0
@@ -910,6 +1001,26 @@ pub unsafe extern "C" fn forge_file_read(handle: i64, max_bytes: i64) -> *mut i8
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn forge_file_read_bytes(handle: i64, max_bytes: i64) -> i64 {
+    use std::io::Read;
+
+    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let mut handles = file_handles().lock();
+    let Some(file) = handles.get_mut(&handle) else {
+        return 0;
+    };
+
+    let mut buf = vec![0u8; size];
+    match file.read(&mut buf) {
+        Ok(n) => {
+            buf.truncate(n);
+            forge_bytes_from_vec(buf)
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Write a chunk to an open file handle
 ///
 /// # Safety
@@ -930,6 +1041,24 @@ pub unsafe extern "C" fn forge_file_write(handle: i64, data: *const i8) -> i64 {
     };
 
     match file.write(bytes) {
+        Ok(n) => n as i64,
+        Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_file_write_bytes(handle: i64, data: i64) -> i64 {
+    use std::io::Write;
+
+    let Some(bytes) = forge_bytes_ref(data) else {
+        return 0;
+    };
+    let mut handles = file_handles().lock();
+    let Some(file) = handles.get_mut(&handle) else {
+        return 0;
+    };
+
+    match file.write(&bytes.data) {
         Ok(n) => n as i64,
         Err(_) => 0,
     }
@@ -2766,6 +2895,146 @@ unsafe fn forge_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
     ptr
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn forge_bytes_from_string_utf8(s: *const i8) -> i64 {
+    if s.is_null() {
+        return forge_bytes_from_vec(Vec::new());
+    }
+    let len = crate::string::forge_cstring_len(s) as usize;
+    let bytes = std::slice::from_raw_parts(s as *const u8, len);
+    forge_bytes_from_vec(bytes.to_vec())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_bytes_to_string_utf8(handle: i64) -> *mut i8 {
+    let Some(bytes) = forge_bytes_ref(handle) else {
+        return std::ptr::null_mut();
+    };
+    if std::str::from_utf8(&bytes.data).is_err() {
+        return std::ptr::null_mut();
+    }
+    forge_copy_bytes_to_cstring(&bytes.data)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_bytes_len(handle: i64) -> i64 {
+    let Some(bytes) = forge_bytes_ref(handle) else {
+        return 0;
+    };
+    bytes.data.len() as i64
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_bytes_is_empty(handle: i64) -> i64 {
+    let Some(bytes) = forge_bytes_ref(handle) else {
+        return 1;
+    };
+    if bytes.data.is_empty() { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_bytes_get(handle: i64, idx: i64) -> i64 {
+    let Some(bytes) = forge_bytes_ref(handle) else {
+        return 0;
+    };
+    if idx < 0 {
+        return 0;
+    }
+    bytes.data.get(idx as usize).copied().unwrap_or(0) as i64
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_bytes_slice(handle: i64, start: i64, end: i64) -> i64 {
+    let Some(bytes) = forge_bytes_ref(handle) else {
+        return 0;
+    };
+    let len = bytes.data.len() as i64;
+    let mut start_idx = start.max(0).min(len);
+    let mut end_idx = end.max(0).min(len);
+    if end_idx < start_idx {
+        std::mem::swap(&mut start_idx, &mut end_idx);
+    }
+    forge_bytes_from_vec(bytes.data[start_idx as usize..end_idx as usize].to_vec())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_bytes_concat(a: i64, b: i64) -> i64 {
+    let Some(a_bytes) = forge_bytes_ref(a) else {
+        return 0;
+    };
+    let Some(b_bytes) = forge_bytes_ref(b) else {
+        return 0;
+    };
+    let mut out = Vec::with_capacity(a_bytes.data.len() + b_bytes.data.len());
+    out.extend_from_slice(&a_bytes.data);
+    out.extend_from_slice(&b_bytes.data);
+    forge_bytes_from_vec(out)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_bytes_eq(a: i64, b: i64) -> i64 {
+    if a == 0 && b == 0 {
+        return 1;
+    }
+    let Some(a_bytes) = forge_bytes_ref(a) else {
+        return 0;
+    };
+    let Some(b_bytes) = forge_bytes_ref(b) else {
+        return 0;
+    };
+    if a_bytes.data == b_bytes.data { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn forge_byte_buffer_new() -> i64 {
+    Box::into_raw(Box::new(ForgeByteBuffer { data: Vec::new() })) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn forge_byte_buffer_with_capacity(capacity: i64) -> i64 {
+    let cap = if capacity > 0 { capacity as usize } else { 0 };
+    Box::into_raw(Box::new(ForgeByteBuffer { data: Vec::with_capacity(cap) })) as i64
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_byte_buffer_write(handle: i64, data: i64) -> i64 {
+    let Some(buffer) = forge_byte_buffer_mut(handle) else {
+        return 0;
+    };
+    let Some(bytes) = forge_bytes_ref(data) else {
+        return 0;
+    };
+    buffer.data.extend_from_slice(&bytes.data);
+    bytes.data.len() as i64
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_byte_buffer_write_byte(handle: i64, value: i64) -> i64 {
+    let Some(buffer) = forge_byte_buffer_mut(handle) else {
+        return 0;
+    };
+    if !(0..=255).contains(&value) {
+        return 0;
+    }
+    buffer.data.push(value as u8);
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_byte_buffer_bytes(handle: i64) -> i64 {
+    let Some(buffer) = forge_byte_buffer_mut(handle) else {
+        return 0;
+    };
+    forge_bytes_from_vec(buffer.data.clone())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_byte_buffer_clear(handle: i64) {
+    if let Some(buffer) = forge_byte_buffer_mut(handle) {
+        buffer.data.clear();
+    }
+}
+
 /// Split string into a list of single-character strings (chars)
 /// Get path extension
 ///
@@ -2920,6 +3189,18 @@ fn forge_read_process_stream<R: std::io::Read>(reader: &mut R, max_bytes: i64) -
     }
 }
 
+fn forge_read_process_stream_bytes<R: std::io::Read>(reader: &mut R, max_bytes: i64) -> i64 {
+    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let mut buf = vec![0u8; size];
+    match reader.read(&mut buf) {
+        Ok(n) => {
+            buf.truncate(n);
+            forge_bytes_from_vec(buf)
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Read contents of a process's stdout
 ///
 /// # Safety
@@ -2936,6 +3217,18 @@ pub unsafe extern "C" fn forge_process_read(handle: i64, max_bytes: i64) -> *mut
     forge_read_process_stream(stdout, max_bytes)
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn forge_process_read_bytes(handle: i64, max_bytes: i64) -> i64 {
+    let mut handles = process_handles().lock();
+    let Some(entry) = handles.get_mut(&handle) else {
+        return 0;
+    };
+    let Some(stdout) = entry.stdout.as_mut() else {
+        return forge_bytes_from_vec(Vec::new());
+    };
+    forge_read_process_stream_bytes(stdout, max_bytes)
+}
+
 /// Read contents of a process's stderr
 ///
 /// # Safety
@@ -2950,6 +3243,18 @@ pub unsafe extern "C" fn forge_process_read_err(handle: i64, max_bytes: i64) -> 
         return unsafe { forge_cstring_empty() };
     };
     forge_read_process_stream(stderr, max_bytes)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_process_read_err_bytes(handle: i64, max_bytes: i64) -> i64 {
+    let mut handles = process_handles().lock();
+    let Some(entry) = handles.get_mut(&handle) else {
+        return 0;
+    };
+    let Some(stderr) = entry.stderr.as_mut() else {
+        return forge_bytes_from_vec(Vec::new());
+    };
+    forge_read_process_stream_bytes(stderr, max_bytes)
 }
 
 /// Write data to a process's stdin
@@ -2972,6 +3277,29 @@ pub unsafe extern "C" fn forge_process_write(handle: i64, data: *const i8) -> i6
     };
     let text = std::ffi::CStr::from_ptr(data).to_str().unwrap_or("");
     match stdin.write(text.as_bytes()) {
+        Ok(n) => {
+            let _ = stdin.flush();
+            n as i64
+        }
+        Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_process_write_bytes(handle: i64, data: i64) -> i64 {
+    use std::io::Write;
+
+    let Some(bytes) = forge_bytes_ref(data) else {
+        return 0;
+    };
+    let mut handles = process_handles().lock();
+    let Some(entry) = handles.get_mut(&handle) else {
+        return 0;
+    };
+    let Some(stdin) = entry.stdin.as_mut() else {
+        return 0;
+    };
+    match stdin.write(&bytes.data) {
         Ok(n) => {
             let _ = stdin.flush();
             n as i64
@@ -3077,6 +3405,29 @@ pub extern "C" fn forge_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
     result
 }
 
+#[no_mangle]
+pub extern "C" fn forge_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::os::unix::io::FromRawFd;
+    if conn_fd <= 0 {
+        return 0;
+    }
+    let mut stream = unsafe { TcpStream::from_raw_fd(conn_fd as i32) };
+    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let mut buf = vec![0u8; size];
+    let result = match stream.read(&mut buf) {
+        Ok(n) => {
+            buf.truncate(n);
+            forge_bytes_from_vec(buf)
+        }
+        Err(_) => 0,
+    };
+    use std::os::unix::io::IntoRawFd;
+    let _ = stream.into_raw_fd();
+    result
+}
+
 /// TCP write — write data to connection fd, return bytes written
 #[no_mangle]
 pub unsafe extern "C" fn forge_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
@@ -3091,6 +3442,28 @@ pub unsafe extern "C" fn forge_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
         Err(_) => 0,
     };
     let _ = stream.flush();
+    use std::os::unix::io::IntoRawFd;
+    let _ = stream.into_raw_fd();
+    result
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_tcp_write_bytes(conn_fd: i64, data: i64) -> i64 {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::os::unix::io::FromRawFd;
+
+    let Some(bytes) = forge_bytes_ref(data) else {
+        return 0;
+    };
+    if conn_fd <= 0 {
+        return 0;
+    }
+    let mut stream = TcpStream::from_raw_fd(conn_fd as i32);
+    let result = match stream.write(&bytes.data) {
+        Ok(n) => n as i64,
+        Err(_) => 0,
+    };
     use std::os::unix::io::IntoRawFd;
     let _ = stream.into_raw_fd();
     result

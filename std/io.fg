@@ -516,17 +516,17 @@ pub fn read_all_string(reader: StringReader) -> String!:
 pub fn read_all_string_chunked(reader: StringReader, chunk_size: Int) -> String!:
     size := normalized_chunk_size(chunk_size)
     mut result := ""
-    mut chunk := string_reader_read(reader, size)!
+    mut chunk := reader.read(size)!
     while chunk.len() > 0:
         result = result + chunk
-        chunk = string_reader_read(reader, size)!
+        chunk = reader.read(size)!
     return result
 
 pub fn write_all_string(writer: StringBuffer, data: String) -> Int!:
     mut total := 0
     mut remaining := data
     while remaining.len() > 0:
-        wrote := string_buffer_write(writer, remaining)!
+        wrote := writer.write(remaining)!
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
@@ -537,7 +537,7 @@ pub fn write_all_tcp_stream(writer: TcpStream, data: String) -> Int!:
     mut total := 0
     mut remaining := data
     while remaining.len() > 0:
-        wrote := tcp_stream_write(writer, remaining)!
+        wrote := writer.write(remaining)!
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
@@ -548,7 +548,7 @@ pub fn write_all_file_stream(writer: FileStream, data: String) -> Int!:
     mut total := 0
     mut remaining := data
     while remaining.len() > 0:
-        wrote := file_stream_write(writer, remaining)!
+        wrote := writer.write(remaining)!
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
@@ -561,10 +561,10 @@ pub fn copy_string(reader: StringReader, writer: StringBuffer) -> Int!:
 pub fn copy_string_chunked(reader: StringReader, writer: StringBuffer, chunk_size: Int) -> Int!:
     size := normalized_chunk_size(chunk_size)
     mut total := 0
-    mut chunk := string_reader_read(reader, size)!
+    mut chunk := reader.read(size)!
     while chunk.len() > 0:
         total = total + write_all_string(writer, chunk)!
-        chunk = string_reader_read(reader, size)!
+        chunk = reader.read(size)!
     return total
 
 pub fn read_all_tcp_stream(stream: TcpStream) -> String!:
@@ -573,10 +573,10 @@ pub fn read_all_tcp_stream(stream: TcpStream) -> String!:
 pub fn read_all_tcp_stream_chunked(stream: TcpStream, chunk_size: Int) -> String!:
     size := normalized_chunk_size(chunk_size)
     mut result := ""
-    mut chunk := tcp_stream_read(stream, size)!
+    mut chunk := stream.read(size)!
     while chunk.len() > 0:
         result = result + chunk
-        chunk = tcp_stream_read(stream, size)!
+        chunk = stream.read(size)!
     return result
 
 pub fn read_all_file_stream(stream: FileStream) -> String!:
@@ -585,10 +585,10 @@ pub fn read_all_file_stream(stream: FileStream) -> String!:
 pub fn read_all_file_stream_chunked(stream: FileStream, chunk_size: Int) -> String!:
     size := normalized_chunk_size(chunk_size)
     mut result := ""
-    mut chunk := file_stream_read(stream, size)!
+    mut chunk := stream.read(size)!
     while chunk.len() > 0:
         result = result + chunk
-        chunk = file_stream_read(stream, size)!
+        chunk = stream.read(size)!
     return result
 
 pub fn read_file_text(path: String) -> String!:
@@ -597,7 +597,7 @@ pub fn read_file_text(path: String) -> String!:
 pub fn read_file_text_chunked(path: String, chunk_size: Int) -> String!:
     stream := file_stream_open_read(path)!
     content := read_all_file_stream_chunked(stream, chunk_size)!
-    file_stream_close(stream)
+    stream.close()
     return content
 
 pub fn write_file_text(path: String, data: String) -> Int!:
@@ -605,10 +605,10 @@ pub fn write_file_text(path: String, data: String) -> Int!:
 
 pub fn write_file_text_chunked(path: String, data: String, chunk_size: Int) -> Int!:
     stream := file_stream_open_write(path)!
-    writer := buffered_file_writer_chunked(stream, chunk_size)
-    mut total := buffered_file_writer_write(writer, data)!
-    total = total + buffered_file_writer_flush(writer)!
-    file_stream_close(stream)
+    writer := stream.buffered_writer_chunked(chunk_size)
+    mut total := writer.write(data)!
+    total = total + writer.flush()!
+    stream.close()
     return total
 
 pub fn append_file_text(path: String, data: String) -> Int!:
@@ -616,17 +616,17 @@ pub fn append_file_text(path: String, data: String) -> Int!:
 
 pub fn append_file_text_chunked(path: String, data: String, chunk_size: Int) -> Int!:
     stream := file_stream_open_append(path)!
-    writer := buffered_file_writer_chunked(stream, chunk_size)
-    mut total := buffered_file_writer_write(writer, data)!
-    total = total + buffered_file_writer_flush(writer)!
-    file_stream_close(stream)
+    writer := stream.buffered_writer_chunked(chunk_size)
+    mut total := writer.write(data)!
+    total = total + writer.flush()!
+    stream.close()
     return total
 
 pub fn write_all_process_stdin(writer: ProcessStdin, data: String) -> Int!:
     mut total := 0
     mut remaining := data
     while remaining.len() > 0:
-        wrote := process_stdin_write(writer, remaining)!
+        wrote := writer.write(remaining)!
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
@@ -639,10 +639,10 @@ pub fn read_all_process_stdout(reader: ProcessStdout) -> String!:
 pub fn read_all_process_stdout_chunked(reader: ProcessStdout, chunk_size: Int) -> String!:
     size := normalized_chunk_size(chunk_size)
     mut result := ""
-    mut chunk := process_stdout_read(reader, size)!
+    mut chunk := reader.read(size)!
     while chunk.len() > 0:
         result = result + chunk
-        chunk = process_stdout_read(reader, size)!
+        chunk = reader.read(size)!
     return result
 
 pub fn read_all_process_stderr(reader: ProcessStderr) -> String!:
@@ -651,10 +651,10 @@ pub fn read_all_process_stderr(reader: ProcessStderr) -> String!:
 pub fn read_all_process_stderr_chunked(reader: ProcessStderr, chunk_size: Int) -> String!:
     size := normalized_chunk_size(chunk_size)
     mut result := ""
-    mut chunk := process_stderr_read(reader, size)!
+    mut chunk := reader.read(size)!
     while chunk.len() > 0:
         result = result + chunk
-        chunk = process_stderr_read(reader, size)!
+        chunk = reader.read(size)!
     return result
 
 fn string_reader_read_internal(reader: StringReader, max_bytes: Int) -> String!:

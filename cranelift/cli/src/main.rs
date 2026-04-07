@@ -796,13 +796,16 @@ fn check_file(path: &str) {
     let output = Command::new(&compiler)
         .args(["check", path])
         .output()
-        .expect("Failed to run compiler");
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to run self-hosted compiler: {}", e);
+            std::process::exit(1);
+        });
 
     print!("{}", String::from_utf8_lossy(&output.stdout));
     eprint!("{}", String::from_utf8_lossy(&output.stderr));
 
     if !output.status.success() {
-        std::process::exit(1);
+        std::process::exit(output.status.code().unwrap_or(1));
     }
 }
 

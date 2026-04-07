@@ -1,12 +1,12 @@
 # csv parsing and encoding
 
-from std.csv import parse, encode_row, save_chunked, parse_file_chunked
-from std.fs import remove
+import std.csv as csv
+import std.fs as fs
 
 fn main() -> String!:
     path := "/tmp/forge_csv_ops.csv"
     data := "name,age,city" + chr(10) + "alice,30,nyc" + chr(10) + "bob,25,sf"
-    rows := parse(data)
+    rows := csv.parse(data)
     print("rows: " + rows.len().to_string())
     print("first: " + rows[0].join("|"))
     print("second: " + rows[1].join("|"))
@@ -14,17 +14,17 @@ fn main() -> String!:
 
     # encoding
     mut r1: List[String] := ["x", "y"]
-    print("encoded: " + encode_row(r1))
+    print("encoded: " + csv.encode_row(r1))
 
     # quoting
     mut r2: List[String] := ["hello, world", "plain"]
-    print("quoted: " + encode_row(r2))
+    print("quoted: " + csv.encode_row(r2))
 
     # file-backed helpers use the same shared io layer now
-    print("saved: " + save_chunked(path, rows, 4)!.to_string())
-    loaded := parse_file_chunked(path, 3)!
+    print("saved: " + csv.save_chunked(path, rows, 4)!.to_string())
+    loaded := csv.parse_file_chunked(path, 3)!
     print("loaded: " + loaded[1].join("|"))
-    remove(path)
+    fs.remove(path)
 
     print("csv ops work")
     return ""

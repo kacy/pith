@@ -1,7 +1,7 @@
 # toml parsing
-from std.toml import parse, parse_file_chunked, type_of, get_string, get_int, get_float, get_bool, has, get_array, array_len, array_get, get_table, keys
-from std.io import write_file_text
-from std.fs import remove
+import std.toml as toml
+import std.io as io
+import std.fs as fs
 
 fn main() -> String!:
     path := "/tmp/forge_toml_ops.toml"
@@ -18,36 +18,36 @@ fn main() -> String!:
     doc = doc + "host = " + chr(34) + "localhost" + chr(34) + newline
     doc = doc + "port = 8080" + newline
 
-    root := parse(doc)
-    print("type: " + type_of(root))
+    root := toml.parse(doc)
+    print("type: " + toml.type_of(root))
 
     # basic values
-    print("title: " + get_string(root, "title"))
-    print("version: " + get_int(root, "version").to_string())
-    print("pi: " + get_float(root, "pi").to_string())
-    print("enabled: " + get_bool(root, "enabled").to_string())
+    print("title: " + toml.get_string(root, "title"))
+    print("version: " + toml.get_int(root, "version").to_string())
+    print("pi: " + toml.get_float(root, "pi").to_string())
+    print("enabled: " + toml.get_bool(root, "enabled").to_string())
 
     # has key
-    print("has title: " + has(root, "title").to_string())
-    print("has missing: " + has(root, "missing").to_string())
+    print("has title: " + toml.has(root, "title").to_string())
+    print("has missing: " + toml.has(root, "missing").to_string())
 
     # array
-    tags := get_array(root, "tags")
-    print("tags count: " + array_len(tags).to_string())
-    tag0 := array_get(tags, 0)
-    print("tag 0 type: " + type_of(tag0))
+    tags := toml.get_array(root, "tags")
+    print("tags count: " + toml.array_len(tags).to_string())
+    tag0 := toml.array_get(tags, 0)
+    print("tag 0 type: " + toml.type_of(tag0))
 
     # sub-table
-    server := get_table(root, "server")
-    print("server host: " + get_string(server, "host"))
-    print("server port: " + get_int(server, "port").to_string())
+    server := toml.get_table(root, "server")
+    print("server host: " + toml.get_string(server, "host"))
+    print("server port: " + toml.get_int(server, "port").to_string())
 
     # keys
-    root_keys := keys(root)
+    root_keys := toml.keys(root)
     print("key count: " + root_keys.len().to_string())
 
-    write_file_text(path, doc)!
-    file_root := parse_file_chunked(path, 3)
-    print("file host: " + get_string(get_table(file_root, "server"), "host"))
-    remove(path)
+    io.write_file_text(path, doc)!
+    file_root := toml.parse_file_chunked(path, 3)
+    print("file host: " + toml.get_string(toml.get_table(file_root, "server"), "host"))
+    fs.remove(path)
     return ""

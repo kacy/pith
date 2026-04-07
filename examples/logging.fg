@@ -1,19 +1,19 @@
 # structured logging examples
-from std.log import info, warn, error, debug, set_file, clear_file
-from std.io import read_file_text
-from std.fs import remove
+import std.log as log
+import std.io as io
+import std.fs as fs
 
 fn main() -> String!:
     path := "/tmp/forge_logging.txt"
-    set_file(path)
-    info("server starting on port 8080")
-    warn("cache miss rate above threshold")
-    error("connection refused")
-    debug("request payload size: 1024 bytes")
-    clear_file()
-    content := read_file_text(path)!
+    log.set_file(path)
+    log.info("server starting on port 8080")
+    log.warn("cache miss rate above threshold")
+    log.error("connection refused")
+    log.debug("request payload size: 1024 bytes")
+    log.clear_file()
+    content := io.read_file_text(path)!
     print("file has info: " + content.contains("[INFO]").to_string())
     print("file has error: " + content.contains("[ERROR]").to_string())
-    remove(path)
+    fs.remove(path)
     print("logging works")
     return ""

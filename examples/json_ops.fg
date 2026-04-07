@@ -1,10 +1,7 @@
 # json_ops.fg — test std.json parse and encode
 
-from std.json import parse, type_of, get_bool, get_int, get_float, get_string
-from std.json import array_len, array_get, object_get, object_has, object_keys
-from std.json import encode, make_int, make_string, make_array, array_push
-from std.json import make_object, object_set, save_chunked, parse_file_chunked
-from std.fs import remove
+import std.json as json
+import std.fs as fs
 
 fn main():
     path := "/tmp/forge_json_ops.json"
@@ -15,58 +12,58 @@ fn main():
 
     # parse a simple object
     input := lb + "\"name\":\"forge\",\"version\":1,\"active\":true,\"tags\":[\"lang\",\"fast\"]" + rb
-    root := parse(input)
-    print("type = " + type_of(root))
+    root := json.parse(input)
+    print("type = " + json.type_of(root))
 
     # extract fields
-    name_h := object_get(root, "name")
-    print("name = " + get_string(name_h))
+    name_h := json.object_get(root, "name")
+    print("name = " + json.get_string(name_h))
 
-    ver := object_get(root, "version")
-    print("version = " + get_int(ver).to_string())
+    ver := json.object_get(root, "version")
+    print("version = " + json.get_int(ver).to_string())
 
-    active := object_get(root, "active")
-    print("active = " + get_bool(active).to_string())
+    active := json.object_get(root, "active")
+    print("active = " + json.get_bool(active).to_string())
 
     # array access
-    tags := object_get(root, "tags")
-    print("tags.len = " + array_len(tags).to_string())
-    print("tags[0] = " + get_string(array_get(tags, 0)))
-    print("tags[1] = " + get_string(array_get(tags, 1)))
+    tags := json.object_get(root, "tags")
+    print("tags.len = " + json.array_len(tags).to_string())
+    print("tags[0] = " + json.get_string(json.array_get(tags, 0)))
+    print("tags[1] = " + json.get_string(json.array_get(tags, 1)))
 
     # key queries
-    print("has name = " + object_has(root, "name").to_string())
-    print("has missing = " + object_has(root, "missing").to_string())
+    print("has name = " + json.object_has(root, "name").to_string())
+    print("has missing = " + json.object_has(root, "missing").to_string())
 
-    names := object_keys(root)
+    names := json.object_keys(root)
     print("keys = " + names.join(", "))
 
     # parse numbers
-    nums := parse("[42, 3.14, -7, 0]")
-    print("nums type = " + type_of(nums))
-    print("nums[0] = " + get_int(array_get(nums, 0)).to_string())
-    print("nums[1] = " + get_float(array_get(nums, 1)).to_string())
+    nums := json.parse("[42, 3.14, -7, 0]")
+    print("nums type = " + json.type_of(nums))
+    print("nums[0] = " + json.get_int(json.array_get(nums, 0)).to_string())
+    print("nums[1] = " + json.get_float(json.array_get(nums, 1)).to_string())
 
     # build and encode JSON
-    obj := make_object()
-    object_set(obj, "tool", make_string("forge"))
-    object_set(obj, "year", make_int(2026))
-    arr := make_array()
-    array_push(arr, make_int(1))
-    array_push(arr, make_int(2))
-    array_push(arr, make_int(3))
-    object_set(obj, "items", arr)
-    print("encoded = " + encode(obj))
-    print("saved = " + save_chunked(path, obj, 4).to_string())
+    obj := json.make_object()
+    json.object_set(obj, "tool", json.make_string("forge"))
+    json.object_set(obj, "year", json.make_int(2026))
+    arr := json.make_array()
+    json.array_push(arr, json.make_int(1))
+    json.array_push(arr, json.make_int(2))
+    json.array_push(arr, json.make_int(3))
+    json.object_set(obj, "items", arr)
+    print("encoded = " + json.encode(obj))
+    print("saved = " + json.save_chunked(path, obj, 4).to_string())
 
-    loaded := parse_file_chunked(path, 3)
-    print("file tool = " + get_string(object_get(loaded, "tool")))
+    loaded := json.parse_file_chunked(path, 3)
+    print("file tool = " + json.get_string(json.object_get(loaded, "tool")))
 
     # null and bool
-    print("null type = " + type_of(parse("null")))
-    print("true type = " + type_of(parse("true")))
+    print("null type = " + json.type_of(json.parse("null")))
+    print("true type = " + json.type_of(json.parse("true")))
 
     # invalid parse
-    bad := parse("not json")
+    bad := json.parse("not json")
     print("bad parse = " + bad.to_string())
-    remove(path)
+    fs.remove(path)

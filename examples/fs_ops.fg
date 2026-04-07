@@ -1,38 +1,38 @@
 # fs_ops.fg — test std.fs module
 
-from std.fs import exists, is_dir, write, read, remove, make_dir, list, open
-from std.io import read_all_file_stream, file_stream_close
+import std.fs as fs
+import std.io as io
 
 fn do_test() -> String!:
     # write a temp file
-    write("/tmp/forge_fs_test.txt", "hello from forge")!
+    fs.write("/tmp/forge_fs_test.txt", "hello from forge")!
 
     # check existence
-    print("exists: " + exists("/tmp/forge_fs_test.txt").to_string())
-    print("is_dir: " + is_dir("/tmp/forge_fs_test.txt").to_string())
-    print("is_dir /tmp: " + is_dir("/tmp").to_string())
+    print("exists: " + fs.exists("/tmp/forge_fs_test.txt").to_string())
+    print("is_dir: " + fs.is_dir("/tmp/forge_fs_test.txt").to_string())
+    print("is_dir /tmp: " + fs.is_dir("/tmp").to_string())
 
     # read it back with the whole-file helper
-    content := read("/tmp/forge_fs_test.txt")!
+    content := fs.read("/tmp/forge_fs_test.txt")!
     print("content: " + content)
 
     # stream the same file through std.io
-    reader := open("/tmp/forge_fs_test.txt")!
-    streamed := read_all_file_stream(reader)!
-    file_stream_close(reader)
+    reader := fs.open("/tmp/forge_fs_test.txt")!
+    streamed := io.read_all_file_stream(reader)!
+    io.file_stream_close(reader)
     print("streamed: " + streamed)
 
     # list directory
-    entries := list("/tmp")
+    entries := fs.list("/tmp")
     print("tmp has entries: " + (entries.len() > 0).to_string())
 
     # make a directory
-    make_dir("/tmp/forge_fs_test_dir")
-    print("dir created: " + is_dir("/tmp/forge_fs_test_dir").to_string())
+    fs.make_dir("/tmp/forge_fs_test_dir")
+    print("dir created: " + fs.is_dir("/tmp/forge_fs_test_dir").to_string())
 
     # clean up
-    remove("/tmp/forge_fs_test.txt")
-    print("removed: " + (exists("/tmp/forge_fs_test.txt") == false).to_string())
+    fs.remove("/tmp/forge_fs_test.txt")
+    print("removed: " + (fs.exists("/tmp/forge_fs_test.txt") == false).to_string())
     exec("rmdir /tmp/forge_fs_test_dir")
     return ""
 

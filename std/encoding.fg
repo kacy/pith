@@ -26,9 +26,6 @@ fn b64_char_val(c: String) -> Int:
     return -1
 
 pub fn b64_encode(input: Bytes) -> String:
-    return encoding_b64_encode(input)
-
-fn encoding_b64_encode(input: Bytes) -> String:
     table := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     mut result := ""
     mut i := 0
@@ -54,16 +51,16 @@ fn encoding_b64_encode(input: Bytes) -> String:
         result = result + "="
     return result
 
+fn encoding_b64_encode(input: Bytes) -> String:
+    return b64_encode(input)
+
 pub fn b64_encode_string(input: String) -> String:
-    return encoding_b64_encode_string(input)
+    return b64_encode(bytes.from_string_utf8(input))
 
 fn encoding_b64_encode_string(input: String) -> String:
-    return encoding_b64_encode(bytes.from_string_utf8(input))
+    return b64_encode_string(input)
 
 pub fn b64_decode(input: String) -> Bytes!:
-    return encoding_b64_decode(input)
-
-fn encoding_b64_decode(input: String) -> Bytes!:
     if input.len() % 4 != 0:
         fail "invalid base64: length not multiple of 4"
 
@@ -94,11 +91,14 @@ fn encoding_b64_decode(input: String) -> Bytes!:
         i = i + 4
     return buf.bytes()
 
+fn encoding_b64_decode(input: String) -> Bytes!:
+    return b64_decode(input)
+
 pub fn b64_decode_utf8(input: String) -> String!:
-    return encoding_b64_decode_utf8(input)
+    return b64_decode(input)!.to_string_utf8()!
 
 fn encoding_b64_decode_utf8(input: String) -> String!:
-    return encoding_b64_decode(input)!.to_string_utf8()!
+    return b64_decode_utf8(input)
 
 fn hex_nibble(c: String) -> Int:
     if c >= "0" and c <= "9":
@@ -110,9 +110,6 @@ fn hex_nibble(c: String) -> Int:
     return -1
 
 pub fn to_hex(input: Bytes) -> String:
-    return encoding_to_hex(input)
-
-fn encoding_to_hex(input: Bytes) -> String:
     hex_digits := "0123456789abcdef"
     mut result := ""
     mut position := 0
@@ -122,16 +119,16 @@ fn encoding_to_hex(input: Bytes) -> String:
         position = position + 1
     return result
 
+fn encoding_to_hex(input: Bytes) -> String:
+    return to_hex(input)
+
 pub fn to_hex_string(input: String) -> String:
-    return encoding_to_hex_string(input)
+    return to_hex(bytes.from_string_utf8(input))
 
 fn encoding_to_hex_string(input: String) -> String:
-    return encoding_to_hex(bytes.from_string_utf8(input))
+    return to_hex_string(input)
 
 pub fn from_hex(input: String) -> Bytes!:
-    return encoding_from_hex(input)
-
-fn encoding_from_hex(input: String) -> Bytes!:
     if input.len() % 2 != 0:
         fail "invalid hex: odd length"
 
@@ -146,8 +143,11 @@ fn encoding_from_hex(input: String) -> Bytes!:
         position = position + 2
     return buf.bytes()
 
+fn encoding_from_hex(input: String) -> Bytes!:
+    return from_hex(input)
+
 pub fn from_hex_utf8(input: String) -> String!:
-    return encoding_from_hex_utf8(input)
+    return from_hex(input)!.to_string_utf8()!
 
 fn encoding_from_hex_utf8(input: String) -> String!:
-    return encoding_from_hex(input)!.to_string_utf8()!
+    return from_hex_utf8(input)

@@ -100,9 +100,6 @@ fn word32_to_hex(val: Int) -> String:
     return result
 
 pub fn sha256(input: Bytes) -> String:
-    return hash_sha256(input)
-
-fn hash_sha256(input: Bytes) -> String:
     sha_init()
 
     mut h0 := 1779033703
@@ -188,16 +185,16 @@ fn hash_sha256(input: Bytes) -> String:
 
     return word32_to_hex(h0) + word32_to_hex(h1) + word32_to_hex(h2) + word32_to_hex(h3) + word32_to_hex(h4) + word32_to_hex(h5) + word32_to_hex(h6) + word32_to_hex(h7)
 
+fn hash_sha256(input: Bytes) -> String:
+    return sha256(input)
+
 pub fn sha256_string(input: String) -> String:
-    return hash_sha256_string(input)
+    return sha256(bytes.from_string_utf8(input))
 
 fn hash_sha256_string(input: String) -> String:
-    return hash_sha256(bytes.from_string_utf8(input))
+    return sha256_string(input)
 
 pub fn fnv1a(input: Bytes) -> Int:
-    return hash_fnv1a(input)
-
-fn hash_fnv1a(input: Bytes) -> Int:
     mut h := 2166136261
     mut i := 0
     while i < input.len():
@@ -206,11 +203,14 @@ fn hash_fnv1a(input: Bytes) -> Int:
         i = i + 1
     return h
 
+fn hash_fnv1a(input: Bytes) -> Int:
+    return fnv1a(input)
+
 pub fn fnv1a_string(input: String) -> Int:
-    return hash_fnv1a_string(input)
+    return fnv1a(bytes.from_string_utf8(input))
 
 fn hash_fnv1a_string(input: String) -> Int:
-    return hash_fnv1a(bytes.from_string_utf8(input))
+    return fnv1a_string(input)
 
 K0 := 1518500249
 K1 := 1859775393
@@ -224,9 +224,6 @@ fn add32(a: Int, b: Int) -> Int:
     return bit_and(a + b, 4294967295)
 
 pub fn sha1(input: Bytes) -> String:
-    return hash_sha1(input)
-
-fn hash_sha1(input: Bytes) -> String:
     mut h0 := 1732584193
     mut h1 := 4023233417
     mut h2 := 2562383102
@@ -308,8 +305,11 @@ fn hash_sha1(input: Bytes) -> String:
 
     return word32_to_hex(h0) + word32_to_hex(h1) + word32_to_hex(h2) + word32_to_hex(h3) + word32_to_hex(h4)
 
+fn hash_sha1(input: Bytes) -> String:
+    return sha1(input)
+
 pub fn sha1_string(input: String) -> String:
-    return hash_sha1_string(input)
+    return sha1(bytes.from_string_utf8(input))
 
 fn hash_sha1_string(input: String) -> String:
-    return hash_sha1(bytes.from_string_utf8(input))
+    return sha1_string(input)

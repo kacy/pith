@@ -1481,9 +1481,6 @@ fn resolve_func_name(name: &str) -> &str {
         "path_ext" | "ext" => "forge_path_ext",
         "path_stem" | "stem" => "forge_path_stem",
         // Logging
-        "log_info" => "forge_log_info",
-        "log_warn" => "forge_log_warn",
-        "log_error" | "log_debug" => "forge_log_error",
         // JSON
         "parse" => "forge_json_parse",
         "type_of" => "forge_json_type_of",

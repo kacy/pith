@@ -9,12 +9,31 @@
 #   warn("this prints")
 #   error("connection failed", "host=db.local port=5432")
 
+from std.fs import open_append
+from std.io import write_all_file_stream, file_stream_close
+
 # Levels: 0=DEBUG, 1=INFO, 2=WARN, 3=ERROR
 mut min_level: Int := 0
+mut sink_path: String := ""
 
 # Set minimum log level (0=DEBUG, 1=INFO, 2=WARN, 3=ERROR)
 pub fn set_level(level: Int):
+    log_set_level(level)
+
+fn log_set_level(level: Int):
     min_level = level
+
+pub fn set_file(path: String):
+    log_set_file(path)
+
+fn log_set_file(path: String):
+    sink_path = path
+
+pub fn clear_file():
+    log_clear_file()
+
+fn log_clear_file():
+    sink_path = ""
 
 fn level_num(level: String) -> Int:
     if level == "DEBUG":
@@ -31,35 +50,70 @@ fn log_line(level: String, msg: String):
     if level_num(level) < min_level:
         return
     ts := format_time(time(), "%Y-%m-%d %H:%M:%S")
-    print_err(ts + " [" + level + "] " + msg)
+    emit_line(ts + " [" + level + "] " + msg)
 
 fn log_kv(level: String, msg: String, fields: String):
     if level_num(level) < min_level:
         return
     ts := format_time(time(), "%Y-%m-%d %H:%M:%S")
-    print_err(ts + " [" + level + "] " + msg + " " + fields)
+    emit_line(ts + " [" + level + "] " + msg + " " + fields)
+
+fn emit_line(line: String):
+    print_err(line)
+    if sink_path == "":
+        return
+    stream_result := open_append(sink_path)
+    if stream_result.is_err:
+        return
+    stream := stream_result.ok
+    _wrote := write_all_file_stream(stream, line + chr(10))
+    file_stream_close(stream)
 
 pub fn debug(msg: String):
+    log_debug(msg)
+
+fn log_debug(msg: String):
     log_line("DEBUG", msg)
 
 pub fn info(msg: String):
+    log_info(msg)
+
+fn log_info(msg: String):
     log_line("INFO", msg)
 
 pub fn warn(msg: String):
+    log_warn(msg)
+
+fn log_warn(msg: String):
     log_line("WARN", msg)
 
 pub fn error(msg: String):
+    log_error(msg)
+
+fn log_error(msg: String):
     log_line("ERROR", msg)
 
 # Log with key=value fields: error("failed", "host=db port=5432")
 pub fn debug_kv(msg: String, fields: String):
+    log_debug_kv(msg, fields)
+
+fn log_debug_kv(msg: String, fields: String):
     log_kv("DEBUG", msg, fields)
 
 pub fn info_kv(msg: String, fields: String):
+    log_info_kv(msg, fields)
+
+fn log_info_kv(msg: String, fields: String):
     log_kv("INFO", msg, fields)
 
 pub fn warn_kv(msg: String, fields: String):
+    log_warn_kv(msg, fields)
+
+fn log_warn_kv(msg: String, fields: String):
     log_kv("WARN", msg, fields)
 
 pub fn error_kv(msg: String, fields: String):
+    log_error_kv(msg, fields)
+
+fn log_error_kv(msg: String, fields: String):
     log_kv("ERROR", msg, fields)

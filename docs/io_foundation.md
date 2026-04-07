@@ -153,10 +153,13 @@ csv is in too, now using buffered file reads and writes directly. toml and json
 both have file-backed helpers on the same foundation.
 
 the main consumer work that still feels worth doing is:
-- move `std.log` off the special-case path and onto normal file-backed io
 - keep cleaning up builtin-only shortcuts that still bypass the module path
 - fix the `forge run` / `forge_main run` wrapper weirdness that sometimes drops
   child stdout even when the built binaries are correct
+
+`std.log` is off the special-case path now too. imported log calls can come
+through the module, and the module can mirror logs into a file sink through the
+shared file-stream helpers when a caller opts into it.
 
 ## the long-term version
 

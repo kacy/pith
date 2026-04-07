@@ -137,121 +137,58 @@ impl Writer for StringBuffer:
         return string_buffer_write(self, data)
 
 pub fn string_reader(data: String) -> StringReader:
-    handle := next_string_reader_handle
-    next_string_reader_handle = next_string_reader_handle + 1
-    string_reader_data.insert(handle, data)
-    string_reader_offsets.insert(handle, 0)
-    return StringReader(handle)
+    return StringReader(allocate_string_reader_handle(data))
 
 pub fn string_buffer() -> StringBuffer:
-    handle := next_string_buffer_handle
-    next_string_buffer_handle = next_string_buffer_handle + 1
-    string_buffer_data.insert(handle, "")
-    return StringBuffer(handle)
+    return StringBuffer(allocate_string_buffer_handle())
 
 pub fn buffered_string_reader(reader: StringReader) -> BufferedStringReader:
     return buffered_string_reader_chunked(reader, DEFAULT_CHUNK_SIZE)
 
 pub fn buffered_string_reader_chunked(reader: StringReader, chunk_size: Int) -> BufferedStringReader:
-    handle := next_buffered_string_reader_handle
-    next_buffered_string_reader_handle = next_buffered_string_reader_handle + 1
-
-    size := normalized_chunk_size(chunk_size)
-    buffered_string_reader_sources.insert(handle, reader.handle)
-    buffered_string_reader_chunk_sizes.insert(handle, size)
-    buffered_string_reader_cache.insert(handle, "")
-    return BufferedStringReader(handle)
+    return BufferedStringReader(allocate_buffered_string_reader_handle(reader.handle, chunk_size))
 
 pub fn buffered_string_writer(writer: StringBuffer) -> BufferedStringWriter:
     return buffered_string_writer_chunked(writer, DEFAULT_CHUNK_SIZE)
 
 pub fn buffered_string_writer_chunked(writer: StringBuffer, chunk_size: Int) -> BufferedStringWriter:
-    handle := next_buffered_string_writer_handle
-    next_buffered_string_writer_handle = next_buffered_string_writer_handle + 1
-
-    size := normalized_chunk_size(chunk_size)
-    buffered_string_writer_targets.insert(handle, writer.handle)
-    buffered_string_writer_chunk_sizes.insert(handle, size)
-    buffered_string_writer_cache.insert(handle, "")
-    return BufferedStringWriter(handle)
+    return BufferedStringWriter(allocate_buffered_string_writer_handle(writer.handle, chunk_size))
 
 pub fn buffered_tcp_stream(stream: TcpStream) -> BufferedTcpStream:
     return buffered_tcp_stream_chunked(stream, DEFAULT_CHUNK_SIZE)
 
 pub fn buffered_tcp_stream_chunked(stream: TcpStream, chunk_size: Int) -> BufferedTcpStream:
-    handle := next_buffered_tcp_stream_handle
-    next_buffered_tcp_stream_handle = next_buffered_tcp_stream_handle + 1
-
-    size := normalized_chunk_size(chunk_size)
-    buffered_tcp_stream_fds.insert(handle, stream.fd)
-    buffered_tcp_stream_chunk_sizes.insert(handle, size)
-    buffered_tcp_stream_cache.insert(handle, "")
-    return BufferedTcpStream(handle)
+    return BufferedTcpStream(allocate_buffered_tcp_stream_handle(stream.fd, chunk_size))
 
 pub fn buffered_tcp_writer(writer: TcpStream) -> BufferedTcpWriter:
     return buffered_tcp_writer_chunked(writer, DEFAULT_CHUNK_SIZE)
 
 pub fn buffered_tcp_writer_chunked(writer: TcpStream, chunk_size: Int) -> BufferedTcpWriter:
-    handle := next_buffered_tcp_writer_handle
-    next_buffered_tcp_writer_handle = next_buffered_tcp_writer_handle + 1
-
-    size := normalized_chunk_size(chunk_size)
-    buffered_tcp_writer_fds.insert(handle, writer.fd)
-    buffered_tcp_writer_chunk_sizes.insert(handle, size)
-    buffered_tcp_writer_cache.insert(handle, "")
-    return BufferedTcpWriter(handle)
+    return BufferedTcpWriter(allocate_buffered_tcp_writer_handle(writer.fd, chunk_size))
 
 pub fn buffered_file_reader(stream: FileStream) -> BufferedFileReader:
     return buffered_file_reader_chunked(stream, DEFAULT_CHUNK_SIZE)
 
 pub fn buffered_file_reader_chunked(stream: FileStream, chunk_size: Int) -> BufferedFileReader:
-    handle := next_buffered_file_reader_handle
-    next_buffered_file_reader_handle = next_buffered_file_reader_handle + 1
-
-    size := normalized_chunk_size(chunk_size)
-    buffered_file_reader_handles.insert(handle, stream.handle)
-    buffered_file_reader_chunk_sizes.insert(handle, size)
-    buffered_file_reader_cache.insert(handle, "")
-    return BufferedFileReader(handle)
+    return BufferedFileReader(allocate_buffered_file_reader_handle(stream.handle, chunk_size))
 
 pub fn buffered_file_writer(stream: FileStream) -> BufferedFileWriter:
     return buffered_file_writer_chunked(stream, DEFAULT_CHUNK_SIZE)
 
 pub fn buffered_file_writer_chunked(stream: FileStream, chunk_size: Int) -> BufferedFileWriter:
-    handle := next_buffered_file_writer_handle
-    next_buffered_file_writer_handle = next_buffered_file_writer_handle + 1
-
-    size := normalized_chunk_size(chunk_size)
-    buffered_file_writer_handles.insert(handle, stream.handle)
-    buffered_file_writer_chunk_sizes.insert(handle, size)
-    buffered_file_writer_cache.insert(handle, "")
-    return BufferedFileWriter(handle)
+    return BufferedFileWriter(allocate_buffered_file_writer_handle(stream.handle, chunk_size))
 
 pub fn buffered_process_stdout(reader: ProcessStdout) -> BufferedProcessStdout:
     return buffered_process_stdout_chunked(reader, DEFAULT_CHUNK_SIZE)
 
 pub fn buffered_process_stdout_chunked(reader: ProcessStdout, chunk_size: Int) -> BufferedProcessStdout:
-    handle := next_buffered_process_stdout_handle
-    next_buffered_process_stdout_handle = next_buffered_process_stdout_handle + 1
-
-    size := normalized_chunk_size(chunk_size)
-    buffered_process_stdout_handles.insert(handle, reader.handle)
-    buffered_process_stdout_chunk_sizes.insert(handle, size)
-    buffered_process_stdout_cache.insert(handle, "")
-    return BufferedProcessStdout(handle)
+    return BufferedProcessStdout(allocate_buffered_process_stdout_handle(reader.handle, chunk_size))
 
 pub fn buffered_process_stderr(reader: ProcessStderr) -> BufferedProcessStderr:
     return buffered_process_stderr_chunked(reader, DEFAULT_CHUNK_SIZE)
 
 pub fn buffered_process_stderr_chunked(reader: ProcessStderr, chunk_size: Int) -> BufferedProcessStderr:
-    handle := next_buffered_process_stderr_handle
-    next_buffered_process_stderr_handle = next_buffered_process_stderr_handle + 1
-
-    size := normalized_chunk_size(chunk_size)
-    buffered_process_stderr_handles.insert(handle, reader.handle)
-    buffered_process_stderr_chunk_sizes.insert(handle, size)
-    buffered_process_stderr_cache.insert(handle, "")
-    return BufferedProcessStderr(handle)
+    return BufferedProcessStderr(allocate_buffered_process_stderr_handle(reader.handle, chunk_size))
 
 pub fn tcp_stream_connect(host: String, port: Int) -> TcpStream!:
     return TcpStream(tcp_connect(host, port)!)
@@ -385,6 +322,83 @@ fn normalized_chunk_size(chunk_size: Int) -> Int:
     if chunk_size <= 0:
         return DEFAULT_CHUNK_SIZE
     return chunk_size
+
+fn allocate_string_reader_handle(data: String) -> Int:
+    handle := next_string_reader_handle
+    next_string_reader_handle = next_string_reader_handle + 1
+    string_reader_data.insert(handle, data)
+    string_reader_offsets.insert(handle, 0)
+    return handle
+
+fn allocate_string_buffer_handle() -> Int:
+    handle := next_string_buffer_handle
+    next_string_buffer_handle = next_string_buffer_handle + 1
+    string_buffer_data.insert(handle, "")
+    return handle
+
+fn allocate_buffered_string_reader_handle(source_handle: Int, chunk_size: Int) -> Int:
+    handle := next_buffered_string_reader_handle
+    next_buffered_string_reader_handle = next_buffered_string_reader_handle + 1
+    buffered_string_reader_sources.insert(handle, source_handle)
+    buffered_string_reader_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
+    buffered_string_reader_cache.insert(handle, "")
+    return handle
+
+fn allocate_buffered_string_writer_handle(target_handle: Int, chunk_size: Int) -> Int:
+    handle := next_buffered_string_writer_handle
+    next_buffered_string_writer_handle = next_buffered_string_writer_handle + 1
+    buffered_string_writer_targets.insert(handle, target_handle)
+    buffered_string_writer_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
+    buffered_string_writer_cache.insert(handle, "")
+    return handle
+
+fn allocate_buffered_tcp_stream_handle(fd: Int, chunk_size: Int) -> Int:
+    handle := next_buffered_tcp_stream_handle
+    next_buffered_tcp_stream_handle = next_buffered_tcp_stream_handle + 1
+    buffered_tcp_stream_fds.insert(handle, fd)
+    buffered_tcp_stream_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
+    buffered_tcp_stream_cache.insert(handle, "")
+    return handle
+
+fn allocate_buffered_tcp_writer_handle(fd: Int, chunk_size: Int) -> Int:
+    handle := next_buffered_tcp_writer_handle
+    next_buffered_tcp_writer_handle = next_buffered_tcp_writer_handle + 1
+    buffered_tcp_writer_fds.insert(handle, fd)
+    buffered_tcp_writer_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
+    buffered_tcp_writer_cache.insert(handle, "")
+    return handle
+
+fn allocate_buffered_file_reader_handle(file_handle: Int, chunk_size: Int) -> Int:
+    handle := next_buffered_file_reader_handle
+    next_buffered_file_reader_handle = next_buffered_file_reader_handle + 1
+    buffered_file_reader_handles.insert(handle, file_handle)
+    buffered_file_reader_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
+    buffered_file_reader_cache.insert(handle, "")
+    return handle
+
+fn allocate_buffered_file_writer_handle(file_handle: Int, chunk_size: Int) -> Int:
+    handle := next_buffered_file_writer_handle
+    next_buffered_file_writer_handle = next_buffered_file_writer_handle + 1
+    buffered_file_writer_handles.insert(handle, file_handle)
+    buffered_file_writer_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
+    buffered_file_writer_cache.insert(handle, "")
+    return handle
+
+fn allocate_buffered_process_stdout_handle(process_handle: Int, chunk_size: Int) -> Int:
+    handle := next_buffered_process_stdout_handle
+    next_buffered_process_stdout_handle = next_buffered_process_stdout_handle + 1
+    buffered_process_stdout_handles.insert(handle, process_handle)
+    buffered_process_stdout_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
+    buffered_process_stdout_cache.insert(handle, "")
+    return handle
+
+fn allocate_buffered_process_stderr_handle(process_handle: Int, chunk_size: Int) -> Int:
+    handle := next_buffered_process_stderr_handle
+    next_buffered_process_stderr_handle = next_buffered_process_stderr_handle + 1
+    buffered_process_stderr_handles.insert(handle, process_handle)
+    buffered_process_stderr_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
+    buffered_process_stderr_cache.insert(handle, "")
+    return handle
 
 fn remaining_after_write(data: String, wrote: Int) -> String:
     if wrote >= data.len():

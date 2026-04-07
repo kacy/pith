@@ -9,6 +9,12 @@
 #   if object_has(root, "name"):
 #       print(object_keys(root).join(", "))
 
+from std.io import file_stream_open_read, file_stream_open_write, file_stream_close
+from std.io import buffered_file_reader_chunked, buffered_file_reader_read
+from std.io import buffered_file_writer_chunked, buffered_file_writer_write, buffered_file_writer_flush
+
+JSON_FILE_CHUNK_SIZE := 4096
+
 # ===============================================================
 # Node Pool
 # ===============================================================
@@ -23,7 +29,7 @@ mut boolean_values: Map[Int, Bool] := {}
 
 # Object children: flat append-only storage with offset/count
 mut object_keys_flat: List[String] := []
-mut object_values_flat: List[Int] := {}
+mut object_values_flat: List[Int] := []
 mut object_key_offsets: Map[Int, Int] := {}
 mut object_key_counts: Map[Int, Int] := {}
 
@@ -283,6 +289,9 @@ fn parse_value() -> Int:
 # Parses a JSON string and returns a handle to the root node.
 # Returns -1 on parse error. Use type_of() to inspect the result.
 pub fn parse(input: String) -> Int:
+    return json_parse(input)
+
+fn json_parse(input: String) -> Int:
     parser_input = input
     parser_position = 0
     parser_error = false
@@ -299,6 +308,37 @@ pub fn parse(input: String) -> Int:
             return 0 - 1
     return result
 
+pub fn parse_file(path: String) -> Int:
+    return json_parse_file(path)
+
+fn json_parse_file(path: String) -> Int:
+    return json_parse_file_chunked(path, JSON_FILE_CHUNK_SIZE)
+
+pub fn parse_file_chunked(path: String, chunk_size: Int) -> Int:
+    return json_parse_file_chunked(path, chunk_size)
+
+fn json_parse_file_chunked(path: String, chunk_size: Int) -> Int:
+    stream_result := file_stream_open_read(path)
+    if stream_result.is_err:
+        return 0 - 1
+    stream := stream_result.ok
+    reader := buffered_file_reader_chunked(stream, chunk_size)
+    mut data := ""
+    mut chunk_result := buffered_file_reader_read(reader, chunk_size)
+    if chunk_result.is_err:
+        file_stream_close(stream)
+        return 0 - 1
+    mut chunk := chunk_result.ok
+    while chunk.len() > 0:
+        data = data + chunk
+        chunk_result = buffered_file_reader_read(reader, chunk_size)
+        if chunk_result.is_err:
+            file_stream_close(stream)
+            return 0 - 1
+        chunk = chunk_result.ok
+    file_stream_close(stream)
+    return json_parse(data)
+
 # ===============================================================
 # Public API — Type and Value Accessors
 # ===============================================================
@@ -306,30 +346,45 @@ pub fn parse(input: String) -> Int:
 # Returns the type of a node as a string: "null", "bool", "int", "float", 
 # "string", "array", or "object". Returns "invalid" for invalid handles.
 pub fn type_of(handle: Int) -> String:
+    return json_type_of(handle)
+
+fn json_type_of(handle: Int) -> String:
     if not is_valid_handle(handle):
         return "invalid"
     return node_types[handle]
 
 # Returns the boolean value from a node. Returns false if not a boolean.
 pub fn get_bool(handle: Int) -> Bool:
+    return json_get_bool(handle)
+
+fn json_get_bool(handle: Int) -> Bool:
     if not handle_has_type(handle, "bool"):
         return false
     return boolean_values[handle]
 
 # Returns the integer value from a node. Returns 0 if not an integer.
 pub fn get_int(handle: Int) -> Int:
+    return json_get_int(handle)
+
+fn json_get_int(handle: Int) -> Int:
     if handle_has_type(handle, "int"):
         return integer_values[handle]
     return 0
 
 # Returns the float value from a node. Returns 0.0 if not a float.
 pub fn get_float(handle: Int) -> Float:
+    return json_get_float(handle)
+
+fn json_get_float(handle: Int) -> Float:
     if handle_has_type(handle, "float"):
         return float_values[handle]
     return 0.0
 
 # Returns the string value from a node. Returns empty string if not a string.
 pub fn get_string(handle: Int) -> String:
+    return json_get_string(handle)
+
+fn json_get_string(handle: Int) -> String:
     if not handle_has_type(handle, "string"):
         return ""
     return string_values[handle]
@@ -340,12 +395,18 @@ pub fn get_string(handle: Int) -> String:
 
 # Returns the number of elements in an array node. Returns 0 for non-arrays.
 pub fn array_len(handle: Int) -> Int:
+    return json_array_len(handle)
+
+fn json_array_len(handle: Int) -> Int:
     if not handle_has_type(handle, "array"):
         return 0
     return array_item_counts[handle]
 
 # Returns the handle of an array element by index. Returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
+    return json_array_get(handle, index)
+
+fn json_array_get(handle: Int, index: Int) -> Int:
     if not handle_has_type(handle, "array"):
         return 0 - 1
     if index < 0 or index >= array_item_counts[handle]:
@@ -359,6 +420,9 @@ pub fn array_get(handle: Int, index: Int) -> Int:
 # Returns the handle of an object value by key. Returns -1 if key not found.
 # Scans from end for latest value (handles duplicate keys).
 pub fn object_get(handle: Int, key: String) -> Int:
+    return json_object_get(handle, key)
+
+fn json_object_get(handle: Int, key: String) -> Int:
     if not handle_has_type(handle, "object"):
         return 0 - 1
     off := object_key_offsets[handle]
@@ -373,10 +437,16 @@ pub fn object_get(handle: Int, key: String) -> Int:
 
 # Returns true if an object contains the specified key.
 pub fn object_has(handle: Int, key: String) -> Bool:
-    return object_get(handle, key) >= 0
+    return json_object_has(handle, key)
+
+fn json_object_has(handle: Int, key: String) -> Bool:
+    return json_object_get(handle, key) >= 0
 
 # Returns the list of keys in an object (deduplicated, insertion order).
 pub fn object_keys(handle: Int) -> List[String]:
+    return json_object_keys(handle)
+
+fn json_object_keys(handle: Int) -> List[String]:
     mut result: List[String] := []
     if not handle_has_type(handle, "object"):
         return result
@@ -403,46 +473,73 @@ pub fn object_keys(handle: Int) -> List[String]:
 
 # Creates a JSON null node.
 pub fn make_null() -> Int:
+    return json_make_null()
+
+fn json_make_null() -> Int:
     return allocate_node("null")
 
 # Creates a JSON boolean node with the given value.
 pub fn make_bool(val: Bool) -> Int:
+    return json_make_bool(val)
+
+fn json_make_bool(val: Bool) -> Int:
     idx := allocate_node("bool")
     boolean_values.insert(idx, val)
     return idx
 
 # Creates a JSON integer node with the given value.
 pub fn make_int(val: Int) -> Int:
+    return json_make_int(val)
+
+fn json_make_int(val: Int) -> Int:
     idx := allocate_node("int")
     integer_values.insert(idx, val)
     return idx
 
 # Creates a JSON float node with the given value.
 pub fn make_float(val: Float) -> Int:
+    return json_make_float(val)
+
+fn json_make_float(val: Float) -> Int:
     idx := allocate_node("float")
     float_values.insert(idx, val)
     return idx
 
 # Creates a JSON string node with the given value.
 pub fn make_string(val: String) -> Int:
+    return json_make_string(val)
+
+fn json_make_string(val: String) -> Int:
     idx := allocate_node("string")
     string_values.insert(idx, val)
     return idx
 
 # Creates an empty JSON array node.
 pub fn make_array() -> Int:
+    return json_make_array()
+
+fn json_make_array() -> Int:
     return allocate_node("array")
 
 # Appends a value handle to an array node.
 pub fn array_push(arr: Int, val: Int):
+    json_array_push(arr, val)
+
+fn json_array_push(arr: Int, val: Int):
     push_array_element(arr, val)
 
 # Creates an empty JSON object node.
 pub fn make_object() -> Int:
+    return json_make_object()
+
+fn json_make_object() -> Int:
     return allocate_node("object")
 
 # Sets a key-value pair on an object node (key is string, val is node handle).
 pub fn object_set(obj: Int, key: String, val: Int):
+    json_object_set(obj, key, val)
+
+fn json_object_set(obj: Int, key: String, val: Int):
     set_object_property(obj, key, val)
 
 # ===============================================================
@@ -474,6 +571,9 @@ fn encode_string(s: String) -> String:
 # Serializes a node tree to a JSON string.
 # Returns "null" for invalid handles.
 pub fn encode(handle: Int) -> String:
+    return json_encode(handle)
+
+fn json_encode(handle: Int) -> String:
     if not is_valid_handle(handle):
         return "null"
     kind := node_types[handle]
@@ -497,17 +597,45 @@ pub fn encode(handle: Int) -> String:
         while i < cnt:
             if i > 0:
                 result = result + ","
-            result = result + encode(array_items_flat[off + i])
+            result = result + json_encode(array_items_flat[off + i])
             i = i + 1
         return result + "]"
     if kind == "object":
         mut result := chr(123)
-        k := object_keys(handle)
+        k := json_object_keys(handle)
         mut i := 0
         while i < k.len():
             if i > 0:
                 result = result + ","
-            result = result + encode_string(k[i]) + ":" + encode(object_get(handle, k[i]))
+            result = result + encode_string(k[i]) + ":" + json_encode(json_object_get(handle, k[i]))
             i = i + 1
         return result + chr(125)
     return "null"
+
+pub fn save(path: String, handle: Int) -> Int:
+    return json_save(path, handle)
+
+fn json_save(path: String, handle: Int) -> Int:
+    return json_save_chunked(path, handle, JSON_FILE_CHUNK_SIZE)
+
+pub fn save_chunked(path: String, handle: Int, chunk_size: Int) -> Int:
+    return json_save_chunked(path, handle, chunk_size)
+
+fn json_save_chunked(path: String, handle: Int, chunk_size: Int) -> Int:
+    stream_result := file_stream_open_write(path)
+    if stream_result.is_err:
+        return 0 - 1
+    stream := stream_result.ok
+    writer := buffered_file_writer_chunked(stream, chunk_size)
+    data := json_encode(handle)
+    write_result := buffered_file_writer_write(writer, data)
+    if write_result.is_err:
+        file_stream_close(stream)
+        return 0 - 1
+    total := write_result.ok
+    flush_result := buffered_file_writer_flush(writer)
+    if flush_result.is_err:
+        file_stream_close(stream)
+        return 0 - 1
+    file_stream_close(stream)
+    return total + flush_result.ok

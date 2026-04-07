@@ -26,6 +26,10 @@ writes instead of dropping back to whole-file string helpers.
 files through buffered file reads instead of staying stuck behind builtin-only
 special handling.
 
+`std.json` is on the same track now: imported calls can resolve through the
+module path, and file-backed parse/save helpers can use the shared buffered
+file layer instead of falling back to one-off whole-file plumbing.
+
 ## the target
 
 we want something closer to the best parts of go's `io` package:

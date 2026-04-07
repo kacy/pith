@@ -9,13 +9,13 @@ fn main() -> String!:
     # write through the shared file stream path
     writer := fs.create(path)!
     io.write_text(writer, "hello from forge")!
-    io.close_file(writer)
+    writer.close()
     print("write: ok")
 
     # read back through the same stream surface
     reader := fs.open(path)!
     content := io.read_text(reader)!
-    io.close_file(reader)
+    reader.close()
     if content.contains("hello"):
         print("read: ok")
 
@@ -35,7 +35,7 @@ fn main() -> String!:
     # stream a known file too
     hello_reader := fs.open("examples/hello.fg")!
     hello := io.read_text(hello_reader)!
-    io.close_file(hello_reader)
+    hello_reader.close()
     if hello.contains("greet"):
         print("read hello.fg: ok")
 

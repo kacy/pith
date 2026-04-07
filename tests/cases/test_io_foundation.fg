@@ -8,28 +8,28 @@ fn main() -> Int!:
     print(io.read_all_chunked(chunked_reader, 2)!)
 
     direct_reader := io.string_reader("xyz")
-    print(io.string_reader_read(direct_reader, 2)!)
-    print(io.string_reader_read(direct_reader, 2)!)
+    print(direct_reader.read(2)!)
+    print(direct_reader.read(2)!)
 
     buf := io.string_buffer()
-    print(io.string_buffer_write(buf, "hi")!.to_string())
-    print(io.string_buffer_string(buf))
+    print(buf.write("hi")!.to_string())
+    print(buf.string())
 
     buf2 := io.string_buffer()
     print(io.write_all(buf2, "hello")!.to_string())
-    print(io.string_buffer_string(buf2))
+    print(buf2.string())
 
     src := io.string_reader("copy me")
     dst := io.string_buffer()
     print(io.copy(src, dst)!.to_string())
-    print(io.string_buffer_string(dst))
+    print(dst.string())
 
     src2 := io.string_reader("chunked")
     dst2 := io.string_buffer()
     print(io.copy_chunked(src2, dst2, 3)!.to_string())
-    print(io.string_buffer_string(dst2))
+    print(dst2.string())
 
     src3 := io.string_reader("done")
     print(io.read_all(src3)!)
-    print(io.string_buffer_string(buf))
+    print(buf.string())
     return 0

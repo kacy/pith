@@ -132,6 +132,12 @@ impl StringBuffer:
     fn write(data: String) -> Int!:
         return string_buffer_write(self, data)
 
+    fn string() -> String:
+        return string_buffer_string(self)
+
+    fn clear():
+        string_buffer_clear(self)
+
 impl Writer for StringBuffer:
     fn write(data: String) -> Int!:
         return string_buffer_write(self, data)
@@ -1211,6 +1217,21 @@ impl Reader for ProcessStderr:
         return process_stderr_read(self, max_bytes)
 
 impl Process:
+    fn stdin() -> ProcessStdin:
+        return process_stdin(self)
+
+    fn stdout() -> ProcessStdout:
+        return process_stdout(self)
+
+    fn stderr() -> ProcessStderr:
+        return process_stderr(self)
+
+    fn wait() -> Int:
+        return wait_process(self)
+
+    fn kill() -> Bool:
+        return kill_process(self)
+
     fn close():
         close_process(self)
 
@@ -1224,6 +1245,9 @@ impl TcpStream:
 
     fn write(data: String) -> Int!:
         return tcp_stream_write(self, data)
+
+    fn set_timeout(ms: Int):
+        tcp_stream_set_timeout(self, ms)
 
     fn close():
         tcp_stream_close(self)

@@ -7,33 +7,33 @@ fn main() -> Int!:
 
     writer := fs.create(data_path)!
     buffered_writer := io.buffered_file_writer_chunked(writer, 4)
-    print(io.buffered_file_writer_write(buffered_writer, "ab")!.to_string())
-    print(io.buffered_file_writer_write(buffered_writer, "cdef")!.to_string())
-    print(io.buffered_file_writer_write(buffered_writer, "gh")!.to_string())
-    print(io.buffered_file_writer_flush(buffered_writer)!.to_string())
-    io.file_stream_close(writer)
+    print(buffered_writer.write("ab")!.to_string())
+    print(buffered_writer.write("cdef")!.to_string())
+    print(buffered_writer.write("gh")!.to_string())
+    print(buffered_writer.flush()!.to_string())
+    writer.close()
 
     reader := fs.open(data_path)!
     buffered_reader := io.buffered_file_reader_chunked(reader, 3)
-    print(io.buffered_file_reader_read(buffered_reader, 3)!)
-    print(io.buffered_file_reader_read(buffered_reader, 3)!)
-    print("[" + io.buffered_file_reader_read(buffered_reader, 3)! + "]")
-    io.file_stream_close(reader)
+    print(buffered_reader.read(3)!)
+    print(buffered_reader.read(3)!)
+    print("[" + buffered_reader.read(3)! + "]")
+    reader.close()
 
     line_writer := fs.create(line_path)!
     buffered_line_writer := io.buffered_file_writer_chunked(line_writer, 5)
-    io.buffered_file_writer_write(buffered_line_writer, "alpha" + chr(10) + "beta")!
-    io.buffered_file_writer_write(buffered_line_writer, chr(13) + chr(10) + "gamma")!
-    io.buffered_file_writer_flush(buffered_line_writer)!
-    io.file_stream_close(line_writer)
+    buffered_line_writer.write("alpha" + chr(10) + "beta")!
+    buffered_line_writer.write(chr(13) + chr(10) + "gamma")!
+    buffered_line_writer.flush()!
+    line_writer.close()
 
     line_reader := fs.open(line_path)!
     buffered_line_reader := io.buffered_file_reader_chunked(line_reader, 2)
-    print(io.buffered_file_reader_read_line(buffered_line_reader)!)
-    print(io.buffered_file_reader_read_line(buffered_line_reader)!)
-    print(io.buffered_file_reader_read_line(buffered_line_reader)!)
-    print("[" + io.buffered_file_reader_read_line(buffered_line_reader)! + "]")
-    io.file_stream_close(line_reader)
+    print(buffered_line_reader.read_line()!)
+    print(buffered_line_reader.read_line()!)
+    print(buffered_line_reader.read_line()!)
+    print("[" + buffered_line_reader.read_line()! + "]")
+    line_reader.close()
 
     fs.remove(data_path)
     fs.remove(line_path)

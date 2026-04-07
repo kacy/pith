@@ -11,18 +11,18 @@ fn main() -> Int!:
     request = request + "hello world"
 
     reader := io.buffered_string_reader_chunked(io.string_reader(request), 3)
-    request_line := io.buffered_string_reader_read_line(reader)!
+    request_line := reader.read_line()!
     mut raw := request_line + crlf
-    mut line := io.buffered_string_reader_read_line(reader)!
+    mut line := reader.read_line()!
     while line.len() > 0:
         raw = raw + line + crlf
-        line = io.buffered_string_reader_read_line(reader)!
+        line = reader.read_line()!
     raw = raw + crlf
 
     head_req := http.parse_request(raw)
     length_text := http.get_header(head_req, "Content-Length")
     if length_text != "":
-        raw = raw + io.buffered_string_reader_read(reader, parse_int(length_text)!)!
+        raw = raw + reader.read(parse_int(length_text)!)!
 
     print(http.body(http.parse_request(raw)))
     return 0

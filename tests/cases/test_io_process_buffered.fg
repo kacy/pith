@@ -2,19 +2,19 @@ import std.io as io
 
 fn main() -> Int!:
     stdout_proc := io.spawn_process("printf 'alpha\nbeta\r\ngamma'")!
-    stdout_reader := io.buffered_process_stdout_chunked(io.stdout(stdout_proc), 2)
-    print(io.buffered_process_stdout_read(stdout_reader, 3)!)
-    print(io.buffered_process_stdout_read_line(stdout_reader)!)
-    print(io.buffered_process_stdout_read_line(stdout_reader)!)
-    print("[" + io.buffered_process_stdout_read_line(stdout_reader)! + "]")
-    print(io.wait(stdout_proc).to_string())
-    io.close_process(stdout_proc)
+    stdout_reader := io.buffered_process_stdout_chunked(stdout_proc.stdout(), 2)
+    print(stdout_reader.read(3)!)
+    print(stdout_reader.read_line()!)
+    print(stdout_reader.read_line()!)
+    print("[" + stdout_reader.read_line()! + "]")
+    print(stdout_proc.wait().to_string())
+    stdout_proc.close()
 
     stderr_proc := io.spawn_process("printf 'warn\nfatal' >&2")!
-    stderr_reader := io.buffered_process_stderr_chunked(io.stderr(stderr_proc), 1)
-    print(io.buffered_process_stderr_read_line(stderr_reader)!)
-    print(io.buffered_process_stderr_read_line(stderr_reader)!)
-    print("[" + io.buffered_process_stderr_read_line(stderr_reader)! + "]")
-    print(io.wait(stderr_proc).to_string())
-    io.close_process(stderr_proc)
+    stderr_reader := io.buffered_process_stderr_chunked(stderr_proc.stderr(), 1)
+    print(stderr_reader.read_line()!)
+    print(stderr_reader.read_line()!)
+    print("[" + stderr_reader.read_line()! + "]")
+    print(stderr_proc.wait().to_string())
+    stderr_proc.close()
     return 0

@@ -1297,6 +1297,9 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
         if is_error_type(annotated) == false:
             if is_error_type(val_type) == false:
                 if annotated != val_type:
+                    if types_structurally_equal(annotated, val_type):
+                        define_binding(scope_id, name, annotated, is_mut)
+                        return
                     # special case: allow empty collections with annotations
                     val_node := get_node(node.children[1])
                     if val_node.kind != "list":
@@ -1334,7 +1337,8 @@ fn check_assignment(node: Node, scope_id: Int):
     op := node.value
     if op == "=":
         if target_type != val_type:
-            report_error("E200", "type mismatch: expected " + get_type_name(target_type) + ", got " + get_type_name(val_type))
+            if types_structurally_equal(target_type, val_type) == false:
+                report_error("E200", "type mismatch: expected " + get_type_name(target_type) + ", got " + get_type_name(val_type))
     else:
         # compound assignment: +=, -=, *=, /=
         if is_numeric_type(target_type) == false:

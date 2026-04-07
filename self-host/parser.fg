@@ -97,10 +97,13 @@ fn get_previous_position() -> (Int, Int):
 fn parser_report_error_at(line: Int, col: Int, code: String, message: String, fix: String):
     parser_diag_list.push(Diagnostic("error", code, message, parser_file_path, line, col, fix))
 
-fn parser_report_error_here(code: String, message: String, fix: String):
-    mut pos := get_current_position()
+fn parser_error_position() -> (Int, Int):
     if _cur_tok_kind() == "eof":
-        pos = get_previous_position()
+        return get_previous_position()
+    return get_current_position()
+
+fn parser_report_error_here(code: String, message: String, fix: String):
+    pos := parser_error_position()
     parser_report_error_at(pos.0, pos.1, code, message, fix)
 
 fn parser_report_lexer_error_here():
@@ -192,9 +195,8 @@ fn expect(kind: String) -> Token:
     cur_kind := _cur_tok_kind()
     if cur_kind == kind:
         return advance_token()
-    mut pos := get_current_position()
+    pos := parser_error_position()
     if cur_kind == "eof":
-        pos = get_previous_position()
         parser_report_error_at(pos.0, pos.1, "E241", "unexpected end of file, expected " + kind, "")
         return Token(kind, "", pos.0, pos.1)
     if cur_kind == "err":

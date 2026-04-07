@@ -1,0 +1,41 @@
+import std.bytes as bytes
+import std.io as io
+import std.net.websocket as websocket
+from std.bytes import ByteBuffer
+
+fn write_fragment(buf: ByteBuffer, opcode: Int, fin: Bool, payload: Bytes) -> Int!:
+    mut first := opcode
+    if fin:
+        first = bit_or(128, opcode)
+    buf.write_byte(first)!
+    buf.write_byte(payload.len())!
+    buf.write(payload)!
+    return payload.len()
+
+fn invalid_continuation_wire() -> Bytes!:
+    wire := bytes.buffer()
+    write_fragment(wire, 0, true, bytes.from_string_utf8("oops"))!
+    return wire.bytes()
+
+fn fragmented_ping_wire() -> Bytes!:
+    wire := bytes.buffer()
+    write_fragment(wire, 9, false, bytes.from_string_utf8("ok"))!
+    return wire.bytes()
+
+fn invalid_text_wire() -> Bytes!:
+    wire := bytes.buffer()
+    payload := bytes.buffer()
+    payload.write_byte(255)!
+    write_fragment(wire, 1, true, payload.bytes())!
+    return wire.bytes()
+
+fn main() -> Int!:
+    invalid_continuation := websocket.from_buffered(io.bytes_reader(invalid_continuation_wire()!).buffered_chunked(3), bytes.buffer().buffered_chunked(3), false)
+    print(invalid_continuation.recv().is_err.to_string())
+
+    fragmented_ping := websocket.from_buffered(io.bytes_reader(fragmented_ping_wire()!).buffered_chunked(3), bytes.buffer().buffered_chunked(3), false)
+    print(fragmented_ping.recv().is_err.to_string())
+
+    invalid_text := websocket.from_buffered(io.bytes_reader(invalid_text_wire()!).buffered_chunked(2), bytes.buffer().buffered_chunked(2), false)
+    print(invalid_text.recv_text().is_err.to_string())
+    return 0

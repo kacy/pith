@@ -1,0 +1,66 @@
+import std.bytes as bytes
+import std.io as io
+import std.net.websocket as websocket
+from std.bytes import ByteBuffer
+fn payload() -> Bytes!:
+    buf := bytes.buffer()
+    mut i := 0
+    while i < 150:
+        buf.write_byte(65 + (i % 26))!
+        i = i + 1
+    return buf.bytes()
+fn write_fragment(buf: ByteBuffer, opcode: Int, fin: Bool, payload: Bytes) -> Int!:
+    mut first := opcode
+    if fin:
+        first = bit_or(128, opcode)
+    buf.write_byte(first)!
+    buf.write_byte(payload.len())!
+    buf.write(payload)!
+    return payload.len()
+fn inbound_frames() -> Bytes!:
+    wire := bytes.buffer()
+    wire.write(websocket.text_frame_bytes("hello")!)!
+    binary := payload()!
+    write_fragment(wire, 2, false, binary.slice(0, 64))!
+    wire.write(websocket.ping_frame(bytes.from_string_utf8("ok"))!)!
+    write_fragment(wire, 0, false, binary.slice(64, 128))!
+    write_fragment(wire, 0, true, binary.slice(128, binary.len()))!
+    wire.write(websocket.close_frame(1000, "done")!)!
+    return wire.bytes()
+fn main() -> Int!:
+    outbound := bytes.buffer()
+    ws := websocket.from_buffered(io.bytes_reader(inbound_frames()!).buffered_chunked(7), outbound.buffered_chunked(5), false)
+    text := ws.recv_text()!
+    binary := ws.recv()!
+    ws.send_text("echo:" + text)!
+    ws.send(binary)!
+    close_result := ws.recv()
+    print(text)
+    print(binary.len().to_string())
+    print(binary[0].to_string())
+    print(binary[binary.len() - 1].to_string())
+    print(close_result.is_err.to_string())
+    print(ws.is_closed().to_string())
+    sent_reader := io.bytes_reader(outbound.bytes()).buffered_chunked(6)
+    pong := websocket.read_frame_buffered(sent_reader)!
+    echoed_text := websocket.read_frame_buffered(sent_reader)!
+    frag1 := websocket.read_frame_buffered(sent_reader)!
+    frag2 := websocket.read_frame_buffered(sent_reader)!
+    frag3 := websocket.read_frame_buffered(sent_reader)!
+    close := websocket.read_frame_buffered(sent_reader)!
+    print(pong.is_pong().to_string())
+    print(pong.payload_text()!)
+    print(echoed_text.payload_text()!)
+    print(frag1.opcode.to_string())
+    print(frag1.fin.to_string())
+    print(frag1.payload.len().to_string())
+    print(frag2.opcode.to_string())
+    print(frag2.fin.to_string())
+    print(frag2.payload.len().to_string())
+    print(frag3.opcode.to_string())
+    print(frag3.fin.to_string())
+    print(frag3.payload.len().to_string())
+    print(close.is_close().to_string())
+    print(close.close_code()!.to_string())
+    print(close.close_reason()!)
+    return 0

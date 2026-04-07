@@ -1,42 +1,58 @@
 # std.net.websocket — WebSocket protocol (RFC 6455)
 #
-# WebSocket handshake implementation using SHA-1 hashing and base64 encoding.
-# This module provides the server-side handshake response computation.
+# WebSocket handshake, framing, and session helpers.
+# the public surface is bytes-first, with text as a convenience layer on top.
 #
-#   from std.net.websocket import compute_accept, handshake_response
-#   accept_value := compute_accept(client_key)
-#   response := handshake_response(client_key)
-
+#   import std.net.websocket as websocket
+#   accept := websocket.compute_accept(client_key)!
+#   response := websocket.handshake_response(client_key)!
 import std.bytes as bytes
 import std.hash as hash
 import std.encoding as encoding
+import std.net.http as http
+import std.io as io
+import std.rand as rand
 from std.bytes import ByteBuffer
-from std.io import BufferedBytesReader
-
+from std.io import BufferedBytesReader, BufferedBytesWriter, TcpStream
+from std.net.http import HttpRequestBytes
 # ===============================================================
 # WebSocket Constants
 # ===============================================================
-
 # Magic GUID defined in RFC 6455 for handshake key computation
 WS_MAGIC := "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-
 # WebSocket frame opcodes
-OP_TEXT := 1     # Text frame
-OP_BINARY := 2   # Binary frame
-OP_CLOSE := 8    # Connection close
-OP_PING := 9     # Ping frame
-OP_PONG := 10    # Pong frame
-
+OP_TEXT := 1 # Text frame
+OP_BINARY := 2 # Binary frame
+OP_CLOSE := 8 # Connection close
+OP_PING := 9 # Ping frame
+OP_PONG := 10 # Pong frame
+OP_CONTINUATION := 0
+WS_VERSION := "13"
+DEFAULT_MESSAGE_FRAGMENT_SIZE := 64
+DEFAULT_READ_CHUNK_SIZE := 1024
+MAX_CONTROL_PAYLOAD := 125
+WS_CLOSE_NONE := 0
+WS_CLOSE_TCP := 1
+mut next_websocket_handle: Int := 1
+mut websocket_reader_handles: Map[Int, Int] := {}
+mut websocket_writer_handles: Map[Int, Int] := {}
+mut websocket_client_flags: Map[Int, Bool] := {}
+mut websocket_closed_flags: Map[Int, Bool] := {}
+mut websocket_close_kinds: Map[Int, Int] := {}
+mut websocket_close_handles: Map[Int, Int] := {}
 pub struct WebSocketFrame:
     pub fin: Bool
     pub opcode: Int
     pub masked: Bool
     pub payload: Bytes
-
+pub struct WebSocket:
+    pub handle: Int
+struct WebSocketMessage:
+    pub opcode: Int
+    pub payload: Bytes
 # ===============================================================
 # Handshake Computation
 # ===============================================================
-
 # Computes the Sec-WebSocket-Accept value from the client's Sec-WebSocket-Key.
 # Implements the RFC 6455 handshake algorithm:
 # 1. Concatenate key with magic GUID
@@ -49,10 +65,8 @@ pub fn compute_accept_bytes(key: Bytes) -> String!:
     combined := buf.bytes()
     digest_hex := hash.sha1(combined)
     return encoding.b64_encode(encoding.from_hex(digest_hex)!)
-
 pub fn compute_accept(key: String) -> String!:
     return compute_accept_bytes(bytes.from_string_utf8(key))
-
 # Builds a complete HTTP 101 Switching Protocols response for WebSocket upgrade.
 # Takes the client's Sec-WebSocket-Key and returns the full HTTP response.
 pub fn handshake_response_bytes(key: Bytes) -> Bytes!:
@@ -63,45 +77,233 @@ pub fn handshake_response_bytes(key: Bytes) -> Bytes!:
     response = response + "Sec-WebSocket-Accept: " + accept + "\r\n"
     response = response + "\r\n"
     return bytes.from_string_utf8(response)
-
 pub fn handshake_response(key: String) -> String!:
     return handshake_response_bytes(bytes.from_string_utf8(key))!.to_string_utf8()!
-
+fn header_text(data: Bytes) -> String:
+    text := data.to_string_utf8()
+    if text.is_err:
+        return ""
+    return text.ok
+fn normalize_path(path: String) -> String:
+    if path.len() == 0:
+        return "/"
+    if ord(path[0]) == ord("/"):
+        return path
+    return "/" + path
+fn default_host_header(host: String, port: Int) -> String:
+    if port == 80:
+        return host
+    return host + ":" + port.to_string()
+fn random_bytes(count: Int) -> Bytes!:
+    buf := bytes.buffer_with_capacity(count)
+    mut i := 0
+    while i < count:
+        buf.write_byte(rand.int(0, 255))!
+        i = i + 1
+    return buf.bytes()
+fn random_mask_key() -> Bytes!:
+    return random_bytes(4)
+fn random_client_key() -> Bytes!:
+    return random_bytes(16)
+fn is_reserved_client_header(name: String) -> Bool:
+    lowered := name.to_lower()
+    return lowered == "host" or lowered == "connection" or lowered == "upgrade" or lowered == "sec-websocket-key" or lowered == "sec-websocket-version"
+fn client_request_with_key(host_header: String, path: String, headers: Map[String, String], key: Bytes) -> Bytes!:
+    crlf := chr(13) + chr(10)
+    key_text := encoding.b64_encode(key)
+    mut request := "GET " + normalize_path(path) + " HTTP/1.1" + crlf
+    request = request + "Host: " + host_header + crlf
+    request = request + "Upgrade: websocket" + crlf
+    request = request + "Connection: Upgrade" + crlf
+    request = request + "Sec-WebSocket-Key: " + key_text + crlf
+    request = request + "Sec-WebSocket-Version: " + WS_VERSION + crlf
+    for header_name in headers:
+        if is_reserved_client_header(header_name):
+            continue
+        request = request + header_name + ": " + headers[header_name] + crlf
+    request = request + crlf
+    return bytes.from_string_utf8(request)
+pub fn client_request(host: String, path: String, headers: Map[String, String]) -> Bytes!:
+    return client_request_with_key(host, path, headers, random_client_key()!)
+fn header_has_token(value: Bytes, token: String) -> Bool:
+    text := header_text(value)
+    if text == "":
+        return false
+    for part in text.split(","):
+        if part.trim().to_lower() == token.to_lower():
+            return true
+    return false
+fn header_equals(value: Bytes, expected: String) -> Bool:
+    text := header_text(value)
+    if text == "":
+        return false
+    return text.trim().to_lower() == expected.to_lower()
+fn bytes_equals_text(value: Bytes, expected: String) -> Bool:
+    return header_text(value) == expected
+pub fn is_upgrade_request(req: HttpRequestBytes) -> Bool:
+    if not bytes_equals_text(req.method_bytes(), "GET"):
+        return false
+    if req.header_bytes("Sec-WebSocket-Key").is_empty():
+        return false
+    if not header_equals(req.header_bytes("Upgrade"), "websocket"):
+        return false
+    if not header_has_token(req.header_bytes("Connection"), "upgrade"):
+        return false
+    if not header_equals(req.header_bytes("Sec-WebSocket-Version"), WS_VERSION):
+        return false
+    return true
+pub fn upgrade_response(req: HttpRequestBytes) -> Bytes!:
+    if not is_upgrade_request(req):
+        fail "invalid websocket upgrade request"
+    key := req.header_bytes("Sec-WebSocket-Key")
+    if key.is_empty():
+        fail "missing websocket key"
+    return handshake_response_bytes(key)
+fn response_header(head: Bytes, name: String) -> String:
+    text := header_text(head)
+    if text == "":
+        return ""
+    lines := text.split(chr(10))
+    mut i := 1
+    while i < lines.len():
+        line := lines[i].trim()
+        colon := line.index_of(":")
+        if colon > 0:
+            header_name := line.substring(0, colon).trim().to_lower()
+            if header_name == name.to_lower():
+                if colon + 1 < line.len():
+                    return line.substring(colon + 1, line.len()).trim()
+                return ""
+        i = i + 1
+    return ""
+fn response_status_code(head: Bytes) -> Int!:
+    text := header_text(head)
+    if text == "":
+        fail "invalid websocket response"
+    lines := text.split(chr(10))
+    if lines.len() == 0:
+        fail "missing websocket status line"
+    parts := lines[0].trim().split(" ")
+    if parts.len() < 2:
+        fail "invalid websocket status line"
+    return parse_int(parts[1])
+fn find_http_head_end(raw: Bytes) -> Int:
+    mut i := 0
+    while i < raw.len() - 3:
+        if raw[i] == 13 and raw[i + 1] == 10 and raw[i + 2] == 13 and raw[i + 3] == 10:
+            return i + 4
+        i = i + 1
+    i = 0
+    while i < raw.len() - 1:
+        if raw[i] == 10 and raw[i + 1] == 10:
+            return i + 2
+        i = i + 1
+    return - 1
+fn read_http_head(reader: BufferedBytesReader) -> Bytes!:
+    buf := bytes.buffer_with_capacity(DEFAULT_READ_CHUNK_SIZE)
+    mut head_end := -1
+    while head_end < 0:
+        chunk := reader.read_bytes(DEFAULT_READ_CHUNK_SIZE)!
+        if chunk.is_empty():
+            fail "websocket handshake response truncated"
+        buf.write(chunk)!
+        head_end = find_http_head_end(buf.bytes())
+    return buf.bytes().slice(0, head_end)
+fn validate_upgrade_response(head: Bytes, key: Bytes) -> Bool!:
+    if response_status_code(head)! != 101:
+        return false
+    if response_header(head, "Upgrade").to_lower() != "websocket":
+        return false
+    if not header_has_token(bytes.from_string_utf8(response_header(head, "Connection")), "upgrade"):
+        return false
+    return response_header(head, "Sec-WebSocket-Accept") == compute_accept_bytes(key)!
+fn next_websocket_id() -> Int:
+    handle := next_websocket_handle
+    next_websocket_handle = next_websocket_handle + 1
+    return handle
+fn register_websocket_state(reader: BufferedBytesReader, writer: BufferedBytesWriter, is_client: Bool, close_kind: Int, close_handle: Int) -> WebSocket:
+    handle := next_websocket_id()
+    websocket_reader_handles.insert(handle, reader.handle)
+    websocket_writer_handles.insert(handle, writer.handle)
+    websocket_client_flags.insert(handle, is_client)
+    websocket_closed_flags.insert(handle, false)
+    websocket_close_kinds.insert(handle, close_kind)
+    websocket_close_handles.insert(handle, close_handle)
+    return WebSocket(handle)
+fn register_websocket(stream: TcpStream, is_client: Bool) -> WebSocket:
+    return register_websocket_state(stream.buffered_bytes_reader(), stream.buffered_bytes_writer(), is_client, WS_CLOSE_TCP, stream.fd)
+pub fn from_buffered(reader: BufferedBytesReader, writer: BufferedBytesWriter, is_client: Bool) -> WebSocket:
+    return register_websocket_state(reader, writer, is_client, WS_CLOSE_NONE, 0)
+fn websocket_reader(ws: WebSocket) -> BufferedBytesReader:
+    return BufferedBytesReader(websocket_reader_handles[ws.handle])
+fn websocket_writer(ws: WebSocket) -> BufferedBytesWriter:
+    return BufferedBytesWriter(websocket_writer_handles[ws.handle])
+fn websocket_is_client(ws: WebSocket) -> Bool:
+    if websocket_client_flags.contains_key(ws.handle):
+        return websocket_client_flags[ws.handle]
+    return false
+fn websocket_mark_closed(ws: WebSocket):
+    websocket_closed_flags.insert(ws.handle, true)
+fn websocket_close_kind(ws: WebSocket) -> Int:
+    if websocket_close_kinds.contains_key(ws.handle):
+        return websocket_close_kinds[ws.handle]
+    return WS_CLOSE_NONE
+fn websocket_close_handle(ws: WebSocket) -> Int:
+    if websocket_close_handles.contains_key(ws.handle):
+        return websocket_close_handles[ws.handle]
+    return 0
+fn ensure_writer_flushed(writer: BufferedBytesWriter) -> Int!:
+    flushed := writer.flush()
+    if flushed.is_err:
+        fail "websocket flush failed"
+    return 1
+pub fn dial(host: String, port: Int, path: String) -> WebSocket!:
+    mut headers: Map[String, String] := {}
+    return dial_with_headers(host, port, path, headers)
+pub fn dial_with_headers(host: String, port: Int, path: String, headers: Map[String, String]) -> WebSocket!:
+    conn := io.connect(host, port)!
+    key := random_client_key()!
+    request := client_request_with_key(default_host_header(host, port), path, headers, key)!
+    writer := conn.buffered_bytes_writer()
+    writer.write_bytes(request)!
+    ensure_writer_flushed(writer)!
+    response_head := read_http_head(conn.buffered_bytes_reader())!
+    if not validate_upgrade_response(response_head, key)!:
+        conn.close()
+        fail "invalid websocket handshake response"
+    return register_websocket(conn, true)
+pub fn upgrade(fd: Int, req: HttpRequestBytes) -> WebSocket!:
+    response := upgrade_response(req)!
+    stream := io.from_fd(fd)
+    writer := stream.buffered_bytes_writer()
+    writer.write_bytes(response)!
+    ensure_writer_flushed(writer)!
+    return register_websocket(stream, false)
 impl WebSocketFrame:
     fn is_text() -> Bool:
         return self.opcode == OP_TEXT
-
     fn is_binary() -> Bool:
         return self.opcode == OP_BINARY
-
     fn is_close() -> Bool:
         return self.opcode == OP_CLOSE
-
     fn is_ping() -> Bool:
         return self.opcode == OP_PING
-
     fn is_pong() -> Bool:
         return self.opcode == OP_PONG
-
     fn payload_text() -> String!:
         return self.payload.to_string_utf8()!
-
     fn close_code() -> Int!:
         if self.payload.len() < 2:
             fail "websocket close frame missing code"
         return bit_or(bit_shl(self.payload[0], 8), self.payload[1])
-
     fn close_reason() -> String!:
         if self.payload.len() <= 2:
             return ""
         return self.payload.slice(2, self.payload.len()).to_string_utf8()!
-
 fn frame_is_masked(second_byte: Int) -> Bool:
     return bit_and(second_byte, 128) != 0
-
 fn frame_length_code(second_byte: Int) -> Int:
     return bit_and(second_byte, 127)
-
 fn frame_extended_length_size(second_byte: Int) -> Int!:
     length_code := frame_length_code(second_byte)
     if length_code == 126:
@@ -109,7 +311,6 @@ fn frame_extended_length_size(second_byte: Int) -> Int!:
     if length_code == 127:
         fail "64-bit websocket lengths not supported yet"
     return 0
-
 fn append_frame_length(buf: ByteBuffer, payload_len: Int, masked: Bool) -> Int!:
     mut len_byte := payload_len
     if masked:
@@ -126,7 +327,6 @@ fn append_frame_length(buf: ByteBuffer, payload_len: Int, masked: Bool) -> Int!:
         buf.write_byte(bit_and(payload_len, 255))!
         return 3
     fail "websocket payload too large"
-
 fn frame_header_size(data: Bytes) -> Int!:
     if data.len() < 2:
         fail "websocket frame too short"
@@ -134,7 +334,6 @@ fn frame_header_size(data: Bytes) -> Int!:
     if frame_is_masked(data[1]):
         offset = offset + 4
     return offset
-
 fn frame_payload_length(data: Bytes) -> Int!:
     if data.len() < 2:
         fail "websocket frame too short"
@@ -147,7 +346,6 @@ fn frame_payload_length(data: Bytes) -> Int!:
         return bit_or(bit_shl(data[2], 8), data[3])
     frame_extended_length_size(data[1])!
     return 0
-
 fn apply_mask(payload: Bytes, mask_key: Bytes) -> Bytes!:
     if mask_key.len() != 4:
         fail "websocket mask key must be 4 bytes"
@@ -157,10 +355,10 @@ fn apply_mask(payload: Bytes, mask_key: Bytes) -> Bytes!:
         buf.write_byte(bit_xor(payload[i], mask_key[i % 4]))!
         i = i + 1
     return buf.bytes()
-
 fn frame_mask_key(data: Bytes, header_size: Int) -> Bytes:
     return data.slice(header_size - 4, header_size)
-
+fn is_control_opcode(opcode: Int) -> Bool:
+    return opcode == OP_CLOSE or opcode == OP_PING or opcode == OP_PONG
 pub fn parse_frame(data: Bytes) -> WebSocketFrame!:
     if data.len() < 2:
         fail "websocket frame too short"
@@ -171,59 +369,65 @@ pub fn parse_frame(data: Bytes) -> WebSocketFrame!:
     header_size := frame_header_size(data)!
     if data.len() < header_size + payload_len:
         fail "websocket frame payload truncated"
-
     payload_start := header_size
     payload_end := payload_start + payload_len
     payload := data.slice(payload_start, payload_end)
     if masked:
         return WebSocketFrame(fin, opcode, true, apply_mask(payload, frame_mask_key(data, header_size))!)
     return WebSocketFrame(fin, opcode, false, payload)
-
 pub fn frame_bytes(opcode: Int, payload: Bytes) -> Bytes!:
-    first := bit_or(128, bit_and(opcode, 15))
+    return frame_bytes_with_fin(opcode, payload, true)
+fn frame_bytes_with_fin(opcode: Int, payload: Bytes, fin: Bool) -> Bytes!:
+    if is_control_opcode(opcode):
+        if not fin:
+            fail "websocket control frames must be final"
+        if payload.len() > MAX_CONTROL_PAYLOAD:
+            fail "websocket control frame payload too large"
+    mut first := bit_and(opcode, 15)
+    if fin:
+        first = bit_or(first, 128)
     buf := bytes.buffer_with_capacity(payload.len() + 10)
     buf.write_byte(first)!
     append_frame_length(buf, payload.len(), false)!
     buf.write(payload)!
     return buf.bytes()
-
 pub fn text_frame_bytes(text: String) -> Bytes!:
     return frame_bytes(OP_TEXT, bytes.from_string_utf8(text))
-
 pub fn binary_frame(payload: Bytes) -> Bytes!:
     return frame_bytes(OP_BINARY, payload)
-
 fn masked_payload(payload: Bytes, mask_key: Bytes) -> Bytes!:
     return apply_mask(payload, mask_key)
-
 fn close_payload(code: Int, reason: String) -> Bytes!:
     payload := bytes.buffer_with_capacity(reason.len() + 2)
     payload.write_byte(bit_and(bit_shr(code, 8), 255))!
     payload.write_byte(bit_and(code, 255))!
     payload.write(bytes.from_string_utf8(reason))!
     return payload.bytes()
-
 pub fn masked_frame_bytes(opcode: Int, payload: Bytes, mask_key: Bytes) -> Bytes!:
-    first := bit_or(128, bit_and(opcode, 15))
+    return masked_frame_bytes_with_fin(opcode, payload, mask_key, true)
+fn masked_frame_bytes_with_fin(opcode: Int, payload: Bytes, mask_key: Bytes, fin: Bool) -> Bytes!:
+    if is_control_opcode(opcode):
+        if not fin:
+            fail "websocket control frames must be final"
+        if payload.len() > MAX_CONTROL_PAYLOAD:
+            fail "websocket control frame payload too large"
+    mut first := bit_and(opcode, 15)
+    if fin:
+        first = bit_or(first, 128)
     buf := bytes.buffer_with_capacity(payload.len() + 14)
     buf.write_byte(first)!
     append_frame_length(buf, payload.len(), true)!
     buf.write(mask_key)!
     buf.write(masked_payload(payload, mask_key)!)!
     return buf.bytes()
-
 pub fn client_text_frame_bytes(text: String, mask_key: Bytes) -> Bytes!:
     return masked_frame_bytes(OP_TEXT, bytes.from_string_utf8(text), mask_key)
-
 pub fn ping_frame(payload: Bytes) -> Bytes!:
     return frame_bytes(OP_PING, payload)
-
 pub fn pong_frame(payload: Bytes) -> Bytes!:
     return frame_bytes(OP_PONG, payload)
-
 pub fn close_frame(code: Int, reason: String) -> Bytes!:
     return frame_bytes(OP_CLOSE, close_payload(code, reason)!)
-
 fn read_exact_bytes(reader: BufferedBytesReader, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
@@ -235,7 +439,6 @@ fn read_exact_bytes(reader: BufferedBytesReader, count: Int) -> Bytes!:
             fail "websocket frame truncated"
         buf.write(chunk)!
     return buf.bytes()
-
 pub fn read_frame_buffered(reader: BufferedBytesReader) -> WebSocketFrame!:
     start := read_exact_bytes(reader, 2)!
     mut extra_header := frame_extended_length_size(start[1])!
@@ -245,3 +448,96 @@ pub fn read_frame_buffered(reader: BufferedBytesReader) -> WebSocketFrame!:
     payload_len := frame_payload_length(header)!
     payload := read_exact_bytes(reader, payload_len)!
     return parse_frame(header.concat(payload))
+fn send_frame(ws: WebSocket, opcode: Int, payload: Bytes, fin: Bool) -> Int!:
+    if ws.is_closed():
+        fail "websocket is closed"
+    writer := websocket_writer(ws)
+    mut frame := bytes.empty()
+    if websocket_is_client(ws):
+        frame = masked_frame_bytes_with_fin(opcode, payload, random_mask_key()!, fin)!
+    else:
+        frame = frame_bytes_with_fin(opcode, payload, fin)!
+    writer.write_bytes(frame)!
+    ensure_writer_flushed(writer)!
+    return payload.len()
+fn receive_message(ws: WebSocket) -> WebSocketMessage!:
+    if ws.is_closed():
+        fail "websocket is closed"
+    mut message_opcode := OP_CONTINUATION
+    mut message_buf := bytes.buffer()
+    reader := websocket_reader(ws)
+    while true:
+        frame := read_frame_buffered(reader)!
+        if is_control_opcode(frame.opcode) and not frame.fin:
+            fail "websocket control frames must not be fragmented"
+        if frame.is_ping():
+            ws.pong(frame.payload)!
+            continue
+        if frame.is_pong():
+            continue
+        if frame.is_close():
+            if not ws.is_closed():
+                send_frame(ws, OP_CLOSE, frame.payload, true)!
+            ws.close_now()
+            fail "websocket closed"
+        if frame.opcode == OP_CONTINUATION:
+            if message_opcode == OP_CONTINUATION:
+                fail "unexpected websocket continuation frame"
+            message_buf.write(frame.payload)!
+            if frame.fin:
+                return WebSocketMessage(message_opcode, message_buf.bytes())
+            continue
+        if frame.opcode != OP_TEXT and frame.opcode != OP_BINARY:
+            fail "unsupported websocket opcode"
+        if message_opcode != OP_CONTINUATION:
+            fail "websocket message interrupted by a new data frame"
+        if frame.fin:
+            return WebSocketMessage(frame.opcode, frame.payload)
+        message_opcode = frame.opcode
+        message_buf.write(frame.payload)!
+fn send_message(ws: WebSocket, opcode: Int, payload: Bytes) -> Int!:
+    if payload.len() <= DEFAULT_MESSAGE_FRAGMENT_SIZE:
+        return send_frame(ws, opcode, payload, true)
+    first_end := DEFAULT_MESSAGE_FRAGMENT_SIZE
+    send_frame(ws, opcode, payload.slice(0, first_end), false)!
+    mut offset := first_end
+    while offset < payload.len():
+        mut end := offset + DEFAULT_MESSAGE_FRAGMENT_SIZE
+        if end > payload.len():
+            end = payload.len()
+        fin := end == payload.len()
+        send_frame(ws, OP_CONTINUATION, payload.slice(offset, end), fin)!
+        offset = end
+    return payload.len()
+impl WebSocket:
+    fn recv() -> Bytes!:
+        return receive_message(self)!.payload
+    fn recv_text() -> String!:
+        message := receive_message(self)!
+        if message.opcode != OP_TEXT:
+            fail "expected websocket text message"
+        return message.payload.to_string_utf8()!
+    fn send(data: Bytes) -> Int!:
+        return send_message(self, OP_BINARY, data)
+    fn send_text(data: String) -> Int!:
+        return send_message(self, OP_TEXT, bytes.from_string_utf8(data))
+    fn ping(data: Bytes) -> Int!:
+        return send_frame(self, OP_PING, data, true)
+    fn pong(data: Bytes) -> Int!:
+        return send_frame(self, OP_PONG, data, true)
+    fn close(code: Int, reason: String) -> Int!:
+        if self.is_closed():
+            return 0
+        wrote := send_frame(self, OP_CLOSE, close_payload(code, reason)!, true)!
+        self.close_now()
+        return wrote
+    fn close_now():
+        if self.is_closed():
+            return
+        if websocket_close_kind(self) == WS_CLOSE_TCP:
+            TcpStream(websocket_close_handle(self)).close()
+        websocket_mark_closed(self)
+    fn is_closed() -> Bool:
+        if websocket_closed_flags.contains_key(self.handle):
+            return websocket_closed_flags[self.handle]
+        return true

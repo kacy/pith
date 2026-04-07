@@ -1,0 +1,25 @@
+import std.bytes as bytes
+import std.io as io
+import std.net.http as http
+import std.net.websocket as websocket
+
+fn main() -> Int!:
+    mut headers: Map[String, String] := {}
+
+    request_bytes := websocket.client_request("example.com", "/chat", headers)!
+    request_reader := io.bytes_reader(request_bytes).buffered_chunked(5)
+    request := http.read_request_buffered_bytes(request_reader)!
+    response := websocket.upgrade_response(request)!
+    response_text := response.to_string_utf8()!
+    request_ok := websocket.is_upgrade_request(request)
+
+    print(request_ok.to_string())
+    print(request.path()!)
+    print(response_text.contains("101 Switching Protocols").to_string())
+    print(response_text.contains("Sec-WebSocket-Accept: ").to_string())
+
+    bad_bytes := bytes.from_string_utf8("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    bad_reader := io.bytes_reader(bad_bytes).buffered_chunked(4)
+    bad_request := http.read_request_buffered_bytes(bad_reader)!
+    print(websocket.is_upgrade_request(bad_request).to_string())
+    return 0

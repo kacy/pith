@@ -1,4 +1,4 @@
-.PHONY: build self-host bootstrap bootstrap-verify run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only test clean
+.PHONY: build self-host bootstrap bootstrap-verify run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -317,6 +317,84 @@ check-invalid-self-host-only:
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-host invalid examples passed"
 
+# --- cli regressions ---
+
+cli-regressions: build cli-regressions-only
+
+cli-regressions-only:
+	@echo "--- cli regressions (native) ---"
+	@tmpdir=$$(mktemp -d /tmp/forge-cli-regressions-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	printf 'fn main() -> Int!:\n    return missing_name\n' > "$$tmpdir/bad.fg"; \
+	printf 'test "broken":\n    assert_eq(1 + 1, 3)\n' > "$$tmpdir/fail_test.fg"; \
+	pass=0; fail=0; \
+	set +e; \
+	./target/release/forge >/dev/null 2>&1; \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ]; then pass=$$((pass+1)); echo "ok   no args fail"; else echo "FAIL no args fail"; fail=$$((fail+1)); fi; \
+	set +e; \
+	./target/release/forge run "$$tmpdir/bad.fg" >/dev/null 2>&1; \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ]; then pass=$$((pass+1)); echo "ok   run compile failure"; else echo "FAIL run compile failure"; fail=$$((fail+1)); fi; \
+	set +e; \
+	./target/release/forge build "$$tmpdir/bad.fg" >/dev/null 2>&1; \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ]; then pass=$$((pass+1)); echo "ok   build compile failure"; else echo "FAIL build compile failure"; fail=$$((fail+1)); fi; \
+	set +e; \
+	./target/release/forge check "$$tmpdir/bad.fg" >/dev/null 2>&1; \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ]; then pass=$$((pass+1)); echo "ok   check failure"; else echo "FAIL check failure"; fail=$$((fail+1)); fi; \
+	set +e; \
+	./target/release/forge test tests/cases/test_test_declarations.fg >/dev/null 2>&1; \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ]; then pass=$$((pass+1)); echo "ok   test declarations pass"; else echo "FAIL test declarations pass"; fail=$$((fail+1)); fi; \
+	set +e; \
+	./target/release/forge test "$$tmpdir/fail_test.fg" >/dev/null 2>&1; \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ]; then pass=$$((pass+1)); echo "ok   test declarations fail"; else echo "FAIL test declarations fail"; fail=$$((fail+1)); fi; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all native cli regressions passed"
+
+cli-regressions-self: self-host cli-regressions-self-only
+
+cli-regressions-self-only:
+	@echo "--- cli regressions (self-hosted wrapper) ---"
+	@tmpdir=$$(mktemp -d /tmp/forge-cli-regressions-self-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	printf 'fn main() -> Int!:\n    return missing_name\n' > "$$tmpdir/bad.fg"; \
+	printf 'test "broken":\n    assert_eq(1 + 1, 3)\n' > "$$tmpdir/fail_test.fg"; \
+	pass=0; fail=0; \
+	set +e; \
+	./self-host/forge_main run "$$tmpdir/bad.fg" >/dev/null 2>&1; \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ]; then pass=$$((pass+1)); echo "ok   run compile failure"; else echo "FAIL run compile failure"; fail=$$((fail+1)); fi; \
+	set +e; \
+	./self-host/forge_main check "$$tmpdir/bad.fg" >/dev/null 2>&1; \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ]; then pass=$$((pass+1)); echo "ok   check failure"; else echo "FAIL check failure"; fail=$$((fail+1)); fi; \
+	set +e; \
+	./self-host/forge_main test tests/cases/test_test_declarations.fg >/dev/null 2>&1; \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ]; then pass=$$((pass+1)); echo "ok   test declarations pass"; else echo "FAIL test declarations pass"; fail=$$((fail+1)); fi; \
+	set +e; \
+	./self-host/forge_main test "$$tmpdir/fail_test.fg" >/dev/null 2>&1; \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ]; then pass=$$((pass+1)); echo "ok   test declarations fail"; else echo "FAIL test declarations fail"; fail=$$((fail+1)); fi; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all self-host cli regressions passed"
+
 # --- full test suite ---
 
 test: build
@@ -342,17 +420,21 @@ test: build
 	@$(MAKE) --no-print-directory check-parse-invalid-only
 	@echo "=== Step 4: run invalid checker examples ==="
 	@$(MAKE) --no-print-directory check-invalid-only
-	@echo "=== Step 5: build self-hosted compiler via Cranelift ==="
+	@echo "=== Step 5: run cli regressions ==="
+	@$(MAKE) --no-print-directory cli-regressions-only
+	@echo "=== Step 6: build self-hosted compiler via Cranelift ==="
 	./target/release/forge build self-host/forge_main.fg
-	@echo "=== Step 6: run regression cases through self-hosted compiler ==="
+	@echo "=== Step 7: run regression cases through self-hosted compiler ==="
 	@$(MAKE) --no-print-directory run-regressions-self-only
-	@echo "=== Step 7: run invalid parse examples through self-hosted parser ==="
+	@echo "=== Step 8: run invalid parse examples through self-hosted parser ==="
 	@$(MAKE) --no-print-directory check-parse-invalid-self-host-only
-	@echo "=== Step 8: compare native and self-hosted example outputs ==="
+	@echo "=== Step 9: compare native and self-hosted example outputs ==="
 	@$(MAKE) --no-print-directory parity-examples-only
-	@echo "=== Step 9: run invalid examples through self-hosted checker ==="
+	@echo "=== Step 10: run invalid examples through self-hosted checker ==="
 	@$(MAKE) --no-print-directory check-invalid-self-host-only
-	@echo "=== Step 10: self-hosted compiler works ==="
+	@echo "=== Step 11: run self-host cli regressions ==="
+	@$(MAKE) --no-print-directory cli-regressions-self-only
+	@echo "=== Step 12: self-hosted compiler works ==="
 	./self-host/forge_main version
 	./self-host/forge_main lex examples/hello.fg > /dev/null
 	./self-host/forge_main parse examples/hello.fg > /dev/null

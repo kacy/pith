@@ -1,4 +1,4 @@
-from std.csv import save, parse_file, parse_with_headers_file
+from std.csv import save_chunked, parse_file_chunked, parse_with_headers_file_chunked
 from std.fs import exists, remove
 
 fn main() -> String!:
@@ -9,13 +9,13 @@ fn main() -> String!:
     rows.push(["alice", "30"])
     rows.push(["bob", "25"])
 
-    print(save(csv_path, rows)!.to_string())
+    print(save_chunked(csv_path, rows, 3)!.to_string())
 
-    parsed := parse_file(csv_path)!
+    parsed := parse_file_chunked(csv_path, 2)!
     print(parsed.len().to_string())
     print(parsed[1].join("|"))
 
-    with_headers := parse_with_headers_file(csv_path)!
+    with_headers := parse_with_headers_file_chunked(csv_path, 2)!
     print(with_headers.len().to_string())
     print(with_headers[0]["name"] + "|" + with_headers[0]["age"])
     print(exists(csv_path).to_string())

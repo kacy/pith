@@ -19,6 +19,9 @@ buffered file readers and writers now sit on top of `FileStream`, so chunked
 and line-oriented file protocols can reuse the same shape as the tcp and
 process adapters.
 
+`std.csv` now uses those buffered file helpers directly for chunked reads and
+writes instead of dropping back to whole-file string helpers.
+
 ## the target
 
 we want something closer to the best parts of go's `io` package:

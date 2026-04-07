@@ -386,10 +386,31 @@ fn normalized_chunk_size(chunk_size: Int) -> Int:
         return DEFAULT_CHUNK_SIZE
     return chunk_size
 
-fn unread_after_write(data: String, wrote: Int) -> String:
+fn remaining_after_write(data: String, wrote: Int) -> String:
     if wrote >= data.len():
         return ""
     return data.substring(wrote, data.len())
+
+fn cache_after_consume(cached: String, consumed: Int) -> String:
+    if consumed >= cached.len():
+        return ""
+    return cached.substring(consumed, cached.len())
+
+fn trim_trailing_cr(line: String) -> String:
+    if line.len() == 0:
+        return ""
+    end := line.len()
+    if line.substring(end - 1, end) == chr(13):
+        return line.substring(0, end - 1)
+    return line
+
+fn find_newline(data: String) -> Int:
+    mut i := 0
+    while i < data.len():
+        if data.substring(i, i + 1) == chr(10):
+            return i
+        i = i + 1
+    return -1
 
 pub fn read_all_string(reader: StringReader) -> String!:
     return read_all_string_chunked(reader, DEFAULT_CHUNK_SIZE)
@@ -411,7 +432,7 @@ pub fn write_all_string(writer: StringBuffer, data: String) -> Int!:
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
-        remaining = unread_after_write(remaining, wrote)
+        remaining = remaining_after_write(remaining, wrote)
     return total
 
 pub fn write_all_tcp_stream(writer: TcpStream, data: String) -> Int!:
@@ -422,7 +443,7 @@ pub fn write_all_tcp_stream(writer: TcpStream, data: String) -> Int!:
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
-        remaining = unread_after_write(remaining, wrote)
+        remaining = remaining_after_write(remaining, wrote)
     return total
 
 pub fn write_all_file_stream(writer: FileStream, data: String) -> Int!:
@@ -433,7 +454,7 @@ pub fn write_all_file_stream(writer: FileStream, data: String) -> Int!:
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
-        remaining = unread_after_write(remaining, wrote)
+        remaining = remaining_after_write(remaining, wrote)
     return total
 
 pub fn copy_string(reader: StringReader, writer: StringBuffer) -> Int!:
@@ -511,7 +532,7 @@ pub fn write_all_process_stdin(writer: ProcessStdin, data: String) -> Int!:
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
-        remaining = unread_after_write(remaining, wrote)
+        remaining = remaining_after_write(remaining, wrote)
     return total
 
 pub fn read_all_process_stdout(reader: ProcessStdout) -> String!:
@@ -598,15 +619,11 @@ fn buffered_string_reader_read_line_internal(reader: BufferedStringReader) -> St
             if filled <= 0:
                 return result
             cached = buffered_string_reader_cache_get(reader.handle)
-        newline := buffered_string_reader_find_newline(cached)
+        newline := find_newline(cached)
         if newline >= 0:
             result = result + cached.substring(0, newline)
             buffered_string_reader_consume(reader.handle, newline + 1)
-            if result.len() > 0:
-                end := result.len()
-                if result.substring(end - 1, end) == chr(13):
-                    return result.substring(0, end - 1)
-            return result
+            return trim_trailing_cr(result)
         result = result + cached
         buffered_string_reader_cache.insert(reader.handle, "")
 
@@ -679,15 +696,11 @@ fn buffered_tcp_stream_read_line_internal(reader: BufferedTcpStream) -> String!:
             if filled <= 0:
                 return result
             cached = buffered_tcp_stream_cache_get(reader.handle)
-        newline := buffered_string_reader_find_newline(cached)
+        newline := find_newline(cached)
         if newline >= 0:
             result = result + cached.substring(0, newline)
             buffered_tcp_stream_consume(reader.handle, newline + 1)
-            if result.len() > 0:
-                end := result.len()
-                if result.substring(end - 1, end) == chr(13):
-                    return result.substring(0, end - 1)
-            return result
+            return trim_trailing_cr(result)
         result = result + cached
         buffered_tcp_stream_cache.insert(reader.handle, "")
 
@@ -760,15 +773,11 @@ fn buffered_file_reader_read_line_internal(reader: BufferedFileReader) -> String
             if filled <= 0:
                 return result
             cached = buffered_file_reader_cache_get(reader.handle)
-        newline := buffered_string_reader_find_newline(cached)
+        newline := find_newline(cached)
         if newline >= 0:
             result = result + cached.substring(0, newline)
             buffered_file_reader_consume(reader.handle, newline + 1)
-            if result.len() > 0:
-                end := result.len()
-                if result.substring(end - 1, end) == chr(13):
-                    return result.substring(0, end - 1)
-            return result
+            return trim_trailing_cr(result)
         result = result + cached
         buffered_file_reader_cache.insert(reader.handle, "")
 
@@ -841,15 +850,11 @@ fn buffered_process_stdout_read_line_internal(reader: BufferedProcessStdout) -> 
             if filled <= 0:
                 return result
             cached = buffered_process_stdout_cache_get(reader.handle)
-        newline := buffered_string_reader_find_newline(cached)
+        newline := find_newline(cached)
         if newline >= 0:
             result = result + cached.substring(0, newline)
             buffered_process_stdout_consume(reader.handle, newline + 1)
-            if result.len() > 0:
-                end := result.len()
-                if result.substring(end - 1, end) == chr(13):
-                    return result.substring(0, end - 1)
-            return result
+            return trim_trailing_cr(result)
         result = result + cached
         buffered_process_stdout_cache.insert(reader.handle, "")
 
@@ -899,15 +904,11 @@ fn buffered_process_stderr_read_line_internal(reader: BufferedProcessStderr) -> 
             if filled <= 0:
                 return result
             cached = buffered_process_stderr_cache_get(reader.handle)
-        newline := buffered_string_reader_find_newline(cached)
+        newline := find_newline(cached)
         if newline >= 0:
             result = result + cached.substring(0, newline)
             buffered_process_stderr_consume(reader.handle, newline + 1)
-            if result.len() > 0:
-                end := result.len()
-                if result.substring(end - 1, end) == chr(13):
-                    return result.substring(0, end - 1)
-            return result
+            return trim_trailing_cr(result)
         result = result + cached
         buffered_process_stderr_cache.insert(reader.handle, "")
 
@@ -931,10 +932,7 @@ fn buffered_string_reader_cache_get(handle: Int) -> String:
 
 fn buffered_string_reader_consume(handle: Int, consumed: Int):
     cached := buffered_string_reader_cache_get(handle)
-    if consumed >= cached.len():
-        buffered_string_reader_cache.insert(handle, "")
-    else:
-        buffered_string_reader_cache.insert(handle, cached.substring(consumed, cached.len()))
+    buffered_string_reader_cache.insert(handle, cache_after_consume(cached, consumed))
 
 fn buffered_tcp_stream_cache_get(handle: Int) -> String:
     if buffered_tcp_stream_cache.contains_key(handle):
@@ -943,10 +941,7 @@ fn buffered_tcp_stream_cache_get(handle: Int) -> String:
 
 fn buffered_tcp_stream_consume(handle: Int, consumed: Int):
     cached := buffered_tcp_stream_cache_get(handle)
-    if consumed >= cached.len():
-        buffered_tcp_stream_cache.insert(handle, "")
-    else:
-        buffered_tcp_stream_cache.insert(handle, cached.substring(consumed, cached.len()))
+    buffered_tcp_stream_cache.insert(handle, cache_after_consume(cached, consumed))
 
 fn buffered_file_reader_cache_get(handle: Int) -> String:
     if buffered_file_reader_cache.contains_key(handle):
@@ -955,10 +950,7 @@ fn buffered_file_reader_cache_get(handle: Int) -> String:
 
 fn buffered_file_reader_consume(handle: Int, consumed: Int):
     cached := buffered_file_reader_cache_get(handle)
-    if consumed >= cached.len():
-        buffered_file_reader_cache.insert(handle, "")
-    else:
-        buffered_file_reader_cache.insert(handle, cached.substring(consumed, cached.len()))
+    buffered_file_reader_cache.insert(handle, cache_after_consume(cached, consumed))
 
 fn buffered_process_stdout_cache_get(handle: Int) -> String:
     if buffered_process_stdout_cache.contains_key(handle):
@@ -967,10 +959,7 @@ fn buffered_process_stdout_cache_get(handle: Int) -> String:
 
 fn buffered_process_stdout_consume(handle: Int, consumed: Int):
     cached := buffered_process_stdout_cache_get(handle)
-    if consumed >= cached.len():
-        buffered_process_stdout_cache.insert(handle, "")
-    else:
-        buffered_process_stdout_cache.insert(handle, cached.substring(consumed, cached.len()))
+    buffered_process_stdout_cache.insert(handle, cache_after_consume(cached, consumed))
 
 fn buffered_process_stderr_cache_get(handle: Int) -> String:
     if buffered_process_stderr_cache.contains_key(handle):
@@ -979,18 +968,7 @@ fn buffered_process_stderr_cache_get(handle: Int) -> String:
 
 fn buffered_process_stderr_consume(handle: Int, consumed: Int):
     cached := buffered_process_stderr_cache_get(handle)
-    if consumed >= cached.len():
-        buffered_process_stderr_cache.insert(handle, "")
-    else:
-        buffered_process_stderr_cache.insert(handle, cached.substring(consumed, cached.len()))
-
-fn buffered_string_reader_find_newline(data: String) -> Int:
-    mut i := 0
-    while i < data.len():
-        if data.substring(i, i + 1) == chr(10):
-            return i
-        i = i + 1
-    return -1
+    buffered_process_stderr_cache.insert(handle, cache_after_consume(cached, consumed))
 
 fn buffered_string_writer_cache_get(handle: Int) -> String:
     if buffered_string_writer_cache.contains_key(handle):

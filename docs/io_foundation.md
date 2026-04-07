@@ -35,6 +35,8 @@ stdlib call sites can read like:
 - `import std.io as io`
 - `import std.json as json`
 - `reader := io.string_reader(data)`
+- `text := io.read_all(reader)!`
+- `conn := io.connect(host, port)!`
 - `root := json.parse(text)`
 
 ## shared pieces

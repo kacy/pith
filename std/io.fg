@@ -364,6 +364,12 @@ fn buffered_bytes_reader_from_stderr(reader: ProcessStderr, chunk_size: Int) -> 
 fn buffered_bytes_writer_to_stdin(writer: ProcessStdin, chunk_size: Int) -> BufferedBytesWriter:
     return make_buffered_bytes_writer(BUFFERED_BYTES_TARGET_PROCESS_STDIN, writer.handle, chunk_size)
 
+fn decode_utf8(data: Bytes) -> String!:
+    return data.to_string_utf8()!
+
+fn encode_utf8(data: String) -> Bytes:
+    return bytes.from_string_utf8(data)
+
 fn tcp_stream_connect(host: String, port: Int) -> TcpStream!:
     return TcpStream(tcp_connect(host, port)!)
 
@@ -371,13 +377,13 @@ fn tcp_stream_from_fd(fd: Int) -> TcpStream:
     return TcpStream(fd)
 
 fn tcp_stream_read(stream: TcpStream, max_bytes: Int) -> String!:
-    return tcp_stream_read_bytes(stream, max_bytes)!.to_string_utf8()!
+    return decode_utf8(tcp_stream_read_bytes(stream, max_bytes)!)
 
 fn tcp_stream_read_bytes(stream: TcpStream, max_bytes: Int) -> Bytes!:
     return tcp_read_bytes(stream.fd, max_bytes)
 
 fn tcp_stream_write(stream: TcpStream, data: String) -> Int!:
-    return tcp_stream_write_bytes(stream, bytes.from_string_utf8(data))
+    return tcp_stream_write_bytes(stream, encode_utf8(data))
 
 fn tcp_stream_write_bytes(stream: TcpStream, data: Bytes) -> Int!:
     return tcp_write_bytes(stream.fd, data)
@@ -398,13 +404,13 @@ fn file_stream_open_append(path: String) -> FileStream!:
     return FileStream(file_open_append(path)!)
 
 fn file_stream_read(stream: FileStream, max_bytes: Int) -> String!:
-    return file_stream_read_bytes(stream, max_bytes)!.to_string_utf8()!
+    return decode_utf8(file_stream_read_bytes(stream, max_bytes)!)
 
 fn file_stream_read_bytes(stream: FileStream, max_bytes: Int) -> Bytes!:
     return file_read_bytes(stream.handle, max_bytes)
 
 fn file_stream_write(stream: FileStream, data: String) -> Int!:
-    return file_stream_write_bytes(stream, bytes.from_string_utf8(data))
+    return file_stream_write_bytes(stream, encode_utf8(data))
 
 fn file_stream_write_bytes(stream: FileStream, data: Bytes) -> Int!:
     return file_write_bytes(stream.handle, data)
@@ -613,13 +619,13 @@ fn buffered_process_stderr_read_line(reader: BufferedProcessStderr) -> String!:
     return buffered_process_stderr_read_line_internal(reader)
 
 fn process_stdin_write(writer: ProcessStdin, data: String) -> Int!:
-    return process_stdin_write_bytes(writer, bytes.from_string_utf8(data))
+    return process_stdin_write_bytes(writer, encode_utf8(data))
 
 fn process_stdout_read(reader: ProcessStdout, max_bytes: Int) -> String!:
-    return process_stdout_read_bytes(reader, max_bytes)!.to_string_utf8()!
+    return decode_utf8(process_stdout_read_bytes(reader, max_bytes)!)
 
 fn process_stderr_read(reader: ProcessStderr, max_bytes: Int) -> String!:
-    return process_stderr_read_bytes(reader, max_bytes)!.to_string_utf8()!
+    return decode_utf8(process_stderr_read_bytes(reader, max_bytes)!)
 
 fn normalized_chunk_size(chunk_size: Int) -> Int:
     if chunk_size <= 0:

@@ -3,6 +3,7 @@
 import std.bytes as bytes
 import std.fs as fs
 import std.io as io
+import std.net.websocket as websocket
 
 fn main() -> String!:
     payload := bytes.from_string_utf8("forge bytes")
@@ -25,4 +26,13 @@ fn main() -> String!:
     print("stdout: " + proc.stdout().read_all_bytes()!.to_string_utf8()!)
     print("exit: " + proc.wait().to_string())
     proc.close()
+
+    mask := bytes.buffer()
+    mask.write_byte(1)!
+    mask.write_byte(2)!
+    mask.write_byte(3)!
+    mask.write_byte(4)!
+    frame := websocket.client_text_frame_bytes("ok", mask.bytes())!
+    parsed := websocket.parse_frame(frame)!
+    print("ws text: " + parsed.payload_text()!)
     return ""

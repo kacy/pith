@@ -78,6 +78,7 @@ the point of this work was not to stop at toy adapters.
 
 real stdlib consumers now use the shared layer:
 - `std.net.http`
+- `std.net.websocket`
 - `std.csv`
 - `std.toml`
 - `std.json`
@@ -89,8 +90,8 @@ and the bytes-first boundary is real too:
 - `std.hash`
 
 that matters because it proves the design under actual request parsing,
-buffered body reads, file-backed parsing, incremental writes, and process/file
-integration instead of only synthetic helpers.
+buffered body reads, websocket framing, file-backed parsing, incremental
+writes, and process/file integration instead of only synthetic helpers.
 
 ## what this buys us
 
@@ -99,6 +100,7 @@ the main win is consistency.
 new stdlib work can start from one io vocabulary instead of inventing new
 string/socket/file loops every time. that makes a few things simpler:
 - http-style request and response handling
+- websocket handshake and frame reads
 - file-backed format parsers
 - process pipelines
 - tests that need cheap fake readers and writers
@@ -119,6 +121,12 @@ the foundation is in place, but there is still room to grow:
 
 the long-term version of forge io should be more protocol-friendly and more
 bytes-first than the original string-only start.
+
+that is already visible in a couple of places:
+- `std.net.http` can preserve request bodies as `Bytes` and only decode headers
+  or bodies when the caller asks for text
+- `std.net.websocket` now has bytes-first handshake and frame helpers, including
+  masked client frames and buffered frame reads
 
 but the right way to get there was to land a useful shared core first, move
 real stdlib code onto it, and then extend the shape from working users instead

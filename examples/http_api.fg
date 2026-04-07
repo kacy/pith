@@ -1,8 +1,10 @@
 # test std.net.http — request parsing, headers, query params, responses
 
+import std.bytes as bytes
 import std.net.http as http
+import std.io as io
 
-fn main():
+fn main() -> Int!:
     crlf := chr(13) + chr(10)
 
     # parse a GET with headers and query string
@@ -38,6 +40,12 @@ fn main():
     print("post type: " + http.get_header(req2, "Content-Type"))
     print("post body: " + http.body(req2))
 
+    raw2_bytes := bytes.buffer()
+    raw2_bytes.write(bytes.from_string_utf8(raw2))!
+    req2_bytes := http.read_request_buffered_bytes(io.bytes_reader(raw2_bytes.bytes()).buffered_chunked(4))!
+    print("post body bytes: " + req2_bytes.body_bytes().len().to_string())
+    print("post type bytes: " + req2_bytes.header_bytes("Content-Type").to_string_utf8()!)
+
     # response builders
     r1 := http.html_response(200, "<h1>ok</h1>")
     if r1.contains("200 OK"):
@@ -60,3 +68,4 @@ fn main():
         print("redirect location: ok")
 
     print("http api works")
+    return 0

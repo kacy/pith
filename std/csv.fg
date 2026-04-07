@@ -2,9 +2,16 @@
 ##
 ## Functions:
 ##   parse(text: String) -> List[List[String]]
+##   parse_file(path: String) -> List[List[String]]!
 ##   parse_with_headers(text: String) -> List[Map[String, String]]
+##   parse_with_headers_file(path: String) -> List[Map[String, String]]!
 ##   encode(rows: List[List[String]]) -> String
+##   save(path: String, rows: List[List[String]]) -> Int!
 ##   encode_row(row: List[String]) -> String
+
+from std.io import file_stream_open_read, file_stream_open_write, read_all_file_stream_chunked, write_all_file_stream, file_stream_close
+
+CSV_FILE_CHUNK_SIZE := 4096
 
 ## Parse CSV text into a list of rows, each row a list of fields
 pub fn parse(text: String) -> List[List[String]]:
@@ -17,6 +24,15 @@ pub fn parse(text: String) -> List[List[String]]:
             rows.push(parse_row(line))
         i = i + 1
     return rows
+
+pub fn parse_file(path: String) -> List[List[String]]!:
+    return parse_file_chunked(path, CSV_FILE_CHUNK_SIZE)
+
+pub fn parse_file_chunked(path: String, chunk_size: Int) -> List[List[String]]!:
+    stream := file_stream_open_read(path)!
+    text := read_all_file_stream_chunked(stream, chunk_size)!
+    file_stream_close(stream)
+    return parse(text)
 
 ## Parse CSV text with the first row as headers.
 ## Returns a list of maps, one per data row.
@@ -41,6 +57,15 @@ pub fn parse_with_headers(text: String) -> List[Map[String, String]]:
         i = i + 1
     return result
 
+pub fn parse_with_headers_file(path: String) -> List[Map[String, String]]!:
+    return parse_with_headers_file_chunked(path, CSV_FILE_CHUNK_SIZE)
+
+pub fn parse_with_headers_file_chunked(path: String, chunk_size: Int) -> List[Map[String, String]]!:
+    stream := file_stream_open_read(path)!
+    text := read_all_file_stream_chunked(stream, chunk_size)!
+    file_stream_close(stream)
+    return parse_with_headers(text)
+
 ## Encode a list of rows into CSV text
 pub fn encode(rows: List[List[String]]) -> String:
     mut lines: List[String] := []
@@ -49,6 +74,12 @@ pub fn encode(rows: List[List[String]]) -> String:
         lines.push(encode_row(rows[i]))
         i = i + 1
     return lines.join(chr(10))
+
+pub fn save(path: String, rows: List[List[String]]) -> Int!:
+    stream := file_stream_open_write(path)!
+    wrote := write_all_file_stream(stream, encode(rows))!
+    file_stream_close(stream)
+    return wrote
 
 ## Encode a single row into a CSV line
 pub fn encode_row(row: List[String]) -> String:

@@ -12,6 +12,9 @@ right now the stdlib has a few different styles:
 that works for small modules, but it doesn't scale into a great standard
 library. every protocol or format layer ends up reinventing the same loops.
 
+the branch has moved past the raw plumbing now. `std.net.http`, `std.fs`, and
+`std.csv` are starting to share the same read and write path.
+
 ## the target
 
 we want something closer to the best parts of go's `io` package:

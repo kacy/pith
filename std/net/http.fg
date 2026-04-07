@@ -1,7 +1,7 @@
 # std.net.http — HTTP server and client
 #
-# Request parsing returns a packed string; accessor functions extract fields.
-# No cross-module state needed — all operations are pure string transforms.
+# forge still keeps the original packed-string request api, but the wire-facing
+# path now goes through bytes first so request bodies can stay raw when needed.
 #
 #   import std.net.http as http
 #
@@ -43,6 +43,44 @@ fn char_eq(s: String, idx: Int, ch: String) -> Bool:
 
 fn byte_eq(data: Bytes, idx: Int, value: Int) -> Bool:
     return data[idx] == value
+
+fn decode_utf8(data: Bytes) -> String!:
+    return data.to_string_utf8()!
+
+fn find_byte(data: Bytes, start: Int, value: Int) -> Int:
+    mut i := start
+    while i < data.len():
+        if data[i] == value:
+            return i
+        i = i + 1
+    return -1
+
+fn trim_ascii_start(data: Bytes, start: Int, end: Int) -> Int:
+    mut i := start
+    while i < end and (data[i] == 32 or data[i] == 9):
+        i = i + 1
+    return i
+
+fn trim_ascii_end(data: Bytes, start: Int, end: Int) -> Int:
+    mut i := end
+    while i > start and (data[i - 1] == 32 or data[i - 1] == 9):
+        i = i - 1
+    return i
+
+fn trim_trailing_cr(data: Bytes, start: Int, end: Int) -> Int:
+    if end > start and data[end - 1] == 13:
+        return end - 1
+    return end
+
+fn header_name_matches(data: Bytes, start: Int, end: Int, name: String) -> Bool:
+    if end - start != name.len():
+        return false
+    mut i := 0
+    while i < name.len():
+        if ascii_lower(data[start + i]) != ascii_lower(ord(name[i])):
+            return false
+        i = i + 1
+    return true
 
 # ===============================================================
 # Request Parsing
@@ -189,22 +227,16 @@ fn request_target_bytes(raw_head: Bytes) -> Bytes:
 
 fn request_target_path_bytes(raw_head: Bytes) -> Bytes:
     target := request_target_bytes(raw_head)
-    mut i := 0
-    while i < target.len():
-        if target[i] == 63:
-            return target.slice(0, i)
-        i = i + 1
+    query_pos := find_byte(target, 0, 63)
+    if query_pos >= 0:
+        return target.slice(0, query_pos)
     return target
 
 fn request_target_query_bytes(raw_head: Bytes) -> Bytes:
     target := request_target_bytes(raw_head)
-    mut i := 0
-    while i < target.len():
-        if target[i] == 63:
-            if i + 1 < target.len():
-                return target.slice(i + 1, target.len())
-            return bytes.empty()
-        i = i + 1
+    query_pos := find_byte(target, 0, 63)
+    if query_pos >= 0 and query_pos + 1 < target.len():
+        return target.slice(query_pos + 1, target.len())
     return bytes.empty()
 
 fn headers_bytes(raw_head: Bytes) -> Bytes:
@@ -212,6 +244,16 @@ fn headers_bytes(raw_head: Bytes) -> Bytes:
     if bounds[0] >= bounds[1]:
         return bytes.empty()
     return raw_head.slice(bounds[0], bounds[1])
+
+fn header_value_bounds(line: Bytes, line_start: Int, line_end: Int, name: String) -> List[Int]:
+    colon := find_byte(line, line_start, 58)
+    if colon <= line_start or colon >= line_end:
+        return []
+    if not header_name_matches(line, line_start, colon, name):
+        return []
+    value_start := trim_ascii_start(line, colon + 1, line_end)
+    value_end := trim_ascii_end(line, value_start, line_end)
+    return [value_start, value_end]
 
 fn header_value_bytes(raw_head: Bytes, name: String) -> Bytes:
     hdrs := headers_bytes(raw_head)
@@ -223,36 +265,11 @@ fn header_value_bytes(raw_head: Bytes, name: String) -> Bytes:
         if not at_end:
             at_nl = hdrs[pos] == 10
         if at_end or at_nl:
-            mut line_end := pos
-            if line_end > line_start and hdrs[line_end - 1] == 13:
-                line_end = line_end - 1
+            line_end := trim_trailing_cr(hdrs, line_start, pos)
             if line_end > line_start:
-                mut colon := -1
-                mut i := line_start
-                while i < line_end:
-                    if hdrs[i] == 58:
-                        colon = i
-                        break
-                    i = i + 1
-                if colon > line_start:
-                    mut matches := true
-                    if colon - line_start != name.len():
-                        matches = false
-                    else:
-                        i = 0
-                        while i < name.len():
-                            if ascii_lower(hdrs[line_start + i]) != ascii_lower(ord(name[i])):
-                                matches = false
-                                break
-                            i = i + 1
-                    if matches:
-                        mut value_start := colon + 1
-                        while value_start < line_end and (hdrs[value_start] == 32 or hdrs[value_start] == 9):
-                            value_start = value_start + 1
-                        mut value_end := line_end
-                        while value_end > value_start and (hdrs[value_end - 1] == 32 or hdrs[value_end - 1] == 9):
-                            value_end = value_end - 1
-                        return hdrs.slice(value_start, value_end)
+                value_bounds := header_value_bounds(hdrs, line_start, line_end, name)
+                if value_bounds.len() == 2:
+                    return hdrs.slice(value_bounds[0], value_bounds[1])
             line_start = pos + 1
         pos = pos + 1
     return bytes.empty()
@@ -292,28 +309,34 @@ impl HttpRequestBytes:
         return header_value_bytes(self.head, name)
 
     fn method() -> String!:
-        return self.method_bytes().to_string_utf8()!
+        return decode_utf8(self.method_bytes())
 
     fn path() -> String!:
-        return self.path_bytes().to_string_utf8()!
+        return decode_utf8(self.path_bytes())
 
     fn query() -> String!:
-        return self.query_bytes().to_string_utf8()!
+        return decode_utf8(self.query_bytes())
 
     fn version() -> String!:
-        return self.version_bytes().to_string_utf8()!
+        return decode_utf8(self.version_bytes())
 
     fn headers() -> String!:
-        return self.headers_bytes().to_string_utf8()!
+        return decode_utf8(self.headers_bytes())
 
     fn header(name: String) -> String!:
-        return self.header_bytes(name).to_string_utf8()!
+        return decode_utf8(self.header_bytes(name))
 
     fn body_bytes() -> Bytes:
         return self.body
 
     fn body_text() -> String!:
-        return self.body.to_string_utf8()!
+        return decode_utf8(self.body)
+
+fn content_length_from_head_bytes(raw_head: Bytes) -> Int!:
+    length_text := header_value_bytes(raw_head, "Content-Length")
+    if length_text.is_empty():
+        return 0
+    return parse_int(decode_utf8(length_text)!)
 
 # ===============================================================
 # Request Accessors
@@ -535,12 +558,6 @@ pub fn redirect(url: String) -> String:
 # ===============================================================
 # Server Helpers
 # ===============================================================
-
-fn content_length_from_head_bytes(raw_head: Bytes) -> Int!:
-    length_text := header_value_bytes(raw_head, "Content-Length")
-    if length_text.is_empty():
-        return 0
-    return parse_int(length_text.to_string_utf8()!)
 
 fn find_request_head_end(raw: Bytes) -> Int:
     mut i := 0

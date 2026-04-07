@@ -96,6 +96,20 @@ impl WebSocketFrame:
             return ""
         return self.payload.slice(2, self.payload.len()).to_string_utf8()!
 
+fn frame_is_masked(second_byte: Int) -> Bool:
+    return bit_and(second_byte, 128) != 0
+
+fn frame_length_code(second_byte: Int) -> Int:
+    return bit_and(second_byte, 127)
+
+fn frame_extended_length_size(second_byte: Int) -> Int!:
+    length_code := frame_length_code(second_byte)
+    if length_code == 126:
+        return 2
+    if length_code == 127:
+        fail "64-bit websocket lengths not supported yet"
+    return 0
+
 fn append_frame_length(buf: ByteBuffer, payload_len: Int, masked: Bool) -> Int!:
     mut len_byte := payload_len
     if masked:
@@ -116,34 +130,43 @@ fn append_frame_length(buf: ByteBuffer, payload_len: Int, masked: Bool) -> Int!:
 fn frame_header_size(data: Bytes) -> Int!:
     if data.len() < 2:
         fail "websocket frame too short"
-    mut offset := 2
-    length_code := bit_and(data[1], 127)
-    if length_code == 126:
-        offset = offset + 2
-    elif length_code == 127:
-        fail "64-bit websocket lengths not supported yet"
-    if bit_and(data[1], 128) != 0:
+    mut offset := 2 + frame_extended_length_size(data[1])!
+    if frame_is_masked(data[1]):
         offset = offset + 4
     return offset
 
 fn frame_payload_length(data: Bytes) -> Int!:
     if data.len() < 2:
         fail "websocket frame too short"
-    length_code := bit_and(data[1], 127)
+    length_code := frame_length_code(data[1])
     if length_code < 126:
         return length_code
     if length_code == 126:
         if data.len() < 4:
             fail "websocket frame missing extended length"
         return bit_or(bit_shl(data[2], 8), data[3])
-    fail "64-bit websocket lengths not supported yet"
+    frame_extended_length_size(data[1])!
+    return 0
+
+fn apply_mask(payload: Bytes, mask_key: Bytes) -> Bytes!:
+    if mask_key.len() != 4:
+        fail "websocket mask key must be 4 bytes"
+    buf := bytes.buffer_with_capacity(payload.len())
+    mut i := 0
+    while i < payload.len():
+        buf.write_byte(bit_xor(payload[i], mask_key[i % 4]))!
+        i = i + 1
+    return buf.bytes()
+
+fn frame_mask_key(data: Bytes, header_size: Int) -> Bytes:
+    return data.slice(header_size - 4, header_size)
 
 pub fn parse_frame(data: Bytes) -> WebSocketFrame!:
     if data.len() < 2:
         fail "websocket frame too short"
     fin := bit_and(data[0], 128) != 0
     opcode := bit_and(data[0], 15)
-    masked := bit_and(data[1], 128) != 0
+    masked := frame_is_masked(data[1])
     payload_len := frame_payload_length(data)!
     header_size := frame_header_size(data)!
     if data.len() < header_size + payload_len:
@@ -151,17 +174,10 @@ pub fn parse_frame(data: Bytes) -> WebSocketFrame!:
 
     payload_start := header_size
     payload_end := payload_start + payload_len
-    if not masked:
-        return WebSocketFrame(fin, opcode, false, data.slice(payload_start, payload_end))
-
-    mask_key_start := header_size - 4
-    buf := bytes.buffer_with_capacity(payload_len)
-    mut i := 0
-    while i < payload_len:
-        mask_byte := data[mask_key_start + (i % 4)]
-        buf.write_byte(bit_xor(data[payload_start + i], mask_byte))!
-        i = i + 1
-    return WebSocketFrame(fin, opcode, true, buf.bytes())
+    payload := data.slice(payload_start, payload_end)
+    if masked:
+        return WebSocketFrame(fin, opcode, true, apply_mask(payload, frame_mask_key(data, header_size))!)
+    return WebSocketFrame(fin, opcode, false, payload)
 
 pub fn frame_bytes(opcode: Int, payload: Bytes) -> Bytes!:
     first := bit_or(128, bit_and(opcode, 15))
@@ -178,14 +194,14 @@ pub fn binary_frame(payload: Bytes) -> Bytes!:
     return frame_bytes(OP_BINARY, payload)
 
 fn masked_payload(payload: Bytes, mask_key: Bytes) -> Bytes!:
-    if mask_key.len() != 4:
-        fail "websocket mask key must be 4 bytes"
-    buf := bytes.buffer_with_capacity(payload.len())
-    mut i := 0
-    while i < payload.len():
-        buf.write_byte(bit_xor(payload[i], mask_key[i % 4]))!
-        i = i + 1
-    return buf.bytes()
+    return apply_mask(payload, mask_key)
+
+fn close_payload(code: Int, reason: String) -> Bytes!:
+    payload := bytes.buffer_with_capacity(reason.len() + 2)
+    payload.write_byte(bit_and(bit_shr(code, 8), 255))!
+    payload.write_byte(bit_and(code, 255))!
+    payload.write(bytes.from_string_utf8(reason))!
+    return payload.bytes()
 
 pub fn masked_frame_bytes(opcode: Int, payload: Bytes, mask_key: Bytes) -> Bytes!:
     first := bit_or(128, bit_and(opcode, 15))
@@ -206,11 +222,7 @@ pub fn pong_frame(payload: Bytes) -> Bytes!:
     return frame_bytes(OP_PONG, payload)
 
 pub fn close_frame(code: Int, reason: String) -> Bytes!:
-    payload := bytes.buffer_with_capacity(reason.len() + 2)
-    payload.write_byte(bit_and(bit_shr(code, 8), 255))!
-    payload.write_byte(bit_and(code, 255))!
-    payload.write(bytes.from_string_utf8(reason))!
-    return frame_bytes(OP_CLOSE, payload.bytes())
+    return frame_bytes(OP_CLOSE, close_payload(code, reason)!)
 
 fn read_exact_bytes(reader: BufferedBytesReader, count: Int) -> Bytes!:
     if count <= 0:
@@ -226,13 +238,8 @@ fn read_exact_bytes(reader: BufferedBytesReader, count: Int) -> Bytes!:
 
 pub fn read_frame_buffered(reader: BufferedBytesReader) -> WebSocketFrame!:
     start := read_exact_bytes(reader, 2)!
-    mut extra_header := 0
-    length_code := bit_and(start[1], 127)
-    if length_code == 126:
-        extra_header = extra_header + 2
-    elif length_code == 127:
-        fail "64-bit websocket lengths not supported yet"
-    if bit_and(start[1], 128) != 0:
+    mut extra_header := frame_extended_length_size(start[1])!
+    if frame_is_masked(start[1]):
         extra_header = extra_header + 4
     header := start.concat(read_exact_bytes(reader, extra_header)!)
     payload_len := frame_payload_length(header)!

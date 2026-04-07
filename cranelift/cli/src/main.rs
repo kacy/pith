@@ -5,7 +5,7 @@
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 /// Offset added to main module's index to avoid collisions with import indices
 const MAIN_MODULE_INDEX_OFFSET: usize = 100;
@@ -15,49 +15,49 @@ fn main() {
 
     if args.len() < 2 {
         print_usage();
-        return;
+        std::process::exit(1);
     }
 
     match args[1].as_str() {
         "build" => {
             if args.len() < 3 {
                 eprintln!("Error: build requires a file argument");
-                return;
+                std::process::exit(1);
             }
             build_file(&args[2]);
         }
         "run" => {
             if args.len() < 3 {
                 eprintln!("Error: run requires a file argument");
-                return;
+                std::process::exit(1);
             }
             run_file(&args[2]);
         }
         "test" => {
             if args.len() < 3 {
                 eprintln!("Error: test requires a file argument");
-                return;
+                std::process::exit(1);
             }
             test_file(&args[2]);
         }
         "check" => {
             if args.len() < 3 {
                 eprintln!("Error: check requires a file argument");
-                return;
+                std::process::exit(1);
             }
             check_file(&args[2]);
         }
         "parse" => {
             if args.len() < 3 {
                 eprintln!("Error: parse requires a file argument");
-                return;
+                std::process::exit(1);
             }
             parse_file(&args[2]);
         }
         "lex" => {
             if args.len() < 3 {
                 eprintln!("Error: lex requires a file argument");
-                return;
+                std::process::exit(1);
             }
             lex_file(&args[2]);
         }
@@ -74,6 +74,7 @@ fn main() {
         _ => {
             eprintln!("Unknown command: {}", args[1]);
             print_usage();
+            std::process::exit(1);
         }
     }
 }
@@ -105,6 +106,12 @@ fn dump_ir_if_requested(ir_text: &str) {
         let _ = fs::write(&dump_path, ir_text);
         eprintln!("IR dumped to {} ({} bytes)", dump_path, ir_text.len());
     }
+}
+
+fn combined_output(output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    format!("{}{}", stdout, stderr)
 }
 
 /// Find the self-hosted compiler executable
@@ -188,8 +195,11 @@ fn run_ir_driver(driver: &str, path: &str, module_index: usize) -> Result<String
         .output()
         .map_err(|e| format!("run ir_driver: {}", e))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("IR driver failed on {}: {}", path, stderr));
+        let combined = combined_output(&output);
+        if combined.trim().is_empty() {
+            return Err(format!("IR driver failed on {}", path));
+        }
+        return Err(format!("IR driver failed on {}: {}", path, combined));
     }
     let ir = String::from_utf8_lossy(&output.stdout).to_string();
     if module_index >= MAIN_MODULE_INDEX_OFFSET {
@@ -666,54 +676,51 @@ fn collect_imports_recursive(
     }
 }
 
-fn build_file(path: &str) {
+fn compile_to_object(path: &str) -> Result<(Vec<u8>, usize), String> {
     use forge_codegen::create_codegen;
     use forge_codegen::finalize_module;
     use forge_codegen::ir_consumer::compile_from_ir;
-    use forge_codegen::linker::build_executable;
 
-    let ir_text = match get_ir_from_compiler(path) {
-        Ok(ir) => ir,
-        Err(e) => {
-            eprintln!("Error getting IR: {}", e);
-            return;
-        }
-    };
+    let ir_text = get_ir_from_compiler(path)
+        .map_err(|e| format!("Error getting IR: {}", e))?;
 
     dump_ir_if_requested(&ir_text);
 
-    match create_codegen() {
-        Ok(mut codegen) => {
-            let runtime_funcs = match forge_codegen::declare_runtime_functions(&mut codegen.module) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("Error declaring runtime: {}", e);
-                    return;
-                }
-            };
-            match compile_from_ir(&mut codegen, &ir_text, &runtime_funcs) {
-                Ok(funcs) => {
-                    eprintln!("Compiled {} functions", funcs.len());
-                    match finalize_module(codegen.module) {
-                        Ok(bytes) => {
-                            let obj_path = path.replace(".fg", ".o");
-                            let exe_path = path.replace(".fg", "");
-                            if let Err(e) = fs::write(&obj_path, &bytes) {
-                                eprintln!("Error writing object: {}", e);
-                                return;
-                            }
-                            match build_executable(&obj_path, &exe_path) {
-                                Ok(_) => eprintln!("Created: {}", exe_path),
-                                Err(e) => eprintln!("Error linking: {}", e),
-                            }
-                        }
-                        Err(e) => eprintln!("Error finalizing: {}", e),
-                    }
-                }
-                Err(e) => eprintln!("Error compiling: {}", e),
-            }
+    let mut codegen = create_codegen()
+        .map_err(|e| format!("Error creating codegen: {}", e))?;
+    let runtime_funcs = forge_codegen::declare_runtime_functions(&mut codegen.module)
+        .map_err(|e| format!("Error declaring runtime: {}", e))?;
+    let funcs = compile_from_ir(&mut codegen, &ir_text, &runtime_funcs)
+        .map_err(|e| format!("Error compiling: {}", e))?;
+    let bytes = finalize_module(codegen.module)
+        .map_err(|e| format!("Error finalizing: {}", e))?;
+    Ok((bytes, funcs.len()))
+}
+
+fn build_file(path: &str) {
+    use forge_codegen::linker::build_executable;
+
+    let (bytes, func_count) = match compile_to_object(path) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
         }
-        Err(e) => eprintln!("Error creating codegen: {}", e),
+    };
+
+    eprintln!("Compiled {} functions", func_count);
+    let obj_path = path.replace(".fg", ".o");
+    let exe_path = path.replace(".fg", "");
+    if let Err(e) = fs::write(&obj_path, &bytes) {
+        eprintln!("Error writing object: {}", e);
+        std::process::exit(1);
+    }
+    match build_executable(&obj_path, &exe_path) {
+        Ok(_) => eprintln!("Created: {}", exe_path),
+        Err(e) => {
+            eprintln!("Error linking: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -728,70 +735,45 @@ fn unique_run_artifact_paths() -> (std::path::PathBuf, std::path::PathBuf) {
 }
 
 fn run_file(path: &str) {
-    use forge_codegen::create_codegen;
-    use forge_codegen::finalize_module;
-    use forge_codegen::ir_consumer::compile_from_ir;
     use forge_codegen::linker::build_executable;
 
-    let ir_text = match get_ir_from_compiler(path) {
-        Ok(ir) => ir,
+    let (bytes, _) = match compile_to_object(path) {
+        Ok(result) => result,
         Err(e) => {
-            eprintln!("Error getting IR: {}", e);
-            return;
+            eprintln!("{}", e);
+            std::process::exit(1);
         }
     };
 
-    dump_ir_if_requested(&ir_text);
-
-    match create_codegen() {
-        Ok(mut codegen) => {
-            let runtime_funcs = match forge_codegen::declare_runtime_functions(&mut codegen.module) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    return;
-                }
-            };
-            match compile_from_ir(&mut codegen, &ir_text, &runtime_funcs) {
-                Ok(_) => match finalize_module(codegen.module) {
-                    Ok(bytes) => {
-                        let (obj_path, exe_path) = unique_run_artifact_paths();
-                        let keep_artifacts = std::env::var("FORGE_KEEP_RUN_ARTIFACTS").is_ok();
-                        if let Err(e) = fs::write(&obj_path, &bytes) {
-                            eprintln!("Error writing object: {}", e);
-                            std::process::exit(1);
-                        }
-                        match build_executable(&obj_path.to_string_lossy(), &exe_path.to_string_lossy()) {
-                            Ok(_) => {
-                                let status = Command::new(&exe_path).status();
-                                if !keep_artifacts {
-                                    let _ = fs::remove_file(&obj_path);
-                                    let _ = fs::remove_file(&exe_path);
-                                }
-                                match status {
-                                    Ok(s) => {
-                                        if !s.success() {
-                                            std::process::exit(s.code().unwrap_or(1));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Error running {}: {}", exe_path.display(), e);
-                                        std::process::exit(1);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Error linking {}: {}", exe_path.display(), e);
-                                std::process::exit(1);
-                            }
-                        }
+    let (obj_path, exe_path) = unique_run_artifact_paths();
+    let keep_artifacts = std::env::var("FORGE_KEEP_RUN_ARTIFACTS").is_ok();
+    if let Err(e) = fs::write(&obj_path, &bytes) {
+        eprintln!("Error writing object: {}", e);
+        std::process::exit(1);
+    }
+    match build_executable(&obj_path.to_string_lossy(), &exe_path.to_string_lossy()) {
+        Ok(_) => {
+            let status = Command::new(&exe_path).status();
+            if !keep_artifacts {
+                let _ = fs::remove_file(&obj_path);
+                let _ = fs::remove_file(&exe_path);
+            }
+            match status {
+                Ok(s) => {
+                    if !s.success() {
+                        std::process::exit(s.code().unwrap_or(1));
                     }
-                    Err(e) => eprintln!("Error: {}", e),
-                },
-                Err(e) => eprintln!("Error: {}", e),
+                }
+                Err(e) => {
+                    eprintln!("Error running {}: {}", exe_path.display(), e);
+                    std::process::exit(1);
+                }
             }
         }
-        Err(e) => eprintln!("Error: {}", e),
+        Err(e) => {
+            eprintln!("Error linking {}: {}", exe_path.display(), e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -799,6 +781,7 @@ fn test_file(path: &str) {
     eprintln!("Test mode not yet implemented for Cranelift backend");
     eprintln!("Use 'forge run' for now");
     let _ = path;
+    std::process::exit(1);
 }
 
 fn check_file(path: &str) {
@@ -806,7 +789,7 @@ fn check_file(path: &str) {
         Some(c) => c,
         None => {
             eprintln!("Self-hosted compiler not found");
-            return;
+            std::process::exit(1);
         }
     };
 
@@ -836,7 +819,10 @@ fn parse_file(path: &str) {
 fn lex_file(path: &str) {
     match get_tokens_from_compiler(path) {
         Ok(tokens) => println!("{}", tokens),
-        Err(e) => eprintln!("{}", e),
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
     }
 }
 

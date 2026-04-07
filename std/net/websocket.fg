@@ -7,10 +7,9 @@
 #   accept_value := compute_accept(client_key)
 #   response := handshake_response(client_key)
 
-# dependencies for WebSocket handshake computation
 import std.bytes as bytes
-from std.hash import sha1
-from std.encoding import b64_encode, from_hex
+import std.hash as hash
+import std.encoding as encoding
 
 # ===============================================================
 # WebSocket Constants
@@ -35,17 +34,27 @@ OP_PONG := 10    # Pong frame
 # 1. Concatenate key with magic GUID
 # 2. Compute SHA-1 hash
 # 3. Base64 encode the hash
+pub fn compute_accept_bytes(key: Bytes) -> String!:
+    buf := bytes.buffer_with_capacity(key.len() + WS_MAGIC.len())
+    buf.write(key)!
+    buf.write(bytes.from_string_utf8(WS_MAGIC))!
+    combined := buf.bytes()
+    digest_hex := hash.sha1(combined)
+    return encoding.b64_encode(encoding.from_hex(digest_hex)!)
+
 pub fn compute_accept(key: String) -> String!:
-    combined := key + WS_MAGIC
-    return b64_encode(from_hex(sha1(bytes.from_string_utf8(combined)))!)
+    return compute_accept_bytes(bytes.from_string_utf8(key))
 
 # Builds a complete HTTP 101 Switching Protocols response for WebSocket upgrade.
 # Takes the client's Sec-WebSocket-Key and returns the full HTTP response.
-pub fn handshake_response(key: String) -> String!:
-    mut accept := compute_accept(key)!
+pub fn handshake_response_bytes(key: Bytes) -> Bytes!:
+    accept := compute_accept_bytes(key)!
     mut response := "HTTP/1.1 101 Switching Protocols\r\n"
     response = response + "Upgrade: websocket\r\n"
     response = response + "Connection: Upgrade\r\n"
     response = response + "Sec-WebSocket-Accept: " + accept + "\r\n"
     response = response + "\r\n"
-    return response
+    return bytes.from_string_utf8(response)
+
+pub fn handshake_response(key: String) -> String!:
+    return handshake_response_bytes(bytes.from_string_utf8(key))!.to_string_utf8()!

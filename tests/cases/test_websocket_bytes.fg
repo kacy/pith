@@ -1,0 +1,18 @@
+import std.bytes as bytes
+import std.net.websocket as websocket
+
+fn main() -> Int!:
+    key := "dGhlIHNhbXBsZSBub25jZQ=="
+    accept := websocket.compute_accept(key)!
+    print(accept)
+
+    accept_bytes := websocket.compute_accept_bytes(bytes.from_string_utf8(key))!
+    print(accept_bytes)
+
+    response := websocket.handshake_response_bytes(bytes.from_string_utf8(key))!
+    text := response.to_string_utf8()!
+    if text.contains("HTTP/1.1 101 Switching Protocols"):
+        print("status ok")
+    if text.contains("Sec-WebSocket-Accept: " + accept):
+        print("accept ok")
+    return 0

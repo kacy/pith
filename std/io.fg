@@ -1,8 +1,8 @@
 # std.io — io interfaces and generic helpers
 #
 # this is the first pass at a shared io foundation for the stdlib.
-# phase one stays string-oriented because that's what the runtime exposes today,
-# but the shape is meant to grow into a bytes-first layer later.
+# the public surface still offers both string and bytes helpers, but
+# the transport-facing string layer now rides on top of bytes where it can.
 #
 # the key idea is simple:
 # - transports implement a small interface surface
@@ -371,13 +371,13 @@ fn tcp_stream_from_fd(fd: Int) -> TcpStream:
     return TcpStream(fd)
 
 fn tcp_stream_read(stream: TcpStream, max_bytes: Int) -> String!:
-    return tcp_read(stream.fd, max_bytes)
+    return tcp_stream_read_bytes(stream, max_bytes)!.to_string_utf8()!
 
 fn tcp_stream_read_bytes(stream: TcpStream, max_bytes: Int) -> Bytes!:
     return tcp_read_bytes(stream.fd, max_bytes)
 
 fn tcp_stream_write(stream: TcpStream, data: String) -> Int!:
-    return tcp_write(stream.fd, data)
+    return tcp_stream_write_bytes(stream, bytes.from_string_utf8(data))
 
 fn tcp_stream_write_bytes(stream: TcpStream, data: Bytes) -> Int!:
     return tcp_write_bytes(stream.fd, data)
@@ -398,13 +398,13 @@ fn file_stream_open_append(path: String) -> FileStream!:
     return FileStream(file_open_append(path)!)
 
 fn file_stream_read(stream: FileStream, max_bytes: Int) -> String!:
-    return file_read(stream.handle, max_bytes)
+    return file_stream_read_bytes(stream, max_bytes)!.to_string_utf8()!
 
 fn file_stream_read_bytes(stream: FileStream, max_bytes: Int) -> Bytes!:
     return file_read_bytes(stream.handle, max_bytes)
 
 fn file_stream_write(stream: FileStream, data: String) -> Int!:
-    return file_write(stream.handle, data)
+    return file_stream_write_bytes(stream, bytes.from_string_utf8(data))
 
 fn file_stream_write_bytes(stream: FileStream, data: Bytes) -> Int!:
     return file_write_bytes(stream.handle, data)
@@ -613,13 +613,13 @@ fn buffered_process_stderr_read_line(reader: BufferedProcessStderr) -> String!:
     return buffered_process_stderr_read_line_internal(reader)
 
 fn process_stdin_write(writer: ProcessStdin, data: String) -> Int!:
-    return process_write(writer.handle, data)
+    return process_stdin_write_bytes(writer, bytes.from_string_utf8(data))
 
 fn process_stdout_read(reader: ProcessStdout, max_bytes: Int) -> String!:
-    return process_read(reader.handle, max_bytes)
+    return process_stdout_read_bytes(reader, max_bytes)!.to_string_utf8()!
 
 fn process_stderr_read(reader: ProcessStderr, max_bytes: Int) -> String!:
-    return process_read_err(reader.handle, max_bytes)
+    return process_stderr_read_bytes(reader, max_bytes)!.to_string_utf8()!
 
 fn normalized_chunk_size(chunk_size: Int) -> Int:
     if chunk_size <= 0:

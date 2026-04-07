@@ -1562,10 +1562,16 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         if node.children.len() > 0:
             obj_r := ir_expr(node.children[0])
             obj_tid := c_get_expr_type(node.children[0])
+            expr_result_kind := ir_expr_result_kind(node.children[0])
             if obj_tid >= 0:
                 obj_info := get_type_info(obj_tid)
                 if obj_info.kind == "result":
                     if fname == "ok":
+                        if expr_result_kind == "result_int" or expr_result_kind == "result_bool":
+                            return ir_decode_result_value(obj_r, expr_result_kind)
+                        result_kind := ir_retkind(get_type_name(obj_info.inner))
+                        if result_kind == "result_int" or result_kind == "result_bool":
+                            return ir_decode_result_value(obj_r, result_kind)
                         return obj_r
                     if fname == "is_ok" or fname == "is_err":
                         zero := ir_reg()
@@ -1577,6 +1583,8 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
                             ir_emit("eq " + r.to_string() + " " + obj_r.to_string() + " " + zero.to_string())
                         return r
             if fname == "ok":
+                if expr_result_kind == "result_int" or expr_result_kind == "result_bool":
+                    return ir_decode_result_value(obj_r, expr_result_kind)
                 return obj_r
             if fname == "is_ok" or fname == "is_err":
                 zero := ir_reg()

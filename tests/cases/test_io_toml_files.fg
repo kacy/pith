@@ -1,0 +1,32 @@
+from std.toml import parse_file, parse_file_chunked, type_of, get_string, get_bool, get_table, get_array, array_len, keys
+from std.fs import write, exists, remove
+
+fn main() -> String!:
+    toml_path := "/tmp/forge_io_toml.toml"
+    newline := chr(10)
+
+    mut doc := "# sample" + newline
+    doc = doc + "title = " + chr(34) + "forge" + chr(34) + newline
+    doc = doc + "enabled = true" + newline
+    doc = doc + newline
+    doc = doc + "[server]" + newline
+    doc = doc + "host = " + chr(34) + "localhost" + chr(34) + newline
+    doc = doc + "ports = [8080, 8081]" + newline
+
+    print(write(toml_path, doc)!.to_string())
+
+    root := parse_file(toml_path)
+    print(type_of(root))
+    print(get_string(root, "title"))
+    print(get_bool(root, "enabled").to_string())
+
+    root_chunked := parse_file_chunked(toml_path, 3)
+    server := get_table(root_chunked, "server")
+    ports := get_array(server, "ports")
+    print(get_string(server, "host"))
+    print(array_len(ports).to_string())
+    print(keys(root_chunked).len().to_string())
+    print(exists(toml_path).to_string())
+
+    remove(toml_path)
+    return ""

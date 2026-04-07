@@ -22,6 +22,10 @@ process adapters.
 `std.csv` now uses those buffered file helpers directly for chunked reads and
 writes instead of dropping back to whole-file string helpers.
 
+`std.toml` can now come through the same imported-module path and parse config
+files through buffered file reads instead of staying stuck behind builtin-only
+special handling.
+
 ## the target
 
 we want something closer to the best parts of go's `io` package:

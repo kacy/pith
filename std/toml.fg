@@ -9,6 +9,11 @@
 #   db := get_table(root, "database")
 #   host := get_string(db, "host")
 
+from std.io import file_stream_open_read, file_stream_close
+from std.io import buffered_file_reader_chunked, buffered_file_reader_read
+
+TOML_FILE_CHUNK_SIZE := 4096
+
 # ===============================================================
 # Node Pool
 # ===============================================================
@@ -23,7 +28,7 @@ mut boolean_values: Map[Int, Bool] := {}
 
 # Table children: flat append-only storage with offset/count
 mut table_keys_flat: List[String] := []
-mut table_values_flat: List[Int] := {}
+mut table_values_flat: List[Int] := []
 mut table_key_offsets: Map[Int, Int] := {}
 mut table_key_counts: Map[Int, Int] := {}
 
@@ -336,6 +341,9 @@ fn ensure_table_path(root: Int, path: String) -> Int:
 # Parses a TOML string and returns a root table handle.
 # Returns -1 on parse error. The root is a table containing all top-level keys.
 pub fn parse(input: String) -> Int:
+    return toml_parse(input)
+
+fn toml_parse(input: String) -> Int:
     parser_input = input
     parser_position = 0
     parser_error = false
@@ -382,6 +390,37 @@ pub fn parse(input: String) -> Int:
         return 0 - 1
     return root
 
+pub fn parse_file(path: String) -> Int:
+    return toml_parse_file(path)
+
+fn toml_parse_file(path: String) -> Int:
+    return toml_parse_file_chunked(path, TOML_FILE_CHUNK_SIZE)
+
+pub fn parse_file_chunked(path: String, chunk_size: Int) -> Int:
+    return toml_parse_file_chunked(path, chunk_size)
+
+fn toml_parse_file_chunked(path: String, chunk_size: Int) -> Int:
+    stream_result := file_stream_open_read(path)
+    if stream_result.is_err:
+        return 0 - 1
+    stream := stream_result.ok
+    reader := buffered_file_reader_chunked(stream, chunk_size)
+    mut data := ""
+    mut chunk_result := buffered_file_reader_read(reader, chunk_size)
+    if chunk_result.is_err:
+        file_stream_close(stream)
+        return 0 - 1
+    mut chunk := chunk_result.ok
+    while chunk.len() > 0:
+        data = data + chunk
+        chunk_result = buffered_file_reader_read(reader, chunk_size)
+        if chunk_result.is_err:
+            file_stream_close(stream)
+            return 0 - 1
+        chunk = chunk_result.ok
+    file_stream_close(stream)
+    return toml_parse(data)
+
 # ===============================================================
 # Public API — Type and Introspection
 # ===============================================================
@@ -389,6 +428,9 @@ pub fn parse(input: String) -> Int:
 # Returns the type of a node: "string", "int", "float", "bool", "table", or "array".
 # Returns "invalid" for invalid handles.
 pub fn type_of(handle: Int) -> String:
+    return toml_type_of(handle)
+
+fn toml_type_of(handle: Int) -> String:
     if not is_valid_handle(handle):
         return "invalid"
     return node_types[handle]
@@ -399,6 +441,9 @@ pub fn type_of(handle: Int) -> String:
 
 # Gets a string value by key from a table. Returns empty string if not found or wrong type.
 pub fn get_string(handle: Int, key: String) -> String:
+    return toml_get_string(handle, key)
+
+fn toml_get_string(handle: Int, key: String) -> String:
     v := table_lookup(handle, key)
     if v >= 0 and node_types[v] == "string":
         return string_values[v]
@@ -406,6 +451,9 @@ pub fn get_string(handle: Int, key: String) -> String:
 
 # Gets an integer value by key from a table. Returns 0 if not found or wrong type.
 pub fn get_int(handle: Int, key: String) -> Int:
+    return toml_get_int(handle, key)
+
+fn toml_get_int(handle: Int, key: String) -> Int:
     v := table_lookup(handle, key)
     if v >= 0 and node_types[v] == "int":
         return integer_values[v]
@@ -413,6 +461,9 @@ pub fn get_int(handle: Int, key: String) -> Int:
 
 # Gets a float value by key from a table. Returns 0.0 if not found or wrong type.
 pub fn get_float(handle: Int, key: String) -> Float:
+    return toml_get_float(handle, key)
+
+fn toml_get_float(handle: Int, key: String) -> Float:
     v := table_lookup(handle, key)
     if v >= 0 and node_types[v] == "float":
         return float_values[v]
@@ -420,6 +471,9 @@ pub fn get_float(handle: Int, key: String) -> Float:
 
 # Gets a boolean value by key from a table. Returns false if not found or wrong type.
 pub fn get_bool(handle: Int, key: String) -> Bool:
+    return toml_get_bool(handle, key)
+
+fn toml_get_bool(handle: Int, key: String) -> Bool:
     v := table_lookup(handle, key)
     if v >= 0 and node_types[v] == "bool":
         return boolean_values[v]
@@ -427,6 +481,9 @@ pub fn get_bool(handle: Int, key: String) -> Bool:
 
 # Gets a sub-table handle by key. Returns -1 if not found or not a table.
 pub fn get_table(handle: Int, key: String) -> Int:
+    return toml_get_table(handle, key)
+
+fn toml_get_table(handle: Int, key: String) -> Int:
     v := table_lookup(handle, key)
     if v >= 0 and node_types[v] == "table":
         return v
@@ -434,6 +491,9 @@ pub fn get_table(handle: Int, key: String) -> Int:
 
 # Gets an array handle by key. Returns -1 if not found or not an array.
 pub fn get_array(handle: Int, key: String) -> Int:
+    return toml_get_array(handle, key)
+
+fn toml_get_array(handle: Int, key: String) -> Int:
     v := table_lookup(handle, key)
     if v >= 0 and node_types[v] == "array":
         return v
@@ -445,12 +505,18 @@ pub fn get_array(handle: Int, key: String) -> Int:
 
 # Returns the number of elements in an array. Returns 0 for non-arrays.
 pub fn array_len(handle: Int) -> Int:
+    return toml_array_len(handle)
+
+fn toml_array_len(handle: Int) -> Int:
     if not is_valid_handle(handle) or node_types[handle] != "array":
         return 0
     return array_item_counts[handle]
 
 # Gets the handle of an array element by index. Returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
+    return toml_array_get(handle, index)
+
+fn toml_array_get(handle: Int, index: Int) -> Int:
     if not is_valid_handle(handle) or node_types[handle] != "array":
         return 0 - 1
     if index < 0 or index >= array_item_counts[handle]:
@@ -463,6 +529,9 @@ pub fn array_get(handle: Int, index: Int) -> Int:
 
 # Returns the list of keys in a table (insertion order).
 pub fn keys(handle: Int) -> List[String]:
+    return toml_keys(handle)
+
+fn toml_keys(handle: Int) -> List[String]:
     mut result: List[String] := []
     if not is_valid_handle(handle) or node_types[handle] != "table":
         return result
@@ -476,4 +545,7 @@ pub fn keys(handle: Int) -> List[String]:
 
 # Returns true if a table contains the specified key.
 pub fn has(handle: Int, key: String) -> Bool:
+    return toml_has(handle, key)
+
+fn toml_has(handle: Int, key: String) -> Bool:
     return table_lookup(handle, key) >= 0

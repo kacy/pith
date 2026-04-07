@@ -1,0 +1,28 @@
+import std.bytes as bytes
+import std.net.http as http
+import std.io as io
+
+fn main() -> Int!:
+    crlf := chr(13) + chr(10)
+    mut header := "POST /upload?mode=raw HTTP/1.1" + crlf
+    header = header + "Host: example.com" + crlf
+    header = header + "Content-Length: 3" + crlf
+    header = header + crlf
+
+    buf := bytes.buffer()
+    buf.write(bytes.from_string_utf8(header))!
+    buf.write_byte(65)!
+    buf.write_byte(0)!
+    buf.write_byte(66)!
+
+    req := http.read_request_buffered_bytes(io.bytes_reader(buf.bytes()).buffered_chunked(4))!
+    print(req.method())
+    print(req.path())
+    print(req.query())
+    print(req.header("host"))
+    print(req.header("content-length"))
+    print(req.body_bytes().len().to_string())
+    print(req.body_bytes()[0].to_string())
+    print(req.body_bytes()[1].to_string())
+    print(req.body_bytes()[2].to_string())
+    return 0

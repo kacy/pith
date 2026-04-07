@@ -13,7 +13,7 @@
 #           http.send_response(fd, http.not_found())
 
 import std.bytes as bytes
-from std.io import BufferedStringReader, BufferedTcpStream
+from std.io import BufferedBytesReader, BufferedStringReader, BufferedTcpStream
 import std.io as io
 
 # ===============================================================
@@ -23,6 +23,10 @@ import std.io as io
 pub MIME_TEXT := "text/plain"
 pub MIME_HTML := "text/html"
 pub MIME_JSON := "application/json"
+
+pub struct HttpRequestBytes:
+    pub request: String
+    pub body: Bytes
 
 fn str_eq(a: String, b: String) -> Bool:
     if a.len() != b.len():
@@ -130,6 +134,31 @@ pub fn parse_request(raw: String) -> String:
     p = p + sep
     p = p + req_body
     return p
+
+impl HttpRequestBytes:
+    fn method() -> String:
+        return method(self.request)
+
+    fn path() -> String:
+        return path(self.request)
+
+    fn query() -> String:
+        return query(self.request)
+
+    fn version() -> String:
+        return version(self.request)
+
+    fn headers() -> String:
+        return headers(self.request)
+
+    fn header(name: String) -> String:
+        return get_header(self.request, name)
+
+    fn body_bytes() -> Bytes:
+        return self.body
+
+    fn body_text() -> String!:
+        return self.body.to_string_utf8()!
 
 # ===============================================================
 # Request Accessors
@@ -359,6 +388,48 @@ fn content_length_from_head(raw_head: String) -> Int!:
         return 0
     return parse_int(length_text)
 
+fn find_request_head_end(raw: Bytes) -> Int:
+    mut i := 0
+    while i < raw.len() - 3:
+        if raw[i] == 13 and raw[i + 1] == 10 and raw[i + 2] == 13 and raw[i + 3] == 10:
+            return i + 4
+        i = i + 1
+    i = 0
+    while i < raw.len() - 1:
+        if raw[i] == 10 and raw[i + 1] == 10:
+            return i + 2
+        i = i + 1
+    return -1
+
+fn read_request_from_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestBytes!:
+    chunk_size := 1024
+    buf := bytes.buffer_with_capacity(chunk_size)
+    mut body_start := -1
+    while body_start < 0:
+        chunk := reader.read_bytes(chunk_size)!
+        if chunk.is_empty():
+            return HttpRequestBytes(parse_request(""), bytes.empty())
+        buf.write(chunk)!
+        body_start = find_request_head_end(buf.bytes())
+
+    raw := buf.bytes()
+    head_bytes := raw.slice(0, body_start)
+    head_text := head_bytes.to_string_utf8()!
+    content_length := content_length_from_head(head_text)!
+
+    body_buf := bytes.buffer_with_capacity(content_length)
+    if body_start < raw.len():
+        body_buf.write(raw.slice(body_start, raw.len()))!
+
+    while body_buf.bytes().len() < content_length:
+        remaining := content_length - body_buf.bytes().len()
+        chunk := reader.read_bytes(remaining)!
+        if chunk.is_empty():
+            break
+        body_buf.write(chunk)!
+
+    return HttpRequestBytes(parse_request(head_text), body_buf.bytes())
+
 fn read_request_from_buffered_string(reader: BufferedStringReader) -> String!:
     crlf := chr(13) + chr(10)
     request_line := reader.read_line()!
@@ -402,6 +473,14 @@ pub fn read_request(fd: Int) -> String!:
     stream := io.from_fd(fd)
     reader := stream.buffered_reader()
     return read_request_from_buffered_tcp(reader)
+
+pub fn read_request_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestBytes!:
+    return read_request_from_buffered_bytes(reader)
+
+pub fn read_request_bytes(fd: Int) -> HttpRequestBytes!:
+    stream := io.from_fd(fd)
+    reader := stream.buffered_bytes_reader()
+    return read_request_from_buffered_bytes(reader)
 
 pub fn send_response_bytes(fd: Int, response: Bytes) -> Int!:
     stream := io.from_fd(fd)

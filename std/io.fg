@@ -120,6 +120,22 @@ struct BufferedProcessStdout:
 struct BufferedProcessStderr:
     pub handle: Int
 
+impl StringReader:
+    fn read(max_bytes: Int) -> String!:
+        return string_reader_read(self, max_bytes)
+
+impl Reader for StringReader:
+    fn read(max_bytes: Int) -> String!:
+        return string_reader_read(self, max_bytes)
+
+impl StringBuffer:
+    fn write(data: String) -> Int!:
+        return string_buffer_write(self, data)
+
+impl Writer for StringBuffer:
+    fn write(data: String) -> Int!:
+        return string_buffer_write(self, data)
+
 pub fn string_reader(data: String) -> StringReader:
     handle := next_string_reader_handle
     next_string_reader_handle = next_string_reader_handle + 1
@@ -140,10 +156,7 @@ pub fn buffered_string_reader_chunked(reader: StringReader, chunk_size: Int) -> 
     handle := next_buffered_string_reader_handle
     next_buffered_string_reader_handle = next_buffered_string_reader_handle + 1
 
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     buffered_string_reader_sources.insert(handle, reader.handle)
     buffered_string_reader_chunk_sizes.insert(handle, size)
     buffered_string_reader_cache.insert(handle, "")
@@ -156,10 +169,7 @@ pub fn buffered_string_writer_chunked(writer: StringBuffer, chunk_size: Int) -> 
     handle := next_buffered_string_writer_handle
     next_buffered_string_writer_handle = next_buffered_string_writer_handle + 1
 
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     buffered_string_writer_targets.insert(handle, writer.handle)
     buffered_string_writer_chunk_sizes.insert(handle, size)
     buffered_string_writer_cache.insert(handle, "")
@@ -172,10 +182,7 @@ pub fn buffered_tcp_stream_chunked(stream: TcpStream, chunk_size: Int) -> Buffer
     handle := next_buffered_tcp_stream_handle
     next_buffered_tcp_stream_handle = next_buffered_tcp_stream_handle + 1
 
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     buffered_tcp_stream_fds.insert(handle, stream.fd)
     buffered_tcp_stream_chunk_sizes.insert(handle, size)
     buffered_tcp_stream_cache.insert(handle, "")
@@ -188,10 +195,7 @@ pub fn buffered_tcp_writer_chunked(writer: TcpStream, chunk_size: Int) -> Buffer
     handle := next_buffered_tcp_writer_handle
     next_buffered_tcp_writer_handle = next_buffered_tcp_writer_handle + 1
 
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     buffered_tcp_writer_fds.insert(handle, writer.fd)
     buffered_tcp_writer_chunk_sizes.insert(handle, size)
     buffered_tcp_writer_cache.insert(handle, "")
@@ -204,10 +208,7 @@ pub fn buffered_file_reader_chunked(stream: FileStream, chunk_size: Int) -> Buff
     handle := next_buffered_file_reader_handle
     next_buffered_file_reader_handle = next_buffered_file_reader_handle + 1
 
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     buffered_file_reader_handles.insert(handle, stream.handle)
     buffered_file_reader_chunk_sizes.insert(handle, size)
     buffered_file_reader_cache.insert(handle, "")
@@ -220,10 +221,7 @@ pub fn buffered_file_writer_chunked(stream: FileStream, chunk_size: Int) -> Buff
     handle := next_buffered_file_writer_handle
     next_buffered_file_writer_handle = next_buffered_file_writer_handle + 1
 
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     buffered_file_writer_handles.insert(handle, stream.handle)
     buffered_file_writer_chunk_sizes.insert(handle, size)
     buffered_file_writer_cache.insert(handle, "")
@@ -236,10 +234,7 @@ pub fn buffered_process_stdout_chunked(reader: ProcessStdout, chunk_size: Int) -
     handle := next_buffered_process_stdout_handle
     next_buffered_process_stdout_handle = next_buffered_process_stdout_handle + 1
 
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     buffered_process_stdout_handles.insert(handle, reader.handle)
     buffered_process_stdout_chunk_sizes.insert(handle, size)
     buffered_process_stdout_cache.insert(handle, "")
@@ -252,10 +247,7 @@ pub fn buffered_process_stderr_chunked(reader: ProcessStderr, chunk_size: Int) -
     handle := next_buffered_process_stderr_handle
     next_buffered_process_stderr_handle = next_buffered_process_stderr_handle + 1
 
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     buffered_process_stderr_handles.insert(handle, reader.handle)
     buffered_process_stderr_chunk_sizes.insert(handle, size)
     buffered_process_stderr_cache.insert(handle, "")
@@ -389,14 +381,21 @@ pub fn process_stdout_read(reader: ProcessStdout, max_bytes: Int) -> String!:
 pub fn process_stderr_read(reader: ProcessStderr, max_bytes: Int) -> String!:
     return process_read_err(reader.handle, max_bytes)
 
+fn normalized_chunk_size(chunk_size: Int) -> Int:
+    if chunk_size <= 0:
+        return DEFAULT_CHUNK_SIZE
+    return chunk_size
+
+fn unread_after_write(data: String, wrote: Int) -> String:
+    if wrote >= data.len():
+        return ""
+    return data.substring(wrote, data.len())
+
 pub fn read_all_string(reader: StringReader) -> String!:
     return read_all_string_chunked(reader, DEFAULT_CHUNK_SIZE)
 
 pub fn read_all_string_chunked(reader: StringReader, chunk_size: Int) -> String!:
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     mut result := ""
     mut chunk := string_reader_read(reader, size)!
     while chunk.len() > 0:
@@ -407,56 +406,41 @@ pub fn read_all_string_chunked(reader: StringReader, chunk_size: Int) -> String!
 pub fn write_all_string(writer: StringBuffer, data: String) -> Int!:
     mut total := 0
     mut remaining := data
-
     while remaining.len() > 0:
         wrote := string_buffer_write(writer, remaining)!
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
-        if wrote >= remaining.len():
-            remaining = ""
-        else:
-            remaining = remaining.substring(wrote, remaining.len())
+        remaining = unread_after_write(remaining, wrote)
     return total
 
 pub fn write_all_tcp_stream(writer: TcpStream, data: String) -> Int!:
     mut total := 0
     mut remaining := data
-
     while remaining.len() > 0:
         wrote := tcp_stream_write(writer, remaining)!
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
-        if wrote >= remaining.len():
-            remaining = ""
-        else:
-            remaining = remaining.substring(wrote, remaining.len())
+        remaining = unread_after_write(remaining, wrote)
     return total
 
 pub fn write_all_file_stream(writer: FileStream, data: String) -> Int!:
     mut total := 0
     mut remaining := data
-
     while remaining.len() > 0:
         wrote := file_stream_write(writer, remaining)!
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
-        if wrote >= remaining.len():
-            remaining = ""
-        else:
-            remaining = remaining.substring(wrote, remaining.len())
+        remaining = unread_after_write(remaining, wrote)
     return total
 
 pub fn copy_string(reader: StringReader, writer: StringBuffer) -> Int!:
     return copy_string_chunked(reader, writer, DEFAULT_CHUNK_SIZE)
 
 pub fn copy_string_chunked(reader: StringReader, writer: StringBuffer, chunk_size: Int) -> Int!:
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     mut total := 0
     mut chunk := string_reader_read(reader, size)!
     while chunk.len() > 0:
@@ -468,10 +452,7 @@ pub fn read_all_tcp_stream(stream: TcpStream) -> String!:
     return read_all_tcp_stream_chunked(stream, DEFAULT_CHUNK_SIZE)
 
 pub fn read_all_tcp_stream_chunked(stream: TcpStream, chunk_size: Int) -> String!:
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     mut result := ""
     mut chunk := tcp_stream_read(stream, size)!
     while chunk.len() > 0:
@@ -483,10 +464,7 @@ pub fn read_all_file_stream(stream: FileStream) -> String!:
     return read_all_file_stream_chunked(stream, DEFAULT_CHUNK_SIZE)
 
 pub fn read_all_file_stream_chunked(stream: FileStream, chunk_size: Int) -> String!:
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     mut result := ""
     mut chunk := file_stream_read(stream, size)!
     while chunk.len() > 0:
@@ -497,26 +475,19 @@ pub fn read_all_file_stream_chunked(stream: FileStream, chunk_size: Int) -> Stri
 pub fn write_all_process_stdin(writer: ProcessStdin, data: String) -> Int!:
     mut total := 0
     mut remaining := data
-
     while remaining.len() > 0:
         wrote := process_stdin_write(writer, remaining)!
         if wrote <= 0:
             fail "write returned 0"
         total = total + wrote
-        if wrote >= remaining.len():
-            remaining = ""
-        else:
-            remaining = remaining.substring(wrote, remaining.len())
+        remaining = unread_after_write(remaining, wrote)
     return total
 
 pub fn read_all_process_stdout(reader: ProcessStdout) -> String!:
     return read_all_process_stdout_chunked(reader, DEFAULT_CHUNK_SIZE)
 
 pub fn read_all_process_stdout_chunked(reader: ProcessStdout, chunk_size: Int) -> String!:
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     mut result := ""
     mut chunk := process_stdout_read(reader, size)!
     while chunk.len() > 0:
@@ -528,10 +499,7 @@ pub fn read_all_process_stderr(reader: ProcessStderr) -> String!:
     return read_all_process_stderr_chunked(reader, DEFAULT_CHUNK_SIZE)
 
 pub fn read_all_process_stderr_chunked(reader: ProcessStderr, chunk_size: Int) -> String!:
-    mut size := chunk_size
-    if size <= 0:
-        size = DEFAULT_CHUNK_SIZE
-
+    size := normalized_chunk_size(chunk_size)
     mut result := ""
     mut chunk := process_stderr_read(reader, size)!
     while chunk.len() > 0:

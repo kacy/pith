@@ -10,7 +10,7 @@
 #       print(object_keys(root).join(", "))
 
 from std.io import file_stream_open_read, file_stream_open_write, file_stream_close
-from std.io import buffered_file_reader_chunked, buffered_file_reader_read
+from std.io import read_all_file_stream_chunked
 from std.io import buffered_file_writer_chunked, buffered_file_writer_write, buffered_file_writer_flush
 
 JSON_FILE_CHUNK_SIZE := 4096
@@ -322,20 +322,11 @@ fn json_parse_file_chunked(path: String, chunk_size: Int) -> Int:
     if stream_result.is_err:
         return 0 - 1
     stream := stream_result.ok
-    reader := buffered_file_reader_chunked(stream, chunk_size)
-    mut data := ""
-    mut chunk_result := buffered_file_reader_read(reader, chunk_size)
-    if chunk_result.is_err:
+    data_result := read_all_file_stream_chunked(stream, chunk_size)
+    if data_result.is_err:
         file_stream_close(stream)
         return 0 - 1
-    mut chunk := chunk_result.ok
-    while chunk.len() > 0:
-        data = data + chunk
-        chunk_result = buffered_file_reader_read(reader, chunk_size)
-        if chunk_result.is_err:
-            file_stream_close(stream)
-            return 0 - 1
-        chunk = chunk_result.ok
+    data := data_result.ok
     file_stream_close(stream)
     return json_parse(data)
 

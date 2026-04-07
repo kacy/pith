@@ -1,9 +1,6 @@
 # test std.net.http — request parsing, headers, query params, responses
 
-from std.net.http import parse_request, method, path, query, version, body
-from std.net.http import get_header, get_query_param
-from std.net.http import html_response, json_response, text_response
-from std.net.http import not_found, redirect
+import std.net.http as http
 
 fn main():
     crlf := chr(13) + chr(10)
@@ -14,49 +11,49 @@ fn main():
     raw = raw + "User-Agent: ForgeTest/1.0" + crlf
     raw = raw + "Accept: text/html" + crlf
     raw = raw + crlf
-    req := parse_request(raw)
-    print("method: " + method(req))
-    print("path: " + path(req))
-    print("query: " + query(req))
-    print("version: " + version(req))
+    req := http.parse_request(raw)
+    print("method: " + http.method(req))
+    print("path: " + http.path(req))
+    print("query: " + http.query(req))
+    print("version: " + http.version(req))
 
     # header access (case-insensitive)
-    print("host: " + get_header(req, "Host"))
-    print("agent: " + get_header(req, "user-agent"))
-    print("missing: " + get_header(req, "X-Missing"))
+    print("host: " + http.get_header(req, "Host"))
+    print("agent: " + http.get_header(req, "user-agent"))
+    print("missing: " + http.get_header(req, "X-Missing"))
 
     # query param access
-    print("q: " + get_query_param(req, "q"))
-    print("lang: " + get_query_param(req, "lang"))
-    print("missing: " + get_query_param(req, "foo"))
+    print("q: " + http.get_query_param(req, "q"))
+    print("lang: " + http.get_query_param(req, "lang"))
+    print("missing: " + http.get_query_param(req, "foo"))
 
     # parse a POST with body
     mut raw2 := "POST /api/data HTTP/1.1" + crlf
     raw2 = raw2 + "Content-Type: application/json" + crlf
     raw2 = raw2 + crlf
     raw2 = raw2 + "hello post body"
-    req2 := parse_request(raw2)
-    print("post method: " + method(req2))
-    print("post path: " + path(req2))
-    print("post type: " + get_header(req2, "Content-Type"))
-    print("post body: " + body(req2))
+    req2 := http.parse_request(raw2)
+    print("post method: " + http.method(req2))
+    print("post path: " + http.path(req2))
+    print("post type: " + http.get_header(req2, "Content-Type"))
+    print("post body: " + http.body(req2))
 
     # response builders
-    r1 := html_response(200, "<h1>ok</h1>")
+    r1 := http.html_response(200, "<h1>ok</h1>")
     if r1.contains("200 OK"):
         print("html 200: ok")
     if r1.contains("text/html"):
         print("html mime: ok")
 
-    r2 := json_response(201, "[]")
+    r2 := http.json_response(201, "[]")
     if r2.contains("201 Created"):
         print("json 201: ok")
 
-    r3 := not_found()
+    r3 := http.not_found()
     if r3.contains("404"):
         print("not found: ok")
 
-    r4 := redirect("/new")
+    r4 := http.redirect("/new")
     if r4.contains("301"):
         print("redirect: ok")
     if r4.contains("/new"):

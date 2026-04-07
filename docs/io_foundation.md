@@ -125,8 +125,9 @@ bytes-first than the original string-only start.
 that is already visible in a couple of places:
 - `std.net.http` can preserve request bodies as `Bytes` and only decode headers
   or bodies when the caller asks for text
-- `std.net.websocket` now has bytes-first handshake and frame helpers, including
-  masked client frames and buffered frame reads
+- `std.net.websocket` now has bytes-first handshake, frame, and session helpers,
+  including `dial(...)`, `upgrade(...)`, buffered frame reads, and an in-memory
+  `from_buffered(...)` path that keeps protocol tests deterministic
 
 but the right way to get there was to land a useful shared core first, move
 real stdlib code onto it, and then extend the shape from working users instead

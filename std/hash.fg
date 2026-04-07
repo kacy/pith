@@ -1,31 +1,25 @@
 # std.hash — cryptographic and non-cryptographic hashing
 #
-# Provides SHA-256 (FIPS 180-4), SHA-1 (RFC 3174), and FNV-1a hash functions.
-# SHA-256 returns a 64-character lowercase hex string.
-# SHA-1 returns a 40-character lowercase hex string.
-# FNV-1a returns a 32-bit integer suitable for hash tables.
+# the raw hashing surface is bytes-first.
+# string helpers stay around as explicit utf-8 wrappers so text hashing
+# still reads clearly at call sites.
 #
-#   from std.hash import sha256, fnv1a
-#   digest := sha256("hello world")
-#   bucket := fnv1a("key") % 64
+#   import std.bytes as bytes
+#   import std.hash as hash
+#   digest := hash.sha256(bytes.from_string_utf8("hello world"))
+#   bucket := hash.fnv1a_string("key") % 64
 
-# ===============================================================
-# SHA-256 Implementation (FIPS 180-4)
-# ===============================================================
+import std.bytes as bytes
 
-# 32-bit mask for SHA-256 word operations
 fn mask32(value: Int) -> Int:
     return bit_and(value, 4294967295)
 
-# 32-bit right rotation for SHA-256
 fn rotate_right(value: Int, bits: Int) -> Int:
     return mask32(bit_or(bit_shr(value, bits), bit_shl(value, 32 - bits)))
 
-# SHA-256 round constants (first 32 bits of fractional cube roots of first 64 primes)
 mut sha256_round_constants: List[Int] := []
 mut constants_initialized: Bool := false
 
-# Lazy initialization of SHA-256 constants
 fn sha_init():
     if constants_initialized:
         return
@@ -95,23 +89,19 @@ fn sha_init():
     sha256_round_constants.push(3204031479)
     sha256_round_constants.push(3329325298)
 
-# Converts a 32-bit word to an 8-character hex string
 fn word32_to_hex(val: Int) -> String:
     hex := "0123456789abcdef"
     mut result := ""
     mut i := 0
     while i < 8:
-        nibble := bit_and(bit_shr(val, (28 - i * 4)), 15)
+        nibble := bit_and(bit_shr(val, 28 - i * 4), 15)
         result = result + hex[nibble]
         i = i + 1
     return result
 
-# Computes SHA-256 hash of a string, returned as 64-char lowercase hex.
-# Implements FIPS 180-4 standard for cryptographic hashing.
-pub fn sha256(input: String) -> String:
+pub fn sha256(input: Bytes) -> String:
     sha_init()
 
-    # Initial hash values (first 32 bits of fractional square roots of first 8 primes)
     mut h0 := 1779033703
     mut h1 := 3144134277
     mut h2 := 1013904242
@@ -121,21 +111,16 @@ pub fn sha256(input: String) -> String:
     mut h6 := 528734635
     mut h7 := 1541459225
 
-    # build padded message as list of bytes
     mut msg: List[Int] := []
     mut i := 0
     while i < input.len():
-        msg.push(ord(input[i]))
+        msg.push(input[i])
         i = i + 1
 
-    # append 0x80
     msg.push(128)
-
-    # pad with zeros until length is 56 mod 64
     while msg.len() % 64 != 56:
         msg.push(0)
 
-    # append 8-byte big-endian bit length
     bit_len := input.len() * 8
     msg.push(bit_and(bit_shr(bit_len, 56), 255))
     msg.push(bit_and(bit_shr(bit_len, 48), 255))
@@ -146,10 +131,8 @@ pub fn sha256(input: String) -> String:
     msg.push(bit_and(bit_shr(bit_len, 8), 255))
     msg.push(bit_and(bit_len, 255))
 
-    # process each 64-byte block
     mut block := 0
     while block < msg.len():
-        # build message schedule (16 words from block + 48 extended)
         mut w: List[Int] := []
         i = 0
         while i < 16:
@@ -163,7 +146,6 @@ pub fn sha256(input: String) -> String:
             w.push(mask32(w[i - 16] + s0 + w[i - 7] + s1))
             i = i + 1
 
-        # working variables
         mut a := h0
         mut b := h1
         mut c := h2
@@ -173,7 +155,6 @@ pub fn sha256(input: String) -> String:
         mut g := h6
         mut h := h7
 
-        # 64 rounds
         i = 0
         while i < 64:
             s1 := bit_xor(bit_xor(rotate_right(e, 6), rotate_right(e, 11)), rotate_right(e, 25))
@@ -200,72 +181,65 @@ pub fn sha256(input: String) -> String:
         h5 = mask32(h5 + f)
         h6 = mask32(h6 + g)
         h7 = mask32(h7 + h)
-
         block = block + 64
 
-    # produce 64-char hex string
     return word32_to_hex(h0) + word32_to_hex(h1) + word32_to_hex(h2) + word32_to_hex(h3) + word32_to_hex(h4) + word32_to_hex(h5) + word32_to_hex(h6) + word32_to_hex(h7)
 
-# ===============================================================
-# FNV-1a Hash (32-bit)
-# ===============================================================
+fn hash_sha256(input: Bytes) -> String:
+    return sha256(input)
 
-# Computes FNV-1a hash (32-bit) of a string, returned as Int.
-# Fast, non-cryptographic hash suitable for hash tables and checksums.
-pub fn fnv1a(input: String) -> Int:
+pub fn sha256_string(input: String) -> String:
+    return sha256(bytes.from_string_utf8(input))
+
+fn hash_sha256_string(input: String) -> String:
+    return sha256_string(input)
+
+pub fn fnv1a(input: Bytes) -> Int:
     mut h := 2166136261
     mut i := 0
     while i < input.len():
-        h = bit_xor(h, ord(input[i]))
+        h = bit_xor(h, input[i])
         h = bit_and(h * 16777619, 4294967295)
         i = i + 1
     return h
 
-# ===============================================================
-# SHA-1 Implementation (RFC 3174)
-# ===============================================================
-# Note: SHA-1 is cryptographically broken. Provided for compatibility
-# with legacy protocols (e.g., WebSocket handshake).
+fn hash_fnv1a(input: Bytes) -> Int:
+    return fnv1a(input)
 
-# SHA-1 round constants
-K0 := 1518500249   # 0x5A827999 for rounds 0-19
-K1 := 1859775393   # 0x6ED9EBA1 for rounds 20-39
-K2 := 2400959708   # 0x8F1BBCDC for rounds 40-59
-K3 := 3395469782   # 0xCA62C1D6 for rounds 60-79
+pub fn fnv1a_string(input: String) -> Int:
+    return fnv1a(bytes.from_string_utf8(input))
 
-# 32-bit left rotation
+fn hash_fnv1a_string(input: String) -> Int:
+    return fnv1a_string(input)
+
+K0 := 1518500249
+K1 := 1859775393
+K2 := 2400959708
+K3 := 3395469782
+
 fn rotl32(x: Int, n: Int) -> Int:
     return bit_or(bit_shl(x, n), bit_shr(x, 32 - n))
 
-# 32-bit addition with overflow protection
 fn add32(a: Int, b: Int) -> Int:
     return bit_and(a + b, 4294967295)
 
-# Computes SHA-1 hash of a string, returned as 40-char hex.
-# Legacy algorithm - prefer SHA-256 for new applications.
-pub fn sha1(input: String) -> String:
-    # Initial hash values
-    mut h0 := 1732584193   # 0x67452301
-    mut h1 := 4023233417   # 0xEFCDAB89
-    mut h2 := 2562383102   # 0x98BADCFE
-    mut h3 := 271733878    # 0x10325476
-    mut h4 := 3285377520   # 0xC3D2E1F0
-    
-    # Build padded message
+pub fn sha1(input: Bytes) -> String:
+    mut h0 := 1732584193
+    mut h1 := 4023233417
+    mut h2 := 2562383102
+    mut h3 := 271733878
+    mut h4 := 3285377520
+
     mut msg: List[Int] := []
     mut i := 0
     while i < input.len():
-        msg.push(ord(input[i]))
+        msg.push(input[i])
         i = i + 1
-    
-    # Append 0x80
+
     msg.push(128)
-    
-    # Pad with zeros until length is 56 mod 64
     while msg.len() % 64 != 56:
         msg.push(0)
-    
-    # Append 8-byte big-endian bit length
+
     bit_len := input.len() * 8
     msg.push(bit_and(bit_shr(bit_len, 56), 255))
     msg.push(bit_and(bit_shr(bit_len, 48), 255))
@@ -275,39 +249,32 @@ pub fn sha1(input: String) -> String:
     msg.push(bit_and(bit_shr(bit_len, 16), 255))
     msg.push(bit_and(bit_shr(bit_len, 8), 255))
     msg.push(bit_and(bit_len, 255))
-    
-    # Process each 64-byte block
+
     mut block := 0
     while block < msg.len():
-        # Prepare message schedule W[0..79]
         mut w: List[Int] := []
-        
-        # First 16 words from block
         i = 0
         while i < 16:
             word := msg[block + i * 4] * 16777216 + msg[block + i * 4 + 1] * 65536 + msg[block + i * 4 + 2] * 256 + msg[block + i * 4 + 3]
             w.push(word)
             i = i + 1
-        
-        # Extend to 80 words
+
         i = 16
         while i < 80:
             w.push(rotl32(bit_xor(bit_xor(bit_xor(w[i - 3], w[i - 8]), w[i - 14]), w[i - 16]), 1))
             i = i + 1
-        
-        # Initialize working variables
+
         mut a := h0
         mut b := h1
         mut c := h2
         mut d := h3
         mut e := h4
-        
-        # Main loop
+
         i = 0
         while i < 80:
             mut f := 0
             mut k := 0
-            
+
             if i < 20:
                 f = bit_or(bit_and(b, c), bit_and(bit_not(b), d))
                 k = K0
@@ -320,24 +287,29 @@ pub fn sha1(input: String) -> String:
             else:
                 f = bit_xor(bit_xor(b, c), d)
                 k = K3
-            
+
             temp := add32(add32(add32(add32(rotl32(a, 5), f), e), k), w[i])
             e = d
             d = c
             c = rotl32(b, 30)
             b = a
             a = temp
-            
             i = i + 1
-        
-        # Add to hash
+
         h0 = add32(h0, a)
         h1 = add32(h1, b)
         h2 = add32(h2, c)
         h3 = add32(h3, d)
         h4 = add32(h4, e)
-        
         block = block + 64
-    
-    # Produce 40-char hex string
+
     return word32_to_hex(h0) + word32_to_hex(h1) + word32_to_hex(h2) + word32_to_hex(h3) + word32_to_hex(h4)
+
+fn hash_sha1(input: Bytes) -> String:
+    return sha1(input)
+
+pub fn sha1_string(input: String) -> String:
+    return sha1(bytes.from_string_utf8(input))
+
+fn hash_sha1_string(input: String) -> String:
+    return sha1_string(input)

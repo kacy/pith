@@ -7,9 +7,10 @@
 #   accept_value := compute_accept(client_key)
 #   response := handshake_response(client_key)
 
-# Dependencies for WebSocket handshake computation
+# dependencies for WebSocket handshake computation
+import std.bytes as bytes
 from std.hash import sha1
-from std.encoding import b64_encode
+from std.encoding import b64_encode, from_hex
 
 # ===============================================================
 # WebSocket Constants
@@ -34,36 +35,14 @@ OP_PONG := 10    # Pong frame
 # 1. Concatenate key with magic GUID
 # 2. Compute SHA-1 hash
 # 3. Base64 encode the hash
-pub fn compute_accept(key: String) -> String:
-    # Concatenate key with magic GUID
+pub fn compute_accept(key: String) -> String!:
     combined := key + WS_MAGIC
-    # SHA1 hash (returns 40-char hex)
-    hash_hex := sha1(combined)
-    # Convert hex to bytes then base64 encode
-    mut hash_bytes := ""
-    mut position := 0
-    while position < hash_hex.len():
-        # Convert 2 hex chars to 1 byte
-        mut high := hex_character_value(hash_hex[position])
-        mut low := hex_character_value(hash_hex[position + 1])
-        hash_bytes = hash_bytes + chr(high * 16 + low)
-        position = position + 2
-    return b64_encode(hash_bytes)
-
-# Converts a hexadecimal character to its numeric value.
-fn hex_character_value(c: String) -> Int:
-    if c >= "0" and c <= "9":
-        return ord(c) - 48
-    if c >= "a" and c <= "f":
-        return ord(c) - 87
-    if c >= "A" and c <= "F":
-        return ord(c) - 55
-    return 0
+    return b64_encode(from_hex(sha1(bytes.from_string_utf8(combined)))!)
 
 # Builds a complete HTTP 101 Switching Protocols response for WebSocket upgrade.
 # Takes the client's Sec-WebSocket-Key and returns the full HTTP response.
-pub fn handshake_response(key: String) -> String:
-    mut accept := compute_accept(key)
+pub fn handshake_response(key: String) -> String!:
+    mut accept := compute_accept(key)!
     mut response := "HTTP/1.1 101 Switching Protocols\r\n"
     response = response + "Upgrade: websocket\r\n"
     response = response + "Connection: Upgrade\r\n"

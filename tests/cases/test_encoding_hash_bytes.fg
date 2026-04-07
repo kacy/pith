@@ -1,0 +1,33 @@
+import std.bytes as bytes
+import std.encoding as encoding
+import std.hash as hash
+
+fn main() -> String!:
+    data := bytes.from_string_utf8("hello")
+    encoded := encoding.b64_encode(data)
+    print(encoded)
+    print(encoding.b64_decode(encoded)!.to_string_utf8()!)
+
+    hexed := encoding.to_hex(data)
+    print(hexed)
+    print(encoding.from_hex(hexed)!.to_string_utf8()!)
+    print(encoding.b64_decode_utf8("Zm9yZ2U=")!)
+
+    sha256_bytes := hash.sha256(data)
+    sha256_text := hash.sha256_string("hello")
+    print(sha256_bytes)
+    print(sha256_text)
+    print((sha256_bytes == sha256_text).to_string())
+
+    sha1_bytes := hash.sha1(data)
+    sha1_text := hash.sha1_string("hello")
+    print(sha1_bytes)
+    print(sha1_text)
+    print((sha1_bytes == sha1_text).to_string())
+
+    fnv_bytes := hash.fnv1a(data)
+    fnv_text := hash.fnv1a_string("hello")
+    print(fnv_bytes.to_string())
+    print(fnv_text.to_string())
+    print((fnv_bytes == fnv_text).to_string())
+    return ""

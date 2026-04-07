@@ -326,6 +326,8 @@ fn compile_ir_function(
     let mut regs: HashMap<usize, Value> = HashMap::new();
     let mut string_regs: HashSet<usize> = HashSet::new();
     let mut string_vars: HashSet<String> = HashSet::new();
+    let mut bytes_regs: HashSet<usize> = HashSet::new();
+    let mut bytes_vars: HashSet<String> = HashSet::new();
     let mut float_regs: HashSet<usize> = HashSet::new();
     let mut float_vars: HashSet<String> = HashSet::new();
     let mut reg_source_vars: HashMap<usize, String> = HashMap::new();
@@ -521,6 +523,7 @@ fn compile_ir_function(
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 string_regs.remove(&reg);
+                bytes_regs.remove(&reg);
                 float_regs.remove(&reg);
             }
 
@@ -537,6 +540,7 @@ fn compile_ir_function(
                 struct_regs.remove(&reg);
                 float_regs.insert(reg);
                 string_regs.remove(&reg);
+                bytes_regs.remove(&reg);
             }
 
             "strref" if parts.len() >= 3 => {
@@ -553,6 +557,7 @@ fn compile_ir_function(
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 string_regs.insert(reg);
+                bytes_regs.remove(&reg);
                 float_regs.remove(&reg);
             }
 
@@ -572,6 +577,7 @@ fn compile_ir_function(
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 string_regs.remove(&reg);
+                bytes_regs.remove(&reg);
                 float_regs.remove(&reg);
             }
 
@@ -583,6 +589,7 @@ fn compile_ir_function(
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 string_regs.remove(&reg);
+                bytes_regs.remove(&reg);
                 float_regs.remove(&reg);
             }
 
@@ -599,6 +606,7 @@ fn compile_ir_function(
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 string_regs.remove(&reg);
+                bytes_regs.remove(&reg);
                 float_regs.remove(&reg);
             }
 
@@ -632,6 +640,7 @@ fn compile_ir_function(
                 struct_regs.remove(&reg);
                 float_regs.insert(reg);
                 string_regs.remove(&reg);
+                bytes_regs.remove(&reg);
             }
 
             "add" | "sub" | "mul" | "div" | "mod" if parts.len() >= 4 => {
@@ -666,6 +675,7 @@ fn compile_ir_function(
                         regs.insert(reg, builder.ins().iadd(a, b));
                     }
                     string_regs.insert(reg);
+                    bytes_regs.remove(&reg);
                     float_regs.remove(&reg);
                 // If operands are known floats, promote to float operation
                 } else if matches!(parts[0], "add" | "sub" | "mul" | "div")
@@ -696,6 +706,7 @@ fn compile_ir_function(
                     regs.insert(reg, v);
                     float_regs.insert(reg);
                     string_regs.remove(&reg);
+                    bytes_regs.remove(&reg);
                 } else {
                     let v = match parts[0] {
                         "add" => builder.ins().iadd(a, b),
@@ -707,6 +718,7 @@ fn compile_ir_function(
                     };
                     regs.insert(reg, v);
                     string_regs.remove(&reg);
+                    bytes_regs.remove(&reg);
                     float_regs.remove(&reg);
                 }
             }
@@ -780,6 +792,7 @@ fn compile_ir_function(
                     regs.insert(reg, v);
                 }
                 string_regs.remove(&reg);
+                bytes_regs.remove(&reg);
                 float_regs.remove(&reg);
             }
 
@@ -809,6 +822,7 @@ fn compile_ir_function(
                     regs.insert(reg, a);
                 }
                 string_regs.insert(reg);
+                bytes_regs.remove(&reg);
                 float_regs.remove(&reg);
             }
 
@@ -849,11 +863,13 @@ fn compile_ir_function(
                         regs.insert(reg, ptr);
                         struct_regs.insert(reg, fname.to_string());
                         string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
                         float_regs.remove(&reg);
                     } else {
                         regs.insert(reg, builder.ins().iconst(types::I64, 0));
                         struct_regs.remove(&reg);
                         string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
                         float_regs.remove(&reg);
                     }
                 } else {
@@ -951,6 +967,11 @@ fn compile_ir_function(
                         } else {
                             string_regs.remove(&reg);
                         }
+                        if retkind == "bytes" {
+                            bytes_regs.insert(reg);
+                        } else {
+                            bytes_regs.remove(&reg);
+                        }
                         if retkind == "float" || (retkind == "unknown" && returns_float) {
                             float_regs.insert(reg);
                         } else {
@@ -974,11 +995,13 @@ fn compile_ir_function(
                         regs.insert(reg, builder.func.dfg.first_result(call));
                         struct_regs.remove(&reg);
                         string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
                         float_regs.remove(&reg);
                     } else {
                         regs.insert(reg, builder.ins().iconst(types::I64, 0));
                         struct_regs.remove(&reg);
                         string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
                         float_regs.remove(&reg);
                     }
                 } // end struct constructor else
@@ -998,6 +1021,11 @@ fn compile_ir_function(
                         string_vars.insert(name.clone());
                     } else {
                         string_vars.remove(&name);
+                    }
+                    if bytes_regs.contains(&src_reg) {
+                        bytes_vars.insert(name.clone());
+                    } else {
+                        bytes_vars.remove(&name);
                     }
                     if float_regs.contains(&src_reg) {
                         float_vars.insert(name.clone());
@@ -1059,6 +1087,11 @@ fn compile_ir_function(
                 } else {
                     string_regs.remove(&reg);
                 }
+                if bytes_vars.contains(name) {
+                    bytes_regs.insert(reg);
+                } else {
+                    bytes_regs.remove(&reg);
+                }
                 if float_vars.contains(name) {
                     float_regs.insert(reg);
                 } else {
@@ -1108,6 +1141,11 @@ fn compile_ir_function(
                     } else {
                         string_regs.remove(&reg);
                     }
+                    if retkind == "bytes" {
+                        bytes_regs.insert(reg);
+                    } else {
+                        bytes_regs.remove(&reg);
+                    }
                     if retkind == "float" {
                         float_regs.insert(reg);
                     } else {
@@ -1118,9 +1156,11 @@ fn compile_ir_function(
                     }
                 } else if field_struct_name.is_some() {
                     string_regs.remove(&reg);
+                    bytes_regs.remove(&reg);
                     float_regs.remove(&reg);
                 } else {
                     string_regs.remove(&reg);
+                    bytes_regs.remove(&reg);
                     float_regs.remove(&reg);
                 }
             }
@@ -1140,6 +1180,7 @@ fn compile_ir_function(
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 string_regs.remove(&reg);
+                bytes_regs.remove(&reg);
                 float_regs.remove(&reg);
             }
 
@@ -1263,6 +1304,7 @@ fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
             | "bool"
             | "result_bool"
             | "string"
+            | "bytes"
             | "list"
             | "list_string"
             | "map"
@@ -1404,6 +1446,20 @@ fn resolve_func_name(name: &str) -> &str {
         "__closure_set_env" => "forge_closure_set_env",
         "__closure_get_env" => "forge_closure_get_env",
         "__str_eq" => "forge_cstring_eq",
+        "bytes_from_string_utf8" => "forge_bytes_from_string_utf8",
+        "bytes_to_string_utf8" => "forge_bytes_to_string_utf8",
+        "bytes_len" => "forge_bytes_len",
+        "bytes_is_empty" => "forge_bytes_is_empty",
+        "bytes_get" => "forge_bytes_get",
+        "bytes_slice" => "forge_bytes_slice",
+        "bytes_concat" => "forge_bytes_concat",
+        "bytes_eq" => "forge_bytes_eq",
+        "byte_buffer_new" => "forge_byte_buffer_new",
+        "byte_buffer_with_capacity" => "forge_byte_buffer_with_capacity",
+        "byte_buffer_write" => "forge_byte_buffer_write",
+        "byte_buffer_write_byte" => "forge_byte_buffer_write_byte",
+        "byte_buffer_bytes" => "forge_byte_buffer_bytes",
+        "byte_buffer_clear" => "forge_byte_buffer_clear",
         // Numeric / math
         "abs" => "forge_abs",
         "min" => "forge_min",
@@ -1445,13 +1501,18 @@ fn resolve_func_name(name: &str) -> &str {
         "bit_shr" => "forge_bit_shr",
         // IO / system
         "read_file" => "forge_read_file",
+        "read_file_bytes" => "forge_read_file_bytes",
         "write_file" => "forge_write_file",
         "append_file" => "forge_append_file",
+        "write_file_bytes" => "forge_write_file_bytes",
+        "append_file_bytes" => "forge_append_file_bytes",
         "file_open_read" => "forge_file_open_read",
         "file_open_write" => "forge_file_open_write",
         "file_open_append" => "forge_file_open_append",
         "file_read" => "forge_file_read",
         "file_write" => "forge_file_write",
+        "file_read_bytes" => "forge_file_read_bytes",
+        "file_write_bytes" => "forge_file_write_bytes",
         "file_close" => "forge_file_close",
         "file_exists" => "forge_file_exists",
         "dir_exists" => "forge_dir_exists",
@@ -1464,6 +1525,9 @@ fn resolve_func_name(name: &str) -> &str {
         "process_write" => "forge_process_write",
         "process_read" => "forge_process_read",
         "process_read_err" => "forge_process_read_err",
+        "process_write_bytes" => "forge_process_write_bytes",
+        "process_read_bytes" => "forge_process_read_bytes",
+        "process_read_err_bytes" => "forge_process_read_err_bytes",
         "process_wait" => "forge_process_wait",
         "process_kill" => "forge_process_kill",
         "process_close" => "forge_process_close",
@@ -1518,6 +1582,8 @@ fn resolve_func_name(name: &str) -> &str {
         "query" => "forge_url_query",
         "fragment" => "forge_url_fragment",
         "decode" => "forge_url_decode",
+        "tcp_read_bytes" => "forge_tcp_read_bytes",
+        "tcp_write_bytes" => "forge_tcp_write_bytes",
         // Concurrency
         "spawn" => "forge_spawn",
         "await" => "forge_await",

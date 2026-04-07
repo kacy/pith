@@ -1,0 +1,28 @@
+# bytes io — explicit bytes/text boundaries over file and process io
+
+import std.bytes as bytes
+import std.fs as fs
+import std.io as io
+
+fn main() -> String!:
+    payload := bytes.from_string_utf8("forge bytes")
+    path := "/tmp/forge_bytes_example.bin"
+
+    out := fs.create(path)!
+    print("wrote: " + out.write_all_bytes(payload)!.to_string())
+    out.close()
+
+    file := fs.open(path)!
+    raw := file.read_all_bytes()!
+    file.close()
+    fs.remove(path)
+
+    print("len: " + raw.len().to_string())
+    print("text: " + raw.to_string_utf8()!)
+
+    proc := io.spawn_process("head -c 5")!
+    print("stdin: " + proc.stdin().write_all_bytes(bytes.from_string_utf8("hello"))!.to_string())
+    print("stdout: " + proc.stdout().read_all_bytes()!.to_string_utf8()!)
+    print("exit: " + proc.wait().to_string())
+    proc.close()
+    return ""

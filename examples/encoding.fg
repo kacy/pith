@@ -1,36 +1,33 @@
 # encoding — base64 and hex encode/decode
-# demonstrates: encoding round-trips and error handling
+# demonstrates: bytes-first encoding with explicit utf-8 boundaries
 
-from std.encoding import b64_encode, b64_decode, to_hex, from_hex
+import std.bytes as bytes
+import std.encoding as encoding
 
 fn run() -> String!:
-    # base64 encode
-    encoded_base64 := b64_encode("hello world")
+    raw := bytes.from_string_utf8("hello world")
+    encoded_base64 := encoding.b64_encode(raw)
     print("base64 encode: " + encoded_base64)
 
-    # base64 decode
-    decoded_string := b64_decode(encoded_base64)!
+    decoded_string := encoding.b64_decode(encoded_base64)!.to_string_utf8()!
     print("base64 decode: " + decoded_string)
 
-    # base64 padding cases - different input lengths produce different padding
-    print("base64 'a': " + b64_encode("a"))
-    print("base64 'ab': " + b64_encode("ab"))
-    print("base64 'abc': " + b64_encode("abc"))
+    print("base64 'a': " + encoding.b64_encode(bytes.from_string_utf8("a")))
+    print("base64 'ab': " + encoding.b64_encode(bytes.from_string_utf8("ab")))
+    print("base64 'abc': " + encoding.b64_encode(bytes.from_string_utf8("abc")))
 
-    # hex encode
-    hex_encoded := to_hex("Hello")
+    hex_encoded := encoding.to_hex(bytes.from_string_utf8("Hello"))
     print("hex encode: " + hex_encoded)
 
-    # hex decode
-    hex_decoded := from_hex(hex_encoded)!
+    hex_decoded := encoding.from_hex(hex_encoded)!.to_string_utf8()!
     print("hex decode: " + hex_decoded)
 
-    # hex single byte
-    print("hex 0xff: " + to_hex(chr(255)))
+    single_byte := bytes.buffer()
+    single_byte.write_byte(255)!
+    print("hex 0xff: " + encoding.to_hex(single_byte.bytes()))
 
-    # round-trip: encode then decode should return original
     original_text := "forge programming language"
-    roundtrip_result := b64_decode(b64_encode(original_text))!
+    roundtrip_result := encoding.b64_decode(encoding.b64_encode(bytes.from_string_utf8(original_text)))!.to_string_utf8()!
     print("round-trip: " + roundtrip_result)
     return ""
 

@@ -22,13 +22,19 @@ the core surface is intentionally small:
 - `Closer`
 - `Flusher`
 
-the current runtime is still string-oriented, so the first pass is string-first
-too:
+the original shared layer was string-first, but it now has an explicit bytes
+side too.
+
+text-facing surface:
 - `fn read(max_bytes: Int) -> String!`
 - `fn write(data: String) -> Int!`
 
-that is enough to unify the common loops today without waiting for a bytes
-layer.
+bytes-facing surface:
+- `fn read_bytes(max_bytes: Int) -> Bytes!`
+- `fn write_bytes(data: Bytes) -> Int!`
+
+the split is intentional: raw transport data and text are different things, so
+forge now treats them as different things in the stdlib too.
 
 the compiler now also supports module-qualified import aliases cleanly, so
 stdlib call sites can read like:
@@ -45,10 +51,12 @@ stdlib call sites can read like:
 
 the io layer now includes:
 - handle-backed in-memory readers and writers for simple composition and tests
+- handle-backed bytes readers and buffers for raw data paths
 - buffered readers and writers for string, tcp, process, and file streams
 - line-oriented reads on top of those buffered readers
 - concrete helpers for `read_all`, `write_all`, and copy-style flows
 - plain file text helpers built on top of the file stream path
+- bytes file and process helpers built on the same stream types
 
 `std.fs` now exposes stream-based `open`, `create`, and `open_append` on the
 same foundation.
@@ -75,6 +83,11 @@ real stdlib consumers now use the shared layer:
 - `std.json`
 - `std.log`
 
+and the bytes-first boundary is real too:
+- `std.bytes`
+- `std.encoding`
+- `std.hash`
+
 that matters because it proves the design under actual request parsing,
 buffered body reads, file-backed parsing, incremental writes, and process/file
 integration instead of only synthetic helpers.
@@ -97,15 +110,15 @@ the foundation is in place, but there is still room to grow:
 - more stdlib consumers can move onto the shared path where it actually helps
 - scanner-style or framed helpers may still be worth adding if real users want
   them
-- a future bytes-first layer would be a better long-term shape than staying
-  string-only forever
+- the text-heavy modules still need a longer migration from string-first helper
+  paths onto the newer bytes-first transport surface where that actually helps
 - there are still a few older builtin shortcuts worth cleaning up when they get
   in the way
 
 ## direction
 
-the long-term version of forge io should probably be more protocol-friendly and
-more bytes-first.
+the long-term version of forge io should be more protocol-friendly and more
+bytes-first than the original string-only start.
 
 but the right way to get there was to land a useful shared core first, move
 real stdlib code onto it, and then extend the shape from working users instead

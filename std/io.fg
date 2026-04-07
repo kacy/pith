@@ -11,6 +11,9 @@
 #
 # handle-backed in-memory adapters are included so the helpers are easy to test.
 
+import std.bytes as bytes
+from std.bytes import ByteBuffer
+
 DEFAULT_CHUNK_SIZE := 4096
 
 mut next_string_reader_handle: Int := 1
@@ -19,6 +22,22 @@ mut string_reader_offsets: Map[Int, Int] := {}
 
 mut next_string_buffer_handle: Int := 1
 mut string_buffer_data: Map[Int, String] := {}
+
+mut next_bytes_reader_handle: Int := 1
+mut bytes_reader_data: Map[Int, Bytes] := {}
+mut bytes_reader_offsets: Map[Int, Int] := {}
+
+mut next_buffered_bytes_reader_handle: Int := 1
+mut buffered_bytes_reader_source_kinds: Map[Int, Int] := {}
+mut buffered_bytes_reader_source_handles: Map[Int, Int] := {}
+mut buffered_bytes_reader_chunk_sizes: Map[Int, Int] := {}
+mut buffered_bytes_reader_cache: Map[Int, Bytes] := {}
+
+mut next_buffered_bytes_writer_handle: Int := 1
+mut buffered_bytes_writer_target_kinds: Map[Int, Int] := {}
+mut buffered_bytes_writer_target_handles: Map[Int, Int] := {}
+mut buffered_bytes_writer_chunk_sizes: Map[Int, Int] := {}
+mut buffered_bytes_writer_cache: Map[Int, Bytes] := {}
 
 mut next_buffered_string_reader_handle: Int := 1
 mut buffered_string_reader_sources: Map[Int, Int] := {}
@@ -66,6 +85,12 @@ interface Reader:
 interface Writer:
     fn write(data: String) -> Int!
 
+interface BytesReader:
+    fn read_bytes(max_bytes: Int) -> Bytes!
+
+interface BytesWriter:
+    fn write_bytes(data: Bytes) -> Int!
+
 interface Closer:
     fn close()
 
@@ -76,6 +101,15 @@ struct StringReader:
     pub handle: Int
 
 struct StringBuffer:
+    pub handle: Int
+
+struct BytesCursor:
+    pub handle: Int
+
+struct BufferedBytesReader:
+    pub handle: Int
+
+struct BufferedBytesWriter:
     pub handle: Int
 
 struct BufferedStringReader:
@@ -120,6 +154,17 @@ struct BufferedProcessStdout:
 struct BufferedProcessStderr:
     pub handle: Int
 
+BUFFERED_BYTES_SOURCE_CURSOR := 1
+BUFFERED_BYTES_SOURCE_TCP := 2
+BUFFERED_BYTES_SOURCE_FILE := 3
+BUFFERED_BYTES_SOURCE_PROCESS_STDOUT := 4
+BUFFERED_BYTES_SOURCE_PROCESS_STDERR := 5
+
+BUFFERED_BYTES_TARGET_BUFFER := 1
+BUFFERED_BYTES_TARGET_TCP := 2
+BUFFERED_BYTES_TARGET_FILE := 3
+BUFFERED_BYTES_TARGET_PROCESS_STDIN := 4
+
 impl StringReader:
     fn read(max_bytes: Int) -> String!:
         return string_reader_read(self, max_bytes)
@@ -163,11 +208,92 @@ impl Writer for StringBuffer:
     fn write(data: String) -> Int!:
         return string_buffer_write(self, data)
 
+impl BytesCursor:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return bytes_cursor_read(self, max_bytes)
+
+    fn read_all_bytes() -> Bytes!:
+        return read_all_bytes_cursor(self)
+
+    fn read_all_bytes_chunked(chunk_size: Int) -> Bytes!:
+        return read_all_bytes_cursor_chunked(self, chunk_size)
+
+    fn buffered() -> BufferedBytesReader:
+        return buffered_bytes_reader(self)
+
+    fn buffered_chunked(chunk_size: Int) -> BufferedBytesReader:
+        return buffered_bytes_reader_chunked(self, chunk_size)
+
+impl BytesReader for BytesCursor:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return bytes_cursor_read(self, max_bytes)
+
+impl BytesWriter for ByteBuffer:
+    fn write_bytes(data: Bytes) -> Int!:
+        return self.write(data)
+
+impl ByteBuffer:
+    fn write_all_bytes(data: Bytes) -> Int!:
+        return write_all_byte_buffer(self, data)
+
+    fn buffered() -> BufferedBytesWriter:
+        return buffered_bytes_writer(self)
+
+    fn buffered_chunked(chunk_size: Int) -> BufferedBytesWriter:
+        return buffered_bytes_writer_chunked(self, chunk_size)
+
+impl BufferedBytesReader:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return buffered_bytes_reader_read(self, max_bytes)
+
+    fn read_all_bytes() -> Bytes!:
+        return read_all_buffered_bytes_reader(self)
+
+    fn read_all_bytes_chunked(chunk_size: Int) -> Bytes!:
+        return read_all_buffered_bytes_reader_chunked(self, chunk_size)
+
+impl BytesReader for BufferedBytesReader:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return buffered_bytes_reader_read(self, max_bytes)
+
+impl BufferedBytesWriter:
+    fn write_bytes(data: Bytes) -> Int!:
+        return buffered_bytes_writer_write(self, data)
+
+    fn write_all_bytes(data: Bytes) -> Int!:
+        return write_all_buffered_bytes_writer(self, data)
+
+    fn flush() -> Int!:
+        return buffered_bytes_writer_flush(self)
+
+impl BytesWriter for BufferedBytesWriter:
+    fn write_bytes(data: Bytes) -> Int!:
+        return buffered_bytes_writer_write(self, data)
+
+impl Flusher for BufferedBytesWriter:
+    fn flush() -> Int!:
+        return buffered_bytes_writer_flush(self)
+
 pub fn string_reader(data: String) -> StringReader:
     return StringReader(allocate_string_reader_handle(data))
 
 pub fn string_buffer() -> StringBuffer:
     return StringBuffer(allocate_string_buffer_handle())
+
+pub fn bytes_reader(data: Bytes) -> BytesCursor:
+    return BytesCursor(allocate_bytes_reader_handle(data))
+
+fn buffered_bytes_reader(reader: BytesCursor) -> BufferedBytesReader:
+    return make_buffered_bytes_reader(BUFFERED_BYTES_SOURCE_CURSOR, reader.handle, DEFAULT_CHUNK_SIZE)
+
+fn buffered_bytes_reader_chunked(reader: BytesCursor, chunk_size: Int) -> BufferedBytesReader:
+    return make_buffered_bytes_reader(BUFFERED_BYTES_SOURCE_CURSOR, reader.handle, chunk_size)
+
+fn buffered_bytes_writer(writer: ByteBuffer) -> BufferedBytesWriter:
+    return make_buffered_bytes_writer(BUFFERED_BYTES_TARGET_BUFFER, writer.handle, DEFAULT_CHUNK_SIZE)
+
+fn buffered_bytes_writer_chunked(writer: ByteBuffer, chunk_size: Int) -> BufferedBytesWriter:
+    return make_buffered_bytes_writer(BUFFERED_BYTES_TARGET_BUFFER, writer.handle, chunk_size)
 
 fn buffered_string_reader(reader: StringReader) -> BufferedStringReader:
     return buffered_string_reader_chunked(reader, DEFAULT_CHUNK_SIZE)
@@ -217,6 +343,27 @@ fn buffered_process_stderr(reader: ProcessStderr) -> BufferedProcessStderr:
 fn buffered_process_stderr_chunked(reader: ProcessStderr, chunk_size: Int) -> BufferedProcessStderr:
     return BufferedProcessStderr(allocate_buffered_process_stderr_handle(reader.handle, chunk_size))
 
+fn buffered_bytes_reader_from_tcp(stream: TcpStream, chunk_size: Int) -> BufferedBytesReader:
+    return make_buffered_bytes_reader(BUFFERED_BYTES_SOURCE_TCP, stream.fd, chunk_size)
+
+fn buffered_bytes_writer_to_tcp(stream: TcpStream, chunk_size: Int) -> BufferedBytesWriter:
+    return make_buffered_bytes_writer(BUFFERED_BYTES_TARGET_TCP, stream.fd, chunk_size)
+
+fn buffered_bytes_reader_from_file(stream: FileStream, chunk_size: Int) -> BufferedBytesReader:
+    return make_buffered_bytes_reader(BUFFERED_BYTES_SOURCE_FILE, stream.handle, chunk_size)
+
+fn buffered_bytes_writer_to_file(stream: FileStream, chunk_size: Int) -> BufferedBytesWriter:
+    return make_buffered_bytes_writer(BUFFERED_BYTES_TARGET_FILE, stream.handle, chunk_size)
+
+fn buffered_bytes_reader_from_stdout(reader: ProcessStdout, chunk_size: Int) -> BufferedBytesReader:
+    return make_buffered_bytes_reader(BUFFERED_BYTES_SOURCE_PROCESS_STDOUT, reader.handle, chunk_size)
+
+fn buffered_bytes_reader_from_stderr(reader: ProcessStderr, chunk_size: Int) -> BufferedBytesReader:
+    return make_buffered_bytes_reader(BUFFERED_BYTES_SOURCE_PROCESS_STDERR, reader.handle, chunk_size)
+
+fn buffered_bytes_writer_to_stdin(writer: ProcessStdin, chunk_size: Int) -> BufferedBytesWriter:
+    return make_buffered_bytes_writer(BUFFERED_BYTES_TARGET_PROCESS_STDIN, writer.handle, chunk_size)
+
 fn tcp_stream_connect(host: String, port: Int) -> TcpStream!:
     return TcpStream(tcp_connect(host, port)!)
 
@@ -226,8 +373,14 @@ fn tcp_stream_from_fd(fd: Int) -> TcpStream:
 fn tcp_stream_read(stream: TcpStream, max_bytes: Int) -> String!:
     return tcp_read(stream.fd, max_bytes)
 
+fn tcp_stream_read_bytes(stream: TcpStream, max_bytes: Int) -> Bytes!:
+    return tcp_read_bytes(stream.fd, max_bytes)
+
 fn tcp_stream_write(stream: TcpStream, data: String) -> Int!:
     return tcp_write(stream.fd, data)
+
+fn tcp_stream_write_bytes(stream: TcpStream, data: Bytes) -> Int!:
+    return tcp_write_bytes(stream.fd, data)
 
 fn tcp_stream_set_timeout(stream: TcpStream, ms: Int):
     tcp_set_timeout(stream.fd, ms)
@@ -247,8 +400,14 @@ fn file_stream_open_append(path: String) -> FileStream!:
 fn file_stream_read(stream: FileStream, max_bytes: Int) -> String!:
     return file_read(stream.handle, max_bytes)
 
+fn file_stream_read_bytes(stream: FileStream, max_bytes: Int) -> Bytes!:
+    return file_read_bytes(stream.handle, max_bytes)
+
 fn file_stream_write(stream: FileStream, data: String) -> Int!:
     return file_write(stream.handle, data)
+
+fn file_stream_write_bytes(stream: FileStream, data: Bytes) -> Int!:
+    return file_write_bytes(stream.handle, data)
 
 fn file_stream_close(stream: FileStream):
     file_close(stream.handle)
@@ -264,6 +423,15 @@ fn process_stdout(process: Process) -> ProcessStdout:
 
 fn process_stderr(process: Process) -> ProcessStderr:
     return ProcessStderr(process.handle)
+
+fn process_stdin_write_bytes(writer: ProcessStdin, data: Bytes) -> Int!:
+    return process_write_bytes(writer.handle, data)
+
+fn process_stdout_read_bytes(reader: ProcessStdout, max_bytes: Int) -> Bytes!:
+    return process_read_bytes(reader.handle, max_bytes)
+
+fn process_stderr_read_bytes(reader: ProcessStderr, max_bytes: Int) -> Bytes!:
+    return process_read_err_bytes(reader.handle, max_bytes)
 
 fn wait_process(process: Process) -> Int:
     return process_wait(process.handle)
@@ -288,6 +456,18 @@ fn string_reader_read(reader: StringReader, max_bytes: Int) -> String!:
 fn string_buffer_write(buf: StringBuffer, data: String) -> Int!:
     return string_buffer_write_internal(buf, data)
 
+fn bytes_cursor_read(reader: BytesCursor, max_bytes: Int) -> Bytes!:
+    return bytes_cursor_read_internal(reader, max_bytes)
+
+fn buffered_bytes_reader_read(reader: BufferedBytesReader, max_bytes: Int) -> Bytes!:
+    return buffered_bytes_reader_read_internal(reader, max_bytes)
+
+fn buffered_bytes_writer_write(writer: BufferedBytesWriter, data: Bytes) -> Int!:
+    return buffered_bytes_writer_write_internal(writer, data)
+
+fn buffered_bytes_writer_flush(writer: BufferedBytesWriter) -> Int!:
+    return buffered_bytes_writer_flush_internal(writer)
+
 pub fn read_all(reader: StringReader) -> String!:
     return read_all_string(reader)
 
@@ -302,6 +482,21 @@ pub fn copy(reader: StringReader, writer: StringBuffer) -> Int!:
 
 pub fn copy_chunked(reader: StringReader, writer: StringBuffer, chunk_size: Int) -> Int!:
     return copy_string_chunked(reader, writer, chunk_size)
+
+pub fn read_all_bytes(reader: BytesCursor) -> Bytes!:
+    return read_all_bytes_cursor(reader)
+
+pub fn read_all_bytes_chunked(reader: BytesCursor, chunk_size: Int) -> Bytes!:
+    return read_all_bytes_cursor_chunked(reader, chunk_size)
+
+pub fn write_all_bytes(writer: ByteBuffer, data: Bytes) -> Int!:
+    return write_all_byte_buffer(writer, data)
+
+pub fn copy_bytes(reader: BytesCursor, writer: ByteBuffer) -> Int!:
+    return copy_bytes_cursor(reader, writer)
+
+pub fn copy_bytes_chunked(reader: BytesCursor, writer: ByteBuffer, chunk_size: Int) -> Int!:
+    return copy_bytes_cursor_chunked(reader, writer, chunk_size)
 
 pub fn connect(host: String, port: Int) -> TcpStream!:
     return tcp_stream_connect(host, port)
@@ -330,14 +525,29 @@ pub fn kill(process: Process) -> Bool:
 pub fn write_stdin(process: Process, data: String) -> Int!:
     return write_all_process_stdin(stdin(process), data)
 
+pub fn write_stdin_bytes(process: Process, data: Bytes) -> Int!:
+    return write_all_process_stdin_bytes(stdin(process), data)
+
 pub fn read_stdout(process: Process) -> String!:
     return read_all_process_stdout(stdout(process))
 
 pub fn read_stdout_chunked(process: Process, chunk_size: Int) -> String!:
     return read_all_process_stdout_chunked(stdout(process), chunk_size)
 
+pub fn read_stdout_bytes(process: Process) -> Bytes!:
+    return read_all_process_stdout_bytes(stdout(process))
+
+pub fn read_stdout_bytes_chunked(process: Process, chunk_size: Int) -> Bytes!:
+    return read_all_process_stdout_bytes_chunked(stdout(process), chunk_size)
+
 pub fn read_stderr(process: Process) -> String!:
     return read_all_process_stderr(stderr(process))
+
+pub fn read_stderr_bytes(process: Process) -> Bytes!:
+    return read_all_process_stderr_bytes(stderr(process))
+
+pub fn read_stderr_bytes_chunked(process: Process, chunk_size: Int) -> Bytes!:
+    return read_all_process_stderr_bytes_chunked(stderr(process), chunk_size)
 
 pub fn read_stderr_chunked(process: Process, chunk_size: Int) -> String!:
     return read_all_process_stderr_chunked(stderr(process), chunk_size)
@@ -428,6 +638,37 @@ fn allocate_string_buffer_handle() -> Int:
     next_string_buffer_handle = next_string_buffer_handle + 1
     string_buffer_data.insert(handle, "")
     return handle
+
+fn allocate_bytes_reader_handle(data: Bytes) -> Int:
+    handle := next_bytes_reader_handle
+    next_bytes_reader_handle = next_bytes_reader_handle + 1
+    bytes_reader_data.insert(handle, data)
+    bytes_reader_offsets.insert(handle, 0)
+    return handle
+
+fn allocate_buffered_bytes_reader_handle(source_kind: Int, source_handle: Int, chunk_size: Int) -> Int:
+    handle := next_buffered_bytes_reader_handle
+    next_buffered_bytes_reader_handle = next_buffered_bytes_reader_handle + 1
+    buffered_bytes_reader_source_kinds.insert(handle, source_kind)
+    buffered_bytes_reader_source_handles.insert(handle, source_handle)
+    buffered_bytes_reader_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
+    buffered_bytes_reader_cache.insert(handle, bytes.empty())
+    return handle
+
+fn make_buffered_bytes_reader(source_kind: Int, source_handle: Int, chunk_size: Int) -> BufferedBytesReader:
+    return BufferedBytesReader(allocate_buffered_bytes_reader_handle(source_kind, source_handle, chunk_size))
+
+fn allocate_buffered_bytes_writer_handle(target_kind: Int, target_handle: Int, chunk_size: Int) -> Int:
+    handle := next_buffered_bytes_writer_handle
+    next_buffered_bytes_writer_handle = next_buffered_bytes_writer_handle + 1
+    buffered_bytes_writer_target_kinds.insert(handle, target_kind)
+    buffered_bytes_writer_target_handles.insert(handle, target_handle)
+    buffered_bytes_writer_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
+    buffered_bytes_writer_cache.insert(handle, bytes.empty())
+    return handle
+
+fn make_buffered_bytes_writer(target_kind: Int, target_handle: Int, chunk_size: Int) -> BufferedBytesWriter:
+    return BufferedBytesWriter(allocate_buffered_bytes_writer_handle(target_kind, target_handle, chunk_size))
 
 fn allocate_buffered_string_reader_handle(source_handle: Int, chunk_size: Int) -> Int:
     handle := next_buffered_string_reader_handle
@@ -692,6 +933,247 @@ fn string_buffer_write_internal(buf: StringBuffer, data: String) -> Int!:
         current = string_buffer_data[buf.handle]
     string_buffer_data.insert(buf.handle, current + data)
     return data.len()
+
+fn bytes_after_write(data: Bytes, wrote: Int) -> Bytes:
+    if wrote >= data.len():
+        return bytes.empty()
+    return data.slice(wrote, data.len())
+
+fn bytes_cursor_read_internal(reader: BytesCursor, max_bytes: Int) -> Bytes!:
+    if max_bytes <= 0:
+        return bytes.empty()
+    if not bytes_reader_data.contains_key(reader.handle):
+        return bytes.empty()
+
+    data := bytes_reader_data[reader.handle]
+    mut offset := 0
+    if bytes_reader_offsets.contains_key(reader.handle):
+        offset = bytes_reader_offsets[reader.handle]
+    if offset >= data.len():
+        return bytes.empty()
+
+    mut end := offset + max_bytes
+    if end > data.len():
+        end = data.len()
+    chunk := data.slice(offset, end)
+    bytes_reader_offsets.insert(reader.handle, end)
+    return chunk
+
+fn write_all_byte_buffer(writer: ByteBuffer, data: Bytes) -> Int!:
+    mut total := 0
+    mut remaining := data
+    while remaining.len() > 0:
+        wrote := writer.write_bytes(remaining)!
+        if wrote <= 0:
+            fail "write returned 0"
+        total = total + wrote
+        remaining = bytes_after_write(remaining, wrote)
+    return total
+
+fn copy_bytes_cursor(reader: BytesCursor, writer: ByteBuffer) -> Int!:
+    return copy_bytes_cursor_chunked(reader, writer, DEFAULT_CHUNK_SIZE)
+
+fn copy_bytes_cursor_chunked(reader: BytesCursor, writer: ByteBuffer, chunk_size: Int) -> Int!:
+    size := normalized_chunk_size(chunk_size)
+    mut total := 0
+    mut chunk := reader.read_bytes(size)!
+    while not chunk.is_empty():
+        total = total + writer.write_bytes(chunk)!
+        chunk = reader.read_bytes(size)!
+    return total
+
+fn read_all_bytes_cursor(reader: BytesCursor) -> Bytes!:
+    return read_all_bytes_cursor_chunked(reader, DEFAULT_CHUNK_SIZE)
+
+fn read_all_bytes_cursor_chunked(reader: BytesCursor, chunk_size: Int) -> Bytes!:
+    size := normalized_chunk_size(chunk_size)
+    buf := bytes.buffer_with_capacity(size)
+    mut chunk := reader.read_bytes(size)!
+    while not chunk.is_empty():
+        buf.write(chunk)!
+        chunk = reader.read_bytes(size)!
+    return buf.bytes()
+
+fn read_all_tcp_stream_bytes(stream: TcpStream) -> Bytes!:
+    return read_all_tcp_stream_bytes_chunked(stream, DEFAULT_CHUNK_SIZE)
+
+fn read_all_tcp_stream_bytes_chunked(stream: TcpStream, chunk_size: Int) -> Bytes!:
+    size := normalized_chunk_size(chunk_size)
+    buf := bytes.buffer_with_capacity(size)
+    mut chunk := stream.read_bytes(size)!
+    while not chunk.is_empty():
+        buf.write(chunk)!
+        chunk = stream.read_bytes(size)!
+    return buf.bytes()
+
+fn write_all_tcp_stream_bytes(stream: TcpStream, data: Bytes) -> Int!:
+    mut total := 0
+    mut remaining := data
+    while not remaining.is_empty():
+        wrote := stream.write_bytes(remaining)!
+        if wrote <= 0:
+            fail "write returned 0"
+        total = total + wrote
+        remaining = bytes_after_write(remaining, wrote)
+    return total
+
+fn read_all_file_stream_bytes(stream: FileStream) -> Bytes!:
+    return read_all_file_stream_bytes_chunked(stream, DEFAULT_CHUNK_SIZE)
+
+fn read_all_file_stream_bytes_chunked(stream: FileStream, chunk_size: Int) -> Bytes!:
+    size := normalized_chunk_size(chunk_size)
+    buf := bytes.buffer_with_capacity(size)
+    mut chunk := stream.read_bytes(size)!
+    while not chunk.is_empty():
+        buf.write(chunk)!
+        chunk = stream.read_bytes(size)!
+    return buf.bytes()
+
+fn write_all_file_stream_bytes(stream: FileStream, data: Bytes) -> Int!:
+    mut total := 0
+    mut remaining := data
+    while not remaining.is_empty():
+        wrote := stream.write_bytes(remaining)!
+        if wrote <= 0:
+            fail "write returned 0"
+        total = total + wrote
+        remaining = bytes_after_write(remaining, wrote)
+    return total
+
+fn write_all_process_stdin_bytes(writer: ProcessStdin, data: Bytes) -> Int!:
+    mut total := 0
+    mut remaining := data
+    while not remaining.is_empty():
+        wrote := writer.write_bytes(remaining)!
+        if wrote <= 0:
+            fail "write returned 0"
+        total = total + wrote
+        remaining = bytes_after_write(remaining, wrote)
+    return total
+
+fn read_all_process_stdout_bytes(reader: ProcessStdout) -> Bytes!:
+    return read_all_process_stdout_bytes_chunked(reader, DEFAULT_CHUNK_SIZE)
+
+fn read_all_process_stdout_bytes_chunked(reader: ProcessStdout, chunk_size: Int) -> Bytes!:
+    size := normalized_chunk_size(chunk_size)
+    buf := bytes.buffer_with_capacity(size)
+    mut chunk := reader.read_bytes(size)!
+    while not chunk.is_empty():
+        buf.write(chunk)!
+        chunk = reader.read_bytes(size)!
+    return buf.bytes()
+
+fn read_all_process_stderr_bytes(reader: ProcessStderr) -> Bytes!:
+    return read_all_process_stderr_bytes_chunked(reader, DEFAULT_CHUNK_SIZE)
+
+fn read_all_process_stderr_bytes_chunked(reader: ProcessStderr, chunk_size: Int) -> Bytes!:
+    size := normalized_chunk_size(chunk_size)
+    buf := bytes.buffer_with_capacity(size)
+    mut chunk := reader.read_bytes(size)!
+    while not chunk.is_empty():
+        buf.write(chunk)!
+        chunk = reader.read_bytes(size)!
+    return buf.bytes()
+
+fn read_all_buffered_bytes_reader(reader: BufferedBytesReader) -> Bytes!:
+    return read_all_buffered_bytes_reader_chunked(reader, DEFAULT_CHUNK_SIZE)
+
+fn read_all_buffered_bytes_reader_chunked(reader: BufferedBytesReader, chunk_size: Int) -> Bytes!:
+    size := normalized_chunk_size(chunk_size)
+    buf := bytes.buffer_with_capacity(size)
+    mut chunk := reader.read_bytes(size)!
+    while not chunk.is_empty():
+        buf.write(chunk)!
+        chunk = reader.read_bytes(size)!
+    return buf.bytes()
+
+fn write_all_buffered_bytes_writer(writer: BufferedBytesWriter, data: Bytes) -> Int!:
+    mut total := 0
+    mut remaining := data
+    while not remaining.is_empty():
+        wrote := writer.write_bytes(remaining)!
+        if wrote <= 0:
+            fail "write returned 0"
+        total = total + wrote
+        remaining = bytes_after_write(remaining, wrote)
+    return total
+
+fn buffered_bytes_reader_read_internal(reader: BufferedBytesReader, max_bytes: Int) -> Bytes!:
+    if max_bytes <= 0:
+        return bytes.empty()
+    if not buffered_bytes_reader_source_handles.contains_key(reader.handle):
+        return bytes.empty()
+
+    buf := bytes.buffer_with_capacity(max_bytes)
+    while buf.bytes().len() < max_bytes:
+        mut cached := buffered_bytes_reader_cache_get(reader.handle)
+        if cached.is_empty():
+            filled := buffered_bytes_reader_fill(reader.handle)!
+            if filled <= 0:
+                return buf.bytes()
+            cached = buffered_bytes_reader_cache_get(reader.handle)
+        mut take := max_bytes - buf.bytes().len()
+        if take > cached.len():
+            take = cached.len()
+        buf.write(cached.slice(0, take))!
+        buffered_bytes_reader_consume(reader.handle, take)
+    return buf.bytes()
+
+fn buffered_bytes_reader_fill(handle: Int) -> Int!:
+    if not buffered_bytes_reader_source_handles.contains_key(handle):
+        return 0
+
+    source_kind := buffered_bytes_reader_source_kinds[handle]
+    source_handle := buffered_bytes_reader_source_handles[handle]
+    mut chunk_size := DEFAULT_CHUNK_SIZE
+    if buffered_bytes_reader_chunk_sizes.contains_key(handle):
+        chunk_size = buffered_bytes_reader_chunk_sizes[handle]
+
+    mut chunk := bytes.empty()
+    if source_kind == BUFFERED_BYTES_SOURCE_CURSOR:
+        chunk = bytes_cursor_read(BytesCursor(source_handle), chunk_size)!
+    elif source_kind == BUFFERED_BYTES_SOURCE_TCP:
+        chunk = tcp_stream_read_bytes(TcpStream(source_handle), chunk_size)!
+    elif source_kind == BUFFERED_BYTES_SOURCE_FILE:
+        chunk = file_stream_read_bytes(FileStream(source_handle), chunk_size)!
+    elif source_kind == BUFFERED_BYTES_SOURCE_PROCESS_STDOUT:
+        chunk = process_stdout_read_bytes(ProcessStdout(source_handle), chunk_size)!
+    elif source_kind == BUFFERED_BYTES_SOURCE_PROCESS_STDERR:
+        chunk = process_stderr_read_bytes(ProcessStderr(source_handle), chunk_size)!
+    buffered_bytes_reader_cache.insert(handle, chunk)
+    return chunk.len()
+
+fn buffered_bytes_writer_write_internal(writer: BufferedBytesWriter, data: Bytes) -> Int!:
+    if not buffered_bytes_writer_target_handles.contains_key(writer.handle):
+        return 0
+
+    cached := buffered_bytes_writer_cache_get(writer.handle)
+    buffered_bytes_writer_cache.insert(writer.handle, cached.concat(data))
+    if buffered_bytes_writer_should_flush(writer.handle):
+        buffered_bytes_writer_flush_internal(writer)!
+    return data.len()
+
+fn buffered_bytes_writer_flush_internal(writer: BufferedBytesWriter) -> Int!:
+    if not buffered_bytes_writer_target_handles.contains_key(writer.handle):
+        return 0
+
+    cached := buffered_bytes_writer_cache_get(writer.handle)
+    if cached.is_empty():
+        return 0
+
+    target_kind := buffered_bytes_writer_target_kinds[writer.handle]
+    target_handle := buffered_bytes_writer_target_handles[writer.handle]
+    mut wrote := 0
+    if target_kind == BUFFERED_BYTES_TARGET_BUFFER:
+        wrote = write_all_byte_buffer(ByteBuffer(target_handle), cached)!
+    elif target_kind == BUFFERED_BYTES_TARGET_TCP:
+        wrote = write_all_tcp_stream_bytes(TcpStream(target_handle), cached)!
+    elif target_kind == BUFFERED_BYTES_TARGET_FILE:
+        wrote = write_all_file_stream_bytes(FileStream(target_handle), cached)!
+    elif target_kind == BUFFERED_BYTES_TARGET_PROCESS_STDIN:
+        wrote = write_all_process_stdin_bytes(ProcessStdin(target_handle), cached)!
+    buffered_bytes_writer_cache.insert(writer.handle, bytes.empty())
+    return wrote
 
 fn buffered_string_reader_read_internal(reader: BufferedStringReader, max_bytes: Int) -> String!:
     if max_bytes <= 0:
@@ -1037,6 +1519,15 @@ fn buffered_string_reader_cache_get(handle: Int) -> String:
         return buffered_string_reader_cache[handle]
     return ""
 
+fn buffered_bytes_reader_cache_get(handle: Int) -> Bytes:
+    if buffered_bytes_reader_cache.contains_key(handle):
+        return buffered_bytes_reader_cache[handle]
+    return bytes.empty()
+
+fn buffered_bytes_reader_consume(handle: Int, consumed: Int):
+    cached := buffered_bytes_reader_cache_get(handle)
+    buffered_bytes_reader_cache.insert(handle, cached.slice(consumed, cached.len()))
+
 fn buffered_string_reader_consume(handle: Int, consumed: Int):
     cached := buffered_string_reader_cache_get(handle)
     buffered_string_reader_cache.insert(handle, cache_after_consume(cached, consumed))
@@ -1081,6 +1572,18 @@ fn buffered_string_writer_cache_get(handle: Int) -> String:
     if buffered_string_writer_cache.contains_key(handle):
         return buffered_string_writer_cache[handle]
     return ""
+
+fn buffered_bytes_writer_cache_get(handle: Int) -> Bytes:
+    if buffered_bytes_writer_cache.contains_key(handle):
+        return buffered_bytes_writer_cache[handle]
+    return bytes.empty()
+
+fn buffered_bytes_writer_should_flush(handle: Int) -> Bool:
+    cached := buffered_bytes_writer_cache_get(handle)
+    mut chunk_size := DEFAULT_CHUNK_SIZE
+    if buffered_bytes_writer_chunk_sizes.contains_key(handle):
+        chunk_size = buffered_bytes_writer_chunk_sizes[handle]
+    return cached.len() >= chunk_size
 
 fn buffered_string_writer_should_flush(handle: Int) -> Bool:
     cached := buffered_string_writer_cache_get(handle)
@@ -1229,9 +1732,25 @@ impl ProcessStdin:
     fn write_all(data: String) -> Int!:
         return write_all_process_stdin(self, data)
 
+    fn write_bytes(data: Bytes) -> Int!:
+        return process_stdin_write_bytes(self, data)
+
+    fn write_all_bytes(data: Bytes) -> Int!:
+        return write_all_process_stdin_bytes(self, data)
+
+    fn buffered_bytes() -> BufferedBytesWriter:
+        return buffered_bytes_writer_to_stdin(self, DEFAULT_CHUNK_SIZE)
+
+    fn buffered_bytes_chunked(chunk_size: Int) -> BufferedBytesWriter:
+        return buffered_bytes_writer_to_stdin(self, chunk_size)
+
 impl Writer for ProcessStdin:
     fn write(data: String) -> Int!:
         return process_stdin_write(self, data)
+
+impl BytesWriter for ProcessStdin:
+    fn write_bytes(data: Bytes) -> Int!:
+        return process_stdin_write_bytes(self, data)
 
 impl ProcessStdout:
     fn read(max_bytes: Int) -> String!:
@@ -1243,6 +1762,21 @@ impl ProcessStdout:
     fn read_all_chunked(chunk_size: Int) -> String!:
         return read_all_process_stdout_chunked(self, chunk_size)
 
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return process_stdout_read_bytes(self, max_bytes)
+
+    fn read_all_bytes() -> Bytes!:
+        return read_all_process_stdout_bytes(self)
+
+    fn read_all_bytes_chunked(chunk_size: Int) -> Bytes!:
+        return read_all_process_stdout_bytes_chunked(self, chunk_size)
+
+    fn buffered_bytes() -> BufferedBytesReader:
+        return buffered_bytes_reader_from_stdout(self, DEFAULT_CHUNK_SIZE)
+
+    fn buffered_bytes_chunked(chunk_size: Int) -> BufferedBytesReader:
+        return buffered_bytes_reader_from_stdout(self, chunk_size)
+
     fn buffered() -> BufferedProcessStdout:
         return buffered_process_stdout(self)
 
@@ -1252,6 +1786,10 @@ impl ProcessStdout:
 impl Reader for ProcessStdout:
     fn read(max_bytes: Int) -> String!:
         return process_stdout_read(self, max_bytes)
+
+impl BytesReader for ProcessStdout:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return process_stdout_read_bytes(self, max_bytes)
 
 impl ProcessStderr:
     fn read(max_bytes: Int) -> String!:
@@ -1263,6 +1801,21 @@ impl ProcessStderr:
     fn read_all_chunked(chunk_size: Int) -> String!:
         return read_all_process_stderr_chunked(self, chunk_size)
 
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return process_stderr_read_bytes(self, max_bytes)
+
+    fn read_all_bytes() -> Bytes!:
+        return read_all_process_stderr_bytes(self)
+
+    fn read_all_bytes_chunked(chunk_size: Int) -> Bytes!:
+        return read_all_process_stderr_bytes_chunked(self, chunk_size)
+
+    fn buffered_bytes() -> BufferedBytesReader:
+        return buffered_bytes_reader_from_stderr(self, DEFAULT_CHUNK_SIZE)
+
+    fn buffered_bytes_chunked(chunk_size: Int) -> BufferedBytesReader:
+        return buffered_bytes_reader_from_stderr(self, chunk_size)
+
     fn buffered() -> BufferedProcessStderr:
         return buffered_process_stderr(self)
 
@@ -1272,6 +1825,10 @@ impl ProcessStderr:
 impl Reader for ProcessStderr:
     fn read(max_bytes: Int) -> String!:
         return process_stderr_read(self, max_bytes)
+
+impl BytesReader for ProcessStderr:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return process_stderr_read_bytes(self, max_bytes)
 
 impl Process:
     fn stdin() -> ProcessStdin:
@@ -1306,11 +1863,38 @@ impl TcpStream:
     fn read_all_chunked(chunk_size: Int) -> String!:
         return read_all_tcp_stream_chunked(self, chunk_size)
 
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return tcp_stream_read_bytes(self, max_bytes)
+
+    fn read_all_bytes() -> Bytes!:
+        return read_all_tcp_stream_bytes(self)
+
+    fn read_all_bytes_chunked(chunk_size: Int) -> Bytes!:
+        return read_all_tcp_stream_bytes_chunked(self, chunk_size)
+
     fn write(data: String) -> Int!:
         return tcp_stream_write(self, data)
 
     fn write_all(data: String) -> Int!:
         return write_all_tcp_stream(self, data)
+
+    fn write_bytes(data: Bytes) -> Int!:
+        return tcp_stream_write_bytes(self, data)
+
+    fn write_all_bytes(data: Bytes) -> Int!:
+        return write_all_tcp_stream_bytes(self, data)
+
+    fn buffered_bytes_reader() -> BufferedBytesReader:
+        return buffered_bytes_reader_from_tcp(self, DEFAULT_CHUNK_SIZE)
+
+    fn buffered_bytes_reader_chunked(chunk_size: Int) -> BufferedBytesReader:
+        return buffered_bytes_reader_from_tcp(self, chunk_size)
+
+    fn buffered_bytes_writer() -> BufferedBytesWriter:
+        return buffered_bytes_writer_to_tcp(self, DEFAULT_CHUNK_SIZE)
+
+    fn buffered_bytes_writer_chunked(chunk_size: Int) -> BufferedBytesWriter:
+        return buffered_bytes_writer_to_tcp(self, chunk_size)
 
     fn buffered_reader() -> BufferedTcpStream:
         return buffered_tcp_stream(self)
@@ -1334,9 +1918,17 @@ impl Reader for TcpStream:
     fn read(max_bytes: Int) -> String!:
         return tcp_stream_read(self, max_bytes)
 
+impl BytesReader for TcpStream:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return tcp_stream_read_bytes(self, max_bytes)
+
 impl Writer for TcpStream:
     fn write(data: String) -> Int!:
         return tcp_stream_write(self, data)
+
+impl BytesWriter for TcpStream:
+    fn write_bytes(data: Bytes) -> Int!:
+        return tcp_stream_write_bytes(self, data)
 
 impl Closer for TcpStream:
     fn close():
@@ -1352,11 +1944,38 @@ impl FileStream:
     fn read_all_chunked(chunk_size: Int) -> String!:
         return read_all_file_stream_chunked(self, chunk_size)
 
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return file_stream_read_bytes(self, max_bytes)
+
+    fn read_all_bytes() -> Bytes!:
+        return read_all_file_stream_bytes(self)
+
+    fn read_all_bytes_chunked(chunk_size: Int) -> Bytes!:
+        return read_all_file_stream_bytes_chunked(self, chunk_size)
+
     fn write(data: String) -> Int!:
         return file_stream_write(self, data)
 
     fn write_all(data: String) -> Int!:
         return write_all_file_stream(self, data)
+
+    fn write_bytes(data: Bytes) -> Int!:
+        return file_stream_write_bytes(self, data)
+
+    fn write_all_bytes(data: Bytes) -> Int!:
+        return write_all_file_stream_bytes(self, data)
+
+    fn buffered_bytes_reader() -> BufferedBytesReader:
+        return buffered_bytes_reader_from_file(self, DEFAULT_CHUNK_SIZE)
+
+    fn buffered_bytes_reader_chunked(chunk_size: Int) -> BufferedBytesReader:
+        return buffered_bytes_reader_from_file(self, chunk_size)
+
+    fn buffered_bytes_writer() -> BufferedBytesWriter:
+        return buffered_bytes_writer_to_file(self, DEFAULT_CHUNK_SIZE)
+
+    fn buffered_bytes_writer_chunked(chunk_size: Int) -> BufferedBytesWriter:
+        return buffered_bytes_writer_to_file(self, chunk_size)
 
     fn buffered_reader() -> BufferedFileReader:
         return buffered_file_reader(self)
@@ -1377,9 +1996,17 @@ impl Reader for FileStream:
     fn read(max_bytes: Int) -> String!:
         return file_stream_read(self, max_bytes)
 
+impl BytesReader for FileStream:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return file_stream_read_bytes(self, max_bytes)
+
 impl Writer for FileStream:
     fn write(data: String) -> Int!:
         return file_stream_write(self, data)
+
+impl BytesWriter for FileStream:
+    fn write_bytes(data: Bytes) -> Int!:
+        return file_stream_write_bytes(self, data)
 
 impl Closer for FileStream:
     fn close():

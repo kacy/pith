@@ -39,7 +39,8 @@ from types import get_type_info
 FLOAT_RETURNING_FUNCS := "pow,sqrt,floor,ceil,round,to_float,get_float,toml_get_float,json_get_float"
 BOOL_RETURNING_FUNCS := "file_exists,dir_exists,get_bool,object_has,has,toml_get_bool,toml_has,json_get_bool,json_object_has"
 INT_RETURNING_FUNCS := "abs,min,max,clamp,len,fnv1a,ord,exec,toml_get_int,toml_array_len,url_parse,url_port,json_parse,json_get_int,json_object_get,json_array_len"
-STRING_RETURNING_FUNCS := "sha256,hex_encode,hex_decode,from_hex,to_hex,b64_encode,b64_decode,chr,read_file,env,path_join,path_dir,path_base,path_ext,path_stem,scheme,host,query,fragment,decode,exec_output,type_of,get_string,toml_type_of,toml_get_string,url_scheme,url_host,url_path,url_query,url_fragment,url_to_string,url_encode,url_decode,json_type_of,json_get_string"
+STRING_RETURNING_FUNCS := "sha256,hex_encode,hex_decode,to_hex,b64_encode,chr,read_file,env,path_join,path_dir,path_base,path_ext,path_stem,scheme,host,query,fragment,decode,exec_output,type_of,get_string,toml_type_of,toml_get_string,url_scheme,url_host,url_path,url_query,url_fragment,url_to_string,url_encode,url_decode,json_type_of,json_get_string"
+BYTES_RETURNING_FUNCS := "bytes_from_string_utf8,read_file_bytes,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,byte_buffer_bytes,b64_decode,from_hex,bytes_slice,bytes_concat"
 LIST_RETURNING_FUNCS := "args,range,repeat_val,zeros,sort,sort_desc,reversed,take,drop,slice,unique,without,intersection,difference,flatten,chunks,json_object_keys"
 LIST_STRING_RETURNING_FUNCS := "sort_strings,zip,enumerate,toml_keys"
 BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,list_contains,list_contains_string,list_is_empty"
@@ -145,6 +146,8 @@ fn ir_resolve_type_hint(type_name: String) -> String:
         resolved = ir_type_aliases[resolved]
     if resolved == "String":
         return "string"
+    if resolved == "Bytes":
+        return "bytes"
     if resolved == "Bool":
         return "bool"
     if resolved == "Int":
@@ -196,6 +199,8 @@ fn ir_resolve_type_node(type_idx: Int) -> String:
             return "result_int"
         if inner_type == "bool":
             return "result_bool"
+        if inner_type == "bytes":
+            return "bytes"
         return inner_type
     return ""
 
@@ -371,6 +376,10 @@ fn ir_import_target_name(module_path: String, name: String) -> String:
         return "json_" + name
     if module_path == "std.toml":
         return "toml_" + name
+    if module_path == "std.encoding":
+        return "encoding_" + name
+    if module_path == "std.hash":
+        return "hash_" + name
     if module_path == "std.log":
         return "log_" + name
     if module_path == "std.os.path":
@@ -532,6 +541,8 @@ fn ir_type_from_tid(tid: Int) -> String:
             return "bool"
         if info.name == "String":
             return "string"
+        if info.name == "Bytes":
+            return "bytes"
         return ""
     if info.kind == "list":
         elem_info := get_type_info(info.inner)
@@ -573,6 +584,8 @@ fn ir_checked_result_kind(idx: Int) -> String:
         return "result_int"
     if inner_type == "bool":
         return "result_bool"
+    if inner_type == "bytes":
+        return "bytes"
     return inner_type
 
 fn ir_call_retkind(idx: Int, uses_result_abi: Bool) -> String:
@@ -706,6 +719,8 @@ fn ir_infer_type(idx: Int) -> String:
                 return "int"
             if STRING_RETURNING_FUNCS.contains(fname):
                 return "string"
+            if BYTES_RETURNING_FUNCS.contains(fname):
+                return "bytes"
             if LIST_RETURNING_FUNCS.contains(fname):
                 return "list"
             if LIST_STRING_RETURNING_FUNCS.contains(fname):
@@ -732,6 +747,8 @@ fn ir_infer_type(idx: Int) -> String:
                 return "int"
             if STRING_RETURNING_FUNCS.contains(alias_fname):
                 return "string"
+            if BYTES_RETURNING_FUNCS.contains(alias_fname):
+                return "bytes"
             if LIST_RETURNING_FUNCS.contains(alias_fname):
                 return "list"
             if LIST_STRING_RETURNING_FUNCS.contains(alias_fname):
@@ -761,10 +778,16 @@ fn ir_infer_type(idx: Int) -> String:
             return "bool"
         if STRING_RETURNING_METHODS.contains(meth):
             return "string"
+        if meth == "to_string_utf8":
+            return "string"
         if meth == "to_float":
             return "float"
         if meth == "len":
             return "int"
+        if meth == "slice" and obj_type == "bytes":
+            return "bytes"
+        if meth == "concat" and obj_type == "bytes":
+            return "bytes"
         if meth == "index_of" and (obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")):
             return "int"
         if meth == "slice" or meth == "sort":
@@ -800,6 +823,8 @@ fn ir_infer_type(idx: Int) -> String:
         coll_type := ir_infer_type(node.children[0])
         if coll_type == "string":
             return "string"
+        if coll_type == "bytes":
+            return "int"
         if coll_type == "list_string":
             return "string"
         if coll_type == "map" or coll_type == "map_int":
@@ -878,7 +903,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
         while ai < arg_regs.len():
             call_text = call_text + " " + arg_regs[ai].to_string()
             ai = ai + 1
-        uses_result_abi := ir_func_returns.contains_key(alias_fname)
+        uses_result_abi := ir_func_returns.contains_key(alias_fname) or ir_checked_result_kind(idx).len() > 0
         ir_emit_call_text(r, alias_fname, ir_call_retkind(idx, uses_result_abi), arg_regs.len(), call_text)
         return r
 
@@ -890,6 +915,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
             obj_type = ir_infer_type(node.children[0])
 
     obj_is_string := obj_type == "string"
+    obj_is_bytes := obj_type == "bytes"
     obj_is_bool := obj_type == "bool"
     obj_is_float := obj_type == "float"
     obj_is_map := obj_type == "map" or obj_type == "map_int"
@@ -911,6 +937,8 @@ fn ir_emit_method_call(idx: Int) -> Int:
     elif mname == "len":
         if obj_is_string:
             emit_name = "string_len"
+        elif obj_is_bytes:
+            emit_name = "bytes_len"
         elif obj_is_list:
             emit_name = "forge_list_len"
         elif obj_is_map:
@@ -945,6 +973,8 @@ fn ir_emit_method_call(idx: Int) -> Int:
     elif mname == "is_empty":
         if obj_is_string:
             emit_name = "string_is_empty"
+        elif obj_is_bytes:
+            emit_name = "bytes_is_empty"
         elif obj_is_list:
             emit_name = "list_is_empty"
         elif obj_is_map:
@@ -977,6 +1007,12 @@ fn ir_emit_method_call(idx: Int) -> Int:
         emit_name = "map_contains_ikey"
     elif mname == "insert" and obj_is_map_int:
         emit_name = "map_insert_ikey"
+    elif mname == "slice" and obj_is_bytes:
+        emit_name = "bytes_slice"
+    elif mname == "concat" and obj_is_bytes:
+        emit_name = "bytes_concat"
+    elif mname == "to_string_utf8" and obj_is_bytes:
+        emit_name = "bytes_to_string_utf8"
     if BOOL_RETURNING_METHODS.contains(emit_name):
         ir_var_types.insert("__last_call", "bool")
 
@@ -1010,7 +1046,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
         call_regs.push(arg_regs[ci])
         ci = ci + 1
     r := ir_reg()
-    uses_result_abi := impl_dispatch or ir_func_returns.contains_key(emit_name)
+    uses_result_abi := impl_dispatch or ir_func_returns.contains_key(emit_name) or ir_checked_result_kind(idx).len() > 0
     mut ret_type := ir_call_retkind(idx, uses_result_abi)
     if VOID_METHODS.contains(emit_name):
         ret_type = "void"
@@ -1220,6 +1256,7 @@ fn ir_expr(idx: Int) -> Int:
         left_type := ir_infer_type(node.children[0])
         right_type := ir_infer_type(node.children[1])
         is_str_op := left_type == "string" or right_type == "string"
+        is_bytes_op := left_type == "bytes" and right_type == "bytes"
         is_float_op := left_type == "float" or right_type == "float"
         if is_float_op and (op == "add" or op == "sub" or op == "mul" or op == "div"):
             ir_emit("f" + op + " " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
@@ -1239,6 +1276,8 @@ fn ir_expr(idx: Int) -> Int:
         elif op == "eq":
             if is_str_op:
                 ir_emit_call2(r, "__str_eq", "bool", left_r, right_r)
+            elif is_bytes_op:
+                ir_emit_call2(r, "bytes_eq", "bool", left_r, right_r)
             else:
                 ir_emit("eq " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
         elif op == "neq":
@@ -1246,6 +1285,12 @@ fn ir_expr(idx: Int) -> Int:
                 # str_neq = 1 - str_eq
                 eq_r := ir_reg()
                 ir_emit_call2(eq_r, "__str_eq", "bool", left_r, right_r)
+                one_r := ir_reg()
+                ir_emit("iconst " + one_r.to_string() + " 1")
+                ir_emit("sub " + r.to_string() + " " + one_r.to_string() + " " + eq_r.to_string())
+            elif is_bytes_op:
+                eq_r := ir_reg()
+                ir_emit_call2(eq_r, "bytes_eq", "bool", left_r, right_r)
                 one_r := ir_reg()
                 ir_emit("iconst " + one_r.to_string() + " 1")
                 ir_emit("sub " + r.to_string() + " " + one_r.to_string() + " " + eq_r.to_string())
@@ -1314,7 +1359,24 @@ fn ir_expr(idx: Int) -> Int:
             return r
         if ir_emit_tests and fname == "assert_eq" and arg_regs.len() >= 2:
             cmp_r := ir_reg()
-            ir_emit("eq " + cmp_r.to_string() + " " + arg_regs[0].to_string() + " " + arg_regs[1].to_string())
+            mut left_type := ""
+            mut right_type := ""
+            if node.children.len() > 1:
+                mut left_idx := node.children[1]
+                left_node := get_node(left_idx)
+                if left_node.kind == "arg" and left_node.children.len() > 0:
+                    left_idx = left_node.children[0]
+                left_type = ir_infer_type(left_idx)
+            if node.children.len() > 2:
+                mut right_idx := node.children[2]
+                right_node := get_node(right_idx)
+                if right_node.kind == "arg" and right_node.children.len() > 0:
+                    right_idx = right_node.children[0]
+                right_type = ir_infer_type(right_idx)
+            if left_type == "bytes" and right_type == "bytes":
+                ir_emit_call2(cmp_r, "bytes_eq", "bool", arg_regs[0], arg_regs[1])
+            else:
+                ir_emit("eq " + cmp_r.to_string() + " " + arg_regs[0].to_string() + " " + arg_regs[1].to_string())
             ok_l := ir_label()
             fail_l := ir_label()
             ir_emit("brif " + cmp_r.to_string() + " " + ok_l + " " + fail_l)
@@ -1331,7 +1393,28 @@ fn ir_expr(idx: Int) -> Int:
             return r
         if ir_emit_tests and fname == "assert_ne" and arg_regs.len() >= 2:
             cmp_r := ir_reg()
-            ir_emit("neq " + cmp_r.to_string() + " " + arg_regs[0].to_string() + " " + arg_regs[1].to_string())
+            mut left_type := ""
+            mut right_type := ""
+            if node.children.len() > 1:
+                mut left_idx := node.children[1]
+                left_node := get_node(left_idx)
+                if left_node.kind == "arg" and left_node.children.len() > 0:
+                    left_idx = left_node.children[0]
+                left_type = ir_infer_type(left_idx)
+            if node.children.len() > 2:
+                mut right_idx := node.children[2]
+                right_node := get_node(right_idx)
+                if right_node.kind == "arg" and right_node.children.len() > 0:
+                    right_idx = right_node.children[0]
+                right_type = ir_infer_type(right_idx)
+            if left_type == "bytes" and right_type == "bytes":
+                eq_r := ir_reg()
+                ir_emit_call2(eq_r, "bytes_eq", "bool", arg_regs[0], arg_regs[1])
+                one_r := ir_reg()
+                ir_emit("iconst " + one_r.to_string() + " 1")
+                ir_emit("sub " + cmp_r.to_string() + " " + one_r.to_string() + " " + eq_r.to_string())
+            else:
+                ir_emit("neq " + cmp_r.to_string() + " " + arg_regs[0].to_string() + " " + arg_regs[1].to_string())
             ok_l := ir_label()
             fail_l := ir_label()
             ir_emit("brif " + cmp_r.to_string() + " " + ok_l + " " + fail_l)
@@ -1353,7 +1436,7 @@ fn ir_expr(idx: Int) -> Int:
         while ai < arg_regs.len():
             call_text = call_text + " " + arg_regs[ai].to_string()
             ai = ai + 1
-        uses_result_abi := ir_static_callee_uses_result_abi(node.children[0])
+        uses_result_abi := ir_static_callee_uses_result_abi(node.children[0]) or ir_checked_result_kind(idx).len() > 0
         ir_emit_call_text(r, fname, ir_call_retkind(idx, uses_result_abi), arg_regs.len(), call_text)
         return r
 
@@ -1629,6 +1712,8 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
             value_type = ir_infer_type(idx)
         if obj_type == "string":
             ir_emit_call2(r, "char_at", "string", obj_r, idx_r)
+        elif obj_type == "bytes":
+            ir_emit_call2(r, "bytes_get", "int", obj_r, idx_r)
         elif obj_type == "map_int":
             if value_type.len() == 0:
                 value_type = "unknown"

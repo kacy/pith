@@ -1,20 +1,17 @@
 # std.encoding — base64 and hex encoding/decoding
 #
-# Encode and decode data using base64 (RFC 4648) and hexadecimal representations.
-# Encoding functions always succeed. Decoding functions return Result types
-# because invalid input is an error.
+# this module is bytes-first.
+# raw encode/decode functions work on Bytes, and text helpers cross the
+# utf-8 boundary explicitly when that's what you want.
 #
-#   from std.encoding import b64_encode, b64_decode, to_hex, from_hex
-#   encoded := b64_encode("hello world")
-#   decoded := b64_decode(encoded)!
-#   hex_str := to_hex("hello")  # "68656c6c6f"
+#   import std.bytes as bytes
+#   import std.encoding as encoding
+#   encoded := encoding.b64_encode(bytes.from_string_utf8("hello world"))
+#   decoded := encoding.b64_decode(encoded)!.to_string_utf8()!
+#   hex_str := encoding.to_hex(bytes.from_string_utf8("hello"))
 
-# ===============================================================
-# Base64 Encoding and Decoding
-# ===============================================================
+import std.bytes as bytes
 
-# Converts a base64 character to its 6-bit value (0-63).
-# Returns -1 for invalid characters.
 fn b64_char_val(c: String) -> Int:
     if c >= "A" and c <= "Z":
         return ord(c) - 65
@@ -26,68 +23,83 @@ fn b64_char_val(c: String) -> Int:
         return 62
     if c == "/":
         return 63
-    return 0 - 1
+    return -1
 
-# Encodes a string to base64 (RFC 4648 standard alphabet).
-# Handles padding automatically for inputs not divisible by 3.
-pub fn b64_encode(input: String) -> String:
+pub fn b64_encode(input: Bytes) -> String:
     table := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
     mut result := ""
     mut i := 0
-    # process 3 bytes at a time
     while i + 2 < input.len():
-        a := ord(input[i])
-        b := ord(input[i + 1])
-        c := ord(input[i + 2])
+        a := input[i]
+        b := input[i + 1]
+        c := input[i + 2]
         result = result + table[a / 4]
         result = result + table[(a % 4) * 16 + b / 16]
         result = result + table[(b % 16) * 4 + c / 64]
         result = result + table[c % 64]
         i = i + 3
-    # handle remaining 1 or 2 bytes
     if i < input.len():
-        a := ord(input[i])
+        a := input[i]
         result = result + table[a / 4]
         if i + 1 < input.len():
-            b := ord(input[i + 1])
+            b := input[i + 1]
             result = result + table[(a % 4) * 16 + b / 16]
             result = result + table[(b % 16) * 4]
-        if i + 1 >= input.len():
+        else:
             result = result + table[(a % 4) * 16]
             result = result + "="
         result = result + "="
     return result
 
-# Decodes a base64 string back to the original data.
-# Fails if the input length is not a multiple of 4 or contains invalid characters.
-pub fn b64_decode(input: String) -> String!:
+fn encoding_b64_encode(input: Bytes) -> String:
+    return b64_encode(input)
+
+pub fn b64_encode_string(input: String) -> String:
+    return b64_encode(bytes.from_string_utf8(input))
+
+fn encoding_b64_encode_string(input: String) -> String:
+    return b64_encode_string(input)
+
+pub fn b64_decode(input: String) -> Bytes!:
     if input.len() % 4 != 0:
         fail "invalid base64: length not multiple of 4"
-    mut result := ""
+
+    buf := bytes.buffer_with_capacity(input.len())
     mut i := 0
     while i < input.len():
         a := b64_char_val(input[i])
         b := b64_char_val(input[i + 1])
+        if a < 0 or b < 0:
+            fail "invalid base64 character"
+
         mut c := 0
         if input[i + 2] != "=":
             c = b64_char_val(input[i + 2])
+            if c < 0:
+                fail "invalid base64 character"
         mut d := 0
         if input[i + 3] != "=":
             d = b64_char_val(input[i + 3])
-        result = result + chr(a * 4 + b / 16)
+            if d < 0:
+                fail "invalid base64 character"
+
+        buf.write_byte(a * 4 + b / 16)!
         if input[i + 2] != "=":
-            result = result + chr((b % 16) * 16 + c / 4)
+            buf.write_byte((b % 16) * 16 + c / 4)!
         if input[i + 3] != "=":
-            result = result + chr((c % 4) * 64 + d)
+            buf.write_byte((c % 4) * 64 + d)!
         i = i + 4
-    return result
+    return buf.bytes()
 
-# ===============================================================
-# Hexadecimal Encoding and Decoding
-# ===============================================================
+fn encoding_b64_decode(input: String) -> Bytes!:
+    return b64_decode(input)
 
-# Converts a hex character to its 4-bit value (0-15).
-# Returns -1 for invalid characters.
+pub fn b64_decode_utf8(input: String) -> String!:
+    return b64_decode(input)!.to_string_utf8()!
+
+fn encoding_b64_decode_utf8(input: String) -> String!:
+    return b64_decode_utf8(input)
+
 fn hex_nibble(c: String) -> Int:
     if c >= "0" and c <= "9":
         return ord(c) - 48
@@ -95,32 +107,47 @@ fn hex_nibble(c: String) -> Int:
         return ord(c) - 97 + 10
     if c >= "A" and c <= "F":
         return ord(c) - 65 + 10
-    return 0 - 1
+    return -1
 
-# Encodes a string as lowercase hexadecimal (two hex chars per byte).
-# Example: to_hex("hello") -> "68656c6c6f"
-pub fn to_hex(input: String) -> String:
+pub fn to_hex(input: Bytes) -> String:
     hex_digits := "0123456789abcdef"
     mut result := ""
     mut position := 0
     while position < input.len():
-        byte_value := ord(input[position])
+        byte_value := input[position]
         result = result + hex_digits[byte_value / 16] + hex_digits[byte_value % 16]
         position = position + 1
     return result
 
-# Decodes a hex string back to the original data.
-# Fails if the input has odd length or contains non-hex characters.
-pub fn from_hex(input: String) -> String!:
+fn encoding_to_hex(input: Bytes) -> String:
+    return to_hex(input)
+
+pub fn to_hex_string(input: String) -> String:
+    return to_hex(bytes.from_string_utf8(input))
+
+fn encoding_to_hex_string(input: String) -> String:
+    return to_hex_string(input)
+
+pub fn from_hex(input: String) -> Bytes!:
     if input.len() % 2 != 0:
         fail "invalid hex: odd length"
-    mut result := ""
+
+    buf := bytes.buffer_with_capacity(input.len() / 2)
     mut position := 0
     while position < input.len():
         high_nibble := hex_nibble(input[position])
         low_nibble := hex_nibble(input[position + 1])
         if high_nibble < 0 or low_nibble < 0:
             fail "invalid hex character"
-        result = result + chr(high_nibble * 16 + low_nibble)
+        buf.write_byte(high_nibble * 16 + low_nibble)!
         position = position + 2
-    return result
+    return buf.bytes()
+
+fn encoding_from_hex(input: String) -> Bytes!:
+    return from_hex(input)
+
+pub fn from_hex_utf8(input: String) -> String!:
+    return from_hex(input)!.to_string_utf8()!
+
+fn encoding_from_hex_utf8(input: String) -> String!:
+    return from_hex_utf8(input)

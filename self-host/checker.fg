@@ -124,6 +124,10 @@ fn module_import_target_name(module_path: String, name: String) -> String:
         return "json_" + name
     if module_path == "std.toml":
         return "toml_" + name
+    if module_path == "std.encoding":
+        return "encoding_" + name
+    if module_path == "std.hash":
+        return "hash_" + name
     if module_path == "std.log":
         return "log_" + name
     if module_path == "std.net.url":
@@ -226,6 +230,7 @@ fn register_builtin_types():
     tid_float := lookup_type_id("Float")
     tid_bool := lookup_type_id("Bool")
     tid_string := lookup_type_id("String")
+    tid_bytes := lookup_type_id("Bytes")
     tid_void := lookup_type_id("Void")
     tid_err := lookup_type_id("<error>")
 
@@ -237,6 +242,7 @@ fn register_builtin_types():
     int_result := add_type_info(ti_result(tid_int, tid_err))
     float_result := add_type_info(ti_result(tid_float, tid_err))
     str_result := add_type_info(ti_result(tid_string, tid_err))
+    bytes_result := add_type_info(ti_result(tid_bytes, tid_err))
     bool_result := add_type_info(ti_result(tid_bool, tid_err))
     opt_string := add_type_info(ti_optional(tid_string))
 
@@ -334,11 +340,15 @@ fn register_builtin_types():
     define_builtin_function("parse_int", create_function_type([TID_STRING], int_result))
     # (String) -> Float!
     define_builtin_function("parse_float", create_function_type([TID_STRING], float_result))
+    define_builtin_function("bytes_from_string_utf8", create_function_type([TID_STRING], tid_bytes))
     # (String) -> String!
     str_to_str_result := create_function_type([TID_STRING], str_result)
     define_builtin_function("read_file", str_to_str_result)
     define_builtin_function("exec_output", str_to_str_result)
     define_builtin_function("dns_resolve", str_to_str_result)
+    define_builtin_function("read_file_bytes", create_function_type([TID_STRING], bytes_result))
+    define_builtin_function("b64_decode", create_function_type([TID_STRING], bytes_result))
+    define_builtin_function("from_hex", create_function_type([TID_STRING], bytes_result))
     # (String) -> Int!
     define_builtin_function("file_open_read", create_function_type([TID_STRING], int_result))
     define_builtin_function("file_open_write", create_function_type([TID_STRING], int_result))
@@ -352,10 +362,27 @@ fn register_builtin_types():
     two_str_to_bool_result := create_function_type([TID_STRING, TID_STRING], bool_result)
     define_builtin_function("write_file", two_str_to_bool_result)
     define_builtin_function("append_file", two_str_to_bool_result)
+    define_builtin_function("write_file_bytes", create_function_type([TID_STRING, tid_bytes], bool_result))
+    define_builtin_function("append_file_bytes", create_function_type([TID_STRING, tid_bytes], bool_result))
+    define_builtin_function("bytes_eq", create_function_type([tid_bytes, tid_bytes], TID_BOOL))
+    define_builtin_function("bytes_concat", create_function_type([tid_bytes, tid_bytes], tid_bytes))
+    define_builtin_function("bytes_len", create_function_type([tid_bytes], TID_INT))
+    define_builtin_function("bytes_is_empty", create_function_type([tid_bytes], TID_BOOL))
+    define_builtin_function("bytes_get", create_function_type([tid_bytes, TID_INT], TID_INT))
+    define_builtin_function("bytes_slice", create_function_type([tid_bytes, TID_INT, TID_INT], tid_bytes))
+    define_builtin_function("bytes_to_string_utf8", create_function_type([tid_bytes], str_result))
+    define_builtin_function("byte_buffer_new", create_function_type([], TID_INT))
+    define_builtin_function("byte_buffer_with_capacity", create_function_type([TID_INT], TID_INT))
+    define_builtin_function("byte_buffer_write", create_function_type([TID_INT, tid_bytes], int_result))
+    define_builtin_function("byte_buffer_write_byte", create_function_type([TID_INT, TID_INT], int_result))
+    define_builtin_function("byte_buffer_bytes", create_function_type([TID_INT], tid_bytes))
+    define_builtin_function("byte_buffer_clear", create_function_type([TID_INT], TID_VOID))
     # (Int, Int) -> String!
     define_builtin_function("file_read", create_function_type([TID_INT, TID_INT], str_result))
     # (Int, String) -> Int!
     define_builtin_function("file_write", create_function_type([TID_INT, TID_STRING], int_result))
+    define_builtin_function("file_read_bytes", create_function_type([TID_INT, TID_INT], bytes_result))
+    define_builtin_function("file_write_bytes", create_function_type([TID_INT, tid_bytes], int_result))
     # (Int) -> Void
     define_builtin_function("file_close", int_to_void)
 
@@ -370,6 +397,8 @@ fn register_builtin_types():
     define_builtin_function("tcp_read", create_function_type([TID_INT, TID_INT], str_result))
     # (Int, String) -> Int!
     define_builtin_function("tcp_write", create_function_type([TID_INT, TID_STRING], int_result))
+    define_builtin_function("tcp_read_bytes", create_function_type([TID_INT, TID_INT], bytes_result))
+    define_builtin_function("tcp_write_bytes", create_function_type([TID_INT, tid_bytes], int_result))
     # (Int, Int) -> Void
     define_builtin_function("tcp_set_timeout", create_function_type([TID_INT, TID_INT], TID_VOID))
 
@@ -381,6 +410,9 @@ fn register_builtin_types():
     # (Int, Int) -> String!
     define_builtin_function("process_read", create_function_type([TID_INT, TID_INT], str_result))
     define_builtin_function("process_read_err", create_function_type([TID_INT, TID_INT], str_result))
+    define_builtin_function("process_write_bytes", create_function_type([TID_INT, tid_bytes], int_result))
+    define_builtin_function("process_read_bytes", create_function_type([TID_INT, TID_INT], bytes_result))
+    define_builtin_function("process_read_err_bytes", create_function_type([TID_INT, TID_INT], bytes_result))
     # (Int) -> Int
     define_builtin_function("process_wait", int_to_int)
     # (Int) -> Bool
@@ -448,9 +480,13 @@ fn register_builtin_types():
     fix_builtin_binding("json_object_keys", [tid_int], list_string)
     fix_builtin_binding("parse_int", [tid_string], int_result)
     fix_builtin_binding("parse_float", [tid_string], float_result)
+    fix_builtin_binding("bytes_from_string_utf8", [tid_string], tid_bytes)
     fix_builtin_binding("read_file", [tid_string], str_result)
     fix_builtin_binding("exec_output", [tid_string], str_result)
     fix_builtin_binding("dns_resolve", [tid_string], str_result)
+    fix_builtin_binding("read_file_bytes", [tid_string], bytes_result)
+    fix_builtin_binding("b64_decode", [tid_string], bytes_result)
+    fix_builtin_binding("from_hex", [tid_string], bytes_result)
     fix_builtin_binding("file_open_read", [tid_string], int_result)
     fix_builtin_binding("file_open_write", [tid_string], int_result)
     fix_builtin_binding("file_open_append", [tid_string], int_result)
@@ -459,19 +495,41 @@ fn register_builtin_types():
     fix_builtin_binding("json_object_has", [tid_int, tid_string], tid_bool)
     fix_builtin_binding("write_file", [tid_string, tid_string], bool_result)
     fix_builtin_binding("append_file", [tid_string, tid_string], bool_result)
+    fix_builtin_binding("write_file_bytes", [tid_string, tid_bytes], bool_result)
+    fix_builtin_binding("append_file_bytes", [tid_string, tid_bytes], bool_result)
+    fix_builtin_binding("bytes_eq", [tid_bytes, tid_bytes], tid_bool)
+    fix_builtin_binding("bytes_concat", [tid_bytes, tid_bytes], tid_bytes)
+    fix_builtin_binding("bytes_len", [tid_bytes], tid_int)
+    fix_builtin_binding("bytes_is_empty", [tid_bytes], tid_bool)
+    fix_builtin_binding("bytes_get", [tid_bytes, tid_int], tid_int)
+    fix_builtin_binding("bytes_slice", [tid_bytes, tid_int, tid_int], tid_bytes)
+    fix_builtin_binding("bytes_to_string_utf8", [tid_bytes], str_result)
+    fix_builtin_binding("byte_buffer_new", [], tid_int)
+    fix_builtin_binding("byte_buffer_with_capacity", [tid_int], tid_int)
+    fix_builtin_binding("byte_buffer_write", [tid_int, tid_bytes], int_result)
+    fix_builtin_binding("byte_buffer_write_byte", [tid_int, tid_int], int_result)
+    fix_builtin_binding("byte_buffer_bytes", [tid_int], tid_bytes)
+    fix_builtin_binding("byte_buffer_clear", [tid_int], tid_void)
     fix_builtin_binding("file_read", [tid_int, tid_int], str_result)
     fix_builtin_binding("file_write", [tid_int, tid_string], int_result)
+    fix_builtin_binding("file_read_bytes", [tid_int, tid_int], bytes_result)
+    fix_builtin_binding("file_write_bytes", [tid_int, tid_bytes], int_result)
     fix_builtin_binding("file_close", [tid_int], tid_void)
     fix_builtin_binding("tcp_connect", [tid_string, tid_int], int_result)
     fix_builtin_binding("tcp_listen", [tid_string, tid_int], int_result)
     fix_builtin_binding("tcp_accept", [tid_int], int_result)
     fix_builtin_binding("tcp_read", [tid_int, tid_int], str_result)
     fix_builtin_binding("tcp_write", [tid_int, tid_string], int_result)
+    fix_builtin_binding("tcp_read_bytes", [tid_int, tid_int], bytes_result)
+    fix_builtin_binding("tcp_write_bytes", [tid_int, tid_bytes], int_result)
     fix_builtin_binding("tcp_set_timeout", [tid_int, tid_int], tid_void)
     fix_builtin_binding("process_spawn", [tid_string], int_result)
     fix_builtin_binding("process_write", [tid_int, tid_string], int_result)
     fix_builtin_binding("process_read", [tid_int, tid_int], str_result)
     fix_builtin_binding("process_read_err", [tid_int, tid_int], str_result)
+    fix_builtin_binding("process_write_bytes", [tid_int, tid_bytes], int_result)
+    fix_builtin_binding("process_read_bytes", [tid_int, tid_int], bytes_result)
+    fix_builtin_binding("process_read_err_bytes", [tid_int, tid_int], bytes_result)
     fix_builtin_binding("process_wait", [tid_int], tid_int)
     fix_builtin_binding("process_kill", [tid_int], tid_bool)
     fix_builtin_binding("process_close", [tid_int], tid_void)
@@ -2215,6 +2273,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         recv_info = get_type_info(dispatch_type)
 
     tid_string := lookup_type_id("String")
+    tid_bytes := lookup_type_id("Bytes")
     tid_int := lookup_type_id("Int")
     tid_float := lookup_type_id("Float")
     tid_bool := lookup_type_id("Bool")
@@ -2222,6 +2281,8 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     # string methods
     if dispatch_type == tid_string:
         return check_string_method_call(method_name, arg_indices, scope_id)
+    if dispatch_type == tid_bytes:
+        return check_bytes_method_call(method_name, arg_indices, scope_id)
     # primitive methods
     if dispatch_type == tid_int:
         return check_int_method_call(method_name, arg_indices, scope_id)
@@ -2346,6 +2407,33 @@ fn check_string_method_call(method: String, args: List[Int], scope_id: Int) -> I
         expect_no_arguments(method, args)
         return intern_list_type(tid_string)
     report_error("E209", "String has no method '" + method + "'")
+    return TID_ERR
+
+# ---------------------------------------------------------------
+# bytes methods
+# ---------------------------------------------------------------
+
+fn check_bytes_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
+    tid_int := lookup_type_id("Int")
+    tid_string := lookup_type_id("String")
+    tid_bytes := lookup_type_id("Bytes")
+    tid_bool := lookup_type_id("Bool")
+    if method == "len":
+        expect_no_arguments(method, args)
+        return tid_int
+    if method == "is_empty":
+        expect_no_arguments(method, args)
+        return tid_bool
+    if method == "slice":
+        expect_two_int_arguments(method, args, scope_id)
+        return tid_bytes
+    if method == "concat":
+        expect_one_typed_argument(method, args, tid_bytes, scope_id)
+        return tid_bytes
+    if method == "to_string_utf8":
+        expect_no_arguments(method, args)
+        return add_type_info(ti_result(tid_string, TID_ERR))
+    report_error("E209", "Bytes has no method '" + method + "'")
     return TID_ERR
 
 # ---------------------------------------------------------------
@@ -2719,6 +2807,8 @@ fn parse_integer_string(s: String) -> Int:
 
 fn check_index_expression(node: Node, scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
+    tid_bytes := lookup_type_id("Bytes")
+    tid_int := lookup_type_id("Int")
     if node.children.len() < 2:
         return TID_ERR
     mut obj_type := c_check_expr(node.children[0], scope_id)
@@ -2740,6 +2830,11 @@ fn check_index_expression(node: Node, scope_id: Int) -> Int:
             report_error("E217", "string index must be integer, got " + get_type_name(idx_type))
             return TID_ERR
         return tid_string
+    if obj_type == tid_bytes:
+        if is_integer_type(idx_type) == false:
+            report_error("E217", "bytes index must be integer, got " + get_type_name(idx_type))
+            return TID_ERR
+        return tid_int
     if obj_info.kind == "list":
         if is_integer_type(idx_type) == false:
             report_error("E217", "list index must be integer, got " + get_type_name(idx_type))

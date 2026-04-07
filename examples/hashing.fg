@@ -1,22 +1,20 @@
 # hashing — SHA-256 and FNV-1a hash functions
 # demonstrates: hash consistency, determinism, and input sensitivity
 
-from std.hash import sha256, fnv1a
+import std.bytes as bytes
+import std.hash as hash
 
 fn main():
-    # SHA-256 known test vectors
-    print("sha256 empty: " + sha256(""))
-    print("sha256 hello: " + sha256("hello"))
-    print("sha256 abc: " + sha256("abc"))
+    print("sha256 empty: " + hash.sha256(bytes.empty()))
+    print("sha256 hello: " + hash.sha256_string("hello"))
+    print("sha256 abc: " + hash.sha256_string("abc"))
 
-    # FNV-1a hash consistency - same input produces same output
-    hash_hello_first := fnv1a("hello")
-    hash_hello_second := fnv1a("hello")
-    hash_world := fnv1a("world")
+    hash_hello_first := hash.fnv1a_string("hello")
+    hash_hello_second := hash.fnv1a_string("hello")
+    hash_world := hash.fnv1a_string("world")
     print("fnv1a consistent: " + (hash_hello_first == hash_hello_second).to_string())
     print("fnv1a differs: " + (hash_hello_first != hash_world).to_string())
 
-    # SHA-256 is deterministic - same input always produces same hash
-    hash_forge_first := sha256("forge")
-    hash_forge_second := sha256("forge")
+    hash_forge_first := hash.sha256_string("forge")
+    hash_forge_second := hash.sha256_string("forge")
     print("sha256 consistent: " + (hash_forge_first == hash_forge_second).to_string())

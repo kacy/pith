@@ -382,12 +382,12 @@ pub fn read_request_buffered(reader: BufferedStringReader) -> String!:
     return read_request_from_buffered_string(reader)
 
 pub fn read_request(fd: Int) -> String!:
-    stream := io.tcp_stream_from_fd(fd)
+    stream := io.from_fd(fd)
     reader := io.buffered_tcp_stream(stream)
     return read_request_from_buffered_tcp(reader)
 
 pub fn send_response(fd: Int, response: String) -> Int!:
-    stream := io.tcp_stream_from_fd(fd)
+    stream := io.from_fd(fd)
     writer := io.buffered_tcp_writer(stream)
     written := io.buffered_tcp_writer_write(writer, response)!
     io.buffered_tcp_writer_flush(writer)!
@@ -399,7 +399,7 @@ pub fn send_response(fd: Int, response: String) -> Int!:
 # ===============================================================
 
 pub fn get(host: String, port: Int, url_path: String) -> String!:
-    conn := io.tcp_stream_connect(host, port)!
+    conn := io.connect(host, port)!
     crlf := chr(13) + chr(10)
     mut req := "GET " + url_path
     req = req + " HTTP/1.1"

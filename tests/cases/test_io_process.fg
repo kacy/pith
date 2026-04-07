@@ -2,20 +2,18 @@ import std.io as io
 
 fn main() -> Int!:
     stdout_proc := io.spawn_process("printf 'hello from child'")!
-    print(io.read_all_process_stdout_chunked(io.stdout(stdout_proc), 3)!)
+    print(io.read_stdout_chunked(stdout_proc, 3)!)
     print(io.wait(stdout_proc).to_string())
     io.close_process(stdout_proc)
 
     stderr_proc := io.spawn_process("printf 'problem' >&2")!
-    print(io.read_all_process_stderr_chunked(io.stderr(stderr_proc), 2)!)
+    print(io.read_stderr_chunked(stderr_proc, 2)!)
     print(io.wait(stderr_proc).to_string())
     io.close_process(stderr_proc)
 
     io_proc := io.spawn_process("head -c 5")!
-    stdin := io.stdin(io_proc)
-    stdout := io.stdout(io_proc)
-    print(io.write_all_process_stdin(stdin, "hello world")!.to_string())
-    print(io.read_all_process_stdout_chunked(stdout, 2)!)
+    print(io.write_stdin(io_proc, "hello world")!.to_string())
+    print(io.read_stdout_chunked(io_proc, 2)!)
     print(io.wait(io_proc).to_string())
     io.close_process(io_proc)
     return 0

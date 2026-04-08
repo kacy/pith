@@ -203,47 +203,58 @@ fn builtin_retkind(name: String) -> String:
         return "result_bool"
     return ""
 
-fn is_runtime_builtin_module(module_path: String) -> Bool:
-    return module_path == "std.fmt" or module_path == "std.net.tcp" or module_path == "std.net.dns" or module_path == "std.net.url" or module_path == "std.os.path" or module_path == "std.os.process"
+fn is_explicit_ir_retkind(kind: String) -> Bool:
+    if kind.starts_with("struct:"):
+        return true
+    return kind == "unknown" or kind == "void" or kind == "int" or kind == "result_int" or kind == "float" or kind == "bool" or kind == "result_bool" or kind == "string" or kind == "bytes" or kind == "list" or kind == "list_string" or kind == "map" or kind == "map_int" or kind == "set" or kind == "set_int" or kind == "tuple" or kind == "channel" or kind == "task"
 
-fn rewrite_call_retkinds(ir: String) -> String:
+fn ir_contract_error(line_no: Int, message: String):
+    print("ir contract error on line " + line_no.to_string() + ": " + message)
+    exit(1)
+
+fn validate_combined_ir_contract(ir: String):
     mut func_kinds: Map[String, String] := {}
+    mut struct_names: Map[String, Bool] := {}
     mut start := 0
+    mut line_no := 1
     while start <= ir.len():
         end := line_end(ir, start)
         line := ir.substring(start, end)
         parts := line.split(" ")
+        if parts.len() >= 2 and parts[0] == "struct":
+            struct_names.insert(parts[1], true)
         if parts.len() >= 4 and parts[0] == "func":
-            func_kinds.insert(parts[1], parts[3])
+            retkind := parts[3]
+            if not is_explicit_ir_retkind(retkind) and struct_names.contains_key(retkind):
+                ir_contract_error(line_no, "bare or unknown function retkind '" + retkind + "'")
+            func_kinds.insert(parts[1], retkind)
         if end >= ir.len():
             break
         start = end + 1
+        line_no = line_no + 1
 
-    mut out: List[String] := []
     start = 0
+    line_no = 1
     while start <= ir.len():
         end := line_end(ir, start)
         line := ir.substring(start, end)
         parts := line.split(" ")
         if parts.len() >= 5 and parts[0] == "call":
-            mut expected := ""
-            if func_kinds.contains_key(parts[2]):
-                expected = func_kinds[parts[2]]
-            elif builtin_retkind(parts[2]).len() > 0:
-                expected = builtin_retkind(parts[2])
-            current := parts[3]
-            if expected.len() > 0:
-                if current == "unknown" or (current == "int" and expected == "result_int") or (current == "bool" and expected == "result_bool"):
-                    out.push("call " + parts[1] + " " + parts[2] + " " + expected + " " + join_from(parts, 4))
-                    if end >= ir.len():
-                        break
-                    start = end + 1
-                    continue
-        out.push(line)
+            callee := parts[2]
+            retkind := parts[3]
+            if not is_explicit_ir_retkind(retkind) and struct_names.contains_key(retkind):
+                ir_contract_error(line_no, "bare or unknown call retkind '" + retkind + "' for " + callee)
+            builtin_kind := builtin_retkind(callee)
+            if builtin_kind.len() > 0 and builtin_kind != retkind:
+                ir_contract_error(line_no, "builtin call retkind '" + retkind + "' does not match expected '" + builtin_kind + "' for " + callee)
         if end >= ir.len():
             break
         start = end + 1
-    return out.join(chr(10))
+        line_no = line_no + 1
+    return
+
+fn is_runtime_builtin_module(module_path: String) -> Bool:
+    return module_path == "std.fmt" or module_path == "std.net.tcp" or module_path == "std.net.dns" or module_path == "std.net.url" or module_path == "std.os.path" or module_path == "std.os.process"
 
 fn parse_args() -> CliArgs:
     a := args()
@@ -346,7 +357,9 @@ fn emit_combined_file(path: String, emit_tests: Bool) -> String!:
     main_ir = rewrite_main_ir(main_ir, imported_global_map, imported_function_map, imported_init_funcs)
     all_ir.push(main_ir)
 
-    print(rewrite_call_retkinds(all_ir.join(chr(10) + chr(10))))
+    combined_ir := all_ir.join(chr(10) + chr(10))
+    validate_combined_ir_contract(combined_ir)
+    print(combined_ir)
     return ""
 
 fn main() -> Int:

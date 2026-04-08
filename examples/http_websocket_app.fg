@@ -5,6 +5,7 @@ import std.net.http as http
 import std.net.websocket as websocket
 from std.io import BufferedBytesReader, BufferedBytesWriter
 from std.net.http import HttpRequestBytes
+
 fn query_param(query: String, name: String) -> String:
     if query == "":
         return ""
@@ -25,15 +26,11 @@ fn write_response(writer: BufferedBytesWriter, response: String) -> Int!:
     if flushed.is_err:
         fail "http response flush failed"
     return response.len()
+
 fn handle_app(req: HttpRequestBytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> String!:
-    method := req.method()!
-    path := req.path()!
-    if path == "/ws" and websocket.is_upgrade_request(req):
-        ws := websocket.accept_buffered(req, reader, writer)!
-        msg := ws.recv_text()!
-        ws.send_text("echo:" + msg)!
-        return "ws:" + msg
-    if method == "GET" and path == "/greet":
+    if websocket.route_echo_buffered(req, reader, writer, "/ws", "", "echo:", "")!:
+        return "ws:ok"
+    if req.is_get("/greet")!:
         mut name := query_param(req.query()!, "name")
         if name == "":
             name = "stranger"

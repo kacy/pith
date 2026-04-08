@@ -496,6 +496,40 @@ fn ir_register_struct_layout(name: String, field_names: List[String], field_type
     ir_struct_names.insert(name, field_names.len())
     ir_emit("struct " + name + " " + field_names.join(" "))
 
+fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool):
+    root := get_node(root_idx)
+    mut i := 0
+    while i < root.children.len():
+        child := root.children[i]
+        mut cn := get_node(child)
+        if cn.kind == "pub" and cn.children.len() > 0:
+            cn = get_node(cn.children[0])
+        if cn.kind == "struct_decl":
+            mut sname := cn.value
+            if sname.contains("["):
+                sname = sname.substring(0, sname.index_of("["))
+            mut field_names: List[String] := []
+            mut j := 0
+            while j < cn.children.len():
+                fc := cn.children[j]
+                fn_node := get_node(fc)
+                if fn_node.kind == "field":
+                    mut field_name := fn_node.value
+                    if field_name.contains(" "):
+                        field_name = field_name.split(" ")[0]
+                    field_index := field_names.len()
+                    field_names.push(field_name)
+                    if fn_node.children.len() > 0:
+                        type_node := get_node(fn_node.children[0])
+                        if type_node.kind == "type" or type_node.kind == "generic_type":
+                            ir_struct_field_lookup.insert(sname + "." + field_name, ir_resolve_type_node(fn_node.children[0]))
+                    ir_struct_field_index_lookup.insert(sname + "." + field_name, field_index.to_string())
+                j = j + 1
+            ir_struct_names.insert(sname, field_names.len())
+            if emit_decl:
+                ir_emit("struct " + sname + " " + field_names.join(" "))
+        i = i + 1
+
 fn ir_seed_global_types():
     for name in ir_global_int_names:
         ir_var_types.insert(name, "int")
@@ -2473,40 +2507,11 @@ pub fn emit_ir(root_idx: Int) -> String:
     ir_struct_field_lookup = {}
     ir_struct_field_index_lookup = {}
     ir_register_known_import_structs()
-    mut _fi22 := 0
-    kids22_children := root.children
-    while _fi22 < kids22_children.len():
-        child := kids22_children[_fi22]
-        mut cn := get_node(child)
-        if cn.kind == "pub" and cn.children.len() > 0:
-            cn = get_node(cn.children[0])
-        if cn.kind == "struct_decl":
-            mut sname := cn.value
-            # strip generic params like Wrapper[T] -> Wrapper
-            if sname.contains("["):
-                sname = sname.substring(0, sname.index_of("["))
-            mut field_names: List[String] := []
-            mut _fi34 := 0
-            kids34_children := cn.children
-            while _fi34 < kids34_children.len():
-                fc := kids34_children[_fi34]
-                fn_node := get_node(fc)
-                if fn_node.kind == "field":
-                    mut field_name := fn_node.value
-                    if field_name.contains(" "):
-                        field_name = field_name.split(" ")[0]
-                    field_index := field_names.len()
-                    field_names.push(field_name)
-                    if fn_node.children.len() > 0:
-                        type_node := get_node(fn_node.children[0])
-                        if type_node.kind == "type" or type_node.kind == "generic_type":
-                            ir_struct_field_lookup.insert(sname + "." + field_name, ir_resolve_type_node(fn_node.children[0]))
-                    ir_struct_field_index_lookup.insert(sname + "." + field_name, field_index.to_string())
-                _fi34 = _fi34 + 1
-            ir_struct_names.insert(sname, field_names.len())
-            ir_emit("struct " + sname + " " + field_names.join(" "))
-
-        _fi22 = _fi22 + 1
+    mut preload_struct_i := 0
+    while preload_struct_i < ir_preloaded_import_roots.len():
+        ir_collect_struct_decls(ir_preloaded_import_roots[preload_struct_i], false)
+        preload_struct_i = preload_struct_i + 1
+    ir_collect_struct_decls(root_idx, true)
     # register type aliases that point to structs
     mut _fi23 := 0
     kids23_children := root.children

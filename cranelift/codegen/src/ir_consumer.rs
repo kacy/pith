@@ -1109,25 +1109,36 @@ fn compile_ir_function(
                 let obj_reg: usize = parts[2].parse().unwrap_or(usize::MAX);
                 let obj_struct_name = struct_regs.get(&obj_reg).cloned();
                 let obj = get_reg(&regs, parts[2]);
-                let (explicit_struct_name, bare_field_name, offset, field_retkind) =
-                    if parts.len() >= 6 && parts[3].parse::<i32>().is_ok() {
-                        (None, parts[5], parts[3].parse::<i32>().unwrap_or(0), Some(parts[4]))
-                    } else if parts.len() >= 5 {
-                        (Some(parts[3]), parts[4], 0, None)
+                let (offset, field_retkind) = if parts.len() >= 6 && parts[3].parse::<i32>().is_ok() {
+                    (parts[3].parse::<i32>().unwrap_or(0), Some(parts[4]))
+                } else if parts.len() == 4 {
+                    let field_name = parts[3];
+                    if let Ok(idx) = field_name.parse::<usize>() {
+                        ((idx * 8) as i32, None)
+                    } else if let Some(struct_name) = obj_struct_name.as_deref() {
+                        let offset = field_offset_in_struct(struct_layouts, struct_name, field_name)
+                            .ok_or_else(|| {
+                                CompileError::ModuleError(format!(
+                                    "ir consumer: unknown field {} on {} in {}",
+                                    field_name, struct_name, func_name
+                                ))
+                            })?;
+                        (offset, None)
                     } else {
-                        let (name, bare) = split_typed_field_name(parts[3]);
-                        (name, bare, 0, None)
-                    };
-                let field_struct_name = explicit_struct_name.or(obj_struct_name.as_deref());
-                let offset = if field_retkind.is_some() {
-                    offset
-                } else {
-                    // Try numeric field index first (for tuples: .0, .1)
-                    if let Ok(idx) = bare_field_name.parse::<usize>() {
-                        (idx * 8) as i32
-                    } else {
-                        field_offset_for_name(struct_layouts, field_struct_name, bare_field_name)
+                        let offset = unique_field_offset_for_name(struct_layouts, field_name)
+                            .ok_or_else(|| {
+                                CompileError::ModuleError(format!(
+                                    "ir consumer: ambiguous field instruction in {}: {}",
+                                    func_name, line
+                                ))
+                            })?;
+                        (offset, None)
                     }
+                } else {
+                    return Err(CompileError::ModuleError(format!(
+                        "ir consumer: malformed field instruction in {}: {}",
+                        func_name, line
+                    )));
                 };
                 let raw = builder.ins().load(
                     types::I64,
@@ -1159,10 +1170,6 @@ fn compile_ir_function(
                     if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
                         struct_regs.insert(reg, struct_name.to_string());
                     }
-                } else if field_struct_name.is_some() {
-                    string_regs.remove(&reg);
-                    bytes_regs.remove(&reg);
-                    float_regs.remove(&reg);
                 } else {
                     string_regs.remove(&reg);
                     bytes_regs.remove(&reg);
@@ -1319,40 +1326,30 @@ fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
     None
 }
 
-fn field_offset_for_name(
+fn field_offset_in_struct(
     struct_layouts: &HashMap<String, Vec<String>>,
-    struct_name: Option<&str>,
+    struct_name: &str,
     field_name: &str,
-) -> i32 {
-    if let Some(name) = struct_name {
-        if let Some(fields) = struct_layouts.get(name) {
-            if let Some(idx) = fields.iter().position(|field| field == field_name) {
-                return (idx * 8) as i32;
-            }
-        }
-    }
+) -> Option<i32> {
+    let fields = struct_layouts.get(struct_name)?;
+    let idx = fields.iter().position(|field| field == field_name)?;
+    Some((idx * 8) as i32)
+}
 
+fn unique_field_offset_for_name(
+    struct_layouts: &HashMap<String, Vec<String>>,
+    field_name: &str,
+) -> Option<i32> {
     let mut matching_positions: Vec<usize> = struct_layouts
         .values()
         .filter_map(|fields| fields.iter().position(|field| field == field_name))
         .collect();
     matching_positions.sort_unstable();
     matching_positions.dedup();
-
-    matching_positions
-        .first()
-        .map_or(0, |idx| (*idx * 8) as i32)
-}
-
-fn split_typed_field_name(field_name: &str) -> (Option<&str>, &str) {
-    if let Some(dot_idx) = field_name.find('.') {
-        let struct_name = &field_name[..dot_idx];
-        let bare_field = &field_name[dot_idx + 1..];
-        if !struct_name.is_empty() && !bare_field.is_empty() {
-            return (Some(struct_name), bare_field);
-        }
+    if matching_positions.len() == 1 {
+        return Some((matching_positions[0] * 8) as i32);
     }
-    (None, field_name)
+    None
 }
 
 

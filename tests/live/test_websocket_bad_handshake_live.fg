@@ -1,0 +1,37 @@
+import std.io as io
+import std.net.http as http
+import std.net.websocket as websocket
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn run_server(port: Int) -> Int!:
+    server_fd := tcp_listen("127.0.0.1", port)!
+    client_fd := tcp_accept(server_fd)!
+    req := http.read_request_bytes(client_fd)!
+    if websocket.route_echo(client_fd, req, "/ws", "", "echo:", "")!:
+        tcp_close(server_fd)
+        return 0
+    http.send_response(client_fd, http.not_found())!
+    tcp_close(server_fd)
+    return 0
+
+fn main() -> Int!:
+    port := choose_port(18844)!
+    server_task := spawn run_server(port)
+    sleep(200)
+
+    conn := io.connect("127.0.0.1", port)!
+    conn.write_all("GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")!
+    response := conn.read_all()!
+    print(response.contains("404 Not Found").to_string())
+
+    await server_task
+    return 0

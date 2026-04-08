@@ -573,11 +573,10 @@ fn find_request_head_end(raw: Bytes) -> Int:
     return -1
 
 fn read_request_from_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestBytes!:
-    chunk_size := 1024
-    buf := bytes.buffer_with_capacity(chunk_size)
+    buf := bytes.buffer_with_capacity(256)
     mut body_start := -1
     while body_start < 0:
-        chunk := reader.read_bytes(chunk_size)!
+        chunk := reader.read_bytes(1)!
         if chunk.is_empty():
             return HttpRequestBytes(bytes.empty(), bytes.empty())
         buf.write(chunk)!
@@ -634,7 +633,7 @@ pub fn read_request_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestBy
 
 pub fn read_request_bytes(fd: Int) -> HttpRequestBytes!:
     stream := io.from_fd(fd)
-    reader := stream.buffered_bytes_reader()
+    reader := stream.buffered_bytes_reader_chunked(1)
     return read_request_from_buffered_bytes(reader)
 
 pub fn send_response_bytes(fd: Int, response: Bytes) -> Int!:

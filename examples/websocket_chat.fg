@@ -1,0 +1,29 @@
+# websocket chat flow over buffered sessions
+import std.bytes as bytes
+import std.io as io
+import std.net.websocket as websocket
+fn chat_client_wire(name: String, message: String) -> Bytes!:
+    wire := bytes.buffer()
+    wire.write(websocket.client_text_frame_bytes(name, bytes.from_string_utf8("abcd"))!)!
+    wire.write(websocket.client_text_frame_bytes(message, bytes.from_string_utf8("wxyz"))!)!
+    return wire.bytes()
+fn main() -> Int!:
+    left_out := bytes.buffer()
+    right_out := bytes.buffer()
+    left := websocket.from_buffered(io.bytes_reader(chat_client_wire("left", "hello from left")!).buffered_chunked(4), left_out.buffered_chunked(4), false)
+    right := websocket.from_buffered(io.bytes_reader(chat_client_wire("right", "hello from right")!).buffered_chunked(4), right_out.buffered_chunked(4), false)
+    left_name := left.recv_text()!
+    right_name := right.recv_text()!
+    left.send_text("welcome " + left_name)!
+    right.send_text("welcome " + right_name)!
+    left_msg := left.recv_text()!
+    right.send_text(left_name + ": " + left_msg)!
+    right_msg := right.recv_text()!
+    left.send_text(right_name + ": " + right_msg)!
+    left_reader := io.bytes_reader(left_out.bytes()).buffered_chunked(4)
+    right_reader := io.bytes_reader(right_out.bytes()).buffered_chunked(4)
+    print(websocket.read_frame_buffered(left_reader)!.payload_text()!)
+    print(websocket.read_frame_buffered(right_reader)!.payload_text()!)
+    print(websocket.read_frame_buffered(right_reader)!.payload_text()!)
+    print(websocket.read_frame_buffered(left_reader)!.payload_text()!)
+    return 0

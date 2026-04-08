@@ -1,0 +1,60 @@
+# http + websocket app routing over buffered io
+import std.bytes as bytes
+import std.io as io
+import std.net.http as http
+import std.net.websocket as websocket
+from std.io import BufferedBytesReader, BufferedBytesWriter
+from std.net.http import HttpRequestBytes
+fn query_param(query: String, name: String) -> String:
+    if query == "":
+        return ""
+    for part in query.split("&"):
+        eq := part.index_of("=")
+        if eq < 0:
+            if part == name:
+                return ""
+            continue
+        if part.substring(0, eq) == name:
+            if eq + 1 < part.len():
+                return part.substring(eq + 1, part.len())
+            return ""
+    return ""
+fn write_response(writer: BufferedBytesWriter, response: String) -> Int!:
+    writer.write_bytes(bytes.from_string_utf8(response))!
+    flushed := writer.flush()
+    if flushed.is_err:
+        fail "http response flush failed"
+    return response.len()
+fn handle_app(req: HttpRequestBytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> String!:
+    method := req.method()!
+    path := req.path()!
+    if path == "/ws" and websocket.is_upgrade_request(req):
+        ws := websocket.accept_buffered(req, reader, writer)!
+        msg := ws.recv_text()!
+        ws.send_text("echo:" + msg)!
+        return "ws:" + msg
+    if method == "GET" and path == "/greet":
+        mut name := query_param(req.query()!, "name")
+        if name == "":
+            name = "stranger"
+        write_response(writer, http.html_response(200, "<h1>Hello, " + name + "!</h1>"))!
+        return "http:" + name
+    write_response(writer, http.not_found())!
+    return "http:404"
+fn main() -> Int!:
+    greet_req := io.bytes_reader(bytes.from_string_utf8("GET /greet?name=forge HTTP/1.1\r\nHost: example.com\r\n\r\n")).buffered_chunked(5)
+    greet := http.read_request_buffered_bytes(greet_req)!
+    greet_out := bytes.buffer()
+    print(handle_app(greet, io.bytes_reader(bytes.empty()).buffered_chunked(2), greet_out.buffered_chunked(4))!)
+    print(greet_out.bytes().to_string_utf8()!.contains("Hello, forge!").to_string())
+    mut headers: Map[String, String] := {}
+    ws_req_bytes := websocket.client_request("example.com", "/ws", headers)!
+    ws_req := http.read_request_buffered_bytes(io.bytes_reader(ws_req_bytes).buffered_chunked(5))!
+    inbound := websocket.client_text_frame_bytes("forge", bytes.from_string_utf8("abcd"))!
+    ws_out := bytes.buffer()
+    print(handle_app(ws_req, io.bytes_reader(inbound).buffered_chunked(3), ws_out.buffered_chunked(4))!)
+    handshake := websocket.upgrade_response(ws_req)!
+    print(ws_out.bytes().slice(0, handshake.len()).to_string_utf8()!.contains("101 Switching Protocols").to_string())
+    echoed := websocket.parse_frame(ws_out.bytes().slice(handshake.len(), ws_out.bytes().len()))!
+    print(echoed.payload_text()!)
+    return 0

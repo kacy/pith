@@ -1,8 +1,9 @@
-.PHONY: build self-host bootstrap bootstrap-verify run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test clean
+.PHONY: build self-host bootstrap bootstrap-verify run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
 REGRESSION_EXPECTED := $(wildcard tests/expected/*.txt)
+LIVE_WEBSOCKET_EXPECTED := $(wildcard tests/live/expected/*.txt)
 PARSE_INVALID_EXAMPLES := $(wildcard tests/invalid_parse/*.fg)
 INVALID_EXAMPLES := $(wildcard tests/invalid/*.fg)
 PARITY_EXAMPLES := \
@@ -124,6 +125,44 @@ run-regressions-self-only:
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-hosted regression cases passed"
+
+run-live-websocket-tests: build
+	@echo "--- live websocket smoke tests (Cranelift backend) ---"
+	@pass=0; fail=0; \
+	for f in $(LIVE_WEBSOCKET_EXPECTED); do \
+		name=$$(basename "$$f" .txt); \
+		actual=$$(timeout 15 ./target/release/forge run "tests/live/$$name.fg" 2>/dev/null); \
+		expected=$$(cat "$$f"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all live websocket smoke tests passed"
+
+run-live-websocket-tests-self-only:
+	@echo "--- live websocket smoke tests (self-hosted compiler) ---"
+	@pass=0; fail=0; \
+	for f in $(LIVE_WEBSOCKET_EXPECTED); do \
+		name=$$(basename "$$f" .txt); \
+		actual=$$(timeout 15 ./self-host/forge_main run "tests/live/$$name.fg" 2>/dev/null); \
+		expected=$$(cat "$$f"); \
+		if [ "$$actual" = "$$expected" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all self-hosted live websocket smoke tests passed"
 
 parity-examples: self-host parity-examples-only
 

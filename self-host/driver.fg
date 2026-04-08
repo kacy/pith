@@ -89,6 +89,7 @@ mut files_being_checked: Map[String, Bool] := {}
 # stdlib root - set by compile_to_c before resolving imports
 mut stdlib_root_directory: String := ""
 mut driver_parse_diagnostics: List[Diagnostic] := []
+mut resolved_module_paths: Map[Int, String] := {}
 
 # convert a dotted module path to a file path segment.
 # "std.math" -> "std/math", "foo" -> "foo"
@@ -168,6 +169,7 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
         if parser_has_errors():
             driver_parse_diagnostics = parser_diagnostics()
             return roots
+        resolved_module_paths.insert(mod_root, mod_path)
         sub_roots := resolve_imports(mod_root, file_path)!
         if driver_parse_diagnostics.len() > 0:
             return roots
@@ -188,6 +190,7 @@ pub fn init_driver(source_path: String):
     visited_files = {}
     files_being_checked = {}
     driver_parse_diagnostics = []
+    resolved_module_paths = {}
     mark_visited(source_path)
 
 pub fn get_driver_parse_diagnostics() -> List[Diagnostic]:
@@ -195,6 +198,11 @@ pub fn get_driver_parse_diagnostics() -> List[Diagnostic]:
 
 pub fn driver_has_parse_errors() -> Bool:
     return driver_parse_diagnostics.len() > 0
+
+pub fn get_resolved_module_path(root_idx: Int) -> String:
+    if resolved_module_paths.contains_key(root_idx):
+        return resolved_module_paths[root_idx]
+    return ""
 
 # run the full compile pipeline: lex, parse, resolve imports, check, codegen.
 # compile_to_c removed — compilation is now handled by the Cranelift native backend.

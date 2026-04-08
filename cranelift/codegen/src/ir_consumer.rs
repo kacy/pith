@@ -338,10 +338,6 @@ fn compile_ir_function(
     #[cfg(not(forge_cranelift_new_api))]
     let mut next_var_id: u32 = 0;
 
-    // Create a zero constant that can be used as fallback for undefined registers
-    let zero_val = builder.ins().iconst(types::I64, 0);
-    regs.insert(usize::MAX, zero_val); // sentinel
-
     // Call __init_globals (and module-specific __init_globals_N) at the start of main
     if func_name == "main" {
         // Call module-specific initializers first (imported modules)
@@ -645,8 +641,8 @@ fn compile_ir_function(
 
             "add" | "sub" | "mul" | "div" | "mod" if parts.len() >= 4 => {
                 let reg: usize = parts[1].parse().unwrap_or(0);
-                let a_reg: usize = parts[2].parse().unwrap_or(usize::MAX);
-                let b_reg: usize = parts[3].parse().unwrap_or(usize::MAX);
+                let a_reg = parts[2].parse::<usize>().ok();
+                let b_reg = parts[3].parse::<usize>().ok();
                 let a = get_reg(&regs, parts[2]);
                 let b = get_reg(&regs, parts[3]);
                 reg_source_vars.remove(&reg);
@@ -654,7 +650,9 @@ fn compile_ir_function(
                 // If `add` has a string operand, treat as concat (IR emitter
                 // sometimes emits `add` instead of `concat` when variable types
                 // aren't tracked across function boundaries)
-                if parts[0] == "add" && string_regs.contains(&a_reg) && string_regs.contains(&b_reg)
+                if parts[0] == "add"
+                    && a_reg.is_some_and(|r| string_regs.contains(&r))
+                    && b_reg.is_some_and(|r| string_regs.contains(&r))
                 {
                     let concat_name = if runtime_funcs.contains_key("forge_concat_cstr") {
                         "forge_concat_cstr"
@@ -679,7 +677,8 @@ fn compile_ir_function(
                     float_regs.remove(&reg);
                 // If operands are known floats, promote to float operation
                 } else if matches!(parts[0], "add" | "sub" | "mul" | "div")
-                    && (float_regs.contains(&a_reg) || float_regs.contains(&b_reg))
+                    && (a_reg.is_some_and(|r| float_regs.contains(&r))
+                        || b_reg.is_some_and(|r| float_regs.contains(&r)))
                 {
                     let fa = builder.ins().bitcast(
                         types::F64,
@@ -725,15 +724,16 @@ fn compile_ir_function(
 
             "eq" | "neq" | "lt" | "gt" | "lte" | "gte" if parts.len() >= 4 => {
                 let reg: usize = parts[1].parse().unwrap_or(0);
-                let a_reg: usize = parts[2].parse().unwrap_or(usize::MAX);
-                let b_reg: usize = parts[3].parse().unwrap_or(usize::MAX);
+                let a_reg = parts[2].parse::<usize>().ok();
+                let b_reg = parts[3].parse::<usize>().ok();
                 let a = get_reg(&regs, parts[2]);
                 let b = get_reg(&regs, parts[3]);
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 // For lt/gt/lte/gte on strings, call runtime comparison
                 let is_str_cmp = matches!(parts[0], "lt" | "gt" | "lte" | "gte")
-                    && (string_regs.contains(&a_reg) || string_regs.contains(&b_reg));
+                    && (a_reg.is_some_and(|r| string_regs.contains(&r))
+                        || b_reg.is_some_and(|r| string_regs.contains(&r)));
                 if is_str_cmp {
                     let cmp_name = match parts[0] {
                         "lt" => "forge_cstring_lt",
@@ -752,7 +752,9 @@ fn compile_ir_function(
                         let cmp = builder.ins().icmp(IntCC::SignedLessThan, a, b);
                         regs.insert(reg, builder.ins().uextend(types::I64, cmp));
                     }
-                } else if float_regs.contains(&a_reg) || float_regs.contains(&b_reg) {
+                } else if a_reg.is_some_and(|r| float_regs.contains(&r))
+                    || b_reg.is_some_and(|r| float_regs.contains(&r))
+                {
                     // Float comparison
                     let fa = builder.ins().bitcast(
                         types::F64,
@@ -828,8 +830,13 @@ fn compile_ir_function(
 
             "call" if parts.len() >= 4 => {
                 let reg: usize = parts[1].parse().unwrap_or(0);
-                let (mut fname, retkind, nargs, arg_start) =
-                    parse_call_shape(&parts).unwrap_or((parts[2], "unknown", 0, 4));
+                let (mut fname, retkind, nargs, arg_start) = parse_call_shape(&parts)
+                    .ok_or_else(|| {
+                        CompileError::ModuleError(format!(
+                            "ir consumer: malformed call instruction in {}: {}",
+                            func_name, line
+                        ))
+                    })?;
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
 
@@ -907,9 +914,6 @@ fn compile_ir_function(
                     } else if let Some(&fid) = runtime_funcs.get(fname) {
                         runtime_call = true;
                         Some(fid)
-                    } else if let Some(&fid) = runtime_funcs.get(&format!("forge_{}", fname)) {
-                        runtime_call = true;
-                        Some(fid)
                     } else {
                         None
                     };
@@ -972,7 +976,7 @@ fn compile_ir_function(
                         } else {
                             bytes_regs.remove(&reg);
                         }
-                        if retkind == "float" || (retkind == "unknown" && returns_float) {
+                        if retkind == "float" || returns_float {
                             float_regs.insert(reg);
                         } else {
                             float_regs.remove(&reg);
@@ -1061,6 +1065,8 @@ fn compile_ir_function(
                 reg_source_vars.insert(reg, name.to_string());
                 if let Some(struct_name) = struct_vars.get(name) {
                     struct_regs.insert(reg, struct_name.clone());
+                } else if struct_layouts.contains_key(name) {
+                    struct_regs.insert(reg, name.to_string());
                 } else {
                     struct_regs.remove(&reg);
                 }
@@ -1078,8 +1084,13 @@ fn compile_ir_function(
                 } else if let Some(&var) = named_vars.get(name) {
                     let val = builder.use_var(var);
                     regs.insert(reg, val);
-                } else {
+                } else if struct_layouts.contains_key(name) {
                     regs.insert(reg, builder.ins().iconst(types::I64, 0));
+                } else {
+                    return Err(CompileError::ModuleError(format!(
+                        "ir consumer: unknown load source '{}' in {}",
+                        name, func_name
+                    )));
                 }
                 // Propagate types through load
                 if string_vars.contains(name) || string_global_names.contains(name) {
@@ -1104,25 +1115,36 @@ fn compile_ir_function(
                 let obj_reg: usize = parts[2].parse().unwrap_or(usize::MAX);
                 let obj_struct_name = struct_regs.get(&obj_reg).cloned();
                 let obj = get_reg(&regs, parts[2]);
-                let (explicit_struct_name, bare_field_name, offset, field_retkind) =
-                    if parts.len() >= 6 && parts[3].parse::<i32>().is_ok() {
-                        (None, parts[5], parts[3].parse::<i32>().unwrap_or(0), Some(parts[4]))
-                    } else if parts.len() >= 5 {
-                        (Some(parts[3]), parts[4], 0, None)
+                let (offset, field_retkind) = if parts.len() >= 6 && parts[3].parse::<i32>().is_ok() {
+                    (parts[3].parse::<i32>().unwrap_or(0), Some(parts[4]))
+                } else if parts.len() == 4 {
+                    let field_name = parts[3];
+                    if let Ok(idx) = field_name.parse::<usize>() {
+                        ((idx * 8) as i32, None)
+                    } else if let Some(struct_name) = obj_struct_name.as_deref() {
+                        let offset = field_offset_in_struct(struct_layouts, struct_name, field_name)
+                            .ok_or_else(|| {
+                                CompileError::ModuleError(format!(
+                                    "ir consumer: unknown field {} on {} in {}",
+                                    field_name, struct_name, func_name
+                                ))
+                            })?;
+                        (offset, None)
                     } else {
-                        let (name, bare) = split_typed_field_name(parts[3]);
-                        (name, bare, 0, None)
-                    };
-                let field_struct_name = explicit_struct_name.or(obj_struct_name.as_deref());
-                let offset = if field_retkind.is_some() {
-                    offset
-                } else {
-                    // Try numeric field index first (for tuples: .0, .1)
-                    if let Ok(idx) = bare_field_name.parse::<usize>() {
-                        (idx * 8) as i32
-                    } else {
-                        field_offset_for_name(struct_layouts, field_struct_name, bare_field_name)
+                        let offset = unique_field_offset_for_name(struct_layouts, field_name)
+                            .ok_or_else(|| {
+                                CompileError::ModuleError(format!(
+                                    "ir consumer: ambiguous field instruction in {}: {}",
+                                    func_name, line
+                                ))
+                            })?;
+                        (offset, None)
                     }
+                } else {
+                    return Err(CompileError::ModuleError(format!(
+                        "ir consumer: malformed field instruction in {}: {}",
+                        func_name, line
+                    )));
                 };
                 let raw = builder.ins().load(
                     types::I64,
@@ -1154,10 +1176,6 @@ fn compile_ir_function(
                     if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
                         struct_regs.insert(reg, struct_name.to_string());
                     }
-                } else if field_struct_name.is_some() {
-                    string_regs.remove(&reg);
-                    bytes_regs.remove(&reg);
-                    float_regs.remove(&reg);
                 } else {
                     string_regs.remove(&reg);
                     bytes_regs.remove(&reg);
@@ -1175,7 +1193,10 @@ fn compile_ir_function(
                     let addr = builder.ins().func_addr(types::I64, fref);
                     regs.insert(reg, addr);
                 } else {
-                    regs.insert(reg, builder.ins().iconst(types::I64, 0));
+                    return Err(CompileError::ModuleError(format!(
+                        "ir consumer: unknown function reference '{}' in {}",
+                        fname, func_name
+                    )));
                 }
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
@@ -1275,19 +1296,16 @@ fn compile_ir_function(
 }
 
 fn parse_call_shape<'a>(parts: &'a [&'a str]) -> Option<(&'a str, &'a str, usize, usize)> {
-    if parts.len() < 4 {
+    if parts.len() < 5 {
         return None;
     }
 
     let fname = parts[2];
-    let looks_like_retkind = parts[3].parse::<usize>().is_err();
-    if looks_like_retkind && parts.len() >= 5 {
-        if let Ok(nargs) = parts[4].parse::<usize>() {
-            return Some((fname, parts[3], nargs, 5));
-        }
+    if parts[3].parse::<usize>().is_ok() {
+        return None;
     }
-
-    Some((fname, "unknown", parts[3].parse().unwrap_or(0), 4))
+    let nargs = parts[4].parse::<usize>().ok()?;
+    Some((fname, parts[3], nargs, 5))
 }
 
 fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
@@ -1317,40 +1335,30 @@ fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
     None
 }
 
-fn field_offset_for_name(
+fn field_offset_in_struct(
     struct_layouts: &HashMap<String, Vec<String>>,
-    struct_name: Option<&str>,
+    struct_name: &str,
     field_name: &str,
-) -> i32 {
-    if let Some(name) = struct_name {
-        if let Some(fields) = struct_layouts.get(name) {
-            if let Some(idx) = fields.iter().position(|field| field == field_name) {
-                return (idx * 8) as i32;
-            }
-        }
-    }
+) -> Option<i32> {
+    let fields = struct_layouts.get(struct_name)?;
+    let idx = fields.iter().position(|field| field == field_name)?;
+    Some((idx * 8) as i32)
+}
 
+fn unique_field_offset_for_name(
+    struct_layouts: &HashMap<String, Vec<String>>,
+    field_name: &str,
+) -> Option<i32> {
     let mut matching_positions: Vec<usize> = struct_layouts
         .values()
         .filter_map(|fields| fields.iter().position(|field| field == field_name))
         .collect();
     matching_positions.sort_unstable();
     matching_positions.dedup();
-
-    matching_positions
-        .first()
-        .map_or(0, |idx| (*idx * 8) as i32)
-}
-
-fn split_typed_field_name(field_name: &str) -> (Option<&str>, &str) {
-    if let Some(dot_idx) = field_name.find('.') {
-        let struct_name = &field_name[..dot_idx];
-        let bare_field = &field_name[dot_idx + 1..];
-        if !struct_name.is_empty() && !bare_field.is_empty() {
-            return (Some(struct_name), bare_field);
-        }
+    if matching_positions.len() == 1 {
+        return Some((matching_positions[0] * 8) as i32);
     }
-    (None, field_name)
+    None
 }
 
 
@@ -1360,46 +1368,47 @@ fn resolve_func_name(name: &str) -> &str {
     match name {
         // String operations
         "print" => "forge_smart_print",
-        "print_err" => "forge_print_err",
-        "to_string" | "int_to_string" => "forge_int_to_cstr",
-        "bool_to_string" => "forge_bool_to_cstr",
-        "float_to_string" => "forge_float_to_cstr",
-        "smart_to_string" => "forge_smart_to_string",
-        "identity" => "forge_identity",
-        "chr" => "forge_chr",
-        "ord" => "forge_ord",
-        "string_len" => "forge_cstring_len",
-        "substring" => "forge_cstring_substring",
-        "contains" | "string_contains" => "forge_cstring_contains",
-        "starts_with" => "forge_cstring_starts_with",
-        "ends_with" => "forge_cstring_ends_with",
-        "trim" => "forge_cstring_trim",
-        "split" => "forge_cstring_split",
-        "to_upper" => "forge_cstring_to_upper",
-        "to_lower" => "forge_cstring_to_lower",
-        "replace" => "forge_cstring_replace",
-        "repeat" => "forge_cstring_repeat",
-        "index_of" | "string_index_of" => "forge_cstring_index_of",
-        "last_index_of" | "string_last_index_of" => "forge_cstring_last_index_of",
-        "string_is_empty" => "forge_cstring_is_empty",
-        "pad_left" => "forge_cstring_pad_left",
-        "pad_right" => "forge_cstring_pad_right",
-        "char_at" => "forge_cstring_char_at",
-        "chars" => "forge_cstring_chars",
-        "reverse" => "forge_cstring_reverse",
+        "print_err" => "print_err",
+        "to_string" | "int_to_string" => "to_string",
+        "bool_to_string" => "bool_to_string",
+        "float_to_string" => "float_to_string",
+        "smart_to_string" => "smart_to_string",
+        "identity" => "identity",
+        "chr" => "chr",
+        "ord" => "ord",
+        "string_len" => "string_len",
+        "substring" => "substring",
+        "contains" | "string_contains" => "contains",
+        "starts_with" => "starts_with",
+        "ends_with" => "ends_with",
+        "trim" => "trim",
+        "split" => "split",
+        "to_upper" => "to_upper",
+        "to_lower" => "to_lower",
+        "replace" => "replace",
+        "repeat" => "repeat",
+        "index_of" | "string_index_of" => "index_of",
+        "last_index_of" | "string_last_index_of" => "last_index_of",
+        "string_is_empty" => "string_is_empty",
+        "pad_left" => "pad_left",
+        "pad_right" => "pad_right",
+        "char_at" => "char_at",
+        "chars" => "chars",
+        "reverse" => "reverse",
         // List operations
         "len" => "forge_auto_len",
         "join" => "forge_list_join",
+        "list_join" => "list_join",
         "push" => "forge_list_push_value",
         "pop" => "forge_list_pop",
-        "remove" | "list_remove" => "forge_list_remove_value",
-        "is_empty" | "list_is_empty" => "forge_list_is_empty",
-        "clear" | "list_clear" => "forge_list_clear_value",
-        "list_reverse" => "forge_list_reverse_value",
-        "list_contains" => "forge_list_contains_int",
-        "list_contains_string" => "forge_list_contains_cstr",
-        "list_index_of" => "forge_list_index_of_int",
-        "list_index_of_string" => "forge_list_index_of_cstr",
+        "remove" | "list_remove" => "list_remove",
+        "is_empty" | "list_is_empty" => "list_is_empty",
+        "clear" | "list_clear" => "list_clear",
+        "list_reverse" => "list_reverse",
+        "list_contains" => "list_contains",
+        "list_contains_string" => "list_contains_string",
+        "list_index_of" => "list_index_of",
+        "list_index_of_string" => "list_index_of_string",
         "set" => "forge_list_set_value",
         "map" | "list_map" => "forge_list_map",
         "filter" | "list_filter" => "forge_list_filter",
@@ -1409,31 +1418,32 @@ fn resolve_func_name(name: &str) -> &str {
         "sort_strings" => "forge_list_sort_strings",
         "slice" => "forge_list_slice",
         // Map operations
-        "insert" => "forge_map_insert_cstr",
-        "map_insert_ikey" => "forge_map_insert_ikey",
-        "map_get" => "forge_map_get_cstr",
-        "map_get_ikey" => "forge_map_get_ikey",
-        "get_default" | "map_get_default" => "forge_map_get_default_cstr",
-        "map_get_default_ikey" => "forge_map_get_default_ikey",
-        "contains_key" | "map_contains_key" => "forge_map_contains_cstr",
-        "map_contains_ikey" => "forge_map_contains_ikey",
-        "keys" | "map_keys" => "forge_map_keys_cstr",
-        "map_values" => "forge_map_values_handle",
-        "map_remove" => "forge_map_remove_cstr",
-        "map_remove_ikey" => "forge_map_remove_ikey",
-        "map_clear" => "forge_map_clear_handle",
-        "map_is_empty" => "forge_map_is_empty_handle",
-        "map_len" => "forge_map_len_handle",
+        "insert" => "insert",
+        "map_insert" => "map_insert",
+        "map_insert_ikey" => "map_insert_ikey",
+        "map_get" => "map_get",
+        "map_get_ikey" => "map_get_ikey",
+        "get_default" | "map_get_default" => "get_default",
+        "map_get_default_ikey" => "map_get_default_ikey",
+        "contains_key" | "map_contains_key" => "contains_key",
+        "map_contains_ikey" => "map_contains_ikey",
+        "keys" | "map_keys" => "keys",
+        "map_values" => "map_values",
+        "map_remove" => "map_remove",
+        "map_remove_ikey" => "map_remove_ikey",
+        "map_clear" => "map_clear",
+        "map_is_empty" => "map_is_empty",
+        "map_len" => "map_len",
         // Set operations
-        "set_add" => "forge_set_add_cstr",
+        "set_add" => "set_add",
         "set_add_int" => "forge_set_add_int_handle",
-        "set_contains" => "forge_set_contains_cstr",
+        "set_contains" => "set_contains",
         "set_contains_int" => "forge_set_contains_int_handle",
-        "set_remove" => "forge_set_remove_cstr",
+        "set_remove" => "set_remove",
         "set_remove_int" => "forge_set_remove_int_handle",
-        "set_clear" => "forge_set_clear_handle",
-        "set_is_empty" => "forge_set_is_empty_handle",
-        "set_len" => "forge_set_len_handle",
+        "set_clear" => "set_clear",
+        "set_is_empty" => "set_is_empty",
+        "set_len" => "set_len",
         // Internal IR instructions
         "__list_get" | "__index" => "forge_list_get_value",
         "__list_new" => "forge_list_new_default",
@@ -1446,20 +1456,20 @@ fn resolve_func_name(name: &str) -> &str {
         "__closure_set_env" => "forge_closure_set_env",
         "__closure_get_env" => "forge_closure_get_env",
         "__str_eq" => "forge_cstring_eq",
-        "bytes_from_string_utf8" => "forge_bytes_from_string_utf8",
-        "bytes_to_string_utf8" => "forge_bytes_to_string_utf8",
-        "bytes_len" => "forge_bytes_len",
-        "bytes_is_empty" => "forge_bytes_is_empty",
-        "bytes_get" => "forge_bytes_get",
-        "bytes_slice" => "forge_bytes_slice",
-        "bytes_concat" => "forge_bytes_concat",
-        "bytes_eq" => "forge_bytes_eq",
-        "byte_buffer_new" => "forge_byte_buffer_new",
-        "byte_buffer_with_capacity" => "forge_byte_buffer_with_capacity",
-        "byte_buffer_write" => "forge_byte_buffer_write",
-        "byte_buffer_write_byte" => "forge_byte_buffer_write_byte",
-        "byte_buffer_bytes" => "forge_byte_buffer_bytes",
-        "byte_buffer_clear" => "forge_byte_buffer_clear",
+        "bytes_from_string_utf8" => "bytes_from_string_utf8",
+        "bytes_to_string_utf8" => "bytes_to_string_utf8",
+        "bytes_len" => "bytes_len",
+        "bytes_is_empty" => "bytes_is_empty",
+        "bytes_get" => "bytes_get",
+        "bytes_slice" => "bytes_slice",
+        "bytes_concat" => "bytes_concat",
+        "bytes_eq" => "bytes_eq",
+        "byte_buffer_new" => "byte_buffer_new",
+        "byte_buffer_with_capacity" => "byte_buffer_with_capacity",
+        "byte_buffer_write" => "byte_buffer_write",
+        "byte_buffer_write_byte" => "byte_buffer_write_byte",
+        "byte_buffer_bytes" => "byte_buffer_bytes",
+        "byte_buffer_clear" => "byte_buffer_clear",
         // Numeric / math
         "abs" => "forge_abs",
         "min" => "forge_min",
@@ -1500,37 +1510,46 @@ fn resolve_func_name(name: &str) -> &str {
         "bit_shl" => "forge_bit_shl",
         "bit_shr" => "forge_bit_shr",
         // IO / system
-        "read_file" => "forge_read_file",
-        "read_file_bytes" => "forge_read_file_bytes",
-        "write_file" => "forge_write_file",
-        "append_file" => "forge_append_file",
-        "write_file_bytes" => "forge_write_file_bytes",
-        "append_file_bytes" => "forge_append_file_bytes",
-        "file_open_read" => "forge_file_open_read",
-        "file_open_write" => "forge_file_open_write",
-        "file_open_append" => "forge_file_open_append",
-        "file_read" => "forge_file_read",
-        "file_write" => "forge_file_write",
-        "file_read_bytes" => "forge_file_read_bytes",
-        "file_write_bytes" => "forge_file_write_bytes",
-        "file_close" => "forge_file_close",
-        "file_exists" => "forge_file_exists",
-        "dir_exists" => "forge_dir_exists",
-        "exec" => "forge_exec",
-        "exit" => "forge_exit",
-        "env" => "forge_env",
-        "args" => "forge_args_to_list",
-        "dns_resolve" => "forge_dns_resolve",
-        "process_spawn" => "forge_process_spawn",
-        "process_write" => "forge_process_write",
-        "process_read" => "forge_process_read",
-        "process_read_err" => "forge_process_read_err",
-        "process_write_bytes" => "forge_process_write_bytes",
-        "process_read_bytes" => "forge_process_read_bytes",
-        "process_read_err_bytes" => "forge_process_read_err_bytes",
-        "process_wait" => "forge_process_wait",
-        "process_kill" => "forge_process_kill",
-        "process_close" => "forge_process_close",
+        "read_file" => "read_file",
+        "read_file_bytes" => "read_file_bytes",
+        "write_file" => "write_file",
+        "append_file" => "append_file",
+        "write_file_bytes" => "write_file_bytes",
+        "append_file_bytes" => "append_file_bytes",
+        "file_open_read" => "file_open_read",
+        "file_open_write" => "file_open_write",
+        "file_open_append" => "file_open_append",
+        "file_read" => "file_read",
+        "file_write" => "file_write",
+        "file_read_bytes" => "file_read_bytes",
+        "file_write_bytes" => "file_write_bytes",
+        "file_close" => "file_close",
+        "file_exists" => "file_exists",
+        "dir_exists" => "dir_exists",
+        "exec" => "exec",
+        "exec_output" => "exec_output",
+        "exit" => "exit",
+        "env" => "env",
+        "args" => "args",
+        "dns_resolve" => "dns_resolve",
+        "tcp_listen" => "tcp_listen",
+        "tcp_connect" => "tcp_connect",
+        "tcp_accept" => "tcp_accept",
+        "tcp_read" => "tcp_read",
+        "tcp_read2" => "tcp_read2",
+        "tcp_write" => "tcp_write",
+        "tcp_set_timeout" => "tcp_set_timeout",
+        "tcp_close" => "tcp_close",
+        "process_spawn" => "process_spawn",
+        "process_write" => "process_write",
+        "process_read" => "process_read",
+        "process_read_err" => "process_read_err",
+        "process_write_bytes" => "process_write_bytes",
+        "process_read_bytes" => "process_read_bytes",
+        "process_read_err_bytes" => "process_read_err_bytes",
+        "process_wait" => "process_wait",
+        "process_kill" => "process_kill",
+        "process_close" => "process_close",
         // Crypto / encoding
         "sha256" => "forge_sha256",
         "fnv1a" => "forge_fnv1a",
@@ -1546,24 +1565,6 @@ fn resolve_func_name(name: &str) -> &str {
         "path_stem" | "stem" => "forge_path_stem",
         // Logging
         // JSON
-        "parse" => "forge_json_parse",
-        "type_of" => "forge_json_type_of",
-        "get_string" => "forge_json_get_string",
-        "get_int" => "forge_json_get_int",
-        "get_float" => "forge_json_get_float",
-        "get_bool" => "forge_json_get_bool",
-        "object_get" => "forge_json_object_get",
-        "object_has" => "forge_json_object_has",
-        "object_keys" => "forge_json_object_keys",
-        "array_len" => "forge_json_array_len",
-        "array_get" => "forge_json_array_get",
-        "make_object" => "forge_json_make_object",
-        "make_array" => "forge_json_make_array",
-        "make_int" => "forge_json_make_int",
-        "make_string" => "forge_json_make_string",
-        "array_push" => "forge_json_array_push",
-        "object_set" => "forge_json_object_set",
-        "encode" => "forge_smart_encode",
         // URL
         "url_parse" => "forge_url_parse",
         "url_scheme" => "forge_url_scheme",
@@ -1575,15 +1576,8 @@ fn resolve_func_name(name: &str) -> &str {
         "url_to_string" => "forge_url_to_string",
         "url_encode" => "forge_url_encode",
         "url_decode" => "forge_url_decode",
-        "scheme" => "forge_url_scheme",
-        "host" => "forge_url_host",
-        "port" => "forge_url_port",
-        "path" => "forge_url_path",
-        "query" => "forge_url_query",
-        "fragment" => "forge_url_fragment",
-        "decode" => "forge_url_decode",
-        "tcp_read_bytes" => "forge_tcp_read_bytes",
-        "tcp_write_bytes" => "forge_tcp_write_bytes",
+        "tcp_read_bytes" => "tcp_read_bytes",
+        "tcp_write_bytes" => "tcp_write_bytes",
         // Concurrency
         "spawn" => "forge_spawn",
         "await" => "forge_await",
@@ -1602,11 +1596,12 @@ fn resolve_func_name(name: &str) -> &str {
 }
 
 fn get_reg(regs: &HashMap<usize, Value>, s: &str) -> Value {
-    let reg: usize = s.parse().unwrap_or(0);
+    let reg: usize = s
+        .parse()
+        .unwrap_or_else(|_| panic!("IR consumer: invalid register reference '{}'", s));
     regs.get(&reg)
-        .or_else(|| regs.get(&usize::MAX)) // fallback to zero sentinel
         .copied()
-        .unwrap_or_else(|| panic!("IR consumer: no registers available"))
+        .unwrap_or_else(|| panic!("IR consumer: missing register {}", reg))
 }
 
 #[cfg(test)]
@@ -1614,12 +1609,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_call_shape_distinguishes_old_and_new_formats() {
+    fn parse_call_shape_requires_explicit_retkind() {
         let old = vec!["call", "7", "print", "1", "3"];
         let new = vec!["call", "8", "char_at", "string", "2", "1", "2"];
         let imported_struct = vec!["call", "9", "advance_token", "Token", "0"];
 
-        assert_eq!(parse_call_shape(&old), Some(("print", "unknown", 1, 4)));
+        assert_eq!(parse_call_shape(&old), None);
         assert_eq!(parse_call_shape(&new), Some(("char_at", "string", 2, 5)));
         assert_eq!(
             parse_call_shape(&imported_struct),

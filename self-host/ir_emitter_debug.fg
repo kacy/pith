@@ -410,7 +410,11 @@ fn ir_infer_type(idx: Int) -> String:
         return ""
     if kind == "field_access":
         if node.children.len() > 0:
-            obj_type := ir_infer_type(node.children[0])
+            mut obj_type := ir_infer_type(node.children[0])
+            if obj_type.len() == 0:
+                recv := get_node(node.children[0])
+                if recv.kind == "ident" and ir_struct_names.contains_key(recv.value):
+                    obj_type = recv.value
             if obj_type.len() > 0:
                 lookup_key := obj_type + "." + node_value(idx)
                 if ir_struct_field_lookup.contains_key(lookup_key):
@@ -523,6 +527,8 @@ fn ir_emit_method_call(idx: Int) -> Int:
     elif mname == "index_of":
         if obj_is_list:
             emit_name = "list_index_of"
+    elif mname == "join" and obj_is_list:
+        emit_name = "list_join"
     elif mname == "sort":
         if obj_type == "list_string":
             emit_name = "sort_strings"
@@ -561,8 +567,11 @@ fn ir_emit_method_call(idx: Int) -> Int:
             emit_name = "map_values"
     elif mname == "contains_key" and obj_is_map_int:
         emit_name = "map_contains_ikey"
-    elif mname == "insert" and obj_is_map_int:
-        emit_name = "map_insert_ikey"
+    elif mname == "insert":
+        if obj_is_map_int:
+            emit_name = "map_insert_ikey"
+        elif obj_is_map:
+            emit_name = "map_insert"
     if BOOL_RETURNING_METHODS.contains(emit_name):
         ir_var_types.insert("__last_call", "bool")
 
@@ -921,7 +930,10 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
             if entry.kind == "entry" and entry.children.len() >= 2:
                 k_r := ir_expr(entry.children[0])
                 v_r := ir_expr(entry.children[1])
-                ir_emit_call(ir_reg(), "insert", "void", [map_r, k_r, v_r])
+                if has_int_keys:
+                    ir_emit_call(ir_reg(), "map_insert_ikey", "void", [map_r, k_r, v_r])
+                else:
+                    ir_emit_call(ir_reg(), "map_insert", "void", [map_r, k_r, v_r])
             _fi7 = _fi7 + 1
         return map_r
 
@@ -1002,7 +1014,11 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         if node.children.len() > 0:
             obj_r := ir_expr(node.children[0])
             r := ir_reg()
-            obj_type := ir_infer_type(node.children[0])
+            mut obj_type := ir_infer_type(node.children[0])
+            if obj_type.len() == 0:
+                recv := get_node(node.children[0])
+                if recv.kind == "ident" and ir_struct_names.contains_key(recv.value):
+                    obj_type = recv.value
             lookup_key := obj_type + "." + fname
             if ir_struct_field_index_lookup.contains_key(lookup_key):
                 field_offset := ir_unpack_field_index(ir_struct_field_index_lookup[lookup_key]) * 8

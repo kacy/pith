@@ -1,25 +1,277 @@
 from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
-from ast import reset_arena
+from ast import reset_arena, get_node
 from ir_emitter import emit_ir, set_import_roots, set_test_mode
-from driver import init_driver, resolve_imports, get_driver_parse_diagnostics, driver_has_parse_errors
+from driver import init_driver, resolve_imports, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path
 from checker import initialize_checker, c_run_module
 from errors import render_diagnostics, has_errors
 
-fn emit_file() -> String!:
+struct CliArgs:
+    path: String
+    emit_tests: Bool
+    emit_combined: Bool
+
+struct ParsedModule:
+    root: Int
+    import_roots: List[Int]
+
+struct RenamedImport:
+    ir: String
+    global_names: List[String]
+    function_names: List[String]
+    init_funcs: List[String]
+
+fn usage():
+    print("usage: ir_driver [--combined] [--tests] <file.fg>")
+
+fn join_from(parts: List[String], start: Int) -> String:
+    mut tail: List[String] := []
+    mut i := start
+    while i < parts.len():
+        tail.push(parts[i])
+        i = i + 1
+    return tail.join(" ")
+
+fn line_end(text: String, start: Int) -> Int:
+    mut end := start
+    while end < text.len():
+        if text.substring(end, end + 1) == chr(10):
+            return end
+        end = end + 1
+    return text.len()
+
+fn remove_main_from_import(ir: String) -> String:
+    mut out: List[String] := []
+    mut skipping := false
+    mut start := 0
+    while start <= ir.len():
+        end := line_end(ir, start)
+        line := ir.substring(start, end)
+        trimmed := line.trim()
+        if trimmed.starts_with("func main "):
+            skipping = true
+        elif skipping and trimmed == "endfunc":
+            skipping = false
+        elif not skipping:
+            out.push(line)
+        if end >= ir.len():
+            break
+        start = end + 1
+    return out.join(chr(10))
+
+fn rename_import_ir(ir: String, module_index: Int) -> RenamedImport:
+    trimmed_ir := remove_main_from_import(ir)
+    prefix := "m" + module_index.to_string() + "_"
+
+    mut global_names: List[String] := []
+    mut global_name_set: Map[String, Bool] := {}
+    mut function_names: List[String] := []
+    mut function_name_set: Map[String, Bool] := {}
+    mut start := 0
+    while start <= trimmed_ir.len():
+        end := line_end(trimmed_ir, start)
+        line := trimmed_ir.substring(start, end)
+        parts := line.split(" ")
+        if parts.len() >= 2 and parts[0] == "global":
+            global_names.push(parts[1])
+            global_name_set.insert(parts[1], true)
+        elif parts.len() >= 2 and parts[0] == "func":
+            function_names.push(parts[1])
+            function_name_set.insert(parts[1], true)
+        if end >= trimmed_ir.len():
+            break
+        start = end + 1
+
+    mut init_funcs: List[String] := []
+    for name in function_names:
+        if name.starts_with("__init_globals"):
+            init_funcs.push(prefix + name.replace("__init_globals", "__init_globals_" + module_index.to_string()))
+
+    mut out: List[String] := []
+    start = 0
+    while start <= trimmed_ir.len():
+        end := line_end(trimmed_ir, start)
+        line := trimmed_ir.substring(start, end)
+        mut rewritten := line
+        if line.contains("__init_globals"):
+            rewritten = line.replace("__init_globals", "__init_globals_" + module_index.to_string())
+        parts := rewritten.split(" ")
+        if parts.len() >= 2 and parts[0] == "func":
+            rewritten = "func " + prefix + parts[1]
+            if parts.len() > 2:
+                rewritten = rewritten + " " + join_from(parts, 2)
+        elif parts.len() >= 2 and parts[0] == "global":
+            if not parts[1].starts_with("__for_"):
+                rewritten = "global " + prefix + parts[1]
+                if parts.len() > 2:
+                    rewritten = rewritten + " " + join_from(parts, 2)
+        elif parts.len() >= 3 and parts[0] == "store":
+            if global_name_set.contains_key(parts[1]):
+                rewritten = "store " + prefix + parts[1] + " " + join_from(parts, 2)
+        elif parts.len() >= 3 and parts[0] == "load":
+            if global_name_set.contains_key(parts[2]):
+                rewritten = "load " + parts[1] + " " + prefix + parts[2]
+        elif parts.len() >= 5 and parts[0] == "call":
+            if function_name_set.contains_key(parts[2]):
+                rewritten = "call " + parts[1] + " " + prefix + parts[2] + " " + join_from(parts, 3)
+        elif parts.len() >= 3 and parts[0] == "callv":
+            if function_name_set.contains_key(parts[1]):
+                rewritten = "callv " + prefix + parts[1]
+                if parts.len() > 2:
+                    rewritten = rewritten + " " + join_from(parts, 2)
+        out.push(rewritten)
+        if end >= trimmed_ir.len():
+            break
+        start = end + 1
+
+    return RenamedImport(out.join(chr(10)), global_names, function_names, init_funcs)
+
+fn rewrite_ir_with_import_maps(ir: String, global_map: Map[String, String], function_map: Map[String, String]) -> String:
+    if global_map.len() == 0 and function_map.len() == 0:
+        return ir
+
+    mut out: List[String] := []
+    mut start := 0
+    while start <= ir.len():
+        end := line_end(ir, start)
+        line := ir.substring(start, end)
+        parts := line.split(" ")
+        mut rewritten := line
+        if parts.len() >= 3 and parts[0] == "load" and global_map.contains_key(parts[2]):
+            rewritten = "load " + parts[1] + " " + global_map[parts[2]]
+        elif parts.len() >= 3 and parts[0] == "store" and global_map.contains_key(parts[1]):
+            rewritten = "store " + global_map[parts[1]] + " " + parts[2]
+        elif parts.len() >= 5 and parts[0] == "call" and function_map.contains_key(parts[2]):
+            rewritten = "call " + parts[1] + " " + function_map[parts[2]] + " " + join_from(parts, 3)
+        elif parts.len() >= 3 and parts[0] == "callv" and function_map.contains_key(parts[1]):
+            rewritten = "callv " + function_map[parts[1]]
+            if parts.len() > 2:
+                rewritten = rewritten + " " + join_from(parts, 2)
+        out.push(rewritten)
+        if end >= ir.len():
+            break
+        start = end + 1
+    return out.join(chr(10))
+
+fn rewrite_main_ir(main_ir: String, imported_global_map: Map[String, String], imported_function_map: Map[String, String], imported_init_funcs: List[String]) -> String:
+    mut main_func_names: Map[String, Bool] := {}
+    mut start := 0
+    while start <= main_ir.len():
+        end := line_end(main_ir, start)
+        line := main_ir.substring(start, end)
+        parts := line.split(" ")
+        if parts.len() >= 2 and parts[0] == "func":
+            main_func_names.insert(parts[1], true)
+        if end >= main_ir.len():
+            break
+        start = end + 1
+
+    mut out: List[String] := []
+    start = 0
+    while start <= main_ir.len():
+        end := line_end(main_ir, start)
+        line := main_ir.substring(start, end)
+        parts := line.split(" ")
+        mut rewritten := line
+        if parts.len() >= 3 and parts[0] == "load" and imported_global_map.contains_key(parts[2]):
+            rewritten = "load " + parts[1] + " " + imported_global_map[parts[2]]
+        elif parts.len() >= 3 and parts[0] == "store" and imported_global_map.contains_key(parts[1]):
+            rewritten = "store " + imported_global_map[parts[1]] + " " + parts[2]
+        elif parts.len() >= 5 and parts[0] == "call":
+            if not main_func_names.contains_key(parts[2]) and imported_function_map.contains_key(parts[2]):
+                rewritten = "call " + parts[1] + " " + imported_function_map[parts[2]] + " " + join_from(parts, 3)
+        elif parts.len() >= 3 and parts[0] == "callv":
+            if not main_func_names.contains_key(parts[1]) and imported_function_map.contains_key(parts[1]):
+                rewritten = "callv " + imported_function_map[parts[1]]
+                if parts.len() > 2:
+                    rewritten = rewritten + " " + join_from(parts, 2)
+        out.push(rewritten)
+        if parts.len() >= 2 and parts[0] == "func" and parts[1] == "main":
+            mut i := 0
+            while i < imported_init_funcs.len():
+                out.push("call " + (900000 + i).to_string() + " " + imported_init_funcs[i] + " int 0")
+                i = i + 1
+        if end >= main_ir.len():
+            break
+        start = end + 1
+    return out.join(chr(10))
+
+fn builtin_retkind(name: String) -> String:
+    if name == "parse_int" or name == "tcp_connect" or name == "tcp_listen" or name == "tcp_accept" or name == "tcp_write" or name == "process_spawn" or name == "process_write" or name == "file_open_read" or name == "file_open_write" or name == "file_open_append" or name == "file_write":
+        return "result_int"
+    if name == "write_file" or name == "append_file":
+        return "result_bool"
+    return ""
+
+fn is_runtime_builtin_module(module_path: String) -> Bool:
+    return module_path == "std.fmt" or module_path == "std.net.tcp" or module_path == "std.net.dns" or module_path == "std.net.url" or module_path == "std.os.path" or module_path == "std.os.process"
+
+fn rewrite_call_retkinds(ir: String) -> String:
+    mut func_kinds: Map[String, String] := {}
+    mut start := 0
+    while start <= ir.len():
+        end := line_end(ir, start)
+        line := ir.substring(start, end)
+        parts := line.split(" ")
+        if parts.len() >= 4 and parts[0] == "func":
+            func_kinds.insert(parts[1], parts[3])
+        if end >= ir.len():
+            break
+        start = end + 1
+
+    mut out: List[String] := []
+    start = 0
+    while start <= ir.len():
+        end := line_end(ir, start)
+        line := ir.substring(start, end)
+        parts := line.split(" ")
+        if parts.len() >= 5 and parts[0] == "call":
+            mut expected := ""
+            if func_kinds.contains_key(parts[2]):
+                expected = func_kinds[parts[2]]
+            elif builtin_retkind(parts[2]).len() > 0:
+                expected = builtin_retkind(parts[2])
+            current := parts[3]
+            if expected.len() > 0:
+                if current == "unknown" or (current == "int" and expected == "result_int") or (current == "bool" and expected == "result_bool"):
+                    out.push("call " + parts[1] + " " + parts[2] + " " + expected + " " + join_from(parts, 4))
+                    if end >= ir.len():
+                        break
+                    start = end + 1
+                    continue
+        out.push(line)
+        if end >= ir.len():
+            break
+        start = end + 1
+    return out.join(chr(10))
+
+fn parse_args() -> CliArgs:
     a := args()
     if a.len() < 2:
-        print("usage: ir_driver [--tests] <file.fg>")
+        usage()
         exit(1)
 
-    mut path := a[1]
+    mut path := ""
     mut emit_tests := false
-    if path == "--tests":
-        if a.len() < 3:
-            print("usage: ir_driver [--tests] <file.fg>")
-            exit(1)
-        emit_tests = true
-        path = a[2]
+    mut emit_combined := false
+    mut i := 1
+    while i < a.len():
+        arg := a[i]
+        if arg == "--tests":
+            emit_tests = true
+        elif arg == "--combined":
+            emit_combined = true
+        else:
+            path = arg
+        i = i + 1
+
+    if path == "":
+        usage()
+        exit(1)
+
+    return CliArgs(path, emit_tests, emit_combined)
+
+fn parse_and_check(path: String) -> ParsedModule!:
     source := read_file(path)!
     tokens := lex_all(source)
     reset_arena()
@@ -44,11 +296,66 @@ fn emit_file() -> String!:
         print(render_diagnostics(diags, source))
         exit(1)
 
+    return ParsedModule(root, import_roots)
+
+fn emit_single_file(path: String, emit_tests: Bool) -> String!:
+    parsed := parse_and_check(path)!
+    root := parsed.root
+    import_roots := parsed.import_roots
     set_import_roots(import_roots)
     set_test_mode(emit_tests)
     ir := emit_ir(root)
     print(ir)
     return ""
 
-fn main():
-    emit_file()
+fn emit_combined_file(path: String, emit_tests: Bool) -> String!:
+    parsed := parse_and_check(path)!
+    root := parsed.root
+    import_roots := parsed.import_roots
+
+    mut all_ir: List[String] := []
+    mut imported_global_map: Map[String, String] := {}
+    mut imported_function_map: Map[String, String] := {}
+    mut imported_init_funcs: List[String] := []
+
+    mut i := 0
+    while i < import_roots.len():
+        module_path := get_resolved_module_path(import_roots[i])
+        if is_runtime_builtin_module(module_path):
+            i = i + 1
+            continue
+        set_import_roots(import_roots)
+        set_test_mode(false)
+        ir := emit_ir(import_roots[i])
+        renamed := rename_import_ir(ir, i)
+        rewritten_ir := rewrite_ir_with_import_maps(renamed.ir, imported_global_map, imported_function_map)
+
+        prefix := "m" + i.to_string() + "_"
+        for bare in renamed.global_names:
+            imported_global_map.insert(bare, prefix + bare)
+        for bare in renamed.function_names:
+            imported_function_map.insert(bare, prefix + bare)
+        for init_func in renamed.init_funcs:
+            imported_init_funcs.push(init_func)
+        all_ir.push(rewritten_ir)
+        i = i + 1
+
+    set_import_roots(import_roots)
+    set_test_mode(emit_tests)
+    mut main_ir := emit_ir(root)
+    main_ir = rewrite_main_ir(main_ir, imported_global_map, imported_function_map, imported_init_funcs)
+    all_ir.push(main_ir)
+
+    print(rewrite_call_retkinds(all_ir.join(chr(10) + chr(10))))
+    return ""
+
+fn main() -> Int:
+    parsed := parse_args()
+    path := parsed.path
+    emit_tests := parsed.emit_tests
+    emit_combined := parsed.emit_combined
+    if emit_combined:
+        emit_combined_file(path, emit_tests)
+    else:
+        emit_single_file(path, emit_tests)
+    return 0

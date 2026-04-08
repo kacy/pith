@@ -44,8 +44,8 @@ BYTES_RETURNING_FUNCS := "bytes_from_string_utf8,read_file_bytes,file_read_bytes
 LIST_RETURNING_FUNCS := "args,range,repeat_val,zeros,sort,sort_desc,reversed,take,drop,slice,unique,without,intersection,difference,flatten,chunks,json_object_keys"
 LIST_STRING_RETURNING_FUNCS := "sort_strings,zip,enumerate,toml_keys"
 BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,list_contains,list_contains_string,list_is_empty"
-VOID_METHODS := "sort,sort_strings,reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear"
-STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,read_file,env,chr"
+VOID_METHODS := "sort,sort_strings,reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear"
+STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,list_join,read_file,env,chr"
 
 # --- state ---
 mut ir_lines: List[String] := []
@@ -496,6 +496,56 @@ fn ir_register_struct_layout(name: String, field_names: List[String], field_type
     ir_struct_names.insert(name, field_names.len())
     ir_emit("struct " + name + " " + field_names.join(" "))
 
+fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool):
+    root := get_node(root_idx)
+    mut i := 0
+    while i < root.children.len():
+        child := root.children[i]
+        mut cn := get_node(child)
+        if cn.kind == "pub" and cn.children.len() > 0:
+            cn = get_node(cn.children[0])
+        if cn.kind == "struct_decl":
+            mut sname := cn.value
+            if sname.contains("["):
+                sname = sname.substring(0, sname.index_of("["))
+            mut field_names: List[String] := []
+            mut j := 0
+            while j < cn.children.len():
+                fc := cn.children[j]
+                fn_node := get_node(fc)
+                if fn_node.kind == "field":
+                    mut field_name := fn_node.value
+                    if field_name.contains(" "):
+                        field_name = field_name.split(" ")[0]
+                    field_index := field_names.len()
+                    field_names.push(field_name)
+                    if fn_node.children.len() > 0:
+                        type_node := get_node(fn_node.children[0])
+                        if type_node.kind == "type" or type_node.kind == "generic_type":
+                            ir_struct_field_lookup.insert(sname + "." + field_name, ir_resolve_type_node(fn_node.children[0]))
+                    ir_struct_field_index_lookup.insert(sname + "." + field_name, field_index.to_string())
+                j = j + 1
+            ir_struct_names.insert(sname, field_names.len())
+            if emit_decl:
+                ir_emit("struct " + sname + " " + field_names.join(" "))
+        elif cn.kind == "enum_decl":
+            sname := cn.value
+            mut variant_names: List[String] := []
+            mut j := 0
+            while j < cn.children.len():
+                vc := cn.children[j]
+                vn := get_node(vc)
+                if vn.kind == "variant":
+                    variant_index := variant_names.len()
+                    variant_names.push(vn.value)
+                    ir_struct_field_lookup.insert(sname + "." + vn.value, sname)
+                    ir_struct_field_index_lookup.insert(sname + "." + vn.value, variant_index.to_string())
+                j = j + 1
+            ir_struct_names.insert(sname, variant_names.len())
+            if emit_decl:
+                ir_emit("struct " + sname + " " + variant_names.join(" "))
+        i = i + 1
+
 fn ir_seed_global_types():
     for name in ir_global_int_names:
         ir_var_types.insert(name, "int")
@@ -807,7 +857,11 @@ fn ir_infer_type(idx: Int) -> String:
                 checked := ir_checked_type(node.children[0])
                 if checked.len() > 0:
                     return checked
-            obj_type := ir_infer_type(node.children[0])
+            mut obj_type := ir_infer_type(node.children[0])
+            if obj_type.len() == 0:
+                recv := get_node(node.children[0])
+                if recv.kind == "ident" and ir_struct_names.contains_key(recv.value):
+                    obj_type = recv.value
             if obj_type.len() > 0:
                 lookup_key := obj_type + "." + fname
                 if ir_struct_field_lookup.contains_key(lookup_key):
@@ -959,6 +1013,8 @@ fn ir_emit_method_call(idx: Int) -> Int:
             emit_name = "list_index_of_string"
         elif obj_is_list:
             emit_name = "list_index_of"
+    elif mname == "join" and obj_is_list:
+        emit_name = "list_join"
     elif mname == "sort":
         if obj_type == "list_string":
             emit_name = "sort_strings"
@@ -1005,8 +1061,11 @@ fn ir_emit_method_call(idx: Int) -> Int:
             emit_name = "map_values"
     elif mname == "contains_key" and obj_is_map_int:
         emit_name = "map_contains_ikey"
-    elif mname == "insert" and obj_is_map_int:
-        emit_name = "map_insert_ikey"
+    elif mname == "insert":
+        if obj_is_map_int:
+            emit_name = "map_insert_ikey"
+        elif obj_is_map:
+            emit_name = "map_insert"
     elif mname == "slice" and obj_is_bytes:
         emit_name = "bytes_slice"
     elif mname == "concat" and obj_is_bytes:
@@ -1475,7 +1534,10 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
             if entry.kind == "entry" and entry.children.len() >= 2:
                 k_r := ir_expr(entry.children[0])
                 v_r := ir_expr(entry.children[1])
-                ir_emit_call3(ir_reg(), "insert", "void", map_r, k_r, v_r)
+                if has_int_keys:
+                    ir_emit_call3(ir_reg(), "map_insert_ikey", "void", map_r, k_r, v_r)
+                else:
+                    ir_emit_call3(ir_reg(), "map_insert", "void", map_r, k_r, v_r)
             _fi7 = _fi7 + 1
         return map_r
 
@@ -1596,7 +1658,11 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
                     ir_emit("eq " + r.to_string() + " " + obj_r.to_string() + " " + zero.to_string())
                 return r
             r := ir_reg()
-            obj_type := ir_infer_type(node.children[0])
+            mut obj_type := ir_infer_type(node.children[0])
+            if obj_type.len() == 0:
+                recv := get_node(node.children[0])
+                if recv.kind == "ident" and ir_struct_names.contains_key(recv.value):
+                    obj_type = recv.value
             lookup_key := obj_type + "." + fname
             if ir_struct_field_index_lookup.contains_key(lookup_key):
                 field_offset := ir_unpack_field_index(ir_struct_field_index_lookup[lookup_key]) * 8
@@ -2473,40 +2539,11 @@ pub fn emit_ir(root_idx: Int) -> String:
     ir_struct_field_lookup = {}
     ir_struct_field_index_lookup = {}
     ir_register_known_import_structs()
-    mut _fi22 := 0
-    kids22_children := root.children
-    while _fi22 < kids22_children.len():
-        child := kids22_children[_fi22]
-        mut cn := get_node(child)
-        if cn.kind == "pub" and cn.children.len() > 0:
-            cn = get_node(cn.children[0])
-        if cn.kind == "struct_decl":
-            mut sname := cn.value
-            # strip generic params like Wrapper[T] -> Wrapper
-            if sname.contains("["):
-                sname = sname.substring(0, sname.index_of("["))
-            mut field_names: List[String] := []
-            mut _fi34 := 0
-            kids34_children := cn.children
-            while _fi34 < kids34_children.len():
-                fc := kids34_children[_fi34]
-                fn_node := get_node(fc)
-                if fn_node.kind == "field":
-                    mut field_name := fn_node.value
-                    if field_name.contains(" "):
-                        field_name = field_name.split(" ")[0]
-                    field_index := field_names.len()
-                    field_names.push(field_name)
-                    if fn_node.children.len() > 0:
-                        type_node := get_node(fn_node.children[0])
-                        if type_node.kind == "type" or type_node.kind == "generic_type":
-                            ir_struct_field_lookup.insert(sname + "." + field_name, ir_resolve_type_node(fn_node.children[0]))
-                    ir_struct_field_index_lookup.insert(sname + "." + field_name, field_index.to_string())
-                _fi34 = _fi34 + 1
-            ir_struct_names.insert(sname, field_names.len())
-            ir_emit("struct " + sname + " " + field_names.join(" "))
-
-        _fi22 = _fi22 + 1
+    mut preload_struct_i := 0
+    while preload_struct_i < ir_preloaded_import_roots.len():
+        ir_collect_struct_decls(ir_preloaded_import_roots[preload_struct_i], false)
+        preload_struct_i = preload_struct_i + 1
+    ir_collect_struct_decls(root_idx, true)
     # register type aliases that point to structs
     mut _fi23 := 0
     kids23_children := root.children

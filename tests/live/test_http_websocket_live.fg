@@ -11,16 +11,10 @@ fn choose_port(start: Int) -> Int!:
             return port
         port = port + 1
     fail "no free tcp port"
-fn handle_websocket(fd: Int, req: HttpRequestBytes) -> Int!:
-    ws := websocket.upgrade(fd, req)!
-    text := ws.recv_text()!
-    ws.send_text("echo:" + text)!
-    ws.close(1000, "done")!
-    return 0
 fn handle_http(fd: Int) -> Int!:
     req := http.read_request_bytes(fd)!
-    if req.path()! == "/ws" and websocket.is_upgrade_request(req):
-        return handle_websocket(fd, req)
+    if websocket.route_echo(fd, req, "/ws", "", "echo:", "quit")!:
+        return 0
     return http.send_response(fd, http.html_response(200, "<h1>Hello, forge!</h1>"))
 fn run_server(port: Int) -> Int!:
     server_fd := tcp_listen("127.0.0.1", port)!
@@ -39,6 +33,7 @@ fn main() -> Int!:
     ws := websocket.dial("127.0.0.1", port, "/ws")!
     ws.send_text("forge")!
     print(ws.recv_text()!)
+    ws.send_text("quit")!
     closed := ws.recv()
     print(closed.is_err.to_string())
     print(ws.is_closed().to_string())

@@ -5,7 +5,8 @@
 #
 #   import std.net.websocket as websocket
 #   req := http.read_request_bytes(fd)!
-#   ws := websocket.upgrade(fd, req)!
+#   if websocket.route_echo(fd, req, "/ws", "connected", "echo:", "quit")!:
+#       return 0
 #   client := websocket.dial("127.0.0.1", 8080, "/chat")!
 import std.bytes as bytes
 import std.hash as hash
@@ -232,7 +233,7 @@ fn register_websocket_state(reader: BufferedBytesReader, writer: BufferedBytesWr
     websocket_close_handles.insert(handle, close_handle)
     return WebSocket(handle)
 fn register_websocket(stream: TcpStream, is_client: Bool) -> WebSocket:
-    return register_websocket_state(stream.buffered_bytes_reader(), stream.buffered_bytes_writer(), is_client, WS_CLOSE_TCP, stream.fd)
+    return register_websocket_state(stream.buffered_bytes_reader_chunked(1), stream.buffered_bytes_writer(), is_client, WS_CLOSE_TCP, stream.fd)
 pub fn from_buffered(reader: BufferedBytesReader, writer: BufferedBytesWriter, is_client: Bool) -> WebSocket:
     return register_websocket_state(reader, writer, is_client, WS_CLOSE_NONE, 0)
 fn websocket_reader(ws: WebSocket) -> BufferedBytesReader:
@@ -289,6 +290,42 @@ pub fn accept_buffered(req: HttpRequestBytes, reader: BufferedBytesReader, write
     writer.write_bytes(response)!
     ensure_writer_flushed(writer)!
     return from_buffered(reader, writer, false)
+fn should_handle_route(req: HttpRequestBytes, path: String) -> Bool!:
+    if not req.is_get(path)!:
+        return false
+    return is_upgrade_request(req)
+pub fn is_route(req: HttpRequestBytes, path: String) -> Bool!:
+    return should_handle_route(req, path)!
+pub fn echo_session(ws: WebSocket, greeting: String, prefix: String, stop_text: String) -> Int!:
+    mut sent := 0
+    if greeting != "":
+        ws.send_text(greeting)!
+        sent = sent + 1
+    while true:
+        msg := ws.recv_text()
+        if msg.is_err:
+            return sent
+        if stop_text != "" and msg.ok == stop_text:
+            ws.close(1000, "bye")!
+            return sent
+        ws.send_text(prefix + msg.ok)!
+        sent = sent + 1
+pub fn serve_echo(fd: Int, req: HttpRequestBytes, greeting: String, prefix: String, stop_text: String) -> Int!:
+    ws := upgrade(fd, req)!
+    return echo_session(ws, greeting, prefix, stop_text)
+pub fn serve_echo_buffered(req: HttpRequestBytes, reader: BufferedBytesReader, writer: BufferedBytesWriter, greeting: String, prefix: String, stop_text: String) -> Int!:
+    ws := accept_buffered(req, reader, writer)!
+    return echo_session(ws, greeting, prefix, stop_text)
+pub fn route_echo(fd: Int, req: HttpRequestBytes, path: String, greeting: String, prefix: String, stop_text: String) -> Bool!:
+    if not should_handle_route(req, path)!:
+        return false
+    serve_echo(fd, req, greeting, prefix, stop_text)!
+    return true
+pub fn route_echo_buffered(req: HttpRequestBytes, reader: BufferedBytesReader, writer: BufferedBytesWriter, path: String, greeting: String, prefix: String, stop_text: String) -> Bool!:
+    if not should_handle_route(req, path)!:
+        return false
+    serve_echo_buffered(req, reader, writer, greeting, prefix, stop_text)!
+    return true
 impl WebSocketFrame:
     fn is_text() -> Bool:
         return self.opcode == OP_TEXT

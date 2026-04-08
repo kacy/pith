@@ -1,0 +1,54 @@
+import std.net.websocket as websocket
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn run_server(port: Int) -> Int!:
+    server_fd := tcp_listen("127.0.0.1", port)!
+    left := websocket.accept(tcp_accept(server_fd)!)!
+    right := websocket.accept(tcp_accept(server_fd)!)!
+
+    left_name := left.recv_text()!
+    right_name := right.recv_text()!
+    left.send_text("welcome " + left_name)!
+    right.send_text("welcome " + right_name)!
+
+    left_msg := left.recv_text()!
+    right.send_text(left_name + ": " + left_msg)!
+
+    right_msg := right.recv_text()!
+    left.send_text(right_name + ": " + right_msg)!
+
+    left.close(1000, "bye")!
+    right.close(1000, "bye")!
+    tcp_close(server_fd)
+    return 0
+
+fn main() -> Int!:
+    port := choose_port(18846)!
+    server_task := spawn run_server(port)
+    sleep(200)
+
+    left := websocket.dial("127.0.0.1", port, "/chat")!
+    right := websocket.dial("127.0.0.1", port, "/chat")!
+
+    left.send_text("left")!
+    right.send_text("right")!
+    print(left.recv_text()!)
+    print(right.recv_text()!)
+
+    left.send_text("hello from left")!
+    print(right.recv_text()!)
+
+    right.send_text("hello from right")!
+    print(left.recv_text()!)
+
+    await server_task
+    return 0

@@ -4,19 +4,17 @@ import std.net.http as http
 import std.net.websocket as websocket
 from std.io import BufferedBytesReader, BufferedBytesWriter
 from std.net.http import HttpRequestBytes
+
 fn write_response(writer: BufferedBytesWriter, response: String) -> Int!:
     writer.write_bytes(bytes.from_string_utf8(response))!
     flushed := writer.flush()
     if flushed.is_err:
         fail "http response flush failed"
     return response.len()
+
 fn handle_app(req: HttpRequestBytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> String!:
-    path := req.path()!
-    if path == "/ws" and websocket.is_upgrade_request(req):
-        ws := websocket.accept_buffered(req, reader, writer)!
-        text := ws.recv_text()!
-        ws.send_text("echo:" + text)!
-        return "ws:" + text
+    if websocket.route_echo_buffered(req, reader, writer, "/ws", "", "echo:", "")!:
+        return "ws:ok"
     write_response(writer, http.not_found())!
     return "http:404"
 fn main() -> Int!:

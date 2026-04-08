@@ -204,7 +204,7 @@ fn read_http_head(reader: BufferedBytesReader) -> Bytes!:
     buf := bytes.buffer_with_capacity(DEFAULT_READ_CHUNK_SIZE)
     mut head_end := -1
     while head_end < 0:
-        chunk := reader.read_bytes(DEFAULT_READ_CHUNK_SIZE)!
+        chunk := reader.read_bytes(1)!
         if chunk.is_empty():
             fail "websocket handshake response truncated"
         buf.write(chunk)!
@@ -264,12 +264,13 @@ pub fn dial(host: String, port: Int, path: String) -> WebSocket!:
 pub fn dial_with_headers(host: String, port: Int, path: String, headers: Map[String, String]) -> WebSocket!:
     conn := io.connect(host, port)!
     key := random_client_key()!
+    key_text := encoding.b64_encode(key)
     request := client_request_with_key(default_host_header(host, port), path, headers, key)!
     writer := conn.buffered_bytes_writer()
     writer.write_bytes(request)!
     ensure_writer_flushed(writer)!
-    response_head := read_http_head(conn.buffered_bytes_reader())!
-    if not validate_upgrade_response(response_head, key)!:
+    response_head := read_http_head(conn.buffered_bytes_reader_chunked(1))!
+    if not validate_upgrade_response(response_head, bytes.from_string_utf8(key_text))!:
         conn.close()
         fail "invalid websocket handshake response"
     return register_websocket(conn, true)

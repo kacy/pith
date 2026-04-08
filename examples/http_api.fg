@@ -1,12 +1,9 @@
 # test std.net.http — request parsing, headers, query params, responses
-
 import std.bytes as bytes
 import std.net.http as http
 import std.io as io
-
 fn main() -> Int!:
     crlf := chr(13) + chr(10)
-
     # parse a GET with headers and query string
     mut raw := "GET /search?q=forge&lang=en HTTP/1.1" + crlf
     raw = raw + "Host: example.com" + crlf
@@ -18,20 +15,18 @@ fn main() -> Int!:
     print("path: " + http.path(req))
     print("query: " + http.query(req))
     print("version: " + http.version(req))
-
     # header access (case-insensitive)
     print("host: " + http.get_header(req, "Host"))
     print("agent: " + http.get_header(req, "user-agent"))
     print("missing: " + http.get_header(req, "X-Missing"))
-
     # query param access
     print("q: " + http.get_query_param(req, "q"))
     print("lang: " + http.get_query_param(req, "lang"))
     print("missing: " + http.get_query_param(req, "foo"))
-
     # parse a POST with body
     mut raw2 := "POST /api/data HTTP/1.1" + crlf
     raw2 = raw2 + "Content-Type: application/json" + crlf
+    raw2 = raw2 + "Content-Length: 15" + crlf
     raw2 = raw2 + crlf
     raw2 = raw2 + "hello post body"
     req2 := http.parse_request(raw2)
@@ -39,33 +34,27 @@ fn main() -> Int!:
     print("post path: " + http.path(req2))
     print("post type: " + http.get_header(req2, "Content-Type"))
     print("post body: " + http.body(req2))
-
     raw2_bytes := bytes.buffer()
     raw2_bytes.write(bytes.from_string_utf8(raw2))!
     req2_bytes := http.read_request_buffered_bytes(io.bytes_reader(raw2_bytes.bytes()).buffered_chunked(4))!
     print("post body bytes: " + req2_bytes.body_bytes().len().to_string())
     print("post type bytes: " + req2_bytes.header_bytes("Content-Type").to_string_utf8()!)
-
     # response builders
     r1 := http.html_response(200, "<h1>ok</h1>")
     if r1.contains("200 OK"):
         print("html 200: ok")
     if r1.contains("text/html"):
         print("html mime: ok")
-
     r2 := http.json_response(201, "[]")
     if r2.contains("201 Created"):
         print("json 201: ok")
-
     r3 := http.not_found()
     if r3.contains("404"):
         print("not found: ok")
-
     r4 := http.redirect("/new")
     if r4.contains("301"):
         print("redirect: ok")
     if r4.contains("/new"):
         print("redirect location: ok")
-
     print("http api works")
     return 0

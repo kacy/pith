@@ -144,6 +144,8 @@ fn ir_resolve_type_hint(type_name: String) -> String:
     mut resolved := type_name
     if ir_type_aliases.contains_key(resolved):
         resolved = ir_type_aliases[resolved]
+    if resolved.starts_with("opaque:"):
+        resolved = resolved.substring(7, resolved.len())
     if resolved == "String":
         return "string"
     if resolved == "Bytes":
@@ -341,6 +343,8 @@ fn ir_retkind(type_name: String) -> String:
         return "set"
     if resolved == "void":
         return "void"
+    if resolved == "Mutex" or resolved == "WaitGroup" or resolved == "Semaphore":
+        return "opaque:" + resolved
     if ir_struct_names.contains_key(resolved):
         return "struct:" + resolved
     return resolved

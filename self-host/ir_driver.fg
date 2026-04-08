@@ -206,6 +206,8 @@ fn builtin_retkind(name: String) -> String:
 fn is_explicit_ir_retkind(kind: String) -> Bool:
     if kind.starts_with("struct:"):
         return true
+    if kind.starts_with("opaque:"):
+        return true
     return kind == "unknown" or kind == "void" or kind == "int" or kind == "result_int" or kind == "float" or kind == "bool" or kind == "result_bool" or kind == "string" or kind == "bytes" or kind == "list" or kind == "list_string" or kind == "map" or kind == "map_int" or kind == "set" or kind == "set_int" or kind == "tuple" or kind == "channel" or kind == "task"
 
 fn ir_contract_error(line_no: Int, message: String):
@@ -225,7 +227,7 @@ fn validate_combined_ir_contract(ir: String):
             struct_names.insert(parts[1], true)
         if parts.len() >= 4 and parts[0] == "func":
             retkind := parts[3]
-            if not is_explicit_ir_retkind(retkind) and struct_names.contains_key(retkind):
+            if not is_explicit_ir_retkind(retkind) and (struct_names.contains_key(retkind) or retkind == "Mutex" or retkind == "WaitGroup" or retkind == "Semaphore"):
                 ir_contract_error(line_no, "bare or unknown function retkind '" + retkind + "'")
             func_kinds.insert(parts[1], retkind)
         if end >= ir.len():
@@ -242,7 +244,7 @@ fn validate_combined_ir_contract(ir: String):
         if parts.len() >= 5 and parts[0] == "call":
             callee := parts[2]
             retkind := parts[3]
-            if not is_explicit_ir_retkind(retkind) and struct_names.contains_key(retkind):
+            if not is_explicit_ir_retkind(retkind) and (struct_names.contains_key(retkind) or retkind == "Mutex" or retkind == "WaitGroup" or retkind == "Semaphore"):
                 ir_contract_error(line_no, "bare or unknown call retkind '" + retkind + "' for " + callee)
             builtin_kind := builtin_retkind(callee)
             if builtin_kind.len() > 0 and builtin_kind != retkind:

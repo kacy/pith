@@ -418,25 +418,7 @@ fn ir_infer_type(idx: Int) -> String:
         return "tuple"
     # identifiers — look up tracked type
     if kind == "ident":
-        if ir_var_types.contains_key(node.value):
-            return ir_var_types[node.value]
-        if ir_global_int_names.contains(node.value):
-            return "int"
-        if ir_global_string_names.contains(node.value):
-            return "string"
-        if ir_global_list_string_names.contains(node.value):
-            return "list_string"
-        if ir_global_list_names.contains(node.value):
-            return "list"
-        if ir_global_map_int_names.contains(node.value):
-            return "map_int"
-        if ir_global_map_names.contains(node.value):
-            return "map"
-        if ir_global_set_names.contains(node.value):
-            return "set"
-        if ir_global_bool_names.contains(node.value):
-            return "bool"
-        return ""
+        return ir_lookup_name_type(node.value)
     if kind == "self":
         return "struct"
     # grouped expression — infer inner

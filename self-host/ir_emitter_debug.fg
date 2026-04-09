@@ -701,6 +701,54 @@ fn ir_collect_method_call_regs(node: Node) -> List[Int]:
         i = i + 1
     return regs
 
+fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
+    mut part_r := ir_expr(expr_idx)
+    expr_type := ir_infer_type(expr_idx)
+    if expr_type == "bool":
+        converted := ir_reg()
+        ir_emit_call(converted, "bool_to_string", "string", [part_r])
+        return converted
+    if expr_type == "float":
+        converted := ir_reg()
+        ir_emit_call(converted, "float_to_string", "string", [part_r])
+        return converted
+    if expr_type == "int":
+        converted := ir_reg()
+        ir_emit_call(converted, "to_string", "string", [part_r])
+        return converted
+    if expr_type == "":
+        converted := ir_reg()
+        ir_emit_call(converted, "smart_to_string", "string", [part_r])
+        return converted
+    return part_r
+
+fn ir_emit_lambda_capture_setup(captures: List[String]):
+    mut i := 0
+    while i < captures.len():
+        cap_val := ir_reg()
+        ir_emit("load " + cap_val.to_string() + " " + captures[i])
+        slot := ir_reg()
+        ir_emit("iconst " + slot.to_string() + " " + i.to_string())
+        ir_emit_call(ir_reg(), "__closure_set_env", "void", [slot, cap_val])
+        i = i + 1
+
+fn ir_emit_lambda_capture_loads(captures: List[String]):
+    mut i := 0
+    while i < captures.len():
+        cap_r := ir_reg()
+        slot_r := ir_reg()
+        ir_emit("iconst " + slot_r.to_string() + " " + i.to_string())
+        ir_emit_call(cap_r, "__closure_get_env", "unknown", [slot_r])
+        ir_var_regs.insert(captures[i], cap_r)
+        ir_emit("store " + captures[i] + " " + cap_r.to_string())
+        i = i + 1
+
+fn ir_append_deferred_lambda_body():
+    mut i := 0
+    while i < ir_lines.len():
+        ir_lambda_bodies.push(ir_lines[i])
+        i = i + 1
+
 # --- method call dispatch (extracted from ir_expr) ---
 fn ir_emit_method_call(idx: Int) -> Int:
     node := get_node(idx)
@@ -750,26 +798,7 @@ fn ir_emit_string_interp(idx: Int) -> Int:
             part_r = ir_reg()
             ir_emit("strref " + part_r.to_string() + " " + si)
         else:
-            part_r = ir_expr(child)
-            # wrap non-string expressions with appropriate to_string
-            expr_type := ir_infer_type(child)
-            if expr_type == "bool":
-                br := ir_reg()
-                ir_emit_call(br, "bool_to_string", "string", [part_r])
-                part_r = br
-            elif expr_type == "float":
-                fr := ir_reg()
-                ir_emit_call(fr, "float_to_string", "string", [part_r])
-                part_r = fr
-            elif expr_type == "int":
-                ts_r := ir_reg()
-                ir_emit_call(ts_r, "to_string", "string", [part_r])
-                part_r = ts_r
-            elif expr_type == "":
-                # unknown type — use smart_to_string for safety
-                ts_r := ir_reg()
-                ir_emit_call(ts_r, "smart_to_string", "string", [part_r])
-                part_r = ts_r
+            part_r = ir_string_interp_expr_part(child)
         if result_r < 0:
             result_r = part_r
         else:
@@ -805,15 +834,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     mut captures: List[String] := []
     if lbody_idx >= 0:
         captures = ir_find_free_vars(lbody_idx, lparams)
-    # emit capture setup: store captured vars in closure env
-    mut ci := 0
-    while ci < captures.len():
-        cap_val := ir_reg()
-        ir_emit("load " + cap_val.to_string() + " " + captures[ci])
-        slot := ir_reg()
-        ir_emit("iconst " + slot.to_string() + " " + ci.to_string())
-        ir_emit_call(ir_reg(), "__closure_set_env", "void", [slot, cap_val])
-        ci = ci + 1
+    ir_emit_lambda_capture_setup(captures)
 
     # save current state and emit lambda to deferred buffer
     saved_regs := ir_next_reg
@@ -831,16 +852,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
         ir_var_regs.insert(lparams[lpi], lr)
         ir_emit("param " + lparams[lpi])
         lpi = lpi + 1
-    # load captured variables from closure env
-    mut ce := 0
-    while ce < captures.len():
-        cap_r := ir_reg()
-        slot_r := ir_reg()
-        ir_emit("iconst " + slot_r.to_string() + " " + ce.to_string())
-        ir_emit_call(cap_r, "__closure_get_env", "unknown", [slot_r])
-        ir_var_regs.insert(captures[ce], cap_r)
-        ir_emit("store " + captures[ce] + " " + cap_r.to_string())
-        ce = ce + 1
+    ir_emit_lambda_capture_loads(captures)
     if lbody_idx >= 0:
         body_node := get_node(lbody_idx)
         if body_node.kind == "body" and body_node.children.len() > 0:
@@ -854,10 +866,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_emit("ret " + dr.to_string())
     ir_emit("endfunc")
     # save lambda IR and restore state
-    mut li := 0
-    while li < ir_lines.len():
-        ir_lambda_bodies.push(ir_lines[li])
-        li = li + 1
+    ir_append_deferred_lambda_body()
     ir_lines = saved_lines
     ir_next_reg = saved_regs
     ir_var_regs = saved_vars

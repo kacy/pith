@@ -21,6 +21,12 @@ struct RenamedImport:
     function_names: List[String]
     init_funcs: List[String]
 
+struct DeclaredIrNames:
+    globals: List[String]
+    global_set: Map[String, Bool]
+    functions: List[String]
+    function_set: Map[String, Bool]
+
 fn usage():
     print("usage: ir_driver [--combined] [--tests] <file.fg>")
 
@@ -59,72 +65,137 @@ fn remove_main_from_import(ir: String) -> String:
         start = end + 1
     return out.join(chr(10))
 
+fn collect_declared_ir_names(ir: String) -> DeclaredIrNames:
+    mut globals: List[String] := []
+    mut global_set: Map[String, Bool] := {}
+    mut functions: List[String] := []
+    mut function_set: Map[String, Bool] := {}
+    mut start := 0
+    while start <= ir.len():
+        end := line_end(ir, start)
+        line := ir.substring(start, end)
+        parts := line.split(" ")
+        if parts.len() >= 2 and parts[0] == "global":
+            globals.push(parts[1])
+            global_set.insert(parts[1], true)
+        elif parts.len() >= 2 and parts[0] == "func":
+            functions.push(parts[1])
+            function_set.insert(parts[1], true)
+        if end >= ir.len():
+            break
+        start = end + 1
+    return DeclaredIrNames(globals, global_set, functions, function_set)
+
+fn prefixed_init_name(module_index: Int) -> String:
+    return "__init_globals_" + module_index.to_string()
+
+fn collect_import_init_funcs(function_names: List[String], prefix: String, module_index: Int) -> List[String]:
+    mut init_funcs: List[String] := []
+    for name in function_names:
+        if name.starts_with("__init_globals"):
+            init_funcs.push(prefix + name.replace("__init_globals", prefixed_init_name(module_index)))
+    return init_funcs
+
+fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix: String, module_index: Int) -> String:
+    mut rewritten := line
+    if line.contains("__init_globals"):
+        rewritten = line.replace("__init_globals", prefixed_init_name(module_index))
+    parts := rewritten.split(" ")
+    if parts.len() >= 2 and parts[0] == "func":
+        rewritten = "func " + prefix + parts[1]
+        if parts.len() > 2:
+            rewritten = rewritten + " " + join_from(parts, 2)
+    elif parts.len() >= 2 and parts[0] == "global":
+        if not parts[1].starts_with("__for_"):
+            rewritten = "global " + prefix + parts[1]
+            if parts.len() > 2:
+                rewritten = rewritten + " " + join_from(parts, 2)
+    elif parts.len() >= 3 and parts[0] == "store":
+        if declared.global_set.contains_key(parts[1]):
+            rewritten = "store " + prefix + parts[1] + " " + join_from(parts, 2)
+    elif parts.len() >= 3 and parts[0] == "load":
+        if declared.global_set.contains_key(parts[2]):
+            rewritten = "load " + parts[1] + " " + prefix + parts[2]
+    elif parts.len() >= 5 and parts[0] == "call":
+        if declared.function_set.contains_key(parts[2]):
+            rewritten = "call " + parts[1] + " " + prefix + parts[2] + " " + join_from(parts, 3)
+    elif parts.len() >= 3 and parts[0] == "callv":
+        if declared.function_set.contains_key(parts[1]):
+            rewritten = "callv " + prefix + parts[1]
+            if parts.len() > 2:
+                rewritten = rewritten + " " + join_from(parts, 2)
+    return rewritten
+
+fn rewrite_line_with_import_maps(line: String, global_map: Map[String, String], function_map: Map[String, String]) -> String:
+    parts := line.split(" ")
+    mut rewritten := line
+    if parts.len() >= 3 and parts[0] == "load" and global_map.contains_key(parts[2]):
+        rewritten = "load " + parts[1] + " " + global_map[parts[2]]
+    elif parts.len() >= 3 and parts[0] == "store" and global_map.contains_key(parts[1]):
+        rewritten = "store " + global_map[parts[1]] + " " + parts[2]
+    elif parts.len() >= 5 and parts[0] == "call" and function_map.contains_key(parts[2]):
+        rewritten = "call " + parts[1] + " " + function_map[parts[2]] + " " + join_from(parts, 3)
+    elif parts.len() >= 3 and parts[0] == "callv" and function_map.contains_key(parts[1]):
+        rewritten = "callv " + function_map[parts[1]]
+        if parts.len() > 2:
+            rewritten = rewritten + " " + join_from(parts, 2)
+    return rewritten
+
 fn rename_import_ir(ir: String, module_index: Int) -> RenamedImport:
     trimmed_ir := remove_main_from_import(ir)
     prefix := "m" + module_index.to_string() + "_"
+    declared := collect_declared_ir_names(trimmed_ir)
+    init_funcs := collect_import_init_funcs(declared.functions, prefix, module_index)
 
-    mut global_names: List[String] := []
-    mut global_name_set: Map[String, Bool] := {}
-    mut function_names: List[String] := []
-    mut function_name_set: Map[String, Bool] := {}
+    mut out: List[String] := []
     mut start := 0
     while start <= trimmed_ir.len():
         end := line_end(trimmed_ir, start)
         line := trimmed_ir.substring(start, end)
-        parts := line.split(" ")
-        if parts.len() >= 2 and parts[0] == "global":
-            global_names.push(parts[1])
-            global_name_set.insert(parts[1], true)
-        elif parts.len() >= 2 and parts[0] == "func":
-            function_names.push(parts[1])
-            function_name_set.insert(parts[1], true)
+        out.push(rewrite_prefixed_import_line(line, declared, prefix, module_index))
         if end >= trimmed_ir.len():
             break
         start = end + 1
+    return RenamedImport(out.join(chr(10)), declared.globals, declared.functions, init_funcs)
 
-    mut init_funcs: List[String] := []
-    for name in function_names:
-        if name.starts_with("__init_globals"):
-            init_funcs.push(prefix + name.replace("__init_globals", "__init_globals_" + module_index.to_string()))
-
-    mut out: List[String] := []
-    start = 0
-    while start <= trimmed_ir.len():
-        end := line_end(trimmed_ir, start)
-        line := trimmed_ir.substring(start, end)
-        mut rewritten := line
-        if line.contains("__init_globals"):
-            rewritten = line.replace("__init_globals", "__init_globals_" + module_index.to_string())
-        parts := rewritten.split(" ")
+fn collect_main_func_names(main_ir: String) -> Map[String, Bool]:
+    mut func_names: Map[String, Bool] := {}
+    mut start := 0
+    while start <= main_ir.len():
+        end := line_end(main_ir, start)
+        line := main_ir.substring(start, end)
+        parts := line.split(" ")
         if parts.len() >= 2 and parts[0] == "func":
-            rewritten = "func " + prefix + parts[1]
+            func_names.insert(parts[1], true)
+        if end >= main_ir.len():
+            break
+        start = end + 1
+    return func_names
+
+fn inject_imported_init_calls(out: List[String], imported_init_funcs: List[String]) -> List[String]:
+    mut with_inits := out
+    mut i := 0
+    while i < imported_init_funcs.len():
+        with_inits.push("call " + (900000 + i).to_string() + " " + imported_init_funcs[i] + " int 0")
+        i = i + 1
+    return with_inits
+
+fn rewrite_main_line(line: String, main_func_names: Map[String, Bool], imported_global_map: Map[String, String], imported_function_map: Map[String, String]) -> String:
+    parts := line.split(" ")
+    mut rewritten := line
+    if parts.len() >= 3 and parts[0] == "load" and imported_global_map.contains_key(parts[2]):
+        rewritten = "load " + parts[1] + " " + imported_global_map[parts[2]]
+    elif parts.len() >= 3 and parts[0] == "store" and imported_global_map.contains_key(parts[1]):
+        rewritten = "store " + imported_global_map[parts[1]] + " " + parts[2]
+    elif parts.len() >= 5 and parts[0] == "call":
+        if not main_func_names.contains_key(parts[2]) and imported_function_map.contains_key(parts[2]):
+            rewritten = "call " + parts[1] + " " + imported_function_map[parts[2]] + " " + join_from(parts, 3)
+    elif parts.len() >= 3 and parts[0] == "callv":
+        if not main_func_names.contains_key(parts[1]) and imported_function_map.contains_key(parts[1]):
+            rewritten = "callv " + imported_function_map[parts[1]]
             if parts.len() > 2:
                 rewritten = rewritten + " " + join_from(parts, 2)
-        elif parts.len() >= 2 and parts[0] == "global":
-            if not parts[1].starts_with("__for_"):
-                rewritten = "global " + prefix + parts[1]
-                if parts.len() > 2:
-                    rewritten = rewritten + " " + join_from(parts, 2)
-        elif parts.len() >= 3 and parts[0] == "store":
-            if global_name_set.contains_key(parts[1]):
-                rewritten = "store " + prefix + parts[1] + " " + join_from(parts, 2)
-        elif parts.len() >= 3 and parts[0] == "load":
-            if global_name_set.contains_key(parts[2]):
-                rewritten = "load " + parts[1] + " " + prefix + parts[2]
-        elif parts.len() >= 5 and parts[0] == "call":
-            if function_name_set.contains_key(parts[2]):
-                rewritten = "call " + parts[1] + " " + prefix + parts[2] + " " + join_from(parts, 3)
-        elif parts.len() >= 3 and parts[0] == "callv":
-            if function_name_set.contains_key(parts[1]):
-                rewritten = "callv " + prefix + parts[1]
-                if parts.len() > 2:
-                    rewritten = rewritten + " " + join_from(parts, 2)
-        out.push(rewritten)
-        if end >= trimmed_ir.len():
-            break
-        start = end + 1
-
-    return RenamedImport(out.join(chr(10)), global_names, function_names, init_funcs)
+    return rewritten
 
 fn rewrite_ir_with_import_maps(ir: String, global_map: Map[String, String], function_map: Map[String, String]) -> String:
     if global_map.len() == 0 and function_map.len() == 0:
@@ -135,62 +206,23 @@ fn rewrite_ir_with_import_maps(ir: String, global_map: Map[String, String], func
     while start <= ir.len():
         end := line_end(ir, start)
         line := ir.substring(start, end)
-        parts := line.split(" ")
-        mut rewritten := line
-        if parts.len() >= 3 and parts[0] == "load" and global_map.contains_key(parts[2]):
-            rewritten = "load " + parts[1] + " " + global_map[parts[2]]
-        elif parts.len() >= 3 and parts[0] == "store" and global_map.contains_key(parts[1]):
-            rewritten = "store " + global_map[parts[1]] + " " + parts[2]
-        elif parts.len() >= 5 and parts[0] == "call" and function_map.contains_key(parts[2]):
-            rewritten = "call " + parts[1] + " " + function_map[parts[2]] + " " + join_from(parts, 3)
-        elif parts.len() >= 3 and parts[0] == "callv" and function_map.contains_key(parts[1]):
-            rewritten = "callv " + function_map[parts[1]]
-            if parts.len() > 2:
-                rewritten = rewritten + " " + join_from(parts, 2)
-        out.push(rewritten)
+        out.push(rewrite_line_with_import_maps(line, global_map, function_map))
         if end >= ir.len():
             break
         start = end + 1
     return out.join(chr(10))
 
 fn rewrite_main_ir(main_ir: String, imported_global_map: Map[String, String], imported_function_map: Map[String, String], imported_init_funcs: List[String]) -> String:
-    mut main_func_names: Map[String, Bool] := {}
+    main_func_names := collect_main_func_names(main_ir)
+    mut out: List[String] := []
     mut start := 0
     while start <= main_ir.len():
         end := line_end(main_ir, start)
         line := main_ir.substring(start, end)
         parts := line.split(" ")
-        if parts.len() >= 2 and parts[0] == "func":
-            main_func_names.insert(parts[1], true)
-        if end >= main_ir.len():
-            break
-        start = end + 1
-
-    mut out: List[String] := []
-    start = 0
-    while start <= main_ir.len():
-        end := line_end(main_ir, start)
-        line := main_ir.substring(start, end)
-        parts := line.split(" ")
-        mut rewritten := line
-        if parts.len() >= 3 and parts[0] == "load" and imported_global_map.contains_key(parts[2]):
-            rewritten = "load " + parts[1] + " " + imported_global_map[parts[2]]
-        elif parts.len() >= 3 and parts[0] == "store" and imported_global_map.contains_key(parts[1]):
-            rewritten = "store " + imported_global_map[parts[1]] + " " + parts[2]
-        elif parts.len() >= 5 and parts[0] == "call":
-            if not main_func_names.contains_key(parts[2]) and imported_function_map.contains_key(parts[2]):
-                rewritten = "call " + parts[1] + " " + imported_function_map[parts[2]] + " " + join_from(parts, 3)
-        elif parts.len() >= 3 and parts[0] == "callv":
-            if not main_func_names.contains_key(parts[1]) and imported_function_map.contains_key(parts[1]):
-                rewritten = "callv " + imported_function_map[parts[1]]
-                if parts.len() > 2:
-                    rewritten = rewritten + " " + join_from(parts, 2)
-        out.push(rewritten)
+        out.push(rewrite_main_line(line, main_func_names, imported_global_map, imported_function_map))
         if parts.len() >= 2 and parts[0] == "func" and parts[1] == "main":
-            mut i := 0
-            while i < imported_init_funcs.len():
-                out.push("call " + (900000 + i).to_string() + " " + imported_init_funcs[i] + " int 0")
-                i = i + 1
+            out = inject_imported_init_calls(out, imported_init_funcs)
         if end >= main_ir.len():
             break
         start = end + 1

@@ -47,14 +47,18 @@ BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contai
 VOID_METHODS := "sort,sort_strings,reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear"
 STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,list_join,read_file,env,chr"
 
-# --- state ---
+# --- emitted ir buffers ---
 mut ir_lines: List[String] := []
 mut ir_next_reg := 0
 mut ir_next_label := 0
 mut ir_strings: List[String] := []
+
+# --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
 mut ir_var_types: Map[String, String] := {}  # variable name -> type hint or struct name
 mut ir_map_value_types: Map[String, String] := {}  # map variable name -> value type
+
+# --- module globals collected during the prepass ---
 mut ir_global_int_names: List[String] := []
 mut ir_global_string_names: List[String] := []
 mut ir_global_list_string_names: List[String] := []
@@ -65,6 +69,8 @@ mut ir_global_map_value_types: Map[String, String] := {}
 mut ir_global_set_names: List[String] := []
 mut ir_global_set_int_names: List[String] := []
 mut ir_global_bool_names: List[String] := []
+
+# --- type and symbol metadata copied from the checker ---
 mut ir_struct_names: Map[String, Int] := {}  # struct name -> field count
 mut ir_struct_field_lookup: Map[String, String] := {}  # "Struct.field" -> field type
 mut ir_struct_field_index_lookup: Map[String, String] := {}  # "Struct.field" -> field index string
@@ -90,7 +96,7 @@ pub fn set_import_roots(roots: List[Int]):
 pub fn set_test_mode(enabled: Bool):
     ir_emit_tests = enabled
 
-pub fn ir_reset():
+fn ir_reset_local_state():
     ir_lines = []
     ir_next_reg = 0
     ir_next_label = 0
@@ -98,6 +104,8 @@ pub fn ir_reset():
     ir_var_regs = {}
     ir_var_types = {}
     ir_map_value_types = {}
+
+fn ir_reset_global_state():
     ir_global_int_names = []
     ir_global_string_names = []
     ir_global_list_string_names = []
@@ -108,15 +116,25 @@ pub fn ir_reset():
     ir_global_set_names = []
     ir_global_set_int_names = []
     ir_global_bool_names = []
+
+fn ir_reset_type_state():
     ir_struct_field_lookup = {}
     ir_struct_field_index_lookup = {}
-    ir_break_stack = []
-    ir_continue_stack = []
     ir_impl_methods = {}
     ir_import_renames = {}
     ir_func_returns = {}
     ir_module_aliases = {}
     ir_current_func_return_kind = ""
+
+fn ir_reset_control_flow_state():
+    ir_break_stack = []
+    ir_continue_stack = []
+
+pub fn ir_reset():
+    ir_reset_local_state()
+    ir_reset_global_state()
+    ir_reset_type_state()
+    ir_reset_control_flow_state()
 
 fn ir_emit(line: String):
     ir_lines.push(line)

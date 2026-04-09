@@ -2473,6 +2473,64 @@ fn ir_collect_imports(root_idx: Int):
                     pi = pi + 1
         ci = ci + 1
 
+fn ir_collect_type_aliases(root_idx: Int):
+    ir_type_aliases = {}
+    root := get_node(root_idx)
+    mut i := 0
+    while i < root.children.len():
+        child := root.children[i]
+        cn := get_node(child)
+        if cn.kind == "type_alias":
+            mut target := ""
+            mut j := 0
+            while j < cn.children.len():
+                tc := cn.children[j]
+                tn := get_node(tc)
+                if tn.kind == "type":
+                    target = tn.value
+                j = j + 1
+            if target.len() > 0:
+                ir_type_aliases.insert(cn.value, target)
+        i = i + 1
+
+fn ir_register_alias_structs(root_idx: Int):
+    root := get_node(root_idx)
+    mut i := 0
+    while i < root.children.len():
+        child := root.children[i]
+        cn := get_node(child)
+        if cn.kind == "type_alias":
+            aname := cn.value
+            if ir_type_aliases.contains_key(aname):
+                target := ir_type_aliases[aname]
+                if ir_struct_names.contains_key(target):
+                    ir_struct_names.insert(aname, ir_struct_names[target])
+                    ir_emit("struct_alias " + aname + " " + target)
+        i = i + 1
+
+fn ir_collect_function_returns(root_idx: Int):
+    ir_func_returns = {}
+    root := get_node(root_idx)
+    mut i := 0
+    while i < root.children.len():
+        child := root.children[i]
+        cn := ir_unwrap_pub_node(child)
+        if cn.kind == "fn" or cn.kind == "fn_decl":
+            mut j := 0
+            while j < cn.children.len():
+                fc := cn.children[j]
+                fcn := get_node(fc)
+                if fcn.kind == "returns":
+                    mut k := 0
+                    while k < fcn.children.len():
+                        rc := fcn.children[k]
+                        rn := get_node(rc)
+                        if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type":
+                            ir_func_returns.insert(cn.value, ir_resolve_type_node(rc))
+                        k = k + 1
+                j = j + 1
+        i = i + 1
+
 # --- main entry ---
 pub fn emit_ir(root_idx: Int) -> String:
     ir_reset()
@@ -2491,28 +2549,11 @@ pub fn emit_ir(root_idx: Int) -> String:
     ir_import_renames = {}
     ir_collect_imports(root_idx)
 
-    # collect type aliases
-    ir_type_aliases = {}
-    mut _fi21 := 0
-    kids21_children := root.children
-    while _fi21 < kids21_children.len():
-        child := kids21_children[_fi21]
-        mut cn := get_node(child)
-        if cn.kind == "type_alias":
-            mut target := ""
-            mut _fi33 := 0
-            kids33_children := cn.children
-            while _fi33 < kids33_children.len():
-                tc := kids33_children[_fi33]
-                tn := get_node(tc)
-                if tn.kind == "type":
-                    target = tn.value
-                _fi33 = _fi33 + 1
-            if target.len() > 0:
-                ir_type_aliases.insert(cn.value, target)
+    # collect type aliases before structs and returns so both can resolve
+    # alias names through the same table.
+    ir_collect_type_aliases(root_idx)
 
-        _fi21 = _fi21 + 1
-    # emit struct declarations and register names (unwrap pub)
+    # emit struct declarations and register names
     ir_struct_names = {}
     ir_struct_field_lookup = {}
     ir_struct_field_index_lookup = {}
@@ -2522,50 +2563,11 @@ pub fn emit_ir(root_idx: Int) -> String:
         ir_collect_struct_decls(ir_preloaded_import_roots[preload_struct_i], false)
         preload_struct_i = preload_struct_i + 1
     ir_collect_struct_decls(root_idx, true)
-    # register type aliases that point to structs
-    mut _fi23 := 0
-    kids23_children := root.children
-    while _fi23 < kids23_children.len():
-        child := kids23_children[_fi23]
-        mut cn := get_node(child)
-        if cn.kind == "type_alias":
-            aname := cn.value
-            if ir_type_aliases.contains_key(aname):
-                target := ir_type_aliases[aname]
-                if ir_struct_names.contains_key(target):
-                    nfields := ir_struct_names[target]
-                    ir_struct_names.insert(aname, nfields)
-                    ir_emit("struct_alias " + aname + " " + target)
-
-        _fi23 = _fi23 + 1
+    ir_register_alias_structs(root_idx)
     ir_lambda_count = 0
     ir_lambda_bodies = []
 
-    # collect function return types (unwrap pub wrappers)
-    ir_func_returns = {}
-    mut _fi24 := 0
-    kids24_children := root.children
-    while _fi24 < kids24_children.len():
-        child := kids24_children[_fi24]
-        cn := ir_unwrap_pub_node(child)
-        if cn.kind == "fn" or cn.kind == "fn_decl":
-            mut _fi35 := 0
-            kids35_children := cn.children
-            while _fi35 < kids35_children.len():
-                fc := kids35_children[_fi35]
-                fcn := get_node(fc)
-                if fcn.kind == "returns":
-                    mut _fi40 := 0
-                    kids40_children := fcn.children
-                    while _fi40 < kids40_children.len():
-                        rc := kids40_children[_fi40]
-                        rn := get_node(rc)
-                        if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type":
-                            ir_func_returns.insert(cn.value, ir_resolve_type_node(rc))
-
-                        _fi40 = _fi40 + 1
-                _fi35 = _fi35 + 1
-        _fi24 = _fi24 + 1
+    ir_collect_function_returns(root_idx)
     mut preload_i := 0
     while preload_i < ir_preloaded_import_roots.len():
         ir_collect_impl_methods(ir_preloaded_import_roots[preload_i])

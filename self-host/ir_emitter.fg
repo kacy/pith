@@ -2437,6 +2437,47 @@ fn ir_impl_func(idx: Int, impl_type: String):
     ir_func_returns.insert(full_name, ret_type)
     ir_finish_func_emission(body_idx)
 
+fn ir_register_import_alias(value: String):
+    mut path := value
+    mut alias := ""
+    mut has_alias := false
+    mut i := 0
+    while i < value.len() - 3:
+        if value[i] == " " and value[i + 1] == "a" and value[i + 2] == "s" and value[i + 3] == " ":
+            path = value.substring(0, i)
+            alias = value.substring(i + 4, value.len())
+            has_alias = true
+            break
+        i = i + 1
+    if has_alias:
+        ir_module_aliases.insert(alias, path)
+    else:
+        ir_module_aliases.insert(ir_module_default_alias(path), path)
+
+fn ir_collect_from_import_renames(value: String):
+    parts := value.split(" ")
+    if parts.len() <= 1:
+        return
+    mod_path := parts[0]
+    mut i := 1
+    while i < parts.len():
+        iname := parts[i]
+        if iname.len() > 0:
+            renamed := ir_import_target_name(mod_path, iname)
+            if renamed != iname:
+                ir_import_renames.insert(iname, renamed)
+        i = i + 1
+
+fn ir_type_alias_target(node: Node) -> String:
+    mut i := 0
+    while i < node.children.len():
+        tc := node.children[i]
+        tn := get_node(tc)
+        if tn.kind == "type":
+            return tn.value
+        i = i + 1
+    return ""
+
 # --- collect import renames ---
 fn ir_collect_imports(root_idx: Int):
     root := get_node(root_idx)
@@ -2444,33 +2485,9 @@ fn ir_collect_imports(root_idx: Int):
     while ci < root.children.len():
         cn := get_node(root.children[ci])
         if cn.kind == "import":
-            mut path := cn.value
-            mut alias := ""
-            mut has_alias := false
-            mut si := 0
-            while si < cn.value.len() - 3:
-                if cn.value[si] == " " and cn.value[si + 1] == "a" and cn.value[si + 2] == "s" and cn.value[si + 3] == " ":
-                    path = cn.value.substring(0, si)
-                    alias = cn.value.substring(si + 4, cn.value.len())
-                    has_alias = true
-                    break
-                si = si + 1
-            if has_alias:
-                ir_module_aliases.insert(alias, path)
-            else:
-                ir_module_aliases.insert(ir_module_default_alias(path), path)
+            ir_register_import_alias(cn.value)
         if cn.kind == "from_import":
-            parts := cn.value.split(" ")
-            if parts.len() > 1:
-                mod_path := parts[0]
-                mut pi := 1
-                while pi < parts.len():
-                    iname := parts[pi]
-                    if iname.len() > 0:
-                        renamed := ir_import_target_name(mod_path, iname)
-                        if renamed != iname:
-                            ir_import_renames.insert(iname, renamed)
-                    pi = pi + 1
+            ir_collect_from_import_renames(cn.value)
         ci = ci + 1
 
 fn ir_collect_type_aliases(root_idx: Int):
@@ -2481,14 +2498,7 @@ fn ir_collect_type_aliases(root_idx: Int):
         child := root.children[i]
         cn := get_node(child)
         if cn.kind == "type_alias":
-            mut target := ""
-            mut j := 0
-            while j < cn.children.len():
-                tc := cn.children[j]
-                tn := get_node(tc)
-                if tn.kind == "type":
-                    target = tn.value
-                j = j + 1
+            target := ir_type_alias_target(cn)
             if target.len() > 0:
                 ir_type_aliases.insert(cn.value, target)
         i = i + 1

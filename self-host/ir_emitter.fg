@@ -2004,186 +2004,172 @@ fn ir_stmt(idx: Int):
 
     ir_stmt_control(idx, node)
 
-fn ir_stmt_control(idx: Int, node: Node):
-    if node.kind == "if" or node.kind == "if_stmt":
-        # children: condition, then, [elif...], [else]
-        # collect all branches
-        mut cond_idx := 0 - 1
-        mut then_idx := 0 - 1
-        mut elif_indices: List[Int] := []
-        mut else_idx := 0 - 1
-        mut _fi15 := 0
-        kids15_children := node.children
-        while _fi15 < kids15_children.len():
-            child := kids15_children[_fi15]
-            cn := get_node(child)
-            if cond_idx < 0 and cn.kind != "then" and cn.kind != "else" and cn.kind != "elif":
-                cond_idx = child
-            elif cn.kind == "then":
-                then_idx = child
-            elif cn.kind == "elif":
-                elif_indices.push(child)
-            elif cn.kind == "else":
-                else_idx = child
-
-            _fi15 = _fi15 + 1
-        end_label := ir_label()
-
-        # main if
-        then_label := ir_label()
-        next_label := ir_label()
-        if cond_idx >= 0:
-            cr := ir_expr(cond_idx)
-            ir_emit("brif " + cr.to_string() + " " + then_label + " " + next_label)
-        ir_emit("label " + then_label)
+fn ir_emit_if_stmt(node: Node):
+    mut cond_idx := 0 - 1
+    mut then_idx := 0 - 1
+    mut elif_indices: List[Int] := []
+    mut else_idx := 0 - 1
+    mut i := 0
+    while i < node.children.len():
+        child := node.children[i]
+        cn := get_node(child)
+        if cond_idx < 0 and cn.kind != "then" and cn.kind != "else" and cn.kind != "elif":
+            cond_idx = child
+        elif cn.kind == "then":
+            then_idx = child
+        elif cn.kind == "elif":
+            elif_indices.push(child)
+        elif cn.kind == "else":
+            else_idx = child
+        i = i + 1
+    end_label := ir_label()
+    then_label := ir_label()
+    next_label := ir_label()
+    if cond_idx >= 0:
+        cr := ir_expr(cond_idx)
+        ir_emit("brif " + cr.to_string() + " " + then_label + " " + next_label)
+    ir_emit("label " + then_label)
+    ir_last_was_ret = false
+    if then_idx >= 0:
+        ir_block(then_idx)
+    if not ir_last_was_ret:
+        ir_emit("jmp " + end_label)
+    ir_emit("label " + next_label)
+    mut ei := 0
+    while ei < elif_indices.len():
+        elif_node := get_node(elif_indices[ei])
+        mut elif_cond := 0 - 1
+        mut elif_body := 0 - 1
+        mut ci := 0
+        while ci < elif_node.children.len():
+            ec := elif_node.children[ci]
+            ecn := get_node(ec)
+            if elif_cond < 0 and ecn.kind != "block" and ecn.kind != "then":
+                elif_cond = ec
+            elif ecn.kind == "block" or ecn.kind == "then":
+                elif_body = ec
+            ci = ci + 1
+        elif_then := ir_label()
+        elif_next := ir_label()
+        if elif_cond >= 0:
+            ecr := ir_expr(elif_cond)
+            ir_emit("brif " + ecr.to_string() + " " + elif_then + " " + elif_next)
+        ir_emit("label " + elif_then)
         ir_last_was_ret = false
-        if then_idx >= 0:
-            ir_block(then_idx)
+        if elif_body >= 0:
+            ir_block(elif_body)
         if not ir_last_was_ret:
             ir_emit("jmp " + end_label)
-        ir_emit("label " + next_label)
+        ir_emit("label " + elif_next)
+        ei = ei + 1
+    if else_idx >= 0:
+        ir_block(else_idx)
+    ir_emit("label " + end_label)
 
-        # elif chains
-        mut ei := 0
-        while ei < elif_indices.len():
-            elif_node := get_node(elif_indices[ei])
-            # elif has: condition, block
-            mut elif_cond := 0 - 1
-            mut elif_body := 0 - 1
-            mut _fi16 := 0
-            kids16_children := elif_node.children
-            while _fi16 < kids16_children.len():
-                ec := kids16_children[_fi16]
-                ecn := get_node(ec)
-                if elif_cond < 0 and ecn.kind != "block" and ecn.kind != "then":
-                    elif_cond = ec
-                elif ecn.kind == "block" or ecn.kind == "then":
-                    elif_body = ec
-                _fi16 = _fi16 + 1
-            elif_then := ir_label()
-            elif_next := ir_label()
-            if elif_cond >= 0:
-                ecr := ir_expr(elif_cond)
-                ir_emit("brif " + ecr.to_string() + " " + elif_then + " " + elif_next)
-            ir_emit("label " + elif_then)
-            ir_last_was_ret = false
-            if elif_body >= 0:
-                ir_block(elif_body)
-            if not ir_last_was_ret:
-                ir_emit("jmp " + end_label)
-            ir_emit("label " + elif_next)
-            ei = ei + 1
+fn ir_emit_while_stmt(node: Node):
+    head_label := ir_label()
+    body_label := ir_label()
+    end_label := ir_label()
+    ir_emit("label " + head_label)
+    if node.children.len() >= 2:
+        cr := ir_expr(node.children[0])
+        ir_emit("brif " + cr.to_string() + " " + body_label + " " + end_label)
+        ir_emit("label " + body_label)
+        ir_break_stack.push(end_label)
+        ir_continue_stack.push(head_label)
+        ir_block(node.children[1])
+        ir_break_stack.remove(ir_break_stack.len() - 1)
+        ir_continue_stack.remove(ir_continue_stack.len() - 1)
+        ir_emit("jmp " + head_label)
+    ir_emit("label " + end_label)
 
-        # else
-        if else_idx >= 0:
-            ir_block(else_idx)
-        ir_emit("label " + end_label)
+fn ir_emit_for_stmt(node: Node):
+    mut var_name := node.value
+    mut idx_var_name := ""
+    if var_name.contains(","):
+        parts := var_name.split(",")
+        var_name = parts[0].trim()
+        if parts.len() > 1:
+            idx_var_name = parts[1].trim()
+    if node.children.len() >= 2:
+        iter_node := get_node(node.children[0])
+        mut is_string_iter := false
+        if iter_node.kind == "string_lit" or iter_node.kind == "string":
+            is_string_iter = true
+        elif iter_node.kind == "ident" and ir_var_types.contains_key(iter_node.value):
+            if ir_var_types[iter_node.value] == "string":
+                is_string_iter = true
+
+        iter_r := ir_expr(node.children[0])
+        fid := ir_for_count
+        ir_for_count = ir_for_count + 1
+        fi := "__for_idx_" + fid.to_string()
+        fl := "__for_len_" + fid.to_string()
+        ft := "__for_iter_" + fid.to_string()
+        len_r := ir_reg()
+        if is_string_iter:
+            ir_emit_call1(len_r, "string_len", "int", iter_r)
+        else:
+            ir_emit_call1(len_r, "len", "int", iter_r)
+        idx_r := ir_reg()
+        ir_emit("iconst " + idx_r.to_string() + " 0")
+        ir_emit("store " + fi + " " + idx_r.to_string())
+        ir_emit("store " + fl + " " + len_r.to_string())
+        ir_emit("store " + ft + " " + iter_r.to_string())
+        head_l := ir_label()
+        body_l := ir_label()
+        step_l := ir_label()
+        end_l := ir_label()
+        ir_emit("label " + head_l)
+        ci := ir_reg()
+        ir_emit("load " + ci.to_string() + " " + fi)
+        cl := ir_reg()
+        ir_emit("load " + cl.to_string() + " " + fl)
+        cmp_r := ir_reg()
+        ir_emit("lt " + cmp_r.to_string() + " " + ci.to_string() + " " + cl.to_string())
+        ir_emit("brif " + cmp_r.to_string() + " " + body_l + " " + end_l)
+        ir_emit("label " + body_l)
+        it_r := ir_reg()
+        ir_emit("load " + it_r.to_string() + " " + ft)
+        idx2 := ir_reg()
+        ir_emit("load " + idx2.to_string() + " " + fi)
+        elem_r := ir_reg()
+        if is_string_iter:
+            ir_emit_call2(elem_r, "char_at", "string", it_r, idx2)
+            ir_var_types.insert(var_name, "string")
+        else:
+            ir_emit_call2(elem_r, "__list_get", "unknown", it_r, idx2)
+        ir_emit("store " + var_name + " " + elem_r.to_string())
+        if idx_var_name.len() > 0:
+            idx_val := ir_reg()
+            ir_emit("load " + idx_val.to_string() + " " + fi)
+            ir_emit("store " + idx_var_name + " " + idx_val.to_string())
+            ir_var_types.insert(idx_var_name, "int")
+        ir_break_stack.push(end_l)
+        ir_continue_stack.push(step_l)
+        ir_block(node.children[1])
+        ir_break_stack.remove(ir_break_stack.len() - 1)
+        ir_continue_stack.remove(ir_continue_stack.len() - 1)
+        ir_emit("label " + step_l)
+        idx3 := ir_reg()
+        ir_emit("load " + idx3.to_string() + " " + fi)
+        one_r := ir_reg()
+        ir_emit("iconst " + one_r.to_string() + " 1")
+        inc_r := ir_reg()
+        ir_emit("add " + inc_r.to_string() + " " + idx3.to_string() + " " + one_r.to_string())
+        ir_emit("store " + fi + " " + inc_r.to_string())
+        ir_emit("jmp " + head_l)
+        ir_emit("label " + end_l)
+
+fn ir_stmt_control(idx: Int, node: Node):
+    if node.kind == "if" or node.kind == "if_stmt":
+        ir_emit_if_stmt(node)
 
     elif node.kind == "while" or node.kind == "while_stmt":
-        head_label := ir_label()
-        body_label := ir_label()
-        end_label := ir_label()
-        ir_emit("label " + head_label)
-        if node.children.len() >= 2:
-            cr := ir_expr(node.children[0])
-            ir_emit("brif " + cr.to_string() + " " + body_label + " " + end_label)
-            ir_emit("label " + body_label)
-            ir_break_stack.push(end_label)
-            ir_continue_stack.push(head_label)
-            ir_block(node.children[1])
-            ir_break_stack.remove(ir_break_stack.len() - 1)
-            ir_continue_stack.remove(ir_continue_stack.len() - 1)
-            ir_emit("jmp " + head_label)
-        ir_emit("label " + end_label)
+        ir_emit_while_stmt(node)
 
     elif node.kind == "for" or node.kind == "for_stmt":
-        mut var_name := node.value
-        mut idx_var_name := ""
-        # handle "var, idx" syntax
-        if var_name.contains(","):
-            parts := var_name.split(",")
-            var_name = parts[0].trim()
-            if parts.len() > 1:
-                idx_var_name = parts[1].trim()
-        # children: iterable, body
-        if node.children.len() >= 2:
-            # detect string iteration
-            iter_node := get_node(node.children[0])
-            mut is_string_iter := false
-            if iter_node.kind == "string_lit" or iter_node.kind == "string":
-                is_string_iter = true
-            elif iter_node.kind == "ident" and ir_var_types.contains_key(iter_node.value):
-                if ir_var_types[iter_node.value] == "string":
-                    is_string_iter = true
-
-            iter_r := ir_expr(node.children[0])
-            # unique for-loop variable names to support nesting
-            fid := ir_for_count
-            ir_for_count = ir_for_count + 1
-            fi := "__for_idx_" + fid.to_string()
-            fl := "__for_len_" + fid.to_string()
-            ft := "__for_iter_" + fid.to_string()
-            # __len = len(iter)
-            len_r := ir_reg()
-            if is_string_iter:
-                ir_emit_call1(len_r, "string_len", "int", iter_r)
-            else:
-                ir_emit_call1(len_r, "len", "int", iter_r)
-            # __i = 0
-            idx_r := ir_reg()
-            ir_emit("iconst " + idx_r.to_string() + " 0")
-            ir_emit("store " + fi + " " + idx_r.to_string())
-            ir_emit("store " + fl + " " + len_r.to_string())
-            ir_emit("store " + ft + " " + iter_r.to_string())
-            head_l := ir_label()
-            body_l := ir_label()
-            step_l := ir_label()
-            end_l := ir_label()
-            ir_emit("label " + head_l)
-            # load current index and length
-            ci := ir_reg()
-            ir_emit("load " + ci.to_string() + " " + fi)
-            cl := ir_reg()
-            ir_emit("load " + cl.to_string() + " " + fl)
-            cmp_r := ir_reg()
-            ir_emit("lt " + cmp_r.to_string() + " " + ci.to_string() + " " + cl.to_string())
-            ir_emit("brif " + cmp_r.to_string() + " " + body_l + " " + end_l)
-            ir_emit("label " + body_l)
-            # elem = iter[i]
-            it_r := ir_reg()
-            ir_emit("load " + it_r.to_string() + " " + ft)
-            idx2 := ir_reg()
-            ir_emit("load " + idx2.to_string() + " " + fi)
-            elem_r := ir_reg()
-            if is_string_iter:
-                ir_emit_call2(elem_r, "char_at", "string", it_r, idx2)
-                ir_var_types.insert(var_name, "string")
-            else:
-                ir_emit_call2(elem_r, "__list_get", "unknown", it_r, idx2)
-            ir_emit("store " + var_name + " " + elem_r.to_string())
-            # store index variable if present
-            if idx_var_name.len() > 0:
-                idx_val := ir_reg()
-                ir_emit("load " + idx_val.to_string() + " " + fi)
-                ir_emit("store " + idx_var_name + " " + idx_val.to_string())
-                ir_var_types.insert(idx_var_name, "int")
-            # body
-            ir_break_stack.push(end_l)
-            ir_continue_stack.push(step_l)
-            ir_block(node.children[1])
-            ir_break_stack.remove(ir_break_stack.len() - 1)
-            ir_continue_stack.remove(ir_continue_stack.len() - 1)
-            ir_emit("label " + step_l)
-            # i = i + 1
-            idx3 := ir_reg()
-            ir_emit("load " + idx3.to_string() + " " + fi)
-            one_r := ir_reg()
-            ir_emit("iconst " + one_r.to_string() + " 1")
-            inc_r := ir_reg()
-            ir_emit("add " + inc_r.to_string() + " " + idx3.to_string() + " " + one_r.to_string())
-            ir_emit("store " + fi + " " + inc_r.to_string())
-            ir_emit("jmp " + head_l)
-            ir_emit("label " + end_l)
+        ir_emit_for_stmt(node)
 
 # --- emit block ---
 # Recursive block walker — unwrap block/body/then/else wrappers

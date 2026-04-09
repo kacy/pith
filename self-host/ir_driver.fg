@@ -237,6 +237,9 @@ fn builtin_retkind(name: String) -> String:
         return "result_bool"
     return ""
 
+fn is_sync_opaque_name(name: String) -> Bool:
+    return name == "Mutex" or name == "WaitGroup" or name == "Semaphore"
+
 fn is_explicit_ir_retkind(kind: String) -> Bool:
     if kind.starts_with("struct:"):
         return true
@@ -247,6 +250,28 @@ fn is_explicit_ir_retkind(kind: String) -> Bool:
 fn ir_contract_error(line_no: Int, message: String):
     print("ir contract error on line " + line_no.to_string() + ": " + message)
     exit(1)
+
+fn is_bare_declared_retkind(kind: String, struct_names: Map[String, Bool]) -> Bool:
+    return not is_explicit_ir_retkind(kind) and (struct_names.contains_key(kind) or is_sync_opaque_name(kind))
+
+fn validate_declared_func_retkind(line_no: Int, parts: List[String], struct_names: Map[String, Bool], func_kinds: Map[String, String]):
+    if parts.len() < 4 or parts[0] != "func":
+        return
+    retkind := parts[3]
+    if is_bare_declared_retkind(retkind, struct_names):
+        ir_contract_error(line_no, "bare or unknown function retkind '" + retkind + "'")
+    func_kinds.insert(parts[1], retkind)
+
+fn validate_call_retkind(line_no: Int, parts: List[String], struct_names: Map[String, Bool]):
+    if parts.len() < 5 or parts[0] != "call":
+        return
+    callee := parts[2]
+    retkind := parts[3]
+    if is_bare_declared_retkind(retkind, struct_names):
+        ir_contract_error(line_no, "bare or unknown call retkind '" + retkind + "' for " + callee)
+    builtin_kind := builtin_retkind(callee)
+    if builtin_kind.len() > 0 and builtin_kind != retkind:
+        ir_contract_error(line_no, "builtin call retkind '" + retkind + "' does not match expected '" + builtin_kind + "' for " + callee)
 
 fn validate_combined_ir_contract(ir: String):
     mut func_kinds: Map[String, String] := {}
@@ -259,11 +284,7 @@ fn validate_combined_ir_contract(ir: String):
         parts := line.split(" ")
         if parts.len() >= 2 and parts[0] == "struct":
             struct_names.insert(parts[1], true)
-        if parts.len() >= 4 and parts[0] == "func":
-            retkind := parts[3]
-            if not is_explicit_ir_retkind(retkind) and (struct_names.contains_key(retkind) or retkind == "Mutex" or retkind == "WaitGroup" or retkind == "Semaphore"):
-                ir_contract_error(line_no, "bare or unknown function retkind '" + retkind + "'")
-            func_kinds.insert(parts[1], retkind)
+        validate_declared_func_retkind(line_no, parts, struct_names, func_kinds)
         if end >= ir.len():
             break
         start = end + 1
@@ -275,14 +296,7 @@ fn validate_combined_ir_contract(ir: String):
         end := line_end(ir, start)
         line := ir.substring(start, end)
         parts := line.split(" ")
-        if parts.len() >= 5 and parts[0] == "call":
-            callee := parts[2]
-            retkind := parts[3]
-            if not is_explicit_ir_retkind(retkind) and (struct_names.contains_key(retkind) or retkind == "Mutex" or retkind == "WaitGroup" or retkind == "Semaphore"):
-                ir_contract_error(line_no, "bare or unknown call retkind '" + retkind + "' for " + callee)
-            builtin_kind := builtin_retkind(callee)
-            if builtin_kind.len() > 0 and builtin_kind != retkind:
-                ir_contract_error(line_no, "builtin call retkind '" + retkind + "' does not match expected '" + builtin_kind + "' for " + callee)
+        validate_call_retkind(line_no, parts, struct_names)
         if end >= ir.len():
             break
         start = end + 1
@@ -377,25 +391,30 @@ fn emit_imported_module_ir(root: Int, import_roots: List[Int], module_index: Int
     record_import_name_maps(renamed, module_index, imported_global_map, imported_function_map, imported_init_funcs)
     return rewritten_ir
 
+fn should_skip_imported_module(module_root: Int) -> Bool:
+    module_path := get_resolved_module_path(module_root)
+    return is_runtime_builtin_module(module_path)
+
+fn collect_imported_ir(import_roots: List[Int], imported_global_map: Map[String, String], imported_function_map: Map[String, String], imported_init_funcs: List[String]) -> List[String]:
+    mut all_ir: List[String] := []
+    mut i := 0
+    while i < import_roots.len():
+        if should_skip_imported_module(import_roots[i]):
+            i = i + 1
+            continue
+        all_ir.push(emit_imported_module_ir(import_roots[i], import_roots, i, imported_global_map, imported_function_map, imported_init_funcs))
+        i = i + 1
+    return all_ir
+
 fn emit_combined_file(path: String, emit_tests: Bool) -> String!:
     parsed := parse_and_check(path)!
     root := parsed.root
     import_roots := parsed.import_roots
 
-    mut all_ir: List[String] := []
     mut imported_global_map: Map[String, String] := {}
     mut imported_function_map: Map[String, String] := {}
     mut imported_init_funcs: List[String] := []
-
-    mut i := 0
-    while i < import_roots.len():
-        module_path := get_resolved_module_path(import_roots[i])
-        if is_runtime_builtin_module(module_path):
-            i = i + 1
-            continue
-        all_ir.push(emit_imported_module_ir(import_roots[i], import_roots, i, imported_global_map, imported_function_map, imported_init_funcs))
-        i = i + 1
-
+    mut all_ir := collect_imported_ir(import_roots, imported_global_map, imported_function_map, imported_init_funcs)
     # the root module keeps its own names, but any imported references need to
     # be rewritten to the prefixed names assigned above.
     mut main_ir := emit_module_ir(root, import_roots, emit_tests)

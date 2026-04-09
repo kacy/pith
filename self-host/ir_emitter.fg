@@ -1017,45 +1017,15 @@ fn ir_checked_target_type(target_idx: Int, fallback_name: String) -> String:
         return ir_lookup_name_type(fallback_name)
     return ""
 
-# --- method call dispatch (extracted from ir_expr) ---
-fn ir_emit_method_call(idx: Int) -> Int:
-    node := get_node(idx)
-    # first child is object, then args. value is method_name (may have leading dot)
-    mut mname := node_value(idx)
-    if mname.starts_with("."):
-        mname = mname.substring(1, mname.len())
+fn ir_method_receiver_type(node: Node) -> String:
+    if node.children.len() == 0:
+        return ""
+    checked := ir_checked_type(node.children[0])
+    if checked.len() > 0:
+        return checked
+    return ir_infer_type(node.children[0])
 
-    alias_fname := ir_resolve_module_alias_method_call_name(idx)
-    if alias_fname.len() > 0:
-        mut arg_regs: List[Int] := []
-        mut arg_idx := 1
-        while arg_idx < node.children.len():
-            child := node.children[arg_idx]
-            child_kind := node_kind(child)
-            if child_kind == "arg":
-                cn := get_node(child)
-                if cn.children.len() > 0:
-                    arg_regs.push(ir_expr(cn.children[0]))
-            else:
-                arg_regs.push(ir_expr(child))
-            arg_idx = arg_idx + 1
-        r := ir_reg()
-        mut call_text := ""
-        mut ai := 0
-        while ai < arg_regs.len():
-            call_text = call_text + " " + arg_regs[ai].to_string()
-            ai = ai + 1
-        uses_result_abi := ir_func_returns.contains_key(alias_fname) or ir_checked_result_kind(idx).len() > 0
-        ir_emit_call_text(r, alias_fname, ir_call_retkind(idx, uses_result_abi), arg_regs.len(), call_text)
-        return r
-
-    # infer receiver type using centralized type inference
-    mut obj_type := ""
-    if node.children.len() > 0:
-        obj_type = ir_checked_type(node.children[0])
-        if obj_type.len() == 0:
-            obj_type = ir_infer_type(node.children[0])
-
+fn ir_method_emit_name(mname: String, obj_type: String) -> String:
     obj_is_string := obj_type == "string"
     obj_is_bytes := obj_type == "bytes"
     obj_is_bool := obj_type == "bool"
@@ -1160,6 +1130,60 @@ fn ir_emit_method_call(idx: Int) -> Int:
         emit_name = "bytes_concat"
     elif mname == "to_string_utf8" and obj_is_bytes:
         emit_name = "bytes_to_string_utf8"
+    return emit_name
+
+fn ir_collect_method_call_regs(node: Node) -> List[Int]:
+    mut regs: List[Int] := []
+    mut i := 0
+    while i < node.children.len():
+        child := node.children[i]
+        if i == 0:
+            regs.push(ir_expr(child))
+        else:
+            child_kind := node_kind(child)
+            if child_kind == "arg":
+                cn := get_node(child)
+                if cn.children.len() > 0:
+                    regs.push(ir_expr(cn.children[0]))
+            else:
+                regs.push(ir_expr(child))
+        i = i + 1
+    return regs
+
+# --- method call dispatch (extracted from ir_expr) ---
+fn ir_emit_method_call(idx: Int) -> Int:
+    node := get_node(idx)
+    # first child is object, then args. value is method_name (may have leading dot)
+    mut mname := node_value(idx)
+    if mname.starts_with("."):
+        mname = mname.substring(1, mname.len())
+
+    alias_fname := ir_resolve_module_alias_method_call_name(idx)
+    if alias_fname.len() > 0:
+        mut arg_regs: List[Int] := []
+        mut arg_idx := 1
+        while arg_idx < node.children.len():
+            child := node.children[arg_idx]
+            child_kind := node_kind(child)
+            if child_kind == "arg":
+                cn := get_node(child)
+                if cn.children.len() > 0:
+                    arg_regs.push(ir_expr(cn.children[0]))
+            else:
+                arg_regs.push(ir_expr(child))
+            arg_idx = arg_idx + 1
+        r := ir_reg()
+        mut call_text := ""
+        mut ai := 0
+        while ai < arg_regs.len():
+            call_text = call_text + " " + arg_regs[ai].to_string()
+            ai = ai + 1
+        uses_result_abi := ir_func_returns.contains_key(alias_fname) or ir_checked_result_kind(idx).len() > 0
+        ir_emit_call_text(r, alias_fname, ir_call_retkind(idx, uses_result_abi), arg_regs.len(), call_text)
+        return r
+
+    obj_type := ir_method_receiver_type(node)
+    mut emit_name := ir_method_emit_name(mname, obj_type)
     if BOOL_RETURNING_METHODS.contains(emit_name):
         ir_var_types.insert("__last_call", "bool")
 
@@ -1168,29 +1192,12 @@ fn ir_emit_method_call(idx: Int) -> Int:
     if impl_dispatch:
         emit_name = impl_name
 
-    mut obj_r := 0 - 1
+    call_regs := ir_collect_method_call_regs(node)
+    obj_r := call_regs[0]
     mut arg_regs: List[Int] := []
-    mut _fi3 := 0
-    kids3_children := node.children
-    while _fi3 < kids3_children.len():
-        child := kids3_children[_fi3]
-        if obj_r < 0:
-            obj_r = ir_expr(child)
-        else:
-            child_kind := node_kind(child)
-            if child_kind == "arg":
-                cn := get_node(child)
-                if cn.children.len() > 0:
-                    ar := ir_expr(cn.children[0])
-                    arg_regs.push(ar)
-            else:
-                arg_regs.push(ir_expr(child))
-        _fi3 = _fi3 + 1
-    mut call_regs: List[Int] := []
-    call_regs.push(obj_r)
     mut ci := 0
-    while ci < arg_regs.len():
-        call_regs.push(arg_regs[ci])
+    while ci + 1 < call_regs.len():
+        arg_regs.push(call_regs[ci + 1])
         ci = ci + 1
     r := ir_reg()
     uses_result_abi := impl_dispatch or ir_func_returns.contains_key(emit_name) or ir_checked_result_kind(idx).len() > 0

@@ -144,6 +144,8 @@ fn ir_resolve_type_hint(type_name: String) -> String:
     mut resolved := type_name
     if ir_type_aliases.contains_key(resolved):
         resolved = ir_type_aliases[resolved]
+    if resolved.starts_with("opaque:"):
+        resolved = resolved.substring(7, resolved.len())
     if resolved == "String":
         return "string"
     if resolved == "Bytes":
@@ -201,7 +203,7 @@ fn ir_resolve_type_node(type_idx: Int) -> String:
             return "result_bool"
         if inner_type == "bytes":
             return "bytes"
-        return inner_type
+        return ir_retkind(inner_type)
     return ""
 
 fn ir_resolve_map_value_type_node(type_idx: Int) -> String:
@@ -341,6 +343,8 @@ fn ir_retkind(type_name: String) -> String:
         return "set"
     if resolved == "void":
         return "void"
+    if resolved == "Mutex" or resolved == "WaitGroup" or resolved == "Semaphore":
+        return "opaque:" + resolved
     if ir_struct_names.contains_key(resolved):
         return "struct:" + resolved
     return resolved
@@ -636,7 +640,7 @@ fn ir_checked_result_kind(idx: Int) -> String:
         return "result_bool"
     if inner_type == "bytes":
         return "bytes"
-    return inner_type
+    return ir_retkind(inner_type)
 
 fn ir_call_retkind(idx: Int, uses_result_abi: Bool) -> String:
     if uses_result_abi:

@@ -1312,26 +1312,6 @@ fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
     if let Some(name) = retkind.strip_prefix("struct:") {
         return Some(name);
     }
-    if !matches!(
-        retkind,
-        "unknown"
-            | "void"
-            | "int"
-            | "result_int"
-            | "float"
-            | "bool"
-            | "result_bool"
-            | "string"
-            | "bytes"
-            | "list"
-            | "list_string"
-            | "map"
-            | "map_int"
-            | "set"
-            | "set_int"
-    ) {
-        return Some(retkind);
-    }
     None
 }
 
@@ -1612,20 +1592,20 @@ mod tests {
     fn parse_call_shape_requires_explicit_retkind() {
         let old = vec!["call", "7", "print", "1", "3"];
         let new = vec!["call", "8", "char_at", "string", "2", "1", "2"];
-        let imported_struct = vec!["call", "9", "advance_token", "Token", "0"];
+        let imported_struct = vec!["call", "9", "advance_token", "struct:Token", "0"];
 
         assert_eq!(parse_call_shape(&old), None);
         assert_eq!(parse_call_shape(&new), Some(("char_at", "string", 2, 5)));
         assert_eq!(
             parse_call_shape(&imported_struct),
-            Some(("advance_token", "Token", 0, 5))
+            Some(("advance_token", "struct:Token", 0, 5))
         );
     }
 
     #[test]
-    fn explicit_struct_name_from_retkind_supports_struct_prefix_and_bare_names() {
+    fn explicit_struct_name_from_retkind_requires_struct_prefix() {
         assert_eq!(explicit_struct_name_from_retkind("struct:Token"), Some("Token"));
-        assert_eq!(explicit_struct_name_from_retkind("Token"), Some("Token"));
+        assert_eq!(explicit_struct_name_from_retkind("Token"), None);
         assert_eq!(explicit_struct_name_from_retkind("string"), None);
         assert_eq!(explicit_struct_name_from_retkind("unknown"), None);
     }

@@ -1309,18 +1309,91 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
     ir_emit("iconst " + r.to_string() + " 0")
     return r
 
+fn ir_stmt_is_expr(kind: String) -> Bool:
+    if kind == "call" or kind == "method_call" or kind == "spawn":
+        return true
+    if kind == "await" or kind == "try" or kind == "try_expr":
+        return true
+    return kind == "fail"
+
+fn ir_emit_return_stmt(node: Node):
+    if node.children.len() > 0:
+        r := ir_expr(node.children[0])
+        ir_emit("ret " + r.to_string())
+    else:
+        r := ir_reg()
+        ir_emit("iconst " + r.to_string() + " 0")
+        ir_emit("ret " + r.to_string())
+    ir_last_was_ret = true
+
+fn ir_emit_bind_stmt(node: Node):
+    mut name := node.value
+    if name.contains(" mut"):
+        name = name.substring(0, name.len() - 4)
+    elif name.contains(" "):
+        name = name.split(" ")[0]
+    mut val_idx := 0 - 1
+    mut type_idx := 0 - 1
+    mut i := 0
+    while i < node.children.len():
+        child := node.children[i]
+        cn := get_node(child)
+        if cn.kind == "type" or cn.kind == "generic_type":
+            type_idx = child
+        else:
+            val_idx = child
+        i = i + 1
+    if type_idx >= 0:
+        resolved_type := ir_resolve_type_node(type_idx)
+        if resolved_type.len() > 0:
+            ir_var_types.insert(name, resolved_type)
+    if val_idx >= 0:
+        r := ir_emit_value_for_target(val_idx, ir_lookup_name_type(name))
+        ir_var_regs.insert(name, r)
+        ir_emit("store " + name + " " + r.to_string())
+        if not ir_var_types.contains_key(name):
+            inferred := ir_infer_type(val_idx)
+            if inferred.len() > 0:
+                ir_var_types.insert(name, inferred)
+
+fn ir_emit_assign_stmt(node: Node):
+    name := node.value
+    if node.children.len() > 0:
+        r := ir_emit_value_for_target(node.children[0], ir_lookup_name_type(name))
+        ir_var_regs.insert(name, r)
+        ir_emit("store " + name + " " + r.to_string())
+
+fn ir_emit_compound_assignment(node: Node):
+    op := node.value
+    if op == "=" and node.children.len() >= 2:
+        tn := get_node(node.children[0])
+        name := tn.value
+        r := ir_emit_value_for_target(node.children[1], ir_lookup_name_type(name))
+        ir_emit("store " + name + " " + r.to_string())
+        return
+    if (op == "+=" or op == "-=" or op == "*=" or op == "/=") and node.children.len() >= 2:
+        tn := get_node(node.children[0])
+        name := tn.value
+        cur := ir_reg()
+        ir_emit("load " + cur.to_string() + " " + name)
+        rhs := ir_expr(node.children[1])
+        res := ir_reg()
+        if op == "+=":
+            ir_emit("add " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
+        elif op == "-=":
+            ir_emit("sub " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
+        elif op == "*=":
+            ir_emit("mul " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
+        elif op == "/=":
+            ir_emit("div " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
+        ir_emit("store " + name + " " + res.to_string())
+
 # --- emit statement ---
 fn ir_stmt(idx: Int):
     node := get_node(idx)
     kind := node.kind
 
-    if kind == "call":
-        ir_expr(idx)
-        return
-    if kind == "method_call":
-        ir_expr(idx)
-        return
-    if kind == "spawn":
+    if ir_stmt_is_expr(kind):
         ir_expr(idx)
         return
 
@@ -1329,83 +1402,19 @@ fn ir_stmt(idx: Int):
         return
 
     if kind == "return":
-        if node.children.len() > 0:
-            r := ir_expr(node.children[0])
-            ir_emit("ret " + r.to_string())
-        else:
-            r := ir_reg()
-            ir_emit("iconst " + r.to_string() + " 0")
-            ir_emit("ret " + r.to_string())
-        ir_last_was_ret = true
+        ir_emit_return_stmt(node)
         return
 
     if kind == "bind" or kind == "binding":
-        mut name := node.value
-        # strip " mut" suffix from binding names
-        if name.contains(" mut"):
-            name = name.substring(0, name.len() - 4)
-        elif name.contains(" "):
-            name = name.split(" ")[0]
-        # find type annotation and value expression
-        mut val_idx := 0 - 1
-        mut type_idx := 0 - 1
-        mut _fi13 := 0
-        _kids13 := node.children
-        while _fi13 < _kids13.len():
-            child := _kids13[_fi13]
-            cn := get_node(child)
-            if cn.kind == "type" or cn.kind == "generic_type":
-                type_idx = child
-            else:
-                val_idx = child
-            _fi13 = _fi13 + 1
-        # track type from annotation with full generic information
-        if type_idx >= 0:
-            resolved_type := ir_resolve_type_node(type_idx)
-            if resolved_type.len() > 0:
-                ir_var_types.insert(name, resolved_type)
-        if val_idx >= 0:
-            r := ir_emit_value_for_target(val_idx, ir_lookup_name_type(name))
-            ir_var_regs.insert(name, r)
-            ir_emit("store " + name + " " + r.to_string())
-            # track type from value expression using centralized inference
-            if not ir_var_types.contains_key(name):
-                inferred := ir_infer_type(val_idx)
-                if inferred.len() > 0:
-                    ir_var_types.insert(name, inferred)
+        ir_emit_bind_stmt(node)
         return
 
     if kind == "assign":
-        name := node.value
-        if node.children.len() > 0:
-            r := ir_emit_value_for_target(node.children[0], ir_lookup_name_type(name))
-            ir_var_regs.insert(name, r)
-            ir_emit("store " + name + " " + r.to_string())
+        ir_emit_assign_stmt(node)
         return
 
     if kind == "assignment":
-        op := node.value
-        if op == "=" and node.children.len() >= 2:
-            tn := get_node(node.children[0])
-            name := tn.value
-            r := ir_emit_value_for_target(node.children[1], ir_lookup_name_type(name))
-            ir_emit("store " + name + " " + r.to_string())
-        elif (op == "+=" or op == "-=" or op == "*=" or op == "/=") and node.children.len() >= 2:
-            tn := get_node(node.children[0])
-            name := tn.value
-            cur := ir_reg()
-            ir_emit("load " + cur.to_string() + " " + name)
-            rhs := ir_expr(node.children[1])
-            res := ir_reg()
-            if op == "+=":
-                ir_emit("add " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
-            elif op == "-=":
-                ir_emit("sub " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
-            elif op == "*=":
-                ir_emit("mul " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
-            elif op == "/=":
-                ir_emit("div " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
-            ir_emit("store " + name + " " + res.to_string())
+        ir_emit_compound_assignment(node)
         return
 
     ir_stmt_control(idx, node)

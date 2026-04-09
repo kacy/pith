@@ -1,4 +1,4 @@
-.PHONY: build self-host bootstrap bootstrap-verify run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test clean
+.PHONY: build self-host bootstrap bootstrap-verify run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -40,6 +40,8 @@ bootstrap-verify: self-host
 	@$(MAKE) --no-print-directory run-examples-self-only
 	@echo "--- verifying self-hosted compiler on regression cases ---"
 	@$(MAKE) --no-print-directory run-regressions-self-only
+	@echo "--- verifying combined ir contract ---"
+	@$(MAKE) --no-print-directory ir-contract-regressions-only
 	echo "bootstrap verified"
 
 # --- example validation ---
@@ -434,6 +436,35 @@ cli-regressions-self-only:
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-host cli regressions passed"
 
+ir-contract-regressions: self-host ir-contract-regressions-only
+
+ir-contract-regressions-only:
+	@echo "--- combined ir contract checks ---"
+	@pass=0; fail=0; \
+	if timeout 15 ./self-host/ir_driver --combined tests/cases/test_suite.fg | awk '/^field / && NF==4 { bad=1 } END { exit bad }'; then \
+		pass=$$((pass+1)); echo "ok   no legacy short fields"; \
+	else \
+		echo "FAIL no legacy short fields"; fail=$$((fail+1)); \
+	fi; \
+	if timeout 15 ./self-host/ir_driver --combined examples/http_api.fg | awk '/^call / && ($$3=="tcp_connect" || $$3=="file_open_read" || $$3=="process_spawn" || $$3=="parse_int") && $$4 != "result_int" { bad=1 } END { exit bad }'; then \
+		pass=$$((pass+1)); echo "ok   builtin result retkinds"; \
+	else \
+		echo "FAIL builtin result retkinds"; fail=$$((fail+1)); \
+	fi; \
+	if timeout 15 ./self-host/ir_driver --combined examples/concurrency.fg | awk 'BEGIN { m=0; w=0; s=0; bad=0 } /^call / && $$3=="Mutex" { if ($$4=="opaque:Mutex") m=1; else bad=1 } /^call / && $$3=="WaitGroup" { if ($$4=="opaque:WaitGroup") w=1; else bad=1 } /^call / && $$3=="Semaphore" { if ($$4=="opaque:Semaphore") s=1; else bad=1 } END { if (!m || !w || !s || bad) exit 1 }'; then \
+		pass=$$((pass+1)); echo "ok   sync primitive opaque retkinds"; \
+	else \
+		echo "FAIL sync primitive opaque retkinds"; fail=$$((fail+1)); \
+	fi; \
+	if timeout 15 ./self-host/ir_driver --combined tests/cases/test_io_file_streams.fg | awk '/^call / && $$4 ~ /^[A-Z]/ { bad=1 } END { exit bad }'; then \
+		pass=$$((pass+1)); echo "ok   no bare struct call retkinds"; \
+	else \
+		echo "FAIL no bare struct call retkinds"; fail=$$((fail+1)); \
+	fi; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all combined ir contract checks passed"
+
 # --- full test suite ---
 
 test: build
@@ -461,19 +492,21 @@ test: build
 	@$(MAKE) --no-print-directory check-invalid-only
 	@echo "=== Step 5: run cli regressions ==="
 	@$(MAKE) --no-print-directory cli-regressions-only
-	@echo "=== Step 6: build self-hosted compiler via Cranelift ==="
+	@echo "=== Step 6: verify combined ir contract ==="
+	@$(MAKE) --no-print-directory ir-contract-regressions-only
+	@echo "=== Step 7: build self-hosted compiler via Cranelift ==="
 	./target/release/forge build self-host/forge_main.fg
-	@echo "=== Step 7: run regression cases through self-hosted compiler ==="
+	@echo "=== Step 8: run regression cases through self-hosted compiler ==="
 	@$(MAKE) --no-print-directory run-regressions-self-only
-	@echo "=== Step 8: run invalid parse examples through self-hosted parser ==="
+	@echo "=== Step 9: run invalid parse examples through self-hosted parser ==="
 	@$(MAKE) --no-print-directory check-parse-invalid-self-host-only
-	@echo "=== Step 9: compare native and self-hosted example outputs ==="
+	@echo "=== Step 10: compare native and self-hosted example outputs ==="
 	@$(MAKE) --no-print-directory parity-examples-only
-	@echo "=== Step 10: run invalid examples through self-hosted checker ==="
+	@echo "=== Step 11: run invalid examples through self-hosted checker ==="
 	@$(MAKE) --no-print-directory check-invalid-self-host-only
-	@echo "=== Step 11: run self-host cli regressions ==="
+	@echo "=== Step 12: run self-host cli regressions ==="
 	@$(MAKE) --no-print-directory cli-regressions-self-only
-	@echo "=== Step 12: self-hosted compiler works ==="
+	@echo "=== Step 13: self-hosted compiler works ==="
 	./self-host/forge_main version
 	./self-host/forge_main lex examples/hello.fg > /dev/null
 	./self-host/forge_main parse examples/hello.fg > /dev/null

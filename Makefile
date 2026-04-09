@@ -22,8 +22,13 @@ IR_FIXED_POINT_SOURCES := \
 	examples/hello.fg \
 	examples/concurrency.fg \
 	tests/cases/test_suite.fg \
+	tests/cases/test_imported_globals_init.fg \
+	tests/cases/test_module_alias_calls.fg \
+	tests/cases/test_imported_io_methods.fg \
 	tests/cases/test_io_file_streams.fg \
-	tests/cases/test_http_request_bytes.fg
+	tests/cases/test_http_request_bytes.fg \
+	tests/cases/test_http_websocket_app.fg \
+	tests/cases/test_websocket_wire.fg
 
 # --- primary build (Cranelift native backend) ---
 

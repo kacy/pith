@@ -1,4 +1,4 @@
-.PHONY: build self-host bootstrap bootstrap-verify run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test clean
+.PHONY: build self-host bootstrap bootstrap-verify bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -17,6 +17,13 @@ PARITY_EXAMPLES := \
 	matrix_math \
 	self_host_patterns \
 	wildcard_import
+
+IR_FIXED_POINT_SOURCES := \
+	examples/hello.fg \
+	examples/concurrency.fg \
+	tests/cases/test_suite.fg \
+	tests/cases/test_io_file_streams.fg \
+	tests/cases/test_http_request_bytes.fg
 
 # --- primary build (Cranelift native backend) ---
 
@@ -42,7 +49,42 @@ bootstrap-verify: self-host
 	@$(MAKE) --no-print-directory run-regressions-self-only
 	@echo "--- verifying combined ir contract ---"
 	@$(MAKE) --no-print-directory ir-contract-regressions-only
+	@echo "--- verifying ir fixed point on deterministic corpus ---"
+	@$(MAKE) --no-print-directory bootstrap-ir-fixed-point-only
 	echo "bootstrap verified"
+
+bootstrap-ir-fixed-point: self-host bootstrap-ir-fixed-point-only
+
+bootstrap-ir-fixed-point-only:
+	@echo "--- bootstrap ir fixed point ---"
+	@tmpdir=$$(mktemp -d /tmp/forge-ir-fixed-point-XXXXXX); \
+	pass=0; fail=0; \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	if [ ! -x ./self-host/ir_driver ]; then \
+		timeout 120 ./target/release/forge build self-host/ir_driver.fg >/dev/null; \
+	fi; \
+	timeout 120 ./self-host/forge_main build self-host/forge_main.fg >/dev/null; \
+	timeout 120 ./self-host/forge_main build self-host/ir_driver.fg >/dev/null; \
+	cp ./self-host/forge_main "$$tmpdir/forge_main_stage1"; \
+	cp ./self-host/ir_driver "$$tmpdir/ir_driver_stage1"; \
+	timeout 120 ./self-host/forge_main build self-host/forge_main.fg >/dev/null; \
+	timeout 120 ./self-host/forge_main build self-host/ir_driver.fg >/dev/null; \
+	for src in $(IR_FIXED_POINT_SOURCES); do \
+		stage1=$$(timeout 20 "$$tmpdir/ir_driver_stage1" --combined "$$src" 2>/dev/null); \
+		stage1_status=$$?; \
+		stage2=$$(timeout 20 ./self-host/ir_driver --combined "$$src" 2>/dev/null); \
+		stage2_status=$$?; \
+		if [ $$stage1_status -eq 0 ] && [ $$stage2_status -eq 0 ] && [ "$$stage1" = "$$stage2" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$src"; \
+		else \
+			echo "FAIL $$src"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "bootstrap ir fixed point verified"
 
 # --- example validation ---
 

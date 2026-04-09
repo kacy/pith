@@ -528,14 +528,58 @@ fn ir_register_struct_layout(name: String, field_names: List[String], field_type
     ir_struct_names.insert(name, field_names.len())
     ir_emit("struct " + name + " " + field_names.join(" "))
 
+fn ir_unwrap_pub_node(idx: Int) -> Node:
+    mut node := get_node(idx)
+    if node.kind == "pub" and node.children.len() > 0:
+        node = get_node(node.children[0])
+    return node
+
+fn ir_is_binding_kind(kind: String) -> Bool:
+    return kind == "bind" or kind == "binding"
+
+fn ir_binding_name(node: Node) -> String:
+    mut name := node.value
+    if name.contains(" mut"):
+        name = name.substring(0, name.len() - 4)
+    elif name.contains(" "):
+        name = name.split(" ")[0]
+    return name
+
+fn ir_binding_has_collection_init(node: Node) -> Bool:
+    mut i := 0
+    while i < node.children.len():
+        kind := get_node(node.children[i]).kind
+        if kind == "list" or kind == "map" or kind == "set":
+            return true
+        i = i + 1
+    return false
+
+fn ir_record_global_type(name: String, global_type: String):
+    if global_type == "int":
+        ir_global_int_names.push(name)
+    elif global_type == "string":
+        ir_global_string_names.push(name)
+    elif global_type == "list_string":
+        ir_global_list_string_names.push(name)
+    elif global_type == "list":
+        ir_global_list_names.push(name)
+    elif global_type == "map_int":
+        ir_global_map_int_names.push(name)
+    elif global_type == "map":
+        ir_global_map_names.push(name)
+    elif global_type == "set":
+        ir_global_set_names.push(name)
+    elif global_type == "set_int":
+        ir_global_set_int_names.push(name)
+    elif global_type == "bool":
+        ir_global_bool_names.push(name)
+
 fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool):
     root := get_node(root_idx)
     mut i := 0
     while i < root.children.len():
         child := root.children[i]
-        mut cn := get_node(child)
-        if cn.kind == "pub" and cn.children.len() > 0:
-            cn = get_node(cn.children[0])
+        cn := ir_unwrap_pub_node(child)
         if cn.kind == "struct_decl":
             mut sname := cn.value
             if sname.contains("["):
@@ -2601,9 +2645,7 @@ pub fn emit_ir(root_idx: Int) -> String:
     kids24_children := root.children
     while _fi24 < kids24_children.len():
         child := kids24_children[_fi24]
-        mut cn := get_node(child)
-        if cn.kind == "pub" and cn.children.len() > 0:
-            cn = get_node(cn.children[0])
+        cn := ir_unwrap_pub_node(child)
         if cn.kind == "fn" or cn.kind == "fn_decl":
             mut _fi35 := 0
             kids35_children := cn.children
@@ -2632,15 +2674,9 @@ pub fn emit_ir(root_idx: Int) -> String:
     kids25_children := root.children
     while _fi25 < kids25_children.len():
         child := kids25_children[_fi25]
-        mut cn := get_node(child)
-        if cn.kind == "pub" and cn.children.len() > 0:
-            cn = get_node(cn.children[0])
-        if cn.kind == "bind" or cn.kind == "binding":
-            mut gname := cn.value
-            if gname.contains(" mut"):
-                gname = gname.substring(0, gname.len() - 4)
-            elif gname.contains(" "):
-                gname = gname.split(" ")[0]
+        cn := ir_unwrap_pub_node(child)
+        if ir_is_binding_kind(cn.kind):
+            gname := ir_binding_name(cn)
             # find initial value
             mut init_val := "0"
             mut global_type := ""
@@ -2688,24 +2724,7 @@ pub fn emit_ir(root_idx: Int) -> String:
                         global_type = "bool"
                 _fi36 = _fi36 + 1
             if global_type.len() > 0:
-                if global_type == "int":
-                    ir_global_int_names.push(gname)
-                elif global_type == "string":
-                    ir_global_string_names.push(gname)
-                elif global_type == "list_string":
-                    ir_global_list_string_names.push(gname)
-                elif global_type == "list":
-                    ir_global_list_names.push(gname)
-                elif global_type == "map_int":
-                    ir_global_map_int_names.push(gname)
-                elif global_type == "map":
-                    ir_global_map_names.push(gname)
-                elif global_type == "set":
-                    ir_global_set_names.push(gname)
-                elif global_type == "set_int":
-                    ir_global_set_int_names.push(gname)
-                elif global_type == "bool":
-                    ir_global_bool_names.push(gname)
+                ir_record_global_type(gname, global_type)
             if global_map_value_type.len() > 0:
                 ir_global_map_value_types.insert(gname, global_map_value_type)
             ir_emit("global " + gname + " " + init_val)
@@ -2717,18 +2736,9 @@ pub fn emit_ir(root_idx: Int) -> String:
     kids26_children := root.children
     while _fi26 < kids26_children.len():
         child := kids26_children[_fi26]
-        mut cn := get_node(child)
-        if cn.kind == "pub" and cn.children.len() > 0:
-            cn = get_node(cn.children[0])
-        if cn.kind == "bind" or cn.kind == "binding":
-            mut _fi37 := 0
-            kids37_children := cn.children
-            while _fi37 < kids37_children.len():
-                gc := kids37_children[_fi37]
-                gcn := get_node(gc)
-                if gcn.kind == "list" or gcn.kind == "map" or gcn.kind == "set":
-                    has_collection_globals = true
-                _fi37 = _fi37 + 1
+        cn := ir_unwrap_pub_node(child)
+        if ir_is_binding_kind(cn.kind) and ir_binding_has_collection_init(cn):
+            has_collection_globals = true
         _fi26 = _fi26 + 1
     if has_collection_globals:
         ir_emit_func_header("__init_globals", 0, "int")
@@ -2736,15 +2746,9 @@ pub fn emit_ir(root_idx: Int) -> String:
         kids27_children := root.children
         while _fi27 < kids27_children.len():
             child := kids27_children[_fi27]
-            mut cn := get_node(child)
-            if cn.kind == "pub" and cn.children.len() > 0:
-                cn = get_node(cn.children[0])
-            if cn.kind == "bind" or cn.kind == "binding":
-                mut gname := cn.value
-                if gname.contains(" mut"):
-                    gname = gname.substring(0, gname.len() - 4)
-                elif gname.contains(" "):
-                    gname = gname.split(" ")[0]
+            cn := ir_unwrap_pub_node(child)
+            if ir_is_binding_kind(cn.kind):
+                gname := ir_binding_name(cn)
                 mut _fi38 := 0
                 kids38_children := cn.children
                 while _fi38 < kids38_children.len():

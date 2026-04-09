@@ -806,6 +806,44 @@ fn ir_known_callable_return_type(fname: String) -> String:
         return ir_resolve_type_hint(ret_kind)
     return ""
 
+fn ir_field_receiver_type(recv_idx: Int) -> String:
+    mut obj_type := ir_infer_type(recv_idx)
+    if obj_type.len() == 0:
+        recv := get_node(recv_idx)
+        if recv.kind == "ident" and ir_struct_names.contains_key(recv.value):
+            obj_type = recv.value
+    return obj_type
+
+fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
+    impl_name := ir_lookup_impl_method_name(obj_type, meth)
+    if impl_name.len() > 0 and ir_func_returns.contains_key(impl_name):
+        ret_kind := ir_func_returns[impl_name]
+        if ret_kind == "result_int":
+            return "int"
+        if ret_kind == "result_bool":
+            return "bool"
+        return ir_resolve_type_hint(ret_kind)
+    if BOOL_RETURNING_METHODS.contains(meth):
+        return "bool"
+    if STRING_RETURNING_METHODS.contains(meth) or meth == "to_string_utf8":
+        return "string"
+    if meth == "to_float":
+        return "float"
+    if meth == "len":
+        return "int"
+    if (meth == "slice" or meth == "concat") and obj_type == "bytes":
+        return "bytes"
+    if meth == "index_of" and (obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")):
+        return "int"
+    if meth == "slice" or meth == "sort":
+        if obj_type == "list_string":
+            return "list_string"
+        if obj_type == "list" or obj_type.starts_with("list:"):
+            return "list"
+    if meth == "keys" or meth == "values" or meth == "split" or meth == "chars":
+        return "list_string"
+    return ""
+
 # --- centralized type inference for AST nodes ---
 # Returns: "int", "float", "bool", "string", "list", "list_string",
 #          "map", "map_int", "set", "set_int", or "" (unknown)
@@ -889,38 +927,7 @@ fn ir_infer_type(idx: Int) -> String:
         mut obj_type := ""
         if node.children.len() > 0:
             obj_type = ir_infer_type(node.children[0])
-        impl_name := ir_lookup_impl_method_name(obj_type, meth)
-        if impl_name.len() > 0 and ir_func_returns.contains_key(impl_name):
-            ret_kind := ir_func_returns[impl_name]
-            if ret_kind == "result_int":
-                return "int"
-            if ret_kind == "result_bool":
-                return "bool"
-            return ir_resolve_type_hint(ret_kind)
-        if BOOL_RETURNING_METHODS.contains(meth):
-            return "bool"
-        if STRING_RETURNING_METHODS.contains(meth):
-            return "string"
-        if meth == "to_string_utf8":
-            return "string"
-        if meth == "to_float":
-            return "float"
-        if meth == "len":
-            return "int"
-        if meth == "slice" and obj_type == "bytes":
-            return "bytes"
-        if meth == "concat" and obj_type == "bytes":
-            return "bytes"
-        if meth == "index_of" and (obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")):
-            return "int"
-        if meth == "slice" or meth == "sort":
-            if obj_type == "list_string":
-                return "list_string"
-            if obj_type == "list" or obj_type.starts_with("list:"):
-                return "list"
-        if meth == "keys" or meth == "values" or meth == "split" or meth == "chars":
-            return "list_string"
-        return ""
+        return ir_known_method_return_type(obj_type, meth)
     if kind == "field_access":
         if node.children.len() > 0:
             fname := node_value(idx)
@@ -930,11 +937,7 @@ fn ir_infer_type(idx: Int) -> String:
                 checked := ir_checked_type(node.children[0])
                 if checked.len() > 0:
                     return checked
-            mut obj_type := ir_infer_type(node.children[0])
-            if obj_type.len() == 0:
-                recv := get_node(node.children[0])
-                if recv.kind == "ident" and ir_struct_names.contains_key(recv.value):
-                    obj_type = recv.value
+            obj_type := ir_field_receiver_type(node.children[0])
             if obj_type.len() > 0:
                 lookup_key := obj_type + "." + fname
                 if ir_struct_field_lookup.contains_key(lookup_key):

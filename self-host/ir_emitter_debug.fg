@@ -1599,6 +1599,8 @@ fn ir_block(idx: Int):
             ir_block(kids[i])
             i = i + 1
     else:
+        # loop control jumps are the one statement shape that still needs
+        # direct block-level handling. everything else goes through ir_stmt.
         if kind == "break":
             if ir_break_stack.len() > 0:
                 ir_emit("jmp " + ir_break_stack[ir_break_stack.len() - 1])
@@ -1689,6 +1691,8 @@ fn ir_emit_default_return():
     ir_emit("endfunc")
 
 fn ir_prepare_func_emission():
+    # debug emission still resets the per-function local state so the output
+    # matches the real emitter structure closely.
     ir_next_reg = 0
     ir_var_regs = {}
     ir_var_types = {}

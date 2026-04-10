@@ -1614,62 +1614,84 @@ fn ir_emit_string_interp(idx: Int) -> Int:
     return result_r
 
 # --- lambda compilation (extracted from ir_expr) ---
+struct LambdaParts:
+    params: List[String]
+    body_idx: Int
+    captures: List[String]
+
+fn ir_collect_lambda_parts(idx: Int) -> LambdaParts:
+    mut params: List[String] := []
+    mut body_idx := 0 - 1
+    mut i := 0
+    while i < node_child_count(idx):
+        child := node_child(idx, i)
+        cn := get_node(child)
+        if cn.kind == "param":
+            params.push(cn.value)
+        elif cn.kind == "body":
+            body_idx = child
+        i = i + 1
+    mut captures: List[String] := []
+    if body_idx >= 0:
+        captures = ir_find_free_vars(body_idx, params)
+    return LambdaParts(params, body_idx, captures)
+
+fn ir_reset_lambda_emit_state():
+    ir_next_reg = 0
+    ir_var_regs = {}
+    ir_var_types = {}
+    ir_lines = []
+
+fn ir_emit_lambda_params(params: List[String]):
+    mut i := 0
+    while i < params.len():
+        lr := ir_reg()
+        ir_var_regs.insert(params[i], lr)
+        ir_emit("param " + params[i])
+        i = i + 1
+
+fn ir_emit_lambda_body_value(body_idx: Int):
+    if body_idx < 0:
+        return
+    if node_kind(body_idx) == "body" and node_child_count(body_idx) > 0:
+        br := ir_expr(node_child(body_idx, 0))
+        ir_emit("ret " + br.to_string())
+        return
+    br := ir_expr(body_idx)
+    ir_emit("ret " + br.to_string())
+
+fn ir_emit_lambda_default_return():
+    dr := ir_reg()
+    ir_emit("iconst " + dr.to_string() + " 0")
+    ir_emit("ret " + dr.to_string())
+    ir_emit("endfunc")
+
+fn ir_finish_lambda_emit(saved_regs: Int, saved_vars: Map[String, Int], saved_types: Map[String, String], saved_lines: List[String]):
+    ir_append_deferred_lambda_body()
+    ir_lines = saved_lines
+    ir_next_reg = saved_regs
+    ir_var_regs = saved_vars
+    ir_var_types = saved_types
+
 fn ir_emit_lambda(idx: Int) -> Int:
     # compile lambda body as a separate function
     lambda_name := "__lambda_" + ir_lambda_count.to_string()
     ir_lambda_count = ir_lambda_count + 1
-    # collect params
-    mut lparams: List[String] := []
-    mut lbody_idx := 0 - 1
-    mut _fi5 := 0
-    while _fi5 < node_child_count(idx):
-        child := node_child(idx, _fi5)
-        mut cn := get_node(child)
-        if cn.kind == "param":
-            lparams.push(cn.value)
-        elif cn.kind == "body":
-            lbody_idx = child
-        _fi5 = _fi5 + 1
-    # detect captured variables: free vars in body that aren't params
-    mut captures: List[String] := []
-    if lbody_idx >= 0:
-        captures = ir_find_free_vars(lbody_idx, lparams)
-    ir_emit_lambda_capture_setup(captures)
+    parts := ir_collect_lambda_parts(idx)
+    ir_emit_lambda_capture_setup(parts.captures)
 
     # save current state and emit lambda to deferred buffer
     saved_regs := ir_next_reg
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
     saved_lines := ir_copy_lines(ir_lines)
-    ir_next_reg = 0
-    ir_var_regs = {}
-    ir_var_types = {}
-    ir_lines = []
-    ir_emit_func_header(lambda_name, lparams.len(), "unknown")
-    mut lpi := 0
-    while lpi < lparams.len():
-        lr := ir_reg()
-        ir_var_regs.insert(lparams[lpi], lr)
-        ir_emit("param " + lparams[lpi])
-        lpi = lpi + 1
-    ir_emit_lambda_capture_loads(captures)
-    if lbody_idx >= 0:
-        if node_kind(lbody_idx) == "body" and node_child_count(lbody_idx) > 0:
-            br := ir_expr(node_child(lbody_idx, 0))
-            ir_emit("ret " + br.to_string())
-        else:
-            br := ir_expr(lbody_idx)
-            ir_emit("ret " + br.to_string())
-    dr := ir_reg()
-    ir_emit("iconst " + dr.to_string() + " 0")
-    ir_emit("ret " + dr.to_string())
-    ir_emit("endfunc")
-    # save lambda IR and restore state
-    ir_append_deferred_lambda_body()
-    ir_lines = saved_lines
-    ir_next_reg = saved_regs
-    ir_var_regs = saved_vars
-    ir_var_types = saved_types
+    ir_reset_lambda_emit_state()
+    ir_emit_func_header(lambda_name, parts.params.len(), "unknown")
+    ir_emit_lambda_params(parts.params)
+    ir_emit_lambda_capture_loads(parts.captures)
+    ir_emit_lambda_body_value(parts.body_idx)
+    ir_emit_lambda_default_return()
+    ir_finish_lambda_emit(saved_regs, saved_vars, saved_types, saved_lines)
     # return function reference
     r := ir_reg()
     ir_emit("funcref " + r.to_string() + " " + lambda_name)

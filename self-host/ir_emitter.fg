@@ -256,7 +256,7 @@ fn ir_expr_result_kind(idx: Int) -> String:
         return checked_kind
     node := get_node(idx)
     if node.kind == "call" and node.children.len() > 0:
-        fname := ir_resolve_static_callee_name(node.children[0])
+        fname := ir_resolve_static_callee(node.children[0]).name
         if fname.len() > 0 and ir_func_returns.contains_key(fname):
             ret_kind := ir_func_returns[fname]
             if ret_kind == "result_int" or ret_kind == "result_bool":
@@ -427,6 +427,25 @@ fn ir_import_target_name(module_path: String, name: String) -> String:
         return "fs_" + name
     return name
 
+struct ResolvedCallee:
+    name: String
+    imported: Bool
+
+fn ir_module_alias_member_name(alias: String, member: String) -> String:
+    if not ir_module_aliases.contains_key(alias):
+        return ""
+    return ir_import_target_name(ir_module_aliases[alias], member)
+
+fn ir_plain_method_name(name: String) -> String:
+    if name.starts_with("."):
+        return name.substring(1, name.len())
+    return name
+
+fn ir_ident_callee(name: String) -> ResolvedCallee:
+    if ir_import_renames.contains_key(name):
+        return ResolvedCallee(ir_import_renames[name], true)
+    return ResolvedCallee(name, false)
+
 fn ir_resolve_module_alias_call_name(idx: Int) -> String:
     node := get_node(idx)
     if node.kind != "field_access" or node.children.len() == 0:
@@ -434,10 +453,7 @@ fn ir_resolve_module_alias_call_name(idx: Int) -> String:
     recv := get_node(node.children[0])
     if recv.kind != "ident":
         return ""
-    alias := recv.value
-    if not ir_module_aliases.contains_key(alias):
-        return ""
-    return ir_import_target_name(ir_module_aliases[alias], node.value)
+    return ir_module_alias_member_name(recv.value, node.value)
 
 fn ir_resolve_module_alias_method_call_name(idx: Int) -> String:
     node := get_node(idx)
@@ -446,35 +462,24 @@ fn ir_resolve_module_alias_method_call_name(idx: Int) -> String:
     recv := get_node(node.children[0])
     if recv.kind != "ident":
         return ""
-    alias := recv.value
-    if not ir_module_aliases.contains_key(alias):
-        return ""
-    mut method_name := node.value
-    if method_name.starts_with("."):
-        method_name = method_name.substring(1, method_name.len())
-    return ir_import_target_name(ir_module_aliases[alias], method_name)
+    return ir_module_alias_member_name(recv.value, ir_plain_method_name(node.value))
 
-fn ir_resolve_static_callee_name(idx: Int) -> String:
+fn ir_resolve_static_callee(idx: Int) -> ResolvedCallee:
     node := get_node(idx)
     if node.kind == "ident":
-        fname := node.value
-        if ir_import_renames.contains_key(fname):
-            return ir_import_renames[fname]
-        return fname
+        return ir_ident_callee(node.value)
     if node.kind == "field_access":
-        return ir_resolve_module_alias_call_name(idx)
-    return ""
+        alias_name := ir_resolve_module_alias_call_name(idx)
+        if alias_name.len() > 0:
+            return ResolvedCallee(alias_name, true)
+    return ResolvedCallee("", false)
 
-fn ir_static_callee_uses_result_abi(idx: Int) -> Bool:
-    node := get_node(idx)
-    if node.kind == "ident":
-        if ir_import_renames.contains_key(node.value):
-            return true
-    if node.kind == "field_access":
-        if ir_resolve_module_alias_call_name(idx).len() > 0:
-            return true
-    fname := ir_resolve_static_callee_name(idx)
-    if fname.len() > 0 and ir_func_returns.contains_key(fname):
+fn ir_callee_uses_result_abi(callee: ResolvedCallee, idx: Int) -> Bool:
+    if callee.imported:
+        return true
+    if callee.name.len() > 0 and ir_func_returns.contains_key(callee.name):
+        return true
+    if ir_checked_result_kind(idx).len() > 0:
         return true
     return false
 
@@ -1330,18 +1335,14 @@ fn ir_emit_binary_expr(node: Node) -> Int:
     return r
 
 fn ir_emit_static_call(idx: Int, node: Node) -> Int:
-    mut fname := ""
-    mut i := 0
-    while i < node.children.len():
-        child := node.children[i]
-        if i == 0:
-            fname = ir_resolve_static_callee_name(child)
-        i = i + 1
-    if fname.len() == 0:
-        fname = "unknown"
+    mut callee := ResolvedCallee("unknown", false)
+    if node.children.len() > 0:
+        callee = ir_resolve_static_callee(node.children[0])
+        if callee.name.len() == 0:
+            callee = ResolvedCallee("unknown", false)
     arg_regs := ir_collect_call_arg_regs(node, 1)
 
-    if ir_emit_tests and fname == "assert" and arg_regs.len() >= 1:
+    if ir_emit_tests and callee.name == "assert" and arg_regs.len() >= 1:
         ok_l := ir_label()
         fail_l := ir_label()
         ir_emit("brif " + arg_regs[0].to_string() + " " + ok_l + " " + fail_l)
@@ -1356,7 +1357,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         r := ir_reg()
         ir_emit("iconst " + r.to_string() + " 0")
         return r
-    if ir_emit_tests and fname == "assert_eq" and arg_regs.len() >= 2:
+    if ir_emit_tests and callee.name == "assert_eq" and arg_regs.len() >= 2:
         cmp_r := ir_reg()
         mut left_type := ""
         mut right_type := ""
@@ -1392,8 +1393,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         return r
 
     r := ir_reg()
-    callee_uses_result_abi := ir_static_callee_uses_result_abi(node.children[0]) or ir_checked_result_kind(idx).len() > 0
-    ir_emit_resolved_call(r, fname, idx, arg_regs, callee_uses_result_abi)
+    ir_emit_resolved_call(r, callee.name, idx, arg_regs, ir_callee_uses_result_abi(callee, idx))
     return r
 
 fn ir_emit_map_literal(node: Node) -> Int:
@@ -1528,16 +1528,13 @@ fn ir_emit_result_field_access(idx: Int, obj_r: Int, fname: String) -> Int:
 fn ir_emit_method_call(idx: Int) -> Int:
     node := get_node(idx)
     # first child is object, then args. value is method_name (may have leading dot)
-    mut mname := node_value(idx)
-    if mname.starts_with("."):
-        mname = mname.substring(1, mname.len())
+    mname := ir_plain_method_name(node_value(idx))
 
     alias_fname := ir_resolve_module_alias_method_call_name(idx)
     if alias_fname.len() > 0:
         arg_regs := ir_collect_call_arg_regs(node, 1)
-        uses_result_abi := ir_func_returns.contains_key(alias_fname) or ir_checked_result_kind(idx).len() > 0
         r := ir_reg()
-        ir_emit_resolved_call(r, alias_fname, idx, arg_regs, uses_result_abi)
+        ir_emit_resolved_call(r, alias_fname, idx, arg_regs, ir_callee_uses_result_abi(ResolvedCallee(alias_fname, true), idx))
         return r
 
     obj_type := ir_method_receiver_type(node)
@@ -1558,7 +1555,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
         arg_regs.push(call_regs[ci + 1])
         ci = ci + 1
     r := ir_reg()
-    uses_result_abi := impl_dispatch or ir_func_returns.contains_key(emit_name) or ir_checked_result_kind(idx).len() > 0
+    uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(emit_name, impl_dispatch), idx)
     mut ret_type := ir_call_retkind(idx, uses_result_abi)
     if VOID_METHODS.contains(emit_name):
         ret_type = "void"

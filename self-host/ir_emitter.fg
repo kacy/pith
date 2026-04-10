@@ -968,6 +968,11 @@ fn ir_binary_expr_type(node: Node) -> String:
         return "int"
     return "int"
 
+fn ir_unary_expr_type(node: Node) -> String:
+    if node.value == "not" or node.value == "!" or node.value == "not_op":
+        return "bool"
+    return "int"
+
 fn ir_index_expr_type(idx: Int, node: Node) -> String:
     checked_index := ir_checked_index_type(idx)
     if checked_index.len() > 0:
@@ -983,6 +988,41 @@ fn ir_index_expr_type(idx: Int, node: Node) -> String:
         return "string"
     if coll_type == "map" or coll_type == "map_int":
         return ir_lookup_map_value_type_for_expr(node.children[0])
+    return ""
+
+fn ir_call_expr_type(idx: Int, node: Node) -> String:
+    if node.children.len() == 0:
+        return ""
+    callee := ir_resolve_static_callee(node.children[0])
+    if callee.name.len() == 0:
+        return ""
+    return ir_known_callable_return_type(callee.name)
+
+fn ir_method_expr_type(idx: Int, node: Node) -> String:
+    alias_fname := ir_resolve_module_alias_method_call_name(idx)
+    if alias_fname.len() > 0:
+        return ir_known_callable_return_type(alias_fname)
+    mut obj_type := ""
+    if node.children.len() > 0:
+        obj_type = ir_infer_type(node.children[0])
+    return ir_known_method_return_type(obj_type, ir_plain_method_name(node_value(idx)))
+
+fn ir_field_expr_type(node: Node) -> String:
+    if node.children.len() == 0:
+        return ""
+    fname := node.value
+    if fname == "is_ok" or fname == "is_err":
+        return "bool"
+    if fname == "ok":
+        checked := ir_checked_type(node.children[0])
+        if checked.len() > 0:
+            return checked
+    obj_type := ir_field_receiver_type(node.children[0])
+    if obj_type.len() == 0:
+        return ""
+    lookup_key := obj_type + "." + fname
+    if ir_struct_field_lookup.contains_key(lookup_key):
+        return ir_struct_field_lookup[lookup_key]
     return ""
 
 # --- centralized type inference for AST nodes ---
@@ -1010,45 +1050,15 @@ fn ir_infer_type(idx: Int) -> String:
         return ir_binary_expr_type(node)
     # unary
     if kind == "unary":
-        if node.value == "not" or node.value == "!" or node.value == "not_op":
-            return "bool"
-        return "int"
+        return ir_unary_expr_type(node)
     # function calls
-    if kind == "call" and node.children.len() > 0:
-        fn_node := get_node(node.children[0])
-        if fn_node.kind == "ident":
-            mut fname := fn_node.value
-            if ir_import_renames.contains_key(fname):
-                fname = ir_import_renames[fname]
-            return ir_known_callable_return_type(fname)
-        return ""
+    if kind == "call":
+        return ir_call_expr_type(idx, node)
     # method calls
     if kind == "method_call":
-        alias_fname := ir_resolve_module_alias_method_call_name(idx)
-        if alias_fname.len() > 0:
-            return ir_known_callable_return_type(alias_fname)
-        mut meth := node_value(idx)
-        if meth.starts_with("."):
-            meth = meth.substring(1, meth.len())
-        mut obj_type := ""
-        if node.children.len() > 0:
-            obj_type = ir_infer_type(node.children[0])
-        return ir_known_method_return_type(obj_type, meth)
+        return ir_method_expr_type(idx, node)
     if kind == "field_access":
-        if node.children.len() > 0:
-            fname := node_value(idx)
-            if fname == "is_ok" or fname == "is_err":
-                return "bool"
-            if fname == "ok":
-                checked := ir_checked_type(node.children[0])
-                if checked.len() > 0:
-                    return checked
-            obj_type := ir_field_receiver_type(node.children[0])
-            if obj_type.len() > 0:
-                lookup_key := obj_type + "." + fname
-                if ir_struct_field_lookup.contains_key(lookup_key):
-                    return ir_struct_field_lookup[lookup_key]
-        return ""
+        return ir_field_expr_type(node)
     if kind == "struct_init":
         return ir_resolve_type_hint(node.value)
     # index — depends on collection type
@@ -1297,6 +1307,26 @@ fn ir_emit_unary_expr(node: Node) -> Int:
         ir_emit("iconst " + r.to_string() + " 0")
     return r
 
+fn ir_emit_binary_neq(result_reg: Int, left_r: Int, right_r: Int, is_str_op: Bool, is_bytes_op: Bool):
+    if is_str_op:
+        eq_r := ir_reg()
+        ir_emit_call2(eq_r, "__str_eq", "bool", left_r, right_r)
+        one_r := ir_reg()
+        ir_emit("iconst " + one_r.to_string() + " 1")
+        ir_emit("sub " + result_reg.to_string() + " " + one_r.to_string() + " " + eq_r.to_string())
+        return
+    if is_bytes_op:
+        eq_r := ir_reg()
+        ir_emit_call2(eq_r, "bytes_eq", "bool", left_r, right_r)
+        one_r := ir_reg()
+        ir_emit("iconst " + one_r.to_string() + " 1")
+        ir_emit("sub " + result_reg.to_string() + " " + one_r.to_string() + " " + eq_r.to_string())
+        return
+    ir_emit("neq " + result_reg.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+
+fn ir_emit_simple_binary(result_reg: Int, op: String, left_r: Int, right_r: Int):
+    ir_emit(op + " " + result_reg.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+
 fn ir_emit_binary_expr(node: Node) -> Int:
     left_r := ir_expr(node.children[0])
     right_r := ir_expr(node.children[1])
@@ -1313,59 +1343,46 @@ fn ir_emit_binary_expr(node: Node) -> Int:
     if op == "add" and is_str_op:
         ir_emit("concat " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
     elif op == "add" and not is_str_op:
-        ir_emit("add " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "add", left_r, right_r)
     elif op == "sub":
-        ir_emit("sub " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "sub", left_r, right_r)
     elif op == "mul":
-        ir_emit("mul " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "mul", left_r, right_r)
     elif op == "div":
-        ir_emit("div " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "div", left_r, right_r)
     elif op == "mod":
-        ir_emit("mod " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "mod", left_r, right_r)
     elif op == "eq":
         if is_str_op:
             ir_emit_call2(r, "__str_eq", "bool", left_r, right_r)
         elif is_bytes_op:
             ir_emit_call2(r, "bytes_eq", "bool", left_r, right_r)
         else:
-            ir_emit("eq " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+            ir_emit_simple_binary(r, "eq", left_r, right_r)
     elif op == "neq":
-        if is_str_op:
-            eq_r := ir_reg()
-            ir_emit_call2(eq_r, "__str_eq", "bool", left_r, right_r)
-            one_r := ir_reg()
-            ir_emit("iconst " + one_r.to_string() + " 1")
-            ir_emit("sub " + r.to_string() + " " + one_r.to_string() + " " + eq_r.to_string())
-        elif is_bytes_op:
-            eq_r := ir_reg()
-            ir_emit_call2(eq_r, "bytes_eq", "bool", left_r, right_r)
-            one_r := ir_reg()
-            ir_emit("iconst " + one_r.to_string() + " 1")
-            ir_emit("sub " + r.to_string() + " " + one_r.to_string() + " " + eq_r.to_string())
-        else:
-            ir_emit("neq " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_binary_neq(r, left_r, right_r, is_str_op, is_bytes_op)
     elif op == "lt":
-        ir_emit("lt " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "lt", left_r, right_r)
     elif op == "gt":
-        ir_emit("gt " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "gt", left_r, right_r)
     elif op == "lte":
-        ir_emit("lte " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "lte", left_r, right_r)
     elif op == "gte":
-        ir_emit("gte " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "gte", left_r, right_r)
     elif op == "bit_and":
-        ir_emit("band " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "band", left_r, right_r)
     elif op == "bit_or":
-        ir_emit("bor " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "bor", left_r, right_r)
     elif op == "bit_xor":
-        ir_emit("bxor " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "bxor", left_r, right_r)
     elif op == "shl":
-        ir_emit("shl " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "shl", left_r, right_r)
     elif op == "shr":
-        ir_emit("shr " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "shr", left_r, right_r)
     elif op == "and":
-        ir_emit("and " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "and", left_r, right_r)
     elif op == "or":
-        ir_emit("or " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        ir_emit_simple_binary(r, "or", left_r, right_r)
     else:
         ir_emit("binop " + r.to_string() + " " + op + " " + left_r.to_string() + " " + right_r.to_string())
     return r

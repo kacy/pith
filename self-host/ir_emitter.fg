@@ -661,53 +661,59 @@ fn ir_emit_impl_methods(node: Node, impl_type: String):
             ir_impl_func(child, impl_type)
         i = i + 1
 
-fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool):
-    root := get_node(root_idx)
+fn ir_declared_struct_name(node: Node) -> String:
+    if node.value.contains("["):
+        return node.value.substring(0, node.value.index_of("["))
+    return node.value
+
+fn ir_record_struct_field(struct_name: String, field_names: List[String], field_node: Node):
+    mut field_name := field_node.value
+    if field_name.contains(" "):
+        field_name = field_name.split(" ")[0]
+    field_index := field_names.len()
+    field_names.push(field_name)
+    if field_node.children.len() > 0:
+        type_node := get_node(field_node.children[0])
+        if type_node.kind == "type" or type_node.kind == "generic_type":
+            ir_struct_field_lookup.insert(struct_name + "." + field_name, ir_resolve_type_node(field_node.children[0]))
+    ir_struct_field_index_lookup.insert(struct_name + "." + field_name, field_index.to_string())
+
+fn ir_collect_struct_decl(node: Node, emit_decl: Bool):
+    sname := ir_declared_struct_name(node)
+    mut field_names: List[String] := []
     mut i := 0
-    while i < root.children.len():
-        child := root.children[i]
-        cn := ir_unwrap_pub_node(child)
-        if cn.kind == "struct_decl":
-            mut sname := cn.value
-            if sname.contains("["):
-                sname = sname.substring(0, sname.index_of("["))
-            mut field_names: List[String] := []
-            mut j := 0
-            while j < cn.children.len():
-                fc := cn.children[j]
-                fn_node := get_node(fc)
-                if fn_node.kind == "field":
-                    mut field_name := fn_node.value
-                    if field_name.contains(" "):
-                        field_name = field_name.split(" ")[0]
-                    field_index := field_names.len()
-                    field_names.push(field_name)
-                    if fn_node.children.len() > 0:
-                        type_node := get_node(fn_node.children[0])
-                        if type_node.kind == "type" or type_node.kind == "generic_type":
-                            ir_struct_field_lookup.insert(sname + "." + field_name, ir_resolve_type_node(fn_node.children[0]))
-                    ir_struct_field_index_lookup.insert(sname + "." + field_name, field_index.to_string())
-                j = j + 1
-            ir_struct_names.insert(sname, field_names.len())
-            if emit_decl:
-                ir_emit("struct " + sname + " " + field_names.join(" "))
-        elif cn.kind == "enum_decl":
-            sname := cn.value
-            mut variant_names: List[String] := []
-            mut j := 0
-            while j < cn.children.len():
-                vc := cn.children[j]
-                vn := get_node(vc)
-                if vn.kind == "variant":
-                    variant_index := variant_names.len()
-                    variant_names.push(vn.value)
-                    ir_struct_field_lookup.insert(sname + "." + vn.value, sname)
-                    ir_struct_field_index_lookup.insert(sname + "." + vn.value, variant_index.to_string())
-                j = j + 1
-            ir_struct_names.insert(sname, variant_names.len())
-            if emit_decl:
-                ir_emit("struct " + sname + " " + variant_names.join(" "))
+    while i < node.children.len():
+        field_node := get_node(node.children[i])
+        if field_node.kind == "field":
+            ir_record_struct_field(sname, field_names, field_node)
         i = i + 1
+    ir_struct_names.insert(sname, field_names.len())
+    if emit_decl:
+        ir_emit("struct " + sname + " " + field_names.join(" "))
+
+fn ir_collect_enum_decl(node: Node, emit_decl: Bool):
+    sname := node.value
+    mut variant_names: List[String] := []
+    mut i := 0
+    while i < node.children.len():
+        variant_node := get_node(node.children[i])
+        if variant_node.kind == "variant":
+            variant_index := variant_names.len()
+            variant_names.push(variant_node.value)
+            ir_struct_field_lookup.insert(sname + "." + variant_node.value, sname)
+            ir_struct_field_index_lookup.insert(sname + "." + variant_node.value, variant_index.to_string())
+        i = i + 1
+    ir_struct_names.insert(sname, variant_names.len())
+    if emit_decl:
+        ir_emit("struct " + sname + " " + variant_names.join(" "))
+
+fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool):
+    for item_idx in ir_root_items(root_idx):
+        cn := get_node(item_idx)
+        if cn.kind == "struct_decl":
+            ir_collect_struct_decl(cn, emit_decl)
+        elif cn.kind == "enum_decl":
+            ir_collect_enum_decl(cn, emit_decl)
 
 fn ir_seed_global_types():
     for name in ir_global_int_names:
@@ -2506,17 +2512,16 @@ fn ir_type_alias_target(node: Node) -> String:
         i = i + 1
     return ""
 
+fn ir_collect_import_item(node: Node):
+    if node.kind == "import":
+        ir_register_import_alias(node.value)
+    elif node.kind == "from_import":
+        ir_collect_from_import_renames(node.value)
+
 # --- collect import renames ---
 fn ir_collect_imports(root_idx: Int):
-    root := get_node(root_idx)
-    mut ci := 0
-    while ci < root.children.len():
-        cn := get_node(root.children[ci])
-        if cn.kind == "import":
-            ir_register_import_alias(cn.value)
-        if cn.kind == "from_import":
-            ir_collect_from_import_renames(cn.value)
-        ci = ci + 1
+    for item_idx in ir_root_items(root_idx):
+        ir_collect_import_item(get_node(item_idx))
 
 fn ir_collect_type_aliases(root_idx: Int):
     ir_type_aliases = {}

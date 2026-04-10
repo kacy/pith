@@ -89,6 +89,11 @@ mut ir_module_aliases: Map[String, String] := {}
 mut ir_current_func_return_kind := ""
 mut ir_preloaded_import_roots: List[Int] := []
 mut ir_emit_tests := false
+mut ir_generic_decl_indices: Map[String, Int] := {}
+mut ir_generic_specialization_keys: List[String] := []
+mut ir_generic_specialization_names: Map[String, String] := {}
+mut ir_generic_specialization_type_lists: Map[String, String] := {}
+mut ir_generic_emitted_specializations: Map[String, Int] := {}
 
 pub fn set_import_roots(roots: List[Int]):
     ir_preloaded_import_roots = roots
@@ -125,6 +130,11 @@ fn ir_reset_type_state():
     ir_func_returns = {}
     ir_module_aliases = {}
     ir_current_func_return_kind = ""
+    ir_generic_decl_indices = {}
+    ir_generic_specialization_keys = []
+    ir_generic_specialization_names = {}
+    ir_generic_specialization_type_lists = {}
+    ir_generic_emitted_specializations = {}
 
 fn ir_reset_control_flow_state():
     ir_break_stack = []
@@ -1454,6 +1464,11 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         callee = ir_resolve_static_callee(node.children[0])
         if callee.name.len() == 0:
             callee = ResolvedCallee("unknown", false)
+    if not callee.imported and ir_is_generic_function_name(callee.name):
+        mut generic_ret_type := ir_checked_type(idx)
+        if generic_ret_type.len() == 0:
+            generic_ret_type = ir_infer_type(idx)
+        callee = ResolvedCallee(ir_queue_generic_specialization(callee.name, ir_generic_arg_types(node), generic_ret_type), false)
     arg_regs := ir_collect_call_arg_regs(node, 1)
 
     if ir_emit_tests and callee.name == "assert" and arg_regs.len() >= 1:
@@ -2454,6 +2469,207 @@ fn ir_root_items(root_idx: Int) -> List[Int]:
 fn ir_is_fn_decl_kind(kind: String) -> Bool:
     return kind == "fn" or kind == "fn_decl"
 
+fn ir_has_generic_params(node: Node) -> Bool:
+    mut i := 0
+    while i < node.children.len():
+        if get_node(node.children[i]).kind == "generic_param":
+            return true
+        i = i + 1
+    return false
+
+fn ir_collect_generic_param_names(node: Node) -> List[String]:
+    mut names: List[String] := []
+    mut i := 0
+    while i < node.children.len():
+        child := get_node(node.children[i])
+        if child.kind == "generic_param":
+            names.push(child.value)
+        i = i + 1
+    return names
+
+fn ir_encode_type_list(type_names: List[String]) -> String:
+    return type_names.join(chr(9))
+
+fn ir_decode_type_list(encoded: String) -> List[String]:
+    if encoded.len() == 0:
+        return []
+    return encoded.split(chr(9))
+
+fn ir_generic_specialization_key(name: String, type_names: List[String]) -> String:
+    return name + chr(9) + ir_encode_type_list(type_names)
+
+fn ir_sanitize_symbol_part(name: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < name.len():
+        ch := name[i]
+        if ch == "[" or ch == "]" or ch == "," or ch == " " or ch == "." or ch == ":":
+            out = out + "_"
+        else:
+            out = out + ch
+        i = i + 1
+    return out
+
+fn ir_generic_specialization_name(name: String, type_names: List[String]) -> String:
+    mut suffix_parts: List[String] := []
+    mut i := 0
+    while i < type_names.len():
+        suffix_parts.push(ir_sanitize_symbol_part(type_names[i]))
+        i = i + 1
+    return name + "__" + suffix_parts.join("_")
+
+fn ir_collect_generic_function_decls(root_idx: Int):
+    ir_generic_decl_indices = {}
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if ir_is_fn_decl_kind(node.kind) and ir_has_generic_params(node):
+            ir_generic_decl_indices.insert(node.value, item_idx)
+
+fn ir_is_generic_function_name(name: String) -> Bool:
+    return ir_generic_decl_indices.contains_key(name)
+
+fn ir_specialize_type_name(name: String, generic_params: List[String], concrete_types: List[String]) -> String:
+    mut i := 0
+    while i < generic_params.len():
+        if i < concrete_types.len() and generic_params[i] == name:
+            return concrete_types[i]
+        i = i + 1
+    return ir_resolve_type_hint(name)
+
+fn ir_resolve_type_node_with_subst(type_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:
+    tn := get_node(type_idx)
+    if tn.kind == "type":
+        return ir_specialize_type_name(tn.value, generic_params, concrete_types)
+    if tn.kind == "generic_type":
+        if tn.value == "List":
+            if tn.children.len() > 0:
+                inner := ir_resolve_type_node_with_subst(tn.children[0], generic_params, concrete_types)
+                if inner == "string":
+                    return "list_string"
+            return "list"
+        if tn.value == "Map":
+            if tn.children.len() > 0:
+                key_type := ir_resolve_type_node_with_subst(tn.children[0], generic_params, concrete_types)
+                if key_type == "int":
+                    return "map_int"
+            return "map"
+        if tn.value == "Set":
+            if tn.children.len() > 0:
+                elem_type := ir_resolve_type_node_with_subst(tn.children[0], generic_params, concrete_types)
+                if elem_type == "int":
+                    return "set_int"
+            return "set"
+        return ir_resolve_type_hint(tn.value)
+    if tn.kind == "result_type" and tn.children.len() > 0:
+        inner_type := ir_resolve_type_node_with_subst(tn.children[0], generic_params, concrete_types)
+        return ir_resolve_result_type_kind(inner_type)
+    if tn.kind == "optional_type" and tn.children.len() > 0:
+        return ir_resolve_type_node_with_subst(tn.children[0], generic_params, concrete_types)
+    return ""
+
+fn ir_extract_return_type_with_subst(fn_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:
+    node := get_node(fn_idx)
+    mut i := 0
+    while i < node.children.len():
+        cn := get_node(node.children[i])
+        if cn.kind == "returns":
+            mut j := 0
+            while j < cn.children.len():
+                rn := get_node(cn.children[j])
+                if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type" or rn.kind == "optional_type":
+                    return ir_resolve_type_node_with_subst(cn.children[j], generic_params, concrete_types)
+                j = j + 1
+        i = i + 1
+    return "unknown"
+
+fn ir_extract_param_types_with_subst(fn_idx: Int, generic_params: List[String], concrete_types: List[String]) -> List[String]:
+    node := get_node(fn_idx)
+    mut param_types: List[String] := []
+    mut i := 0
+    while i < node.children.len():
+        cn := get_node(node.children[i])
+        if cn.kind == "param":
+            if cn.children.len() > 0:
+                param_types.push(ir_resolve_type_node_with_subst(cn.children[0], generic_params, concrete_types))
+            else:
+                param_types.push("")
+        i = i + 1
+    return param_types
+
+fn ir_emit_fn_params_with_types(fn_idx: Int, param_types: List[String]):
+    node := get_node(fn_idx)
+    mut i := 0
+    mut param_idx := 0
+    while i < node.children.len():
+        cn := get_node(node.children[i])
+        if cn.kind == "param":
+            mut param_type := ""
+            if param_idx < param_types.len():
+                param_type = param_types[param_idx]
+            ir_emit_named_param(cn.value, param_type)
+            param_idx = param_idx + 1
+        i = i + 1
+
+fn ir_generic_arg_types(node: Node) -> List[String]:
+    mut arg_types: List[String] := []
+    mut i := 1
+    while i < node.children.len():
+        child := node.children[i]
+        child_kind := node_kind(child)
+        mut expr_idx := child
+        if child_kind == "arg":
+            cn := get_node(child)
+            if cn.children.len() > 0:
+                expr_idx = cn.children[0]
+        checked := ir_checked_type(expr_idx)
+        if checked.len() > 0:
+            arg_types.push(checked)
+        else:
+            arg_types.push(ir_infer_type(expr_idx))
+        i = i + 1
+    return arg_types
+
+fn ir_queue_generic_specialization(name: String, arg_types: List[String], ret_type: String) -> String:
+    key := ir_generic_specialization_key(name, arg_types)
+    if ir_generic_specialization_names.contains_key(key):
+        return ir_generic_specialization_names[key]
+    spec_name := ir_generic_specialization_name(name, arg_types)
+    ir_generic_specialization_keys.push(key)
+    ir_generic_specialization_names.insert(key, spec_name)
+    ir_generic_specialization_type_lists.insert(key, ir_encode_type_list(arg_types))
+    ir_func_returns.insert(spec_name, ret_type)
+    return spec_name
+
+fn ir_emit_generic_specialization(key: String):
+    if not ir_generic_specialization_names.contains_key(key):
+        return
+    base_name := key.split(chr(9))[0]
+    if not ir_generic_decl_indices.contains_key(base_name):
+        return
+    decl_idx := ir_generic_decl_indices[base_name]
+    decl_node := get_node(decl_idx)
+    generic_params := ir_collect_generic_param_names(decl_node)
+    concrete_types := ir_decode_type_list(ir_generic_specialization_type_lists[key])
+    spec_name := ir_generic_specialization_names[key]
+    body_idx := ir_find_body(decl_idx)
+    param_count := ir_param_count(decl_idx)
+    ret_type := ir_extract_return_type_with_subst(decl_idx, generic_params, concrete_types)
+    param_types := ir_extract_param_types_with_subst(decl_idx, generic_params, concrete_types)
+    ir_prepare_func_emission(ret_type)
+    ir_emit_func_header(spec_name, param_count, ret_type)
+    ir_emit_fn_params_with_types(decl_idx, param_types)
+    ir_func_returns.insert(spec_name, ret_type)
+    ir_finish_func_emission(body_idx)
+
+fn ir_emit_generic_specializations():
+    mut i := 0
+    while i < ir_generic_specialization_keys.len():
+        key := ir_generic_specialization_keys[i]
+        if not ir_generic_emitted_specializations.contains_key(key):
+            ir_emit_generic_specialization(key)
+            ir_generic_emitted_specializations.insert(key, 1)
+        i = i + 1
+
 fn ir_collect_impl_method_signatures(node: Node):
     impl_type := ir_impl_target_type(node)
     if impl_type.len() == 0:
@@ -2770,6 +2986,8 @@ fn ir_emit_top_level_items(root_idx: Int, root: Node):
     for item_idx in ir_root_items(root_idx):
         actual_node := get_node(item_idx)
         if actual_node.kind == "fn" or actual_node.kind == "fn_decl":
+            if ir_has_generic_params(actual_node):
+                continue
             if not (ir_emit_tests and actual_node.value == "main"):
                 ir_func(item_idx)
         elif actual_node.kind == "test_decl":
@@ -2814,6 +3032,7 @@ fn ir_collect_root_type_metadata(root_idx: Int):
     ir_register_alias_structs(root_idx)
 
 fn ir_collect_root_callable_metadata(root_idx: Int):
+    ir_collect_generic_function_decls(root_idx)
     ir_collect_function_returns(root_idx)
 
     mut preload_i := 0
@@ -2827,6 +3046,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_global_bindings(root)
     ir_emit_init_globals(root)
     ir_emit_top_level_items(root_idx, root)
+    ir_emit_generic_specializations()
     ir_append_lambda_bodies()
 
 fn ir_finish_module_emit():

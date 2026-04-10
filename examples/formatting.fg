@@ -1,8 +1,11 @@
-# formatting.fg — test std.fmt number formatting
+# formatting.fg — test std.fmt number formatting and lightweight templates
 
-from std.fmt import hex, oct, bin, float_fixed
+from std.fmt import hex, oct, bin, float_fixed, format, format2, format3
 
 fn main():
+    slot := chr(123) + chr(125)
+    escaped_slots := chr(123) + chr(123) + chr(125) + chr(125)
+
     # hex
     print("hex(255) = " + hex(255))
     print("hex(0) = " + hex(0))
@@ -21,3 +24,8 @@ fn main():
     print("float_fixed(3.14159, 2) = " + float_fixed(3.14159, 2))
     print("float_fixed(1.0, 4) = " + float_fixed(1.0, 4))
     print("float_fixed(0.1 + 0.2, 1) = " + float_fixed(0.1 + 0.2, 1))
+
+    # lightweight templates
+    print(format2("pair(" + slot + ", " + slot + ")", "left", "right"))
+    print(format3(slot + " + " + slot + " = " + slot, "2", "3", "5"))
+    print(format("literal braces: " + escaped_slots + " and " + slot, ["done"]))

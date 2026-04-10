@@ -46,15 +46,23 @@ fn line_end(text: String, start: Int) -> Int:
         end = end + 1
     return text.len()
 
+fn ir_lines(text: String) -> List[String]:
+    mut lines: List[String] := []
+    mut start := 0
+    while start <= text.len():
+        end := line_end(text, start)
+        lines.push(text.substring(start, end))
+        if end >= text.len():
+            break
+        start = end + 1
+    return lines
+
 fn remove_main_from_import(ir: String) -> String:
     # imported modules can define their own main, but the combined IR should
     # only keep the root module entry point.
     mut out: List[String] := []
     mut skipping := false
-    mut start := 0
-    while start <= ir.len():
-        end := line_end(ir, start)
-        line := ir.substring(start, end)
+    for line in ir_lines(ir):
         trimmed := line.trim()
         if trimmed.starts_with("func main "):
             skipping = true
@@ -62,9 +70,6 @@ fn remove_main_from_import(ir: String) -> String:
             skipping = false
         elif not skipping:
             out.push(line)
-        if end >= ir.len():
-            break
-        start = end + 1
     return out.join(chr(10))
 
 fn collect_declared_ir_names(ir: String) -> DeclaredIrNames:
@@ -72,10 +77,7 @@ fn collect_declared_ir_names(ir: String) -> DeclaredIrNames:
     mut global_set: Map[String, Bool] := {}
     mut functions: List[String] := []
     mut function_set: Map[String, Bool] := {}
-    mut start := 0
-    while start <= ir.len():
-        end := line_end(ir, start)
-        line := ir.substring(start, end)
+    for line in ir_lines(ir):
         parts := line.split(" ")
         if parts.len() >= 2 and parts[0] == "global":
             globals.push(parts[1])
@@ -83,9 +85,6 @@ fn collect_declared_ir_names(ir: String) -> DeclaredIrNames:
         elif parts.len() >= 2 and parts[0] == "func":
             functions.push(parts[1])
             function_set.insert(parts[1], true)
-        if end >= ir.len():
-            break
-        start = end + 1
     return DeclaredIrNames(globals, global_set, functions, function_set)
 
 fn prefixed_init_name(module_index: Int) -> String:
@@ -150,28 +149,16 @@ fn rename_import_ir(ir: String, module_index: Int) -> RenamedImport:
     init_funcs := collect_import_init_funcs(declared.functions, prefix, module_index)
 
     mut out: List[String] := []
-    mut start := 0
-    while start <= trimmed_ir.len():
-        end := line_end(trimmed_ir, start)
-        line := trimmed_ir.substring(start, end)
+    for line in ir_lines(trimmed_ir):
         out.push(rewrite_prefixed_import_line(line, declared, prefix, module_index))
-        if end >= trimmed_ir.len():
-            break
-        start = end + 1
     return RenamedImport(out.join(chr(10)), declared.globals, declared.functions, init_funcs)
 
 fn collect_main_func_names(main_ir: String) -> Map[String, Bool]:
     mut func_names: Map[String, Bool] := {}
-    mut start := 0
-    while start <= main_ir.len():
-        end := line_end(main_ir, start)
-        line := main_ir.substring(start, end)
+    for line in ir_lines(main_ir):
         parts := line.split(" ")
         if parts.len() >= 2 and parts[0] == "func":
             func_names.insert(parts[1], true)
-        if end >= main_ir.len():
-            break
-        start = end + 1
     return func_names
 
 fn inject_imported_init_calls(out: List[String], imported_init_funcs: List[String]) -> List[String]:
@@ -204,30 +191,18 @@ fn rewrite_ir_with_import_maps(ir: String, global_map: Map[String, String], func
         return ir
 
     mut out: List[String] := []
-    mut start := 0
-    while start <= ir.len():
-        end := line_end(ir, start)
-        line := ir.substring(start, end)
+    for line in ir_lines(ir):
         out.push(rewrite_line_with_import_maps(line, global_map, function_map))
-        if end >= ir.len():
-            break
-        start = end + 1
     return out.join(chr(10))
 
 fn rewrite_main_ir(main_ir: String, imported_global_map: Map[String, String], imported_function_map: Map[String, String], imported_init_funcs: List[String]) -> String:
     main_func_names := collect_main_func_names(main_ir)
     mut out: List[String] := []
-    mut start := 0
-    while start <= main_ir.len():
-        end := line_end(main_ir, start)
-        line := main_ir.substring(start, end)
+    for line in ir_lines(main_ir):
         parts := line.split(" ")
         out.push(rewrite_main_line(line, main_func_names, imported_global_map, imported_function_map))
         if parts.len() >= 2 and parts[0] == "func" and parts[1] == "main":
             out = inject_imported_init_calls(out, imported_init_funcs)
-        if end >= main_ir.len():
-            break
-        start = end + 1
     return out.join(chr(10))
 
 fn builtin_retkind(name: String) -> String:
@@ -276,35 +251,23 @@ fn validate_call_retkind(line_no: Int, parts: List[String], struct_names: Map[St
 fn validate_combined_ir_contract(ir: String):
     mut func_kinds: Map[String, String] := {}
     mut struct_names: Map[String, Bool] := {}
-    mut start := 0
     mut line_no := 1
-    while start <= ir.len():
-        end := line_end(ir, start)
-        line := ir.substring(start, end)
+    for line in ir_lines(ir):
         parts := line.split(" ")
         if parts.len() >= 2 and parts[0] == "struct":
             struct_names.insert(parts[1], true)
         validate_declared_func_retkind(line_no, parts, struct_names, func_kinds)
-        if end >= ir.len():
-            break
-        start = end + 1
         line_no = line_no + 1
 
-    start = 0
     line_no = 1
-    while start <= ir.len():
-        end := line_end(ir, start)
-        line := ir.substring(start, end)
+    for line in ir_lines(ir):
         parts := line.split(" ")
         validate_call_retkind(line_no, parts, struct_names)
-        if end >= ir.len():
-            break
-        start = end + 1
         line_no = line_no + 1
     return
 
 fn is_runtime_builtin_module(module_path: String) -> Bool:
-    return module_path == "std.fmt" or module_path == "std.net.tcp" or module_path == "std.net.dns" or module_path == "std.net.url" or module_path == "std.os.path" or module_path == "std.os.process"
+    return module_path == "std.net.tcp" or module_path == "std.net.dns" or module_path == "std.net.url" or module_path == "std.os.path" or module_path == "std.os.process"
 
 fn parse_args() -> CliArgs:
     a := args()

@@ -1481,6 +1481,7 @@ fn resolve_func_name(name: &str) -> &str {
         "int_to_hex" => "forge_int_to_hex",
         "int_to_oct" => "forge_int_to_oct",
         "int_to_bin" => "forge_int_to_bin",
+        "fmt_float" => "forge_fmt_float",
         "format_int" => "forge_format_int",
         // Bitwise
         "bit_and" => "forge_bit_and",

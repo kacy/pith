@@ -832,7 +832,7 @@ fn ir_checked_index_type(idx: Int) -> String:
         return ir_type_from_tid(coll_info.inner)
     return ir_checked_type(idx)
 
-fn ir_known_callable_return_type(fname: String) -> String:
+fn ir_known_struct_return_type(fname: String) -> String:
     if ir_struct_names.contains_key(fname):
         return fname
     if fname == "get_node":
@@ -841,6 +841,9 @@ fn ir_known_callable_return_type(fname: String) -> String:
         return "Token"
     if fname == "ti_primitive" or fname == "ti_struct" or fname == "ti_enum" or fname == "ti_function" or fname == "ti_optional" or fname == "ti_result" or fname == "ti_tuple" or fname == "ti_list" or fname == "ti_map" or fname == "ti_set" or fname == "ti_task" or fname == "ti_channel" or fname == "get_type_info":
         return "TypeInfo"
+    return ""
+
+fn ir_known_scalar_return_type(fname: String) -> String:
     if FLOAT_RETURNING_FUNCS.contains(fname):
         return "float"
     if BOOL_RETURNING_FUNCS.contains(fname):
@@ -851,10 +854,25 @@ fn ir_known_callable_return_type(fname: String) -> String:
         return "string"
     if BYTES_RETURNING_FUNCS.contains(fname):
         return "bytes"
+    return ""
+
+fn ir_known_collection_return_type(fname: String) -> String:
     if LIST_RETURNING_FUNCS.contains(fname):
         return "list"
     if LIST_STRING_RETURNING_FUNCS.contains(fname):
         return "list_string"
+    return ""
+
+fn ir_known_callable_return_type(fname: String) -> String:
+    struct_type := ir_known_struct_return_type(fname)
+    if struct_type.len() > 0:
+        return struct_type
+    scalar_type := ir_known_scalar_return_type(fname)
+    if scalar_type.len() > 0:
+        return scalar_type
+    collection_type := ir_known_collection_return_type(fname)
+    if collection_type.len() > 0:
+        return collection_type
     return ir_declared_callable_return_type(fname)
 
 fn ir_field_receiver_type(recv_idx: Int) -> String:
@@ -869,6 +887,23 @@ fn ir_field_receiver_type(recv_idx: Int) -> String:
             obj_type = recv.value
     return obj_type
 
+fn ir_known_string_method_return_type(meth: String) -> String:
+    if STRING_RETURNING_METHODS.contains(meth) or meth == "to_string_utf8":
+        return "string"
+    if meth == "keys" or meth == "values" or meth == "split" or meth == "chars":
+        return "list_string"
+    return ""
+
+fn ir_known_collection_method_return_type(obj_type: String, meth: String) -> String:
+    if meth == "index_of" and (obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")):
+        return "int"
+    if meth == "slice" or meth == "sort":
+        if obj_type == "list_string":
+            return "list_string"
+        if obj_type == "list" or obj_type.starts_with("list:"):
+            return "list"
+    return ""
+
 fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
     impl_name := ir_lookup_impl_method_name(obj_type, meth)
     if impl_name.len() > 0:
@@ -877,23 +912,18 @@ fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
             return declared
     if BOOL_RETURNING_METHODS.contains(meth):
         return "bool"
-    if STRING_RETURNING_METHODS.contains(meth) or meth == "to_string_utf8":
-        return "string"
+    string_type := ir_known_string_method_return_type(meth)
+    if string_type.len() > 0:
+        return string_type
     if meth == "to_float":
         return "float"
     if meth == "len":
         return "int"
     if (meth == "slice" or meth == "concat") and obj_type == "bytes":
         return "bytes"
-    if meth == "index_of" and (obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")):
-        return "int"
-    if meth == "slice" or meth == "sort":
-        if obj_type == "list_string":
-            return "list_string"
-        if obj_type == "list" or obj_type.starts_with("list:"):
-            return "list"
-    if meth == "keys" or meth == "values" or meth == "split" or meth == "chars":
-        return "list_string"
+    collection_type := ir_known_collection_method_return_type(obj_type, meth)
+    if collection_type.len() > 0:
+        return collection_type
     return ""
 
 fn ir_literal_expr_type(node: Node, kind: String) -> String:

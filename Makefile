@@ -1,4 +1,4 @@
-.PHONY: build self-host bootstrap bootstrap-verify run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test clean
+.PHONY: build self-host bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -17,6 +17,22 @@ PARITY_EXAMPLES := \
 	matrix_math \
 	self_host_patterns \
 	wildcard_import
+
+IR_FIXED_POINT_SOURCES := \
+	examples/hello.fg \
+	examples/concurrency.fg \
+	tests/cases/test_suite.fg \
+	tests/cases/test_imported_globals_init.fg \
+	tests/cases/test_module_alias_calls.fg \
+	tests/cases/test_imported_io_methods.fg \
+	tests/cases/test_io_file_streams.fg \
+	tests/cases/test_http_request_bytes.fg \
+	tests/cases/test_http_websocket_app.fg \
+	tests/cases/test_websocket_wire.fg
+
+BOOTSTRAP_IR_REBUILD_TARGETS := \
+	self-host/forge_main.fg \
+	self-host/ir_driver.fg
 
 # --- primary build (Cranelift native backend) ---
 
@@ -40,9 +56,78 @@ bootstrap-verify: self-host
 	@$(MAKE) --no-print-directory run-examples-self-only
 	@echo "--- verifying self-hosted compiler on regression cases ---"
 	@$(MAKE) --no-print-directory run-regressions-self-only
+	@$(MAKE) --no-print-directory bootstrap-ir-checks-only
+	echo "bootstrap verified"
+
+# keep the ir hardening checks grouped so bootstrap drift is easy to spot
+bootstrap-ir-checks: self-host bootstrap-ir-checks-only
+
+bootstrap-ir-checks-only:
 	@echo "--- verifying combined ir contract ---"
 	@$(MAKE) --no-print-directory ir-contract-regressions-only
-	echo "bootstrap verified"
+	@echo "--- verifying combined ir invariants ---"
+	@$(MAKE) --no-print-directory bootstrap-ir-invariants-only
+	@echo "--- verifying ir fixed point on deterministic corpus ---"
+	@$(MAKE) --no-print-directory bootstrap-ir-fixed-point-only
+
+bootstrap-ir-invariants: self-host bootstrap-ir-invariants-only
+
+bootstrap-ir-invariants-only:
+	@echo "--- combined ir invariant checks ---"
+	@pass=0; fail=0; \
+	if timeout 15 ./self-host/ir_driver --combined tests/cases/test_imported_globals_init.fg | awk 'BEGIN { init=0 } /^func m[0-9]+___init_globals_[0-9]+(_[0-9]+)? / { init=1 } /^call 900000 m[0-9]+___init_globals_[0-9]+(_[0-9]+)? int 0/ { call=1 } END { if (init && call) exit 0; exit 1 }'; then \
+		pass=$$((pass+1)); echo "ok   imported init globals wiring"; \
+	else \
+		echo "FAIL imported init globals wiring"; fail=$$((fail+1)); \
+	fi; \
+	if timeout 15 ./self-host/ir_driver --combined examples/concurrency.fg | awk 'BEGIN { m=0; w=0; s=0 } /^call / && $$3=="Mutex" && $$4=="opaque:Mutex" { m=1 } /^call / && $$3=="WaitGroup" && $$4=="opaque:WaitGroup" { w=1 } /^call / && $$3=="Semaphore" && $$4=="opaque:Semaphore" { s=1 } END { if (m && w && s) exit 0; exit 1 }'; then \
+		pass=$$((pass+1)); echo "ok   sync primitive retkind invariants"; \
+	else \
+		echo "FAIL sync primitive retkind invariants"; fail=$$((fail+1)); \
+	fi; \
+	if timeout 15 ./self-host/ir_driver --combined tests/cases/test_websocket_wire.fg | awk 'BEGIN { ok=0 } /^call / && $$4 ~ /^struct:/ { ok=1 } /^call / && $$4 ~ /^[A-Z]/ { bad=1 } END { if (ok && !bad) exit 0; exit 1 }'; then \
+		pass=$$((pass+1)); echo "ok   explicit struct call retkinds"; \
+	else \
+		echo "FAIL explicit struct call retkinds"; fail=$$((fail+1)); \
+	fi; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "all combined ir invariant checks passed"
+
+bootstrap-ir-fixed-point: self-host bootstrap-ir-fixed-point-only
+
+bootstrap-ir-fixed-point-only:
+	@echo "--- bootstrap ir fixed point ---"
+	@tmpdir=$$(mktemp -d /tmp/forge-ir-fixed-point-XXXXXX); \
+	pass=0; fail=0; \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	if [ ! -x ./self-host/ir_driver ]; then \
+		timeout 120 ./target/release/forge build self-host/ir_driver.fg >/dev/null; \
+	fi; \
+	for target in $(BOOTSTRAP_IR_REBUILD_TARGETS); do \
+		timeout 120 ./self-host/forge_main build "$$target" >/dev/null; \
+	done; \
+	cp ./self-host/forge_main "$$tmpdir/forge_main_stage1"; \
+	cp ./self-host/ir_driver "$$tmpdir/ir_driver_stage1"; \
+	for target in $(BOOTSTRAP_IR_REBUILD_TARGETS); do \
+		timeout 120 ./self-host/forge_main build "$$target" >/dev/null; \
+	done; \
+	for src in $(IR_FIXED_POINT_SOURCES); do \
+		stage1=$$(timeout 20 "$$tmpdir/ir_driver_stage1" --combined "$$src" 2>/dev/null); \
+		stage1_status=$$?; \
+		stage2=$$(timeout 20 ./self-host/ir_driver --combined "$$src" 2>/dev/null); \
+		stage2_status=$$?; \
+		if [ $$stage1_status -eq 0 ] && [ $$stage2_status -eq 0 ] && [ "$$stage1" = "$$stage2" ]; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$src"; \
+		else \
+			echo "FAIL $$src"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi; \
+	echo "bootstrap ir fixed point verified"
 
 # --- example validation ---
 

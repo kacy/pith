@@ -2336,47 +2336,43 @@ fn ir_lookup_impl_method_name(type_name: String, method_name: String) -> String:
     return ""
 
 fn ir_collect_impl_methods(root_idx: Int):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if node.kind == "impl_decl":
+            ir_collect_impl_method_signatures(node)
+
+fn ir_root_items(root_idx: Int) -> List[Int]:
     root := get_node(root_idx)
+    mut items: List[Int] := []
     mut i := 0
     while i < root.children.len():
-        child := root.children[i]
-        mut cn := get_node(child)
-        if cn.kind == "pub" and cn.children.len() > 0:
-            cn = get_node(cn.children[0])
-        if cn.kind == "impl_decl":
-            mut impl_type := ""
-            mut j := 0
-            while j < cn.children.len():
-                ic := cn.children[j]
-                icn := get_node(ic)
-                if icn.kind == "type" and impl_type == "":
-                    impl_type = icn.value
-                elif icn.kind == "for_type":
-                    mut k := 0
-                    while k < icn.children.len():
-                        ftc := icn.children[k]
-                        ftn := get_node(ftc)
-                        if ftn.kind == "type" or ftn.kind == "generic_type":
-                            impl_type = ftn.value
-                        k = k + 1
-                elif icn.kind == "generic_type" and impl_type == "":
-                    impl_type = icn.value
-                elif icn.kind == "fn_decl" or icn.kind == "pub":
-                    mut method_idx := ic
-                    mut method_node := icn
-                    if icn.kind == "pub" and icn.children.len() > 0:
-                        method_idx = icn.children[0]
-                        method_node = get_node(method_idx)
-                    if method_node.kind == "fn_decl" and impl_type.len() > 0:
-                        method_name := method_node.value
-                        full_name := impl_type + "_" + method_name
-                        key := ir_impl_method_key(impl_type, method_name)
-                        ret_type := ir_extract_return_type(method_idx)
-                        ir_impl_methods.insert(key, full_name)
-                        ir_func_returns.insert(key, ret_type)
-                        ir_func_returns.insert(full_name, ret_type)
-                j = j + 1
+        items.push(ir_unwrap_pub_child(root.children[i]))
         i = i + 1
+    return items
+
+fn ir_is_fn_decl_kind(kind: String) -> Bool:
+    return kind == "fn" or kind == "fn_decl"
+
+fn ir_collect_impl_method_signatures(node: Node):
+    impl_type := ir_impl_target_type(node)
+    if impl_type.len() == 0:
+        return
+    mut i := 0
+    while i < node.children.len():
+        method_idx := ir_unwrap_pub_child(node.children[i])
+        method_node := get_node(method_idx)
+        if ir_is_fn_decl_kind(method_node.kind):
+            ir_record_impl_method_signature(impl_type, method_idx, method_node)
+        i = i + 1
+
+fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_node: Node):
+    method_name := method_node.value
+    full_name := impl_type + "_" + method_name
+    key := ir_impl_method_key(impl_type, method_name)
+    ret_type := ir_extract_return_type(method_idx)
+    ir_impl_methods.insert(key, full_name)
+    ir_func_returns.insert(key, ret_type)
+    ir_func_returns.insert(full_name, ret_type)
 
 fn ir_emit_default_return():
     dr := ir_reg()
@@ -2400,19 +2396,10 @@ fn ir_finish_func_emission(body_idx: Int):
     ir_emit_default_return()
 
 fn ir_collect_test_decls(root_idx: Int) -> List[Int]:
-    root := get_node(root_idx)
     mut tests: List[Int] := []
-    mut i := 0
-    while i < root.children.len():
-        child := root.children[i]
-        mut cn := get_node(child)
-        mut actual := child
-        if cn.kind == "pub" and cn.children.len() > 0:
-            actual = cn.children[0]
-            cn = get_node(actual)
-        if cn.kind == "test_decl":
-            tests.push(actual)
-        i = i + 1
+    for item_idx in ir_root_items(root_idx):
+        if get_node(item_idx).kind == "test_decl":
+            tests.push(item_idx)
     return tests
 
 fn ir_emit_test_func(idx: Int, ordinal: Int):
@@ -2523,23 +2510,16 @@ fn ir_collect_imports(root_idx: Int):
 
 fn ir_collect_type_aliases(root_idx: Int):
     ir_type_aliases = {}
-    root := get_node(root_idx)
-    mut i := 0
-    while i < root.children.len():
-        child := root.children[i]
-        cn := get_node(child)
+    for item_idx in ir_root_items(root_idx):
+        cn := get_node(item_idx)
         if cn.kind == "type_alias":
             target := ir_type_alias_target(cn)
             if target.len() > 0:
                 ir_type_aliases.insert(cn.value, target)
-        i = i + 1
 
 fn ir_register_alias_structs(root_idx: Int):
-    root := get_node(root_idx)
-    mut i := 0
-    while i < root.children.len():
-        child := root.children[i]
-        cn := get_node(child)
+    for item_idx in ir_root_items(root_idx):
+        cn := get_node(item_idx)
         if cn.kind == "type_alias":
             aname := cn.value
             if ir_type_aliases.contains_key(aname):
@@ -2547,29 +2527,30 @@ fn ir_register_alias_structs(root_idx: Int):
                 if ir_struct_names.contains_key(target):
                     ir_struct_names.insert(aname, ir_struct_names[target])
                     ir_emit("struct_alias " + aname + " " + target)
-        i = i + 1
 
 fn ir_collect_function_returns(root_idx: Int):
     ir_func_returns = {}
-    root := get_node(root_idx)
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if ir_is_fn_decl_kind(node.kind):
+            ir_record_function_return(node)
+
+fn ir_record_function_return(node: Node):
     mut i := 0
-    while i < root.children.len():
-        child := root.children[i]
-        cn := ir_unwrap_pub_node(child)
-        if cn.kind == "fn" or cn.kind == "fn_decl":
-            mut j := 0
-            while j < cn.children.len():
-                fc := cn.children[j]
-                fcn := get_node(fc)
-                if fcn.kind == "returns":
-                    mut k := 0
-                    while k < fcn.children.len():
-                        rc := fcn.children[k]
-                        rn := get_node(rc)
-                        if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type":
-                            ir_func_returns.insert(cn.value, ir_resolve_type_node(rc))
-                        k = k + 1
-                j = j + 1
+    while i < node.children.len():
+        returns_idx := node.children[i]
+        returns_node := get_node(returns_idx)
+        if returns_node.kind == "returns":
+            ir_record_returns_clause(node.value, returns_node)
+        i = i + 1
+
+fn ir_record_returns_clause(name: String, returns_node: Node):
+    mut i := 0
+    while i < returns_node.children.len():
+        type_idx := returns_node.children[i]
+        type_node := get_node(type_idx)
+        if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "result_type":
+            ir_func_returns.insert(name, ir_resolve_type_node(type_idx))
         i = i + 1
 
 fn ir_emit_global_binding(node: Node):
@@ -2685,23 +2666,19 @@ fn ir_emit_init_globals(root: Node):
     ir_emit("endfunc")
 
 fn ir_emit_top_level_items(root_idx: Int, root: Node):
-    mut i := 0
     mut test_ord := 0
-    while i < root.children.len():
-        child := root.children[i]
-        actual := ir_unwrap_pub_child(child)
-        actual_node := get_node(actual)
+    for item_idx in ir_root_items(root_idx):
+        actual_node := get_node(item_idx)
         if actual_node.kind == "fn" or actual_node.kind == "fn_decl":
             if not (ir_emit_tests and actual_node.value == "main"):
-                ir_func(actual)
+                ir_func(item_idx)
         elif actual_node.kind == "test_decl":
             if ir_emit_tests:
-                ir_emit_test_func(actual, test_ord)
+                ir_emit_test_func(item_idx, test_ord)
                 test_ord = test_ord + 1
         elif actual_node.kind == "impl_decl":
             impl_type := ir_impl_target_type(actual_node)
             ir_emit_impl_methods(actual_node, impl_type)
-        i = i + 1
     if ir_emit_tests:
         ir_emit_test_main(root_idx)
 

@@ -45,6 +45,12 @@ make bootstrap
 4. validate the bootstrap and self-hosted paths for compiler changes
 5. prefer small helpers and explicit ownership over long inline flows
 
+## example style
+
+- prefer interpolation for direct value printing: `print("count: {items.len()}")`
+- use `std.fmt` when you need a reusable template or literal braces
+- avoid long chains of `"..." + value.to_string()` in user-facing examples unless interpolation would be awkward
+
 ## where to work
 
 - CLI and bootstrap orchestration: `bootstrap/main.zig`, `bootstrap/cli/`, `bootstrap/pipeline.zig`

@@ -51,6 +51,14 @@ common starting points:
 - add type rules: `self-host/checker.fg`
 - native code generation: `cranelift/codegen/src/ir_consumer.rs`
 
+for example-facing output, prefer interpolation for direct value printing:
+
+```fg
+print("count: {items.len()}")
+```
+
+use `std.fmt` when you need a reusable template or literal braces.
+
 ## what it looks like
 
 ```

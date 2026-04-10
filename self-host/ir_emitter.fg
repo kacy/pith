@@ -1117,14 +1117,101 @@ fn ir_method_receiver_type(node: Node) -> String:
         return checked
     return ir_infer_type(node.children[0])
 
+fn ir_method_string_emit_name(mname: String) -> String:
+    if mname == "len":
+        return "string_len"
+    if mname == "is_empty":
+        return "string_is_empty"
+    return mname
+
+fn ir_method_bytes_emit_name(mname: String) -> String:
+    if mname == "len":
+        return "bytes_len"
+    if mname == "is_empty":
+        return "bytes_is_empty"
+    if mname == "slice":
+        return "bytes_slice"
+    if mname == "concat":
+        return "bytes_concat"
+    if mname == "to_string_utf8":
+        return "bytes_to_string_utf8"
+    return mname
+
+fn ir_method_list_emit_name(mname: String, obj_type: String) -> String:
+    if mname == "len":
+        return "forge_list_len"
+    if mname == "contains":
+        if obj_type == "list_string":
+            return "list_contains_string"
+        return "list_contains"
+    if mname == "index_of":
+        if obj_type == "list_string":
+            return "list_index_of_string"
+        return "list_index_of"
+    if mname == "join":
+        return "list_join"
+    if mname == "sort" and obj_type == "list_string":
+        return "sort_strings"
+    if mname == "reverse":
+        return "list_reverse"
+    if mname == "is_empty":
+        return "list_is_empty"
+    if mname == "clear":
+        return "list_clear"
+    return mname
+
+fn ir_method_map_emit_name(mname: String, obj_type: String) -> String:
+    obj_is_map_int := obj_type == "map_int"
+    if mname == "len":
+        return "map_len"
+    if mname == "is_empty":
+        return "map_is_empty"
+    if mname == "clear":
+        return "map_clear"
+    if mname == "keys":
+        return "map_keys"
+    if mname == "values":
+        return "map_values"
+    if mname == "contains_key" and obj_is_map_int:
+        return "map_contains_ikey"
+    if mname == "insert":
+        if obj_is_map_int:
+            return "map_insert_ikey"
+        return "map_insert"
+    if mname == "remove":
+        if obj_is_map_int:
+            return "map_remove_ikey"
+        return "map_remove"
+    return mname
+
+fn ir_method_set_emit_name(mname: String, obj_type: String) -> String:
+    obj_is_set_int := obj_type == "set_int"
+    if mname == "len":
+        return "set_len"
+    if mname == "add":
+        if obj_is_set_int:
+            return "set_add_int"
+        return "set_add"
+    if mname == "contains":
+        if obj_is_set_int:
+            return "set_contains_int"
+        return "set_contains"
+    if mname == "is_empty":
+        return "set_is_empty"
+    if mname == "clear":
+        return "set_clear"
+    if mname == "remove":
+        if obj_is_set_int:
+            return "set_remove_int"
+        return "set_remove"
+    return mname
+
 fn ir_method_emit_name(mname: String, obj_type: String) -> String:
     obj_is_string := obj_type == "string"
     obj_is_bytes := obj_type == "bytes"
     obj_is_bool := obj_type == "bool"
     obj_is_float := obj_type == "float"
     obj_is_map := obj_type == "map" or obj_type == "map_int"
-    obj_is_map_int := obj_type == "map_int"
-    obj_is_set_int := obj_type == "set_int"
     obj_is_set := obj_type == "set" or obj_type == "set_int"
     obj_is_list := obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
 
@@ -1138,90 +1225,16 @@ fn ir_method_emit_name(mname: String, obj_type: String) -> String:
             emit_name = "identity"
         elif obj_type == "":
             emit_name = "smart_to_string"
-    elif mname == "len":
-        if obj_is_string:
-            emit_name = "string_len"
-        elif obj_is_bytes:
-            emit_name = "bytes_len"
-        elif obj_is_list:
-            emit_name = "forge_list_len"
-        elif obj_is_map:
-            emit_name = "map_len"
-        elif obj_is_set:
-            emit_name = "set_len"
-    elif mname == "contains":
-        if obj_type == "list_string":
-            emit_name = "list_contains_string"
-        elif obj_is_list:
-            emit_name = "list_contains"
-        elif obj_is_set_int:
-            emit_name = "set_contains_int"
-        elif obj_is_set:
-            emit_name = "set_contains"
-    elif mname == "index_of":
-        if obj_type == "list_string":
-            emit_name = "list_index_of_string"
-        elif obj_is_list:
-            emit_name = "list_index_of"
-    elif mname == "join" and obj_is_list:
-        emit_name = "list_join"
-    elif mname == "sort":
-        if obj_type == "list_string":
-            emit_name = "sort_strings"
-    elif mname == "reverse":
-        if obj_is_list:
-            emit_name = "list_reverse"
-    elif mname == "add":
-        if obj_is_set_int:
-            emit_name = "set_add_int"
-        elif obj_is_set:
-            emit_name = "set_add"
-    elif mname == "is_empty":
-        if obj_is_string:
-            emit_name = "string_is_empty"
-        elif obj_is_bytes:
-            emit_name = "bytes_is_empty"
-        elif obj_is_list:
-            emit_name = "list_is_empty"
-        elif obj_is_map:
-            emit_name = "map_is_empty"
-        elif obj_is_set:
-            emit_name = "set_is_empty"
-    elif mname == "clear":
-        if obj_is_list:
-            emit_name = "list_clear"
-        elif obj_is_map:
-            emit_name = "map_clear"
-        elif obj_is_set:
-            emit_name = "set_clear"
-    elif mname == "remove":
-        if obj_is_map_int:
-            emit_name = "map_remove_ikey"
-        elif obj_is_map:
-            emit_name = "map_remove"
-        elif obj_is_set_int:
-            emit_name = "set_remove_int"
-        elif obj_is_set:
-            emit_name = "set_remove"
-    elif mname == "keys":
-        if obj_is_map:
-            emit_name = "map_keys"
-    elif mname == "values":
-        if obj_is_map:
-            emit_name = "map_values"
-    elif mname == "contains_key" and obj_is_map_int:
-        emit_name = "map_contains_ikey"
-    elif mname == "insert":
-        if obj_is_map_int:
-            emit_name = "map_insert_ikey"
-        elif obj_is_map:
-            emit_name = "map_insert"
-    elif mname == "slice" and obj_is_bytes:
-        emit_name = "bytes_slice"
-    elif mname == "concat" and obj_is_bytes:
-        emit_name = "bytes_concat"
-    elif mname == "to_string_utf8" and obj_is_bytes:
-        emit_name = "bytes_to_string_utf8"
+    elif obj_is_string:
+        emit_name = ir_method_string_emit_name(mname)
+    elif obj_is_bytes:
+        emit_name = ir_method_bytes_emit_name(mname)
+    elif obj_is_list:
+        emit_name = ir_method_list_emit_name(mname, obj_type)
+    elif obj_is_map:
+        emit_name = ir_method_map_emit_name(mname, obj_type)
+    elif obj_is_set:
+        emit_name = ir_method_set_emit_name(mname, obj_type)
     return emit_name
 
 fn ir_collect_method_call_regs(node: Node) -> List[Int]:
@@ -1387,6 +1400,54 @@ fn ir_emit_binary_expr(node: Node) -> Int:
         ir_emit("binop " + r.to_string() + " " + op + " " + left_r.to_string() + " " + right_r.to_string())
     return r
 
+fn ir_test_assert_fail():
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    exit_r := ir_reg()
+    ir_emit_call1(exit_r, "exit", "unknown", one_r)
+
+fn ir_assert_eq_operand_type(node: Node, child_idx: Int) -> String:
+    if node.children.len() <= child_idx:
+        return ""
+    mut expr_idx := node.children[child_idx]
+    child_node := get_node(expr_idx)
+    if child_node.kind == "arg" and child_node.children.len() > 0:
+        expr_idx = child_node.children[0]
+    return ir_infer_type(expr_idx)
+
+fn ir_emit_test_assert(arg_regs: List[Int]) -> Int:
+    ok_l := ir_label()
+    fail_l := ir_label()
+    ir_emit("brif " + arg_regs[0].to_string() + " " + ok_l + " " + fail_l)
+    ir_emit("label " + fail_l)
+    assert_r := ir_reg()
+    ir_emit_call1(assert_r, "assert", "unknown", arg_regs[0])
+    ir_test_assert_fail()
+    ir_emit("label " + ok_l)
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " 0")
+    return r
+
+fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int]) -> Int:
+    cmp_r := ir_reg()
+    left_type := ir_assert_eq_operand_type(node, 1)
+    right_type := ir_assert_eq_operand_type(node, 2)
+    if left_type == "string" or right_type == "string":
+        ir_emit_call2(cmp_r, "__str_eq", "bool", arg_regs[0], arg_regs[1])
+    else:
+        ir_emit_simple_binary(cmp_r, "eq", arg_regs[0], arg_regs[1])
+    ok_l := ir_label()
+    fail_l := ir_label()
+    ir_emit("brif " + cmp_r.to_string() + " " + ok_l + " " + fail_l)
+    ir_emit("label " + fail_l)
+    fail_r := ir_reg()
+    ir_emit_call2(fail_r, "assert_eq", "unknown", arg_regs[0], arg_regs[1])
+    ir_test_assert_fail()
+    ir_emit("label " + ok_l)
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " 0")
+    return r
+
 fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     mut callee := ResolvedCallee("unknown", false)
     if node.children.len() > 0:
@@ -1396,54 +1457,9 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     arg_regs := ir_collect_call_arg_regs(node, 1)
 
     if ir_emit_tests and callee.name == "assert" and arg_regs.len() >= 1:
-        ok_l := ir_label()
-        fail_l := ir_label()
-        ir_emit("brif " + arg_regs[0].to_string() + " " + ok_l + " " + fail_l)
-        ir_emit("label " + fail_l)
-        assert_r := ir_reg()
-        ir_emit_call1(assert_r, "assert", "unknown", arg_regs[0])
-        one_r := ir_reg()
-        ir_emit("iconst " + one_r.to_string() + " 1")
-        exit_r := ir_reg()
-        ir_emit_call1(exit_r, "exit", "unknown", one_r)
-        ir_emit("label " + ok_l)
-        r := ir_reg()
-        ir_emit("iconst " + r.to_string() + " 0")
-        return r
+        return ir_emit_test_assert(arg_regs)
     if ir_emit_tests and callee.name == "assert_eq" and arg_regs.len() >= 2:
-        cmp_r := ir_reg()
-        mut left_type := ""
-        mut right_type := ""
-        if node.children.len() > 1:
-            mut left_idx := node.children[1]
-            left_node := get_node(left_idx)
-            if left_node.kind == "arg" and left_node.children.len() > 0:
-                left_idx = left_node.children[0]
-            left_type = ir_infer_type(left_idx)
-        if node.children.len() > 2:
-            mut right_idx := node.children[2]
-            right_node := get_node(right_idx)
-            if right_node.kind == "arg" and right_node.children.len() > 0:
-                right_idx = right_node.children[0]
-            right_type = ir_infer_type(right_idx)
-        if left_type == "string" or right_type == "string":
-            ir_emit_call2(cmp_r, "__str_eq", "bool", arg_regs[0], arg_regs[1])
-        else:
-            ir_emit("eq " + cmp_r.to_string() + " " + arg_regs[0].to_string() + " " + arg_regs[1].to_string())
-        ok_l := ir_label()
-        fail_l := ir_label()
-        ir_emit("brif " + cmp_r.to_string() + " " + ok_l + " " + fail_l)
-        ir_emit("label " + fail_l)
-        fail_r := ir_reg()
-        ir_emit_call2(fail_r, "assert_eq", "unknown", arg_regs[0], arg_regs[1])
-        one_r := ir_reg()
-        ir_emit("iconst " + one_r.to_string() + " 1")
-        exit_r := ir_reg()
-        ir_emit_call1(exit_r, "exit", "unknown", one_r)
-        ir_emit("label " + ok_l)
-        r := ir_reg()
-        ir_emit("iconst " + r.to_string() + " 0")
-        return r
+        return ir_emit_test_assert_eq(node, arg_regs)
 
     r := ir_reg()
     ir_emit_resolved_call(r, callee.name, idx, arg_regs, ir_callee_uses_result_abi(callee, idx))

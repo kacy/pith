@@ -54,6 +54,8 @@ make bootstrap
 - prefer `std.testing.assert_eq(...)` / `assert_ne(...)` for straightforward test comparisons
 - prefer `std.os.process.command(...)` for child processes; use `std.io` when you specifically need lower-level stream types
 - remember that collections are shared handles; reach for `std.collections.copy_list(...)`, `copy_map(...)`, or `copy_set(...)` when an example wants an independent top-level container
+- prefer typed results like `T!E` when callers need to inspect the error payload; keep bare `T!` for simpler string-error paths
+- use `catch`, `unwrap_or(...)`, and `or_else(...)` in examples when they make recovery intent clearer than manual `is_err` branching
 
 ## where to work
 

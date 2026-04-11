@@ -121,7 +121,7 @@ output via the Cranelift native backend.
 - collection literals: List, Map, Set with index expressions
 - generics with monomorphization
 - lambdas and closures (capturing lambdas with uniform closure ABI)
-- result types (`T!`) with try propagation (`expr!`) and `fail`
+- result types (`T!` and `T!E`) with try propagation (`expr!`), `fail`, `catch`, `unwrap_or`, and `or_else`
 - optional types (`T?`)
 - tuples with field access (`t.0`, `t.1`)
 - type aliases
@@ -140,6 +140,28 @@ output via the Cranelift native backend.
 
 for child processes, prefer `std.os.process.command(...)` and the structured
 `run` / `output` / `start` flow. keep `std.io` for low-level stream work.
+
+result types can carry either plain string errors or structured typed errors.
+use bare `T!` when a string error is enough, and use `T!E` when callers need
+to inspect the error payload.
+
+```fg
+struct ParseError:
+    message: String
+
+fn parse_port(text: String) -> Int!ParseError:
+    if text == "":
+        fail ParseError{"empty"}
+    return 8080
+
+fn require_port(text: String) -> Int!ParseError:
+    return parse_port(text)!
+
+fn main() -> Int!:
+    print((require_port("8080") catch 9000).to_string())
+    print((parse_port("") catch 9000).to_string())
+    return 0
+```
 
 **memory management:**
 - complete automatic reference counting (ARC) for all heap-allocated types

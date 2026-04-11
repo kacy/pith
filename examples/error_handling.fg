@@ -1,16 +1,41 @@
-# result types and error handling
+# result types and typed errors
 
+struct ParseError:
+    message: String
+
+struct AppError:
+    message: String
+
+# bare `T!` still means `T!String`
 fn divide(a: Int, b: Int) -> Int!:
     if b == 0:
         fail "division by zero"
     return a / b
 
-# try propagation: use ! to unwrap result, propagating errors to caller
-fn half_divide(a: Int, b: Int) -> Int!:
-    result := divide(a, b)!
-    return result / 2
+fn parse_port(text: String) -> Int!ParseError:
+    if text.len() == 0:
+        fail ParseError{"empty"}
+    if text == "8080":
+        return 8080
+    fail ParseError{"invalid port"}
 
-fn main():
-    result := divide(10, 2)
-    answer := half_divide(20, 4)
-    print("error handling works")
+fn require_port(text: String) -> Int!ParseError:
+    return parse_port(text)!
+
+fn wrap_parse_error(err: ParseError) -> Int!AppError:
+    fail AppError{"config: " + err.message}
+
+fn main() -> Int!:
+    print(divide(10, 2).unwrap_or(0).to_string())
+    print((divide(10, 0) catch 99).to_string())
+
+    print((require_port("8080") catch 0).to_string())
+
+    bad := parse_port("nope")
+    print(bad.is_err.to_string())
+    print(bad.err.message)
+
+    wrapped := parse_port("nope").or_else(wrap_parse_error)
+    print(wrapped.is_err.to_string())
+    print(wrapped.err.message)
+    return 0

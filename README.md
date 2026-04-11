@@ -65,6 +65,10 @@ concatenation loops.
 for test-style comparisons in stdlib examples and helper programs, prefer
 `std.testing.assert_eq(...)` and `assert_ne(...)`.
 
+collections are shared handles by default. if you want a separate top-level
+container before mutating it, use helpers like `std.collections.copy_list(...)`,
+`copy_map(...)`, or `copy_set(...)`.
+
 ## what it looks like
 
 ```

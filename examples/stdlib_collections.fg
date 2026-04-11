@@ -1,5 +1,16 @@
 # stdlib collection utilities via import
 from std.collections import range, sum, max_of, min_of, reversed
+from std.collections import copy_list, group_by, count_by, set_union
+
+struct Player:
+    pub name: String
+    pub team: String
+
+fn names_of(players: List[Player]) -> String:
+    mut names: List[String] := []
+    for player in players:
+        names.push(player.name)
+    return names.join(", ")
 
 fn main():
     r := range(1, 6)
@@ -20,4 +31,23 @@ fn main():
         rev_strs.push(rev[i].to_string())
         i = i + 1
     print("reversed: " + rev_strs.join(", "))
+
+    nums_copy := copy_list(r)
+    nums_copy.push(6)
+    print("copy_list keeps original: {r.len()}->{nums_copy.len()}")
+
+    mut players: List[Player] := []
+    players.push(Player("alice", "red"))
+    players.push(Player("bob", "blue"))
+    players.push(Player("carol", "red"))
+    by_team := group_by(players, fn(player: Player) => player.team)
+    red_players := by_team["red"]
+    print("group_by red: " + names_of(red_players))
+
+    counts := count_by(players, fn(player: Player) => player.team)
+    blue_count := counts["blue"]
+    print("count_by blue: {blue_count}")
+
+    merged := set_union({"red", "blue"}, {"blue", "green"})
+    print("set_union size: {merged.len()}")
     print("stdlib collections work")

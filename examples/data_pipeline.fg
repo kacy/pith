@@ -1,6 +1,8 @@
 # data pipeline — transform, filter, aggregate over structured data
 # exercises: structs, lists, maps, lambdas, closures, string methods, for loops
 
+import std.io as io
+
 struct Record:
     name: String
     category: String
@@ -57,22 +59,25 @@ fn count_by_category(records: List[Record]) -> Map[String, Int]:
         i = i + 1
     return counts
 
-fn names_list(records: List[Record]) -> String:
-    mut names: List[String] := []
+fn names_list(records: List[Record]) -> String!:
+    out := io.string_buffer()
     mut i := 0
     while i < records.len():
-        names.push(records[i].name)
+        if i > 0:
+            out.write(", ")!
+        out.write(records[i].name)!
         i = i + 1
-    return names.join(", ")
+    return out.string()
 
-fn main():
+fn main() -> String!:
     records := make_records()
     print("total records: {records.len()}")
 
     # filter
     eng := filter_by_category(records, "engineering")
+    eng_names := names_list(eng)!
     print("engineering count: {eng.len()}")
-    print("engineering names: {names_list(eng)}")
+    print("engineering names: {eng_names}")
 
     # aggregate
     print("engineering avg: {average_score(eng)}")
@@ -94,3 +99,4 @@ fn main():
     print("overall best: {overall_best.name} ({overall_best.score})")
 
     print("pipeline works")
+    return ""

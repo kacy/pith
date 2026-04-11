@@ -323,7 +323,12 @@ fn parse_and_check(path: String) -> ParsedModule!:
     return ParsedModule(root, import_roots)
 
 fn configure_emitter(import_roots: List[Int], emit_tests: Bool):
-    set_import_roots(import_roots)
+    mut import_paths: List[String] := []
+    mut i := 0
+    while i < import_roots.len():
+        import_paths.push(get_resolved_module_path(import_roots[i]))
+        i = i + 1
+    set_import_roots(import_roots, import_paths)
     set_test_mode(emit_tests)
 
 fn emit_module_ir(root: Int, import_roots: List[Int], emit_tests: Bool) -> String:

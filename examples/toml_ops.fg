@@ -1,21 +1,25 @@
 # toml parsing
 import std.toml as toml
 import std.fs as fs
+import std.io as io
 
 fn main() -> String!:
     path := "/tmp/forge_toml_ops.toml"
 
     # build a TOML document
     newline := chr(10)
-    mut doc := "title = " + chr(34) + "forge" + chr(34) + newline
-    doc = doc + "version = 42" + newline
-    doc = doc + "pi = 3.14" + newline
-    doc = doc + "enabled = true" + newline
-    doc = doc + "tags = [" + chr(34) + "lang" + chr(34) + ", " + chr(34) + "fast" + chr(34) + "]" + newline
-    doc = doc + newline
-    doc = doc + "[server]" + newline
-    doc = doc + "host = " + chr(34) + "localhost" + chr(34) + newline
-    doc = doc + "port = 8080" + newline
+    quote := chr(34)
+    doc_buf := io.string_buffer()
+    doc_buf.write("title = " + quote + "forge" + quote + newline)!
+    doc_buf.write("version = 42" + newline)!
+    doc_buf.write("pi = 3.14" + newline)!
+    doc_buf.write("enabled = true" + newline)!
+    doc_buf.write("tags = [" + quote + "lang" + quote + ", " + quote + "fast" + quote + "]" + newline)!
+    doc_buf.newline()!
+    doc_buf.write("[server]" + newline)!
+    doc_buf.write("host = " + quote + "localhost" + quote + newline)!
+    doc_buf.write("port = 8080" + newline)!
+    doc := doc_buf.string()
 
     root := toml.parse(doc)
     print("type: " + toml.type_of(root))

@@ -21,7 +21,8 @@ mut string_reader_data: Map[Int, String] := {}
 mut string_reader_offsets: Map[Int, Int] := {}
 
 mut next_string_buffer_handle: Int := 1
-mut string_buffer_data: Map[Int, String] := {}
+mut string_buffer_parts: Map[Int, List[String]] := {}
+mut string_buffer_lengths: Map[Int, Int] := {}
 
 mut next_bytes_reader_handle: Int := 1
 mut bytes_reader_data: Map[Int, Bytes] := {}
@@ -192,8 +193,20 @@ impl StringBuffer:
     fn write_all(data: String) -> Int!:
         return write_all(self, data)
 
+    fn write_line(data: String) -> Int!:
+        return string_buffer_write_line(self, data)
+
+    fn newline() -> Int!:
+        return string_buffer_write(self, chr(10))
+
     fn string() -> String:
         return string_buffer_string(self)
+
+    fn len() -> Int:
+        return string_buffer_len(self)
+
+    fn is_empty() -> Bool:
+        return string_buffer_len(self) == 0
 
     fn clear():
         string_buffer_clear(self)
@@ -448,13 +461,63 @@ fn kill_process(process: Process) -> Bool:
 fn close_process(process: Process):
     process_close(process.handle)
 
+fn empty_string_parts() -> List[String]:
+    mut parts: List[String] := []
+    return parts
+
+fn string_buffer_chunks(buf: StringBuffer) -> List[String]:
+    if string_buffer_parts.contains_key(buf.handle):
+        return string_buffer_parts[buf.handle]
+    return empty_string_parts()
+
+fn string_buffer_len(buf: StringBuffer) -> Int:
+    if string_buffer_lengths.contains_key(buf.handle):
+        return string_buffer_lengths[buf.handle]
+    return 0
+
 fn string_buffer_string(buf: StringBuffer) -> String:
-    if string_buffer_data.contains_key(buf.handle):
-        return string_buffer_data[buf.handle]
-    return ""
+    parts := string_buffer_chunks(buf)
+    if parts.len() == 0:
+        return ""
+    if parts.len() == 1:
+        return parts[0]
+    return parts.join("")
+
+fn string_buffer_write_line(buf: StringBuffer, data: String) -> Int!:
+    wrote := string_buffer_write_internal(buf, data)
+    if wrote.is_err:
+        return wrote
+    wrote_nl := string_buffer_write_internal(buf, chr(10))
+    if wrote_nl.is_err:
+        return wrote_nl
+    return wrote.ok + wrote_nl.ok
+
+fn string_buffer_reset(buf: StringBuffer):
+    string_buffer_parts.insert(buf.handle, empty_string_parts())
+    string_buffer_lengths.insert(buf.handle, 0)
+
+fn string_buffer_append_chunk(buf: StringBuffer, data: String):
+    parts := string_buffer_chunks(buf)
+    parts.push(data)
+    string_buffer_parts.insert(buf.handle, parts)
+    string_buffer_lengths.insert(buf.handle, string_buffer_len(buf) + data.len())
+
+fn string_buffer_compact(buf: StringBuffer):
+    parts := string_buffer_chunks(buf)
+    if parts.len() <= 1:
+        return
+    joined := parts.join("")
+    mut compacted: List[String] := []
+    compacted.push(joined)
+    string_buffer_parts.insert(buf.handle, compacted)
+    string_buffer_lengths.insert(buf.handle, joined.len())
+
+fn string_buffer_maybe_compact(buf: StringBuffer):
+    if string_buffer_chunks(buf).len() >= 32:
+        string_buffer_compact(buf)
 
 fn string_buffer_clear(buf: StringBuffer):
-    string_buffer_data.insert(buf.handle, "")
+    string_buffer_reset(buf)
 
 fn string_reader_read(reader: StringReader, max_bytes: Int) -> String!:
     return string_reader_read_internal(reader, max_bytes)
@@ -642,7 +705,8 @@ fn allocate_string_reader_handle(data: String) -> Int:
 fn allocate_string_buffer_handle() -> Int:
     handle := next_string_buffer_handle
     next_string_buffer_handle = next_string_buffer_handle + 1
-    string_buffer_data.insert(handle, "")
+    string_buffer_parts.insert(handle, empty_string_parts())
+    string_buffer_lengths.insert(handle, 0)
     return handle
 
 fn allocate_bytes_reader_handle(data: Bytes) -> Int:
@@ -934,10 +998,10 @@ fn string_reader_read_internal(reader: StringReader, max_bytes: Int) -> String!:
     return chunk
 
 fn string_buffer_write_internal(buf: StringBuffer, data: String) -> Int!:
-    mut current := ""
-    if string_buffer_data.contains_key(buf.handle):
-        current = string_buffer_data[buf.handle]
-    string_buffer_data.insert(buf.handle, current + data)
+    if data.len() == 0:
+        return 0
+    string_buffer_append_chunk(buf, data)
+    string_buffer_maybe_compact(buf)
     return data.len()
 
 fn bytes_after_write(data: Bytes, wrote: Int) -> Bytes:

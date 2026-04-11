@@ -88,6 +88,7 @@ mut ir_import_renames: Map[String, String] := {}
 mut ir_module_aliases: Map[String, String] := {}
 mut ir_current_func_return_kind := ""
 mut ir_preloaded_import_roots: List[Int] := []
+mut ir_preloaded_import_paths: List[String] := []
 mut ir_emit_tests := false
 mut ir_generic_decl_indices: Map[String, Int] := {}
 mut ir_generic_specialization_keys: List[String] := []
@@ -95,8 +96,9 @@ mut ir_generic_specialization_names: Map[String, String] := {}
 mut ir_generic_specialization_type_lists: Map[String, String] := {}
 mut ir_generic_emitted_specializations: Map[String, Int] := {}
 
-pub fn set_import_roots(roots: List[Int]):
+pub fn set_import_roots(roots: List[Int], paths: List[String]):
     ir_preloaded_import_roots = roots
+    ir_preloaded_import_paths = paths
 
 pub fn set_test_mode(enabled: Bool):
     ir_emit_tests = enabled
@@ -1458,7 +1460,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         callee = ir_resolve_static_callee(node.children[0])
         if callee.name.len() == 0:
             callee = ResolvedCallee("unknown", false)
-    if not callee.imported and ir_is_generic_function_name(callee.name):
+    if ir_is_generic_function_name(callee.name):
         mut generic_ret_type := ir_checked_type(idx)
         if generic_ret_type.len() == 0:
             generic_ret_type = ir_infer_type(idx)
@@ -2512,12 +2514,22 @@ fn ir_generic_specialization_name(name: String, type_names: List[String]) -> Str
         i = i + 1
     return name + "__" + suffix_parts.join("_")
 
-fn ir_collect_generic_function_decls(root_idx: Int):
-    ir_generic_decl_indices = {}
+fn ir_collect_generic_function_decls_from_root(root_idx: Int, module_path: String):
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
         if ir_is_fn_decl_kind(node.kind) and ir_has_generic_params(node):
-            ir_generic_decl_indices.insert(node.value, item_idx)
+            ir_generic_decl_indices.insert(ir_import_target_name(module_path, node.value), item_idx)
+
+fn ir_collect_generic_function_decls(root_idx: Int):
+    ir_generic_decl_indices = {}
+    mut preload_i := 0
+    while preload_i < ir_preloaded_import_roots.len():
+        mut module_path := ""
+        if preload_i < ir_preloaded_import_paths.len():
+            module_path = ir_preloaded_import_paths[preload_i]
+        ir_collect_generic_function_decls_from_root(ir_preloaded_import_roots[preload_i], module_path)
+        preload_i = preload_i + 1
+    ir_collect_generic_function_decls_from_root(root_idx, "")
 
 fn ir_is_generic_function_name(name: String) -> Bool:
     return ir_generic_decl_indices.contains_key(name)
@@ -3046,6 +3058,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
 fn ir_finish_module_emit():
     ir_module_count = ir_module_count + 1
     ir_preloaded_import_roots = []
+    ir_preloaded_import_paths = []
     ir_emit_tests = false
 
 # --- main entry ---
@@ -3053,6 +3066,10 @@ pub fn emit_ir(root_idx: Int) -> String:
     ir_reset()
 
     root := get_node(root_idx)
+    mut preload_i := 0
+    while preload_i < ir_preloaded_import_roots.len():
+        ir_collect_strings(ir_preloaded_import_roots[preload_i])
+        preload_i = preload_i + 1
     ir_collect_strings(root_idx)
     ir_emit_string_table()
 

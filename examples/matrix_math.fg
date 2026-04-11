@@ -1,6 +1,8 @@
 # matrix math — 2D matrix operations using flat lists
 # exercises: index arithmetic, nested loops, function composition
 
+import std.io as io
+
 fn mat_get(data: List[Int], cols: Int, r: Int, c: Int) -> Int:
     return data[r * cols + c]
 
@@ -39,18 +41,20 @@ fn mat_transpose(data: List[Int], rows: Int, cols: Int) -> List[Int]:
         c = c + 1
     return result
 
-fn mat_to_string(data: List[Int], rows: Int, cols: Int) -> String:
-    mut row_strs: List[String] := []
+fn mat_to_string(data: List[Int], rows: Int, cols: Int) -> String!:
+    out := io.string_buffer()
     mut r := 0
     while r < rows:
-        mut vals: List[String] := []
         mut c := 0
         while c < cols:
-            vals.push(mat_get(data, cols, r, c).to_string())
+            if c > 0:
+                out.write(" ")!
+            out.write(mat_get(data, cols, r, c).to_string())!
             c = c + 1
-        row_strs.push(vals.join(" "))
+        if r + 1 < rows:
+            out.write("; ")!
         r = r + 1
-    return row_strs.join("; ")
+    return out.string()
 
 fn mat_trace(data: List[Int], n: Int) -> Int:
     mut sum := 0
@@ -60,34 +64,42 @@ fn mat_trace(data: List[Int], n: Int) -> Int:
         i = i + 1
     return sum
 
-fn main():
+fn main() -> String!:
     a := [1, 2, 3, 4]
     b := [5, 6, 7, 8]
 
-    print("A = " + mat_to_string(a, 2, 2))
-    print("B = " + mat_to_string(b, 2, 2))
+    a_text := mat_to_string(a, 2, 2)!
+    b_text := mat_to_string(b, 2, 2)!
+    print("A = " + a_text)
+    print("B = " + b_text)
 
     sum := mat_add(a, b, 2, 2)
-    print("A+B = " + mat_to_string(sum, 2, 2))
+    sum_text := mat_to_string(sum, 2, 2)!
+    print("A+B = " + sum_text)
 
     prod := mat_mul(a, b, 2, 2, 2)
-    print("A*B = " + mat_to_string(prod, 2, 2))
+    prod_text := mat_to_string(prod, 2, 2)!
+    print("A*B = " + prod_text)
 
     at := mat_transpose(a, 2, 2)
-    print("A^T = " + mat_to_string(at, 2, 2))
+    at_text := mat_to_string(at, 2, 2)!
+    print("A^T = " + at_text)
 
     print("trace(A) = " + mat_trace(a, 2).to_string())
     print("trace(A*B) = " + mat_trace(prod, 2).to_string())
 
     # 3x3 identity
     id := [1, 0, 0, 0, 1, 0, 0, 0, 1]
-    print("I3 = " + mat_to_string(id, 3, 3))
+    id_text := mat_to_string(id, 3, 3)!
+    print("I3 = " + id_text)
     print("trace(I3) = " + mat_trace(id, 3).to_string())
 
     # 3x2 * 2x3
     c := [1, 2, 3, 4, 5, 6]
     d := [7, 8, 9, 10, 11, 12]
     cd := mat_mul(c, d, 3, 2, 3)
-    print("C*D = " + mat_to_string(cd, 3, 3))
+    cd_text := mat_to_string(cd, 3, 3)!
+    print("C*D = " + cd_text)
 
     print("matrix works")
+    return ""

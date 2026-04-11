@@ -49,7 +49,9 @@ make bootstrap
 
 - prefer interpolation for direct value printing: `print("count: {items.len()}")`
 - use `std.fmt` when you need a reusable template or literal braces
+- use `std.io.string_buffer()` for incremental text assembly in loops or builders
 - avoid long chains of `"..." + value.to_string()` in user-facing examples unless interpolation would be awkward
+- prefer `std.testing.assert_eq(...)` / `assert_ne(...)` for straightforward test comparisons
 - prefer `std.os.process.command(...)` for child processes; use `std.io` when you specifically need lower-level stream types
 
 ## where to work

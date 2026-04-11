@@ -59,6 +59,12 @@ print("count: {items.len()}")
 
 use `std.fmt` when you need a reusable template or literal braces.
 
+for incremental text assembly, prefer `std.io.string_buffer()` over long
+concatenation loops.
+
+for test-style comparisons in stdlib examples and helper programs, prefer
+`std.testing.assert_eq(...)` and `assert_ne(...)`.
+
 ## what it looks like
 
 ```

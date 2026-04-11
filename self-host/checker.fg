@@ -76,6 +76,7 @@ mut method_decl_index_map: Map[String, Int] := {}
 pub mut generic_declaration_map: Map[String, Int] := {}
 mut generic_declaration_names: List[String] := []
 mut interface_declaration_names: List[String] := []
+mut checking_test_decl := false
 # impl set: "Type\tInterface" -> 1
 mut implementation_set: Map[String, Int] := {}
 # expression type cache — populated by c_check_expr, queried by codegen
@@ -271,11 +272,6 @@ fn register_builtin_types():
     int_to_str := create_function_type([TID_INT], TID_STRING)
     define_builtin_function("chr", int_to_str)
     define_builtin_function("random_string", int_to_str)
-    # (Int, Int) -> Void
-    two_int_to_void := create_function_type([TID_INT, TID_INT], TID_VOID)
-    # assert_eq/ne — placeholder (Int, Int), special-cased in checkCall
-    define_builtin_function("assert_eq", two_int_to_void)
-    define_builtin_function("assert_ne", two_int_to_void)
     # (Int, Int) -> Int
     two_int_to_int := create_function_type([TID_INT, TID_INT], TID_INT)
     define_builtin_function("min", two_int_to_int)
@@ -451,8 +447,6 @@ fn register_builtin_types():
     fix_builtin_binding("bit_not", [tid_int], tid_int)
     fix_builtin_binding("chr", [tid_int], tid_string)
     fix_builtin_binding("random_string", [tid_int], tid_string)
-    fix_builtin_binding("assert_eq", [tid_int, tid_int], tid_void)
-    fix_builtin_binding("assert_ne", [tid_int, tid_int], tid_void)
     fix_builtin_binding("min", [tid_int, tid_int], tid_int)
     fix_builtin_binding("max", [tid_int, tid_int], tid_int)
     fix_builtin_binding("random_int", [tid_int, tid_int], tid_int)
@@ -1370,10 +1364,12 @@ fn check_method_body(type_name: String, type_tid: Int, node: Node):
 
 fn check_test_declaration(node: Node):
     test_scope := create_function_scope(current_scope, TID_VOID)
+    checking_test_decl = true
     for child in node.children:
         cn := get_node(child)
         if cn.kind == "body":
             check_function_body(child, test_scope)
+    checking_test_decl = false
 
 # ---------------------------------------------------------------
 # statement checking
@@ -1963,9 +1959,9 @@ fn check_function_call(node: Node, scope_id: Int) -> Int:
     if callee_node.kind == "ident":
         name := callee_node.value
         # special case: assert_eq / assert_ne
-        if name == "assert_eq":
+        if checking_test_decl and name == "assert_eq":
             return check_assertion_equality(arg_indices, scope_id)
-        if name == "assert_ne":
+        if checking_test_decl and name == "assert_ne":
             return check_assertion_equality(arg_indices, scope_id)
         if name == "map":
             return check_list_map_builtin(arg_indices, scope_id)

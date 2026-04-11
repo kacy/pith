@@ -2,8 +2,9 @@
 
 import std.json as json
 import std.fs as fs
+import std.io as io
 
-fn main():
+fn main() -> String!:
     path := "/tmp/forge_json_ops.json"
 
     # note: use chr(123)/chr(125) for curly braces in string literals
@@ -11,7 +12,11 @@ fn main():
     rb := chr(125)
 
     # parse a simple object
-    input := lb + "\"name\":\"forge\",\"version\":1,\"active\":true,\"tags\":[\"lang\",\"fast\"]" + rb
+    input_buf := io.string_buffer()
+    input_buf.write(lb)!
+    input_buf.write("\"name\":\"forge\",\"version\":1,\"active\":true,\"tags\":[\"lang\",\"fast\"]")!
+    input_buf.write(rb)!
+    input := input_buf.string()
     root := json.parse(input)
     print("type = " + json.type_of(root))
 
@@ -67,3 +72,4 @@ fn main():
     bad := json.parse("not json")
     print("bad parse = " + bad.to_string())
     fs.remove(path)
+    return ""

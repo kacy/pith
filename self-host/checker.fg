@@ -2019,9 +2019,11 @@ fn check_channel_constructor(index_node: Node, arg_indices: List[Int], scope_id:
     inner_tid := resolve_named_type(type_arg_node.value)
     if is_error_type(inner_tid):
         return TID_ERR
-    if arg_indices.len() != 0:
-        report_error("E207", "Channel constructor takes 0 arguments, got " + arg_indices.len().to_string())
+    if arg_indices.len() > 1:
+        report_error("E207", "Channel constructor takes 0 or 1 arguments, got " + arg_indices.len().to_string())
         return TID_ERR
+    if arg_indices.len() == 1:
+        expect_one_typed_argument("Channel", arg_indices, lookup_type_id("Int"), scope_id)
     mut type_args: List[Int] := []
     type_args.push(inner_tid)
     return resolve_generic_type("Channel", type_args)
@@ -2968,22 +2970,25 @@ fn check_sync_primitive_method_call(type_name: String, method: String, args: Lis
     return tid_err
 
 fn check_channel_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
-    tid_void := lookup_type_id("Void")
     tid_int := lookup_type_id("Int")
+    tid_bool := lookup_type_id("Bool")
     tid_err := lookup_type_id("<error>")
     inner := info.inner
     if method == "send":
         expect_one_typed_argument("Channel.send", args, inner, scope_id)
-        return tid_void
+        return tid_bool
     if method == "recv":
         # recv() returns T? (optional of inner type)
         expect_no_arguments("Channel.recv", args)
         return add_type_info(ti_optional(inner))
     if method == "close":
         expect_no_arguments("Channel.close", args)
-        return tid_void
+        return tid_bool
     if method == "len":
         expect_no_arguments("Channel.len", args)
+        return tid_int
+    if method == "cap":
+        expect_no_arguments("Channel.cap", args)
         return tid_int
     return tid_err
 

@@ -3866,22 +3866,6 @@ pub unsafe extern "C" fn forge_dns_resolve(hostname: *const i8) -> *mut i8 {
     }
 }
 
-/// Channel new — stub (returns handle)
-#[no_mangle]
-pub extern "C" fn forge_channel_new(_capacity: i64) -> i64 {
-    0
-}
-
-/// Channel send — stub
-#[no_mangle]
-pub extern "C" fn forge_channel_send(_ch: i64, _val: i64) {}
-
-/// Channel recv — stub (returns 0)
-#[no_mangle]
-pub extern "C" fn forge_channel_recv(_ch: i64) -> i64 {
-    0
-}
-
 /// Format a float with fixed decimal places: forge_float_fixed(value, decimals)
 ///
 /// # Safety

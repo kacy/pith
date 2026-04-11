@@ -44,7 +44,7 @@ STRING_RETURNING_FUNCS := "sha256,hex_encode,hex_decode,to_hex,b64_encode,chr,re
 BYTES_RETURNING_FUNCS := "bytes_from_string_utf8,read_file_bytes,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,byte_buffer_bytes,b64_decode,from_hex,bytes_slice,bytes_concat"
 LIST_RETURNING_FUNCS := "args,range,repeat_val,zeros,sort,sort_desc,reversed,take,drop,slice,unique,without,intersection,difference,flatten,chunks,json_object_keys"
 LIST_STRING_RETURNING_FUNCS := "sort_strings,zip,enumerate,toml_keys"
-BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,list_contains,list_contains_string,list_is_empty"
+BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,list_contains,list_contains_string,list_is_empty,send,close"
 VOID_METHODS := "sort,sort_strings,reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear"
 STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,list_join,read_file,env,chr"
 
@@ -604,6 +604,10 @@ fn ir_resolve_static_callee(idx: Int) -> ResolvedCallee:
     node := get_node(idx)
     if node.kind == "ident":
         return ir_ident_callee(node.value)
+    if node.kind == "index" and node.children.len() > 0:
+        base_node := get_node(node.children[0])
+        if base_node.kind == "ident" and base_node.value == "Channel":
+            return ResolvedCallee("Channel", false)
     if node.kind == "field_access":
         alias_name := ir_resolve_module_alias_call_name(idx)
         if alias_name.len() > 0:
@@ -892,9 +896,7 @@ fn ir_type_from_tid(tid: Int) -> String:
     if info.kind == "result":
         return "tuple"
     if info.kind == "optional":
-        if info.inner < 0:
-            return ""
-        info = get_type_info(info.inner)
+        return "tuple"
     if info.kind == "primitive":
         if info.name == "Int" or info.name == "UInt" or info.name == "Int8" or info.name == "Int16" or info.name == "Int32" or info.name == "Int64" or info.name == "UInt8" or info.name == "UInt16" or info.name == "UInt32" or info.name == "UInt64":
             return "int"
@@ -1091,6 +1093,13 @@ fn ir_known_string_method_return_type(meth: String) -> String:
     return ""
 
 fn ir_known_collection_method_return_type(obj_type: String, meth: String) -> String:
+    if obj_type.starts_with("channel:"):
+        if meth == "recv":
+            return "tuple"
+        if meth == "len" or meth == "cap":
+            return "int"
+        if meth == "send" or meth == "close":
+            return "bool"
     if meth == "index_of" and (obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")):
         return "int"
     if meth == "slice" or meth == "sort":
@@ -1113,7 +1122,7 @@ fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
         return string_type
     if meth == "to_float":
         return "float"
-    if meth == "len":
+    if meth == "len" or meth == "cap":
         return "int"
     if (meth == "slice" or meth == "concat") and obj_type == "bytes":
         return "bytes"
@@ -1293,6 +1302,19 @@ fn ir_lookup_name_type(name: String) -> String:
         return "bool"
     return ""
 
+fn ir_optional_flag_field(obj_r: Int) -> Int:
+    r := ir_reg()
+    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 0 bool is_some")
+    return r
+
+fn ir_optional_value_field(obj_r: Int, opt_tid: Int) -> Int:
+    info := get_type_info(opt_tid)
+    if info.kind != "optional" or info.inner < 0:
+        return ir_zero_reg()
+    r := ir_reg()
+    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 8 " + ir_type_from_tid(info.inner) + " value")
+    return r
+
 fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
     vn := get_node(val_idx)
     if vn.kind == "map" and vn.children.len() == 0 and target_type == "set":
@@ -1332,6 +1354,11 @@ fn ir_checked_target_type(target_idx: Int, fallback_name: String) -> String:
 fn ir_method_receiver_type(node: Node) -> String:
     if node.children.len() == 0:
         return ""
+    recv_tid := c_get_expr_type(node.children[0])
+    if recv_tid >= 0:
+        recv_info := get_type_info(recv_tid)
+        if recv_info.kind == "channel" and recv_info.inner >= 0:
+            return "channel:" + ir_type_from_tid(recv_info.inner)
     checked := ir_checked_type(node.children[0])
     if checked.len() > 0:
         return checked
@@ -1435,6 +1462,7 @@ fn ir_method_emit_name(mname: String, obj_type: String) -> String:
     obj_is_map := obj_type == "map" or obj_type == "map_int"
     obj_is_set := obj_type == "set" or obj_type == "set_int"
     obj_is_list := obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
+    obj_is_channel := obj_type.starts_with("channel:")
 
     mut emit_name := mname
     if mname == "to_string":
@@ -1458,7 +1486,23 @@ fn ir_method_emit_name(mname: String, obj_type: String) -> String:
         emit_name = ir_method_map_emit_name(mname, obj_type)
     elif obj_is_set:
         emit_name = ir_method_set_emit_name(mname, obj_type)
+    elif obj_is_channel:
+        if mname == "len":
+            emit_name = "forge_channel_len"
+        elif mname == "cap":
+            emit_name = "forge_channel_cap"
+        elif mname == "send":
+            emit_name = "forge_channel_send"
+        elif mname == "recv":
+            emit_name = "forge_channel_recv"
+        elif mname == "close":
+            emit_name = "forge_channel_close"
     return emit_name
+
+fn ir_emit_optional_unwrap(node: Node) -> Int:
+    recv_r := ir_expr(node.children[0])
+    opt_tid := c_get_expr_type(node.children[0])
+    return ir_optional_value_field(recv_r, opt_tid)
 
 fn ir_collect_method_call_regs(node: Node) -> List[Int]:
     mut regs: List[Int] := []
@@ -1692,6 +1736,10 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
             generic_ret_type = ir_infer_type(idx)
         callee = ResolvedCallee(ir_queue_generic_specialization(callee.name, ir_infer_generic_concrete_types(callee.name, node), generic_ret_type), false)
     arg_regs := ir_collect_call_arg_regs(node, 1)
+    if callee.name == "Channel" and arg_regs.len() == 0:
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        arg_regs.push(zero_r)
 
     if ir_emit_tests and callee.name == "assert" and arg_regs.len() >= 1:
         return ir_emit_test_assert(arg_regs)
@@ -2212,6 +2260,43 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_emit_lambda_capture_setup(r, parts.captures)
     return r
 
+fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
+    wrapper_name := "__spawn_" + ir_lambda_count.to_string()
+    ir_lambda_count = ir_lambda_count + 1
+    mut captures: List[String] := []
+    call_node := get_node(call_idx)
+    if call_node.children.len() > 0:
+        callee := ir_resolve_static_callee(call_node.children[0])
+        if callee.name.len() == 0:
+            captures = ir_find_free_vars(call_node.children[0], [])
+        mut i := 1
+        while i < call_node.children.len():
+            free_in_arg := ir_find_free_vars(call_node.children[i], [])
+            mut j := 0
+            while j < free_in_arg.len():
+                if not ir_list_contains(captures, free_in_arg[j]):
+                    captures.push(free_in_arg[j])
+                j = j + 1
+            i = i + 1
+
+    saved_regs := ir_next_reg
+    saved_vars := ir_copy_var_regs(ir_var_regs)
+    saved_types := ir_copy_var_types(ir_var_types)
+    saved_lines := ir_copy_lines(ir_lines)
+
+    ir_reset_lambda_emit_state()
+    ir_emit_func_header(wrapper_name, 1, "unknown")
+    ir_emit_lambda_hidden_param()
+    ir_emit_lambda_capture_loads(captures)
+    ir_emit("ret " + ir_expr(call_idx).to_string())
+    ir_emit_lambda_default_return()
+    ir_finish_lambda_emit(saved_regs, saved_vars, saved_types, saved_lines)
+
+    closure_r := ir_reg()
+    ir_emit("closure_ref " + closure_r.to_string() + " " + wrapper_name)
+    ir_emit_lambda_capture_setup(closure_r, captures)
+    return closure_r
+
 fn ir_emit_int_literal(node: Node) -> Int:
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " " + node.value)
@@ -2273,24 +2358,9 @@ fn ir_emit_spawn_expr(node: Node) -> Int:
     if node.children.len() > 0:
         inner := get_node(node.children[0])
         if inner.kind == "call":
-            mut spawn_fname := "unknown"
-            mut spawn_arg_r := 0 - 1
-            mut i := 0
-            while i < inner.children.len():
-                sc := inner.children[i]
-                scn := get_node(sc)
-                if scn.kind == "ident" and spawn_fname == "unknown":
-                    spawn_fname = scn.value
-                if scn.kind == "arg" and spawn_arg_r < 0 and scn.children.len() > 0:
-                    spawn_arg_r = ir_expr(scn.children[0])
-                i = i + 1
-            if spawn_arg_r < 0:
-                spawn_arg_r = ir_reg()
-                ir_emit("iconst " + spawn_arg_r.to_string() + " 0")
-            fn_r := ir_reg()
-            ir_emit("funcref " + fn_r.to_string() + " " + spawn_fname)
+            closure_r := ir_emit_spawn_wrapper(node.children[0])
             r := ir_reg()
-            ir_emit_call2(r, "spawn", "unknown", fn_r, spawn_arg_r)
+            ir_emit_call1(r, "spawn", "unknown", closure_r)
             return r
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " 0")
@@ -2464,6 +2534,9 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         r := ir_reg()
         ir_emit("iconst " + r.to_string() + " 0")
         return r
+
+    if kind == "unwrap":
+        return ir_emit_optional_unwrap(node)
 
     if kind == "try" or kind == "try_expr":
         return ir_emit_try_expr(node)

@@ -75,7 +75,7 @@ bootstrap-ir-invariants: self-host bootstrap-ir-invariants-only
 bootstrap-ir-invariants-only:
 	@echo "--- combined ir invariant checks ---"
 	@pass=0; fail=0; \
-	if timeout 15 ./self-host/ir_driver --combined tests/cases/test_imported_globals_init.fg | awk 'BEGIN { init=0 } /^func m[0-9]+___init_globals_[0-9]+(_[0-9]+)? / { init=1 } /^call 900000 m[0-9]+___init_globals_[0-9]+(_[0-9]+)? int 0/ { call=1 } END { if (init && call) exit 0; exit 1 }'; then \
+	if timeout 15 ./self-host/ir_driver --combined tests/cases/test_imported_globals_init.fg | awk 'BEGIN { init=0; call=0 } /^func [A-Za-z0-9_]+___init_globals_[0-9]+(_[0-9]+)? / { init=1 } /^call 900000 [A-Za-z0-9_]+___init_globals_[0-9]+(_[0-9]+)? int 0/ { call=1 } END { if (init && call) exit 0; exit 1 }'; then \
 		pass=$$((pass+1)); echo "ok   imported init globals wiring"; \
 	else \
 		echo "FAIL imported init globals wiring"; fail=$$((fail+1)); \

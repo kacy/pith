@@ -31,6 +31,7 @@ mut module_export_entries: List[String] := []
 # Wildcard import tracking - which modules have been wildcard imported
 # This enables from X import * functionality
 mut wildcard_imports: List[String] := []
+mut generic_inference_subst: Map[String, Int] := {}
 
 # Get position from AST node
 fn get_node_position(node_idx: Int) -> (Int, Int):
@@ -102,6 +103,7 @@ pub fn initialize_checker(file_path: String):
     module_aliases = {}
     module_export_entries = []
     wildcard_imports = []
+    generic_inference_subst = {}
     current_scope = create_scope(-1)
     register_builtin_types()
 
@@ -1086,7 +1088,7 @@ fn collect_generic_parameter_names(node: Node) -> List[String]:
     for child in node.children:
         cn := get_node(child)
         if cn.kind == "generic_param":
-            params.push(cn.value)
+            params.push(trim_type_text(cn.value))
     return params
 
 fn register_generic_declaration(name: String, node_idx: Int):
@@ -2284,64 +2286,140 @@ fn check_type_parameter_bounds(decl_node_idx: Int, subst_map: Map[String, Int]) 
 # generic function call
 # ---------------------------------------------------------------
 
-fn bind_inferred_generic_type(name: String, actual_tid: Int, subst_map: Map[String, Int]) -> Bool:
-    if subst_map.contains_key(name):
-        existing := subst_map[name]
+fn bind_inferred_generic_type(name: String, actual_tid: Int) -> Bool:
+    if generic_inference_subst.contains_key(name):
+        existing := generic_inference_subst[name]
         if types_structurally_equal(existing, actual_tid) == false:
             report_error("E219", "type parameter inference mismatch for " + name + ": " + get_type_name(existing) + " vs " + get_type_name(actual_tid))
             return false
         return true
-    subst_map.insert(name, actual_tid)
+    generic_inference_subst.insert(name, actual_tid)
     return true
 
-fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_params: List[String], subst_map: Map[String, Int]) -> Bool:
+fn trim_type_text(text: String) -> String:
+    mut start := 0
+    mut end := text.len()
+    while start < end and text[start] == " ":
+        start = start + 1
+    while end > start and text[end - 1] == " ":
+        end = end - 1
+    return text.substring(start, end)
+
+fn split_top_level_type_args(text: String) -> List[String]:
+    mut parts: List[String] := []
+    mut start := 0
+    mut depth := 0
+    mut i := 0
+    while i < text.len():
+        ch := text[i]
+        if ch == "[":
+            depth = depth + 1
+        elif ch == "]":
+            depth = depth - 1
+        elif ch == "," and depth == 0:
+            parts.push(trim_type_text(text.substring(start, i)))
+            start = i + 1
+        i = i + 1
+    parts.push(trim_type_text(text.substring(start, text.len())))
+    return parts
+
+fn infer_generic_subst_from_type_text(type_name: String, actual_tid: Int, generic_params: List[String]) -> Bool:
+    if actual_tid < 0:
+        return true
+    trimmed := trim_type_text(type_name)
+    for gp in generic_params:
+        normalized_gp := trim_type_text(gp)
+        if strings_equal(normalized_gp, trimmed):
+            return bind_inferred_generic_type(normalized_gp, actual_tid)
+
+    actual_info := get_type_info(actual_tid)
+
+    if trimmed.starts_with("List[") and trimmed.ends_with("]"):
+        if actual_info.kind != "list":
+            return true
+        inner_text := trimmed.substring(5, trimmed.len() - 1)
+        return infer_generic_subst_from_type_text(inner_text, actual_info.inner, generic_params)
+
+    if trimmed.starts_with("Set[") and trimmed.ends_with("]"):
+        if actual_info.kind != "set":
+            return true
+        inner_text := trimmed.substring(4, trimmed.len() - 1)
+        return infer_generic_subst_from_type_text(inner_text, actual_info.inner, generic_params)
+
+    if trimmed.starts_with("Task[") and trimmed.ends_with("]"):
+        if actual_info.kind != "task":
+            return true
+        inner_text := trimmed.substring(5, trimmed.len() - 1)
+        return infer_generic_subst_from_type_text(inner_text, actual_info.inner, generic_params)
+
+    if trimmed.starts_with("Channel[") and trimmed.ends_with("]"):
+        if actual_info.kind != "channel":
+            return true
+        inner_text := trimmed.substring(8, trimmed.len() - 1)
+        return infer_generic_subst_from_type_text(inner_text, actual_info.inner, generic_params)
+
+    if trimmed.starts_with("Map[") and trimmed.ends_with("]"):
+        if actual_info.kind != "map":
+            return true
+        args := split_top_level_type_args(trimmed.substring(4, trimmed.len() - 1))
+        if args.len() > 0:
+            if infer_generic_subst_from_type_text(args[0], actual_info.key_type, generic_params) == false:
+                return false
+        if args.len() > 1:
+            return infer_generic_subst_from_type_text(args[1], actual_info.value_type, generic_params)
+        return true
+
+    return true
+
+fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_params: List[String]) -> Bool:
     if type_idx < 0 or actual_tid < 0:
         return true
     node := get_node(type_idx)
     if node.kind == "type":
-        for gp in generic_params:
-            if strings_equal(gp, node.value):
-                return bind_inferred_generic_type(gp, actual_tid, subst_map)
-        return true
+        return infer_generic_subst_from_type_text(node.value, actual_tid, generic_params)
 
     actual_info := get_type_info(actual_tid)
 
     if node.kind == "generic_type":
+        for gp in generic_params:
+            normalized_gp := trim_type_text(gp)
+            if strings_equal(normalized_gp, trim_type_text(node.value)):
+                return bind_inferred_generic_type(normalized_gp, actual_tid)
         if node.value == "List":
             if actual_info.kind == "list" and node.children.len() > 0:
-                return infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params, subst_map)
+                return infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params)
             return true
         if node.value == "Set":
             if actual_info.kind == "set" and node.children.len() > 0:
-                return infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params, subst_map)
+                return infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params)
             return true
         if node.value == "Task":
             if actual_info.kind == "task" and node.children.len() > 0:
-                return infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params, subst_map)
+                return infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params)
             return true
         if node.value == "Channel":
             if actual_info.kind == "channel" and node.children.len() > 0:
-                return infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params, subst_map)
+                return infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params)
             return true
         if node.value == "Map":
             if actual_info.kind == "map" and node.children.len() > 1:
-                if infer_generic_subst_from_type_node(node.children[0], actual_info.key_type, generic_params, subst_map) == false:
+                if infer_generic_subst_from_type_node(node.children[0], actual_info.key_type, generic_params) == false:
                     return false
-                return infer_generic_subst_from_type_node(node.children[1], actual_info.value_type, generic_params, subst_map)
+                return infer_generic_subst_from_type_node(node.children[1], actual_info.value_type, generic_params)
             return true
         return true
 
     if node.kind == "optional_type":
         if actual_info.kind == "optional" and node.children.len() > 0:
-            return infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params, subst_map)
+            return infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params)
         return true
 
     if node.kind == "result_type":
         if actual_info.kind == "result" and node.children.len() > 0:
-            if infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params, subst_map) == false:
+            if infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params) == false:
                 return false
             if node.children.len() > 1 and actual_info.value_type >= 0:
-                return infer_generic_subst_from_type_node(node.children[1], actual_info.value_type, generic_params, subst_map)
+                return infer_generic_subst_from_type_node(node.children[1], actual_info.value_type, generic_params)
         return true
 
     if node.kind == "tuple_type":
@@ -2349,7 +2427,7 @@ fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_pa
             mut i := 0
             while i < node.children.len():
                 if i < actual_info.elements.len():
-                    if infer_generic_subst_from_type_node(node.children[i], actual_info.elements[i], generic_params, subst_map) == false:
+                    if infer_generic_subst_from_type_node(node.children[i], actual_info.elements[i], generic_params) == false:
                         return false
                 i = i + 1
         return true
@@ -2361,13 +2439,13 @@ fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_pa
                 cn := get_node(node.children[i])
                 if cn.kind == "param":
                     if i < actual_info.param_types.len():
-                        if infer_generic_subst_from_type_node(cn.children[0], actual_info.param_types[i], generic_params, subst_map) == false:
+                        if infer_generic_subst_from_type_node(cn.children[0], actual_info.param_types[i], generic_params) == false:
                             return false
                     i = i + 1
                     continue
                 if cn.kind == "returns":
                     if cn.children.len() > 0:
-                        return infer_generic_subst_from_type_node(cn.children[0], actual_info.return_type, generic_params, subst_map)
+                        return infer_generic_subst_from_type_node(cn.children[0], actual_info.return_type, generic_params)
                 i = i + 1
         return true
 
@@ -2400,26 +2478,35 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
         report_error("E207", "expected " + param_type_nodes.len().to_string() + " arguments, got " + arg_types.len().to_string())
         return TID_ERR
     # infer type args from argument types using a map
-    mut subst_map: Map[String, Int] := {}
+    generic_inference_subst = {}
     mut pidx := 0
     for ptn in param_type_nodes:
         if ptn >= 0 and pidx < arg_types.len():
-            if infer_generic_subst_from_type_node(ptn, arg_types[pidx], generic_params, subst_map) == false:
+            if infer_generic_subst_from_type_node(ptn, arg_types[pidx], generic_params) == false:
                 return TID_ERR
         pidx = pidx + 1
     # verify all generic params were inferred, build subst_args list
     mut subst_args: List[Int] := []
     mut all_inferred := true
     for gp in generic_params:
-        if subst_map.contains_key(gp):
-            subst_args.push(subst_map[gp])
+        normalized_gp := trim_type_text(gp)
+        if generic_inference_subst.contains_key(normalized_gp):
+            subst_args.push(generic_inference_subst[normalized_gp])
         else:
             all_inferred = false
+            mut debug_args: List[String] := []
+            for arg_tid in arg_types:
+                debug_args.push(get_type_name(arg_tid))
+            mut debug_params: List[String] := []
+            for ptn in param_type_nodes:
+                if ptn >= 0:
+                    pnode := get_node(ptn)
+                    debug_params.push(pnode.kind + ":" + pnode.value)
             report_error("E222", "cannot infer type parameter " + gp)
             # Return immediately to prevent cascading errors
             return TID_ERR
     # check interface bounds
-    if check_type_parameter_bounds(decl_idx, subst_map) == false:
+    if check_type_parameter_bounds(decl_idx, generic_inference_subst) == false:
         return TID_ERR
     # resolve return type with substitution
     mut ret_type := TID_VOID

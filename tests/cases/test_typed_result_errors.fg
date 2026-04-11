@@ -1,0 +1,50 @@
+struct ParseError:
+    message: String
+
+struct WrappedError:
+    message: String
+
+fn parse_digit(s: String) -> Int!ParseError:
+    if s.len() == 0:
+        fail ParseError{"empty"}
+    if s == "7":
+        return 7
+    fail ParseError{"invalid"}
+
+fn plus_one(s: String) -> Int!ParseError:
+    value := parse_digit(s)!
+    return value + 1
+
+fn wrap_parse_error(err: ParseError) -> Int!WrappedError:
+    fail WrappedError{err.message}
+
+fn old_style(s: String) -> Int!:
+    if s == "ok":
+        return 5
+    fail "bad input"
+
+fn main() -> Int!:
+    ok := parse_digit("7")
+    print(ok.is_ok.to_string())
+    print(ok.ok.to_string())
+
+    bad := parse_digit("")
+    print(bad.is_err.to_string())
+    if bad.err.message == "empty":
+        print("empty")
+    else:
+        print("other")
+
+    print(plus_one("7").ok.to_string())
+    print((parse_digit("") catch 9).to_string())
+    print(parse_digit("7").unwrap_or(0).to_string())
+    print(parse_digit("").unwrap_or(11).to_string())
+
+    wrapped := parse_digit("x").or_else(wrap_parse_error)
+    print(wrapped.is_err.to_string())
+    print(wrapped.err.message)
+
+    legacy := old_style("bad")
+    print(legacy.is_err.to_string())
+    print(legacy.err)
+    return 0

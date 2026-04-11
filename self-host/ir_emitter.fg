@@ -87,17 +87,30 @@ mut ir_module_count := 0  # increments per emit_ir call for unique naming
 mut ir_impl_methods: Map[String, String] := {}
 mut ir_import_renames: Map[String, String] := {}
 mut ir_module_aliases: Map[String, String] := {}
+mut ir_import_declared_functions: Map[String, Bool] := {}
+mut ir_import_declared_globals: Map[String, Bool] := {}
 mut ir_current_func_return_kind := ""
 mut ir_preloaded_import_roots: List[Int] := []
 mut ir_preloaded_import_paths: List[String] := []
 mut ir_emit_tests := false
 mut ir_generic_decl_indices: Map[String, Int] := {}
+mut ir_generic_decl_module_paths: Map[String, String] := {}
 mut ir_generic_specialization_keys: List[String] := []
 mut ir_generic_specialization_names: Map[String, String] := {}
 mut ir_generic_specialization_type_lists: Map[String, String] := {}
 mut ir_generic_emitted_specializations: Map[String, Int] := {}
 mut ir_active_generic_params: List[String] := []
 mut ir_active_generic_concrete_types: List[String] := []
+mut ir_generic_runtime_subst: Map[String, String] := {}
+mut ir_active_generic_module_path := ""
+
+fn ir_new_temp_name(prefix: String) -> String:
+    return "__" + prefix + "_" + ir_next_reg.to_string() + "_" + ir_next_label.to_string()
+
+fn ir_push_string(items: List[String], value: String) -> List[String]:
+    mut updated: List[String] := items
+    updated.push(value)
+    return updated
 
 pub fn set_import_roots(roots: List[Int], paths: List[String]):
     ir_preloaded_import_roots = roots
@@ -134,14 +147,19 @@ fn ir_reset_type_state():
     ir_import_renames = {}
     ir_func_returns = {}
     ir_module_aliases = {}
+    ir_import_declared_functions = {}
+    ir_import_declared_globals = {}
     ir_current_func_return_kind = ""
     ir_generic_decl_indices = {}
+    ir_generic_decl_module_paths = {}
     ir_generic_specialization_keys = []
     ir_generic_specialization_names = {}
     ir_generic_specialization_type_lists = {}
     ir_generic_emitted_specializations = {}
     ir_active_generic_params = []
     ir_active_generic_concrete_types = []
+    ir_generic_runtime_subst = {}
+    ir_active_generic_module_path = ""
 
 fn ir_reset_control_flow_state():
     ir_break_stack = []
@@ -154,7 +172,7 @@ pub fn ir_reset():
     ir_reset_control_flow_state()
 
 fn ir_emit(line: String):
-    ir_lines.push(line)
+    ir_lines = ir_push_string(ir_lines, line)
 
 fn ir_reg() -> Int:
     r := ir_next_reg
@@ -228,13 +246,7 @@ fn ir_resolve_generic_type_node(tn: Node) -> String:
     return ""
 
 fn ir_resolve_result_type_kind(inner_type: String) -> String:
-    if inner_type == "int":
-        return "result_int"
-    if inner_type == "bool":
-        return "result_bool"
-    if inner_type == "bytes":
-        return "bytes"
-    return ir_retkind(inner_type)
+    return "tuple"
 
 fn ir_resolve_type_node(type_idx: Int) -> String:
     if ir_active_generic_params.len() > 0:
@@ -283,23 +295,10 @@ fn ir_expr_result_kind(idx: Int) -> String:
     checked_kind := ir_checked_result_kind(idx)
     if checked_kind.len() > 0:
         return checked_kind
-    node := get_node(idx)
-    if node.kind == "call" and node.children.len() > 0:
-        fname := ir_resolve_static_callee(node.children[0]).name
-        if fname.len() > 0 and ir_func_returns.contains_key(fname):
-            ret_kind := ir_func_returns[fname]
-            if ret_kind == "result_int" or ret_kind == "result_bool":
-                return ret_kind
-    if node.kind == "method_call":
-        fname := ir_resolve_module_alias_method_call_name(idx)
-        if fname.len() > 0 and ir_func_returns.contains_key(fname):
-            ret_kind := ir_func_returns[fname]
-            if ret_kind == "result_int" or ret_kind == "result_bool":
-                return ret_kind
-    return ""
+    return ir_expr_legacy_result_kind(idx)
 
 fn ir_uses_result_abi(result_kind: String) -> Bool:
-    return result_kind == "result_int" or result_kind == "result_bool"
+    return result_kind.len() > 0 and result_kind != "tuple"
 
 fn ir_encode_result_value(value_reg: Int, result_kind: String) -> Int:
     if ir_uses_result_abi(result_kind):
@@ -391,13 +390,15 @@ fn ir_is_void_method(meth: String) -> Bool:
 fn ir_is_string_returning_method(meth: String) -> Bool:
     return ir_csv_contains(STRING_RETURNING_METHODS, meth)
 
-fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String]):
+fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String]) -> List[String]:
     node := get_node(idx)
     if node.kind == "ident":
         name := node.value
         if ir_should_capture_name(name, bound, free):
-            free.push(name)
-        return
+            mut updated := ir_copy_names(free)
+            updated.push(name)
+            return updated
+        return free
     if node.kind == "lambda":
         inner_bound := ir_copy_names(bound)
         mut i := 0
@@ -408,23 +409,38 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String]):
                 inner_bound.push(cn.value)
             i = i + 1
         i = 0
+        mut updated_free := ir_copy_names(free)
         while i < node.children.len():
             child := node.children[i]
             cn := get_node(child)
             if cn.kind == "body":
-                ir_find_free_vars_walk(child, inner_bound, free)
+                updated_free = ir_find_free_vars_walk(child, inner_bound, updated_free)
             i = i + 1
-        return
+        return updated_free
+    if node.kind == "body":
+        mut scoped_bound := ir_copy_names(bound)
+        mut updated_free := ir_copy_names(free)
+        mut i := 0
+        while i < node.children.len():
+            child := node.children[i]
+            updated_free = ir_find_free_vars_walk(child, scoped_bound, updated_free)
+            child_node := get_node(child)
+            if ir_is_binding_kind(child_node.kind):
+                bind_name := ir_binding_name(child_node)
+                if bind_name.len() > 0 and not ir_list_contains(scoped_bound, bind_name):
+                    scoped_bound.push(bind_name)
+            i = i + 1
+        return updated_free
+    mut updated_free := ir_copy_names(free)
     mut i := 0
     while i < node.children.len():
         child := node.children[i]
-        ir_find_free_vars_walk(child, bound, free)
+        updated_free = ir_find_free_vars_walk(child, bound, updated_free)
         i = i + 1
+    return updated_free
 
 fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
-    mut free: List[String] := []
-    ir_find_free_vars_walk(idx, bound, free)
-    return free
+    return ir_find_free_vars_walk(idx, bound, [])
 
 fn ir_str(s: String) -> String:
     cleaned := ir_strip_quotes(s)
@@ -434,7 +450,7 @@ fn ir_str(s: String) -> String:
             return ir_string_symbol_name(i)
         i = i + 1
     idx := ir_strings.len()
-    ir_strings.push(cleaned)
+    ir_strings = ir_push_string(ir_strings, cleaned)
     return ir_string_symbol_name(idx)
 
 # --- collect strings (iterative to avoid deep recursion crashes) ---
@@ -510,20 +526,21 @@ fn ir_module_default_alias(module_path: String) -> String:
         return module_path
     return module_path.substring(last_dot + 1, module_path.len())
 
+fn ir_import_symbol_prefix(module_path: String) -> String:
+    if module_path.len() == 0:
+        return ""
+    mut prefix := ""
+    mut i := 0
+    while i < module_path.len():
+        if module_path[i] == ".":
+            prefix = prefix + "_"
+        else:
+            prefix = prefix + module_path[i]
+        i = i + 1
+    return prefix + "_"
+
 fn ir_import_target_name(module_path: String, name: String) -> String:
-    if module_path == "std.json":
-        return "json_" + name
-    if module_path == "std.toml":
-        return "toml_" + name
-    if module_path == "std.encoding":
-        return "encoding_" + name
-    if module_path == "std.hash":
-        return "hash_" + name
-    if module_path == "std.log":
-        return "log_" + name
-    if module_path == "std.net.url":
-        return "url_" + name
-    return name
+    return ir_import_symbol_prefix(module_path) + name
 
 struct ResolvedCallee:
     name: String
@@ -532,7 +549,26 @@ struct ResolvedCallee:
 fn ir_module_alias_member_name(alias: String, member: String) -> String:
     if not ir_module_aliases.contains_key(alias):
         return ""
-    return ir_import_target_name(ir_module_aliases[alias], member)
+    module_path := ir_module_aliases[alias]
+    if ir_import_declares_function(module_path, member):
+        return ir_import_target_name(module_path, member)
+    if ir_import_declares_global(module_path, member):
+        return ir_import_target_name(module_path, member)
+    return member
+
+fn ir_import_declares_function(module_path: String, name: String) -> Bool:
+    return ir_import_declared_functions.contains_key(module_path + "." + name)
+
+fn ir_import_declares_global(module_path: String, name: String) -> Bool:
+    return ir_import_declared_globals.contains_key(module_path + "." + name)
+
+fn ir_collect_import_declared_functions(root_idx: Int, module_path: String):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if ir_is_fn_decl_kind(node.kind):
+            ir_import_declared_functions.insert(module_path + "." + ir_base_decl_name(node.value), true)
+        elif ir_is_binding_kind(node.kind):
+            ir_import_declared_globals.insert(module_path + "." + ir_binding_name(node), true)
 
 fn ir_plain_method_name(name: String) -> String:
     if name.starts_with("."):
@@ -542,6 +578,8 @@ fn ir_plain_method_name(name: String) -> String:
 fn ir_ident_callee(name: String) -> ResolvedCallee:
     if ir_import_renames.contains_key(name):
         return ResolvedCallee(ir_import_renames[name], true)
+    if ir_active_generic_module_path.len() > 0 and ir_import_declares_function(ir_active_generic_module_path, name):
+        return ResolvedCallee(ir_import_target_name(ir_active_generic_module_path, name), true)
     return ResolvedCallee(name, false)
 
 fn ir_resolve_module_alias_call_name(idx: Int) -> String:
@@ -573,13 +611,10 @@ fn ir_resolve_static_callee(idx: Int) -> ResolvedCallee:
     return ResolvedCallee("", false)
 
 fn ir_callee_uses_result_abi(callee: ResolvedCallee, idx: Int) -> Bool:
-    if callee.imported:
+    raw_kind := ir_declared_callable_ir_retkind(callee.name)
+    if raw_kind == "tuple" or raw_kind == "result_int" or raw_kind == "result_bool":
         return true
-    if callee.name.len() > 0 and ir_func_returns.contains_key(callee.name):
-        return true
-    if ir_checked_result_kind(idx).len() > 0:
-        return true
-    return false
+    return ir_builtin_result_retkind(callee.name).len() > 0
 
 fn ir_emit_call2(result_reg: Int, fname: String, ret_type: String, arg0: Int, arg1: Int):
     ir_emit_call_text(result_reg, fname, ret_type, 2, " " + arg0.to_string() + " " + arg1.to_string())
@@ -587,14 +622,21 @@ fn ir_emit_call2(result_reg: Int, fname: String, ret_type: String, arg0: Int, ar
 fn ir_emit_call3(result_reg: Int, fname: String, ret_type: String, arg0: Int, arg1: Int, arg2: Int):
     ir_emit_call_text(result_reg, fname, ret_type, 3, " " + arg0.to_string() + " " + arg1.to_string() + " " + arg2.to_string())
 
-fn ir_declared_callable_return_type(fname: String) -> String:
+fn ir_declared_callable_ir_retkind(fname: String) -> String:
     if not ir_func_returns.contains_key(fname):
         return ""
-    ret_kind := ir_func_returns[fname]
+    return ir_func_returns[fname]
+
+fn ir_declared_callable_return_type(fname: String) -> String:
+    ret_kind := ir_declared_callable_ir_retkind(fname)
+    if ret_kind.len() == 0:
+        return ""
     if ret_kind == "result_int":
         return "int"
     if ret_kind == "result_bool":
         return "bool"
+    if ret_kind == "tuple":
+        return "tuple"
     return ir_resolve_type_hint(ret_kind)
 
 fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
@@ -706,23 +748,23 @@ fn ir_binding_has_collection_init(node: Node) -> Bool:
 
 fn ir_record_global_type(name: String, global_type: String):
     if global_type == "int":
-        ir_global_int_names.push(name)
+        ir_global_int_names = ir_push_string(ir_global_int_names, name)
     elif global_type == "string":
-        ir_global_string_names.push(name)
+        ir_global_string_names = ir_push_string(ir_global_string_names, name)
     elif global_type == "list_string":
-        ir_global_list_string_names.push(name)
+        ir_global_list_string_names = ir_push_string(ir_global_list_string_names, name)
     elif global_type == "list":
-        ir_global_list_names.push(name)
+        ir_global_list_names = ir_push_string(ir_global_list_names, name)
     elif global_type == "map_int":
-        ir_global_map_int_names.push(name)
+        ir_global_map_int_names = ir_push_string(ir_global_map_int_names, name)
     elif global_type == "map":
-        ir_global_map_names.push(name)
+        ir_global_map_names = ir_push_string(ir_global_map_names, name)
     elif global_type == "set":
-        ir_global_set_names.push(name)
+        ir_global_set_names = ir_push_string(ir_global_set_names, name)
     elif global_type == "set_int":
-        ir_global_set_int_names.push(name)
+        ir_global_set_int_names = ir_push_string(ir_global_set_int_names, name)
     elif global_type == "bool":
-        ir_global_bool_names.push(name)
+        ir_global_bool_names = ir_push_string(ir_global_bool_names, name)
 
 fn ir_unwrap_pub_child(idx: Int) -> Int:
     node := get_node(idx)
@@ -764,26 +806,28 @@ fn ir_declared_struct_name(node: Node) -> String:
         return node.value.substring(0, node.value.index_of("["))
     return node.value
 
-fn ir_record_struct_field(struct_name: String, field_names: List[String], field_node: Node):
+fn ir_record_struct_field(struct_name: String, field_names: List[String], field_node: Node) -> List[String]:
     mut field_name := field_node.value
     if field_name.contains(" "):
         field_name = field_name.split(" ")[0]
-    field_index := field_names.len()
-    field_names.push(field_name)
+    mut updated_fields := field_names
+    field_index := updated_fields.len()
+    updated_fields.push(field_name)
     if field_node.children.len() > 0:
         type_node := get_node(field_node.children[0])
         if type_node.kind == "type" or type_node.kind == "generic_type":
             ir_struct_field_lookup.insert(struct_name + "." + field_name, ir_resolve_type_node(field_node.children[0]))
     ir_struct_field_index_lookup.insert(struct_name + "." + field_name, field_index.to_string())
+    return updated_fields
 
 fn ir_collect_struct_decl(node: Node, emit_decl: Bool):
     sname := ir_declared_struct_name(node)
     mut field_names: List[String] := []
     mut i := 0
     while i < node.children.len():
-        field_node := get_node(node.children[i])
+        field_node := ir_unwrap_pub_node(node.children[i])
         if field_node.kind == "field":
-            ir_record_struct_field(sname, field_names, field_node)
+            field_names = ir_record_struct_field(sname, field_names, field_node)
         i = i + 1
     ir_struct_names.insert(sname, field_names.len())
     if emit_decl:
@@ -794,7 +838,7 @@ fn ir_collect_enum_decl(node: Node, emit_decl: Bool):
     mut variant_names: List[String] := []
     mut i := 0
     while i < node.children.len():
-        variant_node := get_node(node.children[i])
+        variant_node := ir_unwrap_pub_node(node.children[i])
         if variant_node.kind == "variant":
             variant_index := variant_names.len()
             variant_names.push(variant_node.value)
@@ -808,9 +852,9 @@ fn ir_collect_enum_decl(node: Node, emit_decl: Bool):
 fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool):
     for item_idx in ir_root_items(root_idx):
         cn := get_node(item_idx)
-        if cn.kind == "struct_decl":
+        if cn.kind == "struct_decl" or cn.kind == "struct":
             ir_collect_struct_decl(cn, emit_decl)
-        elif cn.kind == "enum_decl":
+        elif cn.kind == "enum_decl" or cn.kind == "enum":
             ir_collect_enum_decl(cn, emit_decl)
 
 fn ir_seed_global_types():
@@ -845,7 +889,9 @@ fn ir_type_from_tid(tid: Int) -> String:
     if tid < 0:
         return ""
     mut info := get_type_info(tid)
-    if info.kind == "optional" or info.kind == "result":
+    if info.kind == "result":
+        return "tuple"
+    if info.kind == "optional":
         if info.inner < 0:
             return ""
         info = get_type_info(info.inner)
@@ -896,17 +942,69 @@ fn ir_checked_result_kind(idx: Int) -> String:
     info := get_type_info(tid)
     if info.kind != "result":
         return ""
-    inner_type := ir_type_from_tid(info.inner)
-    if inner_type == "int":
+    return "tuple"
+
+fn ir_builtin_result_retkind(name: String) -> String:
+    if name == "parse_int" or name == "file_open_read" or name == "file_open_write" or name == "file_open_append" or name == "byte_buffer_write" or name == "byte_buffer_write_byte" or name == "file_write" or name == "file_write_bytes" or name == "tcp_connect" or name == "tcp_listen" or name == "tcp_accept" or name == "tcp_write" or name == "tcp_write_bytes" or name == "process_spawn" or name == "process_spawn_argv" or name == "process_output_argv" or name == "process_write" or name == "process_write_bytes":
         return "result_int"
-    if inner_type == "bool":
+    if name == "write_file" or name == "append_file" or name == "write_file_bytes" or name == "append_file_bytes":
         return "result_bool"
-    if inner_type == "bytes":
+    if name == "parse_float":
+        return "float"
+    if name == "read_file" or name == "exec_output" or name == "dns_resolve" or name == "bytes_to_string_utf8" or name == "file_read" or name == "tcp_read" or name == "process_read" or name == "process_read_err":
+        return "string"
+    if name == "read_file_bytes" or name == "b64_decode" or name == "from_hex" or name == "file_read_bytes" or name == "tcp_read_bytes" or name == "process_read_bytes" or name == "process_read_err_bytes":
         return "bytes"
-    return ir_retkind(inner_type)
+    return ""
+
+fn ir_expr_legacy_result_kind(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "call" and node.children.len() > 0:
+        callee := ir_resolve_static_callee(node.children[0])
+        if ir_declared_callable_ir_retkind(callee.name).len() > 0:
+            return ""
+        return ir_builtin_result_retkind(callee.name)
+    if node.kind == "method_call":
+        alias_name := ir_resolve_module_alias_method_call_name(idx)
+        if alias_name.len() > 0:
+            if ir_declared_callable_ir_retkind(alias_name).len() > 0:
+                return ""
+            return ir_builtin_result_retkind(alias_name)
+        obj_type := ir_method_receiver_type(node)
+        emit_name := ir_method_emit_name(ir_plain_method_name(node.value), obj_type)
+        if ir_declared_callable_ir_retkind(emit_name).len() > 0:
+            return ""
+        return ir_builtin_result_retkind(emit_name)
+    return ""
 
 fn ir_call_retkind(idx: Int, uses_result_abi: Bool) -> String:
     if uses_result_abi:
+        node := get_node(idx)
+        if node.kind == "call" and node.children.len() > 0:
+            callee := ir_resolve_static_callee(node.children[0])
+            declared_kind := ir_declared_callable_ir_retkind(callee.name)
+            if declared_kind.len() > 0:
+                return declared_kind
+        if node.kind == "method_call":
+            alias_name := ir_resolve_module_alias_method_call_name(idx)
+            if alias_name.len() > 0:
+                declared_kind := ir_declared_callable_ir_retkind(alias_name)
+                if declared_kind.len() > 0:
+                    return declared_kind
+            obj_type := ir_method_receiver_type(node)
+            method_name := ir_plain_method_name(node.value)
+            impl_name := ir_lookup_impl_method_name(obj_type, method_name)
+            if impl_name.len() > 0:
+                declared_kind := ir_declared_callable_ir_retkind(impl_name)
+                if declared_kind.len() > 0:
+                    return declared_kind
+            emit_name := ir_method_emit_name(method_name, obj_type)
+            declared_kind := ir_declared_callable_ir_retkind(emit_name)
+            if declared_kind.len() > 0:
+                return declared_kind
+        legacy_kind := ir_expr_legacy_result_kind(idx)
+        if legacy_kind.len() > 0:
+            return legacy_kind
         result_kind := ir_checked_result_kind(idx)
         if result_kind.len() > 0:
             return result_kind
@@ -1112,9 +1210,17 @@ fn ir_field_expr_type(node: Node) -> String:
     if fname == "is_ok" or fname == "is_err":
         return "bool"
     if fname == "ok":
-        checked := ir_checked_type(node.children[0])
-        if checked.len() > 0:
-            return checked
+        obj_tid := c_get_expr_type(node.children[0])
+        if obj_tid >= 0:
+            obj_info := get_type_info(obj_tid)
+            if obj_info.kind == "result":
+                return ir_type_from_tid(obj_info.inner)
+    if fname == "err":
+        obj_tid := c_get_expr_type(node.children[0])
+        if obj_tid >= 0:
+            obj_info := get_type_info(obj_tid)
+            if obj_info.kind == "result":
+                return ir_type_from_tid(obj_info.value_type)
     obj_type := ir_field_receiver_type(node.children[0])
     if obj_type.len() == 0:
         return ""
@@ -1325,6 +1431,7 @@ fn ir_method_emit_name(mname: String, obj_type: String) -> String:
     obj_is_bytes := obj_type == "bytes"
     obj_is_bool := obj_type == "bool"
     obj_is_float := obj_type == "float"
+    obj_is_int := obj_type == "int"
     obj_is_map := obj_type == "map" or obj_type == "map_int"
     obj_is_set := obj_type == "set" or obj_type == "set_int"
     obj_is_list := obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
@@ -1335,6 +1442,8 @@ fn ir_method_emit_name(mname: String, obj_type: String) -> String:
             emit_name = "float_to_string"
         elif obj_is_bool:
             emit_name = "bool_to_string"
+        elif obj_is_int:
+            emit_name = "int_to_string"
         elif obj_is_string:
             emit_name = "identity"
         elif obj_type == "":
@@ -1382,7 +1491,7 @@ fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
         return converted
     if expr_type == "int":
         converted := ir_reg()
-        ir_emit_call1(converted, "to_string", "string", part_r)
+        ir_emit_call1(converted, "int_to_string", "string", part_r)
         return converted
     if expr_type == "":
         converted := ir_reg()
@@ -1418,10 +1527,13 @@ fn ir_emit_lambda_capture_loads(captures: List[String]):
         i = i + 1
 
 fn ir_append_deferred_lambda_body():
+    lines: List[String] := ir_lines
+    mut bodies: List[String] := ir_lambda_bodies
     mut i := 0
-    while i < ir_lines.len():
-        ir_lambda_bodies.push(ir_lines[i])
+    while i < lines.len():
+        bodies.push(lines[i])
         i = i + 1
+    ir_lambda_bodies = bodies
 
 fn ir_emit_unary_expr(node: Node) -> Int:
     operand_r := ir_expr(node.children[0])
@@ -1587,7 +1699,11 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         return ir_emit_test_assert_eq(node, arg_regs)
 
     r := ir_reg()
-    ir_emit_resolved_call(r, callee.name, idx, arg_regs, ir_callee_uses_result_abi(callee, idx))
+    uses_result_abi := ir_callee_uses_result_abi(callee, idx)
+    ret_type := ir_call_retkind(idx, uses_result_abi)
+    ir_emit_call_text(r, callee.name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
+    if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
+        return ir_emit_wrapped_legacy_result(r, ret_type, callee.name)
     return r
 
 fn ir_map_uses_int_keys(node: Node) -> Bool:
@@ -1697,37 +1813,229 @@ fn ir_emit_field_access(idx: Int, node: Node) -> Int:
     return r
 
 fn ir_emit_result_flag_field(obj_r: Int, fname: String) -> Int:
+    flag_r := ir_reg()
+    ir_emit("field " + flag_r.to_string() + " " + obj_r.to_string() + " 0 bool is_ok")
+    if fname == "is_ok":
+        return flag_r
     zero := ir_reg()
     ir_emit("iconst " + zero.to_string() + " 0")
     r := ir_reg()
-    if fname == "is_ok":
-        ir_emit("neq " + r.to_string() + " " + obj_r.to_string() + " " + zero.to_string())
+    ir_emit("eq " + r.to_string() + " " + flag_r.to_string() + " " + zero.to_string())
+    return r
+
+fn ir_zero_reg() -> Int:
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " 0")
+    return r
+
+fn ir_emit_result_tuple(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " 3")
+    result_r := ir_reg()
+    ir_emit_call1(result_r, "__struct_alloc", "struct:tuple", count_r)
+    ir_emit("sstore " + result_r.to_string() + " 0 " + is_ok_r.to_string())
+    ir_emit("sstore " + result_r.to_string() + " 1 " + ok_r.to_string())
+    ir_emit("sstore " + result_r.to_string() + " 2 " + err_r.to_string())
+    return result_r
+
+fn ir_emit_ok_result_tuple(ok_r: Int) -> Int:
+    one := ir_reg()
+    ir_emit("iconst " + one.to_string() + " 1")
+    return ir_emit_result_tuple(one, ok_r, ir_zero_reg())
+
+fn ir_emit_err_result_tuple(err_r: Int) -> Int:
+    zero := ir_zero_reg()
+    return ir_emit_result_tuple(zero, zero, err_r)
+
+fn ir_result_field_kind(obj_tid: Int, fname: String) -> String:
+    if obj_tid < 0:
+        if fname == "is_ok" or fname == "is_err":
+            return "bool"
+        return "unknown"
+    obj_info := get_type_info(obj_tid)
+    if obj_info.kind != "result":
+        if fname == "is_ok" or fname == "is_err":
+            return "bool"
+        return "unknown"
+    if fname == "ok":
+        return ir_type_from_tid(obj_info.inner)
+    if fname == "err":
+        return ir_type_from_tid(obj_info.value_type)
+    return "bool"
+
+fn ir_emit_result_value_field(obj_r: Int, obj_tid: Int, fname: String) -> Int:
+    mut offset := 8
+    if fname == "err":
+        offset = 16
+    r := ir_reg()
+    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " " + offset.to_string() + " " + ir_result_field_kind(obj_tid, fname) + " " + fname)
+    return r
+
+fn ir_emit_result_error_message(callee_name: String) -> Int:
+    msg_r := ir_reg()
+    ir_emit("strref " + msg_r.to_string() + " " + ir_str(callee_name + " failed"))
+    return msg_r
+
+fn ir_emit_wrapped_legacy_result(raw_r: Int, legacy_kind: String, callee_name: String) -> Int:
+    temp_name := ir_new_temp_name("legacy_result")
+    ir_var_types.insert(temp_name, "tuple")
+    zero_r := ir_reg()
+    if legacy_kind == "float":
+        ir_emit("fconst " + zero_r.to_string() + " 0.0")
     else:
-        ir_emit("eq " + r.to_string() + " " + obj_r.to_string() + " " + zero.to_string())
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+    cond_r := ir_reg()
+    ir_emit("neq " + cond_r.to_string() + " " + raw_r.to_string() + " " + zero_r.to_string())
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + ok_l)
+    mut ok_r := raw_r
+    if legacy_kind == "result_int" or legacy_kind == "result_bool":
+        ok_r = ir_decode_result_value(raw_r, legacy_kind)
+    ok_tuple := ir_emit_ok_result_tuple(ok_r)
+    ir_emit("store " + temp_name + " " + ok_tuple.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit("label " + err_l)
+    err_tuple := ir_emit_err_result_tuple(ir_emit_result_error_message(callee_name))
+    ir_emit("store " + temp_name + " " + err_tuple.to_string())
+    ir_emit("label " + merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
 fn ir_emit_result_field_access(idx: Int, obj_r: Int, fname: String) -> Int:
     obj_tid := c_get_expr_type(node_child(idx, 0))
-    expr_result_kind := ir_expr_result_kind(node_child(idx, 0))
     if obj_tid >= 0:
         obj_info := get_type_info(obj_tid)
         if obj_info.kind == "result":
             if fname == "ok":
-                if expr_result_kind == "result_int" or expr_result_kind == "result_bool":
-                    return ir_decode_result_value(obj_r, expr_result_kind)
-                result_kind := ir_retkind(get_type_name(obj_info.inner))
-                if result_kind == "result_int" or result_kind == "result_bool":
-                    return ir_decode_result_value(obj_r, result_kind)
-                return obj_r
+                return ir_emit_result_value_field(obj_r, obj_tid, "ok")
+            if fname == "err":
+                return ir_emit_result_value_field(obj_r, obj_tid, "err")
             if fname == "is_ok" or fname == "is_err":
                 return ir_emit_result_flag_field(obj_r, fname)
-    if fname == "ok":
-        if expr_result_kind == "result_int" or expr_result_kind == "result_bool":
-            return ir_decode_result_value(obj_r, expr_result_kind)
-        return obj_r
-    if fname == "is_ok" or fname == "is_err":
-        return ir_emit_result_flag_field(obj_r, fname)
     return 0 - 1
+
+fn ir_method_call_arg_expr(node: Node, arg_index: Int) -> Int:
+    actual_index := arg_index + 1
+    if actual_index >= node.children.len():
+        return 0 - 1
+    child := node.children[actual_index]
+    cn := get_node(child)
+    if cn.kind == "arg" and cn.children.len() > 0:
+        return cn.children[0]
+    return child
+
+fn ir_emit_result_unwrap_or(node: Node) -> Int:
+    recv_r := ir_expr(node.children[0])
+    cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
+    temp_name := ir_new_temp_name("unwrap_or")
+    arg_idx := ir_method_call_arg_expr(node, 0)
+    fallback_r := ir_expr(arg_idx)
+    ok_l := ir_label()
+    fallback_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
+    ir_emit("label " + ok_l)
+    ir_emit("store " + temp_name + " " + ir_emit_result_value_field(recv_r, c_get_expr_type(node.children[0]), "ok").to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit("label " + fallback_l)
+    ir_emit("store " + temp_name + " " + fallback_r.to_string())
+    ir_emit("label " + merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
+fn ir_emit_stringify_value(value_r: Int, value_type: String) -> Int:
+    if value_type == "string":
+        return value_r
+    out_r := ir_reg()
+    if value_type == "bool":
+        ir_emit_call1(out_r, "bool_to_string", "string", value_r)
+        return out_r
+    if value_type == "float":
+        ir_emit_call1(out_r, "float_to_string", "string", value_r)
+        return out_r
+    if value_type == "int":
+        ir_emit_call1(out_r, "int_to_string", "string", value_r)
+        return out_r
+    ir_emit_call1(out_r, "smart_to_string", "string", value_r)
+    return out_r
+
+fn ir_emit_result_to_string(node: Node) -> Int:
+    recv_r := ir_expr(node.children[0])
+    recv_tid := c_get_expr_type(node.children[0])
+    mut ok_type := "unknown"
+    mut err_type := "unknown"
+    if recv_tid >= 0:
+        recv_info := get_type_info(recv_tid)
+        if recv_info.kind == "result":
+            ok_type = ir_type_from_tid(recv_info.inner)
+            err_type = ir_type_from_tid(recv_info.value_type)
+    cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
+    temp_name := ir_new_temp_name("result_to_string")
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + ok_l)
+    ok_r := ir_emit_result_value_field(recv_r, recv_tid, "ok")
+    ir_emit("store " + temp_name + " " + ir_emit_stringify_value(ok_r, ok_type).to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit("label " + err_l)
+    err_r := ir_emit_result_value_field(recv_r, recv_tid, "err")
+    ir_emit("store " + temp_name + " " + ir_emit_stringify_value(err_r, err_type).to_string())
+    ir_emit("label " + merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
+fn ir_emit_named_handler_call(handler_idx: Int, arg_r: Int, ret_type: String) -> Int:
+    handler_node := get_node(handler_idx)
+    callee := ir_resolve_static_callee(handler_idx)
+    mut call_name := callee.name
+    if call_name.len() == 0 and handler_node.kind == "ident":
+        call_name = handler_node.value
+    if call_name.len() > 0:
+        out_r := ir_reg()
+        legacy_kind := ir_builtin_result_retkind(call_name)
+        mut call_type := ret_type
+        if legacy_kind.len() > 0:
+            call_type = legacy_kind
+        ir_emit_call_text(out_r, call_name, call_type, 1, " " + arg_r.to_string())
+        if legacy_kind.len() > 0 and ret_type == "tuple":
+            return ir_emit_wrapped_legacy_result(out_r, legacy_kind, call_name)
+        return out_r
+    handler_r := ir_expr(handler_idx)
+    handler_name := ir_new_temp_name("handler")
+    ir_emit("store " + handler_name + " " + handler_r.to_string())
+    out_r := ir_reg()
+    ir_emit_call_text(out_r, handler_name, ret_type, 1, " " + arg_r.to_string())
+    return out_r
+
+fn ir_emit_result_or_else(idx: Int, node: Node) -> Int:
+    recv_r := ir_expr(node.children[0])
+    cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
+    temp_name := ir_new_temp_name("or_else")
+    ir_var_types.insert(temp_name, "tuple")
+    handler_idx := ir_method_call_arg_expr(node, 0)
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + ok_l)
+    ir_emit("store " + temp_name + " " + recv_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit("label " + err_l)
+    err_r := ir_emit_result_value_field(recv_r, c_get_expr_type(node.children[0]), "err")
+    handled_r := ir_emit_named_handler_call(handler_idx, err_r, ir_checked_type(idx))
+    ir_emit("store " + temp_name + " " + handled_r.to_string())
+    ir_emit("label " + merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
 
 # --- method call dispatch (extracted from ir_expr) ---
 fn ir_emit_method_call(idx: Int) -> Int:
@@ -1735,11 +2043,27 @@ fn ir_emit_method_call(idx: Int) -> Int:
     # first child is object, then args. value is method_name (may have leading dot)
     mname := ir_plain_method_name(node_value(idx))
 
+    if node.children.len() > 0:
+        recv_tid := c_get_expr_type(node.children[0])
+        if recv_tid >= 0:
+            recv_info := get_type_info(recv_tid)
+            if recv_info.kind == "result":
+                if mname == "unwrap_or":
+                    return ir_emit_result_unwrap_or(node)
+                if mname == "or_else":
+                    return ir_emit_result_or_else(idx, node)
+                if mname == "to_string":
+                    return ir_emit_result_to_string(node)
+
     alias_fname := ir_resolve_module_alias_method_call_name(idx)
     if alias_fname.len() > 0:
         arg_regs := ir_collect_call_arg_regs(node, 1)
         r := ir_reg()
-        ir_emit_resolved_call(r, alias_fname, idx, arg_regs, ir_callee_uses_result_abi(ResolvedCallee(alias_fname, true), idx))
+        uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(alias_fname, true), idx)
+        ret_type := ir_call_retkind(idx, uses_result_abi)
+        ir_emit_call_text(r, alias_fname, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
+        if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
+            return ir_emit_wrapped_legacy_result(r, ret_type, alias_fname)
         return r
 
     obj_type := ir_method_receiver_type(node)
@@ -1766,6 +2090,8 @@ fn ir_emit_method_call(idx: Int) -> Int:
         ret_type = "void"
     call_args := ir_method_call_arg_regs(obj_r, arg_regs)
     ir_emit_call_text(r, emit_name, ret_type, call_args.len(), ir_join_arg_regs(call_args))
+    if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
+        return ir_emit_wrapped_legacy_result(r, ret_type, emit_name)
     if ir_is_void_method(emit_name):
         return obj_r
     return r
@@ -1910,9 +2236,14 @@ fn ir_emit_bool_literal(node: Node) -> Int:
         ir_emit("iconst " + r.to_string() + " 0")
     return r
 
+fn ir_resolve_storage_name(name: String) -> String:
+    if ir_import_renames.contains_key(name):
+        return ir_import_renames[name]
+    return name
+
 fn ir_emit_ident_load(name: String) -> Int:
     r := ir_reg()
-    ir_emit("load " + r.to_string() + " " + name)
+    ir_emit("load " + r.to_string() + " " + ir_resolve_storage_name(name))
     return r
 
 fn ir_emit_struct_init(node: Node) -> Int:
@@ -1929,7 +2260,9 @@ fn ir_emit_struct_init(node: Node) -> Int:
         i = i + 1
 
     r := ir_reg()
-    ir_emit_call1(r, "__struct_alloc", "struct:" + sname, field_regs.len())
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " " + field_regs.len().to_string())
+    ir_emit_call1(r, "__struct_alloc", "struct:" + sname, field_count_r)
     mut fi := 0
     while fi < field_regs.len():
         ir_emit("sstore " + r.to_string() + " " + fi.to_string() + " " + field_regs[fi].to_string())
@@ -1967,13 +2300,29 @@ fn ir_emit_try_expr(node: Node) -> Int:
     if node.children.len() > 0:
         result_kind := ir_expr_result_kind(node.children[0])
         val_r := ir_expr(node.children[0])
+        if result_kind == "tuple":
+            cond_r := ir_emit_result_flag_field(val_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            merge_l := ir_label()
+            ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + ok_l)
+            decoded_r := ir_emit_result_value_field(val_r, c_get_expr_type(node.children[0]), "ok")
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + err_l)
+            ir_emit("ret " + val_r.to_string())
+            ir_emit("label " + merge_l)
+            return decoded_r
         mut cond_r := val_r
         mut decoded_r := val_r
         if ir_uses_result_abi(result_kind):
             decoded_r = ir_decode_result_value(val_r, result_kind)
         elif result_kind.len() > 0:
             zero_cmp := ir_reg()
-            ir_emit("iconst " + zero_cmp.to_string() + " 0")
+            if result_kind == "float":
+                ir_emit("fconst " + zero_cmp.to_string() + " 0.0")
+            else:
+                ir_emit("iconst " + zero_cmp.to_string() + " 0")
             cond_r = ir_reg()
             ir_emit("neq " + cond_r.to_string() + " " + val_r.to_string() + " " + zero_cmp.to_string())
         ok_l := ir_label()
@@ -1994,10 +2343,10 @@ fn ir_emit_try_expr(node: Node) -> Int:
 
 fn ir_emit_fail_expr(node: Node) -> Int:
     if node.children.len() > 0:
-        ir_expr(node.children[0])
-    zero := ir_reg()
-    ir_emit("iconst " + zero.to_string() + " 0")
-    ir_emit("ret " + zero.to_string())
+        err_r := ir_expr(node.children[0])
+        ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
+    else:
+        ir_emit("ret " + ir_emit_err_result_tuple(ir_zero_reg()).to_string())
     ub := ir_label()
     ir_emit("label " + ub)
     r := ir_reg()
@@ -2119,6 +2468,24 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
     if kind == "try" or kind == "try_expr":
         return ir_emit_try_expr(node)
 
+    if kind == "catch_expr":
+        result_r := ir_expr(node.children[0])
+        cond_r := ir_emit_result_flag_field(result_r, "is_ok")
+        temp_name := ir_new_temp_name("catch")
+        ok_l := ir_label()
+        fallback_l := ir_label()
+        merge_l := ir_label()
+        ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
+        ir_emit("label " + ok_l)
+        ir_emit("store " + temp_name + " " + ir_emit_result_value_field(result_r, c_get_expr_type(node.children[0]), "ok").to_string())
+        ir_emit("jmp " + merge_l)
+        ir_emit("label " + fallback_l)
+        ir_emit("store " + temp_name + " " + ir_expr(node.children[1]).to_string())
+        ir_emit("label " + merge_l)
+        r := ir_reg()
+        ir_emit("load " + r.to_string() + " " + temp_name)
+        return r
+
     if kind == "fail":
         return ir_emit_fail_expr(node)
 
@@ -2142,6 +2509,8 @@ fn ir_stmt_is_expr(kind: String) -> Bool:
         return true
     if kind == "await" or kind == "try" or kind == "try_expr":
         return true
+    if kind == "catch_expr":
+        return true
     return kind == "fail"
 
 struct IfBranch:
@@ -2156,9 +2525,9 @@ fn ir_emit_return_stmt(node: Node):
     if node.children.len() > 0:
         mut r := ir_expr(node.children[0])
         result_kind := ir_expr_result_kind(node.children[0])
-        if ir_current_func_return_kind == "result_int" or ir_current_func_return_kind == "result_bool":
-            if result_kind != ir_current_func_return_kind:
-                r = ir_encode_result_value(r, ir_current_func_return_kind)
+        if ir_current_func_return_kind == "tuple":
+            if result_kind != "tuple":
+                r = ir_emit_ok_result_tuple(r)
         ir_emit("ret " + r.to_string())
     else:
         r := ir_reg()
@@ -2194,7 +2563,7 @@ fn ir_emit_bind_stmt(node: Node):
     if val_idx >= 0:
         r := ir_emit_value_for_target(val_idx, target_type)
         ir_var_regs.insert(name, r)
-        ir_emit("store " + name + " " + r.to_string())
+        ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
         if not ir_var_types.contains_key(name):
             inferred := ir_infer_type(val_idx)
             if inferred.len() > 0:
@@ -2205,7 +2574,7 @@ fn ir_emit_assign_stmt(node: Node):
     if node.children.len() > 0:
         r := ir_emit_value_for_target(node.children[0], ir_lookup_name_type(name))
         ir_var_regs.insert(name, r)
-        ir_emit("store " + name + " " + r.to_string())
+        ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
 
 fn ir_emit_compound_assignment(node: Node):
     op := node.value
@@ -2214,13 +2583,13 @@ fn ir_emit_compound_assignment(node: Node):
         name := tn.value
         target_type := ir_checked_target_type(node.children[0], name)
         r := ir_emit_value_for_target(node.children[1], target_type)
-        ir_emit("store " + name + " " + r.to_string())
+        ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
         return
     if (op == "+=" or op == "-=" or op == "*=" or op == "/=") and node.children.len() >= 2:
         tn := get_node(node.children[0])
         name := tn.value
         cur := ir_reg()
-        ir_emit("load " + cur.to_string() + " " + name)
+        ir_emit("load " + cur.to_string() + " " + ir_resolve_storage_name(name))
         rhs := ir_expr(node.children[1])
         res := ir_reg()
         if op == "+=":
@@ -2231,7 +2600,7 @@ fn ir_emit_compound_assignment(node: Node):
             ir_emit("mul " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
         elif op == "/=":
             ir_emit("div " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
-        ir_emit("store " + name + " " + res.to_string())
+        ir_emit("store " + ir_resolve_storage_name(name) + " " + res.to_string())
 
 fn ir_collect_if_branch(node: Node) -> IfBranch:
     mut cond_idx := 0 - 1
@@ -2367,8 +2736,8 @@ fn ir_emit_while_stmt(node: Node):
         cr := ir_expr(node.children[0])
         ir_emit("brif " + cr.to_string() + " " + body_label + " " + end_label)
         ir_emit("label " + body_label)
-        ir_break_stack.push(end_label)
-        ir_continue_stack.push(head_label)
+        ir_break_stack = ir_push_string(ir_break_stack, end_label)
+        ir_continue_stack = ir_push_string(ir_continue_stack, head_label)
         ir_block(node.children[1])
         ir_break_stack.remove(ir_break_stack.len() - 1)
         ir_continue_stack.remove(ir_continue_stack.len() - 1)
@@ -2434,8 +2803,8 @@ fn ir_emit_for_stmt(node: Node):
         ir_emit("brif " + cmp_r.to_string() + " " + body_l + " " + end_l)
         ir_emit("label " + body_l)
         ir_emit_for_loop_value_binding(names.value_name, names.index_name, item_kind, ft, fi)
-        ir_break_stack.push(end_l)
-        ir_continue_stack.push(step_l)
+        ir_break_stack = ir_push_string(ir_break_stack, end_l)
+        ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
         ir_block(node.children[1])
         ir_break_stack.remove(ir_break_stack.len() - 1)
         ir_continue_stack.remove(ir_continue_stack.len() - 1)
@@ -2566,6 +2935,9 @@ fn ir_lookup_func_return(full_name: String, base_name: String) -> String:
 fn ir_impl_method_key(type_name: String, method_name: String) -> String:
     return type_name + "." + method_name
 
+fn ir_import_impl_method_name(module_path: String, impl_type: String, method_name: String) -> String:
+    return ir_import_target_name(module_path, impl_type + "_" + method_name)
+
 fn ir_lookup_impl_method_name(type_name: String, method_name: String) -> String:
     if type_name.len() == 0:
         return ""
@@ -2584,11 +2956,11 @@ fn ir_lookup_impl_method_name(type_name: String, method_name: String) -> String:
             return ir_impl_methods[base_key]
     return ""
 
-fn ir_collect_impl_methods(root_idx: Int):
+fn ir_collect_impl_methods(root_idx: Int, module_path: String):
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
         if node.kind == "impl_decl":
-            ir_collect_impl_method_signatures(node)
+            ir_collect_impl_method_signatures(node, module_path)
 
 fn ir_root_items(root_idx: Int) -> List[Int]:
     root := get_node(root_idx)
@@ -2655,7 +3027,11 @@ fn ir_collect_generic_function_decls_from_root(root_idx: Int, module_path: Strin
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
         if ir_is_fn_decl_kind(node.kind) and ir_has_generic_params(node):
-            ir_generic_decl_indices.insert(ir_import_target_name(module_path, node.value), item_idx)
+            mut full_name := node.value
+            if module_path.len() > 0:
+                full_name = ir_import_target_name(module_path, node.value)
+            ir_generic_decl_indices.insert(full_name, item_idx)
+            ir_generic_decl_module_paths.insert(full_name, module_path)
 
 fn ir_collect_generic_function_decls(root_idx: Int):
     ir_generic_decl_indices = {}
@@ -2743,23 +3119,23 @@ fn ir_extract_param_types_with_subst(fn_idx: Int, generic_params: List[String], 
         i = i + 1
     return param_types
 
-fn ir_bind_inferred_generic_runtime_type(name: String, actual_tid: Int, subst_map: Map[String, String]) -> Bool:
+fn ir_bind_inferred_generic_runtime_type(name: String, actual_tid: Int) -> Bool:
     concrete := ir_type_from_tid(actual_tid)
     if concrete.len() == 0:
         return true
-    if subst_map.contains_key(name):
-        return subst_map[name] == concrete
-    subst_map.insert(name, concrete)
+    if ir_generic_runtime_subst.contains_key(name):
+        return ir_generic_runtime_subst[name] == concrete
+    ir_generic_runtime_subst.insert(name, concrete)
     return true
 
-fn ir_infer_generic_runtime_types_from_node(type_idx: Int, actual_tid: Int, generic_params: List[String], subst_map: Map[String, String]) -> Bool:
+fn ir_infer_generic_runtime_types_from_node(type_idx: Int, actual_tid: Int, generic_params: List[String]) -> Bool:
     if type_idx < 0 or actual_tid < 0:
         return true
     node := get_node(type_idx)
     if node.kind == "type":
         for gp in generic_params:
             if gp == node.value:
-                return ir_bind_inferred_generic_runtime_type(gp, actual_tid, subst_map)
+                return ir_bind_inferred_generic_runtime_type(gp, actual_tid)
         return true
 
     actual_info := get_type_info(actual_tid)
@@ -2767,39 +3143,39 @@ fn ir_infer_generic_runtime_types_from_node(type_idx: Int, actual_tid: Int, gene
     if node.kind == "generic_type":
         if node.value == "List":
             if actual_info.kind == "list" and node.children.len() > 0:
-                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map)
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params)
             return true
         if node.value == "Set":
             if actual_info.kind == "set" and node.children.len() > 0:
-                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map)
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params)
             return true
         if node.value == "Task":
             if actual_info.kind == "task" and node.children.len() > 0:
-                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map)
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params)
             return true
         if node.value == "Channel":
             if actual_info.kind == "channel" and node.children.len() > 0:
-                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map)
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params)
             return true
         if node.value == "Map":
             if actual_info.kind == "map" and node.children.len() > 1:
-                if ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.key_type, generic_params, subst_map) == false:
+                if ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.key_type, generic_params) == false:
                     return false
-                return ir_infer_generic_runtime_types_from_node(node.children[1], actual_info.value_type, generic_params, subst_map)
+                return ir_infer_generic_runtime_types_from_node(node.children[1], actual_info.value_type, generic_params)
             return true
         return true
 
     if node.kind == "optional_type":
         if actual_info.kind == "optional" and node.children.len() > 0:
-            return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map)
+            return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params)
         return true
 
     if node.kind == "result_type":
         if actual_info.kind == "result" and node.children.len() > 0:
-            if ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map) == false:
+            if ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params) == false:
                 return false
             if node.children.len() > 1 and actual_info.value_type >= 0:
-                return ir_infer_generic_runtime_types_from_node(node.children[1], actual_info.value_type, generic_params, subst_map)
+                return ir_infer_generic_runtime_types_from_node(node.children[1], actual_info.value_type, generic_params)
         return true
 
     if node.kind == "tuple_type":
@@ -2807,7 +3183,7 @@ fn ir_infer_generic_runtime_types_from_node(type_idx: Int, actual_tid: Int, gene
             mut i := 0
             while i < node.children.len():
                 if i < actual_info.elements.len():
-                    if ir_infer_generic_runtime_types_from_node(node.children[i], actual_info.elements[i], generic_params, subst_map) == false:
+                    if ir_infer_generic_runtime_types_from_node(node.children[i], actual_info.elements[i], generic_params) == false:
                         return false
                 i = i + 1
         return true
@@ -2820,11 +3196,11 @@ fn ir_infer_generic_runtime_types_from_node(type_idx: Int, actual_tid: Int, gene
                 cn := get_node(node.children[i])
                 if cn.kind == "param":
                     if param_idx < actual_info.param_types.len():
-                        if ir_infer_generic_runtime_types_from_node(cn.children[0], actual_info.param_types[param_idx], generic_params, subst_map) == false:
+                        if ir_infer_generic_runtime_types_from_node(cn.children[0], actual_info.param_types[param_idx], generic_params) == false:
                             return false
                     param_idx = param_idx + 1
                 elif cn.kind == "returns" and cn.children.len() > 0:
-                    return ir_infer_generic_runtime_types_from_node(cn.children[0], actual_info.return_type, generic_params, subst_map)
+                    return ir_infer_generic_runtime_types_from_node(cn.children[0], actual_info.return_type, generic_params)
                 i = i + 1
         return true
 
@@ -2857,16 +3233,16 @@ fn ir_infer_generic_concrete_types(name: String, node: Node) -> List[String]:
                 expr_idx = cn.children[0]
         arg_tids.push(c_get_expr_type(expr_idx))
         i = i + 1
-    mut subst_map: Map[String, String] := {}
+    ir_generic_runtime_subst = {}
     mut arg_idx := 0
     while arg_idx < param_type_nodes.len():
         if arg_idx < arg_tids.len() and param_type_nodes[arg_idx] >= 0:
-            ir_infer_generic_runtime_types_from_node(param_type_nodes[arg_idx], arg_tids[arg_idx], generic_params, subst_map)
+            ir_infer_generic_runtime_types_from_node(param_type_nodes[arg_idx], arg_tids[arg_idx], generic_params)
         arg_idx = arg_idx + 1
     mut concrete_types: List[String] := []
     for gp in generic_params:
-        if subst_map.contains_key(gp):
-            concrete_types.push(subst_map[gp])
+        if ir_generic_runtime_subst.contains_key(gp):
+            concrete_types.push(ir_generic_runtime_subst[gp])
         else:
             concrete_types.push("unknown")
     return concrete_types
@@ -2909,7 +3285,7 @@ fn ir_queue_generic_specialization(name: String, arg_types: List[String], ret_ty
     if ir_generic_specialization_names.contains_key(key):
         return ir_generic_specialization_names[key]
     spec_name := ir_generic_specialization_name(name, arg_types)
-    ir_generic_specialization_keys.push(key)
+    ir_generic_specialization_keys = ir_push_string(ir_generic_specialization_keys, key)
     ir_generic_specialization_names.insert(key, spec_name)
     ir_generic_specialization_type_lists.insert(key, ir_encode_type_list(arg_types))
     ir_func_returns.insert(spec_name, ret_type)
@@ -2932,8 +3308,13 @@ fn ir_emit_generic_specialization(key: String):
     param_types := ir_extract_param_types_with_subst(decl_idx, generic_params, concrete_types)
     saved_params := ir_active_generic_params
     saved_types := ir_active_generic_concrete_types
+    saved_module_path := ir_active_generic_module_path
     ir_active_generic_params = generic_params
     ir_active_generic_concrete_types = concrete_types
+    if ir_generic_decl_module_paths.contains_key(base_name):
+        ir_active_generic_module_path = ir_generic_decl_module_paths[base_name]
+    else:
+        ir_active_generic_module_path = ""
     ir_prepare_func_emission(ret_type)
     ir_emit_func_header(spec_name, param_count, ret_type)
     ir_emit_fn_params_with_types(decl_idx, param_types)
@@ -2941,6 +3322,7 @@ fn ir_emit_generic_specialization(key: String):
     ir_finish_func_emission(body_idx)
     ir_active_generic_params = saved_params
     ir_active_generic_concrete_types = saved_types
+    ir_active_generic_module_path = saved_module_path
 
 fn ir_emit_generic_specializations():
     mut i := 0
@@ -2951,7 +3333,7 @@ fn ir_emit_generic_specializations():
             ir_generic_emitted_specializations.insert(key, 1)
         i = i + 1
 
-fn ir_collect_impl_method_signatures(node: Node):
+fn ir_collect_impl_method_signatures(node: Node, module_path: String):
     impl_type := ir_impl_target_type(node)
     if impl_type.len() == 0:
         return
@@ -2960,12 +3342,14 @@ fn ir_collect_impl_method_signatures(node: Node):
         method_idx := ir_unwrap_pub_child(node.children[i])
         method_node := get_node(method_idx)
         if ir_is_fn_decl_kind(method_node.kind):
-            ir_record_impl_method_signature(impl_type, method_idx, method_node)
+            ir_record_impl_method_signature(impl_type, method_idx, method_node, module_path)
         i = i + 1
 
-fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_node: Node):
+fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_node: Node, module_path: String):
     method_name := method_node.value
-    full_name := impl_type + "_" + method_name
+    mut full_name := impl_type + "_" + method_name
+    if module_path.len() > 0:
+        full_name = ir_import_impl_method_name(module_path, impl_type, method_name)
     key := ir_impl_method_key(impl_type, method_name)
     ret_type := ir_extract_return_type(method_idx)
     ir_impl_methods.insert(key, full_name)
@@ -3079,7 +3463,9 @@ fn ir_collect_from_import_renames(value: String):
     while i < parts.len():
         iname := parts[i]
         if iname.len() > 0:
-            renamed := ir_import_target_name(mod_path, iname)
+            mut renamed := iname
+            if ir_import_declares_function(mod_path, iname) or ir_import_declares_global(mod_path, iname):
+                renamed = ir_import_target_name(mod_path, iname)
             ir_import_renames.insert(iname, renamed)
         i = i + 1
 
@@ -3281,9 +3667,19 @@ fn ir_emit_top_level_items(root_idx: Int, root: Node):
         ir_emit_test_main(root_idx)
 
 fn ir_append_lambda_bodies():
+    bodies: List[String] := ir_lambda_bodies
+    mut lines: List[String] := ir_lines
     mut i := 0
-    while i < ir_lambda_bodies.len():
-        ir_lines.push(ir_lambda_bodies[i])
+    while i < bodies.len():
+        lines.push(bodies[i])
+        i = i + 1
+    ir_lines = lines
+
+fn ir_preseed_result_error_strings():
+    builtin_names := "parse_int,file_open_read,file_open_write,file_open_append,byte_buffer_write,byte_buffer_write_byte,file_write,file_write_bytes,tcp_connect,tcp_listen,tcp_accept,tcp_write,tcp_write_bytes,process_spawn,process_spawn_argv,process_output_argv,process_write,process_write_bytes,write_file,append_file,write_file_bytes,append_file_bytes,read_file,exec_output,dns_resolve,bytes_to_string_utf8,file_read,tcp_read,process_read,process_read_err,read_file_bytes,b64_decode,from_hex,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes".split(",")
+    mut i := 0
+    while i < builtin_names.len():
+        ir_str(builtin_names[i] + " failed")
         i = i + 1
 
 fn ir_emit_string_table():
@@ -3295,6 +3691,11 @@ fn ir_emit_string_table():
 
 fn ir_collect_root_import_metadata(root_idx: Int):
     ir_import_renames = {}
+    ir_import_declared_functions = {}
+    mut preload_i := 0
+    while preload_i < ir_preloaded_import_roots.len():
+        ir_collect_import_declared_functions(ir_preloaded_import_roots[preload_i], ir_preloaded_import_paths[preload_i])
+        preload_i = preload_i + 1
     ir_collect_imports(root_idx)
 
 fn ir_collect_root_type_metadata(root_idx: Int):
@@ -3317,10 +3718,10 @@ fn ir_collect_root_callable_metadata(root_idx: Int):
 
     mut preload_i := 0
     while preload_i < ir_preloaded_import_roots.len():
-        ir_collect_impl_methods(ir_preloaded_import_roots[preload_i])
+        ir_collect_impl_methods(ir_preloaded_import_roots[preload_i], ir_preloaded_import_paths[preload_i])
         preload_i = preload_i + 1
 
-    ir_collect_impl_methods(root_idx)
+    ir_collect_impl_methods(root_idx, "")
 
 fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_global_bindings(root)
@@ -3345,6 +3746,7 @@ pub fn emit_ir(root_idx: Int) -> String:
         ir_collect_strings(ir_preloaded_import_roots[preload_i])
         preload_i = preload_i + 1
     ir_collect_strings(root_idx)
+    ir_preseed_result_error_strings()
     ir_emit_string_table()
 
     # collect aliases first so both type and callable metadata can resolve
@@ -3357,5 +3759,6 @@ pub fn emit_ir(root_idx: Int) -> String:
     ir_lambda_bodies = []
     ir_collect_root_callable_metadata(root_idx)
     ir_emit_root_module(root_idx, root)
+    lines: List[String] := ir_lines
     ir_finish_module_emit()
-    return ir_lines.join(chr(10))
+    return lines.join(chr(10))

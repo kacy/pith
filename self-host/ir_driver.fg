@@ -90,76 +90,74 @@ fn collect_declared_ir_names_from_lines(lines: List[String]) -> DeclaredIrNames:
 fn prefixed_init_name(module_index: Int) -> String:
     return "__init_globals_" + module_index.to_string()
 
-fn collect_import_init_funcs(function_names: List[String], prefix: String, module_index: Int) -> List[String]:
+fn next_space(text: String, start: Int) -> Int:
+    mut i := start
+    while i < text.len():
+        if text[i] == " ":
+            return i
+        i = i + 1
+    return text.len()
+
+fn import_symbol_prefix(module_path: String) -> String:
+    mut prefix := ""
+    mut i := 0
+    while i < module_path.len():
+        if module_path[i] == ".":
+            prefix = prefix + "_"
+        else:
+            prefix = prefix + module_path[i]
+        i = i + 1
+    return prefix + "_"
+
+fn import_target_name(module_path: String, name: String) -> String:
+    return import_symbol_prefix(module_path) + name
+
+fn collect_import_init_funcs(function_names: List[String], module_path: String, module_index: Int) -> List[String]:
     mut init_funcs: List[String] := []
     for name in function_names:
         if name.starts_with("__init_globals"):
-            init_funcs.push(prefix + name.replace("__init_globals", prefixed_init_name(module_index)))
+            init_funcs.push(import_target_name(module_path, prefixed_init_name(module_index)))
     return init_funcs
 
-fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix: String, module_index: Int) -> String:
+fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, module_path: String, module_index: Int) -> String:
     mut rewritten := line
     if line.contains("__init_globals"):
         rewritten = line.replace("__init_globals", prefixed_init_name(module_index))
     parts := rewritten.split(" ")
     if parts.len() >= 2 and parts[0] == "func":
-        rewritten = "func " + prefix + parts[1]
+        rewritten = "func " + import_target_name(module_path, parts[1])
         if parts.len() > 2:
             rewritten = rewritten + " " + join_from(parts, 2)
     elif parts.len() >= 2 and parts[0] == "global":
         if not parts[1].starts_with("__for_"):
-            rewritten = "global " + prefix + parts[1]
+            rewritten = "global " + import_target_name(module_path, parts[1])
             if parts.len() > 2:
                 rewritten = rewritten + " " + join_from(parts, 2)
     elif parts.len() >= 3 and parts[0] == "store":
         if declared.global_set.contains_key(parts[1]):
-            rewritten = "store " + prefix + parts[1] + " " + join_from(parts, 2)
+            rewritten = "store " + import_target_name(module_path, parts[1]) + " " + join_from(parts, 2)
     elif parts.len() >= 3 and parts[0] == "load":
         if declared.global_set.contains_key(parts[2]):
-            rewritten = "load " + parts[1] + " " + prefix + parts[2]
+            rewritten = "load " + parts[1] + " " + import_target_name(module_path, parts[2])
     elif parts.len() >= 5 and parts[0] == "call":
         if declared.function_set.contains_key(parts[2]):
-            rewritten = "call " + parts[1] + " " + prefix + parts[2] + " " + join_from(parts, 3)
+            rewritten = "call " + parts[1] + " " + import_target_name(module_path, parts[2]) + " " + join_from(parts, 3)
     elif parts.len() >= 3 and parts[0] == "callv":
         if declared.function_set.contains_key(parts[1]):
-            rewritten = "callv " + prefix + parts[1]
+            rewritten = "callv " + import_target_name(module_path, parts[1])
             if parts.len() > 2:
                 rewritten = rewritten + " " + join_from(parts, 2)
     return rewritten
 
-fn rewrite_line_with_import_maps(line: String, global_map: Map[String, String], function_map: Map[String, String]) -> String:
-    parts := line.split(" ")
-    mut rewritten := line
-    if parts.len() >= 3 and parts[0] == "load" and global_map.contains_key(parts[2]):
-        rewritten = "load " + parts[1] + " " + global_map[parts[2]]
-    elif parts.len() >= 3 and parts[0] == "store" and global_map.contains_key(parts[1]):
-        rewritten = "store " + global_map[parts[1]] + " " + parts[2]
-    elif parts.len() >= 5 and parts[0] == "call" and function_map.contains_key(parts[2]):
-        rewritten = "call " + parts[1] + " " + function_map[parts[2]] + " " + join_from(parts, 3)
-    elif parts.len() >= 3 and parts[0] == "callv" and function_map.contains_key(parts[1]):
-        rewritten = "callv " + function_map[parts[1]]
-        if parts.len() > 2:
-            rewritten = rewritten + " " + join_from(parts, 2)
-    return rewritten
-
-fn rename_import_ir(ir: String, module_index: Int) -> RenamedImport:
+fn rename_import_ir(ir: String, module_path: String, module_index: Int) -> RenamedImport:
     trimmed_lines := remove_main_from_import_lines(ir_lines(ir))
-    prefix := "m" + module_index.to_string() + "_"
     declared := collect_declared_ir_names_from_lines(trimmed_lines)
-    init_funcs := collect_import_init_funcs(declared.functions, prefix, module_index)
+    init_funcs := collect_import_init_funcs(declared.functions, module_path, module_index)
 
     mut out: List[String] := []
     for line in trimmed_lines:
-        out.push(rewrite_prefixed_import_line(line, declared, prefix, module_index))
+        out.push(rewrite_prefixed_import_line(line, declared, module_path, module_index))
     return RenamedImport(out.join(chr(10)), declared.globals, declared.functions, init_funcs)
-
-fn collect_main_func_names_from_lines(lines: List[String]) -> Map[String, Bool]:
-    mut func_names: Map[String, Bool] := {}
-    for line in lines:
-        parts := line.split(" ")
-        if parts.len() >= 2 and parts[0] == "func":
-            func_names.insert(parts[1], true)
-    return func_names
 
 fn inject_imported_init_calls(out: List[String], imported_init_funcs: List[String]) -> List[String]:
     mut with_inits := out
@@ -168,41 +166,12 @@ fn inject_imported_init_calls(out: List[String], imported_init_funcs: List[Strin
         with_inits.push("call " + (900000 + i).to_string() + " " + imported_init_funcs[i] + " int 0")
         i = i + 1
     return with_inits
-
-fn rewrite_main_line(line: String, main_func_names: Map[String, Bool], imported_global_map: Map[String, String], imported_function_map: Map[String, String]) -> String:
-    parts := line.split(" ")
-    mut rewritten := line
-    if parts.len() >= 3 and parts[0] == "load" and imported_global_map.contains_key(parts[2]):
-        rewritten = "load " + parts[1] + " " + imported_global_map[parts[2]]
-    elif parts.len() >= 3 and parts[0] == "store" and imported_global_map.contains_key(parts[1]):
-        rewritten = "store " + imported_global_map[parts[1]] + " " + parts[2]
-    elif parts.len() >= 5 and parts[0] == "call":
-        if not main_func_names.contains_key(parts[2]) and imported_function_map.contains_key(parts[2]):
-            rewritten = "call " + parts[1] + " " + imported_function_map[parts[2]] + " " + join_from(parts, 3)
-    elif parts.len() >= 3 and parts[0] == "callv":
-        if not main_func_names.contains_key(parts[1]) and imported_function_map.contains_key(parts[1]):
-            rewritten = "callv " + imported_function_map[parts[1]]
-            if parts.len() > 2:
-                rewritten = rewritten + " " + join_from(parts, 2)
-    return rewritten
-
-fn rewrite_ir_with_import_maps(ir: String, global_map: Map[String, String], function_map: Map[String, String]) -> String:
-    if global_map.len() == 0 and function_map.len() == 0:
-        return ir
-
-    mut out: List[String] := []
-    for line in ir_lines(ir):
-        out.push(rewrite_line_with_import_maps(line, global_map, function_map))
-    return out.join(chr(10))
-
-fn rewrite_main_ir(main_ir: String, imported_global_map: Map[String, String], imported_function_map: Map[String, String], imported_init_funcs: List[String]) -> String:
+fn rewrite_main_ir(main_ir: String, imported_init_funcs: List[String]) -> String:
     main_lines := ir_lines(main_ir)
-    main_func_names := collect_main_func_names_from_lines(main_lines)
     mut out: List[String] := []
     for line in main_lines:
-        parts := line.split(" ")
-        out.push(rewrite_main_line(line, main_func_names, imported_global_map, imported_function_map))
-        if parts.len() >= 2 and parts[0] == "func" and parts[1] == "main":
+        out.push(line)
+        if line.starts_with("func main "):
             out = inject_imported_init_calls(out, imported_init_funcs)
     return out.join(chr(10))
 
@@ -269,7 +238,7 @@ fn validate_combined_ir_contract(ir: String):
     return
 
 fn is_runtime_builtin_module(module_path: String) -> Bool:
-    return module_path == "std.net.tcp" or module_path == "std.net.dns" or module_path == "std.net.url"
+    return module_path == "std.net.tcp" or module_path == "std.net.dns"
 
 fn parse_args() -> CliArgs:
     a := args()
@@ -341,26 +310,47 @@ fn module_root_map(import_roots: List[Int]) -> Map[String, Int]:
         i = i + 1
     return roots_by_path
 
-fn collect_module_dependencies(root: Int, roots_by_path: Map[String, Int], seen: Map[String, Bool]) -> List[Int]:
+fn module_dependency_roots(root: Int, import_roots: List[Int], roots_by_path: Map[String, Int]) -> List[Int]:
+    if import_roots.len() == 0:
+        return []
     mut deps: List[Int] := []
-    for mod_path in find_imports(root):
+    mut seen: Map[String, Bool] := {}
+    mut stack_roots: List[Int] := []
+    mut stack_expanded: List[Bool] := []
+
+    root_imports := find_imports(root)
+    for mod_path in root_imports:
         if not roots_by_path.contains_key(mod_path):
             continue
         if seen.contains_key(mod_path):
             continue
         seen.insert(mod_path, true)
-        dep_root := roots_by_path[mod_path]
-        subdeps := collect_module_dependencies(dep_root, roots_by_path, seen)
-        for subdep in subdeps:
-            deps.push(subdep)
-        deps.push(dep_root)
-    return deps
+        stack_roots.push(roots_by_path[mod_path])
+        stack_expanded.push(false)
 
-fn module_dependency_roots(root: Int, import_roots: List[Int], roots_by_path: Map[String, Int]) -> List[Int]:
-    if import_roots.len() == 0:
-        return []
-    mut seen: Map[String, Bool] := {}
-    return collect_module_dependencies(root, roots_by_path, seen)
+    while stack_roots.len() > 0:
+        current := stack_roots[stack_roots.len() - 1]
+        expanded := stack_expanded[stack_expanded.len() - 1]
+        stack_roots.remove(stack_roots.len() - 1)
+        stack_expanded.remove(stack_expanded.len() - 1)
+
+        if expanded:
+            deps.push(current)
+            continue
+
+        stack_roots.push(current)
+        stack_expanded.push(true)
+
+        current_imports := find_imports(current)
+        for mod_path in current_imports:
+            if not roots_by_path.contains_key(mod_path):
+                continue
+            if seen.contains_key(mod_path):
+                continue
+            seen.insert(mod_path, true)
+            stack_roots.push(roots_by_path[mod_path])
+            stack_expanded.push(false)
+    return deps
 
 fn emit_module_ir(root: Int, import_roots: List[Int], emit_tests: Bool) -> String:
     configure_emitter(import_roots, emit_tests)
@@ -372,29 +362,16 @@ fn emit_single_file(path: String, emit_tests: Bool) -> String!:
     print(ir)
     return ""
 
-fn record_import_name_maps(renamed: RenamedImport, module_index: Int, imported_global_map: Map[String, String], imported_function_map: Map[String, String], imported_init_funcs: List[String]):
-    prefix := "m" + module_index.to_string() + "_"
-    for bare in renamed.global_names:
-        imported_global_map.insert(bare, prefix + bare)
-    for bare in renamed.function_names:
-        imported_function_map.insert(bare, prefix + bare)
-    for init_func in renamed.init_funcs:
-        imported_init_funcs.push(init_func)
-
-fn emit_imported_module_ir(root: Int, module_deps: List[Int], module_index: Int, imported_global_map: Map[String, String], imported_function_map: Map[String, String], imported_init_funcs: List[String]) -> String:
-    # imported modules are emitted in isolation, then rewritten once the
-    # already-seen global/function maps are known.
-    ir := emit_module_ir(root, module_deps, false)
-    renamed := rename_import_ir(ir, module_index)
-    rewritten_ir := rewrite_ir_with_import_maps(renamed.ir, imported_global_map, imported_function_map)
-    record_import_name_maps(renamed, module_index, imported_global_map, imported_function_map, imported_init_funcs)
-    return rewritten_ir
-
 fn should_skip_imported_module(module_root: Int) -> Bool:
     module_path := get_resolved_module_path(module_root)
     return is_runtime_builtin_module(module_path)
 
-fn collect_imported_ir(import_roots: List[Int], imported_global_map: Map[String, String], imported_function_map: Map[String, String], imported_init_funcs: List[String]) -> List[String]:
+fn emit_combined_file(path: String, emit_tests: Bool) -> String!:
+    parsed := parse_and_check(path)!
+    root := parsed.root
+    import_roots := parsed.import_roots
+
+    mut imported_init_funcs: List[String] := []
     mut all_ir: List[String] := []
     roots_by_path := module_root_map(import_roots)
     mut i := 0
@@ -402,24 +379,19 @@ fn collect_imported_ir(import_roots: List[Int], imported_global_map: Map[String,
         if should_skip_imported_module(import_roots[i]):
             i = i + 1
             continue
+        module_path := get_resolved_module_path(import_roots[i])
         module_deps := module_dependency_roots(import_roots[i], import_roots, roots_by_path)
-        all_ir.push(emit_imported_module_ir(import_roots[i], module_deps, i, imported_global_map, imported_function_map, imported_init_funcs))
+        ir := emit_module_ir(import_roots[i], module_deps, false)
+        renamed := rename_import_ir(ir, module_path, i)
+        for init_func in renamed.init_funcs:
+            imported_init_funcs.push(init_func)
+        all_ir.push(renamed.ir)
         i = i + 1
-    return all_ir
-
-fn emit_combined_file(path: String, emit_tests: Bool) -> String!:
-    parsed := parse_and_check(path)!
-    root := parsed.root
-    import_roots := parsed.import_roots
-
-    mut imported_global_map: Map[String, String] := {}
-    mut imported_function_map: Map[String, String] := {}
-    mut imported_init_funcs: List[String] := []
-    mut all_ir := collect_imported_ir(import_roots, imported_global_map, imported_function_map, imported_init_funcs)
-    # the root module keeps its own names, but any imported references need to
-    # be rewritten to the prefixed names assigned above.
+    # the root module keeps its own names. imported modules are already emitted
+    # with stable qualified symbols, so the only remaining combined-file tweak
+    # is to inject any imported init calls into main.
     mut main_ir := emit_module_ir(root, import_roots, emit_tests)
-    main_ir = rewrite_main_ir(main_ir, imported_global_map, imported_function_map, imported_init_funcs)
+    main_ir = rewrite_main_ir(main_ir, imported_init_funcs)
     all_ir.push(main_ir)
 
     combined_ir := all_ir.join(chr(10) + chr(10))

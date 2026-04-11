@@ -1,10 +1,11 @@
-# std.collections — list and map utilities
+# std.collections — list, map, and set helpers
 #
-# Functional-style operations on lists: transform, filter, aggregate, query.
-# These helpers return new lists instead of mutating the input list.
+# most helpers here build fresh containers instead of mutating the input.
+# plain assignments still share collection handles, so use copy_list/copy_map/
+# copy_set when you want a separate top-level container before mutating it.
 #
 #   from std.collections import range, sum, reversed, zip, enumerate
-#   from std.collections import any, all, find, take, drop, flatten
+#   from std.collections import copy_list, copy_map, copy_set, group_by, index_by
 
 # Returns the smaller of two integers.
 fn min_int(left: Int, right: Int) -> Int:
@@ -37,6 +38,26 @@ pub fn repeat_val(value: Int, count: Int) -> List[Int]:
 # Create a list of n zeros
 pub fn zeros(n: Int) -> List[Int]:
     return repeat_val(0, n)
+
+# shallow copies keep nested collection aliases intact on purpose.
+# they give callers a separate top-level container they can mutate freely.
+pub fn copy_list[T](items: List[T]) -> List[T]:
+    mut result: List[T] := []
+    for item in items:
+        result.push(item)
+    return result
+
+pub fn copy_map[K, V](items: Map[K, V]) -> Map[K, V]:
+    mut result: Map[K, V] := {}
+    for key in items:
+        result.insert(key, items[key])
+    return result
+
+pub fn copy_set[T](items: Set[T]) -> Set[T]:
+    mut result: Set[T] := {}
+    for item in items:
+        result.add(item)
+    return result
 
 # ===============================================================
 # Aggregation
@@ -320,6 +341,89 @@ pub fn difference(a: List[Int], b: List[Int]) -> List[Int]:
             result.push(a[i])
         i = i + 1
     return result
+
+pub fn set_union[T](left: Set[T], right: Set[T]) -> Set[T]:
+    mut result: Set[T] := {}
+    for item in left:
+        result.add(item)
+    for item in right:
+        result.add(item)
+    return result
+
+pub fn set_intersection[T](left: Set[T], right: Set[T]) -> Set[T]:
+    mut result: Set[T] := {}
+    for item in left:
+        if right.contains(item):
+            result.add(item)
+    return result
+
+pub fn set_difference[T](left: Set[T], right: Set[T]) -> Set[T]:
+    mut result: Set[T] := {}
+    for item in left:
+        if not right.contains(item):
+            result.add(item)
+    return result
+
+# ===============================================================
+# generic list and map helpers
+# ===============================================================
+
+pub fn count_by[T](items: List[T], key_fn: fn(T) -> String) -> Map[String, Int]:
+    mut counts: Map[String, Int] := {}
+    for item in items:
+        key := key_fn(item)
+        counts.insert(key, counts.get_default(key, 0) + 1)
+    return counts
+
+pub fn index_by[T](items: List[T], key_fn: fn(T) -> String) -> Map[String, T]:
+    mut result: Map[String, T] := {}
+    for item in items:
+        result.insert(key_fn(item), item)
+    return result
+
+pub fn group_by[T](items: List[T], key_fn: fn(T) -> String) -> Map[String, List[T]]:
+    mut result: Map[String, List[T]] := {}
+    for item in items:
+        key := key_fn(item)
+        if result.contains_key(key):
+            bucket := result[key]
+            bucket.push(item)
+        else:
+            mut bucket: List[T] := []
+            bucket.push(item)
+            result.insert(key, bucket)
+    return result
+
+pub fn map_values[K, V, U](items: Map[K, V], mapper: fn(V) -> U) -> Map[K, U]:
+    mut result: Map[K, U] := {}
+    for key in items:
+        result.insert(key, mapper(items[key]))
+    return result
+
+pub fn filter_entries[K, V](items: Map[K, V], keep: fn(K, V) -> Bool) -> Map[K, V]:
+    mut result: Map[K, V] := {}
+    for key in items:
+        value := items[key]
+        if keep(key, value):
+            result.insert(key, value)
+    return result
+
+pub fn sorted_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:
+    mut remaining := copy_list(items)
+    mut result: List[T] := []
+    while remaining.len() > 0:
+        mut best_idx := 0
+        mut i := 1
+        while i < remaining.len():
+            if less(remaining[i], remaining[best_idx]):
+                best_idx = i
+            i = i + 1
+        result.push(remaining[best_idx])
+        remaining.remove(best_idx)
+    return result
+
+pub fn sort_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:
+    return sorted_by(items, less)
 
 # ===============================================================
 # String List Utilities

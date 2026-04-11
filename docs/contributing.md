@@ -53,6 +53,7 @@ make bootstrap
 - avoid long chains of `"..." + value.to_string()` in user-facing examples unless interpolation would be awkward
 - prefer `std.testing.assert_eq(...)` / `assert_ne(...)` for straightforward test comparisons
 - prefer `std.os.process.command(...)` for child processes; use `std.io` when you specifically need lower-level stream types
+- remember that collections are shared handles; reach for `std.collections.copy_list(...)`, `copy_map(...)`, or `copy_set(...)` when an example wants an independent top-level container
 
 ## where to work
 

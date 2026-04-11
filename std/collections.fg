@@ -1,10 +1,11 @@
-# std.collections — list and map utilities
+# std.collections — list, map, and set helpers
 #
-# Functional-style operations on lists: transform, filter, aggregate, query.
-# These helpers return new lists instead of mutating the input list.
+# most helpers here build fresh containers instead of mutating the input.
+# plain assignments still share collection handles, so use copy_list/copy_map/
+# copy_set when you want a separate top-level container before mutating it.
 #
 #   from std.collections import range, sum, reversed, zip, enumerate
-#   from std.collections import any, all, find, take, drop, flatten
+#   from std.collections import copy_list, copy_map, copy_set, group_by, index_by
 
 # Returns the smaller of two integers.
 fn min_int(left: Int, right: Int) -> Int:
@@ -408,18 +409,17 @@ pub fn filter_entries[K, V](items: Map[K, V], keep: fn(K, V) -> Bool) -> Map[K, 
     return result
 
 pub fn sorted_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:
-    mut result := copy_list(items)
-    n := result.len()
-    mut i := 1
-    while i < n:
-        mut j := i
-        while j > 0 and less(result[j], result[j - 1]):
-            cur := result[j]
-            prev := result[j - 1]
-            result[j - 1] = cur
-            result[j] = prev
-            j = j - 1
-        i = i + 1
+    mut remaining := copy_list(items)
+    mut result: List[T] := []
+    while remaining.len() > 0:
+        mut best_idx := 0
+        mut i := 1
+        while i < remaining.len():
+            if less(remaining[i], remaining[best_idx]):
+                best_idx = i
+            i = i + 1
+        result.push(remaining[best_idx])
+        remaining.remove(best_idx)
     return result
 
 pub fn sort_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:

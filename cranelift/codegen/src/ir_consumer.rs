@@ -1474,6 +1474,8 @@ fn resolve_func_name(name: &str) -> &str {
         "__map_new_int" => "forge_map_new_int",
         "__set_new" => "forge_set_new_default",
         "__set_new_int" => "forge_set_new_int",
+        "__set_to_list" => "forge_set_to_list_cstr",
+        "__set_to_list_int" => "forge_set_to_list_int_handle",
         "__struct_alloc" => "forge_struct_alloc",
         "__closure_set_env" => "forge_closure_set_env",
         "__closure_get_env" => "forge_closure_get_env",

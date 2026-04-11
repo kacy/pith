@@ -96,6 +96,8 @@ mut ir_generic_specialization_keys: List[String] := []
 mut ir_generic_specialization_names: Map[String, String] := {}
 mut ir_generic_specialization_type_lists: Map[String, String] := {}
 mut ir_generic_emitted_specializations: Map[String, Int] := {}
+mut ir_active_generic_params: List[String] := []
+mut ir_active_generic_concrete_types: List[String] := []
 
 pub fn set_import_roots(roots: List[Int], paths: List[String]):
     ir_preloaded_import_roots = roots
@@ -138,6 +140,8 @@ fn ir_reset_type_state():
     ir_generic_specialization_names = {}
     ir_generic_specialization_type_lists = {}
     ir_generic_emitted_specializations = {}
+    ir_active_generic_params = []
+    ir_active_generic_concrete_types = []
 
 fn ir_reset_control_flow_state():
     ir_break_stack = []
@@ -233,6 +237,10 @@ fn ir_resolve_result_type_kind(inner_type: String) -> String:
     return ir_retkind(inner_type)
 
 fn ir_resolve_type_node(type_idx: Int) -> String:
+    if ir_active_generic_params.len() > 0:
+        resolved := ir_resolve_type_node_with_subst(type_idx, ir_active_generic_params, ir_active_generic_concrete_types)
+        if resolved.len() > 0:
+            return resolved
     tn := get_node(type_idx)
     if tn.kind == "type":
         return ir_resolve_type_hint(tn.value)
@@ -244,11 +252,19 @@ fn ir_resolve_type_node(type_idx: Int) -> String:
     if tn.kind == "result_type" and tn.children.len() > 0:
         inner_type := ir_resolve_type_node(tn.children[0])
         return ir_resolve_result_type_kind(inner_type)
+    if tn.kind == "optional_type" and tn.children.len() > 0:
+        return ir_resolve_type_node(tn.children[0])
+    if tn.kind == "fn_type":
+        return "closure"
+    if tn.kind == "tuple_type":
+        return "tuple"
     return ""
 
 fn ir_resolve_map_value_type_node(type_idx: Int) -> String:
     tn := get_node(type_idx)
     if tn.kind == "generic_type" and tn.value == "Map" and tn.children.len() > 1:
+        if ir_active_generic_params.len() > 0:
+            return ir_resolve_type_node_with_subst(tn.children[1], ir_active_generic_params, ir_active_generic_concrete_types)
         return ir_resolve_type_node(tn.children[1])
     return ""
 
@@ -1173,9 +1189,25 @@ fn ir_lookup_name_type(name: String) -> String:
 
 fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
     vn := get_node(val_idx)
+    if vn.kind == "map" and vn.children.len() == 0 and target_type == "set":
+        r := ir_reg()
+        ir_emit_call0(r, "__set_new", "set")
+        return r
+    if vn.kind == "map" and vn.children.len() == 0 and target_type == "set_int":
+        r := ir_reg()
+        ir_emit_call0(r, "__set_new_int", "set_int")
+        return r
+    if vn.kind == "map" and vn.children.len() == 0 and target_type == "map":
+        r := ir_reg()
+        ir_emit_call0(r, "__map_new", "map")
+        return r
     if vn.kind == "map" and vn.children.len() == 0 and target_type == "map_int":
         r := ir_reg()
         ir_emit_call0(r, "__map_new_int", "map_int")
+        return r
+    if vn.kind == "set" and vn.children.len() == 0 and target_type == "set":
+        r := ir_reg()
+        ir_emit_call0(r, "__set_new", "set")
         return r
     if vn.kind == "set" and vn.children.len() == 0 and target_type == "set_int":
         r := ir_reg()
@@ -1546,7 +1578,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         mut generic_ret_type := ir_checked_type(idx)
         if generic_ret_type.len() == 0:
             generic_ret_type = ir_infer_type(idx)
-        callee = ResolvedCallee(ir_queue_generic_specialization(callee.name, ir_generic_arg_types(node), generic_ret_type), false)
+        callee = ResolvedCallee(ir_queue_generic_specialization(callee.name, ir_infer_generic_concrete_types(callee.name, node), generic_ret_type), false)
     arg_regs := ir_collect_call_arg_regs(node, 1)
 
     if ir_emit_tests and callee.name == "assert" and arg_regs.len() >= 1:
@@ -2245,15 +2277,21 @@ fn ir_is_string_iter_expr(iter_idx: Int) -> Bool:
         return ir_var_types[iter_node.value] == "string"
     return false
 
-fn ir_emit_for_loop_value_binding(value_name: String, index_name: String, is_string_iter: Bool, iter_name: String, index_name_internal: String):
+fn ir_emit_for_loop_value_binding(value_name: String, index_name: String, item_kind: String, iter_name: String, index_name_internal: String):
     it_r := ir_reg()
     ir_emit("load " + it_r.to_string() + " " + iter_name)
     idx_r := ir_reg()
     ir_emit("load " + idx_r.to_string() + " " + index_name_internal)
     elem_r := ir_reg()
-    if is_string_iter:
+    if item_kind == "char":
         ir_emit_call2(elem_r, "char_at", "string", it_r, idx_r)
         ir_var_types.insert(value_name, "string")
+    elif item_kind == "string":
+        ir_emit_call2(elem_r, "__list_get", "string", it_r, idx_r)
+        ir_var_types.insert(value_name, "string")
+    elif item_kind == "int":
+        ir_emit_call2(elem_r, "__list_get", "int", it_r, idx_r)
+        ir_var_types.insert(value_name, "int")
     else:
         ir_emit_call2(elem_r, "__list_get", "unknown", it_r, idx_r)
     ir_emit("store " + value_name + " " + elem_r.to_string())
@@ -2340,15 +2378,40 @@ fn ir_emit_while_stmt(node: Node):
 fn ir_emit_for_stmt(node: Node):
     names := ir_for_binding_names(node)
     if node.children.len() >= 2:
-        is_string_iter := ir_is_string_iter_expr(node.children[0])
-        iter_r := ir_expr(node.children[0])
+        iter_type := ir_infer_type(node.children[0])
+        mut iter_r := ir_expr(node.children[0])
+        mut item_kind := "unknown"
+        if iter_type == "string":
+            item_kind = "char"
+        elif iter_type == "list_string":
+            item_kind = "string"
+        elif iter_type == "map":
+            keys_r := ir_reg()
+            ir_emit_call1(keys_r, "map_keys", "list_string", iter_r)
+            iter_r = keys_r
+            item_kind = "string"
+        elif iter_type == "map_int":
+            keys_r := ir_reg()
+            ir_emit_call1(keys_r, "map_keys", "list", iter_r)
+            iter_r = keys_r
+            item_kind = "int"
+        elif iter_type == "set":
+            values_r := ir_reg()
+            ir_emit_call1(values_r, "__set_to_list", "list_string", iter_r)
+            iter_r = values_r
+            item_kind = "string"
+        elif iter_type == "set_int":
+            values_r := ir_reg()
+            ir_emit_call1(values_r, "__set_to_list_int", "list", iter_r)
+            iter_r = values_r
+            item_kind = "int"
         fid := ir_for_count
         ir_for_count = ir_for_count + 1
         fi := "__for_idx_" + fid.to_string()
         fl := "__for_len_" + fid.to_string()
         ft := "__for_iter_" + fid.to_string()
         len_r := ir_reg()
-        if is_string_iter:
+        if item_kind == "char":
             ir_emit_call1(len_r, "string_len", "int", iter_r)
         else:
             ir_emit_call1(len_r, "len", "int", iter_r)
@@ -2370,7 +2433,7 @@ fn ir_emit_for_stmt(node: Node):
         ir_emit("lt " + cmp_r.to_string() + " " + ci.to_string() + " " + cl.to_string())
         ir_emit("brif " + cmp_r.to_string() + " " + body_l + " " + end_l)
         ir_emit("label " + body_l)
-        ir_emit_for_loop_value_binding(names.value_name, names.index_name, is_string_iter, ft, fi)
+        ir_emit_for_loop_value_binding(names.value_name, names.index_name, item_kind, ft, fi)
         ir_break_stack.push(end_l)
         ir_continue_stack.push(step_l)
         ir_block(node.children[1])
@@ -2426,18 +2489,9 @@ fn ir_block(idx: Int):
 # --- helpers for function emission ---
 
 fn ir_extract_param_type(param_idx: Int) -> String:
-    mut stack: List[Int] := [param_idx]
-    while stack.len() > 0:
-        last := stack.len() - 1
-        cur_idx := stack[last]
-        stack.remove(last)
-        tn := get_node(cur_idx)
-        if tn.kind == "type" or tn.kind == "generic_type":
-            return ir_resolve_type_node(cur_idx)
-        mut ci := 0
-        while ci < tn.children.len():
-            stack.push(tn.children[ci])
-            ci = ci + 1
+    node := get_node(param_idx)
+    if node.kind == "param" and node.children.len() > 0:
+        return ir_resolve_type_node(node.children[0])
     return "Int"
 
 fn ir_find_body(fn_idx: Int) -> Int:
@@ -2654,6 +2708,10 @@ fn ir_resolve_type_node_with_subst(type_idx: Int, generic_params: List[String], 
         return ir_resolve_result_type_kind(inner_type)
     if tn.kind == "optional_type" and tn.children.len() > 0:
         return ir_resolve_type_node_with_subst(tn.children[0], generic_params, concrete_types)
+    if tn.kind == "fn_type":
+        return "closure"
+    if tn.kind == "tuple_type":
+        return "tuple"
     return ""
 
 fn ir_extract_return_type_with_subst(fn_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:
@@ -2684,6 +2742,134 @@ fn ir_extract_param_types_with_subst(fn_idx: Int, generic_params: List[String], 
                 param_types.push("")
         i = i + 1
     return param_types
+
+fn ir_bind_inferred_generic_runtime_type(name: String, actual_tid: Int, subst_map: Map[String, String]) -> Bool:
+    concrete := ir_type_from_tid(actual_tid)
+    if concrete.len() == 0:
+        return true
+    if subst_map.contains_key(name):
+        return subst_map[name] == concrete
+    subst_map.insert(name, concrete)
+    return true
+
+fn ir_infer_generic_runtime_types_from_node(type_idx: Int, actual_tid: Int, generic_params: List[String], subst_map: Map[String, String]) -> Bool:
+    if type_idx < 0 or actual_tid < 0:
+        return true
+    node := get_node(type_idx)
+    if node.kind == "type":
+        for gp in generic_params:
+            if gp == node.value:
+                return ir_bind_inferred_generic_runtime_type(gp, actual_tid, subst_map)
+        return true
+
+    actual_info := get_type_info(actual_tid)
+
+    if node.kind == "generic_type":
+        if node.value == "List":
+            if actual_info.kind == "list" and node.children.len() > 0:
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map)
+            return true
+        if node.value == "Set":
+            if actual_info.kind == "set" and node.children.len() > 0:
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map)
+            return true
+        if node.value == "Task":
+            if actual_info.kind == "task" and node.children.len() > 0:
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map)
+            return true
+        if node.value == "Channel":
+            if actual_info.kind == "channel" and node.children.len() > 0:
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map)
+            return true
+        if node.value == "Map":
+            if actual_info.kind == "map" and node.children.len() > 1:
+                if ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.key_type, generic_params, subst_map) == false:
+                    return false
+                return ir_infer_generic_runtime_types_from_node(node.children[1], actual_info.value_type, generic_params, subst_map)
+            return true
+        return true
+
+    if node.kind == "optional_type":
+        if actual_info.kind == "optional" and node.children.len() > 0:
+            return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map)
+        return true
+
+    if node.kind == "result_type":
+        if actual_info.kind == "result" and node.children.len() > 0:
+            if ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params, subst_map) == false:
+                return false
+            if node.children.len() > 1 and actual_info.value_type >= 0:
+                return ir_infer_generic_runtime_types_from_node(node.children[1], actual_info.value_type, generic_params, subst_map)
+        return true
+
+    if node.kind == "tuple_type":
+        if actual_info.kind == "tuple":
+            mut i := 0
+            while i < node.children.len():
+                if i < actual_info.elements.len():
+                    if ir_infer_generic_runtime_types_from_node(node.children[i], actual_info.elements[i], generic_params, subst_map) == false:
+                        return false
+                i = i + 1
+        return true
+
+    if node.kind == "fn_type":
+        if actual_info.kind == "function":
+            mut param_idx := 0
+            mut i := 0
+            while i < node.children.len():
+                cn := get_node(node.children[i])
+                if cn.kind == "param":
+                    if param_idx < actual_info.param_types.len():
+                        if ir_infer_generic_runtime_types_from_node(cn.children[0], actual_info.param_types[param_idx], generic_params, subst_map) == false:
+                            return false
+                    param_idx = param_idx + 1
+                elif cn.kind == "returns" and cn.children.len() > 0:
+                    return ir_infer_generic_runtime_types_from_node(cn.children[0], actual_info.return_type, generic_params, subst_map)
+                i = i + 1
+        return true
+
+    return true
+
+fn ir_infer_generic_concrete_types(name: String, node: Node) -> List[String]:
+    if not ir_generic_decl_indices.contains_key(name):
+        return ir_generic_arg_types(node)
+    decl_idx := ir_generic_decl_indices[name]
+    decl_node := get_node(decl_idx)
+    generic_params := ir_collect_generic_param_names(decl_node)
+    mut param_type_nodes: List[Int] := []
+    mut i := 0
+    while i < decl_node.children.len():
+        cn := get_node(decl_node.children[i])
+        if cn.kind == "param":
+            if cn.children.len() > 0:
+                param_type_nodes.push(cn.children[0])
+            else:
+                param_type_nodes.push(-1)
+        i = i + 1
+    mut arg_tids: List[Int] := []
+    i = 1
+    while i < node.children.len():
+        child := node.children[i]
+        mut expr_idx := child
+        if node_kind(child) == "arg":
+            cn := get_node(child)
+            if cn.children.len() > 0:
+                expr_idx = cn.children[0]
+        arg_tids.push(c_get_expr_type(expr_idx))
+        i = i + 1
+    mut subst_map: Map[String, String] := {}
+    mut arg_idx := 0
+    while arg_idx < param_type_nodes.len():
+        if arg_idx < arg_tids.len() and param_type_nodes[arg_idx] >= 0:
+            ir_infer_generic_runtime_types_from_node(param_type_nodes[arg_idx], arg_tids[arg_idx], generic_params, subst_map)
+        arg_idx = arg_idx + 1
+    mut concrete_types: List[String] := []
+    for gp in generic_params:
+        if subst_map.contains_key(gp):
+            concrete_types.push(subst_map[gp])
+        else:
+            concrete_types.push("unknown")
+    return concrete_types
 
 fn ir_emit_fn_params_with_types(fn_idx: Int, param_types: List[String]):
     node := get_node(fn_idx)
@@ -2744,11 +2930,17 @@ fn ir_emit_generic_specialization(key: String):
     param_count := ir_param_count(decl_idx)
     ret_type := ir_extract_return_type_with_subst(decl_idx, generic_params, concrete_types)
     param_types := ir_extract_param_types_with_subst(decl_idx, generic_params, concrete_types)
+    saved_params := ir_active_generic_params
+    saved_types := ir_active_generic_concrete_types
+    ir_active_generic_params = generic_params
+    ir_active_generic_concrete_types = concrete_types
     ir_prepare_func_emission(ret_type)
     ir_emit_func_header(spec_name, param_count, ret_type)
     ir_emit_fn_params_with_types(decl_idx, param_types)
     ir_func_returns.insert(spec_name, ret_type)
     ir_finish_func_emission(body_idx)
+    ir_active_generic_params = saved_params
+    ir_active_generic_concrete_types = saved_types
 
 fn ir_emit_generic_specializations():
     mut i := 0

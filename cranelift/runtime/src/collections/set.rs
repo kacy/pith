@@ -364,7 +364,8 @@ pub unsafe extern "C" fn forge_set_to_list_int(
 pub unsafe extern "C" fn forge_set_to_list_string(
     set: ForgeSet,
 ) -> crate::collections::list::ForgeList {
-    use crate::collections::list::{forge_list_new, forge_list_push, ForgeList};
+    use crate::collections::list::{forge_list_new, forge_list_push_value, ForgeList};
+    use std::alloc::{alloc, Layout};
 
     if set.ptr.is_null() {
         return ForgeList {
@@ -380,23 +381,54 @@ pub unsafe extern "C" fn forge_set_to_list_string(
         };
     }
 
-    let mut list = forge_list_new(impl_ref.elem_size as i64, 1); // type tag 1 = string
+    let list = forge_list_new(8, 0);
 
     for elem in impl_ref.iter() {
         if let SetElement::String(bytes) = elem {
-            // Retain as we're copying to list
-            let s = ForgeString {
-                ptr: bytes.as_ptr(),
-                len: bytes.len() as i64,
-                is_heap: true,
-            };
-            forge_string_retain(s);
-
-            forge_list_push(&mut list, bytes.as_ptr(), impl_ref.elem_size as i64);
+            let len = bytes.len();
+            let layout = Layout::from_size_align(len + 1, 1).unwrap();
+            let ptr = alloc(layout) as *mut i8;
+            if !ptr.is_null() {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len);
+                *ptr.add(len) = 0;
+                forge_list_push_value(list, ptr as i64);
+            }
         }
     }
 
     list
+}
+
+/// Convert a string set handle to a list handle of C-string pointers.
+///
+/// Returns the raw `ListImpl` pointer as i64 to match the Cranelift collection ABI.
+#[no_mangle]
+pub unsafe extern "C" fn forge_set_to_list_cstr(set_handle: i64) -> i64 {
+    if set_handle == 0 {
+        let empty = crate::collections::list::forge_list_new(8, 0);
+        return empty.ptr as i64;
+    }
+
+    let list = forge_set_to_list_string(ForgeSet {
+        ptr: set_handle as *mut (),
+    });
+    list.ptr as i64
+}
+
+/// Convert an int set handle to a list handle of i64 elements.
+///
+/// Returns the raw `ListImpl` pointer as i64 to match the Cranelift collection ABI.
+#[no_mangle]
+pub unsafe extern "C" fn forge_set_to_list_int_handle(set_handle: i64) -> i64 {
+    if set_handle == 0 {
+        let empty = crate::collections::list::forge_list_new(8, 0);
+        return empty.ptr as i64;
+    }
+
+    let list = forge_set_to_list_int(ForgeSet {
+        ptr: set_handle as *mut (),
+    });
+    list.ptr as i64
 }
 
 // ---------------------------------------------------------------------------

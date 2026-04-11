@@ -1,0 +1,84 @@
+from std.collections import copy_list, copy_map, copy_set
+from std.collections import count_by, index_by, group_by
+from std.collections import map_values, filter_entries
+from std.collections import set_union, set_intersection, set_difference
+from std.collections import sorted_by
+
+struct Item:
+    pub name: String
+    pub team: String
+    pub score: Int
+
+fn names_of(items: List[Item]) -> String:
+    mut parts: List[String] := []
+    for item in items:
+        parts.push(item.name)
+    return parts.join(",")
+
+fn main():
+    mut nums := [3, 1, 2]
+    nums_copy := copy_list(nums)
+    nums_copy.push(4)
+    print("copy-list:{nums.len()}:{nums_copy.len()}")
+
+    mut nested := [[1]]
+    nested_copy := copy_list(nested)
+    inner := nested_copy[0]
+    inner.push(2)
+    print("copy-list-shallow:{nested[0].len()}")
+
+    mut scores := {"alice": 3, "bob": 1}
+    scores_copy := copy_map(scores)
+    scores_copy.insert("carol", 2)
+    print("copy-map:{scores.len()}:{scores_copy.len()}")
+
+    mut tags := {"red", "blue"}
+    tags_copy := copy_set(tags)
+    tags_copy.add("green")
+    print("copy-set:{tags.len()}:{tags_copy.len()}")
+
+    mut items: List[Item] := []
+    items.push(Item("alice", "red", 8))
+    items.push(Item("bob", "blue", 3))
+    items.push(Item("carol", "red", 5))
+    items.push(Item("dave", "blue", 6))
+
+    counts := count_by(items, fn(item: Item) => item.team)
+    red_count := counts["red"]
+    blue_count := counts["blue"]
+    print("count-red:{red_count}")
+    print("count-blue:{blue_count}")
+
+    indexed := index_by(items, fn(item: Item) => item.name)
+    carol := indexed["carol"]
+    print("index-carol:{carol.score}")
+
+    grouped := group_by(items, fn(item: Item) => item.team)
+    red_group := grouped["red"]
+    blue_group := grouped["blue"]
+    print("group-red:{red_group.len()}")
+    print("group-blue:{blue_group.len()}")
+
+    boosted := map_values(scores, fn(score: Int) => score * 10)
+    kept := filter_entries(boosted, fn(name: String, score: Int) => score >= 20)
+    boosted_alice := boosted["alice"]
+    kept_has_bob := kept.contains_key("bob")
+    print("map-values-alice:{boosted_alice}")
+    print("filter-entries-len:{kept.len()}")
+    print("filter-entries-has-bob:{kept_has_bob}")
+
+    left := {"red", "blue"}
+    right := {"blue", "green"}
+    unioned := set_union(left, right)
+    both := set_intersection(left, right)
+    only_left := set_difference(left, right)
+    union_has_green := unioned.contains("green")
+    both_has_blue := both.contains("blue")
+    only_left_has_red := only_left.contains("red")
+    print("set-union:{unioned.len()}:{union_has_green}")
+    print("set-intersection:{both.len()}:{both_has_blue}")
+    print("set-difference:{only_left.len()}:{only_left_has_red}")
+
+    ranked := sorted_by(items, fn(left: Item, right: Item) => left.score < right.score)
+    print("sorted-by:{names_of(ranked)}")
+    print("sorted-original:{names_of(items)}")

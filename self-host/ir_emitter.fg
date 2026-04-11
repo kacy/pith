@@ -316,22 +316,65 @@ fn ir_is_string_literal_kind(kind: String) -> Bool:
 fn ir_string_symbol_name(index: Int) -> String:
     return "m" + ir_module_count.to_string() + "s" + index.to_string()
 
+fn ir_should_capture_name(name: String, bound: List[String], free: List[String]) -> Bool:
+    if ir_list_contains(bound, name) or ir_list_contains(free, name):
+        return false
+    if ir_module_aliases.contains_key(name):
+        return false
+    return ir_known_callable_return_type(name).len() == 0
+
+fn ir_copy_names(names: List[String]) -> List[String]:
+    mut copy: List[String] := []
+    mut i := 0
+    while i < names.len():
+        copy.push(names[i])
+        i = i + 1
+    return copy
+
+fn ir_csv_contains(csv: String, name: String) -> Bool:
+    if name.len() == 0:
+        return false
+    items := csv.split(",")
+    mut i := 0
+    while i < items.len():
+        if items[i] == name:
+            return true
+        i = i + 1
+    return false
+
+fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String]):
+    node := get_node(idx)
+    if node.kind == "ident":
+        name := node.value
+        if ir_should_capture_name(name, bound, free):
+            free.push(name)
+        return
+    if node.kind == "lambda":
+        inner_bound := ir_copy_names(bound)
+        mut i := 0
+        while i < node.children.len():
+            child := node.children[i]
+            cn := get_node(child)
+            if cn.kind == "param":
+                inner_bound.push(cn.value)
+            i = i + 1
+        i = 0
+        while i < node.children.len():
+            child := node.children[i]
+            cn := get_node(child)
+            if cn.kind == "body":
+                ir_find_free_vars_walk(child, inner_bound, free)
+            i = i + 1
+        return
+    mut i := 0
+    while i < node.children.len():
+        child := node.children[i]
+        ir_find_free_vars_walk(child, bound, free)
+        i = i + 1
+
 fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
     mut free: List[String] := []
-    mut stack: List[Int] := [idx]
-    while stack.len() > 0:
-        current := stack[stack.len() - 1]
-        stack.remove(stack.len() - 1)
-        kind := node_kind(current)
-        if kind == "ident":
-            name := node_value(current)
-            if not ir_list_contains(bound, name) and not ir_list_contains(free, name):
-                free.push(name)
-        mut i := 0
-        child_count := node_child_count(current)
-        while i < child_count:
-            stack.push(node_child(current, i))
-            i = i + 1
+    ir_find_free_vars_walk(idx, bound, free)
     return free
 
 fn ir_str(s: String) -> String:
@@ -850,22 +893,22 @@ fn ir_known_struct_return_type(fname: String) -> String:
     return ""
 
 fn ir_known_scalar_return_type(fname: String) -> String:
-    if FLOAT_RETURNING_FUNCS.contains(fname):
+    if ir_csv_contains(FLOAT_RETURNING_FUNCS, fname):
         return "float"
-    if BOOL_RETURNING_FUNCS.contains(fname):
+    if ir_csv_contains(BOOL_RETURNING_FUNCS, fname):
         return "bool"
-    if INT_RETURNING_FUNCS.contains(fname):
+    if ir_csv_contains(INT_RETURNING_FUNCS, fname):
         return "int"
-    if STRING_RETURNING_FUNCS.contains(fname):
+    if ir_csv_contains(STRING_RETURNING_FUNCS, fname):
         return "string"
-    if BYTES_RETURNING_FUNCS.contains(fname):
+    if ir_csv_contains(BYTES_RETURNING_FUNCS, fname):
         return "bytes"
     return ""
 
 fn ir_known_collection_return_type(fname: String) -> String:
-    if LIST_RETURNING_FUNCS.contains(fname):
+    if ir_csv_contains(LIST_RETURNING_FUNCS, fname):
         return "list"
-    if LIST_STRING_RETURNING_FUNCS.contains(fname):
+    if ir_csv_contains(LIST_STRING_RETURNING_FUNCS, fname):
         return "list_string"
     return ""
 
@@ -894,7 +937,7 @@ fn ir_field_receiver_type(recv_idx: Int) -> String:
     return obj_type
 
 fn ir_known_string_method_return_type(meth: String) -> String:
-    if STRING_RETURNING_METHODS.contains(meth) or meth == "to_string_utf8":
+    if ir_csv_contains(STRING_RETURNING_METHODS, meth) or meth == "to_string_utf8":
         return "string"
     if meth == "keys" or meth == "values" or meth == "split" or meth == "chars":
         return "list_string"
@@ -916,7 +959,7 @@ fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
         declared := ir_declared_callable_return_type(impl_name)
         if declared.len() > 0:
             return declared
-    if BOOL_RETURNING_METHODS.contains(meth):
+    if ir_csv_contains(BOOL_RETURNING_METHODS, meth):
         return "bool"
     string_type := ir_known_string_method_return_type(meth)
     if string_type.len() > 0:
@@ -1630,7 +1673,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
 
     obj_type := ir_method_receiver_type(node)
     mut emit_name := ir_method_emit_name(mname, obj_type)
-    if BOOL_RETURNING_METHODS.contains(emit_name):
+    if ir_csv_contains(BOOL_RETURNING_METHODS, emit_name):
         ir_var_types.insert("__last_call", "bool")
 
     impl_name := ir_lookup_impl_method_name(obj_type, mname)
@@ -1648,11 +1691,11 @@ fn ir_emit_method_call(idx: Int) -> Int:
     r := ir_reg()
     uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(emit_name, impl_dispatch), idx)
     mut ret_type := ir_call_retkind(idx, uses_result_abi)
-    if VOID_METHODS.contains(emit_name):
+    if ir_csv_contains(VOID_METHODS, emit_name):
         ret_type = "void"
     call_args := ir_method_call_arg_regs(obj_r, arg_regs)
     ir_emit_call_text(r, emit_name, ret_type, call_args.len(), ir_join_arg_regs(call_args))
-    if VOID_METHODS.contains(emit_name):
+    if ir_csv_contains(VOID_METHODS, emit_name):
         return obj_r
     return r
 

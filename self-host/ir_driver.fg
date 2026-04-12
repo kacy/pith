@@ -222,14 +222,30 @@ fn validate_call_retkind(line_no: Int, parts: List[String], struct_names: Map[St
     if builtin_kind.len() > 0 and builtin_kind != retkind:
         ir_contract_error(line_no, "builtin call retkind '" + retkind + "' does not match expected '" + builtin_kind + "' for " + callee)
 
-fn validate_field_contract(line_no: Int, parts: List[String]):
+fn is_numeric_token(text: String) -> Bool:
+    if text.len() == 0:
+        return false
+    mut start := 0
+    if text[0] == "-":
+        if text.len() == 1:
+            return false
+        start = 1
+    mut i := start
+    while i < text.len():
+        ch := text.substring(i, i + 1)
+        if ch < "0" or ch > "9":
+            return false
+        i = i + 1
+    return true
+
+fn validate_field_contract(line_no: Int, line: String, parts: List[String]):
     if parts.len() < 4 or parts[0] != "field":
         return
-    if parts.len() >= 6 and parse_int(parts[3]).is_ok:
+    if parts.len() >= 6 and is_numeric_token(parts[3]):
         return
-    if parts.len() == 4 and parse_int(parts[3]).is_ok:
+    if parts.len() == 4 and is_numeric_token(parts[3]):
         return
-    ir_contract_error(line_no, "field instructions must use an explicit numeric offset or tuple index")
+    ir_contract_error(line_no, "field instructions must use an explicit numeric offset or tuple index: " + line)
 
 fn validate_combined_ir_contract(ir: String):
     mut func_kinds: Map[String, String] := {}
@@ -247,7 +263,7 @@ fn validate_combined_ir_contract(ir: String):
     for line in lines:
         parts := line.split(" ")
         validate_call_retkind(line_no, parts, struct_names)
-        validate_field_contract(line_no, parts)
+        validate_field_contract(line_no, line, parts)
         line_no = line_no + 1
     return
 

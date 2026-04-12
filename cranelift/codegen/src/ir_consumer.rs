@@ -1336,8 +1336,6 @@ fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
     None
 }
 
-/// Map IR function names to runtime_funcs keys.
-/// Returns the key that exists in the runtime_funcs HashMap.
 fn get_reg(regs: &HashMap<usize, Value>, s: &str) -> Value {
     let reg: usize = s
         .parse()

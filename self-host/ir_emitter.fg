@@ -510,10 +510,50 @@ fn ir_is_declared_callable(name: String) -> Bool:
 fn ir_runtime_call_name(name: String) -> String:
     if name == "print":
         return "forge_smart_print"
+    if name == "spawn":
+        return "forge_spawn"
+    if name == "await":
+        return "forge_await"
     if name == "int_to_string":
-        return "to_string"
+        return "int_to_string"
+    if name == "float_to_string":
+        return "float_to_string"
+    if name == "bool_to_string":
+        return "bool_to_string"
     if name == "len":
         return "forge_auto_len"
+    if name == "contains" or name == "string_contains":
+        return "forge_cstring_contains"
+    if name == "substring":
+        return "forge_cstring_substring"
+    if name == "starts_with":
+        return "forge_cstring_starts_with"
+    if name == "ends_with":
+        return "forge_cstring_ends_with"
+    if name == "trim":
+        return "forge_cstring_trim"
+    if name == "split":
+        return "forge_string_split_to_list"
+    if name == "to_upper":
+        return "forge_cstring_to_upper"
+    if name == "to_lower":
+        return "forge_cstring_to_lower"
+    if name == "replace":
+        return "forge_cstring_replace"
+    if name == "repeat":
+        return "forge_cstring_repeat"
+    if name == "index_of" or name == "string_index_of":
+        return "forge_cstring_index_of"
+    if name == "last_index_of" or name == "string_last_index_of":
+        return "forge_cstring_last_index_of"
+    if name == "char_at":
+        return "forge_cstring_char_at"
+    if name == "chars":
+        return "forge_cstring_chars"
+    if name == "reverse":
+        return "forge_cstring_reverse"
+    if name == "is_empty" or name == "string_is_empty":
+        return "forge_cstring_is_empty"
     if name == "join":
         return "forge_list_join"
     if name == "push":
@@ -1922,6 +1962,46 @@ fn ir_emit_tuple_literal(node: Node) -> Int:
 fn ir_field_lookup_key(recv_idx: Int, field_name: String) -> String:
     return ir_field_receiver_type(recv_idx) + "." + field_name
 
+fn ir_unique_field_offset(field_name: String) -> Int:
+    keys := ir_struct_field_index_lookup.keys()
+    mut matched := false
+    mut offset := 0
+    mut i := 0
+    while i < keys.len():
+        key := keys[i]
+        if key.ends_with("." + field_name):
+            next_offset := ir_unpack_field_index(ir_struct_field_index_lookup[key]) * 8
+            if not matched:
+                matched = true
+                offset = next_offset
+            elif offset != next_offset:
+                return 0 - 1
+            i = i + 1
+            continue
+        i = i + 1
+    if not matched:
+        return 0 - 1
+    return offset
+
+fn ir_unique_field_kind(field_name: String) -> String:
+    keys := ir_struct_field_lookup.keys()
+    mut matched := false
+    mut field_kind := "unknown"
+    mut i := 0
+    while i < keys.len():
+        key := keys[i]
+        if key.ends_with("." + field_name):
+            next_kind := ir_retkind(ir_struct_field_lookup[key])
+            if not matched:
+                matched = true
+                field_kind = next_kind
+            elif field_kind != next_kind:
+                return "unknown"
+            i = i + 1
+            continue
+        i = i + 1
+    return field_kind
+
 fn ir_emit_named_field_access(result_reg: Int, obj_r: Int, lookup_key: String, field_name: String):
     if ir_struct_field_index_lookup.contains_key(lookup_key):
         field_offset := ir_unpack_field_index(ir_struct_field_index_lookup[lookup_key]) * 8
@@ -1930,7 +2010,11 @@ fn ir_emit_named_field_access(result_reg: Int, obj_r: Int, lookup_key: String, f
             field_kind = ir_retkind(ir_struct_field_lookup[lookup_key])
         ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_offset.to_string() + " " + field_kind + " " + field_name)
     else:
-        ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_name)
+        unique_offset := ir_unique_field_offset(field_name)
+        if unique_offset >= 0:
+            ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + unique_offset.to_string() + " " + ir_unique_field_kind(field_name) + " " + field_name)
+        else:
+            ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_name)
 
 fn ir_emit_field_access(idx: Int, node: Node) -> Int:
     fname := node_value(idx)

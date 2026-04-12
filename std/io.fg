@@ -12,7 +12,9 @@
 # handle-backed in-memory adapters are included so the helpers are easy to test.
 
 import std.bytes as bytes
+import std.time as time
 from std.bytes import ByteBuffer
+from std.concurrent import Context, BlockingError, blocking_cancelled, blocking_deadline_exceeded, blocking_failed
 
 DEFAULT_CHUNK_SIZE := 4096
 
@@ -395,11 +397,17 @@ fn tcp_stream_read(stream: TcpStream, max_bytes: Int) -> String!:
 fn tcp_stream_read_bytes(stream: TcpStream, max_bytes: Int) -> Bytes!:
     return tcp_read_bytes(stream.fd, max_bytes)
 
+fn tcp_stream_wait_readable(stream: TcpStream, timeout_ms: Int) -> Int:
+    return tcp_wait_readable(stream.fd, timeout_ms)
+
 fn tcp_stream_write(stream: TcpStream, data: String) -> Int!:
     return tcp_stream_write_bytes(stream, encode_utf8(data))
 
 fn tcp_stream_write_bytes(stream: TcpStream, data: Bytes) -> Int!:
     return tcp_write_bytes(stream.fd, data)
+
+fn tcp_stream_wait_writable(stream: TcpStream, timeout_ms: Int) -> Int:
+    return tcp_wait_writable(stream.fd, timeout_ms)
 
 fn tcp_stream_set_timeout(stream: TcpStream, ms: Int):
     tcp_set_timeout(stream.fd, ms)
@@ -695,6 +703,60 @@ fn normalized_chunk_size(chunk_size: Int) -> Int:
         return DEFAULT_CHUNK_SIZE
     return chunk_size
 
+fn context_blocking_error(ctx: Context) -> BlockingError:
+    if ctx.state.get_default("err", 0) == 2:
+        return blocking_deadline_exceeded()
+    return blocking_cancelled()
+
+fn context_wait_slice_ms(ctx: Context) -> Int:
+    deadline := ctx.state.get_default("deadline", -1)
+    if deadline < 0:
+        return 10
+    remaining := deadline - time.now()
+    if remaining <= 0:
+        return 0
+    if remaining < 10:
+        return remaining
+    return 10
+
+fn tcp_stream_read_bytes_ctx(stream: TcpStream, ctx: Context, max_bytes: Int) -> Bytes!BlockingError:
+    while true:
+        if ctx.is_cancelled():
+            fail context_blocking_error(ctx)
+        waited := tcp_stream_wait_readable(stream, context_wait_slice_ms(ctx))
+        if waited > 0:
+            chunk := tcp_stream_read_bytes(stream, max_bytes)
+            if chunk.is_err:
+                fail blocking_failed(chunk.err)
+            return chunk.ok
+        if waited < 0:
+            fail blocking_failed("tcp read wait failed")
+
+fn tcp_stream_read_ctx(stream: TcpStream, ctx: Context, max_bytes: Int) -> String!BlockingError:
+    bytes_result := tcp_stream_read_bytes_ctx(stream, ctx, max_bytes)
+    if bytes_result.is_err:
+        fail bytes_result.err
+    text := decode_utf8(bytes_result.ok)
+    if text.is_err:
+        fail blocking_failed(text.err)
+    return text.ok
+
+fn tcp_stream_write_bytes_ctx(stream: TcpStream, ctx: Context, data: Bytes) -> Int!BlockingError:
+    while true:
+        if ctx.is_cancelled():
+            fail context_blocking_error(ctx)
+        waited := tcp_stream_wait_writable(stream, context_wait_slice_ms(ctx))
+        if waited > 0:
+            wrote := tcp_stream_write_bytes(stream, data)
+            if wrote.is_err:
+                fail blocking_failed(wrote.err)
+            return wrote.ok
+        if waited < 0:
+            fail blocking_failed("tcp write wait failed")
+
+fn tcp_stream_write_ctx(stream: TcpStream, ctx: Context, data: String) -> Int!BlockingError:
+    return tcp_stream_write_bytes_ctx(stream, ctx, encode_utf8(data))
+
 fn allocate_string_reader_handle(data: String) -> Int:
     handle := next_string_reader_handle
     next_string_reader_handle = next_string_reader_handle + 1
@@ -864,6 +926,17 @@ fn write_all_tcp_stream(writer: TcpStream, data: String) -> Int!:
         remaining = remaining_after_write(remaining, wrote)
     return total
 
+fn write_all_tcp_stream_ctx(writer: TcpStream, ctx: Context, data: String) -> Int!BlockingError:
+    mut total := 0
+    mut remaining := data
+    while remaining.len() > 0:
+        wrote := tcp_stream_write_ctx(writer, ctx, remaining)!
+        if wrote <= 0:
+            fail blocking_failed("write returned 0")
+        total = total + wrote
+        remaining = remaining_after_write(remaining, wrote)
+    return total
+
 fn write_all_file_stream(writer: FileStream, data: String) -> Int!:
     mut total := 0
     mut remaining := data
@@ -897,6 +970,18 @@ fn read_all_tcp_stream_chunked(stream: TcpStream, chunk_size: Int) -> String!:
     while chunk.len() > 0:
         result = result + chunk
         chunk = stream.read(size)!
+    return result
+
+fn read_all_tcp_stream_ctx(stream: TcpStream, ctx: Context) -> String!BlockingError:
+    return read_all_tcp_stream_chunked_ctx(stream, ctx, DEFAULT_CHUNK_SIZE)
+
+fn read_all_tcp_stream_chunked_ctx(stream: TcpStream, ctx: Context, chunk_size: Int) -> String!BlockingError:
+    size := normalized_chunk_size(chunk_size)
+    mut result := ""
+    mut chunk := tcp_stream_read_ctx(stream, ctx, size)!
+    while chunk.len() > 0:
+        result = result + chunk
+        chunk = tcp_stream_read_ctx(stream, ctx, size)!
     return result
 
 fn read_all_file_stream(stream: FileStream) -> String!:
@@ -1076,6 +1161,20 @@ fn read_all_tcp_stream_bytes_chunked(stream: TcpStream, chunk_size: Int) -> Byte
         chunk = stream.read_bytes(size)!
     return buf.bytes()
 
+fn read_all_tcp_stream_bytes_ctx(stream: TcpStream, ctx: Context) -> Bytes!BlockingError:
+    return read_all_tcp_stream_bytes_chunked_ctx(stream, ctx, DEFAULT_CHUNK_SIZE)
+
+fn read_all_tcp_stream_bytes_chunked_ctx(stream: TcpStream, ctx: Context, chunk_size: Int) -> Bytes!BlockingError:
+    size := normalized_chunk_size(chunk_size)
+    buf := bytes.buffer_with_capacity(size)
+    mut chunk := tcp_stream_read_bytes_ctx(stream, ctx, size)!
+    while not chunk.is_empty():
+        wrote := buf.write(chunk)
+        if wrote.is_err:
+            fail blocking_failed(wrote.err)
+        chunk = tcp_stream_read_bytes_ctx(stream, ctx, size)!
+    return buf.bytes()
+
 fn write_all_tcp_stream_bytes(stream: TcpStream, data: Bytes) -> Int!:
     mut total := 0
     mut remaining := data
@@ -1083,6 +1182,17 @@ fn write_all_tcp_stream_bytes(stream: TcpStream, data: Bytes) -> Int!:
         wrote := stream.write_bytes(remaining)!
         if wrote <= 0:
             fail "write returned 0"
+        total = total + wrote
+        remaining = bytes_after_write(remaining, wrote)
+    return total
+
+fn write_all_tcp_stream_bytes_ctx(stream: TcpStream, ctx: Context, data: Bytes) -> Int!BlockingError:
+    mut total := 0
+    mut remaining := data
+    while not remaining.is_empty():
+        wrote := tcp_stream_write_bytes_ctx(stream, ctx, remaining)!
+        if wrote <= 0:
+            fail blocking_failed("write returned 0")
         total = total + wrote
         remaining = bytes_after_write(remaining, wrote)
     return total
@@ -1927,32 +2037,62 @@ impl TcpStream:
     fn read(max_bytes: Int) -> String!:
         return tcp_stream_read(self, max_bytes)
 
+    fn read_ctx(ctx: Context, max_bytes: Int) -> String!BlockingError:
+        return tcp_stream_read_ctx(self, ctx, max_bytes)
+
     fn read_all() -> String!:
         return read_all_tcp_stream(self)
+
+    fn read_all_ctx(ctx: Context) -> String!BlockingError:
+        return read_all_tcp_stream_ctx(self, ctx)
 
     fn read_all_chunked(chunk_size: Int) -> String!:
         return read_all_tcp_stream_chunked(self, chunk_size)
 
+    fn read_all_chunked_ctx(ctx: Context, chunk_size: Int) -> String!BlockingError:
+        return read_all_tcp_stream_chunked_ctx(self, ctx, chunk_size)
+
     fn read_bytes(max_bytes: Int) -> Bytes!:
         return tcp_stream_read_bytes(self, max_bytes)
+
+    fn read_bytes_ctx(ctx: Context, max_bytes: Int) -> Bytes!BlockingError:
+        return tcp_stream_read_bytes_ctx(self, ctx, max_bytes)
 
     fn read_all_bytes() -> Bytes!:
         return read_all_tcp_stream_bytes(self)
 
+    fn read_all_bytes_ctx(ctx: Context) -> Bytes!BlockingError:
+        return read_all_tcp_stream_bytes_ctx(self, ctx)
+
     fn read_all_bytes_chunked(chunk_size: Int) -> Bytes!:
         return read_all_tcp_stream_bytes_chunked(self, chunk_size)
+
+    fn read_all_bytes_chunked_ctx(ctx: Context, chunk_size: Int) -> Bytes!BlockingError:
+        return read_all_tcp_stream_bytes_chunked_ctx(self, ctx, chunk_size)
 
     fn write(data: String) -> Int!:
         return tcp_stream_write(self, data)
 
+    fn write_ctx(ctx: Context, data: String) -> Int!BlockingError:
+        return tcp_stream_write_ctx(self, ctx, data)
+
     fn write_all(data: String) -> Int!:
         return write_all_tcp_stream(self, data)
+
+    fn write_all_ctx(ctx: Context, data: String) -> Int!BlockingError:
+        return write_all_tcp_stream_ctx(self, ctx, data)
 
     fn write_bytes(data: Bytes) -> Int!:
         return tcp_stream_write_bytes(self, data)
 
+    fn write_bytes_ctx(ctx: Context, data: Bytes) -> Int!BlockingError:
+        return tcp_stream_write_bytes_ctx(self, ctx, data)
+
     fn write_all_bytes(data: Bytes) -> Int!:
         return write_all_tcp_stream_bytes(self, data)
+
+    fn write_all_bytes_ctx(ctx: Context, data: Bytes) -> Int!BlockingError:
+        return write_all_tcp_stream_bytes_ctx(self, ctx, data)
 
     fn buffered_bytes_reader() -> BufferedBytesReader:
         return buffered_bytes_reader_from_tcp(self, DEFAULT_CHUNK_SIZE)

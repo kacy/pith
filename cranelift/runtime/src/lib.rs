@@ -3778,6 +3778,55 @@ pub extern "C" fn forge_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
     result
 }
 
+fn forge_tcp_wait(fd: i64, events: i16, timeout_ms: i64) -> i64 {
+    if fd <= 0 {
+        return -1;
+    }
+    let mut poll_fd = libc::pollfd {
+        fd: fd as i32,
+        events,
+        revents: 0,
+    };
+    let timeout = if timeout_ms < 0 {
+        -1
+    } else if timeout_ms > i32::MAX as i64 {
+        i32::MAX
+    } else {
+        timeout_ms as i32
+    };
+    loop {
+        let status = unsafe { libc::poll(&mut poll_fd, 1, timeout) };
+        if status > 0 {
+            let revents = poll_fd.revents;
+            if (revents & libc::POLLNVAL) != 0 || (revents & libc::POLLERR) != 0 {
+                return -1;
+            }
+            if (revents & events) != 0 || (revents & libc::POLLHUP) != 0 {
+                return 1;
+            }
+            return -1;
+        }
+        if status == 0 {
+            return 0;
+        }
+        let kind = std::io::Error::last_os_error().kind();
+        if kind == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return -1;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn forge_tcp_wait_readable(fd: i64, timeout_ms: i64) -> i64 {
+    forge_tcp_wait(fd, libc::POLLIN, timeout_ms)
+}
+
+#[no_mangle]
+pub extern "C" fn forge_tcp_wait_writable(fd: i64, timeout_ms: i64) -> i64 {
+    forge_tcp_wait(fd, libc::POLLOUT, timeout_ms)
+}
+
 /// TCP write — write data to connection fd, return bytes written
 #[no_mangle]
 pub unsafe extern "C" fn forge_tcp_write(conn_fd: i64, data: *const i8) -> i64 {

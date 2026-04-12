@@ -1,0 +1,30 @@
+import std.concurrent as concurrent
+import std.io as io
+import std.time as time
+
+fn main() -> Int!:
+    invalid := io.from_fd(-1)
+
+    timeout_pair := concurrent.with_timeout(concurrent.background(), 1)
+    time.delay(5)
+    timeout_read := invalid.read_ctx(timeout_pair.0, 8)
+    print("read-timeout:{timeout_read.is_err}")
+    print("read-deadline:{timeout_read.is_err and timeout_read.err.is_deadline_exceeded()}")
+
+    cancel_pair := concurrent.with_cancel(concurrent.background())
+    cancel_pair.1.cancel()
+    cancelled_write := invalid.write_ctx(cancel_pair.0, "hi")
+    print("write-cancelled:{cancelled_write.is_err and cancelled_write.err.is_cancelled()}")
+
+    invalid_read := invalid.read_ctx(concurrent.background(), 8)
+    print("invalid-read-failed:{invalid_read.is_err and invalid_read.err.is_failed()}")
+
+    invalid_read_all := invalid.read_all_ctx(concurrent.background())
+    print("invalid-read-all-failed:{invalid_read_all.is_err and invalid_read_all.err.is_failed()}")
+
+    invalid_read_bytes := invalid.read_bytes_ctx(concurrent.background(), 8)
+    print("invalid-read-bytes-failed:{invalid_read_bytes.is_err and invalid_read_bytes.err.is_failed()}")
+
+    invalid_write_all := invalid.write_all_ctx(concurrent.background(), "hi")
+    print("invalid-write-all-failed:{invalid_write_all.is_err and invalid_write_all.err.is_failed()}")
+    return 0

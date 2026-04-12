@@ -400,6 +400,8 @@ fn register_builtin_types():
     define_builtin_function("tcp_write", create_function_type([TID_INT, TID_STRING], int_result))
     define_builtin_function("tcp_read_bytes", create_function_type([TID_INT, TID_INT], bytes_result))
     define_builtin_function("tcp_write_bytes", create_function_type([TID_INT, tid_bytes], int_result))
+    define_builtin_function("tcp_wait_readable", create_function_type([TID_INT, TID_INT], TID_INT))
+    define_builtin_function("tcp_wait_writable", create_function_type([TID_INT, TID_INT], TID_INT))
     # (Int, Int) -> Void
     define_builtin_function("tcp_set_timeout", create_function_type([TID_INT, TID_INT], TID_VOID))
 
@@ -536,6 +538,8 @@ fn register_builtin_types():
     fix_builtin_binding("tcp_write", [tid_int, tid_string], int_result)
     fix_builtin_binding("tcp_read_bytes", [tid_int, tid_int], bytes_result)
     fix_builtin_binding("tcp_write_bytes", [tid_int, tid_bytes], int_result)
+    fix_builtin_binding("tcp_wait_readable", [tid_int, tid_int], tid_int)
+    fix_builtin_binding("tcp_wait_writable", [tid_int, tid_int], tid_int)
     fix_builtin_binding("tcp_set_timeout", [tid_int, tid_int], tid_void)
     fix_builtin_binding("process_spawn", [tid_string], int_result)
     fix_builtin_binding("process_spawn_argv", [tid_string, list_string, tid_string, list_string, list_string], int_result)

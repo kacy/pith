@@ -82,6 +82,19 @@ tcp stream waits can use the same context story through `std.io`:
 - `BufferedTcpWriter.write_ctx(ctx, data)`
 - `BufferedTcpWriter.flush_ctx(ctx)`
 
+process stdio can use the same pattern too:
+
+- `ProcessStdout.read_ctx(ctx, max_bytes)`
+- `ProcessStdout.read_all_ctx(ctx)`
+- `ProcessStderr.read_ctx(ctx, max_bytes)`
+- `ProcessStderr.read_all_ctx(ctx)`
+- `ProcessStdin.write_ctx(ctx, data)`
+- `ProcessStdin.write_all_ctx(ctx, data)`
+- `BufferedProcessStdout.read_ctx(ctx, max_bytes)`
+- `BufferedProcessStdout.read_line_ctx(ctx)`
+- `BufferedProcessStderr.read_ctx(ctx, max_bytes)`
+- `BufferedProcessStderr.read_line_ctx(ctx)`
+
 context cancellation is cooperative. cancelling a context stops the wait, not the task itself.
 
 ## tasks

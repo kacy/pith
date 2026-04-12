@@ -460,6 +460,24 @@ fn process_stdout_read_bytes(reader: ProcessStdout, max_bytes: Int) -> Bytes!:
 fn process_stderr_read_bytes(reader: ProcessStderr, max_bytes: Int) -> Bytes!:
     return process_read_err_bytes(reader.handle, max_bytes)
 
+fn process_stdin_write_worker(writer: ProcessStdin, data: String) -> Int!:
+    return process_stdin_write(writer, data)
+
+fn process_stdin_write_bytes_worker(writer: ProcessStdin, data: Bytes) -> Int!:
+    return process_stdin_write_bytes(writer, data)
+
+fn process_stdout_read_worker(reader: ProcessStdout, max_bytes: Int) -> String!:
+    return process_stdout_read(reader, max_bytes)
+
+fn process_stdout_read_bytes_worker(reader: ProcessStdout, max_bytes: Int) -> Bytes!:
+    return process_stdout_read_bytes(reader, max_bytes)
+
+fn process_stderr_read_worker(reader: ProcessStderr, max_bytes: Int) -> String!:
+    return process_stderr_read(reader, max_bytes)
+
+fn process_stderr_read_bytes_worker(reader: ProcessStderr, max_bytes: Int) -> Bytes!:
+    return process_stderr_read_bytes(reader, max_bytes)
+
 fn wait_process(process: Process) -> Int:
     return process_wait(process.handle)
 
@@ -1062,6 +1080,77 @@ fn read_all_process_stderr_chunked(reader: ProcessStderr, chunk_size: Int) -> St
         chunk = reader.read(size)!
     return result
 
+fn process_stdin_write_ctx(writer: ProcessStdin, ctx: Context, data: String) -> Int!BlockingError:
+    task := spawn process_stdin_write_worker(writer, data)
+    while not task.is_done():
+        if ctx.is_cancelled():
+            task.detach()
+            fail context_blocking_error(ctx)
+        time.delay(1)
+    wrote := await task
+    if wrote.is_err:
+        fail blocking_failed(wrote.err)
+    return wrote.ok
+
+fn write_all_process_stdin_ctx(writer: ProcessStdin, ctx: Context, data: String) -> Int!BlockingError:
+    mut total := 0
+    mut remaining := data
+    while remaining.len() > 0:
+        wrote := process_stdin_write_ctx(writer, ctx, remaining)!
+        if wrote <= 0:
+            fail blocking_failed("write returned 0")
+        total = total + wrote
+        remaining = remaining_after_write(remaining, wrote)
+    return total
+
+fn process_stdout_read_ctx(reader: ProcessStdout, ctx: Context, max_bytes: Int) -> String!BlockingError:
+    task := spawn process_stdout_read_worker(reader, max_bytes)
+    while not task.is_done():
+        if ctx.is_cancelled():
+            task.detach()
+            fail context_blocking_error(ctx)
+        time.delay(1)
+    read := await task
+    if read.is_err:
+        fail blocking_failed(read.err)
+    return read.ok
+
+fn read_all_process_stdout_ctx(reader: ProcessStdout, ctx: Context) -> String!BlockingError:
+    return read_all_process_stdout_chunked_ctx(reader, ctx, DEFAULT_CHUNK_SIZE)
+
+fn read_all_process_stdout_chunked_ctx(reader: ProcessStdout, ctx: Context, chunk_size: Int) -> String!BlockingError:
+    size := normalized_chunk_size(chunk_size)
+    mut result := ""
+    mut chunk := process_stdout_read_ctx(reader, ctx, size)!
+    while chunk.len() > 0:
+        result = result + chunk
+        chunk = process_stdout_read_ctx(reader, ctx, size)!
+    return result
+
+fn process_stderr_read_ctx(reader: ProcessStderr, ctx: Context, max_bytes: Int) -> String!BlockingError:
+    task := spawn process_stderr_read_worker(reader, max_bytes)
+    while not task.is_done():
+        if ctx.is_cancelled():
+            task.detach()
+            fail context_blocking_error(ctx)
+        time.delay(1)
+    read := await task
+    if read.is_err:
+        fail blocking_failed(read.err)
+    return read.ok
+
+fn read_all_process_stderr_ctx(reader: ProcessStderr, ctx: Context) -> String!BlockingError:
+    return read_all_process_stderr_chunked_ctx(reader, ctx, DEFAULT_CHUNK_SIZE)
+
+fn read_all_process_stderr_chunked_ctx(reader: ProcessStderr, ctx: Context, chunk_size: Int) -> String!BlockingError:
+    size := normalized_chunk_size(chunk_size)
+    mut result := ""
+    mut chunk := process_stderr_read_ctx(reader, ctx, size)!
+    while chunk.len() > 0:
+        result = result + chunk
+        chunk = process_stderr_read_ctx(reader, ctx, size)!
+    return result
+
 fn string_reader_read_internal(reader: StringReader, max_bytes: Int) -> String!:
     if max_bytes <= 0:
         return ""
@@ -1253,6 +1342,81 @@ fn read_all_process_stderr_bytes_chunked(reader: ProcessStderr, chunk_size: Int)
     while not chunk.is_empty():
         buf.write(chunk)!
         chunk = reader.read_bytes(size)!
+    return buf.bytes()
+
+fn process_stdin_write_bytes_ctx(writer: ProcessStdin, ctx: Context, data: Bytes) -> Int!BlockingError:
+    task := spawn process_stdin_write_bytes_worker(writer, data)
+    while not task.is_done():
+        if ctx.is_cancelled():
+            task.detach()
+            fail context_blocking_error(ctx)
+        time.delay(1)
+    wrote := await task
+    if wrote.is_err:
+        fail blocking_failed(wrote.err)
+    return wrote.ok
+
+fn write_all_process_stdin_bytes_ctx(writer: ProcessStdin, ctx: Context, data: Bytes) -> Int!BlockingError:
+    mut total := 0
+    mut remaining := data
+    while not remaining.is_empty():
+        wrote := process_stdin_write_bytes_ctx(writer, ctx, remaining)!
+        if wrote <= 0:
+            fail blocking_failed("write returned 0")
+        total = total + wrote
+        remaining = bytes_after_write(remaining, wrote)
+    return total
+
+fn process_stdout_read_bytes_ctx(reader: ProcessStdout, ctx: Context, max_bytes: Int) -> Bytes!BlockingError:
+    task := spawn process_stdout_read_bytes_worker(reader, max_bytes)
+    while not task.is_done():
+        if ctx.is_cancelled():
+            task.detach()
+            fail context_blocking_error(ctx)
+        time.delay(1)
+    read := await task
+    if read.is_err:
+        fail blocking_failed(read.err)
+    return read.ok
+
+fn read_all_process_stdout_bytes_ctx(reader: ProcessStdout, ctx: Context) -> Bytes!BlockingError:
+    return read_all_process_stdout_bytes_chunked_ctx(reader, ctx, DEFAULT_CHUNK_SIZE)
+
+fn read_all_process_stdout_bytes_chunked_ctx(reader: ProcessStdout, ctx: Context, chunk_size: Int) -> Bytes!BlockingError:
+    size := normalized_chunk_size(chunk_size)
+    buf := bytes.buffer_with_capacity(size)
+    mut chunk := process_stdout_read_bytes_ctx(reader, ctx, size)!
+    while not chunk.is_empty():
+        wrote := buf.write(chunk)
+        if wrote.is_err:
+            fail blocking_failed(wrote.err)
+        chunk = process_stdout_read_bytes_ctx(reader, ctx, size)!
+    return buf.bytes()
+
+fn process_stderr_read_bytes_ctx(reader: ProcessStderr, ctx: Context, max_bytes: Int) -> Bytes!BlockingError:
+    task := spawn process_stderr_read_bytes_worker(reader, max_bytes)
+    while not task.is_done():
+        if ctx.is_cancelled():
+            task.detach()
+            fail context_blocking_error(ctx)
+        time.delay(1)
+    read := await task
+    if read.is_err:
+        fail blocking_failed(read.err)
+    return read.ok
+
+fn read_all_process_stderr_bytes_ctx(reader: ProcessStderr, ctx: Context) -> Bytes!BlockingError:
+    return read_all_process_stderr_bytes_chunked_ctx(reader, ctx, DEFAULT_CHUNK_SIZE)
+
+fn read_all_process_stderr_bytes_chunked_ctx(reader: ProcessStderr, ctx: Context, chunk_size: Int) -> Bytes!BlockingError:
+    size := normalized_chunk_size(chunk_size)
+    buf := bytes.buffer_with_capacity(size)
+    mut chunk := process_stderr_read_bytes_ctx(reader, ctx, size)!
+    while not chunk.is_empty():
+        wrote := buf.write(chunk)
+        if wrote.is_err:
+            fail blocking_failed(wrote.err)
+        chunk = process_stderr_read_bytes_ctx(reader, ctx, size)!
     return buf.bytes()
 
 fn read_all_buffered_bytes_reader(reader: BufferedBytesReader) -> Bytes!:
@@ -1684,6 +1848,27 @@ fn buffered_process_stdout_read_internal(reader: BufferedProcessStdout, max_byte
         buffered_process_stdout_consume(reader.handle, take)
     return result
 
+fn buffered_process_stdout_read_internal_ctx(reader: BufferedProcessStdout, ctx: Context, max_bytes: Int) -> String!BlockingError:
+    if max_bytes <= 0:
+        return ""
+    if not buffered_process_stdout_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while result.len() < max_bytes:
+        mut cached := buffered_process_stdout_cache_get(reader.handle)
+        if cached.len() == 0:
+            filled := buffered_process_stdout_fill_ctx(reader.handle, ctx)!
+            if filled <= 0:
+                return result
+            cached = buffered_process_stdout_cache_get(reader.handle)
+        mut take := max_bytes - result.len()
+        if take > cached.len():
+            take = cached.len()
+        result = result + cached.substring(0, take)
+        buffered_process_stdout_consume(reader.handle, take)
+    return result
+
 fn buffered_process_stdout_read_line_internal(reader: BufferedProcessStdout) -> String!:
     if not buffered_process_stdout_handles.contains_key(reader.handle):
         return ""
@@ -1693,6 +1878,26 @@ fn buffered_process_stdout_read_line_internal(reader: BufferedProcessStdout) -> 
         mut cached := buffered_process_stdout_cache_get(reader.handle)
         if cached.len() == 0:
             filled := buffered_process_stdout_fill(reader.handle)!
+            if filled <= 0:
+                return result
+            cached = buffered_process_stdout_cache_get(reader.handle)
+        newline := find_newline(cached)
+        if newline >= 0:
+            result = result + cached.substring(0, newline)
+            buffered_process_stdout_consume(reader.handle, newline + 1)
+            return trim_trailing_cr(result)
+        result = result + cached
+        buffered_process_stdout_cache.insert(reader.handle, "")
+
+fn buffered_process_stdout_read_line_internal_ctx(reader: BufferedProcessStdout, ctx: Context) -> String!BlockingError:
+    if not buffered_process_stdout_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_process_stdout_cache_get(reader.handle)
+        if cached.len() == 0:
+            filled := buffered_process_stdout_fill_ctx(reader.handle, ctx)!
             if filled <= 0:
                 return result
             cached = buffered_process_stdout_cache_get(reader.handle)
@@ -1717,6 +1922,19 @@ fn buffered_process_stdout_fill(handle: Int) -> Int!:
     buffered_process_stdout_cache.insert(handle, chunk)
     return chunk.len()
 
+fn buffered_process_stdout_fill_ctx(handle: Int, ctx: Context) -> Int!BlockingError:
+    if not buffered_process_stdout_handles.contains_key(handle):
+        return 0
+
+    stdout_handle := buffered_process_stdout_handles[handle]
+    mut chunk_size := DEFAULT_CHUNK_SIZE
+    if buffered_process_stdout_chunk_sizes.contains_key(handle):
+        chunk_size = buffered_process_stdout_chunk_sizes[handle]
+
+    chunk := process_stdout_read_ctx(ProcessStdout(stdout_handle), ctx, chunk_size)!
+    buffered_process_stdout_cache.insert(handle, chunk)
+    return chunk.len()
+
 fn buffered_process_stderr_read_internal(reader: BufferedProcessStderr, max_bytes: Int) -> String!:
     if max_bytes <= 0:
         return ""
@@ -1728,6 +1946,27 @@ fn buffered_process_stderr_read_internal(reader: BufferedProcessStderr, max_byte
         mut cached := buffered_process_stderr_cache_get(reader.handle)
         if cached.len() == 0:
             filled := buffered_process_stderr_fill(reader.handle)!
+            if filled <= 0:
+                return result
+            cached = buffered_process_stderr_cache_get(reader.handle)
+        mut take := max_bytes - result.len()
+        if take > cached.len():
+            take = cached.len()
+        result = result + cached.substring(0, take)
+        buffered_process_stderr_consume(reader.handle, take)
+    return result
+
+fn buffered_process_stderr_read_internal_ctx(reader: BufferedProcessStderr, ctx: Context, max_bytes: Int) -> String!BlockingError:
+    if max_bytes <= 0:
+        return ""
+    if not buffered_process_stderr_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while result.len() < max_bytes:
+        mut cached := buffered_process_stderr_cache_get(reader.handle)
+        if cached.len() == 0:
+            filled := buffered_process_stderr_fill_ctx(reader.handle, ctx)!
             if filled <= 0:
                 return result
             cached = buffered_process_stderr_cache_get(reader.handle)
@@ -1758,6 +1997,26 @@ fn buffered_process_stderr_read_line_internal(reader: BufferedProcessStderr) -> 
         result = result + cached
         buffered_process_stderr_cache.insert(reader.handle, "")
 
+fn buffered_process_stderr_read_line_internal_ctx(reader: BufferedProcessStderr, ctx: Context) -> String!BlockingError:
+    if not buffered_process_stderr_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_process_stderr_cache_get(reader.handle)
+        if cached.len() == 0:
+            filled := buffered_process_stderr_fill_ctx(reader.handle, ctx)!
+            if filled <= 0:
+                return result
+            cached = buffered_process_stderr_cache_get(reader.handle)
+        newline := find_newline(cached)
+        if newline >= 0:
+            result = result + cached.substring(0, newline)
+            buffered_process_stderr_consume(reader.handle, newline + 1)
+            return trim_trailing_cr(result)
+        result = result + cached
+        buffered_process_stderr_cache.insert(reader.handle, "")
+
 fn buffered_process_stderr_fill(handle: Int) -> Int!:
     if not buffered_process_stderr_handles.contains_key(handle):
         return 0
@@ -1768,6 +2027,19 @@ fn buffered_process_stderr_fill(handle: Int) -> Int!:
         chunk_size = buffered_process_stderr_chunk_sizes[handle]
 
     chunk := process_stderr_read(ProcessStderr(stderr_handle), chunk_size)!
+    buffered_process_stderr_cache.insert(handle, chunk)
+    return chunk.len()
+
+fn buffered_process_stderr_fill_ctx(handle: Int, ctx: Context) -> Int!BlockingError:
+    if not buffered_process_stderr_handles.contains_key(handle):
+        return 0
+
+    stderr_handle := buffered_process_stderr_handles[handle]
+    mut chunk_size := DEFAULT_CHUNK_SIZE
+    if buffered_process_stderr_chunk_sizes.contains_key(handle):
+        chunk_size = buffered_process_stderr_chunk_sizes[handle]
+
+    chunk := process_stderr_read_ctx(ProcessStderr(stderr_handle), ctx, chunk_size)!
     buffered_process_stderr_cache.insert(handle, chunk)
     return chunk.len()
 
@@ -1923,8 +2195,14 @@ impl BufferedProcessStdout:
     fn read(max_bytes: Int) -> String!:
         return buffered_process_stdout_read(self, max_bytes)
 
+    fn read_ctx(ctx: Context, max_bytes: Int) -> String!BlockingError:
+        return buffered_process_stdout_read_internal_ctx(self, ctx, max_bytes)
+
     fn read_line() -> String!:
         return buffered_process_stdout_read_line(self)
+
+    fn read_line_ctx(ctx: Context) -> String!BlockingError:
+        return buffered_process_stdout_read_line_internal_ctx(self, ctx)
 
 impl Reader for BufferedProcessStdout:
     fn read(max_bytes: Int) -> String!:
@@ -1934,8 +2212,14 @@ impl BufferedProcessStderr:
     fn read(max_bytes: Int) -> String!:
         return buffered_process_stderr_read(self, max_bytes)
 
+    fn read_ctx(ctx: Context, max_bytes: Int) -> String!BlockingError:
+        return buffered_process_stderr_read_internal_ctx(self, ctx, max_bytes)
+
     fn read_line() -> String!:
         return buffered_process_stderr_read_line(self)
+
+    fn read_line_ctx(ctx: Context) -> String!BlockingError:
+        return buffered_process_stderr_read_line_internal_ctx(self, ctx)
 
 impl Reader for BufferedProcessStderr:
     fn read(max_bytes: Int) -> String!:
@@ -2001,14 +2285,26 @@ impl ProcessStdin:
     fn write(data: String) -> Int!:
         return process_stdin_write(self, data)
 
+    fn write_ctx(ctx: Context, data: String) -> Int!BlockingError:
+        return process_stdin_write_ctx(self, ctx, data)
+
     fn write_all(data: String) -> Int!:
         return write_all_process_stdin(self, data)
+
+    fn write_all_ctx(ctx: Context, data: String) -> Int!BlockingError:
+        return write_all_process_stdin_ctx(self, ctx, data)
 
     fn write_bytes(data: Bytes) -> Int!:
         return process_stdin_write_bytes(self, data)
 
+    fn write_bytes_ctx(ctx: Context, data: Bytes) -> Int!BlockingError:
+        return process_stdin_write_bytes_ctx(self, ctx, data)
+
     fn write_all_bytes(data: Bytes) -> Int!:
         return write_all_process_stdin_bytes(self, data)
+
+    fn write_all_bytes_ctx(ctx: Context, data: Bytes) -> Int!BlockingError:
+        return write_all_process_stdin_bytes_ctx(self, ctx, data)
 
     fn buffered_bytes() -> BufferedBytesWriter:
         return buffered_bytes_writer_to_stdin(self, DEFAULT_CHUNK_SIZE)
@@ -2028,20 +2324,38 @@ impl ProcessStdout:
     fn read(max_bytes: Int) -> String!:
         return process_stdout_read(self, max_bytes)
 
+    fn read_ctx(ctx: Context, max_bytes: Int) -> String!BlockingError:
+        return process_stdout_read_ctx(self, ctx, max_bytes)
+
     fn read_all() -> String!:
         return read_all_process_stdout(self)
+
+    fn read_all_ctx(ctx: Context) -> String!BlockingError:
+        return read_all_process_stdout_ctx(self, ctx)
 
     fn read_all_chunked(chunk_size: Int) -> String!:
         return read_all_process_stdout_chunked(self, chunk_size)
 
+    fn read_all_chunked_ctx(ctx: Context, chunk_size: Int) -> String!BlockingError:
+        return read_all_process_stdout_chunked_ctx(self, ctx, chunk_size)
+
     fn read_bytes(max_bytes: Int) -> Bytes!:
         return process_stdout_read_bytes(self, max_bytes)
+
+    fn read_bytes_ctx(ctx: Context, max_bytes: Int) -> Bytes!BlockingError:
+        return process_stdout_read_bytes_ctx(self, ctx, max_bytes)
 
     fn read_all_bytes() -> Bytes!:
         return read_all_process_stdout_bytes(self)
 
+    fn read_all_bytes_ctx(ctx: Context) -> Bytes!BlockingError:
+        return read_all_process_stdout_bytes_ctx(self, ctx)
+
     fn read_all_bytes_chunked(chunk_size: Int) -> Bytes!:
         return read_all_process_stdout_bytes_chunked(self, chunk_size)
+
+    fn read_all_bytes_chunked_ctx(ctx: Context, chunk_size: Int) -> Bytes!BlockingError:
+        return read_all_process_stdout_bytes_chunked_ctx(self, ctx, chunk_size)
 
     fn buffered_bytes() -> BufferedBytesReader:
         return buffered_bytes_reader_from_stdout(self, DEFAULT_CHUNK_SIZE)
@@ -2067,20 +2381,38 @@ impl ProcessStderr:
     fn read(max_bytes: Int) -> String!:
         return process_stderr_read(self, max_bytes)
 
+    fn read_ctx(ctx: Context, max_bytes: Int) -> String!BlockingError:
+        return process_stderr_read_ctx(self, ctx, max_bytes)
+
     fn read_all() -> String!:
         return read_all_process_stderr(self)
+
+    fn read_all_ctx(ctx: Context) -> String!BlockingError:
+        return read_all_process_stderr_ctx(self, ctx)
 
     fn read_all_chunked(chunk_size: Int) -> String!:
         return read_all_process_stderr_chunked(self, chunk_size)
 
+    fn read_all_chunked_ctx(ctx: Context, chunk_size: Int) -> String!BlockingError:
+        return read_all_process_stderr_chunked_ctx(self, ctx, chunk_size)
+
     fn read_bytes(max_bytes: Int) -> Bytes!:
         return process_stderr_read_bytes(self, max_bytes)
+
+    fn read_bytes_ctx(ctx: Context, max_bytes: Int) -> Bytes!BlockingError:
+        return process_stderr_read_bytes_ctx(self, ctx, max_bytes)
 
     fn read_all_bytes() -> Bytes!:
         return read_all_process_stderr_bytes(self)
 
+    fn read_all_bytes_ctx(ctx: Context) -> Bytes!BlockingError:
+        return read_all_process_stderr_bytes_ctx(self, ctx)
+
     fn read_all_bytes_chunked(chunk_size: Int) -> Bytes!:
         return read_all_process_stderr_bytes_chunked(self, chunk_size)
+
+    fn read_all_bytes_chunked_ctx(ctx: Context, chunk_size: Int) -> Bytes!BlockingError:
+        return read_all_process_stderr_bytes_chunked_ctx(self, ctx, chunk_size)
 
     fn buffered_bytes() -> BufferedBytesReader:
         return buffered_bytes_reader_from_stderr(self, DEFAULT_CHUNK_SIZE)

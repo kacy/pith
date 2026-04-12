@@ -31,3 +31,72 @@ fn main():
     proc.kill()
     proc.wait()
     proc.close()
+
+    stdout_started := process.command("sh").args(["-c", "sleep 1; printf later"]).start()
+    if stdout_started.is_err:
+        print("stdout-read-timeout:false")
+        print("stdout-read-deadline:false")
+    else:
+        stdout_proc := stdout_started.ok
+        stdout_pair := concurrent.with_timeout(bg, 5)
+        stdout_result := stdout_proc.stdout().read_ctx(stdout_pair.0, 16)
+        print("stdout-read-timeout:{stdout_result.is_err}")
+        print("stdout-read-deadline:{stdout_result.is_err and stdout_result.err.is_deadline_exceeded()}")
+        stdout_proc.kill()
+        stdout_proc.wait()
+        stdout_proc.close()
+
+    stdout_ok_started := process.command("sh").args(["-c", "printf alpha"]).start()
+    if stdout_ok_started.is_err:
+        print("stdout-read-all-ok:false")
+        print("stdout-read-all-value:")
+    else:
+        stdout_ok_proc := stdout_ok_started.ok
+        stdout_all := stdout_ok_proc.stdout().read_all_ctx(bg)
+        print("stdout-read-all-ok:{stdout_all.is_ok}")
+        if stdout_all.is_ok:
+            print("stdout-read-all-value:{stdout_all.ok}")
+        else:
+            print("stdout-read-all-value:")
+        stdout_ok_proc.wait()
+        stdout_ok_proc.close()
+
+    stderr_ok_started := process.command("sh").args(["-c", "printf beta >&2"]).start()
+    if stderr_ok_started.is_err:
+        print("stderr-read-all-ok:false")
+        print("stderr-read-all-value:")
+    else:
+        stderr_ok_proc := stderr_ok_started.ok
+        stderr_all := stderr_ok_proc.stderr().read_all_ctx(bg)
+        print("stderr-read-all-ok:{stderr_all.is_ok}")
+        if stderr_all.is_ok:
+            print("stderr-read-all-value:{stderr_all.ok}")
+        else:
+            print("stderr-read-all-value:")
+        stderr_ok_proc.wait()
+        stderr_ok_proc.close()
+
+    stdin_started := process.command("sh").args(["-c", "head -c 2 >/dev/null"]).start()
+    if stdin_started.is_err:
+        print("stdin-write-ok:false")
+    else:
+        stdin_proc := stdin_started.ok
+        stdin_result := stdin_proc.stdin().write_ctx(bg, "hi")
+        print("stdin-write-ok:{stdin_result.is_ok and stdin_result.ok == 2}")
+        stdin_proc.wait()
+        stdin_proc.close()
+
+    buffered_started := process.command("sh").args(["-c", "printf 'line\\n'"]).start()
+    if buffered_started.is_err:
+        print("buffered-stdout-line-ok:false")
+        print("buffered-stdout-line:")
+    else:
+        buffered_proc := buffered_started.ok
+        buffered_line := buffered_proc.stdout().buffered().read_line_ctx(bg)
+        print("buffered-stdout-line-ok:{buffered_line.is_ok}")
+        if buffered_line.is_ok:
+            print("buffered-stdout-line:{buffered_line.ok}")
+        else:
+            print("buffered-stdout-line:")
+        buffered_proc.wait()
+        buffered_proc.close()

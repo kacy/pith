@@ -2112,6 +2112,137 @@ fn ir_emit_result_or_else(idx: Int, node: Node) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+fn ir_emit_select_recv_probe(recv_idx: Int) -> Int:
+    recv_node := get_node(recv_idx)
+    if recv_node.kind != "method_call" or recv_node.children.len() == 0:
+        return ir_zero_reg()
+    ch_r := ir_expr(recv_node.children[0])
+    r := ir_reg()
+    ir_emit_call1(r, "forge_channel_try_recv", "tuple", ch_r)
+    return r
+
+fn ir_emit_select_send_probe(send_idx: Int) -> Int:
+    send_node := get_node(send_idx)
+    if send_node.kind != "method_call" or send_node.children.len() == 0:
+        return ir_zero_reg()
+    ch_r := ir_expr(send_node.children[0])
+    arg_idx := ir_method_call_arg_expr(send_node, 0)
+    if arg_idx < 0:
+        return ir_zero_reg()
+    val_r := ir_expr(arg_idx)
+    r := ir_reg()
+    ir_emit_call2(r, "forge_channel_try_send", "bool", ch_r, val_r)
+    return r
+
+fn ir_emit_select_arm_body(body_idx: Int, bind_name: String, bind_r: Int, bind_type: String) -> Int:
+    saved_vars := ir_copy_var_regs(ir_var_regs)
+    saved_types := ir_copy_var_types(ir_var_types)
+    if bind_name.len() > 0:
+        if bind_type.len() > 0:
+            ir_var_types.insert(bind_name, bind_type)
+        ir_emit("store " + bind_name + " " + bind_r.to_string())
+    body_node := get_node(body_idx)
+    mut body_r := ir_zero_reg()
+    if body_node.kind == "body":
+        if body_node.children.len() > 0:
+            body_r = ir_expr(body_node.children[0])
+    elif body_node.kind == "block":
+        ir_block(body_idx)
+    else:
+        body_r = ir_expr(body_idx)
+    ir_var_regs = saved_vars
+    ir_var_types = saved_types
+    return body_r
+
+fn ir_emit_select_expr(node: Node) -> Int:
+    result_temp := ir_new_temp_name("select")
+    mut timeout_idx := 0 - 1
+    mut default_idx := 0 - 1
+    mut i := 0
+    while i < node.children.len():
+        arm_node := get_node(node.children[i])
+        if arm_node.kind == "select_timeout_arm" and timeout_idx < 0:
+            timeout_idx = node.children[i]
+        elif arm_node.kind == "select_default_arm" and default_idx < 0:
+            default_idx = node.children[i]
+        i = i + 1
+
+    mut deadline_name := ""
+    if timeout_idx >= 0:
+        deadline_name = ir_new_temp_name("select_deadline")
+        timeout_node := get_node(timeout_idx)
+        timeout_r := ir_expr(timeout_node.children[0])
+        now_r := ir_reg()
+        ir_emit_call0(now_r, "time", "int")
+        deadline_r := ir_reg()
+        ir_emit("add " + deadline_r.to_string() + " " + now_r.to_string() + " " + timeout_r.to_string())
+        ir_emit("store " + deadline_name + " " + deadline_r.to_string())
+
+    loop_l := ir_label()
+    end_l := ir_label()
+    ir_emit("label " + loop_l)
+
+    i = 0
+    while i < node.children.len():
+        arm_idx := node.children[i]
+        arm_node := get_node(arm_idx)
+        if arm_node.kind == "select_recv_arm" and arm_node.children.len() >= 2:
+            maybe_r := ir_emit_select_recv_probe(arm_node.children[0])
+            ready_r := ir_optional_flag_field(maybe_r)
+            hit_l := ir_label()
+            next_l := ir_label()
+            ir_emit("brif " + ready_r.to_string() + " " + hit_l + " " + next_l)
+            ir_emit("label " + hit_l)
+            body_r := ir_emit_select_arm_body(arm_node.children[1], arm_node.value, maybe_r, ir_checked_type(arm_node.children[0]))
+            ir_emit("store " + result_temp + " " + body_r.to_string())
+            ir_emit("jmp " + end_l)
+            ir_emit("label " + next_l)
+        elif arm_node.kind == "select_send_arm" and arm_node.children.len() >= 2:
+            ready_r := ir_emit_select_send_probe(arm_node.children[0])
+            hit_l := ir_label()
+            next_l := ir_label()
+            ir_emit("brif " + ready_r.to_string() + " " + hit_l + " " + next_l)
+            ir_emit("label " + hit_l)
+            body_r := ir_emit_select_arm_body(arm_node.children[1], "", 0, "")
+            ir_emit("store " + result_temp + " " + body_r.to_string())
+            ir_emit("jmp " + end_l)
+            ir_emit("label " + next_l)
+        i = i + 1
+
+    if default_idx >= 0:
+        default_node := get_node(default_idx)
+        if default_node.children.len() > 0:
+            body_r := ir_emit_select_arm_body(default_node.children[0], "", 0, "")
+            ir_emit("store " + result_temp + " " + body_r.to_string())
+            ir_emit("jmp " + end_l)
+
+    if timeout_idx >= 0:
+        now_r := ir_reg()
+        ir_emit_call0(now_r, "time", "int")
+        deadline_r := ir_reg()
+        ir_emit("load " + deadline_r.to_string() + " " + deadline_name)
+        expired_r := ir_reg()
+        ir_emit("gte " + expired_r.to_string() + " " + now_r.to_string() + " " + deadline_r.to_string())
+        timeout_l := ir_label()
+        wait_l := ir_label()
+        ir_emit("brif " + expired_r.to_string() + " " + timeout_l + " " + wait_l)
+        ir_emit("label " + timeout_l)
+        timeout_node := get_node(timeout_idx)
+        body_r := ir_emit_select_arm_body(timeout_node.children[1], "", 0, "")
+        ir_emit("store " + result_temp + " " + body_r.to_string())
+        ir_emit("jmp " + end_l)
+        ir_emit("label " + wait_l)
+
+    delay_r := ir_reg()
+    ir_emit("iconst " + delay_r.to_string() + " 1")
+    sleep_r := ir_reg()
+    ir_emit_call1(sleep_r, "sleep", "unknown", delay_r)
+    ir_emit("jmp " + loop_l)
+    ir_emit("label " + end_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + result_temp)
+    return r
+
 # --- method call dispatch (extracted from ir_expr) ---
 fn ir_emit_method_call(idx: Int) -> Int:
     node := get_node(idx)
@@ -2586,6 +2717,9 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         ir_emit("load " + r.to_string() + " " + temp_name)
         return r
 
+    if kind == "select_expr":
+        return ir_emit_select_expr(node)
+
     if kind == "fail":
         return ir_emit_fail_expr(node)
 
@@ -2610,6 +2744,8 @@ fn ir_stmt_is_expr(kind: String) -> Bool:
     if kind == "await" or kind == "try" or kind == "try_expr":
         return true
     if kind == "catch_expr":
+        return true
+    if kind == "select_expr":
         return true
     return kind == "fail"
 

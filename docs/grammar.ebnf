@@ -69,7 +69,8 @@ EOF           = (* end of file *) ;
 
 (* keywords *)
 KEYWORD       = "fn" | "if" | "elif" | "else" | "for" | "in" | "while"
-              | "match" | "return" | "fail" | "break" | "continue"
+              | "match" | "select" | "default" | "timeout"
+              | "return" | "fail" | "break" | "continue"
               | "struct" | "enum" | "interface" | "impl" | "type"
               | "pub" | "mut" | "ref" | "weak"
               | "import" | "from" | "as"
@@ -224,12 +225,18 @@ pattern_list  = pattern , { "," , pattern } ;
 (*   |                                                                 *)
 (*   + -                                                               *)
 (*   * / %                                                             *)
+(*   select                                                            *)
 (*   spawn, await, unary - (prefix)                                    *)
 (*   ? ! (postfix)                                                     *)
 (*   call, index, field access                                         *)
 
-expression    = or_expr ;
+expression    = select_expr | or_expr ;
 
+select_expr   = "select" , ":" , NEWLINE , INDENT , select_arm , { NEWLINE , select_arm } , DEDENT ;
+select_arm    = IDENT , ":=" , postfix_expr , "=>" , expression
+              | postfix_expr , "=>" , expression
+              | "timeout" , expression , "=>" , expression
+              | "default" , "=>" , expression ;
 or_expr       = and_expr , { "or" , and_expr } ;
 and_expr      = not_expr , { "and" , not_expr } ;
 not_expr      = "not" , not_expr | comparison ;

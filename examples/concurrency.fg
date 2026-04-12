@@ -1,10 +1,18 @@
-# spawn, await, and sync primitives
+# spawn, await, select, and sync primitives
+
+import std.concurrent as concurrent
+import std.time as time
+from std.concurrent import await_ctx
 
 fn fetch(url: String) -> String:
     return "response from " + url
 
 fn compute(x: Int) -> Int:
     return x * 2
+
+fn slow_compute(ms: Int, value: Int) -> Int:
+    time.delay(ms)
+    return value
 
 fn main():
     # spawn wraps the return type in Task[T]
@@ -17,6 +25,20 @@ fn main():
     # spawn and await can be composed
     value := await spawn compute(21)
     print(value.to_string())
+
+    jobs := Channel[Int](1)
+    jobs.send(7)
+    picked := select:
+        msg := jobs.recv() => msg?
+        default => 0
+    print("select picked: {picked}")
+
+    timeout_pair := concurrent.with_timeout(concurrent.background(), 5)
+    timeout_ctx := timeout_pair.0
+    slow_task := spawn slow_compute(20, 99)
+    timeout_result := await_ctx(slow_task, timeout_ctx)
+    print("await_ctx timed out: {timeout_result.is_err}")
+    await slow_task
 
     # sync primitives
     mu := Mutex()

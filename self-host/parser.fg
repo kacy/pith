@@ -613,6 +613,9 @@ fn parse_primary() -> Int:
     if _cur_tok_kind() == "kw_match":
         return parse_match_expr()
 
+    if _cur_tok_kind() == "kw_select":
+        return parse_select_expr()
+
     if _cur_tok_kind() == "kw_fn":
         return parse_lambda()
 
@@ -774,6 +777,62 @@ fn parse_match_arm() -> Int:
         children.push(add_node_with_position("body", "", body_children))
 
     return add_node_with_position("arm", "", children)
+
+fn parse_select_expr() -> Int:
+    advance_token()
+    expect("colon")
+    expect("newline")
+    expect("indent")
+
+    mut children: List[Int] := []
+    while not check("dedent") and not check("eof"):
+        arm := parse_select_arm()
+        children.push(arm)
+        if check("newline"):
+            advance_token()
+    expect("dedent")
+
+    return add_node_with_position("select_expr", "", children)
+
+fn parse_select_arm() -> Int:
+    if check("kw_default"):
+        advance_token()
+        expect("fat_arrow")
+        return add_node_with_position("select_default_arm", "", parse_select_arm_body())
+
+    if check("kw_timeout"):
+        advance_token()
+        timeout_expr := parse_expression()
+        expect("fat_arrow")
+        mut children := [timeout_expr]
+        for child in parse_select_arm_body():
+            children.push(child)
+        return add_node_with_position("select_timeout_arm", "", children)
+
+    if check("identifier") and _peek_ahead_kind(1) == "colon_eq":
+        name_tok := advance_token()
+        advance_token()
+        recv_expr := parse_expression()
+        expect("fat_arrow")
+        mut children := [recv_expr]
+        for child in parse_select_arm_body():
+            children.push(child)
+        return add_node_with_position("select_recv_arm", name_tok.value, children)
+
+    send_expr := parse_expression()
+    expect("fat_arrow")
+    mut children := [send_expr]
+    for child in parse_select_arm_body():
+        children.push(child)
+    return add_node_with_position("select_send_arm", "", children)
+
+fn parse_select_arm_body() -> List[Int]:
+    if check("newline"):
+        body := parse_block()
+        return [body]
+    body_expr := parse_expression()
+    mut body_children := [body_expr]
+    return [add_node_with_position("body", "", body_children)]
 
 fn parse_lambda() -> Int:
     advance_token()

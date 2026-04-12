@@ -1713,6 +1713,8 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
         return check_try_expression(node, scope_id)
     if node.kind == "catch_expr":
         return check_catch_expression(node, scope_id)
+    if node.kind == "select_expr":
+        return check_select_expression(node, scope_id)
     if node.kind == "match_expr":
         return check_match_expression(node_idx, scope_id)
     if node.kind == "lambda":
@@ -3278,6 +3280,98 @@ fn check_catch_expression(node: Node, scope_id: Int) -> Int:
         report_error("E219", "catch fallback type mismatch: expected " + get_type_name(result_info.inner) + ", got " + get_type_name(fallback_type))
         return TID_ERR
     return result_info.inner
+
+fn check_select_expression(node: Node, scope_id: Int) -> Int:
+    if node.children.len() == 0:
+        report_error("E232", "select requires at least one arm")
+        return TID_ERR
+    mut result_type := TID_ERR
+    mut saw_default := false
+    mut saw_timeout := false
+    for child in node.children:
+        arm_node := get_node(child)
+        arm_type := check_select_arm(arm_node, scope_id)
+        if arm_node.kind == "select_default_arm":
+            if saw_default:
+                report_error("E232", "select can only have one default arm")
+            saw_default = true
+        elif arm_node.kind == "select_timeout_arm":
+            if saw_timeout:
+                report_error("E232", "select can only have one timeout arm")
+            saw_timeout = true
+        if is_error_type(result_type):
+            result_type = arm_type
+        elif is_error_type(arm_type) == false:
+            if arm_type != result_type:
+                if arm_type != TID_VOID and result_type != TID_VOID:
+                    report_error("E225", "select arms have different types: " + get_type_name(result_type) + " vs " + get_type_name(arm_type))
+    return result_type
+
+fn check_select_arm(arm: Node, scope_id: Int) -> Int:
+    if arm.kind == "select_recv_arm":
+        return check_select_recv_arm(arm, scope_id)
+    if arm.kind == "select_send_arm":
+        return check_select_send_arm(arm, scope_id)
+    if arm.kind == "select_timeout_arm":
+        return check_select_timeout_arm(arm, scope_id)
+    if arm.kind == "select_default_arm":
+        return check_select_arm_body(arm, 0, scope_id)
+    report_error("E232", "invalid select arm")
+    return TID_ERR
+
+fn check_select_recv_arm(arm: Node, scope_id: Int) -> Int:
+    if arm.children.len() < 2:
+        report_error("E232", "select recv arm requires a recv expression and body")
+        return TID_ERR
+    recv_node := get_node(arm.children[0])
+    if recv_node.kind != "method_call" or recv_node.value != "recv":
+        report_error("E232", "select recv arms must use name := channel.recv()")
+        return TID_ERR
+    recv_type := c_check_expr(arm.children[0], scope_id)
+    if is_error_type(recv_type):
+        return TID_ERR
+    arm_scope := create_scope(scope_id)
+    define_binding(arm_scope, arm.value, recv_type, false)
+    return check_select_arm_body(arm, 1, arm_scope)
+
+fn check_select_send_arm(arm: Node, scope_id: Int) -> Int:
+    if arm.children.len() < 2:
+        report_error("E232", "select send arm requires a send expression and body")
+        return TID_ERR
+    send_node := get_node(arm.children[0])
+    if send_node.kind != "method_call" or send_node.value != "send":
+        report_error("E232", "select send arms must use channel.send(value)")
+        return TID_ERR
+    send_type := c_check_expr(arm.children[0], scope_id)
+    if is_error_type(send_type):
+        return TID_ERR
+    if send_type != TID_BOOL:
+        report_error("E232", "select send arms must use a channel send expression")
+        return TID_ERR
+    return check_select_arm_body(arm, 1, scope_id)
+
+fn check_select_timeout_arm(arm: Node, scope_id: Int) -> Int:
+    if arm.children.len() < 2:
+        report_error("E232", "select timeout arm requires a duration and body")
+        return TID_ERR
+    timeout_type := c_check_expr(arm.children[0], scope_id)
+    if is_error_type(timeout_type) == false:
+        if timeout_type != TID_INT:
+            report_error("E219", "select timeout expects Int milliseconds, got " + get_type_name(timeout_type))
+    return check_select_arm_body(arm, 1, scope_id)
+
+fn check_select_arm_body(arm: Node, body_idx: Int, scope_id: Int) -> Int:
+    if body_idx >= arm.children.len():
+        return TID_VOID
+    body_node := get_node(arm.children[body_idx])
+    if body_node.kind == "body":
+        if body_node.children.len() == 0:
+            return TID_VOID
+        return c_check_expr(body_node.children[0], scope_id)
+    if body_node.kind == "block":
+        check_block_statement(body_node, scope_id)
+        return TID_VOID
+    return c_check_expr(arm.children[body_idx], scope_id)
 
 # ---------------------------------------------------------------
 # if expression

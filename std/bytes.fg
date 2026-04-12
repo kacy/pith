@@ -4,6 +4,9 @@
 # this module is the small public surface for crossing that boundary
 # and for building bytes incrementally.
 
+pub struct Utf8DecodeError:
+    pub message: String
+
 pub struct ByteBuffer:
     pub handle: Int
 
@@ -13,8 +16,38 @@ pub fn empty() -> Bytes:
 pub fn from_string_utf8(text: String) -> Bytes:
     return bytes_from_string_utf8(text)
 
+pub fn len(data: Bytes) -> Int:
+    return bytes_len(data)
+
+pub fn is_empty(data: Bytes) -> Bool:
+    return bytes_is_empty(data)
+
+pub fn get(data: Bytes, index: Int) -> Int:
+    return bytes_get(data, index)
+
+pub fn slice(data: Bytes, start: Int, end: Int) -> Bytes:
+    return bytes_slice(data, start, end)
+
+pub fn concat(left: Bytes, right: Bytes) -> Bytes:
+    return bytes_concat(left, right)
+
+pub fn eq(left: Bytes, right: Bytes) -> Bool:
+    return bytes_eq(left, right)
+
+fn decode_utf8_result(data: Bytes) -> String!Utf8DecodeError:
+    text := bytes_to_string_utf8(data)
+    if text.is_err:
+        fail Utf8DecodeError(text.err)
+    return text.ok
+
+pub fn decode_utf8(data: Bytes) -> String!Utf8DecodeError:
+    return decode_utf8_result(data)
+
 pub fn to_string_utf8(data: Bytes) -> String!:
-    return bytes_to_string_utf8(data)
+    text := decode_utf8_result(data)
+    if text.is_err:
+        fail text.err.message
+    return text.ok
 
 pub fn buffer() -> ByteBuffer:
     return ByteBuffer(byte_buffer_new())
@@ -29,8 +62,18 @@ impl ByteBuffer:
     fn write_byte(value: Int) -> Int!:
         return byte_buffer_write_byte(self.handle, value)
 
+    fn write_string_utf8(text: String) -> Int!:
+        return self.write(from_string_utf8(text))
+
+    fn write_line_utf8(text: String) -> Int!:
+        wrote := self.write_string_utf8(text)!
+        return wrote + self.write_string_utf8(chr(10))!
+
     fn bytes() -> Bytes:
         return byte_buffer_bytes(self.handle)
 
     fn clear():
         byte_buffer_clear(self.handle)
+
+    fn reset():
+        self.clear()

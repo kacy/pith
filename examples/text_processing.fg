@@ -1,15 +1,16 @@
 # text processing — word frequency counter, text statistics
 # exercises: maps, string splitting, sorting, nested iteration, formatting
 
+import std.strings as strings
+
 fn word_count(text: String) -> Map[String, Int]:
     mut counts: Map[String, Int] := {}
-    words := text.split(" ")
+    words := strings.words(text)
     mut i := 0
     while i < words.len():
-        w := words[i].trim()
-        if w.len() > 0:
-            cur := counts.get_default(w, 0)
-            counts.insert(w, cur + 1)
+        w := words[i]
+        cur := counts.get_default(w, 0)
+        counts.insert(w, cur + 1)
         i = i + 1
     return counts
 
@@ -23,31 +24,30 @@ fn char_count(text: String) -> Int:
     return count
 
 fn line_count(text: String) -> Int:
-    lines := text.split(chr(10))
-    return lines.len()
+    return strings.lines(text).len()
 
 fn longest_word(text: String) -> String:
-    words := text.split(" ")
+    words := strings.words(text)
     mut best := ""
     mut i := 0
     while i < words.len():
-        w := words[i].trim()
+        w := words[i]
         if w.len() > best.len():
             best = w
         i = i + 1
     return best
 
 fn has_word(text: String, target: String) -> Bool:
-    words := text.split(" ")
+    words := strings.words(text)
     mut i := 0
     while i < words.len():
-        if words[i].trim() == target:
+        if words[i] == target:
             return true
         i = i + 1
     return false
 
 fn replace_word(text: String, old_word: String, new_word: String) -> String:
-    words := text.split(" ")
+    words := strings.words(text)
     mut result: List[String] := []
     mut i := 0
     while i < words.len():
@@ -71,7 +71,7 @@ fn main():
     print("'quick' appears: " + counts[quick_key].to_string())
 
     # statistics
-    words := text.split(" ")
+    words := strings.words(text)
     print("word count: " + words.len().to_string())
     print("char count: " + char_count(text).to_string())
     print("longest: " + longest_word(text))
@@ -90,5 +90,9 @@ fn main():
     poem_words := word_count(poem)
     are_key := "are"
     print("'are' in poem: " + poem_words[are_key].to_string())
+    split := strings.split_once("name=forge", "=")
+    print("split found: " + split.found.to_string())
+    print("split right: " + split.right)
+    print("poem rebuild ok: " + (strings.join_lines(strings.lines(poem)) == poem).to_string())
 
     print("text processing works")

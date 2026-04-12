@@ -1,0 +1,35 @@
+import std.bytes as bytes
+
+fn main() -> String!:
+    data := bytes.from_string_utf8("forge")
+    empty := bytes.empty()
+    slice_text := bytes.slice(data, 1, 4).to_string_utf8()!
+    concat_text := bytes.concat(data, bytes.from_string_utf8("!")).to_string_utf8()!
+    print("bytes-len:" + bytes.len(data).to_string())
+    print("bytes-empty:" + bytes.is_empty(data).to_string())
+    print("bytes-empty-len:" + bytes.len(empty).to_string())
+    print("bytes-empty-empty:" + bytes.is_empty(empty).to_string())
+    print("bytes-get:" + bytes.get(data, 1).to_string())
+    print("bytes-slice:" + slice_text)
+    print("bytes-concat:" + concat_text)
+    print("bytes-eq:" + bytes.eq(data, bytes.from_string_utf8("forge")).to_string() + ":" + bytes.eq(data, bytes.from_string_utf8("forged")).to_string())
+    print("decode-ok:" + bytes.decode_utf8(data).ok)
+
+    invalid_buf := bytes.buffer()
+    invalid_buf.write_byte(255)!
+    invalid := bytes.decode_utf8(invalid_buf.bytes())
+    compat := bytes.to_string_utf8(invalid_buf.bytes())
+    print("decode-bad:" + invalid.is_err.to_string())
+    print("decode-bad-msg:" + invalid.err.message.contains("utf").to_string())
+    print("compat-bad:" + compat.is_err.to_string())
+    print("compat-bad-msg:" + compat.err.contains("utf").to_string())
+
+    out := bytes.buffer()
+    out.write_string_utf8("hi")!
+    out.write_line_utf8("there")!
+    out.write_byte(33)!
+    buffer_text := out.bytes().to_string_utf8()!
+    print("buffer-out:" + (buffer_text == "hithere" + chr(10) + "!").to_string())
+    out.reset()
+    print("buffer-reset:" + out.bytes().len().to_string())
+    return ""

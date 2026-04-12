@@ -3,6 +3,9 @@
 forge now has one shared io layer that the stdlib can build on instead of each
 module rolling its own transport loops.
 
+for the higher-level string/bytes helper surface on top of that split, see
+`docs/text_and_bytes.md`.
+
 before this work, the stdlib had a few unrelated io styles:
 - `std.fs` leaned on whole-file helpers
 - `std.net.tcp` was fd-based

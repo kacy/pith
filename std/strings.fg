@@ -294,6 +294,11 @@ pub fn equals_ignore_case(a: String, b: String) -> Bool:
 #   split_n("a,b,c,d", ",", 2)         -> ["a", "b,c,d"] (max 2 parts)
 #   partition("hello=world", "=")      -> ["hello", "=", "world"]
 
+pub struct SplitPair:
+    pub found: Bool
+    pub left: String
+    pub right: String
+
 # Splits a string by line breaks (\n, \r\n, \r)
 # Handles all common line ending styles
 pub fn split_lines(s: String) -> List[String]:
@@ -317,6 +322,92 @@ pub fn split_lines(s: String) -> List[String]:
     # Don't forget the last line (even if empty)
     result.push(current)
     return result
+
+fn ends_with_line_break(s: String) -> Bool:
+    if s.len() == 0:
+        return false
+    last := s[s.len() - 1]
+    return last == chr(10) or last == chr(13)
+
+fn split_pair_missing(s: String) -> SplitPair:
+    return SplitPair(false, s, "")
+
+fn split_pair_at(s: String, sep: String, pos: Int) -> SplitPair:
+    if pos < 0:
+        return split_pair_missing(s)
+    return SplitPair(true, s.substring(0, pos), s.substring(pos + sep.len(), s.len()))
+
+# splits text into lines for normal read-style workflows.
+# empty input stays empty, and a final trailing newline does not create
+# an extra empty line at the end.
+pub fn lines(s: String) -> List[String]:
+    if s.len() == 0:
+        return []
+    parts := split_lines(s)
+    if not ends_with_line_break(s) or parts.len() == 0:
+        return parts
+    mut result: List[String] := []
+    mut i := 0
+    while i + 1 < parts.len():
+        result.push(parts[i])
+        i = i + 1
+    return result
+
+# keeps the exact split output, including empty segments.
+pub fn lines_keep_empty(s: String) -> List[String]:
+    return split_lines(s)
+
+# splits on runs of whitespace and drops empty entries.
+pub fn words(s: String) -> List[String]:
+    mut result: List[String] := []
+    mut current := ""
+    mut i := 0
+    while i < s.len():
+        c := s[i]
+        if is_space(c):
+            if current.len() > 0:
+                result.push(current)
+                current = ""
+        else:
+            current = current + c
+        i = i + 1
+    if current.len() > 0:
+        result.push(current)
+    return result
+
+pub fn split_once(s: String, sep: String) -> SplitPair:
+    if sep.len() == 0:
+        return split_pair_missing(s)
+    return split_pair_at(s, sep, s.index_of(sep))
+
+pub fn rsplit_once(s: String, sep: String) -> SplitPair:
+    if sep.len() == 0:
+        return split_pair_missing(s)
+    return split_pair_at(s, sep, s.last_index_of(sep))
+
+pub fn before(s: String, sep: String) -> String:
+    parts := split_once(s, sep)
+    if not parts.found:
+        return s
+    return parts.left
+
+pub fn after(s: String, sep: String) -> String:
+    parts := split_once(s, sep)
+    if not parts.found:
+        return ""
+    return parts.right
+
+pub fn before_last(s: String, sep: String) -> String:
+    parts := rsplit_once(s, sep)
+    if not parts.found:
+        return s
+    return parts.left
+
+pub fn after_last(s: String, sep: String) -> String:
+    parts := rsplit_once(s, sep)
+    if not parts.found:
+        return ""
+    return parts.right
 
 # Splits a string by separator, at most max_splits times
 # The last element contains the remainder of the string
@@ -371,6 +462,9 @@ pub fn rpartition(s: String, sep: String) -> List[String]:
     mut head := s.substring(0, pos)
     mut tail := s.substring(pos + sep.len(), s.len())
     return [head, sep, tail]
+
+pub fn join_lines(lines: List[String]) -> String:
+    return lines.join(chr(10))
 
 # ---------------------------------------------------------------
 # Removal Operations

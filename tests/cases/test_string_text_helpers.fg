@@ -1,0 +1,33 @@
+import std.collections as collections
+import std.strings as strings
+
+fn main() -> String!:
+    print("lines-empty:" + strings.lines("").len().to_string())
+    print("lines-trailing:" + strings.lines("alpha" + chr(10) + "beta" + chr(10)).len().to_string())
+    print("lines-keep-empty:" + strings.lines_keep_empty("alpha" + chr(10) + chr(10)).len().to_string())
+    print("lines-crlf:" + strings.lines("a" + chr(13) + chr(10) + "b" + chr(13) + chr(10)).len().to_string())
+    print("lines-keep-empty-empty:" + strings.lines_keep_empty("").len().to_string())
+    print("words:" + strings.words(" alpha" + chr(9) + "beta" + chr(10) + "gamma ").join(","))
+    print("words-empty:" + strings.words("   " + chr(9) + chr(10)).len().to_string())
+
+    first := strings.split_once("key=value=rest", "=")
+    print("split-once:" + first.found.to_string() + ":" + first.left + ":" + first.right)
+    missing := strings.split_once("plain", "=")
+    print("split-once-missing:" + missing.found.to_string() + ":" + missing.left + ":" + missing.right)
+    edge := strings.split_once("=value", "=")
+    print("split-once-edge:" + edge.found.to_string() + ":" + edge.left + ":" + edge.right)
+    last := strings.rsplit_once("path/to/file.txt", "/")
+    print("rsplit-once:" + last.found.to_string() + ":" + last.left + ":" + last.right)
+    missing_last := strings.rsplit_once("plain", "/")
+    print("rsplit-once-missing:" + missing_last.found.to_string() + ":" + missing_last.left + ":" + missing_last.right)
+    print("before-after:" + strings.before("hello=world", "=") + ":" + strings.after("hello=world", "="))
+    print("before-after-missing:" + strings.before("hello", "=") + ":" + strings.after("hello", "="))
+    print("before-last-after-last:" + strings.before_last("a/b/c", "/") + ":" + strings.after_last("a/b/c", "/"))
+    print("before-last-after-last-missing:" + strings.before_last("abc", "/") + ":" + strings.after_last("abc", "/"))
+    print("join-lines:" + (strings.join_lines(["a", "b", "c"]) == "a" + chr(10) + "b" + chr(10) + "c").to_string())
+
+    tokens := strings.words(" hello there forge ")
+    loud_words := collections.map_strings(tokens, fn(part: String) => part.to_upper())
+    long_words := collections.filter_strings(loud_words, fn(part: String) => part.len() >= 5)
+    print("pipeline:" + long_words.join(","))
+    return ""

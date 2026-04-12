@@ -2,8 +2,6 @@
 
 import std.bytes as bytes
 import std.fs as fs
-import std.io as io
-import std.net.websocket as websocket
 
 fn main() -> String!:
     payload := bytes.from_string_utf8("forge bytes")
@@ -18,21 +16,20 @@ fn main() -> String!:
     file.close()
     fs.remove(path)
 
-    print("len: " + raw.len().to_string())
-    print("text: " + raw.to_string_utf8()!)
+    decoded := bytes.decode_utf8(raw)
+    print("len: " + bytes.len(raw).to_string())
+    print("typed decode: " + decoded.is_ok.to_string())
+    print("text: " + decoded.ok)
 
-    proc := io.spawn_process("head -c 5")!
-    print("stdin: " + proc.stdin().write_all_bytes(bytes.from_string_utf8("hello"))!.to_string())
-    print("stdout: " + proc.stdout().read_all_bytes()!.to_string_utf8()!)
-    print("exit: " + proc.wait().to_string())
-    proc.close()
+    invalid_buf := bytes.buffer()
+    invalid_buf.write_byte(255)!
+    invalid := bytes.decode_utf8(invalid_buf.bytes())
+    print("invalid decode: " + invalid.is_err.to_string())
 
-    mask := bytes.buffer()
-    mask.write_byte(1)!
-    mask.write_byte(2)!
-    mask.write_byte(3)!
-    mask.write_byte(4)!
-    frame := websocket.client_text_frame_bytes("ok", mask.bytes())!
-    parsed := websocket.parse_frame(frame)!
-    print("ws text: " + parsed.payload_text()!)
+    scratch := bytes.buffer()
+    scratch.write_string_utf8("hi")!
+    scratch.write_line_utf8("there")!
+    print("scratch ok: " + (scratch.bytes().to_string_utf8()! == "hi" + "there" + chr(10)).to_string())
+    scratch.reset()
+    print("scratch reset: " + bytes.len(scratch.bytes()).to_string())
     return ""

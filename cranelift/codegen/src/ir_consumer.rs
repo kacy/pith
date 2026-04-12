@@ -901,15 +901,9 @@ fn compile_ir_function(
                             args.push(get_reg(&regs, parts[j + arg_start]));
                         }
                     }
-                    // Note: `len` maps to forge_auto_len which handles both
-                    // strings and lists at runtime via magic number check.
-                    // Look up function: user-defined first, then runtime with name resolution.
-                    let resolved_name = resolve_func_name(fname);
+                    // Look up function: user-defined first, then a direct runtime import key.
                     let mut runtime_call = false;
                     let fid = if let Some(&fid) = declared_funcs.get(fname) {
-                        Some(fid)
-                    } else if let Some(&fid) = runtime_funcs.get(resolved_name) {
-                        runtime_call = true;
                         Some(fid)
                     } else if let Some(&fid) = runtime_funcs.get(fname) {
                         runtime_call = true;
@@ -1124,8 +1118,6 @@ fn compile_ir_function(
 
             "field" if parts.len() >= 4 => {
                 let reg: usize = parts[1].parse().unwrap_or(0);
-                let obj_reg: usize = parts[2].parse().unwrap_or(usize::MAX);
-                let obj_struct_name = struct_regs.get(&obj_reg).cloned();
                 let obj = get_reg(&regs, parts[2]);
                 let (offset, field_retkind) = if parts.len() >= 6 && parts[3].parse::<i32>().is_ok() {
                     (parts[3].parse::<i32>().unwrap_or(0), Some(parts[4]))
@@ -1133,24 +1125,11 @@ fn compile_ir_function(
                     let field_name = parts[3];
                     if let Ok(idx) = field_name.parse::<usize>() {
                         ((idx * 8) as i32, None)
-                    } else if let Some(struct_name) = obj_struct_name.as_deref() {
-                        let offset = field_offset_in_struct(struct_layouts, struct_name, field_name)
-                            .ok_or_else(|| {
-                                CompileError::ModuleError(format!(
-                                    "ir consumer: unknown field {} on {} in {}",
-                                    field_name, struct_name, func_name
-                                ))
-                            })?;
-                        (offset, None)
                     } else {
-                        let offset = unique_field_offset_for_name(struct_layouts, field_name)
-                            .ok_or_else(|| {
-                                CompileError::ModuleError(format!(
-                                    "ir consumer: ambiguous field instruction in {}: {}",
-                                    func_name, line
-                                ))
-                            })?;
-                        (offset, None)
+                        return Err(CompileError::ModuleError(format!(
+                            "ir consumer: field instruction requires an explicit offset in {}: {}",
+                            func_name, line
+                        )));
                     }
                 } else {
                     return Err(CompileError::ModuleError(format!(
@@ -1355,284 +1334,6 @@ fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
         return Some(name);
     }
     None
-}
-
-fn field_offset_in_struct(
-    struct_layouts: &HashMap<String, Vec<String>>,
-    struct_name: &str,
-    field_name: &str,
-) -> Option<i32> {
-    let fields = struct_layouts.get(struct_name)?;
-    let idx = fields.iter().position(|field| field == field_name)?;
-    Some((idx * 8) as i32)
-}
-
-fn unique_field_offset_for_name(
-    struct_layouts: &HashMap<String, Vec<String>>,
-    field_name: &str,
-) -> Option<i32> {
-    let mut matching_positions: Vec<usize> = struct_layouts
-        .values()
-        .filter_map(|fields| fields.iter().position(|field| field == field_name))
-        .collect();
-    matching_positions.sort_unstable();
-    matching_positions.dedup();
-    if matching_positions.len() == 1 {
-        return Some((matching_positions[0] * 8) as i32);
-    }
-    None
-}
-
-
-/// Map IR function names to runtime_funcs keys.
-/// Returns the key that exists in the runtime_funcs HashMap.
-fn resolve_func_name(name: &str) -> &str {
-    match name {
-        // String operations
-        "print" => "forge_smart_print",
-        "print_err" => "print_err",
-        "to_string" | "int_to_string" => "to_string",
-        "bool_to_string" => "bool_to_string",
-        "float_to_string" => "float_to_string",
-        "smart_to_string" => "smart_to_string",
-        "identity" => "identity",
-        "chr" => "chr",
-        "ord" => "ord",
-        "string_len" => "string_len",
-        "substring" => "substring",
-        "contains" | "string_contains" => "contains",
-        "starts_with" => "starts_with",
-        "ends_with" => "ends_with",
-        "trim" => "trim",
-        "split" => "split",
-        "to_upper" => "to_upper",
-        "to_lower" => "to_lower",
-        "replace" => "replace",
-        "repeat" => "repeat",
-        "index_of" | "string_index_of" => "index_of",
-        "last_index_of" | "string_last_index_of" => "last_index_of",
-        "string_is_empty" => "string_is_empty",
-        "pad_left" => "pad_left",
-        "pad_right" => "pad_right",
-        "char_at" => "char_at",
-        "chars" => "chars",
-        "reverse" => "reverse",
-        // List operations
-        "len" => "forge_auto_len",
-        "join" => "forge_list_join",
-        "list_join" => "list_join",
-        "push" => "forge_list_push_value",
-        "pop" => "forge_list_pop",
-        "remove" | "list_remove" => "list_remove",
-        "is_empty" | "list_is_empty" => "list_is_empty",
-        "clear" | "list_clear" => "list_clear",
-        "list_reverse" => "list_reverse",
-        "list_contains" => "list_contains",
-        "list_contains_string" => "list_contains_string",
-        "list_index_of" => "list_index_of",
-        "list_index_of_string" => "list_index_of_string",
-        "set" => "forge_list_set_value",
-        "map" | "list_map" => "forge_list_map",
-        "filter" | "list_filter" => "forge_list_filter",
-        "reduce" | "list_reduce" => "forge_list_reduce",
-        "each" | "list_each" => "forge_list_each",
-        "sort" => "forge_list_sort",
-        "sort_strings" => "forge_list_sort_strings",
-        "slice" => "forge_list_slice",
-        // Map operations
-        "insert" => "insert",
-        "map_insert" => "map_insert",
-        "map_insert_ikey" => "map_insert_ikey",
-        "map_get" => "map_get",
-        "map_get_ikey" => "map_get_ikey",
-        "get_default" | "map_get_default" => "get_default",
-        "map_get_default_ikey" => "map_get_default_ikey",
-        "contains_key" | "map_contains_key" => "contains_key",
-        "map_contains_ikey" => "map_contains_ikey",
-        "keys" | "map_keys" => "keys",
-        "map_values" => "map_values",
-        "map_remove" => "map_remove",
-        "map_remove_ikey" => "map_remove_ikey",
-        "map_clear" => "map_clear",
-        "map_is_empty" => "map_is_empty",
-        "map_len" => "map_len",
-        // Set operations
-        "set_add" => "set_add",
-        "set_add_int" => "forge_set_add_int_handle",
-        "set_contains" => "set_contains",
-        "set_contains_int" => "forge_set_contains_int_handle",
-        "set_remove" => "set_remove",
-        "set_remove_int" => "forge_set_remove_int_handle",
-        "set_clear" => "set_clear",
-        "set_is_empty" => "set_is_empty",
-        "set_len" => "set_len",
-        // Internal IR instructions
-        "__list_get" | "__index" => "forge_list_get_value",
-        "__list_new" => "forge_list_new_default",
-        "__list_push" => "forge_list_push_value",
-        "__map_new" => "forge_map_new_default",
-        "__map_new_int" => "forge_map_new_int",
-        "__set_new" => "forge_set_new_default",
-        "__set_new_int" => "forge_set_new_int",
-        "__set_to_list" => "forge_set_to_list_cstr",
-        "__set_to_list_int" => "forge_set_to_list_int_handle",
-        "__struct_alloc" => "forge_struct_alloc",
-        "__closure_set_env" => "forge_closure_set_env",
-        "__closure_get_env" => "forge_closure_get_env",
-        "__str_eq" => "forge_cstring_eq",
-        "bytes_from_string_utf8" => "bytes_from_string_utf8",
-        "bytes_to_string_utf8" => "bytes_to_string_utf8",
-        "bytes_len" => "bytes_len",
-        "bytes_is_empty" => "bytes_is_empty",
-        "bytes_get" => "bytes_get",
-        "bytes_slice" => "bytes_slice",
-        "bytes_concat" => "bytes_concat",
-        "bytes_eq" => "bytes_eq",
-        "byte_buffer_new" => "byte_buffer_new",
-        "byte_buffer_with_capacity" => "byte_buffer_with_capacity",
-        "byte_buffer_write" => "byte_buffer_write",
-        "byte_buffer_write_byte" => "byte_buffer_write_byte",
-        "byte_buffer_bytes" => "byte_buffer_bytes",
-        "byte_buffer_clear" => "byte_buffer_clear",
-        // Numeric / math
-        "abs" => "forge_abs",
-        "min" => "forge_min",
-        "max" => "forge_max",
-        "clamp" => "forge_clamp",
-        "pow" => "forge_pow",
-        "sqrt" => "forge_sqrt",
-        "floor" => "forge_floor",
-        "ceil" => "forge_ceil",
-        "round" => "forge_round",
-        "sin" => "forge_sin",
-        "cos" => "forge_cos",
-        "tan" => "forge_tan",
-        "asin" => "forge_asin",
-        "acos" => "forge_acos",
-        "atan" => "forge_atan",
-        "atan2" => "forge_atan2",
-        "math_log" => "forge_log",
-        "math_log10" => "forge_log10",
-        "math_log2" => "forge_log2",
-        "math_exp" => "forge_exp",
-        "math_abs_float" => "forge_abs_float",
-        "to_float" => "forge_int_to_float",
-        "to_int" => "forge_float_to_int",
-        "random_int" => "forge_random_int",
-        "random_seed" => "forge_random_seed",
-        "random_string" => "forge_random_string",
-        "random_float" => "forge_random_float",
-        "int_to_hex" => "forge_int_to_hex",
-        "int_to_oct" => "forge_int_to_oct",
-        "int_to_bin" => "forge_int_to_bin",
-        "fmt_float" => "forge_fmt_float",
-        "format_int" => "forge_format_int",
-        // Bitwise
-        "bit_and" => "forge_bit_and",
-        "bit_or" => "forge_bit_or",
-        "bit_xor" => "forge_bit_xor",
-        "bit_not" => "forge_bit_not",
-        "bit_shl" => "forge_bit_shl",
-        "bit_shr" => "forge_bit_shr",
-        // IO / system
-        "read_file" => "read_file",
-        "read_file_bytes" => "read_file_bytes",
-        "write_file" => "write_file",
-        "append_file" => "append_file",
-        "write_file_bytes" => "write_file_bytes",
-        "append_file_bytes" => "append_file_bytes",
-        "file_open_read" => "file_open_read",
-        "file_open_write" => "file_open_write",
-        "file_open_append" => "file_open_append",
-        "file_read" => "file_read",
-        "file_write" => "file_write",
-        "file_read_bytes" => "file_read_bytes",
-        "file_write_bytes" => "file_write_bytes",
-        "file_close" => "file_close",
-        "file_exists" => "file_exists",
-        "dir_exists" => "dir_exists",
-        "fs_remove_dir" => "fs_remove_dir",
-        "fs_remove_tree" => "fs_remove_tree",
-        "fs_file_size" => "fs_file_size",
-        "exec" => "exec",
-        "exec_output" => "exec_output",
-        "exit" => "exit",
-        "env" => "env",
-        "args" => "args",
-        "os_getcwd" => "os_getcwd",
-        "os_chdir" => "os_chdir",
-        "os_temp_dir" => "os_temp_dir",
-        "os_home_dir" => "os_home_dir",
-        "os_set_env" => "os_set_env",
-        "os_unset_env" => "os_unset_env",
-        "dns_resolve" => "dns_resolve",
-        "tcp_listen" => "tcp_listen",
-        "tcp_connect" => "tcp_connect",
-        "tcp_accept" => "tcp_accept",
-        "tcp_read" => "tcp_read",
-        "tcp_read2" => "tcp_read2",
-        "tcp_write" => "tcp_write",
-        "tcp_set_timeout" => "tcp_set_timeout",
-        "tcp_close" => "tcp_close",
-        "process_spawn" => "process_spawn",
-        "process_spawn_argv" => "process_spawn_argv",
-        "process_output_argv" => "process_output_argv",
-        "process_write" => "process_write",
-        "process_read" => "process_read",
-        "process_read_err" => "process_read_err",
-        "process_write_bytes" => "process_write_bytes",
-        "process_read_bytes" => "process_read_bytes",
-        "process_read_err_bytes" => "process_read_err_bytes",
-        "process_wait" => "process_wait",
-        "process_kill" => "process_kill",
-        "process_close" => "process_close",
-        "process_output_status" => "process_output_status",
-        "process_output_stdout" => "process_output_stdout",
-        "process_output_stderr" => "process_output_stderr",
-        "process_output_close" => "process_output_close",
-        // Crypto / encoding
-        "sha256" => "forge_sha256",
-        "fnv1a" => "forge_fnv1a",
-        "b64_encode" => "forge_b64_encode",
-        "b64_decode" => "forge_b64_decode",
-        "to_hex" => "forge_hex_encode",
-        "from_hex" => "forge_from_hex",
-        // Path
-        "path_join" | "join_path" => "forge_path_join",
-        "path_dir" | "dir" => "forge_path_dir",
-        "path_base" | "base" => "forge_path_basename",
-        "path_ext" | "ext" => "forge_path_ext",
-        "path_stem" | "stem" => "forge_path_stem",
-        // Logging
-        // JSON
-        // URL
-        "url_parse" => "forge_url_parse",
-        "url_scheme" => "forge_url_scheme",
-        "url_host" => "forge_url_host",
-        "url_port" => "forge_url_port",
-        "url_path" => "forge_url_path",
-        "url_query" => "forge_url_query",
-        "url_fragment" => "forge_url_fragment",
-        "url_to_string" => "forge_url_to_string",
-        "url_encode" => "forge_url_encode",
-        "url_decode" => "forge_url_decode",
-        "tcp_read_bytes" => "tcp_read_bytes",
-        "tcp_write_bytes" => "tcp_write_bytes",
-        // Concurrency
-        "spawn" => "forge_spawn",
-        "await" => "forge_await",
-        "Mutex" => "forge_mutex_new",
-        "WaitGroup" => "forge_waitgroup_new",
-        "Semaphore" => "forge_semaphore_new",
-        "lock" => "forge_mutex_lock",
-        "unlock" => "forge_mutex_unlock",
-        "wait" => "forge_waitgroup_wait",
-        "done" => "forge_waitgroup_done",
-        "add" => "forge_waitgroup_add",
-        "acquire" => "forge_semaphore_acquire",
-        "release" => "forge_semaphore_release",
-        _ => name,
-    }
 }
 
 fn get_reg(regs: &HashMap<usize, Value>, s: &str) -> Value {

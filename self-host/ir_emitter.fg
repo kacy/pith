@@ -504,11 +504,110 @@ fn ir_retkind(type_name: String) -> String:
         return "struct:" + resolved
     return resolved
 
+fn ir_is_declared_callable(name: String) -> Bool:
+    return ir_func_returns.contains_key(name)
+
+fn ir_runtime_call_name(name: String) -> String:
+    if name == "print":
+        return "forge_smart_print"
+    if name == "spawn":
+        return "forge_spawn"
+    if name == "await":
+        return "forge_await"
+    if name == "int_to_string":
+        return "int_to_string"
+    if name == "float_to_string":
+        return "float_to_string"
+    if name == "bool_to_string":
+        return "bool_to_string"
+    if name == "len":
+        return "forge_auto_len"
+    if name == "contains" or name == "string_contains":
+        return "forge_cstring_contains"
+    if name == "substring":
+        return "forge_cstring_substring"
+    if name == "starts_with":
+        return "forge_cstring_starts_with"
+    if name == "ends_with":
+        return "forge_cstring_ends_with"
+    if name == "trim":
+        return "forge_cstring_trim"
+    if name == "split":
+        return "forge_string_split_to_list"
+    if name == "to_upper":
+        return "forge_cstring_to_upper"
+    if name == "to_lower":
+        return "forge_cstring_to_lower"
+    if name == "replace":
+        return "forge_cstring_replace"
+    if name == "repeat":
+        return "forge_cstring_repeat"
+    if name == "index_of" or name == "string_index_of":
+        return "forge_cstring_index_of"
+    if name == "last_index_of" or name == "string_last_index_of":
+        return "forge_cstring_last_index_of"
+    if name == "char_at":
+        return "forge_cstring_char_at"
+    if name == "chars":
+        return "forge_cstring_chars"
+    if name == "reverse":
+        return "forge_cstring_reverse"
+    if name == "is_empty" or name == "string_is_empty":
+        return "forge_cstring_is_empty"
+    if name == "join":
+        return "forge_list_join"
+    if name == "push":
+        return "forge_list_push_value"
+    if name == "pop":
+        return "forge_list_pop"
+    if name == "set":
+        return "forge_list_set_value"
+    if name == "map" or name == "list_map":
+        return "forge_list_map"
+    if name == "filter" or name == "list_filter":
+        return "forge_list_filter"
+    if name == "reduce" or name == "list_reduce":
+        return "forge_list_reduce"
+    if name == "each" or name == "list_each":
+        return "forge_list_each"
+    if name == "sort_strings":
+        return "forge_list_sort_strings"
+    if name == "__list_get" or name == "__index":
+        return "forge_list_get_value"
+    if name == "__list_new":
+        return "forge_list_new_default"
+    if name == "__list_push":
+        return "forge_list_push_value"
+    if name == "__map_new":
+        return "forge_map_new_default"
+    if name == "__map_new_int":
+        return "forge_map_new_int"
+    if name == "__set_new":
+        return "forge_set_new_default"
+    if name == "__set_new_int":
+        return "forge_set_new_int"
+    if name == "__set_to_list":
+        return "forge_set_to_list_cstr"
+    if name == "__set_to_list_int":
+        return "forge_set_to_list_int_handle"
+    if name == "__struct_alloc":
+        return "forge_struct_alloc"
+    if name == "__closure_set_env":
+        return "forge_closure_set_env"
+    if name == "__closure_get_env":
+        return "forge_closure_get_env"
+    if name == "__str_eq":
+        return "forge_cstring_eq"
+    return name
+
 fn ir_emit_func_header(name: String, param_count: Int, ret_type: String):
     ir_emit("func " + name + " " + param_count.to_string() + " " + ir_retkind(ret_type))
 
 fn ir_emit_call_text(result_reg: Int, fname: String, ret_type: String, arg_count: Int, arg_text: String):
-    mut call_line := "call " + result_reg.to_string() + " " + fname + " " + ir_retkind(ret_type) + " " + arg_count.to_string()
+    mut emit_name := fname
+    if not ir_is_declared_callable(fname):
+        emit_name = ir_runtime_call_name(fname)
+    mut call_line := "call " + result_reg.to_string() + " " + emit_name + " " + ir_retkind(ret_type) + " " + arg_count.to_string()
     if arg_text.len() > 0:
         call_line = call_line + arg_text
     ir_emit(call_line)
@@ -1863,6 +1962,46 @@ fn ir_emit_tuple_literal(node: Node) -> Int:
 fn ir_field_lookup_key(recv_idx: Int, field_name: String) -> String:
     return ir_field_receiver_type(recv_idx) + "." + field_name
 
+fn ir_unique_field_offset(field_name: String) -> Int:
+    keys := ir_struct_field_index_lookup.keys()
+    mut matched := false
+    mut offset := 0
+    mut i := 0
+    while i < keys.len():
+        key := keys[i]
+        if key.ends_with("." + field_name):
+            next_offset := ir_unpack_field_index(ir_struct_field_index_lookup[key]) * 8
+            if not matched:
+                matched = true
+                offset = next_offset
+            elif offset != next_offset:
+                return 0 - 1
+            i = i + 1
+            continue
+        i = i + 1
+    if not matched:
+        return 0 - 1
+    return offset
+
+fn ir_unique_field_kind(field_name: String) -> String:
+    keys := ir_struct_field_lookup.keys()
+    mut matched := false
+    mut field_kind := "unknown"
+    mut i := 0
+    while i < keys.len():
+        key := keys[i]
+        if key.ends_with("." + field_name):
+            next_kind := ir_retkind(ir_struct_field_lookup[key])
+            if not matched:
+                matched = true
+                field_kind = next_kind
+            elif field_kind != next_kind:
+                return "unknown"
+            i = i + 1
+            continue
+        i = i + 1
+    return field_kind
+
 fn ir_emit_named_field_access(result_reg: Int, obj_r: Int, lookup_key: String, field_name: String):
     if ir_struct_field_index_lookup.contains_key(lookup_key):
         field_offset := ir_unpack_field_index(ir_struct_field_index_lookup[lookup_key]) * 8
@@ -1871,7 +2010,11 @@ fn ir_emit_named_field_access(result_reg: Int, obj_r: Int, lookup_key: String, f
             field_kind = ir_retkind(ir_struct_field_lookup[lookup_key])
         ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_offset.to_string() + " " + field_kind + " " + field_name)
     else:
-        ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_name)
+        unique_offset := ir_unique_field_offset(field_name)
+        if unique_offset >= 0:
+            ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + unique_offset.to_string() + " " + ir_unique_field_kind(field_name) + " " + field_name)
+        else:
+            ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_name)
 
 fn ir_emit_field_access(idx: Int, node: Node) -> Int:
     fname := node_value(idx)

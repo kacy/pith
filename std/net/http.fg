@@ -12,7 +12,9 @@
 #       else:
 #           http.send_response(fd, http.not_found())
 import std.bytes as bytes
-from std.io import BufferedBytesReader, BufferedStringReader
+import std.json as json_mod
+from std.concurrent import Context, BlockingError, blocking_cancelled, blocking_deadline_exceeded, blocking_failed
+from std.io import BufferedBytesReader, BufferedBytesWriter, BufferedStringReader
 import std.io as io
 # ===============================================================
 # MIME Types
@@ -22,6 +24,20 @@ pub MIME_HTML := "text/html"
 pub MIME_JSON := "application/json"
 pub struct HttpRequestBytes:
     pub head: Bytes
+    pub body: Bytes
+
+pub struct HttpResponse:
+    pub status: Int
+    pub content_type: String
+    pub headers: Map[String, String]
+    pub body: Bytes
+
+pub struct ClientRequest:
+    pub method: String
+    pub host: String
+    pub port: Int
+    pub path: String
+    pub headers: Map[String, String]
     pub body: Bytes
 fn str_eq(a: String, b: String) -> Bool:
     if a.len() != b.len():
@@ -34,6 +50,145 @@ fn str_eq(a: String, b: String) -> Bool:
     return true
 fn char_eq(s: String, idx: Int, ch: String) -> Bool:
     return ord(s[idx]) == ord(ch)
+
+fn normalize_path(path: String) -> String:
+    if path == "":
+        return "/"
+    return path
+
+fn copy_headers_map(headers: Map[String, String]) -> Map[String, String]:
+    mut copied: Map[String, String] := {}
+    for key in headers:
+        copied.insert(key, headers[key])
+    return copied
+
+fn header_key_matches(left: String, right: String) -> Bool:
+    return left.to_lower() == right.to_lower()
+
+fn header_lookup(headers: Map[String, String], name: String) -> String:
+    for key in headers:
+        if header_key_matches(key, name):
+            return headers[key]
+    return ""
+
+fn header_without(headers: Map[String, String], name: String) -> Map[String, String]:
+    mut copied: Map[String, String] := {}
+    for key in headers:
+        if not header_key_matches(key, name):
+            copied.insert(key, headers[key])
+    return copied
+
+fn header_with(headers: Map[String, String], name: String, value: String) -> Map[String, String]:
+    copied := header_without(headers, name)
+    copied.insert(name, value)
+    return copied
+
+fn path_segments(path: String) -> List[String]:
+    mut parts: List[String] := []
+    for part in normalize_path(path).split("/"):
+        if part != "":
+            parts.push(part)
+    return parts
+
+fn route_match_path(path: String, pattern: String) -> Bool:
+    path_parts := path_segments(path)
+    pattern_parts := path_segments(pattern)
+    if path_parts.len() != pattern_parts.len():
+        return false
+    mut i := 0
+    while i < path_parts.len():
+        pat := pattern_parts[i]
+        if not pat.starts_with(":") and pat != path_parts[i]:
+            return false
+        i = i + 1
+    return true
+
+fn route_param_from_path(path: String, pattern: String, name: String) -> String:
+    path_parts := path_segments(path)
+    pattern_parts := path_segments(pattern)
+    if path_parts.len() != pattern_parts.len():
+        return ""
+    mut i := 0
+    while i < path_parts.len():
+        pat := pattern_parts[i]
+        if pat.starts_with(":"):
+            if pat.substring(1, pat.len()) == name:
+                return path_parts[i]
+        elif pat != path_parts[i]:
+            return ""
+        i = i + 1
+    return ""
+
+fn query_param_from_string(qs: String, name: String) -> String:
+    if qs.len() == 0:
+        return ""
+    mut start := 0
+    mut pos := 0
+    qs_len := qs.len()
+    while pos <= qs_len:
+        mut at_end := pos == qs_len
+        if not at_end:
+            at_end = char_eq(qs, pos, "&")
+        if at_end and pos > start:
+            pair := qs.substring(start, pos)
+            mut eq := -1
+            mut ei := 0
+            pair_len := pair.len()
+            while ei < pair_len:
+                if char_eq(pair, ei, "="):
+                    eq = ei
+                    break
+                ei = ei + 1
+            if eq >= 0:
+                key := pair.substring(0, eq)
+                if str_eq(key, name):
+                    if eq + 1 < pair_len:
+                        return pair.substring(eq + 1, pair_len)
+                    return ""
+            elif str_eq(pair, name):
+                return ""
+            if at_end and pos == qs_len:
+                break
+            start = pos + 1
+        elif at_end:
+            start = pos + 1
+        pos = pos + 1
+    return ""
+
+fn query_has_param_from_string(qs: String, name: String) -> Bool:
+    if qs.len() == 0:
+        return false
+    mut start := 0
+    mut pos := 0
+    qs_len := qs.len()
+    while pos <= qs_len:
+        mut at_end := pos == qs_len
+        if not at_end:
+            at_end = char_eq(qs, pos, "&")
+        if at_end and pos > start:
+            pair := qs.substring(start, pos)
+            mut eq := pair.index_of("=")
+            if eq >= 0:
+                if pair.substring(0, eq) == name:
+                    return true
+            elif pair == name:
+                return true
+            start = pos + 1
+        elif at_end:
+            start = pos + 1
+        pos = pos + 1
+    return false
+
+fn parse_json_or_fail(text: String) -> Int!:
+    handle := json_mod.parse(text)
+    if handle < 0:
+        fail "invalid json"
+    return handle
+
+fn ctx_blocking_error(ctx: Context) -> BlockingError:
+    if ctx.error_code() == 2:
+        return blocking_deadline_exceeded()
+    return blocking_cancelled()
 fn byte_eq(data: Bytes, idx: Int, value: Int) -> Bool:
     return data[idx] == value
 fn decode_utf8(data: Bytes) -> String!:
@@ -284,12 +439,26 @@ impl HttpRequestBytes:
         return self.body
     fn body_text() -> String!:
         return decode_utf8(self.body)
+    fn body_text_or(fallback: String) -> String:
+        return self.body_text() catch fallback
+    fn body_json() -> Int!:
+        return parse_json_or_fail(self.body_text()!)
     fn matches(method_name: String, path_name: String) -> Bool!:
         return self.method()! == method_name and self.path()! == path_name
     fn is_get(path_name: String) -> Bool!:
         return self.matches("GET", path_name)!
     fn is_post(path_name: String) -> Bool!:
         return self.matches("POST", path_name)!
+    fn query_param(name: String) -> String!:
+        return query_param_from_string(self.query()!, name)
+    fn has_query_param(name: String) -> Bool!:
+        return query_has_param_from_string(self.query()!, name)
+    fn path_parts() -> List[String]!:
+        return path_segments(self.path()!)
+    fn matches_path(pattern: String) -> Bool!:
+        return route_match_path(self.path()!, pattern)
+    fn path_param(pattern: String, name: String) -> String!:
+        return route_param_from_path(self.path()!, pattern, name)
 fn content_length_from_head_bytes(raw_head: Bytes) -> Int!:
     length_text := header_value_bytes(raw_head, "Content-Length")
     if length_text.is_empty():
@@ -363,41 +532,7 @@ pub fn get_header(req: String, name: String) -> String:
         pos = pos + 1
     return ""
 pub fn get_query_param(req: String, name: String) -> String:
-    qs := req_field(req, 2)
-    if qs.len() == 0:
-        return ""
-    mut start := 0
-    mut pos := 0
-    qs_len := qs.len()
-    while pos <= qs_len:
-        mut at_end := pos == qs_len
-        if not at_end:
-            at_end = char_eq(qs, pos, "&")
-        if at_end and pos > start:
-            pair := qs.substring(start, pos)
-            mut eq := -1
-            mut ei := 0
-            pair_len := pair.len()
-            while ei < pair_len:
-                if char_eq(pair, ei, "="):
-                    eq = ei
-                    break
-                ei = ei + 1
-            if eq >= 0:
-                key := pair.substring(0, eq)
-                if str_eq(key, name):
-                    if eq + 1 < pair_len:
-                        return pair.substring(eq + 1, pair_len)
-                    return ""
-            elif str_eq(pair, name):
-                return ""
-            if at_end and pos == qs_len:
-                break
-            start = pos + 1
-        elif at_end:
-            start = pos + 1
-        pos = pos + 1
-    return ""
+    return query_param_from_string(req_field(req, 2), name)
 # ===============================================================
 # Response Building — pre-built status lines avoid repeated formatting
 # ===============================================================
@@ -433,63 +568,123 @@ fn ct_header(ct: String) -> String:
     mut h := "Content-Type: " + ct
     h = h + crlf
     return h
-# Build a full HTTP response
+
+pub fn response(status: Int) -> HttpResponse:
+    mut headers: Map[String, String] := {}
+    return HttpResponse(status, "", headers, bytes.empty())
+
+pub fn text(status: Int, body_text: String) -> HttpResponse:
+    return response(status).with_body_text(body_text).header("Content-Type", MIME_TEXT)
+
+pub fn html(status: Int, body_text: String) -> HttpResponse:
+    return response(status).with_body_text(body_text).header("Content-Type", MIME_HTML)
+
+pub fn json(status: Int, body_text: String) -> HttpResponse:
+    return response(status).with_body_text(body_text).header("Content-Type", MIME_JSON)
+
+pub fn json_value(status: Int, handle: Int) -> HttpResponse:
+    return json(status, json_mod.encode(handle))
+
+pub fn not_found_response() -> HttpResponse:
+    return html(404, "<h1>404 Not Found</h1>")
+
+pub fn method_not_allowed_response() -> HttpResponse:
+    return text(405, "Method Not Allowed")
+
+pub fn server_error_response() -> HttpResponse:
+    return html(500, "<h1>500 Internal Server Error</h1>")
+
+pub fn redirect_response(url: String) -> HttpResponse:
+    return response(301).header("Location", url)
+
+impl HttpResponse:
+    fn header(name: String, value: String) -> HttpResponse:
+        if header_key_matches(name, "Content-Type"):
+            return HttpResponse(self.status, value, header_without(self.headers, "Content-Type"), self.body)
+        return HttpResponse(self.status, self.content_type, header_with(self.headers, name, value), self.body)
+
+    fn with_body_text(text: String) -> HttpResponse:
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), bytes.from_string_utf8(text))
+
+    fn with_body_bytes(data: Bytes) -> HttpResponse:
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), data)
+
+    fn with_json(handle: Int) -> HttpResponse:
+        return self.with_body_text(json_mod.encode(handle)).header("Content-Type", MIME_JSON)
+
+    fn status_code() -> Int:
+        return self.status
+
+    fn header_value(name: String) -> String:
+        if header_key_matches(name, "Content-Type"):
+            if self.content_type != "":
+                return self.content_type
+        return header_lookup(self.headers, name)
+
+    fn body_bytes() -> Bytes:
+        return self.body
+
+    fn body_text() -> String!:
+        return self.body.to_string_utf8()
+
+    fn body_json() -> Int!:
+        return parse_json_or_fail(self.body_text()!)
+
+    fn to_bytes() -> Bytes!:
+        crlf := chr(13) + chr(10)
+        mut header := status_line(self.status)
+        if self.content_type != "":
+            header = header + ct_header(self.content_type)
+        for key in self.headers:
+            if header_key_matches(key, "Content-Type") or header_key_matches(key, "Content-Length"):
+                continue
+            header = header + key + ": " + self.headers[key] + crlf
+        header = header + "Content-Length: " + self.body.len().to_string() + crlf
+        if header_lookup(self.headers, "Connection") == "":
+            header = header + "Connection: close" + crlf
+        header = header + crlf
+        header_bytes := bytes.from_string_utf8(header)
+        buf := bytes.buffer_with_capacity(header_bytes.len() + self.body.len())
+        buf.write(header_bytes)!
+        if self.body.len() > 0:
+            buf.write(self.body)!
+        return buf.bytes()
+
+    fn to_string() -> String!:
+        return self.to_bytes()!.to_string_utf8()
+
+fn response_to_string_or_empty(resp: HttpResponse) -> String:
+    text := resp.to_string()
+    if text.is_err:
+        return ""
+    return text.ok
+
 pub fn respond(status: Int, content_type: String, body_text: String) -> String:
-    crlf := chr(13) + chr(10)
-    bl := body_text.len().to_string()
-    # status line + content-type (pre-built for common cases)
-    mut resp := status_line(status)
-    resp = resp + ct_header(content_type)
-    # content-length
-    cl := "Content-Length: " + bl
-    resp = resp + cl
-    resp = resp + crlf
-    # connection close + blank line + body
-    resp = resp + "Connection: close"
-    resp = resp + crlf
-    resp = resp + crlf
-    resp = resp + body_text
-    return resp
+    return response_to_string_or_empty(response(status).header("Content-Type", content_type).with_body_text(body_text))
+
 pub fn respond_bytes(status: Int, content_type: String, body_bytes: Bytes) -> Bytes!:
-    crlf := chr(13) + chr(10)
-    bl := body_bytes.len().to_string()
-    mut header := status_line(status)
-    header = header + ct_header(content_type)
-    header = header + "Content-Length: " + bl
-    header = header + crlf
-    header = header + "Connection: close"
-    header = header + crlf
-    header = header + crlf
-    header_bytes := bytes.from_string_utf8(header)
-    buf := bytes.buffer_with_capacity(header_bytes.len() + body_bytes.len())
-    buf.write(header_bytes)!
-    buf.write(body_bytes)!
-    return buf.bytes()
+    return response(status).header("Content-Type", content_type).with_body_bytes(body_bytes).to_bytes()
+
 pub fn text_response(status: Int, body_text: String) -> String:
-    return respond(status, MIME_TEXT, body_text)
+    return response_to_string_or_empty(text(status, body_text))
+
 pub fn html_response(status: Int, body_text: String) -> String:
-    return respond(status, MIME_HTML, body_text)
+    return response_to_string_or_empty(html(status, body_text))
+
 pub fn json_response(status: Int, body_text: String) -> String:
-    return respond(status, MIME_JSON, body_text)
+    return response_to_string_or_empty(json(status, body_text))
+
 pub fn not_found() -> String:
-    return html_response(404, "<h1>404 Not Found</h1>")
+    return response_to_string_or_empty(not_found_response())
+
 pub fn method_not_allowed() -> String:
-    return text_response(405, "Method Not Allowed")
+    return response_to_string_or_empty(method_not_allowed_response())
+
 pub fn server_error() -> String:
-    return html_response(500, "<h1>500 Internal Server Error</h1>")
+    return response_to_string_or_empty(server_error_response())
+
 pub fn redirect(url: String) -> String:
-    crlf := chr(13) + chr(10)
-    mut resp := "HTTP/1.1 301 Moved Permanently"
-    resp = resp + crlf
-    loc := "Location: " + url
-    resp = resp + loc
-    resp = resp + crlf
-    resp = resp + "Content-Length: 0"
-    resp = resp + crlf
-    resp = resp + "Connection: close"
-    resp = resp + crlf
-    resp = resp + crlf
-    return resp
+    return response_to_string_or_empty(redirect_response(url))
 # ===============================================================
 # Server Helpers
 # ===============================================================
@@ -556,6 +751,16 @@ pub fn read_request_bytes(fd: Int) -> HttpRequestBytes!:
     stream := io.from_fd(fd)
     reader := stream.buffered_bytes_reader_chunked(1)
     return read_request_from_buffered_bytes(reader)
+
+pub fn send_buffered(writer: BufferedBytesWriter, response: HttpResponse) -> Int!:
+    payload := response.to_bytes()!
+    written := writer.write_all_bytes(payload)!
+    writer.flush()!
+    return written
+
+pub fn send(fd: Int, response: HttpResponse) -> Int!:
+    return send_response_bytes(fd, response.to_bytes()!)
+
 pub fn send_response_bytes(fd: Int, response: Bytes) -> Int!:
     stream := io.from_fd(fd)
     writer := stream.buffered_bytes_writer()
@@ -577,28 +782,124 @@ fn find_response_body_offset(raw: Bytes) -> Int:
             return i + 2
         i = i + 1
     return 0
+
+fn response_headers_map(raw_head: Bytes) -> Map[String, String]:
+    mut result: Map[String, String] := {}
+    hdrs := headers_bytes(raw_head)
+    mut line_start := 0
+    mut pos := 0
+    while pos <= hdrs.len():
+        at_end := pos == hdrs.len()
+        mut at_nl := false
+        if not at_end:
+            at_nl = hdrs[pos] == 10
+        if at_end or at_nl:
+            line_end := trim_trailing_cr(hdrs, line_start, pos)
+            if line_end > line_start:
+                line_text := decode_utf8(hdrs.slice(line_start, line_end)) catch ""
+                colon := line_text.index_of(":")
+                if colon > 0:
+                    result = header_with(result, line_text.substring(0, colon).trim(), line_text.substring(colon + 1, line_text.len()).trim())
+            line_start = pos + 1
+        pos = pos + 1
+    return result
+
+pub fn parse_response_bytes(raw: Bytes) -> HttpResponse!:
+    if raw.len() == 0:
+        fail "empty http response"
+    body_start := find_response_body_offset(raw)
+    if body_start <= 0:
+        fail "invalid http response"
+    head := raw.slice(0, body_start)
+    status_text := decode_utf8(request_line_field_bytes(head, 1))!
+    status := parse_int(status_text)!
+    headers := response_headers_map(head)
+    content_type := header_lookup(headers, "Content-Type")
+    body := raw.slice(body_start, raw.len())
+    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body)
+
+pub fn parse_response(raw: String) -> HttpResponse!:
+    return parse_response_bytes(bytes.from_string_utf8(raw))
 # ===============================================================
 # HTTP Client
 # ===============================================================
+
+pub fn request(method: String, host: String, port: Int, url_path: String) -> ClientRequest:
+    mut headers: Map[String, String] := {}
+    return ClientRequest(method, host, port, normalize_path(url_path), headers, bytes.empty())
+
+impl ClientRequest:
+    fn header(name: String, value: String) -> ClientRequest:
+        return ClientRequest(self.method, self.host, self.port, self.path, header_with(self.headers, name, value), self.body)
+
+    fn body_text(text: String) -> ClientRequest:
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), bytes.from_string_utf8(text))
+
+    fn body_bytes(data: Bytes) -> ClientRequest:
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), data)
+
+    fn json_body(handle: Int) -> ClientRequest:
+        return self.body_text(json_mod.encode(handle)).header("Content-Type", MIME_JSON)
+
+    fn to_bytes() -> Bytes!:
+        crlf := chr(13) + chr(10)
+        mut req := self.method + " " + normalize_path(self.path) + " HTTP/1.1" + crlf
+        if header_lookup(self.headers, "Host") == "":
+            req = req + "Host: " + self.host + crlf
+        for key in self.headers:
+            if header_key_matches(key, "Content-Length"):
+                continue
+            req = req + key + ": " + self.headers[key] + crlf
+        if header_lookup(self.headers, "Connection") == "":
+            req = req + "Connection: close" + crlf
+        req = req + "Content-Length: " + self.body.len().to_string() + crlf + crlf
+        head := bytes.from_string_utf8(req)
+        buf := bytes.buffer_with_capacity(head.len() + self.body.len())
+        buf.write(head)!
+        buf.write(self.body)!
+        return buf.bytes()
+
+    fn send() -> HttpResponse!:
+        conn := io.connect(self.host, self.port)!
+        writer := conn.buffered_bytes_writer()
+        writer.write_all_bytes(self.to_bytes()!)!
+        writer.flush()!
+        raw := conn.read_all_bytes_chunked(4096)!
+        conn.close()
+        return parse_response_bytes(raw)
+
+    fn send_bytes() -> Bytes!:
+        return self.send()!.body_bytes()
+
+pub fn route_param(req: HttpRequestBytes, pattern: String, name: String) -> String!:
+    return req.path_param(pattern, name)
+
+pub fn match_route(req: HttpRequestBytes, method_name: String, pattern: String) -> Bool!:
+    return req.method()! == method_name and req.matches_path(pattern)!
+
+pub fn serve_one(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
+    req := read_request_buffered_bytes(reader)!
+    resp := handler(req)
+    return send_buffered(writer, resp)
+
+pub fn serve_one_ctx(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse, ctx: Context) -> Int!BlockingError:
+    if ctx.is_cancelled():
+        fail ctx_blocking_error(ctx)
+    req := read_request_buffered_bytes(reader)
+    if req.is_err:
+        fail blocking_failed(req.err)
+    if ctx.is_cancelled():
+        fail ctx_blocking_error(ctx)
+    resp := handler(req.ok)
+    if ctx.is_cancelled():
+        fail ctx_blocking_error(ctx)
+    sent := send_buffered(writer, resp)
+    if sent.is_err:
+        fail blocking_failed(sent.err)
+    return sent.ok
+
 pub fn get_bytes(host: String, port: Int, url_path: String) -> Bytes!:
-    conn := io.connect(host, port)!
-    crlf := chr(13) + chr(10)
-    mut req := "GET " + url_path
-    req = req + " HTTP/1.1"
-    req = req + crlf
-    req = req + "Host: " + host
-    req = req + crlf
-    req = req + "Connection: close"
-    req = req + crlf
-    req = req + crlf
-    writer := conn.buffered_bytes_writer()
-    writer.write_all_bytes(bytes.from_string_utf8(req))!
-    writer.flush()!
-    response := conn.read_all_bytes_chunked(4096)!
-    conn.close()
-    body_start := find_response_body_offset(response)
-    if body_start <= 0:
-        return response
-    return response.slice(body_start, response.len())
+    return request("GET", host, port, url_path).send_bytes()
+
 pub fn get(host: String, port: Int, url_path: String) -> String!:
-    return get_bytes(host, port, url_path)!.to_string_utf8()!
+    return request("GET", host, port, url_path).send()!.body_text()

@@ -6,37 +6,16 @@ import std.net.websocket as websocket
 from std.io import BufferedBytesReader, BufferedBytesWriter
 from std.net.http import HttpRequestBytes
 
-fn query_param(query: String, name: String) -> String:
-    if query == "":
-        return ""
-    for part in query.split("&"):
-        eq := part.index_of("=")
-        if eq < 0:
-            if part == name:
-                return ""
-            continue
-        if part.substring(0, eq) == name:
-            if eq + 1 < part.len():
-                return part.substring(eq + 1, part.len())
-            return ""
-    return ""
-fn write_response(writer: BufferedBytesWriter, response: String) -> Int!:
-    writer.write_bytes(bytes.from_string_utf8(response))!
-    flushed := writer.flush()
-    if flushed.is_err:
-        fail "http response flush failed"
-    return response.len()
-
 fn handle_app(req: HttpRequestBytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> String!:
     if websocket.route_echo_buffered(req, reader, writer, "/ws", "", "echo:", "")!:
         return "ws:ok"
     if req.is_get("/greet")!:
-        mut name := query_param(req.query()!, "name")
+        mut name := req.query_param("name")!
         if name == "":
             name = "stranger"
-        write_response(writer, http.html_response(200, "<h1>Hello, " + name + "!</h1>"))!
+        http.send_buffered(writer, http.html(200, "<h1>Hello, " + name + "!</h1>"))!
         return "http:" + name
-    write_response(writer, http.not_found())!
+    http.send_buffered(writer, http.not_found_response())!
     return "http:404"
 fn main() -> Int!:
     greet_req := io.bytes_reader(bytes.from_string_utf8("GET /greet?name=forge HTTP/1.1\r\nHost: example.com\r\n\r\n")).buffered_chunked(5)

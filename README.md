@@ -31,6 +31,7 @@ make self-host
 - `README.md` for the high-level map
 - `docs/architecture.md` for the compiler pipeline and subsystem boundaries
 - `docs/concurrency.md` for channels, contexts, select, and task waits
+- `docs/http_apps.md` for the higher-level http request/response layer
 - `docs/text_and_bytes.md` for the string/bytes split and common helpers
 - `docs/contributing.md` for the development loop and smoke checks
 - `self-host/forge_main.fg` for the self-hosted frontend (lex/parse/check/fmt/lint/doc)

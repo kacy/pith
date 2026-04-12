@@ -116,7 +116,8 @@ fn collect_import_init_funcs(function_names: List[String], module_path: String, 
     mut init_funcs: List[String] := []
     for name in function_names:
         if name.starts_with("__init_globals"):
-            init_funcs.push(import_target_name(module_path, prefixed_init_name(module_index)))
+            renamed := name.replace("__init_globals", prefixed_init_name(module_index))
+            init_funcs.push(import_target_name(module_path, renamed))
     return init_funcs
 
 fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, module_path: String, module_index: Int) -> String:

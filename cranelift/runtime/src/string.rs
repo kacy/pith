@@ -63,6 +63,9 @@ pub fn forge_from_internal(s: InternalString) -> ForgeString {
     if s.is_empty() {
         return EMPTY_STRING;
     }
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_STRING_ALLOCS, 1);
+    crate::perf_count(&crate::PERF_STRING_ALLOC_BYTES, s.len());
 
     // Allocate memory and copy the string data
     let len = s.len();

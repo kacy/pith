@@ -10,8 +10,15 @@
 #       print(json.object_keys(root).join(", "))
 
 import std.io as io
+import std.bytes as bytes
+from std.bytes import ByteBuffer
 
 JSON_FILE_CHUNK_SIZE := 4096
+
+pub struct JsonCheckpoint:
+    pub next_node_id: Int
+    pub object_entry_len: Int
+    pub array_item_len: Int
 
 # ===============================================================
 # Node Pool
@@ -154,6 +161,58 @@ fn is_number_char(c: String) -> Bool:
     if c == "." or c == "e" or c == "E" or c == "+" or c == "-":
         return true
     return false
+
+fn scan_whitespace(c: String) -> Bool:
+    return c == " " or c == chr(9) or c == chr(10) or c == chr(13)
+
+fn scan_object_value_start(input: String, key: String) -> Int:
+    dq := chr(34)
+    key_pos := input.index_of(dq + key + dq)
+    if key_pos < 0:
+        return -1
+    mut pos := key_pos + key.len() + 2
+    while pos < input.len() and scan_whitespace(input[pos]):
+        pos = pos + 1
+    if pos >= input.len() or input[pos] != ":":
+        return -1
+    pos = pos + 1
+    while pos < input.len() and scan_whitespace(input[pos]):
+        pos = pos + 1
+    if pos >= input.len():
+        return -1
+    return pos
+
+fn json_scan_object_string(input: String, key: String) -> String:
+    mut pos := scan_object_value_start(input, key)
+    if pos < 0 or input[pos] != chr(34):
+        return ""
+    pos = pos + 1
+    start := pos
+    while pos < input.len():
+        if input[pos] == chr(92):
+            pos = pos + 2
+            continue
+        if input[pos] == chr(34):
+            return input.substring(start, pos)
+        pos = pos + 1
+    return ""
+
+fn json_scan_object_int_or(input: String, key: String, default_value: Int) -> Int:
+    mut pos := scan_object_value_start(input, key)
+    if pos < 0:
+        return default_value
+    start := pos
+    if input[pos] == "-":
+        pos = pos + 1
+    digits_start := pos
+    while pos < input.len() and input[pos] >= "0" and input[pos] <= "9":
+        pos = pos + 1
+    if pos == digits_start:
+        return default_value
+    parsed := parse_int(input.substring(start, pos))
+    if parsed.is_err:
+        return default_value
+    return parsed.ok
 
 # Parses a JSON string value (double-quoted)
 fn parse_string_raw() -> String:
@@ -320,6 +379,41 @@ fn json_parse_file_chunked(path: String, chunk_size: Int) -> Int:
     if data_result.is_err:
         return 0 - 1
     return json_parse(data_result.ok)
+
+pub fn scan_object_string(input: String, key: String) -> String:
+    return json_scan_object_string(input, key)
+
+pub fn scan_object_int_or(input: String, key: String, default_value: Int) -> Int:
+    return json_scan_object_int_or(input, key, default_value)
+
+pub fn checkpoint() -> JsonCheckpoint:
+    return json_checkpoint()
+
+fn json_checkpoint() -> JsonCheckpoint:
+    return JsonCheckpoint(next_node_id, object_keys_flat.len(), array_items_flat.len())
+
+pub fn restore(mark: JsonCheckpoint):
+    json_restore(mark)
+
+fn json_restore(mark: JsonCheckpoint):
+    mut node_id := next_node_id - 1
+    while node_id >= mark.next_node_id:
+        node_types.remove(node_id)
+        string_values.remove(node_id)
+        integer_values.remove(node_id)
+        float_values.remove(node_id)
+        boolean_values.remove(node_id)
+        object_key_offsets.remove(node_id)
+        object_key_counts.remove(node_id)
+        array_item_offsets.remove(node_id)
+        array_item_counts.remove(node_id)
+        node_id = node_id - 1
+    while object_keys_flat.len() > mark.object_entry_len:
+        object_keys_flat.remove(object_keys_flat.len() - 1)
+        object_values_flat.remove(object_values_flat.len() - 1)
+    while array_items_flat.len() > mark.array_item_len:
+        array_items_flat.remove(array_items_flat.len() - 1)
+    next_node_id = mark.next_node_id
 
 # ===============================================================
 # Public API — Type and Value Accessors
@@ -528,27 +622,151 @@ fn json_object_set(obj: Int, key: String, val: Int):
 # Public API — Encoder
 # ===============================================================
 
-# Escapes special characters in a string for JSON encoding
-fn encode_string(s: String) -> String:
-    mut result := chr(34)
+# writes a json-escaped string into a string buffer.
+fn write_escaped_string(out: StringBuffer, s: String) -> Int!:
+    mut total := out.write_all(chr(34))!
     mut i := 0
     while i < s.len():
         c := s[i]
         if c == chr(34):
-            result = result + chr(92) + chr(34)
+            total = total + out.write_all(chr(92) + chr(34))!
         if c == chr(92):
-            result = result + chr(92) + chr(92)
+            total = total + out.write_all(chr(92) + chr(92))!
         if c == chr(10):
-            result = result + chr(92) + "n"
+            total = total + out.write_all(chr(92) + "n")!
         if c == chr(13):
-            result = result + chr(92) + "r"
+            total = total + out.write_all(chr(92) + "r")!
         if c == chr(9):
-            result = result + chr(92) + "t"
+            total = total + out.write_all(chr(92) + "t")!
         if c != chr(34) and c != chr(92) and c != chr(10) and c != chr(13) and c != chr(9):
-            result = result + c
+            total = total + out.write_all(c)!
         i = i + 1
-    result = result + chr(34)
-    return result
+    total = total + out.write_all(chr(34))!
+    return total
+
+fn json_write(out: StringBuffer, handle: Int) -> Int!:
+    if not is_valid_handle(handle):
+        return out.write_all("null")
+    kind := node_types[handle]
+    if kind == "null":
+        return out.write_all("null")
+    if kind == "bool":
+        if boolean_values[handle]:
+            return out.write_all("true")
+        return out.write_all("false")
+    if kind == "int":
+        return out.write_all(integer_values[handle].to_string())
+    if kind == "float":
+        return out.write_all(float_values[handle].to_string())
+    if kind == "string":
+        return write_escaped_string(out, string_values[handle])
+    if kind == "array":
+        mut total := out.write_all("[")!
+        off := array_item_offsets[handle]
+        cnt := array_item_counts[handle]
+        mut i := 0
+        while i < cnt:
+            if i > 0:
+                total = total + out.write_all(",")!
+            total = total + json_write(out, array_items_flat[off + i])!
+            i = i + 1
+        total = total + out.write_all("]")!
+        return total
+    if kind == "object":
+        mut total := out.write_all(chr(123))!
+        keys := json_object_keys(handle)
+        mut i := 0
+        while i < keys.len():
+            if i > 0:
+                total = total + out.write_all(",")!
+            key := keys[i]
+            total = total + write_escaped_string(out, key)!
+            total = total + out.write_all(":")!
+            total = total + json_write(out, json_object_get(handle, key))!
+            i = i + 1
+        total = total + out.write_all(chr(125))!
+        return total
+    return out.write_all("null")
+
+fn json_encode_result(handle: Int) -> String!:
+    out := io.string_buffer()
+    json_write(out, handle)!
+    return out.string()
+
+fn write_escaped_bytes(out: ByteBuffer, s: String) -> Int!:
+    mut total := out.write_byte(34)!
+    mut i := 0
+    while i < s.len():
+        c := s[i]
+        if c == chr(34):
+            total = total + out.write_byte(92)!
+            total = total + out.write_byte(34)!
+        if c == chr(92):
+            total = total + out.write_byte(92)!
+            total = total + out.write_byte(92)!
+        if c == chr(10):
+            total = total + out.write_byte(92)!
+            total = total + out.write_byte(110)!
+        if c == chr(13):
+            total = total + out.write_byte(92)!
+            total = total + out.write_byte(114)!
+        if c == chr(9):
+            total = total + out.write_byte(92)!
+            total = total + out.write_byte(116)!
+        if c != chr(34) and c != chr(92) and c != chr(10) and c != chr(13) and c != chr(9):
+            total = total + out.write_string_utf8(c)!
+        i = i + 1
+    total = total + out.write_byte(34)!
+    return total
+
+fn json_write_bytes(out: ByteBuffer, handle: Int) -> Int!:
+    if not is_valid_handle(handle):
+        return out.write_string_utf8("null")
+    kind := node_types[handle]
+    if kind == "null":
+        return out.write_string_utf8("null")
+    if kind == "bool":
+        if boolean_values[handle]:
+            return out.write_string_utf8("true")
+        return out.write_string_utf8("false")
+    if kind == "int":
+        return out.write_string_utf8(integer_values[handle].to_string())
+    if kind == "float":
+        return out.write_string_utf8(float_values[handle].to_string())
+    if kind == "string":
+        return write_escaped_bytes(out, string_values[handle])
+    if kind == "array":
+        mut total := out.write_byte(91)!
+        off := array_item_offsets[handle]
+        cnt := array_item_counts[handle]
+        mut i := 0
+        while i < cnt:
+            if i > 0:
+                total = total + out.write_byte(44)!
+            total = total + json_write_bytes(out, array_items_flat[off + i])!
+            i = i + 1
+        total = total + out.write_byte(93)!
+        return total
+    if kind == "object":
+        mut total := out.write_byte(123)!
+        keys := json_object_keys(handle)
+        mut i := 0
+        while i < keys.len():
+            if i > 0:
+                total = total + out.write_byte(44)!
+            key := keys[i]
+            total = total + write_escaped_bytes(out, key)!
+            total = total + out.write_byte(58)!
+            total = total + json_write_bytes(out, json_object_get(handle, key))!
+            i = i + 1
+        total = total + out.write_byte(125)!
+        return total
+    return out.write_string_utf8("null")
+
+fn json_encode_bytes_result(handle: Int) -> Bytes!:
+    out := bytes.buffer()
+    json_write_bytes(out, handle)!
+    return out.bytes()
 
 # Serializes a node tree to a JSON string.
 # Returns "null" for invalid handles.
@@ -556,43 +774,124 @@ pub fn encode(handle: Int) -> String:
     return json_encode(handle)
 
 fn json_encode(handle: Int) -> String:
-    if not is_valid_handle(handle):
-        return "null"
-    kind := node_types[handle]
-    if kind == "null":
-        return "null"
-    if kind == "bool":
-        if boolean_values[handle]:
-            return "true"
-        return "false"
-    if kind == "int":
-        return integer_values[handle].to_string()
-    if kind == "float":
-        return float_values[handle].to_string()
-    if kind == "string":
-        return encode_string(string_values[handle])
-    if kind == "array":
-        mut result := "["
-        off := array_item_offsets[handle]
-        cnt := array_item_counts[handle]
-        mut i := 0
-        while i < cnt:
-            if i > 0:
-                result = result + ","
-            result = result + json_encode(array_items_flat[off + i])
-            i = i + 1
-        return result + "]"
-    if kind == "object":
-        mut result := chr(123)
-        k := json_object_keys(handle)
-        mut i := 0
-        while i < k.len():
-            if i > 0:
-                result = result + ","
-            result = result + encode_string(k[i]) + ":" + json_encode(json_object_get(handle, k[i]))
-            i = i + 1
-        return result + chr(125)
-    return "null"
+    return json_encode_result(handle) catch "null"
+
+pub fn write_to(out: StringBuffer, handle: Int) -> Int!:
+    return json_write(out, handle)
+
+pub fn encode_bytes(handle: Int) -> Bytes!:
+    return json_encode_bytes_result(handle)
+
+pub fn write_bytes_to(out: ByteBuffer, handle: Int) -> Int!:
+    return json_write_bytes(out, handle)
+
+pub fn write_object_start(out: StringBuffer) -> Int!:
+    return out.write_all(chr(123))
+
+pub fn write_object_end(out: StringBuffer) -> Int!:
+    return out.write_all(chr(125))
+
+pub fn write_array_start(out: StringBuffer) -> Int!:
+    return out.write_all("[")
+
+pub fn write_array_end(out: StringBuffer) -> Int!:
+    return out.write_all("]")
+
+fn write_object_field_prefix(out: StringBuffer, is_first: Bool, key: String) -> Int!:
+    mut total := 0
+    if not is_first:
+        total = total + out.write_all(",")!
+    total = total + write_escaped_string(out, key)!
+    total = total + out.write_all(":")!
+    return total
+
+pub fn write_object_string_field(out: StringBuffer, is_first: Bool, key: String, value: String) -> Bool!:
+    write_object_field_prefix(out, is_first, key)!
+    write_escaped_string(out, value)!
+    return false
+
+pub fn write_object_int_field(out: StringBuffer, is_first: Bool, key: String, value: Int) -> Bool!:
+    write_object_field_prefix(out, is_first, key)!
+    out.write_all(value.to_string())!
+    return false
+
+pub fn write_object_bool_field(out: StringBuffer, is_first: Bool, key: String, value: Bool) -> Bool!:
+    write_object_field_prefix(out, is_first, key)!
+    if value:
+        out.write_all("true")!
+    else:
+        out.write_all("false")!
+    return false
+
+pub fn write_int_array(out: StringBuffer, values: List[Int]) -> Int!:
+    mut total := write_array_start(out)!
+    mut i := 0
+    while i < values.len():
+        if i > 0:
+            total = total + out.write_all(",")!
+        total = total + out.write_all(values[i].to_string())!
+        i = i + 1
+    total = total + write_array_end(out)!
+    return total
+
+pub fn write_object_int_array_field(out: StringBuffer, is_first: Bool, key: String, values: List[Int]) -> Bool!:
+    write_object_field_prefix(out, is_first, key)!
+    write_int_array(out, values)!
+    return false
+
+pub fn write_object_start_bytes(out: ByteBuffer) -> Int!:
+    return out.write_byte(123)
+
+pub fn write_object_end_bytes(out: ByteBuffer) -> Int!:
+    return out.write_byte(125)
+
+pub fn write_array_start_bytes(out: ByteBuffer) -> Int!:
+    return out.write_byte(91)
+
+pub fn write_array_end_bytes(out: ByteBuffer) -> Int!:
+    return out.write_byte(93)
+
+fn write_object_field_prefix_bytes(out: ByteBuffer, is_first: Bool, key: String) -> Int!:
+    mut total := 0
+    if not is_first:
+        total = total + out.write_byte(44)!
+    total = total + write_escaped_bytes(out, key)!
+    total = total + out.write_byte(58)!
+    return total
+
+pub fn write_object_string_field_bytes(out: ByteBuffer, is_first: Bool, key: String, value: String) -> Bool!:
+    write_object_field_prefix_bytes(out, is_first, key)!
+    write_escaped_bytes(out, value)!
+    return false
+
+pub fn write_object_int_field_bytes(out: ByteBuffer, is_first: Bool, key: String, value: Int) -> Bool!:
+    write_object_field_prefix_bytes(out, is_first, key)!
+    out.write_string_utf8(value.to_string())!
+    return false
+
+pub fn write_object_bool_field_bytes(out: ByteBuffer, is_first: Bool, key: String, value: Bool) -> Bool!:
+    write_object_field_prefix_bytes(out, is_first, key)!
+    if value:
+        out.write_string_utf8("true")!
+    else:
+        out.write_string_utf8("false")!
+    return false
+
+pub fn write_int_array_bytes(out: ByteBuffer, values: List[Int]) -> Int!:
+    mut total := write_array_start_bytes(out)!
+    mut i := 0
+    while i < values.len():
+        if i > 0:
+            total = total + out.write_byte(44)!
+        total = total + out.write_string_utf8(values[i].to_string())!
+        i = i + 1
+    total = total + write_array_end_bytes(out)!
+    return total
+
+pub fn write_object_int_array_field_bytes(out: ByteBuffer, is_first: Bool, key: String, values: List[Int]) -> Bool!:
+    write_object_field_prefix_bytes(out, is_first, key)!
+    write_int_array_bytes(out, values)!
+    return false
 
 pub fn save(path: String, handle: Int) -> Int:
     return json_save(path, handle)

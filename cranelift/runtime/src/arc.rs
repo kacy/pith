@@ -114,6 +114,8 @@ fn remove_from_object_list(header_to_remove: *mut RcHeader) {
 /// Returns a valid pointer to uninitialized memory after the header
 #[no_mangle]
 pub unsafe extern "C" fn forge_rc_alloc(size: usize, type_tag: u32) -> *mut u8 {
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_RC_ALLOCS, 1);
     let total_size = HEADER_SIZE + size;
     let layout = match Layout::from_size_align(total_size, 8) {
         Ok(l) => l,
@@ -151,6 +153,8 @@ pub unsafe extern "C" fn forge_rc_retain(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_RC_RETAINS, 1);
     let header = (ptr.sub(HEADER_SIZE)) as *mut RcHeader;
     (*header).ref_count.fetch_add(1, Ordering::Relaxed);
 }
@@ -164,6 +168,8 @@ pub unsafe fn rc_release_internal(ptr: *mut u8) -> bool {
     if ptr.is_null() {
         return false;
     }
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_RC_RELEASES, 1);
 
     let header = (ptr.sub(HEADER_SIZE)) as *mut RcHeader;
     let count = (*header).ref_count.fetch_sub(1, Ordering::Release);

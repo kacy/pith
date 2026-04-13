@@ -1,0 +1,18 @@
+import std.json as json
+
+fn main() -> Int!:
+    dq := chr(34)
+    lb := chr(123)
+    rb := chr(125)
+    mut body := lb + dq + "team" + dq + ":" + dq + "payments" + dq
+    body = body + "," + dq + "min_score" + dq + ":500"
+    body = body + "," + dq + "limit" + dq + ":12"
+    body = body + "," + dq + "active" + dq + ":" + dq + "1" + dq + rb
+
+    print(json.scan_object_string(body, "team"))
+    print(json.scan_object_string(body, "active"))
+    print(json.scan_object_string(body, "missing"))
+    print(json.scan_object_int_or(body, "min_score", 0).to_string())
+    print(json.scan_object_int_or(body, "limit", 0).to_string())
+    print(json.scan_object_int_or(body, "missing", 7).to_string())
+    return 0

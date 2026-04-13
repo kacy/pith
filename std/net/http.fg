@@ -25,6 +25,15 @@ pub MIME_JSON := "application/json"
 pub struct HttpRequestBytes:
     pub head: Bytes
     pub body: Bytes
+    pub method_text: String
+    pub path_text: String
+    pub query_text: String
+    pub version_text: String
+    pub headers_text: String
+    pub body_text_cache: String
+    pub header_map: Map[String, String]
+    pub query_map: Map[String, String]
+    pub path_parts_cache: List[String]
 
 pub struct HttpResponse:
     pub status: Int
@@ -60,6 +69,12 @@ fn copy_headers_map(headers: Map[String, String]) -> Map[String, String]:
     mut copied: Map[String, String] := {}
     for key in headers:
         copied.insert(key, headers[key])
+    return copied
+
+fn copy_string_list(items: List[String]) -> List[String]:
+    mut copied: List[String] := []
+    for item in items:
+        copied.push(item)
     return copied
 
 fn header_key_matches(left: String, right: String) -> Bool:
@@ -178,6 +193,39 @@ fn query_has_param_from_string(qs: String, name: String) -> Bool:
             start = pos + 1
         pos = pos + 1
     return false
+
+fn query_params_map_from_string(qs: String) -> Map[String, String]:
+    mut result: Map[String, String] := {}
+    if qs.len() == 0:
+        return result
+    mut start := 0
+    mut pos := 0
+    qs_len := qs.len()
+    while pos <= qs_len:
+        mut at_end := pos == qs_len
+        if not at_end:
+            at_end = char_eq(qs, pos, "&")
+        if at_end and pos > start:
+            pair := qs.substring(start, pos)
+            mut eq := -1
+            mut ei := 0
+            pair_len := pair.len()
+            while ei < pair_len:
+                if char_eq(pair, ei, "="):
+                    eq = ei
+                    break
+                ei = ei + 1
+            if eq >= 0:
+                result.insert(pair.substring(0, eq), pair.substring(eq + 1, pair_len))
+            else:
+                result.insert(pair, "")
+            if at_end and pos == qs_len:
+                break
+            start = pos + 1
+        elif at_end:
+            start = pos + 1
+        pos = pos + 1
+    return result
 
 fn parse_json_or_fail(text: String) -> Int!:
     handle := json_mod.parse(text)
@@ -396,6 +444,43 @@ fn header_value_bytes(raw_head: Bytes, name: String) -> Bytes:
             line_start = pos + 1
         pos = pos + 1
     return bytes.empty()
+
+fn request_headers_map(raw_head: Bytes) -> Map[String, String]!:
+    mut result: Map[String, String] := {}
+    hdrs := headers_bytes(raw_head)
+    mut line_start := 0
+    mut pos := 0
+    while pos <= hdrs.len():
+        at_end := pos == hdrs.len()
+        mut at_nl := false
+        if not at_end:
+            at_nl = hdrs[pos] == 10
+        if at_end or at_nl:
+            line_end := trim_trailing_cr(hdrs, line_start, pos)
+            if line_end > line_start:
+                colon := find_byte(hdrs, line_start, 58)
+                if colon > line_start and colon < line_end:
+                    key := decode_utf8(hdrs.slice(line_start, colon))!
+                    value_start := trim_ascii_start(hdrs, colon + 1, line_end)
+                    value_end := trim_ascii_end(hdrs, value_start, line_end)
+                    value := decode_utf8(hdrs.slice(value_start, value_end))!
+                    result = header_with(result, key.trim(), value)
+            line_start = pos + 1
+        pos = pos + 1
+    return result
+
+fn build_http_request(head: Bytes, body: Bytes) -> HttpRequestBytes!:
+    method_text := decode_utf8(request_line_field_bytes(head, 0))!
+    path_text := decode_utf8(request_target_path_bytes(head))!
+    query_text := decode_utf8(request_target_query_bytes(head))!
+    version_text := decode_utf8(request_line_field_bytes(head, 2))!
+    headers_text := decode_utf8(headers_bytes(head))!
+    body_text := decode_utf8(body)!
+    headers_map := request_headers_map(head)!
+    query_map := query_params_map_from_string(query_text)
+    path_parts := path_segments(path_text)
+    return HttpRequestBytes(head, body, method_text, path_text, query_text, version_text, headers_text, body_text, headers_map, query_map, path_parts)
+
 fn pack_request(req: HttpRequestBytes) -> String!:
     sep := chr(31)
     mut packed := req.method()!
@@ -424,21 +509,21 @@ impl HttpRequestBytes:
     fn header_bytes(name: String) -> Bytes:
         return header_value_bytes(self.head, name)
     fn method() -> String!:
-        return decode_utf8(self.method_bytes())
+        return self.method_text
     fn path() -> String!:
-        return decode_utf8(self.path_bytes())
+        return self.path_text
     fn query() -> String!:
-        return decode_utf8(self.query_bytes())
+        return self.query_text
     fn version() -> String!:
-        return decode_utf8(self.version_bytes())
+        return self.version_text
     fn headers() -> String!:
-        return decode_utf8(self.headers_bytes())
+        return self.headers_text
     fn header(name: String) -> String!:
-        return decode_utf8(self.header_bytes(name))
+        return header_lookup(self.header_map, name)
     fn body_bytes() -> Bytes:
         return self.body
     fn body_text() -> String!:
-        return decode_utf8(self.body)
+        return self.body_text_cache
     fn body_text_or(fallback: String) -> String:
         return self.body_text() catch fallback
     fn body_json() -> Int!:
@@ -450,15 +535,17 @@ impl HttpRequestBytes:
     fn is_post(path_name: String) -> Bool!:
         return self.matches("POST", path_name)!
     fn query_param(name: String) -> String!:
-        return query_param_from_string(self.query()!, name)
+        if self.query_map.contains_key(name):
+            return self.query_map[name]
+        return ""
     fn has_query_param(name: String) -> Bool!:
-        return query_has_param_from_string(self.query()!, name)
+        return self.query_map.contains_key(name)
     fn path_parts() -> List[String]!:
-        return path_segments(self.path()!)
+        return copy_string_list(self.path_parts_cache)
     fn matches_path(pattern: String) -> Bool!:
-        return route_match_path(self.path()!, pattern)
+        return route_match_path(self.path_text, pattern)
     fn path_param(pattern: String, name: String) -> String!:
-        return route_param_from_path(self.path()!, pattern, name)
+        return route_param_from_path(self.path_text, pattern, name)
 fn content_length_from_head_bytes(raw_head: Bytes) -> Int!:
     length_text := header_value_bytes(raw_head, "Content-Length")
     if length_text.is_empty():
@@ -583,7 +670,10 @@ pub fn json(status: Int, body_text: String) -> HttpResponse:
     return response(status).with_body_text(body_text).header("Content-Type", MIME_JSON)
 
 pub fn json_value(status: Int, handle: Int) -> HttpResponse:
-    return json(status, json_mod.encode(handle))
+    body_bytes := json_mod.encode_bytes(handle)
+    if body_bytes.is_err:
+        return json(status, json_mod.encode(handle))
+    return response(status).with_body_bytes(body_bytes.ok).header("Content-Type", MIME_JSON)
 
 pub fn not_found_response() -> HttpResponse:
     return html(404, "<h1>404 Not Found</h1>")
@@ -610,7 +700,10 @@ impl HttpResponse:
         return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), data)
 
     fn with_json(handle: Int) -> HttpResponse:
-        return self.with_body_text(json_mod.encode(handle)).header("Content-Type", MIME_JSON)
+        body_bytes := json_mod.encode_bytes(handle)
+        if body_bytes.is_err:
+            return self.with_body_text(json_mod.encode(handle)).header("Content-Type", MIME_JSON)
+        return self.with_body_bytes(body_bytes.ok).header("Content-Type", MIME_JSON)
 
     fn status_code() -> Int:
         return self.status
@@ -688,27 +781,43 @@ pub fn redirect(url: String) -> String:
 # ===============================================================
 # Server Helpers
 # ===============================================================
-fn find_request_head_end(raw: Bytes) -> Int:
-    mut i := 0
+fn find_request_head_end_from(raw: Bytes, start: Int) -> Int:
+    mut i := start
+    if i < 0:
+        i = 0
     while i < raw.len() - 3:
         if raw[i] == 13 and raw[i + 1] == 10 and raw[i + 2] == 13 and raw[i + 3] == 10:
             return i + 4
         i = i + 1
-    i = 0
+    i = start
+    if i < 0:
+        i = 0
     while i < raw.len() - 1:
         if raw[i] == 10 and raw[i + 1] == 10:
             return i + 2
         i = i + 1
     return - 1
+
+fn find_request_head_end(raw: Bytes) -> Int:
+    return find_request_head_end_from(raw, 0)
+
 fn read_request_from_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestBytes!:
-    buf := bytes.buffer_with_capacity(256)
+    buf := bytes.buffer_with_capacity(1024)
     mut body_start := -1
+    mut scan_start := 0
     while body_start < 0:
         chunk := reader.read_bytes(1)!
         if chunk.is_empty():
-            return HttpRequestBytes(bytes.empty(), bytes.empty())
+            if buf.bytes().is_empty():
+                return build_http_request(bytes.empty(), bytes.empty())
+            break
         buf.write(chunk)!
-        body_start = find_request_head_end(buf.bytes())
+        body_start = find_request_head_end_from(buf.bytes(), scan_start)
+        scan_start = buf.bytes().len() - 3
+        if scan_start < 0:
+            scan_start = 0
+    if body_start < 0:
+        return build_http_request(buf.bytes(), bytes.empty())
     raw := buf.bytes()
     head_bytes := raw.slice(0, body_start)
     content_length := content_length_from_head_bytes(head_bytes)!
@@ -721,12 +830,12 @@ fn read_request_from_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestB
         if chunk.is_empty():
             break
         body_buf.write(chunk)!
-    return HttpRequestBytes(head_bytes, body_buf.bytes())
+    return build_http_request(head_bytes, body_buf.bytes())
 fn read_request_from_buffered_string(reader: BufferedStringReader) -> HttpRequestBytes!:
     crlf := chr(13) + chr(10)
     request_line := reader.read_line()!
     if request_line == "":
-        return HttpRequestBytes(bytes.empty(), bytes.empty())
+        return build_http_request(bytes.empty(), bytes.empty())
     raw := bytes.buffer_with_capacity(1024)
     raw.write(bytes.from_string_utf8(request_line + crlf))!
     mut line := reader.read_line()!
@@ -739,8 +848,8 @@ fn read_request_from_buffered_string(reader: BufferedStringReader) -> HttpReques
         raw.write(bytes.from_string_utf8(reader.read(content_length)!))!
     body_start := find_request_head_end(raw.bytes())
     if body_start < 0:
-        return HttpRequestBytes(raw.bytes(), bytes.empty())
-    return HttpRequestBytes(raw.bytes().slice(0, body_start), raw.bytes().slice(body_start, raw.bytes().len()))
+        return build_http_request(raw.bytes(), bytes.empty())
+    return build_http_request(raw.bytes().slice(0, body_start), raw.bytes().slice(body_start, raw.bytes().len()))
 pub fn read_request_buffered(reader: BufferedStringReader) -> String!:
     return pack_request(read_request_from_buffered_string(reader)!)
 pub fn read_request(fd: Int) -> String!:
@@ -749,7 +858,7 @@ pub fn read_request_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestBy
     return read_request_from_buffered_bytes(reader)
 pub fn read_request_bytes(fd: Int) -> HttpRequestBytes!:
     stream := io.from_fd(fd)
-    reader := stream.buffered_bytes_reader_chunked(1)
+    reader := stream.buffered_bytes_reader_chunked(512)
     return read_request_from_buffered_bytes(reader)
 
 pub fn send_buffered(writer: BufferedBytesWriter, response: HttpResponse) -> Int!:

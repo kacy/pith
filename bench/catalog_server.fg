@@ -7,10 +7,14 @@
 # - GET /search?... query-driven scans
 # - POST /batch-score with a small JSON body
 
-from std.net.http import read_request, send_response
-from std.net.http import method, path, body, get_query_param
-from std.net.http import text_response, json_response, not_found, method_not_allowed, respond
+import std.io as io
+import std.json as json
+import std.net.http as http
+import std.bytes as bytes
+from std.net.http import HttpRequestBytes, HttpResponse
 from std.env import get_args
+
+JSON_MIME := "application/json"
 
 struct CatalogUser:
     pub id: Int
@@ -129,11 +133,6 @@ fn build_batch_suffix_stats():
     batch_count_suffix.reverse()
     batch_score_sum_suffix.reverse()
     batch_quota_sum_suffix.reverse()
-
-fn bool_json(value: Bool) -> String:
-    if value:
-        return "true"
-    return "false"
 
 fn init_catalog():
     if users.len() > 0:
@@ -306,30 +305,20 @@ fn batch_match_score_sum(min_score: Int) -> Int:
 fn batch_match_quota_sum(min_score: Int) -> Int:
     return batch_quota_sum_suffix[min_score]
 
-fn user_json(user: CatalogUser) -> String:
-    lb := chr(123)
-    rb := chr(125)
-    dq := chr(34)
-    team := team_name(user.team_id)
-    region := region_name(user.region_id)
-    mut body := lb + dq + "id" + dq + ":" + user.id.to_string()
-    body = body + "," + dq + "team" + dq + ":" + dq + team + dq
-    body = body + "," + dq + "region" + dq + ":" + dq + region + dq
-    body = body + "," + dq + "active" + dq + ":" + bool_json(user.active)
-    body = body + "," + dq + "score" + dq + ":" + user.score.to_string()
-    body = body + "," + dq + "quota" + dq + ":" + user.quota.to_string()
-    return body + rb
+fn user_json_bytes(user: CatalogUser) -> Bytes!:
+    out := bytes.buffer()
+    json.write_object_start_bytes(out)!
+    mut first := true
+    first = json.write_object_int_field_bytes(out, first, "id", user.id)!
+    first = json.write_object_string_field_bytes(out, first, "team", team_name(user.team_id))!
+    first = json.write_object_string_field_bytes(out, first, "region", region_name(user.region_id))!
+    first = json.write_object_bool_field_bytes(out, first, "active", user.active)!
+    first = json.write_object_int_field_bytes(out, first, "score", user.score)!
+    first = json.write_object_int_field_bytes(out, first, "quota", user.quota)!
+    json.write_object_end_bytes(out)!
+    return out.bytes()
 
-fn ids_json(ids: List[Int]) -> String:
-    mut parts: List[String] := []
-    for id in ids:
-        parts.push(id.to_string())
-    return "[" + parts.join(",") + "]"
-
-fn search_json(team_id: Int, region_id: Int, active_filter: Int, min_score: Int, limit: Int) -> String:
-    lb := chr(123)
-    rb := chr(125)
-    dq := chr(34)
+fn search_json_bytes(team_id: Int, region_id: Int, active_filter: Int, min_score: Int, limit: Int) -> Bytes!:
     mut ids: List[Int] := []
     mut count := 0
     mut total_score := 0
@@ -377,16 +366,17 @@ fn search_json(team_id: Int, region_id: Int, active_filter: Int, min_score: Int,
             quota_sum = quota_sum + user.quota
             if ids.len() < limit:
                 ids.push(user.id)
-    mut body := lb + dq + "count" + dq + ":" + count.to_string()
-    body = body + "," + dq + "total_score" + dq + ":" + total_score.to_string()
-    body = body + "," + dq + "quota_sum" + dq + ":" + quota_sum.to_string()
-    body = body + "," + dq + "ids" + dq + ":" + ids_json(ids)
-    return body + rb
+    out := bytes.buffer()
+    json.write_object_start_bytes(out)!
+    mut first := true
+    first = json.write_object_int_field_bytes(out, first, "count", count)!
+    first = json.write_object_int_field_bytes(out, first, "total_score", total_score)!
+    first = json.write_object_int_field_bytes(out, first, "quota_sum", quota_sum)!
+    first = json.write_object_int_array_field_bytes(out, first, "ids", ids)!
+    json.write_object_end_bytes(out)!
+    return out.bytes()
 
-fn batch_score_json(req_body: String) -> String:
-    root := json_parse(req_body)
-    if root < 0:
-        return ""
+fn batch_score_json_bytes(root: Int) -> Bytes!:
     team_id := find_team_id(json_get_string(json_object_get(root, "team")))
     region_id := find_region_id(json_get_string(json_object_get(root, "region")))
     mut min_score := json_get_int(json_object_get(root, "min_score"))
@@ -436,51 +426,135 @@ fn batch_score_json(req_body: String) -> String:
             weighted_total = weighted_total + (user.score * multiplier) + user.quota
             if ids.len() < limit:
                 ids.push(user.id)
-    lb := chr(123)
-    rb := chr(125)
+    out := bytes.buffer()
+    json.write_object_start_bytes(out)!
+    mut first := true
+    first = json.write_object_int_field_bytes(out, first, "count", count)!
+    first = json.write_object_int_field_bytes(out, first, "score_sum", score_sum)!
+    first = json.write_object_int_field_bytes(out, first, "weighted_total", weighted_total)!
+    first = json.write_object_int_array_field_bytes(out, first, "ids", ids)!
+    json.write_object_end_bytes(out)!
+    return out.bytes()
+
+fn batch_score_json_fast_bytes(body: String) -> Bytes!:
+    team_raw := json.scan_object_string(body, "team")
+    region_raw := json.scan_object_string(body, "region")
+    active_raw := json.scan_object_string(body, "active")
+    if team_raw == "" or region_raw == "" or active_raw == "":
+        fail "fallback"
+    team_id := find_team_id(team_raw)
+    region_id := find_region_id(region_raw)
+    mut min_score := json.scan_object_int_or(body, "min_score", 0)
+    mut limit := json.scan_object_int_or(body, "limit", 10)
+    mut multiplier := json.scan_object_int_or(body, "multiplier", 3)
+
+    if min_score < 0:
+        min_score = 0
+    if limit <= 0:
+        limit = 10
+    if multiplier <= 0:
+        multiplier = 3
+
+    active_filter := parse_active_filter(active_raw)
+    mut ids: List[Int] := []
+    mut count := 0
+    mut weighted_total := 0
+    mut score_sum := 0
+    if team_id == 1 and region_id == 0 and active_filter == 1:
+        count = batch_match_count(min_score)
+        score_sum = batch_match_score_sum(min_score)
+        weighted_total = (score_sum * multiplier) + batch_match_quota_sum(min_score)
+        for idx in batch_candidate_indices:
+            user := users[idx]
+            if user.score < min_score:
+                continue
+            if ids.len() < limit:
+                ids.push(user.id)
+            else:
+                break
+    else:
+        candidates := search_candidates(region_id, active_filter)
+        for idx in candidates:
+            user := users[idx]
+            if team_id >= 0 and user.team_id != team_id:
+                continue
+            if region_id >= 0 and user.region_id != region_id:
+                continue
+            if active_filter == 1 and not user.active:
+                continue
+            if active_filter == 0 and user.active:
+                continue
+            if user.score < min_score:
+                continue
+            count = count + 1
+            score_sum = score_sum + user.score
+            weighted_total = weighted_total + (user.score * multiplier) + user.quota
+            if ids.len() < limit:
+                ids.push(user.id)
+    out := bytes.buffer()
+    json.write_object_start_bytes(out)!
+    mut first := true
+    first = json.write_object_int_field_bytes(out, first, "count", count)!
+    first = json.write_object_int_field_bytes(out, first, "score_sum", score_sum)!
+    first = json.write_object_int_field_bytes(out, first, "weighted_total", weighted_total)!
+    first = json.write_object_int_array_field_bytes(out, first, "ids", ids)!
+    json.write_object_end_bytes(out)!
+    return out.bytes()
+
+fn bad_json_response() -> HttpResponse:
     dq := chr(34)
-    mut body := lb + dq + "count" + dq + ":" + count.to_string()
-    body = body + "," + dq + "score_sum" + dq + ":" + score_sum.to_string()
-    body = body + "," + dq + "weighted_total" + dq + ":" + weighted_total.to_string()
-    body = body + "," + dq + "ids" + dq + ":" + ids_json(ids)
-    return body + rb
+    body := chr(123) + dq + "error" + dq + ":" + dq + "bad json" + dq + chr(125)
+    return http.json(400, body)
 
-fn handle(fd: Int) -> Int!:
-    tcp_set_timeout(fd, 1000)
-    req := read_request(fd)!
-    m := method(req)
-    p := path(req)
+fn handle_request(req: HttpRequestBytes) -> HttpResponse:
+    if req.is_get("/health") catch false:
+        return http.text(200, "ok")
 
-    if m == "GET" and p == "/health":
-        return send_response(fd, text_response(200, "ok"))
-
-    if m == "GET" and p == "/profile":
-        id := parse_int_or_default(get_query_param(req, "id"), 1)
+    if req.is_get("/profile") catch false:
+        id := parse_int_or_default(req.query_param("id") catch "", 1)
         if not user_index.contains_key(id):
-            return send_response(fd, not_found())
+            return http.not_found_response()
         idx := user_index[id]
-        return send_response(fd, json_response(200, user_json(users[idx])))
+        return http.response(200).with_body_bytes(user_json_bytes(users[idx]) catch bytes.empty()).header("Content-Type", JSON_MIME)
 
-    if m == "GET" and p == "/search":
-        team_id := find_team_id(get_query_param(req, "team"))
-        region_id := find_region_id(get_query_param(req, "region"))
-        active_filter := parse_active_filter(get_query_param(req, "active"))
-        min_score := parse_int_or_default(get_query_param(req, "min_score"), 0)
-        limit := parse_int_or_default(get_query_param(req, "limit"), 10)
-        return send_response(fd, json_response(200, search_json(team_id, region_id, active_filter, min_score, limit)))
+    if req.is_get("/search") catch false:
+        team_id := find_team_id(req.query_param("team") catch "")
+        region_id := find_region_id(req.query_param("region") catch "")
+        active_filter := parse_active_filter(req.query_param("active") catch "")
+        min_score := parse_int_or_default(req.query_param("min_score") catch "", 0)
+        limit := parse_int_or_default(req.query_param("limit") catch "", 10)
+        return http.response(200).with_body_bytes(search_json_bytes(team_id, region_id, active_filter, min_score, limit) catch bytes.empty()).header("Content-Type", JSON_MIME)
 
-    if m == "POST" and p == "/batch-score":
-        response_body := batch_score_json(body(req))
-        if response_body == "":
-            dq := chr(34)
-            bad := chr(123) + dq + "error" + dq + ":" + dq + "bad json" + dq + chr(125)
-            return send_response(fd, respond(400, "application/json", bad))
-        return send_response(fd, json_response(200, response_body))
+    if req.is_post("/batch-score") catch false:
+        fast := batch_score_json_fast_bytes(req.body_text() catch "")
+        if fast.is_ok:
+            return http.response(200).with_body_bytes(fast.ok).header("Content-Type", JSON_MIME)
+        mark := json.checkpoint()
+        root := req.body_json() catch -1
+        if root < 0:
+            json.restore(mark)
+            return bad_json_response()
+        response := http.response(200).with_body_bytes(batch_score_json_bytes(root) catch bytes.empty()).header("Content-Type", JSON_MIME)
+        json.restore(mark)
+        return response
 
-    if p == "/batch-score":
-        return send_response(fd, method_not_allowed())
+    if (req.path() catch "") == "/batch-score":
+        return http.method_not_allowed_response()
 
-    return send_response(fd, not_found())
+    return http.not_found_response()
+
+fn handle_client(fd: Int) -> Int!:
+    stream := io.from_fd(fd)
+    stream.set_timeout(1000)
+    reader := stream.buffered_bytes_reader_chunked(1024)
+    writer := stream.buffered_bytes_writer_chunked(1024)
+    req := http.read_request_buffered_bytes(reader)
+    if req.is_err:
+        stream.close()
+        fail req.err
+    sent := http.send_buffered(writer, handle_request(req.ok))
+    stream.close()
+    return sent!
 
 fn main() -> Int!:
     init_catalog()
@@ -494,7 +568,7 @@ fn main() -> Int!:
     while true:
         client := tcp_accept(fd)
         if client.is_ok:
-            handled := handle(client.ok)
+            handled := handle_client(client.ok)
             if handled.is_err:
                 tcp_close(client.ok)
     return 0

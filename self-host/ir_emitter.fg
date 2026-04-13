@@ -624,6 +624,8 @@ fn ir_runtime_call_name(name: String) -> String:
         return "forge_list_sort_strings"
     if name == "__list_get" or name == "__index":
         return "forge_list_get_value"
+    if name == "__list_get_unchecked":
+        return "forge_list_get_value_unchecked"
     if name == "__list_new":
         return "forge_list_new_default"
     if name == "__list_push":
@@ -3164,10 +3166,10 @@ fn ir_emit_for_loop_value_binding(value_name: String, index_name: String, item_k
         ir_emit_call2(elem_r, "char_at", "string", it_r, idx_r)
         ir_var_types.insert(value_name, "string")
     elif item_kind == "string":
-        ir_emit_call2(elem_r, "__list_get", "string", it_r, idx_r)
+        ir_emit_call2(elem_r, "__list_get_unchecked", "string", it_r, idx_r)
         ir_var_types.insert(value_name, "string")
     elif item_kind == "int":
-        ir_emit_call2(elem_r, "__list_get", "int", it_r, idx_r)
+        ir_emit_call2(elem_r, "__list_get_unchecked", "int", it_r, idx_r)
         ir_var_types.insert(value_name, "int")
     else:
         ir_emit_call2(elem_r, "__list_get", "unknown", it_r, idx_r)

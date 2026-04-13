@@ -4,7 +4,6 @@
 //! but presents FFI-compatible interface matching the C runtime.
 
 use crate::string::{forge_string_release, forge_string_retain, ForgeString};
-
 /// FFI-compatible list handle
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -28,6 +27,8 @@ pub struct ListImpl {
     pub type_tag: ListTypeTag,
     /// Element data as byte vectors
     pub elements: Vec<Vec<u8>>,
+    /// Packed storage for 8-byte values and handles.
+    pub values8: Vec<i64>,
 }
 
 /// Magic number to identify ListImpl pointers
@@ -47,41 +48,112 @@ impl ListImpl {
         ListImpl {
             magic: LIST_MAGIC,
             elements: Vec::new(),
+            values8: Vec::new(),
             elem_size,
             type_tag,
         }
     }
 
+    fn uses_value_storage(&self) -> bool {
+        self.elem_size == 8
+    }
+
     fn len(&self) -> usize {
-        self.elements.len()
+        if self.uses_value_storage() {
+            self.values8.len()
+        } else {
+            self.elements.len()
+        }
     }
 
     fn push(&mut self, elem: &[u8]) {
-        self.elements.push(elem.to_vec());
+        if self.uses_value_storage() {
+            self.values8
+                .push(unsafe { std::ptr::read_unaligned(elem.as_ptr() as *const i64) });
+        } else {
+            self.elements.push(elem.to_vec());
+        }
+    }
+
+    fn push_value(&mut self, value: i64) {
+        if self.uses_value_storage() {
+            self.values8.push(value);
+        } else {
+            let bytes = value.to_ne_bytes();
+            let elem_len = self.elem_size.min(bytes.len());
+            self.elements.push(bytes[..elem_len].to_vec());
+        }
     }
 
     fn pop(&mut self) -> Option<Vec<u8>> {
-        self.elements.pop()
+        if self.uses_value_storage() {
+            self.values8.pop().map(|value| value.to_ne_bytes().to_vec())
+        } else {
+            self.elements.pop()
+        }
     }
 
-    fn get(&self, index: usize) -> Option<&[u8]> {
-        self.elements.get(index).map(|v| v.as_slice())
+    unsafe fn get_value_unchecked(&self, index: usize) -> i64 {
+        if self.uses_value_storage() {
+            *self.values8.get_unchecked(index)
+        } else {
+            let elem = self.elements.get_unchecked(index);
+            std::ptr::read_unaligned(elem.as_ptr() as *const i64)
+        }
+    }
+
+    fn get_value(&self, index: usize) -> Option<i64> {
+        if self.uses_value_storage() {
+            self.values8.get(index).copied()
+        } else {
+            self.elements
+                .get(index)
+                .map(|elem| unsafe { std::ptr::read_unaligned(elem.as_ptr() as *const i64) })
+        }
     }
 
     fn set(&mut self, index: usize, elem: &[u8]) {
-        if index < self.elements.len() {
+        if self.uses_value_storage() {
+            if index < self.values8.len() {
+                self.values8[index] =
+                    unsafe { std::ptr::read_unaligned(elem.as_ptr() as *const i64) };
+            }
+        } else if index < self.elements.len() {
             self.elements[index] = elem.to_vec();
         }
     }
 
+    fn set_value(&mut self, index: usize, value: i64) {
+        if self.uses_value_storage() {
+            if index < self.values8.len() {
+                self.values8[index] = value;
+            }
+        } else if index < self.elements.len() {
+            let bytes = value.to_ne_bytes();
+            let elem_len = self.elem_size.min(bytes.len());
+            self.elements[index] = bytes[..elem_len].to_vec();
+        }
+    }
+
     fn insert(&mut self, index: usize, elem: &[u8]) {
-        if index <= self.elements.len() {
+        if self.uses_value_storage() {
+            if index <= self.values8.len() {
+                self.values8
+                    .insert(index, unsafe { std::ptr::read_unaligned(elem.as_ptr() as *const i64) });
+            }
+        } else if index <= self.elements.len() {
             self.elements.insert(index, elem.to_vec());
         }
     }
 
     fn remove(&mut self, index: usize) -> Option<Vec<u8>> {
-        if index < self.elements.len() {
+        if self.uses_value_storage() {
+            if index < self.values8.len() {
+                Some(self.values8.remove(index).to_ne_bytes().to_vec())
+            } else {
+                None
+            }
+        } else if index < self.elements.len() {
             Some(self.elements.remove(index))
         } else {
             None
@@ -89,11 +161,19 @@ impl ListImpl {
     }
 
     fn clear(&mut self) {
-        self.elements.clear();
+        if self.uses_value_storage() {
+            self.values8.clear();
+        } else {
+            self.elements.clear();
+        }
     }
 
     fn swap(&mut self, a: usize, b: usize) {
-        if a < self.elements.len() && b < self.elements.len() {
+        if self.uses_value_storage() {
+            if a < self.values8.len() && b < self.values8.len() {
+                self.values8.swap(a, b);
+            }
+        } else if a < self.elements.len() && b < self.elements.len() {
             self.elements.swap(a, b);
         }
     }
@@ -179,6 +259,8 @@ pub unsafe extern "C" fn forge_list_push(list: *mut ForgeList, elem: *const u8, 
     }
 
     let impl_ref = &mut *((*list).ptr as *mut ListImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_PUSHES, 1);
 
     // Verify element size matches
     if impl_ref.elem_size != elem_size as usize {
@@ -207,9 +289,9 @@ pub unsafe extern "C" fn forge_list_push_value(list: ForgeList, value: i64) {
     }
 
     let impl_ref = &mut *(list.ptr as *mut ListImpl);
-    let bytes = value.to_ne_bytes();
-    let elem_len = impl_ref.elem_size.min(bytes.len());
-    impl_ref.push(&bytes[..elem_len]);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_PUSHES, 1);
+    impl_ref.push_value(value);
 }
 
 /// Set element at index (value-based API, stores i64).
@@ -219,13 +301,13 @@ pub unsafe extern "C" fn forge_list_set_value(list: ForgeList, index: i64, value
         return;
     }
     let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_SETS, 1);
     let idx = index as usize;
-    if idx >= impl_ref.elements.len() {
+    if idx >= impl_ref.len() {
         return;
     }
-    let bytes = value.to_ne_bytes();
-    let elem_len = impl_ref.elem_size.min(bytes.len());
-    impl_ref.elements[idx] = bytes[..elem_len].to_vec();
+    impl_ref.set_value(idx, value);
 }
 
 /// Join a list of C string pointers with a separator.
@@ -239,7 +321,7 @@ pub unsafe extern "C" fn forge_list_join(list: ForgeList, sep: *const i8) -> *mu
     }
 
     let impl_ref = &*(list.ptr as *const ListImpl);
-    if impl_ref.elements.is_empty() {
+    if impl_ref.len() == 0 {
         let ptr = alloc(Layout::from_size_align(1, 1).unwrap()) as *mut i8;
         if !ptr.is_null() {
             *ptr = 0;
@@ -254,16 +336,18 @@ pub unsafe extern "C" fn forge_list_join(list: ForgeList, sep: *const i8) -> *mu
     };
 
     let mut total_len = 0usize;
-    for (i, elem) in impl_ref.elements.iter().enumerate() {
-        if elem.len() >= 8 {
-            let ptr_val = i64::from_ne_bytes(elem[..8].try_into().unwrap()) as *const i8;
+    let mut i = 0usize;
+    while i < impl_ref.len() {
+        if let Some(raw) = impl_ref.get_value(i) {
+            let ptr_val = raw as *const i8;
             if !ptr_val.is_null() {
                 total_len += crate::string::forge_cstring_len(ptr_val) as usize;
             }
         }
-        if i + 1 < impl_ref.elements.len() {
+        if i + 1 < impl_ref.len() {
             total_len += sep_len;
         }
+        i += 1;
     }
 
     let out = alloc(Layout::from_size_align(total_len + 1, 1).unwrap()) as *mut i8;
@@ -272,19 +356,21 @@ pub unsafe extern "C" fn forge_list_join(list: ForgeList, sep: *const i8) -> *mu
     }
 
     let mut write = 0usize;
-    for (i, elem) in impl_ref.elements.iter().enumerate() {
-        if elem.len() >= 8 {
-            let ptr_val = i64::from_ne_bytes(elem[..8].try_into().unwrap()) as *const i8;
+    let mut i = 0usize;
+    while i < impl_ref.len() {
+        if let Some(raw) = impl_ref.get_value(i) {
+            let ptr_val = raw as *const i8;
             if !ptr_val.is_null() {
                 let len = crate::string::forge_cstring_len(ptr_val) as usize;
                 std::ptr::copy_nonoverlapping(ptr_val as *const u8, out.add(write) as *mut u8, len);
                 write += len;
             }
         }
-        if i + 1 < impl_ref.elements.len() && sep_len > 0 {
+        if i + 1 < impl_ref.len() && sep_len > 0 {
             std::ptr::copy_nonoverlapping(sep as *const u8, out.add(write) as *mut u8, sep_len);
             write += sep_len;
         }
+        i += 1;
     }
 
     *out.add(write) = 0;
@@ -337,23 +423,45 @@ pub unsafe extern "C" fn forge_list_get_value(list: ForgeList, index: i64) -> i6
     }
 
     let impl_ref = &*(list.ptr as *const ListImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_GETS, 1);
+    crate::perf_count(&crate::PERF_LIST_GET_VALUE_CALLS, 1);
+    crate::perf_count(&crate::PERF_LIST_GET_VALUE_CHECKED_CALLS, 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
         return 0;
     }
 
-    // For pointer-sized elements (8 bytes), read directly
-    if impl_ref.elem_size == 8 {
-        match impl_ref.get(index as usize) {
-            Some(elem_data) if elem_data.len() == 8 => {
-                let val = i64::from_ne_bytes(elem_data[..8].try_into().unwrap_or([0; 8]));
-                val
-            }
-            _ => 0,
-        }
-    } else {
-        0
+    if impl_ref.elem_size != 8 {
+        crate::perf_count(&crate::PERF_LIST_GET_ELEM_OTHER, 1);
+        return 0;
     }
+
+    crate::perf_count(&crate::PERF_LIST_GET_ELEM8, 1);
+    impl_ref.get_value_unchecked(index as usize)
+}
+
+/// Get element at index for pointer-sized elements without an upper-bound check.
+/// This is used only in compiler-generated loops that already guard the index.
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_get_value_unchecked(list: ForgeList, index: i64) -> i64 {
+    if list.ptr.is_null() || index < 0 {
+        return 0;
+    }
+
+    let impl_ref = &*(list.ptr as *const ListImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_GETS, 1);
+    crate::perf_count(&crate::PERF_LIST_GET_VALUE_CALLS, 1);
+    crate::perf_count(&crate::PERF_LIST_GET_VALUE_UNCHECKED_CALLS, 1);
+
+    if impl_ref.elem_size != 8 {
+        crate::perf_count(&crate::PERF_LIST_GET_ELEM_OTHER, 1);
+        return 0;
+    }
+
+    crate::perf_count(&crate::PERF_LIST_GET_ELEM8, 1);
+    impl_ref.get_value_unchecked(index as usize)
 }
 
 /// Get element at index (copies to out buffer)
@@ -371,6 +479,9 @@ pub unsafe extern "C" fn forge_list_get(
     }
 
     let impl_ref = &*(list.ptr as *const ListImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_GETS, 1);
+    crate::perf_count(&crate::PERF_LIST_GET_BYTES_CALLS, 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
         return false;
@@ -380,10 +491,20 @@ pub unsafe extern "C" fn forge_list_get(
         eprintln!("forge: list element size mismatch");
         return false;
     }
+    if elem_size == 8 {
+        crate::perf_count(&crate::PERF_LIST_GET_ELEM8, 1);
+    } else {
+        crate::perf_count(&crate::PERF_LIST_GET_ELEM_OTHER, 1);
+    }
 
-    match impl_ref.get(index as usize) {
-        Some(elem_data) => {
-            std::ptr::copy_nonoverlapping(elem_data.as_ptr(), out, elem_data.len());
+    match impl_ref.get_value(index as usize) {
+        Some(value) => {
+            if elem_size == 8 {
+                std::ptr::copy_nonoverlapping(value.to_ne_bytes().as_ptr(), out, 8);
+            } else {
+                let elem_data = impl_ref.elements.get(index as usize).unwrap();
+                std::ptr::copy_nonoverlapping(elem_data.as_ptr(), out, elem_data.len());
+            }
 
             // Retain string elements (caller gets a reference)
             if matches!(impl_ref.type_tag, ListTypeTag::String) {
@@ -412,6 +533,8 @@ pub unsafe extern "C" fn forge_list_set(
     }
 
     let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_SETS, 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
         return false;
@@ -424,8 +547,7 @@ pub unsafe extern "C" fn forge_list_set(
 
     // Release old element if it's a heap type
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let old_elem = impl_ref.get(index as usize).unwrap();
-        let old_s = old_elem.as_ptr() as *const ForgeString;
+        let old_s = impl_ref.get_value(index as usize).unwrap() as *const ForgeString;
         forge_string_release(*old_s);
     }
 
@@ -457,6 +579,8 @@ pub unsafe extern "C" fn forge_list_insert(
     }
 
     let impl_ref = &mut *((*list).ptr as *mut ListImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_INSERTS, 1);
 
     if index < 0 || index > impl_ref.len() as i64 {
         return false;
@@ -493,6 +617,8 @@ pub unsafe extern "C" fn forge_list_remove(
     }
 
     let impl_ref = &mut *((*list).ptr as *mut ListImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_REMOVES, 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
         return false;
@@ -505,8 +631,7 @@ pub unsafe extern "C" fn forge_list_remove(
 
     // Release element before removal
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let elem = impl_ref.get(index as usize).unwrap();
-        let s = elem.as_ptr() as *const ForgeString;
+        let s = impl_ref.get_value(index as usize).unwrap() as *const ForgeString;
         forge_string_release(*s);
     }
 
@@ -520,6 +645,8 @@ pub unsafe extern "C" fn forge_list_remove_value(list: ForgeList, index: i64) ->
     if list.ptr.is_null() {
         return 0;
     }
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_REMOVES, 1);
 
     let impl_ref = &mut *(list.ptr as *mut ListImpl);
 
@@ -529,8 +656,7 @@ pub unsafe extern "C" fn forge_list_remove_value(list: ForgeList, index: i64) ->
 
     // Release string element if needed
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let elem = impl_ref.get(index as usize).unwrap();
-        let s = elem.as_ptr() as *const ForgeString;
+        let s = impl_ref.get_value(index as usize).unwrap() as *const ForgeString;
         forge_string_release(*s);
     }
 
@@ -549,8 +675,7 @@ pub unsafe extern "C" fn forge_list_clear_value(list: ForgeList) {
 
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
-            let elem = impl_ref.get(i).unwrap();
-            let s = elem.as_ptr() as *const ForgeString;
+            let s = impl_ref.get_value(i).unwrap() as *const ForgeString;
             forge_string_release(*s);
         }
     }
@@ -583,8 +708,7 @@ pub unsafe extern "C" fn forge_list_clear(list: *mut ForgeList) {
     // Release all elements if they're heap types
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
-            let elem = impl_ref.get(i).unwrap();
-            let s = elem.as_ptr() as *const ForgeString;
+            let s = impl_ref.get_value(i).unwrap() as *const ForgeString;
             forge_string_release(*s);
         }
     }
@@ -615,7 +739,11 @@ pub unsafe extern "C" fn forge_list_reverse(list: ForgeList) {
         return;
     }
     let impl_ref = &mut *(list.ptr as *mut ListImpl);
-    impl_ref.elements.reverse();
+    if impl_ref.uses_value_storage() {
+        impl_ref.values8.reverse();
+    } else {
+        impl_ref.elements.reverse();
+    }
 }
 
 /// Release list and free memory
@@ -630,8 +758,7 @@ pub unsafe extern "C" fn forge_list_release(list: ForgeList) {
     // Release all elements
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
-            let elem = impl_ref.get(i).unwrap();
-            let s = elem.as_ptr() as *const ForgeString;
+            let s = impl_ref.get_value(i).unwrap() as *const ForgeString;
             forge_string_release(*s);
         }
     }
@@ -654,8 +781,7 @@ pub unsafe extern "C" fn forge_list_contains_string(list: ForgeList, s: ForgeStr
     }
 
     for i in 0..impl_ref.len() {
-        let elem = impl_ref.get(i).unwrap();
-        let elem_s = elem.as_ptr() as *const ForgeString;
+        let elem_s = impl_ref.get_value(i).unwrap() as *const ForgeString;
         if crate::string::forge_string_eq(*elem_s, s) {
             return true;
         }
@@ -675,11 +801,8 @@ pub unsafe extern "C" fn forge_list_contains_cstr(list_handle: i64, s: *const i8
     let needle_len = crate::string::forge_cstring_len(s) as usize;
     let needle = std::slice::from_raw_parts(s as *const u8, needle_len);
 
-    for elem in &impl_ref.elements {
-        if elem.len() < 8 {
-            continue;
-        }
-        let ptr_val = i64::from_ne_bytes(elem[..8].try_into().unwrap_or([0; 8])) as *const i8;
+    for i in 0..impl_ref.len() {
+        let ptr_val = impl_ref.get_value(i).unwrap_or(0) as *const i8;
         if ptr_val.is_null() {
             continue;
         }
@@ -710,8 +833,7 @@ pub unsafe extern "C" fn forge_list_index_of_string(list: ForgeList, s: ForgeStr
     }
 
     for i in 0..impl_ref.len() {
-        let elem = impl_ref.get(i).unwrap();
-        let elem_s = elem.as_ptr() as *const ForgeString;
+        let elem_s = impl_ref.get_value(i).unwrap() as *const ForgeString;
         if crate::string::forge_string_eq(*elem_s, s) {
             return i as i64;
         }
@@ -731,11 +853,8 @@ pub unsafe extern "C" fn forge_list_index_of_cstr(list_handle: i64, s: *const i8
     let needle_len = crate::string::forge_cstring_len(s) as usize;
     let needle = std::slice::from_raw_parts(s as *const u8, needle_len);
 
-    for (i, elem) in impl_ref.elements.iter().enumerate() {
-        if elem.len() < 8 {
-            continue;
-        }
-        let ptr_val = i64::from_ne_bytes(elem[..8].try_into().unwrap_or([0; 8])) as *const i8;
+    for i in 0..impl_ref.len() {
+        let ptr_val = impl_ref.get_value(i).unwrap_or(0) as *const i8;
         if ptr_val.is_null() {
             continue;
         }
@@ -762,12 +881,8 @@ pub unsafe extern "C" fn forge_list_index_of_int(list: ForgeList, value: i64) ->
     let impl_ref = &*(list.ptr as *const ListImpl);
 
     for i in 0..impl_ref.len() {
-        let elem = impl_ref.get(i).unwrap();
-        if elem.len() >= 8 {
-            let stored = i64::from_le_bytes(elem[..8].try_into().unwrap_or([0u8; 8]));
-            if stored == value {
-                return i as i64;
-            }
+        if impl_ref.get_value(i).unwrap_or(0) == value {
+            return i as i64;
         }
     }
 
@@ -788,8 +903,7 @@ pub unsafe extern "C" fn forge_list_retain_all_strings(list: ForgeList) {
     }
 
     for i in 0..impl_ref.len() {
-        let elem = impl_ref.get(i).unwrap();
-        let s = elem.as_ptr() as *const ForgeString;
+        let s = impl_ref.get_value(i).unwrap() as *const ForgeString;
         forge_string_retain(*s);
     }
 }
@@ -808,8 +922,7 @@ pub unsafe extern "C" fn forge_list_release_all_strings(list: ForgeList) {
     }
 
     for i in 0..impl_ref.len() {
-        let elem = impl_ref.get(i).unwrap();
-        let s = elem.as_ptr() as *const ForgeString;
+        let s = impl_ref.get_value(i).unwrap() as *const ForgeString;
         forge_string_release(*s);
     }
 }
@@ -824,12 +937,8 @@ pub unsafe extern "C" fn forge_list_contains_int(list: ForgeList, value: i64) ->
     let impl_ref = &*(list.ptr as *const ListImpl);
 
     for i in 0..impl_ref.len() {
-        let elem = impl_ref.get(i).unwrap();
-        if elem.len() >= 8 {
-            let stored = i64::from_le_bytes(elem[..8].try_into().unwrap_or([0u8; 8]));
-            if stored == value {
-                return 1;
-            }
+        if impl_ref.get_value(i).unwrap_or(0) == value {
+            return 1;
         }
     }
 
@@ -873,10 +982,7 @@ pub unsafe extern "C" fn forge_list_map(list_ptr: i64, closure_handle: i64) -> i
     let result_ptr = result.ptr as i64;
 
     for i in 0..src.len() {
-        if let Some(elem_data) = src.get(i) {
-            let val = if elem_data.len() >= 8 {
-                i64::from_ne_bytes(elem_data[..8].try_into().unwrap_or([0; 8]))
-            } else { 0 };
+        if let Some(val) = src.get_value(i) {
             let mapped = func(closure_handle, val);
             forge_list_push_value(ForgeList { ptr: result_ptr as *mut () }, mapped);
         }
@@ -899,10 +1005,7 @@ pub unsafe extern "C" fn forge_list_filter(list_ptr: i64, closure_handle: i64) -
     let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
 
     for i in 0..impl_ref.len() {
-        if let Some(elem_data) = impl_ref.get(i) {
-            let val = if elem_data.len() >= 8 {
-                i64::from_ne_bytes(elem_data[..8].try_into().unwrap_or([0; 8]))
-            } else { 0 };
+        if let Some(val) = impl_ref.get_value(i) {
             if func(closure_handle, val) != 0 {
                 forge_list_push_value(result, val);
             }
@@ -926,10 +1029,7 @@ pub unsafe extern "C" fn forge_list_reduce(list_ptr: i64, init: i64, closure_han
 
     let mut acc = init;
     for i in 0..impl_ref.len() {
-        if let Some(elem_data) = impl_ref.get(i) {
-            let val = if elem_data.len() >= 8 {
-                i64::from_ne_bytes(elem_data[..8].try_into().unwrap_or([0; 8]))
-            } else { 0 };
+        if let Some(val) = impl_ref.get_value(i) {
             acc = func(closure_handle, acc, val);
         }
     }
@@ -950,10 +1050,7 @@ pub unsafe extern "C" fn forge_list_each(list_ptr: i64, closure_handle: i64) {
     let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
 
     for i in 0..impl_ref.len() {
-        if let Some(elem_data) = impl_ref.get(i) {
-            let val = if elem_data.len() >= 8 {
-                i64::from_ne_bytes(elem_data[..8].try_into().unwrap_or([0; 8]))
-            } else { 0 };
+        if let Some(val) = impl_ref.get_value(i) {
             func(closure_handle, val);
         }
     }

@@ -7,7 +7,6 @@ use crate::collections::list::ForgeList;
 use crate::string::{forge_string_release, forge_string_retain, ForgeString};
 use hashbrown::HashMap;
 use std::hash::{Hash, Hasher};
-
 /// FFI-compatible map handle
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -170,6 +169,8 @@ pub unsafe extern "C" fn forge_map_insert_int(
     }
 
     let impl_ref = &mut *((*map).ptr as *mut MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_INT_INSERTS, 1);
 
     // Verify value size matches
     if impl_ref.val_size != val_size as usize {
@@ -222,6 +223,8 @@ pub unsafe extern "C" fn forge_map_insert_string(
     }
 
     let impl_ref = &mut *((*map).ptr as *mut MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_STRING_INSERTS, 1);
 
     // Verify value size matches
     if impl_ref.val_size != val_size as usize {
@@ -277,6 +280,8 @@ pub unsafe extern "C" fn forge_map_get_int(
     }
 
     let impl_ref = &*(map.ptr as *const MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_INT_GETS, 1);
 
     if impl_ref.val_size != val_size as usize {
         eprintln!("forge: map value size mismatch");
@@ -318,6 +323,8 @@ pub unsafe extern "C" fn forge_map_get_string(
     }
 
     let impl_ref = &*(map.ptr as *const MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_STRING_GETS, 1);
 
     if impl_ref.val_size != val_size as usize {
         eprintln!("forge: map value size mismatch");
@@ -356,6 +363,8 @@ pub extern "C" fn forge_map_contains_int(map: ForgeMap, key: i64) -> bool {
 
     unsafe {
         let impl_ref = &*(map.ptr as *const MapImpl);
+        crate::ensure_perf_stats_registered();
+        crate::perf_count(&crate::PERF_MAP_INT_CONTAINS, 1);
 
         if !matches!(impl_ref.key_type, KeyType::Int) {
             return false;
@@ -373,6 +382,8 @@ pub unsafe extern "C" fn forge_map_contains_string(map: ForgeMap, key: ForgeStri
     }
 
     let impl_ref = &*(map.ptr as *const MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_STRING_CONTAINS, 1);
 
     if !matches!(impl_ref.key_type, KeyType::String) {
         return false;
@@ -394,6 +405,8 @@ pub unsafe extern "C" fn forge_map_remove_int(map: *mut ForgeMap, key: i64, val_
     }
 
     let impl_ref = &mut *((*map).ptr as *mut MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_INT_REMOVES, 1);
 
     if impl_ref.val_size != val_size as usize {
         eprintln!("forge: map value size mismatch");
@@ -431,6 +444,8 @@ pub unsafe extern "C" fn forge_map_remove_string(
     }
 
     let impl_ref = &mut *((*map).ptr as *mut MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_STRING_REMOVES, 1);
 
     if impl_ref.val_size != val_size as usize {
         eprintln!("forge: map value size mismatch");
@@ -618,6 +633,8 @@ pub unsafe extern "C" fn forge_map_insert_cstr(map_handle: i64, key: *const i8, 
     }
 
     let impl_ref = &mut *(map_handle as *mut MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_STRING_INSERTS, 1);
     let map_key = cstr_to_map_key(key);
     let val_bytes = value.to_le_bytes().to_vec();
     impl_ref.insert(map_key, val_bytes);
@@ -635,6 +652,8 @@ pub unsafe extern "C" fn forge_map_get_cstr(map_handle: i64, key: *const i8) -> 
     }
 
     let impl_ref = &*(map_handle as *const MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_STRING_GETS, 1);
     let map_key = cstr_to_map_key(key);
 
     match impl_ref.get(&map_key) {
@@ -657,6 +676,8 @@ pub unsafe extern "C" fn forge_map_contains_cstr(map_handle: i64, key: *const i8
     }
 
     let impl_ref = &*(map_handle as *const MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_STRING_CONTAINS, 1);
     let map_key = cstr_to_map_key(key);
 
     if impl_ref.contains_key(&map_key) {
@@ -673,6 +694,8 @@ pub unsafe extern "C" fn forge_map_get_default_cstr(map_handle: i64, key: *const
         return default;
     }
     let impl_ref = &*(map_handle as *const MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_STRING_GETS, 1);
     let map_key = cstr_to_map_key(key);
     match impl_ref.get(&map_key) {
         Some(val_data) if val_data.len() >= 8 => {
@@ -689,6 +712,8 @@ pub unsafe extern "C" fn forge_map_get_default_ikey(map_handle: i64, key: i64, d
         return default;
     }
     let impl_ref = &*(map_handle as *const MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_INT_GETS, 1);
     let map_key = MapKey::Int(key);
     match impl_ref.get(&map_key) {
         Some(val_data) if val_data.len() >= 8 => {
@@ -710,6 +735,8 @@ pub unsafe extern "C" fn forge_map_remove_cstr(map_handle: i64, key: *const i8) 
     }
 
     let impl_ref = &mut *(map_handle as *mut MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_STRING_REMOVES, 1);
     let map_key = cstr_to_map_key(key);
     impl_ref.remove(&map_key);
 }
@@ -729,6 +756,8 @@ pub unsafe extern "C" fn forge_map_insert_ikey(map_handle: i64, key: i64, value:
     }
 
     let impl_ref = &mut *(map_handle as *mut MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_INT_INSERTS, 1);
     let val_bytes = value.to_le_bytes().to_vec();
     impl_ref.insert(MapKey::Int(key), val_bytes);
 }
@@ -744,6 +773,8 @@ pub unsafe extern "C" fn forge_map_get_ikey(map_handle: i64, key: i64) -> i64 {
     }
 
     let impl_ref = &*(map_handle as *const MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_INT_GETS, 1);
 
     match impl_ref.get(&MapKey::Int(key)) {
         Some(val_data) if val_data.len() >= 8 => {
@@ -764,6 +795,8 @@ pub unsafe extern "C" fn forge_map_contains_ikey(map_handle: i64, key: i64) -> i
     }
 
     let impl_ref = &*(map_handle as *const MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_INT_CONTAINS, 1);
 
     if impl_ref.contains_key(&MapKey::Int(key)) {
         1
@@ -783,6 +816,8 @@ pub unsafe extern "C" fn forge_map_remove_ikey(map_handle: i64, key: i64) {
     }
 
     let impl_ref = &mut *(map_handle as *mut MapImpl);
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_INT_REMOVES, 1);
     impl_ref.remove(&MapKey::Int(key));
 }
 

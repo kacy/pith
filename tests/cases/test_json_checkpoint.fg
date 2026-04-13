@@ -1,0 +1,21 @@
+import std.json as json
+
+fn main() -> Int!:
+    dq := chr(34)
+    lb := chr(123)
+    rb := chr(125)
+
+    root1 := json.parse(lb + dq + "name" + dq + ":" + dq + "one" + dq + rb)
+    print(json.get_string(json.object_get(root1, "name")))
+
+    mark := json.checkpoint()
+    temp := json.parse(lb + dq + "name" + dq + ":" + dq + "temp" + dq + "," + dq + "count" + dq + ":2" + rb)
+    print(json.get_string(json.object_get(temp, "name")))
+
+    json.restore(mark)
+    print(json.object_get(temp, "name").to_string())
+
+    root2 := json.parse(lb + dq + "name" + dq + ":" + dq + "two" + dq + rb)
+    print(json.get_string(json.object_get(root2, "name")))
+    print(json.get_string(json.object_get(root1, "name")))
+    return 0

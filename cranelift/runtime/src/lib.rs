@@ -25,12 +25,44 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::OnceLock;
 
 /// Global statistics for debugging
 pub static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_RC_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_RC_RETAINS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_RC_RELEASES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_STRING_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_STRING_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_BYTES_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_BYTES_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_BYTE_BUFFER_NEWS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_BYTE_BUFFER_WRITES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_BYTE_BUFFER_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_PUSHES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_GETS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_GET_VALUE_CALLS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_GET_VALUE_CHECKED_CALLS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_GET_VALUE_UNCHECKED_CALLS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_GET_BYTES_CALLS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_GET_ELEM8: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_GET_ELEM_OTHER: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_SETS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_INSERTS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_REMOVES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_MAP_INT_INSERTS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_MAP_STRING_INSERTS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_MAP_INT_GETS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_MAP_STRING_GETS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_MAP_INT_CONTAINS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_MAP_STRING_CONTAINS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_MAP_INT_REMOVES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_MAP_STRING_REMOVES: AtomicUsize = AtomicUsize::new(0);
+
+static PERF_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
+static PERF_STATS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 struct ProcessHandle {
     child: Child,
@@ -59,6 +91,91 @@ static PROCESS_OUTPUT_HANDLES: OnceLock<Mutex<HashMap<i64, ProcessOutputHandle>>
 static NEXT_PROCESS_OUTPUT_HANDLE: AtomicI64 = AtomicI64::new(1);
 static FILE_HANDLES: OnceLock<Mutex<HashMap<i64, File>>> = OnceLock::new();
 static NEXT_FILE_HANDLE: AtomicI64 = AtomicI64::new(1);
+
+pub fn perf_stats_enabled() -> bool {
+    *PERF_STATS_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("FORGE_PERF_STATS").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    })
+}
+
+pub fn perf_count(counter: &AtomicUsize, delta: usize) {
+    if perf_stats_enabled() {
+        counter.fetch_add(delta, Ordering::Relaxed);
+    }
+}
+
+extern "C" fn forge_perf_dump_stats_at_exit() {
+    dump_perf_stats();
+}
+
+pub fn ensure_perf_stats_registered() {
+    if !perf_stats_enabled() {
+        return;
+    }
+    if PERF_STATS_REGISTERED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    unsafe {
+        libc::atexit(forge_perf_dump_stats_at_exit);
+    }
+}
+
+pub fn dump_perf_stats() {
+    if !perf_stats_enabled() {
+        return;
+    }
+    eprintln!("forge perf stats");
+    eprintln!("  rc allocs: {}", PERF_RC_ALLOCS.load(Ordering::Relaxed));
+    eprintln!("  rc retains: {}", PERF_RC_RETAINS.load(Ordering::Relaxed));
+    eprintln!("  rc releases: {}", PERF_RC_RELEASES.load(Ordering::Relaxed));
+    eprintln!(
+        "  string allocs: {} bytes={}",
+        PERF_STRING_ALLOCS.load(Ordering::Relaxed),
+        PERF_STRING_ALLOC_BYTES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  bytes allocs: {} bytes={}",
+        PERF_BYTES_ALLOCS.load(Ordering::Relaxed),
+        PERF_BYTES_ALLOC_BYTES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  byte_buffer new: {} writes={} write_bytes={}",
+        PERF_BYTE_BUFFER_NEWS.load(Ordering::Relaxed),
+        PERF_BYTE_BUFFER_WRITES.load(Ordering::Relaxed),
+        PERF_BYTE_BUFFER_WRITE_BYTES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  list ops: push={} get={} get_value={} checked={} unchecked={} get_bytes={} elem8={} elem_other={} set={} insert={} remove={}",
+        PERF_LIST_PUSHES.load(Ordering::Relaxed),
+        PERF_LIST_GETS.load(Ordering::Relaxed),
+        PERF_LIST_GET_VALUE_CALLS.load(Ordering::Relaxed),
+        PERF_LIST_GET_VALUE_CHECKED_CALLS.load(Ordering::Relaxed),
+        PERF_LIST_GET_VALUE_UNCHECKED_CALLS.load(Ordering::Relaxed),
+        PERF_LIST_GET_BYTES_CALLS.load(Ordering::Relaxed),
+        PERF_LIST_GET_ELEM8.load(Ordering::Relaxed),
+        PERF_LIST_GET_ELEM_OTHER.load(Ordering::Relaxed),
+        PERF_LIST_SETS.load(Ordering::Relaxed),
+        PERF_LIST_INSERTS.load(Ordering::Relaxed),
+        PERF_LIST_REMOVES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  map int ops: insert={} get={} contains={} remove={}",
+        PERF_MAP_INT_INSERTS.load(Ordering::Relaxed),
+        PERF_MAP_INT_GETS.load(Ordering::Relaxed),
+        PERF_MAP_INT_CONTAINS.load(Ordering::Relaxed),
+        PERF_MAP_INT_REMOVES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  map string ops: insert={} get={} contains={} remove={}",
+        PERF_MAP_STRING_INSERTS.load(Ordering::Relaxed),
+        PERF_MAP_STRING_GETS.load(Ordering::Relaxed),
+        PERF_MAP_STRING_CONTAINS.load(Ordering::Relaxed),
+        PERF_MAP_STRING_REMOVES.load(Ordering::Relaxed)
+    );
+}
 
 fn process_handles() -> &'static Mutex<HashMap<i64, ProcessHandle>> {
     PROCESS_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -160,6 +277,9 @@ unsafe fn forge_byte_buffer_mut<'a>(handle: i64) -> Option<&'a mut ForgeByteBuff
 }
 
 fn forge_bytes_from_vec(data: Vec<u8>) -> i64 {
+    ensure_perf_stats_registered();
+    perf_count(&PERF_BYTES_ALLOCS, 1);
+    perf_count(&PERF_BYTES_ALLOC_BYTES, data.len());
     Box::into_raw(Box::new(ForgeBytes { data })) as i64
 }
 
@@ -231,6 +351,7 @@ pub unsafe extern "C" fn forge_closure_get_env(handle: i64, slot: i64) -> i64 {
 /// Must be called before any other runtime functions
 #[no_mangle]
 pub unsafe extern "C" fn forge_runtime_init() {
+    ensure_perf_stats_registered();
     arc::init_cycle_collector();
 }
 
@@ -241,6 +362,7 @@ pub unsafe extern "C" fn forge_runtime_init() {
 #[no_mangle]
 pub unsafe extern "C" fn forge_runtime_shutdown() {
     arc::shutdown_cycle_collector();
+    dump_perf_stats();
 }
 
 /// Print a string to stdout
@@ -3337,12 +3459,16 @@ pub unsafe extern "C" fn forge_bytes_eq(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn forge_byte_buffer_new() -> i64 {
+    ensure_perf_stats_registered();
+    perf_count(&PERF_BYTE_BUFFER_NEWS, 1);
     Box::into_raw(Box::new(ForgeByteBuffer { data: Vec::new() })) as i64
 }
 
 #[no_mangle]
 pub extern "C" fn forge_byte_buffer_with_capacity(capacity: i64) -> i64 {
     let cap = if capacity > 0 { capacity as usize } else { 0 };
+    ensure_perf_stats_registered();
+    perf_count(&PERF_BYTE_BUFFER_NEWS, 1);
     Box::into_raw(Box::new(ForgeByteBuffer { data: Vec::with_capacity(cap) })) as i64
 }
 
@@ -3354,6 +3480,9 @@ pub unsafe extern "C" fn forge_byte_buffer_write(handle: i64, data: i64) -> i64 
     let Some(bytes) = forge_bytes_ref(data) else {
         return 0;
     };
+    ensure_perf_stats_registered();
+    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
+    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, bytes.data.len());
     buffer.data.extend_from_slice(&bytes.data);
     bytes.data.len() as i64
 }
@@ -3366,6 +3495,9 @@ pub unsafe extern "C" fn forge_byte_buffer_write_byte(handle: i64, value: i64) -
     if !(0..=255).contains(&value) {
         return 0;
     }
+    ensure_perf_stats_registered();
+    perf_count(&PERF_BYTE_BUFFER_WRITES, 1);
+    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, 1);
     buffer.data.push(value as u8);
     1
 }

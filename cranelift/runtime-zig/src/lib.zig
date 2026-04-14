@@ -40,6 +40,25 @@ const Channel = struct {
     state: ChannelState,
 };
 
+const MutexHandle = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    locked: bool = false,
+};
+
+const WaitGroupHandle = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    count: usize = 0,
+};
+
+const SemaphoreHandle = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    count: usize = 0,
+    max: usize = 0,
+};
+
 const forge_closure_env_slots = 16;
 
 const ForgeClosure = struct {
@@ -170,6 +189,21 @@ fn taskFromHandle(handle: i64) ?*Task {
 }
 
 fn channelFromHandle(handle: i64) ?*Channel {
+    if (handle == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(handle)));
+}
+
+fn mutexFromHandle(handle: i64) ?*MutexHandle {
+    if (handle == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(handle)));
+}
+
+fn waitGroupFromHandle(handle: i64) ?*WaitGroupHandle {
+    if (handle == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(handle)));
+}
+
+fn semaphoreFromHandle(handle: i64) ?*SemaphoreHandle {
     if (handle == 0) return null;
     return @ptrFromInt(@as(usize, @intCast(handle)));
 }
@@ -533,6 +567,90 @@ pub export fn forge_select_next_index(count: i64) i64 {
     if (count <= 1) return 0;
     const next = select_counter.fetchAdd(1, .monotonic);
     return @mod(next, count);
+}
+
+pub export fn forge_mutex_new() i64 {
+    const handle = allocator.create(MutexHandle) catch unsupported("out of memory");
+    handle.* = .{};
+    return @intCast(@intFromPtr(handle));
+}
+
+pub export fn forge_mutex_lock(handle: i64) void {
+    const mutex_handle = mutexFromHandle(handle) orelse return;
+    mutex_handle.mutex.lock();
+    defer mutex_handle.mutex.unlock();
+    while (mutex_handle.locked) {
+        mutex_handle.cond.wait(&mutex_handle.mutex);
+    }
+    mutex_handle.locked = true;
+}
+
+pub export fn forge_mutex_unlock(handle: i64) void {
+    const mutex_handle = mutexFromHandle(handle) orelse return;
+    mutex_handle.mutex.lock();
+    defer mutex_handle.mutex.unlock();
+    mutex_handle.locked = false;
+    mutex_handle.cond.signal();
+}
+
+pub export fn forge_waitgroup_new() i64 {
+    const handle = allocator.create(WaitGroupHandle) catch unsupported("out of memory");
+    handle.* = .{};
+    return @intCast(@intFromPtr(handle));
+}
+
+pub export fn forge_waitgroup_add(handle: i64, delta: i64) void {
+    const wg = waitGroupFromHandle(handle) orelse return;
+    wg.mutex.lock();
+    defer wg.mutex.unlock();
+    const next = @as(i64, @intCast(wg.count)) + delta;
+    wg.count = if (next > 0) @intCast(next) else 0;
+    if (wg.count == 0) wg.cond.broadcast();
+}
+
+pub export fn forge_waitgroup_done(handle: i64) void {
+    const wg = waitGroupFromHandle(handle) orelse return;
+    wg.mutex.lock();
+    defer wg.mutex.unlock();
+    if (wg.count > 0) wg.count -= 1;
+    if (wg.count == 0) wg.cond.broadcast();
+}
+
+pub export fn forge_waitgroup_wait(handle: i64) void {
+    const wg = waitGroupFromHandle(handle) orelse return;
+    wg.mutex.lock();
+    defer wg.mutex.unlock();
+    while (wg.count > 0) {
+        wg.cond.wait(&wg.mutex);
+    }
+}
+
+pub export fn forge_semaphore_new(initial: i64) i64 {
+    const handle = allocator.create(SemaphoreHandle) catch unsupported("out of memory");
+    const count = if (initial > 0) @as(usize, @intCast(initial)) else 0;
+    handle.* = .{
+        .count = count,
+        .max = count,
+    };
+    return @intCast(@intFromPtr(handle));
+}
+
+pub export fn forge_semaphore_acquire(handle: i64) void {
+    const sem = semaphoreFromHandle(handle) orelse return;
+    sem.mutex.lock();
+    defer sem.mutex.unlock();
+    while (sem.count == 0) {
+        sem.cond.wait(&sem.mutex);
+    }
+    sem.count -= 1;
+}
+
+pub export fn forge_semaphore_release(handle: i64) void {
+    const sem = semaphoreFromHandle(handle) orelse return;
+    sem.mutex.lock();
+    defer sem.mutex.unlock();
+    if (sem.count < sem.max) sem.count += 1;
+    sem.cond.signal();
 }
 
 pub export fn forge_list_new_default() i64 {

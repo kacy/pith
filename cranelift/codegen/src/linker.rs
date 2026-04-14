@@ -114,6 +114,8 @@ fn rebuild_zig_runtime() {
     let _ = Command::new("zig")
         .args(["build", "-Doptimize=ReleaseFast"])
         .current_dir(runtime_root)
+        .env("ZIG_GLOBAL_CACHE_DIR", ".zig-global-cache")
+        .env("ZIG_LOCAL_CACHE_DIR", ".zig-local-cache")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

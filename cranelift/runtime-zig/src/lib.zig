@@ -7,6 +7,7 @@ const c = @cImport({
     @cInclude("stdlib.h");
     @cInclude("string.h");
     @cInclude("sys/stat.h");
+    @cInclude("poll.h");
     @cInclude("unistd.h");
 });
 
@@ -659,29 +660,108 @@ pub export fn forge_list_dir(path: [*c]const u8) i64 {
     return list;
 }
 
-pub export fn forge_tcp_connect(_: [*c]const u8, _: i64) i64 {
-    return 0;
+pub export fn forge_tcp_listen(addr: [*c]const u8, port: i64) i64 {
+    const host = if (addr == null) "0.0.0.0" else span(addr);
+    const address = std.net.Address.resolveIp(host, @intCast(port)) catch return 0;
+    var server = address.listen(.{ .reuse_address = true }) catch return 0;
+    const fd = server.stream.handle;
+    server.stream.handle = -1;
+    return fd;
 }
 
-pub export fn forge_tcp_read_bytes(_: i64, _: i64) i64 {
-    return 0;
+pub export fn forge_tcp_connect(addr: [*c]const u8, port: i64) i64 {
+    const host = if (addr == null) "127.0.0.1" else span(addr);
+    const stream = std.net.tcpConnectToHost(allocator, host, @intCast(port)) catch return 0;
+    return stream.handle;
 }
 
-pub export fn forge_tcp_wait_readable(_: i64, _: i64) i64 {
-    return 0;
+pub export fn forge_tcp_accept(server_fd: i64) i64 {
+    if (server_fd <= 0) return 0;
+    var server = std.net.Server{
+        .listen_address = undefined,
+        .stream = .{ .handle = @intCast(server_fd) },
+    };
+    const conn = server.accept() catch return 0;
+    return conn.stream.handle;
 }
 
-pub export fn forge_tcp_write_bytes(_: i64, _: i64) i64 {
-    return 0;
+pub export fn forge_tcp_read(conn_fd: i64) [*c]u8 {
+    return forge_tcp_read2(conn_fd, 4096);
 }
 
-pub export fn forge_tcp_wait_writable(_: i64, _: i64) i64 {
-    return 0;
+pub export fn forge_tcp_read2(conn_fd: i64, max_bytes: i64) [*c]u8 {
+    const bytes_handle = forge_tcp_read_bytes(conn_fd, max_bytes);
+    if (bytes_handle == 0) return null;
+    return forge_bytes_to_string_utf8(bytes_handle);
+}
+
+pub export fn forge_tcp_read_bytes(conn_fd: i64, max_bytes: i64) i64 {
+    if (conn_fd <= 0) return 0;
+    const size: usize = if (max_bytes > 0) @intCast(max_bytes) else 4096;
+    const buf = allocator.alloc(u8, size) catch unsupported("out of memory");
+    const n = c.read(@intCast(conn_fd), buf.ptr, size);
+    if (n < 0) return 0;
+    return allocBytesFromSlice(buf[0..@intCast(n)]);
+}
+
+pub export fn forge_tcp_wait_readable(fd: i64, timeout_ms: i64) i64 {
+    if (fd <= 0) return -1;
+    var poll_fd = c.struct_pollfd{
+        .fd = @intCast(fd),
+        .events = c.POLLIN,
+        .revents = 0,
+    };
+    const timeout: c_int = if (timeout_ms < 0) -1 else if (timeout_ms > std.math.maxInt(c_int)) std.math.maxInt(c_int) else @intCast(timeout_ms);
+    const status = c.poll(&poll_fd, 1, timeout);
+    if (status > 0) return 1;
+    if (status == 0) return 0;
+    return -1;
+}
+
+pub export fn forge_tcp_write(conn_fd: i64, data: [*c]const u8) i64 {
+    if (data == null) return 0;
+    return forge_tcp_write_bytes(conn_fd, forge_bytes_from_string_utf8(data));
+}
+
+pub export fn forge_tcp_write_bytes(conn_fd: i64, data: i64) i64 {
+    if (conn_fd <= 0) return 0;
+    const bytes = bytesFromHandle(data) orelse return 0;
+    const n = c.write(@intCast(conn_fd), bytes.data.ptr, bytes.data.len);
+    return if (n < 0) 0 else @intCast(n);
+}
+
+pub export fn forge_tcp_wait_writable(fd: i64, timeout_ms: i64) i64 {
+    if (fd <= 0) return -1;
+    var poll_fd = c.struct_pollfd{
+        .fd = @intCast(fd),
+        .events = c.POLLOUT,
+        .revents = 0,
+    };
+    const timeout: c_int = if (timeout_ms < 0) -1 else if (timeout_ms > std.math.maxInt(c_int)) std.math.maxInt(c_int) else @intCast(timeout_ms);
+    const status = c.poll(&poll_fd, 1, timeout);
+    if (status > 0) return 1;
+    if (status == 0) return 0;
+    return -1;
 }
 
 pub export fn forge_tcp_set_timeout(_: i64, _: i64) void {}
 
-pub export fn forge_tcp_close(_: i64) void {}
+pub export fn forge_tcp_close(fd: i64) void {
+    if (fd <= 0) return;
+    _ = c.close(@intCast(fd));
+}
+
+pub export fn forge_dns_resolve(hostname: [*c]const u8) [*c]u8 {
+    if (hostname == null) return null;
+    const host = span(hostname);
+    if (std.mem.eql(u8, host, "localhost")) {
+        return allocCString("127.0.0.1");
+    }
+    const address = std.net.Address.resolveIp(host, 0) catch return null;
+    var buf: [128]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{f}", .{address}) catch return null;
+    return allocCString(text);
+}
 
 pub export fn forge_process_spawn(cmd: [*c]const u8) i64 {
     if (cmd == null) return 0;

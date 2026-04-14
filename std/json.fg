@@ -165,9 +165,27 @@ fn is_number_char(c: String) -> Bool:
 fn scan_whitespace(c: String) -> Bool:
     return c == " " or c == chr(9) or c == chr(10) or c == chr(13)
 
-fn scan_object_value_start(input: String, key: String) -> Int:
+fn scan_object_key_matches(input: String, key: String, pos: Int) -> Bool:
     dq := chr(34)
-    key_pos := input.index_of(dq + key + dq)
+    if pos < 0 or pos >= input.len() or input[pos] != dq:
+        return false
+    if pos + key.len() + 1 >= input.len():
+        return false
+    mut i := 0
+    while i < key.len():
+        if input[pos + 1 + i] != key[i]:
+            return false
+        i = i + 1
+    return input[pos + key.len() + 1] == dq
+
+fn scan_object_value_start(input: String, key: String) -> Int:
+    mut key_pos := -1
+    mut scan_pos := 0
+    while scan_pos < input.len():
+        if scan_object_key_matches(input, key, scan_pos):
+            key_pos = scan_pos
+            break
+        scan_pos = scan_pos + 1
     if key_pos < 0:
         return -1
     mut pos := key_pos + key.len() + 2

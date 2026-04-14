@@ -362,26 +362,6 @@ pub unsafe extern "C" fn forge_closure_get_env(handle: i64, slot: i64) -> i64 {
     }
 }
 
-/// Initialize the runtime
-///
-/// # Safety
-/// Must be called before any other runtime functions
-#[no_mangle]
-pub unsafe extern "C" fn forge_runtime_init() {
-    ensure_perf_stats_registered();
-    arc::init_cycle_collector();
-}
-
-/// Clean up the runtime
-///
-/// # Safety
-/// Should be called at program exit
-#[no_mangle]
-pub unsafe extern "C" fn forge_runtime_shutdown() {
-    arc::shutdown_cycle_collector();
-    dump_perf_stats();
-}
-
 /// Print a string to stdout
 ///
 /// # Safety
@@ -555,40 +535,6 @@ pub unsafe extern "C" fn forge_cstring_eq(a: *const i8, b: *const i8) -> i64 {
     }
 }
 
-/// Compare two C strings lexicographically (like strcmp).
-/// Returns negative if a < b, 0 if equal, positive if a > b.
-#[no_mangle]
-pub unsafe extern "C" fn forge_cstring_cmp(a: *const i8, b: *const i8) -> i64 {
-    if a.is_null() && b.is_null() {
-        return 0;
-    }
-    if a.is_null() {
-        return -1;
-    }
-    if b.is_null() {
-        return 1;
-    }
-
-    let mut pa = a;
-    let mut pb = b;
-
-    loop {
-        let ca = *pa as u8;
-        let cb = *pb as u8;
-
-        if ca != cb {
-            return (ca as i64) - (cb as i64);
-        }
-
-        if ca == 0 {
-            return 0;
-        }
-
-        pa = pa.add(1);
-        pb = pb.add(1);
-    }
-}
-
 /// Get ASCII value of first char in C string (ord)
 #[no_mangle]
 pub unsafe extern "C" fn forge_ord_cstr(s: *const i8) -> i64 {
@@ -642,22 +588,6 @@ pub extern "C" fn forge_assert_ne(a: i64, b: i64) {
         TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
         eprintln!("Assertion failed: {} == {}", a, b);
     }
-}
-
-/// Check if any test failed
-#[no_mangle]
-pub extern "C" fn forge_test_result() -> i64 {
-    if TEST_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
-        1
-    } else {
-        0
-    }
-}
-
-/// Reset test state
-#[no_mangle]
-pub extern "C" fn forge_test_reset() {
-    TEST_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Bitwise AND
@@ -2660,29 +2590,6 @@ pub unsafe extern "C" fn forge_format_time_fmt(timestamp_ms: i64, _fmt: *const i
     ptr
 }
 
-/// Format time as string — no-arg version (returns current timestamp)
-#[no_mangle]
-pub extern "C" fn forge_format_time() -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let s = ts.to_string();
-    let bytes = s.as_bytes();
-    let layout = Layout::from_size_align(bytes.len() + 1, 1).unwrap();
-    let ptr = unsafe { alloc(layout) as *mut i8 };
-    if !ptr.is_null() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-            *ptr.add(bytes.len()) = 0;
-        }
-    }
-    ptr
-}
-
 /// Write string to file path
 /// Returns 1 on success, 0 on failure
 ///
@@ -2773,12 +2680,6 @@ pub unsafe extern "C" fn forge_smart_to_string(val: i64) -> *mut i8 {
     } else {
         forge_strdup(val as *const i8)
     }
-}
-
-/// Identity function — returns its argument unchanged
-#[no_mangle]
-pub extern "C" fn forge_identity(x: i64) -> i64 {
-    x
 }
 
 /// Spawn a child process and return a process handle
@@ -3407,22 +3308,6 @@ pub unsafe extern "C" fn forge_byte_buffer_clear(handle: i64) {
     }
 }
 
-/// Split string into a list of single-character strings (chars)
-/// Return type of a value as string (stub — returns "any")
-#[no_mangle]
-pub extern "C" fn forge_type_of(_val: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-    let s = b"any\0";
-    let layout = Layout::from_size_align(s.len(), 1).unwrap();
-    let ptr = unsafe { alloc(layout) as *mut i8 };
-    if !ptr.is_null() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(s.as_ptr(), ptr as *mut u8, s.len());
-        }
-    }
-    ptr
-}
-
 /// Generic second(a, b) — returns second argument
 #[no_mangle]
 pub extern "C" fn forge_second(_a: i64, b: i64) -> i64 {
@@ -3969,8 +3854,7 @@ pub unsafe extern "C" fn forge_args_to_list() -> i64 {
 
 // Re-export concurrency primitive FFI functions
 pub use concurrency::{
-    forge_mutex_free, forge_mutex_lock, forge_mutex_new, forge_mutex_unlock,
-    forge_semaphore_acquire, forge_semaphore_free, forge_semaphore_new, forge_semaphore_release,
-    forge_waitgroup_add, forge_waitgroup_done, forge_waitgroup_free, forge_waitgroup_new,
-    forge_waitgroup_wait,
+    forge_mutex_lock, forge_mutex_new, forge_mutex_unlock, forge_semaphore_acquire,
+    forge_semaphore_new, forge_semaphore_release, forge_waitgroup_add, forge_waitgroup_done,
+    forge_waitgroup_new, forge_waitgroup_wait,
 };

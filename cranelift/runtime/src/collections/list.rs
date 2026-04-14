@@ -166,18 +166,6 @@ impl ListImpl {
         }
     }
 
-    fn insert(&mut self, index: usize, elem: &[u8]) {
-        if self.uses_value_storage() {
-            if index <= self.values8.len() {
-                self.values8
-                    .insert(index, unsafe { std::ptr::read_unaligned(elem.as_ptr() as *const i64) });
-                self.sync_value_view();
-            }
-        } else if index <= self.elements.len() {
-            self.elements.insert(index, elem.to_vec());
-        }
-    }
-
     fn remove(&mut self, index: usize) -> Option<Vec<u8>> {
         if self.uses_value_storage() {
             if index < self.values8.len() {
@@ -599,45 +587,6 @@ pub unsafe extern "C" fn forge_list_set(
     true
 }
 
-/// Insert element at index
-///
-/// Returns true if successful
-#[no_mangle]
-pub unsafe extern "C" fn forge_list_insert(
-    list: *mut ForgeList,
-    index: i64,
-    elem: *const u8,
-    elem_size: i64,
-) -> bool {
-    if list.is_null() || (*list).ptr.is_null() || elem.is_null() {
-        return false;
-    }
-
-    let impl_ref = &mut *((*list).ptr as *mut ListImpl);
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_LIST_INSERTS, 1);
-
-    if index < 0 || index > impl_ref.len() as i64 {
-        return false;
-    }
-
-    if impl_ref.elem_size != elem_size as usize {
-        eprintln!("forge: list element size mismatch");
-        return false;
-    }
-
-    let elem_slice = std::slice::from_raw_parts(elem, elem_size as usize);
-
-    // Retain element
-    if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let s = elem as *const ForgeString;
-        forge_string_retain(*s);
-    }
-
-    impl_ref.insert(index as usize, elem_slice);
-    true
-}
-
 /// Remove element at index
 ///
 /// Returns true if successful
@@ -803,29 +752,6 @@ pub unsafe extern "C" fn forge_list_release(list: ForgeList) {
     let _ = Box::from_raw(list.ptr as *mut ListImpl);
 }
 
-/// Check if list contains a string element
-#[no_mangle]
-pub unsafe extern "C" fn forge_list_contains_string(list: ForgeList, s: ForgeString) -> bool {
-    if list.ptr.is_null() {
-        return false;
-    }
-
-    let impl_ref = &*(list.ptr as *const ListImpl);
-
-    if !matches!(impl_ref.type_tag, ListTypeTag::String) {
-        return false;
-    }
-
-    for i in 0..impl_ref.len() {
-        let elem_s = impl_ref.get_value(i).unwrap() as *const ForgeString;
-        if crate::string::forge_string_eq(*elem_s, s) {
-            return true;
-        }
-    }
-
-    false
-}
-
 /// Check if a list of C-string pointers contains the given C-string.
 #[no_mangle]
 pub unsafe extern "C" fn forge_list_contains_cstr(list_handle: i64, s: *const i8) -> i64 {
@@ -853,29 +779,6 @@ pub unsafe extern "C" fn forge_list_contains_cstr(list_handle: i64, s: *const i8
     }
 
     0
-}
-
-/// Find index of string in list
-#[no_mangle]
-pub unsafe extern "C" fn forge_list_index_of_string(list: ForgeList, s: ForgeString) -> i64 {
-    if list.ptr.is_null() {
-        return -1;
-    }
-
-    let impl_ref = &*(list.ptr as *const ListImpl);
-
-    if !matches!(impl_ref.type_tag, ListTypeTag::String) {
-        return -1;
-    }
-
-    for i in 0..impl_ref.len() {
-        let elem_s = impl_ref.get_value(i).unwrap() as *const ForgeString;
-        if crate::string::forge_string_eq(*elem_s, s) {
-            return i as i64;
-        }
-    }
-
-    -1
 }
 
 /// Find the index of a C-string in a list of C-string pointers.
@@ -925,44 +828,6 @@ pub unsafe extern "C" fn forge_list_index_of_int(list: ForgeList, value: i64) ->
     -1
 }
 
-/// Retain all elements (for string lists during copy)
-#[no_mangle]
-pub unsafe extern "C" fn forge_list_retain_all_strings(list: ForgeList) {
-    if list.ptr.is_null() {
-        return;
-    }
-
-    let impl_ref = &*(list.ptr as *const ListImpl);
-
-    if !matches!(impl_ref.type_tag, ListTypeTag::String) {
-        return;
-    }
-
-    for i in 0..impl_ref.len() {
-        let s = impl_ref.get_value(i).unwrap() as *const ForgeString;
-        forge_string_retain(*s);
-    }
-}
-
-/// Release all elements (for cleanup)
-#[no_mangle]
-pub unsafe extern "C" fn forge_list_release_all_strings(list: ForgeList) {
-    if list.ptr.is_null() {
-        return;
-    }
-
-    let impl_ref = &*(list.ptr as *const ListImpl);
-
-    if !matches!(impl_ref.type_tag, ListTypeTag::String) {
-        return;
-    }
-
-    for i in 0..impl_ref.len() {
-        let s = impl_ref.get_value(i).unwrap() as *const ForgeString;
-        forge_string_release(*s);
-    }
-}
-
 /// Check if list contains an integer value
 #[no_mangle]
 pub unsafe extern "C" fn forge_list_contains_int(list: ForgeList, value: i64) -> i64 {
@@ -979,12 +844,6 @@ pub unsafe extern "C" fn forge_list_contains_int(list: ForgeList, value: i64) ->
     }
 
     0
-}
-
-/// Check if list is empty
-#[no_mangle]
-pub extern "C" fn forge_list_is_empty_int(list: ForgeList) -> i64 {
-    forge_list_is_empty(list)
 }
 
 /// Destructor for list elements in collections

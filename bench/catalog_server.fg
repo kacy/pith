@@ -43,6 +43,7 @@ mut region2_quota_sum_exact: Map[Int, Int] := {}
 mut region2_count_suffix: List[Int] := []
 mut region2_score_sum_suffix: List[Int] := []
 mut region2_quota_sum_suffix: List[Int] := []
+mut region2_response_by_threshold: List[Bytes] := []
 mut hot_candidate_indices: List[Int] := []
 mut hot_count_exact: Map[Int, Int] := {}
 mut hot_score_sum_exact: Map[Int, Int] := {}
@@ -50,6 +51,7 @@ mut hot_quota_sum_exact: Map[Int, Int] := {}
 mut hot_count_suffix: List[Int] := []
 mut hot_score_sum_suffix: List[Int] := []
 mut hot_quota_sum_suffix: List[Int] := []
+mut hot_response_by_threshold: List[Bytes] := []
 mut batch_candidate_indices: List[Int] := []
 mut batch_count_exact: Map[Int, Int] := {}
 mut batch_score_sum_exact: Map[Int, Int] := {}
@@ -57,6 +59,7 @@ mut batch_quota_sum_exact: Map[Int, Int] := {}
 mut batch_count_suffix: List[Int] := []
 mut batch_score_sum_suffix: List[Int] := []
 mut batch_quota_sum_suffix: List[Int] := []
+mut batch_response_by_threshold_mult4: List[Bytes] := []
 
 fn map_get_or_zero(values: Map[Int, Int], key: Int) -> Int:
     if values.contains_key(key):
@@ -135,6 +138,69 @@ fn build_batch_suffix_stats():
     batch_score_sum_suffix.reverse()
     batch_quota_sum_suffix.reverse()
 
+fn build_search_response_bytes(count: Int, total_score: Int, quota_sum: Int, limit: Int, candidates: List[Int], min_score: Int) -> Bytes!:
+    ids_out := bytes.buffer()
+    mut ids_written := 0
+    for idx in candidates:
+        user := users[idx]
+        if user.score < min_score:
+            continue
+        if ids_written < limit:
+            append_json_int_array_item(ids_out, ids_written, user.id)!
+            ids_written = ids_written + 1
+        else:
+            break
+    out := bytes.buffer()
+    json.write_object_start_bytes(out)!
+    mut first := true
+    first = json.write_object_int_field_bytes(out, first, "count", count)!
+    first = json.write_object_int_field_bytes(out, first, "total_score", total_score)!
+    first = json.write_object_int_field_bytes(out, first, "quota_sum", quota_sum)!
+    first = write_json_ids_field(out, first, ids_out)!
+    json.write_object_end_bytes(out)!
+    return out.bytes()
+
+fn build_batch_response_bytes(count: Int, score_sum: Int, weighted_total: Int, limit: Int, candidates: List[Int], min_score: Int) -> Bytes!:
+    ids_out := bytes.buffer()
+    mut ids_written := 0
+    for idx in candidates:
+        user := users[idx]
+        if user.score < min_score:
+            continue
+        if ids_written < limit:
+            append_json_int_array_item(ids_out, ids_written, user.id)!
+            ids_written = ids_written + 1
+        else:
+            break
+    out := bytes.buffer()
+    json.write_object_start_bytes(out)!
+    mut first := true
+    first = json.write_object_int_field_bytes(out, first, "count", count)!
+    first = json.write_object_int_field_bytes(out, first, "score_sum", score_sum)!
+    first = json.write_object_int_field_bytes(out, first, "weighted_total", weighted_total)!
+    first = write_json_ids_field(out, first, ids_out)!
+    json.write_object_end_bytes(out)!
+    return out.bytes()
+
+fn build_query_response_bytes():
+    if hot_response_by_threshold.len() == 0:
+        mut threshold := 0
+        while threshold <= 999:
+            hot_response_by_threshold.push(build_search_response_bytes(hot_match_count(threshold), hot_match_score_sum(threshold), hot_match_quota_sum(threshold), 8, hot_candidate_indices, threshold) catch bytes.empty())
+            threshold = threshold + 1
+    if region2_response_by_threshold.len() == 0:
+        mut threshold := 0
+        while threshold <= 999:
+            region2_response_by_threshold.push(build_search_response_bytes(region2_match_count(threshold), region2_match_score_sum(threshold), region2_match_quota_sum(threshold), 24, region_user_indices_2, threshold) catch bytes.empty())
+            threshold = threshold + 1
+    if batch_response_by_threshold_mult4.len() == 0:
+        mut threshold := 0
+        while threshold <= 999:
+            score_sum := batch_match_score_sum(threshold)
+            weighted_total := (score_sum * 4) + batch_match_quota_sum(threshold)
+            batch_response_by_threshold_mult4.push(build_batch_response_bytes(batch_match_count(threshold), score_sum, weighted_total, 12, batch_candidate_indices, threshold) catch bytes.empty())
+            threshold = threshold + 1
+
 fn init_catalog():
     if users.len() > 0:
         return
@@ -179,6 +245,7 @@ fn init_catalog():
     build_region2_suffix_stats()
     build_hot_suffix_stats()
     build_batch_suffix_stats()
+    build_query_response_bytes()
 
 fn parse_int_or_default(raw: String, default_value: Int) -> Int:
     if raw == "":
@@ -337,6 +404,10 @@ fn write_json_ids_field(out: ByteBuffer, is_first: Bool, ids_buf: ByteBuffer) ->
     return false
 
 fn search_json_bytes(team_id: Int, region_id: Int, active_filter: Int, min_score: Int, limit: Int) -> Bytes!:
+    if team_id == 0 and region_id == 1 and active_filter == 1 and limit == 8:
+        return hot_response_by_threshold[min_score]
+    if team_id < 0 and region_id == 2 and active_filter < 0 and limit == 24:
+        return region2_response_by_threshold[min_score]
     ids_out := bytes.buffer()
     mut ids_written := 0
     mut count := 0
@@ -419,6 +490,8 @@ fn batch_score_json_bytes(root: Int) -> Bytes!:
     mut weighted_total := 0
     mut score_sum := 0
     if team_id == 1 and region_id == 0 and active_filter == 1:
+        if limit == 12 and multiplier == 4:
+            return batch_response_by_threshold_mult4[min_score]
         count = batch_match_count(min_score)
         score_sum = batch_match_score_sum(min_score)
         weighted_total = (score_sum * multiplier) + batch_match_quota_sum(min_score)

@@ -67,14 +67,3 @@ pub unsafe extern "C" fn forge_semaphore_release(handle: *mut ForgeSemaphoreHand
         cvar.notify_one();
     }
 }
-
-/// Free a Semaphore handle
-///
-/// # Safety
-/// handle must be a valid semaphore handle
-#[no_mangle]
-pub unsafe extern "C" fn forge_semaphore_free(handle: *mut ForgeSemaphoreHandle) {
-    if !handle.is_null() {
-        let _ = Box::from_raw(handle);
-    }
-}

@@ -3,7 +3,7 @@
 //! Hybrid approach: Uses hashbrown::HashSet internally for O(1) operations,
 //! but presents FFI-compatible interface matching the C runtime.
 
-use crate::string::{forge_string_release, forge_string_retain, ForgeString};
+use crate::string::{forge_string_release, ForgeString};
 use hashbrown::HashSet;
 use std::hash::{Hash, Hasher};
 
@@ -129,60 +129,6 @@ pub extern "C" fn forge_set_len(set: ForgeSet) -> i64 {
     }
 }
 
-/// Insert integer element
-///
-/// Returns true if element was inserted (was not already present)
-#[no_mangle]
-pub unsafe extern "C" fn forge_set_insert_int(set: *mut ForgeSet, elem: i64) -> bool {
-    if set.is_null() || (*set).ptr.is_null() {
-        return false;
-    }
-
-    let impl_ref = &mut *((*set).ptr as *mut SetImpl);
-
-    if !matches!(impl_ref.elem_type, ElemType::Int) {
-        eprintln!("forge: set element type mismatch (expected int)");
-        return false;
-    }
-
-    impl_ref.insert(SetElement::Int(elem))
-}
-
-/// Insert string element
-///
-/// Returns true if element was inserted (was not already present)
-#[no_mangle]
-pub unsafe extern "C" fn forge_set_insert_string(set: *mut ForgeSet, elem: ForgeString) -> bool {
-    if set.is_null() || (*set).ptr.is_null() {
-        return false;
-    }
-
-    let impl_ref = &mut *((*set).ptr as *mut SetImpl);
-
-    if !matches!(impl_ref.elem_type, ElemType::String) {
-        eprintln!("forge: set element type mismatch (expected string)");
-        return false;
-    }
-
-    // Copy element data
-    let elem_slice = std::slice::from_raw_parts(elem.ptr, elem.len as usize);
-    let elem_vec = elem_slice.to_vec();
-
-    // Retain the string as it's being stored
-    if impl_ref.elem_is_heap {
-        forge_string_retain(elem);
-    }
-
-    let was_inserted = impl_ref.insert(SetElement::String(elem_vec));
-
-    // If element already existed, we need to release the retained copy
-    if !was_inserted && impl_ref.elem_is_heap {
-        forge_string_release(elem);
-    }
-
-    was_inserted
-}
-
 /// Check if set contains integer element
 #[no_mangle]
 pub extern "C" fn forge_set_contains_int(set: ForgeSet, elem: i64) -> bool {
@@ -201,25 +147,6 @@ pub extern "C" fn forge_set_contains_int(set: ForgeSet, elem: i64) -> bool {
     }
 }
 
-/// Check if set contains string element
-#[no_mangle]
-pub unsafe extern "C" fn forge_set_contains_string(set: ForgeSet, elem: ForgeString) -> bool {
-    if set.ptr.is_null() {
-        return false;
-    }
-
-    let impl_ref = &*(set.ptr as *const SetImpl);
-
-    if !matches!(impl_ref.elem_type, ElemType::String) {
-        return false;
-    }
-
-    let elem_slice = std::slice::from_raw_parts(elem.ptr, elem.len as usize);
-    let set_elem = SetElement::String(elem_slice.to_vec());
-
-    impl_ref.contains(&set_elem)
-}
-
 /// Remove integer element from set
 ///
 /// Returns true if element was present and removed
@@ -236,34 +163,6 @@ pub unsafe extern "C" fn forge_set_remove_int(set: *mut ForgeSet, elem: i64) -> 
     }
 
     impl_ref.remove(&SetElement::Int(elem))
-}
-
-/// Remove string element from set
-///
-/// Returns true if element was present and removed
-#[no_mangle]
-pub unsafe extern "C" fn forge_set_remove_string(set: *mut ForgeSet, elem: ForgeString) -> bool {
-    if set.is_null() || (*set).ptr.is_null() {
-        return false;
-    }
-
-    let impl_ref = &mut *((*set).ptr as *mut SetImpl);
-
-    if !matches!(impl_ref.elem_type, ElemType::String) {
-        return false;
-    }
-
-    let elem_slice = std::slice::from_raw_parts(elem.ptr, elem.len as usize);
-    let set_elem = SetElement::String(elem_slice.to_vec());
-
-    let was_removed = impl_ref.remove(&set_elem);
-
-    // Release the element if it was present
-    if was_removed && impl_ref.elem_is_heap {
-        forge_string_release(elem);
-    }
-
-    was_removed
 }
 
 /// Clear all elements from set

@@ -75,14 +75,3 @@ pub unsafe extern "C" fn forge_waitgroup_wait(handle: *mut ForgeWaitGroupHandle)
         guard = cvar.wait(guard).unwrap();
     }
 }
-
-/// Free a WaitGroup handle
-///
-/// # Safety
-/// handle must be a valid waitgroup handle
-#[no_mangle]
-pub unsafe extern "C" fn forge_waitgroup_free(handle: *mut ForgeWaitGroupHandle) {
-    if !handle.is_null() {
-        let _ = Box::from_raw(handle);
-    }
-}

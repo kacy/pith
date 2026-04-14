@@ -2569,6 +2569,8 @@ fn ir_emit_method_call(idx: Int) -> Int:
     if ir_is_void_method(emit_name):
         ret_type = "void"
     call_args := ir_method_call_arg_regs(obj_r, arg_regs)
+    if emit_name == "identity" and not impl_dispatch:
+        return obj_r
     ir_emit_call_text(r, emit_name, ret_type, call_args.len(), ir_join_arg_regs(call_args))
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         return ir_emit_wrapped_legacy_result(r, ret_type, emit_name)

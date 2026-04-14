@@ -2,9 +2,11 @@ const std = @import("std");
 const abi = @import("runtime_abi");
 
 const c = @cImport({
+    @cInclude("fcntl.h");
     @cInclude("stdio.h");
     @cInclude("stdlib.h");
     @cInclude("string.h");
+    @cInclude("unistd.h");
 });
 
 const allocator = std.heap.c_allocator;
@@ -15,6 +17,10 @@ const ForgeBytes = struct {
 
 const ForgeByteBuffer = struct {
     data: std.ArrayListUnmanaged(u8) = .{},
+};
+
+const FileHandle = struct {
+    fd: c_int,
 };
 
 const Task = struct {
@@ -178,6 +184,11 @@ fn byteBufferFromHandle(handle: i64) ?*ForgeByteBuffer {
     return @ptrFromInt(@as(usize, @intCast(handle)));
 }
 
+fn fileFromHandle(handle: i64) ?*FileHandle {
+    if (handle == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(handle)));
+}
+
 fn closureFromHandle(handle: i64) ?*ForgeClosure {
     if (handle == 0) return null;
     return @ptrFromInt(@as(usize, @intCast(handle)));
@@ -274,6 +285,15 @@ fn taskWorker(task: *Task, closure_handle: i64) void {
     task.done = true;
     task.result = result;
     task.cond.broadcast();
+}
+
+fn openFile(path: [*c]const u8, flags: c_int) i64 {
+    if (path == null) return 0;
+    const fd = c.open(@ptrCast(path), flags, @as(c_uint, 0o666));
+    if (fd < 0) return 0;
+    const handle = allocator.create(FileHandle) catch unsupported("out of memory");
+    handle.* = .{ .fd = fd };
+    return @intCast(@intFromPtr(handle));
 }
 
 pub export fn forge_print_cstr(ptr: [*c]const u8) void {
@@ -378,6 +398,105 @@ pub export fn forge_time() i64 {
 pub export fn forge_format_time_fmt(timestamp_ms: i64, _: [*c]const u8) [*c]u8 {
     return forge_int_to_cstr(@divTrunc(timestamp_ms, 1000));
 }
+
+pub export fn forge_input() [*c]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+
+    while (true) {
+        const ch = c.getchar();
+        if (ch == c.EOF or ch == '\n') break;
+        out.append(allocator, @intCast(ch)) catch unsupported("out of memory");
+    }
+    if (out.items.len > 0 and out.items[out.items.len - 1] == '\r') {
+        _ = out.pop();
+    }
+    return allocCString(out.items);
+}
+
+pub export fn forge_file_open_read(path: [*c]const u8) i64 {
+    return openFile(path, c.O_RDONLY);
+}
+
+pub export fn forge_file_open_write(path: [*c]const u8) i64 {
+    return openFile(path, c.O_WRONLY | c.O_CREAT | c.O_TRUNC);
+}
+
+pub export fn forge_file_open_append(path: [*c]const u8) i64 {
+    return openFile(path, c.O_WRONLY | c.O_CREAT | c.O_APPEND);
+}
+
+pub export fn forge_file_read_bytes(handle: i64, max_bytes: i64) i64 {
+    const file = fileFromHandle(handle) orelse return 0;
+    const size: usize = if (max_bytes > 0) @intCast(max_bytes) else 4096;
+    const buf = allocator.alloc(u8, size) catch unsupported("out of memory");
+    const n = c.read(file.fd, buf.ptr, size);
+    if (n <= 0) return allocBytesFromSlice("");
+    return allocBytesFromSlice(buf[0..@intCast(n)]);
+}
+
+pub export fn forge_file_write_bytes(handle: i64, data: i64) i64 {
+    const file = fileFromHandle(handle) orelse return 0;
+    const bytes = bytesFromHandle(data) orelse return 0;
+    const n = c.write(file.fd, bytes.data.ptr, bytes.data.len);
+    if (n < 0) return 0;
+    return @intCast(n);
+}
+
+pub export fn forge_file_close(handle: i64) void {
+    const file = fileFromHandle(handle) orelse return;
+    _ = c.close(file.fd);
+}
+
+pub export fn forge_tcp_connect(_: [*c]const u8, _: i64) i64 {
+    return 0;
+}
+
+pub export fn forge_tcp_read_bytes(_: i64, _: i64) i64 {
+    return 0;
+}
+
+pub export fn forge_tcp_wait_readable(_: i64, _: i64) i64 {
+    return 0;
+}
+
+pub export fn forge_tcp_write_bytes(_: i64, _: i64) i64 {
+    return 0;
+}
+
+pub export fn forge_tcp_wait_writable(_: i64, _: i64) i64 {
+    return 0;
+}
+
+pub export fn forge_tcp_set_timeout(_: i64, _: i64) void {}
+
+pub export fn forge_tcp_close(_: i64) void {}
+
+pub export fn forge_process_spawn(_: [*c]const u8) i64 {
+    return 0;
+}
+
+pub export fn forge_process_write_bytes(_: i64, _: i64) i64 {
+    return 0;
+}
+
+pub export fn forge_process_read_bytes(_: i64, _: i64) i64 {
+    return 0;
+}
+
+pub export fn forge_process_read_err_bytes(_: i64, _: i64) i64 {
+    return 0;
+}
+
+pub export fn forge_process_wait(_: i64) i64 {
+    return 0;
+}
+
+pub export fn forge_process_kill(_: i64) i64 {
+    return 0;
+}
+
+pub export fn forge_process_close(_: i64) void {}
 
 pub export fn forge_spawn(closure_handle: i64) i64 {
     if (closure_handle == 0) return 0;

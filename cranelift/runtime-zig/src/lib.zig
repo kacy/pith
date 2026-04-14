@@ -28,6 +28,12 @@ const ProcessHandle = struct {
     child: std.process.Child,
 };
 
+const ProcessOutputHandle = struct {
+    status: i64,
+    stdout: []u8,
+    stderr: []u8,
+};
+
 const Task = struct {
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
@@ -199,6 +205,11 @@ fn processFromHandle(handle: i64) ?*ProcessHandle {
     return @ptrFromInt(@as(usize, @intCast(handle)));
 }
 
+fn processOutputFromHandle(handle: i64) ?*ProcessOutputHandle {
+    if (handle == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(handle)));
+}
+
 fn closureFromHandle(handle: i64) ?*ForgeClosure {
     if (handle == 0) return null;
     return @ptrFromInt(@as(usize, @intCast(handle)));
@@ -313,6 +324,33 @@ fn writeFileBytes(path: []const u8, data: []const u8, flags: c_int) i64 {
     defer _ = c.close(fd);
     const n = c.write(fd, data.ptr, data.len);
     return if (n < 0) 0 else 1;
+}
+
+fn listCStringAt(list: *ListImpl, idx: usize) ?[]const u8 {
+    if (list.values8_ptr == null or idx >= list.values8_len) return null;
+    const ptr_val = list.values8_ptr.?[idx];
+    if (ptr_val == 0) return null;
+    const ptr: [*c]const u8 = @ptrFromInt(@as(usize, @intCast(ptr_val)));
+    return span(ptr);
+}
+
+fn termStatus(term: std.process.Child.Term) i64 {
+    return switch (term) {
+        .Exited => |code| code,
+        else => -1,
+    };
+}
+
+fn buildCommandArgv(program: [*c]const u8, argv_handle: i64, out: *std.ArrayList([]const u8)) bool {
+    if (program == null) return false;
+    out.append(allocator, span(program)) catch unsupported("out of memory");
+    const argv_list = listFromHandle(argv_handle) orelse return true;
+    var idx: usize = 0;
+    while (idx < argv_list.values8_len) : (idx += 1) {
+        const item = listCStringAt(argv_list, idx) orelse continue;
+        out.append(allocator, item) catch unsupported("out of memory");
+    }
+    return true;
 }
 
 pub export fn forge_print_cstr(ptr: [*c]const u8) void {
@@ -661,6 +699,139 @@ pub export fn forge_process_spawn(cmd: [*c]const u8) i64 {
         return 0;
     };
     return @intCast(@intFromPtr(handle));
+}
+
+pub export fn forge_process_spawn_argv(
+    program: [*c]const u8,
+    argv_handle: i64,
+    cwd: [*c]const u8,
+    env_keys_handle: i64,
+    env_values_handle: i64,
+) i64 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    if (!buildCommandArgv(program, argv_handle, &argv)) return 0;
+
+    const handle = allocator.create(ProcessHandle) catch unsupported("out of memory");
+    handle.* = .{
+        .child = std.process.Child.init(argv.items, allocator),
+    };
+    handle.child.stdin_behavior = .Pipe;
+    handle.child.stdout_behavior = .Pipe;
+    handle.child.stderr_behavior = .Pipe;
+    if (cwd != null and cwd[0] != 0) {
+        handle.child.cwd = span(cwd);
+    }
+
+    var env_map = std.process.getEnvMap(allocator) catch std.process.EnvMap.init(allocator);
+    const env_keys = listFromHandle(env_keys_handle);
+    const env_values = listFromHandle(env_values_handle);
+    if (env_keys != null and env_values != null) {
+        const limit = @min(env_keys.?.values8_len, env_values.?.values8_len);
+        var idx: usize = 0;
+        while (idx < limit) : (idx += 1) {
+            const key = listCStringAt(env_keys.?, idx) orelse continue;
+            const value = listCStringAt(env_values.?, idx) orelse continue;
+            env_map.put(key, value) catch unsupported("out of memory");
+        }
+    }
+    handle.child.env_map = &env_map;
+    handle.child.spawn() catch {
+        env_map.deinit();
+        allocator.destroy(handle);
+        return 0;
+    };
+    return @intCast(@intFromPtr(handle));
+}
+
+pub export fn forge_process_output_argv(
+    program: [*c]const u8,
+    argv_handle: i64,
+    cwd: [*c]const u8,
+    env_keys_handle: i64,
+    env_values_handle: i64,
+) i64 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    if (!buildCommandArgv(program, argv_handle, &argv)) return 0;
+
+    var env_map = std.process.getEnvMap(allocator) catch std.process.EnvMap.init(allocator);
+    defer env_map.deinit();
+    const env_keys = listFromHandle(env_keys_handle);
+    const env_values = listFromHandle(env_values_handle);
+    if (env_keys != null and env_values != null) {
+        const limit = @min(env_keys.?.values8_len, env_values.?.values8_len);
+        var idx: usize = 0;
+        while (idx < limit) : (idx += 1) {
+            const key = listCStringAt(env_keys.?, idx) orelse continue;
+            const value = listCStringAt(env_values.?, idx) orelse continue;
+            env_map.put(key, value) catch unsupported("out of memory");
+        }
+    }
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv.items,
+        .cwd = if (cwd != null and cwd[0] != 0) span(cwd) else null,
+        .env_map = &env_map,
+        .max_output_bytes = 1024 * 1024,
+    }) catch return 0;
+
+    const output = allocator.create(ProcessOutputHandle) catch unsupported("out of memory");
+    output.* = .{
+        .status = termStatus(result.term),
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+    };
+    return @intCast(@intFromPtr(output));
+}
+
+pub export fn forge_process_output_status(handle: i64) i64 {
+    const output = processOutputFromHandle(handle) orelse return -1;
+    return output.status;
+}
+
+pub export fn forge_process_output_close(handle: i64) void {
+    const output = processOutputFromHandle(handle) orelse return;
+    allocator.free(output.stdout);
+    allocator.free(output.stderr);
+    allocator.destroy(output);
+}
+
+pub export fn forge_process_output_stdout(handle: i64) [*c]u8 {
+    const output = processOutputFromHandle(handle) orelse return null;
+    return allocCString(output.stdout);
+}
+
+pub export fn forge_process_output_stderr(handle: i64) [*c]u8 {
+    const output = processOutputFromHandle(handle) orelse return null;
+    return allocCString(output.stderr);
+}
+
+pub export fn forge_exec(command: [*c]const u8) i64 {
+    if (command == null) return -1;
+    const argv = [_][]const u8{ "/bin/sh", "-lc", span(command) };
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &argv,
+        .max_output_bytes = 1024,
+    }) catch return -1;
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
+    return termStatus(result.term);
+}
+
+pub export fn forge_exec_output(command: [*c]const u8) [*c]u8 {
+    if (command == null) return null;
+    const argv = [_][]const u8{ "/bin/sh", "-lc", span(command) };
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &argv,
+        .max_output_bytes = 1024 * 1024,
+    }) catch return null;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return allocCString(result.stdout);
 }
 
 pub export fn forge_process_write_bytes(handle: i64, data: i64) i64 {
@@ -1108,6 +1279,18 @@ pub export fn forge_list_reverse_value(list_handle: i64) void {
 pub export fn forge_list_clear_value(list_handle: i64) void {
     const list = listFromHandle(list_handle) orelse return;
     list.values8_len = 0;
+}
+
+pub export fn forge_list_index_of_cstr(list_handle: i64, s: [*c]const u8) i64 {
+    const list = listFromHandle(list_handle) orelse return -1;
+    if (s == null or list.values8_ptr == null) return -1;
+    const needle = span(s);
+    var idx: usize = 0;
+    while (idx < list.values8_len) : (idx += 1) {
+        const item = listCStringAt(list, idx) orelse continue;
+        if (std.mem.eql(u8, item, needle)) return @intCast(idx);
+    }
+    return -1;
 }
 
 pub export fn forge_auto_len(ptr: i64) i64 {

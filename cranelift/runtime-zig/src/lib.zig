@@ -17,6 +17,13 @@ const ForgeByteBuffer = struct {
     data: std.ArrayListUnmanaged(u8) = .{},
 };
 
+const forge_closure_env_slots = 16;
+
+const ForgeClosure = struct {
+    func_ptr: i64,
+    env: [forge_closure_env_slots]i64 = [_]i64{0} ** forge_closure_env_slots,
+};
+
 const ListImpl = extern struct {
     magic: u32,
     _pad0: u32,
@@ -125,6 +132,11 @@ fn byteBufferFromHandle(handle: i64) ?*ForgeByteBuffer {
     return @ptrFromInt(@as(usize, @intCast(handle)));
 }
 
+fn closureFromHandle(handle: i64) ?*ForgeClosure {
+    if (handle == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(handle)));
+}
+
 fn listSlice(list: *ListImpl) []i64 {
     if (list.values8_ptr == null or list.values8_cap == 0) return &.{};
     const ptr = list.values8_ptr.?;
@@ -197,6 +209,10 @@ pub export fn forge_cstring_compare(a: [*c]const u8, b: [*c]const u8) i64 {
     return cmpCStrings(a, b);
 }
 
+pub export fn forge_cstring_len(s: [*c]const u8) i64 {
+    return @intCast(strlen(s));
+}
+
 pub export fn forge_cstring_contains(haystack: [*c]const u8, needle: [*c]const u8) i64 {
     const haystack_bytes = span(haystack);
     const needle_bytes = span(needle);
@@ -225,6 +241,34 @@ pub export fn forge_chr_cstr(n: i64) [*c]u8 {
     var buf: [5]u8 = [_]u8{0} ** 5;
     const len = std.unicode.utf8Encode(@intCast(n), buf[0..4]) catch return allocCString("");
     return allocCString(buf[0..len]);
+}
+
+pub export fn forge_ord_cstr(s: [*c]const u8) i64 {
+    if (s == null or s[0] == 0) return 0;
+    return s[0];
+}
+
+pub export fn forge_closure_new(func_ptr: i64) i64 {
+    const closure = allocator.create(ForgeClosure) catch unsupported("out of memory");
+    closure.* = .{ .func_ptr = func_ptr };
+    return @intCast(@intFromPtr(closure));
+}
+
+pub export fn forge_closure_get_fn(handle: i64) i64 {
+    const closure = closureFromHandle(handle) orelse return 0;
+    return closure.func_ptr;
+}
+
+pub export fn forge_closure_set_env(handle: i64, slot: i64, value: i64) void {
+    if (slot < 0 or slot >= forge_closure_env_slots) return;
+    const closure = closureFromHandle(handle) orelse return;
+    closure.env[@intCast(slot)] = value;
+}
+
+pub export fn forge_closure_get_env(handle: i64, slot: i64) i64 {
+    if (slot < 0 or slot >= forge_closure_env_slots) return 0;
+    const closure = closureFromHandle(handle) orelse return 0;
+    return closure.env[@intCast(slot)];
 }
 
 pub export fn forge_list_new_default() i64 {
@@ -281,6 +325,36 @@ pub export fn forge_list_get_value_unchecked(list_handle: i64, index: i64) i64 {
 pub export fn forge_list_len(list_handle: i64) i64 {
     const list = listFromHandle(list_handle) orelse return 0;
     return @intCast(list.values8_len);
+}
+
+pub export fn forge_list_join(list_handle: i64, sep: [*c]const u8) [*c]u8 {
+    const list = listFromHandle(list_handle) orelse return null;
+    if (list.values8_len == 0 or list.values8_ptr == null) return allocCString("");
+
+    const sep_bytes = if (sep == null) "" else span(sep);
+    var total_len: usize = 0;
+    var idx: usize = 0;
+    while (idx < list.values8_len) : (idx += 1) {
+        const part_ptr: [*c]const u8 = @ptrFromInt(@as(usize, @intCast(list.values8_ptr.?[idx])));
+        total_len += strlen(part_ptr);
+        if (idx + 1 < list.values8_len) total_len += sep_bytes.len;
+    }
+
+    const out = allocator.alloc(u8, total_len + 1) catch unsupported("out of memory");
+    var cursor: usize = 0;
+    idx = 0;
+    while (idx < list.values8_len) : (idx += 1) {
+        const part_ptr: [*c]const u8 = @ptrFromInt(@as(usize, @intCast(list.values8_ptr.?[idx])));
+        const part = span(part_ptr);
+        @memcpy(out[cursor .. cursor + part.len], part);
+        cursor += part.len;
+        if (idx + 1 < list.values8_len and sep_bytes.len > 0) {
+            @memcpy(out[cursor .. cursor + sep_bytes.len], sep_bytes);
+            cursor += sep_bytes.len;
+        }
+    }
+    out[cursor] = 0;
+    return out.ptr;
 }
 
 pub export fn forge_auto_len(ptr: i64) i64 {
@@ -390,6 +464,109 @@ pub export fn forge_set_contains_int_handle(set_handle: i64, elem: i64) i64 {
         if (item == elem) return 1;
     }
     return 0;
+}
+
+pub export fn forge_cstring_substring(s: [*c]const u8, start: i64, end: i64) [*c]u8 {
+    if (s == null) return null;
+    const len: i64 = @intCast(strlen(s));
+    const start_idx = std.math.clamp(start, 0, len);
+    const end_idx = std.math.clamp(end, start_idx, len);
+    return allocCString(span(s)[@intCast(start_idx)..@intCast(end_idx)]);
+}
+
+pub export fn forge_cstring_char_at(s: [*c]const u8, index: i64) [*c]u8 {
+    if (s == null) return allocCString("");
+    const bytes = span(s);
+    if (index < 0) return allocCString("");
+    const idx: usize = @intCast(index);
+    if (idx >= bytes.len) return allocCString("");
+    const one = [_]u8{bytes[idx]};
+    return allocCString(one[0..]);
+}
+
+pub export fn forge_cstring_to_upper(s: [*c]const u8) [*c]u8 {
+    if (s == null) return null;
+    const bytes = span(s);
+    const out = allocator.alloc(u8, bytes.len + 1) catch unsupported("out of memory");
+    for (bytes, 0..) |ch, i| out[i] = std.ascii.toUpper(ch);
+    out[bytes.len] = 0;
+    return out.ptr;
+}
+
+pub export fn forge_cstring_to_lower(s: [*c]const u8) [*c]u8 {
+    if (s == null) return null;
+    const bytes = span(s);
+    const out = allocator.alloc(u8, bytes.len + 1) catch unsupported("out of memory");
+    for (bytes, 0..) |ch, i| out[i] = std.ascii.toLower(ch);
+    out[bytes.len] = 0;
+    return out.ptr;
+}
+
+pub export fn forge_cstring_index_of(haystack: [*c]const u8, needle: [*c]const u8) i64 {
+    if (haystack == null or needle == null) return -1;
+    const h = span(haystack);
+    const n = span(needle);
+    if (n.len == 0) return 0;
+    return if (std.mem.indexOf(u8, h, n)) |idx| @intCast(idx) else -1;
+}
+
+pub export fn forge_cstring_starts_with(s: [*c]const u8, prefix: [*c]const u8) i64 {
+    if (s == null or prefix == null) return 0;
+    return if (std.mem.startsWith(u8, span(s), span(prefix))) 1 else 0;
+}
+
+pub export fn forge_cstring_ends_with(s: [*c]const u8, suffix: [*c]const u8) i64 {
+    if (s == null or suffix == null) return 0;
+    return if (std.mem.endsWith(u8, span(s), span(suffix))) 1 else 0;
+}
+
+pub export fn forge_cstring_last_index_of(haystack: [*c]const u8, needle: [*c]const u8) i64 {
+    if (haystack == null or needle == null) return -1;
+    const h = span(haystack);
+    const n = span(needle);
+    if (n.len == 0) return @intCast(h.len);
+    return if (std.mem.lastIndexOf(u8, h, n)) |idx| @intCast(idx) else -1;
+}
+
+pub export fn forge_cstring_pad_left(s: [*c]const u8, width: i64, fill: [*c]const u8) [*c]u8 {
+    if (s == null) return null;
+    const text = span(s);
+    const target_width: usize = if (width > 0) @intCast(width) else 0;
+    if (text.len >= target_width) return allocCString(text);
+    const fill_char: u8 = if (fill != null and fill[0] != 0) fill[0] else ' ';
+    const pad = target_width - text.len;
+    const out = allocator.alloc(u8, target_width + 1) catch unsupported("out of memory");
+    @memset(out[0..pad], fill_char);
+    @memcpy(out[pad .. pad + text.len], text);
+    out[target_width] = 0;
+    return out.ptr;
+}
+
+pub export fn forge_string_split_to_list(s: [*c]const u8, delim: [*c]const u8) i64 {
+    if (s == null or delim == null) return forge_list_new_default();
+    const input = span(s);
+    const separator = span(delim);
+    const list_handle = forge_list_new_default();
+    if (input.len == 0) return list_handle;
+    if (separator.len == 0) {
+        for (input) |byte| {
+            const one = [_]u8{byte};
+            forge_list_push_value(list_handle, @intCast(@intFromPtr(allocCString(one[0..]))));
+        }
+        return list_handle;
+    }
+    var start: usize = 0;
+    while (start <= input.len) {
+        const tail = input[start..];
+        const rel = std.mem.indexOf(u8, tail, separator);
+        const end = if (rel) |idx| start + idx else input.len;
+        if (end > start) {
+            forge_list_push_value(list_handle, @intCast(@intFromPtr(allocCString(input[start..end]))));
+        }
+        if (rel == null) break;
+        start = end + separator.len;
+    }
+    return list_handle;
 }
 
 pub export fn forge_bytes_from_string_utf8(s: [*c]const u8) i64 {

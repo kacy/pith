@@ -31,8 +31,11 @@ the zig runtime library is built from `cranelift/runtime-zig/` and linked as
 the first slice only covers the runtime surface needed for:
 
 - c-string printing and comparisons
+- core c-string helper operations used by `std.strings`
 - simple string concatenation helpers
 - int and bool to string conversion
+- bytes and byte buffers
+- struct allocation for result/error wrappers
 - 8-byte list storage and iteration
 - string-key and int-key map smoke paths
 - int set smoke paths

@@ -33,6 +33,7 @@ make self-host
 - `docs/concurrency.md` for channels, contexts, select, and task waits
 - `docs/http_apps.md` for the higher-level http request/response layer
 - `docs/text_and_bytes.md` for the string/bytes split and common helpers
+- `docs/zig_runtime_experiment.md` for the opt-in zig runtime experiment
 - `docs/contributing.md` for the development loop and smoke checks
 - `self-host/forge_main.fg` for the self-hosted frontend (lex/parse/check/fmt/lint/doc)
 - `cranelift/cli/src/main.rs` for the native backend CLI (build/run)

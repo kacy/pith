@@ -45,14 +45,3 @@ pub unsafe extern "C" fn forge_mutex_unlock(handle: *mut ForgeMutexHandle) {
     // For now, this is a placeholder that does nothing
     // A proper implementation would track guards in a separate data structure
 }
-
-/// Free a mutex handle
-///
-/// # Safety
-/// handle must be a valid mutex handle obtained from forge_mutex_new
-#[no_mangle]
-pub unsafe extern "C" fn forge_mutex_free(handle: *mut ForgeMutexHandle) {
-    if !handle.is_null() {
-        let _ = Box::from_raw(handle);
-    }
-}

@@ -3940,8 +3940,7 @@ pub unsafe extern "C" fn forge_args_to_list() -> i64 {
 
 // Re-export concurrency primitive FFI functions
 pub use concurrency::{
-    forge_mutex_free, forge_mutex_lock, forge_mutex_new, forge_mutex_unlock,
-    forge_semaphore_acquire, forge_semaphore_free, forge_semaphore_new, forge_semaphore_release,
-    forge_waitgroup_add, forge_waitgroup_done, forge_waitgroup_free, forge_waitgroup_new,
-    forge_waitgroup_wait,
+    forge_mutex_lock, forge_mutex_new, forge_mutex_unlock, forge_semaphore_acquire,
+    forge_semaphore_new, forge_semaphore_release, forge_waitgroup_add, forge_waitgroup_done,
+    forge_waitgroup_new, forge_waitgroup_wait,
 };

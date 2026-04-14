@@ -233,10 +233,3 @@ pub extern "C" fn forge_select_next_index(count: i64) -> i64 {
     let next = SELECT_COUNTER.fetch_add(1, Ordering::Relaxed);
     next.rem_euclid(count)
 }
-
-#[no_mangle]
-pub unsafe extern "C" fn forge_channel_free(handle: i64) {
-    if handle != 0 {
-        let _ = Box::from_raw(handle as *mut ForgeChannelHandle);
-    }
-}

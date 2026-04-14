@@ -2660,29 +2660,6 @@ pub unsafe extern "C" fn forge_format_time_fmt(timestamp_ms: i64, _fmt: *const i
     ptr
 }
 
-/// Format time as string — no-arg version (returns current timestamp)
-#[no_mangle]
-pub extern "C" fn forge_format_time() -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let s = ts.to_string();
-    let bytes = s.as_bytes();
-    let layout = Layout::from_size_align(bytes.len() + 1, 1).unwrap();
-    let ptr = unsafe { alloc(layout) as *mut i8 };
-    if !ptr.is_null() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-            *ptr.add(bytes.len()) = 0;
-        }
-    }
-    ptr
-}
-
 /// Write string to file path
 /// Returns 1 on success, 0 on failure
 ///

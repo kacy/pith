@@ -9,6 +9,14 @@ const c = @cImport({
 
 const allocator = std.heap.c_allocator;
 
+const ForgeBytes = struct {
+    data: []u8,
+};
+
+const ForgeByteBuffer = struct {
+    data: std.ArrayListUnmanaged(u8) = .{},
+};
+
 const ListImpl = extern struct {
     magic: u32,
     _pad0: u32,
@@ -107,6 +115,16 @@ fn setFromHandle(handle: i64) ?*SetImpl {
     return @ptrFromInt(@as(usize, @intCast(handle)));
 }
 
+fn bytesFromHandle(handle: i64) ?*ForgeBytes {
+    if (handle == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(handle)));
+}
+
+fn byteBufferFromHandle(handle: i64) ?*ForgeByteBuffer {
+    if (handle == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(handle)));
+}
+
 fn listSlice(list: *ListImpl) []i64 {
     if (list.values8_ptr == null or list.values8_cap == 0) return &.{};
     const ptr = list.values8_ptr.?;
@@ -144,6 +162,13 @@ fn mapLen(map: *MapImpl) usize {
     return if (map.kind == 1) map.string_entries.items.len else map.int_entries.items.len;
 }
 
+fn allocBytesFromSlice(bytes: []const u8) i64 {
+    const duped = allocator.dupe(u8, bytes) catch unsupported("out of memory");
+    const handle = allocator.create(ForgeBytes) catch unsupported("out of memory");
+    handle.* = .{ .data = duped };
+    return @intCast(@intFromPtr(handle));
+}
+
 pub export fn forge_print_cstr(ptr: [*c]const u8) void {
     if (ptr == null) return;
     _ = c.puts(@ptrCast(ptr));
@@ -172,14 +197,34 @@ pub export fn forge_cstring_compare(a: [*c]const u8, b: [*c]const u8) i64 {
     return cmpCStrings(a, b);
 }
 
+pub export fn forge_cstring_contains(haystack: [*c]const u8, needle: [*c]const u8) i64 {
+    const haystack_bytes = span(haystack);
+    const needle_bytes = span(needle);
+    if (needle_bytes.len == 0) return 1;
+    return if (std.mem.indexOf(u8, haystack_bytes, needle_bytes) != null) 1 else 0;
+}
+
 pub export fn forge_int_to_cstr(n: i64) [*c]u8 {
     var buf: [64]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, "{}", .{n}) catch unreachable;
     return allocCString(text);
 }
 
+pub export fn forge_float_to_cstr(n: f64) [*c]u8 {
+    var buf: [128]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable;
+    return allocCString(text);
+}
+
 pub export fn forge_bool_to_cstr(value: i64) [*c]u8 {
     return allocCString(if (value != 0) "true" else "false");
+}
+
+pub export fn forge_chr_cstr(n: i64) [*c]u8 {
+    if (n < 0 or n > 0x10FFFF) return allocCString("");
+    var buf: [5]u8 = [_]u8{0} ** 5;
+    const len = std.unicode.utf8Encode(@intCast(n), buf[0..4]) catch return allocCString("");
+    return allocCString(buf[0..len]);
 }
 
 pub export fn forge_list_new_default() i64 {
@@ -345,4 +390,107 @@ pub export fn forge_set_contains_int_handle(set_handle: i64, elem: i64) i64 {
         if (item == elem) return 1;
     }
     return 0;
+}
+
+pub export fn forge_bytes_from_string_utf8(s: [*c]const u8) i64 {
+    if (s == null) return allocBytesFromSlice("");
+    return allocBytesFromSlice(span(s));
+}
+
+pub export fn forge_bytes_to_string_utf8(handle: i64) [*c]u8 {
+    const bytes = bytesFromHandle(handle) orelse return null;
+    if (!std.unicode.utf8ValidateSlice(bytes.data)) return null;
+    return allocCString(bytes.data);
+}
+
+pub export fn forge_bytes_len(handle: i64) i64 {
+    const bytes = bytesFromHandle(handle) orelse return 0;
+    return @intCast(bytes.data.len);
+}
+
+pub export fn forge_bytes_is_empty(handle: i64) i64 {
+    const bytes = bytesFromHandle(handle) orelse return 1;
+    return if (bytes.data.len == 0) 1 else 0;
+}
+
+pub export fn forge_bytes_get(handle: i64, idx: i64) i64 {
+    const bytes = bytesFromHandle(handle) orelse return 0;
+    if (idx < 0) return 0;
+    const index: usize = @intCast(idx);
+    if (index >= bytes.data.len) return 0;
+    return bytes.data[index];
+}
+
+pub export fn forge_bytes_slice(handle: i64, start: i64, end: i64) i64 {
+    const bytes = bytesFromHandle(handle) orelse return 0;
+    const len: i64 = @intCast(bytes.data.len);
+    var start_idx = std.math.clamp(start, 0, len);
+    var end_idx = std.math.clamp(end, 0, len);
+    if (end_idx < start_idx) std.mem.swap(i64, &start_idx, &end_idx);
+    return allocBytesFromSlice(bytes.data[@intCast(start_idx)..@intCast(end_idx)]);
+}
+
+pub export fn forge_bytes_concat(a: i64, b: i64) i64 {
+    const left = bytesFromHandle(a) orelse return 0;
+    const right = bytesFromHandle(b) orelse return 0;
+    const out = allocator.alloc(u8, left.data.len + right.data.len) catch unsupported("out of memory");
+    @memcpy(out[0..left.data.len], left.data);
+    @memcpy(out[left.data.len ..], right.data);
+    const handle = allocator.create(ForgeBytes) catch unsupported("out of memory");
+    handle.* = .{ .data = out };
+    return @intCast(@intFromPtr(handle));
+}
+
+pub export fn forge_bytes_eq(a: i64, b: i64) i64 {
+    if (a == 0 and b == 0) return 1;
+    const left = bytesFromHandle(a) orelse return 0;
+    const right = bytesFromHandle(b) orelse return 0;
+    return if (std.mem.eql(u8, left.data, right.data)) 1 else 0;
+}
+
+pub export fn forge_byte_buffer_new() i64 {
+    const handle = allocator.create(ForgeByteBuffer) catch unsupported("out of memory");
+    handle.* = .{};
+    return @intCast(@intFromPtr(handle));
+}
+
+pub export fn forge_byte_buffer_with_capacity(capacity: i64) i64 {
+    const handle = allocator.create(ForgeByteBuffer) catch unsupported("out of memory");
+    handle.* = .{};
+    if (capacity > 0) {
+        handle.data.ensureTotalCapacity(allocator, @intCast(capacity)) catch unsupported("out of memory");
+    }
+    return @intCast(@intFromPtr(handle));
+}
+
+pub export fn forge_byte_buffer_write(handle: i64, data: i64) i64 {
+    const buffer = byteBufferFromHandle(handle) orelse return 0;
+    const bytes = bytesFromHandle(data) orelse return 0;
+    buffer.data.appendSlice(allocator, bytes.data) catch unsupported("out of memory");
+    return @intCast(bytes.data.len);
+}
+
+pub export fn forge_byte_buffer_write_byte(handle: i64, value: i64) i64 {
+    const buffer = byteBufferFromHandle(handle) orelse return 0;
+    if (value < 0 or value > 255) return 0;
+    buffer.data.append(allocator, @intCast(value)) catch unsupported("out of memory");
+    return 1;
+}
+
+pub export fn forge_byte_buffer_bytes(handle: i64) i64 {
+    const buffer = byteBufferFromHandle(handle) orelse return 0;
+    return allocBytesFromSlice(buffer.data.items);
+}
+
+pub export fn forge_byte_buffer_clear(handle: i64) void {
+    const buffer = byteBufferFromHandle(handle) orelse return;
+    buffer.data.clearRetainingCapacity();
+}
+
+pub export fn forge_struct_alloc(num_fields: i64) i64 {
+    if (num_fields <= 0) return 0;
+    const size: usize = @intCast(num_fields * 8);
+    const raw = allocator.alignedAlloc(u8, .fromByteUnits(8), size) catch return 0;
+    @memset(raw, 0);
+    return @intCast(@intFromPtr(raw.ptr));
 }

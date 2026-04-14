@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 
 pub mod ir_consumer;
 pub mod linker;
+pub mod runtime_abi;
 
 // --- Struct layout registry (used by ir_consumer for field access) ---
 

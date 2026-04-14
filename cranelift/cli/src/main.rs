@@ -7,6 +7,12 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeKind {
+    Rust,
+    Zig,
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -21,21 +27,24 @@ fn main() {
                 eprintln!("Error: build requires a file argument");
                 std::process::exit(1);
             }
-            build_file(&args[2]);
+            let (runtime, path) = parse_runtime_and_path(&args[2..], "build");
+            build_file(&path, runtime);
         }
         "run" => {
             if args.len() < 3 {
                 eprintln!("Error: run requires a file argument");
                 std::process::exit(1);
             }
-            run_file(&args[2]);
+            let (runtime, path) = parse_runtime_and_path(&args[2..], "run");
+            run_file(&path, runtime);
         }
         "test" => {
             if args.len() < 3 {
                 eprintln!("Error: test requires a file argument");
                 std::process::exit(1);
             }
-            test_file(&args[2]);
+            let (runtime, path) = parse_runtime_and_path(&args[2..], "test");
+            test_file(&path, runtime);
         }
         "check" => {
             if args.len() < 3 {
@@ -96,6 +105,28 @@ fn print_usage() {
     println!("Environment:");
     println!("  FORGE_SELF_HOST    Path to self-hosted compiler (default: ./self-host/forge_main)");
     println!("  FORGE_DUMP_IR      Path to dump combined IR text (for debugging)");
+    println!("  native runtime selection: --runtime rust|zig (zig is experimental)");
+}
+
+fn parse_runtime_and_path(args: &[String], command: &str) -> (RuntimeKind, String) {
+    let mut runtime = RuntimeKind::Rust;
+    let mut index = 0;
+    if args.len() >= 2 && args[0] == "--runtime" {
+        runtime = match args[1].as_str() {
+            "rust" => RuntimeKind::Rust,
+            "zig" => RuntimeKind::Zig,
+            other => {
+                eprintln!("Error: unknown runtime '{}'. Use rust or zig.", other);
+                std::process::exit(1);
+            }
+        };
+        index = 2;
+    }
+    if args.len() <= index {
+        eprintln!("Error: {} requires a file argument", command);
+        std::process::exit(1);
+    }
+    (runtime, args[index].clone())
 }
 
 fn dump_ir_if_requested(ir_text: &str) {
@@ -227,7 +258,14 @@ fn compile_to_object(path: &str, emit_tests: bool) -> Result<(Vec<u8>, usize), S
     Ok((bytes, funcs.len()))
 }
 
-fn build_file(path: &str) {
+fn to_codegen_runtime(runtime: RuntimeKind) -> forge_codegen::linker::RuntimeKind {
+    match runtime {
+        RuntimeKind::Rust => forge_codegen::linker::RuntimeKind::Rust,
+        RuntimeKind::Zig => forge_codegen::linker::RuntimeKind::Zig,
+    }
+}
+
+fn build_file(path: &str, runtime: RuntimeKind) {
     use forge_codegen::linker::build_executable;
 
     let (bytes, func_count) = match compile_to_object(path, false) {
@@ -245,7 +283,7 @@ fn build_file(path: &str) {
         eprintln!("Error writing object: {}", e);
         std::process::exit(1);
     }
-    match build_executable(&obj_path, &exe_path) {
+    match build_executable(&obj_path, &exe_path, to_codegen_runtime(runtime)) {
         Ok(_) => eprintln!("Created: {}", exe_path),
         Err(e) => {
             eprintln!("Error linking: {}", e);
@@ -264,7 +302,7 @@ fn unique_run_artifact_paths() -> (std::path::PathBuf, std::path::PathBuf) {
     (obj_path, exe_path)
 }
 
-fn run_file(path: &str) {
+fn run_file(path: &str, runtime: RuntimeKind) {
     use forge_codegen::linker::build_executable;
 
     let (bytes, _) = match compile_to_object(path, false) {
@@ -281,7 +319,11 @@ fn run_file(path: &str) {
         eprintln!("Error writing object: {}", e);
         std::process::exit(1);
     }
-    match build_executable(&obj_path.to_string_lossy(), &exe_path.to_string_lossy()) {
+    match build_executable(
+        &obj_path.to_string_lossy(),
+        &exe_path.to_string_lossy(),
+        to_codegen_runtime(runtime),
+    ) {
         Ok(_) => {
             let status = Command::new(&exe_path).status();
             if !keep_artifacts {
@@ -307,7 +349,7 @@ fn run_file(path: &str) {
     }
 }
 
-fn test_file(path: &str) {
+fn test_file(path: &str, runtime: RuntimeKind) {
     use forge_codegen::linker::build_executable;
 
     let (bytes, _) = match compile_to_object(path, true) {
@@ -324,7 +366,11 @@ fn test_file(path: &str) {
         eprintln!("Error writing object: {}", e);
         std::process::exit(1);
     }
-    match build_executable(&obj_path.to_string_lossy(), &exe_path.to_string_lossy()) {
+    match build_executable(
+        &obj_path.to_string_lossy(),
+        &exe_path.to_string_lossy(),
+        to_codegen_runtime(runtime),
+    ) {
         Ok(_) => {
             let status = Command::new(&exe_path).status();
             if !keep_artifacts {

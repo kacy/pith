@@ -30,11 +30,9 @@
 //!   label NAME                     — label definition
 
 use crate::{CodeGen, CompileError};
+use crate::runtime_abi;
 use cranelift::prelude::*;
 use cranelift_module::{FuncId, Linkage, Module};
-use forge_runtime::collections::list::{
-    LIST_IMPL_ELEM_SIZE_OFFSET, LIST_IMPL_VALUES8_LEN_OFFSET, LIST_IMPL_VALUES8_PTR_OFFSET,
-};
 use std::collections::{HashMap, HashSet};
 
 #[cfg(forge_cranelift_new_api)]
@@ -80,7 +78,7 @@ fn inline_list_get_value(
         types::I64,
         MemFlags::new(),
         list,
-        LIST_IMPL_ELEM_SIZE_OFFSET,
+        runtime_abi::list_elem_size_offset(),
     );
     let is_eight = builder.ins().icmp_imm(IntCC::Equal, elem_size, 8);
     let size_fail = builder.create_block();
@@ -95,7 +93,7 @@ fn inline_list_get_value(
             types::I64,
             MemFlags::new(),
             list,
-            LIST_IMPL_VALUES8_LEN_OFFSET,
+            runtime_abi::list_values8_len_offset(),
         );
         let out_of_bounds = builder
             .ins()
@@ -114,7 +112,7 @@ fn inline_list_get_value(
         types::I64,
         MemFlags::new(),
         list,
-        LIST_IMPL_VALUES8_PTR_OFFSET,
+        runtime_abi::list_values8_ptr_offset(),
     );
     let data_is_null = builder.ins().icmp_imm(IntCC::Equal, data_ptr, 0);
     let ptr_fail = builder.create_block();

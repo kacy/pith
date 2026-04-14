@@ -145,6 +145,10 @@ fn unsupported(message: []const u8) noreturn {
     std.process.exit(1);
 }
 
+fn printAssertionMessage(message: []const u8) void {
+    _ = c.fprintf(c.stderr, "%s\n", message.ptr);
+}
+
 fn strlen(ptr: [*c]const u8) usize {
     if (ptr == null) return 0;
     return @intCast(c.strlen(@ptrCast(ptr)));
@@ -393,6 +397,32 @@ pub export fn forge_cstring_gte(a: [*c]const u8, b: [*c]const u8) i64 {
 
 pub export fn forge_bit_and(a: i64, b: i64) i64 {
     return a & b;
+}
+
+pub export fn forge_assert(cond: i64) void {
+    if (cond == 0) {
+        printAssertionMessage("Assertion failed");
+    }
+}
+
+pub export fn forge_assert_eq(a: i64, b: i64) void {
+    if (a != b) {
+        var buf: [128]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&buf, "Assertion failed: {d} != {d}", .{ a, b }) catch unreachable;
+        printAssertionMessage(text);
+    }
+}
+
+pub export fn forge_assert_ne(a: i64, b: i64) void {
+    if (a == b) {
+        var buf: [128]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&buf, "Assertion failed: {d} == {d}", .{ a, b }) catch unreachable;
+        printAssertionMessage(text);
+    }
+}
+
+pub export fn forge_exit(code: i64) void {
+    std.process.exit(@intCast(code));
 }
 
 pub export fn forge_bit_or(a: i64, b: i64) i64 {

@@ -113,22 +113,15 @@ comptime {
     }
 }
 
-const StringEntry = struct {
-    key: []u8,
-    value: i64,
-};
-
-const IntEntry = struct {
-    key: i64,
-    value: i64,
-};
+const StringMap = std.StringArrayHashMapUnmanaged(i64);
+const IntMap = std.AutoArrayHashMapUnmanaged(i64, i64);
 
 const MapImpl = struct {
     kind: i32,
     val_size: usize,
     val_is_heap: bool,
-    string_entries: std.ArrayListUnmanaged(StringEntry) = .{},
-    int_entries: std.ArrayListUnmanaged(IntEntry) = .{},
+    string_entries: StringMap = .empty,
+    int_entries: IntMap = .empty,
 };
 
 const SetImpl = struct {
@@ -280,7 +273,7 @@ fn appendListValue(list: *ListImpl, value: i64) void {
 }
 
 fn mapLen(map: *MapImpl) usize {
-    return if (map.kind == 1) map.string_entries.items.len else map.int_entries.items.len;
+    return if (map.kind == 1) map.string_entries.count() else map.int_entries.count();
 }
 
 fn allocBytesFromSlice(bytes: []const u8) i64 {
@@ -1694,32 +1687,26 @@ pub export fn forge_map_len_handle(map_handle: i64) i64 {
 pub export fn forge_map_insert_cstr(map_handle: i64, key: [*c]const u8, value: i64) void {
     const map = mapFromHandle(map_handle) orelse return;
     const key_bytes = span(key);
-    for (map.string_entries.items) |*entry| {
-        if (std.mem.eql(u8, entry.key, key_bytes)) {
-            entry.value = value;
-            return;
-        }
+    const gop = map.string_entries.getOrPut(allocator, key_bytes) catch unsupported("out of memory");
+    if (gop.found_existing) {
+        gop.value_ptr.* = value;
+        return;
     }
     const duped = allocator.dupe(u8, key_bytes) catch unsupported("out of memory");
-    map.string_entries.append(allocator, .{ .key = duped, .value = value }) catch unsupported("out of memory");
+    gop.key_ptr.* = duped;
+    gop.value_ptr.* = value;
 }
 
 pub export fn forge_map_get_cstr(map_handle: i64, key: [*c]const u8) i64 {
     const map = mapFromHandle(map_handle) orelse return 0;
     const key_bytes = span(key);
-    for (map.string_entries.items) |entry| {
-        if (std.mem.eql(u8, entry.key, key_bytes)) return entry.value;
-    }
-    return 0;
+    return map.string_entries.get(key_bytes) orelse 0;
 }
 
 pub export fn forge_map_contains_cstr(map_handle: i64, key: [*c]const u8) i64 {
     const map = mapFromHandle(map_handle) orelse return 0;
     const key_bytes = span(key);
-    for (map.string_entries.items) |entry| {
-        if (std.mem.eql(u8, entry.key, key_bytes)) return 1;
-    }
-    return 0;
+    return if (map.string_entries.contains(key_bytes)) 1 else 0;
 }
 
 pub export fn forge_map_get_default_cstr(map_handle: i64, key: [*c]const u8, default: i64) i64 {
@@ -1729,44 +1716,29 @@ pub export fn forge_map_get_default_cstr(map_handle: i64, key: [*c]const u8, def
 
 pub export fn forge_map_insert_ikey(map_handle: i64, key: i64, value: i64) void {
     const map = mapFromHandle(map_handle) orelse return;
-    for (map.int_entries.items) |*entry| {
-        if (entry.key == key) {
-            entry.value = value;
-            return;
-        }
-    }
-    map.int_entries.append(allocator, .{ .key = key, .value = value }) catch unsupported("out of memory");
+    map.int_entries.put(allocator, key, value) catch unsupported("out of memory");
 }
 
 pub export fn forge_map_get_ikey(map_handle: i64, key: i64) i64 {
     const map = mapFromHandle(map_handle) orelse return 0;
-    for (map.int_entries.items) |entry| {
-        if (entry.key == key) return entry.value;
-    }
-    return 0;
+    return map.int_entries.get(key) orelse 0;
 }
 
 pub export fn forge_map_contains_ikey(map_handle: i64, key: i64) i64 {
     const map = mapFromHandle(map_handle) orelse return 0;
-    for (map.int_entries.items) |entry| {
-        if (entry.key == key) return 1;
-    }
-    return 0;
+    return if (map.int_entries.contains(key)) 1 else 0;
 }
 
 pub export fn forge_map_get_default_ikey(map_handle: i64, key: i64, default: i64) i64 {
     const map = mapFromHandle(map_handle) orelse return default;
-    for (map.int_entries.items) |entry| {
-        if (entry.key == key) return entry.value;
-    }
-    return default;
+    return map.int_entries.get(key) orelse default;
 }
 
 pub export fn forge_map_keys_cstr(map_handle: i64) i64 {
     const map = mapFromHandle(map_handle) orelse return forge_list_new_default();
     const list_handle = forge_list_new_default();
-    for (map.string_entries.items) |entry| {
-        forge_list_push_value(list_handle, @intCast(@intFromPtr(allocCString(entry.key))));
+    for (map.string_entries.keys()) |key_bytes| {
+        forge_list_push_value(list_handle, @intCast(@intFromPtr(allocCString(key_bytes))));
     }
     return list_handle;
 }
@@ -1774,36 +1746,26 @@ pub export fn forge_map_keys_cstr(map_handle: i64) i64 {
 pub export fn forge_map_remove_cstr(map_handle: i64, key: [*c]const u8) void {
     const map = mapFromHandle(map_handle) orelse return;
     const key_bytes = span(key);
-    var idx: usize = 0;
-    while (idx < map.string_entries.items.len) : (idx += 1) {
-        if (std.mem.eql(u8, map.string_entries.items[idx].key, key_bytes)) {
-            _ = map.string_entries.swapRemove(idx);
-            return;
-        }
-    }
+    const stored_key = map.string_entries.getKey(key_bytes) orelse return;
+    _ = map.string_entries.swapRemove(key_bytes);
+    allocator.free(@constCast(stored_key));
 }
 
 pub export fn forge_map_remove_ikey(map_handle: i64, key: i64) void {
     const map = mapFromHandle(map_handle) orelse return;
-    var idx: usize = 0;
-    while (idx < map.int_entries.items.len) : (idx += 1) {
-        if (map.int_entries.items[idx].key == key) {
-            _ = map.int_entries.swapRemove(idx);
-            return;
-        }
-    }
+    _ = map.int_entries.swapRemove(key);
 }
 
 pub export fn forge_map_values_handle(map_handle: i64) i64 {
     const map = mapFromHandle(map_handle) orelse return forge_list_new_default();
     const list_handle = forge_list_new_default();
     if (map.kind == 1) {
-        for (map.string_entries.items) |entry| {
-            forge_list_push_value(list_handle, entry.value);
+        for (map.string_entries.values()) |value| {
+            forge_list_push_value(list_handle, value);
         }
     } else {
-        for (map.int_entries.items) |entry| {
-            forge_list_push_value(list_handle, entry.value);
+        for (map.int_entries.values()) |value| {
+            forge_list_push_value(list_handle, value);
         }
     }
     return list_handle;
@@ -1811,6 +1773,9 @@ pub export fn forge_map_values_handle(map_handle: i64) i64 {
 
 pub export fn forge_map_clear_handle(map_handle: i64) void {
     const map = mapFromHandle(map_handle) orelse return;
+    for (map.string_entries.keys()) |key_bytes| {
+        allocator.free(@constCast(key_bytes));
+    }
     map.string_entries.clearRetainingCapacity();
     map.int_entries.clearRetainingCapacity();
 }

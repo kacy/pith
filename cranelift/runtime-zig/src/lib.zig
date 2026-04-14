@@ -73,6 +73,8 @@ const MapImpl = struct {
 
 const SetImpl = struct {
     items: std.ArrayListUnmanaged(i64) = .{},
+    string_items: std.ArrayListUnmanaged([]u8) = .{},
+    string_mode: bool = false,
 };
 
 fn unsupported(message: []const u8) noreturn {
@@ -485,7 +487,7 @@ pub export fn forge_set_new_handle(_: i32) i64 {
 
 pub export fn forge_set_len_handle(set_handle: i64) i64 {
     const set = setFromHandle(set_handle) orelse return 0;
-    return @intCast(set.items.items.len);
+    return if (set.string_mode) @intCast(set.string_items.items.len) else @intCast(set.items.items.len);
 }
 
 pub export fn forge_set_add_int_handle(set_handle: i64, elem: i64) i64 {
@@ -505,12 +507,40 @@ pub export fn forge_set_contains_int_handle(set_handle: i64, elem: i64) i64 {
     return 0;
 }
 
+pub export fn forge_set_add_cstr(set_handle: i64, elem: [*c]const u8) i64 {
+    const set = setFromHandle(set_handle) orelse return 0;
+    const elem_bytes = span(elem);
+    set.string_mode = true;
+    for (set.string_items.items) |item| {
+        if (std.mem.eql(u8, item, elem_bytes)) return 0;
+    }
+    const duped = allocator.dupe(u8, elem_bytes) catch unsupported("out of memory");
+    set.string_items.append(allocator, duped) catch unsupported("out of memory");
+    return 1;
+}
+
+pub export fn forge_set_contains_cstr(set_handle: i64, elem: [*c]const u8) i64 {
+    const set = setFromHandle(set_handle) orelse return 0;
+    const elem_bytes = span(elem);
+    for (set.string_items.items) |item| {
+        if (std.mem.eql(u8, item, elem_bytes)) return 1;
+    }
+    return 0;
+}
+
 pub export fn forge_cstring_substring(s: [*c]const u8, start: i64, end: i64) [*c]u8 {
     if (s == null) return null;
     const len: i64 = @intCast(strlen(s));
     const start_idx = std.math.clamp(start, 0, len);
     const end_idx = std.math.clamp(end, start_idx, len);
     return allocCString(span(s)[@intCast(start_idx)..@intCast(end_idx)]);
+}
+
+pub export fn forge_cstring_trim(s: [*c]const u8) [*c]u8 {
+    if (s == null) return null;
+    const input = span(s);
+    const trimmed = std.mem.trim(u8, input, " \t\n\r");
+    return allocCString(trimmed);
 }
 
 pub export fn forge_cstring_char_at(s: [*c]const u8, index: i64) [*c]u8 {
@@ -539,6 +569,29 @@ pub export fn forge_cstring_to_lower(s: [*c]const u8) [*c]u8 {
     for (bytes, 0..) |ch, i| out[i] = std.ascii.toLower(ch);
     out[bytes.len] = 0;
     return out.ptr;
+}
+
+pub export fn forge_cstring_replace(s: [*c]const u8, from: [*c]const u8, to: [*c]const u8) [*c]u8 {
+    if (s == null) return null;
+    const input = span(s);
+    const needle = if (from == null) "" else span(from);
+    const replacement = if (to == null) "" else span(to);
+    if (needle.len == 0) return allocCString(input);
+
+    var out = std.ArrayListUnmanaged(u8){};
+    defer out.deinit(allocator);
+
+    var cursor: usize = 0;
+    while (cursor < input.len) {
+        if (std.mem.startsWith(u8, input[cursor..], needle)) {
+            out.appendSlice(allocator, replacement) catch unsupported("out of memory");
+            cursor += needle.len;
+        } else {
+            out.append(allocator, input[cursor]) catch unsupported("out of memory");
+            cursor += 1;
+        }
+    }
+    return allocCString(out.items);
 }
 
 pub export fn forge_cstring_index_of(haystack: [*c]const u8, needle: [*c]const u8) i64 {

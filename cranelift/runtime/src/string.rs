@@ -222,12 +222,6 @@ pub extern "C" fn forge_string_eq(a: ForgeString, b: ForgeString) -> bool {
     }
 }
 
-/// Check string inequality
-#[no_mangle]
-pub extern "C" fn forge_string_neq(a: ForgeString, b: ForgeString) -> bool {
-    !forge_string_eq(a, b)
-}
-
 /// String less-than comparison (lexicographic)
 #[no_mangle]
 pub extern "C" fn forge_string_lt(a: ForgeString, b: ForgeString) -> bool {
@@ -245,26 +239,6 @@ pub extern "C" fn forge_string_gt(a: ForgeString, b: ForgeString) -> bool {
         let a_internal = internal_from_forge(a);
         let b_internal = internal_from_forge(b);
         a_internal > b_internal
-    }
-}
-
-/// String less-than-or-equal comparison (lexicographic)
-#[no_mangle]
-pub extern "C" fn forge_string_lte(a: ForgeString, b: ForgeString) -> bool {
-    unsafe {
-        let a_internal = internal_from_forge(a);
-        let b_internal = internal_from_forge(b);
-        a_internal <= b_internal
-    }
-}
-
-/// String greater-than-or-equal comparison (lexicographic)
-#[no_mangle]
-pub extern "C" fn forge_string_gte(a: ForgeString, b: ForgeString) -> bool {
-    unsafe {
-        let a_internal = internal_from_forge(a);
-        let b_internal = internal_from_forge(b);
-        a_internal >= b_internal
     }
 }
 
@@ -359,130 +333,6 @@ pub unsafe extern "C" fn forge_string_trim(s: ForgeString) -> ForgeString {
     forge_from_internal(Arc::from(trimmed))
 }
 
-/// Convert to uppercase
-#[no_mangle]
-pub unsafe extern "C" fn forge_string_to_upper(s: ForgeString) -> ForgeString {
-    if s.len == 0 {
-        return EMPTY_STRING;
-    }
-
-    let internal = internal_from_forge(s);
-    let upper = internal.to_uppercase();
-
-    forge_from_internal(Arc::from(upper))
-}
-
-/// Convert to lowercase
-#[no_mangle]
-pub unsafe extern "C" fn forge_string_to_lower(s: ForgeString) -> ForgeString {
-    if s.len == 0 {
-        return EMPTY_STRING;
-    }
-
-    let internal = internal_from_forge(s);
-    let lower = internal.to_lowercase();
-
-    forge_from_internal(Arc::from(lower))
-}
-
-/// Find index of substring (returns -1 if not found)
-#[no_mangle]
-pub extern "C" fn forge_string_index_of(haystack: ForgeString, needle: ForgeString) -> i64 {
-    if needle.len == 0 {
-        return 0;
-    }
-    if needle.len > haystack.len {
-        return -1;
-    }
-
-    unsafe {
-        let hay_internal = internal_from_forge(haystack);
-        let needle_internal = internal_from_forge(needle);
-
-        match hay_internal.find(&*needle_internal) {
-            Some(idx) => idx as i64,
-            None => -1,
-        }
-    }
-}
-
-/// Find last index of substring (returns -1 if not found)
-#[no_mangle]
-pub extern "C" fn forge_string_last_index_of(haystack: ForgeString, needle: ForgeString) -> i64 {
-    if needle.len == 0 {
-        return haystack.len;
-    }
-    if needle.len > haystack.len {
-        return -1;
-    }
-
-    unsafe {
-        let hay_internal = internal_from_forge(haystack);
-        let needle_internal = internal_from_forge(needle);
-
-        match hay_internal.rfind(&*needle_internal) {
-            Some(idx) => idx as i64,
-            None => -1,
-        }
-    }
-}
-
-/// Repeat string n times
-#[no_mangle]
-pub unsafe extern "C" fn forge_string_repeat(s: ForgeString, n: i64) -> ForgeString {
-    if n <= 0 || s.len == 0 {
-        return EMPTY_STRING;
-    }
-
-    let internal = internal_from_forge(s);
-    let repeated = internal.repeat(n as usize);
-
-    forge_from_internal(Arc::from(repeated))
-}
-
-/// Replace all occurrences of old with new_s
-#[no_mangle]
-pub unsafe extern "C" fn forge_string_replace(
-    s: ForgeString,
-    old: ForgeString,
-    new_s: ForgeString,
-) -> ForgeString {
-    if old.len == 0 || s.len == 0 {
-        return forge_string_substring(s, 0, s.len); // Return copy of original
-    }
-
-    let s_internal = internal_from_forge(s);
-    let old_internal = internal_from_forge(old);
-    let new_internal = internal_from_forge(new_s);
-
-    let replaced = s_internal.replace(&*old_internal, &new_internal);
-
-    forge_from_internal(Arc::from(replaced))
-}
-
-/// Get single character at index as new string
-#[no_mangle]
-pub unsafe extern "C" fn forge_string_char_at(s: ForgeString, index: i64) -> ForgeString {
-    if index < 0 || index >= s.len {
-        return EMPTY_STRING;
-    }
-
-    // Get the byte at index (note: this is byte index, not char index)
-    let byte = *s.ptr.add(index as usize);
-
-    // Create a single-character string
-    let mut buf = vec![byte];
-    buf.push(0); // Null terminator for safety
-
-    let ptr = Box::into_raw(buf.into_boxed_slice()) as *const u8;
-
-    ForgeString {
-        ptr,
-        len: 1,
-        is_heap: true,
-    }
-}
-
 /// Create string from single character code
 #[no_mangle]
 pub unsafe extern "C" fn forge_chr(code: i64) -> ForgeString {
@@ -507,20 +357,6 @@ pub extern "C" fn forge_ord(s: ForgeString, index: i64) -> i64 {
         return -1;
     }
     unsafe { *s.ptr.add(index as usize) as i64 }
-}
-
-/// Convert int to string
-#[no_mangle]
-pub extern "C" fn forge_int_to_string(n: i64) -> ForgeString {
-    let s = Arc::from(n.to_string());
-    forge_from_internal(s)
-}
-
-/// Convert float to string
-#[no_mangle]
-pub extern "C" fn forge_float_to_string(n: f64) -> ForgeString {
-    let s = Arc::from(format!("{:.6}", n));
-    forge_from_internal(s)
 }
 
 // ============================================================================

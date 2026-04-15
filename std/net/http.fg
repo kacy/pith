@@ -145,22 +145,19 @@ fn query_param_from_string(qs: String, name: String) -> String:
         if not at_end:
             at_end = char_eq(qs, pos, "&")
         if at_end and pos > start:
-            pair := qs.substring(start, pos)
             mut eq := -1
-            mut ei := 0
-            pair_len := pair.len()
-            while ei < pair_len:
-                if char_eq(pair, ei, "="):
-                    eq = ei
+            mut i := start
+            while i < pos:
+                if char_eq(qs, i, "="):
+                    eq = i
                     break
-                ei = ei + 1
+                i = i + 1
             if eq >= 0:
-                key := pair.substring(0, eq)
-                if str_eq(key, name):
-                    if eq + 1 < pair_len:
-                        return pair.substring(eq + 1, pair_len)
+                if qs.substring(start, eq) == name:
+                    if eq + 1 < pos:
+                        return qs.substring(eq + 1, pos)
                     return ""
-            elif str_eq(pair, name):
+            elif qs.substring(start, pos) == name:
                 return ""
             if at_end and pos == qs_len:
                 break
@@ -181,12 +178,17 @@ fn query_has_param_from_string(qs: String, name: String) -> Bool:
         if not at_end:
             at_end = char_eq(qs, pos, "&")
         if at_end and pos > start:
-            pair := qs.substring(start, pos)
-            mut eq := pair.index_of("=")
+            mut eq := -1
+            mut i := start
+            while i < pos:
+                if char_eq(qs, i, "="):
+                    eq = i
+                    break
+                i = i + 1
             if eq >= 0:
-                if pair.substring(0, eq) == name:
+                if qs.substring(start, eq) == name:
                     return true
-            elif pair == name:
+            elif qs.substring(start, pos) == name:
                 return true
             start = pos + 1
         elif at_end:
@@ -206,19 +208,17 @@ fn query_params_map_from_string(qs: String) -> Map[String, String]:
         if not at_end:
             at_end = char_eq(qs, pos, "&")
         if at_end and pos > start:
-            pair := qs.substring(start, pos)
             mut eq := -1
-            mut ei := 0
-            pair_len := pair.len()
-            while ei < pair_len:
-                if char_eq(pair, ei, "="):
-                    eq = ei
+            mut i := start
+            while i < pos:
+                if char_eq(qs, i, "="):
+                    eq = i
                     break
-                ei = ei + 1
+                i = i + 1
             if eq >= 0:
-                result.insert(pair.substring(0, eq), pair.substring(eq + 1, pair_len))
+                result.insert(qs.substring(start, eq), qs.substring(eq + 1, pos))
             else:
-                result.insert(pair, "")
+                result.insert(qs.substring(start, pos), "")
             if at_end and pos == qs_len:
                 break
             start = pos + 1

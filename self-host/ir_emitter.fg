@@ -1715,7 +1715,27 @@ fn ir_collect_method_call_regs(node: Node) -> List[Int]:
 
 fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
     mut part_r := ir_expr(expr_idx)
-    return ir_emit_stringify_value(part_r, c_get_expr_type(expr_idx))
+    part_tid := c_get_expr_type(expr_idx)
+    part_type := ir_infer_type(expr_idx)
+    if part_type == "string":
+        return part_r
+    if part_type == "bool":
+        converted := ir_reg()
+        ir_emit_call1(converted, "bool_to_string", "string", part_r)
+        return converted
+    if part_type == "float":
+        converted := ir_reg()
+        ir_emit_call1(converted, "float_to_string", "string", part_r)
+        return converted
+    if part_type == "int":
+        converted := ir_reg()
+        ir_emit_call1(converted, "int_to_string", "string", part_r)
+        return converted
+    if part_tid >= 0:
+        part_info := get_type_info(part_tid)
+        if part_info.kind == "result":
+            return ir_emit_result_value_to_string(part_r, part_tid)
+    return part_r
 
 fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String]):
     mut i := 0

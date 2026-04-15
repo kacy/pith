@@ -477,7 +477,7 @@ fn build_http_request(head: Bytes, body: Bytes) -> HttpRequestBytes!:
     headers_text := decode_utf8(headers_bytes(head))!
     body_text := decode_utf8(body)!
     headers_map := request_headers_map(head)!
-    query_map := query_params_map_from_string(query_text)
+    mut query_map: Map[String, String] := {}
     path_parts := path_segments(path_text)
     return HttpRequestBytes(head, body, method_text, path_text, query_text, version_text, headers_text, body_text, headers_map, query_map, path_parts)
 
@@ -535,11 +535,9 @@ impl HttpRequestBytes:
     fn is_post(path_name: String) -> Bool!:
         return self.matches("POST", path_name)!
     fn query_param(name: String) -> String!:
-        if self.query_map.contains_key(name):
-            return self.query_map[name]
-        return ""
+        return query_param_from_string(self.query_text, name)
     fn has_query_param(name: String) -> Bool!:
-        return self.query_map.contains_key(name)
+        return query_has_param_from_string(self.query_text, name)
     fn path_parts() -> List[String]!:
         return copy_string_list(self.path_parts_cache)
     fn matches_path(pattern: String) -> Bool!:

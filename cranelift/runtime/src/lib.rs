@@ -3311,6 +3311,17 @@ pub unsafe extern "C" fn forge_byte_buffer_write_byte(handle: i64, value: i64) -
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn forge_byte_buffer_write_int(handle: i64, value: i64) -> i64 {
+    let Some(buffer) = forge_byte_buffer_mut(handle) else {
+        return 0;
+    };
+    let text = value.to_string();
+    perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, text.len());
+    buffer.data.extend_from_slice(text.as_bytes());
+    text.len() as i64
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn forge_byte_buffer_bytes(handle: i64) -> i64 {
     let Some(buffer) = forge_byte_buffer_mut(handle) else {
         return 0;

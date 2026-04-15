@@ -748,7 +748,7 @@ fn json_write_bytes(out: ByteBuffer, handle: Int) -> Int!:
             return out.write_string_utf8("true")
         return out.write_string_utf8("false")
     if kind == "int":
-        return out.write_string_utf8(integer_values[handle].to_string())
+        return out.write_int(integer_values[handle])
     if kind == "float":
         return out.write_string_utf8(float_values[handle].to_string())
     if kind == "string":
@@ -884,7 +884,7 @@ pub fn write_object_string_field_bytes(out: ByteBuffer, is_first: Bool, key: Str
 
 pub fn write_object_int_field_bytes(out: ByteBuffer, is_first: Bool, key: String, value: Int) -> Bool!:
     write_object_field_prefix_bytes(out, is_first, key)!
-    out.write_string_utf8(value.to_string())!
+    out.write_int(value)!
     return false
 
 pub fn write_object_bool_field_bytes(out: ByteBuffer, is_first: Bool, key: String, value: Bool) -> Bool!:
@@ -901,7 +901,7 @@ pub fn write_int_array_bytes(out: ByteBuffer, values: List[Int]) -> Int!:
     while i < values.len():
         if i > 0:
             total = total + out.write_byte(44)!
-        total = total + out.write_string_utf8(values[i].to_string())!
+        total = total + out.write_int(values[i])!
         i = i + 1
     total = total + write_array_end_bytes(out)!
     return total

@@ -274,6 +274,34 @@ fn appendListValue(list: *ListImpl, value: i64) void {
     list.values8_len += 1;
 }
 
+fn appendIntBytes(out: *std.ArrayListUnmanaged(u8), value: i64) usize {
+    var buf: [32]u8 = undefined;
+    var idx: usize = buf.len;
+    var n: u64 = 0;
+    if (value < 0) {
+        n = @as(u64, @intCast(-(value + 1))) + 1;
+    } else {
+        n = @as(u64, @intCast(value));
+    }
+    if (n == 0) {
+        idx -= 1;
+        buf[idx] = '0';
+    } else {
+        while (n > 0) {
+            const digit: u8 = @intCast(n % 10);
+            n = @divTrunc(n, 10);
+            idx -= 1;
+            buf[idx] = '0' + digit;
+        }
+    }
+    if (value < 0) {
+        idx -= 1;
+        buf[idx] = '-';
+    }
+    out.appendSlice(allocator, buf[idx..]) catch unsupported("out of memory");
+    return buf.len - idx;
+}
+
 fn mapLen(map: *MapImpl) usize {
     return if (map.kind == 1) map.string_entries.count() else map.int_entries.count();
 }
@@ -2140,6 +2168,11 @@ pub export fn forge_byte_buffer_write_byte(handle: i64, value: i64) i64 {
     if (value < 0 or value > 255) return 0;
     buffer.data.append(allocator, @intCast(value)) catch unsupported("out of memory");
     return 1;
+}
+
+pub export fn forge_byte_buffer_write_int(handle: i64, value: i64) i64 {
+    const buffer = byteBufferFromHandle(handle) orelse return 0;
+    return @intCast(appendIntBytes(&buffer.data, value));
 }
 
 pub export fn forge_byte_buffer_bytes(handle: i64) i64 {

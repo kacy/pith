@@ -329,7 +329,6 @@ pub fn declare_runtime_functions(
         ("warn", "forge_log_warn", &[I64], &[]),
         ("forge_spawn", "forge_spawn", &[I64], &[I64]),
         ("forge_await", "forge_await", &[I64], &[I64]),
-        ("smart_to_string", "forge_smart_to_string", &[I64], &[I64]),
         ("process_spawn", "forge_process_spawn", &[I64], &[I64]),
         ("process_spawn_argv", "forge_process_spawn_argv", &[I64, I64, I64, I64, I64], &[I64]),
         ("process_output_argv", "forge_process_output_argv", &[I64, I64, I64, I64, I64], &[I64]),

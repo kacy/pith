@@ -1679,7 +1679,10 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
         for child in node.children:
             cn := get_node(child)
             if cn.kind != "lit":
-                c_check_expr(child, scope_id)
+                expr_tid := c_check_expr(child, scope_id)
+                if is_error_type(expr_tid) == false:
+                    if type_supports_stringify(expr_tid) == false:
+                        report_error("E219", "string interpolation requires a stringifiable value, got " + get_type_name(expr_tid))
         return tid_string
     if node.kind == "if_expr":
         return check_if_expression(node, scope_id)
@@ -1718,6 +1721,16 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     if node.kind == "await":
         return check_await_expression(node, scope_id)
     return TID_ERR
+
+fn type_supports_stringify(tid: Int) -> Bool:
+    if tid < 0:
+        return false
+    info := get_type_info(tid)
+    if info.kind == "primitive":
+        return info.name == "String" or info.name == "Int" or info.name == "UInt" or info.name == "Int8" or info.name == "Int16" or info.name == "Int32" or info.name == "Int64" or info.name == "UInt8" or info.name == "UInt16" or info.name == "UInt32" or info.name == "UInt64" or info.name == "Float" or info.name == "Bool"
+    if info.kind == "result":
+        return type_supports_stringify(info.inner) and type_supports_stringify(info.value_type)
+    return false
 
 # ---------------------------------------------------------------
 # identifier lookup
@@ -2737,6 +2750,13 @@ fn check_bytes_method_call(method: String, args: List[Int], scope_id: Int) -> In
     return TID_ERR
 
 fn check_result_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
+    tid_string := lookup_type_id("String")
+    if method == "to_string":
+        expect_no_arguments(method, args)
+        if type_supports_stringify(info.inner) == false or type_supports_stringify(info.value_type) == false:
+            report_error("E219", "result.to_string requires stringifiable ok and err values")
+            return TID_ERR
+        return tid_string
     if method == "unwrap_or":
         if args.len() != 1:
             report_error("E207", "unwrap_or expects 1 argument, got " + args.len().to_string())

@@ -2669,19 +2669,6 @@ pub unsafe extern "C" fn forge_log_error(msg: *const i8) {
     }
 }
 
-/// Smart to_string for Unknown-typed values: distinguishes likely heap string
-/// pointers from small integer-like values using address range heuristics.
-#[no_mangle]
-pub unsafe extern "C" fn forge_smart_to_string(val: i64) -> *mut i8 {
-    // Small-magnitude values are treated as integers.
-    // Large positive values are treated as heap-allocated C string pointers.
-    if val <= 0 || (val > 0 && val < 1_000_000) {
-        forge_int_to_cstr(val)
-    } else {
-        forge_strdup(val as *const i8)
-    }
-}
-
 /// Spawn a child process and return a process handle
 ///
 /// # Safety

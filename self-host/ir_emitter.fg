@@ -1537,6 +1537,9 @@ fn ir_method_receiver_type(node: Node) -> String:
             return "channel:" + ir_type_from_tid(recv_info.inner)
         if recv_info.kind == "task" and recv_info.inner >= 0:
             return "task:" + ir_type_from_tid(recv_info.inner)
+        known := ir_type_from_tid(recv_tid)
+        if known.len() > 0:
+            return known
     checked := ir_checked_type(node.children[0])
     if checked.len() > 0:
         return checked
@@ -1653,8 +1656,6 @@ fn ir_method_emit_name(mname: String, obj_type: String) -> String:
             emit_name = "int_to_string"
         elif obj_is_string:
             emit_name = "identity"
-        elif obj_type == "":
-            emit_name = "smart_to_string"
     elif obj_is_string:
         emit_name = ir_method_string_emit_name(mname)
     elif obj_is_bytes:
@@ -1714,24 +1715,7 @@ fn ir_collect_method_call_regs(node: Node) -> List[Int]:
 
 fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
     mut part_r := ir_expr(expr_idx)
-    expr_type := ir_infer_type(expr_idx)
-    if expr_type == "bool":
-        converted := ir_reg()
-        ir_emit_call1(converted, "bool_to_string", "string", part_r)
-        return converted
-    if expr_type == "float":
-        converted := ir_reg()
-        ir_emit_call1(converted, "float_to_string", "string", part_r)
-        return converted
-    if expr_type == "int":
-        converted := ir_reg()
-        ir_emit_call1(converted, "int_to_string", "string", part_r)
-        return converted
-    if expr_type == "":
-        converted := ir_reg()
-        ir_emit_call1(converted, "smart_to_string", "string", part_r)
-        return converted
-    return part_r
+    return ir_emit_stringify_value(part_r, c_get_expr_type(expr_idx))
 
 fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String]):
     mut i := 0
@@ -2239,7 +2223,34 @@ fn ir_emit_result_unwrap_or(node: Node) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
-fn ir_emit_stringify_value(value_r: Int, value_type: String) -> Int:
+fn ir_emit_result_value_to_string(recv_r: Int, recv_tid: Int) -> Int:
+    mut ok_tid := 0 - 1
+    mut err_tid := 0 - 1
+    if recv_tid >= 0:
+        recv_info := get_type_info(recv_tid)
+        if recv_info.kind == "result":
+            ok_tid = recv_info.inner
+            err_tid = recv_info.value_type
+    cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
+    temp_name := ir_new_temp_name("result_to_string")
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + ok_l)
+    ok_r := ir_emit_result_value_field(recv_r, recv_tid, "ok")
+    ir_emit("store " + temp_name + " " + ir_emit_stringify_value(ok_r, ok_tid).to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit("label " + err_l)
+    err_r := ir_emit_result_value_field(recv_r, recv_tid, "err")
+    ir_emit("store " + temp_name + " " + ir_emit_stringify_value(err_r, err_tid).to_string())
+    ir_emit("label " + merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
+fn ir_emit_stringify_value(value_r: Int, value_tid: Int) -> Int:
+    value_type := ir_type_from_tid(value_tid)
     if value_type == "string":
         return value_r
     out_r := ir_reg()
@@ -2252,36 +2263,16 @@ fn ir_emit_stringify_value(value_r: Int, value_type: String) -> Int:
     if value_type == "int":
         ir_emit_call1(out_r, "int_to_string", "string", value_r)
         return out_r
-    ir_emit_call1(out_r, "smart_to_string", "string", value_r)
-    return out_r
+    if value_tid >= 0:
+        value_info := get_type_info(value_tid)
+        if value_info.kind == "result":
+            return ir_emit_result_value_to_string(value_r, value_tid)
+    return value_r
 
 fn ir_emit_result_to_string(node: Node) -> Int:
     recv_r := ir_expr(node.children[0])
     recv_tid := c_get_expr_type(node.children[0])
-    mut ok_type := "unknown"
-    mut err_type := "unknown"
-    if recv_tid >= 0:
-        recv_info := get_type_info(recv_tid)
-        if recv_info.kind == "result":
-            ok_type = ir_type_from_tid(recv_info.inner)
-            err_type = ir_type_from_tid(recv_info.value_type)
-    cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
-    temp_name := ir_new_temp_name("result_to_string")
-    ok_l := ir_label()
-    err_l := ir_label()
-    merge_l := ir_label()
-    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
-    ir_emit("label " + ok_l)
-    ok_r := ir_emit_result_value_field(recv_r, recv_tid, "ok")
-    ir_emit("store " + temp_name + " " + ir_emit_stringify_value(ok_r, ok_type).to_string())
-    ir_emit("jmp " + merge_l)
-    ir_emit("label " + err_l)
-    err_r := ir_emit_result_value_field(recv_r, recv_tid, "err")
-    ir_emit("store " + temp_name + " " + ir_emit_stringify_value(err_r, err_type).to_string())
-    ir_emit("label " + merge_l)
-    r := ir_reg()
-    ir_emit("load " + r.to_string() + " " + temp_name)
-    return r
+    return ir_emit_result_value_to_string(recv_r, recv_tid)
 
 fn ir_emit_named_handler_call(handler_idx: Int, arg_r: Int, ret_type: String) -> Int:
     handler_node := get_node(handler_idx)

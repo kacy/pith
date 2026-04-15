@@ -31,6 +31,7 @@
 
 use crate::{CodeGen, CompileError};
 use cranelift::prelude::*;
+use cranelift_codegen::ir::BlockArg;
 use cranelift_module::{FuncId, Linkage, Module};
 use forge_runtime::collections::list::{
     LIST_IMPL_ELEM_SIZE_OFFSET, LIST_IMPL_VALUES8_LEN_OFFSET, LIST_IMPL_VALUES8_PTR_OFFSET,
@@ -65,7 +66,7 @@ fn inline_list_get_value(
     let after_null = builder.create_block();
     builder.ins().brif(list_is_null, null_block, &[], after_null, &[]);
     builder.switch_to_block(null_block);
-    builder.ins().jump(done, &[zero]);
+    builder.ins().jump(done, &[BlockArg::Value(zero)]);
     builder.switch_to_block(after_null);
 
     let index_is_negative = builder.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
@@ -73,7 +74,7 @@ fn inline_list_get_value(
     let after_neg = builder.create_block();
     builder.ins().brif(index_is_negative, neg_block, &[], after_neg, &[]);
     builder.switch_to_block(neg_block);
-    builder.ins().jump(done, &[zero]);
+    builder.ins().jump(done, &[BlockArg::Value(zero)]);
     builder.switch_to_block(after_neg);
 
     let elem_size = builder.ins().load(
@@ -87,7 +88,7 @@ fn inline_list_get_value(
     let after_size = builder.create_block();
     builder.ins().brif(is_eight, after_size, &[], size_fail, &[]);
     builder.switch_to_block(size_fail);
-    builder.ins().jump(done, &[zero]);
+    builder.ins().jump(done, &[BlockArg::Value(zero)]);
     builder.switch_to_block(after_size);
 
     if checked {
@@ -106,7 +107,7 @@ fn inline_list_get_value(
             .ins()
             .brif(out_of_bounds, bounds_fail, &[], after_bounds, &[]);
         builder.switch_to_block(bounds_fail);
-        builder.ins().jump(done, &[zero]);
+        builder.ins().jump(done, &[BlockArg::Value(zero)]);
         builder.switch_to_block(after_bounds);
     }
 
@@ -121,13 +122,13 @@ fn inline_list_get_value(
     let load_block = builder.create_block();
     builder.ins().brif(data_is_null, ptr_fail, &[], load_block, &[]);
     builder.switch_to_block(ptr_fail);
-    builder.ins().jump(done, &[zero]);
+    builder.ins().jump(done, &[BlockArg::Value(zero)]);
     builder.switch_to_block(load_block);
 
     let byte_offset = builder.ins().ishl_imm(index, 3);
     let elem_addr = builder.ins().iadd(data_ptr, byte_offset);
     let value = builder.ins().load(types::I64, MemFlags::new(), elem_addr, 0);
-    builder.ins().jump(done, &[value]);
+    builder.ins().jump(done, &[BlockArg::Value(value)]);
 
     builder.switch_to_block(done);
     builder.block_params(done)[0]

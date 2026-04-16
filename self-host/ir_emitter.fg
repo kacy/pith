@@ -45,7 +45,7 @@ BYTES_RETURNING_FUNCS := "bytes_from_string_utf8,read_file_bytes,file_read_bytes
 LIST_RETURNING_FUNCS := "args,range,repeat_val,zeros,sort,sort_desc,reversed,take,drop,slice,unique,without,intersection,difference,flatten,chunks"
 LIST_STRING_RETURNING_FUNCS := "sort_strings,zip,enumerate,toml_keys"
 BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,list_contains,list_contains_string,list_is_empty,send,try_send,close,is_closed,is_done"
-VOID_METHODS := "sort,sort_strings,reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear,detach"
+VOID_METHODS := "reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear,detach"
 STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,list_join,read_file,env,chr"
 
 # --- emitted ir buffers ---
@@ -1568,6 +1568,12 @@ fn ir_method_bytes_emit_name(mname: String) -> String:
 fn ir_method_list_emit_name(mname: String, obj_type: String) -> String:
     if mname == "len":
         return "forge_list_len"
+    if mname == "slice":
+        return "list_slice_copy"
+    if mname == "sort":
+        if obj_type == "list_string":
+            return "list_sort_strings_copy"
+        return "list_sort_copy"
     if mname == "contains":
         if obj_type == "list_string":
             return "list_contains_string"
@@ -1578,8 +1584,6 @@ fn ir_method_list_emit_name(mname: String, obj_type: String) -> String:
         return "list_index_of"
     if mname == "join":
         return "list_join"
-    if mname == "sort" and obj_type == "list_string":
-        return "sort_strings"
     if mname == "reverse":
         return "list_reverse"
     if mname == "is_empty":

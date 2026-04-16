@@ -319,17 +319,12 @@ pub unsafe extern "C" fn forge_list_sort_strings(list_ptr: i64) {
         return;
     }
     let impl_ref = &mut *(list.ptr as *mut crate::collections::list::ListImpl);
-    impl_ref.elements.sort_by(|a, b| {
-        let ap = if a.len() >= 8 {
-            i64::from_ne_bytes(a[..8].try_into().unwrap_or([0; 8])) as *const i8
-        } else {
-            std::ptr::null()
-        };
-        let bp = if b.len() >= 8 {
-            i64::from_ne_bytes(b[..8].try_into().unwrap_or([0; 8])) as *const i8
-        } else {
-            std::ptr::null()
-        };
+    if impl_ref.elem_size != 8 {
+        return;
+    }
+    impl_ref.values8.sort_by(|a, b| {
+        let ap = *a as *const i8;
+        let bp = *b as *const i8;
         if ap.is_null() && bp.is_null() {
             return std::cmp::Ordering::Equal;
         }
@@ -343,6 +338,7 @@ pub unsafe extern "C" fn forge_list_sort_strings(list_ptr: i64) {
         let b_str = std::ffi::CStr::from_ptr(bp);
         a_str.cmp(b_str)
     });
+    impl_ref.sync_value_view();
 }
 
 /// Sort a list of i64 values in-place
@@ -358,19 +354,11 @@ pub unsafe extern "C" fn forge_list_sort(list_ptr: i64) {
         return;
     }
     let impl_ref = &mut *(list.ptr as *mut crate::collections::list::ListImpl);
-    impl_ref.elements.sort_by(|a, b| {
-        let av = if a.len() >= 8 {
-            i64::from_ne_bytes(a[..8].try_into().unwrap_or([0; 8]))
-        } else {
-            0
-        };
-        let bv = if b.len() >= 8 {
-            i64::from_ne_bytes(b[..8].try_into().unwrap_or([0; 8]))
-        } else {
-            0
-        };
-        av.cmp(&bv)
-    });
+    if impl_ref.elem_size != 8 {
+        return;
+    }
+    impl_ref.values8.sort();
+    impl_ref.sync_value_view();
 }
 
 /// Get a sub-slice of a list
@@ -387,21 +375,71 @@ pub unsafe extern "C" fn forge_list_slice(list_ptr: i64, start: i64, end: i64) -
     };
     if !list.ptr.is_null() {
         let impl_ref = &*(list.ptr as *const crate::collections::list::ListImpl);
-        let len = impl_ref.elements.len() as i64;
+        let len = impl_ref.len() as i64;
         let s = start.max(0).min(len) as usize;
         let e = end.max(0).min(len) as usize;
         for i in s..e {
-            if let Some(elem) = impl_ref.elements.get(i) {
-                let val = if elem.len() >= 8 {
-                    i64::from_ne_bytes(elem[..8].try_into().unwrap_or([0; 8]))
-                } else {
-                    0
-                };
+            if let Some(val) = impl_ref.get_value(i) {
                 forge_list_push_value(new_list, val);
             }
         }
     }
     new_list.ptr as i64
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_sort_copy(list_ptr: i64) -> i64 {
+    use crate::collections::list::{forge_list_new, forge_list_push_value};
+
+    let new_list = forge_list_new(8, 0);
+    let list = ForgeList {
+        ptr: list_ptr as *mut (),
+    };
+    if list.ptr.is_null() {
+        return new_list.ptr as i64;
+    }
+
+    let impl_ref = &*(list.ptr as *const crate::collections::list::ListImpl);
+    let mut i = 0usize;
+    while i < impl_ref.len() {
+        if let Some(val) = impl_ref.get_value(i) {
+            forge_list_push_value(new_list, val);
+        }
+        i += 1;
+    }
+
+    forge_list_sort(new_list.ptr as i64);
+    new_list.ptr as i64
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_sort_strings_copy(list_ptr: i64) -> i64 {
+    use crate::collections::list::{forge_list_new, forge_list_push_value};
+
+    let new_list = forge_list_new(8, 0);
+    let list = ForgeList {
+        ptr: list_ptr as *mut (),
+    };
+    if list.ptr.is_null() {
+        return new_list.ptr as i64;
+    }
+
+    let impl_ref = &*(list.ptr as *const crate::collections::list::ListImpl);
+    let mut i = 0usize;
+    while i < impl_ref.len() {
+        if let Some(val) = impl_ref.get_value(i) {
+            forge_list_push_value(new_list, val);
+        }
+        i += 1;
+    }
+
+    forge_list_sort_strings(new_list.ptr as i64);
+    new_list.ptr as i64
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn forge_list_slice_copy(list_ptr: i64, start: i64, end: i64) -> i64 {
+    forge_list_slice(list_ptr, start, end)
 }
 
 /// Replace all occurrences of `from` with `to` in `s`

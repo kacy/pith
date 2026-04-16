@@ -71,7 +71,7 @@ impl ListImpl {
         self.elem_size == 8
     }
 
-    fn sync_value_view(&mut self) {
+    pub(crate) fn sync_value_view(&mut self) {
         if self.uses_value_storage() {
             self.values8_len = self.values8.len();
             self.values8_ptr = if self.values8_len == 0 {
@@ -85,7 +85,7 @@ impl ListImpl {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         if self.uses_value_storage() {
             self.values8.len()
         } else {
@@ -133,7 +133,7 @@ impl ListImpl {
         }
     }
 
-    fn get_value(&self, index: usize) -> Option<i64> {
+    pub(crate) fn get_value(&self, index: usize) -> Option<i64> {
         if self.uses_value_storage() {
             self.values8.get(index).copied()
         } else {

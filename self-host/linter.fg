@@ -130,12 +130,12 @@ fn is_snake_case(name: String) -> Bool:
     c := ord(name[0])
     if not is_lowercase_char(c) and name[0] != "_":
         return false
-    mut i := 0
-    while i < name.len():
-        ch := ord(name[i])
-        if not is_lowercase_char(ch) and not is_digit_char(ch) and name[i] != "_":
+    for ch, i in name:
+        if i == 0:
+            continue
+        code := ord(ch)
+        if not is_lowercase_char(code) and not is_digit_char(code) and ch != "_":
             return false
-        i = i + 1
     return true
 
 # ---------------------------------------------------------------
@@ -157,14 +157,12 @@ fn is_pascal_case(name: String) -> Bool:
         return false
     # no underscores
     mut has_lower := false
-    mut i := 0
-    while i < name.len():
-        ch := ord(name[i])
-        if not is_alphanumeric_char(ch):
+    for ch in name:
+        code := ord(ch)
+        if not is_alphanumeric_char(code):
             return false
-        if is_lowercase_char(ch):
+        if is_lowercase_char(code):
             has_lower = true
-        i = i + 1
     # must have at least one lowercase letter (HELLO is not PascalCase)
     return name.len() == 1 or has_lower
 

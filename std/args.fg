@@ -110,8 +110,7 @@ fn replace_field(record: String, field_idx: Int, new_val: String) -> String:
 fn rebuild_with_match(data: String, match_idx: Int, match_val: String, field_idx: Int, new_val: String) -> String:
     recs := get_records(data)
     mut result := ""
-    mut i := 0
-    for current_rec in recs:
+    for current_rec, i in recs:
         mut rec := current_rec
         if get_field(rec, match_idx) == match_val:
             rec = replace_field(rec, field_idx, new_val)
@@ -119,7 +118,6 @@ fn rebuild_with_match(data: String, match_idx: Int, match_val: String, field_idx
             result = result + "~" + rec
         else:
             result = rec
-        i = i + 1
     return result
 
 fn rebuild_with_update(data: String, name: String, field_idx: Int, new_val: String) -> String:
@@ -200,8 +198,7 @@ fn find_eq(s: String) -> Int:
 fn rebuild_with_update_by_index(data: String, rec_idx: Int, field_idx: Int, new_val: String) -> String:
     recs := get_records(data)
     mut result := ""
-    mut i := 0
-    for current_rec in recs:
+    for current_rec, i in recs:
         mut rec := current_rec
         if i == rec_idx:
             rec = replace_field(rec, field_idx, new_val)
@@ -209,7 +206,6 @@ fn rebuild_with_update_by_index(data: String, rec_idx: Int, field_idx: Int, new_
             result = result + "~" + rec
         else:
             result = rec
-        i = i + 1
     return result
 
 fn add_error(msg: String):

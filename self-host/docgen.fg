@@ -68,15 +68,11 @@ fn contains_case_insensitive(haystack: String, needle: String) -> Bool:
         return false
     # build lowercase versions
     mut lower_h := ""
-    mut i := 0
-    while i < haystack.len():
-        lower_h = lower_h + char_to_lowercase(haystack[i])
-        i = i + 1
+    for ch in haystack:
+        lower_h = lower_h + char_to_lowercase(ch)
     mut lower_n := ""
-    i = 0
-    while i < needle.len():
-        lower_n = lower_n + char_to_lowercase(needle[i])
-        i = i + 1
+    for ch in needle:
+        lower_n = lower_n + char_to_lowercase(ch)
     # scan for match
     mut j := 0
     while j + lower_n.len() <= lower_h.len():
@@ -90,9 +86,7 @@ fn d_escape_json_string(s: String) -> String:
     quote := chr(34)
     backslash := chr(92)
     mut output := ""
-    mut i := 0
-    while i < s.len():
-        ch := s[i]
+    for ch in s:
         if ch == quote:
             output = output + backslash + quote
         elif ch == backslash:
@@ -103,7 +97,6 @@ fn d_escape_json_string(s: String) -> String:
             output = output + backslash + "t"
         else:
             output = output + ch
-        i = i + 1
     return output
 
 # strip the "# " prefix from a comment line.
@@ -287,24 +280,22 @@ pub fn doc_format() -> String:
             end = end - 1
         if start < end:
             output = output + chr(10)
-            mut i := start
-            while i < end:
-                if d_header_lines[i] == "":
+            for line, i in d_header_lines:
+                if i < start or i >= end:
+                    continue
+                if line == "":
                     output = output + chr(10)
                 else:
-                    output = output + "  " + d_header_lines[i] + chr(10)
-                i = i + 1
+                    output = output + "  " + line + chr(10)
 
     # items
     if d_count > 0:
         output = output + chr(10)
-        mut i := 0
-        while i < d_count:
-            output = output + d_sigs[i] + chr(10)
+        for sig, i in d_sigs:
+            output = output + sig + chr(10)
             if d_docs[i] != "":
                 output = output + "  " + d_docs[i] + chr(10)
             output = output + chr(10)
-            i = i + 1
 
     return output
 
@@ -317,17 +308,15 @@ pub fn doc_format_json() -> String:
     output = output + Q + "module" + Q + ":" + Q + d_escape_json_string(d_mod_name) + Q
     output = output + "," + Q + "description" + Q + ":" + Q + d_escape_json_string(d_mod_desc) + Q
     output = output + "," + Q + "items" + Q + ":["
-    mut i := 0
-    while i < d_count:
+    for name, i in d_names:
         if i > 0:
             output = output + ","
         output = output + LB
-        output = output + Q + "name" + Q + ":" + Q + d_escape_json_string(d_names[i]) + Q
+        output = output + Q + "name" + Q + ":" + Q + d_escape_json_string(name) + Q
         output = output + "," + Q + "kind" + Q + ":" + Q + d_escape_json_string(d_kinds[i]) + Q
         output = output + "," + Q + "signature" + Q + ":" + Q + d_escape_json_string(d_sigs[i]) + Q
         output = output + "," + Q + "doc" + Q + ":" + Q + d_escape_json_string(d_docs[i]) + Q
         output = output + RB
-        i = i + 1
     output = output + "]"
     output = output + RB
     return output
@@ -336,12 +325,10 @@ pub fn doc_format_json() -> String:
 # prints warnings for undocumented items. returns count of missing docs.
 pub fn doc_check() -> Int:
     mut missing := 0
-    mut i := 0
-    while i < d_count:
-        if d_docs[i] == "":
+    for doc, i in d_docs:
+        if doc == "":
             print("  missing doc: " + d_sigs[i])
             missing = missing + 1
-        i = i + 1
     return missing
 
 # --- search ---
@@ -433,12 +420,9 @@ pub fn doc_search(query: String, start_dir: String) -> String!:
     mut output := "search: " + chr(34) + query + chr(34) + chr(10)
     mut found := false
 
-    mut fi := 0
-    while fi < d_file_list.len():
-        path := d_file_list[fi]
+    for path in d_file_list:
         content := read_file(path)!
         if content == "":
-            fi = fi + 1
             continue
         mod_name := convert_path_to_module(path, stdlib_root)
 
@@ -449,11 +433,9 @@ pub fn doc_search(query: String, start_dir: String) -> String!:
 
         # check item-level matches
         mut matching_items: List[Int] := []
-        mut ii := 0
-        while ii < d_count:
-            if contains_case_insensitive(d_names[ii], query) or contains_case_insensitive(d_docs[ii], query) or contains_case_insensitive(d_sigs[ii], query):
-                matching_items.push(ii)
-            ii = ii + 1
+        for name, i in d_names:
+            if contains_case_insensitive(name, query) or contains_case_insensitive(d_docs[i], query) or contains_case_insensitive(d_sigs[i], query):
+                matching_items.push(i)
 
         if mod_match or matching_items.len() > 0:
             found = true
@@ -465,16 +447,12 @@ pub fn doc_search(query: String, start_dir: String) -> String!:
 
             if mod_match:
                 # module name/description matched — show all items
-                mut j := 0
-                while j < d_count:
-                    output = output + "    " + d_sigs[j] + chr(10)
-                    j = j + 1
+                for sig in d_sigs:
+                    output = output + "    " + sig + chr(10)
             else:
                 # only specific items matched — show those
                 for idx in matching_items:
                     output = output + "    " + d_sigs[idx] + chr(10)
-
-        fi = fi + 1
 
     if not found:
         output = output + chr(10) + "  no results" + chr(10)

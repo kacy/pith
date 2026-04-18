@@ -5,6 +5,8 @@
 #
 #   from std.algo import sort, sort_desc, sort_strings, binary_search, strcmp
 
+from std.collections import reversed, reversed_strings
+
 # ===============================================================
 # Sorting
 # ===============================================================
@@ -17,13 +19,11 @@ pub fn sort(list: List[Int]) -> List[Int]:
     mid := n / 2
     mut left: List[Int] := []
     mut right: List[Int] := []
-    mut i := 0
-    while i < mid:
-        left.push(list[i])
-        i = i + 1
-    while i < n:
-        right.push(list[i])
-        i = i + 1
+    for item, i in list:
+        if i < mid:
+            left.push(item)
+        else:
+            right.push(item)
     left = sort(left)
     right = sort(right)
     return merge(left, right)
@@ -52,13 +52,7 @@ fn merge(a: List[Int], b: List[Int]) -> List[Int]:
 # Merge sort descending
 pub fn sort_desc(list: List[Int]) -> List[Int]:
     sorted := sort(list)
-    n := sorted.len()
-    mut result: List[Int] := []
-    mut i := n - 1
-    while i >= 0:
-        result.push(sorted[i])
-        i = i - 1
-    return result
+    return reversed(sorted)
 
 # Lexicographic string comparison. Returns -1, 0, or 1.
 pub fn strcmp(a: String, b: String) -> Int:
@@ -88,13 +82,11 @@ pub fn sort_strings(list: List[String]) -> List[String]:
     mid := n / 2
     mut left: List[String] := []
     mut right: List[String] := []
-    mut i := 0
-    while i < mid:
-        left.push(list[i])
-        i = i + 1
-    while i < n:
-        right.push(list[i])
-        i = i + 1
+    for item, i in list:
+        if i < mid:
+            left.push(item)
+        else:
+            right.push(item)
     left = sort_strings(left)
     right = sort_strings(right)
     return merge_strings(left, right)

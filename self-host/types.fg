@@ -4,6 +4,8 @@
 # kind tag instead of tagged union, global lists instead of pointer-based
 # tables. TypeIds are plain integers indexing into a flat list.
 
+from std.collections import copy_list
+
 # ---------------------------------------------------------------
 # type id constants — must match the zig bootstrap
 # ---------------------------------------------------------------
@@ -86,9 +88,7 @@ pub fn ti_function(param_types: List[Int], return_type: Int) -> TypeInfo:
     mut empty_i: List[Int] := []
     mut empty_b: List[Bool] := []
     mut empty_li: List[List[Int]] := []
-    mut copied_params: List[Int] := []
-    for param_type in param_types:
-        copied_params.push(param_type)
+    copied_params := copy_list(param_types)
     return TypeInfo("function", "", empty_s, empty_i, empty_b, empty_b, copied_params, return_type, -1, -1, -1, empty_i, empty_s, empty_li)
 
 pub fn ti_optional(inner: Int) -> TypeInfo:

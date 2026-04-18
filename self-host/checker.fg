@@ -2425,29 +2425,24 @@ fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_pa
 
     if node.kind == "tuple_type":
         if actual_info.kind == "tuple":
-            mut i := 0
-            while i < node.children.len():
+            for child, i in node.children:
                 if i < actual_info.elements.len():
-                    if infer_generic_subst_from_type_node(node.children[i], actual_info.elements[i], generic_params) == false:
+                    if infer_generic_subst_from_type_node(child, actual_info.elements[i], generic_params) == false:
                         return false
-                i = i + 1
         return true
 
     if node.kind == "fn_type":
         if actual_info.kind == "function":
-            mut i := 0
-            while i < node.children.len():
-                cn := get_node(node.children[i])
+            for child, i in node.children:
+                cn := get_node(child)
                 if cn.kind == "param":
                     if i < actual_info.param_types.len():
                         if infer_generic_subst_from_type_node(cn.children[0], actual_info.param_types[i], generic_params) == false:
                             return false
-                    i = i + 1
                     continue
                 if cn.kind == "returns":
                     if cn.children.len() > 0:
                         return infer_generic_subst_from_type_node(cn.children[0], actual_info.return_type, generic_params)
-                i = i + 1
         return true
 
     return true
@@ -3921,12 +3916,10 @@ fn types_structurally_equal(a: Int, b: Int) -> Bool:
         if bi.kind == "function":
             if ai.param_types.len() != bi.param_types.len():
                 return false
-            mut i := 0
-            for ap in ai.param_types:
+            for ap, i in ai.param_types:
                 if i < bi.param_types.len():
                     if types_structurally_equal(ap, bi.param_types[i]) == false:
                         return false
-                i = i + 1
             if types_structurally_equal(ai.return_type, bi.return_type) == false:
                 return false
             return true
@@ -3935,12 +3928,10 @@ fn types_structurally_equal(a: Int, b: Int) -> Bool:
         if bi.kind == "tuple":
             if ai.elements.len() != bi.elements.len():
                 return false
-            mut i := 0
-            for ae in ai.elements:
+            for ae, i in ai.elements:
                 if i < bi.elements.len():
                     if types_structurally_equal(ae, bi.elements[i]) == false:
                         return false
-                i = i + 1
             return true
     # result structural equality
     if ai.kind == "result":
@@ -3979,32 +3970,26 @@ fn types_structurally_equal(a: Int, b: Int) -> Bool:
         if bi.kind == "struct":
             if ai.fields.len() != bi.fields.len():
                 return false
-            mut i := 0
-            while i < ai.fields.len():
-                if ai.fields[i] != bi.fields[i]:
+            for field_name, i in ai.fields:
+                if field_name != bi.fields[i]:
                     return false
                 if types_structurally_equal(ai.field_types[i], bi.field_types[i]) == false:
                     return false
-                i = i + 1
             return true
     # enum structural equality
     if ai.kind == "enum":
         if bi.kind == "enum":
             if ai.variants.len() != bi.variants.len():
                 return false
-            mut i := 0
-            while i < ai.variants.len():
-                if ai.variants[i] != bi.variants[i]:
+            for variant_name, i in ai.variants:
+                if variant_name != bi.variants[i]:
                     return false
                 # compare variant field types
                 if ai.variant_types[i].len() != bi.variant_types[i].len():
                     return false
-                mut j := 0
-                while j < ai.variant_types[i].len():
-                    if types_structurally_equal(ai.variant_types[i][j], bi.variant_types[i][j]) == false:
+                for field_type, j in ai.variant_types[i]:
+                    if types_structurally_equal(field_type, bi.variant_types[i][j]) == false:
                         return false
-                    j = j + 1
-                i = i + 1
             return true
     return false
 

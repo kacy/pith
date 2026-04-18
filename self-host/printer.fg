@@ -607,17 +607,17 @@ fn print_if_expr(idx: Int, indent: Int):
     print_expr(node.children[0], indent + 1)
     print_expr(node.children[1], indent + 1)
     # elifs and else
-    mut i := 2
-    while i < node.children.len():
-        c := get_node(node.children[i])
+    for child, i in node.children:
+        if i < 2:
+            continue
+        c := get_node(child)
         if c.kind == "elif_branch":
             # elif has cond, expr
             print_expr(c.children[0], indent + 1)
             print_expr(c.children[1], indent + 1)
         else:
             # last is else expr
-            print_expr(node.children[i], indent + 1)
-        i = i + 1
+            print_expr(child, indent + 1)
 
 fn print_lambda(idx: Int, indent: Int):
     node := get_node(idx)

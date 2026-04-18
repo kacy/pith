@@ -1912,10 +1912,8 @@ fn ir_emit_map_literal(node: Node) -> Int:
         ir_emit_call0(map_r, "__map_new_int", "map_int")
     else:
         ir_emit_call0(map_r, "__map_new", "map")
-    mut i := 0
-    while i < node.children.len():
-        ir_emit_map_entry_insert(map_r, has_int_keys, get_node(node.children[i]))
-        i = i + 1
+    for child in node.children:
+        ir_emit_map_entry_insert(map_r, has_int_keys, get_node(child))
     return map_r
 
 fn ir_set_new_name(literal_type: String) -> String:
@@ -2305,13 +2303,10 @@ fn ir_emit_select_arm_body(body_idx: Int, bind_name: String, bind_r: Int, bind_t
 
 fn ir_select_probe_arm_indices(node: Node) -> List[Int]:
     mut probe_arms: List[Int] := []
-    mut i := 0
-    while i < node.children.len():
-        arm_idx := node.children[i]
+    for arm_idx in node.children:
         arm_node := get_node(arm_idx)
         if arm_node.kind == "select_recv_arm" or arm_node.kind == "select_send_arm":
             probe_arms.push(arm_idx)
-        i = i + 1
     return probe_arms
 
 fn ir_emit_select_probe_arm(arm_idx: Int, result_temp: String, end_l: String):

@@ -309,10 +309,8 @@ fn parse_and_check(path: String) -> ParsedModule!:
         exit(1)
 
     initialize_checker(path)
-    mut i := 0
-    while i < import_roots.len():
-        c_run_module(import_roots[i])
-        i = i + 1
+    for import_root in import_roots:
+        c_run_module(import_root)
     diags := c_run_module(root)
     if has_errors(diags):
         print(render_diagnostics(diags, source))
@@ -322,19 +320,15 @@ fn parse_and_check(path: String) -> ParsedModule!:
 
 fn configure_emitter(import_roots: List[Int], emit_tests: Bool):
     mut import_paths: List[String] := []
-    mut i := 0
-    while i < import_roots.len():
-        import_paths.push(get_resolved_module_path(import_roots[i]))
-        i = i + 1
+    for import_root in import_roots:
+        import_paths.push(get_resolved_module_path(import_root))
     set_import_roots(import_roots, import_paths)
     set_test_mode(emit_tests)
 
 fn module_root_map(import_roots: List[Int]) -> Map[String, Int]:
     mut roots_by_path: Map[String, Int] := {}
-    mut i := 0
-    while i < import_roots.len():
-        roots_by_path.insert(get_resolved_module_path(import_roots[i]), import_roots[i])
-        i = i + 1
+    for import_root in import_roots:
+        roots_by_path.insert(get_resolved_module_path(import_root), import_root)
     return roots_by_path
 
 fn module_dependency_roots(root: Int, import_roots: List[Int], roots_by_path: Map[String, Int]) -> List[Int]:
@@ -401,19 +395,16 @@ fn emit_combined_file(path: String, emit_tests: Bool) -> String!:
     mut imported_init_funcs: List[String] := []
     mut all_ir: List[String] := []
     roots_by_path := module_root_map(import_roots)
-    mut i := 0
-    while i < import_roots.len():
-        if should_skip_imported_module(import_roots[i]):
-            i = i + 1
+    for import_root, i in import_roots:
+        if should_skip_imported_module(import_root):
             continue
-        module_path := get_resolved_module_path(import_roots[i])
-        module_deps := module_dependency_roots(import_roots[i], import_roots, roots_by_path)
-        ir := emit_module_ir(import_roots[i], module_deps, false)
+        module_path := get_resolved_module_path(import_root)
+        module_deps := module_dependency_roots(import_root, import_roots, roots_by_path)
+        ir := emit_module_ir(import_root, module_deps, false)
         renamed := rename_import_ir(ir, module_path, i)
         for init_func in renamed.init_funcs:
             imported_init_funcs.push(init_func)
         all_ir.push(renamed.ir)
-        i = i + 1
     # the root module keeps its own names. imported modules are already emitted
     # with stable qualified symbols, so the only remaining combined-file tweak
     # is to inject any imported init calls into main.

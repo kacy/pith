@@ -12,6 +12,7 @@
 
 from std.io import ProcessStdin, ProcessStdout, ProcessStderr
 from std.concurrent import Context, BlockingError, WaitError, blocking_failed, blocking_from_wait
+from std.collections import copy_list
 import std.time as time
 
 pub struct Command:
@@ -29,40 +30,34 @@ pub struct Output:
     pub stdout: String
     pub stderr: String
 
-fn copy_string_list(items: List[String]) -> List[String]:
-    mut copied: List[String] := []
-    for item in items:
-        copied.push(item)
-    return copied
-
 pub fn command(program: String) -> Command:
     return Command(program, [], "", [], [])
 
 impl Command:
     fn arg(value: String) -> Command:
-        argv := copy_string_list(self.argv)
+        argv := copy_list(self.argv)
         argv.push(value)
-        return Command(self.program, argv, self.cwd_path, copy_string_list(self.env_keys), copy_string_list(self.env_values))
+        return Command(self.program, argv, self.cwd_path, copy_list(self.env_keys), copy_list(self.env_values))
 
     fn args(values: List[String]) -> Command:
-        argv := copy_string_list(self.argv)
+        argv := copy_list(self.argv)
         for value in values:
             argv.push(value)
-        return Command(self.program, argv, self.cwd_path, copy_string_list(self.env_keys), copy_string_list(self.env_values))
+        return Command(self.program, argv, self.cwd_path, copy_list(self.env_keys), copy_list(self.env_values))
 
     fn env(name: String, value: String) -> Command:
-        keys := copy_string_list(self.env_keys)
-        values := copy_string_list(self.env_values)
+        keys := copy_list(self.env_keys)
+        values := copy_list(self.env_values)
         idx := keys.index_of(name)
         if idx >= 0:
             values[idx] = value
         else:
             keys.push(name)
             values.push(value)
-        return Command(self.program, copy_string_list(self.argv), self.cwd_path, keys, values)
+        return Command(self.program, copy_list(self.argv), self.cwd_path, keys, values)
 
     fn cwd(path: String) -> Command:
-        return Command(self.program, copy_string_list(self.argv), path, copy_string_list(self.env_keys), copy_string_list(self.env_values))
+        return Command(self.program, copy_list(self.argv), path, copy_list(self.env_keys), copy_list(self.env_values))
 
     fn start() -> Process!:
         return start(self)

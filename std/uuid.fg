@@ -3,6 +3,12 @@
 ## Functions:
 ##   v4() -> String    Generate a random UUID v4
 
+from std.collections import range
+
+fn append_random_chars(parts: List[String], chars: String, count: Int):
+    for _i in range(0, count):
+        parts.push(chars[random_int(0, chars.len() - 1)])
+
 ## Generate a random UUID v4 string (e.g., "550e8400-e29b-41d4-a716-446655440000")
 pub fn v4() -> String:
     # UUID v4: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
@@ -10,35 +16,20 @@ pub fn v4() -> String:
     hex_chars := "0123456789abcdef"
     mut parts: List[String] := []
     # 8 hex chars
-    mut i := 0
-    while i < 8:
-        parts.push(hex_chars[random_int(0, 15)])
-        i = i + 1
+    append_random_chars(parts, hex_chars, 8)
     parts.push("-")
     # 4 hex chars
-    i = 0
-    while i < 4:
-        parts.push(hex_chars[random_int(0, 15)])
-        i = i + 1
+    append_random_chars(parts, hex_chars, 4)
     parts.push("-4")  # version 4
     # 3 hex chars
-    i = 0
-    while i < 3:
-        parts.push(hex_chars[random_int(0, 15)])
-        i = i + 1
+    append_random_chars(parts, hex_chars, 3)
     parts.push("-")
     # variant: 8, 9, a, or b
     variant_chars := "89ab"
     parts.push(variant_chars[random_int(0, 3)])
     # 3 hex chars
-    i = 0
-    while i < 3:
-        parts.push(hex_chars[random_int(0, 15)])
-        i = i + 1
+    append_random_chars(parts, hex_chars, 3)
     parts.push("-")
     # 12 hex chars
-    i = 0
-    while i < 12:
-        parts.push(hex_chars[random_int(0, 15)])
-        i = i + 1
+    append_random_chars(parts, hex_chars, 12)
     return parts.join("")

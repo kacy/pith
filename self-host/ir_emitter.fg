@@ -3416,10 +3416,8 @@ fn ir_root_items(root_idx: Int) -> List[Int]:
         return ir_root_items_cache[root_idx]
     root := get_node(root_idx)
     mut items: List[Int] := []
-    mut i := 0
-    while i < root.children.len():
-        items.push(ir_unwrap_pub_child(root.children[i]))
-        i = i + 1
+    for child in root.children:
+        items.push(ir_unwrap_pub_child(child))
     ir_root_items_cache.insert(root_idx, items)
     return items
 
@@ -3427,11 +3425,9 @@ fn ir_is_fn_decl_kind(kind: String) -> Bool:
     return kind == "fn" or kind == "fn_decl"
 
 fn ir_has_generic_params(node: Node) -> Bool:
-    mut i := 0
-    while i < node.children.len():
-        if get_node(node.children[i]).kind == "generic_param":
+    for child in node.children:
+        if get_node(child).kind == "generic_param":
             return true
-        i = i + 1
     return false
 
 fn ir_collect_generic_param_names(node: Node) -> List[String]:
@@ -3773,25 +3769,20 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_generic_module_path = saved_module_path
 
 fn ir_emit_generic_specializations():
-    mut i := 0
-    while i < ir_generic_specialization_keys.len():
-        key := ir_generic_specialization_keys[i]
+    for key in ir_generic_specialization_keys:
         if not ir_generic_emitted_specializations.contains_key(key):
             ir_emit_generic_specialization(key)
             ir_generic_emitted_specializations.insert(key, 1)
-        i = i + 1
 
 fn ir_collect_impl_method_signatures(node: Node, module_path: String):
     impl_type := ir_impl_target_type(node)
     if impl_type.len() == 0:
         return
-    mut i := 0
-    while i < node.children.len():
-        method_idx := ir_unwrap_pub_child(node.children[i])
+    for child in node.children:
+        method_idx := ir_unwrap_pub_child(child)
         method_node := get_node(method_idx)
         if ir_is_fn_decl_kind(method_node.kind):
             ir_record_impl_method_signature(impl_type, method_idx, method_node, module_path)
-        i = i + 1
 
 fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_node: Node, module_path: String):
     method_name := method_node.value
@@ -3845,11 +3836,9 @@ fn ir_emit_test_main(root_idx: Int):
     ir_prepare_func_emission("int")
     ir_emit_func_header("main", 0, "int")
 
-    mut i := 0
-    while i < tests.len():
+    for _test_idx, i in tests:
         test_r := ir_reg()
         ir_emit_call0(test_r, "__test_" + i.to_string(), "int")
-        i = i + 1
 
     ir_emit_default_return()
 
@@ -4060,24 +4049,18 @@ fn ir_emit_collection_global_init(binding: Node):
 
 fn ir_emit_init_globals(root: Node):
     mut has_collection_globals := false
-    mut i := 0
-    while i < root.children.len():
-        child := root.children[i]
+    for child in root.children:
         cn := ir_unwrap_pub_node(child)
         if ir_is_binding_kind(cn.kind) and ir_binding_has_collection_init(cn):
             has_collection_globals = true
-        i = i + 1
     if not has_collection_globals:
         return
 
     ir_emit_func_header("__init_globals", 0, "int")
-    i = 0
-    while i < root.children.len():
-        child := root.children[i]
+    for child in root.children:
         cn := ir_unwrap_pub_node(child)
         if ir_is_binding_kind(cn.kind):
             ir_emit_collection_global_init(cn)
-        i = i + 1
     dr := ir_reg()
     ir_emit("iconst " + dr.to_string() + " 0")
     ir_emit("ret " + dr.to_string())

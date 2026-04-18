@@ -3,6 +3,17 @@
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
 REGRESSION_EXPECTED := $(wildcard tests/expected/*.txt)
+SLOW_NATIVE_REGRESSIONS := \
+	test_http_app_helpers \
+	test_http_websocket_app \
+	test_websocket_accept_buffered \
+	test_websocket_bytes \
+	test_websocket_fragmentation \
+	test_websocket_frames \
+	test_websocket_handshake \
+	test_websocket_session \
+	test_websocket_wire
+FAST_REGRESSION_EXPECTED := $(filter-out $(addprefix tests/expected/,$(addsuffix .txt,$(SLOW_NATIVE_REGRESSIONS))),$(REGRESSION_EXPECTED))
 LIVE_WEBSOCKET_EXPECTED := $(wildcard tests/live/expected/*.txt)
 PARSE_INVALID_EXAMPLES := $(wildcard tests/invalid_parse/*.fg)
 INVALID_EXAMPLES := $(wildcard tests/invalid/*.fg)
@@ -181,13 +192,35 @@ run-regressions: build run-regressions-only
 run-regressions-only:
 	@echo "--- regression cases (Cranelift backend) ---"
 	@pass=0; fail=0; \
-	for f in $(REGRESSION_EXPECTED); do \
+	for f in $(FAST_REGRESSION_EXPECTED); do \
 		name=$$(basename "$$f" .txt); \
 		actual=$$(timeout 15 ./target/release/forge run "tests/cases/$$name.fg" 2>/dev/null); \
 		expected=$$(cat "$$f"); \
 		if [ "$$actual" = "$$expected" ]; then \
 			pass=$$((pass+1)); \
 			echo "ok   $$name"; \
+		else \
+			echo "FAIL $$name"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	for name in $(SLOW_NATIVE_REGRESSIONS); do \
+		expected_file="tests/expected/$$name.txt"; \
+		if [ ! -f "$$expected_file" ]; then \
+			echo "FAIL $$name (missing $$expected_file)"; \
+			fail=$$((fail+1)); \
+			continue; \
+		fi; \
+		if timeout 120 ./target/release/forge build "tests/cases/$$name.fg" >/dev/null 2>/dev/null; then \
+			actual=$$(timeout 15 "./tests/cases/$$name" 2>/dev/null); \
+			expected=$$(cat "$$expected_file"); \
+			if [ "$$actual" = "$$expected" ]; then \
+				pass=$$((pass+1)); \
+				echo "ok   $$name"; \
+			else \
+				echo "FAIL $$name"; \
+				fail=$$((fail+1)); \
+			fi; \
 		else \
 			echo "FAIL $$name"; \
 			fail=$$((fail+1)); \

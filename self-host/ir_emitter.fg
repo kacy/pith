@@ -795,9 +795,9 @@ fn ir_declared_callable_return_type(fname: String) -> String:
 
 fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
     mut arg_regs: List[Int] := []
-    mut i := start_idx
-    while i < node.children.len():
-        child := node.children[i]
+    for child, i in node.children:
+        if i < start_idx:
+            continue
         child_kind := node_kind(child)
         if child_kind == "arg":
             cn := get_node(child)
@@ -805,15 +805,12 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
                 arg_regs.push(ir_expr(cn.children[0]))
         else:
             arg_regs.push(ir_expr(child))
-        i = i + 1
     return arg_regs
 
 fn ir_join_arg_regs(arg_regs: List[Int]) -> String:
     mut call_text := ""
-    mut i := 0
-    while i < arg_regs.len():
-        call_text = call_text + " " + arg_regs[i].to_string()
-        i = i + 1
+    for arg_reg in arg_regs:
+        call_text = call_text + " " + arg_reg.to_string()
     return call_text
 
 fn ir_emit_resolved_call(result_reg: Int, fname: String, idx: Int, arg_regs: List[Int], uses_result_abi: Bool):
@@ -1941,11 +1938,9 @@ fn ir_emit_set_literal(node: Node) -> Int:
     set_r := ir_reg()
     literal_type := ir_literal_expr_type(node, "set")
     ir_emit_call0(set_r, ir_set_new_name(literal_type), literal_type)
-    mut i := 0
-    while i < node.children.len():
-        elem_r := ir_expr(node.children[i])
+    for child in node.children:
+        elem_r := ir_expr(child)
         ir_emit_call2(ir_reg(), ir_set_add_name(literal_type), "void", set_r, elem_r)
-        i = i + 1
     return set_r
 
 fn ir_emit_list_literal(node: Node) -> Int:
@@ -2355,14 +2350,12 @@ fn ir_emit_select_expr(node: Node) -> Int:
     mut default_idx := 0 - 1
     probe_arms := ir_select_probe_arm_indices(node)
     probe_count := probe_arms.len()
-    mut i := 0
-    while i < node.children.len():
-        arm_node := get_node(node.children[i])
+    for child in node.children:
+        arm_node := get_node(child)
         if arm_node.kind == "select_timeout_arm" and timeout_idx < 0:
-            timeout_idx = node.children[i]
+            timeout_idx = child
         elif arm_node.kind == "select_default_arm" and default_idx < 0:
-            default_idx = node.children[i]
-        i = i + 1
+            default_idx = child
 
     mut deadline_name := ""
     if timeout_idx >= 0:
@@ -2395,7 +2388,7 @@ fn ir_emit_select_expr(node: Node) -> Int:
         probe_done_l := ir_label()
         offset_r := ir_reg()
         ir_emit("load " + offset_r.to_string() + " " + offset_name)
-        i = 0
+        mut i := 0
         while i < probe_count:
             case_l := ir_label()
             next_case_l := ir_label()
@@ -4112,34 +4105,26 @@ fn ir_emit_top_level_items(root_idx: Int, root: Node):
 fn ir_append_lambda_bodies():
     bodies: List[String] := ir_lambda_bodies
     mut lines: List[String] := ir_lines
-    mut i := 0
-    while i < bodies.len():
-        lines.push(bodies[i])
-        i = i + 1
+    for body in bodies:
+        lines.push(body)
     ir_lines = lines
 
 fn ir_preseed_result_error_strings():
     builtin_names := "parse_int,file_open_read,file_open_write,file_open_append,byte_buffer_write,byte_buffer_write_byte,file_write,file_write_bytes,tcp_connect,tcp_listen,tcp_accept,tcp_write,tcp_write_bytes,process_spawn,process_spawn_argv,process_output_argv,process_write,process_write_bytes,write_file,append_file,write_file_bytes,append_file_bytes,read_file,exec_output,dns_resolve,bytes_to_string_utf8,file_read,tcp_read,process_read,process_read_err,read_file_bytes,b64_decode,from_hex,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes".split(",")
-    mut i := 0
-    while i < builtin_names.len():
-        ir_str(builtin_names[i] + " failed")
-        i = i + 1
+    for builtin_name in builtin_names:
+        ir_str(builtin_name + " failed")
 
 fn ir_emit_string_table():
-    mut i := 0
-    while i < ir_strings.len():
+    for value, i in ir_strings:
         sid := "m" + ir_module_count.to_string() + "s" + i.to_string()
-        ir_emit("string " + sid + " " + chr(34) + ir_strings[i] + chr(34))
-        i = i + 1
+        ir_emit("string " + sid + " " + chr(34) + value + chr(34))
 
 fn ir_collect_root_import_metadata(root_idx: Int):
     ir_import_renames = {}
     ir_import_declared_functions = {}
     ir_import_declared_globals = {}
-    mut preload_i := 0
-    while preload_i < ir_preloaded_import_roots.len():
-        ir_collect_preloaded_root_metadata(ir_preloaded_import_roots[preload_i], ir_preloaded_import_paths[preload_i])
-        preload_i = preload_i + 1
+    for root, i in ir_preloaded_import_roots:
+        ir_collect_preloaded_root_metadata(root, ir_preloaded_import_paths[i])
 
 fn ir_collect_root_phase_one_metadata(root_idx: Int):
     ir_func_returns = {}
@@ -4147,13 +4132,11 @@ fn ir_collect_root_phase_one_metadata(root_idx: Int):
     ir_generic_decl_indices = {}
     ir_generic_decl_module_paths = {}
 
-    mut preload_i := 0
-    while preload_i < ir_preloaded_import_roots.len():
+    for root, preload_i in ir_preloaded_import_roots:
         mut module_path := ""
         if preload_i < ir_preloaded_import_paths.len():
             module_path = ir_preloaded_import_paths[preload_i]
-        ir_collect_generic_function_decls_from_root(ir_preloaded_import_roots[preload_i], module_path)
-        preload_i = preload_i + 1
+        ir_collect_generic_function_decls_from_root(root, module_path)
 
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)

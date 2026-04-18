@@ -68,15 +68,11 @@ fn contains_case_insensitive(haystack: String, needle: String) -> Bool:
         return false
     # build lowercase versions
     mut lower_h := ""
-    mut i := 0
-    while i < haystack.len():
-        lower_h = lower_h + char_to_lowercase(haystack[i])
-        i = i + 1
+    for ch in haystack:
+        lower_h = lower_h + char_to_lowercase(ch)
     mut lower_n := ""
-    i = 0
-    while i < needle.len():
-        lower_n = lower_n + char_to_lowercase(needle[i])
-        i = i + 1
+    for ch in needle:
+        lower_n = lower_n + char_to_lowercase(ch)
     # scan for match
     mut j := 0
     while j + lower_n.len() <= lower_h.len():
@@ -90,9 +86,7 @@ fn d_escape_json_string(s: String) -> String:
     quote := chr(34)
     backslash := chr(92)
     mut output := ""
-    mut i := 0
-    while i < s.len():
-        ch := s[i]
+    for ch in s:
         if ch == quote:
             output = output + backslash + quote
         elif ch == backslash:
@@ -103,7 +97,6 @@ fn d_escape_json_string(s: String) -> String:
             output = output + backslash + "t"
         else:
             output = output + ch
-        i = i + 1
     return output
 
 # strip the "# " prefix from a comment line.

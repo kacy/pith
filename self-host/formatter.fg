@@ -20,9 +20,7 @@ pub fn fmt_source(source: String) -> String:
     mut output := ""
     mut consecutive_blank := 0
 
-    mut i := 0
-    while i < lines.len():
-        raw_line := lines[i]
+    for raw_line in lines:
         # trim trailing whitespace
         line := trim_right(raw_line)
 
@@ -31,7 +29,6 @@ pub fn fmt_source(source: String) -> String:
             consecutive_blank = consecutive_blank + 1
             if consecutive_blank <= 1:
                 output = output + chr(10)
-            i = i + 1
             continue
         consecutive_blank = 0
 
@@ -44,13 +41,11 @@ pub fn fmt_source(source: String) -> String:
                 output = output + line.substring(0, indent_len)
                 output = output + format_comment(trimmed)
                 output = output + chr(10)
-                i = i + 1
                 continue
 
         # for code lines, normalize spacing
         output = output + format_code_line(line)
         output = output + chr(10)
-        i = i + 1
 
     # ensure exactly one trailing newline
     while output.len() > 1:

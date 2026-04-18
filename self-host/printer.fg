@@ -214,9 +214,9 @@ fn print_impl_decl(idx: Int, indent: Int):
         print_type_node(node.children[0], indent + 1)
 
     # process remaining children
-    mut i := 1
-    while i < node.children.len():
-        child := node.children[i]
+    for child, i in node.children:
+        if i == 0:
+            continue
         c := get_node(child)
         if c.kind == "for_type":
             print_line(indent + 1, "for")
@@ -226,7 +226,6 @@ fn print_impl_decl(idx: Int, indent: Int):
             print_fn_decl(c.children[0], indent + 1)
         elif c.kind == "fn_decl":
             print_fn_decl(child, indent + 1)
-        i = i + 1
 
 fn print_type_alias(idx: Int, indent: Int):
     node := get_node(idx)
@@ -369,9 +368,9 @@ fn print_if_stmt(idx: Int, indent: Int):
     print_expr(node.children[0], indent + 1)
 
     # then: find the "then" node
-    mut ci := 1
-    while ci < node.children.len():
-        child := node.children[ci]
+    for child, ci in node.children:
+        if ci == 0:
+            continue
         c := get_node(child)
         if c.kind == "then":
             print_line(indent + 1, "then")
@@ -384,7 +383,6 @@ fn print_if_stmt(idx: Int, indent: Int):
         elif c.kind == "else":
             print_line(indent + 1, "else")
             print_block_contents(c.children[0], indent + 2)
-        ci = ci + 1
 
 fn print_for_stmt(idx: Int, indent: Int):
     node := get_node(idx)
@@ -405,18 +403,15 @@ fn print_match(idx: Int, indent: Int):
     # first child is subject
     print_expr(node.children[0], indent + 1)
     # remaining children are arms
-    mut i := 1
-    while i < node.children.len():
-        print_match_arm(node.children[i], indent + 1)
-        i = i + 1
+    for child, i in node.children:
+        if i > 0:
+            print_match_arm(child, indent + 1)
 
 fn print_match_arm(idx: Int, indent: Int):
     node := get_node(idx)
     print_line(indent, "arm")
     # children: pattern, optional guard, body
-    mut ci := 0
-    while ci < node.children.len():
-        child := node.children[ci]
+    for child in node.children:
         c := get_node(child)
         if c.kind == "guard":
             print_line(indent + 1, "guard")
@@ -435,7 +430,6 @@ fn print_match_arm(idx: Int, indent: Int):
         else:
             # pattern
             print_pattern(child, indent + 1)
-        ci = ci + 1
 
 fn print_return(idx: Int, indent: Int):
     node := get_node(idx)
@@ -500,10 +494,9 @@ fn print_expr(idx: Int, indent: Int):
         # first child is callee
         print_expr(node.children[0], indent + 1)
         # rest are args
-        mut i := 1
-        while i < node.children.len():
-            print_arg(node.children[i], indent + 1)
-            i = i + 1
+        for child, i in node.children:
+            if i > 0:
+                print_arg(child, indent + 1)
         return
 
     if node.kind == "method_call":
@@ -511,10 +504,9 @@ fn print_expr(idx: Int, indent: Int):
         # first child is receiver
         print_expr(node.children[0], indent + 1)
         # rest are args
-        mut i := 1
-        while i < node.children.len():
-            print_arg(node.children[i], indent + 1)
-            i = i + 1
+        for child, i in node.children:
+            if i > 0:
+                print_arg(child, indent + 1)
         return
 
     if node.kind == "field_access":

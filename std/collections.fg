@@ -94,24 +94,18 @@ pub fn max_of(list: List[Int]) -> Int:
     if list.len() == 0:
         return 0
     mut result := list[0]
-    n := list.len()
-    mut i := 1
-    while i < n:
-        if list[i] > result:
-            result = list[i]
-        i = i + 1
+    for item, i in list:
+        if i > 0 and item > result:
+            result = item
     return result
 
 pub fn min_of(list: List[Int]) -> Int:
     if list.len() == 0:
         return 0
     mut result := list[0]
-    n := list.len()
-    mut i := 1
-    while i < n:
-        if list[i] < result:
-            result = list[i]
-        i = i + 1
+    for item, i in list:
+        if i > 0 and item < result:
+            result = item
     return result
 
 pub fn average(list: List[Int]) -> Int:
@@ -166,12 +160,9 @@ pub fn count(list: List[Int], value: Int) -> Int:
 
 # True if list is sorted ascending
 pub fn is_sorted(list: List[Int]) -> Bool:
-    n := list.len()
-    mut i := 1
-    while i < n:
-        if list[i] < list[i - 1]:
+    for item, i in list:
+        if i > 0 and item < list[i - 1]:
             return false
-        i = i + 1
     return true
 
 # ===============================================================
@@ -192,10 +183,10 @@ pub fn take(list: List[Int], n: Int) -> List[Int]:
     mut count := min_int(n, list.len())
     if count < 0:
         count = 0
-    mut i := 0
-    while i < count:
-        result.push(list[i])
-        i = i + 1
+    for item, i in list:
+        if i >= count:
+            break
+        result.push(item)
     return result
 
 # Everything after the first n elements
@@ -204,11 +195,9 @@ pub fn drop(list: List[Int], n: Int) -> List[Int]:
     mut start := n
     if start < 0:
         start = 0
-    len := list.len()
-    mut i := start
-    while i < len:
-        result.push(list[i])
-        i = i + 1
+    for item, i in list:
+        if i >= start:
+            result.push(item)
     return result
 
 # Slice from start (inclusive) to end (exclusive)
@@ -221,35 +210,27 @@ pub fn slice(list: List[Int], start: Int, end: Int) -> List[Int]:
     mut hi := end
     if hi > n:
         hi = n
-    mut i := lo
-    while i < hi:
-        result.push(list[i])
-        i = i + 1
+    for item, i in list:
+        if i >= lo and i < hi:
+            result.push(item)
     return result
 
 # Remove consecutive duplicates (sort first for full dedup)
 pub fn unique(list: List[Int]) -> List[Int]:
-    n := list.len()
-    if n == 0:
+    if list.len() == 0:
         return []
     mut result: List[Int] := []
-    result.push(list[0])
-    mut i := 1
-    while i < n:
-        if list[i] != list[i - 1]:
-            result.push(list[i])
-        i = i + 1
+    for item, i in list:
+        if i == 0 or item != list[i - 1]:
+            result.push(item)
     return result
 
 # Remove all occurrences of a value
 pub fn without(list: List[Int], value: Int) -> List[Int]:
     mut result: List[Int] := []
-    n := list.len()
-    mut i := 0
-    while i < n:
-        if list[i] != value:
-            result.push(list[i])
-        i = i + 1
+    for item in list:
+        if item != value:
+            result.push(item)
     return result
 
 # ===============================================================

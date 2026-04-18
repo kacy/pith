@@ -3300,12 +3300,10 @@ fn ir_param_count(fn_idx: Int) -> Int:
     node := get_node(fn_idx)
     nk := node.children
     mut count := 0
-    mut i := 0
-    while i < nk.len():
-        cn := get_node(nk[i])
+    for child in nk:
+        cn := get_node(child)
         if cn.kind == "param":
             count = count + 1
-        i = i + 1
     return count
 
 fn ir_emit_named_param(name: String, param_type: String):
@@ -3318,12 +3316,10 @@ fn ir_emit_named_param(name: String, param_type: String):
 fn ir_emit_fn_params(fn_idx: Int):
     node := get_node(fn_idx)
     nk := node.children
-    mut i := 0
-    while i < nk.len():
-        cn := get_node(nk[i])
+    for child in nk:
+        cn := get_node(child)
         if cn.kind == "param":
-            ir_emit_named_param(cn.value, ir_extract_param_type(nk[i]))
-        i = i + 1
+            ir_emit_named_param(cn.value, ir_extract_param_type(child))
 
 fn ir_base_decl_name(name: String) -> String:
     if name.contains("["):
@@ -3332,17 +3328,13 @@ fn ir_base_decl_name(name: String) -> String:
 
 fn ir_extract_return_type(fn_idx: Int) -> String:
     node := get_node(fn_idx)
-    mut i := 0
-    while i < node.children.len():
-        cn := get_node(node.children[i])
+    for child in node.children:
+        cn := get_node(child)
         if cn.kind == "returns":
-            mut j := 0
-            while j < cn.children.len():
-                rn := get_node(cn.children[j])
+            for returns_child in cn.children:
+                rn := get_node(returns_child)
                 if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type":
-                    return ir_resolve_type_node(cn.children[j])
-                j = j + 1
-        i = i + 1
+                    return ir_resolve_type_node(returns_child)
     return "unknown"
 
 fn ir_lookup_func_return(full_name: String, base_name: String) -> String:
@@ -3436,10 +3428,8 @@ fn ir_sanitize_symbol_part(name: String) -> String:
 
 fn ir_generic_specialization_name(name: String, type_names: List[String]) -> String:
     mut suffix_parts: List[String] := []
-    mut i := 0
-    while i < type_names.len():
-        suffix_parts.push(ir_sanitize_symbol_part(type_names[i]))
-        i = i + 1
+    for type_name in type_names:
+        suffix_parts.push(ir_sanitize_symbol_part(type_name))
     return name + "__" + suffix_parts.join("_")
 
 fn ir_collect_generic_function_decls_from_root(root_idx: Int, module_path: String):
@@ -3450,24 +3440,20 @@ fn ir_collect_generic_function_decls_from_root(root_idx: Int, module_path: Strin
 
 fn ir_collect_generic_function_decls(root_idx: Int):
     ir_generic_decl_indices = {}
-    mut preload_i := 0
-    while preload_i < ir_preloaded_import_roots.len():
+    for root, preload_i in ir_preloaded_import_roots:
         mut module_path := ""
         if preload_i < ir_preloaded_import_paths.len():
             module_path = ir_preloaded_import_paths[preload_i]
-        ir_collect_generic_function_decls_from_root(ir_preloaded_import_roots[preload_i], module_path)
-        preload_i = preload_i + 1
+        ir_collect_generic_function_decls_from_root(root, module_path)
     ir_collect_generic_function_decls_from_root(root_idx, "")
 
 fn ir_is_generic_function_name(name: String) -> Bool:
     return ir_generic_decl_indices.contains_key(name)
 
 fn ir_specialize_type_name(name: String, generic_params: List[String], concrete_types: List[String]) -> String:
-    mut i := 0
-    while i < generic_params.len():
-        if i < concrete_types.len() and generic_params[i] == name:
+    for generic_param, i in generic_params:
+        if i < concrete_types.len() and generic_param == name:
             return concrete_types[i]
-        i = i + 1
     return ir_resolve_type_hint(name)
 
 fn ir_resolve_type_node_with_subst(type_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:

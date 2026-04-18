@@ -2697,24 +2697,19 @@ fn ir_emit_ident_load(name: String) -> Int:
 fn ir_emit_struct_init(node: Node) -> Int:
     sname := node.value
     mut field_regs: List[Int] := []
-    mut i := 0
-    while i < node.children.len():
-        child := node.children[i]
+    for child in node.children:
         cn := get_node(child)
         if cn.kind == "field_init" and cn.children.len() > 0:
             field_regs.push(ir_expr(cn.children[0]))
         else:
             field_regs.push(ir_expr(child))
-        i = i + 1
 
     r := ir_reg()
     field_count_r := ir_reg()
     ir_emit("iconst " + field_count_r.to_string() + " " + field_regs.len().to_string())
     ir_emit_call1(r, "__struct_alloc", "struct:" + sname, field_count_r)
-    mut fi := 0
-    while fi < field_regs.len():
-        ir_emit("sstore " + r.to_string() + " " + fi.to_string() + " " + field_regs[fi].to_string())
-        fi = fi + 1
+    for field_reg, fi in field_regs:
+        ir_emit("sstore " + r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
     return r
 
 fn ir_emit_spawn_expr(node: Node) -> Int:
@@ -3528,31 +3523,25 @@ fn ir_resolve_type_node_with_subst(type_idx: Int, generic_params: List[String], 
 
 fn ir_extract_return_type_with_subst(fn_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:
     node := get_node(fn_idx)
-    mut i := 0
-    while i < node.children.len():
-        cn := get_node(node.children[i])
+    for child in node.children:
+        cn := get_node(child)
         if cn.kind == "returns":
-            mut j := 0
-            while j < cn.children.len():
-                rn := get_node(cn.children[j])
+            for returns_child in cn.children:
+                rn := get_node(returns_child)
                 if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type" or rn.kind == "optional_type":
-                    return ir_resolve_type_node_with_subst(cn.children[j], generic_params, concrete_types)
-                j = j + 1
-        i = i + 1
+                    return ir_resolve_type_node_with_subst(returns_child, generic_params, concrete_types)
     return "unknown"
 
 fn ir_extract_param_types_with_subst(fn_idx: Int, generic_params: List[String], concrete_types: List[String]) -> List[String]:
     node := get_node(fn_idx)
     mut param_types: List[String] := []
-    mut i := 0
-    while i < node.children.len():
-        cn := get_node(node.children[i])
+    for child in node.children:
+        cn := get_node(child)
         if cn.kind == "param":
             if cn.children.len() > 0:
                 param_types.push(ir_resolve_type_node_with_subst(cn.children[0], generic_params, concrete_types))
             else:
                 param_types.push("")
-        i = i + 1
     return param_types
 
 fn ir_bind_inferred_generic_runtime_type(name: String, actual_tid: Int) -> Bool:
@@ -3941,13 +3930,10 @@ fn ir_collect_function_returns(root_idx: Int):
             ir_record_function_return(node)
 
 fn ir_record_function_return(node: Node):
-    mut i := 0
-    while i < node.children.len():
-        returns_idx := node.children[i]
+    for returns_idx in node.children:
         returns_node := get_node(returns_idx)
         if returns_node.kind == "returns":
             ir_record_returns_clause(node.value, returns_node)
-        i = i + 1
 
 fn ir_record_returns_clause(name: String, returns_node: Node):
     for type_idx in returns_node.children:

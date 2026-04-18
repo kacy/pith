@@ -12,15 +12,18 @@ jobs:
           version: 0.15.2
 
       - name: build
-        run: zig build
+        run: cargo build --release
 
       - name: test
-        run: zig build test
+        run: |
+          ./target/release/forge run tests/cases/test_suite.fg
+          ./target/release/forge run tests/cases/test_process_command.fg
+          ./target/release/forge run tests/cases/test_http_request_bytes.fg
 
       - name: check examples
         run: |
           for f in examples/*.fg; do
-            result=$(./zig-out/bin/forge check "$f" 2>&1)
+            result=$(./target/release/forge check "$f" 2>&1)
             if [ "$result" != "ok" ]; then
               echo "FAIL $f"
               echo "$result"
@@ -31,21 +34,6 @@ jobs:
 
       - name: run examples
         run: make run-examples
-
-      - name: build (release)
-        run: zig build release
-
-      - name: check examples (release)
-        run: |
-          for f in examples/*.fg; do
-            result=$(./zig-out/bin/forge check "$f" 2>&1)
-            if [ "$result" != "ok" ]; then
-              echo "FAIL $f (release)"
-              echo "$result"
-              exit 1
-            fi
-            echo "ok   $f"
-          done
 
       - name: build self-hosted compiler
         run: make self-host

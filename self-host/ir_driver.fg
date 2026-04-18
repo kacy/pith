@@ -32,10 +32,9 @@ fn usage():
 
 fn join_from(parts: List[String], start: Int) -> String:
     mut tail: List[String] := []
-    mut i := start
-    while i < parts.len():
-        tail.push(parts[i])
-        i = i + 1
+    for part, i in parts:
+        if i >= start:
+            tail.push(part)
     return tail.join(" ")
 
 fn line_end(text: String, start: Int) -> Int:
@@ -165,10 +164,8 @@ fn rename_import_ir(ir: String, module_path: String, module_index: Int) -> Renam
 
 fn inject_imported_init_calls(out: List[String], imported_init_funcs: List[String]) -> List[String]:
     mut with_inits := out
-    mut i := 0
-    while i < imported_init_funcs.len():
-        with_inits.push("call " + (900000 + i).to_string() + " " + imported_init_funcs[i] + " int 0")
-        i = i + 1
+    for init_func, i in imported_init_funcs:
+        with_inits.push("call " + (900000 + i).to_string() + " " + init_func + " int 0")
     return with_inits
 fn rewrite_main_ir(main_ir: String, imported_init_funcs: List[String]) -> String:
     main_lines := ir_lines(main_ir)

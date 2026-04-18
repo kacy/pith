@@ -78,22 +78,16 @@ pub fn filter_strings(items: List[String], keep: fn(String) -> Bool) -> List[Str
 
 pub fn sum(list: List[Int]) -> Int:
     mut total := 0
-    n := list.len()
-    mut i := 0
-    while i < n:
-        total = total + list[i]
-        i = i + 1
+    for item in list:
+        total = total + item
     return total
 
 pub fn product(list: List[Int]) -> Int:
     if list.len() == 0:
         return 1
     mut result := 1
-    n := list.len()
-    mut i := 0
-    while i < n:
-        result = result * list[i]
-        i = i + 1
+    for item in list:
+        result = result * item
     return result
 
 pub fn max_of(list: List[Int]) -> Int:
@@ -135,54 +129,39 @@ pub fn has(list: List[Int], value: Int) -> Bool:
 
 # True if all elements are non-zero
 pub fn all_nonzero(list: List[Int]) -> Bool:
-    n := list.len()
-    mut i := 0
-    while i < n:
-        if list[i] == 0:
+    for item in list:
+        if item == 0:
             return false
-        i = i + 1
     return true
 
 # True if any element is non-zero
 pub fn any_nonzero(list: List[Int]) -> Bool:
-    n := list.len()
-    mut i := 0
-    while i < n:
-        if list[i] != 0:
+    for item in list:
+        if item != 0:
             return true
-        i = i + 1
     return false
 
 # Index of first occurrence of value, or -1
 pub fn index_of(list: List[Int], value: Int) -> Int:
-    n := list.len()
-    mut i := 0
-    while i < n:
-        if list[i] == value:
+    for item, i in list:
+        if item == value:
             return i
-        i = i + 1
     return -1
 
 # Index of last occurrence of value, or -1
 pub fn last_index_of(list: List[Int], value: Int) -> Int:
     mut result := -1
-    n := list.len()
-    mut i := 0
-    while i < n:
-        if list[i] == value:
+    for item, i in list:
+        if item == value:
             result = i
-        i = i + 1
     return result
 
 # Count how many elements equal the value
 pub fn count(list: List[Int], value: Int) -> Int:
     mut result := 0
-    n := list.len()
-    mut i := 0
-    while i < n:
-        if list[i] == value:
+    for item in list:
+        if item == value:
             result = result + 1
-        i = i + 1
     return result
 
 # True if list is sorted ascending
@@ -281,35 +260,25 @@ pub fn without(list: List[Int], value: Int) -> List[Int]:
 pub fn zip(a: List[Int], b: List[Int]) -> List[String]:
     mut result: List[String] := []
     len := min_int(a.len(), b.len())
-    mut i := 0
-    while i < len:
-        result.push(a[i].to_string() + ":" + b[i].to_string())
-        i = i + 1
+    for left, i in a:
+        if i >= len:
+            break
+        result.push(left.to_string() + ":" + b[i].to_string())
     return result
 
 # Create "index:value" pairs
 pub fn enumerate(list: List[Int]) -> List[String]:
     mut result: List[String] := []
-    n := list.len()
-    mut i := 0
-    while i < n:
-        result.push(i.to_string() + ":" + list[i].to_string())
-        i = i + 1
+    for item, i in list:
+        result.push(i.to_string() + ":" + item.to_string())
     return result
 
 # Flatten a list of lists into a single list
 pub fn flatten(lists: List[List[Int]]) -> List[Int]:
     mut result: List[Int] := []
-    n := lists.len()
-    mut i := 0
-    while i < n:
-        inner := lists[i]
-        ni := inner.len()
-        mut j := 0
-        while j < ni:
-            result.push(inner[j])
-            j = j + 1
-        i = i + 1
+    for inner in lists:
+        for item in inner:
+            result.push(item)
     return result
 
 # Split list into chunks of given size
@@ -336,23 +305,17 @@ pub fn chunks(list: List[Int], size: Int) -> List[List[Int]]:
 # Elements in both lists
 pub fn intersection(a: List[Int], b: List[Int]) -> List[Int]:
     mut result: List[Int] := []
-    na := a.len()
-    mut i := 0
-    while i < na:
-        if has(b, a[i]):
-            result.push(a[i])
-        i = i + 1
+    for item in a:
+        if has(b, item):
+            result.push(item)
     return result
 
 # Elements in first but not second
 pub fn difference(a: List[Int], b: List[Int]) -> List[Int]:
     mut result: List[Int] := []
-    na := a.len()
-    mut i := 0
-    while i < na:
-        if not has(b, a[i]):
-            result.push(a[i])
-        i = i + 1
+    for item in a:
+        if not has(b, item):
+            result.push(item)
     return result
 
 pub fn set_union[T](left: Set[T], right: Set[T]) -> Set[T]:
@@ -453,12 +416,9 @@ pub fn reversed_strings(list: List[String]) -> List[String]:
 
 # True if any string in the list equals the value
 pub fn has_string(list: List[String], value: String) -> Bool:
-    n := list.len()
-    mut i := 0
-    while i < n:
-        if list[i] == value:
+    for item in list:
+        if item == value:
             return true
-        i = i + 1
     return false
 
 # Join strings with a separator (builtin .join() exists but this

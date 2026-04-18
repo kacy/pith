@@ -87,9 +87,9 @@ fn lint_fn_decl(node: Node, node_idx: Int, is_pub: Bool, source: String):
 
 fn lint_impl_decl(node: Node, source: String):
     # iterate methods
-    mut i := 1
-    while i < node.children.len():
-        method_idx := node.children[i]
+    for method_idx, i in node.children:
+        if i == 0:
+            continue
         method := get_node(method_idx)
         mut is_pub := false
         mut actual_idx := method_idx
@@ -112,7 +112,6 @@ fn lint_impl_decl(node: Node, source: String):
                 cn := get_node(child)
                 if cn.kind == "body":
                     lint_block_depth(cn, 1)
-        i = i + 1
 
 # ---------------------------------------------------------------
 # E300: snake_case for functions and variables
@@ -181,11 +180,9 @@ fn check_doc_comment(name: String, node_idx: Int, source: String):
     # search for the function declaration by looking for "fn name("
     search := "fn " + name + "("
     mut found_line := 0 - 1
-    mut i := 0
-    while i < lines.len():
-        if lines[i].contains(search):
+    for line, i in lines:
+        if line.contains(search):
             found_line = i
-        i = i + 1
     if found_line <= 0:
         # can't find or first line — skip
         return

@@ -18,12 +18,10 @@ CSV_FILE_CHUNK_SIZE := 4096
 pub fn parse(text: String) -> List[List[String]]:
     mut rows: List[List[String]] := []
     lines := text.split(chr(10))
-    mut i := 0
-    while i < lines.len():
-        line := lines[i].trim()
+    for raw_line in lines:
+        line := raw_line.trim()
         if line.len() > 0:
             rows.push(parse_row(line))
-        i = i + 1
     return rows
 
 pub fn parse_file(path: String) -> List[List[String]]!:
@@ -58,28 +56,23 @@ fn rows_with_headers(all_rows: List[List[String]]) -> List[Map[String, String]]:
     if all_rows.len() < 2:
         return result
     headers := all_rows[0]
-    mut i := 1
-    while i < all_rows.len():
-        row := all_rows[i]
+    for row, i in all_rows:
+        if i == 0:
+            continue
         mut record: Map[String, String] := {}
-        mut j := 0
-        while j < headers.len():
+        for header, j in headers:
             if j < row.len():
-                record.insert(headers[j], row[j])
+                record.insert(header, row[j])
             else:
-                record.insert(headers[j], "")
-            j = j + 1
+                record.insert(header, "")
         result.push(record)
-        i = i + 1
     return result
 
 ## Encode a list of rows into CSV text
 pub fn encode(rows: List[List[String]]) -> String:
     mut lines: List[String] := []
-    mut i := 0
-    while i < rows.len():
-        lines.push(encode_row(rows[i]))
-        i = i + 1
+    for row in rows:
+        lines.push(encode_row(row))
     return lines.join(chr(10))
 
 pub fn save(path: String, rows: List[List[String]]) -> Int!:
@@ -89,13 +82,11 @@ pub fn save_chunked(path: String, rows: List[List[String]], chunk_size: Int) -> 
     stream := FileStream(file_open_write(path)!)
     writer := stream.buffered_writer_chunked(chunk_size)
     mut total := 0
-    mut i := 0
-    while i < rows.len():
-        line := encode_row(rows[i])
+    for row, i in rows:
+        line := encode_row(row)
         total = total + writer.write(line)!
         if i + 1 < rows.len():
             total = total + writer.write(chr(10))!
-        i = i + 1
     total = total + writer.flush()!
     stream.close()
     return total
@@ -103,16 +94,13 @@ pub fn save_chunked(path: String, rows: List[List[String]], chunk_size: Int) -> 
 ## Encode a single row into a CSV line
 pub fn encode_row(row: List[String]) -> String:
     mut fields: List[String] := []
-    mut i := 0
-    while i < row.len():
-        field := row[i]
+    for field in row:
         if field.contains(",") or field.contains(chr(34)) or field.contains(chr(10)):
             # quote the field: escape internal quotes by doubling them
             escaped := field.replace(chr(34), chr(34) + chr(34))
             fields.push(chr(34) + escaped + chr(34))
         else:
             fields.push(field)
-        i = i + 1
     return fields.join(",")
 
 # Parse a single CSV line into fields (handles quoted fields)

@@ -15,11 +15,8 @@ pub struct Diagnostic:
 # render all diagnostics as human-readable text with source context.
 pub fn render_diagnostics(diags: List[Diagnostic], source: String) -> String:
     mut output := ""
-    mut i := 0
-    while i < diags.len():
-        d := diags[i]
+    for d in diags:
         output = output + render_single_diagnostic(d, source)
-        i = i + 1
     return output
 
 # render a single diagnostic with source context and underline.
@@ -68,12 +65,10 @@ fn render_single_diagnostic(d: Diagnostic, source: String) -> String:
 # render diagnostics as JSON (same format as check_main.fg).
 pub fn render_diagnostics_json(diags: List[Diagnostic]) -> String:
     mut output := "["
-    mut i := 0
-    while i < diags.len():
+    for d, i in diags:
         if i > 0:
             output = output + ","
-        output = output + render_diagnostic_json(diags[i])
-        i = i + 1
+        output = output + render_diagnostic_json(d)
     output = output + "]" + chr(10)
     return output
 
@@ -127,11 +122,9 @@ fn escape_json_string(s: String) -> String:
 # count errors in a diagnostic list.
 pub fn count_errors(diags: List[Diagnostic]) -> Int:
     mut count := 0
-    mut i := 0
-    while i < diags.len():
-        if diags[i].severity == "error":
+    for d in diags:
+        if d.severity == "error":
             count = count + 1
-        i = i + 1
     return count
 
 # check if a diagnostic list has any errors (not just warnings).

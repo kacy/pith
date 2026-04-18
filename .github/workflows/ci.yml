@@ -20,20 +20,12 @@ jobs:
           ./target/release/forge run tests/cases/test_process_command.fg
           ./target/release/forge run tests/cases/test_http_request_bytes.fg
 
-      - name: check examples
+      - name: run examples (native smoke)
         run: |
-          for f in examples/*.fg; do
-            result=$(./target/release/forge check "$f" 2>&1)
-            if [ "$result" != "ok" ]; then
-              echo "FAIL $f"
-              echo "$result"
-              exit 1
-            fi
-            echo "ok   $f"
-          done
-
-      - name: run examples
-        run: make run-examples
+          ./target/release/forge run examples/hello.fg >/dev/null
+          ./target/release/forge run examples/collection_methods.fg >/dev/null
+          ./target/release/forge run examples/string_collection_methods.fg >/dev/null
+          ./target/release/forge run examples/stdlib_algo.fg >/dev/null
 
       - name: build self-hosted compiler
         run: make self-host

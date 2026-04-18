@@ -67,11 +67,9 @@ pub fn add_positional(name: String, description: String):
 
 fn get_field(record: String, idx: Int) -> String:
     parts := record.split("|")
-    mut i := 0
-    for part in parts:
+    for part, i in parts:
         if i == idx:
             return part
-        i = i + 1
     return ""
 
 fn get_records(data: String) -> List[String]:
@@ -134,12 +132,9 @@ fn rebuild_with_update(data: String, name: String, field_idx: Int, new_val: Stri
 pub fn parse():
     a := args()
     mut argv: List[String] := []
-    mut skipped_program := false
-    for arg in a:
-        if skipped_program:
+    for arg, i in a:
+        if i > 0:
             argv.push(arg)
-        else:
-            skipped_program = true
     parse_list(argv)
 
 pub fn parse_list(argv: List[String]):

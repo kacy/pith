@@ -43,23 +43,20 @@ fn backend_command(command: String, path: String) -> String:
     parts := ["./target/release/forge", command, path]
     return parts.join(" ")
 
-fn cmd_build(path: String) -> String!:
-    status := exec(backend_command("build", path))
+fn run_backend_command(command: String, path: String) -> String!:
+    status := exec(backend_command(command, path))
     if status != 0:
         exit(status)
     return ""
+
+fn cmd_build(path: String) -> String!:
+    return run_backend_command("build", path)
 
 fn cmd_run(path: String) -> String!:
-    status := exec(backend_command("run", path))
-    if status != 0:
-        exit(status)
-    return ""
+    return run_backend_command("run", path)
 
 fn cmd_test(path: String) -> String!:
-    status := exec(backend_command("test", path))
-    if status != 0:
-        exit(status)
-    return ""
+    return run_backend_command("test", path)
 
 fn render_diagnostics_for_path(diags: List[Diagnostic], primary_path: String, primary_source: String) -> String!:
     mut output := ""

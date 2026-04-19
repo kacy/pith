@@ -2,7 +2,6 @@ from ast import get_node, reset_arena
 from ir_emitter import emit_ir
 from lexer import lex_all
 from parser import parse
-
 fn main() -> String!:
     source := read_file(args()[1])!
     mut target := "main"
@@ -11,7 +10,6 @@ fn main() -> String!:
     tokens := lex_all(source)
     reset_arena()
     root := parse(tokens)
-
     root_node := get_node(root)
     mut main_idx := 0 - 1
     mut i := 0
@@ -21,14 +19,11 @@ fn main() -> String!:
         if (child.kind == "fn" or child.kind == "fn_decl") and child.value == target:
             main_idx = child_idx
         i = i + 1
-
     print("fn_idx=" + main_idx.to_string())
     if main_idx < 0:
         return ""
-
     main_node := get_node(main_idx)
     print("main_children=" + main_node.children.len().to_string())
-
     mut body_idx := 0 - 1
     i = 0
     while i < main_node.children.len():
@@ -37,7 +32,6 @@ fn main() -> String!:
         if child.kind == "body":
             body_idx = child_idx
         i = i + 1
-
     print("body_idx=" + body_idx.to_string())
     if body_idx >= 0:
         body := get_node(body_idx)
@@ -55,7 +49,6 @@ fn main() -> String!:
                     print("block_stmt " + j.to_string() + " " + inner.kind + " " + inner.value)
                     j = j + 1
             i = i + 1
-
     ir := emit_ir(root)
     print("ir_len=" + ir.len().to_string())
     print(ir)

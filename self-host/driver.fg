@@ -2,14 +2,12 @@
 #
 # provides path helpers, import resolution, and the compile pipeline
 # used by both codegen_main.fg and forge_main.fg.
-
 from lexer import lex_all
 from parser import parse, parse_with_file, parser_diagnostics, parser_has_errors
 from ast import get_node, reset_arena
 from checker import initialize_checker, c_run_module
 from errors import Diagnostic
 # note: codegen removed — compilation handled by Cranelift native backend
-
 # extract directory from a file path.
 # "foo/bar/baz.fg" -> "foo/bar", "baz.fg" -> "."
 pub fn get_directory(path: String) -> String:
@@ -20,7 +18,6 @@ pub fn get_directory(path: String) -> String:
     if last_slash < 0:
         return "."
     return path.substring(0, last_slash)
-
 # extract filename without extension from a path.
 pub fn get_stem(path: String) -> String:
     # find last slash
@@ -36,7 +33,6 @@ pub fn get_stem(path: String) -> String:
         if name.substring(name.len() - 3, name.len()) == ".fg":
             return name.substring(0, name.len() - 3)
     return name
-
 # scan an AST root for import declarations and return the module paths.
 # from_import values are "path name1 name2 ..." - we extract the path.
 # plain import values are "path" or "path as alias" - we extract the path.
@@ -71,20 +67,16 @@ pub fn find_imports(root_idx: Int) -> List[String]:
                     break
             imports.push(path)
     return imports
-
 # global visited map for diamond import dedup.
 # keep it global so the recursive import walk can mutate one shared map.
 mut visited_files: Map[String, Bool] := {}
-
 # global checking map for cycle detection.
 # tracks files currently being processed to detect circular imports.
 mut files_being_checked: Map[String, Bool] := {}
-
 # stdlib root - set by compile_to_c before resolving imports
 mut stdlib_root_directory: String := ""
 mut driver_parse_diagnostics: List[Diagnostic] := []
 mut resolved_module_paths: Map[Int, String] := {}
-
 # convert a dotted module path to a file path segment.
 # "std.math" -> "std/math", "foo" -> "foo"
 fn dots_to_slashes(mod_path: String) -> String:
@@ -95,7 +87,6 @@ fn dots_to_slashes(mod_path: String) -> String:
         else:
             result = result + ch
     return result
-
 # find the stdlib root by walking up from source file directory.
 # uses exec to test for std/ directory existence.
 fn dr_find_stdlib_root(source_path: String) -> String:
@@ -113,7 +104,6 @@ fn dr_find_stdlib_root(source_path: String) -> String:
         dir = parent
         depth = depth + 1
     return ""
-
 # resolve imports recursively via DFS.
 # returns module roots in dependency order (leaves first).
 pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
@@ -170,11 +160,9 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
             roots.push(sr)
         roots.push(mod_root)
     return roots
-
 # mark a path as visited (call before resolve_imports for the main file).
 pub fn mark_visited(path: String):
     visited_files.insert(path, true)
-
 # initialize driver state for import resolution.
 # sets up stdlib root and resets the visited and checking maps.
 pub fn init_driver(source_path: String):
@@ -184,41 +172,32 @@ pub fn init_driver(source_path: String):
     driver_parse_diagnostics = []
     resolved_module_paths = {}
     mark_visited(source_path)
-
 pub fn get_driver_parse_diagnostics() -> List[Diagnostic]:
     return driver_parse_diagnostics
-
 pub fn driver_has_parse_errors() -> Bool:
     return driver_parse_diagnostics.len() > 0
-
 pub fn get_resolved_module_path(root_idx: Int) -> String:
     if resolved_module_paths.contains_key(root_idx):
         return resolved_module_paths[root_idx]
     return ""
-
 # run the full compile pipeline: lex, parse, resolve imports, check, codegen.
 # compile_to_c removed — compilation is now handled by the Cranelift native backend.
 # the self-hosted compiler provides the frontend: lex, parse, check, fmt, lint, doc.
-
 # Import alias tracking for module namespaces
 # Maps alias name -> (module_path, original_name) for from_import aliases
 # Maps alias name -> module_path for import aliases
 mut module_aliases: Map[String, String] := {}
-
 # Add a module alias mapping
 pub fn add_module_alias(alias: String, module_path: String):
     module_aliases.insert(alias, module_path)
-
 # Lookup a module path by alias
 pub fn resolve_module_alias(name: String) -> String:
     if module_aliases.contains_key(name):
         return module_aliases[name]
     return ""
-
 # Clear all aliases (call at start of compilation)
 pub fn clear_module_aliases():
     module_aliases = {}
-
 # Parse import declarations and extract aliases
 # Returns the module path and populates the alias map
 pub fn find_imports_with_aliases(root_idx: Int) -> List[String]:

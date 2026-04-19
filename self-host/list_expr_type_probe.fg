@@ -3,14 +3,12 @@ from checker import c_check_expr, c_register_all, initialize_checker
 from lexer import lex_all
 from parser import parse
 from types import get_type_info
-
 fn main() -> String!:
     source := read_file("self-host/direct_list_len_probe.fg")!
     reset_arena()
     root := parse(lex_all(source))
     initialize_checker("self-host/direct_list_len_probe.fg")
     c_register_all(root)
-
     root_node := get_node(root)
     print(root_node.kind)
     fn_node := get_node(root_node.children[0])
@@ -36,13 +34,11 @@ fn main() -> String!:
     print(child_tid.to_string())
     child_info := get_type_info(child_tid)
     print(child_info.kind)
-
     list_tid := c_check_expr(list_idx, 1)
     print(list_tid.to_string())
     list_info := get_type_info(list_tid)
     print(list_info.kind)
     print(list_info.inner.to_string())
-
     len_tid := c_check_expr(to_string_node.children[0], 1)
     print(len_tid.to_string())
     len_info := get_type_info(len_tid)

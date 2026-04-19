@@ -11,64 +11,50 @@
 #
 # all globals use c_ prefix to avoid collisions with lexer/parser
 # globals in the flat C namespace.
-
 from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, get_type_count, register_type_name, lookup_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
 from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
-
 mut checker_diagnostics: List[Diagnostic] := []
 mut current_file_path: String := ""
-
 # Module alias tracking - maps alias name to module path
 mut module_aliases: Map[String, String] := {}
-
 # Module exports tracking - flat list of "module_path<TAB>export_name".
 # Qualified resolution currently uses scope bindings directly, so this is
 # retained only as lightweight bookkeeping for future module APIs.
 mut module_export_entries: List[String] := []
-
 # Wildcard import tracking - which modules have been wildcard imported
 # This enables from X import * functionality
 mut wildcard_imports: List[String] := []
 mut generic_inference_subst: Map[String, Int] := {}
-
 # Get position from AST node
 fn get_node_position(node_idx: Int) -> (Int, Int):
     if node_idx < 0:
         return (0, 0)
     node := get_node(node_idx)
     return (node.line, node.col)
-
 # Report error with position from node
 fn report_error_at(node_idx: Int, code: String, message: String):
     mut pos := get_node_position(node_idx)
     checker_diagnostics.push(Diagnostic("error", code, message, current_file_path, pos.0, pos.1, ""))
-
 # Report error without specific node (uses 0,0)
 fn report_error(code: String, message: String):
     checker_diagnostics.push(Diagnostic("error", code, message, current_file_path, 0, 0, ""))
-
 # Report error with fix suggestion
 fn report_error_with_fix_at(node_idx: Int, code: String, message: String, fix: String):
     mut pos := get_node_position(node_idx)
     checker_diagnostics.push(Diagnostic("error", code, message, current_file_path, pos.0, pos.1, fix))
-
 fn report_error_with_fix(code: String, message: String, fix: String):
     checker_diagnostics.push(Diagnostic("error", code, message, current_file_path, 0, 0, fix))
-
 # Report warning with position from node
 fn report_warning_at(node_idx: Int, code: String, message: String):
     mut pos := get_node_position(node_idx)
     checker_diagnostics.push(Diagnostic("warning", code, message, current_file_path, pos.0, pos.1, ""))
-
 fn report_warning(code: String, message: String):
     checker_diagnostics.push(Diagnostic("warning", code, message, current_file_path, 0, 0, ""))
-
 # ---------------------------------------------------------------
 # checker state
 # ---------------------------------------------------------------
-
 pub mut current_scope := -1
 pub mut method_type_map: Map[String, Int] := {}
 pub mut method_visibility_map: Map[String, Bool] := {}
@@ -82,11 +68,9 @@ mut checking_test_decl := false
 mut implementation_set: Map[String, Int] := {}
 # expression type cache — populated by c_check_expr, queried by codegen
 pub mut expression_type_cache: Map[Int, Int] := {}
-
 # ---------------------------------------------------------------
 # initialization
 # ---------------------------------------------------------------
-
 pub fn initialize_checker(file_path: String):
     initialize_type_table()
     reset_scope_arena()
@@ -106,11 +90,9 @@ pub fn initialize_checker(file_path: String):
     generic_inference_subst = {}
     current_scope = create_scope(-1)
     register_builtin_types()
-
 # Register an import alias for module namespace resolution
 pub fn register_import_alias(alias: String, module_path: String):
     module_aliases.insert(alias, module_path)
-
 fn module_default_alias(module_path: String) -> String:
     mut last_dot := 0 - 1
     mut i := 0
@@ -121,7 +103,6 @@ fn module_default_alias(module_path: String) -> String:
     if last_dot < 0:
         return module_path
     return module_path.substring(last_dot + 1, module_path.len())
-
 fn module_import_target_name(module_path: String, name: String) -> String:
     if module_path == "std.json":
         return "json_" + name
@@ -136,7 +117,6 @@ fn module_import_target_name(module_path: String, name: String) -> String:
     if module_path == "std.net.url":
         return "url_" + name
     return name
-
 # Process import declarations from AST and register aliases
 pub fn process_import_aliases(root_idx: Int):
     root := get_node(root_idx)
@@ -185,18 +165,15 @@ pub fn process_import_aliases(root_idx: Int):
                         parts.push(value.substring(part_start, i))
                     part_start = i + 1
                 i = i + 1
-            
             if parts.len() > 0:
                 mod_path := parts[0]
                 # Check for wildcard import (second part is "*")
                 if parts.len() > 1:
                     if parts[1] == "*":
                         wildcard_imports.push(mod_path)
-
 # Collect all pub exports from a module.
 pub fn collect_module_exports(module_path: String, root_idx: Int):
     root := get_node(root_idx)
-    
     for child in root.children:
         node := get_node(child)
         if node.kind == "pub":
@@ -221,7 +198,6 @@ pub fn collect_module_exports(module_path: String, root_idx: Int):
                         si = si + 1
                     binding_name := inner.value.substring(0, name_end)
                     module_export_entries.push(module_path + chr(9) + binding_name)
-
 fn register_builtin_types():
     tid_int := lookup_type_id("Int")
     tid_float := lookup_type_id("Float")
@@ -230,11 +206,9 @@ fn register_builtin_types():
     tid_bytes := lookup_type_id("Bytes")
     tid_void := lookup_type_id("Void")
     tid_err := lookup_type_id("<error>")
-
     # pre-register List[String] — used by String.split() and args()
     intern_list_type(tid_string)
     list_string := lookup_type_id("List[String]")
-
     # result types used by multiple builtins
     int_result := add_type_info(ti_result(tid_int, tid_string))
     float_result := add_type_info(ti_result(tid_float, tid_string))
@@ -242,9 +216,7 @@ fn register_builtin_types():
     bytes_result := add_type_info(ti_result(tid_bytes, tid_string))
     bool_result := add_type_info(ti_result(tid_bool, tid_string))
     opt_string := add_type_info(ti_optional(tid_string))
-
     # --- shared function signatures, one type per group ---
-
     # () -> Int
     void_to_int := create_function_type([], TID_INT)
     define_builtin_function("time", void_to_int)
@@ -254,10 +226,8 @@ fn register_builtin_types():
     define_builtin_function("input", create_function_type([], TID_STRING))
     # () -> List[String]
     define_builtin_function("args", create_function_type([], list_string))
-
     # (Bool) -> Void
     define_builtin_function("assert", create_function_type([TID_BOOL], TID_VOID))
-
     # (Int) -> Void
     int_to_void := create_function_type([TID_INT], TID_VOID)
     define_builtin_function("exit", int_to_void)
@@ -269,7 +239,6 @@ fn register_builtin_types():
     define_builtin_function("abs", int_to_int)
     # (Int) -> Int (bitwise unary)
     define_builtin_function("bit_not", int_to_int)
-
     # (Int) -> String
     int_to_str := create_function_type([TID_INT], TID_STRING)
     define_builtin_function("chr", int_to_str)
@@ -286,7 +255,6 @@ fn register_builtin_types():
     define_builtin_function("bit_shr", two_int_to_int)
     # (Int, Int, Int) -> Int
     define_builtin_function("clamp", create_function_type([TID_INT, TID_INT, TID_INT], TID_INT))
-
     # (Int, String) -> String
     int_str_to_str := create_function_type([TID_INT, TID_STRING], TID_STRING)
     define_builtin_function("format_time", int_str_to_str)
@@ -300,7 +268,6 @@ fn register_builtin_types():
     define_builtin_function("pow", create_function_type([TID_FLOAT, TID_FLOAT], TID_FLOAT))
     # (Float, Int) -> String
     define_builtin_function("fmt_float", create_function_type([TID_FLOAT, TID_INT], TID_STRING))
-
     # (String) -> Void
     str_to_void := create_function_type([TID_STRING], TID_VOID)
     define_builtin_function("print", str_to_void)
@@ -327,7 +294,6 @@ fn register_builtin_types():
     define_builtin_function("os_home_dir", create_function_type([], tid_string))
     define_builtin_function("os_chdir", str_to_bool)
     define_builtin_function("os_unset_env", str_to_bool)
-
     # (String) -> Int!
     define_builtin_function("parse_int", create_function_type([TID_STRING], int_result))
     # (String) -> Float!
@@ -345,7 +311,6 @@ fn register_builtin_types():
     define_builtin_function("file_open_read", create_function_type([TID_STRING], int_result))
     define_builtin_function("file_open_write", create_function_type([TID_STRING], int_result))
     define_builtin_function("file_open_append", create_function_type([TID_STRING], int_result))
-
     # (String, String) -> Bool
     define_builtin_function("rename_file", create_function_type([TID_STRING, TID_STRING], TID_BOOL))
     define_builtin_function("os_set_env", create_function_type([TID_STRING, TID_STRING], TID_BOOL))
@@ -376,7 +341,6 @@ fn register_builtin_types():
     define_builtin_function("file_write_bytes", create_function_type([TID_INT, tid_bytes], int_result))
     # (Int) -> Void
     define_builtin_function("file_close", int_to_void)
-
     # networking builtins
     # (String, Int) -> Int!
     str_int_to_int_result := create_function_type([TID_STRING, TID_INT], int_result)
@@ -394,7 +358,6 @@ fn register_builtin_types():
     define_builtin_function("tcp_wait_writable", create_function_type([TID_INT, TID_INT], TID_INT))
     # (Int, Int) -> Void
     define_builtin_function("tcp_set_timeout", create_function_type([TID_INT, TID_INT], TID_VOID))
-
     # process management builtins
     # (String) -> Int!
     define_builtin_function("process_spawn", create_function_type([TID_STRING], int_result))
@@ -418,12 +381,10 @@ fn register_builtin_types():
     define_builtin_function("process_output_stdout", create_function_type([TID_INT], TID_STRING))
     define_builtin_function("process_output_stderr", create_function_type([TID_INT], TID_STRING))
     define_builtin_function("process_output_close", int_to_void)
-
     # concurrency primitives (stub types)
     register_sync_primitive_type("Mutex", [])
     register_sync_primitive_type("WaitGroup", [])
     register_sync_primitive_type("Semaphore", [tid_int])
-
     # Rebind builtin names at the end. On the active self-hosted path,
     # the long registration sequence above can leave some earlier
     # function type entries with corrupted return_type fields. Rebinding
@@ -537,18 +498,14 @@ fn register_builtin_types():
     fix_builtin_binding("process_output_stdout", [tid_int], tid_string)
     fix_builtin_binding("process_output_stderr", [tid_int], tid_string)
     fix_builtin_binding("process_output_close", [tid_int], tid_void)
-
 # create a function type from param list and return type
 fn create_function_type(params: List[Int], ret: Int) -> Int:
     return add_type_info(ti_function(params, ret))
-
 # register a builtin function name with a pre-computed function type
 fn define_builtin_function(name: String, fn_tid: Int):
     define_binding(current_scope, name, fn_tid, false)
-
 fn fix_builtin_binding(name: String, params: List[Int], ret: Int):
     define_builtin_function(name, add_type_info(ti_function(params, ret)))
-
 # register an opaque sync primitive type with a constructor
 fn register_sync_primitive_type(name: String, param_tids: List[Int]):
     mut fields: List[String] := []
@@ -565,16 +522,13 @@ fn register_sync_primitive_type(name: String, param_tids: List[Int]):
         j = j + 1
     ctor_tid := add_type_info(ti_function(ctor_params, tid))
     define_binding(current_scope, name, ctor_tid, false)
-
 # ---------------------------------------------------------------
 # intern collection types
 # ---------------------------------------------------------------
-
 fn build_collection_type_name(base: String, key_or_elem: Int, val: Int) -> String:
     if val < 0:
         return base + "[" + get_type_name(key_or_elem) + "]"
     return base + "[" + get_type_name(key_or_elem) + "," + get_type_name(val) + "]"
-
 fn intern_list_type(elem: Int) -> Int:
     name := build_collection_type_name("List", elem, -1)
     existing := lookup_type_id(name)
@@ -584,7 +538,6 @@ fn intern_list_type(elem: Int) -> Int:
         register_type_name(name, tid)
         return tid
     return existing
-
 fn intern_set_type(elem: Int) -> Int:
     name := build_collection_type_name("Set", elem, -1)
     existing := lookup_type_id(name)
@@ -594,7 +547,6 @@ fn intern_set_type(elem: Int) -> Int:
         register_type_name(name, tid)
         return tid
     return existing
-
 fn intern_map_type(key_type: Int, val_type: Int) -> Int:
     name := build_collection_type_name("Map", key_type, val_type)
     existing := lookup_type_id(name)
@@ -604,7 +556,6 @@ fn intern_map_type(key_type: Int, val_type: Int) -> Int:
         register_type_name(name, tid)
         return tid
     return existing
-
 fn intern_task_type(inner: Int) -> Int:
     name := build_collection_type_name("Task", inner, -1)
     existing := lookup_type_id(name)
@@ -614,7 +565,6 @@ fn intern_task_type(inner: Int) -> Int:
         register_type_name(name, tid)
         return tid
     return existing
-
 fn intern_channel_type(inner: Int) -> Int:
     name := build_collection_type_name("Channel", inner, -1)
     existing := lookup_type_id(name)
@@ -624,14 +574,11 @@ fn intern_channel_type(inner: Int) -> Int:
         register_type_name(name, tid)
         return tid
     return existing
-
 pub fn debug_intern_list_string() -> Int:
     return intern_list_type(lookup_type_id("String"))
-
 pub fn debug_add_list_type_direct() -> Int:
     add_type_info(ti_list(lookup_type_id("String")))
     return get_type_count()
-
 # build an instantiation name like "Pair[Int,String]"
 fn build_instantiated_type_name(base: String, type_args: List[Int]) -> String:
     mut result := base + "["
@@ -641,16 +588,12 @@ fn build_instantiated_type_name(base: String, type_args: List[Int]) -> String:
         result = result + get_type_name(i)
     result = result + "]"
     return result
-
 # ---------------------------------------------------------------
 # type resolution — resolve AST type expression nodes to TypeIds
 # ---------------------------------------------------------------
-
 mut type_resolve_depth := 0
-
 pub fn c_resolve_type(node_idx: Int) -> Int:
     return resolve_type_with_substitution(node_idx, false, "")
-
 # resolve a type expression node, with optional generic substitution
 # subst_active: if true, subst_params/subst_args provide substitution
 fn resolve_type_implementation(node_idx: Int) -> Int:
@@ -696,21 +639,18 @@ fn resolve_type_implementation(node_idx: Int) -> Int:
         result = add_type_info(ti_function(params, ret))
     type_resolve_depth = type_resolve_depth - 1
     return result
-
 fn resolve_named_type(name: String) -> Int:
     tid := lookup_type_id(name)
     if tid < 0:
         report_error("E202", "unknown type: " + name)
         return TID_ERR
     return tid
-
 fn resolve_generic_type_from_node(node: Node) -> Int:
     base := node.value
     mut type_args: List[Int] := []
     for child in node.children:
         type_args.push(resolve_type_implementation(child))
     return resolve_generic_type(base, type_args)
-
 fn resolve_generic_type(base: String, type_args: List[Int]) -> Int:
     # builtin generic types
     if strings_equal(base, "List"):
@@ -744,12 +684,10 @@ fn resolve_generic_type(base: String, type_args: List[Int]) -> Int:
         return instantiate_generic_type(decl_idx, type_args)
     report_error("E202", "unknown generic type: " + base)
     return TID_ERR
-
 # resolve with substitution map (for generic instantiation)
 fn resolve_type_with_substitution(node_idx: Int, subst_active: Bool, subst_key: String) -> Int:
     # no substitution — use the normal path
     return resolve_type_implementation(node_idx)
-
 # resolve with a substitution map for generic params
 fn resolve_type_with_substitution_map(node_idx: Int, subst_params: List[String], subst_args: List[Int]) -> Int:
     if node_idx < 0:
@@ -797,16 +735,13 @@ fn resolve_type_with_substitution_map(node_idx: Int, subst_params: List[String],
                 ret = resolve_type_with_substitution_map(cn.children[0], subst_params, subst_args)
         return add_type_info(ti_function(params, ret))
     return TID_ERR
-
 # ---------------------------------------------------------------
 # pass 1 — declaration registration
 # ---------------------------------------------------------------
-
 pub fn c_register_all(root_idx: Int):
     root := get_node(root_idx)
     for child in root.children:
         register_top_level_declarations(child)
-
 fn register_top_level_declarations(node_idx: Int):
     node := get_node(node_idx)
     if node.kind == "pub":
@@ -818,7 +753,6 @@ fn register_top_level_declarations(node_idx: Int):
         return
     else:
         register_declaration(node_idx, false)
-
 fn register_declaration(node_idx: Int, is_pub: Bool):
     node := get_node(node_idx)
     if node.kind == "fn_decl":
@@ -839,11 +773,9 @@ fn register_declaration(node_idx: Int, is_pub: Bool):
     elif node.kind == "test_decl":
         # no names to register
         return
-
 # ---------------------------------------------------------------
 # pass 1 — function declarations
 # ---------------------------------------------------------------
-
 fn register_function_declaration(node_idx: Int, node: Node):
     name := node.value
     if declaration_has_generic_params(node):
@@ -853,7 +785,6 @@ fn register_function_declaration(node_idx: Int, node: Node):
     fn_tid := resolve_function_signature(node)
     if fn_tid >= 0:
         define_binding(current_scope, name, fn_tid, false)
-
 fn resolve_function_signature(node: Node) -> Int:
     mut params: List[Int] := []
     mut ret := TID_VOID
@@ -869,11 +800,9 @@ fn resolve_function_signature(node: Node) -> Int:
         elif cn.kind == "returns":
             ret = resolve_type_implementation(cn.children[0])
     return add_type_info(ti_function(params, ret))
-
 # ---------------------------------------------------------------
 # pass 1 — struct declarations
 # ---------------------------------------------------------------
-
 fn register_struct_declaration(node_idx: Int, node: Node):
     name := node.value
     if declaration_has_generic_params(node):
@@ -903,11 +832,9 @@ fn register_struct_declaration(node_idx: Int, node: Node):
     tid := add_type_info(ti_struct(base_name, field_names, field_types, field_pub, field_mut))
     register_type_name(base_name, tid)
     define_binding(current_scope, base_name, tid, false)
-
 # ---------------------------------------------------------------
 # pass 1 — enum declarations
 # ---------------------------------------------------------------
-
 fn register_enum_declaration(node_idx: Int, node: Node):
     name := node.value
     if declaration_has_generic_params(node):
@@ -929,11 +856,9 @@ fn register_enum_declaration(node_idx: Int, node: Node):
     tid := add_type_info(ti_enum(base_name, variant_names, variant_types))
     register_type_name(base_name, tid)
     define_binding(current_scope, base_name, tid, false)
-
 # ---------------------------------------------------------------
 # pass 1 — interface declarations
 # ---------------------------------------------------------------
-
 fn register_interface_declaration(node_idx: Int, node: Node):
     base_name := node.value
     mut name := base_name
@@ -954,11 +879,9 @@ fn register_interface_declaration(node_idx: Int, node: Node):
         register_type_name(base_name, tid)
         register_interface_declaration_name(base_name)
     register_interface_declaration_name(name)
-
 # ---------------------------------------------------------------
 # pass 1 — impl declarations
 # ---------------------------------------------------------------
-
 fn register_implementation_declaration(node_idx: Int, node: Node):
     # children[0] is the target type (or interface type if "impl X for Y:")
     # optional for_type node follows
@@ -967,7 +890,6 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
     mut concrete_name := ""
     mut interface_name := ""
     mut method_start := 1
-
     # check if there's a for_type node
     if node.children.len() > 1:
         second_node := get_node(node.children[1])
@@ -984,10 +906,8 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             concrete_name = get_type_node_name(first_type_node)
     else:
         concrete_name = get_type_node_name(first_type_node)
-
     if concrete_name == "":
         return
-
     # register each method (skip first method_start children)
     mut skip := method_start
     for child in node.children:
@@ -1003,7 +923,6 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             cn = get_node(method_node_idx)
         if cn.kind == "fn_decl":
             register_method_declaration(concrete_name, method_node_idx, cn, method_is_pub)
-
 fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_pub: Bool):
     mut method_name := node.value
     fn_tid := resolve_function_signature(node)
@@ -1011,11 +930,9 @@ fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_
     method_type_map.insert(key, fn_tid)
     method_visibility_map.insert(key, is_pub)
     register_method_signature(key, node_idx, is_pub)
-
 fn check_type_implements_interface(type_name: String, iface_name: String) -> Bool:
     key := type_name + chr(9) + iface_name
     return implementation_set.contains_key(key)
-
 fn has_interface_declaration(name: String) -> Bool:
     for iface_name in interface_declaration_names:
         if strings_equal(iface_name, name):
@@ -1026,7 +943,6 @@ fn has_interface_declaration(name: String) -> Bool:
             if strings_equal(iface_name, base):
                 return true
     return false
-
 fn build_interface_type_name(base: String, args: List[String]) -> String:
     mut result := base + "["
     mut first := true
@@ -1036,21 +952,17 @@ fn build_interface_type_name(base: String, args: List[String]) -> String:
         first = false
         result = result + arg
     return result + "]"
-
 # ---------------------------------------------------------------
 # pass 1 — type alias
 # ---------------------------------------------------------------
-
 fn register_type_alias_declaration(node: Node):
     name := node.value
     if node.children.len() > 0:
         target := resolve_type_implementation(node.children[0])
         register_type_name(name, target)
-
 # ---------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------
-
 fn extract_base_type_name(name: String) -> String:
     # "swap[T]" -> "swap", "Pair[A, B]" -> "Pair"
     mut i := 0
@@ -1059,14 +971,12 @@ fn extract_base_type_name(name: String) -> String:
             return name.substring(0, i)
         i = i + 1
     return name
-
 fn declaration_has_generic_params(node: Node) -> Bool:
     for child in node.children:
         cn := get_node(child)
         if cn.kind == "generic_param":
             return true
     return false
-
 fn collect_generic_parameter_names(node: Node) -> List[String]:
     mut params: List[String] := []
     for child in node.children:
@@ -1074,41 +984,33 @@ fn collect_generic_parameter_names(node: Node) -> List[String]:
         if cn.kind == "generic_param":
             params.push(trim_type_text(cn.value))
     return params
-
 fn register_generic_declaration(name: String, node_idx: Int):
     if generic_declaration_map.contains_key(name) == false:
         generic_declaration_names.push(name)
     generic_declaration_map.insert(name, node_idx)
-
 fn has_generic_declaration(name: String) -> Bool:
     for generic_name in generic_declaration_names:
         if strings_equal(generic_name, name):
             return true
     return false
-
 fn get_generic_declaration_index(name: String) -> Int:
     if generic_declaration_map.contains_key(name):
         return generic_declaration_map[name]
     return - 1
-
 fn register_interface_declaration_name(name: String):
     for iface_name in interface_declaration_names:
         if strings_equal(iface_name, name):
             return
     interface_declaration_names.push(name)
-
 fn register_method_signature(key: String, node_idx: Int, is_pub: Bool):
     method_decl_index_map.insert(key, node_idx)
     method_visibility_map.insert(key, is_pub)
-
 fn has_method_declaration(key: String) -> Bool:
     return method_decl_index_map.contains_key(key)
-
 fn get_method_declaration_index(key: String) -> Int:
     if method_decl_index_map.contains_key(key):
         return method_decl_index_map[key]
     return - 1
-
 fn collect_function_param_types(node: Node) -> List[Int]:
     mut params: List[Int] := []
     for child in node.children:
@@ -1119,14 +1021,12 @@ fn collect_function_param_types(node: Node) -> List[Int]:
             else:
                 params.push(TID_ERR)
     return params
-
 fn collect_function_return_type(node: Node) -> Int:
     for child in node.children:
         cn := get_node(child)
         if cn.kind == "returns":
             return resolve_type_implementation(cn.children[0])
     return TID_VOID
-
 fn extract_field_name(value: String) -> String:
     # "name pub mut" -> "name"
     mut i := 0
@@ -1135,7 +1035,6 @@ fn extract_field_name(value: String) -> String:
             return value.substring(0, i)
         i = i + 1
     return value
-
 fn strings_equal(a: String, b: String) -> Bool:
     if a.len() != b.len():
         return false
@@ -1145,7 +1044,6 @@ fn strings_equal(a: String, b: String) -> Bool:
             return false
         i = i + 1
     return true
-
 fn split_qualified_name(value: String) -> (String, String):
     mut i := 0
     while i < value.len():
@@ -1153,7 +1051,6 @@ fn split_qualified_name(value: String) -> (String, String):
             return (value.substring(0, i), value.substring(i + 1, value.len()))
         i = i + 1
     return (value, "")
-
 fn get_type_node_name(node: Node) -> String:
     # extract the type name from a type expression node
     if node.kind == "type":
@@ -1175,7 +1072,6 @@ fn get_type_node_name(node: Node) -> String:
             parts.push(child_name)
         return build_interface_type_name(node.value, parts)
     return ""
-
 fn get_type_node_name_with_substitution(node: Node, subst_map: Map[String, Int]) -> String:
     if node.kind == "type":
         if node.value.contains("["):
@@ -1202,7 +1098,6 @@ fn get_type_node_name_with_substitution(node: Node, subst_map: Map[String, Int])
             parts.push(child_name)
         return build_interface_type_name(node.value, parts)
     return ""
-
 # extract the binding name from a binding value like "x" or "x mut"
 fn extract_binding_name(value: String) -> String:
     mut i := 0
@@ -1211,19 +1106,15 @@ fn extract_binding_name(value: String) -> String:
             return value.substring(0, i)
         i = i + 1
     return value
-
 fn binding_is_mutable(value: String) -> Bool:
     return value.contains(" mut")
-
 # ---------------------------------------------------------------
 # pass 2 — check declarations
 # ---------------------------------------------------------------
-
 pub fn c_check_all(root_idx: Int):
     root := get_node(root_idx)
     for child in root.children:
         check_top_level_declarations(child)
-
 fn check_top_level_declarations(node_idx: Int):
     node := get_node(node_idx)
     if node.kind == "pub":
@@ -1234,7 +1125,6 @@ fn check_top_level_declarations(node_idx: Int):
         return
     else:
         check_declaration(node_idx)
-
 fn check_declaration(node_idx: Int):
     node := get_node(node_idx)
     if node.kind == "fn_decl":
@@ -1245,11 +1135,9 @@ fn check_declaration(node_idx: Int):
         check_implementation_declaration(node)
     elif node.kind == "test_decl":
         check_test_declaration(node)
-
 # ---------------------------------------------------------------
 # pass 2 — function checking
 # ---------------------------------------------------------------
-
 fn check_function_declaration(node: Node):
     if declaration_has_generic_params(node):
         return
@@ -1274,27 +1162,22 @@ fn check_function_declaration(node: Node):
             param_idx = param_idx + 1
         elif cn.kind == "body":
             check_function_body(child, fn_scope)
-
 fn check_function_body(node_idx: Int, scope_id: Int):
     node := get_node(node_idx)
     if node.children.len() > 0:
         block := get_node(node.children[0])
         if block.kind == "block":
             check_block_statement(block, scope_id)
-
 fn check_block_statement(node: Node, scope_id: Int):
     for child in node.children:
         check_statement(child, scope_id)
-
 # ---------------------------------------------------------------
 # pass 2 — impl checking
 # ---------------------------------------------------------------
-
 fn check_implementation_declaration(node: Node):
     first_type_node := get_node(node.children[0])
     mut concrete_name := ""
     mut method_start := 1
-
     if node.children.len() > 1:
         second_node := get_node(node.children[1])
         if second_node.kind == "for_type":
@@ -1305,14 +1188,11 @@ fn check_implementation_declaration(node: Node):
             concrete_name = get_type_node_name(first_type_node)
     else:
         concrete_name = get_type_node_name(first_type_node)
-
     if concrete_name == "":
         return
-
     concrete_tid := lookup_type_id(concrete_name)
     if concrete_tid < 0:
         return
-
     # check each method body (skip first method_start children)
     mut skip := method_start
     for child in node.children:
@@ -1324,14 +1204,12 @@ fn check_implementation_declaration(node: Node):
             cn = get_node(cn.children[0])
         if cn.kind == "fn_decl":
             check_method_body(concrete_name, concrete_tid, cn)
-
 fn check_method_body(type_name: String, type_tid: Int, node: Node):
     param_types := collect_function_param_types(node)
     ret_type := collect_function_return_type(node)
     method_scope := create_function_scope(current_scope, ret_type)
     # bind self
     define_binding(method_scope, "self", type_tid, false)
-
     # define parameters (skipping self — it's implicit)
     mut param_idx := 0
     for child in node.children:
@@ -1343,11 +1221,9 @@ fn check_method_body(type_name: String, type_tid: Int, node: Node):
             param_idx = param_idx + 1
         elif cn.kind == "body":
             check_function_body(child, method_scope)
-
 # ---------------------------------------------------------------
 # pass 2 — test checking
 # ---------------------------------------------------------------
-
 fn check_test_declaration(node: Node):
     test_scope := create_function_scope(current_scope, TID_VOID)
     checking_test_decl = true
@@ -1356,11 +1232,9 @@ fn check_test_declaration(node: Node):
         if cn.kind == "body":
             check_function_body(child, test_scope)
     checking_test_decl = false
-
 # ---------------------------------------------------------------
 # statement checking
 # ---------------------------------------------------------------
-
 fn check_statement(node_idx: Int, scope_id: Int):
     node := get_node(node_idx)
     if node.kind == "binding":
@@ -1388,11 +1262,9 @@ fn check_statement(node_idx: Int, scope_id: Int):
     else:
         # expression statement
         c_check_expr(node_idx, scope_id)
-
 # ---------------------------------------------------------------
 # binding statement
 # ---------------------------------------------------------------
-
 fn check_binding_statement(node_idx: Int, scope_id: Int):
     node := get_node(node_idx)
     name := extract_binding_name(node.value)
@@ -1420,11 +1292,9 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
     elif node.children.len() == 1:
         val_type := c_check_expr(node.children[0], scope_id)
         define_binding(scope_id, name, val_type, is_mut)
-
 # ---------------------------------------------------------------
 # assignment statement
 # ---------------------------------------------------------------
-
 fn check_assignment(node: Node, scope_id: Int):
     # node.value is the operator: "=", "+=", "-=", "*=", "/="
     # children[0] is target, children[1] is value
@@ -1455,11 +1325,9 @@ fn check_assignment(node: Node, scope_id: Int):
             report_error("E217", "operator " + op + " requires numeric type, got " + get_type_name(target_type))
         elif target_type != val_type:
             report_error("E200", "type mismatch: expected " + get_type_name(target_type) + ", got " + get_type_name(val_type))
-
 # ---------------------------------------------------------------
 # return statement
 # ---------------------------------------------------------------
-
 fn check_return_statement(node: Node, scope_id: Int):
     expected := get_scope_return_type(scope_id)
     if expected < 0:
@@ -1488,11 +1356,9 @@ fn check_return_statement(node: Node, scope_id: Int):
     if types_structurally_equal(actual, expected):
         return
     report_error_with_fix("E200", "return type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(actual), "change the return type to " + get_type_name(actual))
-
 # ---------------------------------------------------------------
 # fail statement
 # ---------------------------------------------------------------
-
 fn check_fail_statement(node: Node, scope_id: Int):
     ret_type := get_scope_return_type(scope_id)
     if ret_type < 0:
@@ -1509,11 +1375,9 @@ fn check_fail_statement(node: Node, scope_id: Int):
         return
     if types_compatible(err_type, ret_info.value_type) == false:
         report_error("E219", "fail type mismatch: expected " + get_type_name(ret_info.value_type) + ", got " + get_type_name(err_type))
-
 # ---------------------------------------------------------------
 # if statement
 # ---------------------------------------------------------------
-
 fn check_if_statement(node: Node, scope_id: Int):
     # children: [condition, then, elif..., else?]
     if node.children.len() < 2:
@@ -1561,11 +1425,9 @@ fn check_if_statement(node: Node, scope_id: Int):
                 eblock := get_node(cn.children[0])
                 if eblock.kind == "block":
                     check_block_statement(eblock, else_scope)
-
 # ---------------------------------------------------------------
 # while statement
 # ---------------------------------------------------------------
-
 fn check_while_statement(node: Node, scope_id: Int):
     if node.children.len() < 2:
         return
@@ -1580,11 +1442,9 @@ fn check_while_statement(node: Node, scope_id: Int):
         check_function_body(node.children[1], loop_scope)
     elif body_node.kind == "block":
         check_block_statement(body_node, loop_scope)
-
 # ---------------------------------------------------------------
 # for statement
 # ---------------------------------------------------------------
-
 fn check_for_statement(node: Node, scope_id: Int):
     # node.value: "x" or "x, i" (binding names)
     # children[0]: iterable expression
@@ -1629,22 +1489,18 @@ fn check_for_statement(node: Node, scope_id: Int):
         check_function_body(node.children[1], loop_scope)
     elif body_node.kind == "block":
         check_block_statement(body_node, loop_scope)
-
 # ---------------------------------------------------------------
 # expression checking
 # ---------------------------------------------------------------
-
 pub fn c_check_expr(node_idx: Int, scope_id: Int) -> Int:
     result := check_expression_implementation(node_idx, scope_id)
     expression_type_cache.insert(node_idx, result)
     return result
-
 # look up cached expression type (returns TID_ERR if not found)
 pub fn c_get_expr_type(node_idx: Int) -> Int:
     if expression_type_cache.contains_key(node_idx):
         return expression_type_cache[node_idx]
     return TID_ERR
-
 fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     node := get_node(node_idx)
     tid_int := lookup_type_id("Int")
@@ -1721,7 +1577,6 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     if node.kind == "await":
         return check_await_expression(node, scope_id)
     return TID_ERR
-
 fn type_supports_stringify(tid: Int) -> Bool:
     if tid < 0:
         return false
@@ -1731,11 +1586,9 @@ fn type_supports_stringify(tid: Int) -> Bool:
     if info.kind == "result":
         return type_supports_stringify(info.inner) and type_supports_stringify(info.value_type)
     return false
-
 # ---------------------------------------------------------------
 # identifier lookup
 # ---------------------------------------------------------------
-
 fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
     tid := lookup_binding(scope_id, name)
     if tid >= 0:
@@ -1745,11 +1598,9 @@ fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
         return TID_ERR
     report_error_at(node_idx, "E201", "undefined variable: " + name)
     return TID_ERR
-
 # ---------------------------------------------------------------
 # binary expression checking
 # ---------------------------------------------------------------
-
 fn check_binary_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 2:
         return TID_ERR
@@ -1759,21 +1610,17 @@ fn check_binary_expression(node: Node, scope_id: Int) -> Int:
     # pipe operator: special handling
     if op == "pipe":
         return check_pipe_expression(node, scope_id)
-
     left := c_check_expr(node.children[0], scope_id)
     right := c_check_expr(node.children[1], scope_id)
-
     if is_error_type(left):
         return TID_ERR
     if is_error_type(right):
         return TID_ERR
-
     # string concatenation
     if op == "add":
         if left == tid_string:
             if right == tid_string:
                 return tid_string
-
     # arithmetic operators: add, sub, mul, div, mod
     if op == "add":
         if is_numeric_type(left) == false:
@@ -1815,7 +1662,6 @@ fn check_binary_expression(node: Node, scope_id: Int) -> Int:
             report_error("E217", "operator % type mismatch: " + get_type_name(left) + " vs " + get_type_name(right))
             return TID_ERR
         return left
-
     # comparison operators: eq, neq
     if op == "eq":
         if left != right:
@@ -1827,7 +1673,6 @@ fn check_binary_expression(node: Node, scope_id: Int) -> Int:
             report_error("E217", "operator != type mismatch: " + get_type_name(left) + " vs " + get_type_name(right))
             return TID_ERR
         return tid_bool
-
     # ordering: lt, gt, lte, gte
     if op == "lt":
         if is_numeric_type(left) == false:
@@ -1865,7 +1710,6 @@ fn check_binary_expression(node: Node, scope_id: Int) -> Int:
             report_error("E217", "operator >= type mismatch: " + get_type_name(left) + " vs " + get_type_name(right))
             return TID_ERR
         return tid_bool
-
     # logical: and, or
     if op == "and":
         if left != tid_bool:
@@ -1883,13 +1727,10 @@ fn check_binary_expression(node: Node, scope_id: Int) -> Int:
             report_error("E217", "operator 'or' requires Bool, got " + get_type_name(right))
             return TID_ERR
         return tid_bool
-
     return TID_ERR
-
 # ---------------------------------------------------------------
 # pipe expression: value | fn_name
 # ---------------------------------------------------------------
-
 fn check_pipe_expression(node: Node, scope_id: Int) -> Int:
     left := c_check_expr(node.children[0], scope_id)
     if is_error_type(left):
@@ -1914,11 +1755,9 @@ fn check_pipe_expression(node: Node, scope_id: Int) -> Int:
         report_error("E200", "pipe type mismatch: function expects " + get_type_name(fn_info.param_types[0]) + ", got " + get_type_name(left))
         return TID_ERR
     return fn_info.return_type
-
 # ---------------------------------------------------------------
 # unary expression
 # ---------------------------------------------------------------
-
 fn check_unary_expression(node: Node, scope_id: Int) -> Int:
     tid_bool := lookup_type_id("Bool")
     if node.children.len() < 1:
@@ -1938,17 +1777,14 @@ fn check_unary_expression(node: Node, scope_id: Int) -> Int:
             return TID_ERR
         return tid_bool
     return TID_ERR
-
 # ---------------------------------------------------------------
 # call expression
 # ---------------------------------------------------------------
-
 fn check_function_call(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
         return TID_ERR
     callee_idx := node.children[0]
     callee_node := get_node(callee_idx)
-
     # get argument nodes (children after callee)
     mut arg_indices: List[Int] := []
     mut skip_callee := 1
@@ -1957,7 +1793,6 @@ fn check_function_call(node: Node, scope_id: Int) -> Int:
             skip_callee = skip_callee - 1
             continue
         arg_indices.push(child)
-
     # Channel[T]() constructor — callee is an index expr like Channel[Int]
     if callee_node.kind == "index":
         if callee_node.children.len() >= 2:
@@ -1966,7 +1801,6 @@ fn check_function_call(node: Node, scope_id: Int) -> Int:
                 if obj_node.value == "Channel":
                     return check_channel_constructor(callee_node, arg_indices, scope_id)
         return check_function_call_expression(callee_idx, arg_indices, scope_id)
-
     if callee_node.kind == "ident":
         name := callee_node.value
         # special case: assert_eq / assert_ne
@@ -2003,10 +1837,8 @@ fn check_function_call(node: Node, scope_id: Int) -> Int:
             return check_generic_function_call(name, arg_indices, scope_id)
         # normal function call
         return check_function_call_expression(callee_idx, arg_indices, scope_id)
-
     # non-ident callee (e.g. lambda call)
     return check_function_call_expression(callee_idx, arg_indices, scope_id)
-
 # check a Channel[T]() constructor call — resolves the type argument
 # and returns the channel type id
 fn check_channel_constructor(index_node: Node, arg_indices: List[Int], scope_id: Int) -> Int:
@@ -2026,13 +1858,11 @@ fn check_channel_constructor(index_node: Node, arg_indices: List[Int], scope_id:
     mut type_args: List[Int] := []
     type_args.push(inner_tid)
     return resolve_generic_type("Channel", type_args)
-
 fn check_function_call_expression(callee_idx: Int, arg_indices: List[Int], scope_id: Int) -> Int:
     callee_type := c_check_expr(callee_idx, scope_id)
     if is_error_type(callee_type):
         return TID_ERR
     return check_callable_type_with_args(callee_type, arg_indices, scope_id)
-
 fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope_id: Int) -> Int:
     fn_info := get_type_info(callee_type)
     if fn_info.kind != "function":
@@ -2059,7 +1889,6 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
                         report_error("E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return fn_info.return_type
-
 fn check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_indices: List[Int], scope_id: Int) -> Int:
     # check field count
     if arg_indices.len() != info.fields.len():
@@ -2081,7 +1910,6 @@ fn check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_i
                     report_error("E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return struct_tid
-
 fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_id: Int) -> Int:
     decl_idx := get_generic_declaration_index(name)
     decl_node := get_node(decl_idx)
@@ -2133,7 +1961,6 @@ fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_
             type_args.push(TID_ERR)
     # instantiate the struct
     return instantiate_generic_struct_type(decl_node, type_args)
-
 fn check_assertion_equality(arg_indices: List[Int], scope_id: Int) -> Int:
     if arg_indices.len() != 2:
         report_error("E207", "assert_eq expects 2 arguments, got " + arg_indices.len().to_string())
@@ -2157,14 +1984,12 @@ fn check_assertion_equality(arg_indices: List[Int], scope_id: Int) -> Int:
             if t1 != t2:
                 report_error("E219", "assert_eq arguments must be the same type: " + get_type_name(t1) + " vs " + get_type_name(t2))
     return TID_VOID
-
 fn call_arg_expr_index(arg_idx: Int) -> Int:
     arg_node := get_node(arg_idx)
     if arg_node.kind == "arg":
         if arg_node.children.len() > 0:
             return arg_node.children[0]
     return arg_idx
-
 fn check_list_map_builtin(arg_indices: List[Int], scope_id: Int) -> Int:
     if arg_indices.len() != 2:
         report_error("E207", "map expects 2 arguments, got " + arg_indices.len().to_string())
@@ -2190,7 +2015,6 @@ fn check_list_map_builtin(arg_indices: List[Int], scope_id: Int) -> Int:
         report_error("E219", "map callback parameter mismatch: expected " + get_type_name(list_info.inner) + ", got " + get_type_name(fn_info.param_types[0]))
         return TID_ERR
     return intern_list_type(fn_info.return_type)
-
 fn check_list_filter_builtin(arg_indices: List[Int], scope_id: Int) -> Int:
     if arg_indices.len() != 2:
         report_error("E207", "filter expects 2 arguments, got " + arg_indices.len().to_string())
@@ -2220,7 +2044,6 @@ fn check_list_filter_builtin(arg_indices: List[Int], scope_id: Int) -> Int:
             report_error("E219", "filter callback must return Bool or Int-like truthy value, got " + get_type_name(fn_info.return_type))
             return TID_ERR
     return list_tid
-
 fn check_list_reduce_builtin(arg_indices: List[Int], scope_id: Int) -> Int:
     if arg_indices.len() != 3:
         report_error("E207", "reduce expects 3 arguments, got " + arg_indices.len().to_string())
@@ -2255,11 +2078,9 @@ fn check_list_reduce_builtin(arg_indices: List[Int], scope_id: Int) -> Int:
         report_error("E219", "reduce callback return mismatch: expected " + get_type_name(init_tid) + ", got " + get_type_name(fn_info.return_type))
         return TID_ERR
     return init_tid
-
 # ---------------------------------------------------------------
 # interface bounds checking
 # ---------------------------------------------------------------
-
 fn check_type_parameter_bounds(decl_node_idx: Int, subst_map: Map[String, Int]) -> Bool:
     decl_node := get_node(decl_node_idx)
     mut ok := true
@@ -2282,11 +2103,9 @@ fn check_type_parameter_bounds(decl_node_idx: Int, subst_map: Map[String, Int]) 
                             report_error("E226", "type '" + type_name + "' does not implement interface '" + iface_name + "'")
                             ok = false
     return ok
-
 # ---------------------------------------------------------------
 # generic function call
 # ---------------------------------------------------------------
-
 fn bind_inferred_generic_type(name: String, actual_tid: Int) -> Bool:
     if generic_inference_subst.contains_key(name):
         existing := generic_inference_subst[name]
@@ -2296,7 +2115,6 @@ fn bind_inferred_generic_type(name: String, actual_tid: Int) -> Bool:
         return true
     generic_inference_subst.insert(name, actual_tid)
     return true
-
 fn trim_type_text(text: String) -> String:
     mut start := 0
     mut end := text.len()
@@ -2305,7 +2123,6 @@ fn trim_type_text(text: String) -> String:
     while end > start and text[end - 1] == " ":
         end = end - 1
     return text.substring(start, end)
-
 fn split_top_level_type_args(text: String) -> List[String]:
     mut parts: List[String] := []
     mut start := 0
@@ -2323,7 +2140,6 @@ fn split_top_level_type_args(text: String) -> List[String]:
         i = i + 1
     parts.push(trim_type_text(text.substring(start, text.len())))
     return parts
-
 fn infer_generic_subst_from_type_text(type_name: String, actual_tid: Int, generic_params: List[String]) -> Bool:
     if actual_tid < 0:
         return true
@@ -2332,33 +2148,27 @@ fn infer_generic_subst_from_type_text(type_name: String, actual_tid: Int, generi
         normalized_gp := trim_type_text(gp)
         if strings_equal(normalized_gp, trimmed):
             return bind_inferred_generic_type(normalized_gp, actual_tid)
-
     actual_info := get_type_info(actual_tid)
-
     if trimmed.starts_with("List[") and trimmed.ends_with("]"):
         if actual_info.kind != "list":
             return true
         inner_text := trimmed.substring(5, trimmed.len() - 1)
         return infer_generic_subst_from_type_text(inner_text, actual_info.inner, generic_params)
-
     if trimmed.starts_with("Set[") and trimmed.ends_with("]"):
         if actual_info.kind != "set":
             return true
         inner_text := trimmed.substring(4, trimmed.len() - 1)
         return infer_generic_subst_from_type_text(inner_text, actual_info.inner, generic_params)
-
     if trimmed.starts_with("Task[") and trimmed.ends_with("]"):
         if actual_info.kind != "task":
             return true
         inner_text := trimmed.substring(5, trimmed.len() - 1)
         return infer_generic_subst_from_type_text(inner_text, actual_info.inner, generic_params)
-
     if trimmed.starts_with("Channel[") and trimmed.ends_with("]"):
         if actual_info.kind != "channel":
             return true
         inner_text := trimmed.substring(8, trimmed.len() - 1)
         return infer_generic_subst_from_type_text(inner_text, actual_info.inner, generic_params)
-
     if trimmed.starts_with("Map[") and trimmed.ends_with("]"):
         if actual_info.kind != "map":
             return true
@@ -2369,18 +2179,14 @@ fn infer_generic_subst_from_type_text(type_name: String, actual_tid: Int, generi
         if args.len() > 1:
             return infer_generic_subst_from_type_text(args[1], actual_info.value_type, generic_params)
         return true
-
     return true
-
 fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_params: List[String]) -> Bool:
     if type_idx < 0 or actual_tid < 0:
         return true
     node := get_node(type_idx)
     if node.kind == "type":
         return infer_generic_subst_from_type_text(node.value, actual_tid, generic_params)
-
     actual_info := get_type_info(actual_tid)
-
     if node.kind == "generic_type":
         for gp in generic_params:
             normalized_gp := trim_type_text(gp)
@@ -2409,12 +2215,10 @@ fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_pa
                 return infer_generic_subst_from_type_node(node.children[1], actual_info.value_type, generic_params)
             return true
         return true
-
     if node.kind == "optional_type":
         if actual_info.kind == "optional" and node.children.len() > 0:
             return infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params)
         return true
-
     if node.kind == "result_type":
         if actual_info.kind == "result" and node.children.len() > 0:
             if infer_generic_subst_from_type_node(node.children[0], actual_info.inner, generic_params) == false:
@@ -2422,7 +2226,6 @@ fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_pa
             if node.children.len() > 1 and actual_info.value_type >= 0:
                 return infer_generic_subst_from_type_node(node.children[1], actual_info.value_type, generic_params)
         return true
-
     if node.kind == "tuple_type":
         if actual_info.kind == "tuple":
             for child, i in node.children:
@@ -2430,7 +2233,6 @@ fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_pa
                     if infer_generic_subst_from_type_node(child, actual_info.elements[i], generic_params) == false:
                         return false
         return true
-
     if node.kind == "fn_type":
         if actual_info.kind == "function":
             for child, i in node.children:
@@ -2444,9 +2246,7 @@ fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_pa
                     if cn.children.len() > 0:
                         return infer_generic_subst_from_type_node(cn.children[0], actual_info.return_type, generic_params)
         return true
-
     return true
-
 fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: Int) -> Int:
     decl_idx := get_generic_declaration_index(name)
     decl_node := get_node(decl_idx)
@@ -2523,11 +2323,9 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
                                 report_error("E219", "argument type mismatch: expected " + get_type_name(concrete) + ", got " + get_type_name(arg_types[vidx]))
         vidx = vidx + 1
     return ret_type
-
 # ---------------------------------------------------------------
 # method call
 # ---------------------------------------------------------------
-
 fn check_method_call(node: Node, scope_id: Int) -> Int:
     # node.value = method name
     # children[0] = receiver
@@ -2538,7 +2336,6 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     if method_name.starts_with("."):
         method_name = method_name.substring(1, method_name.len())
     recv_node := get_node(node.children[0])
-
     mut arg_indices: List[Int] := []
     mut skip_recv := 1
     for child in node.children:
@@ -2546,7 +2343,6 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             skip_recv = skip_recv - 1
             continue
         arg_indices.push(child)
-
     if recv_node.kind == "ident":
         recv_name := recv_node.value
         if module_aliases.contains_key(recv_name):
@@ -2559,7 +2355,6 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 report_error("E201", "undefined function: " + recv_name + "." + method_name)
                 return TID_ERR
             return check_callable_type_with_args(callee_type, arg_indices, scope_id)
-
     receiver_type := c_check_expr(node.children[0], scope_id)
     if is_error_type(receiver_type):
         return TID_ERR
@@ -2574,13 +2369,11 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             return result_method
         dispatch_type = recv_info.inner
         recv_info = get_type_info(dispatch_type)
-
     tid_string := lookup_type_id("String")
     tid_bytes := lookup_type_id("Bytes")
     tid_int := lookup_type_id("Int")
     tid_float := lookup_type_id("Float")
     tid_bool := lookup_type_id("Bool")
-
     # string methods
     if dispatch_type == tid_string:
         return check_string_method_call(method_name, arg_indices, scope_id)
@@ -2593,7 +2386,6 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         return check_float_method_call(method_name, arg_indices, scope_id)
     if dispatch_type == tid_bool:
         return check_bool_method_call(method_name, arg_indices, scope_id)
-
     # collection methods
     if recv_info.kind == "list":
         result := check_list_method_call(method_name, recv_info, arg_indices, scope_id)
@@ -2607,24 +2399,20 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         result := check_set_method_call(method_name, recv_info, arg_indices, scope_id)
         if is_error_type(result) == false:
             return result
-
     # channel methods
     if recv_info.kind == "channel":
         ch_result := check_channel_method_call(method_name, recv_info, arg_indices, scope_id)
         if is_error_type(ch_result) == false:
             return ch_result
-
     if recv_info.kind == "task":
         task_result := check_task_method_call(method_name, recv_info, arg_indices, scope_id)
         if is_error_type(task_result) == false:
             return task_result
-
     # sync primitive methods
     if recv_info.kind == "struct":
         sync_result := check_sync_primitive_method_call(recv_info.name, method_name, arg_indices, scope_id)
         if is_error_type(sync_result) == false:
             return sync_result
-
     # user-defined methods
     type_name := get_type_name(dispatch_type)
     key := type_name + "." + method_name
@@ -2654,11 +2442,9 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         return ret_type
     report_error("E209", get_type_name(receiver_type) + " has no method '" + method_name + "'")
     return TID_ERR
-
 # ---------------------------------------------------------------
 # string methods
 # ---------------------------------------------------------------
-
 fn check_string_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
     tid_int := lookup_type_id("Int")
     tid_string := lookup_type_id("String")
@@ -2716,11 +2502,9 @@ fn check_string_method_call(method: String, args: List[Int], scope_id: Int) -> I
         return intern_list_type(tid_string)
     report_error("E209", "String has no method '" + method + "'")
     return TID_ERR
-
 # ---------------------------------------------------------------
 # bytes methods
 # ---------------------------------------------------------------
-
 fn check_bytes_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
     tid_int := lookup_type_id("Int")
     tid_string := lookup_type_id("String")
@@ -2743,7 +2527,6 @@ fn check_bytes_method_call(method: String, args: List[Int], scope_id: Int) -> In
         return add_type_info(ti_result(tid_string, TID_STRING))
     report_error("E209", "Bytes has no method '" + method + "'")
     return TID_ERR
-
 fn check_result_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
     if method == "to_string":
@@ -2784,11 +2567,9 @@ fn check_result_method_call(method: String, info: TypeInfo, args: List[Int], sco
             return TID_ERR
         return handler_info.return_type
     return TID_ERR
-
 # ---------------------------------------------------------------
 # primitive methods
 # ---------------------------------------------------------------
-
 fn check_int_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
     tid_float := lookup_type_id("Float")
@@ -2800,7 +2581,6 @@ fn check_int_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
         return tid_float
     report_error("E209", "Int has no method '" + method + "'")
     return TID_ERR
-
 fn check_float_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
     tid_int := lookup_type_id("Int")
@@ -2812,7 +2592,6 @@ fn check_float_method_call(method: String, args: List[Int], scope_id: Int) -> In
         return tid_int
     report_error("E209", "Float has no method '" + method + "'")
     return TID_ERR
-
 fn check_bool_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
     if method == "to_string":
@@ -2820,11 +2599,9 @@ fn check_bool_method_call(method: String, args: List[Int], scope_id: Int) -> Int
         return tid_string
     report_error("E209", "Bool has no method '" + method + "'")
     return TID_ERR
-
 # ---------------------------------------------------------------
 # list methods
 # ---------------------------------------------------------------
-
 fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
     elem := info.inner
     tid_int := lookup_type_id("Int")
@@ -2866,11 +2643,9 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
         return intern_list_type(elem)
     # not a built-in list method
     return - 1
-
 # ---------------------------------------------------------------
 # map methods
 # ---------------------------------------------------------------
-
 fn check_map_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
     key_t := info.key_type
     val_t := info.value_type
@@ -2914,11 +2689,9 @@ fn check_map_method_call(method: String, info: TypeInfo, args: List[Int], scope_
         expect_no_arguments(method, args)
         return intern_list_type(val_t)
     return - 1
-
 # ---------------------------------------------------------------
 # set methods
 # ---------------------------------------------------------------
-
 fn check_set_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
     elem := info.inner
     if method == "add":
@@ -2940,11 +2713,9 @@ fn check_set_method_call(method: String, info: TypeInfo, args: List[Int], scope_
         expect_one_typed_argument(method, args, elem, scope_id)
         return TID_VOID
     return - 1
-
 # ---------------------------------------------------------------
 # method arg validators
 # ---------------------------------------------------------------
-
 fn check_sync_primitive_method_call(type_name: String, method: String, args: List[Int], scope_id: Int) -> Int:
     tid_void := lookup_type_id("Void")
     tid_int := lookup_type_id("Int")
@@ -2974,7 +2745,6 @@ fn check_sync_primitive_method_call(type_name: String, method: String, args: Lis
             expect_no_arguments("Semaphore.release", args)
             return tid_void
     return tid_err
-
 fn check_channel_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
     tid_int := lookup_type_id("Int")
     tid_bool := lookup_type_id("Bool")
@@ -3006,7 +2776,6 @@ fn check_channel_method_call(method: String, info: TypeInfo, args: List[Int], sc
         expect_no_arguments("Channel.cap", args)
         return tid_int
     return tid_err
-
 fn check_task_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
     tid_bool := lookup_type_id("Bool")
     tid_void := lookup_type_id("Void")
@@ -3018,18 +2787,15 @@ fn check_task_method_call(method: String, info: TypeInfo, args: List[Int], scope
         expect_no_arguments("Task.detach", args)
         return tid_void
     return tid_err
-
 fn expect_no_arguments(method: String, args: List[Int]):
     if args.len() != 0:
         report_error("E207", method + " takes no arguments, got " + args.len().to_string())
-
 fn expect_one_string_argument(method: String, args: List[Int], scope_id: Int):
     tid_string := lookup_type_id("String")
     if args.len() != 1:
         report_error("E207", method + " expects 1 argument, got " + args.len().to_string())
         return
     check_argument_type(args[0], tid_string, scope_id)
-
 fn expect_two_string_arguments(method: String, args: List[Int], scope_id: Int):
     tid_string := lookup_type_id("String")
     if args.len() != 2:
@@ -3037,7 +2803,6 @@ fn expect_two_string_arguments(method: String, args: List[Int], scope_id: Int):
         return
     check_argument_type(args[0], tid_string, scope_id)
     check_argument_type(args[1], tid_string, scope_id)
-
 fn expect_two_int_arguments(method: String, args: List[Int], scope_id: Int):
     tid_int := lookup_type_id("Int")
     if args.len() != 2:
@@ -3045,7 +2810,6 @@ fn expect_two_int_arguments(method: String, args: List[Int], scope_id: Int):
         return
     check_argument_type(args[0], tid_int, scope_id)
     check_argument_type(args[1], tid_int, scope_id)
-
 fn expect_int_string_arguments(method: String, args: List[Int], scope_id: Int):
     tid_int := lookup_type_id("Int")
     tid_string := lookup_type_id("String")
@@ -3054,13 +2818,11 @@ fn expect_int_string_arguments(method: String, args: List[Int], scope_id: Int):
         return
     check_argument_type(args[0], tid_int, scope_id)
     check_argument_type(args[1], tid_string, scope_id)
-
 fn expect_one_typed_argument(method: String, args: List[Int], expected: Int, scope_id: Int):
     if args.len() != 1:
         report_error("E207", method + " expects 1 argument, got " + args.len().to_string())
         return
     check_argument_type(args[0], expected, scope_id)
-
 fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
     arg_node := get_node(arg_idx)
     mut expr_idx := arg_idx
@@ -3072,16 +2834,13 @@ fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
         if actual != expected:
             if types_structurally_equal(actual, expected) == false:
                 report_error("E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(actual))
-
 # ---------------------------------------------------------------
 # field access
 # ---------------------------------------------------------------
-
 fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
         return TID_ERR
     field_name := node.value
-    
     # check if this is module alias access (e.g., math.abs)
     obj_node_idx := node.children[0]
     obj_node := get_node(obj_node_idx)
@@ -3098,7 +2857,6 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
                 return func_tid
             report_error("E209", "module '" + obj_name + "' has no function '" + field_name + "'")
             return TID_ERR
-    
     obj_type := c_check_expr(obj_node_idx, scope_id)
     if is_error_type(obj_type):
         return TID_ERR
@@ -3140,7 +2898,6 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
         return obj_type
     report_error("E209", get_type_name(obj_type) + " has no field '" + field_name + "'")
     return TID_ERR
-
 fn parse_integer_string(s: String) -> Int:
     # simple integer parser for tuple field indices
     if s.len() == 0:
@@ -3173,11 +2930,9 @@ fn parse_integer_string(s: String) -> Int:
             return - 1
         i = i + 1
     return result
-
 # ---------------------------------------------------------------
 # index expression
 # ---------------------------------------------------------------
-
 fn check_index_expression(node: Node, scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
     tid_bytes := lookup_type_id("Bytes")
@@ -3220,11 +2975,9 @@ fn check_index_expression(node: Node, scope_id: Int) -> Int:
         return obj_info.value_type
     report_error("E217", get_type_name(obj_type) + " does not support indexing")
     return TID_ERR
-
 # ---------------------------------------------------------------
 # unwrap expression (value?)
 # ---------------------------------------------------------------
-
 fn check_unwrap_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
         return TID_ERR
@@ -3236,11 +2989,9 @@ fn check_unwrap_expression(node: Node, scope_id: Int) -> Int:
         return info.inner
     report_error_with_fix("E224", "unwrap requires an optional type, got " + get_type_name(inner), "use ? for unwrapping optional types")
     return TID_ERR
-
 # ---------------------------------------------------------------
 # try expression (value!)
 # ---------------------------------------------------------------
-
 fn check_try_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
         return TID_ERR
@@ -3264,7 +3015,6 @@ fn check_try_expression(node: Node, scope_id: Int) -> Int:
         return info.inner
     report_error_with_fix("E224", "try requires a result type, got " + get_type_name(inner), "use ! for unwrapping optional types")
     return TID_ERR
-
 fn check_catch_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 2:
         return TID_ERR
@@ -3282,7 +3032,6 @@ fn check_catch_expression(node: Node, scope_id: Int) -> Int:
         report_error("E219", "catch fallback type mismatch: expected " + get_type_name(result_info.inner) + ", got " + get_type_name(fallback_type))
         return TID_ERR
     return result_info.inner
-
 fn check_select_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() == 0:
         report_error("E232", "select requires at least one arm")
@@ -3308,7 +3057,6 @@ fn check_select_expression(node: Node, scope_id: Int) -> Int:
                 if arm_type != TID_VOID and result_type != TID_VOID:
                     report_error("E225", "select arms have different types: " + get_type_name(result_type) + " vs " + get_type_name(arm_type))
     return result_type
-
 fn check_select_arm(arm: Node, scope_id: Int) -> Int:
     if arm.kind == "select_recv_arm":
         return check_select_recv_arm(arm, scope_id)
@@ -3320,7 +3068,6 @@ fn check_select_arm(arm: Node, scope_id: Int) -> Int:
         return check_select_arm_body(arm, 0, scope_id)
     report_error("E232", "invalid select arm")
     return TID_ERR
-
 fn check_select_recv_arm(arm: Node, scope_id: Int) -> Int:
     if arm.children.len() < 2:
         report_error("E232", "select recv arm requires a recv expression and body")
@@ -3335,7 +3082,6 @@ fn check_select_recv_arm(arm: Node, scope_id: Int) -> Int:
     arm_scope := create_scope(scope_id)
     define_binding(arm_scope, arm.value, recv_type, false)
     return check_select_arm_body(arm, 1, arm_scope)
-
 fn check_select_send_arm(arm: Node, scope_id: Int) -> Int:
     if arm.children.len() < 2:
         report_error("E232", "select send arm requires a send expression and body")
@@ -3351,7 +3097,6 @@ fn check_select_send_arm(arm: Node, scope_id: Int) -> Int:
         report_error("E232", "select send arms must use a channel send expression")
         return TID_ERR
     return check_select_arm_body(arm, 1, scope_id)
-
 fn check_select_timeout_arm(arm: Node, scope_id: Int) -> Int:
     if arm.children.len() < 2:
         report_error("E232", "select timeout arm requires a duration and body")
@@ -3361,7 +3106,6 @@ fn check_select_timeout_arm(arm: Node, scope_id: Int) -> Int:
         if timeout_type != TID_INT:
             report_error("E219", "select timeout expects Int milliseconds, got " + get_type_name(timeout_type))
     return check_select_arm_body(arm, 1, scope_id)
-
 fn check_select_arm_body(arm: Node, body_idx: Int, scope_id: Int) -> Int:
     if body_idx >= arm.children.len():
         return TID_VOID
@@ -3374,11 +3118,9 @@ fn check_select_arm_body(arm: Node, body_idx: Int, scope_id: Int) -> Int:
         check_block_statement(body_node, scope_id)
         return TID_VOID
     return c_check_expr(arm.children[body_idx], scope_id)
-
 # ---------------------------------------------------------------
 # if expression
 # ---------------------------------------------------------------
-
 fn check_if_expression(node: Node, scope_id: Int) -> Int:
     # children: [condition, then_expr, elif_branches..., else_expr]
     if node.children.len() < 2:
@@ -3418,11 +3160,9 @@ fn check_if_expression(node: Node, scope_id: Int) -> Int:
                 if etype != result_type:
                     report_error("E225", "if expression branches have different types: " + get_type_name(result_type) + " vs " + get_type_name(etype))
     return result_type
-
 # ---------------------------------------------------------------
 # match expression
 # ---------------------------------------------------------------
-
 fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
     node := get_node(node_idx)
     # children[0] is the subject expression
@@ -3458,7 +3198,6 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
     # exhaustiveness checking
     check_match_exhaustiveness(subject_type, arm_values, node_idx)
     return result_type
-
 fn check_match_arm(arm: Node, subject_type: Int, scope_id: Int) -> Int:
     # children: [pattern, guard?, body]
     if arm.children.len() < 2:
@@ -3488,11 +3227,9 @@ fn check_match_arm(arm: Node, subject_type: Int, scope_id: Int) -> Int:
         return TID_VOID
     # expression arm
     return c_check_expr(arm.children[body_idx], arm_scope)
-
 # ---------------------------------------------------------------
 # pattern checking
 # ---------------------------------------------------------------
-
 fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
     pat := get_node(pat_idx)
     if pat.kind == "pat_wildcard":
@@ -3524,7 +3261,6 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
     if pat.kind == "pat_tuple":
         check_tuple_pattern_match(pat, expected_type, scope_id)
         return
-
 fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     # value: "EnumName.VariantName"
     # children: sub-patterns for variant fields
@@ -3565,7 +3301,6 @@ fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
         vidx = vidx + 1
     if found == false:
         report_error("E212", type_name + " has no variant '" + variant_name + "'")
-
 fn check_tuple_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     info := get_type_info(expected_type)
     if info.kind != "tuple":
@@ -3579,11 +3314,9 @@ fn check_tuple_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
         if i < info.elements.len():
             check_pattern_match(sub_pat, info.elements[i], scope_id)
         i = i + 1
-
 # ---------------------------------------------------------------
 # exhaustiveness checking
 # ---------------------------------------------------------------
-
 fn collect_arm_pattern_bindings(pat: Node) -> String:
     if pat.kind == "pat_wildcard":
         return "_"
@@ -3602,7 +3335,6 @@ fn collect_arm_pattern_bindings(pat: Node) -> String:
     if pat.kind == "pat_string":
         return pat.value
     return ""
-
 fn check_match_exhaustiveness(subject_type: Int, arm_values: List[String], node_idx: Int):
     # if any wildcard or binding pattern, it's exhaustive
     for v in arm_values:
@@ -3636,7 +3368,6 @@ fn check_match_exhaustiveness(subject_type: Int, arm_values: List[String], node_
         return
     # infinite domain (Int, String, Float) — need wildcard
     report_error("E204", "non-exhaustive match: add a wildcard (_) pattern")
-
 fn check_bool_exhaustiveness(arm_values: List[String]):
     mut has_true := false
     mut has_false := false
@@ -3649,7 +3380,6 @@ fn check_bool_exhaustiveness(arm_values: List[String]):
         report_error("E204", "non-exhaustive match: missing 'true' case")
     if has_false == false:
         report_error("E204", "non-exhaustive match: missing 'false' case")
-
 fn check_enum_exhaustiveness(info: TypeInfo, arm_values: List[String]):
     mut missing: List[String] := []
     for variant in info.variants:
@@ -3661,11 +3391,9 @@ fn check_enum_exhaustiveness(info: TypeInfo, arm_values: List[String]):
             missing.push(variant)
     if missing.len() > 0:
         report_error("E204", "non-exhaustive match: missing variants: " + missing.join(", "))
-
 # ---------------------------------------------------------------
 # lambda expression
 # ---------------------------------------------------------------
-
 fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
     # children: params..., body (last child is the expression body or body node)
     mut params: List[Int] := []
@@ -3697,11 +3425,9 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
         else:
             ret_type = c_check_expr(body_idx, lambda_scope)
     return add_type_info(ti_function(params, ret_type))
-
 # ---------------------------------------------------------------
 # collection literal expressions
 # ---------------------------------------------------------------
-
 fn check_list_expression(node: Node, scope_id: Int) -> Int:
     tid_err := lookup_type_id("<error>")
     if node.children.len() == 0:
@@ -3719,7 +3445,6 @@ fn check_list_expression(node: Node, scope_id: Int) -> Int:
     if is_error_type(elem_type):
         return tid_err
     return intern_list_type(elem_type)
-
 fn check_map_expression(node: Node, scope_id: Int) -> Int:
     tid_err := lookup_type_id("<error>")
     if node.children.len() == 0:
@@ -3747,7 +3472,6 @@ fn check_map_expression(node: Node, scope_id: Int) -> Int:
     if is_error_type(val_type):
         return tid_err
     return intern_map_type(key_type, val_type)
-
 fn check_set_expression(node: Node, scope_id: Int) -> Int:
     # sets look like {a, b, c} — distinguish from map by no entries
     tid_err := lookup_type_id("<error>")
@@ -3764,13 +3488,11 @@ fn check_set_expression(node: Node, scope_id: Int) -> Int:
     if is_error_type(elem_type):
         return tid_err
     return intern_set_type(elem_type)
-
 fn check_tuple_expression(node: Node, scope_id: Int) -> Int:
     mut elems: List[Int] := []
     for child in node.children:
         elems.push(c_check_expr(child, scope_id))
     return add_type_info(ti_tuple(elems))
-
 fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
     # node.value contains the struct type name
     struct_name := node.value
@@ -3778,18 +3500,15 @@ fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
     if struct_tid < 0:
         report_error("E202", "unknown type: " + struct_name)
         return TID_ERR
-
     # get struct info
     info := get_type_info(struct_tid)
     if info.kind != "struct":
         report_error("E202", struct_name + " is not a struct type")
         return TID_ERR
-
     # check field count
     if node.children.len() != info.fields.len():
         report_error("E207", struct_name + " expects " + info.fields.len().to_string() + " fields, got " + node.children.len().to_string())
         return TID_ERR
-
     # check each field type
     mut idx := 0
     for child in node.children:
@@ -3801,13 +3520,10 @@ fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
                 if arg_type != expected:
                     report_error("E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
-
     return struct_tid
-
 # ---------------------------------------------------------------
 # spawn/await
 # ---------------------------------------------------------------
-
 fn check_spawn_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
         report_error("E232", "spawn requires a function call")
@@ -3820,7 +3536,6 @@ fn check_spawn_expression(node: Node, scope_id: Int) -> Int:
     if is_error_type(inner):
         return TID_ERR
     return add_type_info(ti_task(inner))
-
 fn check_await_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
         report_error("E232", "await requires a Task expression")
@@ -3833,11 +3548,9 @@ fn check_await_expression(node: Node, scope_id: Int) -> Int:
         return info.inner
     report_error("E232", "await requires a Task type, got " + get_type_name(inner))
     return TID_ERR
-
 # ---------------------------------------------------------------
 # generic instantiation
 # ---------------------------------------------------------------
-
 fn instantiate_generic_type(decl_idx: Int, type_args: List[Int]) -> Int:
     decl := get_node(decl_idx)
     if decl.kind == "struct_decl":
@@ -3845,7 +3558,6 @@ fn instantiate_generic_type(decl_idx: Int, type_args: List[Int]) -> Int:
     if decl.kind == "enum_decl":
         return instantiate_generic_enum_type(decl, type_args)
     return TID_ERR
-
 fn instantiate_generic_struct_type(decl: Node, type_args: List[Int]) -> Int:
     name := decl.value
     base_name := name
@@ -3875,7 +3587,6 @@ fn instantiate_generic_struct_type(decl: Node, type_args: List[Int]) -> Int:
     tid := add_type_info(ti_struct(inst_name, field_names, field_types, field_pub, field_mut))
     register_type_name(inst_name, tid)
     return tid
-
 fn instantiate_generic_enum_type(decl: Node, type_args: List[Int]) -> Int:
     name := decl.value
     base_name := name
@@ -3897,11 +3608,9 @@ fn instantiate_generic_enum_type(decl: Node, type_args: List[Int]) -> Int:
     tid := add_type_info(ti_enum(inst_name, variant_names, variant_types))
     register_type_name(inst_name, tid)
     return tid
-
 # ---------------------------------------------------------------
 # structural equality
 # ---------------------------------------------------------------
-
 fn types_structurally_equal(a: Int, b: Int) -> Bool:
     if a == b:
         return true
@@ -3992,23 +3701,19 @@ fn types_structurally_equal(a: Int, b: Int) -> Bool:
                         return false
             return true
     return false
-
 fn types_compatible(actual: Int, expected: Int) -> Bool:
     if actual == expected:
         return true
     return types_structurally_equal(actual, expected)
-
 # ---------------------------------------------------------------
 # public API — run checker and return diagnostics as JSON
 # ---------------------------------------------------------------
-
 pub fn c_run(root_idx: Int, file_path: String) -> List[Diagnostic]:
     initialize_checker(file_path)
     process_import_aliases(root_idx)
     c_register_all(root_idx)
     c_check_all(root_idx)
     return checker_diagnostics
-
 # run checker passes on a single module without re-initializing.
 # call initialize_checker() once, then c_run_module() for each module in order.
 pub fn c_run_module(root_idx: Int) -> List[Diagnostic]:
@@ -4016,6 +3721,5 @@ pub fn c_run_module(root_idx: Int) -> List[Diagnostic]:
     c_register_all(root_idx)
     c_check_all(root_idx)
     return checker_diagnostics
-
 pub fn c_diagnostics_to_json(diags: List[Diagnostic]) -> String:
     return render_diagnostics_json(diags)

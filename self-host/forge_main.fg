@@ -19,7 +19,6 @@
 #   forge parse <file.fg>      print AST
 #   forge version              print version
 #   forge help                 print usage
-
 from driver import get_directory, get_stem, init_driver, resolve_imports, mark_visited, find_imports, get_driver_parse_diagnostics, driver_has_parse_errors
 from lexer import lex_all, Token
 from parser import parse, parse_with_file, parser_diagnostics, parser_has_errors
@@ -30,40 +29,32 @@ from formatter import fmt_source
 from linter import lint_module
 from errors import Diagnostic, render_diagnostics, render_diagnostics_json, count_errors, has_errors
 from docgen import doc_extract, doc_format, doc_format_json, doc_check, doc_search
-
 # ---------------------------------------------------------------
 # native backend passthrough
 # build/run/test still go through the Rust backend, but this CLI now forwards
 # those commands so the self-hosted binary is usable in bootstrap verification.
-
 fn backend_command(command: String, path: String) -> String:
     if path.contains(" "):
         print("error: paths with spaces are not supported by self-hosted " + command)
         exit(1)
     parts := ["./target/release/forge", command, path]
     return parts.join(" ")
-
 fn run_backend_command(command: String, path: String) -> String!:
     status := exec(backend_command(command, path))
     if status != 0:
         exit(status)
     return ""
-
 fn cmd_build(path: String) -> String!:
     return run_backend_command("build", path)
-
 fn cmd_run(path: String) -> String!:
     return run_backend_command("run", path)
-
 fn cmd_test(path: String) -> String!:
     return run_backend_command("test", path)
-
 fn render_diagnostics_for_path(diags: List[Diagnostic], primary_path: String, primary_source: String) -> String!:
     mut output := ""
     mut current_file := primary_path
     mut current_source := primary_source
     mut group: List[Diagnostic] := []
-
     for d in diags:
         mut diag_file := d.file
         if diag_file == "":
@@ -83,21 +74,17 @@ fn render_diagnostics_for_path(diags: List[Diagnostic], primary_path: String, pr
             else:
                 current_source = read_file(current_file)!
         group.push(d)
-
     if group.len() > 0:
         output = output + render_diagnostics(group, current_source)
     return output
-
 # ---------------------------------------------------------------
 # check command
 # ---------------------------------------------------------------
-
 fn cmd_check(path: String, json_mode: Bool) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
     reset_arena()
     root := parse_with_file(tokens, path)
-
     if parser_has_errors():
         diags := parser_diagnostics()
         if json_mode:
@@ -105,7 +92,6 @@ fn cmd_check(path: String, json_mode: Bool) -> String!:
         else:
             print(render_diagnostics(diags, source))
         exit(1)
-
     # resolve imports for multi-module type checking
     init_driver(path)
     import_roots := resolve_imports(root, path)!
@@ -116,12 +102,10 @@ fn cmd_check(path: String, json_mode: Bool) -> String!:
         else:
             print(render_diagnostics_for_path(diags, path, source)!)
         exit(1)
-
     initialize_checker(path)
     for imp_root in import_roots:
         c_run_module(imp_root)
     diags := c_run_module(root)
-
     if json_mode:
         print(c_diagnostics_to_json(diags))
     else:
@@ -131,36 +115,29 @@ fn cmd_check(path: String, json_mode: Bool) -> String!:
         else:
             print("ok")
     return ""
-
 # ---------------------------------------------------------------
 # fmt command
 # ---------------------------------------------------------------
-
 fn cmd_fmt(path: String, check_mode: Bool) -> String!:
     source := read_file(path)!
     formatted := fmt_source(source)
-
     if check_mode:
         if source != formatted:
             print(path + " needs formatting")
             exit(1)
         return ""
-
     if source != formatted:
         write_file(path, formatted)!
         print("formatted " + path)
     return ""
-
 # ---------------------------------------------------------------
 # lint command
 # ---------------------------------------------------------------
-
 fn cmd_lint(path: String, json_mode: Bool) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
     reset_arena()
     root := parse_with_file(tokens, path)
-
     if parser_has_errors():
         diags := parser_diagnostics()
         if json_mode:
@@ -168,7 +145,6 @@ fn cmd_lint(path: String, json_mode: Bool) -> String!:
         else:
             print(render_diagnostics(diags, source))
         exit(1)
-
     # resolve imports for type info (linter needs checker to run first)
     init_driver(path)
     import_roots := resolve_imports(root, path)!
@@ -183,9 +159,7 @@ fn cmd_lint(path: String, json_mode: Bool) -> String!:
     for imp_root in import_roots:
         c_run_module(imp_root)
     c_run_module(root)
-
     diags := lint_module(root, source)
-
     if json_mode:
         print(render_diagnostics_json(diags))
     else:
@@ -196,15 +170,12 @@ fn cmd_lint(path: String, json_mode: Bool) -> String!:
         else:
             print("ok")
     return ""
-
 # ---------------------------------------------------------------
 # doc command
 # ---------------------------------------------------------------
-
 fn cmd_doc(path: String, check_mode: Bool, json_mode: Bool) -> String!:
     source := read_file(path)!
     doc_extract(source)
-
     if check_mode:
         missing := doc_check()
         if missing > 0:
@@ -212,31 +183,25 @@ fn cmd_doc(path: String, check_mode: Bool, json_mode: Bool) -> String!:
             exit(1)
         print("ok")
         return ""
-
     if json_mode:
         print(doc_format_json())
     else:
         print(doc_format())
     return ""
-
 fn cmd_doc_search(query: String) -> String!:
     result := doc_search(query, ".")!
     print(result)
     return ""
-
 # ---------------------------------------------------------------
 # new command — scaffold a new package
 # ---------------------------------------------------------------
-
 fn cmd_new(name: String) -> String!:
     nl := chr(10)
     tab := chr(9)
     if dir_exists(name):
         print("error: directory '" + name + "' already exists")
         exit(1)
-
     mkdir(name)
-
     # forge.toml
     mut toml := "[package]" + nl
     toml = toml + "name = " + chr(34) + name + chr(34) + nl
@@ -244,7 +209,6 @@ fn cmd_new(name: String) -> String!:
     toml = toml + "description = " + chr(34) + "a short description of " + name + chr(34) + nl
     toml = toml + "license = " + chr(34) + "MIT" + chr(34) + nl
     write_file(name + "/forge.toml", toml)!
-
     # AGENTS.md
     mut agents := "# AGENTS.md" + nl
     agents = agents + nl
@@ -279,13 +243,11 @@ fn cmd_new(name: String) -> String!:
     agents = agents + "`forge publish` enforces: type check, lint, tests, docs, coverage." + nl
     agents = agents + "fix what it flags." + nl
     write_file(name + "/AGENTS.md", agents)!
-
     # .gitignore
     mut gi := ".forge-build/" + nl
     gi = gi + "zig-out/" + nl
     gi = gi + ".zig-cache/" + nl
     write_file(name + "/.gitignore", gi)!
-
     # Makefile
     mut mk := ".PHONY: build test check fmt lint" + nl
     mk = mk + nl
@@ -304,44 +266,36 @@ fn cmd_new(name: String) -> String!:
     mk = mk + "lint:" + nl
     mk = mk + tab + "forge lint lib.fg" + nl
     write_file(name + "/Makefile", mk)!
-
     # Dockerfile
     mut df := "FROM ubuntu:latest" + nl
     df = df + "COPY . /app" + nl
     df = df + "WORKDIR /app" + nl
     write_file(name + "/Dockerfile", df)!
-
     # README.md
     mut readme := "# " + name + nl
     readme = readme + nl
     readme = readme + "a short description of " + name + "." + nl
     write_file(name + "/README.md", readme)!
-
     # lib.fg
     mut lib := "# " + name + nl
     lib = lib + nl
     lib = lib + "pub fn hello() -> String:" + nl
     lib = lib + "    return " + chr(34) + "hello from " + name + chr(34) + nl
     write_file(name + "/lib.fg", lib)!
-
     print("created " + name + "/")
     return ""
-
 # ---------------------------------------------------------------
 # lex command
 # ---------------------------------------------------------------
-
 fn cmd_lex(path: String) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
     for tok in tokens:
         print(tok.kind + " " + tok.value)
     return ""
-
 # ---------------------------------------------------------------
 # parse command
 # ---------------------------------------------------------------
-
 fn cmd_parse(path: String) -> String!:
     source := read_file(path)!
     tokens := lex_all(source)
@@ -352,14 +306,11 @@ fn cmd_parse(path: String) -> String!:
         exit(1)
     print_ast(root)
     return ""
-
 # ---------------------------------------------------------------
 # help / version
 # ---------------------------------------------------------------
-
 fn print_version():
     print("forge 0.1.0 (self-hosted)")
-
 fn print_help():
     print("forge — the forge programming language compiler")
     print("")
@@ -384,19 +335,15 @@ fn print_help():
     print("  parse <file.fg>        print AST")
     print("  version                print version")
     print("  help                   print this help")
-
 # ---------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------
-
 fn run_cli() -> String!:
     a := args()
     if a.len() < 2:
         print_help()
         exit(1)
-
     command := a[1]
-
     # commands that don't need a file argument
     if command == "version":
         print_version()
@@ -410,7 +357,6 @@ fn run_cli() -> String!:
     if command == "--help":
         print_help()
         return ""
-
     # commands with optional flags
     if command == "check":
         if a.len() < 3:
@@ -424,7 +370,6 @@ fn run_cli() -> String!:
         else:
             _result := cmd_check(a[2], false)!
         return ""
-
     if command == "fmt":
         if a.len() < 3:
             print("usage: forge fmt [--check] <file.fg>")
@@ -437,7 +382,6 @@ fn run_cli() -> String!:
         else:
             _result := cmd_fmt(a[2], false)!
         return ""
-
     if command == "lint":
         if a.len() < 3:
             print("usage: forge lint [--json] <file.fg>")
@@ -450,7 +394,6 @@ fn run_cli() -> String!:
         else:
             _result := cmd_lint(a[2], false)!
         return ""
-
     if command == "doc":
         if a.len() < 3:
             print("usage: forge doc [--json|--check] <file.fg>")
@@ -475,7 +418,6 @@ fn run_cli() -> String!:
         else:
             _result := cmd_doc(a[2], false, false)!
         return ""
-
     # scaffold new package
     if command == "new":
         if a.len() < 3:
@@ -483,35 +425,25 @@ fn run_cli() -> String!:
             exit(1)
         _result := cmd_new(a[2])!
         return ""
-
     # commands that need exactly one file argument
     if a.len() < 3:
         print("usage: forge " + command + " <file.fg>")
         exit(1)
-
     path := a[2]
-
     if command == "lex":
         _result := cmd_lex(path)!
-
     elif command == "build":
         _result := cmd_build(path)!
-
     elif command == "run":
         _result := cmd_run(path)!
-
     elif command == "test":
         _result := cmd_test(path)!
-
     elif command == "parse":
         _result := cmd_parse(path)!
-
     else:
         print("unknown command: " + command)
         print_help()
         exit(1)
-
     return ""
-
 fn main():
     run_cli()

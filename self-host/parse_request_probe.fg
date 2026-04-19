@@ -4,7 +4,6 @@ fn parse_request(raw: String) -> String:
     sep := chr(31)
     mut header_part := raw
     mut req_body := ""
-
     mut i := 0
     raw_len := raw.len()
     while i < raw_len - 1:
@@ -18,13 +17,11 @@ fn parse_request(raw: String) -> String:
                 req_body = raw.substring(i + 3, raw_len)
                 break
         i = i + 1
-
     lines := header_part.split(nl)
     mut meth := "GET"
     mut full_path := "/"
     mut ver := "HTTP/1.1"
     mut hdrs := ""
-
     if lines.len() > 0:
         request_line := lines[0].trim()
         mut sp1 := -1
@@ -46,7 +43,6 @@ fn parse_request(raw: String) -> String:
             ver = request_line.substring(sp2 + 1, rl_len).trim()
         elif sp1 >= 0:
             full_path = request_line.substring(sp1 + 1, rl_len).trim()
-
     mut p := meth
     p = p + sep
     p = p + full_path
@@ -57,7 +53,6 @@ fn parse_request(raw: String) -> String:
     p = p + sep
     p = p + req_body
     return p
-
 fn main():
     crlf := chr(13) + chr(10)
     raw := "GET / HTTP/1.1" + crlf + crlf

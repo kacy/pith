@@ -4,21 +4,17 @@
 # runs the type checker, and outputs diagnostics as JSON.
 #
 # usage: forge run self-host/check_main.fg <file.fg>
-
 from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
 from checker import c_run, c_diagnostics_to_json
 from errors import render_diagnostics_json
-
 fn check_and_print() -> String!:
     a := args()
     if a.len() < 2:
         print("usage: forge run self-host/check_main.fg <file.fg>")
         exit(1)
-
     path := a[1]
     content := read_file(path)!
-
     tokens := lex_all(content)
     root := parse_with_file(tokens, path)
     if parser_has_errors():
@@ -27,6 +23,5 @@ fn check_and_print() -> String!:
     diags := c_run(root, path)
     print(c_diagnostics_to_json(diags))
     return ""
-
 fn main():
     check_and_print()

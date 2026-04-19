@@ -9,23 +9,17 @@
 #   E302 — unused variable
 #   E304 — public function missing doc comment
 #   E305 — indentation depth exceeds 4 levels
-
 from ast import Node, get_node
 from errors import Diagnostic
-
 # ---------------------------------------------------------------
 # diagnostics
 # ---------------------------------------------------------------
-
 mut l_diagnostics: List[Diagnostic] := []
-
 fn report_linter_warning(code: String, message: String):
     l_diagnostics.push(Diagnostic("warning", code, message, "", 0, 0, ""))
-
 # ---------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------
-
 # run all lint rules on a checked module AST.
 # source is needed for doc comment detection.
 pub fn lint_module(root_idx: Int, source: String) -> List[Diagnostic]:
@@ -34,19 +28,15 @@ pub fn lint_module(root_idx: Int, source: String) -> List[Diagnostic]:
     for child in root.children:
         lint_top_level(child, source)
     return l_diagnostics
-
 fn lint_top_level(node_idx: Int, source: String):
     node := get_node(node_idx)
     mut is_pub := false
     mut inner_idx := node_idx
-
     if node.kind == "pub":
         is_pub = true
         if node.children.len() > 0:
             inner_idx = node.children[0]
-
     inner := get_node(inner_idx)
-
     if inner.kind == "fn_decl":
         lint_fn_decl(inner, inner_idx, is_pub, source)
     elif inner.kind == "struct_decl":
@@ -64,27 +54,22 @@ fn lint_top_level(node_idx: Int, source: String):
         check_snake_case(name, "variable")
     elif inner.kind == "test_decl":
         lint_block_depth(inner, 1)
-
 fn lint_fn_decl(node: Node, node_idx: Int, is_pub: Bool, source: String):
     name := node.value
     # skip generic declarations
     if name.contains("["):
         return
-
     # E300: function name must be snake_case (skip main)
     if name != "main":
         check_snake_case(name, "function")
-
     # E304: public function missing doc comment
     if is_pub:
         check_doc_comment(name, node_idx, source)
-
     # check body for nesting depth
     for child in node.children:
         cn := get_node(child)
         if cn.kind == "body":
             lint_block_depth(cn, 1)
-
 fn lint_impl_decl(node: Node, source: String):
     # iterate methods
     for method_idx, i in node.children:
@@ -93,12 +78,10 @@ fn lint_impl_decl(node: Node, source: String):
         method := get_node(method_idx)
         mut is_pub := false
         mut actual_idx := method_idx
-
         if method.kind == "pub":
             is_pub = true
             if method.children.len() > 0:
                 actual_idx = method.children[0]
-
         actual := get_node(actual_idx)
         if actual.kind == "fn_decl":
             name := actual.value
@@ -112,17 +95,14 @@ fn lint_impl_decl(node: Node, source: String):
                 cn := get_node(child)
                 if cn.kind == "body":
                     lint_block_depth(cn, 1)
-
 # ---------------------------------------------------------------
 # E300: snake_case for functions and variables
 # ---------------------------------------------------------------
-
 fn check_snake_case(name: String, kind: String):
     if name == "" or name == "_":
         return
     if not is_snake_case(name):
         report_linter_warning("E300", kind + " '" + name + "' should be snake_case")
-
 fn is_snake_case(name: String) -> Bool:
     if name.len() == 0:
         return true
@@ -137,17 +117,14 @@ fn is_snake_case(name: String) -> Bool:
         if not is_lowercase_char(code) and not is_digit_char(code) and ch != "_":
             return false
     return true
-
 # ---------------------------------------------------------------
 # E301: PascalCase for types
 # ---------------------------------------------------------------
-
 fn check_pascal_case(name: String, kind: String):
     if name == "":
         return
     if not is_pascal_case(name):
         report_linter_warning("E301", kind + " '" + name + "' should be PascalCase")
-
 fn is_pascal_case(name: String) -> Bool:
     if name.len() == 0:
         return true
@@ -165,11 +142,9 @@ fn is_pascal_case(name: String) -> Bool:
             has_lower = true
     # must have at least one lowercase letter (HELLO is not PascalCase)
     return name.len() == 1 or has_lower
-
 # ---------------------------------------------------------------
 # E304: public function missing doc comment
 # ---------------------------------------------------------------
-
 fn check_doc_comment(name: String, node_idx: Int, source: String):
     # since self-hosted AST nodes don't have line numbers,
     # search source for "fn <name>" or "pub fn <name>" to find
@@ -188,11 +163,9 @@ fn check_doc_comment(name: String, node_idx: Int, source: String):
     prev := lines[found_line - 1].trim()
     if prev.len() == 0 or prev[0] != "#":
         report_linter_warning("E304", "public function '" + name + "' is missing a doc comment")
-
 # ---------------------------------------------------------------
 # E305: indentation depth exceeds 4 levels
 # ---------------------------------------------------------------
-
 fn lint_block_depth(node: Node, depth: Int):
     for child in node.children:
         cn := get_node(child)
@@ -205,7 +178,6 @@ fn lint_block_depth(node: Node, depth: Int):
             lint_block_depth(cn, depth + 1)
         else:
             lint_stmt_depth(child, depth)
-
 fn lint_stmt_depth(node_idx: Int, depth: Int):
     node := get_node(node_idx)
     if node.kind == "if" or node.kind == "while" or node.kind == "for_in" or node.kind == "match":
@@ -217,25 +189,19 @@ fn lint_stmt_depth(node_idx: Int, depth: Int):
                 lint_block_depth(cn, depth + 1)
             else:
                 lint_stmt_depth(child, depth)
-
 # ---------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------
-
 # extract the plain binding name from a value like "mut x" or "x"
 fn l_extract_binding_name(value: String) -> String:
     if value.starts_with("mut "):
         return value.substring(4, value.len())
     return value
-
 fn is_lowercase_char(c: Int) -> Bool:
     return c >= 97 and c <= 122
-
 fn is_uppercase_char(c: Int) -> Bool:
     return c >= 65 and c <= 90
-
 fn is_digit_char(c: Int) -> Bool:
     return c >= 48 and c <= 57
-
 fn is_alphanumeric_char(c: Int) -> Bool:
     return is_lowercase_char(c) or is_uppercase_char(c) or is_digit_char(c)

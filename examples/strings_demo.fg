@@ -10,6 +10,8 @@ from std.strings import remove_prefix, remove_suffix, strip_prefix, strip_suffix
 from std.strings import reverse, center, zfill
 from std.strings import first_n, last_n
 from std.strings import split_nonempty, join_nonempty, unlines
+from std.strings import collapse_whitespace, starts_with_any, ends_with_any
+from std.strings import common_prefix, common_suffix, indent_nonempty
 import std.io as io
 
 fn print_line(label: String, value: String) -> String!:
@@ -71,6 +73,12 @@ fn main() -> String!:
     print_line("split_nonempty('a,,b,c,', ','): '", split_nonempty("a,,b,c,", ",").join("|") + "'")!
     print_line("join_nonempty(['a', '', 'b'], ','): '", join_nonempty(["a", "", "b"], ",") + "'")!
     print_line("unlines(['x', 'y']): '", unlines(["x", "y"]) + "'")!
+    print_line("collapse_whitespace(' a\\tb\\nc '): '", collapse_whitespace(" a" + chr(9) + "b" + chr(10) + "c ") + "'")!
+    print("starts_with_any('forge.toml'): {starts_with_any("forge.toml", ["forge", "zig"])}")
+    print("ends_with_any('archive.tar.gz'): {ends_with_any("archive.tar.gz", [".zip", ".gz"])}")
+    print_line("common_prefix([...]): '", common_prefix(["forge.toml", "forge.lock", "forge.json"]) + "'")!
+    print_line("common_suffix([...]): '", common_suffix(["build.log", "debug.log", "trace.log"]) + "'")!
+    print_line("indent_nonempty('a\\\\n\\\\nb', '> '): '", indent_nonempty("a" + chr(10) + chr(10) + "b", "> ").replace(chr(10), "|") + "'")!
     
     print("\n=== All demonstrations complete! ===")
     return ""

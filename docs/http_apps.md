@@ -25,11 +25,21 @@ fn app(req: HttpRequestBytes) -> HttpResponse:
 
 use these helpers instead of reparsing strings by hand:
 - `req.query_param(...)`
+- `req.query_param_or(...)`
 - `req.has_query_param(...)`
 - `req.path_parts()`
 - `req.matches_path(...)`
 - `req.path_param(...)`
+- `req.path_param_or(...)`
 - `req.body_json()`
+- `req.body_json_or(...)`
+
+for common verb checks, prefer the small route wrappers:
+- `http.get_route(...)`
+- `http.post_route(...)`
+- `http.put_route(...)`
+- `http.delete_route(...)`
+- `http.patch_route(...)`
 
 ## response helpers
 
@@ -46,6 +56,10 @@ the common constructors are:
 - `http.html(status, body)`
 - `http.json(status, body)`
 - `http.json_value(status, handle)`
+- `http.bad_request_response()`
+- `http.unauthorized_response()`
+- `http.forbidden_response()`
+- `http.no_content()`
 - `http.not_found_response()`
 - `http.redirect_response(url)`
 
@@ -56,6 +70,16 @@ the older raw string helpers still exist for compatibility:
 - `redirect(...)`
 
 but the object form is the better default for new code.
+
+`HttpResponse` also has a few small helpers for the common inspection and
+builder cases:
+- `resp.is_success()`
+- `resp.is_client_error()`
+- `resp.is_server_error()`
+- `resp.text_body(...)`
+- `resp.bytes_body(...)`
+- `resp.json_body(...)`
+- `resp.content_type(...)`
 
 ## serving one request
 
@@ -92,10 +116,19 @@ raw := req.to_bytes()!
 for real requests:
 
 ```fg
-resp := http.request("GET", "127.0.0.1", 8080, "/health").send()!
+resp := http.get_request("127.0.0.1", 8080, "/health").accept(http.MIME_JSON).send()!
 print(resp.status_code().to_string())
 print(resp.body_text()!)
 ```
 
 that keeps request construction, response parsing, and body decoding in one
 module instead of splitting the work across app code.
+
+for common write-heavy client paths, prefer the request helpers:
+
+```fg
+req := http.post_request("example.com", 80, "/items") \
+    .query_param("mode", "fast path") \
+    .bearer("token") \
+    .json_body(payload)
+```

@@ -6,16 +6,16 @@ import std.net.http as http
 from std.net.http import HttpRequestBytes, HttpResponse
 
 fn app(req: HttpRequestBytes) -> HttpResponse:
-    if http.match_route(req, "POST", "/items/:id") catch false:
-        payload := req.body_json() catch -1
+    if http.post_route(req, "/items/:id") catch false:
+        payload := req.body_json_or(-1)
         if payload < 0:
-            return http.server_error_response()
+            return http.bad_request_response()
         out := json.make_object()
-        json.object_set(out, "id", json.make_string(http.route_param(req, "/items/:id", "id") catch ""))
-        json.object_set(out, "mode", json.make_string(req.query_param("mode") catch ""))
+        json.object_set(out, "id", json.make_string(req.path_param_or("/items/:id", "id", "")))
+        json.object_set(out, "mode", json.make_string(req.query_param_or("mode", "")))
         json.object_set(out, "has_empty", json.make_bool(req.has_query_param("empty") catch false))
         json.object_set(out, "kind", json.make_string(json.get_string(json.object_get(payload, "kind"))))
-        return http.json_value(201, out).header("X-Route", "item")
+        return http.response(201).json_body(out).header("X-Route", "item")
     return http.not_found_response()
 
 fn build_payload() -> Int:
@@ -25,7 +25,9 @@ fn build_payload() -> Int:
     return obj
 
 fn main() -> String!:
-    mut req_builder := http.request("POST", "example.com", 80, "/items/42?mode=raw&empty=")
+    mut req_builder := http.post_request("example.com", 80, "/items/42")
+    req_builder = req_builder.query_param("mode", "raw")
+    req_builder = req_builder.query_param("empty", "")
     req_builder = req_builder.header("X-Test", "yes")
     req_builder = req_builder.json_body(build_payload())
     req_bytes := req_builder.to_bytes()!
@@ -33,7 +35,7 @@ fn main() -> String!:
     req := http.read_request_buffered_bytes(io.bytes_reader(req_bytes).buffered_chunked(4))!
     print("method: " + req.method()!)
     print("path: " + req.path()!)
-    print("mode: " + req.query_param("mode")!)
+    print("mode: " + req.query_param_or("mode", ""))
     print("parts: " + req.path_parts()!.join(","))
 
     out := bytes.buffer()
@@ -41,6 +43,7 @@ fn main() -> String!:
     resp := http.parse_response_bytes(out.bytes())!
     body := resp.body_json()!
     print("status: " + resp.status_code().to_string())
+    print("success: " + resp.is_success().to_string())
     print("route: " + resp.header_value("X-Route"))
     print("body id: " + json.get_string(json.object_get(body, "id")))
     print("body kind: " + json.get_string(json.object_get(body, "kind")))
@@ -49,5 +52,6 @@ fn main() -> String!:
     print("html has status: " + html.contains("200 OK").to_string())
     redirect := http.redirect_response("/next").to_string()!
     print("redirect has location: " + redirect.contains("/next").to_string())
+    print("no content status: " + http.no_content().status_code().to_string())
     print("http apps work")
     return ""

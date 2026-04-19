@@ -56,5 +56,23 @@ fn main() -> Int!:
         print("redirect: ok")
     if r4.contains("/new"):
         print("redirect location: ok")
+    # request builders
+    mut req_builder := http.post_request("example.com", 80, "/submit")
+    req_builder = req_builder.query_param("mode", "fast path")
+    req_builder = req_builder.accept("application/json")
+    req_builder = req_builder.bearer("token123")
+    req_builder = req_builder.text_body("hello")
+    parsed_req := http.read_request_buffered_bytes(io.bytes_reader(req_builder.to_bytes()!).buffered_chunked(4))!
+    print("builder method: " + parsed_req.method()!)
+    print("builder mode: " + parsed_req.query_param_or("mode", ""))
+    print("builder accept: " + parsed_req.header_or("Accept", ""))
+    print("builder auth: " + parsed_req.header_or("Authorization", ""))
+    # form helper
+    mut form_fields: Map[String, String] := {}
+    form_fields.insert("name", "forge cli")
+    form_req := http.post_request("example.com", 80, "/form").form_body(form_fields)
+    parsed_form := http.read_request_buffered_bytes(io.bytes_reader(form_req.to_bytes()!).buffered_chunked(4))!
+    print("form type: " + parsed_form.header_or("Content-Type", ""))
+    print("form body: " + parsed_form.body_text_or(""))
     print("http api works")
     return 0

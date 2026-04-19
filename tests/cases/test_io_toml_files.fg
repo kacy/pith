@@ -19,11 +19,13 @@ fn main() -> String!:
     print(toml.type_of(root))
     print(toml.get_string(root, "title"))
     print(toml.get_bool(root, "enabled").to_string())
+    print(toml.get_string_or(root, "missing", "fallback"))
 
     root_chunked := toml.parse_file_chunked(toml_path, 3)
     server := toml.get_table(root_chunked, "server")
     ports := toml.get_array(server, "ports")
     print(toml.get_string(server, "host"))
+    print(toml.get_int_or(server, "missing_port", 9000).to_string())
     print(toml.array_len(ports).to_string())
     print(toml.keys(root_chunked).len().to_string())
     print(fs.exists(toml_path).to_string())

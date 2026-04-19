@@ -366,17 +366,21 @@ pub fn filter_entries[K, V](items: Map[K, V], keep: fn(K, V) -> Bool) -> Map[K, 
     return result
 
 pub fn sorted_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:
-    mut remaining := copy_list(items)
     mut result: List[T] := []
-    while remaining.len() > 0:
+    mut used: Set[Int] := {}
+    while result.len() < items.len():
+        mut found := false
         mut best_idx := 0
-        mut i := 1
-        while i < remaining.len():
-            if less(remaining[i], remaining[best_idx]):
+        for item, i in items:
+            if used.contains(i):
+                continue
+            if not found or less(item, items[best_idx]):
                 best_idx = i
-            i = i + 1
-        result.push(remaining[best_idx])
-        remaining.remove(best_idx)
+                found = true
+        if not found:
+            return result
+        result.push(items[best_idx])
+        used.add(best_idx)
     return result
 
 pub fn sort_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:

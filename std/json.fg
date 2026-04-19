@@ -543,6 +543,64 @@ pub fn object_has(handle: Int, key: String) -> Bool:
 fn json_object_has(handle: Int, key: String) -> Bool:
     return json_object_get(handle, key) >= 0
 
+# Gets a string value by key from an object. Returns empty string if missing or wrong type.
+pub fn object_get_string(handle: Int, key: String) -> String:
+    return json_get_string(json_object_get(handle, key))
+
+# Gets a string value by key from an object with a fallback.
+pub fn object_get_string_or(handle: Int, key: String, default_value: String) -> String:
+    value := json_object_get(handle, key)
+    if not handle_has_type(value, "string"):
+        return default_value
+    return string_values[value]
+
+# Gets an int value by key from an object. Returns 0 if missing or wrong type.
+pub fn object_get_int(handle: Int, key: String) -> Int:
+    return json_get_int(json_object_get(handle, key))
+
+# Gets an int value by key from an object with a fallback.
+pub fn object_get_int_or(handle: Int, key: String, default_value: Int) -> Int:
+    value := json_object_get(handle, key)
+    if not handle_has_type(value, "int"):
+        return default_value
+    return integer_values[value]
+
+# Gets a float value by key from an object. Returns 0.0 if missing or wrong type.
+pub fn object_get_float(handle: Int, key: String) -> Float:
+    return json_get_float(json_object_get(handle, key))
+
+# Gets a float value by key from an object with a fallback.
+pub fn object_get_float_or(handle: Int, key: String, default_value: Float) -> Float:
+    value := json_object_get(handle, key)
+    if not handle_has_type(value, "float"):
+        return default_value
+    return float_values[value]
+
+# Gets a bool value by key from an object. Returns false if missing or wrong type.
+pub fn object_get_bool(handle: Int, key: String) -> Bool:
+    return json_get_bool(json_object_get(handle, key))
+
+# Gets a bool value by key from an object with a fallback.
+pub fn object_get_bool_or(handle: Int, key: String, default_value: Bool) -> Bool:
+    value := json_object_get(handle, key)
+    if not handle_has_type(value, "bool"):
+        return default_value
+    return boolean_values[value]
+
+# Gets an array handle by key from an object. Returns -1 if missing or wrong type.
+pub fn object_get_array(handle: Int, key: String) -> Int:
+    value := json_object_get(handle, key)
+    if not handle_has_type(value, "array"):
+        return 0 - 1
+    return value
+
+# Gets an object handle by key from an object. Returns -1 if missing or wrong type.
+pub fn object_get_object(handle: Int, key: String) -> Int:
+    value := json_object_get(handle, key)
+    if not handle_has_type(value, "object"):
+        return 0 - 1
+    return value
+
 # Returns the list of keys in an object (deduplicated, insertion order).
 pub fn object_keys(handle: Int) -> List[String]:
     return json_object_keys(handle)

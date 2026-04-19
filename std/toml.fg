@@ -434,6 +434,13 @@ fn toml_get_string(handle: Int, key: String) -> String:
         return string_values[v]
     return ""
 
+# Gets a string value by key from a table with a fallback.
+pub fn get_string_or(handle: Int, key: String, default_value: String) -> String:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "string":
+        return string_values[v]
+    return default_value
+
 # Gets an integer value by key from a table. Returns 0 if not found or wrong type.
 pub fn get_int(handle: Int, key: String) -> Int:
     return toml_get_int(handle, key)
@@ -443,6 +450,13 @@ fn toml_get_int(handle: Int, key: String) -> Int:
     if v >= 0 and node_types[v] == "int":
         return integer_values[v]
     return 0
+
+# Gets an integer value by key from a table with a fallback.
+pub fn get_int_or(handle: Int, key: String, default_value: Int) -> Int:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "int":
+        return integer_values[v]
+    return default_value
 
 # Gets a float value by key from a table. Returns 0.0 if not found or wrong type.
 pub fn get_float(handle: Int, key: String) -> Float:
@@ -454,6 +468,13 @@ fn toml_get_float(handle: Int, key: String) -> Float:
         return float_values[v]
     return 0.0
 
+# Gets a float value by key from a table with a fallback.
+pub fn get_float_or(handle: Int, key: String, default_value: Float) -> Float:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "float":
+        return float_values[v]
+    return default_value
+
 # Gets a boolean value by key from a table. Returns false if not found or wrong type.
 pub fn get_bool(handle: Int, key: String) -> Bool:
     return toml_get_bool(handle, key)
@@ -463,6 +484,13 @@ fn toml_get_bool(handle: Int, key: String) -> Bool:
     if v >= 0 and node_types[v] == "bool":
         return boolean_values[v]
     return false
+
+# Gets a boolean value by key from a table with a fallback.
+pub fn get_bool_or(handle: Int, key: String, default_value: Bool) -> Bool:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "bool":
+        return boolean_values[v]
+    return default_value
 
 # Gets a sub-table handle by key. Returns -1 if not found or not a table.
 pub fn get_table(handle: Int, key: String) -> Int:

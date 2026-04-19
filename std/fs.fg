@@ -22,9 +22,34 @@ pub struct Info:
     pub is_dir: Bool
     pub size: Int
 
-fn temp_path_impl(prefix: String, suffix: String) -> String:
+# one directory entry with a few common metadata fields.
+pub struct Entry:
+    pub path: String
+    pub name: String
+    pub is_dir: Bool
+    pub size: Int
+
+fn temp_path_impl(dir_path: String, prefix: String, suffix: String) -> String:
     unique := prefix + time().to_string() + "_" + random_int(0, 1000000).to_string() + suffix
-    return path.join(os.temp_dir(), unique)
+    return path.join(dir_path, unique)
+
+fn entry_for_path(entry_path: String) -> Entry!:
+    meta := info(entry_path)!
+    return Entry(entry_path, path.base(entry_path), meta.is_dir, meta.size)
+
+fn walk_into(entries: List[Entry], root_path: String) -> List[Entry]!:
+    current := entry_for_path(root_path)!
+    entries.push(current)
+    if current.is_dir:
+        for name in list(root_path):
+            child_path := path.join(root_path, name)
+            walk_into(entries, child_path)!
+    return entries
+
+fn atomic_temp_path(target_path: String) -> String:
+    dir_path := path.dir(target_path)
+    prefix := "." + path.base(target_path) + "."
+    return temp_path_impl(dir_path, prefix, ".tmp")
 
 # ===============================================================
 # File Existence and Type
@@ -36,6 +61,10 @@ pub fn exists(path: String) -> Bool:
 # true when the path exists and is a directory.
 pub fn is_dir(path: String) -> Bool:
     return dir_exists(path)
+
+# true when the path exists and is not a directory.
+pub fn is_file(path: String) -> Bool:
+    return exists(path) and not is_dir(path)
 
 # ===============================================================
 # File Reading and Writing
@@ -55,6 +84,32 @@ pub fn write(path: String, data: String) -> Bool!:
 # write raw bytes to a file, replacing existing contents.
 pub fn write_bytes(path: String, data: Bytes) -> Bool!:
     return write_file_bytes(path, data)
+
+# write text to a temp file and rename it into place.
+pub fn write_atomic(target_path: String, data: String) -> Bool!:
+    parent := path.dir(target_path)
+    if parent != "." and not is_dir(parent):
+        if not make_dirs(parent):
+            fail "could not create parent dir: " + parent
+    temp_path := atomic_temp_path(target_path)
+    write(temp_path, data)!
+    if not rename(temp_path, target_path):
+        remove(temp_path)
+        fail "could not replace file atomically: " + target_path
+    return true
+
+# write bytes to a temp file and rename it into place.
+pub fn write_bytes_atomic(target_path: String, data: Bytes) -> Bool!:
+    parent := path.dir(target_path)
+    if parent != "." and not is_dir(parent):
+        if not make_dirs(parent):
+            fail "could not create parent dir: " + parent
+    temp_path := atomic_temp_path(target_path)
+    write_bytes(temp_path, data)!
+    if not rename(temp_path, target_path):
+        remove(temp_path)
+        fail "could not replace file atomically: " + target_path
+    return true
 
 # append text to a file.
 pub fn append(path: String, data: String) -> Bool!:
@@ -95,6 +150,10 @@ pub fn remove_tree(path: String) -> Bool:
         return fs_remove_tree(path)
     return remove(path)
 
+# remove a path recursively.
+pub fn remove_all(path: String) -> Bool:
+    return remove_tree(path)
+
 # rename a file or directory.
 pub fn rename(old_path: String, new_path: String) -> Bool:
     return rename_file(old_path, new_path)
@@ -128,8 +187,21 @@ pub fn make_dirs(dir_path: String) -> Bool:
 pub fn list(path: String) -> List[String]:
     return list_dir(path)
 
+# list direct entries with path metadata.
+pub fn read_dir(dir_path: String) -> List[Entry]!:
+    if not is_dir(dir_path):
+        fail "not a directory: " + dir_path
+    mut entries: List[Entry] := []
+    for name in list(dir_path):
+        entries.push(entry_for_path(path.join(dir_path, name))!)
+    return entries
+
 # copy one file from one path to another.
 pub fn copy(from_path: String, to_path: String) -> Bool!:
+    parent := path.dir(to_path)
+    if parent != "." and not is_dir(parent):
+        if not make_dirs(parent):
+            fail "could not create parent dir: " + parent
     data := read_bytes(from_path)!
     return write_bytes(to_path, data)
 
@@ -163,23 +235,51 @@ pub fn info(path: String) -> Info!:
         return Info(path, true, false, size)
     fail "path does not exist: " + path
 
+# return basic metadata for a path.
+pub fn metadata(path: String) -> Info!:
+    return info(path)
+
 # return the size field from info().
 pub fn size(path: String) -> Int!:
     return info(path)!.size
 
 # build a temp path candidate without creating it.
 pub fn temp_path(prefix: String, suffix: String) -> String:
-    return temp_path_impl(prefix, suffix)
+    return temp_path_impl(os.temp_dir(), prefix, suffix)
+
+# build a temp path candidate inside a specific directory.
+pub fn temp_path_in(dir_path: String, prefix: String, suffix: String) -> String:
+    return temp_path_impl(dir_path, prefix, suffix)
 
 # create a temporary directory and return its path.
 pub fn make_temp_dir(prefix: String) -> String!:
-    dir_path := temp_path_impl(prefix, "")
+    dir_path := temp_path_impl(os.temp_dir(), prefix, "")
     if not make_dirs(dir_path):
         fail "could not create temp dir: " + dir_path
     return dir_path
 
+# create a temporary directory inside a specific directory.
+pub fn make_temp_dir_in(dir_path: String, prefix: String) -> String!:
+    temp_dir_path := temp_path_impl(dir_path, prefix, "")
+    if not make_dirs(temp_dir_path):
+        fail "could not create temp dir: " + temp_dir_path
+    return temp_dir_path
+
 # create an empty temporary file and return its path.
 pub fn make_temp_file(prefix: String, suffix: String) -> String!:
-    file_path := temp_path_impl(prefix, suffix)
+    file_path := temp_path_impl(os.temp_dir(), prefix, suffix)
     write(file_path, "")!
     return file_path
+
+# create an empty temporary file inside a specific directory.
+pub fn make_temp_file_in(dir_path: String, prefix: String, suffix: String) -> String!:
+    file_path := temp_path_impl(dir_path, prefix, suffix)
+    write(file_path, "")!
+    return file_path
+
+# walk a file tree in preorder starting at root_path.
+pub fn walk(root_path: String) -> List[Entry]!:
+    if not exists(root_path):
+        fail "path does not exist: " + root_path
+    mut entries: List[Entry] := []
+    return walk_into(entries, root_path)

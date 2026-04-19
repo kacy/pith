@@ -273,6 +273,9 @@ impl BufferedBytesReader:
     fn read_until_bytes(sep: Bytes) -> Bytes!:
         return buffered_bytes_reader_read_until_internal(self, sep)
 
+    fn read_until_bytes_including(sep: Bytes) -> Bytes!:
+        return buffered_bytes_reader_read_until_including_internal(self, sep)
+
     fn read_all_bytes() -> Bytes!:
         return read_all_buffered_bytes_reader(self)
 
@@ -1689,6 +1692,12 @@ fn buffered_bytes_reader_read_internal(reader: BufferedBytesReader, max_bytes: I
     return buf.bytes()
 
 fn buffered_bytes_reader_read_until_internal(reader: BufferedBytesReader, sep: Bytes) -> Bytes!:
+    return buffered_bytes_reader_read_until_with_sep_internal(reader, sep, false)
+
+fn buffered_bytes_reader_read_until_including_internal(reader: BufferedBytesReader, sep: Bytes) -> Bytes!:
+    return buffered_bytes_reader_read_until_with_sep_internal(reader, sep, true)
+
+fn buffered_bytes_reader_read_until_with_sep_internal(reader: BufferedBytesReader, sep: Bytes, include_sep: Bool) -> Bytes!:
     if sep.is_empty():
         fail "empty separator"
     if not buffered_bytes_reader_source_handles.contains_key(reader.handle):
@@ -1701,6 +1710,8 @@ fn buffered_bytes_reader_read_until_internal(reader: BufferedBytesReader, sep: B
         if sep_pos >= 0:
             if sep_pos > 0:
                 buf.write(cached.slice(0, sep_pos))!
+            if include_sep:
+                buf.write(sep)!
             buffered_bytes_reader_consume(reader.handle, sep_pos + sep.len())
             return buf.bytes()
         keep := sep.len() - 1
@@ -1816,6 +1827,12 @@ fn buffered_string_reader_read_line_internal(reader: BufferedStringReader) -> St
         buffered_string_reader_cache.insert(reader.handle, "")
 
 fn buffered_string_reader_read_until_internal(reader: BufferedStringReader, sep: String) -> String!:
+    return buffered_string_reader_read_until_with_sep_internal(reader, sep, false)
+
+fn buffered_string_reader_read_until_including_internal(reader: BufferedStringReader, sep: String) -> String!:
+    return buffered_string_reader_read_until_with_sep_internal(reader, sep, true)
+
+fn buffered_string_reader_read_until_with_sep_internal(reader: BufferedStringReader, sep: String, include_sep: Bool) -> String!:
     if sep.len() == 0:
         fail "empty separator"
     if not buffered_string_reader_sources.contains_key(reader.handle):
@@ -1829,6 +1846,8 @@ fn buffered_string_reader_read_until_internal(reader: BufferedStringReader, sep:
             sep_pos = cached.index_of(sep)
         if sep_pos >= 0:
             result = result + cached.substring(0, sep_pos)
+            if include_sep:
+                result = result + sep
             buffered_string_reader_consume(reader.handle, sep_pos + sep.len())
             return result
         keep := sep.len() - 1
@@ -1965,6 +1984,12 @@ fn buffered_tcp_stream_read_line_internal_ctx(reader: BufferedTcpStream, ctx: Co
         buffered_tcp_stream_cache.insert(reader.handle, "")
 
 fn buffered_tcp_stream_read_until_internal(reader: BufferedTcpStream, sep: String) -> String!:
+    return buffered_tcp_stream_read_until_with_sep_internal(reader, sep, false)
+
+fn buffered_tcp_stream_read_until_including_internal(reader: BufferedTcpStream, sep: String) -> String!:
+    return buffered_tcp_stream_read_until_with_sep_internal(reader, sep, true)
+
+fn buffered_tcp_stream_read_until_with_sep_internal(reader: BufferedTcpStream, sep: String, include_sep: Bool) -> String!:
     if sep.len() == 0:
         fail "empty separator"
     if not buffered_tcp_stream_fds.contains_key(reader.handle):
@@ -1978,6 +2003,8 @@ fn buffered_tcp_stream_read_until_internal(reader: BufferedTcpStream, sep: Strin
             sep_pos = cached.index_of(sep)
         if sep_pos >= 0:
             result = result + cached.substring(0, sep_pos)
+            if include_sep:
+                result = result + sep
             buffered_tcp_stream_consume(reader.handle, sep_pos + sep.len())
             return result
         keep := sep.len() - 1
@@ -1995,6 +2022,12 @@ fn buffered_tcp_stream_read_until_internal(reader: BufferedTcpStream, sep: Strin
     return result
 
 fn buffered_tcp_stream_read_until_internal_ctx(reader: BufferedTcpStream, ctx: Context, sep: String) -> String!BlockingError:
+    return buffered_tcp_stream_read_until_with_sep_internal_ctx(reader, ctx, sep, false)
+
+fn buffered_tcp_stream_read_until_including_internal_ctx(reader: BufferedTcpStream, ctx: Context, sep: String) -> String!BlockingError:
+    return buffered_tcp_stream_read_until_with_sep_internal_ctx(reader, ctx, sep, true)
+
+fn buffered_tcp_stream_read_until_with_sep_internal_ctx(reader: BufferedTcpStream, ctx: Context, sep: String, include_sep: Bool) -> String!BlockingError:
     if sep.len() == 0:
         fail blocking_failed("empty separator")
     if not buffered_tcp_stream_fds.contains_key(reader.handle):
@@ -2008,6 +2041,8 @@ fn buffered_tcp_stream_read_until_internal_ctx(reader: BufferedTcpStream, ctx: C
             sep_pos = cached.index_of(sep)
         if sep_pos >= 0:
             result = result + cached.substring(0, sep_pos)
+            if include_sep:
+                result = result + sep
             buffered_tcp_stream_consume(reader.handle, sep_pos + sep.len())
             return result
         keep := sep.len() - 1
@@ -2140,6 +2175,12 @@ fn buffered_file_reader_read_line_internal(reader: BufferedFileReader) -> String
         buffered_file_reader_cache.insert(reader.handle, "")
 
 fn buffered_file_reader_read_until_internal(reader: BufferedFileReader, sep: String) -> String!:
+    return buffered_file_reader_read_until_with_sep_internal(reader, sep, false)
+
+fn buffered_file_reader_read_until_including_internal(reader: BufferedFileReader, sep: String) -> String!:
+    return buffered_file_reader_read_until_with_sep_internal(reader, sep, true)
+
+fn buffered_file_reader_read_until_with_sep_internal(reader: BufferedFileReader, sep: String, include_sep: Bool) -> String!:
     if sep.len() == 0:
         fail "empty separator"
     if not buffered_file_reader_handles.contains_key(reader.handle):
@@ -2153,6 +2194,8 @@ fn buffered_file_reader_read_until_internal(reader: BufferedFileReader, sep: Str
             sep_pos = cached.index_of(sep)
         if sep_pos >= 0:
             result = result + cached.substring(0, sep_pos)
+            if include_sep:
+                result = result + sep
             buffered_file_reader_consume(reader.handle, sep_pos + sep.len())
             return result
         keep := sep.len() - 1
@@ -2289,6 +2332,12 @@ fn buffered_process_stdout_read_line_internal_ctx(reader: BufferedProcessStdout,
         buffered_process_stdout_cache.insert(reader.handle, "")
 
 fn buffered_process_stdout_read_until_internal(reader: BufferedProcessStdout, sep: String) -> String!:
+    return buffered_process_stdout_read_until_with_sep_internal(reader, sep, false)
+
+fn buffered_process_stdout_read_until_including_internal(reader: BufferedProcessStdout, sep: String) -> String!:
+    return buffered_process_stdout_read_until_with_sep_internal(reader, sep, true)
+
+fn buffered_process_stdout_read_until_with_sep_internal(reader: BufferedProcessStdout, sep: String, include_sep: Bool) -> String!:
     if sep.len() == 0:
         fail "empty separator"
     if not buffered_process_stdout_handles.contains_key(reader.handle):
@@ -2302,6 +2351,8 @@ fn buffered_process_stdout_read_until_internal(reader: BufferedProcessStdout, se
             sep_pos = cached.index_of(sep)
         if sep_pos >= 0:
             result = result + cached.substring(0, sep_pos)
+            if include_sep:
+                result = result + sep
             buffered_process_stdout_consume(reader.handle, sep_pos + sep.len())
             return result
         keep := sep.len() - 1
@@ -2319,6 +2370,12 @@ fn buffered_process_stdout_read_until_internal(reader: BufferedProcessStdout, se
     return result
 
 fn buffered_process_stdout_read_until_internal_ctx(reader: BufferedProcessStdout, ctx: Context, sep: String) -> String!BlockingError:
+    return buffered_process_stdout_read_until_with_sep_internal_ctx(reader, ctx, sep, false)
+
+fn buffered_process_stdout_read_until_including_internal_ctx(reader: BufferedProcessStdout, ctx: Context, sep: String) -> String!BlockingError:
+    return buffered_process_stdout_read_until_with_sep_internal_ctx(reader, ctx, sep, true)
+
+fn buffered_process_stdout_read_until_with_sep_internal_ctx(reader: BufferedProcessStdout, ctx: Context, sep: String, include_sep: Bool) -> String!BlockingError:
     if sep.len() == 0:
         fail blocking_failed("empty separator")
     if not buffered_process_stdout_handles.contains_key(reader.handle):
@@ -2332,6 +2389,8 @@ fn buffered_process_stdout_read_until_internal_ctx(reader: BufferedProcessStdout
             sep_pos = cached.index_of(sep)
         if sep_pos >= 0:
             result = result + cached.substring(0, sep_pos)
+            if include_sep:
+                result = result + sep
             buffered_process_stdout_consume(reader.handle, sep_pos + sep.len())
             return result
         keep := sep.len() - 1
@@ -2459,6 +2518,12 @@ fn buffered_process_stderr_read_line_internal_ctx(reader: BufferedProcessStderr,
         buffered_process_stderr_cache.insert(reader.handle, "")
 
 fn buffered_process_stderr_read_until_internal(reader: BufferedProcessStderr, sep: String) -> String!:
+    return buffered_process_stderr_read_until_with_sep_internal(reader, sep, false)
+
+fn buffered_process_stderr_read_until_including_internal(reader: BufferedProcessStderr, sep: String) -> String!:
+    return buffered_process_stderr_read_until_with_sep_internal(reader, sep, true)
+
+fn buffered_process_stderr_read_until_with_sep_internal(reader: BufferedProcessStderr, sep: String, include_sep: Bool) -> String!:
     if sep.len() == 0:
         fail "empty separator"
     if not buffered_process_stderr_handles.contains_key(reader.handle):
@@ -2472,6 +2537,8 @@ fn buffered_process_stderr_read_until_internal(reader: BufferedProcessStderr, se
             sep_pos = cached.index_of(sep)
         if sep_pos >= 0:
             result = result + cached.substring(0, sep_pos)
+            if include_sep:
+                result = result + sep
             buffered_process_stderr_consume(reader.handle, sep_pos + sep.len())
             return result
         keep := sep.len() - 1
@@ -2489,6 +2556,12 @@ fn buffered_process_stderr_read_until_internal(reader: BufferedProcessStderr, se
     return result
 
 fn buffered_process_stderr_read_until_internal_ctx(reader: BufferedProcessStderr, ctx: Context, sep: String) -> String!BlockingError:
+    return buffered_process_stderr_read_until_with_sep_internal_ctx(reader, ctx, sep, false)
+
+fn buffered_process_stderr_read_until_including_internal_ctx(reader: BufferedProcessStderr, ctx: Context, sep: String) -> String!BlockingError:
+    return buffered_process_stderr_read_until_with_sep_internal_ctx(reader, ctx, sep, true)
+
+fn buffered_process_stderr_read_until_with_sep_internal_ctx(reader: BufferedProcessStderr, ctx: Context, sep: String, include_sep: Bool) -> String!BlockingError:
     if sep.len() == 0:
         fail blocking_failed("empty separator")
     if not buffered_process_stderr_handles.contains_key(reader.handle):
@@ -2502,6 +2575,8 @@ fn buffered_process_stderr_read_until_internal_ctx(reader: BufferedProcessStderr
             sep_pos = cached.index_of(sep)
         if sep_pos >= 0:
             result = result + cached.substring(0, sep_pos)
+            if include_sep:
+                result = result + sep
             buffered_process_stderr_consume(reader.handle, sep_pos + sep.len())
             return result
         keep := sep.len() - 1
@@ -2658,6 +2733,9 @@ impl BufferedStringReader:
     fn read_until(sep: String) -> String!:
         return buffered_string_reader_read_until_internal(self, sep)
 
+    fn read_until_including(sep: String) -> String!:
+        return buffered_string_reader_read_until_including_internal(self, sep)
+
 impl Reader for BufferedStringReader:
     fn read(max_bytes: Int) -> String!:
         return buffered_string_reader_read(self, max_bytes)
@@ -2699,6 +2777,12 @@ impl BufferedTcpStream:
     fn read_until_ctx(ctx: Context, sep: String) -> String!BlockingError:
         return buffered_tcp_stream_read_until_internal_ctx(self, ctx, sep)
 
+    fn read_until_including(sep: String) -> String!:
+        return buffered_tcp_stream_read_until_including_internal(self, sep)
+
+    fn read_until_including_ctx(ctx: Context, sep: String) -> String!BlockingError:
+        return buffered_tcp_stream_read_until_including_internal_ctx(self, ctx, sep)
+
 impl Reader for BufferedTcpStream:
     fn read(max_bytes: Int) -> String!:
         return buffered_tcp_stream_read(self, max_bytes)
@@ -2722,6 +2806,12 @@ impl BufferedProcessStdout:
     fn read_until_ctx(ctx: Context, sep: String) -> String!BlockingError:
         return buffered_process_stdout_read_until_internal_ctx(self, ctx, sep)
 
+    fn read_until_including(sep: String) -> String!:
+        return buffered_process_stdout_read_until_including_internal(self, sep)
+
+    fn read_until_including_ctx(ctx: Context, sep: String) -> String!BlockingError:
+        return buffered_process_stdout_read_until_including_internal_ctx(self, ctx, sep)
+
 impl Reader for BufferedProcessStdout:
     fn read(max_bytes: Int) -> String!:
         return buffered_process_stdout_read(self, max_bytes)
@@ -2744,6 +2834,12 @@ impl BufferedProcessStderr:
 
     fn read_until_ctx(ctx: Context, sep: String) -> String!BlockingError:
         return buffered_process_stderr_read_until_internal_ctx(self, ctx, sep)
+
+    fn read_until_including(sep: String) -> String!:
+        return buffered_process_stderr_read_until_including_internal(self, sep)
+
+    fn read_until_including_ctx(ctx: Context, sep: String) -> String!BlockingError:
+        return buffered_process_stderr_read_until_including_internal_ctx(self, ctx, sep)
 
 impl Reader for BufferedProcessStderr:
     fn read(max_bytes: Int) -> String!:
@@ -2785,6 +2881,9 @@ impl BufferedFileReader:
 
     fn read_until(sep: String) -> String!:
         return buffered_file_reader_read_until_internal(self, sep)
+
+    fn read_until_including(sep: String) -> String!:
+        return buffered_file_reader_read_until_including_internal(self, sep)
 
 impl Reader for BufferedFileReader:
     fn read(max_bytes: Int) -> String!:

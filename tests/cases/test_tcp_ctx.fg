@@ -37,15 +37,23 @@ fn main() -> Int!:
     buffered_read := buffered_reader.read_ctx(buffered_timeout_pair.0, 8)
     print("buffered-read-timeout:{buffered_read.is_err and buffered_read.err.is_deadline_exceeded()}")
 
+    buffered_line_reader := invalid.buffered_reader()
     buffered_line_pair := concurrent.with_timeout(concurrent.background(), 1)
     time.delay(5)
-    buffered_line := buffered_reader.read_line_ctx(buffered_line_pair.0)
+    buffered_line := buffered_line_reader.read_line_ctx(buffered_line_pair.0)
     print("buffered-read-line-timeout:{buffered_line.is_err and buffered_line.err.is_deadline_exceeded()}")
 
+    buffered_until_reader := invalid.buffered_reader()
     buffered_until_pair := concurrent.with_timeout(concurrent.background(), 1)
     time.delay(5)
-    buffered_until := buffered_reader.read_until_ctx(buffered_until_pair.0, "|")
+    buffered_until := buffered_until_reader.read_until_ctx(buffered_until_pair.0, "|")
     print("buffered-read-until-timeout:{buffered_until.is_err and buffered_until.err.is_deadline_exceeded()}")
+
+    buffered_until_including_reader := invalid.buffered_reader()
+    buffered_until_including_pair := concurrent.with_timeout(concurrent.background(), 1)
+    time.delay(5)
+    buffered_until_including := buffered_until_including_reader.read_until_including_ctx(buffered_until_including_pair.0, "|")
+    print("buffered-read-until-including-timeout:{buffered_until_including.is_err and buffered_until_including.err.is_deadline_exceeded()}")
 
     buffered_writer := invalid.buffered_writer()
     buffered_write := buffered_writer.write_ctx(concurrent.background(), "hi")

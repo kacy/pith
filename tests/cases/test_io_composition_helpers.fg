@@ -23,6 +23,12 @@ fn test_buffered_text_reads() -> String!:
     print(empty_sep.read_until("").is_err.to_string())
     return ""
 
+fn test_buffered_text_reads_including() -> String!:
+    including_reader := io.string_reader("alpha--beta").buffered_chunked(3)
+    print(including_reader.read_until_including("--")!)
+    print("[" + including_reader.read_until_including("--")! + "]")
+    return ""
+
 fn test_exact_and_buffered_bytes() -> String!:
     exact_reader := io.bytes_reader(bytes.from_string_utf8("abcdef"))
     print(io.read_exact_bytes(exact_reader, 4)!.to_string_utf8()!)
@@ -35,7 +41,16 @@ fn test_exact_and_buffered_bytes() -> String!:
     print(second_bytes.to_string_utf8()!)
     third_bytes := bytes_reader.read_until_bytes(bytes.from_string_utf8("::"))!
     print("[" + third_bytes.to_string_utf8()! + "]")
+
     print(bytes_empty_sep_result()!)
+    return ""
+
+fn test_exact_and_buffered_bytes_including() -> String!:
+    including_bytes_reader := io.bytes_reader(bytes.from_string_utf8("alpha::beta")).buffered_chunked(2)
+    including_first := including_bytes_reader.read_until_bytes_including(bytes.from_string_utf8("::"))!
+    print(including_first.to_string_utf8()!)
+    including_second := including_bytes_reader.read_until_bytes_including(bytes.from_string_utf8("::"))!
+    print("[" + including_second.to_string_utf8()! + "]")
     return ""
 
 fn bytes_empty_sep_result() -> String!:
@@ -64,13 +79,28 @@ fn test_file_helpers() -> String!:
     print(file_buffered.read_until("--")!)
     print("[" + file_buffered.read_until("--")! + "]")
     file_buffered_stream.close()
+
+    fs.remove(path)
+    return ""
+
+fn test_file_helpers_including() -> String!:
+    path := "/tmp/forge_io_composition_helpers.txt"
+    fs.write(path, "alpha--beta")!
+    file_including_stream := fs.open(path)!
+    file_including := file_including_stream.buffered_reader_chunked(3)
+    print(file_including.read_until_including("--")!)
+    print("[" + file_including.read_until_including("--")! + "]")
+    file_including_stream.close()
     fs.remove(path)
     return ""
 
 fn main() -> String!:
     test_copy_and_write_text()!
     test_buffered_text_reads()!
+    test_buffered_text_reads_including()!
     test_exact_and_buffered_bytes()!
+    test_exact_and_buffered_bytes_including()!
     test_byte_writes_and_copy()!
     test_file_helpers()!
+    test_file_helpers_including()!
     return ""

@@ -378,6 +378,10 @@ pub fn words(s: String) -> List[String]:
         result.push(current)
     return result
 
+# collapse runs of whitespace to single spaces and trim the ends.
+pub fn collapse_whitespace(s: String) -> String:
+    return words(s).join(" ")
+
 ## split once and return the left and right pieces plus a found flag.
 pub fn split_once(s: String, sep: String) -> SplitPair:
     if sep.len() == 0:
@@ -417,6 +421,27 @@ pub fn after_last(s: String, sep: String) -> String:
     if not parts.found:
         return ""
     return parts.right
+
+# return true if the string starts with any prefix in the list.
+pub fn starts_with_any(s: String, prefixes: List[String]) -> Bool:
+    for prefix in prefixes:
+        if s.starts_with(prefix):
+            return true
+    return false
+
+# return true if the string ends with any suffix in the list.
+pub fn ends_with_any(s: String, suffixes: List[String]) -> Bool:
+    for suffix in suffixes:
+        if s.ends_with(suffix):
+            return true
+    return false
+
+# return true if the string contains any value in the list.
+pub fn contains_any(s: String, parts: List[String]) -> Bool:
+    for part in parts:
+        if s.contains(part):
+            return true
+    return false
 
 # Splits a string by separator, at most max_splits times
 # The last element contains the remainder of the string
@@ -704,6 +729,17 @@ pub fn indent(s: String, prefix: String) -> String:
         result.push(prefix + line)
     return result.join(chr(10))
 
+# adds a prefix only to non-empty lines.
+pub fn indent_nonempty(s: String, prefix: String) -> String:
+    mut lines := split_lines(s)
+    mut result: List[String] := []
+    for line in lines:
+        if line.len() == 0:
+            result.push(line)
+        else:
+            result.push(prefix + line)
+    return result.join(chr(10))
+
 # ---------------------------------------------------------------
 # Replace with Count Limit
 # ---------------------------------------------------------------
@@ -746,5 +782,50 @@ pub fn replace_n(s: String, old: String, new: String, count: Int) -> String:
         pos = pos + 1
     
     return result
+
+# return the shared starting prefix across all strings.
+pub fn common_prefix(items: List[String]) -> String:
+    if items.len() == 0:
+        return ""
+    mut prefix := items[0]
+    for item, i in items:
+        if i == 0:
+            continue
+        mut shared := ""
+        mut j := 0
+        mut limit := prefix.len()
+        if item.len() < limit:
+            limit = item.len()
+        while j < limit:
+            if prefix[j] != item[j]:
+                break
+            shared = shared + prefix[j]
+            j = j + 1
+        prefix = shared
+        if prefix.len() == 0:
+            return ""
+    return prefix
+
+# return the shared ending suffix across all strings.
+pub fn common_suffix(items: List[String]) -> String:
+    if items.len() == 0:
+        return ""
+    mut suffix := items[0]
+    for item, i in items:
+        if i == 0:
+            continue
+        mut shared := ""
+        mut suffix_idx := suffix.len() - 1
+        mut item_idx := item.len() - 1
+        while suffix_idx >= 0 and item_idx >= 0:
+            if suffix[suffix_idx] != item[item_idx]:
+                break
+            shared = suffix[suffix_idx] + shared
+            suffix_idx = suffix_idx - 1
+            item_idx = item_idx - 1
+        suffix = shared
+        if suffix.len() == 0:
+            return ""
+    return suffix
 
 # End of std/strings.fg

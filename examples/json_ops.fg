@@ -21,17 +21,13 @@ fn main() -> String!:
     print("type = " + json.type_of(root))
 
     # extract fields
-    name_h := json.object_get(root, "name")
-    print("name = " + json.get_string(name_h))
-
-    ver := json.object_get(root, "version")
-    print("version = " + json.get_int(ver).to_string())
-
-    active := json.object_get(root, "active")
-    print("active = " + json.get_bool(active).to_string())
+    print("name = " + json.object_get_string(root, "name"))
+    print("version = " + json.object_get_int(root, "version").to_string())
+    print("active = " + json.object_get_bool(root, "active").to_string())
+    print("missing = " + json.object_get_string_or(root, "missing", "n/a"))
 
     # array access
-    tags := json.object_get(root, "tags")
+    tags := json.object_get_array(root, "tags")
     print("tags.len = " + json.array_len(tags).to_string())
     print("tags[0] = " + json.get_string(json.array_get(tags, 0)))
     print("tags[1] = " + json.get_string(json.array_get(tags, 1)))
@@ -62,7 +58,7 @@ fn main() -> String!:
     print("saved = " + json.save(path, obj).to_string())
 
     loaded := json.parse_file(path)
-    print("file tool = " + json.get_string(json.object_get(loaded, "tool")))
+    print("file tool = " + json.object_get_string(loaded, "tool"))
 
     # null and bool
     print("null type = " + json.type_of(json.parse("null")))

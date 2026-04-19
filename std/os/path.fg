@@ -34,9 +34,23 @@ fn normalize_segments(parts: List[String], absolute: Bool) -> List[String]:
         stack.push(part)
     return stack
 
+fn cleaned_parts(path: String) -> List[String]:
+    cleaned := clean(path)
+    if cleaned == "." or cleaned == "/":
+        return []
+    mut out: List[String] := []
+    for part in cleaned.split("/"):
+        if part != "":
+            out.push(part)
+    return out
+
 # true when the path starts at the filesystem root.
 pub fn is_abs(path: String) -> Bool:
     return path.starts_with("/")
+
+# true when the path does not start at the filesystem root.
+pub fn is_rel(path: String) -> Bool:
+    return not is_abs(path)
 
 # ===============================================================
 # Path Joining
@@ -87,6 +101,10 @@ pub fn clean(path: String) -> String:
     if cleaned.starts_with("/.."):
         return "/"
     return cleaned
+
+# returns the normalized non-empty path segments.
+pub fn parts(path: String) -> List[String]:
+    return cleaned_parts(path)
 
 # ===============================================================
 # Path Components
@@ -149,3 +167,60 @@ pub fn stem(path: String) -> String:
             return b.substring(0, i)
         i = i - 1
     return b
+
+# returns true when the basename has an extension.
+# returns true when the basename has an extension.
+pub fn has_ext(path: String) -> Bool:
+    e := ext(path)
+    return e != "" and e != base(path)
+
+# returns the path with the basename extension removed.
+# returns the path with the basename extension removed.
+pub fn without_ext(path: String) -> String:
+    if not has_ext(path):
+        return path
+    parent := dir(path)
+    base_name := base(path)
+    suffix := ext(path)
+    trimmed := base_name.substring(0, base_name.len() - suffix.len())
+    if parent == ".":
+        return trimmed
+    if parent == "/":
+        return "/" + trimmed
+    return join(parent, trimmed)
+
+# replaces the basename extension, adding a leading dot if needed.
+# replaces the basename extension, adding a leading dot if needed.
+pub fn with_ext(path: String, new_ext: String) -> String:
+    mut normalized_ext := new_ext
+    if normalized_ext != "" and not normalized_ext.starts_with("."):
+        normalized_ext = "." + normalized_ext
+    return without_ext(path) + normalized_ext
+
+# returns the relative path from base_path to target_path when both share the same root style.
+# returns the relative path from base_path to target_path.
+pub fn rel(base_path: String, target_path: String) -> String:
+    base_clean := clean(base_path)
+    target_clean := clean(target_path)
+    if is_abs(base_clean) != is_abs(target_clean):
+        return target_clean
+
+    base_parts := cleaned_parts(base_clean)
+    target_parts := cleaned_parts(target_clean)
+    mut shared := 0
+    while shared < base_parts.len() and shared < target_parts.len() and base_parts[shared] == target_parts[shared]:
+        shared = shared + 1
+
+    mut rel_parts: List[String] := []
+    mut i := shared
+    while i < base_parts.len():
+        rel_parts.push("..")
+        i = i + 1
+    i = shared
+    while i < target_parts.len():
+        rel_parts.push(target_parts[i])
+        i = i + 1
+
+    if rel_parts.len() == 0:
+        return "."
+    return join_all(rel_parts)

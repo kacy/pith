@@ -12,9 +12,10 @@ fn main() -> String!:
 
     loaded := json.parse_file_chunked(json_path, 3)
     print(json.type_of(loaded))
-    print(json.get_string(json.object_get(loaded, "name")))
-    print(json.get_bool(json.object_get(loaded, "enabled")).to_string())
-    print(json.array_len(json.object_get(loaded, "items")).to_string())
+    print(json.object_get_string(loaded, "name"))
+    print(json.object_get_bool(loaded, "enabled").to_string())
+    print(json.object_get_string_or(loaded, "missing", "fallback"))
+    print(json.array_len(json.object_get_array(loaded, "items")).to_string())
     print(fs.exists(json_path).to_string())
 
     fs.remove(json_path)

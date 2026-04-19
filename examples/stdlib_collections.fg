@@ -1,6 +1,7 @@
 # stdlib collection utilities via import
 from std.collections import range, sum, max_of, min_of, reversed
 from std.collections import copy_list, group_by, count_by, set_union
+from std.collections import any, find, sort_by_key, min_by, max_by
 
 struct Player:
     pub name: String
@@ -47,6 +48,19 @@ fn main():
     counts := count_by(players, fn(player: Player) => player.team)
     blue_count := counts["blue"]
     print("count_by blue: {blue_count}")
+
+    print("any blue: {any(players, fn(player: Player) => player.team == "blue")}")
+
+    alice := find(players, fn(player: Player) => player.name == "alice")
+    print("find alice: {alice.ok.team}")
+
+    ranked := sort_by_key(players, fn(player: Player) => player.name.len())
+    print("sort_by_key shortest: {ranked[0].name}")
+
+    first_red := min_by(players, fn(player: Player) => player.name.len())
+    last_red := max_by(players, fn(player: Player) => player.name.len())
+    print("min_by len: {first_red.ok.name}")
+    print("max_by len: {last_red.ok.name}")
 
     merged := set_union({"red", "blue"}, {"blue", "green"})
     print("set_union size: {merged.len()}")

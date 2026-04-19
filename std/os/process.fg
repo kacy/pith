@@ -33,6 +33,12 @@ pub struct Output:
     pub stdout: String
     pub stderr: String
 
+# command failure with captured output.
+pub struct ExitError:
+    pub status: Int
+    pub stdout: String
+    pub stderr: String
+
 # starts a command builder for one program.
 pub fn command(program: String) -> Command:
     return Command(program, [], "", [], [])
@@ -71,6 +77,15 @@ impl Command:
 
     fn output() -> Output!:
         return output(self)
+
+    fn output_checked() -> Output!ExitError:
+        return output_checked(self)
+
+    fn text() -> String!ExitError:
+        return text(self)
+
+    fn text_trimmed() -> String!ExitError:
+        return text_trimmed(self)
 
     fn run_ctx(ctx: Context) -> Int!BlockingError:
         return run_ctx(self, ctx)
@@ -146,6 +161,29 @@ pub fn output(cmd: Command) -> Output!:
     process_output_close(handle)
     return out
 
+# runs a command and fails when the exit status is nonzero.
+pub fn output_checked(cmd: Command) -> Output!ExitError:
+    out := output(cmd)
+    if out.is_err:
+        fail ExitError{-1, "", out.err}
+    if out.ok.status != 0:
+        fail ExitError{out.ok.status, out.ok.stdout, out.ok.stderr}
+    return out.ok
+
+# runs a command and returns stdout when it succeeds.
+pub fn text(cmd: Command) -> String!ExitError:
+    out := output_checked(cmd)
+    if out.is_err:
+        fail out.err
+    return out.ok.stdout
+
+# runs a command and returns trimmed stdout when it succeeds.
+pub fn text_trimmed(cmd: Command) -> String!ExitError:
+    out := output_checked(cmd)
+    if out.is_err:
+        fail out.err
+    return out.ok.stdout.trim()
+
 # runs a command with cancellation and captures stdout and stderr.
 pub fn output_ctx(cmd: Command, ctx: Context) -> Output!BlockingError:
     process := start_or_fail(cmd)!
@@ -186,6 +224,24 @@ impl Process:
 
     fn close():
         process_close(self.handle)
+
+impl Output:
+    fn success() -> Bool:
+        return self.status == 0
+
+    fn failed() -> Bool:
+        return self.status != 0
+
+    fn stdout_trimmed() -> String:
+        return self.stdout.trim()
+
+    fn stderr_trimmed() -> String:
+        return self.stderr.trim()
+
+    fn ensure_success() -> Output!ExitError:
+        if self.status != 0:
+            fail ExitError{self.status, self.stdout, self.stderr}
+        return self
 
 # starts a shell command as a child process.
 pub fn start_shell(command_text: String) -> Process!:

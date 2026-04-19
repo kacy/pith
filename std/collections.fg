@@ -336,6 +336,67 @@ pub fn set_difference[T](left: Set[T], right: Set[T]) -> Set[T]:
 # generic list and map helpers
 # ===============================================================
 
+# generic collection helper failure.
+pub struct CollectionError:
+    pub message: String
+
+# return true if any item matches the predicate.
+pub fn any[T](items: List[T], keep: fn(T) -> Bool) -> Bool:
+    for item in items:
+        if keep(item):
+            return true
+    return false
+
+# return true if every item matches the predicate.
+pub fn all[T](items: List[T], keep: fn(T) -> Bool) -> Bool:
+    for item in items:
+        if not keep(item):
+            return false
+    return true
+
+# return the index of the first item that matches, or -1.
+pub fn find_index[T](items: List[T], keep: fn(T) -> Bool) -> Int:
+    for item, i in items:
+        if keep(item):
+            return i
+    return -1
+
+# return the first matching item or fail when nothing matches.
+pub fn find[T](items: List[T], keep: fn(T) -> Bool) -> T!CollectionError:
+    for item in items:
+        if keep(item):
+            return item
+    fail CollectionError{"no matching item"}
+
+# split items into kept and dropped buckets.
+pub fn partition[T](items: List[T], keep: fn(T) -> Bool) -> List[List[T]]:
+    mut kept: List[T] := []
+    mut dropped: List[T] := []
+    for item in items:
+        if keep(item):
+            kept.push(item)
+        else:
+            dropped.push(item)
+    return [kept, dropped]
+
+# map each item to a list and flatten the result.
+pub fn flat_map[T, U](items: List[T], mapper: fn(T) -> List[U]) -> List[U]:
+    mut result: List[U] := []
+    for item in items:
+        mapped := mapper(item)
+        for value in mapped:
+            result.push(value)
+    return result
+
+# count how many items match the predicate.
+pub fn count_where[T](items: List[T], keep: fn(T) -> Bool) -> Int:
+    mut result := 0
+    for item in items:
+        if keep(item):
+            result = result + 1
+    return result
+
+# count items by a computed string key.
 pub fn count_by[T](items: List[T], key_fn: fn(T) -> String) -> Map[String, Int]:
     mut counts: Map[String, Int] := {}
     for item in items:
@@ -402,6 +463,40 @@ pub fn sorted_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:
 # alias for sorted_by.
 pub fn sort_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:
     return sorted_by(items, less)
+
+# return a sorted copy using an integer sort key.
+pub fn sort_by_key[T](items: List[T], key_fn: fn(T) -> Int) -> List[T]:
+    return sorted_by(items, fn(left: T, right: T) => key_fn(left) < key_fn(right))
+
+# return the item with the smallest integer key.
+pub fn min_by[T](items: List[T], key_fn: fn(T) -> Int) -> T!CollectionError:
+    if items.len() == 0:
+        fail CollectionError{"empty collection"}
+    mut best := items[0]
+    mut best_key := key_fn(best)
+    for item, i in items:
+        if i == 0:
+            continue
+        item_key := key_fn(item)
+        if item_key < best_key:
+            best = item
+            best_key = item_key
+    return best
+
+# return the item with the largest integer key.
+pub fn max_by[T](items: List[T], key_fn: fn(T) -> Int) -> T!CollectionError:
+    if items.len() == 0:
+        fail CollectionError{"empty collection"}
+    mut best := items[0]
+    mut best_key := key_fn(best)
+    for item, i in items:
+        if i == 0:
+            continue
+        item_key := key_fn(item)
+        if item_key > best_key:
+            best = item
+            best_key = item_key
+    return best
 
 # ===============================================================
 # String List Utilities

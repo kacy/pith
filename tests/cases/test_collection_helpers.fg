@@ -2,7 +2,9 @@ from std.collections import copy_list, copy_map, copy_set
 from std.collections import count_by, index_by, group_by
 from std.collections import map_values, filter_entries
 from std.collections import set_union, set_intersection, set_difference
-from std.collections import sorted_by
+from std.collections import sorted_by, sort_by_key
+from std.collections import any, all, find_index, find, partition
+from std.collections import flat_map, count_where, min_by, max_by
 
 struct Item:
     pub name: String
@@ -82,3 +84,30 @@ fn main():
     ranked := sorted_by(items, fn(left: Item, right: Item) => left.score < right.score)
     print("sorted-by:{names_of(ranked)}")
     print("sorted-original:{names_of(items)}")
+
+    print("any-red:{any(items, fn(item: Item) => item.team == "red")}")
+    print("all-score-positive:{all(items, fn(item: Item) => item.score > 0)}")
+    print("find-index-blue:{find_index(items, fn(item: Item) => item.team == "blue")}")
+
+    found := find(items, fn(item: Item) => item.name == "carol")
+    print("find-carol:{found.ok.score}")
+    missing := find(items, fn(item: Item) => item.name == "zoe")
+    print("find-missing:{missing.is_err}")
+
+    num_split := partition(nums, fn(n: Int) => n >= 2)
+    print("partition-kept-len:{num_split[0].len()}")
+    print("partition-dropped-len:{num_split[1].len()}")
+    print("partition-kept-first:{num_split[0][0]}")
+    print("partition-dropped-first:{num_split[1][0]}")
+
+    scores_by_team := flat_map(items, fn(item: Item) => [item.team + ":" + item.score.to_string()])
+    print("flat-map:{scores_by_team.join(",")}")
+    print("count-where-blue:{count_where(items, fn(item: Item) => item.team == "blue")}")
+
+    ranked_by_key := sort_by_key(items, fn(item: Item) => item.score)
+    print("sort-by-key:{names_of(ranked_by_key)}")
+
+    lowest := min_by(items, fn(item: Item) => item.score)
+    highest := max_by(items, fn(item: Item) => item.score)
+    print("min-by:{lowest.ok.name}")
+    print("max-by:{highest.ok.name}")

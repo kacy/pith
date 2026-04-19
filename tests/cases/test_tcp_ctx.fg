@@ -25,6 +25,9 @@ fn main() -> Int!:
     invalid_read_bytes := invalid.read_bytes_ctx(concurrent.background(), 8)
     print("invalid-read-bytes-failed:{invalid_read_bytes.is_err and invalid_read_bytes.err.is_failed()}")
 
+    invalid_exact_bytes := invalid.read_exact_bytes_ctx(concurrent.background(), 8)
+    print("invalid-read-exact-bytes-failed:{invalid_exact_bytes.is_err and invalid_exact_bytes.err.is_failed()}")
+
     invalid_write_all := invalid.write_all_ctx(concurrent.background(), "hi")
     print("invalid-write-all-failed:{invalid_write_all.is_err and invalid_write_all.err.is_failed()}")
 
@@ -38,6 +41,11 @@ fn main() -> Int!:
     time.delay(5)
     buffered_line := buffered_reader.read_line_ctx(buffered_line_pair.0)
     print("buffered-read-line-timeout:{buffered_line.is_err and buffered_line.err.is_deadline_exceeded()}")
+
+    buffered_until_pair := concurrent.with_timeout(concurrent.background(), 1)
+    time.delay(5)
+    buffered_until := buffered_reader.read_until_ctx(buffered_until_pair.0, "|")
+    print("buffered-read-until-timeout:{buffered_until.is_err and buffered_until.err.is_deadline_exceeded()}")
 
     buffered_writer := invalid.buffered_writer()
     buffered_write := buffered_writer.write_ctx(concurrent.background(), "hi")

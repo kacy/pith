@@ -227,6 +227,9 @@ impl BytesCursor:
     fn read_bytes(max_bytes: Int) -> Bytes!:
         return bytes_cursor_read(self, max_bytes)
 
+    fn read_exact_bytes(count: Int) -> Bytes!:
+        return read_exact_bytes_cursor(self, count)
+
     fn read_all_bytes() -> Bytes!:
         return read_all_bytes_cursor(self)
 
@@ -251,6 +254,9 @@ impl ByteBuffer:
     fn write_all_bytes(data: Bytes) -> Int!:
         return write_all_byte_buffer(self, data)
 
+    fn write_n_bytes(data: Bytes, count: Int) -> Int!:
+        return write_n_bytes(self, data, count)
+
     fn buffered() -> BufferedBytesWriter:
         return buffered_bytes_writer(self)
 
@@ -260,6 +266,12 @@ impl ByteBuffer:
 impl BufferedBytesReader:
     fn read_bytes(max_bytes: Int) -> Bytes!:
         return buffered_bytes_reader_read(self, max_bytes)
+
+    fn read_exact_bytes(count: Int) -> Bytes!:
+        return read_exact_buffered_bytes_reader(self, count)
+
+    fn read_until_bytes(sep: Bytes) -> Bytes!:
+        return buffered_bytes_reader_read_until_internal(self, sep)
 
     fn read_all_bytes() -> Bytes!:
         return read_all_buffered_bytes_reader(self)
@@ -588,6 +600,14 @@ pub fn copy_chunked(reader: StringReader, writer: StringBuffer, chunk_size: Int)
 pub fn read_all_bytes(reader: BytesCursor) -> Bytes!:
     return read_all_bytes_cursor(reader)
 
+# read exactly count bytes or fail with unexpected eof.
+pub fn read_exact_bytes(reader: BytesCursor, count: Int) -> Bytes!:
+    return read_exact_bytes_cursor(reader, count)
+
+# read exactly count bytes from a buffered bytes reader.
+pub fn read_exact_buffered_bytes(reader: BufferedBytesReader, count: Int) -> Bytes!:
+    return read_exact_buffered_bytes_reader(reader, count)
+
 # read the rest of a bytes reader with an explicit chunk size.
 pub fn read_all_bytes_chunked(reader: BytesCursor, chunk_size: Int) -> Bytes!:
     return read_all_bytes_cursor_chunked(reader, chunk_size)
@@ -603,6 +623,48 @@ pub fn copy_bytes(reader: BytesCursor, writer: ByteBuffer) -> Int!:
 # copy all bytes from a reader into a byte buffer with an explicit chunk size.
 pub fn copy_bytes_chunked(reader: BytesCursor, writer: ByteBuffer, chunk_size: Int) -> Int!:
     return copy_bytes_cursor_chunked(reader, writer, chunk_size)
+
+# copy exactly count characters from a string reader into a string buffer.
+pub fn copy_n(reader: StringReader, writer: StringBuffer, count: Int) -> Int!:
+    if count <= 0:
+        return 0
+    mut total := 0
+    mut remaining := count
+    while remaining > 0:
+        mut take := remaining
+        if take > DEFAULT_CHUNK_SIZE:
+            take = DEFAULT_CHUNK_SIZE
+        chunk := reader.read(take)!
+        if chunk.len() == 0:
+            fail "unexpected eof"
+        total = total + write_all_string(writer, chunk)!
+        remaining = remaining - chunk.len()
+    return total
+
+# copy exactly count bytes from a bytes reader into a byte buffer.
+pub fn copy_n_bytes(reader: BytesCursor, writer: ByteBuffer, count: Int) -> Int!:
+    if count <= 0:
+        return 0
+    data := read_exact_bytes_cursor(reader, count)!
+    return write_all_byte_buffer(writer, data)
+
+# write at most count characters from the input string.
+pub fn write_n(writer: StringBuffer, data: String, count: Int) -> Int!:
+    if count <= 0:
+        return 0
+    mut end := count
+    if end > data.len():
+        end = data.len()
+    return write_all_string(writer, data.substring(0, end))
+
+# write at most count bytes from the input bytes.
+pub fn write_n_bytes(writer: ByteBuffer, data: Bytes, count: Int) -> Int!:
+    if count <= 0:
+        return 0
+    mut end := count
+    if end > data.len():
+        end = data.len()
+    return write_all_byte_buffer(writer, data.slice(0, end))
 
 # open a tcp client connection.
 pub fn connect(host: String, port: Int) -> TcpStream!:
@@ -942,6 +1004,25 @@ fn find_newline(data: String) -> Int:
             return i
         i = i + 1
     return -1
+
+fn find_bytes_sep(data: Bytes, sep: Bytes) -> Int:
+    if sep.is_empty():
+        return 0 - 1
+    if data.len() < sep.len():
+        return 0 - 1
+    mut i := 0
+    while i + sep.len() <= data.len():
+        mut matched := true
+        mut j := 0
+        while j < sep.len():
+            if bytes.get(data, i + j) != bytes.get(sep, j):
+                matched = false
+                break
+            j = j + 1
+        if matched:
+            return i
+        i = i + 1
+    return 0 - 1
 
 fn read_all_string(reader: StringReader) -> String!:
     return read_all_string_chunked(reader, DEFAULT_CHUNK_SIZE)
@@ -1458,6 +1539,111 @@ fn read_all_process_stderr_bytes_chunked_ctx(reader: ProcessStderr, ctx: Context
         chunk = process_stderr_read_bytes_ctx(reader, ctx, size)!
     return buf.bytes()
 
+fn read_exact_bytes_cursor(reader: BytesCursor, count: Int) -> Bytes!:
+    if count <= 0:
+        return bytes.empty()
+    buf := bytes.buffer_with_capacity(count)
+    while buf.bytes().len() < count:
+        chunk := bytes_cursor_read(reader, count - buf.bytes().len())!
+        if chunk.is_empty():
+            fail "unexpected eof"
+        buf.write(chunk)!
+    return buf.bytes()
+
+fn read_exact_buffered_bytes_reader(reader: BufferedBytesReader, count: Int) -> Bytes!:
+    if count <= 0:
+        return bytes.empty()
+    buf := bytes.buffer_with_capacity(count)
+    while buf.bytes().len() < count:
+        chunk := buffered_bytes_reader_read(reader, count - buf.bytes().len())!
+        if chunk.is_empty():
+            fail "unexpected eof"
+        buf.write(chunk)!
+    return buf.bytes()
+
+fn read_exact_tcp_stream_bytes(stream: TcpStream, count: Int) -> Bytes!:
+    if count <= 0:
+        return bytes.empty()
+    buf := bytes.buffer_with_capacity(count)
+    while buf.bytes().len() < count:
+        chunk := tcp_stream_read_bytes(stream, count - buf.bytes().len())!
+        if chunk.is_empty():
+            fail "unexpected eof"
+        buf.write(chunk)!
+    return buf.bytes()
+
+fn read_exact_tcp_stream_bytes_ctx(stream: TcpStream, ctx: Context, count: Int) -> Bytes!BlockingError:
+    if count <= 0:
+        return bytes.empty()
+    buf := bytes.buffer_with_capacity(count)
+    while buf.bytes().len() < count:
+        chunk := tcp_stream_read_bytes_ctx(stream, ctx, count - buf.bytes().len())!
+        if chunk.is_empty():
+            fail blocking_failed("unexpected eof")
+        wrote := buf.write(chunk)
+        if wrote.is_err:
+            fail blocking_failed(wrote.err)
+    return buf.bytes()
+
+fn read_exact_file_stream_bytes(stream: FileStream, count: Int) -> Bytes!:
+    if count <= 0:
+        return bytes.empty()
+    buf := bytes.buffer_with_capacity(count)
+    while buf.bytes().len() < count:
+        chunk := file_stream_read_bytes(stream, count - buf.bytes().len())!
+        if chunk.is_empty():
+            fail "unexpected eof"
+        buf.write(chunk)!
+    return buf.bytes()
+
+fn read_exact_process_stdout_bytes(reader: ProcessStdout, count: Int) -> Bytes!:
+    if count <= 0:
+        return bytes.empty()
+    buf := bytes.buffer_with_capacity(count)
+    while buf.bytes().len() < count:
+        chunk := process_stdout_read_bytes(reader, count - buf.bytes().len())!
+        if chunk.is_empty():
+            fail "unexpected eof"
+        buf.write(chunk)!
+    return buf.bytes()
+
+fn read_exact_process_stdout_bytes_ctx(reader: ProcessStdout, ctx: Context, count: Int) -> Bytes!BlockingError:
+    if count <= 0:
+        return bytes.empty()
+    buf := bytes.buffer_with_capacity(count)
+    while buf.bytes().len() < count:
+        chunk := process_stdout_read_bytes_ctx(reader, ctx, count - buf.bytes().len())!
+        if chunk.is_empty():
+            fail blocking_failed("unexpected eof")
+        wrote := buf.write(chunk)
+        if wrote.is_err:
+            fail blocking_failed(wrote.err)
+    return buf.bytes()
+
+fn read_exact_process_stderr_bytes(reader: ProcessStderr, count: Int) -> Bytes!:
+    if count <= 0:
+        return bytes.empty()
+    buf := bytes.buffer_with_capacity(count)
+    while buf.bytes().len() < count:
+        chunk := process_stderr_read_bytes(reader, count - buf.bytes().len())!
+        if chunk.is_empty():
+            fail "unexpected eof"
+        buf.write(chunk)!
+    return buf.bytes()
+
+fn read_exact_process_stderr_bytes_ctx(reader: ProcessStderr, ctx: Context, count: Int) -> Bytes!BlockingError:
+    if count <= 0:
+        return bytes.empty()
+    buf := bytes.buffer_with_capacity(count)
+    while buf.bytes().len() < count:
+        chunk := process_stderr_read_bytes_ctx(reader, ctx, count - buf.bytes().len())!
+        if chunk.is_empty():
+            fail blocking_failed("unexpected eof")
+        wrote := buf.write(chunk)
+        if wrote.is_err:
+            fail blocking_failed(wrote.err)
+    return buf.bytes()
+
 fn read_all_buffered_bytes_reader(reader: BufferedBytesReader) -> Bytes!:
     return read_all_buffered_bytes_reader_chunked(reader, DEFAULT_CHUNK_SIZE)
 
@@ -1502,6 +1688,35 @@ fn buffered_bytes_reader_read_internal(reader: BufferedBytesReader, max_bytes: I
         buffered_bytes_reader_consume(reader.handle, take)
     return buf.bytes()
 
+fn buffered_bytes_reader_read_until_internal(reader: BufferedBytesReader, sep: Bytes) -> Bytes!:
+    if sep.is_empty():
+        fail "empty separator"
+    if not buffered_bytes_reader_source_handles.contains_key(reader.handle):
+        return bytes.empty()
+
+    buf := bytes.buffer()
+    while true:
+        mut cached := buffered_bytes_reader_cache_get(reader.handle)
+        sep_pos := find_bytes_sep(cached, sep)
+        if sep_pos >= 0:
+            if sep_pos > 0:
+                buf.write(cached.slice(0, sep_pos))!
+            buffered_bytes_reader_consume(reader.handle, sep_pos + sep.len())
+            return buf.bytes()
+        keep := sep.len() - 1
+        if cached.len() > keep:
+            flush_len := cached.len() - keep
+            buf.write(cached.slice(0, flush_len))!
+            buffered_bytes_reader_consume(reader.handle, flush_len)
+        filled := buffered_bytes_reader_fill(reader.handle)!
+        if filled <= 0:
+            cached = buffered_bytes_reader_cache_get(reader.handle)
+            if not cached.is_empty():
+                buf.write(cached)!
+                buffered_bytes_reader_cache.insert(reader.handle, bytes.empty())
+            return buf.bytes()
+    return buf.bytes()
+
 fn buffered_bytes_reader_fill(handle: Int) -> Int!:
     if not buffered_bytes_reader_source_handles.contains_key(handle):
         return 0
@@ -1523,7 +1738,8 @@ fn buffered_bytes_reader_fill(handle: Int) -> Int!:
         chunk = process_stdout_read_bytes(ProcessStdout(source_handle), chunk_size)!
     elif source_kind == BUFFERED_BYTES_SOURCE_PROCESS_STDERR:
         chunk = process_stderr_read_bytes(ProcessStderr(source_handle), chunk_size)!
-    buffered_bytes_reader_cache.insert(handle, chunk)
+    cached := buffered_bytes_reader_cache_get(handle)
+    buffered_bytes_reader_cache.insert(handle, cached.concat(chunk))
     return chunk.len()
 
 fn buffered_bytes_writer_write_internal(writer: BufferedBytesWriter, data: Bytes) -> Int!:
@@ -1599,6 +1815,36 @@ fn buffered_string_reader_read_line_internal(reader: BufferedStringReader) -> St
         result = result + cached
         buffered_string_reader_cache.insert(reader.handle, "")
 
+fn buffered_string_reader_read_until_internal(reader: BufferedStringReader, sep: String) -> String!:
+    if sep.len() == 0:
+        fail "empty separator"
+    if not buffered_string_reader_sources.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_string_reader_cache_get(reader.handle)
+        mut sep_pos := -1
+        if cached.len() > 0:
+            sep_pos = cached.index_of(sep)
+        if sep_pos >= 0:
+            result = result + cached.substring(0, sep_pos)
+            buffered_string_reader_consume(reader.handle, sep_pos + sep.len())
+            return result
+        keep := sep.len() - 1
+        if cached.len() > keep:
+            flush_len := cached.len() - keep
+            result = result + cached.substring(0, flush_len)
+            buffered_string_reader_consume(reader.handle, flush_len)
+        filled := buffered_string_reader_fill(reader.handle)!
+        if filled <= 0:
+            cached = buffered_string_reader_cache_get(reader.handle)
+            if cached.len() > 0:
+                result = result + cached
+                buffered_string_reader_cache.insert(reader.handle, "")
+            return result
+    return result
+
 fn buffered_string_reader_fill(handle: Int) -> Int!:
     if not buffered_string_reader_sources.contains_key(handle):
         return 0
@@ -1609,7 +1855,8 @@ fn buffered_string_reader_fill(handle: Int) -> Int!:
         chunk_size = buffered_string_reader_chunk_sizes[handle]
 
     chunk := string_reader_read(StringReader(source_handle), chunk_size)!
-    buffered_string_reader_cache.insert(handle, chunk)
+    cached := buffered_string_reader_cache_get(handle)
+    buffered_string_reader_cache.insert(handle, cached + chunk)
     return chunk.len()
 
 fn buffered_string_writer_write_internal(writer: BufferedStringWriter, data: String) -> Int!:
@@ -1717,6 +1964,66 @@ fn buffered_tcp_stream_read_line_internal_ctx(reader: BufferedTcpStream, ctx: Co
         result = result + cached
         buffered_tcp_stream_cache.insert(reader.handle, "")
 
+fn buffered_tcp_stream_read_until_internal(reader: BufferedTcpStream, sep: String) -> String!:
+    if sep.len() == 0:
+        fail "empty separator"
+    if not buffered_tcp_stream_fds.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_tcp_stream_cache_get(reader.handle)
+        mut sep_pos := -1
+        if cached.len() > 0:
+            sep_pos = cached.index_of(sep)
+        if sep_pos >= 0:
+            result = result + cached.substring(0, sep_pos)
+            buffered_tcp_stream_consume(reader.handle, sep_pos + sep.len())
+            return result
+        keep := sep.len() - 1
+        if cached.len() > keep:
+            flush_len := cached.len() - keep
+            result = result + cached.substring(0, flush_len)
+            buffered_tcp_stream_consume(reader.handle, flush_len)
+        filled := buffered_tcp_stream_fill(reader.handle)!
+        if filled <= 0:
+            cached = buffered_tcp_stream_cache_get(reader.handle)
+            if cached.len() > 0:
+                result = result + cached
+                buffered_tcp_stream_cache.insert(reader.handle, "")
+            return result
+    return result
+
+fn buffered_tcp_stream_read_until_internal_ctx(reader: BufferedTcpStream, ctx: Context, sep: String) -> String!BlockingError:
+    if sep.len() == 0:
+        fail blocking_failed("empty separator")
+    if not buffered_tcp_stream_fds.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_tcp_stream_cache_get(reader.handle)
+        mut sep_pos := -1
+        if cached.len() > 0:
+            sep_pos = cached.index_of(sep)
+        if sep_pos >= 0:
+            result = result + cached.substring(0, sep_pos)
+            buffered_tcp_stream_consume(reader.handle, sep_pos + sep.len())
+            return result
+        keep := sep.len() - 1
+        if cached.len() > keep:
+            flush_len := cached.len() - keep
+            result = result + cached.substring(0, flush_len)
+            buffered_tcp_stream_consume(reader.handle, flush_len)
+        filled := buffered_tcp_stream_fill_ctx(reader.handle, ctx)!
+        if filled <= 0:
+            cached = buffered_tcp_stream_cache_get(reader.handle)
+            if cached.len() > 0:
+                result = result + cached
+                buffered_tcp_stream_cache.insert(reader.handle, "")
+            return result
+    return result
+
 fn buffered_tcp_stream_fill(handle: Int) -> Int!:
     if not buffered_tcp_stream_fds.contains_key(handle):
         return 0
@@ -1727,7 +2034,8 @@ fn buffered_tcp_stream_fill(handle: Int) -> Int!:
         chunk_size = buffered_tcp_stream_chunk_sizes[handle]
 
     chunk := tcp_stream_read(TcpStream(fd), chunk_size)!
-    buffered_tcp_stream_cache.insert(handle, chunk)
+    cached := buffered_tcp_stream_cache_get(handle)
+    buffered_tcp_stream_cache.insert(handle, cached + chunk)
     return chunk.len()
 
 fn buffered_tcp_stream_fill_ctx(handle: Int, ctx: Context) -> Int!BlockingError:
@@ -1740,7 +2048,8 @@ fn buffered_tcp_stream_fill_ctx(handle: Int, ctx: Context) -> Int!BlockingError:
         chunk_size = buffered_tcp_stream_chunk_sizes[handle]
 
     chunk := tcp_stream_read_ctx(TcpStream(fd), ctx, chunk_size)!
-    buffered_tcp_stream_cache.insert(handle, chunk)
+    cached := buffered_tcp_stream_cache_get(handle)
+    buffered_tcp_stream_cache.insert(handle, cached + chunk)
     return chunk.len()
 
 fn buffered_tcp_writer_write_internal(writer: BufferedTcpWriter, data: String) -> Int!:
@@ -1830,6 +2139,36 @@ fn buffered_file_reader_read_line_internal(reader: BufferedFileReader) -> String
         result = result + cached
         buffered_file_reader_cache.insert(reader.handle, "")
 
+fn buffered_file_reader_read_until_internal(reader: BufferedFileReader, sep: String) -> String!:
+    if sep.len() == 0:
+        fail "empty separator"
+    if not buffered_file_reader_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_file_reader_cache_get(reader.handle)
+        mut sep_pos := -1
+        if cached.len() > 0:
+            sep_pos = cached.index_of(sep)
+        if sep_pos >= 0:
+            result = result + cached.substring(0, sep_pos)
+            buffered_file_reader_consume(reader.handle, sep_pos + sep.len())
+            return result
+        keep := sep.len() - 1
+        if cached.len() > keep:
+            flush_len := cached.len() - keep
+            result = result + cached.substring(0, flush_len)
+            buffered_file_reader_consume(reader.handle, flush_len)
+        filled := buffered_file_reader_fill(reader.handle)!
+        if filled <= 0:
+            cached = buffered_file_reader_cache_get(reader.handle)
+            if cached.len() > 0:
+                result = result + cached
+                buffered_file_reader_cache.insert(reader.handle, "")
+            return result
+    return result
+
 fn buffered_file_reader_fill(handle: Int) -> Int!:
     if not buffered_file_reader_handles.contains_key(handle):
         return 0
@@ -1840,7 +2179,8 @@ fn buffered_file_reader_fill(handle: Int) -> Int!:
         chunk_size = buffered_file_reader_chunk_sizes[handle]
 
     chunk := file_stream_read(FileStream(file_handle), chunk_size)!
-    buffered_file_reader_cache.insert(handle, chunk)
+    cached := buffered_file_reader_cache_get(handle)
+    buffered_file_reader_cache.insert(handle, cached + chunk)
     return chunk.len()
 
 fn buffered_file_writer_write_internal(writer: BufferedFileWriter, data: String) -> Int!:
@@ -1948,6 +2288,66 @@ fn buffered_process_stdout_read_line_internal_ctx(reader: BufferedProcessStdout,
         result = result + cached
         buffered_process_stdout_cache.insert(reader.handle, "")
 
+fn buffered_process_stdout_read_until_internal(reader: BufferedProcessStdout, sep: String) -> String!:
+    if sep.len() == 0:
+        fail "empty separator"
+    if not buffered_process_stdout_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_process_stdout_cache_get(reader.handle)
+        mut sep_pos := -1
+        if cached.len() > 0:
+            sep_pos = cached.index_of(sep)
+        if sep_pos >= 0:
+            result = result + cached.substring(0, sep_pos)
+            buffered_process_stdout_consume(reader.handle, sep_pos + sep.len())
+            return result
+        keep := sep.len() - 1
+        if cached.len() > keep:
+            flush_len := cached.len() - keep
+            result = result + cached.substring(0, flush_len)
+            buffered_process_stdout_consume(reader.handle, flush_len)
+        filled := buffered_process_stdout_fill(reader.handle)!
+        if filled <= 0:
+            cached = buffered_process_stdout_cache_get(reader.handle)
+            if cached.len() > 0:
+                result = result + cached
+                buffered_process_stdout_cache.insert(reader.handle, "")
+            return result
+    return result
+
+fn buffered_process_stdout_read_until_internal_ctx(reader: BufferedProcessStdout, ctx: Context, sep: String) -> String!BlockingError:
+    if sep.len() == 0:
+        fail blocking_failed("empty separator")
+    if not buffered_process_stdout_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_process_stdout_cache_get(reader.handle)
+        mut sep_pos := -1
+        if cached.len() > 0:
+            sep_pos = cached.index_of(sep)
+        if sep_pos >= 0:
+            result = result + cached.substring(0, sep_pos)
+            buffered_process_stdout_consume(reader.handle, sep_pos + sep.len())
+            return result
+        keep := sep.len() - 1
+        if cached.len() > keep:
+            flush_len := cached.len() - keep
+            result = result + cached.substring(0, flush_len)
+            buffered_process_stdout_consume(reader.handle, flush_len)
+        filled := buffered_process_stdout_fill_ctx(reader.handle, ctx)!
+        if filled <= 0:
+            cached = buffered_process_stdout_cache_get(reader.handle)
+            if cached.len() > 0:
+                result = result + cached
+                buffered_process_stdout_cache.insert(reader.handle, "")
+            return result
+    return result
+
 fn buffered_process_stdout_fill(handle: Int) -> Int!:
     if not buffered_process_stdout_handles.contains_key(handle):
         return 0
@@ -1958,7 +2358,8 @@ fn buffered_process_stdout_fill(handle: Int) -> Int!:
         chunk_size = buffered_process_stdout_chunk_sizes[handle]
 
     chunk := process_stdout_read(ProcessStdout(stdout_handle), chunk_size)!
-    buffered_process_stdout_cache.insert(handle, chunk)
+    cached := buffered_process_stdout_cache_get(handle)
+    buffered_process_stdout_cache.insert(handle, cached + chunk)
     return chunk.len()
 
 fn buffered_process_stdout_fill_ctx(handle: Int, ctx: Context) -> Int!BlockingError:
@@ -1971,7 +2372,8 @@ fn buffered_process_stdout_fill_ctx(handle: Int, ctx: Context) -> Int!BlockingEr
         chunk_size = buffered_process_stdout_chunk_sizes[handle]
 
     chunk := process_stdout_read_ctx(ProcessStdout(stdout_handle), ctx, chunk_size)!
-    buffered_process_stdout_cache.insert(handle, chunk)
+    cached := buffered_process_stdout_cache_get(handle)
+    buffered_process_stdout_cache.insert(handle, cached + chunk)
     return chunk.len()
 
 fn buffered_process_stderr_read_internal(reader: BufferedProcessStderr, max_bytes: Int) -> String!:
@@ -2056,6 +2458,66 @@ fn buffered_process_stderr_read_line_internal_ctx(reader: BufferedProcessStderr,
         result = result + cached
         buffered_process_stderr_cache.insert(reader.handle, "")
 
+fn buffered_process_stderr_read_until_internal(reader: BufferedProcessStderr, sep: String) -> String!:
+    if sep.len() == 0:
+        fail "empty separator"
+    if not buffered_process_stderr_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_process_stderr_cache_get(reader.handle)
+        mut sep_pos := -1
+        if cached.len() > 0:
+            sep_pos = cached.index_of(sep)
+        if sep_pos >= 0:
+            result = result + cached.substring(0, sep_pos)
+            buffered_process_stderr_consume(reader.handle, sep_pos + sep.len())
+            return result
+        keep := sep.len() - 1
+        if cached.len() > keep:
+            flush_len := cached.len() - keep
+            result = result + cached.substring(0, flush_len)
+            buffered_process_stderr_consume(reader.handle, flush_len)
+        filled := buffered_process_stderr_fill(reader.handle)!
+        if filled <= 0:
+            cached = buffered_process_stderr_cache_get(reader.handle)
+            if cached.len() > 0:
+                result = result + cached
+                buffered_process_stderr_cache.insert(reader.handle, "")
+            return result
+    return result
+
+fn buffered_process_stderr_read_until_internal_ctx(reader: BufferedProcessStderr, ctx: Context, sep: String) -> String!BlockingError:
+    if sep.len() == 0:
+        fail blocking_failed("empty separator")
+    if not buffered_process_stderr_handles.contains_key(reader.handle):
+        return ""
+
+    mut result := ""
+    while true:
+        mut cached := buffered_process_stderr_cache_get(reader.handle)
+        mut sep_pos := -1
+        if cached.len() > 0:
+            sep_pos = cached.index_of(sep)
+        if sep_pos >= 0:
+            result = result + cached.substring(0, sep_pos)
+            buffered_process_stderr_consume(reader.handle, sep_pos + sep.len())
+            return result
+        keep := sep.len() - 1
+        if cached.len() > keep:
+            flush_len := cached.len() - keep
+            result = result + cached.substring(0, flush_len)
+            buffered_process_stderr_consume(reader.handle, flush_len)
+        filled := buffered_process_stderr_fill_ctx(reader.handle, ctx)!
+        if filled <= 0:
+            cached = buffered_process_stderr_cache_get(reader.handle)
+            if cached.len() > 0:
+                result = result + cached
+                buffered_process_stderr_cache.insert(reader.handle, "")
+            return result
+    return result
+
 fn buffered_process_stderr_fill(handle: Int) -> Int!:
     if not buffered_process_stderr_handles.contains_key(handle):
         return 0
@@ -2066,7 +2528,8 @@ fn buffered_process_stderr_fill(handle: Int) -> Int!:
         chunk_size = buffered_process_stderr_chunk_sizes[handle]
 
     chunk := process_stderr_read(ProcessStderr(stderr_handle), chunk_size)!
-    buffered_process_stderr_cache.insert(handle, chunk)
+    cached := buffered_process_stderr_cache_get(handle)
+    buffered_process_stderr_cache.insert(handle, cached + chunk)
     return chunk.len()
 
 fn buffered_process_stderr_fill_ctx(handle: Int, ctx: Context) -> Int!BlockingError:
@@ -2079,7 +2542,8 @@ fn buffered_process_stderr_fill_ctx(handle: Int, ctx: Context) -> Int!BlockingEr
         chunk_size = buffered_process_stderr_chunk_sizes[handle]
 
     chunk := process_stderr_read_ctx(ProcessStderr(stderr_handle), ctx, chunk_size)!
-    buffered_process_stderr_cache.insert(handle, chunk)
+    cached := buffered_process_stderr_cache_get(handle)
+    buffered_process_stderr_cache.insert(handle, cached + chunk)
     return chunk.len()
 
 fn buffered_string_reader_cache_get(handle: Int) -> String:
@@ -2191,6 +2655,9 @@ impl BufferedStringReader:
     fn read_line() -> String!:
         return buffered_string_reader_read_line(self)
 
+    fn read_until(sep: String) -> String!:
+        return buffered_string_reader_read_until_internal(self, sep)
+
 impl Reader for BufferedStringReader:
     fn read(max_bytes: Int) -> String!:
         return buffered_string_reader_read(self, max_bytes)
@@ -2226,6 +2693,12 @@ impl BufferedTcpStream:
     fn read_line_ctx(ctx: Context) -> String!BlockingError:
         return buffered_tcp_stream_read_line_internal_ctx(self, ctx)
 
+    fn read_until(sep: String) -> String!:
+        return buffered_tcp_stream_read_until_internal(self, sep)
+
+    fn read_until_ctx(ctx: Context, sep: String) -> String!BlockingError:
+        return buffered_tcp_stream_read_until_internal_ctx(self, ctx, sep)
+
 impl Reader for BufferedTcpStream:
     fn read(max_bytes: Int) -> String!:
         return buffered_tcp_stream_read(self, max_bytes)
@@ -2243,6 +2716,12 @@ impl BufferedProcessStdout:
     fn read_line_ctx(ctx: Context) -> String!BlockingError:
         return buffered_process_stdout_read_line_internal_ctx(self, ctx)
 
+    fn read_until(sep: String) -> String!:
+        return buffered_process_stdout_read_until_internal(self, sep)
+
+    fn read_until_ctx(ctx: Context, sep: String) -> String!BlockingError:
+        return buffered_process_stdout_read_until_internal_ctx(self, ctx, sep)
+
 impl Reader for BufferedProcessStdout:
     fn read(max_bytes: Int) -> String!:
         return buffered_process_stdout_read(self, max_bytes)
@@ -2259,6 +2738,12 @@ impl BufferedProcessStderr:
 
     fn read_line_ctx(ctx: Context) -> String!BlockingError:
         return buffered_process_stderr_read_line_internal_ctx(self, ctx)
+
+    fn read_until(sep: String) -> String!:
+        return buffered_process_stderr_read_until_internal(self, sep)
+
+    fn read_until_ctx(ctx: Context, sep: String) -> String!BlockingError:
+        return buffered_process_stderr_read_until_internal_ctx(self, ctx, sep)
 
 impl Reader for BufferedProcessStderr:
     fn read(max_bytes: Int) -> String!:
@@ -2297,6 +2782,9 @@ impl BufferedFileReader:
 
     fn read_line() -> String!:
         return buffered_file_reader_read_line(self)
+
+    fn read_until(sep: String) -> String!:
+        return buffered_file_reader_read_until_internal(self, sep)
 
 impl Reader for BufferedFileReader:
     fn read(max_bytes: Int) -> String!:
@@ -2384,6 +2872,12 @@ impl ProcessStdout:
     fn read_bytes_ctx(ctx: Context, max_bytes: Int) -> Bytes!BlockingError:
         return process_stdout_read_bytes_ctx(self, ctx, max_bytes)
 
+    fn read_exact_bytes(count: Int) -> Bytes!:
+        return read_exact_process_stdout_bytes(self, count)
+
+    fn read_exact_bytes_ctx(ctx: Context, count: Int) -> Bytes!BlockingError:
+        return read_exact_process_stdout_bytes_ctx(self, ctx, count)
+
     fn read_all_bytes() -> Bytes!:
         return read_all_process_stdout_bytes(self)
 
@@ -2440,6 +2934,12 @@ impl ProcessStderr:
 
     fn read_bytes_ctx(ctx: Context, max_bytes: Int) -> Bytes!BlockingError:
         return process_stderr_read_bytes_ctx(self, ctx, max_bytes)
+
+    fn read_exact_bytes(count: Int) -> Bytes!:
+        return read_exact_process_stderr_bytes(self, count)
+
+    fn read_exact_bytes_ctx(ctx: Context, count: Int) -> Bytes!BlockingError:
+        return read_exact_process_stderr_bytes_ctx(self, ctx, count)
 
     fn read_all_bytes() -> Bytes!:
         return read_all_process_stderr_bytes(self)
@@ -2520,6 +3020,12 @@ impl TcpStream:
 
     fn read_bytes_ctx(ctx: Context, max_bytes: Int) -> Bytes!BlockingError:
         return tcp_stream_read_bytes_ctx(self, ctx, max_bytes)
+
+    fn read_exact_bytes(count: Int) -> Bytes!:
+        return read_exact_tcp_stream_bytes(self, count)
+
+    fn read_exact_bytes_ctx(ctx: Context, count: Int) -> Bytes!BlockingError:
+        return read_exact_tcp_stream_bytes_ctx(self, ctx, count)
 
     fn read_all_bytes() -> Bytes!:
         return read_all_tcp_stream_bytes(self)
@@ -2620,6 +3126,9 @@ impl FileStream:
     fn read_bytes(max_bytes: Int) -> Bytes!:
         return file_stream_read_bytes(self, max_bytes)
 
+    fn read_exact_bytes(count: Int) -> Bytes!:
+        return read_exact_file_stream_bytes(self, count)
+
     fn read_all_bytes() -> Bytes!:
         return read_all_file_stream_bytes(self)
 
@@ -2637,6 +3146,9 @@ impl FileStream:
 
     fn write_all_bytes(data: Bytes) -> Int!:
         return write_all_file_stream_bytes(self, data)
+
+    fn write_n_bytes(data: Bytes, count: Int) -> Int!:
+        return write_n_bytes(self, data, count)
 
     fn buffered_bytes_reader() -> BufferedBytesReader:
         return buffered_bytes_reader_from_file(self, DEFAULT_CHUNK_SIZE)

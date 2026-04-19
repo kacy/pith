@@ -12,7 +12,9 @@
 #       else:
 #           http.send_response(fd, http.not_found())
 import std.bytes as bytes
+import std.encoding as encoding
 import std.json as json_mod
+import std.net.url as url_mod
 from std.concurrent import Context, BlockingError, blocking_cancelled, blocking_deadline_exceeded, blocking_failed
 from std.io import BufferedBytesReader, BufferedBytesWriter, BufferedStringReader
 import std.io as io
@@ -100,6 +102,23 @@ fn header_with(headers: Map[String, String], name: String, value: String) -> Map
     copied := header_without(headers, name)
     copied.insert(name, value)
     return copied
+
+fn append_query_param_to_path(path: String, name: String, value: String) -> String:
+    encoded_name := url_mod.encode(name)
+    encoded_value := url_mod.encode(value)
+    mut separator := "?"
+    if path.contains("?"):
+        separator = "&"
+    return normalize_path(path) + separator + encoded_name + "=" + encoded_value
+
+fn form_component_encode(input: String) -> String:
+    return url_mod.encode(input).replace("%20", "+")
+
+fn form_encode_fields(fields: Map[String, String]) -> String:
+    mut pairs: List[String] := []
+    for key in fields:
+        pairs.push(form_component_encode(key) + "=" + form_component_encode(fields[key]))
+    return pairs.join("&")
 
 fn path_segments(path: String) -> List[String]:
     mut parts: List[String] := []
@@ -523,6 +542,11 @@ impl HttpRequestBytes:
         return self.headers_text
     fn header(name: String) -> String!:
         return header_lookup(self.header_map, name)
+    fn header_or(name: String, fallback: String) -> String:
+        value := self.header(name) catch ""
+        if value == "":
+            return fallback
+        return value
     fn body_bytes() -> Bytes:
         return self.body
     fn body_text() -> String!:
@@ -531,16 +555,29 @@ impl HttpRequestBytes:
         return self.body_text() catch fallback
     fn body_json() -> Int!:
         return parse_json_or_fail(self.body_text()!)
+    fn body_json_or(fallback: Int) -> Int:
+        return self.body_json() catch fallback
     fn matches(method_name: String, path_name: String) -> Bool!:
         return self.method()! == method_name and self.path()! == path_name
     fn is_get(path_name: String) -> Bool!:
         return self.matches("GET", path_name)!
     fn is_post(path_name: String) -> Bool!:
         return self.matches("POST", path_name)!
+    fn is_put(path_name: String) -> Bool!:
+        return self.matches("PUT", path_name)!
+    fn is_delete(path_name: String) -> Bool!:
+        return self.matches("DELETE", path_name)!
+    fn is_patch(path_name: String) -> Bool!:
+        return self.matches("PATCH", path_name)!
     fn query_param(name: String) -> String!:
         if self.query_map.contains_key(name):
             return self.query_map[name]
         return ""
+    fn query_param_or(name: String, fallback: String) -> String:
+        value := self.query_param(name) catch ""
+        if value == "":
+            return fallback
+        return value
     fn has_query_param(name: String) -> Bool!:
         return self.query_map.contains_key(name)
     fn path_parts() -> List[String]!:
@@ -549,6 +586,11 @@ impl HttpRequestBytes:
         return route_match_path(self.path_text, pattern)
     fn path_param(pattern: String, name: String) -> String!:
         return route_param_from_path(self.path_text, pattern, name)
+    fn path_param_or(pattern: String, name: String, fallback: String) -> String:
+        value := self.path_param(pattern, name) catch ""
+        if value == "":
+            return fallback
+        return value
 fn content_length_from_head_bytes(raw_head: Bytes) -> Int!:
     length_text := header_value_bytes(raw_head, "Content-Length")
     if length_text.is_empty():
@@ -640,10 +682,16 @@ fn status_line(status: Int) -> String:
         return "HTTP/1.1 200 OK" + crlf
     if status == 201:
         return "HTTP/1.1 201 Created" + crlf
+    if status == 204:
+        return "HTTP/1.1 204 No Content" + crlf
     if status == 301:
         return "HTTP/1.1 301 Moved Permanently" + crlf
     if status == 400:
         return "HTTP/1.1 400 Bad Request" + crlf
+    if status == 401:
+        return "HTTP/1.1 401 Unauthorized" + crlf
+    if status == 403:
+        return "HTTP/1.1 403 Forbidden" + crlf
     if status == 404:
         return "HTTP/1.1 404 Not Found" + crlf
     if status == 405:
@@ -695,6 +743,18 @@ pub fn json_value(status: Int, handle: Int) -> HttpResponse:
 pub fn not_found_response() -> HttpResponse:
     return html(404, "<h1>404 Not Found</h1>")
 
+# returns a standard 400 response.
+pub fn bad_request_response() -> HttpResponse:
+    return text(400, "Bad Request")
+
+# returns a standard 401 response.
+pub fn unauthorized_response() -> HttpResponse:
+    return text(401, "Unauthorized")
+
+# returns a standard 403 response.
+pub fn forbidden_response() -> HttpResponse:
+    return text(403, "Forbidden")
+
 # returns a standard 405 response.
 pub fn method_not_allowed_response() -> HttpResponse:
     return text(405, "Method Not Allowed")
@@ -702,6 +762,10 @@ pub fn method_not_allowed_response() -> HttpResponse:
 # returns a standard 500 response.
 pub fn server_error_response() -> HttpResponse:
     return html(500, "<h1>500 Internal Server Error</h1>")
+
+# returns a standard 204 response.
+pub fn no_content() -> HttpResponse:
+    return response(204)
 
 # returns a redirect response with a location header.
 pub fn redirect_response(url: String) -> HttpResponse:
@@ -725,8 +789,32 @@ impl HttpResponse:
             return self.with_body_text(json_mod.encode(handle)).header("Content-Type", MIME_JSON)
         return self.with_body_bytes(body_bytes.ok).header("Content-Type", MIME_JSON)
 
+    fn text_body(text: String) -> HttpResponse:
+        return self.with_body_text(text)
+
+    fn bytes_body(data: Bytes) -> HttpResponse:
+        return self.with_body_bytes(data)
+
+    fn json_body(handle: Int) -> HttpResponse:
+        return self.with_json(handle)
+
+    fn content_type(value: String) -> HttpResponse:
+        return self.header("Content-Type", value)
+
     fn status_code() -> Int:
         return self.status
+
+    fn status_is_ok() -> Bool:
+        return self.status == 200
+
+    fn is_success() -> Bool:
+        return self.status >= 200 and self.status < 300
+
+    fn is_client_error() -> Bool:
+        return self.status >= 400 and self.status < 500
+
+    fn is_server_error() -> Bool:
+        return self.status >= 500 and self.status < 600
 
     fn header_value(name: String) -> String:
         if header_key_matches(name, "Content-Type"):
@@ -972,13 +1060,39 @@ pub fn parse_response(raw: String) -> HttpResponse!:
 # HTTP Client
 # ===============================================================
 
+# starts building an outbound request.
 pub fn request(method: String, host: String, port: Int, url_path: String) -> ClientRequest:
     mut headers: Map[String, String] := {}
     return ClientRequest(method, host, port, normalize_path(url_path), headers, bytes.empty())
 
+# starts a get request builder.
+pub fn get_request(host: String, port: Int, url_path: String) -> ClientRequest:
+    return request("GET", host, port, url_path)
+
+# starts a post request builder.
+pub fn post_request(host: String, port: Int, url_path: String) -> ClientRequest:
+    return request("POST", host, port, url_path)
+
+# starts a put request builder.
+pub fn put_request(host: String, port: Int, url_path: String) -> ClientRequest:
+    return request("PUT", host, port, url_path)
+
+# starts a delete request builder.
+pub fn delete_request(host: String, port: Int, url_path: String) -> ClientRequest:
+    return request("DELETE", host, port, url_path)
+
 impl ClientRequest:
     fn header(name: String, value: String) -> ClientRequest:
         return ClientRequest(self.method, self.host, self.port, self.path, header_with(self.headers, name, value), self.body)
+
+    fn query_param(name: String, value: String) -> ClientRequest:
+        return ClientRequest(self.method, self.host, self.port, append_query_param_to_path(self.path, name, value), copy_headers_map(self.headers), self.body)
+
+    fn query_params(values: Map[String, String]) -> ClientRequest:
+        mut next := self
+        for key in values:
+            next = next.query_param(key, values[key])
+        return next
 
     fn body_text(text: String) -> ClientRequest:
         return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), bytes.from_string_utf8(text))
@@ -986,8 +1100,27 @@ impl ClientRequest:
     fn body_bytes(data: Bytes) -> ClientRequest:
         return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), data)
 
+    fn text_body(text: String) -> ClientRequest:
+        return self.body_text(text)
+
+    fn bytes_body(data: Bytes) -> ClientRequest:
+        return self.body_bytes(data)
+
     fn json_body(handle: Int) -> ClientRequest:
         return self.body_text(json_mod.encode(handle)).header("Content-Type", MIME_JSON)
+
+    fn form_body(fields: Map[String, String]) -> ClientRequest:
+        return self.body_text(form_encode_fields(fields)).header("Content-Type", "application/x-www-form-urlencoded")
+
+    fn accept(content_type: String) -> ClientRequest:
+        return self.header("Accept", content_type)
+
+    fn bearer(token: String) -> ClientRequest:
+        return self.header("Authorization", "Bearer " + token)
+
+    fn basic_auth(username: String, password: String) -> ClientRequest:
+        creds := username + ":" + password
+        return self.header("Authorization", "Basic " + encoding.b64_encode(bytes.from_string_utf8(creds)))
 
     fn to_bytes() -> Bytes!:
         crlf := chr(13) + chr(10)
@@ -1023,9 +1156,33 @@ impl ClientRequest:
 pub fn route_param(req: HttpRequestBytes, pattern: String, name: String) -> String!:
     return req.path_param(pattern, name)
 
+# alias for match_route() that reads a little closer to handler code.
+pub fn is_route(req: HttpRequestBytes, method_name: String, pattern: String) -> Bool!:
+    return match_route(req, method_name, pattern)
+
 # checks whether a request matches a method and route pattern.
 pub fn match_route(req: HttpRequestBytes, method_name: String, pattern: String) -> Bool!:
     return req.method()! == method_name and req.matches_path(pattern)!
+
+# checks whether a request matches a get route.
+pub fn get_route(req: HttpRequestBytes, pattern: String) -> Bool!:
+    return match_route(req, "GET", pattern)
+
+# checks whether a request matches a post route.
+pub fn post_route(req: HttpRequestBytes, pattern: String) -> Bool!:
+    return match_route(req, "POST", pattern)
+
+# checks whether a request matches a put route.
+pub fn put_route(req: HttpRequestBytes, pattern: String) -> Bool!:
+    return match_route(req, "PUT", pattern)
+
+# checks whether a request matches a delete route.
+pub fn delete_route(req: HttpRequestBytes, pattern: String) -> Bool!:
+    return match_route(req, "DELETE", pattern)
+
+# checks whether a request matches a patch route.
+pub fn patch_route(req: HttpRequestBytes, pattern: String) -> Bool!:
+    return match_route(req, "PATCH", pattern)
 
 # serves one request using a bytes reader, writer, and handler.
 pub fn serve_one(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
@@ -1057,3 +1214,11 @@ pub fn get_bytes(host: String, port: Int, url_path: String) -> Bytes!:
 # issues a simple get request and returns the response body text.
 pub fn get(host: String, port: Int, url_path: String) -> String!:
     return request("GET", host, port, url_path).send()!.body_text()
+
+# issues a simple post request with a json body.
+pub fn post_json(host: String, port: Int, url_path: String, handle: Int) -> HttpResponse!:
+    return post_request(host, port, url_path).json_body(handle).send()
+
+# issues a simple post request with a text body.
+pub fn post_text(host: String, port: Int, url_path: String, text: String) -> HttpResponse!:
+    return post_request(host, port, url_path).text_body(text).send()

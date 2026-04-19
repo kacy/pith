@@ -11,16 +11,16 @@ fn build_payload() -> Int:
     return obj
 
 fn app(req: HttpRequestBytes) -> HttpResponse:
-    if http.match_route(req, "POST", "/items/:id") catch false:
-        payload := req.body_json() catch -1
+    if http.post_route(req, "/items/:id") catch false:
+        payload := req.body_json_or(-1)
         if payload < 0:
             return http.server_error_response()
         out := json.make_object()
-        json.object_set(out, "id", json.make_string(http.route_param(req, "/items/:id", "id") catch ""))
-        json.object_set(out, "mode", json.make_string(req.query_param("mode") catch ""))
+        json.object_set(out, "id", json.make_string(req.path_param_or("/items/:id", "id", "")))
+        json.object_set(out, "mode", json.make_string(req.query_param_or("mode", "")))
         json.object_set(out, "has_empty", json.make_bool(req.has_query_param("empty") catch false))
         json.object_set(out, "kind", json.make_string(json.get_string(json.object_get(payload, "kind"))))
-        return http.json_value(201, out).header("X-Route", "item")
+        return http.response(201).json_body(out).header("X-Route", "item")
     return http.not_found_response()
 
 fn main() -> String!:
@@ -42,9 +42,17 @@ fn main() -> String!:
     print("has-empty:" + has_empty.to_string())
     print("path-match:" + path_match.to_string())
     print("path-id:" + path_id)
+    print("path-id-or:" + req.path_param_or("/items/:id", "id", "missing"))
+    print("path-miss-or:" + req.path_param_or("/other/:id", "id", "missing"))
     print("parts:" + parts.join(","))
     print("body-json-kind:" + body_kind)
     print("body-text-default:" + req.body_text_or("fallback"))
+    print("query-mode-or:" + req.query_param_or("mode", "fallback"))
+    print("query-miss-or:" + req.query_param_or("missing", "fallback"))
+    print("header-hit-or:" + req.header_or("X-Test", "fallback"))
+    print("header-miss-or:" + req.header_or("X-Missing", "fallback"))
+    print("is-put:" + (req.is_put("/items/42") catch false).to_string())
+    print("is-patch:" + (req.is_patch("/items/42") catch false).to_string())
 
     out := bytes.buffer()
     http.serve_one(io.bytes_reader(req_bytes).buffered_chunked(3), out.buffered_chunked(4), fn(inner_req: HttpRequestBytes) => app(inner_req))!
@@ -57,14 +65,35 @@ fn main() -> String!:
     print("served-route:" + served.header_value("X-Route"))
     print("served-id:" + served_id)
     print("served-empty:" + served_empty.to_string())
+    print("served-success:" + served.is_success().to_string())
+    print("served-status-ok:" + served.status_is_ok().to_string())
+    print("bad-request-client-error:" + http.bad_request_response().is_client_error().to_string())
+    print("server-error-server-error:" + http.server_error_response().is_server_error().to_string())
+    print("no-content-status:" + http.no_content().status_code().to_string())
+    print("forbidden-status:" + http.forbidden_response().status_code().to_string())
 
-    mut client_builder := http.request("PUT", "api.example", 8080, "/v1/items")
+    mut client_builder := http.put_request("api.example", 8080, "/v1/items")
     client_builder = client_builder.header("X-Test", "yes")
-    client_builder = client_builder.body_text("ping")
+    client_builder = client_builder.accept("application/json")
+    client_builder = client_builder.bearer("abc123")
+    client_builder = client_builder.text_body("ping")
+    client_builder = client_builder.query_param("mode", "fast path")
     client_req_bytes := client_builder.to_bytes()!
     client_req := http.read_request_buffered_bytes(io.bytes_reader(client_req_bytes).buffered_chunked(5))!
     print("client-method:" + client_req.method()!)
     print("client-path:" + client_req.path()!)
+    print("client-query-mode:" + client_req.query_param_or("mode", ""))
     print("client-header:" + client_req.header("X-Test")!)
+    print("client-accept:" + client_req.header("Accept")!)
+    print("client-auth:" + client_req.header("Authorization")!)
     print("client-body:" + client_req.body_text()!)
+
+    mut form_fields: Map[String, String] := {}
+    form_fields.insert("name", "forge cli")
+    form_req := http.post_request("api.example", 8080, "/submit").basic_auth("user", "pass").form_body(form_fields)
+    form_req_bytes := form_req.to_bytes()!
+    form_http_req := http.read_request_buffered_bytes(io.bytes_reader(form_req_bytes).buffered_chunked(5))!
+    print("form-type:" + form_http_req.header("Content-Type")!)
+    print("form-auth:" + form_http_req.header("Authorization")!)
+    print("form-body:" + form_http_req.body_text()!)
     return ""

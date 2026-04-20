@@ -224,3 +224,25 @@ pub fn rel(base_path: String, target_path: String) -> String:
     if rel_parts.len() == 0:
         return "."
     return join_all(rel_parts)
+
+test "join and clean normalize path segments":
+    assert_eq(join("src/", "/main.fg"), "src/main.fg")
+    assert_eq(join_all(["src", "pkg", "main.fg"]), "src/pkg/main.fg")
+    assert_eq(clean("src//pkg/./main.fg"), "src/pkg/main.fg")
+    assert_eq(clean("/tmp/../var/"), "/var")
+
+test "path components split names":
+    assert_eq(dir("/tmp/forge/main.fg"), "/tmp/forge")
+    assert_eq(base("/tmp/forge/main.fg"), "main.fg")
+    assert_eq(ext("/tmp/forge/main.fg"), ".fg")
+    assert_eq(stem("/tmp/forge/main.fg"), "main")
+
+test "extension helpers replace suffixes":
+    assert(without_ext("main.fg") == "main")
+    assert_eq(with_ext("main", "fg"), "main.fg")
+    assert_eq(with_ext("/tmp/main.fg", ".c"), "/tmp/main.c")
+
+test "relative paths compare cleaned segments":
+    assert_eq(rel("src/pkg", "src/pkg/main.fg"), "main.fg")
+    assert_eq(rel("src/pkg", "src/lib/main.fg"), "../lib/main.fg")
+    assert_eq(rel("/src/pkg", "src/pkg"), "src/pkg")

@@ -211,3 +211,29 @@ pub fn get_int_or(row: Map[String, String], column: String, fallback: Int) -> In
     if parsed.is_err:
         return fallback
     return parsed.ok
+
+test "tables can be built from positional rows":
+    table := from_rows(["name", "age"], [["ada", "37"], ["grace"]])
+    assert_eq(row_count(table), 2)
+    assert_eq(column_count(table), 2)
+    assert_eq(get(table.rows[0], "name"), "ada")
+    assert_eq(get(table.rows[1], "age"), "")
+    assert_eq(get_int_or(table.rows[0], "age", 0), 37)
+
+test "table column operations keep row values":
+    table := from_rows(["name", "team"], [["ada", "blue"], ["grace", "red"]])
+    selected := select_columns(table, ["team"])!
+    counts := group_count(table, "team")!
+
+    assert_eq(column_count(selected), 1)
+    assert_eq(get(selected.rows[0], "team"), "blue")
+    assert_eq(counts["blue"], 1)
+    assert_eq(counts["red"], 1)
+
+test "tables support derived rows":
+    table := from_rows(["name", "age"], [["ada", "37"], ["grace", "85"]])
+    labelled := with_column(table, "label", fn(row: Map[String, String]) => get(row, "name") + ":" + get(row, "age"))
+
+    assert_eq(row_count(labelled), 2)
+    assert_eq(get(labelled.rows[0], "label"), "ada:37")
+    assert_eq(get(labelled.rows[1], "label"), "grace:85")

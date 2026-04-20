@@ -1,4 +1,4 @@
-.PHONY: build self-host bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -56,6 +56,9 @@ build:
 self-host: build
 	./target/release/forge build self-host/forge_main.fg
 
+self-host-ir-driver: build
+	./target/release/forge build self-host/ir_driver.fg
+
 # rebuild the self-hosted compiler using the Cranelift-compiled version of itself
 bootstrap: self-host
 	@echo "--- stage 1: compile with current Cranelift binary ---"
@@ -67,6 +70,9 @@ bootstrap: self-host
 bootstrap-verify: self-host
 	@echo "--- verifying self-hosted compiler on deterministic examples ---"
 	@$(MAKE) --no-print-directory run-examples-self-only
+	@$(MAKE) --no-print-directory self-host-ir-driver
+	@echo "--- verifying colocated std tests ---"
+	@$(MAKE) --no-print-directory test-std-self-only
 	@echo "--- verifying self-hosted compiler on regression cases ---"
 	@$(MAKE) --no-print-directory run-regressions-self-only
 	@$(MAKE) --no-print-directory bootstrap-ir-checks-only
@@ -272,6 +278,53 @@ run-regressions-self-only:
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-hosted regression cases passed"
+
+test-std-self: self-host self-host-ir-driver test-std-self-only
+
+test-std-self-only:
+	@echo "--- colocated std tests (self-hosted compiler) ---"
+	@pass=0; fail=0; \
+	files=$$(find std -name '*.fg' -print | sort); \
+	for f in $$files; do \
+		if ! grep -q '^[[:space:]]*test "' "$$f"; then \
+			continue; \
+		fi; \
+		if timeout 60 ./self-host/forge_main test "$$f" >/tmp/forge-test-out 2>&1; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$f"; \
+		else \
+			echo "FAIL $$f"; \
+			cat /tmp/forge-test-out; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi
+
+test-self-host-only:
+	@echo "--- colocated self-host tests ---"
+	@pass=0; fail=0; \
+	files=$$(find self-host -name '*.fg' -print | sort); \
+	for f in $$files; do \
+		if ! grep -q '^[[:space:]]*test "' "$$f"; then \
+			continue; \
+		fi; \
+		if timeout 60 ./self-host/forge_main test "$$f" >/tmp/forge-test-out 2>&1; then \
+			pass=$$((pass+1)); \
+			echo "ok   $$f"; \
+		else \
+			echo "FAIL $$f"; \
+			cat /tmp/forge-test-out; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo "$$pass passed, $$fail failed"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi
+
+test-fast-self: self-host self-host-ir-driver
+	@$(MAKE) --no-print-directory test-std-self-only
+	@$(MAKE) --no-print-directory test-self-host-only
+	@$(MAKE) --no-print-directory run-regressions-self-only
 
 run-live-websocket-tests: build
 	@echo "--- live websocket smoke tests (Cranelift backend) ---"

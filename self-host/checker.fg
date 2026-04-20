@@ -3265,6 +3265,8 @@ fn check_try_expression(node: Node, scope_id: Int) -> Int:
         return TID_ERR
     info := get_type_info(inner)
     if info.kind == "result":
+        if checking_test_decl:
+            return info.inner
         # verify enclosing function also returns a result
         ret := get_scope_return_type(scope_id)
         if ret < 0:

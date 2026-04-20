@@ -94,6 +94,7 @@ mut ir_current_func_return_kind := ""
 mut ir_preloaded_import_roots: List[Int] := []
 mut ir_preloaded_import_paths: List[String] := []
 mut ir_emit_tests := false
+mut ir_emitting_test_func := false
 mut ir_generic_decl_indices: Map[String, Int] := {}
 mut ir_generic_decl_module_paths: Map[String, String] := {}
 mut ir_generic_specialization_keys: List[String] := []
@@ -1814,6 +1815,12 @@ fn ir_test_assert_fail():
     exit_r := ir_reg()
     ir_emit_call1(exit_r, "exit", "unknown", one_r)
 
+fn ir_test_assert_fail_return():
+    ir_test_assert_fail()
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    ir_emit("ret " + one_r.to_string())
+
 fn ir_assert_eq_operand_type(node: Node, child_idx: Int) -> String:
     if node.children.len() <= child_idx:
         return ""
@@ -2733,7 +2740,10 @@ fn ir_emit_try_expr(node: Node) -> Int:
             decoded_r := ir_emit_result_value_field(val_r, c_get_expr_type(node.children[0]), "ok")
             ir_emit("jmp " + merge_l)
             ir_emit("label " + err_l)
-            ir_emit("ret " + val_r.to_string())
+            if ir_emit_tests and ir_emitting_test_func:
+                ir_test_assert_fail_return()
+            else:
+                ir_emit("ret " + val_r.to_string())
             ir_emit("label " + merge_l)
             return decoded_r
         mut cond_r := val_r
@@ -2755,9 +2765,12 @@ fn ir_emit_try_expr(node: Node) -> Int:
         ir_emit("label " + ok_l)
         ir_emit("jmp " + merge_l)
         ir_emit("label " + err_l)
-        zero := ir_reg()
-        ir_emit("iconst " + zero.to_string() + " 0")
-        ir_emit("ret " + zero.to_string())
+        if ir_emit_tests and ir_emitting_test_func:
+            ir_test_assert_fail_return()
+        else:
+            zero := ir_reg()
+            ir_emit("iconst " + zero.to_string() + " 0")
+            ir_emit("ret " + zero.to_string())
         ir_emit("label " + merge_l)
         return decoded_r
     r := ir_reg()
@@ -3768,7 +3781,9 @@ fn ir_emit_test_func(idx: Int, ordinal: Int):
     body_idx := ir_find_body(idx)
     ir_prepare_func_emission("int")
     ir_emit_func_header("__test_" + ordinal.to_string(), 0, "int")
+    ir_emitting_test_func = true
     ir_finish_func_emission(body_idx)
+    ir_emitting_test_func = false
 
 fn ir_emit_test_main(root_idx: Int):
     tests := ir_collect_test_decls(root_idx)
@@ -4103,6 +4118,7 @@ fn ir_finish_module_emit():
     ir_preloaded_import_roots = []
     ir_preloaded_import_paths = []
     ir_emit_tests = false
+    ir_emitting_test_func = false
 
 # --- main entry ---
 pub fn emit_ir(root_idx: Int) -> String:

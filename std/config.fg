@@ -338,3 +338,37 @@ pub fn get_float_or(cfg: Config, key: String, fallback: Float) -> Float:
     if parsed.is_err:
         return fallback
     return parsed.ok
+
+test "config maps copy values and expose lookups":
+    mut values: Map[String, String] := {}
+    values.insert("host", "localhost")
+    values.insert("port", "8080")
+    cfg := from_map(values)
+    values.insert("host", "changed")
+
+    assert(has(cfg, "host"))
+    assert_eq(get(cfg, "host"), "localhost")
+    assert_eq(get_or(cfg, "missing", "fallback"), "fallback")
+    assert_eq(get_int_or(cfg, "port", 0), 8080)
+
+test "config merge prefers overrides":
+    mut base_values: Map[String, String] := {}
+    base_values.insert("host", "localhost")
+    base_values.insert("port", "8080")
+    mut override_values: Map[String, String] := {}
+    override_values.insert("port", "9090")
+    override_values.insert("debug", "true")
+
+    cfg := merge(from_map(base_values), from_map(override_values))
+    assert_eq(get(cfg, "host"), "localhost")
+    assert_eq(get_int_or(cfg, "port", 0), 9090)
+    assert_eq(get_bool_or(cfg, "debug", false), true)
+
+test "config flattens json and toml text":
+    json_cfg := from_json(chr(123) + chr(34) + "server" + chr(34) + ":" + chr(123) + chr(34) + "host" + chr(34) + ":" + chr(34) + "localhost" + chr(34) + "," + chr(34) + "port" + chr(34) + ":8080" + chr(125) + chr(125))!
+    toml_cfg := from_toml("[server]" + chr(10) + "host = " + chr(34) + "localhost" + chr(34) + chr(10) + "debug = true")!
+
+    assert_eq(get(json_cfg, "server.host"), "localhost")
+    assert_eq(get_int_or(json_cfg, "server.port", 0), 8080)
+    assert_eq(get(toml_cfg, "server.host"), "localhost")
+    assert_eq(get_bool_or(toml_cfg, "server.debug", false), true)

@@ -1,0 +1,40 @@
+# std.compress.gzip — gzip helpers
+#
+# the current implementation writes portable gzip streams with stored
+# deflate blocks. that means the output is valid gzip, but this first
+# slice favors compatibility over smaller files.
+
+import std.bytes as bytes
+import std.fs as fs
+
+# compress bytes into a gzip stream.
+pub fn compress(data: Bytes) -> Bytes:
+    return gzip_compress(data)
+
+# decompress a gzip stream created with stored deflate blocks.
+pub fn decompress(data: Bytes) -> Bytes!:
+    if not is_valid(data):
+        fail "invalid gzip data"
+    return gzip_decompress(data)
+
+# true when the data is a gzip stream this module can read.
+pub fn is_valid(data: Bytes) -> Bool:
+    return gzip_validate(data)
+
+# compress utf-8 text into gzip bytes.
+pub fn compress_string(text: String) -> Bytes:
+    return compress(bytes.from_string_utf8(text))
+
+# decompress gzip bytes and decode the result as utf-8 text.
+pub fn decompress_string(data: Bytes) -> String!:
+    return decompress(data)!.to_string_utf8()!
+
+# read one file, gzip it, and write the output file.
+pub fn compress_file(from_path: String, to_path: String) -> Bool!:
+    source := fs.read_bytes(from_path)!
+    return fs.write_bytes(to_path, compress(source))
+
+# read one gzip file, decompress it, and write the output file.
+pub fn decompress_file(from_path: String, to_path: String) -> Bool!:
+    archive := fs.read_bytes(from_path)!
+    return fs.write_bytes(to_path, decompress(archive)!)

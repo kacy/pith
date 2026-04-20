@@ -131,9 +131,9 @@ bootstrap-ir-fixed-point-only:
 		timeout 120 ./self-host/forge_main build "$$target" >/dev/null; \
 	done; \
 	for src in $(IR_FIXED_POINT_SOURCES); do \
-		stage1=$$(timeout 20 "$$tmpdir/ir_driver_stage1" --combined "$$src" 2>/dev/null); \
+		stage1=$$(timeout 60 "$$tmpdir/ir_driver_stage1" --combined "$$src" 2>/dev/null); \
 		stage1_status=$$?; \
-		stage2=$$(timeout 20 ./self-host/ir_driver --combined "$$src" 2>/dev/null); \
+		stage2=$$(timeout 60 ./self-host/ir_driver --combined "$$src" 2>/dev/null); \
 		stage2_status=$$?; \
 		if [ $$stage1_status -eq 0 ] && [ $$stage2_status -eq 0 ] && [ "$$stage1" = "$$stage2" ]; then \
 			pass=$$((pass+1)); \

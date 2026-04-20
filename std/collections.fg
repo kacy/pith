@@ -466,7 +466,25 @@ pub fn sort_by[T](items: List[T], less: fn(T, T) -> Bool) -> List[T]:
 
 # return a sorted copy using an integer sort key.
 pub fn sort_by_key[T](items: List[T], key_fn: fn(T) -> Int) -> List[T]:
-    return sorted_by(items, fn(left: T, right: T) => key_fn(left) < key_fn(right))
+    mut result: List[T] := []
+    mut used: Set[Int] := {}
+    while result.len() < items.len():
+        mut found := false
+        mut best_idx := 0
+        mut best_key := 0
+        for item, i in items:
+            if used.contains(i):
+                continue
+            item_key := key_fn(item)
+            if not found or item_key < best_key:
+                best_idx = i
+                best_key = item_key
+                found = true
+        if not found:
+            return result
+        result.push(items[best_idx])
+        used.add(best_idx)
+    return result
 
 # return the item with the smallest integer key.
 pub fn min_by[T](items: List[T], key_fn: fn(T) -> Int) -> T!CollectionError:

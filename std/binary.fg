@@ -1,0 +1,203 @@
+# std.binary — byte-order readers and writers
+#
+# this module keeps binary format code out of ad hoc bit twiddling.
+# readers are handle-backed so reads can advance a cursor.
+
+import std.bytes as bytes
+
+mut next_reader_handle := 1
+mut reader_data: Map[Int, Bytes] := {}
+mut reader_positions: Map[Int, Int] := {}
+
+## error returned when a binary reader runs out of bytes or sees bad input.
+pub struct BinaryError:
+    pub message: String
+
+# cursor over a bytes value.
+pub struct Reader:
+    pub handle: Int
+
+fn binary_fail(message: String) -> BinaryError:
+    return BinaryError(message)
+
+fn reader_bytes(reader: Reader) -> Bytes:
+    if reader_data.contains_key(reader.handle):
+        return reader_data[reader.handle]
+    return bytes.empty()
+
+fn reader_pos(reader: Reader) -> Int:
+    if reader_positions.contains_key(reader.handle):
+        return reader_positions[reader.handle]
+    return 0
+
+fn set_reader_pos(reader: Reader, position: Int):
+    reader_positions.insert(reader.handle, position)
+
+fn check_range(value: Int, max_value: Int, name: String) -> Int!BinaryError:
+    if value < 0 or value > max_value:
+        fail binary_fail(name + " out of range")
+    return value
+
+fn write_byte_checked(out: ByteBuffer, value: Int) -> Int!BinaryError:
+    wrote := out.write_byte(value)
+    if wrote.is_err:
+        fail binary_fail(wrote.err)
+    return wrote.ok
+
+fn read_at(data: Bytes, offset: Int) -> Int!BinaryError:
+    if offset < 0 or offset >= data.len():
+        fail binary_fail("unexpected end of bytes")
+    return data[offset]
+
+# make a reader for a bytes value.
+pub fn reader(data: Bytes) -> Reader:
+    handle := next_reader_handle
+    next_reader_handle = next_reader_handle + 1
+    reader_data.insert(handle, data)
+    reader_positions.insert(handle, 0)
+    return Reader(handle)
+
+# return the current cursor position.
+pub fn position(reader: Reader) -> Int:
+    return reader_pos(reader)
+
+# return bytes remaining from the current cursor.
+pub fn remaining(reader: Reader) -> Int:
+    data := reader_bytes(reader)
+    pos := reader_pos(reader)
+    if pos >= data.len():
+        return 0
+    return data.len() - pos
+
+# skip bytes from the current cursor.
+pub fn skip(reader: Reader, count: Int) -> Bool!BinaryError:
+    if count < 0:
+        fail binary_fail("skip count out of range")
+    if remaining(reader) < count:
+        fail binary_fail("unexpected end of bytes")
+    set_reader_pos(reader, reader_pos(reader) + count)
+    return true
+
+# read one byte at an absolute offset.
+pub fn read_u8_at(data: Bytes, offset: Int) -> Int!BinaryError:
+    return read_at(data, offset)
+
+# read a little-endian u16 at an absolute offset.
+pub fn read_u16_le_at(data: Bytes, offset: Int) -> Int!BinaryError:
+    b0 := read_at(data, offset)!
+    b1 := read_at(data, offset + 1)!
+    return b0 + bit_shl(b1, 8)
+
+# read a big-endian u16 at an absolute offset.
+pub fn read_u16_be_at(data: Bytes, offset: Int) -> Int!BinaryError:
+    b0 := read_at(data, offset)!
+    b1 := read_at(data, offset + 1)!
+    return bit_shl(b0, 8) + b1
+
+# read a little-endian u32 at an absolute offset.
+pub fn read_u32_le_at(data: Bytes, offset: Int) -> Int!BinaryError:
+    b0 := read_at(data, offset)!
+    b1 := read_at(data, offset + 1)!
+    b2 := read_at(data, offset + 2)!
+    b3 := read_at(data, offset + 3)!
+    return b0 + bit_shl(b1, 8) + bit_shl(b2, 16) + bit_shl(b3, 24)
+
+# read a big-endian u32 at an absolute offset.
+pub fn read_u32_be_at(data: Bytes, offset: Int) -> Int!BinaryError:
+    b0 := read_at(data, offset)!
+    b1 := read_at(data, offset + 1)!
+    b2 := read_at(data, offset + 2)!
+    b3 := read_at(data, offset + 3)!
+    return bit_shl(b0, 24) + bit_shl(b1, 16) + bit_shl(b2, 8) + b3
+
+# read one byte and advance the cursor.
+pub fn read_u8(reader: Reader) -> Int!BinaryError:
+    pos := reader_pos(reader)
+    value := read_u8_at(reader_bytes(reader), pos)!
+    set_reader_pos(reader, pos + 1)
+    return value
+
+# read a little-endian u16 and advance the cursor.
+pub fn read_u16_le(reader: Reader) -> Int!BinaryError:
+    pos := reader_pos(reader)
+    value := read_u16_le_at(reader_bytes(reader), pos)!
+    set_reader_pos(reader, pos + 2)
+    return value
+
+# read a big-endian u16 and advance the cursor.
+pub fn read_u16_be(reader: Reader) -> Int!BinaryError:
+    pos := reader_pos(reader)
+    value := read_u16_be_at(reader_bytes(reader), pos)!
+    set_reader_pos(reader, pos + 2)
+    return value
+
+# read a little-endian u32 and advance the cursor.
+pub fn read_u32_le(reader: Reader) -> Int!BinaryError:
+    pos := reader_pos(reader)
+    value := read_u32_le_at(reader_bytes(reader), pos)!
+    set_reader_pos(reader, pos + 4)
+    return value
+
+# read a big-endian u32 and advance the cursor.
+pub fn read_u32_be(reader: Reader) -> Int!BinaryError:
+    pos := reader_pos(reader)
+    value := read_u32_be_at(reader_bytes(reader), pos)!
+    set_reader_pos(reader, pos + 4)
+    return value
+
+# read bytes and advance the cursor.
+pub fn read_bytes(reader: Reader, count: Int) -> Bytes!BinaryError:
+    if count < 0:
+        fail binary_fail("byte count out of range")
+    pos := reader_pos(reader)
+    data := reader_bytes(reader)
+    if pos + count > data.len():
+        fail binary_fail("unexpected end of bytes")
+    set_reader_pos(reader, pos + count)
+    return data.slice(pos, pos + count)
+
+# read through the next zero byte, excluding the zero byte.
+pub fn read_until_zero(reader: Reader) -> Bytes!BinaryError:
+    data := reader_bytes(reader)
+    pos := reader_pos(reader)
+    mut end := pos
+    while end < data.len():
+        if data[end] == 0:
+            out := data.slice(pos, end)
+            set_reader_pos(reader, end + 1)
+            return out
+        end = end + 1
+    fail binary_fail("zero terminator not found")
+
+# write one byte to a byte buffer.
+pub fn write_u8(out: ByteBuffer, value: Int) -> Int!BinaryError:
+    checked := check_range(value, 255, "u8")!
+    return write_byte_checked(out, checked)
+
+# write a little-endian u16 to a byte buffer.
+pub fn write_u16_le(out: ByteBuffer, value: Int) -> Int!BinaryError:
+    checked := check_range(value, 65535, "u16")!
+    wrote := write_byte_checked(out, bit_and(checked, 255))!
+    return wrote + write_byte_checked(out, bit_and(bit_shr(checked, 8), 255))!
+
+# write a big-endian u16 to a byte buffer.
+pub fn write_u16_be(out: ByteBuffer, value: Int) -> Int!BinaryError:
+    checked := check_range(value, 65535, "u16")!
+    wrote := write_byte_checked(out, bit_and(bit_shr(checked, 8), 255))!
+    return wrote + write_byte_checked(out, bit_and(checked, 255))!
+
+# write a little-endian u32 to a byte buffer.
+pub fn write_u32_le(out: ByteBuffer, value: Int) -> Int!BinaryError:
+    checked := check_range(value, 4294967295, "u32")!
+    mut wrote := write_byte_checked(out, bit_and(checked, 255))!
+    wrote = wrote + write_byte_checked(out, bit_and(bit_shr(checked, 8), 255))!
+    wrote = wrote + write_byte_checked(out, bit_and(bit_shr(checked, 16), 255))!
+    return wrote + write_byte_checked(out, bit_and(bit_shr(checked, 24), 255))!
+
+# write a big-endian u32 to a byte buffer.
+pub fn write_u32_be(out: ByteBuffer, value: Int) -> Int!BinaryError:
+    checked := check_range(value, 4294967295, "u32")!
+    mut wrote := write_byte_checked(out, bit_and(bit_shr(checked, 24), 255))!
+    wrote = wrote + write_byte_checked(out, bit_and(bit_shr(checked, 16), 255))!
+    wrote = wrote + write_byte_checked(out, bit_and(bit_shr(checked, 8), 255))!
+    return wrote + write_byte_checked(out, bit_and(checked, 255))!

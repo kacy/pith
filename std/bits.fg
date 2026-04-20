@@ -1,0 +1,61 @@
+# std.bits — small bit manipulation helpers
+#
+# this is a named wrapper around the existing bit builtins. we keep
+# these as functions because `|` is already forge's pipe operator.
+
+fn bits_mask(value: Int, mask: Int) -> Int:
+    return bit_and(value, mask)
+
+# bitwise and.
+pub fn band(left: Int, right: Int) -> Int:
+    return bit_and(left, right)
+
+# bitwise or.
+pub fn bor(left: Int, right: Int) -> Int:
+    return bit_or(left, right)
+
+# bitwise xor.
+pub fn xor(left: Int, right: Int) -> Int:
+    return bit_xor(left, right)
+
+# bitwise not.
+pub fn invert(value: Int) -> Int:
+    return bit_not(value)
+
+# shift left.
+pub fn shl(value: Int, amount: Int) -> Int:
+    return bit_shl(value, amount)
+
+# shift right with zero fill.
+pub fn shr(value: Int, amount: Int) -> Int:
+    return bit_shr(value, amount)
+
+# keep the low 8 bits.
+pub fn mask8(value: Int) -> Int:
+    return bits_mask(value, 255)
+
+# keep the low 16 bits.
+pub fn mask16(value: Int) -> Int:
+    return bits_mask(value, 65535)
+
+# keep the low 32 bits.
+pub fn mask32(value: Int) -> Int:
+    return bits_mask(value, 4294967295)
+
+# keep the low 64 bits.
+pub fn mask64(value: Int) -> Int:
+    return value
+
+# rotate a 32-bit value left.
+pub fn rotl32(value: Int, amount: Int) -> Int:
+    n := amount % 32
+    if n == 0:
+        return mask32(value)
+    return mask32(bit_or(bit_shl(value, n), bit_shr(value, 32 - n)))
+
+# rotate a 32-bit value right.
+pub fn rotr32(value: Int, amount: Int) -> Int:
+    n := amount % 32
+    if n == 0:
+        return mask32(value)
+    return mask32(bit_or(bit_shr(value, n), bit_shl(value, 32 - n)))

@@ -10,12 +10,13 @@
 #   bucket := hash.fnv1a_string("key") % 64
 
 import std.bytes as bytes
+import std.bits as bits
 
 fn mask32(value: Int) -> Int:
-    return bit_and(value, 4294967295)
+    return bits.mask32(value)
 
-fn rotate_right(value: Int, bits: Int) -> Int:
-    return mask32(bit_or(bit_shr(value, bits), bit_shl(value, 32 - bits)))
+fn rotate_right(value: Int, amount: Int) -> Int:
+    return bits.rotr32(value, amount)
 
 mut sha256_round_constants: List[Int] := []
 mut constants_initialized: Bool := false
@@ -94,7 +95,7 @@ fn word32_to_hex(val: Int) -> String:
     mut result := ""
     mut i := 0
     while i < 8:
-        nibble := bit_and(bit_shr(val, 28 - i * 4), 15)
+        nibble := bits.band(bits.shr(val, 28 - i * 4), 15)
         result = result + hex[nibble]
         i = i + 1
     return result
@@ -123,14 +124,14 @@ pub fn sha256(input: Bytes) -> String:
         msg.push(0)
 
     bit_len := input.len() * 8
-    msg.push(bit_and(bit_shr(bit_len, 56), 255))
-    msg.push(bit_and(bit_shr(bit_len, 48), 255))
-    msg.push(bit_and(bit_shr(bit_len, 40), 255))
-    msg.push(bit_and(bit_shr(bit_len, 32), 255))
-    msg.push(bit_and(bit_shr(bit_len, 24), 255))
-    msg.push(bit_and(bit_shr(bit_len, 16), 255))
-    msg.push(bit_and(bit_shr(bit_len, 8), 255))
-    msg.push(bit_and(bit_len, 255))
+    msg.push(bits.mask8(bits.shr(bit_len, 56)))
+    msg.push(bits.mask8(bits.shr(bit_len, 48)))
+    msg.push(bits.mask8(bits.shr(bit_len, 40)))
+    msg.push(bits.mask8(bits.shr(bit_len, 32)))
+    msg.push(bits.mask8(bits.shr(bit_len, 24)))
+    msg.push(bits.mask8(bits.shr(bit_len, 16)))
+    msg.push(bits.mask8(bits.shr(bit_len, 8)))
+    msg.push(bits.mask8(bit_len))
 
     mut block := 0
     while block < msg.len():
@@ -142,8 +143,8 @@ pub fn sha256(input: Bytes) -> String:
             w.push(word)
             i = i + 1
         while i < 64:
-            s0 := bit_xor(bit_xor(rotate_right(w[i - 15], 7), rotate_right(w[i - 15], 18)), bit_shr(w[i - 15], 3))
-            s1 := bit_xor(bit_xor(rotate_right(w[i - 2], 17), rotate_right(w[i - 2], 19)), bit_shr(w[i - 2], 10))
+            s0 := bits.xor(bits.xor(rotate_right(w[i - 15], 7), rotate_right(w[i - 15], 18)), bits.shr(w[i - 15], 3))
+            s1 := bits.xor(bits.xor(rotate_right(w[i - 2], 17), rotate_right(w[i - 2], 19)), bits.shr(w[i - 2], 10))
             w.push(mask32(w[i - 16] + s0 + w[i - 7] + s1))
             i = i + 1
 
@@ -158,11 +159,11 @@ pub fn sha256(input: Bytes) -> String:
 
         i = 0
         while i < 64:
-            s1 := bit_xor(bit_xor(rotate_right(e, 6), rotate_right(e, 11)), rotate_right(e, 25))
-            ch := bit_xor(bit_and(e, f), bit_and(mask32(bit_not(e)), g))
+            s1 := bits.xor(bits.xor(rotate_right(e, 6), rotate_right(e, 11)), rotate_right(e, 25))
+            ch := bits.xor(bits.band(e, f), bits.band(mask32(bits.invert(e)), g))
             temp1 := mask32(h + s1 + ch + sha256_round_constants[i] + w[i])
-            s0 := bit_xor(bit_xor(rotate_right(a, 2), rotate_right(a, 13)), rotate_right(a, 22))
-            maj := bit_xor(bit_xor(bit_and(a, b), bit_and(a, c)), bit_and(b, c))
+            s0 := bits.xor(bits.xor(rotate_right(a, 2), rotate_right(a, 13)), rotate_right(a, 22))
+            maj := bits.xor(bits.xor(bits.band(a, b), bits.band(a, c)), bits.band(b, c))
             temp2 := mask32(s0 + maj)
             h = g
             g = f
@@ -201,8 +202,8 @@ pub fn fnv1a(input: Bytes) -> Int:
     mut h := 2166136261
     mut i := 0
     while i < input.len():
-        h = bit_xor(h, input[i])
-        h = bit_and(h * 16777619, 4294967295)
+        h = bits.xor(h, input[i])
+        h = bits.mask32(h * 16777619)
         i = i + 1
     return h
 
@@ -222,10 +223,10 @@ K2 := 2400959708
 K3 := 3395469782
 
 fn rotl32(x: Int, n: Int) -> Int:
-    return mask32(bit_or(bit_shl(x, n), bit_shr(x, 32 - n)))
+    return bits.rotl32(x, n)
 
 fn add32(a: Int, b: Int) -> Int:
-    return bit_and(a + b, 4294967295)
+    return bits.mask32(a + b)
 
 ## hash bytes with sha-1.
 pub fn sha1(input: Bytes) -> String:
@@ -246,14 +247,14 @@ pub fn sha1(input: Bytes) -> String:
         msg.push(0)
 
     bit_len := input.len() * 8
-    msg.push(bit_and(bit_shr(bit_len, 56), 255))
-    msg.push(bit_and(bit_shr(bit_len, 48), 255))
-    msg.push(bit_and(bit_shr(bit_len, 40), 255))
-    msg.push(bit_and(bit_shr(bit_len, 32), 255))
-    msg.push(bit_and(bit_shr(bit_len, 24), 255))
-    msg.push(bit_and(bit_shr(bit_len, 16), 255))
-    msg.push(bit_and(bit_shr(bit_len, 8), 255))
-    msg.push(bit_and(bit_len, 255))
+    msg.push(bits.mask8(bits.shr(bit_len, 56)))
+    msg.push(bits.mask8(bits.shr(bit_len, 48)))
+    msg.push(bits.mask8(bits.shr(bit_len, 40)))
+    msg.push(bits.mask8(bits.shr(bit_len, 32)))
+    msg.push(bits.mask8(bits.shr(bit_len, 24)))
+    msg.push(bits.mask8(bits.shr(bit_len, 16)))
+    msg.push(bits.mask8(bits.shr(bit_len, 8)))
+    msg.push(bits.mask8(bit_len))
 
     mut block := 0
     while block < msg.len():
@@ -266,7 +267,7 @@ pub fn sha1(input: Bytes) -> String:
 
         i = 16
         while i < 80:
-            w.push(rotl32(bit_xor(bit_xor(bit_xor(w[i - 3], w[i - 8]), w[i - 14]), w[i - 16]), 1))
+            w.push(rotl32(bits.xor(bits.xor(bits.xor(w[i - 3], w[i - 8]), w[i - 14]), w[i - 16]), 1))
             i = i + 1
 
         mut a := h0
@@ -281,16 +282,16 @@ pub fn sha1(input: Bytes) -> String:
             mut k := 0
 
             if i < 20:
-                f = bit_or(bit_and(b, c), bit_and(bit_not(b), d))
+                f = bits.bor(bits.band(b, c), bits.band(bits.invert(b), d))
                 k = K0
             elif i < 40:
-                f = bit_xor(bit_xor(b, c), d)
+                f = bits.xor(bits.xor(b, c), d)
                 k = K1
             elif i < 60:
-                f = bit_or(bit_or(bit_and(b, c), bit_and(b, d)), bit_and(c, d))
+                f = bits.bor(bits.bor(bits.band(b, c), bits.band(b, d)), bits.band(c, d))
                 k = K2
             else:
-                f = bit_xor(bit_xor(b, c), d)
+                f = bits.xor(bits.xor(b, c), d)
                 k = K3
 
             temp := add32(add32(add32(add32(rotl32(a, 5), f), e), k), w[i])

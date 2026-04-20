@@ -9,6 +9,8 @@
 #       return 0
 #   client := websocket.dial("127.0.0.1", 8080, "/chat")!
 import std.bytes as bytes
+import std.binary as bin
+import std.bits as bits
 import std.hash as hash
 import std.encoding as encoding
 import std.net.http as http
@@ -365,9 +367,9 @@ impl WebSocketFrame:
             return ""
         return self.payload.slice(2, self.payload.len()).to_string_utf8()!
 fn frame_is_masked(second_byte: Int) -> Bool:
-    return bit_and(second_byte, 128) != 0
+    return bits.band(second_byte, 128) != 0
 fn frame_length_code(second_byte: Int) -> Int:
-    return bit_and(second_byte, 127)
+    return bits.band(second_byte, 127)
 fn frame_extended_length_size(second_byte: Int) -> Int!:
     length_code := frame_length_code(second_byte)
     if length_code == 126:
@@ -378,17 +380,18 @@ fn frame_extended_length_size(second_byte: Int) -> Int!:
 fn append_frame_length(buf: ByteBuffer, payload_len: Int, masked: Bool) -> Int!:
     mut len_byte := payload_len
     if masked:
-        len_byte = bit_or(len_byte, 128)
+        len_byte = bits.bor(len_byte, 128)
     if payload_len < 126:
         buf.write_byte(len_byte)!
         return 1
     if payload_len <= 65535:
         mut ext_len_marker := 126
         if masked:
-            ext_len_marker = bit_or(ext_len_marker, 128)
+            ext_len_marker = bits.bor(ext_len_marker, 128)
         buf.write_byte(ext_len_marker)!
-        buf.write_byte(bit_and(bit_shr(payload_len, 8), 255))!
-        buf.write_byte(bit_and(payload_len, 255))!
+        wrote := bin.write_u16_be(buf, payload_len)
+        if wrote.is_err:
+            fail wrote.err.message
         return 3
     fail "websocket payload too large"
 fn frame_header_size(data: Bytes) -> Int!:
@@ -407,7 +410,10 @@ fn frame_payload_length(data: Bytes) -> Int!:
     if length_code == 126:
         if data.len() < 4:
             fail "websocket frame missing extended length"
-        return bit_or(bit_shl(data[2], 8), data[3])
+        value := bin.read_u16_be_at(data, 2)
+        if value.is_err:
+            fail value.err.message
+        return value.ok
     frame_extended_length_size(data[1])!
     return 0
 fn apply_mask(payload: Bytes, mask_key: Bytes) -> Bytes!:
@@ -416,13 +422,13 @@ fn apply_mask(payload: Bytes, mask_key: Bytes) -> Bytes!:
     buf := bytes.buffer_with_capacity(payload.len())
     mut i := 0
     while i < payload.len():
-        buf.write_byte(bit_xor(payload[i], mask_key[i % 4]))!
+        buf.write_byte(bits.xor(payload[i], mask_key[i % 4]))!
         i = i + 1
     return buf.bytes()
 fn frame_mask_key(data: Bytes, header_size: Int) -> Bytes:
     return data.slice(header_size - 4, header_size)
 fn has_reserved_bits(first_byte: Int) -> Bool:
-    return bit_and(first_byte, 112) != 0
+    return bits.band(first_byte, 112) != 0
 fn is_data_opcode(opcode: Int) -> Bool:
     return opcode == OP_TEXT or opcode == OP_BINARY
 fn is_reserved_opcode(opcode: Int) -> Bool:
@@ -440,7 +446,10 @@ fn validate_close_payload(payload: Bytes) -> Int!:
         fail "websocket close frame payload too short"
     if payload.len() < 2:
         return 0
-    code := bit_or(bit_shl(payload[0], 8), payload[1])
+    code_result := bin.read_u16_be_at(payload, 0)
+    if code_result.is_err:
+        fail code_result.err.message
+    code := code_result.ok
     if not is_valid_close_code(code):
         fail "invalid websocket close code"
     if payload.len() > 2:
@@ -477,8 +486,8 @@ pub fn parse_frame(data: Bytes) -> WebSocketFrame!:
         fail "websocket frame too short"
     if has_reserved_bits(data[0]):
         fail "websocket reserved bits are not supported"
-    fin := bit_and(data[0], 128) != 0
-    opcode := bit_and(data[0], 15)
+    fin := bits.band(data[0], 128) != 0
+    opcode := bits.band(data[0], 15)
     masked := frame_is_masked(data[1])
     payload_len := frame_payload_length(data)!
     header_size := frame_header_size(data)!
@@ -503,9 +512,9 @@ fn frame_bytes_with_fin(opcode: Int, payload: Bytes, fin: Bool) -> Bytes!:
             fail "websocket control frames must be final"
         if payload.len() > MAX_CONTROL_PAYLOAD:
             fail "websocket control frame payload too large"
-    mut first := bit_and(opcode, 15)
+    mut first := bits.band(opcode, 15)
     if fin:
-        first = bit_or(first, 128)
+        first = bits.bor(first, 128)
     buf := bytes.buffer_with_capacity(payload.len() + 10)
     buf.write_byte(first)!
     append_frame_length(buf, payload.len(), false)!
@@ -521,8 +530,9 @@ fn masked_payload(payload: Bytes, mask_key: Bytes) -> Bytes!:
     return apply_mask(payload, mask_key)
 fn close_payload(code: Int, reason: String) -> Bytes!:
     payload := bytes.buffer_with_capacity(reason.len() + 2)
-    payload.write_byte(bit_and(bit_shr(code, 8), 255))!
-    payload.write_byte(bit_and(code, 255))!
+    wrote := bin.write_u16_be(payload, code)
+    if wrote.is_err:
+        fail wrote.err.message
     payload.write(bytes.from_string_utf8(reason))!
     validate_close_payload(payload.bytes())!
     return payload.bytes()
@@ -535,9 +545,9 @@ fn masked_frame_bytes_with_fin(opcode: Int, payload: Bytes, mask_key: Bytes, fin
             fail "websocket control frames must be final"
         if payload.len() > MAX_CONTROL_PAYLOAD:
             fail "websocket control frame payload too large"
-    mut first := bit_and(opcode, 15)
+    mut first := bits.band(opcode, 15)
     if fin:
-        first = bit_or(first, 128)
+        first = bits.bor(first, 128)
     buf := bytes.buffer_with_capacity(payload.len() + 14)
     buf.write_byte(first)!
     append_frame_length(buf, payload.len(), true)!

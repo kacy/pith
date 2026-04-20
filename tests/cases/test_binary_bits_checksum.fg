@@ -18,6 +18,13 @@ fn main() -> Int:
     print("at-u32-le:" + binary.read_u32_le_at(data, 5).ok.to_string())
     print("at-u32-be:" + binary.read_u32_be_at(data, 9).ok.to_string())
 
+    wide := bytes.buffer()
+    binary.write_u64_le(wide, 81985529216486895)
+    binary.write_u64_be(wide, 81985529216486895)
+    wide_data := wide.bytes()
+    print("u64le:" + binary.read_u64_le_at(wide_data, 0).ok.to_string())
+    print("u64be:" + binary.read_u64_be_at(wide_data, 8).ok.to_string())
+
     bin_reader := binary.reader(data)
     print("pos0:" + binary.position(bin_reader).to_string())
     print("u8:" + binary.read_u8(bin_reader).ok.to_string())
@@ -43,4 +50,5 @@ fn main() -> Int:
     print("rotr32:" + bits.rotr32(256, 8).to_string())
     print("crc32:" + checksum.crc32(bytes.from_string_utf8("hello")).to_string())
     print("write-bad:" + binary.write_u8(bytes.buffer(), 256).is_err.to_string())
+    print("write-u64-bad:" + binary.write_u64_be(bytes.buffer(), -1).is_err.to_string())
     return 0

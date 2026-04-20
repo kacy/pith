@@ -4,6 +4,7 @@
 # readers are handle-backed so reads can advance a cursor.
 
 import std.bytes as bytes
+import std.bits as bits
 
 mut next_reader_handle := 1
 mut reader_data: Map[Int, Bytes] := {}
@@ -49,6 +50,9 @@ fn read_at(data: Bytes, offset: Int) -> Int!BinaryError:
         fail binary_fail("unexpected end of bytes")
     return data[offset]
 
+fn max_i64() -> Int:
+    return 9223372036854775807
+
 # make a reader for a bytes value.
 pub fn reader(data: Bytes) -> Reader:
     handle := next_reader_handle
@@ -86,13 +90,13 @@ pub fn read_u8_at(data: Bytes, offset: Int) -> Int!BinaryError:
 pub fn read_u16_le_at(data: Bytes, offset: Int) -> Int!BinaryError:
     b0 := read_at(data, offset)!
     b1 := read_at(data, offset + 1)!
-    return b0 + bit_shl(b1, 8)
+    return b0 + bits.shl(b1, 8)
 
 # read a big-endian u16 at an absolute offset.
 pub fn read_u16_be_at(data: Bytes, offset: Int) -> Int!BinaryError:
     b0 := read_at(data, offset)!
     b1 := read_at(data, offset + 1)!
-    return bit_shl(b0, 8) + b1
+    return bits.shl(b0, 8) + b1
 
 # read a little-endian u32 at an absolute offset.
 pub fn read_u32_le_at(data: Bytes, offset: Int) -> Int!BinaryError:
@@ -100,7 +104,7 @@ pub fn read_u32_le_at(data: Bytes, offset: Int) -> Int!BinaryError:
     b1 := read_at(data, offset + 1)!
     b2 := read_at(data, offset + 2)!
     b3 := read_at(data, offset + 3)!
-    return b0 + bit_shl(b1, 8) + bit_shl(b2, 16) + bit_shl(b3, 24)
+    return b0 + bits.shl(b1, 8) + bits.shl(b2, 16) + bits.shl(b3, 24)
 
 # read a big-endian u32 at an absolute offset.
 pub fn read_u32_be_at(data: Bytes, offset: Int) -> Int!BinaryError:
@@ -108,7 +112,35 @@ pub fn read_u32_be_at(data: Bytes, offset: Int) -> Int!BinaryError:
     b1 := read_at(data, offset + 1)!
     b2 := read_at(data, offset + 2)!
     b3 := read_at(data, offset + 3)!
-    return bit_shl(b0, 24) + bit_shl(b1, 16) + bit_shl(b2, 8) + b3
+    return bits.shl(b0, 24) + bits.shl(b1, 16) + bits.shl(b2, 8) + b3
+
+# read a little-endian u64 at an absolute offset.
+pub fn read_u64_le_at(data: Bytes, offset: Int) -> Int!BinaryError:
+    b0 := read_at(data, offset)!
+    b1 := read_at(data, offset + 1)!
+    b2 := read_at(data, offset + 2)!
+    b3 := read_at(data, offset + 3)!
+    b4 := read_at(data, offset + 4)!
+    b5 := read_at(data, offset + 5)!
+    b6 := read_at(data, offset + 6)!
+    b7 := read_at(data, offset + 7)!
+    if b7 >= 128:
+        fail binary_fail("u64 out of Int range")
+    return b0 + bits.shl(b1, 8) + bits.shl(b2, 16) + bits.shl(b3, 24) + bits.shl(b4, 32) + bits.shl(b5, 40) + bits.shl(b6, 48) + bits.shl(b7, 56)
+
+# read a big-endian u64 at an absolute offset.
+pub fn read_u64_be_at(data: Bytes, offset: Int) -> Int!BinaryError:
+    b0 := read_at(data, offset)!
+    b1 := read_at(data, offset + 1)!
+    b2 := read_at(data, offset + 2)!
+    b3 := read_at(data, offset + 3)!
+    b4 := read_at(data, offset + 4)!
+    b5 := read_at(data, offset + 5)!
+    b6 := read_at(data, offset + 6)!
+    b7 := read_at(data, offset + 7)!
+    if b0 >= 128:
+        fail binary_fail("u64 out of Int range")
+    return bits.shl(b0, 56) + bits.shl(b1, 48) + bits.shl(b2, 40) + bits.shl(b3, 32) + bits.shl(b4, 24) + bits.shl(b5, 16) + bits.shl(b6, 8) + b7
 
 # read one byte and advance the cursor.
 pub fn read_u8(reader: Reader) -> Int!BinaryError:
@@ -145,6 +177,20 @@ pub fn read_u32_be(reader: Reader) -> Int!BinaryError:
     set_reader_pos(reader, pos + 4)
     return value
 
+# read a little-endian u64 and advance the cursor.
+pub fn read_u64_le(reader: Reader) -> Int!BinaryError:
+    pos := reader_pos(reader)
+    value := read_u64_le_at(reader_bytes(reader), pos)!
+    set_reader_pos(reader, pos + 8)
+    return value
+
+# read a big-endian u64 and advance the cursor.
+pub fn read_u64_be(reader: Reader) -> Int!BinaryError:
+    pos := reader_pos(reader)
+    value := read_u64_be_at(reader_bytes(reader), pos)!
+    set_reader_pos(reader, pos + 8)
+    return value
+
 # read bytes and advance the cursor.
 pub fn read_bytes(reader: Reader, count: Int) -> Bytes!BinaryError:
     if count < 0:
@@ -177,27 +223,51 @@ pub fn write_u8(out: ByteBuffer, value: Int) -> Int!BinaryError:
 # write a little-endian u16 to a byte buffer.
 pub fn write_u16_le(out: ByteBuffer, value: Int) -> Int!BinaryError:
     checked := check_range(value, 65535, "u16")!
-    wrote := write_byte_checked(out, bit_and(checked, 255))!
-    return wrote + write_byte_checked(out, bit_and(bit_shr(checked, 8), 255))!
+    wrote := write_byte_checked(out, bits.mask8(checked))!
+    return wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 8)))!
 
 # write a big-endian u16 to a byte buffer.
 pub fn write_u16_be(out: ByteBuffer, value: Int) -> Int!BinaryError:
     checked := check_range(value, 65535, "u16")!
-    wrote := write_byte_checked(out, bit_and(bit_shr(checked, 8), 255))!
-    return wrote + write_byte_checked(out, bit_and(checked, 255))!
+    wrote := write_byte_checked(out, bits.mask8(bits.shr(checked, 8)))!
+    return wrote + write_byte_checked(out, bits.mask8(checked))!
 
 # write a little-endian u32 to a byte buffer.
 pub fn write_u32_le(out: ByteBuffer, value: Int) -> Int!BinaryError:
     checked := check_range(value, 4294967295, "u32")!
-    mut wrote := write_byte_checked(out, bit_and(checked, 255))!
-    wrote = wrote + write_byte_checked(out, bit_and(bit_shr(checked, 8), 255))!
-    wrote = wrote + write_byte_checked(out, bit_and(bit_shr(checked, 16), 255))!
-    return wrote + write_byte_checked(out, bit_and(bit_shr(checked, 24), 255))!
+    mut wrote := write_byte_checked(out, bits.mask8(checked))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 8)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 16)))!
+    return wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 24)))!
 
 # write a big-endian u32 to a byte buffer.
 pub fn write_u32_be(out: ByteBuffer, value: Int) -> Int!BinaryError:
     checked := check_range(value, 4294967295, "u32")!
-    mut wrote := write_byte_checked(out, bit_and(bit_shr(checked, 24), 255))!
-    wrote = wrote + write_byte_checked(out, bit_and(bit_shr(checked, 16), 255))!
-    wrote = wrote + write_byte_checked(out, bit_and(bit_shr(checked, 8), 255))!
-    return wrote + write_byte_checked(out, bit_and(checked, 255))!
+    mut wrote := write_byte_checked(out, bits.mask8(bits.shr(checked, 24)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 16)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 8)))!
+    return wrote + write_byte_checked(out, bits.mask8(checked))!
+
+# write a little-endian u64 to a byte buffer.
+pub fn write_u64_le(out: ByteBuffer, value: Int) -> Int!BinaryError:
+    checked := check_range(value, max_i64(), "u64")!
+    mut wrote := write_byte_checked(out, bits.mask8(checked))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 8)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 16)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 24)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 32)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 40)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 48)))!
+    return wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 56)))!
+
+# write a big-endian u64 to a byte buffer.
+pub fn write_u64_be(out: ByteBuffer, value: Int) -> Int!BinaryError:
+    checked := check_range(value, max_i64(), "u64")!
+    mut wrote := write_byte_checked(out, bits.mask8(bits.shr(checked, 56)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 48)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 40)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 32)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 24)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 16)))!
+    wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 8)))!
+    return wrote + write_byte_checked(out, bits.mask8(checked))!

@@ -148,7 +148,7 @@ pub fn index_of(list: List[Int], value: Int) -> Int:
     for item, i in list:
         if item == value:
             return i
-    return -1
+    return - 1
 
 # Index of last occurrence of value, or -1
 pub fn last_index_of(list: List[Int], value: Int) -> Int:
@@ -359,7 +359,7 @@ pub fn find_index[T](items: List[T], keep: fn(T) -> Bool) -> Int:
     for item, i in items:
         if keep(item):
             return i
-    return -1
+    return - 1
 
 # return the first matching item or fail when nothing matches.
 pub fn find[T](items: List[T], keep: fn(T) -> Bool) -> T!CollectionError:
@@ -548,3 +548,70 @@ pub fn join_with(list: List[String], sep: String) -> String:
         result = result + sep + list[i]
         i = i + 1
     return result
+
+test "collection constructors and aggregations work":
+    nums := range(1, 5)
+    repeated := repeat_val(3, 2)
+    assert_eq(nums.len(), 4)
+    assert_eq(nums[0], 1)
+    assert_eq(nums[3], 4)
+    assert_eq(repeated.len(), 2)
+    assert_eq(repeated[0], 3)
+    assert_eq(sum(nums), 10)
+    assert_eq(product(nums), 24)
+    assert_eq(max_of(nums), 4)
+    assert_eq(min_of(nums), 1)
+    assert_eq(average(nums), 2)
+
+test "collection list transforms keep ordering":
+    nums := [1, 2, 3, 4]
+    rev := reversed(nums)
+    first_two := take(nums, 2)
+    rest := drop(nums, 2)
+    middle := slice(nums, 1, 3)
+    deduped := unique([1, 1, 2, 2, 3])
+    removed := without(nums, 2)
+
+    assert_eq(rev[0], 4)
+    assert_eq(first_two.len(), 2)
+    assert_eq(rest[0], 3)
+    assert_eq(middle[0], 2)
+    assert_eq(deduped.len(), 3)
+    assert_eq(removed.len(), 3)
+
+test "collection set helpers return expected membership":
+    mut left: Set[String] := {}
+    left.add("red")
+    left.add("blue")
+    mut right: Set[String] := {}
+    right.add("blue")
+    right.add("green")
+
+    unioned := set_union(left, right)
+    both := set_intersection(left, right)
+    only_left := set_difference(left, right)
+
+    assert(unioned.contains("green"))
+    assert(both.contains("blue"))
+    assert(not both.contains("red"))
+    assert(only_left.contains("red"))
+
+test "collection predicate helpers find values":
+    nums := [1, 2, 3, 4]
+    assert(any(nums, fn(n: Int) => n > 3))
+    assert(all(nums, fn(n: Int) => n > 0))
+    assert_eq(find_index(nums, fn(n: Int) => n == 3), 2)
+    assert_eq(find(nums, fn(n: Int) => n == 4)!, 4)
+    assert_eq(count_where(nums, fn(n: Int) => n % 2 == 0), 2)
+
+test "collection map helpers transform entries":
+    mut scores: Map[String, Int] := {}
+    scores.insert("ada", 10)
+    scores.insert("grace", 20)
+
+    boosted := map_values(scores, fn(score: Int) => score + 1)
+    kept := filter_entries(scores, fn(name: String, score: Int) => score > 10)
+
+    assert_eq(boosted["ada"], 11)
+    assert_eq(kept.len(), 1)
+    assert(kept.contains_key("grace"))

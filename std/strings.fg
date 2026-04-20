@@ -40,8 +40,8 @@
 fn single_char_code(c: String) -> Int:
     return ord(c)
 
-## tests if a single-character string is a decimal digit.
-## returns false for strings longer than one character.
+# # tests if a single-character string is a decimal digit.
+# # returns false for strings longer than one character.
 pub fn is_digit(c: String) -> Bool:
     if c.len() != 1:
         return false
@@ -164,7 +164,7 @@ pub fn trim_left(s: String) -> String:
         start = start + 1
     return s.substring(start, s.len())
 
-# Removes trailing whitespace characters  
+# Removes trailing whitespace characters
 pub fn trim_right(s: String) -> String:
     mut end := s.len()
     while end > 0:
@@ -318,7 +318,7 @@ pub fn split_lines(s: String) -> List[String]:
             result.push(current)
             current = ""
             if i + 1 < s.len() and s[i + 1] == chr(10):
-                i = i + 1  # Skip the \n
+                i = i + 1 # Skip the \n
         else:
             current = current + c
         i = i + 1
@@ -382,7 +382,7 @@ pub fn words(s: String) -> List[String]:
 pub fn collapse_whitespace(s: String) -> String:
     return words(s).join(" ")
 
-## split once and return the left and right pieces plus a found flag.
+# # split once and return the left and right pieces plus a found flag.
 pub fn split_once(s: String, sep: String) -> SplitPair:
     if sep.len() == 0:
         return split_pair_missing(s)
@@ -497,7 +497,7 @@ pub fn rpartition(s: String, sep: String) -> List[String]:
     mut tail := s.substring(pos + sep.len(), s.len())
     return [head, sep, tail]
 
-## join lines with newline separators.
+# # join lines with newline separators.
 pub fn join_lines(lines: List[String]) -> String:
     return lines.join(chr(10))
 
@@ -696,7 +696,7 @@ pub fn dedent(s: String) -> String:
     mut lines := split_lines(s)
     if lines.len() == 0:
         return s
-    
+
     # Find minimum indentation (ignoring empty lines)
     mut min_indent := -1
     for line in lines:
@@ -706,10 +706,10 @@ pub fn dedent(s: String) -> String:
                 indent = indent + 1
             if min_indent < 0 or indent < min_indent:
                 min_indent = indent
-    
+
     if min_indent <= 0:
         return s
-    
+
     # Remove common indentation from each line
     mut result: List[String] := []
     for line in lines:
@@ -717,7 +717,7 @@ pub fn dedent(s: String) -> String:
             result.push(line.substring(min_indent, line.len()))
         else:
             result.push(line)
-    
+
     return result.join(chr(10))
 
 # Adds a prefix to the beginning of each line
@@ -753,11 +753,11 @@ pub fn indent_nonempty(s: String, prefix: String) -> String:
 pub fn replace_n(s: String, old: String, new: String, count: Int) -> String:
     if count <= 0 or old.len() == 0:
         return s
-    
+
     mut result := ""
     mut pos := 0
     mut replacements := 0
-    
+
     while pos < s.len() and replacements < count:
         # Check if old matches at current position
         mut matches := true
@@ -767,7 +767,7 @@ pub fn replace_n(s: String, old: String, new: String, count: Int) -> String:
                 matches = false
                 i = old.len()
             i = i + 1
-        
+
         if matches:
             result = result + new
             pos = pos + old.len()
@@ -775,12 +775,12 @@ pub fn replace_n(s: String, old: String, new: String, count: Int) -> String:
         else:
             result = result + s[pos]
             pos = pos + 1
-    
+
     # Append remainder
     while pos < s.len():
         result = result + s[pos]
         pos = pos + 1
-    
+
     return result
 
 # return the shared starting prefix across all strings.
@@ -828,4 +828,45 @@ pub fn common_suffix(items: List[String]) -> String:
             return ""
     return suffix
 
-# End of std/strings.fg
+test "string character helpers classify simple chars":
+    assert(is_digit("7"))
+    assert(not is_digit("x"))
+    assert(is_alpha("A"))
+    assert(is_alnum("9"))
+    assert(is_space(chr(9)))
+    assert(is_blank(" " + chr(10)))
+
+test "string trimming and case helpers transform text":
+    assert_eq(trim_left("  forge"), "forge")
+    assert_eq(trim_right("forge  "), "forge")
+    assert_eq(trim_left_chars("xxforge", "x"), "forge")
+    assert_eq(trim_right_chars("forgexx", "x"), "forge")
+    assert_eq(capitalize("FORGE"), "Forge")
+    assert_eq(title("forge lang"), "Forge Lang")
+    assert_eq(swap_case("Fo9"), "fO9")
+
+test "string line and word helpers split text":
+    assert_eq(lines("a" + chr(10) + "b" + chr(10)).len(), 2)
+    assert_eq(lines_keep_empty("a" + chr(10) + chr(10)).len(), 3)
+    assert_eq(words(" alpha" + chr(9) + "beta" + chr(10)).join(","), "alpha,beta")
+    assert_eq(collapse_whitespace(" alpha" + chr(9) + "beta" + chr(10)), "alpha beta")
+
+test "string split pair helpers find edges":
+    first := split_once("hello=world", "=")
+    last := rsplit_once("a/b/c", "/")
+    missing := split_once("hello", "=")
+
+    assert(first.found)
+    assert_eq(first.left, "hello")
+    assert_eq(first.right, "world")
+    assert_eq(last.left, "a/b")
+    assert_eq(last.right, "c")
+    assert(not missing.found)
+
+test "string prefix suffix helpers remove known parts":
+    assert_eq(before("hello=world", "="), "hello")
+    assert_eq(after("hello=world", "="), "world")
+    assert_eq(before_last("a/b/c", "/"), "a/b")
+    assert_eq(after_last("a/b/c", "/"), "c")
+    assert_eq(strip_prefix("prefix-value", "prefix-"), "value")
+    assert_eq(strip_suffix("value.txt", ".txt"), "value")

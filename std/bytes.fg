@@ -9,8 +9,8 @@ fn byte_buffer_handle(capacity: Int) -> Int:
         return byte_buffer_new()
     return byte_buffer_with_capacity(capacity)
 
-## error returned when utf-8 decoding fails.
-## used by decode_utf8 when the bytes are not valid text.
+# # error returned when utf-8 decoding fails.
+# # used by decode_utf8 when the bytes are not valid text.
 pub struct Utf8DecodeError:
     pub message: String
 
@@ -56,7 +56,7 @@ fn decode_utf8_result(data: Bytes) -> String!Utf8DecodeError:
         fail Utf8DecodeError(text.err)
     return text.ok
 
-## decode utf-8 bytes and return a typed decode error on failure.
+# # decode utf-8 bytes and return a typed decode error on failure.
 pub fn decode_utf8(data: Bytes) -> String!Utf8DecodeError:
     return decode_utf8_result(data)
 
@@ -97,3 +97,38 @@ impl ByteBuffer:
 
     fn reset():
         self.clear()
+
+test "bytes helpers wrap raw byte operations":
+    data := from_string_utf8("forge")
+    empty_data := empty()
+    slice_text := slice(data, 1, 4).to_string_utf8()!
+    concat_text := concat(data, from_string_utf8("!")).to_string_utf8()!
+
+    assert_eq(len(data), 5)
+    assert(not is_empty(data))
+    assert_eq(len(empty_data), 0)
+    assert(is_empty(empty_data))
+    assert_eq(get(data, 1), 111)
+    assert_eq(slice_text, "org")
+    assert_eq(concat_text, "forge!")
+    assert(eq(data, from_string_utf8("forge")))
+
+test "bytes decode utf8 surfaces typed errors":
+    data := from_string_utf8("forge")
+    invalid_buf := buffer()
+    invalid_buf.write_byte(255)!
+    invalid := decode_utf8(invalid_buf.bytes())
+
+    assert_eq(decode_utf8(data)!, "forge")
+    assert(invalid.is_err)
+    assert(invalid.err.message.contains("utf"))
+
+test "byte buffers write and reset":
+    out := buffer()
+    out.write_string_utf8("hi")!
+    out.write_line_utf8("there")!
+    out.write_byte(33)!
+
+    assert_eq(out.bytes().to_string_utf8()!, "hithere" + chr(10) + "!")
+    out.reset()
+    assert_eq(out.bytes().len(), 0)

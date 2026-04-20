@@ -10,7 +10,7 @@ mut next_reader_handle := 1
 mut reader_data: Map[Int, Bytes] := {}
 mut reader_positions: Map[Int, Int] := {}
 
-## error returned when a binary reader runs out of bytes or sees bad input.
+# # error returned when a binary reader runs out of bytes or sees bad input.
 pub struct BinaryError:
     pub message: String
 
@@ -271,3 +271,47 @@ pub fn write_u64_be(out: ByteBuffer, value: Int) -> Int!BinaryError:
     wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 16)))!
     wrote = wrote + write_byte_checked(out, bits.mask8(bits.shr(checked, 8)))!
     return wrote + write_byte_checked(out, bits.mask8(checked))!
+
+test "binary reads integers by endianness":
+    data := bytes.from_string_utf8(chr(18) + chr(52) + chr(86) + chr(120))
+
+    assert_eq(read_u8_at(data, 0)!, 18)
+    assert_eq(read_u16_be_at(data, 0)!, 4660)
+    assert_eq(read_u16_le_at(data, 0)!, 13330)
+    assert_eq(read_u32_be_at(data, 0)!, 305419896)
+    assert_eq(read_u32_le_at(data, 0)!, 2018915346)
+
+test "binary reader advances cursor":
+    data := bytes.from_string_utf8(chr(1) + chr(2) + chr(3) + chr(4) + "done")
+    r := reader(data)
+
+    assert_eq(position(r), 0)
+    assert_eq(read_u8(r)!, 1)
+    assert_eq(position(r), 1)
+    assert_eq(read_u16_be(r)!, 515)
+    assert_eq(position(r), 3)
+    assert_eq(read_bytes(r, 1)!.len(), 1)
+
+test "binary writers emit expected bytes":
+    out := bytes.buffer()
+    write_u8(out, 18)!
+    write_u16_be(out, 13398)!
+    write_u16_le(out, 30806)!
+
+    data := out.bytes()
+    assert_eq(data.len(), 5)
+    assert_eq(data[0], 18)
+    assert_eq(data[1], 52)
+    assert_eq(data[2], 86)
+    assert_eq(data[3], 86)
+    assert_eq(data[4], 120)
+
+test "binary reports range and eof errors":
+    out := bytes.buffer()
+    too_large := write_u8(out, 300)
+    short := read_u32_be_at(bytes.from_string_utf8(chr(1)), 0)
+    missing_zero := read_until_zero(reader(bytes.from_string_utf8("abc")))
+
+    assert(too_large.is_err)
+    assert(short.is_err)
+    assert(missing_zero.is_err)

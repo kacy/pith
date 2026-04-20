@@ -197,7 +197,7 @@ fn find_eq(s: String) -> Int:
         if s[i] == "=":
             return i
         i = i + 1
-    return -1
+    return - 1
 
 fn rebuild_with_update_by_index(data: String, rec_idx: Int, field_idx: Int, new_val: String) -> String:
     recs := get_records(data)
@@ -310,3 +310,23 @@ pub fn help_text() -> String:
                 out = out + nl + line
 
     return out
+
+test "args parses explicit argv lists":
+    init("tool", "does work")
+    add_flag("verbose", "v", "enable verbose output")
+    add_option("output", "o", "output file", "out.txt")
+    add_positional("input", "input file")
+
+    parse_list(["--verbose", "--output=result.txt", "main.fg"])
+
+    assert(get_flag("verbose"))
+    assert_eq(get_option("output"), "result.txt")
+    assert_eq(get_positional("input"), "main.fg")
+    assert(not has_errors())
+
+test "args records unknown options":
+    init("badtool", "does work")
+    parse_list(["--missing"])
+
+    assert(has_errors())
+    assert(get_errors().contains("unknown option: --missing"))

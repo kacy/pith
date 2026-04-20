@@ -15,8 +15,8 @@ fn ansi_wrap(code: String, s: String) -> String:
 # Colors
 # ===============================================================
 
-## wrap text in the ansi code for red.
-## the reset code is appended so later output is unaffected.
+# # wrap text in the ansi code for red.
+# # the reset code is appended so later output is unaffected.
 pub fn red(s: String) -> String:
     return ansi_wrap("31", s)
 
@@ -81,3 +81,16 @@ pub fn strip(s: String) -> String:
         elif not in_esc:
             result = result + c
     return result
+
+test "term colors and styles wrap ansi codes":
+    esc := chr(27)
+
+    assert_eq(red("fail"), esc + "[31mfail" + esc + "[0m")
+    assert_eq(green("ok"), esc + "[32mok" + esc + "[0m")
+    assert_eq(bold("title"), esc + "[1mtitle" + esc + "[0m")
+    assert_eq(underline("link"), esc + "[4mlink" + esc + "[0m")
+
+test "term strip removes ansi escape codes":
+    text := red("fail") + " " + bold("now")
+
+    assert_eq(strip(text), "fail now")

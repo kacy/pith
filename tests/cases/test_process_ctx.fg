@@ -36,12 +36,18 @@ fn main():
     if stdout_started.is_err:
         print("stdout-read-timeout:false")
         print("stdout-read-deadline:false")
+        print("stdout-read-exact-timeout:false")
+        print("stdout-read-exact-deadline:false")
     else:
         stdout_proc := stdout_started.ok
         stdout_pair := concurrent.with_timeout(bg, 5)
         stdout_result := stdout_proc.stdout().read_ctx(stdout_pair.0, 16)
         print("stdout-read-timeout:{stdout_result.is_err}")
         print("stdout-read-deadline:{stdout_result.is_err and stdout_result.err.is_deadline_exceeded()}")
+        stdout_exact_pair := concurrent.with_timeout(bg, 5)
+        stdout_exact := stdout_proc.stdout().read_exact_bytes_ctx(stdout_exact_pair.0, 5)
+        print("stdout-read-exact-timeout:{stdout_exact.is_err}")
+        print("stdout-read-exact-deadline:{stdout_exact.is_err and stdout_exact.err.is_deadline_exceeded()}")
         stdout_proc.kill()
         stdout_proc.wait()
         stdout_proc.close()
@@ -100,3 +106,65 @@ fn main():
             print("buffered-stdout-line:")
         buffered_proc.wait()
         buffered_proc.close()
+
+    buffered_until_started := process.command("sh").args(["-c", "printf 'alpha|omega'"]).start()
+    if buffered_until_started.is_err:
+        print("buffered-stdout-until-ok:false")
+        print("buffered-stdout-until:")
+    else:
+        buffered_until_proc := buffered_until_started.ok
+        buffered_until_reader := buffered_until_proc.stdout().buffered()
+        buffered_until := buffered_until_reader.read_until_ctx(bg, "|")
+        print("buffered-stdout-until-ok:{buffered_until.is_ok}")
+        if buffered_until.is_ok:
+            print("buffered-stdout-until:{buffered_until.ok}")
+        else:
+            print("buffered-stdout-until:")
+        buffered_until_proc.wait()
+        buffered_until_proc.close()
+
+    buffered_until_including_started := process.command("sh").args(["-c", "printf 'alpha|omega'"]).start()
+    if buffered_until_including_started.is_err:
+        print("buffered-stdout-until-including-ok:false")
+        print("buffered-stdout-until-including:")
+    else:
+        buffered_until_including_proc := buffered_until_including_started.ok
+        buffered_until_including := buffered_until_including_proc.stdout().buffered().read_until_including_ctx(bg, "|")
+        print("buffered-stdout-until-including-ok:{buffered_until_including.is_ok}")
+        if buffered_until_including.is_ok:
+            print("buffered-stdout-until-including:{buffered_until_including.ok}")
+        else:
+            print("buffered-stdout-until-including:")
+        buffered_until_including_proc.wait()
+        buffered_until_including_proc.close()
+
+    buffered_stderr_started := process.command("sh").args(["-c", "printf 'beta|tail' >&2"]).start()
+    if buffered_stderr_started.is_err:
+        print("buffered-stderr-until-ok:false")
+        print("buffered-stderr-until:")
+    else:
+        buffered_stderr_proc := buffered_stderr_started.ok
+        buffered_stderr_reader := buffered_stderr_proc.stderr().buffered()
+        buffered_stderr_until := buffered_stderr_reader.read_until_ctx(bg, "|")
+        print("buffered-stderr-until-ok:{buffered_stderr_until.is_ok}")
+        if buffered_stderr_until.is_ok:
+            print("buffered-stderr-until:{buffered_stderr_until.ok}")
+        else:
+            print("buffered-stderr-until:")
+        buffered_stderr_proc.wait()
+        buffered_stderr_proc.close()
+
+    buffered_stderr_including_started := process.command("sh").args(["-c", "printf 'beta|tail' >&2"]).start()
+    if buffered_stderr_including_started.is_err:
+        print("buffered-stderr-until-including-ok:false")
+        print("buffered-stderr-until-including:")
+    else:
+        buffered_stderr_including_proc := buffered_stderr_including_started.ok
+        buffered_stderr_until_including := buffered_stderr_including_proc.stderr().buffered().read_until_including_ctx(bg, "|")
+        print("buffered-stderr-until-including-ok:{buffered_stderr_until_including.is_ok}")
+        if buffered_stderr_until_including.is_ok:
+            print("buffered-stderr-until-including:{buffered_stderr_until_including.ok}")
+        else:
+            print("buffered-stderr-until-including:")
+        buffered_stderr_including_proc.wait()
+        buffered_stderr_including_proc.close()

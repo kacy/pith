@@ -307,8 +307,10 @@ type_expr     = base_type , [ "?" ]          (* T? = Option[T] *)
               | base_type , "!" , [ type_expr ]  (* T! = Result[T, Error], T!E = Result[T, E] *)
               ;
 
-base_type     = IDENT , [ "[" , type_list , "]" ]   (* named or generic: Map[String, Int] *)
+base_type     = qualified_type , [ "[" , type_list , "]" ]   (* named or generic: Map[String, Int] *)
               | "(" , type_list , ")"                (* tuple type: (Int, String) *)
               | fn_type ;
+
+qualified_type = IDENT , { "." , IDENT } ;
 
 fn_type       = "fn" , "(" , [ type_list ] , ")" , [ "->" , type_expr ] ;

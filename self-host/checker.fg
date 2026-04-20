@@ -697,15 +697,31 @@ fn resolve_type_implementation(node_idx: Int) -> Int:
     type_resolve_depth = type_resolve_depth - 1
     return result
 
+fn resolve_imported_type_name(name: String) -> String:
+    parts := split_qualified_name(name)
+    alias := parts.0
+    member := parts.1
+    if member == "":
+        return name
+    if module_aliases.contains_key(alias):
+        module_path := module_aliases[alias]
+        target := module_import_target_name(module_path, member)
+        if lookup_type_id(target) >= 0:
+            return target
+        if lookup_type_id(member) >= 0:
+            return member
+    return name
+
 fn resolve_named_type(name: String) -> Int:
-    tid := lookup_type_id(name)
+    resolved_name := resolve_imported_type_name(name)
+    tid := lookup_type_id(resolved_name)
     if tid < 0:
         report_error("E202", "unknown type: " + name)
         return TID_ERR
     return tid
 
 fn resolve_generic_type_from_node(node: Node) -> Int:
-    base := node.value
+    base := resolve_imported_type_name(node.value)
     mut type_args: List[Int] := []
     for child in node.children:
         type_args.push(resolve_type_implementation(child))

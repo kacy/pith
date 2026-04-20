@@ -1,0 +1,21 @@
+# std.checksum — small checksum helpers
+
+import std.bits as bits
+
+# compute the standard crc-32 checksum used by gzip and zip.
+pub fn crc32(data: Bytes) -> Int:
+    mut crc := 4294967295
+    mut pos := 0
+    while pos < data.len():
+        byte := data[pos]
+        crc = bits.xor(crc, byte)
+        mut i := 0
+        while i < 8:
+            if bits.band(crc, 1) == 1:
+                crc = bits.xor(bits.shr(crc, 1), 3988292384)
+            else:
+                crc = bits.shr(crc, 1)
+            crc = bits.mask32(crc)
+            i = i + 1
+        pos = pos + 1
+    return bits.mask32(bits.invert(crc))

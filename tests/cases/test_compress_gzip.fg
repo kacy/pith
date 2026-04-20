@@ -1,0 +1,43 @@
+import std.bytes as bytes
+import std.compress.gzip as gzip
+import std.fs as fs
+import std.os.path as path
+
+fn main() -> Int!:
+    raw := bytes.from_string_utf8("hello hello hello")
+    archived := gzip.compress(raw)
+    print("magic:" + (archived[0] == 31 and archived[1] == 139 and archived[2] == 8).to_string())
+    print("valid:" + gzip.is_valid(archived).to_string())
+    print("roundtrip:" + gzip.decompress(archived)!.to_string_utf8()!)
+
+    empty_roundtrip := gzip.decompress(gzip.compress(bytes.empty()))!
+    print("empty:" + empty_roundtrip.is_empty().to_string())
+
+    text_archive := gzip.compress_string("forge gzip")
+    print("string:" + gzip.decompress_string(text_archive)!)
+
+    large := bytes.buffer_with_capacity(66000)
+    mut i := 0
+    while i < 66000:
+        large.write_byte(65)!
+        i = i + 1
+    large_data := large.bytes()
+    large_archive := gzip.compress(large_data)
+    large_roundtrip := gzip.decompress(large_archive)!
+    print("large-valid:" + gzip.is_valid(large_archive).to_string())
+    print("large-size:" + large_roundtrip.len().to_string())
+    print("large-same:" + bytes.eq(large_data, large_roundtrip).to_string())
+
+    invalid := gzip.decompress(bytes.from_string_utf8("not gzip"))
+    print("invalid:" + invalid.is_err.to_string())
+
+    root := fs.make_temp_dir("forge_gzip_")!
+    source := path.join(root, "source.txt")
+    archive := path.join(root, "source.txt.gz")
+    output := path.join(root, "output.txt")
+    fs.write(source, "archive-data")!
+    gzip.compress_file(source, archive)!
+    gzip.decompress_file(archive, output)!
+    print("file:" + fs.read(output)!)
+    print("cleanup:" + fs.remove_tree(root).to_string())
+    return 0

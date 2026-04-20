@@ -247,6 +247,10 @@ fn parse_base_type() -> Int:
     # named or generic type
     if _cur_tok_kind() == "identifier":
         name_tok := advance_token()
+        mut type_name := name_tok.value
+        while match_tok("dot"):
+            part_tok := expect("identifier")
+            type_name = type_name + "." + part_tok.value
 
         # check for generic args: Type[T, U]
         if check("lbracket"):
@@ -257,9 +261,9 @@ fn parse_base_type() -> Int:
             expect("rbracket")
 
             # build inline representation: "Name[Arg1, Arg2]"
-            return add_node_with_position("generic_type", name_tok.value, args)
+            return add_node_with_position("generic_type", type_name, args)
 
-        return add_leaf_with_position("type", name_tok.value)
+        return add_leaf_with_position("type", type_name)
 
     # unexpected
     return add_leaf_with_position("type", "")

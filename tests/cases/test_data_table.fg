@@ -1,0 +1,59 @@
+import std.data.table as table
+import std.fs as fs
+import std.os.path as path
+
+fn main() -> Int!:
+    nl := chr(10)
+    csv_text := "name,team,score" + nl + "alice,red,8" + nl + "bob,blue,3" + nl + "carol,red,5"
+    t := table.from_csv(csv_text)
+    print("shape:" + table.row_count(t).to_string() + ":" + table.column_count(t).to_string())
+    print("columns:" + table.columns(t).join(","))
+    print("has-team:" + table.has_column(t, "team").to_string())
+    print("has-missing:" + table.has_column(t, "missing").to_string())
+    first := t.rows[0]
+    print("get:" + table.get_string(first, "name"))
+    print("get-or:" + table.get_or(first, "missing", "fallback"))
+    print("get-int:" + table.get_int_or(first, "score", 0).to_string())
+
+    selected := table.select_columns(t, ["score", "name"]).ok
+    print("select-columns:" + table.columns(selected).join(","))
+    print("select-first:" + table.get_string(selected.rows[0], "score") + ":" + table.get_string(selected.rows[0], "name"))
+
+    red := table.filter(t, fn(row: Map[String, String]) => table.get_or(row, "team", "") == "red")
+    print("filter-red:" + table.row_count(red).to_string())
+
+    labeled := table.with_column(t, "label", fn(row: Map[String, String]) => table.get_or(row, "name", "") + ":" + table.get_or(row, "team", ""))
+    print("with-column:" + table.column_count(labeled).to_string() + ":" + table.get_string(labeled.rows[1], "label"))
+    print("original-columns:" + table.column_count(t).to_string())
+
+    counts := table.group_count(t, "team").ok
+    print("group-red:" + counts["red"].to_string())
+    print("group-blue:" + counts["blue"].to_string())
+
+    mut row1: Map[String, String] := {}
+    row1.insert("city", "nyc")
+    row1.insert("name", "alice")
+    mut row2: Map[String, String] := {}
+    row2.insert("name", "bob")
+    row2.insert("score", "4")
+    records := table.from_records([row1, row2])
+    print("records-columns:" + table.columns(records).join(","))
+
+    rows_table := table.from_rows(["a", "b"], [["1"], ["2", "3"]])
+    print("from-rows:" + table.get_string(rows_table.rows[0], "b") + ":" + table.get_string(rows_table.rows[1], "b"))
+
+    encoded := table.to_csv(selected)
+    print("csv:" + encoded.replace(nl, "|"))
+
+    root := fs.make_temp_dir("forge_data_table_")!
+    csv_path := path.join(root, "table.csv")
+    table.save_csv(csv_path, selected)!
+    loaded := table.from_csv_file(csv_path)!
+    print("file:" + table.get_string(loaded.rows[1], "name") + ":" + table.get_string(loaded.rows[1], "score"))
+
+    select_missing := table.select_columns(t, ["name", "missing"])
+    print("select-missing:" + select_missing.is_err.to_string() + ":" + select_missing.err.message)
+    group_missing := table.group_count(t, "missing")
+    print("group-missing:" + group_missing.is_err.to_string() + ":" + group_missing.err.message)
+    print("cleanup:" + fs.remove_tree(root).to_string())
+    return 0

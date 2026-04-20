@@ -1,0 +1,213 @@
+# std.data.table — string-backed table helpers
+#
+# useful for small csv-shaped datasets where every cell can stay a string.
+
+import std.csv as csv
+
+# # tabular data with ordered headers and row maps.
+pub struct Table:
+    pub headers: List[String]
+    pub rows: List[Map[String, String]]
+
+# # error returned when table operations see bad input.
+pub struct DataError:
+    pub message: String
+
+fn data_fail(message: String) -> DataError:
+    return DataError(message)
+
+fn copy_headers(headers: List[String]) -> List[String]:
+    mut result: List[String] := []
+    for header in headers:
+        result.push(header)
+    return result
+
+fn copy_row(row: Map[String, String]) -> Map[String, String]:
+    mut result: Map[String, String] := {}
+    for key in row:
+        result.insert(key, row[key])
+    return result
+
+fn copy_rows(rows: List[Map[String, String]]) -> List[Map[String, String]]:
+    mut result: List[Map[String, String]] := []
+    for row in rows:
+        result.push(copy_row(row))
+    return result
+
+fn row_has(row: Map[String, String], column: String) -> Bool:
+    return row.contains_key(column)
+
+fn header_has(headers: List[String], name: String) -> Bool:
+    for header in headers:
+        if header == name:
+            return true
+    return false
+
+fn derived_headers(rows: List[Map[String, String]]) -> List[String]:
+    mut seen: Set[String] := {}
+    for row in rows:
+        for key in row:
+            seen.add(key)
+    mut result: List[String] := []
+    for key in seen:
+        result.push(key)
+    return result.sort()
+
+fn rows_to_csv_rows(table: Table) -> List[List[String]]:
+    mut out: List[List[String]] := []
+    out.push(copy_headers(table.headers))
+    for row in table.rows:
+        mut csv_row: List[String] := []
+        for header in table.headers:
+            csv_row.push(get_or(row, header, ""))
+        out.push(csv_row)
+    return out
+
+fn table_from_csv_rows(rows: List[List[String]]) -> Table:
+    if rows.len() == 0:
+        return empty()
+    headers := rows[0]
+    mut records: List[Map[String, String]] := []
+    for row, i in rows:
+        if i == 0:
+            continue
+        mut record: Map[String, String] := {}
+        for header, j in headers:
+            if j < row.len():
+                record.insert(header, row[j])
+            else:
+                record.insert(header, "")
+        records.push(record)
+    return Table(copy_headers(headers), records)
+
+fn require_column(table: Table, name: String) -> Bool!DataError:
+    if not has_column(table, name):
+        fail data_fail("missing column: " + name)
+    return true
+
+# # create an empty table.
+pub fn empty() -> Table:
+    mut headers: List[String] := []
+    mut rows: List[Map[String, String]] := []
+    return Table(headers, rows)
+
+# # build a table from explicit headers and positional rows.
+pub fn from_rows(headers: List[String], rows: List[List[String]]) -> Table:
+    mut records: List[Map[String, String]] := []
+    for row in rows:
+        mut record: Map[String, String] := {}
+        for header, i in headers:
+            if i < row.len():
+                record.insert(header, row[i])
+            else:
+                record.insert(header, "")
+        records.push(record)
+    return Table(copy_headers(headers), records)
+
+# # build a table from record maps with sorted headers.
+pub fn from_records(rows: List[Map[String, String]]) -> Table:
+    return Table(derived_headers(rows), copy_rows(rows))
+
+# # parse csv text into a table, using the first row as headers.
+pub fn from_csv(text: String) -> Table:
+    return table_from_csv_rows(csv.parse(text))
+
+# # parse a csv file into a table.
+pub fn from_csv_file(path: String) -> Table!:
+    return table_from_csv_rows(csv.parse_file(path)!)
+
+# # encode a table as csv.
+pub fn to_csv(table: Table) -> String:
+    return csv.encode(rows_to_csv_rows(table))
+
+# # save a table as csv.
+pub fn save_csv(path: String, table: Table) -> Int!:
+    return csv.save(path, rows_to_csv_rows(table))
+
+# # return the number of rows.
+pub fn row_count(table: Table) -> Int:
+    return table.rows.len()
+
+# # return the number of columns.
+pub fn column_count(table: Table) -> Int:
+    return table.headers.len()
+
+# # return a copy of the table headers.
+pub fn columns(table: Table) -> List[String]:
+    return copy_headers(table.headers)
+
+# # return true when the table has a column.
+pub fn has_column(table: Table, name: String) -> Bool:
+    return header_has(table.headers, name)
+
+# # select a subset of columns in the requested order.
+pub fn select_columns(table: Table, names: List[String]) -> Table!DataError:
+    for name in names:
+        require_column(table, name)!
+    mut rows: List[Map[String, String]] := []
+    for row in table.rows:
+        mut selected: Map[String, String] := {}
+        for name in names:
+            selected.insert(name, get_or(row, name, ""))
+        rows.push(selected)
+    return Table(copy_headers(names), rows)
+
+# # return rows matching a predicate.
+pub fn filter(table: Table, keep: fn(Map[String, String]) -> Bool) -> Table:
+    mut rows: List[Map[String, String]] := []
+    for row in table.rows:
+        if keep(row):
+            rows.push(copy_row(row))
+    return Table(copy_headers(table.headers), rows)
+
+# # add or replace a derived column.
+pub fn with_column(table: Table, name: String, mapper: fn(Map[String, String]) -> String) -> Table:
+    headers := copy_headers(table.headers)
+    if not header_has(headers, name):
+        headers.push(name)
+    mut rows: List[Map[String, String]] := []
+    for row in table.rows:
+        next := copy_row(row)
+        next.insert(name, mapper(row))
+        rows.push(next)
+    return Table(headers, rows)
+
+# # count rows by column value.
+pub fn group_count(table: Table, column: String) -> Map[String, Int]!DataError:
+    require_column(table, column)!
+    mut counts: Map[String, Int] := {}
+    for row in table.rows:
+        value := get_or(row, column, "")
+        if counts.contains_key(value):
+            counts.insert(value, counts[value] + 1)
+        else:
+            counts.insert(value, 1)
+    return counts
+
+fn table_get_string(row: Map[String, String], column: String) -> String:
+    if row_has(row, column):
+        return row[column]
+    return ""
+
+# # return a row value or an empty string.
+pub fn get_string(row: Map[String, String], column: String) -> String:
+    return table_get_string(row, column)
+
+# # return a row value or an empty string.
+pub fn get(row: Map[String, String], column: String) -> String:
+    return table_get_string(row, column)
+
+# # return a row value or the fallback.
+pub fn get_or(row: Map[String, String], column: String, fallback: String) -> String:
+    if row_has(row, column):
+        return row[column]
+    return fallback
+
+# # return a row value parsed as an int, or the fallback.
+pub fn get_int_or(row: Map[String, String], column: String, fallback: Int) -> Int:
+    if not row_has(row, column):
+        return fallback
+    parsed := parse_int(row[column])
+    if parsed.is_err:
+        return fallback
+    return parsed.ok

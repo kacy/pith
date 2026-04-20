@@ -251,12 +251,15 @@ pub fn create(paths: List[String]) -> Bytes!:
     for input_path in paths:
         if not fs.exists(input_path):
             fail zip_fail("path does not exist: " + input_path)
-        entries := fs.walk(input_path)!.sort()
+        entries := fs.walk(input_path)!
+        mut file_paths: List[String] := []
         for entry in entries:
             if entry.is_dir:
                 continue
-            name := zip_archive_name(input_path, entry.path)!
-            records = zip_add_file(out, records, name, fs.read_bytes(entry.path)!)!
+            file_paths.push(entry.path)
+        for file_path in file_paths.sort():
+            name := zip_archive_name(input_path, file_path)!
+            records = zip_add_file(out, records, name, fs.read_bytes(file_path)!)!
     central_offset := out.bytes().len()
     for record in records:
         zip_write_central_header(out, record)!

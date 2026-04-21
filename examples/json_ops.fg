@@ -3,6 +3,18 @@
 import std.json as json
 import std.fs as fs
 import std.io as io
+from std.json import JsonDecodeError, JsonScalarObject
+
+struct ToolInfo:
+    pub name: String
+    pub version: Int
+    pub active: Bool
+
+fn decode_tool_info(fields: JsonScalarObject) -> ToolInfo!JsonDecodeError:
+    name := json.require_string(fields, "name")!
+    version := json.require_int(fields, "version")!
+    active := json.require_bool(fields, "active")!
+    return ToolInfo(name, version, active)
 
 fn main() -> String!:
     path := "/tmp/forge_json_ops.json"
@@ -25,6 +37,13 @@ fn main() -> String!:
     print("version = " + json.object_get_int(root, "version").to_string())
     print("active = " + json.object_get_bool(root, "active").to_string())
     print("missing = " + json.object_get_string_or(root, "missing", "n/a"))
+
+    shallow := lb + "\"name\":\"forge\",\"version\":1,\"active\":true" + rb
+    fields := json.decode_scalars(shallow)
+    if fields.is_ok:
+        info := decode_tool_info(fields.ok)
+        if info.is_ok:
+            print("decoded = " + info.ok.name + "@" + info.ok.version.to_string())
 
     # array access
     tags := json.object_get_array(root, "tags")

@@ -14,6 +14,7 @@ import std.bytes as bytes
 from std.net.http import HttpRequestBytes, HttpResponse
 from std.env import get_args
 from std.bytes import ByteBuffer
+from std.json import JsonDecodeError, JsonScalarObject
 
 JSON_MIME := "application/json"
 
@@ -24,6 +25,14 @@ struct CatalogUser:
     pub active: Bool
     pub score: Int
     pub quota: Int
+
+struct BatchRequest:
+    pub team: String
+    pub region: String
+    pub active: String
+    pub min_score: Int
+    pub limit: Int
+    pub multiplier: Int
 
 mut users: List[CatalogUser] := []
 mut user_index: Map[Int, Int] := {}
@@ -264,6 +273,15 @@ fn parse_active_filter(raw: String) -> Int:
     if raw == "0" or raw == "false":
         return 0
     return 0 - 1
+
+fn decode_batch_request(fields: JsonScalarObject) -> BatchRequest!JsonDecodeError:
+    team := json.scalar_string_or(fields, "team", "")
+    region := json.scalar_string_or(fields, "region", "")
+    active := json.scalar_string_or(fields, "active", "")
+    min_score := json.scalar_int_or(fields, "min_score", 0)
+    limit := json.scalar_int_or(fields, "limit", 0)
+    multiplier := json.scalar_int_or(fields, "multiplier", 0)
+    return BatchRequest(team, region, active, min_score, limit, multiplier)
 
 fn server_port() -> Int:
     a := get_args()
@@ -534,17 +552,19 @@ fn batch_score_json_bytes(root: Int) -> Bytes!:
     json.write_object_end_bytes(out)!
     return out.bytes()
 
-fn batch_score_json_fast_bytes(body: String) -> Bytes!:
-    team_raw := json.scan_object_string(body, "team")
-    region_raw := json.scan_object_string(body, "region")
-    active_raw := json.scan_object_string(body, "active")
-    if team_raw == "" or region_raw == "" or active_raw == "":
+fn batch_score_json_fast_bytes(body: Bytes) -> Bytes!:
+    fields := json.decode_scalars_bytes(body)
+    if fields.is_err:
         fail "fallback"
-    team_id := find_team_id(team_raw)
-    region_id := find_region_id(region_raw)
-    mut min_score := json.scan_object_int_or(body, "min_score", 0)
-    mut limit := json.scan_object_int_or(body, "limit", 10)
-    mut multiplier := json.scan_object_int_or(body, "multiplier", 3)
+    decoded := decode_batch_request(fields.ok)
+    if decoded.is_err:
+        fail "fallback"
+    req := decoded.ok
+    team_id := find_team_id(req.team)
+    region_id := find_region_id(req.region)
+    mut min_score := req.min_score
+    mut limit := req.limit
+    mut multiplier := req.multiplier
 
     if min_score < 0:
         min_score = 0
@@ -553,7 +573,7 @@ fn batch_score_json_fast_bytes(body: String) -> Bytes!:
     if multiplier <= 0:
         multiplier = 3
 
-    active_filter := parse_active_filter(active_raw)
+    active_filter := parse_active_filter(req.active)
     ids_out := bytes.buffer()
     mut ids_written := 0
     mut count := 0
@@ -627,11 +647,11 @@ fn handle_request(req: HttpRequestBytes) -> HttpResponse:
         return http.response(200).with_body_bytes(search_json_bytes(team_id, region_id, active_filter, min_score, limit) catch bytes.empty()).header("Content-Type", JSON_MIME)
 
     if req.is_post("/batch-score") catch false:
-        fast := batch_score_json_fast_bytes(req.body_text() catch "")
+        fast := batch_score_json_fast_bytes(req.body_bytes())
         if fast.is_ok:
             return http.response(200).with_body_bytes(fast.ok).header("Content-Type", JSON_MIME)
         mark := json.checkpoint()
-        root := req.body_json() catch -1
+        root := req.body_json() catch - 1
         if root < 0:
             json.restore(mark)
             return bad_json_response()

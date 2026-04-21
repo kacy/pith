@@ -145,14 +145,14 @@ request.
 
 latest measured results on this machine, using the median of 3 trials:
 
-| iterations | go total | forge total | ratio |
-|---|---:|---:|---:|
-| `200000` | `741 ms` | `514 ms` | `0.69x` |
-| `2000000` | `6767 ms` | `5859 ms` | `0.87x` |
+| iterations | go total | forge total | ratio | go batch | forge batch |
+|---|---:|---:|---:|---:|---:|
+| `200000` | `747 ms` | `2615 ms` | `3.50x` | `656 ms` | `2603 ms` |
 
-the biggest win came from moving the batch path onto the runtime JSON builtins
-and removing extra object-key allocations in the Rust JSON parser. with that in
-place, the batch phase is no longer the bottleneck in this benchmark.
+the current forge workload uses the bytes-backed shallow JSON scanner and a
+small manual struct translation step for the batch request. that removes most
+of the old handle-tree parse overhead, but batch JSON decoding is still the
+dominant remaining cost in this benchmark.
 
 this is the better comparison point today if you want to isolate runtime,
 language, and service-logic costs from the current long-running HTTP server

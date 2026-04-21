@@ -21,6 +21,27 @@ pub struct JsonCheckpoint:
     pub object_entry_len: Int
     pub array_item_len: Int
 
+# shallow scalar fields from a json object.
+pub struct JsonScalarObject:
+    pub ok: Bool
+    pub strings: Map[String, String]
+    pub ints: Map[String, Int]
+    pub bools: Map[String, Bool]
+
+# error returned by the typed json decoding helpers.
+pub struct JsonDecodeError:
+    pub message: String
+
+struct JsonByteString:
+    ok: Bool
+    value: String
+    next_pos: Int
+
+struct JsonByteInt:
+    ok: Bool
+    value: Int
+    next_pos: Int
+
 # ===============================================================
 # Node Pool
 # ===============================================================
@@ -233,6 +254,135 @@ fn json_scan_object_int_or(input: String, key: String, default_value: Int) -> In
         return default_value
     return parsed.ok
 
+fn json_scalar_object(ok: Bool) -> JsonScalarObject:
+    mut string_values_map: Map[String, String] := {}
+    mut int_values_map: Map[String, Int] := {}
+    mut bool_values_map: Map[String, Bool] := {}
+    return JsonScalarObject(ok, string_values_map, int_values_map, bool_values_map)
+
+fn json_byte_is_whitespace(value: Int) -> Bool:
+    return value == 32 or value == 9 or value == 10 or value == 13
+
+fn json_byte_is_digit(value: Int) -> Bool:
+    return value >= 48 and value <= 57
+
+fn json_byte_skip_whitespace(input: Bytes, pos: Int) -> Int:
+    mut i := pos
+    while i < input.len() and json_byte_is_whitespace(input[i]):
+        i = i + 1
+    return i
+
+fn json_byte_read_string(input: Bytes, pos: Int) -> JsonByteString:
+    if pos < 0 or pos >= input.len() or input[pos] != 34:
+        return JsonByteString(false, "", pos)
+    mut i := pos + 1
+    start := i
+    mut escaped := false
+    while i < input.len():
+        b := input[i]
+        if escaped:
+            escaped = false
+            i = i + 1
+            continue
+        if b == 92:
+            escaped = true
+            i = i + 1
+            continue
+        if b == 34:
+            text := bytes.to_string_utf8(bytes.slice(input, start, i))
+            if text.is_err:
+                return JsonByteString(false, "", i)
+            return JsonByteString(true, text.ok, i + 1)
+        i = i + 1
+    return JsonByteString(false, "", i)
+
+fn json_byte_read_int(input: Bytes, pos: Int) -> JsonByteInt:
+    mut i := pos
+    mut neg := false
+    if i < input.len() and input[i] == 45:
+        neg = true
+        i = i + 1
+    digits_start := i
+    mut value := 0
+    while i < input.len() and json_byte_is_digit(input[i]):
+        value = (value * 10) + (input[i] - 48)
+        i = i + 1
+    if i == digits_start:
+        return JsonByteInt(false, 0, pos)
+    if neg:
+        value = 0 - value
+    return JsonByteInt(true, value, i)
+
+fn json_byte_match_literal(input: Bytes, pos: Int, literal: String) -> Bool:
+    if pos + literal.len() > input.len():
+        return false
+    mut i := 0
+    while i < literal.len():
+        if input[pos + i] != ord(literal[i]):
+            return false
+        i = i + 1
+    return true
+
+fn json_scan_object_scalars_bytes(input: Bytes) -> JsonScalarObject:
+    result := json_scalar_object(true)
+    mut pos := json_byte_skip_whitespace(input, 0)
+    if pos >= input.len() or input[pos] != 123:
+        return json_scalar_object(false)
+    pos = json_byte_skip_whitespace(input, pos + 1)
+    if pos < input.len() and input[pos] == 125:
+        return result
+
+    while pos < input.len():
+        key := json_byte_read_string(input, pos)
+        if not key.ok:
+            return json_scalar_object(false)
+        pos = json_byte_skip_whitespace(input, key.next_pos)
+        if pos >= input.len() or input[pos] != 58:
+            return json_scalar_object(false)
+        pos = json_byte_skip_whitespace(input, pos + 1)
+        if pos >= input.len():
+            return json_scalar_object(false)
+
+        b := input[pos]
+        mut handled := false
+        if b == 34:
+            value := json_byte_read_string(input, pos)
+            if not value.ok:
+                return json_scalar_object(false)
+            result.strings.insert(key.value, value.value)
+            pos = value.next_pos
+            handled = true
+        if not handled and (b == 45 or json_byte_is_digit(b)):
+            value := json_byte_read_int(input, pos)
+            if not value.ok:
+                return json_scalar_object(false)
+            result.ints.insert(key.value, value.value)
+            pos = value.next_pos
+            handled = true
+        if not handled and json_byte_match_literal(input, pos, "true"):
+            result.bools.insert(key.value, true)
+            pos = pos + 4
+            handled = true
+        if not handled and json_byte_match_literal(input, pos, "false"):
+            result.bools.insert(key.value, false)
+            pos = pos + 5
+            handled = true
+        if not handled and json_byte_match_literal(input, pos, "null"):
+            pos = pos + 4
+            handled = true
+        if not handled:
+            return json_scalar_object(false)
+
+        pos = json_byte_skip_whitespace(input, pos)
+        if pos < input.len() and input[pos] == 44:
+            pos = json_byte_skip_whitespace(input, pos + 1)
+            continue
+        if pos < input.len() and input[pos] == 125:
+            pos = json_byte_skip_whitespace(input, pos + 1)
+            return JsonScalarObject(pos == input.len(), result.strings, result.ints, result.bools)
+        return json_scalar_object(false)
+    return json_scalar_object(false)
+
 # Parses a JSON string value (double-quoted)
 fn parse_string_raw() -> String:
     # skip opening quote
@@ -408,6 +558,61 @@ pub fn scan_object_string(input: String, key: String) -> String:
  # scans a small object string for one int field with a fallback.
 pub fn scan_object_int_or(input: String, key: String, default_value: Int) -> Int:
     return json_scan_object_int_or(input, key, default_value)
+
+ # scans a shallow object of scalar fields from bytes in one pass.
+pub fn scan_object_scalars_bytes(input: Bytes) -> JsonScalarObject:
+    return json_scan_object_scalars_bytes(input)
+
+ # scans a shallow object of scalar fields from text in one pass.
+pub fn scan_object_scalars(input: String) -> JsonScalarObject:
+    return json_scan_object_scalars_bytes(bytes.from_string_utf8(input))
+
+ # gets a string from a scanned scalar object with a fallback.
+pub fn scalar_string_or(object: JsonScalarObject, key: String, default_value: String) -> String:
+    if object.strings.contains_key(key):
+        return object.strings[key]
+    return default_value
+
+ # gets an int from a scanned scalar object with a fallback.
+pub fn scalar_int_or(object: JsonScalarObject, key: String, default_value: Int) -> Int:
+    if object.ints.contains_key(key):
+        return object.ints[key]
+    return default_value
+
+ # gets a bool from a scanned scalar object with a fallback.
+pub fn scalar_bool_or(object: JsonScalarObject, key: String, default_value: Bool) -> Bool:
+    if object.bools.contains_key(key):
+        return object.bools[key]
+    return default_value
+
+ # decodes a shallow scalar object or returns a typed error.
+pub fn decode_scalars_bytes(input: Bytes) -> JsonScalarObject!JsonDecodeError:
+    object := scan_object_scalars_bytes(input)
+    if not object.ok:
+        fail JsonDecodeError("invalid json object")
+    return object
+
+ # decodes a shallow scalar object from text.
+pub fn decode_scalars(input: String) -> JsonScalarObject!JsonDecodeError:
+    return decode_scalars_bytes(bytes.from_string_utf8(input))!
+
+ # gets a required string field from a scanned scalar object.
+pub fn require_string(object: JsonScalarObject, key: String) -> String!JsonDecodeError:
+    if object.strings.contains_key(key):
+        return object.strings[key]
+    fail JsonDecodeError("missing string field: " + key)
+
+ # gets a required int field from a scanned scalar object.
+pub fn require_int(object: JsonScalarObject, key: String) -> Int!JsonDecodeError:
+    if object.ints.contains_key(key):
+        return object.ints[key]
+    fail JsonDecodeError("missing int field: " + key)
+
+ # gets a required bool field from a scanned scalar object.
+pub fn require_bool(object: JsonScalarObject, key: String) -> Bool!JsonDecodeError:
+    if object.bools.contains_key(key):
+        return object.bools[key]
+    fail JsonDecodeError("missing bool field: " + key)
 
  # captures the current parser state.
 pub fn checkpoint() -> JsonCheckpoint:
@@ -1057,6 +1262,64 @@ test "json small object scanners find shallow values":
     assert_eq(scan_object_string(doc, "missing"), "")
     assert_eq(scan_object_int_or(doc, "limit", 0), 25)
     assert_eq(scan_object_int_or(doc, "missing", 7), 7)
+
+test "json byte scalar scanner reads shallow objects":
+    dq := chr(34)
+    mut doc := chr(123) + dq + "team" + dq + ":" + dq + "blue" + dq
+    doc = doc + "," + dq + "limit" + dq + ":-25"
+    doc = doc + "," + dq + "active" + dq + ":true"
+    doc = doc + "," + dq + "skip" + dq + ":null" + chr(125)
+    scanned := scan_object_scalars_bytes(bytes.from_string_utf8(doc))
+
+    assert(scanned.ok)
+    assert(scanned.strings.contains_key("team"))
+    assert(scanned.ints.contains_key("limit"))
+    assert(scanned.bools.contains_key("active"))
+    assert_eq(scanned.strings["team"], "blue")
+    assert_eq(scanned.ints["limit"], 0 - 25)
+    assert(scanned.bools["active"])
+    assert(not scanned.strings.contains_key("skip"))
+    assert_eq(scalar_string_or(scanned, "missing", "fallback"), "fallback")
+    assert_eq(scalar_int_or(scanned, "missing", 9), 9)
+    assert(scalar_bool_or(scanned, "missing", true))
+
+test "json byte scalar scanner rejects nested values":
+    dq := chr(34)
+    doc := chr(123) + dq + "nested" + dq + ":" + chr(123) + dq + "x" + dq + ":1" + chr(125) + chr(125)
+    scanned := scan_object_scalars_bytes(bytes.from_string_utf8(doc))
+
+    assert(not scanned.ok)
+
+struct JsonStructDecodeFixture:
+    pub name: String
+    pub score: Int
+    pub active: Bool
+
+fn json_decode_fixture(fields: JsonScalarObject) -> JsonStructDecodeFixture!JsonDecodeError:
+    name := require_string(fields, "name")!
+    score := require_int(fields, "score")!
+    active := require_bool(fields, "active")!
+    return JsonStructDecodeFixture(name, score, active)
+
+test "json scalar fields translate into structs":
+    dq := chr(34)
+    mut doc := chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq
+    doc = doc + "," + dq + "score" + dq + ":42"
+    doc = doc + "," + dq + "active" + dq + ":true" + chr(125)
+    fields := decode_scalars(doc)!
+    decoded := json_decode_fixture(fields)!
+
+    assert_eq(decoded.name, "forge")
+    assert_eq(decoded.score, 42)
+    assert(decoded.active)
+
+test "json scalar decoding reports missing required fields":
+    dq := chr(34)
+    doc := chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq + chr(125)
+    decoded := json_decode_fixture(decode_scalars(doc)!)
+
+    assert(decoded.is_err)
+    assert(decoded.err.message.contains("score"))
 
 fn json_save_chunked(path: String, handle: Int, chunk_size: Int) -> Int:
     write_result := io.write_file_text_chunked(path, json_encode(handle), chunk_size)

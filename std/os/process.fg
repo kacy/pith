@@ -254,3 +254,31 @@ pub fn run_shell(command_text: String) -> Int:
 # runs a shell command and returns stdout.
 pub fn output_shell(command_text: String) -> String!:
     return exec_output(command_text)
+
+test "process command builder stores argv cwd and env":
+    cmd := command("tool").arg("one").args(["two", "three"]).cwd("/tmp").env("MODE", "dev")
+
+    assert(cmd.program == "tool")
+    assert_eq(cmd.argv.len(), 3)
+    assert(cmd.argv[0] == "one")
+    assert(cmd.argv[2] == "three")
+    assert(cmd.cwd_path == "/tmp")
+    assert_eq(cmd.env_keys.len(), 1)
+    assert(cmd.env_keys[0] == "MODE")
+    assert(cmd.env_values[0] == "dev")
+
+test "process output helpers classify status":
+    ok := Output(0, " forge" + chr(10), "")
+    bad := Output(7, "", "problem" + chr(10))
+    checked := bad.ensure_success()
+
+    assert(ok.success())
+    assert(not ok.failed())
+    assert(ok.stdout_trimmed() == "forge")
+    assert(bad.failed())
+    assert(bad.stderr_trimmed() == "problem")
+    assert(checked.is_err)
+    assert_eq(checked.err.status, 7)
+
+test "process shell helpers capture output":
+    assert(output_shell("printf shell")! == "shell")

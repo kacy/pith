@@ -306,6 +306,28 @@ test "binary writers emit expected bytes":
     assert_eq(data[3], 86)
     assert_eq(data[4], 120)
 
+test "binary writers and readers round trip larger values":
+    out := bytes.buffer()
+    write_u8(out, 31)!
+    write_u16_le(out, 4660)!
+    write_u16_be(out, 4660)!
+    write_u32_le(out, 305419896)!
+    write_u32_be(out, 305419896)!
+    data := out.bytes()
+
+    assert_eq(data.len(), 13)
+    assert_eq(read_u16_le_at(data, 1)!, 4660)
+    assert_eq(read_u16_be_at(data, 3)!, 4660)
+    assert_eq(read_u32_le_at(data, 5)!, 305419896)
+    assert_eq(read_u32_be_at(data, 9)!, 305419896)
+
+    wide := bytes.buffer()
+    write_u64_le(wide, 81985529216486895)!
+    write_u64_be(wide, 81985529216486895)!
+    wide_data := wide.bytes()
+    assert_eq(read_u64_le_at(wide_data, 0)!, 81985529216486895)
+    assert_eq(read_u64_be_at(wide_data, 8)!, 81985529216486895)
+
 test "binary reports range and eof errors":
     out := bytes.buffer()
     too_large := write_u8(out, 300)
@@ -315,3 +337,25 @@ test "binary reports range and eof errors":
     assert(too_large.is_err)
     assert(short.is_err)
     assert(missing_zero.is_err)
+
+test "binary reader skips and reads zero-terminated bytes":
+    data := bytes.from_string_utf8(chr(31) + chr(52) + chr(18) + chr(18) + chr(52) + chr(120) + chr(86) + chr(52) + chr(18) + chr(18) + chr(52) + chr(86) + chr(120))
+    bin_reader := reader(data)
+
+    assert_eq(position(bin_reader), 0)
+    assert_eq(read_u8(bin_reader)!, 31)
+    assert_eq(read_u16_le(bin_reader)!, 4660)
+    assert_eq(read_u16_be(bin_reader)!, 4660)
+    assert(skip(bin_reader, 4)!)
+    assert_eq(read_u32_be(bin_reader)!, 305419896)
+    assert_eq(remaining(bin_reader), 0)
+    assert(read_u8(bin_reader).is_err)
+
+    zero_data := bytes.buffer()
+    zero_data.write_string_utf8("abc")!
+    zero_data.write_byte(0)!
+    zero_data.write_string_utf8("tail")!
+    zero_reader := reader(zero_data.bytes())
+    zero_text := read_until_zero(zero_reader)!.to_string_utf8()!
+    assert_eq(zero_text, "abc")
+    assert_eq(position(zero_reader), 4)

@@ -79,30 +79,32 @@ fn make_rows(records: Int) -> List[List[String]]:
         i = i + 1
     return rows
 
-fn transform(rows: List[List[String]], cfg: BenchConfig) -> PipelineStats:
-    mut active_count := 0
-    mut selected_count := 0
-    mut score_sum := 0
-    mut quota_sum := 0
-    mut url_path_sum := 0
-    mut path_part_sum := 0
-    mut note_hash_sum := 0
+fn empty_stats() -> PipelineStats:
+    return PipelineStats(0, 0, 0, 0, 0, 0, 0)
+
+fn transform_row(stats: PipelineStats, row: csv.Row, cfg: BenchConfig, index: Int) -> PipelineStats:
+    if index == 0:
+        return stats
+    score := row.get_int(4)
+    quota := row.get_int(5)
+    active := row.eq(3, "true")
+    mut active_count := stats.active_count
+    mut selected_count := stats.selected_count
+    mut score_sum := stats.score_sum
+    mut quota_sum := stats.quota_sum
+    if active:
+        active_count = active_count + 1
+    if (active or cfg.include_inactive) and score >= cfg.min_score:
+        selected_count = selected_count + 1
+        score_sum = score_sum + score * cfg.multiplier
+        quota_sum = quota_sum + quota
+    return PipelineStats(active_count, selected_count, score_sum, quota_sum, stats.url_path_sum + url.path_len(row.get(6)), stats.path_part_sum + path.clean_part_count(row.get(9)), stats.note_hash_sum + hash.fnv1a(row.bytes(8)))
+
+fn transform_row_views(rows: List[csv.Row], cfg: BenchConfig) -> PipelineStats:
+    mut stats := empty_stats()
     for row, i in rows:
-        if i == 0:
-            continue
-        score := parse_int(row[4]).ok
-        quota := parse_int(row[5]).ok
-        active := row[3] == "true"
-        url_path_sum = url_path_sum + url.path_len(row[6])
-        path_part_sum = path_part_sum + path.clean_part_count(row[9])
-        note_hash_sum = note_hash_sum + hash.fnv1a_string(row[8])
-        if active:
-            active_count = active_count + 1
-        if (active or cfg.include_inactive) and score >= cfg.min_score:
-            selected_count = selected_count + 1
-            score_sum = score_sum + score * cfg.multiplier
-            quota_sum = quota_sum + quota
-    return PipelineStats(active_count, selected_count, score_sum, quota_sum, url_path_sum, path_part_sum, note_hash_sum)
+        stats = transform_row(stats, row, cfg, i)
+    return stats
 
 fn write_report(stats: PipelineStats, records: Int) -> Bytes:
     mut report := chr(123) + chr(34) + "records" + chr(34) + ":" + records.to_string()
@@ -153,11 +155,12 @@ fn main() -> Int!:
     csv_write_ms := time() - start
 
     start = time()
-    parsed_rows := csv.parse_file_chunked(csv_path, 8192)!
+    csv_data := fs.read_bytes(csv_path)!
+    row_views := csv.rows_bytes(csv_data)
     csv_read_ms := time() - start
 
     start = time()
-    stats := transform(parsed_rows, cfg)
+    stats := transform_row_views(row_views, cfg)
     transform_ms := time() - start
 
     start = time()

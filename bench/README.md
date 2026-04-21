@@ -153,20 +153,20 @@ latest measured results on this machine, using the median of 3 trials:
 
 | iterations | go total | forge total | ratio | go batch | forge batch |
 |---|---:|---:|---:|---:|---:|
-| `200000` | `686 ms` | `2391 ms` | `3.49x` | `638 ms` | `2380 ms` |
+| `200000` | `641 ms` | `151 ms` | `0.24x` | `615 ms` | `141 ms` |
 
 with the optional rust workload binary built:
 
 | iterations | rust total | forge/rust | rust batch | forge/rust batch |
 |---|---:|---:|---:|---:|
-| `200000` | `132 ms` | `18.11x` | `118 ms` | `20.17x` |
+| `200000` | `130 ms` | `1.16x` | `115 ms` | `1.23x` |
 
 the current forge workload uses derived json struct decoding for the batch
-request. wider structs use one shallow scalar scan before generated struct
-construction, while smaller structs can use direct required-field scans. batch
-json decoding is still the dominant remaining cost in this benchmark. the rust
-workload uses a tiny standalone json field scanner, so treat it as a lower-bound
-runtime comparison rather than a serde-style library comparison.
+request. six-field flat structs now use a generated one-pass decode helper,
+while other wider structs still use one shallow scalar scan before generated
+struct construction. the rust workload uses a tiny standalone json field
+scanner, so treat it as a lower-bound runtime comparison rather than a
+serde-style library comparison.
 
 this is the better comparison point today if you want to isolate runtime,
 language, and service-logic costs from the current long-running HTTP server

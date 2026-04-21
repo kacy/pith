@@ -6,6 +6,14 @@ struct JsonDerivedFixture:
     pub score: Int
     pub active: Bool
 
+struct JsonDerivedWideFixture:
+    pub name: String
+    pub region: String
+    pub active: Bool
+    pub score: Int
+    pub limit: Int
+    pub multiplier: Int
+
 fn main() -> Int:
     dq := chr(34)
     mut doc := chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq
@@ -24,4 +32,16 @@ fn main() -> Int:
     print(missing.is_err.to_string())
     if missing.is_err:
         print(missing.err.message.contains("score").to_string())
+
+    mut wide_doc := chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq
+    wide_doc = wide_doc + "," + dq + "region" + dq + ":" + dq + "west" + dq
+    wide_doc = wide_doc + "," + dq + "active" + dq + ":true"
+    wide_doc = wide_doc + "," + dq + "score" + dq + ":42"
+    wide_doc = wide_doc + "," + dq + "limit" + dq + ":5"
+    wide_doc = wide_doc + "," + dq + "multiplier" + dq + ":3" + chr(125)
+    wide := json.decode_text[JsonDerivedWideFixture](wide_doc)
+    if wide.is_ok:
+        print(wide.ok.name + ":" + wide.ok.region + ":" + wide.ok.score.to_string() + ":" + wide.ok.limit.to_string() + ":" + wide.ok.multiplier.to_string())
+    wide_missing := json.decode_text[JsonDerivedWideFixture](chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq + chr(125))
+    print(wide_missing.is_err.to_string())
     return 0

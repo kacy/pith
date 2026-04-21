@@ -44,9 +44,10 @@ fn declare_i64_var(builder: &mut FunctionBuilder<'_>) -> Variable {
 
 #[cfg(forge_cranelift_new_api)]
 fn jump_with_i64_arg(builder: &mut FunctionBuilder<'_>, block: Block, value: Value) {
-    builder
-        .ins()
-        .jump(block, &[cranelift::codegen::ir::instructions::BlockArg::Value(value)]);
+    builder.ins().jump(
+        block,
+        &[cranelift::codegen::ir::instructions::BlockArg::Value(value)],
+    );
 }
 
 #[cfg(not(forge_cranelift_new_api))]
@@ -75,7 +76,9 @@ fn inline_list_get_value(
     let list_is_null = builder.ins().icmp_imm(IntCC::Equal, list, 0);
     let null_block = builder.create_block();
     let after_null = builder.create_block();
-    builder.ins().brif(list_is_null, null_block, &[], after_null, &[]);
+    builder
+        .ins()
+        .brif(list_is_null, null_block, &[], after_null, &[]);
     builder.switch_to_block(null_block);
     jump_with_i64_arg(builder, done, zero);
     builder.switch_to_block(after_null);
@@ -83,7 +86,9 @@ fn inline_list_get_value(
     let index_is_negative = builder.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
     let neg_block = builder.create_block();
     let after_neg = builder.create_block();
-    builder.ins().brif(index_is_negative, neg_block, &[], after_neg, &[]);
+    builder
+        .ins()
+        .brif(index_is_negative, neg_block, &[], after_neg, &[]);
     builder.switch_to_block(neg_block);
     jump_with_i64_arg(builder, done, zero);
     builder.switch_to_block(after_neg);
@@ -97,7 +102,9 @@ fn inline_list_get_value(
     let is_eight = builder.ins().icmp_imm(IntCC::Equal, elem_size, 8);
     let size_fail = builder.create_block();
     let after_size = builder.create_block();
-    builder.ins().brif(is_eight, after_size, &[], size_fail, &[]);
+    builder
+        .ins()
+        .brif(is_eight, after_size, &[], size_fail, &[]);
     builder.switch_to_block(size_fail);
     jump_with_i64_arg(builder, done, zero);
     builder.switch_to_block(after_size);
@@ -131,14 +138,66 @@ fn inline_list_get_value(
     let data_is_null = builder.ins().icmp_imm(IntCC::Equal, data_ptr, 0);
     let ptr_fail = builder.create_block();
     let load_block = builder.create_block();
-    builder.ins().brif(data_is_null, ptr_fail, &[], load_block, &[]);
+    builder
+        .ins()
+        .brif(data_is_null, ptr_fail, &[], load_block, &[]);
     builder.switch_to_block(ptr_fail);
     jump_with_i64_arg(builder, done, zero);
     builder.switch_to_block(load_block);
 
     let byte_offset = builder.ins().ishl_imm(index, 3);
     let elem_addr = builder.ins().iadd(data_ptr, byte_offset);
-    let value = builder.ins().load(types::I64, MemFlags::new(), elem_addr, 0);
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), elem_addr, 0);
+    jump_with_i64_arg(builder, done, value);
+
+    builder.switch_to_block(done);
+    builder.block_params(done)[0]
+}
+
+fn inline_bytes_get(builder: &mut FunctionBuilder<'_>, bytes: Value, index: Value) -> Value {
+    let zero = builder.ins().iconst(types::I64, 0);
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+
+    let bytes_is_null = builder.ins().icmp_imm(IntCC::Equal, bytes, 0);
+    let null_block = builder.create_block();
+    let after_null = builder.create_block();
+    builder
+        .ins()
+        .brif(bytes_is_null, null_block, &[], after_null, &[]);
+    builder.switch_to_block(null_block);
+    jump_with_i64_arg(builder, done, zero);
+    builder.switch_to_block(after_null);
+
+    let index_is_negative = builder.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
+    let neg_block = builder.create_block();
+    let after_neg = builder.create_block();
+    builder
+        .ins()
+        .brif(index_is_negative, neg_block, &[], after_neg, &[]);
+    builder.switch_to_block(neg_block);
+    jump_with_i64_arg(builder, done, zero);
+    builder.switch_to_block(after_neg);
+
+    let data_ptr = builder.ins().load(types::I64, MemFlags::new(), bytes, 0);
+    let len = builder.ins().load(types::I64, MemFlags::new(), bytes, 8);
+    let out_of_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
+    let bounds_fail = builder.create_block();
+    let after_bounds = builder.create_block();
+    builder
+        .ins()
+        .brif(out_of_bounds, bounds_fail, &[], after_bounds, &[]);
+    builder.switch_to_block(bounds_fail);
+    jump_with_i64_arg(builder, done, zero);
+    builder.switch_to_block(after_bounds);
+
+    let elem_addr = builder.ins().iadd(data_ptr, index);
+    let byte = builder.ins().load(types::I8, MemFlags::new(), elem_addr, 0);
+    let value = builder.ins().uextend(types::I64, byte);
     jump_with_i64_arg(builder, done, value);
 
     builder.switch_to_block(done);
@@ -253,14 +312,17 @@ pub fn compile_from_ir(
                         .declare_data(&data_name, Linkage::Local, true, false)
                         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
                     let mut desc = DataDescription::new();
-                    let init_val: i64 =
-                        if init_kind == "list" || init_kind == "map" || init_kind == "set" || init_kind == "set_int" {
-                            0
-                        } else if init_kind.starts_with("str:") {
-                            0 // will be patched in __init_globals
-                        } else {
-                            init_kind.parse().unwrap_or(0)
-                        };
+                    let init_val: i64 = if init_kind == "list"
+                        || init_kind == "map"
+                        || init_kind == "set"
+                        || init_kind == "set_int"
+                    {
+                        0
+                    } else if init_kind.starts_with("str:") {
+                        0 // will be patched in __init_globals
+                    } else {
+                        init_kind.parse().unwrap_or(0)
+                    };
                     desc.define(init_val.to_le_bytes().to_vec().into_boxed_slice());
                     codegen
                         .module
@@ -921,8 +983,8 @@ fn compile_ir_function(
 
             "call" if parts.len() >= 4 => {
                 let reg: usize = parts[1].parse().unwrap_or(0);
-                let (mut fname, retkind, nargs, arg_start) = parse_call_shape(&parts)
-                    .ok_or_else(|| {
+                let (mut fname, retkind, nargs, arg_start) =
+                    parse_call_shape(&parts).ok_or_else(|| {
                         CompileError::ModuleError(format!(
                             "ir consumer: malformed call instruction in {}: {}",
                             func_name, line
@@ -991,6 +1053,15 @@ fn compile_ir_function(
                         if j + arg_start < parts.len() {
                             args.push(get_reg(&regs, parts[j + arg_start]));
                         }
+                    }
+                    if fname == "bytes_get" && args.len() == 2 {
+                        let inlined = inline_bytes_get(&mut builder, args[0], args[1]);
+                        regs.insert(reg, inlined);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        struct_regs.remove(&reg);
+                        continue;
                     }
                     if (fname == "forge_list_get_value"
                         || fname == "forge_list_get_value_unchecked")
@@ -1095,10 +1166,15 @@ fn compile_ir_function(
                     } else if let Some(&var) = named_vars.get(fname) {
                         // Indirect call through closure handle variable
                         let closure_handle = builder.use_var(var);
-                        let fn_ptr = if let Some(&closure_get_id) = runtime_funcs.get("forge_closure_get_fn") {
-                            let closure_get_ref = *func_ref_cache.entry(closure_get_id).or_insert_with(|| {
-                                codegen.module.declare_func_in_func(closure_get_id, builder.func)
-                            });
+                        let fn_ptr = if let Some(&closure_get_id) =
+                            runtime_funcs.get("forge_closure_get_fn")
+                        {
+                            let closure_get_ref =
+                                *func_ref_cache.entry(closure_get_id).or_insert_with(|| {
+                                    codegen
+                                        .module
+                                        .declare_func_in_func(closure_get_id, builder.func)
+                                });
                             let call = builder.ins().call(closure_get_ref, &[closure_handle]);
                             builder.func.dfg.first_result(call)
                         } else {
@@ -1231,7 +1307,8 @@ fn compile_ir_function(
             "field" if parts.len() >= 4 => {
                 let reg: usize = parts[1].parse().unwrap_or(0);
                 let obj = get_reg(&regs, parts[2]);
-                let (offset, field_retkind) = if parts.len() >= 6 && parts[3].parse::<i32>().is_ok() {
+                let (offset, field_retkind) = if parts.len() >= 6 && parts[3].parse::<i32>().is_ok()
+                {
                     (parts[3].parse::<i32>().unwrap_or(0), Some(parts[4]))
                 } else if parts.len() == 4 {
                     let field_name = parts[3];
@@ -1317,9 +1394,12 @@ fn compile_ir_function(
                         .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func));
                     let addr = builder.ins().func_addr(types::I64, fref);
                     if let Some(&closure_new_id) = runtime_funcs.get("forge_closure_new") {
-                        let closure_new_ref = *func_ref_cache.entry(closure_new_id).or_insert_with(|| {
-                            codegen.module.declare_func_in_func(closure_new_id, builder.func)
-                        });
+                        let closure_new_ref =
+                            *func_ref_cache.entry(closure_new_id).or_insert_with(|| {
+                                codegen
+                                    .module
+                                    .declare_func_in_func(closure_new_id, builder.func)
+                            });
                         let call = builder.ins().call(closure_new_ref, &[addr]);
                         regs.insert(reg, builder.func.dfg.first_result(call));
                     } else {
@@ -1477,7 +1557,10 @@ mod tests {
 
     #[test]
     fn explicit_struct_name_from_retkind_requires_struct_prefix() {
-        assert_eq!(explicit_struct_name_from_retkind("struct:Token"), Some("Token"));
+        assert_eq!(
+            explicit_struct_name_from_retkind("struct:Token"),
+            Some("Token")
+        );
         assert_eq!(explicit_struct_name_from_retkind("Token"), None);
         assert_eq!(explicit_struct_name_from_retkind("string"), None);
         assert_eq!(explicit_struct_name_from_retkind("unknown"), None);

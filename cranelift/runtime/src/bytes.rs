@@ -1,7 +1,10 @@
 use crate::{ensure_perf_stats_registered, perf_count, PERF_BYTES_ALLOCS, PERF_BYTES_ALLOC_BYTES};
-use crate::{PERF_BYTE_BUFFER_NEWS, PERF_BYTE_BUFFER_WRITE_BYTES, PERF_BYTE_BUFFER_WRITES};
+use crate::{PERF_BYTE_BUFFER_NEWS, PERF_BYTE_BUFFER_WRITES, PERF_BYTE_BUFFER_WRITE_BYTES};
 
+#[repr(C)]
 pub(crate) struct ForgeBytes {
+    pub(crate) data_ptr: *const u8,
+    pub(crate) data_len: usize,
     pub(crate) data: Vec<u8>,
 }
 
@@ -27,7 +30,13 @@ pub(crate) fn forge_bytes_from_vec(data: Vec<u8>) -> i64 {
     ensure_perf_stats_registered();
     perf_count(&PERF_BYTES_ALLOCS, 1);
     perf_count(&PERF_BYTES_ALLOC_BYTES, data.len());
-    Box::into_raw(Box::new(ForgeBytes { data })) as i64
+    let data_ptr = data.as_ptr();
+    let data_len = data.len();
+    Box::into_raw(Box::new(ForgeBytes {
+        data_ptr,
+        data_len,
+        data,
+    })) as i64
 }
 
 #[no_mangle]
@@ -64,7 +73,11 @@ pub unsafe extern "C" fn forge_bytes_is_empty(handle: i64) -> i64 {
     let Some(bytes) = forge_bytes_ref(handle) else {
         return 1;
     };
-    if bytes.data.is_empty() { 1 } else { 0 }
+    if bytes.data.is_empty() {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -117,7 +130,11 @@ pub unsafe extern "C" fn forge_bytes_eq(a: i64, b: i64) -> i64 {
     let Some(b_bytes) = forge_bytes_ref(b) else {
         return 0;
     };
-    if a_bytes.data == b_bytes.data { 1 } else { 0 }
+    if a_bytes.data == b_bytes.data {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -132,7 +149,9 @@ pub extern "C" fn forge_byte_buffer_with_capacity(capacity: i64) -> i64 {
     let cap = if capacity > 0 { capacity as usize } else { 0 };
     ensure_perf_stats_registered();
     perf_count(&PERF_BYTE_BUFFER_NEWS, 1);
-    Box::into_raw(Box::new(ForgeByteBuffer { data: Vec::with_capacity(cap) })) as i64
+    Box::into_raw(Box::new(ForgeByteBuffer {
+        data: Vec::with_capacity(cap),
+    })) as i64
 }
 
 #[no_mangle]

@@ -1915,6 +1915,17 @@ fn ir_json_require_helper_name(field_tid: Int) -> String:
             return "std_json_require_bool"
     return ""
 
+fn ir_json_field_type_tag(field_tid: Int) -> Int:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        if info.name == "String":
+            return 0
+        if info.name == "Int":
+            return 1
+        if info.name == "Bool":
+            return 2
+    return 0 - 1
+
 fn ir_emit_json_field_ok(result_r: Int, field_tid: Int) -> Int:
     ok_r := ir_reg()
     ir_emit("field " + ok_r.to_string() + " " + result_r.to_string() + " 8 " + ir_type_from_tid(field_tid) + " ok")
@@ -1971,6 +1982,26 @@ fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+fn ir_emit_json_decode_flat6_call(input_r: Int, target_info: TypeInfo) -> Int:
+    result_r := ir_reg()
+    mut arg_text := " " + input_r.to_string()
+
+    for field_name, i in target_info.fields:
+        if i >= target_info.field_types.len():
+            continue
+        field_tid := target_info.field_types[i]
+        tag := ir_json_field_type_tag(field_tid)
+        if tag < 0:
+            return ir_zero_reg()
+        key_r := ir_reg()
+        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
+        tag_r := ir_reg()
+        ir_emit("iconst " + tag_r.to_string() + " " + tag.to_string())
+        arg_text = arg_text + " " + key_r.to_string() + " " + tag_r.to_string()
+
+    ir_emit_call_text(result_r, "json_decode_flat6", "tuple", 13, arg_text)
+    return result_r
+
 fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool) -> Int:
     arg_regs := ir_collect_call_arg_regs(node, 1)
     if arg_regs.len() == 0:
@@ -1992,6 +2023,8 @@ fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool) -> Int:
     target_info := get_type_info(target_tid)
     if target_info.kind != "struct":
         return ir_zero_reg()
+    if target_info.fields.len() == 6:
+        return ir_emit_json_decode_flat6_call(input_r, target_info)
     if target_info.fields.len() > 3:
         return ir_emit_json_decode_map_call(input_r, target_info)
 

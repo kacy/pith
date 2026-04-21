@@ -16,7 +16,7 @@ EOCD_SIG := 101010256
 METHOD_STORED := 0
 VERSION_NEEDED := 20
 
-## one entry in a zip archive.
+# one entry in a zip archive.
 pub struct ZipEntry:
     pub name: String
     pub size: Int
@@ -236,7 +236,7 @@ fn zip_add_file(out: ByteBuffer, records: List[ZipRecord], name: String, content
     records.push(ZipRecord(clean_name, content.len(), content.len(), crc, METHOD_STORED, offset, false))
     return records
 
-## list entries in a zip archive.
+# list entries in a zip archive.
 pub fn list(data: Bytes) -> List[ZipEntry]!:
     records := zip_records(data)!
     mut entries: List[ZipEntry] := []
@@ -244,7 +244,7 @@ pub fn list(data: Bytes) -> List[ZipEntry]!:
         entries.push(zip_entry_from_record(record))
     return entries
 
-## create a zip archive from paths.
+# create a zip archive from paths.
 pub fn create(paths: List[String]) -> Bytes!:
     out := bytes.buffer()
     mut records: List[ZipRecord] := []
@@ -267,7 +267,7 @@ pub fn create(paths: List[String]) -> Bytes!:
     zip_write_eocd(out, records.len(), central_size, central_offset)!
     return out.bytes()
 
-## extract a zip archive into a directory.
+# extract a zip archive into a directory.
 pub fn extract(data: Bytes, output_dir: String) -> Bool!:
     if not fs.make_dirs(output_dir):
         fail zip_fail("could not create output dir")
@@ -286,10 +286,90 @@ pub fn extract(data: Bytes, output_dir: String) -> Bool!:
         fs.write_bytes(out_path, content)!
     return true
 
-## create a zip archive file from paths.
+# create a zip archive file from paths.
 pub fn create_file(paths: List[String], output_path: String) -> Bool!:
     return fs.write_bytes(output_path, create(paths)!)
 
-## extract a zip archive file into a directory.
+# extract a zip archive file into a directory.
 pub fn extract_file(archive_path: String, output_dir: String) -> Bool!:
     return extract(fs.read_bytes(archive_path)!, output_dir)
+
+fn zip_test_manual_archive(name: String, content: Bytes, method: Int, crc_value: Int) -> Bytes!:
+    out := bytes.buffer()
+    name_bytes := bytes.from_string_utf8(name)
+    zip_write_u32(out, LOCAL_HEADER_SIG)!
+    zip_write_u16(out, VERSION_NEEDED)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, method)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u32(out, crc_value)!
+    zip_write_u32(out, content.len())!
+    zip_write_u32(out, content.len())!
+    zip_write_u16(out, name_bytes.len())!
+    zip_write_u16(out, 0)!
+    zip_write_bytes(out, name_bytes)!
+    zip_write_bytes(out, content)!
+    central_offset := out.bytes().len()
+
+    zip_write_u32(out, CENTRAL_HEADER_SIG)!
+    zip_write_u16(out, VERSION_NEEDED)!
+    zip_write_u16(out, VERSION_NEEDED)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, method)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u32(out, crc_value)!
+    zip_write_u32(out, content.len())!
+    zip_write_u32(out, content.len())!
+    zip_write_u16(out, name_bytes.len())!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u32(out, 0)!
+    zip_write_u32(out, 0)!
+    zip_write_bytes(out, name_bytes)!
+    central_size := out.bytes().len() - central_offset
+
+    zip_write_u32(out, EOCD_SIG)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 1)!
+    zip_write_u16(out, 1)!
+    zip_write_u32(out, central_size)!
+    zip_write_u32(out, central_offset)!
+    zip_write_u16(out, 0)!
+    return out.bytes()
+
+test "zip creates extracts and rejects invalid archives":
+    root := fs.make_temp_dir("forge-zip-")!
+    bundle := path.join(root, "bundle")
+    assert(fs.make_dirs(path.join(bundle, "nested")))
+    assert(fs.write(path.join(bundle, "hello.txt"), "hello zip")!)
+    assert(fs.write_bytes(path.join(path.join(bundle, "nested"), "data.bin"), bytes.from_string_utf8("bin"))!)
+
+    archive := create([bundle])!
+    entries := list(archive)!
+    assert_eq(entries.len(), 2)
+    assert_eq(entries[0].name, "bundle/hello.txt")
+    assert_eq(entries[0].size, 9)
+    assert_eq(entries[1].name, "bundle/nested/data.bin")
+    assert_eq(entries[1].size, 3)
+
+    out_dir := path.join(root, "out")
+    assert(extract(archive, out_dir)!)
+    assert_eq(fs.read(path.join(path.join(out_dir, "bundle"), "hello.txt"))!, "hello zip")
+    assert_eq(fs.read(path.join(path.join(path.join(out_dir, "bundle"), "nested"), "data.bin"))!, "bin")
+
+    archive_path := path.join(root, "bundle.zip")
+    assert(create_file([bundle], archive_path)!)
+    out_dir2 := path.join(root, "out2")
+    assert(extract_file(archive_path, out_dir2)!)
+    assert_eq(fs.read(path.join(path.join(out_dir2, "bundle"), "hello.txt"))!, "hello zip")
+
+    content := bytes.from_string_utf8("bad")
+    assert(extract(zip_test_manual_archive("bad.txt", content, METHOD_STORED, checksum.crc32(content) + 1)!, path.join(root, "bad-crc")).is_err)
+    assert(list(zip_test_manual_archive("compressed.txt", content, 8, checksum.crc32(content))!).is_err)
+    assert(extract(zip_test_manual_archive("../evil.txt", bytes.empty(), METHOD_STORED, checksum.crc32(bytes.empty()))!, path.join(root, "unsafe")).is_err)
+    assert(fs.remove_tree(root))

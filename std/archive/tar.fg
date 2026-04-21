@@ -12,7 +12,7 @@ BLOCK_SIZE := 512
 TYPE_FILE := "0"
 TYPE_DIR := "5"
 
-## one entry in a tar archive.
+# one entry in a tar archive.
 pub struct TarEntry:
     pub name: String
     pub size: Int
@@ -269,7 +269,7 @@ fn tar_entry_from_header(data: Bytes, offset: Int) -> TarEntry!:
         fail tar_fail("unsupported tar entry type")
     return TarEntry(tar_safe_name(name)!, size, is_dir)
 
-## list entries in a tar archive.
+# list entries in a tar archive.
 pub fn list(data: Bytes) -> List[TarEntry]!:
     mut entries: List[TarEntry] := []
     mut offset := 0
@@ -281,7 +281,7 @@ pub fn list(data: Bytes) -> List[TarEntry]!:
         offset = offset + BLOCK_SIZE + tar_padded_size(entry.size)
     fail tar_fail("tar archive truncated")
 
-## create a tar archive from paths.
+# create a tar archive from paths.
 pub fn create(paths: List[String]) -> Bytes!:
     out := bytes.buffer()
     for input_path in paths:
@@ -301,7 +301,7 @@ pub fn create(paths: List[String]) -> Bytes!:
         i = i + 1
     return out.bytes()
 
-## extract a tar archive into a directory.
+# extract a tar archive into a directory.
 pub fn extract(data: Bytes, output_dir: String) -> Bool!:
     if not fs.make_dirs(output_dir):
         fail tar_fail("could not create output dir")
@@ -326,10 +326,87 @@ pub fn extract(data: Bytes, output_dir: String) -> Bool!:
         offset = offset + BLOCK_SIZE + tar_padded_size(entry.size)
     fail tar_fail("tar archive truncated")
 
-## create a tar archive file from paths.
+# create a tar archive file from paths.
 pub fn create_file(paths: List[String], output_path: String) -> Bool!:
     return fs.write_bytes(output_path, create(paths)!)
 
-## extract a tar archive file into a directory.
+# extract a tar archive file into a directory.
 pub fn extract_file(archive_path: String, output_dir: String) -> Bool!:
     return extract(fs.read_bytes(archive_path)!, output_dir)
+
+fn tar_test_unsafe_archive() -> Bytes!:
+    mut header: List[Int] := []
+    tar_push_string_field(header, "../evil.txt", 100)!
+    tar_push_octal_field(header, 420, 8)!
+    tar_push_octal_field(header, 0, 8)!
+    tar_push_octal_field(header, 0, 8)!
+    tar_push_octal_field(header, 0, 12)!
+    tar_push_octal_field(header, 0, 12)!
+    mut checksum_i := 0
+    while checksum_i < 8:
+        header.push(32)
+        checksum_i = checksum_i + 1
+    tar_push_byte(header, ord(TYPE_FILE))
+    tar_push_string_field(header, "", 100)!
+    tar_push_string_field(header, "ustar", 6)!
+    tar_push_string_field(header, "00", 2)!
+    tar_push_string_field(header, "", 32)!
+    tar_push_string_field(header, "", 32)!
+    tar_push_octal_field(header, 0, 8)!
+    tar_push_octal_field(header, 0, 8)!
+    tar_push_string_field(header, "", 155)!
+    tar_push_zeroes(header, 12)
+    checksum := tar_header_checksum(header)
+
+    mut final_header: List[Int] := []
+    tar_push_string_field(final_header, "../evil.txt", 100)!
+    tar_push_octal_field(final_header, 420, 8)!
+    tar_push_octal_field(final_header, 0, 8)!
+    tar_push_octal_field(final_header, 0, 8)!
+    tar_push_octal_field(final_header, 0, 12)!
+    tar_push_octal_field(final_header, 0, 12)!
+    tar_push_checksum_field(final_header, checksum)!
+    tar_push_byte(final_header, ord(TYPE_FILE))
+    tar_push_string_field(final_header, "", 100)!
+    tar_push_string_field(final_header, "ustar", 6)!
+    tar_push_string_field(final_header, "00", 2)!
+    tar_push_string_field(final_header, "", 32)!
+    tar_push_string_field(final_header, "", 32)!
+    tar_push_octal_field(final_header, 0, 8)!
+    tar_push_octal_field(final_header, 0, 8)!
+    tar_push_string_field(final_header, "", 155)!
+    tar_push_zeroes(final_header, 12)
+
+    out := bytes.buffer()
+    tar_write_bytes(out, tar_bytes_from_list(final_header)!)!
+    mut i := 0
+    while i < BLOCK_SIZE * 2:
+        out.write_byte(0)!
+        i = i + 1
+    return out.bytes()
+
+test "tar creates extracts and rejects unsafe paths":
+    root := fs.make_temp_dir("forge-tar-")!
+    bundle := path.join(root, "bundle")
+    assert(fs.make_dirs(bundle))
+    assert(fs.write(path.join(bundle, "hello.txt"), "hello tar")!)
+
+    archive := create([bundle])!
+    entries := list(archive)!
+    assert_eq(entries.len(), 2)
+    assert_eq(entries[0].name, "bundle")
+    assert(entries[0].is_dir)
+    assert_eq(entries[1].name, "bundle/hello.txt")
+    assert_eq(entries[1].size, 9)
+
+    out_dir := path.join(root, "out")
+    assert(extract(archive, out_dir)!)
+    assert_eq(fs.read(path.join(path.join(out_dir, "bundle"), "hello.txt"))!, "hello tar")
+
+    archive_path := path.join(root, "bundle.tar")
+    assert(create_file([bundle], archive_path)!)
+    out_dir2 := path.join(root, "out2")
+    assert(extract_file(archive_path, out_dir2)!)
+    assert_eq(fs.read(path.join(path.join(out_dir2, "bundle"), "hello.txt"))!, "hello tar")
+    assert(extract(tar_test_unsafe_archive()!, path.join(root, "unsafe")).is_err)
+    assert(fs.remove_tree(root))

@@ -57,3 +57,9 @@ pub fn set_timeout(fd: Int, ms: Int):
 # Closes a TCP connection.
 pub fn close(fd: Int):
     tcp_close(fd)
+
+test "tcp wrappers report invalid descriptor errors":
+    assert(read(-1, 8).is_err)
+    assert(write(-1, "hello").is_err)
+    set_timeout(-1, 1)
+    close(-1)

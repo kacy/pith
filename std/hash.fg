@@ -212,13 +212,7 @@ fn hash_fnv1a(input: Bytes) -> Int:
 
 # hash a utf-8 string with fnv-1a.
 pub fn fnv1a_string(input: String) -> Int:
-    mut h := 2166136261
-    mut i := 0
-    while i < input.len():
-        h = bits.xor(h, ord(input[i]))
-        h = bits.mask32(h * 16777619)
-        i = i + 1
-    return h
+    return fnv1a(bytes.from_string_utf8(input))
 
 fn hash_fnv1a_string(input: String) -> Int:
     return fnv1a_string(input)

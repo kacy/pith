@@ -28,6 +28,10 @@ pub struct JsonScalarObject:
     pub ints: Map[String, Int]
     pub bools: Map[String, Bool]
 
+# error returned by the typed json decoding helpers.
+pub struct JsonDecodeError:
+    pub message: String
+
 struct JsonByteString:
     ok: Bool
     value: String
@@ -580,6 +584,35 @@ pub fn scalar_bool_or(object: JsonScalarObject, key: String, default_value: Bool
     if object.bools.contains_key(key):
         return object.bools[key]
     return default_value
+
+ # decodes a shallow scalar object or returns a typed error.
+pub fn decode_scalars_bytes(input: Bytes) -> JsonScalarObject!JsonDecodeError:
+    object := scan_object_scalars_bytes(input)
+    if not object.ok:
+        fail JsonDecodeError("invalid json object")
+    return object
+
+ # decodes a shallow scalar object from text.
+pub fn decode_scalars(input: String) -> JsonScalarObject!JsonDecodeError:
+    return decode_scalars_bytes(bytes.from_string_utf8(input))!
+
+ # gets a required string field from a scanned scalar object.
+pub fn require_string(object: JsonScalarObject, key: String) -> String!JsonDecodeError:
+    if object.strings.contains_key(key):
+        return object.strings[key]
+    fail JsonDecodeError("missing string field: " + key)
+
+ # gets a required int field from a scanned scalar object.
+pub fn require_int(object: JsonScalarObject, key: String) -> Int!JsonDecodeError:
+    if object.ints.contains_key(key):
+        return object.ints[key]
+    fail JsonDecodeError("missing int field: " + key)
+
+ # gets a required bool field from a scanned scalar object.
+pub fn require_bool(object: JsonScalarObject, key: String) -> Bool!JsonDecodeError:
+    if object.bools.contains_key(key):
+        return object.bools[key]
+    fail JsonDecodeError("missing bool field: " + key)
 
  # captures the current parser state.
 pub fn checkpoint() -> JsonCheckpoint:
@@ -1256,6 +1289,37 @@ test "json byte scalar scanner rejects nested values":
     scanned := scan_object_scalars_bytes(bytes.from_string_utf8(doc))
 
     assert(not scanned.ok)
+
+struct JsonStructDecodeFixture:
+    pub name: String
+    pub score: Int
+    pub active: Bool
+
+fn json_decode_fixture(fields: JsonScalarObject) -> JsonStructDecodeFixture!JsonDecodeError:
+    name := require_string(fields, "name")!
+    score := require_int(fields, "score")!
+    active := require_bool(fields, "active")!
+    return JsonStructDecodeFixture(name, score, active)
+
+test "json scalar fields translate into structs":
+    dq := chr(34)
+    mut doc := chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq
+    doc = doc + "," + dq + "score" + dq + ":42"
+    doc = doc + "," + dq + "active" + dq + ":true" + chr(125)
+    fields := decode_scalars(doc)!
+    decoded := json_decode_fixture(fields)!
+
+    assert_eq(decoded.name, "forge")
+    assert_eq(decoded.score, 42)
+    assert(decoded.active)
+
+test "json scalar decoding reports missing required fields":
+    dq := chr(34)
+    doc := chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq + chr(125)
+    decoded := json_decode_fixture(decode_scalars(doc)!)
+
+    assert(decoded.is_err)
+    assert(decoded.err.message.contains("score"))
 
 fn json_save_chunked(path: String, handle: Int, chunk_size: Int) -> Int:
     write_result := io.write_file_text_chunked(path, json_encode(handle), chunk_size)

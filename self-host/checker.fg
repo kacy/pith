@@ -31,6 +31,9 @@ mut module_export_entries: List[String] := []
 # Wildcard import tracking - which modules have been wildcard imported
 # This enables from X import * functionality
 mut wildcard_imports: List[String] := []
+mut generic_named_import_entries: List[String] := []
+mut generic_wildcard_import_entries: List[String] := []
+mut current_checker_module_path: String := ""
 mut generic_inference_subst: Map[String, Int] := {}
 
 # Get position from AST node
@@ -103,13 +106,42 @@ pub fn initialize_checker(file_path: String):
     module_aliases = {}
     module_export_entries = []
     wildcard_imports = []
+    generic_named_import_entries = []
+    generic_wildcard_import_entries = []
+    current_checker_module_path = ""
     generic_inference_subst = {}
     current_scope = create_scope(-1)
     register_builtin_types()
 
+pub fn set_checker_module_path(module_path: String):
+    current_checker_module_path = module_path
+
 # Register an import alias for module namespace resolution
 pub fn register_import_alias(alias: String, module_path: String):
     module_aliases.insert(alias, module_path)
+
+fn module_symbol_prefix(module_path: String) -> String:
+    mut prefix := ""
+    for ch in module_path:
+        if ch == ".":
+            prefix = prefix + "_"
+        else:
+            prefix = prefix + ch
+    return prefix + "_"
+
+fn module_generic_target_name(module_path: String, name: String) -> String:
+    if module_path.len() == 0:
+        return name
+    return module_symbol_prefix(module_path) + name
+
+fn clean_import_part(part: String) -> String:
+    mut start := 0
+    mut end := part.len()
+    while start < end and part[start] == ",":
+        start = start + 1
+    while end > start and part[end - 1] == ",":
+        end = end - 1
+    return part.substring(start, end)
 
 fn module_default_alias(module_path: String) -> String:
     mut last_dot := 0 - 1
@@ -192,6 +224,14 @@ pub fn process_import_aliases(root_idx: Int):
                 if parts.len() > 1:
                     if parts[1] == "*":
                         wildcard_imports.push(mod_path)
+                        generic_wildcard_import_entries.push(current_checker_module_path + chr(9) + mod_path)
+                    else:
+                        mut pi := 1
+                        while pi < parts.len():
+                            imported_name := clean_import_part(parts[pi])
+                            if imported_name.len() > 0:
+                                generic_named_import_entries.push(current_checker_module_path + chr(9) + imported_name + chr(9) + mod_path)
+                            pi = pi + 1
 
 # Collect all pub exports from a module.
 pub fn collect_module_exports(module_path: String, root_idx: Int):
@@ -365,6 +405,7 @@ fn register_builtin_types():
     define_builtin_function("byte_buffer_new", create_function_type([], TID_INT))
     define_builtin_function("byte_buffer_with_capacity", create_function_type([TID_INT], TID_INT))
     define_builtin_function("byte_buffer_write", create_function_type([TID_INT, tid_bytes], int_result))
+    define_builtin_function("byte_buffer_write_string_utf8", create_function_type([TID_INT, TID_STRING], int_result))
     define_builtin_function("byte_buffer_write_byte", create_function_type([TID_INT, TID_INT], int_result))
     define_builtin_function("byte_buffer_bytes", create_function_type([TID_INT], tid_bytes))
     define_builtin_function("byte_buffer_clear", create_function_type([TID_INT], TID_VOID))
@@ -503,6 +544,7 @@ fn register_builtin_types():
     fix_builtin_binding("byte_buffer_new", [], tid_int)
     fix_builtin_binding("byte_buffer_with_capacity", [tid_int], tid_int)
     fix_builtin_binding("byte_buffer_write", [tid_int, tid_bytes], int_result)
+    fix_builtin_binding("byte_buffer_write_string_utf8", [tid_int, tid_string], int_result)
     fix_builtin_binding("byte_buffer_write_byte", [tid_int, tid_int], int_result)
     fix_builtin_binding("byte_buffer_bytes", [tid_int], tid_bytes)
     fix_builtin_binding("byte_buffer_clear", [tid_int], tid_void)
@@ -869,6 +911,8 @@ fn register_function_declaration(node_idx: Int, node: Node):
     fn_tid := resolve_function_signature(node)
     if fn_tid >= 0:
         define_binding(current_scope, name, fn_tid, false)
+        if current_checker_module_path.len() > 0:
+            define_binding(current_scope, module_generic_target_name(current_checker_module_path, name), fn_tid, false)
 
 fn resolve_function_signature(node: Node) -> Int:
     mut params: List[Int] := []
@@ -1092,19 +1136,44 @@ fn collect_generic_parameter_names(node: Node) -> List[String]:
     return params
 
 fn register_generic_declaration(name: String, node_idx: Int):
-    if generic_declaration_map.contains_key(name) == false:
+    key := module_generic_target_name(current_checker_module_path, name)
+    if generic_declaration_map.contains_key(key) == false:
+        generic_declaration_names.push(key)
+    generic_declaration_map.insert(key, node_idx)
+    if current_checker_module_path.len() > 0 and generic_declaration_map.contains_key(name) == false:
         generic_declaration_names.push(name)
-    generic_declaration_map.insert(name, node_idx)
+        generic_declaration_map.insert(name, node_idx)
+
+fn resolve_generic_declaration_key(name: String) -> String:
+    if current_checker_module_path.len() > 0:
+        current_key := module_generic_target_name(current_checker_module_path, name)
+        if generic_declaration_map.contains_key(current_key):
+            return current_key
+    if generic_declaration_map.contains_key(name):
+        return name
+    for entry in generic_named_import_entries:
+        parts := entry.split(chr(9))
+        if parts.len() >= 3:
+            if parts[0] == current_checker_module_path and parts[1] == name:
+                imported_key := module_generic_target_name(parts[2], name)
+                if generic_declaration_map.contains_key(imported_key):
+                    return imported_key
+    for entry in generic_wildcard_import_entries:
+        parts := entry.split(chr(9))
+        if parts.len() >= 2:
+            if parts[0] == current_checker_module_path:
+                imported_key := module_generic_target_name(parts[1], name)
+                if generic_declaration_map.contains_key(imported_key):
+                    return imported_key
+    return ""
 
 fn has_generic_declaration(name: String) -> Bool:
-    for generic_name in generic_declaration_names:
-        if strings_equal(generic_name, name):
-            return true
-    return false
+    return resolve_generic_declaration_key(name).len() > 0
 
 fn get_generic_declaration_index(name: String) -> Int:
-    if generic_declaration_map.contains_key(name):
-        return generic_declaration_map[name]
+    key := resolve_generic_declaration_key(name)
+    if key.len() > 0:
+        return generic_declaration_map[key]
     return - 1
 
 fn register_interface_declaration_name(name: String):
@@ -1959,6 +2028,79 @@ fn check_unary_expression(node: Node, scope_id: Int) -> Int:
 # call expression
 # ---------------------------------------------------------------
 
+fn check_json_decode_callee(index_node: Node, member_name: String) -> Bool:
+    if index_node.kind != "index" or index_node.children.len() < 2:
+        return false
+    base_node := get_node(index_node.children[0])
+    if base_node.kind != "field_access" or base_node.value != member_name:
+        return false
+    if base_node.children.len() < 1:
+        return false
+    recv_node := get_node(base_node.children[0])
+    if recv_node.kind != "ident":
+        return false
+    if module_aliases.contains_key(recv_node.value):
+        if module_aliases[recv_node.value] == "std.json":
+            return true
+    return recv_node.value == "json" or recv_node.value == "json_mod"
+
+fn resolve_json_decode_type_arg(type_arg_idx: Int) -> Int:
+    type_arg := get_node(type_arg_idx)
+    if type_arg.kind == "ident":
+        return resolve_named_type(type_arg.value)
+    if type_arg.kind == "field_access" and type_arg.children.len() > 0:
+        recv := get_node(type_arg.children[0])
+        if recv.kind == "ident":
+            return resolve_named_type(recv.value + "." + type_arg.value)
+    report_error("E202", "json.decode type argument must be a concrete struct type")
+    return TID_ERR
+
+fn json_decode_field_supported(field_tid: Int) -> Bool:
+    return field_tid == lookup_type_id("String") or field_tid == lookup_type_id("Int") or field_tid == lookup_type_id("Bool")
+
+fn check_json_decode_call(index_node: Node, arg_indices: List[Int], scope_id: Int, text_input: Bool) -> Int:
+    if index_node.children.len() < 2:
+        report_error("E222", "json.decode requires an explicit struct type")
+        return TID_ERR
+    if arg_indices.len() != 1:
+        report_error("E207", "json.decode expects 1 argument, got " + arg_indices.len().to_string())
+        return TID_ERR
+
+    target_tid := resolve_json_decode_type_arg(index_node.children[1])
+    if is_error_type(target_tid):
+        return TID_ERR
+    target_info := get_type_info(target_tid)
+    if target_info.kind != "struct":
+        report_error("E219", "json.decode target must be a struct, got " + get_type_name(target_tid))
+        return TID_ERR
+
+    arg_node := get_node(arg_indices[0])
+    mut arg_expr_idx := arg_indices[0]
+    if arg_node.kind == "arg" and arg_node.children.len() > 0:
+        arg_expr_idx = arg_node.children[0]
+    arg_tid := c_check_expr(arg_expr_idx, scope_id)
+    mut expected_tid := lookup_type_id("Bytes")
+    if text_input:
+        expected_tid = lookup_type_id("String")
+    if is_error_type(arg_tid) == false and arg_tid != expected_tid:
+        report_error("E219", "json.decode argument type mismatch: expected " + get_type_name(expected_tid) + ", got " + get_type_name(arg_tid))
+        return TID_ERR
+
+    for field_name, i in target_info.fields:
+        if i < target_info.field_pub.len() and not target_info.field_pub[i]:
+            report_error("E219", "json.decode target field must be public: " + field_name)
+            return TID_ERR
+        if i < target_info.field_types.len():
+            field_tid := target_info.field_types[i]
+            if not json_decode_field_supported(field_tid):
+                report_error("E219", "json.decode does not support field '" + field_name + "' of type " + get_type_name(field_tid))
+                return TID_ERR
+    err_tid := lookup_type_id("JsonDecodeError")
+    if err_tid < 0:
+        report_error("E202", "unknown type: JsonDecodeError")
+        return TID_ERR
+    return add_type_info(ti_result(target_tid, err_tid))
+
 fn check_function_call(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
         return TID_ERR
@@ -1976,6 +2118,10 @@ fn check_function_call(node: Node, scope_id: Int) -> Int:
 
     # Channel[T]() constructor — callee is an index expr like Channel[Int]
     if callee_node.kind == "index":
+        if check_json_decode_callee(callee_node, "decode"):
+            return check_json_decode_call(callee_node, arg_indices, scope_id, false)
+        if check_json_decode_callee(callee_node, "decode_text"):
+            return check_json_decode_call(callee_node, arg_indices, scope_id, true)
         if callee_node.children.len() >= 2:
             obj_node := get_node(callee_node.children[0])
             if obj_node.kind == "ident":
@@ -2010,6 +2156,11 @@ fn check_function_call(node: Node, scope_id: Int) -> Int:
             if info.kind == "enum":
                 # enum variant constructor (qualified as EnumName.Variant)
                 # — this case shouldn't happen for plain ident calls
+                return check_function_call_expression(callee_idx, arg_indices, scope_id)
+        existing_fn := lookup_binding(scope_id, name)
+        if existing_fn >= 0:
+            existing_info := get_type_info(existing_fn)
+            if existing_info.kind == "function":
                 return check_function_call_expression(callee_idx, arg_indices, scope_id)
         # check if it's a generic declaration
         if has_generic_declaration(name):
@@ -2568,9 +2719,18 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         if module_aliases.contains_key(recv_name):
             module_path := module_aliases[recv_name]
             qualified_name := module_import_target_name(module_path, method_name)
-            mut callee_type := lookup_binding(scope_id, qualified_name)
+            module_name := module_generic_target_name(module_path, method_name)
+            mut callee_type := lookup_binding(scope_id, module_name)
+            if callee_type < 0:
+                callee_type = lookup_binding(scope_id, qualified_name)
             if callee_type < 0:
                 callee_type = lookup_binding(scope_id, method_name)
+            if callee_type < 0:
+                generic_name := module_generic_target_name(module_path, method_name)
+                if has_generic_declaration(generic_name):
+                    return check_generic_function_call(generic_name, arg_indices, scope_id)
+                if has_generic_declaration(method_name):
+                    return check_generic_function_call(method_name, arg_indices, scope_id)
             if callee_type < 0:
                 report_error("E201", "undefined function: " + recv_name + "." + method_name)
                 return TID_ERR
@@ -3106,7 +3266,11 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
         if module_aliases.contains_key(obj_name):
             module_path := module_aliases[obj_name]
             qualified_name := module_import_target_name(module_path, field_name)
-            mut func_tid := lookup_binding(scope_id, qualified_name)
+            module_name := module_generic_target_name(module_path, field_name)
+            mut func_tid := lookup_binding(scope_id, module_name)
+            if func_tid >= 0:
+                return func_tid
+            func_tid = lookup_binding(scope_id, qualified_name)
             if func_tid >= 0:
                 return func_tid
             func_tid = lookup_binding(scope_id, field_name)

@@ -18,6 +18,7 @@ pub mod concurrency;
 pub mod encoding;
 pub mod ffi_util;
 pub mod host_fs;
+pub mod json;
 pub mod network;
 pub mod perf;
 pub mod platform;
@@ -39,7 +40,9 @@ pub use runtime_core::*;
 pub use string_list::*;
 pub use utility::*;
 
-pub(crate) use runtime_core::{forge_copy_bytes_to_cstring, forge_cstring_empty, forge_strdup_string};
+pub(crate) use runtime_core::{
+    forge_copy_bytes_to_cstring, forge_cstring_empty, forge_strdup_string,
+};
 
 pub use concurrency::{
     forge_mutex_lock, forge_mutex_new, forge_mutex_unlock, forge_semaphore_acquire,

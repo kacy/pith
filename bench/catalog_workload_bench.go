@@ -104,6 +104,11 @@ func ratio(numerator, denominator int) string {
 	return fmt.Sprintf("%.2fx", float64(numerator)/float64(denominator))
 }
 
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func median(values []int) int {
 	sorted := append([]int(nil), values...)
 	sort.Ints(sorted)
@@ -187,12 +192,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("%-12s %-8s %-8s %-8s\n", "phase", "go", "forge", "ratio")
-	fmt.Printf("%-12s %-8d %-8d %-8s\n", "profile", goResult.profileMS, forgeResult.profileMS, ratio(forgeResult.profileMS, goResult.profileMS))
-	fmt.Printf("%-12s %-8d %-8d %-8s\n", "search_hot", goResult.searchHotMS, forgeResult.searchHotMS, ratio(forgeResult.searchHotMS, goResult.searchHotMS))
-	fmt.Printf("%-12s %-8d %-8d %-8s\n", "search_wide", goResult.searchWideMS, forgeResult.searchWideMS, ratio(forgeResult.searchWideMS, goResult.searchWideMS))
-	fmt.Printf("%-12s %-8d %-8d %-8s\n", "batch", goResult.batchMS, forgeResult.batchMS, ratio(forgeResult.batchMS, goResult.batchMS))
-	fmt.Printf("%-12s %-8d %-8d %-8s\n", "total", goResult.totalMS, forgeResult.totalMS, ratio(forgeResult.totalMS, goResult.totalMS))
+	if fileExists("./bench/catalog_workload_rust") {
+		rustResult, rustErr := runTrials("./bench/catalog_workload_rust", iterations, trials)
+		if rustErr != nil {
+			fmt.Println(rustErr)
+			os.Exit(1)
+		}
+		if goResult.checksum != rustResult.checksum {
+			fmt.Printf("checksum mismatch: go=%d rust=%d\n", goResult.checksum, rustResult.checksum)
+			os.Exit(1)
+		}
+
+		fmt.Printf("%-12s %-8s %-8s %-8s %-10s %-10s\n", "phase", "go", "rust", "forge", "forge/go", "forge/rust")
+		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "profile", goResult.profileMS, rustResult.profileMS, forgeResult.profileMS, ratio(forgeResult.profileMS, goResult.profileMS), ratio(forgeResult.profileMS, rustResult.profileMS))
+		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "search_hot", goResult.searchHotMS, rustResult.searchHotMS, forgeResult.searchHotMS, ratio(forgeResult.searchHotMS, goResult.searchHotMS), ratio(forgeResult.searchHotMS, rustResult.searchHotMS))
+		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "search_wide", goResult.searchWideMS, rustResult.searchWideMS, forgeResult.searchWideMS, ratio(forgeResult.searchWideMS, goResult.searchWideMS), ratio(forgeResult.searchWideMS, rustResult.searchWideMS))
+		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "batch", goResult.batchMS, rustResult.batchMS, forgeResult.batchMS, ratio(forgeResult.batchMS, goResult.batchMS), ratio(forgeResult.batchMS, rustResult.batchMS))
+		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "total", goResult.totalMS, rustResult.totalMS, forgeResult.totalMS, ratio(forgeResult.totalMS, goResult.totalMS), ratio(forgeResult.totalMS, rustResult.totalMS))
+	} else {
+		fmt.Printf("%-12s %-8s %-8s %-8s\n", "phase", "go", "forge", "ratio")
+		fmt.Printf("%-12s %-8d %-8d %-8s\n", "profile", goResult.profileMS, forgeResult.profileMS, ratio(forgeResult.profileMS, goResult.profileMS))
+		fmt.Printf("%-12s %-8d %-8d %-8s\n", "search_hot", goResult.searchHotMS, forgeResult.searchHotMS, ratio(forgeResult.searchHotMS, goResult.searchHotMS))
+		fmt.Printf("%-12s %-8d %-8d %-8s\n", "search_wide", goResult.searchWideMS, forgeResult.searchWideMS, ratio(forgeResult.searchWideMS, goResult.searchWideMS))
+		fmt.Printf("%-12s %-8d %-8d %-8s\n", "batch", goResult.batchMS, forgeResult.batchMS, ratio(forgeResult.batchMS, goResult.batchMS))
+		fmt.Printf("%-12s %-8d %-8d %-8s\n", "total", goResult.totalMS, forgeResult.totalMS, ratio(forgeResult.totalMS, goResult.totalMS))
+	}
 	fmt.Println()
 	fmt.Printf("checksum %d\n", goResult.checksum)
 }

@@ -7,12 +7,6 @@ struct Player:
     pub name: String
     pub team: String
 
-fn names_of(players: List[Player]) -> String:
-    mut names: List[String] := []
-    for player in players:
-        names.push(player.name)
-    return names.join(", ")
-
 fn main():
     r := range(1, 6)
     mut strs: List[String] := []
@@ -43,7 +37,10 @@ fn main():
     players.push(Player("carol", "red"))
     by_team := group_by(players, fn(player: Player) => player.team)
     red_players := by_team["red"]
-    print("group_by red: " + names_of(red_players))
+    mut red_names: List[String] := []
+    for player in red_players:
+        red_names.push(player.name)
+    print("group_by red: " + red_names.join(", "))
 
     counts := count_by(players, fn(player: Player) => player.team)
     blue_count := counts["blue"]

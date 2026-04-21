@@ -157,6 +157,36 @@ pub fn path(handle: Int) -> String:
         return ""
     return url_paths[handle]
 
+# return the length of the path component without allocating a parsed url node.
+pub fn path_len(input: String) -> Int:
+    mut pos := 0
+    mut i := 0
+    while i + 2 < input.len():
+        if input[i] == ":" and input[i + 1] == "/" and input[i + 2] == "/":
+            pos = i + 3
+            i = input.len()
+        i = i + 1
+
+    mut host_end := input.len()
+    i = pos
+    while i < input.len() and host_end == input.len():
+        c := input[i]
+        if c == "/" or c == "?" or c == "#":
+            host_end = i
+        i = i + 1
+
+    if host_end >= input.len() or input[host_end] != "/":
+        return 0
+
+    mut path_end := input.len()
+    i = host_end
+    while i < input.len() and path_end == input.len():
+        c := input[i]
+        if c == "?" or c == "#":
+            path_end = i
+        i = i + 1
+    return path_end - host_end
+
 # Returns the query string without the leading "?".
 # Returns empty string if no query.
 pub fn query(handle: Int) -> String:
@@ -266,6 +296,7 @@ test "url parse splits full urls":
     assert_eq(host(u), "example.com")
     assert_eq(port(u), 8443)
     assert_eq(path(u), "/api/v1")
+    assert_eq(path_len("https://example.com:8443/api/v1?q=forge#docs"), 7)
     assert_eq(query(u), "q=forge")
     assert_eq(fragment(u), "docs")
     assert_eq(to_string(u), "https://example.com:8443/api/v1?q=forge#docs")
@@ -277,6 +308,8 @@ test "url parse handles missing pieces":
     assert_eq(host(u), "example.com")
     assert_eq(port(u), 0 - 1)
     assert_eq(path(u), "/path")
+    assert_eq(path_len("example.com/path"), 5)
+    assert_eq(path_len("https://example.com?x=1"), 0)
     assert_eq(query(u), "")
     assert_eq(fragment(u), "")
 

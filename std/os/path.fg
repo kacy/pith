@@ -54,6 +54,18 @@ fn cleaned_parts(path: String) -> List[String]:
             out.push(part)
     return out
 
+fn clean_count_segment(stack: List[String], part: String, absolute: Bool) -> List[String]:
+    if part == "" or part == ".":
+        return stack
+    if part == "..":
+        if stack.len() > 0 and stack[stack.len() - 1] != "..":
+            return without_last_segment(stack)
+        if not absolute:
+            stack.push("..")
+        return stack
+    stack.push(part)
+    return stack
+
 # true when the path starts at the filesystem root.
 pub fn is_abs(path: String) -> Bool:
     return path.starts_with("/")
@@ -115,6 +127,24 @@ pub fn clean(path: String) -> String:
 # returns the normalized non-empty path segments.
 pub fn parts(path: String) -> List[String]:
     return cleaned_parts(path)
+
+# returns the number of normalized non-empty path segments.
+pub fn clean_part_count(path: String) -> Int:
+    if path.len() == 0:
+        return 0
+    absolute := path.starts_with("/")
+    mut stack: List[String] := []
+    mut start := 0
+    mut i := 0
+    while i < path.len():
+        if path[i] == "/":
+            if i > start:
+                stack = clean_count_segment(stack, path.substring(start, i), absolute)
+            start = i + 1
+        i = i + 1
+    if start < path.len():
+        stack = clean_count_segment(stack, path.substring(start, path.len()), absolute)
+    return stack.len()
 
 # ===============================================================
 # Path Components
@@ -240,6 +270,10 @@ test "join and clean normalize path segments":
     assert_eq(join_all(["src", "pkg", "main.fg"]), "src/pkg/main.fg")
     assert_eq(clean("src//pkg/./main.fg"), "src/pkg/main.fg")
     assert_eq(clean("/tmp/../var/"), "/var")
+    assert_eq(clean_part_count("src//pkg/./main.fg"), 3)
+    assert_eq(clean_part_count("/tmp/../var/"), 1)
+    assert_eq(clean_part_count("data//north/./users/../users/0.json"), 4)
+    assert_eq(clean_part_count("/"), 0)
 
 test "path components split names":
     assert_eq(dir("/tmp/forge/main.fg"), "/tmp/forge")

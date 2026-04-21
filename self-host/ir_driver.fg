@@ -3,7 +3,7 @@ from parser import parse_with_file, parser_diagnostics, parser_has_errors
 from ast import reset_arena, get_node
 from ir_emitter import emit_ir, set_import_roots, set_test_mode
 from driver import init_driver, resolve_imports, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, find_imports
-from checker import initialize_checker, c_run_module
+from checker import initialize_checker, set_checker_module_path, c_run_module
 from errors import render_diagnostics, has_errors
 
 struct CliArgs:
@@ -309,7 +309,9 @@ fn parse_and_check(path: String) -> ParsedModule!:
 
     initialize_checker(path)
     for import_root in import_roots:
+        set_checker_module_path(get_resolved_module_path(import_root))
         c_run_module(import_root)
+    set_checker_module_path("")
     diags := c_run_module(root)
     if has_errors(diags):
         print(render_diagnostics(diags, source))

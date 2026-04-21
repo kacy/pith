@@ -9,10 +9,48 @@ pub unsafe extern "C" fn forge_parse_int(s: *const i8) -> i64 {
     }
     let len = crate::string::forge_cstring_len(s) as usize;
     let slice = std::slice::from_raw_parts(s as *const u8, len);
-    if let Ok(str_ref) = std::str::from_utf8(slice) {
-        str_ref.trim().parse::<i64>().unwrap_or(0)
+    let mut start = 0;
+    let mut end = len;
+    while start < end && slice[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && slice[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if start == end {
+        return 0;
+    }
+    let mut pos = start;
+    let mut negative = false;
+    if slice[pos] == b'-' || slice[pos] == b'+' {
+        negative = slice[pos] == b'-';
+        pos += 1;
+        if pos == end {
+            return 0;
+        }
+    }
+    let limit = if negative { i64::MAX as u64 + 1 } else { i64::MAX as u64 };
+    let mut value: u64 = 0;
+    while pos < end {
+        let digit = slice[pos];
+        if !digit.is_ascii_digit() {
+            return 0;
+        }
+        let digit_value = (digit - b'0') as u64;
+        if value > (limit - digit_value) / 10 {
+            return 0;
+        }
+        value = value * 10 + digit_value;
+        pos += 1;
+    }
+    if negative {
+        if value == limit {
+            i64::MIN
+        } else {
+            -(value as i64)
+        }
     } else {
-        0
+        value as i64
     }
 }
 
@@ -337,4 +375,36 @@ fn sha256_compute(data: &[u8]) -> [u8; 32] {
         result[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forge_parse_int;
+    use std::ffi::CString;
+
+    fn parse(input: &str) -> i64 {
+        let c_input = CString::new(input).unwrap();
+        unsafe { forge_parse_int(c_input.as_ptr()) }
+    }
+
+    #[test]
+    fn parse_int_accepts_trimmed_signed_values() {
+        assert_eq!(parse("42"), 42);
+        assert_eq!(parse("  -17\n"), -17);
+        assert_eq!(parse("+5"), 5);
+    }
+
+    #[test]
+    fn parse_int_rejects_invalid_or_overflowing_values() {
+        assert_eq!(parse(""), 0);
+        assert_eq!(parse("12x"), 0);
+        assert_eq!(parse("9223372036854775808"), 0);
+        assert_eq!(parse("-9223372036854775809"), 0);
+    }
+
+    #[test]
+    fn parse_int_handles_i64_bounds() {
+        assert_eq!(parse("9223372036854775807"), i64::MAX);
+        assert_eq!(parse("-9223372036854775808"), i64::MIN);
+    }
 }

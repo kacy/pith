@@ -1,6 +1,5 @@
 import std.json as json
 import std.bytes as bytes
-from std.json import JsonDecodeError, JsonScalarObject
 
 struct CatalogUser:
     pub id: Int
@@ -248,15 +247,6 @@ fn parse_active_filter(raw: String) -> Int:
         return 0
     return 0 - 1
 
-fn decode_batch_request(fields: JsonScalarObject) -> BatchRequest!JsonDecodeError:
-    team := json.scalar_string_or(fields, "team", "")
-    region := json.scalar_string_or(fields, "region", "")
-    active := json.scalar_string_or(fields, "active", "")
-    min_score := json.scalar_int_or(fields, "min_score", 0)
-    limit := json.scalar_int_or(fields, "limit", 0)
-    multiplier := json.scalar_int_or(fields, "multiplier", 0)
-    return BatchRequest(team, region, active, min_score, limit, multiplier)
-
 fn iterations_from_args() -> Int:
     a := args()
     if a.len() < 2:
@@ -411,10 +401,7 @@ fn search_checksum(team_id: Int, region_id: Int, active_filter: Int, min_score: 
     return count + total_score + quota_sum + id_sum
 
 fn batch_checksum(req_body: Bytes) -> Int:
-    fields := json.decode_scalars_bytes(req_body)
-    if fields.is_err:
-        return 0 - 1
-    decoded := decode_batch_request(fields.ok)
+    decoded := json.decode[BatchRequest](req_body)
     if decoded.is_err:
         return 0 - 1
     req := decoded.ok

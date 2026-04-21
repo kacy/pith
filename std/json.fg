@@ -42,6 +42,11 @@ struct JsonByteInt:
     value: Int
     next_pos: Int
 
+struct JsonByteFieldPos:
+    ok: Bool
+    found: Bool
+    pos: Int
+
 # ===============================================================
 # Node Pool
 # ===============================================================
@@ -322,6 +327,106 @@ fn json_byte_match_literal(input: Bytes, pos: Int, literal: String) -> Bool:
             return false
         i = i + 1
     return true
+
+fn json_byte_skip_scalar_value(input: Bytes, pos: Int) -> Int:
+    if pos >= input.len():
+        return - 1
+    b := input[pos]
+    if b == 34:
+        value := json_byte_read_string(input, pos)
+        if value.ok:
+            return value.next_pos
+        return - 1
+    if b == 45 or json_byte_is_digit(b):
+        value := json_byte_read_int(input, pos)
+        if value.ok:
+            return value.next_pos
+        return - 1
+    if json_byte_match_literal(input, pos, "true"):
+        return pos + 4
+    if json_byte_match_literal(input, pos, "false"):
+        return pos + 5
+    if json_byte_match_literal(input, pos, "null"):
+        return pos + 4
+    return - 1
+
+fn json_byte_find_field_value(input: Bytes, key: String) -> JsonByteFieldPos:
+    mut pos := json_byte_skip_whitespace(input, 0)
+    if pos >= input.len() or input[pos] != 123:
+        return JsonByteFieldPos(false, false, pos)
+    pos = json_byte_skip_whitespace(input, pos + 1)
+    if pos < input.len() and input[pos] == 125:
+        pos = json_byte_skip_whitespace(input, pos + 1)
+        return JsonByteFieldPos(pos == input.len(), false, pos)
+
+    while pos < input.len():
+        field_key := json_byte_read_string(input, pos)
+        if not field_key.ok:
+            return JsonByteFieldPos(false, false, pos)
+        pos = json_byte_skip_whitespace(input, field_key.next_pos)
+        if pos >= input.len() or input[pos] != 58:
+            return JsonByteFieldPos(false, false, pos)
+        pos = json_byte_skip_whitespace(input, pos + 1)
+        if pos >= input.len():
+            return JsonByteFieldPos(false, false, pos)
+        if field_key.value == key:
+            return JsonByteFieldPos(true, true, pos)
+
+        pos = json_byte_skip_scalar_value(input, pos)
+        if pos < 0:
+            return JsonByteFieldPos(false, false, pos)
+        pos = json_byte_skip_whitespace(input, pos)
+        if pos < input.len() and input[pos] == 44:
+            pos = json_byte_skip_whitespace(input, pos + 1)
+            continue
+        if pos < input.len() and input[pos] == 125:
+            pos = json_byte_skip_whitespace(input, pos + 1)
+            return JsonByteFieldPos(pos == input.len(), false, pos)
+        return JsonByteFieldPos(false, false, pos)
+    return JsonByteFieldPos(false, false, pos)
+
+fn json_missing_field_error(kind: String, key: String) -> JsonDecodeError:
+    return JsonDecodeError("missing " + kind + " field: " + key)
+
+fn json_wrong_field_error(kind: String, key: String) -> JsonDecodeError:
+    return JsonDecodeError("expected " + kind + " field: " + key)
+
+fn json_invalid_object_error() -> JsonDecodeError:
+    return JsonDecodeError("invalid json object")
+
+fn json_scan_required_string_bytes(input: Bytes, key: String) -> String!JsonDecodeError:
+    found := json_byte_find_field_value(input, key)
+    if not found.ok:
+        fail json_invalid_object_error()
+    if not found.found:
+        fail json_missing_field_error("string", key)
+    value := json_byte_read_string(input, found.pos)
+    if not value.ok:
+        fail json_wrong_field_error("string", key)
+    return value.value
+
+fn json_scan_required_int_bytes(input: Bytes, key: String) -> Int!JsonDecodeError:
+    found := json_byte_find_field_value(input, key)
+    if not found.ok:
+        fail json_invalid_object_error()
+    if not found.found:
+        fail json_missing_field_error("int", key)
+    value := json_byte_read_int(input, found.pos)
+    if not value.ok:
+        fail json_wrong_field_error("int", key)
+    return value.value
+
+fn json_scan_required_bool_bytes(input: Bytes, key: String) -> Bool!JsonDecodeError:
+    found := json_byte_find_field_value(input, key)
+    if not found.ok:
+        fail json_invalid_object_error()
+    if not found.found:
+        fail json_missing_field_error("bool", key)
+    if json_byte_match_literal(input, found.pos, "true"):
+        return true
+    if json_byte_match_literal(input, found.pos, "false"):
+        return false
+    fail json_wrong_field_error("bool", key)
 
 fn json_scan_object_scalars_bytes(input: Bytes) -> JsonScalarObject:
     result := json_scalar_object(true)
@@ -613,6 +718,28 @@ pub fn require_bool(object: JsonScalarObject, key: String) -> Bool!JsonDecodeErr
     if object.bools.contains_key(key):
         return object.bools[key]
     fail JsonDecodeError("missing bool field: " + key)
+
+ # scans one required string field from object bytes without building a map.
+pub fn scan_required_string_bytes(input: Bytes, key: String) -> String!JsonDecodeError:
+    return json_scan_required_string_bytes(input, key)!
+
+ # scans one required int field from object bytes without building a map.
+pub fn scan_required_int_bytes(input: Bytes, key: String) -> Int!JsonDecodeError:
+    return json_scan_required_int_bytes(input, key)!
+
+ # scans one required bool field from object bytes without building a map.
+pub fn scan_required_bool_bytes(input: Bytes, key: String) -> Bool!JsonDecodeError:
+    return json_scan_required_bool_bytes(input, key)!
+
+ # decodes json object bytes into a concrete struct.
+ # this is lowered by the compiler so structs do not need runtime reflection.
+pub fn decode[T](input: Bytes) -> T!JsonDecodeError:
+    fail JsonDecodeError("json.decode requires compiler support")
+
+ # decodes json object text into a concrete struct.
+ # this is lowered by the compiler so structs do not need runtime reflection.
+pub fn decode_text[T](input: String) -> T!JsonDecodeError:
+    fail JsonDecodeError("json.decode_text requires compiler support")
 
  # captures the current parser state.
 pub fn checkpoint() -> JsonCheckpoint:

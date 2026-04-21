@@ -106,6 +106,7 @@ for a stable service-shaped comparison without socket noise, there is also an
 in-process catalog workload benchmark:
 
 - `bench/catalog_workload.go`
+- `bench/catalog_workload.rs`
 - `bench/catalog_workload.fg`
 
 this uses the same synthetic dataset and benchmark shape as the catalog service,
@@ -125,12 +126,17 @@ forge build bench/catalog_workload.fg
 
 # go
 go run bench/catalog_workload.go 4000
+
+# rust
+rustc -O -o bench/catalog_workload_rust bench/catalog_workload.rs
+./bench/catalog_workload_rust 4000
 ```
 
-a helper runner is also available once both workload binaries are built:
+a helper runner is also available once the workload binaries are built:
 
 ```
 go build -o bench/catalog_workload_go bench/catalog_workload.go
+rustc -O -o bench/catalog_workload_rust bench/catalog_workload.rs
 forge build bench/catalog_workload.fg
 go run bench/catalog_workload_bench.go 10000 5
 ```
@@ -147,12 +153,20 @@ latest measured results on this machine, using the median of 3 trials:
 
 | iterations | go total | forge total | ratio | go batch | forge batch |
 |---|---:|---:|---:|---:|---:|
-| `200000` | `747 ms` | `2615 ms` | `3.50x` | `656 ms` | `2603 ms` |
+| `200000` | `686 ms` | `2391 ms` | `3.49x` | `638 ms` | `2380 ms` |
 
-the current forge workload uses the bytes-backed shallow JSON scanner and a
-small manual struct translation step for the batch request. that removes most
-of the old handle-tree parse overhead, but batch JSON decoding is still the
-dominant remaining cost in this benchmark.
+with the optional rust workload binary built:
+
+| iterations | rust total | forge/rust | rust batch | forge/rust batch |
+|---|---:|---:|---:|---:|
+| `200000` | `132 ms` | `18.11x` | `118 ms` | `20.17x` |
+
+the current forge workload uses derived json struct decoding for the batch
+request. wider structs use one shallow scalar scan before generated struct
+construction, while smaller structs can use direct required-field scans. batch
+json decoding is still the dominant remaining cost in this benchmark. the rust
+workload uses a tiny standalone json field scanner, so treat it as a lower-bound
+runtime comparison rather than a serde-style library comparison.
 
 this is the better comparison point today if you want to isolate runtime,
 language, and service-logic costs from the current long-running HTTP server

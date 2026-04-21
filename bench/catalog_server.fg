@@ -14,7 +14,6 @@ import std.bytes as bytes
 from std.net.http import HttpRequestBytes, HttpResponse
 from std.env import get_args
 from std.bytes import ByteBuffer
-from std.json import JsonDecodeError, JsonScalarObject
 
 JSON_MIME := "application/json"
 
@@ -273,15 +272,6 @@ fn parse_active_filter(raw: String) -> Int:
     if raw == "0" or raw == "false":
         return 0
     return 0 - 1
-
-fn decode_batch_request(fields: JsonScalarObject) -> BatchRequest!JsonDecodeError:
-    team := json.scalar_string_or(fields, "team", "")
-    region := json.scalar_string_or(fields, "region", "")
-    active := json.scalar_string_or(fields, "active", "")
-    min_score := json.scalar_int_or(fields, "min_score", 0)
-    limit := json.scalar_int_or(fields, "limit", 0)
-    multiplier := json.scalar_int_or(fields, "multiplier", 0)
-    return BatchRequest(team, region, active, min_score, limit, multiplier)
 
 fn server_port() -> Int:
     a := get_args()
@@ -553,10 +543,7 @@ fn batch_score_json_bytes(root: Int) -> Bytes!:
     return out.bytes()
 
 fn batch_score_json_fast_bytes(body: Bytes) -> Bytes!:
-    fields := json.decode_scalars_bytes(body)
-    if fields.is_err:
-        fail "fallback"
-    decoded := decode_batch_request(fields.ok)
+    decoded := json.decode[BatchRequest](body)
     if decoded.is_err:
         fail "fallback"
     req := decoded.ok

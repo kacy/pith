@@ -34,7 +34,7 @@
 
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
 from checker import c_get_expr_type
-from types import get_type_info
+from types import TypeInfo, get_type_info
 
 # --- type knowledge constants (single source of truth) ---
 FLOAT_RETURNING_FUNCS := "pow,sqrt,floor,ceil,round,to_float,get_float"
@@ -495,6 +495,21 @@ fn ir_collect_strings(idx: Int):
     for node_idx in nodes:
         ir_str(get_node(node_idx).value)
 
+fn ir_struct_field_name(field_node: Node) -> String:
+    mut field_name := field_node.value
+    if field_name.contains(" "):
+        field_name = field_name.split(" ")[0]
+    return field_name
+
+fn ir_collect_struct_field_strings(root_idx: Int):
+    for item_idx in ir_root_items(root_idx):
+        actual := ir_unwrap_pub_node(item_idx)
+        if actual.kind == "struct_decl" or actual.kind == "struct":
+            for child in actual.children:
+                field_node := get_node(child)
+                if field_node.kind == "field":
+                    ir_str(ir_struct_field_name(field_node))
+
 fn ir_retkind(type_name: String) -> String:
     if type_name.len() == 0:
         return "unknown"
@@ -759,6 +774,23 @@ fn ir_resolve_static_callee(idx: Int) -> ResolvedCallee:
             return ResolvedCallee(alias_name, true)
     return ResolvedCallee("", false)
 
+fn ir_is_json_decode_callee(index_idx: Int, member_name: String) -> Bool:
+    index_node := get_node(index_idx)
+    if index_node.kind != "index" or index_node.children.len() < 2:
+        return false
+    base_node := get_node(index_node.children[0])
+    if base_node.kind != "field_access" or base_node.value != member_name:
+        return false
+    if base_node.children.len() < 1:
+        return false
+    recv := get_node(base_node.children[0])
+    if recv.kind != "ident":
+        return false
+    if ir_module_aliases.contains_key(recv.value):
+        if ir_module_aliases[recv.value] == "std.json":
+            return true
+    return recv.value == "json" or recv.value == "json_mod"
+
 fn ir_callee_uses_result_abi(callee: ResolvedCallee, idx: Int) -> Bool:
     raw_kind := ir_declared_callable_ir_retkind(callee.name)
     if raw_kind == "tuple" or raw_kind == "result_int" or raw_kind == "result_bool":
@@ -929,9 +961,7 @@ fn ir_declared_struct_name(node: Node) -> String:
     return node.value
 
 fn ir_record_struct_field(struct_name: String, field_names: List[String], field_node: Node) -> List[String]:
-    mut field_name := field_node.value
-    if field_name.contains(" "):
-        field_name = field_name.split(" ")[0]
+    field_name := ir_struct_field_name(field_node)
     mut updated_fields := field_names
     field_index := updated_fields.len()
     updated_fields.push(field_name)
@@ -1863,7 +1893,155 @@ fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int]) -> Int:
     ir_emit("iconst " + r.to_string() + " 0")
     return r
 
+fn ir_json_field_helper_name(field_tid: Int) -> String:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        if info.name == "String":
+            return "std_json_scan_required_string_bytes"
+        if info.name == "Int":
+            return "std_json_scan_required_int_bytes"
+        if info.name == "Bool":
+            return "std_json_scan_required_bool_bytes"
+    return ""
+
+fn ir_json_require_helper_name(field_tid: Int) -> String:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        if info.name == "String":
+            return "std_json_require_string"
+        if info.name == "Int":
+            return "std_json_require_int"
+        if info.name == "Bool":
+            return "std_json_require_bool"
+    return ""
+
+fn ir_emit_json_field_ok(result_r: Int, field_tid: Int) -> Int:
+    ok_r := ir_reg()
+    ir_emit("field " + ok_r.to_string() + " " + result_r.to_string() + " 8 " + ir_type_from_tid(field_tid) + " ok")
+    return ok_r
+
+fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo) -> Int:
+    temp_name := ir_new_temp_name("json_decode")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+
+    scan_r := ir_reg()
+    ir_emit_call1(scan_r, "std_json_decode_scalars_bytes", "tuple", input_r)
+    scan_ok_r := ir_emit_result_flag_field(scan_r, "is_ok")
+    scan_ok_l := ir_label()
+    scan_err_l := ir_label()
+    ir_emit("brif " + scan_ok_r.to_string() + " " + scan_ok_l + " " + scan_err_l)
+    ir_emit("label " + scan_err_l)
+    ir_emit("store " + temp_name + " " + scan_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + scan_ok_l)
+    fields_r := ir_emit_result_value_field(scan_r, -1, "ok")
+
+    mut field_regs: List[Int] := []
+    for field_name, i in target_info.fields:
+        if i >= target_info.field_types.len():
+            continue
+        field_tid := target_info.field_types[i]
+        helper_name := ir_json_require_helper_name(field_tid)
+        if helper_name.len() == 0:
+            continue
+        key_r := ir_reg()
+        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
+        field_result_r := ir_reg()
+        ir_emit_call2(field_result_r, helper_name, "tuple", fields_r, key_r)
+        ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+        ok_l := ir_label()
+        err_l := ir_label()
+        ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+        ir_emit("label " + err_l)
+        ir_emit("store " + temp_name + " " + field_result_r.to_string())
+        ir_emit("jmp " + done_l)
+        ir_emit("label " + ok_l)
+        field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
+
+    struct_r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " " + field_regs.len().to_string())
+    ir_emit_call1(struct_r, "__struct_alloc", "struct:" + target_info.name, field_count_r)
+    for field_reg, fi in field_regs:
+        ir_emit("sstore " + struct_r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple(struct_r).to_string())
+    ir_emit("label " + done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
+fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool) -> Int:
+    arg_regs := ir_collect_call_arg_regs(node, 1)
+    if arg_regs.len() == 0:
+        return ir_zero_reg()
+
+    mut input_r := arg_regs[0]
+    if text_input:
+        converted_r := ir_reg()
+        ir_emit_call1(converted_r, "std_bytes_from_string_utf8", "bytes", input_r)
+        input_r = converted_r
+
+    ret_tid := c_get_expr_type(idx)
+    if ret_tid < 0:
+        return ir_zero_reg()
+    ret_info := get_type_info(ret_tid)
+    if ret_info.kind != "result":
+        return ir_zero_reg()
+    target_tid := ret_info.inner
+    target_info := get_type_info(target_tid)
+    if target_info.kind != "struct":
+        return ir_zero_reg()
+    if target_info.fields.len() > 3:
+        return ir_emit_json_decode_map_call(input_r, target_info)
+
+    temp_name := ir_new_temp_name("json_decode")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    mut field_regs: List[Int] := []
+
+    for field_name, i in target_info.fields:
+        if i >= target_info.field_types.len():
+            continue
+        field_tid := target_info.field_types[i]
+        helper_name := ir_json_field_helper_name(field_tid)
+        if helper_name.len() == 0:
+            continue
+        key_r := ir_reg()
+        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
+        field_result_r := ir_reg()
+        ir_emit_call2(field_result_r, helper_name, "tuple", input_r, key_r)
+        ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+        ok_l := ir_label()
+        err_l := ir_label()
+        ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+        ir_emit("label " + err_l)
+        ir_emit("store " + temp_name + " " + field_result_r.to_string())
+        ir_emit("jmp " + done_l)
+        ir_emit("label " + ok_l)
+        field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
+
+    struct_r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " " + field_regs.len().to_string())
+    ir_emit_call1(struct_r, "__struct_alloc", "struct:" + target_info.name, field_count_r)
+    for field_reg, fi in field_regs:
+        ir_emit("sstore " + struct_r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple(struct_r).to_string())
+    ir_emit("label " + done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
 fn ir_emit_static_call(idx: Int, node: Node) -> Int:
+    if node.children.len() > 0:
+        callee_node := get_node(node.children[0])
+        if callee_node.kind == "index":
+            if ir_is_json_decode_callee(node.children[0], "decode"):
+                return ir_emit_json_decode_call(idx, node, false)
+            if ir_is_json_decode_callee(node.children[0], "decode_text"):
+                return ir_emit_json_decode_call(idx, node, true)
+
     mut callee := ResolvedCallee("unknown", false)
     if node.children.len() > 0:
         callee = ir_resolve_static_callee(node.children[0])
@@ -4128,8 +4306,10 @@ pub fn emit_ir(root_idx: Int) -> String:
     mut preload_i := 0
     while preload_i < ir_preloaded_import_roots.len():
         ir_collect_strings(ir_preloaded_import_roots[preload_i])
+        ir_collect_struct_field_strings(ir_preloaded_import_roots[preload_i])
         preload_i = preload_i + 1
     ir_collect_strings(root_idx)
+    ir_collect_struct_field_strings(root_idx)
     ir_preseed_result_error_strings()
     ir_emit_string_table()
 

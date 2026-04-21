@@ -26,13 +26,23 @@ fn normalize_segments(parts: List[String], absolute: Bool) -> List[String]:
             continue
         if part == "..":
             if stack.len() > 0 and stack[stack.len() - 1] != "..":
-                stack.remove(stack.len() - 1)
+                stack = without_last_segment(stack)
             else:
                 if not absolute:
                     stack.push("..")
             continue
         stack.push(part)
     return stack
+
+fn without_last_segment(parts: List[String]) -> List[String]:
+    mut out: List[String] := []
+    if parts.len() == 0:
+        return out
+    mut i := 0
+    while i + 1 < parts.len():
+        out.push(parts[i])
+        i = i + 1
+    return out
 
 fn cleaned_parts(path: String) -> List[String]:
     cleaned := clean(path)

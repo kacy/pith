@@ -292,9 +292,12 @@ pub fn compile_from_ir(
                         sig.params.push(AbiParam::new(types::I64));
                     }
                     sig.returns.push(AbiParam::new(types::I64));
-                    if let Ok(func_id) =
-                        codegen.module.declare_function(name, Linkage::Export, &sig)
-                    {
+                    let linkage = if name == "main" {
+                        Linkage::Export
+                    } else {
+                        Linkage::Local
+                    };
+                    if let Ok(func_id) = codegen.module.declare_function(name, linkage, &sig) {
                         declared_funcs.insert(name.to_string(), func_id);
                     }
                     // silently skip if name conflicts with runtime declaration

@@ -283,3 +283,19 @@ pub fn walk(root_path: String) -> List[Entry]!:
         fail "path does not exist: " + root_path
     mut entries: List[Entry] := []
     return walk_into(entries, root_path)
+
+test "fs writes reads appends and removes files":
+    dir := make_temp_dir("forge-std-fs-")!
+    file_path := dir + "/note.txt"
+
+    assert(not exists(file_path))
+    assert(write(file_path, "hello")!)
+    assert(exists(file_path))
+    assert(is_file(file_path))
+    assert(not is_dir(file_path))
+    assert_eq(read(file_path)!, "hello")
+    assert_eq(size(file_path)!, 5)
+    assert(append(file_path, " world")!)
+    assert_eq(read(file_path)!, "hello world")
+    assert(remove(file_path))
+    assert(remove_empty_dir(dir))

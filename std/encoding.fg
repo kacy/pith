@@ -1,8 +1,9 @@
-# std.encoding - base64, base32, hex, and pem helpers
+# std.encoding - base64, base32, base58, hex, varint, and pem helpers
 #
 # this module is bytes-first. text helpers cross the utf-8 boundary
 # explicitly when that's what you want.
 
+import std.bits as bits
 import std.bytes as bytes
 
 # a decoded pem block.
@@ -10,6 +11,11 @@ pub struct PemBlock:
     pub kind: String
     pub headers: Map[String, String]
     pub body: Bytes
+
+# a decoded unsigned varint and the number of bytes consumed.
+pub struct VarintResult:
+    pub value: Int
+    pub read: Int
 
 fn b64_standard_table() -> String:
     return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -22,6 +28,9 @@ fn b32_standard_table() -> String:
 
 fn b32_hex_table() -> String:
     return "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+
+fn b58_table() -> String:
+    return "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 fn is_ws(c: String) -> Bool:
     return c == " " or c == chr(9) or c == chr(10) or c == chr(13)
@@ -268,6 +277,92 @@ pub fn base32_hex_encode(input: Bytes) -> String:
 pub fn base32_hex_decode(input: String) -> Bytes!:
     return b32_decode_with(input, b32_hex_table(), true, false)
 
+fn b58_value(c: String) -> Int:
+    return table_char_val(c, b58_table())
+
+# encode bytes with the bitcoin base58 alphabet.
+pub fn base58_encode(input: Bytes) -> String:
+    if input.len() == 0:
+        return ""
+
+    alphabet := b58_table()
+    mut zeroes := 0
+    while zeroes < input.len() and input[zeroes] == 0:
+        zeroes = zeroes + 1
+
+    digits := bytes.array()
+    digits.push(0)
+    mut i := zeroes
+    while i < input.len():
+        mut carry := input[i]
+        mut j := 0
+        while j < digits.len():
+            carry = carry + digits.get(j) * 256
+            digits.set(j, carry % 58)
+            carry = carry / 58
+            j = j + 1
+        while carry > 0:
+            digits.push(carry % 58)
+            carry = carry / 58
+        i = i + 1
+
+    mut result := ""
+    i = 0
+    while i < zeroes:
+        result = result + alphabet[0]
+        i = i + 1
+
+    mut j := digits.len() - 1
+    while j >= 0 and digits.get(j) == 0:
+        j = j - 1
+    while j >= 0:
+        result = result + alphabet[digits.get(j)]
+        j = j - 1
+    return result
+
+# decode bitcoin base58 into bytes.
+pub fn base58_decode(input: String) -> Bytes!:
+    if input.len() == 0:
+        return bytes.empty()
+
+    alphabet := b58_table()
+    mut zeroes := 0
+    while zeroes < input.len() and input[zeroes] == alphabet[0]:
+        zeroes = zeroes + 1
+
+    digits := bytes.array()
+    digits.push(0)
+    mut i := zeroes
+    while i < input.len():
+        value := b58_value(input[i])
+        if value < 0:
+            fail "invalid base58 character"
+        mut carry := value
+        mut j := 0
+        while j < digits.len():
+            carry = carry + digits.get(j) * 58
+            digits.set(j, carry % 256)
+            carry = carry / 256
+            j = j + 1
+        while carry > 0:
+            digits.push(carry % 256)
+            carry = carry / 256
+        i = i + 1
+
+    out := bytes.buffer_with_capacity(zeroes + digits.len())
+    i = 0
+    while i < zeroes:
+        out.write_byte(0)
+        i = i + 1
+
+    mut j := digits.len() - 1
+    while j >= 0 and digits.get(j) == 0:
+        j = j - 1
+    while j >= 0:
+        out.write_byte(digits.get(j))
+        j = j - 1
+    return out.bytes()
+
 fn hex_nibble(c: String) -> Int:
     if c >= "0" and c <= "9":
         return ord(c) - 48
@@ -329,6 +424,37 @@ pub fn from_hex_utf8(input: String) -> String!:
 
 fn encoding_from_hex_utf8(input: String) -> String!:
     return from_hex_utf8(input)
+
+# encode a non-negative integer as unsigned LEB128.
+pub fn varint_encode(value: Int) -> Bytes!:
+    if value < 0:
+        fail "varint value must be non-negative"
+    out := bytes.buffer()
+    mut remaining := value
+    while true:
+        mut byte_value := bits.band(remaining, 127)
+        remaining = bits.shr(remaining, 7)
+        if remaining != 0:
+            byte_value = bits.bor(byte_value, 128)
+        out.write_byte(byte_value)!
+        if remaining == 0:
+            return out.bytes()
+
+# decode an unsigned LEB128 varint from the start of a byte slice.
+pub fn varint_decode(input: Bytes) -> VarintResult!:
+    mut result := 0
+    mut shift := 0
+    mut i := 0
+    while i < input.len():
+        byte_value := input[i]
+        result = result + bits.shl(bits.band(byte_value, 127), shift)
+        if bits.band(byte_value, 128) == 0:
+            return VarintResult(result, i + 1)
+        shift = shift + 7
+        if shift >= 63:
+            fail "varint too large"
+        i = i + 1
+    fail "truncated varint"
 
 fn pem_line_wrap(text: String) -> String:
     mut lines: List[String] := []
@@ -436,6 +562,20 @@ test "base32 round trips rfc vectors":
     assert_eq(base32_hex_encode(bytes.from_string_utf8("foobar")), "CPNMUOJ1E8======")
     assert_eq(base32_hex_decode("CPNMUOJ1E8======")!.to_string_utf8()!, "foobar")
 
+test "base58 round trips common vectors":
+    zeroes := from_hex("00000000000000000000")!
+    hello := bytes.from_string_utf8("Hello World!")
+
+    assert_eq(base58_encode(bytes.empty()), "")
+    assert_eq(base58_encode(bytes.from_string_utf8(" ")), "Z")
+    assert_eq(base58_encode(bytes.from_string_utf8("-")), "n")
+    assert_eq(base58_encode(bytes.from_string_utf8("0")), "q")
+    assert_eq(base58_encode(bytes.from_string_utf8("1")), "r")
+    assert_eq(base58_encode(hello), "2NEpo7TZRRrLZSi2U")
+    assert_eq(base58_encode(zeroes), "1111111111")
+    assert_eq(base58_decode("2NEpo7TZRRrLZSi2U")!.to_string_utf8()!, "Hello World!")
+    assert_eq(base58_decode("1111111111")!.len(), 10)
+
 test "hex round trips bytes and text":
     data := bytes.from_string_utf8("hello")
     hexed := to_hex(data)
@@ -445,6 +585,19 @@ test "hex round trips bytes and text":
     assert_eq(from_hex(hexed)!.to_string_utf8()!, "hello")
     assert_eq(to_hex_string("forge"), "666f726765")
     assert_eq(from_hex_utf8("666f726765")!, "forge")
+
+test "varints encode and decode unsigned integers":
+    one := varint_decode(varint_encode(1)!)!
+    multi := varint_decode(varint_encode(300)!)!
+    maxish := varint_decode(varint_encode(4294967295)!)!
+
+    assert_eq(to_hex(varint_encode(0)!), "00")
+    assert_eq(to_hex(varint_encode(300)!), "ac02")
+    assert_eq(one.value, 1)
+    assert_eq(one.read, 1)
+    assert_eq(multi.value, 300)
+    assert_eq(multi.read, 2)
+    assert_eq(maxish.value, 4294967295)
 
 test "pem round trips simple blocks":
     block := PemBlock("FORGE DATA", {"Version": "1"}, bytes.from_string_utf8("hello"))
@@ -462,6 +615,9 @@ test "decoders reject malformed input":
     bad_b64_char := b64_decode("!!!!")
     bad_b64_pad := b64_decode("AA=A")
     bad_b32_len := base32_decode("ABC")
+    bad_b58_char := base58_decode("0")
+    bad_varint_neg := varint_encode(-1)
+    bad_varint_truncated := varint_decode(from_hex("80")!)
     bad_pem := pem_decode("-----BEGIN A-----" + chr(10) + "AA==" + chr(10) + "-----END B-----")
 
     assert(odd_hex.is_err)
@@ -470,4 +626,7 @@ test "decoders reject malformed input":
     assert(bad_b64_char.is_err)
     assert(bad_b64_pad.is_err)
     assert(bad_b32_len.is_err)
+    assert(bad_b58_char.is_err)
+    assert(bad_varint_neg.is_err)
+    assert(bad_varint_truncated.is_err)
     assert(bad_pem.is_err)

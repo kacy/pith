@@ -1,0 +1,83 @@
+# std.crypto.hmac - keyed hash message authentication
+
+import std.bits as bits
+import std.bytes as bytes
+import std.encoding as encoding
+import std.hash as hash
+import std.crypto.subtle as subtle
+
+fn list_to_bytes(data: List[Int]) -> Bytes:
+    out := bytes.buffer_with_capacity(data.len())
+    for value in data:
+        out.write_byte(value)
+    return out.bytes()
+
+fn normalize_key_sha1(key: Bytes) -> Bytes:
+    if key.len() > 64:
+        return hash.sha1_bytes(key)
+    return key
+
+fn normalize_key_sha256(key: Bytes) -> Bytes:
+    if key.len() > 64:
+        return hash.sha256_bytes(key)
+    return key
+
+fn hmac_pad(key: Bytes, pad: Int) -> Bytes:
+    out := bytes.buffer_with_capacity(64)
+    mut i := 0
+    while i < 64:
+        mut value := 0
+        if i < key.len():
+            value = key[i]
+        out.write_byte(bits.xor(value, pad))
+        i = i + 1
+    return out.bytes()
+
+fn hmac_sha1_digest(key: Bytes, message: Bytes) -> Bytes:
+    k := normalize_key_sha1(key)
+    inner := hmac_pad(k, 54).concat(message)
+    inner_digest := hash.sha1_bytes(inner)
+    outer := hmac_pad(k, 92).concat(inner_digest)
+    return hash.sha1_bytes(outer)
+
+fn hmac_sha256_digest(key: Bytes, message: Bytes) -> Bytes:
+    k := normalize_key_sha256(key)
+    inner := hmac_pad(k, 54).concat(message)
+    inner_digest := hash.sha256_bytes(inner)
+    outer := hmac_pad(k, 92).concat(inner_digest)
+    return hash.sha256_bytes(outer)
+
+# compute HMAC-SHA1 and return raw bytes.
+pub fn sha1(key: Bytes, message: Bytes) -> Bytes:
+    return hmac_sha1_digest(key, message)
+
+# compute HMAC-SHA1 and return lowercase hex.
+pub fn sha1_hex(key: Bytes, message: Bytes) -> String:
+    return encoding.to_hex(sha1(key, message))
+
+# compute HMAC-SHA256 and return raw bytes.
+pub fn sha256(key: Bytes, message: Bytes) -> Bytes:
+    return hmac_sha256_digest(key, message)
+
+# compute HMAC-SHA256 and return lowercase hex.
+pub fn sha256_hex(key: Bytes, message: Bytes) -> String:
+    return encoding.to_hex(sha256(key, message))
+
+# verify HMAC-SHA256 using a no-early-return comparison.
+pub fn verify_sha256(key: Bytes, message: Bytes, expected: Bytes) -> Bool:
+    return subtle.equal(sha256(key, message), expected)
+
+test "hmac sha256 matches rfc 4231 vector":
+    key := list_to_bytes([11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11])
+    message := bytes.from_string_utf8("Hi There")
+    expected := "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+
+    assert_eq(sha256_hex(key, message), expected)
+    assert(verify_sha256(key, message, encoding.from_hex(expected)!))
+    assert(not verify_sha256(key, bytes.from_string_utf8("hi there"), encoding.from_hex(expected)!))
+
+test "hmac sha1 matches common vector":
+    key := bytes.from_string_utf8("key")
+    message := bytes.from_string_utf8("The quick brown fox jumps over the lazy dog")
+
+    assert_eq(sha1_hex(key, message), "de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9")

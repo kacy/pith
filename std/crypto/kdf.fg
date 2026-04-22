@@ -1,0 +1,114 @@
+# std.crypto.kdf - key derivation helpers
+
+import std.bits as bits
+import std.bytes as bytes
+import std.encoding as encoding
+import std.crypto.hmac as hmac
+
+fn zero_bytes(count: Int) -> Bytes:
+    out := bytes.buffer_with_capacity(count)
+    mut i := 0
+    while i < count:
+        out.write_byte(0)
+        i = i + 1
+    return out.bytes()
+
+fn int32_be(value: Int) -> Bytes:
+    out := bytes.buffer_with_capacity(4)
+    out.write_byte(bits.band(bits.shr(value, 24), 255))
+    out.write_byte(bits.band(bits.shr(value, 16), 255))
+    out.write_byte(bits.band(bits.shr(value, 8), 255))
+    out.write_byte(bits.band(value, 255))
+    return out.bytes()
+
+fn bytes_to_list(data: Bytes) -> List[Int]:
+    mut out: List[Int] := []
+    mut i := 0
+    while i < data.len():
+        out.push(data[i])
+        i = i + 1
+    return out
+
+fn list_to_bytes(data: List[Int], limit: Int) -> Bytes:
+    out := bytes.buffer_with_capacity(limit)
+    mut i := 0
+    while i < data.len() and i < limit:
+        out.write_byte(data[i])
+        i = i + 1
+    return out.bytes()
+
+fn xor_digest(left: List[Int], right: Bytes) -> List[Int]:
+    mut out: List[Int] := []
+    mut i := 0
+    while i < left.len():
+        out.push(bits.xor(left[i], right[i]))
+        i = i + 1
+    return out
+
+# derive bytes with HKDF-SHA256.
+pub fn hkdf_sha256(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Bytes!:
+    if length < 0:
+        fail "hkdf length out of range"
+    if length > 8160:
+        fail "hkdf length out of range"
+    mut actual_salt := salt
+    if actual_salt.len() == 0:
+        actual_salt = zero_bytes(32)
+    prk := hmac.sha256(actual_salt, secret)
+    mut okm := bytes.buffer_with_capacity(length)
+    mut previous := bytes.empty()
+    mut counter := 1
+    while okm.bytes().len() < length:
+        input := previous.concat(info).concat(int32_be(counter).slice(3, 4))
+        previous = hmac.sha256(prk, input)
+        need := length - okm.bytes().len()
+        mut take := previous.len()
+        if take > need:
+            take = need
+        okm.write(previous.slice(0, take))!
+        counter = counter + 1
+    return okm.bytes()
+
+# derive bytes with PBKDF2-HMAC-SHA256.
+pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int, length: Int) -> Bytes!:
+    if iterations <= 0:
+        fail "pbkdf2 iterations must be positive"
+    if length < 0:
+        fail "pbkdf2 length out of range"
+    out := bytes.buffer_with_capacity(length)
+    mut block_index := 1
+    while out.bytes().len() < length:
+        mut u := hmac.sha256(password, salt.concat(int32_be(block_index)))
+        mut mixed := bytes_to_list(u)
+        mut round := 2
+        while round <= iterations:
+            u = hmac.sha256(password, u)
+            mixed = xor_digest(mixed, u)
+            round = round + 1
+        need := length - out.bytes().len()
+        block := list_to_bytes(mixed, need)
+        out.write(block)!
+        block_index = block_index + 1
+    return out.bytes()
+
+test "hkdf sha256 matches rfc 5869 vector":
+    ikm := encoding.from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")!
+    salt := encoding.from_hex("000102030405060708090a0b0c")!
+    info := encoding.from_hex("f0f1f2f3f4f5f6f7f8f9")!
+    okm := hkdf_sha256(ikm, salt, info, 42)!
+
+    assert_eq(encoding.to_hex(okm), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+
+test "pbkdf2 sha256 matches common vectors":
+    password := bytes.from_string_utf8("password")
+    salt := bytes.from_string_utf8("salt")
+
+    assert_eq(encoding.to_hex(pbkdf2_sha256(password, salt, 1, 32)!), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+    assert_eq(encoding.to_hex(pbkdf2_sha256(password, salt, 2, 32)!), "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43")
+
+test "kdf rejects invalid parameters":
+    assert(hkdf_sha256(bytes.empty(), bytes.empty(), bytes.empty(), -1).is_err)
+    assert(pbkdf2_sha256(bytes.empty(), bytes.empty(), 0, 32).is_err)
+    assert(pbkdf2_sha256(bytes.empty(), bytes.empty(), 1, -1).is_err)
+    assert_eq(hkdf_sha256(bytes.empty(), bytes.empty(), bytes.empty(), 0)!.len(), 0)
+    assert_eq(pbkdf2_sha256(bytes.empty(), bytes.empty(), 1, 0)!.len(), 0)

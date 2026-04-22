@@ -132,13 +132,13 @@ output via the Cranelift native backend.
 - concurrency: spawn/await, Task[T], Mutex, WaitGroup, Semaphore, Channel, select, contexts, timers
 - multi-module imports with `from ... import`
 
-**standard library (43 modules):**
+**standard library (47 modules):**
 - string methods, type conversions, math builtins
 - file I/O, env, args, exit, exec
 - collection methods (push, remove, contains, keys, values, reverse, etc.)
 - std.json, std.toml, std.csv, std.config — parse/encode config and data
 - std.net.tcp, std.net.dns, std.net.url, std.net.http, std.net.websocket — networking
-- std.hash, std.checksum, std.encoding, std.bits, std.bytes, std.binary — bytes and encoding
+- std.hash, std.checksum, std.encoding, std.crypto, std.bits, std.bytes, std.binary — bytes, crypto, and encoding
 - std.os.path, std.os.process, std.fs, std.glob — files, paths, and file discovery
 - std.cli, std.diagnostic, std.testing, std.text.scanner — small tooling layers
 - std.log, std.fmt, std.math, std.rand, std.time, std.datetime, std.uuid — common app helpers

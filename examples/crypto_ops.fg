@@ -1,0 +1,26 @@
+# crypto ops - hmac, hkdf, pbkdf2, and subtle comparison
+
+import std.bytes as bytes
+import std.crypto.hmac as hmac
+import std.crypto.kdf as kdf
+import std.crypto.subtle as subtle
+import std.encoding as encoding
+
+fn main() -> String!:
+    key := bytes.from_string_utf8("key")
+    message := bytes.from_string_utf8("The quick brown fox jumps over the lazy dog")
+    mac := hmac.sha256(key, message)
+    print("hmac sha256: " + encoding.to_hex(mac))
+    print("hmac verify: " + hmac.verify_sha256(key, message, mac).to_string())
+
+    ikm := encoding.from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")!
+    salt := encoding.from_hex("000102030405060708090a0b0c")!
+    info := encoding.from_hex("f0f1f2f3f4f5f6f7f8f9")!
+    hkdf := kdf.hkdf_sha256(ikm, salt, info, 16)!
+    print("hkdf prefix: " + encoding.to_hex(hkdf))
+
+    derived := kdf.pbkdf2_sha256(bytes.from_string_utf8("password"), bytes.from_string_utf8("salt"), 2, 16)!
+    print("pbkdf2 prefix: " + encoding.to_hex(derived))
+    print("subtle equal: " + subtle.equal(mac, mac).to_string())
+    print("crypto ops work")
+    return ""

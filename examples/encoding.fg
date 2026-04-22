@@ -15,16 +15,28 @@ fn run() -> String!:
     print("base64 'a': " + encoding.b64_encode(bytes.from_string_utf8("a")))
     print("base64 'ab': " + encoding.b64_encode(bytes.from_string_utf8("ab")))
     print("base64 'abc': " + encoding.b64_encode(bytes.from_string_utf8("abc")))
+    print("base64 raw: " + encoding.b64_raw_encode(bytes.from_string_utf8("foobar")))
+    print("base64 url raw: " + encoding.b64_url_raw_encode(bytes.from_string_utf8("??")))
 
     hex_encoded := encoding.to_hex(bytes.from_string_utf8("Hello"))
     print("hex encode: " + hex_encoded)
+    print("hex upper: " + encoding.to_hex_upper(bytes.from_string_utf8("Hello")))
 
     hex_decoded := encoding.from_hex(hex_encoded)!.to_string_utf8()!
     print("hex decode: " + hex_decoded)
 
+    base32_encoded := encoding.base32_encode(bytes.from_string_utf8("foobar"))
+    print("base32 encode: " + base32_encoded)
+    print("base32 decode: " + encoding.base32_decode(base32_encoded)!.to_string_utf8()!)
+
     single_byte := bytes.buffer()
     single_byte.write_byte(255)!
     print("hex 0xff: " + encoding.to_hex(single_byte.bytes()))
+
+    pem := encoding.pem_encode("FORGE DATA", bytes.from_string_utf8("hello"))
+    parsed := encoding.pem_decode(pem)!
+    print("pem kind: " + parsed.kind)
+    print("pem body: " + parsed.body.to_string_utf8()!)
 
     original_text := "forge programming language"
     roundtrip_result := encoding.b64_decode(encoding.b64_encode(bytes.from_string_utf8(original_text)))!.to_string_utf8()!

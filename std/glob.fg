@@ -100,6 +100,12 @@ fn glob_any_match(patterns: List[String], candidate: String) -> String:
             return pattern
     return ""
 
+fn glob_match_paths(matches: List[GlobMatch]) -> List[String]:
+    mut out: List[String] := []
+    for item in matches:
+        out.push(item.path)
+    return out
+
 fn glob_find_into(out: List[GlobMatch], root: String, current: String, include: List[String], exclude: List[String], opts: GlobOptions) -> List[GlobMatch]!:
     for entry in fs.read_dir(current)!:
         if glob_should_skip(entry, opts):
@@ -116,32 +122,24 @@ fn glob_find_into(out: List[GlobMatch], root: String, current: String, include: 
                     out.push(GlobMatch(entry.path, include_pattern))
     return out
 
+fn glob_find_matches_checked(root: String, include: List[String], exclude: List[String], options: GlobOptions) -> List[GlobMatch]!:
+    if not fs.exists(root):
+        fail "path does not exist: " + root
+    mut out: List[GlobMatch] := []
+    glob_find_into(out, root, root, include, exclude, options)!
+    return out
+
 # find matching files under root using default options.
 pub fn find(root: String, patterns: List[String]) -> List[String]!:
-    matches := find_matches(root, patterns, default_options())!
-    mut out: List[String] := []
-    for item in matches:
-        out.push(item.path)
-    return out
+    return glob_match_paths(find_matches(root, patterns, default_options())!)
 
 # find matching files and return the pattern for each match.
 pub fn find_matches(root: String, patterns: List[String], options: GlobOptions) -> List[GlobMatch]!:
-    mut out: List[GlobMatch] := []
-    if not fs.exists(root):
-        fail "path does not exist: " + root
-    glob_find_into(out, root, root, patterns, [], options)!
-    return out
+    return glob_find_matches_checked(root, patterns, [], options)
 
 # find matching files while excluding paths that match exclude patterns.
 pub fn find_excluding(root: String, include: List[String], exclude: List[String], options: GlobOptions) -> List[String]!:
-    mut matches: List[GlobMatch] := []
-    if not fs.exists(root):
-        fail "path does not exist: " + root
-    glob_find_into(matches, root, root, include, exclude, options)!
-    mut out: List[String] := []
-    for item in matches:
-        out.push(item.path)
-    return out
+    return glob_match_paths(glob_find_matches_checked(root, include, exclude, options)!)
 
 test "glob matches path patterns":
     assert(matches("std/**/*.fg", "std/net/http.fg"))

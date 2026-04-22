@@ -13,9 +13,9 @@ import std.binary as bin
 import std.bits as bits
 import std.hash as hash
 import std.encoding as encoding
+import std.crypto.random as crypto_random
 import std.net.http as http
 import std.io as io
-import std.rand as rand
 import std.text.scanner as scanner
 from std.bytes import ByteBuffer
 from std.io import BufferedBytesReader, BufferedBytesWriter, TcpStream
@@ -104,12 +104,7 @@ fn default_host_header(host: String, port: Int) -> String:
         return host
     return host + ":" + port.to_string()
 fn random_bytes(count: Int) -> Bytes!:
-    buf := bytes.buffer_with_capacity(count)
-    mut i := 0
-    while i < count:
-        buf.write_byte(rand.int(0, 255))!
-        i = i + 1
-    return buf.bytes()
+    return crypto_random.bytes(count)
 fn random_mask_key() -> Bytes!:
     return random_bytes(4)
 fn random_client_key() -> Bytes!:

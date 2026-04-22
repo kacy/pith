@@ -1,5 +1,6 @@
 use crate::{ensure_perf_stats_registered, perf_count, PERF_BYTES_ALLOCS, PERF_BYTES_ALLOC_BYTES};
 use crate::{PERF_BYTE_BUFFER_NEWS, PERF_BYTE_BUFFER_WRITES, PERF_BYTE_BUFFER_WRITE_BYTES};
+use std::io::Read;
 
 #[repr(C)]
 pub(crate) struct ForgeBytes {
@@ -134,6 +135,20 @@ pub unsafe extern "C" fn forge_bytes_eq(a: i64, b: i64) -> i64 {
         1
     } else {
         0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn forge_secure_random_bytes(count: i64) -> i64 {
+    let len = count.max(0) as usize;
+    let mut out = vec![0_u8; len];
+    if len == 0 {
+        return forge_bytes_from_vec(out);
+    }
+
+    match std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut out)) {
+        Ok(()) => forge_bytes_from_vec(out),
+        Err(_) => 0,
     }
 }
 

@@ -1,0 +1,19 @@
+# std.crypto.random - os-backed random bytes
+#
+# use this for keys, nonces, ids, and protocol randomness. `std.rand` stays
+# deterministic and seedable for tests and simulations.
+
+import std.bytes as bytes
+
+# return random bytes from the operating system.
+pub fn bytes(count: Int) -> Bytes!:
+    if count < 0:
+        fail "random byte count must be non-negative"
+    out := secure_random_bytes(count)
+    if out.len() != count:
+        fail "secure random source failed"
+    return out
+
+test "crypto random returns the requested byte count":
+    assert_eq(bytes(0)!.len(), 0)
+    assert_eq(bytes(16)!.len(), 16)

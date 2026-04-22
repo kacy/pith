@@ -9,11 +9,11 @@ coding agents can read the errors, apply fixes, and iterate — fast.
 **status:** the compiler self-hosts — forge is written in forge. the
 self-hosted compiler compiles itself and produces identical output across
 stages (fixed-point verified). two backends: C transpilation and Cranelift
-native code generation — both compile all 43 examples identically, and both
+native code generation — both compile all 81 examples identically, and both
 compile the compiler itself to a fixed point. the CLI handles build, run,
-test, check, fmt, lint, lex, parse, doc, and more. 16 standard library
+test, check, fmt, lint, lex, parse, doc, and more. 42 standard library
 modules cover I/O, networking, encoding, hashing, JSON, TOML, process
-management, and more.
+management, tooling helpers, and more.
 
 ## quick start
 
@@ -34,6 +34,7 @@ make self-host
 - `docs/http_apps.md` for the higher-level http request/response layer
 - `docs/text_and_bytes.md` for the string/bytes split and common helpers
 - `docs/contributing.md` for the development loop and smoke checks
+- `docs/tooling_stdlib.md` for glob, cli, diagnostic, and testing helpers
 - `self-host/forge_main.fg` for the self-hosted frontend (lex/parse/check/fmt/lint/doc)
 - `cranelift/cli/src/main.rs` for the native backend CLI (build/run)
 
@@ -101,7 +102,7 @@ fn main():
 ## what works today
 
 the self-hosted compiler handles the full pipeline: lex → parse → check →
-codegen. 53 deterministic example programs compile and produce verified
+codegen. 81 deterministic example programs compile and produce verified
 output via the Cranelift native backend.
 
 **language features:**
@@ -131,15 +132,16 @@ output via the Cranelift native backend.
 - concurrency: spawn/await, Task[T], Mutex, WaitGroup, Semaphore, Channel, select, contexts, timers
 - multi-module imports with `from ... import`
 
-**standard library (16 modules):**
+**standard library (42 modules):**
 - string methods, type conversions, math builtins
 - file I/O, env, args, exit, exec
 - collection methods (push, remove, contains, keys, values, reverse, etc.)
-- std.json, std.toml — parse/encode
-- std.net.tcp, std.net.dns, std.net.url — networking
-- std.hash, std.encoding — SHA-256, FNV-1a, base64, hex
-- std.os.path, std.os.process — path manipulation, child processes
-- std.log, std.fmt, std.fs, std.math — logging, formatting, file ops, math
+- std.json, std.toml, std.csv, std.config — parse/encode config and data
+- std.net.tcp, std.net.dns, std.net.url, std.net.http, std.net.websocket — networking
+- std.hash, std.checksum, std.encoding, std.bits, std.bytes, std.binary — bytes and encoding
+- std.os.path, std.os.process, std.fs, std.glob — files, paths, and file discovery
+- std.cli, std.diagnostic, std.testing — small tooling layers
+- std.log, std.fmt, std.math, std.rand, std.time, std.datetime, std.uuid — common app helpers
 
 for child processes, prefer `std.os.process.command(...)` and the structured
 `run` / `output` / `start` flow. keep `std.io` for low-level stream work.
@@ -241,10 +243,13 @@ cranelift/             native code backend — Rust + Cranelift (~18,100 lines)
   codegen/           AST-to-IR compilation, monomorphization, type inference
   runtime/           runtime library (ARC, collections, JSON, TOML, URL, concurrency)
 
-std/                 standard library (13 native forge modules)
+std/                 standard library (42 native forge modules)
+  cli.fg             command-line parsing helpers
+  diagnostic.fg      reusable diagnostics for tools
   encoding.fg        base64/hex encoding
   fmt.fg             string formatting
   fs.fg              file I/O
+  glob.fg            file pattern discovery
   hash.fg            SHA-256, FNV-1a
   json.fg            JSON parse/encode
   log.fg             structured logging
@@ -266,7 +271,7 @@ tests/               regression and negative compiler fixtures
   invalid/           checker-invalid programs + expected error codes
   invalid_parse/     parser-invalid programs + expected error codes
 
-examples/              43 deterministic .fg programs with verified expected output
+examples/              81 deterministic .fg programs with verified expected output
 docs/grammar.ebnf    complete EBNF for the language
 docs/errors.md       error code reference (E0xx–E3xx)
 docs/architecture.md compiler and ownership overview

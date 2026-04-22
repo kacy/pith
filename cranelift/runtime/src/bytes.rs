@@ -139,6 +139,22 @@ pub unsafe extern "C" fn forge_bytes_eq(a: i64, b: i64) -> i64 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn forge_crypto_constant_time_eq(a: i64, b: i64) -> i64 {
+    let a_bytes = forge_bytes_ref(a).map(|bytes| bytes.data.as_slice()).unwrap_or(&[]);
+    let b_bytes = forge_bytes_ref(b).map(|bytes| bytes.data.as_slice()).unwrap_or(&[]);
+    let max_len = a_bytes.len().max(b_bytes.len());
+    let mut diff = (a_bytes.len() ^ b_bytes.len()) as u8;
+
+    for i in 0..max_len {
+        let left = a_bytes.get(i).copied().unwrap_or(0);
+        let right = b_bytes.get(i).copied().unwrap_or(0);
+        diff |= left ^ right;
+    }
+
+    if diff == 0 { 1 } else { 0 }
+}
+
+#[no_mangle]
 pub extern "C" fn forge_secure_random_bytes(count: i64) -> i64 {
     let len = count.max(0) as usize;
     let mut out = vec![0_u8; len];

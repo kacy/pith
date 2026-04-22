@@ -1,32 +1,15 @@
-# std.crypto.subtle - constant-time-ish helpers
+# std.crypto.subtle - constant-time helpers
 #
-# these helpers avoid data-dependent early returns in forge code. the runtime
-# still needs native constant-time primitives before we should claim stronger
-# guarantees.
-
-import std.bits as bits
+# byte equality is handled in the runtime so callers don't pay for a forge-level
+# byte loop or an early-return comparison.
 
 # return true when two byte slices are equal.
 pub fn equal(left: Bytes, right: Bytes) -> Bool:
-    return compare(left, right) == 1
+    return crypto_constant_time_eq(left, right)
 
 # return 1 when two byte slices are equal, otherwise 0.
 pub fn compare(left: Bytes, right: Bytes) -> Int:
-    mut diff := bits.xor(left.len(), right.len())
-    mut max_len := left.len()
-    if right.len() > max_len:
-        max_len = right.len()
-    mut i := 0
-    while i < max_len:
-        mut a := 0
-        mut b := 0
-        if i < left.len():
-            a = left[i]
-        if i < right.len():
-            b = right[i]
-        diff = bits.bor(diff, bits.xor(a, b))
-        i = i + 1
-    if diff == 0:
+    if equal(left, right):
         return 1
     return 0
 

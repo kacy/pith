@@ -21,6 +21,8 @@ fn rotate_right(value: Int, amount: Int) -> Int:
 
 mut sha256_round_constants: List[Int] := []
 mut constants_initialized: Bool := false
+mut sha512_round_constants: List[Int] := []
+mut sha512_constants_initialized: Bool := false
 
 fn sha_init():
     if constants_initialized:
@@ -91,6 +93,91 @@ fn sha_init():
     sha256_round_constants.push(3204031479)
     sha256_round_constants.push(3329325298)
 
+fn sha512_init():
+    if sha512_constants_initialized:
+        return
+    sha512_constants_initialized = true
+    sha512_round_constants.push(4794697086780616226)
+    sha512_round_constants.push(8158064640168781261)
+    sha512_round_constants.push(-5349999486874862801)
+    sha512_round_constants.push(-1606136188198331460)
+    sha512_round_constants.push(4131703408338449720)
+    sha512_round_constants.push(6480981068601479193)
+    sha512_round_constants.push(-7908458776815382629)
+    sha512_round_constants.push(-6116909921290321640)
+    sha512_round_constants.push(-2880145864133508542)
+    sha512_round_constants.push(1334009975649890238)
+    sha512_round_constants.push(2608012711638119052)
+    sha512_round_constants.push(6128411473006802146)
+    sha512_round_constants.push(8268148722764581231)
+    sha512_round_constants.push(-9160688886553864527)
+    sha512_round_constants.push(-7215885187991268811)
+    sha512_round_constants.push(-4495734319001033068)
+    sha512_round_constants.push(-1973867731355612462)
+    sha512_round_constants.push(-1171420211273849373)
+    sha512_round_constants.push(1135362057144423861)
+    sha512_round_constants.push(2597628984639134821)
+    sha512_round_constants.push(3308224258029322869)
+    sha512_round_constants.push(5365058923640841347)
+    sha512_round_constants.push(6679025012923562964)
+    sha512_round_constants.push(8573033837759648693)
+    sha512_round_constants.push(-7476448914759557205)
+    sha512_round_constants.push(-6327057829258317296)
+    sha512_round_constants.push(-5763719355590565569)
+    sha512_round_constants.push(-4658551843659510044)
+    sha512_round_constants.push(-4116276920077217854)
+    sha512_round_constants.push(-3051310485924567259)
+    sha512_round_constants.push(489312712824947311)
+    sha512_round_constants.push(1452737877330783856)
+    sha512_round_constants.push(2861767655752347644)
+    sha512_round_constants.push(3322285676063803686)
+    sha512_round_constants.push(5560940570517711597)
+    sha512_round_constants.push(5996557281743188959)
+    sha512_round_constants.push(7280758554555802590)
+    sha512_round_constants.push(8532644243296465576)
+    sha512_round_constants.push(-9096487096722542874)
+    sha512_round_constants.push(-7894198246740708037)
+    sha512_round_constants.push(-6719396339535248540)
+    sha512_round_constants.push(-6333637450476146687)
+    sha512_round_constants.push(-4446306890439682159)
+    sha512_round_constants.push(-4076793802049405392)
+    sha512_round_constants.push(-3345356375505022440)
+    sha512_round_constants.push(-2983346525034927856)
+    sha512_round_constants.push(-860691631967231958)
+    sha512_round_constants.push(1182934255886127544)
+    sha512_round_constants.push(1847814050463011016)
+    sha512_round_constants.push(2177327727835720531)
+    sha512_round_constants.push(2830643537854262169)
+    sha512_round_constants.push(3796741975233480872)
+    sha512_round_constants.push(4115178125766777443)
+    sha512_round_constants.push(5681478168544905931)
+    sha512_round_constants.push(6601373596472566643)
+    sha512_round_constants.push(7507060721942968483)
+    sha512_round_constants.push(8399075790359081724)
+    sha512_round_constants.push(8693463985226723168)
+    sha512_round_constants.push(-8878714635349349518)
+    sha512_round_constants.push(-8302665154208450068)
+    sha512_round_constants.push(-8016688836872298968)
+    sha512_round_constants.push(-6606660893046293015)
+    sha512_round_constants.push(-4685533653050689259)
+    sha512_round_constants.push(-4147400797238176981)
+    sha512_round_constants.push(-3880063495543823972)
+    sha512_round_constants.push(-3348786107499101689)
+    sha512_round_constants.push(-1523767162380948706)
+    sha512_round_constants.push(-757361751448694408)
+    sha512_round_constants.push(500013540394364858)
+    sha512_round_constants.push(748580250866718886)
+    sha512_round_constants.push(1242879168328830382)
+    sha512_round_constants.push(1977374033974150939)
+    sha512_round_constants.push(2944078676154940804)
+    sha512_round_constants.push(3659926193048069267)
+    sha512_round_constants.push(4368137639120453308)
+    sha512_round_constants.push(4836135668995329356)
+    sha512_round_constants.push(5532061633213252278)
+    sha512_round_constants.push(6448918945643986474)
+    sha512_round_constants.push(6902733635092675308)
+    sha512_round_constants.push(7801388544844847127)
+
 fn word32_to_hex(val: Int) -> String:
     hex := "0123456789abcdef"
     mut result := ""
@@ -100,6 +187,25 @@ fn word32_to_hex(val: Int) -> String:
         result = result + hex[nibble]
         i = i + 1
     return result
+
+fn word64_to_hex(val: Int) -> String:
+    hex := "0123456789abcdef"
+    mut result := ""
+    mut i := 0
+    while i < 16:
+        nibble := bits.band(bits.shr(val, 60 - i * 4), 15)
+        result = result + hex[nibble]
+        i = i + 1
+    return result
+
+fn add64_4(a: Int, b: Int, c: Int, d: Int) -> Int:
+    return bits.add64(bits.add64(bits.add64(a, b), c), d)
+
+fn add64_5(a: Int, b: Int, c: Int, d: Int, e: Int) -> Int:
+    return bits.add64(add64_4(a, b, c, d), e)
+
+fn word64_from_be(msg: List[Int], off: Int) -> Int:
+    return bits.bor(bits.bor(bits.bor(bits.bor(bits.bor(bits.bor(bits.bor(bits.shl(msg[off], 56), bits.shl(msg[off + 1], 48)), bits.shl(msg[off + 2], 40)), bits.shl(msg[off + 3], 32)), bits.shl(msg[off + 4], 24)), bits.shl(msg[off + 5], 16)), bits.shl(msg[off + 6], 8)), msg[off + 7])
 
 fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int) -> String:
     sha_init()
@@ -190,6 +296,100 @@ fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
         out = out + word32_to_hex(h7)
     return out
 
+fn sha2_64(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int) -> String:
+    sha512_init()
+
+    mut h0 := ih0
+    mut h1 := ih1
+    mut h2 := ih2
+    mut h3 := ih3
+    mut h4 := ih4
+    mut h5 := ih5
+    mut h6 := ih6
+    mut h7 := ih7
+
+    mut msg: List[Int] := []
+    mut i := 0
+    while i < input.len():
+        msg.push(input[i])
+        i = i + 1
+
+    msg.push(128)
+    while msg.len() % 128 != 112:
+        msg.push(0)
+
+    i = 0
+    while i < 8:
+        msg.push(0)
+        i = i + 1
+
+    bit_len := input.len() * 8
+    msg.push(bits.mask8(bits.shr(bit_len, 56)))
+    msg.push(bits.mask8(bits.shr(bit_len, 48)))
+    msg.push(bits.mask8(bits.shr(bit_len, 40)))
+    msg.push(bits.mask8(bits.shr(bit_len, 32)))
+    msg.push(bits.mask8(bits.shr(bit_len, 24)))
+    msg.push(bits.mask8(bits.shr(bit_len, 16)))
+    msg.push(bits.mask8(bits.shr(bit_len, 8)))
+    msg.push(bits.mask8(bit_len))
+
+    mut block := 0
+    while block < msg.len():
+        mut w: List[Int] := []
+        i = 0
+        while i < 16:
+            w.push(word64_from_be(msg, block + i * 8))
+            i = i + 1
+        while i < 80:
+            s0 := bits.xor(bits.xor(bits.rotr64(w[i - 15], 1), bits.rotr64(w[i - 15], 8)), bits.shr(w[i - 15], 7))
+            s1 := bits.xor(bits.xor(bits.rotr64(w[i - 2], 19), bits.rotr64(w[i - 2], 61)), bits.shr(w[i - 2], 6))
+            w.push(add64_4(w[i - 16], s0, w[i - 7], s1))
+            i = i + 1
+
+        mut a := h0
+        mut b := h1
+        mut c := h2
+        mut d := h3
+        mut e := h4
+        mut f := h5
+        mut g := h6
+        mut h := h7
+
+        i = 0
+        while i < 80:
+            s1 := bits.xor(bits.xor(bits.rotr64(e, 14), bits.rotr64(e, 18)), bits.rotr64(e, 41))
+            ch := bits.xor(bits.band(e, f), bits.band(bits.invert(e), g))
+            temp1 := add64_5(h, s1, ch, sha512_round_constants[i], w[i])
+            s0 := bits.xor(bits.xor(bits.rotr64(a, 28), bits.rotr64(a, 34)), bits.rotr64(a, 39))
+            maj := bits.xor(bits.xor(bits.band(a, b), bits.band(a, c)), bits.band(b, c))
+            temp2 := bits.add64(s0, maj)
+            h = g
+            g = f
+            f = e
+            e = bits.add64(d, temp1)
+            d = c
+            c = b
+            b = a
+            a = bits.add64(temp1, temp2)
+            i = i + 1
+
+        h0 = bits.add64(h0, a)
+        h1 = bits.add64(h1, b)
+        h2 = bits.add64(h2, c)
+        h3 = bits.add64(h3, d)
+        h4 = bits.add64(h4, e)
+        h5 = bits.add64(h5, f)
+        h6 = bits.add64(h6, g)
+        h7 = bits.add64(h7, h)
+        block = block + 128
+
+    mut out := word64_to_hex(h0) + word64_to_hex(h1) + word64_to_hex(h2) + word64_to_hex(h3) + word64_to_hex(h4) + word64_to_hex(h5)
+    if words > 6:
+        out = out + word64_to_hex(h6)
+    if words > 7:
+        out = out + word64_to_hex(h7)
+    return out
+
 # compute a sha-256 digest and return it as lowercase hex.
 pub fn sha256(input: Bytes) -> String:
     return sha2_32(input, 1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225, 8)
@@ -223,6 +423,44 @@ pub fn sha224_bytes(input: Bytes) -> Bytes:
 # hash a utf-8 string with sha-224.
 pub fn sha224_string(input: String) -> String:
     return sha224(bytes.from_string_utf8(input))
+
+# compute a sha-512 digest and return it as lowercase hex.
+pub fn sha512(input: Bytes) -> String:
+    return sha2_64(input, 7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935, 5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809, 8)
+
+fn hash_sha512(input: Bytes) -> String:
+    return sha512(input)
+
+# compute a sha-512 digest and return raw bytes.
+pub fn sha512_bytes(input: Bytes) -> Bytes:
+    return encoding.from_hex(sha512(input)) catch bytes.empty()
+
+# compute a sha-512 digest and return lowercase hex.
+pub fn sha512_hex(input: Bytes) -> String:
+    return sha512(input)
+
+# hash a utf-8 string with sha-512.
+pub fn sha512_string(input: String) -> String:
+    return sha512(bytes.from_string_utf8(input))
+
+fn hash_sha512_string(input: String) -> String:
+    return sha512_string(input)
+
+# compute a sha-384 digest and return it as lowercase hex.
+pub fn sha384(input: Bytes) -> String:
+    return sha2_64(input, -3766243637369397544, 7105036623409894663, -7973340178411365097, 1526699215303891257, 7436329637833083697, -8163818279084223215, -2662702644619276377, 5167115440072839076, 6)
+
+# compute a sha-384 digest and return raw bytes.
+pub fn sha384_bytes(input: Bytes) -> Bytes:
+    return encoding.from_hex(sha384(input)) catch bytes.empty()
+
+# compute a sha-384 digest and return lowercase hex.
+pub fn sha384_hex(input: Bytes) -> String:
+    return sha384(input)
+
+# hash a utf-8 string with sha-384.
+pub fn sha384_string(input: String) -> String:
+    return sha384(bytes.from_string_utf8(input))
 
 # # hash bytes with fnv-1a.
 pub fn fnv1a(input: Bytes) -> Int:
@@ -372,6 +610,24 @@ test "sha224 hashes bytes and strings":
     assert_eq(sha224(data), digest)
     assert_eq(encoding.to_hex(sha224_bytes(data)), digest)
     assert_eq(sha224_string("hello"), digest)
+
+test "sha512 hashes bytes and strings":
+    data := bytes.from_string_utf8("abc")
+    digest := "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+
+    assert_eq(sha512(data), digest)
+    assert_eq(sha512_hex(data), digest)
+    assert_eq(encoding.to_hex(sha512_bytes(data)), digest)
+    assert_eq(sha512_string("abc"), digest)
+
+test "sha384 hashes bytes and strings":
+    data := bytes.from_string_utf8("abc")
+    digest := "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"
+
+    assert_eq(sha384(data), digest)
+    assert_eq(sha384_hex(data), digest)
+    assert_eq(encoding.to_hex(sha384_bytes(data)), digest)
+    assert_eq(sha384_string("abc"), digest)
 
 test "sha1 hashes bytes and strings":
     data := bytes.from_string_utf8("hello")

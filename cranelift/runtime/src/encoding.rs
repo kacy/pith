@@ -1,11 +1,27 @@
-/// Parse string to int — returns 0 on failure
+unsafe fn alloc_parse_int_result(is_ok: i64, ok: i64, err: i64) -> i64 {
+    let tuple = crate::forge_struct_alloc(3) as *mut i64;
+    if tuple.is_null() {
+        return 0;
+    }
+    *tuple = is_ok;
+    *tuple.add(1) = ok;
+    *tuple.add(2) = err;
+    tuple as i64
+}
+
+unsafe fn parse_int_error(message: &[u8]) -> i64 {
+    let err = crate::forge_copy_bytes_to_cstring(message) as i64;
+    alloc_parse_int_result(0, 0, err)
+}
+
+/// Parse string to int and return a result tuple pointer.
 ///
 /// # Safety
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn forge_parse_int(s: *const i8) -> i64 {
     if s.is_null() {
-        return 0;
+        return parse_int_error(b"invalid integer");
     }
     let len = crate::string::forge_cstring_len(s) as usize;
     let slice = std::slice::from_raw_parts(s as *const u8, len);
@@ -18,7 +34,7 @@ pub unsafe extern "C" fn forge_parse_int(s: *const i8) -> i64 {
         end -= 1;
     }
     if start == end {
-        return 0;
+        return parse_int_error(b"invalid integer");
     }
     let mut pos = start;
     let mut negative = false;
@@ -26,7 +42,7 @@ pub unsafe extern "C" fn forge_parse_int(s: *const i8) -> i64 {
         negative = slice[pos] == b'-';
         pos += 1;
         if pos == end {
-            return 0;
+            return parse_int_error(b"invalid integer");
         }
     }
     let limit = if negative { i64::MAX as u64 + 1 } else { i64::MAX as u64 };
@@ -34,16 +50,16 @@ pub unsafe extern "C" fn forge_parse_int(s: *const i8) -> i64 {
     while pos < end {
         let digit = slice[pos];
         if !digit.is_ascii_digit() {
-            return 0;
+            return parse_int_error(b"invalid integer");
         }
         let digit_value = (digit - b'0') as u64;
         if value > (limit - digit_value) / 10 {
-            return 0;
+            return parse_int_error(b"integer overflow");
         }
         value = value * 10 + digit_value;
         pos += 1;
     }
-    if negative {
+    let parsed = if negative {
         if value == limit {
             i64::MIN
         } else {
@@ -51,7 +67,8 @@ pub unsafe extern "C" fn forge_parse_int(s: *const i8) -> i64 {
         }
     } else {
         value as i64
-    }
+    };
+    alloc_parse_int_result(1, parsed, 0)
 }
 
 /// Parse string to float — returns 0.0 on failure
@@ -382,29 +399,35 @@ mod tests {
     use super::forge_parse_int;
     use std::ffi::CString;
 
-    fn parse(input: &str) -> i64 {
+    fn parse(input: &str) -> (bool, i64) {
         let c_input = CString::new(input).unwrap();
-        unsafe { forge_parse_int(c_input.as_ptr()) }
+        let tuple = unsafe { forge_parse_int(c_input.as_ptr()) as *const i64 };
+        assert!(!tuple.is_null());
+        let is_ok = unsafe { *tuple } != 0;
+        let value = unsafe { *tuple.add(1) };
+        (is_ok, value)
     }
 
     #[test]
     fn parse_int_accepts_trimmed_signed_values() {
-        assert_eq!(parse("42"), 42);
-        assert_eq!(parse("  -17\n"), -17);
-        assert_eq!(parse("+5"), 5);
+        assert_eq!(parse("42"), (true, 42));
+        assert_eq!(parse("  -17\n"), (true, -17));
+        assert_eq!(parse("+5"), (true, 5));
+        assert_eq!(parse("-1"), (true, -1));
+        assert_eq!(parse("0"), (true, 0));
     }
 
     #[test]
     fn parse_int_rejects_invalid_or_overflowing_values() {
-        assert_eq!(parse(""), 0);
-        assert_eq!(parse("12x"), 0);
-        assert_eq!(parse("9223372036854775808"), 0);
-        assert_eq!(parse("-9223372036854775809"), 0);
+        assert_eq!(parse(""), (false, 0));
+        assert_eq!(parse("12x"), (false, 0));
+        assert_eq!(parse("9223372036854775808"), (false, 0));
+        assert_eq!(parse("-9223372036854775809"), (false, 0));
     }
 
     #[test]
     fn parse_int_handles_i64_bounds() {
-        assert_eq!(parse("9223372036854775807"), i64::MAX);
-        assert_eq!(parse("-9223372036854775808"), i64::MIN);
+        assert_eq!(parse("9223372036854775807"), (true, i64::MAX));
+        assert_eq!(parse("-9223372036854775808"), (true, i64::MIN));
     }
 }

@@ -532,6 +532,46 @@ pub fn pem_decode(text: String) -> PemBlock!:
         index = index + 1
     fail "pem end marker not found"
 
+# decode every pem block in text.
+pub fn pem_decode_all(text: String) -> List[PemBlock]!:
+    lines := text.split(chr(10))
+    mut blocks: List[PemBlock] := []
+    mut index := 0
+    while index < lines.len():
+        kind := parse_pem_begin(lines[index].trim())
+        if kind == "":
+            index = index + 1
+            continue
+        index = index + 1
+        mut headers: Map[String, String] := {}
+        mut saw_body := false
+        mut body_text := ""
+        mut found_end := false
+        while index < lines.len():
+            line := lines[index].trim()
+            end_kind := parse_pem_end(line)
+            if end_kind != "":
+                if end_kind != kind:
+                    fail "pem end marker mismatch"
+                blocks.push(PemBlock(kind, headers, b64_decode_ignore_ws(body_text)!))
+                found_end = true
+                break
+            if line == "":
+                saw_body = true
+            elif not saw_body and line.contains(":"):
+                parts := line.split(":")
+                headers.insert(parts[0].trim(), parts.slice(1, parts.len()).join(":").trim())
+            else:
+                saw_body = true
+                body_text = body_text + line
+            index = index + 1
+        if not found_end:
+            fail "pem end marker not found"
+        index = index + 1
+    if blocks.len() == 0:
+        fail "pem begin marker not found"
+    return blocks
+
 test "base64 round trips bytes and text":
     data := bytes.from_string_utf8("hello")
     encoded := b64_encode(data)
@@ -603,10 +643,13 @@ test "pem round trips simple blocks":
     block := PemBlock("FORGE DATA", {"Version": "1"}, bytes.from_string_utf8("hello"))
     encoded := pem_encode_block(block)
     decoded := pem_decode(encoded)!
+    decoded_all := pem_decode_all(encoded + encoded)!
 
     assert_eq(decoded.kind, "FORGE DATA")
     assert_eq(decoded.headers["Version"], "1")
     assert_eq(decoded.body.to_string_utf8()!, "hello")
+    assert_eq(decoded_all.len(), 2)
+    assert_eq(decoded_all[1].body.to_string_utf8()!, "hello")
 
 test "decoders reject malformed input":
     odd_hex := from_hex("abc")
@@ -619,6 +662,7 @@ test "decoders reject malformed input":
     bad_varint_neg := varint_encode(-1)
     bad_varint_truncated := varint_decode(from_hex("80")!)
     bad_pem := pem_decode("-----BEGIN A-----" + chr(10) + "AA==" + chr(10) + "-----END B-----")
+    bad_pem_all := pem_decode_all("-----BEGIN A-----" + chr(10) + "AA==" + chr(10) + "-----END B-----")
 
     assert(odd_hex.is_err)
     assert(bad_hex.is_err)
@@ -630,3 +674,4 @@ test "decoders reject malformed input":
     assert(bad_varint_neg.is_err)
     assert(bad_varint_truncated.is_err)
     assert(bad_pem.is_err)
+    assert(bad_pem_all.is_err)

@@ -329,6 +329,17 @@ pub fn parse_pem(text: String) -> Certificate!:
         fail "pem block is not a certificate"
     return parse_der(block.body)!
 
+# parse every certificate in a pem document.
+pub fn parse_pem_chain(text: String) -> List[Certificate]!:
+    blocks := encoding.pem_decode_all(text)!
+    mut certs: List[Certificate] := []
+    for block in blocks:
+        if block.kind == "CERTIFICATE":
+            certs.push(parse_der(block.body)!)
+    if certs.len() == 0:
+        fail "pem certificate not found"
+    return certs
+
 fn host_is_ip(host: String) -> Bool:
     if host.contains(":"):
         return true
@@ -447,6 +458,14 @@ test "x509 hostname matching uses san names":
     assert(cert.matches_hostname("localhost"))
     assert(cert.matches_hostname("127.0.0.1"))
     assert(not cert.matches_hostname("example.com"))
+
+test "x509 parses pem certificate chains":
+    chain := fs.read("tests/live/fixtures/localhost.crt")! + fs.read("tests/live/fixtures/localhost-ca.crt")!
+    certs := parse_pem_chain(chain)!
+
+    assert_eq(certs.len(), 2)
+    assert_eq(certs[0].subject_common_name, "localhost")
+    assert_eq(certs[1].subject_common_name, "forge-test-ca")
 
 test "x509 trust preflight verifies fixture signature":
     cert := parse_pem(fs.read("tests/live/fixtures/localhost.crt")!)!

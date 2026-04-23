@@ -9,6 +9,7 @@ import std.bytes as bytes
 import std.crypto.aead as aead
 import std.crypto.kdf as kdf
 import std.encoding as encoding
+import std.hash as hash
 
 CONTENT_CHANGE_CIPHER_SPEC := 20
 CONTENT_ALERT := 21
@@ -27,6 +28,11 @@ pub struct Record:
 pub struct HandshakeMessage:
     pub message_type: Int
     pub body: Bytes
+
+# a tls traffic key and nonce base.
+pub struct TrafficKeys:
+    pub key: Bytes
+    pub iv: Bytes
 
 fn tls13_fail(message: String) -> String:
     return message
@@ -133,6 +139,14 @@ fn open_record_with_chacha(key: Bytes, static_iv: Bytes, sequence: Int, record: 
     inner := aead.chacha20_poly1305_open(key, sequence_nonce(static_iv, sequence)!, header, outer.payload)!
     return open_inner_plaintext(inner)
 
+fn zero_secret_sha256() -> Bytes:
+    out := bytes.buffer_with_capacity(32)
+    mut i := 0
+    while i < 32:
+        out.write_byte(0)
+        i = i + 1
+    return out.bytes()
+
 fn valid_content_type(content_type: Int) -> Bool:
     return content_type == CONTENT_CHANGE_CIPHER_SPEC or content_type == CONTENT_ALERT or content_type == CONTENT_HANDSHAKE or content_type == CONTENT_APPLICATION_DATA
 
@@ -213,6 +227,66 @@ pub fn hkdf_label(label: String, context: Bytes, length: Int) -> Bytes!:
 pub fn hkdf_expand_label_sha256(secret: Bytes, label: String, context: Bytes, length: Int) -> Bytes!:
     return kdf.hkdf_expand_sha256(secret, hkdf_label(label, context, length)!, length)
 
+# hash raw encoded handshake bytes with sha-256.
+pub fn transcript_hash_sha256(transcript: Bytes) -> Bytes:
+    return hash.sha256_bytes(transcript)
+
+# hash a list of decoded handshake messages with sha-256.
+pub fn handshake_transcript_hash_sha256(messages: List[HandshakeMessage]) -> Bytes!:
+    out := bytes.buffer()
+    for message in messages:
+        write_bytes_if_any(out, encode_handshake(message.message_type, message.body)!)!
+    return transcript_hash_sha256(out.bytes())
+
+# derive a tls 1.3 sha-256 secret for the current transcript.
+pub fn derive_secret_sha256(secret: Bytes, label: String, transcript: Bytes) -> Bytes!:
+    return hkdf_expand_label_sha256(secret, label, transcript_hash_sha256(transcript), 32)
+
+# derive a tls 1.3 sha-256 secret from a precomputed transcript hash.
+pub fn derive_secret_from_hash_sha256(secret: Bytes, label: String, transcript_hash: Bytes) -> Bytes!:
+    if transcript_hash.len() != 32:
+        fail "tls transcript hash must be 32 bytes"
+    return hkdf_expand_label_sha256(secret, label, transcript_hash, 32)
+
+# derive the tls 1.3 handshake secret from an x25519 shared secret.
+pub fn handshake_secret_sha256(shared_secret: Bytes) -> Bytes!:
+    early_secret := kdf.hkdf_extract_sha256(zero_secret_sha256(), bytes.empty())
+    derived := derive_secret_sha256(early_secret, "derived", bytes.empty())!
+    return kdf.hkdf_extract_sha256(derived, shared_secret)
+
+# derive the tls 1.3 master secret from the handshake secret.
+pub fn master_secret_sha256(handshake_secret: Bytes) -> Bytes!:
+    derived := derive_secret_sha256(handshake_secret, "derived", bytes.empty())!
+    return kdf.hkdf_extract_sha256(derived, bytes.empty())
+
+# derive the client handshake traffic secret.
+pub fn client_handshake_traffic_secret_sha256(handshake_secret: Bytes, transcript: Bytes) -> Bytes!:
+    return derive_secret_sha256(handshake_secret, "c hs traffic", transcript)
+
+# derive the server handshake traffic secret.
+pub fn server_handshake_traffic_secret_sha256(handshake_secret: Bytes, transcript: Bytes) -> Bytes!:
+    return derive_secret_sha256(handshake_secret, "s hs traffic", transcript)
+
+# derive the client application traffic secret.
+pub fn client_application_traffic_secret_sha256(master_secret: Bytes, transcript: Bytes) -> Bytes!:
+    return derive_secret_sha256(master_secret, "c ap traffic", transcript)
+
+# derive the server application traffic secret.
+pub fn server_application_traffic_secret_sha256(master_secret: Bytes, transcript: Bytes) -> Bytes!:
+    return derive_secret_sha256(master_secret, "s ap traffic", transcript)
+
+# derive the tls 1.3 finished key for hmac-sha256.
+pub fn finished_key_sha256(base_key: Bytes) -> Bytes!:
+    return hkdf_expand_label_sha256(base_key, "finished", bytes.empty(), 32)
+
+# expand an aes-128-gcm traffic secret into its key and static iv.
+pub fn traffic_keys_aes_128_gcm_sha256(secret: Bytes) -> TrafficKeys!:
+    return TrafficKeys(hkdf_expand_label_sha256(secret, "key", bytes.empty(), 16)!, hkdf_expand_label_sha256(secret, "iv", bytes.empty(), 12)!)
+
+# expand a chacha20-poly1305 traffic secret into its key and static iv.
+pub fn traffic_keys_chacha20_poly1305_sha256(secret: Bytes) -> TrafficKeys!:
+    return TrafficKeys(hkdf_expand_label_sha256(secret, "key", bytes.empty(), 32)!, hkdf_expand_label_sha256(secret, "iv", bytes.empty(), 12)!)
+
 # seal a tls 1.3 application record with aes-128-gcm.
 pub fn seal_application_aes_128_gcm(key: Bytes, static_iv: Bytes, sequence: Int, content_type: Int, plaintext: Bytes) -> Bytes!:
     return seal_record_with_aes(key, static_iv, sequence, content_type, plaintext)
@@ -270,6 +344,36 @@ test "tls13 encodes hkdf labels":
 
     assert_eq(encoding.to_hex(label), "00200d746c733133206465726976656400")
     assert_eq(hkdf_expand_label_sha256(secret, "derived", bytes.empty(), 32)!.len(), 32)
+
+test "tls13 hashes handshake transcripts":
+    client_hello := encode_handshake(1, bytes.from_string_utf8("client"))!
+    server_hello := encode_handshake(2, bytes.from_string_utf8("server"))!
+    transcript := client_hello.concat(server_hello)
+    messages := decode_handshakes(transcript)!
+
+    assert_eq(encoding.to_hex(transcript_hash_sha256(bytes.empty())), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert(bytes.eq(handshake_transcript_hash_sha256(messages)!, transcript_hash_sha256(transcript)))
+
+test "tls13 derives sha256 traffic keys":
+    shared := encoding.from_hex("010203040506070809000102030405060708090001020304050607080900010203")!
+    transcript := encode_handshake(1, bytes.from_string_utf8("client"))!.concat(encode_handshake(2, bytes.from_string_utf8("server"))!)
+    hs_secret := handshake_secret_sha256(shared)!
+    client_secret := client_handshake_traffic_secret_sha256(hs_secret, transcript)!
+    server_secret := server_handshake_traffic_secret_sha256(hs_secret, transcript)!
+    keys := traffic_keys_aes_128_gcm_sha256(client_secret)!
+    chacha_keys := traffic_keys_chacha20_poly1305_sha256(server_secret)!
+    master := master_secret_sha256(hs_secret)!
+
+    assert_eq(hs_secret.len(), 32)
+    assert_eq(client_secret.len(), 32)
+    assert_eq(server_secret.len(), 32)
+    assert(not bytes.eq(client_secret, server_secret))
+    assert_eq(keys.key.len(), 16)
+    assert_eq(keys.iv.len(), 12)
+    assert_eq(chacha_keys.key.len(), 32)
+    assert_eq(chacha_keys.iv.len(), 12)
+    assert_eq(master.len(), 32)
+    assert_eq(finished_key_sha256(client_secret)!.len(), 32)
 
 test "tls13 seals and opens aes application records":
     key := encoding.from_hex("00000000000000000000000000000000")!

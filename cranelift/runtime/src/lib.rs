@@ -28,7 +28,6 @@ pub mod process_io;
 pub mod runtime_core;
 pub mod string;
 pub mod string_list;
-pub mod tls;
 pub mod utility;
 
 pub use encoding::*;
@@ -40,7 +39,6 @@ pub use process::*;
 pub use process_io::*;
 pub use runtime_core::*;
 pub use string_list::*;
-pub use tls::*;
 pub use utility::*;
 
 pub(crate) use runtime_core::{

@@ -7,7 +7,9 @@ import std.bytes as bytes
 import std.binary as binary
 import std.crypto.ecdh as ecdh
 import std.crypto.random as random
+import std.crypto.signature as signature
 import std.crypto.x509 as x509
+import std.encoding as encoding
 import std.io as io
 import std.net.tls13 as tls13
 import std.os.certs as os_certs
@@ -16,6 +18,9 @@ from std.io import TcpStream
 mut next_native_config_handle := -1
 mut next_native_conn_handle := -1000000
 mut native_config_roots_pem: Map[Int, String] := {}
+mut native_server_cert_pem: Map[Int, String] := {}
+mut native_server_key_der: Map[Int, Bytes] := {}
+mut native_listener_config: Map[Int, Int] := {}
 mut native_conn_fd: Map[Int, Int] := {}
 mut native_conn_cipher: Map[Int, Int] := {}
 mut native_conn_read_key: Map[Int, Bytes] := {}
@@ -29,6 +34,7 @@ TLS_CONTENT_CHANGE_CIPHER_SPEC := 20
 TLS_CONTENT_ALERT := 21
 TLS_CONTENT_HANDSHAKE := 22
 TLS_CONTENT_APPLICATION_DATA := 23
+TLS_HANDSHAKE_CLIENT_HELLO := 1
 TLS_HANDSHAKE_SERVER_HELLO := 2
 TLS_HANDSHAKE_ENCRYPTED_EXTENSIONS := 8
 TLS_HANDSHAKE_CERTIFICATE := 11
@@ -36,6 +42,7 @@ TLS_HANDSHAKE_CERTIFICATE_VERIFY := 15
 TLS_HANDSHAKE_FINISHED := 20
 TLS_CIPHER_AES_128_GCM_SHA256 := 4865
 TLS_CIPHER_CHACHA20_POLY1305_SHA256 := 4867
+TLS_SIG_RSA_PSS_RSAE_SHA256 := 2052
 TLS_MAX_PLAINTEXT_RECORD := 16384
 
 # reusable tls configuration.
@@ -50,11 +57,6 @@ pub struct Conn:
 pub struct Listener:
     pub handle: Int
 
-fn tls_fail_if_zero(handle: Int, message: String) -> Int!:
-    if handle <= 0:
-        fail message
-    return handle
-
 fn native_config_handle(roots_pem: String) -> Config!:
     if roots_pem == "":
         fail "tls root certificates not found"
@@ -65,6 +67,19 @@ fn native_config_handle(roots_pem: String) -> Config!:
     native_config_roots_pem.insert(handle, roots_pem)
     return Config(handle)
 
+fn native_server_config_handle(cert_pem: String, key_pem: String) -> Config!:
+    certs := x509.parse_pem_chain(cert_pem)!
+    if certs.len() == 0:
+        fail "tls certificate chain is empty"
+    key := encoding.pem_decode(key_pem)!
+    if key.kind != "PRIVATE KEY":
+        fail "tls private key must be pkcs#8 pem"
+    handle := next_native_config_handle
+    next_native_config_handle = next_native_config_handle - 1
+    native_server_cert_pem.insert(handle, cert_pem)
+    native_server_key_der.insert(handle, key.body)
+    return Config(handle)
+
 fn native_config_roots(config: Config) -> List[x509.Certificate]!:
     if not native_config_roots_pem.contains_key(config.handle):
         fail "native tls client config not found"
@@ -73,8 +88,28 @@ fn native_config_roots(config: Config) -> List[x509.Certificate]!:
 fn is_native_config(config: Config) -> Bool:
     return native_config_roots_pem.contains_key(config.handle)
 
+fn is_native_server_config(config: Config) -> Bool:
+    return native_server_cert_pem.contains_key(config.handle)
+
 fn is_native_conn(handle: Int) -> Bool:
     return native_conn_fd.contains_key(handle)
+
+fn native_server_certificate_chain(config: Config) -> List[Bytes]!:
+    if not native_server_cert_pem.contains_key(config.handle):
+        fail "native tls server config not found"
+    blocks := encoding.pem_decode_all(native_server_cert_pem[config.handle])!
+    certs: List[Bytes] := []
+    for block in blocks:
+        if block.kind == "CERTIFICATE":
+            certs.push(block.body)
+    if certs.len() == 0:
+        fail "tls certificate chain is empty"
+    return certs
+
+fn native_server_private_key(config: Config) -> Bytes!:
+    if not native_server_key_der.contains_key(config.handle):
+        fail "native tls server key not found"
+    return native_server_key_der[config.handle]
 
 fn checked_read(result: Int!binary.BinaryError) -> Int!:
     if result.is_err:
@@ -119,6 +154,13 @@ fn traffic_keys_for_cipher(cipher: Int, secret: Bytes) -> tls13.TrafficKeys!:
     if cipher == TLS_CIPHER_CHACHA20_POLY1305_SHA256:
         return tls13.traffic_keys_chacha20_poly1305_sha256(secret)
     fail "unsupported tls cipher suite"
+
+fn select_cipher(client: tls13.ClientHello) -> Int!:
+    if client.cipher_suites.contains(TLS_CIPHER_AES_128_GCM_SHA256):
+        return TLS_CIPHER_AES_128_GCM_SHA256
+    if client.cipher_suites.contains(TLS_CIPHER_CHACHA20_POLY1305_SHA256):
+        return TLS_CIPHER_CHACHA20_POLY1305_SHA256
+    fail "client did not offer a supported tls cipher suite"
 
 fn open_record_for_cipher(cipher: Int, key: Bytes, iv: Bytes, sequence: Int, record: Bytes) -> tls13.Record!:
     if cipher == TLS_CIPHER_AES_128_GCM_SHA256:
@@ -257,6 +299,83 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
     native_write_all(stream, encrypted_finished)!
     return allocate_native_conn(stream, server_hello.cipher_suite, server_app_keys, client_app_keys)
 
+fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
+    first_record := native_read_record(stream)!
+    if first_record.content_type == TLS_CONTENT_ALERT:
+        native_fail_alert(first_record)!
+    if first_record.content_type != TLS_CONTENT_HANDSHAKE:
+        fail "expected tls client hello"
+    client_messages := tls13.decode_handshakes(first_record.payload)!
+    if client_messages.len() == 0 or client_messages[0].message_type != TLS_HANDSHAKE_CLIENT_HELLO:
+        fail "expected tls client hello"
+    client_hello := tls13.parse_client_hello(client_messages[0].body)!
+    cipher := select_cipher(client_hello)!
+
+    keypair := ecdh.x25519_keypair()!
+    server_random := random.bytes(32)!
+    server_hello := tls13.encode_server_hello(server_random, client_hello.session_id, cipher, keypair.public_key)!
+    native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, server_hello)!)!
+
+    transcript := bytes.buffer()
+    transcript_append(transcript, client_messages[0])!
+    server_messages := tls13.decode_handshakes(server_hello)!
+    transcript_append(transcript, server_messages[0])!
+
+    shared_secret := keypair.shared_secret(client_hello.key_share)!
+    keypair.close()
+    handshake_secret := tls13.handshake_secret_sha256(shared_secret)!
+    server_hs_secret := tls13.server_handshake_traffic_secret_sha256(handshake_secret, transcript.bytes())!
+    client_hs_secret := tls13.client_handshake_traffic_secret_sha256(handshake_secret, transcript.bytes())!
+    server_hs_keys := traffic_keys_for_cipher(cipher, server_hs_secret)!
+    client_hs_keys := traffic_keys_for_cipher(cipher, client_hs_secret)!
+
+    encrypted_extensions := tls13.encode_encrypted_extensions()!
+    transcript.write(encrypted_extensions)!
+    certificate := tls13.encode_certificate_message(native_server_certificate_chain(config)!)!
+    transcript.write(certificate)!
+    cert_verify_input := tls13.server_certificate_verify_input_sha256(transcript.bytes())!
+    cert_signature := signature.sign_rsa_pss_sha256_pkcs8(native_server_private_key(config)!, cert_verify_input)!
+    certificate_verify := tls13.encode_certificate_verify(TLS_SIG_RSA_PSS_RSAE_SHA256, cert_signature)!
+    transcript.write(certificate_verify)!
+    server_verify := tls13.finished_verify_data_sha256(server_hs_secret, transcript.bytes())!
+    server_finished := tls13.encode_finished(server_verify)!
+    server_flight := encrypted_extensions.concat(certificate).concat(certificate_verify).concat(server_finished)
+    encrypted_flight := seal_record_for_cipher(cipher, server_hs_keys.key, server_hs_keys.iv, 0, TLS_CONTENT_HANDSHAKE, server_flight)!
+    native_write_all(stream, encrypted_flight)!
+    transcript.write(server_finished)!
+
+    application_transcript := transcript.bytes()
+    mut client_hs_seq := 0
+    mut client_finished_seen := false
+    while not client_finished_seen:
+        record := native_read_record(stream)!
+        if record.content_type == TLS_CONTENT_CHANGE_CIPHER_SPEC:
+            continue
+        if record.content_type == TLS_CONTENT_ALERT:
+            native_fail_alert(record)!
+        if record.content_type != TLS_CONTENT_APPLICATION_DATA:
+            fail "expected encrypted tls client finished"
+        inner := open_record_for_cipher(cipher, client_hs_keys.key, client_hs_keys.iv, client_hs_seq, record_bytes(record)!)!
+        client_hs_seq = client_hs_seq + 1
+        if inner.content_type != TLS_CONTENT_HANDSHAKE:
+            fail "expected tls client finished"
+        messages := tls13.decode_handshakes(inner.payload)!
+        for message in messages:
+            if message.message_type == TLS_HANDSHAKE_FINISHED:
+                verify_data := tls13.parse_finished(message.body)!
+                if not tls13.verify_finished_sha256(client_hs_secret, application_transcript, verify_data)!:
+                    fail "client finished verification failed"
+                client_finished_seen = true
+            else:
+                fail "unexpected tls client handshake message"
+
+    master_secret := tls13.master_secret_sha256(handshake_secret)!
+    server_app_secret := tls13.server_application_traffic_secret_sha256(master_secret, application_transcript)!
+    client_app_secret := tls13.client_application_traffic_secret_sha256(master_secret, application_transcript)!
+    server_app_keys := traffic_keys_for_cipher(cipher, server_app_secret)!
+    client_app_keys := traffic_keys_for_cipher(cipher, client_app_secret)!
+    return allocate_native_conn(stream, cipher, client_app_keys, server_app_keys)
+
 fn record_bytes(record: tls13.Record) -> Bytes!:
     out := bytes.buffer_with_capacity(record.payload.len() + 5)
     write_u8(out, record.content_type)!
@@ -345,7 +464,7 @@ pub fn client_config_with_ca_file(path: String) -> Config!:
 
 # create a server config from pem certificate and private key files.
 pub fn server_config(cert_path: String, key_path: String) -> Config!:
-    return Config(tls_fail_if_zero(tls_server_config(cert_path, key_path), "tls server config failed")!)
+    return native_server_config_handle(read_file(cert_path)!, read_file(key_path)!)
 
 # dial a tls server with system roots and host name verification.
 pub fn dial(host: String, port: Int) -> Conn!:
@@ -365,9 +484,13 @@ pub fn client(stream: TcpStream, server_name: String, config: Config) -> Conn!:
 
 # listen for tls connections.
 pub fn listen(host: String, port: Int, config: Config) -> Listener!:
+    if is_native_server_config(config):
+        fd := tcp_listen(host, port)!
+        native_listener_config.insert(fd, config.handle)
+        return Listener(fd)
     if is_native_config(config):
         fail "native tls server is not implemented yet"
-    return Listener(tls_fail_if_zero(tls_listen(host, port, config.handle), "tls listen failed")!)
+    fail "native tls server config required"
 
 # accept a tls connection.
 pub fn accept(listener: Listener) -> Conn!:
@@ -378,20 +501,31 @@ impl Config:
         if native_config_roots_pem.contains_key(self.handle):
             native_config_roots_pem.remove(self.handle)
             return
-        tls_config_close(self.handle)
+        if native_server_cert_pem.contains_key(self.handle):
+            native_server_cert_pem.remove(self.handle)
+            native_server_key_der.remove(self.handle)
+            return
+        return
 
 impl Listener:
     fn accept() -> Conn!:
-        return Conn(tls_fail_if_zero(tls_accept(self.handle), "tls accept failed")!)
+        if native_listener_config.contains_key(self.handle):
+            fd := tcp_accept(self.handle)!
+            return native_server_handshake(TcpStream(fd), Config(native_listener_config[self.handle]))
+        fail "native tls listener not found"
 
     fn close():
-        tls_listener_close(self.handle)
+        if native_listener_config.contains_key(self.handle):
+            native_listener_config.remove(self.handle)
+            tcp_close(self.handle)
+            return
+        return
 
 impl Conn:
     fn read_bytes(max_bytes: Int) -> Bytes!:
         if is_native_conn(self.handle):
             return native_conn_read_bytes(self.handle, max_bytes)
-        return tls_read_bytes(self.handle, max_bytes)!
+        fail "native tls conn not found"
 
     fn read(max_bytes: Int) -> String!:
         return self.read_bytes(max_bytes)!.to_string_utf8()!
@@ -399,7 +533,7 @@ impl Conn:
     fn write_bytes(data: Bytes) -> Int!:
         if is_native_conn(self.handle):
             return native_conn_write_bytes(self.handle, data)
-        return tls_fail_if_zero(tls_write_bytes(self.handle, data), "tls write failed")!
+        fail "native tls conn not found"
 
     fn write(data: String) -> Int!:
         return self.write_bytes(bytes.from_string_utf8(data))!
@@ -439,7 +573,7 @@ impl Conn:
         if is_native_conn(self.handle):
             native_conn_close(self.handle)
             return
-        tls_close(self.handle)
+        return
 
 test "tls configs reject missing files":
     assert(client_config_with_ca_file("/path/that/does/not/exist").is_err)

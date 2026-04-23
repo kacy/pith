@@ -9,6 +9,7 @@ import std.bytes as bytes
 import std.crypto.aead as aead
 import std.crypto.hmac as hmac
 import std.crypto.kdf as kdf
+import std.crypto.signature as signature
 import std.encoding as encoding
 import std.hash as hash
 
@@ -33,6 +34,8 @@ SIG_RSA_PKCS1_SHA256 := 1025
 SIG_ECDSA_SECP256R1_SHA256 := 1027
 SIG_RSA_PSS_RSAE_SHA256 := 2052
 SIG_ED25519 := 2055
+SERVER_CERT_VERIFY_CONTEXT := "TLS 1.3, server CertificateVerify"
+CLIENT_CERT_VERIFY_CONTEXT := "TLS 1.3, client CertificateVerify"
 
 # one tls record.
 pub struct Record:
@@ -239,6 +242,30 @@ fn zero_secret_sha256() -> Bytes:
         out.write_byte(0)
         i = i + 1
     return out.bytes()
+
+fn certificate_verify_context(context: String, transcript_hash: Bytes) -> Bytes!:
+    if transcript_hash.len() != 32:
+        fail "tls transcript hash must be 32 bytes"
+    out := bytes.buffer_with_capacity(64 + context.len() + 1 + transcript_hash.len())
+    mut i := 0
+    while i < 64:
+        out.write_byte(32)
+        i = i + 1
+    write_bytes_if_any(out, bytes.from_string_utf8(context))!
+    out.write_byte(0)
+    write_bytes_if_any(out, transcript_hash)!
+    return out.bytes()
+
+fn verify_certificate_signature(public_key: Bytes, scheme: Int, message: Bytes, signed: Bytes) -> Bool!:
+    if scheme == SIG_RSA_PKCS1_SHA256:
+        return signature.verify_rsa_pkcs1_sha256(public_key, message, signed)
+    if scheme == SIG_ECDSA_SECP256R1_SHA256:
+        return signature.verify_ecdsa_p256_sha256_asn1(public_key, message, signed)
+    if scheme == SIG_RSA_PSS_RSAE_SHA256:
+        return signature.verify_rsa_pss_sha256(public_key, message, signed)
+    if scheme == SIG_ED25519:
+        return signature.verify_ed25519(public_key, message, signed)
+    return false
 
 fn valid_content_type(content_type: Int) -> Bool:
     return content_type == CONTENT_CHANGE_CIPHER_SPEC or content_type == CONTENT_ALERT or content_type == CONTENT_HANDSHAKE or content_type == CONTENT_APPLICATION_DATA
@@ -447,6 +474,18 @@ pub fn finished_verify_data_from_hash_sha256(base_key: Bytes, transcript_hash: B
 pub fn verify_finished_sha256(base_key: Bytes, transcript: Bytes, expected: Bytes) -> Bool!:
     return bytes.eq(finished_verify_data_sha256(base_key, transcript)!, expected)
 
+# build the server CertificateVerify input for tls 1.3 sha-256.
+pub fn server_certificate_verify_input_sha256(transcript: Bytes) -> Bytes!:
+    return certificate_verify_context(SERVER_CERT_VERIFY_CONTEXT, transcript_hash_sha256(transcript))
+
+# build the client CertificateVerify input for tls 1.3 sha-256.
+pub fn client_certificate_verify_input_sha256(transcript: Bytes) -> Bytes!:
+    return certificate_verify_context(CLIENT_CERT_VERIFY_CONTEXT, transcript_hash_sha256(transcript))
+
+# verify a tls 1.3 server CertificateVerify signature.
+pub fn verify_server_certificate_sha256(public_key: Bytes, scheme: Int, transcript: Bytes, signed: Bytes) -> Bool!:
+    return verify_certificate_signature(public_key, scheme, server_certificate_verify_input_sha256(transcript)!, signed)
+
 # expand an aes-128-gcm traffic secret into its key and static iv.
 pub fn traffic_keys_aes_128_gcm_sha256(secret: Bytes) -> TrafficKeys!:
     return TrafficKeys(hkdf_expand_label_sha256(secret, "key", bytes.empty(), 16)!, hkdf_expand_label_sha256(secret, "iv", bytes.empty(), 12)!)
@@ -601,6 +640,19 @@ test "tls13 derives sha256 traffic keys":
     assert_eq(verify.len(), 32)
     assert(verify_finished_sha256(client_secret, transcript, verify)!)
     assert(not verify_finished_sha256(server_secret, transcript, verify)!)
+
+test "tls13 builds certificate verify input":
+    transcript := encode_handshake(HANDSHAKE_CLIENT_HELLO, bytes.from_string_utf8("client"))!
+    server_input := server_certificate_verify_input_sha256(transcript)!
+    client_input := client_certificate_verify_input_sha256(transcript)!
+
+    assert_eq(server_input.len(), 64 + SERVER_CERT_VERIFY_CONTEXT.len() + 1 + 32)
+    assert_eq(client_input.len(), 64 + CLIENT_CERT_VERIFY_CONTEXT.len() + 1 + 32)
+    assert_eq(server_input[0], 32)
+    assert_eq(server_input[63], 32)
+    assert_eq(server_input[64 + SERVER_CERT_VERIFY_CONTEXT.len()], 0)
+    assert(not bytes.eq(server_input, client_input))
+    assert(not verify_server_certificate_sha256(bytes.empty(), 9999, transcript, bytes.empty())!)
 
 test "tls13 seals and opens aes application records":
     key := encoding.from_hex("00000000000000000000000000000000")!

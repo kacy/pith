@@ -855,11 +855,31 @@ impl MultipartPart:
         return self.text() catch fallback
     fn is_file() -> Bool:
         return self.filename != ""
+
+fn parse_decimal_bytes(raw: Bytes) -> Int!:
+    start := trim_ascii_start(raw, 0, raw.len())
+    end := trim_ascii_end(raw, start, raw.len())
+    if start >= end:
+        fail "expected decimal digits"
+
+    mut value := 0
+    mut pos := start
+    while pos < end:
+        digit := raw[pos]
+        if digit < 48 or digit > 57:
+            fail "expected decimal digits"
+        digit_value := digit - 48
+        if value > 922337203685477580 or (value == 922337203685477580 and digit_value > 7):
+            fail "integer overflow"
+        value = value * 10 + digit_value
+        pos = pos + 1
+    return value
+
 fn content_length_from_head_bytes(raw_head: Bytes) -> Int!:
     length_text := header_value_bytes(raw_head, "Content-Length")
     if length_text.is_empty():
         return 0
-    return parse_int(decode_utf8(length_text)!)
+    return parse_decimal_bytes(length_text)
 # ===============================================================
 # Request Accessors
 # ===============================================================
@@ -1369,8 +1389,7 @@ pub fn parse_response_bytes(raw: Bytes) -> HttpResponse!:
     if body_start <= 0:
         fail "invalid http response"
     head := raw.slice(0, body_start)
-    status_text := decode_utf8(request_line_field_bytes(head, 1))!
-    status := parse_int(status_text)!
+    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
     headers := response_headers_map(head)
     content_type := header_lookup(headers, "Content-Type")
     set_cookie_headers := response_set_cookie_headers(head)
@@ -1656,6 +1675,14 @@ test "http builds and parses responses":
     assert(parsed.is_success())
     assert_eq(parsed.header_value("content-type"), "text/plain")
     assert_eq(parsed.body_text()!, "created")
+
+test "http accepts zero content length":
+    crlf := chr(13) + chr(10)
+    raw := "GET / HTTP/1.1" + crlf + "Host: example.test" + crlf + "Content-Length: 0" + crlf + crlf
+    req := read_request_buffered_bytes(io.bytes_reader(bytes.from_string_utf8(raw)).buffered_chunked(4))!
+
+    assert_eq(req.method()!, "GET")
+    assert_eq(req.body_bytes().len(), 0)
 
 test "http cookies work across request and response helpers":
     req_bytes := get_request("example.test", 80, "/").cookie("session", "abc123").cookie("theme", "dark").to_bytes()!

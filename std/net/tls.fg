@@ -355,13 +355,13 @@ pub fn dial(host: String, port: Int) -> Conn!:
 pub fn dial_with_config(host: String, port: Int, server_name: String, config: Config) -> Conn!:
     if is_native_config(config):
         return native_client_handshake(io.connect(host, port)!, server_name, config)
-    return Conn(tls_fail_if_zero(tls_dial(host, port, server_name, config.handle), "tls dial failed")!)
+    fail "native tls client config required"
 
 # wrap an existing tcp stream as a tls client connection.
 pub fn client(stream: TcpStream, server_name: String, config: Config) -> Conn!:
     if is_native_config(config):
         return native_client_handshake(stream, server_name, config)
-    return Conn(tls_fail_if_zero(tls_client(stream.fd, server_name, config.handle), "tls client handshake failed")!)
+    fail "native tls client config required"
 
 # listen for tls connections.
 pub fn listen(host: String, port: Int, config: Config) -> Listener!:

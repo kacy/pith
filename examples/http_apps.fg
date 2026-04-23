@@ -15,7 +15,7 @@ fn app(req: HttpRequestBytes) -> HttpResponse:
         json.object_set(out, "mode", json.make_string(req.query_param_or("mode", "")))
         json.object_set(out, "has_empty", json.make_bool(req.has_query_param("empty") catch false))
         json.object_set(out, "kind", json.make_string(json.get_string(json.object_get(payload, "kind"))))
-        return http.response(201).json_body(out).header("X-Route", "item")
+        return http.response(201).json_body(out).header("X-Route", "item").set_cookie(http.cookie("session", "fresh").path("/").http_only())
     return http.not_found_response()
 
 fn build_payload() -> Int:
@@ -29,6 +29,7 @@ fn main() -> String!:
     req_builder = req_builder.query_param("mode", "raw")
     req_builder = req_builder.query_param("empty", "")
     req_builder = req_builder.header("X-Test", "yes")
+    req_builder = req_builder.cookie("session", "incoming")
     req_builder = req_builder.json_body(build_payload())
     req_bytes := req_builder.to_bytes()!
 
@@ -37,14 +38,16 @@ fn main() -> String!:
     print("path: " + req.path()!)
     print("mode: " + req.query_param_or("mode", ""))
     print("parts: " + req.path_parts()!.join(","))
+    print("cookie: " + req.cookie_or("session", "missing"))
 
     out := bytes.buffer()
-    http.serve_one(io.bytes_reader(req_bytes).buffered_chunked(3), out.buffered_chunked(4), fn(inner_req: HttpRequestBytes) => app(inner_req))!
+    http.serve_one(io.bytes_reader(req_bytes).buffered_chunked(3), out.buffered_chunked(4), app)!
     resp := http.parse_response_bytes(out.bytes())!
     body := resp.body_json()!
     print("status: " + resp.status_code().to_string())
     print("success: " + resp.is_success().to_string())
     print("route: " + resp.header_value("X-Route"))
+    print("set-cookie: " + resp.cookies()[0])
     print("body id: " + json.get_string(json.object_get(body, "id")))
     print("body kind: " + json.get_string(json.object_get(body, "kind")))
 

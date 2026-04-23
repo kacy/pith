@@ -27,6 +27,10 @@ use these helpers instead of reparsing strings by hand:
 - `req.query_param(...)`
 - `req.query_param_or(...)`
 - `req.has_query_param(...)`
+- `req.cookie(...)`
+- `req.cookie_or(...)`
+- `req.has_cookie(...)`
+- `req.cookies()`
 - `req.path_parts()`
 - `req.matches_path(...)`
 - `req.path_param(...)`
@@ -76,10 +80,26 @@ builder cases:
 - `resp.is_success()`
 - `resp.is_client_error()`
 - `resp.is_server_error()`
+- `resp.set_cookie(http.cookie(...))`
+- `resp.clear_cookie(...)`
+- `resp.cookies()`
 - `resp.text_body(...)`
 - `resp.bytes_body(...)`
 - `resp.json_body(...)`
 - `resp.content_type(...)`
+
+the cookie builder keeps the common cases out of manual header strings:
+
+```fg
+resp := http.text(200, "ok")
+    .set_cookie(http.cookie("session", "abc123").path("/").http_only())
+```
+
+client requests can carry cookies the same way:
+
+```fg
+req := http.get_request("example.test", 80, "/profile").cookie("session", "abc123")
+```
 
 ## serving one request
 
@@ -92,6 +112,12 @@ http.serve_one(reader, writer, app)!
 that keeps the handler shape simple:
 - input: `HttpRequestBytes`
 - output: `HttpResponse`
+
+for fd-based servers that already accepted a client connection, use:
+
+```fg
+http.serve_fd(client_fd, handler)!
+```
 
 if a handler wants to recover from parse or query issues, just map those
 results into a normal response:

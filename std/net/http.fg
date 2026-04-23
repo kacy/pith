@@ -46,6 +46,7 @@ pub struct HttpResponse:
     pub content_type: String
     pub headers: Map[String, String]
     pub body: Bytes
+    pub set_cookie_headers: List[String]
 
 # a small builder for outbound http client requests.
 pub struct ClientRequest:
@@ -55,6 +56,18 @@ pub struct ClientRequest:
     pub path: String
     pub headers: Map[String, String]
     pub body: Bytes
+
+# cookie builder used by request and response helpers.
+pub struct Cookie:
+    pub name: String
+    pub value: String
+    pub path_text: String
+    pub domain_text: String
+    pub expires_text: String
+    pub max_age_seconds: Int
+    pub secure_flag: Bool
+    pub http_only_flag: Bool
+    pub same_site_value: String
 fn str_eq(a: String, b: String) -> Bool:
     if a.len() != b.len():
         return false
@@ -83,6 +96,47 @@ fn copy_string_list(items: List[String]) -> List[String]:
     for item in items:
         copied.push(item)
     return copied
+
+fn parse_cookie_map(header_value: String) -> Map[String, String]:
+    mut cookies: Map[String, String] := {}
+    if header_value == "":
+        return cookies
+    for part in header_value.split(";"):
+        entry := part.trim()
+        if entry == "":
+            continue
+        eq := entry.index_of("=")
+        if eq <= 0:
+            continue
+        name := entry.substring(0, eq).trim()
+        value := entry.substring(eq + 1, entry.len()).trim()
+        if name != "":
+            cookies.insert(name, value)
+    return cookies
+
+fn append_cookie_header(existing: String, name: String, value: String) -> String:
+    pair := name + "=" + value
+    if existing == "":
+        return pair
+    return existing + "; " + pair
+
+fn serialize_cookie(item: Cookie) -> String:
+    mut out := item.name + "=" + item.value
+    if item.path_text != "":
+        out = out + "; Path=" + item.path_text
+    if item.domain_text != "":
+        out = out + "; Domain=" + item.domain_text
+    if item.expires_text != "":
+        out = out + "; Expires=" + item.expires_text
+    if item.max_age_seconds >= 0:
+        out = out + "; Max-Age=" + item.max_age_seconds.to_string()
+    if item.secure_flag:
+        out = out + "; Secure"
+    if item.http_only_flag:
+        out = out + "; HttpOnly"
+    if item.same_site_value != "":
+        out = out + "; SameSite=" + item.same_site_value
+    return out
 
 fn header_key_matches(left: String, right: String) -> Bool:
     return left.to_lower() == right.to_lower()
@@ -574,6 +628,20 @@ impl HttpRequestBytes:
         return value
     fn has_query_param(name: String) -> Bool!:
         return self.query_map.contains_key(name)
+    fn cookies() -> Map[String, String]!:
+        return parse_cookie_map(self.header_or("Cookie", ""))
+    fn cookie(name: String) -> String!:
+        cookies := self.cookies()!
+        if cookies.contains_key(name):
+            return cookies[name]
+        return ""
+    fn cookie_or(name: String, fallback: String) -> String:
+        value := self.cookie(name) catch ""
+        if value == "":
+            return fallback
+        return value
+    fn has_cookie(name: String) -> Bool!:
+        return self.cookies()!.contains_key(name)
     fn path_parts() -> List[String]!:
         return copy_string_list(self.path_parts_cache)
     fn matches_path(pattern: String) -> Bool!:
@@ -702,7 +770,7 @@ fn ct_header(ct: String) -> String:
 # starts building an http response.
 pub fn response(status: Int) -> HttpResponse:
     mut headers: Map[String, String] := {}
-    return HttpResponse(status, "", headers, bytes.empty())
+    return HttpResponse(status, "", headers, bytes.empty(), [])
 
 # builds a plain text response.
 pub fn text(status: Int, body_text: String) -> HttpResponse:
@@ -755,17 +823,50 @@ pub fn no_content() -> HttpResponse:
 pub fn redirect_response(url: String) -> HttpResponse:
     return response(301).header("Location", url)
 
+# starts building a cookie value.
+pub fn cookie(name: String, value: String) -> Cookie:
+    return Cookie(name, value, "", "", "", -1, false, false, "")
+
+# builds an expired cookie so callers can clear browser state without formatting headers by hand.
+pub fn expired_cookie(name: String) -> Cookie:
+    return cookie(name, "").path("/").expires("Thu, 01 Jan 1970 00:00:00 GMT").max_age(0)
+
+impl Cookie:
+    fn path(value: String) -> Cookie:
+        return Cookie(self.name, self.value, value, self.domain_text, self.expires_text, self.max_age_seconds, self.secure_flag, self.http_only_flag, self.same_site_value)
+
+    fn domain(value: String) -> Cookie:
+        return Cookie(self.name, self.value, self.path_text, value, self.expires_text, self.max_age_seconds, self.secure_flag, self.http_only_flag, self.same_site_value)
+
+    fn expires(value: String) -> Cookie:
+        return Cookie(self.name, self.value, self.path_text, self.domain_text, value, self.max_age_seconds, self.secure_flag, self.http_only_flag, self.same_site_value)
+
+    fn max_age(seconds: Int) -> Cookie:
+        return Cookie(self.name, self.value, self.path_text, self.domain_text, self.expires_text, seconds, self.secure_flag, self.http_only_flag, self.same_site_value)
+
+    fn secure_only() -> Cookie:
+        return Cookie(self.name, self.value, self.path_text, self.domain_text, self.expires_text, self.max_age_seconds, true, self.http_only_flag, self.same_site_value)
+
+    fn http_only() -> Cookie:
+        return Cookie(self.name, self.value, self.path_text, self.domain_text, self.expires_text, self.max_age_seconds, self.secure_flag, true, self.same_site_value)
+
+    fn same_site(value: String) -> Cookie:
+        return Cookie(self.name, self.value, self.path_text, self.domain_text, self.expires_text, self.max_age_seconds, self.secure_flag, self.http_only_flag, value)
+
+    fn to_header() -> String:
+        return serialize_cookie(self)
+
 impl HttpResponse:
     fn header(name: String, value: String) -> HttpResponse:
         if header_key_matches(name, "Content-Type"):
-            return HttpResponse(self.status, value, header_without(self.headers, "Content-Type"), self.body)
-        return HttpResponse(self.status, self.content_type, header_with(self.headers, name, value), self.body)
+            return HttpResponse(self.status, value, header_without(self.headers, "Content-Type"), self.body, copy_string_list(self.set_cookie_headers))
+        return HttpResponse(self.status, self.content_type, header_with(self.headers, name, value), self.body, copy_string_list(self.set_cookie_headers))
 
     fn with_body_text(text: String) -> HttpResponse:
-        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), bytes.from_string_utf8(text))
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), bytes.from_string_utf8(text), copy_string_list(self.set_cookie_headers))
 
     fn with_body_bytes(data: Bytes) -> HttpResponse:
-        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), data)
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), data, copy_string_list(self.set_cookie_headers))
 
     fn with_json(handle: Int) -> HttpResponse:
         body_bytes := json_mod.encode_bytes(handle)
@@ -784,6 +885,17 @@ impl HttpResponse:
 
     fn content_type(value: String) -> HttpResponse:
         return self.header("Content-Type", value)
+
+    fn set_cookie(item: Cookie) -> HttpResponse:
+        mut next := copy_string_list(self.set_cookie_headers)
+        next.push(serialize_cookie(item))
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), self.body, next)
+
+    fn clear_cookie(name: String) -> HttpResponse:
+        return self.set_cookie(expired_cookie(name))
+
+    fn cookies() -> List[String]:
+        return copy_string_list(self.set_cookie_headers)
 
     fn status_code() -> Int:
         return self.status
@@ -821,9 +933,11 @@ impl HttpResponse:
         if self.content_type != "":
             header = header + ct_header(self.content_type)
         for key in self.headers:
-            if header_key_matches(key, "Content-Type") or header_key_matches(key, "Content-Length"):
+            if header_key_matches(key, "Content-Type") or header_key_matches(key, "Content-Length") or header_key_matches(key, "Set-Cookie"):
                 continue
             header = header + key + ": " + self.headers[key] + crlf
+        for line in self.set_cookie_headers:
+            header = header + "Set-Cookie: " + line + crlf
         header = header + "Content-Length: " + self.body.len().to_string() + crlf
         if header_lookup(self.headers, "Connection") == "":
             header = header + "Connection: close" + crlf
@@ -1022,6 +1136,29 @@ fn response_headers_map(raw_head: Bytes) -> Map[String, String]:
         pos = pos + 1
     return result
 
+fn response_set_cookie_headers(raw_head: Bytes) -> List[String]:
+    mut result: List[String] := []
+    hdrs := headers_bytes(raw_head)
+    mut line_start := 0
+    mut pos := 0
+    while pos <= hdrs.len():
+        at_end := pos == hdrs.len()
+        mut at_nl := false
+        if not at_end:
+            at_nl = hdrs[pos] == 10
+        if at_end or at_nl:
+            line_end := trim_trailing_cr(hdrs, line_start, pos)
+            if line_end > line_start:
+                colon := find_byte(hdrs, line_start, 58)
+                if colon > line_start and colon < line_end:
+                    if header_name_matches(hdrs, line_start, colon, "Set-Cookie"):
+                        value_start := trim_ascii_start(hdrs, colon + 1, line_end)
+                        value_end := trim_ascii_end(hdrs, value_start, line_end)
+                        result.push(decode_utf8(hdrs.slice(value_start, value_end)) catch "")
+            line_start = pos + 1
+        pos = pos + 1
+    return result
+
 # parses a raw http response payload into a structured response.
 pub fn parse_response_bytes(raw: Bytes) -> HttpResponse!:
     if raw.len() == 0:
@@ -1034,8 +1171,9 @@ pub fn parse_response_bytes(raw: Bytes) -> HttpResponse!:
     status := parse_int(status_text)!
     headers := response_headers_map(head)
     content_type := header_lookup(headers, "Content-Type")
+    set_cookie_headers := response_set_cookie_headers(head)
     body := raw.slice(body_start, raw.len())
-    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body)
+    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body, set_cookie_headers)
 
 # parses a raw http response string into a structured response.
 pub fn parse_response(raw: String) -> HttpResponse!:
@@ -1117,6 +1255,9 @@ impl ClientRequest:
     fn basic_auth(username: String, password: String) -> ClientRequest:
         creds := username + ":" + password
         return self.header("Authorization", "Basic " + encoding.b64_encode(bytes.from_string_utf8(creds)))
+
+    fn cookie(name: String, value: String) -> ClientRequest:
+        return self.header("Cookie", append_cookie_header(header_lookup(self.headers, "Cookie"), name, value))
 
     fn to_bytes() -> Bytes!:
         crlf := chr(13) + chr(10)
@@ -1203,6 +1344,15 @@ pub fn serve_one(reader: BufferedBytesReader, writer: BufferedBytesWriter, handl
     resp := handler(req)
     return send_buffered(writer, resp)
 
+# serves one request from a client fd and closes the connection after writing the response.
+pub fn serve_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
+    req := read_request_bytes(fd)!
+    return send(fd, handler(req))
+
+# accepts one client from a listener fd and serves exactly one request.
+pub fn serve_listener_once(listener_fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
+    return serve_fd(tcp_accept(listener_fd)!, handler)
+
 # serves one request like serve_one(), but respects cancellation and deadlines.
 pub fn serve_one_ctx(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse, ctx: Context) -> Int!BlockingError:
     if ctx.is_cancelled():
@@ -1283,6 +1433,23 @@ test "http builds and parses responses":
     assert(parsed.is_success())
     assert_eq(parsed.header_value("content-type"), "text/plain")
     assert_eq(parsed.body_text()!, "created")
+
+test "http cookies work across request and response helpers":
+    req_bytes := get_request("example.test", 80, "/").cookie("session", "abc123").cookie("theme", "dark").to_bytes()!
+    req := read_request_buffered_bytes(io.bytes_reader(req_bytes).buffered_chunked(4))!
+    assert(req.has_cookie("session")!)
+    assert_eq(req.cookie("session")!, "abc123")
+    assert_eq(req.cookie_or("missing", "fallback"), "fallback")
+    parsed_cookies := req.cookies()!
+    assert_eq(parsed_cookies["theme"], "dark")
+
+    resp := text(200, "ok").set_cookie(cookie("session", "abc123").path("/").http_only()).set_cookie(cookie("theme", "dark").same_site("Lax")).clear_cookie("flash")
+    payload := resp.to_string()!
+    parsed := parse_response(payload)!
+    assert(payload.contains("Set-Cookie: session=abc123; Path=/; HttpOnly"))
+    assert(payload.contains("Set-Cookie: theme=dark; SameSite=Lax"))
+    assert(payload.contains("Set-Cookie: flash=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0"))
+    assert_eq(parsed.cookies().len().to_string(), "3")
 
 test "http client request builder renders headers and bodies":
     payload := post_request("example.test", 80, "/submit").query_param("q", "forge lang").body_text("hi").to_bytes()!.to_string_utf8()!

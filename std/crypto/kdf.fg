@@ -45,16 +45,19 @@ fn xor_digest(left: List[Int], right: Bytes) -> List[Int]:
         i = i + 1
     return out
 
-# derive bytes with HKDF-SHA256.
-pub fn hkdf_sha256(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Bytes!:
+# hkdf extract with hmac-sha256.
+pub fn hkdf_extract_sha256(salt: Bytes, secret: Bytes) -> Bytes:
+    mut actual_salt := salt
+    if actual_salt.len() == 0:
+        actual_salt = zero_bytes(32)
+    return hmac.sha256(actual_salt, secret)
+
+# hkdf expand with hmac-sha256.
+pub fn hkdf_expand_sha256(prk: Bytes, info: Bytes, length: Int) -> Bytes!:
     if length < 0:
         fail "hkdf length out of range"
     if length > 8160:
         fail "hkdf length out of range"
-    mut actual_salt := salt
-    if actual_salt.len() == 0:
-        actual_salt = zero_bytes(32)
-    prk := hmac.sha256(actual_salt, secret)
     mut okm := bytes.buffer_with_capacity(length)
     mut previous := bytes.empty()
     mut counter := 1
@@ -69,16 +72,19 @@ pub fn hkdf_sha256(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Byte
         counter = counter + 1
     return okm.bytes()
 
-# derive bytes with HKDF-SHA512.
-pub fn hkdf_sha512(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Bytes!:
+# hkdf extract with hmac-sha512.
+pub fn hkdf_extract_sha512(salt: Bytes, secret: Bytes) -> Bytes:
+    mut actual_salt := salt
+    if actual_salt.len() == 0:
+        actual_salt = zero_bytes(64)
+    return hmac.sha512(actual_salt, secret)
+
+# hkdf expand with hmac-sha512.
+pub fn hkdf_expand_sha512(prk: Bytes, info: Bytes, length: Int) -> Bytes!:
     if length < 0:
         fail "hkdf length out of range"
     if length > 16320:
         fail "hkdf length out of range"
-    mut actual_salt := salt
-    if actual_salt.len() == 0:
-        actual_salt = zero_bytes(64)
-    prk := hmac.sha512(actual_salt, secret)
     mut okm := bytes.buffer_with_capacity(length)
     mut previous := bytes.empty()
     mut counter := 1
@@ -92,6 +98,14 @@ pub fn hkdf_sha512(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Byte
         okm.write(previous.slice(0, take))!
         counter = counter + 1
     return okm.bytes()
+
+# derive bytes with HKDF-SHA256.
+pub fn hkdf_sha256(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Bytes!:
+    return hkdf_expand_sha256(hkdf_extract_sha256(salt, secret), info, length)
+
+# derive bytes with HKDF-SHA512.
+pub fn hkdf_sha512(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Bytes!:
+    return hkdf_expand_sha512(hkdf_extract_sha512(salt, secret), info, length)
 
 # derive bytes with PBKDF2-HMAC-SHA256.
 pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int, length: Int) -> Bytes!:
@@ -143,6 +157,16 @@ test "hkdf sha256 matches rfc 5869 vector":
     info := encoding.from_hex("f0f1f2f3f4f5f6f7f8f9")!
     okm := hkdf_sha256(ikm, salt, info, 42)!
 
+    assert_eq(encoding.to_hex(okm), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+
+test "hkdf extract and expand match rfc 5869 vector":
+    ikm := encoding.from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")!
+    salt := encoding.from_hex("000102030405060708090a0b0c")!
+    info := encoding.from_hex("f0f1f2f3f4f5f6f7f8f9")!
+    prk := hkdf_extract_sha256(salt, ikm)
+    okm := hkdf_expand_sha256(prk, info, 42)!
+
+    assert_eq(encoding.to_hex(prk), "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")
     assert_eq(encoding.to_hex(okm), "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
 
 test "hkdf sha512 matches known vector":

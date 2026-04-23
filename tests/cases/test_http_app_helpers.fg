@@ -23,9 +23,18 @@ fn app(req: HttpRequestBytes) -> HttpResponse:
         return http.response(201).json_body(out).header("X-Route", "item").set_cookie(http.cookie("session", "fresh").path("/").http_only())
     return http.not_found_response()
 
+fn auth_middleware(next: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> HttpResponse:
+    if not (req.has_cookie("session") catch false):
+        return http.unauthorized_response()
+    return next(req)
+
+fn trace_middleware(next: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> HttpResponse:
+    return next(req).header("X-Trace", req.header_or("X-Trace", "trace-generated"))
+
 fn main() -> String!:
     mut req_builder := http.request("POST", "example.com", 80, "/items/42?mode=raw&empty=")
     req_builder = req_builder.header("X-Test", "yes")
+    req_builder = req_builder.header("X-Trace", "trace-req")
     req_builder = req_builder.cookie("session", "incoming")
     req_builder = req_builder.json_body(build_payload())
     req_bytes := req_builder.to_bytes()!
@@ -60,7 +69,8 @@ fn main() -> String!:
     print("is-patch:" + (req.is_patch("/items/42") catch false).to_string())
 
     out := bytes.buffer()
-    http.serve_one(io.bytes_reader(req_bytes).buffered_chunked(3), out.buffered_chunked(4), app)!
+    wrapped := http.wrap(http.wrap(app, auth_middleware), trace_middleware)
+    http.serve_one(io.bytes_reader(req_bytes).buffered_chunked(3), out.buffered_chunked(4), wrapped)!
     served := http.parse_response_bytes(out.bytes())!
     served_json := served.body_json()!
     served_id := json.get_string(json.object_get(served_json, "id"))
@@ -72,6 +82,7 @@ fn main() -> String!:
     print("served-empty:" + served_empty.to_string())
     print("served-success:" + served.is_success().to_string())
     print("served-status-ok:" + served.status_is_ok().to_string())
+    print("served-trace:" + served.header_value("X-Trace"))
     print("served-cookie-count:" + served.cookies().len().to_string())
     print("served-cookie-first:" + served.cookies()[0])
     print("bad-request-client-error:" + http.bad_request_response().is_client_error().to_string())

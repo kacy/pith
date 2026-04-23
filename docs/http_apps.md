@@ -101,6 +101,21 @@ client requests can carry cookies the same way:
 req := http.get_request("example.test", 80, "/profile").cookie("session", "abc123")
 ```
 
+## middleware
+
+middleware wraps a normal handler and returns another normal handler:
+
+```fg
+fn auth(next: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> HttpResponse:
+    if req.cookie_or("session", "") == "":
+        return http.unauthorized_response()
+    return next(req)
+
+handler := http.wrap(app, auth)
+```
+
+stack multiple wrappers by repeating `wrap(...)`.
+
 ## serving one request
 
 for tests, in-memory examples, or small buffered handlers:

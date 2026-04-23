@@ -79,6 +79,7 @@ mut ir_struct_field_index_lookup: Map[String, String] := {} # "Struct.field" -> 
 mut ir_type_aliases: Map[String, String] := {} # alias name -> target type
 mut ir_last_was_ret := false # tracks if the last emitted instruction was a return
 mut ir_func_returns: Map[String, String] := {} # function name -> return type hint
+mut ir_named_fn_value_wrappers: Map[String, String] := {}
 mut ir_lambda_count := 0
 mut ir_for_count := 0
 mut ir_break_stack: List[String] := []
@@ -189,6 +190,7 @@ fn ir_reset_type_state():
     ir_impl_methods = {}
     ir_import_renames = {}
     ir_func_returns = {}
+    ir_named_fn_value_wrappers = {}
     ir_module_aliases = {}
     ir_import_declared_functions = {}
     ir_import_declared_globals = {}
@@ -2948,8 +2950,74 @@ fn ir_resolve_storage_name(name: String) -> String:
         return ir_import_target_name(ir_active_generic_module_path, name)
     return name
 
-fn ir_emit_ident_load(name: String) -> Int:
+fn ir_ident_is_function_value(idx: Int, name: String) -> Bool:
+    if ir_var_regs.contains_key(name) or ir_var_types.contains_key(name):
+        return false
+    callee := ir_ident_callee(name)
+    return ir_is_declared_callable(callee.name)
+
+fn ir_named_function_value_wrapper(idx: Int, target_name: String) -> String:
+    if ir_named_fn_value_wrappers.contains_key(target_name):
+        return ir_named_fn_value_wrappers[target_name]
+
+    wrapper_name := "__fnval_" + ir_lambda_count.to_string()
+    ir_lambda_count = ir_lambda_count + 1
+    tid := c_get_expr_type(idx)
+    info := get_type_info(tid)
+    mut ret_type := ir_declared_callable_return_type(target_name)
+    if ret_type.len() == 0:
+        ret_type = "unknown"
+
+    saved_regs := ir_next_reg
+    saved_vars := ir_copy_var_regs(ir_var_regs)
+    saved_types := ir_copy_var_types(ir_var_types)
+    saved_lines := ir_copy_lines(ir_lines)
+
+    ir_reset_lambda_emit_state()
+    mut param_count := 1
+    if info.kind == "function":
+        param_count = info.param_types.len() + 1
+    ir_emit_func_header(wrapper_name, param_count, ret_type)
+    ir_emit_lambda_hidden_param()
+
+    mut arg_names: List[String] := []
+    if info.kind == "function":
+        mut i := 0
+        while i < info.param_types.len():
+            arg_name := "__arg_" + i.to_string()
+            arg_names.push(arg_name)
+            ir_emit_named_param(arg_name, "")
+            i = i + 1
+
+    mut arg_regs: List[Int] := []
+    for arg_name in arg_names:
+        arg_r := ir_reg()
+        ir_emit("load " + arg_r.to_string() + " " + arg_name)
+        arg_regs.push(arg_r)
+
+    if ret_type == "void":
+        call_r := ir_reg()
+        ir_emit_call_text(call_r, target_name, "void", arg_regs.len(), ir_join_arg_regs(arg_regs))
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        ir_emit("ret " + zero_r.to_string())
+    else:
+        call_r := ir_reg()
+        ir_emit_call_text(call_r, target_name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
+        ir_emit("ret " + call_r.to_string())
+    ir_emit_lambda_default_return()
+    ir_finish_lambda_emit(saved_regs, saved_vars, saved_types, saved_lines)
+    ir_named_fn_value_wrappers.insert(target_name, wrapper_name)
+    return wrapper_name
+
+fn ir_emit_ident_load(idx: Int, name: String) -> Int:
     r := ir_reg()
+    if ir_ident_is_function_value(idx, name):
+        callee := ir_ident_callee(name)
+        wrapper_name := ir_named_function_value_wrapper(idx, callee.name)
+        ir_emit("closure_ref " + r.to_string() + " " + wrapper_name)
+        return r
+    # normal variables and globals still load through storage.
     ir_emit("load " + r.to_string() + " " + ir_resolve_storage_name(name))
     return r
 
@@ -3091,10 +3159,10 @@ fn ir_expr(idx: Int) -> Int:
         return ir_emit_bool_literal(node)
 
     if node.kind == "ident":
-        return ir_emit_ident_load(node.value)
+        return ir_emit_ident_load(idx, node.value)
 
     if node.kind == "self":
-        return ir_emit_ident_load("self")
+        return ir_emit_ident_load(idx, "self")
 
     if node.kind == "unary":
         return ir_emit_unary_expr(node)

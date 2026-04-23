@@ -1338,6 +1338,10 @@ pub fn delete_route(req: HttpRequestBytes, pattern: String) -> Bool!:
 pub fn patch_route(req: HttpRequestBytes, pattern: String) -> Bool!:
     return match_route(req, "PATCH", pattern)
 
+# wraps a handler with middleware and returns another handler.
+pub fn wrap(handler: fn(HttpRequestBytes) -> HttpResponse, middleware: fn(fn(HttpRequestBytes) -> HttpResponse, HttpRequestBytes) -> HttpResponse) -> fn(HttpRequestBytes) -> HttpResponse:
+    return fn(req: HttpRequestBytes) => middleware(handler, req)
+
 # serves one request using a bytes reader, writer, and handler.
 pub fn serve_one(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
     req := read_request_buffered_bytes(reader)!

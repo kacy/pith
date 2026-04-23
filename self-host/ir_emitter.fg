@@ -2958,6 +2958,8 @@ fn ir_ident_is_function_value(idx: Int, name: String) -> Bool:
     callee := ir_ident_callee(name)
     return ir_is_declared_callable(callee.name)
 
+# named functions need a small adapter so they can travel through the same
+# closure abi lambdas already use.
 fn ir_named_function_value_wrapper(idx: Int, target_name: String) -> String:
     if ir_named_fn_value_wrappers.contains_key(target_name):
         return ir_named_fn_value_wrappers[target_name]

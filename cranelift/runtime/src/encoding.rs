@@ -1,4 +1,5 @@
 unsafe fn alloc_parse_int_result(is_ok: i64, ok: i64, err: i64) -> i64 {
+    // this matches forge's heap result tuple layout: [is_ok, ok, err].
     let tuple = crate::forge_struct_alloc(3) as *mut i64;
     if tuple.is_null() {
         return 0;

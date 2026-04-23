@@ -239,10 +239,11 @@ fn multipart_consume_newline(data: Bytes, start: Int) -> Int:
         return start + 1
     return start
 
+# parse multipart bodies without decoding the part payloads.
 fn parse_multipart_parts(body: Bytes, boundary: String) -> List[MultipartPart]!:
     marker := bytes.from_string_utf8("--" + boundary)
     closing := bytes.from_string_utf8("--")
-    mut first := find_bytes(body, 0, marker)
+    first := find_bytes(body, 0, marker)
     if first < 0:
         fail "multipart boundary not found"
     mut pos := first + marker.len()
@@ -856,6 +857,10 @@ impl MultipartPart:
     fn is_file() -> Bool:
         return self.filename != ""
 
+DECIMAL_INT_MAX_DIV10 := 922337203685477580
+DECIMAL_INT_MAX_LAST_DIGIT := 7
+
+# http wire integers here are decimal and non-negative.
 fn parse_decimal_bytes(raw: Bytes) -> Int!:
     start := trim_ascii_start(raw, 0, raw.len())
     end := trim_ascii_end(raw, start, raw.len())
@@ -869,7 +874,7 @@ fn parse_decimal_bytes(raw: Bytes) -> Int!:
         if digit < 48 or digit > 57:
             fail "expected decimal digits"
         digit_value := digit - 48
-        if value > 922337203685477580 or (value == 922337203685477580 and digit_value > 7):
+        if value > DECIMAL_INT_MAX_DIV10 or (value == DECIMAL_INT_MAX_DIV10 and digit_value > DECIMAL_INT_MAX_LAST_DIGIT):
             fail "integer overflow"
         value = value * 10 + digit_value
         pos = pos + 1

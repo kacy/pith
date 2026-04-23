@@ -124,6 +124,19 @@ fn replace_token(line: String, start: Int, end: Int, replacement: String) -> Str
         out = out + line.substring(end, line.len())
     return out
 
+fn rewrite_declared_global_ref(line: String, declared: DeclaredIrNames, prefix: String, name_start: Int, name_end: Int) -> String:
+    name := line.substring(name_start, name_end)
+    if not declared.global_set.contains_key(name):
+        return line
+    return replace_token(line, name_start, name_end, prefixed_target_name(prefix, name))
+
+fn rewrite_declared_function_ref(line: String, declared: DeclaredIrNames, prefix: String, init_prefix: String, name_start: Int, name_end: Int) -> String:
+    name := line.substring(name_start, name_end)
+    if not declared.function_set.contains_key(name):
+        return line
+    renamed := maybe_prefixed_init_name(name, init_prefix)
+    return replace_token(line, name_start, name_end, prefixed_target_name(prefix, renamed))
+
 fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix: String, init_prefix: String) -> String:
     first_end := next_space(line, 0)
     if first_end >= line.len():
@@ -142,10 +155,7 @@ fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix:
     if op == "store":
         name_start := first_end + 1
         name_end := next_space(line, name_start)
-        name := line.substring(name_start, name_end)
-        if not declared.global_set.contains_key(name):
-            return line
-        return replace_token(line, name_start, name_end, prefixed_target_name(prefix, name))
+        return rewrite_declared_global_ref(line, declared, prefix, name_start, name_end)
 
     if op == "load":
         reg_start := first_end + 1
@@ -154,10 +164,7 @@ fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix:
             return line
         name_start := reg_end + 1
         name_end := next_space(line, name_start)
-        name := line.substring(name_start, name_end)
-        if not declared.global_set.contains_key(name):
-            return line
-        return replace_token(line, name_start, name_end, prefixed_target_name(prefix, name))
+        return rewrite_declared_global_ref(line, declared, prefix, name_start, name_end)
 
     if op == "call":
         reg_start := first_end + 1
@@ -166,20 +173,12 @@ fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix:
             return line
         callee_start := reg_end + 1
         callee_end := next_space(line, callee_start)
-        callee := line.substring(callee_start, callee_end)
-        if not declared.function_set.contains_key(callee):
-            return line
-        renamed := maybe_prefixed_init_name(callee, init_prefix)
-        return replace_token(line, callee_start, callee_end, prefixed_target_name(prefix, renamed))
+        return rewrite_declared_function_ref(line, declared, prefix, init_prefix, callee_start, callee_end)
 
     if op == "callv":
         callee_start := first_end + 1
         callee_end := next_space(line, callee_start)
-        callee := line.substring(callee_start, callee_end)
-        if not declared.function_set.contains_key(callee):
-            return line
-        renamed := maybe_prefixed_init_name(callee, init_prefix)
-        return replace_token(line, callee_start, callee_end, prefixed_target_name(prefix, renamed))
+        return rewrite_declared_function_ref(line, declared, prefix, init_prefix, callee_start, callee_end)
 
     if op == "closure_ref":
         reg_start := first_end + 1
@@ -188,11 +187,7 @@ fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix:
             return line
         callee_start := reg_end + 1
         callee_end := next_space(line, callee_start)
-        callee := line.substring(callee_start, callee_end)
-        if not declared.function_set.contains_key(callee):
-            return line
-        renamed := maybe_prefixed_init_name(callee, init_prefix)
-        return replace_token(line, callee_start, callee_end, prefixed_target_name(prefix, renamed))
+        return rewrite_declared_function_ref(line, declared, prefix, init_prefix, callee_start, callee_end)
 
     return line
 

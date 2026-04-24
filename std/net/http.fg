@@ -53,6 +53,14 @@ pub struct HttpResponse:
     pub body: Bytes
     pub set_cookie_headers: List[String]
 
+# response metadata returned when a body is streamed into a writer.
+pub struct StreamedHttpResponse:
+    pub status: Int
+    pub content_type: String
+    pub headers: Map[String, String]
+    pub set_cookie_headers: List[String]
+    pub body_size: Int
+
 # a small builder for outbound http client requests.
 pub struct ClientRequest:
     pub method: String
@@ -1068,6 +1076,13 @@ fn response_from_head_and_body(head: Bytes, body: Bytes) -> HttpResponse!:
     set_cookie_headers := response_set_cookie_headers(head)
     return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body, set_cookie_headers)
 
+fn streamed_response_from_head(head: Bytes, body_size: Int) -> StreamedHttpResponse!:
+    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
+    headers := response_headers_map(head)
+    content_type := header_lookup(headers, "Content-Type")
+    set_cookie_headers := response_set_cookie_headers(head)
+    return StreamedHttpResponse(status, content_type, header_without(headers, "Content-Type"), set_cookie_headers, body_size)
+
 fn read_response_body_buffered(head: Bytes, reader: BufferedBytesReader) -> Bytes!:
     if uses_chunked_transfer_encoding(head):
         return read_chunked_body(reader)!
@@ -1095,6 +1110,112 @@ fn read_response_body_tls(head: Bytes, conn: tls.Conn) -> Bytes!:
     if transfer_encoding_value(head) == "" and (decode_utf8(header_value_bytes(head, "Connection")) catch "").to_lower() == "close":
         return conn.read_all_bytes()!
     return bytes.empty()
+
+fn stream_exact_bytes_from_reader(reader: BufferedBytesReader, writer: BufferedBytesWriter, count: Int) -> Int!:
+    mut remaining := count
+    mut total := 0
+    while remaining > 0:
+        mut chunk_size := remaining
+        if chunk_size > 4096:
+            chunk_size = 4096
+        chunk := reader.read_exact_bytes(chunk_size)!
+        if chunk.is_empty():
+            fail "unexpected eof"
+        total = total + writer.write_all_bytes(chunk)!
+        remaining = remaining - chunk.len()
+    writer.flush()!
+    return total
+
+fn stream_exact_bytes_from_tls(conn: tls.Conn, writer: BufferedBytesWriter, count: Int) -> Int!:
+    mut remaining := count
+    mut total := 0
+    while remaining > 0:
+        mut chunk_size := remaining
+        if chunk_size > 4096:
+            chunk_size = 4096
+        chunk := read_exact_from_tls(conn, chunk_size)!
+        total = total + writer.write_all_bytes(chunk)!
+        remaining = remaining - chunk.len()
+    writer.flush()!
+    return total
+
+fn stream_until_close_from_reader(reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
+    mut total := 0
+    while true:
+        chunk := reader.read_bytes(4096)!
+        if chunk.is_empty():
+            writer.flush()!
+            return total
+        total = total + writer.write_all_bytes(chunk)!
+
+fn stream_until_close_from_tls(conn: tls.Conn, writer: BufferedBytesWriter) -> Int!:
+    mut total := 0
+    while true:
+        chunk := conn.read_bytes(4096)!
+        if chunk.is_empty():
+            writer.flush()!
+            return total
+        total = total + writer.write_all_bytes(chunk)!
+
+fn stream_chunked_body_from_reader(reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
+    nl := bytes.from_string_utf8(chr(10))
+    mut total := 0
+    while true:
+        line := reader.read_until_bytes_including(nl)!
+        if line.is_empty():
+            fail "incomplete chunk size"
+        chunk_size := parse_hex_bytes(chunk_size_line_bytes(line))!
+        if chunk_size == 0:
+            while true:
+                trailer := reader.read_until_bytes_including(nl)!
+                if trailer.is_empty() or chunk_line_is_blank(trailer):
+                    writer.flush()!
+                    return total
+        total = total + stream_exact_bytes_from_reader(reader, writer, chunk_size)!
+        consume_chunk_line_ending(reader)
+
+fn stream_chunked_body_from_tls(conn: tls.Conn, writer: BufferedBytesWriter) -> Int!:
+    nl := bytes.from_string_utf8(chr(10))
+    mut total := 0
+    while true:
+        line := read_until_including_from_tls(conn, nl)!
+        if line.is_empty():
+            fail "incomplete chunk size"
+        chunk_size := parse_hex_bytes(chunk_size_line_bytes(line))!
+        if chunk_size == 0:
+            while true:
+                trailer := read_until_including_from_tls(conn, nl)!
+                if trailer.is_empty() or chunk_line_is_blank(trailer):
+                    writer.flush()!
+                    return total
+        total = total + stream_exact_bytes_from_tls(conn, writer, chunk_size)!
+        consume_chunk_line_ending_tls(conn)
+
+fn stream_response_body_buffered(head: Bytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
+    if uses_chunked_transfer_encoding(head):
+        return stream_chunked_body_from_reader(reader, writer)
+    content_length_raw := header_value_bytes(head, "Content-Length")
+    if not content_length_raw.is_empty():
+        return stream_exact_bytes_from_reader(reader, writer, parse_decimal_bytes(content_length_raw)!)
+    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
+    if response_status_has_no_body(status):
+        return 0
+    if transfer_encoding_value(head) == "" and (decode_utf8(header_value_bytes(head, "Connection")) catch "").to_lower() == "close":
+        return stream_until_close_from_reader(reader, writer)
+    return 0
+
+fn stream_response_body_tls(head: Bytes, conn: tls.Conn, writer: BufferedBytesWriter) -> Int!:
+    if uses_chunked_transfer_encoding(head):
+        return stream_chunked_body_from_tls(conn, writer)
+    content_length_raw := header_value_bytes(head, "Content-Length")
+    if not content_length_raw.is_empty():
+        return stream_exact_bytes_from_tls(conn, writer, parse_decimal_bytes(content_length_raw)!)
+    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
+    if response_status_has_no_body(status):
+        return 0
+    if transfer_encoding_value(head) == "" and (decode_utf8(header_value_bytes(head, "Connection")) catch "").to_lower() == "close":
+        return stream_until_close_from_tls(conn, writer)
+    return 0
 
 fn content_length_from_head_bytes(raw_head: Bytes) -> Int!:
     length_text := header_value_bytes(raw_head, "Content-Length")
@@ -1405,6 +1526,19 @@ fn response_head_bytes(response: HttpResponse, content_length: Int, use_chunked:
     if header_lookup(response.headers, "Connection") == "":
         head = head + "Connection: close" + crlf
     return bytes.from_string_utf8(head + crlf)
+
+impl StreamedHttpResponse:
+    fn header_value(name: String) -> String:
+        if header_key_matches(name, "Content-Type"):
+            if self.content_type != "":
+                return self.content_type
+        return header_lookup(self.headers, name)
+
+    fn cookies() -> List[String]:
+        return copy_string_list(self.set_cookie_headers)
+
+    fn is_success() -> Bool:
+        return self.status >= 200 and self.status < 300
 
 fn response_to_string_or_empty(resp: HttpResponse) -> String:
     text := resp.to_string()
@@ -1718,15 +1852,31 @@ pub fn read_response_buffered_bytes(reader: BufferedBytesReader) -> HttpResponse
     body := read_response_body_buffered(head, reader)!
     return response_from_head_and_body(head, body)
 
+# reads one http response and streams the decoded body into a writer.
+pub fn read_response_buffered_bytes_into(reader: BufferedBytesReader, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+    head := read_response_head_buffered(reader)!
+    body_size := stream_response_body_buffered(head, reader, writer)!
+    return streamed_response_from_head(head, body_size)
+
 # reads one http response from a tcp stream.
 pub fn read_response_stream(stream: TcpStream) -> HttpResponse!:
     return read_response_buffered_bytes(stream.buffered_bytes_reader_chunked(512))
+
+# reads one http response from a tcp stream and streams the decoded body into a writer.
+pub fn read_response_stream_into(stream: TcpStream, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+    return read_response_buffered_bytes_into(stream.buffered_bytes_reader_chunked(512), writer)
 
 # reads one http response from a tls connection.
 pub fn read_response_tls(conn: tls.Conn) -> HttpResponse!:
     head := read_response_head_tls(conn)!
     body := read_response_body_tls(head, conn)!
     return response_from_head_and_body(head, body)
+
+# reads one http response from a tls connection and streams the decoded body into a writer.
+pub fn read_response_tls_into(conn: tls.Conn, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+    head := read_response_head_tls(conn)!
+    body_size := stream_response_body_tls(head, conn, writer)!
+    return streamed_response_from_head(head, body_size)
 # ===============================================================
 # HTTP Client
 # ===============================================================
@@ -1918,6 +2068,27 @@ fn send_request_tls(req: ClientRequest, server_name: String, config: tls.Config)
     conn.close()
     return parse_response_bytes(raw)
 
+fn send_request_plain_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+    stream := io.connect(req.host, req.port)!
+    if req.timeout_ms >= 0:
+        stream.set_timeout(req.timeout_ms)
+    req_writer := stream.buffered_bytes_writer()
+    req_writer.write_all_bytes(req.to_bytes()!)!
+    req_writer.flush()!
+    streamed := read_response_buffered_bytes_into(stream.buffered_bytes_reader_chunked(512), writer)!
+    stream.close()
+    return streamed
+
+fn send_request_tls_into(req: ClientRequest, server_name: String, config: tls.Config, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+    stream := io.connect(req.host, req.port)!
+    if req.timeout_ms >= 0:
+        stream.set_timeout(req.timeout_ms)
+    conn := tls.client(stream, server_name, config)!
+    conn.write_all_bytes(req.to_bytes()!)!
+    streamed := read_response_tls_into(conn, writer)!
+    conn.close()
+    return streamed
+
 fn send_request_once(req: ClientRequest) -> HttpResponse!:
     if req.use_tls:
         return send_request_tls(req, req.host, tls.client_config()!)
@@ -2052,6 +2223,22 @@ impl ClientRequest:
             return send_request_tls(current, server_name, config)
         return send_request_following_redirects_with_tls_config(current, config)
 
+    fn send_into(writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+        if self.redirect_limit > 0:
+            fail "send_into does not follow redirects yet"
+        if self.use_tls:
+            return send_request_tls_into(self, self.host, tls.client_config()!, writer)
+        return send_request_plain_into(self, writer)
+
+    fn send_tls_into(writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+        return self.send_tls_into_with_config(self.host, tls.client_config()!, writer)
+
+    fn send_tls_into_with_config(server_name: String, config: tls.Config, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+        if self.redirect_limit > 0 and server_name == self.host:
+            fail "send_tls_into does not follow redirects yet"
+        current := ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, true, self.timeout_ms, self.redirect_limit)
+        return send_request_tls_into(current, server_name, config, writer)
+
     fn send_bytes() -> Bytes!:
         return self.send()!.body_bytes()
 
@@ -2069,6 +2256,13 @@ impl ClientConn:
     fn close():
         self.stream.close()
 
+    fn send_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+        if req.timeout_ms >= 0:
+            self.stream.set_timeout(req.timeout_ms)
+        self.writer.write_all_bytes(req.to_bytes()!)!
+        self.writer.flush()!
+        return read_response_buffered_bytes_into(self.reader, writer)
+
 impl TlsClientConn:
     fn send(req: ClientRequest) -> HttpResponse!:
         self.conn.write_all_bytes(req.to_bytes()!)!
@@ -2076,6 +2270,10 @@ impl TlsClientConn:
 
     fn close():
         self.conn.close()
+
+    fn send_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+        self.conn.write_all_bytes(req.to_bytes()!)!
+        return read_response_tls_into(self.conn, writer)
 
 # extracts one route parameter from a matched path pattern.
 pub fn route_param(req: HttpRequestBytes, pattern: String, name: String) -> String!:
@@ -2394,6 +2592,28 @@ test "http streams chunked responses over a buffered writer":
     assert_eq(resp.body_text()!, "hello world")
     assert_eq(resp.header_value("Transfer-Encoding"), "chunked")
     assert_eq(resp.header_value("Connection"), "keep-alive")
+
+test "http streams decoded response bodies into writers":
+    raw := text(200, "hello world").keep_alive().to_bytes()!
+    output := bytes.buffer()
+
+    streamed := read_response_buffered_bytes_into(io.bytes_reader(raw).buffered_chunked(4), output.buffered_chunked(5))!
+
+    assert(streamed.is_success())
+    assert_eq(streamed.body_size, 11)
+    assert_eq(streamed.header_value("Connection"), "keep-alive")
+    assert_eq(output.bytes().to_string_utf8()!, "hello world")
+
+test "http streams chunked response bodies into writers":
+    crlf := chr(13) + chr(10)
+    raw := "HTTP/1.1 200 OK" + crlf + "Transfer-Encoding: chunked" + crlf + "Connection: keep-alive" + crlf + crlf + "6" + crlf + "hello " + crlf + "5" + crlf + "world" + crlf + "0" + crlf + crlf
+    output := bytes.buffer()
+
+    streamed := read_response_buffered_bytes_into(io.bytes_reader(bytes.from_string_utf8(raw)).buffered_chunked(4), output.buffered_chunked(5))!
+
+    assert_eq(streamed.body_size, 11)
+    assert_eq(streamed.header_value("Transfer-Encoding"), "chunked")
+    assert_eq(output.bytes().to_string_utf8()!, "hello world")
 
 test "http multipart helpers keep binary bodies raw":
     file_buf := bytes.buffer()

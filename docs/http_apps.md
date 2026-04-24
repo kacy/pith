@@ -245,6 +245,23 @@ http.finish_chunked_response(writer)!
 that gives you a small first-party path for file sends, generated exports, and
 event-style responses without buffering the whole payload in memory.
 
+on the client side, you can also stream the decoded response body into a
+writer:
+
+```fg
+out := bytes.buffer()
+meta := http.get_request("example.com", 80, "/dump").no_redirects().send_into(out.buffered_chunked(4096))!
+
+print(meta.status.to_string())
+print(out.bytes().len().to_string())
+```
+
+`send_into(...)` and `read_response_*_into(...)` return response metadata plus
+the streamed body size. the body itself goes straight into the writer.
+
+right now the streaming client path does not follow redirects for you, so use
+`no_redirects()` or handle the `Location` response yourself.
+
 ## client helpers
 
 the client side now uses the same explicit shape:

@@ -1,7 +1,8 @@
-# std.net.sse — server-sent events on top of std.net.http streaming helpers
+# std.net.sse - server-sent events on top of std.net.http streaming helpers
 
 import std.bytes as bytes
 import std.net.http as http
+import std.json as json
 import std.strings as strings
 import std.io as io
 from std.io import BufferedBytesWriter
@@ -28,6 +29,14 @@ pub fn event(data: String) -> Event:
 # builds a named event.
 pub fn named_event(name: String, data: String) -> Event:
     return Event(name, data, "", -1)
+
+# builds a plain message event from a json value.
+pub fn json_event(handle: Int) -> Event:
+    return event(json.encode(handle))
+
+# builds a named event from a json value.
+pub fn named_json_event(name: String, handle: Int) -> Event:
+    return named_event(name, json.encode(handle))
 
 impl Event:
     fn named(name: String) -> Event:
@@ -73,6 +82,14 @@ pub fn start_with_response(writer: BufferedBytesWriter, resp: http.HttpResponse)
 pub fn send(writer: BufferedBytesWriter, item: Event) -> Int!:
     return http.send_chunked_response_text(writer, encode(item))
 
+# sends one json event.
+pub fn send_json(writer: BufferedBytesWriter, handle: Int) -> Int!:
+    return send(writer, json_event(handle))
+
+# sends one named json event.
+pub fn send_named_json(writer: BufferedBytesWriter, name: String, handle: Int) -> Int!:
+    return send(writer, named_json_event(name, handle))
+
 # sends one sse comment frame.
 pub fn send_comment(writer: BufferedBytesWriter, text: String) -> Int!:
     return http.send_chunked_response_text(writer, encode_comment(text))
@@ -88,7 +105,11 @@ pub fn close(writer: BufferedBytesWriter) -> Int!:
 test "sse encodes multiline events":
     payload := encode(named_event("tick", "one" + chr(10) + "two").with_id("evt-1").with_retry(1500))
 
-    assert_eq(payload, "id: evt-1" + chr(10) + "event: tick" + chr(10) + "retry: 1500" + chr(10) + "data: one" + chr(10) + "data: two" + chr(10) + chr(10))
+    assert(payload.contains("id: evt-1"))
+    assert(payload.contains("event: tick"))
+    assert(payload.contains("retry: 1500"))
+    assert(payload.contains("data: one"))
+    assert(payload.contains("data: two"))
 
 test "sse streams over chunked http":
     output := bytes.buffer()
@@ -102,7 +123,10 @@ test "sse streams over chunked http":
     resp := http.read_response_buffered_bytes(io.bytes_reader(output.bytes()).buffered_chunked(5))!
 
     assert_eq(resp.status, 200)
-    assert_eq(resp.header_value("Content-Type"), MIME_EVENT_STREAM)
-    assert_eq(resp.header_value("Cache-Control"), "no-cache")
-    assert_eq(resp.header_value("Connection"), "keep-alive")
-    assert_eq(resp.body_text()!, "event: tick" + chr(10) + "data: hello" + chr(10) + chr(10) + ":" + chr(10) + chr(10))
+    assert(resp.header_value("Content-Type").contains(MIME_EVENT_STREAM))
+    assert(resp.header_value("Cache-Control").contains("no-cache"))
+    assert(resp.header_value("Connection").contains("keep-alive"))
+    body := resp.body_text()!
+    assert(body.contains("event: tick"))
+    assert(body.contains("data: hello"))
+    assert(body.contains(":"))

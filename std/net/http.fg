@@ -1061,6 +1061,13 @@ fn read_response_head_tls(conn: tls.Conn) -> Bytes!:
 fn response_status_has_no_body(status: Int) -> Bool:
     return status == 204 or status == 304 or (status >= 100 and status < 200)
 
+fn response_from_head_and_body(head: Bytes, body: Bytes) -> HttpResponse!:
+    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
+    headers := response_headers_map(head)
+    content_type := header_lookup(headers, "Content-Type")
+    set_cookie_headers := response_set_cookie_headers(head)
+    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body, set_cookie_headers)
+
 fn read_response_body_buffered(head: Bytes, reader: BufferedBytesReader) -> Bytes!:
     if uses_chunked_transfer_encoding(head):
         return read_chunked_body(reader)!
@@ -1651,12 +1658,8 @@ pub fn parse_response(raw: String) -> HttpResponse!:
 # reads one http response from a buffered bytes reader without waiting for connection close.
 pub fn read_response_buffered_bytes(reader: BufferedBytesReader) -> HttpResponse!:
     head := read_response_head_buffered(reader)!
-    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
-    headers := response_headers_map(head)
-    content_type := header_lookup(headers, "Content-Type")
-    set_cookie_headers := response_set_cookie_headers(head)
     body := read_response_body_buffered(head, reader)!
-    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body, set_cookie_headers)
+    return response_from_head_and_body(head, body)
 
 # reads one http response from a tcp stream.
 pub fn read_response_stream(stream: TcpStream) -> HttpResponse!:
@@ -1665,12 +1668,8 @@ pub fn read_response_stream(stream: TcpStream) -> HttpResponse!:
 # reads one http response from a tls connection.
 pub fn read_response_tls(conn: tls.Conn) -> HttpResponse!:
     head := read_response_head_tls(conn)!
-    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
-    headers := response_headers_map(head)
-    content_type := header_lookup(headers, "Content-Type")
-    set_cookie_headers := response_set_cookie_headers(head)
     body := read_response_body_tls(head, conn)!
-    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body, set_cookie_headers)
+    return response_from_head_and_body(head, body)
 # ===============================================================
 # HTTP Client
 # ===============================================================
@@ -1710,7 +1709,7 @@ pub fn get_https_request(host: String, url_path: String) -> ClientRequest:
 
 pub fn connect_client(host: String, port: Int) -> ClientConn!:
     stream := io.connect(host, port)!
-    return ClientConn(stream, stream.buffered_bytes_reader_chunked(512), stream.buffered_bytes_writer())
+    return client_conn_from_stream(stream)
 
 pub fn connect_client_with_timeout(host: String, port: Int, timeout_ms: Int) -> ClientConn!:
     conn := connect_client(host, port)!
@@ -1722,7 +1721,7 @@ pub fn connect_tls_client(host: String, port: Int, server_name: String) -> TlsCl
 
 pub fn connect_tls_client_with_config(host: String, port: Int, server_name: String, config: tls.Config) -> TlsClientConn!:
     stream := io.connect(host, port)!
-    return TlsClientConn(tls.client(stream, server_name, config)!)
+    return tls_client_conn_from_stream(stream, server_name, config)
 
 pub fn connect_tls_client_with_timeout(host: String, port: Int, server_name: String, timeout_ms: Int) -> TlsClientConn!:
     return connect_tls_client_with_timeout_and_config(host, port, server_name, timeout_ms, tls.client_config()!)
@@ -1730,7 +1729,7 @@ pub fn connect_tls_client_with_timeout(host: String, port: Int, server_name: Str
 pub fn connect_tls_client_with_timeout_and_config(host: String, port: Int, server_name: String, timeout_ms: Int, config: tls.Config) -> TlsClientConn!:
     stream := io.connect(host, port)!
     stream.set_timeout(timeout_ms)
-    return TlsClientConn(tls.client(stream, server_name, config)!)
+    return tls_client_conn_from_stream(stream, server_name, config)
 
 pub fn multipart_field(name: String, value: String) -> MultipartPart:
     return MultipartPart(name, "", "", {}, bytes.from_string_utf8(value))
@@ -1745,6 +1744,12 @@ fn request_default_port(use_tls: Bool) -> Int:
     if use_tls:
         return 443
     return 80
+
+fn client_conn_from_stream(stream: TcpStream) -> ClientConn:
+    return ClientConn(stream, stream.buffered_bytes_reader_chunked(512), stream.buffered_bytes_writer())
+
+fn tls_client_conn_from_stream(stream: TcpStream, server_name: String, config: tls.Config) -> TlsClientConn!:
+    return TlsClientConn(tls.client(stream, server_name, config)!)
 
 fn request_origin_changed(req: ClientRequest, next_use_tls: Bool, next_host: String, next_port: Int) -> Bool:
     return req.use_tls != next_use_tls or req.host != next_host or req.port != next_port

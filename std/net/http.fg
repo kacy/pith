@@ -19,6 +19,7 @@ import std.log as log
 import std.metrics as metrics
 import std.net.url as url_mod
 import std.net.tls as tls
+import std.os.path as path_mod
 import std.text.scanner as scanner
 import std.time as time_mod
 import std.uuid as uuid
@@ -32,6 +33,15 @@ pub MIME_TEXT := "text/plain"
 pub MIME_HTML := "text/html"
 pub MIME_JSON := "application/json"
 pub MIME_MULTIPART_FORM := "multipart/form-data"
+pub MIME_CSS := "text/css"
+pub MIME_JS := "application/javascript"
+pub MIME_SVG := "image/svg+xml"
+pub MIME_PNG := "image/png"
+pub MIME_JPEG := "image/jpeg"
+pub MIME_GIF := "image/gif"
+pub MIME_WEBP := "image/webp"
+pub MIME_WASM := "application/wasm"
+pub MIME_BINARY := "application/octet-stream"
 HTTP_FILE_STREAM_CHUNK_SIZE := 4096
 # raw request parts plus lazy decoded helpers for bytes-first request handling.
 pub struct HttpRequestBytes:
@@ -125,6 +135,41 @@ fn normalize_path(path: String) -> String:
     if path == "":
         return "/"
     return path
+
+fn quoted_filename(name: String) -> String:
+    return chr(34) + name + chr(34)
+
+fn fallback_download_name(file_path: String) -> String:
+    name := path_mod.base(file_path)
+    if name == "":
+        return "download"
+    return name
+
+pub fn content_type_for_path(file_path: String) -> String:
+    ext := path_mod.ext(file_path).to_lower()
+    if ext == ".html" or ext == ".htm":
+        return MIME_HTML
+    if ext == ".txt":
+        return MIME_TEXT
+    if ext == ".json":
+        return MIME_JSON
+    if ext == ".css":
+        return MIME_CSS
+    if ext == ".js" or ext == ".mjs":
+        return MIME_JS
+    if ext == ".svg":
+        return MIME_SVG
+    if ext == ".png":
+        return MIME_PNG
+    if ext == ".jpg" or ext == ".jpeg":
+        return MIME_JPEG
+    if ext == ".gif":
+        return MIME_GIF
+    if ext == ".webp":
+        return MIME_WEBP
+    if ext == ".wasm":
+        return MIME_WASM
+    return MIME_BINARY
 
 fn copy_headers_map(headers: Map[String, String]) -> Map[String, String]:
     mut copied: Map[String, String] := {}
@@ -1811,6 +1856,18 @@ pub fn send_file_path(writer: BufferedBytesWriter, response: HttpResponse, file_
     file.close()
     return written
 
+# guesses a content type from the path and streams the file without buffering it.
+pub fn send_static_path(writer: BufferedBytesWriter, response: HttpResponse, file_path: String) -> Int!:
+    return send_file_path(writer, response.content_type(content_type_for_path(file_path)), file_path)
+
+# streams a file as an attachment download.
+pub fn send_download_path(writer: BufferedBytesWriter, response: HttpResponse, file_path: String, download_name: String) -> Int!:
+    mut name := download_name
+    if name == "":
+        name = fallback_download_name(file_path)
+    resp := response.content_type(content_type_for_path(file_path)).header("Content-Disposition", "attachment; filename=" + quoted_filename(name))
+    return send_file_path(writer, resp, file_path)
+
 # sends a chunked response head so callers can stream chunks without buffering the whole body.
 pub fn send_chunked_response_head(writer: BufferedBytesWriter, response: HttpResponse) -> Int!:
     if not response.body.is_empty():
@@ -2831,6 +2888,23 @@ test "http streams file responses over buffered writers":
     resp := read_response_buffered_bytes(io.bytes_reader(output.bytes()).buffered_chunked(4))!
     assert_eq(resp.body_text()!, "hello file body")
     assert_eq(resp.header_value("Connection"), "keep-alive")
+    fs.remove(file_path)
+
+test "http static and download helpers set file headers":
+    file_path := "/tmp/forge-http-static-" + time_mod.now().to_string() + ".html"
+    fs.write(file_path, "<h1>ok</h1>")!
+    static_out := bytes.buffer()
+    download_out := bytes.buffer()
+
+    send_static_path(static_out.buffered_chunked(5), response(200).keep_alive(), file_path)!
+    send_download_path(download_out.buffered_chunked(5), response(200).keep_alive(), file_path, "index.html")!
+
+    static_resp := read_response_buffered_bytes(io.bytes_reader(static_out.bytes()).buffered_chunked(4))!
+    download_resp := read_response_buffered_bytes(io.bytes_reader(download_out.bytes()).buffered_chunked(4))!
+    assert_eq(static_resp.header_value("Content-Type"), MIME_HTML)
+    assert_eq(download_resp.header_value("Content-Type"), MIME_HTML)
+    assert_eq(download_resp.header_value("Content-Disposition"), "attachment; filename=" + chr(34) + "index.html" + chr(34))
+    assert_eq(download_resp.body_text()!, "<h1>ok</h1>")
     fs.remove(file_path)
 
 test "http streams chunked response bodies into writers":

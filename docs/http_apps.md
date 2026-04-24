@@ -259,6 +259,43 @@ http.finish_chunked_response(writer)!
 that gives you a small first-party path for generated exports and event-style
 responses without buffering the whole payload in memory.
 
+for file-backed responses, use the path helpers instead of reading the whole
+file into memory first:
+
+```fg
+http.send_static_path(writer, http.response(200).keep_alive(), "public/app.js")!
+http.send_download_path(writer, http.response(200), "build/report.json", "report.json")!
+```
+
+`send_static_path(...)` guesses a content type from the file extension.
+`send_download_path(...)` does the same thing and adds a normal attachment
+`Content-Disposition` header.
+
+if you want the client side of that flow, stream a response body straight into
+an output file:
+
+```fg
+req := http.get_request("example.test", 80, "/artifact")
+saved := req.send_to_file("artifact.bin")!
+print(saved.body_size.to_string())
+```
+
+there are matching connection-level helpers too:
+- `ClientConn.send_to_file(...)`
+- `TlsClientConn.send_to_file(...)`
+
+the built-in content type guesser covers the common web assets:
+- `.html`, `.htm`
+- `.txt`
+- `.json`
+- `.css`
+- `.js`, `.mjs`
+- `.svg`
+- `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`
+- `.wasm`
+
+everything else falls back to `application/octet-stream`.
+
 for server-sent events, use `std.net.sse` on top of that same chunked path:
 
 ```fg

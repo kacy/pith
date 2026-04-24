@@ -1,9 +1,11 @@
 # http app helpers — request helpers, response builders, and simple routing
 import std.bytes as bytes
+import std.fs as fs
 import std.io as io
 import std.json as json
 import std.net.http as http
-from std.net.http import HttpRequestBytes, HttpResponse
+import std.time as time
+from std.net.http import ClientConn, HttpRequestBytes, HttpResponse
 
 fn app(req: HttpRequestBytes) -> HttpResponse:
     if http.post_route(req, "/items/:id") catch false:
@@ -67,5 +69,25 @@ fn main() -> String!:
     redirect := http.redirect_response("/next").to_string()!
     print("redirect has location: " + redirect.contains("/next").to_string())
     print("no content status: " + http.no_content().status_code().to_string())
+
+    asset_path := "/tmp/forge-http-apps-" + time.now().to_string() + ".html"
+    fs.write(asset_path, "<h1>asset</h1>")!
+    asset_out := bytes.buffer()
+    http.send_static_path(asset_out.buffered_chunked(5), http.response(200).keep_alive(), asset_path)!
+    asset_resp := http.parse_response_bytes(asset_out.bytes())!
+    print("static type: " + asset_resp.header_value("Content-Type"))
+
+    download_out := bytes.buffer()
+    http.send_download_path(download_out.buffered_chunked(5), http.response(200).keep_alive(), asset_path, "asset.html")!
+    download_resp := http.parse_response_bytes(download_out.bytes())!
+    print("download disposition: " + download_resp.header_value("Content-Disposition"))
+
+    save_path := "/tmp/forge-http-download-" + time.now().to_string() + ".txt"
+    download_req := http.get_request("example.com", 80, "/download")
+    download_conn := ClientConn(io.from_fd(1), io.bytes_reader(http.text(200, "saved").to_bytes()!).buffered_chunked(4), bytes.buffer().buffered_chunked(4))
+    download_conn.send_to_file(download_req, save_path)!
+    print("saved body: " + fs.read(save_path)!)
+    fs.remove(save_path)
+    fs.remove(asset_path)
     print("http apps work")
     return ""

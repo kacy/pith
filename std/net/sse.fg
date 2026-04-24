@@ -61,6 +61,18 @@ fn encode_comment(text: String) -> String:
         return ":" + chr(10) + chr(10)
     return ": " + text + chr(10) + chr(10)
 
+fn event_has_content(item: Event) -> Bool:
+    return item.event != "" or item.data != "" or item.id != "" or item.retry_ms >= 0
+
+fn parse_line_value(line: String) -> List[String]:
+    colon := line.index_of(":")
+    if colon < 0:
+        return [line, ""]
+    mut value := line.substring(colon + 1, line.len())
+    if value.starts_with(" "):
+        value = value.substring(1, value.len())
+    return [line.substring(0, colon), value]
+
 # encodes one event into the wire format.
 pub fn encode(item: Event) -> String:
     mut lines: List[String] := []
@@ -77,6 +89,56 @@ pub fn encode(item: Event) -> String:
         for line in data_lines:
             lines.push("data: " + line)
     return strings.join_lines(lines) + chr(10) + chr(10)
+
+# encodes one retry control frame.
+pub fn encode_retry(ms: Int) -> String!:
+    if ms < 0:
+        fail "retry must be non-negative"
+    return "retry: " + ms.to_string() + chr(10) + chr(10)
+
+# parses one event frame.
+pub fn parse(frame: String) -> Event!:
+    mut event_name := ""
+    mut id := ""
+    mut retry_ms := -1
+    mut data_lines: List[String] := []
+    for raw_line in strings.split_lines(frame):
+        line := raw_line
+        if line == "" or line.starts_with(":"):
+            continue
+        parts := parse_line_value(line)
+        field := parts[0]
+        value := parts[1]
+        if field == "event":
+            event_name = value
+            continue
+        if field == "data":
+            data_lines.push(value)
+            continue
+        if field == "id":
+            id = value
+            continue
+        if field == "retry":
+            retry_ms = parse_int(value)!
+    return Event(event_name, strings.join_lines(data_lines), id, retry_ms)
+
+# parses a stream body into event frames.
+pub fn parse_all(stream: String) -> List[Event]!:
+    mut parsed: List[Event] := []
+    mut lines: List[String] := []
+    for line in strings.split_lines(stream):
+        if line == "":
+            item := parse(strings.join_lines(lines))!
+            if event_has_content(item):
+                parsed.push(item)
+            lines = []
+            continue
+        lines.push(line)
+    if lines.len() > 0:
+        item := parse(strings.join_lines(lines))!
+        if event_has_content(item):
+            parsed.push(item)
+    return parsed
 
 # sends the default sse response head.
 pub fn start(writer: BufferedBytesWriter) -> Int!:
@@ -101,6 +163,10 @@ pub fn send_named_json(writer: BufferedBytesWriter, name: String, handle: Int) -
 # sends one sse comment frame.
 pub fn send_comment(writer: BufferedBytesWriter, text: String) -> Int!:
     return http.send_chunked_response_text(writer, encode_comment(text))
+
+# sends one retry control frame.
+pub fn send_retry(writer: BufferedBytesWriter, ms: Int) -> Int!:
+    return http.send_chunked_response_text(writer, encode_retry(ms)!)
 
 # sends an empty keep-alive comment.
 pub fn keep_alive(writer: BufferedBytesWriter) -> Int!:
@@ -127,12 +193,33 @@ test "sse request helpers read stream headers":
     assert(accepts_stream(req))
     assert(last_event_id(req).contains("evt-42"))
 
+test "sse parses encoded events":
+    frame := encode(named_event("tick", "one" + chr(10) + "two").with_id("evt-1").with_retry(1500))
+    item := parse(frame)!
+
+    assert_eq(item.event, "tick")
+    assert_eq(item.id, "evt-1")
+    assert_eq(item.retry_ms, 1500)
+    assert_eq(item.data, "one" + chr(10) + "two")
+
+test "sse parses event streams and skips comments":
+    stream := encode_comment("keep alive") + encode_retry(2500)! + encode(named_event("tick", "hello").with_id("evt-2"))
+    items := parse_all(stream)!
+
+    assert_eq(items.len(), 2)
+    assert_eq(items[0].retry_ms, 2500)
+    assert_eq(items[0].data, "")
+    assert_eq(items[1].event, "tick")
+    assert_eq(items[1].id, "evt-2")
+    assert_eq(items[1].data, "hello")
+
 test "sse streams over chunked http":
     output := bytes.buffer()
     writer := output.buffered_chunked(6)
 
     start(writer)!
     send(writer, named_event("tick", "hello"))!
+    send_retry(writer, 1500)!
     keep_alive(writer)!
     close(writer)!
 
@@ -145,4 +232,5 @@ test "sse streams over chunked http":
     body := resp.body_text()!
     assert(body.contains("event: tick"))
     assert(body.contains("data: hello"))
+    assert(body.contains("retry: 1500"))
     assert(body.contains(":"))

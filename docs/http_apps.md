@@ -266,6 +266,7 @@ import std.net.sse as sse
 
 sse.start(writer)!
 sse.send(writer, sse.named_event("tick", "hello"))!
+sse.send_retry(writer, 1500)!
 sse.keep_alive(writer)!
 ```
 
@@ -276,6 +277,12 @@ if your payload is already a forge json value, use the json helpers:
 
 ```fg
 sse.send_named_json(writer, "tick", payload)!
+```
+
+on the client side, you can parse an event-stream body back into frames:
+
+```fg
+items := sse.parse_all(resp.body_text()!)!
 ```
 
 on the request side, `std.net.sse` also gives you the small header helpers:

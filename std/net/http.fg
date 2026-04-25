@@ -145,8 +145,7 @@ fn fallback_download_name(file_path: String) -> String:
         return "download"
     return name
 
-pub fn content_type_for_path(file_path: String) -> String:
-    ext := path_mod.ext(file_path).to_lower()
+fn content_type_for_extension(ext: String) -> String:
     if ext == ".html" or ext == ".htm":
         return MIME_HTML
     if ext == ".txt":
@@ -170,6 +169,9 @@ pub fn content_type_for_path(file_path: String) -> String:
     if ext == ".wasm":
         return MIME_WASM
     return MIME_BINARY
+
+pub fn content_type_for_path(file_path: String) -> String:
+    return content_type_for_extension(path_mod.ext(file_path).to_lower())
 
 fn copy_headers_map(headers: Map[String, String]) -> Map[String, String]:
     mut copied: Map[String, String] := {}
@@ -223,6 +225,29 @@ fn serialize_cookie(item: Cookie) -> String:
     if item.same_site_value != "":
         out = out + "; SameSite=" + item.same_site_value
     return out
+
+fn streamed_file_info(file_path: String) -> fs.Info!:
+    meta := fs.info(file_path)!
+    if meta.is_dir:
+        fail "http file response path must be a file: " + file_path
+    return meta
+
+fn static_file_response(response: HttpResponse, file_path: String) -> HttpResponse:
+    return response.content_type(content_type_for_path(file_path))
+
+fn download_file_response(response: HttpResponse, file_path: String, download_name: String) -> HttpResponse:
+    mut name := download_name
+    if name == "":
+        name = fallback_download_name(file_path)
+    return static_file_response(response, file_path).header("Content-Disposition", "attachment; filename=" + quoted_filename(name))
+
+fn output_file_writer(file: FileStream) -> BufferedBytesWriter:
+    return file.buffered_bytes_writer_chunked(HTTP_FILE_STREAM_CHUNK_SIZE)
+
+fn finish_output_file_writer(file: FileStream, writer: BufferedBytesWriter) -> Int!:
+    writer.flush()!
+    file.close()
+    return 0
 
 fn trim_quotes(value: String) -> String:
     if value.len() >= 2 and value[0] == chr(34) and value[value.len() - 1] == chr(34):
@@ -1848,9 +1873,7 @@ pub fn send_file_stream(writer: BufferedBytesWriter, response: HttpResponse, fil
 
 # opens a file, sends it as a fixed-size response body, and closes it afterwards.
 pub fn send_file_path(writer: BufferedBytesWriter, response: HttpResponse, file_path: String) -> Int!:
-    meta := fs.info(file_path)!
-    if meta.is_dir:
-        fail "http file response path must be a file: " + file_path
+    meta := streamed_file_info(file_path)!
     file := fs.open(file_path)!
     written := send_file_stream(writer, response, file, meta.size)!
     file.close()
@@ -1858,15 +1881,11 @@ pub fn send_file_path(writer: BufferedBytesWriter, response: HttpResponse, file_
 
 # guesses a content type from the path and streams the file without buffering it.
 pub fn send_static_path(writer: BufferedBytesWriter, response: HttpResponse, file_path: String) -> Int!:
-    return send_file_path(writer, response.content_type(content_type_for_path(file_path)), file_path)
+    return send_file_path(writer, static_file_response(response, file_path), file_path)
 
 # streams a file as an attachment download.
 pub fn send_download_path(writer: BufferedBytesWriter, response: HttpResponse, file_path: String, download_name: String) -> Int!:
-    mut name := download_name
-    if name == "":
-        name = fallback_download_name(file_path)
-    resp := response.content_type(content_type_for_path(file_path)).header("Content-Disposition", "attachment; filename=" + quoted_filename(name))
-    return send_file_path(writer, resp, file_path)
+    return send_file_path(writer, download_file_response(response, file_path, download_name), file_path)
 
 # sends a chunked response head so callers can stream chunks without buffering the whole body.
 pub fn send_chunked_response_head(writer: BufferedBytesWriter, response: HttpResponse) -> Int!:
@@ -2456,10 +2475,9 @@ impl ClientRequest:
 
     fn send_to_file(output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
-        writer := file.buffered_bytes_writer_chunked(HTTP_FILE_STREAM_CHUNK_SIZE)
+        writer := output_file_writer(file)
         streamed := self.send_into(writer)!
-        writer.flush()!
-        file.close()
+        finish_output_file_writer(file, writer)!
         return streamed
 
     fn send_tls_to_file(output_path: String) -> StreamedHttpResponse!:
@@ -2467,10 +2485,9 @@ impl ClientRequest:
 
     fn send_tls_to_file_with_config(server_name: String, config: tls.Config, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
-        writer := file.buffered_bytes_writer_chunked(HTTP_FILE_STREAM_CHUNK_SIZE)
+        writer := output_file_writer(file)
         streamed := self.send_tls_into_with_config(server_name, config, writer)!
-        writer.flush()!
-        file.close()
+        finish_output_file_writer(file, writer)!
         return streamed
 
     fn send_bytes() -> Bytes!:
@@ -2499,10 +2516,9 @@ impl ClientConn:
 
     fn send_to_file(req: ClientRequest, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
-        writer := file.buffered_bytes_writer_chunked(HTTP_FILE_STREAM_CHUNK_SIZE)
+        writer := output_file_writer(file)
         streamed := self.send_into(req, writer)!
-        writer.flush()!
-        file.close()
+        finish_output_file_writer(file, writer)!
         return streamed
 
 impl TlsClientConn:
@@ -2519,10 +2535,9 @@ impl TlsClientConn:
 
     fn send_to_file(req: ClientRequest, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
-        writer := file.buffered_bytes_writer_chunked(HTTP_FILE_STREAM_CHUNK_SIZE)
+        writer := output_file_writer(file)
         streamed := self.send_into(req, writer)!
-        writer.flush()!
-        file.close()
+        finish_output_file_writer(file, writer)!
         return streamed
 
 # extracts one route parameter from a matched path pattern.

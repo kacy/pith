@@ -4374,17 +4374,10 @@ fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool) -> Int:
 fn ir_emit_json_nested_decode_path_specialized(parent_handle_r: Int, key_r: Int, target_tid: Int, module_path: String) -> Int:
     child_result_r := ir_reg()
     ir_emit_call2(child_result_r, ir_resolve_generic_module_call_name(module_path, "object_require_object"), "tuple", parent_handle_r, key_r)
-    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
-    child_ok_l := ir_label()
-    child_err_l := ir_label()
     done_l := ir_label()
     temp_name := ir_new_temp_name("json_nested_decode")
     ir_var_types.insert(temp_name, "tuple")
-    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
-    ir_emit("label " + child_err_l)
-    ir_emit("store " + temp_name + " " + child_result_r.to_string())
-    ir_emit("jmp " + done_l)
-    ir_emit("label " + child_ok_l)
+    ir_emit_result_or_jump(child_result_r, temp_name, done_l)
     child_handle_r := ir_emit_result_value_field(child_result_r, lookup_type_id("Int"), "ok")
     decode_name := ir_json_generic_name("decode_object")
     decode_result_r := ir_reg()
@@ -4394,6 +4387,21 @@ fn ir_emit_json_nested_decode_path_specialized(parent_handle_r: Int, key_r: Int,
     result_r := ir_reg()
     ir_emit("load " + result_r.to_string() + " " + temp_name)
     return result_r
+
+fn ir_emit_json_object_has(handle_r: Int, key_r: Int, module_path: String) -> Int:
+    has_r := ir_reg()
+    ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "object_has"), "bool", handle_r, key_r)
+    return has_r
+
+fn ir_emit_result_or_jump(result_r: Int, temp_name: String, done_l: String):
+    ok_flag_r := ir_emit_result_flag_field(result_r, "is_ok")
+    ok_l := ir_label()
+    err_l := ir_label()
+    ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + err_l)
+    ir_emit("store " + temp_name + " " + result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + ok_l)
 
 fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: Int, module_path: String, temp_name: String, done_l: String):
     mut field_regs: List[Int] := []
@@ -4410,8 +4418,7 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
         if optional_inner_tid >= 0:
             optional_struct_tid = ir_struct_decode_field_tid(optional_inner_tid)
         if optional_struct_tid >= 0:
-            has_r := ir_reg()
-            ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "object_has"), "bool", handle_r, key_r)
+            has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
             present_l := ir_label()
             missing_l := ir_label()
             merge_l := ir_label()
@@ -4426,14 +4433,7 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
             ir_emit("jmp " + merge_l)
             ir_emit("label " + present_l)
             field_result_r := ir_emit_json_nested_decode_path_specialized(handle_r, key_r, optional_struct_tid, module_path)
-            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
-            ok_l := ir_label()
-            err_l := ir_label()
-            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
-            ir_emit("label " + err_l)
-            ir_emit("store " + temp_name + " " + field_result_r.to_string())
-            ir_emit("jmp " + done_l)
-            ir_emit("label " + ok_l)
+            ir_emit_result_or_jump(field_result_r, temp_name, done_l)
             some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid))
             ir_emit("store " + field_temp + " " + some_r.to_string())
             ir_emit("jmp " + merge_l)
@@ -4446,8 +4446,7 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
         nested_struct_tid := ir_struct_decode_field_tid(field_tid)
         if nested_struct_tid >= 0:
             if default_idx >= 0:
-                has_r := ir_reg()
-                ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "object_has"), "bool", handle_r, key_r)
+                has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
                 present_l := ir_label()
                 missing_l := ir_label()
                 merge_l := ir_label()
@@ -4459,14 +4458,7 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
                 ir_emit("jmp " + merge_l)
                 ir_emit("label " + present_l)
                 field_result_r := ir_emit_json_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
-                ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
-                ok_l := ir_label()
-                err_l := ir_label()
-                ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
-                ir_emit("label " + err_l)
-                ir_emit("store " + temp_name + " " + field_result_r.to_string())
-                ir_emit("jmp " + done_l)
-                ir_emit("label " + ok_l)
+                ir_emit_result_or_jump(field_result_r, temp_name, done_l)
                 ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
                 ir_emit("jmp " + merge_l)
                 ir_emit("label " + merge_l)
@@ -4476,14 +4468,7 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
                 i = i + 1
                 continue
             field_result_r := ir_emit_json_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
-            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
-            ok_l := ir_label()
-            err_l := ir_label()
-            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
-            ir_emit("label " + err_l)
-            ir_emit("store " + temp_name + " " + field_result_r.to_string())
-            ir_emit("jmp " + done_l)
-            ir_emit("label " + ok_l)
+            ir_emit_result_or_jump(field_result_r, temp_name, done_l)
             field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
             i = i + 1
             continue
@@ -4491,8 +4476,7 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
             helper_name := ir_json_object_helper_name(optional_inner_tid)
             if helper_name.len() == 0:
                 continue
-            has_r := ir_reg()
-            ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "object_has"), "bool", handle_r, key_r)
+            has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
             present_l := ir_label()
             missing_l := ir_label()
             merge_l := ir_label()
@@ -4508,14 +4492,7 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
             ir_emit("label " + present_l)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), "tuple", handle_r, key_r)
-            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
-            ok_l := ir_label()
-            err_l := ir_label()
-            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
-            ir_emit("label " + err_l)
-            ir_emit("store " + temp_name + " " + field_result_r.to_string())
-            ir_emit("jmp " + done_l)
-            ir_emit("label " + ok_l)
+            ir_emit_result_or_jump(field_result_r, temp_name, done_l)
             some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid))
             ir_emit("store " + field_temp + " " + some_r.to_string())
             ir_emit("jmp " + merge_l)
@@ -4529,8 +4506,7 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
         if helper_name.len() == 0:
             continue
         if default_idx >= 0:
-            has_r := ir_reg()
-            ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "object_has"), "bool", handle_r, key_r)
+            has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
             present_l := ir_label()
             missing_l := ir_label()
             merge_l := ir_label()
@@ -4543,14 +4519,7 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
             ir_emit("label " + present_l)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), "tuple", handle_r, key_r)
-            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
-            ok_l := ir_label()
-            err_l := ir_label()
-            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
-            ir_emit("label " + err_l)
-            ir_emit("store " + temp_name + " " + field_result_r.to_string())
-            ir_emit("jmp " + done_l)
-            ir_emit("label " + ok_l)
+            ir_emit_result_or_jump(field_result_r, temp_name, done_l)
             ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
             ir_emit("jmp " + merge_l)
             ir_emit("label " + merge_l)
@@ -4561,14 +4530,7 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
             continue
         field_result_r := ir_reg()
         ir_emit_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), "tuple", handle_r, key_r)
-        ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
-        ok_l := ir_label()
-        err_l := ir_label()
-        ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
-        ir_emit("label " + err_l)
-        ir_emit("store " + temp_name + " " + field_result_r.to_string())
-        ir_emit("jmp " + done_l)
-        ir_emit("label " + ok_l)
+        ir_emit_result_or_jump(field_result_r, temp_name, done_l)
         field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
         i = i + 1
 

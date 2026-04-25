@@ -90,6 +90,21 @@ fn allocate_node(kind: String) -> Int:
 fn object_slot_key(handle: Int, index: Int) -> String:
     return handle.to_string() + ":" + index.to_string()
 
+fn object_slot_name(handle: Int, index: Int) -> String:
+    return object_keys_by_slot[object_slot_key(handle, index)]
+
+fn object_slot_value(handle: Int, index: Int) -> Int:
+    return object_values_by_slot[object_slot_key(handle, index)]
+
+fn clear_object_entries(handle: Int):
+    count := object_key_counts[handle]
+    mut i := 0
+    while i < count:
+        slot := object_slot_key(handle, i)
+        object_keys_by_slot.remove(slot)
+        object_values_by_slot.remove(slot)
+        i = i + 1
+
 # Sets a key-value pair on an object node
 fn set_object_property(handle: Int, key: String, value: Int):
     count := object_key_counts[handle]
@@ -808,13 +823,7 @@ fn json_restore(mark: JsonCheckpoint):
         integer_values.remove(node_id)
         float_values.remove(node_id)
         boolean_values.remove(node_id)
-        count := object_key_counts[node_id]
-        mut i := 0
-        while i < count:
-            slot := object_slot_key(node_id, i)
-            object_keys_by_slot.remove(slot)
-            object_values_by_slot.remove(slot)
-            i = i + 1
+        clear_object_entries(node_id)
         object_key_counts.remove(node_id)
         array_item_offsets.remove(node_id)
         array_item_counts.remove(node_id)
@@ -913,9 +922,8 @@ fn json_object_get(handle: Int, key: String) -> Int:
     # scan from end for latest value (handles duplicate keys from object_set)
     mut i := count - 1
     while i >= 0:
-        slot := object_slot_key(handle, i)
-        if object_keys_by_slot[slot] == key:
-            return object_values_by_slot[slot]
+        if object_slot_name(handle, i) == key:
+            return object_slot_value(handle, i)
         i = i - 1
     return 0 - 1
 
@@ -1037,14 +1045,12 @@ fn json_object_keys(handle: Int) -> List[String]:
     count := object_key_counts[handle]
     mut i := 0
     while i < count:
-        slot := object_slot_key(handle, i)
-        key := object_keys_by_slot[slot]
+        key := object_slot_name(handle, i)
         # skip duplicates — keep first occurrence only
         mut is_dup := false
         mut j := 0
         while j < i:
-            prev_slot := object_slot_key(handle, j)
-            if object_keys_by_slot[prev_slot] == key:
+            if object_slot_name(handle, j) == key:
                 is_dup = true
             j = j + 1
         if not is_dup:

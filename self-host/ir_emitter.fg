@@ -4489,11 +4489,10 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
             continue
         if optional_inner_tid >= 0:
             helper_name := ir_json_object_helper_name(optional_inner_tid)
-            has_name := ir_json_scalar_has_helper_name(optional_inner_tid)
-            if helper_name.len() == 0 or has_name.len() == 0:
+            if helper_name.len() == 0:
                 continue
             has_r := ir_reg()
-            ir_emit_call2(has_r, has_name, "bool", handle_r, key_r)
+            ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "object_has"), "bool", handle_r, key_r)
             present_l := ir_label()
             missing_l := ir_label()
             merge_l := ir_label()
@@ -4530,11 +4529,8 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
         if helper_name.len() == 0:
             continue
         if default_idx >= 0:
-            has_name := ir_json_scalar_has_helper_name(field_tid)
-            if has_name.len() == 0:
-                continue
             has_r := ir_reg()
-            ir_emit_call2(has_r, has_name, "bool", handle_r, key_r)
+            ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "object_has"), "bool", handle_r, key_r)
             present_l := ir_label()
             missing_l := ir_label()
             merge_l := ir_label()

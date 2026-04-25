@@ -61,11 +61,10 @@ mut integer_values: Map[Int, Int] := {}
 mut float_values: Map[Int, Float] := {}
 mut boolean_values: Map[Int, Bool] := {}
 
-# Object children: flat append-only storage with offset/count
-mut object_keys_flat: List[String] := []
-mut object_values_flat: List[Int] := []
-mut object_key_offsets: Map[Int, Int] := {}
+# Object children: per-object append-only storage keyed by object/id slot
 mut object_key_counts: Map[Int, Int] := {}
+mut object_keys_by_slot: Map[String, String] := {}
+mut object_values_by_slot: Map[String, Int] := {}
 
 # Array children: flat append-only storage with offset/count
 mut array_items_flat: List[Int] := []
@@ -81,19 +80,22 @@ fn allocate_node(kind: String) -> Int:
     integer_values.insert(node_id, 0)
     float_values.insert(node_id, 0.0)
     boolean_values.insert(node_id, false)
-    object_key_offsets.insert(node_id, 0)
     object_key_counts.insert(node_id, 0)
     array_item_offsets.insert(node_id, 0)
     array_item_counts.insert(node_id, 0)
     return node_id
 
+# object entries live under stable per-object slot keys so nested object parses
+# do not break parent lookups by interleaving child fields.
+fn object_slot_key(handle: Int, index: Int) -> String:
+    return handle.to_string() + ":" + index.to_string()
+
 # Sets a key-value pair on an object node
 fn set_object_property(handle: Int, key: String, value: Int):
     count := object_key_counts[handle]
-    if count == 0:
-        object_key_offsets.insert(handle, object_keys_flat.len())
-    object_keys_flat.push(key)
-    object_values_flat.push(value)
+    slot := object_slot_key(handle, count)
+    object_keys_by_slot.insert(slot, key)
+    object_values_by_slot.insert(slot, value)
     object_key_counts.insert(handle, count + 1)
 
 # Appends a value to an array node
@@ -792,7 +794,7 @@ pub fn checkpoint() -> JsonCheckpoint:
     return json_checkpoint()
 
 fn json_checkpoint() -> JsonCheckpoint:
-    return JsonCheckpoint(next_node_id, object_keys_flat.len(), array_items_flat.len())
+    return JsonCheckpoint(next_node_id, 0, array_items_flat.len())
 
  # restores parser state captured by checkpoint().
 pub fn restore(mark: JsonCheckpoint):
@@ -806,14 +808,17 @@ fn json_restore(mark: JsonCheckpoint):
         integer_values.remove(node_id)
         float_values.remove(node_id)
         boolean_values.remove(node_id)
-        object_key_offsets.remove(node_id)
+        count := object_key_counts[node_id]
+        mut i := 0
+        while i < count:
+            slot := object_slot_key(node_id, i)
+            object_keys_by_slot.remove(slot)
+            object_values_by_slot.remove(slot)
+            i = i + 1
         object_key_counts.remove(node_id)
         array_item_offsets.remove(node_id)
         array_item_counts.remove(node_id)
         node_id = node_id - 1
-    while object_keys_flat.len() > mark.object_entry_len:
-        object_keys_flat.remove(object_keys_flat.len() - 1)
-        object_values_flat.remove(object_values_flat.len() - 1)
     while array_items_flat.len() > mark.array_item_len:
         array_items_flat.remove(array_items_flat.len() - 1)
     next_node_id = mark.next_node_id
@@ -904,13 +909,13 @@ pub fn object_get(handle: Int, key: String) -> Int:
 fn json_object_get(handle: Int, key: String) -> Int:
     if not handle_has_type(handle, "object"):
         return 0 - 1
-    off := object_key_offsets[handle]
-    cnt := object_key_counts[handle]
+    count := object_key_counts[handle]
     # scan from end for latest value (handles duplicate keys from object_set)
-    mut i := cnt - 1
+    mut i := count - 1
     while i >= 0:
-        if object_keys_flat[off + i] == key:
-            return object_values_flat[off + i]
+        slot := object_slot_key(handle, i)
+        if object_keys_by_slot[slot] == key:
+            return object_values_by_slot[slot]
         i = i - 1
     return 0 - 1
 
@@ -1029,19 +1034,21 @@ fn json_object_keys(handle: Int) -> List[String]:
     mut result: List[String] := []
     if not handle_has_type(handle, "object"):
         return result
-    off := object_key_offsets[handle]
-    cnt := object_key_counts[handle]
+    count := object_key_counts[handle]
     mut i := 0
-    while i < cnt:
+    while i < count:
+        slot := object_slot_key(handle, i)
+        key := object_keys_by_slot[slot]
         # skip duplicates — keep first occurrence only
         mut is_dup := false
         mut j := 0
         while j < i:
-            if object_keys_flat[off + j] == object_keys_flat[off + i]:
+            prev_slot := object_slot_key(handle, j)
+            if object_keys_by_slot[prev_slot] == key:
                 is_dup = true
             j = j + 1
         if not is_dup:
-            result.push(object_keys_flat[off + i])
+            result.push(key)
         i = i + 1
     return result
 
@@ -1468,6 +1475,18 @@ test "json constructors encode objects":
     expected = expected + chr(34) + "fast" + chr(34) + "," + chr(34) + "small" + chr(34) + "]" + chr(125)
 
     assert_eq(encode(obj), expected)
+
+test "json keeps nested object fields on the right object":
+    dq := chr(34)
+    mut doc := chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq
+    doc = doc + "," + dq + "server" + dq + ":" + chr(123)
+    doc = doc + dq + "host" + dq + ":" + dq + "edge" + dq + chr(125) + chr(125)
+    root := parse(doc)
+    server := object_require_object(root, "server")!
+
+    assert_eq(object_get_string(root, "name"), "forge")
+    assert(not object_has(root, "host"))
+    assert_eq(object_get_string(server, "host"), "edge")
 
 test "json small object scanners find shallow values":
     dq := chr(34)

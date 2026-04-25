@@ -30,6 +30,15 @@ struct JsonDerivedDefaultFixture:
     pub region: String = "local"
     pub active: Bool = false
 
+struct JsonDerivedNestedDefaultServer:
+    pub host: String
+    pub port: Int = 8080
+    pub tls: Bool = false
+
+struct JsonDerivedNestedDefaultApp:
+    pub name: String
+    pub server: JsonDerivedNestedDefaultServer = JsonDerivedNestedDefaultServer("localhost")
+
 fn main() -> Int!:
     dq := chr(34)
     mut doc := chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq
@@ -74,6 +83,15 @@ fn main() -> Int!:
     defaulted := json.decode_text[JsonDerivedDefaultFixture](default_doc)
     if defaulted.is_ok:
         print(defaulted.ok.name + ":" + defaulted.ok.region + ":" + defaulted.ok.active.to_string())
+
+    nested_default_missing_doc := chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq + chr(125)
+    nested_default_partial_doc := chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq + "," + dq + "server" + dq + ":" + chr(123) + dq + "host" + dq + ":" + dq + "edge" + dq + chr(125) + chr(125)
+    nested_default_missing := json.decode_text[JsonDerivedNestedDefaultApp](nested_default_missing_doc)
+    nested_default_partial := json.decode_text[JsonDerivedNestedDefaultApp](nested_default_partial_doc)
+    if nested_default_missing.is_ok:
+        print(nested_default_missing.ok.name + ":" + nested_default_missing.ok.server.host + ":" + nested_default_missing.ok.server.port.to_string() + ":" + nested_default_missing.ok.server.tls.to_string())
+    if nested_default_partial.is_ok:
+        print(nested_default_partial.ok.name + ":" + nested_default_partial.ok.server.host + ":" + nested_default_partial.ok.server.port.to_string() + ":" + nested_default_partial.ok.server.tls.to_string())
 
     nested_doc := chr(123) + dq + "server" + dq + ":" + chr(123) + dq + "host" + dq + ":" + dq + "localhost" + dq + "," + dq + "port" + dq + ":8080" + chr(125) + chr(125)
     nested_root := json.parse(nested_doc)

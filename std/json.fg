@@ -755,6 +755,12 @@ pub fn decode[T](input: Bytes) -> T!JsonDecodeError:
 pub fn decode_text[T](input: String) -> T!JsonDecodeError:
     fail JsonDecodeError("json.decode_text requires compiler support")
 
+pub fn parse_bytes_required(input: Bytes) -> Int!JsonDecodeError:
+    text := bytes.decode_utf8(input)
+    if text.is_err:
+        fail JsonDecodeError(text.err.message)
+    return parse(text.ok)
+
  # decodes a parsed json object handle into a concrete struct.
  # this is lowered by the compiler so structs do not need runtime reflection.
 pub fn decode_object[T](handle: Int) -> T!JsonDecodeError:

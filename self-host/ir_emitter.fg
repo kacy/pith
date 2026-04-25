@@ -76,6 +76,7 @@ mut ir_global_bool_names: List[String] := []
 mut ir_struct_names: Map[String, Int] := {} # struct name -> field count
 mut ir_struct_field_lookup: Map[String, String] := {} # "Struct.field" -> field type
 mut ir_struct_field_index_lookup: Map[String, String] := {} # "Struct.field" -> field index string
+mut ir_struct_decl_nodes: Map[String, Int] := {} # struct name -> declaration node idx
 mut ir_struct_field_default_nodes: Map[String, Int] := {} # "Struct.field" -> default expr node idx
 mut ir_type_aliases: Map[String, String] := {} # alias name -> target type
 mut ir_last_was_ret := false # tracks if the last emitted instruction was a return
@@ -188,8 +189,10 @@ fn ir_reset_global_state():
     ir_global_bool_names = []
 
 fn ir_reset_type_state():
+    ir_struct_names = {}
     ir_struct_field_lookup = {}
     ir_struct_field_index_lookup = {}
+    ir_struct_decl_nodes = {}
     ir_struct_field_default_nodes = {}
     ir_impl_methods = {}
     ir_import_renames = {}
@@ -1195,8 +1198,9 @@ fn ir_record_struct_field(struct_name: String, field_names: List[String], field_
     ir_struct_field_index_lookup.insert(struct_name + "." + field_name, field_index.to_string())
     return updated_fields
 
-fn ir_collect_struct_decl(node: Node, emit_decl: Bool):
+fn ir_collect_struct_decl(node_idx: Int, node: Node, emit_decl: Bool):
     sname := ir_declared_struct_name(node)
+    ir_struct_decl_nodes.insert(sname, node_idx)
     mut field_names: List[String] := []
     for child in node.children:
         field_node := ir_unwrap_pub_node(child)
@@ -1224,7 +1228,7 @@ fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool):
     for item_idx in ir_root_items(root_idx):
         cn := get_node(item_idx)
         if cn.kind == "struct_decl" or cn.kind == "struct":
-            ir_collect_struct_decl(cn, emit_decl)
+            ir_collect_struct_decl(item_idx, cn, emit_decl)
         elif cn.kind == "enum_decl" or cn.kind == "enum":
             ir_collect_enum_decl(cn, emit_decl)
 
@@ -2272,6 +2276,111 @@ fn ir_toml_require_helper_name(field_tid: Int) -> String:
             return "std_toml_require_bool"
     return ""
 
+fn ir_struct_decode_field_tid(field_tid: Int) -> Int:
+    info := get_type_info(field_tid)
+    if info.kind == "struct":
+        return field_tid
+    return 0 - 1
+
+fn ir_generic_preferred_name(preferred: String, fallback: String) -> String:
+    if ir_generic_decl_indices.contains_key(preferred):
+        return preferred
+    return fallback
+
+fn ir_json_generic_name(base_name: String) -> String:
+    return ir_generic_preferred_name("std_json_" + base_name, base_name)
+
+fn ir_config_generic_name(base_name: String) -> String:
+    return ir_generic_preferred_name("std_config_" + base_name, base_name)
+
+fn ir_toml_generic_name(base_name: String, module_path: String) -> String:
+    preferred := ir_resolve_generic_module_call_name(module_path, base_name)
+    return ir_generic_preferred_name(preferred, base_name)
+
+fn ir_emit_json_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid: Int, index_idx: Int) -> Int:
+    child_result_r := ir_reg()
+    ir_emit_call2(child_result_r, ir_resolve_json_call_name(index_idx, "object_require_object"), "tuple", parent_handle_r, key_r)
+    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
+    child_ok_l := ir_label()
+    child_err_l := ir_label()
+    done_l := ir_label()
+    temp_name := ir_new_temp_name("json_nested_decode")
+    ir_var_types.insert(temp_name, "tuple")
+    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
+    ir_emit("label " + child_err_l)
+    ir_emit("store " + temp_name + " " + child_result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + child_ok_l)
+    child_handle_r := ir_emit_result_value_field(child_result_r, lookup_type_id("Int"), "ok")
+    decode_name := ir_generic_preferred_name(ir_resolve_json_call_name(index_idx, "decode_object"), "decode_object")
+    decode_result_r := ir_reg()
+    ir_emit_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", child_handle_r)
+    ir_emit("store " + temp_name + " " + decode_result_r.to_string())
+    ir_emit("label " + done_l)
+    result_r := ir_reg()
+    ir_emit("load " + result_r.to_string() + " " + temp_name)
+    return result_r
+
+fn ir_emit_config_nested_decode_prefix(cfg_r: Int, prefix_r: Int, target_tid: Int, index_idx: Int) -> Int:
+    decode_name := ir_generic_preferred_name(ir_resolve_config_call_name(index_idx, "decode_prefix"), "decode_prefix")
+    result_r := ir_reg()
+    ir_emit_call2(result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", cfg_r, prefix_r)
+    return result_r
+
+fn ir_emit_config_nested_decode_prefix_specialized(cfg_r: Int, prefix_r: Int, target_tid: Int) -> Int:
+    decode_name := ir_config_generic_name("decode_prefix")
+    result_r := ir_reg()
+    ir_emit_call2(result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", cfg_r, prefix_r)
+    return result_r
+
+fn ir_emit_toml_nested_decode_path(handle_r: Int, key_r: Int, target_tid: Int, index_idx: Int) -> Int:
+    child_result_r := ir_reg()
+    ir_emit_call2(child_result_r, ir_resolve_toml_call_name(index_idx, "toml_require_table"), "tuple", handle_r, key_r)
+    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
+    child_ok_l := ir_label()
+    child_err_l := ir_label()
+    done_l := ir_label()
+    temp_name := ir_new_temp_name("toml_nested_decode")
+    ir_var_types.insert(temp_name, "tuple")
+    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
+    ir_emit("label " + child_err_l)
+    ir_emit("store " + temp_name + " " + child_result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + child_ok_l)
+    child_handle_r := ir_emit_result_value_field(child_result_r, lookup_type_id("Int"), "ok")
+    decode_name := ir_generic_preferred_name(ir_resolve_toml_call_name(index_idx, "decode"), "decode")
+    decode_result_r := ir_reg()
+    ir_emit_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", child_handle_r)
+    ir_emit("store " + temp_name + " " + decode_result_r.to_string())
+    ir_emit("label " + done_l)
+    result_r := ir_reg()
+    ir_emit("load " + result_r.to_string() + " " + temp_name)
+    return result_r
+
+fn ir_emit_toml_nested_decode_path_specialized(handle_r: Int, key_r: Int, target_tid: Int, module_path: String) -> Int:
+    child_result_r := ir_reg()
+    ir_emit_call2(child_result_r, ir_resolve_generic_module_call_name(module_path, "toml_require_table"), "tuple", handle_r, key_r)
+    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
+    child_ok_l := ir_label()
+    child_err_l := ir_label()
+    done_l := ir_label()
+    temp_name := ir_new_temp_name("toml_nested_decode")
+    ir_var_types.insert(temp_name, "tuple")
+    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
+    ir_emit("label " + child_err_l)
+    ir_emit("store " + temp_name + " " + child_result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + child_ok_l)
+    child_handle_r := ir_emit_result_value_field(child_result_r, lookup_type_id("Int"), "ok")
+    decode_name := ir_toml_generic_name("decode", module_path)
+    decode_result_r := ir_reg()
+    ir_emit_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", child_handle_r)
+    ir_emit("store " + temp_name + " " + decode_result_r.to_string())
+    ir_emit("label " + done_l)
+    result_r := ir_reg()
+    ir_emit("load " + result_r.to_string() + " " + temp_name)
+    return result_r
+
 fn ir_json_field_type_tag(field_tid: Int) -> Int:
     info := get_type_info(field_tid)
     if info.kind == "primitive":
@@ -2303,6 +2412,15 @@ fn ir_struct_has_optional_fields(target_info: TypeInfo) -> Bool:
 fn ir_struct_has_default_fields(target_info: TypeInfo) -> Bool:
     for field_name in target_info.fields:
         if ir_struct_field_default_node(target_info.name, field_name) >= 0:
+            return true
+    return false
+
+fn ir_struct_has_nested_decode_fields(target_info: TypeInfo) -> Bool:
+    for field_tid in target_info.field_types:
+        if ir_struct_decode_field_tid(field_tid) >= 0:
+            return true
+        optional_inner_tid := ir_optional_inner_tid(field_tid)
+        if optional_inner_tid >= 0 and ir_struct_decode_field_tid(optional_inner_tid) >= 0:
             return true
     return false
 
@@ -2372,6 +2490,11 @@ fn ir_struct_field_count(struct_name: String) -> Int:
     return 0
 
 fn ir_struct_field_name_at(struct_name: String, field_index: Int) -> String:
+    struct_tid := lookup_type_id(struct_name)
+    if struct_tid >= 0:
+        struct_info := get_type_info(struct_tid)
+        if struct_info.kind == "struct" and field_index >= 0 and field_index < struct_info.fields.len():
+            return struct_info.fields[field_index]
     prefix := ir_struct_layout_name(struct_name) + "."
     want := field_index.to_string()
     for key in ir_struct_field_index_lookup:
@@ -2384,6 +2507,56 @@ fn ir_struct_field_type_name(struct_name: String, field_name: String) -> String:
     if ir_struct_field_lookup.contains_key(key):
         return ir_struct_field_lookup[key]
     return ""
+
+fn ir_struct_field_kind_from_decl(struct_name: String, field_index: Int) -> String:
+    layout_name := ir_struct_layout_name(struct_name)
+    if not ir_struct_decl_nodes.contains_key(layout_name):
+        return ""
+    decl := get_node(ir_struct_decl_nodes[layout_name])
+    mut current_index := 0
+    for child in decl.children:
+        field_node := ir_unwrap_pub_node(child)
+        if field_node.kind != "field":
+            continue
+        if current_index == field_index:
+            if field_node.children.len() > 0:
+                return ir_resolve_type_node(field_node.children[0])
+            return ""
+        current_index = current_index + 1
+    return ""
+
+fn ir_field_kind_tid(kind: String) -> Int:
+    if kind == "int":
+        return 0
+    if kind == "float":
+        return 2
+    if kind == "bool":
+        return 3
+    if kind == "string":
+        return 4
+    if kind == "bytes":
+        return 5
+    if kind == "void":
+        return 6
+    if ir_struct_names.contains_key(kind):
+        return lookup_type_id(kind)
+    return -1
+
+fn ir_struct_field_tid_at(struct_name: String, field_index: Int, fallback_tid: Int) -> Int:
+    mut field_kind := ir_struct_field_kind_from_decl(struct_name, field_index)
+    if field_kind.len() == 0:
+        field_name := ir_struct_field_name_at(struct_name, field_index)
+        field_kind = ir_struct_field_type_name(struct_name, field_name)
+    if field_kind.len() == 0:
+        return fallback_tid
+    field_tid := ir_field_kind_tid(field_kind)
+    if field_tid < 0:
+        return fallback_tid
+    if fallback_tid < 0:
+        return field_tid
+    if ir_type_from_tid(fallback_tid) != field_kind:
+        return field_tid
+    return fallback_tid
 
 fn ir_struct_field_default_node(struct_name: String, field_name: String) -> Int:
     key := ir_struct_layout_name(struct_name) + "." + field_name
@@ -2421,10 +2594,87 @@ fn ir_emit_config_decode_specialization_body(struct_name: String, prefixed: Bool
     mut i := 0
     while i < field_count:
         field_name := ir_struct_field_name_at(struct_name, i)
-        field_tid := struct_info.field_types[i]
+        field_tid := ir_struct_field_tid_at(struct_name, i, struct_info.field_types[i])
         default_idx := ir_struct_field_default_node(struct_name, field_name)
         optional_inner_tid := ir_optional_inner_tid(field_tid)
         full_key_r := ir_emit_config_specialized_field_key(field_name, prefix_r)
+        mut optional_struct_tid := 0 - 1
+        if optional_inner_tid >= 0:
+            optional_struct_tid = ir_struct_decode_field_tid(optional_inner_tid)
+        if optional_struct_tid >= 0:
+            has_r := ir_reg()
+            ir_emit_call2(has_r, "std_config_has_prefix", "bool", cfg_r, full_key_r)
+            present_l := ir_label()
+            missing_l := ir_label()
+            merge_l := ir_label()
+            field_temp := ir_new_temp_name("config_spec_optional_struct_field")
+            ir_var_types.insert(field_temp, "tuple")
+            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+            ir_emit("label " + missing_l)
+            if default_idx >= 0:
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
+            else:
+                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + present_l)
+            field_result_r := ir_emit_config_nested_decode_prefix_specialized(cfg_r, full_key_r, optional_struct_tid)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("ret " + field_result_r.to_string())
+            ir_emit("label " + ok_l)
+            ir_emit("store " + field_temp + " " + ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)).to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + merge_l)
+            loaded_r := ir_reg()
+            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+            field_regs.push(loaded_r)
+            i = i + 1
+            continue
+        nested_struct_tid := ir_struct_decode_field_tid(field_tid)
+        if nested_struct_tid >= 0:
+            if default_idx >= 0:
+                has_r := ir_reg()
+                ir_emit_call2(has_r, "std_config_has_prefix", "bool", cfg_r, full_key_r)
+                present_l := ir_label()
+                missing_l := ir_label()
+                merge_l := ir_label()
+                field_temp := ir_new_temp_name("config_spec_default_struct_field")
+                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
+                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+                ir_emit("label " + missing_l)
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + present_l)
+                field_result_r := ir_emit_config_nested_decode_prefix_specialized(cfg_r, full_key_r, nested_struct_tid)
+                ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+                ok_l := ir_label()
+                err_l := ir_label()
+                ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+                ir_emit("label " + err_l)
+                ir_emit("ret " + field_result_r.to_string())
+                ir_emit("label " + ok_l)
+                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + merge_l)
+                loaded_r := ir_reg()
+                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+                field_regs.push(loaded_r)
+                i = i + 1
+                continue
+            field_result_r := ir_emit_config_nested_decode_prefix_specialized(cfg_r, full_key_r, nested_struct_tid)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("ret " + field_result_r.to_string())
+            ir_emit("label " + ok_l)
+            field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
+            i = i + 1
+            continue
         if optional_inner_tid >= 0:
             helper_name := ir_config_require_full_name_for_type_name(ir_type_from_tid(optional_inner_tid))
             if helper_name.len() == 0:
@@ -2550,11 +2800,11 @@ fn ir_is_config_decode_specialization(base_name: String, prefixed: Bool, module_
 fn ir_toml_require_full_name_for_type_name(type_name: String, module_path: String) -> String:
     resolved := ir_resolve_type_hint(type_name)
     if resolved == "string":
-        return ir_resolve_generic_module_call_name(module_path, "toml_require_string")
+        return ir_resolve_generic_module_call_name(module_path, "require_string")
     if resolved == "int":
-        return ir_resolve_generic_module_call_name(module_path, "toml_require_int")
+        return ir_resolve_generic_module_call_name(module_path, "require_int")
     if resolved == "bool":
-        return ir_resolve_generic_module_call_name(module_path, "toml_require_bool")
+        return ir_resolve_generic_module_call_name(module_path, "require_bool")
     return ""
 
 fn ir_is_toml_decode_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
@@ -2580,19 +2830,130 @@ fn ir_is_toml_decode_text_path_specialization(base_name: String, module_path: St
         return true
     return base_name == "decode_text_path" and local_std_toml and first_param == "input" and second_param == "dotted_path"
 
+fn ir_is_toml_decode_text_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
+    local_std_toml := module_path == "" or module_path == "std.toml"
+    first_param := ir_param_name_at(decl_idx, 0)
+    if base_name == "std_toml_decode_text":
+        return true
+    return base_name == "decode_text" and local_std_toml and first_param == "input"
+
+fn ir_is_json_decode_object_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
+    local_std_json := module_path == "" or module_path == "std.json"
+    first_param := ir_param_name_at(decl_idx, 0)
+    if base_name == "std_json_decode_object":
+        return true
+    return base_name == "decode_object" and local_std_json and first_param == "handle"
+
+fn ir_is_json_decode_specialization(base_name: String, module_path: String, decl_idx: Int, text_input: Bool) -> Bool:
+    local_std_json := module_path == "" or module_path == "std.json"
+    first_param := ir_param_name_at(decl_idx, 0)
+    if text_input:
+        if base_name == "std_json_decode_text":
+            return true
+        return base_name == "decode_text" and local_std_json and first_param == "input"
+    if base_name == "std_json_decode":
+        return true
+    return base_name == "decode" and local_std_json and first_param == "input"
+
+fn ir_is_json_decode_path_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
+    local_std_json := module_path == "" or module_path == "std.json"
+    first_param := ir_param_name_at(decl_idx, 0)
+    second_param := ir_param_name_at(decl_idx, 1)
+    if base_name == "std_json_decode_path":
+        return true
+    return base_name == "decode_path" and local_std_json and first_param == "handle" and second_param == "dotted_path"
+
 fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: Int, index_idx: Int, temp_name: String, done_l: String):
     mut field_regs: List[Int] := []
     for field_name, i in target_info.fields:
         if i >= target_info.field_types.len():
             continue
-        field_tid := target_info.field_types[i]
+        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
         default_idx := ir_struct_field_default_node(target_info.name, field_name)
         optional_inner_tid := ir_optional_inner_tid(field_tid)
+        full_key_r := ir_emit_config_field_key(field_name, prefix_r, index_idx)
+        mut optional_struct_tid := 0 - 1
+        if optional_inner_tid >= 0:
+            optional_struct_tid = ir_struct_decode_field_tid(optional_inner_tid)
+        if optional_struct_tid >= 0:
+            has_r := ir_reg()
+            ir_emit_call2(has_r, ir_resolve_config_call_name(index_idx, "has_prefix"), "bool", cfg_r, full_key_r)
+            present_l := ir_label()
+            missing_l := ir_label()
+            merge_l := ir_label()
+            field_temp := ir_new_temp_name("config_optional_struct_field")
+            ir_var_types.insert(field_temp, "tuple")
+            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+            ir_emit("label " + missing_l)
+            if default_idx >= 0:
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
+            else:
+                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + present_l)
+            field_result_r := ir_emit_config_nested_decode_prefix(cfg_r, full_key_r, optional_struct_tid, index_idx)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("store " + temp_name + " " + field_result_r.to_string())
+            ir_emit("jmp " + done_l)
+            ir_emit("label " + ok_l)
+            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid))
+            ir_emit("store " + field_temp + " " + some_r.to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + merge_l)
+            loaded_r := ir_reg()
+            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+            field_regs.push(loaded_r)
+            continue
+        nested_struct_tid := ir_struct_decode_field_tid(field_tid)
+        if nested_struct_tid >= 0:
+            if default_idx >= 0:
+                has_r := ir_reg()
+                ir_emit_call2(has_r, ir_resolve_config_call_name(index_idx, "has_prefix"), "bool", cfg_r, full_key_r)
+                present_l := ir_label()
+                missing_l := ir_label()
+                merge_l := ir_label()
+                field_temp := ir_new_temp_name("config_default_struct_field")
+                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
+                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+                ir_emit("label " + missing_l)
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + present_l)
+                field_result_r := ir_emit_config_nested_decode_prefix(cfg_r, full_key_r, nested_struct_tid, index_idx)
+                ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+                ok_l := ir_label()
+                err_l := ir_label()
+                ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+                ir_emit("label " + err_l)
+                ir_emit("store " + temp_name + " " + field_result_r.to_string())
+                ir_emit("jmp " + done_l)
+                ir_emit("label " + ok_l)
+                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + merge_l)
+                loaded_r := ir_reg()
+                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+                field_regs.push(loaded_r)
+                continue
+            field_result_r := ir_emit_config_nested_decode_prefix(cfg_r, full_key_r, nested_struct_tid, index_idx)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("store " + temp_name + " " + field_result_r.to_string())
+            ir_emit("jmp " + done_l)
+            ir_emit("label " + ok_l)
+            field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
+            continue
         if optional_inner_tid >= 0:
             helper_name := ir_config_require_helper_name(optional_inner_tid)
             if helper_name.len() == 0:
                 continue
-            full_key_r := ir_emit_config_field_key(field_name, prefix_r, index_idx)
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_config_call_name(index_idx, "has"), "bool", cfg_r, full_key_r)
             present_l := ir_label()
@@ -2630,7 +2991,6 @@ fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: Int,
         if helper_name.len() == 0:
             continue
         if default_idx >= 0:
-            full_key_r := ir_emit_config_field_key(field_name, prefix_r, index_idx)
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_config_call_name(index_idx, "has"), "bool", cfg_r, full_key_r)
             present_l := ir_label()
@@ -2660,7 +3020,6 @@ fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: Int,
             ir_emit("load " + loaded_r.to_string() + " " + field_temp)
             field_regs.push(loaded_r)
             continue
-        full_key_r := ir_emit_config_field_key(field_name, prefix_r, index_idx)
         field_result_r := ir_reg()
         ir_emit_call2(field_result_r, ir_resolve_config_call_name(index_idx, helper_name), "tuple", cfg_r, full_key_r)
         ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
@@ -2685,11 +3044,6 @@ fn ir_emit_toml_decode_struct_from_handle(struct_name: String, module_path: Stri
     if not ir_struct_names.contains_key(struct_name):
         ir_emit_default_return()
         return
-    struct_tid := lookup_type_id(struct_name)
-    if struct_tid < 0:
-        ir_emit_default_return()
-        return
-    struct_info := get_type_info(struct_tid)
     handle_r := ir_reg()
     ir_emit("load " + handle_r.to_string() + " " + handle_name)
 
@@ -2698,11 +3052,88 @@ fn ir_emit_toml_decode_struct_from_handle(struct_name: String, module_path: Stri
     mut i := 0
     while i < field_count:
         field_name := ir_struct_field_name_at(struct_name, i)
-        field_tid := struct_info.field_types[i]
+        field_tid := ir_struct_field_tid_at(struct_name, i, -1)
         default_idx := ir_struct_field_default_node(struct_name, field_name)
         optional_inner_tid := ir_optional_inner_tid(field_tid)
         key_r := ir_reg()
         ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
+        mut optional_struct_tid := 0 - 1
+        if optional_inner_tid >= 0:
+            optional_struct_tid = ir_struct_decode_field_tid(optional_inner_tid)
+        if optional_struct_tid >= 0:
+            has_r := ir_reg()
+            ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
+            present_l := ir_label()
+            missing_l := ir_label()
+            merge_l := ir_label()
+            field_temp := ir_new_temp_name("toml_spec_optional_struct_field")
+            ir_var_types.insert(field_temp, "tuple")
+            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+            ir_emit("label " + missing_l)
+            if default_idx >= 0:
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
+            else:
+                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + present_l)
+            field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, optional_struct_tid, module_path)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("ret " + field_result_r.to_string())
+            ir_emit("label " + ok_l)
+            ir_emit("store " + field_temp + " " + ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)).to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + merge_l)
+            loaded_r := ir_reg()
+            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+            field_regs.push(loaded_r)
+            i = i + 1
+            continue
+        nested_struct_tid := ir_struct_decode_field_tid(field_tid)
+        if nested_struct_tid >= 0:
+            if default_idx >= 0:
+                has_r := ir_reg()
+                ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
+                present_l := ir_label()
+                missing_l := ir_label()
+                merge_l := ir_label()
+                field_temp := ir_new_temp_name("toml_spec_default_struct_field")
+                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
+                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+                ir_emit("label " + missing_l)
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + present_l)
+                field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
+                ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+                ok_l := ir_label()
+                err_l := ir_label()
+                ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+                ir_emit("label " + err_l)
+                ir_emit("ret " + field_result_r.to_string())
+                ir_emit("label " + ok_l)
+                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + merge_l)
+                loaded_r := ir_reg()
+                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+                field_regs.push(loaded_r)
+                i = i + 1
+                continue
+            field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("ret " + field_result_r.to_string())
+            ir_emit("label " + ok_l)
+            field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
+            i = i + 1
+            continue
         if optional_inner_tid >= 0:
             helper_name := ir_toml_require_full_name_for_type_name(ir_type_from_tid(optional_inner_tid), module_path)
             if helper_name.len() == 0:
@@ -2872,6 +3303,26 @@ fn ir_emit_toml_decode_path_specialization_body(struct_name: String, module_path
     ir_emit("label " + done_l)
     ir_emit_toml_decode_struct_from_handle(struct_name, module_path, "current")
 
+fn ir_emit_toml_decode_text_specialization_body(struct_name: String, module_path: String, concrete_types: List[String], ret_type: String):
+    input_r := ir_reg()
+    ir_emit("load " + input_r.to_string() + " input")
+    parse_result_r := ir_reg()
+    ir_emit_call1(parse_result_r, ir_resolve_generic_module_call_name(module_path, "parse_required"), "tuple", input_r)
+    parse_ok_r := ir_emit_result_flag_field(parse_result_r, "is_ok")
+    parse_ok_l := ir_label()
+    parse_err_l := ir_label()
+    ir_emit("brif " + parse_ok_r.to_string() + " " + parse_ok_l + " " + parse_err_l)
+    ir_emit("label " + parse_err_l)
+    ir_emit("ret " + parse_result_r.to_string())
+    ir_emit("label " + parse_ok_l)
+    root_r := ir_emit_result_ok_field_typed(parse_result_r, "Int")
+    decode_base := ir_resolve_generic_module_call_name(module_path, "decode")
+    decode_name := ir_queue_generic_specialization(decode_base, concrete_types, ret_type)
+    decode_result_r := ir_reg()
+    ir_emit_call1(decode_result_r, decode_name, "tuple", root_r)
+    ir_emit("ret " + decode_result_r.to_string())
+    ir_emit("endfunc")
+
 fn ir_emit_toml_decode_text_path_specialization_body(struct_name: String, module_path: String, concrete_types: List[String], ret_type: String):
     input_r := ir_reg()
     ir_emit("load " + input_r.to_string() + " input")
@@ -3015,15 +3466,93 @@ fn ir_emit_toml_decode_value(target_info: TypeInfo, handle_r: Int, index_idx: In
     for field_name, i in target_info.fields:
         if i >= target_info.field_types.len():
             continue
-        field_tid := target_info.field_types[i]
+        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
         default_idx := ir_struct_field_default_node(target_info.name, field_name)
         optional_inner_tid := ir_optional_inner_tid(field_tid)
+        key_r := ir_reg()
+        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
+        mut optional_struct_tid := 0 - 1
+        if optional_inner_tid >= 0:
+            optional_struct_tid = ir_struct_decode_field_tid(optional_inner_tid)
+        if optional_struct_tid >= 0:
+            has_r := ir_reg()
+            ir_emit_call2(has_r, ir_resolve_toml_call_name(index_idx, "has"), "bool", handle_r, key_r)
+            present_l := ir_label()
+            missing_l := ir_label()
+            merge_l := ir_label()
+            field_temp := ir_new_temp_name("toml_optional_struct_field")
+            ir_var_types.insert(field_temp, "tuple")
+            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+            ir_emit("label " + missing_l)
+            if default_idx >= 0:
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
+            else:
+                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + present_l)
+            field_result_r := ir_emit_toml_nested_decode_path(handle_r, key_r, optional_struct_tid, index_idx)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("store " + temp_name + " " + field_result_r.to_string())
+            ir_emit("jmp " + done_l)
+            ir_emit("label " + ok_l)
+            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid))
+            ir_emit("store " + field_temp + " " + some_r.to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + merge_l)
+            loaded_r := ir_reg()
+            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+            field_regs.push(loaded_r)
+            continue
+        nested_struct_tid := ir_struct_decode_field_tid(field_tid)
+        if nested_struct_tid >= 0:
+            if default_idx >= 0:
+                has_r := ir_reg()
+                ir_emit_call2(has_r, ir_resolve_toml_call_name(index_idx, "has"), "bool", handle_r, key_r)
+                present_l := ir_label()
+                missing_l := ir_label()
+                merge_l := ir_label()
+                field_temp := ir_new_temp_name("toml_default_struct_field")
+                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
+                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+                ir_emit("label " + missing_l)
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + present_l)
+                field_result_r := ir_emit_toml_nested_decode_path(handle_r, key_r, nested_struct_tid, index_idx)
+                ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+                ok_l := ir_label()
+                err_l := ir_label()
+                ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+                ir_emit("label " + err_l)
+                ir_emit("store " + temp_name + " " + field_result_r.to_string())
+                ir_emit("jmp " + done_l)
+                ir_emit("label " + ok_l)
+                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + merge_l)
+                loaded_r := ir_reg()
+                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+                field_regs.push(loaded_r)
+                continue
+            field_result_r := ir_emit_toml_nested_decode_path(handle_r, key_r, nested_struct_tid, index_idx)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("store " + temp_name + " " + field_result_r.to_string())
+            ir_emit("jmp " + done_l)
+            ir_emit("label " + ok_l)
+            field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
+            continue
         if optional_inner_tid >= 0:
             helper_name := ir_toml_require_helper_name(optional_inner_tid)
             if helper_name.len() == 0:
                 continue
-            key_r := ir_reg()
-            ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_toml_call_name(index_idx, "has"), "bool", handle_r, key_r)
             present_l := ir_label()
@@ -3061,8 +3590,6 @@ fn ir_emit_toml_decode_value(target_info: TypeInfo, handle_r: Int, index_idx: In
         if helper_name.len() == 0:
             continue
         if default_idx >= 0:
-            key_r := ir_reg()
-            ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_toml_call_name(index_idx, "has"), "bool", handle_r, key_r)
             present_l := ir_label()
@@ -3092,8 +3619,6 @@ fn ir_emit_toml_decode_value(target_info: TypeInfo, handle_r: Int, index_idx: In
             ir_emit("load " + loaded_r.to_string() + " " + field_temp)
             field_regs.push(loaded_r)
             continue
-        key_r := ir_reg()
-        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
         field_result_r := ir_reg()
         ir_emit_call2(field_result_r, ir_resolve_toml_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
         ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
@@ -3438,7 +3963,7 @@ fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo) -> Int:
     for field_name, i in target_info.fields:
         if i >= target_info.field_types.len():
             continue
-        field_tid := target_info.field_types[i]
+        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
         default_idx := ir_struct_field_default_node(target_info.name, field_name)
         optional_inner_tid := ir_optional_inner_tid(field_tid)
         if optional_inner_tid >= 0:
@@ -3550,15 +4075,93 @@ fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, index_
     for field_name, i in target_info.fields:
         if i >= target_info.field_types.len():
             continue
-        field_tid := target_info.field_types[i]
+        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
         default_idx := ir_struct_field_default_node(target_info.name, field_name)
         optional_inner_tid := ir_optional_inner_tid(field_tid)
+        key_r := ir_reg()
+        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
+        mut optional_struct_tid := 0 - 1
+        if optional_inner_tid >= 0:
+            optional_struct_tid = ir_struct_decode_field_tid(optional_inner_tid)
+        if optional_struct_tid >= 0:
+            has_r := ir_reg()
+            ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
+            present_l := ir_label()
+            missing_l := ir_label()
+            merge_l := ir_label()
+            field_temp := ir_new_temp_name("json_object_optional_struct_field")
+            ir_var_types.insert(field_temp, "tuple")
+            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+            ir_emit("label " + missing_l)
+            if default_idx >= 0:
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
+            else:
+                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + present_l)
+            field_result_r := ir_emit_json_nested_decode_path(handle_r, key_r, optional_struct_tid, index_idx)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("store " + temp_name + " " + field_result_r.to_string())
+            ir_emit("jmp " + done_l)
+            ir_emit("label " + ok_l)
+            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid))
+            ir_emit("store " + field_temp + " " + some_r.to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + merge_l)
+            loaded_r := ir_reg()
+            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+            field_regs.push(loaded_r)
+            continue
+        nested_struct_tid := ir_struct_decode_field_tid(field_tid)
+        if nested_struct_tid >= 0:
+            if default_idx >= 0:
+                has_r := ir_reg()
+                ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
+                present_l := ir_label()
+                missing_l := ir_label()
+                merge_l := ir_label()
+                field_temp := ir_new_temp_name("json_object_default_struct_field")
+                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
+                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+                ir_emit("label " + missing_l)
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + present_l)
+                field_result_r := ir_emit_json_nested_decode_path(handle_r, key_r, nested_struct_tid, index_idx)
+                ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+                ok_l := ir_label()
+                err_l := ir_label()
+                ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+                ir_emit("label " + err_l)
+                ir_emit("store " + temp_name + " " + field_result_r.to_string())
+                ir_emit("jmp " + done_l)
+                ir_emit("label " + ok_l)
+                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + merge_l)
+                loaded_r := ir_reg()
+                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+                field_regs.push(loaded_r)
+                continue
+            field_result_r := ir_emit_json_nested_decode_path(handle_r, key_r, nested_struct_tid, index_idx)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("store " + temp_name + " " + field_result_r.to_string())
+            ir_emit("jmp " + done_l)
+            ir_emit("label " + ok_l)
+            field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
+            continue
         if optional_inner_tid >= 0:
             helper_name := ir_json_object_helper_name(optional_inner_tid)
             if helper_name.len() == 0:
                 continue
-            key_r := ir_reg()
-            ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
             present_l := ir_label()
@@ -3596,8 +4199,6 @@ fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, index_
         if helper_name.len() == 0:
             continue
         if default_idx >= 0:
-            key_r := ir_reg()
-            ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
             present_l := ir_label()
@@ -3627,8 +4228,6 @@ fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, index_
             ir_emit("load " + loaded_r.to_string() + " " + field_temp)
             field_regs.push(loaded_r)
             continue
-        key_r := ir_reg()
-        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
         field_result_r := ir_reg()
         ir_emit_call2(field_result_r, ir_resolve_json_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
         ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
@@ -3692,6 +4291,44 @@ fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool) -> Int:
         return ir_zero_reg()
     has_optional_fields := ir_struct_has_optional_fields(target_info)
     has_default_fields := ir_struct_has_default_fields(target_info)
+    has_nested_fields := ir_struct_has_nested_decode_fields(target_info)
+    if has_nested_fields:
+        temp_name := ir_new_temp_name("json_decode_nested")
+        ir_var_types.insert(temp_name, "tuple")
+        done_l := ir_label()
+        mut handle_r := input_r
+        if text_input:
+            parsed_r := ir_reg()
+            ir_emit_call1(parsed_r, ir_resolve_json_call_name(node.children[0], "parse"), "int", input_r)
+            handle_r = parsed_r
+        else:
+            parse_result_r := ir_reg()
+            ir_emit_call1(parse_result_r, ir_resolve_json_call_name(node.children[0], "parse_bytes_required"), "tuple", input_r)
+            parse_ok_r := ir_emit_result_flag_field(parse_result_r, "is_ok")
+            parse_ok_l := ir_label()
+            parse_err_l := ir_label()
+            ir_emit("brif " + parse_ok_r.to_string() + " " + parse_ok_l + " " + parse_err_l)
+            ir_emit("label " + parse_err_l)
+            ir_emit("store " + temp_name + " " + parse_result_r.to_string())
+            ir_emit("jmp " + done_l)
+            ir_emit("label " + parse_ok_l)
+            handle_r = ir_emit_result_value_field(parse_result_r, lookup_type_id("Int"), "ok")
+        checked_r := ir_reg()
+        ir_emit_call1(checked_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), "tuple", handle_r)
+        checked_ok_r := ir_emit_result_flag_field(checked_r, "is_ok")
+        checked_ok_l := ir_label()
+        checked_err_l := ir_label()
+        ir_emit("brif " + checked_ok_r.to_string() + " " + checked_ok_l + " " + checked_err_l)
+        ir_emit("label " + checked_err_l)
+        ir_emit("store " + temp_name + " " + checked_r.to_string())
+        ir_emit("jmp " + done_l)
+        ir_emit("label " + checked_ok_l)
+        object_r := ir_emit_result_value_field(checked_r, lookup_type_id("Int"), "ok")
+        ir_emit_json_decode_object_value(target_info, object_r, node.children[0], temp_name, done_l)
+        ir_emit("label " + done_l)
+        r := ir_reg()
+        ir_emit("load " + r.to_string() + " " + temp_name)
+        return r
     if target_info.fields.len() == 6 and not has_optional_fields and not has_default_fields:
         return ir_emit_json_decode_flat6_call(input_r, target_info)
     if target_info.fields.len() > 3 or has_optional_fields or has_default_fields:
@@ -3734,6 +4371,379 @@ fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool) -> Int:
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
+
+fn ir_emit_json_nested_decode_path_specialized(parent_handle_r: Int, key_r: Int, target_tid: Int, module_path: String) -> Int:
+    child_result_r := ir_reg()
+    ir_emit_call2(child_result_r, ir_resolve_generic_module_call_name(module_path, "object_require_object"), "tuple", parent_handle_r, key_r)
+    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
+    child_ok_l := ir_label()
+    child_err_l := ir_label()
+    done_l := ir_label()
+    temp_name := ir_new_temp_name("json_nested_decode")
+    ir_var_types.insert(temp_name, "tuple")
+    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
+    ir_emit("label " + child_err_l)
+    ir_emit("store " + temp_name + " " + child_result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + child_ok_l)
+    child_handle_r := ir_emit_result_value_field(child_result_r, lookup_type_id("Int"), "ok")
+    decode_name := ir_json_generic_name("decode_object")
+    decode_result_r := ir_reg()
+    ir_emit_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", child_handle_r)
+    ir_emit("store " + temp_name + " " + decode_result_r.to_string())
+    ir_emit("label " + done_l)
+    result_r := ir_reg()
+    ir_emit("load " + result_r.to_string() + " " + temp_name)
+    return result_r
+
+fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: Int, module_path: String, temp_name: String, done_l: String):
+    mut field_regs: List[Int] := []
+    field_count := ir_struct_field_count(struct_name)
+    mut i := 0
+    while i < field_count:
+        field_name := ir_struct_field_name_at(struct_name, i)
+        field_tid := ir_struct_field_tid_at(struct_name, i, -1)
+        default_idx := ir_struct_field_default_node(struct_name, field_name)
+        optional_inner_tid := ir_optional_inner_tid(field_tid)
+        key_r := ir_reg()
+        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
+        mut optional_struct_tid := 0 - 1
+        if optional_inner_tid >= 0:
+            optional_struct_tid = ir_struct_decode_field_tid(optional_inner_tid)
+        if optional_struct_tid >= 0:
+            has_r := ir_reg()
+            ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "object_has"), "bool", handle_r, key_r)
+            present_l := ir_label()
+            missing_l := ir_label()
+            merge_l := ir_label()
+            field_temp := ir_new_temp_name("json_object_optional_struct_field")
+            ir_var_types.insert(field_temp, "tuple")
+            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+            ir_emit("label " + missing_l)
+            if default_idx >= 0:
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
+            else:
+                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + present_l)
+            field_result_r := ir_emit_json_nested_decode_path_specialized(handle_r, key_r, optional_struct_tid, module_path)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("store " + temp_name + " " + field_result_r.to_string())
+            ir_emit("jmp " + done_l)
+            ir_emit("label " + ok_l)
+            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid))
+            ir_emit("store " + field_temp + " " + some_r.to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + merge_l)
+            loaded_r := ir_reg()
+            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+            field_regs.push(loaded_r)
+            i = i + 1
+            continue
+        nested_struct_tid := ir_struct_decode_field_tid(field_tid)
+        if nested_struct_tid >= 0:
+            if default_idx >= 0:
+                has_r := ir_reg()
+                ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "object_has"), "bool", handle_r, key_r)
+                present_l := ir_label()
+                missing_l := ir_label()
+                merge_l := ir_label()
+                field_temp := ir_new_temp_name("json_object_default_struct_field")
+                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
+                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+                ir_emit("label " + missing_l)
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + present_l)
+                field_result_r := ir_emit_json_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
+                ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+                ok_l := ir_label()
+                err_l := ir_label()
+                ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+                ir_emit("label " + err_l)
+                ir_emit("store " + temp_name + " " + field_result_r.to_string())
+                ir_emit("jmp " + done_l)
+                ir_emit("label " + ok_l)
+                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
+                ir_emit("jmp " + merge_l)
+                ir_emit("label " + merge_l)
+                loaded_r := ir_reg()
+                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+                field_regs.push(loaded_r)
+                i = i + 1
+                continue
+            field_result_r := ir_emit_json_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("store " + temp_name + " " + field_result_r.to_string())
+            ir_emit("jmp " + done_l)
+            ir_emit("label " + ok_l)
+            field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
+            i = i + 1
+            continue
+        if optional_inner_tid >= 0:
+            helper_name := ir_json_object_helper_name(optional_inner_tid)
+            has_name := ir_json_scalar_has_helper_name(optional_inner_tid)
+            if helper_name.len() == 0 or has_name.len() == 0:
+                continue
+            has_r := ir_reg()
+            ir_emit_call2(has_r, has_name, "bool", handle_r, key_r)
+            present_l := ir_label()
+            missing_l := ir_label()
+            merge_l := ir_label()
+            field_temp := ir_new_temp_name("json_object_optional_field")
+            ir_var_types.insert(field_temp, "tuple")
+            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+            ir_emit("label " + missing_l)
+            if default_idx >= 0:
+                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
+            else:
+                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + present_l)
+            field_result_r := ir_reg()
+            ir_emit_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), "tuple", handle_r, key_r)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("store " + temp_name + " " + field_result_r.to_string())
+            ir_emit("jmp " + done_l)
+            ir_emit("label " + ok_l)
+            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid))
+            ir_emit("store " + field_temp + " " + some_r.to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + merge_l)
+            loaded_r := ir_reg()
+            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+            field_regs.push(loaded_r)
+            i = i + 1
+            continue
+        helper_name := ir_json_object_helper_name(field_tid)
+        if helper_name.len() == 0:
+            continue
+        if default_idx >= 0:
+            has_name := ir_json_scalar_has_helper_name(field_tid)
+            if has_name.len() == 0:
+                continue
+            has_r := ir_reg()
+            ir_emit_call2(has_r, has_name, "bool", handle_r, key_r)
+            present_l := ir_label()
+            missing_l := ir_label()
+            merge_l := ir_label()
+            field_temp := ir_new_temp_name("json_object_default_field")
+            ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
+            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+            ir_emit("label " + missing_l)
+            ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + present_l)
+            field_result_r := ir_reg()
+            ir_emit_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), "tuple", handle_r, key_r)
+            ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+            ok_l := ir_label()
+            err_l := ir_label()
+            ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+            ir_emit("label " + err_l)
+            ir_emit("store " + temp_name + " " + field_result_r.to_string())
+            ir_emit("jmp " + done_l)
+            ir_emit("label " + ok_l)
+            ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
+            ir_emit("jmp " + merge_l)
+            ir_emit("label " + merge_l)
+            loaded_r := ir_reg()
+            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
+            field_regs.push(loaded_r)
+            i = i + 1
+            continue
+        field_result_r := ir_reg()
+        ir_emit_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), "tuple", handle_r, key_r)
+        ok_flag_r := ir_emit_result_flag_field(field_result_r, "is_ok")
+        ok_l := ir_label()
+        err_l := ir_label()
+        ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+        ir_emit("label " + err_l)
+        ir_emit("store " + temp_name + " " + field_result_r.to_string())
+        ir_emit("jmp " + done_l)
+        ir_emit("label " + ok_l)
+        field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
+        i = i + 1
+
+    struct_r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " " + field_regs.len().to_string())
+    ir_emit_call1(struct_r, "__struct_alloc", "struct:" + struct_name, field_count_r)
+    for field_reg, fi in field_regs:
+        ir_emit("sstore " + struct_r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple(struct_r).to_string())
+    ir_emit("label " + done_l)
+
+fn ir_emit_json_decode_object_specialization_body(struct_name: String, module_path: String):
+    if not ir_struct_names.contains_key(struct_name):
+        ir_emit_default_return()
+        return
+    handle_r := ir_reg()
+    ir_emit("load " + handle_r.to_string() + " handle")
+    temp_name := ir_new_temp_name("json_decode_object")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    ir_emit_json_decode_object_value_specialized(struct_name, handle_r, module_path, temp_name, done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    ir_emit("ret " + r.to_string())
+    ir_emit("endfunc")
+
+fn ir_emit_json_decode_specialization_body(struct_name: String, module_path: String, text_input: Bool):
+    if not ir_struct_names.contains_key(struct_name):
+        ir_emit_default_return()
+        return
+    input_r := ir_reg()
+    ir_emit("load " + input_r.to_string() + " input")
+    mut handle_r := input_r
+    if text_input:
+        parsed_r := ir_reg()
+        ir_emit_call1(parsed_r, ir_resolve_generic_module_call_name(module_path, "parse"), "int", input_r)
+        handle_r = parsed_r
+    else:
+        parse_result_r := ir_reg()
+        ir_emit_call1(parse_result_r, ir_resolve_generic_module_call_name(module_path, "parse_bytes_required"), "tuple", input_r)
+        parse_ok_r := ir_emit_result_flag_field(parse_result_r, "is_ok")
+        parse_ok_l := ir_label()
+        parse_err_l := ir_label()
+        ir_emit("brif " + parse_ok_r.to_string() + " " + parse_ok_l + " " + parse_err_l)
+        ir_emit("label " + parse_err_l)
+        ir_emit("ret " + parse_result_r.to_string())
+        ir_emit("label " + parse_ok_l)
+        handle_r = ir_emit_result_value_field(parse_result_r, 0, "ok")
+    checked_r := ir_reg()
+    ir_emit_call1(checked_r, ir_resolve_generic_module_call_name(module_path, "require_object_handle"), "tuple", handle_r)
+    checked_ok_r := ir_emit_result_flag_field(checked_r, "is_ok")
+    checked_ok_l := ir_label()
+    checked_err_l := ir_label()
+    temp_name := ir_new_temp_name("json_decode")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    ir_emit("brif " + checked_ok_r.to_string() + " " + checked_ok_l + " " + checked_err_l)
+    ir_emit("label " + checked_err_l)
+    ir_emit("store " + temp_name + " " + checked_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + checked_ok_l)
+    object_r := ir_emit_result_value_field(checked_r, 0, "ok")
+    ir_emit_json_decode_object_value_specialized(struct_name, object_r, module_path, temp_name, done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    ir_emit("ret " + r.to_string())
+    ir_emit("endfunc")
+
+fn ir_emit_json_decode_path_specialization_body(struct_name: String, module_path: String):
+    if not ir_struct_names.contains_key(struct_name):
+        ir_emit_default_return()
+        return
+    handle_r := ir_reg()
+    ir_emit("load " + handle_r.to_string() + " handle")
+    root_result_r := ir_reg()
+    ir_emit_call1(root_result_r, ir_resolve_generic_module_call_name(module_path, "require_object_handle"), "tuple", handle_r)
+    root_ok_r := ir_emit_result_flag_field(root_result_r, "is_ok")
+    root_ok_l := ir_label()
+    root_err_l := ir_label()
+    temp_name := ir_new_temp_name("json_decode_path")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    ir_emit("brif " + root_ok_r.to_string() + " " + root_ok_l + " " + root_err_l)
+    ir_emit("label " + root_err_l)
+    ir_emit("store " + temp_name + " " + root_result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + root_ok_l)
+    current_name := ir_new_temp_name("json_current")
+    parts_name := ir_new_temp_name("json_parts")
+    len_name := ir_new_temp_name("json_parts_len")
+    idx_name := ir_new_temp_name("json_parts_idx")
+    ir_var_types.insert(current_name, "int")
+    ir_var_types.insert(parts_name, "list_string")
+    ir_var_types.insert(len_name, "int")
+    ir_var_types.insert(idx_name, "int")
+    root_r := ir_emit_result_value_field(root_result_r, 0, "ok")
+    ir_emit("store " + current_name + " " + root_r.to_string())
+    dotted_path_r := ir_reg()
+    ir_emit("load " + dotted_path_r.to_string() + " dotted_path")
+    dot_r := ir_reg()
+    ir_emit("strref " + dot_r.to_string() + " " + ir_str("."))
+    parts_r := ir_reg()
+    ir_emit_call2(parts_r, "forge_string_split_to_list", "list_string", dotted_path_r, dot_r)
+    ir_emit("store " + parts_name + " " + parts_r.to_string())
+    len_r := ir_reg()
+    ir_emit_call1(len_r, "forge_auto_len", "int", parts_r)
+    ir_emit("store " + len_name + " " + len_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+    loop_l := ir_label()
+    body_l := ir_label()
+    lookup_l := ir_label()
+    step_l := ir_label()
+    loop_done_l := ir_label()
+    ir_emit("label " + loop_l)
+    loop_idx_r := ir_reg()
+    ir_emit("load " + loop_idx_r.to_string() + " " + idx_name)
+    loop_len_r := ir_reg()
+    ir_emit("load " + loop_len_r.to_string() + " " + len_name)
+    cond_r := ir_reg()
+    ir_emit("lt " + cond_r.to_string() + " " + loop_idx_r.to_string() + " " + loop_len_r.to_string())
+    ir_emit("brif " + cond_r.to_string() + " " + body_l + " " + loop_done_l)
+    ir_emit("label " + body_l)
+    parts_load_r := ir_reg()
+    ir_emit("load " + parts_load_r.to_string() + " " + parts_name)
+    idx_load_r := ir_reg()
+    ir_emit("load " + idx_load_r.to_string() + " " + idx_name)
+    part_r := ir_reg()
+    ir_emit_call2(part_r, "forge_list_get_value_unchecked", "string", parts_load_r, idx_load_r)
+    part_len_r := ir_reg()
+    ir_emit_call1(part_len_r, "forge_auto_len", "int", part_r)
+    empty_r := ir_reg()
+    ir_emit("iconst " + empty_r.to_string() + " 0")
+    skip_empty_r := ir_reg()
+    ir_emit("eq " + skip_empty_r.to_string() + " " + part_len_r.to_string() + " " + empty_r.to_string())
+    ir_emit("brif " + skip_empty_r.to_string() + " " + step_l + " " + lookup_l)
+    ir_emit("label " + lookup_l)
+    current_r := ir_reg()
+    ir_emit("load " + current_r.to_string() + " " + current_name)
+    child_result_r := ir_reg()
+    ir_emit_call2(child_result_r, ir_resolve_generic_module_call_name(module_path, "object_require_object"), "tuple", current_r, part_r)
+    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
+    child_ok_l := ir_label()
+    child_err_l := ir_label()
+    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
+    ir_emit("label " + child_err_l)
+    ir_emit("store " + temp_name + " " + child_result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + child_ok_l)
+    child_handle_r := ir_emit_result_value_field(child_result_r, 0, "ok")
+    ir_emit("store " + current_name + " " + child_handle_r.to_string())
+    ir_emit("label " + step_l)
+    step_idx_r := ir_reg()
+    ir_emit("load " + step_idx_r.to_string() + " " + idx_name)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_idx_r := ir_reg()
+    ir_emit("add " + next_idx_r.to_string() + " " + step_idx_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_idx_r.to_string())
+    ir_emit("jmp " + loop_l)
+    ir_emit("label " + loop_done_l)
+    final_handle_r := ir_reg()
+    ir_emit("load " + final_handle_r.to_string() + " " + current_name)
+    ir_emit_json_decode_object_value_specialized(struct_name, final_handle_r, module_path, temp_name, done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    ir_emit("ret " + r.to_string())
+    ir_emit("endfunc")
 
 fn ir_emit_json_decode_object_call(idx: Int, node: Node) -> Int:
     arg_regs := ir_collect_call_arg_regs(node, 1)
@@ -6155,6 +7165,22 @@ fn ir_emit_generic_specialization(key: String):
         ir_emit_config_decode_specialization_body(concrete_types[0], false)
     elif concrete_types.len() == 1 and ir_is_config_decode_specialization(base_name, true, ir_active_generic_module_path, decl_idx):
         ir_emit_config_decode_specialization_body(concrete_types[0], true)
+    elif concrete_types.len() == 1 and ir_is_toml_decode_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_toml_decode_specialization_body(concrete_types[0], ir_active_generic_module_path)
+    elif concrete_types.len() == 1 and ir_is_toml_decode_text_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_toml_decode_text_specialization_body(concrete_types[0], ir_active_generic_module_path, concrete_types, ret_type)
+    elif concrete_types.len() == 1 and ir_is_toml_decode_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_toml_decode_path_specialization_body(concrete_types[0], ir_active_generic_module_path)
+    elif concrete_types.len() == 1 and ir_is_toml_decode_text_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_toml_decode_text_path_specialization_body(concrete_types[0], ir_active_generic_module_path, concrete_types, ret_type)
+    elif concrete_types.len() == 1 and ir_is_json_decode_specialization(base_name, ir_active_generic_module_path, decl_idx, false):
+        ir_emit_json_decode_specialization_body(concrete_types[0], ir_active_generic_module_path, false)
+    elif concrete_types.len() == 1 and ir_is_json_decode_specialization(base_name, ir_active_generic_module_path, decl_idx, true):
+        ir_emit_json_decode_specialization_body(concrete_types[0], ir_active_generic_module_path, true)
+    elif concrete_types.len() == 1 and ir_is_json_decode_object_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_json_decode_object_specialization_body(concrete_types[0], ir_active_generic_module_path)
+    elif concrete_types.len() == 1 and ir_is_json_decode_path_specialization(base_name, ir_active_generic_module_path, decl_idx):
+        ir_emit_json_decode_path_specialization_body(concrete_types[0], ir_active_generic_module_path)
     else:
         ir_finish_func_emission(body_idx)
     ir_active_generic_params = saved_params
@@ -6544,6 +7570,7 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     ir_struct_names = {}
     ir_struct_field_lookup = {}
     ir_struct_field_index_lookup = {}
+    ir_struct_decl_nodes = {}
     ir_impl_methods = {}
     ir_register_known_import_structs()
 
@@ -6556,7 +7583,7 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
         if node.kind == "struct_decl" or node.kind == "struct":
-            ir_collect_struct_decl(node, true)
+            ir_collect_struct_decl(item_idx, node, true)
         elif node.kind == "enum_decl" or node.kind == "enum":
             ir_collect_enum_decl(node, true)
         elif node.kind == "impl_decl":

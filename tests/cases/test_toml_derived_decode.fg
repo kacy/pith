@@ -19,6 +19,15 @@ struct TomlDefaultFixture:
     pub name: String
     pub tls: Bool = false
 
+struct TomlNestedDefaultServer:
+    pub host: String
+    pub port: Int = 8080
+    pub tls: Bool = false
+
+struct TomlNestedDefaultApp:
+    pub name: String
+    pub server: TomlNestedDefaultServer = TomlNestedDefaultServer("localhost")
+
 fn main() -> Int!:
     nl := chr(10)
     dq := chr(34)
@@ -56,6 +65,15 @@ fn main() -> Int!:
     defaulted := toml.decode_text[TomlDefaultFixture]("name = " + dq + "forge" + dq)
     if defaulted.is_ok:
         print(defaulted.ok.name + ":" + defaulted.ok.tls.to_string())
+
+    nested_default_missing_doc := "name = " + dq + "forge" + dq
+    nested_default_partial_doc := "name = " + dq + "forge" + dq + nl + "[server]" + nl + "host = " + dq + "edge" + dq
+    nested_default_missing := toml.decode_text[TomlNestedDefaultApp](nested_default_missing_doc)
+    nested_default_partial := toml.decode_text[TomlNestedDefaultApp](nested_default_partial_doc)
+    if nested_default_missing.is_ok:
+        print(nested_default_missing.ok.name + ":" + nested_default_missing.ok.server.host + ":" + nested_default_missing.ok.server.port.to_string() + ":" + nested_default_missing.ok.server.tls.to_string())
+    if nested_default_partial.is_ok:
+        print(nested_default_partial.ok.name + ":" + nested_default_partial.ok.server.host + ":" + nested_default_partial.ok.server.port.to_string() + ":" + nested_default_partial.ok.server.tls.to_string())
 
     nested_root := toml.parse(nested_doc)
     nested := toml.decode_path[TomlServerFixture](nested_root, "server")

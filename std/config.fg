@@ -301,6 +301,16 @@ pub fn merge(base: Config, overrides: Config) -> Config:
 pub fn has(cfg: Config, key: String) -> Bool:
     return cfg.values.contains_key(key)
 
+# true when any flattened config key lives under the dotted prefix.
+pub fn has_prefix(cfg: Config, prefix: String) -> Bool:
+    if prefix == "":
+        return not cfg.values.is_empty()
+    dotted := prefix + "."
+    for key in cfg.values:
+        if key == prefix or key.starts_with(dotted):
+            return true
+    return false
+
 # # return sorted config keys.
 pub fn keys(cfg: Config) -> List[String]:
     mut result: List[String] := []

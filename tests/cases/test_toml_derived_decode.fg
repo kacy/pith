@@ -1,0 +1,31 @@
+import std.toml as toml
+
+struct TomlDerivedFixture:
+    pub name: String
+    pub score: Int
+    pub active: Bool
+
+fn main() -> Int:
+    nl := chr(10)
+    dq := chr(34)
+    doc := "name = " + dq + "forge" + dq + nl + "score = 42" + nl + "active = true"
+
+    root := toml.parse(doc)
+    from_handle := toml.decode[TomlDerivedFixture](root)
+    if from_handle.is_ok:
+        print(from_handle.ok.name + ":" + from_handle.ok.score.to_string() + ":" + from_handle.ok.active.to_string())
+
+    from_text := toml.decode_text[TomlDerivedFixture](doc)
+    if from_text.is_ok:
+        print(from_text.ok.name + "@" + from_text.ok.score.to_string())
+
+    missing := toml.decode_text[TomlDerivedFixture]("name = " + dq + "forge" + dq)
+    print(missing.is_err.to_string())
+    if missing.is_err:
+        print(missing.err.message.contains("score").to_string())
+
+    invalid := toml.decode_text[TomlDerivedFixture]("name = ")
+    print(invalid.is_err.to_string())
+    if invalid.is_err:
+        print(invalid.err.message.contains("invalid toml").to_string())
+    return 0

@@ -1,4 +1,6 @@
 import std.config as config
+import std.fs as fs
+import std.os.path as path
 
 struct AppConfig:
     pub name: String
@@ -36,4 +38,22 @@ fn main() -> String!:
     bad := config.decode_prefix[ServerConfig](config.from_map(bad_values), "server")
     assert(bad.is_err)
     print("bad:" + bad.err.message)
+
+    root := fs.make_temp_dir("forge-config-typed-")!
+    toml_path := path.join(root, "app.toml")
+    json_path := path.join(root, "app.json")
+    assert(fs.write(toml_path, "host = " + chr(34) + "localhost" + chr(34) + chr(10) + "port = 8080" + chr(10))!)
+    assert(fs.write(json_path, chr(123) + chr(34) + "host" + chr(34) + ":" + chr(34) + "0.0.0.0" + chr(34) + "," + chr(34) + "port" + chr(34) + ":9090" + chr(125))!)
+
+    typed_toml := config.from_toml_file_typed[ConfigFileServer](toml_path)
+    typed_json := config.from_json_file_typed[ConfigFileServer](json_path)
+    assert(typed_toml.is_ok)
+    assert(typed_json.is_ok)
+    print("typed-toml:{typed_toml.ok.host}:{typed_toml.ok.port}")
+    print("typed-json:{typed_json.ok.host}:{typed_json.ok.port}")
+    assert(fs.remove_tree(root))
     return ""
+
+struct ConfigFileServer:
+    pub host: String
+    pub port: Int

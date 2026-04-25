@@ -13,6 +13,12 @@ import std.io as io
 
 TOML_FILE_CHUNK_SIZE := 4096
 
+pub struct TomlDecodeError:
+    pub message: String
+
+fn toml_decode_fail(message: String) -> TomlDecodeError:
+    return TomlDecodeError(message)
+
 # ===============================================================
 # Node Pool
 # ===============================================================
@@ -406,6 +412,12 @@ fn toml_parse_file_chunked(path: String, chunk_size: Int) -> Int:
         return 0 - 1
     return toml_parse(data_result.ok)
 
+pub fn parse_required(input: String) -> Int!TomlDecodeError:
+    root := parse(input)
+    if root < 0 or type_of(root) != "table":
+        fail toml_decode_fail("invalid toml document")
+    return root
+
 # ===============================================================
 # Public API — Type and Introspection
 # ===============================================================
@@ -438,6 +450,14 @@ fn toml_get_string(handle: Int, key: String) -> String:
         return string_values[v]
     return ""
 
+pub fn require_string(handle: Int, key: String) -> String!TomlDecodeError:
+    v := table_lookup(handle, key)
+    if v < 0:
+        fail toml_decode_fail("missing string field: " + key)
+    if node_types[v] != "string":
+        fail toml_decode_fail("expected string field: " + key)
+    return string_values[v]
+
 # Gets a string value by key from a table with a fallback.
 pub fn get_string_or(handle: Int, key: String, default_value: String) -> String:
     v := table_lookup(handle, key)
@@ -454,6 +474,14 @@ fn toml_get_int(handle: Int, key: String) -> Int:
     if v >= 0 and node_types[v] == "int":
         return integer_values[v]
     return 0
+
+pub fn require_int(handle: Int, key: String) -> Int!TomlDecodeError:
+    v := table_lookup(handle, key)
+    if v < 0:
+        fail toml_decode_fail("missing int field: " + key)
+    if node_types[v] != "int":
+        fail toml_decode_fail("expected int field: " + key)
+    return integer_values[v]
 
 # Gets an integer value by key from a table with a fallback.
 pub fn get_int_or(handle: Int, key: String, default_value: Int) -> Int:
@@ -488,6 +516,14 @@ fn toml_get_bool(handle: Int, key: String) -> Bool:
     if v >= 0 and node_types[v] == "bool":
         return boolean_values[v]
     return false
+
+pub fn require_bool(handle: Int, key: String) -> Bool!TomlDecodeError:
+    v := table_lookup(handle, key)
+    if v < 0:
+        fail toml_decode_fail("missing bool field: " + key)
+    if node_types[v] != "bool":
+        fail toml_decode_fail("expected bool field: " + key)
+    return boolean_values[v]
 
 # Gets a boolean value by key from a table with a fallback.
 pub fn get_bool_or(handle: Int, key: String, default_value: Bool) -> Bool:
@@ -566,6 +602,12 @@ pub fn has(handle: Int, key: String) -> Bool:
 
 fn toml_has(handle: Int, key: String) -> Bool:
     return table_lookup(handle, key) >= 0
+
+pub fn decode[T](handle: Int) -> T!TomlDecodeError:
+    fail toml_decode_fail("toml.decode requires compiler support")
+
+pub fn decode_text[T](input: String) -> T!TomlDecodeError:
+    fail toml_decode_fail("toml.decode_text requires compiler support")
 
 test "toml parses scalar values":
     doc := "title = " + chr(34) + "forge" + chr(34) + chr(10) + "version = 3" + chr(10) + "pi = 3.14" + chr(10) + "enabled = true"

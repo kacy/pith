@@ -380,6 +380,14 @@ pub fn decode[T](cfg: Config) -> T!ConfigError:
 pub fn decode_prefix[T](cfg: Config, prefix: String) -> T!ConfigError:
     fail config_fail("config.decode_prefix requires compiler support")
 
+# # load a toml file and decode it into a concrete struct.
+pub fn from_toml_file_typed[T](file_path: String) -> T!ConfigError:
+    return decode[T](from_toml_file(file_path)!)
+
+# # load a json file and decode it into a concrete struct.
+pub fn from_json_file_typed[T](file_path: String) -> T!ConfigError:
+    return decode[T](from_json_file(file_path)!)
+
 test "config maps copy values and expose lookups":
     mut values: Map[String, String] := {}
     values.insert("host", "localhost")
@@ -488,6 +496,19 @@ test "config loads files and reports missing values":
     assert(fs.write(json_path, json_doc)!)
     assert_eq(get_string(from_toml_file(toml_path)!, "server.host"), "localhost")
     assert_eq(get_string(from_json_file(json_path)!, "server.host"), "0.0.0.0")
+    typed_toml := from_toml_file_typed[ConfigFileName](toml_path)
+    typed_json := from_json_file_typed[ConfigFileName](json_path)
+    assert(typed_toml.is_ok)
+    assert(typed_json.is_ok)
+    assert_eq(typed_toml.ok.name, "forge")
+    assert_eq(typed_json.ok.name, "forge-json")
     assert(from_json("not json").is_err)
     assert(from_toml_file(path.join(root, "missing.toml")).is_err)
     assert(fs.remove_tree(root))
+
+struct ConfigFileServer:
+    pub host: String
+    pub port: Int
+
+struct ConfigFileName:
+    pub name: String

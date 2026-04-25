@@ -418,6 +418,13 @@ pub fn parse_required(input: String) -> Int!TomlDecodeError:
         fail toml_decode_fail("invalid toml document")
     return root
 
+# # parses a toml file and returns the root table handle or a typed error.
+pub fn parse_file_required(file_path: String) -> Int!TomlDecodeError:
+    root := parse_file(file_path)
+    if root < 0 or type_of(root) != "table":
+        fail toml_decode_fail("invalid toml document")
+    return root
+
 # ===============================================================
 # Public API — Type and Introspection
 # ===============================================================
@@ -635,6 +642,14 @@ pub fn decode_path[T](handle: Int, dotted_path: String) -> T!TomlDecodeError:
 pub fn decode_text_path[T](input: String, dotted_path: String) -> T!TomlDecodeError:
     root := parse_required(input)!
     return decode_path[T](root, dotted_path)!
+
+# # loads a toml file and decodes it into a concrete struct.
+pub fn decode_file[T](file_path: String) -> T!TomlDecodeError:
+    return decode[T](parse_file_required(file_path)!)!
+
+# # loads a toml file and decodes a nested table selected by a dotted path.
+pub fn decode_file_path[T](file_path: String, dotted_path: String) -> T!TomlDecodeError:
+    return decode_path[T](parse_file_required(file_path)!, dotted_path)!
 
 struct TomlNestedFixture:
     pub host: String

@@ -1,5 +1,7 @@
 import std.json as json
 import std.bytes as bytes
+import std.fs as fs
+import std.os.path as os_path
 
 struct JsonDerivedFixture:
     pub name: String
@@ -18,7 +20,7 @@ struct JsonDerivedNestedFixture:
     pub host: String
     pub port: Int
 
-fn main() -> Int:
+fn main() -> Int!:
     dq := chr(34)
     mut doc := chr(123) + dq + "name" + dq + ":" + dq + "forge" + dq
     doc = doc + "," + dq + "score" + dq + ":42"
@@ -54,9 +56,16 @@ fn main() -> Int:
     nested := json.decode_path[JsonDerivedNestedFixture](nested_root, "server")
     nested_text := json.decode_text_path[JsonDerivedNestedFixture](nested_doc, "server")
     nested_missing := json.decode_text_path[JsonDerivedNestedFixture](nested_doc, "database")
+    root := fs.make_temp_dir("forge-json-derived-")!
+    file_path := os_path.join(root, "app.json")
+    assert(fs.write(file_path, nested_doc)!)
+    nested_file := json.decode_file_path[JsonDerivedNestedFixture](file_path, "server")
     if nested.is_ok:
         print(nested.ok.host + "#" + nested.ok.port.to_string())
     if nested_text.is_ok:
         print(nested_text.ok.host + "$" + nested_text.ok.port.to_string())
+    if nested_file.is_ok:
+        print(nested_file.ok.host + "%" + nested_file.ok.port.to_string())
     print(nested_missing.is_err.to_string())
+    assert(fs.remove_tree(root))
     return 0

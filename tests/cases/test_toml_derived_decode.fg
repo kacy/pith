@@ -1,4 +1,6 @@
 import std.toml as toml
+import std.fs as fs
+import std.os.path as os_path
 
 struct TomlDerivedFixture:
     pub name: String
@@ -9,7 +11,7 @@ struct TomlServerFixture:
     pub host: String
     pub port: Int
 
-fn main() -> Int:
+fn main() -> Int!:
     nl := chr(10)
     dq := chr(34)
     doc := "name = " + dq + "forge" + dq + nl + "score = 42" + nl + "active = true"
@@ -42,6 +44,14 @@ fn main() -> Int:
     nested_text := toml.decode_text_path[TomlServerFixture](nested_doc, "server")
     if nested_text.is_ok:
         print(nested_text.ok.host + "$" + nested_text.ok.port.to_string())
+
+    root := fs.make_temp_dir("forge-toml-derived-")!
+    file_path := os_path.join(root, "app.toml")
+    assert(fs.write(file_path, nested_doc)!)
+    nested_file := toml.decode_file_path[TomlServerFixture](file_path, "server")
+    if nested_file.is_ok:
+        print(nested_file.ok.host + "%" + nested_file.ok.port.to_string())
+    assert(fs.remove_tree(root))
 
     nested_missing := toml.decode_text_path[TomlServerFixture](nested_doc, "database")
     print(nested_missing.is_err.to_string())

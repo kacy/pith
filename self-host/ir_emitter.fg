@@ -2850,6 +2850,154 @@ fn ir_emit_toml_decode_path_call(idx: Int, node: Node, text_input: Bool) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool) -> Int:
+    arg_regs := ir_collect_call_arg_regs(node, 1)
+    if arg_regs.len() == 0:
+        return ir_zero_reg()
+
+    file_path_r := arg_regs[0]
+    if not path_input:
+        ret_tid := c_get_expr_type(idx)
+        if ret_tid < 0:
+            return ir_zero_reg()
+        ret_info := get_type_info(ret_tid)
+        if ret_info.kind != "result":
+            return ir_zero_reg()
+        target_tid := ret_info.inner
+        target_info := get_type_info(target_tid)
+        if target_info.kind != "struct":
+            return ir_zero_reg()
+
+        temp_name := ir_new_temp_name("toml_decode_file")
+        ir_var_types.insert(temp_name, "tuple")
+        done_l := ir_label()
+        parse_result_r := ir_reg()
+        ir_emit_call1(parse_result_r, ir_resolve_toml_call_name(node.children[0], "parse_file_required"), "tuple", file_path_r)
+        parse_ok_r := ir_emit_result_flag_field(parse_result_r, "is_ok")
+        parse_ok_l := ir_label()
+        parse_err_l := ir_label()
+        ir_emit("brif " + parse_ok_r.to_string() + " " + parse_ok_l + " " + parse_err_l)
+        ir_emit("label " + parse_err_l)
+        ir_emit("store " + temp_name + " " + parse_result_r.to_string())
+        ir_emit("jmp " + done_l)
+        ir_emit("label " + parse_ok_l)
+        handle_r := ir_emit_result_value_field(parse_result_r, lookup_type_id("Int"), "ok")
+        ir_emit_toml_decode_value(target_info, handle_r, node.children[0], temp_name, done_l)
+        ir_emit("label " + done_l)
+        r := ir_reg()
+        ir_emit("load " + r.to_string() + " " + temp_name)
+        return r
+
+    if arg_regs.len() < 2:
+        return ir_zero_reg()
+    dotted_path_r := arg_regs[1]
+    ret_tid := c_get_expr_type(idx)
+    if ret_tid < 0:
+        return ir_zero_reg()
+    ret_info := get_type_info(ret_tid)
+    if ret_info.kind != "result":
+        return ir_zero_reg()
+    target_tid := ret_info.inner
+    target_info := get_type_info(target_tid)
+    if target_info.kind != "struct":
+        return ir_zero_reg()
+
+    temp_name := ir_new_temp_name("toml_decode_file_path")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    parse_result_r := ir_reg()
+    ir_emit_call1(parse_result_r, ir_resolve_toml_call_name(node.children[0], "parse_file_required"), "tuple", file_path_r)
+    parse_ok_r := ir_emit_result_flag_field(parse_result_r, "is_ok")
+    parse_ok_l := ir_label()
+    parse_err_l := ir_label()
+    ir_emit("brif " + parse_ok_r.to_string() + " " + parse_ok_l + " " + parse_err_l)
+    ir_emit("label " + parse_err_l)
+    ir_emit("store " + temp_name + " " + parse_result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + parse_ok_l)
+    handle_r := ir_emit_result_value_field(parse_result_r, lookup_type_id("Int"), "ok")
+
+    current_name := ir_new_temp_name("toml_file_current")
+    parts_name := ir_new_temp_name("toml_file_parts")
+    len_name := ir_new_temp_name("toml_file_parts_len")
+    idx_name := ir_new_temp_name("toml_file_parts_idx")
+    ir_var_types.insert(current_name, "int")
+    ir_var_types.insert(parts_name, "list_string")
+    ir_var_types.insert(len_name, "int")
+    ir_var_types.insert(idx_name, "int")
+    ir_emit("store " + current_name + " " + handle_r.to_string())
+    dot_r := ir_reg()
+    ir_emit("strref " + dot_r.to_string() + " " + ir_str("."))
+    parts_r := ir_reg()
+    ir_emit_call2(parts_r, "forge_string_split_to_list", "list_string", dotted_path_r, dot_r)
+    ir_emit("store " + parts_name + " " + parts_r.to_string())
+    len_r := ir_reg()
+    ir_emit_call1(len_r, "forge_auto_len", "int", parts_r)
+    ir_emit("store " + len_name + " " + len_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    lookup_l := ir_label()
+    step_l := ir_label()
+    loop_done_l := ir_label()
+    ir_emit("label " + loop_l)
+    loop_idx_r := ir_reg()
+    ir_emit("load " + loop_idx_r.to_string() + " " + idx_name)
+    loop_len_r := ir_reg()
+    ir_emit("load " + loop_len_r.to_string() + " " + len_name)
+    cond_r := ir_reg()
+    ir_emit("lt " + cond_r.to_string() + " " + loop_idx_r.to_string() + " " + loop_len_r.to_string())
+    ir_emit("brif " + cond_r.to_string() + " " + body_l + " " + loop_done_l)
+    ir_emit("label " + body_l)
+    parts_load_r := ir_reg()
+    ir_emit("load " + parts_load_r.to_string() + " " + parts_name)
+    idx_load_r := ir_reg()
+    ir_emit("load " + idx_load_r.to_string() + " " + idx_name)
+    part_r := ir_reg()
+    ir_emit_call2(part_r, "forge_list_get_value_unchecked", "string", parts_load_r, idx_load_r)
+    part_len_r := ir_reg()
+    ir_emit_call1(part_len_r, "forge_auto_len", "int", part_r)
+    empty_r := ir_reg()
+    ir_emit("iconst " + empty_r.to_string() + " 0")
+    skip_empty_r := ir_reg()
+    ir_emit("eq " + skip_empty_r.to_string() + " " + part_len_r.to_string() + " " + empty_r.to_string())
+    ir_emit("brif " + skip_empty_r.to_string() + " " + step_l + " " + lookup_l)
+    ir_emit("label " + lookup_l)
+    current_r := ir_reg()
+    ir_emit("load " + current_r.to_string() + " " + current_name)
+    child_result_r := ir_reg()
+    ir_emit_call2(child_result_r, ir_resolve_toml_call_name(node.children[0], "toml_require_table"), "tuple", current_r, part_r)
+    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
+    child_ok_l := ir_label()
+    child_err_l := ir_label()
+    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
+    ir_emit("label " + child_err_l)
+    ir_emit("store " + temp_name + " " + child_result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + child_ok_l)
+    child_handle_r := ir_emit_result_value_field(child_result_r, lookup_type_id("Int"), "ok")
+    ir_emit("store " + current_name + " " + child_handle_r.to_string())
+    ir_emit("label " + step_l)
+    step_idx_r := ir_reg()
+    ir_emit("load " + step_idx_r.to_string() + " " + idx_name)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_idx_r := ir_reg()
+    ir_emit("add " + next_idx_r.to_string() + " " + step_idx_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_idx_r.to_string())
+    ir_emit("jmp " + loop_l)
+    ir_emit("label " + loop_done_l)
+    final_handle_r := ir_reg()
+    ir_emit("load " + final_handle_r.to_string() + " " + current_name)
+    ir_emit_toml_decode_value(target_info, final_handle_r, node.children[0], temp_name, done_l)
+    ir_emit("label " + done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
 fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo) -> Int:
     temp_name := ir_new_temp_name("json_decode")
     ir_var_types.insert(temp_name, "tuple")
@@ -3173,6 +3321,158 @@ fn ir_emit_json_decode_path_call(idx: Int, node: Node, text_input: Bool) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool) -> Int:
+    arg_regs := ir_collect_call_arg_regs(node, 1)
+    if arg_regs.len() == 0:
+        return ir_zero_reg()
+
+    file_path_r := arg_regs[0]
+    if not path_input:
+        ret_tid := c_get_expr_type(idx)
+        if ret_tid < 0:
+            return ir_zero_reg()
+        ret_info := get_type_info(ret_tid)
+        if ret_info.kind != "result":
+            return ir_zero_reg()
+        target_tid := ret_info.inner
+        target_info := get_type_info(target_tid)
+        if target_info.kind != "struct":
+            return ir_zero_reg()
+
+        temp_name := ir_new_temp_name("json_decode_file")
+        ir_var_types.insert(temp_name, "tuple")
+        done_l := ir_label()
+        parsed_r := ir_reg()
+        ir_emit_call1(parsed_r, ir_resolve_json_call_name(node.children[0], "parse_file"), "int", file_path_r)
+        checked_r := ir_reg()
+        ir_emit_call1(checked_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), "tuple", parsed_r)
+        checked_ok_r := ir_emit_result_flag_field(checked_r, "is_ok")
+        checked_ok_l := ir_label()
+        checked_err_l := ir_label()
+        ir_emit("brif " + checked_ok_r.to_string() + " " + checked_ok_l + " " + checked_err_l)
+        ir_emit("label " + checked_err_l)
+        ir_emit("store " + temp_name + " " + checked_r.to_string())
+        ir_emit("jmp " + done_l)
+        ir_emit("label " + checked_ok_l)
+        object_r := ir_emit_result_value_field(checked_r, lookup_type_id("Int"), "ok")
+        ir_emit_json_decode_object_value(target_info, object_r, node.children[0], temp_name, done_l)
+        ir_emit("label " + done_l)
+        r := ir_reg()
+        ir_emit("load " + r.to_string() + " " + temp_name)
+        return r
+
+    if arg_regs.len() < 2:
+        return ir_zero_reg()
+    dotted_path_r := arg_regs[1]
+    ret_tid := c_get_expr_type(idx)
+    if ret_tid < 0:
+        return ir_zero_reg()
+    ret_info := get_type_info(ret_tid)
+    if ret_info.kind != "result":
+        return ir_zero_reg()
+    target_tid := ret_info.inner
+    target_info := get_type_info(target_tid)
+    if target_info.kind != "struct":
+        return ir_zero_reg()
+
+    temp_name := ir_new_temp_name("json_decode_file_path")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    parsed_r := ir_reg()
+    ir_emit_call1(parsed_r, ir_resolve_json_call_name(node.children[0], "parse_file"), "int", file_path_r)
+    root_result_r := ir_reg()
+    ir_emit_call1(root_result_r, ir_resolve_json_call_name(node.children[0], "require_object_handle"), "tuple", parsed_r)
+    root_ok_r := ir_emit_result_flag_field(root_result_r, "is_ok")
+    root_ok_l := ir_label()
+    root_err_l := ir_label()
+    ir_emit("brif " + root_ok_r.to_string() + " " + root_ok_l + " " + root_err_l)
+    ir_emit("label " + root_err_l)
+    ir_emit("store " + temp_name + " " + root_result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + root_ok_l)
+
+    current_name := ir_new_temp_name("json_file_current")
+    parts_name := ir_new_temp_name("json_file_parts")
+    len_name := ir_new_temp_name("json_file_parts_len")
+    idx_name := ir_new_temp_name("json_file_parts_idx")
+    ir_var_types.insert(current_name, "int")
+    ir_var_types.insert(parts_name, "list_string")
+    ir_var_types.insert(len_name, "int")
+    ir_var_types.insert(idx_name, "int")
+    root_r := ir_emit_result_value_field(root_result_r, lookup_type_id("Int"), "ok")
+    ir_emit("store " + current_name + " " + root_r.to_string())
+    dot_r := ir_reg()
+    ir_emit("strref " + dot_r.to_string() + " " + ir_str("."))
+    parts_r := ir_reg()
+    ir_emit_call2(parts_r, "forge_string_split_to_list", "list_string", dotted_path_r, dot_r)
+    ir_emit("store " + parts_name + " " + parts_r.to_string())
+    len_r := ir_reg()
+    ir_emit_call1(len_r, "forge_auto_len", "int", parts_r)
+    ir_emit("store " + len_name + " " + len_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    lookup_l := ir_label()
+    step_l := ir_label()
+    loop_done_l := ir_label()
+    ir_emit("label " + loop_l)
+    loop_idx_r := ir_reg()
+    ir_emit("load " + loop_idx_r.to_string() + " " + idx_name)
+    loop_len_r := ir_reg()
+    ir_emit("load " + loop_len_r.to_string() + " " + len_name)
+    cond_r := ir_reg()
+    ir_emit("lt " + cond_r.to_string() + " " + loop_idx_r.to_string() + " " + loop_len_r.to_string())
+    ir_emit("brif " + cond_r.to_string() + " " + body_l + " " + loop_done_l)
+    ir_emit("label " + body_l)
+    parts_load_r := ir_reg()
+    ir_emit("load " + parts_load_r.to_string() + " " + parts_name)
+    idx_load_r := ir_reg()
+    ir_emit("load " + idx_load_r.to_string() + " " + idx_name)
+    part_r := ir_reg()
+    ir_emit_call2(part_r, "forge_list_get_value_unchecked", "string", parts_load_r, idx_load_r)
+    part_len_r := ir_reg()
+    ir_emit_call1(part_len_r, "forge_auto_len", "int", part_r)
+    empty_r := ir_reg()
+    ir_emit("iconst " + empty_r.to_string() + " 0")
+    skip_empty_r := ir_reg()
+    ir_emit("eq " + skip_empty_r.to_string() + " " + part_len_r.to_string() + " " + empty_r.to_string())
+    ir_emit("brif " + skip_empty_r.to_string() + " " + step_l + " " + lookup_l)
+    ir_emit("label " + lookup_l)
+    current_r := ir_reg()
+    ir_emit("load " + current_r.to_string() + " " + current_name)
+    child_result_r := ir_reg()
+    ir_emit_call2(child_result_r, ir_resolve_json_call_name(node.children[0], "object_require_object"), "tuple", current_r, part_r)
+    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
+    child_ok_l := ir_label()
+    child_err_l := ir_label()
+    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
+    ir_emit("label " + child_err_l)
+    ir_emit("store " + temp_name + " " + child_result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + child_ok_l)
+    child_handle_r := ir_emit_result_value_field(child_result_r, lookup_type_id("Int"), "ok")
+    ir_emit("store " + current_name + " " + child_handle_r.to_string())
+    ir_emit("label " + step_l)
+    step_idx_r := ir_reg()
+    ir_emit("load " + step_idx_r.to_string() + " " + idx_name)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_idx_r := ir_reg()
+    ir_emit("add " + next_idx_r.to_string() + " " + step_idx_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_idx_r.to_string())
+    ir_emit("jmp " + loop_l)
+    ir_emit("label " + loop_done_l)
+    final_handle_r := ir_reg()
+    ir_emit("load " + final_handle_r.to_string() + " " + current_name)
+    ir_emit_json_decode_object_value(target_info, final_handle_r, node.children[0], temp_name, done_l)
+    ir_emit("label " + done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
 fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     mut explicit_generic_types: List[String] := []
     if node.children.len() > 0:
@@ -3188,6 +3488,10 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
                 return ir_emit_json_decode_path_call(idx, node, false)
             if ir_is_json_decode_callee(node.children[0], "decode_text_path"):
                 return ir_emit_json_decode_path_call(idx, node, true)
+            if ir_is_json_decode_callee(node.children[0], "decode_file"):
+                return ir_emit_json_decode_file_call(idx, node, false)
+            if ir_is_json_decode_callee(node.children[0], "decode_file_path"):
+                return ir_emit_json_decode_file_call(idx, node, true)
             if ir_is_local_generic_callee(node.children[0], "decode", "input"):
                 return ir_emit_json_decode_call(idx, node, false)
             if ir_is_local_generic_callee(node.children[0], "decode_text", "input"):
@@ -3198,6 +3502,10 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
                 return ir_emit_json_decode_path_call(idx, node, false)
             if ir_is_local_generic_callee(node.children[0], "decode_text_path", "input"):
                 return ir_emit_json_decode_path_call(idx, node, true)
+            if ir_is_local_generic_callee(node.children[0], "decode_file", "file_path"):
+                return ir_emit_json_decode_file_call(idx, node, false)
+            if ir_is_local_generic_callee(node.children[0], "decode_file_path", "file_path"):
+                return ir_emit_json_decode_file_call(idx, node, true)
             if ir_is_config_decode_callee(node.children[0], "decode"):
                 return ir_emit_config_decode_call(idx, node, false)
             if ir_is_config_decode_callee(node.children[0], "decode_prefix"):
@@ -3210,12 +3518,20 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
                 return ir_emit_toml_decode_path_call(idx, node, false)
             if ir_is_toml_decode_callee(node.children[0], "decode_text_path"):
                 return ir_emit_toml_decode_path_call(idx, node, true)
+            if ir_is_toml_decode_callee(node.children[0], "decode_file"):
+                return ir_emit_toml_decode_file_call(idx, node, false)
+            if ir_is_toml_decode_callee(node.children[0], "decode_file_path"):
+                return ir_emit_toml_decode_file_call(idx, node, true)
             if ir_is_local_generic_callee(node.children[0], "decode", "handle"):
                 return ir_emit_toml_decode_call(idx, node, false)
             if ir_is_local_generic_callee(node.children[0], "decode_text", "input"):
                 return ir_emit_toml_decode_call(idx, node, true)
             if ir_is_local_generic_callee(node.children[0], "decode_text_path", "input"):
                 return ir_emit_local_toml_decode_text_path_call(idx, node, callee_node)
+            if ir_is_local_generic_callee(node.children[0], "decode_file", "file_path"):
+                return ir_emit_toml_decode_file_call(idx, node, false)
+            if ir_is_local_generic_callee(node.children[0], "decode_file_path", "file_path"):
+                return ir_emit_toml_decode_file_call(idx, node, true)
             if ir_is_config_file_decode_callee(node.children[0], "from_toml_file_typed"):
                 return ir_emit_config_file_decode_call(idx, node, "from_toml_file")
             if ir_is_config_file_decode_callee(node.children[0], "from_json_file_typed"):

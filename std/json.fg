@@ -11,6 +11,8 @@
 
 import std.io as io
 import std.bytes as bytes
+import std.fs as fs
+import std.os.path as os_path
 from std.bytes import ByteBuffer
 
 JSON_FILE_CHUNK_SIZE := 4096
@@ -758,6 +760,14 @@ pub fn decode_path[T](handle: Int, dotted_path: String) -> T!JsonDecodeError:
  # parses json text and decodes a nested object selected by a dotted path.
 pub fn decode_text_path[T](input: String, dotted_path: String) -> T!JsonDecodeError:
     return decode_path[T](parse(input), dotted_path)!
+
+# loads a json file and decodes it into a concrete struct.
+pub fn decode_file[T](file_path: String) -> T!JsonDecodeError:
+    return decode_object[T](parse_file(file_path))!
+
+# loads a json file and decodes a nested object selected by a dotted path.
+pub fn decode_file_path[T](file_path: String, dotted_path: String) -> T!JsonDecodeError:
+    return decode_path[T](parse_file(file_path), dotted_path)!
 
  # captures the current parser state.
 pub fn checkpoint() -> JsonCheckpoint:
@@ -1529,6 +1539,19 @@ test "json decodes nested objects by dotted path":
     assert_eq(decoded_text.ok.port, 8080)
     assert(missing.is_err)
     assert(missing.err.message.contains("missing object field"))
+
+test "json decodes files into typed structs":
+    dq := chr(34)
+    doc := chr(123) + dq + "server" + dq + ":" + chr(123) + dq + "host" + dq + ":" + dq + "localhost" + dq + "," + dq + "port" + dq + ":8080" + chr(125) + chr(125)
+    root := fs.make_temp_dir("forge-json-file-decode-")!
+    file_path := os_path.join(root, "app.json")
+    assert(fs.write(file_path, doc)!)
+
+    decoded := decode_file_path[JsonNestedDecodeFixture](file_path, "server")
+    assert(decoded.is_ok)
+    assert_eq(decoded.ok.host, "localhost")
+    assert_eq(decoded.ok.port, 8080)
+    assert(fs.remove_tree(root))
 
 fn json_save_chunked(path: String, handle: Int, chunk_size: Int) -> Int:
     write_result := io.write_file_text_chunked(path, json_encode(handle), chunk_size)

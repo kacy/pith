@@ -37,13 +37,8 @@ mut native_conn_write_iv: Map[Int, Bytes] := {}
 mut native_conn_read_seq: Map[Int, Int] := {}
 mut native_conn_write_seq: Map[Int, Int] := {}
 mut native_conn_pending: Map[Int, Bytes] := {}
-mut native_conn_alpn: Map[Int, String] := {}
-mut native_conn_did_resume: Map[Int, Bool] := {}
 mut native_conn_cache_key: Map[Int, String] := {}
 mut native_conn_resumption_master_secret: Map[Int, Bytes] := {}
-mut native_conn_peer_common_name: Map[Int, String] := {}
-mut native_conn_peer_dns_names: Map[Int, List[String]] := {}
-mut native_conn_peer_ip_addresses: Map[Int, List[String]] := {}
 TLS_CONTENT_CHANGE_CIPHER_SPEC := 20
 TLS_CONTENT_ALERT := 21
 TLS_CONTENT_HANDSHAKE := 22
@@ -95,9 +90,24 @@ pub struct Config:
 pub struct Conn:
     pub handle: Int
 
+# summary of one negotiated tls connection.
+pub struct ConnectionState:
+    pub version: Int
+    pub cipher_suite: Int
+    pub negotiated_protocol: String
+    pub did_resume: Bool
+    pub peer_common_name: String
+    pub peer_dns_names: List[String]
+    pub peer_ip_addresses: List[String]
+    pub peer_chain_present: Bool
+    pub client_auth_requested: Bool
+    pub client_auth_verified: Bool
+
 # a tls listener.
 pub struct Listener:
     pub handle: Int
+
+mut native_conn_state: Map[Int, ConnectionState] := {}
 
 fn native_config_handle(roots_pem: String) -> Config!:
     if roots_pem == "":
@@ -311,6 +321,12 @@ fn copy_string_list(items: List[String]) -> List[String]:
         out.push(item)
     return out
 
+fn copy_connection_state(state: ConnectionState) -> ConnectionState:
+    return ConnectionState(state.version, state.cipher_suite, state.negotiated_protocol, state.did_resume, state.peer_common_name, copy_string_list(state.peer_dns_names), copy_string_list(state.peer_ip_addresses), state.peer_chain_present, state.client_auth_requested, state.client_auth_verified)
+
+fn empty_connection_state() -> ConnectionState:
+    return ConnectionState(0, 0, "", false, "", [], [], false, false, false)
+
 fn certificate_common_name(certs: List[x509.Certificate]) -> String:
     if certs.len() == 0:
         return ""
@@ -368,6 +384,11 @@ fn remember_server_ticket(ticket_key: String, entry: SessionTicketEntry):
         if native_server_session_tickets.contains_key(oldest):
             native_server_session_tickets.remove(oldest)
 
+fn touch_server_ticket(ticket_key: String):
+    if native_server_session_tickets.contains_key(ticket_key):
+        native_server_session_ticket_order = drop_key(native_server_session_ticket_order, ticket_key)
+        native_server_session_ticket_order.push(ticket_key)
+
 fn remember_client_cached_session(cache_key: String, session: CachedSession):
     forget_client_cached_session(cache_key)
     native_client_session_cache.insert(cache_key, session)
@@ -378,7 +399,12 @@ fn remember_client_cached_session(cache_key: String, session: CachedSession):
         if native_client_session_cache.contains_key(oldest):
             native_client_session_cache.remove(oldest)
 
-fn allocate_native_conn(stream: TcpStream, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, alpn_protocol: String, did_resume: Bool, cache_key: String, resumption_master_secret: Bytes, peer_common_name: String, peer_dns_names: List[String], peer_ip_addresses: List[String]) -> Conn:
+fn touch_client_cached_session(cache_key: String):
+    if native_client_session_cache.contains_key(cache_key):
+        native_client_session_cache_order = drop_key(native_client_session_cache_order, cache_key)
+        native_client_session_cache_order.push(cache_key)
+
+fn allocate_native_conn(stream: TcpStream, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState) -> Conn:
     handle := next_native_conn_handle
     next_native_conn_handle = next_native_conn_handle - 1
     native_conn_fd.insert(handle, stream.fd)
@@ -390,12 +416,8 @@ fn allocate_native_conn(stream: TcpStream, cipher: Int, read_keys: tls13.Traffic
     native_conn_read_seq.insert(handle, read_seq)
     native_conn_write_seq.insert(handle, write_seq)
     native_conn_pending.insert(handle, bytes.empty())
-    native_conn_alpn.insert(handle, alpn_protocol)
-    native_conn_did_resume.insert(handle, did_resume)
     native_conn_cache_key.insert(handle, cache_key)
-    native_conn_peer_common_name.insert(handle, peer_common_name)
-    native_conn_peer_dns_names.insert(handle, peer_dns_names)
-    native_conn_peer_ip_addresses.insert(handle, peer_ip_addresses)
+    native_conn_state.insert(handle, copy_connection_state(state))
     if not resumption_master_secret.is_empty():
         native_conn_resumption_master_secret.insert(handle, resumption_master_secret)
     return Conn(handle)
@@ -421,6 +443,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
             if cached_session_expired(cached_session):
                 forget_client_cached_session(cache_key)
             else:
+                touch_client_cached_session(cache_key)
                 binder_input := tls13.client_hello_psk_binder_input(server_name, client_random, session_id, keypair.public_key, alpn_protocols, cached_session.ticket, 0)!
                 binder := tls13.resumption_binder_verify_data_sha256(cached_session.psk, binder_input)!
                 client_hello := tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, alpn_protocols, cached_session.ticket, 0, binder)!
@@ -575,7 +598,9 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         peer_common_name = cached_session.peer_common_name
         peer_dns_names = copy_string_list(cached_session.peer_dns_names)
         peer_ip_addresses = copy_string_list(cached_session.peer_ip_addresses)
-    return allocate_native_conn(stream, server_hello.cipher_suite, server_app_keys, client_app_keys, 0, 0, negotiated_alpn, did_resume, cache_key, resumption_master_secret, peer_common_name, peer_dns_names, peer_ip_addresses)
+    peer_chain_present := peer_common_name != "" or peer_dns_names.len() > 0 or peer_ip_addresses.len() > 0
+    state := ConnectionState(772, server_hello.cipher_suite, negotiated_alpn, did_resume, peer_common_name, peer_dns_names, peer_ip_addresses, peer_chain_present, client_cert_requested, false)
+    return allocate_native_conn(stream, server_hello.cipher_suite, server_app_keys, client_app_keys, 0, 0, cache_key, resumption_master_secret, state)
 
 fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     first_record := native_read_record(stream)!
@@ -600,6 +625,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             elif entry.config_handle == config.handle and client_hello.cipher_suites.contains(entry.cipher) and entry.alpn_protocol == selected_alpn:
                 expected_binder := tls13.resumption_binder_verify_data_sha256(entry.psk, client_hello.psk_binder_input)!
                 if bytes.eq(expected_binder, client_hello.psk_binder):
+                    touch_server_ticket(ticket_key)
                     did_resume = true
                     resumed_psk = entry.psk
                     cipher = entry.cipher
@@ -722,7 +748,9 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         ticket_record := seal_record_for_cipher(cipher, server_app_keys.key, server_app_keys.iv, 0, TLS_CONTENT_HANDSHAKE, ticket_message)!
         native_write_all(stream, ticket_record)!
         initial_write_seq = 1
-    return allocate_native_conn(stream, cipher, client_app_keys, server_app_keys, 0, initial_write_seq, selected_alpn, did_resume, "", bytes.empty(), peer_common_name, peer_dns_names, peer_ip_addresses)
+    peer_chain_present := peer_common_name != "" or peer_dns_names.len() > 0 or peer_ip_addresses.len() > 0
+    state := ConnectionState(772, cipher, selected_alpn, did_resume, peer_common_name, peer_dns_names, peer_ip_addresses, peer_chain_present, client_cert_requested, client_cert_seen and client_cert_verify_seen)
+    return allocate_native_conn(stream, cipher, client_app_keys, server_app_keys, 0, initial_write_seq, "", bytes.empty(), state)
 
 fn record_bytes(record: tls13.Record) -> Bytes!:
     out := bytes.buffer_with_capacity(record.payload.len() + 5)
@@ -771,7 +799,10 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
                         continue
                     psk := tls13.resumption_psk_sha256(native_conn_resumption_master_secret[handle], ticket_message.nonce)!
                     expires_at_ms := time.now() + ttl_ms(ticket_message.ticket_lifetime)
-                    remember_client_cached_session(cache_key, CachedSession(ticket_message.ticket, psk, cipher, native_conn_alpn[handle], native_conn_peer_common_name[handle], copy_string_list(native_conn_peer_dns_names[handle]), copy_string_list(native_conn_peer_ip_addresses[handle]), expires_at_ms))
+                    mut state := empty_connection_state()
+                    if native_conn_state.contains_key(handle):
+                        state = native_conn_state[handle]
+                    remember_client_cached_session(cache_key, CachedSession(ticket_message.ticket, psk, cipher, state.negotiated_protocol, state.peer_common_name, copy_string_list(state.peer_dns_names), copy_string_list(state.peer_ip_addresses), expires_at_ms))
             continue
         if inner.content_type == TLS_CONTENT_APPLICATION_DATA:
             payload := inner.payload
@@ -815,20 +846,12 @@ fn native_conn_close(handle: Int):
         native_conn_write_seq.remove(handle)
     if native_conn_pending.contains_key(handle):
         native_conn_pending.remove(handle)
-    if native_conn_alpn.contains_key(handle):
-        native_conn_alpn.remove(handle)
-    if native_conn_did_resume.contains_key(handle):
-        native_conn_did_resume.remove(handle)
     if native_conn_cache_key.contains_key(handle):
         native_conn_cache_key.remove(handle)
     if native_conn_resumption_master_secret.contains_key(handle):
         native_conn_resumption_master_secret.remove(handle)
-    if native_conn_peer_common_name.contains_key(handle):
-        native_conn_peer_common_name.remove(handle)
-    if native_conn_peer_dns_names.contains_key(handle):
-        native_conn_peer_dns_names.remove(handle)
-    if native_conn_peer_ip_addresses.contains_key(handle):
-        native_conn_peer_ip_addresses.remove(handle)
+    if native_conn_state.contains_key(handle):
+        native_conn_state.remove(handle)
 
 # create a client config using system certificate roots.
 pub fn client_config() -> Config!:
@@ -957,30 +980,25 @@ impl Listener:
         return
 
 impl Conn:
+    fn state() -> ConnectionState:
+        if native_conn_state.contains_key(self.handle):
+            return copy_connection_state(native_conn_state[self.handle])
+        return empty_connection_state()
+
     fn negotiated_protocol() -> String:
-        if native_conn_alpn.contains_key(self.handle):
-            return native_conn_alpn[self.handle]
-        return ""
+        return self.state().negotiated_protocol
 
     fn did_resume() -> Bool:
-        if native_conn_did_resume.contains_key(self.handle):
-            return native_conn_did_resume[self.handle]
-        return false
+        return self.state().did_resume
 
     fn peer_common_name() -> String:
-        if native_conn_peer_common_name.contains_key(self.handle):
-            return native_conn_peer_common_name[self.handle]
-        return ""
+        return self.state().peer_common_name
 
     fn peer_dns_names() -> List[String]:
-        if native_conn_peer_dns_names.contains_key(self.handle):
-            return copy_string_list(native_conn_peer_dns_names[self.handle])
-        return []
+        return self.state().peer_dns_names
 
     fn peer_ip_addresses() -> List[String]:
-        if native_conn_peer_ip_addresses.contains_key(self.handle):
-            return copy_string_list(native_conn_peer_ip_addresses[self.handle])
-        return []
+        return self.state().peer_ip_addresses
 
     fn read_bytes(max_bytes: Int) -> Bytes!:
         if is_native_conn(self.handle):
@@ -1064,9 +1082,20 @@ test "tls config helpers track alpn, client auth, and resumption":
 test "tls wrappers reject invalid handles":
     bad_conn := Conn(-1)
     bad_listener := Listener(-1)
+    bad_state := bad_conn.state()
 
     assert(bad_conn.read_bytes(8).is_err)
     assert(bad_conn.write_bytes(bytes.from_string_utf8("hello")).is_err)
+    assert_eq(bad_state.version, 0)
+    assert_eq(bad_state.cipher_suite, 0)
+    assert_eq(bad_state.negotiated_protocol, "")
+    assert(not bad_state.did_resume)
+    assert_eq(bad_state.peer_common_name, "")
+    assert_eq(bad_state.peer_dns_names.len(), 0)
+    assert_eq(bad_state.peer_ip_addresses.len(), 0)
+    assert(not bad_state.peer_chain_present)
+    assert(not bad_state.client_auth_requested)
+    assert(not bad_state.client_auth_verified)
     assert_eq(bad_conn.negotiated_protocol(), "")
     assert(not bad_conn.did_resume())
     assert_eq(bad_conn.peer_common_name(), "")
@@ -1092,8 +1121,11 @@ test "tls cache helpers evict oldest and expire entries":
         key := "client-" + i.to_string()
         remember_client_cached_session(key, CachedSession(bytes.from_string_utf8(key), bytes.from_string_utf8("psk"), TLS_CIPHER_AES_128_GCM_SHA256, "forge", "", [], [], time.now() + 1000))
         i = i + 1
+    touch_client_cached_session("client-1")
+    remember_client_cached_session("client-extra", CachedSession(bytes.from_string_utf8("extra"), bytes.from_string_utf8("psk"), TLS_CIPHER_AES_128_GCM_SHA256, "forge", "", [], [], time.now() + 1000))
     assert_eq(native_client_session_cache_order.len(), TLS_MAX_CLIENT_SESSION_CACHE)
-    assert(not native_client_session_cache.contains_key("client-0"))
+    assert(not native_client_session_cache.contains_key("client-2"))
+    assert(native_client_session_cache.contains_key("client-1"))
 
     remember_server_ticket("expired", SessionTicketEntry(1, TLS_CIPHER_AES_128_GCM_SHA256, bytes.from_string_utf8("psk"), "forge", time.now() - 1000, 1))
     assert(session_ticket_expired(native_server_session_tickets["expired"]))
@@ -1104,5 +1136,8 @@ test "tls cache helpers evict oldest and expire entries":
         key := "server-" + i.to_string()
         remember_server_ticket(key, SessionTicketEntry(1, TLS_CIPHER_AES_128_GCM_SHA256, bytes.from_string_utf8("psk"), "forge", time.now(), 1000))
         i = i + 1
+    touch_server_ticket("server-1")
+    remember_server_ticket("server-extra", SessionTicketEntry(1, TLS_CIPHER_AES_128_GCM_SHA256, bytes.from_string_utf8("psk"), "forge", time.now(), 1000))
     assert_eq(native_server_session_ticket_order.len(), TLS_MAX_SERVER_SESSION_TICKETS)
-    assert(not native_server_session_tickets.contains_key("server-0"))
+    assert(not native_server_session_tickets.contains_key("server-2"))
+    assert(native_server_session_tickets.contains_key("server-1"))

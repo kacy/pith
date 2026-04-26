@@ -28,12 +28,23 @@ fn run_server(port: Int) -> Int!:
     listener := tls.listen("127.0.0.1", port, server_cfg)!
 
     echo_conn := listener.accept()!
+    echo_state := echo_conn.state()
+    assert(echo_state.version == 772)
+    assert(echo_state.cipher_suite > 0)
+    assert(echo_state.negotiated_protocol == "forge.echo")
+    assert(not echo_state.did_resume)
+    assert(not echo_state.peer_chain_present)
+    assert(not echo_state.client_auth_requested)
+    assert(not echo_state.client_auth_verified)
     assert(echo_conn.peer_common_name() == "")
     msg := echo_conn.read(64)!
     echo_conn.write_all("echo:" + msg)!
     echo_conn.close()
 
     resumed_conn := listener.accept()!
+    resumed_state := resumed_conn.state()
+    assert(resumed_state.did_resume)
+    assert(resumed_state.negotiated_protocol == "forge.echo")
     resumed_msg := resumed_conn.read(64)!
     resumed_conn.write_all("echo:" + resumed_msg)!
     resumed_conn.close()
@@ -54,6 +65,12 @@ fn run_mtls_server(port: Int) -> Int!:
     server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["forge.mtls"]).require_client_ca_file(CA_PATH)!
     listener := tls.listen("127.0.0.1", port, server_cfg)!
     conn := listener.accept()!
+    state := conn.state()
+    assert(state.version == 772)
+    assert(state.negotiated_protocol == "forge.mtls")
+    assert(state.peer_chain_present)
+    assert(state.client_auth_requested)
+    assert(state.client_auth_verified)
     assert(conn.peer_common_name() == "localhost")
     assert(conn.peer_dns_names().contains("localhost"))
     msg := conn.read(64)!
@@ -67,6 +84,12 @@ fn run_optional_client_auth_server(port: Int) -> Int!:
     server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["forge.optional"]).request_client_ca_file(CA_PATH)!
     listener := tls.listen("127.0.0.1", port, server_cfg)!
     conn := listener.accept()!
+    state := conn.state()
+    assert(state.version == 772)
+    assert(state.negotiated_protocol == "forge.optional")
+    assert(not state.peer_chain_present)
+    assert(state.client_auth_requested)
+    assert(not state.client_auth_verified)
     assert(conn.peer_common_name() == "")
     assert(conn.peer_dns_names().len() == 0)
     msg := conn.read(64)!
@@ -83,6 +106,14 @@ fn main() -> Int!:
 
     client_cfg := alpn_client_config()!
     conn := tls.dial_with_config("127.0.0.1", port, "localhost", client_cfg)!
+    state := conn.state()
+    assert(state.version == 772)
+    assert(state.cipher_suite > 0)
+    assert(state.negotiated_protocol == "forge.echo")
+    assert(not state.did_resume)
+    assert(state.peer_chain_present)
+    assert(not state.client_auth_requested)
+    assert(not state.client_auth_verified)
     conn.write_all("forge")!
     assert(conn.read(64)! == "echo:forge")
     assert(conn.negotiated_protocol() == "forge.echo")
@@ -91,6 +122,10 @@ fn main() -> Int!:
     conn.close()
 
     resumed_conn := tls.dial_with_config("127.0.0.1", port, "localhost", client_cfg)!
+    resumed_state := resumed_conn.state()
+    assert(resumed_state.did_resume)
+    assert(resumed_state.peer_chain_present)
+    assert(resumed_state.negotiated_protocol == "forge.echo")
     resumed_conn.write_all("again")!
     assert(resumed_conn.read(64)! == "echo:again")
     assert(resumed_conn.did_resume())
@@ -112,6 +147,11 @@ fn main() -> Int!:
 
     mtls_cfg := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["forge.mtls"]).with_client_certificate(CERT_PATH, KEY_PATH)!
     mtls_conn := tls.dial_with_config("127.0.0.1", mtls_port, "localhost", mtls_cfg)!
+    mtls_state := mtls_conn.state()
+    assert(mtls_state.negotiated_protocol == "forge.mtls")
+    assert(mtls_state.peer_chain_present)
+    assert(not mtls_state.client_auth_requested)
+    assert(not mtls_state.client_auth_verified)
     mtls_conn.write_all("client")!
     assert(mtls_conn.read(64)! == "mtls:client")
     assert(mtls_conn.negotiated_protocol() == "forge.mtls")
@@ -128,6 +168,11 @@ fn main() -> Int!:
 
     optional_cfg := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["forge.optional"])
     optional_conn := tls.dial_with_config("127.0.0.1", optional_port, "localhost", optional_cfg)!
+    optional_state := optional_conn.state()
+    assert(optional_state.negotiated_protocol == "forge.optional")
+    assert(optional_state.peer_chain_present)
+    assert(not optional_state.client_auth_requested)
+    assert(not optional_state.client_auth_verified)
     optional_conn.write_all("guest")!
     assert(optional_conn.read(64)! == "optional:guest")
     assert(optional_conn.negotiated_protocol() == "forge.optional")

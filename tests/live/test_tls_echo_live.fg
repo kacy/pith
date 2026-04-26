@@ -64,6 +64,8 @@ fn run_server(port: Int) -> Int!:
     assert(not echo_state.peer_chain_present)
     assert(not echo_state.client_auth_requested)
     assert(not echo_state.client_auth_verified)
+    assert(echo_conn.version_name() == "tls1.3")
+    assert(echo_conn.cipher_suite_name() != "unknown")
     assert(echo_conn.peer_common_name() == "")
     msg := echo_conn.read(64)!
     echo_conn.write_all("echo:" + msg)!
@@ -124,6 +126,8 @@ fn run_mtls_server(port: Int) -> Int!:
     assert(state.peer_chain_present)
     assert(state.client_auth_requested)
     assert(state.client_auth_verified)
+    assert(conn.client_auth_requested())
+    assert(conn.client_auth_verified())
     assert(conn.peer_common_name() == "localhost")
     assert(conn.peer_dns_names().contains("localhost"))
     msg := conn.read(64)!
@@ -143,6 +147,8 @@ fn run_optional_client_auth_server(port: Int) -> Int!:
     assert(not state.peer_chain_present)
     assert(state.client_auth_requested)
     assert(not state.client_auth_verified)
+    assert(conn.client_auth_requested())
+    assert(not conn.client_auth_verified())
     assert(conn.peer_common_name() == "")
     assert(conn.peer_dns_names().len() == 0)
     msg := conn.read(64)!
@@ -167,6 +173,11 @@ fn main() -> Int!:
     assert(state.peer_chain_present)
     assert(not state.client_auth_requested)
     assert(not state.client_auth_verified)
+    assert(conn.version() == 772)
+    assert(conn.version_name() == "tls1.3")
+    assert(conn.cipher_suite() == state.cipher_suite)
+    assert(conn.cipher_suite_name() != "unknown")
+    assert(conn.peer_chain_present())
     conn.write_all("forge")!
     assert(conn.read(64)! == "echo:forge")
     assert(conn.negotiated_protocol() == "forge.echo")
@@ -179,6 +190,7 @@ fn main() -> Int!:
     assert(resumed_state.did_resume)
     assert(resumed_state.peer_chain_present)
     assert(resumed_state.negotiated_protocol == "forge.echo")
+    assert(resumed_conn.peer_chain_present())
     resumed_conn.write_all("again")!
     assert(resumed_conn.read(64)! == "echo:again")
     assert(resumed_conn.did_resume())
@@ -209,6 +221,7 @@ fn main() -> Int!:
     assert(mtls_state.peer_chain_present)
     assert(not mtls_state.client_auth_requested)
     assert(not mtls_state.client_auth_verified)
+    assert(mtls_conn.version_name() == "tls1.3")
     mtls_conn.write_all("client")!
     assert(mtls_conn.read(64)! == "mtls:client")
     assert(mtls_conn.negotiated_protocol() == "forge.mtls")
@@ -230,6 +243,7 @@ fn main() -> Int!:
     assert(optional_state.peer_chain_present)
     assert(not optional_state.client_auth_requested)
     assert(not optional_state.client_auth_verified)
+    assert(optional_conn.version_name() == "tls1.3")
     optional_conn.write_all("guest")!
     assert(optional_conn.read(64)! == "optional:guest")
     assert(optional_conn.negotiated_protocol() == "forge.optional")
@@ -250,6 +264,7 @@ fn main() -> Int!:
     dynamic_conn := tls.dial_with_config("127.0.0.1", dynamic_port, "localhost", dynamic_cfg)!
     dynamic_state := dynamic_conn.state()
     assert(dynamic_state.negotiated_protocol == "forge.dynamic")
+    assert(dynamic_conn.version_name() == "tls1.3")
     dynamic_conn.write_all("route")!
     assert(dynamic_conn.read(64)! == "dynamic:route")
     dynamic_conn.close()

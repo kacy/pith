@@ -268,6 +268,22 @@ fn traffic_keys_for_cipher(cipher: Int, secret: Bytes) -> tls13.TrafficKeys!:
         return tls13.traffic_keys_chacha20_poly1305_sha256(secret)
     fail "unsupported tls cipher suite"
 
+# return a small printable tls version label for connection state.
+pub fn version_name(version: Int) -> String:
+    if version == 772:
+        return "tls1.3"
+    if version == 771:
+        return "tls1.2"
+    return "unknown"
+
+# return a printable cipher suite label for connection state.
+pub fn cipher_suite_name(cipher: Int) -> String:
+    if cipher == TLS_CIPHER_AES_128_GCM_SHA256:
+        return "TLS_AES_128_GCM_SHA256"
+    if cipher == TLS_CIPHER_CHACHA20_POLY1305_SHA256:
+        return "TLS_CHACHA20_POLY1305_SHA256"
+    return "unknown"
+
 fn select_cipher(client: tls13.ClientHello) -> Int!:
     if client.cipher_suites.contains(TLS_CIPHER_AES_128_GCM_SHA256):
         return TLS_CIPHER_AES_128_GCM_SHA256
@@ -1045,6 +1061,18 @@ impl Conn:
             return copy_connection_state(native_conn_state[self.handle])
         return empty_connection_state()
 
+    fn version() -> Int:
+        return self.state().version
+
+    fn version_name() -> String:
+        return version_name(self.version())
+
+    fn cipher_suite() -> Int:
+        return self.state().cipher_suite
+
+    fn cipher_suite_name() -> String:
+        return cipher_suite_name(self.cipher_suite())
+
     fn negotiated_protocol() -> String:
         return self.state().negotiated_protocol
 
@@ -1059,6 +1087,15 @@ impl Conn:
 
     fn peer_ip_addresses() -> List[String]:
         return self.state().peer_ip_addresses
+
+    fn peer_chain_present() -> Bool:
+        return self.state().peer_chain_present
+
+    fn client_auth_requested() -> Bool:
+        return self.state().client_auth_requested
+
+    fn client_auth_verified() -> Bool:
+        return self.state().client_auth_verified
 
     fn read_bytes(max_bytes: Int) -> Bytes!:
         if is_native_conn(self.handle):
@@ -1174,14 +1211,29 @@ test "tls wrappers reject invalid handles":
     assert(not bad_state.peer_chain_present)
     assert(not bad_state.client_auth_requested)
     assert(not bad_state.client_auth_verified)
+    assert_eq(bad_conn.version(), 0)
+    assert_eq(bad_conn.version_name(), "unknown")
+    assert_eq(bad_conn.cipher_suite(), 0)
+    assert_eq(bad_conn.cipher_suite_name(), "unknown")
     assert_eq(bad_conn.negotiated_protocol(), "")
     assert(not bad_conn.did_resume())
     assert_eq(bad_conn.peer_common_name(), "")
     assert_eq(bad_conn.peer_dns_names().len(), 0)
     assert_eq(bad_conn.peer_ip_addresses().len(), 0)
+    assert(not bad_conn.peer_chain_present())
+    assert(not bad_conn.client_auth_requested())
+    assert(not bad_conn.client_auth_verified())
     assert(bad_listener.accept().is_err)
     bad_conn.close()
     bad_listener.close()
+
+test "tls helper names cover current protocol values":
+    assert_eq(version_name(772), "tls1.3")
+    assert_eq(version_name(771), "tls1.2")
+    assert_eq(version_name(0), "unknown")
+    assert_eq(cipher_suite_name(TLS_CIPHER_AES_128_GCM_SHA256), "TLS_AES_128_GCM_SHA256")
+    assert_eq(cipher_suite_name(TLS_CIPHER_CHACHA20_POLY1305_SHA256), "TLS_CHACHA20_POLY1305_SHA256")
+    assert_eq(cipher_suite_name(0), "unknown")
 
 test "tls cache helpers evict oldest and expire entries":
     native_client_session_cache = {}

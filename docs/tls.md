@@ -45,6 +45,24 @@ the selector receives `ClientHelloInfo` with:
 
 and returns the server config that should handle that connection.
 
+that means one selector can choose between different certificate chains,
+different alpn lists, and different client-auth policies just by returning a
+different `server_config(...)` value.
+
+```fg
+api_cfg := tls.server_config("certs/api.crt", "certs/api.key")!.with_alpn(["forge.rpc"])
+web_cfg := tls.server_config("certs/web.crt", "certs/web.key")!.with_alpn(["http/1.1"])
+
+listener_cfg := tls.with_config_selector(
+    tls.server_config("certs/default.crt", "certs/default.key")!,
+    fn(info: tls.ClientHelloInfo) =>
+        if info.alpn_protocols.contains("forge.rpc"):
+            api_cfg
+        else:
+            web_cfg
+)
+```
+
 ## connection state
 
 every native tls connection exposes a `ConnectionState`:

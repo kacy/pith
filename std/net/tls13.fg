@@ -128,6 +128,25 @@ pub struct NewSessionTicketMessage:
     pub nonce: Bytes
     pub ticket: Bytes
 
+struct ClientKeyShareExtension:
+    group: Int
+    key_share: Bytes
+
+struct ClientPskExtension:
+    identity: Bytes
+    binder: Bytes
+    obfuscated_ticket_age: Int
+    binder_input: Bytes
+
+struct ParsedClientHelloExtensions:
+    supported_versions: List[Int]
+    signature_schemes: List[Int]
+    server_name: String
+    alpn_protocols: List[String]
+    key_share: ClientKeyShareExtension
+    psk_mode_dhe: Bool
+    psk: ClientPskExtension
+
 fn tls13_fail(message: String) -> String:
     return message
 
@@ -301,16 +320,20 @@ fn pre_shared_key_server_extension(selected_identity: Int) -> Bytes!:
     write_u16_be(data, selected_identity)!
     return extension_record(EXT_PRE_SHARED_KEY, data.bytes())
 
-fn default_client_extensions_with_options(server_name: String, x25519_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_binder: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
+fn write_common_client_extensions(out: ByteBuffer, server_name: String, x25519_public_key: Bytes, alpn_protocols: List[String]) -> Bool!:
     if x25519_public_key.len() != 32:
         fail "x25519 public key must be 32 bytes"
-    out := bytes.buffer()
     write_bytes_if_any(out, server_name_extension(server_name)!)!
     write_bytes_if_any(out, alpn_extension(alpn_protocols)!)!
     write_bytes_if_any(out, supported_versions_client_extension()!)!
     write_bytes_if_any(out, supported_groups_extension([GROUP_X25519])!)!
     write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PKCS1_SHA256, SIG_ED25519])!)!
     write_bytes_if_any(out, key_share_client_extension(GROUP_X25519, x25519_public_key)!)!
+    return true
+
+fn default_client_extensions_with_options(server_name: String, x25519_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_binder: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
+    out := bytes.buffer()
+    write_common_client_extensions(out, server_name, x25519_public_key, alpn_protocols)!
     if psk_identity.len() > 0:
         write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
         write_bytes_if_any(out, pre_shared_key_client_extension(psk_identity, psk_obfuscated_ticket_age, psk_binder)!)!
@@ -320,15 +343,8 @@ fn default_client_extensions(server_name: String, x25519_public_key: Bytes) -> B
     return default_client_extensions_with_options(server_name, x25519_public_key, [], bytes.empty(), bytes.empty(), 0)
 
 fn default_client_extensions_partial_psk(server_name: String, x25519_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
-    if x25519_public_key.len() != 32:
-        fail "x25519 public key must be 32 bytes"
     out := bytes.buffer()
-    write_bytes_if_any(out, server_name_extension(server_name)!)!
-    write_bytes_if_any(out, alpn_extension(alpn_protocols)!)!
-    write_bytes_if_any(out, supported_versions_client_extension()!)!
-    write_bytes_if_any(out, supported_groups_extension([GROUP_X25519])!)!
-    write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PKCS1_SHA256, SIG_ED25519])!)!
-    write_bytes_if_any(out, key_share_client_extension(GROUP_X25519, x25519_public_key)!)!
+    write_common_client_extensions(out, server_name, x25519_public_key, alpn_protocols)!
     write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
     write_bytes_if_any(out, pre_shared_key_client_partial_extension(psk_identity, psk_obfuscated_ticket_age, 32)!)!
     return out.bytes()
@@ -549,6 +565,133 @@ fn parse_alpn_protocol_list(data: Bytes) -> List[String]!:
         protocols.push(protocol.to_string_utf8()!)
     return protocols
 
+fn parse_supported_versions_list(data: Bytes) -> List[Int]!:
+    out: List[Int] := []
+    r := binary.reader(data)
+    list_len := checked_read(binary.read_u8(r))!
+    list := checked_bytes(binary.read_bytes(r, list_len))!
+    vr := binary.reader(list)
+    while binary.remaining(vr) > 0:
+        out.push(checked_read(binary.read_u16_be(vr))!)
+    return out
+
+fn parse_client_key_share(data: Bytes) -> ClientKeyShareExtension!:
+    r := binary.reader(data)
+    list_len := checked_read(binary.read_u16_be(r))!
+    list := checked_bytes(binary.read_bytes(r, list_len))!
+    kr := binary.reader(list)
+    if binary.remaining(kr) == 0:
+        return ClientKeyShareExtension(0, bytes.empty())
+    group := checked_read(binary.read_u16_be(kr))!
+    key_len := checked_read(binary.read_u16_be(kr))!
+    return ClientKeyShareExtension(group, checked_bytes(binary.read_bytes(kr, key_len))!)
+
+fn parse_signature_scheme_list(data: Bytes) -> List[Int]!:
+    out: List[Int] := []
+    r := binary.reader(data)
+    list_len := checked_read(binary.read_u16_be(r))!
+    list := checked_bytes(binary.read_bytes(r, list_len))!
+    sr := binary.reader(list)
+    while binary.remaining(sr) > 0:
+        out.push(checked_read(binary.read_u16_be(sr))!)
+    return out
+
+fn parse_server_name_extension(data: Bytes) -> String!:
+    r := binary.reader(data)
+    list_len := checked_read(binary.read_u16_be(r))!
+    names := checked_bytes(binary.read_bytes(r, list_len))!
+    if binary.remaining(r) != 0:
+        fail "malformed tls server name extension"
+    nr := binary.reader(names)
+    if binary.remaining(nr) == 0:
+        return ""
+    name_type := checked_read(binary.read_u8(nr))!
+    if name_type != 0:
+        fail "unsupported tls server name type"
+    name_len := checked_read(binary.read_u16_be(nr))!
+    server_name := checked_bytes(binary.read_bytes(nr, name_len))!.to_string_utf8()!
+    if binary.remaining(nr) != 0:
+        fail "multiple tls server names are not supported"
+    return server_name
+
+fn parse_psk_key_exchange_modes(data: Bytes) -> Bool!:
+    r := binary.reader(data)
+    list_len := checked_read(binary.read_u8(r))!
+    modes := checked_bytes(binary.read_bytes(r, list_len))!
+    if binary.remaining(r) != 0:
+        fail "malformed tls psk key exchange modes"
+    mut i := 0
+    while i < modes.len():
+        if modes[i] == PSK_MODE_DHE_KE:
+            return true
+        i = i + 1
+    return false
+
+fn empty_client_psk_extension() -> ClientPskExtension:
+    return ClientPskExtension(bytes.empty(), bytes.empty(), 0, bytes.empty())
+
+fn parse_client_psk_extension(body: Bytes, extension_body_start: Int, extension_offset: Int, data: Bytes) -> ClientPskExtension!:
+    r := binary.reader(data)
+    identity_len := checked_read(binary.read_u16_be(r))!
+    identities := checked_bytes(binary.read_bytes(r, identity_len))!
+    binders_len_pos := extension_body_start + extension_offset + 4 + 2 + identity_len
+    if binders_len_pos < 0 or binders_len_pos > body.len():
+        fail "malformed tls psk binder input"
+    binder_input := body.slice(0, binders_len_pos)
+    mut identity := bytes.empty()
+    mut obfuscated_ticket_age := 0
+    ir := binary.reader(identities)
+    if binary.remaining(ir) > 0:
+        ticket_len := checked_read(binary.read_u16_be(ir))!
+        identity = checked_bytes(binary.read_bytes(ir, ticket_len))!
+        obfuscated_ticket_age = checked_read(binary.read_u32_be(ir))!
+    binders_len := checked_read(binary.read_u16_be(r))!
+    binders := checked_bytes(binary.read_bytes(r, binders_len))!
+    if binary.remaining(r) != 0:
+        fail "malformed tls pre_shared_key extension"
+    mut binder := bytes.empty()
+    br := binary.reader(binders)
+    if binary.remaining(br) > 0:
+        binder_len := checked_read(binary.read_u8(br))!
+        binder = checked_bytes(binary.read_bytes(br, binder_len))!
+        if binary.remaining(br) != 0:
+            fail "multiple tls psk binders are not supported"
+    if binder.len() == 0:
+        fail "tls psk binder is empty"
+    return ClientPskExtension(identity, binder, obfuscated_ticket_age, binder_input)
+
+fn parse_client_hello_extensions(body: Bytes, extensions: Bytes) -> ParsedClientHelloExtensions!:
+    mut supported_versions: List[Int] := []
+    mut signature_schemes: List[Int] := []
+    mut server_name := ""
+    mut alpn_protocols: List[String] := []
+    mut key_share := ClientKeyShareExtension(0, bytes.empty())
+    mut psk_mode_dhe := false
+    mut psk := empty_client_psk_extension()
+    extension_body_start := body.len() - extensions.len()
+    mut extension_offset := 0
+    r := binary.reader(extensions)
+    while binary.remaining(r) > 0:
+        extension_type := checked_read(binary.read_u16_be(r))!
+        data_len := checked_read(binary.read_u16_be(r))!
+        data := checked_bytes(binary.read_bytes(r, data_len))!
+        if extension_type == EXT_SUPPORTED_VERSIONS:
+            supported_versions = parse_supported_versions_list(data)!
+        elif extension_type == EXT_KEY_SHARE:
+            key_share = parse_client_key_share(data)!
+        elif extension_type == EXT_SIGNATURE_ALGORITHMS:
+            signature_schemes = parse_signature_scheme_list(data)!
+        elif extension_type == EXT_ALPN:
+            alpn_protocols = parse_alpn_protocol_list(data)!
+        elif extension_type == EXT_SERVER_NAME:
+            server_name = parse_server_name_extension(data)!
+        elif extension_type == EXT_PSK_KEY_EXCHANGE_MODES:
+            psk_mode_dhe = parse_psk_key_exchange_modes(data)!
+        elif extension_type == EXT_PRE_SHARED_KEY:
+            psk = parse_client_psk_extension(body, extension_body_start, extension_offset, data)!
+        extension_offset = extension_offset + 4 + data_len
+    return ParsedClientHelloExtensions(supported_versions, signature_schemes, server_name, alpn_protocols, key_share, psk_mode_dhe, psk)
+
 # parse the client hello body from a tls handshake message.
 pub fn parse_client_hello(body: Bytes) -> ClientHello!:
     r := binary.reader(body)
@@ -572,106 +715,12 @@ pub fn parse_client_hello(body: Bytes) -> ClientHello!:
     while binary.remaining(cr) > 0:
         cipher_suites.push(checked_read(binary.read_u16_be(cr))!)
 
-    supported_versions: List[Int] := []
-    signature_schemes: List[Int] := []
-    mut server_name := ""
-    mut alpn_protocols: List[String] := []
-    mut key_share_group := 0
-    mut key_share := bytes.empty()
-    mut psk_mode_dhe := false
-    mut psk_identity := bytes.empty()
-    mut psk_binder := bytes.empty()
-    mut psk_obfuscated_ticket_age := 0
-    mut psk_binder_input := bytes.empty()
-    extension_body_start := body.len() - extensions.len()
-    mut extension_offset := 0
-    er := binary.reader(extensions)
-    while binary.remaining(er) > 0:
-        extension_type := checked_read(binary.read_u16_be(er))!
-        data_len := checked_read(binary.read_u16_be(er))!
-        data := checked_bytes(binary.read_bytes(er, data_len))!
-        if extension_type == EXT_SUPPORTED_VERSIONS:
-            dr := binary.reader(data)
-            list_len := checked_read(binary.read_u8(dr))!
-            list := checked_bytes(binary.read_bytes(dr, list_len))!
-            vr := binary.reader(list)
-            while binary.remaining(vr) > 0:
-                supported_versions.push(checked_read(binary.read_u16_be(vr))!)
-        elif extension_type == EXT_KEY_SHARE:
-            dr := binary.reader(data)
-            list_len := checked_read(binary.read_u16_be(dr))!
-            list := checked_bytes(binary.read_bytes(dr, list_len))!
-            kr := binary.reader(list)
-            if binary.remaining(kr) > 0:
-                key_share_group = checked_read(binary.read_u16_be(kr))!
-                key_len := checked_read(binary.read_u16_be(kr))!
-                key_share = checked_bytes(binary.read_bytes(kr, key_len))!
-        elif extension_type == EXT_SIGNATURE_ALGORITHMS:
-            dr := binary.reader(data)
-            list_len := checked_read(binary.read_u16_be(dr))!
-            list := checked_bytes(binary.read_bytes(dr, list_len))!
-            sr := binary.reader(list)
-            while binary.remaining(sr) > 0:
-                signature_schemes.push(checked_read(binary.read_u16_be(sr))!)
-        elif extension_type == EXT_ALPN:
-            alpn_protocols = parse_alpn_protocol_list(data)!
-        elif extension_type == EXT_SERVER_NAME:
-            dr := binary.reader(data)
-            list_len := checked_read(binary.read_u16_be(dr))!
-            names := checked_bytes(binary.read_bytes(dr, list_len))!
-            if binary.remaining(dr) != 0:
-                fail "malformed tls server name extension"
-            nr := binary.reader(names)
-            if binary.remaining(nr) > 0:
-                name_type := checked_read(binary.read_u8(nr))!
-                if name_type != 0:
-                    fail "unsupported tls server name type"
-                name_len := checked_read(binary.read_u16_be(nr))!
-                server_name = checked_bytes(binary.read_bytes(nr, name_len))!.to_string_utf8()!
-                if binary.remaining(nr) != 0:
-                    fail "multiple tls server names are not supported"
-        elif extension_type == EXT_PSK_KEY_EXCHANGE_MODES:
-            dr := binary.reader(data)
-            list_len := checked_read(binary.read_u8(dr))!
-            modes := checked_bytes(binary.read_bytes(dr, list_len))!
-            if binary.remaining(dr) != 0:
-                fail "malformed tls psk key exchange modes"
-            mut i := 0
-            while i < modes.len():
-                if modes[i] == PSK_MODE_DHE_KE:
-                    psk_mode_dhe = true
-                i = i + 1
-        elif extension_type == EXT_PRE_SHARED_KEY:
-            dr := binary.reader(data)
-            identity_len := checked_read(binary.read_u16_be(dr))!
-            identities := checked_bytes(binary.read_bytes(dr, identity_len))!
-            binders_len_pos := extension_body_start + extension_offset + 4 + 2 + identity_len
-            if binders_len_pos < 0 or binders_len_pos > body.len():
-                fail "malformed tls psk binder input"
-            psk_binder_input = body.slice(0, binders_len_pos)
-            ir := binary.reader(identities)
-            if binary.remaining(ir) > 0:
-                ticket_len := checked_read(binary.read_u16_be(ir))!
-                psk_identity = checked_bytes(binary.read_bytes(ir, ticket_len))!
-                psk_obfuscated_ticket_age = checked_read(binary.read_u32_be(ir))!
-            binders_len := checked_read(binary.read_u16_be(dr))!
-            binders := checked_bytes(binary.read_bytes(dr, binders_len))!
-            if binary.remaining(dr) != 0:
-                fail "malformed tls pre_shared_key extension"
-            br := binary.reader(binders)
-            if binary.remaining(br) > 0:
-                binder_len := checked_read(binary.read_u8(br))!
-                psk_binder = checked_bytes(binary.read_bytes(br, binder_len))!
-                if binary.remaining(br) != 0:
-                    fail "multiple tls psk binders are not supported"
-            if psk_binder.len() == 0:
-                fail "tls psk binder is empty"
-        extension_offset = extension_offset + 4 + data_len
-    if not supported_versions.contains(TLS13_VERSION):
+    parsed := parse_client_hello_extensions(body, extensions)!
+    if not parsed.supported_versions.contains(TLS13_VERSION):
         fail "client did not offer tls 1.3"
-    if key_share_group != GROUP_X25519 or key_share.len() != 32:
+    if parsed.key_share.group != GROUP_X25519 or parsed.key_share.key_share.len() != 32:
         fail "client hello missing x25519 key share"
-    return ClientHello(legacy_version, random, session_id, server_name, cipher_suites, supported_versions, key_share_group, key_share, signature_schemes, alpn_protocols, psk_mode_dhe, psk_identity, psk_binder, psk_obfuscated_ticket_age, psk_binder_input)
+    return ClientHello(legacy_version, random, session_id, parsed.server_name, cipher_suites, parsed.supported_versions, parsed.key_share.group, parsed.key_share.key_share, parsed.signature_schemes, parsed.alpn_protocols, parsed.psk_mode_dhe, parsed.psk.identity, parsed.psk.binder, parsed.psk.obfuscated_ticket_age, parsed.psk.binder_input)
 
 # encode a tls 1.3 server hello.
 pub fn encode_server_hello(random: Bytes, session_id: Bytes, cipher_suite: Int, x25519_public_key: Bytes) -> Bytes!:

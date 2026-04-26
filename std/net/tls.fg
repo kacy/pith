@@ -154,6 +154,11 @@ struct PeerIdentity:
     certificates: List[PeerCertificate]
     chain_present: Bool
 
+struct ServerResumptionDecision:
+    did_resume: Bool
+    cipher: Int
+    psk: Bytes
+
 # a tls listener.
 pub struct Listener:
     pub handle: Int
@@ -465,6 +470,67 @@ fn select_server_config(config: Config, client_hello: tls13.ClientHello) -> Conf
         fail "tls config selector must return a server config"
     return selected
 
+fn selected_psk_identity(did_resume: Bool) -> Int:
+    if did_resume:
+        return 0
+    return 0 - 1
+
+fn handshake_secret_for_resumption(did_resume: Bool, psk: Bytes, shared_secret: Bytes) -> Bytes!:
+    if did_resume:
+        return tls13.handshake_secret_from_early_secret_sha256(tls13.early_secret_from_psk_sha256(psk), shared_secret)
+    return tls13.handshake_secret_sha256(shared_secret)
+
+fn select_server_resumption(config: Config, client_hello: tls13.ClientHello, selected_alpn: String, fallback_cipher: Int) -> ServerResumptionDecision!:
+    if not config_resumption_enabled(config) or config_requires_client_certificate(config):
+        return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
+    if not client_hello.psk_mode_dhe or client_hello.psk_identity.len() == 0:
+        return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
+
+    ticket_key := server_ticket_key(client_hello.psk_identity)
+    if not native_server_session_tickets.contains_key(ticket_key):
+        return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
+    entry := native_server_session_tickets[ticket_key]
+    if session_ticket_expired(entry):
+        forget_server_ticket(ticket_key)
+        return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
+    if entry.config_handle != config.handle or not client_hello.cipher_suites.contains(entry.cipher) or entry.alpn_protocol != selected_alpn:
+        return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
+    expected_binder := tls13.resumption_binder_verify_data_sha256(entry.psk, client_hello.psk_binder_input)!
+    if not bytes.eq(expected_binder, client_hello.psk_binder):
+        return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
+    touch_server_ticket(ticket_key)
+    return ServerResumptionDecision(true, entry.cipher, entry.psk)
+
+fn append_client_certificate_flight(config: Config, transcript: ByteBuffer, flight: ByteBuffer) -> Bool!:
+    if config_has_client_certificate(config):
+        client_certs := native_config_client_cert_chain(config)!
+        client_certificate := tls13.encode_certificate_message(client_certs)!
+        transcript.write(client_certificate)!
+        client_cert_input := tls13.client_certificate_verify_input_sha256(transcript.bytes())!
+        client_sig := signature.sign_rsa_pss_sha256_pkcs8(native_client_private_key(config)!, client_cert_input)!
+        client_certificate_verify := tls13.encode_certificate_verify(TLS_SIG_RSA_PSS_RSAE_SHA256, client_sig)!
+        transcript.write(client_certificate_verify)!
+        flight.write(client_certificate)!
+        flight.write(client_certificate_verify)!
+        return true
+    client_certificate := tls13.encode_certificate_message([])!
+    transcript.write(client_certificate)!
+    flight.write(client_certificate)!
+    return true
+
+fn send_new_session_ticket_if_enabled(stream: TcpStream, config: Config, client_cert_requested: Bool, cipher: Int, selected_alpn: String, master_secret: Bytes, transcript: ByteBuffer, server_app_keys: tls13.TrafficKeys) -> Int!:
+    if not config_resumption_enabled(config) or client_cert_requested:
+        return 0
+    ticket_nonce := random.bytes(8)!
+    ticket := random.bytes(32)!
+    resumption_master_secret := tls13.resumption_master_secret_sha256(master_secret, transcript.bytes())!
+    ticket_psk := tls13.resumption_psk_sha256(resumption_master_secret, ticket_nonce)!
+    remember_server_ticket(server_ticket_key(ticket), SessionTicketEntry(config.handle, cipher, ticket_psk, selected_alpn, time.now(), ttl_ms(TLS_SESSION_TICKET_LIFETIME)))
+    ticket_message := tls13.encode_new_session_ticket(TLS_SESSION_TICKET_LIFETIME, 0, ticket_nonce, ticket)!
+    ticket_record := seal_record_for_cipher(cipher, server_app_keys.key, server_app_keys.iv, 0, TLS_CONTENT_HANDSHAKE, ticket_message)!
+    native_write_all(stream, ticket_record)!
+    return 1
+
 fn ttl_ms(seconds: Int) -> Int:
     if seconds <= 0:
         return 0
@@ -605,11 +671,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
         if not offering_psk or server_hello.selected_psk_identity != 0:
             fail "server selected an unexpected tls psk identity"
         did_resume = true
-    mut handshake_secret := bytes.empty()
-    if did_resume:
-        handshake_secret = tls13.handshake_secret_from_early_secret_sha256(tls13.early_secret_from_psk_sha256(cached_session.psk), shared_secret)!
-    else:
-        handshake_secret = tls13.handshake_secret_sha256(shared_secret)!
+    handshake_secret := handshake_secret_for_resumption(did_resume, cached_session.psk, shared_secret)!
     server_hs_secret := tls13.server_handshake_traffic_secret_sha256(handshake_secret, transcript_buf.bytes())!
     client_hs_secret := tls13.client_handshake_traffic_secret_sha256(handshake_secret, transcript_buf.bytes())!
     server_hs_keys := traffic_keys_for_cipher(server_hello.cipher_suite, server_hs_secret)!
@@ -687,20 +749,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
 
     client_flight := bytes.buffer()
     if client_cert_requested:
-        if config_has_client_certificate(config):
-            client_certs := native_config_client_cert_chain(config)!
-            client_certificate := tls13.encode_certificate_message(client_certs)!
-            transcript_buf.write(client_certificate)!
-            client_cert_input := tls13.client_certificate_verify_input_sha256(transcript_buf.bytes())!
-            client_sig := signature.sign_rsa_pss_sha256_pkcs8(native_client_private_key(config)!, client_cert_input)!
-            client_certificate_verify := tls13.encode_certificate_verify(TLS_SIG_RSA_PSS_RSAE_SHA256, client_sig)!
-            transcript_buf.write(client_certificate_verify)!
-            client_flight.write(client_certificate)!
-            client_flight.write(client_certificate_verify)!
-        else:
-            client_certificate := tls13.encode_certificate_message([])!
-            transcript_buf.write(client_certificate)!
-            client_flight.write(client_certificate)!
+        append_client_certificate_flight(config, transcript_buf, client_flight)!
     client_verify := tls13.finished_verify_data_sha256(client_hs_secret, transcript_buf.bytes())!
     client_finished := tls13.encode_finished(client_verify)!
     transcript_buf.write(client_finished)!
@@ -730,30 +779,15 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
         fail "expected tls client hello"
     client_hello := tls13.parse_client_hello(client_messages[0].body)!
     handshake_config := select_server_config(config, client_hello)!
-    mut cipher := select_cipher(client_hello)!
+    fallback_cipher := select_cipher(client_hello)!
     selected_alpn := select_alpn_protocol(handshake_config, client_hello.alpn_protocols)!
-    mut did_resume := false
-    mut resumed_psk := bytes.empty()
-    if config_resumption_enabled(handshake_config) and not config_requires_client_certificate(handshake_config) and client_hello.psk_mode_dhe and client_hello.psk_identity.len() > 0:
-        ticket_key := server_ticket_key(client_hello.psk_identity)
-        if native_server_session_tickets.contains_key(ticket_key):
-            entry := native_server_session_tickets[ticket_key]
-            if session_ticket_expired(entry):
-                forget_server_ticket(ticket_key)
-            elif entry.config_handle == handshake_config.handle and client_hello.cipher_suites.contains(entry.cipher) and entry.alpn_protocol == selected_alpn:
-                expected_binder := tls13.resumption_binder_verify_data_sha256(entry.psk, client_hello.psk_binder_input)!
-                if bytes.eq(expected_binder, client_hello.psk_binder):
-                    touch_server_ticket(ticket_key)
-                    did_resume = true
-                    resumed_psk = entry.psk
-                    cipher = entry.cipher
+    resumption := select_server_resumption(handshake_config, client_hello, selected_alpn, fallback_cipher)!
+    cipher := resumption.cipher
+    did_resume := resumption.did_resume
 
     keypair := ecdh.x25519_keypair()!
     server_random := random.bytes(32)!
-    mut selected_psk_identity := 0 - 1
-    if did_resume:
-        selected_psk_identity = 0
-    server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, selected_psk_identity)!
+    server_hello := tls13.encode_server_hello_with_options(server_random, client_hello.session_id, cipher, keypair.public_key, selected_psk_identity(did_resume))!
     native_write_all(stream, tls13.encode_record(TLS_CONTENT_HANDSHAKE, server_hello)!)!
 
     transcript := bytes.buffer()
@@ -763,11 +797,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
 
     shared_secret := keypair.shared_secret(client_hello.key_share)!
     keypair.close()
-    mut handshake_secret := bytes.empty()
-    if did_resume:
-        handshake_secret = tls13.handshake_secret_from_early_secret_sha256(tls13.early_secret_from_psk_sha256(resumed_psk), shared_secret)!
-    else:
-        handshake_secret = tls13.handshake_secret_sha256(shared_secret)!
+    handshake_secret := handshake_secret_for_resumption(did_resume, resumption.psk, shared_secret)!
     server_hs_secret := tls13.server_handshake_traffic_secret_sha256(handshake_secret, transcript.bytes())!
     client_hs_secret := tls13.client_handshake_traffic_secret_sha256(handshake_secret, transcript.bytes())!
     server_hs_keys := traffic_keys_for_cipher(cipher, server_hs_secret)!
@@ -851,17 +881,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     client_app_secret := tls13.client_application_traffic_secret_sha256(master_secret, application_transcript)!
     server_app_keys := traffic_keys_for_cipher(cipher, server_app_secret)!
     client_app_keys := traffic_keys_for_cipher(cipher, client_app_secret)!
-    mut initial_write_seq := 0
-    if config_resumption_enabled(handshake_config) and not client_cert_requested:
-        ticket_nonce := random.bytes(8)!
-        ticket := random.bytes(32)!
-        resumption_master_secret := tls13.resumption_master_secret_sha256(master_secret, transcript.bytes())!
-        ticket_psk := tls13.resumption_psk_sha256(resumption_master_secret, ticket_nonce)!
-        remember_server_ticket(server_ticket_key(ticket), SessionTicketEntry(handshake_config.handle, cipher, ticket_psk, selected_alpn, time.now(), ttl_ms(TLS_SESSION_TICKET_LIFETIME)))
-        ticket_message := tls13.encode_new_session_ticket(TLS_SESSION_TICKET_LIFETIME, 0, ticket_nonce, ticket)!
-        ticket_record := seal_record_for_cipher(cipher, server_app_keys.key, server_app_keys.iv, 0, TLS_CONTENT_HANDSHAKE, ticket_message)!
-        native_write_all(stream, ticket_record)!
-        initial_write_seq = 1
+    initial_write_seq := send_new_session_ticket_if_enabled(stream, handshake_config, client_cert_requested, cipher, selected_alpn, master_secret, transcript, server_app_keys)!
     state := connection_state_from_peer(772, cipher, selected_alpn, did_resume, peer, client_cert_requested, client_cert_seen and client_cert_verify_seen)
     run_verify_connection_hook(handshake_config, state)!
     return allocate_native_conn(stream, cipher, client_app_keys, server_app_keys, 0, initial_write_seq, "", bytes.empty(), state)
@@ -874,6 +894,24 @@ fn record_bytes(record: tls13.Record) -> Bytes!:
     if record.payload.len() > 0:
         out.write(record.payload)!
     return out.bytes()
+
+fn remember_client_ticket_from_message(handle: Int, cipher: Int, message: tls13.HandshakeMessage) -> Bool!:
+    if message.message_type != TLS_HANDSHAKE_NEW_SESSION_TICKET or not native_conn_resumption_master_secret.contains_key(handle):
+        return false
+    cache_key := native_conn_cache_key[handle]
+    if cache_key == "":
+        return false
+    ticket_message := tls13.parse_new_session_ticket(message.body)!
+    if ticket_message.ticket_lifetime <= 0:
+        return false
+    psk := tls13.resumption_psk_sha256(native_conn_resumption_master_secret[handle], ticket_message.nonce)!
+    expires_at_ms := time.now() + ttl_ms(ticket_message.ticket_lifetime)
+    mut state := empty_connection_state()
+    if native_conn_state.contains_key(handle):
+        state = native_conn_state[handle]
+    peer := peer_identity_from_connection_state(state)
+    remember_client_cached_session(cache_key, cached_session_from_peer(ticket_message.ticket, psk, cipher, state.negotiated_protocol, peer, expires_at_ms))
+    return true
 
 fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     mut size := max_bytes
@@ -904,20 +942,7 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
         if inner.content_type == TLS_CONTENT_HANDSHAKE:
             messages := tls13.decode_handshakes(inner.payload)!
             for message in messages:
-                if message.message_type == TLS_HANDSHAKE_NEW_SESSION_TICKET and native_conn_resumption_master_secret.contains_key(handle):
-                    cache_key := native_conn_cache_key[handle]
-                    if cache_key == "":
-                        continue
-                    ticket_message := tls13.parse_new_session_ticket(message.body)!
-                    if ticket_message.ticket_lifetime <= 0:
-                        continue
-                    psk := tls13.resumption_psk_sha256(native_conn_resumption_master_secret[handle], ticket_message.nonce)!
-                    expires_at_ms := time.now() + ttl_ms(ticket_message.ticket_lifetime)
-                    mut state := empty_connection_state()
-                    if native_conn_state.contains_key(handle):
-                        state = native_conn_state[handle]
-                    peer := peer_identity_from_connection_state(state)
-                    remember_client_cached_session(cache_key, cached_session_from_peer(ticket_message.ticket, psk, cipher, state.negotiated_protocol, peer, expires_at_ms))
+                remember_client_ticket_from_message(handle, cipher, message)!
             continue
         if inner.content_type == TLS_CONTENT_APPLICATION_DATA:
             payload := inner.payload

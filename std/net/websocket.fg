@@ -57,6 +57,15 @@ pub struct WebSocket:
 struct WebSocketMessage:
     pub opcode: Int
     pub payload: Bytes
+
+struct FrameHeader:
+    first_byte: Int
+    fin: Bool
+    opcode: Int
+    masked: Bool
+    payload_len: Int
+    header_size: Int
+
 # ===============================================================
 # Handshake Computation
 # ===============================================================
@@ -425,6 +434,15 @@ fn apply_mask(payload: Bytes, mask_key: Bytes) -> Bytes!:
     return buf.bytes()
 fn frame_mask_key(data: Bytes, header_size: Int) -> Bytes:
     return data.slice(header_size - 4, header_size)
+
+fn parse_frame_header(data: Bytes) -> FrameHeader!:
+    if data.len() < 2:
+        fail "websocket frame too short"
+    first_byte := data[0]
+    if has_reserved_bits(first_byte):
+        fail "websocket reserved bits are not supported"
+    return FrameHeader(first_byte, bits.band(first_byte, 128) != 0, bits.band(first_byte, 15), frame_is_masked(data[1]), frame_payload_length(data)!, frame_header_size(data)!)
+
 fn has_reserved_bits(first_byte: Int) -> Bool:
     return bits.band(first_byte, 112) != 0
 fn is_data_opcode(opcode: Int) -> Bool:
@@ -480,27 +498,17 @@ fn is_control_opcode(opcode: Int) -> Bool:
     return opcode == OP_CLOSE or opcode == OP_PING or opcode == OP_PONG
 # parses one raw websocket frame.
 pub fn parse_frame(data: Bytes) -> WebSocketFrame!:
-    if data.len() < 2:
-        fail "websocket frame too short"
-    if has_reserved_bits(data[0]):
-        fail "websocket reserved bits are not supported"
-    fin := bits.band(data[0], 128) != 0
-    opcode := bits.band(data[0], 15)
-    masked := frame_is_masked(data[1])
-    payload_len := frame_payload_length(data)!
-    header_size := frame_header_size(data)!
-    if data.len() < header_size + payload_len:
+    header := parse_frame_header(data)!
+    if data.len() < header.header_size + header.payload_len:
         fail "websocket frame payload truncated"
-    payload_start := header_size
-    payload_end := payload_start + payload_len
+    payload_start := header.header_size
+    payload_end := payload_start + header.payload_len
     payload := data.slice(payload_start, payload_end)
     mut decoded_payload := payload
-    if masked:
-        decoded_payload = apply_mask(payload, frame_mask_key(data, header_size))!
-    validate_frame_rules(data[0], fin, opcode, decoded_payload)!
-    if masked:
-        return WebSocketFrame(fin, opcode, true, decoded_payload)
-    return WebSocketFrame(fin, opcode, false, decoded_payload)
+    if header.masked:
+        decoded_payload = apply_mask(payload, frame_mask_key(data, header.header_size))!
+    validate_frame_rules(header.first_byte, header.fin, header.opcode, decoded_payload)!
+    return WebSocketFrame(header.fin, header.opcode, header.masked, decoded_payload)
 # builds one unmasked websocket frame.
 pub fn frame_bytes(opcode: Int, payload: Bytes) -> Bytes!:
     return frame_bytes_with_fin(opcode, payload, true)
@@ -597,6 +605,20 @@ fn send_frame(ws: WebSocket, opcode: Int, payload: Bytes, fin: Bool) -> Int!:
     writer.write_bytes(frame)!
     ensure_writer_flushed(writer)!
     return payload.len()
+
+fn handle_control_frame(ws: WebSocket, frame: WebSocketFrame) -> Bool!:
+    if frame.is_ping():
+        ws.pong(frame.payload)!
+        return true
+    if frame.is_pong():
+        return true
+    if frame.is_close():
+        if not ws.is_closed():
+            send_frame(ws, OP_CLOSE, frame.payload, true)!
+        ws.close_now()
+        fail "websocket closed"
+    return false
+
 fn receive_message(ws: WebSocket) -> WebSocketMessage!:
     if ws.is_closed():
         fail "websocket is closed"
@@ -606,16 +628,8 @@ fn receive_message(ws: WebSocket) -> WebSocketMessage!:
     while true:
         frame := read_frame_buffered(reader)!
         validate_frame_direction(ws, frame)!
-        if frame.is_ping():
-            ws.pong(frame.payload)!
+        if handle_control_frame(ws, frame)!:
             continue
-        if frame.is_pong():
-            continue
-        if frame.is_close():
-            if not ws.is_closed():
-                send_frame(ws, OP_CLOSE, frame.payload, true)!
-            ws.close_now()
-            fail "websocket closed"
         if frame.opcode == OP_CONTINUATION:
             if message_opcode == OP_CONTINUATION:
                 fail "unexpected websocket continuation frame"

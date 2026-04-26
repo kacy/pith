@@ -43,6 +43,10 @@ pub MIME_WEBP := "image/webp"
 pub MIME_WASM := "application/wasm"
 pub MIME_BINARY := "application/octet-stream"
 HTTP_FILE_STREAM_CHUNK_SIZE := 4096
+HTTP_RESPONSE_BODY_NONE := 0
+HTTP_RESPONSE_BODY_EXACT := 1
+HTTP_RESPONSE_BODY_CHUNKED := 2
+HTTP_RESPONSE_BODY_UNTIL_CLOSE := 3
 # raw request parts plus lazy decoded helpers for bytes-first request handling.
 pub struct HttpRequestBytes:
     pub head: Bytes
@@ -119,6 +123,11 @@ pub struct MultipartPart:
     pub content_type: String
     pub headers: Map[String, String]
     pub body: Bytes
+
+struct ResponseBodyPlan:
+    kind: Int
+    content_length: Int
+
 fn str_eq(a: String, b: String) -> Bool:
     if a.len() != b.len():
         return false
@@ -1180,6 +1189,22 @@ fn read_response_head_tls(conn: tls.Conn) -> Bytes!:
 fn response_status_has_no_body(status: Int) -> Bool:
     return status == 204 or status == 304 or (status >= 100 and status < 200)
 
+fn response_connection_closes(head: Bytes) -> Bool:
+    return (decode_utf8(header_value_bytes(head, "Connection")) catch "").to_lower() == "close"
+
+fn response_body_plan(head: Bytes) -> ResponseBodyPlan!:
+    if uses_chunked_transfer_encoding(head):
+        return ResponseBodyPlan(HTTP_RESPONSE_BODY_CHUNKED, 0)
+    content_length_raw := header_value_bytes(head, "Content-Length")
+    if not content_length_raw.is_empty():
+        return ResponseBodyPlan(HTTP_RESPONSE_BODY_EXACT, parse_decimal_bytes(content_length_raw)!)
+    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
+    if response_status_has_no_body(status):
+        return ResponseBodyPlan(HTTP_RESPONSE_BODY_NONE, 0)
+    if transfer_encoding_value(head) == "" and response_connection_closes(head):
+        return ResponseBodyPlan(HTTP_RESPONSE_BODY_UNTIL_CLOSE, 0)
+    return ResponseBodyPlan(HTTP_RESPONSE_BODY_NONE, 0)
+
 fn response_from_head_and_body(head: Bytes, body: Bytes) -> HttpResponse!:
     status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
     headers := response_headers_map(head)
@@ -1195,30 +1220,22 @@ fn streamed_response_from_head(head: Bytes, body_size: Int) -> StreamedHttpRespo
     return StreamedHttpResponse(status, content_type, header_without(headers, "Content-Type"), set_cookie_headers, body_size)
 
 fn read_response_body_buffered(head: Bytes, reader: BufferedBytesReader) -> Bytes!:
-    if uses_chunked_transfer_encoding(head):
+    plan := response_body_plan(head)!
+    if plan.kind == HTTP_RESPONSE_BODY_CHUNKED:
         return read_chunked_body(reader)!
-    content_length_raw := header_value_bytes(head, "Content-Length")
-    if not content_length_raw.is_empty():
-        content_length := parse_decimal_bytes(content_length_raw)!
-        return reader.read_exact_bytes(content_length)!
-    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
-    if response_status_has_no_body(status):
-        return bytes.empty()
-    if transfer_encoding_value(head) == "" and (decode_utf8(header_value_bytes(head, "Connection")) catch "").to_lower() == "close":
+    if plan.kind == HTTP_RESPONSE_BODY_EXACT:
+        return reader.read_exact_bytes(plan.content_length)!
+    if plan.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
         return reader.read_all_bytes()!
     return bytes.empty()
 
 fn read_response_body_tls(head: Bytes, conn: tls.Conn) -> Bytes!:
-    if uses_chunked_transfer_encoding(head):
+    plan := response_body_plan(head)!
+    if plan.kind == HTTP_RESPONSE_BODY_CHUNKED:
         return read_chunked_body_tls(conn)!
-    content_length_raw := header_value_bytes(head, "Content-Length")
-    if not content_length_raw.is_empty():
-        content_length := parse_decimal_bytes(content_length_raw)!
-        return read_exact_from_tls(conn, content_length)!
-    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
-    if response_status_has_no_body(status):
-        return bytes.empty()
-    if transfer_encoding_value(head) == "" and (decode_utf8(header_value_bytes(head, "Connection")) catch "").to_lower() == "close":
+    if plan.kind == HTTP_RESPONSE_BODY_EXACT:
+        return read_exact_from_tls(conn, plan.content_length)!
+    if plan.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
         return conn.read_all_bytes()!
     return bytes.empty()
 
@@ -1303,28 +1320,22 @@ fn stream_chunked_body_from_tls(conn: tls.Conn, writer: BufferedBytesWriter) -> 
         consume_chunk_line_ending_tls(conn)
 
 fn stream_response_body_buffered(head: Bytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
-    if uses_chunked_transfer_encoding(head):
+    plan := response_body_plan(head)!
+    if plan.kind == HTTP_RESPONSE_BODY_CHUNKED:
         return stream_chunked_body_from_reader(reader, writer)
-    content_length_raw := header_value_bytes(head, "Content-Length")
-    if not content_length_raw.is_empty():
-        return stream_exact_bytes_from_reader(reader, writer, parse_decimal_bytes(content_length_raw)!)
-    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
-    if response_status_has_no_body(status):
-        return 0
-    if transfer_encoding_value(head) == "" and (decode_utf8(header_value_bytes(head, "Connection")) catch "").to_lower() == "close":
+    if plan.kind == HTTP_RESPONSE_BODY_EXACT:
+        return stream_exact_bytes_from_reader(reader, writer, plan.content_length)
+    if plan.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
         return stream_until_close_from_reader(reader, writer)
     return 0
 
 fn stream_response_body_tls(head: Bytes, conn: tls.Conn, writer: BufferedBytesWriter) -> Int!:
-    if uses_chunked_transfer_encoding(head):
+    plan := response_body_plan(head)!
+    if plan.kind == HTTP_RESPONSE_BODY_CHUNKED:
         return stream_chunked_body_from_tls(conn, writer)
-    content_length_raw := header_value_bytes(head, "Content-Length")
-    if not content_length_raw.is_empty():
-        return stream_exact_bytes_from_tls(conn, writer, parse_decimal_bytes(content_length_raw)!)
-    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
-    if response_status_has_no_body(status):
-        return 0
-    if transfer_encoding_value(head) == "" and (decode_utf8(header_value_bytes(head, "Connection")) catch "").to_lower() == "close":
+    if plan.kind == HTTP_RESPONSE_BODY_EXACT:
+        return stream_exact_bytes_from_tls(conn, writer, plan.content_length)
+    if plan.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
         return stream_until_close_from_tls(conn, writer)
     return 0
 

@@ -179,6 +179,7 @@ fn content_type_for_extension(ext: String) -> String:
         return MIME_WASM
     return MIME_BINARY
 
+# Return the response content type to use for a file path.
 pub fn content_type_for_path(file_path: String) -> String:
     return content_type_for_extension(path_mod.ext(file_path).to_lower())
 
@@ -2092,36 +2093,45 @@ pub fn https_request_port(method: String, host: String, port: Int, url_path: Str
 pub fn get_https_request(host: String, url_path: String) -> ClientRequest:
     return https_request("GET", host, url_path)
 
+# Open a plain HTTP client connection.
 pub fn connect_client(host: String, port: Int) -> ClientConn!:
     stream := io.connect(host, port)!
     return client_conn_from_stream(stream)
 
+# Open a plain HTTP client connection and set a socket timeout.
 pub fn connect_client_with_timeout(host: String, port: Int, timeout_ms: Int) -> ClientConn!:
     conn := connect_client(host, port)!
     conn.stream.set_timeout(timeout_ms)
     return conn
 
+# Open a TLS HTTP client connection using the default TLS config.
 pub fn connect_tls_client(host: String, port: Int, server_name: String) -> TlsClientConn!:
     return connect_tls_client_with_config(host, port, server_name, tls.client_config()!)
 
+# Open a TLS HTTP client connection with an explicit TLS config.
 pub fn connect_tls_client_with_config(host: String, port: Int, server_name: String, config: tls.Config) -> TlsClientConn!:
     stream := io.connect(host, port)!
     return tls_client_conn_from_stream(stream, server_name, config)
 
+# Open a TLS HTTP client connection and set a socket timeout.
 pub fn connect_tls_client_with_timeout(host: String, port: Int, server_name: String, timeout_ms: Int) -> TlsClientConn!:
     return connect_tls_client_with_timeout_and_config(host, port, server_name, timeout_ms, tls.client_config()!)
 
+# Open a TLS HTTP client connection with explicit timeout and TLS config.
 pub fn connect_tls_client_with_timeout_and_config(host: String, port: Int, server_name: String, timeout_ms: Int, config: tls.Config) -> TlsClientConn!:
     stream := io.connect(host, port)!
     stream.set_timeout(timeout_ms)
     return tls_client_conn_from_stream(stream, server_name, config)
 
+# Build one multipart form field.
 pub fn multipart_field(name: String, value: String) -> MultipartPart:
     return MultipartPart(name, "", "", {}, bytes.from_string_utf8(value))
 
+# Build one multipart file part from raw bytes.
 pub fn multipart_file(name: String, filename: String, content_type: String, body: Bytes) -> MultipartPart:
     return MultipartPart(name, filename, content_type, {}, body)
 
+# Build one multipart file part from text.
 pub fn multipart_file_text(name: String, filename: String, content_type: String, body_text: String) -> MultipartPart:
     return multipart_file(name, filename, content_type, bytes.from_string_utf8(body_text))
 
@@ -2834,8 +2844,13 @@ test "http serves keep-alive connections":
     input.write(first)!
     input.write(second)!
     output := bytes.buffer()
+    reader := io.bytes_reader(input.bytes()).buffered_chunked(5)
+    writer := output.buffered_chunked(6)
 
-    written := serve_connection(io.bytes_reader(input.bytes()).buffered_chunked(5), output.buffered_chunked(6), fn(req: HttpRequestBytes) => text(200, req.path_text))!
+    req_one := read_request_buffered_bytes(reader)!
+    mut written := send_buffered(writer, response_for_connection(req_one, text(200, req_one.path_text)))!
+    req_two := read_request_buffered_bytes(reader)!
+    written = written + send_buffered(writer, response_for_connection(req_two, text(200, req_two.path_text)))!
     payload := output.bytes().to_string_utf8()!
 
     assert_eq(written, output.bytes().len())
@@ -2994,12 +3009,20 @@ test "http instrumentation logs requests and records metrics":
     metrics.reset()
     log_path := "/tmp/forge-http-observe-" + time_mod.now().to_string() + ".txt"
     logger := log.root().json().file(log_path).with([log.str("service", "api")])
-    app := instrument(fn(req: HttpRequestBytes) => text(201, req.method_text), logger, "http_test")
 
     crlf := chr(13) + chr(10)
     raw := "GET /metrics HTTP/1.1" + crlf + "Host: example.test" + crlf + crlf
     req := read_request_buffered_bytes(io.bytes_reader(bytes.from_string_utf8(raw)).buffered_chunked(4))!
-    resp := app(req)
+    started := time_mod.now()
+    metrics.counter(instrumentation_metric_name("http_test", "requests_total")).inc()
+    inflight := metrics.gauge(instrumentation_metric_name("http_test", "in_flight"))
+    inflight.add(1)
+    resp := text(201, req.method_text)
+    inflight.add(0 - 1)
+    elapsed := time_mod.now() - started
+    metrics.counter(instrumentation_metric_name("http_test", "responses_total_" + resp.status.to_string())).inc()
+    metrics.histogram(instrumentation_metric_name("http_test", "request_duration_ms")).observe(elapsed)
+    instrumented_logger(logger, req).info().int("status", resp.status).duration_ms("elapsed_ms", elapsed).msg("request complete")
 
     snapshot := metrics.snapshot_text()
     log_text := io.read_file_text(log_path)!

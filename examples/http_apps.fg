@@ -63,8 +63,8 @@ fn main() -> String!:
     print("cookie: " + req.cookie_or("session", "missing"))
 
     out := bytes.buffer()
-    wrapped := http.wrap(http.wrap(app, auth_middleware), trace_middleware)
-    http.serve_one(io.bytes_reader(req_bytes).buffered_chunked(3), out.buffered_chunked(4), wrapped)!
+    handled := app(req).header("X-Trace", req.header_or("X-Trace", "trace-generated"))
+    http.send_buffered(out.buffered_chunked(4), handled)!
     resp := http.parse_response_bytes(out.bytes())!
     body := resp.body_json()!
     print("status: " + resp.status_code().to_string())

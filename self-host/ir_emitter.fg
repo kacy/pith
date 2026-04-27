@@ -45,7 +45,7 @@ BYTES_RETURNING_FUNCS := "bytes_from_string_utf8,read_file_bytes,file_read_bytes
 LIST_RETURNING_FUNCS := "args,range,repeat_val,zeros,sort,sort_desc,reversed,take,drop,slice,unique,without,intersection,difference,flatten,chunks"
 LIST_STRING_RETURNING_FUNCS := "sort_strings,zip,enumerate,toml_keys"
 BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,list_contains,list_contains_string,list_is_empty,send,try_send,close,is_closed,is_done"
-VOID_METHODS := "reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear,detach"
+VOID_METHODS := "reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear,detach,lock,unlock,done,wait,acquire,release"
 STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,list_join,read_file,env,chr"
 
 # --- emitted ir buffers ---
@@ -695,6 +695,9 @@ fn ir_retkind(type_name: String) -> String:
     if ir_struct_names.contains_key(resolved):
         return "struct:" + resolved
     return resolved
+
+fn ir_is_sync_primitive_name(name: String) -> Bool:
+    return name == "Mutex" or name == "WaitGroup" or name == "Semaphore"
 
 fn ir_is_declared_callable(name: String) -> Bool:
     return ir_func_returns.contains_key(name)
@@ -2540,7 +2543,7 @@ fn ir_field_kind_tid(kind: String) -> Int:
         return 6
     if ir_struct_names.contains_key(kind):
         return lookup_type_id(kind)
-    return -1
+    return - 1
 
 fn ir_struct_field_tid_at(struct_name: String, field_index: Int, fallback_tid: Int) -> Int:
     mut field_kind := ir_struct_field_kind_from_decl(struct_name, field_index)
@@ -5092,7 +5095,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     expr_tid := c_get_expr_type(idx)
     if expr_tid >= 0:
         expr_info := get_type_info(expr_tid)
-        if expr_info.kind == "struct" and ir_is_declared_callable(callee.name) == false:
+        if expr_info.kind == "struct" and ir_is_declared_callable(callee.name) == false and not ir_is_sync_primitive_name(callee.name):
             mut arg_nodes: List[Int] := []
             for child, i in node.children:
                 if i == 0:

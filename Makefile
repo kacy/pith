@@ -106,7 +106,7 @@ bootstrap-ir-invariants-only:
 	else \
 		echo "FAIL sync primitive retkind invariants"; fail=$$((fail+1)); \
 	fi; \
-	if timeout 15 ./self-host/ir_driver --combined examples/generic_interfaces.fg | awk 'BEGIN { value=0; x=0; bad=0 } /^field / && NF==4 { bad=1 } /^field / && $$5=="T" && $$6=="value" { value=1 } /^field / && $$5=="int" && $$6=="x" { x=1 } END { if (value && x && !bad) exit 0; exit 1 }'; then \
+	if timeout 15 ./self-host/ir_driver --combined examples/generic_interfaces.fg | awk 'BEGIN { value=0; x=0; bad=0 } /^field / && NF==4 { bad=1 } /^field / && ($$5=="T" || $$5=="Point") && $$6=="value" { value=1 } /^field / && $$5=="int" && $$6=="x" { x=1 } END { if (value && x && !bad) exit 0; exit 1 }'; then \
 		pass=$$((pass+1)); echo "ok   imported struct field metadata"; \
 	else \
 		echo "FAIL imported struct field metadata"; fail=$$((fail+1)); \

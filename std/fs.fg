@@ -1,5 +1,6 @@
 # file streams build on std.io's shared handle-backed surface
 from std.io import FileStream
+import std.bytes as bytes
 import std.os as os
 import std.os.path as path
 
@@ -16,6 +17,9 @@ import std.os.path as path
 #       content := fs.read("config.txt")!
 #       fs.write("backup.txt", content)!
 
+FS_IO_CHUNK_SIZE := 4096
+
+# Basic metadata for a path.
 pub struct Info:
     pub path: String
     pub exists: Bool
@@ -51,10 +55,49 @@ fn atomic_temp_path(target_path: String) -> String:
     prefix := "." + path.base(target_path) + "."
     return temp_path_impl(dir_path, prefix, ".tmp")
 
+fn fs_read_all(stream: FileStream) -> String!:
+    mut out := ""
+    mut chunk := stream.read(FS_IO_CHUNK_SIZE)!
+    while chunk.len() > 0:
+        out = out + chunk
+        chunk = stream.read(FS_IO_CHUNK_SIZE)!
+    return out
+
+fn fs_read_all_bytes(stream: FileStream) -> Bytes!:
+    buf := bytes.buffer_with_capacity(FS_IO_CHUNK_SIZE)
+    mut chunk := stream.read_bytes(FS_IO_CHUNK_SIZE)!
+    while not chunk.is_empty():
+        buf.write(chunk)!
+        chunk = stream.read_bytes(FS_IO_CHUNK_SIZE)!
+    return buf.bytes()
+
+fn fs_write_all(stream: FileStream, data: String) -> Int!:
+    mut total := 0
+    mut remaining := data
+    while remaining.len() > 0:
+        wrote := stream.write(remaining)!
+        if wrote <= 0:
+            fail "write returned 0"
+        total = total + wrote
+        remaining = remaining.substring(wrote, remaining.len())
+    return total
+
+fn fs_write_all_bytes(stream: FileStream, data: Bytes) -> Int!:
+    mut total := 0
+    mut remaining := data
+    while not remaining.is_empty():
+        wrote := stream.write_bytes(remaining)!
+        if wrote <= 0:
+            fail "write returned 0"
+        total = total + wrote
+        remaining = remaining.slice(wrote, remaining.len())
+    return total
+
 # ===============================================================
 # File Existence and Type
 # ===============================================================
 
+# True when a path exists.
 pub fn exists(path: String) -> Bool:
     return file_exists(path)
 
@@ -70,6 +113,7 @@ pub fn is_file(path: String) -> Bool:
 # File Reading and Writing
 # ===============================================================
 
+# Read an entire file as text.
 pub fn read(path: String) -> String!:
     return read_file(path)
 
@@ -131,10 +175,39 @@ pub fn create(path: String) -> FileStream!:
 pub fn open_append(path: String) -> FileStream!:
     return FileStream(file_open_append(path)!)
 
+impl FileStream:
+    fn read(max_bytes: Int) -> String!:
+        return file_read_bytes(self.handle, max_bytes)!.to_string_utf8()!
+
+    fn read_all() -> String!:
+        return fs_read_all(self)
+
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return file_read_bytes(self.handle, max_bytes)
+
+    fn read_all_bytes() -> Bytes!:
+        return fs_read_all_bytes(self)
+
+    fn write(data: String) -> Int!:
+        return file_write_bytes(self.handle, bytes.from_string_utf8(data))!
+
+    fn write_all(data: String) -> Int!:
+        return fs_write_all(self, data)
+
+    fn write_bytes(data: Bytes) -> Int!:
+        return file_write_bytes(self.handle, data)
+
+    fn write_all_bytes(data: Bytes) -> Int!:
+        return fs_write_all_bytes(self, data)
+
+    fn close():
+        file_close(self.handle)
+
 # ===============================================================
 # File and Directory Management
 # ===============================================================
 
+# Remove one file.
 pub fn remove(path: String) -> Bool:
     return remove_file(path)
 

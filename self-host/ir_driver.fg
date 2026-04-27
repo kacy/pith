@@ -292,6 +292,9 @@ fn validate_combined_ir_contract(ir: String):
     lines := ir_lines(ir)
     mut line_no := 1
     for line in lines:
+        if not line.starts_with("struct ") and not line.starts_with("func "):
+            line_no = line_no + 1
+            continue
         parts := line.split(" ")
         if parts.len() >= 2 and parts[0] == "struct":
             struct_names.insert(parts[1], true)
@@ -300,6 +303,9 @@ fn validate_combined_ir_contract(ir: String):
 
     line_no = 1
     for line in lines:
+        if not line.starts_with("call ") and not line.starts_with("field "):
+            line_no = line_no + 1
+            continue
         parts := line.split(" ")
         validate_call_retkind(line_no, parts, struct_names)
         validate_field_contract(line_no, line, parts)

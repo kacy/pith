@@ -3,6 +3,7 @@
 import std.json as json
 import std.fs as fs
 import std.io as io
+import std.fmt as fmt
 
 struct ToolInfo:
     pub name: String
@@ -23,37 +24,37 @@ fn main() -> String!:
     input_buf.write(rb)!
     input := input_buf.string()
     root := json.parse(input)
-    print("type = " + json.type_of(root))
+    print("type = {json.type_of(root)}")
 
     # extract fields
-    print("name = " + json.object_get_string(root, "name"))
-    print("version = " + json.object_get_int(root, "version").to_string())
-    print("active = " + json.object_get_bool(root, "active").to_string())
-    print("missing = " + json.object_get_string_or(root, "missing", "n/a"))
+    print("name = {json.object_get_string(root, "name")}")
+    print("version = {json.object_get_int(root, "version")}")
+    print("active = {json.object_get_bool(root, "active")}")
+    print("missing = {json.object_get_string_or(root, "missing", "n/a")}")
 
     shallow := lb + "\"name\":\"forge\",\"version\":1,\"active\":true" + rb
     info := json.decode_text[ToolInfo](shallow)
     if info.is_ok:
-        print("decoded = " + info.ok.name + "@" + info.ok.version.to_string())
+        print("decoded = {info.ok.name}@{info.ok.version}")
 
     # array access
     tags := json.object_get_array(root, "tags")
-    print("tags.len = " + json.array_len(tags).to_string())
-    print("tags[0] = " + json.get_string(json.array_get(tags, 0)))
-    print("tags[1] = " + json.get_string(json.array_get(tags, 1)))
+    print("tags.len = {json.array_len(tags)}")
+    print("tags[0] = {json.get_string(json.array_get(tags, 0))}")
+    print("tags[1] = {json.get_string(json.array_get(tags, 1))}")
 
     # key queries
-    print("has name = " + json.object_has(root, "name").to_string())
-    print("has missing = " + json.object_has(root, "missing").to_string())
+    print("has name = {json.object_has(root, "name")}")
+    print("has missing = {json.object_has(root, "missing")}")
 
     names := json.object_keys(root)
-    print("keys = " + names.join(", "))
+    print("keys = {fmt.join_strings(names, ", ")}")
 
     # parse numbers
     nums := json.parse("[42, 3.14, -7, 0]")
-    print("nums type = " + json.type_of(nums))
-    print("nums[0] = " + json.get_int(json.array_get(nums, 0)).to_string())
-    print("nums[1] = " + json.get_float(json.array_get(nums, 1)).to_string())
+    print("nums type = {json.type_of(nums)}")
+    print("nums[0] = {json.get_int(json.array_get(nums, 0))}")
+    print("nums[1] = {json.get_float(json.array_get(nums, 1))}")
 
     # build and encode JSON
     obj := json.make_object()
@@ -64,18 +65,18 @@ fn main() -> String!:
     json.array_push(arr, json.make_int(2))
     json.array_push(arr, json.make_int(3))
     json.object_set(obj, "items", arr)
-    print("encoded = " + json.encode(obj))
-    print("saved = " + json.save(path, obj).to_string())
+    print("encoded = {json.encode(obj)}")
+    print("saved = {json.save(path, obj)}")
 
     loaded := json.parse_file(path)
-    print("file tool = " + json.object_get_string(loaded, "tool"))
+    print("file tool = {json.object_get_string(loaded, "tool")}")
 
     # null and bool
-    print("null type = " + json.type_of(json.parse("null")))
-    print("true type = " + json.type_of(json.parse("true")))
+    print("null type = {json.type_of(json.parse("null"))}")
+    print("true type = {json.type_of(json.parse("true"))}")
 
     # invalid parse
     bad := json.parse("not json")
-    print("bad parse = " + bad.to_string())
+    print("bad parse = {bad}")
     fs.remove(path)
     return ""

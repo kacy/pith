@@ -176,6 +176,12 @@ fn get_tokens_from_compiler(path: &str) -> Result<String, String> {
 
 /// Find the pre-compiled IR driver binary
 fn find_ir_driver() -> Option<String> {
+    if let Ok(path) = env::var("FORGE_IR_DRIVER") {
+        if Path::new(&path).exists() {
+            return Some(path);
+        }
+    }
+
     for candidate in &["./self-host/ir_driver", "../self-host/ir_driver"] {
         if Path::new(candidate).exists() {
             return Some(candidate.to_string());
@@ -185,8 +191,8 @@ fn find_ir_driver() -> Option<String> {
 }
 
 fn get_ir_from_compiler(path: &str, emit_tests: bool) -> Result<String, String> {
-    let driver = find_ir_driver()
-        .ok_or("No IR driver found. Ensure ./self-host/ir_driver exists.")?;
+    let driver =
+        find_ir_driver().ok_or("No IR driver found. Ensure ./self-host/ir_driver exists.")?;
     let mut command = Command::new(&driver);
     command.arg("--combined");
     if emit_tests {
@@ -206,24 +212,53 @@ fn get_ir_from_compiler(path: &str, emit_tests: bool) -> Result<String, String> 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn validate_combined_ir_contract(ir_text: &str) -> Result<(), String> {
+    for (index, line) in ir_text.lines().enumerate() {
+        let line_no = index + 1;
+        if line.starts_with("call ") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 5 {
+                return Err(format!(
+                    "IR contract error on line {}: malformed call",
+                    line_no
+                ));
+            }
+            if parts[3].parse::<usize>().is_ok() || parts[4].parse::<usize>().is_err() {
+                return Err(format!(
+                    "IR contract error on line {}: call instructions must include an explicit return kind",
+                    line_no
+                ));
+            }
+        } else if line.starts_with("field ") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 4 || parts[3].parse::<i32>().is_err() {
+                return Err(format!(
+                    "IR contract error on line {}: field instructions must include an explicit offset",
+                    line_no
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn compile_to_object(path: &str, emit_tests: bool) -> Result<(Vec<u8>, usize), String> {
     use forge_codegen::create_codegen;
     use forge_codegen::finalize_module;
     use forge_codegen::ir_consumer::compile_from_ir;
 
-    let ir_text = get_ir_from_compiler(path, emit_tests)
-        .map_err(|e| format!("Error getting IR: {}", e))?;
+    let ir_text =
+        get_ir_from_compiler(path, emit_tests).map_err(|e| format!("Error getting IR: {}", e))?;
+    validate_combined_ir_contract(&ir_text)?;
 
     dump_ir_if_requested(&ir_text);
 
-    let mut codegen = create_codegen()
-        .map_err(|e| format!("Error creating codegen: {}", e))?;
+    let mut codegen = create_codegen().map_err(|e| format!("Error creating codegen: {}", e))?;
     let runtime_funcs = forge_codegen::declare_runtime_functions(&mut codegen.module)
         .map_err(|e| format!("Error declaring runtime: {}", e))?;
     let funcs = compile_from_ir(&mut codegen, &ir_text, &runtime_funcs)
         .map_err(|e| format!("Error compiling: {}", e))?;
-    let bytes = finalize_module(codegen.module)
-        .map_err(|e| format!("Error finalizing: {}", e))?;
+    let bytes = finalize_module(codegen.module).map_err(|e| format!("Error finalizing: {}", e))?;
     Ok((bytes, funcs.len()))
 }
 
@@ -347,6 +382,29 @@ fn test_file(path: &str) {
             eprintln!("Error linking {}: {}", exe_path.display(), e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_combined_ir_contract;
+
+    #[test]
+    fn accepts_explicit_call_and_field_contracts() {
+        let ir = "func main 0 unknown\ncall 1 greet string 1 0\nfield 2 1 0 Point name\n";
+        assert!(validate_combined_ir_contract(ir).is_ok());
+    }
+
+    #[test]
+    fn rejects_legacy_call_without_retkind() {
+        let ir = "call 1 greet 1 0\n";
+        assert!(validate_combined_ir_contract(ir).is_err());
+    }
+
+    #[test]
+    fn rejects_field_without_offset() {
+        let ir = "field 2 1 Point name\n";
+        assert!(validate_combined_ir_contract(ir).is_err());
     }
 }
 

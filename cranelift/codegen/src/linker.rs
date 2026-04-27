@@ -39,15 +39,35 @@ pub fn link_executable(
 
 /// Get the path to the runtime static library
 pub fn get_runtime_lib_path() -> String {
-    // In development, use target/release
-    if std::path::Path::new("target/release/libforge_runtime.a").exists() {
-        "target/release/libforge_runtime.a".to_string()
-    } else if std::path::Path::new("../target/release/libforge_runtime.a").exists() {
-        "../target/release/libforge_runtime.a".to_string()
-    } else {
-        // Try to find it
-        "target/release/libforge_runtime.a".to_string()
+    if let Ok(path) = std::env::var("FORGE_RUNTIME_LIB") {
+        if std::path::Path::new(&path).exists() {
+            return path;
+        }
     }
+
+    for candidate in &[
+        "target/release/libforge_runtime.a",
+        "../target/release/libforge_runtime.a",
+    ] {
+        if std::path::Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(root) = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            let candidate = root.join("target/release/libforge_runtime.a");
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    "target/release/libforge_runtime.a".to_string()
 }
 
 /// Rebuild the runtime static library if sources are newer than the .a file.

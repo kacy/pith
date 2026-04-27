@@ -7,11 +7,17 @@ backend demos.
 
 ## Current Inventory
 
+Update: the first round of IR hardening has landed. Combined IR now carries
+explicit call return kinds and field metadata, and CI checks those contracts
+with `make bootstrap-ir-checks-only`. The remaining work is to make that
+validated path the only native build path and keep deleting Rust-side frontend
+policy.
+
 Source totals:
 
-- `self-host/*.fg`: 18,814 lines
-- `std/**/*.fg`: 21,281 lines
-- `cranelift/**/*.rs`: 10,532 lines
+- `self-host/*.fg`: about 22,450 lines
+- `std/**/*.fg`: about 10,690 lines
+- `cranelift/**/*.rs`: about 10,550 lines
 
 Rust breakdown:
 
@@ -51,6 +57,11 @@ support them.
 
 ### Phase 1: Delete Rust-side Backend Guessing
 
+Status: mostly done. The IR emitter now writes explicit call return kinds, and
+field instructions carry enough type metadata for the backend to stop guessing
+common struct and string cases. The next step is enforcement: native builds
+should always ask the IR driver to validate the combined contract.
+
 Target files:
 
 - `cranelift/codegen/src/ir_consumer.rs`
@@ -89,6 +100,7 @@ Acceptance criteria:
 - `ir_consumer.rs` no longer contains return-type inference loops
 - most symbol dispatch becomes direct rather than heuristic
 - backend bugs stop looking like “Rust guessed the wrong type”
+- native build/run/test uses validated combined IR by default
 
 ### Phase 2: Move CLI Orchestration Into Forge
 
@@ -331,13 +343,13 @@ The common pattern is not “missing power”. It is “too much ceremony”.
 
 If work begins now, the first concrete implementation steps should be:
 
-1. Extend the self-hosted IR emitter to attach explicit call/return metadata
-2. Simplify `ir_consumer.rs` to trust emitted metadata
-3. Move import graph walking from `cranelift/cli/src/main.rs` into Forge
+1. Use validated combined IR for native build/run/test
+2. Simplify `ir_consumer.rs` further now that it can trust emitted metadata
+3. Move the remaining CLI orchestration policy out of `cranelift/cli/src/main.rs`
 4. Decide whether JSON/TOML/URL ownership belongs primarily in Forge stdlib or
    Rust runtime, then delete the duplicate side
-5. Add formatting and display improvements so examples can be rewritten in the
-   new idiomatic style
+5. Keep adding small formatting, display, and collection helpers that let
+   examples read like normal application code
 
 ## Proposed IR Contract For Phase 1
 

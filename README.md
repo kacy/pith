@@ -33,6 +33,7 @@ make self-host
 - `docs/concurrency.md` for channels, contexts, select, and task waits
 - `docs/http_apps.md` for the higher-level http request/response layer
 - `docs/text_and_bytes.md` for the string/bytes split and common helpers
+- `docs/idiomatic_forge.md` for the current everyday style
 - `docs/contributing.md` for the development loop and smoke checks
 - `docs/tooling_stdlib.md` for glob, cli, diagnostic, and testing helpers
 - `self-host/forge_main.fg` for the self-hosted frontend (lex/parse/check/fmt/lint/doc)
@@ -102,7 +103,7 @@ fn main():
 ## what works today
 
 the self-hosted compiler handles the full pipeline: lex → parse → check →
-codegen. 82 deterministic example programs compile and produce verified
+codegen. 85 deterministic example programs compile and produce verified
 output via the Cranelift native backend.
 
 **language features:**
@@ -132,7 +133,7 @@ output via the Cranelift native backend.
 - concurrency: spawn/await, Task[T], Mutex, WaitGroup, Semaphore, Channel, select, contexts, timers
 - multi-module imports with `from ... import`
 
-**standard library (57 modules):**
+**standard library (58 modules):**
 - string methods, type conversions, math builtins
 - file I/O, env, args, exit, exec
 - collection methods (push, remove, contains, keys, values, reverse, etc.)
@@ -243,7 +244,7 @@ cranelift/             native code backend — Rust + Cranelift (~10,500 lines)
   codegen/           AST-to-IR compilation, monomorphization, type inference
   runtime/           runtime library (ARC, collections, JSON, TOML, URL, concurrency, crypto)
 
-std/                 standard library (56 native forge modules)
+std/                 standard library (58 native forge modules)
   cli.fg             command-line parsing helpers
   diagnostic.fg      reusable diagnostics for tools
   encoding.fg        base64/hex encoding

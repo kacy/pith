@@ -296,21 +296,22 @@ fn cmd_new(name: String) -> String!:
 
     # Makefile
     mut mk := ".PHONY: build test check fmt lint" + nl
+    mk = mk + "FORGE ?= forge" + nl
     mk = mk + nl
     mk = mk + "build:" + nl
-    mk = mk + tab + "forge build lib.fg" + nl
+    mk = mk + tab + "$(FORGE) build lib.fg" + nl
     mk = mk + nl
     mk = mk + "test:" + nl
-    mk = mk + tab + "forge test lib.fg" + nl
+    mk = mk + tab + "$(FORGE) test lib.fg" + nl
     mk = mk + nl
     mk = mk + "check:" + nl
-    mk = mk + tab + "forge check lib.fg" + nl
+    mk = mk + tab + "$(FORGE) check lib.fg" + nl
     mk = mk + nl
     mk = mk + "fmt:" + nl
-    mk = mk + tab + "forge fmt lib.fg" + nl
+    mk = mk + tab + "$(FORGE) fmt lib.fg" + nl
     mk = mk + nl
     mk = mk + "lint:" + nl
-    mk = mk + tab + "forge lint lib.fg" + nl
+    mk = mk + tab + "$(FORGE) lint lib.fg" + nl
     write_file(name + "/Makefile", mk)!
 
     # Dockerfile
@@ -328,8 +329,12 @@ fn cmd_new(name: String) -> String!:
     # lib.fg
     mut lib := "# " + name + nl
     lib = lib + nl
+    lib = lib + "# Return a greeting from this package." + nl
     lib = lib + "pub fn hello() -> String:" + nl
     lib = lib + "    return " + chr(34) + "hello from " + name + chr(34) + nl
+    lib = lib + nl
+    lib = lib + "test " + chr(34) + "hello returns package greeting" + chr(34) + ":" + nl
+    lib = lib + "    assert_eq(hello(), " + chr(34) + "hello from " + name + chr(34) + ")" + nl
     write_file(name + "/lib.fg", lib)!
 
     print("created " + name + "/")

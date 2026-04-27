@@ -1,7 +1,8 @@
 # data pipeline — transform, filter, aggregate over structured data
 # exercises: structs, lists, maps, lambdas, closures, string methods, for loops
 
-import std.io as io
+import std.collections as collections
+import std.fmt as fmt
 
 struct Record:
     name: String
@@ -21,61 +22,31 @@ fn make_records() -> List[Record]:
     return records
 
 fn filter_by_category(records: List[Record], cat: String) -> List[Record]:
-    mut result: List[Record] := []
-    mut i := 0
-    while i < records.len():
-        r := records[i]
-        if r.category == cat:
-            result.push(r)
-        i = i + 1
-    return result
+    return collections.filter_list(records, fn(record: Record) => record.category == cat)
 
 fn average_score(records: List[Record]) -> Int:
     if records.len() == 0:
         return 0
-    mut total := 0
-    mut i := 0
-    while i < records.len():
-        total = total + records[i].score
-        i = i + 1
+    total := collections.fold_list(records, 0, fn(acc: Int, record: Record) => acc + record.score)
     return total / records.len()
 
 fn max_score(records: List[Record]) -> Record:
-    mut best := records[0]
-    mut i := 1
-    while i < records.len():
-        if records[i].score > best.score:
-            best = records[i]
-        i = i + 1
-    return best
+    return collections.max_by(records, fn(record: Record) => record.score) catch records[0]
 
 fn count_by_category(records: List[Record]) -> Map[String, Int]:
-    mut counts: Map[String, Int] := {}
-    mut i := 0
-    while i < records.len():
-        cat := records[i].category
-        cur := counts.get_default(cat, 0)
-        counts.insert(cat, cur + 1)
-        i = i + 1
-    return counts
+    return collections.count_by(records, fn(record: Record) => record.category)
 
-fn names_list(records: List[Record]) -> String!:
-    out := io.string_buffer()
-    mut i := 0
-    while i < records.len():
-        if i > 0:
-            out.write(", ")!
-        out.write(records[i].name)!
-        i = i + 1
-    return out.string()
+fn names_list(records: List[Record]) -> String:
+    names := collections.map_list(records, fn(record: Record) => record.name)
+    return fmt.join_strings(names, ", ")
 
-fn main() -> String!:
+fn main():
     records := make_records()
     print("total records: {records.len()}")
 
     # filter
     eng := filter_by_category(records, "engineering")
-    eng_names := names_list(eng)!
+    eng_names := names_list(eng)
     print("engineering count: {eng.len()}")
     print("engineering names: {eng_names}")
 
@@ -99,4 +70,3 @@ fn main() -> String!:
     print("overall best: {overall_best.name} ({overall_best.score})")
 
     print("pipeline works")
-    return ""

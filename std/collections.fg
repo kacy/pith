@@ -76,6 +76,28 @@ pub fn filter_strings(items: List[String], keep: fn(String) -> Bool) -> List[Str
             result.push(item)
     return result
 
+# map every item to a new list.
+pub fn map_list[T, U](items: List[T], mapper: fn(T) -> U) -> List[U]:
+    mut result: List[U] := []
+    for item in items:
+        result.push(mapper(item))
+    return result
+
+# keep only items that match the predicate.
+pub fn filter_list[T](items: List[T], keep: fn(T) -> Bool) -> List[T]:
+    mut result: List[T] := []
+    for item in items:
+        if keep(item):
+            result.push(item)
+    return result
+
+# reduce a list into a single value.
+pub fn fold_list[T, U](items: List[T], init: U, reducer: fn(U, T) -> U) -> U:
+    mut result := init
+    for item in items:
+        result = reducer(result, item)
+    return result
+
 # ===============================================================
 # Aggregation
 # ===============================================================
@@ -370,6 +392,10 @@ pub fn find[T](items: List[T], keep: fn(T) -> Bool) -> T!CollectionError:
             return item
     fail CollectionError{"no matching item"}
 
+# return the first matching item or fail when nothing matches.
+pub fn find_first[T](items: List[T], keep: fn(T) -> Bool) -> T!CollectionError:
+    return find(items, keep)!
+
 # split items into kept and dropped buckets.
 pub fn partition[T](items: List[T], keep: fn(T) -> Bool) -> List[List[T]]:
     mut kept: List[T] := []
@@ -604,7 +630,18 @@ test "collection predicate helpers find values":
     assert(all(nums, fn(n: Int) => n > 0))
     assert_eq(find_index(nums, fn(n: Int) => n == 3), 2)
     assert_eq(find(nums, fn(n: Int) => n == 4)!, 4)
+    assert_eq(find_first(nums, fn(n: Int) => n == 2)!, 2)
     assert_eq(count_where(nums, fn(n: Int) => n % 2 == 0), 2)
+
+test "generic list helpers transform values":
+    nums := [1, 2, 3, 4]
+    doubled := map_list(nums, fn(n: Int) => n * 2)
+    evens := filter_list(nums, fn(n: Int) => n % 2 == 0)
+    total := fold_list(nums, 0, fn(acc: Int, n: Int) => acc + n)
+
+    assert_eq(doubled[1], 4)
+    assert_eq(evens.len(), 2)
+    assert_eq(total, 10)
 
 test "collection map helpers transform entries":
     mut scores: Map[String, Int] := {}

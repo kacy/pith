@@ -48,7 +48,8 @@ make bootstrap
 ## example style
 
 - prefer interpolation for direct value printing: `print("count: {items.len()}")`
-- use `std.fmt` when you need a reusable template or literal braces
+- use `std.fmt` when you need a reusable template, literal braces, or common collection display helpers
+- use `std.collections` helpers like `map_list`, `filter_list`, `fold_list`, and `count_by` for straightforward list transforms
 - use `std.io.string_buffer()` for incremental text assembly in loops or builders
 - avoid long chains of `"..." + value.to_string()` in user-facing examples unless interpolation would be awkward
 - prefer `std.testing.assert_eq(...)` / `assert_ne(...)` for straightforward test comparisons

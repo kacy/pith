@@ -887,6 +887,9 @@ pub unsafe extern "C" fn pith_list_map(list_ptr: i64, closure_handle: i64) -> i6
         return 0;
     };
     let func_ptr = crate::pith_closure_get_fn(closure_handle);
+    if func_ptr == 0 {
+        return 0;
+    }
     let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
     let result = pith_list_new(8, 0);
     let result_ptr = result.ptr as i64;
@@ -918,6 +921,9 @@ pub unsafe extern "C" fn pith_list_filter(list_ptr: i64, closure_handle: i64) ->
         return result.ptr as i64;
     };
     let func_ptr = crate::pith_closure_get_fn(closure_handle);
+    if func_ptr == 0 {
+        return result.ptr as i64;
+    }
     let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
 
     for i in 0..impl_ref.len() {
@@ -941,6 +947,9 @@ pub unsafe extern "C" fn pith_list_reduce(list_ptr: i64, init: i64, closure_hand
         return init;
     };
     let func_ptr = crate::pith_closure_get_fn(closure_handle);
+    if func_ptr == 0 {
+        return init;
+    }
     let func: extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
 
     let mut acc = init;
@@ -963,11 +972,77 @@ pub unsafe extern "C" fn pith_list_each(list_ptr: i64, closure_handle: i64) {
         return;
     };
     let func_ptr = crate::pith_closure_get_fn(closure_handle);
+    if func_ptr == 0 {
+        return;
+    }
     let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
 
     for i in 0..impl_ref.len() {
         if let Some(val) = impl_ref.get_value(i) {
             func(closure_handle, val);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bogus_list() -> PithList {
+        PithList {
+            ptr: 12345usize as *mut (),
+        }
+    }
+
+    #[test]
+    fn invalid_list_handles_return_safe_defaults() {
+        unsafe {
+            assert_eq!(pith_list_len(bogus_list()), 0);
+            assert_eq!(pith_list_is_empty(bogus_list()), 1);
+            assert_eq!(pith_list_get_value(bogus_list(), 0), 0);
+            assert_eq!(pith_list_get_value_unchecked(bogus_list(), 0), 0);
+            pith_list_set_value(bogus_list(), 0, 7);
+            pith_list_reverse(bogus_list());
+            pith_list_release(bogus_list());
+        }
+    }
+
+    #[test]
+    fn released_list_handles_are_rejected() {
+        unsafe {
+            let list = pith_list_new(8, 0);
+            pith_list_push_value(list, 7);
+            assert_eq!(pith_list_len(list), 1);
+            pith_list_release(list);
+            assert_eq!(pith_list_len(list), 0);
+            assert_eq!(pith_list_get_value(list, 0), 0);
+            pith_list_release(list);
+        }
+    }
+
+    #[test]
+    fn functional_list_ops_reject_invalid_closure_handles() {
+        unsafe {
+            let list = pith_list_new(8, 0);
+            pith_list_push_value(list, 7);
+            let list_ptr = list.ptr as i64;
+
+            assert_eq!(pith_list_map(list_ptr, 12345), 0);
+            let filtered = pith_list_filter(list_ptr, 12345);
+            assert_ne!(filtered, 0);
+            assert_eq!(
+                pith_list_len(PithList {
+                    ptr: filtered as *mut (),
+                }),
+                0
+            );
+            pith_list_release(PithList {
+                ptr: filtered as *mut (),
+            });
+            assert_eq!(pith_list_reduce(list_ptr, 99, 12345), 99);
+            pith_list_each(list_ptr, 12345);
+
+            pith_list_release(list);
         }
     }
 }

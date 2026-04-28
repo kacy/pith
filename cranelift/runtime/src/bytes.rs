@@ -296,3 +296,30 @@ pub unsafe extern "C" fn pith_byte_buffer_clear(handle: i64) {
         buffer.data.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_bytes_handles_return_safe_defaults() {
+        unsafe {
+            assert_eq!(pith_bytes_len(12345), 0);
+            assert_eq!(pith_bytes_is_empty(12345), 1);
+            assert_eq!(pith_bytes_get(12345, 0), 0);
+            assert_eq!(pith_bytes_slice(12345, 0, 1), 0);
+            assert!(pith_bytes_to_string_utf8(12345).is_null());
+        }
+    }
+
+    #[test]
+    fn invalid_byte_buffer_handles_return_safe_defaults() {
+        unsafe {
+            assert_eq!(pith_byte_buffer_len(12345), 0);
+            assert_eq!(pith_byte_buffer_get(12345, 0), 0);
+            assert_eq!(pith_byte_buffer_set(12345, 0, 1), 0);
+            assert_eq!(pith_byte_buffer_bytes(12345), 0);
+            pith_byte_buffer_clear(12345);
+        }
+    }
+}

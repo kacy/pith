@@ -274,3 +274,29 @@ pub extern "C" fn pith_process_close(handle: i64) {
     handles.remove(&handle);
     handle_registry::unregister_id(handle, HandleKind::Process);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_process_handles_return_safe_defaults() {
+        assert_eq!(pith_process_wait(12345), -1);
+        assert_eq!(pith_process_kill(12345), 0);
+        pith_process_close(12345);
+    }
+
+    #[test]
+    fn closed_process_output_handles_are_rejected() {
+        let handle = pith_store_process_output(7, "out".to_string(), "err".to_string());
+        assert_eq!(pith_process_output_status(handle), 7);
+        assert!(!pith_process_output_stdout(handle).is_null());
+        assert!(!pith_process_output_stderr(handle).is_null());
+
+        pith_process_output_close(handle);
+        assert_eq!(pith_process_output_status(handle), -1);
+        assert!(pith_process_output_stdout(handle).is_null());
+        assert!(pith_process_output_stderr(handle).is_null());
+        pith_process_output_close(handle);
+    }
+}

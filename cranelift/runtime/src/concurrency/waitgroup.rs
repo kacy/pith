@@ -92,3 +92,18 @@ pub unsafe extern "C" fn pith_waitgroup_wait(handle: *mut PithWaitGroupHandle) {
         guard = wait_state(cvar, guard);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_waitgroup_handles_are_ignored() {
+        unsafe {
+            let handle = 12345usize as *mut PithWaitGroupHandle;
+            pith_waitgroup_add(handle, 1);
+            pith_waitgroup_done(handle);
+            pith_waitgroup_wait(handle);
+        }
+    }
+}

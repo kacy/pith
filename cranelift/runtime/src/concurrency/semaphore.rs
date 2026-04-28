@@ -86,3 +86,17 @@ pub unsafe extern "C" fn pith_semaphore_release(handle: *mut PithSemaphoreHandle
     }
     cvar.notify_one();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_semaphore_handles_are_ignored() {
+        unsafe {
+            let handle = 12345usize as *mut PithSemaphoreHandle;
+            pith_semaphore_acquire(handle);
+            pith_semaphore_release(handle);
+        }
+    }
+}

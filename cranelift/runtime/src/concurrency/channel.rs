@@ -251,3 +251,24 @@ pub extern "C" fn pith_select_next_index(count: i64) -> i64 {
     let next = SELECT_COUNTER.fetch_add(1, Ordering::Relaxed);
     next.rem_euclid(count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_channel_handles_return_safe_defaults() {
+        unsafe {
+            assert_eq!(pith_channel_send(12345, 7), 0);
+            assert_eq!(pith_channel_try_send(12345, 7), 0);
+            assert_eq!(pith_channel_close(12345), 0);
+            assert_eq!(pith_channel_len(12345), 0);
+            assert_eq!(pith_channel_cap(12345), 0);
+            assert_eq!(pith_channel_is_closed(12345), 1);
+
+            let recv = pith_channel_try_recv(12345) as *const i64;
+            assert!(!recv.is_null());
+            assert_eq!(*recv, 0);
+        }
+    }
+}

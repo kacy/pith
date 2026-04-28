@@ -143,3 +143,20 @@ pub unsafe extern "C" fn pith_process_write_bytes(handle: i64, data: i64) -> i64
         Err(_) => 0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_process_io_handles_return_safe_defaults() {
+        unsafe {
+            assert!(pith_process_read(12345, 16).is_null());
+            assert_eq!(pith_process_read_bytes(12345, 16), 0);
+            assert!(pith_process_read_err(12345, 16).is_null());
+            assert_eq!(pith_process_read_err_bytes(12345, 16), 0);
+            assert_eq!(pith_process_write(12345, std::ptr::null()), 0);
+            assert_eq!(pith_process_write_bytes(12345, 0), 0);
+        }
+    }
+}

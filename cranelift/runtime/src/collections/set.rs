@@ -516,3 +516,43 @@ pub extern "C" fn pith_set_destructor(ptr: *mut u8) {
         pith_set_release(*set);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bogus_set() -> PithSet {
+        PithSet {
+            ptr: 12345usize as *mut (),
+        }
+    }
+
+    #[test]
+    fn invalid_set_handles_return_safe_defaults() {
+        unsafe {
+            let mut set = bogus_set();
+            assert_eq!(pith_set_len(bogus_set()), 0);
+            assert!(!pith_set_contains_int(bogus_set(), 7));
+            assert_eq!(pith_set_len_handle(12345), 0);
+            assert_eq!(pith_set_contains_int_handle(12345, 7), 0);
+            assert_eq!(pith_set_is_empty_handle(12345), 1);
+            pith_set_clear(&mut set);
+            pith_set_clear_handle(12345);
+            pith_set_release(bogus_set());
+        }
+    }
+
+    #[test]
+    fn released_set_handles_are_rejected() {
+        unsafe {
+            let set = pith_set_new(0, 8, false);
+            let handle = set.ptr as i64;
+            assert_eq!(pith_set_len(set), 0);
+            pith_set_release(set);
+            assert_eq!(pith_set_len(set), 0);
+            assert_eq!(pith_set_len_handle(handle), 0);
+            assert_eq!(pith_set_is_empty_handle(handle), 1);
+            pith_set_release(set);
+        }
+    }
+}

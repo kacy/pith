@@ -54,3 +54,17 @@ pub unsafe extern "C" fn pith_mutex_unlock(handle: *mut PithMutexHandle) {
     // For now, this is a placeholder that does nothing
     // A proper implementation would track guards in a separate data structure
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_mutex_handles_are_ignored() {
+        unsafe {
+            let handle = 12345usize as *mut PithMutexHandle;
+            pith_mutex_lock(handle);
+            pith_mutex_unlock(handle);
+        }
+    }
+}

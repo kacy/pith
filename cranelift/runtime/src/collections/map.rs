@@ -727,3 +727,41 @@ pub unsafe extern "C" fn pith_map_values_handle(map_handle: i64) -> i64 {
 
     list.ptr as i64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bogus_map() -> PithMap {
+        PithMap {
+            ptr: 12345usize as *mut (),
+        }
+    }
+
+    #[test]
+    fn invalid_map_handles_return_safe_defaults() {
+        unsafe {
+            let mut map = bogus_map();
+            assert_eq!(pith_map_len(bogus_map()), 0);
+            assert_eq!(pith_map_len_handle(12345), 0);
+            assert_eq!(pith_map_is_empty_handle(12345), 1);
+            pith_map_clear(&mut map);
+            pith_map_clear_handle(12345);
+            pith_map_release(bogus_map());
+        }
+    }
+
+    #[test]
+    fn released_map_handles_are_rejected() {
+        unsafe {
+            let map = pith_map_new(0, 8, 0);
+            let handle = map.ptr as i64;
+            assert_eq!(pith_map_len(map), 0);
+            pith_map_release(map);
+            assert_eq!(pith_map_len(map), 0);
+            assert_eq!(pith_map_len_handle(handle), 0);
+            assert_eq!(pith_map_is_empty_handle(handle), 1);
+            pith_map_release(map);
+        }
+    }
+}

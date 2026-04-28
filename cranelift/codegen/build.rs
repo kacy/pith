@@ -108,20 +108,6 @@ fn generate_runtime_table() -> Result<(), String> {
         target.push_str(", returns: ");
         target.push_str(&format_type_slice(&returns));
         target.push_str(" },\n");
-
-        if matches!(class, RuntimeDeclClass::Abi) {
-            if let Some(legacy_key) = key.strip_prefix("pith_") {
-                compat.push_str("    RuntimeDecl { key: \"forge_");
-                compat.push_str(legacy_key);
-                compat.push_str("\", symbol: \"");
-                compat.push_str(symbol);
-                compat.push_str("\", params: ");
-                compat.push_str(&format_type_slice(&params));
-                compat.push_str(", returns: ");
-                compat.push_str(&format_type_slice(&returns));
-                compat.push_str(" },\n");
-            }
-        }
     }
     abi.push_str("];\n");
     compat.push_str("];\n");

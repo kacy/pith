@@ -1,0 +1,65 @@
+# toml parsing
+import std.toml as toml
+import std.fs as fs
+import std.io as io
+
+struct ServerConfig:
+    pub host: String
+    pub port: Int
+
+fn main() -> String!:
+    path := "/tmp/pith_toml_ops.toml"
+
+    # build a TOML document
+    newline := chr(10)
+    quote := chr(34)
+    doc_buf := io.string_buffer()
+    doc_buf.write("title = " + quote + "pith" + quote + newline)!
+    doc_buf.write("version = 42" + newline)!
+    doc_buf.write("pi = 3.14" + newline)!
+    doc_buf.write("enabled = true" + newline)!
+    doc_buf.write("tags = [" + quote + "lang" + quote + ", " + quote + "fast" + quote + "]" + newline)!
+    doc_buf.newline()!
+    doc_buf.write("[server]" + newline)!
+    doc_buf.write("host = " + quote + "localhost" + quote + newline)!
+    doc_buf.write("port = 8080" + newline)!
+    doc := doc_buf.string()
+
+    root := toml.parse(doc)
+    print("type: {toml.type_of(root)}")
+
+    # basic values
+    print("title: {toml.get_string(root, "title")}")
+    print("version: {toml.get_int(root, "version")}")
+    print("pi: {toml.get_float(root, "pi")}")
+    print("enabled: {toml.get_bool(root, "enabled")}")
+    print("missing title: {toml.get_string_or(root, "missing_title", "n/a")}")
+    print("missing port: {toml.get_int_or(root, "missing_port", 9000)}")
+
+    # has key
+    print("has title: {toml.has(root, "title")}")
+    print("has missing: {toml.has(root, "missing")}")
+
+    # array
+    tags := toml.get_array(root, "tags")
+    print("tags count: {toml.array_len(tags)}")
+    tag0 := toml.array_get(tags, 0)
+    print("tag 0 type: {toml.type_of(tag0)}")
+
+    # sub-table
+    server := toml.get_table(root, "server")
+    print("server host: {toml.get_string(server, "host")}")
+    print("server port: {toml.get_int(server, "port")}")
+    typed_server := toml.decode[ServerConfig](server)
+    if typed_server.is_ok:
+        print("typed server: {typed_server.ok.host}:{typed_server.ok.port}")
+
+    # keys
+    root_keys := toml.keys(root)
+    print("key count: {root_keys.len()}")
+
+    fs.write(path, doc)!
+    file_root := toml.parse_file(path)
+    print("file host: {toml.get_string(toml.get_table(file_root, "server"), "host")}")
+    fs.remove(path)
+    return ""

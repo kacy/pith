@@ -87,23 +87,23 @@ func waitForServer(url string, timeout time.Duration) bool {
 
 func main() {
 	goPort := "9101"
-	forgePort := "9102"
+	pithPort := "9102"
 	if len(os.Args) > 1 && os.Args[1] != "" {
 		goPort = os.Args[1]
 	}
 	if len(os.Args) > 2 && os.Args[2] != "" {
-		forgePort = os.Args[2]
+		pithPort = os.Args[2]
 	}
 
 	fmt.Println("waiting for catalog servers...")
 	goOK := waitForServer("http://localhost:"+goPort+"/health", 5*time.Second)
-	forgeOK := waitForServer("http://localhost:"+forgePort+"/health", 5*time.Second)
+	pithOK := waitForServer("http://localhost:"+pithPort+"/health", 5*time.Second)
 	if !goOK {
 		fmt.Println("go catalog server not responding on :" + goPort)
 		os.Exit(1)
 	}
-	if !forgeOK {
-		fmt.Println("forge catalog server not responding on :" + forgePort)
+	if !pithOK {
+		fmt.Println("pith catalog server not responding on :" + pithPort)
 		os.Exit(1)
 	}
 	fmt.Println("both catalog servers ready.")
@@ -111,7 +111,7 @@ func main() {
 
 	warmup := scenario{name: "warmup", method: "GET", path: "/health", requests: 20}
 	benchRequest(warmup.method, "http://localhost:"+goPort+warmup.path, warmup.body, warmup.requests)
-	benchRequest(warmup.method, "http://localhost:"+forgePort+warmup.path, warmup.body, warmup.requests)
+	benchRequest(warmup.method, "http://localhost:"+pithPort+warmup.path, warmup.body, warmup.requests)
 
 	scenarios := []scenario{
 		{name: "GET /profile", method: "GET", path: "/profile?id=424", requests: 250},
@@ -127,9 +127,9 @@ func main() {
 	for _, s := range scenarios {
 		fmt.Printf("[%s] %d requests\n", s.name, s.requests)
 		gP50, gP95, gP99, gRPS, gErr := benchRequest(s.method, "http://localhost:"+goPort+s.path, s.body, s.requests)
-		fP50, fP95, fP99, fRPS, fErr := benchRequest(s.method, "http://localhost:"+forgePort+s.path, s.body, s.requests)
+		fP50, fP95, fP99, fRPS, fErr := benchRequest(s.method, "http://localhost:"+pithPort+s.path, s.body, s.requests)
 		printRow("go", gP50, gP95, gP99, gRPS, gErr)
-		printRow("forge", fP50, fP95, fP99, fRPS, fErr)
+		printRow("pith", fP50, fP95, fP99, fRPS, fErr)
 		if gP50 > 0 {
 			fmt.Printf("  ratio    p50=%.1fx     p95=%.1fx     p99=%.1fx\n", fP50/gP50, fP95/gP95, fP99/gP99)
 		}

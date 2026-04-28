@@ -66,17 +66,17 @@ func waitForServer(url string, timeout time.Duration) bool {
 
 func main() {
 	goPort := "9001"
-	forgePort := "9002"
+	pithPort := "9002"
 
 	fmt.Println("Waiting for servers...")
 	goOK := waitForServer("http://localhost:"+goPort+"/", 5*time.Second)
-	forgeOK := waitForServer("http://localhost:"+forgePort+"/", 5*time.Second)
+	pithOK := waitForServer("http://localhost:"+pithPort+"/", 5*time.Second)
 	if !goOK {
 		fmt.Println("Go server not responding on :" + goPort)
 		os.Exit(1)
 	}
-	if !forgeOK {
-		fmt.Println("Forge server not responding on :" + forgePort)
+	if !pithOK {
+		fmt.Println("Pith server not responding on :" + pithPort)
 		os.Exit(1)
 	}
 	fmt.Println("Both servers ready.")
@@ -84,7 +84,7 @@ func main() {
 
 	// warmup
 	bench("warmup", "http://localhost:"+goPort+"/", 20)
-	bench("warmup", "http://localhost:"+forgePort+"/", 20)
+	bench("warmup", "http://localhost:"+pithPort+"/", 20)
 
 	type scenario struct {
 		name string
@@ -106,9 +106,9 @@ func main() {
 	for _, s := range scenarios {
 		fmt.Printf("[%s] %d requests\n", s.name, s.n)
 		gP50, gP95, gP99, gRPS, gErr := bench("go", "http://localhost:"+goPort+s.path, s.n)
-		fP50, fP95, fP99, fRPS, fErr := bench("forge", "http://localhost:"+forgePort+s.path, s.n)
+		fP50, fP95, fP99, fRPS, fErr := bench("pith", "http://localhost:"+pithPort+s.path, s.n)
 		printRow("go", gP50, gP95, gP99, gRPS, gErr)
-		printRow("forge", fP50, fP95, fP99, fRPS, fErr)
+		printRow("pith", fP50, fP95, fP99, fRPS, fErr)
 		if gP50 > 0 {
 			fmt.Printf("  ratio    p50=%.1fx     p95=%.1fx     p99=%.1fx\n", fP50/gP50, fP95/gP95, fP99/gP99)
 		}

@@ -1,6 +1,6 @@
 # io foundation
 
-forge now has one shared io layer that the stdlib can build on instead of each
+pith now has one shared io layer that the stdlib can build on instead of each
 module rolling its own transport loops.
 
 for the higher-level string/bytes helper surface on top of that split, see
@@ -37,7 +37,7 @@ bytes-facing surface:
 - `fn write_bytes(data: Bytes) -> Int!`
 
 the split is intentional: raw transport data and text are different things, so
-forge now treats them as different things in the stdlib too.
+pith now treats them as different things in the stdlib too.
 
 the compiler now also supports module-qualified import aliases cleanly, so
 stdlib call sites can read like:
@@ -66,13 +66,13 @@ same foundation.
 
 ## why the adapters are handle-backed
 
-forge structs are value types right now. that means a tiny adapter struct cannot
+pith structs are value types right now. that means a tiny adapter struct cannot
 just mutate internal fields and expect the caller to observe that state after it
 gets passed around.
 
 the practical bridge is to keep mutable adapter state in module-level tables and
 pass around tiny structs that only hold handles into that state. it is not the
-final forever shape, but it gives forge stable buffered and stateful io today
+final forever shape, but it gives pith stable buffered and stateful io today
 without waiting on a larger ownership model.
 
 ## stdlib consumers on the shared path
@@ -122,7 +122,7 @@ the foundation is in place, but there is still room to grow:
 
 ## direction
 
-the long-term version of forge io should be more protocol-friendly and more
+the long-term version of pith io should be more protocol-friendly and more
 bytes-first than the original string-only start.
 
 that is already visible in a couple of places:

@@ -10,8 +10,8 @@ pub struct SemaphoreState {
     max: usize,
 }
 
-/// Opaque handle to a Forge Semaphore
-pub type ForgeSemaphoreHandle = Arc<(Mutex<SemaphoreState>, Condvar)>;
+/// Opaque handle to a Pith Semaphore
+pub type PithSemaphoreHandle = Arc<(Mutex<SemaphoreState>, Condvar)>;
 
 /// Create a new Semaphore
 ///
@@ -20,7 +20,7 @@ pub type ForgeSemaphoreHandle = Arc<(Mutex<SemaphoreState>, Condvar)>;
 ///
 /// Returns an opaque handle to the semaphore
 #[no_mangle]
-pub extern "C" fn forge_semaphore_new(initial: i64) -> *mut ForgeSemaphoreHandle {
+pub extern "C" fn pith_semaphore_new(initial: i64) -> *mut PithSemaphoreHandle {
     let state = SemaphoreState {
         count: initial as usize,
         max: initial as usize,
@@ -36,7 +36,7 @@ pub extern "C" fn forge_semaphore_new(initial: i64) -> *mut ForgeSemaphoreHandle
 /// # Safety
 /// handle must be a valid semaphore handle
 #[no_mangle]
-pub unsafe extern "C" fn forge_semaphore_acquire(handle: *mut ForgeSemaphoreHandle) {
+pub unsafe extern "C" fn pith_semaphore_acquire(handle: *mut PithSemaphoreHandle) {
     if handle.is_null() {
         return;
     }
@@ -54,7 +54,7 @@ pub unsafe extern "C" fn forge_semaphore_acquire(handle: *mut ForgeSemaphoreHand
 /// # Safety
 /// handle must be a valid semaphore handle
 #[no_mangle]
-pub unsafe extern "C" fn forge_semaphore_release(handle: *mut ForgeSemaphoreHandle) {
+pub unsafe extern "C" fn pith_semaphore_release(handle: *mut PithSemaphoreHandle) {
     if handle.is_null() {
         return;
     }

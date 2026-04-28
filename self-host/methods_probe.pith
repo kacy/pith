@@ -1,0 +1,38 @@
+from ast import reset_arena
+from checker import initialize_checker, c_register_all, method_type_map, debug_method_signature_summary
+from lexer import lex_all
+from parser import parse
+from types import get_type_info, get_type_name, lookup_type_id
+
+fn show_method(key: String):
+    if method_type_map.contains_key(key):
+        tid := method_type_map[key]
+        info := get_type_info(tid)
+        print(key + " -> " + info.kind)
+        print("params=" + info.param_types.len().to_string())
+        mut i := 0
+        while i < info.param_types.len():
+            print(get_type_name(info.param_types[i]))
+            i = i + 1
+        print("ret=" + get_type_name(info.return_type))
+    else:
+        print(key + " missing")
+
+fn main() -> String!:
+    source := read_file("examples/methods.pith")!
+    reset_arena()
+    root := parse(lex_all(source))
+    initialize_checker("examples/methods.pith")
+    c_register_all(root)
+    show_method("Point.distance_from_origin")
+    show_method("Point.translate")
+    show_method("Point.show")
+    print("debug distance=" + debug_method_signature_summary("Point.distance_from_origin"))
+    print("debug translate=" + debug_method_signature_summary("Point.translate"))
+    print("debug show=" + debug_method_signature_summary("Point.show"))
+    point_tid := lookup_type_id("Point")
+    point_info := get_type_info(point_tid)
+    print("Point tid=" + point_tid.to_string())
+    print("Point kind=" + point_info.kind)
+    print("Point fields=" + point_info.fields.len().to_string())
+    return ""

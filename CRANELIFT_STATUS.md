@@ -1,15 +1,15 @@
 # Cranelift Native Backend
 
-The Cranelift backend compiles Forge programs directly to native machine code
+The Cranelift backend compiles Pith programs directly to native machine code
 via a self-hosted IR emitter. The pipeline is fully self-hosted on the frontend
-(lex/parse/check/emit_ir in Forge), with Rust handling IR consumption and
+(lex/parse/check/emit_ir in Pith), with Rust handling IR consumption and
 native codegen.
 
 ## Architecture
 
 ```
-Forge source (.fg)
-  → self-hosted IR emitter (ir_emitter.fg → text IR)
+Pith source (.pith)
+  → self-hosted IR emitter (ir_emitter.pith → text IR)
   → ir_consumer.rs (text IR → Cranelift IR)
   → Cranelift native code generation
   → object file (.o)
@@ -52,12 +52,12 @@ JSON/TOML/URL parsing, file I/O, path/process helpers, and more.
 The Cranelift backend compiles the entire self-hosted compiler into a working
 native binary. The self-hosted compiler plus stdlib source surface is now well
 past 40k lines, with the frontend and most language logic already living in
-Forge rather than Rust.
+Pith rather than Rust.
 
 **Verified:**
-- `forge version`, `lex`, `parse`, `check` — all work
-- `forge build` / `forge run` — compiles and executes the tracked example suite
-- `std.net.tls` now owns both client and server TLS 1.3 handshakes in Forge
+- `pith version`, `lex`, `parse`, `check` — all work
+- `pith build` / `pith run` — compiles and executes the tracked example suite
+- `std.net.tls` now owns both client and server TLS 1.3 handshakes in Pith
 - Fixed-point reached: C output is byte-for-byte identical whether the
   compiler was compiled via C transpilation or Cranelift (837,451 bytes)
 
@@ -65,6 +65,6 @@ Forge rather than Rust.
 
 ```
 cargo build --release                           # build the Cranelift backend
-./target/release/forge run examples/hello.fg    # compile and run
-./target/release/forge build examples/hello.fg  # compile to native binary
+./target/release/pith run examples/hello.pith    # compile and run
+./target/release/pith build examples/hello.pith  # compile to native binary
 ```

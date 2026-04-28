@@ -113,21 +113,21 @@ fn remove_from_object_list(header_to_remove: *mut RcHeader) {
 /// # Safety
 /// Returns a valid pointer to uninitialized memory after the header
 #[no_mangle]
-pub unsafe extern "C" fn forge_rc_alloc(size: usize, type_tag: u32) -> *mut u8 {
+pub unsafe extern "C" fn pith_rc_alloc(size: usize, type_tag: u32) -> *mut u8 {
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_RC_ALLOCS, 1);
     let total_size = HEADER_SIZE + size;
     let layout = match Layout::from_size_align(total_size, 8) {
         Ok(l) => l,
         Err(_) => {
-            eprintln!("forge: allocation size overflow");
+            eprintln!("pith: allocation size overflow");
             std::process::abort();
         }
     };
 
     let ptr = alloc(layout);
     if ptr.is_null() {
-        eprintln!("forge: out of memory");
+        eprintln!("pith: out of memory");
         std::process::abort();
     }
 
@@ -149,7 +149,7 @@ pub unsafe extern "C" fn forge_rc_alloc(size: usize, type_tag: u32) -> *mut u8 {
 /// # Safety
 /// ptr must be a valid heap-allocated FFI object or null
 #[no_mangle]
-pub unsafe extern "C" fn forge_rc_retain(ptr: *mut u8) {
+pub unsafe extern "C" fn pith_rc_retain(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
@@ -182,7 +182,7 @@ pub unsafe fn rc_release_internal(ptr: *mut u8) -> bool {
 /// # Safety
 /// ptr must be a valid heap-allocated FFI object or null
 #[no_mangle]
-pub unsafe extern "C" fn forge_rc_release(
+pub unsafe extern "C" fn pith_rc_release(
     ptr: *mut u8,
     destructor: Option<extern "C" fn(*mut u8)>,
 ) {
@@ -323,10 +323,10 @@ fn free_cycles(cycles: Vec<*mut RcHeader>) {
 /// Get destructor for a given type tag
 fn get_destructor_for_type(type_tag: u32) -> Option<extern "C" fn(*mut u8)> {
     match type_tag {
-        1 => Some(crate::string::forge_string_destructor), // String
-        2 => Some(crate::collections::list::forge_list_destructor), // List
-        3 => Some(crate::collections::map::forge_map_destructor), // Map
-        4 => Some(crate::collections::set::forge_set_destructor), // Set
+        1 => Some(crate::string::pith_string_destructor), // String
+        2 => Some(crate::collections::list::pith_list_destructor), // List
+        3 => Some(crate::collections::map::pith_map_destructor), // Map
+        4 => Some(crate::collections::set::pith_set_destructor), // Set
         _ => None,
     }
 }
@@ -373,7 +373,7 @@ pub unsafe fn header_from_ptr(ptr: *mut u8) -> *mut RcHeader {
 
 /// Force immediate cycle collection
 #[no_mangle]
-pub extern "C" fn forge_force_cycle_collection() {
+pub extern "C" fn pith_force_cycle_collection() {
     collect_cycles();
     RC_RELEASE_COUNT.store(0, Ordering::Relaxed);
 }

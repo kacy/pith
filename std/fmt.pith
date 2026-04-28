@@ -1,0 +1,241 @@
+# std.fmt — number formatting, display helpers, and lightweight templates
+#
+# use interpolation for one-off value printing:
+#   print("count: {items.len()}")
+#
+# use std.fmt when you want a reusable template or literal braces:
+#   slot := chr(123) + chr(125)
+#   format2("x=" + slot + ", y=" + slot, "3", "4")
+#
+# format integers as hexadecimal, octal, or binary strings.
+# format floats with a fixed number of decimal places.
+# display small lists and grids without local helper functions.
+# fill `{}` placeholders with string values.
+
+# ===============================================================
+# Integer Formatting
+# ===============================================================
+
+fn format_int_base(n: Int, base: Int) -> String:
+    if n == 0:
+        return "0"
+    if n < 0:
+        return "-" + format_int_base(-n, base)
+    digits := "0123456789abcdef"
+    mut val := n
+    mut result := ""
+    while val > 0:
+        result = digits[val % base] + result
+        val = val / base
+    return result
+
+# Formats an integer as a lowercase hexadecimal string.
+# Example: hex(255) -> "ff", hex(0) -> "0", hex(-16) -> "-10"
+pub fn hex(n: Int) -> String:
+    return format_int_base(n, 16)
+
+# Formats an integer as an octal string (base 8).
+# Example: oct(8) -> "10", oct(64) -> "100"
+pub fn oct(n: Int) -> String:
+    return format_int_base(n, 8)
+
+# Formats an integer as a binary string (base 2).
+# Example: bin(5) -> "101", bin(255) -> "11111111"
+pub fn bin(n: Int) -> String:
+    return format_int_base(n, 2)
+
+# ===============================================================
+# Float Formatting
+# ===============================================================
+
+# Formats a float with a fixed number of decimal places.
+# Rounds to the specified precision.
+# Example: float_fixed(3.14159, 2) -> "3.14"
+pub fn float_fixed(n: Float, decimals: Int) -> String:
+    return fmt_float(n, decimals)
+
+# ===============================================================
+# Display Helpers
+# ===============================================================
+
+# join integers with the provided separator.
+pub fn join_ints(values: List[Int], sep: String) -> String:
+    mut parts: List[String] := []
+    for value in values:
+        parts.push(value.to_string())
+    return parts.join(sep)
+
+# render integers as a bracketed list.
+pub fn ints(values: List[Int]) -> String:
+    return "[" + join_ints(values, ", ") + "]"
+
+# join strings with the provided separator.
+pub fn join_strings(values: List[String], sep: String) -> String:
+    return values.join(sep)
+
+# render strings as a bracketed list.
+pub fn strings(values: List[String]) -> String:
+    return "[" + join_strings(values, ", ") + "]"
+
+# join booleans with the provided separator.
+pub fn join_bools(values: List[Bool], sep: String) -> String:
+    mut parts: List[String] := []
+    for value in values:
+        parts.push(value.to_string())
+    return parts.join(sep)
+
+# render booleans as a bracketed list.
+pub fn bools(values: List[Bool]) -> String:
+    return "[" + join_bools(values, ", ") + "]"
+
+# join floats with the provided separator.
+pub fn join_floats(values: List[Float], sep: String) -> String:
+    mut parts: List[String] := []
+    for value in values:
+        parts.push(value.to_string())
+    return parts.join(sep)
+
+# render floats as a bracketed list.
+pub fn floats(values: List[Float]) -> String:
+    return "[" + join_floats(values, ", ") + "]"
+
+# render a string-to-int map as comma-separated key/value pairs.
+pub fn string_int_map(values: Map[String, Int]) -> String:
+    mut parts: List[String] := []
+    for key in values:
+        parts.push(key + ": " + values[key].to_string())
+    return chr(123) + parts.join(", ") + chr(125)
+
+# render a string-to-string map as comma-separated key/value pairs.
+pub fn string_string_map(values: Map[String, String]) -> String:
+    mut parts: List[String] := []
+    for key in values:
+        parts.push(key + ": " + values[key])
+    return chr(123) + parts.join(", ") + chr(125)
+
+# render nested integer lists as bracketed lists.
+pub fn nested_ints(values: List[List[Int]]) -> String:
+    mut parts: List[String] := []
+    for value in values:
+        parts.push(ints(value))
+    return "[" + parts.join(", ") + "]"
+
+# render a flat integer grid, row-major.
+pub fn int_grid(values: List[Int], rows: Int, cols: Int) -> String:
+    mut row_parts: List[String] := []
+    mut r := 0
+    while r < rows:
+        mut col_parts: List[String] := []
+        mut c := 0
+        while c < cols:
+            col_parts.push(values[r * cols + c].to_string())
+            c = c + 1
+        row_parts.push(col_parts.join(" "))
+        r = r + 1
+    return row_parts.join("; ")
+
+# ===============================================================
+# String Formatting
+# ===============================================================
+
+fn append_format_segment(parts: List[String], value: String):
+    parts.push(value)
+
+fn left_brace() -> String:
+    return chr(123)
+
+fn right_brace() -> String:
+    return chr(125)
+
+fn is_placeholder_at(pattern: String, index: Int) -> Bool:
+    return index + 1 < pattern.len() and pattern.substring(index, index + 1) == left_brace() and pattern.substring(index + 1, index + 2) == right_brace()
+
+fn is_left_escape_at(pattern: String, index: Int) -> Bool:
+    return index + 1 < pattern.len() and pattern.substring(index, index + 1) == left_brace() and pattern.substring(index + 1, index + 2) == left_brace()
+
+fn is_right_escape_at(pattern: String, index: Int) -> Bool:
+    return index + 1 < pattern.len() and pattern.substring(index, index + 1) == right_brace() and pattern.substring(index + 1, index + 2) == right_brace()
+
+fn format_values(pattern: String, values: List[String]) -> String:
+    mut parts: List[String] := []
+    mut value_index := 0
+    mut i := 0
+    while i < pattern.len():
+        if is_left_escape_at(pattern, i):
+            append_format_segment(parts, left_brace())
+            i = i + 2
+        elif is_right_escape_at(pattern, i):
+            append_format_segment(parts, right_brace())
+            i = i + 2
+        elif is_placeholder_at(pattern, i):
+            if value_index < values.len():
+                append_format_segment(parts, values[value_index])
+                value_index = value_index + 1
+            else:
+                append_format_segment(parts, left_brace() + right_brace())
+            i = i + 2
+        else:
+            append_format_segment(parts, pattern.substring(i, i + 1))
+            i = i + 1
+    return parts.join("")
+
+# Fills `{}` placeholders in order using the provided string values.
+# `{{` and `}}` escape literal braces. extra values are ignored.
+pub fn format(pattern: String, values: List[String]) -> String:
+    return format_values(pattern, values)
+
+# fill the first placeholder in a pattern.
+pub fn format1(pattern: String, a: String) -> String:
+    return format_values(pattern, [a])
+
+# fill the first two placeholders in a pattern.
+pub fn format2(pattern: String, a: String, b: String) -> String:
+    return format_values(pattern, [a, b])
+
+# fill the first three placeholders in a pattern.
+pub fn format3(pattern: String, a: String, b: String, c: String) -> String:
+    return format_values(pattern, [a, b, c])
+
+test "integer formatters render common bases":
+    assert_eq(hex(255), "ff")
+    assert_eq(hex(-16), "-10")
+    assert_eq(oct(64), "100")
+    assert_eq(bin(5), "101")
+
+test "display helpers render common collection shapes":
+    assert_eq(join_ints([1, 2, 3], ", "), "1, 2, 3")
+    assert_eq(ints([1, 2, 3]), "[1, 2, 3]")
+    assert_eq(strings(["red", "blue"]), "[red, blue]")
+    assert_eq(bools([true, false]), "[true, false]")
+    assert_eq(floats([1.5, 2.25]), "[1.5, 2.25]")
+    assert_eq(nested_ints([[1, 2], [3]]), "[[1, 2], [3]]")
+    assert_eq(int_grid([1, 2, 3, 4], 2, 2), "1 2; 3 4")
+
+test "map display helpers render key value pairs":
+    mut counts: Map[String, Int] := {}
+    counts.insert("red", 2)
+    counts.insert("blue", 3)
+    mut names: Map[String, String] := {}
+    names.insert("lang", "pith")
+    names.insert("backend", "cranelift")
+
+    count_text := string_int_map(counts)
+    name_text := string_string_map(names)
+    assert(count_text.contains("red: 2"))
+    assert(count_text.contains("blue: 3"))
+    assert(name_text.contains("lang: pith"))
+    assert(name_text.contains("backend: cranelift"))
+
+test "format fills placeholders in order":
+    slot := chr(123) + chr(125)
+    assert_eq(format("coords: " + slot + ", " + slot, ["3", "4"]), "coords: 3, 4")
+    assert_eq(format1("answer: " + slot, "42"), "answer: 42")
+    assert_eq(format2("user " + slot + " score " + slot, "pith", "7"), "user pith score 7")
+    assert_eq(format3(slot + " " + slot + " " + slot, "a", "b", "c"), "a b c")
+
+test "format handles escaped and missing placeholders":
+    slot := chr(123) + chr(125)
+    left_escape := chr(123) + chr(123)
+    right_escape := chr(125) + chr(125)
+    assert_eq(format(left_escape + slot + right_escape, ["x"]), chr(123) + "x" + chr(125))
+    assert_eq(format("left " + slot, []), "left " + slot)

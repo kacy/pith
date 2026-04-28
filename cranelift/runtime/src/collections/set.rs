@@ -3,14 +3,14 @@
 //! Hybrid approach: Uses hashbrown::HashSet internally for O(1) operations,
 //! but presents FFI-compatible interface matching the C runtime.
 
-use crate::string::{forge_string_release, ForgeString};
+use crate::string::{pith_string_release, PithString};
 use hashbrown::HashSet;
 use std::hash::{Hash, Hasher};
 
 /// FFI-compatible set handle
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct ForgeSet {
+pub struct PithSet {
     /// Pointer to internal set implementation (pub for cross-module access)
     pub ptr: *mut (),
 }
@@ -98,11 +98,11 @@ impl SetImpl {
 /// * `elem_size` - Size of each element in bytes
 /// * `elem_is_heap` - Whether elements are heap types (need retain/release)
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_new(
+pub unsafe extern "C" fn pith_set_new(
     elem_type: i32,
     elem_size: i64,
     elem_is_heap: bool,
-) -> ForgeSet {
+) -> PithSet {
     let etype = match elem_type {
         1 => ElemType::String,
         _ => ElemType::Int,
@@ -111,14 +111,14 @@ pub unsafe extern "C" fn forge_set_new(
     let set_impl = SetImpl::new(etype, elem_size as usize, elem_is_heap);
     let boxed = Box::new(set_impl);
 
-    ForgeSet {
+    PithSet {
         ptr: Box::into_raw(boxed) as *mut (),
     }
 }
 
 /// Get set length
 #[no_mangle]
-pub extern "C" fn forge_set_len(set: ForgeSet) -> i64 {
+pub extern "C" fn pith_set_len(set: PithSet) -> i64 {
     if set.ptr.is_null() {
         return 0;
     }
@@ -131,7 +131,7 @@ pub extern "C" fn forge_set_len(set: ForgeSet) -> i64 {
 
 /// Check if set contains integer element
 #[no_mangle]
-pub extern "C" fn forge_set_contains_int(set: ForgeSet, elem: i64) -> bool {
+pub extern "C" fn pith_set_contains_int(set: PithSet, elem: i64) -> bool {
     if set.ptr.is_null() {
         return false;
     }
@@ -151,7 +151,7 @@ pub extern "C" fn forge_set_contains_int(set: ForgeSet, elem: i64) -> bool {
 ///
 /// Returns true if element was present and removed
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_remove_int(set: *mut ForgeSet, elem: i64) -> bool {
+pub unsafe extern "C" fn pith_set_remove_int(set: *mut PithSet, elem: i64) -> bool {
     if set.is_null() || (*set).ptr.is_null() {
         return false;
     }
@@ -167,7 +167,7 @@ pub unsafe extern "C" fn forge_set_remove_int(set: *mut ForgeSet, elem: i64) -> 
 
 /// Clear all elements from set
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_clear(set: *mut ForgeSet) {
+pub unsafe extern "C" fn pith_set_clear(set: *mut PithSet) {
     if set.is_null() || (*set).ptr.is_null() {
         return;
     }
@@ -179,12 +179,12 @@ pub unsafe extern "C" fn forge_set_clear(set: *mut ForgeSet) {
         for elem in impl_ref.iter() {
             if let SetElement::String(bytes) = elem {
                 // Reconstruct the string from bytes to release it
-                let s = ForgeString {
+                let s = PithString {
                     ptr: bytes.as_ptr(),
                     len: bytes.len() as i64,
                     is_heap: true,
                 };
-                forge_string_release(s);
+                pith_string_release(s);
             }
         }
     }
@@ -194,7 +194,7 @@ pub unsafe extern "C" fn forge_set_clear(set: *mut ForgeSet) {
 
 /// Release set and free memory
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_release(set: ForgeSet) {
+pub unsafe extern "C" fn pith_set_release(set: PithSet) {
     if set.ptr.is_null() {
         return;
     }
@@ -205,12 +205,12 @@ pub unsafe extern "C" fn forge_set_release(set: ForgeSet) {
     if impl_ref.elem_is_heap {
         for elem in impl_ref.iter() {
             if let SetElement::String(bytes) = elem {
-                let s = ForgeString {
+                let s = PithString {
                     ptr: bytes.as_ptr(),
                     len: bytes.len() as i64,
                     is_heap: true,
                 };
-                forge_string_release(s);
+                pith_string_release(s);
             }
         }
     }
@@ -224,13 +224,13 @@ pub unsafe extern "C" fn forge_set_release(set: ForgeSet) {
 /// # Safety
 /// Returns a new list that must be released
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_to_list_int(
-    set: ForgeSet,
-) -> crate::collections::list::ForgeList {
-    use crate::collections::list::{forge_list_new, forge_list_push, ForgeList};
+pub unsafe extern "C" fn pith_set_to_list_int(
+    set: PithSet,
+) -> crate::collections::list::PithList {
+    use crate::collections::list::{pith_list_new, pith_list_push, PithList};
 
     if set.ptr.is_null() {
-        return ForgeList {
+        return PithList {
             ptr: std::ptr::null_mut(),
         };
     }
@@ -238,17 +238,17 @@ pub unsafe extern "C" fn forge_set_to_list_int(
     let impl_ref = &*(set.ptr as *const SetImpl);
 
     if !matches!(impl_ref.elem_type, ElemType::Int) {
-        return ForgeList {
+        return PithList {
             ptr: std::ptr::null_mut(),
         };
     }
 
-    let mut list = forge_list_new(std::mem::size_of::<i64>() as i64, 0);
+    let mut list = pith_list_new(std::mem::size_of::<i64>() as i64, 0);
 
     for elem in impl_ref.iter() {
         if let SetElement::Int(n) = elem {
             let n_ptr = n as *const i64 as *const u8;
-            forge_list_push(&mut list, n_ptr, std::mem::size_of::<i64>() as i64);
+            pith_list_push(&mut list, n_ptr, std::mem::size_of::<i64>() as i64);
         }
     }
 
@@ -260,14 +260,14 @@ pub unsafe extern "C" fn forge_set_to_list_int(
 /// # Safety
 /// Returns a new list that must be released
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_to_list_string(
-    set: ForgeSet,
-) -> crate::collections::list::ForgeList {
-    use crate::collections::list::{forge_list_new, forge_list_push_value, ForgeList};
+pub unsafe extern "C" fn pith_set_to_list_string(
+    set: PithSet,
+) -> crate::collections::list::PithList {
+    use crate::collections::list::{pith_list_new, pith_list_push_value, PithList};
     use std::alloc::{alloc, Layout};
 
     if set.ptr.is_null() {
-        return ForgeList {
+        return PithList {
             ptr: std::ptr::null_mut(),
         };
     }
@@ -275,12 +275,12 @@ pub unsafe extern "C" fn forge_set_to_list_string(
     let impl_ref = &*(set.ptr as *const SetImpl);
 
     if !matches!(impl_ref.elem_type, ElemType::String) {
-        return ForgeList {
+        return PithList {
             ptr: std::ptr::null_mut(),
         };
     }
 
-    let list = forge_list_new(8, 0);
+    let list = pith_list_new(8, 0);
 
     for elem in impl_ref.iter() {
         if let SetElement::String(bytes) = elem {
@@ -290,7 +290,7 @@ pub unsafe extern "C" fn forge_set_to_list_string(
             if !ptr.is_null() {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len);
                 *ptr.add(len) = 0;
-                forge_list_push_value(list, ptr as i64);
+                pith_list_push_value(list, ptr as i64);
             }
         }
     }
@@ -302,13 +302,13 @@ pub unsafe extern "C" fn forge_set_to_list_string(
 ///
 /// Returns the raw `ListImpl` pointer as i64 to match the Cranelift collection ABI.
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_to_list_cstr(set_handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_set_to_list_cstr(set_handle: i64) -> i64 {
     if set_handle == 0 {
-        let empty = crate::collections::list::forge_list_new(8, 0);
+        let empty = crate::collections::list::pith_list_new(8, 0);
         return empty.ptr as i64;
     }
 
-    let list = forge_set_to_list_string(ForgeSet {
+    let list = pith_set_to_list_string(PithSet {
         ptr: set_handle as *mut (),
     });
     list.ptr as i64
@@ -318,13 +318,13 @@ pub unsafe extern "C" fn forge_set_to_list_cstr(set_handle: i64) -> i64 {
 ///
 /// Returns the raw `ListImpl` pointer as i64 to match the Cranelift collection ABI.
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_to_list_int_handle(set_handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_set_to_list_int_handle(set_handle: i64) -> i64 {
     if set_handle == 0 {
-        let empty = crate::collections::list::forge_list_new(8, 0);
+        let empty = crate::collections::list::pith_list_new(8, 0);
         return empty.ptr as i64;
     }
 
-    let list = forge_set_to_list_int(ForgeSet {
+    let list = pith_set_to_list_int(PithSet {
         ptr: set_handle as *mut (),
     });
     list.ptr as i64
@@ -348,17 +348,17 @@ unsafe fn cstr_to_set_element(s: *const i8) -> SetElement {
 /// Create a new string set (handle-based). Returns SetImpl pointer as i64.
 /// Create a new string set with default settings
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_new_default() -> i64 {
-    forge_set_new_handle(1)
+pub unsafe extern "C" fn pith_set_new_default() -> i64 {
+    pith_set_new_handle(1)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_new_int() -> i64 {
-    forge_set_new_handle(0)
+pub unsafe extern "C" fn pith_set_new_int() -> i64 {
+    pith_set_new_handle(0)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_new_handle(elem_type: i32) -> i64 {
+pub unsafe extern "C" fn pith_set_new_handle(elem_type: i32) -> i64 {
     let etype = match elem_type {
         1 => ElemType::String,
         _ => ElemType::Int,
@@ -370,7 +370,7 @@ pub unsafe extern "C" fn forge_set_new_handle(elem_type: i32) -> i64 {
 
 /// Get set length (handle-based).
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_len_handle(set_handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_set_len_handle(set_handle: i64) -> i64 {
     if set_handle == 0 {
         return 0;
     }
@@ -380,7 +380,7 @@ pub unsafe extern "C" fn forge_set_len_handle(set_handle: i64) -> i64 {
 
 /// Insert a C-string element into the set. Returns 1 if newly inserted, 0 if already present.
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_add_cstr(set_handle: i64, elem: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_set_add_cstr(set_handle: i64, elem: *const i8) -> i64 {
     if set_handle == 0 || elem.is_null() {
         return 0;
     }
@@ -391,7 +391,7 @@ pub unsafe extern "C" fn forge_set_add_cstr(set_handle: i64, elem: *const i8) ->
 
 /// Insert an integer element into the set. Returns 1 if newly inserted, 0 if already present.
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_add_int_handle(set_handle: i64, elem: i64) -> i64 {
+pub unsafe extern "C" fn pith_set_add_int_handle(set_handle: i64, elem: i64) -> i64 {
     if set_handle == 0 {
         return 0;
     }
@@ -404,7 +404,7 @@ pub unsafe extern "C" fn forge_set_add_int_handle(set_handle: i64, elem: i64) ->
 
 /// Check if a C-string element exists in the set. Returns 1 if present, 0 otherwise.
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_contains_cstr(set_handle: i64, elem: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_set_contains_cstr(set_handle: i64, elem: *const i8) -> i64 {
     if set_handle == 0 || elem.is_null() {
         return 0;
     }
@@ -415,7 +415,7 @@ pub unsafe extern "C" fn forge_set_contains_cstr(set_handle: i64, elem: *const i
 
 /// Check if an integer element exists in the set. Returns 1 if present, 0 otherwise.
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_contains_int_handle(set_handle: i64, elem: i64) -> i64 {
+pub unsafe extern "C" fn pith_set_contains_int_handle(set_handle: i64, elem: i64) -> i64 {
     if set_handle == 0 {
         return 0;
     }
@@ -428,7 +428,7 @@ pub unsafe extern "C" fn forge_set_contains_int_handle(set_handle: i64, elem: i6
 
 /// Remove a C-string element from the set.
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_remove_cstr(set_handle: i64, elem: *const i8) {
+pub unsafe extern "C" fn pith_set_remove_cstr(set_handle: i64, elem: *const i8) {
     if set_handle == 0 || elem.is_null() {
         return;
     }
@@ -439,7 +439,7 @@ pub unsafe extern "C" fn forge_set_remove_cstr(set_handle: i64, elem: *const i8)
 
 /// Remove an integer element from the set.
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_remove_int_handle(set_handle: i64, elem: i64) {
+pub unsafe extern "C" fn pith_set_remove_int_handle(set_handle: i64, elem: i64) {
     if set_handle == 0 {
         return;
     }
@@ -452,7 +452,7 @@ pub unsafe extern "C" fn forge_set_remove_int_handle(set_handle: i64, elem: i64)
 
 /// Clear all elements from set (handle-based).
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_clear_handle(set_handle: i64) {
+pub unsafe extern "C" fn pith_set_clear_handle(set_handle: i64) {
     if set_handle == 0 {
         return;
     }
@@ -462,7 +462,7 @@ pub unsafe extern "C" fn forge_set_clear_handle(set_handle: i64) {
 
 /// Check if set is empty (handle-based). Returns 1 if empty, 0 otherwise.
 #[no_mangle]
-pub unsafe extern "C" fn forge_set_is_empty_handle(set_handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_set_is_empty_handle(set_handle: i64) -> i64 {
     if set_handle == 0 {
         return 1;
     }
@@ -474,13 +474,13 @@ pub unsafe extern "C" fn forge_set_is_empty_handle(set_handle: i64) -> i64 {
 ///
 /// Called by cycle collector when freeing cyclic set objects
 #[no_mangle]
-pub extern "C" fn forge_set_destructor(ptr: *mut u8) {
+pub extern "C" fn pith_set_destructor(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
 
     unsafe {
-        let set = ptr as *const ForgeSet;
-        forge_set_release(*set);
+        let set = ptr as *const PithSet;
+        pith_set_release(*set);
     }
 }

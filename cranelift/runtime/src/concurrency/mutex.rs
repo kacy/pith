@@ -1,17 +1,17 @@
 //! Mutex synchronization primitive
 //!
-//! Provides FFI-compatible mutex operations for the Forge runtime.
+//! Provides FFI-compatible mutex operations for the Pith runtime.
 
 use std::sync::{Arc, Mutex};
 
-/// Opaque handle to a Forge mutex
-pub type ForgeMutexHandle = Arc<Mutex<()>>;
+/// Opaque handle to a Pith mutex
+pub type PithMutexHandle = Arc<Mutex<()>>;
 
 /// Create a new mutex
 ///
 /// Returns an opaque handle to the mutex
 #[no_mangle]
-pub extern "C" fn forge_mutex_new() -> *mut ForgeMutexHandle {
+pub extern "C" fn pith_mutex_new() -> *mut PithMutexHandle {
     let mutex = Arc::new(Mutex::new(()));
     Box::into_raw(Box::new(mutex))
 }
@@ -19,9 +19,9 @@ pub extern "C" fn forge_mutex_new() -> *mut ForgeMutexHandle {
 /// Lock the mutex
 ///
 /// # Safety
-/// handle must be a valid mutex handle obtained from forge_mutex_new
+/// handle must be a valid mutex handle obtained from pith_mutex_new
 #[no_mangle]
-pub unsafe extern "C" fn forge_mutex_lock(handle: *mut ForgeMutexHandle) {
+pub unsafe extern "C" fn pith_mutex_lock(handle: *mut PithMutexHandle) {
     if handle.is_null() {
         return;
     }
@@ -36,7 +36,7 @@ pub unsafe extern "C" fn forge_mutex_lock(handle: *mut ForgeMutexHandle) {
 /// # Safety
 /// handle must be a valid locked mutex handle
 #[no_mangle]
-pub unsafe extern "C" fn forge_mutex_unlock(handle: *mut ForgeMutexHandle) {
+pub unsafe extern "C" fn pith_mutex_unlock(handle: *mut PithMutexHandle) {
     if handle.is_null() {
         return;
     }

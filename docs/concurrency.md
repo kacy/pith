@@ -1,6 +1,6 @@
 # concurrency guide
 
-forge's concurrency model is explicit and pretty small on purpose.
+pith's concurrency model is explicit and pretty small on purpose.
 
 - `spawn expr` starts work and gives you a `Task[T]`
 - `await task` waits for the task and gives you `T`
@@ -13,7 +13,7 @@ forge's concurrency model is explicit and pretty small on purpose.
 
 unbuffered channels are rendezvous channels. buffered channels queue up to their capacity.
 
-```fg
+```pith
 jobs := Channel[Int](1)
 jobs.send(7)
 value := jobs.recv()
@@ -37,7 +37,7 @@ send on a closed channel returns `false`. recv on a closed and drained channel r
 
 `select` is an expression, so each arm needs to produce the same type.
 
-```fg
+```pith
 picked := select:
     msg := jobs.recv() => msg?
     timeout 50 => -1
@@ -50,7 +50,7 @@ use `default` when you want a non-blocking probe. use `timeout` when you want to
 
 `std.concurrent` keeps cancellation and deadlines explicit.
 
-```fg
+```pith
 import std.concurrent as concurrent
 
 pair := concurrent.with_timeout(concurrent.background(), 250)

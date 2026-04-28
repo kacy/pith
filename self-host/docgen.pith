@@ -1,0 +1,492 @@
+# docgen.pith — documentation extractor for pith source files
+#
+# walks source text line by line (same approach as the formatter)
+# to extract module headers and doc comments above pub declarations.
+#
+#   pith doc <file.pith>          human-readable documentation
+#   pith doc --json <file.pith>   JSON output for agents
+#   pith doc --check <file.pith>  verify all pub items are documented
+
+import std.text.scanner as scanner
+
+# --- state (parallel lists, same pattern as codegen) ---
+
+mut d_count: Int := 0
+mut d_names: List[String] := []
+mut d_kinds: List[String] := []
+mut d_sigs: List[String] := []
+mut d_docs: List[String] := []
+
+mut d_mod_name: String := ""
+mut d_mod_desc: String := ""
+mut d_header_lines: List[String] := []
+mut d_header_end: Int := 0
+
+# --- helpers ---
+
+# trim leading whitespace from a string.
+fn d_trim_left(s: String) -> String:
+    mut i := 0
+    while i < s.len():
+        if s[i] == " " or s[i] == chr(9):
+            i = i + 1
+        else:
+            break
+    return s.substring(i, s.len())
+
+# trim trailing whitespace from a string.
+fn d_trim_right(s: String) -> String:
+    mut end := s.len()
+    while end > 0:
+        ch := s[end - 1]
+        if ch == " " or ch == chr(9) or ch == chr(13):
+            end = end - 1
+        else:
+            break
+    return s.substring(0, end)
+
+# trim both ends.
+fn trim_whitespace(s: String) -> String:
+    return d_trim_left(d_trim_right(s))
+
+# check if a string starts with a prefix.
+fn string_starts_with(s: String, prefix: String) -> Bool:
+    if s.len() < prefix.len():
+        return false
+    return s.substring(0, prefix.len()) == prefix
+
+# convert a character to lowercase.
+fn char_to_lowercase(ch: String) -> String:
+    c := ord(ch)
+    if c >= 65 and c <= 90:
+        return chr(c + 32)
+    return ch
+
+# case-insensitive substring search.
+fn contains_case_insensitive(haystack: String, needle: String) -> Bool:
+    if needle.len() == 0:
+        return true
+    if haystack.len() < needle.len():
+        return false
+    # build lowercase versions
+    mut lower_h := ""
+    for ch in haystack:
+        lower_h = lower_h + char_to_lowercase(ch)
+    mut lower_n := ""
+    for ch in needle:
+        lower_n = lower_n + char_to_lowercase(ch)
+    # scan for match
+    mut j := 0
+    while j + lower_n.len() <= lower_h.len():
+        if lower_h.substring(j, j + lower_n.len()) == lower_n:
+            return true
+        j = j + 1
+    return false
+
+# escape a string for JSON output.
+fn d_escape_json_string(s: String) -> String:
+    quote := chr(34)
+    backslash := chr(92)
+    mut output := ""
+    for ch in s:
+        if ch == quote:
+            output = output + backslash + quote
+        elif ch == backslash:
+            output = output + backslash + backslash
+        elif ch == chr(10):
+            output = output + backslash + "n"
+        elif ch == chr(9):
+            output = output + backslash + "t"
+        else:
+            output = output + ch
+    return output
+
+# strip the "# " prefix from a comment line.
+fn strip_comment_markers(line: String) -> String:
+    trimmed := d_trim_left(line)
+    if trimmed.len() >= 2:
+        if trimmed[0] == "#" and trimmed[1] == " ":
+            return trimmed.substring(2, trimmed.len())
+    if trimmed == "#":
+        return ""
+    return trimmed
+
+fn source_lines(source: String) -> List[String]:
+    mut lines: List[String] := []
+    mut cur := scanner.new(source)
+    while not scanner.done(cur):
+        line := scanner.take_line(cur)
+        lines.push(line.slice.text)
+        cur = line.cursor
+    if source.len() == 0:
+        return []
+    if source[source.len() - 1] == chr(10) or source[source.len() - 1] == chr(13):
+        lines.push("")
+    return lines
+
+# extract the name from a pub declaration line.
+# "pub fn abs(x: Int) -> Int" -> "abs"
+# "pub struct Foo:" -> "Foo"
+# "pub enum Color:" -> "Color"
+fn extract_documentation_name(line: String) -> String:
+    trimmed := trim_whitespace(line)
+    mut rest := ""
+    if string_starts_with(trimmed, "pub fn "):
+        rest = trimmed.substring(7, trimmed.len())
+    elif string_starts_with(trimmed, "pub struct "):
+        rest = trimmed.substring(11, trimmed.len())
+    elif string_starts_with(trimmed, "pub enum "):
+        rest = trimmed.substring(9, trimmed.len())
+    else:
+        return ""
+    # find end of name: ( or : or space or end
+    mut end := 0
+    while end < rest.len():
+        ch := rest[end]
+        if ch == "(" or ch == ":" or ch == " " or ch == "[":
+            break
+        end = end + 1
+    return rest.substring(0, end)
+
+# extract the kind from a pub declaration line.
+fn extract_documentation_kind(line: String) -> String:
+    trimmed := trim_whitespace(line)
+    if string_starts_with(trimmed, "pub fn "):
+        return "fn"
+    if string_starts_with(trimmed, "pub struct "):
+        return "struct"
+    if string_starts_with(trimmed, "pub enum "):
+        return "enum"
+    return ""
+
+fn is_public_documentation_decl(trimmed: String) -> Bool:
+    return string_starts_with(trimmed, "pub fn ") or string_starts_with(trimmed, "pub struct ") or string_starts_with(trimmed, "pub enum ")
+
+fn comment_block_documents_pub(lines: List[String], start: Int) -> Bool:
+    mut j := start
+    while j < lines.len():
+        trimmed := d_trim_left(lines[j])
+        if trimmed.len() == 0:
+            return false
+        if trimmed[0] == "#":
+            j = j + 1
+            continue
+        return is_public_documentation_decl(trimmed)
+    return false
+
+# extract the signature from a pub declaration line (strip trailing colon).
+fn extract_documentation_signature(line: String) -> String:
+    trimmed := trim_whitespace(line)
+    if trimmed.len() > 0 and trimmed[trimmed.len() - 1] == ":":
+        return trimmed.substring(0, trimmed.len() - 1)
+    return trimmed
+
+# find the position of a dash separator in a header line.
+# looks for " - " (3 bytes) or " — " (5 bytes, em dash is 3 bytes in UTF-8).
+# returns -1 if not found.
+fn find_doc_separator(s: String) -> Int:
+    emdash := chr(226) + chr(128) + chr(148)
+    mut j := 0
+    while j < s.len():
+        if s[j] == " ":
+            if j + 3 <= s.len() and s.substring(j, j + 3) == " - ":
+                return j
+            if j + 5 <= s.len() and s.substring(j + 1, j + 4) == emdash:
+                return j
+        j = j + 1
+    return 0 - 1
+
+# return the byte length of the separator at position pos.
+fn get_separator_length(s: String, pos: Int) -> Int:
+    if pos + 3 <= s.len() and s.substring(pos, pos + 3) == " - ":
+        return 3
+    return 5
+
+# --- core ---
+
+# reset all state for a new extraction.
+fn reset_docgen_state():
+    d_count = 0
+    d_names = []
+    d_kinds = []
+    d_sigs = []
+    d_docs = []
+    d_mod_name = ""
+    d_mod_desc = ""
+    d_header_lines = []
+    d_header_end = 0
+
+# extract documentation from pith source text.
+# populates module-level state with items found.
+pub fn doc_extract(source: String):
+    reset_docgen_state()
+    lines := source_lines(source)
+    mut i := 0
+
+    # collect module header — leading comment block
+    # first line should be "# module.name — description"
+    if lines.len() > 0 and string_starts_with(d_trim_left(lines[0]), "#"):
+        first := strip_comment_markers(lines[0])
+        # parse "std.math — basic math functions" or "std.math - description"
+        # em dash is 3 bytes in UTF-8, so " — " is 5 bytes; " - " is 3 bytes
+        sep := find_doc_separator(first)
+        if sep > 0:
+            d_mod_name = trim_whitespace(first.substring(0, sep))
+            sep_len := get_separator_length(first, sep)
+            d_mod_desc = trim_whitespace(first.substring(sep + sep_len, first.len()))
+        else:
+            d_mod_name = trim_whitespace(first)
+        i = 1
+
+        # collect remaining header lines — stop at first blank line (no #).
+        # blank lines within the comment block use "#" alone, so they won't
+        # trigger the stop condition. a truly empty line separates the header
+        # from per-item doc comments.
+        while i < lines.len():
+            trimmed := d_trim_left(lines[i])
+            if trimmed.len() == 0:
+                break
+            if trimmed[0] == "#":
+                if comment_block_documents_pub(lines, i):
+                    break
+                d_header_lines.push(strip_comment_markers(lines[i]))
+                i = i + 1
+                continue
+            break
+
+    d_header_end = i
+
+    # scan for pub declarations
+    while i < lines.len():
+        trimmed := d_trim_left(lines[i])
+
+        # check for pub fn/struct/enum
+        if is_public_documentation_decl(trimmed):
+            name := extract_documentation_name(trimmed)
+            kind := extract_documentation_kind(trimmed)
+            sig := extract_documentation_signature(trimmed)
+
+            # look back for doc comment on preceding line(s)
+            # don't look past the module header
+            mut doc := ""
+            mut back := i - 1
+            while back >= d_header_end:
+                prev := d_trim_left(lines[back])
+                if prev.len() > 0 and prev[0] == "#":
+                    comment_text := strip_comment_markers(lines[back])
+                    if doc == "":
+                        doc = comment_text
+                    else:
+                        doc = comment_text + " " + doc
+                    back = back - 1
+                else:
+                    break
+
+            d_names.push(name)
+            d_kinds.push(kind)
+            d_sigs.push(sig)
+            d_docs.push(doc)
+            d_count = d_count + 1
+
+        i = i + 1
+
+# format extracted docs as human-readable text.
+pub fn doc_format() -> String:
+    mut output := ""
+
+    # module header
+    if d_mod_name != "":
+        if d_mod_desc != "":
+            output = output + d_mod_name + " — " + d_mod_desc + chr(10)
+        else:
+            output = output + d_mod_name + chr(10)
+
+    # extra header lines (description, examples)
+    # skip leading and trailing empty entries from "#" only lines
+    if d_header_lines.len() > 0:
+        mut start := 0
+        while start < d_header_lines.len() and d_header_lines[start] == "":
+            start = start + 1
+        mut end := d_header_lines.len()
+        while end > start and d_header_lines[end - 1] == "":
+            end = end - 1
+        if start < end:
+            output = output + chr(10)
+            for line, i in d_header_lines:
+                if i < start or i >= end:
+                    continue
+                if line == "":
+                    output = output + chr(10)
+                else:
+                    output = output + "  " + line + chr(10)
+
+    # items
+    if d_count > 0:
+        output = output + chr(10)
+        for sig, i in d_sigs:
+            output = output + sig + chr(10)
+            if d_docs[i] != "":
+                output = output + "  " + d_docs[i] + chr(10)
+            output = output + chr(10)
+
+    return output
+
+# format extracted docs as JSON.
+pub fn doc_format_json() -> String:
+    LB := chr(123)
+    RB := chr(125)
+    Q := chr(34)
+    mut output := LB
+    output = output + Q + "module" + Q + ":" + Q + d_escape_json_string(d_mod_name) + Q
+    output = output + "," + Q + "description" + Q + ":" + Q + d_escape_json_string(d_mod_desc) + Q
+    output = output + "," + Q + "items" + Q + ":["
+    for name, i in d_names:
+        if i > 0:
+            output = output + ","
+        output = output + LB
+        output = output + Q + "name" + Q + ":" + Q + d_escape_json_string(name) + Q
+        output = output + "," + Q + "kind" + Q + ":" + Q + d_escape_json_string(d_kinds[i]) + Q
+        output = output + "," + Q + "signature" + Q + ":" + Q + d_escape_json_string(d_sigs[i]) + Q
+        output = output + "," + Q + "doc" + Q + ":" + Q + d_escape_json_string(d_docs[i]) + Q
+        output = output + RB
+    output = output + "]"
+    output = output + RB
+    return output
+
+# check that all pub items have doc comments.
+# prints warnings for undocumented items. returns count of missing docs.
+pub fn doc_check() -> Int:
+    mut missing := 0
+    for doc, i in d_docs:
+        if doc == "":
+            print("  missing doc: " + d_sigs[i])
+            missing = missing + 1
+    return missing
+
+# --- search ---
+
+# global file list for directory scanning.
+# keep it global so the directory walk appends into one shared list.
+mut d_file_list: List[String] := []
+
+# find the stdlib root by walking up from a starting directory.
+fn d_find_stdlib_root(start_dir: String) -> String:
+    mut dir := start_dir
+    mut depth := 0
+    while depth < 20:
+        test_path := dir + "/std"
+        if dir_exists(test_path):
+            return dir
+        parent := get_directory_path(dir)
+        if parent == dir:
+            break
+        dir = parent
+        depth = depth + 1
+    return ""
+
+# extract directory from a path.
+fn get_directory_path(path: String) -> String:
+    mut last_slash := 0 - 1
+    mut i := 0
+    while i < path.len():
+        if path[i] == "/":
+            last_slash = i
+        i = i + 1
+    if last_slash < 0:
+        return "."
+    return path.substring(0, last_slash)
+
+# derive a module name from a file path relative to the stdlib root.
+# "std/math.pith" -> "std.math", "std/net/tcp.pith" -> "std.net.tcp"
+fn convert_path_to_module(path: String, root: String) -> String:
+    # strip root prefix and leading slash
+    mut rel := path
+    if path.len() > root.len() + 1:
+        rel = path.substring(root.len() + 1, path.len())
+    # strip .pith extension
+    if rel.len() > 3 and rel.substring(rel.len() - 3, rel.len()) == ".pith":
+        rel = rel.substring(0, rel.len() - 3)
+    # replace / with .
+    mut result := ""
+    mut i := 0
+    while i < rel.len():
+        if rel[i] == "/":
+            result = result + "."
+        else:
+            result = result + rel[i]
+        i = i + 1
+    return result
+
+# scan the stdlib directory for .pith files.
+fn scan_stdlib_documentation(stdlib_root: String):
+    d_file_list = []
+    std_dir := stdlib_root + "/std"
+    if not dir_exists(std_dir):
+        return
+
+    # flat .pith files in std/
+    entries := list_dir(std_dir)
+    for entry in entries:
+        if entry.len() > 3 and entry.substring(entry.len() - 3, entry.len()) == ".pith":
+            d_file_list.push(std_dir + "/" + entry)
+
+    # check subdirectories: net/, os/
+    subdirs := list_dir(std_dir)
+    for subdir in subdirs:
+        sub_path := std_dir + "/" + subdir
+        if dir_exists(sub_path):
+            sub_entries := list_dir(sub_path)
+            for sub_entry in sub_entries:
+                if sub_entry.len() > 3 and sub_entry.substring(sub_entry.len() - 3, sub_entry.len()) == ".pith":
+                    d_file_list.push(sub_path + "/" + sub_entry)
+
+# search stdlib documentation for a query string.
+# returns formatted results or a "no results" message.
+pub fn doc_search(query: String, start_dir: String) -> String!:
+    stdlib_root := d_find_stdlib_root(start_dir)
+    if stdlib_root == "":
+        return "error: cannot find std/ directory"
+
+    scan_stdlib_documentation(stdlib_root)
+
+    mut output := "search: " + chr(34) + query + chr(34) + chr(10)
+    mut found := false
+
+    for path in d_file_list:
+        content := read_file(path)!
+        if content == "":
+            continue
+        mod_name := convert_path_to_module(path, stdlib_root)
+
+        doc_extract(content)
+
+        # check module-level match
+        mut mod_match := contains_case_insensitive(d_mod_name, query) or contains_case_insensitive(d_mod_desc, query)
+
+        # check item-level matches
+        mut matching_items: List[Int] := []
+        for name, i in d_names:
+            if contains_case_insensitive(name, query) or contains_case_insensitive(d_docs[i], query) or contains_case_insensitive(d_sigs[i], query):
+                matching_items.push(i)
+
+        if mod_match or matching_items.len() > 0:
+            found = true
+            output = output + chr(10)
+            if d_mod_desc != "":
+                output = output + "  " + d_mod_name + " — " + d_mod_desc + chr(10)
+            else:
+                output = output + "  " + d_mod_name + chr(10)
+
+            if mod_match:
+                # module name/description matched — show all items
+                for sig in d_sigs:
+                    output = output + "    " + sig + chr(10)
+            else:
+                # only specific items matched — show those
+                for idx in matching_items:
+                    output = output + "    " + d_sigs[idx] + chr(10)
+
+    if not found:
+        output = output + chr(10) + "  no results" + chr(10)
+
+    return output

@@ -1,0 +1,30 @@
+import std.bytes as bytes
+import std.fs as fs
+import std.io as io
+
+fn main() -> String!:
+    reader := io.bytes_reader(bytes.from_string_utf8("pith"))
+    print(reader.read_bytes(2)!.to_string_utf8()!)
+    print(reader.read_all_bytes()!.to_string_utf8()!)
+
+    copy_reader := io.bytes_reader(bytes.from_string_utf8("alpha"))
+    copy_buf := bytes.buffer()
+    print(io.copy_bytes(copy_reader, copy_buf)!.to_string())
+    print(copy_buf.bytes().to_string_utf8()!)
+
+    path := "/tmp/pith_io_bytes.txt"
+    writer := fs.create(path)!
+    print(writer.write_all_bytes(bytes.from_string_utf8("hello"))!.to_string())
+    writer.close()
+
+    file := fs.open(path)!
+    print(file.read_all_bytes()!.to_string_utf8()!)
+    file.close()
+    fs.remove(path)
+
+    proc := io.spawn_process("head -c 4")!
+    print(proc.stdin().write_all_bytes(bytes.from_string_utf8("wxyz"))!.to_string())
+    print(proc.stdout().read_all_bytes()!.to_string_utf8()!)
+    print(proc.wait().to_string())
+    proc.close()
+    return ""

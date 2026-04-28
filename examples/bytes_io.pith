@@ -1,0 +1,35 @@
+# bytes io — explicit bytes/text boundaries over file and process io
+
+import std.bytes as bytes
+import std.fs as fs
+
+fn main() -> String!:
+    payload := bytes.from_string_utf8("pith bytes")
+    path := "/tmp/pith_bytes_example.bin"
+
+    out := fs.create(path)!
+    print("wrote: " + out.write_all_bytes(payload)!.to_string())
+    out.close()
+
+    file := fs.open(path)!
+    raw := file.read_all_bytes()!
+    file.close()
+    fs.remove(path)
+
+    decoded := bytes.decode_utf8(raw)
+    print("len: " + bytes.len(raw).to_string())
+    print("typed decode: " + decoded.is_ok.to_string())
+    print("text: " + decoded.ok)
+
+    invalid_buf := bytes.buffer()
+    invalid_buf.write_byte(255)!
+    invalid := bytes.decode_utf8(invalid_buf.bytes())
+    print("invalid decode: " + invalid.is_err.to_string())
+
+    scratch := bytes.buffer()
+    scratch.write_string_utf8("hi")!
+    scratch.write_line_utf8("there")!
+    print("scratch ok: " + (scratch.bytes().to_string_utf8()! == "hi" + "there" + chr(10)).to_string())
+    scratch.reset()
+    print("scratch reset: " + bytes.len(scratch.bytes()).to_string())
+    return ""

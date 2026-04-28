@@ -16,16 +16,16 @@ jobs:
 
       - name: test
         run: |
-          ./target/release/forge run tests/cases/test_suite.fg
-          ./target/release/forge run tests/cases/test_process_command.fg
-          ./target/release/forge run tests/cases/test_http_request_bytes.fg
+          ./target/release/pith run tests/cases/test_suite.pith
+          ./target/release/pith run tests/cases/test_process_command.pith
+          ./target/release/pith run tests/cases/test_http_request_bytes.pith
 
       - name: run examples (native smoke)
         run: |
-          ./target/release/forge run examples/hello.fg >/dev/null
-          ./target/release/forge run examples/collection_methods.fg >/dev/null
-          ./target/release/forge run examples/string_collection_methods.fg >/dev/null
-          ./target/release/forge run examples/stdlib_algo.fg >/dev/null
+          ./target/release/pith run examples/hello.pith >/dev/null
+          ./target/release/pith run examples/collection_methods.pith >/dev/null
+          ./target/release/pith run examples/string_collection_methods.pith >/dev/null
+          ./target/release/pith run examples/stdlib_algo.pith >/dev/null
 
       - name: build self-hosted compiler
         run: make self-host
@@ -41,8 +41,8 @@ jobs:
 
       - name: lint examples
         run: |
-          for f in examples/*.fg; do
-            ./self-host/forge_main lint "$f"
+          for f in examples/*.pith; do
+            ./self-host/pith_main lint "$f"
             if [ $? -ne 0 ]; then
               echo "FAIL lint $f"
               exit 1
@@ -51,8 +51,8 @@ jobs:
 
       - name: lint self-host
         run: |
-          for f in self-host/*.fg; do
-            ./self-host/forge_main lint "$f"
+          for f in self-host/*.pith; do
+            ./self-host/pith_main lint "$f"
             if [ $? -ne 0 ]; then
               echo "FAIL lint $f"
               exit 1
@@ -61,8 +61,8 @@ jobs:
 
       - name: check examples (self-hosted)
         run: |
-          for f in examples/*.fg; do
-            result=$(./self-host/forge_main check "$f" 2>&1)
+          for f in examples/*.pith; do
+            result=$(./self-host/pith_main check "$f" 2>&1)
             if [ "$result" != "ok" ]; then
               echo "FAIL $f (self-hosted check)"
               echo "$result"
@@ -71,10 +71,10 @@ jobs:
             echo "ok   $f"
           done
 
-      - name: check forge formatting
+      - name: check pith formatting
         run: |
-          for f in self-host/*.fg; do
-            ./self-host/forge_main fmt --check "$f"
+          for f in self-host/*.pith; do
+            ./self-host/pith_main fmt --check "$f"
             if [ $? -ne 0 ]; then
               echo "FAIL $f not formatted"
               exit 1
@@ -83,9 +83,9 @@ jobs:
 
       - name: check doc coverage
         run: |
-          for f in std/*.fg std/**/*.fg; do
+          for f in std/*.pith std/**/*.pith; do
             [ -f "$f" ] || continue
-            ./self-host/forge_main doc --check "$f"
+            ./self-host/pith_main doc --check "$f"
             if [ $? -ne 0 ]; then
               echo "FAIL $f missing doc comments"
               exit 1

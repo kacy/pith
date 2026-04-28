@@ -198,25 +198,25 @@ func main() {
 		fmt.Println(rustErr)
 		os.Exit(1)
 	}
-	forgeResult, forgeErr := runTrials("./bench/std_pipeline", records, trials)
-	if forgeErr != nil {
-		fmt.Println(forgeErr)
+	pithResult, pithErr := runTrials("./bench/std_pipeline", records, trials)
+	if pithErr != nil {
+		fmt.Println(pithErr)
 		os.Exit(1)
 	}
-	if goResult.checksum != rustResult.checksum || goResult.checksum != forgeResult.checksum {
-		fmt.Printf("checksum mismatch: go=%d rust=%d forge=%d\n", goResult.checksum, rustResult.checksum, forgeResult.checksum)
+	if goResult.checksum != rustResult.checksum || goResult.checksum != pithResult.checksum {
+		fmt.Printf("checksum mismatch: go=%d rust=%d pith=%d\n", goResult.checksum, rustResult.checksum, pithResult.checksum)
 		os.Exit(1)
 	}
 
-	fmt.Printf("%-14s %-8s %-8s %-8s %-10s %-10s\n", "phase", "go", "rust", "forge", "forge/go", "forge/rust")
-	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "config", goResult.configMS, rustResult.configMS, forgeResult.configMS, ratio(forgeResult.configMS, goResult.configMS), ratio(forgeResult.configMS, rustResult.configMS))
-	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "csv_write", goResult.csvWriteMS, rustResult.csvWriteMS, forgeResult.csvWriteMS, ratio(forgeResult.csvWriteMS, goResult.csvWriteMS), ratio(forgeResult.csvWriteMS, rustResult.csvWriteMS))
-	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "csv_read", goResult.csvReadMS, rustResult.csvReadMS, forgeResult.csvReadMS, ratio(forgeResult.csvReadMS, goResult.csvReadMS), ratio(forgeResult.csvReadMS, rustResult.csvReadMS))
-	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "transform", goResult.transformMS, rustResult.transformMS, forgeResult.transformMS, ratio(forgeResult.transformMS, goResult.transformMS), ratio(forgeResult.transformMS, rustResult.transformMS))
-	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "json", goResult.jsonMS, rustResult.jsonMS, forgeResult.jsonMS, ratio(forgeResult.jsonMS, goResult.jsonMS), ratio(forgeResult.jsonMS, rustResult.jsonMS))
-	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "gzip_hash", goResult.gzipHashMS, rustResult.gzipHashMS, forgeResult.gzipHashMS, ratio(forgeResult.gzipHashMS, goResult.gzipHashMS), ratio(forgeResult.gzipHashMS, rustResult.gzipHashMS))
-	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "fs", goResult.fsMS, rustResult.fsMS, forgeResult.fsMS, ratio(forgeResult.fsMS, goResult.fsMS), ratio(forgeResult.fsMS, rustResult.fsMS))
-	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "total", goResult.totalMS, rustResult.totalMS, forgeResult.totalMS, ratio(forgeResult.totalMS, goResult.totalMS), ratio(forgeResult.totalMS, rustResult.totalMS))
+	fmt.Printf("%-14s %-8s %-8s %-8s %-10s %-10s\n", "phase", "go", "rust", "pith", "pith/go", "pith/rust")
+	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "config", goResult.configMS, rustResult.configMS, pithResult.configMS, ratio(pithResult.configMS, goResult.configMS), ratio(pithResult.configMS, rustResult.configMS))
+	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "csv_write", goResult.csvWriteMS, rustResult.csvWriteMS, pithResult.csvWriteMS, ratio(pithResult.csvWriteMS, goResult.csvWriteMS), ratio(pithResult.csvWriteMS, rustResult.csvWriteMS))
+	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "csv_read", goResult.csvReadMS, rustResult.csvReadMS, pithResult.csvReadMS, ratio(pithResult.csvReadMS, goResult.csvReadMS), ratio(pithResult.csvReadMS, rustResult.csvReadMS))
+	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "transform", goResult.transformMS, rustResult.transformMS, pithResult.transformMS, ratio(pithResult.transformMS, goResult.transformMS), ratio(pithResult.transformMS, rustResult.transformMS))
+	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "json", goResult.jsonMS, rustResult.jsonMS, pithResult.jsonMS, ratio(pithResult.jsonMS, goResult.jsonMS), ratio(pithResult.jsonMS, rustResult.jsonMS))
+	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "gzip_hash", goResult.gzipHashMS, rustResult.gzipHashMS, pithResult.gzipHashMS, ratio(pithResult.gzipHashMS, goResult.gzipHashMS), ratio(pithResult.gzipHashMS, rustResult.gzipHashMS))
+	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "fs", goResult.fsMS, rustResult.fsMS, pithResult.fsMS, ratio(pithResult.fsMS, goResult.fsMS), ratio(pithResult.fsMS, rustResult.fsMS))
+	fmt.Printf("%-14s %-8d %-8d %-8d %-10s %-10s\n", "total", goResult.totalMS, rustResult.totalMS, pithResult.totalMS, ratio(pithResult.totalMS, goResult.totalMS), ratio(pithResult.totalMS, rustResult.totalMS))
 	fmt.Println()
 	fmt.Printf("checksum %d\n", goResult.checksum)
 }

@@ -1,0 +1,66 @@
+# HTTP server using std.net.http
+#
+# Demonstrates: request parsing, header/query access, response builders,
+# routing, and the read_request/send_response helpers.
+#
+# Run:  pith run examples/http_server.pith
+# Test: curl http://localhost:8080
+#       curl http://localhost:8080/api
+#       curl http://localhost:8080/greet?name=world
+import std.net.http as http
+import std.net.websocket as websocket
+from std.net.http import HttpRequestBytes
+fn query_param(query: String, name: String) -> String:
+    if query == "":
+        return ""
+    for part in query.split("&"):
+        eq := part.index_of("=")
+        if eq < 0:
+            if part == name:
+                return ""
+            continue
+        if part.substring(0, eq) == name:
+            if eq + 1 < part.len():
+                return part.substring(eq + 1, part.len())
+            return ""
+    return ""
+fn handle(fd: Int) -> Int!:
+    tcp_set_timeout(fd, 1000)
+    req := http.read_request_bytes(fd)!
+    if websocket.route_echo(fd, req, "/ws", "connected", "echo:", "quit")!:
+        return 0
+    if req.is_get("/")!:
+        mut html := "<!DOCTYPE html><html><body>"
+        html = html + "<h1>Hello from Pith!</h1>"
+        html = html + "<p><a href=/api>JSON API</a></p>"
+        html = html + "<p><a href=/greet?name=world>Greet</a></p>"
+        html = html + "<p>websocket route: /ws</p>"
+        html = html + "</body></html>"
+        return http.send_response(fd, http.html_response(200, html))
+    elif req.is_get("/api")!:
+        ua := req.header("User-Agent")!
+        lb := chr(123)
+        rb := chr(125)
+        quote := chr(34)
+        mut body := lb + quote + "status" + quote + ":" + quote + "ok" + quote
+        body = body + "," + quote + "agent" + quote + ":" + quote + ua + quote + rb
+        return http.send_response(fd, http.json_response(200, body))
+    elif req.is_get("/greet")!:
+        name := query_param(req.query()!, "name")
+        if name == "":
+            return http.send_response(fd, http.html_response(200, "<h1>Hello, stranger!</h1>"))
+        else:
+            greeting := "<h1>Hello, " + name + "!</h1>"
+            return http.send_response(fd, http.html_response(200, greeting))
+    elif req.is_get("/redirect")!:
+        return http.send_response(fd, http.redirect("/"))
+    else:
+        return http.send_response(fd, http.not_found())
+fn main() -> Int!:
+    port := 8080
+    print("http://localhost:" + port.to_string())
+    fd := tcp_listen("0.0.0.0", port)!
+    while true:
+        client := tcp_accept(fd)!
+        handle(client)!
+    return 0

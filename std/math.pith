@@ -1,0 +1,285 @@
+# std.math — pure Pith math library
+#
+# All math functions implemented in Pith. Trig uses Taylor series,
+# log uses Newton's method, constants computed via Machin's formula.
+#
+# Builtins still available (no import needed):
+#   abs, min, max, clamp, fmt_float
+#
+# This module provides:
+#   from std.math import PI, E, sin, cos, tan, asin, acos, atan, atan2
+#   from std.math import exp, log, log10, log2, sqrt, pow_float
+#   from std.math import degrees, radians, hypot, sign, abs_float
+
+# ===============================================================
+# Core: atan series (used to compute PI)
+# ===============================================================
+
+fn atan_series(x: Float) -> Float:
+    mut term := x
+    mut sum := x
+    x2 := x * x
+    mut i := 1.0
+    while i < 25.0:
+        n := 2.0 * i + 1.0
+        tmp := term * x2
+        term = 0.0 - tmp
+        sum = sum + term / n
+        i = i + 1.0
+    return sum
+
+# ===============================================================
+# Constants
+# ===============================================================
+
+# Machin's formula: pi/4 = 4*atan(1/5) - atan(1/239)
+pub fn PI() -> Float:
+    a := atan_series(1.0 / 5.0)
+    b := atan_series(1.0 / 239.0)
+    return 4.0 * (4.0 * a - b)
+
+# # return e, the base of natural logarithms.
+pub fn E() -> Float:
+    return exp(1.0)
+
+# return tau, which is 2*pi.
+pub fn TAU() -> Float:
+    return PI() * 2.0
+
+# ===============================================================
+# Exponential and Logarithm
+# ===============================================================
+
+# e^x via range reduction + Taylor series
+pub fn exp(x: Float) -> Float:
+    mut val := x
+    mut neg := false
+    if val < 0.0:
+        val = 0.0 - val
+        neg = true
+    # reduce to |val| <= 1 by peeling off integer part
+    # e = 2.71828182845904523536
+    e_val := 2.71828182845904523536
+    mut result := 1.0
+    while val > 1.0:
+        val = val - 1.0
+        result = result * e_val
+    # Taylor: 1 + x + x^2/2! + x^3/3! + ...
+    mut term := 1.0
+    mut sum := 1.0
+    mut i := 1.0
+    while i < 25.0:
+        tmp := term * val
+        term = tmp / i
+        sum = sum + term
+        i = i + 1.0
+    result = result * sum
+    if neg:
+        return 1.0 / result
+    return result
+
+# Natural log via Halley's method
+pub fn log(x: Float) -> Float:
+    if x <= 0.0:
+        return 0.0 / 0.0
+    e_val := 2.71828182845904523536
+    mut y := 0.0
+    mut val := x
+    while val > e_val:
+        val = val / e_val
+        y = y + 1.0
+    inv_e := 1.0 / e_val
+    while val < inv_e:
+        val = val * e_val
+        y = y - 1.0
+    mut i := 0
+    while i < 12:
+        ey := exp(y)
+        diff := val - ey
+        denom := 2.0 * ey + diff
+        y = y + 2.0 * diff / denom
+        i = i + 1
+    return y
+
+# log base 10.
+pub fn log10(x: Float) -> Float:
+    return log(x) / log(10.0)
+
+# log base 2.
+pub fn log2(x: Float) -> Float:
+    return log(x) / log(2.0)
+
+# ===============================================================
+# Power and Root
+# ===============================================================
+
+# # Raise a float to a float exponent.
+pub fn pow_float(base: Float, exponent: Float) -> Float:
+    if exponent == 0.0:
+        return 1.0
+    if base == 0.0:
+        return 0.0
+    return exp(exponent * log(base))
+
+# square root via newton iteration.
+pub fn sqrt(x: Float) -> Float:
+    if x <= 0.0:
+        return 0.0
+    mut guess := x / 2.0
+    if guess < 1.0:
+        guess = 1.0
+    mut i := 0
+    while i < 20:
+        guess = (guess + x / guess) / 2.0
+        i = i + 1
+    return guess
+
+# absolute value for floats.
+pub fn abs_float(x: Float) -> Float:
+    if x < 0.0:
+        return 0.0 - x
+    return x
+
+# ===============================================================
+# Trigonometry
+# ===============================================================
+
+fn reduce_angle(x: Float) -> Float:
+    pi := PI()
+    tau := pi * 2.0
+    mut val := x
+    while val > pi:
+        val = val - tau
+    negpi := 0.0 - pi
+    while val < negpi:
+        val = val + tau
+    return val
+
+# sin via Taylor: x - x^3/3! + x^5/5! - ...
+pub fn sin(x: Float) -> Float:
+    val := reduce_angle(x)
+    v2 := val * val
+    mut term := val
+    mut sum := val
+    mut i := 1.0
+    while i < 15.0:
+        n := 2.0 * i
+        denom := n * (n + 1.0)
+        tmp := term * v2
+        term = 0.0 - tmp / denom
+        sum = sum + term
+        i = i + 1.0
+    return sum
+
+# cos via Taylor: 1 - x^2/2! + x^4/4! - ...
+pub fn cos(x: Float) -> Float:
+    val := reduce_angle(x)
+    v2 := val * val
+    mut term := 1.0
+    mut sum := 1.0
+    mut i := 1.0
+    while i < 15.0:
+        n := 2.0 * i
+        denom := (n - 1.0) * n
+        tmp := term * v2
+        term = 0.0 - tmp / denom
+        sum = sum + term
+        i = i + 1.0
+    return sum
+
+# tangent, computed as sin/cos.
+pub fn tan(x: Float) -> Float:
+    c := cos(x)
+    if abs_float(c) < 0.0000000001:
+        return 1.0 / 0.0
+    return sin(x) / c
+
+# inverse tangent.
+pub fn atan(x: Float) -> Float:
+    if x < 0.0:
+        return 0.0 - atan(0.0 - x)
+    if abs_float(x - 1.0) < 0.0000000001:
+        return PI() / 4.0
+    if x > 1.0:
+        return PI() / 2.0 - atan(1.0 / x)
+    return atan_series(x)
+
+# inverse tangent with quadrant handling.
+pub fn atan2(y: Float, x: Float) -> Float:
+    pi := PI()
+    if x > 0.0:
+        return atan(y / x)
+    if x < 0.0:
+        if y >= 0.0:
+            return atan(y / x) + pi
+        return atan(y / x) - pi
+    if y > 0.0:
+        return pi / 2.0
+    if y < 0.0:
+        return 0.0 - pi / 2.0
+    return 0.0
+
+# inverse sine.
+pub fn asin(x: Float) -> Float:
+    if abs_float(x) >= 1.0:
+        if x > 0.0:
+            return PI() / 2.0
+            return 0.0 - PI() / 2.0
+    return atan(x / sqrt(1.0 - x * x))
+
+# inverse cosine.
+pub fn acos(x: Float) -> Float:
+    return PI() / 2.0 - asin(x)
+
+# ===============================================================
+# Helpers
+# ===============================================================
+
+# # Convert radians to degrees.
+pub fn degrees(rad: Float) -> Float:
+    return rad * 180.0 / PI()
+
+# convert degrees to radians.
+pub fn radians(deg: Float) -> Float:
+    return deg * PI() / 180.0
+
+# compute the hypotenuse length for a right triangle.
+pub fn hypot(a: Float, b: Float) -> Float:
+    return sqrt(a * a + b * b)
+
+# return -1, 0, or 1 based on the sign of the input.
+pub fn sign(x: Float) -> Float:
+    if x > 0.0:
+        return 1.0
+    if x < 0.0:
+        return 0.0 - 1.0
+    return 0.0
+
+test "math constants and conversions are close":
+    pi := PI()
+
+    assert(abs_float(pi - 3.14159) < 0.001)
+    assert(abs_float(TAU() - 6.28318) < 0.001)
+    assert(abs_float(degrees(pi) - 180.0) < 0.001)
+    assert(abs_float(radians(180.0) - pi) < 0.001)
+
+test "math exponent logs powers and roots are close":
+    assert(abs_float(exp(1.0) - E()) < 0.001)
+    assert(abs_float(sqrt(9.0) - 3.0) < 0.001)
+    assert(abs_float(pow_float(2.0, 3.0) - 8.0) < 0.001)
+
+test "math trig helpers are close":
+    pi := PI()
+
+    assert(abs_float(sin(pi / 2.0) - 1.0) < 0.001)
+    assert(abs_float(cos(pi) + 1.0) < 0.001)
+    assert(abs_float(tan(pi / 4.0) - 1.0) < 0.001)
+    assert(abs_float(atan(1.0) - pi / 4.0) < 0.001)
+    assert(abs_float(atan2(1.0, 0.0) - pi / 2.0) < 0.001)
+
+test "math scalar helpers handle signs and triangles":
+    assert_eq(sign(2.0), 1.0)
+    assert_eq(sign(0.0 - 2.0), 0.0 - 1.0)
+    assert_eq(sign(0.0), 0.0)
+    assert_eq(abs_float(0.0 - 4.0), 4.0)
+    assert(abs_float(hypot(3.0, 4.0) - 5.0) < 0.001)

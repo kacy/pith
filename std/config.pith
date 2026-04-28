@@ -1,0 +1,589 @@
+# std.config — layered app configuration
+#
+# this module flattens toml and json objects into dotted keys so tools can
+# merge defaults, files, env-style maps, and cli overrides without ceremony.
+
+import std.json as json
+import std.toml as toml
+import std.fs as fs
+import std.os.path as path
+import std.text.scanner as scanner
+
+# # config values flattened by dotted key.
+pub struct Config:
+    pub values: Map[String, String]
+
+# # error returned when config loading or required lookup fails.
+pub struct ConfigError:
+    pub message: String
+
+struct ConfigStringScan:
+    value: String
+    position: Int
+
+fn config_fail(message: String) -> ConfigError:
+    return ConfigError(message)
+
+fn config_join_key(prefix: String, key: String) -> String:
+    if prefix == "":
+        return key
+    return prefix + "." + key
+
+fn config_copy_values(values: Map[String, String]) -> Map[String, String]:
+    mut result: Map[String, String] := {}
+    for key in values:
+        result.insert(key, values[key])
+    return result
+
+fn config_set_scalar(out: Map[String, String], key: String, value: String):
+    if key != "":
+        out.insert(key, value)
+
+fn config_strip_comment(line: String) -> String:
+    mut in_string := false
+    mut i := 0
+    while i < line.len():
+        c := line[i]
+        if c == chr(34):
+            in_string = not in_string
+        if c == "#" and not in_string:
+            return line.substring(0, i)
+        i = i + 1
+    return line
+
+fn config_unquote(value: String) -> String:
+    if value.len() >= 2 and value[0] == chr(34) and value[value.len() - 1] == chr(34):
+        return value.substring(1, value.len() - 1)
+    return value
+
+fn config_store_toml_scalar(out: Map[String, String], key: String, raw_value: String):
+    value := raw_value.trim()
+    if value == "" or value.starts_with("["):
+        return
+    config_set_scalar(out, key, config_unquote(value))
+
+fn config_flatten_toml_text(out: Map[String, String], text: String):
+    mut section := ""
+    mut cur := scanner.new(text)
+    while not scanner.done(cur):
+        raw_line := scanner.take_line(cur)
+        cur = raw_line.cursor
+        line := config_strip_comment(raw_line.slice.text).trim()
+        if line == "":
+            continue
+        if line.starts_with("[") and line.ends_with("]"):
+            section = line.substring(1, line.len() - 1).trim()
+            continue
+        parts := line.split("=")
+        if parts.len() < 2:
+            continue
+        key := parts[0].trim()
+        mut raw_value := parts[1]
+        mut i := 2
+        while i < parts.len():
+            raw_value = raw_value + "=" + parts[i]
+            i = i + 1
+        config_store_toml_scalar(out, config_join_key(section, key), raw_value)
+
+fn config_flatten_toml_table(out: Map[String, String], prefix: String, handle: Int):
+    for key in toml.keys(handle):
+        child_key := config_join_key(prefix, key)
+        child := toml.get_value(handle, key)
+        kind := toml.type_of(child)
+        if kind == "table":
+            config_flatten_toml_table(out, child_key, child)
+        elif kind == "string":
+            config_set_scalar(out, child_key, toml.get_string(handle, key))
+        elif kind == "int":
+            config_set_scalar(out, child_key, toml.get_int(handle, key).to_string())
+        elif kind == "float":
+            config_set_scalar(out, child_key, toml.get_float(handle, key).to_string())
+        elif kind == "bool":
+            config_set_scalar(out, child_key, toml.get_bool(handle, key).to_string())
+
+fn config_json_skip_ws(input: String, position: Int) -> Int:
+    mut pos := position
+    while pos < input.len() and (input[pos] == " " or input[pos] == chr(9) or input[pos] == chr(10) or input[pos] == chr(13)):
+        pos = pos + 1
+    return pos
+
+fn config_json_read_string(input: String, position: Int) -> ConfigStringScan:
+    mut pos := position
+    mut out := ""
+    if pos >= input.len() or input[pos] != chr(34):
+        return ConfigStringScan(out, pos)
+    pos = pos + 1
+    while pos < input.len():
+        if input[pos] == chr(92):
+            if pos + 1 < input.len():
+                out = out + input[pos + 1]
+                pos = pos + 2
+                continue
+        if input[pos] == chr(34):
+            return ConfigStringScan(out, pos + 1)
+        out = out + input[pos]
+        pos = pos + 1
+    return ConfigStringScan(out, pos)
+
+fn config_json_starts_at(input: String, position: Int, text: String) -> Bool:
+    if position + text.len() > input.len():
+        return false
+    mut i := 0
+    while i < text.len():
+        if input[position + i] != text[i]:
+            return false
+        i = i + 1
+    return true
+
+fn config_json_is_number_char(c: String) -> Bool:
+    if c >= "0" and c <= "9":
+        return true
+    return c == "-" or c == "+" or c == "." or c == "e" or c == "E"
+
+fn config_json_skip_array(input: String, position: Int) -> Int:
+    mut pos := position
+    mut depth := 0
+    while pos < input.len():
+        if input[pos] == chr(34):
+            scan := config_json_read_string(input, pos)
+            pos = scan.position
+            continue
+        if input[pos] == "[":
+            depth = depth + 1
+        elif input[pos] == "]":
+            depth = depth - 1
+            if depth <= 0:
+                return pos + 1
+        pos = pos + 1
+    return pos
+
+fn config_json_flatten_value(input: String, position: Int, key: String, out: Map[String, String]) -> Int:
+    mut pos := config_json_skip_ws(input, position)
+    if pos >= input.len():
+        return pos
+    if input[pos] == chr(123):
+        return config_json_flatten_object(input, pos, key, out)
+    if input[pos] == "[":
+        return config_json_skip_array(input, pos)
+    if input[pos] == chr(34):
+        scan := config_json_read_string(input, pos)
+        config_set_scalar(out, key, scan.value)
+        return scan.position
+    if config_json_starts_at(input, pos, "true"):
+        config_set_scalar(out, key, "true")
+        return pos + 4
+    if config_json_starts_at(input, pos, "false"):
+        config_set_scalar(out, key, "false")
+        return pos + 5
+    if config_json_starts_at(input, pos, "null"):
+        return pos + 4
+    start := pos
+    while pos < input.len() and config_json_is_number_char(input[pos]):
+        pos = pos + 1
+    if pos > start:
+        config_set_scalar(out, key, input.substring(start, pos))
+    return pos
+
+fn config_json_flatten_object(input: String, position: Int, prefix: String, out: Map[String, String]) -> Int:
+    mut pos := config_json_skip_ws(input, position)
+    if pos >= input.len() or input[pos] != chr(123):
+        return pos
+    pos = pos + 1
+    while pos < input.len():
+        pos = config_json_skip_ws(input, pos)
+        if pos >= input.len():
+            return pos
+        if input[pos] == chr(125):
+            return pos + 1
+        key_scan := config_json_read_string(input, pos)
+        key := key_scan.value
+        pos = config_json_skip_ws(input, key_scan.position)
+        if pos < input.len() and input[pos] == ":":
+            pos = pos + 1
+        pos = config_json_flatten_value(input, pos, config_join_key(prefix, key), out)
+        pos = config_json_skip_ws(input, pos)
+        if pos < input.len() and input[pos] == ",":
+            pos = pos + 1
+            continue
+        if pos < input.len() and input[pos] == chr(125):
+            return pos + 1
+    return pos
+
+fn config_flatten_json_object(out: Map[String, String], prefix: String, handle: Int):
+    for key in json.object_keys(handle):
+        child_key := config_join_key(prefix, key)
+        value := json.object_get(handle, key)
+        kind := json.type_of(value)
+        if kind == "object":
+            config_flatten_json_object(out, child_key, value)
+        elif kind == "string":
+            config_set_scalar(out, child_key, json.get_string(value))
+        elif kind == "int":
+            config_set_scalar(out, child_key, json.get_int(value).to_string())
+        elif kind == "float":
+            config_set_scalar(out, child_key, json.get_float(value).to_string())
+        elif kind == "bool":
+            config_set_scalar(out, child_key, json.get_bool(value).to_string())
+
+fn config_parse_bool(value: String, fallback: Bool) -> Bool:
+    lowered := value.to_lower()
+    if lowered == "true" or lowered == "1" or lowered == "yes" or lowered == "on":
+        return true
+    if lowered == "false" or lowered == "0" or lowered == "no" or lowered == "off":
+        return false
+    return fallback
+
+fn config_parse_bool_required(key: String, value: String) -> Bool!ConfigError:
+    lowered := value.to_lower()
+    if lowered == "true" or lowered == "1" or lowered == "yes" or lowered == "on":
+        return true
+    if lowered == "false" or lowered == "0" or lowered == "no" or lowered == "off":
+        return false
+    fail config_fail("invalid bool config key: " + key)
+
+# # create an empty config.
+pub fn empty() -> Config:
+    mut values: Map[String, String] := {}
+    return Config(values)
+
+# # create a config from a string map.
+pub fn from_map(values: Map[String, String]) -> Config:
+    return Config(config_copy_values(values))
+
+# # join a section prefix and field name into a dotted config key.
+pub fn dotted_key(prefix: String, key: String) -> String:
+    return config_join_key(prefix, key)
+
+# # parse toml text into a config.
+pub fn from_toml(text: String) -> Config!ConfigError:
+    root := toml.parse(text)
+    if root < 0 or toml.type_of(root) != "table":
+        fail config_fail("could not parse config")
+    mut values: Map[String, String] := {}
+    config_flatten_toml_text(values, text)
+    return Config(values)
+
+# # read and parse a toml config file.
+pub fn from_toml_file(file_path: String) -> Config!ConfigError:
+    if not file_exists(file_path):
+        fail config_fail("could not read config file: " + file_path)
+    data := read_file(file_path)
+    if data.is_err:
+        fail config_fail("could not read config file: " + file_path)
+    return from_toml(data.ok)
+
+# # parse json text into a config.
+pub fn from_json(text: String) -> Config!ConfigError:
+    root := json.parse(text)
+    if root < 0 or json.type_of(root) != "object":
+        fail config_fail("could not parse config")
+    mut values: Map[String, String] := {}
+    config_json_flatten_object(text, 0, "", values)
+    return Config(values)
+
+# # read and parse a json config file.
+pub fn from_json_file(file_path: String) -> Config!ConfigError:
+    if not file_exists(file_path):
+        fail config_fail("could not read config file: " + file_path)
+    data := read_file(file_path)
+    if data.is_err:
+        fail config_fail("could not read config file: " + file_path)
+    return from_json(data.ok)
+
+# # merge two configs, with values from overrides winning.
+pub fn merge(base: Config, overrides: Config) -> Config:
+    mut values := config_copy_values(base.values)
+    for key in overrides.values:
+        values.insert(key, overrides.values[key])
+    return Config(values)
+
+# # return true when a key exists.
+pub fn has(cfg: Config, key: String) -> Bool:
+    return cfg.values.contains_key(key)
+
+# true when any flattened config key lives under the dotted prefix.
+pub fn has_prefix(cfg: Config, prefix: String) -> Bool:
+    if prefix == "":
+        return not cfg.values.is_empty()
+    dotted := prefix + "."
+    for key in cfg.values:
+        if key == prefix or key.starts_with(dotted):
+            return true
+    return false
+
+# # return sorted config keys.
+pub fn keys(cfg: Config) -> List[String]:
+    mut result: List[String] := []
+    for key in cfg.values:
+        result.push(key)
+    return result.sort()
+
+fn config_get_string(cfg: Config, key: String) -> String:
+    if not has(cfg, key):
+        return ""
+    return cfg.values[key]
+
+# # return a config value or an empty string.
+pub fn get_string(cfg: Config, key: String) -> String:
+    return config_get_string(cfg, key)
+
+# # return a config value or an empty string.
+pub fn get(cfg: Config, key: String) -> String:
+    return config_get_string(cfg, key)
+
+# # return a config value or the fallback.
+pub fn get_or(cfg: Config, key: String, fallback: String) -> String:
+    if not has(cfg, key):
+        return fallback
+    return cfg.values[key]
+
+# # return a required config value.
+pub fn require(cfg: Config, key: String) -> String!ConfigError:
+    if not has(cfg, key):
+        fail config_fail("missing config key: " + key)
+    return cfg.values[key]
+
+# # return a required config value parsed as an int.
+pub fn require_int(cfg: Config, key: String) -> Int!ConfigError:
+    value := require(cfg, key)!
+    parsed := parse_int(value)
+    if parsed.is_err:
+        fail config_fail("invalid int config key: " + key)
+    return parsed.ok
+
+# # return a required config value parsed as a bool.
+pub fn require_bool(cfg: Config, key: String) -> Bool!ConfigError:
+    value := require(cfg, key)!
+    return config_parse_bool_required(key, value)!
+
+# # return a config value parsed as an int, or the fallback.
+pub fn get_int_or(cfg: Config, key: String, fallback: Int) -> Int:
+    if not has(cfg, key):
+        return fallback
+    parsed := parse_int(cfg.values[key])
+    if parsed.is_err:
+        return fallback
+    return parsed.ok
+
+# # return a config value parsed as a bool, or the fallback.
+pub fn get_bool_or(cfg: Config, key: String, fallback: Bool) -> Bool:
+    if not has(cfg, key):
+        return fallback
+    return config_parse_bool(cfg.values[key], fallback)
+
+# # return a config value parsed as a float, or the fallback.
+pub fn get_float_or(cfg: Config, key: String, fallback: Float) -> Float:
+    if not has(cfg, key):
+        return fallback
+    parsed := parse_float(cfg.values[key])
+    if parsed.is_err:
+        return fallback
+    return parsed.ok
+
+# # decode a config into a concrete struct.
+# # this is lowered by the compiler so structs do not need runtime reflection.
+pub fn decode[T](cfg: Config) -> T!ConfigError:
+    fail config_fail("config.decode requires compiler support")
+
+# # decode a config subtree into a concrete struct using dotted keys.
+# # this is lowered by the compiler so structs do not need runtime reflection.
+pub fn decode_prefix[T](cfg: Config, prefix: String) -> T!ConfigError:
+    fail config_fail("config.decode_prefix requires compiler support")
+
+# # load a toml file and decode it into a concrete struct.
+pub fn from_toml_file_typed[T](file_path: String) -> T!ConfigError:
+    return decode[T](from_toml_file(file_path)!)
+
+# # parse toml text and decode it into a concrete struct.
+pub fn from_toml_typed[T](text: String) -> T!ConfigError:
+    return decode[T](from_toml(text)!)
+
+# # parse toml text and decode a dotted subtree into a concrete struct.
+pub fn from_toml_typed_prefix[T](text: String, prefix: String) -> T!ConfigError:
+    return decode_prefix[T](from_toml(text)!, prefix)!
+
+# # load a toml file and decode a dotted subtree into a concrete struct.
+pub fn from_toml_file_typed_prefix[T](file_path: String, prefix: String) -> T!ConfigError:
+    return decode_prefix[T](from_toml_file(file_path)!, prefix)!
+
+# # load a json file and decode it into a concrete struct.
+pub fn from_json_file_typed[T](file_path: String) -> T!ConfigError:
+    return decode[T](from_json_file(file_path)!)
+
+# # parse json text and decode it into a concrete struct.
+pub fn from_json_typed[T](text: String) -> T!ConfigError:
+    return decode[T](from_json(text)!)
+
+# # parse json text and decode a dotted subtree into a concrete struct.
+pub fn from_json_typed_prefix[T](text: String, prefix: String) -> T!ConfigError:
+    return decode_prefix[T](from_json(text)!, prefix)!
+
+# # load a json file and decode a dotted subtree into a concrete struct.
+pub fn from_json_file_typed_prefix[T](file_path: String, prefix: String) -> T!ConfigError:
+    return decode_prefix[T](from_json_file(file_path)!, prefix)!
+
+test "config maps copy values and expose lookups":
+    mut values: Map[String, String] := {}
+    values.insert("host", "localhost")
+    values.insert("port", "8080")
+    cfg := from_map(values)
+    values.insert("host", "changed")
+
+    assert(has(cfg, "host"))
+    assert_eq(get(cfg, "host"), "localhost")
+    assert_eq(get_or(cfg, "missing", "fallback"), "fallback")
+    assert_eq(get_int_or(cfg, "port", 0), 8080)
+
+test "config merge prefers overrides":
+    mut base_values: Map[String, String] := {}
+    base_values.insert("host", "localhost")
+    base_values.insert("port", "8080")
+    mut override_values: Map[String, String] := {}
+    override_values.insert("port", "9090")
+    override_values.insert("debug", "true")
+
+    cfg := merge(from_map(base_values), from_map(override_values))
+    assert_eq(get(cfg, "host"), "localhost")
+    assert_eq(get_int_or(cfg, "port", 0), 9090)
+    assert_eq(get_bool_or(cfg, "debug", false), true)
+
+test "config dotted keys and required scalars stay strict":
+    mut values: Map[String, String] := {}
+    values.insert("server.port", "8080")
+    values.insert("feature.enabled", "yes")
+    values.insert("feature.broken", "maybe")
+    cfg := from_map(values)
+
+    assert_eq(dotted_key("server", "port"), "server.port")
+    assert_eq(dotted_key("", "name"), "name")
+    assert_eq(require_int(cfg, "server.port")!, 8080)
+    assert(require_bool(cfg, "feature.enabled")!)
+    assert(require_int(cfg, "missing").is_err)
+    assert(require_bool(cfg, "feature.broken").is_err)
+
+test "config flattens json and toml text":
+    json_cfg := from_json(chr(123) + chr(34) + "server" + chr(34) + ":" + chr(123) + chr(34) + "host" + chr(34) + ":" + chr(34) + "localhost" + chr(34) + "," + chr(34) + "port" + chr(34) + ":8080" + chr(125) + chr(125))!
+    toml_cfg := from_toml("[server]" + chr(10) + "host = " + chr(34) + "localhost" + chr(34) + chr(10) + "debug = true")!
+
+    assert_eq(get(json_cfg, "server.host"), "localhost")
+    assert_eq(get_int_or(json_cfg, "server.port", 0), 8080)
+    assert_eq(get(toml_cfg, "server.host"), "localhost")
+    assert_eq(get_bool_or(toml_cfg, "server.debug", false), true)
+
+test "config loads files and reports missing values":
+    nl := chr(10)
+    q := chr(34)
+    lb := chr(123)
+    rb := chr(125)
+
+    mut toml_doc := "name = " + q + "pith" + q + nl
+    toml_doc = toml_doc + "debug = false" + nl
+    toml_doc = toml_doc + "[server]" + nl
+    toml_doc = toml_doc + "host = " + q + "localhost" + q + nl
+    toml_doc = toml_doc + "port = 8080" + nl
+    toml_doc = toml_doc + "ratio = 0.75" + nl
+    toml_doc = toml_doc + "empty = " + q + q + nl
+    toml_doc = toml_doc + "tags = [" + q + "api" + q + "]" + nl
+    toml_doc = toml_doc + "[database]" + nl
+    toml_doc = toml_doc + "url = " + q + "sqlite://local" + q + nl
+
+    toml_cfg := from_toml(toml_doc)!
+    assert_eq(get_string(toml_cfg, "server.host"), "localhost")
+    assert_eq(get_int_or(toml_cfg, "server.port", 0), 8080)
+    assert_eq(get_bool_or(toml_cfg, "debug", true), false)
+    assert_eq(get_float_or(toml_cfg, "server.ratio", 0.0).to_string(), "0.75")
+    assert(has(toml_cfg, "server.empty"))
+    assert(not has(toml_cfg, "server.tags"))
+    assert_eq(keys(toml_cfg).join(","), "database.url,debug,name,server.empty,server.host,server.port,server.ratio")
+
+    mut json_doc := lb + q + "name" + q + ":" + q + "pith-json" + q
+    json_doc = json_doc + "," + q + "server" + q + ":" + lb
+    json_doc = json_doc + q + "host" + q + ":" + q + "0.0.0.0" + q
+    json_doc = json_doc + "," + q + "port" + q + ":9090"
+    json_doc = json_doc + "," + q + "tls" + q + ":false" + rb
+    json_doc = json_doc + "," + q + "items" + q + ":[1,2]" + rb
+    json_cfg := from_json(json_doc)!
+    assert_eq(get_string(json_cfg, "name"), "pith-json")
+    assert_eq(get_string(json_cfg, "server.host"), "0.0.0.0")
+    assert_eq(get_int_or(json_cfg, "server.port", 0), 9090)
+    assert_eq(get_bool_or(json_cfg, "server.tls", true), false)
+    assert(not has(json_cfg, "items"))
+
+    mut override_values: Map[String, String] := {}
+    override_values.insert("server.port", "7070")
+    override_values.insert("feature.enabled", "yes")
+    overrides := from_map(override_values)
+    override_values.insert("feature.enabled", "no")
+    merged := merge(toml_cfg, overrides)
+    assert_eq(get_int_or(merged, "server.port", 0), 7070)
+    assert_eq(get_bool_or(merged, "feature.enabled", false), true)
+    assert_eq(get_or(merged, "missing", "fallback"), "fallback")
+    assert_eq(require(merged, "database.url")!, "sqlite://local")
+    missing := require(merged, "missing")
+    assert(missing.is_err)
+    assert_eq(missing.err.message, "missing config key: missing")
+
+    root := fs.make_temp_dir("pith-config-")!
+    toml_path := path.join(root, "app.toml")
+    json_path := path.join(root, "app.json")
+    assert(fs.write(toml_path, toml_doc)!)
+    assert(fs.write(json_path, json_doc)!)
+    assert_eq(get_string(from_toml_file(toml_path)!, "server.host"), "localhost")
+    assert_eq(get_string(from_json_file(json_path)!, "server.host"), "0.0.0.0")
+    typed_toml := from_toml_file_typed[ConfigFileName](toml_path)
+    typed_json := from_json_file_typed[ConfigFileName](json_path)
+    assert(typed_toml.is_ok)
+    assert(typed_json.is_ok)
+    assert_eq(typed_toml.ok.name, "pith")
+    assert_eq(typed_json.ok.name, "pith-json")
+    assert(from_json("not json").is_err)
+    assert(from_toml_file(path.join(root, "missing.toml")).is_err)
+    assert(fs.remove_tree(root))
+
+test "config decodes typed text and file prefixes":
+    nl := chr(10)
+    q := chr(34)
+    lb := chr(123)
+    rb := chr(125)
+
+    toml_doc := "name = " + q + "pith" + q + nl + "[server]" + nl + "host = " + q + "127.0.0.1" + q + nl + "port = 8080" + nl + "tls = true" + nl
+    json_doc := lb + q + "name" + q + ":" + q + "pith" + q + "," + q + "server" + q + ":" + lb + q + "host" + q + ":" + q + "0.0.0.0" + q + "," + q + "port" + q + ":9090," + q + "tls" + q + ":false" + rb + rb
+    toml_cfg := from_toml_typed_prefix[ConfigNestedServer](toml_doc, "server")
+    json_cfg := from_json_typed_prefix[ConfigNestedServer](json_doc, "server")
+
+    assert(toml_cfg.is_ok)
+    assert(json_cfg.is_ok)
+    assert_eq(toml_cfg.ok.host, "127.0.0.1")
+    assert_eq(toml_cfg.ok.port, 8080)
+    assert(toml_cfg.ok.tls)
+    assert_eq(json_cfg.ok.host, "0.0.0.0")
+    assert_eq(json_cfg.ok.port, 9090)
+    assert(not json_cfg.ok.tls)
+
+    root := fs.make_temp_dir("pith-config-prefix-")!
+    toml_path := path.join(root, "app.toml")
+    json_path := path.join(root, "app.json")
+    assert(fs.write(toml_path, "host = " + q + "localhost" + q + nl + "port = 8080" + nl)!)
+    assert(fs.write(json_path, lb + q + "host" + q + ":" + q + "0.0.0.0" + q + "," + q + "port" + q + ":9090" + rb)!)
+
+    file_toml := from_toml_file_typed_prefix[ConfigFileServer](toml_path, "")
+    file_json := from_json_file_typed_prefix[ConfigFileServer](json_path, "")
+    assert(file_toml.is_ok)
+    assert(file_json.is_ok)
+    assert_eq(file_toml.ok.host, "localhost")
+    assert_eq(file_toml.ok.port, 8080)
+    assert_eq(file_json.ok.host, "0.0.0.0")
+    assert_eq(file_json.ok.port, 9090)
+    assert(fs.remove_tree(root))
+
+struct ConfigFileServer:
+    pub host: String
+    pub port: Int
+
+struct ConfigFileName:
+    pub name: String
+
+struct ConfigNestedServer:
+    pub host: String
+    pub port: Int
+    pub tls: Bool

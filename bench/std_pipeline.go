@@ -296,7 +296,7 @@ func printMetric(name string, value int) {
 
 func main() {
 	records := recordsFromArgs()
-	workDir, err := os.MkdirTemp("", "forge-std-pipeline-")
+	workDir, err := os.MkdirTemp("", "pith-std-pipeline-")
 	if err != nil {
 		panic(err)
 	}

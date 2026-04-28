@@ -1,0 +1,40 @@
+import std.fs as fs
+import std.io as io
+
+fn main() -> Int!:
+    data_path := "/tmp/pith_io_buffered_data.txt"
+    line_path := "/tmp/pith_io_buffered_lines.txt"
+
+    writer := fs.create(data_path)!
+    buffered_writer := writer.buffered_writer_chunked(4)
+    print(buffered_writer.write("ab")!.to_string())
+    print(buffered_writer.write("cdef")!.to_string())
+    print(buffered_writer.write("gh")!.to_string())
+    print(buffered_writer.flush()!.to_string())
+    writer.close()
+
+    reader := fs.open(data_path)!
+    buffered_reader := reader.buffered_reader_chunked(3)
+    print(buffered_reader.read(3)!)
+    print(buffered_reader.read(3)!)
+    print("[" + buffered_reader.read(3)! + "]")
+    reader.close()
+
+    line_writer := fs.create(line_path)!
+    buffered_line_writer := line_writer.buffered_writer_chunked(5)
+    buffered_line_writer.write("alpha" + chr(10) + "beta")!
+    buffered_line_writer.write(chr(13) + chr(10) + "gamma")!
+    buffered_line_writer.flush()!
+    line_writer.close()
+
+    line_reader := fs.open(line_path)!
+    buffered_line_reader := line_reader.buffered_reader_chunked(2)
+    print(buffered_line_reader.read_line()!)
+    print(buffered_line_reader.read_line()!)
+    print(buffered_line_reader.read_line()!)
+    print("[" + buffered_line_reader.read_line()! + "]")
+    line_reader.close()
+
+    fs.remove(data_path)
+    fs.remove(line_path)
+    return 0

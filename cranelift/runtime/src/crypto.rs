@@ -1,14 +1,14 @@
-use crate::bytes::{forge_bytes_from_vec, forge_bytes_ref};
+use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use ring::{aead, agreement, rand, signature};
 use std::fs;
 
-struct ForgeX25519Key {
+struct PithX25519Key {
     key: Option<agreement::EphemeralPrivateKey>,
     public_key: Vec<u8>,
 }
 
 unsafe fn bytes_slice<'a>(handle: i64) -> Option<&'a [u8]> {
-    Some(forge_bytes_ref(handle)?.data.as_slice())
+    Some(pith_bytes_ref(handle)?.data.as_slice())
 }
 
 fn seal_with(
@@ -35,7 +35,7 @@ fn seal_with(
     {
         return 0;
     }
-    forge_bytes_from_vec(out)
+    pith_bytes_from_vec(out)
 }
 
 fn open_with(
@@ -59,7 +59,7 @@ fn open_with(
     let Ok(plain) = key.open_in_place(nonce, aead::Aad::from(aad), &mut in_out) else {
         return 0;
     };
-    forge_bytes_from_vec(plain.to_vec())
+    pith_bytes_from_vec(plain.to_vec())
 }
 
 fn verify_with(
@@ -89,11 +89,11 @@ fn sign_rsa_with(
     if key_pair.sign(encoding, &rng, message, &mut sig).is_err() {
         return 0;
     }
-    forge_bytes_from_vec(sig)
+    pith_bytes_from_vec(sig)
 }
 
 #[no_mangle]
-pub extern "C" fn forge_crypto_x25519_keygen() -> i64 {
+pub extern "C" fn pith_crypto_x25519_keygen() -> i64 {
     let rng = rand::SystemRandom::new();
     let Ok(key) = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng) else {
         return 0;
@@ -101,23 +101,23 @@ pub extern "C" fn forge_crypto_x25519_keygen() -> i64 {
     let Ok(public_key) = key.compute_public_key() else {
         return 0;
     };
-    Box::into_raw(Box::new(ForgeX25519Key {
+    Box::into_raw(Box::new(PithX25519Key {
         key: Some(key),
         public_key: public_key.as_ref().to_vec(),
     })) as i64
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_crypto_x25519_public_key(handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_crypto_x25519_public_key(handle: i64) -> i64 {
     if handle <= 0 {
         return 0;
     }
-    let key = &*(handle as *const ForgeX25519Key);
-    forge_bytes_from_vec(key.public_key.clone())
+    let key = &*(handle as *const PithX25519Key);
+    pith_bytes_from_vec(key.public_key.clone())
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_crypto_x25519_shared_secret(
+pub unsafe extern "C" fn pith_crypto_x25519_shared_secret(
     handle: i64,
     peer_public_key: i64,
 ) -> i64 {
@@ -127,27 +127,27 @@ pub unsafe extern "C" fn forge_crypto_x25519_shared_secret(
     let Some(peer) = bytes_slice(peer_public_key) else {
         return 0;
     };
-    let key = &mut *(handle as *mut ForgeX25519Key);
+    let key = &mut *(handle as *mut PithX25519Key);
     let Some(private_key) = key.key.take() else {
         return 0;
     };
     let peer_key = agreement::UnparsedPublicKey::new(&agreement::X25519, peer);
     agreement::agree_ephemeral(private_key, &peer_key, |secret| {
-        forge_bytes_from_vec(secret.to_vec())
+        pith_bytes_from_vec(secret.to_vec())
     })
     .unwrap_or(0)
 }
 
 #[no_mangle]
-pub extern "C" fn forge_crypto_x25519_close(handle: i64) {
+pub extern "C" fn pith_crypto_x25519_close(handle: i64) {
     if handle <= 0 {
         return;
     }
-    let _ = unsafe { Box::from_raw(handle as *mut ForgeX25519Key) };
+    let _ = unsafe { Box::from_raw(handle as *mut PithX25519Key) };
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_crypto_aes_128_gcm_seal(
+pub unsafe extern "C" fn pith_crypto_aes_128_gcm_seal(
     key: i64,
     nonce: i64,
     aad: i64,
@@ -169,7 +169,7 @@ pub unsafe extern "C" fn forge_crypto_aes_128_gcm_seal(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_crypto_aes_128_gcm_open(
+pub unsafe extern "C" fn pith_crypto_aes_128_gcm_open(
     key: i64,
     nonce: i64,
     aad: i64,
@@ -191,7 +191,7 @@ pub unsafe extern "C" fn forge_crypto_aes_128_gcm_open(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_crypto_chacha20_poly1305_seal(
+pub unsafe extern "C" fn pith_crypto_chacha20_poly1305_seal(
     key: i64,
     nonce: i64,
     aad: i64,
@@ -213,7 +213,7 @@ pub unsafe extern "C" fn forge_crypto_chacha20_poly1305_seal(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_crypto_chacha20_poly1305_open(
+pub unsafe extern "C" fn pith_crypto_chacha20_poly1305_open(
     key: i64,
     nonce: i64,
     aad: i64,
@@ -235,7 +235,7 @@ pub unsafe extern "C" fn forge_crypto_chacha20_poly1305_open(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_crypto_verify_ed25519(
+pub unsafe extern "C" fn pith_crypto_verify_ed25519(
     public_key: i64,
     message: i64,
     sig: i64,
@@ -253,7 +253,7 @@ pub unsafe extern "C" fn forge_crypto_verify_ed25519(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_crypto_verify_ecdsa_p256_sha256_asn1(
+pub unsafe extern "C" fn pith_crypto_verify_ecdsa_p256_sha256_asn1(
     public_key: i64,
     message: i64,
     sig: i64,
@@ -271,7 +271,7 @@ pub unsafe extern "C" fn forge_crypto_verify_ecdsa_p256_sha256_asn1(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_crypto_verify_rsa_pkcs1_sha256(
+pub unsafe extern "C" fn pith_crypto_verify_rsa_pkcs1_sha256(
     public_key: i64,
     message: i64,
     sig: i64,
@@ -294,7 +294,7 @@ pub unsafe extern "C" fn forge_crypto_verify_rsa_pkcs1_sha256(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_crypto_verify_rsa_pss_sha256(
+pub unsafe extern "C" fn pith_crypto_verify_rsa_pss_sha256(
     public_key: i64,
     message: i64,
     sig: i64,
@@ -317,7 +317,7 @@ pub unsafe extern "C" fn forge_crypto_verify_rsa_pss_sha256(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_crypto_sign_rsa_pss_sha256_pkcs8(pkcs8: i64, message: i64) -> i64 {
+pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha256_pkcs8(pkcs8: i64, message: i64) -> i64 {
     let Some(pkcs8) = bytes_slice(pkcs8) else {
         return 0;
     };
@@ -328,7 +328,7 @@ pub unsafe extern "C" fn forge_crypto_sign_rsa_pss_sha256_pkcs8(pkcs8: i64, mess
 }
 
 #[no_mangle]
-pub extern "C" fn forge_os_cert_roots_pem() -> *mut i8 {
+pub extern "C" fn pith_os_cert_roots_pem() -> *mut i8 {
     let mut candidates = Vec::new();
     if let Ok(path) = std::env::var("SSL_CERT_FILE") {
         candidates.push(path);
@@ -346,9 +346,9 @@ pub extern "C" fn forge_os_cert_roots_pem() -> *mut i8 {
                 .windows(27)
                 .any(|window| window == b"-----BEGIN CERTIFICATE-----")
             {
-                return unsafe { crate::forge_copy_bytes_to_cstring(&data) };
+                return unsafe { crate::pith_copy_bytes_to_cstring(&data) };
             }
         }
     }
-    unsafe { crate::forge_cstring_empty() }
+    unsafe { crate::pith_cstring_empty() }
 }

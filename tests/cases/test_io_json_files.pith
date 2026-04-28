@@ -1,0 +1,22 @@
+import std.json as json
+import std.fs as fs
+
+fn main() -> String!:
+    json_path := "/tmp/pith_io_json.json"
+    lb := chr(123)
+    rb := chr(125)
+
+    doc := lb + "\"name\":\"pith\",\"enabled\":true,\"items\":[1,2,3]" + rb
+    root := json.parse(doc)
+    print(json.save_chunked(json_path, root, 4).to_string())
+
+    loaded := json.parse_file_chunked(json_path, 3)
+    print(json.type_of(loaded))
+    print(json.object_get_string(loaded, "name"))
+    print(json.object_get_bool(loaded, "enabled").to_string())
+    print(json.object_get_string_or(loaded, "missing", "fallback"))
+    print(json.array_len(json.object_get_array(loaded, "items")).to_string())
+    print(fs.exists(json_path).to_string())
+
+    fs.remove(json_path)
+    return ""

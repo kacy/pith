@@ -1,0 +1,30 @@
+# csv parsing and encoding
+
+import std.csv as csv
+import std.fs as fs
+
+fn main() -> String!:
+    path := "/tmp/pith_csv_ops.csv"
+    data := "name,age,city" + chr(10) + "alice,30,nyc" + chr(10) + "bob,25,sf"
+    rows := csv.parse(data)
+    print("rows: " + rows.len().to_string())
+    print("first: " + rows[0].join("|"))
+    print("second: " + rows[1].join("|"))
+    print("third: " + rows[2].join("|"))
+
+    # encoding
+    mut r1: List[String] := ["x", "y"]
+    print("encoded: " + csv.encode_row(r1))
+
+    # quoting
+    mut r2: List[String] := ["hello, world", "plain"]
+    print("quoted: " + csv.encode_row(r2))
+
+    # file-backed helpers use the same shared io layer now
+    print("saved: " + csv.save(path, rows)!.to_string())
+    loaded := csv.parse_file(path)!
+    print("loaded: " + loaded[1].join("|"))
+    fs.remove(path)
+
+    print("csv ops work")
+    return ""

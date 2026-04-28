@@ -1,0 +1,123 @@
+# std.bits — small bit manipulation helpers
+#
+# this is a named wrapper around the existing bit builtins. we keep
+# these as functions because `|` is already pith's pipe operator.
+
+fn bits_mask(value: Int, mask: Int) -> Int:
+    return bit_and(value, mask)
+
+# bitwise and.
+pub fn band(left: Int, right: Int) -> Int:
+    return bit_and(left, right)
+
+# bitwise or.
+pub fn bor(left: Int, right: Int) -> Int:
+    return bit_or(left, right)
+
+# bitwise xor.
+pub fn xor(left: Int, right: Int) -> Int:
+    return bit_xor(left, right)
+
+# bitwise not.
+pub fn invert(value: Int) -> Int:
+    return bit_not(value)
+
+# shift left.
+pub fn shl(value: Int, amount: Int) -> Int:
+    return bit_shl(value, amount)
+
+# shift right with zero fill.
+pub fn shr(value: Int, amount: Int) -> Int:
+    return bit_shr(value, amount)
+
+# keep the low 8 bits.
+pub fn mask8(value: Int) -> Int:
+    return bits_mask(value, 255)
+
+# keep the low 16 bits.
+pub fn mask16(value: Int) -> Int:
+    return bits_mask(value, 65535)
+
+# keep the low 32 bits.
+pub fn mask32(value: Int) -> Int:
+    return bits_mask(value, 4294967295)
+
+# keep the low 64 bits.
+pub fn mask64(value: Int) -> Int:
+    return value
+
+# wrap a 32-bit addition.
+pub fn add32(left: Int, right: Int) -> Int:
+    return mask32(left + right)
+
+# wrap a 64-bit addition.
+pub fn add64(left: Int, right: Int) -> Int:
+    return mask64(left + right)
+
+# rotate a 32-bit value left.
+pub fn rotl32(value: Int, amount: Int) -> Int:
+    n := amount % 32
+    if n == 0:
+        return mask32(value)
+    return mask32(bit_or(bit_shl(value, n), bit_shr(value, 32 - n)))
+
+# rotate a 32-bit value right.
+pub fn rotr32(value: Int, amount: Int) -> Int:
+    n := amount % 32
+    if n == 0:
+        return mask32(value)
+    return mask32(bit_or(bit_shr(value, n), bit_shl(value, 32 - n)))
+
+# rotate a 64-bit value left.
+pub fn rotl64(value: Int, amount: Int) -> Int:
+    n := amount % 64
+    if n == 0:
+        return mask64(value)
+    return mask64(bit_or(bit_shl(value, n), bit_shr(value, 64 - n)))
+
+# rotate a 64-bit value right.
+pub fn rotr64(value: Int, amount: Int) -> Int:
+    n := amount % 64
+    if n == 0:
+        return mask64(value)
+    return mask64(bit_or(bit_shr(value, n), bit_shl(value, 64 - n)))
+
+test "bit helpers wrap the bit builtins":
+    assert_eq(band(6, 3), 2)
+    assert_eq(bor(4, 1), 5)
+    assert_eq(xor(7, 3), 4)
+    assert_eq(shl(3, 2), 12)
+    assert_eq(shr(8, 1), 4)
+
+test "bit masks keep the low bits":
+    assert_eq(mask8(511), 255)
+    assert_eq(mask16(65537), 1)
+    assert_eq(mask32(4294967296), 0)
+
+test "addition helpers wrap unsigned widths":
+    assert_eq(add32(4294967295, 1), 0)
+    assert_eq(UInt64(add64(-1, 1)).to_string(), "0")
+    assert_eq(UInt64(add64(9223372036854775807, 1)).to_string(), "9223372036854775808")
+
+test "rotations stay inside 32 bits":
+    assert_eq(rotl32(1, 4), 16)
+    assert_eq(rotr32(16, 4), 1)
+    assert_eq(rotl32(1, 8), 256)
+    assert_eq(rotr32(256, 8), 1)
+    assert_eq(rotl32(5, 0), 5)
+
+test "rotations stay inside 64 bits":
+    assert_eq(rotl64(1, 8), 256)
+    assert_eq(rotr64(256, 8), 1)
+    assert_eq(UInt64(rotl64(1, 63)).to_string(), "9223372036854775808")
+    assert_eq(UInt64(rotr64(1, 1)).to_string(), "9223372036854775808")
+    assert_eq(UInt64(rotl64(-1, 17)).to_string(), "18446744073709551615")
+
+test "fixed width integer constructors wrap values":
+    assert_eq(UInt8(257).to_string(), "1")
+    assert_eq(UInt16(65537).to_string(), "1")
+    assert_eq(UInt32(4294967295).to_string(), "4294967295")
+    assert_eq(UInt64(-1).to_string(), "18446744073709551615")
+    assert_eq(Int8(255).to_string(), "-1")
+    assert_eq(Int16(65535).to_string(), "-1")
+    assert_eq(Int32(4294967295).to_string(), "-1")

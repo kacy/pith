@@ -19,9 +19,9 @@ RUN zig build -Doptimize=ReleaseSafe
 
 FROM alpine:3.21.6@sha256:c3f8e73fdb79deaebaa2037150150191b9dcbfba68b4a46d70103204c53f4709
 
-RUN addgroup -g 1000 forge && adduser -D -u 1000 -G forge forge
+RUN addgroup -g 1000 pith && adduser -D -u 1000 -G pith pith
 
-COPY --from=builder /src/zig-out/bin/forge /usr/local/bin/forge
+COPY --from=builder /src/zig-out/bin/pith /usr/local/bin/pith
 
-USER forge
-ENTRYPOINT ["forge"]
+USER pith
+ENTRYPOINT ["pith"]

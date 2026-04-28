@@ -4,19 +4,19 @@ static RANDOM_SEED: AtomicU64 = AtomicU64::new(123456789);
 
 /// Exit the program with given status code
 #[no_mangle]
-pub extern "C" fn forge_exit(code: i64) {
+pub extern "C" fn pith_exit(code: i64) {
     std::process::exit(code as i32);
 }
 
 /// Sleep for given number of milliseconds
 #[no_mangle]
-pub extern "C" fn forge_sleep(ms: i64) {
+pub extern "C" fn pith_sleep(ms: i64) {
     std::thread::sleep(std::time::Duration::from_millis(ms as u64));
 }
 
 /// Get current time in milliseconds since epoch
 #[no_mangle]
-pub extern "C" fn forge_time() -> i64 {
+pub extern "C" fn pith_time() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -25,9 +25,9 @@ pub extern "C" fn forge_time() -> i64 {
 }
 
 /// Read a line from stdin
-/// Returns C string. Caller must free with forge_free.
+/// Returns C string. Caller must free with pith_free.
 #[no_mangle]
-pub unsafe extern "C" fn forge_input() -> *mut i8 {
+pub unsafe extern "C" fn pith_input() -> *mut i8 {
     use std::alloc::{alloc, Layout};
     use std::io::{self, BufRead};
 
@@ -59,14 +59,14 @@ pub unsafe extern "C" fn forge_input() -> *mut i8 {
 /// # Safety
 /// command must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_exec(command: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_exec(command: *const i8) -> i64 {
     use std::process::Command;
 
     if command.is_null() {
         return -1;
     }
 
-    let len = crate::string::forge_cstring_len(command) as usize;
+    let len = crate::string::pith_cstring_len(command) as usize;
     let slice = std::slice::from_raw_parts(command as *const u8, len);
     if let Ok(cmd_str) = std::str::from_utf8(slice) {
         let parts: Vec<&str> = cmd_str.split_whitespace().collect();
@@ -91,7 +91,7 @@ pub unsafe extern "C" fn forge_exec(command: *const i8) -> i64 {
 
 /// Random float between 0.0 and 1.0
 #[no_mangle]
-pub extern "C" fn forge_random_float() -> f64 {
+pub extern "C" fn pith_random_float() -> f64 {
     use std::num::Wrapping;
 
     let s = RANDOM_SEED.load(Ordering::Relaxed);
@@ -102,25 +102,25 @@ pub extern "C" fn forge_random_float() -> f64 {
 
 /// Seed the random number generator
 #[no_mangle]
-pub extern "C" fn forge_random_seed(seed: i64) {
+pub extern "C" fn pith_random_seed(seed: i64) {
     RANDOM_SEED.store(seed as u64, Ordering::Relaxed);
 }
 
 /// Random integer in range [min, max]
 #[no_mangle]
-pub extern "C" fn forge_random_int(min: i64, max: i64) -> i64 {
+pub extern "C" fn pith_random_int(min: i64, max: i64) -> i64 {
     if min >= max {
         return min;
     }
     let range = (max - min + 1) as u64;
-    let r = (forge_random_float() * range as f64) as i64;
+    let r = (pith_random_float() * range as f64) as i64;
     min + r
 }
 
 /// Format float with given precision
 /// Returns C string. Caller must free.
 #[no_mangle]
-pub unsafe extern "C" fn forge_fmt_float(n: f64, precision: i64) -> *mut i8 {
+pub unsafe extern "C" fn pith_fmt_float(n: f64, precision: i64) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     let s = format!("{:.1$}", n, precision as usize);
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn forge_fmt_float(n: f64, precision: i64) -> *mut i8 {
 /// Generate random string of given length
 /// Returns C string. Caller must free.
 #[no_mangle]
-pub unsafe extern "C" fn forge_random_string(len: i64) -> *mut i8 {
+pub unsafe extern "C" fn pith_random_string(len: i64) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -149,7 +149,7 @@ pub unsafe extern "C" fn forge_random_string(len: i64) -> *mut i8 {
 
     if !ptr.is_null() {
         for i in 0..n {
-            let idx = (forge_random_float() * CHARSET.len() as f64) as usize % CHARSET.len();
+            let idx = (pith_random_float() * CHARSET.len() as f64) as usize % CHARSET.len();
             *ptr.add(i) = CHARSET[idx] as i8;
         }
         *ptr.add(n) = 0;

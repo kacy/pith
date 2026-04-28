@@ -1,4 +1,4 @@
-//! Forge CLI - native compilation with Cranelift
+//! Pith CLI - native compilation with Cranelift
 //!
 //! Pipeline: source → self-hosted parse+emit_ir → text IR → ir_consumer.rs → Cranelift → native
 
@@ -59,8 +59,8 @@ fn main() {
             lex_file(&args[2]);
         }
         "version" => {
-            println!("Forge Cranelift Compiler v0.2.2");
-            println!("Using IR path: source → ir_emitter.fg → ir_consumer.rs → native");
+            println!("Pith Cranelift Compiler v0.2.2");
+            println!("Using IR path: source → ir_emitter.pith → ir_consumer.rs → native");
         }
         "fmt" | "lint" | "doc" | "new" | "package" => {
             delegate_to_frontend(&args[1..]);
@@ -77,30 +77,30 @@ fn main() {
 }
 
 fn print_usage() {
-    println!("Usage: forge <command> [args...]");
+    println!("Usage: pith <command> [args...]");
     println!();
     println!("Commands:");
-    println!("  build <file.fg>    Compile .fg file to native binary");
-    println!("  run <file.fg>      Compile and run immediately");
-    println!("  test <file.fg>     Compile and run tests");
-    println!("  check <file.fg>    Type-check without generating code");
+    println!("  build <file.pith>    Compile .pith file to native binary");
+    println!("  run <file.pith>      Compile and run immediately");
+    println!("  test <file.pith>     Compile and run tests");
+    println!("  check <file.pith>    Type-check without generating code");
     println!("  fmt [args...]      Format source files");
     println!("  lint [args...]     Lint source files");
     println!("  doc [args...]      Generate or search documentation");
     println!("  package [args...]  Run package-level check/test/lint/doc");
     println!("  new [args...]      Create a new project");
-    println!("  parse <file.fg>    Parse and display AST");
-    println!("  lex <file.fg>      Tokenize and display token stream");
+    println!("  parse <file.pith>    Parse and display AST");
+    println!("  lex <file.pith>      Tokenize and display token stream");
     println!("  version            Display version information");
     println!("  help               Show this help message");
     println!();
     println!("Environment:");
-    println!("  FORGE_SELF_HOST    Path to self-hosted compiler (default: ./self-host/forge_main)");
-    println!("  FORGE_DUMP_IR      Path to dump combined IR text (for debugging)");
+    println!("  PITH_SELF_HOST    Path to self-hosted compiler (default: ./self-host/pith_main)");
+    println!("  PITH_DUMP_IR      Path to dump combined IR text (for debugging)");
 }
 
 fn dump_ir_if_requested(ir_text: &str) {
-    if let Ok(dump_path) = env::var("FORGE_DUMP_IR") {
+    if let Ok(dump_path) = env::var("PITH_DUMP_IR") {
         let _ = fs::write(&dump_path, ir_text);
         eprintln!("IR dumped to {} ({} bytes)", dump_path, ir_text.len());
     }
@@ -114,16 +114,16 @@ fn combined_output(output: &Output) -> String {
 
 /// Find the self-hosted compiler executable
 fn find_self_hosted_compiler() -> Option<String> {
-    if let Ok(path) = env::var("FORGE_SELF_HOST") {
+    if let Ok(path) = env::var("PITH_SELF_HOST") {
         if Path::new(&path).exists() {
             return Some(path);
         }
     }
 
     let candidates = [
-        "./self-host/forge_main",
-        "../self-host/forge_main",
-        "./forge_main",
+        "./self-host/pith_main",
+        "../self-host/pith_main",
+        "./pith_main",
     ];
 
     for candidate in &candidates {
@@ -135,10 +135,10 @@ fn find_self_hosted_compiler() -> Option<String> {
     None
 }
 
-/// Get AST from self-hosted compiler by running 'forge parse'
+/// Get AST from self-hosted compiler by running 'pith parse'
 fn get_ast_from_compiler(path: &str) -> Result<String, String> {
     let compiler = find_self_hosted_compiler()
-        .ok_or("Self-hosted compiler not found. Set FORGE_SELF_HOST or ensure ./self-host/forge_main exists")?;
+        .ok_or("Self-hosted compiler not found. Set PITH_SELF_HOST or ensure ./self-host/pith_main exists")?;
 
     let output = Command::new(&compiler)
         .args(["parse", path])
@@ -158,7 +158,7 @@ fn get_ast_from_compiler(path: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Get tokens from self-hosted compiler by running 'forge lex'
+/// Get tokens from self-hosted compiler by running 'pith lex'
 fn get_tokens_from_compiler(path: &str) -> Result<String, String> {
     let compiler = find_self_hosted_compiler().ok_or("Self-hosted compiler not found")?;
 
@@ -177,7 +177,7 @@ fn get_tokens_from_compiler(path: &str) -> Result<String, String> {
 
 /// Find the pre-compiled IR driver binary
 fn find_ir_driver() -> Option<String> {
-    if let Ok(path) = env::var("FORGE_IR_DRIVER") {
+    if let Ok(path) = env::var("PITH_IR_DRIVER") {
         if Path::new(&path).exists() {
             return Some(path);
         }
@@ -244,9 +244,9 @@ fn validate_combined_ir_contract(ir_text: &str) -> Result<(), String> {
 }
 
 fn compile_to_object(path: &str, emit_tests: bool) -> Result<(Vec<u8>, usize), String> {
-    use forge_codegen::create_codegen;
-    use forge_codegen::finalize_module;
-    use forge_codegen::ir_consumer::compile_from_ir;
+    use pith_codegen::create_codegen;
+    use pith_codegen::finalize_module;
+    use pith_codegen::ir_consumer::compile_from_ir;
 
     let ir_text =
         get_ir_from_compiler(path, emit_tests).map_err(|e| format!("Error getting IR: {}", e))?;
@@ -255,7 +255,7 @@ fn compile_to_object(path: &str, emit_tests: bool) -> Result<(Vec<u8>, usize), S
     dump_ir_if_requested(&ir_text);
 
     let mut codegen = create_codegen().map_err(|e| format!("Error creating codegen: {}", e))?;
-    let runtime_funcs = forge_codegen::declare_runtime_functions(&mut codegen.module)
+    let runtime_funcs = pith_codegen::declare_runtime_functions(&mut codegen.module)
         .map_err(|e| format!("Error declaring runtime: {}", e))?;
     let funcs = compile_from_ir(&mut codegen, &ir_text, &runtime_funcs)
         .map_err(|e| format!("Error compiling: {}", e))?;
@@ -264,7 +264,7 @@ fn compile_to_object(path: &str, emit_tests: bool) -> Result<(Vec<u8>, usize), S
 }
 
 fn build_file(path: &str) {
-    use forge_codegen::linker::build_executable;
+    use pith_codegen::linker::build_executable;
 
     let (bytes, func_count) = match compile_to_object(path, false) {
         Ok(result) => result,
@@ -275,8 +275,8 @@ fn build_file(path: &str) {
     };
 
     eprintln!("Compiled {} functions", func_count);
-    let obj_path = path.replace(".fg", ".o");
-    let exe_path = path.replace(".fg", "");
+    let obj_path = path.replace(".pith", ".o");
+    let exe_path = path.replace(".pith", "");
     if let Err(e) = fs::write(&obj_path, &bytes) {
         eprintln!("Error writing object: {}", e);
         std::process::exit(1);
@@ -295,13 +295,13 @@ fn unique_run_artifact_paths() -> (std::path::PathBuf, std::path::PathBuf) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_else(|_| std::time::Duration::from_secs(0))
         .as_nanos();
-    let exe_path = env::temp_dir().join(format!("forge_ir_{}_{}", std::process::id(), stamp));
-    let obj_path = env::temp_dir().join(format!("forge_ir_{}_{}.o", std::process::id(), stamp));
+    let exe_path = env::temp_dir().join(format!("pith_ir_{}_{}", std::process::id(), stamp));
+    let obj_path = env::temp_dir().join(format!("pith_ir_{}_{}.o", std::process::id(), stamp));
     (obj_path, exe_path)
 }
 
 fn run_file(path: &str) {
-    use forge_codegen::linker::build_executable;
+    use pith_codegen::linker::build_executable;
 
     let (bytes, _) = match compile_to_object(path, false) {
         Ok(result) => result,
@@ -312,7 +312,7 @@ fn run_file(path: &str) {
     };
 
     let (obj_path, exe_path) = unique_run_artifact_paths();
-    let keep_artifacts = std::env::var("FORGE_KEEP_RUN_ARTIFACTS").is_ok();
+    let keep_artifacts = std::env::var("PITH_KEEP_RUN_ARTIFACTS").is_ok();
     if let Err(e) = fs::write(&obj_path, &bytes) {
         eprintln!("Error writing object: {}", e);
         std::process::exit(1);
@@ -344,7 +344,7 @@ fn run_file(path: &str) {
 }
 
 fn test_file(path: &str) {
-    use forge_codegen::linker::build_executable;
+    use pith_codegen::linker::build_executable;
 
     let (bytes, _) = match compile_to_object(path, true) {
         Ok(result) => result,
@@ -355,7 +355,7 @@ fn test_file(path: &str) {
     };
 
     let (obj_path, exe_path) = unique_run_artifact_paths();
-    let keep_artifacts = std::env::var("FORGE_KEEP_RUN_ARTIFACTS").is_ok();
+    let keep_artifacts = std::env::var("PITH_KEEP_RUN_ARTIFACTS").is_ok();
     if let Err(e) = fs::write(&obj_path, &bytes) {
         eprintln!("Error writing object: {}", e);
         std::process::exit(1);
@@ -466,7 +466,7 @@ fn delegate_to_frontend(args: &[String]) {
     let mut command = Command::new(&compiler);
     command.args(args);
     if let Ok(current_exe) = env::current_exe() {
-        if env::var("FORGE_IR_DRIVER").is_err() {
+        if env::var("PITH_IR_DRIVER").is_err() {
             if let Some(root) = current_exe
                 .parent()
                 .and_then(|p| p.parent())
@@ -474,11 +474,11 @@ fn delegate_to_frontend(args: &[String]) {
             {
                 let ir_driver = root.join("self-host").join("ir_driver");
                 if ir_driver.exists() {
-                    command.env("FORGE_IR_DRIVER", ir_driver);
+                    command.env("PITH_IR_DRIVER", ir_driver);
                 }
             }
         }
-        command.env("FORGE_NATIVE", current_exe);
+        command.env("PITH_NATIVE", current_exe);
     }
     let status = command.status().unwrap_or_else(|e| {
         eprintln!("Failed to run self-hosted compiler: {}", e);

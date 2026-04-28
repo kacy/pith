@@ -1,9 +1,9 @@
 # error codes
 
-forge diagnostics use stable error codes grouped by compiler phase.
+pith diagnostics use stable error codes grouped by compiler phase.
 codes are never reused — if a code is retired, it stays retired.
 
-use `forge check --json <file>` or `forge lint --json <file>` for
+use `pith check --json <file>` or `pith lint --json <file>` for
 machine-readable output that includes the error code, location, message,
 and fix suggestion (if available).
 
@@ -414,7 +414,7 @@ the lexer produced an invalid token, such as an unterminated string literal.
 
 ## lint errors (E3xx)
 
-reported by `forge lint`. naming violations are errors; style issues are warnings.
+reported by `pith lint`. naming violations are errors; style issues are warnings.
 
 ### E300 — snake_case required (error)
 

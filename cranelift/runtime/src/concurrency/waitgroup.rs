@@ -9,14 +9,14 @@ pub struct WaitGroupState {
     count: usize,
 }
 
-/// Opaque handle to a Forge WaitGroup
-pub type ForgeWaitGroupHandle = Arc<(Mutex<WaitGroupState>, Condvar)>;
+/// Opaque handle to a Pith WaitGroup
+pub type PithWaitGroupHandle = Arc<(Mutex<WaitGroupState>, Condvar)>;
 
 /// Create a new WaitGroup
 ///
 /// Returns an opaque handle to the waitgroup
 #[no_mangle]
-pub extern "C" fn forge_waitgroup_new() -> *mut ForgeWaitGroupHandle {
+pub extern "C" fn pith_waitgroup_new() -> *mut PithWaitGroupHandle {
     let state = WaitGroupState { count: 0 };
     let wg = Arc::new((Mutex::new(state), Condvar::new()));
     Box::into_raw(Box::new(wg))
@@ -27,7 +27,7 @@ pub extern "C" fn forge_waitgroup_new() -> *mut ForgeWaitGroupHandle {
 /// # Safety
 /// handle must be a valid waitgroup handle
 #[no_mangle]
-pub unsafe extern "C" fn forge_waitgroup_add(handle: *mut ForgeWaitGroupHandle, delta: i64) {
+pub unsafe extern "C" fn pith_waitgroup_add(handle: *mut PithWaitGroupHandle, delta: i64) {
     if handle.is_null() {
         return;
     }
@@ -43,7 +43,7 @@ pub unsafe extern "C" fn forge_waitgroup_add(handle: *mut ForgeWaitGroupHandle, 
 /// # Safety
 /// handle must be a valid waitgroup handle
 #[no_mangle]
-pub unsafe extern "C" fn forge_waitgroup_done(handle: *mut ForgeWaitGroupHandle) {
+pub unsafe extern "C" fn pith_waitgroup_done(handle: *mut PithWaitGroupHandle) {
     if handle.is_null() {
         return;
     }
@@ -64,7 +64,7 @@ pub unsafe extern "C" fn forge_waitgroup_done(handle: *mut ForgeWaitGroupHandle)
 /// # Safety
 /// handle must be a valid waitgroup handle
 #[no_mangle]
-pub unsafe extern "C" fn forge_waitgroup_wait(handle: *mut ForgeWaitGroupHandle) {
+pub unsafe extern "C" fn pith_waitgroup_wait(handle: *mut PithWaitGroupHandle) {
     if handle.is_null() {
         return;
     }

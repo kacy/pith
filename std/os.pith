@@ -1,0 +1,70 @@
+# std.os — process-level environment helpers
+#
+# small wrappers around cwd, env, and temp-path operations.
+
+import std.env as env
+import std.os.path as path
+
+# return the current working directory.
+pub fn cwd() -> String:
+    return os_getcwd()
+
+# change the current working directory.
+pub fn chdir(next_dir: String) -> Bool:
+    return os_chdir(next_dir)
+
+# return the system temp directory.
+pub fn temp_dir() -> String:
+    return os_temp_dir()
+
+# return the current user's home directory when available.
+pub fn home_dir() -> String:
+    return os_home_dir()
+
+# read an environment variable.
+pub fn get_env(name: String) -> String:
+    return env.get(name)
+
+# set an environment variable.
+pub fn set_env(name: String, value: String) -> Bool:
+    return os_set_env(name, value)
+
+# remove an environment variable.
+pub fn unset_env(name: String) -> Bool:
+    return os_unset_env(name)
+
+# search PATH for an executable.
+pub fn which(program: String) -> String:
+    if program == "":
+        return ""
+    if program.contains("/"):
+        if file_exists(program):
+            return program
+        return ""
+
+    search_path := env.get("PATH")
+    if search_path == "":
+        return ""
+
+    for dir in search_path.split(":"):
+        mut candidate := program
+        if dir != "":
+            candidate = path.join(dir, program)
+        if file_exists(candidate):
+            return candidate
+    return ""
+
+test "os reports basic process paths":
+    assert(cwd().len() > 0)
+    assert(temp_dir().len() > 0)
+    assert_eq(which(""), "")
+
+test "os can set and unset environment variables":
+    key := "PITH_STD_OS_TEST_KEY"
+    unset_env(key)
+
+    assert_eq(get_env(key), "")
+    assert(set_env(key, "value"))
+    assert_eq(get_env(key), "value")
+    assert(unset_env(key))
+    assert_eq(get_env(key), "")

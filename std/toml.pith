@@ -1,0 +1,690 @@
+# std.toml — TOML v1.0 parser
+#
+# parse TOML configuration files into a tree structure.
+# uses opaque Int handles into a node pool.
+#
+#   import std.toml as toml
+#   root := toml.parse(data)
+#   name := toml.get_string(root, "name")
+#   db := toml.get_table(root, "database")
+#   host := toml.get_string(db, "host")
+
+import std.io as io
+
+TOML_FILE_CHUNK_SIZE := 4096
+
+# # TOML decode failure with a human-readable message.
+pub struct TomlDecodeError:
+    pub message: String
+
+fn toml_decode_fail(message: String) -> TomlDecodeError:
+    return TomlDecodeError(message)
+
+# ===============================================================
+# Node Pool
+# ===============================================================
+
+# Global node storage indexed by handle
+mut next_node_id: Int := 0
+mut node_types: Map[Int, String] := {}
+mut string_values: Map[Int, String] := {}
+mut integer_values: Map[Int, Int] := {}
+mut float_values: Map[Int, Float] := {}
+mut boolean_values: Map[Int, Bool] := {}
+
+# Table children: flat append-only storage with offset/count
+mut table_keys_flat: List[String] := []
+mut table_values_flat: List[Int] := []
+mut table_key_offsets: Map[Int, Int] := {}
+mut table_key_counts: Map[Int, Int] := {}
+
+# Array children: flat append-only storage with offset/count
+mut array_items_flat: List[Int] := []
+mut array_item_offsets: Map[Int, Int] := {}
+mut array_item_counts: Map[Int, Int] := {}
+
+# Allocates a new node of the specified type
+fn allocate_node(kind: String) -> Int:
+    idx := next_node_id
+    next_node_id = next_node_id + 1
+    node_types.insert(idx, kind)
+    string_values.insert(idx, "")
+    integer_values.insert(idx, 0)
+    float_values.insert(idx, 0.0)
+    boolean_values.insert(idx, false)
+    table_key_offsets.insert(idx, 0)
+    table_key_counts.insert(idx, 0)
+    array_item_offsets.insert(idx, 0)
+    array_item_counts.insert(idx, 0)
+    return idx
+
+# Sets a key-value pair in a table
+fn set_table_property(handle: Int, key: String, val: Int):
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
+    # for well-formed TOML, duplicates don't occur — just append
+    if cnt == 0:
+        table_key_offsets.insert(handle, table_keys_flat.len())
+    table_keys_flat.push(key)
+    table_values_flat.push(val)
+    table_key_counts.insert(handle, cnt + 1)
+
+# Appends a value to an array
+fn push_array_element(handle: Int, val: Int):
+    cnt := array_item_counts[handle]
+    if cnt == 0:
+        array_item_offsets.insert(handle, array_items_flat.len())
+    array_items_flat.push(val)
+    array_item_counts.insert(handle, cnt + 1)
+
+# ===============================================================
+# Parser (Internal)
+# ===============================================================
+
+# Parser state
+mut parser_input: String := ""
+mut parser_position: Int := 0
+mut parser_error: Bool := false
+
+# Returns character at position i or empty string if out of bounds
+fn get_char_at(i: Int) -> String:
+    if i >= parser_input.len():
+        return ""
+    return parser_input[i]
+
+# Returns true if a node handle points at an allocated node.
+fn is_valid_handle(handle: Int) -> Bool:
+    return handle >= 0 and handle < next_node_id
+
+# Looks up a direct key in a table and returns the child handle, or -1.
+fn table_lookup(handle: Int, key: String) -> Int:
+    if not is_valid_handle(handle) or node_types[handle] != "table":
+        return 0 - 1
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
+    mut i := 0
+    while i < cnt:
+        if table_keys_flat[off + i] == key:
+            return table_values_flat[off + i]
+        i = i + 1
+    return 0 - 1
+
+# Skips whitespace (space, tab, carriage return)
+fn skip_whitespace():
+    while parser_position < parser_input.len() and (get_char_at(parser_position) == " " or get_char_at(parser_position) == chr(9) or get_char_at(parser_position) == chr(13)):
+        parser_position = parser_position + 1
+
+# Skips a comment from # to end of line
+fn skip_comment():
+    if parser_position < parser_input.len() and get_char_at(parser_position) == "#":
+        while parser_position < parser_input.len() and get_char_at(parser_position) != chr(10):
+            parser_position = parser_position + 1
+
+# Skips the rest of the current line (ws, comment, newline)
+fn skip_line():
+    skip_whitespace()
+    skip_comment()
+    if parser_position < parser_input.len() and get_char_at(parser_position) == chr(10):
+        parser_position = parser_position + 1
+
+# Returns true if character is valid in a bare key
+fn is_key_char(c: String) -> Bool:
+    if c >= "a" and c <= "z":
+        return true
+    if c >= "A" and c <= "Z":
+        return true
+    if c >= "0" and c <= "9":
+        return true
+    if c == "-" or c == "_":
+        return true
+    return false
+
+# Parses a key (quoted or bare)
+fn parse_key() -> String:
+    skip_whitespace()
+    # quoted key
+    if parser_position < parser_input.len() and get_char_at(parser_position) == chr(34):
+        parser_position = parser_position + 1
+        start := parser_position
+        while parser_position < parser_input.len() and get_char_at(parser_position) != chr(34):
+            parser_position = parser_position + 1
+        result := parser_input.substring(start, parser_position)
+        if parser_position < parser_input.len():
+            parser_position = parser_position + 1
+        return result
+    # bare key
+    start := parser_position
+    while parser_position < parser_input.len() and is_key_char(get_char_at(parser_position)):
+        parser_position = parser_position + 1
+    return parser_input.substring(start, parser_position)
+
+# Returns true if character is valid in a number
+fn is_number_char(c: String) -> Bool:
+    if c >= "0" and c <= "9":
+        return true
+    if c == "." or c == "e" or c == "E" or c == "+" or c == "-" or c == "_":
+        return true
+    return false
+
+# Parses an integer from a string manually
+fn parse_integer_manual(s: String) -> Int:
+    mut val := 0
+    mut neg := false
+    mut i := 0
+    if s.len() > 0 and s[0] == "-":
+        neg = true
+        i = 1
+    if s.len() > 0 and s[0] == "+":
+        i = 1
+    while i < s.len():
+        c := s[i]
+        if c >= "0" and c <= "9":
+            val = val * 10 + (ord(c) - 48)
+        i = i + 1
+    if neg:
+        return 0 - val
+    return val
+
+# Parses a float from a string manually
+fn parse_float_manual(s: String) -> Float:
+    # split on decimal point, compute integer + fractional parts
+    mut int_part := 0
+    mut frac_part := 0.0
+    mut frac_div := 1.0
+    mut neg := false
+    mut i := 0
+    mut in_frac := false
+    if s.len() > 0 and s[0] == "-":
+        neg = true
+        i = 1
+    if s.len() > 0 and s[0] == "+":
+        i = 1
+    while i < s.len():
+        c := s[i]
+        if c == ".":
+            in_frac = true
+        if c >= "0" and c <= "9" and not in_frac:
+            int_part = int_part * 10 + (ord(c) - 48)
+        if c >= "0" and c <= "9" and in_frac:
+            frac_div = frac_div * 10.0
+            frac_part = frac_part + (ord(c) - 48).to_float() / frac_div
+        i = i + 1
+    result := int_part.to_float() + frac_part
+    if neg:
+        return 0.0 - result
+    return result
+
+# Main recursive value parser
+fn parse_value() -> Int:
+    skip_whitespace()
+    if parser_position >= parser_input.len():
+        parser_error = true
+        return 0 - 1
+    c := get_char_at(parser_position)
+
+    # string
+    if c == chr(34):
+        parser_position = parser_position + 1
+        start := parser_position
+        while parser_position < parser_input.len() and get_char_at(parser_position) != chr(34):
+            if get_char_at(parser_position) == chr(92):
+                parser_position = parser_position + 1
+            parser_position = parser_position + 1
+        val := parser_input.substring(start, parser_position)
+        if parser_position < parser_input.len():
+            parser_position = parser_position + 1
+        idx := allocate_node("string")
+        string_values.insert(idx, val)
+        return idx
+
+    # boolean true
+    if parser_position + 4 <= parser_input.len() and parser_input.substring(parser_position, parser_position + 4) == "true":
+        parser_position = parser_position + 4
+        idx := allocate_node("bool")
+        boolean_values.insert(idx, true)
+        return idx
+    # boolean false
+    if parser_position + 5 <= parser_input.len() and parser_input.substring(parser_position, parser_position + 5) == "false":
+        parser_position = parser_position + 5
+        idx := allocate_node("bool")
+        return idx
+
+    # array
+    if c == "[":
+        parser_position = parser_position + 1
+        arr := allocate_node("array")
+        skip_whitespace()
+        mut iterations := 0
+        mut last_pos := parser_position
+        while parser_position < parser_input.len() and get_char_at(parser_position) != "]":
+            iterations = iterations + 1
+            # Safety: prevent infinite loops on malformed input
+            if iterations > 10000:
+                parser_error = true
+                return 0 - 1
+            # Ensure we're making progress
+            if parser_position == last_pos and iterations > 1:
+                parser_error = true
+                return 0 - 1
+            last_pos = parser_position
+            skip_whitespace()
+            if parser_position < parser_input.len() and get_char_at(parser_position) == chr(10):
+                parser_position = parser_position + 1
+            if parser_position < parser_input.len() and get_char_at(parser_position) == "#":
+                skip_comment()
+            if parser_position < parser_input.len() and get_char_at(parser_position) != "]" and get_char_at(parser_position) != chr(10) and get_char_at(parser_position) != "#":
+                val := parse_value()
+                if parser_error:
+                    return 0 - 1
+                push_array_element(arr, val)
+                skip_whitespace()
+                if parser_position < parser_input.len() and get_char_at(parser_position) == ",":
+                    parser_position = parser_position + 1
+                skip_whitespace()
+                while parser_position < parser_input.len() and get_char_at(parser_position) == chr(10):
+                    parser_position = parser_position + 1
+        if parser_position < parser_input.len():
+            parser_position = parser_position + 1
+        return arr
+
+    # number (int or float)
+    if (c >= "0" and c <= "9") or c == "-" or c == "+":
+        start := parser_position
+        mut is_float := false
+        if c == "-" or c == "+":
+            parser_position = parser_position + 1
+        while parser_position < parser_input.len() and is_number_char(get_char_at(parser_position)):
+            d := get_char_at(parser_position)
+            if d == "." or d == "e" or d == "E":
+                is_float = true
+            parser_position = parser_position + 1
+        num_str := parser_input.substring(start, parser_position)
+        if is_float:
+            idx := allocate_node("float")
+            float_values.insert(idx, parse_float_manual(num_str))
+            return idx
+        if not is_float:
+            idx := allocate_node("int")
+            integer_values.insert(idx, parse_integer_manual(num_str))
+            return idx
+
+    parser_error = true
+    return 0 - 1
+
+# Ensures a nested table path exists, creating intermediate tables as needed.
+# Takes a dot-separated path like "database.connection" and returns the table handle.
+fn ensure_table_path(root: Int, path: String) -> Int:
+    mut current := root
+    mut start := 0
+    mut i := 0
+    while i <= path.len():
+        mut is_sep := i == path.len()
+        if not is_sep and i < path.len() and path[i] == ".":
+            is_sep = true
+        if is_sep:
+            key := path.substring(start, i)
+            # look up existing child in current table
+            off := table_key_offsets[current]
+            cnt := table_key_counts[current]
+            mut found := 0 - 1
+            mut j := 0
+            while j < cnt:
+                if table_keys_flat[off + j] == key:
+                    found = table_values_flat[off + j]
+                j = j + 1
+            if found < 0:
+                found = allocate_node("table")
+                set_table_property(current, key, found)
+            current = found
+            start = i + 1
+        i = i + 1
+    return current
+
+# ===============================================================
+# Public API — Parsing
+# ===============================================================
+
+# Parses a TOML string and returns a root table handle.
+# Returns -1 on parse error. The root is a table containing all top-level keys.
+pub fn parse(input: String) -> Int:
+    return toml_parse(input)
+
+fn toml_parse(input: String) -> Int:
+    parser_input = input
+    parser_position = 0
+    parser_error = false
+    root := allocate_node("table")
+    mut current_table := root
+
+    while parser_position < parser_input.len():
+        skip_whitespace()
+        if parser_position >= parser_input.len():
+            return root
+        c := get_char_at(parser_position)
+
+        # skip blank lines
+        if c == chr(10):
+            parser_position = parser_position + 1
+        # skip comments
+        if c == "#":
+            skip_comment()
+        # table header [name]
+        if c == "[":
+            parser_position = parser_position + 1
+            skip_whitespace()
+            start := parser_position
+            while parser_position < parser_input.len() and get_char_at(parser_position) != "]":
+                parser_position = parser_position + 1
+            section := parser_input.substring(start, parser_position)
+            if parser_position < parser_input.len():
+                parser_position = parser_position + 1
+            current_table = ensure_table_path(root, section)
+            skip_line()
+        # key = value
+        if c != chr(10) and c != "#" and c != "[":
+            key := parse_key()
+            skip_whitespace()
+            if parser_position < parser_input.len() and get_char_at(parser_position) == "=":
+                parser_position = parser_position + 1
+            val := parse_value()
+            if parser_error:
+                return 0 - 1
+            set_table_property(current_table, key, val)
+            skip_line()
+
+    if parser_error:
+        return 0 - 1
+    return root
+
+# parse a toml file from disk.
+pub fn parse_file(path: String) -> Int:
+    return toml_parse_file(path)
+
+fn toml_parse_file(path: String) -> Int:
+    return toml_parse_file_chunked(path, TOML_FILE_CHUNK_SIZE)
+
+# parse a toml file using a custom read chunk size.
+pub fn parse_file_chunked(path: String, chunk_size: Int) -> Int:
+    return toml_parse_file_chunked(path, chunk_size)
+
+fn toml_parse_file_chunked(path: String, chunk_size: Int) -> Int:
+    data_result := io.read_file_text_chunked(path, chunk_size)
+    if data_result.is_err:
+        return 0 - 1
+    return toml_parse(data_result.ok)
+
+# # Parse TOML and fail if the input is invalid.
+pub fn parse_required(input: String) -> Int!TomlDecodeError:
+    root := parse(input)
+    if root < 0 or type_of(root) != "table":
+        fail toml_decode_fail("invalid toml document")
+    return root
+
+# # parses a toml file and returns the root table handle or a typed error.
+pub fn parse_file_required(file_path: String) -> Int!TomlDecodeError:
+    root := parse_file(file_path)
+    if root < 0 or type_of(root) != "table":
+        fail toml_decode_fail("invalid toml document")
+    return root
+
+# ===============================================================
+# Public API — Type and Introspection
+# ===============================================================
+
+# Returns the type of a node: "string", "int", "float", "bool", "table", or "array".
+# Returns "invalid" for invalid handles.
+pub fn type_of(handle: Int) -> String:
+    return toml_type_of(handle)
+
+fn toml_type_of(handle: Int) -> String:
+    if not is_valid_handle(handle):
+        return "invalid"
+    return node_types[handle]
+
+# ===============================================================
+# Public API — Table Value Accessors
+# ===============================================================
+
+# Gets a child value handle by key from a table. Returns -1 if not found.
+pub fn get_value(handle: Int, key: String) -> Int:
+    return table_lookup(handle, key)
+
+# Gets a string value by key from a table. Returns empty string if not found or wrong type.
+pub fn get_string(handle: Int, key: String) -> String:
+    return toml_get_string(handle, key)
+
+fn toml_get_string(handle: Int, key: String) -> String:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "string":
+        return string_values[v]
+    return ""
+
+# # get a required string field or return a typed decode error.
+pub fn require_string(handle: Int, key: String) -> String!TomlDecodeError:
+    v := table_lookup(handle, key)
+    if v < 0:
+        fail toml_decode_fail("missing string field: " + key)
+    if node_types[v] != "string":
+        fail toml_decode_fail("expected string field: " + key)
+    return string_values[v]
+
+# Gets a string value by key from a table with a fallback.
+pub fn get_string_or(handle: Int, key: String, default_value: String) -> String:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "string":
+        return string_values[v]
+    return default_value
+
+# Gets an integer value by key from a table. Returns 0 if not found or wrong type.
+pub fn get_int(handle: Int, key: String) -> Int:
+    return toml_get_int(handle, key)
+
+fn toml_get_int(handle: Int, key: String) -> Int:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "int":
+        return integer_values[v]
+    return 0
+
+# # get a required int field or return a typed decode error.
+pub fn require_int(handle: Int, key: String) -> Int!TomlDecodeError:
+    v := table_lookup(handle, key)
+    if v < 0:
+        fail toml_decode_fail("missing int field: " + key)
+    if node_types[v] != "int":
+        fail toml_decode_fail("expected int field: " + key)
+    return integer_values[v]
+
+# Gets an integer value by key from a table with a fallback.
+pub fn get_int_or(handle: Int, key: String, default_value: Int) -> Int:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "int":
+        return integer_values[v]
+    return default_value
+
+# Gets a float value by key from a table. Returns 0.0 if not found or wrong type.
+pub fn get_float(handle: Int, key: String) -> Float:
+    return toml_get_float(handle, key)
+
+fn toml_get_float(handle: Int, key: String) -> Float:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "float":
+        return float_values[v]
+    return 0.0
+
+# Gets a float value by key from a table with a fallback.
+pub fn get_float_or(handle: Int, key: String, default_value: Float) -> Float:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "float":
+        return float_values[v]
+    return default_value
+
+# Gets a boolean value by key from a table. Returns false if not found or wrong type.
+pub fn get_bool(handle: Int, key: String) -> Bool:
+    return toml_get_bool(handle, key)
+
+fn toml_get_bool(handle: Int, key: String) -> Bool:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "bool":
+        return boolean_values[v]
+    return false
+
+# # get a required bool field or return a typed decode error.
+pub fn require_bool(handle: Int, key: String) -> Bool!TomlDecodeError:
+    v := table_lookup(handle, key)
+    if v < 0:
+        fail toml_decode_fail("missing bool field: " + key)
+    if node_types[v] != "bool":
+        fail toml_decode_fail("expected bool field: " + key)
+    return boolean_values[v]
+
+# Gets a boolean value by key from a table with a fallback.
+pub fn get_bool_or(handle: Int, key: String, default_value: Bool) -> Bool:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "bool":
+        return boolean_values[v]
+    return default_value
+
+# Gets a sub-table handle by key. Returns -1 if not found or not a table.
+pub fn get_table(handle: Int, key: String) -> Int:
+    return toml_get_table(handle, key)
+
+fn toml_get_table(handle: Int, key: String) -> Int:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "table":
+        return v
+    return 0 - 1
+
+# Gets an array handle by key. Returns -1 if not found or not an array.
+pub fn get_array(handle: Int, key: String) -> Int:
+    return toml_get_array(handle, key)
+
+fn toml_get_array(handle: Int, key: String) -> Int:
+    v := table_lookup(handle, key)
+    if v >= 0 and node_types[v] == "array":
+        return v
+    return 0 - 1
+
+# ===============================================================
+# Public API — Array Operations
+# ===============================================================
+
+# Returns the number of elements in an array. Returns 0 for non-arrays.
+pub fn array_len(handle: Int) -> Int:
+    return toml_array_len(handle)
+
+fn toml_array_len(handle: Int) -> Int:
+    if not is_valid_handle(handle) or node_types[handle] != "array":
+        return 0
+    return array_item_counts[handle]
+
+# Gets the handle of an array element by index. Returns -1 if out of bounds.
+pub fn array_get(handle: Int, index: Int) -> Int:
+    return toml_array_get(handle, index)
+
+fn toml_array_get(handle: Int, index: Int) -> Int:
+    if not is_valid_handle(handle) or node_types[handle] != "array":
+        return 0 - 1
+    if index < 0 or index >= array_item_counts[handle]:
+        return 0 - 1
+    return array_items_flat[array_item_offsets[handle] + index]
+
+# ===============================================================
+# Public API — Table Introspection
+# ===============================================================
+
+# Returns the list of keys in a table (insertion order).
+pub fn keys(handle: Int) -> List[String]:
+    return toml_keys(handle)
+
+fn toml_keys(handle: Int) -> List[String]:
+    mut result: List[String] := []
+    if not is_valid_handle(handle) or node_types[handle] != "table":
+        return result
+    off := table_key_offsets[handle]
+    cnt := table_key_counts[handle]
+    mut i := 0
+    while i < cnt:
+        result.push(table_keys_flat[off + i])
+        i = i + 1
+    return result
+
+# Returns true if a table contains the specified key.
+pub fn has(handle: Int, key: String) -> Bool:
+    return toml_has(handle, key)
+
+fn toml_has(handle: Int, key: String) -> Bool:
+    return table_lookup(handle, key) >= 0
+
+# # decode a toml table handle into a concrete struct with public string/int/bool fields.
+pub fn decode[T](handle: Int) -> T!TomlDecodeError:
+    fail toml_decode_fail("toml.decode requires compiler support")
+
+# # parse toml text and decode it into a concrete struct.
+pub fn decode_text[T](input: String) -> T!TomlDecodeError:
+    fail toml_decode_fail("toml.decode_text requires compiler support")
+
+fn toml_require_table(handle: Int, key: String) -> Int!TomlDecodeError:
+    child := table_lookup(handle, key)
+    if child < 0:
+        fail toml_decode_fail("missing table field: " + key)
+    if node_types[child] != "table":
+        fail toml_decode_fail("expected table field: " + key)
+    return child
+
+# # decode a nested table selected by a dotted path.
+pub fn decode_path[T](handle: Int, dotted_path: String) -> T!TomlDecodeError:
+    mut current := handle
+    for part in dotted_path.split("."):
+        if part == "":
+            continue
+        current = toml_require_table(current, part)!
+    return decode[T](current)!
+
+# # parse toml text and decode a nested table selected by a dotted path.
+pub fn decode_text_path[T](input: String, dotted_path: String) -> T!TomlDecodeError:
+    root := parse_required(input)!
+    return decode_path[T](root, dotted_path)!
+
+# # loads a toml file and decodes it into a concrete struct.
+pub fn decode_file[T](file_path: String) -> T!TomlDecodeError:
+    return decode[T](parse_file_required(file_path)!)!
+
+# # loads a toml file and decodes a nested table selected by a dotted path.
+pub fn decode_file_path[T](file_path: String, dotted_path: String) -> T!TomlDecodeError:
+    return decode_path[T](parse_file_required(file_path)!, dotted_path)!
+
+struct TomlNestedFixture:
+    pub host: String
+    pub port: Int
+
+test "toml parses scalar values":
+    doc := "title = " + chr(34) + "pith" + chr(34) + chr(10) + "version = 3" + chr(10) + "pi = 3.14" + chr(10) + "enabled = true"
+    root := parse(doc)
+
+    assert_eq(type_of(root), "table")
+    assert_eq(get_string(root, "title"), "pith")
+    assert_eq(get_int(root, "version"), 3)
+    assert(get_float(root, "pi") > 3.1)
+    assert(get_bool(root, "enabled"))
+    assert_eq(get_string_or(root, "missing", "fallback"), "fallback")
+
+test "toml parses tables and arrays":
+    doc := "[server]" + chr(10) + "host = " + chr(34) + "localhost" + chr(34) + chr(10) + "ports = [8000, 9000]"
+    root := parse(doc)
+    server := get_table(root, "server")
+    ports := get_array(server, "ports")
+
+    assert_eq(type_of(server), "table")
+    assert_eq(get_string(server, "host"), "localhost")
+    assert_eq(array_len(ports), 2)
+    assert_eq(type_of(array_get(ports, 0)), "int")
+    assert_eq(keys(root).join(","), "server")
+
+test "toml accessors handle missing values":
+    root := parse("title = " + chr(34) + "pith" + chr(34))
+
+    assert(has(root, "title"))
+    assert(not has(root, "missing"))
+    assert_eq(get_table(root, "missing"), 0 - 1)
+    assert_eq(get_array(root, "missing"), 0 - 1)
+    assert_eq(array_get(get_array(root, "missing"), 0), 0 - 1)

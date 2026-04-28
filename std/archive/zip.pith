@@ -1,0 +1,375 @@
+# std.archive.zip — small stored zip archive helpers
+#
+# this first pass supports regular files with method 0 (stored). compressed
+# entries are rejected until we add deflate support.
+
+import std.binary as bin
+import std.bytes as bytes
+import std.checksum as checksum
+import std.fs as fs
+import std.os.path as path
+from std.bytes import ByteBuffer
+
+LOCAL_HEADER_SIG := 67324752
+CENTRAL_HEADER_SIG := 33639248
+EOCD_SIG := 101010256
+METHOD_STORED := 0
+VERSION_NEEDED := 20
+
+# one entry in a zip archive.
+pub struct ZipEntry:
+    pub name: String
+    pub size: Int
+    pub compressed_size: Int
+    pub crc32: Int
+    pub method: Int
+    pub is_dir: Bool
+
+struct ZipRecord:
+    name: String
+    size: Int
+    compressed_size: Int
+    crc32: Int
+    method: Int
+    local_offset: Int
+    is_dir: Bool
+
+fn zip_fail(message: String) -> String:
+    return message
+
+fn zip_write_bytes(out: ByteBuffer, data: Bytes) -> Int!:
+    if data.len() == 0:
+        return 0
+    return out.write(data)
+
+fn zip_write_u16(out: ByteBuffer, value: Int) -> Int!:
+    wrote := bin.write_u16_le(out, value)
+    if wrote.is_err:
+        fail wrote.err.message
+    return wrote.ok
+
+fn zip_write_u32(out: ByteBuffer, value: Int) -> Int!:
+    wrote := bin.write_u32_le(out, value)
+    if wrote.is_err:
+        fail wrote.err.message
+    return wrote.ok
+
+fn zip_read_u16(data: Bytes, offset: Int) -> Int!:
+    value := bin.read_u16_le_at(data, offset)
+    if value.is_err:
+        fail value.err.message
+    return value.ok
+
+fn zip_read_u32(data: Bytes, offset: Int) -> Int!:
+    value := bin.read_u32_le_at(data, offset)
+    if value.is_err:
+        fail value.err.message
+    return value.ok
+
+fn zip_safe_name(name: String) -> String!:
+    if name == "" or path.is_abs(name):
+        fail zip_fail("unsafe zip path")
+    cleaned := path.clean(name)
+    if cleaned == ".":
+        fail zip_fail("unsafe zip path")
+    for part in path.parts(cleaned):
+        if part == "..":
+            fail zip_fail("unsafe zip path")
+    return cleaned
+
+fn zip_archive_name(root_path: String, entry_path: String) -> String!:
+    base := path.base(root_path)
+    mut name := base
+    if entry_path != root_path:
+        rel := path.rel(root_path, entry_path)
+        name = path.join(base, rel)
+    return zip_safe_name(name)!
+
+fn zip_decode_name(data: Bytes, offset: Int, length: Int) -> String!:
+    if length < 0 or offset < 0 or offset + length > data.len():
+        fail zip_fail("zip filename truncated")
+    name := data.slice(offset, offset + length).to_string_utf8()
+    if name.is_err:
+        fail zip_fail("zip filename is not utf-8")
+    return zip_safe_name(name.ok)!
+
+fn zip_entry_from_record(record: ZipRecord) -> ZipEntry:
+    return ZipEntry(record.name, record.size, record.compressed_size, record.crc32, record.method, record.is_dir)
+
+fn zip_find_eocd(data: Bytes) -> Int!:
+    if data.len() < 22:
+        fail zip_fail("zip archive too short")
+    mut pos := data.len() - 22
+    mut limit := data.len() - 66000
+    if limit < 0:
+        limit = 0
+    while pos >= limit:
+        sig := zip_read_u32(data, pos)
+        if sig.is_ok and sig.ok == EOCD_SIG:
+            comment_len := zip_read_u16(data, pos + 20)!
+            if pos + 22 + comment_len == data.len():
+                return pos
+        pos = pos - 1
+    fail zip_fail("zip end record not found")
+
+fn zip_records(data: Bytes) -> List[ZipRecord]!:
+    eocd := zip_find_eocd(data)!
+    total_entries := zip_read_u16(data, eocd + 10)!
+    central_size := zip_read_u32(data, eocd + 12)!
+    central_offset := zip_read_u32(data, eocd + 16)!
+    if central_offset + central_size > data.len():
+        fail zip_fail("zip central directory truncated")
+    mut records: List[ZipRecord] := []
+    mut pos := central_offset
+    mut i := 0
+    while i < total_entries:
+        if pos + 46 > data.len():
+            fail zip_fail("zip central directory truncated")
+        if zip_read_u32(data, pos)! != CENTRAL_HEADER_SIG:
+            fail zip_fail("invalid zip central directory")
+        method := zip_read_u16(data, pos + 10)!
+        if method != METHOD_STORED:
+            fail zip_fail("unsupported zip compression method")
+        crc := zip_read_u32(data, pos + 16)!
+        compressed_size := zip_read_u32(data, pos + 20)!
+        size := zip_read_u32(data, pos + 24)!
+        name_len := zip_read_u16(data, pos + 28)!
+        extra_len := zip_read_u16(data, pos + 30)!
+        comment_len := zip_read_u16(data, pos + 32)!
+        local_offset := zip_read_u32(data, pos + 42)!
+        name := zip_decode_name(data, pos + 46, name_len)!
+        is_dir := name.ends_with("/")
+        records.push(ZipRecord(name, size, compressed_size, crc, method, local_offset, is_dir))
+        pos = pos + 46 + name_len + extra_len + comment_len
+        i = i + 1
+    return records
+
+fn zip_local_data_start(data: Bytes, record: ZipRecord) -> Int!:
+    pos := record.local_offset
+    if pos + 30 > data.len():
+        fail zip_fail("zip local header truncated")
+    if zip_read_u32(data, pos)! != LOCAL_HEADER_SIG:
+        fail zip_fail("invalid zip local header")
+    method := zip_read_u16(data, pos + 8)!
+    if method != METHOD_STORED:
+        fail zip_fail("unsupported zip compression method")
+    local_crc := zip_read_u32(data, pos + 14)!
+    compressed_size := zip_read_u32(data, pos + 18)!
+    size := zip_read_u32(data, pos + 22)!
+    name_len := zip_read_u16(data, pos + 26)!
+    extra_len := zip_read_u16(data, pos + 28)!
+    local_name := zip_decode_name(data, pos + 30, name_len)!
+    if local_name != record.name:
+        fail zip_fail("zip local header name mismatch")
+    if local_crc != record.crc32 or compressed_size != record.compressed_size or size != record.size:
+        fail zip_fail("zip local header mismatch")
+    start := pos + 30 + name_len + extra_len
+    if start + compressed_size > data.len():
+        fail zip_fail("zip entry data truncated")
+    return start
+
+fn zip_validate_record_data(data: Bytes, record: ZipRecord) -> Bytes!:
+    start := zip_local_data_start(data, record)!
+    content := data.slice(start, start + record.compressed_size)
+    if record.compressed_size != record.size:
+        fail zip_fail("unsupported zip compressed entry")
+    if checksum.crc32(content) != record.crc32:
+        fail zip_fail("zip crc mismatch")
+    return content
+
+fn zip_write_local_header(out: ByteBuffer, name: String, content: Bytes, crc: Int) -> Int!:
+    name_bytes := bytes.from_string_utf8(name)
+    mut total := zip_write_u32(out, LOCAL_HEADER_SIG)!
+    total = total + zip_write_u16(out, VERSION_NEEDED)!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u16(out, METHOD_STORED)!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u32(out, crc)!
+    total = total + zip_write_u32(out, content.len())!
+    total = total + zip_write_u32(out, content.len())!
+    total = total + zip_write_u16(out, name_bytes.len())!
+    total = total + zip_write_u16(out, 0)!
+    return total + zip_write_bytes(out, name_bytes)!
+
+fn zip_write_central_header(out: ByteBuffer, record: ZipRecord) -> Int!:
+    name_bytes := bytes.from_string_utf8(record.name)
+    mut total := zip_write_u32(out, CENTRAL_HEADER_SIG)!
+    total = total + zip_write_u16(out, VERSION_NEEDED)!
+    total = total + zip_write_u16(out, VERSION_NEEDED)!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u16(out, METHOD_STORED)!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u32(out, record.crc32)!
+    total = total + zip_write_u32(out, record.compressed_size)!
+    total = total + zip_write_u32(out, record.size)!
+    total = total + zip_write_u16(out, name_bytes.len())!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u32(out, 0)!
+    total = total + zip_write_u32(out, record.local_offset)!
+    return total + zip_write_bytes(out, name_bytes)!
+
+fn zip_write_eocd(out: ByteBuffer, entry_count: Int, central_size: Int, central_offset: Int) -> Int!:
+    mut total := zip_write_u32(out, EOCD_SIG)!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u16(out, 0)!
+    total = total + zip_write_u16(out, entry_count)!
+    total = total + zip_write_u16(out, entry_count)!
+    total = total + zip_write_u32(out, central_size)!
+    total = total + zip_write_u32(out, central_offset)!
+    return total + zip_write_u16(out, 0)!
+
+fn zip_add_file(out: ByteBuffer, records: List[ZipRecord], name: String, content: Bytes) -> List[ZipRecord]!:
+    clean_name := zip_safe_name(name)!
+    if clean_name.len() > 65535:
+        fail zip_fail("zip path too long")
+    if content.len() > 4294967295:
+        fail zip_fail("zip entry too large")
+    offset := out.bytes().len()
+    crc := checksum.crc32(content)
+    zip_write_local_header(out, clean_name, content, crc)!
+    zip_write_bytes(out, content)!
+    records.push(ZipRecord(clean_name, content.len(), content.len(), crc, METHOD_STORED, offset, false))
+    return records
+
+# list entries in a zip archive.
+pub fn list(data: Bytes) -> List[ZipEntry]!:
+    records := zip_records(data)!
+    mut entries: List[ZipEntry] := []
+    for record in records:
+        entries.push(zip_entry_from_record(record))
+    return entries
+
+# create a zip archive from paths.
+pub fn create(paths: List[String]) -> Bytes!:
+    out := bytes.buffer()
+    mut records: List[ZipRecord] := []
+    for input_path in paths:
+        if not fs.exists(input_path):
+            fail zip_fail("path does not exist: " + input_path)
+        entries := fs.walk(input_path)!
+        mut file_paths: List[String] := []
+        for entry in entries:
+            if entry.is_dir:
+                continue
+            file_paths.push(entry.path)
+        for file_path in file_paths.sort():
+            name := zip_archive_name(input_path, file_path)!
+            records = zip_add_file(out, records, name, fs.read_bytes(file_path)!)!
+    central_offset := out.bytes().len()
+    for record in records:
+        zip_write_central_header(out, record)!
+    central_size := out.bytes().len() - central_offset
+    zip_write_eocd(out, records.len(), central_size, central_offset)!
+    return out.bytes()
+
+# extract a zip archive into a directory.
+pub fn extract(data: Bytes, output_dir: String) -> Bool!:
+    if not fs.make_dirs(output_dir):
+        fail zip_fail("could not create output dir")
+    records := zip_records(data)!
+    for record in records:
+        if record.is_dir:
+            dir_path := path.join(output_dir, zip_safe_name(record.name)!)
+            if not fs.make_dirs(dir_path):
+                fail zip_fail("could not create dir: " + record.name)
+            continue
+        content := zip_validate_record_data(data, record)!
+        out_path := path.join(output_dir, zip_safe_name(record.name)!)
+        parent := path.dir(out_path)
+        if parent != "." and not fs.make_dirs(parent):
+            fail zip_fail("could not create parent dir: " + parent)
+        fs.write_bytes(out_path, content)!
+    return true
+
+# create a zip archive file from paths.
+pub fn create_file(paths: List[String], output_path: String) -> Bool!:
+    return fs.write_bytes(output_path, create(paths)!)
+
+# extract a zip archive file into a directory.
+pub fn extract_file(archive_path: String, output_dir: String) -> Bool!:
+    return extract(fs.read_bytes(archive_path)!, output_dir)
+
+fn zip_test_manual_archive(name: String, content: Bytes, method: Int, crc_value: Int) -> Bytes!:
+    out := bytes.buffer()
+    name_bytes := bytes.from_string_utf8(name)
+    zip_write_u32(out, LOCAL_HEADER_SIG)!
+    zip_write_u16(out, VERSION_NEEDED)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, method)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u32(out, crc_value)!
+    zip_write_u32(out, content.len())!
+    zip_write_u32(out, content.len())!
+    zip_write_u16(out, name_bytes.len())!
+    zip_write_u16(out, 0)!
+    zip_write_bytes(out, name_bytes)!
+    zip_write_bytes(out, content)!
+    central_offset := out.bytes().len()
+
+    zip_write_u32(out, CENTRAL_HEADER_SIG)!
+    zip_write_u16(out, VERSION_NEEDED)!
+    zip_write_u16(out, VERSION_NEEDED)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, method)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u32(out, crc_value)!
+    zip_write_u32(out, content.len())!
+    zip_write_u32(out, content.len())!
+    zip_write_u16(out, name_bytes.len())!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u32(out, 0)!
+    zip_write_u32(out, 0)!
+    zip_write_bytes(out, name_bytes)!
+    central_size := out.bytes().len() - central_offset
+
+    zip_write_u32(out, EOCD_SIG)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 0)!
+    zip_write_u16(out, 1)!
+    zip_write_u16(out, 1)!
+    zip_write_u32(out, central_size)!
+    zip_write_u32(out, central_offset)!
+    zip_write_u16(out, 0)!
+    return out.bytes()
+
+test "zip creates extracts and rejects invalid archives":
+    root := fs.make_temp_dir("pith-zip-")!
+    bundle := path.join(root, "bundle")
+    assert(fs.make_dirs(path.join(bundle, "nested")))
+    assert(fs.write(path.join(bundle, "hello.txt"), "hello zip")!)
+    assert(fs.write_bytes(path.join(path.join(bundle, "nested"), "data.bin"), bytes.from_string_utf8("bin"))!)
+
+    archive := create([bundle])!
+    entries := list(archive)!
+    assert_eq(entries.len(), 2)
+    assert_eq(entries[0].name, "bundle/hello.txt")
+    assert_eq(entries[0].size, 9)
+    assert_eq(entries[1].name, "bundle/nested/data.bin")
+    assert_eq(entries[1].size, 3)
+
+    out_dir := path.join(root, "out")
+    assert(extract(archive, out_dir)!)
+    assert_eq(fs.read(path.join(path.join(out_dir, "bundle"), "hello.txt"))!, "hello zip")
+    assert_eq(fs.read(path.join(path.join(path.join(out_dir, "bundle"), "nested"), "data.bin"))!, "bin")
+
+    archive_path := path.join(root, "bundle.zip")
+    assert(create_file([bundle], archive_path)!)
+    out_dir2 := path.join(root, "out2")
+    assert(extract_file(archive_path, out_dir2)!)
+    assert_eq(fs.read(path.join(path.join(out_dir2, "bundle"), "hello.txt"))!, "hello zip")
+
+    content := bytes.from_string_utf8("bad")
+    assert(extract(zip_test_manual_archive("bad.txt", content, METHOD_STORED, checksum.crc32(content) + 1)!, path.join(root, "bad-crc")).is_err)
+    assert(list(zip_test_manual_archive("compressed.txt", content, 8, checksum.crc32(content))!).is_err)
+    assert(extract(zip_test_manual_archive("../evil.txt", bytes.empty(), METHOD_STORED, checksum.crc32(bytes.empty()))!, path.join(root, "unsafe")).is_err)
+    assert(fs.remove_tree(root))

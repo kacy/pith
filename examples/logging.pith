@@ -1,0 +1,51 @@
+# structured logging examples
+import std.log as log
+import std.metrics as metrics
+import std.fs as fs
+
+fn main() -> String!:
+    path := "/tmp/pith_logging.txt"
+    fs.remove(path)
+    log.set_console()
+    log.set_level(log.debug_level())
+    log.set_file(path)
+    log.info("server starting on port 8080")
+    log.warn("cache miss rate above threshold")
+    log.error("connection refused")
+    log.debug("request payload size: 1024 bytes")
+    log.clear_file()
+    content := fs.read(path)!
+    print("file has info: " + content.contains("[INFO]").to_string())
+    print("file has error: " + content.contains("[ERROR]").to_string())
+    fs.remove(path)
+
+    json_path := "/tmp/pith_logging_json.txt"
+    fs.remove(json_path)
+    logger := log.root().json().file(json_path).with([log.str("service", "api")]).target("http").trace_context("trace-demo", "span-demo")
+    logger.info().int("port", 8080).bool("tls", false).duration_ms("elapsed_ms", 12).msg("server started")
+    json_content := fs.read(json_path)!
+    print("json has message: " + json_content.contains(chr(34) + "message" + chr(34) + ":" + chr(34) + "server started" + chr(34)).to_string())
+    print("json has service: " + json_content.contains(chr(34) + "service" + chr(34) + ":" + chr(34) + "api" + chr(34)).to_string())
+    print("json has trace: " + json_content.contains(chr(34) + "trace_id" + chr(34) + ":" + chr(34) + "trace-demo" + chr(34)).to_string())
+    fs.remove(json_path)
+
+    trace_id := log.new_trace_id()!
+    span_id := log.new_span_id()!
+    print("trace ids look compact: " + (trace_id.len() == 32 and span_id.len() == 16 and not trace_id.contains("-") and not span_id.contains("-")).to_string())
+
+    metrics.reset()
+    requests := metrics.counter("requests total")
+    inflight := metrics.gauge("requests in flight")
+    latency := metrics.histogram("request latency ms")
+    requests.inc()
+    requests.add(2)
+    inflight.set(1)
+    inflight.add(0 - 1)
+    latency.observe(12)
+    latency.observe(30)
+    snapshot := metrics.snapshot_text()
+    print("metrics has counter: " + snapshot.contains("requests_total 3").to_string())
+    print("metrics has histogram: " + snapshot.contains("request_latency_ms_count 2").to_string())
+
+    print("logging works")
+    return ""

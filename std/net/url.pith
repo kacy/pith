@@ -1,0 +1,322 @@
+# std.net.url — URL parsing and percent-encoding
+#
+# Parse URLs into components (scheme, host, port, path, query, fragment)
+# and perform percent-encoding/decoding per RFC 3986.
+#
+# Uses opaque Int handles into a node pool. Call parse() to get
+# a handle, then use accessor functions to read components.
+#
+#   from std.net.url import parse, host, path, encode, decode
+#   u := parse("https://example.com/api?q=1")
+#   host(u)        # "example.com"
+#   path(u)        # "/api"
+#   encode("hello world")  # "hello%20world"
+
+# ===============================================================
+# URL Node Pool
+# ===============================================================
+
+# Pool of parsed URL components indexed by handle
+mut next_url_id: Int := 0
+mut url_schemes: Map[Int, String] := {}
+mut url_hosts: Map[Int, String] := {}
+mut url_ports: Map[Int, Int] := {}
+mut url_paths: Map[Int, String] := {}
+mut url_queries: Map[Int, String] := {}
+mut url_fragments: Map[Int, String] := {}
+
+# Allocates a new URL node and returns its handle
+fn allocate_url() -> Int:
+    idx := next_url_id
+    next_url_id = next_url_id + 1
+    url_schemes.insert(idx, "")
+    url_hosts.insert(idx, "")
+    url_ports.insert(idx, 0 - 1)
+    url_paths.insert(idx, "")
+    url_queries.insert(idx, "")
+    url_fragments.insert(idx, "")
+    return idx
+
+# ===============================================================
+# URL Parsing
+# ===============================================================
+
+# Parses a URL string into its components.
+# Returns a handle that can be used with accessor functions.
+# Supports: scheme://host:port/path?query#fragment
+pub fn parse(input: String) -> Int:
+    idx := allocate_url()
+    mut pos := 0
+
+    # scheme: find "://"
+    mut scheme_end := 0 - 1
+    mut i := 0
+    while i + 2 < input.len():
+        if input[i] == ":" and input[i + 1] == "/" and input[i + 2] == "/":
+            scheme_end = i
+            i = input.len()
+        i = i + 1
+    if scheme_end > 0:
+        url_schemes.insert(idx, input.substring(0, scheme_end))
+        pos = scheme_end + 3
+
+    # host: up to : / ? # or end
+    host_start := pos
+    mut host_end := input.len()
+    i = pos
+    while i < input.len() and host_end == input.len():
+        c := input[i]
+        if c == "/" or c == "?" or c == "#":
+            host_end = i
+        i = i + 1
+
+    # check for port in host portion
+    mut colon := 0 - 1
+    i = host_start
+    while i < host_end:
+        if input[i] == ":":
+            colon = i
+            i = host_end
+        i = i + 1
+    if colon >= 0:
+        url_hosts.insert(idx, input.substring(host_start, colon))
+        # parse port number
+        mut port_val := 0
+        i = colon + 1
+        while i < host_end:
+            c := input[i]
+            if c >= "0" and c <= "9":
+                port_val = port_val * 10 + (ord(c) - 48)
+            i = i + 1
+        url_ports.insert(idx, port_val)
+    if colon < 0:
+        url_hosts.insert(idx, input.substring(host_start, host_end))
+    pos = host_end
+
+    # path: up to ? # or end
+    path_start := pos
+    mut path_end := input.len()
+    i = pos
+    while i < input.len() and path_end == input.len():
+        c := input[i]
+        if c == "?" or c == "#":
+            path_end = i
+        i = i + 1
+    if path_end > path_start:
+        url_paths.insert(idx, input.substring(path_start, path_end))
+    pos = path_end
+
+    # query: after ? before #
+    if pos < input.len() and input[pos] == "?":
+        pos = pos + 1
+        qstart := pos
+        mut qend := input.len()
+        i = pos
+        while i < input.len() and qend == input.len():
+            if input[i] == "#":
+                qend = i
+            i = i + 1
+        url_queries.insert(idx, input.substring(qstart, qend))
+        pos = qend
+
+    # fragment: after #
+    if pos < input.len() and input[pos] == "#":
+        pos = pos + 1
+        url_fragments.insert(idx, input.substring(pos, input.len()))
+
+    return idx
+
+# ===============================================================
+# URL Component Accessors
+# ===============================================================
+
+# Returns the URL scheme (e.g., "https", "http", "ftp").
+# Returns empty string if no scheme was present.
+pub fn scheme(handle: Int) -> String:
+    if handle < 0 or handle >= next_url_id:
+        return ""
+    return url_schemes[handle]
+
+# Returns the hostname (e.g., "example.com").
+# Returns empty string if parse failed or no host.
+pub fn host(handle: Int) -> String:
+    if handle < 0 or handle >= next_url_id:
+        return ""
+    return url_hosts[handle]
+
+# Returns the port number, or -1 if not specified in the URL.
+pub fn port(handle: Int) -> Int:
+    if handle < 0 or handle >= next_url_id:
+        return 0 - 1
+    return url_ports[handle]
+
+# Returns the path component (e.g., "/api/v1/users").
+# Returns empty string if no path.
+pub fn path(handle: Int) -> String:
+    if handle < 0 or handle >= next_url_id:
+        return ""
+    return url_paths[handle]
+
+# return the length of the path component without allocating a parsed url node.
+pub fn path_len(input: String) -> Int:
+    mut pos := 0
+    mut i := 0
+    while i + 2 < input.len():
+        if input[i] == ":" and input[i + 1] == "/" and input[i + 2] == "/":
+            pos = i + 3
+            i = input.len()
+        i = i + 1
+
+    mut host_end := input.len()
+    i = pos
+    while i < input.len() and host_end == input.len():
+        c := input[i]
+        if c == "/" or c == "?" or c == "#":
+            host_end = i
+        i = i + 1
+
+    if host_end >= input.len() or input[host_end] != "/":
+        return 0
+
+    mut path_end := input.len()
+    i = host_end
+    while i < input.len() and path_end == input.len():
+        c := input[i]
+        if c == "?" or c == "#":
+            path_end = i
+        i = i + 1
+    return path_end - host_end
+
+# Returns the query string without the leading "?".
+# Returns empty string if no query.
+pub fn query(handle: Int) -> String:
+    if handle < 0 or handle >= next_url_id:
+        return ""
+    return url_queries[handle]
+
+# Returns the fragment without the leading "#".
+# Returns empty string if no fragment.
+pub fn fragment(handle: Int) -> String:
+    if handle < 0 or handle >= next_url_id:
+        return ""
+    return url_fragments[handle]
+
+# Reconstructs the full URL string from its components.
+# Returns empty string if handle is invalid.
+pub fn to_string(handle: Int) -> String:
+    if handle < 0 or handle >= next_url_id:
+        return ""
+    mut result := ""
+    s := url_schemes[handle]
+    if s.len() > 0:
+        result = result + s + "://"
+    result = result + url_hosts[handle]
+    p := url_ports[handle]
+    if p >= 0:
+        result = result + ":" + p.to_string()
+    result = result + url_paths[handle]
+    q := url_queries[handle]
+    if q.len() > 0:
+        result = result + "?" + q
+    f := url_fragments[handle]
+    if f.len() > 0:
+        result = result + "#" + f
+    return result
+
+# ===============================================================
+# Percent-Encoding (RFC 3986)
+# ===============================================================
+
+# Returns true if character is unreserved per RFC 3986.
+# Unreserved chars: A-Z a-z 0-9 - _ . ~
+fn is_unreserved(c: String) -> Bool:
+    if c >= "A" and c <= "Z":
+        return true
+    if c >= "a" and c <= "z":
+        return true
+    if c >= "0" and c <= "9":
+        return true
+    if c == "-" or c == "_" or c == "." or c == "~":
+        return true
+    return false
+
+# Percent-encodes a string per RFC 3986.
+# Unreserved characters are left as-is, all others become %XX.
+pub fn encode(input: String) -> String:
+    hex_digits := "0123456789abcdef"
+    mut result := ""
+    mut position := 0
+    while position < input.len():
+        character := input[position]
+        if is_unreserved(character):
+            result = result + character
+        if not is_unreserved(character):
+            char_value := ord(character)
+            result = result + "%" + hex_digits[char_value / 16] + hex_digits[char_value % 16]
+        position = position + 1
+    return result
+
+# Converts a hex digit character to its numeric value.
+fn hex_digit(c: String) -> Int:
+    if c >= "0" and c <= "9":
+        return ord(c) - 48
+    if c >= "a" and c <= "f":
+        return ord(c) - 97 + 10
+    if c >= "A" and c <= "F":
+        return ord(c) - 65 + 10
+    return 0 - 1
+
+# Percent-decodes a string, converting %XX sequences to characters.
+# Also converts "+" to space (application/x-www-form-urlencoded).
+pub fn decode(input: String) -> String:
+    mut result := ""
+    mut position := 0
+    while position < input.len():
+        if input[position] == "%" and position + 2 < input.len():
+            high_nibble := hex_digit(input[position + 1])
+            low_nibble := hex_digit(input[position + 2])
+            if high_nibble >= 0 and low_nibble >= 0:
+                result = result + chr(high_nibble * 16 + low_nibble)
+                position = position + 3
+            if high_nibble < 0 or low_nibble < 0:
+                result = result + input[position]
+                position = position + 1
+        if input[position] != "%" or position + 2 >= input.len():
+            if input[position] == "+":
+                result = result + " "
+            if input[position] != "+":
+                result = result + input[position]
+            position = position + 1
+    return result
+
+test "url parse splits full urls":
+    u := parse("https://example.com:8443/api/v1?q=pith#docs")
+
+    assert_eq(scheme(u), "https")
+    assert_eq(host(u), "example.com")
+    assert_eq(port(u), 8443)
+    assert_eq(path(u), "/api/v1")
+    assert_eq(path_len("https://example.com:8443/api/v1?q=pith#docs"), 7)
+    assert_eq(query(u), "q=pith")
+    assert_eq(fragment(u), "docs")
+    assert_eq(to_string(u), "https://example.com:8443/api/v1?q=pith#docs")
+
+test "url parse handles missing pieces":
+    u := parse("example.com/path")
+
+    assert_eq(scheme(u), "")
+    assert_eq(host(u), "example.com")
+    assert_eq(port(u), 0 - 1)
+    assert_eq(path(u), "/path")
+    assert_eq(path_len("example.com/path"), 5)
+    assert_eq(path_len("https://example.com?x=1"), 0)
+    assert_eq(query(u), "")
+    assert_eq(fragment(u), "")
+
+test "url percent encoding round trips reserved chars":
+    encoded := encode("hello world/a+b")
+
+    assert_eq(encoded, "hello%20world%2fa%2bb")
+    assert_eq(decode(encoded), "hello world/a+b")
+    assert_eq(decode("hello+world"), "hello world")
+    assert_eq(decode("%zz"), "%zz")

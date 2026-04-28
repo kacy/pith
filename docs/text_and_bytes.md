@@ -1,6 +1,6 @@
 # text and bytes
 
-forge keeps text and raw bytes separate on purpose.
+pith keeps text and raw bytes separate on purpose.
 
 that means most code should stay in one of two lanes:
 - `std.strings` when you are shaping text
@@ -26,8 +26,8 @@ use these for the usual cases:
 
 `split_once` and `rsplit_once` return a small struct:
 
-```fg
-pair := strings.split_once("name=forge", "=")
+```pith
+pair := strings.split_once("name=pith", "=")
 if pair.found:
     print(pair.left)
     print(pair.right)
@@ -50,8 +50,8 @@ the low-level wrappers are there when you want a module-qualified surface:
 
 utf-8 decoding now has two paths:
 
-```fg
-raw := bytes.from_string_utf8("forge")
+```pith
+raw := bytes.from_string_utf8("pith")
 
 typed := bytes.decode_utf8(raw)
 if typed.is_ok:
@@ -70,7 +70,7 @@ keep `to_string_utf8(...)` when a plain string error is enough.
 
 the newer helpers are just there to make the common utf-8 path shorter:
 
-```fg
+```pith
 buf := bytes.buffer()
 buf.write_string_utf8("hello")!
 buf.write_line_utf8("world")!

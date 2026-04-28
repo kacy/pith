@@ -1,4 +1,4 @@
-# forge -> github-linguist PR checklist
+# pith -> github-linguist PR checklist
 
 ## 1) fork and branch
 
@@ -7,31 +7,31 @@ git clone https://github.com/<your-user>/linguist.git
 cd linguist
 git remote add upstream https://github.com/github-linguist/linguist.git
 git fetch upstream
-git checkout -b forge-language upstream/main
+git checkout -b pith-language upstream/main
 ```
 
-## 2) add forge language metadata
+## 2) add pith language metadata
 
 - update `lib/linguist/languages.yml` with the entry from `languages.yml.snippet.yml`
 
 ## 3) add grammar
 
-- add `grammars/forge.tmLanguage.json` (or the exact grammar location expected by linguist)
-- ensure grammar scope is `source.forge`
+- add `grammars/pith.tmLanguage.json` (or the exact grammar location expected by linguist)
+- ensure grammar scope is `source.pith`
 
 ## 4) add samples
 
-- add representative files under `samples/Forge/`
+- add representative files under `samples/Pith/`
 - include declarations, interpolation, generics, match, impl/interface, and indentation blocks
 
 ## 5) run local checks in linguist
 
 - run linguist test suite commands expected by the repo
-- verify `.fg` resolves to forge in local linguist output
+- verify `.pith` resolves to pith in local linguist output
 
 ## 6) open PR
 
 include:
 - concise language rationale
-- link to forge repo and language docs
-- note that `.fg` is currently mapped as a temporary workaround in the forge repo
+- link to pith repo and language docs
+- note that `.pith` is currently mapped as a temporary workaround in the pith repo

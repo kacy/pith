@@ -1,0 +1,374 @@
+# file streams build on std.io's shared handle-backed surface
+from std.io import FileStream
+import std.bytes as bytes
+import std.os as os
+import std.os.path as path
+
+# std.fs — file system operations
+#
+# file system utilities for checking existence, reading, writing,
+# and managing files and directories. all paths are strings.
+#
+# note: read() and write() return result types because i/o can fail.
+#       exists(), is_dir(), remove(), etc. return bool for success checks.
+#
+#   import std.fs as fs
+#   if fs.exists("config.txt"):
+#       content := fs.read("config.txt")!
+#       fs.write("backup.txt", content)!
+
+FS_IO_CHUNK_SIZE := 4096
+
+# Basic metadata for a path.
+pub struct Info:
+    pub path: String
+    pub exists: Bool
+    pub is_dir: Bool
+    pub size: Int
+
+# one directory entry with a few common metadata fields.
+pub struct Entry:
+    pub path: String
+    pub name: String
+    pub is_dir: Bool
+    pub size: Int
+
+fn temp_path_impl(dir_path: String, prefix: String, suffix: String) -> String:
+    unique := prefix + time().to_string() + "_" + random_int(0, 1000000).to_string() + suffix
+    return path.join(dir_path, unique)
+
+fn entry_for_path(entry_path: String) -> Entry!:
+    meta := info(entry_path)!
+    return Entry(entry_path, path.base(entry_path), meta.is_dir, meta.size)
+
+fn walk_into(entries: List[Entry], root_path: String) -> List[Entry]!:
+    current := entry_for_path(root_path)!
+    entries.push(current)
+    if current.is_dir:
+        for name in list(root_path):
+            child_path := path.join(root_path, name)
+            walk_into(entries, child_path)!
+    return entries
+
+fn atomic_temp_path(target_path: String) -> String:
+    dir_path := path.dir(target_path)
+    prefix := "." + path.base(target_path) + "."
+    return temp_path_impl(dir_path, prefix, ".tmp")
+
+fn fs_read_all(stream: FileStream) -> String!:
+    mut out := ""
+    mut chunk := stream.read(FS_IO_CHUNK_SIZE)!
+    while chunk.len() > 0:
+        out = out + chunk
+        chunk = stream.read(FS_IO_CHUNK_SIZE)!
+    return out
+
+fn fs_read_all_bytes(stream: FileStream) -> Bytes!:
+    buf := bytes.buffer_with_capacity(FS_IO_CHUNK_SIZE)
+    mut chunk := stream.read_bytes(FS_IO_CHUNK_SIZE)!
+    while not chunk.is_empty():
+        buf.write(chunk)!
+        chunk = stream.read_bytes(FS_IO_CHUNK_SIZE)!
+    return buf.bytes()
+
+fn fs_write_all(stream: FileStream, data: String) -> Int!:
+    mut total := 0
+    mut remaining := data
+    while remaining.len() > 0:
+        wrote := stream.write(remaining)!
+        if wrote <= 0:
+            fail "write returned 0"
+        total = total + wrote
+        remaining = remaining.substring(wrote, remaining.len())
+    return total
+
+fn fs_write_all_bytes(stream: FileStream, data: Bytes) -> Int!:
+    mut total := 0
+    mut remaining := data
+    while not remaining.is_empty():
+        wrote := stream.write_bytes(remaining)!
+        if wrote <= 0:
+            fail "write returned 0"
+        total = total + wrote
+        remaining = remaining.slice(wrote, remaining.len())
+    return total
+
+# ===============================================================
+# File Existence and Type
+# ===============================================================
+
+# True when a path exists.
+pub fn exists(path: String) -> Bool:
+    return file_exists(path)
+
+# true when the path exists and is a directory.
+pub fn is_dir(path: String) -> Bool:
+    return dir_exists(path)
+
+# true when the path exists and is not a directory.
+pub fn is_file(path: String) -> Bool:
+    return exists(path) and not is_dir(path)
+
+# ===============================================================
+# File Reading and Writing
+# ===============================================================
+
+# Read an entire file as text.
+pub fn read(path: String) -> String!:
+    return read_file(path)
+
+# read an entire file as raw bytes.
+pub fn read_bytes(path: String) -> Bytes!:
+    return read_file_bytes(path)
+
+# write text to a file, replacing existing contents.
+pub fn write(path: String, data: String) -> Bool!:
+    return write_file(path, data)
+
+# write raw bytes to a file, replacing existing contents.
+pub fn write_bytes(path: String, data: Bytes) -> Bool!:
+    return write_file_bytes(path, data)
+
+# write text to a temp file and rename it into place.
+pub fn write_atomic(target_path: String, data: String) -> Bool!:
+    parent := path.dir(target_path)
+    if parent != "." and not is_dir(parent):
+        if not make_dirs(parent):
+            fail "could not create parent dir: " + parent
+    temp_path := atomic_temp_path(target_path)
+    write(temp_path, data)!
+    if not rename(temp_path, target_path):
+        remove(temp_path)
+        fail "could not replace file atomically: " + target_path
+    return true
+
+# write bytes to a temp file and rename it into place.
+pub fn write_bytes_atomic(target_path: String, data: Bytes) -> Bool!:
+    parent := path.dir(target_path)
+    if parent != "." and not is_dir(parent):
+        if not make_dirs(parent):
+            fail "could not create parent dir: " + parent
+    temp_path := atomic_temp_path(target_path)
+    write_bytes(temp_path, data)!
+    if not rename(temp_path, target_path):
+        remove(temp_path)
+        fail "could not replace file atomically: " + target_path
+    return true
+
+# append text to a file.
+pub fn append(path: String, data: String) -> Bool!:
+    return append_file(path, data)
+
+# append raw bytes to a file.
+pub fn append_bytes(path: String, data: Bytes) -> Bool!:
+    return append_file_bytes(path, data)
+
+# open an existing file for reading.
+pub fn open(path: String) -> FileStream!:
+    return FileStream(file_open_read(path)!)
+
+# create or truncate a file for writing.
+pub fn create(path: String) -> FileStream!:
+    return FileStream(file_open_write(path)!)
+
+# open a file for appending.
+pub fn open_append(path: String) -> FileStream!:
+    return FileStream(file_open_append(path)!)
+
+impl FileStream:
+    fn read(max_bytes: Int) -> String!:
+        return file_read_bytes(self.handle, max_bytes)!.to_string_utf8()!
+
+    fn read_all() -> String!:
+        return fs_read_all(self)
+
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return file_read_bytes(self.handle, max_bytes)
+
+    fn read_all_bytes() -> Bytes!:
+        return fs_read_all_bytes(self)
+
+    fn write(data: String) -> Int!:
+        return file_write_bytes(self.handle, bytes.from_string_utf8(data))!
+
+    fn write_all(data: String) -> Int!:
+        return fs_write_all(self, data)
+
+    fn write_bytes(data: Bytes) -> Int!:
+        return file_write_bytes(self.handle, data)
+
+    fn write_all_bytes(data: Bytes) -> Int!:
+        return fs_write_all_bytes(self, data)
+
+    fn close():
+        file_close(self.handle)
+
+# ===============================================================
+# File and Directory Management
+# ===============================================================
+
+# Remove one file.
+pub fn remove(path: String) -> Bool:
+    return remove_file(path)
+
+# remove an empty directory.
+pub fn remove_empty_dir(path: String) -> Bool:
+    return fs_remove_dir(path)
+
+# remove a file tree recursively.
+pub fn remove_tree(path: String) -> Bool:
+    if not exists(path):
+        return true
+    if is_dir(path):
+        return fs_remove_tree(path)
+    return remove(path)
+
+# remove a path recursively.
+pub fn remove_all(path: String) -> Bool:
+    return remove_tree(path)
+
+# rename a file or directory.
+pub fn rename(old_path: String, new_path: String) -> Bool:
+    return rename_file(old_path, new_path)
+
+# alias for rename.
+pub fn move(old_path: String, new_path: String) -> Bool:
+    return rename(old_path, new_path)
+
+# create one directory.
+pub fn make_dir(path: String) -> Bool:
+    return mkdir(path)
+
+# create a directory and any missing parents.
+pub fn make_dirs(dir_path: String) -> Bool:
+    cleaned := path.clean(dir_path)
+    if cleaned == "." or cleaned == "/":
+        return true
+    if is_dir(cleaned):
+        return true
+
+    parent := path.dir(cleaned)
+    if parent != "." and parent != cleaned:
+        if not make_dirs(parent):
+            return false
+
+    if is_dir(cleaned):
+        return true
+    return make_dir(cleaned)
+
+# list direct entries in a directory.
+pub fn list(path: String) -> List[String]:
+    return list_dir(path)
+
+# list direct entries with path metadata.
+pub fn read_dir(dir_path: String) -> List[Entry]!:
+    if not is_dir(dir_path):
+        fail "not a directory: " + dir_path
+    mut entries: List[Entry] := []
+    for name in list(dir_path):
+        entries.push(entry_for_path(path.join(dir_path, name))!)
+    return entries
+
+# copy one file from one path to another.
+pub fn copy(from_path: String, to_path: String) -> Bool!:
+    parent := path.dir(to_path)
+    if parent != "." and not is_dir(parent):
+        if not make_dirs(parent):
+            fail "could not create parent dir: " + parent
+    data := read_bytes(from_path)!
+    return write_bytes(to_path, data)
+
+# copy a whole file tree recursively.
+pub fn copy_tree(from_path: String, to_path: String) -> Bool!:
+    if is_dir(from_path):
+        if not make_dirs(to_path):
+            fail "could not create dir: " + to_path
+        for entry in list(from_path):
+            child_from := path.join(from_path, entry)
+            child_to := path.join(to_path, entry)
+            copied := copy_tree(child_from, child_to)
+            if copied.is_err:
+                fail "could not copy tree entry: " + child_from
+        return true
+    if exists(from_path):
+        copied := copy(from_path, to_path)
+        if copied.is_err:
+            fail "could not copy file: " + from_path
+        return copied.ok
+    fail "path does not exist: " + from_path
+
+# return basic metadata for a path.
+pub fn info(path: String) -> Info!:
+    if is_dir(path):
+        return Info(path, true, true, 0)
+    if exists(path):
+        size := fs_file_size(path)
+        if size < 0:
+            fail "could not read file info: " + path
+        return Info(path, true, false, size)
+    fail "path does not exist: " + path
+
+# return basic metadata for a path.
+pub fn metadata(path: String) -> Info!:
+    return info(path)
+
+# return the size field from info().
+pub fn size(path: String) -> Int!:
+    return info(path)!.size
+
+# build a temp path candidate without creating it.
+pub fn temp_path(prefix: String, suffix: String) -> String:
+    return temp_path_impl(os.temp_dir(), prefix, suffix)
+
+# build a temp path candidate inside a specific directory.
+pub fn temp_path_in(dir_path: String, prefix: String, suffix: String) -> String:
+    return temp_path_impl(dir_path, prefix, suffix)
+
+# create a temporary directory and return its path.
+pub fn make_temp_dir(prefix: String) -> String!:
+    dir_path := temp_path_impl(os.temp_dir(), prefix, "")
+    if not make_dirs(dir_path):
+        fail "could not create temp dir: " + dir_path
+    return dir_path
+
+# create a temporary directory inside a specific directory.
+pub fn make_temp_dir_in(dir_path: String, prefix: String) -> String!:
+    temp_dir_path := temp_path_impl(dir_path, prefix, "")
+    if not make_dirs(temp_dir_path):
+        fail "could not create temp dir: " + temp_dir_path
+    return temp_dir_path
+
+# create an empty temporary file and return its path.
+pub fn make_temp_file(prefix: String, suffix: String) -> String!:
+    file_path := temp_path_impl(os.temp_dir(), prefix, suffix)
+    write(file_path, "")!
+    return file_path
+
+# create an empty temporary file inside a specific directory.
+pub fn make_temp_file_in(dir_path: String, prefix: String, suffix: String) -> String!:
+    file_path := temp_path_impl(dir_path, prefix, suffix)
+    write(file_path, "")!
+    return file_path
+
+# walk a file tree in preorder starting at root_path.
+pub fn walk(root_path: String) -> List[Entry]!:
+    if not exists(root_path):
+        fail "path does not exist: " + root_path
+    mut entries: List[Entry] := []
+    return walk_into(entries, root_path)
+
+test "fs writes reads appends and removes files":
+    dir := make_temp_dir("pith-std-fs-")!
+    file_path := dir + "/note.txt"
+
+    assert(not exists(file_path))
+    assert(write(file_path, "hello")!)
+    assert(exists(file_path))
+    assert(is_file(file_path))
+    assert(not is_dir(file_path))
+    assert_eq(read(file_path)!, "hello")
+    assert_eq(size(file_path)!, 5)
+    assert(append(file_path, " world")!)
+    assert_eq(read(file_path)!, "hello world")
+    assert(remove(file_path))
+    assert(remove_empty_dir(dir))

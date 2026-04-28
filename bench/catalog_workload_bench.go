@@ -181,14 +181,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	forgeResult, forgeErr := runTrials("./bench/catalog_workload", iterations, trials)
-	if forgeErr != nil {
-		fmt.Println(forgeErr)
+	pithResult, pithErr := runTrials("./bench/catalog_workload", iterations, trials)
+	if pithErr != nil {
+		fmt.Println(pithErr)
 		os.Exit(1)
 	}
 
-	if goResult.checksum != forgeResult.checksum {
-		fmt.Printf("checksum mismatch: go=%d forge=%d\n", goResult.checksum, forgeResult.checksum)
+	if goResult.checksum != pithResult.checksum {
+		fmt.Printf("checksum mismatch: go=%d pith=%d\n", goResult.checksum, pithResult.checksum)
 		os.Exit(1)
 	}
 
@@ -203,19 +203,19 @@ func main() {
 			os.Exit(1)
 		}
 
-		fmt.Printf("%-12s %-8s %-8s %-8s %-10s %-10s\n", "phase", "go", "rust", "forge", "forge/go", "forge/rust")
-		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "profile", goResult.profileMS, rustResult.profileMS, forgeResult.profileMS, ratio(forgeResult.profileMS, goResult.profileMS), ratio(forgeResult.profileMS, rustResult.profileMS))
-		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "search_hot", goResult.searchHotMS, rustResult.searchHotMS, forgeResult.searchHotMS, ratio(forgeResult.searchHotMS, goResult.searchHotMS), ratio(forgeResult.searchHotMS, rustResult.searchHotMS))
-		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "search_wide", goResult.searchWideMS, rustResult.searchWideMS, forgeResult.searchWideMS, ratio(forgeResult.searchWideMS, goResult.searchWideMS), ratio(forgeResult.searchWideMS, rustResult.searchWideMS))
-		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "batch", goResult.batchMS, rustResult.batchMS, forgeResult.batchMS, ratio(forgeResult.batchMS, goResult.batchMS), ratio(forgeResult.batchMS, rustResult.batchMS))
-		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "total", goResult.totalMS, rustResult.totalMS, forgeResult.totalMS, ratio(forgeResult.totalMS, goResult.totalMS), ratio(forgeResult.totalMS, rustResult.totalMS))
+		fmt.Printf("%-12s %-8s %-8s %-8s %-10s %-10s\n", "phase", "go", "rust", "pith", "pith/go", "pith/rust")
+		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "profile", goResult.profileMS, rustResult.profileMS, pithResult.profileMS, ratio(pithResult.profileMS, goResult.profileMS), ratio(pithResult.profileMS, rustResult.profileMS))
+		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "search_hot", goResult.searchHotMS, rustResult.searchHotMS, pithResult.searchHotMS, ratio(pithResult.searchHotMS, goResult.searchHotMS), ratio(pithResult.searchHotMS, rustResult.searchHotMS))
+		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "search_wide", goResult.searchWideMS, rustResult.searchWideMS, pithResult.searchWideMS, ratio(pithResult.searchWideMS, goResult.searchWideMS), ratio(pithResult.searchWideMS, rustResult.searchWideMS))
+		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "batch", goResult.batchMS, rustResult.batchMS, pithResult.batchMS, ratio(pithResult.batchMS, goResult.batchMS), ratio(pithResult.batchMS, rustResult.batchMS))
+		fmt.Printf("%-12s %-8d %-8d %-8d %-10s %-10s\n", "total", goResult.totalMS, rustResult.totalMS, pithResult.totalMS, ratio(pithResult.totalMS, goResult.totalMS), ratio(pithResult.totalMS, rustResult.totalMS))
 	} else {
-		fmt.Printf("%-12s %-8s %-8s %-8s\n", "phase", "go", "forge", "ratio")
-		fmt.Printf("%-12s %-8d %-8d %-8s\n", "profile", goResult.profileMS, forgeResult.profileMS, ratio(forgeResult.profileMS, goResult.profileMS))
-		fmt.Printf("%-12s %-8d %-8d %-8s\n", "search_hot", goResult.searchHotMS, forgeResult.searchHotMS, ratio(forgeResult.searchHotMS, goResult.searchHotMS))
-		fmt.Printf("%-12s %-8d %-8d %-8s\n", "search_wide", goResult.searchWideMS, forgeResult.searchWideMS, ratio(forgeResult.searchWideMS, goResult.searchWideMS))
-		fmt.Printf("%-12s %-8d %-8d %-8s\n", "batch", goResult.batchMS, forgeResult.batchMS, ratio(forgeResult.batchMS, goResult.batchMS))
-		fmt.Printf("%-12s %-8d %-8d %-8s\n", "total", goResult.totalMS, forgeResult.totalMS, ratio(forgeResult.totalMS, goResult.totalMS))
+		fmt.Printf("%-12s %-8s %-8s %-8s\n", "phase", "go", "pith", "ratio")
+		fmt.Printf("%-12s %-8d %-8d %-8s\n", "profile", goResult.profileMS, pithResult.profileMS, ratio(pithResult.profileMS, goResult.profileMS))
+		fmt.Printf("%-12s %-8d %-8d %-8s\n", "search_hot", goResult.searchHotMS, pithResult.searchHotMS, ratio(pithResult.searchHotMS, goResult.searchHotMS))
+		fmt.Printf("%-12s %-8d %-8d %-8s\n", "search_wide", goResult.searchWideMS, pithResult.searchWideMS, ratio(pithResult.searchWideMS, goResult.searchWideMS))
+		fmt.Printf("%-12s %-8d %-8d %-8s\n", "batch", goResult.batchMS, pithResult.batchMS, ratio(pithResult.batchMS, goResult.batchMS))
+		fmt.Printf("%-12s %-8d %-8d %-8s\n", "total", goResult.totalMS, pithResult.totalMS, ratio(pithResult.totalMS, goResult.totalMS))
 	}
 	fmt.Println()
 	fmt.Printf("checksum %d\n", goResult.checksum)

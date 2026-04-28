@@ -1,0 +1,45 @@
+# process management with std.os.process
+
+import std.os as os
+import std.os.process as process
+
+fn main() -> Int!:
+    print("which sh: {(os.which("sh") != "")}")
+
+    pwd_out := process.command("pwd").cwd("/tmp").output_checked()
+    pwd_status := pwd_out.ok.status
+    pwd_text := pwd_out.ok.stdout_trimmed()
+    print("pwd status: {pwd_status}")
+    print("pwd: {pwd_text}")
+    print("pwd success: {pwd_out.ok.success()}")
+
+    env_out := process.command("env").env("PITH_PROCESS_EXAMPLE", "hello world").output()!
+    env_seen := env_out.stdout.contains("PITH_PROCESS_EXAMPLE=hello world")
+    print("env seen: {env_seen}")
+    print("env success: {env_out.success()}")
+
+    quiet_code := process.command("printf").arg("").run()!
+    print("quiet run: {quiet_code}")
+
+    failing_out := process.command("ls").arg("/nonexistent_path_xyz").output()!
+    has_stderr := failing_out.stderr_trimmed().len() > 0
+    ls_failed := failing_out.failed()
+    print("stderr: {has_stderr}")
+    print("ls failed: {ls_failed}")
+    checked_fail := process.command("ls").arg("/nonexistent_path_xyz").output_checked()
+    print("checked fail: {checked_fail.is_err}")
+
+    child := process.command("head").args(["-c", "5"]).start()!
+    child.stdin().write_all("abcdef")!
+    streamed := child.stdout().read_all()!
+    child_exit := child.wait()
+    print("streamed: {streamed}")
+    print("child exit: {child_exit}")
+    child.close()
+
+    shell_command := "printf shell-ok"
+    shell_output := process.output_shell(shell_command)!
+    print("shell output: {shell_output}")
+    trimmed := process.command("printf").arg("trimmed").text_trimmed().ok
+    print("trimmed text: {trimmed}")
+    return 0

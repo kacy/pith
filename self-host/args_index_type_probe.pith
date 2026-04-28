@@ -1,0 +1,55 @@
+from lexer import lex_all
+from parser import parse
+from ast import get_node, reset_arena
+from checker import initialize_checker, c_run_module, c_get_expr_type
+from types import get_type_name, get_type_info
+
+fn show_expr(label: String, node_idx: Int):
+    tid := c_get_expr_type(node_idx)
+    info := get_type_info(tid)
+    print(label)
+    print(get_node(node_idx).kind)
+    print(tid.to_string())
+    print(get_type_name(tid))
+    print(info.kind)
+    print(info.name)
+    print("inner")
+    print(info.inner.to_string())
+    if info.inner >= 0:
+        print(get_type_name(info.inner))
+
+fn main():
+    src := read_file("tests/cases/test_args_dispatch.pith")!
+    toks := lex_all(src)
+    reset_arena()
+    root := parse(toks)
+    initialize_checker("tests/cases/test_args_dispatch.pith")
+    c_run_module(root)
+
+    root_node := get_node(root)
+    print("root children")
+    for child in root_node.children:
+        node := get_node(child)
+        print(node.kind)
+        print(node.value)
+    main_fn := root_node.children[0]
+    main_node := get_node(main_fn)
+    print("main node")
+    print(main_node.kind)
+    print(main_node.value)
+    body_idx := main_node.children[0]
+    body_wrapper := get_node(body_idx)
+    body_node := get_node(body_wrapper.children[0])
+    print("body node")
+    print(body_node.kind)
+
+    mut i := 0
+    while i < body_node.children.len():
+        child := body_node.children[i]
+        node := get_node(child)
+        print("body child " + i.to_string())
+        print(node.kind)
+        print(node.value)
+        if node.children.len() > 0:
+            show_expr("first child expr", node.children[0])
+        i = i + 1

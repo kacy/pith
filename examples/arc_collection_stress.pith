@@ -1,0 +1,40 @@
+# ARC stress test: Collection churn
+# Creates and destroys lists/maps with string elements
+# Collection ARC is now implemented - memory should be properly managed
+
+fn main():
+    print("ARC Collection Stress Test")
+    print("Collection ARC is now implemented!")
+
+    # Test 1: List of strings
+    print("Test 1: List[String] (100 iterations)")
+    mut i := 0
+    while i < 100:
+        items := ["item_" + i.to_string()]
+        items.push("second_" + i.to_string())
+        # items and its contents should be released when scope ends
+        i = i + 1
+    print("Test 1 complete")
+
+    # Test 2: Collection operations
+    print("Test 2: Collection operations (100 iterations)")
+    i = 0
+    while i < 100:
+        words := ["hello", "world", "from", "pith"]
+        joined := words.join(" ")
+        # joined is a new string, should be managed
+        i = i + 1
+    print("Test 2 complete")
+
+    # Test 3: String in collections
+    print("Test 3: String processing (200 iterations)")
+    i = 0
+    while i < 200:
+        base := "base_" + i.to_string()
+        chars := base.split("")
+        # chars is a list of strings - should be properly released
+        i = i + 1
+    print("Test 3 complete")
+
+    print("Collection stress tests complete")
+    print("All collections should be properly freed via ARC")

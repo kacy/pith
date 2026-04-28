@@ -1,11 +1,11 @@
 # http apps
 
-forge now has a more practical http layer in `std.net.http`.
+pith now has a more practical http layer in `std.net.http`.
 
 the important split is:
 - `HttpRequestBytes` is the main request type
 - `HttpResponse` is the main response type
-- routing stays explicit in normal forge code
+- routing stays explicit in normal pith code
 
 that means you can write small apps without hand-rolling query parsing,
 response serialization, or request building every time.
@@ -14,7 +14,7 @@ response serialization, or request building every time.
 
 use `HttpRequestBytes` for normal server-side code:
 
-```fg
+```pith
 fn app(req: HttpRequestBytes) -> HttpResponse:
     if http.match_route(req, "GET", "/users/:id") catch false:
         user_id := req.path_param("/users/:id", "id") catch ""
@@ -48,7 +48,7 @@ for common verb checks, prefer the small route wrappers:
 if an upload should go straight to a writer instead of into memory, stream the
 body and keep the request metadata:
 
-```fg
+```pith
 out := bytes.buffer()
 streamed := http.read_request_buffered_bytes_into(reader, out.buffered_chunked(4096))!
 
@@ -63,7 +63,7 @@ decoded body size. the request body itself goes straight into the writer.
 
 `HttpResponse` is a plain value with a small builder surface:
 
-```fg
+```pith
 resp := http.json_value(200, payload).header("X-Trace", "abc123")
 http.send_buffered(writer, resp)!
 ```
@@ -104,14 +104,14 @@ builder cases:
 
 the cookie builder keeps the common cases out of manual header strings:
 
-```fg
+```pith
 resp := http.text(200, "ok")
     .set_cookie(http.cookie("session", "abc123").path("/").http_only())
 ```
 
 client requests can carry cookies the same way:
 
-```fg
+```pith
 req := http.get_request("example.test", 80, "/profile").cookie("session", "abc123")
 ```
 
@@ -130,7 +130,7 @@ on the request side:
 
 parts keep their raw bytes, so file uploads do not need to decode as utf-8:
 
-```fg
+```pith
 part := req.multipart_part("avatar")!
 size := part.body_bytes().len()
 filename := part.filename
@@ -139,7 +139,7 @@ kind := part.header("Content-Type")
 
 for client-side requests, build parts explicitly:
 
-```fg
+```pith
 mut parts: List[http.MultipartPart] := []
 parts.push(http.multipart_field("note", "hello"))
 parts.push(http.multipart_file("blob", "blob.bin", "application/octet-stream", payload))
@@ -153,7 +153,7 @@ if you want a stable boundary for tests, use `multipart_body_with_boundary(...)`
 
 middleware wraps a normal handler and returns another normal handler:
 
-```fg
+```pith
 fn auth(next: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> HttpResponse:
     if req.cookie_or("session", "") == "":
         return http.unauthorized_response()
@@ -167,7 +167,7 @@ stack multiple wrappers by repeating `wrap(...)`.
 for the common "log every request and keep a few process metrics" path, use
 `http.instrument(...)` with `std.log` and `std.metrics`:
 
-```fg
+```pith
 import std.log as log
 import std.metrics as metrics
 
@@ -191,7 +191,7 @@ path, status, elapsed time, trace id, and span id.
 
 for tests, in-memory examples, or small buffered handlers:
 
-```fg
+```pith
 http.serve_one(reader, writer, app)!
 ```
 
@@ -201,26 +201,26 @@ that keeps the handler shape simple:
 
 for fd-based servers that already accepted a client connection, use:
 
-```fg
+```pith
 http.serve_fd(client_fd, handler)!
 ```
 
 for one persistent client connection, use:
 
-```fg
+```pith
 http.serve_connection(reader, writer, handler)!
 ```
 
 or with an already-accepted fd:
 
-```fg
+```pith
 http.serve_connection_fd(client_fd, handler)!
 ```
 
 if you want the connection to stay open, set it explicitly on the request or
 response builder:
 
-```fg
+```pith
 req := http.get_request("example.test", 80, "/events").keep_alive()
 resp := http.text(200, "ok").keep_alive()
 ```
@@ -228,7 +228,7 @@ resp := http.text(200, "ok").keep_alive()
 if a handler wants to recover from parse or query issues, just map those
 results into a normal response:
 
-```fg
+```pith
 payload := req.body_json() catch -1
 if payload < 0:
     return http.server_error_response()
@@ -241,7 +241,7 @@ buffer first.
 
 for known sizes, send the head once and then stream the body bytes:
 
-```fg
+```pith
 http.send_sized_response_head(writer, http.response(200).content_type("text/plain"), size)!
 http.send_stream_bytes(writer, chunk1)!
 http.send_stream_bytes(writer, chunk2)!
@@ -249,7 +249,7 @@ http.send_stream_bytes(writer, chunk2)!
 
 for open-ended bodies, use chunked transfer encoding:
 
-```fg
+```pith
 http.send_chunked_response_head(writer, http.response(200).content_type("text/plain").keep_alive())!
 http.send_chunked_response_text(writer, "hello ")!
 http.send_chunked_response_text(writer, "world")!
@@ -262,7 +262,7 @@ responses without buffering the whole payload in memory.
 for file-backed responses, use the path helpers instead of reading the whole
 file into memory first:
 
-```fg
+```pith
 http.send_static_path(writer, http.response(200).keep_alive(), "public/app.js")!
 http.send_download_path(writer, http.response(200), "build/report.json", "report.json")!
 ```
@@ -274,7 +274,7 @@ http.send_download_path(writer, http.response(200), "build/report.json", "report
 if you want the client side of that flow, stream a response body straight into
 an output file:
 
-```fg
+```pith
 req := http.get_request("example.test", 80, "/artifact")
 saved := req.send_to_file("artifact.bin")!
 print(saved.body_size.to_string())
@@ -298,7 +298,7 @@ everything else falls back to `application/octet-stream`.
 
 for server-sent events, use `std.net.sse` on top of that same chunked path:
 
-```fg
+```pith
 import std.net.sse as sse
 
 sse.start(writer)!
@@ -310,15 +310,15 @@ sse.keep_alive(writer)!
 that sets the usual `text/event-stream` headers and writes correctly framed sse
 events instead of making each handler rebuild the wire format.
 
-if your payload is already a forge json value, use the json helpers:
+if your payload is already a pith json value, use the json helpers:
 
-```fg
+```pith
 sse.send_named_json(writer, "tick", payload)!
 ```
 
 on the client side, you can parse an event-stream body back into frames:
 
-```fg
+```pith
 items := sse.parse_all(resp.body_text()!)!
 payload := items[0].json_data()!
 ```
@@ -330,7 +330,7 @@ on the request side, `std.net.sse` also gives you the small header helpers:
 on the client side, you can also stream the decoded response body into a
 writer:
 
-```fg
+```pith
 out := bytes.buffer()
 meta := http.get_request("example.com", 80, "/dump").no_redirects().send_into(out.buffered_chunked(4096))!
 
@@ -347,7 +347,7 @@ the streamed body size. the body itself goes straight into the writer.
 
 the client side now uses the same explicit shape:
 
-```fg
+```pith
 mut req := http.request("POST", "example.com", 80, "/items")
 req = req.header("X-Test", "yes")
 req = req.json_body(payload)
@@ -356,7 +356,7 @@ raw := req.to_bytes()!
 
 for real requests:
 
-```fg
+```pith
 resp := http.get_request("127.0.0.1", 8080, "/health").accept(http.MIME_JSON).send()!
 print(resp.status_code().to_string())
 print(resp.body_text()!)
@@ -364,7 +364,7 @@ print(resp.body_text()!)
 
 for transport control, keep it on the request builder:
 
-```fg
+```pith
 resp := http.get_https_request("example.com", "/docs")
     .with_timeout(1500)
     .follow_redirects(3)
@@ -379,7 +379,7 @@ resp := http.get_https_request("example.com", "/docs")
 
 for client-side keep-alive, send requests on an already-open connection:
 
-```fg
+```pith
 conn := http.connect_client_with_timeout("127.0.0.1", 8080, 1500)!
 
 req1 := http.get_request("127.0.0.1", 8080, "/one").keep_alive()
@@ -397,7 +397,7 @@ module instead of splitting the work across app code.
 
 for common write-heavy client paths, prefer the request helpers:
 
-```fg
+```pith
 req := http.post_request("example.com", 80, "/items") \
     .query_param("mode", "fast path") \
     .bearer("token") \

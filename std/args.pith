@@ -1,0 +1,336 @@
+# std.args — command-line argument parser
+#
+# Declarative argument parser for CLI tools.
+#
+#   from std.args import init, add_flag, add_option, add_positional
+#   from std.args import parse, get_flag, get_option, get_positional
+#   init("myapp", "Does things")
+#   add_flag("verbose", "v", "Enable verbose output")
+#   add_option("output", "o", "Output file", "out.txt")
+#   add_positional("input", "Input file")
+#   parse()
+
+# ===============================================================
+# State — delimited strings because Map globals don't survive
+# cross-module access in the current runtime
+# ===============================================================
+
+mut app_name: String := ""
+mut app_desc: String := ""
+mut flags_data: String := ""
+mut flag_count: Int := 0
+mut opts_data: String := ""
+mut opt_count: Int := 0
+mut pos_data: String := ""
+mut pos_count: Int := 0
+mut error_data: String := ""
+mut error_count: Int := 0
+
+# ===============================================================
+# Setup
+# ===============================================================
+
+# # Initialize parser metadata for help output.
+pub fn init(name: String, description: String):
+    app_name = name
+    app_desc = description
+
+# register a boolean flag like --verbose or -v.
+pub fn add_flag(name: String, short: String, description: String):
+    entry := name + "|" + short + "|" + description + "|0"
+    if flag_count > 0:
+        sep := flags_data + "~"
+        flags_data = sep + entry
+    else:
+        flags_data = entry
+    flag_count = flag_count + 1
+
+# register an option that expects a value.
+pub fn add_option(name: String, short: String, description: String, default_val: String):
+    entry := name + "|" + short + "|" + description + "|" + default_val
+    if opt_count > 0:
+        sep := opts_data + "~"
+        opts_data = sep + entry
+    else:
+        opts_data = entry
+    opt_count = opt_count + 1
+
+# register a positional argument in parse order.
+pub fn add_positional(name: String, description: String):
+    entry := name + "|" + description + "| "
+    if pos_count > 0:
+        sep := pos_data + "~"
+        pos_data = sep + entry
+    else:
+        pos_data = entry
+    pos_count = pos_count + 1
+
+# ===============================================================
+# Internal field access
+# ===============================================================
+
+fn get_field(record: String, idx: Int) -> String:
+    parts := record.split("|")
+    for part, i in parts:
+        if i == idx:
+            return part
+    return ""
+
+fn get_records(data: String) -> List[String]:
+    return data.split("~")
+
+fn find_record(data: String, count: Int, name: String) -> String:
+    if count == 0:
+        return ""
+    recs := get_records(data)
+    for rec in recs:
+        if get_field(rec, 0) == name:
+            return rec
+    return ""
+
+fn find_by_short(data: String, count: Int, short: String) -> String:
+    if count == 0:
+        return ""
+    recs := get_records(data)
+    for rec in recs:
+        if get_field(rec, 1) == short:
+            return get_field(rec, 0)
+    return ""
+
+fn replace_field(record: String, field_idx: Int, new_val: String) -> String:
+    parts := record.split("|")
+    mut rebuilt := ""
+    mut j := 0
+    for part in parts:
+        if j > 0:
+            rebuilt = rebuilt + "|"
+        if j == field_idx:
+            rebuilt = rebuilt + new_val
+        else:
+            rebuilt = rebuilt + part
+        j = j + 1
+    return rebuilt
+
+fn rebuild_with_match(data: String, match_idx: Int, match_val: String, field_idx: Int, new_val: String) -> String:
+    recs := get_records(data)
+    mut result := ""
+    for current_rec, i in recs:
+        mut rec := current_rec
+        if get_field(rec, match_idx) == match_val:
+            rec = replace_field(rec, field_idx, new_val)
+        if i > 0:
+            result = result + "~" + rec
+        else:
+            result = rec
+    return result
+
+fn rebuild_with_update(data: String, name: String, field_idx: Int, new_val: String) -> String:
+    return rebuild_with_match(data, 0, name, field_idx, new_val)
+
+# ===============================================================
+# Parsing
+# ===============================================================
+
+# # Parse the process argument list.
+pub fn parse():
+    a := args()
+    mut argv: List[String] := []
+    for arg, i in a:
+        if i > 0:
+            argv.push(arg)
+    parse_list(argv)
+
+# parse an explicit argv list instead of reading process args().
+pub fn parse_list(argv: List[String]):
+    mut pi := 0
+    mut pending_long := ""
+    mut pending_short := ""
+    for arg in argv:
+        if pending_long != "":
+            opts_data = rebuild_with_update(opts_data, pending_long, 3, arg)
+            pending_long = ""
+            continue
+        if pending_short != "":
+            opts_data = rebuild_with_update(opts_data, pending_short, 3, arg)
+            pending_short = ""
+            continue
+        if arg == "--help" or arg == "-h":
+            print(help_text())
+        elif arg.starts_with("--"):
+            name := arg.substring(2, arg.len())
+            eq := find_eq(name)
+            if eq >= 0:
+                oname := name.substring(0, eq)
+                oval := name.substring(eq + 1, name.len())
+                if find_record(opts_data, opt_count, oname) != "":
+                    opts_data = rebuild_with_update(opts_data, oname, 3, oval)
+                else:
+                    add_error("unknown option: --" + oname)
+            elif find_record(flags_data, flag_count, name) != "":
+                flags_data = rebuild_with_update(flags_data, name, 3, "1")
+            elif find_record(opts_data, opt_count, name) != "":
+                pending_long = name
+            else:
+                add_error("unknown option: --" + name)
+        elif arg.starts_with("-") and arg != "-":
+            short := arg.substring(1, arg.len())
+            lf := find_by_short(flags_data, flag_count, short)
+            lo := find_by_short(opts_data, opt_count, short)
+            if lf != "":
+                flags_data = rebuild_with_update(flags_data, lf, 3, "1")
+            elif lo != "":
+                pending_short = lo
+            else:
+                add_error("unknown option: -" + short)
+        else:
+            if pi < pos_count:
+                pos_data = rebuild_with_update_by_index(pos_data, pi, 2, arg)
+                pi = pi + 1
+            else:
+                add_error("unexpected argument: " + arg)
+    if pending_long != "":
+        add_error("--" + pending_long + " requires a value")
+    if pending_short != "":
+        add_error("-" + pending_short + " requires a value")
+
+fn find_eq(s: String) -> Int:
+    mut i := 0
+    while i < s.len():
+        if s[i] == "=":
+            return i
+        i = i + 1
+    return - 1
+
+fn rebuild_with_update_by_index(data: String, rec_idx: Int, field_idx: Int, new_val: String) -> String:
+    recs := get_records(data)
+    mut result := ""
+    for current_rec, i in recs:
+        mut rec := current_rec
+        if i == rec_idx:
+            rec = replace_field(rec, field_idx, new_val)
+        if i > 0:
+            result = result + "~" + rec
+        else:
+            result = rec
+    return result
+
+fn add_error(msg: String):
+    if error_count > 0:
+        sep := error_data + chr(10)
+        error_data = sep + msg
+    else:
+        error_data = msg
+    error_count = error_count + 1
+
+# ===============================================================
+# Querying
+# ===============================================================
+
+# # Return true when a parsed flag was present.
+pub fn get_flag(name: String) -> Bool:
+    rec := find_record(flags_data, flag_count, name)
+    if rec == "":
+        return false
+    return get_field(rec, 3) == "1"
+
+# get the parsed value for an option by long name.
+pub fn get_option(name: String) -> String:
+    rec := find_record(opts_data, opt_count, name)
+    if rec == "":
+        return ""
+    return get_field(rec, 3)
+
+# get the parsed value for a positional argument by name.
+pub fn get_positional(name: String) -> String:
+    rec := find_record(pos_data, pos_count, name)
+    if rec == "":
+        return ""
+    return get_field(rec, 2).trim()
+
+# true when parsing recorded one or more argument errors.
+pub fn has_errors() -> Bool:
+    return error_count > 0
+
+# return all parse errors joined with newlines.
+pub fn get_errors() -> String:
+    return error_data
+
+# ===============================================================
+# Help Text
+# ===============================================================
+
+# # Render usage and argument help text.
+pub fn help_text() -> String:
+    nl := chr(10)
+    mut out := app_name + " - " + app_desc + nl + nl
+
+    mut usage := "Usage: " + app_name
+    mut has_options := false
+    if flag_count > 0:
+        has_options = true
+    if opt_count > 0:
+        has_options = true
+    if has_options:
+        usage = usage + " [options]"
+    if pos_count > 0:
+        precs := get_records(pos_data)
+        for rec in precs:
+            usage = usage + " <" + get_field(rec, 0) + ">"
+    out = out + usage
+
+    if pos_count > 0:
+        out = out + nl + nl + "Arguments:"
+        precs := get_records(pos_data)
+        for rec in precs:
+            pn := get_field(rec, 0)
+            pd := get_field(rec, 1)
+            out = out + nl + "  " + pn + " - " + pd
+
+    if has_options:
+        out = out + nl + nl + "Options:"
+        if flag_count > 0:
+            frecs := get_records(flags_data)
+            for rec in frecs:
+                fn_name := get_field(rec, 0)
+                fs := get_field(rec, 1)
+                fd := get_field(rec, 2)
+                mut label := "  --" + fn_name
+                if fs != "":
+                    label = "  -" + fs + ", --" + fn_name
+                out = out + nl + label + " - " + fd
+        if opt_count > 0:
+            orecs := get_records(opts_data)
+            for rec in orecs:
+                on := get_field(rec, 0)
+                os := get_field(rec, 1)
+                od := get_field(rec, 2)
+                odef := get_field(rec, 3)
+                mut label := "  --" + on + " <value>"
+                if os != "":
+                    label = "  -" + os + ", --" + on + " <value>"
+                mut line := label + " - " + od
+                if odef != "":
+                    line = line + " (default: " + odef + ")"
+                out = out + nl + line
+
+    return out
+
+test "args parses explicit argv lists":
+    init("tool", "does work")
+    add_flag("verbose", "v", "enable verbose output")
+    add_option("output", "o", "output file", "out.txt")
+    add_positional("input", "input file")
+
+    parse_list(["--verbose", "--output=result.txt", "main.pith"])
+
+    assert(get_flag("verbose"))
+    assert_eq(get_option("output"), "result.txt")
+    assert_eq(get_positional("input"), "main.pith")
+    assert(not has_errors())
+
+test "args records unknown options":
+    init("badtool", "does work")
+    parse_list(["--missing"])
+
+    assert(has_errors())
+    assert(get_errors().contains("unknown option: --missing"))

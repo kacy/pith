@@ -1,0 +1,323 @@
+import std.net.http as http
+import std.net.tls as tls
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn alpn_server_config() -> tls.Config!:
+    cfg := tls.server_config(CERT_PATH, KEY_PATH)!
+    return cfg.with_alpn(["pith.echo", "http/1.1"]).enable_session_resumption()
+
+fn alpn_client_config() -> tls.Config!:
+    cfg := tls.client_config_with_ca_file(CA_PATH)!
+    return cfg.with_alpn(["pith.echo", "http/1.1"]).enable_session_resumption()
+
+fn verify_echo_client(state: tls.ConnectionState) -> String:
+    if state.negotiated_protocol != "pith.echo":
+        return "expected pith.echo"
+    if state.peer_common_name != "localhost":
+        return "expected localhost certificate"
+    if state.peer_issuer_common_name != "pith-test-ca":
+        return "expected pith-test-ca issuer"
+    if not state.peer_chain_present:
+        return "expected verified peer certificate"
+    return ""
+
+fn verify_optional_server(state: tls.ConnectionState) -> String:
+    if not state.client_auth_requested:
+        return "expected client auth request"
+    if state.client_auth_verified:
+        return "did not expect a verified client certificate"
+    if state.peer_chain_present:
+        return "did not expect client certificate metadata"
+    return ""
+
+fn reject_client(state: tls.ConnectionState) -> String:
+    if state.negotiated_protocol == "pith.echo":
+        return "intentional tls hook rejection"
+    return ""
+
+fn choose_dynamic_config(info: tls.ClientHelloInfo, dynamic_echo_cfg: tls.Config, dynamic_http_cfg: tls.Config) -> tls.Config:
+    if info.alpn_protocols.contains("pith.dynamic"):
+        return dynamic_echo_cfg
+    return dynamic_http_cfg
+
+fn run_server(port: Int) -> Int!:
+    server_cfg := alpn_server_config()!
+    listener := tls.listen("127.0.0.1", port, server_cfg)!
+
+    echo_conn := listener.accept()!
+    echo_state := echo_conn.state()
+    assert(echo_state.version == 772)
+    assert(echo_state.cipher_suite > 0)
+    assert(echo_state.negotiated_protocol == "pith.echo")
+    assert(not echo_state.did_resume)
+    assert(not echo_state.peer_chain_present)
+    assert(not echo_state.client_auth_requested)
+    assert(not echo_state.client_auth_verified)
+    assert(echo_state.peer_certificates.len() == 0)
+    assert(echo_conn.version_name() == "tls1.3")
+    assert(echo_conn.cipher_suite_name() != "unknown")
+    assert(echo_conn.peer_common_name() == "")
+    msg := echo_conn.read(64)!
+    echo_conn.write_all("echo:" + msg)!
+    echo_conn.close()
+
+    resumed_conn := listener.accept()!
+    resumed_state := resumed_conn.state()
+    assert(resumed_state.did_resume)
+    assert(resumed_state.negotiated_protocol == "pith.echo")
+    resumed_msg := resumed_conn.read(64)!
+    resumed_conn.write_all("echo:" + resumed_msg)!
+    resumed_conn.close()
+
+    http_conn := listener.accept()!
+    req := http_conn.read(2048)!
+    if req.contains("GET /secure HTTP/1.1"):
+        http_conn.write_all("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 12\r\nConnection: close\r\n\r\nhello secure")!
+    else:
+        http_conn.write_all("HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")!
+    http_conn.close()
+
+    rejected_conn := listener.accept()!
+    rejected_conn.close()
+
+    listener.close()
+    server_cfg.close()
+    return 0
+
+fn run_dynamic_select_server(port: Int, base_cfg: tls.Config) -> Int!:
+    listener := tls.listen("127.0.0.1", port, base_cfg)!
+
+    echo_conn := listener.accept()!
+    echo_state := echo_conn.state()
+    assert(echo_state.negotiated_protocol == "pith.dynamic")
+    msg := echo_conn.read(64)!
+    echo_conn.write_all("dynamic:" + msg)!
+    echo_conn.close()
+
+    http_conn := listener.accept()!
+    req := http_conn.read(2048)!
+    if req.contains("GET /dynamic HTTP/1.1"):
+        http_conn.write_all("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: close\r\n\r\ndynamic hello")!
+    else:
+        http_conn.write_all("HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad")!
+    http_conn.close()
+
+    listener.close()
+    base_cfg.close()
+    return 0
+
+fn run_mtls_server(port: Int) -> Int!:
+    server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["pith.mtls"]).require_client_ca_file(CA_PATH)!
+    listener := tls.listen("127.0.0.1", port, server_cfg)!
+    conn := listener.accept()!
+    state := conn.state()
+    assert(state.version == 772)
+    assert(state.negotiated_protocol == "pith.mtls")
+    assert(state.peer_chain_present)
+    assert(state.client_auth_requested)
+    assert(state.client_auth_verified)
+    assert(state.peer_issuer_common_name == "pith-test-ca")
+    assert(state.peer_serial_hex != "")
+    assert(state.peer_not_before != "")
+    assert(state.peer_not_after != "")
+    assert(state.peer_certificate_count > 0)
+    assert(state.peer_certificates.len() == state.peer_certificate_count)
+    assert(state.peer_certificates[0].subject_common_name == "localhost")
+    assert(conn.client_auth_requested())
+    assert(conn.client_auth_verified())
+    assert(conn.peer_common_name() == "localhost")
+    assert(conn.peer_issuer_common_name() == "pith-test-ca")
+    assert(conn.peer_dns_names().contains("localhost"))
+    msg := conn.read(64)!
+    conn.write_all("mtls:" + msg)!
+    conn.close()
+    listener.close()
+    server_cfg.close()
+    return 0
+
+fn run_optional_client_auth_server(port: Int) -> Int!:
+    server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["pith.optional"]).request_client_ca_file(CA_PATH)!.with_verify_connection(verify_optional_server)
+    listener := tls.listen("127.0.0.1", port, server_cfg)!
+    conn := listener.accept()!
+    state := conn.state()
+    assert(state.version == 772)
+    assert(state.negotiated_protocol == "pith.optional")
+    assert(not state.peer_chain_present)
+    assert(state.client_auth_requested)
+    assert(not state.client_auth_verified)
+    assert(conn.client_auth_requested())
+    assert(not conn.client_auth_verified())
+    assert(conn.peer_common_name() == "")
+    assert(conn.peer_dns_names().len() == 0)
+    msg := conn.read(64)!
+    conn.write_all("optional:" + msg)!
+    conn.close()
+    listener.close()
+    server_cfg.close()
+    return 0
+
+fn main() -> Int!:
+    port := choose_port(18942)!
+    server_task := spawn run_server(port)
+    sleep(200)
+
+    client_cfg := alpn_client_config()!.with_verify_connection(verify_echo_client)
+    conn := tls.dial_with_config("127.0.0.1", port, "localhost", client_cfg)!
+    state := conn.state()
+    assert(state.version == 772)
+    assert(state.cipher_suite > 0)
+    assert(state.negotiated_protocol == "pith.echo")
+    assert(not state.did_resume)
+    assert(state.peer_chain_present)
+    assert(not state.client_auth_requested)
+    assert(not state.client_auth_verified)
+    assert(state.peer_issuer_common_name == "pith-test-ca")
+    assert(state.peer_serial_hex != "")
+    assert(state.peer_not_before != "")
+    assert(state.peer_not_after != "")
+    assert(state.peer_certificate_count > 0)
+    assert(state.peer_certificates.len() == state.peer_certificate_count)
+    assert(state.peer_certificates[0].subject_common_name == "localhost")
+    assert(conn.version() == 772)
+    assert(conn.version_name() == "tls1.3")
+    assert(conn.cipher_suite() == state.cipher_suite)
+    assert(conn.cipher_suite_name() != "unknown")
+    assert(conn.peer_chain_present())
+    assert(conn.peer_issuer_common_name() == "pith-test-ca")
+    assert(conn.peer_serial_hex() != "")
+    assert(conn.peer_not_before() != "")
+    assert(conn.peer_not_after() != "")
+    assert(conn.peer_certificate_count() > 0)
+    assert(conn.peer_certificates().len() == conn.peer_certificate_count())
+    assert(conn.peer_certificates()[0].subject_common_name == "localhost")
+    conn.write_all("pith")!
+    assert(conn.read(64)! == "echo:pith")
+    assert(conn.negotiated_protocol() == "pith.echo")
+    assert(conn.peer_common_name() == "localhost")
+    assert(conn.peer_dns_names().contains("localhost"))
+    conn.close()
+
+    resumed_conn := tls.dial_with_config("127.0.0.1", port, "localhost", client_cfg)!
+    resumed_state := resumed_conn.state()
+    assert(resumed_state.did_resume)
+    assert(resumed_state.peer_chain_present)
+    assert(resumed_state.negotiated_protocol == "pith.echo")
+    assert(resumed_state.peer_issuer_common_name == "pith-test-ca")
+    assert(resumed_state.peer_serial_hex != "")
+    assert(resumed_state.peer_certificate_count > 0)
+    assert(resumed_state.peer_certificates.len() == resumed_state.peer_certificate_count)
+    assert(resumed_state.peer_certificates[0].subject_common_name == "localhost")
+    assert(resumed_conn.peer_chain_present())
+    assert(resumed_conn.peer_issuer_common_name() == "pith-test-ca")
+    assert(resumed_conn.peer_serial_hex() != "")
+    assert(resumed_conn.peer_certificate_count() > 0)
+    resumed_conn.write_all("again")!
+    assert(resumed_conn.read(64)! == "echo:again")
+    assert(resumed_conn.did_resume())
+    assert(resumed_conn.peer_common_name() == "localhost")
+    resumed_conn.close()
+
+    http_cfg := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["http/1.1"])
+    res := http.https_request_port("GET", "127.0.0.1", port, "/secure").send_tls_with_config("localhost", http_cfg)!
+    assert(res.status == 200)
+    assert(res.body_text()! == "hello secure")
+    http_cfg.close()
+
+    rejecting_cfg := alpn_client_config()!.with_verify_connection(reject_client)
+    assert(tls.dial_with_config("127.0.0.1", port, "localhost", rejecting_cfg).is_err)
+    rejecting_cfg.close()
+    client_cfg.close()
+
+    await server_task
+
+    mtls_port := choose_port(19142)!
+    mtls_task := spawn run_mtls_server(mtls_port)
+    sleep(200)
+
+    mtls_cfg := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["pith.mtls"]).with_client_certificate(CERT_PATH, KEY_PATH)!
+    mtls_conn := tls.dial_with_config("127.0.0.1", mtls_port, "localhost", mtls_cfg)!
+    mtls_state := mtls_conn.state()
+    assert(mtls_state.negotiated_protocol == "pith.mtls")
+    assert(mtls_state.peer_chain_present)
+    assert(not mtls_state.client_auth_requested)
+    assert(not mtls_state.client_auth_verified)
+    assert(mtls_state.peer_issuer_common_name == "pith-test-ca")
+    assert(mtls_state.peer_certificate_count > 0)
+    assert(mtls_state.peer_certificates.len() == mtls_state.peer_certificate_count)
+    assert(mtls_state.peer_certificates[0].subject_common_name == "localhost")
+    assert(mtls_conn.version_name() == "tls1.3")
+    mtls_conn.write_all("client")!
+    assert(mtls_conn.read(64)! == "mtls:client")
+    assert(mtls_conn.negotiated_protocol() == "pith.mtls")
+    assert(mtls_conn.peer_common_name() == "localhost")
+    assert(mtls_conn.peer_dns_names().contains("localhost"))
+    mtls_conn.close()
+    mtls_cfg.close()
+
+    await mtls_task
+
+    optional_port := choose_port(19342)!
+    optional_task := spawn run_optional_client_auth_server(optional_port)
+    sleep(200)
+
+    optional_cfg := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["pith.optional"])
+    optional_conn := tls.dial_with_config("127.0.0.1", optional_port, "localhost", optional_cfg)!
+    optional_state := optional_conn.state()
+    assert(optional_state.negotiated_protocol == "pith.optional")
+    assert(optional_state.peer_chain_present)
+    assert(not optional_state.client_auth_requested)
+    assert(not optional_state.client_auth_verified)
+    assert(optional_state.peer_issuer_common_name == "pith-test-ca")
+    assert(optional_state.peer_certificate_count > 0)
+    assert(optional_state.peer_certificates.len() == optional_state.peer_certificate_count)
+    assert(optional_state.peer_certificates[0].subject_common_name == "localhost")
+    assert(optional_conn.version_name() == "tls1.3")
+    optional_conn.write_all("guest")!
+    assert(optional_conn.read(64)! == "optional:guest")
+    assert(optional_conn.negotiated_protocol() == "pith.optional")
+    assert(optional_conn.peer_common_name() == "localhost")
+    optional_conn.close()
+    optional_cfg.close()
+
+    await optional_task
+
+    dynamic_echo_cfg := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["pith.dynamic"])
+    dynamic_http_cfg := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["http/1.1"])
+    dynamic_base_cfg := tls.with_config_selector(tls.server_config(CERT_PATH, KEY_PATH)!, fn(info: tls.ClientHelloInfo) => choose_dynamic_config(info, dynamic_echo_cfg, dynamic_http_cfg))
+    dynamic_port := choose_port(19542)!
+    dynamic_task := spawn run_dynamic_select_server(dynamic_port, dynamic_base_cfg)
+    sleep(200)
+
+    dynamic_cfg := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["pith.dynamic"])
+    dynamic_conn := tls.dial_with_config("127.0.0.1", dynamic_port, "localhost", dynamic_cfg)!
+    dynamic_state := dynamic_conn.state()
+    assert(dynamic_state.negotiated_protocol == "pith.dynamic")
+    assert(dynamic_conn.version_name() == "tls1.3")
+    dynamic_conn.write_all("route")!
+    assert(dynamic_conn.read(64)! == "dynamic:route")
+    dynamic_conn.close()
+    dynamic_cfg.close()
+
+    dynamic_http_cfg_client := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["http/1.1"])
+    dynamic_res := http.https_request_port("GET", "127.0.0.1", dynamic_port, "/dynamic").send_tls_with_config("localhost", dynamic_http_cfg_client)!
+    assert(dynamic_res.status == 200)
+    assert(dynamic_res.body_text()! == "dynamic hello")
+    dynamic_http_cfg_client.close()
+
+    await dynamic_task
+    dynamic_echo_cfg.close()
+    dynamic_http_cfg.close()
+    return 0

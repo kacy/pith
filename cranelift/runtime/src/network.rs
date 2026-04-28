@@ -1,9 +1,9 @@
-use crate::bytes::{forge_bytes_from_vec, forge_bytes_ref};
+use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::ffi_util::cstr_to_str;
 
 /// TCP listen — bind and listen on addr:port, return server fd
 #[no_mangle]
-pub unsafe extern "C" fn forge_tcp_listen(addr: *const i8, port: i64) -> i64 {
+pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
     use std::net::TcpListener;
 
     let host = cstr_to_str(addr);
@@ -20,7 +20,7 @@ pub unsafe extern "C" fn forge_tcp_listen(addr: *const i8, port: i64) -> i64 {
 
 /// TCP connect — connect to addr:port, return connection fd
 #[no_mangle]
-pub unsafe extern "C" fn forge_tcp_connect(addr: *const i8, port: i64) -> i64 {
+pub unsafe extern "C" fn pith_tcp_connect(addr: *const i8, port: i64) -> i64 {
     use std::net::TcpStream;
 
     let host = cstr_to_str(addr);
@@ -38,7 +38,7 @@ pub unsafe extern "C" fn forge_tcp_connect(addr: *const i8, port: i64) -> i64 {
 
 /// TCP accept — accept a connection on a server fd, return client fd
 #[no_mangle]
-pub extern "C" fn forge_tcp_accept(server_fd: i64) -> i64 {
+pub extern "C" fn pith_tcp_accept(server_fd: i64) -> i64 {
     if server_fd <= 0 {
         return 0;
     }
@@ -61,7 +61,7 @@ pub extern "C" fn forge_tcp_accept(server_fd: i64) -> i64 {
 
 /// TCP read — read up to 4096 bytes from connection fd, return as C string
 #[no_mangle]
-pub extern "C" fn forge_tcp_read(conn_fd: i64) -> *mut i8 {
+pub extern "C" fn pith_tcp_read(conn_fd: i64) -> *mut i8 {
     use std::io::Read;
     use std::net::TcpStream;
     use std::os::unix::io::FromRawFd;
@@ -75,7 +75,7 @@ pub extern "C" fn forge_tcp_read(conn_fd: i64) -> *mut i8 {
         Ok(n) => {
             buf.truncate(n);
             let s = String::from_utf8_lossy(&buf).to_string();
-            crate::forge_strdup_string(&s)
+            crate::pith_strdup_string(&s)
         }
         Err(_) => std::ptr::null_mut(),
     };
@@ -86,7 +86,7 @@ pub extern "C" fn forge_tcp_read(conn_fd: i64) -> *mut i8 {
 
 /// TCP read with max bytes limit
 #[no_mangle]
-pub extern "C" fn forge_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
+pub extern "C" fn pith_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
     use std::io::Read;
     use std::net::TcpStream;
     use std::os::unix::io::FromRawFd;
@@ -101,7 +101,7 @@ pub extern "C" fn forge_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
         Ok(n) => {
             buf.truncate(n);
             let s = String::from_utf8_lossy(&buf).to_string();
-            crate::forge_strdup_string(&s)
+            crate::pith_strdup_string(&s)
         }
         Err(_) => std::ptr::null_mut(),
     };
@@ -111,7 +111,7 @@ pub extern "C" fn forge_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
 }
 
 #[no_mangle]
-pub extern "C" fn forge_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
+pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
     use std::io::Read;
     use std::net::TcpStream;
     use std::os::unix::io::FromRawFd;
@@ -125,7 +125,7 @@ pub extern "C" fn forge_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
     let result = match stream.read(&mut buf) {
         Ok(n) => {
             buf.truncate(n);
-            forge_bytes_from_vec(buf)
+            pith_bytes_from_vec(buf)
         }
         Err(_) => 0,
     };
@@ -134,7 +134,7 @@ pub extern "C" fn forge_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
     result
 }
 
-fn forge_tcp_wait(fd: i64, events: i16, timeout_ms: i64) -> i64 {
+fn pith_tcp_wait(fd: i64, events: i16, timeout_ms: i64) -> i64 {
     if fd <= 0 {
         return -1;
     }
@@ -174,18 +174,18 @@ fn forge_tcp_wait(fd: i64, events: i16, timeout_ms: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn forge_tcp_wait_readable(fd: i64, timeout_ms: i64) -> i64 {
-    forge_tcp_wait(fd, libc::POLLIN, timeout_ms)
+pub extern "C" fn pith_tcp_wait_readable(fd: i64, timeout_ms: i64) -> i64 {
+    pith_tcp_wait(fd, libc::POLLIN, timeout_ms)
 }
 
 #[no_mangle]
-pub extern "C" fn forge_tcp_wait_writable(fd: i64, timeout_ms: i64) -> i64 {
-    forge_tcp_wait(fd, libc::POLLOUT, timeout_ms)
+pub extern "C" fn pith_tcp_wait_writable(fd: i64, timeout_ms: i64) -> i64 {
+    pith_tcp_wait(fd, libc::POLLOUT, timeout_ms)
 }
 
 /// TCP write — write data to connection fd, return bytes written
 #[no_mangle]
-pub unsafe extern "C" fn forge_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
     use std::io::Write;
     use std::net::TcpStream;
     use std::os::unix::io::FromRawFd;
@@ -206,12 +206,12 @@ pub unsafe extern "C" fn forge_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_tcp_write_bytes(conn_fd: i64, data: i64) -> i64 {
+pub unsafe extern "C" fn pith_tcp_write_bytes(conn_fd: i64, data: i64) -> i64 {
     use std::io::Write;
     use std::net::TcpStream;
     use std::os::unix::io::FromRawFd;
 
-    let Some(bytes) = forge_bytes_ref(data) else {
+    let Some(bytes) = pith_bytes_ref(data) else {
         return 0;
     };
     if conn_fd <= 0 {
@@ -229,7 +229,7 @@ pub unsafe extern "C" fn forge_tcp_write_bytes(conn_fd: i64, data: i64) -> i64 {
 
 /// TCP set read timeout in milliseconds (0 = no timeout)
 #[no_mangle]
-pub extern "C" fn forge_tcp_set_timeout(fd: i64, ms: i64) {
+pub extern "C" fn pith_tcp_set_timeout(fd: i64, ms: i64) {
     if fd < 0 {
         return;
     }
@@ -249,7 +249,7 @@ pub extern "C" fn forge_tcp_set_timeout(fd: i64, ms: i64) {
 
 /// TCP close — close the file descriptor
 #[no_mangle]
-pub extern "C" fn forge_tcp_close(fd: i64) {
+pub extern "C" fn pith_tcp_close(fd: i64) {
     if fd <= 0 {
         return;
     }
@@ -260,7 +260,7 @@ pub extern "C" fn forge_tcp_close(fd: i64) {
 
 /// DNS resolve — resolve hostname to IP address string
 #[no_mangle]
-pub unsafe extern "C" fn forge_dns_resolve(hostname: *const i8) -> *mut i8 {
+pub unsafe extern "C" fn pith_dns_resolve(hostname: *const i8) -> *mut i8 {
     use std::net::ToSocketAddrs;
 
     if hostname.is_null() {
@@ -271,7 +271,7 @@ pub unsafe extern "C" fn forge_dns_resolve(hostname: *const i8) -> *mut i8 {
     match addr_str.to_socket_addrs() {
         Ok(mut addrs) => {
             if let Some(addr) = addrs.next() {
-                crate::forge_strdup_string(&addr.ip().to_string())
+                crate::pith_strdup_string(&addr.ip().to_string())
             } else {
                 std::ptr::null_mut()
             }

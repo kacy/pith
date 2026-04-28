@@ -1,0 +1,20 @@
+import std.os as os
+import std.os.process as process
+
+fn main() -> Int!:
+    print(process.command("printf").args(["%s|%s|%s", "a b", "", "c"]).output()!.stdout)
+
+    print(process.command("definitely_missing_pith_cmd_xyz").output().is_err.to_string())
+    print(process.command("pwd").cwd("/definitely/missing/pith/cwd").output().is_err.to_string())
+
+    os.set_env("PITH_PROCESS_PARENT_ENV", "outer")
+    inherited := process.command("env").output()!
+    print(inherited.stdout.contains("PITH_PROCESS_PARENT_ENV=outer").to_string())
+
+    overridden := process.command("env").env("PITH_PROCESS_PARENT_ENV", "inner").output()!
+    print(overridden.stdout.contains("PITH_PROCESS_PARENT_ENV=inner").to_string())
+
+    os.unset_env("PITH_PROCESS_PARENT_ENV")
+    unset_out := process.command("env").output()!
+    print(unset_out.stdout.contains("PITH_PROCESS_PARENT_ENV=").to_string())
+    return 0

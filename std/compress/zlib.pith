@@ -1,0 +1,247 @@
+# std.compress.zlib — zlib helpers
+#
+# this writes portable zlib streams with stored deflate blocks. like the
+# gzip module, this first slice favors compatibility over smaller output.
+
+import std.bytes as bytes
+import std.binary as binary
+import std.bits as bits
+import std.checksum as checksum
+import std.fs as fs
+import std.os.path as path
+from std.bytes import ByteBuffer
+
+ZLIB_STORED_BLOCK_SIZE := 65535
+ZLIB_COMPRESSION_METHOD_DEFLATE := 8
+ZLIB_FLAG_DICT := 32
+
+fn zlib_invalid() -> String:
+    return "invalid zlib data"
+
+fn zlib_read_u8_at(data: Bytes, offset: Int) -> Int!:
+    value := binary.read_u8_at(data, offset)
+    if value.is_err:
+        fail zlib_invalid()
+    return value.ok
+
+fn zlib_read_u16_le_at(data: Bytes, offset: Int) -> Int!:
+    value := binary.read_u16_le_at(data, offset)
+    if value.is_err:
+        fail zlib_invalid()
+    return value.ok
+
+fn zlib_read_u32_be_at(data: Bytes, offset: Int) -> Int!:
+    value := binary.read_u32_be_at(data, offset)
+    if value.is_err:
+        fail zlib_invalid()
+    return value.ok
+
+fn zlib_write_u8(out: ByteBuffer, value: Int) -> Int!:
+    wrote := binary.write_u8(out, value)
+    if wrote.is_err:
+        fail wrote.err.message
+    return wrote.ok
+
+fn zlib_write_u16_le(out: ByteBuffer, value: Int) -> Int!:
+    wrote := binary.write_u16_le(out, value)
+    if wrote.is_err:
+        fail wrote.err.message
+    return wrote.ok
+
+fn zlib_write_u32_be(out: ByteBuffer, value: Int) -> Int!:
+    wrote := binary.write_u32_be(out, value)
+    if wrote.is_err:
+        fail wrote.err.message
+    return wrote.ok
+
+fn zlib_write_header(out: ByteBuffer) -> Int!:
+    mut total := zlib_write_u8(out, 120)!
+    return total + zlib_write_u8(out, 1)!
+
+fn zlib_write_stored_block(out: ByteBuffer, is_final: Bool, data: Bytes) -> Int!:
+    mut total := 0
+    if is_final:
+        total = total + zlib_write_u8(out, 1)!
+    else:
+        total = total + zlib_write_u8(out, 0)!
+    total = total + zlib_write_u16_le(out, data.len())!
+    total = total + zlib_write_u16_le(out, ZLIB_STORED_BLOCK_SIZE - data.len())!
+    if data.len() == 0:
+        return total
+    return total + out.write(data)!
+
+fn zlib_parse_header(data: Bytes) -> Int!:
+    if data.len() < 6:
+        fail zlib_invalid()
+    cmf := zlib_read_u8_at(data, 0)!
+    flg := zlib_read_u8_at(data, 1)!
+    method := bits.band(cmf, 15)
+    cinfo := bits.shr(cmf, 4)
+    if method != ZLIB_COMPRESSION_METHOD_DEFLATE:
+        fail zlib_invalid()
+    if cinfo > 7:
+        fail zlib_invalid()
+    if bits.band(flg, ZLIB_FLAG_DICT) != 0:
+        fail zlib_invalid()
+    if (cmf * 256 + flg) % 31 != 0:
+        fail zlib_invalid()
+    return 2
+
+fn zlib_decompress_stored(data: Bytes) -> Bytes!:
+    mut pos := zlib_parse_header(data)!
+    out := bytes.buffer()
+    deflate_limit := data.len() - 4
+    while true:
+        if pos + 1 > deflate_limit:
+            fail zlib_invalid()
+        block_header := zlib_read_u8_at(data, pos)!
+        pos = pos + 1
+        is_final := bits.band(block_header, 1) != 0
+        block_type := bits.band(bits.shr(block_header, 1), 3)
+        if block_type != 0:
+            fail zlib_invalid()
+        if pos + 4 > deflate_limit:
+            fail zlib_invalid()
+        block_len := zlib_read_u16_le_at(data, pos)!
+        block_nlen := zlib_read_u16_le_at(data, pos + 2)!
+        pos = pos + 4
+        if block_len + block_nlen != ZLIB_STORED_BLOCK_SIZE:
+            fail zlib_invalid()
+        if pos + block_len > deflate_limit:
+            fail zlib_invalid()
+        if block_len > 0:
+            out.write(data.slice(pos, pos + block_len))!
+        pos = pos + block_len
+        if is_final:
+            break
+    if pos + 4 != data.len():
+        fail zlib_invalid()
+    result := out.bytes()
+    expected_adler := zlib_read_u32_be_at(data, pos)!
+    if checksum.adler32(result) != expected_adler:
+        fail zlib_invalid()
+    return result
+
+fn zlib_compress_result(data: Bytes) -> Bytes!:
+    out := bytes.buffer_with_capacity(2 + data.len() + 5 + 4)
+    zlib_write_header(out)!
+    if data.len() == 0:
+        zlib_write_stored_block(out, true, data)!
+    else:
+        mut offset := 0
+        while offset < data.len():
+            mut end := offset + ZLIB_STORED_BLOCK_SIZE
+            if end > data.len():
+                end = data.len()
+            chunk := data.slice(offset, end)
+            zlib_write_stored_block(out, end == data.len(), chunk)!
+            offset = end
+    zlib_write_u32_be(out, checksum.adler32(data))!
+    return out.bytes()
+
+# compress bytes into a zlib stream.
+pub fn compress(data: Bytes) -> Bytes:
+    return zlib_compress_result(data) catch bytes.empty()
+
+# decompress a zlib stream created with stored deflate blocks.
+pub fn decompress(data: Bytes) -> Bytes!:
+    return zlib_decompress_stored(data)
+
+# true when the data is a zlib stream this module can read.
+pub fn is_valid(data: Bytes) -> Bool:
+    result := zlib_decompress_stored(data)
+    return result.is_ok
+
+# compress utf-8 text into zlib bytes.
+pub fn compress_string(text: String) -> Bytes:
+    return compress(bytes.from_string_utf8(text))
+
+# decompress zlib bytes and decode the result as utf-8 text.
+pub fn decompress_string(data: Bytes) -> String!:
+    return decompress(data)!.to_string_utf8()!
+
+# read one file, zlib it, and write the output file.
+pub fn compress_file(from_path: String, to_path: String) -> Bool!:
+    source := fs.read_bytes(from_path)!
+    return fs.write_bytes(to_path, compress(source))
+
+# read one zlib file, decompress it, and write the output file.
+pub fn decompress_file(from_path: String, to_path: String) -> Bool!:
+    archive := fs.read_bytes(from_path)!
+    return fs.write_bytes(to_path, decompress(archive)!)
+
+test "zlib round trips bytes and strings":
+    data := bytes.from_string_utf8("pith zlib data")
+    compressed := compress(data)
+
+    assert(compressed.len() > data.len())
+    assert(is_valid(compressed))
+    assert_eq(decompress(compressed)!.to_string_utf8()!, "pith zlib data")
+    assert_eq(decompress_string(compress_string("hello zlib"))!, "hello zlib")
+
+test "zlib reads a stored deflate fixture":
+    fixture_buf := bytes.buffer()
+    fixture_buf.write_byte(120)!
+    fixture_buf.write_byte(1)!
+    fixture_buf.write_byte(1)!
+    fixture_buf.write_byte(5)!
+    fixture_buf.write_byte(0)!
+    fixture_buf.write_byte(250)!
+    fixture_buf.write_byte(255)!
+    fixture_buf.write_string_utf8("hello")!
+    fixture_buf.write_byte(6)!
+    fixture_buf.write_byte(44)!
+    fixture_buf.write_byte(2)!
+    fixture_buf.write_byte(21)!
+    fixture := fixture_buf.bytes()
+
+    assert(is_valid(fixture))
+    assert_eq(decompress(fixture)!.to_string_utf8()!, "hello")
+
+test "zlib rejects invalid input":
+    bad := bytes.from_string_utf8("not zlib")
+    bad_buf := bytes.buffer()
+    bad_buf.write_byte(120)!
+    bad_buf.write_byte(1)!
+    bad_buf.write_byte(1)!
+    bad_buf.write_byte(5)!
+    bad_buf.write_byte(0)!
+    bad_buf.write_byte(250)!
+    bad_buf.write_byte(255)!
+    bad_buf.write_string_utf8("hello")!
+    bad_buf.write_byte(0)!
+    bad_buf.write_byte(0)!
+    bad_buf.write_byte(0)!
+    bad_buf.write_byte(0)!
+    bad_checksum := bad_buf.bytes()
+
+    assert(not is_valid(bad))
+    assert(decompress(bad).is_err)
+    assert(not is_valid(bad_checksum))
+    assert(decompress(bad_checksum).is_err)
+
+test "zlib handles empty large and file round trips":
+    empty_roundtrip := decompress(compress(bytes.empty()))!
+    assert(empty_roundtrip.is_empty())
+
+    large := bytes.buffer_with_capacity(66000)
+    mut i := 0
+    while i < 66000:
+        large.write_byte(65)!
+        i = i + 1
+    large_data := large.bytes()
+    large_archive := compress(large_data)
+    large_roundtrip := decompress(large_archive)!
+    assert(is_valid(large_archive))
+    assert_eq(large_roundtrip.len(), 66000)
+    assert(bytes.eq(large_data, large_roundtrip))
+
+    root := fs.make_temp_dir("pith-zlib-")!
+    source := path.join(root, "source.txt")
+    archive := path.join(root, "source.txt.zlib")
+    output := path.join(root, "output.txt")
+    assert(fs.write(source, "archive-data")!)
+    assert(compress_file(source, archive)!)
+    assert(decompress_file(archive, output)!)
+    assert_eq(fs.read(output)!, "archive-data")
+    assert(fs.remove_tree(root))

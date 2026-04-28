@@ -1,0 +1,28 @@
+from ast import reset_arena
+from checker import initialize_checker, c_register_all, current_scope
+from lexer import lex_all
+from parser import parse
+from scope import lookup_binding
+from types import get_type_info
+
+fn main() -> String!:
+    source := read_file("examples/hello.pith")!
+    reset_arena()
+    root := parse(lex_all(source))
+    initialize_checker("examples/hello.pith")
+    c_register_all(root)
+
+    greet_tid := lookup_binding(current_scope, "greet")
+    print_tid := lookup_binding(current_scope, "print")
+    print(greet_tid.to_string())
+    print(print_tid.to_string())
+
+    greet_info := get_type_info(greet_tid)
+    print_info := get_type_info(print_tid)
+    print(greet_info.kind)
+    print(print_info.kind)
+    print(greet_info.param_types.len().to_string())
+    print(greet_info.return_type.to_string())
+    print(print_info.param_types.len().to_string())
+    print(print_info.return_type.to_string())
+    return ""

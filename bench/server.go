@@ -11,7 +11,7 @@ import (
 )
 
 // singleConnListener wraps a net.Listener to handle one connection at a time
-// (no goroutines per connection) for fair comparison with Forge's sequential model
+// (no goroutines per connection) for fair comparison with Pith's sequential model
 type singleConnListener struct {
 	ln net.Listener
 }
@@ -67,7 +67,7 @@ func main() {
 	}
 	fmt.Println("Go server on :9001")
 
-	// Serve sequentially (one connection at a time, like Forge)
+	// Serve sequentially (one connection at a time, like Pith)
 	srv := &http.Server{Handler: mux}
 	srv.SetKeepAlivesEnabled(false)
 	srv.Serve(ln)

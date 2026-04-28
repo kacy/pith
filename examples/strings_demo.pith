@@ -1,0 +1,84 @@
+# String library demonstration
+#
+# Shows usage of std/strings module functions
+
+from std.strings import is_digit, is_alpha, is_space
+from std.strings import trim_left, trim_right
+from std.strings import capitalize, title, swap_case
+from std.strings import count, split_lines, partition
+from std.strings import remove_prefix, remove_suffix, strip_prefix, strip_suffix
+from std.strings import reverse, center, zfill
+from std.strings import first_n, last_n
+from std.strings import split_nonempty, join_nonempty, unlines
+from std.strings import collapse_whitespace, starts_with_any, ends_with_any
+from std.strings import common_prefix, common_suffix, indent_nonempty
+import std.io as io
+
+fn print_line(label: String, value: String) -> String!:
+    out := io.string_buffer()
+    out.write(label)!
+    out.write(value)!
+    print(out.string())
+    return ""
+
+fn main() -> String!:
+    print("=== Character Classification ===")
+    print("is_digit('5'): {is_digit("5")}")
+    print("is_alpha('a'): {is_alpha("a")}")
+    print("is_space(' '): {is_space(" ")}")
+    
+    print("\n=== Trim Variants ===")
+    print_line("trim_left('  hello  '): '", trim_left("  hello  ") + "'")!
+    print_line("trim_right('  hello  '): '", trim_right("  hello  ") + "'")!
+    
+    print("\n=== Case Conversions ===")
+    print_line("capitalize('hello'): '", capitalize("hello") + "'")!
+    print_line("title('hello world'): '", title("hello world") + "'")!
+    print_line("swap_case('Hello'): '", swap_case("Hello") + "'")!
+    
+    print("\n=== Counting ===")
+    print("count('hello hello', 'hello'): {count("hello hello", "hello")}")
+    
+    print("\n=== Splitting ===")
+    mut lines := split_lines("line1\nline2\nline3")
+    print("split_lines result:")
+    for line in lines:
+        print("  - '" + line + "'")
+    
+    print("\n=== Partition ===")
+    mut parts := partition("key=value", "=")
+    print("partition('key=value', '='):")
+    print_line("  head: '", parts[0] + "'")!
+    print_line("  sep: '", parts[1] + "'")!
+    print_line("  tail: '", parts[2] + "'")!
+    
+    print("\n=== Removal ===")
+    print_line("remove_prefix('test.txt', 'test.'): '", remove_prefix("test.txt", "test.") + "'")!
+    print_line("remove_suffix('image.png', '.png'): '", remove_suffix("image.png", ".png") + "'")!
+    print_line("strip_prefix('prefix-value', 'prefix-'): '", strip_prefix("prefix-value", "prefix-") + "'")!
+    print_line("strip_suffix('value.txt', '.txt'): '", strip_suffix("value.txt", ".txt") + "'")!
+
+    print("\n=== Reversal ===")
+    print_line("reverse('hello'): '", reverse("hello") + "'")!
+    
+    print("\n=== Padding ===")
+    print_line("center('hi', 6): '", center("hi", 6) + "'")!
+    print_line("zfill('42', 5): '", zfill("42", 5) + "'")!
+    
+    print("\n=== Extraction ===")
+    print_line("first_n('hello', 3): '", first_n("hello", 3) + "'")!
+    print_line("last_n('hello', 2): '", last_n("hello", 2) + "'")!
+
+    print("\n=== Text Helpers ===")
+    print_line("split_nonempty('a,,b,c,', ','): '", split_nonempty("a,,b,c,", ",").join("|") + "'")!
+    print_line("join_nonempty(['a', '', 'b'], ','): '", join_nonempty(["a", "", "b"], ",") + "'")!
+    print_line("unlines(['x', 'y']): '", unlines(["x", "y"]) + "'")!
+    print_line("collapse_whitespace(' a\\tb\\nc '): '", collapse_whitespace(" a" + chr(9) + "b" + chr(10) + "c ") + "'")!
+    print("starts_with_any('pith.toml'): {starts_with_any("pith.toml", ["pith", "zig"])}")
+    print("ends_with_any('archive.tar.gz'): {ends_with_any("archive.tar.gz", [".zip", ".gz"])}")
+    print_line("common_prefix([...]): '", common_prefix(["pith.toml", "pith.lock", "pith.json"]) + "'")!
+    print_line("common_suffix([...]): '", common_suffix(["build.log", "debug.log", "trace.log"]) + "'")!
+    print_line("indent_nonempty('a\\\\n\\\\nb', '> '): '", indent_nonempty("a" + chr(10) + chr(10) + "b", "> ").replace(chr(10), "|") + "'")!
+    
+    print("\n=== All demonstrations complete! ===")
+    return ""

@@ -1,0 +1,58 @@
+# std.crypto.aead - authenticated encryption helpers
+#
+# these wrappers are small runtime-backed crypto kernels used by native tls.
+
+import std.bytes as bytes
+import std.encoding as encoding
+
+fn check_len(data: Bytes, expected: Int, name: String) -> Bool!:
+    if data.len() != expected:
+        fail name + " must be " + expected.to_string() + " bytes"
+    return true
+
+# seal with aes-128-gcm. the result is ciphertext followed by the 16 byte tag.
+pub fn aes_128_gcm_seal(key: Bytes, nonce: Bytes, aad: Bytes, plaintext: Bytes) -> Bytes!:
+    check_len(key, 16, "aes-128-gcm key")!
+    check_len(nonce, 12, "aes-gcm nonce")!
+    return crypto_aes_128_gcm_seal(key, nonce, aad, plaintext)!
+
+# open aes-128-gcm ciphertext with its tag appended.
+pub fn aes_128_gcm_open(key: Bytes, nonce: Bytes, aad: Bytes, ciphertext: Bytes) -> Bytes!:
+    check_len(key, 16, "aes-128-gcm key")!
+    check_len(nonce, 12, "aes-gcm nonce")!
+    return crypto_aes_128_gcm_open(key, nonce, aad, ciphertext)!
+
+# seal with chacha20-poly1305. the result is ciphertext followed by the 16 byte tag.
+pub fn chacha20_poly1305_seal(key: Bytes, nonce: Bytes, aad: Bytes, plaintext: Bytes) -> Bytes!:
+    check_len(key, 32, "chacha20-poly1305 key")!
+    check_len(nonce, 12, "chacha20-poly1305 nonce")!
+    return crypto_chacha20_poly1305_seal(key, nonce, aad, plaintext)!
+
+# open chacha20-poly1305 ciphertext with its tag appended.
+pub fn chacha20_poly1305_open(key: Bytes, nonce: Bytes, aad: Bytes, ciphertext: Bytes) -> Bytes!:
+    check_len(key, 32, "chacha20-poly1305 key")!
+    check_len(nonce, 12, "chacha20-poly1305 nonce")!
+    return crypto_chacha20_poly1305_open(key, nonce, aad, ciphertext)!
+
+test "aes-128-gcm matches the empty nist vector":
+    key := encoding.from_hex("00000000000000000000000000000000")!
+    nonce := encoding.from_hex("000000000000000000000000")!
+    sealed := aes_128_gcm_seal(key, nonce, bytes.empty(), bytes.empty())!
+
+    assert_eq(encoding.to_hex(sealed), "58e2fccefa7e3061367f1d57a4e7455a")
+    assert_eq(aes_128_gcm_open(key, nonce, bytes.empty(), sealed)!.len(), 0)
+
+test "chacha20-poly1305 round trips and rejects bad tags":
+    key := encoding.from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")!
+    nonce := encoding.from_hex("000000000001020304050607")!
+    aad := bytes.from_string_utf8("header")
+    plaintext := bytes.from_string_utf8("pith tls")
+    sealed := chacha20_poly1305_seal(key, nonce, aad, plaintext)!
+    tampered := sealed.slice(0, sealed.len() - 1).concat(bytes.from_string_utf8(chr(0)))
+
+    assert_eq(chacha20_poly1305_open(key, nonce, aad, sealed)!.to_string_utf8()!, "pith tls")
+    assert(chacha20_poly1305_open(key, nonce, aad, tampered).is_err)
+
+test "aead wrappers reject invalid lengths":
+    assert(aes_128_gcm_seal(bytes.empty(), bytes.empty(), bytes.empty(), bytes.empty()).is_err)
+    assert(chacha20_poly1305_seal(bytes.empty(), bytes.empty(), bytes.empty(), bytes.empty()).is_err)

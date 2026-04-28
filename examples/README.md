@@ -1,4 +1,4 @@
-This directory is for user-facing Forge demos.
+This directory is for user-facing Pith demos.
 
 - keep small, browseable example programs here
 - keep deterministic output snapshots in `expected/`

@@ -1,0 +1,26 @@
+from std.net.http import parse_request, method, path, query, version, get_header
+from std.net.http import body
+
+fn main():
+    crlf := chr(13) + chr(10)
+    mut raw := "GET /search?q=pith&lang=en HTTP/1.1" + crlf
+    raw = raw + "Host: example.com" + crlf
+    raw = raw + "User-Agent: PithTest/1.0" + crlf
+    raw = raw + crlf
+    packed := parse_request(raw)
+    print(packed)
+    print("m=" + method(packed))
+    print("p=" + path(packed))
+    print("q=" + query(packed))
+    print("v=" + version(packed))
+    print("h=" + get_header(packed, "Host"))
+
+    mut raw2 := "POST /api/data HTTP/1.1" + crlf
+    raw2 = raw2 + "Content-Type: application/json" + crlf
+    raw2 = raw2 + crlf
+    raw2 = raw2 + "hello post body"
+    packed2 := parse_request(raw2)
+    print(packed2)
+    print("pm=" + method(packed2))
+    print("pp=" + path(packed2))
+    print("pb=" + body(packed2))

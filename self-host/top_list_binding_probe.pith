@@ -1,0 +1,27 @@
+from ast import reset_arena, get_node
+from checker import initialize_checker, c_register_all, c_check_all, current_scope
+from lexer import lex_all
+from parser import parse
+from scope import lookup_binding
+from types import get_type_info
+
+fn main() -> String!:
+    source := read_file("self-host/top_list_binding_probe_src.pith")!
+    reset_arena()
+    root := parse(lex_all(source))
+    root_node := get_node(root)
+    if root_node.children.len() > 0:
+        child := get_node(root_node.children[0])
+        print(child.kind)
+        print(child.value)
+    initialize_checker("self-host/top_list_binding_probe_src.pith")
+    c_register_all(root)
+    c_check_all(root)
+    print(current_scope.to_string())
+    tid := lookup_binding(0, "xs")
+    print(tid.to_string())
+    print(lookup_binding(0, "").to_string())
+    info := get_type_info(tid)
+    print(info.kind)
+    print(info.inner.to_string())
+    return ""

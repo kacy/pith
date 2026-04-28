@@ -1,6 +1,6 @@
 unsafe fn alloc_parse_int_result(is_ok: i64, ok: i64, err: i64) -> i64 {
-    // this matches forge's heap result tuple layout: [is_ok, ok, err].
-    let tuple = crate::forge_struct_alloc(3) as *mut i64;
+    // this matches pith's heap result tuple layout: [is_ok, ok, err].
+    let tuple = crate::pith_struct_alloc(3) as *mut i64;
     if tuple.is_null() {
         return 0;
     }
@@ -11,7 +11,7 @@ unsafe fn alloc_parse_int_result(is_ok: i64, ok: i64, err: i64) -> i64 {
 }
 
 unsafe fn parse_int_error(message: &[u8]) -> i64 {
-    let err = crate::forge_copy_bytes_to_cstring(message) as i64;
+    let err = crate::pith_copy_bytes_to_cstring(message) as i64;
     alloc_parse_int_result(0, 0, err)
 }
 
@@ -20,11 +20,11 @@ unsafe fn parse_int_error(message: &[u8]) -> i64 {
 /// # Safety
 /// s must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_parse_int(s: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
     if s.is_null() {
         return parse_int_error(b"invalid integer");
     }
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     let slice = std::slice::from_raw_parts(s as *const u8, len);
     let mut start = 0;
     let mut end = len;
@@ -77,11 +77,11 @@ pub unsafe extern "C" fn forge_parse_int(s: *const i8) -> i64 {
 /// # Safety
 /// s must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_parse_float(s: *const i8) -> f64 {
+pub unsafe extern "C" fn pith_parse_float(s: *const i8) -> f64 {
     if s.is_null() {
         return 0.0;
     }
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     let slice = std::slice::from_raw_parts(s as *const u8, len);
     if let Ok(str_ref) = std::str::from_utf8(slice) {
         str_ref.trim().parse::<f64>().unwrap_or(0.0)
@@ -95,14 +95,14 @@ pub unsafe extern "C" fn forge_parse_float(s: *const i8) -> f64 {
 /// # Safety
 /// s must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_b64_encode(s: *const i8) -> *mut i8 {
+pub unsafe extern "C" fn pith_b64_encode(s: *const i8) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     if s.is_null() {
         return std::ptr::null_mut();
     }
 
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     let input = std::slice::from_raw_parts(s as *const u8, len);
 
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -143,14 +143,14 @@ pub unsafe extern "C" fn forge_b64_encode(s: *const i8) -> *mut i8 {
 /// # Safety
 /// s must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_hex_encode(s: *const i8) -> *mut i8 {
+pub unsafe extern "C" fn pith_hex_encode(s: *const i8) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     if s.is_null() {
         return std::ptr::null_mut();
     }
 
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     let input = std::slice::from_raw_parts(s as *const u8, len);
     let hex_len = len * 2 + 1;
     let layout = Layout::from_size_align(hex_len, 1).unwrap();
@@ -174,14 +174,14 @@ pub unsafe extern "C" fn forge_hex_encode(s: *const i8) -> *mut i8 {
 /// # Safety
 /// s must be a valid null-terminated C string of hex digits
 #[no_mangle]
-pub unsafe extern "C" fn forge_from_hex(s: *const i8) -> *mut i8 {
+pub unsafe extern "C" fn pith_from_hex(s: *const i8) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     if s.is_null() {
         return std::ptr::null_mut();
     }
 
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     if len % 2 != 0 {
         return std::ptr::null_mut();
     }
@@ -215,7 +215,7 @@ fn hex_digit(b: u8) -> u8 {
 /// # Safety
 /// Returns heap-allocated null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_int_to_hex(n: i64) -> *mut i8 {
+pub unsafe extern "C" fn pith_int_to_hex(n: i64) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     let s = format!("{:x}", n);
@@ -234,7 +234,7 @@ pub unsafe extern "C" fn forge_int_to_hex(n: i64) -> *mut i8 {
 /// # Safety
 /// Returns heap-allocated null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_int_to_oct(n: i64) -> *mut i8 {
+pub unsafe extern "C" fn pith_int_to_oct(n: i64) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     let s = format!("{:o}", n);
@@ -253,7 +253,7 @@ pub unsafe extern "C" fn forge_int_to_oct(n: i64) -> *mut i8 {
 /// # Safety
 /// Returns heap-allocated null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_int_to_bin(n: i64) -> *mut i8 {
+pub unsafe extern "C" fn pith_int_to_bin(n: i64) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     let s = format!("{:b}", n);
@@ -272,7 +272,7 @@ pub unsafe extern "C" fn forge_int_to_bin(n: i64) -> *mut i8 {
 /// # Safety
 /// s must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_sha256(s: *const i8) -> *mut i8 {
+pub unsafe extern "C" fn pith_sha256(s: *const i8) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     if s.is_null() {
@@ -286,7 +286,7 @@ pub unsafe extern "C" fn forge_sha256(s: *const i8) -> *mut i8 {
         return ptr;
     }
 
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     let input = std::slice::from_raw_parts(s as *const u8, len);
 
     let hash = sha256_compute(input);
@@ -397,12 +397,12 @@ fn sha256_compute(data: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::forge_parse_int;
+    use super::pith_parse_int;
     use std::ffi::CString;
 
     fn parse(input: &str) -> (bool, i64) {
         let c_input = CString::new(input).unwrap();
-        let tuple = unsafe { forge_parse_int(c_input.as_ptr()) as *const i64 };
+        let tuple = unsafe { pith_parse_int(c_input.as_ptr()) as *const i64 };
         assert!(!tuple.is_null());
         let is_ok = unsafe { *tuple } != 0;
         let value = unsafe { *tuple.add(1) };

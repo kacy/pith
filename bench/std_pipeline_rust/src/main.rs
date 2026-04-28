@@ -231,7 +231,7 @@ fn print_metric(name: &str, value: i64) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let records = records_from_args();
     let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let work_dir: PathBuf = env::temp_dir().join(format!("forge-std-pipeline-{unique}"));
+    let work_dir: PathBuf = env::temp_dir().join(format!("pith-std-pipeline-{unique}"));
     fs::create_dir_all(&work_dir)?;
     let csv_path = work_dir.join("input.csv");
     let json_path = work_dir.join("report.json");

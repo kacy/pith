@@ -15,11 +15,11 @@ struct ChannelState {
     sender_waiting: usize,
 }
 
-pub type ForgeChannelHandle = Arc<(Mutex<ChannelState>, Condvar)>;
+pub type PithChannelHandle = Arc<(Mutex<ChannelState>, Condvar)>;
 
 fn optional_tuple(is_some: bool, value: i64) -> i64 {
     unsafe {
-        let tuple = crate::forge_struct_alloc(2);
+        let tuple = crate::pith_struct_alloc(2);
         if tuple == 0 {
             return 0;
         }
@@ -31,7 +31,7 @@ fn optional_tuple(is_some: bool, value: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn forge_channel_new(capacity: i64) -> i64 {
+pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
     let cap = capacity.max(0) as usize;
     let state = ChannelState {
         queue: VecDeque::new(),
@@ -46,11 +46,11 @@ pub extern "C" fn forge_channel_new(capacity: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_channel_send(handle: i64, value: i64) -> i64 {
+pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
     if handle == 0 {
         return 0;
     }
-    let channel = &*(handle as *mut ForgeChannelHandle);
+    let channel = &*(handle as *mut PithChannelHandle);
     let (lock, cvar) = &**channel;
     let mut state = lock.lock().unwrap();
 
@@ -91,11 +91,11 @@ pub unsafe extern "C" fn forge_channel_send(handle: i64, value: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_channel_try_send(handle: i64, value: i64) -> i64 {
+pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
     if handle == 0 {
         return 0;
     }
-    let channel = &*(handle as *mut ForgeChannelHandle);
+    let channel = &*(handle as *mut PithChannelHandle);
     let (lock, cvar) = &**channel;
     let mut state = lock.lock().unwrap();
 
@@ -121,11 +121,11 @@ pub unsafe extern "C" fn forge_channel_try_send(handle: i64, value: i64) -> i64 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_channel_recv(handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
     if handle == 0 {
         return optional_tuple(false, 0);
     }
-    let channel = &*(handle as *mut ForgeChannelHandle);
+    let channel = &*(handle as *mut PithChannelHandle);
     let (lock, cvar) = &**channel;
     let mut state = lock.lock().unwrap();
 
@@ -154,11 +154,11 @@ pub unsafe extern "C" fn forge_channel_recv(handle: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_channel_try_recv(handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
     if handle == 0 {
         return optional_tuple(false, 0);
     }
-    let channel = &*(handle as *mut ForgeChannelHandle);
+    let channel = &*(handle as *mut PithChannelHandle);
     let (lock, cvar) = &**channel;
     let mut state = lock.lock().unwrap();
 
@@ -176,11 +176,11 @@ pub unsafe extern "C" fn forge_channel_try_recv(handle: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_channel_close(handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
     if handle == 0 {
         return 0;
     }
-    let channel = &*(handle as *mut ForgeChannelHandle);
+    let channel = &*(handle as *mut PithChannelHandle);
     let (lock, cvar) = &**channel;
     let mut state = lock.lock().unwrap();
     if state.closed {
@@ -193,40 +193,40 @@ pub unsafe extern "C" fn forge_channel_close(handle: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_channel_len(handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
     if handle == 0 {
         return 0;
     }
-    let channel = &*(handle as *mut ForgeChannelHandle);
+    let channel = &*(handle as *mut PithChannelHandle);
     let (lock, _) = &**channel;
     let state = lock.lock().unwrap();
     state.queue.len() as i64
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_channel_cap(handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_channel_cap(handle: i64) -> i64 {
     if handle == 0 {
         return 0;
     }
-    let channel = &*(handle as *mut ForgeChannelHandle);
+    let channel = &*(handle as *mut PithChannelHandle);
     let (lock, _) = &**channel;
     let state = lock.lock().unwrap();
     state.capacity as i64
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_channel_is_closed(handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_channel_is_closed(handle: i64) -> i64 {
     if handle == 0 {
         return 1;
     }
-    let channel = &*(handle as *mut ForgeChannelHandle);
+    let channel = &*(handle as *mut PithChannelHandle);
     let (lock, _) = &**channel;
     let state = lock.lock().unwrap();
     if state.closed { 1 } else { 0 }
 }
 
 #[no_mangle]
-pub extern "C" fn forge_select_next_index(count: i64) -> i64 {
+pub extern "C" fn pith_select_next_index(count: i64) -> i64 {
     if count <= 1 {
         return 0;
     }

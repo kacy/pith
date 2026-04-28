@@ -1,0 +1,20 @@
+# websocket session api over buffered bytes
+
+import std.bytes as bytes
+import std.io as io
+import std.net.websocket as websocket
+
+fn main() -> Int!:
+    inbound := bytes.buffer()
+    inbound.write(websocket.text_frame_bytes("pith")!)!
+
+    outbound := bytes.buffer()
+    ws := websocket.from_buffered(io.bytes_reader(inbound.bytes()).buffered_chunked(4), outbound.buffered_chunked(4), true)
+
+    text := ws.recv_text()!
+    ws.send_text("echo:" + text)!
+
+    echoed := websocket.read_frame_buffered(io.bytes_reader(outbound.bytes()).buffered_chunked(4))!
+    print(text)
+    print(echoed.payload_text()!)
+    return 0

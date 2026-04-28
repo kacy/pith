@@ -1,6 +1,6 @@
-//! Cranelift code generation for Forge
+//! Cranelift code generation for Pith
 //!
-//! Pipeline: Forge IR text → ir_consumer → Cranelift → native object code
+//! Pipeline: Pith IR text → ir_consumer → Cranelift → native object code
 
 use cranelift::prelude::*;
 use cranelift_module::{FuncId, Linkage, Module};
@@ -77,7 +77,7 @@ pub fn create_codegen() -> Result<CodeGen, CompileError> {
     let isa = isa_builder
         .finish(settings::Flags::new(settings::builder()))
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-    let builder = ObjectBuilder::new(isa, "forge_module", cranelift_module::default_libcall_names())
+    let builder = ObjectBuilder::new(isa, "pith_module", cranelift_module::default_libcall_names())
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
     Ok(CodeGen { module: ObjectModule::new(builder) })
 }

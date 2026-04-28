@@ -1,8 +1,8 @@
-//! IR Consumer — translates Forge text IR to Cranelift native code
+//! IR Consumer — translates Pith text IR to Cranelift native code
 //!
-//! This module parses the simple text IR emitted by self-host/ir_emitter.fg
+//! This module parses the simple text IR emitted by self-host/ir_emitter.pith
 //! and translates it to Cranelift API calls. This is the Rust-side half of
-//! Stage 2: moving compilation logic from Rust to Forge.
+//! Stage 2: moving compilation logic from Rust to Pith.
 //!
 //! IR format reference:
 //!   string N "content"              — string data declaration
@@ -32,17 +32,17 @@
 use crate::{CodeGen, CompileError};
 use cranelift::prelude::*;
 use cranelift_module::{FuncId, Linkage, Module};
-use forge_runtime::collections::list::{
+use pith_runtime::collections::list::{
     LIST_IMPL_ELEM_SIZE_OFFSET, LIST_IMPL_VALUES8_LEN_OFFSET, LIST_IMPL_VALUES8_PTR_OFFSET,
 };
 use std::collections::{HashMap, HashSet};
 
-#[cfg(forge_cranelift_new_api)]
+#[cfg(pith_cranelift_new_api)]
 fn declare_i64_var(builder: &mut FunctionBuilder<'_>) -> Variable {
     builder.declare_var(types::I64)
 }
 
-#[cfg(forge_cranelift_new_api)]
+#[cfg(pith_cranelift_new_api)]
 fn jump_with_i64_arg(builder: &mut FunctionBuilder<'_>, block: Block, value: Value) {
     builder.ins().jump(
         block,
@@ -50,7 +50,7 @@ fn jump_with_i64_arg(builder: &mut FunctionBuilder<'_>, block: Block, value: Val
     );
 }
 
-#[cfg(not(forge_cranelift_new_api))]
+#[cfg(not(pith_cranelift_new_api))]
 fn declare_i64_var(builder: &mut FunctionBuilder<'_>, next_var_id: &mut u32) -> Variable {
     let var = Variable::new((*next_var_id) as usize);
     *next_var_id += 1;
@@ -58,7 +58,7 @@ fn declare_i64_var(builder: &mut FunctionBuilder<'_>, next_var_id: &mut u32) -> 
     var
 }
 
-#[cfg(not(forge_cranelift_new_api))]
+#[cfg(not(pith_cranelift_new_api))]
 fn jump_with_i64_arg(builder: &mut FunctionBuilder<'_>, block: Block, value: Value) {
     builder.ins().jump(block, &[value]);
 }
@@ -498,7 +498,7 @@ fn compile_ir_function(
     let mut struct_vars: HashMap<String, String> = HashMap::new();
     let mut named_vars: HashMap<String, Variable> = HashMap::new();
     let mut labels: HashMap<String, Block> = HashMap::new();
-    #[cfg(not(forge_cranelift_new_api))]
+    #[cfg(not(pith_cranelift_new_api))]
     let mut next_var_id: u32 = 0;
 
     // Call __init_globals (and module-specific __init_globals_N) at the start of main
@@ -535,9 +535,9 @@ fn compile_ir_function(
 
     for (i, name) in param_names.iter().enumerate() {
         if i < block_params.len() {
-            #[cfg(forge_cranelift_new_api)]
+            #[cfg(pith_cranelift_new_api)]
             let var = declare_i64_var(&mut builder);
-            #[cfg(not(forge_cranelift_new_api))]
+            #[cfg(not(pith_cranelift_new_api))]
             let var = declare_i64_var(&mut builder, &mut next_var_id);
             builder.def_var(var, block_params[i]);
             named_vars.insert(name.clone(), var);
@@ -817,7 +817,7 @@ fn compile_ir_function(
                     && a_reg.is_some_and(|r| string_regs.contains(&r))
                     && b_reg.is_some_and(|r| string_regs.contains(&r))
                 {
-                    if let Some(&concat_id) = runtime_funcs.get("forge_concat_cstr") {
+                    if let Some(&concat_id) = runtime_funcs.get("pith_concat_cstr") {
                         let concat_ref = *func_ref_cache.entry(concat_id).or_insert_with(|| {
                             codegen.module.declare_func_in_func(concat_id, builder.func)
                         });
@@ -894,11 +894,11 @@ fn compile_ir_function(
                         || b_reg.is_some_and(|r| string_regs.contains(&r)));
                 if is_str_cmp {
                     let cmp_name = match parts[0] {
-                        "lt" => "forge_cstring_lt",
-                        "gt" => "forge_cstring_gt",
-                        "lte" => "forge_cstring_lte",
-                        "gte" => "forge_cstring_gte",
-                        _ => "forge_cstring_lt",
+                        "lt" => "pith_cstring_lt",
+                        "gt" => "pith_cstring_gt",
+                        "lte" => "pith_cstring_lte",
+                        "gte" => "pith_cstring_gte",
+                        _ => "pith_cstring_lt",
                     };
                     if let Some(&fid) = runtime_funcs.get(cmp_name) {
                         let fref = *func_ref_cache.entry(fid).or_insert_with(|| {
@@ -962,7 +962,7 @@ fn compile_ir_function(
                 let b = get_reg(&regs, parts[3]);
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
-                if let Some(&concat_id) = runtime_funcs.get("forge_concat_cstr") {
+                if let Some(&concat_id) = runtime_funcs.get("pith_concat_cstr") {
                     let concat_ref = *func_ref_cache.entry(concat_id).or_insert_with(|| {
                         codegen.module.declare_func_in_func(concat_id, builder.func)
                     });
@@ -1003,7 +1003,7 @@ fn compile_ir_function(
                         }
                     }
                     // Allocate struct
-                    if let Some(&alloc_id) = runtime_funcs.get("forge_struct_alloc") {
+                    if let Some(&alloc_id) = runtime_funcs.get("pith_struct_alloc") {
                         let alloc_ref = *func_ref_cache.entry(alloc_id).or_insert_with(|| {
                             codegen.module.declare_func_in_func(alloc_id, builder.func)
                         });
@@ -1063,15 +1063,15 @@ fn compile_ir_function(
                         struct_regs.remove(&reg);
                         continue;
                     }
-                    if (fname == "forge_list_get_value"
-                        || fname == "forge_list_get_value_unchecked")
+                    if (fname == "pith_list_get_value"
+                        || fname == "pith_list_get_value_unchecked")
                         && args.len() == 2
                     {
                         let inlined = inline_list_get_value(
                             &mut builder,
                             args[0],
                             args[1],
-                            fname == "forge_list_get_value",
+                            fname == "pith_list_get_value",
                         );
                         regs.insert(reg, inlined);
                         string_regs.remove(&reg);
@@ -1167,7 +1167,7 @@ fn compile_ir_function(
                         // Indirect call through closure handle variable
                         let closure_handle = builder.use_var(var);
                         let fn_ptr = if let Some(&closure_get_id) =
-                            runtime_funcs.get("forge_closure_get_fn")
+                            runtime_funcs.get("pith_closure_get_fn")
                         {
                             let closure_get_ref =
                                 *func_ref_cache.entry(closure_get_id).or_insert_with(|| {
@@ -1242,9 +1242,9 @@ fn compile_ir_function(
                     let var = if let Some(&v) = named_vars.get(&name) {
                         v
                     } else {
-                        #[cfg(forge_cranelift_new_api)]
+                        #[cfg(pith_cranelift_new_api)]
                         let v = declare_i64_var(&mut builder);
-                        #[cfg(not(forge_cranelift_new_api))]
+                        #[cfg(not(pith_cranelift_new_api))]
                         let v = declare_i64_var(&mut builder, &mut next_var_id);
                         named_vars.insert(name, v);
                         v
@@ -1393,7 +1393,7 @@ fn compile_ir_function(
                         .entry(fid)
                         .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func));
                     let addr = builder.ins().func_addr(types::I64, fref);
-                    if let Some(&closure_new_id) = runtime_funcs.get("forge_closure_new") {
+                    if let Some(&closure_new_id) = runtime_funcs.get("pith_closure_new") {
                         let closure_new_ref =
                             *func_ref_cache.entry(closure_new_id).or_insert_with(|| {
                                 codegen

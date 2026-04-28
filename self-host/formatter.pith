@@ -1,0 +1,392 @@
+# formatter.pith — canonical source code formatter for pith
+#
+# uses a source-preserving approach: walks source text line by line,
+# normalizing whitespace around operators, delimiters, and comments.
+#
+# canonical rules:
+#   1. 4-space indentation (already enforced by lexer)
+#   2. single space around binary operators
+#   3. no space before colon, space after (in type annotations)
+#   4. no trailing whitespace on lines
+#   5. single blank line between top-level declarations (max)
+#   6. single space after # in comments
+#   7. trailing newline at end of file
+#   8. no space inside parens/brackets
+#   9. single space after commas
+
+# format pith source code, returning a new string with canonical formatting.
+pub fn fmt_source(source: String) -> String:
+    lines := split_lines_preserve_empty(source)
+    mut output := ""
+    mut consecutive_blank := 0
+
+    for raw_line in lines:
+        # trim trailing whitespace
+        line := trim_right(raw_line)
+
+        # handle blank lines — allow at most one
+        if line.len() == 0:
+            consecutive_blank = consecutive_blank + 1
+            if consecutive_blank <= 1:
+                output = output + chr(10)
+            continue
+        consecutive_blank = 0
+
+        # detect if line is a comment (after indentation)
+        trimmed := trim_left(line)
+        if trimmed.len() > 0:
+            if trimmed[0] == "#":
+                # preserve indentation, normalize comment spacing
+                indent_len := line.len() - trimmed.len()
+                output = output + line.substring(0, indent_len)
+                output = output + format_comment(trimmed)
+                output = output + chr(10)
+                continue
+
+        # for code lines, normalize spacing
+        output = output + format_code_line(line)
+        output = output + chr(10)
+
+    # ensure exactly one trailing newline
+    while output.len() > 1:
+        if output[output.len() - 1] == chr(10):
+            if output[output.len() - 2] == chr(10):
+                output = output.substring(0, output.len() - 1)
+                continue
+        break
+
+    # ensure at least one trailing newline
+    if output.len() > 0:
+        if output[output.len() - 1] != chr(10):
+            output = output + chr(10)
+
+    return output
+
+fn split_lines_preserve_empty(source: String) -> List[String]:
+    mut lines: List[String] := []
+    mut start := 0
+    mut i := 0
+    while i < source.len():
+        if source[i] == chr(10):
+            lines.push(source.substring(start, i))
+            start = i + 1
+        i = i + 1
+    lines.push(source.substring(start, source.len()))
+    return lines
+
+# normalize a comment line: ensure single space after #
+fn format_comment(comment: String) -> String:
+    if comment.len() == 1:
+        if comment[0] == "#":
+            return "#"
+    if comment.len() >= 2:
+        if comment[1] != " ":
+            return "# " + comment.substring(1, comment.len())
+    return comment
+
+# format a code line by normalizing operator spacing.
+# preserves string contents exactly.
+fn format_code_line(line: String) -> String:
+    mut output := ""
+    mut i := 0
+    mut in_string := false
+    mut brace_depth := 0
+
+    # preserve leading whitespace (indentation)
+    while i < line.len():
+        if line[i] == " " or line[i] == chr(9):
+            output = output + line[i]
+            i = i + 1
+        else:
+            break
+
+    while i < line.len():
+        ch := line[i]
+        quote := chr(34)
+
+        # string handling — preserve contents exactly
+        if ch == quote:
+            if not in_string:
+                in_string = true
+                output = output + ch
+                i = i + 1
+                continue
+
+        if in_string:
+            if ch == chr(92):
+                if i + 1 < line.len():
+                    # escape sequence — copy both chars
+                    output = output + ch + line[i + 1]
+                    i = i + 2
+                    continue
+            LB := chr(123)
+            RB := chr(125)
+            if ch == LB:
+                brace_depth = brace_depth + 1
+                output = output + ch
+                i = i + 1
+                continue
+            if ch == RB:
+                if brace_depth > 0:
+                    brace_depth = brace_depth - 1
+                    output = output + ch
+                    i = i + 1
+                    continue
+            if ch == quote:
+                if brace_depth == 0:
+                    in_string = false
+                    output = output + ch
+                    i = i + 1
+                    continue
+            output = output + ch
+            i = i + 1
+            continue
+
+        # inline comment — normalize and copy rest
+        if ch == "#":
+            output = ensure_trimmed_trailing(output)
+            output = output + " "
+            output = output + format_comment(line.substring(i, line.len()))
+            break
+
+        # two-character operators
+        if i + 1 < line.len():
+            next := line[i + 1]
+
+            # := — space around
+            if ch == ":" and next == "=":
+                output = ensure_trailing_space(output)
+                output = output + ":= "
+                i = i + 2
+                i = skip_leading_spaces(line, i)
+                continue
+
+            # ==, !=, <=, >=, +=, -=, *=, /=, =>, ->
+            if is_two_char_operator(ch, next):
+                output = ensure_trailing_space(output)
+                output = output + ch + next + " "
+                i = i + 2
+                i = skip_leading_spaces(line, i)
+                continue
+
+        # single-char binary operators: + * / %
+        if ch == "+" or ch == "*" or ch == "/" or ch == "%":
+            output = ensure_trailing_space(output)
+            output = output + ch + " "
+            i = i + 1
+            i = skip_leading_spaces(line, i)
+            continue
+
+        # minus — could be binary or unary
+        if ch == "-":
+            if is_preceded_by_operand(output):
+                output = ensure_trailing_space(output)
+                output = output + "- "
+                i = i + 1
+                i = skip_leading_spaces(line, i)
+                continue
+            # unary — no space after
+            output = output + "-"
+            i = i + 1
+            continue
+
+        # = (assignment, not ==)
+        if ch == "=":
+            output = ensure_trailing_space(output)
+            output = output + "= "
+            i = i + 1
+            i = skip_leading_spaces(line, i)
+            continue
+
+        # < and > as comparison
+        if ch == "<" or ch == ">":
+            output = ensure_trailing_space(output)
+            output = output + ch + " "
+            i = i + 1
+            i = skip_leading_spaces(line, i)
+            continue
+
+        # | (pipe operator)
+        if ch == "|":
+            output = ensure_trailing_space(output)
+            output = output + "| "
+            i = i + 1
+            i = skip_leading_spaces(line, i)
+            continue
+
+        # colon — no space before, space after
+        if ch == ":":
+            output = trim_trailing_spaces(output)
+            output = output + ":"
+            i = i + 1
+            if i < line.len():
+                if line[i] != chr(10):
+                    i = skip_leading_spaces(line, i)
+                    if i < line.len():
+                        output = output + " "
+            continue
+
+        # comma — no space before, space after
+        if ch == ",":
+            output = trim_trailing_spaces(output)
+            output = output + ","
+            i = i + 1
+            i = skip_leading_spaces(line, i)
+            if i < line.len():
+                output = output + " "
+            continue
+
+        # dot — no spaces around
+        if ch == ".":
+            output = trim_trailing_spaces(output)
+            output = output + "."
+            i = i + 1
+            i = skip_leading_spaces(line, i)
+            continue
+
+        # opening delimiters — no space after
+        if ch == "(" or ch == "[":
+            output = output + ch
+            i = i + 1
+            i = skip_leading_spaces(line, i)
+            continue
+        LB := chr(123)
+        if ch == LB:
+            output = output + ch
+            i = i + 1
+            i = skip_leading_spaces(line, i)
+            continue
+
+        # closing delimiters — no space before
+        if ch == ")" or ch == "]":
+            output = trim_trailing_spaces(output)
+            output = output + ch
+            i = i + 1
+            continue
+        RB := chr(125)
+        if ch == RB:
+            output = trim_trailing_spaces(output)
+            output = output + ch
+            i = i + 1
+            continue
+
+        # regular character — just copy
+        output = output + ch
+        i = i + 1
+
+    return output
+
+# ---------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------
+
+# check if two characters form a two-char operator
+fn is_two_char_operator(ch: String, next: String) -> Bool:
+    if ch == "=" and next == "=":
+        return true
+    if ch == "!" and next == "=":
+        return true
+    if ch == "<" and next == "=":
+        return true
+    if ch == ">" and next == "=":
+        return true
+    if ch == "+" and next == "=":
+        return true
+    if ch == "-" and next == "=":
+        return true
+    if ch == "*" and next == "=":
+        return true
+    if ch == "/" and next == "=":
+        return true
+    if ch == "=" and next == ">":
+        return true
+    if ch == "-" and next == ">":
+        return true
+    return false
+
+# ensure output ends with a space (unless already has one or ends with open paren)
+fn ensure_trailing_space(s: String) -> String:
+    if s.len() > 0:
+        last := s[s.len() - 1]
+        if last != " " and last != "(" and last != "[":
+            return s + " "
+    return s
+
+# trim trailing spaces from a string
+fn trim_trailing_spaces(s: String) -> String:
+    mut result := s
+    while result.len() > 0:
+        if result[result.len() - 1] == " ":
+            result = result.substring(0, result.len() - 1)
+        else:
+            break
+    return result
+
+# trim trailing spaces and add space before (for inline comments)
+fn ensure_trimmed_trailing(s: String) -> String:
+    return trim_trailing_spaces(s)
+
+# skip spaces in a line starting at position i
+fn skip_leading_spaces(line: String, start: Int) -> Int:
+    mut i := start
+    while i < line.len():
+        if line[i] == " ":
+            i = i + 1
+        else:
+            break
+    return i
+
+# check if the output so far ends with an operand (for binary vs unary minus)
+fn is_preceded_by_operand(output: String) -> Bool:
+    if output.len() == 0:
+        return false
+    # skip trailing spaces
+    mut idx := output.len()
+    while idx > 0:
+        if output[idx - 1] == " ":
+            idx = idx - 1
+        else:
+            break
+    if idx == 0:
+        return false
+    last := output[idx - 1]
+    if is_alphanumeric(last):
+        return true
+    if last == ")" or last == "]" or last == "_" or last == "?" or last == "!":
+        return true
+    return false
+
+# check if a single character is alphanumeric
+fn is_alphanumeric(ch: String) -> Bool:
+    if ch.len() != 1:
+        return false
+    c := ord(ch)
+    # 0-9: 48-57, A-Z: 65-90, a-z: 97-122
+    if c >= 48 and c <= 57:
+        return true
+    if c >= 65 and c <= 90:
+        return true
+    if c >= 97 and c <= 122:
+        return true
+    return false
+
+# trim trailing whitespace (spaces and tabs) from a string
+fn trim_right(s: String) -> String:
+    mut end := s.len()
+    while end > 0:
+        ch := s[end - 1]
+        if ch == " " or ch == chr(9) or ch == chr(13):
+            end = end - 1
+        else:
+            break
+    return s.substring(0, end)
+
+# trim leading whitespace from a string
+fn trim_left(s: String) -> String:
+    mut start := 0
+    while start < s.len():
+        if s[start] == " " or s[start] == chr(9):
+            start = start + 1
+        else:
+            break
+    return s.substring(start, s.len())

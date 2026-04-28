@@ -1,0 +1,42 @@
+# file operations — stream and path-based fs helpers
+
+import std.fs as fs
+
+fn main() -> String!:
+    path := "/tmp/pith_test_file_ops.txt"
+
+    # write through the shared file stream path
+    writer := fs.create(path)!
+    writer.write_all("hello from pith")!
+    writer.close()
+    print("write: ok")
+
+    # read back through the same stream surface
+    reader := fs.open(path)!
+    content := reader.read_all()!
+    reader.close()
+    if content.contains("hello"):
+        print("read: ok")
+
+    # exists
+    if fs.exists(path):
+        print("exists: ok")
+
+    # read by size
+    size := content.len()
+    print("size: " + size.to_string())
+
+    # clean up
+    fs.remove(path)
+    if not fs.exists(path):
+        print("remove: ok")
+
+    # stream a known file too
+    hello_reader := fs.open("examples/hello.pith")!
+    hello := hello_reader.read_all()!
+    hello_reader.close()
+    if hello.contains("greet"):
+        print("read hello.pith: ok")
+
+    print("file ops work")
+    return ""

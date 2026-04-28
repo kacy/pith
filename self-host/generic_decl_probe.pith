@@ -1,0 +1,35 @@
+from ast import reset_arena, get_node
+from checker import initialize_checker, c_register_all, generic_declaration_map, debug_generic_declaration_summary, debug_extract_generic_parameters
+from lexer import lex_all
+from parser import parse
+
+fn main() -> String!:
+    source := read_file("examples/generic_interfaces.pith")!
+    reset_arena()
+    root := parse(lex_all(source))
+    root_node := get_node(root)
+    for child in root_node.children:
+        node := get_node(child)
+        print(node.kind + " " + node.value)
+        for grand in node.children:
+            g := get_node(grand)
+            print("  " + g.kind + " " + g.value)
+
+    initialize_checker("examples/generic_interfaces.pith")
+    c_register_all(root)
+
+    if generic_declaration_map.contains_key("show"):
+        node := get_node(generic_declaration_map["show"])
+        print("show => " + node.kind + " " + node.value)
+    if generic_declaration_map.contains_key("Wrapper"):
+        node := get_node(generic_declaration_map["Wrapper"])
+        print("Wrapper => " + node.kind + " " + node.value)
+    if generic_declaration_map.contains_key("Renderer"):
+        node := get_node(generic_declaration_map["Renderer"])
+        print("Renderer => " + node.kind + " " + node.value)
+    print("debug show => " + debug_generic_declaration_summary("show"))
+    print("debug Wrapper => " + debug_generic_declaration_summary("Wrapper"))
+    print("params show[T] => " + debug_extract_generic_parameters("show[T]"))
+    print("params Wrapper[T] => " + debug_extract_generic_parameters("Wrapper[T]"))
+    print("params id[T] => " + debug_extract_generic_parameters("id[T]"))
+    return ""

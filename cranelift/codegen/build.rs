@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rustc-check-cfg=cfg(forge_cranelift_new_api)");
+    println!("cargo:rustc-check-cfg=cfg(pith_cranelift_new_api)");
 
     let Some(lockfile) = workspace_lockfile() else {
         return;
@@ -11,7 +11,7 @@ fn main() {
         return;
     };
     if uses_new_cranelift_api(&contents) {
-        println!("cargo:rustc-cfg=forge_cranelift_new_api");
+        println!("cargo:rustc-cfg=pith_cranelift_new_api");
     }
 
     if let Err(err) = generate_runtime_table() {
@@ -117,6 +117,7 @@ fn generate_runtime_table() -> Result<(), String> {
     fs::write(out_dir.join("runtime_table.rs"), out).map_err(|e| e.to_string())
 }
 
+#[derive(Clone, Copy)]
 enum RuntimeDeclClass {
     Abi,
     Compat,

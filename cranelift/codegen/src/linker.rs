@@ -39,15 +39,15 @@ pub fn link_executable(
 
 /// Get the path to the runtime static library
 pub fn get_runtime_lib_path() -> String {
-    if let Ok(path) = std::env::var("FORGE_RUNTIME_LIB") {
+    if let Ok(path) = std::env::var("PITH_RUNTIME_LIB") {
         if std::path::Path::new(&path).exists() {
             return path;
         }
     }
 
     for candidate in &[
-        "target/release/libforge_runtime.a",
-        "../target/release/libforge_runtime.a",
+        "target/release/libpith_runtime.a",
+        "../target/release/libpith_runtime.a",
     ] {
         if std::path::Path::new(candidate).exists() {
             return candidate.to_string();
@@ -60,20 +60,20 @@ pub fn get_runtime_lib_path() -> String {
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
         {
-            let candidate = root.join("target/release/libforge_runtime.a");
+            let candidate = root.join("target/release/libpith_runtime.a");
             if candidate.exists() {
                 return candidate.to_string_lossy().to_string();
             }
         }
     }
 
-    "target/release/libforge_runtime.a".to_string()
+    "target/release/libpith_runtime.a".to_string()
 }
 
 /// Rebuild the runtime static library if sources are newer than the .a file.
-/// This ensures `forge run` always links against an up-to-date runtime.
+/// This ensures `pith run` always links against an up-to-date runtime.
 fn rebuild_runtime_if_stale(runtime_lib: &str) {
-    // Find the forge executable to determine the workspace root
+    // Find the pith executable to determine the workspace root
     let exe = std::env::current_exe().unwrap_or_default();
     let workspace_root = exe
         .parent() // target/release
@@ -98,7 +98,7 @@ fn rebuild_runtime_if_stale(runtime_lib: &str) {
 
     if needs_rebuild {
         let _ = Command::new("cargo")
-            .args(["build", "--release", "-p", "forge-runtime"])
+            .args(["build", "--release", "-p", "pith-runtime"])
             .current_dir(&workspace_root)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

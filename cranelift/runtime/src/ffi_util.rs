@@ -1,4 +1,4 @@
-//! Shared FFI helper utilities for the Forge runtime.
+//! Shared FFI helper utilities for the Pith runtime.
 //!
 //! These are used by json, toml, and other modules that need to
 //! convert between Rust strings and C strings.
@@ -11,7 +11,7 @@ pub unsafe fn cstr_to_str<'a>(s: *const i8) -> &'a str {
     if s.is_null() {
         return "";
     }
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     let slice = std::slice::from_raw_parts(s as *const u8, len);
     std::str::from_utf8(slice).unwrap_or("")
 }

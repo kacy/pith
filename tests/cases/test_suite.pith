@@ -1,0 +1,161 @@
+# Pith language test suite using std.testing
+#
+# Covers: types, operators, control flow, strings, collections,
+# structs, enums, optionals, error handling, closures
+
+from std.testing import check, check_str, check_ne, check_true, check_not, done
+
+# --- basic types and operators ---
+
+fn test_integers():
+    check(1 + 2, 3, "int add")
+    check(10 - 3, 7, "int sub")
+    check(4 * 5, 20, "int mul")
+    check(15 / 4, 3, "int div")
+    check(17 % 5, 2, "int mod")
+    check(0 - 7, -7, "int negate")
+
+fn test_booleans():
+    check_true(true, "true literal")
+    check_not(false, "false literal")
+    check_true(3 > 2, "greater than")
+    check_true(2 < 3, "less than")
+    check_true(5 >= 5, "gte equal")
+    check_true(5 <= 5, "lte equal")
+    check_true(true and true, "and true")
+    check_not(true and false, "and false")
+    check_true(true or false, "or true")
+    check_not(false or false, "or false")
+
+fn test_strings():
+    check_str("hello" + " world", "hello world", "concat")
+    check("hello".len(), 5, "length")
+    check_str("HELLO".to_lower(), "hello", "to_lower")
+    check_str("hello".to_upper(), "HELLO", "to_upper")
+    check_true("hello world".contains("world"), "contains")
+    check_not("hello".contains("xyz"), "not contains")
+    check_true("hello".starts_with("hel"), "starts_with")
+    check_true("hello".ends_with("llo"), "ends_with")
+    check("hello world".index_of("world"), 6, "index_of")
+    check_str("  hello  ".trim(), "hello", "trim")
+    check_str("abc".repeat(3), "abcabcabc", "repeat")
+
+fn test_string_compare():
+    check_true("apple" < "banana", "str lt")
+    check_true("banana" > "apple", "str gt")
+    check_true("abc" <= "abc", "str lte eq")
+    check_true("abc" >= "abc", "str gte eq")
+    check_true("a" < "b", "single char lt")
+    check_true("z" > "a", "single char gt")
+
+# --- control flow ---
+
+fn test_control_flow():
+    mut x := 0
+    if true:
+        x = 1
+    check(x, 1, "if true")
+
+    mut y := 0
+    if false:
+        y = 1
+    else:
+        y = 2
+    check(y, 2, "if-else")
+
+    mut sum := 0
+    mut i := 0
+    while i < 5:
+        sum = sum + i
+        i = i + 1
+    check(sum, 10, "while loop")
+
+    mut count := 0
+    for item in [10, 20, 30]:
+        count = count + 1
+    check(count, 3, "for-in list")
+
+# --- collections ---
+
+fn test_list():
+    items: List[Int] := [1, 2, 3]
+    check(items.len(), 3, "list len")
+    check(items[0], 1, "list index 0")
+    check(items[2], 3, "list index 2")
+
+fn test_map():
+    mut m: Map[String, Int] := {}
+    m.insert("a", 1)
+    m.insert("b", 2)
+    check(m["a"], 1, "map get")
+    check(m["b"], 2, "map get 2")
+
+# --- structs ---
+
+struct Point:
+    x: Int
+    y: Int
+
+fn test_structs():
+    p := Point(3, 4)
+    check(p.x, 3, "struct field x")
+    check(p.y, 4, "struct field y")
+
+# --- enums and match ---
+
+enum Color:
+    Red
+    Green
+    Blue
+
+fn color_name(c: Color) -> String:
+    match c:
+        Red => "red"
+        Green => "green"
+        Blue => "blue"
+
+fn test_enums():
+    check_str(color_name(Color.Red), "red", "enum Red")
+    check_str(color_name(Color.Green), "green", "enum Green")
+    check_str(color_name(Color.Blue), "blue", "enum Blue")
+
+# --- optionals ---
+
+fn test_optionals():
+    return
+
+# --- error handling ---
+
+fn might_fail(ok: Bool) -> Int!:
+    if ok:
+        return 42
+    fail "oops"
+
+fn test_errors():
+    return
+
+# --- lambdas ---
+
+fn apply(x: Int, f: fn(Int) -> Int) -> Int:
+    return f(x)
+
+fn test_lambdas():
+    doubled := apply(21, fn(x: Int) => x * 2)
+    check(doubled, 42, "lambda apply")
+    squared := apply(5, fn(x: Int) => x * x)
+    check(squared, 25, "lambda square")
+
+# --- run all ---
+
+fn main():
+    test_integers()
+    test_booleans()
+    test_strings()
+    test_string_compare()
+    test_control_flow()
+    test_list()
+    test_map()
+    test_structs()
+    test_optionals()
+    test_lambdas()
+    done()

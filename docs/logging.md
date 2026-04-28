@@ -1,10 +1,10 @@
 # structured logging
 
-`std.log` is the blessed logging layer for forge programs. it keeps the old
+`std.log` is the blessed logging layer for pith programs. it keeps the old
 simple helpers, but the main path for application code is now a structured
 logger with typed fields.
 
-```fg
+```pith
 import std.log as log
 
 logger := log.root()
@@ -23,7 +23,7 @@ logger.info()
 
 the existing global helpers still work:
 
-```fg
+```pith
 log.info("started")
 log.warn_kv("cache miss", "key=user:1")
 log.set_level(log.warn_level())
@@ -60,7 +60,7 @@ formatting.
 
 `std.metrics` is the matching in-memory metrics layer for apps and tools.
 
-```fg
+```pith
 import std.metrics as metrics
 
 requests := metrics.counter("requests total")

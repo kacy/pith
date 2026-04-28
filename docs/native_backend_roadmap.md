@@ -1,7 +1,7 @@
 # Native Backend Roadmap
 
 This document turns the current Cranelift backend analysis into an execution
-plan: what should stay Rust, what should move into Forge, and which language
+plan: what should stay Rust, what should move into Pith, and which language
 features would make the examples read like a finished language instead of
 backend demos.
 
@@ -15,8 +15,8 @@ policy.
 
 Source totals:
 
-- `self-host/*.fg`: about 22,540 lines
-- `std/**/*.fg`: about 25,330 lines
+- `self-host/*.pith`: about 22,540 lines
+- `std/**/*.pith`: about 25,330 lines
 - `cranelift/**/*.rs`: about 10,650 tracked lines
 
 Rust breakdown:
@@ -47,10 +47,10 @@ These should remain Rust for the foreseeable future:
 - OS, process, DNS, and socket syscalls
 
 The desired end state is not zero Rust. It is a thin Rust backend/runtime with
-the language, compiler policy, and most standard-library logic living in Forge.
+the language, compiler policy, and most standard-library logic living in Pith.
 
 That line is even more true now that TLS has moved out of a Rust runtime module
-and into `std.net.tls`, `std.net.tls13`, and the Forge-side crypto helpers that
+and into `std.net.tls`, `std.net.tls13`, and the Pith-side crypto helpers that
 support them.
 
 ## Migration Targets
@@ -81,10 +81,10 @@ Rust currently infers:
 - whether a call returns a string
 - whether a call returns a struct
 - which fields are string fields
-- which runtime symbol a Forge name should map to
+- which runtime symbol a Pith name should map to
 - fallback field offsets when type identity is incomplete
 
-This is the source of a large share of backend bugs. Forge should emit this
+This is the source of a large share of backend bugs. Pith should emit this
 metadata explicitly.
 
 Required additions:
@@ -102,7 +102,7 @@ Acceptance criteria:
 - backend bugs stop looking like “Rust guessed the wrong type”
 - native build/run/test uses validated combined IR by default
 
-### Phase 2: Move CLI Orchestration Into Forge
+### Phase 2: Move CLI Orchestration Into Pith
 
 Target file:
 
@@ -120,7 +120,7 @@ Why:
 
 The Rust CLI is doing frontend policy work:
 
-- finding `self-host/forge_main`
+- finding `self-host/pith_main`
 - scanning `from ... import ...`
 - resolving module paths
 - maintaining a hardcoded builtin-module skip list
@@ -128,9 +128,9 @@ The Rust CLI is doing frontend policy work:
 
 That logic belongs with:
 
-- `self-host/forge_main.fg`
-- `self-host/driver.fg`
-- eventually a Forge-native backend driver layer
+- `self-host/pith_main.pith`
+- `self-host/driver.pith`
+- eventually a Pith-native backend driver layer
 
 Desired end state:
 
@@ -143,8 +143,8 @@ Rust CLI becomes a thin shell around:
 
 Acceptance criteria:
 
-- import graph walking lives in Forge
-- builtin-module policy is expressed in Forge, not Rust
+- import graph walking lives in Pith
+- builtin-module policy is expressed in Pith, not Rust
 - `main.rs` shrinks toward a thin backend wrapper
 
 ### Phase 3: Remove Duplicated High-level Runtime Logic
@@ -157,13 +157,13 @@ Target files:
 
 Obvious duplication:
 
-- Forge JSON: `std/json.fg` (510 lines)
+- Pith JSON: `std/json.pith` (510 lines)
 - Rust JSON: `cranelift/runtime/src/json.rs` (488 lines)
-- Forge TOML: `std/toml.fg` (519 lines)
+- Pith TOML: `std/toml.pith` (519 lines)
 - Rust TOML: `cranelift/runtime/src/toml.rs` (290 lines)
-- Forge URL/path:
-  - `std/net/url.fg` (260 lines)
-  - `std/os/path.fg` (81 lines)
+- Pith URL/path:
+  - `std/net/url.pith` (260 lines)
+  - `std/os/path.pith` (81 lines)
 - Rust URL/path/smart glue:
   - `cranelift/runtime/src/lib.rs:2163-3233` (1,071 lines)
 
@@ -171,22 +171,22 @@ Why:
 
 The current split duplicates ownership and creates contract drift:
 
-- JSON exists in both Rust and Forge
-- TOML exists in both Rust and Forge
-- URL/path helpers exist in both Rust and Forge
+- JSON exists in both Rust and Pith
+- TOML exists in both Rust and Pith
+- URL/path helpers exist in both Rust and Pith
 - “smart” helpers paper over representation mismatches rather than fixing them
 
 Recommended ownership model:
 
 - Rust runtime owns primitive FFI and storage
-- Forge stdlib owns parsing, formatting, and user-facing APIs
+- Pith stdlib owns parsing, formatting, and user-facing APIs
 
 Near-term deletion targets inside `runtime/src/lib.rs`:
 
-- `forge_json_parse` smart fallback behavior
-- `forge_smart_to_string`
-- `forge_smart_encode`
-- `forge_url_*` convenience layer, if Forge stdlib owns URL semantics
+- `pith_json_parse` smart fallback behavior
+- `pith_smart_to_string`
+- `pith_smart_encode`
+- `pith_url_*` convenience layer, if Pith stdlib owns URL semantics
 - path helpers that are better modeled as stdlib wrappers over smaller intrinsics
 - obvious stubs like process/channel placeholders when they are not part of the
   intended long-term contract
@@ -212,7 +212,7 @@ mostly describe real low-level intrinsics.
 Acceptance criteria:
 
 - fewer aliases
-- fewer Forge names with Rust-side special cases
+- fewer Pith names with Rust-side special cases
 - more one-to-one mappings between emitted IR and imported runtime symbols
 
 ## Recommended Execution Order
@@ -221,7 +221,7 @@ Use this order. It minimizes churn and avoids deleting infrastructure before
 contracts are explicit.
 
 1. Make IR metadata explicit and delete Rust inference
-2. Move import graph and IR orchestration into Forge
+2. Move import graph and IR orchestration into Pith
 3. Remove duplicated JSON/TOML/URL/path ownership
 4. Shrink runtime import tables
 
@@ -232,7 +232,7 @@ guess what the frontend meant.
 
 The example corpus shows the biggest quality gaps directly.
 
-Observed frequency in `examples/*.fg`:
+Observed frequency in `examples/*.pith`:
 
 - `print(...)`: 785
 - string concatenations with `+`: 653
@@ -331,12 +331,12 @@ append-oriented string buffer instead of repeated concatenation.
 
 These would benefit immediately from the additions above:
 
-- `examples/url_ops.fg`
-- `examples/data_pipeline.fg`
-- `examples/strings_demo.fg`
-- `examples/matrix_math.fg`
-- `examples/json_ops.fg`
-- `examples/toml_ops.fg`
+- `examples/url_ops.pith`
+- `examples/data_pipeline.pith`
+- `examples/strings_demo.pith`
+- `examples/matrix_math.pith`
+- `examples/json_ops.pith`
+- `examples/toml_ops.pith`
 
 The common pattern is not “missing power”. It is “too much ceremony”.
 
@@ -347,7 +347,7 @@ If work begins now, the first concrete implementation steps should be:
 1. Use validated combined IR for native build/run/test
 2. Simplify `ir_consumer.rs` further now that it can trust emitted metadata
 3. Move the remaining CLI orchestration policy out of `cranelift/cli/src/main.rs`
-4. Decide whether JSON/TOML/URL ownership belongs primarily in Forge stdlib or
+4. Decide whether JSON/TOML/URL ownership belongs primarily in Pith stdlib or
    Rust runtime, then delete the duplicate side
 5. Keep adding small formatting, display, and collection helpers that let
    examples read like normal application code
@@ -368,7 +368,7 @@ Today the Rust backend tries to recover facts like:
 
 That creates duplicate logic and drift between:
 
-- `self-host/ir_emitter.fg`
+- `self-host/ir_emitter.pith`
 - `cranelift/codegen/src/ir_consumer.rs`
 - `cranelift/codegen/src/lib.rs`
 
@@ -391,7 +391,7 @@ call REG NAME RETKIND NARGS ARG...
 Where:
 
 - `NAME` is already fully lowered
-  - examples: `url_to_string`, `toml_get_int`, `forge_path_basename`
+  - examples: `url_to_string`, `toml_get_int`, `pith_path_basename`
 - `RETKIND` is one of:
   - `void`
   - `int`
@@ -480,7 +480,7 @@ shrink or disappear:
 
 ### Implementation order inside Phase 1
 
-1. Teach `self-host/ir_emitter.fg` to emit `RETKIND` and explicit field info
+1. Teach `self-host/ir_emitter.pith` to emit `RETKIND` and explicit field info
 2. Update `self-host/ir_driver` to preserve the new IR format
 3. Update `ir_consumer.rs` to trust emitted metadata
 4. Delete the old inference helpers
@@ -490,8 +490,8 @@ shrink or disappear:
 
 Do not try to:
 
-- rewrite Cranelift lowering in Forge
-- replace low-level runtime storage with Forge code
+- rewrite Cranelift lowering in Pith
+- replace low-level runtime storage with Pith code
 - eliminate Rust entirely
 
 That would fight the architecture instead of tightening it.

@@ -13,13 +13,13 @@ the smallest useful validation loop is:
 
 ```
 zig build test
-./self-host/forge_main check <file>
+./self-host/pith_main check <file>
 make run-examples-self
 make run-regressions-self
 make bootstrap
 ```
 
-if `./self-host/forge_main` does not exist yet, build it first:
+if `./self-host/pith_main` does not exist yet, build it first:
 
 ```
 make self-host
@@ -29,9 +29,9 @@ recommended smoke loop for this repo:
 
 ```
 zig build test
-zig build run -- check examples/hello.fg
+zig build run -- check examples/hello.pith
 make self-host
-./self-host/forge_main check examples/hello.fg
+./self-host/pith_main check examples/hello.pith
 make run-examples-self
 make run-regressions-self
 make bootstrap
@@ -64,8 +64,8 @@ make bootstrap
 - bootstrap semantic logic: `bootstrap/checker.zig`
 - bootstrap code generation: `bootstrap/codegen.zig`
 - self-hosted implementation: `self-host/`
-- runtime support: `runtime/forge_runtime.h`
-- native tls and higher-level protocol work: `std/net/tls.fg`, `std/net/tls13.fg`, `std/net/http.fg`, `std/net/websocket.fg`
+- runtime support: `runtime/pith_runtime.h`
+- native tls and higher-level protocol work: `std/net/tls.pith`, `std/net/tls13.pith`, `std/net/http.pith`, `std/net/websocket.pith`
 - language and diagnostic docs: `docs/`
 
 ## common validation commands
@@ -73,9 +73,9 @@ make bootstrap
 ```
 zig fmt --check build.zig bootstrap/*.zig bootstrap/cli/*.zig
 zig build test
-zig build run -- check examples/hello.fg
+zig build run -- check examples/hello.pith
 make self-host
-./self-host/forge_main run examples/hello.fg
+./self-host/pith_main run examples/hello.pith
 make run-examples-self
 make run-regressions-self
 make bootstrap
@@ -84,5 +84,5 @@ make bootstrap
 for tls-facing changes, add a live sanity check after the normal loop:
 
 ```
-./self-host/forge_main run tests/live/test_tls_echo_live.fg
+./self-host/pith_main run tests/live/test_tls_echo_live.pith
 ```

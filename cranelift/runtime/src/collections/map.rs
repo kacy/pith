@@ -3,14 +3,14 @@
 //! Hybrid approach: Uses hashbrown::HashMap internally for O(1) lookups,
 //! but presents FFI-compatible interface matching the C runtime.
 
-use crate::collections::list::ForgeList;
-use crate::string::{forge_string_release, forge_string_retain, ForgeString};
+use crate::collections::list::PithList;
+use crate::string::{pith_string_release, pith_string_retain, PithString};
 use hashbrown::HashMap;
 use std::hash::{Hash, Hasher};
 /// FFI-compatible map handle
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct ForgeMap {
+pub struct PithMap {
     /// Pointer to internal map implementation
     ptr: *mut (),
 }
@@ -167,22 +167,22 @@ impl MapImpl {
 /// * `val_is_heap` - Whether values are heap types (need retain/release)
 /// Create a new string-key map with default settings
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_new_default() -> ForgeMap {
-    forge_map_new(1, 8, 0) // string keys, 8-byte values, not heap
+pub unsafe extern "C" fn pith_map_new_default() -> PithMap {
+    pith_map_new(1, 8, 0) // string keys, 8-byte values, not heap
 }
 
 /// Create a new int-key map with default settings
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_new_int() -> ForgeMap {
-    forge_map_new(0, 8, 0) // int keys, 8-byte values, not heap
+pub unsafe extern "C" fn pith_map_new_int() -> PithMap {
+    pith_map_new(0, 8, 0) // int keys, 8-byte values, not heap
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_new(
+pub unsafe extern "C" fn pith_map_new(
     key_type: i32,
     val_size: i64,
     val_is_heap: i64,
-) -> ForgeMap {
+) -> PithMap {
     let ktype = match key_type {
         1 => KeyType::String,
         _ => KeyType::Int,
@@ -190,14 +190,14 @@ pub unsafe extern "C" fn forge_map_new(
 
     let map_impl = MapImpl::new(ktype, val_size as usize, val_is_heap != 0);
     let boxed = Box::new(map_impl);
-    ForgeMap {
+    PithMap {
         ptr: Box::into_raw(boxed) as *mut (),
     }
 }
 
 /// Get map length
 #[no_mangle]
-pub extern "C" fn forge_map_len(map: ForgeMap) -> i64 {
+pub extern "C" fn pith_map_len(map: PithMap) -> i64 {
     if map.ptr.is_null() {
         return 0;
     }
@@ -214,8 +214,8 @@ pub extern "C" fn forge_map_len(map: ForgeMap) -> i64 {
 /// * `key` is the integer key value
 /// * `value` must point to valid data of size `val_size`
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_insert_int(
-    map: *mut ForgeMap,
+pub unsafe extern "C" fn pith_map_insert_int(
+    map: *mut PithMap,
     key: i64,
     value: *const u8,
     val_size: i64,
@@ -230,13 +230,13 @@ pub unsafe extern "C" fn forge_map_insert_int(
 
     // Verify value size matches
     if impl_ref.val_size != val_size as usize {
-        eprintln!("forge: map value size mismatch");
+        eprintln!("pith: map value size mismatch");
         return;
     }
 
     // Verify key type
     if !matches!(impl_ref.key_type, KeyType::Int) {
-        eprintln!("forge: map key type mismatch (expected int)");
+        eprintln!("pith: map key type mismatch (expected int)");
         return;
     }
 
@@ -254,15 +254,15 @@ pub unsafe extern "C" fn forge_map_insert_int(
     // Release old value if present
     if impl_ref.val_is_heap {
         if let Some(old_val) = impl_ref.get(&MapKey::Int(key)) {
-            let s = old_val.as_ptr() as *const ForgeString;
-            forge_string_release(*s);
+            let s = old_val.as_ptr() as *const PithString;
+            pith_string_release(*s);
         }
     }
 
     // Retain new value if heap type
     if impl_ref.val_is_heap {
-        let s = value as *const ForgeString;
-        forge_string_retain(*s);
+        let s = value as *const PithString;
+        pith_string_retain(*s);
     }
 
     // Insert into map
@@ -271,7 +271,7 @@ pub unsafe extern "C" fn forge_map_insert_int(
 
 /// Clear all entries from map
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_clear(map: *mut ForgeMap) {
+pub unsafe extern "C" fn pith_map_clear(map: *mut PithMap) {
     if map.is_null() || (*map).ptr.is_null() {
         return;
     }
@@ -281,8 +281,8 @@ pub unsafe extern "C" fn forge_map_clear(map: *mut ForgeMap) {
     // Release all values if they're heap types
     if impl_ref.val_is_heap {
         for (_, val) in &impl_ref.data {
-            let s = val.as_ptr() as *const ForgeString;
-            forge_string_release(*s);
+            let s = val.as_ptr() as *const PithString;
+            pith_string_release(*s);
         }
     }
 
@@ -294,23 +294,23 @@ pub unsafe extern "C" fn forge_map_clear(map: *mut ForgeMap) {
 /// # Safety
 /// Returns a new list that must be released
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_values(map: ForgeMap) -> ForgeList {
-    use crate::collections::list::forge_list_new;
+pub unsafe extern "C" fn pith_map_values(map: PithMap) -> PithList {
+    use crate::collections::list::pith_list_new;
 
     if map.ptr.is_null() {
-        return ForgeList {
+        return PithList {
             ptr: std::ptr::null_mut(),
         };
     }
 
     let impl_ref = &*(map.ptr as *const MapImpl);
-    let mut list = forge_list_new(
+    let mut list = pith_list_new(
         impl_ref.val_size as i64,
         if impl_ref.val_is_heap { 1 } else { 0 },
     );
 
     for val in impl_ref.values() {
-        crate::collections::list::forge_list_push(
+        crate::collections::list::pith_list_push(
             &mut list,
             val.as_ptr(),
             impl_ref.val_size as i64,
@@ -318,8 +318,8 @@ pub unsafe extern "C" fn forge_map_values(map: ForgeMap) -> ForgeList {
 
         // Retain values as they're being copied to the list
         if impl_ref.val_is_heap {
-            let s = val.as_ptr() as *const ForgeString;
-            forge_string_retain(*s);
+            let s = val.as_ptr() as *const PithString;
+            pith_string_retain(*s);
         }
     }
 
@@ -328,7 +328,7 @@ pub unsafe extern "C" fn forge_map_values(map: ForgeMap) -> ForgeList {
 
 /// Release map and free memory
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_release(map: ForgeMap) {
+pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     if map.ptr.is_null() {
         return;
     }
@@ -338,8 +338,8 @@ pub unsafe extern "C" fn forge_map_release(map: ForgeMap) {
     // Release all values if they're heap types
     if impl_ref.val_is_heap {
         for (_, val) in &impl_ref.data {
-            let s = val.as_ptr() as *const ForgeString;
-            forge_string_release(*s);
+            let s = val.as_ptr() as *const PithString;
+            pith_string_release(*s);
         }
     }
 
@@ -351,22 +351,22 @@ pub unsafe extern "C" fn forge_map_release(map: ForgeMap) {
 ///
 /// Called by cycle collector when freeing cyclic map objects
 #[no_mangle]
-pub extern "C" fn forge_map_destructor(ptr: *mut u8) {
+pub extern "C" fn pith_map_destructor(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }
 
     unsafe {
-        let map = ptr as *const ForgeMap;
-        forge_map_release(*map);
+        let map = ptr as *const PithMap;
+        pith_map_release(*map);
     }
 }
 
 // ---------------------------------------------------------------------------
 // C-string-key variants for Cranelift codegen
 //
-// These functions accept a raw map_handle (the ForgeMap.ptr cast to i64) and
-// null-terminated C string keys, providing a simpler ABI than the ForgeString
+// These functions accept a raw map_handle (the PithMap.ptr cast to i64) and
+// null-terminated C string keys, providing a simpler ABI than the PithString
 // variants above.
 // ---------------------------------------------------------------------------
 
@@ -388,7 +388,7 @@ unsafe fn cstr_to_map_key(key: *const i8) -> MapKey {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 /// * `key` must be a valid null-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_insert_cstr(map_handle: i64, key: *const i8, value: i64) {
+pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, value: i64) {
     if map_handle == 0 || key.is_null() {
         return;
     }
@@ -407,7 +407,7 @@ pub unsafe extern "C" fn forge_map_insert_cstr(map_handle: i64, key: *const i8, 
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 /// * `key` must be a valid null-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_get_cstr(map_handle: i64, key: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i64 {
     if map_handle == 0 || key.is_null() {
         return 0;
     }
@@ -431,7 +431,7 @@ pub unsafe extern "C" fn forge_map_get_cstr(map_handle: i64, key: *const i8) -> 
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 /// * `key` must be a valid null-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_contains_cstr(map_handle: i64, key: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_map_contains_cstr(map_handle: i64, key: *const i8) -> i64 {
     if map_handle == 0 || key.is_null() {
         return 0;
     }
@@ -450,7 +450,7 @@ pub unsafe extern "C" fn forge_map_contains_cstr(map_handle: i64, key: *const i8
 
 /// Get value by C-string key with a default if not found.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_get_default_cstr(map_handle: i64, key: *const i8, default: i64) -> i64 {
+pub unsafe extern "C" fn pith_map_get_default_cstr(map_handle: i64, key: *const i8, default: i64) -> i64 {
     if map_handle == 0 || key.is_null() {
         return default;
     }
@@ -468,7 +468,7 @@ pub unsafe extern "C" fn forge_map_get_default_cstr(map_handle: i64, key: *const
 
 /// Get value by integer key with a default if not found.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_get_default_ikey(map_handle: i64, key: i64, default: i64) -> i64 {
+pub unsafe extern "C" fn pith_map_get_default_ikey(map_handle: i64, key: i64, default: i64) -> i64 {
     if map_handle == 0 {
         return default;
     }
@@ -496,7 +496,7 @@ pub unsafe extern "C" fn forge_map_get_default_ikey(map_handle: i64, key: i64, d
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 /// * `key` must be a valid null-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_remove_cstr(map_handle: i64, key: *const i8) {
+pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
     if map_handle == 0 || key.is_null() {
         return;
     }
@@ -517,7 +517,7 @@ pub unsafe extern "C" fn forge_map_remove_cstr(map_handle: i64, key: *const i8) 
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_insert_ikey(map_handle: i64, key: i64, value: i64) {
+pub unsafe extern "C" fn pith_map_insert_ikey(map_handle: i64, key: i64, value: i64) {
     if map_handle == 0 {
         return;
     }
@@ -540,7 +540,7 @@ pub unsafe extern "C" fn forge_map_insert_ikey(map_handle: i64, key: i64, value:
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_get_ikey(map_handle: i64, key: i64) -> i64 {
+pub unsafe extern "C" fn pith_map_get_ikey(map_handle: i64, key: i64) -> i64 {
     if map_handle == 0 {
         return 0;
     }
@@ -568,7 +568,7 @@ pub unsafe extern "C" fn forge_map_get_ikey(map_handle: i64, key: i64) -> i64 {
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_contains_ikey(map_handle: i64, key: i64) -> i64 {
+pub unsafe extern "C" fn pith_map_contains_ikey(map_handle: i64, key: i64) -> i64 {
     if map_handle == 0 {
         return 0;
     }
@@ -597,7 +597,7 @@ pub unsafe extern "C" fn forge_map_contains_ikey(map_handle: i64, key: i64) -> i
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_remove_ikey(map_handle: i64, key: i64) {
+pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
     if map_handle == 0 {
         return;
     }
@@ -619,7 +619,7 @@ pub unsafe extern "C" fn forge_map_remove_ikey(map_handle: i64, key: i64) {
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_len_handle(map_handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_map_len_handle(map_handle: i64) -> i64 {
     if map_handle == 0 {
         return 0;
     }
@@ -628,24 +628,24 @@ pub unsafe extern "C" fn forge_map_len_handle(map_handle: i64) -> i64 {
     impl_ref.len() as i64
 }
 
-/// Return all keys as a ForgeList of C-string pointers (each element is an i64
-/// pointer to a newly allocated null-terminated string). The ForgeList pointer
+/// Return all keys as a PithList of C-string pointers (each element is an i64
+/// pointer to a newly allocated null-terminated string). The PithList pointer
 /// is returned as i64.
 ///
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_keys_cstr(map_handle: i64) -> i64 {
-    use crate::collections::list::{forge_list_new, forge_list_push_value};
+pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
+    use crate::collections::list::{pith_list_new, pith_list_push_value};
     use std::alloc::{alloc, Layout};
 
     if map_handle == 0 {
-        let empty = forge_list_new(8, 0);
+        let empty = pith_list_new(8, 0);
         return empty.ptr as i64;
     }
 
     let impl_ref = &*(map_handle as *const MapImpl);
-    let list = forge_list_new(8, 0); // list of i64 (pointer-sized primitives)
+    let list = pith_list_new(8, 0); // list of i64 (pointer-sized primitives)
 
     for key in impl_ref.keys() {
         if let MapKey::String(ref bytes) = key {
@@ -655,7 +655,7 @@ pub unsafe extern "C" fn forge_map_keys_cstr(map_handle: i64) -> i64 {
             if !ptr.is_null() {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len);
                 *ptr.add(len) = 0;
-                forge_list_push_value(list, ptr as i64);
+                pith_list_push_value(list, ptr as i64);
             }
         }
     }
@@ -668,7 +668,7 @@ pub unsafe extern "C" fn forge_map_keys_cstr(map_handle: i64) -> i64 {
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_clear_handle(map_handle: i64) {
+pub unsafe extern "C" fn pith_map_clear_handle(map_handle: i64) {
     if map_handle == 0 {
         return;
     }
@@ -682,7 +682,7 @@ pub unsafe extern "C" fn forge_map_clear_handle(map_handle: i64) {
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_is_empty_handle(map_handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_map_is_empty_handle(map_handle: i64) -> i64 {
     if map_handle == 0 {
         return 1;
     }
@@ -691,27 +691,27 @@ pub unsafe extern "C" fn forge_map_is_empty_handle(map_handle: i64) -> i64 {
     if impl_ref.len() == 0 { 1 } else { 0 }
 }
 
-/// Return all values as a ForgeList (handle-based API). The ForgeList pointer
+/// Return all values as a PithList (handle-based API). The PithList pointer
 /// is returned as i64.
 ///
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
-pub unsafe extern "C" fn forge_map_values_handle(map_handle: i64) -> i64 {
-    use crate::collections::list::{forge_list_new, forge_list_push_value};
+pub unsafe extern "C" fn pith_map_values_handle(map_handle: i64) -> i64 {
+    use crate::collections::list::{pith_list_new, pith_list_push_value};
 
     if map_handle == 0 {
-        let empty = forge_list_new(8, 0);
+        let empty = pith_list_new(8, 0);
         return empty.ptr as i64;
     }
 
     let impl_ref = &*(map_handle as *const MapImpl);
-    let list = forge_list_new(8, 0);
+    let list = pith_list_new(8, 0);
 
     for val in impl_ref.values() {
         if val.len() >= 8 {
             let v = i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]));
-            forge_list_push_value(list, v);
+            pith_list_push_value(list, v);
         }
     }
 

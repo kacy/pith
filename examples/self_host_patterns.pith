@@ -1,0 +1,123 @@
+# self_host_patterns — exercises every pattern used by the self-hosted compiler
+# this is the integration test for self-hosting readiness
+
+# --- structs with list fields (ast.pith pattern) ---
+struct Node:
+    kind: String
+    value: String
+    children: List[Int]
+
+mut nodes: List[Node] := []
+
+fn add_node(kind: String, value: String, children: List[Int]) -> Int:
+    nodes.push(Node(kind, value, children))
+    return nodes.len() - 1
+
+fn add_leaf(kind: String, value: String) -> Int:
+    mut empty: List[Int] := []
+    nodes.push(Node(kind, value, empty))
+    return nodes.len() - 1
+
+# --- for-in over struct field (160 occurrences in self-host) ---
+fn count_children(idx: Int) -> Int:
+    node := nodes[idx]
+    mut count := 0
+    for child in node.children:
+        count = count + 1
+    return count
+
+fn collect_child_kinds(idx: Int) -> List[String]:
+    node := nodes[idx]
+    mut kinds: List[String] := []
+    for child in node.children:
+        child_node := nodes[child]
+        kinds.push(child_node.kind)
+    return kinds
+
+# --- string methods (substring 85x, split 13x, contains 16x, trim 8x) ---
+fn test_string_methods() -> String:
+    s := "hello world"
+    sub := s.substring(0, 5)
+    parts := "a,b,c".split(",")
+    has := s.contains("world")
+    trimmed := "  hi  ".trim()
+    starts := s.starts_with("hello")
+    return sub + "|" + parts.join("+") + "|" + has.to_string() + "|" + trimmed + "|" + starts.to_string()
+
+# --- map operations (insert 40x, contains_key 27x, keys 3x) ---
+fn test_map_ops():
+    mut m: Map[String, Int] := {}
+    m.insert("a", 1)
+    m.insert("b", 2)
+    m.insert("c", 3)
+    print("has a: " + m.contains_key("a").to_string())
+    print("has z: " + m.contains_key("z").to_string())
+    k := m.keys()
+    print("key count: " + k.len().to_string())
+
+# --- integer-key maps (checker.pith pattern) ---
+fn test_int_key_map():
+    mut cache: Map[Int, Int] := {}
+    cache.insert(10, 100)
+    cache.insert(20, 200)
+    print("cache has 10: " + cache.contains_key(10).to_string())
+    print("cache has 99: " + cache.contains_key(99).to_string())
+    print("cache[10]: " + cache[10].to_string())
+
+# --- recursive function (scope.pith parent chain pattern) ---
+struct Scope:
+    parent: Int
+    name: String
+
+mut scopes: List[Scope] := []
+
+fn lookup(scope_id: Int, target: String) -> String:
+    if scope_id < 0:
+        return "not found"
+    s := scopes[scope_id]
+    if s.name == target:
+        return "found at " + scope_id.to_string()
+    return lookup(s.parent, target)
+
+fn main():
+    # build a small AST
+    leaf1 := add_leaf("int", "1")
+    leaf2 := add_leaf("int", "2")
+    leaf3 := add_leaf("ident", "x")
+    parent := add_node("binary", "+", [leaf1, leaf2])
+    root := add_node("call", "add", [parent, leaf3])
+
+    print("nodes: " + nodes.len().to_string())
+    print("root children: " + count_children(root).to_string())
+    print("child kinds: " + collect_child_kinds(root).join(", "))
+
+    # nested iteration
+    root_node := nodes[root]
+    mut all_leaves := 0
+    for child in root_node.children:
+        child_count := count_children(child)
+        if child_count == 0:
+            all_leaves = all_leaves + 1
+        else:
+            for grandchild in nodes[child].children:
+                all_leaves = all_leaves + 1
+    print("leaf count: " + all_leaves.to_string())
+
+    # string methods
+    print("strings: " + test_string_methods())
+
+    # map operations
+    test_map_ops()
+
+    # integer-key map
+    test_int_key_map()
+
+    # scope chain lookup
+    scopes.push(Scope(-1, "global"))
+    scopes.push(Scope(0, "func"))
+    scopes.push(Scope(1, "block"))
+    print("lookup block: " + lookup(2, "block"))
+    print("lookup global: " + lookup(2, "global"))
+    print("lookup missing: " + lookup(2, "missing"))
+
+    print("self host patterns work")

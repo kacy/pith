@@ -1,5 +1,5 @@
-use crate::bytes::{forge_bytes_from_vec, forge_bytes_ref};
-use crate::collections::list::{forge_list_new, forge_list_push_value};
+use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
+use crate::collections::list::{pith_list_new, pith_list_push_value};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::File;
@@ -13,14 +13,14 @@ fn file_handles() -> &'static Mutex<HashMap<i64, File>> {
     FILE_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-unsafe fn forge_open_file_with(path: *const i8, create: bool, write: bool, append: bool) -> i64 {
+unsafe fn pith_open_file_with(path: *const i8, create: bool, write: bool, append: bool) -> i64 {
     use std::fs::OpenOptions;
 
     if path.is_null() {
         return 0;
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     let Ok(path_str) = std::str::from_utf8(slice) else {
         return 0;
@@ -48,12 +48,12 @@ unsafe fn forge_open_file_with(path: *const i8, create: bool, write: bool, appen
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_file_exists(path: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_file_exists(path: *const i8) -> i64 {
     if path.is_null() {
         return 0;
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         if std::path::Path::new(path_str).exists() {
@@ -68,12 +68,12 @@ pub unsafe extern "C" fn forge_file_exists(path: *const i8) -> i64 {
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_dir_exists(path: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_dir_exists(path: *const i8) -> i64 {
     if path.is_null() {
         return 0;
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         let path = std::path::Path::new(path_str);
@@ -89,14 +89,14 @@ pub unsafe extern "C" fn forge_dir_exists(path: *const i8) -> i64 {
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_mkdir(path: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_mkdir(path: *const i8) -> i64 {
     use std::fs;
 
     if path.is_null() {
         return 0;
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         if fs::create_dir_all(path_str).is_ok() {
@@ -111,14 +111,14 @@ pub unsafe extern "C" fn forge_mkdir(path: *const i8) -> i64 {
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_remove_dir(path: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_remove_dir(path: *const i8) -> i64 {
     use std::fs;
 
     if path.is_null() {
         return 0;
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         if fs::remove_dir(path_str).is_ok() {
@@ -133,14 +133,14 @@ pub unsafe extern "C" fn forge_remove_dir(path: *const i8) -> i64 {
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_remove_tree(path: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_remove_tree(path: *const i8) -> i64 {
     use std::fs;
 
     if path.is_null() {
         return 0;
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         if fs::remove_dir_all(path_str).is_ok() {
@@ -156,12 +156,12 @@ pub unsafe extern "C" fn forge_remove_tree(path: *const i8) -> i64 {
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_file_size(path: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_file_size(path: *const i8) -> i64 {
     if path.is_null() {
         return -1;
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         if let Ok(meta) = std::fs::metadata(path_str) {
@@ -176,14 +176,14 @@ pub unsafe extern "C" fn forge_file_size(path: *const i8) -> i64 {
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_remove_file(path: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_remove_file(path: *const i8) -> i64 {
     use std::fs;
 
     if path.is_null() {
         return 0;
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         if fs::remove_file(path_str).is_ok() {
@@ -198,15 +198,15 @@ pub unsafe extern "C" fn forge_remove_file(path: *const i8) -> i64 {
 /// # Safety
 /// Both paths must be valid null-terminated C strings
 #[no_mangle]
-pub unsafe extern "C" fn forge_rename_file(from: *const i8, to: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_rename_file(from: *const i8, to: *const i8) -> i64 {
     use std::fs;
 
     if from.is_null() || to.is_null() {
         return 0;
     }
 
-    let from_len = crate::string::forge_cstring_len(from) as usize;
-    let to_len = crate::string::forge_cstring_len(to) as usize;
+    let from_len = crate::string::pith_cstring_len(from) as usize;
+    let to_len = crate::string::pith_cstring_len(to) as usize;
     let from_slice = std::slice::from_raw_parts(from as *const u8, from_len);
     let to_slice = std::slice::from_raw_parts(to as *const u8, to_len);
 
@@ -222,12 +222,12 @@ pub unsafe extern "C" fn forge_rename_file(from: *const i8, to: *const i8) -> i6
 }
 
 /// Read entire file contents as a C string
-/// Returns null pointer on error. Caller must free with forge_free.
+/// Returns null pointer on error. Caller must free with pith_free.
 ///
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_read_file(path: *const i8) -> *mut i8 {
+pub unsafe extern "C" fn pith_read_file(path: *const i8) -> *mut i8 {
     use std::alloc::{alloc, Layout};
     use std::fs;
 
@@ -235,7 +235,7 @@ pub unsafe extern "C" fn forge_read_file(path: *const i8) -> *mut i8 {
         return std::ptr::null_mut();
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         if let Ok(contents) = fs::read_to_string(path_str) {
@@ -254,35 +254,35 @@ pub unsafe extern "C" fn forge_read_file(path: *const i8) -> *mut i8 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_read_file_bytes(path: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_read_file_bytes(path: *const i8) -> i64 {
     use std::fs;
 
     if path.is_null() {
         return 0;
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     let Ok(path_str) = std::str::from_utf8(slice) else {
         return 0;
     };
 
     match fs::read(path_str) {
-        Ok(contents) => forge_bytes_from_vec(contents),
+        Ok(contents) => pith_bytes_from_vec(contents),
         Err(_) => 0,
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_write_file(path: *const i8, content: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_write_file(path: *const i8, content: *const i8) -> i64 {
     use std::fs;
 
     if path.is_null() || content.is_null() {
         return 0;
     }
 
-    let path_len = crate::string::forge_cstring_len(path) as usize;
-    let content_len = crate::string::forge_cstring_len(content) as usize;
+    let path_len = crate::string::pith_cstring_len(path) as usize;
+    let content_len = crate::string::pith_cstring_len(content) as usize;
     let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
     let content_slice = std::slice::from_raw_parts(content as *const u8, content_len);
 
@@ -298,16 +298,16 @@ pub unsafe extern "C" fn forge_write_file(path: *const i8, content: *const i8) -
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_write_file_bytes(path: *const i8, content: i64) -> i64 {
+pub unsafe extern "C" fn pith_write_file_bytes(path: *const i8, content: i64) -> i64 {
     use std::fs;
 
     if path.is_null() {
         return 0;
     }
-    let Some(bytes) = forge_bytes_ref(content) else {
+    let Some(bytes) = pith_bytes_ref(content) else {
         return 0;
     };
-    let path_len = crate::string::forge_cstring_len(path) as usize;
+    let path_len = crate::string::pith_cstring_len(path) as usize;
     let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
     let Ok(path_str) = std::str::from_utf8(path_slice) else {
         return 0;
@@ -319,7 +319,7 @@ pub unsafe extern "C" fn forge_write_file_bytes(path: *const i8, content: i64) -
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_append_file(path: *const i8, content: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_append_file(path: *const i8, content: *const i8) -> i64 {
     use std::fs::OpenOptions;
     use std::io::Write;
 
@@ -327,8 +327,8 @@ pub unsafe extern "C" fn forge_append_file(path: *const i8, content: *const i8) 
         return 0;
     }
 
-    let path_len = crate::string::forge_cstring_len(path) as usize;
-    let content_len = crate::string::forge_cstring_len(content) as usize;
+    let path_len = crate::string::pith_cstring_len(path) as usize;
+    let content_len = crate::string::pith_cstring_len(content) as usize;
     let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
     let content_slice = std::slice::from_raw_parts(content as *const u8, content_len);
 
@@ -346,17 +346,17 @@ pub unsafe extern "C" fn forge_append_file(path: *const i8, content: *const i8) 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_append_file_bytes(path: *const i8, content: i64) -> i64 {
+pub unsafe extern "C" fn pith_append_file_bytes(path: *const i8, content: i64) -> i64 {
     use std::fs::OpenOptions;
     use std::io::Write;
 
     if path.is_null() {
         return 0;
     }
-    let Some(bytes) = forge_bytes_ref(content) else {
+    let Some(bytes) = pith_bytes_ref(content) else {
         return 0;
     };
-    let path_len = crate::string::forge_cstring_len(path) as usize;
+    let path_len = crate::string::pith_cstring_len(path) as usize;
     let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
     let Ok(path_str) = std::str::from_utf8(path_slice) else {
         return 0;
@@ -370,22 +370,22 @@ pub unsafe extern "C" fn forge_append_file_bytes(path: *const i8, content: i64) 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_file_open_read(path: *const i8) -> i64 {
-    forge_open_file_with(path, false, false, false)
+pub unsafe extern "C" fn pith_file_open_read(path: *const i8) -> i64 {
+    pith_open_file_with(path, false, false, false)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_file_open_write(path: *const i8) -> i64 {
-    forge_open_file_with(path, true, true, false)
+pub unsafe extern "C" fn pith_file_open_write(path: *const i8) -> i64 {
+    pith_open_file_with(path, true, true, false)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_file_open_append(path: *const i8) -> i64 {
-    forge_open_file_with(path, true, false, true)
+pub unsafe extern "C" fn pith_file_open_append(path: *const i8) -> i64 {
+    pith_open_file_with(path, true, false, true)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_file_read(handle: i64, max_bytes: i64) -> *mut i8 {
+pub unsafe extern "C" fn pith_file_read(handle: i64, max_bytes: i64) -> *mut i8 {
     use std::io::Read;
 
     let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
@@ -396,17 +396,17 @@ pub unsafe extern "C" fn forge_file_read(handle: i64, max_bytes: i64) -> *mut i8
 
     let mut buf = vec![0u8; size];
     match file.read(&mut buf) {
-        Ok(0) => crate::forge_cstring_empty(),
+        Ok(0) => crate::pith_cstring_empty(),
         Ok(n) => {
             buf.truncate(n);
-            crate::forge_copy_bytes_to_cstring(&buf)
+            crate::pith_copy_bytes_to_cstring(&buf)
         }
         Err(_) => std::ptr::null_mut(),
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_file_read_bytes(handle: i64, max_bytes: i64) -> i64 {
+pub unsafe extern "C" fn pith_file_read_bytes(handle: i64, max_bytes: i64) -> i64 {
     use std::io::Read;
 
     let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
@@ -419,21 +419,21 @@ pub unsafe extern "C" fn forge_file_read_bytes(handle: i64, max_bytes: i64) -> i
     match file.read(&mut buf) {
         Ok(n) => {
             buf.truncate(n);
-            forge_bytes_from_vec(buf)
+            pith_bytes_from_vec(buf)
         }
         Err(_) => 0,
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_file_write(handle: i64, data: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_file_write(handle: i64, data: *const i8) -> i64 {
     use std::io::Write;
 
     if data.is_null() {
         return 0;
     }
 
-    let len = crate::string::forge_cstring_len(data) as usize;
+    let len = crate::string::pith_cstring_len(data) as usize;
     let bytes = std::slice::from_raw_parts(data as *const u8, len);
     let mut handles = file_handles().lock();
     let Some(file) = handles.get_mut(&handle) else {
@@ -447,10 +447,10 @@ pub unsafe extern "C" fn forge_file_write(handle: i64, data: *const i8) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_file_write_bytes(handle: i64, data: i64) -> i64 {
+pub unsafe extern "C" fn pith_file_write_bytes(handle: i64, data: i64) -> i64 {
     use std::io::Write;
 
-    let Some(bytes) = forge_bytes_ref(data) else {
+    let Some(bytes) = pith_bytes_ref(data) else {
         return 0;
     };
     let mut handles = file_handles().lock();
@@ -465,7 +465,7 @@ pub unsafe extern "C" fn forge_file_write_bytes(handle: i64, data: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn forge_file_close(handle: i64) {
+pub extern "C" fn pith_file_close(handle: i64) {
     file_handles().lock().remove(&handle);
 }
 
@@ -474,14 +474,14 @@ pub extern "C" fn forge_file_close(handle: i64) {
 /// # Safety
 /// name must be a valid null-terminated C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_env(name: *const i8) -> *const i8 {
+pub unsafe extern "C" fn pith_env(name: *const i8) -> *const i8 {
     use std::alloc::{alloc, Layout};
 
     if name.is_null() {
         return std::ptr::null();
     }
 
-    let len = crate::string::forge_cstring_len(name) as usize;
+    let len = crate::string::pith_cstring_len(name) as usize;
     let slice = std::slice::from_raw_parts(name as *const u8, len);
     if let Ok(name_str) = std::str::from_utf8(slice) {
         if let Ok(var) = std::env::var(name_str) {
@@ -496,26 +496,26 @@ pub unsafe extern "C" fn forge_env(name: *const i8) -> *const i8 {
             }
         }
     }
-    crate::forge_strdup_string("")
+    crate::pith_strdup_string("")
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_os_getcwd() -> *const i8 {
+pub unsafe extern "C" fn pith_os_getcwd() -> *const i8 {
     if let Ok(path) = std::env::current_dir() {
         if let Some(text) = path.to_str() {
-            return crate::forge_strdup_string(text);
+            return crate::pith_strdup_string(text);
         }
     }
     std::ptr::null()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_os_chdir(path: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_os_chdir(path: *const i8) -> i64 {
     if path.is_null() {
         return 0;
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         if std::env::set_current_dir(path_str).is_ok() {
@@ -526,33 +526,33 @@ pub unsafe extern "C" fn forge_os_chdir(path: *const i8) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_os_temp_dir() -> *const i8 {
+pub unsafe extern "C" fn pith_os_temp_dir() -> *const i8 {
     let path = std::env::temp_dir();
     if let Some(text) = path.to_str() {
-        return crate::forge_strdup_string(text);
+        return crate::pith_strdup_string(text);
     }
     std::ptr::null()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_os_home_dir() -> *const i8 {
+pub unsafe extern "C" fn pith_os_home_dir() -> *const i8 {
     if let Ok(home) = std::env::var("HOME") {
-        return crate::forge_strdup_string(&home);
+        return crate::pith_strdup_string(&home);
     }
     if let Ok(home) = std::env::var("USERPROFILE") {
-        return crate::forge_strdup_string(&home);
+        return crate::pith_strdup_string(&home);
     }
     std::ptr::null()
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_os_set_env(name: *const i8, value: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_os_set_env(name: *const i8, value: *const i8) -> i64 {
     if name.is_null() || value.is_null() {
         return 0;
     }
 
-    let name_len = crate::string::forge_cstring_len(name) as usize;
-    let value_len = crate::string::forge_cstring_len(value) as usize;
+    let name_len = crate::string::pith_cstring_len(name) as usize;
+    let value_len = crate::string::pith_cstring_len(value) as usize;
     let name_slice = std::slice::from_raw_parts(name as *const u8, name_len);
     let value_slice = std::slice::from_raw_parts(value as *const u8, value_len);
     if let (Ok(name_str), Ok(value_str)) = (
@@ -566,12 +566,12 @@ pub unsafe extern "C" fn forge_os_set_env(name: *const i8, value: *const i8) -> 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_os_unset_env(name: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_os_unset_env(name: *const i8) -> i64 {
     if name.is_null() {
         return 0;
     }
 
-    let name_len = crate::string::forge_cstring_len(name) as usize;
+    let name_len = crate::string::pith_cstring_len(name) as usize;
     let name_slice = std::slice::from_raw_parts(name as *const u8, name_len);
     if let Ok(name_str) = std::str::from_utf8(name_slice) {
         std::env::remove_var(name_str);
@@ -581,29 +581,29 @@ pub unsafe extern "C" fn forge_os_unset_env(name: *const i8) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_list_dir(path: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_list_dir(path: *const i8) -> i64 {
     use std::fs;
 
     if path.is_null() {
-        return forge_list_new(8, 1).ptr as i64;
+        return pith_list_new(8, 1).ptr as i64;
     }
 
-    let len = crate::string::forge_cstring_len(path) as usize;
+    let len = crate::string::pith_cstring_len(path) as usize;
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         if let Ok(entries) = fs::read_dir(path_str) {
-            let list = forge_list_new(8, 1);
+            let list = pith_list_new(8, 1);
 
             for entry in entries {
                 if let Ok(entry) = entry {
                     if let Some(name) = entry.file_name().to_str() {
-                        let name_ptr = crate::forge_strdup_string(name) as i64;
-                        forge_list_push_value(list, name_ptr);
+                        let name_ptr = crate::pith_strdup_string(name) as i64;
+                        pith_list_push_value(list, name_ptr);
                     }
                 }
             }
             return list.ptr as i64;
         }
     }
-    forge_list_new(8, 1).ptr as i64
+    pith_list_new(8, 1).ptr as i64
 }

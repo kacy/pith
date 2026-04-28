@@ -1,0 +1,112 @@
+import std.config as config
+import std.fs as fs
+import std.os.path as path
+
+struct AppConfig:
+    pub name: String
+    pub debug: Bool
+
+struct ServerConfig:
+    pub host: String
+    pub port: Int
+    pub tls: Bool
+
+struct OptionalServerConfig:
+    pub host: String
+    pub tls: Bool?
+
+struct DefaultServerConfig:
+    pub host: String
+    pub port: Int = 7000
+    pub tls: Bool = false
+
+struct NestedDefaultAppConfig:
+    pub name: String
+    pub server: DefaultServerConfig = DefaultServerConfig("127.0.0.1")
+
+fn main() -> String!:
+    mut values: Map[String, String] := {}
+    values.insert("name", "pith")
+    values.insert("debug", "true")
+    values.insert("server.host", "127.0.0.1")
+    values.insert("server.port", "8080")
+    values.insert("server.tls", "yes")
+    cfg := config.from_map(values)
+
+    app := config.decode[AppConfig](cfg)
+    server := config.decode_prefix[ServerConfig](cfg, "server")
+    assert(app.is_ok)
+    assert(server.is_ok)
+    print("app:{app.ok.name}:{app.ok.debug}")
+    print("server:{server.ok.host}:{server.ok.port}:{server.ok.tls}")
+
+    optional_server := config.decode_prefix[OptionalServerConfig](cfg, "server")
+    assert(optional_server.is_ok)
+    print("optional-server:{optional_server.ok.host}:{optional_server.ok.tls?.to_string()}")
+
+    mut optional_values: Map[String, String] := {}
+    optional_values.insert("server.host", "127.0.0.1")
+    optional_missing_server := config.decode_prefix[OptionalServerConfig](config.from_map(optional_values), "server")
+    assert(optional_missing_server.is_ok)
+    print("optional-missing:{optional_missing_server.ok.host}:{(optional_missing_server.ok.tls == none).to_string()}")
+
+    default_server := config.decode_prefix[DefaultServerConfig](config.from_map(optional_values), "server")
+    assert(default_server.is_ok)
+    print("default-server:{default_server.ok.host}:{default_server.ok.port}:{default_server.ok.tls}")
+
+    mut nested_default_values: Map[String, String] := {}
+    nested_default_values.insert("name", "pith")
+    nested_default_missing := config.decode[NestedDefaultAppConfig](config.from_map(nested_default_values))
+    assert(nested_default_missing.is_ok)
+    print("nested-default-missing:{nested_default_missing.ok.name}:{nested_default_missing.ok.server.host}:{nested_default_missing.ok.server.port}:{nested_default_missing.ok.server.tls}")
+
+    nested_default_values.insert("server.host", "edge")
+    nested_default_partial := config.decode[NestedDefaultAppConfig](config.from_map(nested_default_values))
+    assert(nested_default_partial.is_ok)
+    print("nested-default-partial:{nested_default_partial.ok.name}:{nested_default_partial.ok.server.host}:{nested_default_partial.ok.server.port}:{nested_default_partial.ok.server.tls}")
+
+    missing := config.decode[AppConfig](config.empty())
+    assert(missing.is_err)
+    print("missing:" + missing.err.message)
+
+    mut bad_values: Map[String, String] := {}
+    bad_values.insert("server.host", "127.0.0.1")
+    bad_values.insert("server.port", "oops")
+    bad_values.insert("server.tls", "maybe")
+    bad := config.decode_prefix[ServerConfig](config.from_map(bad_values), "server")
+    assert(bad.is_err)
+    print("bad:" + bad.err.message)
+
+    root := fs.make_temp_dir("pith-config-typed-")!
+    toml_path := path.join(root, "app.toml")
+    json_path := path.join(root, "app.json")
+    assert(fs.write(toml_path, "host = " + chr(34) + "localhost" + chr(34) + chr(10) + "port = 8080" + chr(10))!)
+    assert(fs.write(json_path, chr(123) + chr(34) + "host" + chr(34) + ":" + chr(34) + "0.0.0.0" + chr(34) + "," + chr(34) + "port" + chr(34) + ":9090" + chr(125))!)
+
+    typed_toml := config.from_toml_file_typed[ConfigFileServer](toml_path)
+    typed_json := config.from_json_file_typed[ConfigFileServer](json_path)
+    assert(typed_toml.is_ok)
+    assert(typed_json.is_ok)
+    print("typed-toml:{typed_toml.ok.host}:{typed_toml.ok.port}")
+    print("typed-json:{typed_json.ok.host}:{typed_json.ok.port}")
+
+    nested_toml := "name = " + chr(34) + "pith" + chr(34) + chr(10) + "[server]" + chr(10) + "host = " + chr(34) + "127.0.0.1" + chr(34) + chr(10) + "port = 8080" + chr(10) + "tls = true" + chr(10)
+    nested_json := chr(123) + chr(34) + "name" + chr(34) + ":" + chr(34) + "pith" + chr(34) + "," + chr(34) + "server" + chr(34) + ":" + chr(123) + chr(34) + "host" + chr(34) + ":" + chr(34) + "0.0.0.0" + chr(34) + "," + chr(34) + "port" + chr(34) + ":9090," + chr(34) + "tls" + chr(34) + ":false" + chr(125) + chr(125)
+    nested_toml_cfg := config.from_toml_typed_prefix[ServerConfig](nested_toml, "server")
+    nested_json_cfg := config.from_json_typed_prefix[ServerConfig](nested_json, "server")
+    file_nested_toml := config.from_toml_file_typed_prefix[ConfigFileServer](toml_path, "")
+    file_nested_json := config.from_json_file_typed_prefix[ConfigFileServer](json_path, "")
+    assert(nested_toml_cfg.is_ok)
+    assert(nested_json_cfg.is_ok)
+    assert(file_nested_toml.is_ok)
+    assert(file_nested_json.is_ok)
+    print("prefix-toml:{nested_toml_cfg.ok.host}:{nested_toml_cfg.ok.port}:{nested_toml_cfg.ok.tls}")
+    print("prefix-json:{nested_json_cfg.ok.host}:{nested_json_cfg.ok.port}:{nested_json_cfg.ok.tls}")
+    print("file-prefix-toml:{file_nested_toml.ok.host}:{file_nested_toml.ok.port}")
+    print("file-prefix-json:{file_nested_json.ok.host}:{file_nested_json.ok.port}")
+    assert(fs.remove_tree(root))
+    return ""
+
+struct ConfigFileServer:
+    pub host: String
+    pub port: Int

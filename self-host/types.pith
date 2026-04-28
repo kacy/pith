@@ -1,0 +1,369 @@
+# types.pith — type representation for the self-hosted type checker
+#
+# mirrors src/types.zig but uses pith idioms: flat struct with string
+# kind tag instead of tagged union, global lists instead of pointer-based
+# tables. TypeIds are plain integers indexing into a flat list.
+
+from std.collections import copy_list
+
+# ---------------------------------------------------------------
+# type id constants — must match the zig bootstrap
+# ---------------------------------------------------------------
+
+pub TID_INT := 0
+pub TID_UINT := 1
+pub TID_FLOAT := 2
+pub TID_BOOL := 3
+pub TID_STRING := 4
+pub TID_BYTES := 5
+pub TID_VOID := 6
+pub TID_INT8 := 7
+pub TID_INT16 := 8
+pub TID_INT32 := 9
+pub TID_INT64 := 10
+pub TID_UINT8 := 11
+pub TID_UINT16 := 12
+pub TID_UINT32 := 13
+pub TID_UINT64 := 14
+pub TID_ERR := 15
+pub TID_FIRST_USER := 16
+
+# ---------------------------------------------------------------
+# type info — flat struct with string kind tag
+# ---------------------------------------------------------------
+#
+# kind values: "primitive", "struct", "enum", "function", "optional",
+#   "result", "tuple", "task", "channel", "list", "map", "set"
+#
+# unused fields default to empty/0/-1 depending on kind.
+
+pub struct TypeInfo:
+    pub kind: String
+    pub name: String
+    # struct fields
+    pub fields: List[String]
+    pub field_types: List[Int]
+    pub field_pub: List[Bool]
+    pub field_mut: List[Bool]
+    # function signature
+    pub param_types: List[Int]
+    pub return_type: Int
+    # optional/list/set/task/channel inner type
+    pub inner: Int
+    # map key/value types
+    pub key_type: Int
+    pub value_type: Int
+    # tuple element types
+    pub elements: List[Int]
+    # enum variants
+    pub variants: List[String]
+    pub variant_types: List[List[Int]]
+
+# ---------------------------------------------------------------
+# constructors — one per kind for clarity
+# ---------------------------------------------------------------
+
+pub fn ti_primitive(name: String) -> TypeInfo:
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mut empty_li: List[List[Int]] := []
+    return TypeInfo("primitive", name, empty_s, empty_i, empty_b, empty_b, empty_i, -1, -1, -1, -1, empty_i, empty_s, empty_li)
+
+pub fn ti_struct(name: String, fields: List[String], field_types: List[Int], field_pub: List[Bool], field_mut: List[Bool]) -> TypeInfo:
+    mut empty_i: List[Int] := []
+    mut empty_s: List[String] := []
+    mut empty_li: List[List[Int]] := []
+    copied_fields := copy_list(fields)
+    copied_field_types := copy_list(field_types)
+    copied_field_pub := copy_list(field_pub)
+    copied_field_mut := copy_list(field_mut)
+    return TypeInfo("struct", name, copied_fields, copied_field_types, copied_field_pub, copied_field_mut, empty_i, -1, -1, -1, -1, empty_i, empty_s, empty_li)
+
+pub fn ti_enum(name: String, variants: List[String], variant_types: List[List[Int]]) -> TypeInfo:
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mut empty_li: List[List[Int]] := []
+    return TypeInfo("enum", name, empty_s, empty_i, empty_b, empty_b, empty_i, -1, -1, -1, -1, empty_i, variants, variant_types)
+
+pub fn ti_function(param_types: List[Int], return_type: Int) -> TypeInfo:
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mut empty_li: List[List[Int]] := []
+    copied_params := copy_list(param_types)
+    return TypeInfo("function", "", empty_s, empty_i, empty_b, empty_b, copied_params, return_type, -1, -1, -1, empty_i, empty_s, empty_li)
+
+pub fn ti_optional(inner: Int) -> TypeInfo:
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mut empty_li: List[List[Int]] := []
+    return TypeInfo("optional", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, inner, -1, -1, empty_i, empty_s, empty_li)
+
+pub fn ti_result(ok_type: Int, err_type: Int) -> TypeInfo:
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mut empty_li: List[List[Int]] := []
+    return TypeInfo("result", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, ok_type, -1, err_type, empty_i, empty_s, empty_li)
+
+pub fn ti_tuple(elements: List[Int]) -> TypeInfo:
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mut empty_li: List[List[Int]] := []
+    return TypeInfo("tuple", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, -1, -1, -1, elements, empty_s, empty_li)
+
+pub fn ti_list(element: Int) -> TypeInfo:
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mut empty_li: List[List[Int]] := []
+    return TypeInfo("list", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, element, -1, -1, empty_i, empty_s, empty_li)
+
+pub fn ti_map(key_type: Int, val_type: Int) -> TypeInfo:
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mut empty_li: List[List[Int]] := []
+    return TypeInfo("map", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, -1, key_type, val_type, empty_i, empty_s, empty_li)
+
+pub fn ti_set(element: Int) -> TypeInfo:
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mut empty_li: List[List[Int]] := []
+    return TypeInfo("set", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, element, -1, -1, empty_i, empty_s, empty_li)
+
+pub fn ti_task(inner: Int) -> TypeInfo:
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mut empty_li: List[List[Int]] := []
+    return TypeInfo("task", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, inner, -1, -1, empty_i, empty_s, empty_li)
+
+pub fn ti_channel(inner: Int) -> TypeInfo:
+    mut empty_s: List[String] := []
+    mut empty_i: List[Int] := []
+    mut empty_b: List[Bool] := []
+    mut empty_li: List[List[Int]] := []
+    return TypeInfo("channel", "", empty_s, empty_i, empty_b, empty_b, empty_i, -1, inner, -1, -1, empty_i, empty_s, empty_li)
+
+# ---------------------------------------------------------------
+# type table — global flat list + name map
+# ---------------------------------------------------------------
+
+mut tt_types: List[TypeInfo] := []
+mut tt_names: Map[String, Int] := {}
+
+# add a type to the table, return its id
+pub fn add_type_info(info: TypeInfo) -> Int:
+    tt_types.push(info)
+    return tt_types.len() - 1
+
+# register a name -> type id mapping
+pub fn register_type_name(name: String, tid: Int):
+    tt_names.insert(name, tid)
+
+# look up a type by name, returns -1 if not found
+pub fn lookup_type_id(name: String) -> Int:
+    if tt_names.contains_key(name):
+        return tt_names[name]
+    return - 1
+
+# get the number of types in the table
+pub fn get_type_count() -> Int:
+    return tt_types.len()
+
+# get type info by id
+pub fn get_type_info(tid: Int) -> TypeInfo:
+    if tid < 0:
+        return TypeInfo("<error>", "", [], [], [], [], [], -1, -1, -1, -1, [], [], [])
+    if tid >= tt_types.len():
+        return TypeInfo("<error>", "", [], [], [], [], [], -1, -1, -1, -1, [], [], [])
+    return tt_types[tid]
+
+# get the human-readable name for a type id
+pub fn get_type_name(tid: Int) -> String:
+    if tid == TID_INT:
+        return "Int"
+    if tid == TID_UINT:
+        return "UInt"
+    if tid == TID_FLOAT:
+        return "Float"
+    if tid == TID_BOOL:
+        return "Bool"
+    if tid == TID_STRING:
+        return "String"
+    if tid == TID_BYTES:
+        return "Bytes"
+    if tid == TID_VOID:
+        return "Void"
+    if tid == TID_INT8:
+        return "Int8"
+    if tid == TID_INT16:
+        return "Int16"
+    if tid == TID_INT32:
+        return "Int32"
+    if tid == TID_INT64:
+        return "Int64"
+    if tid == TID_UINT8:
+        return "UInt8"
+    if tid == TID_UINT16:
+        return "UInt16"
+    if tid == TID_UINT32:
+        return "UInt32"
+    if tid == TID_UINT64:
+        return "UInt64"
+    if tid == TID_ERR:
+        return "<error>"
+    if tid < 0:
+        return "<unknown>"
+    if tid >= tt_types.len():
+        return "<unknown>"
+    info := tt_types[tid]
+    if info.kind == "struct":
+        return info.name
+    if info.kind == "enum":
+        return info.name
+    if info.kind == "primitive":
+        return info.name
+    if info.kind == "function":
+        return "fn"
+    if info.kind == "optional":
+        return "optional"
+    if info.kind == "result":
+        return "result"
+    if info.kind == "tuple":
+        return "tuple"
+    if info.kind == "task":
+        return "Task"
+    if info.kind == "channel":
+        return "Channel"
+    if info.kind == "list":
+        return "List"
+    if info.kind == "map":
+        return "Map"
+    if info.kind == "set":
+        return "Set"
+    return "<unknown>"
+
+# ---------------------------------------------------------------
+# helper predicates
+# ---------------------------------------------------------------
+
+pub fn is_numeric_type(tid: Int) -> Bool:
+    tid_int := lookup_type_id("Int")
+    tid_uint := lookup_type_id("UInt")
+    tid_float := lookup_type_id("Float")
+    tid_int8 := lookup_type_id("Int8")
+    tid_int16 := lookup_type_id("Int16")
+    tid_int32 := lookup_type_id("Int32")
+    tid_int64 := lookup_type_id("Int64")
+    tid_uint8 := lookup_type_id("UInt8")
+    tid_uint16 := lookup_type_id("UInt16")
+    tid_uint32 := lookup_type_id("UInt32")
+    tid_uint64 := lookup_type_id("UInt64")
+    if tid == tid_int:
+        return true
+    if tid == tid_uint:
+        return true
+    if tid == tid_float:
+        return true
+    if tid == tid_int8:
+        return true
+    if tid == tid_int16:
+        return true
+    if tid == tid_int32:
+        return true
+    if tid == tid_int64:
+        return true
+    if tid == tid_uint8:
+        return true
+    if tid == tid_uint16:
+        return true
+    if tid == tid_uint32:
+        return true
+    if tid == tid_uint64:
+        return true
+    return false
+
+pub fn is_integer_type(tid: Int) -> Bool:
+    tid_int := lookup_type_id("Int")
+    tid_uint := lookup_type_id("UInt")
+    tid_int8 := lookup_type_id("Int8")
+    tid_int16 := lookup_type_id("Int16")
+    tid_int32 := lookup_type_id("Int32")
+    tid_int64 := lookup_type_id("Int64")
+    tid_uint8 := lookup_type_id("UInt8")
+    tid_uint16 := lookup_type_id("UInt16")
+    tid_uint32 := lookup_type_id("UInt32")
+    tid_uint64 := lookup_type_id("UInt64")
+    if tid == tid_int:
+        return true
+    if tid == tid_uint:
+        return true
+    if tid == tid_int8:
+        return true
+    if tid == tid_int16:
+        return true
+    if tid == tid_int32:
+        return true
+    if tid == tid_int64:
+        return true
+    if tid == tid_uint8:
+        return true
+    if tid == tid_uint16:
+        return true
+    if tid == tid_uint32:
+        return true
+    if tid == tid_uint64:
+        return true
+    return false
+
+pub fn is_error_type(tid: Int) -> Bool:
+    return tid == lookup_type_id("<error>")
+
+# ---------------------------------------------------------------
+# initialization — register all 16 builtin types
+# ---------------------------------------------------------------
+
+pub fn initialize_type_table():
+    tt_types = []
+    tt_names = {}
+    # primitives at known indices 0-14
+    add_type_info(ti_primitive("Int"))
+    register_type_name("Int", TID_INT)
+    add_type_info(ti_primitive("UInt"))
+    register_type_name("UInt", TID_UINT)
+    add_type_info(ti_primitive("Float"))
+    register_type_name("Float", TID_FLOAT)
+    add_type_info(ti_primitive("Bool"))
+    register_type_name("Bool", TID_BOOL)
+    add_type_info(ti_primitive("String"))
+    register_type_name("String", TID_STRING)
+    add_type_info(ti_primitive("Bytes"))
+    register_type_name("Bytes", TID_BYTES)
+    add_type_info(ti_primitive("Void"))
+    register_type_name("Void", TID_VOID)
+    add_type_info(ti_primitive("Int8"))
+    register_type_name("Int8", TID_INT8)
+    add_type_info(ti_primitive("Int16"))
+    register_type_name("Int16", TID_INT16)
+    add_type_info(ti_primitive("Int32"))
+    register_type_name("Int32", TID_INT32)
+    add_type_info(ti_primitive("Int64"))
+    register_type_name("Int64", TID_INT64)
+    add_type_info(ti_primitive("UInt8"))
+    register_type_name("UInt8", TID_UINT8)
+    add_type_info(ti_primitive("UInt16"))
+    register_type_name("UInt16", TID_UINT16)
+    add_type_info(ti_primitive("UInt32"))
+    register_type_name("UInt32", TID_UINT32)
+    add_type_info(ti_primitive("UInt64"))
+    register_type_name("UInt64", TID_UINT64)
+    # error sentinel at index 15
+    add_type_info(ti_primitive("<error>"))
+    register_type_name("<error>", TID_ERR)

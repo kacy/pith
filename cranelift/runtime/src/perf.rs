@@ -48,7 +48,7 @@ static PERF_STATS_REGISTERED: AtomicBool = AtomicBool::new(false);
 pub fn perf_stats_enabled() -> bool {
     *PERF_STATS_ENABLED.get_or_init(|| {
         matches!(
-            std::env::var("FORGE_PERF_STATS").ok().as_deref(),
+            std::env::var("PITH_PERF_STATS").ok().as_deref(),
             Some("1") | Some("true") | Some("yes")
         )
     })
@@ -60,7 +60,7 @@ pub fn perf_count(counter: &AtomicUsize, delta: usize) {
     }
 }
 
-extern "C" fn forge_perf_dump_stats_at_exit() {
+extern "C" fn pith_perf_dump_stats_at_exit() {
     dump_perf_stats();
 }
 
@@ -72,7 +72,7 @@ pub fn ensure_perf_stats_registered() {
         return;
     }
     unsafe {
-        libc::atexit(forge_perf_dump_stats_at_exit);
+        libc::atexit(pith_perf_dump_stats_at_exit);
     }
 }
 
@@ -80,7 +80,7 @@ pub fn dump_perf_stats() {
     if !perf_stats_enabled() {
         return;
     }
-    eprintln!("forge perf stats");
+    eprintln!("pith perf stats");
     eprintln!("  rc allocs: {}", PERF_RC_ALLOCS.load(Ordering::Relaxed));
     eprintln!("  rc retains: {}", PERF_RC_RETAINS.load(Ordering::Relaxed));
     eprintln!("  rc releases: {}", PERF_RC_RELEASES.load(Ordering::Relaxed));

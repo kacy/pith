@@ -1,0 +1,605 @@
+# std.log - first-class structured logging
+#
+# the simple global helpers still work:
+#
+#   import std.log as log
+#   log.info("server starting")
+#
+# for structured logs, create a logger and attach typed fields:
+#
+#   logger := log.root().with([log.str("service", "api")]).json()
+#   logger.info().int("port", 8080).msg("listening")
+
+import std.io as io
+import std.uuid as uuid
+
+# debug logs are useful while developing.
+pub LEVEL_DEBUG := 0
+
+# info logs describe normal application flow.
+pub LEVEL_INFO := 1
+
+# warn logs describe recoverable problems.
+pub LEVEL_WARN := 2
+
+# error logs describe failed work.
+pub LEVEL_ERROR := 3
+
+# fatal logs describe unrecoverable failures. logging does not exit.
+pub LEVEL_FATAL := 4
+
+# human-readable console output.
+pub FORMAT_CONSOLE := 0
+
+# newline-delimited json output.
+pub FORMAT_JSON := 1
+
+# a typed key-value field.
+pub struct Field:
+    pub key: String
+    pub kind: String
+    pub string_value: String
+    pub int_value: Int
+    pub float_value: Float
+    pub bool_value: Bool
+
+# a reusable logger with context fields.
+pub struct Logger:
+    pub min_level: Int
+    pub format: Int
+    pub sink_path: String
+    pub context: List[Field]
+    pub trace_id: String
+    pub span_id: String
+    pub target_name: String
+
+# a pending log event.
+pub struct Event:
+    pub logger: Logger
+    pub level: Int
+    pub message: String
+    pub fields: List[Field]
+
+mut min_level: Int := LEVEL_DEBUG
+mut sink_path: String := ""
+mut output_format: Int := FORMAT_CONSOLE
+
+fn trace_rank() -> Int:
+    return 0 - 1
+
+# return the trace level rank.
+pub fn trace_level() -> Int:
+    return trace_rank()
+
+# return the debug level rank.
+pub fn debug_level() -> Int:
+    return LEVEL_DEBUG
+
+# return the info level rank.
+pub fn info_level() -> Int:
+    return LEVEL_INFO
+
+# return the warn level rank.
+pub fn warn_level() -> Int:
+    return LEVEL_WARN
+
+# return the error level rank.
+pub fn error_level() -> Int:
+    return LEVEL_ERROR
+
+# return the fatal level rank.
+pub fn fatal_level() -> Int:
+    return LEVEL_FATAL
+
+fn make_field(key: String, kind: String, string_value: String, int_value: Int, float_value: Float, bool_value: Bool) -> Field:
+    return Field(key, kind, string_value, int_value, float_value, bool_value)
+
+# create a string field.
+pub fn str(key: String, value: String) -> Field:
+    return make_field(key, "string", value, 0, 0.0, false)
+
+# create an integer field.
+pub fn int(key: String, value: Int) -> Field:
+    return make_field(key, "int", "", value, 0.0, false)
+
+# create a float field.
+pub fn float(key: String, value: Float) -> Field:
+    return make_field(key, "float", "", 0, value, false)
+
+# create a boolean field.
+pub fn bool(key: String, value: Bool) -> Field:
+    return make_field(key, "bool", "", 0, 0.0, value)
+
+# create an error field.
+pub fn err(value: String) -> Field:
+    return str("error", value)
+
+# create a duration field in milliseconds.
+pub fn duration_ms(key: String, value: Int) -> Field:
+    return int(key, value)
+
+fn raw_fields(value: String) -> Field:
+    return make_field("", "raw", value, 0, 0.0, false)
+
+fn compact_trace_value(value: String) -> String:
+    return value.replace("-", "")
+
+fn copy_fields(items: List[Field]) -> List[Field]:
+    mut out: List[Field] := []
+    for item in items:
+        out.push(item)
+    return out
+
+fn append_fields(base: List[Field], extra: List[Field]) -> List[Field]:
+    mut out := copy_fields(base)
+    for item in extra:
+        out.push(item)
+    return out
+
+fn add_field(base: List[Field], item: Field) -> List[Field]:
+    mut out := copy_fields(base)
+    out.push(item)
+    return out
+
+# create a logger from the current global settings.
+pub fn root() -> Logger:
+    return Logger(min_level, output_format, sink_path, [], "", "", "")
+
+# create a compact trace id suitable for logs and future propagation.
+pub fn new_trace_id() -> String!:
+    return compact_trace_value(uuid.v7() catch uuid.v4()!)
+
+# create a compact span id.
+pub fn new_span_id() -> String!:
+    mut trace_id := new_trace_id()!
+    if trace_id.len() >= 16:
+        return trace_id.substring(0, 16)
+    return trace_id
+
+# set minimum level (trace=-1, debug=0, info=1, warn=2, error=3, fatal=4).
+pub fn set_level(level: Int):
+    log_set_level(level)
+
+fn log_set_level(level: Int):
+    min_level = level
+
+# set the global output format.
+pub fn set_format(format: Int):
+    output_format = format
+
+# use console output for the global logger.
+pub fn set_console():
+    set_format(FORMAT_CONSOLE)
+
+# use json output for the global logger.
+pub fn set_json():
+    set_format(FORMAT_JSON)
+
+# append future log lines to a file as well as stderr.
+pub fn set_file(path: String):
+    log_set_file(path)
+
+fn log_set_file(path: String):
+    sink_path = path
+
+# stop writing log output to a file sink.
+pub fn clear_file():
+    log_clear_file()
+
+fn log_clear_file():
+    sink_path = ""
+
+impl Logger:
+    fn with(fields: List[Field]) -> Logger:
+        return Logger(self.min_level, self.format, self.sink_path, append_fields(self.context, fields), self.trace_id, self.span_id, self.target_name)
+
+    fn target(name: String) -> Logger:
+        return Logger(self.min_level, self.format, self.sink_path, copy_fields(self.context), self.trace_id, self.span_id, name)
+
+    fn trace_context(trace_id: String, span_id: String) -> Logger:
+        return Logger(self.min_level, self.format, self.sink_path, copy_fields(self.context), trace_id, span_id, self.target_name)
+
+    fn with_new_trace() -> Logger!:
+        return self.trace_context(new_trace_id()!, new_span_id()!)
+
+    fn child_span() -> Logger!:
+        mut trace_id := self.trace_id
+        if trace_id == "":
+            trace_id = new_trace_id()!
+        return self.trace_context(trace_id, new_span_id()!)
+
+    fn level(level: Int) -> Logger:
+        return Logger(level, self.format, self.sink_path, copy_fields(self.context), self.trace_id, self.span_id, self.target_name)
+
+    fn console() -> Logger:
+        return Logger(self.min_level, FORMAT_CONSOLE, self.sink_path, copy_fields(self.context), self.trace_id, self.span_id, self.target_name)
+
+    fn json() -> Logger:
+        return Logger(self.min_level, FORMAT_JSON, self.sink_path, copy_fields(self.context), self.trace_id, self.span_id, self.target_name)
+
+    fn file(path: String) -> Logger:
+        return Logger(self.min_level, self.format, path, copy_fields(self.context), self.trace_id, self.span_id, self.target_name)
+
+    fn trace() -> Event:
+        return Event(self, trace_rank(), "", [])
+
+    fn debug() -> Event:
+        return Event(self, LEVEL_DEBUG, "", [])
+
+    fn info() -> Event:
+        return Event(self, LEVEL_INFO, "", [])
+
+    fn warn() -> Event:
+        return Event(self, LEVEL_WARN, "", [])
+
+    fn error() -> Event:
+        return Event(self, LEVEL_ERROR, "", [])
+
+    fn fatal() -> Event:
+        return Event(self, LEVEL_FATAL, "", [])
+
+impl Event:
+    fn field(item: Field) -> Event:
+        return Event(self.logger, self.level, self.message, add_field(self.fields, item))
+
+    fn fields(items: List[Field]) -> Event:
+        return Event(self.logger, self.level, self.message, append_fields(self.fields, items))
+
+    fn str(key: String, value: String) -> Event:
+        return self.field(str(key, value))
+
+    fn int(key: String, value: Int) -> Event:
+        return self.field(int(key, value))
+
+    fn float(key: String, value: Float) -> Event:
+        return self.field(float(key, value))
+
+    fn bool(key: String, value: Bool) -> Event:
+        return self.field(bool(key, value))
+
+    fn err(value: String) -> Event:
+        return self.field(err(value))
+
+    fn duration_ms(key: String, value: Int) -> Event:
+        return self.field(duration_ms(key, value))
+
+    fn msg(message: String):
+        emit_record(self.logger, self.level, message, self.fields)
+
+fn level_num(level: String) -> Int:
+    if level == "TRACE":
+        return trace_rank()
+    if level == "DEBUG":
+        return LEVEL_DEBUG
+    if level == "INFO":
+        return LEVEL_INFO
+    if level == "WARN":
+        return LEVEL_WARN
+    if level == "ERROR":
+        return LEVEL_ERROR
+    if level == "FATAL":
+        return LEVEL_FATAL
+    return LEVEL_DEBUG
+
+fn level_label(level: Int) -> String:
+    if level == trace_rank():
+        return "TRACE"
+    if level == LEVEL_DEBUG:
+        return "DEBUG"
+    if level == LEVEL_INFO:
+        return "INFO"
+    if level == LEVEL_WARN:
+        return "WARN"
+    if level == LEVEL_ERROR:
+        return "ERROR"
+    if level == LEVEL_FATAL:
+        return "FATAL"
+    return "DEBUG"
+
+fn level_text(level: Int) -> String:
+    return level_label(level).to_lower()
+
+fn severity_number(level: Int) -> Int:
+    if level == trace_rank():
+        return 1
+    if level == LEVEL_DEBUG:
+        return 5
+    if level == LEVEL_INFO:
+        return 9
+    if level == LEVEL_WARN:
+        return 13
+    if level == LEVEL_ERROR:
+        return 17
+    if level == LEVEL_FATAL:
+        return 21
+    return 5
+
+fn field_value_text(field: Field) -> String:
+    if field.kind == "int":
+        return field.int_value.to_string()
+    if field.kind == "float":
+        return field.float_value.to_string()
+    if field.kind == "bool":
+        return field.bool_value.to_string()
+    return field.string_value
+
+fn needs_console_quotes(value: String) -> Bool:
+    if value == "":
+        return true
+    return value.contains(" ") or value.contains(chr(9)) or value.contains(chr(10)) or value.contains(chr(34))
+
+fn console_escape(value: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < value.len():
+        c := value[i]
+        if c == chr(34):
+            out = out + chr(92) + chr(34)
+        elif c == chr(92):
+            out = out + chr(92) + chr(92)
+        elif c == chr(10):
+            out = out + chr(92) + "n"
+        else:
+            out = out + c
+        i = i + 1
+    return out
+
+fn render_console_field(field: Field) -> String:
+    if field.kind == "raw":
+        return field.string_value
+    if field.key == "":
+        return ""
+    mut value := field_value_text(field)
+    if field.kind == "string" and needs_console_quotes(value):
+        value = chr(34) + console_escape(value) + chr(34)
+    return field.key + "=" + value
+
+fn render_console_fields(fields: List[Field]) -> String:
+    mut parts: List[String] := []
+    for field in fields:
+        rendered := render_console_field(field)
+        if rendered != "":
+            parts.push(rendered)
+    if parts.len() == 0:
+        return ""
+    return " " + parts.join(" ")
+
+fn json_escape(text: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < text.len():
+        c := text[i]
+        if c == chr(34):
+            out = out + chr(92) + chr(34)
+        elif c == chr(92):
+            out = out + chr(92) + chr(92)
+        elif c == chr(10):
+            out = out + chr(92) + "n"
+        else:
+            out = out + c
+        i = i + 1
+    return out
+
+fn json_string_field(name: String, value: String) -> String:
+    return chr(34) + name + chr(34) + ":" + chr(34) + json_escape(value) + chr(34)
+
+fn json_field_value(field: Field) -> String:
+    if field.kind == "int":
+        return field.int_value.to_string()
+    if field.kind == "float":
+        return field.float_value.to_string()
+    if field.kind == "bool":
+        return field.bool_value.to_string()
+    return chr(34) + json_escape(field.string_value) + chr(34)
+
+fn render_json_fields(fields: List[Field]) -> String:
+    mut parts: List[String] := []
+    for field in fields:
+        mut key := field.key
+        if field.kind == "raw" and key == "":
+            key = "fields_text"
+        if key != "":
+            parts.push(chr(34) + json_escape(key) + chr(34) + ":" + json_field_value(field))
+    return chr(123) + parts.join(",") + chr(125)
+
+fn render_console(logger: Logger, ts: Int, level: Int, msg: String, fields: List[Field]) -> String:
+    mut out := format_time(ts, "%Y-%m-%d %H:%M:%S") + " [" + level_label(level) + "] " + msg
+    if logger.target_name != "":
+        out = out + " target=" + logger.target_name
+    if logger.trace_id != "":
+        out = out + " trace_id=" + logger.trace_id
+    if logger.span_id != "":
+        out = out + " span_id=" + logger.span_id
+    return out + render_console_fields(fields)
+
+fn render_json(logger: Logger, ts: Int, level: Int, msg: String, fields: List[Field]) -> String:
+    mut parts: List[String] := []
+    parts.push(chr(34) + "time" + chr(34) + ":" + ts.to_string())
+    parts.push(json_string_field("level", level_text(level)))
+    parts.push(chr(34) + "severity" + chr(34) + ":" + severity_number(level).to_string())
+    parts.push(json_string_field("message", msg))
+    parts.push(json_string_field("target", logger.target_name))
+    parts.push(json_string_field("trace_id", logger.trace_id))
+    parts.push(json_string_field("span_id", logger.span_id))
+    parts.push(chr(34) + "fields" + chr(34) + ":" + render_json_fields(fields))
+    return chr(123) + parts.join(",") + chr(125)
+
+fn emit_line_to(path: String, line: String):
+    print_err(line)
+    if path == "":
+        return
+    _wrote := io.append_file_text(path, line + chr(10))
+
+fn emit_record(logger: Logger, level: Int, msg: String, fields: List[Field]):
+    if level < logger.min_level:
+        return
+    ts := time()
+    all_fields := append_fields(logger.context, fields)
+    mut line := ""
+    if logger.format == FORMAT_JSON:
+        line = render_json(logger, ts, level, msg, all_fields)
+    else:
+        line = render_console(logger, ts, level, msg, all_fields)
+    emit_line_to(logger.sink_path, line)
+
+fn log_line(level: String, msg: String):
+    emit_record(root(), level_num(level), msg, [])
+
+fn log_kv(level: String, msg: String, fields: String):
+    emit_record(root(), level_num(level), msg, [raw_fields(fields)])
+
+# log a trace message.
+pub fn trace(msg: String):
+    log_trace(msg)
+
+fn log_trace(msg: String):
+    log_line("TRACE", msg)
+
+# log a debug message.
+pub fn debug(msg: String):
+    log_debug(msg)
+
+fn log_debug(msg: String):
+    log_line("DEBUG", msg)
+
+# log an info message.
+pub fn info(msg: String):
+    log_info(msg)
+
+fn log_info(msg: String):
+    log_line("INFO", msg)
+
+# log a warning message.
+pub fn warn(msg: String):
+    log_warn(msg)
+
+fn log_warn(msg: String):
+    log_line("WARN", msg)
+
+# log an error message.
+pub fn error(msg: String):
+    log_error(msg)
+
+fn log_error(msg: String):
+    log_line("ERROR", msg)
+
+# log a fatal message. this does not exit.
+pub fn fatal(msg: String):
+    log_fatal(msg)
+
+fn log_fatal(msg: String):
+    log_line("FATAL", msg)
+
+# log with key=value fields: error("failed", "host=db port=5432")
+pub fn trace_kv(msg: String, fields: String):
+    log_trace_kv(msg, fields)
+
+fn log_trace_kv(msg: String, fields: String):
+    log_kv("TRACE", msg, fields)
+
+# log a debug message with key=value fields.
+pub fn debug_kv(msg: String, fields: String):
+    log_debug_kv(msg, fields)
+
+fn log_debug_kv(msg: String, fields: String):
+    log_kv("DEBUG", msg, fields)
+
+# log an info message with key=value fields.
+pub fn info_kv(msg: String, fields: String):
+    log_info_kv(msg, fields)
+
+fn log_info_kv(msg: String, fields: String):
+    log_kv("INFO", msg, fields)
+
+# log a warning message with key=value fields.
+pub fn warn_kv(msg: String, fields: String):
+    log_warn_kv(msg, fields)
+
+fn log_warn_kv(msg: String, fields: String):
+    log_kv("WARN", msg, fields)
+
+# log an error message with key=value fields.
+pub fn error_kv(msg: String, fields: String):
+    log_error_kv(msg, fields)
+
+fn log_error_kv(msg: String, fields: String):
+    log_kv("ERROR", msg, fields)
+
+# log a fatal message with key=value fields.
+pub fn fatal_kv(msg: String, fields: String):
+    log_fatal_kv(msg, fields)
+
+fn log_fatal_kv(msg: String, fields: String):
+    log_kv("FATAL", msg, fields)
+
+test "log levels map to ranks and severity numbers":
+    assert_eq(level_num("TRACE"), trace_level())
+    assert_eq(level_num("DEBUG"), LEVEL_DEBUG)
+    assert_eq(level_num("INFO"), LEVEL_INFO)
+    assert_eq(level_num("WARN"), LEVEL_WARN)
+    assert_eq(level_num("ERROR"), LEVEL_ERROR)
+    assert_eq(level_num("FATAL"), LEVEL_FATAL)
+    assert_eq(level_num("custom"), LEVEL_DEBUG)
+    assert_eq(severity_number(LEVEL_INFO), 9)
+    assert_eq(severity_number(LEVEL_ERROR), 17)
+
+test "log file sinks respect minimum level":
+    path := "/tmp/pith-std-log-" + time().to_string() + ".txt"
+    clear_file()
+    set_console()
+    set_level(LEVEL_WARN)
+    set_file(path)
+
+    debug("hidden")
+    warn("visible")
+    error_kv("failed", "code=1")
+    clear_file()
+    set_level(LEVEL_DEBUG)
+
+    text := io.read_file_text(path)!
+    assert(not text.contains("[DEBUG] hidden"))
+    assert(text.contains("[WARN] visible"))
+    assert(text.contains("[ERROR] failed code=1"))
+    remove_file(path)
+
+test "structured logger renders json fields and context":
+    path := "/tmp/pith-std-log-json-" + time().to_string() + ".txt"
+    logger := root().json().file(path).with([str("service", "api"), int("port", 8080)]).target("http").trace_context("trace-1", "span-1")
+
+    logger.info().str("route", "/").bool("cached", false).duration_ms("elapsed_ms", 12).msg("request complete")
+
+    text := io.read_file_text(path)!
+    assert(text.contains(chr(34) + "level" + chr(34) + ":" + chr(34) + "info" + chr(34)))
+    assert(text.contains(chr(34) + "severity" + chr(34) + ":9"))
+    assert(text.contains(chr(34) + "message" + chr(34) + ":" + chr(34) + "request complete" + chr(34)))
+    assert(text.contains(chr(34) + "target" + chr(34) + ":" + chr(34) + "http" + chr(34)))
+    assert(text.contains(chr(34) + "trace_id" + chr(34) + ":" + chr(34) + "trace-1" + chr(34)))
+    assert(text.contains(chr(34) + "service" + chr(34) + ":" + chr(34) + "api" + chr(34)))
+    assert(text.contains(chr(34) + "port" + chr(34) + ":8080"))
+    assert(text.contains(chr(34) + "cached" + chr(34) + ":false"))
+    remove_file(path)
+
+test "trace ids are compact and span ids stay short":
+    trace_id := new_trace_id()!
+    span_id := new_span_id()!
+    child := root().with_new_trace()!.child_span()!
+
+    assert_eq(trace_id.len(), 32)
+    assert_eq(span_id.len(), 16)
+    assert(not trace_id.contains("-"))
+    assert(not span_id.contains("-"))
+    assert(child.trace_id.len() == 32)
+    assert(child.span_id.len() == 16)
+
+test "structured logger filters by local minimum level":
+    path := "/tmp/pith-std-log-filter-" + time().to_string() + ".txt"
+    logger := root().json().file(path).level(LEVEL_ERROR)
+
+    logger.info().msg("hidden")
+    logger.error().err("boom").msg("visible")
+
+    text := io.read_file_text(path)!
+    assert(not text.contains("hidden"))
+    assert(text.contains("visible"))
+    assert(text.contains(chr(34) + "error" + chr(34) + ":" + chr(34) + "boom" + chr(34)))
+    remove_file(path)

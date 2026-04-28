@@ -1,0 +1,30 @@
+from ast import get_node, reset_arena
+from checker import c_register_all, initialize_checker
+from lexer import lex_all
+from parser import parse
+from types import get_type_info, lookup_type_id
+
+fn main() -> String!:
+    source := read_file("self-host/struct_field_access_probe.pith")!
+    reset_arena()
+    root := parse(lex_all(source))
+    initialize_checker("self-host/struct_field_access_probe.pith")
+    c_register_all(root)
+
+    tid := lookup_type_id("Foo")
+    info := get_type_info(tid)
+    print(info.fields.len().to_string())
+    if info.fields.len() > 0:
+        print(info.fields[0])
+
+    root_node := get_node(root)
+    fn_node := get_node(root_node.children[1])
+    body_node := get_node(fn_node.children[2])
+    block_node := get_node(body_node.children[0])
+    ret_node := get_node(block_node.children[0])
+    len_node := get_node(ret_node.children[0])
+    field_node := get_node(len_node.children[0])
+    print(field_node.value)
+    if info.fields.len() > 0:
+        print((info.fields[0] == field_node.value).to_string())
+    return ""

@@ -1,6 +1,6 @@
 # security & reliability
 
-forge is designed to never panic or crash, regardless of input. this
+pith is designed to never panic or crash, regardless of input. this
 document summarizes the safeguards in the bootstrap compiler.
 
 ## the no-panic guarantee
@@ -32,7 +32,7 @@ all limits produce clear error messages when hit.
 
 ## container security
 
-the dockerfile runs the forge binary as a non-root user (`forge`,
+the dockerfile runs the pith binary as a non-root user (`pith`,
 uid 1000) in the final stage.
 
 ## error handling convention

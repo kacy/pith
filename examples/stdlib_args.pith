@@ -1,0 +1,23 @@
+from std.args import init, add_flag, add_option, add_positional
+from std.args import parse_list, get_flag, get_option, get_positional
+from std.args import has_errors, get_errors
+
+fn main():
+    init("testapp", "A test application")
+    add_flag("verbose", "v", "Enable verbose output")
+    add_option("output", "o", "Output file", "out.txt")
+    add_option("format", "f", "Output format", "json")
+    add_positional("input", "Input file")
+    parse_list(["--verbose", "-o", "result.csv", "-f", "csv", "data.pith"])
+    if get_flag("verbose"):
+        print("verbose: true")
+    else:
+        print("verbose: false")
+    print("output: " + get_option("output"))
+    print("format: " + get_option("format"))
+    print("input: " + get_positional("input"))
+    if has_errors():
+        print("errors: yes")
+    else:
+        print("errors: none")
+    print("args tests passed")

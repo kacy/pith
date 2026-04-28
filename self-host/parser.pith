@@ -1,0 +1,1664 @@
+# parser.pith — recursive descent parser for pith
+#
+# consumes a token list from the lexer and builds an arena-indexed AST.
+# port of src/parser.zig to pith.
+#
+# usage: import from parse_main.pith or call parse() directly
+
+from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_count, load_tokens, load_token_snapshot
+from ast import Node, add_node, add_leaf, get_node
+from errors import Diagnostic
+
+# ---------------------------------------------------------------
+# parser state
+# ---------------------------------------------------------------
+
+mut current_token_position := 0
+mut recursion_depth := 0
+mut max_depth := 256
+mut parser_file_path := ""
+mut parser_diag_list: List[Diagnostic] := []
+
+fn _cur_tok_kind() -> String:
+    tc := tok_count()
+    if tc == 0:
+        return "eof"
+    mut i := current_token_position
+    while i < tc:
+        k := tok_kind(i)
+        if k != "comment":
+            return k
+        i = i + 1
+    return tok_kind(tc - 1)
+
+fn _cur_tok_value() -> String:
+    tc := tok_count()
+    if tc == 0:
+        return ""
+    mut i := current_token_position
+    while i < tc:
+        k := tok_kind(i)
+        if k != "comment":
+            return tok_value(i)
+        i = i + 1
+    return tok_value(tc - 1)
+
+fn _peek_ahead_kind(offset: Int) -> String:
+    tc := tok_count()
+    if tc == 0:
+        return "eof"
+    mut i := current_token_position
+    mut skipped := 0
+    while i < tc:
+        k := tok_kind(i)
+        if k != "comment":
+            if skipped == offset:
+                return k
+            skipped = skipped + 1
+        i = i + 1
+    return tok_kind(tc - 1)
+
+# -------------------------------------------------------------
+# position-aware AST helpers (must come after state declarations)
+# -------------------------------------------------------------
+
+# Get line and column from current token position
+fn get_current_position() -> (Int, Int):
+    tc := tok_count()
+    if tc == 0:
+        return (0, 0)
+    mut i := current_token_position
+    while i < tc:
+        k := tok_kind(i)
+        if k != "comment":
+            return (tok_line(i), tok_col(i))
+        i = i + 1
+    if tc > 0:
+        return (tok_line(tc - 1), tok_col(tc - 1))
+    return (0, 0)
+
+fn get_previous_position() -> (Int, Int):
+    tc := tok_count()
+    if tc == 0:
+        return (0, 0)
+    if current_token_position <= 0:
+        return (tok_line(0), tok_col(0))
+    mut i := current_token_position - 1
+    while i >= 0:
+        if tok_kind(i) != "comment":
+            return (tok_line(i), tok_col(i))
+        if i == 0:
+            break
+        i = i - 1
+    return (tok_line(0), tok_col(0))
+
+fn parser_report_error_at(line: Int, col: Int, code: String, message: String, fix: String):
+    parser_diag_list.push(Diagnostic("error", code, message, parser_file_path, line, col, fix))
+
+fn parser_error_position() -> (Int, Int):
+    if _cur_tok_kind() == "eof":
+        return get_previous_position()
+    return get_current_position()
+
+fn parser_report_error_here(code: String, message: String, fix: String):
+    pos := parser_error_position()
+    parser_report_error_at(pos.0, pos.1, code, message, fix)
+
+fn parser_report_lexer_error_here():
+    parser_report_error_here("E243", _cur_tok_value(), "")
+
+pub fn parser_diagnostics() -> List[Diagnostic]:
+    return parser_diag_list
+
+pub fn parser_has_errors() -> Bool:
+    return parser_diag_list.len() > 0
+
+# Wrapper that adds node with current position
+fn add_node_with_position(kind: String, value: String, children: List[Int]) -> Int:
+    mut pos := get_current_position()
+    return add_node(kind, value, children, pos.0, pos.1)
+
+# Wrapper that adds leaf with current position
+fn add_leaf_with_position(kind: String, value: String) -> Int:
+    mut pos := get_current_position()
+    return add_leaf(kind, value, pos.0, pos.1)
+
+fn snapshot_token_kinds() -> List[String]:
+    mut snapshot: List[String] := []
+    tc := tok_count()
+    mut i := 0
+    while i < tc:
+        snapshot.push(tok_kind(i))
+        i = i + 1
+    return snapshot
+
+fn snapshot_token_values() -> List[String]:
+    mut snapshot: List[String] := []
+    tc := tok_count()
+    mut i := 0
+    while i < tc:
+        snapshot.push(tok_value(i))
+        i = i + 1
+    return snapshot
+
+fn snapshot_token_lines() -> List[Int]:
+    mut snapshot: List[Int] := []
+    tc := tok_count()
+    mut i := 0
+    while i < tc:
+        snapshot.push(tok_line(i))
+        i = i + 1
+    return snapshot
+
+fn snapshot_token_cols() -> List[Int]:
+    mut snapshot: List[Int] := []
+    tc := tok_count()
+    mut i := 0
+    while i < tc:
+        snapshot.push(tok_col(i))
+        i = i + 1
+    return snapshot
+
+# safe EOF token for empty token list cases
+# ---------------------------------------------------------------
+# token navigation
+# ---------------------------------------------------------------
+
+fn advance_token() -> Token:
+    tc := tok_count()
+    if tc == 0:
+        return Token("eof", "", 0, 0)
+    while current_token_position < tc:
+        k := tok_kind(current_token_position)
+        v := tok_value(current_token_position)
+        l := tok_line(current_token_position)
+        c := tok_col(current_token_position)
+        current_token_position = current_token_position + 1
+        if k != "comment":
+            return Token(k, v, l, c)
+    return Token(tok_kind(tc - 1), tok_value(tc - 1), tok_line(tc - 1), tok_col(tc - 1))
+
+fn check(kind: String) -> Bool:
+    return _cur_tok_kind() == kind
+
+fn match_tok(kind: String) -> Bool:
+    if check(kind):
+        advance_token()
+        return true
+    return false
+
+fn expect(kind: String) -> Token:
+    # token via _cur_tok_kind/_cur_tok_value
+    cur_kind := _cur_tok_kind()
+    if cur_kind == kind:
+        return advance_token()
+    pos := parser_error_position()
+    if cur_kind == "eof":
+        parser_report_error_at(pos.0, pos.1, "E241", "unexpected end of file, expected " + kind, "")
+        return Token(kind, "", pos.0, pos.1)
+    if cur_kind == "err":
+        parser_report_lexer_error_here()
+    else:
+        parser_report_error_at(pos.0, pos.1, "E240", "expected " + kind + " but found " + cur_kind, "")
+    advance_token()
+    return Token(kind, "", pos.0, pos.1)
+
+fn skip_newlines():
+    while _cur_tok_kind() == "newline":
+        advance_token()
+
+# ---------------------------------------------------------------
+# type expressions
+# ---------------------------------------------------------------
+
+fn parse_type_expr() -> Int:
+    base := parse_base_type()
+
+    # optional: T?
+    if check("question"):
+        advance_token()
+        mut children: List[Int] := [base]
+        return add_node_with_position("optional_type", "", children)
+
+    # result: T! or T!E
+    if check("bang"):
+        advance_token()
+        next_kind := _cur_tok_kind()
+        if next_kind == "identifier" or next_kind == "kw_fn" or next_kind == "lparen":
+            err_type := parse_type_expr()
+            mut children: List[Int] := [base, err_type]
+            return add_node_with_position("result_type", "", children)
+        mut children: List[Int] := [base]
+        return add_node_with_position("result_type", "", children)
+
+    return base
+
+fn parse_base_type() -> Int:
+    # token via _cur_tok_kind/_cur_tok_value
+
+    # fn type: fn(Int, String) -> Bool
+    if _cur_tok_kind() == "kw_fn":
+        return parse_fn_type()
+
+    # tuple type: (Int, String)
+    if _cur_tok_kind() == "lparen":
+        return parse_tuple_type()
+
+    # named or generic type
+    if _cur_tok_kind() == "identifier":
+        name_tok := advance_token()
+        mut type_name := name_tok.value
+        while match_tok("dot"):
+            part_tok := expect("identifier")
+            type_name = type_name + "." + part_tok.value
+
+        # check for generic args: Type[T, U]
+        if check("lbracket"):
+            advance_token()
+            mut args: List[Int] := [parse_type_expr()]
+            while match_tok("comma"):
+                args.push(parse_type_expr())
+            expect("rbracket")
+
+            # build inline representation: "Name[Arg1, Arg2]"
+            return add_node_with_position("generic_type", type_name, args)
+
+        return add_leaf_with_position("type", type_name)
+
+    # unexpected
+    return add_leaf_with_position("type", "")
+
+fn parse_fn_type() -> Int:
+    advance_token()
+    expect("lparen")
+    mut params: List[Int] := []
+    if not check("rparen"):
+        params.push(parse_type_expr())
+        while match_tok("comma"):
+            params.push(parse_type_expr())
+    expect("rparen")
+
+    # wrap each param type in a "param" node
+    mut param_nodes: List[Int] := []
+    for p in params:
+        mut children: List[Int] := [p]
+        param_nodes.push(add_node_with_position("param", "", children))
+
+    if match_tok("arrow"):
+        ret := parse_type_expr()
+        mut ret_node_children: List[Int] := [ret]
+        ret_node := add_node_with_position("returns", "", ret_node_children)
+        param_nodes.push(ret_node)
+        return add_node_with_position("fn_type", "", param_nodes)
+
+    return add_node_with_position("fn_type", "", param_nodes)
+
+fn parse_tuple_type() -> Int:
+    advance_token()
+    mut types: List[Int] := []
+    if not check("rparen"):
+        types.push(parse_type_expr())
+        while match_tok("comma") and not check("rparen"):
+            types.push(parse_type_expr())
+    expect("rparen")
+    return add_node_with_position("tuple_type", "", types)
+
+# ---------------------------------------------------------------
+# expressions — precedence tower
+# ---------------------------------------------------------------
+
+pub fn parse_expression() -> Int:
+    if recursion_depth >= max_depth:
+        parser_report_error_here("E242", "expression nesting too deep", "")
+        return add_leaf_with_position("error", "max recursion_depth exceeded")
+    recursion_depth = recursion_depth + 1
+    left := parse_catch_expression()
+    recursion_depth = recursion_depth - 1
+    return left
+
+fn parse_catch_expression() -> Int:
+    mut left := parse_or_expression()
+    while check("kw_catch"):
+        advance_token()
+        fallback := parse_or_expression()
+        mut children: List[Int] := [left, fallback]
+        left = add_node_with_position("catch_expr", "", children)
+    return left
+
+fn parse_or_expression() -> Int:
+    mut left := parse_and_expression()
+    while check("kw_or"):
+        advance_token()
+        right := parse_and_expression()
+        mut children: List[Int] := [left, right]
+        left = add_node_with_position("binary", "or", children)
+    return left
+
+fn parse_and_expression() -> Int:
+    mut left := parse_comparison_expression()
+    while check("kw_and"):
+        advance_token()
+        right := parse_comparison_expression()
+        mut children: List[Int] := [left, right]
+        left = add_node_with_position("binary", "and", children)
+    return left
+
+fn parse_comparison_expression() -> Int:
+    mut left := parse_pipe_expression()
+    mut keep_parsing := true
+    while keep_parsing:
+        mut op := ""
+        if check("eq_eq"):
+            op = "eq"
+        elif check("bang_eq"):
+            op = "neq"
+        elif check("less"):
+            op = "lt"
+        elif check("greater"):
+            op = "gt"
+        elif check("less_eq"):
+            op = "lte"
+        elif check("greater_eq"):
+            op = "gte"
+        if op.len() == 0:
+            keep_parsing = false
+        else:
+            advance_token()
+            right := parse_pipe_expression()
+            mut children: List[Int] := [left, right]
+            left = add_node_with_position("binary", op, children)
+    return left
+
+fn parse_pipe_expression() -> Int:
+    mut left := parse_additive_expression()
+    while check("pipe"):
+        advance_token()
+        right := parse_additive_expression()
+        mut children: List[Int] := [left, right]
+        left = add_node_with_position("binary", "pipe", children)
+    return left
+
+fn parse_additive_expression() -> Int:
+    mut left := parse_multiplicative_expression()
+    mut keep_parsing := true
+    while keep_parsing:
+        mut op := ""
+        if check("plus"):
+            op = "add"
+        elif check("minus"):
+            op = "sub"
+        if op.len() == 0:
+            keep_parsing = false
+        else:
+            advance_token()
+            right := parse_multiplicative_expression()
+            mut children: List[Int] := [left, right]
+            left = add_node_with_position("binary", op, children)
+    return left
+
+fn parse_multiplicative_expression() -> Int:
+    mut left := parse_unary()
+    mut keep_parsing := true
+    while keep_parsing:
+        mut op := ""
+        if check("star"):
+            op = "mul"
+        elif check("slash"):
+            op = "div"
+        elif check("percent"):
+            op = "mod"
+        if op.len() == 0:
+            keep_parsing = false
+        else:
+            advance_token()
+            right := parse_unary()
+            mut children: List[Int] := [left, right]
+            left = add_node_with_position("binary", op, children)
+    return left
+
+fn parse_unary() -> Int:
+    if check("kw_not"):
+        advance_token()
+        operand := parse_unary()
+        mut children: List[Int] := [operand]
+        return add_node_with_position("unary", "not", children)
+
+    if check("kw_spawn"):
+        advance_token()
+        operand := parse_unary()
+        mut children: List[Int] := [operand]
+        return add_node_with_position("spawn", "", children)
+
+    if check("kw_await"):
+        advance_token()
+        operand := parse_unary()
+        mut children: List[Int] := [operand]
+        return add_node_with_position("await", "", children)
+
+    if check("minus"):
+        advance_token()
+        operand := parse_unary()
+        mut children: List[Int] := [operand]
+        return add_node_with_position("unary", "negate", children)
+
+    return parse_postfix()
+
+fn parse_postfix() -> Int:
+    mut expr := parse_primary()
+
+    mut has_postfix := true
+    while has_postfix:
+        # token via _cur_tok_kind/_cur_tok_value
+        kind := _cur_tok_kind()
+
+        if kind == "question":
+            # unwrap: expr?
+            advance_token()
+            mut children: List[Int] := [expr]
+            expr = add_node_with_position("unwrap", "", children)
+
+        elif kind == "bang":
+            # try: expr!
+            advance_token()
+            mut children: List[Int] := [expr]
+            expr = add_node_with_position("try", "", children)
+
+        elif kind == "lparen":
+            # call: expr(args)
+            expr = parse_call_expr(expr)
+
+        elif kind == "lbracket":
+            # index: expr[index]
+            advance_token()
+            idx := parse_expression()
+            expect("rbracket")
+            mut children: List[Int] := [expr, idx]
+            expr = add_node_with_position("index", "", children)
+
+        elif kind == "dot":
+            # field access or method call
+            advance_token()
+            if check("int_lit"):
+                # tuple field: expr.0
+                _tv := _cur_tok_value()
+                advance_token()
+                mut children: List[Int] := [expr]
+                expr = add_node_with_position("field_access", _tv, children)
+            else:
+                name_tok := expect("identifier")
+                if check("lparen"):
+                    # method call: expr.name(args)
+                    advance_token()
+                    call_args := parse_arg_list()
+                    expect("rparen")
+                    mut children: List[Int] := [expr]
+                    for a in call_args:
+                        children.push(a)
+                    expr = add_node_with_position("method_call", name_tok.value, children)
+                else:
+                    # field access: expr.name
+                    mut children: List[Int] := [expr]
+                    expr = add_node_with_position("field_access", name_tok.value, children)
+
+        elif kind == "lbrace":
+            # struct init: TypeName{...}
+            expr_node := get_node(expr)
+            if expr_node.kind == "ident":
+                advance_token()
+                mut args: List[Int] := []
+                skip_newlines()
+                if check("rbrace") == false:
+                    args.push(parse_expression())
+                    while match_tok("comma") and not check("rbrace"):
+                        skip_newlines()
+                        args.push(parse_expression())
+                skip_newlines()
+                expect("rbrace")
+                expr = add_node_with_position("struct_init", expr_node.value, args)
+            else:
+                has_postfix = false
+        else:
+            has_postfix = false
+
+    return expr
+
+fn parse_call_expr(callee: Int) -> Int:
+    advance_token()
+    call_args := parse_arg_list()
+    expect("rparen")
+    mut children: List[Int] := [callee]
+    for a in call_args:
+        children.push(a)
+    return add_node_with_position("call", "", children)
+
+fn parse_arg_list() -> List[Int]:
+    mut args: List[Int] := []
+    skip_newlines()
+    if check("rparen"):
+        return args
+    args.push(parse_arg())
+    while match_tok("comma") and not check("rparen"):
+        skip_newlines()
+        args.push(parse_arg())
+    skip_newlines()
+    return args
+
+fn parse_arg() -> Int:
+    # check for named argument: name = expr
+    if _cur_tok_kind() == "identifier":
+        if _peek_ahead_kind(1) == "eq":
+            name := advance_token().value
+            advance_token()
+            val := parse_expression()
+            mut children: List[Int] := [val]
+            return add_node_with_position("arg", name, children)
+
+    val := parse_expression()
+    mut children: List[Int] := [val]
+    return add_node_with_position("arg", "", children)
+
+fn parse_primary() -> Int:
+    # token via _cur_tok_kind/_cur_tok_value
+
+    if _cur_tok_kind() == "int_lit":
+        _tv := _cur_tok_value()
+        advance_token()
+        return add_leaf_with_position("int_lit", _tv)
+
+    if _cur_tok_kind() == "float_lit":
+        _tv := _cur_tok_value()
+        advance_token()
+        return add_leaf_with_position("float_lit", _tv)
+
+    if _cur_tok_kind() == "string_lit":
+        _tv := _cur_tok_value()
+        advance_token()
+        return add_leaf_with_position("string_lit", _tv)
+
+    if _cur_tok_kind() == "string_start":
+        return parse_string_interpolation()
+
+    if _cur_tok_kind() == "kw_true":
+        advance_token()
+        return add_leaf_with_position("bool_lit", "true")
+
+    if _cur_tok_kind() == "kw_false":
+        advance_token()
+        return add_leaf_with_position("bool_lit", "false")
+
+    if _cur_tok_kind() == "kw_none":
+        advance_token()
+        return add_leaf_with_position("none_lit", "")
+
+    if _cur_tok_kind() == "kw_self":
+        advance_token()
+        return add_leaf_with_position("self", "")
+
+    if _cur_tok_kind() == "identifier":
+        _tv := _cur_tok_value()
+        advance_token()
+        return add_leaf_with_position("ident", _tv)
+
+    if _cur_tok_kind() == "lparen":
+        return parse_grouped_or_tuple()
+
+    if _cur_tok_kind() == "lbracket":
+        return parse_list_literal()
+
+    if _cur_tok_kind() == "lbrace":
+        return parse_map_or_set_literal()
+
+    if _cur_tok_kind() == "kw_if":
+        return parse_if_expr()
+
+    if _cur_tok_kind() == "kw_match":
+        return parse_match_expr()
+
+    if _cur_tok_kind() == "kw_select":
+        return parse_select_expr()
+
+    if _cur_tok_kind() == "kw_fn":
+        return parse_lambda()
+
+    # unexpected token — skip it
+    if _cur_tok_kind() == "err":
+        parser_report_lexer_error_here()
+    elif _cur_tok_kind() == "eof":
+        parser_report_error_here("E241", "unexpected end of file while parsing expression", "")
+    else:
+        parser_report_error_here("E242", "unexpected token in expression: " + _cur_tok_kind(), "")
+    _tv := _cur_tok_value()
+    advance_token()
+    return add_leaf_with_position("error", _tv)
+
+fn parse_grouped_or_tuple() -> Int:
+    advance_token()
+    skip_newlines()
+
+    # empty tuple: ()
+    if check("rparen"):
+        advance_token()
+        mut children: List[Int] := []
+        return add_node_with_position("tuple", "", children)
+
+    first := parse_expression()
+    skip_newlines()
+
+    # tuple with trailing comma or multiple elements
+    if check("comma"):
+        mut elements: List[Int] := [first]
+        while match_tok("comma") and not check("rparen"):
+            skip_newlines()
+            elements.push(parse_expression())
+            skip_newlines()
+        expect("rparen")
+        return add_node_with_position("tuple", "", elements)
+
+    # grouped: (expr)
+    expect("rparen")
+    mut children: List[Int] := [first]
+    return add_node_with_position("grouped", "", children)
+
+fn parse_list_literal() -> Int:
+    advance_token()
+    mut elements: List[Int] := []
+    skip_newlines()
+    if not check("rbracket"):
+        elements.push(parse_expression())
+        while match_tok("comma") and not check("rbracket"):
+            skip_newlines()
+            elements.push(parse_expression())
+    skip_newlines()
+    expect("rbracket")
+    return add_node_with_position("list", "", elements)
+
+fn parse_map_or_set_literal() -> Int:
+    advance_token()
+    skip_newlines()
+
+    # empty map: {}
+    if check("rbrace"):
+        advance_token()
+        mut children: List[Int] := []
+        return add_node_with_position("map", "", children)
+
+    first := parse_expression()
+    skip_newlines()
+
+    # map: first expression followed by ":"
+    if check("colon"):
+        advance_token()
+        mut entries: List[Int] := []
+        first_val := parse_expression()
+        mut entry_children: List[Int] := [first, first_val]
+        entries.push(add_node_with_position("entry", "", entry_children))
+
+        while match_tok("comma") and not check("rbrace"):
+            skip_newlines()
+            key := parse_expression()
+            expect("colon")
+            val := parse_expression()
+            mut ec: List[Int] := [key, val]
+            entries.push(add_node_with_position("entry", "", ec))
+        skip_newlines()
+        expect("rbrace")
+        return add_node_with_position("map", "", entries)
+
+    # set: {x} or {x, y, ...}
+    mut elements: List[Int] := [first]
+    while match_tok("comma") and not check("rbrace"):
+        skip_newlines()
+        elements.push(parse_expression())
+    skip_newlines()
+    expect("rbrace")
+    return add_node_with_position("set", "", elements)
+
+fn parse_if_expr() -> Int:
+    advance_token()
+    condition := parse_expression()
+    expect("colon")
+    then_expr := parse_expression()
+
+    mut children: List[Int] := [condition, then_expr]
+
+    # parse elif branches
+    while check("kw_elif"):
+        advance_token()
+        elif_cond := parse_expression()
+        expect("colon")
+        elif_expr := parse_expression()
+        mut elif_children: List[Int] := [elif_cond, elif_expr]
+        children.push(add_node_with_position("elif_branch", "", elif_children))
+
+    expect("kw_else")
+    expect("colon")
+    else_expr := parse_expression()
+    children.push(else_expr)
+
+    return add_node_with_position("if_expr", "", children)
+
+fn parse_match_expr() -> Int:
+    advance_token()
+    subject := parse_expression()
+    expect("colon")
+    expect("newline")
+    expect("indent")
+
+    mut children: List[Int] := [subject]
+    while not check("dedent") and not check("eof"):
+        arm := parse_match_arm()
+        children.push(arm)
+        if check("newline"):
+            advance_token()
+    expect("dedent")
+
+    return add_node_with_position("match_expr", "", children)
+
+fn parse_match_arm() -> Int:
+    pattern := parse_pattern()
+
+    mut children: List[Int] := [pattern]
+
+    # guard
+    if check("kw_if"):
+        advance_token()
+        guard_expr := parse_expression()
+        mut guard_children: List[Int] := [guard_expr]
+        children.push(add_node_with_position("guard", "", guard_children))
+
+    expect("fat_arrow")
+
+    # body: inline expression or block
+    if check("newline"):
+        body := parse_block()
+        children.push(body)
+    else:
+        body_expr := parse_expression()
+        mut body_children: List[Int] := [body_expr]
+        children.push(add_node_with_position("body", "", body_children))
+
+    return add_node_with_position("arm", "", children)
+
+fn parse_select_expr() -> Int:
+    advance_token()
+    expect("colon")
+    expect("newline")
+    expect("indent")
+
+    mut children: List[Int] := []
+    while not check("dedent") and not check("eof"):
+        arm := parse_select_arm()
+        children.push(arm)
+        if check("newline"):
+            advance_token()
+    expect("dedent")
+
+    return add_node_with_position("select_expr", "", children)
+
+fn parse_select_arm() -> Int:
+    if check("kw_default"):
+        advance_token()
+        expect("fat_arrow")
+        return add_node_with_position("select_default_arm", "", parse_select_arm_body())
+
+    if check("kw_timeout"):
+        advance_token()
+        timeout_expr := parse_expression()
+        expect("fat_arrow")
+        mut children := [timeout_expr]
+        for child in parse_select_arm_body():
+            children.push(child)
+        return add_node_with_position("select_timeout_arm", "", children)
+
+    if check("identifier") and _peek_ahead_kind(1) == "colon_eq":
+        name_tok := advance_token()
+        advance_token()
+        recv_expr := parse_expression()
+        expect("fat_arrow")
+        mut children := [recv_expr]
+        for child in parse_select_arm_body():
+            children.push(child)
+        return add_node_with_position("select_recv_arm", name_tok.value, children)
+
+    send_expr := parse_expression()
+    expect("fat_arrow")
+    mut children := [send_expr]
+    for child in parse_select_arm_body():
+        children.push(child)
+    return add_node_with_position("select_send_arm", "", children)
+
+fn parse_select_arm_body() -> List[Int]:
+    if check("newline"):
+        body := parse_block()
+        return [body]
+    body_expr := parse_expression()
+    mut body_children := [body_expr]
+    return [add_node_with_position("body", "", body_children)]
+
+fn parse_lambda() -> Int:
+    advance_token()
+    expect("lparen")
+    params := parse_lambda_params()
+    expect("rparen")
+
+    # short form: fn(x) => expr
+    if check("fat_arrow"):
+        advance_token()
+        body_expr := parse_expression()
+        mut body_children: List[Int] := [body_expr]
+        mut children: List[Int] := []
+        for p in params:
+            children.push(p)
+        children.push(add_node_with_position("body", "", body_children))
+        return add_node_with_position("lambda", "", children)
+
+    # block form: fn(x): block
+    if check("colon"):
+        body := parse_block()
+        mut children: List[Int] := []
+        for p in params:
+            children.push(p)
+        children.push(body)
+        return add_node_with_position("lambda", "", children)
+
+    parser_report_error_here("E240", "expected fat_arrow or colon after lambda parameters", "")
+    return add_leaf_with_position("error", "expected => or : after lambda params")
+
+fn parse_lambda_params() -> List[Int]:
+    mut params: List[Int] := []
+    if check("rparen"):
+        return params
+    params.push(parse_lambda_param())
+    while match_tok("comma"):
+        params.push(parse_lambda_param())
+    return params
+
+fn parse_lambda_param() -> Int:
+    mut modifiers := ""
+    if check("kw_mut"):
+        advance_token()
+        modifiers = "mut"
+    if check("kw_ref"):
+        advance_token()
+        if modifiers.len() > 0:
+            modifiers = modifiers + " ref"
+        else:
+            modifiers = "ref"
+    name_tok := expect("identifier")
+
+    mut children: List[Int] := []
+    if match_tok("colon"):
+        children.push(parse_type_expr())
+
+    if modifiers.len() > 0:
+        return add_node_with_position("param", name_tok.value + " " + modifiers, children)
+    return add_node_with_position("param", name_tok.value, children)
+
+fn parse_string_interpolation() -> Int:
+    _tv := _cur_tok_value()
+    advance_token()
+    mut parts: List[Int] := []
+
+    if _tv.len() > 0:
+        parts.push(add_leaf_with_position("lit", _tv))
+
+    mut keep_parsing := true
+    while keep_parsing:
+        mut matched_part := false
+
+        # interpolation expression
+        if check("interpolation_expr"):
+            _tv := _cur_tok_value()
+            advance_token()
+            interp_expr := parse_interp_expr(_tv)
+            parts.push(interp_expr)
+            matched_part = true
+
+        # string_mid — more interpolations follow
+        if matched_part == false:
+            if check("string_mid"):
+                _tv := _cur_tok_value()
+                advance_token()
+                if _tv.len() > 0:
+                    parts.push(add_leaf_with_position("lit", _tv))
+                matched_part = true
+
+        # string_end — done
+        if matched_part == false:
+            if check("string_end"):
+                _tv := _cur_tok_value()
+                advance_token()
+                if _tv.len() > 0:
+                    parts.push(add_leaf_with_position("lit", _tv))
+                matched_part = true
+                keep_parsing = false
+
+        # unexpected
+        if matched_part == false:
+            keep_parsing = false
+
+    return add_node_with_position("string_interp", "", parts)
+
+fn parse_interp_expr(text: String) -> Int:
+    # save parser state
+    saved_kinds := snapshot_token_kinds()
+    saved_values := snapshot_token_values()
+    saved_lines := snapshot_token_lines()
+    saved_cols := snapshot_token_cols()
+    saved_pos := current_token_position
+    saved_depth := recursion_depth
+
+    # sub-lex and sub-parse the interpolation expression
+    sub_tokens := lex_all(text)
+    load_tokens(sub_tokens)
+    current_token_position = 0
+    recursion_depth = 0
+
+    result := parse_expression()
+
+    # restore parser state
+    load_token_snapshot(saved_kinds, saved_values, saved_lines, saved_cols)
+    current_token_position = saved_pos
+    recursion_depth = saved_depth
+
+    return result
+
+# ---------------------------------------------------------------
+# patterns
+# ---------------------------------------------------------------
+
+fn parse_pattern() -> Int:
+    # token via _cur_tok_kind/_cur_tok_value
+
+    if _cur_tok_kind() == "underscore":
+        advance_token()
+        return add_leaf_with_position("pat_wildcard", "_")
+
+    if _cur_tok_kind() == "int_lit":
+        _tv := _cur_tok_value()
+        advance_token()
+        return add_leaf_with_position("pat_int", _tv)
+
+    if _cur_tok_kind() == "float_lit":
+        _tv := _cur_tok_value()
+        advance_token()
+        return add_leaf_with_position("pat_float", _tv)
+
+    if _cur_tok_kind() == "string_lit":
+        _tv := _cur_tok_value()
+        advance_token()
+        return add_leaf_with_position("pat_string", _tv)
+
+    if _cur_tok_kind() == "kw_true":
+        advance_token()
+        return add_leaf_with_position("pat_bool", "true")
+
+    if _cur_tok_kind() == "kw_false":
+        advance_token()
+        return add_leaf_with_position("pat_bool", "false")
+
+    if _cur_tok_kind() == "kw_none":
+        advance_token()
+        return add_leaf_with_position("pat_none", "")
+
+    if _cur_tok_kind() == "identifier":
+        type_tok := advance_token()
+        # variant pattern: Type.Variant or Type.Variant(fields)
+        if check("dot"):
+            advance_token()
+            variant_tok := expect("identifier")
+
+            if check("lparen"):
+                advance_token()
+                mut fields: List[Int] := []
+                if not check("rparen"):
+                    fields.push(parse_pattern())
+                    while match_tok("comma"):
+                        fields.push(parse_pattern())
+                expect("rparen")
+                return add_node_with_position("pat_variant", type_tok.value + "." + variant_tok.value, fields)
+
+            mut empty: List[Int] := []
+            return add_node_with_position("pat_variant", type_tok.value + "." + variant_tok.value, empty)
+
+        return add_leaf_with_position("pat_binding", type_tok.value)
+
+    if _cur_tok_kind() == "lparen":
+        advance_token()
+        mut patterns: List[Int] := []
+        if not check("rparen"):
+            patterns.push(parse_pattern())
+            while match_tok("comma"):
+                patterns.push(parse_pattern())
+        expect("rparen")
+        return add_node_with_position("pat_tuple", "", patterns)
+
+    # unexpected — advance to avoid infinite loop
+    if _cur_tok_kind() == "err":
+        parser_report_lexer_error_here()
+    elif _cur_tok_kind() == "eof":
+        parser_report_error_here("E241", "unexpected end of file while parsing pattern", "")
+    else:
+        parser_report_error_here("E242", "unexpected token in pattern: " + _cur_tok_kind(), "")
+    advance_token()
+    return add_leaf_with_position("pat_wildcard", "_")
+
+# ---------------------------------------------------------------
+# blocks and statements
+# ---------------------------------------------------------------
+
+fn parse_block() -> Int:
+    expect("newline")
+    expect("indent")
+
+    mut stmts: List[Int] := []
+    while not check("dedent") and not check("eof"):
+        before := current_token_position
+        stmts.push(parse_statement())
+        if current_token_position == before:
+            parser_report_error_here("E242", "parser stalled in block", "")
+            stmts.push(add_leaf_with_position("error", "parser stalled in block"))
+            advance_token()
+        skip_newlines()
+    expect("dedent")
+
+    return add_node_with_position("block", "", stmts)
+
+fn parse_statement() -> Int:
+    # token via _cur_tok_kind/_cur_tok_value
+
+    # mut binding
+    if _cur_tok_kind() == "kw_mut":
+        return parse_binding()
+
+    # binding: name := expr or name: Type := expr
+    if _cur_tok_kind() == "identifier":
+        if _peek_ahead_kind(1) == "colon_eq":
+            return parse_binding()
+        if _peek_ahead_kind(1) == "colon":
+            return parse_binding()
+
+    # control flow
+    if _cur_tok_kind() == "kw_if":
+        return parse_if_stmt()
+    if _cur_tok_kind() == "kw_for":
+        return parse_for_stmt()
+    if _cur_tok_kind() == "kw_while":
+        return parse_while_stmt()
+    if _cur_tok_kind() == "kw_match":
+        return parse_match_stmt()
+    if _cur_tok_kind() == "kw_return":
+        return parse_return_stmt()
+    if _cur_tok_kind() == "kw_fail":
+        return parse_fail_stmt()
+
+    if _cur_tok_kind() == "kw_break":
+        advance_token()
+        return add_leaf_with_position("break", "")
+    if _cur_tok_kind() == "kw_continue":
+        advance_token()
+        return add_leaf_with_position("continue", "")
+
+    return parse_expr_stmt_or_assignment()
+
+fn looks_like_binding() -> Bool:
+    mut i := 2
+    while true:
+        ak := _peek_ahead_kind(i)
+        if ak == "colon_eq":
+            return true
+        if ak == "eof" or ak == "newline" or ak == "dedent":
+            return false
+        if ak == "identifier" or ak == "lbracket" or ak == "rbracket" or ak == "lparen" or ak == "rparen" or ak == "comma" or ak == "question" or ak == "bang" or ak == "arrow" or ak == "kw_fn" or ak == "plus":
+            i = i + 1
+            continue
+        return false
+
+fn parse_binding() -> Int:
+    mut is_mut := false
+    if match_tok("kw_mut"):
+        is_mut = true
+    name_tok := expect("identifier")
+
+    mut children: List[Int] := []
+
+    # type annotation
+    if match_tok("colon"):
+        children.push(parse_type_expr())
+
+    expect("colon_eq")
+    children.push(parse_expression())
+
+    mut mod := ""
+    if is_mut:
+        mod = " mut"
+    return add_node_with_position("binding", name_tok.value + mod, children)
+
+fn parse_expr_stmt_or_assignment() -> Int:
+    expr := parse_expression()
+
+    # token via _cur_tok_kind/_cur_tok_value
+    mut op := ""
+    if _cur_tok_kind() == "eq":
+        op = "="
+    elif _cur_tok_kind() == "plus_eq":
+        op = "+="
+    elif _cur_tok_kind() == "minus_eq":
+        op = "-="
+    elif _cur_tok_kind() == "star_eq":
+        op = "*="
+    elif _cur_tok_kind() == "slash_eq":
+        op = "/="
+
+    if op.len() > 0:
+        advance_token()
+        val := parse_expression()
+        mut children: List[Int] := [expr, val]
+        return add_node_with_position("assignment", op, children)
+
+    return expr
+
+fn parse_if_stmt() -> Int:
+    advance_token()
+    condition := parse_expression()
+    expect("colon")
+    then_block := parse_block()
+
+    mut children: List[Int] := [condition]
+    mut then_children: List[Int] := [then_block]
+    children.push(add_node_with_position("then", "", then_children))
+
+    # elif branches
+    while check("kw_elif"):
+        advance_token()
+        elif_cond := parse_expression()
+        expect("colon")
+        elif_block := parse_block()
+        mut elif_children: List[Int] := [elif_cond, elif_block]
+        children.push(add_node_with_position("elif", "", elif_children))
+
+    # else
+    if check("kw_else"):
+        advance_token()
+        expect("colon")
+        else_block := parse_block()
+        mut else_children: List[Int] := [else_block]
+        children.push(add_node_with_position("else", "", else_children))
+
+    return add_node_with_position("if_stmt", "", children)
+
+fn parse_for_stmt() -> Int:
+    advance_token()
+    binding_tok := expect("identifier")
+
+    mut label := binding_tok.value
+    mut loop_var := add_leaf_with_position("loop_var", binding_tok.value)
+    mut loop_idx := -1
+    if match_tok("comma"):
+        idx_tok := expect("identifier")
+        label = binding_tok.value + ", " + idx_tok.value
+        loop_idx = add_leaf_with_position("loop_index", idx_tok.value)
+
+    expect("kw_in")
+    iterable := parse_expression()
+    expect("colon")
+    body := parse_block()
+
+    mut children: List[Int] := [iterable, body]
+    children.push(loop_var)
+    if loop_idx >= 0:
+        children.push(loop_idx)
+    return add_node_with_position("for_stmt", label, children)
+
+fn parse_while_stmt() -> Int:
+    advance_token()
+    condition := parse_expression()
+    expect("colon")
+    body := parse_block()
+
+    mut children: List[Int] := [condition, body]
+    return add_node_with_position("while_stmt", "", children)
+
+fn parse_match_stmt() -> Int:
+    # reuse match_expr parsing
+    return parse_match_expr()
+
+fn parse_return_stmt() -> Int:
+    advance_token()
+    next_kind := _cur_tok_kind()
+    if next_kind == "newline" or next_kind == "dedent" or next_kind == "eof":
+        mut children: List[Int] := []
+        return add_node_with_position("return", "", children)
+    val := parse_expression()
+    mut children: List[Int] := [val]
+    return add_node_with_position("return", "", children)
+
+fn parse_fail_stmt() -> Int:
+    advance_token()
+    val := parse_expression()
+    mut children: List[Int] := [val]
+    return add_node_with_position("fail", "", children)
+
+# ---------------------------------------------------------------
+# declarations
+# ---------------------------------------------------------------
+
+pub fn parse(token_list: List[Token]) -> Int:
+    return parse_with_file(token_list, "")
+
+pub fn parse_with_file(token_list: List[Token], file_path: String) -> Int:
+    load_tokens(token_list)
+    current_token_position = 0
+    recursion_depth = 0
+    parser_file_path = file_path
+    parser_diag_list = []
+
+    mut imports: List[Int] := []
+    mut decls: List[Int] := []
+
+    skip_newlines()
+
+    # parse imports (must come first)
+    while check("kw_import") or check("kw_from"):
+        before := current_token_position
+        imports.push(parse_import_decl())
+        if current_token_position == before:
+            parser_report_error_here("E242", "parser stalled in import", "")
+            imports.push(add_leaf_with_position("error", "parser stalled in import"))
+            advance_token()
+        skip_newlines()
+
+    # parse top-level declarations
+    while not check("eof"):
+        skip_newlines()
+        if not check("eof"):
+            before := current_token_position
+            decls.push(parse_top_level_decl())
+            if current_token_position == before:
+                parser_report_error_here("E242", "parser stalled at top level", "")
+                decls.push(add_leaf_with_position("error", "parser stalled at top level"))
+                advance_token()
+            skip_newlines()
+
+    mut children: List[Int] := []
+    for i in imports:
+        children.push(i)
+    for d in decls:
+        children.push(d)
+
+    return add_node_with_position("module", "", children)
+
+fn parse_import_decl() -> Int:
+    if check("kw_from"):
+        # from path import names
+        advance_token()
+        path := parse_dotted_path()
+        expect("kw_import")
+
+        # Check for wildcard import: from X import *
+        if check("star"):
+            advance_token()
+            mut parts: List[String] := [path, "*"]
+            return add_leaf_with_position("from_import", parts.join(" "))
+
+        mut names: List[String] := []
+        n := expect("identifier")
+        names.push(n.value)
+        # check for alias
+        mut alias := ""
+        if match_tok("kw_as"):
+            alias_tok := expect("identifier")
+            alias = alias_tok.value
+
+        while match_tok("comma"):
+            n2 := expect("identifier")
+            names.push(n2.value)
+            if match_tok("kw_as"):
+                expect("identifier")
+
+        mut parts: List[String] := [path]
+        for nm in names:
+            parts.push(nm)
+        return add_leaf_with_position("from_import", parts.join(" "))
+
+    # import path [as alias]
+    advance_token()
+    path := parse_dotted_path()
+    mut parts: List[String] := [path]
+    if match_tok("kw_as"):
+        alias_tok := expect("identifier")
+        parts.push("as")
+        parts.push(alias_tok.value)
+
+    return add_leaf_with_position("import", parts.join(" "))
+
+fn parse_dotted_path() -> String:
+    first := expect("identifier")
+    mut path := first.value
+    while match_tok("dot"):
+        next := expect("identifier")
+        path = path + "." + next.value
+    return path
+
+fn parse_top_level_decl() -> Int:
+    mut is_pub := false
+    if match_tok("kw_pub"):
+        is_pub = true
+
+    # token via _cur_tok_kind/_cur_tok_value
+    cur_kind := _cur_tok_kind()
+
+    mut decl := 0
+    if cur_kind == "kw_fn":
+        decl = parse_fn_decl()
+    elif cur_kind == "kw_struct":
+        decl = parse_struct_decl()
+    elif cur_kind == "kw_enum":
+        decl = parse_enum_decl()
+    elif cur_kind == "kw_interface":
+        decl = parse_interface_decl()
+    elif cur_kind == "kw_impl":
+        decl = parse_impl_decl()
+    elif cur_kind == "kw_type":
+        decl = parse_type_alias_decl()
+    elif cur_kind == "kw_test":
+        decl = parse_test_decl()
+    elif cur_kind == "kw_mut":
+        decl = parse_binding()
+    elif cur_kind == "identifier":
+        if _peek_ahead_kind(1) == "colon_eq":
+            decl = parse_binding()
+        elif _peek_ahead_kind(1) == "colon" and looks_like_binding():
+            decl = parse_binding()
+        else:
+            parser_report_error_here("E242", "expected declaration", "")
+            advance_token()
+            decl = add_leaf_with_position("error", "expected declaration")
+    else:
+        if cur_kind == "err":
+            parser_report_lexer_error_here()
+        else:
+            parser_report_error_here("E242", "expected declaration", "")
+        advance_token()
+        decl = add_leaf_with_position("error", "expected declaration")
+
+    if is_pub:
+        mut children: List[Int] := [decl]
+        return add_node_with_position("pub", "", children)
+    return decl
+
+fn parse_fn_decl() -> Int:
+    advance_token()
+    name_tok := expect("identifier")
+
+    # optional generic params
+    generics := parse_optional_generic_params()
+
+    expect("lparen")
+    params := parse_param_list()
+    expect("rparen")
+
+    mut children: List[Int] := []
+
+    # store generic_param nodes so checker can access bounds
+    for g in generics:
+        children.push(g)
+
+    for p in params:
+        children.push(p)
+
+    if match_tok("arrow"):
+        ret := parse_type_expr()
+        mut ret_children: List[Int] := [ret]
+        children.push(add_node_with_position("returns", "", ret_children))
+
+    expect("colon")
+    body := parse_block()
+    mut body_children: List[Int] := [body]
+    children.push(add_node_with_position("body", "", body_children))
+
+    return add_node_with_position("fn_decl", name_tok.value, children)
+
+fn parse_test_decl() -> Int:
+    advance_token()
+    name_tok := expect("string_lit")
+    expect("colon")
+    body := parse_block()
+    mut body_children: List[Int] := [body]
+    mut children: List[Int] := []
+    children.push(add_node_with_position("body", "", body_children))
+    return add_node_with_position("test_decl", name_tok.value, children)
+
+fn parse_param_list() -> List[Int]:
+    mut params: List[Int] := []
+    skip_newlines()
+    if check("rparen"):
+        return params
+    params.push(parse_param())
+    while match_tok("comma"):
+        skip_newlines()
+        params.push(parse_param())
+    skip_newlines()
+    return params
+
+fn parse_param() -> Int:
+    mut modifiers := ""
+    if check("kw_mut"):
+        advance_token()
+        modifiers = " mut"
+    if check("kw_ref"):
+        advance_token()
+        modifiers = modifiers + " ref"
+    name_tok := expect("identifier")
+
+    expect("colon")
+    type_node := parse_type_expr()
+
+    mut children: List[Int] := [type_node]
+
+    # default value
+    if match_tok("eq"):
+        children.push(parse_expression())
+
+    return add_node_with_position("param", name_tok.value + modifiers, children)
+
+fn parse_optional_generic_params() -> List[Int]:
+    if check("lbracket"):
+        return parse_generic_params()
+    mut empty: List[Int] := []
+    return empty
+
+fn parse_generic_params() -> List[Int]:
+    advance_token()
+    mut params: List[Int] := []
+    params.push(parse_generic_param())
+    while match_tok("comma"):
+        params.push(parse_generic_param())
+    expect("rbracket")
+    return params
+
+fn parse_generic_param() -> Int:
+    name_tok := expect("identifier")
+    # bounds: T: Comparable + Hash
+    if match_tok("colon"):
+        mut bounds: List[Int] := [parse_type_expr()]
+        while match_tok("plus"):
+            bounds.push(parse_type_expr())
+        return add_node_with_position("generic_param", name_tok.value, bounds)
+    mut empty: List[Int] := []
+    return add_node_with_position("generic_param", name_tok.value, empty)
+
+fn parse_struct_decl() -> Int:
+    advance_token()
+    name_tok := expect("identifier")
+    generics := parse_optional_generic_params()
+
+    expect("colon")
+    expect("newline")
+    expect("indent")
+
+    mut children: List[Int] := []
+    # store generic_param nodes so checker can access bounds
+    for g in generics:
+        children.push(g)
+    while not check("dedent") and not check("eof"):
+        before := current_token_position
+        children.push(parse_struct_field())
+        if current_token_position == before:
+            children.push(add_leaf_with_position("error", "parser stalled in struct"))
+            advance_token()
+        skip_newlines()
+    expect("dedent")
+
+    return add_node_with_position("struct_decl", name_tok.value, children)
+
+fn parse_struct_field() -> Int:
+    mut modifiers := ""
+    if match_tok("kw_pub"):
+        modifiers = " pub"
+    if match_tok("kw_mut"):
+        modifiers = modifiers + " mut"
+    if match_tok("kw_weak"):
+        modifiers = modifiers + " weak"
+    name_tok := expect("identifier")
+    expect("colon")
+    type_node := parse_type_expr()
+
+    mut children: List[Int] := [type_node]
+
+    # default value
+    if match_tok("eq"):
+        children.push(parse_expression())
+
+    return add_node_with_position("field", name_tok.value + modifiers, children)
+
+fn parse_enum_decl() -> Int:
+    advance_token()
+    name_tok := expect("identifier")
+    generics := parse_optional_generic_params()
+
+    expect("colon")
+    expect("newline")
+    expect("indent")
+
+    mut children: List[Int] := []
+    # store generic_param nodes so checker can access bounds
+    for g in generics:
+        children.push(g)
+    while not check("dedent") and not check("eof"):
+        before := current_token_position
+        children.push(parse_enum_variant())
+        if current_token_position == before:
+            children.push(add_leaf_with_position("error", "parser stalled in enum"))
+            advance_token()
+        skip_newlines()
+    expect("dedent")
+
+    return add_node_with_position("enum_decl", name_tok.value, children)
+
+fn parse_enum_variant() -> Int:
+    name_tok := expect("identifier")
+    mut fields: List[Int] := []
+    if match_tok("lparen"):
+        fields.push(parse_type_expr())
+        while match_tok("comma"):
+            fields.push(parse_type_expr())
+        expect("rparen")
+
+    return add_node_with_position("variant", name_tok.value, fields)
+
+fn parse_interface_decl() -> Int:
+    advance_token()
+    name_tok := expect("identifier")
+    generics := parse_optional_generic_params()
+
+    expect("colon")
+    expect("newline")
+    expect("indent")
+
+    mut children: List[Int] := []
+    # store generic_param nodes so checker can detect E233
+    for g in generics:
+        children.push(g)
+    while not check("dedent") and not check("eof"):
+        before := current_token_position
+        children.push(parse_fn_sig())
+        if current_token_position == before:
+            children.push(add_leaf_with_position("error", "parser stalled in interface"))
+            advance_token()
+        skip_newlines()
+    expect("dedent")
+
+    return add_node_with_position("interface_decl", name_tok.value, children)
+
+fn parse_fn_sig() -> Int:
+    expect("kw_fn")
+    name_tok := expect("identifier")
+    generics := parse_optional_generic_params()
+
+    expect("lparen")
+    params := parse_param_list()
+    expect("rparen")
+
+    mut children: List[Int] := []
+    # store generic_param nodes so checker can detect E233
+    for g in generics:
+        children.push(g)
+    for p in params:
+        children.push(p)
+
+    if match_tok("arrow"):
+        ret := parse_type_expr()
+        mut ret_children: List[Int] := [ret]
+        children.push(add_node_with_position("returns", "", ret_children))
+
+    return add_node_with_position("fn_sig", name_tok.value, children)
+
+fn parse_impl_decl() -> Int:
+    advance_token()
+    target := parse_type_expr()
+
+    mut children: List[Int] := [target]
+
+    # impl Display for Point:
+    if match_tok("kw_for"):
+        iface := parse_type_expr()
+        mut for_children: List[Int] := [iface]
+        children.push(add_node_with_position("for_type", "", for_children))
+
+    expect("colon")
+    expect("newline")
+    expect("indent")
+
+    while not check("dedent") and not check("eof"):
+        mut method_pub := false
+        if match_tok("kw_pub"):
+            method_pub = true
+        before := current_token_position
+        method := parse_fn_decl()
+        if current_token_position == before:
+            children.push(add_leaf_with_position("error", "parser stalled in impl"))
+            advance_token()
+            skip_newlines()
+            continue
+        if method_pub:
+            mut pub_children: List[Int] := [method]
+            children.push(add_node_with_position("pub", "", pub_children))
+        else:
+            children.push(method)
+        skip_newlines()
+    expect("dedent")
+
+    return add_node_with_position("impl_decl", "", children)
+
+fn parse_type_alias_decl() -> Int:
+    advance_token()
+    name_tok := expect("identifier")
+    generics := parse_optional_generic_params()
+    expect("eq")
+    type_node := parse_type_expr()
+    mut children: List[Int] := [type_node]
+    # store generic_param nodes for generic type aliases
+    for g in generics:
+        children.push(g)
+    return add_node_with_position("type_alias", name_tok.value, children)

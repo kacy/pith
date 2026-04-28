@@ -1,0 +1,304 @@
+# std.data.table — string-backed table helpers
+#
+# useful for small csv-shaped datasets where every cell can stay a string.
+
+import std.csv as csv
+import std.fs as fs
+import std.os.path as path
+
+# # tabular data with ordered headers and row maps.
+pub struct Table:
+    pub headers: List[String]
+    pub rows: List[Map[String, String]]
+
+# # error returned when table operations see bad input.
+pub struct DataError:
+    pub message: String
+
+fn data_fail(message: String) -> DataError:
+    return DataError(message)
+
+fn copy_headers(headers: List[String]) -> List[String]:
+    mut result: List[String] := []
+    for header in headers:
+        result.push(header)
+    return result
+
+fn copy_row(row: Map[String, String]) -> Map[String, String]:
+    mut result: Map[String, String] := {}
+    for key in row:
+        result.insert(key, row[key])
+    return result
+
+fn copy_rows(rows: List[Map[String, String]]) -> List[Map[String, String]]:
+    mut result: List[Map[String, String]] := []
+    for row in rows:
+        result.push(copy_row(row))
+    return result
+
+fn row_has(row: Map[String, String], column: String) -> Bool:
+    return row.contains_key(column)
+
+fn header_has(headers: List[String], name: String) -> Bool:
+    for header in headers:
+        if header == name:
+            return true
+    return false
+
+fn derived_headers(rows: List[Map[String, String]]) -> List[String]:
+    mut seen: Set[String] := {}
+    for row in rows:
+        for key in row:
+            seen.add(key)
+    mut result: List[String] := []
+    for key in seen:
+        result.push(key)
+    return result.sort()
+
+fn rows_to_csv_rows(table: Table) -> List[List[String]]:
+    mut out: List[List[String]] := []
+    out.push(copy_headers(table.headers))
+    for row in table.rows:
+        mut csv_row: List[String] := []
+        for header in table.headers:
+            csv_row.push(get_or(row, header, ""))
+        out.push(csv_row)
+    return out
+
+fn table_from_csv_rows(rows: List[List[String]]) -> Table:
+    if rows.len() == 0:
+        return empty()
+    headers := rows[0]
+    mut records: List[Map[String, String]] := []
+    for row, i in rows:
+        if i == 0:
+            continue
+        mut record: Map[String, String] := {}
+        for header, j in headers:
+            if j < row.len():
+                record.insert(header, row[j])
+            else:
+                record.insert(header, "")
+        records.push(record)
+    return Table(copy_headers(headers), records)
+
+fn require_column(table: Table, name: String) -> Bool!DataError:
+    if not has_column(table, name):
+        fail data_fail("missing column: " + name)
+    return true
+
+# # create an empty table.
+pub fn empty() -> Table:
+    mut headers: List[String] := []
+    mut rows: List[Map[String, String]] := []
+    return Table(headers, rows)
+
+# # build a table from explicit headers and positional rows.
+pub fn from_rows(headers: List[String], rows: List[List[String]]) -> Table:
+    mut records: List[Map[String, String]] := []
+    for row in rows:
+        mut record: Map[String, String] := {}
+        for header, i in headers:
+            if i < row.len():
+                record.insert(header, row[i])
+            else:
+                record.insert(header, "")
+        records.push(record)
+    return Table(copy_headers(headers), records)
+
+# # build a table from record maps with sorted headers.
+pub fn from_records(rows: List[Map[String, String]]) -> Table:
+    return Table(derived_headers(rows), copy_rows(rows))
+
+# # parse csv text into a table, using the first row as headers.
+pub fn from_csv(text: String) -> Table:
+    return table_from_csv_rows(csv.parse(text))
+
+# # parse a csv file into a table.
+pub fn from_csv_file(path: String) -> Table!:
+    return table_from_csv_rows(csv.parse_file(path)!)
+
+# # encode a table as csv.
+pub fn to_csv(table: Table) -> String:
+    return csv.encode(rows_to_csv_rows(table))
+
+# # save a table as csv.
+pub fn save_csv(path: String, table: Table) -> Int!:
+    return csv.save(path, rows_to_csv_rows(table))
+
+# # return the number of rows.
+pub fn row_count(table: Table) -> Int:
+    return table.rows.len()
+
+# # return the number of columns.
+pub fn column_count(table: Table) -> Int:
+    return table.headers.len()
+
+# # return a copy of the table headers.
+pub fn columns(table: Table) -> List[String]:
+    return copy_headers(table.headers)
+
+# # return true when the table has a column.
+pub fn has_column(table: Table, name: String) -> Bool:
+    return header_has(table.headers, name)
+
+# # select a subset of columns in the requested order.
+pub fn select_columns(table: Table, names: List[String]) -> Table!DataError:
+    for name in names:
+        require_column(table, name)!
+    mut rows: List[Map[String, String]] := []
+    for row in table.rows:
+        mut selected: Map[String, String] := {}
+        for name in names:
+            selected.insert(name, get_or(row, name, ""))
+        rows.push(selected)
+    return Table(copy_headers(names), rows)
+
+fn table_filter(table: Table, keep: fn(Map[String, String]) -> Bool) -> Table:
+    mut rows: List[Map[String, String]] := []
+    for row in table.rows:
+        if keep(row):
+            rows.push(copy_row(row))
+    return Table(copy_headers(table.headers), rows)
+
+# # return rows matching a predicate.
+pub fn filter(table: Table, keep: fn(Map[String, String]) -> Bool) -> Table:
+    return table_filter(table, keep)
+
+# # add or replace a derived column.
+pub fn with_column(table: Table, name: String, mapper: fn(Map[String, String]) -> String) -> Table:
+    headers := copy_headers(table.headers)
+    if not header_has(headers, name):
+        headers.push(name)
+    mut rows: List[Map[String, String]] := []
+    for row in table.rows:
+        next := copy_row(row)
+        next.insert(name, mapper(row))
+        rows.push(next)
+    return Table(headers, rows)
+
+# # count rows by column value.
+pub fn group_count(table: Table, column: String) -> Map[String, Int]!DataError:
+    require_column(table, column)!
+    mut counts: Map[String, Int] := {}
+    for row in table.rows:
+        value := get_or(row, column, "")
+        if counts.contains_key(value):
+            counts.insert(value, counts[value] + 1)
+        else:
+            counts.insert(value, 1)
+    return counts
+
+fn table_get_string(row: Map[String, String], column: String) -> String:
+    if row_has(row, column):
+        return row[column]
+    return ""
+
+# # return a row value or an empty string.
+pub fn get_string(row: Map[String, String], column: String) -> String:
+    return table_get_string(row, column)
+
+# # return a row value or an empty string.
+pub fn get(row: Map[String, String], column: String) -> String:
+    return table_get_string(row, column)
+
+# # return a row value or the fallback.
+pub fn get_or(row: Map[String, String], column: String, fallback: String) -> String:
+    if row_has(row, column):
+        return row[column]
+    return fallback
+
+# # return a row value parsed as an int, or the fallback.
+pub fn get_int_or(row: Map[String, String], column: String, fallback: Int) -> Int:
+    if not row_has(row, column):
+        return fallback
+    parsed := parse_int(row[column])
+    if parsed.is_err:
+        return fallback
+    return parsed.ok
+
+test "tables can be built from positional rows":
+    table := from_rows(["name", "age"], [["ada", "37"], ["grace"]])
+    assert_eq(row_count(table), 2)
+    assert_eq(column_count(table), 2)
+    assert_eq(get(table.rows[0], "name"), "ada")
+    assert_eq(get(table.rows[1], "age"), "")
+    assert_eq(get_int_or(table.rows[0], "age", 0), 37)
+
+test "table column operations keep row values":
+    table := from_rows(["name", "team"], [["ada", "blue"], ["grace", "red"]])
+    selected := select_columns(table, ["team"])!
+    counts := group_count(table, "team")!
+
+    assert_eq(column_count(selected), 1)
+    assert_eq(get(selected.rows[0], "team"), "blue")
+    assert_eq(counts["blue"], 1)
+    assert_eq(counts["red"], 1)
+
+test "tables support derived rows":
+    table := from_rows(["name", "age"], [["ada", "37"], ["grace", "85"]])
+    labelled := with_column(table, "label", fn(row: Map[String, String]) => get(row, "name") + ":" + get(row, "age"))
+
+    assert_eq(row_count(labelled), 2)
+    assert_eq(get(labelled.rows[0], "label"), "ada:37")
+    assert_eq(get(labelled.rows[1], "label"), "grace:85")
+
+test "tables parse csv files and report column errors":
+    nl := chr(10)
+    csv_text := "name,team,score" + nl + "alice,red,8" + nl + "bob,blue,3" + nl + "carol,red,5"
+    table := from_csv(csv_text)
+    first := table.rows[0]
+
+    assert_eq(row_count(table), 3)
+    assert_eq(column_count(table), 3)
+    assert_eq(columns(table).join(","), "name,team,score")
+    assert(has_column(table, "team"))
+    assert(not has_column(table, "missing"))
+    assert_eq(get_string(first, "name"), "alice")
+    assert_eq(get_or(first, "missing", "fallback"), "fallback")
+    assert_eq(get_int_or(first, "score", 0), 8)
+
+    selected := select_columns(table, ["score", "name"])!
+    assert_eq(columns(selected).join(","), "score,name")
+    assert_eq(get_string(selected.rows[0], "score"), "8")
+    assert_eq(get_string(selected.rows[0], "name"), "alice")
+
+    red := table_filter(table, fn(row: Map[String, String]) => get_or(row, "team", "") == "red")
+    assert_eq(row_count(red), 2)
+    labelled := with_column(table, "label", fn(row: Map[String, String]) => get_or(row, "name", "") + ":" + get_or(row, "team", ""))
+    assert_eq(column_count(labelled), 4)
+    assert_eq(get_string(labelled.rows[1], "label"), "bob:blue")
+    assert_eq(column_count(table), 3)
+
+    counts := group_count(table, "team")!
+    assert_eq(counts["red"], 2)
+    assert_eq(counts["blue"], 1)
+
+    mut row1: Map[String, String] := {}
+    row1.insert("city", "nyc")
+    row1.insert("name", "alice")
+    mut row2: Map[String, String] := {}
+    row2.insert("name", "bob")
+    row2.insert("score", "4")
+    records := from_records([row1, row2])
+    assert_eq(columns(records).join(","), "city,name,score")
+
+    rows_table := from_rows(["a", "b"], [["1"], ["2", "3"]])
+    assert_eq(get_string(rows_table.rows[0], "b"), "")
+    assert_eq(get_string(rows_table.rows[1], "b"), "3")
+    assert_eq(to_csv(selected).replace(nl, "|"), "score,name|8,alice|3,bob|5,carol")
+
+    root := fs.make_temp_dir("pith-data-table-")!
+    csv_path := path.join(root, "table.csv")
+    save_csv(csv_path, selected)!
+    loaded := from_csv_file(csv_path)!
+    assert_eq(get_string(loaded.rows[1], "name"), "bob")
+    assert_eq(get_string(loaded.rows[1], "score"), "3")
+
+    select_missing := select_columns(table, ["name", "missing"])
+    assert(select_missing.is_err)
+    assert_eq(select_missing.err.message, "missing column: missing")
+    group_missing := group_count(table, "missing")
+    assert(group_missing.is_err)
+    assert_eq(group_missing.err.message, "missing column: missing")
+    assert(fs.remove_tree(root))

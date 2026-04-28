@@ -1,0 +1,245 @@
+# std.compress.gzip — gzip helpers
+#
+# the current implementation writes portable gzip streams with stored
+# deflate blocks. that means the output is valid gzip, but this first
+# slice favors compatibility over smaller files.
+
+import std.bytes as bytes
+import std.binary as binary
+import std.bits as bits
+import std.checksum as checksum
+import std.fs as fs
+import std.os.path as path
+from std.bytes import ByteBuffer
+
+GZIP_STORED_BLOCK_SIZE := 65535
+GZIP_FLAG_HEADER_CRC := 2
+GZIP_FLAG_EXTRA := 4
+GZIP_FLAG_NAME := 8
+GZIP_FLAG_COMMENT := 16
+GZIP_FLAG_RESERVED := 224
+
+fn gzip_invalid() -> String:
+    return "invalid gzip data"
+
+fn gzip_read_u8_at(data: Bytes, offset: Int) -> Int!:
+    value := binary.read_u8_at(data, offset)
+    if value.is_err:
+        fail gzip_invalid()
+    return value.ok
+
+fn gzip_read_u16_le_at(data: Bytes, offset: Int) -> Int!:
+    value := binary.read_u16_le_at(data, offset)
+    if value.is_err:
+        fail gzip_invalid()
+    return value.ok
+
+fn gzip_read_u32_le_at(data: Bytes, offset: Int) -> Int!:
+    value := binary.read_u32_le_at(data, offset)
+    if value.is_err:
+        fail gzip_invalid()
+    return value.ok
+
+fn gzip_skip(data: Bytes, pos: Int, count: Int) -> Int!:
+    if count < 0 or pos + count > data.len():
+        fail gzip_invalid()
+    return pos + count
+
+fn gzip_write_u8(out: ByteBuffer, value: Int) -> Int!:
+    wrote := binary.write_u8(out, value)
+    if wrote.is_err:
+        fail wrote.err.message
+    return wrote.ok
+
+fn gzip_write_u16_le(out: ByteBuffer, value: Int) -> Int!:
+    wrote := binary.write_u16_le(out, value)
+    if wrote.is_err:
+        fail wrote.err.message
+    return wrote.ok
+
+fn gzip_write_u32_le(out: ByteBuffer, value: Int) -> Int!:
+    wrote := binary.write_u32_le(out, value)
+    if wrote.is_err:
+        fail wrote.err.message
+    return wrote.ok
+
+fn gzip_write_header(out: ByteBuffer) -> Int!:
+    mut total := gzip_write_u8(out, 31)!
+    total = total + gzip_write_u8(out, 139)!
+    total = total + gzip_write_u8(out, 8)!
+    total = total + gzip_write_u8(out, 0)!
+    total = total + gzip_write_u32_le(out, 0)!
+    total = total + gzip_write_u8(out, 0)!
+    return total + gzip_write_u8(out, 255)!
+
+fn gzip_write_stored_block(out: ByteBuffer, is_final: Bool, data: Bytes) -> Int!:
+    mut total := 0
+    if is_final:
+        total = total + gzip_write_u8(out, 1)!
+    else:
+        total = total + gzip_write_u8(out, 0)!
+    total = total + gzip_write_u16_le(out, data.len())!
+    total = total + gzip_write_u16_le(out, GZIP_STORED_BLOCK_SIZE - data.len())!
+    if data.len() == 0:
+        return total
+    return total + out.write(data)!
+
+fn gzip_skip_zero_terminated(data: Bytes, pos: Int) -> Int!:
+    mut cursor := pos
+    while cursor < data.len():
+        value := gzip_read_u8_at(data, cursor)!
+        cursor = cursor + 1
+        if value == 0:
+            return cursor
+    fail gzip_invalid()
+
+fn gzip_parse_header(data: Bytes) -> Int!:
+    id1 := gzip_read_u8_at(data, 0)!
+    id2 := gzip_read_u8_at(data, 1)!
+    method := gzip_read_u8_at(data, 2)!
+    flags := gzip_read_u8_at(data, 3)!
+    if id1 != 31 or id2 != 139 or method != 8:
+        fail gzip_invalid()
+    if bits.band(flags, GZIP_FLAG_RESERVED) != 0:
+        fail gzip_invalid()
+    mut pos := gzip_skip(data, 4, 6)!
+    if bits.band(flags, GZIP_FLAG_EXTRA) != 0:
+        extra_len := gzip_read_u16_le_at(data, pos)!
+        pos = gzip_skip(data, pos + 2, extra_len)!
+    if bits.band(flags, GZIP_FLAG_NAME) != 0:
+        pos = gzip_skip_zero_terminated(data, pos)!
+    if bits.band(flags, GZIP_FLAG_COMMENT) != 0:
+        pos = gzip_skip_zero_terminated(data, pos)!
+    if bits.band(flags, GZIP_FLAG_HEADER_CRC) != 0:
+        pos = gzip_skip(data, pos, 2)!
+    return pos
+
+fn gzip_decompress_stored(data: Bytes) -> Bytes!:
+    if data.len() < 18:
+        fail gzip_invalid()
+    mut pos := gzip_parse_header(data)!
+    out := bytes.buffer()
+    deflate_limit := data.len() - 8
+    while true:
+        if pos + 1 > deflate_limit:
+            fail gzip_invalid()
+        block_header := gzip_read_u8_at(data, pos)!
+        pos = pos + 1
+        is_final := bits.band(block_header, 1) != 0
+        block_type := bits.band(bits.shr(block_header, 1), 3)
+        if block_type != 0:
+            fail gzip_invalid()
+        if pos + 4 > deflate_limit:
+            fail gzip_invalid()
+        block_len := gzip_read_u16_le_at(data, pos)!
+        block_nlen := gzip_read_u16_le_at(data, pos + 2)!
+        pos = pos + 4
+        if block_len + block_nlen != GZIP_STORED_BLOCK_SIZE:
+            fail gzip_invalid()
+        if pos + block_len > deflate_limit:
+            fail gzip_invalid()
+        if block_len > 0:
+            out.write(data.slice(pos, pos + block_len))!
+        pos = pos + block_len
+        if is_final:
+            break
+    if pos + 8 != data.len():
+        fail gzip_invalid()
+    expected_crc := gzip_read_u32_le_at(data, pos)!
+    expected_size := gzip_read_u32_le_at(data, pos + 4)!
+    result := out.bytes()
+    if checksum.crc32(result) != expected_crc:
+        fail gzip_invalid()
+    if bits.mask32(result.len()) != expected_size:
+        fail gzip_invalid()
+    return result
+
+fn gzip_compress_result(data: Bytes) -> Bytes!:
+    out := bytes.buffer_with_capacity(10 + data.len() + 5 + 8)
+    gzip_write_header(out)!
+    if data.len() == 0:
+        gzip_write_stored_block(out, true, data)!
+    else:
+        mut offset := 0
+        while offset < data.len():
+            mut end := offset + GZIP_STORED_BLOCK_SIZE
+            if end > data.len():
+                end = data.len()
+            chunk := data.slice(offset, end)
+            gzip_write_stored_block(out, end == data.len(), chunk)!
+            offset = end
+    gzip_write_u32_le(out, checksum.crc32(data))!
+    gzip_write_u32_le(out, bits.mask32(data.len()))!
+    return out.bytes()
+
+# compress bytes into a gzip stream.
+pub fn compress(data: Bytes) -> Bytes:
+    return gzip_compress_result(data) catch bytes.empty()
+
+# decompress a gzip stream created with stored deflate blocks.
+pub fn decompress(data: Bytes) -> Bytes!:
+    return gzip_decompress_stored(data)
+
+# true when the data is a gzip stream this module can read.
+pub fn is_valid(data: Bytes) -> Bool:
+    result := gzip_decompress_stored(data)
+    return result.is_ok
+
+# compress utf-8 text into gzip bytes.
+pub fn compress_string(text: String) -> Bytes:
+    return compress(bytes.from_string_utf8(text))
+
+# decompress gzip bytes and decode the result as utf-8 text.
+pub fn decompress_string(data: Bytes) -> String!:
+    return decompress(data)!.to_string_utf8()!
+
+# read one file, gzip it, and write the output file.
+pub fn compress_file(from_path: String, to_path: String) -> Bool!:
+    source := fs.read_bytes(from_path)!
+    return fs.write_bytes(to_path, compress(source))
+
+# read one gzip file, decompress it, and write the output file.
+pub fn decompress_file(from_path: String, to_path: String) -> Bool!:
+    archive := fs.read_bytes(from_path)!
+    return fs.write_bytes(to_path, decompress(archive)!)
+
+test "gzip round trips bytes and strings":
+    data := bytes.from_string_utf8("pith gzip data")
+    compressed := compress(data)
+
+    assert(compressed.len() > data.len())
+    assert(is_valid(compressed))
+    assert_eq(decompress(compressed)!.to_string_utf8()!, "pith gzip data")
+    assert_eq(decompress_string(compress_string("hello gzip"))!, "hello gzip")
+
+test "gzip rejects invalid input":
+    bad := bytes.from_string_utf8("not gzip")
+
+    assert(not is_valid(bad))
+    assert(decompress(bad).is_err)
+
+test "gzip handles empty large and file round trips":
+    empty_roundtrip := decompress(compress(bytes.empty()))!
+    assert(empty_roundtrip.is_empty())
+
+    large := bytes.buffer_with_capacity(66000)
+    mut i := 0
+    while i < 66000:
+        large.write_byte(65)!
+        i = i + 1
+    large_data := large.bytes()
+    large_archive := compress(large_data)
+    large_roundtrip := decompress(large_archive)!
+    assert(is_valid(large_archive))
+    assert_eq(large_roundtrip.len(), 66000)
+    assert(bytes.eq(large_data, large_roundtrip))
+
+    root := fs.make_temp_dir("pith-gzip-")!
+    source := path.join(root, "source.txt")
+    archive := path.join(root, "source.txt.gz")
+    output := path.join(root, "output.txt")
+    assert(fs.write(source, "archive-data")!)
+    assert(compress_file(source, archive)!)
+    assert(decompress_file(archive, output)!)
+    assert_eq(fs.read(output)!, "archive-data")
+    assert(fs.remove_tree(root))

@@ -1,0 +1,37 @@
+import std.io as io
+import std.json as json
+import std.bytes as bytes
+
+fn main() -> Int!:
+    root := json.make_object()
+    json.object_set(root, "name", json.make_string("pith"))
+    json.object_set(root, "count", json.make_int(3))
+
+    tags := json.make_array()
+    json.array_push(tags, json.make_string("fast"))
+    json.array_push(tags, json.make_string("compact"))
+    json.object_set(root, "tags", tags)
+
+    buf := io.string_buffer()
+    json.write_to(buf, root)!
+    print(buf.string())
+    print(json.encode(root))
+
+    out := io.string_buffer()
+    json.write_object_start(out)!
+    mut first := true
+    first = json.write_object_string_field(out, first, "mode", "fast")!
+    first = json.write_object_bool_field(out, first, "ok", true)!
+    first = json.write_object_int_array_field(out, first, "ids", [4, 8, 15])!
+    json.write_object_end(out)!
+    print(out.string())
+
+    raw := bytes.buffer()
+    json.write_object_start_bytes(raw)!
+    first = true
+    first = json.write_object_string_field_bytes(raw, first, "mode", "fast")!
+    first = json.write_object_bool_field_bytes(raw, first, "ok", true)!
+    first = json.write_object_int_array_field_bytes(raw, first, "ids", [4, 8, 15])!
+    json.write_object_end_bytes(raw)!
+    print(raw.bytes().to_string_utf8()!)
+    return 0

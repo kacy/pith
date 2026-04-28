@@ -4,7 +4,7 @@
 /// # Safety
 /// fmt must be a valid null-terminated C string (or null for default)
 #[no_mangle]
-pub unsafe extern "C" fn forge_format_time_fmt(timestamp_ms: i64, _fmt: *const i8) -> *mut i8 {
+pub unsafe extern "C" fn pith_format_time_fmt(timestamp_ms: i64, _fmt: *const i8) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     let secs = timestamp_ms / 1000;
@@ -25,12 +25,12 @@ pub unsafe extern "C" fn forge_format_time_fmt(timestamp_ms: i64, _fmt: *const i
 /// # Safety
 /// Both pointers must be valid null-terminated C strings
 #[no_mangle]
-pub unsafe extern "C" fn forge_fs_write(path: *const i8, content: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_fs_write(path: *const i8, content: *const i8) -> i64 {
     if path.is_null() || content.is_null() {
         return 0;
     }
-    let path_len = crate::string::forge_cstring_len(path) as usize;
-    let content_len = crate::string::forge_cstring_len(content) as usize;
+    let path_len = crate::string::pith_cstring_len(path) as usize;
+    let content_len = crate::string::pith_cstring_len(content) as usize;
     let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
     let content_slice = std::slice::from_raw_parts(content as *const u8, content_len);
 
@@ -48,12 +48,12 @@ pub unsafe extern "C" fn forge_fs_write(path: *const i8, content: *const i8) -> 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_log_info(msg: *const i8) {
+pub unsafe extern "C" fn pith_log_info(msg: *const i8) {
     if msg.is_null() {
         eprintln!("[INFO] ");
         return;
     }
-    let len = crate::string::forge_cstring_len(msg) as usize;
+    let len = crate::string::pith_cstring_len(msg) as usize;
     let slice = std::slice::from_raw_parts(msg as *const u8, len);
     if let Ok(s) = std::str::from_utf8(slice) {
         eprintln!("[INFO] {}", s);
@@ -61,12 +61,12 @@ pub unsafe extern "C" fn forge_log_info(msg: *const i8) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_log_warn(msg: *const i8) {
+pub unsafe extern "C" fn pith_log_warn(msg: *const i8) {
     if msg.is_null() {
         eprintln!("[WARN] ");
         return;
     }
-    let len = crate::string::forge_cstring_len(msg) as usize;
+    let len = crate::string::pith_cstring_len(msg) as usize;
     let slice = std::slice::from_raw_parts(msg as *const u8, len);
     if let Ok(s) = std::str::from_utf8(slice) {
         eprintln!("[WARN] {}", s);
@@ -74,12 +74,12 @@ pub unsafe extern "C" fn forge_log_warn(msg: *const i8) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_log_error(msg: *const i8) {
+pub unsafe extern "C" fn pith_log_error(msg: *const i8) {
     if msg.is_null() {
         eprintln!("[ERROR] ");
         return;
     }
-    let len = crate::string::forge_cstring_len(msg) as usize;
+    let len = crate::string::pith_cstring_len(msg) as usize;
     let slice = std::slice::from_raw_parts(msg as *const u8, len);
     if let Ok(s) = std::str::from_utf8(slice) {
         eprintln!("[ERROR] {}", s);
@@ -88,13 +88,13 @@ pub unsafe extern "C" fn forge_log_error(msg: *const i8) {
 
 /// Execute command and capture output — returns stdout as C string
 #[no_mangle]
-pub unsafe extern "C" fn forge_exec_output(cmd: *const i8) -> *mut i8 {
+pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     if cmd.is_null() {
         return std::ptr::null_mut();
     }
-    let len = crate::string::forge_cstring_len(cmd) as usize;
+    let len = crate::string::pith_cstring_len(cmd) as usize;
     let slice = std::slice::from_raw_parts(cmd as *const u8, len);
     if let Ok(cmd_str) = std::str::from_utf8(slice) {
         let parts: Vec<&str> = cmd_str.split_whitespace().collect();
@@ -120,14 +120,14 @@ pub unsafe extern "C" fn forge_exec_output(cmd: *const i8) -> *mut i8 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_b64_decode(s: *const i8) -> *mut i8 {
+pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     if s.is_null() {
         return std::ptr::null_mut();
     }
 
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     let input = std::slice::from_raw_parts(s as *const u8, len);
 
     const DECODE: [u8; 256] = {
@@ -185,11 +185,11 @@ pub unsafe extern "C" fn forge_b64_decode(s: *const i8) -> *mut i8 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_fnv1a(s: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_fnv1a(s: *const i8) -> i64 {
     if s.is_null() {
         return 0;
     }
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     let bytes = std::slice::from_raw_parts(s as *const u8, len);
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in bytes {
@@ -200,12 +200,12 @@ pub unsafe extern "C" fn forge_fnv1a(s: *const i8) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_cstring_index_of(haystack: *const i8, needle: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_cstring_index_of(haystack: *const i8, needle: *const i8) -> i64 {
     if haystack.is_null() || needle.is_null() {
         return -1;
     }
-    let h_len = crate::string::forge_cstring_len(haystack) as usize;
-    let n_len = crate::string::forge_cstring_len(needle) as usize;
+    let h_len = crate::string::pith_cstring_len(haystack) as usize;
+    let n_len = crate::string::pith_cstring_len(needle) as usize;
     if n_len == 0 {
         return 0;
     }
@@ -220,12 +220,12 @@ pub unsafe extern "C" fn forge_cstring_index_of(haystack: *const i8, needle: *co
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_cstring_contains(haystack: *const i8, needle: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_cstring_contains(haystack: *const i8, needle: *const i8) -> i64 {
     if haystack.is_null() || needle.is_null() {
         return 0;
     }
-    let h_len = crate::string::forge_cstring_len(haystack) as usize;
-    let n_len = crate::string::forge_cstring_len(needle) as usize;
+    let h_len = crate::string::pith_cstring_len(haystack) as usize;
+    let n_len = crate::string::pith_cstring_len(needle) as usize;
     if n_len == 0 {
         return 1;
     }
@@ -243,12 +243,12 @@ pub unsafe extern "C" fn forge_cstring_contains(haystack: *const i8, needle: *co
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_cstring_starts_with(s: *const i8, prefix: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_cstring_starts_with(s: *const i8, prefix: *const i8) -> i64 {
     if s.is_null() || prefix.is_null() {
         return 0;
     }
-    let s_len = crate::string::forge_cstring_len(s) as usize;
-    let p_len = crate::string::forge_cstring_len(prefix) as usize;
+    let s_len = crate::string::pith_cstring_len(s) as usize;
+    let p_len = crate::string::pith_cstring_len(prefix) as usize;
     if p_len > s_len {
         return 0;
     }
@@ -258,12 +258,12 @@ pub unsafe extern "C" fn forge_cstring_starts_with(s: *const i8, prefix: *const 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_cstring_ends_with(s: *const i8, suffix: *const i8) -> i64 {
+pub unsafe extern "C" fn pith_cstring_ends_with(s: *const i8, suffix: *const i8) -> i64 {
     if s.is_null() || suffix.is_null() {
         return 0;
     }
-    let s_len = crate::string::forge_cstring_len(s) as usize;
-    let x_len = crate::string::forge_cstring_len(suffix) as usize;
+    let s_len = crate::string::pith_cstring_len(s) as usize;
+    let x_len = crate::string::pith_cstring_len(suffix) as usize;
     if x_len > s_len {
         return 0;
     }
@@ -273,7 +273,7 @@ pub unsafe extern "C" fn forge_cstring_ends_with(s: *const i8, suffix: *const i8
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_cstring_pad_left(
+pub unsafe extern "C" fn pith_cstring_pad_left(
     s: *const i8,
     width: i64,
     fill: *const i8,
@@ -283,10 +283,10 @@ pub unsafe extern "C" fn forge_cstring_pad_left(
     if s.is_null() {
         return std::ptr::null_mut();
     }
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     let w = width as usize;
     if len >= w {
-        return crate::forge_strdup(s);
+        return crate::pith_strdup(s);
     }
     let fill_char = if !fill.is_null() && *fill != 0 { *fill } else { b' ' as i8 };
     let pad = w - len;
@@ -304,7 +304,7 @@ pub unsafe extern "C" fn forge_cstring_pad_left(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_cstring_pad_right(
+pub unsafe extern "C" fn pith_cstring_pad_right(
     s: *const i8,
     width: i64,
     fill: *const i8,
@@ -314,10 +314,10 @@ pub unsafe extern "C" fn forge_cstring_pad_right(
     if s.is_null() {
         return std::ptr::null_mut();
     }
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     let w = width as usize;
     if len >= w {
-        return crate::forge_strdup(s);
+        return crate::pith_strdup(s);
     }
     let fill_char = if !fill.is_null() && *fill != 0 { *fill } else { b' ' as i8 };
     let total = w + 1;
@@ -334,13 +334,13 @@ pub unsafe extern "C" fn forge_cstring_pad_right(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_cstring_repeat(s: *const i8, n: i64) -> *mut i8 {
+pub unsafe extern "C" fn pith_cstring_repeat(s: *const i8, n: i64) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     if s.is_null() || n <= 0 {
-        return crate::forge_cstring_empty();
+        return crate::pith_cstring_empty();
     }
-    let len = crate::string::forge_cstring_len(s) as usize;
+    let len = crate::string::pith_cstring_len(s) as usize;
     let total = len * n as usize + 1;
     let layout = Layout::from_size_align(total, 1).unwrap();
     let ptr = alloc(layout) as *mut i8;
@@ -354,7 +354,7 @@ pub unsafe extern "C" fn forge_cstring_repeat(s: *const i8, n: i64) -> *mut i8 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_float_fixed(value: f64, decimals: i64) -> *mut i8 {
+pub unsafe extern "C" fn pith_float_fixed(value: f64, decimals: i64) -> *mut i8 {
     use std::alloc::{alloc, Layout};
 
     let s = format!("{:.prec$}", value, prec = decimals as usize);
@@ -369,12 +369,12 @@ pub unsafe extern "C" fn forge_float_fixed(value: f64, decimals: i64) -> *mut i8
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_is_dir(path: i64) -> i64 {
+pub unsafe extern "C" fn pith_is_dir(path: i64) -> i64 {
     let path_ptr = path as *const i8;
     if path_ptr.is_null() {
         return 0;
     }
-    let len = crate::string::forge_cstring_len(path_ptr) as usize;
+    let len = crate::string::pith_cstring_len(path_ptr) as usize;
     let slice = std::slice::from_raw_parts(path_ptr as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         if std::path::Path::new(path_str).is_dir() { 1 } else { 0 }

@@ -1,4 +1,4 @@
-# forge
+# pith
 
 a programming language where any coding agent is immediately productive.
 
@@ -6,7 +6,7 @@ no panics, no null, no data races. automatic memory management via ARC with
 compile-time cycle prevention. result types everywhere. designed so that AI
 coding agents can read the errors, apply fixes, and iterate — fast.
 
-**status:** the compiler self-hosts — forge is written in forge. the
+**status:** the compiler self-hosts — pith is written in pith. the
 self-hosted compiler compiles itself and produces identical output across
 stages (fixed-point verified). two backends: C transpilation and Cranelift
 native code generation — both compile the tracked example suite, and both
@@ -21,9 +21,9 @@ requires [rust/cargo](https://rustup.rs/) for the Cranelift native backend.
 
 ```
 cargo build --release
-./target/release/forge run examples/hello.fg
+./target/release/pith run examples/hello.pith
 make self-host
-./self-host/forge_main check examples/hello.fg
+./self-host/pith_main check examples/hello.pith
 ```
 
 ## where to read first
@@ -33,10 +33,10 @@ make self-host
 - `docs/concurrency.md` for channels, contexts, select, and task waits
 - `docs/http_apps.md` for the higher-level http request/response layer
 - `docs/text_and_bytes.md` for the string/bytes split and common helpers
-- `docs/idiomatic_forge.md` for the current everyday style
+- `docs/idiomatic_pith.md` for the current everyday style
 - `docs/contributing.md` for the development loop and smoke checks
 - `docs/tooling_stdlib.md` for glob, cli, diagnostic, and testing helpers
-- `self-host/forge_main.fg` for the self-hosted frontend (lex/parse/check/fmt/lint/doc)
+- `self-host/pith_main.pith` for the self-hosted frontend (lex/parse/check/fmt/lint/doc)
 - `cranelift/cli/src/main.rs` for the native backend CLI (build/run)
 
 ## contributor fast path
@@ -44,21 +44,21 @@ make self-host
 if you are new to the codebase, the shortest useful path is:
 
 1. run `cargo build --release`
-2. run `./target/release/forge run examples/hello.fg`
+2. run `./target/release/pith run examples/hello.pith`
 3. run `make self-host`
-4. run `./self-host/forge_main check examples/hello.fg`
+4. run `./self-host/pith_main check examples/hello.pith`
 5. read `docs/architecture.md`
 
 common starting points:
 
-- add a token or keyword: `self-host/lexer.fg`
-- add syntax: `self-host/parser.fg`, `docs/grammar.ebnf`
-- add type rules: `self-host/checker.fg`
+- add a token or keyword: `self-host/lexer.pith`
+- add syntax: `self-host/parser.pith`, `docs/grammar.ebnf`
+- add type rules: `self-host/checker.pith`
 - native code generation: `cranelift/codegen/src/ir_consumer.rs`
 
 for example-facing output, prefer interpolation for direct value printing:
 
-```fg
+```pith
 print("count: {items.len()}")
 ```
 
@@ -151,7 +151,7 @@ result types can carry either plain string errors or structured typed errors.
 use bare `T!` when a string error is enough, and use `T!E` when callers need
 to inspect the error payload.
 
-```fg
+```pith
 struct ParseError:
     message: String
 
@@ -183,27 +183,27 @@ full reference.
 ## cli commands
 
 ```
-forge build <file>             # compile to native binary
-forge run <file>               # compile and run
-forge test <file>              # run test declarations
-forge check <file>             # type check and report errors
-forge check --json <file>      # machine-readable JSON diagnostics
-forge fmt <file>               # format source code (canonical style)
-forge fmt --check <file>       # check if file is formatted (exit 1 if not)
-forge lint <file>              # check conventions and best practices
-forge lint --json <file>       # machine-readable lint output
-forge lex <file>               # print token stream
-forge parse <file>             # print AST
-forge doc <file>               # generate documentation
-forge doc --json <file>        # machine-readable doc output
-forge doc --check <file>       # verify all public items documented
-forge doc search <query>       # search stdlib by keyword
-forge package check            # type check package root from forge.toml
-forge package test             # run package root tests
-forge package lint             # lint package root
-forge package doc              # generate package root documentation
-forge version                  # print version
-forge help                     # print usage
+pith build <file>             # compile to native binary
+pith run <file>               # compile and run
+pith test <file>              # run test declarations
+pith check <file>             # type check and report errors
+pith check --json <file>      # machine-readable JSON diagnostics
+pith fmt <file>               # format source code (canonical style)
+pith fmt --check <file>       # check if file is formatted (exit 1 if not)
+pith lint <file>              # check conventions and best practices
+pith lint --json <file>       # machine-readable lint output
+pith lex <file>               # print token stream
+pith parse <file>             # print AST
+pith doc <file>               # generate documentation
+pith doc --json <file>        # machine-readable doc output
+pith doc --check <file>       # verify all public items documented
+pith doc search <query>       # search stdlib by keyword
+pith package check            # type check package root from pith.toml
+pith package test             # run package root tests
+pith package lint             # lint package root
+pith package doc              # generate package root documentation
+pith version                  # print version
+pith help                     # print usage
 ```
 
 ## building
@@ -221,55 +221,55 @@ make clean                 # remove build artifacts
 
 ## syntax highlighting on github
 
-`.fg` files are temporarily mapped to python highlighting through `.gitattributes`.
-this is a stopgap until forge is added to `github-linguist` with native support.
-see `tooling/highlighting/` for the forge TextMate grammar, sample files, and
+`.pith` files are temporarily mapped to python highlighting through `.gitattributes`.
+this is a stopgap until pith is added to `github-linguist` with native support.
+see `tooling/highlighting/` for the pith TextMate grammar, sample files, and
 the upstream submission checklist.
 
 ## project layout
 
 ```
-self-host/             compiler frontend — written in forge (~22,540 lines)
-  forge_main.fg      CLI — check/fmt/lint/lex/parse/doc
-  driver.fg          import resolution pipeline
-  lexer.fg           tokenizer with indentation tracking
-  parser.fg          recursive descent parser
-  ast.fg             AST node representation
-  printer.fg         AST pretty-printer
-  checker.fg         type checker
-  types.fg           type representation
-  scope.fg           scope management
-  formatter.fg       source code formatter
-  linter.fg          convention linter
-  errors.fg          human-readable error rendering
-  docgen.fg          documentation generator and search
+self-host/             compiler frontend — written in pith (~22,540 lines)
+  pith_main.pith      CLI — check/fmt/lint/lex/parse/doc
+  driver.pith          import resolution pipeline
+  lexer.pith           tokenizer with indentation tracking
+  parser.pith          recursive descent parser
+  ast.pith             AST node representation
+  printer.pith         AST pretty-printer
+  checker.pith         type checker
+  types.pith           type representation
+  scope.pith           scope management
+  formatter.pith       source code formatter
+  linter.pith          convention linter
+  errors.pith          human-readable error rendering
+  docgen.pith          documentation generator and search
 
 cranelift/             native code backend — Rust + Cranelift (~10,650 tracked lines)
   cli/               CLI entry point (build/run/test + delegates to self-host)
   codegen/           AST-to-IR compilation, monomorphization, type inference
   runtime/           runtime library (ARC, collections, JSON, TOML, URL, concurrency, crypto)
 
-std/                 standard library (58 native forge modules, ~25,300 lines)
-  cli.fg             command-line parsing helpers
-  diagnostic.fg      reusable diagnostics for tools
-  encoding.fg        base64/hex encoding
-  fmt.fg             string formatting
-  fs.fg              file I/O
-  glob.fg            file pattern discovery
-  hash.fg            SHA-256, FNV-1a
-  json.fg            JSON parse/encode
-  log.fg             structured logging
-  math.fg            math builtins
-  toml.fg            TOML parse/encode
-  text/scanner.fg    source-like text cursor helpers
-  net/tcp.fg         TCP connect/listen/accept/read/write/close
-  net/tls.fg         native TLS 1.3 client and server streams
-  net/tls13.fg       TLS 1.3 wire and key-schedule helpers
-  net/dns.fg         DNS resolution
-  net/url.fg         URL parsing and percent-encoding
-  os/certs.fg        system root certificate loading
-  os/path.fg         file path manipulation
-  os/process.fg      child process management
+std/                 standard library (58 native pith modules, ~25,300 lines)
+  cli.pith             command-line parsing helpers
+  diagnostic.pith      reusable diagnostics for tools
+  encoding.pith        base64/hex encoding
+  fmt.pith             string formatting
+  fs.pith              file I/O
+  glob.pith            file pattern discovery
+  hash.pith            SHA-256, FNV-1a
+  json.pith            JSON parse/encode
+  log.pith             structured logging
+  math.pith            math builtins
+  toml.pith            TOML parse/encode
+  text/scanner.pith    source-like text cursor helpers
+  net/tcp.pith         TCP connect/listen/accept/read/write/close
+  net/tls.pith         native TLS 1.3 client and server streams
+  net/tls13.pith       TLS 1.3 wire and key-schedule helpers
+  net/dns.pith         DNS resolution
+  net/url.pith         URL parsing and percent-encoding
+  os/certs.pith        system root certificate loading
+  os/path.pith         file path manipulation
+  os/process.pith      child process management
 
 examples/            user-facing demos and sample programs
   expected/          expected output snapshots for deterministic demos
@@ -281,7 +281,7 @@ tests/               regression and negative compiler fixtures
   invalid/           checker-invalid programs + expected error codes
   invalid_parse/     parser-invalid programs + expected error codes
 
-examples/            89 tracked .fg programs, including deterministic demos and live networking examples
+examples/            89 tracked .pith programs, including deterministic demos and live networking examples
 docs/grammar.ebnf    complete EBNF for the language
 docs/errors.md       error code reference (E0xx–E3xx)
 docs/architecture.md compiler and ownership overview

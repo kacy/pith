@@ -1,0 +1,22 @@
+import std.env as env
+import std.os as os
+import std.os.path as path
+
+fn main() -> Int!:
+    print(path.clean("/tmp//pith/./alpha/../beta/"))
+    print(path.clean("alpha/./beta/../gamma"))
+    print(path.clean("alpha/beta/../../gamma"))
+
+    start := os.cwd()
+    temp := os.temp_dir()
+    print((start.len() > 0).to_string())
+    print(path.is_abs(temp).to_string())
+    print(os.chdir(temp).to_string())
+    print((os.cwd() == temp).to_string())
+    print(os.chdir(start).to_string())
+    print((os.cwd() == start).to_string())
+    print(os.set_env("PITH_OS_HELPER_TEST", "hello").to_string())
+    print(env.get("PITH_OS_HELPER_TEST"))
+    print(os.unset_env("PITH_OS_HELPER_TEST").to_string())
+    print((env.get("PITH_OS_HELPER_TEST") == "").to_string())
+    return 0

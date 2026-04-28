@@ -1,4 +1,4 @@
-use crate::bytes::forge_bytes_ref;
+use crate::bytes::pith_bytes_ref;
 
 const TYPE_STRING: i64 = 0;
 const TYPE_INT: i64 = 1;
@@ -8,7 +8,7 @@ unsafe fn cstr_bytes<'a>(ptr: i64) -> &'a [u8] {
     if ptr == 0 {
         return &[];
     }
-    let len = crate::string::forge_cstring_len(ptr as *const i8) as usize;
+    let len = crate::string::pith_cstring_len(ptr as *const i8) as usize;
     std::slice::from_raw_parts(ptr as *const u8, len)
 }
 
@@ -92,7 +92,7 @@ fn skip_scalar(input: &[u8], pos: usize) -> Option<usize> {
 }
 
 unsafe fn alloc_result(is_ok: i64, ok: i64, err: i64) -> i64 {
-    let tuple = crate::forge_struct_alloc(3) as *mut i64;
+    let tuple = crate::pith_struct_alloc(3) as *mut i64;
     if tuple.is_null() {
         return 0;
     }
@@ -107,11 +107,11 @@ unsafe fn ok_result(value: i64) -> i64 {
 }
 
 unsafe fn err_result(message: &[u8]) -> i64 {
-    let error = crate::forge_struct_alloc(1) as *mut i64;
+    let error = crate::pith_struct_alloc(1) as *mut i64;
     if error.is_null() {
         return 0;
     }
-    *error = crate::forge_copy_bytes_to_cstring(message) as i64;
+    *error = crate::pith_copy_bytes_to_cstring(message) as i64;
     alloc_result(0, 0, error as i64)
 }
 
@@ -129,7 +129,7 @@ fn match_field(key: &[u8], keys: &[&[u8]; 6]) -> Option<usize> {
 unsafe fn parse_field_value(input: &[u8], pos: usize, field_type: i64) -> Option<(i64, usize)> {
     if field_type == TYPE_STRING {
         let end = read_string_end(input, pos)?;
-        let value = crate::forge_copy_bytes_to_cstring(&input[pos + 1..end]) as i64;
+        let value = crate::pith_copy_bytes_to_cstring(&input[pos + 1..end]) as i64;
         return Some((value, end + 1));
     }
     if field_type == TYPE_INT {
@@ -147,7 +147,7 @@ unsafe fn parse_field_value(input: &[u8], pos: usize, field_type: i64) -> Option
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_json_decode_flat6(
+pub unsafe extern "C" fn pith_json_decode_flat6(
     bytes_handle: i64,
     key0: i64,
     type0: i64,
@@ -162,7 +162,7 @@ pub unsafe extern "C" fn forge_json_decode_flat6(
     key5: i64,
     type5: i64,
 ) -> i64 {
-    let Some(bytes) = forge_bytes_ref(bytes_handle) else {
+    let Some(bytes) = pith_bytes_ref(bytes_handle) else {
         return err_result(b"invalid json object");
     };
     let input = bytes.data.as_slice();
@@ -239,7 +239,7 @@ pub unsafe extern "C" fn forge_json_decode_flat6(
         i += 1;
     }
 
-    let object = crate::forge_struct_alloc(6) as *mut i64;
+    let object = crate::pith_struct_alloc(6) as *mut i64;
     if object.is_null() {
         return 0;
     }

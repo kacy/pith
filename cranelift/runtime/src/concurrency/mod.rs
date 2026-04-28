@@ -8,14 +8,14 @@ pub mod waitgroup;
 
 // Re-export FFI functions for use by the codegen
 pub use channel::{
-    forge_channel_cap, forge_channel_close, forge_channel_is_closed, forge_channel_len,
-    forge_channel_new, forge_channel_recv, forge_channel_send, forge_channel_try_recv,
-    forge_channel_try_send, forge_select_next_index,
+    pith_channel_cap, pith_channel_close, pith_channel_is_closed, pith_channel_len,
+    pith_channel_new, pith_channel_recv, pith_channel_send, pith_channel_try_recv,
+    pith_channel_try_send, pith_select_next_index,
 };
-pub use mutex::{forge_mutex_lock, forge_mutex_new, forge_mutex_unlock};
+pub use mutex::{pith_mutex_lock, pith_mutex_new, pith_mutex_unlock};
 pub use semaphore::{
-    forge_semaphore_acquire, forge_semaphore_new, forge_semaphore_release,
+    pith_semaphore_acquire, pith_semaphore_new, pith_semaphore_release,
 };
 pub use waitgroup::{
-    forge_waitgroup_add, forge_waitgroup_done, forge_waitgroup_new, forge_waitgroup_wait,
+    pith_waitgroup_add, pith_waitgroup_done, pith_waitgroup_new, pith_waitgroup_wait,
 };

@@ -1,0 +1,6 @@
+import std.diagnostic as diagnostic
+
+fn main():
+    diag := diagnostic.with_fix(diagnostic.with_span(diagnostic.error("expected expression"), "main.pith", 3, 7, "value ="), "add an expression")
+    print(diagnostic.render(diag).contains("main.pith:3:7: error: expected expression").to_string())
+    print(diagnostic.render_json(diag).contains(chr(34) + "severity" + chr(34) + ":" + chr(34) + "error" + chr(34)).to_string())

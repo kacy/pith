@@ -1,0 +1,32 @@
+import std.json as json
+
+struct JsonProbeServer:
+    pub host: String
+    pub port: Int = 8080
+    pub tls: Bool = false
+
+struct JsonProbeApp:
+    pub name: String
+    pub server: JsonProbeServer = JsonProbeServer("localhost")
+
+fn main() -> Int:
+    dq := chr(34)
+    missing_doc := chr(123) + dq + "name" + dq + ":" + dq + "pith" + dq + chr(125)
+    partial_doc := chr(123) + dq + "name" + dq + ":" + dq + "pith" + dq + "," + dq + "server" + dq + ":" + chr(123) + dq + "host" + dq + ":" + dq + "edge" + dq + chr(125) + chr(125)
+
+    missing := json.decode_text[JsonProbeApp](missing_doc)
+    partial := json.decode_text[JsonProbeApp](partial_doc)
+
+    print("missing-ok:" + missing.is_ok.to_string())
+    if missing.is_ok:
+        print("missing:" + missing.ok.server.host + ":" + missing.ok.server.port.to_string() + ":" + missing.ok.server.tls.to_string())
+    if missing.is_err:
+        print("missing-err:" + missing.err.message)
+
+    print("partial-ok:" + partial.is_ok.to_string())
+    if partial.is_ok:
+        print("partial:" + partial.ok.server.host + ":" + partial.ok.server.port.to_string() + ":" + partial.ok.server.tls.to_string())
+    if partial.is_err:
+        print("partial-err:" + partial.err.message)
+
+    return 0

@@ -1,0 +1,335 @@
+# std.os.process — structured child process management
+#
+# use command(...) for the main api:
+#
+#   import std.os.process as process
+#   out := process.command("pwd").cwd("/tmp").output()!
+#   print("cwd: {out.stdout.trim()}")
+#
+# shell-string helpers still exist as compatibility paths:
+#
+#   code := process.run_shell("ls -la")
+
+from std.io import ProcessStdin, ProcessStdout, ProcessStderr
+from std.concurrent import Context, BlockingError, WaitError, blocking_failed, blocking_from_wait
+from std.collections import copy_list
+import std.bytes as bytes
+import std.time as time
+
+PROCESS_IO_CHUNK_SIZE := 4096
+
+# a process command builder with argv, cwd, and env overrides.
+pub struct Command:
+    pub program: String
+    pub argv: List[String]
+    pub cwd_path: String
+    pub env_keys: List[String]
+    pub env_values: List[String]
+
+# a running child process handle.
+pub struct Process:
+    pub handle: Int
+
+# captured process output.
+pub struct Output:
+    pub status: Int
+    pub stdout: String
+    pub stderr: String
+
+# command failure with captured output.
+pub struct ExitError:
+    pub status: Int
+    pub stdout: String
+    pub stderr: String
+
+# starts a command builder for one program.
+pub fn command(program: String) -> Command:
+    return Command(program, [], "", [], [])
+
+impl Command:
+    fn arg(value: String) -> Command:
+        argv := copy_list(self.argv)
+        argv.push(value)
+        return Command(self.program, argv, self.cwd_path, copy_list(self.env_keys), copy_list(self.env_values))
+
+    fn args(values: List[String]) -> Command:
+        argv := copy_list(self.argv)
+        for value in values:
+            argv.push(value)
+        return Command(self.program, argv, self.cwd_path, copy_list(self.env_keys), copy_list(self.env_values))
+
+    fn env(name: String, value: String) -> Command:
+        keys := copy_list(self.env_keys)
+        values := copy_list(self.env_values)
+        idx := keys.index_of(name)
+        if idx >= 0:
+            values[idx] = value
+        else:
+            keys.push(name)
+            values.push(value)
+        return Command(self.program, copy_list(self.argv), self.cwd_path, keys, values)
+
+    fn cwd(path: String) -> Command:
+        return Command(self.program, copy_list(self.argv), path, copy_list(self.env_keys), copy_list(self.env_values))
+
+    fn start() -> Process!:
+        return start(self)
+
+    fn run() -> Int!:
+        return run(self)
+
+    fn output() -> Output!:
+        return output(self)
+
+    fn output_checked() -> Output!ExitError:
+        return output_checked(self)
+
+    fn text() -> String!ExitError:
+        return text(self)
+
+    fn text_trimmed() -> String!ExitError:
+        return text_trimmed(self)
+
+    fn run_ctx(ctx: Context) -> Int!BlockingError:
+        return run_ctx(self, ctx)
+
+    fn output_ctx(ctx: Context) -> Output!BlockingError:
+        return output_ctx(self, ctx)
+
+fn wait_worker(process: Process) -> Int:
+    return process.wait()
+
+fn read_stdout_worker(process: Process) -> String!:
+    return process.stdout().read_all()
+
+fn read_stderr_worker(process: Process) -> String!:
+    return process.stderr().read_all()
+
+fn wait_error(ctx: Context) -> WaitError:
+    if ctx.error_code() == 2:
+        return WaitError.DeadlineExceeded
+    return WaitError.Cancelled
+
+fn start_or_fail(cmd: Command) -> Process!BlockingError:
+    started := start(cmd)
+    if started.is_err:
+        fail blocking_failed(started.err)
+    return started.ok
+
+fn kill_and_reap(process: Process):
+    process.kill()
+    process.wait()
+    process.close()
+
+fn await_output_or_fail(process: Process, task: Task[String!]) -> String!BlockingError:
+    result := await task
+    if result.is_err:
+        process.close()
+        fail blocking_failed(result.err)
+    return result.ok
+
+fn process_write_all(writer: ProcessStdin, data: String) -> Int!:
+    mut total := 0
+    mut remaining := data
+    while remaining.len() > 0:
+        wrote := writer.write(remaining)!
+        if wrote <= 0:
+            fail "write returned 0"
+        total = total + wrote
+        remaining = remaining.substring(wrote, remaining.len())
+    return total
+
+fn process_read_all_stdout(reader: ProcessStdout) -> String!:
+    mut out := ""
+    mut chunk := reader.read(PROCESS_IO_CHUNK_SIZE)!
+    while chunk.len() > 0:
+        out = out + chunk
+        chunk = reader.read(PROCESS_IO_CHUNK_SIZE)!
+    return out
+
+fn process_read_all_stderr(reader: ProcessStderr) -> String!:
+    mut out := ""
+    mut chunk := reader.read(PROCESS_IO_CHUNK_SIZE)!
+    while chunk.len() > 0:
+        out = out + chunk
+        chunk = reader.read(PROCESS_IO_CHUNK_SIZE)!
+    return out
+
+# waits for a process while respecting cancellation and deadlines.
+pub fn wait_ctx(process: Process, ctx: Context) -> Int!WaitError:
+    task := spawn wait_worker(process)
+    while not task.is_done():
+        if ctx.is_cancelled():
+            fail wait_error(ctx)
+        time.delay(1)
+    return await task
+
+# starts a process without waiting for it.
+pub fn start(cmd: Command) -> Process!:
+    handle := process_spawn_argv(cmd.program, cmd.argv, cmd.cwd_path, cmd.env_keys, cmd.env_values)!
+    return Process(handle)
+
+# runs a command and returns its exit status.
+pub fn run(cmd: Command) -> Int!:
+    return output(cmd)!.status
+
+# runs a command with cancellation and deadline support.
+pub fn run_ctx(cmd: Command, ctx: Context) -> Int!BlockingError:
+    process := start_or_fail(cmd)!
+    wait_result := process.wait_ctx(ctx)
+    if wait_result.is_err:
+        kill_and_reap(process)
+        fail blocking_from_wait(wait_result.err)
+    status := wait_result.ok
+    process.close()
+    return status
+
+# runs a command and captures its stdout and stderr.
+pub fn output(cmd: Command) -> Output!:
+    handle := process_output_argv(cmd.program, cmd.argv, cmd.cwd_path, cmd.env_keys, cmd.env_values)!
+    out := Output(process_output_status(handle), process_output_stdout(handle), process_output_stderr(handle))
+    process_output_close(handle)
+    return out
+
+# runs a command and fails when the exit status is nonzero.
+pub fn output_checked(cmd: Command) -> Output!ExitError:
+    out := output(cmd)
+    if out.is_err:
+        fail ExitError{-1, "", out.err}
+    if out.ok.status != 0:
+        fail ExitError{out.ok.status, out.ok.stdout, out.ok.stderr}
+    return out.ok
+
+# runs a command and returns stdout when it succeeds.
+pub fn text(cmd: Command) -> String!ExitError:
+    out := output_checked(cmd)
+    if out.is_err:
+        fail out.err
+    return out.ok.stdout
+
+# runs a command and returns trimmed stdout when it succeeds.
+pub fn text_trimmed(cmd: Command) -> String!ExitError:
+    out := output_checked(cmd)
+    if out.is_err:
+        fail out.err
+    return out.ok.stdout.trim()
+
+# runs a command with cancellation and captures stdout and stderr.
+pub fn output_ctx(cmd: Command, ctx: Context) -> Output!BlockingError:
+    process := start_or_fail(cmd)!
+    stdout_task := spawn read_stdout_worker(process)
+    stderr_task := spawn read_stderr_worker(process)
+    wait_result := process.wait_ctx(ctx)
+    if wait_result.is_err:
+        process.kill()
+        process.wait()
+        await stdout_task
+        await stderr_task
+        process.close()
+        fail blocking_from_wait(wait_result.err)
+    stdout := await_output_or_fail(process, stdout_task)!
+    stderr := await_output_or_fail(process, stderr_task)!
+    status := wait_result.ok
+    process.close()
+    return Output(status, stdout, stderr)
+
+impl Process:
+    fn stdin() -> ProcessStdin:
+        return ProcessStdin(self.handle)
+
+    fn stdout() -> ProcessStdout:
+        return ProcessStdout(self.handle)
+
+    fn stderr() -> ProcessStderr:
+        return ProcessStderr(self.handle)
+
+    fn wait() -> Int:
+        return process_wait(self.handle)
+
+    fn wait_ctx(ctx: Context) -> Int!WaitError:
+        return wait_ctx(self, ctx)
+
+    fn kill() -> Bool:
+        return process_kill(self.handle)
+
+    fn close():
+        process_close(self.handle)
+
+impl ProcessStdin:
+    fn write(data: String) -> Int!:
+        return process_write_bytes(self.handle, bytes.from_string_utf8(data))!
+
+    fn write_all(data: String) -> Int!:
+        return process_write_all(self, data)
+
+impl ProcessStdout:
+    fn read(max_bytes: Int) -> String!:
+        return process_read_bytes(self.handle, max_bytes)!.to_string_utf8()!
+
+    fn read_all() -> String!:
+        return process_read_all_stdout(self)
+
+impl ProcessStderr:
+    fn read(max_bytes: Int) -> String!:
+        return process_read_err_bytes(self.handle, max_bytes)!.to_string_utf8()!
+
+    fn read_all() -> String!:
+        return process_read_all_stderr(self)
+
+impl Output:
+    fn success() -> Bool:
+        return self.status == 0
+
+    fn failed() -> Bool:
+        return self.status != 0
+
+    fn stdout_trimmed() -> String:
+        return self.stdout.trim()
+
+    fn stderr_trimmed() -> String:
+        return self.stderr.trim()
+
+    fn ensure_success() -> Output!ExitError:
+        if self.status != 0:
+            fail ExitError{self.status, self.stdout, self.stderr}
+        return self
+
+# starts a shell command as a child process.
+pub fn start_shell(command_text: String) -> Process!:
+    return Process(process_spawn(command_text)!)
+
+# runs a shell command and returns its exit status.
+pub fn run_shell(command_text: String) -> Int:
+    return exec(command_text)
+
+# runs a shell command and returns stdout.
+pub fn output_shell(command_text: String) -> String!:
+    return exec_output(command_text)
+
+test "process command builder stores argv cwd and env":
+    cmd := command("tool").arg("one").args(["two", "three"]).cwd("/tmp").env("MODE", "dev")
+
+    assert(cmd.program == "tool")
+    assert_eq(cmd.argv.len(), 3)
+    assert(cmd.argv[0] == "one")
+    assert(cmd.argv[2] == "three")
+    assert(cmd.cwd_path == "/tmp")
+    assert_eq(cmd.env_keys.len(), 1)
+    assert(cmd.env_keys[0] == "MODE")
+    assert(cmd.env_values[0] == "dev")
+
+test "process output helpers classify status":
+    ok := Output(0, " pith" + chr(10), "")
+    bad := Output(7, "", "problem" + chr(10))
+    checked := bad.ensure_success()
+
+    assert(ok.success())
+    assert(not ok.failed())
+    assert(ok.stdout_trimmed() == "pith")
+    assert(bad.failed())
+    assert(bad.stderr_trimmed() == "problem")
+    assert(checked.is_err)
+    assert_eq(checked.err.status, 7)
+
+test "process shell helpers capture output":
+    assert(output_shell("printf shell")! == "shell")

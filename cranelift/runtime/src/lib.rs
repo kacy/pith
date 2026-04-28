@@ -1,6 +1,6 @@
-//! Forge Runtime - Core runtime library for the Forge language
+//! Pith Runtime - Core runtime library for the Pith language
 //!
-//! This crate provides the runtime support for Forge programs:
+//! This crate provides the runtime support for Pith programs:
 //! - Reference counting (ARC) with cycle collection
 //! - String operations
 //! - Collections (List, Map, Set)
@@ -42,11 +42,11 @@ pub use string_list::*;
 pub use utility::*;
 
 pub(crate) use runtime_core::{
-    forge_copy_bytes_to_cstring, forge_cstring_empty, forge_strdup_string,
+    pith_copy_bytes_to_cstring, pith_cstring_empty, pith_strdup_string,
 };
 
 pub use concurrency::{
-    forge_mutex_lock, forge_mutex_new, forge_mutex_unlock, forge_semaphore_acquire,
-    forge_semaphore_new, forge_semaphore_release, forge_waitgroup_add, forge_waitgroup_done,
-    forge_waitgroup_new, forge_waitgroup_wait,
+    pith_mutex_lock, pith_mutex_new, pith_mutex_unlock, pith_semaphore_acquire,
+    pith_semaphore_new, pith_semaphore_release, pith_waitgroup_add, pith_waitgroup_done,
+    pith_waitgroup_new, pith_waitgroup_wait,
 };

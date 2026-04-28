@@ -1,0 +1,26 @@
+import std.fs as fs
+import std.io as io
+
+fn main() -> Int!:
+    path := "/tmp/pith_io_stream_test.txt"
+
+    writer := fs.create(path)!
+    print(writer.write_all("hello")!.to_string())
+    writer.close()
+
+    appender := fs.open_append(path)!
+    print(appender.write_all(" world")!.to_string())
+    appender.close()
+
+    reader := fs.open(path)!
+    print(reader.read_all_chunked(4)!)
+    reader.close()
+
+    print(fs.exists(path).to_string())
+
+    text_path := "/tmp/pith_io_text_test.txt"
+    print(io.write_file_text_chunked(text_path, "alpha", 2)!.to_string())
+    print(io.append_file_text_chunked(text_path, " beta", 2)!.to_string())
+    print(io.read_file_text_chunked(text_path, 3)!)
+    print(fs.exists(text_path).to_string())
+    return 0

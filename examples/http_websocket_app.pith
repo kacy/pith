@@ -1,0 +1,36 @@
+# http + websocket app routing over buffered io
+import std.bytes as bytes
+import std.io as io
+import std.net.http as http
+import std.net.websocket as websocket
+from std.io import BufferedBytesReader, BufferedBytesWriter
+from std.net.http import HttpRequestBytes
+
+fn handle_app(req: HttpRequestBytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> String!:
+    if websocket.route_echo_buffered(req, reader, writer, "/ws", "", "echo:", "")!:
+        return "ws:ok"
+    if req.is_get("/greet")!:
+        mut name := req.query_param("name")!
+        if name == "":
+            name = "stranger"
+        http.send_buffered(writer, http.html(200, "<h1>Hello, " + name + "!</h1>"))!
+        return "http:" + name
+    http.send_buffered(writer, http.not_found_response())!
+    return "http:404"
+fn main() -> Int!:
+    greet_req := io.bytes_reader(bytes.from_string_utf8("GET /greet?name=pith HTTP/1.1\r\nHost: example.com\r\n\r\n")).buffered_chunked(5)
+    greet := http.read_request_buffered_bytes(greet_req)!
+    greet_out := bytes.buffer()
+    print(handle_app(greet, io.bytes_reader(bytes.empty()).buffered_chunked(2), greet_out.buffered_chunked(4))!)
+    print(greet_out.bytes().to_string_utf8()!.contains("Hello, pith!").to_string())
+    mut headers: Map[String, String] := {}
+    ws_req_bytes := websocket.client_request("example.com", "/ws", headers)!
+    ws_req := http.read_request_buffered_bytes(io.bytes_reader(ws_req_bytes).buffered_chunked(5))!
+    inbound := websocket.client_text_frame_bytes("pith", bytes.from_string_utf8("abcd"))!
+    ws_out := bytes.buffer()
+    print(handle_app(ws_req, io.bytes_reader(inbound).buffered_chunked(3), ws_out.buffered_chunked(4))!)
+    handshake := websocket.upgrade_response(ws_req)!
+    print(ws_out.bytes().slice(0, handshake.len()).to_string_utf8()!.contains("101 Switching Protocols").to_string())
+    echoed := websocket.parse_frame(ws_out.bytes().slice(handshake.len(), ws_out.bytes().len()))!
+    print(echoed.payload_text()!)
+    return 0

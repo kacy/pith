@@ -1,0 +1,21 @@
+import std.fs as fs
+import std.glob as glob
+import std.os.path as path
+
+fn main() -> String!:
+    root := fs.make_temp_dir("pith-glob-example-")!
+    src := path.join(root, "src")
+    ignored := path.join(root, "target")
+    fs.make_dirs(src)
+    fs.make_dirs(ignored)
+    fs.write(path.join(root, "main.pith"), "")!
+    fs.write(path.join(src, "lib.pith"), "")!
+    fs.write(path.join(ignored, "skip.pith"), "")!
+
+    pattern := path.join(root, "**/*.pith")
+    matches := glob.find(root, [pattern])!
+    print("matches: {matches.len()}")
+    print("main matches: {glob.matches(pattern, path.join(root, "main.pith"))}")
+    print("target skipped: {(matches.len() == 2)}")
+    fs.remove_tree(root)
+    return ""

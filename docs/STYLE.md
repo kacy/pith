@@ -1,6 +1,6 @@
-# Forge Style Guide
+# Pith Style Guide
 
-This guide establishes best practices for writing readable, maintainable Forge code. The goal is code that humans can understand quickly and reason about confidently.
+This guide establishes best practices for writing readable, maintainable Pith code. The goal is code that humans can understand quickly and reason about confidently.
 
 ## Core Philosophy
 
@@ -10,7 +10,7 @@ This guide establishes best practices for writing readable, maintainable Forge c
 - Explicit over clever
 - Consistency over novelty
 
-These principles are adapted from Go's readability philosophy, tailored for Forge's specific features and constraints.
+These principles are adapted from Go's readability philosophy, tailored for Pith's specific features and constraints.
 
 ---
 
@@ -26,7 +26,7 @@ Use descriptive names. Avoid single-letter variables except in these specific ca
 - Mathematical conventions: `x`, `y` for coordinates in geometry code
 
 **Always use full words:**
-```forge
+```pith
 # GOOD
 mut character_index := 0
 mut current_line := ""
@@ -44,7 +44,7 @@ mut cap := 1024
 
 Use the full name of what you're iterating over:
 
-```forge
+```pith
 # GOOD
 for item in items:
     process(item)
@@ -64,7 +64,7 @@ for c in line:
 
 For index-based iteration, use meaningful names:
 
-```forge
+```pith
 # GOOD
 mut line_index := 0
 while line_index < lines.len():
@@ -83,7 +83,7 @@ while i < items.len():
 
 Parameters should be descriptive, especially when the function is public or long:
 
-```forge
+```pith
 # GOOD - public API
 pub fn read_file_contents(file_path: String) -> String:
     return read_file(file_path)
@@ -104,7 +104,7 @@ fn is_ws(c: String) -> Bool:
 
 All functions use `snake_case`. Names should describe what the function does:
 
-```forge
+```pith
 # GOOD
 fn calculate_checksum(data: String) -> Int:
 fn parse_http_request(raw_request: String) -> Request:
@@ -118,7 +118,7 @@ fn check(a: String) -> Bool:
 
 **Predicate functions** (returning Bool) should start with `is_`, `has_`, or `can_`:
 
-```forge
+```pith
 fn is_valid_email(address: String) -> Bool:
 fn has_permission(user: User, resource: String) -> Bool:
 fn can_execute(command: String) -> Bool:
@@ -128,7 +128,7 @@ fn can_execute(command: String) -> Bool:
 
 All types use `PascalCase`:
 
-```forge
+```pith
 struct HttpRequest:
     pub method: String
     pub path: String
@@ -150,7 +150,7 @@ type EmailAddress = String
 
 Separate logical sections with blank lines:
 
-```forge
+```pith
 # GOOD
 mut input_buffer := ""
 mut output_buffer := ""
@@ -169,7 +169,7 @@ mut lines := 0
 
 A function should do one thing. If you can't describe it in a single sentence, it might be too big.
 
-```forge
+```pith
 # GOOD - clear purpose
 pub fn read_configuration_file(path: String) -> Configuration:
     raw_contents := read_file(path)
@@ -191,7 +191,7 @@ pub fn load_and_parse_and_validate_and_return_config(p: String) -> Configuration
 
 Prefer early returns over deep nesting:
 
-```forge
+```pith
 # GOOD - flat, readable
 fn find_user_by_id(users: List[User], target_id: Int) -> Option[User]:
     for user in users:
@@ -223,7 +223,7 @@ Every public function must have a doc comment. The comment should explain:
 3. What it returns
 4. Any error conditions
 
-```forge
+```pith
 # Reads the entire contents of a file at the given path.
 # Returns the file contents as a string.
 # Returns an empty string if the file doesn't exist.
@@ -236,7 +236,7 @@ pub fn read_file(path: String) -> String:
 
 Use comments to explain *why*, not *what*:
 
-```forge
+```pith
 # GOOD - explains the reasoning
 # We use a simple linear scan because the list is always small (< 100 items).
 mut current_index := 0
@@ -252,7 +252,7 @@ current_index = current_index + 1
 
 Use section comments to group related functionality:
 
-```forge
+```pith
 # ============================================================
 # File Operations
 # ============================================================
@@ -277,7 +277,7 @@ pub fn list_directory(path: String) -> List[String]:
 
 ### Use the Error Operator for Simple Cases
 
-```forge
+```pith
 # GOOD - simple error propagation
 pub fn load_user_data(user_id: Int) -> UserData!:
     raw_data := fetch_from_database(user_id)!  # propagate errors
@@ -286,7 +286,7 @@ pub fn load_user_data(user_id: Int) -> UserData!:
 
 ### Handle Errors Explicitly for Complex Cases
 
-```forge
+```pith
 # GOOD - explicit error handling with context
 pub fn save_configuration(config: Configuration, path: String) -> Result[Unit, String]:
     json_string := serialize_to_json(config)
@@ -305,7 +305,7 @@ pub fn save_configuration(config: Configuration, path: String) -> Result[Unit, S
 
 ### String Building
 
-```forge
+```pith
 # GOOD - descriptive variable names
 mut result_lines := ""
 for line in input_lines:
@@ -317,7 +317,7 @@ for line in input_lines:
 
 ### Working with Collections
 
-```forge
+```pith
 # GOOD - use descriptive names
 mut active_users := [] as List[User]
 for user in all_users:
@@ -330,7 +330,7 @@ for user in all_users:
 
 ### Mathematical Operations
 
-```forge
+```pith
 # OK - mathematical conventions apply
 fn calculate_distance(x1: Float, y1: Float, x2: Float, y2: Float) -> Float:
     dx := x2 - x1
@@ -344,7 +344,7 @@ fn calculate_distance(x1: Float, y1: Float, x2: Float, y2: Float) -> Float:
 
 ### 1. Cryptic Abbreviations
 
-```forge
+```pith
 # BAD
 g_ooff  # What is this? Object offset? Outgoing offer?
 buf
@@ -360,7 +360,7 @@ current_user
 
 ### 2. Mixing Abbreviation Styles
 
-```forge
+```pith
 # BAD - inconsistent
 current_position
 pos
@@ -377,7 +377,7 @@ end_position
 
 ### 3. Deep Nesting
 
-```forge
+```pith
 # BAD
 if condition_a:
     if condition_b:
@@ -396,7 +396,7 @@ do_something()
 
 ### 4. Long Chains of Single Letters
 
-```forge
+```pith
 # BAD - cryptographic code becomes unreadable
 mut a := h0
 mut b := h1
@@ -438,8 +438,8 @@ When in doubt, spell it out.
 
 Every file should start with a brief description:
 
-```forge
-# http_client.fg - HTTP client implementation with connection pooling
+```pith
+# http_client.pith - HTTP client implementation with connection pooling
 #
 # This module provides functions for making HTTP requests with support
 # for keep-alive connections, retries, and custom headers.
@@ -451,12 +451,12 @@ from std.net.tcp import connect, read, write, close
 
 Group imports by source:
 
-```forge
+```pith
 # Standard library imports
 from std.fs import read_file, write_file
 from std.json import parse, encode
 
-# Third-party imports (when Forge supports them)
+# Third-party imports (when Pith supports them)
 # from external.lib import something
 
 # Local/module imports
@@ -485,8 +485,8 @@ Before submitting code, verify:
 
 ### Complete Example: Configuration Parser
 
-```forge
-# config_parser.fg - Parse configuration files in key=value format
+```pith
+# config_parser.pith - Parse configuration files in key=value format
 #
 # Supports comments (#), empty lines, and basic validation.
 
@@ -572,7 +572,7 @@ This example demonstrates:
 
 ## Contributing
 
-When contributing to the Forge codebase:
+When contributing to the Pith codebase:
 
 1. Follow this style guide
 2. Update this guide if you introduce new patterns

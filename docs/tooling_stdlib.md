@@ -1,6 +1,6 @@
 # tooling standard library
 
-forge now has a small set of stdlib modules aimed at tools: walking files,
+pith now has a small set of stdlib modules aimed at tools: walking files,
 scanning source-like text, parsing command lines, rendering diagnostics, and
 writing tighter tests.
 
@@ -8,16 +8,16 @@ writing tighter tests.
 
 `std.glob` matches file paths with `*`, `?`, and `**`.
 
-```fg
+```pith
 import std.glob as glob
 
-files := glob.find(".", ["std/**/*.fg"])!
+files := glob.find(".", ["std/**/*.pith"])!
 for file in files:
     print(file)
 ```
 
 by default it skips hidden entries and common build folders like `.git`,
-`.forge-build`, `target`, `zig-cache`, `zig-out`, and `.zig-cache`.
+`.pith-build`, `target`, `zig-cache`, `zig-out`, and `.zig-cache`.
 
 use `find_matches` when you need to know which pattern matched a file, and
 `find_excluding` when a tool has include and exclude patterns.
@@ -28,10 +28,10 @@ use `find_matches` when you need to know which pattern matched a file, and
 tracks byte position plus 1-based line and column while callers peek, advance,
 and take slices.
 
-```fg
+```pith
 import std.text.scanner as scanner
 
-source := "name: forge" + chr(10) + "version: 1"
+source := "name: pith" + chr(10) + "version: 1"
 key := scanner.take_until(scanner.new(source), ":")
 line := scanner.take_line(scanner.new(source))
 
@@ -47,30 +47,30 @@ or source positions without writing another local `while i < text.len()` loop.
 `std.cli` is intentionally stateless. build a spec, pass `argv`, and inspect
 the parsed result.
 
-```fg
+```pith
 import std.cli as cli
 
 fmt := cli.command("fmt", "format files", [cli.flag("check", "c", "check only")], ["pattern"])
-spec := cli.app("forge-tool", "small tooling cli", [], [], [fmt])
-parsed := cli.parse(spec, ["fmt", "--check", "std/**/*.fg"])!
+spec := cli.app("pith-tool", "small tooling cli", [], [], [fmt])
+parsed := cli.parse(spec, ["fmt", "--check", "std/**/*.pith"])!
 
 print(parsed.command)
 print(cli.flag_value(parsed, "check").to_string())
 print(cli.positional(parsed, 0))
 ```
 
-this layer is for small forge tools that want options, flags, subcommands, and
+this layer is for small pith tools that want options, flags, subcommands, and
 help text without each tool reimplementing the same argument loop.
 
 ## diagnostics
 
 `std.diagnostic` gives tools one shape for human-readable and json output.
 
-```fg
+```pith
 import std.diagnostic as diagnostic
 
 diag := diagnostic.with_fix(
-    diagnostic.with_span(diagnostic.error("expected expression"), "main.fg", 3, 7, "value ="),
+    diagnostic.with_span(diagnostic.error("expected expression"), "main.pith", 3, 7, "value ="),
     "add an expression",
 )
 

@@ -20,7 +20,7 @@ struct TaskShared {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_spawn(closure_handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_spawn(closure_handle: i64) -> i64 {
     if closure_handle == 0 {
         return 0;
     }
@@ -35,7 +35,7 @@ pub unsafe extern "C" fn forge_spawn(closure_handle: i64) -> i64 {
     let shared_clone = shared.clone();
 
     let handle = std::thread::spawn(move || {
-        let func_ptr = crate::forge_closure_get_fn(closure_handle);
+        let func_ptr = crate::pith_closure_get_fn(closure_handle);
         if func_ptr == 0 {
             let (lock, cvar) = &*shared_clone;
             if let Ok(mut state) = lock.lock() {
@@ -65,7 +65,7 @@ pub unsafe extern "C" fn forge_spawn(closure_handle: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_await(task_handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_await(task_handle: i64) -> i64 {
     if task_handle <= 0 {
         return 0;
     }
@@ -100,7 +100,7 @@ pub unsafe extern "C" fn forge_await(task_handle: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_task_is_done(task_handle: i64) -> i64 {
+pub unsafe extern "C" fn pith_task_is_done(task_handle: i64) -> i64 {
     if task_handle <= 0 {
         return 0;
     }
@@ -127,7 +127,7 @@ pub unsafe extern "C" fn forge_task_is_done(task_handle: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn forge_task_detach(task_handle: i64) {
+pub unsafe extern "C" fn pith_task_detach(task_handle: i64) {
     if task_handle <= 0 {
         return;
     }

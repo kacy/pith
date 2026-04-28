@@ -1,0 +1,843 @@
+# printer.pith — AST pretty printer
+#
+# renders a parsed AST (arena-indexed nodes) as indented text,
+# matching the output format of `pith parse` exactly.
+
+from ast import get_node, Node
+
+# ---------------------------------------------------------------
+# indentation helper
+# ---------------------------------------------------------------
+
+fn print_indent(level: Int):
+    mut i := 0
+    while i < level:
+        print_raw("  ")
+        i = i + 1
+
+# we need a way to print without newline. pith's print() adds a newline.
+# use a buffer approach: build the full line then print it.
+mut line_buf := ""
+
+fn print_raw(s: String):
+    line_buf = line_buf + s
+
+fn flush_line():
+    print(line_buf)
+    line_buf = ""
+
+fn print_line(indent: Int, text: String):
+    mut i := 0
+    while i < indent:
+        line_buf = line_buf + "  "
+        i = i + 1
+    line_buf = line_buf + text
+    flush_line()
+
+fn strip_generic_params(name: String) -> String:
+    # "Pair[A, B]" -> "Pair"
+    mut i := 0
+    while i < name.len():
+        if name[i] == "[":
+            return name.substring(0, i)
+        i = i + 1
+    return name
+
+# ---------------------------------------------------------------
+# main entry point
+# ---------------------------------------------------------------
+
+pub fn print_ast(root: Int):
+    node := get_node(root)
+    if node.kind == "module":
+        print("module")
+        for child in node.children:
+            print_top_level(child, 1)
+    else:
+        print_top_level(root, 0)
+
+# ---------------------------------------------------------------
+# top-level declarations
+# ---------------------------------------------------------------
+
+fn print_top_level(idx: Int, indent: Int):
+    node := get_node(idx)
+
+    if node.kind == "pub":
+        print_line(indent, "pub")
+        print_top_level(node.children[0], indent)
+        return
+
+    if node.kind == "fn_decl":
+        print_fn_decl(idx, indent)
+        return
+
+    if node.kind == "struct_decl":
+        print_struct_decl(idx, indent)
+        return
+
+    if node.kind == "enum_decl":
+        print_enum_decl(idx, indent)
+        return
+
+    if node.kind == "interface_decl":
+        print_interface_decl(idx, indent)
+        return
+
+    if node.kind == "impl_decl":
+        print_impl_decl(idx, indent)
+        return
+
+    if node.kind == "type_alias":
+        print_type_alias(idx, indent)
+        return
+
+    if node.kind == "test_decl":
+        print_test_decl(idx, indent)
+        return
+
+    if node.kind == "binding":
+        print_binding(idx, indent)
+        return
+
+    if node.kind == "import":
+        print_import(idx, indent)
+        return
+
+    if node.kind == "from_import":
+        print_from_import(idx, indent)
+        return
+
+    # fallback
+    print_line(indent, node.kind + " " + node.value)
+
+fn print_fn_decl(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "fn " + node.value)
+
+    for child in node.children:
+        c := get_node(child)
+        if c.kind == "param":
+            print_param(child, indent + 1)
+        elif c.kind == "returns":
+            print_line(indent + 1, "returns")
+            print_type_node(c.children[0], indent + 2)
+        elif c.kind == "body":
+            print_line(indent + 1, "body")
+            print_block_contents(c.children[0], indent + 2)
+
+fn print_param(idx: Int, indent: Int):
+    node := get_node(idx)
+    # value is "name" or "name mut" or "name ref" etc
+    name := node.value
+    mut label := "param"
+
+    # split name and modifiers
+    # the parser stores "name mut", "name ref", "name mut ref"
+    mut parts_name := name
+    mut parts_mod := ""
+    # find first space
+    mut space_pos := 0 - 1
+    mut si := 0
+    while si < name.len():
+        if name[si] == " ":
+            space_pos = si
+            break
+        si = si + 1
+    if space_pos >= 0:
+        parts_name = name.substring(0, space_pos)
+        parts_mod = name.substring(space_pos, name.len())
+    label = "param " + parts_name + parts_mod
+    print_line(indent, label)
+
+    for child in node.children:
+        c := get_node(child)
+        if c.kind == "type" or c.kind == "generic_type" or c.kind == "optional_type" or c.kind == "result_type" or c.kind == "tuple_type" or c.kind == "fn_type":
+            print_type_node(child, indent + 1)
+        else:
+            # default value
+            print_expr(child, indent + 1)
+
+fn print_struct_decl(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "struct " + strip_generic_params(node.value))
+    for child in node.children:
+        print_struct_field(child, indent + 1)
+
+fn print_struct_field(idx: Int, indent: Int):
+    node := get_node(idx)
+    # value is "name pub", "name pub mut", etc.
+    print_line(indent, "field " + node.value)
+    for child in node.children:
+        c := get_node(child)
+        if c.kind == "type" or c.kind == "generic_type" or c.kind == "optional_type" or c.kind == "result_type" or c.kind == "tuple_type" or c.kind == "fn_type":
+            print_type_node(child, indent + 1)
+        else:
+            print_expr(child, indent + 1)
+
+fn print_enum_decl(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "enum " + strip_generic_params(node.value))
+    for child in node.children:
+        print_enum_variant(child, indent + 1)
+
+fn print_enum_variant(idx: Int, indent: Int):
+    node := get_node(idx)
+    if node.children.len() == 0:
+        print_line(indent, "variant " + node.value)
+    else:
+        # variant with fields: build inline type list
+        mut label := "variant " + node.value + "("
+        mut first := true
+        for child in node.children:
+            if not first:
+                label = label + ", "
+            label = label + type_expr_inline(child)
+            first = false
+        label = label + ")"
+        print_line(indent, label)
+
+fn print_interface_decl(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "interface " + node.value)
+    for child in node.children:
+        c := get_node(child)
+        # fn_sig — just print "fn name"
+        print_line(indent + 1, "fn " + c.value)
+
+fn print_impl_decl(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "impl")
+
+    # first child is target type
+    if node.children.len() > 0:
+        print_type_node(node.children[0], indent + 1)
+
+    # process remaining children
+    for child, i in node.children:
+        if i == 0:
+            continue
+        c := get_node(child)
+        if c.kind == "for_type":
+            print_line(indent + 1, "for")
+            print_type_node(c.children[0], indent + 2)
+        elif c.kind == "pub":
+            print_line(indent + 1, "pub")
+            print_fn_decl(c.children[0], indent + 1)
+        elif c.kind == "fn_decl":
+            print_fn_decl(child, indent + 1)
+
+fn print_type_alias(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "type_alias " + node.value)
+    if node.children.len() > 0:
+        print_type_node(node.children[0], indent + 1)
+
+fn print_test_decl(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "test " + node.value)
+    for child in node.children:
+        c := get_node(child)
+        if c.kind == "body":
+            print_block_contents(c.children[0], indent + 1)
+
+fn print_import(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "import " + node.value)
+
+fn print_from_import(idx: Int, indent: Int):
+    node := get_node(idx)
+    # value is "path name1 name2 ..."
+    # need to format as "from path import name1, name2"
+    parts := node.value
+    # find first space to split path from names
+    mut first_space := 0 - 1
+    for ch, si in parts:
+        if ch == " ":
+            first_space = si
+            break
+    if first_space < 0:
+        print_line(indent, "from " + parts + " import")
+        return
+
+    path := parts.substring(0, first_space)
+    names_str := parts.substring(first_space + 1, parts.len())
+
+    # split names by space and join with ", "
+    mut names: List[String] := []
+    mut start := 0
+    for ch, ni in names_str:
+        if ch == " ":
+            if ni > start:
+                names.push(names_str.substring(start, ni))
+            start = ni + 1
+    if start < names_str.len():
+        names.push(names_str.substring(start, names_str.len()))
+
+    label := "from " + path + " import " + names.join(", ")
+    print_line(indent, label)
+
+# ---------------------------------------------------------------
+# bindings
+# ---------------------------------------------------------------
+
+fn print_binding(idx: Int, indent: Int):
+    node := get_node(idx)
+    # value is "name" or "name mut"
+    print_line(indent, "bind " + node.value)
+    for child in node.children:
+        c := get_node(child)
+        if c.kind == "type" or c.kind == "generic_type" or c.kind == "optional_type" or c.kind == "result_type" or c.kind == "tuple_type" or c.kind == "fn_type":
+            print_type_node(child, indent + 1)
+        else:
+            print_expr(child, indent + 1)
+
+# ---------------------------------------------------------------
+# statements
+# ---------------------------------------------------------------
+
+fn print_stmt(idx: Int, indent: Int):
+    node := get_node(idx)
+
+    if node.kind == "binding":
+        print_binding(idx, indent)
+        return
+
+    if node.kind == "assignment":
+        print_assignment(idx, indent)
+        return
+
+    if node.kind == "if_stmt":
+        print_if_stmt(idx, indent)
+        return
+
+    if node.kind == "for_stmt":
+        print_for_stmt(idx, indent)
+        return
+
+    if node.kind == "while_stmt":
+        print_while_stmt(idx, indent)
+        return
+
+    if node.kind == "match_expr":
+        print_match(idx, indent)
+        return
+
+    if node.kind == "return":
+        print_return(idx, indent)
+        return
+
+    if node.kind == "fail":
+        print_fail(idx, indent)
+        return
+
+    if node.kind == "break":
+        print_line(indent, "break")
+        return
+
+    if node.kind == "continue":
+        print_line(indent, "continue")
+        return
+
+    # expression statement
+    print_expr(idx, indent)
+
+fn print_assignment(idx: Int, indent: Int):
+    node := get_node(idx)
+    # map op symbols to printer names
+    mut op := node.value
+    if op == "=":
+        op = "="
+    elif op == "+=":
+        op = "+="
+    elif op == "-=":
+        op = "-="
+    elif op == "*=":
+        op = "*="
+    elif op == "/=":
+        op = "/="
+    print_line(indent, "assign " + op)
+    print_expr(node.children[0], indent + 1)
+    print_expr(node.children[1], indent + 1)
+
+fn print_if_stmt(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "if")
+
+    # first child is condition
+    print_expr(node.children[0], indent + 1)
+
+    # then: find the "then" node
+    for child, ci in node.children:
+        if ci == 0:
+            continue
+        c := get_node(child)
+        if c.kind == "then":
+            print_line(indent + 1, "then")
+            print_block_contents(c.children[0], indent + 2)
+        elif c.kind == "elif":
+            print_line(indent + 1, "elif")
+            # elif has condition + block
+            print_expr(c.children[0], indent + 2)
+            print_block_contents(c.children[1], indent + 2)
+        elif c.kind == "else":
+            print_line(indent + 1, "else")
+            print_block_contents(c.children[0], indent + 2)
+
+fn print_for_stmt(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "for " + node.value)
+    # children[0] = iterable, children[1] = body
+    print_expr(node.children[0], indent + 1)
+    print_block_contents(node.children[1], indent + 1)
+
+fn print_while_stmt(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "while")
+    print_expr(node.children[0], indent + 1)
+    print_block_contents(node.children[1], indent + 1)
+
+fn print_match(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "match")
+    # first child is subject
+    print_expr(node.children[0], indent + 1)
+    # remaining children are arms
+    for child, i in node.children:
+        if i > 0:
+            print_match_arm(child, indent + 1)
+
+fn print_match_arm(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "arm")
+    # children: pattern, optional guard, body
+    for child in node.children:
+        c := get_node(child)
+        if c.kind == "guard":
+            print_line(indent + 1, "guard")
+            print_expr(c.children[0], indent + 2)
+        elif c.kind == "body":
+            print_line(indent + 1, "body")
+            # body contains either a single expr or block contents
+            body_child := get_node(c.children[0])
+            if body_child.kind == "block":
+                print_block_contents(c.children[0], indent + 2)
+            else:
+                print_expr(c.children[0], indent + 2)
+        elif c.kind == "block":
+            # block body from match arm
+            print_block_contents(child, indent + 1)
+        else:
+            # pattern
+            print_pattern(child, indent + 1)
+
+fn print_return(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "return")
+    for child in node.children:
+        print_expr(child, indent + 1)
+
+fn print_fail(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "fail")
+    for child in node.children:
+        print_expr(child, indent + 1)
+
+# ---------------------------------------------------------------
+# expressions
+# ---------------------------------------------------------------
+
+fn print_expr(idx: Int, indent: Int):
+    node := get_node(idx)
+
+    if node.kind == "int_lit":
+        print_line(indent, "int " + node.value)
+        return
+
+    if node.kind == "float_lit":
+        print_line(indent, "float " + node.value)
+        return
+
+    if node.kind == "string_lit":
+        print_line(indent, "string " + node.value)
+        return
+
+    if node.kind == "bool_lit":
+        print_line(indent, "bool " + node.value)
+        return
+
+    if node.kind == "none_lit":
+        print_line(indent, "none")
+        return
+
+    if node.kind == "ident":
+        print_line(indent, "ident " + node.value)
+        return
+
+    if node.kind == "self":
+        print_line(indent, "self")
+        return
+
+    if node.kind == "binary":
+        print_line(indent, "binary " + node.value)
+        print_expr(node.children[0], indent + 1)
+        print_expr(node.children[1], indent + 1)
+        return
+
+    if node.kind == "unary":
+        print_line(indent, "unary " + node.value)
+        print_expr(node.children[0], indent + 1)
+        return
+
+    if node.kind == "call":
+        print_line(indent, "call")
+        # first child is callee
+        print_expr(node.children[0], indent + 1)
+        # rest are args
+        for child, i in node.children:
+            if i > 0:
+                print_arg(child, indent + 1)
+        return
+
+    if node.kind == "method_call":
+        print_line(indent, "method_call ." + node.value)
+        # first child is receiver
+        print_expr(node.children[0], indent + 1)
+        # rest are args
+        for child, i in node.children:
+            if i > 0:
+                print_arg(child, indent + 1)
+        return
+
+    if node.kind == "field_access":
+        print_line(indent, "field ." + node.value)
+        print_expr(node.children[0], indent + 1)
+        return
+
+    if node.kind == "index":
+        print_line(indent, "index")
+        print_expr(node.children[0], indent + 1)
+        print_expr(node.children[1], indent + 1)
+        return
+
+    if node.kind == "unwrap":
+        print_line(indent, "unwrap")
+        print_expr(node.children[0], indent + 1)
+        return
+
+    if node.kind == "try":
+        print_line(indent, "try")
+        print_expr(node.children[0], indent + 1)
+        return
+
+    if node.kind == "spawn":
+        print_line(indent, "spawn")
+        print_expr(node.children[0], indent + 1)
+        return
+
+    if node.kind == "await":
+        print_line(indent, "await")
+        print_expr(node.children[0], indent + 1)
+        return
+
+    if node.kind == "if_expr":
+        print_if_expr(idx, indent)
+        return
+
+    if node.kind == "match_expr":
+        print_match(idx, indent)
+        return
+
+    if node.kind == "lambda":
+        print_lambda(idx, indent)
+        return
+
+    if node.kind == "list":
+        print_line(indent, "list (" + node.children.len().to_string() + " items)")
+        for child in node.children:
+            print_expr(child, indent + 1)
+        return
+
+    if node.kind == "map":
+        print_line(indent, "map (" + node.children.len().to_string() + " entries)")
+        for child in node.children:
+            c := get_node(child)
+            print_line(indent + 1, "entry")
+            print_expr(c.children[0], indent + 2)
+            print_expr(c.children[1], indent + 2)
+        return
+
+    if node.kind == "set":
+        print_line(indent, "set (" + node.children.len().to_string() + " items)")
+        for child in node.children:
+            print_expr(child, indent + 1)
+        return
+
+    if node.kind == "tuple":
+        print_line(indent, "tuple (" + node.children.len().to_string() + " items)")
+        for child in node.children:
+            print_expr(child, indent + 1)
+        return
+
+    if node.kind == "string_interp":
+        print_string_interp(idx, indent)
+        return
+
+    if node.kind == "grouped":
+        # grouped just passes through to inner expression
+        print_expr(node.children[0], indent)
+        return
+
+    if node.kind == "error":
+        print_line(indent, "<error>")
+        return
+
+    # statement nodes appearing as expressions
+    if node.kind == "binding" or node.kind == "assignment" or node.kind == "if_stmt" or node.kind == "for_stmt" or node.kind == "while_stmt" or node.kind == "return" or node.kind == "fail" or node.kind == "break" or node.kind == "continue":
+        print_stmt(idx, indent)
+        return
+
+    # fallback
+    print_line(indent, node.kind + " " + node.value)
+
+fn print_if_expr(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "if_expr")
+    # children: condition, then_expr, [elif_branches...], else_expr
+    print_expr(node.children[0], indent + 1)
+    print_expr(node.children[1], indent + 1)
+    # elifs and else
+    for child, i in node.children:
+        if i < 2:
+            continue
+        c := get_node(child)
+        if c.kind == "elif_branch":
+            # elif has cond, expr
+            print_expr(c.children[0], indent + 1)
+            print_expr(c.children[1], indent + 1)
+        else:
+            # last is else expr
+            print_expr(child, indent + 1)
+
+fn print_lambda(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "lambda")
+    for child in node.children:
+        c := get_node(child)
+        if c.kind == "param":
+            print_param(child, indent + 1)
+        elif c.kind == "body":
+            print_line(indent + 1, "body")
+            # body contains either an expr or block
+            body_child := get_node(c.children[0])
+            if body_child.kind == "block":
+                print_block_contents(c.children[0], indent + 2)
+            else:
+                print_expr(c.children[0], indent + 2)
+
+fn print_string_interp(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "string_interp (" + node.children.len().to_string() + " parts)")
+    for child in node.children:
+        c := get_node(child)
+        if c.kind == "lit":
+            print_line(indent + 1, "lit " + c.value)
+        else:
+            print_expr(child, indent + 1)
+
+fn print_arg(idx: Int, indent: Int):
+    node := get_node(idx)
+    if node.value.len() > 0:
+        print_line(indent, "arg " + node.value + "=")
+    else:
+        print_line(indent, "arg")
+    print_expr(node.children[0], indent + 1)
+
+# ---------------------------------------------------------------
+# patterns
+# ---------------------------------------------------------------
+
+fn print_pattern(idx: Int, indent: Int):
+    node := get_node(idx)
+
+    if node.kind == "pat_wildcard":
+        print_line(indent, "pattern _")
+        return
+
+    if node.kind == "pat_int":
+        print_line(indent, "pattern int " + node.value)
+        return
+
+    if node.kind == "pat_float":
+        print_line(indent, "pattern float " + node.value)
+        return
+
+    if node.kind == "pat_string":
+        print_line(indent, "pattern string " + node.value)
+        return
+
+    if node.kind == "pat_bool":
+        print_line(indent, "pattern bool " + node.value)
+        return
+
+    if node.kind == "pat_none":
+        print_line(indent, "pattern none")
+        return
+
+    if node.kind == "pat_binding":
+        print_line(indent, "pattern bind " + node.value)
+        return
+
+    if node.kind == "pat_variant":
+        # value is "Type.Variant", children are field patterns
+        if node.children.len() > 0:
+            mut label := "pattern " + node.value + "("
+            mut first := true
+            for child in node.children:
+                if not first:
+                    label = label + ", "
+                label = label + "_"
+                first = false
+            label = label + ")"
+            print_line(indent, label)
+        else:
+            print_line(indent, "pattern " + node.value)
+        return
+
+    if node.kind == "pat_tuple":
+        print_line(indent, "pattern tuple")
+        for child in node.children:
+            print_pattern(child, indent + 1)
+        return
+
+    print_line(indent, "pattern " + node.kind)
+
+# ---------------------------------------------------------------
+# type expressions
+# ---------------------------------------------------------------
+
+fn print_type_node(idx: Int, indent: Int):
+    node := get_node(idx)
+
+    if node.kind == "type":
+        print_line(indent, "type " + node.value)
+        return
+
+    if node.kind == "generic_type":
+        # inline type args
+        mut label := "type " + node.value + "["
+        mut first := true
+        for child in node.children:
+            if not first:
+                label = label + ", "
+            label = label + type_expr_inline(child)
+            first = false
+        label = label + "]"
+        print_line(indent, label)
+        return
+
+    if node.kind == "optional_type":
+        print_line(indent, "optional")
+        print_type_node(node.children[0], indent + 1)
+        return
+
+    if node.kind == "result_type":
+        print_line(indent, "result")
+        print_type_node(node.children[0], indent + 1)
+        if node.children.len() > 1:
+            print_type_node(node.children[1], indent + 1)
+        return
+
+    if node.kind == "tuple_type":
+        print_line(indent, "tuple_type")
+        for child in node.children:
+            print_type_node(child, indent + 1)
+        return
+
+    if node.kind == "fn_type":
+        print_line(indent, "fn_type")
+        for child in node.children:
+            c := get_node(child)
+            if c.kind == "param":
+                print_line(indent + 1, "param")
+                if c.children.len() > 0:
+                    print_type_node(c.children[0], indent + 2)
+            elif c.kind == "returns":
+                print_line(indent + 1, "returns")
+                if c.children.len() > 0:
+                    print_type_node(c.children[0], indent + 2)
+        return
+
+    print_line(indent, "type " + node.value)
+
+# inline type rendering — returns a string instead of printing
+fn type_expr_inline(idx: Int) -> String:
+    node := get_node(idx)
+
+    if node.kind == "type":
+        return node.value
+
+    if node.kind == "generic_type":
+        mut result := node.value + "["
+        mut first := true
+        for child in node.children:
+            if not first:
+                result = result + ", "
+            result = result + type_expr_inline(child)
+            first = false
+        result = result + "]"
+        return result
+
+    if node.kind == "optional_type":
+        return type_expr_inline(node.children[0]) + "?"
+
+    if node.kind == "result_type":
+        mut result := type_expr_inline(node.children[0]) + "!"
+        if node.children.len() > 1:
+            result = result + type_expr_inline(node.children[1])
+        return result
+
+    if node.kind == "tuple_type":
+        mut result := "("
+        mut first := true
+        for child in node.children:
+            if not first:
+                result = result + ", "
+            result = result + type_expr_inline(child)
+            first = false
+        result = result + ")"
+        return result
+
+    if node.kind == "fn_type":
+        mut result := "fn("
+        mut first := true
+        for child in node.children:
+            c := get_node(child)
+            if c.kind == "param":
+                if not first:
+                    result = result + ", "
+                if c.children.len() > 0:
+                    result = result + type_expr_inline(c.children[0])
+                first = false
+            elif c.kind == "returns":
+                result = result + ")"
+                if c.children.len() > 0:
+                    result = result + " -> " + type_expr_inline(c.children[0])
+                return result
+        result = result + ")"
+        return result
+
+    return node.value
+
+# ---------------------------------------------------------------
+# block contents
+# ---------------------------------------------------------------
+
+fn print_block_contents(idx: Int, indent: Int):
+    node := get_node(idx)
+    if node.kind == "block":
+        for child in node.children:
+            print_stmt(child, indent)
+    else:
+        # single statement
+        print_stmt(idx, indent)

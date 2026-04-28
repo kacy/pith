@@ -258,8 +258,7 @@ fn emit_checked_int_div_or_mod(
         .brif(zero_divisor, zero_error, &[], after_zero_check, &[]);
 
     builder.switch_to_block(zero_error);
-    let zero_result =
-        emit_runtime_error_value(codegen, builder, func_ref_cache, runtime_funcs, 1)?;
+    let zero_result = emit_runtime_error_value(codegen, builder, func_ref_cache, runtime_funcs, 1)?;
     jump_with_i64_arg(builder, done, zero_result);
 
     builder.switch_to_block(after_zero_check);
@@ -1185,8 +1184,7 @@ fn compile_ir_function(
                         struct_regs.remove(&reg);
                         continue;
                     }
-                    if (fname == "pith_list_get_value"
-                        || fname == "pith_list_get_value_unchecked")
+                    if (fname == "pith_list_get_value" || fname == "pith_list_get_value_unchecked")
                         && args.len() == 2
                     {
                         let inlined = inline_list_get_value(
@@ -1373,13 +1371,6 @@ fn compile_ir_function(
                     };
                     builder.def_var(var, val);
                 }
-            }
-
-            "store" => {
-                // The current self-hosted emitter can produce an empty store
-                // target for indexed mutations that are already emitted as
-                // their own set operation. Treat that known form as a no-op,
-                // but keep unknown instructions strict below.
             }
 
             "load" if parts.len() >= 3 => {
@@ -1680,9 +1671,9 @@ fn get_reg(regs: &HashMap<usize, Value>, s: &str) -> Result<Value, CompileError>
     let reg = s.parse::<usize>().map_err(|_| {
         CompileError::ModuleError(format!("IR consumer: invalid register reference '{}'", s))
     })?;
-    regs.get(&reg).copied().ok_or_else(|| {
-        CompileError::ModuleError(format!("IR consumer: missing register {}", reg))
-    })
+    regs.get(&reg)
+        .copied()
+        .ok_or_else(|| CompileError::ModuleError(format!("IR consumer: missing register {}", reg)))
 }
 
 fn get_label(
@@ -1760,8 +1751,15 @@ mod tests {
     }
 
     #[test]
+    fn malformed_store_returns_compile_error() {
+        let err = compile_err_for_ir("func main 0 int\niconst 17 1\nstore  17\nendfunc\n");
+        assert!(err.contains("unknown or malformed instruction"));
+    }
+
+    #[test]
     fn unknown_branch_label_returns_compile_error() {
-        let err = compile_err_for_ir("func main 0 int\niconst 1 1\nbrif 1 then_l else_l\nendfunc\n");
+        let err =
+            compile_err_for_ir("func main 0 int\niconst 1 1\nbrif 1 then_l else_l\nendfunc\n");
         assert!(err.contains("unknown label 'then_l'"));
     }
 

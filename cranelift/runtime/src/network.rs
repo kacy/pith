@@ -95,7 +95,11 @@ pub extern "C" fn pith_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
         return std::ptr::null_mut();
     }
     let mut stream = unsafe { TcpStream::from_raw_fd(conn_fd as i32) };
-    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let size = if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        4096
+    };
     let mut buf = vec![0u8; size];
     let result = match stream.read(&mut buf) {
         Ok(n) => {
@@ -120,7 +124,11 @@ pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
         return 0;
     }
     let mut stream = unsafe { TcpStream::from_raw_fd(conn_fd as i32) };
-    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let size = if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        4096
+    };
     let mut buf = vec![0u8; size];
     let result = match stream.read(&mut buf) {
         Ok(n) => {

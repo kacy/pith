@@ -1,5 +1,6 @@
 //! channel support for task communication
 
+use crate::handle_registry::{self, HandleKind};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -16,6 +17,13 @@ struct ChannelState {
 }
 
 type PithChannelHandle = Arc<(Mutex<ChannelState>, Condvar)>;
+
+unsafe fn channel_ref<'a>(handle: i64) -> Option<&'a PithChannelHandle> {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Channel) {
+        return None;
+    }
+    Some(&*(handle as *const PithChannelHandle))
+}
 
 fn lock_state(lock: &Mutex<ChannelState>) -> MutexGuard<'_, ChannelState> {
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -54,15 +62,16 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
         sender_waiting: 0,
     };
     let channel = Arc::new((Mutex::new(state), Condvar::new()));
-    Box::into_raw(Box::new(channel)) as i64
+    let ptr = Box::into_raw(Box::new(channel));
+    handle_registry::register(ptr as *const (), HandleKind::Channel);
+    ptr as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 0;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, cvar) = &**channel;
     let mut state = lock_state(lock);
 
@@ -104,10 +113,9 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 0;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, cvar) = &**channel;
     let mut state = lock_state(lock);
 
@@ -134,10 +142,9 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return optional_tuple(false, 0);
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, cvar) = &**channel;
     let mut state = lock_state(lock);
 
@@ -167,10 +174,9 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return optional_tuple(false, 0);
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, cvar) = &**channel;
     let mut state = lock_state(lock);
 
@@ -189,10 +195,9 @@ pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 0;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, cvar) = &**channel;
     let mut state = lock_state(lock);
     if state.closed {
@@ -206,10 +211,9 @@ pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 0;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, _) = &**channel;
     let state = lock_state(lock);
     state.queue.len() as i64
@@ -217,10 +221,9 @@ pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_cap(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 0;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, _) = &**channel;
     let state = lock_state(lock);
     state.capacity as i64
@@ -228,13 +231,16 @@ pub unsafe extern "C" fn pith_channel_cap(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_is_closed(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 1;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, _) = &**channel;
     let state = lock_state(lock);
-    if state.closed { 1 } else { 0 }
+    if state.closed {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]

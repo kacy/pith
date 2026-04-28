@@ -278,61 +278,101 @@ pub extern "C" fn pith_assert_ne(a: i64, b: i64) {
 }
 
 #[no_mangle]
-pub extern "C" fn pith_bit_and(a: i64, b: i64) -> i64 { a & b }
+pub extern "C" fn pith_bit_and(a: i64, b: i64) -> i64 {
+    a & b
+}
 
 #[no_mangle]
-pub extern "C" fn pith_bit_or(a: i64, b: i64) -> i64 { a | b }
+pub extern "C" fn pith_bit_or(a: i64, b: i64) -> i64 {
+    a | b
+}
 
 #[no_mangle]
-pub extern "C" fn pith_bit_xor(a: i64, b: i64) -> i64 { a ^ b }
+pub extern "C" fn pith_bit_xor(a: i64, b: i64) -> i64 {
+    a ^ b
+}
 
 #[no_mangle]
-pub extern "C" fn pith_bit_not(a: i64) -> i64 { !a }
+pub extern "C" fn pith_bit_not(a: i64) -> i64 {
+    !a
+}
 
 #[no_mangle]
-pub extern "C" fn pith_bit_shl(a: i64, b: i64) -> i64 { a << b }
+pub extern "C" fn pith_bit_shl(a: i64, b: i64) -> i64 {
+    a << b
+}
 
 #[no_mangle]
-pub extern "C" fn pith_bit_shr(a: i64, b: i64) -> i64 { ((a as u64) >> b) as i64 }
+pub extern "C" fn pith_bit_shr(a: i64, b: i64) -> i64 {
+    ((a as u64) >> b) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_uint(n: i64) -> i64 { n }
+pub extern "C" fn pith_uint(n: i64) -> i64 {
+    n
+}
 
 #[no_mangle]
-pub extern "C" fn pith_int8(n: i64) -> i64 { (n as i8) as i64 }
+pub extern "C" fn pith_int8(n: i64) -> i64 {
+    (n as i8) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_int16(n: i64) -> i64 { (n as i16) as i64 }
+pub extern "C" fn pith_int16(n: i64) -> i64 {
+    (n as i16) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_int32(n: i64) -> i64 { (n as i32) as i64 }
+pub extern "C" fn pith_int32(n: i64) -> i64 {
+    (n as i32) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_int64(n: i64) -> i64 { n }
+pub extern "C" fn pith_int64(n: i64) -> i64 {
+    n
+}
 
 #[no_mangle]
-pub extern "C" fn pith_uint8(n: i64) -> i64 { (n as u8) as i64 }
+pub extern "C" fn pith_uint8(n: i64) -> i64 {
+    (n as u8) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_uint16(n: i64) -> i64 { (n as u16) as i64 }
+pub extern "C" fn pith_uint16(n: i64) -> i64 {
+    (n as u16) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_uint32(n: i64) -> i64 { (n as u32) as i64 }
+pub extern "C" fn pith_uint32(n: i64) -> i64 {
+    (n as u32) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_uint64(n: i64) -> i64 { n }
+pub extern "C" fn pith_uint64(n: i64) -> i64 {
+    n
+}
 
 #[no_mangle]
-pub extern "C" fn pith_abs(n: i64) -> i64 { n.abs() }
+pub extern "C" fn pith_abs(n: i64) -> i64 {
+    n.abs()
+}
 
 #[no_mangle]
 pub extern "C" fn pith_min(a: i64, b: i64) -> i64 {
-    if a < b { a } else { b }
+    if a < b {
+        a
+    } else {
+        b
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn pith_max(a: i64, b: i64) -> i64 {
-    if a > b { a } else { b }
+    if a > b {
+        a
+    } else {
+        b
+    }
 }
 
 #[no_mangle]
@@ -347,61 +387,101 @@ pub extern "C" fn pith_clamp(n: i64, min: i64, max: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn pith_pow(a: f64, b: f64) -> f64 { a.powf(b) }
+pub extern "C" fn pith_pow(a: f64, b: f64) -> f64 {
+    a.powf(b)
+}
 
 #[no_mangle]
-pub extern "C" fn pith_sqrt(n: f64) -> f64 { n.sqrt() }
+pub extern "C" fn pith_sqrt(n: f64) -> f64 {
+    n.sqrt()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_floor(n: f64) -> f64 { n.floor() }
+pub extern "C" fn pith_floor(n: f64) -> f64 {
+    n.floor()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_ceil(n: f64) -> f64 { n.ceil() }
+pub extern "C" fn pith_ceil(n: f64) -> f64 {
+    n.ceil()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_round(n: f64) -> f64 { n.round() }
+pub extern "C" fn pith_round(n: f64) -> f64 {
+    n.round()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_sin(n: f64) -> f64 { n.sin() }
+pub extern "C" fn pith_sin(n: f64) -> f64 {
+    n.sin()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_cos(n: f64) -> f64 { n.cos() }
+pub extern "C" fn pith_cos(n: f64) -> f64 {
+    n.cos()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_tan(n: f64) -> f64 { n.tan() }
+pub extern "C" fn pith_tan(n: f64) -> f64 {
+    n.tan()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_asin(n: f64) -> f64 { n.asin() }
+pub extern "C" fn pith_asin(n: f64) -> f64 {
+    n.asin()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_acos(n: f64) -> f64 { n.acos() }
+pub extern "C" fn pith_acos(n: f64) -> f64 {
+    n.acos()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_atan(n: f64) -> f64 { n.atan() }
+pub extern "C" fn pith_atan(n: f64) -> f64 {
+    n.atan()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_atan2(y: f64, x: f64) -> f64 { y.atan2(x) }
+pub extern "C" fn pith_atan2(y: f64, x: f64) -> f64 {
+    y.atan2(x)
+}
 
 #[no_mangle]
-pub extern "C" fn pith_log(n: f64) -> f64 { n.ln() }
+pub extern "C" fn pith_log(n: f64) -> f64 {
+    n.ln()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_log10(n: f64) -> f64 { n.log10() }
+pub extern "C" fn pith_log10(n: f64) -> f64 {
+    n.log10()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_log2(n: f64) -> f64 { n.log2() }
+pub extern "C" fn pith_log2(n: f64) -> f64 {
+    n.log2()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_exp(n: f64) -> f64 { n.exp() }
+pub extern "C" fn pith_exp(n: f64) -> f64 {
+    n.exp()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_abs_float(n: f64) -> f64 { n.abs() }
+pub extern "C" fn pith_abs_float(n: f64) -> f64 {
+    n.abs()
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_compare(a: *const i8, b: *const i8) -> i64 {
-    if a.is_null() && b.is_null() { return 0; }
-    if a.is_null() { return -1; }
-    if b.is_null() { return 1; }
+    if a.is_null() && b.is_null() {
+        return 0;
+    }
+    if a.is_null() {
+        return -1;
+    }
+    if b.is_null() {
+        return 1;
+    }
     let mut pa = a;
     let mut pb = b;
     loop {
@@ -420,22 +500,38 @@ pub unsafe extern "C" fn pith_cstring_compare(a: *const i8, b: *const i8) -> i64
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_lt(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) < 0 { 1 } else { 0 }
+    if pith_cstring_compare(a, b) < 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_gt(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) > 0 { 1 } else { 0 }
+    if pith_cstring_compare(a, b) > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_lte(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) <= 0 { 1 } else { 0 }
+    if pith_cstring_compare(a, b) <= 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_gte(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) >= 0 { 1 } else { 0 }
+    if pith_cstring_compare(a, b) >= 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -458,7 +554,10 @@ pub extern "C" fn pith_float_to_cstr(n: f64) -> *mut i8 {
         format!("{}", n as i64)
     } else {
         let formatted = format!("{:.6}", n);
-        formatted.trim_end_matches('0').trim_end_matches('.').to_string()
+        formatted
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
     };
     let len = s.len();
     unsafe { pith_copy_bytes_to_cstring(&s.as_bytes()[..len]) }
@@ -487,13 +586,19 @@ pub unsafe extern "C" fn pith_free(ptr: *mut i8) {
 }
 
 #[no_mangle]
-pub extern "C" fn pith_int_to_float(n: i64) -> f64 { n as f64 }
+pub extern "C" fn pith_int_to_float(n: i64) -> f64 {
+    n as f64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_float_to_int(n: f64) -> i64 { n as i64 }
+pub extern "C" fn pith_float_to_int(n: f64) -> i64 {
+    n as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 { b }
+pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
+    b
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {

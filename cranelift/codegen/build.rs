@@ -55,17 +55,24 @@ fn uses_new_cranelift_api(lockfile: &str) -> bool {
 
 fn version_is_new_api(version: &str) -> bool {
     let mut parts = version.split('.');
-    let major = parts.next().and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
-    let minor = parts.next().and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
+    let major = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(0);
+    let minor = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(0);
     major > 0 || minor >= 130
 }
 
 fn generate_runtime_table() -> Result<(), String> {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
+    let manifest_dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").map_err(|e| e.to_string())?);
     let abi_path = manifest_dir.join("../runtime-abi/runtime_functions.txt");
     println!("cargo:rerun-if-changed={}", abi_path.display());
-    let contents = fs::read_to_string(&abi_path)
-        .map_err(|e| format!("{}: {}", abi_path.display(), e))?;
+    let contents =
+        fs::read_to_string(&abi_path).map_err(|e| format!("{}: {}", abi_path.display(), e))?;
 
     let mut abi = String::new();
     let mut compat = String::new();
@@ -151,9 +158,6 @@ fn format_type_slice(types: &[&str]) -> String {
     if types.is_empty() {
         return "&[]".to_string();
     }
-    let items: Vec<String> = types
-        .iter()
-        .map(|name| format!("types::{name}"))
-        .collect();
+    let items: Vec<String> = types.iter().map(|name| format!("types::{name}")).collect();
     format!("&[{}]", items.join(", "))
 }

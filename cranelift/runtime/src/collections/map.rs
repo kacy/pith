@@ -4,6 +4,7 @@
 //! but presents FFI-compatible interface matching the C runtime.
 
 use crate::collections::list::PithList;
+use crate::handle_registry::{self, HandleKind};
 use crate::string::{pith_string_release, pith_string_retain, PithString};
 use hashbrown::HashMap;
 use std::hash::{Hash, Hasher};
@@ -159,6 +160,34 @@ impl MapImpl {
     }
 }
 
+unsafe fn map_ref<'a>(map: PithMap) -> Option<&'a MapImpl> {
+    if !handle_registry::is_valid(map.ptr as *const (), HandleKind::Map) {
+        return None;
+    }
+    Some(&*(map.ptr as *const MapImpl))
+}
+
+unsafe fn map_mut<'a>(map: PithMap) -> Option<&'a mut MapImpl> {
+    if !handle_registry::is_valid(map.ptr as *const (), HandleKind::Map) {
+        return None;
+    }
+    Some(&mut *(map.ptr as *mut MapImpl))
+}
+
+unsafe fn map_ref_from_handle<'a>(handle: i64) -> Option<&'a MapImpl> {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Map) {
+        return None;
+    }
+    Some(&*(handle as *const MapImpl))
+}
+
+unsafe fn map_mut_from_handle<'a>(handle: i64) -> Option<&'a mut MapImpl> {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Map) {
+        return None;
+    }
+    Some(&mut *(handle as *mut MapImpl))
+}
+
 /// Create a new empty map
 ///
 /// # Arguments
@@ -178,11 +207,7 @@ pub unsafe extern "C" fn pith_map_new_int() -> PithMap {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pith_map_new(
-    key_type: i32,
-    val_size: i64,
-    val_is_heap: i64,
-) -> PithMap {
+pub unsafe extern "C" fn pith_map_new(key_type: i32, val_size: i64, val_is_heap: i64) -> PithMap {
     let ktype = match key_type {
         1 => KeyType::String,
         _ => KeyType::Int,
@@ -190,21 +215,18 @@ pub unsafe extern "C" fn pith_map_new(
 
     let map_impl = MapImpl::new(ktype, val_size as usize, val_is_heap != 0);
     let boxed = Box::new(map_impl);
-    PithMap {
-        ptr: Box::into_raw(boxed) as *mut (),
-    }
+    let ptr = Box::into_raw(boxed) as *mut ();
+    handle_registry::register(ptr as *const (), HandleKind::Map);
+    PithMap { ptr }
 }
 
 /// Get map length
 #[no_mangle]
 pub extern "C" fn pith_map_len(map: PithMap) -> i64 {
-    if map.ptr.is_null() {
-        return 0;
-    }
-
     unsafe {
-        let impl_ref = &*(map.ptr as *const MapImpl);
-        impl_ref.len() as i64
+        map_ref(map)
+            .map(|impl_ref| impl_ref.len() as i64)
+            .unwrap_or(0)
     }
 }
 
@@ -220,11 +242,13 @@ pub unsafe extern "C" fn pith_map_insert_int(
     value: *const u8,
     val_size: i64,
 ) {
-    if map.is_null() || (*map).ptr.is_null() || value.is_null() {
+    if map.is_null() || value.is_null() {
         return;
     }
 
-    let impl_ref = &mut *((*map).ptr as *mut MapImpl);
+    let Some(impl_ref) = map_mut(*map) else {
+        return;
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_INT_INSERTS, 1);
 
@@ -272,11 +296,13 @@ pub unsafe extern "C" fn pith_map_insert_int(
 /// Clear all entries from map
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_clear(map: *mut PithMap) {
-    if map.is_null() || (*map).ptr.is_null() {
+    if map.is_null() {
         return;
     }
 
-    let impl_ref = &mut *((*map).ptr as *mut MapImpl);
+    let Some(impl_ref) = map_mut(*map) else {
+        return;
+    };
 
     // Release all values if they're heap types
     if impl_ref.val_is_heap {
@@ -297,24 +323,18 @@ pub unsafe extern "C" fn pith_map_clear(map: *mut PithMap) {
 pub unsafe extern "C" fn pith_map_values(map: PithMap) -> PithList {
     use crate::collections::list::pith_list_new;
 
-    if map.ptr.is_null() {
+    let Some(impl_ref) = map_ref(map) else {
         return PithList {
             ptr: std::ptr::null_mut(),
         };
-    }
-
-    let impl_ref = &*(map.ptr as *const MapImpl);
+    };
     let mut list = pith_list_new(
         impl_ref.val_size as i64,
         if impl_ref.val_is_heap { 1 } else { 0 },
     );
 
     for val in impl_ref.values() {
-        crate::collections::list::pith_list_push(
-            &mut list,
-            val.as_ptr(),
-            impl_ref.val_size as i64,
-        );
+        crate::collections::list::pith_list_push(&mut list, val.as_ptr(), impl_ref.val_size as i64);
 
         // Retain values as they're being copied to the list
         if impl_ref.val_is_heap {
@@ -329,11 +349,9 @@ pub unsafe extern "C" fn pith_map_values(map: PithMap) -> PithList {
 /// Release map and free memory
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_release(map: PithMap) {
-    if map.ptr.is_null() {
+    let Some(impl_ref) = map_mut(map) else {
         return;
-    }
-
-    let impl_ref = &mut *(map.ptr as *mut MapImpl);
+    };
 
     // Release all values if they're heap types
     if impl_ref.val_is_heap {
@@ -344,6 +362,7 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     }
 
     // Free the map implementation
+    handle_registry::unregister(map.ptr as *const (), HandleKind::Map);
     let _ = Box::from_raw(map.ptr as *mut MapImpl);
 }
 
@@ -389,11 +408,13 @@ unsafe fn cstr_to_map_key(key: *const i8) -> MapKey {
 /// * `key` must be a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, value: i64) {
-    if map_handle == 0 || key.is_null() {
+    if key.is_null() {
         return;
     }
 
-    let impl_ref = &mut *(map_handle as *mut MapImpl);
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
+        return;
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_INSERTS, 1);
     let map_key = cstr_to_map_key(key);
@@ -408,11 +429,13 @@ pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, v
 /// * `key` must be a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i64 {
-    if map_handle == 0 || key.is_null() {
+    if key.is_null() {
         return 0;
     }
 
-    let impl_ref = &*(map_handle as *const MapImpl);
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        return 0;
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_GETS, 1);
     let map_key = cstr_to_map_key(key);
@@ -432,11 +455,13 @@ pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i
 /// * `key` must be a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_contains_cstr(map_handle: i64, key: *const i8) -> i64 {
-    if map_handle == 0 || key.is_null() {
+    if key.is_null() {
         return 0;
     }
 
-    let impl_ref = &*(map_handle as *const MapImpl);
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        return 0;
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_CONTAINS, 1);
     let map_key = cstr_to_map_key(key);
@@ -450,11 +475,17 @@ pub unsafe extern "C" fn pith_map_contains_cstr(map_handle: i64, key: *const i8)
 
 /// Get value by C-string key with a default if not found.
 #[no_mangle]
-pub unsafe extern "C" fn pith_map_get_default_cstr(map_handle: i64, key: *const i8, default: i64) -> i64 {
-    if map_handle == 0 || key.is_null() {
+pub unsafe extern "C" fn pith_map_get_default_cstr(
+    map_handle: i64,
+    key: *const i8,
+    default: i64,
+) -> i64 {
+    if key.is_null() {
         return default;
     }
-    let impl_ref = &*(map_handle as *const MapImpl);
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        return default;
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_GETS, 1);
     let map_key = cstr_to_map_key(key);
@@ -469,10 +500,9 @@ pub unsafe extern "C" fn pith_map_get_default_cstr(map_handle: i64, key: *const 
 /// Get value by integer key with a default if not found.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_default_ikey(map_handle: i64, key: i64, default: i64) -> i64 {
-    if map_handle == 0 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return default;
-    }
-    let impl_ref = &*(map_handle as *const MapImpl);
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_INT_GETS, 1);
     if impl_ref.uses_int_values8() {
@@ -497,11 +527,13 @@ pub unsafe extern "C" fn pith_map_get_default_ikey(map_handle: i64, key: i64, de
 /// * `key` must be a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
-    if map_handle == 0 || key.is_null() {
+    if key.is_null() {
         return;
     }
 
-    let impl_ref = &mut *(map_handle as *mut MapImpl);
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
+        return;
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_REMOVES, 1);
     let map_key = cstr_to_map_key(key);
@@ -518,11 +550,9 @@ pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_insert_ikey(map_handle: i64, key: i64, value: i64) {
-    if map_handle == 0 {
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
-    }
-
-    let impl_ref = &mut *(map_handle as *mut MapImpl);
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_INT_INSERTS, 1);
     if impl_ref.uses_int_values8() {
@@ -541,11 +571,9 @@ pub unsafe extern "C" fn pith_map_insert_ikey(map_handle: i64, key: i64, value: 
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_ikey(map_handle: i64, key: i64) -> i64 {
-    if map_handle == 0 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return 0;
-    }
-
-    let impl_ref = &*(map_handle as *const MapImpl);
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_INT_GETS, 1);
 
@@ -569,11 +597,9 @@ pub unsafe extern "C" fn pith_map_get_ikey(map_handle: i64, key: i64) -> i64 {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_contains_ikey(map_handle: i64, key: i64) -> i64 {
-    if map_handle == 0 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return 0;
-    }
-
-    let impl_ref = &*(map_handle as *const MapImpl);
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_INT_CONTAINS, 1);
 
@@ -598,11 +624,9 @@ pub unsafe extern "C" fn pith_map_contains_ikey(map_handle: i64, key: i64) -> i6
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
-    if map_handle == 0 {
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
-    }
-
-    let impl_ref = &mut *(map_handle as *mut MapImpl);
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_INT_REMOVES, 1);
     if impl_ref.uses_int_values8() {
@@ -620,12 +644,9 @@ pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_len_handle(map_handle: i64) -> i64 {
-    if map_handle == 0 {
-        return 0;
-    }
-
-    let impl_ref = &*(map_handle as *const MapImpl);
-    impl_ref.len() as i64
+    map_ref_from_handle(map_handle)
+        .map(|impl_ref| impl_ref.len() as i64)
+        .unwrap_or(0)
 }
 
 /// Return all keys as a PithList of C-string pointers (each element is an i64
@@ -638,12 +659,10 @@ pub unsafe extern "C" fn pith_map_len_handle(map_handle: i64) -> i64 {
 pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
 
-    if map_handle == 0 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         let empty = pith_list_new(8, 0);
         return empty.ptr as i64;
-    }
-
-    let impl_ref = &*(map_handle as *const MapImpl);
+    };
     let list = pith_list_new(8, 0); // list of i64 (pointer-sized primitives)
 
     for key in impl_ref.keys() {
@@ -662,11 +681,9 @@ pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_clear_handle(map_handle: i64) {
-    if map_handle == 0 {
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
         return;
-    }
-
-    let impl_ref = &mut *(map_handle as *mut MapImpl);
+    };
     impl_ref.clear();
 }
 
@@ -676,12 +693,14 @@ pub unsafe extern "C" fn pith_map_clear_handle(map_handle: i64) {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_is_empty_handle(map_handle: i64) -> i64 {
-    if map_handle == 0 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         return 1;
+    };
+    if impl_ref.len() == 0 {
+        1
+    } else {
+        0
     }
-
-    let impl_ref = &*(map_handle as *const MapImpl);
-    if impl_ref.len() == 0 { 1 } else { 0 }
 }
 
 /// Return all values as a PithList (handle-based API). The PithList pointer
@@ -693,12 +712,10 @@ pub unsafe extern "C" fn pith_map_is_empty_handle(map_handle: i64) -> i64 {
 pub unsafe extern "C" fn pith_map_values_handle(map_handle: i64) -> i64 {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
 
-    if map_handle == 0 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
         let empty = pith_list_new(8, 0);
         return empty.ptr as i64;
-    }
-
-    let impl_ref = &*(map_handle as *const MapImpl);
+    };
     let list = pith_list_new(8, 0);
 
     for val in impl_ref.values() {

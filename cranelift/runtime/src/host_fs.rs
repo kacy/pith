@@ -379,7 +379,11 @@ pub unsafe extern "C" fn pith_file_open_append(path: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_file_read(handle: i64, max_bytes: i64) -> *mut i8 {
     use std::io::Read;
 
-    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let size = if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        4096
+    };
     let mut handles = file_handles().lock();
     let Some(file) = handles.get_mut(&handle) else {
         return std::ptr::null_mut();
@@ -400,7 +404,11 @@ pub unsafe extern "C" fn pith_file_read(handle: i64, max_bytes: i64) -> *mut i8 
 pub unsafe extern "C" fn pith_file_read_bytes(handle: i64, max_bytes: i64) -> i64 {
     use std::io::Read;
 
-    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let size = if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        4096
+    };
     let mut handles = file_handles().lock();
     let Some(file) = handles.get_mut(&handle) else {
         return 0;

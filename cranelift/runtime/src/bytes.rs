@@ -1,3 +1,4 @@
+use crate::handle_registry::{self, HandleKind};
 use crate::{ensure_perf_stats_registered, perf_count, PERF_BYTES_ALLOCS, PERF_BYTES_ALLOC_BYTES};
 use crate::{PERF_BYTE_BUFFER_NEWS, PERF_BYTE_BUFFER_WRITES, PERF_BYTE_BUFFER_WRITE_BYTES};
 use std::io::Read;
@@ -14,14 +15,14 @@ pub(crate) struct PithByteBuffer {
 }
 
 pub(crate) unsafe fn pith_bytes_ref<'a>(handle: i64) -> Option<&'a PithBytes> {
-    if handle == 0 {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Bytes) {
         return None;
     }
     Some(&*(handle as *const PithBytes))
 }
 
 unsafe fn pith_byte_buffer_mut<'a>(handle: i64) -> Option<&'a mut PithByteBuffer> {
-    if handle == 0 {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::ByteBuffer) {
         return None;
     }
     Some(&mut *(handle as *mut PithByteBuffer))
@@ -33,11 +34,13 @@ pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
     perf_count(&PERF_BYTES_ALLOC_BYTES, data.len());
     let data_ptr = data.as_ptr();
     let data_len = data.len();
-    Box::into_raw(Box::new(PithBytes {
+    let ptr = Box::into_raw(Box::new(PithBytes {
         data_ptr,
         data_len,
         data,
-    })) as i64
+    }));
+    handle_registry::register(ptr as *const (), HandleKind::Bytes);
+    ptr as i64
 }
 
 #[no_mangle]
@@ -140,8 +143,12 @@ pub unsafe extern "C" fn pith_bytes_eq(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_constant_time_eq(a: i64, b: i64) -> i64 {
-    let a_bytes = pith_bytes_ref(a).map(|bytes| bytes.data.as_slice()).unwrap_or(&[]);
-    let b_bytes = pith_bytes_ref(b).map(|bytes| bytes.data.as_slice()).unwrap_or(&[]);
+    let a_bytes = pith_bytes_ref(a)
+        .map(|bytes| bytes.data.as_slice())
+        .unwrap_or(&[]);
+    let b_bytes = pith_bytes_ref(b)
+        .map(|bytes| bytes.data.as_slice())
+        .unwrap_or(&[]);
     let max_len = a_bytes.len().max(b_bytes.len());
     let mut diff = (a_bytes.len() ^ b_bytes.len()) as u8;
 
@@ -151,7 +158,11 @@ pub unsafe extern "C" fn pith_crypto_constant_time_eq(a: i64, b: i64) -> i64 {
         diff |= left ^ right;
     }
 
-    if diff == 0 { 1 } else { 0 }
+    if diff == 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -172,7 +183,9 @@ pub extern "C" fn pith_secure_random_bytes(count: i64) -> i64 {
 pub extern "C" fn pith_byte_buffer_new() -> i64 {
     ensure_perf_stats_registered();
     perf_count(&PERF_BYTE_BUFFER_NEWS, 1);
-    Box::into_raw(Box::new(PithByteBuffer { data: Vec::new() })) as i64
+    let ptr = Box::into_raw(Box::new(PithByteBuffer { data: Vec::new() }));
+    handle_registry::register(ptr as *const (), HandleKind::ByteBuffer);
+    ptr as i64
 }
 
 #[no_mangle]
@@ -180,9 +193,11 @@ pub extern "C" fn pith_byte_buffer_with_capacity(capacity: i64) -> i64 {
     let cap = if capacity > 0 { capacity as usize } else { 0 };
     ensure_perf_stats_registered();
     perf_count(&PERF_BYTE_BUFFER_NEWS, 1);
-    Box::into_raw(Box::new(PithByteBuffer {
+    let ptr = Box::into_raw(Box::new(PithByteBuffer {
         data: Vec::with_capacity(cap),
-    })) as i64
+    }));
+    handle_registry::register(ptr as *const (), HandleKind::ByteBuffer);
+    ptr as i64
 }
 
 #[no_mangle]

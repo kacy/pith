@@ -74,8 +74,9 @@ pub fn get_runtime_lib_path() -> String {
 /// This ensures `pith run` always links against an up-to-date runtime.
 fn rebuild_runtime_if_stale(runtime_lib: &str) -> Result<(), CompileError> {
     // Find the pith executable to determine the workspace root
-    let exe = std::env::current_exe()
-        .map_err(|e| CompileError::ModuleError(format!("Failed to locate current executable: {}", e)))?;
+    let exe = std::env::current_exe().map_err(|e| {
+        CompileError::ModuleError(format!("Failed to locate current executable: {}", e))
+    })?;
     let Some(workspace_root) = exe
         .parent() // target/release
         .and_then(|p| p.parent()) // target

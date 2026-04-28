@@ -1,4 +1,4 @@
-use crate::collections::list::PithList;
+use crate::collections::list::{list_mut_from_handle, list_ref_from_handle, PithList};
 
 /// Get command line arguments as a Pith list of C string pointers.
 #[no_mangle]
@@ -254,13 +254,9 @@ pub unsafe extern "C" fn pith_cstring_chars(s: *const i8) -> i64 {
 /// each 8-byte element is a *const i8 pointer to a null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_sort_strings(list_ptr: i64) {
-    let list = PithList {
-        ptr: list_ptr as *mut (),
-    };
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_mut_from_handle(list_ptr) else {
         return;
-    }
-    let impl_ref = &mut *(list.ptr as *mut crate::collections::list::ListImpl);
+    };
     if impl_ref.elem_size != 8 {
         return;
     }
@@ -289,13 +285,9 @@ pub unsafe extern "C" fn pith_list_sort_strings(list_ptr: i64) {
 /// list_ptr is i64 carrying the PithList's internal ptr value
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_sort(list_ptr: i64) {
-    let list = PithList {
-        ptr: list_ptr as *mut (),
-    };
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_mut_from_handle(list_ptr) else {
         return;
-    }
-    let impl_ref = &mut *(list.ptr as *mut crate::collections::list::ListImpl);
+    };
     if impl_ref.elem_size != 8 {
         return;
     }
@@ -312,11 +304,7 @@ pub unsafe extern "C" fn pith_list_slice(list_ptr: i64, start: i64, end: i64) ->
     use crate::collections::list::{pith_list_new, pith_list_push_value};
 
     let new_list = pith_list_new(8, 0);
-    let list = PithList {
-        ptr: list_ptr as *mut (),
-    };
-    if !list.ptr.is_null() {
-        let impl_ref = &*(list.ptr as *const crate::collections::list::ListImpl);
+    if let Some(impl_ref) = list_ref_from_handle(list_ptr) {
         let len = impl_ref.len() as i64;
         let s = start.max(0).min(len) as usize;
         let e = end.max(0).min(len) as usize;
@@ -334,14 +322,9 @@ pub unsafe extern "C" fn pith_list_sort_copy(list_ptr: i64) -> i64 {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
 
     let new_list = pith_list_new(8, 0);
-    let list = PithList {
-        ptr: list_ptr as *mut (),
-    };
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_ref_from_handle(list_ptr) else {
         return new_list.ptr as i64;
-    }
-
-    let impl_ref = &*(list.ptr as *const crate::collections::list::ListImpl);
+    };
     let mut i = 0usize;
     while i < impl_ref.len() {
         if let Some(val) = impl_ref.get_value(i) {
@@ -359,14 +342,9 @@ pub unsafe extern "C" fn pith_list_sort_strings_copy(list_ptr: i64) -> i64 {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
 
     let new_list = pith_list_new(8, 0);
-    let list = PithList {
-        ptr: list_ptr as *mut (),
-    };
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_ref_from_handle(list_ptr) else {
         return new_list.ptr as i64;
-    }
-
-    let impl_ref = &*(list.ptr as *const crate::collections::list::ListImpl);
+    };
     let mut i = 0usize;
     while i < impl_ref.len() {
         if let Some(val) = impl_ref.get_value(i) {
@@ -454,7 +432,11 @@ pub unsafe extern "C" fn pith_cstring_is_empty(s: *const i8) -> i64 {
         return 1;
     }
     let len = crate::string::pith_cstring_len(s);
-    if len == 0 { 1 } else { 0 }
+    if len == 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Find last index of needle in haystack, returns -1 if not found
@@ -462,10 +444,7 @@ pub unsafe extern "C" fn pith_cstring_is_empty(s: *const i8) -> i64 {
 /// # Safety
 /// Both arguments must be valid null-terminated C strings
 #[no_mangle]
-pub unsafe extern "C" fn pith_cstring_last_index_of(
-    haystack: *const i8,
-    needle: *const i8,
-) -> i64 {
+pub unsafe extern "C" fn pith_cstring_last_index_of(haystack: *const i8, needle: *const i8) -> i64 {
     if haystack.is_null() || needle.is_null() {
         return -1;
     }

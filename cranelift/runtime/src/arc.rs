@@ -190,10 +190,7 @@ pub unsafe fn rc_release_internal(ptr: *mut u8) -> bool {
 /// # Safety
 /// ptr must be a valid heap-allocated FFI object or null
 #[no_mangle]
-pub unsafe extern "C" fn pith_rc_release(
-    ptr: *mut u8,
-    destructor: Option<extern "C" fn(*mut u8)>,
-) {
+pub unsafe extern "C" fn pith_rc_release(ptr: *mut u8, destructor: Option<extern "C" fn(*mut u8)>) {
     // Check if we should trigger cycle collection
     let should_collect = RC_RELEASE_COUNT.fetch_add(1, Ordering::Relaxed) >= RC_RELEASE_THRESHOLD;
 

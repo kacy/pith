@@ -14,7 +14,10 @@ fn main() {
     std::panic::set_hook(previous_hook);
 
     if let Err(payload) = result {
-        eprintln!("internal compiler error: {}", panic_message(payload.as_ref()));
+        eprintln!(
+            "internal compiler error: {}",
+            panic_message(payload.as_ref())
+        );
         std::process::exit(1);
     }
 }
@@ -159,8 +162,9 @@ fn find_self_hosted_compiler() -> Option<String> {
 
 /// Get AST from self-hosted compiler by running 'pith parse'
 fn get_ast_from_compiler(path: &str) -> Result<String, String> {
-    let compiler = find_self_hosted_compiler()
-        .ok_or("Self-hosted compiler not found. Set PITH_SELF_HOST or ensure ./self-host/pith_main exists")?;
+    let compiler = find_self_hosted_compiler().ok_or(
+        "Self-hosted compiler not found. Set PITH_SELF_HOST or ensure ./self-host/pith_main exists",
+    )?;
 
     let output = Command::new(&compiler)
         .args(["parse", path])

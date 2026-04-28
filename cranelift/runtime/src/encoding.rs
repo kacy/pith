@@ -46,7 +46,11 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
             return parse_int_error(b"invalid integer");
         }
     }
-    let limit = if negative { i64::MAX as u64 + 1 } else { i64::MAX as u64 };
+    let limit = if negative {
+        i64::MAX as u64 + 1
+    } else {
+        i64::MAX as u64
+    };
     let mut value: u64 = 0;
     while pos < end {
         let digit = slice[pos];

@@ -1,5 +1,6 @@
 //! task system for spawn/await
 
+use crate::handle_registry::{self, HandleKind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
@@ -77,12 +78,14 @@ pub unsafe extern "C" fn pith_spawn(closure_handle: i64) -> i64 {
         handle: Some(handle),
         shared,
     }));
-    (idx as i64) + 1
+    let task_handle = (idx as i64) + 1;
+    handle_registry::register_id(task_handle, HandleKind::Task);
+    task_handle
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_await(task_handle: i64) -> i64 {
-    if task_handle <= 0 {
+    if !handle_registry::is_valid_id(task_handle, HandleKind::Task) {
         return 0;
     }
     let idx = (task_handle - 1) as usize;
@@ -117,7 +120,7 @@ pub unsafe extern "C" fn pith_await(task_handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_task_is_done(task_handle: i64) -> i64 {
-    if task_handle <= 0 {
+    if !handle_registry::is_valid_id(task_handle, HandleKind::Task) {
         return 0;
     }
     let idx = (task_handle - 1) as usize;
@@ -143,7 +146,7 @@ pub unsafe extern "C" fn pith_task_is_done(task_handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_task_detach(task_handle: i64) {
-    if task_handle <= 0 {
+    if !handle_registry::is_valid_id(task_handle, HandleKind::Task) {
         return;
     }
     let idx = (task_handle - 1) as usize;

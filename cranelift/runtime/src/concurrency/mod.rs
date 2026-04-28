@@ -13,9 +13,7 @@ pub use channel::{
     pith_channel_try_send, pith_select_next_index,
 };
 pub use mutex::{pith_mutex_lock, pith_mutex_new, pith_mutex_unlock};
-pub use semaphore::{
-    pith_semaphore_acquire, pith_semaphore_new, pith_semaphore_release,
-};
+pub use semaphore::{pith_semaphore_acquire, pith_semaphore_new, pith_semaphore_release};
 pub use waitgroup::{
     pith_waitgroup_add, pith_waitgroup_done, pith_waitgroup_new, pith_waitgroup_wait,
 };

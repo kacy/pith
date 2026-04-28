@@ -2,6 +2,7 @@
 //!
 //! A counting semaphore for limiting concurrent access.
 
+use crate::handle_registry::{self, HandleKind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Semaphore state
@@ -12,6 +13,13 @@ pub struct SemaphoreState {
 
 /// Opaque handle to a Pith Semaphore
 pub type PithSemaphoreHandle = Arc<(Mutex<SemaphoreState>, Condvar)>;
+
+unsafe fn semaphore_ref<'a>(handle: *mut PithSemaphoreHandle) -> Option<&'a PithSemaphoreHandle> {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Semaphore) {
+        return None;
+    }
+    Some(&*handle)
+}
 
 fn lock_state(lock: &Mutex<SemaphoreState>) -> MutexGuard<'_, SemaphoreState> {
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -34,11 +42,13 @@ fn wait_state<'a>(
 #[no_mangle]
 pub extern "C" fn pith_semaphore_new(initial: i64) -> *mut PithSemaphoreHandle {
     let state = SemaphoreState {
-        count: initial as usize,
-        max: initial as usize,
+        count: initial.max(0) as usize,
+        max: initial.max(0) as usize,
     };
     let sem = Arc::new((Mutex::new(state), Condvar::new()));
-    Box::into_raw(Box::new(sem))
+    let ptr = Box::into_raw(Box::new(sem));
+    handle_registry::register(ptr as *const (), HandleKind::Semaphore);
+    ptr
 }
 
 /// Acquire a permit from the semaphore (decrement counter)
@@ -49,10 +59,9 @@ pub extern "C" fn pith_semaphore_new(initial: i64) -> *mut PithSemaphoreHandle {
 /// handle must be a valid semaphore handle
 #[no_mangle]
 pub unsafe extern "C" fn pith_semaphore_acquire(handle: *mut PithSemaphoreHandle) {
-    if handle.is_null() {
+    let Some(sem) = semaphore_ref(handle) else {
         return;
-    }
-    let sem = &*handle;
+    };
     let (lock, cvar) = &**sem;
     let mut guard = lock_state(lock);
     while guard.count == 0 {
@@ -67,10 +76,9 @@ pub unsafe extern "C" fn pith_semaphore_acquire(handle: *mut PithSemaphoreHandle
 /// handle must be a valid semaphore handle
 #[no_mangle]
 pub unsafe extern "C" fn pith_semaphore_release(handle: *mut PithSemaphoreHandle) {
-    if handle.is_null() {
+    let Some(sem) = semaphore_ref(handle) else {
         return;
-    }
-    let sem = &*handle;
+    };
     let (lock, cvar) = &**sem;
     let mut state = lock_state(lock);
     if state.count < state.max {

@@ -90,7 +90,10 @@ pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
         if parts.is_empty() {
             return std::ptr::null_mut();
         }
-        match std::process::Command::new(parts[0]).args(&parts[1..]).output() {
+        match std::process::Command::new(parts[0])
+            .args(&parts[1..])
+            .output()
+        {
             Ok(output) => crate::pith_copy_bytes_to_cstring(&output.stdout),
             Err(_) => std::ptr::null_mut(),
         }
@@ -111,11 +114,20 @@ pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
     const DECODE: [u8; 256] = {
         let mut t = [255u8; 256];
         let mut i = 0u8;
-        while i < 26 { t[(b'A' + i) as usize] = i; i += 1; }
+        while i < 26 {
+            t[(b'A' + i) as usize] = i;
+            i += 1;
+        }
         i = 0;
-        while i < 26 { t[(b'a' + i) as usize] = i + 26; i += 1; }
+        while i < 26 {
+            t[(b'a' + i) as usize] = i + 26;
+            i += 1;
+        }
         i = 0;
-        while i < 10 { t[(b'0' + i) as usize] = i + 52; i += 1; }
+        while i < 10 {
+            t[(b'0' + i) as usize] = i + 52;
+            i += 1;
+        }
         t[b'+' as usize] = 62;
         t[b'/' as usize] = 63;
         t
@@ -136,20 +148,35 @@ pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
         let c = DECODE[input[si + 2] as usize] as u32;
         let d = DECODE[input[si + 3] as usize] as u32;
         let n = (a << 18) | (b << 12) | (c << 6) | d;
-        if di < out_len { *ptr.add(di) = (n >> 16) as u8; di += 1; }
-        if di < out_len { *ptr.add(di) = (n >> 8) as u8; di += 1; }
-        if di < out_len { *ptr.add(di) = n as u8; di += 1; }
+        if di < out_len {
+            *ptr.add(di) = (n >> 16) as u8;
+            di += 1;
+        }
+        if di < out_len {
+            *ptr.add(di) = (n >> 8) as u8;
+            di += 1;
+        }
+        if di < out_len {
+            *ptr.add(di) = n as u8;
+            di += 1;
+        }
         si += 4;
     }
     if si + 1 < in_len {
         let a = DECODE[input[si] as usize] as u32;
         let b = DECODE[input[si + 1] as usize] as u32;
         let n = (a << 18) | (b << 12);
-        if di < out_len { *ptr.add(di) = (n >> 16) as u8; di += 1; }
+        if di < out_len {
+            *ptr.add(di) = (n >> 16) as u8;
+            di += 1;
+        }
         if si + 2 < in_len {
             let c = DECODE[input[si + 2] as usize] as u32;
             let n2 = (a << 18) | (b << 12) | (c << 6);
-            if di < out_len { *ptr.add(di) = ((n2 >> 8) & 0xff) as u8; di += 1; }
+            if di < out_len {
+                *ptr.add(di) = ((n2 >> 8) & 0xff) as u8;
+                di += 1;
+            }
         }
     }
     *ptr.add(di.min(out_len)) = 0;
@@ -227,7 +254,11 @@ pub unsafe extern "C" fn pith_cstring_starts_with(s: *const i8, prefix: *const i
     }
     let s_bytes = std::slice::from_raw_parts(s as *const u8, p_len);
     let p_bytes = std::slice::from_raw_parts(prefix as *const u8, p_len);
-    if s_bytes == p_bytes { 1 } else { 0 }
+    if s_bytes == p_bytes {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -242,7 +273,11 @@ pub unsafe extern "C" fn pith_cstring_ends_with(s: *const i8, suffix: *const i8)
     }
     let s_bytes = std::slice::from_raw_parts(s as *const u8, s_len);
     let x_bytes = std::slice::from_raw_parts(suffix as *const u8, x_len);
-    if &s_bytes[s_len - x_len..] == x_bytes { 1 } else { 0 }
+    if &s_bytes[s_len - x_len..] == x_bytes {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -262,7 +297,11 @@ pub unsafe extern "C" fn pith_cstring_pad_left(
     if len >= w {
         return crate::pith_strdup(s);
     }
-    let fill_char = if !fill.is_null() && *fill != 0 { *fill } else { b' ' as i8 };
+    let fill_char = if !fill.is_null() && *fill != 0 {
+        *fill
+    } else {
+        b' ' as i8
+    };
     let pad = w - len;
     let ptr = crate::pith_alloc(crate::pith_layout(w + 1, 1)) as *mut i8;
     for i in 0..pad {
@@ -290,7 +329,11 @@ pub unsafe extern "C" fn pith_cstring_pad_right(
     if len >= w {
         return crate::pith_strdup(s);
     }
-    let fill_char = if !fill.is_null() && *fill != 0 { *fill } else { b' ' as i8 };
+    let fill_char = if !fill.is_null() && *fill != 0 {
+        *fill
+    } else {
+        b' ' as i8
+    };
     let ptr = crate::pith_alloc(crate::pith_layout(w + 1, 1)) as *mut i8;
     std::ptr::copy_nonoverlapping(s, ptr, len);
     for i in len..w {
@@ -333,7 +376,11 @@ pub unsafe extern "C" fn pith_is_dir(path: i64) -> i64 {
     let len = crate::string::pith_cstring_len(path_ptr) as usize;
     let slice = std::slice::from_raw_parts(path_ptr as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
-        if std::path::Path::new(path_str).is_dir() { 1 } else { 0 }
+        if std::path::Path::new(path_str).is_dir() {
+            1
+        } else {
+            0
+        }
     } else {
         0
     }

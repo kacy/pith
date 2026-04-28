@@ -205,11 +205,7 @@ pub extern "C" fn pith_string_len(s: PithString) -> i64 {
 
 /// Create substring
 #[no_mangle]
-pub unsafe extern "C" fn pith_string_substring(
-    s: PithString,
-    start: i64,
-    end: i64,
-) -> PithString {
+pub unsafe extern "C" fn pith_string_substring(s: PithString, start: i64, end: i64) -> PithString {
     if start < 0 || end > s.len || start >= end {
         return EMPTY_STRING;
     }
@@ -356,7 +352,11 @@ pub extern "C" fn pith_string_contains_ptr(
     unsafe {
         let haystack = &*haystack_ptr;
         let needle = &*needle_ptr;
-        if pith_string_contains(*haystack, *needle) { 1 } else { 0 }
+        if pith_string_contains(*haystack, *needle) {
+            1
+        } else {
+            0
+        }
     }
 }
 
@@ -378,10 +378,7 @@ pub unsafe extern "C" fn pith_string_substring_ptr(
 
 /// ABI wrapper for pith_string_trim - takes pointer to PithString, returns new PithString on stack
 #[no_mangle]
-pub unsafe extern "C" fn pith_string_trim_ptr(
-    s_ptr: *const PithString,
-    out_ptr: *mut PithString,
-) {
+pub unsafe extern "C" fn pith_string_trim_ptr(s_ptr: *const PithString, out_ptr: *mut PithString) {
     if s_ptr.is_null() || out_ptr.is_null() {
         return;
     }
@@ -399,7 +396,13 @@ pub extern "C" fn pith_string_starts_with_ptr(
     if s_ptr.is_null() || prefix_ptr.is_null() {
         return 0;
     }
-    unsafe { if pith_string_starts_with(*s_ptr, *prefix_ptr) { 1 } else { 0 } }
+    unsafe {
+        if pith_string_starts_with(*s_ptr, *prefix_ptr) {
+            1
+        } else {
+            0
+        }
+    }
 }
 
 /// ABI wrapper for pith_string_ends_with
@@ -411,7 +414,13 @@ pub extern "C" fn pith_string_ends_with_ptr(
     if s_ptr.is_null() || suffix_ptr.is_null() {
         return 0;
     }
-    unsafe { if pith_string_ends_with(*s_ptr, *suffix_ptr) { 1 } else { 0 } }
+    unsafe {
+        if pith_string_ends_with(*s_ptr, *suffix_ptr) {
+            1
+        } else {
+            0
+        }
+    }
 }
 
 /// ABI wrapper for pith_string_concat - returns result on stack

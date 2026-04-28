@@ -6,15 +6,17 @@ pub(crate) enum HandleKind {
     Bytes,
     ByteBuffer,
     Channel,
+    Closure,
     List,
     Map,
     Mutex,
+    Process,
+    ProcessOutput,
     Semaphore,
     Set,
     Task,
-    Process,
-    ProcessOutput,
     WaitGroup,
+    X25519Key,
 }
 
 static HANDLES: LazyLock<Mutex<HashSet<(usize, HandleKind)>>> =

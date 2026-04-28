@@ -1,4 +1,5 @@
 use crate::collections::list::{pith_list_new, pith_list_push_value};
+use crate::handle_registry::{self, HandleKind};
 use crate::string;
 use std::alloc::{alloc, Layout};
 
@@ -59,14 +60,14 @@ struct PithClosure {
 }
 
 unsafe fn pith_closure_mut<'a>(handle: i64) -> Option<&'a mut PithClosure> {
-    if handle == 0 {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Closure) {
         return None;
     }
     Some(&mut *(handle as *mut PithClosure))
 }
 
 unsafe fn pith_closure_ref<'a>(handle: i64) -> Option<&'a PithClosure> {
-    if handle == 0 {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Closure) {
         return None;
     }
     Some(&*(handle as *const PithClosure))
@@ -74,10 +75,12 @@ unsafe fn pith_closure_ref<'a>(handle: i64) -> Option<&'a PithClosure> {
 
 #[no_mangle]
 pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
-    Box::into_raw(Box::new(PithClosure {
+    let ptr = Box::into_raw(Box::new(PithClosure {
         func_ptr,
         env: [0; PITH_CLOSURE_ENV_SLOTS],
-    })) as i64
+    }));
+    handle_registry::register(ptr as *const (), HandleKind::Closure);
+    ptr as i64
 }
 
 #[no_mangle]
@@ -123,6 +126,37 @@ pub unsafe extern "C" fn pith_print(s: string::PithString) {
         println!("{}", str_ref);
     } else {
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_closure_handles_return_safe_defaults() {
+        unsafe {
+            assert_eq!(pith_closure_get_fn(12345), 0);
+            assert_eq!(pith_closure_get_env(12345, 0), 0);
+            pith_closure_set_env(12345, 0, 99);
+        }
+    }
+
+    #[test]
+    fn closure_env_access_requires_valid_slot() {
+        let handle = pith_closure_new(77);
+        unsafe {
+            pith_closure_set_env(handle, 0, 42);
+            pith_closure_set_env(handle, -1, 99);
+            pith_closure_set_env(handle, PITH_CLOSURE_ENV_SLOTS as i64, 99);
+            assert_eq!(pith_closure_get_fn(handle), 77);
+            assert_eq!(pith_closure_get_env(handle, 0), 42);
+            assert_eq!(pith_closure_get_env(handle, -1), 0);
+            assert_eq!(
+                pith_closure_get_env(handle, PITH_CLOSURE_ENV_SLOTS as i64),
+                0
+            );
+        }
     }
 }
 

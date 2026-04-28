@@ -72,17 +72,23 @@ pub fn get_runtime_lib_path() -> String {
 
 /// Rebuild the runtime static library if sources are newer than the .a file.
 /// This ensures `pith run` always links against an up-to-date runtime.
-fn rebuild_runtime_if_stale(runtime_lib: &str) {
+fn rebuild_runtime_if_stale(runtime_lib: &str) -> Result<(), CompileError> {
     // Find the pith executable to determine the workspace root
-    let exe = std::env::current_exe().unwrap_or_default();
-    let workspace_root = exe
+    let exe = std::env::current_exe()
+        .map_err(|e| CompileError::ModuleError(format!("Failed to locate current executable: {}", e)))?;
+    let Some(workspace_root) = exe
         .parent() // target/release
         .and_then(|p| p.parent()) // target
         .and_then(|p| p.parent()) // workspace root
         .map(|p| p.to_path_buf())
-        .unwrap_or_default();
+    else {
+        return Ok(());
+    };
 
     let runtime_src = workspace_root.join("cranelift/runtime/src");
+    if !runtime_src.exists() {
+        return Ok(());
+    }
 
     // Check if runtime lib is older than any source file
     let lib_mtime = std::fs::metadata(runtime_lib)
@@ -97,13 +103,21 @@ fn rebuild_runtime_if_stale(runtime_lib: &str) {
     };
 
     if needs_rebuild {
-        let _ = Command::new("cargo")
+        let status = Command::new("cargo")
             .args(["build", "--release", "-p", "pith-runtime"])
             .current_dir(&workspace_root)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status();
+            .status()
+            .map_err(|e| CompileError::ModuleError(format!("Failed to rebuild runtime: {}", e)))?;
+        if !status.success() {
+            return Err(CompileError::ModuleError(
+                "Failed to rebuild runtime library".to_string(),
+            ));
+        }
     }
+
+    Ok(())
 }
 
 fn walkdir_check_newer(dir: &std::path::Path, lib_time: std::time::SystemTime) -> bool {
@@ -131,7 +145,7 @@ pub fn build_executable(obj_file: &str, output: &str) -> Result<(), CompileError
     let runtime_lib = get_runtime_lib_path();
 
     // Rebuild runtime if stale
-    rebuild_runtime_if_stale(&runtime_lib);
+    rebuild_runtime_if_stale(&runtime_lib)?;
 
     if !std::path::Path::new(&runtime_lib).exists() {
         return Err(CompileError::ModuleError(format!(

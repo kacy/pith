@@ -15,7 +15,8 @@ fn main() {
     }
 
     if let Err(err) = generate_runtime_table() {
-        panic!("failed to generate runtime table: {err}");
+        eprintln!("failed to generate runtime table: {err}");
+        std::process::exit(1);
     }
 }
 

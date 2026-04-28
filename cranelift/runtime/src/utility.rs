@@ -5,18 +5,9 @@
 /// fmt must be a valid null-terminated C string (or null for default)
 #[no_mangle]
 pub unsafe extern "C" fn pith_format_time_fmt(timestamp_ms: i64, _fmt: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let secs = timestamp_ms / 1000;
     let s = format!("{}", secs);
-    let bytes = s.as_bytes();
-    let layout = Layout::from_size_align(bytes.len() + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        *ptr.add(bytes.len()) = 0;
-    }
-    ptr
+    crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
 
 /// Write string to file path
@@ -89,8 +80,6 @@ pub unsafe extern "C" fn pith_log_error(msg: *const i8) {
 /// Execute command and capture output — returns stdout as C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if cmd.is_null() {
         return std::ptr::null_mut();
     }
@@ -102,16 +91,7 @@ pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
             return std::ptr::null_mut();
         }
         match std::process::Command::new(parts[0]).args(&parts[1..]).output() {
-            Ok(output) => {
-                let stdout = &output.stdout;
-                let layout = Layout::from_size_align(stdout.len() + 1, 1).unwrap();
-                let ptr = alloc(layout) as *mut i8;
-                if !ptr.is_null() {
-                    std::ptr::copy_nonoverlapping(stdout.as_ptr(), ptr as *mut u8, stdout.len());
-                    *ptr.add(stdout.len()) = 0;
-                }
-                ptr
-            }
+            Ok(output) => crate::pith_copy_bytes_to_cstring(&output.stdout),
             Err(_) => std::ptr::null_mut(),
         }
     } else {
@@ -121,8 +101,6 @@ pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
         return std::ptr::null_mut();
     }
@@ -148,12 +126,7 @@ pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
         in_len -= 1;
     }
     let out_len = in_len * 3 / 4;
-    let layout = Layout::from_size_align(out_len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut u8;
-
-    if ptr.is_null() {
-        return std::ptr::null_mut();
-    }
+    let ptr = crate::pith_alloc(crate::pith_layout(out_len + 1, 1));
 
     let mut si = 0;
     let mut di = 0;
@@ -278,28 +251,25 @@ pub unsafe extern "C" fn pith_cstring_pad_left(
     width: i64,
     fill: *const i8,
 ) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
         return std::ptr::null_mut();
     }
     let len = crate::string::pith_cstring_len(s) as usize;
+    if width <= 0 {
+        return crate::pith_strdup(s);
+    }
     let w = width as usize;
     if len >= w {
         return crate::pith_strdup(s);
     }
     let fill_char = if !fill.is_null() && *fill != 0 { *fill } else { b' ' as i8 };
     let pad = w - len;
-    let total = w + 1;
-    let layout = Layout::from_size_align(total, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        for i in 0..pad {
-            *ptr.add(i) = fill_char;
-        }
-        std::ptr::copy_nonoverlapping(s, ptr.add(pad), len);
-        *ptr.add(w) = 0;
+    let ptr = crate::pith_alloc(crate::pith_layout(w + 1, 1)) as *mut i8;
+    for i in 0..pad {
+        *ptr.add(i) = fill_char;
     }
+    std::ptr::copy_nonoverlapping(s, ptr.add(pad), len);
+    *ptr.add(w) = 0;
     ptr
 }
 
@@ -309,63 +279,49 @@ pub unsafe extern "C" fn pith_cstring_pad_right(
     width: i64,
     fill: *const i8,
 ) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
         return std::ptr::null_mut();
     }
     let len = crate::string::pith_cstring_len(s) as usize;
+    if width <= 0 {
+        return crate::pith_strdup(s);
+    }
     let w = width as usize;
     if len >= w {
         return crate::pith_strdup(s);
     }
     let fill_char = if !fill.is_null() && *fill != 0 { *fill } else { b' ' as i8 };
-    let total = w + 1;
-    let layout = Layout::from_size_align(total, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(s, ptr, len);
-        for i in len..w {
-            *ptr.add(i) = fill_char;
-        }
-        *ptr.add(w) = 0;
+    let ptr = crate::pith_alloc(crate::pith_layout(w + 1, 1)) as *mut i8;
+    std::ptr::copy_nonoverlapping(s, ptr, len);
+    for i in len..w {
+        *ptr.add(i) = fill_char;
     }
+    *ptr.add(w) = 0;
     ptr
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_repeat(s: *const i8, n: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() || n <= 0 {
         return crate::pith_cstring_empty();
     }
     let len = crate::string::pith_cstring_len(s) as usize;
-    let total = len * n as usize + 1;
-    let layout = Layout::from_size_align(total, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        for i in 0..n as usize {
-            std::ptr::copy_nonoverlapping(s, ptr.add(i * len), len);
-        }
-        *ptr.add(len * n as usize) = 0;
+    let Some(total_len) = len.checked_mul(n as usize) else {
+        return crate::pith_cstring_empty();
+    };
+    let ptr = crate::pith_alloc(crate::pith_layout(total_len + 1, 1)) as *mut i8;
+    for i in 0..n as usize {
+        std::ptr::copy_nonoverlapping(s, ptr.add(i * len), len);
     }
+    *ptr.add(total_len) = 0;
     ptr
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_float_fixed(value: f64, decimals: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
-    let s = format!("{:.prec$}", value, prec = decimals as usize);
-    let bytes = s.as_bytes();
-    let layout = Layout::array::<u8>(bytes.len() + 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        *ptr.add(bytes.len()) = 0;
-    }
-    ptr
+    let precision = decimals.max(0) as usize;
+    let s = format!("{:.prec$}", value, prec = precision);
+    crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
 
 #[no_mangle]

@@ -2,7 +2,7 @@
 //!
 //! A WaitGroup waits for a collection of tasks to finish.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// WaitGroup state
 pub struct WaitGroupState {
@@ -11,6 +11,18 @@ pub struct WaitGroupState {
 
 /// Opaque handle to a Pith WaitGroup
 pub type PithWaitGroupHandle = Arc<(Mutex<WaitGroupState>, Condvar)>;
+
+fn lock_state(lock: &Mutex<WaitGroupState>) -> MutexGuard<'_, WaitGroupState> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn wait_state<'a>(
+    cvar: &Condvar,
+    state: MutexGuard<'a, WaitGroupState>,
+) -> MutexGuard<'a, WaitGroupState> {
+    cvar.wait(state)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Create a new WaitGroup
 ///
@@ -33,9 +45,8 @@ pub unsafe extern "C" fn pith_waitgroup_add(handle: *mut PithWaitGroupHandle, de
     }
     let wg = &*handle;
     let (lock, _) = &**wg;
-    if let Ok(mut state) = lock.lock() {
-        state.count = (state.count as i64 + delta) as usize;
-    }
+    let mut state = lock_state(lock);
+    state.count = (state.count as i64 + delta).max(0) as usize;
 }
 
 /// Decrement the WaitGroup counter (Done)
@@ -49,13 +60,12 @@ pub unsafe extern "C" fn pith_waitgroup_done(handle: *mut PithWaitGroupHandle) {
     }
     let wg = &*handle;
     let (lock, cvar) = &**wg;
-    if let Ok(mut state) = lock.lock() {
-        if state.count > 0 {
-            state.count -= 1;
-        }
-        if state.count == 0 {
-            cvar.notify_all();
-        }
+    let mut state = lock_state(lock);
+    if state.count > 0 {
+        state.count -= 1;
+    }
+    if state.count == 0 {
+        cvar.notify_all();
     }
 }
 
@@ -70,8 +80,8 @@ pub unsafe extern "C" fn pith_waitgroup_wait(handle: *mut PithWaitGroupHandle) {
     }
     let wg = &*handle;
     let (lock, cvar) = &**wg;
-    let mut guard = lock.lock().unwrap();
+    let mut guard = lock_state(lock);
     while guard.count > 0 {
-        guard = cvar.wait(guard).unwrap();
+        guard = wait_state(cvar, guard);
     }
 }

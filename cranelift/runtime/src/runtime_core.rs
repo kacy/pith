@@ -1,9 +1,54 @@
 use crate::collections::list::{pith_list_new, pith_list_push_value};
 use crate::string;
+use std::alloc::{alloc, Layout};
 
 pub(crate) fn pith_strdup_string(text: &str) -> *mut i8 {
     let owned = format!("{}\0", text);
     unsafe { pith_strdup(owned.as_ptr() as *const i8) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_runtime_error(code: i64) -> i64 {
+    let message = match code {
+        1 => "division by zero",
+        2 => "integer division overflow",
+        3 => "allocation failed",
+        4 => "invalid allocation layout",
+        _ => "runtime error",
+    };
+    eprintln!("pith runtime error: {message}");
+    std::process::exit(1);
+}
+
+pub(crate) fn pith_layout(size: usize, align: usize) -> Layout {
+    match Layout::from_size_align(size, align) {
+        Ok(layout) => layout,
+        Err(_) => {
+            eprintln!("pith runtime error: invalid allocation layout");
+            std::process::exit(1);
+        }
+    }
+}
+
+pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
+    let ptr = alloc(layout);
+    if ptr.is_null() {
+        eprintln!("pith runtime error: allocation failed");
+        std::process::exit(1);
+    }
+    ptr
+}
+
+pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
+    let layout = pith_layout(bytes.len() + 1, 1);
+    let ptr = pith_alloc(layout) as *mut i8;
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+    *ptr.add(bytes.len()) = 0;
+    ptr
+}
+
+pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
+    pith_copy_bytes_to_cstring(&[])
 }
 
 const PITH_CLOSURE_ENV_SLOTS: usize = 16;
@@ -88,8 +133,6 @@ pub extern "C" fn pith_print_int(n: i64) {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if a.is_null() {
         return if b.is_null() {
             std::ptr::null_mut()
@@ -104,12 +147,8 @@ pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8
     let len_a = string::pith_cstring_len(a) as usize;
     let len_b = string::pith_cstring_len(b) as usize;
     let total_len = len_a + len_b;
-    let layout = Layout::from_size_align(total_len + 1, 1).unwrap();
-    let result = alloc(layout) as *mut i8;
-
-    if result.is_null() {
-        return std::ptr::null_mut();
-    }
+    let layout = pith_layout(total_len + 1, 1);
+    let result = pith_alloc(layout) as *mut i8;
 
     std::ptr::copy_nonoverlapping(a, result, len_a);
     std::ptr::copy_nonoverlapping(b, result.add(len_a), len_b);
@@ -119,19 +158,14 @@ pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_strdup(ptr: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if ptr.is_null() {
         return std::ptr::null_mut();
     }
 
     let len = string::pith_cstring_len(ptr) as usize;
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let result = alloc(layout) as *mut i8;
-
-    if !result.is_null() {
-        std::ptr::copy_nonoverlapping(ptr, result, len + 1);
-    }
+    let layout = pith_layout(len + 1, 1);
+    let result = pith_alloc(layout) as *mut i8;
+    std::ptr::copy_nonoverlapping(ptr, result, len + 1);
 
     result
 }
@@ -209,15 +243,10 @@ pub unsafe extern "C" fn pith_ord_cstr(s: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_chr_cstr(n: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
-    let layout = Layout::from_size_align(2, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-
-    if !ptr.is_null() {
-        *ptr = (n as u8) as i8;
-        *ptr.add(1) = 0;
-    }
+    let layout = pith_layout(2, 1);
+    let ptr = pith_alloc(layout) as *mut i8;
+    *ptr = (n as u8) as i8;
+    *ptr.add(1) = 0;
 
     ptr
 }
@@ -411,42 +440,20 @@ pub unsafe extern "C" fn pith_cstring_gte(a: *const i8, b: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_cstr(n: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let s = n.to_string();
     let len = s.len();
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(s.as_ptr(), ptr as *mut u8, len);
-        *ptr.add(len) = 0;
-    }
-
-    ptr
+    pith_copy_bytes_to_cstring(&s.as_bytes()[..len])
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_uint_to_cstr(n: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let s = (n as u64).to_string();
     let len = s.len();
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(s.as_ptr(), ptr as *mut u8, len);
-        *ptr.add(len) = 0;
-    }
-
-    ptr
+    pith_copy_bytes_to_cstring(&s.as_bytes()[..len])
 }
 
 #[no_mangle]
 pub extern "C" fn pith_float_to_cstr(n: f64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let s = if n == n.floor() && n.abs() < 1e15 {
         format!("{}", n as i64)
     } else {
@@ -454,36 +461,14 @@ pub extern "C" fn pith_float_to_cstr(n: f64) -> *mut i8 {
         formatted.trim_end_matches('0').trim_end_matches('.').to_string()
     };
     let len = s.len();
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = unsafe { alloc(layout) as *mut i8 };
-
-    if !ptr.is_null() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(s.as_ptr(), ptr as *mut u8, len);
-            *ptr.add(len) = 0;
-        }
-    }
-
-    ptr
+    unsafe { pith_copy_bytes_to_cstring(&s.as_bytes()[..len]) }
 }
 
 #[no_mangle]
 pub extern "C" fn pith_bool_to_cstr(b: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let s = if b != 0 { "true" } else { "false" };
     let len = s.len();
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = unsafe { alloc(layout) as *mut i8 };
-
-    if !ptr.is_null() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(s.as_ptr(), ptr as *mut u8, len);
-            *ptr.add(len) = 0;
-        }
-    }
-
-    ptr
+    unsafe { pith_copy_bytes_to_cstring(&s.as_bytes()[..len]) }
 }
 
 pub use pith_ceil as pith_math_ceil;
@@ -507,65 +492,35 @@ pub extern "C" fn pith_int_to_float(n: i64) -> f64 { n as f64 }
 #[no_mangle]
 pub extern "C" fn pith_float_to_int(n: f64) -> i64 { n as i64 }
 
-pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
-    let layout = Layout::from_size_align(1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        *ptr = 0;
-    }
-    ptr
-}
-
-pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
-    let layout = Layout::from_size_align(bytes.len() + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        *ptr.add(bytes.len()) = 0;
-    }
-    ptr
-}
-
 #[no_mangle]
 pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 { b }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
-    use std::alloc::{alloc_zeroed, Layout};
+    use std::alloc::alloc_zeroed;
 
     let size = (num_fields.max(0) as usize) * 8;
     if size == 0 {
         return 0;
     }
 
-    let layout = Layout::from_size_align(size, 8).unwrap();
+    let layout = pith_layout(size, 8);
     let ptr = alloc_zeroed(layout);
     if ptr.is_null() {
-        return 0;
+        eprintln!("pith runtime error: allocation failed");
+        std::process::exit(1);
     }
     ptr as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_args_to_list() -> i64 {
-    use std::alloc::{alloc, Layout};
-
     let list = pith_list_new(8, 0);
 
     for arg in std::env::args() {
         let arg_len = arg.len();
-        let arg_layout = Layout::from_size_align(arg_len + 1, 1).unwrap();
-        let arg_ptr = alloc(arg_layout) as *mut i8;
-
-        if !arg_ptr.is_null() {
-            std::ptr::copy_nonoverlapping(arg.as_ptr(), arg_ptr as *mut u8, arg_len);
-            *arg_ptr.add(arg_len) = 0;
-            pith_list_push_value(list, arg_ptr as i64);
-        }
+        let arg_ptr = pith_copy_bytes_to_cstring(&arg.as_bytes()[..arg_len]);
+        pith_list_push_value(list, arg_ptr as i64);
     }
 
     list.ptr as i64

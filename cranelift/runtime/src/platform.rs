@@ -28,7 +28,6 @@ pub extern "C" fn pith_time() -> i64 {
 /// Returns C string. Caller must free with pith_free.
 #[no_mangle]
 pub unsafe extern "C" fn pith_input() -> *mut i8 {
-    use std::alloc::{alloc, Layout};
     use std::io::{self, BufRead};
 
     let stdin = io::stdin();
@@ -41,15 +40,7 @@ pub unsafe extern "C" fn pith_input() -> *mut i8 {
             line.pop();
         }
 
-        let len = line.len();
-        let layout = Layout::from_size_align(len + 1, 1).unwrap();
-        let ptr = alloc(layout) as *mut i8;
-
-        if !ptr.is_null() {
-            std::ptr::copy_nonoverlapping(line.as_ptr(), ptr as *mut u8, len);
-            *ptr.add(len) = 0;
-        }
-        return ptr;
+        return crate::pith_copy_bytes_to_cstring(line.as_bytes());
     }
     std::ptr::null_mut()
 }
@@ -121,38 +112,23 @@ pub extern "C" fn pith_random_int(min: i64, max: i64) -> i64 {
 /// Returns C string. Caller must free.
 #[no_mangle]
 pub unsafe extern "C" fn pith_fmt_float(n: f64, precision: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
-    let s = format!("{:.1$}", n, precision as usize);
-    let len = s.len();
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(s.as_ptr(), ptr as *mut u8, len);
-        *ptr.add(len) = 0;
-    }
-    ptr
+    let precision = precision.max(0) as usize;
+    let s = format!("{:.1$}", n, precision);
+    crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
 
 /// Generate random string of given length
 /// Returns C string. Caller must free.
 #[no_mangle]
 pub unsafe extern "C" fn pith_random_string(len: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let n = len.max(0) as usize;
 
-    let layout = Layout::from_size_align(n + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-
-    if !ptr.is_null() {
-        for i in 0..n {
-            let idx = (pith_random_float() * CHARSET.len() as f64) as usize % CHARSET.len();
-            *ptr.add(i) = CHARSET[idx] as i8;
-        }
-        *ptr.add(n) = 0;
+    let ptr = crate::pith_alloc(crate::pith_layout(n + 1, 1)) as *mut i8;
+    for i in 0..n {
+        let idx = (pith_random_float() * CHARSET.len() as f64) as usize % CHARSET.len();
+        *ptr.add(i) = CHARSET[idx] as i8;
     }
+    *ptr.add(n) = 0;
     ptr
 }

@@ -8,6 +8,28 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 fn main() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(run_cli);
+    std::panic::set_hook(previous_hook);
+
+    if let Err(payload) = result {
+        eprintln!("internal compiler error: {}", panic_message(payload.as_ref()));
+        std::process::exit(1);
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unexpected panic".to_string()
+}
+
+fn run_cli() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {

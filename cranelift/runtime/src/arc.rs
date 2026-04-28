@@ -10,10 +10,10 @@
 //! 3. Propagate marks through references from marked objects
 //! 4. Objects still unmarked with RC == 0 are in cycles -> free them
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc, dealloc};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 /// RC Header stored before each heap-allocated FFI object
 #[repr(C)]
@@ -67,44 +67,58 @@ unsafe impl Sync for ObjectList {}
 static OBJECT_LIST: LazyLock<Mutex<ObjectList>> =
     LazyLock::new(|| Mutex::new(ObjectList { head: None }));
 
+fn lock_object_list() -> MutexGuard<'static, ObjectList> {
+    OBJECT_LIST
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_next(header: *mut RcHeader) -> MutexGuard<'static, Option<NonNull<RcHeader>>> {
+    unsafe {
+        (*header)
+            .next
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Add object to global list
 fn add_to_object_list(header: *mut RcHeader) {
-    let mut list = OBJECT_LIST.lock().unwrap();
-    let header_nn = NonNull::new(header).unwrap();
+    let Some(header_nn) = NonNull::new(header) else {
+        return;
+    };
 
-    unsafe {
-        if let Some(old_head) = (*header).next.lock().unwrap().take() {
-            *(*header).next.lock().unwrap() = Some(old_head);
-        }
+    let mut list = lock_object_list();
+    let mut next = lock_next(header);
+    if let Some(old_head) = next.take() {
+        *next = Some(old_head);
     }
     list.head = Some(header_nn);
 }
 
 /// Remove object from global list
 fn remove_from_object_list(header_to_remove: *mut RcHeader) {
-    let mut list = OBJECT_LIST.lock().unwrap();
+    let mut list = lock_object_list();
 
-    unsafe {
-        let mut curr_opt = list.head;
-        let mut prev_opt: Option<NonNull<RcHeader>> = None;
+    let mut curr_opt = list.head;
+    let mut prev_opt: Option<NonNull<RcHeader>> = None;
 
-        while let Some(curr) = curr_opt {
-            if curr.as_ptr() == header_to_remove {
-                // Found it - remove from list
-                let next_opt = (*curr.as_ptr()).next.lock().unwrap().take();
+    while let Some(curr) = curr_opt {
+        if curr.as_ptr() == header_to_remove {
+            // Found it - remove from list
+            let next_opt = lock_next(curr.as_ptr()).take();
 
-                if let Some(prev) = prev_opt {
-                    *(*prev.as_ptr()).next.lock().unwrap() = next_opt;
-                } else {
-                    // Removing head
-                    list.head = next_opt;
-                }
-                return;
+            if let Some(prev) = prev_opt {
+                *lock_next(prev.as_ptr()) = next_opt;
+            } else {
+                // Removing head
+                list.head = next_opt;
             }
-
-            prev_opt = curr_opt;
-            curr_opt = *(*curr.as_ptr()).next.lock().unwrap();
+            return;
         }
+
+        prev_opt = curr_opt;
+        curr_opt = *lock_next(curr.as_ptr());
     }
 }
 
@@ -117,18 +131,12 @@ pub unsafe extern "C" fn pith_rc_alloc(size: usize, type_tag: u32) -> *mut u8 {
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_RC_ALLOCS, 1);
     let total_size = HEADER_SIZE + size;
-    let layout = match Layout::from_size_align(total_size, 8) {
-        Ok(l) => l,
-        Err(_) => {
-            eprintln!("pith: allocation size overflow");
-            std::process::abort();
-        }
-    };
+    let layout = crate::pith_layout(total_size, 8);
 
     let ptr = alloc(layout);
     if ptr.is_null() {
-        eprintln!("pith: out of memory");
-        std::process::abort();
+        eprintln!("pith runtime error: allocation failed");
+        std::process::exit(1);
     }
 
     // Initialize header
@@ -217,20 +225,20 @@ pub unsafe extern "C" fn pith_rc_release(
     remove_from_object_list(header);
 
     // Free memory
-    let layout = Layout::from_size_align(HEADER_SIZE + 4096, 8).unwrap();
+    let layout = crate::pith_layout(HEADER_SIZE + 4096, 8);
     dealloc(header as *mut u8, layout);
 }
 
 /// Clear all mark flags
 fn clear_marks() {
-    let list = OBJECT_LIST.lock().unwrap();
+    let list = lock_object_list();
 
     unsafe {
         let mut curr_opt = list.head;
         while let Some(curr) = curr_opt {
             let header = curr.as_ptr();
             (*header).flags.store(0, Ordering::Relaxed);
-            curr_opt = *(*header).next.lock().unwrap();
+            curr_opt = *lock_next(header);
         }
     }
 }
@@ -249,7 +257,7 @@ fn mark_as_root(header: *mut RcHeader) {
 
 /// Mark all objects reachable from roots
 fn mark_reachable() {
-    let list = OBJECT_LIST.lock().unwrap();
+    let list = lock_object_list();
 
     unsafe {
         // First pass: mark objects with RC > 0 as roots
@@ -262,14 +270,14 @@ fn mark_reachable() {
                 mark_as_root(header);
             }
 
-            curr_opt = *(*header).next.lock().unwrap();
+            curr_opt = *lock_next(header);
         }
     }
 }
 
 /// Collect all unmarked objects with RC == 0 (they're in cycles)
 fn collect_unmarked() -> Vec<*mut RcHeader> {
-    let list = OBJECT_LIST.lock().unwrap();
+    let list = lock_object_list();
     let mut to_collect = Vec::new();
 
     unsafe {
@@ -287,7 +295,7 @@ fn collect_unmarked() -> Vec<*mut RcHeader> {
                 to_collect.push(header);
             }
 
-            curr_opt = *(*header).next.lock().unwrap();
+            curr_opt = *lock_next(header);
         }
     }
 
@@ -314,7 +322,7 @@ fn free_cycles(cycles: Vec<*mut RcHeader>) {
             }
 
             // Free the memory
-            let layout = Layout::from_size_align(HEADER_SIZE + 4096, 8).unwrap();
+            let layout = crate::pith_layout(HEADER_SIZE + 4096, 8);
             dealloc(header as *mut u8, layout);
         }
     }

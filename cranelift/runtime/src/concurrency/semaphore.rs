@@ -2,7 +2,7 @@
 //!
 //! A counting semaphore for limiting concurrent access.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Semaphore state
 pub struct SemaphoreState {
@@ -12,6 +12,18 @@ pub struct SemaphoreState {
 
 /// Opaque handle to a Pith Semaphore
 pub type PithSemaphoreHandle = Arc<(Mutex<SemaphoreState>, Condvar)>;
+
+fn lock_state(lock: &Mutex<SemaphoreState>) -> MutexGuard<'_, SemaphoreState> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn wait_state<'a>(
+    cvar: &Condvar,
+    state: MutexGuard<'a, SemaphoreState>,
+) -> MutexGuard<'a, SemaphoreState> {
+    cvar.wait(state)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Create a new Semaphore
 ///
@@ -42,9 +54,9 @@ pub unsafe extern "C" fn pith_semaphore_acquire(handle: *mut PithSemaphoreHandle
     }
     let sem = &*handle;
     let (lock, cvar) = &**sem;
-    let mut guard = lock.lock().unwrap();
+    let mut guard = lock_state(lock);
     while guard.count == 0 {
-        guard = cvar.wait(guard).unwrap();
+        guard = wait_state(cvar, guard);
     }
     guard.count -= 1;
 }
@@ -60,10 +72,9 @@ pub unsafe extern "C" fn pith_semaphore_release(handle: *mut PithSemaphoreHandle
     }
     let sem = &*handle;
     let (lock, cvar) = &**sem;
-    if let Ok(mut state) = lock.lock() {
-        if state.count < state.max {
-            state.count += 1;
-        }
-        cvar.notify_one();
+    let mut state = lock_state(lock);
+    if state.count < state.max {
+        state.count += 1;
     }
+    cvar.notify_one();
 }

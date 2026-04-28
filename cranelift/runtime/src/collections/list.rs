@@ -337,19 +337,13 @@ pub unsafe extern "C" fn pith_list_set_value(list: PithList, index: i64, value: 
 /// Returns a newly allocated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_join(list: PithList, sep: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if list.ptr.is_null() {
         return std::ptr::null_mut();
     }
 
     let impl_ref = &*(list.ptr as *const ListImpl);
     if impl_ref.len() == 0 {
-        let ptr = alloc(Layout::from_size_align(1, 1).unwrap()) as *mut i8;
-        if !ptr.is_null() {
-            *ptr = 0;
-        }
-        return ptr;
+        return crate::pith_cstring_empty();
     }
 
     let sep_len = if sep.is_null() {
@@ -373,10 +367,7 @@ pub unsafe extern "C" fn pith_list_join(list: PithList, sep: *const i8) -> *mut 
         i += 1;
     }
 
-    let out = alloc(Layout::from_size_align(total_len + 1, 1).unwrap()) as *mut i8;
-    if out.is_null() {
-        return std::ptr::null_mut();
-    }
+    let out = crate::pith_alloc(crate::pith_layout(total_len + 1, 1)) as *mut i8;
 
     let mut write = 0usize;
     let mut i = 0usize;
@@ -524,9 +515,10 @@ pub unsafe extern "C" fn pith_list_get(
         Some(value) => {
             if elem_size == 8 {
                 std::ptr::copy_nonoverlapping(value.to_ne_bytes().as_ptr(), out, 8);
-            } else {
-                let elem_data = impl_ref.elements.get(index as usize).unwrap();
+            } else if let Some(elem_data) = impl_ref.elements.get(index as usize) {
                 std::ptr::copy_nonoverlapping(elem_data.as_ptr(), out, elem_data.len());
+            } else {
+                return false;
             }
 
             // Retain string elements (caller gets a reference)
@@ -570,8 +562,9 @@ pub unsafe extern "C" fn pith_list_set(
 
     // Release old element if it's a heap type
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let old_s = impl_ref.get_value(index as usize).unwrap() as *const PithString;
-        pith_string_release(*old_s);
+        if let Some(old_s) = impl_ref.get_value(index as usize) {
+            pith_string_release(*(old_s as *const PithString));
+        }
     }
 
     // Copy new element
@@ -615,8 +608,9 @@ pub unsafe extern "C" fn pith_list_remove(
 
     // Release element before removal
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let s = impl_ref.get_value(index as usize).unwrap() as *const PithString;
-        pith_string_release(*s);
+        if let Some(s) = impl_ref.get_value(index as usize) {
+            pith_string_release(*(s as *const PithString));
+        }
     }
 
     impl_ref.remove(index as usize);
@@ -640,8 +634,9 @@ pub unsafe extern "C" fn pith_list_remove_value(list: PithList, index: i64) -> i
 
     // Release string element if needed
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let s = impl_ref.get_value(index as usize).unwrap() as *const PithString;
-        pith_string_release(*s);
+        if let Some(s) = impl_ref.get_value(index as usize) {
+            pith_string_release(*(s as *const PithString));
+        }
     }
 
     impl_ref.remove(index as usize);
@@ -659,8 +654,9 @@ pub unsafe extern "C" fn pith_list_clear_value(list: PithList) {
 
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
-            let s = impl_ref.get_value(i).unwrap() as *const PithString;
-            pith_string_release(*s);
+            if let Some(s) = impl_ref.get_value(i) {
+                pith_string_release(*(s as *const PithString));
+            }
         }
     }
 
@@ -692,8 +688,9 @@ pub unsafe extern "C" fn pith_list_clear(list: *mut PithList) {
     // Release all elements if they're heap types
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
-            let s = impl_ref.get_value(i).unwrap() as *const PithString;
-            pith_string_release(*s);
+            if let Some(s) = impl_ref.get_value(i) {
+                pith_string_release(*(s as *const PithString));
+            }
         }
     }
 
@@ -743,8 +740,9 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
     // Release all elements
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
-            let s = impl_ref.get_value(i).unwrap() as *const PithString;
-            pith_string_release(*s);
+            if let Some(s) = impl_ref.get_value(i) {
+                pith_string_release(*(s as *const PithString));
+            }
         }
     }
 

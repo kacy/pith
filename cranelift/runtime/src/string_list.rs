@@ -4,21 +4,14 @@ use crate::collections::list::PithList;
 #[no_mangle]
 pub unsafe extern "C" fn pith_args() -> PithList {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
-    use std::alloc::{alloc, Layout};
     use std::env;
 
     let list = pith_list_new(8, 1);
 
     for arg in env::args() {
         let arg_len = arg.len();
-        let arg_layout = Layout::from_size_align(arg_len + 1, 1).unwrap();
-        let arg_ptr = alloc(arg_layout) as *mut i8;
-
-        if !arg_ptr.is_null() {
-            std::ptr::copy_nonoverlapping(arg.as_ptr(), arg_ptr as *mut u8, arg_len);
-            *arg_ptr.add(arg_len) = 0;
-            pith_list_push_value(list, arg_ptr as i64);
-        }
+        let arg_ptr = crate::pith_copy_bytes_to_cstring(&arg.as_bytes()[..arg_len]);
+        pith_list_push_value(list, arg_ptr as i64);
     }
 
     list
@@ -31,8 +24,6 @@ pub unsafe extern "C" fn pith_args() -> PithList {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_substring(s: *const i8, start: i64, end: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
         return std::ptr::null_mut();
     }
@@ -43,26 +34,11 @@ pub unsafe extern "C" fn pith_cstring_substring(s: *const i8, start: i64, end: i
     let sub_len = (end - start) as usize;
 
     if sub_len == 0 {
-        let layout = Layout::from_size_align(1, 1).unwrap();
-        let ptr = alloc(layout) as *mut i8;
-        if !ptr.is_null() {
-            *ptr = 0;
-        }
-        return ptr;
+        return crate::pith_cstring_empty();
     }
 
-    let layout = Layout::from_size_align(sub_len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(
-            s.offset(start as isize) as *const u8,
-            ptr as *mut u8,
-            sub_len,
-        );
-        *ptr.add(sub_len) = 0;
-    }
-    ptr
+    let bytes = std::slice::from_raw_parts(s.offset(start as isize) as *const u8, sub_len);
+    crate::pith_copy_bytes_to_cstring(bytes)
 }
 
 /// Split a string by delimiter and return as a PithList of strings
@@ -72,7 +48,6 @@ pub unsafe extern "C" fn pith_cstring_substring(s: *const i8, start: i64, end: i
 #[no_mangle]
 pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i8) -> PithList {
     use crate::collections::list::pith_list_new;
-    use std::alloc::{alloc, Layout};
 
     if s.is_null() || delim.is_null() {
         return pith_list_new(8, 0);
@@ -106,14 +81,8 @@ pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i
         if is_delim || i == s_len {
             let part_len = i - start;
             if part_len > 0 {
-                let part_layout = Layout::from_size_align(part_len + 1, 1).unwrap();
-                let part_ptr = alloc(part_layout) as *mut i8;
-
-                if !part_ptr.is_null() {
-                    std::ptr::copy_nonoverlapping(&s_slice[start], part_ptr as *mut u8, part_len);
-                    *part_ptr.add(part_len) = 0;
-                    crate::collections::list::pith_list_push_value(list, part_ptr as i64);
-                }
+                let part_ptr = crate::pith_copy_bytes_to_cstring(&s_slice[start..i]);
+                crate::collections::list::pith_list_push_value(list, part_ptr as i64);
             }
 
             if delim_len > 0 {
@@ -154,30 +123,18 @@ pub unsafe extern "C" fn pith_cstring_trim(s: *const i8) -> *mut i8 {
 /// Returns a newly allocated 1-character string (or empty string if out of bounds)
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_char_at(s: *const i8, index: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
-        let ptr = alloc(Layout::from_size_align(1, 1).unwrap()) as *mut i8;
-        if !ptr.is_null() {
-            *ptr = 0;
-        }
-        return ptr;
+        return crate::pith_cstring_empty();
     }
 
     let len = crate::string::pith_cstring_len(s);
     if index < 0 || index >= len {
-        let ptr = alloc(Layout::from_size_align(1, 1).unwrap()) as *mut i8;
-        if !ptr.is_null() {
-            *ptr = 0;
-        }
-        return ptr;
+        return crate::pith_cstring_empty();
     }
 
-    let ptr = alloc(Layout::from_size_align(2, 1).unwrap()) as *mut i8;
-    if !ptr.is_null() {
-        *ptr = *s.offset(index as isize);
-        *ptr.add(1) = 0;
-    }
+    let ptr = crate::pith_alloc(crate::pith_layout(2, 1)) as *mut i8;
+    *ptr = *s.offset(index as isize);
+    *ptr.add(1) = 0;
     ptr
 }
 
@@ -206,8 +163,6 @@ pub unsafe extern "C" fn pith_cstring_trim_left(s: *const i8) -> *mut i8 {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_to_upper(s: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
         return std::ptr::null_mut();
     }
@@ -215,16 +170,13 @@ pub unsafe extern "C" fn pith_cstring_to_upper(s: *const i8) -> *mut i8 {
     let len = crate::string::pith_cstring_len(s) as usize;
     let slice = std::slice::from_raw_parts(s as *const u8, len);
 
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
+    let ptr = crate::pith_alloc(crate::pith_layout(len + 1, 1)) as *mut i8;
 
-    if !ptr.is_null() {
-        for i in 0..len {
-            let c = slice[i];
-            *ptr.add(i) = (c as char).to_ascii_uppercase() as u8 as i8;
-        }
-        *ptr.add(len) = 0;
+    for i in 0..len {
+        let c = slice[i];
+        *ptr.add(i) = (c as char).to_ascii_uppercase() as u8 as i8;
     }
+    *ptr.add(len) = 0;
     ptr
 }
 
@@ -235,8 +187,6 @@ pub unsafe extern "C" fn pith_cstring_to_upper(s: *const i8) -> *mut i8 {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_to_lower(s: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
         return std::ptr::null_mut();
     }
@@ -244,16 +194,13 @@ pub unsafe extern "C" fn pith_cstring_to_lower(s: *const i8) -> *mut i8 {
     let len = crate::string::pith_cstring_len(s) as usize;
     let slice = std::slice::from_raw_parts(s as *const u8, len);
 
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
+    let ptr = crate::pith_alloc(crate::pith_layout(len + 1, 1)) as *mut i8;
 
-    if !ptr.is_null() {
-        for i in 0..len {
-            let c = slice[i];
-            *ptr.add(i) = (c as char).to_ascii_lowercase() as u8 as i8;
-        }
-        *ptr.add(len) = 0;
+    for i in 0..len {
+        let c = slice[i];
+        *ptr.add(i) = (c as char).to_ascii_lowercase() as u8 as i8;
     }
+    *ptr.add(len) = 0;
     ptr
 }
 
@@ -264,8 +211,6 @@ pub unsafe extern "C" fn pith_cstring_to_lower(s: *const i8) -> *mut i8 {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_reverse(s: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
         return std::ptr::null_mut();
     }
@@ -273,15 +218,12 @@ pub unsafe extern "C" fn pith_cstring_reverse(s: *const i8) -> *mut i8 {
     let len = crate::string::pith_cstring_len(s) as usize;
     let slice = std::slice::from_raw_parts(s as *const u8, len);
 
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
+    let ptr = crate::pith_alloc(crate::pith_layout(len + 1, 1)) as *mut i8;
 
-    if !ptr.is_null() {
-        for i in 0..len {
-            *ptr.add(i) = slice[len - 1 - i] as i8;
-        }
-        *ptr.add(len) = 0;
+    for i in 0..len {
+        *ptr.add(i) = slice[len - 1 - i] as i8;
     }
+    *ptr.add(len) = 0;
     ptr
 }
 
@@ -453,8 +395,6 @@ pub unsafe extern "C" fn pith_cstring_replace(
     from: *const i8,
     to: *const i8,
 ) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
         return std::ptr::null_mut();
     }
@@ -472,13 +412,8 @@ pub unsafe extern "C" fn pith_cstring_replace(
     };
 
     if from_len == 0 {
-        let layout = Layout::from_size_align(s_len + 1, 1).unwrap();
-        let out = alloc(layout) as *mut i8;
-        if !out.is_null() {
-            std::ptr::copy_nonoverlapping(s, out, s_len);
-            *out.add(s_len) = 0;
-        }
-        return out;
+        let bytes = std::slice::from_raw_parts(s as *const u8, s_len);
+        return crate::pith_copy_bytes_to_cstring(bytes);
     }
 
     let s_bytes = std::slice::from_raw_parts(s as *const u8, s_len);
@@ -506,13 +441,7 @@ pub unsafe extern "C" fn pith_cstring_replace(
     }
 
     let out_len = result.len();
-    let layout = Layout::from_size_align(out_len + 1, 1).unwrap();
-    let out = alloc(layout) as *mut i8;
-    if !out.is_null() {
-        std::ptr::copy_nonoverlapping(result.as_ptr(), out as *mut u8, out_len);
-        *out.add(out_len) = 0;
-    }
-    out
+    crate::pith_copy_bytes_to_cstring(&result[..out_len])
 }
 
 /// Check if a C string is empty (null or zero-length)

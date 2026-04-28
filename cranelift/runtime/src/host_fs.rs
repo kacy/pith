@@ -228,7 +228,6 @@ pub unsafe extern "C" fn pith_rename_file(from: *const i8, to: *const i8) -> i64
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_read_file(path: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
     use std::fs;
 
     if path.is_null() {
@@ -239,15 +238,7 @@ pub unsafe extern "C" fn pith_read_file(path: *const i8) -> *mut i8 {
     let slice = std::slice::from_raw_parts(path as *const u8, len);
     if let Ok(path_str) = std::str::from_utf8(slice) {
         if let Ok(contents) = fs::read_to_string(path_str) {
-            let content_len = contents.len();
-            let layout = Layout::from_size_align(content_len + 1, 1).unwrap();
-            let ptr = alloc(layout) as *mut i8;
-
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(contents.as_ptr(), ptr as *mut u8, content_len);
-                *ptr.add(content_len) = 0;
-            }
-            return ptr;
+            return crate::pith_copy_bytes_to_cstring(contents.as_bytes());
         }
     }
     std::ptr::null_mut()
@@ -475,8 +466,6 @@ pub extern "C" fn pith_file_close(handle: i64) {
 /// name must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_env(name: *const i8) -> *const i8 {
-    use std::alloc::{alloc, Layout};
-
     if name.is_null() {
         return std::ptr::null();
     }
@@ -485,15 +474,7 @@ pub unsafe extern "C" fn pith_env(name: *const i8) -> *const i8 {
     let slice = std::slice::from_raw_parts(name as *const u8, len);
     if let Ok(name_str) = std::str::from_utf8(slice) {
         if let Ok(var) = std::env::var(name_str) {
-            let var_len = var.len();
-            let layout = Layout::from_size_align(var_len + 1, 1).unwrap();
-            let ptr = alloc(layout) as *mut i8;
-
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(var.as_ptr(), ptr as *mut u8, var_len);
-                *ptr.add(var_len) = 0;
-                return ptr;
-            }
+            return crate::pith_copy_bytes_to_cstring(var.as_bytes());
         }
     }
     crate::pith_strdup_string("")

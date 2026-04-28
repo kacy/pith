@@ -21,13 +21,5 @@ pub unsafe fn cstr_to_str<'a>(s: *const i8) -> &'a str {
 /// # Safety
 /// The caller is responsible for eventually freeing the returned pointer.
 pub unsafe fn alloc_cstring(s: &str) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-    let bytes = s.as_bytes();
-    let layout = Layout::from_size_align(bytes.len() + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        *ptr.add(bytes.len()) = 0;
-    }
-    ptr
+    crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }

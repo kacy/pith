@@ -43,8 +43,6 @@ pub struct SetImpl {
     data: HashSet<SetElement>,
     /// Type tag for elements (0=int, 1=string)
     elem_type: ElemType,
-    /// Size of each element in bytes
-    elem_size: usize,
     /// Whether elements are heap types (need retain/release)
     elem_is_heap: bool,
 }
@@ -57,11 +55,10 @@ pub enum ElemType {
 }
 
 impl SetImpl {
-    fn new(elem_type: ElemType, elem_size: usize, elem_is_heap: bool) -> Self {
+    fn new(elem_type: ElemType, _elem_size: usize, elem_is_heap: bool) -> Self {
         SetImpl {
             data: HashSet::new(),
             elem_type,
-            elem_size,
             elem_is_heap,
         }
     }
@@ -264,7 +261,6 @@ pub unsafe extern "C" fn pith_set_to_list_string(
     set: PithSet,
 ) -> crate::collections::list::PithList {
     use crate::collections::list::{pith_list_new, pith_list_push_value, PithList};
-    use std::alloc::{alloc, Layout};
 
     if set.ptr.is_null() {
         return PithList {
@@ -284,14 +280,8 @@ pub unsafe extern "C" fn pith_set_to_list_string(
 
     for elem in impl_ref.iter() {
         if let SetElement::String(bytes) = elem {
-            let len = bytes.len();
-            let layout = Layout::from_size_align(len + 1, 1).unwrap();
-            let ptr = alloc(layout) as *mut i8;
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len);
-                *ptr.add(len) = 0;
-                pith_list_push_value(list, ptr as i64);
-            }
+            let ptr = crate::pith_copy_bytes_to_cstring(bytes);
+            pith_list_push_value(list, ptr as i64);
         }
     }
 

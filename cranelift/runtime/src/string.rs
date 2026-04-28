@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::dealloc;
 
 /// FFI-compatible string representation
 ///
@@ -51,9 +51,10 @@ pub unsafe fn internal_from_pith(s: PithString) -> InternalString {
     }
 
     let slice = std::slice::from_raw_parts(s.ptr, s.len as usize);
-    // SAFETY: We assume the caller provides valid UTF-8
-    let str_ref = std::str::from_utf8_unchecked(slice);
-    Arc::from(str_ref)
+    match std::str::from_utf8(slice) {
+        Ok(str_ref) => Arc::from(str_ref),
+        Err(_) => Arc::from(""),
+    }
 }
 
 /// Create a PithString from an internal String
@@ -67,16 +68,9 @@ pub fn pith_from_internal(s: InternalString) -> PithString {
     crate::perf_count(&crate::PERF_STRING_ALLOCS, 1);
     crate::perf_count(&crate::PERF_STRING_ALLOC_BYTES, s.len());
 
-    // Allocate memory and copy the string data
     let len = s.len();
-    let layout = Layout::from_size_align(len, 1).unwrap();
-    let ptr = unsafe { alloc(layout) };
-
-    if ptr.is_null() {
-        eprintln!("pith: out of memory");
-        std::process::abort();
-    }
-
+    let layout = crate::pith_layout(len, 1);
+    let ptr = unsafe { crate::pith_alloc(layout) };
     unsafe {
         std::ptr::copy_nonoverlapping(s.as_bytes().as_ptr(), ptr, len);
     }
@@ -99,9 +93,10 @@ pub unsafe extern "C" fn pith_string_new(data: *const u8, len: i64) -> PithStrin
     }
 
     let slice = std::slice::from_raw_parts(data, len as usize);
-    let s = Arc::from(std::str::from_utf8_unchecked(slice));
-
-    pith_from_internal(s)
+    match std::str::from_utf8(slice) {
+        Ok(text) => pith_from_internal(Arc::from(text)),
+        Err(_) => EMPTY_STRING,
+    }
 }
 
 /// Create a string from a C string (null-terminated)
@@ -170,7 +165,7 @@ pub unsafe extern "C" fn pith_string_release(s: PithString) {
     }
 
     // Free the allocated memory
-    let layout = Layout::from_size_align(s.len as usize, 1).unwrap();
+    let layout = crate::pith_layout(s.len as usize, 1);
     dealloc(s.ptr as *mut u8, layout);
 }
 

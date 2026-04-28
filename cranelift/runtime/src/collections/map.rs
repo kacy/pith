@@ -637,7 +637,6 @@ pub unsafe extern "C" fn pith_map_len_handle(map_handle: i64) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
-    use std::alloc::{alloc, Layout};
 
     if map_handle == 0 {
         let empty = pith_list_new(8, 0);
@@ -649,14 +648,8 @@ pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
 
     for key in impl_ref.keys() {
         if let MapKey::String(ref bytes) = key {
-            let len = bytes.len();
-            let layout = Layout::from_size_align(len + 1, 1).unwrap();
-            let ptr = alloc(layout) as *mut i8;
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len);
-                *ptr.add(len) = 0;
-                pith_list_push_value(list, ptr as i64);
-            }
+            let ptr = crate::pith_copy_bytes_to_cstring(bytes);
+            pith_list_push_value(list, ptr as i64);
         }
     }
 

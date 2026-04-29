@@ -1,3 +1,5 @@
+use crate::ffi_util::cstr_str_or_empty;
+
 fn pith_read_process_stream<R: std::io::Read>(reader: &mut R, max_bytes: i64) -> *mut i8 {
     let size = if max_bytes > 0 {
         max_bytes as usize
@@ -108,7 +110,7 @@ pub unsafe extern "C" fn pith_process_write(handle: i64, data: *const i8) -> i64
     let Some(stdin) = entry.stdin.as_mut() else {
         return 0;
     };
-    let text = std::ffi::CStr::from_ptr(data).to_str().unwrap_or("");
+    let text = cstr_str_or_empty(data);
     match stdin.write(text.as_bytes()) {
         Ok(n) => {
             let _ = stdin.flush();

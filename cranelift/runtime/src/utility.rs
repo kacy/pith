@@ -1,3 +1,5 @@
+use crate::ffi_util::{cstr_bytes, cstr_str};
+
 /// Format time as string — takes unix timestamp (ms) and format string
 /// Simple implementation: returns ISO-like date string
 ///
@@ -17,18 +19,7 @@ pub unsafe extern "C" fn pith_format_time_fmt(timestamp_ms: i64, _fmt: *const i8
 /// Both pointers must be valid null-terminated C strings
 #[no_mangle]
 pub unsafe extern "C" fn pith_fs_write(path: *const i8, content: *const i8) -> i64 {
-    if path.is_null() || content.is_null() {
-        return 0;
-    }
-    let path_len = crate::string::pith_cstring_len(path) as usize;
-    let content_len = crate::string::pith_cstring_len(content) as usize;
-    let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
-    let content_slice = std::slice::from_raw_parts(content as *const u8, content_len);
-
-    if let (Ok(path_str), Ok(content_str)) = (
-        std::str::from_utf8(path_slice),
-        std::str::from_utf8(content_slice),
-    ) {
+    if let (Some(path_str), Some(content_str)) = (cstr_str(path), cstr_str(content)) {
         match std::fs::write(path_str, content_str) {
             Ok(_) => 1,
             Err(_) => 0,
@@ -40,56 +31,29 @@ pub unsafe extern "C" fn pith_fs_write(path: *const i8, content: *const i8) -> i
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_log_info(msg: *const i8) {
-    if msg.is_null() {
-        eprintln!("[INFO] ");
-        return;
-    }
-    let len = crate::string::pith_cstring_len(msg) as usize;
-    let slice = std::slice::from_raw_parts(msg as *const u8, len);
-    if let Ok(s) = std::str::from_utf8(slice) {
-        eprintln!("[INFO] {}", s);
-    }
+    eprintln!("[INFO] {}", cstr_str(msg).unwrap_or(""));
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_log_warn(msg: *const i8) {
-    if msg.is_null() {
-        eprintln!("[WARN] ");
-        return;
-    }
-    let len = crate::string::pith_cstring_len(msg) as usize;
-    let slice = std::slice::from_raw_parts(msg as *const u8, len);
-    if let Ok(s) = std::str::from_utf8(slice) {
-        eprintln!("[WARN] {}", s);
-    }
+    eprintln!("[WARN] {}", cstr_str(msg).unwrap_or(""));
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_log_error(msg: *const i8) {
-    if msg.is_null() {
-        eprintln!("[ERROR] ");
-        return;
-    }
-    let len = crate::string::pith_cstring_len(msg) as usize;
-    let slice = std::slice::from_raw_parts(msg as *const u8, len);
-    if let Ok(s) = std::str::from_utf8(slice) {
-        eprintln!("[ERROR] {}", s);
-    }
+    eprintln!("[ERROR] {}", cstr_str(msg).unwrap_or(""));
 }
 
 /// Execute command and capture output — returns stdout as C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
-    if cmd.is_null() {
+    let Some(cmd_str) = cstr_str(cmd) else {
         return std::ptr::null_mut();
-    }
-    let len = crate::string::pith_cstring_len(cmd) as usize;
-    let slice = std::slice::from_raw_parts(cmd as *const u8, len);
-    if let Ok(cmd_str) = std::str::from_utf8(slice) {
-        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-        if parts.is_empty() {
-            return std::ptr::null_mut();
-        }
+    };
+    let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+    if parts.is_empty() {
+        std::ptr::null_mut()
+    } else {
         match std::process::Command::new(parts[0])
             .args(&parts[1..])
             .output()
@@ -97,19 +61,14 @@ pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
             Ok(output) => crate::pith_copy_bytes_to_cstring(&output.stdout),
             Err(_) => std::ptr::null_mut(),
         }
-    } else {
-        std::ptr::null_mut()
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
-    if s.is_null() {
+    let Some(input) = cstr_bytes(s) else {
         return std::ptr::null_mut();
-    }
-
-    let len = crate::string::pith_cstring_len(s) as usize;
-    let input = std::slice::from_raw_parts(s as *const u8, len);
+    };
 
     const DECODE: [u8; 256] = {
         let mut t = [255u8; 256];
@@ -133,7 +92,7 @@ pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
         t
     };
 
-    let mut in_len = len;
+    let mut in_len = input.len();
     while in_len > 0 && input[in_len - 1] == b'=' {
         in_len -= 1;
     }
@@ -186,11 +145,9 @@ pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_fnv1a(s: *const i8) -> i64 {
-    if s.is_null() {
+    let Some(bytes) = cstr_bytes(s) else {
         return 0;
-    }
-    let len = crate::string::pith_cstring_len(s) as usize;
-    let bytes = std::slice::from_raw_parts(s as *const u8, len);
+    };
     let mut hash: u64 = 0xcbf29ce484222325;
     for &b in bytes {
         hash ^= b as u64;
@@ -201,16 +158,14 @@ pub unsafe extern "C" fn pith_fnv1a(s: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_index_of(haystack: *const i8, needle: *const i8) -> i64 {
-    if haystack.is_null() || needle.is_null() {
+    let (Some(h_bytes), Some(n_bytes)) = (cstr_bytes(haystack), cstr_bytes(needle)) else {
         return -1;
-    }
-    let h_len = crate::string::pith_cstring_len(haystack) as usize;
-    let n_len = crate::string::pith_cstring_len(needle) as usize;
+    };
+    let h_len = h_bytes.len();
+    let n_len = n_bytes.len();
     if n_len == 0 {
         return 0;
     }
-    let h_bytes = std::slice::from_raw_parts(haystack as *const u8, h_len);
-    let n_bytes = std::slice::from_raw_parts(needle as *const u8, n_len);
     for i in 0..=(h_len.saturating_sub(n_len)) {
         if &h_bytes[i..i + n_len] == n_bytes {
             return i as i64;
@@ -221,19 +176,17 @@ pub unsafe extern "C" fn pith_cstring_index_of(haystack: *const i8, needle: *con
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_contains(haystack: *const i8, needle: *const i8) -> i64 {
-    if haystack.is_null() || needle.is_null() {
+    let (Some(h_bytes), Some(n_bytes)) = (cstr_bytes(haystack), cstr_bytes(needle)) else {
         return 0;
-    }
-    let h_len = crate::string::pith_cstring_len(haystack) as usize;
-    let n_len = crate::string::pith_cstring_len(needle) as usize;
+    };
+    let h_len = h_bytes.len();
+    let n_len = n_bytes.len();
     if n_len == 0 {
         return 1;
     }
     if n_len > h_len {
         return 0;
     }
-    let h_bytes = std::slice::from_raw_parts(haystack as *const u8, h_len);
-    let n_bytes = std::slice::from_raw_parts(needle as *const u8, n_len);
     for i in 0..=(h_len - n_len) {
         if &h_bytes[i..i + n_len] == n_bytes {
             return 1;
@@ -244,17 +197,10 @@ pub unsafe extern "C" fn pith_cstring_contains(haystack: *const i8, needle: *con
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_starts_with(s: *const i8, prefix: *const i8) -> i64 {
-    if s.is_null() || prefix.is_null() {
+    let (Some(bytes), Some(prefix_bytes)) = (cstr_bytes(s), cstr_bytes(prefix)) else {
         return 0;
-    }
-    let s_len = crate::string::pith_cstring_len(s) as usize;
-    let p_len = crate::string::pith_cstring_len(prefix) as usize;
-    if p_len > s_len {
-        return 0;
-    }
-    let s_bytes = std::slice::from_raw_parts(s as *const u8, p_len);
-    let p_bytes = std::slice::from_raw_parts(prefix as *const u8, p_len);
-    if s_bytes == p_bytes {
+    };
+    if bytes.starts_with(prefix_bytes) {
         1
     } else {
         0
@@ -263,17 +209,10 @@ pub unsafe extern "C" fn pith_cstring_starts_with(s: *const i8, prefix: *const i
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_ends_with(s: *const i8, suffix: *const i8) -> i64 {
-    if s.is_null() || suffix.is_null() {
+    let (Some(bytes), Some(suffix_bytes)) = (cstr_bytes(s), cstr_bytes(suffix)) else {
         return 0;
-    }
-    let s_len = crate::string::pith_cstring_len(s) as usize;
-    let x_len = crate::string::pith_cstring_len(suffix) as usize;
-    if x_len > s_len {
-        return 0;
-    }
-    let s_bytes = std::slice::from_raw_parts(s as *const u8, s_len);
-    let x_bytes = std::slice::from_raw_parts(suffix as *const u8, x_len);
-    if &s_bytes[s_len - x_len..] == x_bytes {
+    };
+    if bytes.ends_with(suffix_bytes) {
         1
     } else {
         0
@@ -286,10 +225,10 @@ pub unsafe extern "C" fn pith_cstring_pad_left(
     width: i64,
     fill: *const i8,
 ) -> *mut i8 {
-    if s.is_null() {
+    let Some(bytes) = cstr_bytes(s) else {
         return std::ptr::null_mut();
-    }
-    let len = crate::string::pith_cstring_len(s) as usize;
+    };
+    let len = bytes.len();
     if width <= 0 {
         return crate::pith_strdup(s);
     }
@@ -318,10 +257,10 @@ pub unsafe extern "C" fn pith_cstring_pad_right(
     width: i64,
     fill: *const i8,
 ) -> *mut i8 {
-    if s.is_null() {
+    let Some(bytes) = cstr_bytes(s) else {
         return std::ptr::null_mut();
-    }
-    let len = crate::string::pith_cstring_len(s) as usize;
+    };
+    let len = bytes.len();
     if width <= 0 {
         return crate::pith_strdup(s);
     }
@@ -345,10 +284,13 @@ pub unsafe extern "C" fn pith_cstring_pad_right(
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_repeat(s: *const i8, n: i64) -> *mut i8 {
-    if s.is_null() || n <= 0 {
+    let Some(bytes) = cstr_bytes(s) else {
+        return crate::pith_cstring_empty();
+    };
+    if n <= 0 {
         return crate::pith_cstring_empty();
     }
-    let len = crate::string::pith_cstring_len(s) as usize;
+    let len = bytes.len();
     let Some(total_len) = len.checked_mul(n as usize) else {
         return crate::pith_cstring_empty();
     };
@@ -369,13 +311,7 @@ pub unsafe extern "C" fn pith_float_fixed(value: f64, decimals: i64) -> *mut i8 
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_is_dir(path: i64) -> i64 {
-    let path_ptr = path as *const i8;
-    if path_ptr.is_null() {
-        return 0;
-    }
-    let len = crate::string::pith_cstring_len(path_ptr) as usize;
-    let slice = std::slice::from_raw_parts(path_ptr as *const u8, len);
-    if let Ok(path_str) = std::str::from_utf8(slice) {
+    if let Some(path_str) = cstr_str(path as *const i8) {
         if std::path::Path::new(path_str).is_dir() {
             1
         } else {
@@ -383,5 +319,25 @@ pub unsafe extern "C" fn pith_is_dir(path: i64) -> i64 {
         }
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utility_cstring_callers_handle_null_and_invalid_utf8() {
+        let invalid = [0xffu8, 0x00];
+        let ptr = invalid.as_ptr() as *const i8;
+
+        unsafe {
+            assert_eq!(pith_fs_write(ptr, b"x\0".as_ptr() as *const i8), 0);
+            assert!(pith_exec_output(ptr).is_null());
+            assert!(pith_b64_decode(std::ptr::null()).is_null());
+            assert_eq!(pith_cstring_index_of(std::ptr::null(), ptr), -1);
+            assert_eq!(pith_cstring_contains(ptr, b"x\0".as_ptr() as *const i8), 0);
+            assert_eq!(pith_is_dir(ptr as i64), 0);
+        }
     }
 }

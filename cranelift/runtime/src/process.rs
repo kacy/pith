@@ -1,4 +1,5 @@
 use crate::collections::list::PithList;
+use crate::ffi_util::{cstr_str, cstr_str_or_empty};
 use crate::handle_registry::{self, HandleKind};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -33,20 +34,15 @@ fn process_output_handles() -> &'static Mutex<HashMap<i64, ProcessOutputHandle>>
 }
 
 unsafe fn pith_optional_cstring(ptr: *const i8) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    let len = crate::string::pith_cstring_len(ptr) as usize;
-    let slice = std::slice::from_raw_parts(ptr as *const u8, len);
-    std::str::from_utf8(slice).unwrap_or("").to_string()
+    cstr_str_or_empty(ptr).to_string()
 }
 
 unsafe fn pith_required_cstring(ptr: *const i8) -> Option<String> {
-    let text = pith_optional_cstring(ptr);
+    let text = cstr_str(ptr)?;
     if text.is_empty() {
         return None;
     }
-    Some(text)
+    Some(text.to_string())
 }
 
 unsafe fn pith_string_list_to_vec(list: PithList) -> Vec<String> {
@@ -125,25 +121,19 @@ unsafe fn pith_build_command(
 /// cmd must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_process_spawn(cmd: *const i8) -> i64 {
-    if cmd.is_null() {
+    let Some(cmd_str) = cstr_str(cmd) else {
         return 0;
-    }
-    let len = crate::string::pith_cstring_len(cmd) as usize;
-    let slice = std::slice::from_raw_parts(cmd as *const u8, len);
-    if let Ok(cmd_str) = std::str::from_utf8(slice) {
-        match Command::new("/bin/sh")
-            .arg("-lc")
-            .arg(cmd_str)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => pith_store_process_handle(child),
-            Err(_) => 0,
-        }
-    } else {
-        0
+    };
+    match Command::new("/bin/sh")
+        .arg("-lc")
+        .arg(cmd_str)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => pith_store_process_handle(child),
+        Err(_) => 0,
     }
 }
 
@@ -284,6 +274,16 @@ mod tests {
         assert_eq!(pith_process_wait(12345), -1);
         assert_eq!(pith_process_kill(12345), 0);
         pith_process_close(12345);
+    }
+
+    #[test]
+    fn process_spawn_rejects_null_and_invalid_utf8() {
+        let invalid = [0xffu8, 0x00];
+
+        unsafe {
+            assert_eq!(pith_process_spawn(std::ptr::null()), 0);
+            assert_eq!(pith_process_spawn(invalid.as_ptr() as *const i8), 0);
+        }
     }
 
     #[test]

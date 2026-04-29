@@ -1,3 +1,4 @@
+use crate::ffi_util::cstr_str;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static RANDOM_SEED: AtomicU64 = AtomicU64::new(123456789);
@@ -53,29 +54,24 @@ pub unsafe extern "C" fn pith_input() -> *mut i8 {
 pub unsafe extern "C" fn pith_exec(command: *const i8) -> i64 {
     use std::process::Command;
 
-    if command.is_null() {
+    let Some(cmd_str) = cstr_str(command) else {
+        return -1;
+    };
+    let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+    if parts.is_empty() {
         return -1;
     }
 
-    let len = crate::string::pith_cstring_len(command) as usize;
-    let slice = std::slice::from_raw_parts(command as *const u8, len);
-    if let Ok(cmd_str) = std::str::from_utf8(slice) {
-        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-        if parts.is_empty() {
-            return -1;
-        }
+    let mut cmd = Command::new(parts[0]);
+    if parts.len() > 1 {
+        cmd.args(&parts[1..]);
+    }
 
-        let mut cmd = Command::new(parts[0]);
-        if parts.len() > 1 {
-            cmd.args(&parts[1..]);
+    if let Ok(status) = cmd.status() {
+        if let Some(code) = status.code() {
+            return code as i64;
         }
-
-        if let Ok(status) = cmd.status() {
-            if let Some(code) = status.code() {
-                return code as i64;
-            }
-            return 0;
-        }
+        return 0;
     }
     -1
 }
@@ -131,4 +127,19 @@ pub unsafe extern "C" fn pith_random_string(len: i64) -> *mut i8 {
     }
     *ptr.add(n) = 0;
     ptr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_rejects_null_and_invalid_utf8() {
+        let invalid = [0xffu8, 0x00];
+
+        unsafe {
+            assert_eq!(pith_exec(std::ptr::null()), -1);
+            assert_eq!(pith_exec(invalid.as_ptr() as *const i8), -1);
+        }
+    }
 }

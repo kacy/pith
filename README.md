@@ -203,8 +203,25 @@ pith package check            # type check package root from pith.toml
 pith package test             # run package root tests
 pith package lint             # lint package root
 pith package doc              # generate package root documentation
+pith package deps             # list local path dependencies
+pith package inspect [pkg]    # inspect current package or a dependency
+pith package context [pkg]    # print a compact package summary for agents
 pith version                  # print version
 pith help                     # print usage
+```
+
+Package dependencies start with local paths in `pith.toml`:
+
+```toml
+[dependencies]
+greeter = { path = "../greeter" }
+```
+
+That lets source code stay stable:
+
+```pith
+from greeter import greet
+import greeter.extra as extra
 ```
 
 ## building

@@ -18,13 +18,16 @@
 #   pith package test         run package root tests
 #   pith package lint         lint package root
 #   pith package doc          generate package root documentation
+#   pith package deps         list local path dependencies
+#   pith package inspect [pkg] inspect current package or dependency
+#   pith package context [pkg] emit an agent-readable package summary
 #   pith new <name>           scaffold new package
 #   pith lex <file.pith>        print token stream
 #   pith parse <file.pith>      print AST
 #   pith version              print version
 #   pith help                 print usage
 
-from driver import get_directory, get_stem, init_driver, resolve_imports, mark_visited, find_imports, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file
+from driver import get_directory, get_stem, init_driver, resolve_imports, mark_visited, find_imports, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, package_root_file, package_dependency_root, package_dependency_names
 from lexer import lex_all, Token
 from parser import parse, parse_with_file, parser_diagnostics, parser_has_errors
 from ast import get_node, reset_arena
@@ -279,7 +282,156 @@ fn package_root_path() -> String!:
             return root
     return "lib.pith"
 
-fn cmd_package(action: String) -> String!:
+fn package_join_path(base: String, child: String) -> String:
+    if child.len() == 0:
+        return base
+    if child.starts_with("/"):
+        return child
+    if base == "" or base == ".":
+        return child
+    return base + "/" + child
+
+fn package_manifest_path(package_root: String) -> String:
+    return package_join_path(package_root, "pith.toml")
+
+fn package_manifest_value(package_root: String, key: String) -> String!:
+    manifest_path := package_manifest_path(package_root)
+    if not file_exists(manifest_path):
+        return ""
+    manifest := read_file(manifest_path)!
+    for line in manifest.split(chr(10)):
+        value := package_value_for_key(line, key)
+        if value.len() > 0:
+            return value
+    return ""
+
+fn package_current_root() -> String!:
+    if not file_exists("pith.toml"):
+        print("error: pith.toml not found; run this command from a package root")
+        exit(1)
+    return "."
+
+fn package_target_root(name: String) -> String!:
+    current := package_current_root()!
+    if name == "." or name == "":
+        return current
+    dep_root := package_dependency_root(current, name)
+    if dep_root.len() == 0:
+        print("error: package dependency '" + name + "' not found in pith.toml")
+        exit(1)
+    return dep_root
+
+fn package_skip_entry(name: String) -> Bool:
+    if name.starts_with("."):
+        return true
+    return name == "target" or name == "zig-out"
+
+fn package_collect_files(root: String, rel: String, depth: Int) -> List[String]:
+    mut files: List[String] := []
+    mut dir := root
+    if rel.len() > 0:
+        dir = package_join_path(root, rel)
+    if not dir_exists(dir):
+        return files
+    entries := list_dir(dir)
+    for entry in entries:
+        if package_skip_entry(entry):
+            continue
+        mut entry_rel := entry
+        if rel.len() > 0:
+            entry_rel = package_join_path(rel, entry)
+        full := package_join_path(root, entry_rel)
+        if file_exists(full) and entry.ends_with(".pith"):
+            files.push(entry_rel)
+        elif depth > 0 and dir_exists(full):
+            nested := package_collect_files(root, entry_rel, depth - 1)
+            for item in nested:
+                files.push(item)
+    return files
+
+fn package_print_summary(root: String, label: String) -> String!:
+    print("package: " + label)
+    name := package_manifest_value(root, "name")!
+    if name.len() > 0:
+        print("name: " + name)
+    version := package_manifest_value(root, "version")!
+    if version.len() > 0:
+        print("version: " + version)
+    description := package_manifest_value(root, "description")!
+    if description.len() > 0:
+        print("description: " + description)
+    license := package_manifest_value(root, "license")!
+    if license.len() > 0:
+        print("license: " + license)
+    print("root: " + package_root_file(root))
+    return ""
+
+fn package_print_dependencies(root: String):
+    deps := package_dependency_names(root)
+    if deps.len() == 0:
+        print("dependencies: none")
+        return
+    print("dependencies:")
+    for dep in deps:
+        print("- " + dep + " -> " + package_dependency_root(root, dep))
+
+fn package_print_files(root: String):
+    files := package_collect_files(root, "", 4)
+    if files.len() == 0:
+        print("files: none")
+        return
+    print("files:")
+    for file in files:
+        print("- " + file)
+
+fn package_print_api(root: String) -> String!:
+    root_file := package_root_file(root)
+    if not file_exists(root_file):
+        print("api: root file not found: " + root_file)
+        return ""
+    source := read_file(root_file)!
+    doc_extract(source)
+    print(doc_format())
+    return ""
+
+fn cmd_package_deps() -> String!:
+    root := package_current_root()!
+    package_print_dependencies(root)
+    return ""
+
+fn cmd_package_inspect(name: String, api_only: Bool, files_only: Bool) -> String!:
+    root := package_target_root(name)!
+    if files_only:
+        package_print_files(root)
+        return ""
+    if api_only:
+        return package_print_api(root)
+    package_print_summary(root, name)!
+    package_print_dependencies(root)
+    package_print_files(root)
+    return package_print_api(root)
+
+fn cmd_package_context(name: String) -> String!:
+    root := package_target_root(name)!
+    print("# pith package context")
+    package_print_summary(root, name)!
+    print("")
+    print("## commands")
+    print("- pith package check")
+    print("- pith package test")
+    print("- pith package lint")
+    print("- pith package doc")
+    print("")
+    print("## dependencies")
+    package_print_dependencies(root)
+    print("")
+    print("## files")
+    package_print_files(root)
+    print("")
+    print("## public api")
+    return package_print_api(root)
+
+fn cmd_package(action: String, args_list: List[String]) -> String!:
     root := package_root_path()!
     if action == "check":
         return cmd_check(root, false)
@@ -289,8 +441,27 @@ fn cmd_package(action: String) -> String!:
         return cmd_lint(root, false)
     if action == "doc":
         return cmd_doc(root, false, false)
+    if action == "deps":
+        return cmd_package_deps()
+    if action == "inspect":
+        mut name := "."
+        mut api_only := false
+        mut files_only := false
+        if args_list.len() >= 4:
+            name = args_list[3]
+        if args_list.len() >= 5:
+            if args_list[4] == "--api":
+                api_only = true
+            elif args_list[4] == "--files":
+                files_only = true
+        return cmd_package_inspect(name, api_only, files_only)
+    if action == "context":
+        mut name := "."
+        if args_list.len() >= 4:
+            name = args_list[3]
+        return cmd_package_context(name)
 
-    print("usage: pith package <check|test|lint|doc>")
+    print("usage: pith package <check|test|lint|doc|deps|inspect|context>")
     exit(1)
     return ""
 
@@ -314,6 +485,9 @@ fn cmd_new(name: String) -> String!:
     toml = toml + "description = " + chr(34) + "a short description of " + name + chr(34) + nl
     toml = toml + "root = " + chr(34) + "lib.pith" + chr(34) + nl
     toml = toml + "license = " + chr(34) + "MIT" + chr(34) + nl
+    toml = toml + nl
+    toml = toml + "[dependencies]" + nl
+    toml = toml + "# helper = " + chr(123) + " path = " + chr(34) + "../helper" + chr(34) + " " + chr(125) + nl
     write_file(name + "/pith.toml", toml)!
 
     # AGENTS.md
@@ -342,8 +516,9 @@ fn cmd_new(name: String) -> String!:
     agents = agents + "## finding things" + nl
     agents = agents + nl
     agents = agents + "    pith doc search " + chr(34) + "query" + chr(34) + "         search the standard library" + nl
-    agents = agents + "    pith inspect <package>          read a published package's source" + nl
-    agents = agents + "    pith inspect <package> --api    see just the public API" + nl
+    agents = agents + "    pith package inspect <package>          read a dependency package" + nl
+    agents = agents + "    pith package inspect <package> --api    see just the public API" + nl
+    agents = agents + "    pith package context <package>          compact context for agents" + nl
     agents = agents + nl
     agents = agents + "## publishing" + nl
     agents = agents + nl
@@ -462,6 +637,9 @@ fn print_help():
     print("  package test           run package root tests")
     print("  package lint           lint package root")
     print("  package doc            generate package root documentation")
+    print("  package deps           list package dependencies")
+    print("  package inspect [pkg]  inspect current package or dependency")
+    print("  package context [pkg]  emit agent-readable package context")
     print("  new <name>             scaffold new package")
     print("  lex <file.pith>          print token stream")
     print("  parse <file.pith>        print AST")
@@ -561,9 +739,9 @@ fn run_cli() -> String!:
 
     if command == "package":
         if a.len() < 3:
-            print("usage: pith package <check|test|lint|doc>")
+            print("usage: pith package <check|test|lint|doc|deps|inspect|context>")
             exit(1)
-        _result := cmd_package(a[2])!
+        _result := cmd_package(a[2], a)!
         return ""
 
     # scaffold new package

@@ -204,6 +204,7 @@ pith package test             # run package root tests
 pith package lint             # lint package root
 pith package doc              # generate package root documentation
 pith package deps             # list local path dependencies
+pith package lock             # write pith.lock for deterministic local deps
 pith package inspect [pkg]    # inspect current package or a dependency
 pith package context [pkg]    # print a compact package summary for agents
 pith version                  # print version

@@ -100,6 +100,9 @@ fn dr_join_path(base: String, child: String) -> String:
 fn dr_manifest_path(package_root: String) -> String:
     return dr_join_path(package_root, "pith.toml")
 
+fn dr_lock_path(package_root: String) -> String:
+    return dr_join_path(package_root, "pith.lock")
+
 fn dr_strip_quotes(value: String) -> String:
     trimmed := value.trim()
     if trimmed.len() >= 2 and trimmed[0] == chr(34) and trimmed[trimmed.len() - 1] == chr(34):
@@ -179,16 +182,10 @@ fn dr_dependency_path_value(value: String) -> String:
 fn dr_dependency_key(package_root: String, dep_name: String) -> String:
     return package_root + "|" + dep_name
 
-fn dr_load_package_dependencies(package_root: String):
-    if package_root == "":
+fn dr_load_dependency_file(package_root: String, path: String):
+    if not file_exists(path):
         return
-    if package_dependency_loaded.contains_key(package_root):
-        return
-    package_dependency_loaded.insert(package_root, true)
-    manifest_path := dr_manifest_path(package_root)
-    if not file_exists(manifest_path):
-        return
-    manifest := read_file(manifest_path).unwrap_or("")
+    manifest := read_file(path).unwrap_or("")
     mut in_dependencies := false
     for line in manifest.split(chr(10)):
         trimmed := line.trim()
@@ -207,6 +204,18 @@ fn dr_load_package_dependencies(package_root: String):
                 key := dr_dependency_key(package_root, dep_name)
                 root := dr_join_path(package_root, dep_path)
                 package_dependency_roots.insert(key, root)
+
+fn dr_load_package_dependencies(package_root: String):
+    if package_root == "":
+        return
+    if package_dependency_loaded.contains_key(package_root):
+        return
+    package_dependency_loaded.insert(package_root, true)
+    lock_path := dr_lock_path(package_root)
+    if file_exists(lock_path):
+        dr_load_dependency_file(package_root, lock_path)
+        return
+    dr_load_dependency_file(package_root, dr_manifest_path(package_root))
 
 fn dr_first_module_segment(mod_path: String) -> String:
     dot := mod_path.index_of(".")

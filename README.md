@@ -206,6 +206,7 @@ pith package doc              # generate package root documentation
 pith package deps             # list local path dependencies
 pith package lock             # write pith.lock for deterministic local deps
 pith package install          # copy local dependencies into .pith/packages
+pith package install --refresh # recopy cached local dependencies
 pith package inspect [pkg]    # inspect current package or a dependency
 pith package context [pkg]    # print a compact package summary for agents
 pith version                  # print version

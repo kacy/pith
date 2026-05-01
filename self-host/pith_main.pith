@@ -21,6 +21,7 @@
 #   pith package deps         list local path dependencies
 #   pith package lock         write pith.lock from local path dependencies
 #   pith package install      copy path dependencies into .pith/packages
+#   pith package install --refresh recopy existing cached dependencies
 #   pith package inspect [pkg] inspect current package or dependency
 #   pith package context [pkg] emit an agent-readable package summary
 #   pith new <name>           scaffold new package
@@ -378,14 +379,85 @@ fn package_manifest_dependencies(package_root: String) -> List[PackageDependency
                 deps.push(PackageDependency(name, dep_path))
     return deps
 
-fn package_path_has_space(path: String) -> Bool:
-    return path.contains(" ") or path.contains(chr(9)) or path.contains(chr(10))
+fn package_safe_segment(value: String) -> Bool:
+    if value.len() == 0:
+        return false
+    if value == "." or value == "..":
+        return false
+    allowed := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+    for ch in value:
+        if not allowed.contains(ch):
+            return false
+    return true
+
+fn package_validate_cache_segment(label: String, value: String) -> String:
+    if not package_safe_segment(value):
+        print("error: invalid package " + label + " for cache path: " + value)
+        exit(1)
+    return value
+
+fn package_ensure_dir(path: String) -> Bool:
+    if dir_exists(path):
+        return true
+    if file_exists(path):
+        print("error: path is a file, not a directory: " + path)
+        exit(1)
+    parent := get_directory(path)
+    if parent != "." and parent != path:
+        package_ensure_dir(parent)
+    if not mkdir(path):
+        print("error: could not create directory: " + path)
+        exit(1)
+    return true
+
+fn package_copy_tree(from_path: String, to_path: String) -> Bool:
+    if dir_exists(from_path):
+        package_ensure_dir(to_path)
+        for entry in list_dir(from_path):
+            if entry == ".pith" or entry == ".git" or entry == ".pith-build" or entry == "target" or entry == "zig-out":
+                continue
+            package_copy_tree(package_join_path(from_path, entry), package_join_path(to_path, entry))
+        return true
+
+    if file_exists(from_path):
+        parent := get_directory(to_path)
+        if parent != ".":
+            package_ensure_dir(parent)
+        data := read_file_bytes(from_path)
+        if data.is_err:
+            print("error: could not read dependency file: " + from_path)
+            exit(1)
+        wrote := write_file_bytes(to_path, data.ok)
+        if wrote.is_err or not wrote.ok:
+            print("error: could not write cached dependency file: " + to_path)
+            exit(1)
+        return true
+
+    print("error: path does not exist: " + from_path)
+    exit(1)
+    return false
 
 fn package_dependency_version(dep_root: String) -> String!:
+    manifest_path := package_manifest_path(dep_root)
+    if not file_exists(manifest_path):
+        print("error: dependency manifest not found: " + manifest_path)
+        exit(1)
     version := package_manifest_value(dep_root, "version")!
     if version.len() == 0:
-        return "0.0.0"
+        print("error: dependency version missing in: " + manifest_path)
+        exit(1)
     return version
+
+fn package_dependency_manifest_name(dep_root: String) -> String!:
+    manifest_path := package_manifest_path(dep_root)
+    if not file_exists(manifest_path):
+        print("error: dependency manifest not found: " + manifest_path)
+        exit(1)
+    name := package_manifest_value(dep_root, "name")!
+    if name.len() == 0:
+        print("error: dependency name missing in: " + manifest_path)
+        exit(1)
+    return name
 
 fn package_cache_rel_path(dep: PackageDependency, version: String) -> String:
     return ".pith/packages/" + dep.name + "-" + version
@@ -396,7 +468,9 @@ fn package_lock_text(root: String, deps: List[PackageDependency], use_cache: Boo
     out = out + "[dependencies]" + nl
     for dep in deps:
         dep_root := package_join_path(root, dep.path)
+        package_validate_cache_segment("name", dep.name)
         version := package_dependency_version(dep_root)!
+        package_validate_cache_segment("version", version)
         mut lock_path := dep.path
         if use_cache:
             lock_path = package_cache_rel_path(dep, version)
@@ -510,24 +584,35 @@ fn cmd_package_lock() -> String!:
     print("wrote pith.lock")
     return ""
 
-fn cmd_package_install() -> String!:
+fn cmd_package_install(refresh: Bool) -> String!:
     root := package_current_root()!
     deps := package_manifest_dependencies(root)!
     cache_dir := package_cache_dir(root)
-    mkdir(cache_dir)
+    package_ensure_dir(cache_dir)
     for dep in deps:
         dep_root := package_join_path(root, dep.path)
+        if not dir_exists(dep_root):
+            print("error: dependency path not found: " + dep.path)
+            exit(1)
+        manifest_name := package_dependency_manifest_name(dep_root)!
+        package_validate_cache_segment("name", manifest_name)
+        package_validate_cache_segment("name", dep.name)
         version := package_dependency_version(dep_root)!
+        package_validate_cache_segment("version", version)
         cache_rel := package_cache_rel_path(dep, version)
         cache_root := package_join_path(root, cache_rel)
-        if package_path_has_space(dep_root) or package_path_has_space(cache_root):
-            print("error: package install does not support dependency paths with spaces")
+        if dir_exists(cache_root):
+            if refresh:
+                if not fs_remove_tree(cache_root):
+                    print("error: could not refresh cached dependency: " + cache_rel)
+                    exit(1)
+            else:
+                print("already installed " + dep.name + " " + version + " -> " + cache_rel)
+                continue
+        elif file_exists(cache_root):
+            print("error: cache path is a file, not a directory: " + cache_rel)
             exit(1)
-        if not dir_exists(cache_root):
-            status := exec("cp -R " + dep_root + " " + cache_root)
-            if status != 0:
-                print("error: failed to install dependency '" + dep.name + "'")
-                exit(status)
+        package_copy_tree(dep_root, cache_root)
         print("installed " + dep.name + " " + version + " -> " + cache_rel)
     write_file(package_lock_path(root), package_lock_text(root, deps, true)!)!
     print("wrote pith.lock")
@@ -580,7 +665,14 @@ fn cmd_package(action: String, args_list: List[String]) -> String!:
     if action == "lock":
         return cmd_package_lock()
     if action == "install":
-        return cmd_package_install()
+        mut refresh := false
+        if args_list.len() >= 4:
+            if args_list[3] == "--refresh":
+                refresh = true
+            else:
+                print("usage: pith package install [--refresh]")
+                exit(1)
+        return cmd_package_install(refresh)
     if action == "inspect":
         mut name := "."
         mut api_only := false
@@ -778,6 +870,7 @@ fn print_help():
     print("  package deps           list package dependencies")
     print("  package lock           write pith.lock")
     print("  package install        copy path dependencies into .pith/packages")
+    print("  package install --refresh recopy existing cached dependencies")
     print("  package inspect [pkg]  inspect current package or dependency")
     print("  package context [pkg]  emit agent-readable package context")
     print("  new <name>             scaffold new package")

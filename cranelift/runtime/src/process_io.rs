@@ -1,5 +1,11 @@
+use crate::ffi_util::cstr_str_or_empty;
+
 fn pith_read_process_stream<R: std::io::Read>(reader: &mut R, max_bytes: i64) -> *mut i8 {
-    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let size = if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        4096
+    };
     let mut buf = vec![0u8; size];
     match reader.read(&mut buf) {
         Ok(0) => unsafe { crate::pith_cstring_empty() },
@@ -12,7 +18,11 @@ fn pith_read_process_stream<R: std::io::Read>(reader: &mut R, max_bytes: i64) ->
 }
 
 fn pith_read_process_stream_bytes<R: std::io::Read>(reader: &mut R, max_bytes: i64) -> i64 {
-    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let size = if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        4096
+    };
     let mut buf = vec![0u8; size];
     match reader.read(&mut buf) {
         Ok(n) => {
@@ -25,6 +35,9 @@ fn pith_read_process_stream_bytes<R: std::io::Read>(reader: &mut R, max_bytes: i
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_process_read(handle: i64, max_bytes: i64) -> *mut i8 {
+    if !crate::handle_registry::is_valid_id(handle, crate::handle_registry::HandleKind::Process) {
+        return std::ptr::null_mut();
+    }
     let mut handles = crate::process::process_handles().lock();
     let Some(entry) = handles.get_mut(&handle) else {
         return std::ptr::null_mut();
@@ -37,6 +50,9 @@ pub unsafe extern "C" fn pith_process_read(handle: i64, max_bytes: i64) -> *mut 
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_process_read_bytes(handle: i64, max_bytes: i64) -> i64 {
+    if !crate::handle_registry::is_valid_id(handle, crate::handle_registry::HandleKind::Process) {
+        return 0;
+    }
     let mut handles = crate::process::process_handles().lock();
     let Some(entry) = handles.get_mut(&handle) else {
         return 0;
@@ -49,6 +65,9 @@ pub unsafe extern "C" fn pith_process_read_bytes(handle: i64, max_bytes: i64) ->
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_process_read_err(handle: i64, max_bytes: i64) -> *mut i8 {
+    if !crate::handle_registry::is_valid_id(handle, crate::handle_registry::HandleKind::Process) {
+        return std::ptr::null_mut();
+    }
     let mut handles = crate::process::process_handles().lock();
     let Some(entry) = handles.get_mut(&handle) else {
         return std::ptr::null_mut();
@@ -61,6 +80,9 @@ pub unsafe extern "C" fn pith_process_read_err(handle: i64, max_bytes: i64) -> *
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_process_read_err_bytes(handle: i64, max_bytes: i64) -> i64 {
+    if !crate::handle_registry::is_valid_id(handle, crate::handle_registry::HandleKind::Process) {
+        return 0;
+    }
     let mut handles = crate::process::process_handles().lock();
     let Some(entry) = handles.get_mut(&handle) else {
         return 0;
@@ -78,6 +100,9 @@ pub unsafe extern "C" fn pith_process_write(handle: i64, data: *const i8) -> i64
     if data.is_null() {
         return 0;
     }
+    if !crate::handle_registry::is_valid_id(handle, crate::handle_registry::HandleKind::Process) {
+        return 0;
+    }
     let mut handles = crate::process::process_handles().lock();
     let Some(entry) = handles.get_mut(&handle) else {
         return 0;
@@ -85,7 +110,7 @@ pub unsafe extern "C" fn pith_process_write(handle: i64, data: *const i8) -> i64
     let Some(stdin) = entry.stdin.as_mut() else {
         return 0;
     };
-    let text = std::ffi::CStr::from_ptr(data).to_str().unwrap_or("");
+    let text = cstr_str_or_empty(data);
     match stdin.write(text.as_bytes()) {
         Ok(n) => {
             let _ = stdin.flush();
@@ -102,6 +127,9 @@ pub unsafe extern "C" fn pith_process_write_bytes(handle: i64, data: i64) -> i64
     let Some(bytes) = crate::bytes::pith_bytes_ref(data) else {
         return 0;
     };
+    if !crate::handle_registry::is_valid_id(handle, crate::handle_registry::HandleKind::Process) {
+        return 0;
+    }
     let mut handles = crate::process::process_handles().lock();
     let Some(entry) = handles.get_mut(&handle) else {
         return 0;
@@ -115,5 +143,22 @@ pub unsafe extern "C" fn pith_process_write_bytes(handle: i64, data: i64) -> i64
             n as i64
         }
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_process_io_handles_return_safe_defaults() {
+        unsafe {
+            assert!(pith_process_read(12345, 16).is_null());
+            assert_eq!(pith_process_read_bytes(12345, 16), 0);
+            assert!(pith_process_read_err(12345, 16).is_null());
+            assert_eq!(pith_process_read_err_bytes(12345, 16), 0);
+            assert_eq!(pith_process_write(12345, std::ptr::null()), 0);
+            assert_eq!(pith_process_write_bytes(12345, 0), 0);
+        }
     }
 }

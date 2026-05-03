@@ -46,7 +46,11 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> i64 {
             return parse_int_error(b"invalid integer");
         }
     }
-    let limit = if negative { i64::MAX as u64 + 1 } else { i64::MAX as u64 };
+    let limit = if negative {
+        i64::MAX as u64 + 1
+    } else {
+        i64::MAX as u64
+    };
     let mut value: u64 = 0;
     while pos < end {
         let digit = slice[pos];
@@ -96,8 +100,6 @@ pub unsafe extern "C" fn pith_parse_float(s: *const i8) -> f64 {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_b64_encode(s: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
         return std::ptr::null_mut();
     }
@@ -130,12 +132,7 @@ pub unsafe extern "C" fn pith_b64_encode(s: *const i8) -> *mut i8 {
     }
     out.push(0);
 
-    let layout = Layout::from_size_align(out.len(), 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(out.as_ptr(), ptr as *mut u8, out.len());
-    }
-    ptr
+    crate::pith_copy_bytes_to_cstring(&out[..out.len() - 1])
 }
 
 /// Hex encode a C string — returns newly allocated C string
@@ -144,8 +141,6 @@ pub unsafe extern "C" fn pith_b64_encode(s: *const i8) -> *mut i8 {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_hex_encode(s: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
         return std::ptr::null_mut();
     }
@@ -153,19 +148,16 @@ pub unsafe extern "C" fn pith_hex_encode(s: *const i8) -> *mut i8 {
     let len = crate::string::pith_cstring_len(s) as usize;
     let input = std::slice::from_raw_parts(s as *const u8, len);
     let hex_len = len * 2 + 1;
-    let layout = Layout::from_size_align(hex_len, 1).unwrap();
-    let ptr = alloc(layout) as *mut u8;
+    let ptr = crate::pith_alloc(crate::pith_layout(hex_len, 1));
 
-    if !ptr.is_null() {
-        for (i, &byte) in input.iter().enumerate() {
-            let hi = (byte >> 4) as usize;
-            let lo = (byte & 0xf) as usize;
-            const HEX: &[u8] = b"0123456789abcdef";
-            *ptr.add(i * 2) = HEX[hi];
-            *ptr.add(i * 2 + 1) = HEX[lo];
-        }
-        *ptr.add(len * 2) = 0;
+    for (i, &byte) in input.iter().enumerate() {
+        let hi = (byte >> 4) as usize;
+        let lo = (byte & 0xf) as usize;
+        const HEX: &[u8] = b"0123456789abcdef";
+        *ptr.add(i * 2) = HEX[hi];
+        *ptr.add(i * 2 + 1) = HEX[lo];
     }
+    *ptr.add(len * 2) = 0;
     ptr as *mut i8
 }
 
@@ -175,8 +167,6 @@ pub unsafe extern "C" fn pith_hex_encode(s: *const i8) -> *mut i8 {
 /// s must be a valid null-terminated C string of hex digits
 #[no_mangle]
 pub unsafe extern "C" fn pith_from_hex(s: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
         return std::ptr::null_mut();
     }
@@ -187,17 +177,14 @@ pub unsafe extern "C" fn pith_from_hex(s: *const i8) -> *mut i8 {
     }
     let input = std::slice::from_raw_parts(s as *const u8, len);
     let out_len = len / 2;
-    let layout = Layout::from_size_align(out_len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut u8;
+    let ptr = crate::pith_alloc(crate::pith_layout(out_len + 1, 1));
 
-    if !ptr.is_null() {
-        for i in 0..out_len {
-            let hi = hex_digit(input[i * 2]);
-            let lo = hex_digit(input[i * 2 + 1]);
-            *ptr.add(i) = (hi << 4) | lo;
-        }
-        *ptr.add(out_len) = 0;
+    for i in 0..out_len {
+        let hi = hex_digit(input[i * 2]);
+        let lo = hex_digit(input[i * 2 + 1]);
+        *ptr.add(i) = (hi << 4) | lo;
     }
+    *ptr.add(out_len) = 0;
     ptr as *mut i8
 }
 
@@ -216,17 +203,8 @@ fn hex_digit(b: u8) -> u8 {
 /// Returns heap-allocated null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_hex(n: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let s = format!("{:x}", n);
-    let bytes = s.as_bytes();
-    let layout = Layout::array::<u8>(bytes.len() + 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        *ptr.add(bytes.len()) = 0;
-    }
-    ptr
+    crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
 
 /// Convert an integer to octal string (e.g., 8 → "10")
@@ -235,17 +213,8 @@ pub unsafe extern "C" fn pith_int_to_hex(n: i64) -> *mut i8 {
 /// Returns heap-allocated null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_oct(n: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let s = format!("{:o}", n);
-    let bytes = s.as_bytes();
-    let layout = Layout::array::<u8>(bytes.len() + 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        *ptr.add(bytes.len()) = 0;
-    }
-    ptr
+    crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
 
 /// Convert an integer to binary string (e.g., 10 → "1010")
@@ -254,17 +223,8 @@ pub unsafe extern "C" fn pith_int_to_oct(n: i64) -> *mut i8 {
 /// Returns heap-allocated null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_bin(n: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let s = format!("{:b}", n);
-    let bytes = s.as_bytes();
-    let layout = Layout::array::<u8>(bytes.len() + 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        *ptr.add(bytes.len()) = 0;
-    }
-    ptr
+    crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
 
 /// SHA-256 hash of a C string — returns hex-encoded C string
@@ -273,17 +233,9 @@ pub unsafe extern "C" fn pith_int_to_bin(n: i64) -> *mut i8 {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_sha256(s: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if s.is_null() {
-        let placeholder =
-            b"0000000000000000000000000000000000000000000000000000000000000000\0";
-        let layout = Layout::from_size_align(placeholder.len(), 1).unwrap();
-        let ptr = alloc(layout) as *mut i8;
-        if !ptr.is_null() {
-            std::ptr::copy_nonoverlapping(placeholder.as_ptr(), ptr as *mut u8, placeholder.len());
-        }
-        return ptr;
+        let placeholder = b"0000000000000000000000000000000000000000000000000000000000000000";
+        return crate::pith_copy_bytes_to_cstring(placeholder);
     }
 
     let len = crate::string::pith_cstring_len(s) as usize;
@@ -296,14 +248,8 @@ pub unsafe extern "C" fn pith_sha256(s: *const i8) -> *mut i8 {
         hex.push(HEX[(byte >> 4) as usize]);
         hex.push(HEX[(byte & 0xf) as usize]);
     }
-    hex.push(0);
 
-    let layout = Layout::from_size_align(hex.len(), 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(hex.as_ptr(), ptr as *mut u8, hex.len());
-    }
-    ptr
+    crate::pith_copy_bytes_to_cstring(&hex)
 }
 
 fn sha256_compute(data: &[u8]) -> [u8; 32] {

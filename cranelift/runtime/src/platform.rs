@@ -1,3 +1,4 @@
+use crate::ffi_util::cstr_str;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static RANDOM_SEED: AtomicU64 = AtomicU64::new(123456789);
@@ -28,7 +29,6 @@ pub extern "C" fn pith_time() -> i64 {
 /// Returns C string. Caller must free with pith_free.
 #[no_mangle]
 pub unsafe extern "C" fn pith_input() -> *mut i8 {
-    use std::alloc::{alloc, Layout};
     use std::io::{self, BufRead};
 
     let stdin = io::stdin();
@@ -41,15 +41,7 @@ pub unsafe extern "C" fn pith_input() -> *mut i8 {
             line.pop();
         }
 
-        let len = line.len();
-        let layout = Layout::from_size_align(len + 1, 1).unwrap();
-        let ptr = alloc(layout) as *mut i8;
-
-        if !ptr.is_null() {
-            std::ptr::copy_nonoverlapping(line.as_ptr(), ptr as *mut u8, len);
-            *ptr.add(len) = 0;
-        }
-        return ptr;
+        return crate::pith_copy_bytes_to_cstring(line.as_bytes());
     }
     std::ptr::null_mut()
 }
@@ -62,29 +54,24 @@ pub unsafe extern "C" fn pith_input() -> *mut i8 {
 pub unsafe extern "C" fn pith_exec(command: *const i8) -> i64 {
     use std::process::Command;
 
-    if command.is_null() {
+    let Some(cmd_str) = cstr_str(command) else {
+        return -1;
+    };
+    let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+    if parts.is_empty() {
         return -1;
     }
 
-    let len = crate::string::pith_cstring_len(command) as usize;
-    let slice = std::slice::from_raw_parts(command as *const u8, len);
-    if let Ok(cmd_str) = std::str::from_utf8(slice) {
-        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-        if parts.is_empty() {
-            return -1;
-        }
+    let mut cmd = Command::new(parts[0]);
+    if parts.len() > 1 {
+        cmd.args(&parts[1..]);
+    }
 
-        let mut cmd = Command::new(parts[0]);
-        if parts.len() > 1 {
-            cmd.args(&parts[1..]);
+    if let Ok(status) = cmd.status() {
+        if let Some(code) = status.code() {
+            return code as i64;
         }
-
-        if let Ok(status) = cmd.status() {
-            if let Some(code) = status.code() {
-                return code as i64;
-            }
-            return 0;
-        }
+        return 0;
     }
     -1
 }
@@ -121,38 +108,38 @@ pub extern "C" fn pith_random_int(min: i64, max: i64) -> i64 {
 /// Returns C string. Caller must free.
 #[no_mangle]
 pub unsafe extern "C" fn pith_fmt_float(n: f64, precision: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
-    let s = format!("{:.1$}", n, precision as usize);
-    let len = s.len();
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(s.as_ptr(), ptr as *mut u8, len);
-        *ptr.add(len) = 0;
-    }
-    ptr
+    let precision = precision.max(0) as usize;
+    let s = format!("{:.1$}", n, precision);
+    crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
 
 /// Generate random string of given length
 /// Returns C string. Caller must free.
 #[no_mangle]
 pub unsafe extern "C" fn pith_random_string(len: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let n = len.max(0) as usize;
 
-    let layout = Layout::from_size_align(n + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-
-    if !ptr.is_null() {
-        for i in 0..n {
-            let idx = (pith_random_float() * CHARSET.len() as f64) as usize % CHARSET.len();
-            *ptr.add(i) = CHARSET[idx] as i8;
-        }
-        *ptr.add(n) = 0;
+    let ptr = crate::pith_alloc(crate::pith_layout(n + 1, 1)) as *mut i8;
+    for i in 0..n {
+        let idx = (pith_random_float() * CHARSET.len() as f64) as usize % CHARSET.len();
+        *ptr.add(i) = CHARSET[idx] as i8;
     }
+    *ptr.add(n) = 0;
     ptr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_rejects_null_and_invalid_utf8() {
+        let invalid = [0xffu8, 0x00];
+
+        unsafe {
+            assert_eq!(pith_exec(std::ptr::null()), -1);
+            assert_eq!(pith_exec(invalid.as_ptr() as *const i8), -1);
+        }
+    }
 }

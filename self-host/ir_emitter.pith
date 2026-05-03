@@ -6171,6 +6171,33 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
         ir_emit_call2(r, "__list_get", ir_infer_type(idx), obj_r, idx_r)
     return r
 
+fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
+    target := get_node(target_idx)
+    if target.kind != "index" or target.children.len() < 2:
+        return false
+
+    obj_r := ir_expr(target.children[0])
+    idx_r := ir_expr(target.children[1])
+    mut obj_type := ir_checked_type(target.children[0])
+    mut value_type := ir_checked_index_type(target_idx)
+    if obj_type.len() == 0:
+        obj_type = ir_infer_type(target.children[0])
+    if value_type.len() == 0:
+        value_type = ir_lookup_map_value_type_for_expr(target.children[0])
+    if value_type.len() == 0:
+        value_type = ir_infer_type(value_idx)
+    value_r := ir_emit_value_for_target(value_idx, value_type)
+
+    if obj_type == "map_int":
+        ir_emit_call3(ir_reg(), "map_insert_ikey", "void", obj_r, idx_r, value_r)
+        return true
+    if obj_type == "map":
+        ir_emit_call3(ir_reg(), "map_insert", "void", obj_r, idx_r, value_r)
+        return true
+
+    ir_emit_call3(ir_reg(), "pith_list_set_value", "void", obj_r, idx_r, value_r)
+    return true
+
 # --- emit expression, return register ---
 fn ir_expr(idx: Int) -> Int:
     node := get_node(idx)
@@ -6376,6 +6403,9 @@ fn ir_emit_bind_stmt(node: Node):
 
 fn ir_emit_assign_stmt(node: Node):
     name := node.value
+    if node.children.len() >= 2:
+        if ir_emit_index_assignment(node.children[0], node.children[1]):
+            return
     if node.children.len() > 0:
         r := ir_emit_value_for_target(node.children[0], ir_lookup_name_type(name))
         ir_var_regs.insert(name, r)
@@ -6384,6 +6414,8 @@ fn ir_emit_assign_stmt(node: Node):
 fn ir_emit_compound_assignment(node: Node):
     op := node.value
     if op == "=" and node.children.len() >= 2:
+        if ir_emit_index_assignment(node.children[0], node.children[1]):
+            return
         tn := get_node(node.children[0])
         name := tn.value
         target_type := ir_checked_target_type(node.children[0], name)

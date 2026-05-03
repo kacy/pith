@@ -21,7 +21,9 @@ static STRUCT_LAYOUTS: OnceLock<Mutex<HashMap<String, Vec<(String, usize)>>>> = 
 
 pub fn register_struct_layout(name: &str, fields: &[(String, String)]) {
     let layouts = STRUCT_LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let field_info: Vec<_> = fields.iter().enumerate()
+    let field_info: Vec<_> = fields
+        .iter()
+        .enumerate()
         .map(|(i, (fname, _))| {
             let clean = fname.strip_suffix(" pub").unwrap_or(fname).to_string();
             (clean, i * 8)
@@ -33,7 +35,8 @@ pub fn register_struct_layout(name: &str, fields: &[(String, String)]) {
 }
 
 pub fn get_struct_layout(name: &str) -> Option<Vec<(String, usize)>> {
-    STRUCT_LAYOUTS.get()
+    STRUCT_LAYOUTS
+        .get()
         .and_then(|m| m.lock().ok())
         .and_then(|map| map.get(name).cloned())
 }
@@ -77,9 +80,15 @@ pub fn create_codegen() -> Result<CodeGen, CompileError> {
     let isa = isa_builder
         .finish(settings::Flags::new(settings::builder()))
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-    let builder = ObjectBuilder::new(isa, "pith_module", cranelift_module::default_libcall_names())
-        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-    Ok(CodeGen { module: ObjectModule::new(builder) })
+    let builder = ObjectBuilder::new(
+        isa,
+        "pith_module",
+        cranelift_module::default_libcall_names(),
+    )
+    .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+    Ok(CodeGen {
+        module: ObjectModule::new(builder),
+    })
 }
 /// Declare a string in the data section and return its address
 pub fn declare_string_data(

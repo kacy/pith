@@ -18,6 +18,7 @@ pub mod concurrency;
 pub mod crypto;
 pub mod encoding;
 pub mod ffi_util;
+pub mod handle_registry;
 pub mod host_fs;
 pub mod json;
 pub mod network;
@@ -42,11 +43,11 @@ pub use string_list::*;
 pub use utility::*;
 
 pub(crate) use runtime_core::{
-    pith_copy_bytes_to_cstring, pith_cstring_empty, pith_strdup_string,
+    pith_alloc, pith_copy_bytes_to_cstring, pith_cstring_empty, pith_layout, pith_strdup_string,
 };
 
 pub use concurrency::{
-    pith_mutex_lock, pith_mutex_new, pith_mutex_unlock, pith_semaphore_acquire,
-    pith_semaphore_new, pith_semaphore_release, pith_waitgroup_add, pith_waitgroup_done,
-    pith_waitgroup_new, pith_waitgroup_wait,
+    pith_mutex_lock, pith_mutex_new, pith_mutex_unlock, pith_semaphore_acquire, pith_semaphore_new,
+    pith_semaphore_release, pith_waitgroup_add, pith_waitgroup_done, pith_waitgroup_new,
+    pith_waitgroup_wait,
 };

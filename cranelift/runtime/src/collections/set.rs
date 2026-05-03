@@ -3,6 +3,7 @@
 //! Hybrid approach: Uses hashbrown::HashSet internally for O(1) operations,
 //! but presents FFI-compatible interface matching the C runtime.
 
+use crate::handle_registry::{self, HandleKind};
 use crate::string::{pith_string_release, PithString};
 use hashbrown::HashSet;
 use std::hash::{Hash, Hasher};
@@ -43,8 +44,6 @@ pub struct SetImpl {
     data: HashSet<SetElement>,
     /// Type tag for elements (0=int, 1=string)
     elem_type: ElemType,
-    /// Size of each element in bytes
-    elem_size: usize,
     /// Whether elements are heap types (need retain/release)
     elem_is_heap: bool,
 }
@@ -57,11 +56,10 @@ pub enum ElemType {
 }
 
 impl SetImpl {
-    fn new(elem_type: ElemType, elem_size: usize, elem_is_heap: bool) -> Self {
+    fn new(elem_type: ElemType, _elem_size: usize, elem_is_heap: bool) -> Self {
         SetImpl {
             data: HashSet::new(),
             elem_type,
-            elem_size,
             elem_is_heap,
         }
     }
@@ -91,6 +89,34 @@ impl SetImpl {
     }
 }
 
+unsafe fn set_ref<'a>(set: PithSet) -> Option<&'a SetImpl> {
+    if !handle_registry::is_valid(set.ptr as *const (), HandleKind::Set) {
+        return None;
+    }
+    Some(&*(set.ptr as *const SetImpl))
+}
+
+unsafe fn set_mut<'a>(set: PithSet) -> Option<&'a mut SetImpl> {
+    if !handle_registry::is_valid(set.ptr as *const (), HandleKind::Set) {
+        return None;
+    }
+    Some(&mut *(set.ptr as *mut SetImpl))
+}
+
+unsafe fn set_ref_from_handle<'a>(handle: i64) -> Option<&'a SetImpl> {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Set) {
+        return None;
+    }
+    Some(&*(handle as *const SetImpl))
+}
+
+unsafe fn set_mut_from_handle<'a>(handle: i64) -> Option<&'a mut SetImpl> {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Set) {
+        return None;
+    }
+    Some(&mut *(handle as *mut SetImpl))
+}
+
 /// Create a new empty set
 ///
 /// # Arguments
@@ -110,34 +136,29 @@ pub unsafe extern "C" fn pith_set_new(
 
     let set_impl = SetImpl::new(etype, elem_size as usize, elem_is_heap);
     let boxed = Box::new(set_impl);
+    let ptr = Box::into_raw(boxed) as *mut ();
+    handle_registry::register(ptr as *const (), HandleKind::Set);
 
-    PithSet {
-        ptr: Box::into_raw(boxed) as *mut (),
-    }
+    PithSet { ptr }
 }
 
 /// Get set length
 #[no_mangle]
 pub extern "C" fn pith_set_len(set: PithSet) -> i64 {
-    if set.ptr.is_null() {
-        return 0;
-    }
-
     unsafe {
-        let impl_ref = &*(set.ptr as *const SetImpl);
-        impl_ref.len() as i64
+        set_ref(set)
+            .map(|impl_ref| impl_ref.len() as i64)
+            .unwrap_or(0)
     }
 }
 
 /// Check if set contains integer element
 #[no_mangle]
 pub extern "C" fn pith_set_contains_int(set: PithSet, elem: i64) -> bool {
-    if set.ptr.is_null() {
-        return false;
-    }
-
     unsafe {
-        let impl_ref = &*(set.ptr as *const SetImpl);
+        let Some(impl_ref) = set_ref(set) else {
+            return false;
+        };
 
         if !matches!(impl_ref.elem_type, ElemType::Int) {
             return false;
@@ -152,11 +173,13 @@ pub extern "C" fn pith_set_contains_int(set: PithSet, elem: i64) -> bool {
 /// Returns true if element was present and removed
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_remove_int(set: *mut PithSet, elem: i64) -> bool {
-    if set.is_null() || (*set).ptr.is_null() {
+    if set.is_null() {
         return false;
     }
 
-    let impl_ref = &mut *((*set).ptr as *mut SetImpl);
+    let Some(impl_ref) = set_mut(*set) else {
+        return false;
+    };
 
     if !matches!(impl_ref.elem_type, ElemType::Int) {
         return false;
@@ -168,11 +191,13 @@ pub unsafe extern "C" fn pith_set_remove_int(set: *mut PithSet, elem: i64) -> bo
 /// Clear all elements from set
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_clear(set: *mut PithSet) {
-    if set.is_null() || (*set).ptr.is_null() {
+    if set.is_null() {
         return;
     }
 
-    let impl_ref = &mut *((*set).ptr as *mut SetImpl);
+    let Some(impl_ref) = set_mut(*set) else {
+        return;
+    };
 
     // Release all elements if they're heap types
     if impl_ref.elem_is_heap {
@@ -195,11 +220,9 @@ pub unsafe extern "C" fn pith_set_clear(set: *mut PithSet) {
 /// Release set and free memory
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_release(set: PithSet) {
-    if set.ptr.is_null() {
+    let Some(impl_ref) = set_mut(set) else {
         return;
-    }
-
-    let impl_ref = &mut *(set.ptr as *mut SetImpl);
+    };
 
     // Release all elements if they're heap types
     if impl_ref.elem_is_heap {
@@ -216,6 +239,7 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
     }
 
     // Free the set implementation
+    handle_registry::unregister(set.ptr as *const (), HandleKind::Set);
     let _ = Box::from_raw(set.ptr as *mut SetImpl);
 }
 
@@ -224,18 +248,14 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
 /// # Safety
 /// Returns a new list that must be released
 #[no_mangle]
-pub unsafe extern "C" fn pith_set_to_list_int(
-    set: PithSet,
-) -> crate::collections::list::PithList {
+pub unsafe extern "C" fn pith_set_to_list_int(set: PithSet) -> crate::collections::list::PithList {
     use crate::collections::list::{pith_list_new, pith_list_push, PithList};
 
-    if set.ptr.is_null() {
+    let Some(impl_ref) = set_ref(set) else {
         return PithList {
             ptr: std::ptr::null_mut(),
         };
-    }
-
-    let impl_ref = &*(set.ptr as *const SetImpl);
+    };
 
     if !matches!(impl_ref.elem_type, ElemType::Int) {
         return PithList {
@@ -264,15 +284,12 @@ pub unsafe extern "C" fn pith_set_to_list_string(
     set: PithSet,
 ) -> crate::collections::list::PithList {
     use crate::collections::list::{pith_list_new, pith_list_push_value, PithList};
-    use std::alloc::{alloc, Layout};
 
-    if set.ptr.is_null() {
+    let Some(impl_ref) = set_ref(set) else {
         return PithList {
             ptr: std::ptr::null_mut(),
         };
-    }
-
-    let impl_ref = &*(set.ptr as *const SetImpl);
+    };
 
     if !matches!(impl_ref.elem_type, ElemType::String) {
         return PithList {
@@ -284,14 +301,8 @@ pub unsafe extern "C" fn pith_set_to_list_string(
 
     for elem in impl_ref.iter() {
         if let SetElement::String(bytes) = elem {
-            let len = bytes.len();
-            let layout = Layout::from_size_align(len + 1, 1).unwrap();
-            let ptr = alloc(layout) as *mut i8;
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, len);
-                *ptr.add(len) = 0;
-                pith_list_push_value(list, ptr as i64);
-            }
+            let ptr = crate::pith_copy_bytes_to_cstring(bytes);
+            pith_list_push_value(list, ptr as i64);
         }
     }
 
@@ -303,7 +314,7 @@ pub unsafe extern "C" fn pith_set_to_list_string(
 /// Returns the raw `ListImpl` pointer as i64 to match the Cranelift collection ABI.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_to_list_cstr(set_handle: i64) -> i64 {
-    if set_handle == 0 {
+    if !handle_registry::is_valid(set_handle as *const (), HandleKind::Set) {
         let empty = crate::collections::list::pith_list_new(8, 0);
         return empty.ptr as i64;
     }
@@ -319,7 +330,7 @@ pub unsafe extern "C" fn pith_set_to_list_cstr(set_handle: i64) -> i64 {
 /// Returns the raw `ListImpl` pointer as i64 to match the Cranelift collection ABI.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_to_list_int_handle(set_handle: i64) -> i64 {
-    if set_handle == 0 {
+    if !handle_registry::is_valid(set_handle as *const (), HandleKind::Set) {
         let empty = crate::collections::list::pith_list_new(8, 0);
         return empty.ptr as i64;
     }
@@ -365,74 +376,94 @@ pub unsafe extern "C" fn pith_set_new_handle(elem_type: i32) -> i64 {
     };
     let set_impl = SetImpl::new(etype, 8, false);
     let boxed = Box::new(set_impl);
-    Box::into_raw(boxed) as i64
+    let ptr = Box::into_raw(boxed);
+    handle_registry::register(ptr as *const (), HandleKind::Set);
+    ptr as i64
 }
 
 /// Get set length (handle-based).
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_len_handle(set_handle: i64) -> i64 {
-    if set_handle == 0 {
-        return 0;
-    }
-    let impl_ref = &*(set_handle as *const SetImpl);
-    impl_ref.len() as i64
+    set_ref_from_handle(set_handle)
+        .map(|impl_ref| impl_ref.len() as i64)
+        .unwrap_or(0)
 }
 
 /// Insert a C-string element into the set. Returns 1 if newly inserted, 0 if already present.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_add_cstr(set_handle: i64, elem: *const i8) -> i64 {
-    if set_handle == 0 || elem.is_null() {
+    if elem.is_null() {
         return 0;
     }
-    let impl_ref = &mut *(set_handle as *mut SetImpl);
+    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
+        return 0;
+    };
     let set_elem = cstr_to_set_element(elem);
-    if impl_ref.insert(set_elem) { 1 } else { 0 }
+    if impl_ref.insert(set_elem) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Insert an integer element into the set. Returns 1 if newly inserted, 0 if already present.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_add_int_handle(set_handle: i64, elem: i64) -> i64 {
-    if set_handle == 0 {
+    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
         return 0;
-    }
-    let impl_ref = &mut *(set_handle as *mut SetImpl);
+    };
     if !matches!(impl_ref.elem_type, ElemType::Int) {
         return 0;
     }
-    if impl_ref.insert(SetElement::Int(elem)) { 1 } else { 0 }
+    if impl_ref.insert(SetElement::Int(elem)) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Check if a C-string element exists in the set. Returns 1 if present, 0 otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_contains_cstr(set_handle: i64, elem: *const i8) -> i64 {
-    if set_handle == 0 || elem.is_null() {
+    if elem.is_null() {
         return 0;
     }
-    let impl_ref = &*(set_handle as *const SetImpl);
+    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
+        return 0;
+    };
     let set_elem = cstr_to_set_element(elem);
-    if impl_ref.contains(&set_elem) { 1 } else { 0 }
+    if impl_ref.contains(&set_elem) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Check if an integer element exists in the set. Returns 1 if present, 0 otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_contains_int_handle(set_handle: i64, elem: i64) -> i64 {
-    if set_handle == 0 {
+    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
         return 0;
-    }
-    let impl_ref = &*(set_handle as *const SetImpl);
+    };
     if !matches!(impl_ref.elem_type, ElemType::Int) {
         return 0;
     }
-    if impl_ref.contains(&SetElement::Int(elem)) { 1 } else { 0 }
+    if impl_ref.contains(&SetElement::Int(elem)) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Remove a C-string element from the set.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_remove_cstr(set_handle: i64, elem: *const i8) {
-    if set_handle == 0 || elem.is_null() {
+    if elem.is_null() {
         return;
     }
-    let impl_ref = &mut *(set_handle as *mut SetImpl);
+    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
+        return;
+    };
     let set_elem = cstr_to_set_element(elem);
     impl_ref.remove(&set_elem);
 }
@@ -440,10 +471,9 @@ pub unsafe extern "C" fn pith_set_remove_cstr(set_handle: i64, elem: *const i8) 
 /// Remove an integer element from the set.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_remove_int_handle(set_handle: i64, elem: i64) {
-    if set_handle == 0 {
+    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
         return;
-    }
-    let impl_ref = &mut *(set_handle as *mut SetImpl);
+    };
     if !matches!(impl_ref.elem_type, ElemType::Int) {
         return;
     }
@@ -453,21 +483,23 @@ pub unsafe extern "C" fn pith_set_remove_int_handle(set_handle: i64, elem: i64) 
 /// Clear all elements from set (handle-based).
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_clear_handle(set_handle: i64) {
-    if set_handle == 0 {
+    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
         return;
-    }
-    let impl_ref = &mut *(set_handle as *mut SetImpl);
+    };
     impl_ref.clear();
 }
 
 /// Check if set is empty (handle-based). Returns 1 if empty, 0 otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_is_empty_handle(set_handle: i64) -> i64 {
-    if set_handle == 0 {
+    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
         return 1;
+    };
+    if impl_ref.len() == 0 {
+        1
+    } else {
+        0
     }
-    let impl_ref = &*(set_handle as *const SetImpl);
-    if impl_ref.len() == 0 { 1 } else { 0 }
 }
 
 /// Destructor for set elements in collections
@@ -482,5 +514,45 @@ pub extern "C" fn pith_set_destructor(ptr: *mut u8) {
     unsafe {
         let set = ptr as *const PithSet;
         pith_set_release(*set);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bogus_set() -> PithSet {
+        PithSet {
+            ptr: 12345usize as *mut (),
+        }
+    }
+
+    #[test]
+    fn invalid_set_handles_return_safe_defaults() {
+        unsafe {
+            let mut set = bogus_set();
+            assert_eq!(pith_set_len(bogus_set()), 0);
+            assert!(!pith_set_contains_int(bogus_set(), 7));
+            assert_eq!(pith_set_len_handle(12345), 0);
+            assert_eq!(pith_set_contains_int_handle(12345, 7), 0);
+            assert_eq!(pith_set_is_empty_handle(12345), 1);
+            pith_set_clear(&mut set);
+            pith_set_clear_handle(12345);
+            pith_set_release(bogus_set());
+        }
+    }
+
+    #[test]
+    fn released_set_handles_are_rejected() {
+        unsafe {
+            let set = pith_set_new(0, 8, false);
+            let handle = set.ptr as i64;
+            assert_eq!(pith_set_len(set), 0);
+            pith_set_release(set);
+            assert_eq!(pith_set_len(set), 0);
+            assert_eq!(pith_set_len_handle(handle), 0);
+            assert_eq!(pith_set_is_empty_handle(handle), 1);
+            pith_set_release(set);
+        }
     }
 }

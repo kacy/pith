@@ -204,6 +204,95 @@ fn inline_bytes_get(builder: &mut FunctionBuilder<'_>, bytes: Value, index: Valu
     builder.block_params(done)[0]
 }
 
+fn runtime_func_ref(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, cranelift::codegen::ir::FuncRef>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    name: &str,
+) -> Result<cranelift::codegen::ir::FuncRef, CompileError> {
+    let fid = runtime_funcs.get(name).copied().ok_or_else(|| {
+        CompileError::ModuleError(format!("IR consumer: missing runtime function '{name}'"))
+    })?;
+    Ok(*func_ref_cache
+        .entry(fid)
+        .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func)))
+}
+
+fn emit_runtime_error_value(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, cranelift::codegen::ir::FuncRef>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    code: i64,
+) -> Result<Value, CompileError> {
+    let error_ref = runtime_func_ref(
+        codegen,
+        builder,
+        func_ref_cache,
+        runtime_funcs,
+        "pith_runtime_error",
+    )?;
+    let code_value = builder.ins().iconst(types::I64, code);
+    let call = builder.ins().call(error_ref, &[code_value]);
+    Ok(builder.func.dfg.first_result(call))
+}
+
+fn emit_checked_int_div_or_mod(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, cranelift::codegen::ir::FuncRef>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    op: &str,
+    a: Value,
+    b: Value,
+) -> Result<Value, CompileError> {
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+
+    let zero_divisor = builder.ins().icmp_imm(IntCC::Equal, b, 0);
+    let zero_error = builder.create_block();
+    let after_zero_check = builder.create_block();
+    builder
+        .ins()
+        .brif(zero_divisor, zero_error, &[], after_zero_check, &[]);
+
+    builder.switch_to_block(zero_error);
+    let zero_result = emit_runtime_error_value(codegen, builder, func_ref_cache, runtime_funcs, 1)?;
+    jump_with_i64_arg(builder, done, zero_result);
+
+    builder.switch_to_block(after_zero_check);
+    let min_int = builder.ins().iconst(types::I64, i64::MIN);
+    let is_min_int = builder.ins().icmp(IntCC::Equal, a, min_int);
+    let is_minus_one = builder.ins().icmp_imm(IntCC::Equal, b, -1);
+    let overflows = builder.ins().band(is_min_int, is_minus_one);
+    let overflow_error = builder.create_block();
+    let calculate = builder.create_block();
+    builder
+        .ins()
+        .brif(overflows, overflow_error, &[], calculate, &[]);
+
+    builder.switch_to_block(overflow_error);
+    let overflow_result =
+        emit_runtime_error_value(codegen, builder, func_ref_cache, runtime_funcs, 2)?;
+    jump_with_i64_arg(builder, done, overflow_result);
+
+    builder.switch_to_block(calculate);
+    let value = match op {
+        "div" => builder.ins().sdiv(a, b),
+        "mod" => builder.ins().srem(a, b),
+        _ => {
+            return Err(CompileError::ModuleError(format!(
+                "IR consumer: unsupported checked integer op '{op}'"
+            )))
+        }
+    };
+    jump_with_i64_arg(builder, done, value);
+
+    builder.switch_to_block(done);
+    Ok(builder.block_params(done)[0])
+}
+
 /// Compile IR text to native code via Cranelift
 pub fn compile_from_ir(
     codegen: &mut CodeGen,
@@ -666,7 +755,7 @@ fn compile_ir_function(
 
         match parts[0] {
             "iconst" if parts.len() >= 3 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
+                let reg = parse_reg(parts[1], line, func_name)?;
                 let s = parts[2];
                 let val: i64 = if s.starts_with("0x") || s.starts_with("0X") {
                     i64::from_str_radix(&s[2..], 16).unwrap_or(0)
@@ -687,7 +776,7 @@ fn compile_ir_function(
             }
 
             "fconst" if parts.len() >= 3 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
+                let reg = parse_reg(parts[1], line, func_name)?;
                 let fval: f64 = parts[2].parse().unwrap_or(0.0);
                 let fv = builder.ins().f64const(fval);
                 let v =
@@ -703,7 +792,7 @@ fn compile_ir_function(
             }
 
             "strref" if parts.len() >= 3 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
+                let reg = parse_reg(parts[1], line, func_name)?;
                 let str_idx = parts[2].to_string();
                 if let Some(&sf_id) = string_funcs.get(&str_idx) {
                     let sf_ref = codegen.module.declare_func_in_func(sf_id, builder.func);
@@ -721,16 +810,21 @@ fn compile_ir_function(
             }
 
             "band" | "bor" | "bxor" | "shl" | "shr" if parts.len() >= 4 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
-                let a = get_reg(&regs, parts[2]);
-                let b = get_reg(&regs, parts[3]);
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let a = get_reg(&regs, parts[2])?;
+                let b = get_reg(&regs, parts[3])?;
                 let v = match parts[0] {
                     "band" => builder.ins().band(a, b),
                     "bor" => builder.ins().bor(a, b),
                     "bxor" => builder.ins().bxor(a, b),
                     "shl" => builder.ins().ishl(a, b),
                     "shr" => builder.ins().ushr(a, b),
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(CompileError::ModuleError(format!(
+                            "IR consumer: unsupported bitwise instruction in {}: {}",
+                            func_name, line
+                        )))
+                    }
                 };
                 regs.insert(reg, v);
                 reg_source_vars.remove(&reg);
@@ -741,8 +835,8 @@ fn compile_ir_function(
             }
 
             "bnot" if parts.len() >= 3 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
-                let a = get_reg(&regs, parts[2]);
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let a = get_reg(&regs, parts[2])?;
                 let v = builder.ins().bnot(a);
                 regs.insert(reg, v);
                 reg_source_vars.remove(&reg);
@@ -753,13 +847,18 @@ fn compile_ir_function(
             }
 
             "and" | "or" if parts.len() >= 4 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
-                let a = get_reg(&regs, parts[2]);
-                let b = get_reg(&regs, parts[3]);
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let a = get_reg(&regs, parts[2])?;
+                let b = get_reg(&regs, parts[3])?;
                 let v = match parts[0] {
                     "and" => builder.ins().band(a, b),
                     "or" => builder.ins().bor(a, b),
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(CompileError::ModuleError(format!(
+                            "IR consumer: unsupported boolean instruction in {}: {}",
+                            func_name, line
+                        )))
+                    }
                 };
                 regs.insert(reg, v);
                 reg_source_vars.remove(&reg);
@@ -770,9 +869,9 @@ fn compile_ir_function(
             }
 
             "fadd" | "fsub" | "fmul" | "fdiv" if parts.len() >= 4 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
-                let a = get_reg(&regs, parts[2]);
-                let b = get_reg(&regs, parts[3]);
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let a = get_reg(&regs, parts[2])?;
+                let b = get_reg(&regs, parts[3])?;
                 // Bitcast i64 → f64
                 let fa =
                     builder
@@ -787,7 +886,12 @@ fn compile_ir_function(
                     "fsub" => builder.ins().fsub(fa, fb),
                     "fmul" => builder.ins().fmul(fa, fb),
                     "fdiv" => builder.ins().fdiv(fa, fb),
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(CompileError::ModuleError(format!(
+                            "IR consumer: unsupported float instruction in {}: {}",
+                            func_name, line
+                        )))
+                    }
                 };
                 // Bitcast f64 → i64
                 let v =
@@ -803,11 +907,11 @@ fn compile_ir_function(
             }
 
             "add" | "sub" | "mul" | "div" | "mod" if parts.len() >= 4 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
+                let reg = parse_reg(parts[1], line, func_name)?;
                 let a_reg = parts[2].parse::<usize>().ok();
                 let b_reg = parts[3].parse::<usize>().ok();
-                let a = get_reg(&regs, parts[2]);
-                let b = get_reg(&regs, parts[3]);
+                let a = get_reg(&regs, parts[2])?;
+                let b = get_reg(&regs, parts[3])?;
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 // If `add` has a string operand, treat as concat (IR emitter
@@ -853,7 +957,12 @@ fn compile_ir_function(
                         "sub" => builder.ins().fsub(fa, fb),
                         "mul" => builder.ins().fmul(fa, fb),
                         "div" => builder.ins().fdiv(fa, fb),
-                        _ => unreachable!(),
+                        _ => {
+                            return Err(CompileError::ModuleError(format!(
+                                "IR consumer: unsupported float-promoted instruction in {}: {}",
+                                func_name, line
+                            )))
+                        }
                     };
                     let v = builder.ins().bitcast(
                         types::I64,
@@ -869,9 +978,21 @@ fn compile_ir_function(
                         "add" => builder.ins().iadd(a, b),
                         "sub" => builder.ins().isub(a, b),
                         "mul" => builder.ins().imul(a, b),
-                        "div" => builder.ins().sdiv(a, b),
-                        "mod" => builder.ins().srem(a, b),
-                        _ => unreachable!(),
+                        "div" | "mod" => emit_checked_int_div_or_mod(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            parts[0],
+                            a,
+                            b,
+                        )?,
+                        _ => {
+                            return Err(CompileError::ModuleError(format!(
+                                "IR consumer: unsupported arithmetic instruction in {}: {}",
+                                func_name, line
+                            )))
+                        }
                     };
                     regs.insert(reg, v);
                     string_regs.remove(&reg);
@@ -881,11 +1002,11 @@ fn compile_ir_function(
             }
 
             "eq" | "neq" | "lt" | "gt" | "lte" | "gte" if parts.len() >= 4 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
+                let reg = parse_reg(parts[1], line, func_name)?;
                 let a_reg = parts[2].parse::<usize>().ok();
                 let b_reg = parts[3].parse::<usize>().ok();
-                let a = get_reg(&regs, parts[2]);
-                let b = get_reg(&regs, parts[3]);
+                let a = get_reg(&regs, parts[2])?;
+                let b = get_reg(&regs, parts[3])?;
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 // For lt/gt/lte/gte on strings, call runtime comparison
@@ -957,9 +1078,9 @@ fn compile_ir_function(
             }
 
             "concat" if parts.len() >= 4 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
-                let a = get_reg(&regs, parts[2]);
-                let b = get_reg(&regs, parts[3]);
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let a = get_reg(&regs, parts[2])?;
+                let b = get_reg(&regs, parts[3])?;
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 if let Some(&concat_id) = runtime_funcs.get("pith_concat_cstr") {
@@ -982,7 +1103,7 @@ fn compile_ir_function(
             }
 
             "call" if parts.len() >= 4 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
+                let reg = parse_reg(parts[1], line, func_name)?;
                 let (mut fname, retkind, nargs, arg_start) =
                     parse_call_shape(&parts).ok_or_else(|| {
                         CompileError::ModuleError(format!(
@@ -999,7 +1120,7 @@ fn compile_ir_function(
                     let mut args: Vec<Value> = Vec::new();
                     for j in 0..nargs {
                         if j + arg_start < parts.len() {
-                            args.push(get_reg(&regs, parts[j + arg_start]));
+                            args.push(get_reg(&regs, parts[j + arg_start])?);
                         }
                     }
                     // Allocate struct
@@ -1051,7 +1172,7 @@ fn compile_ir_function(
                     let mut args: Vec<Value> = Vec::new();
                     for j in 0..nargs {
                         if j + arg_start < parts.len() {
-                            args.push(get_reg(&regs, parts[j + arg_start]));
+                            args.push(get_reg(&regs, parts[j + arg_start])?);
                         }
                     }
                     if fname == "bytes_get" && args.len() == 2 {
@@ -1063,8 +1184,7 @@ fn compile_ir_function(
                         struct_regs.remove(&reg);
                         continue;
                     }
-                    if (fname == "pith_list_get_value"
-                        || fname == "pith_list_get_value_unchecked")
+                    if (fname == "pith_list_get_value" || fname == "pith_list_get_value_unchecked")
                         && args.len() == 2
                     {
                         let inlined = inline_list_get_value(
@@ -1207,7 +1327,7 @@ fn compile_ir_function(
 
             "store" if parts.len() >= 3 => {
                 let name = parts[1].to_string();
-                let val = get_reg(&regs, parts[2]);
+                let val = get_reg(&regs, parts[2])?;
                 // Propagate types through store
                 if let Ok(src_reg) = parts[2].parse::<usize>() {
                     if let Some(struct_name) = struct_regs.get(&src_reg) {
@@ -1254,7 +1374,7 @@ fn compile_ir_function(
             }
 
             "load" if parts.len() >= 3 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
+                let reg = parse_reg(parts[1], line, func_name)?;
                 let name = parts[2];
                 reg_source_vars.insert(reg, name.to_string());
                 if let Some(struct_name) = struct_vars.get(name) {
@@ -1305,8 +1425,8 @@ fn compile_ir_function(
             }
 
             "field" if parts.len() >= 4 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
-                let obj = get_reg(&regs, parts[2]);
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let obj = get_reg(&regs, parts[2])?;
                 let (offset, field_retkind) = if parts.len() >= 6 && parts[3].parse::<i32>().is_ok()
                 {
                     (parts[3].parse::<i32>().unwrap_or(0), Some(parts[4]))
@@ -1364,7 +1484,7 @@ fn compile_ir_function(
             }
 
             "funcref" if parts.len() >= 3 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
+                let reg = parse_reg(parts[1], line, func_name)?;
                 let fname = parts[2];
                 if let Some(&fid) = declared_funcs.get(fname) {
                     let fref = *func_ref_cache
@@ -1386,7 +1506,7 @@ fn compile_ir_function(
             }
 
             "closure_ref" if parts.len() >= 3 => {
-                let reg: usize = parts[1].parse().unwrap_or(0);
+                let reg = parse_reg(parts[1], line, func_name)?;
                 let fname = parts[2];
                 if let Some(&fid) = declared_funcs.get(fname) {
                     let fref = *func_ref_cache
@@ -1420,9 +1540,14 @@ fn compile_ir_function(
 
             "sstore" if parts.len() >= 4 => {
                 // Store field in struct: sstore struct_reg field_idx value_reg
-                let struct_val = get_reg(&regs, parts[1]);
-                let field_idx: i32 = parts[2].parse().unwrap_or(0);
-                let val = get_reg(&regs, parts[3]);
+                let struct_val = get_reg(&regs, parts[1])?;
+                let field_idx: i32 = parts[2].parse().map_err(|_| {
+                    CompileError::ModuleError(format!(
+                        "ir consumer: invalid struct field index in {}: {}",
+                        func_name, line
+                    ))
+                })?;
+                let val = get_reg(&regs, parts[3])?;
                 let offset = field_idx * 8;
                 builder.ins().store(
                     cranelift::codegen::ir::MemFlags::new(),
@@ -1437,19 +1562,19 @@ fn compile_ir_function(
                     let zero = builder.ins().iconst(types::I64, 0);
                     builder.ins().return_(&[zero]);
                 } else {
-                    let val = get_reg(&regs, parts[1]);
+                    let val = get_reg(&regs, parts[1])?;
                     builder.ins().return_(&[val]);
                 }
                 terminated = true;
             }
 
             "brif" if parts.len() >= 4 => {
-                let cond = get_reg(&regs, parts[1]);
+                let cond = get_reg(&regs, parts[1])?;
                 let then_label = parts[2];
                 let else_label = parts[3];
                 let cond_bool = builder.ins().icmp_imm(IntCC::NotEqual, cond, 0);
-                let then_block = labels.get(then_label).copied().unwrap_or(entry_block);
-                let else_block = labels.get(else_label).copied().unwrap_or(entry_block);
+                let then_block = get_label(&labels, then_label, func_name)?;
+                let else_block = get_label(&labels, else_label, func_name)?;
                 builder
                     .ins()
                     .brif(cond_bool, then_block, &[], else_block, &[]);
@@ -1463,7 +1588,7 @@ fn compile_ir_function(
                     .get(target)
                     .map(|s| s.as_str())
                     .unwrap_or(target);
-                let block = labels.get(actual_target).copied().unwrap_or(entry_block);
+                let block = get_label(&labels, actual_target, func_name)?;
                 builder.ins().jump(block, &[]);
                 terminated = true;
             }
@@ -1477,8 +1602,13 @@ fn compile_ir_function(
                 terminated = false;
             }
 
+            _ if parts[0].starts_with('#') || parts[0].starts_with("//") => {}
+
             _ => {
-                // Skip unknown instructions (comments, etc.)
+                return Err(CompileError::ModuleError(format!(
+                    "ir consumer: unknown or malformed instruction in {}: {}",
+                    func_name, line
+                )));
             }
         }
     }
@@ -1521,6 +1651,15 @@ fn parse_call_shape<'a>(parts: &'a [&'a str]) -> Option<(&'a str, &'a str, usize
     Some((fname, parts[3], nargs, 5))
 }
 
+fn parse_reg(s: &str, instruction: &str, func_name: &str) -> Result<usize, CompileError> {
+    s.parse::<usize>().map_err(|_| {
+        CompileError::ModuleError(format!(
+            "IR consumer: invalid destination register '{}' in {}: {}",
+            s, func_name, instruction
+        ))
+    })
+}
+
 fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
     if let Some(name) = retkind.strip_prefix("struct:") {
         return Some(name);
@@ -1528,13 +1667,26 @@ fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
     None
 }
 
-fn get_reg(regs: &HashMap<usize, Value>, s: &str) -> Value {
-    let reg: usize = s
-        .parse()
-        .unwrap_or_else(|_| panic!("IR consumer: invalid register reference '{}'", s));
+fn get_reg(regs: &HashMap<usize, Value>, s: &str) -> Result<Value, CompileError> {
+    let reg = s.parse::<usize>().map_err(|_| {
+        CompileError::ModuleError(format!("IR consumer: invalid register reference '{}'", s))
+    })?;
     regs.get(&reg)
         .copied()
-        .unwrap_or_else(|| panic!("IR consumer: missing register {}", reg))
+        .ok_or_else(|| CompileError::ModuleError(format!("IR consumer: missing register {}", reg)))
+}
+
+fn get_label(
+    labels: &HashMap<String, Block>,
+    name: &str,
+    func_name: &str,
+) -> Result<Block, CompileError> {
+    labels.get(name).copied().ok_or_else(|| {
+        CompileError::ModuleError(format!(
+            "IR consumer: unknown label '{}' in {}",
+            name, func_name
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -1564,5 +1716,56 @@ mod tests {
         assert_eq!(explicit_struct_name_from_retkind("Token"), None);
         assert_eq!(explicit_struct_name_from_retkind("string"), None);
         assert_eq!(explicit_struct_name_from_retkind("unknown"), None);
+    }
+
+    fn compile_err_for_ir(ir: &str) -> String {
+        let mut codegen = crate::create_codegen().expect("create codegen");
+        let runtime_funcs = HashMap::new();
+        let result = compile_from_ir(&mut codegen, ir, &runtime_funcs);
+        assert!(result.is_err(), "expected malformed IR to fail");
+        result.err().expect("compile error").to_string()
+    }
+
+    #[test]
+    fn invalid_register_reference_returns_compile_error() {
+        let err = compile_err_for_ir("func main 0 int\niconst 1 1\nadd 2 nope 1\nendfunc\n");
+        assert!(err.contains("invalid register reference 'nope'"));
+    }
+
+    #[test]
+    fn missing_register_reference_returns_compile_error() {
+        let err = compile_err_for_ir("func main 0 int\niconst 1 1\nadd 2 1 99\nendfunc\n");
+        assert!(err.contains("missing register 99"));
+    }
+
+    #[test]
+    fn invalid_destination_register_returns_compile_error() {
+        let err = compile_err_for_ir("func main 0 int\niconst nope 1\nendfunc\n");
+        assert!(err.contains("invalid destination register 'nope'"));
+    }
+
+    #[test]
+    fn unknown_instruction_returns_compile_error() {
+        let err = compile_err_for_ir("func main 0 int\nsurprise 1 2 3\nendfunc\n");
+        assert!(err.contains("unknown or malformed instruction"));
+    }
+
+    #[test]
+    fn malformed_store_returns_compile_error() {
+        let err = compile_err_for_ir("func main 0 int\niconst 17 1\nstore  17\nendfunc\n");
+        assert!(err.contains("unknown or malformed instruction"));
+    }
+
+    #[test]
+    fn unknown_branch_label_returns_compile_error() {
+        let err =
+            compile_err_for_ir("func main 0 int\niconst 1 1\nbrif 1 then_l else_l\nendfunc\n");
+        assert!(err.contains("unknown label 'then_l'"));
+    }
+
+    #[test]
+    fn unknown_jump_label_returns_compile_error() {
+        let err = compile_err_for_ir("func main 0 int\njmp missing_l\nendfunc\n");
+        assert!(err.contains("unknown label 'missing_l'"));
     }
 }

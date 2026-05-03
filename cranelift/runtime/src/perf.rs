@@ -83,7 +83,10 @@ pub fn dump_perf_stats() {
     eprintln!("pith perf stats");
     eprintln!("  rc allocs: {}", PERF_RC_ALLOCS.load(Ordering::Relaxed));
     eprintln!("  rc retains: {}", PERF_RC_RETAINS.load(Ordering::Relaxed));
-    eprintln!("  rc releases: {}", PERF_RC_RELEASES.load(Ordering::Relaxed));
+    eprintln!(
+        "  rc releases: {}",
+        PERF_RC_RELEASES.load(Ordering::Relaxed)
+    );
     eprintln!(
         "  string allocs: {} bytes={}",
         PERF_STRING_ALLOCS.load(Ordering::Relaxed),

@@ -3,6 +3,7 @@
 //! Hybrid approach: Uses idiomatic Rust Vec internally for all operations,
 //! but presents FFI-compatible interface matching the C runtime.
 
+use crate::handle_registry::{self, HandleKind};
 use crate::string::{pith_string_release, pith_string_retain, PithString};
 /// FFI-compatible list handle
 #[repr(C)]
@@ -202,6 +203,34 @@ impl ListImpl {
     }
 }
 
+unsafe fn list_ref<'a>(list: PithList) -> Option<&'a ListImpl> {
+    if !handle_registry::is_valid(list.ptr as *const (), HandleKind::List) {
+        return None;
+    }
+    Some(&*(list.ptr as *const ListImpl))
+}
+
+unsafe fn list_mut<'a>(list: PithList) -> Option<&'a mut ListImpl> {
+    if !handle_registry::is_valid(list.ptr as *const (), HandleKind::List) {
+        return None;
+    }
+    Some(&mut *(list.ptr as *mut ListImpl))
+}
+
+pub(crate) unsafe fn list_ref_from_handle<'a>(handle: i64) -> Option<&'a ListImpl> {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::List) {
+        return None;
+    }
+    Some(&*(handle as *const ListImpl))
+}
+
+pub(crate) unsafe fn list_mut_from_handle<'a>(handle: i64) -> Option<&'a mut ListImpl> {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::List) {
+        return None;
+    }
+    Some(&mut *(handle as *mut ListImpl))
+}
+
 /// Create a new empty list
 ///
 /// # Arguments
@@ -224,34 +253,25 @@ pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithLis
 
     let list_impl = ListImpl::new(elem_size as usize, tag);
     let boxed = Box::new(list_impl);
+    let ptr = Box::into_raw(boxed) as *mut ();
+    handle_registry::register(ptr as *const (), HandleKind::List);
 
-    PithList {
-        ptr: Box::into_raw(boxed) as *mut (),
-    }
+    PithList { ptr }
 }
 
 /// Get list length
 #[no_mangle]
 pub extern "C" fn pith_list_len(list: PithList) -> i64 {
-    if list.ptr.is_null() {
-        return 0;
-    }
-
     unsafe {
-        let impl_ref = &*(list.ptr as *const ListImpl);
-        impl_ref.len() as i64
+        list_ref(list)
+            .map(|impl_ref| impl_ref.len() as i64)
+            .unwrap_or(0)
     }
 }
 
 /// Check if a raw pointer looks like a ListImpl (has the magic number)
 pub fn is_list_ptr(ptr: *const ()) -> bool {
-    if ptr.is_null() {
-        return false;
-    }
-    unsafe {
-        let magic = *(ptr as *const u32);
-        magic == LIST_MAGIC
-    }
+    handle_registry::is_valid(ptr, HandleKind::List)
 }
 
 /// Auto-detect len: works on both lists and C strings
@@ -264,7 +284,9 @@ pub extern "C" fn pith_auto_len(ptr: i64) -> i64 {
     }
     let raw = ptr as *const ();
     if is_list_ptr(raw) {
-        let list = PithList { ptr: raw as *mut () };
+        let list = PithList {
+            ptr: raw as *mut (),
+        };
         pith_list_len(list)
     } else {
         crate::string::pith_cstring_len(ptr as *const i8)
@@ -277,11 +299,13 @@ pub extern "C" fn pith_auto_len(ptr: i64) -> i64 {
 /// * `elem` must point to valid data of size `elem_size`
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_push(list: *mut PithList, elem: *const u8, elem_size: i64) {
-    if list.is_null() || (*list).ptr.is_null() || elem.is_null() {
+    if list.is_null() || elem.is_null() {
         return;
     }
 
-    let impl_ref = &mut *((*list).ptr as *mut ListImpl);
+    let Some(impl_ref) = list_mut(*list) else {
+        return;
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_LIST_PUSHES, 1);
 
@@ -307,11 +331,9 @@ pub unsafe extern "C" fn pith_list_push(list: *mut PithList, elem: *const u8, el
 /// This is a simpler ABI used by generated method calls.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_push_value(list: PithList, value: i64) {
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_mut(list) else {
         return;
-    }
-
-    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_LIST_PUSHES, 1);
     impl_ref.push_value(value);
@@ -320,10 +342,9 @@ pub unsafe extern "C" fn pith_list_push_value(list: PithList, value: i64) {
 /// Set element at index (value-based API, stores i64).
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_set_value(list: PithList, index: i64, value: i64) {
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_mut(list) else {
         return;
-    }
-    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_LIST_SETS, 1);
     let idx = index as usize;
@@ -337,19 +358,11 @@ pub unsafe extern "C" fn pith_list_set_value(list: PithList, index: i64, value: 
 /// Returns a newly allocated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_join(list: PithList, sep: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_ref(list) else {
         return std::ptr::null_mut();
-    }
-
-    let impl_ref = &*(list.ptr as *const ListImpl);
+    };
     if impl_ref.len() == 0 {
-        let ptr = alloc(Layout::from_size_align(1, 1).unwrap()) as *mut i8;
-        if !ptr.is_null() {
-            *ptr = 0;
-        }
-        return ptr;
+        return crate::pith_cstring_empty();
     }
 
     let sep_len = if sep.is_null() {
@@ -373,10 +386,7 @@ pub unsafe extern "C" fn pith_list_join(list: PithList, sep: *const i8) -> *mut 
         i += 1;
     }
 
-    let out = alloc(Layout::from_size_align(total_len + 1, 1).unwrap()) as *mut i8;
-    if out.is_null() {
-        return std::ptr::null_mut();
-    }
+    let out = crate::pith_alloc(crate::pith_layout(total_len + 1, 1)) as *mut i8;
 
     let mut write = 0usize;
     let mut i = 0usize;
@@ -404,16 +414,14 @@ pub unsafe extern "C" fn pith_list_join(list: PithList, sep: *const i8) -> *mut 
 ///
 /// Returns true if successful, false if list is empty
 #[no_mangle]
-pub unsafe extern "C" fn pith_list_pop(
-    list: *mut PithList,
-    elem_size: i64,
-    out: *mut u8,
-) -> bool {
-    if list.is_null() || (*list).ptr.is_null() || out.is_null() {
+pub unsafe extern "C" fn pith_list_pop(list: *mut PithList, elem_size: i64, out: *mut u8) -> bool {
+    if list.is_null() || out.is_null() {
         return false;
     }
 
-    let impl_ref = &mut *((*list).ptr as *mut ListImpl);
+    let Some(impl_ref) = list_mut(*list) else {
+        return false;
+    };
 
     if impl_ref.elem_size != elem_size as usize {
         eprintln!("pith: list element size mismatch");
@@ -441,11 +449,9 @@ pub unsafe extern "C" fn pith_list_pop(
 /// Returns 0 if out of bounds or on error
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_get_value(list: PithList, index: i64) -> i64 {
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_ref(list) else {
         return 0;
-    }
-
-    let impl_ref = &*(list.ptr as *const ListImpl);
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_LIST_GETS, 1);
     crate::perf_count(&crate::PERF_LIST_GET_VALUE_CALLS, 1);
@@ -468,11 +474,13 @@ pub unsafe extern "C" fn pith_list_get_value(list: PithList, index: i64) -> i64 
 /// This is used only in compiler-generated loops that already guard the index.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_get_value_unchecked(list: PithList, index: i64) -> i64 {
-    if list.ptr.is_null() || index < 0 {
+    if index < 0 {
         return 0;
     }
 
-    let impl_ref = &*(list.ptr as *const ListImpl);
+    let Some(impl_ref) = list_ref(list) else {
+        return 0;
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_LIST_GETS, 1);
     crate::perf_count(&crate::PERF_LIST_GET_VALUE_CALLS, 1);
@@ -480,6 +488,9 @@ pub unsafe extern "C" fn pith_list_get_value_unchecked(list: PithList, index: i6
 
     if impl_ref.elem_size != 8 {
         crate::perf_count(&crate::PERF_LIST_GET_ELEM_OTHER, 1);
+        return 0;
+    }
+    if index >= impl_ref.len() as i64 {
         return 0;
     }
 
@@ -497,11 +508,13 @@ pub unsafe extern "C" fn pith_list_get(
     elem_size: i64,
     out: *mut u8,
 ) -> bool {
-    if list.ptr.is_null() || out.is_null() {
+    if out.is_null() {
         return false;
     }
 
-    let impl_ref = &*(list.ptr as *const ListImpl);
+    let Some(impl_ref) = list_ref(list) else {
+        return false;
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_LIST_GETS, 1);
     crate::perf_count(&crate::PERF_LIST_GET_BYTES_CALLS, 1);
@@ -524,9 +537,10 @@ pub unsafe extern "C" fn pith_list_get(
         Some(value) => {
             if elem_size == 8 {
                 std::ptr::copy_nonoverlapping(value.to_ne_bytes().as_ptr(), out, 8);
-            } else {
-                let elem_data = impl_ref.elements.get(index as usize).unwrap();
+            } else if let Some(elem_data) = impl_ref.elements.get(index as usize) {
                 std::ptr::copy_nonoverlapping(elem_data.as_ptr(), out, elem_data.len());
+            } else {
+                return false;
             }
 
             // Retain string elements (caller gets a reference)
@@ -551,11 +565,13 @@ pub unsafe extern "C" fn pith_list_set(
     elem: *const u8,
     elem_size: i64,
 ) -> bool {
-    if list.ptr.is_null() || elem.is_null() {
+    if elem.is_null() {
         return false;
     }
 
-    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    let Some(impl_ref) = list_mut(list) else {
+        return false;
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_LIST_SETS, 1);
 
@@ -570,8 +586,9 @@ pub unsafe extern "C" fn pith_list_set(
 
     // Release old element if it's a heap type
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let old_s = impl_ref.get_value(index as usize).unwrap() as *const PithString;
-        pith_string_release(*old_s);
+        if let Some(old_s) = impl_ref.get_value(index as usize) {
+            pith_string_release(*(old_s as *const PithString));
+        }
     }
 
     // Copy new element
@@ -591,16 +608,14 @@ pub unsafe extern "C" fn pith_list_set(
 ///
 /// Returns true if successful
 #[no_mangle]
-pub unsafe extern "C" fn pith_list_remove(
-    list: *mut PithList,
-    index: i64,
-    elem_size: i64,
-) -> bool {
-    if list.is_null() || (*list).ptr.is_null() {
+pub unsafe extern "C" fn pith_list_remove(list: *mut PithList, index: i64, elem_size: i64) -> bool {
+    if list.is_null() {
         return false;
     }
 
-    let impl_ref = &mut *((*list).ptr as *mut ListImpl);
+    let Some(impl_ref) = list_mut(*list) else {
+        return false;
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_LIST_REMOVES, 1);
 
@@ -615,8 +630,9 @@ pub unsafe extern "C" fn pith_list_remove(
 
     // Release element before removal
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let s = impl_ref.get_value(index as usize).unwrap() as *const PithString;
-        pith_string_release(*s);
+        if let Some(s) = impl_ref.get_value(index as usize) {
+            pith_string_release(*(s as *const PithString));
+        }
     }
 
     impl_ref.remove(index as usize);
@@ -626,13 +642,11 @@ pub unsafe extern "C" fn pith_list_remove(
 /// Remove element at index (by-value variant — works with internal pointer)
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_remove_value(list: PithList, index: i64) -> i64 {
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_mut(list) else {
         return 0;
-    }
+    };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_LIST_REMOVES, 1);
-
-    let impl_ref = &mut *(list.ptr as *mut ListImpl);
 
     if index < 0 || index >= impl_ref.len() as i64 {
         return 0;
@@ -640,8 +654,9 @@ pub unsafe extern "C" fn pith_list_remove_value(list: PithList, index: i64) -> i
 
     // Release string element if needed
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let s = impl_ref.get_value(index as usize).unwrap() as *const PithString;
-        pith_string_release(*s);
+        if let Some(s) = impl_ref.get_value(index as usize) {
+            pith_string_release(*(s as *const PithString));
+        }
     }
 
     impl_ref.remove(index as usize);
@@ -651,16 +666,15 @@ pub unsafe extern "C" fn pith_list_remove_value(list: PithList, index: i64) -> i
 /// Clear all elements from list (by-value variant)
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_clear_value(list: PithList) {
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_mut(list) else {
         return;
-    }
-
-    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    };
 
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
-            let s = impl_ref.get_value(i).unwrap() as *const PithString;
-            pith_string_release(*s);
+            if let Some(s) = impl_ref.get_value(i) {
+                pith_string_release(*(s as *const PithString));
+            }
         }
     }
 
@@ -670,10 +684,9 @@ pub unsafe extern "C" fn pith_list_clear_value(list: PithList) {
 /// Reverse list in-place (by-value variant — works with internal pointer)
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_reverse_value(list: PithList) {
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_mut(list) else {
         return;
-    }
-    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    };
     let len = impl_ref.len();
     for i in 0..len / 2 {
         impl_ref.swap(i, len - 1 - i);
@@ -683,17 +696,20 @@ pub unsafe extern "C" fn pith_list_reverse_value(list: PithList) {
 /// Clear all elements from list
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_clear(list: *mut PithList) {
-    if list.is_null() || (*list).ptr.is_null() {
+    if list.is_null() {
         return;
     }
 
-    let impl_ref = &mut *((*list).ptr as *mut ListImpl);
+    let Some(impl_ref) = list_mut(*list) else {
+        return;
+    };
 
     // Release all elements if they're heap types
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
-            let s = impl_ref.get_value(i).unwrap() as *const PithString;
-            pith_string_release(*s);
+            if let Some(s) = impl_ref.get_value(i) {
+                pith_string_release(*(s as *const PithString));
+            }
         }
     }
 
@@ -703,11 +719,10 @@ pub unsafe extern "C" fn pith_list_clear(list: *mut PithList) {
 /// Check if list is empty
 #[no_mangle]
 pub extern "C" fn pith_list_is_empty(list: PithList) -> i64 {
-    if list.ptr.is_null() {
-        return 1;
-    }
     unsafe {
-        let impl_ref = &*(list.ptr as *const ListImpl);
+        let Some(impl_ref) = list_ref(list) else {
+            return 1;
+        };
         if impl_ref.len() == 0 {
             1
         } else {
@@ -719,10 +734,9 @@ pub extern "C" fn pith_list_is_empty(list: PithList) -> i64 {
 /// Reverse list elements in-place
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_reverse(list: PithList) {
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_mut(list) else {
         return;
-    }
-    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    };
     if impl_ref.uses_value_storage() {
         impl_ref.values8.reverse();
         impl_ref.sync_value_view();
@@ -734,32 +748,34 @@ pub unsafe extern "C" fn pith_list_reverse(list: PithList) {
 /// Release list and free memory
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_release(list: PithList) {
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_mut(list) else {
         return;
-    }
-
-    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    };
 
     // Release all elements
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
-            let s = impl_ref.get_value(i).unwrap() as *const PithString;
-            pith_string_release(*s);
+            if let Some(s) = impl_ref.get_value(i) {
+                pith_string_release(*(s as *const PithString));
+            }
         }
     }
 
     // Free the list implementation
+    handle_registry::unregister(list.ptr as *const (), HandleKind::List);
     let _ = Box::from_raw(list.ptr as *mut ListImpl);
 }
 
 /// Check if a list of C-string pointers contains the given C-string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_contains_cstr(list_handle: i64, s: *const i8) -> i64 {
-    if list_handle == 0 || s.is_null() {
+    if s.is_null() {
         return 0;
     }
 
-    let impl_ref = &*(list_handle as *const ListImpl);
+    let Some(impl_ref) = list_ref_from_handle(list_handle) else {
+        return 0;
+    };
     let needle_len = crate::string::pith_cstring_len(s) as usize;
     let needle = std::slice::from_raw_parts(s as *const u8, needle_len);
 
@@ -784,11 +800,13 @@ pub unsafe extern "C" fn pith_list_contains_cstr(list_handle: i64, s: *const i8)
 /// Find the index of a C-string in a list of C-string pointers.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_index_of_cstr(list_handle: i64, s: *const i8) -> i64 {
-    if list_handle == 0 || s.is_null() {
+    if s.is_null() {
         return -1;
     }
 
-    let impl_ref = &*(list_handle as *const ListImpl);
+    let Some(impl_ref) = list_ref_from_handle(list_handle) else {
+        return -1;
+    };
     let needle_len = crate::string::pith_cstring_len(s) as usize;
     let needle = std::slice::from_raw_parts(s as *const u8, needle_len);
 
@@ -813,11 +831,9 @@ pub unsafe extern "C" fn pith_list_index_of_cstr(list_handle: i64, s: *const i8)
 /// Find index of integer value in list
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_index_of_int(list: PithList, value: i64) -> i64 {
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_ref(list) else {
         return -1;
-    }
-
-    let impl_ref = &*(list.ptr as *const ListImpl);
+    };
 
     for i in 0..impl_ref.len() {
         if impl_ref.get_value(i).unwrap_or(0) == value {
@@ -831,11 +847,9 @@ pub unsafe extern "C" fn pith_list_index_of_int(list: PithList, value: i64) -> i
 /// Check if list contains an integer value
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_contains_int(list: PithList, value: i64) -> i64 {
-    if list.ptr.is_null() {
+    let Some(impl_ref) = list_ref(list) else {
         return 0;
-    }
-
-    let impl_ref = &*(list.ptr as *const ListImpl);
+    };
 
     for i in 0..impl_ref.len() {
         if impl_ref.get_value(i).unwrap_or(0) == value {
@@ -869,9 +883,13 @@ pub extern "C" fn pith_list_destructor(ptr: *mut u8) {
 /// closure_handle is a closure handle: fn(i64) -> i64
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_map(list_ptr: i64, closure_handle: i64) -> i64 {
-    if list_ptr == 0 { return 0; }
-    let src = &*(list_ptr as *const ListImpl);
+    let Some(src) = list_ref_from_handle(list_ptr) else {
+        return 0;
+    };
     let func_ptr = crate::pith_closure_get_fn(closure_handle);
+    if func_ptr == 0 {
+        return 0;
+    }
     let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
     let result = pith_list_new(8, 0);
     let result_ptr = result.ptr as i64;
@@ -879,7 +897,12 @@ pub unsafe extern "C" fn pith_list_map(list_ptr: i64, closure_handle: i64) -> i6
     for i in 0..src.len() {
         if let Some(val) = src.get_value(i) {
             let mapped = func(closure_handle, val);
-            pith_list_push_value(PithList { ptr: result_ptr as *mut () }, mapped);
+            pith_list_push_value(
+                PithList {
+                    ptr: result_ptr as *mut (),
+                },
+                mapped,
+            );
         }
     }
     result_ptr
@@ -889,14 +912,18 @@ pub unsafe extern "C" fn pith_list_map(list_ptr: i64, closure_handle: i64) -> i6
 /// closure_handle is a closure handle: fn(i64) -> i64 (truthy = non-zero)
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_filter(list_ptr: i64, closure_handle: i64) -> i64 {
-    let list = PithList { ptr: list_ptr as *mut () };
+    let list = PithList {
+        ptr: list_ptr as *mut (),
+    };
     let result = pith_list_new(8, 0);
-    if list.ptr.is_null() {
+
+    let Some(impl_ref) = list_ref(list) else {
+        return result.ptr as i64;
+    };
+    let func_ptr = crate::pith_closure_get_fn(closure_handle);
+    if func_ptr == 0 {
         return result.ptr as i64;
     }
-
-    let impl_ref = &*(list.ptr as *const ListImpl);
-    let func_ptr = crate::pith_closure_get_fn(closure_handle);
     let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
 
     for i in 0..impl_ref.len() {
@@ -913,13 +940,16 @@ pub unsafe extern "C" fn pith_list_filter(list_ptr: i64, closure_handle: i64) ->
 /// closure_handle: fn(accumulator: i64, element: i64) -> i64
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_reduce(list_ptr: i64, init: i64, closure_handle: i64) -> i64 {
-    let list = PithList { ptr: list_ptr as *mut () };
-    if list.ptr.is_null() {
+    let list = PithList {
+        ptr: list_ptr as *mut (),
+    };
+    let Some(impl_ref) = list_ref(list) else {
+        return init;
+    };
+    let func_ptr = crate::pith_closure_get_fn(closure_handle);
+    if func_ptr == 0 {
         return init;
     }
-
-    let impl_ref = &*(list.ptr as *const ListImpl);
-    let func_ptr = crate::pith_closure_get_fn(closure_handle);
     let func: extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
 
     let mut acc = init;
@@ -935,18 +965,84 @@ pub unsafe extern "C" fn pith_list_reduce(list_ptr: i64, init: i64, closure_hand
 /// closure_handle: fn(i64) -> i64
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_each(list_ptr: i64, closure_handle: i64) {
-    let list = PithList { ptr: list_ptr as *mut () };
-    if list.ptr.is_null() {
+    let list = PithList {
+        ptr: list_ptr as *mut (),
+    };
+    let Some(impl_ref) = list_ref(list) else {
+        return;
+    };
+    let func_ptr = crate::pith_closure_get_fn(closure_handle);
+    if func_ptr == 0 {
         return;
     }
-
-    let impl_ref = &*(list.ptr as *const ListImpl);
-    let func_ptr = crate::pith_closure_get_fn(closure_handle);
     let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
 
     for i in 0..impl_ref.len() {
         if let Some(val) = impl_ref.get_value(i) {
             func(closure_handle, val);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bogus_list() -> PithList {
+        PithList {
+            ptr: 12345usize as *mut (),
+        }
+    }
+
+    #[test]
+    fn invalid_list_handles_return_safe_defaults() {
+        unsafe {
+            assert_eq!(pith_list_len(bogus_list()), 0);
+            assert_eq!(pith_list_is_empty(bogus_list()), 1);
+            assert_eq!(pith_list_get_value(bogus_list(), 0), 0);
+            assert_eq!(pith_list_get_value_unchecked(bogus_list(), 0), 0);
+            pith_list_set_value(bogus_list(), 0, 7);
+            pith_list_reverse(bogus_list());
+            pith_list_release(bogus_list());
+        }
+    }
+
+    #[test]
+    fn released_list_handles_are_rejected() {
+        unsafe {
+            let list = pith_list_new(8, 0);
+            pith_list_push_value(list, 7);
+            assert_eq!(pith_list_len(list), 1);
+            pith_list_release(list);
+            assert_eq!(pith_list_len(list), 0);
+            assert_eq!(pith_list_get_value(list, 0), 0);
+            pith_list_release(list);
+        }
+    }
+
+    #[test]
+    fn functional_list_ops_reject_invalid_closure_handles() {
+        unsafe {
+            let list = pith_list_new(8, 0);
+            pith_list_push_value(list, 7);
+            let list_ptr = list.ptr as i64;
+
+            assert_eq!(pith_list_map(list_ptr, 12345), 0);
+            let filtered = pith_list_filter(list_ptr, 12345);
+            assert_ne!(filtered, 0);
+            assert_eq!(
+                pith_list_len(PithList {
+                    ptr: filtered as *mut (),
+                }),
+                0
+            );
+            pith_list_release(PithList {
+                ptr: filtered as *mut (),
+            });
+            assert_eq!(pith_list_reduce(list_ptr, 99, 12345), 99);
+            pith_list_each(list_ptr, 12345);
+
+            pith_list_release(list);
         }
     }
 }

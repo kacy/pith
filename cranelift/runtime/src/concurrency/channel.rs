@@ -1,8 +1,9 @@
 //! channel support for task communication
 
+use crate::handle_registry::{self, HandleKind};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 static SELECT_COUNTER: AtomicI64 = AtomicI64::new(0);
 
@@ -15,7 +16,26 @@ struct ChannelState {
     sender_waiting: usize,
 }
 
-pub type PithChannelHandle = Arc<(Mutex<ChannelState>, Condvar)>;
+type PithChannelHandle = Arc<(Mutex<ChannelState>, Condvar)>;
+
+unsafe fn channel_ref<'a>(handle: i64) -> Option<&'a PithChannelHandle> {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Channel) {
+        return None;
+    }
+    Some(&*(handle as *const PithChannelHandle))
+}
+
+fn lock_state(lock: &Mutex<ChannelState>) -> MutexGuard<'_, ChannelState> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn wait_state<'a>(
+    cvar: &Condvar,
+    state: MutexGuard<'a, ChannelState>,
+) -> MutexGuard<'a, ChannelState> {
+    cvar.wait(state)
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn optional_tuple(is_some: bool, value: i64) -> i64 {
     unsafe {
@@ -42,17 +62,18 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
         sender_waiting: 0,
     };
     let channel = Arc::new((Mutex::new(state), Condvar::new()));
-    Box::into_raw(Box::new(channel)) as i64
+    let ptr = Box::into_raw(Box::new(channel));
+    handle_registry::register(ptr as *const (), HandleKind::Channel);
+    ptr as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 0;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, cvar) = &**channel;
-    let mut state = lock.lock().unwrap();
+    let mut state = lock_state(lock);
 
     if state.closed {
         return 0;
@@ -64,12 +85,12 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
                 state.pending_value = Some(value);
                 cvar.notify_all();
                 while !state.closed && state.pending_value.is_some() {
-                    state = cvar.wait(state).unwrap();
+                    state = wait_state(cvar, state);
                 }
                 return if state.closed { 0 } else { 1 };
             }
             state.sender_waiting += 1;
-            state = cvar.wait(state).unwrap();
+            state = wait_state(cvar, state);
             state.sender_waiting -= 1;
         }
         return 0;
@@ -77,7 +98,7 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
 
     while !state.closed && state.queue.len() >= state.capacity {
         state.sender_waiting += 1;
-        state = cvar.wait(state).unwrap();
+        state = wait_state(cvar, state);
         state.sender_waiting -= 1;
     }
 
@@ -92,12 +113,11 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 0;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, cvar) = &**channel;
-    let mut state = lock.lock().unwrap();
+    let mut state = lock_state(lock);
 
     if state.closed {
         return 0;
@@ -122,12 +142,11 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return optional_tuple(false, 0);
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, cvar) = &**channel;
-    let mut state = lock.lock().unwrap();
+    let mut state = lock_state(lock);
 
     loop {
         if let Some(value) = state.queue.pop_front() {
@@ -148,19 +167,18 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
 
         state.receiver_waiting += 1;
         cvar.notify_all();
-        state = cvar.wait(state).unwrap();
+        state = wait_state(cvar, state);
         state.receiver_waiting -= 1;
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return optional_tuple(false, 0);
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, cvar) = &**channel;
-    let mut state = lock.lock().unwrap();
+    let mut state = lock_state(lock);
 
     if let Some(value) = state.queue.pop_front() {
         cvar.notify_all();
@@ -177,12 +195,11 @@ pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 0;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, cvar) = &**channel;
-    let mut state = lock.lock().unwrap();
+    let mut state = lock_state(lock);
     if state.closed {
         return 0;
     }
@@ -194,35 +211,36 @@ pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 0;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, _) = &**channel;
-    let state = lock.lock().unwrap();
+    let state = lock_state(lock);
     state.queue.len() as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_cap(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 0;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, _) = &**channel;
-    let state = lock.lock().unwrap();
+    let state = lock_state(lock);
     state.capacity as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_is_closed(handle: i64) -> i64 {
-    if handle == 0 {
+    let Some(channel) = channel_ref(handle) else {
         return 1;
-    }
-    let channel = &*(handle as *mut PithChannelHandle);
+    };
     let (lock, _) = &**channel;
-    let state = lock.lock().unwrap();
-    if state.closed { 1 } else { 0 }
+    let state = lock_state(lock);
+    if state.closed {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -232,4 +250,25 @@ pub extern "C" fn pith_select_next_index(count: i64) -> i64 {
     }
     let next = SELECT_COUNTER.fetch_add(1, Ordering::Relaxed);
     next.rem_euclid(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_channel_handles_return_safe_defaults() {
+        unsafe {
+            assert_eq!(pith_channel_send(12345, 7), 0);
+            assert_eq!(pith_channel_try_send(12345, 7), 0);
+            assert_eq!(pith_channel_close(12345), 0);
+            assert_eq!(pith_channel_len(12345), 0);
+            assert_eq!(pith_channel_cap(12345), 0);
+            assert_eq!(pith_channel_is_closed(12345), 1);
+
+            let recv = pith_channel_try_recv(12345) as *const i64;
+            assert!(!recv.is_null());
+            assert_eq!(*recv, 0);
+        }
+    }
 }

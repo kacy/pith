@@ -1,5 +1,6 @@
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::collections::list::{pith_list_new, pith_list_push_value};
+use crate::ffi_util::{cstr_bytes, cstr_str};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::File;
@@ -16,13 +17,7 @@ fn file_handles() -> &'static Mutex<HashMap<i64, File>> {
 unsafe fn pith_open_file_with(path: *const i8, create: bool, write: bool, append: bool) -> i64 {
     use std::fs::OpenOptions;
 
-    if path.is_null() {
-        return 0;
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    let Ok(path_str) = std::str::from_utf8(slice) else {
+    let Some(path_str) = cstr_str(path) else {
         return 0;
     };
 
@@ -49,13 +44,7 @@ unsafe fn pith_open_file_with(path: *const i8, create: bool, write: bool, append
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_exists(path: *const i8) -> i64 {
-    if path.is_null() {
-        return 0;
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    if let Ok(path_str) = std::str::from_utf8(slice) {
+    if let Some(path_str) = cstr_str(path) {
         if std::path::Path::new(path_str).exists() {
             return 1;
         }
@@ -69,13 +58,7 @@ pub unsafe extern "C" fn pith_file_exists(path: *const i8) -> i64 {
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_dir_exists(path: *const i8) -> i64 {
-    if path.is_null() {
-        return 0;
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    if let Ok(path_str) = std::str::from_utf8(slice) {
+    if let Some(path_str) = cstr_str(path) {
         let path = std::path::Path::new(path_str);
         if path.exists() && path.is_dir() {
             return 1;
@@ -92,13 +75,7 @@ pub unsafe extern "C" fn pith_dir_exists(path: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_mkdir(path: *const i8) -> i64 {
     use std::fs;
 
-    if path.is_null() {
-        return 0;
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    if let Ok(path_str) = std::str::from_utf8(slice) {
+    if let Some(path_str) = cstr_str(path) {
         if fs::create_dir_all(path_str).is_ok() {
             return 1;
         }
@@ -114,13 +91,7 @@ pub unsafe extern "C" fn pith_mkdir(path: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_remove_dir(path: *const i8) -> i64 {
     use std::fs;
 
-    if path.is_null() {
-        return 0;
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    if let Ok(path_str) = std::str::from_utf8(slice) {
+    if let Some(path_str) = cstr_str(path) {
         if fs::remove_dir(path_str).is_ok() {
             return 1;
         }
@@ -136,13 +107,7 @@ pub unsafe extern "C" fn pith_remove_dir(path: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_remove_tree(path: *const i8) -> i64 {
     use std::fs;
 
-    if path.is_null() {
-        return 0;
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    if let Ok(path_str) = std::str::from_utf8(slice) {
+    if let Some(path_str) = cstr_str(path) {
         if fs::remove_dir_all(path_str).is_ok() {
             return 1;
         }
@@ -157,13 +122,7 @@ pub unsafe extern "C" fn pith_remove_tree(path: *const i8) -> i64 {
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_size(path: *const i8) -> i64 {
-    if path.is_null() {
-        return -1;
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    if let Ok(path_str) = std::str::from_utf8(slice) {
+    if let Some(path_str) = cstr_str(path) {
         if let Ok(meta) = std::fs::metadata(path_str) {
             return meta.len() as i64;
         }
@@ -179,13 +138,7 @@ pub unsafe extern "C" fn pith_file_size(path: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_remove_file(path: *const i8) -> i64 {
     use std::fs;
 
-    if path.is_null() {
-        return 0;
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    if let Ok(path_str) = std::str::from_utf8(slice) {
+    if let Some(path_str) = cstr_str(path) {
         if fs::remove_file(path_str).is_ok() {
             return 1;
         }
@@ -201,19 +154,7 @@ pub unsafe extern "C" fn pith_remove_file(path: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_rename_file(from: *const i8, to: *const i8) -> i64 {
     use std::fs;
 
-    if from.is_null() || to.is_null() {
-        return 0;
-    }
-
-    let from_len = crate::string::pith_cstring_len(from) as usize;
-    let to_len = crate::string::pith_cstring_len(to) as usize;
-    let from_slice = std::slice::from_raw_parts(from as *const u8, from_len);
-    let to_slice = std::slice::from_raw_parts(to as *const u8, to_len);
-
-    if let (Ok(from_str), Ok(to_str)) = (
-        std::str::from_utf8(from_slice),
-        std::str::from_utf8(to_slice),
-    ) {
+    if let (Some(from_str), Some(to_str)) = (cstr_str(from), cstr_str(to)) {
         if fs::rename(from_str, to_str).is_ok() {
             return 1;
         }
@@ -228,26 +169,11 @@ pub unsafe extern "C" fn pith_rename_file(from: *const i8, to: *const i8) -> i64
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_read_file(path: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
     use std::fs;
 
-    if path.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    if let Ok(path_str) = std::str::from_utf8(slice) {
+    if let Some(path_str) = cstr_str(path) {
         if let Ok(contents) = fs::read_to_string(path_str) {
-            let content_len = contents.len();
-            let layout = Layout::from_size_align(content_len + 1, 1).unwrap();
-            let ptr = alloc(layout) as *mut i8;
-
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(contents.as_ptr(), ptr as *mut u8, content_len);
-                *ptr.add(content_len) = 0;
-            }
-            return ptr;
+            return crate::pith_copy_bytes_to_cstring(contents.as_bytes());
         }
     }
     std::ptr::null_mut()
@@ -257,13 +183,7 @@ pub unsafe extern "C" fn pith_read_file(path: *const i8) -> *mut i8 {
 pub unsafe extern "C" fn pith_read_file_bytes(path: *const i8) -> i64 {
     use std::fs;
 
-    if path.is_null() {
-        return 0;
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    let Ok(path_str) = std::str::from_utf8(slice) else {
+    let Some(path_str) = cstr_str(path) else {
         return 0;
     };
 
@@ -277,19 +197,7 @@ pub unsafe extern "C" fn pith_read_file_bytes(path: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_write_file(path: *const i8, content: *const i8) -> i64 {
     use std::fs;
 
-    if path.is_null() || content.is_null() {
-        return 0;
-    }
-
-    let path_len = crate::string::pith_cstring_len(path) as usize;
-    let content_len = crate::string::pith_cstring_len(content) as usize;
-    let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
-    let content_slice = std::slice::from_raw_parts(content as *const u8, content_len);
-
-    if let (Ok(path_str), Ok(content_str)) = (
-        std::str::from_utf8(path_slice),
-        std::str::from_utf8(content_slice),
-    ) {
+    if let (Some(path_str), Some(content_str)) = (cstr_str(path), cstr_str(content)) {
         if fs::write(path_str, content_str).is_ok() {
             return 1;
         }
@@ -301,15 +209,10 @@ pub unsafe extern "C" fn pith_write_file(path: *const i8, content: *const i8) ->
 pub unsafe extern "C" fn pith_write_file_bytes(path: *const i8, content: i64) -> i64 {
     use std::fs;
 
-    if path.is_null() {
-        return 0;
-    }
     let Some(bytes) = pith_bytes_ref(content) else {
         return 0;
     };
-    let path_len = crate::string::pith_cstring_len(path) as usize;
-    let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
-    let Ok(path_str) = std::str::from_utf8(path_slice) else {
+    let Some(path_str) = cstr_str(path) else {
         return 0;
     };
     if fs::write(path_str, &bytes.data).is_ok() {
@@ -323,21 +226,9 @@ pub unsafe extern "C" fn pith_append_file(path: *const i8, content: *const i8) -
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    if path.is_null() || content.is_null() {
-        return 0;
-    }
-
-    let path_len = crate::string::pith_cstring_len(path) as usize;
-    let content_len = crate::string::pith_cstring_len(content) as usize;
-    let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
-    let content_slice = std::slice::from_raw_parts(content as *const u8, content_len);
-
-    if let (Ok(path_str), Ok(_content_str)) = (
-        std::str::from_utf8(path_slice),
-        std::str::from_utf8(content_slice),
-    ) {
+    if let (Some(path_str), Some(content_str)) = (cstr_str(path), cstr_str(content)) {
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path_str) {
-            if file.write_all(content_slice).is_ok() {
+            if file.write_all(content_str.as_bytes()).is_ok() {
                 return 1;
             }
         }
@@ -350,15 +241,10 @@ pub unsafe extern "C" fn pith_append_file_bytes(path: *const i8, content: i64) -
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    if path.is_null() {
-        return 0;
-    }
     let Some(bytes) = pith_bytes_ref(content) else {
         return 0;
     };
-    let path_len = crate::string::pith_cstring_len(path) as usize;
-    let path_slice = std::slice::from_raw_parts(path as *const u8, path_len);
-    let Ok(path_str) = std::str::from_utf8(path_slice) else {
+    let Some(path_str) = cstr_str(path) else {
         return 0;
     };
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path_str) {
@@ -388,7 +274,11 @@ pub unsafe extern "C" fn pith_file_open_append(path: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_file_read(handle: i64, max_bytes: i64) -> *mut i8 {
     use std::io::Read;
 
-    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let size = if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        4096
+    };
     let mut handles = file_handles().lock();
     let Some(file) = handles.get_mut(&handle) else {
         return std::ptr::null_mut();
@@ -409,7 +299,11 @@ pub unsafe extern "C" fn pith_file_read(handle: i64, max_bytes: i64) -> *mut i8 
 pub unsafe extern "C" fn pith_file_read_bytes(handle: i64, max_bytes: i64) -> i64 {
     use std::io::Read;
 
-    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let size = if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        4096
+    };
     let mut handles = file_handles().lock();
     let Some(file) = handles.get_mut(&handle) else {
         return 0;
@@ -429,12 +323,9 @@ pub unsafe extern "C" fn pith_file_read_bytes(handle: i64, max_bytes: i64) -> i6
 pub unsafe extern "C" fn pith_file_write(handle: i64, data: *const i8) -> i64 {
     use std::io::Write;
 
-    if data.is_null() {
+    let Some(bytes) = cstr_bytes(data) else {
         return 0;
-    }
-
-    let len = crate::string::pith_cstring_len(data) as usize;
-    let bytes = std::slice::from_raw_parts(data as *const u8, len);
+    };
     let mut handles = file_handles().lock();
     let Some(file) = handles.get_mut(&handle) else {
         return 0;
@@ -475,25 +366,9 @@ pub extern "C" fn pith_file_close(handle: i64) {
 /// name must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_env(name: *const i8) -> *const i8 {
-    use std::alloc::{alloc, Layout};
-
-    if name.is_null() {
-        return std::ptr::null();
-    }
-
-    let len = crate::string::pith_cstring_len(name) as usize;
-    let slice = std::slice::from_raw_parts(name as *const u8, len);
-    if let Ok(name_str) = std::str::from_utf8(slice) {
+    if let Some(name_str) = cstr_str(name) {
         if let Ok(var) = std::env::var(name_str) {
-            let var_len = var.len();
-            let layout = Layout::from_size_align(var_len + 1, 1).unwrap();
-            let ptr = alloc(layout) as *mut i8;
-
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(var.as_ptr(), ptr as *mut u8, var_len);
-                *ptr.add(var_len) = 0;
-                return ptr;
-            }
+            return crate::pith_copy_bytes_to_cstring(var.as_bytes());
         }
     }
     crate::pith_strdup_string("")
@@ -511,13 +386,7 @@ pub unsafe extern "C" fn pith_os_getcwd() -> *const i8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_os_chdir(path: *const i8) -> i64 {
-    if path.is_null() {
-        return 0;
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    if let Ok(path_str) = std::str::from_utf8(slice) {
+    if let Some(path_str) = cstr_str(path) {
         if std::env::set_current_dir(path_str).is_ok() {
             return 1;
         }
@@ -547,18 +416,7 @@ pub unsafe extern "C" fn pith_os_home_dir() -> *const i8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_os_set_env(name: *const i8, value: *const i8) -> i64 {
-    if name.is_null() || value.is_null() {
-        return 0;
-    }
-
-    let name_len = crate::string::pith_cstring_len(name) as usize;
-    let value_len = crate::string::pith_cstring_len(value) as usize;
-    let name_slice = std::slice::from_raw_parts(name as *const u8, name_len);
-    let value_slice = std::slice::from_raw_parts(value as *const u8, value_len);
-    if let (Ok(name_str), Ok(value_str)) = (
-        std::str::from_utf8(name_slice),
-        std::str::from_utf8(value_slice),
-    ) {
+    if let (Some(name_str), Some(value_str)) = (cstr_str(name), cstr_str(value)) {
         std::env::set_var(name_str, value_str);
         return 1;
     }
@@ -567,13 +425,7 @@ pub unsafe extern "C" fn pith_os_set_env(name: *const i8, value: *const i8) -> i
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_os_unset_env(name: *const i8) -> i64 {
-    if name.is_null() {
-        return 0;
-    }
-
-    let name_len = crate::string::pith_cstring_len(name) as usize;
-    let name_slice = std::slice::from_raw_parts(name as *const u8, name_len);
-    if let Ok(name_str) = std::str::from_utf8(name_slice) {
+    if let Some(name_str) = cstr_str(name) {
         std::env::remove_var(name_str);
         return 1;
     }
@@ -584,13 +436,7 @@ pub unsafe extern "C" fn pith_os_unset_env(name: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_list_dir(path: *const i8) -> i64 {
     use std::fs;
 
-    if path.is_null() {
-        return pith_list_new(8, 1).ptr as i64;
-    }
-
-    let len = crate::string::pith_cstring_len(path) as usize;
-    let slice = std::slice::from_raw_parts(path as *const u8, len);
-    if let Ok(path_str) = std::str::from_utf8(slice) {
+    if let Some(path_str) = cstr_str(path) {
         if let Ok(entries) = fs::read_dir(path_str) {
             let list = pith_list_new(8, 1);
 
@@ -606,4 +452,23 @@ pub unsafe extern "C" fn pith_list_dir(path: *const i8) -> i64 {
         }
     }
     pith_list_new(8, 1).ptr as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_file_paths_return_safe_defaults() {
+        let invalid = [0xffu8, 0x00];
+        let ptr = invalid.as_ptr() as *const i8;
+
+        unsafe {
+            assert_eq!(pith_file_exists(ptr), 0);
+            assert_eq!(pith_file_size(ptr), -1);
+            assert_eq!(pith_write_file(ptr, b"x\0".as_ptr() as *const i8), 0);
+            assert!(pith_read_file(ptr).is_null());
+            assert_eq!(pith_os_chdir(ptr), 0);
+        }
+    }
 }

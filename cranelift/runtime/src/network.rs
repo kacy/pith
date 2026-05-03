@@ -1,12 +1,12 @@
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
-use crate::ffi_util::cstr_to_str;
+use crate::ffi_util::{cstr_str, cstr_str_or_empty};
 
 /// TCP listen — bind and listen on addr:port, return server fd
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
     use std::net::TcpListener;
 
-    let host = cstr_to_str(addr);
+    let host = cstr_str_or_empty(addr);
     let host = if host.is_empty() { "0.0.0.0" } else { host };
     let bind_addr = format!("{}:{}", host, port);
     match TcpListener::bind(&bind_addr) {
@@ -23,7 +23,7 @@ pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
 pub unsafe extern "C" fn pith_tcp_connect(addr: *const i8, port: i64) -> i64 {
     use std::net::TcpStream;
 
-    let host = cstr_to_str(addr);
+    let host = cstr_str_or_empty(addr);
     let host = if host.is_empty() { "127.0.0.1" } else { host };
     let connect_addr = format!("{}:{}", host, port);
     match TcpStream::connect(&connect_addr) {
@@ -95,7 +95,11 @@ pub extern "C" fn pith_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
         return std::ptr::null_mut();
     }
     let mut stream = unsafe { TcpStream::from_raw_fd(conn_fd as i32) };
-    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let size = if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        4096
+    };
     let mut buf = vec![0u8; size];
     let result = match stream.read(&mut buf) {
         Ok(n) => {
@@ -120,7 +124,11 @@ pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
         return 0;
     }
     let mut stream = unsafe { TcpStream::from_raw_fd(conn_fd as i32) };
-    let size = if max_bytes > 0 { max_bytes as usize } else { 4096 };
+    let size = if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        4096
+    };
     let mut buf = vec![0u8; size];
     let result = match stream.read(&mut buf) {
         Ok(n) => {
@@ -194,7 +202,7 @@ pub unsafe extern "C" fn pith_tcp_write(conn_fd: i64, data: *const i8) -> i64 {
         return 0;
     }
     let mut stream = TcpStream::from_raw_fd(conn_fd as i32);
-    let s = cstr_to_str(data);
+    let s = cstr_str_or_empty(data);
     let result = match stream.write(s.as_bytes()) {
         Ok(n) => n as i64,
         Err(_) => 0,
@@ -263,10 +271,9 @@ pub extern "C" fn pith_tcp_close(fd: i64) {
 pub unsafe extern "C" fn pith_dns_resolve(hostname: *const i8) -> *mut i8 {
     use std::net::ToSocketAddrs;
 
-    if hostname.is_null() {
+    let Some(host) = cstr_str(hostname) else {
         return std::ptr::null_mut();
-    }
-    let host = std::ffi::CStr::from_ptr(hostname).to_str().unwrap_or("");
+    };
     let addr_str = format!("{}:0", host);
     match addr_str.to_socket_addrs() {
         Ok(mut addrs) => {
@@ -277,5 +284,20 @@ pub unsafe extern "C" fn pith_dns_resolve(hostname: *const i8) -> *mut i8 {
             }
         }
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dns_resolve_rejects_null_and_invalid_utf8() {
+        let invalid = [0xffu8, 0x00];
+
+        unsafe {
+            assert!(pith_dns_resolve(std::ptr::null()).is_null());
+            assert!(pith_dns_resolve(invalid.as_ptr() as *const i8).is_null());
+        }
     }
 }

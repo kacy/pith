@@ -1,4 +1,6 @@
 use crate::collections::list::PithList;
+use crate::ffi_util::{cstr_str, cstr_str_or_empty};
+use crate::handle_registry::{self, HandleKind};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
@@ -32,20 +34,15 @@ fn process_output_handles() -> &'static Mutex<HashMap<i64, ProcessOutputHandle>>
 }
 
 unsafe fn pith_optional_cstring(ptr: *const i8) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    let len = crate::string::pith_cstring_len(ptr) as usize;
-    let slice = std::slice::from_raw_parts(ptr as *const u8, len);
-    std::str::from_utf8(slice).unwrap_or("").to_string()
+    cstr_str_or_empty(ptr).to_string()
 }
 
 unsafe fn pith_required_cstring(ptr: *const i8) -> Option<String> {
-    let text = pith_optional_cstring(ptr);
+    let text = cstr_str(ptr)?;
     if text.is_empty() {
         return None;
     }
-    Some(text)
+    Some(text.to_string())
 }
 
 unsafe fn pith_string_list_to_vec(list: PithList) -> Vec<String> {
@@ -68,6 +65,20 @@ fn pith_store_process_output(status: i64, stdout: String, stderr: String) -> i64
         stderr,
     };
     process_output_handles().lock().insert(handle, entry);
+    handle_registry::register_id(handle, HandleKind::ProcessOutput);
+    handle
+}
+
+fn pith_store_process_handle(mut child: Child) -> i64 {
+    let handle = NEXT_PROCESS_HANDLE.fetch_add(1, Ordering::Relaxed);
+    let entry = ProcessHandle {
+        stdin: child.stdin.take(),
+        stdout: child.stdout.take(),
+        stderr: child.stderr.take(),
+        child,
+    };
+    process_handles().lock().insert(handle, entry);
+    handle_registry::register_id(handle, HandleKind::Process);
     handle
 }
 
@@ -110,35 +121,19 @@ unsafe fn pith_build_command(
 /// cmd must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_process_spawn(cmd: *const i8) -> i64 {
-    if cmd.is_null() {
+    let Some(cmd_str) = cstr_str(cmd) else {
         return 0;
-    }
-    let len = crate::string::pith_cstring_len(cmd) as usize;
-    let slice = std::slice::from_raw_parts(cmd as *const u8, len);
-    if let Ok(cmd_str) = std::str::from_utf8(slice) {
-        match Command::new("/bin/sh")
-            .arg("-lc")
-            .arg(cmd_str)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(mut child) => {
-                let handle = NEXT_PROCESS_HANDLE.fetch_add(1, Ordering::Relaxed);
-                let entry = ProcessHandle {
-                    stdin: child.stdin.take(),
-                    stdout: child.stdout.take(),
-                    stderr: child.stderr.take(),
-                    child,
-                };
-                process_handles().lock().insert(handle, entry);
-                handle
-            }
-            Err(_) => 0,
-        }
-    } else {
-        0
+    };
+    match Command::new("/bin/sh")
+        .arg("-lc")
+        .arg(cmd_str)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => pith_store_process_handle(child),
+        Err(_) => 0,
     }
 }
 
@@ -160,17 +155,7 @@ pub unsafe extern "C" fn pith_process_spawn_argv(
         .stderr(Stdio::piped())
         .spawn()
     {
-        Ok(mut child) => {
-            let handle = NEXT_PROCESS_HANDLE.fetch_add(1, Ordering::Relaxed);
-            let entry = ProcessHandle {
-                stdin: child.stdin.take(),
-                stdout: child.stdout.take(),
-                stderr: child.stderr.take(),
-                child,
-            };
-            process_handles().lock().insert(handle, entry);
-            handle
-        }
+        Ok(child) => pith_store_process_handle(child),
         Err(_) => 0,
     }
 }
@@ -200,6 +185,9 @@ pub unsafe extern "C" fn pith_process_output_argv(
 
 #[no_mangle]
 pub extern "C" fn pith_process_output_status(handle: i64) -> i64 {
+    if !handle_registry::is_valid_id(handle, HandleKind::ProcessOutput) {
+        return -1;
+    }
     let outputs = process_output_handles().lock();
     let Some(entry) = outputs.get(&handle) else {
         return -1;
@@ -210,10 +198,14 @@ pub extern "C" fn pith_process_output_status(handle: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn pith_process_output_close(handle: i64) {
     process_output_handles().lock().remove(&handle);
+    handle_registry::unregister_id(handle, HandleKind::ProcessOutput);
 }
 
 #[no_mangle]
 pub extern "C" fn pith_process_output_stdout(handle: i64) -> *mut i8 {
+    if !handle_registry::is_valid_id(handle, HandleKind::ProcessOutput) {
+        return std::ptr::null_mut();
+    }
     let outputs = process_output_handles().lock();
     let Some(entry) = outputs.get(&handle) else {
         return std::ptr::null_mut();
@@ -223,6 +215,9 @@ pub extern "C" fn pith_process_output_stdout(handle: i64) -> *mut i8 {
 
 #[no_mangle]
 pub extern "C" fn pith_process_output_stderr(handle: i64) -> *mut i8 {
+    if !handle_registry::is_valid_id(handle, HandleKind::ProcessOutput) {
+        return std::ptr::null_mut();
+    }
     let outputs = process_output_handles().lock();
     let Some(entry) = outputs.get(&handle) else {
         return std::ptr::null_mut();
@@ -233,6 +228,9 @@ pub extern "C" fn pith_process_output_stderr(handle: i64) -> *mut i8 {
 /// Wait for a spawned process to finish, returns exit code
 #[no_mangle]
 pub extern "C" fn pith_process_wait(handle: i64) -> i64 {
+    if !handle_registry::is_valid_id(handle, HandleKind::Process) {
+        return -1;
+    }
     let mut handles = process_handles().lock();
     let Some(entry) = handles.get_mut(&handle) else {
         return -1;
@@ -246,6 +244,9 @@ pub extern "C" fn pith_process_wait(handle: i64) -> i64 {
 /// Send a kill signal to a process
 #[no_mangle]
 pub extern "C" fn pith_process_kill(handle: i64) -> i64 {
+    if !handle_registry::is_valid_id(handle, HandleKind::Process) {
+        return 0;
+    }
     let mut handles = process_handles().lock();
     let Some(entry) = handles.get_mut(&handle) else {
         return 0;
@@ -261,4 +262,41 @@ pub extern "C" fn pith_process_kill(handle: i64) -> i64 {
 pub extern "C" fn pith_process_close(handle: i64) {
     let mut handles = process_handles().lock();
     handles.remove(&handle);
+    handle_registry::unregister_id(handle, HandleKind::Process);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_process_handles_return_safe_defaults() {
+        assert_eq!(pith_process_wait(12345), -1);
+        assert_eq!(pith_process_kill(12345), 0);
+        pith_process_close(12345);
+    }
+
+    #[test]
+    fn process_spawn_rejects_null_and_invalid_utf8() {
+        let invalid = [0xffu8, 0x00];
+
+        unsafe {
+            assert_eq!(pith_process_spawn(std::ptr::null()), 0);
+            assert_eq!(pith_process_spawn(invalid.as_ptr() as *const i8), 0);
+        }
+    }
+
+    #[test]
+    fn closed_process_output_handles_are_rejected() {
+        let handle = pith_store_process_output(7, "out".to_string(), "err".to_string());
+        assert_eq!(pith_process_output_status(handle), 7);
+        assert!(!pith_process_output_stdout(handle).is_null());
+        assert!(!pith_process_output_stderr(handle).is_null());
+
+        pith_process_output_close(handle);
+        assert_eq!(pith_process_output_status(handle), -1);
+        assert!(pith_process_output_stdout(handle).is_null());
+        assert!(pith_process_output_stderr(handle).is_null());
+        pith_process_output_close(handle);
+    }
 }

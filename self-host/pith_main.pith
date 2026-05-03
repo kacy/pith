@@ -18,13 +18,19 @@
 #   pith package test         run package root tests
 #   pith package lint         lint package root
 #   pith package doc          generate package root documentation
+#   pith package deps         list local path dependencies
+#   pith package lock         write pith.lock from local path dependencies
+#   pith package install      copy path dependencies into .pith/packages
+#   pith package install --refresh recopy existing cached dependencies
+#   pith package inspect [pkg] inspect current package or dependency
+#   pith package context [pkg] emit an agent-readable package summary
 #   pith new <name>           scaffold new package
 #   pith lex <file.pith>        print token stream
 #   pith parse <file.pith>      print AST
 #   pith version              print version
 #   pith help                 print usage
 
-from driver import get_directory, get_stem, init_driver, resolve_imports, mark_visited, find_imports, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file
+from driver import get_directory, get_stem, init_driver, resolve_imports, mark_visited, find_imports, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, package_root_file, package_dependency_root, package_dependency_names
 from lexer import lex_all, Token
 from parser import parse, parse_with_file, parser_diagnostics, parser_has_errors
 from ast import get_node, reset_arena
@@ -34,6 +40,10 @@ from formatter import fmt_source
 from linter import lint_module
 from errors import Diagnostic, render_diagnostics, render_diagnostics_json, count_errors, has_errors
 from docgen import doc_extract, doc_format, doc_format_json, doc_check, doc_search
+
+struct PackageDependency:
+    name: String
+    path: String
 
 # ---------------------------------------------------------------
 # native backend passthrough
@@ -279,7 +289,368 @@ fn package_root_path() -> String!:
             return root
     return "lib.pith"
 
-fn cmd_package(action: String) -> String!:
+fn package_join_path(base: String, child: String) -> String:
+    if child.len() == 0:
+        return base
+    if child.starts_with("/"):
+        return child
+    if base == "" or base == ".":
+        return child
+    return base + "/" + child
+
+fn package_manifest_path(package_root: String) -> String:
+    return package_join_path(package_root, "pith.toml")
+
+fn package_lock_path(package_root: String) -> String:
+    return package_join_path(package_root, "pith.lock")
+
+fn package_cache_dir(package_root: String) -> String:
+    return package_join_path(package_root, ".pith/packages")
+
+fn package_manifest_value(package_root: String, key: String) -> String!:
+    manifest_path := package_manifest_path(package_root)
+    if not file_exists(manifest_path):
+        return ""
+    manifest := read_file(manifest_path)!
+    for line in manifest.split(chr(10)):
+        value := package_value_for_key(line, key)
+        if value.len() > 0:
+            return value
+    return ""
+
+fn package_extract_braced_value(value: String, key: String) -> String:
+    key_pos := value.index_of(key)
+    if key_pos < 0:
+        return ""
+    rest := value.substring(key_pos + key.len(), value.len())
+    eq := rest.index_of("=")
+    if eq < 0:
+        return ""
+    after := rest.substring(eq + 1, rest.len()).trim()
+    if after.len() == 0:
+        return ""
+    if after[0] == chr(34):
+        mut end := 1
+        while end < after.len():
+            if after[end] == chr(34):
+                return after.substring(1, end)
+            end = end + 1
+        return ""
+    mut end := 0
+    while end < after.len():
+        if after[end] == "," or after[end] == chr(125):
+            break
+        end = end + 1
+    return after.substring(0, end).trim()
+
+fn package_dependency_path_value(value: String) -> String:
+    trimmed := value.trim()
+    if trimmed.len() == 0:
+        return ""
+    if trimmed[0] == chr(34):
+        if trimmed.len() >= 2 and trimmed[trimmed.len() - 1] == chr(34):
+            return trimmed.substring(1, trimmed.len() - 1)
+        return ""
+    if trimmed[0] == chr(123):
+        return package_extract_braced_value(trimmed, "path")
+    return ""
+
+fn package_manifest_dependencies(package_root: String) -> List[PackageDependency]!:
+    deps: List[PackageDependency] := []
+    manifest_path := package_manifest_path(package_root)
+    if not file_exists(manifest_path):
+        return deps
+    manifest := read_file(manifest_path)!
+    mut in_dependencies := false
+    for line in manifest.split(chr(10)):
+        trimmed := line.trim()
+        if trimmed.len() == 0 or trimmed.starts_with("#"):
+            continue
+        if trimmed.starts_with("[") and trimmed.ends_with("]"):
+            in_dependencies = trimmed == "[dependencies]"
+            continue
+        if in_dependencies:
+            eq := trimmed.index_of("=")
+            if eq < 0:
+                continue
+            name := trimmed.substring(0, eq).trim()
+            dep_path := package_dependency_path_value(trimmed.substring(eq + 1, trimmed.len()))
+            if name.len() > 0 and dep_path.len() > 0:
+                deps.push(PackageDependency(name, dep_path))
+    return deps
+
+fn package_safe_segment(value: String) -> Bool:
+    if value.len() == 0:
+        return false
+    if value == "." or value == "..":
+        return false
+    allowed := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+    for ch in value:
+        if not allowed.contains(ch):
+            return false
+    return true
+
+fn package_validate_cache_segment(label: String, value: String) -> String:
+    if not package_safe_segment(value):
+        print("error: invalid package " + label + " for cache path: " + value)
+        exit(1)
+    return value
+
+fn package_ensure_dir(path: String) -> Bool:
+    if dir_exists(path):
+        return true
+    if file_exists(path):
+        print("error: path is a file, not a directory: " + path)
+        exit(1)
+    parent := get_directory(path)
+    if parent != "." and parent != path:
+        package_ensure_dir(parent)
+    if not mkdir(path):
+        print("error: could not create directory: " + path)
+        exit(1)
+    return true
+
+fn package_copy_tree(from_path: String, to_path: String) -> Bool:
+    if dir_exists(from_path):
+        package_ensure_dir(to_path)
+        for entry in list_dir(from_path):
+            if entry == ".pith" or entry == ".git" or entry == ".pith-build" or entry == "target" or entry == "zig-out":
+                continue
+            package_copy_tree(package_join_path(from_path, entry), package_join_path(to_path, entry))
+        return true
+
+    if file_exists(from_path):
+        parent := get_directory(to_path)
+        if parent != ".":
+            package_ensure_dir(parent)
+        data := read_file_bytes(from_path)
+        if data.is_err:
+            print("error: could not read dependency file: " + from_path)
+            exit(1)
+        wrote := write_file_bytes(to_path, data.ok)
+        if wrote.is_err or not wrote.ok:
+            print("error: could not write cached dependency file: " + to_path)
+            exit(1)
+        return true
+
+    print("error: path does not exist: " + from_path)
+    exit(1)
+    return false
+
+fn package_dependency_version(dep_root: String) -> String!:
+    manifest_path := package_manifest_path(dep_root)
+    if not file_exists(manifest_path):
+        print("error: dependency manifest not found: " + manifest_path)
+        exit(1)
+    version := package_manifest_value(dep_root, "version")!
+    if version.len() == 0:
+        print("error: dependency version missing in: " + manifest_path)
+        exit(1)
+    return version
+
+fn package_dependency_manifest_name(dep_root: String) -> String!:
+    manifest_path := package_manifest_path(dep_root)
+    if not file_exists(manifest_path):
+        print("error: dependency manifest not found: " + manifest_path)
+        exit(1)
+    name := package_manifest_value(dep_root, "name")!
+    if name.len() == 0:
+        print("error: dependency name missing in: " + manifest_path)
+        exit(1)
+    return name
+
+fn package_cache_rel_path(dep: PackageDependency, version: String) -> String:
+    return ".pith/packages/" + dep.name + "-" + version
+
+fn package_lock_text(root: String, deps: List[PackageDependency], use_cache: Bool) -> String!:
+    nl := chr(10)
+    mut out := "# generated by pith package lock" + nl
+    out = out + "[dependencies]" + nl
+    for dep in deps:
+        dep_root := package_join_path(root, dep.path)
+        package_validate_cache_segment("name", dep.name)
+        version := package_dependency_version(dep_root)!
+        package_validate_cache_segment("version", version)
+        mut lock_path := dep.path
+        if use_cache:
+            lock_path = package_cache_rel_path(dep, version)
+        mut dep_line := dep.name + " = " + chr(123)
+        dep_line = dep_line + " path = " + chr(34) + lock_path + chr(34)
+        dep_line = dep_line + ", version = " + chr(34) + version + chr(34)
+        if use_cache:
+            dep_line = dep_line + ", source = " + chr(34) + dep.path + chr(34)
+        dep_line = dep_line + " " + chr(125)
+        out = out + dep_line + nl
+    return out
+
+fn package_current_root() -> String!:
+    if not file_exists("pith.toml"):
+        print("error: pith.toml not found; run this command from a package root")
+        exit(1)
+    return "."
+
+fn package_target_root(name: String) -> String!:
+    current := package_current_root()!
+    if name == "." or name == "":
+        return current
+    dep_root := package_dependency_root(current, name)
+    if dep_root.len() == 0:
+        print("error: package dependency '" + name + "' not found in pith.toml")
+        exit(1)
+    return dep_root
+
+fn package_skip_entry(name: String) -> Bool:
+    if name.starts_with("."):
+        return true
+    return name == "target" or name == "zig-out"
+
+fn package_collect_files(root: String, rel: String, depth: Int) -> List[String]:
+    mut files: List[String] := []
+    mut dir := root
+    if rel.len() > 0:
+        dir = package_join_path(root, rel)
+    if not dir_exists(dir):
+        return files
+    entries := list_dir(dir)
+    for entry in entries:
+        if package_skip_entry(entry):
+            continue
+        mut entry_rel := entry
+        if rel.len() > 0:
+            entry_rel = package_join_path(rel, entry)
+        full := package_join_path(root, entry_rel)
+        if file_exists(full) and entry.ends_with(".pith"):
+            files.push(entry_rel)
+        elif depth > 0 and dir_exists(full):
+            nested := package_collect_files(root, entry_rel, depth - 1)
+            for item in nested:
+                files.push(item)
+    return files
+
+fn package_print_summary(root: String, label: String) -> String!:
+    print("package: " + label)
+    name := package_manifest_value(root, "name")!
+    if name.len() > 0:
+        print("name: " + name)
+    version := package_manifest_value(root, "version")!
+    if version.len() > 0:
+        print("version: " + version)
+    description := package_manifest_value(root, "description")!
+    if description.len() > 0:
+        print("description: " + description)
+    license := package_manifest_value(root, "license")!
+    if license.len() > 0:
+        print("license: " + license)
+    print("root: " + package_root_file(root))
+    return ""
+
+fn package_print_dependencies(root: String):
+    deps := package_dependency_names(root)
+    if deps.len() == 0:
+        print("dependencies: none")
+        return
+    print("dependencies:")
+    for dep in deps:
+        print("- " + dep + " -> " + package_dependency_root(root, dep))
+
+fn package_print_files(root: String):
+    files := package_collect_files(root, "", 4)
+    if files.len() == 0:
+        print("files: none")
+        return
+    print("files:")
+    for file in files:
+        print("- " + file)
+
+fn package_print_api(root: String) -> String!:
+    root_file := package_root_file(root)
+    if not file_exists(root_file):
+        print("api: root file not found: " + root_file)
+        return ""
+    source := read_file(root_file)!
+    doc_extract(source)
+    print(doc_format())
+    return ""
+
+fn cmd_package_deps() -> String!:
+    root := package_current_root()!
+    package_print_dependencies(root)
+    return ""
+
+fn cmd_package_lock() -> String!:
+    root := package_current_root()!
+    deps := package_manifest_dependencies(root)!
+    write_file(package_lock_path(root), package_lock_text(root, deps, false)!)!
+    print("wrote pith.lock")
+    return ""
+
+fn cmd_package_install(refresh: Bool) -> String!:
+    root := package_current_root()!
+    deps := package_manifest_dependencies(root)!
+    cache_dir := package_cache_dir(root)
+    package_ensure_dir(cache_dir)
+    for dep in deps:
+        dep_root := package_join_path(root, dep.path)
+        if not dir_exists(dep_root):
+            print("error: dependency path not found: " + dep.path)
+            exit(1)
+        manifest_name := package_dependency_manifest_name(dep_root)!
+        package_validate_cache_segment("name", manifest_name)
+        package_validate_cache_segment("name", dep.name)
+        version := package_dependency_version(dep_root)!
+        package_validate_cache_segment("version", version)
+        cache_rel := package_cache_rel_path(dep, version)
+        cache_root := package_join_path(root, cache_rel)
+        if dir_exists(cache_root):
+            if refresh:
+                if not fs_remove_tree(cache_root):
+                    print("error: could not refresh cached dependency: " + cache_rel)
+                    exit(1)
+            else:
+                print("already installed " + dep.name + " " + version + " -> " + cache_rel)
+                continue
+        elif file_exists(cache_root):
+            print("error: cache path is a file, not a directory: " + cache_rel)
+            exit(1)
+        package_copy_tree(dep_root, cache_root)
+        print("installed " + dep.name + " " + version + " -> " + cache_rel)
+    write_file(package_lock_path(root), package_lock_text(root, deps, true)!)!
+    print("wrote pith.lock")
+    return ""
+
+fn cmd_package_inspect(name: String, api_only: Bool, files_only: Bool) -> String!:
+    root := package_target_root(name)!
+    if files_only:
+        package_print_files(root)
+        return ""
+    if api_only:
+        return package_print_api(root)
+    package_print_summary(root, name)!
+    package_print_dependencies(root)
+    package_print_files(root)
+    return package_print_api(root)
+
+fn cmd_package_context(name: String) -> String!:
+    root := package_target_root(name)!
+    print("# pith package context")
+    package_print_summary(root, name)!
+    print("")
+    print("## commands")
+    print("- pith package check")
+    print("- pith package test")
+    print("- pith package lint")
+    print("- pith package doc")
+    print("")
+    print("## dependencies")
+    package_print_dependencies(root)
+    print("")
+    print("## files")
+    package_print_files(root)
+    print("")
+    print("## public api")
+    return package_print_api(root)
+
+fn cmd_package(action: String, args_list: List[String]) -> String!:
     root := package_root_path()!
     if action == "check":
         return cmd_check(root, false)
@@ -289,8 +660,38 @@ fn cmd_package(action: String) -> String!:
         return cmd_lint(root, false)
     if action == "doc":
         return cmd_doc(root, false, false)
+    if action == "deps":
+        return cmd_package_deps()
+    if action == "lock":
+        return cmd_package_lock()
+    if action == "install":
+        mut refresh := false
+        if args_list.len() >= 4:
+            if args_list[3] == "--refresh":
+                refresh = true
+            else:
+                print("usage: pith package install [--refresh]")
+                exit(1)
+        return cmd_package_install(refresh)
+    if action == "inspect":
+        mut name := "."
+        mut api_only := false
+        mut files_only := false
+        if args_list.len() >= 4:
+            name = args_list[3]
+        if args_list.len() >= 5:
+            if args_list[4] == "--api":
+                api_only = true
+            elif args_list[4] == "--files":
+                files_only = true
+        return cmd_package_inspect(name, api_only, files_only)
+    if action == "context":
+        mut name := "."
+        if args_list.len() >= 4:
+            name = args_list[3]
+        return cmd_package_context(name)
 
-    print("usage: pith package <check|test|lint|doc>")
+    print("usage: pith package <check|test|lint|doc|deps|lock|install|inspect|context>")
     exit(1)
     return ""
 
@@ -314,6 +715,9 @@ fn cmd_new(name: String) -> String!:
     toml = toml + "description = " + chr(34) + "a short description of " + name + chr(34) + nl
     toml = toml + "root = " + chr(34) + "lib.pith" + chr(34) + nl
     toml = toml + "license = " + chr(34) + "MIT" + chr(34) + nl
+    toml = toml + nl
+    toml = toml + "[dependencies]" + nl
+    toml = toml + "# helper = " + chr(123) + " path = " + chr(34) + "../helper" + chr(34) + " " + chr(125) + nl
     write_file(name + "/pith.toml", toml)!
 
     # AGENTS.md
@@ -342,8 +746,9 @@ fn cmd_new(name: String) -> String!:
     agents = agents + "## finding things" + nl
     agents = agents + nl
     agents = agents + "    pith doc search " + chr(34) + "query" + chr(34) + "         search the standard library" + nl
-    agents = agents + "    pith inspect <package>          read a published package's source" + nl
-    agents = agents + "    pith inspect <package> --api    see just the public API" + nl
+    agents = agents + "    pith package inspect <package>          read a dependency package" + nl
+    agents = agents + "    pith package inspect <package> --api    see just the public API" + nl
+    agents = agents + "    pith package context <package>          compact context for agents" + nl
     agents = agents + nl
     agents = agents + "## publishing" + nl
     agents = agents + nl
@@ -462,6 +867,12 @@ fn print_help():
     print("  package test           run package root tests")
     print("  package lint           lint package root")
     print("  package doc            generate package root documentation")
+    print("  package deps           list package dependencies")
+    print("  package lock           write pith.lock")
+    print("  package install        copy path dependencies into .pith/packages")
+    print("  package install --refresh recopy existing cached dependencies")
+    print("  package inspect [pkg]  inspect current package or dependency")
+    print("  package context [pkg]  emit agent-readable package context")
     print("  new <name>             scaffold new package")
     print("  lex <file.pith>          print token stream")
     print("  parse <file.pith>        print AST")
@@ -561,9 +972,9 @@ fn run_cli() -> String!:
 
     if command == "package":
         if a.len() < 3:
-            print("usage: pith package <check|test|lint|doc>")
+            print("usage: pith package <check|test|lint|doc|deps|lock|install|inspect|context>")
             exit(1)
-        _result := cmd_package(a[2])!
+        _result := cmd_package(a[2], a)!
         return ""
 
     # scaffold new package

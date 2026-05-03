@@ -8,6 +8,31 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 fn main() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(run_cli);
+    std::panic::set_hook(previous_hook);
+
+    if let Err(payload) = result {
+        eprintln!(
+            "internal compiler error: {}",
+            panic_message(payload.as_ref())
+        );
+        std::process::exit(1);
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unexpected panic".to_string()
+}
+
+fn run_cli() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -137,8 +162,9 @@ fn find_self_hosted_compiler() -> Option<String> {
 
 /// Get AST from self-hosted compiler by running 'pith parse'
 fn get_ast_from_compiler(path: &str) -> Result<String, String> {
-    let compiler = find_self_hosted_compiler()
-        .ok_or("Self-hosted compiler not found. Set PITH_SELF_HOST or ensure ./self-host/pith_main exists")?;
+    let compiler = find_self_hosted_compiler().ok_or(
+        "Self-hosted compiler not found. Set PITH_SELF_HOST or ensure ./self-host/pith_main exists",
+    )?;
 
     let output = Command::new(&compiler)
         .args(["parse", path])

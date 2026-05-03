@@ -1,9 +1,55 @@
 use crate::collections::list::{pith_list_new, pith_list_push_value};
+use crate::handle_registry::{self, HandleKind};
 use crate::string;
+use std::alloc::{alloc, Layout};
 
 pub(crate) fn pith_strdup_string(text: &str) -> *mut i8 {
     let owned = format!("{}\0", text);
     unsafe { pith_strdup(owned.as_ptr() as *const i8) }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_runtime_error(code: i64) -> i64 {
+    let message = match code {
+        1 => "division by zero",
+        2 => "integer division overflow",
+        3 => "allocation failed",
+        4 => "invalid allocation layout",
+        _ => "runtime error",
+    };
+    eprintln!("pith runtime error: {message}");
+    std::process::exit(1);
+}
+
+pub(crate) fn pith_layout(size: usize, align: usize) -> Layout {
+    match Layout::from_size_align(size, align) {
+        Ok(layout) => layout,
+        Err(_) => {
+            eprintln!("pith runtime error: invalid allocation layout");
+            std::process::exit(1);
+        }
+    }
+}
+
+pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
+    let ptr = alloc(layout);
+    if ptr.is_null() {
+        eprintln!("pith runtime error: allocation failed");
+        std::process::exit(1);
+    }
+    ptr
+}
+
+pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
+    let layout = pith_layout(bytes.len() + 1, 1);
+    let ptr = pith_alloc(layout) as *mut i8;
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+    *ptr.add(bytes.len()) = 0;
+    ptr
+}
+
+pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
+    pith_copy_bytes_to_cstring(&[])
 }
 
 const PITH_CLOSURE_ENV_SLOTS: usize = 16;
@@ -14,14 +60,14 @@ struct PithClosure {
 }
 
 unsafe fn pith_closure_mut<'a>(handle: i64) -> Option<&'a mut PithClosure> {
-    if handle == 0 {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Closure) {
         return None;
     }
     Some(&mut *(handle as *mut PithClosure))
 }
 
 unsafe fn pith_closure_ref<'a>(handle: i64) -> Option<&'a PithClosure> {
-    if handle == 0 {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::Closure) {
         return None;
     }
     Some(&*(handle as *const PithClosure))
@@ -29,10 +75,12 @@ unsafe fn pith_closure_ref<'a>(handle: i64) -> Option<&'a PithClosure> {
 
 #[no_mangle]
 pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
-    Box::into_raw(Box::new(PithClosure {
+    let ptr = Box::into_raw(Box::new(PithClosure {
         func_ptr,
         env: [0; PITH_CLOSURE_ENV_SLOTS],
-    })) as i64
+    }));
+    handle_registry::register(ptr as *const (), HandleKind::Closure);
+    ptr as i64
 }
 
 #[no_mangle]
@@ -81,6 +129,37 @@ pub unsafe extern "C" fn pith_print(s: string::PithString) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_closure_handles_return_safe_defaults() {
+        unsafe {
+            assert_eq!(pith_closure_get_fn(12345), 0);
+            assert_eq!(pith_closure_get_env(12345, 0), 0);
+            pith_closure_set_env(12345, 0, 99);
+        }
+    }
+
+    #[test]
+    fn closure_env_access_requires_valid_slot() {
+        let handle = pith_closure_new(77);
+        unsafe {
+            pith_closure_set_env(handle, 0, 42);
+            pith_closure_set_env(handle, -1, 99);
+            pith_closure_set_env(handle, PITH_CLOSURE_ENV_SLOTS as i64, 99);
+            assert_eq!(pith_closure_get_fn(handle), 77);
+            assert_eq!(pith_closure_get_env(handle, 0), 42);
+            assert_eq!(pith_closure_get_env(handle, -1), 0);
+            assert_eq!(
+                pith_closure_get_env(handle, PITH_CLOSURE_ENV_SLOTS as i64),
+                0
+            );
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn pith_print_int(n: i64) {
     println!("{}", n);
@@ -88,8 +167,6 @@ pub extern "C" fn pith_print_int(n: i64) {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if a.is_null() {
         return if b.is_null() {
             std::ptr::null_mut()
@@ -104,12 +181,8 @@ pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8
     let len_a = string::pith_cstring_len(a) as usize;
     let len_b = string::pith_cstring_len(b) as usize;
     let total_len = len_a + len_b;
-    let layout = Layout::from_size_align(total_len + 1, 1).unwrap();
-    let result = alloc(layout) as *mut i8;
-
-    if result.is_null() {
-        return std::ptr::null_mut();
-    }
+    let layout = pith_layout(total_len + 1, 1);
+    let result = pith_alloc(layout) as *mut i8;
 
     std::ptr::copy_nonoverlapping(a, result, len_a);
     std::ptr::copy_nonoverlapping(b, result.add(len_a), len_b);
@@ -119,19 +192,14 @@ pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_strdup(ptr: *const i8) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     if ptr.is_null() {
         return std::ptr::null_mut();
     }
 
     let len = string::pith_cstring_len(ptr) as usize;
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let result = alloc(layout) as *mut i8;
-
-    if !result.is_null() {
-        std::ptr::copy_nonoverlapping(ptr, result, len + 1);
-    }
+    let layout = pith_layout(len + 1, 1);
+    let result = pith_alloc(layout) as *mut i8;
+    std::ptr::copy_nonoverlapping(ptr, result, len + 1);
 
     result
 }
@@ -209,15 +277,10 @@ pub unsafe extern "C" fn pith_ord_cstr(s: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_chr_cstr(n: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
-    let layout = Layout::from_size_align(2, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-
-    if !ptr.is_null() {
-        *ptr = (n as u8) as i8;
-        *ptr.add(1) = 0;
-    }
+    let layout = pith_layout(2, 1);
+    let ptr = pith_alloc(layout) as *mut i8;
+    *ptr = (n as u8) as i8;
+    *ptr.add(1) = 0;
 
     ptr
 }
@@ -249,61 +312,101 @@ pub extern "C" fn pith_assert_ne(a: i64, b: i64) {
 }
 
 #[no_mangle]
-pub extern "C" fn pith_bit_and(a: i64, b: i64) -> i64 { a & b }
+pub extern "C" fn pith_bit_and(a: i64, b: i64) -> i64 {
+    a & b
+}
 
 #[no_mangle]
-pub extern "C" fn pith_bit_or(a: i64, b: i64) -> i64 { a | b }
+pub extern "C" fn pith_bit_or(a: i64, b: i64) -> i64 {
+    a | b
+}
 
 #[no_mangle]
-pub extern "C" fn pith_bit_xor(a: i64, b: i64) -> i64 { a ^ b }
+pub extern "C" fn pith_bit_xor(a: i64, b: i64) -> i64 {
+    a ^ b
+}
 
 #[no_mangle]
-pub extern "C" fn pith_bit_not(a: i64) -> i64 { !a }
+pub extern "C" fn pith_bit_not(a: i64) -> i64 {
+    !a
+}
 
 #[no_mangle]
-pub extern "C" fn pith_bit_shl(a: i64, b: i64) -> i64 { a << b }
+pub extern "C" fn pith_bit_shl(a: i64, b: i64) -> i64 {
+    a << b
+}
 
 #[no_mangle]
-pub extern "C" fn pith_bit_shr(a: i64, b: i64) -> i64 { ((a as u64) >> b) as i64 }
+pub extern "C" fn pith_bit_shr(a: i64, b: i64) -> i64 {
+    ((a as u64) >> b) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_uint(n: i64) -> i64 { n }
+pub extern "C" fn pith_uint(n: i64) -> i64 {
+    n
+}
 
 #[no_mangle]
-pub extern "C" fn pith_int8(n: i64) -> i64 { (n as i8) as i64 }
+pub extern "C" fn pith_int8(n: i64) -> i64 {
+    (n as i8) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_int16(n: i64) -> i64 { (n as i16) as i64 }
+pub extern "C" fn pith_int16(n: i64) -> i64 {
+    (n as i16) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_int32(n: i64) -> i64 { (n as i32) as i64 }
+pub extern "C" fn pith_int32(n: i64) -> i64 {
+    (n as i32) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_int64(n: i64) -> i64 { n }
+pub extern "C" fn pith_int64(n: i64) -> i64 {
+    n
+}
 
 #[no_mangle]
-pub extern "C" fn pith_uint8(n: i64) -> i64 { (n as u8) as i64 }
+pub extern "C" fn pith_uint8(n: i64) -> i64 {
+    (n as u8) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_uint16(n: i64) -> i64 { (n as u16) as i64 }
+pub extern "C" fn pith_uint16(n: i64) -> i64 {
+    (n as u16) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_uint32(n: i64) -> i64 { (n as u32) as i64 }
+pub extern "C" fn pith_uint32(n: i64) -> i64 {
+    (n as u32) as i64
+}
 
 #[no_mangle]
-pub extern "C" fn pith_uint64(n: i64) -> i64 { n }
+pub extern "C" fn pith_uint64(n: i64) -> i64 {
+    n
+}
 
 #[no_mangle]
-pub extern "C" fn pith_abs(n: i64) -> i64 { n.abs() }
+pub extern "C" fn pith_abs(n: i64) -> i64 {
+    n.abs()
+}
 
 #[no_mangle]
 pub extern "C" fn pith_min(a: i64, b: i64) -> i64 {
-    if a < b { a } else { b }
+    if a < b {
+        a
+    } else {
+        b
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn pith_max(a: i64, b: i64) -> i64 {
-    if a > b { a } else { b }
+    if a > b {
+        a
+    } else {
+        b
+    }
 }
 
 #[no_mangle]
@@ -318,61 +421,101 @@ pub extern "C" fn pith_clamp(n: i64, min: i64, max: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn pith_pow(a: f64, b: f64) -> f64 { a.powf(b) }
+pub extern "C" fn pith_pow(a: f64, b: f64) -> f64 {
+    a.powf(b)
+}
 
 #[no_mangle]
-pub extern "C" fn pith_sqrt(n: f64) -> f64 { n.sqrt() }
+pub extern "C" fn pith_sqrt(n: f64) -> f64 {
+    n.sqrt()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_floor(n: f64) -> f64 { n.floor() }
+pub extern "C" fn pith_floor(n: f64) -> f64 {
+    n.floor()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_ceil(n: f64) -> f64 { n.ceil() }
+pub extern "C" fn pith_ceil(n: f64) -> f64 {
+    n.ceil()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_round(n: f64) -> f64 { n.round() }
+pub extern "C" fn pith_round(n: f64) -> f64 {
+    n.round()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_sin(n: f64) -> f64 { n.sin() }
+pub extern "C" fn pith_sin(n: f64) -> f64 {
+    n.sin()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_cos(n: f64) -> f64 { n.cos() }
+pub extern "C" fn pith_cos(n: f64) -> f64 {
+    n.cos()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_tan(n: f64) -> f64 { n.tan() }
+pub extern "C" fn pith_tan(n: f64) -> f64 {
+    n.tan()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_asin(n: f64) -> f64 { n.asin() }
+pub extern "C" fn pith_asin(n: f64) -> f64 {
+    n.asin()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_acos(n: f64) -> f64 { n.acos() }
+pub extern "C" fn pith_acos(n: f64) -> f64 {
+    n.acos()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_atan(n: f64) -> f64 { n.atan() }
+pub extern "C" fn pith_atan(n: f64) -> f64 {
+    n.atan()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_atan2(y: f64, x: f64) -> f64 { y.atan2(x) }
+pub extern "C" fn pith_atan2(y: f64, x: f64) -> f64 {
+    y.atan2(x)
+}
 
 #[no_mangle]
-pub extern "C" fn pith_log(n: f64) -> f64 { n.ln() }
+pub extern "C" fn pith_log(n: f64) -> f64 {
+    n.ln()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_log10(n: f64) -> f64 { n.log10() }
+pub extern "C" fn pith_log10(n: f64) -> f64 {
+    n.log10()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_log2(n: f64) -> f64 { n.log2() }
+pub extern "C" fn pith_log2(n: f64) -> f64 {
+    n.log2()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_exp(n: f64) -> f64 { n.exp() }
+pub extern "C" fn pith_exp(n: f64) -> f64 {
+    n.exp()
+}
 
 #[no_mangle]
-pub extern "C" fn pith_abs_float(n: f64) -> f64 { n.abs() }
+pub extern "C" fn pith_abs_float(n: f64) -> f64 {
+    n.abs()
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_compare(a: *const i8, b: *const i8) -> i64 {
-    if a.is_null() && b.is_null() { return 0; }
-    if a.is_null() { return -1; }
-    if b.is_null() { return 1; }
+    if a.is_null() && b.is_null() {
+        return 0;
+    }
+    if a.is_null() {
+        return -1;
+    }
+    if b.is_null() {
+        return 1;
+    }
     let mut pa = a;
     let mut pb = b;
     loop {
@@ -391,99 +534,74 @@ pub unsafe extern "C" fn pith_cstring_compare(a: *const i8, b: *const i8) -> i64
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_lt(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) < 0 { 1 } else { 0 }
+    if pith_cstring_compare(a, b) < 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_gt(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) > 0 { 1 } else { 0 }
+    if pith_cstring_compare(a, b) > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_lte(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) <= 0 { 1 } else { 0 }
+    if pith_cstring_compare(a, b) <= 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_gte(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) >= 0 { 1 } else { 0 }
+    if pith_cstring_compare(a, b) >= 0 {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_cstr(n: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let s = n.to_string();
     let len = s.len();
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(s.as_ptr(), ptr as *mut u8, len);
-        *ptr.add(len) = 0;
-    }
-
-    ptr
+    pith_copy_bytes_to_cstring(&s.as_bytes()[..len])
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_uint_to_cstr(n: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let s = (n as u64).to_string();
     let len = s.len();
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(s.as_ptr(), ptr as *mut u8, len);
-        *ptr.add(len) = 0;
-    }
-
-    ptr
+    pith_copy_bytes_to_cstring(&s.as_bytes()[..len])
 }
 
 #[no_mangle]
 pub extern "C" fn pith_float_to_cstr(n: f64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let s = if n == n.floor() && n.abs() < 1e15 {
         format!("{}", n as i64)
     } else {
         let formatted = format!("{:.6}", n);
-        formatted.trim_end_matches('0').trim_end_matches('.').to_string()
+        formatted
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
     };
     let len = s.len();
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = unsafe { alloc(layout) as *mut i8 };
-
-    if !ptr.is_null() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(s.as_ptr(), ptr as *mut u8, len);
-            *ptr.add(len) = 0;
-        }
-    }
-
-    ptr
+    unsafe { pith_copy_bytes_to_cstring(&s.as_bytes()[..len]) }
 }
 
 #[no_mangle]
 pub extern "C" fn pith_bool_to_cstr(b: i64) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
     let s = if b != 0 { "true" } else { "false" };
     let len = s.len();
-    let layout = Layout::from_size_align(len + 1, 1).unwrap();
-    let ptr = unsafe { alloc(layout) as *mut i8 };
-
-    if !ptr.is_null() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(s.as_ptr(), ptr as *mut u8, len);
-            *ptr.add(len) = 0;
-        }
-    }
-
-    ptr
+    unsafe { pith_copy_bytes_to_cstring(&s.as_bytes()[..len]) }
 }
 
 pub use pith_ceil as pith_math_ceil;
@@ -502,70 +620,46 @@ pub unsafe extern "C" fn pith_free(ptr: *mut i8) {
 }
 
 #[no_mangle]
-pub extern "C" fn pith_int_to_float(n: i64) -> f64 { n as f64 }
-
-#[no_mangle]
-pub extern "C" fn pith_float_to_int(n: f64) -> i64 { n as i64 }
-
-pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
-    let layout = Layout::from_size_align(1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        *ptr = 0;
-    }
-    ptr
-}
-
-pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
-    use std::alloc::{alloc, Layout};
-
-    let layout = Layout::from_size_align(bytes.len() + 1, 1).unwrap();
-    let ptr = alloc(layout) as *mut i8;
-    if !ptr.is_null() {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        *ptr.add(bytes.len()) = 0;
-    }
-    ptr
+pub extern "C" fn pith_int_to_float(n: i64) -> f64 {
+    n as f64
 }
 
 #[no_mangle]
-pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 { b }
+pub extern "C" fn pith_float_to_int(n: f64) -> i64 {
+    n as i64
+}
+
+#[no_mangle]
+pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
+    b
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
-    use std::alloc::{alloc_zeroed, Layout};
+    use std::alloc::alloc_zeroed;
 
     let size = (num_fields.max(0) as usize) * 8;
     if size == 0 {
         return 0;
     }
 
-    let layout = Layout::from_size_align(size, 8).unwrap();
+    let layout = pith_layout(size, 8);
     let ptr = alloc_zeroed(layout);
     if ptr.is_null() {
-        return 0;
+        eprintln!("pith runtime error: allocation failed");
+        std::process::exit(1);
     }
     ptr as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_args_to_list() -> i64 {
-    use std::alloc::{alloc, Layout};
-
     let list = pith_list_new(8, 0);
 
     for arg in std::env::args() {
         let arg_len = arg.len();
-        let arg_layout = Layout::from_size_align(arg_len + 1, 1).unwrap();
-        let arg_ptr = alloc(arg_layout) as *mut i8;
-
-        if !arg_ptr.is_null() {
-            std::ptr::copy_nonoverlapping(arg.as_ptr(), arg_ptr as *mut u8, arg_len);
-            *arg_ptr.add(arg_len) = 0;
-            pith_list_push_value(list, arg_ptr as i64);
-        }
+        let arg_ptr = pith_copy_bytes_to_cstring(&arg.as_bytes()[..arg_len]);
+        pith_list_push_value(list, arg_ptr as i64);
     }
 
     list.ptr as i64

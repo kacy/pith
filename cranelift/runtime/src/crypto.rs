@@ -1,4 +1,5 @@
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
+use crate::handle_registry::{self, HandleKind};
 use ring::{aead, agreement, rand, signature};
 use std::fs;
 
@@ -9,6 +10,20 @@ struct PithX25519Key {
 
 unsafe fn bytes_slice<'a>(handle: i64) -> Option<&'a [u8]> {
     Some(pith_bytes_ref(handle)?.data.as_slice())
+}
+
+unsafe fn x25519_key_ref<'a>(handle: i64) -> Option<&'a PithX25519Key> {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::X25519Key) {
+        return None;
+    }
+    Some(&*(handle as *const PithX25519Key))
+}
+
+unsafe fn x25519_key_mut<'a>(handle: i64) -> Option<&'a mut PithX25519Key> {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::X25519Key) {
+        return None;
+    }
+    Some(&mut *(handle as *mut PithX25519Key))
 }
 
 fn seal_with(
@@ -101,18 +116,19 @@ pub extern "C" fn pith_crypto_x25519_keygen() -> i64 {
     let Ok(public_key) = key.compute_public_key() else {
         return 0;
     };
-    Box::into_raw(Box::new(PithX25519Key {
+    let ptr = Box::into_raw(Box::new(PithX25519Key {
         key: Some(key),
         public_key: public_key.as_ref().to_vec(),
-    })) as i64
+    }));
+    handle_registry::register(ptr as *const (), HandleKind::X25519Key);
+    ptr as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_x25519_public_key(handle: i64) -> i64 {
-    if handle <= 0 {
+    let Some(key) = x25519_key_ref(handle) else {
         return 0;
-    }
-    let key = &*(handle as *const PithX25519Key);
+    };
     pith_bytes_from_vec(key.public_key.clone())
 }
 
@@ -121,13 +137,12 @@ pub unsafe extern "C" fn pith_crypto_x25519_shared_secret(
     handle: i64,
     peer_public_key: i64,
 ) -> i64 {
-    if handle <= 0 {
-        return 0;
-    }
     let Some(peer) = bytes_slice(peer_public_key) else {
         return 0;
     };
-    let key = &mut *(handle as *mut PithX25519Key);
+    let Some(key) = x25519_key_mut(handle) else {
+        return 0;
+    };
     let Some(private_key) = key.key.take() else {
         return 0;
     };
@@ -140,9 +155,10 @@ pub unsafe extern "C" fn pith_crypto_x25519_shared_secret(
 
 #[no_mangle]
 pub extern "C" fn pith_crypto_x25519_close(handle: i64) {
-    if handle <= 0 {
+    if !handle_registry::is_valid(handle as *const (), HandleKind::X25519Key) {
         return;
     }
+    handle_registry::unregister(handle as *const (), HandleKind::X25519Key);
     let _ = unsafe { Box::from_raw(handle as *mut PithX25519Key) };
 }
 
@@ -351,4 +367,30 @@ pub extern "C" fn pith_os_cert_roots_pem() -> *mut i8 {
         }
     }
     unsafe { crate::pith_cstring_empty() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_x25519_handles_return_safe_defaults() {
+        unsafe {
+            assert_eq!(pith_crypto_x25519_public_key(12345), 0);
+            assert_eq!(pith_crypto_x25519_shared_secret(12345, 0), 0);
+        }
+        pith_crypto_x25519_close(12345);
+    }
+
+    #[test]
+    fn closed_x25519_handle_is_rejected() {
+        let handle = pith_crypto_x25519_keygen();
+        assert!(handle > 0);
+        pith_crypto_x25519_close(handle);
+        unsafe {
+            assert_eq!(pith_crypto_x25519_public_key(handle), 0);
+            assert_eq!(pith_crypto_x25519_shared_secret(handle, 0), 0);
+        }
+        pith_crypto_x25519_close(handle);
+    }
 }

@@ -85,6 +85,215 @@ mut stdlib_root_directory: String := ""
 mut driver_parse_diagnostics: List[Diagnostic] := []
 mut resolved_module_paths: Map[Int, String] := {}
 mut resolved_module_files: Map[Int, String] := {}
+mut package_dependency_loaded: Map[String, Bool] := {}
+mut package_dependency_roots: Map[String, String] := {}
+
+fn dr_join_path(base: String, child: String) -> String:
+    if child.len() == 0:
+        return base
+    if child.starts_with("/"):
+        return child
+    if base == "" or base == ".":
+        return child
+    return base + "/" + child
+
+fn dr_manifest_path(package_root: String) -> String:
+    return dr_join_path(package_root, "pith.toml")
+
+fn dr_lock_path(package_root: String) -> String:
+    return dr_join_path(package_root, "pith.lock")
+
+fn dr_strip_quotes(value: String) -> String:
+    trimmed := value.trim()
+    if trimmed.len() >= 2 and trimmed[0] == chr(34) and trimmed[trimmed.len() - 1] == chr(34):
+        return trimmed.substring(1, trimmed.len() - 1)
+    return trimmed
+
+fn dr_value_for_key(line: String, key: String) -> String:
+    trimmed := line.trim()
+    prefix := key + " "
+    if not trimmed.starts_with(prefix):
+        return ""
+    eq := trimmed.index_of("=")
+    if eq < 0:
+        return ""
+    return dr_strip_quotes(trimmed.substring(eq + 1, trimmed.len()))
+
+fn dr_find_package_root(source_path: String) -> String:
+    mut dir := get_directory(source_path)
+    mut depth := 0
+    while depth < 20:
+        manifest := dr_manifest_path(dir)
+        if file_exists(manifest):
+            return dir
+        parent := get_directory(dir)
+        if parent == dir:
+            break
+        dir = parent
+        depth = depth + 1
+    return ""
+
+fn dr_root_file_for_package(package_root: String) -> String:
+    manifest_path := dr_manifest_path(package_root)
+    if not file_exists(manifest_path):
+        return dr_join_path(package_root, "lib.pith")
+    manifest := read_file(manifest_path).unwrap_or("")
+    for line in manifest.split(chr(10)):
+        root := dr_value_for_key(line, "root")
+        if root.len() > 0:
+            return dr_join_path(package_root, root)
+    return dr_join_path(package_root, "lib.pith")
+
+fn dr_extract_braced_path(value: String) -> String:
+    path_pos := value.index_of("path")
+    if path_pos < 0:
+        return ""
+    rest := value.substring(path_pos + 4, value.len())
+    eq := rest.index_of("=")
+    if eq < 0:
+        return ""
+    after := rest.substring(eq + 1, rest.len()).trim()
+    if after.len() == 0:
+        return ""
+    if after[0] == chr(34):
+        mut end := 1
+        while end < after.len():
+            if after[end] == chr(34):
+                return after.substring(1, end)
+            end = end + 1
+        return ""
+    mut end := 0
+    while end < after.len():
+        if after[end] == "," or after[end] == chr(125):
+            break
+        end = end + 1
+    return after.substring(0, end).trim()
+
+fn dr_dependency_path_value(value: String) -> String:
+    trimmed := value.trim()
+    if trimmed.len() == 0:
+        return ""
+    if trimmed[0] == chr(34):
+        return dr_strip_quotes(trimmed)
+    if trimmed[0] == chr(123):
+        return dr_extract_braced_path(trimmed)
+    return ""
+
+fn dr_dependency_key(package_root: String, dep_name: String) -> String:
+    return package_root + "|" + dep_name
+
+fn dr_load_dependency_file(package_root: String, path: String):
+    if not file_exists(path):
+        return
+    manifest := read_file(path).unwrap_or("")
+    mut in_dependencies := false
+    for line in manifest.split(chr(10)):
+        trimmed := line.trim()
+        if trimmed.len() == 0 or trimmed.starts_with("#"):
+            continue
+        if trimmed.starts_with("[") and trimmed.ends_with("]"):
+            in_dependencies = trimmed == "[dependencies]"
+            continue
+        if in_dependencies:
+            eq := trimmed.index_of("=")
+            if eq < 0:
+                continue
+            dep_name := trimmed.substring(0, eq).trim()
+            dep_path := dr_dependency_path_value(trimmed.substring(eq + 1, trimmed.len()))
+            if dep_name.len() > 0 and dep_path.len() > 0:
+                key := dr_dependency_key(package_root, dep_name)
+                root := dr_join_path(package_root, dep_path)
+                package_dependency_roots.insert(key, root)
+
+fn dr_load_package_dependencies(package_root: String):
+    if package_root == "":
+        return
+    if package_dependency_loaded.contains_key(package_root):
+        return
+    package_dependency_loaded.insert(package_root, true)
+    lock_path := dr_lock_path(package_root)
+    if file_exists(lock_path):
+        dr_load_dependency_file(package_root, lock_path)
+        return
+    dr_load_dependency_file(package_root, dr_manifest_path(package_root))
+
+fn dr_first_module_segment(mod_path: String) -> String:
+    dot := mod_path.index_of(".")
+    if dot < 0:
+        return mod_path
+    return mod_path.substring(0, dot)
+
+fn dr_dependency_root_for(source_path: String, dep_name: String) -> String:
+    package_root := dr_find_package_root(source_path)
+    if package_root == "":
+        return ""
+    dr_load_package_dependencies(package_root)
+    key := dr_dependency_key(package_root, dep_name)
+    if package_dependency_roots.contains_key(key):
+        return package_dependency_roots[key]
+    return ""
+
+fn dr_dependency_module_file(mod_path: String, source_path: String) -> String:
+    dep_name := dr_first_module_segment(mod_path)
+    dep_root := dr_dependency_root_for(source_path, dep_name)
+    if dep_root == "":
+        return ""
+    if mod_path == dep_name:
+        return dr_root_file_for_package(dep_root)
+    rest := mod_path.substring(dep_name.len() + 1, mod_path.len())
+    return dr_join_path(dep_root, dots_to_slashes(rest) + ".pith")
+
+fn dr_local_module_file(mod_path: String, source_path: String) -> String:
+    rel_path := dots_to_slashes(mod_path)
+    dir := get_directory(source_path)
+    if dir == ".":
+        return rel_path + ".pith"
+    return dir + "/" + rel_path + ".pith"
+
+fn dr_std_module_file(mod_path: String, source_path: String) -> String:
+    rel_path := dots_to_slashes(mod_path)
+    dir := get_directory(source_path)
+    if stdlib_root_directory != "":
+        return stdlib_root_directory + "/" + rel_path + ".pith"
+    if dir == ".":
+        return rel_path + ".pith"
+    return dir + "/" + rel_path + ".pith"
+
+fn dr_resolve_module_file(mod_path: String, source_path: String) -> String:
+    if mod_path.starts_with("std.") or mod_path == "std":
+        return dr_std_module_file(mod_path, source_path)
+
+    local_file := dr_local_module_file(mod_path, source_path)
+    if file_exists(local_file):
+        return local_file
+
+    dep_file := dr_dependency_module_file(mod_path, source_path)
+    if dep_file.len() > 0:
+        return dep_file
+
+    return local_file
+
+pub fn package_root_for_source(source_path: String) -> String:
+    return dr_find_package_root(source_path)
+
+pub fn package_root_file(package_root: String) -> String:
+    return dr_root_file_for_package(package_root)
+
+pub fn package_dependency_root(package_root: String, dep_name: String) -> String:
+    dr_load_package_dependencies(package_root)
+    key := dr_dependency_key(package_root, dep_name)
+    if package_dependency_roots.contains_key(key):
+        return package_dependency_roots[key]
+    return ""
+
+pub fn package_dependency_names(package_root: String) -> List[String]:
+    dr_load_package_dependencies(package_root)
+    mut names: List[String] := []
+    prefix := package_root + "|"
+    for key in package_dependency_roots.keys():
+        if key.starts_with(prefix):
+            names.push(key.substring(prefix.len(), key.len()))
+    return names
 
 # convert a dotted module path to a file path segment.
 # "std.math" -> "std/math", "foo" -> "foo"
@@ -121,24 +330,9 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
     mut roots: List[Int] := []
     if driver_parse_diagnostics.len() > 0:
         return roots
-    dir := get_directory(source_path)
     imports := find_imports(root_idx)
     for mod_path in imports:
-        # convert dots to slashes for file path
-        rel_path := dots_to_slashes(mod_path)
-        mut file_path := ""
-        # if module starts with "std.", resolve relative to stdlib root
-        if mod_path.starts_with("std.") or mod_path == "std":
-            if stdlib_root_directory != "":
-                file_path = stdlib_root_directory + "/" + rel_path + ".pith"
-            elif dir == ".":
-                file_path = rel_path + ".pith"
-            else:
-                file_path = dir + "/" + rel_path + ".pith"
-        elif dir == ".":
-            file_path = rel_path + ".pith"
-        else:
-            file_path = dir + "/" + rel_path + ".pith"
+        file_path := dr_resolve_module_file(mod_path, source_path)
         if visited_files.contains_key(file_path):
             continue
         # Check for import cycles (must check this AFTER checking visited)
@@ -186,6 +380,8 @@ pub fn init_driver(source_path: String):
     driver_parse_diagnostics = []
     resolved_module_paths = {}
     resolved_module_files = {}
+    package_dependency_loaded = {}
+    package_dependency_roots = {}
     mark_visited(source_path)
 
 pub fn get_driver_parse_diagnostics() -> List[Diagnostic]:

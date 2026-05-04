@@ -1,6 +1,17 @@
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::ffi_util::{cstr_str, cstr_str_or_empty};
 
+const DEFAULT_TCP_READ_BYTES: usize = 4096;
+const MAX_TCP_READ_BYTES: usize = 64 * 1024 * 1024;
+
+fn tcp_read_size(max_bytes: i64) -> usize {
+    if max_bytes <= 0 {
+        DEFAULT_TCP_READ_BYTES
+    } else {
+        (max_bytes as usize).min(MAX_TCP_READ_BYTES)
+    }
+}
+
 /// TCP listen — bind and listen on addr:port, return server fd
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
@@ -74,8 +85,10 @@ pub extern "C" fn pith_tcp_read(conn_fd: i64) -> *mut i8 {
     let result = match stream.read(&mut buf) {
         Ok(n) => {
             buf.truncate(n);
-            let s = String::from_utf8_lossy(&buf).to_string();
-            crate::pith_strdup_string(&s)
+            unsafe {
+                crate::runtime_core::pith_try_copy_bytes_to_cstring(&buf)
+                    .unwrap_or(std::ptr::null_mut())
+            }
         }
         Err(_) => std::ptr::null_mut(),
     };
@@ -95,17 +108,15 @@ pub extern "C" fn pith_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
         return std::ptr::null_mut();
     }
     let mut stream = unsafe { TcpStream::from_raw_fd(conn_fd as i32) };
-    let size = if max_bytes > 0 {
-        max_bytes as usize
-    } else {
-        4096
-    };
+    let size = tcp_read_size(max_bytes);
     let mut buf = vec![0u8; size];
     let result = match stream.read(&mut buf) {
         Ok(n) => {
             buf.truncate(n);
-            let s = String::from_utf8_lossy(&buf).to_string();
-            crate::pith_strdup_string(&s)
+            unsafe {
+                crate::runtime_core::pith_try_copy_bytes_to_cstring(&buf)
+                    .unwrap_or(std::ptr::null_mut())
+            }
         }
         Err(_) => std::ptr::null_mut(),
     };
@@ -124,11 +135,7 @@ pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
         return 0;
     }
     let mut stream = unsafe { TcpStream::from_raw_fd(conn_fd as i32) };
-    let size = if max_bytes > 0 {
-        max_bytes as usize
-    } else {
-        4096
-    };
+    let size = tcp_read_size(max_bytes);
     let mut buf = vec![0u8; size];
     let result = match stream.read(&mut buf) {
         Ok(n) => {
@@ -290,6 +297,14 @@ pub unsafe extern "C" fn pith_dns_resolve(hostname: *const i8) -> *mut i8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_read_size_is_bounded() {
+        assert_eq!(tcp_read_size(0), DEFAULT_TCP_READ_BYTES);
+        assert_eq!(tcp_read_size(-1), DEFAULT_TCP_READ_BYTES);
+        assert_eq!(tcp_read_size(32), 32);
+        assert_eq!(tcp_read_size(i64::MAX), MAX_TCP_READ_BYTES);
+    }
 
     #[test]
     fn dns_resolve_rejects_null_and_invalid_utf8() {

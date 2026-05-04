@@ -14,6 +14,19 @@ pub(crate) struct PithByteBuffer {
     pub(crate) data: Vec<u8>,
 }
 
+const MAX_BYTE_ALLOCATION: usize = 64 * 1024 * 1024;
+
+fn requested_byte_len(count: i64) -> Option<usize> {
+    if count < 0 {
+        return Some(0);
+    }
+    let len = count as usize;
+    if len > MAX_BYTE_ALLOCATION {
+        return None;
+    }
+    Some(len)
+}
+
 pub(crate) unsafe fn pith_bytes_ref<'a>(handle: i64) -> Option<&'a PithBytes> {
     if !handle_registry::is_valid(handle as *const (), HandleKind::Bytes) {
         return None;
@@ -117,7 +130,13 @@ pub unsafe extern "C" fn pith_bytes_concat(a: i64, b: i64) -> i64 {
     let Some(b_bytes) = pith_bytes_ref(b) else {
         return 0;
     };
-    let mut out = Vec::with_capacity(a_bytes.data.len() + b_bytes.data.len());
+    let Some(total_len) = a_bytes.data.len().checked_add(b_bytes.data.len()) else {
+        return 0;
+    };
+    let mut out = Vec::new();
+    if out.try_reserve(total_len).is_err() {
+        return 0;
+    }
     out.extend_from_slice(&a_bytes.data);
     out.extend_from_slice(&b_bytes.data);
     pith_bytes_from_vec(out)
@@ -167,7 +186,9 @@ pub unsafe extern "C" fn pith_crypto_constant_time_eq(a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn pith_secure_random_bytes(count: i64) -> i64 {
-    let len = count.max(0) as usize;
+    let Some(len) = requested_byte_len(count) else {
+        return 0;
+    };
     let mut out = vec![0_u8; len];
     if len == 0 {
         return pith_bytes_from_vec(out);
@@ -190,12 +211,16 @@ pub extern "C" fn pith_byte_buffer_new() -> i64 {
 
 #[no_mangle]
 pub extern "C" fn pith_byte_buffer_with_capacity(capacity: i64) -> i64 {
-    let cap = if capacity > 0 { capacity as usize } else { 0 };
+    let Some(cap) = requested_byte_len(capacity) else {
+        return 0;
+    };
     ensure_perf_stats_registered();
     perf_count(&PERF_BYTE_BUFFER_NEWS, 1);
-    let ptr = Box::into_raw(Box::new(PithByteBuffer {
-        data: Vec::with_capacity(cap),
-    }));
+    let mut data = Vec::new();
+    if data.try_reserve(cap).is_err() {
+        return 0;
+    }
+    let ptr = Box::into_raw(Box::new(PithByteBuffer { data }));
     handle_registry::register(ptr as *const (), HandleKind::ByteBuffer);
     ptr as i64
 }
@@ -321,6 +346,12 @@ mod tests {
             assert_eq!(pith_byte_buffer_bytes(12345), 0);
             pith_byte_buffer_clear(12345);
         }
+    }
+
+    #[test]
+    fn large_byte_requests_return_safe_defaults() {
+        assert_eq!(pith_secure_random_bytes(i64::MAX), 0);
+        assert_eq!(pith_byte_buffer_with_capacity(i64::MAX), 0);
     }
 
     #[test]

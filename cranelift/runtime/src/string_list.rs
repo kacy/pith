@@ -376,18 +376,30 @@ pub unsafe extern "C" fn pith_cstring_replace(
         return copy_bytes(s_bytes);
     }
 
-    let mut result: Vec<u8> = Vec::with_capacity(s_len);
+    let mut result: Vec<u8> = Vec::new();
+    if result.try_reserve(s_len).is_err() {
+        return std::ptr::null_mut();
+    }
     let mut i = 0;
     while i <= s_len.saturating_sub(from_len) {
         if &s_bytes[i..i + from_len] == from_bytes {
+            if result.try_reserve(to_bytes.len()).is_err() {
+                return std::ptr::null_mut();
+            }
             result.extend_from_slice(to_bytes);
             i += from_len;
         } else {
+            if result.try_reserve(1).is_err() {
+                return std::ptr::null_mut();
+            }
             result.push(s_bytes[i]);
             i += 1;
         }
     }
     while i < s_len {
+        if result.try_reserve(1).is_err() {
+            return std::ptr::null_mut();
+        }
         result.push(s_bytes[i]);
         i += 1;
     }

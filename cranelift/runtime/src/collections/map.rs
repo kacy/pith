@@ -242,7 +242,7 @@ pub unsafe extern "C" fn pith_map_insert_int(
     value: *const u8,
     val_size: i64,
 ) {
-    if map.is_null() || value.is_null() {
+    if map.is_null() || value.is_null() || val_size < 0 {
         return;
     }
 

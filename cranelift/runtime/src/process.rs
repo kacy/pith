@@ -47,7 +47,11 @@ unsafe fn pith_required_cstring(ptr: *const i8) -> Option<String> {
 
 unsafe fn pith_string_list_to_vec(list: PithList) -> Vec<String> {
     let len = crate::collections::list::pith_list_len(list);
-    let mut values = Vec::with_capacity(len as usize);
+    let cap = if len > 0 { len as usize } else { 0 };
+    let mut values = Vec::new();
+    if values.try_reserve(cap).is_err() {
+        return values;
+    }
     let mut i = 0;
     while i < len {
         let ptr = crate::collections::list::pith_list_get_value(list, i) as *const i8;

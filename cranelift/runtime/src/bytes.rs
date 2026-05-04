@@ -61,7 +61,7 @@ pub unsafe extern "C" fn pith_bytes_to_string_utf8(handle: i64) -> *mut i8 {
     if std::str::from_utf8(&bytes.data).is_err() {
         return std::ptr::null_mut();
     }
-    crate::pith_copy_bytes_to_cstring(&bytes.data)
+    crate::runtime_core::pith_try_copy_bytes_to_cstring(&bytes.data).unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -320,6 +320,19 @@ mod tests {
             assert_eq!(pith_byte_buffer_set(12345, 0, 1), 0);
             assert_eq!(pith_byte_buffer_bytes(12345), 0);
             pith_byte_buffer_clear(12345);
+        }
+    }
+
+    #[test]
+    fn bytes_to_string_uses_tracked_allocation() {
+        unsafe {
+            let handle = pith_bytes_from_vec(b"pith".to_vec());
+            let text = pith_bytes_to_string_utf8(handle);
+            assert_eq!(crate::ffi_util::cstr_bytes(text), Some(&b"pith"[..]));
+            crate::pith_free(text);
+            crate::pith_free(text);
+            handle_registry::unregister(handle as *const (), HandleKind::Bytes);
+            drop(Box::from_raw(handle as *mut PithBytes));
         }
     }
 }

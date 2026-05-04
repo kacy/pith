@@ -1,5 +1,7 @@
 use crate::ffi_util::{cstr_bytes, cstr_str};
 
+const MAX_FLOAT_FIXED_DECIMALS: usize = 308;
+
 fn b64_decoded_len(input_len: usize) -> Option<usize> {
     input_len.checked_mul(3)?.checked_div(4)
 }
@@ -13,7 +15,8 @@ fn b64_decoded_len(input_len: usize) -> Option<usize> {
 pub unsafe extern "C" fn pith_format_time_fmt(timestamp_ms: i64, _fmt: *const i8) -> *mut i8 {
     let secs = timestamp_ms / 1000;
     let s = format!("{}", secs);
-    crate::pith_copy_bytes_to_cstring(s.as_bytes())
+    crate::runtime_core::pith_try_copy_bytes_to_cstring(s.as_bytes())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Write string to file path
@@ -62,7 +65,8 @@ pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
             .args(&parts[1..])
             .output()
         {
-            Ok(output) => crate::pith_copy_bytes_to_cstring(&output.stdout),
+            Ok(output) => crate::runtime_core::pith_try_copy_bytes_to_cstring(&output.stdout)
+                .unwrap_or(std::ptr::null_mut()),
             Err(_) => std::ptr::null_mut(),
         }
     }
@@ -320,9 +324,14 @@ pub unsafe extern "C" fn pith_cstring_repeat(s: *const i8, n: i64) -> *mut i8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_float_fixed(value: f64, decimals: i64) -> *mut i8 {
-    let precision = decimals.max(0) as usize;
+    let precision = if decimals <= 0 {
+        0
+    } else {
+        (decimals as usize).min(MAX_FLOAT_FIXED_DECIMALS)
+    };
     let s = format!("{:.prec$}", value, prec = precision);
-    crate::pith_copy_bytes_to_cstring(s.as_bytes())
+    crate::runtime_core::pith_try_copy_bytes_to_cstring(s.as_bytes())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -399,6 +408,25 @@ mod tests {
             crate::pith_free(repeated);
             crate::pith_free(padded_left);
             crate::pith_free(padded_right);
+        }
+    }
+
+    #[test]
+    fn utility_formatters_use_checked_allocations() {
+        unsafe {
+            let timestamp = pith_format_time_fmt(123_000, std::ptr::null());
+            assert_eq!(cstring_bytes(timestamp), b"123");
+
+            let fixed = pith_float_fixed(1.25, 2);
+            assert_eq!(cstring_bytes(fixed), b"1.25");
+
+            let capped = pith_float_fixed(1.0, i64::MAX);
+            assert!(!capped.is_null());
+            assert!(cstring_bytes(capped).len() <= MAX_FLOAT_FIXED_DECIMALS + 2);
+
+            crate::pith_free(timestamp);
+            crate::pith_free(fixed);
+            crate::pith_free(capped);
         }
     }
 }

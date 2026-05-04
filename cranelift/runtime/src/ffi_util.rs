@@ -56,7 +56,8 @@ pub unsafe fn cstr_to_str<'a>(s: *const i8) -> &'a str {
 /// # Safety
 /// The caller is responsible for eventually freeing the returned pointer.
 pub unsafe fn alloc_cstring(s: &str) -> *mut i8 {
-    crate::pith_copy_bytes_to_cstring(s.as_bytes())
+    crate::runtime_core::pith_try_copy_bytes_to_cstring(s.as_bytes())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[cfg(test)]
@@ -96,6 +97,16 @@ mod tests {
             assert_eq!(cstr_str(ptr), Some("pith"));
             assert_eq!(cstr_str_or_empty(ptr), "pith");
             assert_eq!(cstr_string(ptr), Some("pith".to_string()));
+        }
+    }
+
+    #[test]
+    fn alloc_cstring_returns_tracked_allocation() {
+        unsafe {
+            let ptr = alloc_cstring("pith");
+            assert_eq!(cstr_bytes(ptr), Some(&b"pith"[..]));
+            crate::pith_free(ptr);
+            crate::pith_free(ptr);
         }
     }
 }

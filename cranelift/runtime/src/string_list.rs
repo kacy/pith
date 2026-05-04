@@ -1,6 +1,14 @@
 use crate::collections::list::{list_mut_from_handle, list_ref_from_handle, PithList};
 use crate::ffi_util::{cstr_bytes, cstr_str};
 
+unsafe fn copy_bytes(bytes: &[u8]) -> *mut i8 {
+    crate::runtime_core::pith_try_copy_bytes_to_cstring(bytes).unwrap_or(std::ptr::null_mut())
+}
+
+unsafe fn alloc_cstring(len: usize) -> *mut i8 {
+    crate::runtime_core::pith_try_alloc_cstring(len).unwrap_or(std::ptr::null_mut())
+}
+
 /// Get command line arguments as a Pith list of C string pointers.
 #[no_mangle]
 pub unsafe extern "C" fn pith_args() -> PithList {
@@ -11,7 +19,7 @@ pub unsafe extern "C" fn pith_args() -> PithList {
 
     for arg in env::args() {
         let arg_len = arg.len();
-        let arg_ptr = crate::pith_copy_bytes_to_cstring(&arg.as_bytes()[..arg_len]);
+        let arg_ptr = copy_bytes(&arg.as_bytes()[..arg_len]);
         pith_list_push_value(list, arg_ptr as i64);
     }
 
@@ -38,7 +46,7 @@ pub unsafe extern "C" fn pith_cstring_substring(s: *const i8, start: i64, end: i
         return crate::pith_cstring_empty();
     }
 
-    crate::pith_copy_bytes_to_cstring(&bytes[start..end])
+    copy_bytes(&bytes[start..end])
 }
 
 /// Split a string by delimiter and return as a PithList of strings
@@ -73,7 +81,7 @@ pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i
         if is_delim || i == s_len {
             let part_len = i - start;
             if part_len > 0 {
-                let part_ptr = crate::pith_copy_bytes_to_cstring(&s_slice[start..i]);
+                let part_ptr = copy_bytes(&s_slice[start..i]);
                 crate::collections::list::pith_list_push_value(list, part_ptr as i64);
             }
 
@@ -105,7 +113,7 @@ pub unsafe extern "C" fn pith_cstring_trim(s: *const i8) -> *mut i8 {
         end -= 1;
     }
 
-    crate::pith_copy_bytes_to_cstring(&slice[start..end])
+    copy_bytes(&slice[start..end])
 }
 
 /// Get a single character from a C string at index as a new C string.
@@ -120,7 +128,10 @@ pub unsafe extern "C" fn pith_cstring_char_at(s: *const i8, index: i64) -> *mut 
         return crate::pith_cstring_empty();
     }
 
-    let ptr = crate::pith_alloc(crate::pith_layout(2, 1)) as *mut i8;
+    let ptr = alloc_cstring(1);
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
     *ptr = bytes[index as usize] as i8;
     *ptr.add(1) = 0;
     ptr
@@ -138,7 +149,7 @@ pub unsafe extern "C" fn pith_cstring_trim_left(s: *const i8) -> *mut i8 {
         start += 1;
     }
 
-    crate::pith_copy_bytes_to_cstring(&slice[start..])
+    copy_bytes(&slice[start..])
 }
 
 /// Convert C string to uppercase
@@ -153,7 +164,10 @@ pub unsafe extern "C" fn pith_cstring_to_upper(s: *const i8) -> *mut i8 {
     };
     let len = slice.len();
 
-    let ptr = crate::pith_alloc(crate::pith_layout(len + 1, 1)) as *mut i8;
+    let ptr = alloc_cstring(len);
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
 
     for i in 0..len {
         let c = slice[i];
@@ -175,7 +189,10 @@ pub unsafe extern "C" fn pith_cstring_to_lower(s: *const i8) -> *mut i8 {
     };
     let len = slice.len();
 
-    let ptr = crate::pith_alloc(crate::pith_layout(len + 1, 1)) as *mut i8;
+    let ptr = alloc_cstring(len);
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
 
     for i in 0..len {
         let c = slice[i];
@@ -197,7 +214,10 @@ pub unsafe extern "C" fn pith_cstring_reverse(s: *const i8) -> *mut i8 {
     };
     let len = slice.len();
 
-    let ptr = crate::pith_alloc(crate::pith_layout(len + 1, 1)) as *mut i8;
+    let ptr = alloc_cstring(len);
+    if ptr.is_null() {
+        return std::ptr::null_mut();
+    }
 
     for i in 0..len {
         *ptr.add(i) = slice[len - 1 - i] as i8;
@@ -353,7 +373,7 @@ pub unsafe extern "C" fn pith_cstring_replace(
     let from_len = from_bytes.len();
 
     if from_len == 0 {
-        return crate::pith_copy_bytes_to_cstring(s_bytes);
+        return copy_bytes(s_bytes);
     }
 
     let mut result: Vec<u8> = Vec::with_capacity(s_len);
@@ -372,8 +392,7 @@ pub unsafe extern "C" fn pith_cstring_replace(
         i += 1;
     }
 
-    let out_len = result.len();
-    crate::pith_copy_bytes_to_cstring(&result[..out_len])
+    copy_bytes(&result)
 }
 
 /// Check if a C string is empty (null or zero-length)
@@ -423,6 +442,35 @@ mod tests {
                 pith_cstring_last_index_of(ptr, b"x\0".as_ptr() as *const i8),
                 -1
             );
+        }
+    }
+
+    #[test]
+    fn string_helpers_use_checked_allocations() {
+        unsafe {
+            let text = b" Pith \0";
+            let ptr = text.as_ptr() as *const i8;
+
+            let trimmed = pith_cstring_trim(ptr);
+            assert_eq!(crate::ffi_util::cstr_bytes(trimmed), Some(&b"Pith"[..]));
+
+            let upper = pith_cstring_to_upper(trimmed);
+            assert_eq!(crate::ffi_util::cstr_bytes(upper), Some(&b"PITH"[..]));
+
+            let lower = pith_cstring_to_lower(upper);
+            assert_eq!(crate::ffi_util::cstr_bytes(lower), Some(&b"pith"[..]));
+
+            let reversed = pith_cstring_reverse(lower);
+            assert_eq!(crate::ffi_util::cstr_bytes(reversed), Some(&b"htip"[..]));
+
+            let ch = pith_cstring_char_at(reversed, 1);
+            assert_eq!(crate::ffi_util::cstr_bytes(ch), Some(&b"t"[..]));
+
+            crate::pith_free(trimmed);
+            crate::pith_free(upper);
+            crate::pith_free(lower);
+            crate::pith_free(reversed);
+            crate::pith_free(ch);
         }
     }
 }

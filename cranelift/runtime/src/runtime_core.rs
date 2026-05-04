@@ -32,31 +32,12 @@ pub unsafe extern "C" fn pith_runtime_error(code: i64) -> i64 {
     std::process::exit(1);
 }
 
-pub(crate) fn pith_layout(size: usize, align: usize) -> Layout {
-    if let Some(layout) = pith_try_layout(size, align) {
-        layout
-    } else {
-        eprintln!("pith runtime error: invalid allocation layout");
-        std::process::exit(1);
-    }
-}
-
 pub(crate) fn pith_try_layout(size: usize, align: usize) -> Option<Layout> {
     Layout::from_size_align(size, align).ok()
 }
 
 fn cstring_layout(len: usize) -> Option<Layout> {
     pith_try_layout(len.checked_add(1)?, 1)
-}
-
-pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
-    let ptr = alloc(layout);
-    if ptr.is_null() {
-        eprintln!("pith runtime error: allocation failed");
-        std::process::exit(1);
-    }
-    lock_allocations().insert(ptr as usize, layout);
-    ptr
 }
 
 pub(crate) unsafe fn pith_try_alloc(layout: Layout) -> *mut u8 {
@@ -282,6 +263,17 @@ mod tests {
     }
 
     #[test]
+    fn chr_cstr_uses_tracked_allocation() {
+        unsafe {
+            let ch = pith_chr_cstr(65);
+            assert_eq!(string::pith_cstring_len(ch), 1);
+            assert_eq!(*ch, b'A' as i8);
+            pith_free(ch);
+            pith_free(ch);
+        }
+    }
+
+    #[test]
     fn struct_alloc_returns_zeroed_memory() {
         unsafe {
             let ptr = pith_struct_alloc(3);
@@ -437,8 +429,9 @@ pub unsafe extern "C" fn pith_ord_cstr(s: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_chr_cstr(n: i64) -> *mut i8 {
-    let layout = pith_layout(2, 1);
-    let ptr = pith_alloc(layout) as *mut i8;
+    let Some(ptr) = pith_try_alloc_cstring(1) else {
+        return std::ptr::null_mut();
+    };
     *ptr = (n as u8) as i8;
     *ptr.add(1) = 0;
 

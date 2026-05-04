@@ -252,7 +252,9 @@ pub unsafe extern "C" fn pith_cstring_pad_left(
         b' ' as i8
     };
     let pad = w - len;
-    let ptr = crate::pith_alloc(crate::pith_layout(w + 1, 1)) as *mut i8;
+    let Some(ptr) = crate::runtime_core::pith_try_alloc_cstring(w) else {
+        return std::ptr::null_mut();
+    };
     for i in 0..pad {
         *ptr.add(i) = fill_char;
     }
@@ -283,7 +285,9 @@ pub unsafe extern "C" fn pith_cstring_pad_right(
     } else {
         b' ' as i8
     };
-    let ptr = crate::pith_alloc(crate::pith_layout(w + 1, 1)) as *mut i8;
+    let Some(ptr) = crate::runtime_core::pith_try_alloc_cstring(w) else {
+        return std::ptr::null_mut();
+    };
     std::ptr::copy_nonoverlapping(s, ptr, len);
     for i in len..w {
         *ptr.add(i) = fill_char;
@@ -384,8 +388,17 @@ mod tests {
             let repeated = pith_cstring_repeat(text.as_ptr(), 3);
             assert_eq!(cstring_bytes(repeated), b"hahaha");
 
+            let padded_left = pith_cstring_pad_left(text.as_ptr(), 4, b".\0".as_ptr() as *const i8);
+            assert_eq!(cstring_bytes(padded_left), b"..ha");
+
+            let padded_right =
+                pith_cstring_pad_right(text.as_ptr(), 4, b".\0".as_ptr() as *const i8);
+            assert_eq!(cstring_bytes(padded_right), b"ha..");
+
             crate::pith_free(decoded);
             crate::pith_free(repeated);
+            crate::pith_free(padded_left);
+            crate::pith_free(padded_right);
         }
     }
 }

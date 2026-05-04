@@ -75,6 +75,16 @@ unsafe fn pith_try_alloc_zeroed(layout: Layout) -> *mut u8 {
     ptr
 }
 
+pub(crate) unsafe fn pith_try_alloc_cstring(len: usize) -> Option<*mut i8> {
+    let layout = cstring_layout(len)?;
+    let ptr = pith_try_alloc(layout) as *mut i8;
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
+}
+
 pub(crate) unsafe fn pith_dealloc(ptr: *mut u8) -> bool {
     if ptr.is_null() {
         return false;
@@ -98,11 +108,7 @@ pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
 }
 
 pub(crate) unsafe fn pith_try_copy_bytes_to_cstring(bytes: &[u8]) -> Option<*mut i8> {
-    let layout = cstring_layout(bytes.len())?;
-    let ptr = pith_try_alloc(layout) as *mut i8;
-    if ptr.is_null() {
-        return None;
-    }
+    let ptr = pith_try_alloc_cstring(bytes.len())?;
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
     *ptr.add(bytes.len()) = 0;
     Some(ptr)

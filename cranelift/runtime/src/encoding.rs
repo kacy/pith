@@ -15,6 +15,14 @@ unsafe fn parse_int_error(message: &[u8]) -> i64 {
     alloc_parse_int_result(0, 0, err)
 }
 
+fn b64_encoded_len(len: usize) -> Option<usize> {
+    len.checked_add(2)?.checked_div(3)?.checked_mul(4)
+}
+
+fn hex_encoded_len(len: usize) -> Option<usize> {
+    len.checked_mul(2)
+}
+
 /// Parse string to int and return a result tuple pointer.
 ///
 /// # Safety
@@ -108,31 +116,40 @@ pub unsafe extern "C" fn pith_b64_encode(s: *const i8) -> *mut i8 {
     let input = std::slice::from_raw_parts(s as *const u8, len);
 
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out: Vec<u8> = Vec::with_capacity((len + 2) / 3 * 4 + 1);
+    let Some(out_len) = b64_encoded_len(len) else {
+        eprintln!("pith runtime error: base64 output size overflow");
+        return std::ptr::null_mut();
+    };
+    let Some(out) = crate::runtime_core::pith_try_alloc_cstring(out_len) else {
+        eprintln!("pith runtime error: allocation failed");
+        return std::ptr::null_mut();
+    };
     let mut i = 0;
+    let mut j = 0;
     while i < len {
         let b0 = input[i];
         let b1 = if i + 1 < len { input[i + 1] } else { 0 };
         let b2 = if i + 2 < len { input[i + 2] } else { 0 };
 
-        out.push(CHARS[(b0 >> 2) as usize]);
-        out.push(CHARS[((b0 & 3) << 4 | b1 >> 4) as usize]);
-        out.push(if i + 1 < len {
+        *out.add(j) = CHARS[(b0 >> 2) as usize] as i8;
+        *out.add(j + 1) = CHARS[((b0 & 3) << 4 | b1 >> 4) as usize] as i8;
+        *out.add(j + 2) = if i + 1 < len {
             CHARS[((b1 & 0xf) << 2 | b2 >> 6) as usize]
         } else {
             b'='
-        });
-        out.push(if i + 2 < len {
+        } as i8;
+        *out.add(j + 3) = if i + 2 < len {
             CHARS[(b2 & 0x3f) as usize]
         } else {
             b'='
-        });
+        } as i8;
 
         i += 3;
+        j += 4;
     }
-    out.push(0);
+    *out.add(out_len) = 0;
 
-    crate::pith_copy_bytes_to_cstring(&out[..out.len() - 1])
+    out
 }
 
 /// Hex encode a C string — returns newly allocated C string
@@ -147,18 +164,24 @@ pub unsafe extern "C" fn pith_hex_encode(s: *const i8) -> *mut i8 {
 
     let len = crate::string::pith_cstring_len(s) as usize;
     let input = std::slice::from_raw_parts(s as *const u8, len);
-    let hex_len = len * 2 + 1;
-    let ptr = crate::pith_alloc(crate::pith_layout(hex_len, 1));
+    let Some(out_len) = hex_encoded_len(len) else {
+        eprintln!("pith runtime error: hex output size overflow");
+        return std::ptr::null_mut();
+    };
+    let Some(ptr) = crate::runtime_core::pith_try_alloc_cstring(out_len) else {
+        eprintln!("pith runtime error: allocation failed");
+        return std::ptr::null_mut();
+    };
 
     for (i, &byte) in input.iter().enumerate() {
         let hi = (byte >> 4) as usize;
         let lo = (byte & 0xf) as usize;
         const HEX: &[u8] = b"0123456789abcdef";
-        *ptr.add(i * 2) = HEX[hi];
-        *ptr.add(i * 2 + 1) = HEX[lo];
+        *ptr.add(i * 2) = HEX[hi] as i8;
+        *ptr.add(i * 2 + 1) = HEX[lo] as i8;
     }
-    *ptr.add(len * 2) = 0;
-    ptr as *mut i8
+    *ptr.add(out_len) = 0;
+    ptr
 }
 
 /// Decode a hex string back to the original string
@@ -177,15 +200,18 @@ pub unsafe extern "C" fn pith_from_hex(s: *const i8) -> *mut i8 {
     }
     let input = std::slice::from_raw_parts(s as *const u8, len);
     let out_len = len / 2;
-    let ptr = crate::pith_alloc(crate::pith_layout(out_len + 1, 1));
+    let Some(ptr) = crate::runtime_core::pith_try_alloc_cstring(out_len) else {
+        eprintln!("pith runtime error: allocation failed");
+        return std::ptr::null_mut();
+    };
 
     for i in 0..out_len {
         let hi = hex_digit(input[i * 2]);
         let lo = hex_digit(input[i * 2 + 1]);
-        *ptr.add(i) = (hi << 4) | lo;
+        *ptr.add(i) = ((hi << 4) | lo) as i8;
     }
     *ptr.add(out_len) = 0;
-    ptr as *mut i8
+    ptr
 }
 
 fn hex_digit(b: u8) -> u8 {
@@ -343,7 +369,10 @@ fn sha256_compute(data: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::pith_parse_int;
+    use super::{
+        b64_encoded_len, hex_encoded_len, pith_b64_encode, pith_from_hex, pith_hex_encode,
+        pith_parse_int,
+    };
     use std::ffi::CString;
 
     fn parse(input: &str) -> (bool, i64) {
@@ -376,5 +405,42 @@ mod tests {
     fn parse_int_handles_i64_bounds() {
         assert_eq!(parse("9223372036854775807"), (true, i64::MAX));
         assert_eq!(parse("-9223372036854775808"), (true, i64::MIN));
+    }
+
+    unsafe fn cstring_bytes(ptr: *const i8) -> Vec<u8> {
+        assert!(!ptr.is_null());
+        let len = crate::string::pith_cstring_len(ptr) as usize;
+        std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
+    }
+
+    #[test]
+    fn encoding_lengths_reject_overflow() {
+        assert_eq!(b64_encoded_len(0), Some(0));
+        assert_eq!(b64_encoded_len(3), Some(4));
+        assert_eq!(b64_encoded_len(usize::MAX), None);
+        assert_eq!(hex_encoded_len(usize::MAX), None);
+    }
+
+    #[test]
+    fn base64_and_hex_encoders_use_checked_allocations() {
+        let Ok(input) = CString::new("pith") else {
+            assert!(false);
+            return;
+        };
+
+        unsafe {
+            let b64 = pith_b64_encode(input.as_ptr());
+            assert_eq!(cstring_bytes(b64), b"cGl0aA==");
+
+            let hex = pith_hex_encode(input.as_ptr());
+            assert_eq!(cstring_bytes(hex), b"70697468");
+
+            let decoded = pith_from_hex(hex);
+            assert_eq!(cstring_bytes(decoded), b"pith");
+
+            crate::pith_free(b64);
+            crate::pith_free(hex);
+            crate::pith_free(decoded);
+        }
     }
 }

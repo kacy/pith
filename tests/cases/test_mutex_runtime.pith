@@ -1,0 +1,24 @@
+import std.time as time
+
+fn wait_for_mutex(mu: Mutex, ready: Channel[Int], done: Channel[Int]):
+    mu.lock()
+    ready.send(1)
+    mu.unlock()
+    done.send(1)
+
+fn main():
+    mu := Mutex()
+    ready := Channel[Int](1)
+    done := Channel[Int](1)
+
+    mu.lock()
+    task := spawn wait_for_mutex(mu, ready, done)
+    time.delay(10)
+
+    blocked := ready.try_recv()
+    print("blocked:{blocked == none}")
+
+    mu.unlock()
+    print("entered:{ready.recv()?}")
+    print("done:{done.recv()?}")
+    await task

@@ -2,6 +2,17 @@ use crate::collections::list::{pith_list_new, pith_list_push_value};
 use crate::handle_registry::{self, HandleKind};
 use crate::string;
 use std::alloc::{alloc, Layout};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+static ALLOCATIONS: LazyLock<Mutex<HashMap<usize, Layout>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn lock_allocations() -> MutexGuard<'static, HashMap<usize, Layout>> {
+    ALLOCATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub(crate) fn pith_strdup_string(text: &str) -> *mut i8 {
     let owned = format!("{}\0", text);
@@ -37,7 +48,22 @@ pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
         eprintln!("pith runtime error: allocation failed");
         std::process::exit(1);
     }
+    lock_allocations().insert(ptr as usize, layout);
     ptr
+}
+
+pub(crate) unsafe fn pith_dealloc(ptr: *mut u8) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+
+    let layout = lock_allocations().remove(&(ptr as usize));
+    if let Some(layout) = layout {
+        std::alloc::dealloc(ptr, layout);
+        true
+    } else {
+        false
+    }
 }
 
 pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
@@ -156,6 +182,27 @@ mod tests {
                 pith_closure_get_env(handle, PITH_CLOSURE_ENV_SLOTS as i64),
                 0
             );
+        }
+    }
+
+    #[test]
+    fn pith_free_uses_the_recorded_allocation_layout() {
+        unsafe {
+            let ptr = pith_copy_bytes_to_cstring(b"layout-sized allocation");
+            assert!(pith_dealloc(ptr as *mut u8));
+        }
+    }
+
+    #[test]
+    fn pith_free_ignores_unknown_or_repeated_pointers() {
+        let mut byte = 0u8;
+        unsafe {
+            assert!(!pith_dealloc(std::ptr::null_mut()));
+            assert!(!pith_dealloc(&mut byte));
+
+            let ptr = pith_copy_bytes_to_cstring(b"free once");
+            pith_free(ptr);
+            pith_free(ptr);
         }
     }
 }
@@ -612,11 +659,7 @@ pub use pith_sqrt as pith_math_sqrt;
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_free(ptr: *mut i8) {
-    use std::alloc::Layout;
-
-    if !ptr.is_null() {
-        std::alloc::dealloc(ptr as *mut u8, Layout::new::<u8>());
-    }
+    pith_dealloc(ptr as *mut u8);
 }
 
 #[no_mangle]

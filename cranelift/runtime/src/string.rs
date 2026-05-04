@@ -7,8 +7,6 @@
 
 use std::sync::Arc;
 
-use std::alloc::dealloc;
-
 /// FFI-compatible string representation
 ///
 /// This struct matches the layout expected by the compiler.
@@ -164,9 +162,7 @@ pub unsafe extern "C" fn pith_string_release(s: PithString) {
         return;
     }
 
-    // Free the allocated memory
-    let layout = crate::pith_layout(s.len as usize, 1);
-    dealloc(s.ptr as *mut u8, layout);
+    crate::runtime_core::pith_dealloc(s.ptr as *mut u8);
 }
 
 /// Destructor for string elements in collections

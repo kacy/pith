@@ -54,6 +54,25 @@ inspect the error payload.
 Prefer `catch`, `unwrap_or`, and `or_else` when they make recovery clearer than
 manual `is_err` branching.
 
+## absence: `T?` vs `T!`
+
+Pith has two distinct shapes for "no value here". Pick by intent, not by mood:
+
+- **`T?` (Optional)** — for *predictable* absence the caller routinely
+  handles. Lookup misses, end-of-stream, optional config fields, channel
+  closure. Construct with `none`; consume with `match`, `== none`, or `?`
+  inside a `T!` function. Examples: `Map.get`, `Channel.recv`,
+  `std.strings.get`.
+- **`T!` (Result)** — for *unexpected* failure the caller usually wants to
+  propagate. I/O, parsing, network, anything with an external cause.
+  Construct with `fail`; consume with `!`, `catch`, `unwrap_or`, `or_else`.
+  Examples: `fs.read`, `parse_port`, `tls.connect`.
+
+Rule of thumb: if the caller would write `if x == none: ...` more often than
+`!`, use `T?`. If they'd write `let v = x!` more often than `match`, use `T!`.
+Don't double-wrap (`T?!` or `T!?`) unless absence and failure are genuinely
+distinct outcomes — usually one or the other tells the whole story.
+
 Write colocated `test` declarations for stdlib behavior. Use
 `std.testing.assert_eq` and `assert_ne` for normal comparisons, and keep golden
 stdout examples for end-to-end behavior.

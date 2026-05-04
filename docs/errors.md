@@ -385,9 +385,19 @@ error[E237]: 'secret' is not public in the imported module
                        ^^^^^^
 ```
 
-### E238 — reserved
+### E238 — invalid unwrap context
 
-reserved for future checker diagnostics. not currently emitted.
+the `?` operator was used outside a function that returns a result type.
+`?` propagates `none` as a `fail`, so the enclosing function must be able
+to carry that error. Either change the function to return `T!`, or replace
+`?` with `match`/`unwrap_or` for an in-place default.
+
+```
+error[E238]: unwrap (?) can only be used in functions that return a result type
+  3 | print("got: {value?}")
+                  ^^^^^^
+  fix: wrap main or the enclosing fn return in T! and propagate, or replace ? with `match`/`unwrap_or` for an in-place default
+```
 
 ### E239 — invalid try context
 

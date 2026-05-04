@@ -33,13 +33,20 @@ pub unsafe extern "C" fn pith_runtime_error(code: i64) -> i64 {
 }
 
 pub(crate) fn pith_layout(size: usize, align: usize) -> Layout {
-    match Layout::from_size_align(size, align) {
-        Ok(layout) => layout,
-        Err(_) => {
-            eprintln!("pith runtime error: invalid allocation layout");
-            std::process::exit(1);
-        }
+    if let Some(layout) = pith_try_layout(size, align) {
+        layout
+    } else {
+        eprintln!("pith runtime error: invalid allocation layout");
+        std::process::exit(1);
     }
+}
+
+pub(crate) fn pith_try_layout(size: usize, align: usize) -> Option<Layout> {
+    Layout::from_size_align(size, align).ok()
+}
+
+fn cstring_layout(len: usize) -> Option<Layout> {
+    pith_try_layout(len.checked_add(1)?, 1)
 }
 
 pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
@@ -83,11 +90,22 @@ pub(crate) unsafe fn pith_dealloc(ptr: *mut u8) -> bool {
 }
 
 pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
-    let layout = pith_layout(bytes.len() + 1, 1);
-    let ptr = pith_alloc(layout) as *mut i8;
+    let Some(ptr) = pith_try_copy_bytes_to_cstring(bytes) else {
+        eprintln!("pith runtime error: allocation failed");
+        std::process::exit(1);
+    };
+    ptr
+}
+
+pub(crate) unsafe fn pith_try_copy_bytes_to_cstring(bytes: &[u8]) -> Option<*mut i8> {
+    let layout = cstring_layout(bytes.len())?;
+    let ptr = pith_try_alloc(layout) as *mut i8;
+    if ptr.is_null() {
+        return None;
+    }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
     *ptr.add(bytes.len()) = 0;
-    ptr
+    Some(ptr)
 }
 
 pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
@@ -223,6 +241,41 @@ mod tests {
     }
 
     #[test]
+    fn cstring_layout_rejects_length_overflow() {
+        assert!(cstring_layout(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn try_copy_bytes_to_cstring_round_trips_and_tracks_layout() {
+        unsafe {
+            let Some(ptr) = pith_try_copy_bytes_to_cstring(b"checked allocation") else {
+                assert!(false);
+                return;
+            };
+            assert_eq!(string::pith_cstring_len(ptr), 18);
+            assert!(pith_dealloc(ptr as *mut u8));
+        }
+    }
+
+    #[test]
+    fn concat_and_strdup_use_tracked_allocations() {
+        unsafe {
+            let left = pith_copy_bytes_to_cstring(b"safe ");
+            let right = pith_copy_bytes_to_cstring(b"strings");
+            let joined = pith_concat_cstr(left, right);
+            let copied = pith_strdup(joined);
+
+            assert_eq!(string::pith_cstring_len(joined), 12);
+            assert_eq!(string::pith_cstring_len(copied), 12);
+
+            pith_free(left);
+            pith_free(right);
+            pith_free(joined);
+            pith_free(copied);
+        }
+    }
+
+    #[test]
     fn struct_alloc_returns_zeroed_memory() {
         unsafe {
             let ptr = pith_struct_alloc(3);
@@ -264,9 +317,19 @@ pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8
 
     let len_a = string::pith_cstring_len(a) as usize;
     let len_b = string::pith_cstring_len(b) as usize;
-    let total_len = len_a + len_b;
-    let layout = pith_layout(total_len + 1, 1);
-    let result = pith_alloc(layout) as *mut i8;
+    let Some(total_len) = len_a.checked_add(len_b) else {
+        eprintln!("pith runtime error: string concatenation size overflow");
+        return std::ptr::null_mut();
+    };
+    let Some(layout) = cstring_layout(total_len) else {
+        eprintln!("pith runtime error: invalid string concatenation layout");
+        return std::ptr::null_mut();
+    };
+    let result = pith_try_alloc(layout) as *mut i8;
+    if result.is_null() {
+        eprintln!("pith runtime error: allocation failed");
+        return std::ptr::null_mut();
+    }
 
     std::ptr::copy_nonoverlapping(a, result, len_a);
     std::ptr::copy_nonoverlapping(b, result.add(len_a), len_b);
@@ -281,8 +344,15 @@ pub unsafe extern "C" fn pith_strdup(ptr: *const i8) -> *mut i8 {
     }
 
     let len = string::pith_cstring_len(ptr) as usize;
-    let layout = pith_layout(len + 1, 1);
-    let result = pith_alloc(layout) as *mut i8;
+    let Some(layout) = cstring_layout(len) else {
+        eprintln!("pith runtime error: invalid string duplication layout");
+        return std::ptr::null_mut();
+    };
+    let result = pith_try_alloc(layout) as *mut i8;
+    if result.is_null() {
+        eprintln!("pith runtime error: allocation failed");
+        return std::ptr::null_mut();
+    }
     std::ptr::copy_nonoverlapping(ptr, result, len + 1);
 
     result

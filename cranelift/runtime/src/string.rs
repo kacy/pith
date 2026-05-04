@@ -39,17 +39,25 @@ pub static EMPTY_STRING: PithString = PithString {
 /// The string data is stored as Arc<str> which is immutable and thread-safe.
 pub type InternalString = Arc<str>;
 
+unsafe fn pith_string_bytes<'a>(s: PithString) -> Option<&'a [u8]> {
+    if s.len < 0 || s.ptr.is_null() {
+        return None;
+    }
+    if s.len == 0 {
+        return Some(&[]);
+    }
+    Some(std::slice::from_raw_parts(s.ptr, s.len as usize))
+}
+
 /// Create an internal String from a PithString
 ///
 /// # Safety
 /// The PithString must contain valid UTF-8 data
 pub unsafe fn internal_from_pith(s: PithString) -> InternalString {
-    if s.len == 0 {
+    let Some(bytes) = pith_string_bytes(s) else {
         return Arc::from("");
-    }
-
-    let slice = std::slice::from_raw_parts(s.ptr, s.len as usize);
-    match std::str::from_utf8(slice) {
+    };
+    match std::str::from_utf8(bytes) {
         Ok(str_ref) => Arc::from(str_ref),
         Err(_) => Arc::from(""),
     }
@@ -67,8 +75,19 @@ pub fn pith_from_internal(s: InternalString) -> PithString {
     crate::perf_count(&crate::PERF_STRING_ALLOC_BYTES, s.len());
 
     let len = s.len();
-    let layout = crate::pith_layout(len, 1);
-    let ptr = unsafe { crate::pith_alloc(layout) };
+    if len > i64::MAX as usize {
+        eprintln!("pith runtime error: string allocation size overflow");
+        return EMPTY_STRING;
+    }
+    let Some(layout) = crate::runtime_core::pith_try_layout(len, 1) else {
+        eprintln!("pith runtime error: invalid string allocation layout");
+        return EMPTY_STRING;
+    };
+    let ptr = unsafe { crate::runtime_core::pith_try_alloc(layout) };
+    if ptr.is_null() {
+        eprintln!("pith runtime error: allocation failed");
+        return EMPTY_STRING;
+    }
     unsafe {
         std::ptr::copy_nonoverlapping(s.as_bytes().as_ptr(), ptr, len);
     }
@@ -185,8 +204,16 @@ pub extern "C" fn pith_string_destructor(ptr: *mut u8) {
 pub unsafe extern "C" fn pith_string_concat(a: PithString, b: PithString) -> PithString {
     let a_internal = internal_from_pith(a);
     let b_internal = internal_from_pith(b);
+    let Some(total_len) = a_internal.len().checked_add(b_internal.len()) else {
+        eprintln!("pith runtime error: string concatenation size overflow");
+        return EMPTY_STRING;
+    };
 
-    let mut result = String::with_capacity(a_internal.len() + b_internal.len());
+    let mut result = String::new();
+    if result.try_reserve(total_len).is_err() {
+        eprintln!("pith runtime error: string allocation failed");
+        return EMPTY_STRING;
+    }
     result.push_str(&a_internal);
     result.push_str(&b_internal);
 
@@ -196,18 +223,23 @@ pub unsafe extern "C" fn pith_string_concat(a: PithString, b: PithString) -> Pit
 /// Get string length in bytes
 #[no_mangle]
 pub extern "C" fn pith_string_len(s: PithString) -> i64 {
-    s.len
+    s.len.max(0)
 }
 
 /// Create substring
 #[no_mangle]
 pub unsafe extern "C" fn pith_string_substring(s: PithString, start: i64, end: i64) -> PithString {
-    if start < 0 || end > s.len || start >= end {
+    let Some(bytes) = pith_string_bytes(s) else {
+        return EMPTY_STRING;
+    };
+    if start < 0 || end < start || end as usize > bytes.len() || start == end {
         return EMPTY_STRING;
     }
 
-    let internal = internal_from_pith(s);
-    let substr = &internal[start as usize..end as usize];
+    let slice = &bytes[start as usize..end as usize];
+    let Ok(substr) = std::str::from_utf8(slice) else {
+        return EMPTY_STRING;
+    };
 
     pith_from_internal(Arc::from(substr))
 }
@@ -266,7 +298,7 @@ pub extern "C" fn pith_string_ends_with(s: PithString, suffix: PithString) -> bo
 /// Trim whitespace from both ends
 #[no_mangle]
 pub unsafe extern "C" fn pith_string_trim(s: PithString) -> PithString {
-    if s.len == 0 {
+    if s.len <= 0 || s.ptr.is_null() {
         return EMPTY_STRING;
     }
 
@@ -284,11 +316,14 @@ pub unsafe extern "C" fn pith_string_trim(s: PithString) -> PithString {
 #[no_mangle]
 pub unsafe extern "C" fn pith_chr(code: i64) -> PithString {
     let byte = (code & 0xFF) as u8;
-
-    let mut buf = vec![byte];
-    buf.push(0);
-
-    let ptr = Box::into_raw(buf.into_boxed_slice()) as *const u8;
+    let Some(layout) = crate::runtime_core::pith_try_layout(1, 1) else {
+        return EMPTY_STRING;
+    };
+    let ptr = crate::runtime_core::pith_try_alloc(layout);
+    if ptr.is_null() {
+        return EMPTY_STRING;
+    }
+    *ptr = byte;
 
     PithString {
         ptr,
@@ -300,7 +335,7 @@ pub unsafe extern "C" fn pith_chr(code: i64) -> PithString {
 /// Get character code at index (or -1 if out of bounds)
 #[no_mangle]
 pub extern "C" fn pith_ord(s: PithString, index: i64) -> i64 {
-    if index < 0 || index >= s.len {
+    if s.ptr.is_null() || index < 0 || index >= s.len {
         return -1;
     }
     unsafe { *s.ptr.add(index as usize) as i64 }
@@ -327,13 +362,69 @@ pub extern "C" fn pith_cstring_len(cstr: *const i8) -> i64 {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_pith_strings_return_safe_defaults() {
+        let malformed = PithString {
+            ptr: std::ptr::null(),
+            len: 4,
+            is_heap: false,
+        };
+        let negative_len = PithString {
+            ptr: b"abc".as_ptr(),
+            len: -1,
+            is_heap: false,
+        };
+
+        unsafe {
+            assert_eq!(&*internal_from_pith(malformed), "");
+            assert_eq!(&*internal_from_pith(negative_len), "");
+            assert_eq!(pith_string_len(negative_len), 0);
+            assert_eq!(pith_ord(malformed, 0), -1);
+            assert_eq!(pith_string_substring(malformed, 0, 1).len, 0);
+        }
+    }
+
+    #[test]
+    fn substring_rejects_invalid_utf8_boundaries() {
+        let text = "é";
+        let s = PithString {
+            ptr: text.as_ptr(),
+            len: text.len() as i64,
+            is_heap: false,
+        };
+
+        unsafe {
+            let invalid = pith_string_substring(s, 0, 1);
+            assert_eq!(invalid.len, 0);
+
+            let valid = pith_string_substring(s, 0, text.len() as i64);
+            assert_eq!(&*internal_from_pith(valid), text);
+            pith_string_release(valid);
+        }
+    }
+
+    #[test]
+    fn chr_allocations_can_be_released() {
+        unsafe {
+            let ch = pith_chr(65);
+            assert_eq!(pith_ord(ch, 0), 65);
+            pith_string_release(ch);
+            pith_string_release(ch);
+        }
+    }
+}
+
 /// ABI wrapper for pith_string_len - takes pointer to PithString
 #[no_mangle]
 pub extern "C" fn pith_string_len_ptr(s_ptr: *const PithString) -> i64 {
     if s_ptr.is_null() {
         return 0;
     }
-    unsafe { (*s_ptr).len }
+    unsafe { pith_string_len(*s_ptr) }
 }
 
 /// ABI wrapper for pith_string_contains - takes pointers to PithStrings

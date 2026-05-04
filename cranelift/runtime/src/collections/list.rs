@@ -1062,9 +1062,9 @@ mod tests {
     fn list_join_uses_checked_allocation() {
         unsafe {
             let list = pith_list_new(8, 0);
-            let left = crate::pith_copy_bytes_to_cstring(b"alpha");
-            let right = crate::pith_copy_bytes_to_cstring(b"beta");
-            let sep = crate::pith_copy_bytes_to_cstring(b",");
+            let left = crate::runtime_core::pith_copy_bytes_to_cstring(b"alpha");
+            let right = crate::runtime_core::pith_copy_bytes_to_cstring(b"beta");
+            let sep = crate::runtime_core::pith_copy_bytes_to_cstring(b",");
 
             pith_list_push_value(list, left as i64);
             pith_list_push_value(list, right as i64);

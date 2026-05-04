@@ -1,7 +1,10 @@
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::handle_registry::{self, HandleKind};
 use ring::{aead, agreement, rand, signature};
-use std::fs;
+use std::fs::File;
+use std::io::Read;
+
+const MAX_CERT_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 
 struct PithX25519Key {
     key: Option<agreement::EphemeralPrivateKey>,
@@ -357,16 +360,32 @@ pub extern "C" fn pith_os_cert_roots_pem() -> *mut i8 {
     ]);
 
     for path in candidates {
-        if let Ok(data) = fs::read(&path) {
+        if let Some(data) = read_cert_bundle_limited(&path) {
             if data
                 .windows(27)
                 .any(|window| window == b"-----BEGIN CERTIFICATE-----")
             {
-                return unsafe { crate::pith_copy_bytes_to_cstring(&data) };
+                return unsafe {
+                    crate::runtime_core::pith_try_copy_bytes_to_cstring(&data)
+                        .unwrap_or(std::ptr::null_mut())
+                };
             }
         }
     }
     unsafe { crate::pith_cstring_empty() }
+}
+
+fn read_cert_bundle_limited(path: &str) -> Option<Vec<u8>> {
+    let mut file = File::open(path).ok()?;
+    let mut data = Vec::new();
+    file.by_ref()
+        .take((MAX_CERT_BUNDLE_BYTES + 1) as u64)
+        .read_to_end(&mut data)
+        .ok()?;
+    if data.len() > MAX_CERT_BUNDLE_BYTES {
+        return None;
+    }
+    Some(data)
 }
 
 #[cfg(test)]

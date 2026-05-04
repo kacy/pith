@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static RANDOM_SEED: AtomicU64 = AtomicU64::new(123456789);
 const RANDOM_MULTIPLIER: u64 = 6364136223846793005;
+const MAX_FLOAT_PRECISION: usize = 308;
 
 fn next_random_seed() -> u64 {
     loop {
@@ -59,7 +60,8 @@ pub unsafe extern "C" fn pith_input() -> *mut i8 {
             line.pop();
         }
 
-        return crate::pith_copy_bytes_to_cstring(line.as_bytes());
+        return crate::runtime_core::pith_try_copy_bytes_to_cstring(line.as_bytes())
+            .unwrap_or(std::ptr::null_mut());
     }
     std::ptr::null_mut()
 }
@@ -122,9 +124,14 @@ pub extern "C" fn pith_random_int(min: i64, max: i64) -> i64 {
 /// Returns C string. Caller must free.
 #[no_mangle]
 pub unsafe extern "C" fn pith_fmt_float(n: f64, precision: i64) -> *mut i8 {
-    let precision = precision.max(0) as usize;
+    let precision = if precision <= 0 {
+        0
+    } else {
+        (precision as usize).min(MAX_FLOAT_PRECISION)
+    };
     let s = format!("{:.1$}", n, precision);
-    crate::pith_copy_bytes_to_cstring(s.as_bytes())
+    crate::runtime_core::pith_try_copy_bytes_to_cstring(s.as_bytes())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Generate random string of given length

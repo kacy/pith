@@ -11,7 +11,9 @@ unsafe fn alloc_parse_int_result(is_ok: i64, ok: i64, err: i64) -> i64 {
 }
 
 unsafe fn parse_int_error(message: &[u8]) -> i64 {
-    let err = crate::pith_copy_bytes_to_cstring(message) as i64;
+    let err = crate::runtime_core::pith_try_copy_bytes_to_cstring(message)
+        .map(|ptr| ptr as i64)
+        .unwrap_or(0);
     alloc_parse_int_result(0, 0, err)
 }
 
@@ -230,7 +232,8 @@ fn hex_digit(b: u8) -> u8 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_hex(n: i64) -> *mut i8 {
     let s = format!("{:x}", n);
-    crate::pith_copy_bytes_to_cstring(s.as_bytes())
+    crate::runtime_core::pith_try_copy_bytes_to_cstring(s.as_bytes())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Convert an integer to octal string (e.g., 8 → "10")
@@ -240,7 +243,8 @@ pub unsafe extern "C" fn pith_int_to_hex(n: i64) -> *mut i8 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_oct(n: i64) -> *mut i8 {
     let s = format!("{:o}", n);
-    crate::pith_copy_bytes_to_cstring(s.as_bytes())
+    crate::runtime_core::pith_try_copy_bytes_to_cstring(s.as_bytes())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// Convert an integer to binary string (e.g., 10 → "1010")
@@ -250,7 +254,8 @@ pub unsafe extern "C" fn pith_int_to_oct(n: i64) -> *mut i8 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_bin(n: i64) -> *mut i8 {
     let s = format!("{:b}", n);
-    crate::pith_copy_bytes_to_cstring(s.as_bytes())
+    crate::runtime_core::pith_try_copy_bytes_to_cstring(s.as_bytes())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// SHA-256 hash of a C string — returns hex-encoded C string
@@ -261,7 +266,8 @@ pub unsafe extern "C" fn pith_int_to_bin(n: i64) -> *mut i8 {
 pub unsafe extern "C" fn pith_sha256(s: *const i8) -> *mut i8 {
     if s.is_null() {
         let placeholder = b"0000000000000000000000000000000000000000000000000000000000000000";
-        return crate::pith_copy_bytes_to_cstring(placeholder);
+        return crate::runtime_core::pith_try_copy_bytes_to_cstring(placeholder)
+            .unwrap_or(std::ptr::null_mut());
     }
 
     let len = crate::string::pith_cstring_len(s) as usize;
@@ -275,7 +281,7 @@ pub unsafe extern "C" fn pith_sha256(s: *const i8) -> *mut i8 {
         hex.push(HEX[(byte & 0xf) as usize]);
     }
 
-    crate::pith_copy_bytes_to_cstring(&hex)
+    crate::runtime_core::pith_try_copy_bytes_to_cstring(&hex).unwrap_or(std::ptr::null_mut())
 }
 
 fn sha256_compute(data: &[u8]) -> [u8; 32] {

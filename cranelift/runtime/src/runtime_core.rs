@@ -81,11 +81,7 @@ pub(crate) unsafe fn pith_dealloc(ptr: *mut u8) -> bool {
 }
 
 pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
-    let Some(ptr) = pith_try_copy_bytes_to_cstring(bytes) else {
-        eprintln!("pith runtime error: allocation failed");
-        std::process::exit(1);
-    };
-    ptr
+    pith_try_copy_bytes_to_cstring(bytes).unwrap_or(std::ptr::null_mut())
 }
 
 pub(crate) unsafe fn pith_try_copy_bytes_to_cstring(bytes: &[u8]) -> Option<*mut i8> {
@@ -725,14 +721,14 @@ pub unsafe extern "C" fn pith_cstring_gte(a: *const i8, b: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_int_to_cstr(n: i64) -> *mut i8 {
     let s = n.to_string();
     let len = s.len();
-    pith_copy_bytes_to_cstring(&s.as_bytes()[..len])
+    pith_try_copy_bytes_to_cstring(&s.as_bytes()[..len]).unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_uint_to_cstr(n: i64) -> *mut i8 {
     let s = (n as u64).to_string();
     let len = s.len();
-    pith_copy_bytes_to_cstring(&s.as_bytes()[..len])
+    pith_try_copy_bytes_to_cstring(&s.as_bytes()[..len]).unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -747,14 +743,14 @@ pub extern "C" fn pith_float_to_cstr(n: f64) -> *mut i8 {
             .to_string()
     };
     let len = s.len();
-    unsafe { pith_copy_bytes_to_cstring(&s.as_bytes()[..len]) }
+    unsafe { pith_try_copy_bytes_to_cstring(&s.as_bytes()[..len]).unwrap_or(std::ptr::null_mut()) }
 }
 
 #[no_mangle]
 pub extern "C" fn pith_bool_to_cstr(b: i64) -> *mut i8 {
     let s = if b != 0 { "true" } else { "false" };
     let len = s.len();
-    unsafe { pith_copy_bytes_to_cstring(&s.as_bytes()[..len]) }
+    unsafe { pith_try_copy_bytes_to_cstring(&s.as_bytes()[..len]).unwrap_or(std::ptr::null_mut()) }
 }
 
 pub use pith_ceil as pith_math_ceil;
@@ -812,8 +808,9 @@ pub unsafe extern "C" fn pith_args_to_list() -> i64 {
 
     for arg in std::env::args() {
         let arg_len = arg.len();
-        let arg_ptr = pith_copy_bytes_to_cstring(&arg.as_bytes()[..arg_len]);
-        pith_list_push_value(list, arg_ptr as i64);
+        if let Some(arg_ptr) = pith_try_copy_bytes_to_cstring(&arg.as_bytes()[..arg_len]) {
+            pith_list_push_value(list, arg_ptr as i64);
+        }
     }
 
     list.ptr as i64

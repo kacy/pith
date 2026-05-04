@@ -301,8 +301,9 @@ pub unsafe extern "C" fn pith_set_to_list_string(
 
     for elem in impl_ref.iter() {
         if let SetElement::String(bytes) = elem {
-            let ptr = crate::pith_copy_bytes_to_cstring(bytes);
-            pith_list_push_value(list, ptr as i64);
+            if let Some(ptr) = crate::runtime_core::pith_try_copy_bytes_to_cstring(bytes) {
+                pith_list_push_value(list, ptr as i64);
+            }
         }
     }
 

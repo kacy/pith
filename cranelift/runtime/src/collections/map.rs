@@ -667,8 +667,9 @@ pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
 
     for key in impl_ref.keys() {
         if let MapKey::String(ref bytes) = key {
-            let ptr = crate::pith_copy_bytes_to_cstring(bytes);
-            pith_list_push_value(list, ptr as i64);
+            if let Some(ptr) = crate::runtime_core::pith_try_copy_bytes_to_cstring(bytes) {
+                pith_list_push_value(list, ptr as i64);
+            }
         }
     }
 

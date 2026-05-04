@@ -111,7 +111,11 @@ unsafe fn err_result(message: &[u8]) -> i64 {
     if error.is_null() {
         return 0;
     }
-    *error = crate::pith_copy_bytes_to_cstring(message) as i64;
+    let Some(message_ptr) = crate::runtime_core::pith_try_copy_bytes_to_cstring(message) else {
+        crate::pith_free(error as *mut i8);
+        return 0;
+    };
+    *error = message_ptr as i64;
     alloc_result(0, 0, error as i64)
 }
 
@@ -129,7 +133,8 @@ fn match_field(key: &[u8], keys: &[&[u8]; 6]) -> Option<usize> {
 unsafe fn parse_field_value(input: &[u8], pos: usize, field_type: i64) -> Option<(i64, usize)> {
     if field_type == TYPE_STRING {
         let end = read_string_end(input, pos)?;
-        let value = crate::pith_copy_bytes_to_cstring(&input[pos + 1..end]) as i64;
+        let value =
+            crate::runtime_core::pith_try_copy_bytes_to_cstring(&input[pos + 1..end])? as i64;
         return Some((value, end + 1));
     }
     if field_type == TYPE_INT {

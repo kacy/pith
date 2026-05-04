@@ -9,6 +9,31 @@ use std::sync::OnceLock;
 
 static FILE_HANDLES: OnceLock<Mutex<HashMap<i64, File>>> = OnceLock::new();
 static NEXT_FILE_HANDLE: AtomicI64 = AtomicI64::new(1);
+const DEFAULT_READ_BYTES: usize = 4096;
+const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
+
+fn read_size(max_bytes: i64) -> usize {
+    if max_bytes <= 0 {
+        DEFAULT_READ_BYTES
+    } else {
+        (max_bytes as usize).min(MAX_READ_BYTES)
+    }
+}
+
+fn read_file_limited(path: &str) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = File::open(path).ok()?;
+    let mut contents = Vec::new();
+    file.by_ref()
+        .take((MAX_READ_BYTES + 1) as u64)
+        .read_to_end(&mut contents)
+        .ok()?;
+    if contents.len() > MAX_READ_BYTES {
+        return None;
+    }
+    Some(contents)
+}
 
 fn file_handles() -> &'static Mutex<HashMap<i64, File>> {
     FILE_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -169,11 +194,12 @@ pub unsafe extern "C" fn pith_rename_file(from: *const i8, to: *const i8) -> i64
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_read_file(path: *const i8) -> *mut i8 {
-    use std::fs;
-
     if let Some(path_str) = cstr_str(path) {
-        if let Ok(contents) = fs::read_to_string(path_str) {
-            return crate::pith_copy_bytes_to_cstring(contents.as_bytes());
+        if let Some(contents) = read_file_limited(path_str) {
+            if std::str::from_utf8(&contents).is_ok() {
+                return crate::runtime_core::pith_try_copy_bytes_to_cstring(&contents)
+                    .unwrap_or(std::ptr::null_mut());
+            }
         }
     }
     std::ptr::null_mut()
@@ -181,15 +207,13 @@ pub unsafe extern "C" fn pith_read_file(path: *const i8) -> *mut i8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_read_file_bytes(path: *const i8) -> i64 {
-    use std::fs;
-
     let Some(path_str) = cstr_str(path) else {
         return 0;
     };
 
-    match fs::read(path_str) {
-        Ok(contents) => pith_bytes_from_vec(contents),
-        Err(_) => 0,
+    match read_file_limited(path_str) {
+        Some(contents) => pith_bytes_from_vec(contents),
+        None => 0,
     }
 }
 
@@ -274,11 +298,7 @@ pub unsafe extern "C" fn pith_file_open_append(path: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_file_read(handle: i64, max_bytes: i64) -> *mut i8 {
     use std::io::Read;
 
-    let size = if max_bytes > 0 {
-        max_bytes as usize
-    } else {
-        4096
-    };
+    let size = read_size(max_bytes);
     let mut handles = file_handles().lock();
     let Some(file) = handles.get_mut(&handle) else {
         return std::ptr::null_mut();
@@ -289,7 +309,8 @@ pub unsafe extern "C" fn pith_file_read(handle: i64, max_bytes: i64) -> *mut i8 
         Ok(0) => crate::pith_cstring_empty(),
         Ok(n) => {
             buf.truncate(n);
-            crate::pith_copy_bytes_to_cstring(&buf)
+            crate::runtime_core::pith_try_copy_bytes_to_cstring(&buf)
+                .unwrap_or(std::ptr::null_mut())
         }
         Err(_) => std::ptr::null_mut(),
     }
@@ -299,11 +320,7 @@ pub unsafe extern "C" fn pith_file_read(handle: i64, max_bytes: i64) -> *mut i8 
 pub unsafe extern "C" fn pith_file_read_bytes(handle: i64, max_bytes: i64) -> i64 {
     use std::io::Read;
 
-    let size = if max_bytes > 0 {
-        max_bytes as usize
-    } else {
-        4096
-    };
+    let size = read_size(max_bytes);
     let mut handles = file_handles().lock();
     let Some(file) = handles.get_mut(&handle) else {
         return 0;
@@ -368,7 +385,8 @@ pub extern "C" fn pith_file_close(handle: i64) {
 pub unsafe extern "C" fn pith_env(name: *const i8) -> *const i8 {
     if let Some(name_str) = cstr_str(name) {
         if let Ok(var) = std::env::var(name_str) {
-            return crate::pith_copy_bytes_to_cstring(var.as_bytes());
+            return crate::runtime_core::pith_try_copy_bytes_to_cstring(var.as_bytes())
+                .unwrap_or(std::ptr::null_mut());
         }
     }
     crate::pith_strdup_string("")

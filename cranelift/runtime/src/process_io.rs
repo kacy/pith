@@ -1,28 +1,34 @@
 use crate::ffi_util::cstr_str_or_empty;
 
-fn pith_read_process_stream<R: std::io::Read>(reader: &mut R, max_bytes: i64) -> *mut i8 {
-    let size = if max_bytes > 0 {
-        max_bytes as usize
+const DEFAULT_STREAM_READ_BYTES: usize = 4096;
+const MAX_STREAM_READ_BYTES: usize = 64 * 1024 * 1024;
+
+fn stream_read_size(max_bytes: i64) -> usize {
+    if max_bytes <= 0 {
+        DEFAULT_STREAM_READ_BYTES
     } else {
-        4096
-    };
+        (max_bytes as usize).min(MAX_STREAM_READ_BYTES)
+    }
+}
+
+fn pith_read_process_stream<R: std::io::Read>(reader: &mut R, max_bytes: i64) -> *mut i8 {
+    let size = stream_read_size(max_bytes);
     let mut buf = vec![0u8; size];
     match reader.read(&mut buf) {
         Ok(0) => unsafe { crate::pith_cstring_empty() },
         Ok(n) => {
             buf.truncate(n);
-            unsafe { crate::pith_copy_bytes_to_cstring(&buf) }
+            unsafe {
+                crate::runtime_core::pith_try_copy_bytes_to_cstring(&buf)
+                    .unwrap_or(std::ptr::null_mut())
+            }
         }
         Err(_) => std::ptr::null_mut(),
     }
 }
 
 fn pith_read_process_stream_bytes<R: std::io::Read>(reader: &mut R, max_bytes: i64) -> i64 {
-    let size = if max_bytes > 0 {
-        max_bytes as usize
-    } else {
-        4096
-    };
+    let size = stream_read_size(max_bytes);
     let mut buf = vec![0u8; size];
     match reader.read(&mut buf) {
         Ok(n) => {

@@ -1,5 +1,9 @@
 use crate::ffi_util::{cstr_bytes, cstr_str};
 
+fn b64_decoded_len(input_len: usize) -> Option<usize> {
+    input_len.checked_mul(3)?.checked_div(4)
+}
+
 /// Format time as string — takes unix timestamp (ms) and format string
 /// Simple implementation: returns ISO-like date string
 ///
@@ -96,8 +100,14 @@ pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
     while in_len > 0 && input[in_len - 1] == b'=' {
         in_len -= 1;
     }
-    let out_len = in_len * 3 / 4;
-    let ptr = crate::pith_alloc(crate::pith_layout(out_len + 1, 1));
+    let Some(out_len) = b64_decoded_len(in_len) else {
+        eprintln!("pith runtime error: base64 decode output size overflow");
+        return std::ptr::null_mut();
+    };
+    let Some(ptr) = crate::runtime_core::pith_try_alloc_cstring(out_len) else {
+        eprintln!("pith runtime error: allocation failed");
+        return std::ptr::null_mut();
+    };
 
     let mut si = 0;
     let mut di = 0;
@@ -108,15 +118,15 @@ pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
         let d = DECODE[input[si + 3] as usize] as u32;
         let n = (a << 18) | (b << 12) | (c << 6) | d;
         if di < out_len {
-            *ptr.add(di) = (n >> 16) as u8;
+            *ptr.add(di) = (n >> 16) as u8 as i8;
             di += 1;
         }
         if di < out_len {
-            *ptr.add(di) = (n >> 8) as u8;
+            *ptr.add(di) = (n >> 8) as u8 as i8;
             di += 1;
         }
         if di < out_len {
-            *ptr.add(di) = n as u8;
+            *ptr.add(di) = n as u8 as i8;
             di += 1;
         }
         si += 4;
@@ -126,21 +136,21 @@ pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
         let b = DECODE[input[si + 1] as usize] as u32;
         let n = (a << 18) | (b << 12);
         if di < out_len {
-            *ptr.add(di) = (n >> 16) as u8;
+            *ptr.add(di) = (n >> 16) as u8 as i8;
             di += 1;
         }
         if si + 2 < in_len {
             let c = DECODE[input[si + 2] as usize] as u32;
             let n2 = (a << 18) | (b << 12) | (c << 6);
             if di < out_len {
-                *ptr.add(di) = ((n2 >> 8) & 0xff) as u8;
+                *ptr.add(di) = ((n2 >> 8) & 0xff) as u8 as i8;
                 di += 1;
             }
         }
     }
     *ptr.add(di.min(out_len)) = 0;
 
-    ptr as *mut i8
+    ptr
 }
 
 #[no_mangle]
@@ -294,7 +304,9 @@ pub unsafe extern "C" fn pith_cstring_repeat(s: *const i8, n: i64) -> *mut i8 {
     let Some(total_len) = len.checked_mul(n as usize) else {
         return crate::pith_cstring_empty();
     };
-    let ptr = crate::pith_alloc(crate::pith_layout(total_len + 1, 1)) as *mut i8;
+    let Some(ptr) = crate::runtime_core::pith_try_alloc_cstring(total_len) else {
+        return crate::pith_cstring_empty();
+    };
     for i in 0..n as usize {
         std::ptr::copy_nonoverlapping(s, ptr.add(i * len), len);
     }
@@ -325,6 +337,7 @@ pub unsafe extern "C" fn pith_is_dir(path: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
 
     #[test]
     fn utility_cstring_callers_handle_null_and_invalid_utf8() {
@@ -338,6 +351,41 @@ mod tests {
             assert_eq!(pith_cstring_index_of(std::ptr::null(), ptr), -1);
             assert_eq!(pith_cstring_contains(ptr, b"x\0".as_ptr() as *const i8), 0);
             assert_eq!(pith_is_dir(ptr as i64), 0);
+        }
+    }
+
+    unsafe fn cstring_bytes(ptr: *const i8) -> Vec<u8> {
+        assert!(!ptr.is_null());
+        let len = crate::string::pith_cstring_len(ptr) as usize;
+        std::slice::from_raw_parts(ptr as *const u8, len).to_vec()
+    }
+
+    #[test]
+    fn base64_decode_length_rejects_overflow() {
+        assert_eq!(b64_decoded_len(4), Some(3));
+        assert_eq!(b64_decoded_len(usize::MAX), None);
+    }
+
+    #[test]
+    fn base64_decode_and_repeat_use_checked_allocations() {
+        let Ok(encoded) = CString::new("cGl0aA==") else {
+            assert!(false);
+            return;
+        };
+        let Ok(text) = CString::new("ha") else {
+            assert!(false);
+            return;
+        };
+
+        unsafe {
+            let decoded = pith_b64_decode(encoded.as_ptr());
+            assert_eq!(cstring_bytes(decoded), b"pith");
+
+            let repeated = pith_cstring_repeat(text.as_ptr(), 3);
+            assert_eq!(cstring_bytes(repeated), b"hahaha");
+
+            crate::pith_free(decoded);
+            crate::pith_free(repeated);
         }
     }
 }

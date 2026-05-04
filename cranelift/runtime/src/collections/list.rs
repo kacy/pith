@@ -377,16 +377,28 @@ pub unsafe extern "C" fn pith_list_join(list: PithList, sep: *const i8) -> *mut 
         if let Some(raw) = impl_ref.get_value(i) {
             let ptr_val = raw as *const i8;
             if !ptr_val.is_null() {
-                total_len += crate::string::pith_cstring_len(ptr_val) as usize;
+                let len = crate::string::pith_cstring_len(ptr_val) as usize;
+                let Some(next_len) = total_len.checked_add(len) else {
+                    eprintln!("pith runtime error: list join output size overflow");
+                    return std::ptr::null_mut();
+                };
+                total_len = next_len;
             }
         }
         if i + 1 < impl_ref.len() {
-            total_len += sep_len;
+            let Some(next_len) = total_len.checked_add(sep_len) else {
+                eprintln!("pith runtime error: list join output size overflow");
+                return std::ptr::null_mut();
+            };
+            total_len = next_len;
         }
         i += 1;
     }
 
-    let out = crate::pith_alloc(crate::pith_layout(total_len + 1, 1)) as *mut i8;
+    let Some(out) = crate::runtime_core::pith_try_alloc_cstring(total_len) else {
+        eprintln!("pith runtime error: allocation failed");
+        return std::ptr::null_mut();
+    };
 
     let mut write = 0usize;
     let mut i = 0usize;
@@ -1042,6 +1054,31 @@ mod tests {
             assert_eq!(pith_list_reduce(list_ptr, 99, 12345), 99);
             pith_list_each(list_ptr, 12345);
 
+            pith_list_release(list);
+        }
+    }
+
+    #[test]
+    fn list_join_uses_checked_allocation() {
+        unsafe {
+            let list = pith_list_new(8, 0);
+            let left = crate::pith_copy_bytes_to_cstring(b"alpha");
+            let right = crate::pith_copy_bytes_to_cstring(b"beta");
+            let sep = crate::pith_copy_bytes_to_cstring(b",");
+
+            pith_list_push_value(list, left as i64);
+            pith_list_push_value(list, right as i64);
+
+            let joined = pith_list_join(list, sep);
+            assert_eq!(
+                crate::ffi_util::cstr_bytes(joined),
+                Some(&b"alpha,beta"[..])
+            );
+
+            crate::pith_free(left);
+            crate::pith_free(right);
+            crate::pith_free(sep);
+            crate::pith_free(joined);
             pith_list_release(list);
         }
     }

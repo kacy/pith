@@ -1,4 +1,5 @@
 use crate::ffi_util::cstr_str;
+use std::alloc::Layout;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static RANDOM_SEED: AtomicU64 = AtomicU64::new(123456789);
@@ -132,8 +133,20 @@ pub unsafe extern "C" fn pith_fmt_float(n: f64, precision: i64) -> *mut i8 {
 pub unsafe extern "C" fn pith_random_string(len: i64) -> *mut i8 {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let n = len.max(0) as usize;
+    let Some(size) = n.checked_add(1) else {
+        eprintln!("pith runtime error: random string allocation size overflow");
+        return std::ptr::null_mut();
+    };
+    let Ok(layout) = Layout::from_size_align(size, 1) else {
+        eprintln!("pith runtime error: invalid random string allocation layout");
+        return std::ptr::null_mut();
+    };
 
-    let ptr = crate::pith_alloc(crate::pith_layout(n + 1, 1)) as *mut i8;
+    let ptr = crate::runtime_core::pith_try_alloc(layout) as *mut i8;
+    if ptr.is_null() {
+        eprintln!("pith runtime error: allocation failed");
+        return std::ptr::null_mut();
+    }
     for i in 0..n {
         let idx = (pith_random_float() * CHARSET.len() as f64) as usize % CHARSET.len();
         *ptr.add(i) = CHARSET[idx] as i8;
@@ -179,6 +192,13 @@ mod tests {
 
         for thread in threads {
             assert!(thread.join().is_ok());
+        }
+    }
+
+    #[test]
+    fn random_string_rejects_size_overflow_without_exiting() {
+        unsafe {
+            assert!(pith_random_string(i64::MAX).is_null());
         }
     }
 }

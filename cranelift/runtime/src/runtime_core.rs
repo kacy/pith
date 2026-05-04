@@ -52,6 +52,14 @@ pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
     ptr
 }
 
+pub(crate) unsafe fn pith_try_alloc(layout: Layout) -> *mut u8 {
+    let ptr = alloc(layout);
+    if !ptr.is_null() {
+        lock_allocations().insert(ptr as usize, layout);
+    }
+    ptr
+}
+
 unsafe fn pith_try_alloc_zeroed(layout: Layout) -> *mut u8 {
     let ptr = alloc_zeroed(layout);
     if !ptr.is_null() {

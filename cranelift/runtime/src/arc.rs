@@ -10,7 +10,7 @@
 //! 3. Propagate marks through references from marked objects
 //! 4. Objects still unmarked with RC == 0 are in cycles -> free them
 
-use std::alloc::{alloc, dealloc};
+use std::alloc::{alloc, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -20,6 +20,8 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 pub struct RcHeader {
     /// Reference count
     pub ref_count: AtomicI64,
+    /// Total allocation size, including this header
+    pub alloc_size: usize,
     /// Type identifier
     pub type_tag: AtomicU32,
     /// Flags for cycle collector
@@ -90,10 +92,16 @@ fn add_to_object_list(header: *mut RcHeader) {
 
     let mut list = lock_object_list();
     let mut next = lock_next(header);
-    if let Some(old_head) = next.take() {
-        *next = Some(old_head);
-    }
+    *next = list.head;
     list.head = Some(header_nn);
+}
+
+fn layout_for_size(total_size: usize) -> Option<Layout> {
+    Layout::from_size_align(total_size, 8).ok()
+}
+
+unsafe fn layout_for_header(header: *mut RcHeader) -> Option<Layout> {
+    layout_for_size((*header).alloc_size)
 }
 
 /// Remove object from global list
@@ -130,18 +138,25 @@ fn remove_from_object_list(header_to_remove: *mut RcHeader) {
 pub unsafe extern "C" fn pith_rc_alloc(size: usize, type_tag: u32) -> *mut u8 {
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_RC_ALLOCS, 1);
-    let total_size = HEADER_SIZE + size;
-    let layout = crate::pith_layout(total_size, 8);
+    let Some(total_size) = HEADER_SIZE.checked_add(size) else {
+        eprintln!("pith runtime error: allocation size overflow");
+        return std::ptr::null_mut();
+    };
+    let Some(layout) = layout_for_size(total_size) else {
+        eprintln!("pith runtime error: invalid allocation layout");
+        return std::ptr::null_mut();
+    };
 
     let ptr = alloc(layout);
     if ptr.is_null() {
         eprintln!("pith runtime error: allocation failed");
-        std::process::exit(1);
+        return std::ptr::null_mut();
     }
 
     // Initialize header
     let header = ptr as *mut RcHeader;
     (*header).ref_count = AtomicI64::new(1);
+    (*header).alloc_size = total_size;
     (*header).type_tag = AtomicU32::new(type_tag);
     (*header).flags = AtomicU32::new(0);
     (*header).next = Mutex::new(None);
@@ -222,8 +237,9 @@ pub unsafe extern "C" fn pith_rc_release(ptr: *mut u8, destructor: Option<extern
     remove_from_object_list(header);
 
     // Free memory
-    let layout = crate::pith_layout(HEADER_SIZE + 4096, 8);
-    dealloc(header as *mut u8, layout);
+    if let Some(layout) = layout_for_header(header) {
+        dealloc(header as *mut u8, layout);
+    }
 }
 
 /// Clear all mark flags
@@ -319,8 +335,9 @@ fn free_cycles(cycles: Vec<*mut RcHeader>) {
             }
 
             // Free the memory
-            let layout = crate::pith_layout(HEADER_SIZE + 4096, 8);
-            dealloc(header as *mut u8, layout);
+            if let Some(layout) = layout_for_header(header) {
+                dealloc(header as *mut u8, layout);
+            }
         }
     }
 }
@@ -381,4 +398,30 @@ pub unsafe fn header_from_ptr(ptr: *mut u8) -> *mut RcHeader {
 pub extern "C" fn pith_force_cycle_collection() {
     collect_cycles();
     RC_RELEASE_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rc_alloc_records_the_actual_layout_size() {
+        unsafe {
+            let ptr = pith_rc_alloc(8192, TypeTag::String as u32);
+            assert!(!ptr.is_null());
+
+            let header = header_from_ptr(ptr);
+            assert_eq!((*header).alloc_size, HEADER_SIZE + 8192);
+
+            pith_rc_release(ptr, None);
+        }
+    }
+
+    #[test]
+    fn rc_alloc_rejects_size_overflow_without_exiting() {
+        unsafe {
+            let ptr = pith_rc_alloc(usize::MAX, TypeTag::String as u32);
+            assert!(ptr.is_null());
+        }
+    }
 }

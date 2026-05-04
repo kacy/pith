@@ -22,7 +22,6 @@ allowed_patterns=(
   'cranelift/codegen/build.rs:[0-9]+:        std::process::exit\(1\);'
   'cranelift/runtime/src/platform.rs:[0-9]+:    std::process::exit\(code as i32\);'
   'cranelift/runtime/src/runtime_core.rs:[0-9]+:.*std::process::exit\(1\);'
-  'cranelift/runtime/src/arc.rs:[0-9]+:        std::process::exit\(1\);'
 )
 
 violations="$matches"

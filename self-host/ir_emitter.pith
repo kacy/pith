@@ -1956,7 +1956,24 @@ fn ir_method_emit_name(mname: String, obj_type: String) -> String:
 fn ir_emit_optional_unwrap(node: Node) -> Int:
     recv_r := ir_expr(node.children[0])
     opt_tid := c_get_expr_type(node.children[0])
-    return ir_optional_value_field(recv_r, opt_tid)
+    flag_r := ir_optional_flag_field(recv_r)
+    some_l := ir_label()
+    none_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
+    ir_emit("label " + some_l)
+    decoded_r := ir_optional_value_field(recv_r, opt_tid)
+    ir_emit("jmp " + merge_l)
+    ir_emit("label " + none_l)
+    if ir_emit_tests and ir_emitting_test_func:
+        ir_test_assert_fail_return()
+    else:
+        si := ir_str("unwrap of none")
+        err_r := ir_reg()
+        ir_emit("strref " + err_r.to_string() + " " + si)
+        ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
+    ir_emit("label " + merge_l)
+    return decoded_r
 
 fn ir_collect_method_call_regs(node: Node) -> List[Int]:
     mut regs: List[Int] := []

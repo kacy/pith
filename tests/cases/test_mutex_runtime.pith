@@ -6,7 +6,7 @@ fn wait_for_mutex(mu: Mutex, ready: Channel[Int], done: Channel[Int]):
     mu.unlock()
     done.send(1)
 
-fn main():
+fn main() -> Int!:
     mu := Mutex()
     ready := Channel[Int](1)
     done := Channel[Int](1)
@@ -22,3 +22,4 @@ fn main():
     print("entered:{ready.recv()?}")
     print("done:{done.recv()?}")
     await task
+    return 0

@@ -1,0 +1,16 @@
+import std.json as json
+
+# Confirm that an int wider than i64::MAX is reported as a parse error
+# instead of silently aliasing to 0. Regression for the in-band overflow
+# sentinel that used to live in parse_integer_manual.
+
+fn main() -> Int!:
+    overflow := "99999999999999999999"
+    handle := json.parse(overflow)
+    print("overflow_handle:{handle}")
+
+    valid_zero := "0"
+    zero_handle := json.parse(valid_zero)
+    print("zero_handle_valid:{zero_handle >= 0}")
+    print("zero_value:{json.get_int(zero_handle).to_string()}")
+    return 0

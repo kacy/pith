@@ -166,7 +166,8 @@ fn is_number_char(c: String) -> Bool:
         return true
     return false
 
-# Parses an integer from a string manually
+# Parses an integer from a string manually. Sets parser_error on overflow
+# instead of silently wrapping to a meaningless value.
 fn parse_integer_manual(s: String) -> Int:
     mut val := 0
     mut neg := false
@@ -179,7 +180,11 @@ fn parse_integer_manual(s: String) -> Int:
     while i < s.len():
         c := s[i]
         if c >= "0" and c <= "9":
-            val = val * 10 + (ord(c) - 48)
+            digit := ord(c) - 48
+            if val > 922337203685477580 / 10:
+                parser_error = true
+                return 0
+            val = val * 10 + digit
         i = i + 1
     if neg:
         return 0 - val

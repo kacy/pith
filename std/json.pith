@@ -149,7 +149,9 @@ fn skip_whitespace():
     while parser_position < parser_input.len() and (get_char_at(parser_position) == " " or get_char_at(parser_position) == chr(9) or get_char_at(parser_position) == chr(10) or get_char_at(parser_position) == chr(13)):
         parser_position = parser_position + 1
 
-# Parses an integer from a string manually (handles negative numbers)
+# Parses an integer from a string manually (handles negative numbers).
+# On overflow, sets parser_error so json_parse returns -1 instead of
+# silently aliasing the overflowed value with a legitimate 0.
 fn parse_integer_manual(s: String) -> Int:
     mut val := 0
     mut neg := false
@@ -163,9 +165,9 @@ fn parse_integer_manual(s: String) -> Int:
         c := s[i]
         if c >= "0" and c <= "9":
             digit := ord(c) - 48
-            # Overflow detection
             if val > 922337203685477580 / 10:
-                return 0 # Overflow sentinel
+                parser_error = true
+                return 0
             val = val * 10 + digit
         i = i + 1
     if neg:

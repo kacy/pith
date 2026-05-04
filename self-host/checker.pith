@@ -3877,8 +3877,25 @@ fn check_unwrap_expression(node: Node, scope_id: Int) -> Int:
         return TID_ERR
     info := get_type_info(inner)
     if info.kind == "optional":
+        if checking_test_decl:
+            return info.inner
+        # ? propagates `none` as a fail in the enclosing function. That
+        # only makes sense when the enclosing function returns a result;
+        # otherwise the unwrap would either silently corrupt the program
+        # or have to abort, which violates the no-panics rule.
+        ret := get_scope_return_type(scope_id)
+        if ret < 0:
+            report_error_with_fix("E238", "unwrap (?) can only be used in functions that return a result type", "wrap main or the enclosing fn return in T! and propagate, or replace ? with `match`/`unwrap_or` for an in-place default")
+            return TID_ERR
+        ret_info := get_type_info(ret)
+        if ret_info.kind != "result":
+            report_error_with_fix("E238", "unwrap (?) can only be used in functions that return a result type", "wrap main or the enclosing fn return in T! and propagate, or replace ? with `match`/`unwrap_or` for an in-place default")
+            return TID_ERR
         return info.inner
-    report_error_with_fix("E224", "unwrap requires an optional type, got " + get_type_name(inner), "use ? for unwrapping optional types")
+    if info.kind == "result":
+        report_error_with_fix("E224", "unwrap (?) requires an optional type, got " + get_type_name(inner), "use ! to propagate a result error")
+    else:
+        report_error_with_fix("E224", "unwrap (?) requires an optional type, got " + get_type_name(inner), "wrap the producer return in T? so ? has something to unwrap")
     return TID_ERR
 
 # ---------------------------------------------------------------
@@ -3908,7 +3925,10 @@ fn check_try_expression(node: Node, scope_id: Int) -> Int:
             report_error("E239", "try (!) error type mismatch: cannot propagate " + get_type_name(info.value_type) + " from function returning " + get_type_name(ret))
             return TID_ERR
         return info.inner
-    report_error_with_fix("E224", "try requires a result type, got " + get_type_name(inner), "use ! for unwrapping optional types")
+    if info.kind == "optional":
+        report_error_with_fix("E224", "try (!) requires a result type, got " + get_type_name(inner), "use ? to unwrap an optional value")
+    else:
+        report_error_with_fix("E224", "try (!) requires a result type, got " + get_type_name(inner), "wrap the producer return in T! so ! can propagate the error")
     return TID_ERR
 
 fn check_catch_expression(node: Node, scope_id: Int) -> Int:

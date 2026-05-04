@@ -1,7 +1,7 @@
 use crate::collections::list::{pith_list_new, pith_list_push_value};
 use crate::handle_registry::{self, HandleKind};
 use crate::string;
-use std::alloc::{alloc, Layout};
+use std::alloc::{alloc, alloc_zeroed, Layout};
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
@@ -49,6 +49,14 @@ pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
         std::process::exit(1);
     }
     lock_allocations().insert(ptr as usize, layout);
+    ptr
+}
+
+unsafe fn pith_try_alloc_zeroed(layout: Layout) -> *mut u8 {
+    let ptr = alloc_zeroed(layout);
+    if !ptr.is_null() {
+        lock_allocations().insert(ptr as usize, layout);
+    }
     ptr
 }
 
@@ -203,6 +211,27 @@ mod tests {
             let ptr = pith_copy_bytes_to_cstring(b"free once");
             pith_free(ptr);
             pith_free(ptr);
+        }
+    }
+
+    #[test]
+    fn struct_alloc_returns_zeroed_memory() {
+        unsafe {
+            let ptr = pith_struct_alloc(3);
+            assert_ne!(ptr, 0);
+
+            let fields = std::slice::from_raw_parts(ptr as *const i64, 3);
+            assert_eq!(fields, &[0, 0, 0]);
+            assert!(pith_dealloc(ptr as *mut u8));
+        }
+    }
+
+    #[test]
+    fn struct_alloc_rejects_invalid_sizes_without_exiting() {
+        unsafe {
+            assert_eq!(pith_struct_alloc(0), 0);
+            assert_eq!(pith_struct_alloc(-1), 0);
+            assert_eq!(pith_struct_alloc(i64::MAX), 0);
         }
     }
 }
@@ -679,18 +708,23 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
-    use std::alloc::alloc_zeroed;
-
-    let size = (num_fields.max(0) as usize) * 8;
-    if size == 0 {
+    if num_fields <= 0 {
         return 0;
     }
 
-    let layout = pith_layout(size, 8);
-    let ptr = alloc_zeroed(layout);
+    let Some(size) = (num_fields as usize).checked_mul(8) else {
+        eprintln!("pith runtime error: struct allocation size overflow");
+        return 0;
+    };
+    let Ok(layout) = Layout::from_size_align(size, 8) else {
+        eprintln!("pith runtime error: invalid struct allocation layout");
+        return 0;
+    };
+
+    let ptr = pith_try_alloc_zeroed(layout);
     if ptr.is_null() {
         eprintln!("pith runtime error: allocation failed");
-        std::process::exit(1);
+        return 0;
     }
     ptr as i64
 }

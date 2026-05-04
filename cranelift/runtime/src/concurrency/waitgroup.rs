@@ -32,6 +32,23 @@ fn wait_state<'a>(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn delta_magnitude(delta: i64) -> usize {
+    let value = delta.unsigned_abs();
+    if value > usize::MAX as u64 {
+        usize::MAX
+    } else {
+        value as usize
+    }
+}
+
+fn apply_delta(count: usize, delta: i64) -> usize {
+    if delta >= 0 {
+        count.saturating_add(delta_magnitude(delta))
+    } else {
+        count.saturating_sub(delta_magnitude(delta))
+    }
+}
+
 /// Create a new WaitGroup
 ///
 /// Returns an opaque handle to the waitgroup
@@ -53,9 +70,12 @@ pub unsafe extern "C" fn pith_waitgroup_add(handle: *mut PithWaitGroupHandle, de
     let Some(wg) = waitgroup_ref(handle) else {
         return;
     };
-    let (lock, _) = &**wg;
+    let (lock, cvar) = &**wg;
     let mut state = lock_state(lock);
-    state.count = (state.count as i64 + delta).max(0) as usize;
+    state.count = apply_delta(state.count, delta);
+    if state.count == 0 {
+        cvar.notify_all();
+    }
 }
 
 /// Decrement the WaitGroup counter (Done)
@@ -96,6 +116,9 @@ pub unsafe extern "C" fn pith_waitgroup_wait(handle: *mut PithWaitGroupHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn invalid_waitgroup_handles_are_ignored() {
@@ -103,6 +126,45 @@ mod tests {
             let handle = 12345usize as *mut PithWaitGroupHandle;
             pith_waitgroup_add(handle, 1);
             pith_waitgroup_done(handle);
+            pith_waitgroup_wait(handle);
+        }
+    }
+
+    #[test]
+    fn negative_add_wakes_waiters_when_count_reaches_zero() {
+        let handle = pith_waitgroup_new();
+        unsafe {
+            pith_waitgroup_add(handle, 1);
+        }
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_for_thread = finished.clone();
+        let handle_addr = handle as usize;
+        let waiter = std::thread::spawn(move || {
+            let handle = handle_addr as *mut PithWaitGroupHandle;
+            unsafe {
+                pith_waitgroup_wait(handle);
+            }
+            finished_for_thread.store(true, Ordering::SeqCst);
+        });
+
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(!finished.load(Ordering::SeqCst));
+
+        unsafe {
+            pith_waitgroup_add(handle, -1);
+        }
+
+        assert!(waiter.join().is_ok());
+        assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn large_negative_delta_saturates_at_zero() {
+        let handle = pith_waitgroup_new();
+        unsafe {
+            pith_waitgroup_add(handle, 2);
+            pith_waitgroup_add(handle, i64::MIN);
             pith_waitgroup_wait(handle);
         }
     }

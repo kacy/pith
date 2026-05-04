@@ -2,6 +2,20 @@ use crate::ffi_util::cstr_str;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static RANDOM_SEED: AtomicU64 = AtomicU64::new(123456789);
+const RANDOM_MULTIPLIER: u64 = 6364136223846793005;
+
+fn next_random_seed() -> u64 {
+    loop {
+        let current = RANDOM_SEED.load(Ordering::Relaxed);
+        let next = current.wrapping_mul(RANDOM_MULTIPLIER).wrapping_add(1);
+        if RANDOM_SEED
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
 
 /// Exit the program with given status code
 #[no_mangle]
@@ -12,6 +26,9 @@ pub extern "C" fn pith_exit(code: i64) {
 /// Sleep for given number of milliseconds
 #[no_mangle]
 pub extern "C" fn pith_sleep(ms: i64) {
+    if ms <= 0 {
+        return;
+    }
     std::thread::sleep(std::time::Duration::from_millis(ms as u64));
 }
 
@@ -79,12 +96,7 @@ pub unsafe extern "C" fn pith_exec(command: *const i8) -> i64 {
 /// Random float between 0.0 and 1.0
 #[no_mangle]
 pub extern "C" fn pith_random_float() -> f64 {
-    use std::num::Wrapping;
-
-    let s = RANDOM_SEED.load(Ordering::Relaxed);
-    let new_s = Wrapping(s) * Wrapping(6364136223846793005) + Wrapping(1);
-    RANDOM_SEED.store(new_s.0, Ordering::Relaxed);
-    (new_s.0 >> 11) as f64 / (1u64 << 53) as f64
+    (next_random_seed() >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Seed the random number generator
@@ -99,9 +111,10 @@ pub extern "C" fn pith_random_int(min: i64, max: i64) -> i64 {
     if min >= max {
         return min;
     }
-    let range = (max - min + 1) as u64;
-    let r = (pith_random_float() * range as f64) as i64;
-    min + r
+
+    let range = max as i128 - min as i128 + 1;
+    let offset = (pith_random_float() * range as f64) as i128;
+    (min as i128 + offset.min(range - 1)) as i64
 }
 
 /// Format float with given precision
@@ -140,6 +153,32 @@ mod tests {
         unsafe {
             assert_eq!(pith_exec(std::ptr::null()), -1);
             assert_eq!(pith_exec(invalid.as_ptr() as *const i8), -1);
+        }
+    }
+
+    #[test]
+    fn random_int_handles_the_full_i64_range() {
+        pith_random_seed(1);
+        let value = pith_random_int(i64::MIN, i64::MAX);
+        assert!((i64::MIN..=i64::MAX).contains(&value));
+    }
+
+    #[test]
+    fn random_seed_updates_are_atomic_across_threads() {
+        pith_random_seed(1);
+
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            threads.push(std::thread::spawn(|| {
+                for _ in 0..1000 {
+                    let value = pith_random_float();
+                    assert!((0.0..1.0).contains(&value));
+                }
+            }));
+        }
+
+        for thread in threads {
+            assert!(thread.join().is_ok());
         }
     }
 }

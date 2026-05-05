@@ -17,6 +17,7 @@ from scope import reset_scope_arena, create_scope, define_binding, lookup_bindin
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
+from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 
 mut checker_diagnostics: List[Diagnostic] := []
 mut current_file_path: String := ""
@@ -626,65 +627,6 @@ fn register_sync_primitive_type(name: String, param_tids: List[Int]):
         j = j + 1
     ctor_tid := add_type_info(ti_function(ctor_params, tid))
     define_binding(current_scope, name, ctor_tid, false)
-
-# ---------------------------------------------------------------
-# intern collection types
-# ---------------------------------------------------------------
-
-fn build_collection_type_name(base: String, key_or_elem: Int, val: Int) -> String:
-    if val < 0:
-        return base + "[" + get_type_name(key_or_elem) + "]"
-    return base + "[" + get_type_name(key_or_elem) + "," + get_type_name(val) + "]"
-
-fn intern_list_type(elem: Int) -> Int:
-    name := build_collection_type_name("List", elem, -1)
-    existing := lookup_type_id(name)
-    if existing == -1:
-        add_type_info(ti_list(elem))
-        tid := get_type_count() - 1
-        register_type_name(name, tid)
-        return tid
-    return existing
-
-fn intern_set_type(elem: Int) -> Int:
-    name := build_collection_type_name("Set", elem, -1)
-    existing := lookup_type_id(name)
-    if existing == -1:
-        add_type_info(ti_set(elem))
-        tid := get_type_count() - 1
-        register_type_name(name, tid)
-        return tid
-    return existing
-
-fn intern_map_type(key_type: Int, val_type: Int) -> Int:
-    name := build_collection_type_name("Map", key_type, val_type)
-    existing := lookup_type_id(name)
-    if existing == -1:
-        add_type_info(ti_map(key_type, val_type))
-        tid := get_type_count() - 1
-        register_type_name(name, tid)
-        return tid
-    return existing
-
-fn intern_task_type(inner: Int) -> Int:
-    name := build_collection_type_name("Task", inner, -1)
-    existing := lookup_type_id(name)
-    if existing == -1:
-        add_type_info(ti_task(inner))
-        tid := get_type_count() - 1
-        register_type_name(name, tid)
-        return tid
-    return existing
-
-fn intern_channel_type(inner: Int) -> Int:
-    name := build_collection_type_name("Channel", inner, -1)
-    existing := lookup_type_id(name)
-    if existing == -1:
-        add_type_info(ti_channel(inner))
-        tid := get_type_count() - 1
-        register_type_name(name, tid)
-        return tid
-    return existing
 
 pub fn debug_intern_list_string() -> Int:
     return intern_list_type(lookup_type_id("String"))

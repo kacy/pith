@@ -40,6 +40,7 @@ from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_dec
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
 from ir_ast_helpers import ir_list_contains, ir_is_string_literal_kind, ir_unwrap_pub_node, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
+from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -441,27 +442,6 @@ fn ir_emit_result_ok_field_for_expr(obj_r: Int, expr_idx: Int) -> Int:
     r := ir_reg()
     ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 8 " + field_kind + " ok")
     return r
-
-fn ir_uses_result_abi(result_kind: String) -> Bool:
-    return result_kind.len() > 0 and result_kind != "tuple"
-
-fn ir_encode_result_value(value_reg: Int, result_kind: String) -> Int:
-    if ir_uses_result_abi(result_kind):
-        one := ir_reg()
-        ir_emit("iconst " + one.to_string() + " 1")
-        encoded := ir_reg()
-        ir_emit("add " + encoded.to_string() + " " + value_reg.to_string() + " " + one.to_string())
-        return encoded
-    return value_reg
-
-fn ir_decode_result_value(value_reg: Int, result_kind: String) -> Int:
-    if ir_uses_result_abi(result_kind):
-        one := ir_reg()
-        ir_emit("iconst " + one.to_string() + " 1")
-        decoded := ir_reg()
-        ir_emit("sub " + decoded.to_string() + " " + value_reg.to_string() + " " + one.to_string())
-        return decoded
-    return value_reg
 
 fn ir_capture_blocked_names() -> Map[String, Bool]:
     mut blocked: Map[String, Bool] := {}
@@ -5157,22 +5137,6 @@ fn ir_emit_field_access(idx: Int, node: Node) -> Int:
     ir_emit_named_field_access(r, obj_r, ir_field_lookup_key(recv_idx, fname), fname, ir_checked_struct_field_type(recv_idx, fname))
     return r
 
-fn ir_emit_result_flag_field(obj_r: Int, fname: String) -> Int:
-    flag_r := ir_reg()
-    ir_emit("field " + flag_r.to_string() + " " + obj_r.to_string() + " 0 bool is_ok")
-    if fname == "is_ok":
-        return flag_r
-    zero := ir_reg()
-    ir_emit("iconst " + zero.to_string() + " 0")
-    r := ir_reg()
-    ir_emit("eq " + r.to_string() + " " + flag_r.to_string() + " " + zero.to_string())
-    return r
-
-fn ir_zero_reg() -> Int:
-    r := ir_reg()
-    ir_emit("iconst " + r.to_string() + " 0")
-    return r
-
 fn ir_emit_result_tuple(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
     count_r := ir_reg()
     ir_emit("iconst " + count_r.to_string() + " 3")
@@ -5215,11 +5179,6 @@ fn ir_emit_result_value_field(obj_r: Int, obj_tid: Int, fname: String) -> Int:
     r := ir_reg()
     ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " " + offset.to_string() + " " + ir_result_field_kind(obj_tid, fname) + " " + fname)
     return r
-
-fn ir_emit_result_error_message(callee_name: String) -> Int:
-    msg_r := ir_reg()
-    ir_emit("strref " + msg_r.to_string() + " " + ir_str(callee_name + " failed"))
-    return msg_r
 
 fn ir_emit_wrapped_legacy_result(raw_r: Int, legacy_kind: String, callee_name: String) -> Int:
     temp_name := ir_new_temp_name("legacy_result")

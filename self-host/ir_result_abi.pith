@@ -1,0 +1,44 @@
+# ir_result_abi.pith - low-level Result IR helpers
+
+from ir_builder import ir_emit, ir_reg, ir_str
+
+pub fn ir_uses_result_abi(result_kind: String) -> Bool:
+    return result_kind.len() > 0 and result_kind != "tuple"
+
+pub fn ir_encode_result_value(value_reg: Int, result_kind: String) -> Int:
+    if ir_uses_result_abi(result_kind):
+        one := ir_reg()
+        ir_emit("iconst " + one.to_string() + " 1")
+        encoded := ir_reg()
+        ir_emit("add " + encoded.to_string() + " " + value_reg.to_string() + " " + one.to_string())
+        return encoded
+    return value_reg
+
+pub fn ir_decode_result_value(value_reg: Int, result_kind: String) -> Int:
+    if ir_uses_result_abi(result_kind):
+        one := ir_reg()
+        ir_emit("iconst " + one.to_string() + " 1")
+        decoded := ir_reg()
+        ir_emit("sub " + decoded.to_string() + " " + value_reg.to_string() + " " + one.to_string())
+        return decoded
+    return value_reg
+
+pub fn ir_emit_result_flag_field(obj_r: Int, fname: String) -> Int:
+    flag_r := ir_reg()
+    ir_emit("field " + flag_r.to_string() + " " + obj_r.to_string() + " 0 bool is_ok")
+    if fname == "is_ok":
+        return flag_r
+    zero := ir_zero_reg()
+    r := ir_reg()
+    ir_emit("eq " + r.to_string() + " " + flag_r.to_string() + " " + zero.to_string())
+    return r
+
+pub fn ir_zero_reg() -> Int:
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " 0")
+    return r
+
+pub fn ir_emit_result_error_message(callee_name: String) -> Int:
+    msg_r := ir_reg()
+    ir_emit("strref " + msg_r.to_string() + " " + ir_str(callee_name + " failed"))
+    return msg_r

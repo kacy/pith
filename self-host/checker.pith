@@ -16,6 +16,7 @@ from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_op
 from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
+from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 
 mut checker_diagnostics: List[Diagnostic] := []
 mut current_file_path: String := ""
@@ -130,55 +131,6 @@ pub fn set_checker_file_path(file_path: String):
 # Register an import alias for module namespace resolution
 pub fn register_import_alias(alias: String, module_path: String):
     module_aliases.insert(alias, module_path)
-
-fn module_symbol_prefix(module_path: String) -> String:
-    mut prefix := ""
-    for ch in module_path:
-        if ch == ".":
-            prefix = prefix + "_"
-        else:
-            prefix = prefix + ch
-    return prefix + "_"
-
-fn module_generic_target_name(module_path: String, name: String) -> String:
-    if module_path.len() == 0:
-        return name
-    return module_symbol_prefix(module_path) + name
-
-fn clean_import_part(part: String) -> String:
-    mut start := 0
-    mut end := part.len()
-    while start < end and part[start] == ",":
-        start = start + 1
-    while end > start and part[end - 1] == ",":
-        end = end - 1
-    return part.substring(start, end)
-
-fn module_default_alias(module_path: String) -> String:
-    mut last_dot := 0 - 1
-    mut i := 0
-    while i < module_path.len():
-        if module_path[i] == ".":
-            last_dot = i
-        i = i + 1
-    if last_dot < 0:
-        return module_path
-    return module_path.substring(last_dot + 1, module_path.len())
-
-fn module_import_target_name(module_path: String, name: String) -> String:
-    if module_path == "std.json":
-        return "json_" + name
-    if module_path == "std.toml":
-        return "toml_" + name
-    if module_path == "std.encoding":
-        return "encoding_" + name
-    if module_path == "std.hash":
-        return "hash_" + name
-    if module_path == "std.log":
-        return "log_" + name
-    if module_path == "std.net.url":
-        return "url_" + name
-    return name
 
 # Process import declarations from AST and register aliases
 pub fn process_import_aliases(root_idx: Int):
@@ -1308,14 +1260,6 @@ fn strings_equal(a: String, b: String) -> Bool:
             return false
         i = i + 1
     return true
-
-fn split_qualified_name(value: String) -> (String, String):
-    mut i := 0
-    while i < value.len():
-        if ord(value[i]) == 46:
-            return (value.substring(0, i), value.substring(i + 1, value.len()))
-        i = i + 1
-    return (value, "")
 
 fn get_type_node_name(node: Node) -> String:
     # extract the type name from a type expression node

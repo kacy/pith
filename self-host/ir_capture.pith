@@ -1,0 +1,58 @@
+# ir_capture.pith - lambda capture analysis
+
+from ast import get_node
+from ir_ast_helpers import ir_list_contains, ir_is_binding_kind, ir_binding_name
+from ir_metadata import ir_is_known_returning_func
+
+fn ir_copy_names(names: List[String]) -> List[String]:
+    mut copy: List[String] := []
+    for name in names:
+        copy.push(name)
+    return copy
+
+fn ir_should_capture_name(name: String, bound: List[String], free: List[String], blocked_names: Map[String, Bool]) -> Bool:
+    if ir_list_contains(bound, name) or ir_list_contains(free, name):
+        return false
+    if blocked_names.contains_key(name):
+        return false
+    return not ir_is_known_returning_func(name)
+
+fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blocked_names: Map[String, Bool]) -> List[String]:
+    node := get_node(idx)
+    if node.kind == "ident":
+        name := node.value
+        if ir_should_capture_name(name, bound, free, blocked_names):
+            mut updated := ir_copy_names(free)
+            updated.push(name)
+            return updated
+        return free
+    if node.kind == "lambda":
+        inner_bound := ir_copy_names(bound)
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "param":
+                inner_bound.push(cn.value)
+        mut updated_free := ir_copy_names(free)
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "body":
+                updated_free = ir_find_free_vars_walk(child, inner_bound, updated_free, blocked_names)
+        return updated_free
+    if node.kind == "body":
+        mut scoped_bound := ir_copy_names(bound)
+        mut updated_free := ir_copy_names(free)
+        for child in node.children:
+            updated_free = ir_find_free_vars_walk(child, scoped_bound, updated_free, blocked_names)
+            child_node := get_node(child)
+            if ir_is_binding_kind(child_node.kind):
+                bind_name := ir_binding_name(child_node)
+                if bind_name.len() > 0 and not ir_list_contains(scoped_bound, bind_name):
+                    scoped_bound.push(bind_name)
+        return updated_free
+    mut updated_free := ir_copy_names(free)
+    for child in node.children:
+        updated_free = ir_find_free_vars_walk(child, bound, updated_free, blocked_names)
+    return updated_free
+
+pub fn ir_capture_find_free_vars(idx: Int, bound: List[String], blocked_names: Map[String, Bool]) -> List[String]:
+    return ir_find_free_vars_walk(idx, bound, [], blocked_names)

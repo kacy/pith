@@ -39,6 +39,7 @@ from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, i
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
 from ir_ast_helpers import ir_list_contains, ir_is_string_literal_kind, ir_unwrap_pub_node, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
+from ir_capture import ir_capture_find_free_vars
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -462,60 +463,20 @@ fn ir_decode_result_value(value_reg: Int, result_kind: String) -> Int:
         return decoded
     return value_reg
 
-fn ir_should_capture_name(name: String, bound: List[String], free: List[String]) -> Bool:
-    if ir_list_contains(bound, name) or ir_list_contains(free, name):
-        return false
-    if ir_module_aliases.contains_key(name):
-        return false
-    if ir_import_renames.contains_key(name):
-        return false
-    return ir_known_callable_return_type(name).len() == 0
-
-fn ir_copy_names(names: List[String]) -> List[String]:
-    mut copy: List[String] := []
-    for name in names:
-        copy.push(name)
-    return copy
-
-fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String]) -> List[String]:
-    node := get_node(idx)
-    if node.kind == "ident":
-        name := node.value
-        if ir_should_capture_name(name, bound, free):
-            mut updated := ir_copy_names(free)
-            updated.push(name)
-            return updated
-        return free
-    if node.kind == "lambda":
-        inner_bound := ir_copy_names(bound)
-        for child in node.children:
-            cn := get_node(child)
-            if cn.kind == "param":
-                inner_bound.push(cn.value)
-        mut updated_free := ir_copy_names(free)
-        for child in node.children:
-            cn := get_node(child)
-            if cn.kind == "body":
-                updated_free = ir_find_free_vars_walk(child, inner_bound, updated_free)
-        return updated_free
-    if node.kind == "body":
-        mut scoped_bound := ir_copy_names(bound)
-        mut updated_free := ir_copy_names(free)
-        for child in node.children:
-            updated_free = ir_find_free_vars_walk(child, scoped_bound, updated_free)
-            child_node := get_node(child)
-            if ir_is_binding_kind(child_node.kind):
-                bind_name := ir_binding_name(child_node)
-                if bind_name.len() > 0 and not ir_list_contains(scoped_bound, bind_name):
-                    scoped_bound.push(bind_name)
-        return updated_free
-    mut updated_free := ir_copy_names(free)
-    for child in node.children:
-        updated_free = ir_find_free_vars_walk(child, bound, updated_free)
-    return updated_free
+fn ir_capture_blocked_names() -> Map[String, Bool]:
+    mut blocked: Map[String, Bool] := {}
+    for name in ir_module_aliases.keys():
+        blocked.insert(name, true)
+    for name in ir_import_renames.keys():
+        blocked.insert(name, true)
+    for name in ir_struct_names.keys():
+        blocked.insert(name, true)
+    for name in ir_func_returns.keys():
+        blocked.insert(name, true)
+    return blocked
 
 fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
-    return ir_find_free_vars_walk(idx, bound, [])
+    return ir_capture_find_free_vars(idx, bound, ir_capture_blocked_names())
 
 fn ir_collect_string_nodes(idx: Int) -> List[Int]:
     mut string_nodes: List[Int] := []

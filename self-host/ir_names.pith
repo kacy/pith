@@ -1,0 +1,36 @@
+# ir_names.pith — IR symbol naming helpers
+
+pub fn ir_module_default_alias(module_path: String) -> String:
+    mut last_dot := 0 - 1
+    mut i := 0
+    while i < module_path.len():
+        if module_path[i] == ".":
+            last_dot = i
+        i = i + 1
+    if last_dot < 0:
+        return module_path
+    return module_path.substring(last_dot + 1, module_path.len())
+
+pub fn ir_import_symbol_prefix(module_path: String) -> String:
+    if module_path.len() == 0:
+        return ""
+    mut prefix := ""
+    mut i := 0
+    while i < module_path.len():
+        if module_path[i] == ".":
+            prefix = prefix + "_"
+        else:
+            prefix = prefix + module_path[i]
+        i = i + 1
+    return prefix + "_"
+
+pub fn ir_import_target_name(module_path: String, name: String) -> String:
+    return ir_import_symbol_prefix(module_path) + name
+
+pub fn ir_base_decl_name(name: String) -> String:
+    if name.contains("["):
+        return name.substring(0, name.index_of("["))
+    return name
+
+pub fn ir_import_impl_method_name(module_path: String, impl_type: String, method_name: String) -> String:
+    return ir_import_target_name(module_path, impl_type + "_" + method_name)

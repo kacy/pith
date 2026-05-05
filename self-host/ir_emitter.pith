@@ -36,6 +36,7 @@ from ast import get_node, node_kind, node_value, node_child, node_child_count, N
 from checker import c_get_expr_type
 from types import TypeInfo, get_type_info
 from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, ir_is_int_returning_func, ir_is_string_returning_func, ir_is_bytes_returning_func, ir_is_list_returning_func, ir_is_list_string_returning_func, ir_is_bool_returning_method, ir_is_void_method, ir_is_string_returning_method, ir_runtime_call_name, ir_method_emit_name
+from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
 
 # --- emitted ir buffers ---
 mut ir_lines: List[String] := []
@@ -669,33 +670,6 @@ fn ir_emit_call0(result_reg: Int, fname: String, ret_type: String):
 
 fn ir_emit_call1(result_reg: Int, fname: String, ret_type: String, arg0: Int):
     ir_emit_call_text(result_reg, fname, ret_type, 1, " " + arg0.to_string())
-
-fn ir_module_default_alias(module_path: String) -> String:
-    mut last_dot := 0 - 1
-    mut i := 0
-    while i < module_path.len():
-        if module_path[i] == ".":
-            last_dot = i
-        i = i + 1
-    if last_dot < 0:
-        return module_path
-    return module_path.substring(last_dot + 1, module_path.len())
-
-fn ir_import_symbol_prefix(module_path: String) -> String:
-    if module_path.len() == 0:
-        return ""
-    mut prefix := ""
-    mut i := 0
-    while i < module_path.len():
-        if module_path[i] == ".":
-            prefix = prefix + "_"
-        else:
-            prefix = prefix + module_path[i]
-        i = i + 1
-    return prefix + "_"
-
-fn ir_import_target_name(module_path: String, name: String) -> String:
-    return ir_import_symbol_prefix(module_path) + name
 
 struct ResolvedCallee:
     name: String
@@ -6749,11 +6723,6 @@ fn ir_emit_fn_params(fn_idx: Int):
         if cn.kind == "param":
             ir_emit_named_param(cn.value, ir_extract_param_type(child))
 
-fn ir_base_decl_name(name: String) -> String:
-    if name.contains("["):
-        return name.substring(0, name.index_of("["))
-    return name
-
 fn ir_extract_return_type(fn_idx: Int) -> String:
     node := get_node(fn_idx)
     for child in node.children:
@@ -6785,9 +6754,6 @@ fn ir_lookup_func_return(full_name: String, base_name: String) -> String:
 
 fn ir_impl_method_key(type_name: String, method_name: String) -> String:
     return type_name + "." + method_name
-
-fn ir_import_impl_method_name(module_path: String, impl_type: String, method_name: String) -> String:
-    return ir_import_target_name(module_path, impl_type + "_" + method_name)
 
 fn ir_lookup_impl_method_name(type_name: String, method_name: String) -> String:
     if type_name.len() == 0:

@@ -716,21 +716,6 @@ pub unsafe extern "C" fn pith_list_clear(list: *mut PithList) {
     impl_ref.clear();
 }
 
-/// Check if list is empty
-#[no_mangle]
-pub extern "C" fn pith_list_is_empty(list: PithList) -> i64 {
-    unsafe {
-        let Some(impl_ref) = list_ref(list) else {
-            return 1;
-        };
-        if impl_ref.len() == 0 {
-            1
-        } else {
-            0
-        }
-    }
-}
-
 /// Reverse list elements in-place
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_reverse(list: PithList) {
@@ -766,100 +751,6 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
     let _ = Box::from_raw(list.ptr as *mut ListImpl);
 }
 
-/// Check if a list of C-string pointers contains the given C-string.
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_contains_cstr(list_handle: i64, s: *const i8) -> i64 {
-    if s.is_null() {
-        return 0;
-    }
-
-    let Some(impl_ref) = list_ref_from_handle(list_handle) else {
-        return 0;
-    };
-    let needle_len = crate::string::pith_cstring_len(s) as usize;
-    let needle = std::slice::from_raw_parts(s as *const u8, needle_len);
-
-    for i in 0..impl_ref.len() {
-        let ptr_val = impl_ref.get_value(i).unwrap_or(0) as *const i8;
-        if ptr_val.is_null() {
-            continue;
-        }
-        let elem_len = crate::string::pith_cstring_len(ptr_val) as usize;
-        if elem_len != needle_len {
-            continue;
-        }
-        let elem_bytes = std::slice::from_raw_parts(ptr_val as *const u8, elem_len);
-        if elem_bytes == needle {
-            return 1;
-        }
-    }
-
-    0
-}
-
-/// Find the index of a C-string in a list of C-string pointers.
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_index_of_cstr(list_handle: i64, s: *const i8) -> i64 {
-    if s.is_null() {
-        return -1;
-    }
-
-    let Some(impl_ref) = list_ref_from_handle(list_handle) else {
-        return -1;
-    };
-    let needle_len = crate::string::pith_cstring_len(s) as usize;
-    let needle = std::slice::from_raw_parts(s as *const u8, needle_len);
-
-    for i in 0..impl_ref.len() {
-        let ptr_val = impl_ref.get_value(i).unwrap_or(0) as *const i8;
-        if ptr_val.is_null() {
-            continue;
-        }
-        let elem_len = crate::string::pith_cstring_len(ptr_val) as usize;
-        if elem_len != needle_len {
-            continue;
-        }
-        let elem_bytes = std::slice::from_raw_parts(ptr_val as *const u8, elem_len);
-        if elem_bytes == needle {
-            return i as i64;
-        }
-    }
-
-    -1
-}
-
-/// Find index of integer value in list
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_index_of_int(list: PithList, value: i64) -> i64 {
-    let Some(impl_ref) = list_ref(list) else {
-        return -1;
-    };
-
-    for i in 0..impl_ref.len() {
-        if impl_ref.get_value(i).unwrap_or(0) == value {
-            return i as i64;
-        }
-    }
-
-    -1
-}
-
-/// Check if list contains an integer value
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_contains_int(list: PithList, value: i64) -> i64 {
-    let Some(impl_ref) = list_ref(list) else {
-        return 0;
-    };
-
-    for i in 0..impl_ref.len() {
-        if impl_ref.get_value(i).unwrap_or(0) == value {
-            return 1;
-        }
-    }
-
-    0
-}
-
 /// Destructor for list elements in collections
 ///
 /// Called by cycle collector when freeing cyclic list objects
@@ -889,7 +780,6 @@ mod tests {
     fn invalid_list_handles_return_safe_defaults() {
         unsafe {
             assert_eq!(pith_list_len(bogus_list()), 0);
-            assert_eq!(pith_list_is_empty(bogus_list()), 1);
             assert_eq!(pith_list_get_value(bogus_list(), 0), 0);
             assert_eq!(pith_list_get_value_unchecked(bogus_list(), 0), 0);
             pith_list_set_value(bogus_list(), 0, 7);

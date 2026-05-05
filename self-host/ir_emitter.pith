@@ -44,7 +44,7 @@ STRING_RETURNING_FUNCS := "sha256,hex_encode,hex_decode,to_hex,b64_encode,chr,re
 BYTES_RETURNING_FUNCS := "bytes_from_string_utf8,read_file_bytes,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,byte_buffer_bytes,b64_decode,from_hex,bytes_slice,bytes_concat,secure_random_bytes,crypto_x25519_public_key,crypto_x25519_shared_secret,crypto_aes_128_gcm_seal,crypto_aes_128_gcm_open,crypto_chacha20_poly1305_seal,crypto_chacha20_poly1305_open,crypto_sign_rsa_pss_sha256_pkcs8"
 LIST_RETURNING_FUNCS := "args,range,repeat_val,zeros,sort,sort_desc,reversed,take,drop,slice,unique,without,intersection,difference,flatten,chunks"
 LIST_STRING_RETURNING_FUNCS := "sort_strings,zip,enumerate,toml_keys"
-BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,list_contains,list_contains_string,list_is_empty,send,try_send,close,is_closed,is_done"
+BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,send,try_send,close,is_closed,is_done"
 VOID_METHODS := "reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear,detach,lock,unlock,done,wait,acquire,release"
 STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,list_join,read_file,env,chr"
 
@@ -1854,20 +1854,10 @@ fn ir_method_list_emit_name(mname: String, obj_type: String) -> String:
         if obj_type == "list_string":
             return "list_sort_strings_copy"
         return "list_sort_copy"
-    if mname == "contains":
-        if obj_type == "list_string":
-            return "list_contains_string"
-        return "list_contains"
-    if mname == "index_of":
-        if obj_type == "list_string":
-            return "list_index_of_string"
-        return "list_index_of"
     if mname == "join":
         return "list_join"
     if mname == "reverse":
         return "list_reverse"
-    if mname == "is_empty":
-        return "list_is_empty"
     if mname == "clear":
         return "list_clear"
     return mname
@@ -5065,7 +5055,7 @@ fn ir_emit_list_map_call(idx: Int, node: Node) -> Int:
     mut result_kind := ir_checked_type(idx)
     if result_kind.len() == 0:
         result_kind = "list"
-    elem_kind := ir_list_element_kind(list_idx)
+    mut elem_kind := ir_list_element_kind(list_idx)
     mapped_kind := ir_function_return_kind(mapper_idx)
 
     result_r := ir_reg()
@@ -5116,7 +5106,7 @@ fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
         result_kind = ir_infer_type(list_idx)
     if result_kind.len() == 0:
         result_kind = "list"
-    elem_kind := ir_list_element_kind(list_idx)
+    mut elem_kind := ir_list_element_kind(list_idx)
 
     result_r := ir_reg()
     ir_emit_call0(result_r, "__list_new", result_kind)
@@ -5219,6 +5209,100 @@ fn ir_emit_higher_order_list_call(idx: Int, node: Node, callee_name: String) -> 
         return ir_emit_list_filter_call(idx, node)
     if callee_name == "reduce":
         return ir_emit_list_reduce_call(idx, node)
+    return -1
+
+fn ir_is_list_runtime_type(obj_type: String) -> Bool:
+    return obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
+
+fn ir_emit_list_is_empty_method(node: Node) -> Int:
+    list_r := ir_expr(node.children[0])
+    len_r := ir_reg()
+    ir_emit_call1(len_r, "pith_list_len", "int", list_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    out_r := ir_reg()
+    ir_emit("eq " + out_r.to_string() + " " + len_r.to_string() + " " + zero_r.to_string())
+    return out_r
+
+fn ir_emit_list_item_eq(out_r: Int, elem_kind: String, item_r: Int, target_r: Int):
+    if elem_kind == "string":
+        ir_emit_call2(out_r, "__str_eq", "bool", item_r, target_r)
+        return
+    ir_emit("eq " + out_r.to_string() + " " + item_r.to_string() + " " + target_r.to_string())
+
+fn ir_emit_list_index_search(node: Node, obj_type: String) -> Int:
+    if node.children.len() < 2:
+        missing_r := ir_reg()
+        ir_emit("iconst " + missing_r.to_string() + " -1")
+        return missing_r
+    list_idx := node.children[0]
+    target_idx := ir_method_call_arg_expr(node, 0)
+    list_r := ir_expr(list_idx)
+    target_r := ir_expr(target_idx)
+    mut elem_kind := ir_list_element_kind(list_idx)
+    if obj_type == "list_string":
+        elem_kind = "string"
+
+    result_name := ir_temp_name("__list_index_result")
+    idx_name := ir_temp_name("__list_index_i")
+    missing_r := ir_reg()
+    ir_emit("iconst " + missing_r.to_string() + " -1")
+    ir_emit("store " + result_name + " " + missing_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+    len_r := ir_reg()
+    ir_emit_call1(len_r, "pith_list_len", "int", list_r)
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    match_l := ir_label()
+    step_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    in_range_r := ir_reg()
+    ir_emit("lt " + in_range_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + in_range_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2(item_r, "__list_get", elem_kind, list_r, i_r)
+    eq_r := ir_reg()
+    ir_emit_list_item_eq(eq_r, elem_kind, item_r, target_r)
+    ir_emit("brif " + eq_r.to_string() + " " + match_l + " " + step_l)
+    ir_emit("label " + match_l)
+    ir_emit("store " + result_name + " " + i_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + step_l)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_i_r := ir_reg()
+    ir_emit("add " + next_i_r.to_string() + " " + i_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_i_r.to_string())
+    ir_emit("jmp " + loop_l)
+    ir_emit("label " + done_l)
+    out_r := ir_reg()
+    ir_emit("load " + out_r.to_string() + " " + result_name)
+    return out_r
+
+fn ir_emit_list_contains_method(node: Node, obj_type: String) -> Int:
+    index_r := ir_emit_list_index_search(node, obj_type)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    out_r := ir_reg()
+    ir_emit("gte " + out_r.to_string() + " " + index_r.to_string() + " " + zero_r.to_string())
+    return out_r
+
+fn ir_emit_self_hosted_list_method(node: Node, mname: String, obj_type: String) -> Int:
+    if not ir_is_list_runtime_type(obj_type):
+        return -1
+    if mname == "is_empty":
+        return ir_emit_list_is_empty_method(node)
+    if mname == "index_of":
+        return ir_emit_list_index_search(node, obj_type)
+    if mname == "contains":
+        return ir_emit_list_contains_method(node, obj_type)
     return -1
 
 fn ir_emit_static_call(idx: Int, node: Node) -> Int:
@@ -5958,6 +6042,9 @@ fn ir_emit_method_call(idx: Int) -> Int:
         return r
 
     obj_type := ir_method_receiver_type(node)
+    self_hosted_list_r := ir_emit_self_hosted_list_method(node, mname, obj_type)
+    if self_hosted_list_r >= 0:
+        return self_hosted_list_r
     mut emit_name := ir_method_emit_name(mname, obj_type)
     if ir_is_bool_returning_method(emit_name):
         ir_var_types.insert("__last_call", "bool")

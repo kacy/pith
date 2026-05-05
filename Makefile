@@ -678,7 +678,8 @@ ir-contract-regressions-only:
 	@pass=0; fail=0; \
 	http_ir=$$(mktemp /tmp/pith-http-api-ir-XXXXXX); \
 	higher_order_ir=$$(mktemp /tmp/pith-higher-order-ir-XXXXXX); \
-	trap 'rm -f "$$http_ir" "$$higher_order_ir"' EXIT; \
+	list_query_ir=$$(mktemp /tmp/pith-list-query-ir-XXXXXX); \
+	trap 'rm -f "$$http_ir" "$$higher_order_ir" "$$list_query_ir"' EXIT; \
 	if timeout 15 ./self-host/ir_driver --combined tests/cases/test_suite.pith | awk '/^field / && NF==4 { bad=1 } END { exit bad }'; then \
 		pass=$$((pass+1)); echo "ok   no legacy short fields"; \
 	else \
@@ -703,6 +704,11 @@ ir-contract-regressions-only:
 		pass=$$((pass+1)); echo "ok   higher-order lists self-host"; \
 	else \
 		echo "FAIL higher-order lists self-host"; fail=$$((fail+1)); \
+	fi; \
+	if timeout 15 ./self-host/ir_driver --combined examples/string_collection_methods.pith > "$$list_query_ir" && ! grep -Eq 'list_(is_empty|contains|index_of)' "$$list_query_ir"; then \
+		pass=$$((pass+1)); echo "ok   list query methods self-host"; \
+	else \
+		echo "FAIL list query methods self-host"; fail=$$((fail+1)); \
 	fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \

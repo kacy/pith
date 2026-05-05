@@ -41,6 +41,7 @@ from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_fun
 from ir_ast_helpers import ir_list_contains, ir_is_string_literal_kind, ir_unwrap_pub_node, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message
+from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -5754,30 +5755,6 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     ir_emit("closure_ref " + closure_r.to_string() + " " + wrapper_name)
     ir_emit_lambda_capture_setup(closure_r, captures)
     return closure_r
-
-fn ir_emit_int_literal(node: Node) -> Int:
-    r := ir_reg()
-    ir_emit("iconst " + r.to_string() + " " + node.value)
-    return r
-
-fn ir_emit_string_literal(node: Node) -> Int:
-    si := ir_str(node.value)
-    r := ir_reg()
-    ir_emit("strref " + r.to_string() + " " + si)
-    return r
-
-fn ir_emit_float_literal(node: Node) -> Int:
-    r := ir_reg()
-    ir_emit("fconst " + r.to_string() + " " + node.value)
-    return r
-
-fn ir_emit_bool_literal(node: Node) -> Int:
-    r := ir_reg()
-    if node.value == "true":
-        ir_emit("iconst " + r.to_string() + " 1")
-    else:
-        ir_emit("iconst " + r.to_string() + " 0")
-    return r
 
 fn ir_resolve_storage_name(name: String) -> String:
     if ir_import_renames.contains_key(name):

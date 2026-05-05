@@ -716,21 +716,6 @@ pub unsafe extern "C" fn pith_list_clear(list: *mut PithList) {
     impl_ref.clear();
 }
 
-/// Check if list is empty
-#[no_mangle]
-pub extern "C" fn pith_list_is_empty(list: PithList) -> i64 {
-    unsafe {
-        let Some(impl_ref) = list_ref(list) else {
-            return 1;
-        };
-        if impl_ref.len() == 0 {
-            1
-        } else {
-            0
-        }
-    }
-}
-
 /// Reverse list elements in-place
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_reverse(list: PithList) {
@@ -766,100 +751,6 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
     let _ = Box::from_raw(list.ptr as *mut ListImpl);
 }
 
-/// Check if a list of C-string pointers contains the given C-string.
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_contains_cstr(list_handle: i64, s: *const i8) -> i64 {
-    if s.is_null() {
-        return 0;
-    }
-
-    let Some(impl_ref) = list_ref_from_handle(list_handle) else {
-        return 0;
-    };
-    let needle_len = crate::string::pith_cstring_len(s) as usize;
-    let needle = std::slice::from_raw_parts(s as *const u8, needle_len);
-
-    for i in 0..impl_ref.len() {
-        let ptr_val = impl_ref.get_value(i).unwrap_or(0) as *const i8;
-        if ptr_val.is_null() {
-            continue;
-        }
-        let elem_len = crate::string::pith_cstring_len(ptr_val) as usize;
-        if elem_len != needle_len {
-            continue;
-        }
-        let elem_bytes = std::slice::from_raw_parts(ptr_val as *const u8, elem_len);
-        if elem_bytes == needle {
-            return 1;
-        }
-    }
-
-    0
-}
-
-/// Find the index of a C-string in a list of C-string pointers.
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_index_of_cstr(list_handle: i64, s: *const i8) -> i64 {
-    if s.is_null() {
-        return -1;
-    }
-
-    let Some(impl_ref) = list_ref_from_handle(list_handle) else {
-        return -1;
-    };
-    let needle_len = crate::string::pith_cstring_len(s) as usize;
-    let needle = std::slice::from_raw_parts(s as *const u8, needle_len);
-
-    for i in 0..impl_ref.len() {
-        let ptr_val = impl_ref.get_value(i).unwrap_or(0) as *const i8;
-        if ptr_val.is_null() {
-            continue;
-        }
-        let elem_len = crate::string::pith_cstring_len(ptr_val) as usize;
-        if elem_len != needle_len {
-            continue;
-        }
-        let elem_bytes = std::slice::from_raw_parts(ptr_val as *const u8, elem_len);
-        if elem_bytes == needle {
-            return i as i64;
-        }
-    }
-
-    -1
-}
-
-/// Find index of integer value in list
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_index_of_int(list: PithList, value: i64) -> i64 {
-    let Some(impl_ref) = list_ref(list) else {
-        return -1;
-    };
-
-    for i in 0..impl_ref.len() {
-        if impl_ref.get_value(i).unwrap_or(0) == value {
-            return i as i64;
-        }
-    }
-
-    -1
-}
-
-/// Check if list contains an integer value
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_contains_int(list: PithList, value: i64) -> i64 {
-    let Some(impl_ref) = list_ref(list) else {
-        return 0;
-    };
-
-    for i in 0..impl_ref.len() {
-        if impl_ref.get_value(i).unwrap_or(0) == value {
-            return 1;
-        }
-    }
-
-    0
-}
-
 /// Destructor for list elements in collections
 ///
 /// Called by cycle collector when freeing cyclic list objects
@@ -872,115 +763,6 @@ pub extern "C" fn pith_list_destructor(ptr: *mut u8) {
     unsafe {
         let list = ptr as *const PithList;
         pith_list_release(*list);
-    }
-}
-
-// ===============================================================
-// Functional list operations: map, filter, reduce
-// ===============================================================
-
-/// Apply a function to each element, return a new list.
-/// closure_handle is a closure handle: fn(i64) -> i64
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_map(list_ptr: i64, closure_handle: i64) -> i64 {
-    let Some(src) = list_ref_from_handle(list_ptr) else {
-        return 0;
-    };
-    let func_ptr = crate::pith_closure_get_fn(closure_handle);
-    if func_ptr == 0 {
-        return 0;
-    }
-    let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
-    let result = pith_list_new(8, 0);
-    let result_ptr = result.ptr as i64;
-
-    for i in 0..src.len() {
-        if let Some(val) = src.get_value(i) {
-            let mapped = func(closure_handle, val);
-            pith_list_push_value(
-                PithList {
-                    ptr: result_ptr as *mut (),
-                },
-                mapped,
-            );
-        }
-    }
-    result_ptr
-}
-
-/// Return a new list containing only elements where predicate returns non-zero.
-/// closure_handle is a closure handle: fn(i64) -> i64 (truthy = non-zero)
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_filter(list_ptr: i64, closure_handle: i64) -> i64 {
-    let list = PithList {
-        ptr: list_ptr as *mut (),
-    };
-    let result = pith_list_new(8, 0);
-
-    let Some(impl_ref) = list_ref(list) else {
-        return result.ptr as i64;
-    };
-    let func_ptr = crate::pith_closure_get_fn(closure_handle);
-    if func_ptr == 0 {
-        return result.ptr as i64;
-    }
-    let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
-
-    for i in 0..impl_ref.len() {
-        if let Some(val) = impl_ref.get_value(i) {
-            if func(closure_handle, val) != 0 {
-                pith_list_push_value(result, val);
-            }
-        }
-    }
-    result.ptr as i64
-}
-
-/// Reduce a list to a single value using an accumulator function.
-/// closure_handle: fn(accumulator: i64, element: i64) -> i64
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_reduce(list_ptr: i64, init: i64, closure_handle: i64) -> i64 {
-    let list = PithList {
-        ptr: list_ptr as *mut (),
-    };
-    let Some(impl_ref) = list_ref(list) else {
-        return init;
-    };
-    let func_ptr = crate::pith_closure_get_fn(closure_handle);
-    if func_ptr == 0 {
-        return init;
-    }
-    let func: extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
-
-    let mut acc = init;
-    for i in 0..impl_ref.len() {
-        if let Some(val) = impl_ref.get_value(i) {
-            acc = func(closure_handle, acc, val);
-        }
-    }
-    acc
-}
-
-/// Apply function to each element (no return value, side effects only).
-/// closure_handle: fn(i64) -> i64
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_each(list_ptr: i64, closure_handle: i64) {
-    let list = PithList {
-        ptr: list_ptr as *mut (),
-    };
-    let Some(impl_ref) = list_ref(list) else {
-        return;
-    };
-    let func_ptr = crate::pith_closure_get_fn(closure_handle);
-    if func_ptr == 0 {
-        return;
-    }
-    let func: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(func_ptr as *const ());
-
-    for i in 0..impl_ref.len() {
-        if let Some(val) = impl_ref.get_value(i) {
-            func(closure_handle, val);
-        }
     }
 }
 
@@ -998,7 +780,6 @@ mod tests {
     fn invalid_list_handles_return_safe_defaults() {
         unsafe {
             assert_eq!(pith_list_len(bogus_list()), 0);
-            assert_eq!(pith_list_is_empty(bogus_list()), 1);
             assert_eq!(pith_list_get_value(bogus_list(), 0), 0);
             assert_eq!(pith_list_get_value_unchecked(bogus_list(), 0), 0);
             pith_list_set_value(bogus_list(), 0, 7);
@@ -1020,29 +801,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn functional_list_ops_reject_invalid_closure_handles() {
-        unsafe {
-            let list = pith_list_new(8, 0);
-            pith_list_push_value(list, 7);
-            let list_ptr = list.ptr as i64;
-
-            assert_eq!(pith_list_map(list_ptr, 12345), 0);
-            let filtered = pith_list_filter(list_ptr, 12345);
-            assert_ne!(filtered, 0);
-            assert_eq!(
-                pith_list_len(PithList {
-                    ptr: filtered as *mut (),
-                }),
-                0
-            );
-            pith_list_release(PithList {
-                ptr: filtered as *mut (),
-            });
-            assert_eq!(pith_list_reduce(list_ptr, 99, 12345), 99);
-            pith_list_each(list_ptr, 12345);
-
-            pith_list_release(list);
-        }
-    }
 }

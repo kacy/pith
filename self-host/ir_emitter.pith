@@ -44,7 +44,7 @@ STRING_RETURNING_FUNCS := "sha256,hex_encode,hex_decode,to_hex,b64_encode,chr,re
 BYTES_RETURNING_FUNCS := "bytes_from_string_utf8,read_file_bytes,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,byte_buffer_bytes,b64_decode,from_hex,bytes_slice,bytes_concat,secure_random_bytes,crypto_x25519_public_key,crypto_x25519_shared_secret,crypto_aes_128_gcm_seal,crypto_aes_128_gcm_open,crypto_chacha20_poly1305_seal,crypto_chacha20_poly1305_open,crypto_sign_rsa_pss_sha256_pkcs8"
 LIST_RETURNING_FUNCS := "args,range,repeat_val,zeros,sort,sort_desc,reversed,take,drop,slice,unique,without,intersection,difference,flatten,chunks"
 LIST_STRING_RETURNING_FUNCS := "sort_strings,zip,enumerate,toml_keys"
-BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,list_contains,list_contains_string,list_is_empty,send,try_send,close,is_closed,is_done"
+BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,send,try_send,close,is_closed,is_done"
 VOID_METHODS := "reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear,detach,lock,unlock,done,wait,acquire,release"
 STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,list_join,read_file,env,chr"
 
@@ -759,14 +759,6 @@ fn ir_runtime_call_name(name: String) -> String:
         return "pith_list_pop"
     if name == "set":
         return "pith_list_set_value"
-    if name == "map" or name == "list_map":
-        return "pith_list_map"
-    if name == "filter" or name == "list_filter":
-        return "pith_list_filter"
-    if name == "reduce" or name == "list_reduce":
-        return "pith_list_reduce"
-    if name == "each" or name == "list_each":
-        return "pith_list_each"
     if name == "sort_strings":
         return "pith_list_sort_strings"
     if name == "__list_get" or name == "__index":
@@ -1029,6 +1021,35 @@ fn ir_emit_call2(result_reg: Int, fname: String, ret_type: String, arg0: Int, ar
 
 fn ir_emit_call3(result_reg: Int, fname: String, ret_type: String, arg0: Int, arg1: Int, arg2: Int):
     ir_emit_call_text(result_reg, fname, ret_type, 3, " " + arg0.to_string() + " " + arg1.to_string() + " " + arg2.to_string())
+
+fn ir_temp_name(prefix: String) -> String:
+    return prefix + "_" + ir_label()
+
+fn ir_list_element_kind(expr_idx: Int) -> String:
+    tid := c_get_expr_type(expr_idx)
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "list":
+            kind := ir_type_from_tid(info.inner)
+            if kind.len() > 0:
+                return kind
+    return "unknown"
+
+fn ir_function_return_kind(expr_idx: Int) -> String:
+    tid := c_get_expr_type(expr_idx)
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "function":
+            kind := ir_type_from_tid(info.return_type)
+            if kind.len() > 0:
+                return kind
+    return "unknown"
+
+fn ir_call_arg_expr_index(arg_idx: Int) -> Int:
+    arg_node := get_node(arg_idx)
+    if arg_node.kind == "arg" and arg_node.children.len() > 0:
+        return arg_node.children[0]
+    return arg_idx
 
 fn ir_declared_callable_ir_retkind(fname: String) -> String:
     if not ir_func_returns.contains_key(fname):
@@ -1833,20 +1854,10 @@ fn ir_method_list_emit_name(mname: String, obj_type: String) -> String:
         if obj_type == "list_string":
             return "list_sort_strings_copy"
         return "list_sort_copy"
-    if mname == "contains":
-        if obj_type == "list_string":
-            return "list_contains_string"
-        return "list_contains"
-    if mname == "index_of":
-        if obj_type == "list_string":
-            return "list_index_of_string"
-        return "list_index_of"
     if mname == "join":
         return "list_join"
     if mname == "reverse":
         return "list_reverse"
-    if mname == "is_empty":
-        return "list_is_empty"
     if mname == "clear":
         return "list_clear"
     return mname
@@ -5031,6 +5042,269 @@ fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+fn ir_emit_list_map_call(idx: Int, node: Node) -> Int:
+    if node.children.len() != 3:
+        return -1
+    list_idx := ir_call_arg_expr_index(node.children[1])
+    mapper_idx := ir_call_arg_expr_index(node.children[2])
+    list_r := ir_expr(list_idx)
+    mapper_r := ir_expr(mapper_idx)
+    mapper_name := ir_temp_name("__map_fn")
+    ir_emit("store " + mapper_name + " " + mapper_r.to_string())
+
+    mut result_kind := ir_checked_type(idx)
+    if result_kind.len() == 0:
+        result_kind = "list"
+    mut elem_kind := ir_list_element_kind(list_idx)
+    mapped_kind := ir_function_return_kind(mapper_idx)
+
+    result_r := ir_reg()
+    ir_emit_call0(result_r, "__list_new", result_kind)
+    len_r := ir_reg()
+    ir_emit_call1(len_r, "pith_list_len", "int", list_r)
+    idx_name := ir_temp_name("__map_i")
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    keep_loop_r := ir_reg()
+    ir_emit("lt " + keep_loop_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + keep_loop_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2(item_r, "__list_get", elem_kind, list_r, i_r)
+    mapped_r := ir_reg()
+    ir_emit_call_text(mapped_r, mapper_name, mapped_kind, 1, " " + item_r.to_string())
+    ir_emit_call2(ir_reg(), "__list_push", "void", result_r, mapped_r)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_i_r := ir_reg()
+    ir_emit("add " + next_i_r.to_string() + " " + i_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_i_r.to_string())
+    ir_emit("jmp " + loop_l)
+    ir_emit("label " + done_l)
+    return result_r
+
+fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
+    if node.children.len() != 3:
+        return -1
+    list_idx := ir_call_arg_expr_index(node.children[1])
+    keep_idx := ir_call_arg_expr_index(node.children[2])
+    list_r := ir_expr(list_idx)
+    keep_r := ir_expr(keep_idx)
+    keep_name := ir_temp_name("__filter_fn")
+    ir_emit("store " + keep_name + " " + keep_r.to_string())
+
+    mut result_kind := ir_checked_type(idx)
+    if result_kind.len() == 0:
+        result_kind = ir_infer_type(list_idx)
+    if result_kind.len() == 0:
+        result_kind = "list"
+    mut elem_kind := ir_list_element_kind(list_idx)
+
+    result_r := ir_reg()
+    ir_emit_call0(result_r, "__list_new", result_kind)
+    len_r := ir_reg()
+    ir_emit_call1(len_r, "pith_list_len", "int", list_r)
+    idx_name := ir_temp_name("__filter_i")
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    push_l := ir_label()
+    step_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    keep_loop_r := ir_reg()
+    ir_emit("lt " + keep_loop_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + keep_loop_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2(item_r, "__list_get", elem_kind, list_r, i_r)
+    pred_r := ir_reg()
+    ir_emit_call_text(pred_r, keep_name, "int", 1, " " + item_r.to_string())
+    ir_emit("brif " + pred_r.to_string() + " " + push_l + " " + step_l)
+    ir_emit("label " + push_l)
+    ir_emit_call2(ir_reg(), "__list_push", "void", result_r, item_r)
+    ir_emit("label " + step_l)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_i_r := ir_reg()
+    ir_emit("add " + next_i_r.to_string() + " " + i_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_i_r.to_string())
+    ir_emit("jmp " + loop_l)
+    ir_emit("label " + done_l)
+    return result_r
+
+fn ir_emit_list_reduce_call(idx: Int, node: Node) -> Int:
+    if node.children.len() != 4:
+        return -1
+    list_idx := ir_call_arg_expr_index(node.children[1])
+    init_idx := ir_call_arg_expr_index(node.children[2])
+    reducer_idx := ir_call_arg_expr_index(node.children[3])
+    list_r := ir_expr(list_idx)
+    init_r := ir_expr(init_idx)
+    reducer_r := ir_expr(reducer_idx)
+    reducer_name := ir_temp_name("__reduce_fn")
+    acc_name := ir_temp_name("__reduce_acc")
+    ir_emit("store " + reducer_name + " " + reducer_r.to_string())
+    ir_emit("store " + acc_name + " " + init_r.to_string())
+
+    elem_kind := ir_list_element_kind(list_idx)
+    mut result_kind := ir_checked_type(idx)
+    if result_kind.len() == 0:
+        result_kind = ir_infer_type(init_idx)
+    if result_kind.len() == 0:
+        result_kind = "unknown"
+
+    len_r := ir_reg()
+    ir_emit_call1(len_r, "pith_list_len", "int", list_r)
+    idx_name := ir_temp_name("__reduce_i")
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    keep_loop_r := ir_reg()
+    ir_emit("lt " + keep_loop_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + keep_loop_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2(item_r, "__list_get", elem_kind, list_r, i_r)
+    acc_r := ir_reg()
+    ir_emit("load " + acc_r.to_string() + " " + acc_name)
+    next_acc_r := ir_reg()
+    ir_emit_call_text(next_acc_r, reducer_name, result_kind, 2, " " + acc_r.to_string() + " " + item_r.to_string())
+    ir_emit("store " + acc_name + " " + next_acc_r.to_string())
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_i_r := ir_reg()
+    ir_emit("add " + next_i_r.to_string() + " " + i_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_i_r.to_string())
+    ir_emit("jmp " + loop_l)
+    ir_emit("label " + done_l)
+    out_r := ir_reg()
+    ir_emit("load " + out_r.to_string() + " " + acc_name)
+    return out_r
+
+fn ir_emit_higher_order_list_call(idx: Int, node: Node, callee_name: String) -> Int:
+    if callee_name == "map":
+        return ir_emit_list_map_call(idx, node)
+    if callee_name == "filter":
+        return ir_emit_list_filter_call(idx, node)
+    if callee_name == "reduce":
+        return ir_emit_list_reduce_call(idx, node)
+    return -1
+
+fn ir_is_list_runtime_type(obj_type: String) -> Bool:
+    return obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
+
+fn ir_emit_list_is_empty_method(node: Node) -> Int:
+    list_r := ir_expr(node.children[0])
+    len_r := ir_reg()
+    ir_emit_call1(len_r, "pith_list_len", "int", list_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    out_r := ir_reg()
+    ir_emit("eq " + out_r.to_string() + " " + len_r.to_string() + " " + zero_r.to_string())
+    return out_r
+
+fn ir_emit_list_item_eq(out_r: Int, elem_kind: String, item_r: Int, target_r: Int):
+    if elem_kind == "string":
+        ir_emit_call2(out_r, "__str_eq", "bool", item_r, target_r)
+        return
+    ir_emit("eq " + out_r.to_string() + " " + item_r.to_string() + " " + target_r.to_string())
+
+fn ir_emit_list_index_search(node: Node, obj_type: String) -> Int:
+    if node.children.len() < 2:
+        missing_r := ir_reg()
+        ir_emit("iconst " + missing_r.to_string() + " -1")
+        return missing_r
+    list_idx := node.children[0]
+    target_idx := ir_method_call_arg_expr(node, 0)
+    list_r := ir_expr(list_idx)
+    target_r := ir_expr(target_idx)
+    mut elem_kind := ir_list_element_kind(list_idx)
+    if obj_type == "list_string":
+        elem_kind = "string"
+
+    result_name := ir_temp_name("__list_index_result")
+    idx_name := ir_temp_name("__list_index_i")
+    missing_r := ir_reg()
+    ir_emit("iconst " + missing_r.to_string() + " -1")
+    ir_emit("store " + result_name + " " + missing_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+    len_r := ir_reg()
+    ir_emit_call1(len_r, "pith_list_len", "int", list_r)
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    match_l := ir_label()
+    step_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    in_range_r := ir_reg()
+    ir_emit("lt " + in_range_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + in_range_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2(item_r, "__list_get", elem_kind, list_r, i_r)
+    eq_r := ir_reg()
+    ir_emit_list_item_eq(eq_r, elem_kind, item_r, target_r)
+    ir_emit("brif " + eq_r.to_string() + " " + match_l + " " + step_l)
+    ir_emit("label " + match_l)
+    ir_emit("store " + result_name + " " + i_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + step_l)
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_i_r := ir_reg()
+    ir_emit("add " + next_i_r.to_string() + " " + i_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_i_r.to_string())
+    ir_emit("jmp " + loop_l)
+    ir_emit("label " + done_l)
+    out_r := ir_reg()
+    ir_emit("load " + out_r.to_string() + " " + result_name)
+    return out_r
+
+fn ir_emit_list_contains_method(node: Node, obj_type: String) -> Int:
+    index_r := ir_emit_list_index_search(node, obj_type)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    out_r := ir_reg()
+    ir_emit("gte " + out_r.to_string() + " " + index_r.to_string() + " " + zero_r.to_string())
+    return out_r
+
+fn ir_emit_self_hosted_list_method(node: Node, mname: String, obj_type: String) -> Int:
+    if not ir_is_list_runtime_type(obj_type):
+        return -1
+    if mname == "is_empty":
+        return ir_emit_list_is_empty_method(node)
+    if mname == "index_of":
+        return ir_emit_list_index_search(node, obj_type)
+    if mname == "contains":
+        return ir_emit_list_contains_method(node, obj_type)
+    return -1
+
 fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     mut explicit_generic_types: List[String] := []
     if node.children.len() > 0:
@@ -5109,6 +5383,9 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         callee = ir_resolve_static_callee(node.children[0])
         if callee.name.len() == 0:
             callee = ResolvedCallee("unknown", false)
+    higher_order_r := ir_emit_higher_order_list_call(idx, node, callee.name)
+    if higher_order_r >= 0:
+        return higher_order_r
     expr_tid := c_get_expr_type(idx)
     if expr_tid >= 0:
         expr_info := get_type_info(expr_tid)
@@ -5765,6 +6042,9 @@ fn ir_emit_method_call(idx: Int) -> Int:
         return r
 
     obj_type := ir_method_receiver_type(node)
+    self_hosted_list_r := ir_emit_self_hosted_list_method(node, mname, obj_type)
+    if self_hosted_list_r >= 0:
+        return self_hosted_list_r
     mut emit_name := ir_method_emit_name(mname, obj_type)
     if ir_is_bool_returning_method(emit_name):
         ir_var_types.insert("__last_call", "bool")

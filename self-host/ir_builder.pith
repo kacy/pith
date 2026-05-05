@@ -3,6 +3,9 @@
 mut ir_lines: List[String] := []
 mut ir_next_reg := 0
 mut ir_next_label := 0
+mut ir_strings: List[String] := []
+mut ir_string_indices: Map[String, Int] := {}
+mut ir_string_module_count := 0
 
 pub struct IrBuilderSnapshot:
     next_reg: Int
@@ -12,6 +15,18 @@ fn ir_push_line(items: List[String], value: String) -> List[String]:
     mut updated: List[String] := items
     updated.push(value)
     return updated
+
+fn ir_strip_quotes(s: String) -> String:
+    mut result := s
+    if result.len() >= 2:
+        if result.substring(0, 1) == chr(34):
+            result = result.substring(1, result.len())
+        if result.len() > 0 and result.substring(result.len() - 1, result.len()) == chr(34):
+            result = result.substring(0, result.len() - 1)
+    return result
+
+fn ir_string_symbol_name(index: Int) -> String:
+    return "m" + ir_string_module_count.to_string() + "s" + index.to_string()
 
 fn ir_copy_lines(lines: List[String]) -> List[String]:
     mut copy: List[String] := []
@@ -23,6 +38,8 @@ pub fn ir_builder_reset():
     ir_lines = []
     ir_next_reg = 0
     ir_next_label = 0
+    ir_strings = []
+    ir_string_indices = {}
 
 pub fn ir_builder_reset_function():
     ir_lines = []
@@ -30,6 +47,9 @@ pub fn ir_builder_reset_function():
 
 pub fn ir_builder_reset_registers():
     ir_next_reg = 0
+
+pub fn ir_builder_set_string_module_count(module_count: Int):
+    ir_string_module_count = module_count
 
 pub fn ir_builder_snapshot() -> IrBuilderSnapshot:
     return IrBuilderSnapshot(ir_next_reg, ir_copy_lines(ir_lines))
@@ -52,6 +72,19 @@ pub fn ir_new_temp_name(prefix: String) -> String:
 
 pub fn ir_emit(line: String):
     ir_lines = ir_push_line(ir_lines, line)
+
+pub fn ir_str(s: String) -> String:
+    cleaned := ir_strip_quotes(s)
+    if ir_string_indices.contains_key(cleaned):
+        return ir_string_symbol_name(ir_string_indices[cleaned])
+    idx := ir_strings.len()
+    ir_strings = ir_push_line(ir_strings, cleaned)
+    ir_string_indices.insert(cleaned, idx)
+    return ir_string_symbol_name(idx)
+
+pub fn ir_emit_string_table():
+    for value, i in ir_strings:
+        ir_emit("string " + ir_string_symbol_name(i) + " " + chr(34) + value + chr(34))
 
 pub fn ir_reg() -> Int:
     r := ir_next_reg

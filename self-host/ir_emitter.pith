@@ -37,11 +37,7 @@ from checker import c_get_expr_type
 from types import TypeInfo, get_type_info
 from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, ir_is_int_returning_func, ir_is_string_returning_func, ir_is_bytes_returning_func, ir_is_list_returning_func, ir_is_list_string_returning_func, ir_is_bool_returning_method, ir_is_void_method, ir_is_string_returning_method, ir_runtime_call_name, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
-from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_reg, ir_label
-
-# --- string constant table ---
-mut ir_strings: List[String] := []
-mut ir_string_indices: Map[String, Int] := {}
+from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -153,8 +149,7 @@ pub fn set_test_mode(enabled: Bool):
 
 fn ir_reset_local_state():
     ir_builder_reset()
-    ir_strings = []
-    ir_string_indices = {}
+    ir_builder_set_string_module_count(ir_module_count)
     ir_var_regs = {}
     ir_var_types = {}
     ir_map_value_types = {}
@@ -207,15 +202,6 @@ pub fn ir_reset():
     ir_reset_global_state()
     ir_reset_type_state()
     ir_reset_control_flow_state()
-
-fn ir_strip_quotes(s: String) -> String:
-    mut result := s
-    if result.len() >= 2:
-        if result.substring(0, 1) == chr(34):
-            result = result.substring(1, result.len())
-        if result.len() > 0 and result.substring(result.len() - 1, result.len()) == chr(34):
-            result = result.substring(0, result.len() - 1)
-    return result
 
 fn ir_resolve_type_hint(type_name: String) -> String:
     mut resolved := type_name
@@ -484,9 +470,6 @@ fn ir_list_contains(items: List[String], value: String) -> Bool:
 fn ir_is_string_literal_kind(kind: String) -> Bool:
     return kind == "string_lit" or kind == "string" or kind == "str_lit" or kind == "lit"
 
-fn ir_string_symbol_name(index: Int) -> String:
-    return "m" + ir_module_count.to_string() + "s" + index.to_string()
-
 fn ir_should_capture_name(name: String, bound: List[String], free: List[String]) -> Bool:
     if ir_list_contains(bound, name) or ir_list_contains(free, name):
         return false
@@ -541,15 +524,6 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String]) -> 
 
 fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
     return ir_find_free_vars_walk(idx, bound, [])
-
-fn ir_str(s: String) -> String:
-    cleaned := ir_strip_quotes(s)
-    if ir_string_indices.contains_key(cleaned):
-        return ir_string_symbol_name(ir_string_indices[cleaned])
-    idx := ir_strings.len()
-    ir_strings = ir_push_string(ir_strings, cleaned)
-    ir_string_indices.insert(cleaned, idx)
-    return ir_string_symbol_name(idx)
 
 fn ir_collect_string_nodes(idx: Int) -> List[Int]:
     mut string_nodes: List[Int] := []
@@ -7468,11 +7442,6 @@ fn ir_preseed_result_error_strings():
     builtin_names := "parse_int,file_open_read,file_open_write,file_open_append,byte_buffer_write,byte_buffer_write_string_utf8,byte_buffer_write_byte,file_write,file_write_bytes,tcp_connect,tcp_listen,tcp_accept,tcp_write,tcp_write_bytes,process_spawn,process_spawn_argv,process_output_argv,process_write,process_write_bytes,crypto_x25519_keygen,write_file,append_file,write_file_bytes,append_file_bytes,read_file,exec_output,dns_resolve,bytes_to_string_utf8,file_read,tcp_read,process_read,process_read_err,read_file_bytes,b64_decode,from_hex,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,crypto_x25519_public_key,crypto_x25519_shared_secret,crypto_aes_128_gcm_seal,crypto_aes_128_gcm_open,crypto_chacha20_poly1305_seal,crypto_chacha20_poly1305_open,crypto_sign_rsa_pss_sha256_pkcs8".split(",")
     for builtin_name in builtin_names:
         ir_str(builtin_name + " failed")
-
-fn ir_emit_string_table():
-    for value, i in ir_strings:
-        sid := "m" + ir_module_count.to_string() + "s" + i.to_string()
-        ir_emit("string " + sid + " " + chr(34) + value + chr(34))
 
 fn ir_collect_root_import_metadata(root_idx: Int):
     ir_import_renames = {}

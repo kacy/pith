@@ -37,11 +37,9 @@ from checker import c_get_expr_type
 from types import TypeInfo, get_type_info
 from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, ir_is_int_returning_func, ir_is_string_returning_func, ir_is_bytes_returning_func, ir_is_list_returning_func, ir_is_list_string_returning_func, ir_is_bool_returning_method, ir_is_void_method, ir_is_string_returning_method, ir_runtime_call_name, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
+from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_reg, ir_label
 
-# --- emitted ir buffers ---
-mut ir_lines: List[String] := []
-mut ir_next_reg := 0
-mut ir_next_label := 0
+# --- string constant table ---
 mut ir_strings: List[String] := []
 mut ir_string_indices: Map[String, Int] := {}
 
@@ -104,9 +102,6 @@ mut ir_root_items_cache: Map[Int, List[Int]] := {}
 mut ir_string_node_cache_roots: List[Int] := []
 mut ir_string_node_cache_values: List[String] := []
 
-fn ir_new_temp_name(prefix: String) -> String:
-    return "__" + prefix + "_" + ir_next_reg.to_string() + "_" + ir_next_label.to_string()
-
 fn ir_push_string(items: List[String], value: String) -> List[String]:
     mut updated: List[String] := items
     updated.push(value)
@@ -157,9 +152,7 @@ pub fn set_test_mode(enabled: Bool):
     ir_emit_tests = enabled
 
 fn ir_reset_local_state():
-    ir_lines = []
-    ir_next_reg = 0
-    ir_next_label = 0
+    ir_builder_reset()
     ir_strings = []
     ir_string_indices = {}
     ir_var_regs = {}
@@ -214,19 +207,6 @@ pub fn ir_reset():
     ir_reset_global_state()
     ir_reset_type_state()
     ir_reset_control_flow_state()
-
-fn ir_emit(line: String):
-    ir_lines = ir_push_string(ir_lines, line)
-
-fn ir_reg() -> Int:
-    r := ir_next_reg
-    ir_next_reg = ir_next_reg + 1
-    return r
-
-fn ir_label() -> String:
-    n := ir_next_label
-    ir_next_label = ir_next_label + 1
-    return "L" + n.to_string()
 
 fn ir_strip_quotes(s: String) -> String:
     mut result := s
@@ -931,12 +911,6 @@ fn ir_method_call_arg_regs(obj_r: Int, arg_regs: List[Int]) -> List[Int]:
     for arg_reg in arg_regs:
         call_args.push(arg_reg)
     return call_args
-
-fn ir_copy_lines(lines: List[String]) -> List[String]:
-    mut copy: List[String] := []
-    for line in lines:
-        copy.push(line)
-    return copy
 
 fn ir_copy_var_regs(src: Map[String, Int]) -> Map[String, Int]:
     mut copy: Map[String, Int] := {}
@@ -1745,7 +1719,7 @@ fn ir_emit_lambda_capture_loads(captures: List[String]):
         ir_emit("store " + capture_name + " " + cap_r.to_string())
 
 fn ir_append_deferred_lambda_body():
-    lines: List[String] := ir_lines
+    lines := ir_builder_lines()
     mut bodies: List[String] := ir_lambda_bodies
     for line in lines:
         bodies.push(line)
@@ -4740,7 +4714,7 @@ fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool) -> Int:
 
 fn ir_emit_list_map_call(idx: Int, node: Node) -> Int:
     if node.children.len() != 3:
-        return -1
+        return - 1
     list_idx := ir_call_arg_expr_index(node.children[1])
     mapper_idx := ir_call_arg_expr_index(node.children[2])
     list_r := ir_expr(list_idx)
@@ -4789,7 +4763,7 @@ fn ir_emit_list_map_call(idx: Int, node: Node) -> Int:
 
 fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
     if node.children.len() != 3:
-        return -1
+        return - 1
     list_idx := ir_call_arg_expr_index(node.children[1])
     keep_idx := ir_call_arg_expr_index(node.children[2])
     list_r := ir_expr(list_idx)
@@ -4844,7 +4818,7 @@ fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
 
 fn ir_emit_list_reduce_call(idx: Int, node: Node) -> Int:
     if node.children.len() != 4:
-        return -1
+        return - 1
     list_idx := ir_call_arg_expr_index(node.children[1])
     init_idx := ir_call_arg_expr_index(node.children[2])
     reducer_idx := ir_call_arg_expr_index(node.children[3])
@@ -4905,7 +4879,7 @@ fn ir_emit_higher_order_list_call(idx: Int, node: Node, callee_name: String) -> 
         return ir_emit_list_filter_call(idx, node)
     if callee_name == "reduce":
         return ir_emit_list_reduce_call(idx, node)
-    return -1
+    return - 1
 
 fn ir_is_list_runtime_type(obj_type: String) -> Bool:
     return obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
@@ -4992,14 +4966,14 @@ fn ir_emit_list_contains_method(node: Node, obj_type: String) -> Int:
 
 fn ir_emit_self_hosted_list_method(node: Node, mname: String, obj_type: String) -> Int:
     if not ir_is_list_runtime_type(obj_type):
-        return -1
+        return - 1
     if mname == "is_empty":
         return ir_emit_list_is_empty_method(node)
     if mname == "index_of":
         return ir_emit_list_index_search(node, obj_type)
     if mname == "contains":
         return ir_emit_list_contains_method(node, obj_type)
-    return -1
+    return - 1
 
 fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     mut explicit_generic_types: List[String] := []
@@ -5827,10 +5801,9 @@ fn ir_collect_lambda_parts(idx: Int) -> LambdaParts:
     return LambdaParts(params, body_idx, captures)
 
 fn ir_reset_lambda_emit_state():
-    ir_next_reg = 0
+    ir_builder_reset_function()
     ir_var_regs = {}
     ir_var_types = {}
-    ir_lines = []
 
 fn ir_emit_lambda_params(params: List[String]):
     for param in params:
@@ -5854,10 +5827,9 @@ fn ir_emit_lambda_default_return():
     ir_emit("ret " + dr.to_string())
     ir_emit("endfunc")
 
-fn ir_finish_lambda_emit(saved_regs: Int, saved_vars: Map[String, Int], saved_types: Map[String, String], saved_lines: List[String]):
+fn ir_finish_lambda_emit(saved_builder: IrBuilderSnapshot, saved_vars: Map[String, Int], saved_types: Map[String, String]):
     ir_append_deferred_lambda_body()
-    ir_lines = saved_lines
-    ir_next_reg = saved_regs
+    ir_builder_restore(saved_builder)
     ir_var_regs = saved_vars
     ir_var_types = saved_types
 
@@ -5868,10 +5840,9 @@ fn ir_emit_lambda(idx: Int) -> Int:
     parts := ir_collect_lambda_parts(idx)
 
     # save current state and emit lambda to deferred buffer
-    saved_regs := ir_next_reg
+    saved_builder := ir_builder_snapshot()
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
-    saved_lines := ir_copy_lines(ir_lines)
     ir_reset_lambda_emit_state()
     ir_emit_func_header(lambda_name, parts.params.len() + 1, "unknown")
     ir_emit_lambda_hidden_param()
@@ -5879,7 +5850,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_emit_lambda_capture_loads(parts.captures)
     ir_emit_lambda_body_value(parts.body_idx)
     ir_emit_lambda_default_return()
-    ir_finish_lambda_emit(saved_regs, saved_vars, saved_types, saved_lines)
+    ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
     # return closure handle and fill captures
     r := ir_reg()
     ir_emit("closure_ref " + r.to_string() + " " + lambda_name)
@@ -5905,10 +5876,9 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
                 j = j + 1
             i = i + 1
 
-    saved_regs := ir_next_reg
+    saved_builder := ir_builder_snapshot()
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
-    saved_lines := ir_copy_lines(ir_lines)
 
     ir_reset_lambda_emit_state()
     ir_emit_func_header(wrapper_name, 1, "unknown")
@@ -5916,7 +5886,7 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     ir_emit_lambda_capture_loads(captures)
     ir_emit("ret " + ir_expr(call_idx).to_string())
     ir_emit_lambda_default_return()
-    ir_finish_lambda_emit(saved_regs, saved_vars, saved_types, saved_lines)
+    ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
 
     closure_r := ir_reg()
     ir_emit("closure_ref " + closure_r.to_string() + " " + wrapper_name)
@@ -5974,10 +5944,9 @@ fn ir_named_function_value_wrapper(idx: Int, target_name: String) -> String:
     if ret_type.len() == 0:
         ret_type = "unknown"
 
-    saved_regs := ir_next_reg
+    saved_builder := ir_builder_snapshot()
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
-    saved_lines := ir_copy_lines(ir_lines)
 
     ir_reset_lambda_emit_state()
     mut param_count := 1
@@ -6012,7 +5981,7 @@ fn ir_named_function_value_wrapper(idx: Int, target_name: String) -> String:
         ir_emit_call_text(call_r, target_name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
         ir_emit("ret " + call_r.to_string())
     ir_emit_lambda_default_return()
-    ir_finish_lambda_emit(saved_regs, saved_vars, saved_types, saved_lines)
+    ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
     ir_named_fn_value_wrappers.insert(target_name, wrapper_name)
     return wrapper_name
 
@@ -7203,7 +7172,7 @@ fn ir_emit_default_return():
 fn ir_prepare_func_emission(ret_type: String):
     # each function starts from a clean local register/type state but keeps
     # the seeded global type tables so lowering stays consistent.
-    ir_next_reg = 0
+    ir_builder_reset_registers()
     ir_var_regs = {}
     ir_var_types = {}
     ir_map_value_types = {}
@@ -7493,10 +7462,7 @@ fn ir_emit_top_level_items(root_idx: Int, root: Node):
 
 fn ir_append_lambda_bodies():
     bodies: List[String] := ir_lambda_bodies
-    mut lines: List[String] := ir_lines
-    for body in bodies:
-        lines.push(body)
-    ir_lines = lines
+    ir_builder_append_lines(bodies)
 
 fn ir_preseed_result_error_strings():
     builtin_names := "parse_int,file_open_read,file_open_write,file_open_append,byte_buffer_write,byte_buffer_write_string_utf8,byte_buffer_write_byte,file_write,file_write_bytes,tcp_connect,tcp_listen,tcp_accept,tcp_write,tcp_write_bytes,process_spawn,process_spawn_argv,process_output_argv,process_write,process_write_bytes,crypto_x25519_keygen,write_file,append_file,write_file_bytes,append_file_bytes,read_file,exec_output,dns_resolve,bytes_to_string_utf8,file_read,tcp_read,process_read,process_read_err,read_file_bytes,b64_decode,from_hex,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,crypto_x25519_public_key,crypto_x25519_shared_secret,crypto_aes_128_gcm_seal,crypto_aes_128_gcm_open,crypto_chacha20_poly1305_seal,crypto_chacha20_poly1305_open,crypto_sign_rsa_pss_sha256_pkcs8".split(",")
@@ -7606,6 +7572,6 @@ pub fn emit_ir(root_idx: Int) -> String:
     ir_lambda_count = 0
     ir_lambda_bodies = []
     ir_emit_root_module(root_idx, root)
-    lines: List[String] := ir_lines
+    lines := ir_builder_lines()
     ir_finish_module_emit()
     return lines.join(chr(10))

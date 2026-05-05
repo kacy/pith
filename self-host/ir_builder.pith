@@ -1,0 +1,64 @@
+# ir_builder.pith - low-level IR output state
+
+mut ir_lines: List[String] := []
+mut ir_next_reg := 0
+mut ir_next_label := 0
+
+pub struct IrBuilderSnapshot:
+    next_reg: Int
+    lines: List[String]
+
+fn ir_push_line(items: List[String], value: String) -> List[String]:
+    mut updated: List[String] := items
+    updated.push(value)
+    return updated
+
+fn ir_copy_lines(lines: List[String]) -> List[String]:
+    mut copy: List[String] := []
+    for line in lines:
+        copy.push(line)
+    return copy
+
+pub fn ir_builder_reset():
+    ir_lines = []
+    ir_next_reg = 0
+    ir_next_label = 0
+
+pub fn ir_builder_reset_function():
+    ir_lines = []
+    ir_next_reg = 0
+
+pub fn ir_builder_reset_registers():
+    ir_next_reg = 0
+
+pub fn ir_builder_snapshot() -> IrBuilderSnapshot:
+    return IrBuilderSnapshot(ir_next_reg, ir_copy_lines(ir_lines))
+
+pub fn ir_builder_restore(snapshot: IrBuilderSnapshot):
+    ir_next_reg = snapshot.next_reg
+    ir_lines = ir_copy_lines(snapshot.lines)
+
+pub fn ir_builder_lines() -> List[String]:
+    return ir_copy_lines(ir_lines)
+
+pub fn ir_builder_append_lines(lines: List[String]):
+    mut updated: List[String] := ir_lines
+    for line in lines:
+        updated.push(line)
+    ir_lines = updated
+
+pub fn ir_new_temp_name(prefix: String) -> String:
+    return "__" + prefix + "_" + ir_next_reg.to_string() + "_" + ir_next_label.to_string()
+
+pub fn ir_emit(line: String):
+    ir_lines = ir_push_line(ir_lines, line)
+
+pub fn ir_reg() -> Int:
+    r := ir_next_reg
+    ir_next_reg = ir_next_reg + 1
+    return r
+
+pub fn ir_label() -> String:
+    n := ir_next_label
+    ir_next_label = ir_next_label + 1
+    return "L" + n.to_string()

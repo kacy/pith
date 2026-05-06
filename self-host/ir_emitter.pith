@@ -38,11 +38,12 @@ from types import TypeInfo, get_type_info
 from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, ir_is_int_returning_func, ir_is_string_returning_func, ir_is_bytes_returning_func, ir_is_list_returning_func, ir_is_list_string_returning_func, ir_is_bool_returning_method, ir_is_void_method, ir_is_string_returning_method, ir_runtime_call_name, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
-from ir_ast_helpers import ir_list_contains, ir_is_string_literal_kind, ir_unwrap_pub_node, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
+from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
-from ir_utils import ir_push_string, ir_encode_int_list, ir_parse_field_index, ir_decode_int_list
+from ir_utils import ir_push_string, ir_parse_field_index
+from ir_tree_cache import ir_cached_string_nodes, ir_root_items
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -99,9 +100,6 @@ mut ir_active_generic_params: List[String] := []
 mut ir_active_generic_concrete_types: List[String] := []
 mut ir_generic_runtime_subst: Map[String, String] := {}
 mut ir_active_generic_module_path := ""
-mut ir_root_items_cache: Map[Int, List[Int]] := {}
-mut ir_string_node_cache_roots: List[Int] := []
-mut ir_string_node_cache_values: List[String] := []
 
 pub fn set_import_roots(roots: List[Int], paths: List[String]):
     ir_preloaded_import_roots = roots
@@ -417,29 +415,6 @@ fn ir_capture_blocked_names() -> Map[String, Bool]:
 
 fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
     return ir_capture_find_free_vars(idx, bound, ir_capture_blocked_names())
-
-fn ir_collect_string_nodes(idx: Int) -> List[Int]:
-    mut string_nodes: List[Int] := []
-    mut stack: List[Int] := [idx]
-    while stack.len() > 0:
-        current := stack[stack.len() - 1]
-        stack.remove(stack.len() - 1)
-        node := get_node(current)
-        if ir_is_string_literal_kind(node.kind):
-            string_nodes.push(current)
-        kids := node.children
-        for kid in kids:
-            stack.push(kid)
-    return string_nodes
-
-fn ir_cached_string_nodes(root_idx: Int) -> List[Int]:
-    for cached_root, i in ir_string_node_cache_roots:
-        if cached_root == root_idx:
-            return ir_decode_int_list(ir_string_node_cache_values[i])
-    nodes := ir_collect_string_nodes(root_idx)
-    ir_string_node_cache_roots.push(root_idx)
-    ir_string_node_cache_values.push(ir_encode_int_list(nodes))
-    return nodes
 
 # --- collect strings (iterative to avoid deep recursion crashes) ---
 fn ir_collect_strings(idx: Int):
@@ -827,12 +802,6 @@ fn ir_record_global_type(name: String, global_type: String):
         ir_global_set_int_names = ir_push_string(ir_global_set_int_names, name)
     elif global_type == "bool":
         ir_global_bool_names = ir_push_string(ir_global_bool_names, name)
-
-fn ir_unwrap_pub_child(idx: Int) -> Int:
-    node := get_node(idx)
-    if node.kind == "pub" and node.children.len() > 0:
-        return node.children[0]
-    return idx
 
 fn ir_impl_target_type(node: Node) -> String:
     mut impl_type := ""
@@ -6545,16 +6514,6 @@ fn ir_collect_impl_methods(root_idx: Int, module_path: String):
         node := get_node(item_idx)
         if node.kind == "impl_decl":
             ir_collect_impl_method_signatures(node, module_path)
-
-fn ir_root_items(root_idx: Int) -> List[Int]:
-    if ir_root_items_cache.contains_key(root_idx):
-        return ir_root_items_cache[root_idx]
-    root := get_node(root_idx)
-    mut items: List[Int] := []
-    for child in root.children:
-        items.push(ir_unwrap_pub_child(child))
-    ir_root_items_cache.insert(root_idx, items)
-    return items
 
 fn ir_is_fn_decl_kind(kind: String) -> Bool:
     return kind == "fn" or kind == "fn_decl"

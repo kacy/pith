@@ -20,6 +20,7 @@ from checker_modules import module_generic_target_name, clean_import_part, modul
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 from checker_builtins import register_builtin_types
 from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning
+from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration
 
 # Module alias tracking - maps alias name to module path
 mut module_aliases: Map[String, String] := {}
@@ -55,7 +56,6 @@ mut struct_field_default_nodes: Map[String, Int] := {}
 # legacy map kept for probes; generic declaration lookup uses flat lists
 pub mut generic_declaration_map: Map[String, Int] := {}
 mut generic_declaration_names: List[String] := []
-mut interface_declaration_names: List[String] := []
 mut checking_test_decl := false
 # impl set: "Type\tInterface" -> 1
 mut implementation_set: Map[String, Int] := {}
@@ -76,7 +76,7 @@ pub fn initialize_checker(file_path: String):
     struct_field_default_nodes = {}
     generic_declaration_map = {}
     generic_declaration_names = []
-    interface_declaration_names = []
+    checker_interfaces_reset()
     implementation_set = {}
     expression_type_cache = {}
     module_aliases = {}
@@ -612,17 +612,6 @@ fn check_type_implements_interface(type_name: String, iface_name: String) -> Boo
     key := type_name + chr(9) + iface_name
     return implementation_set.contains_key(key)
 
-fn has_interface_declaration(name: String) -> Bool:
-    for iface_name in interface_declaration_names:
-        if strings_equal(iface_name, name):
-            return true
-    base := extract_base_type_name(name)
-    if base != name:
-        for iface_name in interface_declaration_names:
-            if strings_equal(iface_name, base):
-                return true
-    return false
-
 fn build_interface_type_name(base: String, args: List[String]) -> String:
     mut result := base + "["
     mut first := true
@@ -711,12 +700,6 @@ fn get_generic_declaration_index(name: String) -> Int:
     if key.len() > 0:
         return generic_declaration_map[key]
     return - 1
-
-fn register_interface_declaration_name(name: String):
-    for iface_name in interface_declaration_names:
-        if strings_equal(iface_name, name):
-            return
-    interface_declaration_names.push(name)
 
 fn register_method_signature(key: String, node_idx: Int, is_pub: Bool):
     method_decl_index_map.insert(key, node_idx)

@@ -19,9 +19,7 @@ from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 from checker_builtins import register_builtin_types
-
-mut checker_diagnostics: List[Diagnostic] := []
-mut current_file_path: String := ""
+from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning
 
 # Module alias tracking - maps alias name to module path
 mut module_aliases: Map[String, String] := {}
@@ -44,38 +42,6 @@ fn copy_string_map(src: Map[String, String]) -> Map[String, String]:
     for key in src.keys():
         dst.insert(key, src[key])
     return dst
-
-# Get position from AST node
-fn get_node_position(node_idx: Int) -> (Int, Int):
-    if node_idx < 0:
-        return (0, 0)
-    node := get_node(node_idx)
-    return (node.line, node.col)
-
-# Report error with position from node
-fn report_error_at(node_idx: Int, code: String, message: String):
-    mut pos := get_node_position(node_idx)
-    checker_diagnostics.push(Diagnostic("error", code, message, current_file_path, pos.0, pos.1, ""))
-
-# Report error without specific node (uses 0,0)
-fn report_error(code: String, message: String):
-    checker_diagnostics.push(Diagnostic("error", code, message, current_file_path, 0, 0, ""))
-
-# Report error with fix suggestion
-fn report_error_with_fix_at(node_idx: Int, code: String, message: String, fix: String):
-    mut pos := get_node_position(node_idx)
-    checker_diagnostics.push(Diagnostic("error", code, message, current_file_path, pos.0, pos.1, fix))
-
-fn report_error_with_fix(code: String, message: String, fix: String):
-    checker_diagnostics.push(Diagnostic("error", code, message, current_file_path, 0, 0, fix))
-
-# Report warning with position from node
-fn report_warning_at(node_idx: Int, code: String, message: String):
-    mut pos := get_node_position(node_idx)
-    checker_diagnostics.push(Diagnostic("warning", code, message, current_file_path, pos.0, pos.1, ""))
-
-fn report_warning(code: String, message: String):
-    checker_diagnostics.push(Diagnostic("warning", code, message, current_file_path, 0, 0, ""))
 
 # ---------------------------------------------------------------
 # checker state
@@ -103,8 +69,7 @@ pub mut expression_type_cache: Map[Int, Int] := {}
 pub fn initialize_checker(file_path: String):
     initialize_type_table()
     reset_scope_arena()
-    checker_diagnostics = []
-    current_file_path = file_path
+    checker_reset_diagnostics(file_path)
     method_type_map = {}
     method_visibility_map = {}
     method_decl_index_map = {}
@@ -128,7 +93,7 @@ pub fn set_checker_module_path(module_path: String):
     current_checker_module_path = module_path
 
 pub fn set_checker_file_path(file_path: String):
-    current_file_path = file_path
+    checker_set_file_path(file_path)
 
 # Register an import alias for module namespace resolution
 pub fn register_import_alias(alias: String, module_path: String):
@@ -4164,7 +4129,7 @@ pub fn c_run(root_idx: Int, file_path: String) -> List[Diagnostic]:
     process_import_aliases(root_idx)
     c_register_all(root_idx)
     c_check_all(root_idx)
-    return checker_diagnostics
+    return checker_get_diagnostics()
 
 # run checker passes on a single module without re-initializing.
 # call initialize_checker() once, then c_run_module() for each module in order.
@@ -4174,7 +4139,7 @@ pub fn c_run_module(root_idx: Int) -> List[Diagnostic]:
     c_register_all(root_idx)
     c_check_all(root_idx)
     module_aliases = saved_aliases
-    return checker_diagnostics
+    return checker_get_diagnostics()
 
 pub fn c_diagnostics_to_json(diags: List[Diagnostic]) -> String:
     return render_diagnostics_json(diags)

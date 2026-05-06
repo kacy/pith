@@ -1,0 +1,44 @@
+# checker_diagnostics.pith - checker diagnostic state and reporting helpers
+
+from ast import get_node
+from errors import Diagnostic
+
+mut checker_diagnostics: List[Diagnostic] := []
+mut checker_file_path := ""
+
+fn checker_node_position(node_idx: Int) -> (Int, Int):
+    if node_idx < 0:
+        return (0, 0)
+    node := get_node(node_idx)
+    return (node.line, node.col)
+
+pub fn checker_reset_diagnostics(file_path: String):
+    checker_diagnostics = []
+    checker_file_path = file_path
+
+pub fn checker_set_file_path(file_path: String):
+    checker_file_path = file_path
+
+pub fn checker_get_diagnostics() -> List[Diagnostic]:
+    return checker_diagnostics
+
+pub fn report_error_at(node_idx: Int, code: String, message: String):
+    pos := checker_node_position(node_idx)
+    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, ""))
+
+pub fn report_error(code: String, message: String):
+    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, 0, 0, ""))
+
+pub fn report_error_with_fix_at(node_idx: Int, code: String, message: String, fix: String):
+    pos := checker_node_position(node_idx)
+    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, fix))
+
+pub fn report_error_with_fix(code: String, message: String, fix: String):
+    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, 0, 0, fix))
+
+pub fn report_warning_at(node_idx: Int, code: String, message: String):
+    pos := checker_node_position(node_idx)
+    checker_diagnostics.push(Diagnostic("warning", code, message, checker_file_path, pos.0, pos.1, ""))
+
+pub fn report_warning(code: String, message: String):
+    checker_diagnostics.push(Diagnostic("warning", code, message, checker_file_path, 0, 0, ""))

@@ -42,7 +42,7 @@ from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_c
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
-from ir_utils import ir_push_string, ir_parse_field_index
+from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
 
 # --- current function locals ---
@@ -753,26 +753,6 @@ fn ir_method_call_arg_regs(obj_r: Int, arg_regs: List[Int]) -> List[Int]:
     for arg_reg in arg_regs:
         call_args.push(arg_reg)
     return call_args
-
-fn ir_copy_var_regs(src: Map[String, Int]) -> Map[String, Int]:
-    mut copy: Map[String, Int] := {}
-    for key in src.keys():
-        copy.insert(key, src[key])
-    return copy
-
-fn ir_copy_var_types(src: Map[String, String]) -> Map[String, String]:
-    mut copy: Map[String, String] := {}
-    for key in src.keys():
-        copy.insert(key, src[key])
-    return copy
-
-fn ir_unpack_field_index(meta: String) -> Int:
-    mut value := 0
-    mut i := 0
-    while i < meta.len():
-        value = (value * 10) + (ord(meta.substring(i, i + 1)) - ord("0"))
-        i = i + 1
-    return value
 
 fn ir_register_struct_layout(name: String, field_names: List[String], field_types: List[String]):
     if ir_struct_names.contains_key(name):

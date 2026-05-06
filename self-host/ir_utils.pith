@@ -41,3 +41,23 @@ pub fn ir_decode_int_list(encoded: String) -> List[Int]:
     for part in parts:
         decoded.push(ir_parse_cached_int(part))
     return decoded
+
+pub fn ir_copy_var_regs(src: Map[String, Int]) -> Map[String, Int]:
+    mut copy: Map[String, Int] := {}
+    for key in src.keys():
+        copy.insert(key, src[key])
+    return copy
+
+pub fn ir_copy_var_types(src: Map[String, String]) -> Map[String, String]:
+    mut copy: Map[String, String] := {}
+    for key in src.keys():
+        copy.insert(key, src[key])
+    return copy
+
+pub fn ir_unpack_field_index(meta: String) -> Int:
+    mut value := 0
+    mut i := 0
+    while i < meta.len():
+        value = (value * 10) + (ord(meta.substring(i, i + 1)) - ord("0"))
+        i = i + 1
+    return value

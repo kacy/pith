@@ -42,6 +42,7 @@ from ir_ast_helpers import ir_list_contains, ir_is_string_literal_kind, ir_unwra
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
+from ir_utils import ir_push_string, ir_encode_int_list, ir_parse_field_index, ir_decode_int_list
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -101,48 +102,6 @@ mut ir_active_generic_module_path := ""
 mut ir_root_items_cache: Map[Int, List[Int]] := {}
 mut ir_string_node_cache_roots: List[Int] := []
 mut ir_string_node_cache_values: List[String] := []
-
-fn ir_push_string(items: List[String], value: String) -> List[String]:
-    mut updated: List[String] := items
-    updated.push(value)
-    return updated
-
-fn ir_encode_int_list(items: List[Int]) -> String:
-    mut encoded: List[String] := []
-    for item in items:
-        encoded.push(item.to_string())
-    return encoded.join(chr(9))
-
-fn ir_parse_cached_int(text: String) -> Int:
-    mut value := 0
-    mut i := 0
-    while i < text.len():
-        value = (value * 10) + (ord(text.substring(i, i + 1)) - ord("0"))
-        i = i + 1
-    return value
-
-fn ir_parse_field_index(text: String) -> Int:
-    if text.len() == 0:
-        return 0 - 1
-    mut value := 0
-    mut i := 0
-    while i < text.len():
-        ch := text[i]
-        code := ord(ch)
-        if code < 48 or code > 57:
-            return 0 - 1
-        value = (value * 10) + (code - 48)
-        i = i + 1
-    return value
-
-fn ir_decode_int_list(encoded: String) -> List[Int]:
-    mut decoded: List[Int] := []
-    if encoded.len() == 0:
-        return decoded
-    parts := encoded.split(chr(9))
-    for part in parts:
-        decoded.push(ir_parse_cached_int(part))
-    return decoded
 
 pub fn set_import_roots(roots: List[Int], paths: List[String]):
     ir_preloaded_import_roots = roots

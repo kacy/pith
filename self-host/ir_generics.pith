@@ -1,0 +1,51 @@
+# ir_generics.pith - generic function metadata helpers
+
+from ast import get_node, Node
+
+pub fn ir_is_fn_decl_kind(kind: String) -> Bool:
+    return kind == "fn" or kind == "fn_decl"
+
+pub fn ir_has_generic_params(node: Node) -> Bool:
+    for child in node.children:
+        if get_node(child).kind == "generic_param":
+            return true
+    return false
+
+pub fn ir_collect_generic_param_names(node: Node) -> List[String]:
+    mut names: List[String] := []
+    mut i := 0
+    while i < node.children.len():
+        child := get_node(node.children[i])
+        if child.kind == "generic_param":
+            names.push(child.value)
+        i = i + 1
+    return names
+
+pub fn ir_encode_type_list(type_names: List[String]) -> String:
+    return type_names.join(chr(9))
+
+pub fn ir_decode_type_list(encoded: String) -> List[String]:
+    if encoded.len() == 0:
+        return []
+    return encoded.split(chr(9))
+
+pub fn ir_generic_specialization_key(name: String, type_names: List[String]) -> String:
+    return name + chr(9) + ir_encode_type_list(type_names)
+
+fn ir_sanitize_symbol_part(name: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < name.len():
+        ch := name[i]
+        if ch == "[" or ch == "]" or ch == "," or ch == " " or ch == "." or ch == ":":
+            out = out + "_"
+        else:
+            out = out + ch
+        i = i + 1
+    return out
+
+pub fn ir_generic_specialization_name(name: String, type_names: List[String]) -> String:
+    mut suffix_parts: List[String] := []
+    for type_name in type_names:
+        suffix_parts.push(ir_sanitize_symbol_part(type_name))
+    return name + "__" + suffix_parts.join("_")

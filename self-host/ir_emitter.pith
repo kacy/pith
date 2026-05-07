@@ -35,7 +35,7 @@
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
 from checker import c_get_expr_type
 from types import TypeInfo, get_type_info
-from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, ir_is_int_returning_func, ir_is_string_returning_func, ir_is_bytes_returning_func, ir_is_list_returning_func, ir_is_list_string_returning_func, ir_is_bool_returning_method, ir_is_void_method, ir_is_string_returning_method, ir_runtime_call_name, ir_method_emit_name
+from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_runtime_call_name, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
@@ -44,6 +44,7 @@ from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
+from ir_type_helpers import ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -203,26 +204,6 @@ fn ir_resolve_type_hint(type_name: String) -> String:
         return base
     return resolved
 
-fn ir_resolve_generic_type_node(tn: Node) -> String:
-    if tn.value == "List":
-        if tn.children.len() > 0:
-            first := get_node(tn.children[0])
-            if first.kind == "type" and first.value == "String":
-                return "list_string"
-        return "list"
-    if tn.value == "Map":
-        if tn.children.len() > 0:
-            first := get_node(tn.children[0])
-            if first.kind == "type" and first.value == "Int":
-                return "map_int"
-        return "map"
-    if tn.value == "Set":
-        return "set"
-    return ""
-
-fn ir_resolve_result_type_kind(inner_type: String) -> String:
-    return "tuple"
-
 fn ir_resolve_type_node(type_idx: Int) -> String:
     if ir_active_generic_params.len() > 0:
         resolved := ir_resolve_type_node_with_subst(type_idx, ir_active_generic_params, ir_active_generic_concrete_types)
@@ -323,16 +304,6 @@ fn ir_expr_result_kind(idx: Int) -> String:
         if builtin_kind.len() > 0:
             return builtin_kind
     return ir_expr_legacy_result_kind(idx)
-
-fn ir_builtin_result_ok_kind(name: String) -> String:
-    legacy_kind := ir_builtin_result_retkind(name)
-    if legacy_kind == "result_int":
-        return "int"
-    if legacy_kind == "result_bool":
-        return "bool"
-    if name == "parse_int":
-        return "int"
-    return ""
 
 fn ir_generic_result_ok_kind(name: String, concrete_types: List[String]) -> String:
     if not ir_generic_decl_indices.contains_key(name):
@@ -885,80 +856,6 @@ fn ir_register_known_import_structs():
     ir_register_struct_layout("TypeInfo", ["kind", "name", "fields", "field_types", "field_pub", "field_mut", "param_types", "return_type", "inner", "key_type", "value_type", "elements", "variants", "variant_types"], ["string", "string", "list_string", "list", "list", "list", "list", "int", "int", "int", "int", "list", "list_string", "list"])
     ir_register_struct_layout("Diagnostic", ["severity", "code", "message", "file", "line", "col", "fix"], ["string", "string", "string", "string", "int", "int", "string"])
 
-fn ir_type_from_tid(tid: Int) -> String:
-    if tid < 0:
-        return ""
-    mut info := get_type_info(tid)
-    if info.kind == "result":
-        return "tuple"
-    if info.kind == "optional":
-        return "tuple"
-    if info.kind == "primitive":
-        if info.name == "Int" or info.name == "UInt" or info.name == "Int8" or info.name == "Int16" or info.name == "Int32" or info.name == "Int64" or info.name == "UInt8" or info.name == "UInt16" or info.name == "UInt32" or info.name == "UInt64":
-            return "int"
-        if info.name == "Float":
-            return "float"
-        if info.name == "Bool":
-            return "bool"
-        if info.name == "String":
-            return "string"
-        if info.name == "Bytes":
-            return "bytes"
-        return ""
-    if info.kind == "list":
-        elem_info := get_type_info(info.inner)
-        if elem_info.kind == "primitive" and elem_info.name == "String":
-            return "list_string"
-        return "list"
-    if info.kind == "map":
-        key_info := get_type_info(info.key_type)
-        if key_info.kind == "primitive" and (key_info.name == "Int" or key_info.name == "UInt" or key_info.name == "Int8" or key_info.name == "Int16" or key_info.name == "Int32" or key_info.name == "Int64" or key_info.name == "UInt8" or key_info.name == "UInt16" or key_info.name == "UInt32" or key_info.name == "UInt64"):
-            return "map_int"
-        return "map"
-    if info.kind == "set":
-        elem_info := get_type_info(info.inner)
-        if elem_info.kind == "primitive" and (elem_info.name == "Int" or elem_info.name == "UInt" or elem_info.name == "Int8" or elem_info.name == "Int16" or elem_info.name == "Int32" or elem_info.name == "Int64" or elem_info.name == "UInt8" or elem_info.name == "UInt16" or elem_info.name == "UInt32" or elem_info.name == "UInt64"):
-            return "set_int"
-        return "set"
-    if info.kind == "tuple":
-        return "tuple"
-    if info.kind == "enum":
-        return "int"
-    if info.kind == "struct":
-        return info.name
-    if info.kind == "channel":
-        return "channel"
-    if info.kind == "task":
-        return "task"
-    return ""
-
-fn ir_checked_type(idx: Int) -> String:
-    return ir_type_from_tid(c_get_expr_type(idx))
-
-fn ir_checked_result_kind(idx: Int) -> String:
-    tid := c_get_expr_type(idx)
-    if tid < 0:
-        return ""
-    info := get_type_info(tid)
-    if info.kind != "result":
-        return ""
-    return "tuple"
-
-fn ir_builtin_result_retkind(name: String) -> String:
-    if name == "parse_int":
-        return "tuple"
-    if name == "file_open_read" or name == "file_open_write" or name == "file_open_append" or name == "byte_buffer_write" or name == "byte_buffer_write_string_utf8" or name == "byte_buffer_write_byte" or name == "file_write" or name == "file_write_bytes" or name == "tcp_connect" or name == "tcp_listen" or name == "tcp_accept" or name == "tcp_write" or name == "tcp_write_bytes" or name == "process_spawn" or name == "process_spawn_argv" or name == "process_output_argv" or name == "process_write" or name == "process_write_bytes" or name == "crypto_x25519_keygen":
-        return "result_int"
-    if name == "write_file" or name == "append_file" or name == "write_file_bytes" or name == "append_file_bytes":
-        return "result_bool"
-    if name == "parse_float":
-        return "float"
-    if name == "read_file" or name == "exec_output" or name == "dns_resolve" or name == "bytes_to_string_utf8" or name == "file_read" or name == "tcp_read" or name == "process_read" or name == "process_read_err":
-        return "string"
-    if name == "read_file_bytes" or name == "b64_decode" or name == "from_hex" or name == "file_read_bytes" or name == "tcp_read_bytes" or name == "process_read_bytes" or name == "process_read_err_bytes" or name == "crypto_x25519_public_key" or name == "crypto_x25519_shared_secret" or name == "crypto_aes_128_gcm_seal" or name == "crypto_aes_128_gcm_open" or name == "crypto_chacha20_poly1305_seal" or name == "crypto_chacha20_poly1305_open" or name == "crypto_sign_rsa_pss_sha256_pkcs8":
-        return "bytes"
-    return ""
-
 fn ir_expr_legacy_result_kind(idx: Int) -> String:
     node := get_node(idx)
     if node.kind == "call" and node.children.len() > 0:
@@ -1019,24 +916,6 @@ fn ir_call_retkind_for_name(idx: Int, uses_result_abi: Bool, callee_name: String
             return declared_kind
     return ir_call_retkind(idx, uses_result_abi)
 
-fn ir_checked_index_type(idx: Int) -> String:
-    node := get_node(idx)
-    if node.kind != "index" or node.children.len() == 0:
-        return ir_checked_type(idx)
-    coll_tid := c_get_expr_type(node.children[0])
-    if coll_tid < 0:
-        return ir_checked_type(idx)
-    mut coll_info := get_type_info(coll_tid)
-    if coll_info.kind == "optional" or coll_info.kind == "result":
-        if coll_info.inner < 0:
-            return ir_checked_type(idx)
-        coll_info = get_type_info(coll_info.inner)
-    if coll_info.kind == "map" and coll_info.value_type >= 0:
-        return ir_type_from_tid(coll_info.value_type)
-    if coll_info.kind == "list" and coll_info.inner >= 0:
-        return ir_type_from_tid(coll_info.inner)
-    return ir_checked_type(idx)
-
 fn ir_known_struct_return_type(fname: String) -> String:
     if ir_struct_names.contains_key(fname):
         return fname
@@ -1046,26 +925,6 @@ fn ir_known_struct_return_type(fname: String) -> String:
         return "Token"
     if fname == "ti_primitive" or fname == "ti_struct" or fname == "ti_enum" or fname == "ti_function" or fname == "ti_optional" or fname == "ti_result" or fname == "ti_tuple" or fname == "ti_list" or fname == "ti_map" or fname == "ti_set" or fname == "ti_task" or fname == "ti_channel" or fname == "get_type_info":
         return "TypeInfo"
-    return ""
-
-fn ir_known_scalar_return_type(fname: String) -> String:
-    if ir_is_float_returning_func(fname):
-        return "float"
-    if ir_is_bool_returning_func(fname):
-        return "bool"
-    if ir_is_int_returning_func(fname):
-        return "int"
-    if ir_is_string_returning_func(fname):
-        return "string"
-    if ir_is_bytes_returning_func(fname):
-        return "bytes"
-    return ""
-
-fn ir_known_collection_return_type(fname: String) -> String:
-    if ir_is_list_returning_func(fname):
-        return "list"
-    if ir_is_list_string_returning_func(fname):
-        return "list_string"
     return ""
 
 fn ir_known_callable_return_type(fname: String) -> String:
@@ -1092,34 +951,6 @@ fn ir_field_receiver_type(recv_idx: Int) -> String:
             obj_type = recv.value
     return obj_type
 
-fn ir_known_string_method_return_type(meth: String) -> String:
-    if ir_is_string_returning_method(meth) or meth == "to_string_utf8":
-        return "string"
-    if meth == "keys" or meth == "values" or meth == "split" or meth == "chars":
-        return "list_string"
-    return ""
-
-fn ir_known_collection_method_return_type(obj_type: String, meth: String) -> String:
-    if obj_type == "channel" or obj_type.starts_with("channel:"):
-        if meth == "recv":
-            return "tuple"
-        if meth == "try_recv":
-            return "tuple"
-        if meth == "len" or meth == "cap":
-            return "int"
-        if meth == "send" or meth == "try_send" or meth == "close" or meth == "is_closed":
-            return "bool"
-    if (obj_type == "task" or obj_type.starts_with("task:")) and meth == "is_done":
-        return "bool"
-    if meth == "index_of" and (obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")):
-        return "int"
-    if meth == "slice" or meth == "sort":
-        if obj_type == "list_string":
-            return "list_string"
-        if obj_type == "list" or obj_type.starts_with("list:"):
-            return "list"
-    return ""
-
 fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
     impl_name := ir_lookup_impl_method_name(obj_type, meth)
     if impl_name.len() > 0:
@@ -1142,33 +973,6 @@ fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
         return collection_type
     return ""
 
-fn ir_literal_expr_type(node: Node, kind: String) -> String:
-    if kind == "int_lit" or kind == "int" or kind == "integer":
-        return "int"
-    if kind == "float_lit" or kind == "float":
-        return "float"
-    if kind == "bool_lit" or kind == "bool":
-        return "bool"
-    if kind == "string_lit" or kind == "string" or kind == "str_lit" or kind == "string_interp":
-        return "string"
-    if kind == "list":
-        if node.children.len() > 0:
-            first := get_node(node.children[0])
-            if first.kind == "string_lit" or first.kind == "string":
-                return "list_string"
-        return "list"
-    if kind == "map":
-        return "map"
-    if kind == "set":
-        if node.children.len() > 0:
-            first := get_node(node.children[0])
-            if first.kind == "int_lit" or first.kind == "int" or first.kind == "integer":
-                return "set_int"
-        return "set"
-    if kind == "tuple":
-        return "tuple"
-    return ""
-
 fn ir_binary_expr_type(node: Node) -> String:
     op := node.value
     if op == "eq" or op == "neq" or op == "lt" or op == "gt" or op == "lte" or op == "gte" or op == "and" or op == "or":
@@ -1182,11 +986,6 @@ fn ir_binary_expr_type(node: Node) -> String:
             if lt == "string" or rt == "string":
                 return "string"
         return "int"
-    return "int"
-
-fn ir_unary_expr_type(node: Node) -> String:
-    if node.value == "not" or node.value == "!" or node.value == "not_op":
-        return "bool"
     return "int"
 
 fn ir_index_expr_type(idx: Int, node: Node) -> String:

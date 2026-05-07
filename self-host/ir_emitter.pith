@@ -48,6 +48,7 @@ from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_sta
 from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_toml_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_resolve_decode_call_name_with_state, ir_json_field_helper_name, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_config_require_helper_name, ir_toml_require_helper_name, ir_struct_decode_field_tid, ir_json_field_type_tag, ir_optional_inner_tid
 from ir_callees import ResolvedCallee, ir_import_declares_function_with_state, ir_import_declares_global_with_state, ir_module_alias_member_name_with_state, ir_plain_method_name, ir_ident_callee_with_state, ir_resolve_module_alias_call_name_with_state, ir_resolve_module_alias_method_call_name_with_state, ir_resolve_static_callee_with_state
 from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_encode_type_list, ir_decode_type_list, ir_generic_specialization_key, ir_generic_specialization_name, ir_specialize_type_name_with_state, ir_resolve_type_node_with_subst_with_state, ir_extract_return_type_with_subst_with_state, ir_extract_optional_inner_type_with_subst_with_state, ir_extract_param_types_with_subst_with_state
+from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_count_with_state, ir_struct_field_name_at_with_state, ir_struct_field_type_name_with_state, ir_struct_field_kind_from_decl_with_state, ir_field_kind_tid_with_state, ir_struct_field_tid_at_with_state, ir_struct_field_default_node_with_state
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -1482,94 +1483,28 @@ fn ir_emit_config_field_key(field_name: String, prefix_r: Int, index_idx: Int) -
     return full_key_r
 
 fn ir_struct_layout_name(struct_name: String) -> String:
-    if ir_struct_names.contains_key(struct_name):
-        return struct_name
-    if struct_name.contains("["):
-        base_name := struct_name.substring(0, struct_name.index_of("["))
-        if ir_struct_names.contains_key(base_name):
-            return base_name
-    return struct_name
+    return ir_struct_layout_name_with_state(struct_name, ir_struct_names)
 
 fn ir_struct_field_count(struct_name: String) -> Int:
-    layout_name := ir_struct_layout_name(struct_name)
-    if ir_struct_names.contains_key(layout_name):
-        return ir_struct_names[layout_name]
-    return 0
+    return ir_struct_field_count_with_state(struct_name, ir_struct_names)
 
 fn ir_struct_field_name_at(struct_name: String, field_index: Int) -> String:
-    struct_tid := lookup_type_id(struct_name)
-    if struct_tid >= 0:
-        struct_info := get_type_info(struct_tid)
-        if struct_info.kind == "struct" and field_index >= 0 and field_index < struct_info.fields.len():
-            return struct_info.fields[field_index]
-    prefix := ir_struct_layout_name(struct_name) + "."
-    want := field_index.to_string()
-    for key in ir_struct_field_index_lookup:
-        if key.starts_with(prefix) and ir_struct_field_index_lookup[key] == want:
-            return key.substring(prefix.len(), key.len())
-    return ""
+    return ir_struct_field_name_at_with_state(struct_name, field_index, ir_struct_names, ir_struct_field_index_lookup)
 
 fn ir_struct_field_type_name(struct_name: String, field_name: String) -> String:
-    key := ir_struct_layout_name(struct_name) + "." + field_name
-    if ir_struct_field_lookup.contains_key(key):
-        return ir_struct_field_lookup[key]
-    return ""
+    return ir_struct_field_type_name_with_state(struct_name, field_name, ir_struct_names, ir_struct_field_lookup)
 
 fn ir_struct_field_kind_from_decl(struct_name: String, field_index: Int) -> String:
-    layout_name := ir_struct_layout_name(struct_name)
-    if not ir_struct_decl_nodes.contains_key(layout_name):
-        return ""
-    decl := get_node(ir_struct_decl_nodes[layout_name])
-    mut current_index := 0
-    for child in decl.children:
-        field_node := ir_unwrap_pub_node(child)
-        if field_node.kind != "field":
-            continue
-        if current_index == field_index:
-            if field_node.children.len() > 0:
-                return ir_resolve_type_node(field_node.children[0])
-            return ""
-        current_index = current_index + 1
-    return ""
+    return ir_struct_field_kind_from_decl_with_state(struct_name, field_index, ir_struct_names, ir_struct_decl_nodes, ir_type_aliases)
 
 fn ir_field_kind_tid(kind: String) -> Int:
-    if kind == "int":
-        return 0
-    if kind == "float":
-        return 2
-    if kind == "bool":
-        return 3
-    if kind == "string":
-        return 4
-    if kind == "bytes":
-        return 5
-    if kind == "void":
-        return 6
-    if ir_struct_names.contains_key(kind):
-        return lookup_type_id(kind)
-    return - 1
+    return ir_field_kind_tid_with_state(kind, ir_struct_names)
 
 fn ir_struct_field_tid_at(struct_name: String, field_index: Int, fallback_tid: Int) -> Int:
-    mut field_kind := ir_struct_field_kind_from_decl(struct_name, field_index)
-    if field_kind.len() == 0:
-        field_name := ir_struct_field_name_at(struct_name, field_index)
-        field_kind = ir_struct_field_type_name(struct_name, field_name)
-    if field_kind.len() == 0:
-        return fallback_tid
-    field_tid := ir_field_kind_tid(field_kind)
-    if field_tid < 0:
-        return fallback_tid
-    if fallback_tid < 0:
-        return field_tid
-    if ir_type_from_tid(fallback_tid) != field_kind:
-        return field_tid
-    return fallback_tid
+    return ir_struct_field_tid_at_with_state(struct_name, field_index, fallback_tid, ir_struct_names, ir_struct_decl_nodes, ir_struct_field_index_lookup, ir_struct_field_lookup, ir_type_aliases)
 
 fn ir_struct_field_default_node(struct_name: String, field_name: String) -> Int:
-    key := ir_struct_layout_name(struct_name) + "." + field_name
-    if ir_struct_field_default_nodes.contains_key(key):
-        return ir_struct_field_default_nodes[key]
-    return 0 - 1
+    return ir_struct_field_default_node_with_state(struct_name, field_name, ir_struct_names, ir_struct_field_default_nodes)
 
 fn ir_emit_config_specialized_field_key(field_name: String, prefix_r: Int) -> Int:
     key_r := ir_reg()

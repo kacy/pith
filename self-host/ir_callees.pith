@@ -1,0 +1,77 @@
+# ir_callees.pith - static callee resolution helpers
+
+from ast import get_node
+from ir_names import ir_import_target_name
+
+pub struct ResolvedCallee:
+    name: String
+    imported: Bool
+
+fn ir_import_key(module_path: String, name: String) -> String:
+    return module_path + "." + name
+
+pub fn ir_import_declares_function_with_state(module_path: String, name: String, import_declared_functions: Map[String, Bool]) -> Bool:
+    return import_declared_functions.contains_key(ir_import_key(module_path, name))
+
+pub fn ir_import_declares_global_with_state(module_path: String, name: String, import_declared_globals: Map[String, Bool]) -> Bool:
+    return import_declared_globals.contains_key(ir_import_key(module_path, name))
+
+pub fn ir_module_alias_member_name_with_state(alias: String, member: String, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> String:
+    if not module_aliases.contains_key(alias):
+        return ""
+    module_path := module_aliases[alias]
+    if ir_import_declares_function_with_state(module_path, member, import_declared_functions):
+        return ir_import_target_name(module_path, member)
+    if ir_import_declares_global_with_state(module_path, member, import_declared_globals):
+        return ir_import_target_name(module_path, member)
+    return member
+
+pub fn ir_plain_method_name(name: String) -> String:
+    if name.starts_with("."):
+        return name.substring(1, name.len())
+    return name
+
+pub fn ir_ident_callee_with_state(name: String, import_renames: Map[String, String], active_generic_module_path: String, import_declared_functions: Map[String, Bool]) -> ResolvedCallee:
+    if import_renames.contains_key(name):
+        return ResolvedCallee(import_renames[name], true)
+    if active_generic_module_path.len() > 0 and ir_import_declares_function_with_state(active_generic_module_path, name, import_declared_functions):
+        return ResolvedCallee(ir_import_target_name(active_generic_module_path, name), true)
+    return ResolvedCallee(name, false)
+
+pub fn ir_resolve_module_alias_call_name_with_state(idx: Int, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> String:
+    node := get_node(idx)
+    if node.kind != "field_access" or node.children.len() == 0:
+        return ""
+    recv := get_node(node.children[0])
+    if recv.kind != "ident":
+        return ""
+    return ir_module_alias_member_name_with_state(recv.value, node.value, module_aliases, import_declared_functions, import_declared_globals)
+
+pub fn ir_resolve_module_alias_method_call_name_with_state(idx: Int, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> String:
+    node := get_node(idx)
+    if node.kind != "method_call" or node.children.len() == 0:
+        return ""
+    recv := get_node(node.children[0])
+    if recv.kind != "ident":
+        return ""
+    return ir_module_alias_member_name_with_state(recv.value, ir_plain_method_name(node.value), module_aliases, import_declared_functions, import_declared_globals)
+
+pub fn ir_resolve_static_callee_with_state(idx: Int, import_renames: Map[String, String], active_generic_module_path: String, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> ResolvedCallee:
+    node := get_node(idx)
+    if node.kind == "ident":
+        return ir_ident_callee_with_state(node.value, import_renames, active_generic_module_path, import_declared_functions)
+    if node.kind == "index" and node.children.len() > 0:
+        base_node := get_node(node.children[0])
+        if base_node.kind == "ident" and base_node.value == "Channel":
+            return ResolvedCallee("Channel", false)
+        if base_node.kind == "ident":
+            return ir_ident_callee_with_state(base_node.value, import_renames, active_generic_module_path, import_declared_functions)
+        if base_node.kind == "field_access":
+            alias_name := ir_resolve_module_alias_call_name_with_state(node.children[0], module_aliases, import_declared_functions, import_declared_globals)
+            if alias_name.len() > 0:
+                return ResolvedCallee(alias_name, true)
+    if node.kind == "field_access":
+        alias_name := ir_resolve_module_alias_call_name_with_state(idx, module_aliases, import_declared_functions, import_declared_globals)
+        if alias_name.len() > 0:
+            return ResolvedCallee(alias_name, true)
+    return ResolvedCallee("", false)

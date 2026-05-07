@@ -46,6 +46,7 @@ from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
 from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type
 from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_toml_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_resolve_decode_call_name_with_state, ir_json_field_helper_name, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_config_require_helper_name, ir_toml_require_helper_name, ir_struct_decode_field_tid, ir_json_field_type_tag, ir_optional_inner_tid
+from ir_callees import ResolvedCallee, ir_import_declares_function_with_state, ir_import_declares_global_with_state, ir_module_alias_member_name_with_state, ir_plain_method_name, ir_ident_callee_with_state, ir_resolve_module_alias_call_name_with_state, ir_resolve_module_alias_method_call_name_with_state, ir_resolve_static_callee_with_state
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -400,25 +401,14 @@ fn ir_emit_call0(result_reg: Int, fname: String, ret_type: String):
 fn ir_emit_call1(result_reg: Int, fname: String, ret_type: String, arg0: Int):
     ir_emit_call_text(result_reg, fname, ret_type, 1, " " + arg0.to_string())
 
-struct ResolvedCallee:
-    name: String
-    imported: Bool
-
 fn ir_module_alias_member_name(alias: String, member: String) -> String:
-    if not ir_module_aliases.contains_key(alias):
-        return ""
-    module_path := ir_module_aliases[alias]
-    if ir_import_declares_function(module_path, member):
-        return ir_import_target_name(module_path, member)
-    if ir_import_declares_global(module_path, member):
-        return ir_import_target_name(module_path, member)
-    return member
+    return ir_module_alias_member_name_with_state(alias, member, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
 fn ir_import_declares_function(module_path: String, name: String) -> Bool:
-    return ir_import_declared_functions.contains_key(module_path + "." + name)
+    return ir_import_declares_function_with_state(module_path, name, ir_import_declared_functions)
 
 fn ir_import_declares_global(module_path: String, name: String) -> Bool:
-    return ir_import_declared_globals.contains_key(module_path + "." + name)
+    return ir_import_declares_global_with_state(module_path, name, ir_import_declared_globals)
 
 fn ir_collect_import_declared_functions(root_idx: Int, module_path: String):
     for item_idx in ir_root_items(root_idx):
@@ -443,55 +433,17 @@ fn ir_collect_preloaded_root_metadata(root_idx: Int, module_path: String):
         elif ir_is_binding_kind(node.kind):
             ir_import_declared_globals.insert(module_path + "." + ir_binding_name(node), true)
 
-fn ir_plain_method_name(name: String) -> String:
-    if name.starts_with("."):
-        return name.substring(1, name.len())
-    return name
-
 fn ir_ident_callee(name: String) -> ResolvedCallee:
-    if ir_import_renames.contains_key(name):
-        return ResolvedCallee(ir_import_renames[name], true)
-    if ir_active_generic_module_path.len() > 0 and ir_import_declares_function(ir_active_generic_module_path, name):
-        return ResolvedCallee(ir_import_target_name(ir_active_generic_module_path, name), true)
-    return ResolvedCallee(name, false)
+    return ir_ident_callee_with_state(name, ir_import_renames, ir_active_generic_module_path, ir_import_declared_functions)
 
 fn ir_resolve_module_alias_call_name(idx: Int) -> String:
-    node := get_node(idx)
-    if node.kind != "field_access" or node.children.len() == 0:
-        return ""
-    recv := get_node(node.children[0])
-    if recv.kind != "ident":
-        return ""
-    return ir_module_alias_member_name(recv.value, node.value)
+    return ir_resolve_module_alias_call_name_with_state(idx, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
 fn ir_resolve_module_alias_method_call_name(idx: Int) -> String:
-    node := get_node(idx)
-    if node.kind != "method_call" or node.children.len() == 0:
-        return ""
-    recv := get_node(node.children[0])
-    if recv.kind != "ident":
-        return ""
-    return ir_module_alias_member_name(recv.value, ir_plain_method_name(node.value))
+    return ir_resolve_module_alias_method_call_name_with_state(idx, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
 fn ir_resolve_static_callee(idx: Int) -> ResolvedCallee:
-    node := get_node(idx)
-    if node.kind == "ident":
-        return ir_ident_callee(node.value)
-    if node.kind == "index" and node.children.len() > 0:
-        base_node := get_node(node.children[0])
-        if base_node.kind == "ident" and base_node.value == "Channel":
-            return ResolvedCallee("Channel", false)
-        if base_node.kind == "ident":
-            return ir_ident_callee(base_node.value)
-        if base_node.kind == "field_access":
-            alias_name := ir_resolve_module_alias_call_name(node.children[0])
-            if alias_name.len() > 0:
-                return ResolvedCallee(alias_name, true)
-    if node.kind == "field_access":
-        alias_name := ir_resolve_module_alias_call_name(idx)
-        if alias_name.len() > 0:
-            return ResolvedCallee(alias_name, true)
-    return ResolvedCallee("", false)
+    return ir_resolve_static_callee_with_state(idx, ir_import_renames, ir_active_generic_module_path, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
 fn ir_is_json_decode_callee(index_idx: Int, member_name: String) -> Bool:
     return ir_is_json_decode_callee_with_aliases(index_idx, member_name, ir_module_aliases)

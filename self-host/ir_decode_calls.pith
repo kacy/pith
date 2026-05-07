@@ -1,6 +1,7 @@
 # ir_decode_calls.pith - decode call recognition helpers
 
 from ast import get_node
+from ir_names import ir_import_target_name
 
 fn ir_decode_field_receiver(index_idx: Int, member_name: String) -> String:
     index_node := get_node(index_idx)
@@ -61,3 +62,26 @@ pub fn ir_is_config_file_decode_callee_with_aliases(index_idx: Int, member_name:
         if module_aliases[recv.value] == "std.config":
             return true
     return recv.value == "config" or recv.value == "config_mod"
+
+fn ir_module_alias_member_name_with_state(alias: String, member: String, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> String:
+    if not module_aliases.contains_key(alias):
+        return ""
+    module_path := module_aliases[alias]
+    key := module_path + "." + member
+    if import_declared_functions.contains_key(key):
+        return ir_import_target_name(module_path, member)
+    if import_declared_globals.contains_key(key):
+        return ir_import_target_name(module_path, member)
+    return member
+
+pub fn ir_resolve_decode_call_name_with_state(index_idx: Int, member_name: String, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> String:
+    index_node := get_node(index_idx)
+    if index_node.kind == "index" and index_node.children.len() > 0:
+        base_node := get_node(index_node.children[0])
+        if base_node.kind == "field_access" and base_node.children.len() > 0:
+            recv := get_node(base_node.children[0])
+            if recv.kind == "ident":
+                alias_name := ir_module_alias_member_name_with_state(recv.value, member_name, module_aliases, import_declared_functions, import_declared_globals)
+                if alias_name.len() > 0:
+                    return alias_name
+    return member_name

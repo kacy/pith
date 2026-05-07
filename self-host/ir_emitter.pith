@@ -45,7 +45,7 @@ from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_flo
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
 from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type
-from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_toml_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases
+from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_toml_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_resolve_decode_call_name_with_state
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -1600,40 +1600,13 @@ fn ir_emit_result_ok_field_typed(result_r: Int, field_type_name: String) -> Int:
     return ok_r
 
 fn ir_resolve_config_call_name(index_idx: Int, member_name: String) -> String:
-    index_node := get_node(index_idx)
-    if index_node.kind == "index" and index_node.children.len() > 0:
-        base_node := get_node(index_node.children[0])
-        if base_node.kind == "field_access" and base_node.children.len() > 0:
-            recv := get_node(base_node.children[0])
-            if recv.kind == "ident":
-                alias_name := ir_module_alias_member_name(recv.value, member_name)
-                if alias_name.len() > 0:
-                    return alias_name
-    return member_name
+    return ir_resolve_decode_call_name_with_state(index_idx, member_name, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
 fn ir_resolve_json_call_name(index_idx: Int, member_name: String) -> String:
-    index_node := get_node(index_idx)
-    if index_node.kind == "index" and index_node.children.len() > 0:
-        base_node := get_node(index_node.children[0])
-        if base_node.kind == "field_access" and base_node.children.len() > 0:
-            recv := get_node(base_node.children[0])
-            if recv.kind == "ident":
-                alias_name := ir_module_alias_member_name(recv.value, member_name)
-                if alias_name.len() > 0:
-                    return alias_name
-    return member_name
+    return ir_resolve_decode_call_name_with_state(index_idx, member_name, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
 fn ir_resolve_toml_call_name(index_idx: Int, member_name: String) -> String:
-    index_node := get_node(index_idx)
-    if index_node.kind == "index" and index_node.children.len() > 0:
-        base_node := get_node(index_node.children[0])
-        if base_node.kind == "field_access" and base_node.children.len() > 0:
-            recv := get_node(base_node.children[0])
-            if recv.kind == "ident":
-                alias_name := ir_module_alias_member_name(recv.value, member_name)
-                if alias_name.len() > 0:
-                    return alias_name
-    return member_name
+    return ir_resolve_decode_call_name_with_state(index_idx, member_name, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
 fn ir_emit_config_field_key(field_name: String, prefix_r: Int, index_idx: Int) -> Int:
     key_r := ir_reg()

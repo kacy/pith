@@ -1,6 +1,8 @@
 # ir_result_abi.pith - low-level Result IR helpers
 
 from ir_builder import ir_emit, ir_reg, ir_str
+from ir_type_helpers import ir_type_from_tid
+from types import get_type_info
 
 pub fn ir_uses_result_abi(result_kind: String) -> Bool:
     return result_kind.len() > 0 and result_kind != "tuple"
@@ -42,3 +44,27 @@ pub fn ir_emit_result_error_message(callee_name: String) -> Int:
     msg_r := ir_reg()
     ir_emit("strref " + msg_r.to_string() + " " + ir_str(callee_name + " failed"))
     return msg_r
+
+pub fn ir_result_field_kind(obj_tid: Int, fname: String) -> String:
+    if obj_tid < 0:
+        if fname == "is_ok" or fname == "is_err":
+            return "bool"
+        return "unknown"
+    obj_info := get_type_info(obj_tid)
+    if obj_info.kind != "result":
+        if fname == "is_ok" or fname == "is_err":
+            return "bool"
+        return "unknown"
+    if fname == "ok":
+        return ir_type_from_tid(obj_info.inner)
+    if fname == "err":
+        return ir_type_from_tid(obj_info.value_type)
+    return "bool"
+
+pub fn ir_emit_result_value_field(obj_r: Int, obj_tid: Int, fname: String) -> Int:
+    mut offset := 8
+    if fname == "err":
+        offset = 16
+    r := ir_reg()
+    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " " + offset.to_string() + " " + ir_result_field_kind(obj_tid, fname) + " " + fname)
+    return r

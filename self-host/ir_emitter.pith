@@ -40,7 +40,7 @@ from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_dec
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
-from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message
+from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
@@ -4513,30 +4513,6 @@ fn ir_emit_ok_result_tuple(ok_r: Int) -> Int:
 fn ir_emit_err_result_tuple(err_r: Int) -> Int:
     zero := ir_zero_reg()
     return ir_emit_result_tuple(zero, zero, err_r)
-
-fn ir_result_field_kind(obj_tid: Int, fname: String) -> String:
-    if obj_tid < 0:
-        if fname == "is_ok" or fname == "is_err":
-            return "bool"
-        return "unknown"
-    obj_info := get_type_info(obj_tid)
-    if obj_info.kind != "result":
-        if fname == "is_ok" or fname == "is_err":
-            return "bool"
-        return "unknown"
-    if fname == "ok":
-        return ir_type_from_tid(obj_info.inner)
-    if fname == "err":
-        return ir_type_from_tid(obj_info.value_type)
-    return "bool"
-
-fn ir_emit_result_value_field(obj_r: Int, obj_tid: Int, fname: String) -> Int:
-    mut offset := 8
-    if fname == "err":
-        offset = 16
-    r := ir_reg()
-    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " " + offset.to_string() + " " + ir_result_field_kind(obj_tid, fname) + " " + fname)
-    return r
 
 fn ir_emit_wrapped_legacy_result(raw_r: Int, legacy_kind: String, callee_name: String) -> Int:
     temp_name := ir_new_temp_name("legacy_result")

@@ -2,6 +2,7 @@
 
 from ast import get_node
 from ir_names import ir_import_target_name
+from types import get_type_info
 
 fn ir_decode_field_receiver(index_idx: Int, member_name: String) -> String:
     index_node := get_node(index_idx)
@@ -85,3 +86,92 @@ pub fn ir_resolve_decode_call_name_with_state(index_idx: Int, member_name: Strin
                 if alias_name.len() > 0:
                     return alias_name
     return member_name
+
+pub fn ir_json_field_helper_name(field_tid: Int) -> String:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        if info.name == "String":
+            return "std_json_scan_required_string_bytes"
+        if info.name == "Int":
+            return "std_json_scan_required_int_bytes"
+        if info.name == "Bool":
+            return "std_json_scan_required_bool_bytes"
+    return ""
+
+pub fn ir_json_object_helper_name(field_tid: Int) -> String:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        if info.name == "String":
+            return "object_require_string"
+        if info.name == "Int":
+            return "object_require_int"
+        if info.name == "Bool":
+            return "object_require_bool"
+    return ""
+
+pub fn ir_json_require_helper_name(field_tid: Int) -> String:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        if info.name == "String":
+            return "std_json_require_string"
+        if info.name == "Int":
+            return "std_json_require_int"
+        if info.name == "Bool":
+            return "std_json_require_bool"
+    return ""
+
+pub fn ir_json_scalar_has_helper_name(field_tid: Int) -> String:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        if info.name == "String":
+            return "std_json_scalar_has_string"
+        if info.name == "Int":
+            return "std_json_scalar_has_int"
+        if info.name == "Bool":
+            return "std_json_scalar_has_bool"
+    return ""
+
+pub fn ir_config_require_helper_name(field_tid: Int) -> String:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        if info.name == "String":
+            return "require"
+        if info.name == "Int":
+            return "require_int"
+        if info.name == "Bool":
+            return "require_bool"
+    return ""
+
+pub fn ir_toml_require_helper_name(field_tid: Int) -> String:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        if info.name == "String":
+            return "std_toml_require_string"
+        if info.name == "Int":
+            return "std_toml_require_int"
+        if info.name == "Bool":
+            return "std_toml_require_bool"
+    return ""
+
+pub fn ir_struct_decode_field_tid(field_tid: Int) -> Int:
+    info := get_type_info(field_tid)
+    if info.kind == "struct":
+        return field_tid
+    return 0 - 1
+
+pub fn ir_json_field_type_tag(field_tid: Int) -> Int:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        if info.name == "String":
+            return 0
+        if info.name == "Int":
+            return 1
+        if info.name == "Bool":
+            return 2
+    return 0 - 1
+
+pub fn ir_optional_inner_tid(field_tid: Int) -> Int:
+    info := get_type_info(field_tid)
+    if info.kind == "optional":
+        return info.inner
+    return 0 - 1

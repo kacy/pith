@@ -1,0 +1,63 @@
+# ir_decode_calls.pith - decode call recognition helpers
+
+from ast import get_node
+
+fn ir_decode_field_receiver(index_idx: Int, member_name: String) -> String:
+    index_node := get_node(index_idx)
+    if index_node.kind != "index" or index_node.children.len() < 2:
+        return ""
+    base_node := get_node(index_node.children[0])
+    if base_node.kind != "field_access" or base_node.value != member_name:
+        return ""
+    if base_node.children.len() < 1:
+        return ""
+    recv := get_node(base_node.children[0])
+    if recv.kind != "ident":
+        return ""
+    return recv.value
+
+pub fn ir_is_json_decode_callee_with_aliases(index_idx: Int, member_name: String, module_aliases: Map[String, String]) -> Bool:
+    recv_name := ir_decode_field_receiver(index_idx, member_name)
+    if recv_name.len() == 0:
+        return false
+    if module_aliases.contains_key(recv_name):
+        if module_aliases[recv_name] == "std.json":
+            return true
+    return recv_name == "json" or recv_name == "json_mod"
+
+pub fn ir_is_config_decode_callee_with_aliases(index_idx: Int, member_name: String, module_aliases: Map[String, String]) -> Bool:
+    recv_name := ir_decode_field_receiver(index_idx, member_name)
+    if recv_name.len() == 0:
+        return false
+    if module_aliases.contains_key(recv_name):
+        if module_aliases[recv_name] == "std.config":
+            return true
+    return recv_name == "config" or recv_name == "config_mod"
+
+pub fn ir_is_toml_decode_callee_with_aliases(index_idx: Int, member_name: String, module_aliases: Map[String, String]) -> Bool:
+    recv_name := ir_decode_field_receiver(index_idx, member_name)
+    if recv_name.len() == 0:
+        return false
+    if module_aliases.contains_key(recv_name):
+        if module_aliases[recv_name] == "std.toml":
+            return true
+    return recv_name == "toml" or recv_name == "toml_mod"
+
+pub fn ir_is_config_file_decode_callee_with_aliases(index_idx: Int, member_name: String, module_aliases: Map[String, String]) -> Bool:
+    index_node := get_node(index_idx)
+    if index_node.kind != "index" or index_node.children.len() < 2:
+        return false
+    base_node := get_node(index_node.children[0])
+    if base_node.kind == "ident":
+        return base_node.value == member_name
+    if base_node.kind != "field_access" or base_node.value != member_name:
+        return false
+    if base_node.children.len() < 1:
+        return false
+    recv := get_node(base_node.children[0])
+    if recv.kind != "ident":
+        return false
+    if module_aliases.contains_key(recv.value):
+        if module_aliases[recv.value] == "std.config":
+            return true
+    return recv.value == "config" or recv.value == "config_mod"

@@ -45,6 +45,7 @@ from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_flo
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
 from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type
+from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_toml_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -493,55 +494,13 @@ fn ir_resolve_static_callee(idx: Int) -> ResolvedCallee:
     return ResolvedCallee("", false)
 
 fn ir_is_json_decode_callee(index_idx: Int, member_name: String) -> Bool:
-    index_node := get_node(index_idx)
-    if index_node.kind != "index" or index_node.children.len() < 2:
-        return false
-    base_node := get_node(index_node.children[0])
-    if base_node.kind != "field_access" or base_node.value != member_name:
-        return false
-    if base_node.children.len() < 1:
-        return false
-    recv := get_node(base_node.children[0])
-    if recv.kind != "ident":
-        return false
-    if ir_module_aliases.contains_key(recv.value):
-        if ir_module_aliases[recv.value] == "std.json":
-            return true
-    return recv.value == "json" or recv.value == "json_mod"
+    return ir_is_json_decode_callee_with_aliases(index_idx, member_name, ir_module_aliases)
 
 fn ir_is_config_decode_callee(index_idx: Int, member_name: String) -> Bool:
-    index_node := get_node(index_idx)
-    if index_node.kind != "index" or index_node.children.len() < 2:
-        return false
-    base_node := get_node(index_node.children[0])
-    if base_node.kind != "field_access" or base_node.value != member_name:
-        return false
-    if base_node.children.len() < 1:
-        return false
-    recv := get_node(base_node.children[0])
-    if recv.kind != "ident":
-        return false
-    if ir_module_aliases.contains_key(recv.value):
-        if ir_module_aliases[recv.value] == "std.config":
-            return true
-    return recv.value == "config" or recv.value == "config_mod"
+    return ir_is_config_decode_callee_with_aliases(index_idx, member_name, ir_module_aliases)
 
 fn ir_is_toml_decode_callee(index_idx: Int, member_name: String) -> Bool:
-    index_node := get_node(index_idx)
-    if index_node.kind != "index" or index_node.children.len() < 2:
-        return false
-    base_node := get_node(index_node.children[0])
-    if base_node.kind != "field_access" or base_node.value != member_name:
-        return false
-    if base_node.children.len() < 1:
-        return false
-    recv := get_node(base_node.children[0])
-    if recv.kind != "ident":
-        return false
-    if ir_module_aliases.contains_key(recv.value):
-        if ir_module_aliases[recv.value] == "std.toml":
-            return true
-    return recv.value == "toml" or recv.value == "toml_mod"
+    return ir_is_toml_decode_callee_with_aliases(index_idx, member_name, ir_module_aliases)
 
 fn ir_is_local_generic_callee(index_idx: Int, member_name: String, first_param_name: String) -> Bool:
     index_node := get_node(index_idx)
@@ -555,23 +514,7 @@ fn ir_is_local_generic_callee(index_idx: Int, member_name: String, first_param_n
     return ir_param_name_at(ir_generic_decl_indices[member_name], 0) == first_param_name
 
 fn ir_is_config_file_decode_callee(index_idx: Int, member_name: String) -> Bool:
-    index_node := get_node(index_idx)
-    if index_node.kind != "index" or index_node.children.len() < 2:
-        return false
-    base_node := get_node(index_node.children[0])
-    if base_node.kind == "ident":
-        return base_node.value == member_name
-    if base_node.kind != "field_access" or base_node.value != member_name:
-        return false
-    if base_node.children.len() < 1:
-        return false
-    recv := get_node(base_node.children[0])
-    if recv.kind != "ident":
-        return false
-    if ir_module_aliases.contains_key(recv.value):
-        if ir_module_aliases[recv.value] == "std.config":
-            return true
-    return recv.value == "config" or recv.value == "config_mod"
+    return ir_is_config_file_decode_callee_with_aliases(index_idx, member_name, ir_module_aliases)
 
 fn ir_callee_uses_result_abi(callee: ResolvedCallee, idx: Int) -> Bool:
     raw_kind := ir_declared_callable_ir_retkind(callee.name)

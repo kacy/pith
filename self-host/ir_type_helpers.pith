@@ -5,6 +5,77 @@ from checker import c_get_expr_type
 from types import get_type_info
 from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, ir_is_int_returning_func, ir_is_string_returning_func, ir_is_bytes_returning_func, ir_is_list_returning_func, ir_is_list_string_returning_func, ir_is_string_returning_method
 
+pub fn ir_resolve_type_hint_with_state(type_name: String, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
+    mut resolved := type_name
+    if type_aliases.contains_key(resolved):
+        resolved = type_aliases[resolved]
+    if resolved.starts_with("opaque:"):
+        resolved = resolved.substring(7, resolved.len())
+    if resolved == "String":
+        return "string"
+    if resolved == "Bytes":
+        return "bytes"
+    if resolved == "Bool":
+        return "bool"
+    if resolved == "Int":
+        return "int"
+    if resolved == "Float":
+        return "float"
+    if resolved.contains("List[String]"):
+        return "list_string"
+    if resolved.contains("List[") or resolved == "List":
+        return "list"
+    if resolved.contains("Map[Int,") or resolved.contains("Map[Int, "):
+        return "map_int"
+    if resolved.contains("Map[") or resolved == "Map":
+        return "map"
+    if resolved.contains("Set[Int]") or resolved.contains("Set[UInt]") or resolved.contains("Set[Int8]") or resolved.contains("Set[Int16]") or resolved.contains("Set[Int32]") or resolved.contains("Set[Int64]") or resolved.contains("Set[UInt8]") or resolved.contains("Set[UInt16]") or resolved.contains("Set[UInt32]") or resolved.contains("Set[UInt64]"):
+        return "set_int"
+    if resolved.contains("Set[") or resolved == "Set":
+        return "set"
+    if resolved.contains("Channel[") or resolved == "Channel":
+        return "channel"
+    if resolved.contains("Task[") or resolved == "Task":
+        return "task"
+    mut base := resolved
+    if base.contains("["):
+        base = base.substring(0, base.index_of("["))
+    if struct_names.contains_key(base):
+        return base
+    return resolved
+
+pub fn ir_retkind_with_state(type_name: String, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
+    if type_name.len() == 0:
+        return "unknown"
+    resolved := ir_resolve_type_hint_with_state(type_name, type_aliases, struct_names)
+    if resolved == "int":
+        return "int"
+    if resolved == "float":
+        return "float"
+    if resolved == "bool":
+        return "bool"
+    if resolved == "string":
+        return "string"
+    if resolved == "list":
+        return "list"
+    if resolved == "list_string":
+        return "list_string"
+    if resolved == "map":
+        return "map"
+    if resolved == "map_int":
+        return "map_int"
+    if resolved == "set_int":
+        return "set_int"
+    if resolved == "set":
+        return "set"
+    if resolved == "void":
+        return "void"
+    if resolved == "Mutex" or resolved == "WaitGroup" or resolved == "Semaphore":
+        return "opaque:" + resolved
+    if struct_names.contains_key(resolved):
+        return "struct:" + resolved
+    return resolved
+
 pub fn ir_resolve_generic_type_node(tn: Node) -> String:
     if tn.value == "List":
         if tn.children.len() > 0:

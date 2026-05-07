@@ -44,7 +44,7 @@ from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
-from ir_type_helpers import ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type
+from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -166,43 +166,7 @@ pub fn ir_reset():
     ir_reset_control_flow_state()
 
 fn ir_resolve_type_hint(type_name: String) -> String:
-    mut resolved := type_name
-    if ir_type_aliases.contains_key(resolved):
-        resolved = ir_type_aliases[resolved]
-    if resolved.starts_with("opaque:"):
-        resolved = resolved.substring(7, resolved.len())
-    if resolved == "String":
-        return "string"
-    if resolved == "Bytes":
-        return "bytes"
-    if resolved == "Bool":
-        return "bool"
-    if resolved == "Int":
-        return "int"
-    if resolved == "Float":
-        return "float"
-    if resolved.contains("List[String]"):
-        return "list_string"
-    if resolved.contains("List[") or resolved == "List":
-        return "list"
-    if resolved.contains("Map[Int,") or resolved.contains("Map[Int, "):
-        return "map_int"
-    if resolved.contains("Map[") or resolved == "Map":
-        return "map"
-    if resolved.contains("Set[Int]") or resolved.contains("Set[UInt]") or resolved.contains("Set[Int8]") or resolved.contains("Set[Int16]") or resolved.contains("Set[Int32]") or resolved.contains("Set[Int64]") or resolved.contains("Set[UInt8]") or resolved.contains("Set[UInt16]") or resolved.contains("Set[UInt32]") or resolved.contains("Set[UInt64]"):
-        return "set_int"
-    if resolved.contains("Set[") or resolved == "Set":
-        return "set"
-    if resolved.contains("Channel[") or resolved == "Channel":
-        return "channel"
-    if resolved.contains("Task[") or resolved == "Task":
-        return "task"
-    mut base := resolved
-    if base.contains("["):
-        base = base.substring(0, base.index_of("["))
-    if ir_struct_names.contains_key(base):
-        return base
-    return resolved
+    return ir_resolve_type_hint_with_state(type_name, ir_type_aliases, ir_struct_names)
 
 fn ir_resolve_type_node(type_idx: Int) -> String:
     if ir_active_generic_params.len() > 0:
@@ -409,36 +373,7 @@ fn ir_collect_struct_field_strings(root_idx: Int):
                     ir_str(ir_struct_field_name(field_node))
 
 fn ir_retkind(type_name: String) -> String:
-    if type_name.len() == 0:
-        return "unknown"
-    resolved := ir_resolve_type_hint(type_name)
-    if resolved == "int":
-        return "int"
-    if resolved == "float":
-        return "float"
-    if resolved == "bool":
-        return "bool"
-    if resolved == "string":
-        return "string"
-    if resolved == "list":
-        return "list"
-    if resolved == "list_string":
-        return "list_string"
-    if resolved == "map":
-        return "map"
-    if resolved == "map_int":
-        return "map_int"
-    if resolved == "set_int":
-        return "set_int"
-    if resolved == "set":
-        return "set"
-    if resolved == "void":
-        return "void"
-    if resolved == "Mutex" or resolved == "WaitGroup" or resolved == "Semaphore":
-        return "opaque:" + resolved
-    if ir_struct_names.contains_key(resolved):
-        return "struct:" + resolved
-    return resolved
+    return ir_retkind_with_state(type_name, ir_type_aliases, ir_struct_names)
 
 fn ir_is_sync_primitive_name(name: String) -> Bool:
     return name == "Mutex" or name == "WaitGroup" or name == "Semaphore"

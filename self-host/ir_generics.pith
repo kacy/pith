@@ -1,6 +1,7 @@
 # ir_generics.pith - generic function metadata helpers
 
 from ast import get_node, Node
+from ir_type_helpers import ir_resolve_type_hint_with_state, ir_resolve_result_type_kind
 
 pub fn ir_is_fn_decl_kind(kind: String) -> Bool:
     return kind == "fn" or kind == "fn_decl"
@@ -49,3 +50,78 @@ pub fn ir_generic_specialization_name(name: String, type_names: List[String]) ->
     for type_name in type_names:
         suffix_parts.push(ir_sanitize_symbol_part(type_name))
     return name + "__" + suffix_parts.join("_")
+
+pub fn ir_specialize_type_name_with_state(name: String, generic_params: List[String], concrete_types: List[String], type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
+    for generic_param, i in generic_params:
+        if i < concrete_types.len() and generic_param == name:
+            return concrete_types[i]
+    return ir_resolve_type_hint_with_state(name, type_aliases, struct_names)
+
+pub fn ir_resolve_type_node_with_subst_with_state(type_idx: Int, generic_params: List[String], concrete_types: List[String], type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
+    tn := get_node(type_idx)
+    if tn.kind == "type":
+        return ir_resolve_type_hint_with_state(ir_specialize_type_name_with_state(tn.value, generic_params, concrete_types, type_aliases, struct_names), type_aliases, struct_names)
+    if tn.kind == "generic_type":
+        if tn.value == "List":
+            if tn.children.len() > 0:
+                inner := ir_resolve_type_node_with_subst_with_state(tn.children[0], generic_params, concrete_types, type_aliases, struct_names)
+                if inner == "string":
+                    return "list_string"
+            return "list"
+        if tn.value == "Map":
+            if tn.children.len() > 0:
+                key_type := ir_resolve_type_node_with_subst_with_state(tn.children[0], generic_params, concrete_types, type_aliases, struct_names)
+                if key_type == "int":
+                    return "map_int"
+            return "map"
+        if tn.value == "Set":
+            if tn.children.len() > 0:
+                elem_type := ir_resolve_type_node_with_subst_with_state(tn.children[0], generic_params, concrete_types, type_aliases, struct_names)
+                if elem_type == "int":
+                    return "set_int"
+            return "set"
+        return ir_resolve_type_hint_with_state(tn.value, type_aliases, struct_names)
+    if tn.kind == "result_type" and tn.children.len() > 0:
+        inner_type := ir_resolve_type_node_with_subst_with_state(tn.children[0], generic_params, concrete_types, type_aliases, struct_names)
+        return ir_resolve_result_type_kind(inner_type)
+    if tn.kind == "optional_type" and tn.children.len() > 0:
+        return "tuple"
+    if tn.kind == "fn_type":
+        return "closure"
+    if tn.kind == "tuple_type":
+        return "tuple"
+    return ""
+
+pub fn ir_extract_return_type_with_subst_with_state(fn_idx: Int, generic_params: List[String], concrete_types: List[String], type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
+    node := get_node(fn_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(returns_child)
+                if rn.kind == "type" or rn.kind == "generic_type" or rn.kind == "result_type" or rn.kind == "optional_type":
+                    return ir_resolve_type_node_with_subst_with_state(returns_child, generic_params, concrete_types, type_aliases, struct_names)
+    return "unknown"
+
+pub fn ir_extract_optional_inner_type_with_subst_with_state(fn_idx: Int, generic_params: List[String], concrete_types: List[String], type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
+    node := get_node(fn_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(returns_child)
+                if rn.kind == "optional_type" and rn.children.len() > 0:
+                    return ir_resolve_type_node_with_subst_with_state(rn.children[0], generic_params, concrete_types, type_aliases, struct_names)
+    return ""
+
+pub fn ir_extract_param_types_with_subst_with_state(fn_idx: Int, generic_params: List[String], concrete_types: List[String], type_aliases: Map[String, String], struct_names: Map[String, Int]) -> List[String]:
+    node := get_node(fn_idx)
+    mut param_types: List[String] := []
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if cn.children.len() > 0:
+                param_types.push(ir_resolve_type_node_with_subst_with_state(cn.children[0], generic_params, concrete_types, type_aliases, struct_names))
+            else:
+                param_types.push("")
+    return param_types

@@ -53,7 +53,7 @@ from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_
 from ir_control_helpers import IrIfBranch, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
 from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name
 from ir_field_helpers import ir_emit_named_field_access_with_state, ir_emit_tuple_field_access
-from ir_operator_helpers import ir_emit_unary_op, ir_emit_simple_binary
+from ir_operator_helpers import ir_emit_unary_op, ir_emit_simple_binary, ir_is_float_arithmetic, ir_emit_float_binary, ir_binary_simple_ir_op
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -1196,21 +1196,11 @@ fn ir_emit_binary_expr(node: Node) -> Int:
             else:
                 ir_emit("neq " + r.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
             return r
-    if is_float_op and (op == "add" or op == "sub" or op == "mul" or op == "div"):
-        ir_emit("f" + op + " " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+    if is_float_op and ir_is_float_arithmetic(op):
+        ir_emit_float_binary(r, op, left_r, right_r)
         return r
     if op == "add" and is_str_op:
         ir_emit("concat " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
-    elif op == "add" and not is_str_op:
-        ir_emit_simple_binary(r, "add", left_r, right_r)
-    elif op == "sub":
-        ir_emit_simple_binary(r, "sub", left_r, right_r)
-    elif op == "mul":
-        ir_emit_simple_binary(r, "mul", left_r, right_r)
-    elif op == "div":
-        ir_emit_simple_binary(r, "div", left_r, right_r)
-    elif op == "mod":
-        ir_emit_simple_binary(r, "mod", left_r, right_r)
     elif op == "eq":
         if is_str_op:
             ir_emit_call2(r, "__str_eq", "bool", left_r, right_r)
@@ -1220,30 +1210,12 @@ fn ir_emit_binary_expr(node: Node) -> Int:
             ir_emit_simple_binary(r, "eq", left_r, right_r)
     elif op == "neq":
         ir_emit_binary_neq(r, left_r, right_r, is_str_op, is_bytes_op)
-    elif op == "lt":
-        ir_emit_simple_binary(r, "lt", left_r, right_r)
-    elif op == "gt":
-        ir_emit_simple_binary(r, "gt", left_r, right_r)
-    elif op == "lte":
-        ir_emit_simple_binary(r, "lte", left_r, right_r)
-    elif op == "gte":
-        ir_emit_simple_binary(r, "gte", left_r, right_r)
-    elif op == "bit_and":
-        ir_emit_simple_binary(r, "band", left_r, right_r)
-    elif op == "bit_or":
-        ir_emit_simple_binary(r, "bor", left_r, right_r)
-    elif op == "bit_xor":
-        ir_emit_simple_binary(r, "bxor", left_r, right_r)
-    elif op == "shl":
-        ir_emit_simple_binary(r, "shl", left_r, right_r)
-    elif op == "shr":
-        ir_emit_simple_binary(r, "shr", left_r, right_r)
-    elif op == "and":
-        ir_emit_simple_binary(r, "and", left_r, right_r)
-    elif op == "or":
-        ir_emit_simple_binary(r, "or", left_r, right_r)
     else:
-        ir_emit("binop " + r.to_string() + " " + op + " " + left_r.to_string() + " " + right_r.to_string())
+        simple_op := ir_binary_simple_ir_op(op)
+        if simple_op.len() > 0:
+            ir_emit_simple_binary(r, simple_op, left_r, right_r)
+        else:
+            ir_emit("binop " + r.to_string() + " " + op + " " + left_r.to_string() + " " + right_r.to_string())
     return r
 
 fn ir_test_assert_fail():

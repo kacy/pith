@@ -3,6 +3,7 @@
 from ast import get_node
 from ir_names import ir_import_target_name
 from ir_type_helpers import ir_resolve_type_hint_with_state
+from ir_generics import ir_param_name_at, ir_resolve_generic_module_call_name
 from types import get_type_info
 
 fn ir_decode_field_receiver(index_idx: Int, member_name: String) -> String:
@@ -74,6 +75,84 @@ pub fn ir_config_require_full_name_for_type_name_with_state(type_name: String, t
     if resolved == "bool":
         return "std_config_require_bool"
     return ""
+
+pub fn ir_toml_require_full_name_for_type_name_with_state(type_name: String, module_path: String, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
+    resolved := ir_resolve_type_hint_with_state(type_name, type_aliases, struct_names)
+    if resolved == "string":
+        return ir_resolve_generic_module_call_name(module_path, "require_string")
+    if resolved == "int":
+        return ir_resolve_generic_module_call_name(module_path, "require_int")
+    if resolved == "bool":
+        return ir_resolve_generic_module_call_name(module_path, "require_bool")
+    return ""
+
+pub fn ir_is_config_decode_specialization(base_name: String, prefixed: Bool, module_path: String, decl_idx: Int) -> Bool:
+    local_std_config := module_path == "" or module_path == "std/config"
+    first_param := ir_param_name_at(decl_idx, 0)
+    second_param := ir_param_name_at(decl_idx, 1)
+    if prefixed:
+        if base_name == "std_config_decode_prefix":
+            return true
+        return base_name == "decode_prefix" and local_std_config and first_param == "cfg" and second_param == "prefix"
+    if base_name == "std_config_decode":
+        return true
+    return base_name == "decode" and local_std_config and first_param == "cfg"
+
+pub fn ir_is_toml_decode_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
+    local_std_toml := module_path == "" or module_path == "std.toml"
+    first_param := ir_param_name_at(decl_idx, 0)
+    if base_name == "std_toml_decode":
+        return true
+    return base_name == "decode" and local_std_toml and first_param == "handle"
+
+pub fn ir_is_toml_decode_path_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
+    local_std_toml := module_path == "" or module_path == "std.toml"
+    first_param := ir_param_name_at(decl_idx, 0)
+    second_param := ir_param_name_at(decl_idx, 1)
+    if base_name == "std_toml_decode_path":
+        return true
+    return base_name == "decode_path" and local_std_toml and first_param == "handle" and second_param == "dotted_path"
+
+pub fn ir_is_toml_decode_text_path_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
+    local_std_toml := module_path == "" or module_path == "std.toml"
+    first_param := ir_param_name_at(decl_idx, 0)
+    second_param := ir_param_name_at(decl_idx, 1)
+    if base_name == "std_toml_decode_text_path":
+        return true
+    return base_name == "decode_text_path" and local_std_toml and first_param == "input" and second_param == "dotted_path"
+
+pub fn ir_is_toml_decode_text_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
+    local_std_toml := module_path == "" or module_path == "std.toml"
+    first_param := ir_param_name_at(decl_idx, 0)
+    if base_name == "std_toml_decode_text":
+        return true
+    return base_name == "decode_text" and local_std_toml and first_param == "input"
+
+pub fn ir_is_json_decode_object_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
+    local_std_json := module_path == "" or module_path == "std.json"
+    first_param := ir_param_name_at(decl_idx, 0)
+    if base_name == "std_json_decode_object":
+        return true
+    return base_name == "decode_object" and local_std_json and first_param == "handle"
+
+pub fn ir_is_json_decode_specialization(base_name: String, module_path: String, decl_idx: Int, text_input: Bool) -> Bool:
+    local_std_json := module_path == "" or module_path == "std.json"
+    first_param := ir_param_name_at(decl_idx, 0)
+    if text_input:
+        if base_name == "std_json_decode_text":
+            return true
+        return base_name == "decode_text" and local_std_json and first_param == "input"
+    if base_name == "std_json_decode":
+        return true
+    return base_name == "decode" and local_std_json and first_param == "input"
+
+pub fn ir_is_json_decode_path_specialization(base_name: String, module_path: String, decl_idx: Int) -> Bool:
+    local_std_json := module_path == "" or module_path == "std.json"
+    first_param := ir_param_name_at(decl_idx, 0)
+    second_param := ir_param_name_at(decl_idx, 1)
+    if base_name == "std_json_decode_path":
+        return true
+    return base_name == "decode_path" and local_std_json and first_param == "handle" and second_param == "dotted_path"
 
 fn ir_module_alias_member_name_with_state(alias: String, member: String, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> String:
     if not module_aliases.contains_key(alias):

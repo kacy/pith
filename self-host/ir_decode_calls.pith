@@ -2,6 +2,7 @@
 
 from ast import get_node
 from ir_names import ir_import_target_name
+from ir_type_helpers import ir_resolve_type_hint_with_state
 from types import get_type_info
 
 fn ir_decode_field_receiver(index_idx: Int, member_name: String) -> String:
@@ -63,6 +64,16 @@ pub fn ir_is_config_file_decode_callee_with_aliases(index_idx: Int, member_name:
         if module_aliases[recv.value] == "std.config":
             return true
     return recv.value == "config" or recv.value == "config_mod"
+
+pub fn ir_config_require_full_name_for_type_name_with_state(type_name: String, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
+    resolved := ir_resolve_type_hint_with_state(type_name, type_aliases, struct_names)
+    if resolved == "string":
+        return "std_config_require"
+    if resolved == "int":
+        return "std_config_require_int"
+    if resolved == "bool":
+        return "std_config_require_bool"
+    return ""
 
 fn ir_module_alias_member_name_with_state(alias: String, member: String, module_aliases: Map[String, String], import_declared_functions: Map[String, Bool], import_declared_globals: Map[String, Bool]) -> String:
     if not module_aliases.contains_key(alias):

@@ -1,6 +1,7 @@
 # ir_generics.pith - generic function metadata helpers
 
 from ast import get_node, Node
+from ir_names import ir_import_target_name
 from ir_type_helpers import ir_resolve_type_hint_with_state, ir_resolve_result_type_kind
 
 pub fn ir_is_fn_decl_kind(kind: String) -> Bool:
@@ -21,6 +22,37 @@ pub fn ir_collect_generic_param_names(node: Node) -> List[String]:
             names.push(child.value)
         i = i + 1
     return names
+
+pub fn ir_param_name_at(fn_idx: Int, param_index: Int) -> String:
+    node := get_node(fn_idx)
+    mut seen := 0
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if seen == param_index:
+                return cn.value
+            seen = seen + 1
+    return ""
+
+pub fn ir_generic_preferred_name_with_state(preferred: String, fallback: String, generic_decl_indices: Map[String, Int]) -> String:
+    if generic_decl_indices.contains_key(preferred):
+        return preferred
+    return fallback
+
+pub fn ir_json_generic_name_with_state(base_name: String, generic_decl_indices: Map[String, Int]) -> String:
+    return ir_generic_preferred_name_with_state("std_json_" + base_name, base_name, generic_decl_indices)
+
+pub fn ir_config_generic_name_with_state(base_name: String, generic_decl_indices: Map[String, Int]) -> String:
+    return ir_generic_preferred_name_with_state("std_config_" + base_name, base_name, generic_decl_indices)
+
+pub fn ir_resolve_generic_module_call_name(module_path: String, member_name: String) -> String:
+    if module_path.len() > 0:
+        return ir_import_target_name(module_path, member_name)
+    return member_name
+
+pub fn ir_toml_generic_name_with_state(base_name: String, module_path: String, generic_decl_indices: Map[String, Int]) -> String:
+    preferred := ir_resolve_generic_module_call_name(module_path, base_name)
+    return ir_generic_preferred_name_with_state(preferred, base_name, generic_decl_indices)
 
 pub fn ir_encode_type_list(type_names: List[String]) -> String:
     return type_names.join(chr(9))

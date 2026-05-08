@@ -50,7 +50,7 @@ from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_
 from ir_callees import ResolvedCallee, ir_import_declares_function_with_state, ir_import_declares_global_with_state, ir_module_alias_member_name_with_state, ir_plain_method_name, ir_ident_callee_with_state, ir_resolve_module_alias_call_name_with_state, ir_resolve_module_alias_method_call_name_with_state, ir_resolve_static_callee_with_state
 from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_encode_type_list, ir_decode_type_list, ir_generic_specialization_key, ir_generic_specialization_name, ir_specialize_type_name_with_state, ir_resolve_type_node_with_subst_with_state, ir_extract_return_type_with_subst_with_state, ir_extract_optional_inner_type_with_subst_with_state, ir_extract_param_types_with_subst_with_state
 from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_count_with_state, ir_struct_field_name_at_with_state, ir_struct_field_type_name_with_state, ir_struct_field_kind_from_decl_with_state, ir_field_kind_tid_with_state, ir_struct_field_tid_at_with_state, ir_struct_field_default_node_with_state
-from ir_control_helpers import IrIfBranch, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names
+from ir_control_helpers import IrIfBranch, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -5475,19 +5475,10 @@ fn ir_emit_return_stmt(node: Node):
     ir_last_was_ret = true
 
 fn ir_emit_bind_stmt(node: Node):
-    mut name := node.value
-    if name.contains(" mut"):
-        name = name.substring(0, name.len() - 4)
-    elif name.contains(" "):
-        name = name.split(" ")[0]
-    mut val_idx := 0 - 1
-    mut type_idx := 0 - 1
-    for child in node.children:
-        cn := get_node(child)
-        if cn.kind == "type" or cn.kind == "generic_type" or cn.kind == "optional_type":
-            type_idx = child
-        else:
-            val_idx = child
+    parts := ir_collect_bind_parts(node)
+    name := parts.name
+    val_idx := parts.val_idx
+    type_idx := parts.type_idx
     mut target_type := ""
     if type_idx >= 0:
         target_type = ir_resolve_type_node(type_idx)

@@ -10,6 +10,11 @@ pub struct IrForBindingNames:
     value_name: String
     index_name: String
 
+pub struct IrBindParts:
+    name: String
+    val_idx: Int
+    type_idx: Int
+
 pub fn ir_stmt_is_expr(kind: String) -> Bool:
     if kind == "call" or kind == "method_call" or kind == "spawn":
         return true
@@ -41,3 +46,22 @@ pub fn ir_for_binding_names(node: Node) -> IrForBindingNames:
         if parts.len() > 1:
             index_name = parts[1].trim()
     return IrForBindingNames(value_name, index_name)
+
+pub fn ir_bind_stmt_name(raw_name: String) -> String:
+    mut name := raw_name
+    if name.contains(" mut"):
+        name = name.substring(0, name.len() - 4)
+    elif name.contains(" "):
+        name = name.split(" ")[0]
+    return name
+
+pub fn ir_collect_bind_parts(node: Node) -> IrBindParts:
+    mut val_idx := 0 - 1
+    mut type_idx := 0 - 1
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "type" or cn.kind == "generic_type" or cn.kind == "optional_type":
+            type_idx = child
+        else:
+            val_idx = child
+    return IrBindParts(ir_bind_stmt_name(node.value), val_idx, type_idx)

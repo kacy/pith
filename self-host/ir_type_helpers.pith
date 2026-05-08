@@ -143,6 +143,26 @@ pub fn ir_type_from_tid(tid: Int) -> String:
         return "task"
     return ""
 
+pub fn ir_list_element_kind(expr_idx: Int) -> String:
+    tid := c_get_expr_type(expr_idx)
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "list":
+            kind := ir_type_from_tid(info.inner)
+            if kind.len() > 0:
+                return kind
+    return "unknown"
+
+pub fn ir_function_return_kind(expr_idx: Int) -> String:
+    tid := c_get_expr_type(expr_idx)
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "function":
+            kind := ir_type_from_tid(info.return_type)
+            if kind.len() > 0:
+                return kind
+    return "unknown"
+
 pub fn ir_checked_type(idx: Int) -> String:
     return ir_type_from_tid(c_get_expr_type(idx))
 

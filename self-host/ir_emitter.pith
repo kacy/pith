@@ -45,10 +45,10 @@ from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emi
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
-from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type
+from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type, ir_list_element_kind, ir_function_return_kind
 from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_toml_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_resolve_decode_call_name_with_state, ir_json_field_helper_name, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_config_require_helper_name, ir_toml_require_helper_name, ir_struct_decode_field_tid, ir_json_field_type_tag, ir_optional_inner_tid
 from ir_callees import ResolvedCallee, ir_import_declares_function_with_state, ir_import_declares_global_with_state, ir_module_alias_member_name_with_state, ir_plain_method_name, ir_ident_callee_with_state, ir_resolve_module_alias_call_name_with_state, ir_resolve_module_alias_method_call_name_with_state, ir_resolve_static_callee_with_state
-from ir_call_helpers import ir_is_declared_callable_with_state, ir_emit_call_text_with_state, ir_join_arg_regs, ir_method_call_arg_regs
+from ir_call_helpers import ir_is_declared_callable_with_state, ir_emit_call_text_with_state, ir_join_arg_regs, ir_method_call_arg_regs, ir_call_arg_expr_index
 from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_encode_type_list, ir_decode_type_list, ir_generic_specialization_key, ir_generic_specialization_name, ir_specialize_type_name_with_state, ir_resolve_type_node_with_subst_with_state, ir_extract_return_type_with_subst_with_state, ir_extract_optional_inner_type_with_subst_with_state, ir_extract_param_types_with_subst_with_state
 from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_count_with_state, ir_struct_field_name_at_with_state, ir_struct_field_type_name_with_state, ir_struct_field_kind_from_decl_with_state, ir_field_kind_tid_with_state, ir_struct_field_tid_at_with_state, ir_struct_field_default_node_with_state
 from ir_control_helpers import IrIfBranch, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
@@ -484,32 +484,6 @@ fn ir_emit_call3(result_reg: Int, fname: String, ret_type: String, arg0: Int, ar
 
 fn ir_temp_name(prefix: String) -> String:
     return prefix + "_" + ir_label()
-
-fn ir_list_element_kind(expr_idx: Int) -> String:
-    tid := c_get_expr_type(expr_idx)
-    if tid >= 0:
-        info := get_type_info(tid)
-        if info.kind == "list":
-            kind := ir_type_from_tid(info.inner)
-            if kind.len() > 0:
-                return kind
-    return "unknown"
-
-fn ir_function_return_kind(expr_idx: Int) -> String:
-    tid := c_get_expr_type(expr_idx)
-    if tid >= 0:
-        info := get_type_info(tid)
-        if info.kind == "function":
-            kind := ir_type_from_tid(info.return_type)
-            if kind.len() > 0:
-                return kind
-    return "unknown"
-
-fn ir_call_arg_expr_index(arg_idx: Int) -> Int:
-    arg_node := get_node(arg_idx)
-    if arg_node.kind == "arg" and arg_node.children.len() > 0:
-        return arg_node.children[0]
-    return arg_idx
 
 fn ir_declared_callable_ir_retkind(fname: String) -> String:
     if not ir_func_returns.contains_key(fname):

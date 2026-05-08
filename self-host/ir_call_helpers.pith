@@ -3,6 +3,7 @@
 from ir_builder import ir_emit
 from ir_metadata import ir_runtime_call_name
 from ir_type_helpers import ir_retkind_with_state
+from ast import get_node
 
 pub fn ir_is_declared_callable_with_state(name: String, func_returns: Map[String, String]) -> Bool:
     return func_returns.contains_key(name)
@@ -27,3 +28,9 @@ pub fn ir_method_call_arg_regs(obj_r: Int, arg_regs: List[Int]) -> List[Int]:
     for arg_reg in arg_regs:
         call_args.push(arg_reg)
     return call_args
+
+pub fn ir_call_arg_expr_index(arg_idx: Int) -> Int:
+    arg_node := get_node(arg_idx)
+    if arg_node.kind == "arg" and arg_node.children.len() > 0:
+        return arg_node.children[0]
+    return arg_idx

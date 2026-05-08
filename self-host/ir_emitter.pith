@@ -52,6 +52,7 @@ from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_ge
 from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_count_with_state, ir_struct_field_name_at_with_state, ir_struct_field_type_name_with_state, ir_struct_field_kind_from_decl_with_state, ir_field_kind_tid_with_state, ir_struct_field_tid_at_with_state, ir_struct_field_default_node_with_state
 from ir_control_helpers import IrIfBranch, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
 from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name
+from ir_field_helpers import ir_emit_named_field_access_with_state, ir_emit_tuple_field_access
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -4380,68 +4381,8 @@ fn ir_emit_tuple_literal(node: Node) -> Int:
 fn ir_field_lookup_key(recv_idx: Int, field_name: String) -> String:
     return ir_field_receiver_type(recv_idx) + "." + field_name
 
-fn ir_unique_field_offset(field_name: String) -> Int:
-    keys := ir_struct_field_index_lookup.keys()
-    mut matched := false
-    mut offset := 0
-    for key in keys:
-        if key.ends_with("." + field_name):
-            next_offset := ir_unpack_field_index(ir_struct_field_index_lookup[key]) * 8
-            if not matched:
-                matched = true
-                offset = next_offset
-            elif offset != next_offset:
-                return 0 - 1
-            continue
-    if not matched:
-        return 0 - 1
-    return offset
-
-fn ir_unique_field_kind(field_name: String) -> String:
-    keys := ir_struct_field_lookup.keys()
-    mut matched := false
-    mut field_kind := "unknown"
-    for key in keys:
-        if key.ends_with("." + field_name):
-            next_kind := ir_retkind(ir_struct_field_lookup[key])
-            if not matched:
-                matched = true
-                field_kind = next_kind
-            elif field_kind != next_kind:
-                return "unknown"
-            continue
-    return field_kind
-
 fn ir_emit_named_field_access(result_reg: Int, obj_r: Int, lookup_key: String, field_name: String, field_kind_override: String):
-    if ir_struct_field_index_lookup.contains_key(lookup_key):
-        field_offset := ir_unpack_field_index(ir_struct_field_index_lookup[lookup_key]) * 8
-        mut field_kind := "unknown"
-        if field_kind_override.len() > 0:
-            field_kind = field_kind_override
-        elif ir_struct_field_lookup.contains_key(lookup_key):
-            field_kind = ir_retkind(ir_struct_field_lookup[lookup_key])
-        ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_offset.to_string() + " " + field_kind + " " + field_name)
-    else:
-        unique_offset := ir_unique_field_offset(field_name)
-        if unique_offset >= 0:
-            ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + unique_offset.to_string() + " " + ir_unique_field_kind(field_name) + " " + field_name)
-        else:
-            ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_name)
-
-fn ir_emit_tuple_field_access(result_reg: Int, obj_r: Int, recv_idx: Int, field_name: String) -> Bool:
-    recv_tid := c_get_expr_type(recv_idx)
-    if recv_tid < 0:
-        return false
-    recv_info := get_type_info(recv_tid)
-    if recv_info.kind != "tuple":
-        return false
-    field_index := ir_parse_field_index(field_name)
-    if field_index < 0 or field_index >= recv_info.elements.len():
-        return false
-    field_tid := recv_info.elements[field_index]
-    field_offset := field_index * 8
-    ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_offset.to_string() + " " + ir_type_from_tid(field_tid) + " " + field_name)
-    return true
+    ir_emit_named_field_access_with_state(result_reg, obj_r, lookup_key, field_name, field_kind_override, ir_struct_field_index_lookup, ir_struct_field_lookup, ir_type_aliases, ir_struct_names)
 
 fn ir_emit_field_access(idx: Int, node: Node) -> Int:
     fname := node_value(idx)

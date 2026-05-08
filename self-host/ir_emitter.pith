@@ -53,6 +53,7 @@ from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_
 from ir_control_helpers import IrIfBranch, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
 from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name
 from ir_field_helpers import ir_emit_named_field_access_with_state, ir_emit_tuple_field_access
+from ir_operator_helpers import ir_emit_unary_op, ir_emit_simple_binary
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -1141,20 +1142,7 @@ fn ir_append_deferred_lambda_body():
 
 fn ir_emit_unary_expr(node: Node) -> Int:
     operand_r := ir_expr(node.children[0])
-    r := ir_reg()
-    if node.value == "not" or node.value == "!" or node.value == "not_op":
-        one := ir_reg()
-        ir_emit("iconst " + one.to_string() + " 1")
-        ir_emit("sub " + r.to_string() + " " + one.to_string() + " " + operand_r.to_string())
-    elif node.value == "neg" or node.value == "-" or node.value == "negate":
-        zero := ir_reg()
-        ir_emit("iconst " + zero.to_string() + " 0")
-        ir_emit("sub " + r.to_string() + " " + zero.to_string() + " " + operand_r.to_string())
-    elif node.value == "bit_not" or node.value == "~":
-        ir_emit("bnot " + r.to_string() + " " + operand_r.to_string())
-    else:
-        ir_emit("iconst " + r.to_string() + " 0")
-    return r
+    return ir_emit_unary_op(node.value, operand_r)
 
 fn ir_emit_binary_neq(result_reg: Int, left_r: Int, right_r: Int, is_str_op: Bool, is_bytes_op: Bool):
     if is_str_op:
@@ -1172,9 +1160,6 @@ fn ir_emit_binary_neq(result_reg: Int, left_r: Int, right_r: Int, is_str_op: Boo
         ir_emit("sub " + result_reg.to_string() + " " + one_r.to_string() + " " + eq_r.to_string())
         return
     ir_emit("neq " + result_reg.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
-
-fn ir_emit_simple_binary(result_reg: Int, op: String, left_r: Int, right_r: Int):
-    ir_emit(op + " " + result_reg.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
 
 fn ir_emit_binary_expr(node: Node) -> Int:
     left_r := ir_expr(node.children[0])

@@ -1,0 +1,22 @@
+# ir_operator_helpers.pith - low-level operator IR emission helpers
+
+from ir_builder import ir_emit, ir_reg
+
+pub fn ir_emit_unary_op(op: String, operand_r: Int) -> Int:
+    r := ir_reg()
+    if op == "not" or op == "!" or op == "not_op":
+        one := ir_reg()
+        ir_emit("iconst " + one.to_string() + " 1")
+        ir_emit("sub " + r.to_string() + " " + one.to_string() + " " + operand_r.to_string())
+    elif op == "neg" or op == "-" or op == "negate":
+        zero := ir_reg()
+        ir_emit("iconst " + zero.to_string() + " 0")
+        ir_emit("sub " + r.to_string() + " " + zero.to_string() + " " + operand_r.to_string())
+    elif op == "bit_not" or op == "~":
+        ir_emit("bnot " + r.to_string() + " " + operand_r.to_string())
+    else:
+        ir_emit("iconst " + r.to_string() + " 0")
+    return r
+
+pub fn ir_emit_simple_binary(result_reg: Int, op: String, left_r: Int, right_r: Int):
+    ir_emit(op + " " + result_reg.to_string() + " " + left_r.to_string() + " " + right_r.to_string())

@@ -1,0 +1,17 @@
+# ir_call_helpers.pith - shared call-line emission helpers
+
+from ir_builder import ir_emit
+from ir_metadata import ir_runtime_call_name
+from ir_type_helpers import ir_retkind_with_state
+
+pub fn ir_is_declared_callable_with_state(name: String, func_returns: Map[String, String]) -> Bool:
+    return func_returns.contains_key(name)
+
+pub fn ir_emit_call_text_with_state(result_reg: Int, fname: String, ret_type: String, arg_count: Int, arg_text: String, func_returns: Map[String, String], type_aliases: Map[String, String], struct_names: Map[String, Int]):
+    mut emit_name := fname
+    if not ir_is_declared_callable_with_state(fname, func_returns):
+        emit_name = ir_runtime_call_name(fname)
+    mut call_line := "call " + result_reg.to_string() + " " + emit_name + " " + ir_retkind_with_state(ret_type, type_aliases, struct_names) + " " + arg_count.to_string()
+    if arg_text.len() > 0:
+        call_line = call_line + arg_text
+    ir_emit(call_line)

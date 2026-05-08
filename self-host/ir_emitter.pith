@@ -35,7 +35,7 @@
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
 from checker import c_get_expr_type
 from types import TypeInfo, get_type_info
-from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_runtime_call_name, ir_method_emit_name
+from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
@@ -48,6 +48,7 @@ from ir_tree_cache import ir_cached_string_nodes, ir_root_items
 from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type
 from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_toml_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_resolve_decode_call_name_with_state, ir_json_field_helper_name, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_config_require_helper_name, ir_toml_require_helper_name, ir_struct_decode_field_tid, ir_json_field_type_tag, ir_optional_inner_tid
 from ir_callees import ResolvedCallee, ir_import_declares_function_with_state, ir_import_declares_global_with_state, ir_module_alias_member_name_with_state, ir_plain_method_name, ir_ident_callee_with_state, ir_resolve_module_alias_call_name_with_state, ir_resolve_module_alias_method_call_name_with_state, ir_resolve_static_callee_with_state
+from ir_call_helpers import ir_is_declared_callable_with_state, ir_emit_call_text_with_state
 from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_encode_type_list, ir_decode_type_list, ir_generic_specialization_key, ir_generic_specialization_name, ir_specialize_type_name_with_state, ir_resolve_type_node_with_subst_with_state, ir_extract_return_type_with_subst_with_state, ir_extract_optional_inner_type_with_subst_with_state, ir_extract_param_types_with_subst_with_state
 from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_count_with_state, ir_struct_field_name_at_with_state, ir_struct_field_type_name_with_state, ir_struct_field_kind_from_decl_with_state, ir_field_kind_tid_with_state, ir_struct_field_tid_at_with_state, ir_struct_field_default_node_with_state
 from ir_control_helpers import IrIfBranch, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
@@ -388,19 +389,13 @@ fn ir_is_sync_primitive_name(name: String) -> Bool:
     return name == "Mutex" or name == "WaitGroup" or name == "Semaphore"
 
 fn ir_is_declared_callable(name: String) -> Bool:
-    return ir_func_returns.contains_key(name)
+    return ir_is_declared_callable_with_state(name, ir_func_returns)
 
 fn ir_emit_func_header(name: String, param_count: Int, ret_type: String):
     ir_emit("func " + name + " " + param_count.to_string() + " " + ir_retkind(ret_type))
 
 fn ir_emit_call_text(result_reg: Int, fname: String, ret_type: String, arg_count: Int, arg_text: String):
-    mut emit_name := fname
-    if not ir_is_declared_callable(fname):
-        emit_name = ir_runtime_call_name(fname)
-    mut call_line := "call " + result_reg.to_string() + " " + emit_name + " " + ir_retkind(ret_type) + " " + arg_count.to_string()
-    if arg_text.len() > 0:
-        call_line = call_line + arg_text
-    ir_emit(call_line)
+    ir_emit_call_text_with_state(result_reg, fname, ret_type, arg_count, arg_text, ir_func_returns, ir_type_aliases, ir_struct_names)
 
 fn ir_emit_call0(result_reg: Int, fname: String, ret_type: String):
     ir_emit_call_text(result_reg, fname, ret_type, 0, "")

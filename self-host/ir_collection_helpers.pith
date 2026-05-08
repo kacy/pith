@@ -1,0 +1,22 @@
+# ir_collection_helpers.pith - collection literal metadata helpers
+
+from ast import get_node, Node
+
+pub fn ir_map_uses_int_keys(node: Node) -> Bool:
+    if node.children.len() == 0:
+        return false
+    first_entry := get_node(node.children[0])
+    if first_entry.kind != "entry" or first_entry.children.len() == 0:
+        return false
+    key_node := get_node(first_entry.children[0])
+    return key_node.kind == "int_lit" or key_node.kind == "int"
+
+pub fn ir_set_new_name(literal_type: String) -> String:
+    if literal_type == "set_int":
+        return "__set_new_int"
+    return "__set_new"
+
+pub fn ir_set_add_name(literal_type: String) -> String:
+    if literal_type == "set_int":
+        return "set_add_int"
+    return "set_add"

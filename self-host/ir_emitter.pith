@@ -50,6 +50,7 @@ from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_
 from ir_callees import ResolvedCallee, ir_import_declares_function_with_state, ir_import_declares_global_with_state, ir_module_alias_member_name_with_state, ir_plain_method_name, ir_ident_callee_with_state, ir_resolve_module_alias_call_name_with_state, ir_resolve_module_alias_method_call_name_with_state, ir_resolve_static_callee_with_state
 from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_encode_type_list, ir_decode_type_list, ir_generic_specialization_key, ir_generic_specialization_name, ir_specialize_type_name_with_state, ir_resolve_type_node_with_subst_with_state, ir_extract_return_type_with_subst_with_state, ir_extract_optional_inner_type_with_subst_with_state, ir_extract_param_types_with_subst_with_state
 from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_count_with_state, ir_struct_field_name_at_with_state, ir_struct_field_type_name_with_state, ir_struct_field_kind_from_decl_with_state, ir_field_kind_tid_with_state, ir_struct_field_tid_at_with_state, ir_struct_field_default_node_with_state
+from ir_control_helpers import IrIfBranch, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -5449,25 +5450,6 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
     ir_emit("iconst " + r.to_string() + " 0")
     return r
 
-fn ir_stmt_is_expr(kind: String) -> Bool:
-    if kind == "call" or kind == "method_call" or kind == "spawn":
-        return true
-    if kind == "await" or kind == "try" or kind == "try_expr":
-        return true
-    if kind == "catch_expr":
-        return true
-    if kind == "select_expr":
-        return true
-    return kind == "fail"
-
-struct IfBranch:
-    cond_idx: Int
-    body_idx: Int
-
-struct ForBindingNames:
-    value_name: String
-    index_name: String
-
 fn ir_emit_return_stmt(node: Node):
     if node.children.len() > 0:
         mut r := ir_expr(node.children[0])
@@ -5561,18 +5543,7 @@ fn ir_emit_compound_assignment(node: Node):
             ir_emit("div " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
         ir_emit("store " + ir_resolve_storage_name(name) + " " + res.to_string())
 
-fn ir_collect_if_branch(node: Node) -> IfBranch:
-    mut cond_idx := 0 - 1
-    mut body_idx := 0 - 1
-    for child in node.children:
-        cn := get_node(child)
-        if cond_idx < 0 and cn.kind != "then" and cn.kind != "else" and cn.kind != "elif" and cn.kind != "block":
-            cond_idx = child
-        elif cn.kind == "then" or cn.kind == "block":
-            body_idx = child
-    return IfBranch(cond_idx, body_idx)
-
-fn ir_emit_if_branch(branch: IfBranch, then_label: String, next_label: String, end_label: String):
+fn ir_emit_if_branch(branch: IrIfBranch, then_label: String, next_label: String, end_label: String):
     if branch.cond_idx >= 0:
         cr := ir_expr(branch.cond_idx)
         ir_emit("brif " + cr.to_string() + " " + then_label + " " + next_label)
@@ -5583,16 +5554,6 @@ fn ir_emit_if_branch(branch: IfBranch, then_label: String, next_label: String, e
     if not ir_last_was_ret:
         ir_emit("jmp " + end_label)
     ir_emit("label " + next_label)
-
-fn ir_for_binding_names(node: Node) -> ForBindingNames:
-    mut value_name := node.value
-    mut index_name := ""
-    if value_name.contains(","):
-        parts := value_name.split(",")
-        value_name = parts[0].trim()
-        if parts.len() > 1:
-            index_name = parts[1].trim()
-    return ForBindingNames(value_name, index_name)
 
 fn ir_is_string_iter_expr(iter_idx: Int) -> Bool:
     iter_node := get_node(iter_idx)

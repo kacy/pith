@@ -17,3 +17,12 @@ pub fn ir_optional_value_field(obj_r: Int, opt_tid: Int) -> Int:
     r := ir_reg()
     ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 8 " + ir_type_from_tid(info.inner) + " value")
     return r
+
+pub fn ir_emit_optional_none_compare(result_reg: Int, op: String, optional_r: Int):
+    flag_r := ir_optional_flag_field(optional_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    if op == "eq":
+        ir_emit("eq " + result_reg.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
+    else:
+        ir_emit("neq " + result_reg.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())

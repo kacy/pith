@@ -41,7 +41,7 @@ from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_fun
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field
-from ir_optionals import ir_optional_flag_field, ir_optional_value_field
+from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
@@ -1179,22 +1179,10 @@ fn ir_emit_binary_expr(node: Node) -> Int:
     is_float_op := left_type == "float" or right_type == "float"
     if op == "eq" or op == "neq":
         if left_node.kind == "none_lit" and right_info.kind == "optional":
-            flag_r := ir_optional_flag_field(right_r)
-            zero_r := ir_reg()
-            ir_emit("iconst " + zero_r.to_string() + " 0")
-            if op == "eq":
-                ir_emit("eq " + r.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
-            else:
-                ir_emit("neq " + r.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
+            ir_emit_optional_none_compare(r, op, right_r)
             return r
         if right_node.kind == "none_lit" and left_info.kind == "optional":
-            flag_r := ir_optional_flag_field(left_r)
-            zero_r := ir_reg()
-            ir_emit("iconst " + zero_r.to_string() + " 0")
-            if op == "eq":
-                ir_emit("eq " + r.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
-            else:
-                ir_emit("neq " + r.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
+            ir_emit_optional_none_compare(r, op, left_r)
             return r
     if is_float_op and ir_is_float_arithmetic(op):
         ir_emit_float_binary(r, op, left_r, right_r)

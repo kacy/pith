@@ -15,3 +15,15 @@ pub fn ir_emit_call_text_with_state(result_reg: Int, fname: String, ret_type: St
     if arg_text.len() > 0:
         call_line = call_line + arg_text
     ir_emit(call_line)
+
+pub fn ir_join_arg_regs(arg_regs: List[Int]) -> String:
+    mut call_text := ""
+    for arg_reg in arg_regs:
+        call_text = call_text + " " + arg_reg.to_string()
+    return call_text
+
+pub fn ir_method_call_arg_regs(obj_r: Int, arg_regs: List[Int]) -> List[Int]:
+    mut call_args := [obj_r]
+    for arg_reg in arg_regs:
+        call_args.push(arg_reg)
+    return call_args

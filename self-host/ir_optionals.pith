@@ -1,0 +1,19 @@
+# ir_optionals.pith - low-level optional IR helpers
+
+from ir_builder import ir_emit, ir_reg
+from ir_result_abi import ir_zero_reg
+from ir_type_helpers import ir_type_from_tid
+from types import get_type_info
+
+pub fn ir_optional_flag_field(obj_r: Int) -> Int:
+    r := ir_reg()
+    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 0 bool is_some")
+    return r
+
+pub fn ir_optional_value_field(obj_r: Int, opt_tid: Int) -> Int:
+    info := get_type_info(opt_tid)
+    if info.kind != "optional" or info.inner < 0:
+        return ir_zero_reg()
+    r := ir_reg()
+    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 8 " + ir_type_from_tid(info.inner) + " value")
+    return r

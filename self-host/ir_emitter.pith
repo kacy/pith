@@ -41,6 +41,7 @@ from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_fun
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field
+from ir_optionals import ir_optional_flag_field, ir_optional_value_field
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
@@ -958,19 +959,6 @@ fn ir_lookup_name_type(name: String) -> String:
     if ir_global_bool_names.contains(name):
         return "bool"
     return ""
-
-fn ir_optional_flag_field(obj_r: Int) -> Int:
-    r := ir_reg()
-    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 0 bool is_some")
-    return r
-
-fn ir_optional_value_field(obj_r: Int, opt_tid: Int) -> Int:
-    info := get_type_info(opt_tid)
-    if info.kind != "optional" or info.inner < 0:
-        return ir_zero_reg()
-    r := ir_reg()
-    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 8 " + ir_type_from_tid(info.inner) + " value")
-    return r
 
 fn ir_emit_optional_tuple(flag_r: Int, value_r: Int) -> Int:
     tuple_r := ir_reg()

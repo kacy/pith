@@ -20,3 +20,27 @@ pub fn ir_set_add_name(literal_type: String) -> String:
     if literal_type == "set_int":
         return "set_add_int"
     return "set_add"
+
+pub fn ir_lookup_map_value_type_for_expr_with_state(idx: Int, map_value_types: Map[String, String]) -> String:
+    node := get_node(idx)
+    if node.kind == "ident" and map_value_types.contains_key(node.value):
+        return map_value_types[node.value]
+    return ""
+
+pub fn ir_index_get_call_name(obj_type: String) -> String:
+    if obj_type == "string":
+        return "char_at"
+    if obj_type == "bytes":
+        return "bytes_get"
+    if obj_type == "map_int":
+        return "map_get_ikey"
+    if obj_type == "map":
+        return "map_get"
+    return "__list_get"
+
+pub fn ir_index_set_call_name(obj_type: String) -> String:
+    if obj_type == "map_int":
+        return "map_insert_ikey"
+    if obj_type == "map":
+        return "map_insert"
+    return "pith_list_set_value"

@@ -58,3 +58,35 @@ pub fn ir_for_loop_item_return_kind(item_kind: String) -> String:
     if item_kind == "int":
         return "int"
     return "unknown"
+
+pub fn ir_for_iter_item_kind(iter_type: String) -> String:
+    if iter_type == "string":
+        return "char"
+    if iter_type == "list_string":
+        return "string"
+    if iter_type == "map" or iter_type == "set":
+        return "string"
+    if iter_type == "map_int" or iter_type == "set_int":
+        return "int"
+    return "unknown"
+
+pub fn ir_for_iter_conversion_call(iter_type: String) -> String:
+    if iter_type == "map" or iter_type == "map_int":
+        return "map_keys"
+    if iter_type == "set":
+        return "__set_to_list"
+    if iter_type == "set_int":
+        return "__set_to_list_int"
+    return ""
+
+pub fn ir_for_iter_conversion_return_kind(iter_type: String) -> String:
+    if iter_type == "map" or iter_type == "set":
+        return "list_string"
+    if iter_type == "map_int" or iter_type == "set_int":
+        return "list"
+    return ""
+
+pub fn ir_for_len_call_name(item_kind: String) -> String:
+    if item_kind == "char":
+        return "string_len"
+    return "len"

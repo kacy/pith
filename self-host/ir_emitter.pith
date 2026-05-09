@@ -54,7 +54,7 @@ from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_
 from ir_control_helpers import IrIfBranch, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
 from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name, ir_lookup_map_value_type_for_expr_with_state, ir_index_get_call_name, ir_index_set_call_name
 from ir_field_helpers import ir_emit_named_field_access_with_state, ir_emit_tuple_field_access
-from ir_operator_helpers import ir_emit_unary_op, ir_emit_simple_binary, ir_is_float_arithmetic, ir_emit_float_binary, ir_binary_simple_ir_op
+from ir_operator_helpers import ir_emit_unary_op, ir_emit_simple_binary, ir_is_float_arithmetic, ir_emit_float_binary, ir_binary_simple_ir_op, ir_compound_assignment_ir_op
 
 # --- current function locals ---
 mut ir_var_regs: Map[String, Int] := {}
@@ -5226,21 +5226,15 @@ fn ir_emit_compound_assignment(node: Node):
         r := ir_emit_value_for_target(node.children[1], target_type)
         ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
         return
-    if (op == "+=" or op == "-=" or op == "*=" or op == "/=") and node.children.len() >= 2:
+    compound_op := ir_compound_assignment_ir_op(op)
+    if compound_op.len() > 0 and node.children.len() >= 2:
         tn := get_node(node.children[0])
         name := tn.value
         cur := ir_reg()
         ir_emit("load " + cur.to_string() + " " + ir_resolve_storage_name(name))
         rhs := ir_expr(node.children[1])
         res := ir_reg()
-        if op == "+=":
-            ir_emit("add " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
-        elif op == "-=":
-            ir_emit("sub " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
-        elif op == "*=":
-            ir_emit("mul " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
-        elif op == "/=":
-            ir_emit("div " + res.to_string() + " " + cur.to_string() + " " + rhs.to_string())
+        ir_emit_simple_binary(res, compound_op, cur, rhs)
         ir_emit("store " + ir_resolve_storage_name(name) + " " + res.to_string())
 
 fn ir_emit_if_branch(branch: IrIfBranch, then_label: String, next_label: String, end_label: String):

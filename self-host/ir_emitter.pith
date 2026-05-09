@@ -1232,22 +1232,14 @@ fn ir_config_generic_name(base_name: String) -> String:
 fn ir_toml_generic_name(base_name: String, module_path: String) -> String:
     return ir_toml_generic_name_with_state(base_name, module_path, ir_generic_decl_indices)
 
-fn ir_emit_json_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid: Int, index_idx: Int) -> Int:
+fn ir_emit_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid: Int, require_name: String, decode_name: String, temp_prefix: String) -> Int:
     child_result_r := ir_reg()
-    ir_emit_call2(child_result_r, ir_resolve_json_call_name(index_idx, "object_require_object"), "tuple", parent_handle_r, key_r)
-    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
-    child_ok_l := ir_label()
-    child_err_l := ir_label()
+    ir_emit_call2(child_result_r, require_name, "tuple", parent_handle_r, key_r)
     done_l := ir_label()
-    temp_name := ir_new_temp_name("json_nested_decode")
+    temp_name := ir_new_temp_name(temp_prefix)
     ir_var_types.insert(temp_name, "tuple")
-    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
-    ir_emit("label " + child_err_l)
-    ir_emit("store " + temp_name + " " + child_result_r.to_string())
-    ir_emit("jmp " + done_l)
-    ir_emit("label " + child_ok_l)
+    ir_emit_result_or_jump(child_result_r, temp_name, done_l)
     child_handle_r := ir_emit_result_value_field(child_result_r, lookup_type_id("Int"), "ok")
-    decode_name := ir_generic_preferred_name(ir_resolve_json_call_name(index_idx, "decode_object"), "decode_object")
     decode_result_r := ir_reg()
     ir_emit_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", child_handle_r)
     ir_emit("store " + temp_name + " " + decode_result_r.to_string())
@@ -1255,6 +1247,10 @@ fn ir_emit_json_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid:
     result_r := ir_reg()
     ir_emit("load " + result_r.to_string() + " " + temp_name)
     return result_r
+
+fn ir_emit_json_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid: Int, index_idx: Int) -> Int:
+    decode_name := ir_generic_preferred_name(ir_resolve_json_call_name(index_idx, "decode_object"), "decode_object")
+    return ir_emit_nested_decode_path(parent_handle_r, key_r, target_tid, ir_resolve_json_call_name(index_idx, "object_require_object"), decode_name, "json_nested_decode")
 
 fn ir_emit_config_nested_decode_prefix(cfg_r: Int, prefix_r: Int, target_tid: Int, index_idx: Int) -> Int:
     decode_name := ir_generic_preferred_name(ir_resolve_config_call_name(index_idx, "decode_prefix"), "decode_prefix")
@@ -1269,52 +1265,12 @@ fn ir_emit_config_nested_decode_prefix_specialized(cfg_r: Int, prefix_r: Int, ta
     return result_r
 
 fn ir_emit_toml_nested_decode_path(handle_r: Int, key_r: Int, target_tid: Int, index_idx: Int) -> Int:
-    child_result_r := ir_reg()
-    ir_emit_call2(child_result_r, ir_resolve_toml_call_name(index_idx, "toml_require_table"), "tuple", handle_r, key_r)
-    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
-    child_ok_l := ir_label()
-    child_err_l := ir_label()
-    done_l := ir_label()
-    temp_name := ir_new_temp_name("toml_nested_decode")
-    ir_var_types.insert(temp_name, "tuple")
-    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
-    ir_emit("label " + child_err_l)
-    ir_emit("store " + temp_name + " " + child_result_r.to_string())
-    ir_emit("jmp " + done_l)
-    ir_emit("label " + child_ok_l)
-    child_handle_r := ir_emit_result_value_field(child_result_r, lookup_type_id("Int"), "ok")
     decode_name := ir_generic_preferred_name(ir_resolve_toml_call_name(index_idx, "decode"), "decode")
-    decode_result_r := ir_reg()
-    ir_emit_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", child_handle_r)
-    ir_emit("store " + temp_name + " " + decode_result_r.to_string())
-    ir_emit("label " + done_l)
-    result_r := ir_reg()
-    ir_emit("load " + result_r.to_string() + " " + temp_name)
-    return result_r
+    return ir_emit_nested_decode_path(handle_r, key_r, target_tid, ir_resolve_toml_call_name(index_idx, "toml_require_table"), decode_name, "toml_nested_decode")
 
 fn ir_emit_toml_nested_decode_path_specialized(handle_r: Int, key_r: Int, target_tid: Int, module_path: String) -> Int:
-    child_result_r := ir_reg()
-    ir_emit_call2(child_result_r, ir_resolve_generic_module_call_name(module_path, "toml_require_table"), "tuple", handle_r, key_r)
-    child_ok_r := ir_emit_result_flag_field(child_result_r, "is_ok")
-    child_ok_l := ir_label()
-    child_err_l := ir_label()
-    done_l := ir_label()
-    temp_name := ir_new_temp_name("toml_nested_decode")
-    ir_var_types.insert(temp_name, "tuple")
-    ir_emit("brif " + child_ok_r.to_string() + " " + child_ok_l + " " + child_err_l)
-    ir_emit("label " + child_err_l)
-    ir_emit("store " + temp_name + " " + child_result_r.to_string())
-    ir_emit("jmp " + done_l)
-    ir_emit("label " + child_ok_l)
-    child_handle_r := ir_emit_result_value_field(child_result_r, lookup_type_id("Int"), "ok")
     decode_name := ir_toml_generic_name("decode", module_path)
-    decode_result_r := ir_reg()
-    ir_emit_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", child_handle_r)
-    ir_emit("store " + temp_name + " " + decode_result_r.to_string())
-    ir_emit("label " + done_l)
-    result_r := ir_reg()
-    ir_emit("load " + result_r.to_string() + " " + temp_name)
-    return result_r
+    return ir_emit_nested_decode_path(handle_r, key_r, target_tid, ir_resolve_generic_module_call_name(module_path, "toml_require_table"), decode_name, "toml_nested_decode")
 
 fn ir_emit_json_field_ok(result_r: Int, field_tid: Int) -> Int:
     ok_r := ir_reg()
@@ -3102,21 +3058,8 @@ fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool) -> Int:
     return r
 
 fn ir_emit_json_nested_decode_path_specialized(parent_handle_r: Int, key_r: Int, target_tid: Int, module_path: String) -> Int:
-    child_result_r := ir_reg()
-    ir_emit_call2(child_result_r, ir_resolve_generic_module_call_name(module_path, "object_require_object"), "tuple", parent_handle_r, key_r)
-    done_l := ir_label()
-    temp_name := ir_new_temp_name("json_nested_decode")
-    ir_var_types.insert(temp_name, "tuple")
-    ir_emit_result_or_jump(child_result_r, temp_name, done_l)
-    child_handle_r := ir_emit_result_value_field(child_result_r, lookup_type_id("Int"), "ok")
     decode_name := ir_json_generic_name("decode_object")
-    decode_result_r := ir_reg()
-    ir_emit_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", child_handle_r)
-    ir_emit("store " + temp_name + " " + decode_result_r.to_string())
-    ir_emit("label " + done_l)
-    result_r := ir_reg()
-    ir_emit("load " + result_r.to_string() + " " + temp_name)
-    return result_r
+    return ir_emit_nested_decode_path(parent_handle_r, key_r, target_tid, ir_resolve_generic_module_call_name(module_path, "object_require_object"), decode_name, "json_nested_decode")
 
 fn ir_emit_json_object_has(handle_r: Int, key_r: Int, module_path: String) -> Int:
     has_r := ir_reg()

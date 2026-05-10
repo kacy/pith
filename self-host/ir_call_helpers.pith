@@ -2,11 +2,28 @@
 
 from ir_builder import ir_emit
 from ir_metadata import ir_runtime_call_name
-from ir_type_helpers import ir_retkind_with_state
+from ir_type_helpers import ir_retkind_with_state, ir_resolve_type_hint_with_state
 from ast import get_node
 
 pub fn ir_is_declared_callable_with_state(name: String, func_returns: Map[String, String]) -> Bool:
     return func_returns.contains_key(name)
+
+pub fn ir_declared_callable_ir_retkind_with_state(fname: String, func_returns: Map[String, String]) -> String:
+    if not func_returns.contains_key(fname):
+        return ""
+    return func_returns[fname]
+
+pub fn ir_declared_callable_return_type_with_state(fname: String, func_returns: Map[String, String], type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
+    ret_kind := ir_declared_callable_ir_retkind_with_state(fname, func_returns)
+    if ret_kind.len() == 0:
+        return ""
+    if ret_kind == "result_int":
+        return "int"
+    if ret_kind == "result_bool":
+        return "bool"
+    if ret_kind == "tuple":
+        return "tuple"
+    return ir_resolve_type_hint_with_state(ret_kind, type_aliases, struct_names)
 
 pub fn ir_emit_call_text_with_state(result_reg: Int, fname: String, ret_type: String, arg_count: Int, arg_text: String, func_returns: Map[String, String], type_aliases: Map[String, String], struct_names: Map[String, Int]):
     mut emit_name := fname

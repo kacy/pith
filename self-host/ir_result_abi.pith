@@ -1,7 +1,7 @@
 # ir_result_abi.pith - low-level Result IR helpers
 
 from ir_builder import ir_emit, ir_reg, ir_str
-from ir_type_helpers import ir_type_from_tid
+from ir_type_helpers import ir_type_from_tid, ir_resolve_type_hint_with_state
 from types import get_type_info
 
 pub fn ir_uses_result_abi(result_kind: String) -> Bool:
@@ -68,3 +68,13 @@ pub fn ir_emit_result_value_field(obj_r: Int, obj_tid: Int, fname: String) -> In
     r := ir_reg()
     ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " " + offset.to_string() + " " + ir_result_field_kind(obj_tid, fname) + " " + fname)
     return r
+
+pub fn ir_emit_json_field_ok(result_r: Int, field_tid: Int) -> Int:
+    ok_r := ir_reg()
+    ir_emit("field " + ok_r.to_string() + " " + result_r.to_string() + " 8 " + ir_type_from_tid(field_tid) + " ok")
+    return ok_r
+
+pub fn ir_emit_result_ok_field_typed_with_state(result_r: Int, field_type_name: String, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> Int:
+    ok_r := ir_reg()
+    ir_emit("field " + ok_r.to_string() + " " + result_r.to_string() + " 8 " + ir_resolve_type_hint_with_state(field_type_name, type_aliases, struct_names) + " ok")
+    return ok_r

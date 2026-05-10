@@ -40,7 +40,7 @@ from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_dec
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
-from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field
+from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
@@ -1261,18 +1261,11 @@ fn ir_emit_toml_nested_decode_path_specialized(handle_r: Int, key_r: Int, target
     decode_name := ir_toml_generic_name("decode", module_path)
     return ir_emit_nested_decode_path(handle_r, key_r, target_tid, ir_resolve_generic_module_call_name(module_path, "toml_require_table"), decode_name, "toml_nested_decode")
 
-fn ir_emit_json_field_ok(result_r: Int, field_tid: Int) -> Int:
-    ok_r := ir_reg()
-    ir_emit("field " + ok_r.to_string() + " " + result_r.to_string() + " 8 " + ir_type_from_tid(field_tid) + " ok")
-    return ok_r
-
 fn ir_struct_has_default_fields(target_info: TypeInfo) -> Bool:
     return ir_struct_has_default_fields_with_state(target_info, ir_struct_field_default_nodes)
 
 fn ir_emit_result_ok_field_typed(result_r: Int, field_type_name: String) -> Int:
-    ok_r := ir_reg()
-    ir_emit("field " + ok_r.to_string() + " " + result_r.to_string() + " 8 " + ir_resolve_type_hint(field_type_name) + " ok")
-    return ok_r
+    return ir_emit_result_ok_field_typed_with_state(result_r, field_type_name, ir_type_aliases, ir_struct_names)
 
 fn ir_resolve_config_call_name(index_idx: Int, member_name: String) -> String:
     return ir_resolve_decode_call_name_with_state(index_idx, member_name, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)

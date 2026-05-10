@@ -265,3 +265,24 @@ pub fn ir_optional_inner_tid(field_tid: Int) -> Int:
     if info.kind == "optional":
         return info.inner
     return 0 - 1
+
+pub fn ir_struct_has_optional_fields(target_info: TypeInfo) -> Bool:
+    for field_tid in target_info.field_types:
+        if ir_optional_inner_tid(field_tid) >= 0:
+            return true
+    return false
+
+pub fn ir_struct_has_default_fields_with_state(target_info: TypeInfo, struct_field_default_nodes: Map[String, Int]) -> Bool:
+    for field_name in target_info.fields:
+        if struct_field_default_nodes.contains_key(target_info.name + "." + field_name):
+            return true
+    return false
+
+pub fn ir_struct_has_nested_decode_fields(target_info: TypeInfo) -> Bool:
+    for field_tid in target_info.field_types:
+        if ir_struct_decode_field_tid(field_tid) >= 0:
+            return true
+        optional_inner_tid := ir_optional_inner_tid(field_tid)
+        if optional_inner_tid >= 0 and ir_struct_decode_field_tid(optional_inner_tid) >= 0:
+            return true
+    return false

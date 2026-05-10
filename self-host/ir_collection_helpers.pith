@@ -90,3 +90,22 @@ pub fn ir_for_len_call_name(item_kind: String) -> String:
     if item_kind == "char":
         return "string_len"
     return "len"
+
+pub fn ir_empty_collection_init_call_name(literal_kind: String, child_count: Int, target_type: String) -> String:
+    if child_count != 0:
+        return ""
+    if literal_kind == "map":
+        if target_type == "set":
+            return "__set_new"
+        if target_type == "set_int":
+            return "__set_new_int"
+        if target_type == "map":
+            return "__map_new"
+        if target_type == "map_int":
+            return "__map_new_int"
+    if literal_kind == "set":
+        if target_type == "set":
+            return "__set_new"
+        if target_type == "set_int":
+            return "__set_new_int"
+    return ""

@@ -45,7 +45,7 @@ from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emi
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
-from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type, ir_list_element_kind, ir_function_return_kind
+from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_lookup_name_type_with_state, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type, ir_list_element_kind, ir_function_return_kind
 from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_toml_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_config_require_full_name_for_type_name_with_state, ir_toml_require_full_name_for_type_name_with_state, ir_is_config_decode_specialization, ir_is_toml_decode_specialization, ir_is_toml_decode_path_specialization, ir_is_toml_decode_text_path_specialization, ir_is_toml_decode_text_specialization, ir_is_json_decode_object_specialization, ir_is_json_decode_specialization, ir_is_json_decode_path_specialization, ir_resolve_decode_call_name_with_state, ir_json_field_helper_name, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_config_require_helper_name, ir_toml_require_helper_name, ir_struct_decode_field_tid, ir_json_field_type_tag, ir_optional_inner_tid, ir_struct_has_optional_fields, ir_struct_has_default_fields_with_state, ir_struct_has_nested_decode_fields
 from ir_callees import ResolvedCallee, ir_import_declares_function_with_state, ir_import_declares_global_with_state, ir_module_alias_member_name_with_state, ir_plain_method_name, ir_ident_callee_with_state, ir_resolve_module_alias_call_name_with_state, ir_resolve_module_alias_method_call_name_with_state, ir_resolve_static_callee_with_state
 from ir_call_helpers import ir_is_declared_callable_with_state, ir_declared_callable_ir_retkind_with_state, ir_declared_callable_return_type_with_state, ir_emit_call_text_with_state, ir_join_arg_regs, ir_method_call_arg_regs, ir_call_arg_expr_index
@@ -885,27 +885,7 @@ fn ir_infer_type(idx: Int) -> String:
     return ""
 
 fn ir_lookup_name_type(name: String) -> String:
-    if ir_var_types.contains_key(name):
-        return ir_var_types[name]
-    if ir_global_int_names.contains(name):
-        return "int"
-    if ir_global_string_names.contains(name):
-        return "string"
-    if ir_global_list_string_names.contains(name):
-        return "list_string"
-    if ir_global_list_names.contains(name):
-        return "list"
-    if ir_global_map_int_names.contains(name):
-        return "map_int"
-    if ir_global_map_names.contains(name):
-        return "map"
-    if ir_global_set_int_names.contains(name):
-        return "set_int"
-    if ir_global_set_names.contains(name):
-        return "set"
-    if ir_global_bool_names.contains(name):
-        return "bool"
-    return ""
+    return ir_lookup_name_type_with_state(name, ir_var_types, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_int_names, ir_global_map_names, ir_global_set_int_names, ir_global_set_names, ir_global_bool_names)
 
 fn ir_emit_optional_tuple(flag_r: Int, value_r: Int) -> Int:
     tuple_r := ir_reg()

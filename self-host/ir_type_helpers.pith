@@ -193,6 +193,29 @@ pub fn ir_checked_index_type(idx: Int) -> String:
         return ir_type_from_tid(coll_info.inner)
     return ir_checked_type(idx)
 
+pub fn ir_lookup_name_type_with_state(name: String, var_types: Map[String, String], global_int_names: List[String], global_string_names: List[String], global_list_string_names: List[String], global_list_names: List[String], global_map_int_names: List[String], global_map_names: List[String], global_set_int_names: List[String], global_set_names: List[String], global_bool_names: List[String]) -> String:
+    if var_types.contains_key(name):
+        return var_types[name]
+    if global_int_names.contains(name):
+        return "int"
+    if global_string_names.contains(name):
+        return "string"
+    if global_list_string_names.contains(name):
+        return "list_string"
+    if global_list_names.contains(name):
+        return "list"
+    if global_map_int_names.contains(name):
+        return "map_int"
+    if global_map_names.contains(name):
+        return "map"
+    if global_set_int_names.contains(name):
+        return "set_int"
+    if global_set_names.contains(name):
+        return "set"
+    if global_bool_names.contains(name):
+        return "bool"
+    return ""
+
 pub fn ir_builtin_result_retkind(name: String) -> String:
     if name == "parse_int":
         return "tuple"

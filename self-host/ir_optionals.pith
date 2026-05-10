@@ -1,6 +1,7 @@
 # ir_optionals.pith - low-level optional IR helpers
 
 from ir_builder import ir_emit, ir_reg
+from ir_metadata import ir_runtime_call_name
 from ir_result_abi import ir_zero_reg
 from ir_type_helpers import ir_type_from_tid
 from types import get_type_info
@@ -26,3 +27,27 @@ pub fn ir_emit_optional_none_compare(result_reg: Int, op: String, optional_r: In
         ir_emit("eq " + result_reg.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
     else:
         ir_emit("neq " + result_reg.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
+
+fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
+    ir_emit("call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " 1 " + arg0.to_string())
+
+fn ir_emit_optional_tuple(flag_r: Int, value_r: Int) -> Int:
+    tuple_r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " 2")
+    ir_emit_call1_raw(tuple_r, "__struct_alloc", "tuple", field_count_r)
+    ir_emit("sstore " + tuple_r.to_string() + " 0 " + flag_r.to_string())
+    ir_emit("sstore " + tuple_r.to_string() + " 1 " + value_r.to_string())
+    return tuple_r
+
+pub fn ir_emit_optional_none_value() -> Int:
+    flag_r := ir_reg()
+    value_r := ir_reg()
+    ir_emit("iconst " + flag_r.to_string() + " 0")
+    ir_emit("iconst " + value_r.to_string() + " 0")
+    return ir_emit_optional_tuple(flag_r, value_r)
+
+pub fn ir_emit_optional_some_value(value_r: Int) -> Int:
+    flag_r := ir_reg()
+    ir_emit("iconst " + flag_r.to_string() + " 1")
+    return ir_emit_optional_tuple(flag_r, value_r)

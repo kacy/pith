@@ -1,0 +1,130 @@
+# ir_generic_infer.pith - runtime generic argument inference
+
+from ast import get_node, node_kind, Node
+from checker import c_get_expr_type
+from types import get_type_info
+from ir_generics import ir_collect_generic_param_names
+from ir_type_helpers import ir_type_from_tid
+
+mut ir_generic_infer_subst: Map[String, String] := {}
+
+fn ir_bind_inferred_generic_runtime_type(name: String, actual_tid: Int) -> Bool:
+    concrete := ir_type_from_tid(actual_tid)
+    if concrete.len() == 0:
+        return true
+    if ir_generic_infer_subst.contains_key(name):
+        return ir_generic_infer_subst[name] == concrete
+    ir_generic_infer_subst.insert(name, concrete)
+    return true
+
+fn ir_infer_generic_runtime_types_from_node(type_idx: Int, actual_tid: Int, generic_params: List[String]) -> Bool:
+    if type_idx < 0 or actual_tid < 0:
+        return true
+    node := get_node(type_idx)
+    if node.kind == "type":
+        for gp in generic_params:
+            if gp == node.value:
+                return ir_bind_inferred_generic_runtime_type(gp, actual_tid)
+        return true
+
+    actual_info := get_type_info(actual_tid)
+
+    if node.kind == "generic_type":
+        if node.value == "List":
+            if actual_info.kind == "list" and node.children.len() > 0:
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params)
+            return true
+        if node.value == "Set":
+            if actual_info.kind == "set" and node.children.len() > 0:
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params)
+            return true
+        if node.value == "Task":
+            if actual_info.kind == "task" and node.children.len() > 0:
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params)
+            return true
+        if node.value == "Channel":
+            if actual_info.kind == "channel" and node.children.len() > 0:
+                return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params)
+            return true
+        if node.value == "Map":
+            if actual_info.kind == "map" and node.children.len() > 1:
+                if ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.key_type, generic_params) == false:
+                    return false
+                return ir_infer_generic_runtime_types_from_node(node.children[1], actual_info.value_type, generic_params)
+            return true
+        return true
+
+    if node.kind == "optional_type":
+        if actual_info.kind == "optional" and node.children.len() > 0:
+            return ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params)
+        return true
+
+    if node.kind == "result_type":
+        if actual_info.kind == "result" and node.children.len() > 0:
+            if ir_infer_generic_runtime_types_from_node(node.children[0], actual_info.inner, generic_params) == false:
+                return false
+            if node.children.len() > 1 and actual_info.value_type >= 0:
+                return ir_infer_generic_runtime_types_from_node(node.children[1], actual_info.value_type, generic_params)
+        return true
+
+    if node.kind == "tuple_type":
+        if actual_info.kind == "tuple":
+            for child, i in node.children:
+                if i < actual_info.elements.len():
+                    if ir_infer_generic_runtime_types_from_node(child, actual_info.elements[i], generic_params) == false:
+                        return false
+        return true
+
+    if node.kind == "fn_type":
+        if actual_info.kind == "function":
+            mut param_idx := 0
+            for child in node.children:
+                cn := get_node(child)
+                if cn.kind == "param":
+                    if param_idx < actual_info.param_types.len():
+                        if ir_infer_generic_runtime_types_from_node(cn.children[0], actual_info.param_types[param_idx], generic_params) == false:
+                            return false
+                    param_idx = param_idx + 1
+                elif cn.kind == "returns" and cn.children.len() > 0:
+                    return ir_infer_generic_runtime_types_from_node(cn.children[0], actual_info.return_type, generic_params)
+        return true
+
+    return true
+
+pub fn ir_infer_generic_concrete_types_with_state(name: String, node: Node, generic_decl_indices: Map[String, Int]) -> List[String]:
+    if not generic_decl_indices.contains_key(name):
+        return []
+    decl_idx := generic_decl_indices[name]
+    decl_node := get_node(decl_idx)
+    generic_params := ir_collect_generic_param_names(decl_node)
+    mut param_type_nodes: List[Int] := []
+    for child in decl_node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if cn.children.len() > 0:
+                param_type_nodes.push(cn.children[0])
+            else:
+                param_type_nodes.push(-1)
+    mut arg_tids: List[Int] := []
+    for child, i in node.children:
+        if i == 0:
+            continue
+        mut expr_idx := child
+        if node_kind(child) == "arg":
+            cn := get_node(child)
+            if cn.children.len() > 0:
+                expr_idx = cn.children[0]
+        arg_tids.push(c_get_expr_type(expr_idx))
+    ir_generic_infer_subst = {}
+    mut arg_idx := 0
+    while arg_idx < param_type_nodes.len():
+        if arg_idx < arg_tids.len() and param_type_nodes[arg_idx] >= 0:
+            ir_infer_generic_runtime_types_from_node(param_type_nodes[arg_idx], arg_tids[arg_idx], generic_params)
+        arg_idx = arg_idx + 1
+    mut concrete_types: List[String] := []
+    for gp in generic_params:
+        if ir_generic_infer_subst.contains_key(gp):
+            concrete_types.push(ir_generic_infer_subst[gp])
+        else:
+            concrete_types.push("unknown")
+    return concrete_types

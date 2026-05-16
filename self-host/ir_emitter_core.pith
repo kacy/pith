@@ -1261,6 +1261,44 @@ fn ir_emit_config_specialized_field_key(field_name: String, prefix_r: Int) -> In
     ir_emit_call2(full_key_r, "std_config_dotted_key", "string", prefix_r, key_r)
     return full_key_r
 
+struct IrDecodeFieldBranch:
+    field_temp: String
+    present_l: String
+    merge_l: String
+
+fn ir_begin_decode_field_branch(has_r: Int, temp_prefix: String, temp_type: String) -> IrDecodeFieldBranch:
+    present_l := ir_label()
+    missing_l := ir_label()
+    merge_l := ir_label()
+    field_temp := ir_new_temp_name(temp_prefix)
+    ir_var_types.insert(field_temp, temp_type)
+    ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
+    ir_emit("label " + missing_l)
+    return IrDecodeFieldBranch(field_temp, present_l, merge_l)
+
+fn ir_decode_field_present(branch: IrDecodeFieldBranch):
+    ir_emit("jmp " + branch.merge_l)
+    ir_emit("label " + branch.present_l)
+
+fn ir_decode_field_store_and_merge(branch: IrDecodeFieldBranch, value_r: Int):
+    ir_emit("store " + branch.field_temp + " " + value_r.to_string())
+    ir_emit("jmp " + branch.merge_l)
+
+fn ir_decode_field_load_after_merge(branch: IrDecodeFieldBranch) -> Int:
+    ir_emit("label " + branch.merge_l)
+    loaded_r := ir_reg()
+    ir_emit("load " + loaded_r.to_string() + " " + branch.field_temp)
+    return loaded_r
+
+fn ir_decode_field_store_missing_optional(branch: IrDecodeFieldBranch, default_idx: Int):
+    if default_idx >= 0:
+        ir_decode_field_store_and_merge(branch, ir_emit_value_for_target(default_idx, "tuple"))
+    else:
+        ir_decode_field_store_and_merge(branch, ir_emit_optional_none_value())
+
+fn ir_decode_field_store_missing_default(branch: IrDecodeFieldBranch, default_idx: Int, target_kind: String):
+    ir_decode_field_store_and_merge(branch, ir_emit_value_for_target(default_idx, target_kind))
+
 fn ir_emit_config_decode_specialization_body(struct_name: String, prefixed: Bool):
     if not ir_struct_names.contains_key(struct_name):
         ir_emit_default_return()
@@ -1292,27 +1330,13 @@ fn ir_emit_config_decode_specialization_body(struct_name: String, prefixed: Bool
         if optional_struct_tid >= 0:
             has_r := ir_reg()
             ir_emit_call2(has_r, "std_config_has_prefix", "bool", cfg_r, full_key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("config_spec_optional_struct_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "config_spec_optional_struct_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_emit_config_nested_decode_prefix_specialized(cfg_r, full_key_r, optional_struct_tid)
             ir_emit_result_return_error_branch(field_result_r)
-            ir_emit("store " + field_temp + " " + ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             i = i + 1
             continue
         nested_struct_tid := ir_struct_decode_field_tid(field_tid)
@@ -1320,24 +1344,13 @@ fn ir_emit_config_decode_specialization_body(struct_name: String, prefixed: Bool
             if default_idx >= 0:
                 has_r := ir_reg()
                 ir_emit_call2(has_r, "std_config_has_prefix", "bool", cfg_r, full_key_r)
-                present_l := ir_label()
-                missing_l := ir_label()
-                merge_l := ir_label()
-                field_temp := ir_new_temp_name("config_spec_default_struct_field")
-                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-                ir_emit("label " + missing_l)
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + present_l)
+                branch := ir_begin_decode_field_branch(has_r, "config_spec_default_struct_field", ir_type_from_tid(field_tid))
+                ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid))
+                ir_decode_field_present(branch)
                 field_result_r := ir_emit_config_nested_decode_prefix_specialized(cfg_r, full_key_r, nested_struct_tid)
                 ir_emit_result_return_error_branch(field_result_r)
-                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + merge_l)
-                loaded_r := ir_reg()
-                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-                field_regs.push(loaded_r)
+                ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
                 i = i + 1
                 continue
             field_result_r := ir_emit_config_nested_decode_prefix_specialized(cfg_r, full_key_r, nested_struct_tid)
@@ -1352,28 +1365,14 @@ fn ir_emit_config_decode_specialization_body(struct_name: String, prefixed: Bool
                 return
             has_r := ir_reg()
             ir_emit_call2(has_r, "std_config_has", "bool", cfg_r, full_key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("config_spec_optional_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "config_spec_optional_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, helper_name, "tuple", cfg_r, full_key_r)
             ir_emit_result_return_error_branch(field_result_r)
-            ir_emit("store " + field_temp + " " + ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             i = i + 1
             continue
         helper_name := ir_config_require_full_name_for_type_name(ir_type_from_tid(field_tid))
@@ -1383,25 +1382,14 @@ fn ir_emit_config_decode_specialization_body(struct_name: String, prefixed: Bool
         if default_idx >= 0:
             has_r := ir_reg()
             ir_emit_call2(has_r, "std_config_has", "bool", cfg_r, full_key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("config_spec_default_field")
-            ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            ir_emit("store " + field_temp + " " + ir_expr(default_idx).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "config_spec_default_field", ir_type_from_tid(field_tid))
+            ir_decode_field_store_and_merge(branch, ir_expr(default_idx))
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, helper_name, "tuple", cfg_r, full_key_r)
             ir_emit_result_return_error_branch(field_result_r)
-            ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             i = i + 1
             continue
         field_result_r := ir_reg()
@@ -1427,52 +1415,26 @@ fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: Int,
         if optional_struct_tid >= 0:
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_config_call_name(index_idx, "has_prefix"), "bool", cfg_r, full_key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("config_optional_struct_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "config_optional_struct_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_emit_config_nested_decode_prefix(cfg_r, full_key_r, optional_struct_tid, index_idx)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid))
-            ir_emit("store " + field_temp + " " + some_r.to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         nested_struct_tid := ir_struct_decode_field_tid(field_tid)
         if nested_struct_tid >= 0:
             if default_idx >= 0:
                 has_r := ir_reg()
                 ir_emit_call2(has_r, ir_resolve_config_call_name(index_idx, "has_prefix"), "bool", cfg_r, full_key_r)
-                present_l := ir_label()
-                missing_l := ir_label()
-                merge_l := ir_label()
-                field_temp := ir_new_temp_name("config_default_struct_field")
-                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-                ir_emit("label " + missing_l)
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + present_l)
+                branch := ir_begin_decode_field_branch(has_r, "config_default_struct_field", ir_type_from_tid(field_tid))
+                ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid))
+                ir_decode_field_present(branch)
                 field_result_r := ir_emit_config_nested_decode_prefix(cfg_r, full_key_r, nested_struct_tid, index_idx)
                 ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + merge_l)
-                loaded_r := ir_reg()
-                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-                field_regs.push(loaded_r)
+                ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
                 continue
             field_result_r := ir_emit_config_nested_decode_prefix(cfg_r, full_key_r, nested_struct_tid, index_idx)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
@@ -1484,29 +1446,14 @@ fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: Int,
                 continue
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_config_call_name(index_idx, "has"), "bool", cfg_r, full_key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("config_optional_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "config_optional_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, ir_resolve_config_call_name(index_idx, helper_name), "tuple", cfg_r, full_key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid))
-            ir_emit("store " + field_temp + " " + some_r.to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         helper_name := ir_config_require_helper_name(field_tid)
         if helper_name.len() == 0:
@@ -1514,25 +1461,14 @@ fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: Int,
         if default_idx >= 0:
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_config_call_name(index_idx, "has"), "bool", cfg_r, full_key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("config_default_field")
-            ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            ir_emit("store " + field_temp + " " + ir_expr(default_idx).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "config_default_field", ir_type_from_tid(field_tid))
+            ir_decode_field_store_and_merge(branch, ir_expr(default_idx))
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, ir_resolve_config_call_name(index_idx, helper_name), "tuple", cfg_r, full_key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         field_result_r := ir_reg()
         ir_emit_call2(field_result_r, ir_resolve_config_call_name(index_idx, helper_name), "tuple", cfg_r, full_key_r)
@@ -1564,27 +1500,13 @@ fn ir_emit_toml_decode_struct_from_handle(struct_name: String, module_path: Stri
         if optional_struct_tid >= 0:
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("toml_spec_optional_struct_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "toml_spec_optional_struct_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, optional_struct_tid, module_path)
             ir_emit_result_return_error_branch(field_result_r)
-            ir_emit("store " + field_temp + " " + ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             i = i + 1
             continue
         nested_struct_tid := ir_struct_decode_field_tid(field_tid)
@@ -1592,24 +1514,13 @@ fn ir_emit_toml_decode_struct_from_handle(struct_name: String, module_path: Stri
             if default_idx >= 0:
                 has_r := ir_reg()
                 ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
-                present_l := ir_label()
-                missing_l := ir_label()
-                merge_l := ir_label()
-                field_temp := ir_new_temp_name("toml_spec_default_struct_field")
-                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-                ir_emit("label " + missing_l)
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + present_l)
+                branch := ir_begin_decode_field_branch(has_r, "toml_spec_default_struct_field", ir_type_from_tid(field_tid))
+                ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid))
+                ir_decode_field_present(branch)
                 field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
                 ir_emit_result_return_error_branch(field_result_r)
-                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + merge_l)
-                loaded_r := ir_reg()
-                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-                field_regs.push(loaded_r)
+                ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
                 i = i + 1
                 continue
             field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
@@ -1624,28 +1535,14 @@ fn ir_emit_toml_decode_struct_from_handle(struct_name: String, module_path: Stri
                 return
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("toml_spec_optional_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "toml_spec_optional_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, helper_name, "tuple", handle_r, key_r)
             ir_emit_result_return_error_branch(field_result_r)
-            ir_emit("store " + field_temp + " " + ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             i = i + 1
             continue
         helper_name := ir_toml_require_full_name_for_type_name(ir_type_from_tid(field_tid), module_path)
@@ -1655,25 +1552,14 @@ fn ir_emit_toml_decode_struct_from_handle(struct_name: String, module_path: Stri
         if default_idx >= 0:
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("toml_spec_default_field")
-            ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            ir_emit("store " + field_temp + " " + ir_expr(default_idx).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "toml_spec_default_field", ir_type_from_tid(field_tid))
+            ir_decode_field_store_and_merge(branch, ir_expr(default_idx))
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, helper_name, "tuple", handle_r, key_r)
             ir_emit_result_return_error_branch(field_result_r)
-            ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             i = i + 1
             continue
         field_result_r := ir_reg()
@@ -1843,52 +1729,26 @@ fn ir_emit_toml_decode_value(target_info: TypeInfo, handle_r: Int, index_idx: In
         if optional_struct_tid >= 0:
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_toml_call_name(index_idx, "has"), "bool", handle_r, key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("toml_optional_struct_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "toml_optional_struct_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_emit_toml_nested_decode_path(handle_r, key_r, optional_struct_tid, index_idx)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid))
-            ir_emit("store " + field_temp + " " + some_r.to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         nested_struct_tid := ir_struct_decode_field_tid(field_tid)
         if nested_struct_tid >= 0:
             if default_idx >= 0:
                 has_r := ir_reg()
                 ir_emit_call2(has_r, ir_resolve_toml_call_name(index_idx, "has"), "bool", handle_r, key_r)
-                present_l := ir_label()
-                missing_l := ir_label()
-                merge_l := ir_label()
-                field_temp := ir_new_temp_name("toml_default_struct_field")
-                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-                ir_emit("label " + missing_l)
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + present_l)
+                branch := ir_begin_decode_field_branch(has_r, "toml_default_struct_field", ir_type_from_tid(field_tid))
+                ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid))
+                ir_decode_field_present(branch)
                 field_result_r := ir_emit_toml_nested_decode_path(handle_r, key_r, nested_struct_tid, index_idx)
                 ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + merge_l)
-                loaded_r := ir_reg()
-                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-                field_regs.push(loaded_r)
+                ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
                 continue
             field_result_r := ir_emit_toml_nested_decode_path(handle_r, key_r, nested_struct_tid, index_idx)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
@@ -1900,29 +1760,14 @@ fn ir_emit_toml_decode_value(target_info: TypeInfo, handle_r: Int, index_idx: In
                 continue
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_toml_call_name(index_idx, "has"), "bool", handle_r, key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("toml_optional_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "toml_optional_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, ir_resolve_toml_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid))
-            ir_emit("store " + field_temp + " " + some_r.to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         helper_name := ir_toml_require_helper_name(field_tid)
         if helper_name.len() == 0:
@@ -1930,25 +1775,14 @@ fn ir_emit_toml_decode_value(target_info: TypeInfo, handle_r: Int, index_idx: In
         if default_idx >= 0:
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_toml_call_name(index_idx, "has"), "bool", handle_r, key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("toml_default_field")
-            ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            ir_emit("store " + field_temp + " " + ir_expr(default_idx).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "toml_default_field", ir_type_from_tid(field_tid))
+            ir_decode_field_store_and_merge(branch, ir_expr(default_idx))
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, ir_resolve_toml_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         field_result_r := ir_reg()
         ir_emit_call2(field_result_r, ir_resolve_toml_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
@@ -2210,52 +2044,26 @@ fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, index_
         if optional_struct_tid >= 0:
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("json_object_optional_struct_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "json_object_optional_struct_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_emit_json_nested_decode_path(handle_r, key_r, optional_struct_tid, index_idx)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid))
-            ir_emit("store " + field_temp + " " + some_r.to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         nested_struct_tid := ir_struct_decode_field_tid(field_tid)
         if nested_struct_tid >= 0:
             if default_idx >= 0:
                 has_r := ir_reg()
                 ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
-                present_l := ir_label()
-                missing_l := ir_label()
-                merge_l := ir_label()
-                field_temp := ir_new_temp_name("json_object_default_struct_field")
-                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-                ir_emit("label " + missing_l)
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + present_l)
+                branch := ir_begin_decode_field_branch(has_r, "json_object_default_struct_field", ir_type_from_tid(field_tid))
+                ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid))
+                ir_decode_field_present(branch)
                 field_result_r := ir_emit_json_nested_decode_path(handle_r, key_r, nested_struct_tid, index_idx)
                 ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + merge_l)
-                loaded_r := ir_reg()
-                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-                field_regs.push(loaded_r)
+                ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
                 continue
             field_result_r := ir_emit_json_nested_decode_path(handle_r, key_r, nested_struct_tid, index_idx)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
@@ -2267,29 +2075,14 @@ fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, index_
                 continue
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("json_object_optional_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "json_object_optional_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, ir_resolve_json_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid))
-            ir_emit("store " + field_temp + " " + some_r.to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         helper_name := ir_json_object_helper_name(field_tid)
         if helper_name.len() == 0:
@@ -2297,25 +2090,14 @@ fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, index_
         if default_idx >= 0:
             has_r := ir_reg()
             ir_emit_call2(has_r, ir_resolve_json_call_name(index_idx, "object_has"), "bool", handle_r, key_r)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("json_object_default_field")
-            ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            ir_emit("store " + field_temp + " " + ir_expr(default_idx).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "json_object_default_field", ir_type_from_tid(field_tid))
+            ir_decode_field_store_and_merge(branch, ir_expr(default_idx))
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, ir_resolve_json_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             continue
         field_result_r := ir_reg()
         ir_emit_call2(field_result_r, ir_resolve_json_call_name(index_idx, helper_name), "tuple", handle_r, key_r)
@@ -2445,52 +2227,26 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
             optional_struct_tid = ir_struct_decode_field_tid(optional_inner_tid)
         if optional_struct_tid >= 0:
             has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("json_object_optional_struct_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "json_object_optional_struct_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_emit_json_nested_decode_path_specialized(handle_r, key_r, optional_struct_tid, module_path)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid))
-            ir_emit("store " + field_temp + " " + some_r.to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             i = i + 1
             continue
         nested_struct_tid := ir_struct_decode_field_tid(field_tid)
         if nested_struct_tid >= 0:
             if default_idx >= 0:
                 has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
-                present_l := ir_label()
-                missing_l := ir_label()
-                merge_l := ir_label()
-                field_temp := ir_new_temp_name("json_object_default_struct_field")
-                ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-                ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-                ir_emit("label " + missing_l)
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + present_l)
+                branch := ir_begin_decode_field_branch(has_r, "json_object_default_struct_field", ir_type_from_tid(field_tid))
+                ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid))
+                ir_decode_field_present(branch)
                 field_result_r := ir_emit_json_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
                 ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-                ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-                ir_emit("jmp " + merge_l)
-                ir_emit("label " + merge_l)
-                loaded_r := ir_reg()
-                ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-                field_regs.push(loaded_r)
+                ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+                field_regs.push(ir_decode_field_load_after_merge(branch))
                 i = i + 1
                 continue
             field_result_r := ir_emit_json_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
@@ -2503,29 +2259,14 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
             if helper_name.len() == 0:
                 continue
             has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("json_object_optional_field")
-            ir_var_types.insert(field_temp, "tuple")
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            if default_idx >= 0:
-                ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, "tuple").to_string())
-            else:
-                ir_emit("store " + field_temp + " " + ir_emit_optional_none_value().to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "json_object_optional_field", "tuple")
+            ir_decode_field_store_missing_optional(branch, default_idx)
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), "tuple", handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            some_r := ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid))
-            ir_emit("store " + field_temp + " " + some_r.to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             i = i + 1
             continue
         helper_name := ir_json_object_helper_name(field_tid)
@@ -2533,25 +2274,14 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
             continue
         if default_idx >= 0:
             has_r := ir_emit_json_object_has(handle_r, key_r, module_path)
-            present_l := ir_label()
-            missing_l := ir_label()
-            merge_l := ir_label()
-            field_temp := ir_new_temp_name("json_object_default_field")
-            ir_var_types.insert(field_temp, ir_type_from_tid(field_tid))
-            ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-            ir_emit("label " + missing_l)
-            ir_emit("store " + field_temp + " " + ir_emit_value_for_target(default_idx, ir_type_from_tid(field_tid)).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + present_l)
+            branch := ir_begin_decode_field_branch(has_r, "json_object_default_field", ir_type_from_tid(field_tid))
+            ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid))
+            ir_decode_field_present(branch)
             field_result_r := ir_reg()
             ir_emit_call2(field_result_r, ir_resolve_generic_module_call_name(module_path, helper_name), "tuple", handle_r, key_r)
             ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-            ir_emit("store " + field_temp + " " + ir_emit_json_field_ok(field_result_r, field_tid).to_string())
-            ir_emit("jmp " + merge_l)
-            ir_emit("label " + merge_l)
-            loaded_r := ir_reg()
-            ir_emit("load " + loaded_r.to_string() + " " + field_temp)
-            field_regs.push(loaded_r)
+            ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+            field_regs.push(ir_decode_field_load_after_merge(branch))
             i = i + 1
             continue
         field_result_r := ir_reg()
@@ -3324,6 +3054,22 @@ fn ir_select_probe_arm_indices(node: Node) -> List[Int]:
             probe_arms.push(arm_idx)
     return probe_arms
 
+struct IrSelectParts:
+    probe_arms: List[Int]
+    timeout_idx: Int
+    default_idx: Int
+
+fn ir_collect_select_parts(node: Node) -> IrSelectParts:
+    mut timeout_idx := 0 - 1
+    mut default_idx := 0 - 1
+    for child in node.children:
+        arm_node := get_node(child)
+        if arm_node.kind == "select_timeout_arm" and timeout_idx < 0:
+            timeout_idx = child
+        elif arm_node.kind == "select_default_arm" and default_idx < 0:
+            default_idx = child
+    return IrSelectParts(ir_select_probe_arm_indices(node), timeout_idx, default_idx)
+
 fn ir_emit_select_probe_arm(arm_idx: Int, result_temp: String, end_l: String):
     arm_node := get_node(arm_idx)
     if arm_node.kind == "select_recv_arm" and arm_node.children.len() >= 2:
@@ -3348,111 +3094,131 @@ fn ir_emit_select_probe_arm(arm_idx: Int, result_temp: String, end_l: String):
         ir_emit("jmp " + end_l)
         ir_emit("label " + next_l)
 
+fn ir_emit_select_deadline(timeout_idx: Int) -> String:
+    if timeout_idx < 0:
+        return ""
+    deadline_name := ir_new_temp_name("select_deadline")
+    timeout_node := get_node(timeout_idx)
+    timeout_r := ir_expr(timeout_node.children[0])
+    now_r := ir_reg()
+    ir_emit_call0(now_r, "time", "int")
+    deadline_r := ir_reg()
+    ir_emit("add " + deadline_r.to_string() + " " + now_r.to_string() + " " + timeout_r.to_string())
+    ir_emit("store " + deadline_name + " " + deadline_r.to_string())
+    return deadline_name
+
+fn ir_emit_select_offset(probe_count: Int) -> String:
+    if probe_count <= 1:
+        return ""
+    offset_name := ir_new_temp_name("select_offset")
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " " + probe_count.to_string())
+    seed_r := ir_reg()
+    ir_emit_call1(seed_r, "pith_select_next_index", "int", count_r)
+    ir_emit("store " + offset_name + " " + seed_r.to_string())
+    return offset_name
+
+fn ir_emit_rotated_select_probes(probe_arms: List[Int], offset_name: String, result_temp: String, end_l: String):
+    probe_count := probe_arms.len()
+    probe_done_l := ir_label()
+    offset_r := ir_reg()
+    ir_emit("load " + offset_r.to_string() + " " + offset_name)
+    mut i := 0
+    while i < probe_count:
+        case_l := ir_label()
+        next_case_l := ir_label()
+        match_r := ir_reg()
+        case_r := ir_reg()
+        ir_emit("iconst " + case_r.to_string() + " " + i.to_string())
+        ir_emit("eq " + match_r.to_string() + " " + offset_r.to_string() + " " + case_r.to_string())
+        ir_emit("brif " + match_r.to_string() + " " + case_l + " " + next_case_l)
+        ir_emit("label " + case_l)
+        mut j := 0
+        while j < probe_count:
+            probe_idx := (i + j) % probe_count
+            ir_emit_select_probe_arm(probe_arms[probe_idx], result_temp, end_l)
+            j = j + 1
+        ir_emit("jmp " + probe_done_l)
+        ir_emit("label " + next_case_l)
+        i = i + 1
+    ir_emit("label " + probe_done_l)
+
+fn ir_emit_select_probes(probe_arms: List[Int], offset_name: String, result_temp: String, end_l: String):
+    probe_count := probe_arms.len()
+    if probe_count == 0:
+        return
+    if probe_count == 1:
+        ir_emit_select_probe_arm(probe_arms[0], result_temp, end_l)
+        return
+    ir_emit_rotated_select_probes(probe_arms, offset_name, result_temp, end_l)
+
+fn ir_emit_select_default(default_idx: Int, result_temp: String, end_l: String):
+    if default_idx < 0:
+        return
+    default_node := get_node(default_idx)
+    if default_node.children.len() == 0:
+        return
+    body_r := ir_emit_select_arm_body(default_node.children[0], "", 0, "")
+    ir_emit("store " + result_temp + " " + body_r.to_string())
+    ir_emit("jmp " + end_l)
+
+fn ir_emit_select_timeout(timeout_idx: Int, deadline_name: String, result_temp: String, end_l: String):
+    if timeout_idx < 0:
+        return
+    now_r := ir_reg()
+    ir_emit_call0(now_r, "time", "int")
+    deadline_r := ir_reg()
+    ir_emit("load " + deadline_r.to_string() + " " + deadline_name)
+    expired_r := ir_reg()
+    ir_emit("gte " + expired_r.to_string() + " " + now_r.to_string() + " " + deadline_r.to_string())
+    timeout_l := ir_label()
+    wait_l := ir_label()
+    ir_emit("brif " + expired_r.to_string() + " " + timeout_l + " " + wait_l)
+    ir_emit("label " + timeout_l)
+    timeout_node := get_node(timeout_idx)
+    body_r := ir_emit_select_arm_body(timeout_node.children[1], "", 0, "")
+    ir_emit("store " + result_temp + " " + body_r.to_string())
+    ir_emit("jmp " + end_l)
+    ir_emit("label " + wait_l)
+
+fn ir_advance_select_offset(probe_count: Int, offset_name: String):
+    if probe_count <= 1:
+        return
+    next_offset_r := ir_reg()
+    cur_offset_r := ir_reg()
+    one_r := ir_reg()
+    count_r := ir_reg()
+    ir_emit("load " + cur_offset_r.to_string() + " " + offset_name)
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    ir_emit("iconst " + count_r.to_string() + " " + probe_count.to_string())
+    next_sum_r := ir_reg()
+    ir_emit("add " + next_sum_r.to_string() + " " + cur_offset_r.to_string() + " " + one_r.to_string())
+    ir_emit("mod " + next_offset_r.to_string() + " " + next_sum_r.to_string() + " " + count_r.to_string())
+    ir_emit("store " + offset_name + " " + next_offset_r.to_string())
+
+fn ir_emit_select_wait(loop_l: String, probe_count: Int, offset_name: String):
+    ir_advance_select_offset(probe_count, offset_name)
+    delay_r := ir_reg()
+    ir_emit("iconst " + delay_r.to_string() + " 1")
+    sleep_r := ir_reg()
+    ir_emit_call1(sleep_r, "sleep", "unknown", delay_r)
+    ir_emit("jmp " + loop_l)
+
 fn ir_emit_select_expr(node: Node) -> Int:
     result_temp := ir_new_temp_name("select")
-    mut timeout_idx := 0 - 1
-    mut default_idx := 0 - 1
-    probe_arms := ir_select_probe_arm_indices(node)
-    probe_count := probe_arms.len()
-    for child in node.children:
-        arm_node := get_node(child)
-        if arm_node.kind == "select_timeout_arm" and timeout_idx < 0:
-            timeout_idx = child
-        elif arm_node.kind == "select_default_arm" and default_idx < 0:
-            default_idx = child
-
-    mut deadline_name := ""
-    if timeout_idx >= 0:
-        deadline_name = ir_new_temp_name("select_deadline")
-        timeout_node := get_node(timeout_idx)
-        timeout_r := ir_expr(timeout_node.children[0])
-        now_r := ir_reg()
-        ir_emit_call0(now_r, "time", "int")
-        deadline_r := ir_reg()
-        ir_emit("add " + deadline_r.to_string() + " " + now_r.to_string() + " " + timeout_r.to_string())
-        ir_emit("store " + deadline_name + " " + deadline_r.to_string())
+    parts := ir_collect_select_parts(node)
+    probe_count := parts.probe_arms.len()
+    deadline_name := ir_emit_select_deadline(parts.timeout_idx)
 
     loop_l := ir_label()
     end_l := ir_label()
     ir_emit("label " + loop_l)
 
-    mut offset_name := ""
-    if probe_count > 1:
-        offset_name = ir_new_temp_name("select_offset")
-        count_r := ir_reg()
-        ir_emit("iconst " + count_r.to_string() + " " + probe_count.to_string())
-        seed_r := ir_reg()
-        ir_emit_call1(seed_r, "pith_select_next_index", "int", count_r)
-        ir_emit("store " + offset_name + " " + seed_r.to_string())
-
-    if probe_count <= 1:
-        if probe_count == 1:
-            ir_emit_select_probe_arm(probe_arms[0], result_temp, end_l)
-    else:
-        probe_done_l := ir_label()
-        offset_r := ir_reg()
-        ir_emit("load " + offset_r.to_string() + " " + offset_name)
-        mut i := 0
-        while i < probe_count:
-            case_l := ir_label()
-            next_case_l := ir_label()
-            match_r := ir_reg()
-            case_r := ir_reg()
-            ir_emit("iconst " + case_r.to_string() + " " + i.to_string())
-            ir_emit("eq " + match_r.to_string() + " " + offset_r.to_string() + " " + case_r.to_string())
-            ir_emit("brif " + match_r.to_string() + " " + case_l + " " + next_case_l)
-            ir_emit("label " + case_l)
-            mut j := 0
-            while j < probe_count:
-                probe_idx := (i + j) % probe_count
-                ir_emit_select_probe_arm(probe_arms[probe_idx], result_temp, end_l)
-                j = j + 1
-            ir_emit("jmp " + probe_done_l)
-            ir_emit("label " + next_case_l)
-            i = i + 1
-        ir_emit("label " + probe_done_l)
-
-    if default_idx >= 0:
-        default_node := get_node(default_idx)
-        if default_node.children.len() > 0:
-            body_r := ir_emit_select_arm_body(default_node.children[0], "", 0, "")
-            ir_emit("store " + result_temp + " " + body_r.to_string())
-            ir_emit("jmp " + end_l)
-
-    if timeout_idx >= 0:
-        now_r := ir_reg()
-        ir_emit_call0(now_r, "time", "int")
-        deadline_r := ir_reg()
-        ir_emit("load " + deadline_r.to_string() + " " + deadline_name)
-        expired_r := ir_reg()
-        ir_emit("gte " + expired_r.to_string() + " " + now_r.to_string() + " " + deadline_r.to_string())
-        timeout_l := ir_label()
-        wait_l := ir_label()
-        ir_emit("brif " + expired_r.to_string() + " " + timeout_l + " " + wait_l)
-        ir_emit("label " + timeout_l)
-        timeout_node := get_node(timeout_idx)
-        body_r := ir_emit_select_arm_body(timeout_node.children[1], "", 0, "")
-        ir_emit("store " + result_temp + " " + body_r.to_string())
-        ir_emit("jmp " + end_l)
-        ir_emit("label " + wait_l)
-
-    delay_r := ir_reg()
-    if probe_count > 1:
-        next_offset_r := ir_reg()
-        cur_offset_r := ir_reg()
-        one_r := ir_reg()
-        count_r := ir_reg()
-        ir_emit("load " + cur_offset_r.to_string() + " " + offset_name)
-        ir_emit("iconst " + one_r.to_string() + " 1")
-        ir_emit("iconst " + count_r.to_string() + " " + probe_count.to_string())
-        next_sum_r := ir_reg()
-        ir_emit("add " + next_sum_r.to_string() + " " + cur_offset_r.to_string() + " " + one_r.to_string())
-        ir_emit("mod " + next_offset_r.to_string() + " " + next_sum_r.to_string() + " " + count_r.to_string())
-        ir_emit("store " + offset_name + " " + next_offset_r.to_string())
-    ir_emit("iconst " + delay_r.to_string() + " 1")
-    sleep_r := ir_reg()
-    ir_emit_call1(sleep_r, "sleep", "unknown", delay_r)
-    ir_emit("jmp " + loop_l)
+    offset_name := ir_emit_select_offset(probe_count)
+    ir_emit_select_probes(parts.probe_arms, offset_name, result_temp, end_l)
+    ir_emit_select_default(parts.default_idx, result_temp, end_l)
+    ir_emit_select_timeout(parts.timeout_idx, deadline_name, result_temp, end_l)
+    ir_emit_select_wait(loop_l, probe_count, offset_name)
     ir_emit("label " + end_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + result_temp)

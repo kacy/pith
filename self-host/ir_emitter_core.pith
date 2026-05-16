@@ -3725,6 +3725,54 @@ fn ir_expr(idx: Int) -> Int:
     else:
         return ir_expr_complex(idx, node)
 
+fn ir_emit_zero_value() -> Int:
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " 0")
+    return r
+
+fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
+    fname := node_value(idx)
+    if node.children.len() > 0:
+        obj_r := ir_expr(node.children[0])
+        # result fields are special: `.ok` and status checks read the tagged value,
+        # not a struct field.
+        result_r := ir_emit_result_field_access(idx, obj_r, fname)
+        if result_r >= 0:
+            return result_r
+    return ir_emit_field_access(idx, node)
+
+fn ir_emit_await_expr(node: Node) -> Int:
+    if node.children.len() == 0:
+        return ir_emit_zero_value()
+    task_r := ir_expr(node.children[0])
+    r := ir_reg()
+    ir_emit_call1(r, "await", "unknown", task_r)
+    return r
+
+fn ir_emit_catch_expr(node: Node) -> Int:
+    result_r := ir_expr(node.children[0])
+    cond_r := ir_emit_result_flag_field(result_r, "is_ok")
+    temp_name := ir_new_temp_name("catch")
+    ok_l := ir_label()
+    fallback_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
+    ir_emit("label " + ok_l)
+    ok_value_r := ir_emit_result_value_field(result_r, c_get_expr_type(node.children[0]), "ok")
+    ir_emit("store " + temp_name + " " + ok_value_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit("label " + fallback_l)
+    ir_emit("store " + temp_name + " " + ir_expr(node.children[1]).to_string())
+    ir_emit("label " + merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
+fn ir_emit_grouped_expr(node: Node) -> Int:
+    if node.children.len() > 0:
+        return ir_expr(node.children[0])
+    return ir_emit_zero_value()
+
 fn ir_expr_complex(idx: Int, node: Node) -> Int:
     kind := node_kind(idx)
     if kind == "method_call":
@@ -3749,15 +3797,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_struct_init(node)
 
     if kind == "field_access":
-        fname := node_value(idx)
-        if node.children.len() > 0:
-            obj_r := ir_expr(node.children[0])
-            # result fields are special: `.ok` and status checks read the tagged value,
-            # not a struct field.
-            result_r := ir_emit_result_field_access(idx, obj_r, fname)
-            if result_r >= 0:
-                return result_r
-        return ir_emit_field_access(idx, node)
+        return ir_emit_field_access_expr(idx, node)
 
     if kind == "lambda":
         return ir_emit_lambda(idx)
@@ -3766,14 +3806,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_spawn_expr(node)
 
     if kind == "await":
-        if node.children.len() > 0:
-            task_r := ir_expr(node.children[0])
-            r := ir_reg()
-            ir_emit_call1(r, "await", "unknown", task_r)
-            return r
-        r := ir_reg()
-        ir_emit("iconst " + r.to_string() + " 0")
-        return r
+        return ir_emit_await_expr(node)
 
     if kind == "unwrap":
         return ir_emit_optional_unwrap(node)
@@ -3782,22 +3815,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_try_expr(node)
 
     if kind == "catch_expr":
-        result_r := ir_expr(node.children[0])
-        cond_r := ir_emit_result_flag_field(result_r, "is_ok")
-        temp_name := ir_new_temp_name("catch")
-        ok_l := ir_label()
-        fallback_l := ir_label()
-        merge_l := ir_label()
-        ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
-        ir_emit("label " + ok_l)
-        ir_emit("store " + temp_name + " " + ir_emit_result_value_field(result_r, c_get_expr_type(node.children[0]), "ok").to_string())
-        ir_emit("jmp " + merge_l)
-        ir_emit("label " + fallback_l)
-        ir_emit("store " + temp_name + " " + ir_expr(node.children[1]).to_string())
-        ir_emit("label " + merge_l)
-        r := ir_reg()
-        ir_emit("load " + r.to_string() + " " + temp_name)
-        return r
+        return ir_emit_catch_expr(node)
 
     if kind == "select_expr":
         return ir_emit_select_expr(node)
@@ -3806,19 +3824,13 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_fail_expr(node)
 
     if kind == "grouped":
-        if node.children.len() > 0:
-            return ir_expr(node.children[0])
-        r := ir_reg()
-        ir_emit("iconst " + r.to_string() + " 0")
-        return r
+        return ir_emit_grouped_expr(node)
 
     if kind == "index":
         return ir_emit_index_expr(idx, node)
 
     # fallback
-    r := ir_reg()
-    ir_emit("iconst " + r.to_string() + " 0")
-    return r
+    return ir_emit_zero_value()
 
 fn ir_emit_return_stmt(node: Node):
     if node.children.len() > 0:

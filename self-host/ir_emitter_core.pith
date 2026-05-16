@@ -1492,6 +1492,84 @@ fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: Int,
 
     ir_emit_struct_result_store(field_regs, "struct:" + target_info.name, temp_name)
 
+fn ir_emit_toml_spec_optional_struct_field(handle_r: Int, key_r: Int, module_path: String, default_idx: Int, optional_struct_tid: Int) -> IrDecodeFieldValue:
+    has_r := ir_reg()
+    ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
+    branch := ir_begin_decode_field_branch(has_r, "toml_spec_optional_struct_field", "tuple")
+    ir_decode_field_store_missing_optional(branch, default_idx)
+    ir_decode_field_present(branch)
+    field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, optional_struct_tid, module_path)
+    ir_emit_result_return_error_branch(field_result_r)
+    ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)))
+    return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
+
+fn ir_emit_toml_spec_nested_struct_field(handle_r: Int, key_r: Int, module_path: String, field_tid: Int, default_idx: Int, nested_struct_tid: Int) -> IrDecodeFieldValue:
+    if default_idx < 0:
+        field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
+        ir_emit_result_return_error_branch(field_result_r)
+        return IrDecodeFieldValue(true, ir_emit_json_field_ok(field_result_r, field_tid))
+
+    has_r := ir_reg()
+    ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
+    branch := ir_begin_decode_field_branch(has_r, "toml_spec_default_struct_field", ir_type_from_tid(field_tid))
+    ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid))
+    ir_decode_field_present(branch)
+    field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
+    ir_emit_result_return_error_branch(field_result_r)
+    ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+    return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
+
+fn ir_emit_toml_spec_optional_scalar_field(handle_r: Int, key_r: Int, module_path: String, default_idx: Int, optional_inner_tid: Int) -> IrDecodeFieldValue:
+    helper_name := ir_toml_require_full_name_for_type_name(ir_type_from_tid(optional_inner_tid), module_path)
+    if helper_name.len() == 0:
+        return ir_decode_missing_helper_value()
+    has_r := ir_reg()
+    ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
+    branch := ir_begin_decode_field_branch(has_r, "toml_spec_optional_field", "tuple")
+    ir_decode_field_store_missing_optional(branch, default_idx)
+    ir_decode_field_present(branch)
+    field_result_r := ir_reg()
+    ir_emit_call2(field_result_r, helper_name, "tuple", handle_r, key_r)
+    ir_emit_result_return_error_branch(field_result_r)
+    ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)))
+    return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
+
+fn ir_emit_toml_spec_scalar_field(handle_r: Int, key_r: Int, module_path: String, field_tid: Int, default_idx: Int) -> IrDecodeFieldValue:
+    helper_name := ir_toml_require_full_name_for_type_name(ir_type_from_tid(field_tid), module_path)
+    if helper_name.len() == 0:
+        return ir_decode_missing_helper_value()
+    if default_idx < 0:
+        field_result_r := ir_reg()
+        ir_emit_call2(field_result_r, helper_name, "tuple", handle_r, key_r)
+        ir_emit_result_return_error_branch(field_result_r)
+        return IrDecodeFieldValue(true, ir_emit_json_field_ok(field_result_r, field_tid))
+
+    has_r := ir_reg()
+    ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
+    branch := ir_begin_decode_field_branch(has_r, "toml_spec_default_field", ir_type_from_tid(field_tid))
+    ir_decode_field_store_and_merge(branch, ir_expr(default_idx))
+    ir_decode_field_present(branch)
+    field_result_r := ir_reg()
+    ir_emit_call2(field_result_r, helper_name, "tuple", handle_r, key_r)
+    ir_emit_result_return_error_branch(field_result_r)
+    ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
+    return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
+
+fn ir_emit_toml_spec_field(handle_r: Int, module_path: String, field_name: String, field_tid: Int, default_idx: Int) -> IrDecodeFieldValue:
+    key_r := ir_reg()
+    ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
+    optional_inner_tid := ir_optional_inner_tid(field_tid)
+    if optional_inner_tid >= 0:
+        optional_struct_tid := ir_struct_decode_field_tid(optional_inner_tid)
+        if optional_struct_tid >= 0:
+            return ir_emit_toml_spec_optional_struct_field(handle_r, key_r, module_path, default_idx, optional_struct_tid)
+    nested_struct_tid := ir_struct_decode_field_tid(field_tid)
+    if nested_struct_tid >= 0:
+        return ir_emit_toml_spec_nested_struct_field(handle_r, key_r, module_path, field_tid, default_idx, nested_struct_tid)
+    if optional_inner_tid >= 0:
+        return ir_emit_toml_spec_optional_scalar_field(handle_r, key_r, module_path, default_idx, optional_inner_tid)
+    return ir_emit_toml_spec_scalar_field(handle_r, key_r, module_path, field_tid, default_idx)
+
 fn ir_emit_toml_decode_struct_from_handle(struct_name: String, module_path: String, handle_name: String):
     if not ir_struct_names.contains_key(struct_name):
         ir_emit_default_return()
@@ -1506,81 +1584,10 @@ fn ir_emit_toml_decode_struct_from_handle(struct_name: String, module_path: Stri
         field_name := ir_struct_field_name_at(struct_name, i)
         field_tid := ir_struct_field_tid_at(struct_name, i, -1)
         default_idx := ir_struct_field_default_node(struct_name, field_name)
-        optional_inner_tid := ir_optional_inner_tid(field_tid)
-        key_r := ir_reg()
-        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
-        mut optional_struct_tid := 0 - 1
-        if optional_inner_tid >= 0:
-            optional_struct_tid = ir_struct_decode_field_tid(optional_inner_tid)
-        if optional_struct_tid >= 0:
-            has_r := ir_reg()
-            ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
-            branch := ir_begin_decode_field_branch(has_r, "toml_spec_optional_struct_field", "tuple")
-            ir_decode_field_store_missing_optional(branch, default_idx)
-            ir_decode_field_present(branch)
-            field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, optional_struct_tid, module_path)
-            ir_emit_result_return_error_branch(field_result_r)
-            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)))
-            field_regs.push(ir_decode_field_load_after_merge(branch))
-            i = i + 1
-            continue
-        nested_struct_tid := ir_struct_decode_field_tid(field_tid)
-        if nested_struct_tid >= 0:
-            if default_idx >= 0:
-                has_r := ir_reg()
-                ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
-                branch := ir_begin_decode_field_branch(has_r, "toml_spec_default_struct_field", ir_type_from_tid(field_tid))
-                ir_decode_field_store_missing_default(branch, default_idx, ir_type_from_tid(field_tid))
-                ir_decode_field_present(branch)
-                field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
-                ir_emit_result_return_error_branch(field_result_r)
-                ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
-                field_regs.push(ir_decode_field_load_after_merge(branch))
-                i = i + 1
-                continue
-            field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
-            ir_emit_result_return_error_branch(field_result_r)
-            field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
-            i = i + 1
-            continue
-        if optional_inner_tid >= 0:
-            helper_name := ir_toml_require_full_name_for_type_name(ir_type_from_tid(optional_inner_tid), module_path)
-            if helper_name.len() == 0:
-                ir_emit_default_return()
-                return
-            has_r := ir_reg()
-            ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
-            branch := ir_begin_decode_field_branch(has_r, "toml_spec_optional_field", "tuple")
-            ir_decode_field_store_missing_optional(branch, default_idx)
-            ir_decode_field_present(branch)
-            field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, helper_name, "tuple", handle_r, key_r)
-            ir_emit_result_return_error_branch(field_result_r)
-            ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)))
-            field_regs.push(ir_decode_field_load_after_merge(branch))
-            i = i + 1
-            continue
-        helper_name := ir_toml_require_full_name_for_type_name(ir_type_from_tid(field_tid), module_path)
-        if helper_name.len() == 0:
-            ir_emit_default_return()
+        field_value := ir_emit_toml_spec_field(handle_r, module_path, field_name, field_tid, default_idx)
+        if not field_value.ok:
             return
-        if default_idx >= 0:
-            has_r := ir_reg()
-            ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
-            branch := ir_begin_decode_field_branch(has_r, "toml_spec_default_field", ir_type_from_tid(field_tid))
-            ir_decode_field_store_and_merge(branch, ir_expr(default_idx))
-            ir_decode_field_present(branch)
-            field_result_r := ir_reg()
-            ir_emit_call2(field_result_r, helper_name, "tuple", handle_r, key_r)
-            ir_emit_result_return_error_branch(field_result_r)
-            ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
-            field_regs.push(ir_decode_field_load_after_merge(branch))
-            i = i + 1
-            continue
-        field_result_r := ir_reg()
-        ir_emit_call2(field_result_r, helper_name, "tuple", handle_r, key_r)
-        ir_emit_result_return_error_branch(field_result_r)
-        field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
+        field_regs.push(field_value.value_r)
         i = i + 1
 
     ir_emit_struct_result_return(field_regs, "struct:" + struct_name)

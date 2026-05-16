@@ -2617,77 +2617,103 @@ fn ir_emit_self_hosted_list_method(node: Node, mname: String, obj_type: String) 
         return ir_emit_list_contains_method(node, obj_type)
     return - 1
 
+fn ir_emit_index_json_decode_call(idx: Int, node: Node, callee_idx: Int) -> Int:
+    if ir_is_json_decode_callee(callee_idx, "decode") or ir_is_local_generic_callee(callee_idx, "decode", "input"):
+        return ir_emit_json_decode_call(idx, node, false)
+    if ir_is_json_decode_callee(callee_idx, "decode_text") or ir_is_local_generic_callee(callee_idx, "decode_text", "input"):
+        return ir_emit_json_decode_call(idx, node, true)
+    if ir_is_json_decode_callee(callee_idx, "decode_object") or ir_is_local_generic_callee(callee_idx, "decode_object", "handle"):
+        return ir_emit_json_decode_object_call(idx, node)
+    if ir_is_json_decode_callee(callee_idx, "decode_path") or ir_is_local_generic_callee(callee_idx, "decode_path", "handle"):
+        return ir_emit_json_decode_path_call(idx, node, false)
+    if ir_is_json_decode_callee(callee_idx, "decode_text_path") or ir_is_local_generic_callee(callee_idx, "decode_text_path", "input"):
+        return ir_emit_json_decode_path_call(idx, node, true)
+    if ir_is_json_decode_callee(callee_idx, "decode_file") or ir_is_local_generic_callee(callee_idx, "decode_file", "file_path"):
+        return ir_emit_json_decode_file_call(idx, node, false)
+    if ir_is_json_decode_callee(callee_idx, "decode_file_path") or ir_is_local_generic_callee(callee_idx, "decode_file_path", "file_path"):
+        return ir_emit_json_decode_file_call(idx, node, true)
+    return 0 - 1
+
+fn ir_emit_index_toml_decode_call(idx: Int, node: Node, callee_idx: Int, callee_node: Node) -> Int:
+    if ir_is_toml_decode_callee(callee_idx, "decode") or ir_is_local_generic_callee(callee_idx, "decode", "handle"):
+        return ir_emit_toml_decode_call(idx, node, false)
+    if ir_is_toml_decode_callee(callee_idx, "decode_text") or ir_is_local_generic_callee(callee_idx, "decode_text", "input"):
+        return ir_emit_toml_decode_call(idx, node, true)
+    if ir_is_toml_decode_callee(callee_idx, "decode_path"):
+        return ir_emit_toml_decode_path_call(idx, node, false)
+    if ir_is_toml_decode_callee(callee_idx, "decode_text_path"):
+        return ir_emit_toml_decode_path_call(idx, node, true)
+    if ir_is_local_generic_callee(callee_idx, "decode_text_path", "input"):
+        return ir_emit_local_toml_decode_text_path_call(idx, node, callee_node)
+    if ir_is_toml_decode_callee(callee_idx, "decode_file") or ir_is_local_generic_callee(callee_idx, "decode_file", "file_path"):
+        return ir_emit_toml_decode_file_call(idx, node, false)
+    if ir_is_toml_decode_callee(callee_idx, "decode_file_path") or ir_is_local_generic_callee(callee_idx, "decode_file_path", "file_path"):
+        return ir_emit_toml_decode_file_call(idx, node, true)
+    return 0 - 1
+
+fn ir_emit_index_config_decode_call(idx: Int, node: Node, callee_idx: Int) -> Int:
+    if ir_is_config_decode_callee(callee_idx, "decode"):
+        return ir_emit_config_decode_call(idx, node, false)
+    if ir_is_config_decode_callee(callee_idx, "decode_prefix"):
+        return ir_emit_config_decode_call(idx, node, true)
+    if ir_is_config_file_decode_callee(callee_idx, "from_toml_file_typed"):
+        return ir_emit_config_file_decode_call(idx, node, "from_toml_file")
+    if ir_is_config_file_decode_callee(callee_idx, "from_json_file_typed"):
+        return ir_emit_config_file_decode_call(idx, node, "from_json_file")
+    if ir_is_config_file_decode_callee(callee_idx, "from_toml_typed_prefix"):
+        return ir_emit_config_loader_decode_call(idx, node, "from_toml", true)
+    if ir_is_config_file_decode_callee(callee_idx, "from_json_typed_prefix"):
+        return ir_emit_config_loader_decode_call(idx, node, "from_json", true)
+    if ir_is_config_file_decode_callee(callee_idx, "from_toml_file_typed_prefix"):
+        return ir_emit_config_loader_decode_call(idx, node, "from_toml_file", true)
+    if ir_is_config_file_decode_callee(callee_idx, "from_json_file_typed_prefix"):
+        return ir_emit_config_loader_decode_call(idx, node, "from_json_file", true)
+    return 0 - 1
+
+fn ir_emit_index_decode_call(idx: Int, node: Node, callee_idx: Int, callee_node: Node) -> Int:
+    json_r := ir_emit_index_json_decode_call(idx, node, callee_idx)
+    if json_r >= 0:
+        return json_r
+    config_r := ir_emit_index_config_decode_call(idx, node, callee_idx)
+    if config_r >= 0:
+        return config_r
+    return ir_emit_index_toml_decode_call(idx, node, callee_idx, callee_node)
+
+fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
+    expr_tid := c_get_expr_type(idx)
+    if expr_tid < 0:
+        return 0 - 1
+    expr_info := get_type_info(expr_tid)
+    if expr_info.kind != "struct":
+        return 0 - 1
+    if ir_is_declared_callable(callee_name) or ir_is_sync_primitive_name(callee_name):
+        return 0 - 1
+    mut arg_nodes: List[Int] := []
+    for child, i in node.children:
+        if i == 0:
+            continue
+        arg_nodes.push(child)
+    return ir_emit_struct_positional_init(expr_info.name, arg_nodes)
+
+fn ir_specialize_static_callee(idx: Int, node: Node, callee: ResolvedCallee, explicit_generic_types: List[String]) -> ResolvedCallee:
+    if not ir_is_generic_function_name(callee.name):
+        return callee
+    mut generic_ret_type := ir_checked_type(idx)
+    if generic_ret_type.len() == 0:
+        generic_ret_type = ir_infer_type(idx)
+    mut concrete_types := explicit_generic_types
+    if concrete_types.len() == 0:
+        concrete_types = ir_infer_generic_concrete_types(callee.name, node)
+    return ResolvedCallee(ir_queue_generic_specialization(callee.name, concrete_types, generic_ret_type), false)
+
 fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     mut explicit_generic_types: List[String] := []
     if node.children.len() > 0:
         callee_node := get_node(node.children[0])
         if callee_node.kind == "index":
-            if ir_is_json_decode_callee(node.children[0], "decode"):
-                return ir_emit_json_decode_call(idx, node, false)
-            if ir_is_json_decode_callee(node.children[0], "decode_text"):
-                return ir_emit_json_decode_call(idx, node, true)
-            if ir_is_json_decode_callee(node.children[0], "decode_object"):
-                return ir_emit_json_decode_object_call(idx, node)
-            if ir_is_json_decode_callee(node.children[0], "decode_path"):
-                return ir_emit_json_decode_path_call(idx, node, false)
-            if ir_is_json_decode_callee(node.children[0], "decode_text_path"):
-                return ir_emit_json_decode_path_call(idx, node, true)
-            if ir_is_json_decode_callee(node.children[0], "decode_file"):
-                return ir_emit_json_decode_file_call(idx, node, false)
-            if ir_is_json_decode_callee(node.children[0], "decode_file_path"):
-                return ir_emit_json_decode_file_call(idx, node, true)
-            if ir_is_local_generic_callee(node.children[0], "decode", "input"):
-                return ir_emit_json_decode_call(idx, node, false)
-            if ir_is_local_generic_callee(node.children[0], "decode_text", "input"):
-                return ir_emit_json_decode_call(idx, node, true)
-            if ir_is_local_generic_callee(node.children[0], "decode_object", "handle"):
-                return ir_emit_json_decode_object_call(idx, node)
-            if ir_is_local_generic_callee(node.children[0], "decode_path", "handle"):
-                return ir_emit_json_decode_path_call(idx, node, false)
-            if ir_is_local_generic_callee(node.children[0], "decode_text_path", "input"):
-                return ir_emit_json_decode_path_call(idx, node, true)
-            if ir_is_local_generic_callee(node.children[0], "decode_file", "file_path"):
-                return ir_emit_json_decode_file_call(idx, node, false)
-            if ir_is_local_generic_callee(node.children[0], "decode_file_path", "file_path"):
-                return ir_emit_json_decode_file_call(idx, node, true)
-            if ir_is_config_decode_callee(node.children[0], "decode"):
-                return ir_emit_config_decode_call(idx, node, false)
-            if ir_is_config_decode_callee(node.children[0], "decode_prefix"):
-                return ir_emit_config_decode_call(idx, node, true)
-            if ir_is_toml_decode_callee(node.children[0], "decode"):
-                return ir_emit_toml_decode_call(idx, node, false)
-            if ir_is_toml_decode_callee(node.children[0], "decode_text"):
-                return ir_emit_toml_decode_call(idx, node, true)
-            if ir_is_toml_decode_callee(node.children[0], "decode_path"):
-                return ir_emit_toml_decode_path_call(idx, node, false)
-            if ir_is_toml_decode_callee(node.children[0], "decode_text_path"):
-                return ir_emit_toml_decode_path_call(idx, node, true)
-            if ir_is_toml_decode_callee(node.children[0], "decode_file"):
-                return ir_emit_toml_decode_file_call(idx, node, false)
-            if ir_is_toml_decode_callee(node.children[0], "decode_file_path"):
-                return ir_emit_toml_decode_file_call(idx, node, true)
-            if ir_is_local_generic_callee(node.children[0], "decode", "handle"):
-                return ir_emit_toml_decode_call(idx, node, false)
-            if ir_is_local_generic_callee(node.children[0], "decode_text", "input"):
-                return ir_emit_toml_decode_call(idx, node, true)
-            if ir_is_local_generic_callee(node.children[0], "decode_text_path", "input"):
-                return ir_emit_local_toml_decode_text_path_call(idx, node, callee_node)
-            if ir_is_local_generic_callee(node.children[0], "decode_file", "file_path"):
-                return ir_emit_toml_decode_file_call(idx, node, false)
-            if ir_is_local_generic_callee(node.children[0], "decode_file_path", "file_path"):
-                return ir_emit_toml_decode_file_call(idx, node, true)
-            if ir_is_config_file_decode_callee(node.children[0], "from_toml_file_typed"):
-                return ir_emit_config_file_decode_call(idx, node, "from_toml_file")
-            if ir_is_config_file_decode_callee(node.children[0], "from_json_file_typed"):
-                return ir_emit_config_file_decode_call(idx, node, "from_json_file")
-            if ir_is_config_file_decode_callee(node.children[0], "from_toml_typed_prefix"):
-                return ir_emit_config_loader_decode_call(idx, node, "from_toml", true)
-            if ir_is_config_file_decode_callee(node.children[0], "from_json_typed_prefix"):
-                return ir_emit_config_loader_decode_call(idx, node, "from_json", true)
-            if ir_is_config_file_decode_callee(node.children[0], "from_toml_file_typed_prefix"):
-                return ir_emit_config_loader_decode_call(idx, node, "from_toml_file", true)
-            if ir_is_config_file_decode_callee(node.children[0], "from_json_file_typed_prefix"):
-                return ir_emit_config_loader_decode_call(idx, node, "from_json_file", true)
+            special_r := ir_emit_index_decode_call(idx, node, node.children[0], callee_node)
+            if special_r >= 0:
+                return special_r
             explicit_generic_types = ir_explicit_generic_concrete_types(callee_node)
 
     mut callee := ResolvedCallee("unknown", false)
@@ -2698,24 +2724,10 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     higher_order_r := ir_emit_higher_order_list_call(idx, node, callee.name)
     if higher_order_r >= 0:
         return higher_order_r
-    expr_tid := c_get_expr_type(idx)
-    if expr_tid >= 0:
-        expr_info := get_type_info(expr_tid)
-        if expr_info.kind == "struct" and ir_is_declared_callable(callee.name) == false and not ir_is_sync_primitive_name(callee.name):
-            mut arg_nodes: List[Int] := []
-            for child, i in node.children:
-                if i == 0:
-                    continue
-                arg_nodes.push(child)
-            return ir_emit_struct_positional_init(expr_info.name, arg_nodes)
-    if ir_is_generic_function_name(callee.name):
-        mut generic_ret_type := ir_checked_type(idx)
-        if generic_ret_type.len() == 0:
-            generic_ret_type = ir_infer_type(idx)
-        mut concrete_types := explicit_generic_types
-        if concrete_types.len() == 0:
-            concrete_types = ir_infer_generic_concrete_types(callee.name, node)
-        callee = ResolvedCallee(ir_queue_generic_specialization(callee.name, concrete_types, generic_ret_type), false)
+    struct_r := ir_static_struct_init_call(idx, node, callee.name)
+    if struct_r >= 0:
+        return struct_r
+    callee = ir_specialize_static_callee(idx, node, callee, explicit_generic_types)
     arg_regs := ir_collect_call_arg_regs(node, 1)
     if callee.name == "Channel" and arg_regs.len() == 0:
         zero_r := ir_reg()

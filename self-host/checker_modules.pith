@@ -1,0 +1,58 @@
+# checker_modules.pith — module-name helpers for the semantic checker
+
+pub fn module_symbol_prefix(module_path: String) -> String:
+    mut prefix := ""
+    for ch in module_path:
+        if ch == ".":
+            prefix = prefix + "_"
+        else:
+            prefix = prefix + ch
+    return prefix + "_"
+
+pub fn module_generic_target_name(module_path: String, name: String) -> String:
+    if module_path.len() == 0:
+        return name
+    return module_symbol_prefix(module_path) + name
+
+pub fn clean_import_part(part: String) -> String:
+    mut start := 0
+    mut end := part.len()
+    while start < end and part[start] == ",":
+        start = start + 1
+    while end > start and part[end - 1] == ",":
+        end = end - 1
+    return part.substring(start, end)
+
+pub fn module_default_alias(module_path: String) -> String:
+    mut last_dot := 0 - 1
+    mut i := 0
+    while i < module_path.len():
+        if module_path[i] == ".":
+            last_dot = i
+        i = i + 1
+    if last_dot < 0:
+        return module_path
+    return module_path.substring(last_dot + 1, module_path.len())
+
+pub fn module_import_target_name(module_path: String, name: String) -> String:
+    if module_path == "std.json":
+        return "json_" + name
+    if module_path == "std.toml":
+        return "toml_" + name
+    if module_path == "std.encoding":
+        return "encoding_" + name
+    if module_path == "std.hash":
+        return "hash_" + name
+    if module_path == "std.log":
+        return "log_" + name
+    if module_path == "std.net.url":
+        return "url_" + name
+    return name
+
+pub fn split_qualified_name(value: String) -> (String, String):
+    mut i := 0
+    while i < value.len():
+        if ord(value[i]) == 46:
+            return (value.substring(0, i), value.substring(i + 1, value.len()))
+        i = i + 1
+    return (value, "")

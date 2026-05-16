@@ -1,0 +1,28 @@
+# ir_literals.pith - literal expression lowering
+
+from ast import Node
+from ir_builder import ir_emit, ir_reg, ir_str
+
+pub fn ir_emit_int_literal(node: Node) -> Int:
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " " + node.value)
+    return r
+
+pub fn ir_emit_string_literal(node: Node) -> Int:
+    si := ir_str(node.value)
+    r := ir_reg()
+    ir_emit("strref " + r.to_string() + " " + si)
+    return r
+
+pub fn ir_emit_float_literal(node: Node) -> Int:
+    r := ir_reg()
+    ir_emit("fconst " + r.to_string() + " " + node.value)
+    return r
+
+pub fn ir_emit_bool_literal(node: Node) -> Int:
+    r := ir_reg()
+    if node.value == "true":
+        ir_emit("iconst " + r.to_string() + " 1")
+    else:
+        ir_emit("iconst " + r.to_string() + " 0")
+    return r

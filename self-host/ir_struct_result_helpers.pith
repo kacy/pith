@@ -1,0 +1,47 @@
+# ir_struct_result_helpers.pith - struct result packing IR helpers
+
+from ir_builder import ir_emit, ir_reg
+from ir_metadata import ir_runtime_call_name
+
+fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
+    ir_emit("call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " 1 " + arg0.to_string())
+
+fn ir_zero_reg_raw() -> Int:
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " 0")
+    return r
+
+fn ir_emit_result_tuple_raw(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " 3")
+    result_r := ir_reg()
+    ir_emit_call1_raw(result_r, "__struct_alloc", "struct:tuple", count_r)
+    ir_emit("sstore " + result_r.to_string() + " 0 " + is_ok_r.to_string())
+    ir_emit("sstore " + result_r.to_string() + " 1 " + ok_r.to_string())
+    ir_emit("sstore " + result_r.to_string() + " 2 " + err_r.to_string())
+    return result_r
+
+fn ir_emit_ok_result_tuple_raw(ok_r: Int) -> Int:
+    one := ir_reg()
+    ir_emit("iconst " + one.to_string() + " 1")
+    return ir_emit_result_tuple_raw(one, ok_r, ir_zero_reg_raw())
+
+pub fn ir_emit_struct_result_store(field_regs: List[Int], struct_kind: String, temp_name: String):
+    struct_r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " " + field_regs.len().to_string())
+    ir_emit_call1_raw(struct_r, "__struct_alloc", struct_kind, field_count_r)
+    for field_reg, fi in field_regs:
+        ir_emit("sstore " + struct_r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple_raw(struct_r).to_string())
+
+pub fn ir_emit_struct_result_return(field_regs: List[Int], struct_kind: String):
+    struct_r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " " + field_regs.len().to_string())
+    ir_emit_call1_raw(struct_r, "__struct_alloc", struct_kind, field_count_r)
+    for field_reg, fi in field_regs:
+        ir_emit("sstore " + struct_r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    result_r := ir_emit_ok_result_tuple_raw(struct_r)
+    ir_emit("ret " + result_r.to_string())
+    ir_emit("endfunc")

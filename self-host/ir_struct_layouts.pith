@@ -1,0 +1,116 @@
+# ir_struct_layouts.pith - struct layout metadata lookups
+
+from ast import get_node
+from ir_ast_helpers import ir_unwrap_pub_node
+from ir_type_helpers import ir_resolve_type_hint_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid
+from types import get_type_info, lookup_type_id
+
+pub fn ir_struct_layout_name_with_state(struct_name: String, struct_names: Map[String, Int]) -> String:
+    if struct_names.contains_key(struct_name):
+        return struct_name
+    if struct_name.contains("["):
+        base_name := struct_name.substring(0, struct_name.index_of("["))
+        if struct_names.contains_key(base_name):
+            return base_name
+    return struct_name
+
+pub fn ir_struct_field_count_with_state(struct_name: String, struct_names: Map[String, Int]) -> Int:
+    layout_name := ir_struct_layout_name_with_state(struct_name, struct_names)
+    if struct_names.contains_key(layout_name):
+        return struct_names[layout_name]
+    return 0
+
+pub fn ir_struct_field_name_at_with_state(struct_name: String, field_index: Int, struct_names: Map[String, Int], struct_field_index_lookup: Map[String, String]) -> String:
+    struct_tid := lookup_type_id(struct_name)
+    if struct_tid >= 0:
+        struct_info := get_type_info(struct_tid)
+        if struct_info.kind == "struct" and field_index >= 0 and field_index < struct_info.fields.len():
+            return struct_info.fields[field_index]
+    prefix := ir_struct_layout_name_with_state(struct_name, struct_names) + "."
+    want := field_index.to_string()
+    for key in struct_field_index_lookup:
+        if key.starts_with(prefix) and struct_field_index_lookup[key] == want:
+            return key.substring(prefix.len(), key.len())
+    return ""
+
+pub fn ir_struct_field_type_name_with_state(struct_name: String, field_name: String, struct_names: Map[String, Int], struct_field_lookup: Map[String, String]) -> String:
+    key := ir_struct_layout_name_with_state(struct_name, struct_names) + "." + field_name
+    if struct_field_lookup.contains_key(key):
+        return struct_field_lookup[key]
+    return ""
+
+fn ir_struct_resolve_type_node(type_idx: Int, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
+    type_node := get_node(type_idx)
+    if type_node.kind == "type":
+        return ir_resolve_type_hint_with_state(type_node.value, type_aliases, struct_names)
+    if type_node.kind == "generic_type":
+        resolved := ir_resolve_generic_type_node(type_node)
+        if resolved.len() > 0:
+            return resolved
+        return ir_resolve_type_hint_with_state(type_node.value, type_aliases, struct_names)
+    if type_node.kind == "optional_type" and type_node.children.len() > 0:
+        return "tuple"
+    if type_node.kind == "result_type" and type_node.children.len() > 0:
+        inner_type := ir_struct_resolve_type_node(type_node.children[0], type_aliases, struct_names)
+        return ir_resolve_result_type_kind(inner_type)
+    if type_node.kind == "fn_type":
+        return "closure"
+    if type_node.kind == "tuple_type":
+        return "tuple"
+    return ""
+
+pub fn ir_struct_field_kind_from_decl_with_state(struct_name: String, field_index: Int, struct_names: Map[String, Int], struct_decl_nodes: Map[String, Int], type_aliases: Map[String, String]) -> String:
+    layout_name := ir_struct_layout_name_with_state(struct_name, struct_names)
+    if not struct_decl_nodes.contains_key(layout_name):
+        return ""
+    decl := get_node(struct_decl_nodes[layout_name])
+    mut current_index := 0
+    for child in decl.children:
+        field_node := ir_unwrap_pub_node(child)
+        if field_node.kind != "field":
+            continue
+        if current_index == field_index:
+            if field_node.children.len() > 0:
+                return ir_struct_resolve_type_node(field_node.children[0], type_aliases, struct_names)
+            return ""
+        current_index = current_index + 1
+    return ""
+
+pub fn ir_field_kind_tid_with_state(kind: String, struct_names: Map[String, Int]) -> Int:
+    if kind == "int":
+        return 0
+    if kind == "float":
+        return 2
+    if kind == "bool":
+        return 3
+    if kind == "string":
+        return 4
+    if kind == "bytes":
+        return 5
+    if kind == "void":
+        return 6
+    if struct_names.contains_key(kind):
+        return lookup_type_id(kind)
+    return - 1
+
+pub fn ir_struct_field_tid_at_with_state(struct_name: String, field_index: Int, fallback_tid: Int, struct_names: Map[String, Int], struct_decl_nodes: Map[String, Int], struct_field_index_lookup: Map[String, String], struct_field_lookup: Map[String, String], type_aliases: Map[String, String]) -> Int:
+    mut field_kind := ir_struct_field_kind_from_decl_with_state(struct_name, field_index, struct_names, struct_decl_nodes, type_aliases)
+    if field_kind.len() == 0:
+        field_name := ir_struct_field_name_at_with_state(struct_name, field_index, struct_names, struct_field_index_lookup)
+        field_kind = ir_struct_field_type_name_with_state(struct_name, field_name, struct_names, struct_field_lookup)
+    if field_kind.len() == 0:
+        return fallback_tid
+    field_tid := ir_field_kind_tid_with_state(field_kind, struct_names)
+    if field_tid < 0:
+        return fallback_tid
+    if fallback_tid < 0:
+        return field_tid
+    if ir_type_from_tid(fallback_tid) != field_kind:
+        return field_tid
+    return fallback_tid
+
+pub fn ir_struct_field_default_node_with_state(struct_name: String, field_name: String, struct_names: Map[String, Int], struct_field_default_nodes: Map[String, Int]) -> Int:
+    key := ir_struct_layout_name_with_state(struct_name, struct_names) + "." + field_name
+    if struct_field_default_nodes.contains_key(key):
+        return struct_field_default_nodes[key]
+    return 0 - 1

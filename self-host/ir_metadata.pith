@@ -1,0 +1,282 @@
+# ir_metadata.pith — static IR lowering metadata
+
+FLOAT_RETURNING_FUNCS := "pow,sqrt,floor,ceil,round,to_float,get_float"
+BOOL_RETURNING_FUNCS := "file_exists,dir_exists,fs_remove_dir,fs_remove_tree,os_chdir,os_set_env,os_unset_env,get_bool,object_has,has,crypto_constant_time_eq,crypto_verify_ed25519,crypto_verify_ecdsa_p256_sha256_asn1,crypto_verify_rsa_pkcs1_sha256,crypto_verify_rsa_pss_sha256,byte_buffer_set"
+INT_RETURNING_FUNCS := "abs,min,max,clamp,len,fnv1a,ord,exec,fs_file_size,byte_buffer_len,byte_buffer_get,crypto_x25519_keygen,UInt,Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64"
+STRING_RETURNING_FUNCS := "sha256,hex_encode,hex_decode,to_hex,b64_encode,chr,read_file,env,os_getcwd,os_temp_dir,os_home_dir,os_cert_roots_pem,scheme,host,query,fragment,decode,exec_output,type_of,get_string"
+BYTES_RETURNING_FUNCS := "bytes_from_string_utf8,read_file_bytes,file_read_bytes,tcp_read_bytes,process_read_bytes,process_read_err_bytes,byte_buffer_bytes,b64_decode,from_hex,bytes_slice,bytes_concat,secure_random_bytes,crypto_x25519_public_key,crypto_x25519_shared_secret,crypto_aes_128_gcm_seal,crypto_aes_128_gcm_open,crypto_chacha20_poly1305_seal,crypto_chacha20_poly1305_open,crypto_sign_rsa_pss_sha256_pkcs8"
+LIST_RETURNING_FUNCS := "args,range,repeat_val,zeros,sort,sort_desc,reversed,take,drop,slice,unique,without,intersection,difference,flatten,chunks"
+LIST_STRING_RETURNING_FUNCS := "sort_strings,zip,enumerate,toml_keys"
+BOOL_RETURNING_METHODS := "contains,starts_with,ends_with,is_empty,string_contains,string_is_empty,contains_key,map_contains_key,map_contains_ikey,map_is_empty,set_contains,set_contains_int,set_is_empty,send,try_send,close,is_closed,is_done"
+VOID_METHODS := "reverse,clear,push,remove,insert,add,list_remove,list_clear,list_reverse,map_insert,map_insert_ikey,map_remove,map_remove_ikey,map_clear,set_add,set_add_int,set_remove,set_remove_int,set_clear,detach,lock,unlock,done,wait,acquire,release"
+STRING_RETURNING_METHODS := "trim,substring,to_upper,to_lower,reverse,replace,repeat,pad_left,pad_right,char_at,join,list_join,read_file,env,chr"
+
+fn ir_csv_contains(csv: String, name: String) -> Bool:
+    if name.len() == 0:
+        return false
+    items := csv.split(",")
+    for item in items:
+        if item == name:
+            return true
+    return false
+
+pub fn ir_is_float_returning_func(fname: String) -> Bool:
+    return ir_csv_contains(FLOAT_RETURNING_FUNCS, fname)
+
+pub fn ir_is_bool_returning_func(fname: String) -> Bool:
+    return ir_csv_contains(BOOL_RETURNING_FUNCS, fname)
+
+pub fn ir_is_int_returning_func(fname: String) -> Bool:
+    return ir_csv_contains(INT_RETURNING_FUNCS, fname)
+
+pub fn ir_is_string_returning_func(fname: String) -> Bool:
+    return ir_csv_contains(STRING_RETURNING_FUNCS, fname)
+
+pub fn ir_is_bytes_returning_func(fname: String) -> Bool:
+    return ir_csv_contains(BYTES_RETURNING_FUNCS, fname)
+
+pub fn ir_is_list_returning_func(fname: String) -> Bool:
+    return ir_csv_contains(LIST_RETURNING_FUNCS, fname)
+
+pub fn ir_is_list_string_returning_func(fname: String) -> Bool:
+    return ir_csv_contains(LIST_STRING_RETURNING_FUNCS, fname)
+
+pub fn ir_is_known_returning_func(fname: String) -> Bool:
+    return ir_is_float_returning_func(fname) or ir_is_bool_returning_func(fname) or ir_is_int_returning_func(fname) or ir_is_string_returning_func(fname) or ir_is_bytes_returning_func(fname) or ir_is_list_returning_func(fname) or ir_is_list_string_returning_func(fname)
+
+pub fn ir_is_bool_returning_method(meth: String) -> Bool:
+    return ir_csv_contains(BOOL_RETURNING_METHODS, meth)
+
+pub fn ir_is_void_method(meth: String) -> Bool:
+    return ir_csv_contains(VOID_METHODS, meth)
+
+pub fn ir_is_string_returning_method(meth: String) -> Bool:
+    return ir_csv_contains(STRING_RETURNING_METHODS, meth)
+
+pub fn ir_runtime_call_name(name: String) -> String:
+    if name == "print":
+        return "pith_print_cstr"
+    if name == "spawn":
+        return "pith_spawn"
+    if name == "await":
+        return "pith_await"
+    if name == "int_to_string":
+        return "int_to_string"
+    if name == "float_to_string":
+        return "float_to_string"
+    if name == "bool_to_string":
+        return "bool_to_string"
+    if name == "len":
+        return "pith_auto_len"
+    if name == "contains" or name == "string_contains":
+        return "pith_cstring_contains"
+    if name == "substring":
+        return "pith_cstring_substring"
+    if name == "starts_with":
+        return "pith_cstring_starts_with"
+    if name == "ends_with":
+        return "pith_cstring_ends_with"
+    if name == "trim":
+        return "pith_cstring_trim"
+    if name == "split":
+        return "pith_string_split_to_list"
+    if name == "to_upper":
+        return "pith_cstring_to_upper"
+    if name == "to_lower":
+        return "pith_cstring_to_lower"
+    if name == "replace":
+        return "pith_cstring_replace"
+    if name == "repeat":
+        return "pith_cstring_repeat"
+    if name == "index_of" or name == "string_index_of":
+        return "pith_cstring_index_of"
+    if name == "last_index_of" or name == "string_last_index_of":
+        return "pith_cstring_last_index_of"
+    if name == "char_at":
+        return "pith_cstring_char_at"
+    if name == "chars":
+        return "pith_cstring_chars"
+    if name == "reverse":
+        return "pith_cstring_reverse"
+    if name == "is_empty" or name == "string_is_empty":
+        return "pith_cstring_is_empty"
+    if name == "join":
+        return "list_join"
+    if name == "slice":
+        return "list_slice_copy"
+    if name == "push":
+        return "pith_list_push_value"
+    if name == "pop":
+        return "pith_list_pop"
+    if name == "set":
+        return "pith_list_set_value"
+    if name == "sort_strings":
+        return "pith_list_sort_strings"
+    if name == "__list_get" or name == "__index":
+        return "pith_list_get_value"
+    if name == "__list_get_unchecked":
+        return "pith_list_get_value_unchecked"
+    if name == "__list_new":
+        return "pith_list_new_default"
+    if name == "__list_push":
+        return "pith_list_push_value"
+    if name == "__map_new":
+        return "pith_map_new_default"
+    if name == "__map_new_int":
+        return "pith_map_new_int"
+    if name == "__set_new":
+        return "pith_set_new_default"
+    if name == "__set_new_int":
+        return "pith_set_new_int"
+    if name == "__set_to_list":
+        return "pith_set_to_list_cstr"
+    if name == "__set_to_list_int":
+        return "pith_set_to_list_int_handle"
+    if name == "__struct_alloc":
+        return "pith_struct_alloc"
+    if name == "__closure_set_env":
+        return "pith_closure_set_env"
+    if name == "__closure_get_env":
+        return "pith_closure_get_env"
+    if name == "__str_eq":
+        return "pith_cstring_eq"
+    return name
+
+fn ir_method_string_emit_name(mname: String) -> String:
+    if mname == "len":
+        return "string_len"
+    if mname == "is_empty":
+        return "string_is_empty"
+    return mname
+
+fn ir_method_bytes_emit_name(mname: String) -> String:
+    if mname == "len":
+        return "bytes_len"
+    if mname == "is_empty":
+        return "bytes_is_empty"
+    if mname == "slice":
+        return "bytes_slice"
+    if mname == "concat":
+        return "bytes_concat"
+    if mname == "to_string_utf8":
+        return "bytes_to_string_utf8"
+    return mname
+
+fn ir_method_list_emit_name(mname: String, obj_type: String) -> String:
+    if mname == "len":
+        return "pith_list_len"
+    if mname == "slice":
+        return "list_slice_copy"
+    if mname == "sort":
+        if obj_type == "list_string":
+            return "list_sort_strings_copy"
+        return "list_sort_copy"
+    if mname == "join":
+        return "list_join"
+    if mname == "reverse":
+        return "list_reverse"
+    if mname == "clear":
+        return "list_clear"
+    return mname
+
+fn ir_method_map_emit_name(mname: String, obj_type: String) -> String:
+    obj_is_map_int := obj_type == "map_int"
+    if mname == "len":
+        return "map_len"
+    if mname == "is_empty":
+        return "map_is_empty"
+    if mname == "clear":
+        return "map_clear"
+    if mname == "keys":
+        return "map_keys"
+    if mname == "values":
+        return "map_values"
+    if mname == "contains_key" and obj_is_map_int:
+        return "map_contains_ikey"
+    if mname == "insert":
+        if obj_is_map_int:
+            return "map_insert_ikey"
+        return "map_insert"
+    if mname == "remove":
+        if obj_is_map_int:
+            return "map_remove_ikey"
+        return "map_remove"
+    return mname
+
+fn ir_method_set_emit_name(mname: String, obj_type: String) -> String:
+    obj_is_set_int := obj_type == "set_int"
+    if mname == "len":
+        return "set_len"
+    if mname == "add":
+        if obj_is_set_int:
+            return "set_add_int"
+        return "set_add"
+    if mname == "contains":
+        if obj_is_set_int:
+            return "set_contains_int"
+        return "set_contains"
+    if mname == "is_empty":
+        return "set_is_empty"
+    if mname == "clear":
+        return "set_clear"
+    if mname == "remove":
+        if obj_is_set_int:
+            return "set_remove_int"
+        return "set_remove"
+    return mname
+
+pub fn ir_method_emit_name(mname: String, obj_type: String) -> String:
+    obj_is_string := obj_type == "string"
+    obj_is_bytes := obj_type == "bytes"
+    obj_is_bool := obj_type == "bool"
+    obj_is_float := obj_type == "float"
+    obj_is_int := obj_type == "int"
+    obj_is_map := obj_type == "map" or obj_type == "map_int"
+    obj_is_set := obj_type == "set" or obj_type == "set_int"
+    obj_is_list := obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
+    obj_is_channel := obj_type == "channel" or obj_type.starts_with("channel:")
+    obj_is_task := obj_type == "task" or obj_type.starts_with("task:")
+
+    mut emit_name := mname
+    if mname == "to_string":
+        if obj_is_float:
+            emit_name = "float_to_string"
+        elif obj_is_bool:
+            emit_name = "bool_to_string"
+        elif obj_is_int:
+            emit_name = "int_to_string"
+        elif obj_is_string:
+            emit_name = "identity"
+    elif obj_is_string:
+        emit_name = ir_method_string_emit_name(mname)
+    elif obj_is_bytes:
+        emit_name = ir_method_bytes_emit_name(mname)
+    elif obj_is_list:
+        emit_name = ir_method_list_emit_name(mname, obj_type)
+    elif obj_is_map:
+        emit_name = ir_method_map_emit_name(mname, obj_type)
+    elif obj_is_set:
+        emit_name = ir_method_set_emit_name(mname, obj_type)
+    elif obj_is_channel:
+        if mname == "len":
+            emit_name = "pith_channel_len"
+        elif mname == "cap":
+            emit_name = "pith_channel_cap"
+        elif mname == "send":
+            emit_name = "pith_channel_send"
+        elif mname == "try_send":
+            emit_name = "pith_channel_try_send"
+        elif mname == "recv":
+            emit_name = "pith_channel_recv"
+        elif mname == "try_recv":
+            emit_name = "pith_channel_try_recv"
+        elif mname == "close":
+            emit_name = "pith_channel_close"
+        elif mname == "is_closed":
+            emit_name = "pith_channel_is_closed"
+    elif obj_is_task:
+        if mname == "is_done":
+            emit_name = "pith_task_is_done"
+        elif mname == "detach":
+            emit_name = "pith_task_detach"
+    return emit_name

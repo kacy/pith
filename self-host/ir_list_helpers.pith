@@ -1,0 +1,184 @@
+# ir_list_helpers.pith - list method and higher-order list IR helpers
+
+from ir_builder import ir_emit, ir_reg, ir_label
+from ir_metadata import ir_runtime_call_name
+
+fn ir_emit_call_text_raw(result_reg: Int, fname: String, ret_kind: String, arg_count: Int, arg_text: String):
+    mut call_line := "call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " " + arg_count.to_string()
+    if arg_text.len() > 0:
+        call_line = call_line + arg_text
+    ir_emit(call_line)
+
+fn ir_emit_call0_raw(result_reg: Int, fname: String, ret_kind: String):
+    ir_emit_call_text_raw(result_reg, fname, ret_kind, 0, "")
+
+fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
+    ir_emit_call_text_raw(result_reg, fname, ret_kind, 1, " " + arg0.to_string())
+
+fn ir_emit_call2_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int, arg1: Int):
+    ir_emit_call_text_raw(result_reg, fname, ret_kind, 2, " " + arg0.to_string() + " " + arg1.to_string())
+
+fn ir_emit_list_loop_step(idx_name: String, i_r: Int, loop_l: String):
+    one_r := ir_reg()
+    ir_emit("iconst " + one_r.to_string() + " 1")
+    next_i_r := ir_reg()
+    ir_emit("add " + next_i_r.to_string() + " " + i_r.to_string() + " " + one_r.to_string())
+    ir_emit("store " + idx_name + " " + next_i_r.to_string())
+    ir_emit("jmp " + loop_l)
+
+pub fn ir_is_list_runtime_type(obj_type: String) -> Bool:
+    return obj_type == "list" or obj_type == "list_string" or obj_type.starts_with("list:")
+
+pub fn ir_emit_list_map_loop(list_r: Int, mapper_name: String, result_kind: String, elem_kind: String, mapped_kind: String, idx_name: String) -> Int:
+    result_r := ir_reg()
+    ir_emit_call0_raw(result_r, "__list_new", result_kind)
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    keep_loop_r := ir_reg()
+    ir_emit("lt " + keep_loop_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + keep_loop_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2_raw(item_r, "__list_get", elem_kind, list_r, i_r)
+    mapped_r := ir_reg()
+    ir_emit_call_text_raw(mapped_r, mapper_name, mapped_kind, 1, " " + item_r.to_string())
+    ir_emit_call2_raw(ir_reg(), "__list_push", "void", result_r, mapped_r)
+    ir_emit_list_loop_step(idx_name, i_r, loop_l)
+    ir_emit("label " + done_l)
+    return result_r
+
+pub fn ir_emit_list_filter_loop(list_r: Int, keep_name: String, result_kind: String, elem_kind: String, idx_name: String) -> Int:
+    result_r := ir_reg()
+    ir_emit_call0_raw(result_r, "__list_new", result_kind)
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    push_l := ir_label()
+    step_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    keep_loop_r := ir_reg()
+    ir_emit("lt " + keep_loop_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + keep_loop_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2_raw(item_r, "__list_get", elem_kind, list_r, i_r)
+    pred_r := ir_reg()
+    ir_emit_call_text_raw(pred_r, keep_name, "int", 1, " " + item_r.to_string())
+    ir_emit("brif " + pred_r.to_string() + " " + push_l + " " + step_l)
+    ir_emit("label " + push_l)
+    ir_emit_call2_raw(ir_reg(), "__list_push", "void", result_r, item_r)
+    ir_emit("label " + step_l)
+    ir_emit_list_loop_step(idx_name, i_r, loop_l)
+    ir_emit("label " + done_l)
+    return result_r
+
+pub fn ir_emit_list_reduce_loop(list_r: Int, reducer_name: String, acc_name: String, elem_kind: String, result_kind: String, idx_name: String) -> Int:
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    keep_loop_r := ir_reg()
+    ir_emit("lt " + keep_loop_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + keep_loop_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2_raw(item_r, "__list_get", elem_kind, list_r, i_r)
+    acc_r := ir_reg()
+    ir_emit("load " + acc_r.to_string() + " " + acc_name)
+    next_acc_r := ir_reg()
+    ir_emit_call_text_raw(next_acc_r, reducer_name, result_kind, 2, " " + acc_r.to_string() + " " + item_r.to_string())
+    ir_emit("store " + acc_name + " " + next_acc_r.to_string())
+    ir_emit_list_loop_step(idx_name, i_r, loop_l)
+    ir_emit("label " + done_l)
+    out_r := ir_reg()
+    ir_emit("load " + out_r.to_string() + " " + acc_name)
+    return out_r
+
+pub fn ir_emit_list_is_empty(list_r: Int) -> Int:
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    out_r := ir_reg()
+    ir_emit("eq " + out_r.to_string() + " " + len_r.to_string() + " " + zero_r.to_string())
+    return out_r
+
+fn ir_emit_list_item_eq(out_r: Int, elem_kind: String, item_r: Int, target_r: Int):
+    if elem_kind == "string":
+        ir_emit_call2_raw(out_r, "__str_eq", "bool", item_r, target_r)
+        return
+    ir_emit("eq " + out_r.to_string() + " " + item_r.to_string() + " " + target_r.to_string())
+
+pub fn ir_emit_list_missing_index_result() -> Int:
+    missing_r := ir_reg()
+    ir_emit("iconst " + missing_r.to_string() + " -1")
+    return missing_r
+
+pub fn ir_emit_list_index_search_loop(list_r: Int, target_r: Int, elem_kind: String, result_name: String, idx_name: String) -> Int:
+    missing_r := ir_emit_list_missing_index_result()
+    ir_emit("store " + result_name + " " + missing_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + idx_name + " " + zero_r.to_string())
+    len_r := ir_reg()
+    ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
+
+    loop_l := ir_label()
+    body_l := ir_label()
+    match_l := ir_label()
+    step_l := ir_label()
+    done_l := ir_label()
+    ir_emit("label " + loop_l)
+    i_r := ir_reg()
+    ir_emit("load " + i_r.to_string() + " " + idx_name)
+    in_range_r := ir_reg()
+    ir_emit("lt " + in_range_r.to_string() + " " + i_r.to_string() + " " + len_r.to_string())
+    ir_emit("brif " + in_range_r.to_string() + " " + body_l + " " + done_l)
+    ir_emit("label " + body_l)
+    item_r := ir_reg()
+    ir_emit_call2_raw(item_r, "__list_get", elem_kind, list_r, i_r)
+    eq_r := ir_reg()
+    ir_emit_list_item_eq(eq_r, elem_kind, item_r, target_r)
+    ir_emit("brif " + eq_r.to_string() + " " + match_l + " " + step_l)
+    ir_emit("label " + match_l)
+    ir_emit("store " + result_name + " " + i_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + step_l)
+    ir_emit_list_loop_step(idx_name, i_r, loop_l)
+    ir_emit("label " + done_l)
+    out_r := ir_reg()
+    ir_emit("load " + out_r.to_string() + " " + result_name)
+    return out_r
+
+pub fn ir_emit_list_contains_from_index(index_r: Int) -> Int:
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    out_r := ir_reg()
+    ir_emit("gte " + out_r.to_string() + " " + index_r.to_string() + " " + zero_r.to_string())
+    return out_r

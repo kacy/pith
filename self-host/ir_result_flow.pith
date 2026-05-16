@@ -1,0 +1,23 @@
+# ir_result_flow.pith - shared result-control-flow emission
+
+from ir_builder import ir_emit, ir_label
+from ir_result_abi import ir_emit_result_flag_field
+
+pub fn ir_emit_result_store_error_branch(result_r: Int, temp_name: String, done_l: String):
+    ok_flag_r := ir_emit_result_flag_field(result_r, "is_ok")
+    ok_l := ir_label()
+    err_l := ir_label()
+    ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + err_l)
+    ir_emit("store " + temp_name + " " + result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + ok_l)
+
+pub fn ir_emit_result_return_error_branch(result_r: Int):
+    ok_flag_r := ir_emit_result_flag_field(result_r, "is_ok")
+    ok_l := ir_label()
+    err_l := ir_label()
+    ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + err_l)
+    ir_emit("ret " + result_r.to_string())
+    ir_emit("label " + ok_l)

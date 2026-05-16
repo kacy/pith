@@ -1,0 +1,42 @@
+# ir_ast_helpers.pith - small AST helpers used by IR lowering
+
+from ast import get_node, Node
+
+pub fn ir_list_contains(items: List[String], value: String) -> Bool:
+    for item in items:
+        if item == value:
+            return true
+    return false
+
+pub fn ir_is_string_literal_kind(kind: String) -> Bool:
+    return kind == "string_lit" or kind == "string" or kind == "str_lit" or kind == "lit"
+
+pub fn ir_unwrap_pub_node(idx: Int) -> Node:
+    mut node := get_node(idx)
+    if node.kind == "pub" and node.children.len() > 0:
+        node = get_node(node.children[0])
+    return node
+
+pub fn ir_unwrap_pub_child(idx: Int) -> Int:
+    node := get_node(idx)
+    if node.kind == "pub" and node.children.len() > 0:
+        return node.children[0]
+    return idx
+
+pub fn ir_is_binding_kind(kind: String) -> Bool:
+    return kind == "bind" or kind == "binding"
+
+pub fn ir_binding_name(node: Node) -> String:
+    mut name := node.value
+    if name.contains(" mut"):
+        name = name.substring(0, name.len() - 4)
+    elif name.contains(" "):
+        name = name.split(" ")[0]
+    return name
+
+pub fn ir_binding_has_collection_init(node: Node) -> Bool:
+    for child in node.children:
+        kind := get_node(child).kind
+        if kind == "list" or kind == "map" or kind == "set":
+            return true
+    return false

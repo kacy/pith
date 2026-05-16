@@ -1,0 +1,53 @@
+# ir_call_helpers.pith - shared call-line emission helpers
+
+from ir_builder import ir_emit
+from ir_metadata import ir_runtime_call_name
+from ir_type_helpers import ir_retkind_with_state, ir_resolve_type_hint_with_state
+from ast import get_node
+
+pub fn ir_is_declared_callable_with_state(name: String, func_returns: Map[String, String]) -> Bool:
+    return func_returns.contains_key(name)
+
+pub fn ir_declared_callable_ir_retkind_with_state(fname: String, func_returns: Map[String, String]) -> String:
+    if not func_returns.contains_key(fname):
+        return ""
+    return func_returns[fname]
+
+pub fn ir_declared_callable_return_type_with_state(fname: String, func_returns: Map[String, String], type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
+    ret_kind := ir_declared_callable_ir_retkind_with_state(fname, func_returns)
+    if ret_kind.len() == 0:
+        return ""
+    if ret_kind == "result_int":
+        return "int"
+    if ret_kind == "result_bool":
+        return "bool"
+    if ret_kind == "tuple":
+        return "tuple"
+    return ir_resolve_type_hint_with_state(ret_kind, type_aliases, struct_names)
+
+pub fn ir_emit_call_text_with_state(result_reg: Int, fname: String, ret_type: String, arg_count: Int, arg_text: String, func_returns: Map[String, String], type_aliases: Map[String, String], struct_names: Map[String, Int]):
+    mut emit_name := fname
+    if not ir_is_declared_callable_with_state(fname, func_returns):
+        emit_name = ir_runtime_call_name(fname)
+    mut call_line := "call " + result_reg.to_string() + " " + emit_name + " " + ir_retkind_with_state(ret_type, type_aliases, struct_names) + " " + arg_count.to_string()
+    if arg_text.len() > 0:
+        call_line = call_line + arg_text
+    ir_emit(call_line)
+
+pub fn ir_join_arg_regs(arg_regs: List[Int]) -> String:
+    mut call_text := ""
+    for arg_reg in arg_regs:
+        call_text = call_text + " " + arg_reg.to_string()
+    return call_text
+
+pub fn ir_method_call_arg_regs(obj_r: Int, arg_regs: List[Int]) -> List[Int]:
+    mut call_args := [obj_r]
+    for arg_reg in arg_regs:
+        call_args.push(arg_reg)
+    return call_args
+
+pub fn ir_call_arg_expr_index(arg_idx: Int) -> Int:
+    arg_node := get_node(arg_idx)
+    if arg_node.kind == "arg" and arg_node.children.len() > 0:
+        return arg_node.children[0]
+    return arg_idx

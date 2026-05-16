@@ -1,0 +1,63 @@
+# ir_utils.pith - small utility helpers used by IR lowering
+
+pub fn ir_push_string(items: List[String], value: String) -> List[String]:
+    mut updated: List[String] := items
+    updated.push(value)
+    return updated
+
+pub fn ir_encode_int_list(items: List[Int]) -> String:
+    mut encoded: List[String] := []
+    for item in items:
+        encoded.push(item.to_string())
+    return encoded.join(chr(9))
+
+fn ir_parse_cached_int(text: String) -> Int:
+    mut value := 0
+    mut i := 0
+    while i < text.len():
+        value = (value * 10) + (ord(text.substring(i, i + 1)) - ord("0"))
+        i = i + 1
+    return value
+
+pub fn ir_parse_field_index(text: String) -> Int:
+    if text.len() == 0:
+        return 0 - 1
+    mut value := 0
+    mut i := 0
+    while i < text.len():
+        ch := text[i]
+        code := ord(ch)
+        if code < 48 or code > 57:
+            return 0 - 1
+        value = (value * 10) + (code - 48)
+        i = i + 1
+    return value
+
+pub fn ir_decode_int_list(encoded: String) -> List[Int]:
+    mut decoded: List[Int] := []
+    if encoded.len() == 0:
+        return decoded
+    parts := encoded.split(chr(9))
+    for part in parts:
+        decoded.push(ir_parse_cached_int(part))
+    return decoded
+
+pub fn ir_copy_var_regs(src: Map[String, Int]) -> Map[String, Int]:
+    mut copy: Map[String, Int] := {}
+    for key in src.keys():
+        copy.insert(key, src[key])
+    return copy
+
+pub fn ir_copy_var_types(src: Map[String, String]) -> Map[String, String]:
+    mut copy: Map[String, String] := {}
+    for key in src.keys():
+        copy.insert(key, src[key])
+    return copy
+
+pub fn ir_unpack_field_index(meta: String) -> Int:
+    mut value := 0
+    mut i := 0
+    while i < meta.len():
+        value = (value * 10) + (ord(meta.substring(i, i + 1)) - ord("0"))
+        i = i + 1
+    return value

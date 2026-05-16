@@ -1,0 +1,58 @@
+# checker_type_intern.pith — shared generic type interning
+
+from types import ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, get_type_count, register_type_name, lookup_type_id, get_type_name
+
+fn build_collection_type_name(base: String, key_or_elem: Int, val: Int) -> String:
+    if val < 0:
+        return base + "[" + get_type_name(key_or_elem) + "]"
+    return base + "[" + get_type_name(key_or_elem) + "," + get_type_name(val) + "]"
+
+pub fn intern_list_type(elem: Int) -> Int:
+    name := build_collection_type_name("List", elem, -1)
+    existing := lookup_type_id(name)
+    if existing == -1:
+        add_type_info(ti_list(elem))
+        tid := get_type_count() - 1
+        register_type_name(name, tid)
+        return tid
+    return existing
+
+pub fn intern_set_type(elem: Int) -> Int:
+    name := build_collection_type_name("Set", elem, -1)
+    existing := lookup_type_id(name)
+    if existing == -1:
+        add_type_info(ti_set(elem))
+        tid := get_type_count() - 1
+        register_type_name(name, tid)
+        return tid
+    return existing
+
+pub fn intern_map_type(key_type: Int, val_type: Int) -> Int:
+    name := build_collection_type_name("Map", key_type, val_type)
+    existing := lookup_type_id(name)
+    if existing == -1:
+        add_type_info(ti_map(key_type, val_type))
+        tid := get_type_count() - 1
+        register_type_name(name, tid)
+        return tid
+    return existing
+
+pub fn intern_task_type(inner: Int) -> Int:
+    name := build_collection_type_name("Task", inner, -1)
+    existing := lookup_type_id(name)
+    if existing == -1:
+        add_type_info(ti_task(inner))
+        tid := get_type_count() - 1
+        register_type_name(name, tid)
+        return tid
+    return existing
+
+pub fn intern_channel_type(inner: Int) -> Int:
+    name := build_collection_type_name("Channel", inner, -1)
+    existing := lookup_type_id(name)
+    if existing == -1:
+        add_type_info(ti_channel(inner))
+        tid := get_type_count() - 1
+        register_type_name(name, tid)
+        return tid
+    return existing

@@ -1,0 +1,41 @@
+# checker_interfaces.pith - interface declaration registry
+
+mut interface_declaration_names: List[String] := []
+
+fn names_equal(a: String, b: String) -> Bool:
+    if a.len() != b.len():
+        return false
+    mut i := 0
+    while i < a.len():
+        if ord(a[i]) != ord(b[i]):
+            return false
+        i = i + 1
+    return true
+
+fn base_type_name(name: String) -> String:
+    mut i := 0
+    while i < name.len():
+        if ord(name[i]) == 91:
+            return name.substring(0, i)
+        i = i + 1
+    return name
+
+pub fn checker_interfaces_reset():
+    interface_declaration_names = []
+
+pub fn register_interface_declaration_name(name: String):
+    for iface_name in interface_declaration_names:
+        if names_equal(iface_name, name):
+            return
+    interface_declaration_names.push(name)
+
+pub fn has_interface_declaration(name: String) -> Bool:
+    for iface_name in interface_declaration_names:
+        if names_equal(iface_name, name):
+            return true
+    base := base_type_name(name)
+    if base != name:
+        for iface_name in interface_declaration_names:
+            if names_equal(iface_name, base):
+                return true
+    return false

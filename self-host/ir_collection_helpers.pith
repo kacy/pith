@@ -1,0 +1,111 @@
+# ir_collection_helpers.pith - collection literal metadata helpers
+
+from ast import get_node, Node
+
+pub fn ir_map_uses_int_keys(node: Node) -> Bool:
+    if node.children.len() == 0:
+        return false
+    first_entry := get_node(node.children[0])
+    if first_entry.kind != "entry" or first_entry.children.len() == 0:
+        return false
+    key_node := get_node(first_entry.children[0])
+    return key_node.kind == "int_lit" or key_node.kind == "int"
+
+pub fn ir_set_new_name(literal_type: String) -> String:
+    if literal_type == "set_int":
+        return "__set_new_int"
+    return "__set_new"
+
+pub fn ir_set_add_name(literal_type: String) -> String:
+    if literal_type == "set_int":
+        return "set_add_int"
+    return "set_add"
+
+pub fn ir_lookup_map_value_type_for_expr_with_state(idx: Int, map_value_types: Map[String, String]) -> String:
+    node := get_node(idx)
+    if node.kind == "ident" and map_value_types.contains_key(node.value):
+        return map_value_types[node.value]
+    return ""
+
+pub fn ir_index_get_call_name(obj_type: String) -> String:
+    if obj_type == "string":
+        return "char_at"
+    if obj_type == "bytes":
+        return "bytes_get"
+    if obj_type == "map_int":
+        return "map_get_ikey"
+    if obj_type == "map":
+        return "map_get"
+    return "__list_get"
+
+pub fn ir_index_set_call_name(obj_type: String) -> String:
+    if obj_type == "map_int":
+        return "map_insert_ikey"
+    if obj_type == "map":
+        return "map_insert"
+    return "pith_list_set_value"
+
+pub fn ir_for_loop_item_call_name(item_kind: String) -> String:
+    if item_kind == "char":
+        return "char_at"
+    if item_kind == "string" or item_kind == "int":
+        return "__list_get_unchecked"
+    return "__list_get"
+
+pub fn ir_for_loop_item_return_kind(item_kind: String) -> String:
+    if item_kind == "char" or item_kind == "string":
+        return "string"
+    if item_kind == "int":
+        return "int"
+    return "unknown"
+
+pub fn ir_for_iter_item_kind(iter_type: String) -> String:
+    if iter_type == "string":
+        return "char"
+    if iter_type == "list_string":
+        return "string"
+    if iter_type == "map" or iter_type == "set":
+        return "string"
+    if iter_type == "map_int" or iter_type == "set_int":
+        return "int"
+    return "unknown"
+
+pub fn ir_for_iter_conversion_call(iter_type: String) -> String:
+    if iter_type == "map" or iter_type == "map_int":
+        return "map_keys"
+    if iter_type == "set":
+        return "__set_to_list"
+    if iter_type == "set_int":
+        return "__set_to_list_int"
+    return ""
+
+pub fn ir_for_iter_conversion_return_kind(iter_type: String) -> String:
+    if iter_type == "map" or iter_type == "set":
+        return "list_string"
+    if iter_type == "map_int" or iter_type == "set_int":
+        return "list"
+    return ""
+
+pub fn ir_for_len_call_name(item_kind: String) -> String:
+    if item_kind == "char":
+        return "string_len"
+    return "len"
+
+pub fn ir_empty_collection_init_call_name(literal_kind: String, child_count: Int, target_type: String) -> String:
+    if child_count != 0:
+        return ""
+    if literal_kind == "map":
+        if target_type == "set":
+            return "__set_new"
+        if target_type == "set_int":
+            return "__set_new_int"
+        if target_type == "map":
+            return "__map_new"
+        if target_type == "map_int":
+            return "__map_new_int"
+    if literal_kind == "set":
+        if target_type == "set":
+            return "__set_new"
+        if target_type == "set_int":
+            return "__set_new_int"
+    return ""

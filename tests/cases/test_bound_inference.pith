@@ -1,0 +1,58 @@
+# type parameters can be inferred through interface bounds:
+# `fn f[I: Iface[T], T](it: I)` called with a concrete C that implements
+# Iface[X] for C infers T = X.
+
+interface Iterator[T]:
+    fn next() -> T?
+
+interface Pair[A, B]:
+    fn first() -> A
+    fn second() -> B
+
+struct Counter:
+    cur: Int
+    hi: Int
+
+impl Iterator[Int] for Counter:
+    fn next() -> Int?:
+        if self.cur >= self.hi:
+            return none
+        v := self.cur
+        self.cur = self.cur + 1
+        return v
+
+struct IntStr:
+    n: Int
+    s: String
+
+impl Pair[Int, String] for IntStr:
+    fn first() -> Int:
+        return self.n
+    fn second() -> String:
+        return self.s
+
+fn to_list[I: Iterator[T], T](it: I) -> List[T]:
+    mut out: List[T] := []
+    for x in it:
+        out.push(x)
+    return out
+
+fn fst[P: Pair[A, B], A, B](p: P) -> A:
+    return p.first()
+
+fn snd[P: Pair[A, B], A, B](p: P) -> B:
+    return p.second()
+
+fn main():
+    # T = Int inferred from Counter's impl Iterator[Int]
+    xs := to_list(Counter(0, 5))
+    print("len: {xs.len()}")
+    mut s := ""
+    for x in xs:
+        s = s + x.to_string() + " "
+    print("vals: {s}")
+
+    # A = Int, B = String inferred from IntStr's impl Pair[Int, String]
+    p := IntStr(42, "hello")
+    print("fst: {fst(p)}")
+    print("snd: {snd(p)}")

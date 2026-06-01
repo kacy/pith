@@ -59,6 +59,9 @@ mut generic_declaration_names: List[String] := []
 mut checking_test_decl := false
 # impl set: "Type\tInterface" -> 1
 mut implementation_set: Map[String, Int] := {}
+# impl interface args: "Type\tIfaceBase" -> "tid1,tid2,..." (tid list as csv)
+# (Pith Maps can't hold List values reliably; encode the tid list as a string.)
+mut impl_interface_args: Map[String, String] := {}
 # expression type cache — populated by c_check_expr, queried by codegen
 pub mut expression_type_cache: Map[Int, Int] := {}
 
@@ -78,6 +81,7 @@ pub fn initialize_checker(file_path: String):
     generic_declaration_names = []
     checker_interfaces_reset()
     implementation_set = {}
+    impl_interface_args = {}
     expression_type_cache = {}
     module_aliases = {}
     module_export_entries = []
@@ -576,6 +580,11 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             # record in impl set
             key := concrete_name + chr(9) + interface_name
             implementation_set.insert(key, 1)
+            # also record the impl's interface-arg tids, indexed by base name,
+            # so bound-based type-parameter inference can look them up later
+            iface_base := iface_type_base_name(first_type_node)
+            iface_args := iface_type_arg_tids(first_type_node)
+            impl_interface_args.insert(concrete_name + chr(9) + iface_base, encode_tid_list(iface_args))
         else:
             concrete_name = get_type_node_name(first_type_node)
     else:
@@ -2423,6 +2432,92 @@ fn check_list_reduce_method(info: TypeInfo, args: List[Int], scope_id: Int) -> I
 # interface bounds checking
 # ---------------------------------------------------------------
 
+# Extract the base name of a type/generic_type node, ignoring its arg list.
+# For `Iterator[Int]` returns "Iterator"; for `Counter` returns "Counter".
+fn iface_type_base_name(node: Node) -> String:
+    if node.kind == "generic_type":
+        return node.value
+    if node.kind == "type":
+        if node.value.contains("["):
+            return extract_base_type_name(node.value)
+        return node.value
+    return ""
+
+# Extract the type-argument names of a type/generic_type node, in order.
+# For `Iterator[T]` returns ["T"]; for `Iterator[Int]` returns ["Int"].
+fn iface_type_arg_names(node: Node) -> List[String]:
+    mut names: List[String] := []
+    if node.kind == "generic_type":
+        for child in node.children:
+            cn := get_node(child)
+            names.push(get_type_node_name(cn))
+    elif node.kind == "type":
+        if node.value.contains("["):
+            base := extract_base_type_name(node.value)
+            inner := node.value.substring(base.len() + 1, node.value.len() - 1)
+            parts := inner.split(",")
+            for part in parts:
+                names.push(part.trim())
+    return names
+
+# Resolve the type-argument names of a bound to tids. Unknown names map to -1
+# (not an error here; impl registration runs before all types may be known).
+fn iface_type_arg_tids(node: Node) -> List[Int]:
+    mut tids: List[Int] := []
+    arg_names := iface_type_arg_names(node)
+    for n in arg_names:
+        tids.push(lookup_type_id(n))
+    return tids
+
+# Encode a tid list as a comma-separated string, so we can store it in a
+# Map[String, String] (Maps with List values are unreliable today).
+fn encode_tid_list(tids: List[Int]) -> String:
+    mut parts: List[String] := []
+    for tid in tids:
+        parts.push(tid.to_string())
+    return parts.join(",")
+
+fn decode_tid_list(s: String) -> List[Int]:
+    mut tids: List[Int] := []
+    if s.len() == 0:
+        return tids
+    parts := s.split(",")
+    for part in parts:
+        tids.push(parse_integer_string(part))
+    return tids
+
+# After arg-based inference has bound some type params to concrete types, walk
+# the function's interface bounds: if a bound param `T` is already concrete `C`
+# and `C` implements `Iface[A, B, ...]`, unify each unbound bound arg with the
+# corresponding `A`, `B`, ... from the impl record. Kept small/separate so the
+# module-global Map reads compile reliably (see codegen-map-read-sensitivity).
+fn infer_subst_from_bounds(decl_node: Node, generic_params: List[String]):
+    for child in decl_node.children:
+        cn := get_node(child)
+        if cn.kind == "generic_param":
+            param_name := cn.value
+            if generic_inference_subst.contains_key(param_name):
+                concrete_tid := generic_inference_subst[param_name]
+                concrete_name := get_type_name(concrete_tid)
+                for bound_idx in cn.children:
+                    bound_node := get_node(bound_idx)
+                    iface_base := iface_type_base_name(bound_node)
+                    bound_arg_names := iface_type_arg_names(bound_node)
+                    impl_key := concrete_name + chr(9) + iface_base
+                    if impl_interface_args.contains_key(impl_key):
+                        impl_args := decode_tid_list(impl_interface_args[impl_key])
+                        mut k := 0
+                        while k < bound_arg_names.len() and k < impl_args.len():
+                            ban := bound_arg_names[k]
+                            mut is_gp := false
+                            for gp in generic_params:
+                                if gp == ban:
+                                    is_gp = true
+                            if is_gp and generic_inference_subst.contains_key(ban) == false:
+                                if impl_args[k] >= 0:
+                                    generic_inference_subst.insert(ban, impl_args[k])
+                            k = k + 1
+
 fn check_type_parameter_bounds(decl_node_idx: Int, subst_map: Map[String, Int]) -> Bool:
     decl_node := get_node(decl_node_idx)
     mut ok := true
@@ -2644,6 +2739,10 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
             if infer_generic_subst_from_type_node(ptn, arg_types[pidx], generic_params) == false:
                 return TID_ERR
         pidx = pidx + 1
+    # infer remaining type parameters by walking interface bounds: if T_i is
+    # already bound to a concrete C, and C implements Iface[T_j, ...], then T_j
+    # is fixed by the implementation
+    infer_subst_from_bounds(decl_node, generic_params)
     # verify all generic params were inferred, build subst_args list
     mut subst_args: List[Int] := []
     mut all_inferred := true

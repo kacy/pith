@@ -3275,6 +3275,11 @@ fn ir_emit_method_call(idx: Int) -> Int:
                     return ir_emit_result_or_else(idx, node)
                 if mname == "to_string":
                     return ir_emit_result_to_string(node)
+            if recv_info.kind == "optional" and mname == "value":
+                # unchecked extraction of the inner value (caller has verified
+                # the optional is Some); used by iterator adapters in std.iter
+                obj_r := ir_expr(node.children[0])
+                return ir_optional_value_field(obj_r, recv_tid)
 
     alias_fname := ir_resolve_module_alias_method_call_name(idx)
     if alias_fname.len() > 0:

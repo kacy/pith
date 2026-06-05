@@ -1,0 +1,38 @@
+# std.iter — iterator protocol, eager Range, and a generic collection terminal.
+#
+# A type implements the iterator protocol by providing `fn next() -> T?`. The
+# compiler's `for` loop sugar (added in #203) recognizes any such type and
+# drives it via next(), so user-defined iterators work the same as the
+# language's built-in collection loops.
+#
+# `to_list` (below) is the canonical terminal: it drains any iterator into a
+# `List[T]`. The element type T is inferred from the `Iterator[T]` bound (see
+# #204), so callers don't need explicit type arguments.
+
+# Iterator[T]: anything yielding values of T until it runs out.
+pub interface Iterator[T]:
+    fn next() -> T?
+
+# Range yields each integer in the half-open interval [lo, hi).
+#
+# Use this when you want a value you can hold, pass around, or pass to `to_list`.
+# The for-loop sugar `for i in lo..hi:` is still faster for the common case
+# because it compiles to a counted loop with no allocation.
+pub struct Range:
+    cur: Int
+    hi: Int
+
+impl Iterator[Int] for Range:
+    fn next() -> Int?:
+        if self.cur >= self.hi:
+            return none
+        v := self.cur
+        self.cur = self.cur + 1
+        return v
+
+# Drain an iterator into a List. T is inferred from the I: Iterator[T] bound.
+pub fn to_list[I: Iterator[T], T](it: I) -> List[T]:
+    mut out: List[T] := []
+    for x in it:
+        out.push(x)
+    return out

@@ -1,0 +1,27 @@
+# std.iter brings the iterator protocol into the stdlib: an Iterator[T]
+# interface, an eager Range value, and a to_list terminal that drains any
+# iterator into a List[T] (T inferred from the bound).
+
+from std.iter import Range, to_list
+
+fn main():
+    xs := to_list(Range(0, 5))
+    print("len: {xs.len()}")
+    mut vals := ""
+    for x in xs:
+        vals = vals + x.to_string() + " "
+    print("vals: {vals}")
+
+    # for-loop drives the Range value directly (via the next() protocol)
+    mut sum := 0
+    for x in Range(1, 6):
+        sum = sum + x
+    print("sum: {sum}")
+
+    # empty range
+    empty := to_list(Range(3, 3))
+    print("empty: {empty.len()}")
+
+    # single-element range
+    single := to_list(Range(7, 8))
+    print("single first: {single[0]}")

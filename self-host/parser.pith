@@ -468,11 +468,14 @@ fn parse_postfix() -> Int:
             expr = parse_call_expr(expr)
 
         elif kind == "lbracket":
-            # index: expr[index]
+            # index: expr[index]; or multi-arg explicit generic call: expr[T, U](...)
             advance_token()
             idx := parse_expression()
-            expect("rbracket")
             mut children: List[Int] := [expr, idx]
+            while check("comma"):
+                advance_token()
+                children.push(parse_expression())
+            expect("rbracket")
             expr = add_node_with_position("index", "", children)
 
         elif kind == "dot":

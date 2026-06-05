@@ -1,0 +1,26 @@
+# explicit type arguments at a call site can now be a comma-separated list,
+# not just a single type. this unlocks generic functions and generic struct
+# constructors with more than one type parameter when inference can't decide.
+
+struct Triple[A, B, C]:
+    a: A
+    b: B
+    c: C
+
+fn first[T](xs: List[T]) -> T:
+    return xs[0]
+
+fn pair_first[A, B](xs: List[A], ys: List[B]) -> A:
+    return xs[0]
+
+fn main():
+    # single-arg generic call (regression for the existing path)
+    print("single: {first[Int]([10, 20, 30])}")
+
+    # two-arg generic function call
+    n := pair_first[Int, String]([1, 2], ["a", "b"])
+    print("two-arg fn: {n}")
+
+    # three-arg generic struct constructor
+    t := Triple[Int, String, Bool](42, "hi", true)
+    print("three-arg struct: {t.a} {t.b} {t.c}")

@@ -1,0 +1,47 @@
+# An optional `T?` has a `.value()` method that extracts the inner T without
+# the `?` operator's Result-propagation requirement. The caller is
+# responsible for checking `!= none` first — this is the unchecked extractor
+# used by iterator adapters and other code that has already verified the
+# optional is Some.
+
+fn maybe(n: Int) -> Int?:
+    if n > 0:
+        return n
+    return none
+
+fn first_word(words: List[String]) -> String?:
+    if words.len() == 0:
+        return none
+    return words[0]
+
+fn main():
+    a := maybe(42)
+    if a != none:
+        print("int: {a.value()}")
+
+    b := maybe(0)
+    print("b none: {b == none}")
+
+    w := first_word(["hello", "world"])
+    if w != none:
+        print("str: {w.value()}")
+
+    empty := first_word([])
+    print("empty none: {empty == none}")
+
+    # value() inside a loop, the iterator-adapter pattern:
+    src: List[Int] := [10, 20, 30]
+    mut i := 0
+    mut sum := 0
+    while i < src.len():
+        opt := first_word_at(src, i)
+        if opt == none:
+            break
+        sum = sum + opt.value()
+        i = i + 1
+    print("sum: {sum}")
+
+fn first_word_at(xs: List[Int], i: Int) -> Int?:
+    if i >= xs.len():
+        return none
+    return xs[i]

@@ -2908,6 +2908,12 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     mut recv_info := get_type_info(receiver_type)
     mut dispatch_type := receiver_type
     if recv_info.kind == "optional":
+        # `.value` extracts the inner T from a T?; callers are responsible for
+        # checking `!= none` first. used by iterator adapters where the source's
+        # next() result is already known to be Some.
+        if method_name == "value":
+            expect_no_arguments(method_name, arg_indices)
+            return recv_info.inner
         dispatch_type = recv_info.inner
         recv_info = get_type_info(dispatch_type)
     elif recv_info.kind == "result":

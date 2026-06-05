@@ -62,6 +62,16 @@ mut implementation_set: Map[String, Int] := {}
 # impl interface args: "Type\tIfaceBase" -> "tid1,tid2,..." (tid list as csv)
 # (Pith Maps can't hold List values reliably; encode the tid list as a string.)
 mut impl_interface_args: Map[String, String] := {}
+# generic struct instance info, keyed by the instance's tid, for dispatch-time
+# substitution: type_args is a csv of arg tids, base_name is the original
+# (un-instantiated) struct name from which the instance was built.
+mut struct_instance_type_args: Map[Int, String] := {}
+mut struct_instance_base_name: Map[Int, String] := {}
+# names that resolve_named_type should treat as unknown without raising E202.
+# used while registering methods on a generic struct so the methods can
+# reference the struct's type parameters (T) without errors. dispatch
+# substitutes the real types later via resolve_type_with_substitution_map.
+mut suppress_unknown_type_for: Map[String, Int] := {}
 # expression type cache — populated by c_check_expr, queried by codegen
 pub mut expression_type_cache: Map[Int, Int] := {}
 
@@ -82,6 +92,9 @@ pub fn initialize_checker(file_path: String):
     checker_interfaces_reset()
     implementation_set = {}
     impl_interface_args = {}
+    struct_instance_type_args = {}
+    struct_instance_base_name = {}
+    suppress_unknown_type_for = {}
     expression_type_cache = {}
     module_aliases = {}
     module_export_entries = []
@@ -287,6 +300,11 @@ fn resolve_named_type(name: String) -> Int:
     resolved_name := resolve_imported_type_name(name)
     tid := lookup_type_id(resolved_name)
     if tid < 0:
+        # methods on a generic struct can reference the struct's type params
+        # (T, U, ...) — at registration time those aren't real types yet, but
+        # dispatch will re-resolve them with substitution
+        if suppress_unknown_type_for.contains_key(resolved_name):
+            return TID_ERR
         report_error("E202", "unknown type: " + name)
         return TID_ERR
     return tid
@@ -593,6 +611,16 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
     if concrete_name == "":
         return
 
+    # if this impl is for a generic struct, suppress `unknown type` errors for
+    # the struct's type parameters while registering its methods so signatures
+    # like `fn next() -> T?` resolve cleanly. dispatch substitutes T later.
+    mut suppressed_params: List[String] := []
+    if has_generic_declaration(concrete_name):
+        gdecl := get_node(get_generic_declaration_index(concrete_name))
+        suppressed_params = collect_generic_parameter_names(gdecl)
+        for sp in suppressed_params:
+            suppress_unknown_type_for.insert(sp, 1)
+
     # register each method (skip first method_start children)
     mut skip := method_start
     for child in node.children:
@@ -608,6 +636,10 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             cn = get_node(method_node_idx)
         if cn.kind == "fn_decl":
             register_method_declaration(concrete_name, method_node_idx, cn, method_is_pub)
+
+    # clear the suppression for the next impl block
+    for sp in suppressed_params:
+        suppress_unknown_type_for.remove(sp)
 
 fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_pub: Bool):
     mut method_name := node.value
@@ -1218,17 +1250,34 @@ fn check_while_statement(node: Node, scope_id: Int):
 # ---------------------------------------------------------------
 
 # If `iter_type` is an iterator (a struct with a `next() -> T?` method), return
-# the element type T; otherwise return -1. Kept small and separate so the map
-# reads compile reliably.
+# the element type T; otherwise return -1. For a generic struct instance like
+# `Iter[Int]`, the method registers under the base name and references the
+# struct's type params, so we normalize the lookup and resolve next()'s return
+# type with substitution.
 fn iterator_element_type(iter_type: Int) -> Int:
     info := get_type_info(iter_type)
     if info.kind != "struct":
         return 0 - 1
-    next_key := get_type_name(iter_type) + ".next"
-    if method_type_map.contains_key(next_key) == false:
+    type_name := get_type_name(iter_type)
+    mut next_key := type_name + ".next"
+    if has_method_declaration(next_key) == false:
+        base := extract_base_type_name(type_name)
+        if base != type_name:
+            next_key = base + ".next"
+    if has_method_declaration(next_key) == false:
         return 0 - 1
-    next_fn_info := get_type_info(method_type_map[next_key])
-    ret_info := get_type_info(next_fn_info.return_type)
+    method_node := get_node(get_method_declaration_index(next_key))
+    mut struct_params: List[String] := []
+    mut struct_args: List[Int] := []
+    if struct_instance_type_args.contains_key(iter_type):
+        struct_args = decode_tid_list(struct_instance_type_args[iter_type])
+        if struct_instance_base_name.contains_key(iter_type):
+            base := struct_instance_base_name[iter_type]
+            if has_generic_declaration(base):
+                sdecl := get_node(get_generic_declaration_index(base))
+                struct_params = collect_generic_parameter_names(sdecl)
+    ret_tid := collect_function_return_type_with_subst(method_node, struct_params, struct_args)
+    ret_info := get_type_info(ret_tid)
     if ret_info.kind != "optional":
         return 0 - 1
     return ret_info.inner
@@ -2790,6 +2839,28 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
 # method call
 # ---------------------------------------------------------------
 
+# Variants of collect_function_param_types / collect_function_return_type that
+# substitute generic type parameters with concrete type arguments. Used to
+# resolve method signatures on a generic struct instance like `Iter[Int]`.
+fn collect_function_param_types_with_subst(node: Node, params: List[String], args: List[Int]) -> List[Int]:
+    mut out: List[Int] := []
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if cn.children.len() > 0:
+                out.push(resolve_type_with_substitution_map(cn.children[0], params, args))
+            else:
+                out.push(TID_ERR)
+    return out
+
+fn collect_function_return_type_with_subst(node: Node, params: List[String], args: List[Int]) -> Int:
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            if cn.children.len() > 0:
+                return resolve_type_with_substitution_map(cn.children[0], params, args)
+    return TID_VOID
+
 fn check_method_call(node: Node, scope_id: Int) -> Int:
     # node.value = method name
     # children[0] = receiver
@@ -2896,13 +2967,30 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         if is_error_type(sync_result) == false:
             return sync_result
 
-    # user-defined methods
+    # user-defined methods. methods on a generic struct are registered under
+    # the base name (e.g. "Iter"), so fall back to that if the qualified name
+    # (e.g. "Iter[Int].next") doesn't match a declaration.
     type_name := get_type_name(dispatch_type)
-    key := type_name + "." + method_name
+    mut key := type_name + "." + method_name
+    if has_method_declaration(key) == false:
+        base_name := extract_base_type_name(type_name)
+        if base_name != type_name:
+            key = base_name + "." + method_name
     if has_method_declaration(key):
         method_node := get_node(get_method_declaration_index(key))
-        param_types := collect_function_param_types(method_node)
-        ret_type := collect_function_return_type(method_node)
+        # if the receiver is a generic struct instance, build a substitution
+        # map (T -> Int, ...) so the method signature resolves concretely
+        mut struct_params: List[String] := []
+        mut struct_args: List[Int] := []
+        if struct_instance_type_args.contains_key(dispatch_type):
+            struct_args = decode_tid_list(struct_instance_type_args[dispatch_type])
+            if struct_instance_base_name.contains_key(dispatch_type):
+                base := struct_instance_base_name[dispatch_type]
+                if has_generic_declaration(base):
+                    sdecl := get_node(get_generic_declaration_index(base))
+                    struct_params = collect_generic_parameter_names(sdecl)
+        param_types := collect_function_param_types_with_subst(method_node, struct_params, struct_args)
+        ret_type := collect_function_return_type_with_subst(method_node, struct_params, struct_args)
         # check arg count
         if arg_indices.len() != param_types.len():
             report_error("E207", method_name + " expects " + param_types.len().to_string() + " arguments, got " + arg_indices.len().to_string())
@@ -4187,6 +4275,10 @@ fn instantiate_generic_struct_type(decl: Node, type_args: List[Int]) -> Int:
                 field_types.push(TID_ERR)
     tid := add_type_info(ti_struct(inst_name, field_names, field_types, field_pub, field_mut))
     register_type_name(inst_name, tid)
+    # remember the type-args + base name on the instance tid so dispatch can
+    # substitute the struct's type parameters in method signatures
+    struct_instance_type_args.insert(tid, encode_tid_list(type_args))
+    struct_instance_base_name.insert(tid, base_name)
     return tid
 
 fn instantiate_generic_enum_type(decl: Node, type_args: List[Int]) -> Int:

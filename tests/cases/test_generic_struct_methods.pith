@@ -1,0 +1,40 @@
+# methods on a generic struct work with explicit type arguments at construction
+# (constructor inference is a separate follow-up). this covers field reads,
+# field writes via self, method dispatch returning the substituted T, and
+# driving the iterator through the `for` loop.
+
+struct Iter[T]:
+    items: List[T]
+    pos: Int
+
+impl Iter:
+    fn next() -> T?:
+        if self.pos >= self.items.len():
+            return none
+        v := self.items[self.pos]
+        self.pos = self.pos + 1
+        return v
+
+    fn count() -> Int:
+        return self.items.len()
+
+fn main():
+    # int iterator: explicit annotation + manual stepping
+    it := Iter[Int]([10, 20, 30], 0)
+    print("count: {it.count()}")
+    n1 := it.next()
+    print("n1 set: {n1 != none}, pos: {it.pos}")
+    n2 := it.next()
+    print("n2 set: {n2 != none}, pos: {it.pos}")
+
+    # for-driver from #203 over the same kind of iterator
+    mut sum := 0
+    for x in Iter[Int]([1, 2, 3, 4, 5], 0):
+        sum = sum + x
+    print("sum: {sum}")
+
+    # string-element generic iterator
+    mut joined := ""
+    for w in Iter[String](["red", "green", "blue"], 0):
+        joined = joined + w + " "
+    print("words: {joined}")

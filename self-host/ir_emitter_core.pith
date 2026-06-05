@@ -102,6 +102,9 @@ mut ir_import_declared_functions: Map[String, Bool] := {}
 mut ir_import_declared_globals: Map[String, Bool] := {}
 mut ir_current_func_return_kind := ""
 mut ir_current_func_optional_inner_kind := ""
+# the impl block's target type, set while a method body is being emitted, so
+# `self.field = ...` knows what struct fields to look up
+mut ir_current_impl_type := ""
 mut ir_preloaded_import_roots: List[Int] := []
 mut ir_preloaded_import_paths: List[String] := []
 mut ir_emit_tests := false
@@ -732,6 +735,9 @@ fn ir_field_receiver_type(recv_idx: Int) -> String:
         recv := get_node(recv_idx)
         if recv.kind == "ident" and ir_struct_names.contains_key(recv.value):
             obj_type = recv.value
+        # `self` inside a method body resolves to the impl block's target type
+        elif recv.kind == "self" and ir_current_impl_type.len() > 0:
+            obj_type = ir_current_impl_type
     return obj_type
 
 fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
@@ -862,6 +868,10 @@ fn ir_infer_type(idx: Int) -> String:
     if kind == "ident":
         return ir_lookup_name_type(node.value)
     if kind == "self":
+        # use the current impl block's target type so field lookups resolve
+        # to the right struct; "struct" is a generic placeholder fallback
+        if ir_current_impl_type.len() > 0:
+            return ir_current_impl_type
         return "struct"
     # grouped expression — infer inner
     if kind == "grouped" and node.children.len() > 0:
@@ -3897,6 +3907,30 @@ fn ir_emit_assign_stmt(node: Node):
         ir_var_regs.insert(name, r)
         ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
 
+# Strip generic type-args from a type name: "Iter[Int]" -> "Iter".
+fn ir_strip_type_args(name: String) -> String:
+    mut i := 0
+    while i < name.len():
+        if name.substring(i, i + 1) == "[":
+            return name.substring(0, i)
+        i = i + 1
+    return name
+
+# Resolve a field-write lookup key, falling back to the receiver's base type
+# name so writes work on generic struct instances (Iter[Int] -> Iter). Returns
+# the matching key or "" if neither the qualified nor base form is registered.
+fn ir_resolve_field_lookup_key(recv_idx: Int, fname: String) -> String:
+    direct := ir_field_lookup_key(recv_idx, fname)
+    if ir_struct_field_index_lookup.contains_key(direct):
+        return direct
+    recv_type := ir_field_receiver_type(recv_idx)
+    base := ir_strip_type_args(recv_type)
+    if base != recv_type:
+        base_key := base + "." + fname
+        if ir_struct_field_index_lookup.contains_key(base_key):
+            return base_key
+    return ""
+
 # Assign to a struct field target: `obj.field = value`. Returns false if the
 # target is not a known struct field (so the caller falls back to other forms).
 fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
@@ -3905,8 +3939,8 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
         return false
     fname := node_value(target_idx)
     recv_idx := target.children[0]
-    lookup_key := ir_field_lookup_key(recv_idx, fname)
-    if not ir_struct_field_index_lookup.contains_key(lookup_key):
+    lookup_key := ir_resolve_field_lookup_key(recv_idx, fname)
+    if lookup_key.len() == 0:
         return false
     field_index := ir_unpack_field_index(ir_struct_field_index_lookup[lookup_key])
     obj_r := ir_expr(recv_idx)
@@ -3924,8 +3958,8 @@ fn ir_emit_field_compound_assignment(target_idx: Int, value_idx: Int, compound_o
         return false
     fname := node_value(target_idx)
     recv_idx := target.children[0]
-    lookup_key := ir_field_lookup_key(recv_idx, fname)
-    if not ir_struct_field_index_lookup.contains_key(lookup_key):
+    lookup_key := ir_resolve_field_lookup_key(recv_idx, fname)
+    if lookup_key.len() == 0:
         return false
     field_index := ir_unpack_field_index(ir_struct_field_index_lookup[lookup_key])
     obj_r := ir_expr(recv_idx)
@@ -4646,12 +4680,14 @@ fn ir_impl_func(idx: Int, impl_type: String):
     ret_type := ir_extract_return_type(idx)
     ir_prepare_func_emission(ret_type)
     ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
+    ir_current_impl_type = impl_type
     ir_emit_func_header(full_name, param_count, ret_type)
     ir_emit_named_param("self", impl_type)
     ir_emit_fn_params(idx)
     ir_func_returns.insert(method_key, ret_type)
     ir_func_returns.insert(full_name, ret_type)
     ir_finish_func_emission(body_idx)
+    ir_current_impl_type = ""
 
 fn ir_register_import_alias(value: String):
     mut path := value

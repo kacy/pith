@@ -61,7 +61,7 @@ mut checking_test_decl := false
 mut implementation_set: Map[String, Int] := {}
 # impl interface args: "Type\tIfaceBase" -> "tid1,tid2,..." (tid list as csv)
 # (Pith Maps can't hold List values reliably; encode the tid list as a string.)
-mut impl_interface_args: Map[String, String] := {}
+pub mut impl_interface_args: Map[String, String] := {}
 # generic struct instance info, keyed by the instance's tid, for dispatch-time
 # substitution: type_args is a csv of arg tids, base_name is the original
 # (un-instantiated) struct name from which the instance was built.
@@ -682,7 +682,7 @@ fn register_type_alias_declaration(node: Node):
 # helpers
 # ---------------------------------------------------------------
 
-fn extract_base_type_name(name: String) -> String:
+pub fn extract_base_type_name(name: String) -> String:
     # "swap[T]" -> "swap", "Pair[A, B]" -> "Pair"
     mut i := 0
     while i < name.len():
@@ -698,7 +698,7 @@ fn declaration_has_generic_params(node: Node) -> Bool:
             return true
     return false
 
-fn collect_generic_parameter_names(node: Node) -> List[String]:
+pub fn collect_generic_parameter_names(node: Node) -> List[String]:
     mut params: List[String] := []
     for child in node.children:
         cn := get_node(child)
@@ -2488,7 +2488,7 @@ fn check_list_reduce_method(info: TypeInfo, args: List[Int], scope_id: Int) -> I
 
 # Extract the base name of a type/generic_type node, ignoring its arg list.
 # For `Iterator[Int]` returns "Iterator"; for `Counter` returns "Counter".
-fn iface_type_base_name(node: Node) -> String:
+pub fn iface_type_base_name(node: Node) -> String:
     if node.kind == "generic_type":
         return node.value
     if node.kind == "type":
@@ -2499,7 +2499,7 @@ fn iface_type_base_name(node: Node) -> String:
 
 # Extract the type-argument names of a type/generic_type node, in order.
 # For `Iterator[T]` returns ["T"]; for `Iterator[Int]` returns ["Int"].
-fn iface_type_arg_names(node: Node) -> List[String]:
+pub fn iface_type_arg_names(node: Node) -> List[String]:
     mut names: List[String] := []
     if node.kind == "generic_type":
         for child in node.children:

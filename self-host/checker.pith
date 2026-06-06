@@ -595,14 +595,15 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             for_inner := get_node(second_node.children[0])
             concrete_name = get_type_node_name(for_inner)
             method_start = 2
-            # record in impl set
-            key := concrete_name + chr(9) + interface_name
-            implementation_set.insert(key, 1)
-            # also record the impl's interface-arg tids, indexed by base name,
-            # so bound-based type-parameter inference can look them up later
+            # record in impl set, keyed on base names so generic instances
+            # (FilterIter[Range, Int]) find the impl registered for FilterIter
             iface_base := iface_type_base_name(first_type_node)
-            iface_args := iface_type_arg_tids(first_type_node)
-            impl_interface_args.insert(concrete_name + chr(9) + iface_base, encode_tid_list(iface_args))
+            key := concrete_name + chr(9) + iface_base
+            implementation_set.insert(key, 1)
+            # also record the impl's interface-arg encoding (per-arg "tid:N" or
+            # "param:N" — see encode_impl_iface_args) so bound-based inference
+            # can recover the args and substitute the receiver's instance args
+            impl_interface_args.insert(key, encode_impl_iface_args(concrete_name, first_type_node))
         else:
             concrete_name = get_type_node_name(first_type_node)
     else:
@@ -650,7 +651,11 @@ fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_
     register_method_signature(key, node_idx)
 
 fn check_type_implements_interface(type_name: String, iface_name: String) -> Bool:
-    key := type_name + chr(9) + iface_name
+    # match on base names so a generic instance like FilterIter[Range, Int]
+    # finds the impl registered for FilterIter against Iterator
+    type_base := extract_base_type_name(type_name)
+    iface_base := extract_base_type_name(iface_name)
+    key := type_base + chr(9) + iface_base
     return implementation_set.contains_key(key)
 
 fn build_interface_type_name(base: String, args: List[String]) -> String:
@@ -2518,6 +2523,57 @@ fn iface_type_arg_tids(node: Node) -> List[Int]:
         tids.push(lookup_type_id(n))
     return tids
 
+# Encode an impl's interface arguments so bound-based inference can resolve
+# them later against a concrete instance. Each arg is one of:
+#   "param:N"  — references the impl-struct's Nth generic parameter (e.g.,
+#                for `impl Iterator[U] for MapIter[I, T, U]`, the lone arg is
+#                "param:2" because U is the 3rd type param of MapIter)
+#   "tid:N"    — a concrete type id resolved at registration
+# Encoded as a comma-separated list.
+pub fn encode_impl_iface_args(impl_struct_base: String, bound_node: Node) -> String:
+    arg_names := iface_type_arg_names(bound_node)
+    mut struct_params: List[String] := []
+    if has_generic_declaration(impl_struct_base):
+        sdecl := get_node(get_generic_declaration_index(impl_struct_base))
+        struct_params = collect_generic_parameter_names(sdecl)
+    mut parts: List[String] := []
+    for n in arg_names:
+        mut found_idx := 0 - 1
+        for sp, sp_i in struct_params:
+            if sp == n:
+                found_idx = sp_i
+        if found_idx >= 0:
+            parts.push("param:" + found_idx.to_string())
+        else:
+            parts.push("tid:" + lookup_type_id(n).to_string())
+    return parts.join(",")
+
+# Decode an encoded impl-args string into concrete tids, substituting any
+# "param:N" markers using the receiver instance's type arguments. Returns -1
+# for entries that can't be resolved.
+pub fn decode_impl_iface_args(encoded: String, instance_tid: Int) -> List[Int]:
+    mut tids: List[Int] := []
+    if encoded.len() == 0:
+        return tids
+    mut instance_args: List[Int] := []
+    if struct_instance_type_args.contains_key(instance_tid):
+        instance_args = decode_tid_list(struct_instance_type_args[instance_tid])
+    parts := encoded.split(",")
+    for part in parts:
+        if part.starts_with("param:"):
+            idx_str := part.substring(6, part.len())
+            idx := parse_integer_string(idx_str)
+            if idx >= 0 and idx < instance_args.len():
+                tids.push(instance_args[idx])
+            else:
+                tids.push(0 - 1)
+        elif part.starts_with("tid:"):
+            tid := parse_integer_string(part.substring(4, part.len()))
+            tids.push(tid)
+        else:
+            tids.push(0 - 1)
+    return tids
+
 # Encode a tid list as a comma-separated string, so we can store it in a
 # Map[String, String] (Maps with List values are unreliable today).
 fn encode_tid_list(tids: List[Int]) -> String:
@@ -2547,14 +2603,20 @@ fn infer_subst_from_bounds(decl_node: Node, generic_params: List[String]):
             param_name := cn.value
             if generic_inference_subst.contains_key(param_name):
                 concrete_tid := generic_inference_subst[param_name]
-                concrete_name := get_type_name(concrete_tid)
+                # normalize to the base name so generic instances (Iter[Int])
+                # look up against the impl registered under their base (Iter)
+                concrete_name := extract_base_type_name(get_type_name(concrete_tid))
                 for bound_idx in cn.children:
                     bound_node := get_node(bound_idx)
                     iface_base := iface_type_base_name(bound_node)
                     bound_arg_names := iface_type_arg_names(bound_node)
                     impl_key := concrete_name + chr(9) + iface_base
                     if impl_interface_args.contains_key(impl_key):
-                        impl_args := decode_tid_list(impl_interface_args[impl_key])
+                        # decode_impl_iface_args substitutes any "param:N"
+                        # markers using concrete_tid's instance type args, so
+                        # `impl Iterator[U] for MapIter[I, T, U]` resolves U
+                        # to the receiver's actual third type argument
+                        impl_args := decode_impl_iface_args(impl_interface_args[impl_key], concrete_tid)
                         mut k := 0
                         while k < bound_arg_names.len() and k < impl_args.len():
                             ban := bound_arg_names[k]

@@ -1,8 +1,8 @@
 # ir_generic_infer.pith - runtime generic argument inference
 
 from ast import get_node, node_kind, Node
-from checker import c_get_expr_type
-from types import get_type_info
+from checker import c_get_expr_type, impl_interface_args, decode_impl_iface_args, iface_type_base_name, iface_type_arg_names, collect_generic_parameter_names, extract_base_type_name
+from types import get_type_info, get_type_name
 from ir_generics import ir_collect_generic_param_names
 from ir_type_helpers import ir_type_from_tid
 
@@ -121,6 +121,10 @@ pub fn ir_infer_generic_concrete_types_with_state(name: String, node: Node, gene
         if arg_idx < arg_tids.len() and param_type_nodes[arg_idx] >= 0:
             ir_infer_generic_runtime_types_from_node(param_type_nodes[arg_idx], arg_tids[arg_idx], generic_params)
         arg_idx = arg_idx + 1
+    # walk interface bounds to fix remaining type parameters: if T_i is
+    # already inferred to a concrete C, and C implements Iface[T_j, ...]
+    # via the impl_interface_args registry, T_j is fixed by the impl
+    ir_infer_remaining_from_bounds(decl_node, generic_params, arg_tids, param_type_nodes)
     mut concrete_types: List[String] := []
     for gp in generic_params:
         if ir_generic_infer_subst.contains_key(gp):
@@ -128,3 +132,53 @@ pub fn ir_infer_generic_concrete_types_with_state(name: String, node: Node, gene
         else:
             concrete_types.push("unknown")
     return concrete_types
+
+# Mirror of the checker's infer_subst_from_bounds (#204 + #209), in the IR
+# generic-specialization pass. For each generic param the arg-based step has
+# fixed to a concrete struct C, look up C's impl entries in impl_interface_args
+# and substitute the iface's args using C's instance type arguments. Any iface
+# arg whose name matches a still-unbound generic param of this call gets
+# bound here.
+fn ir_infer_remaining_from_bounds(decl_node: Node, generic_params: List[String], arg_tids: List[Int], param_type_nodes: List[Int]):
+    for child in decl_node.children:
+        cn := get_node(child)
+        if cn.kind == "generic_param":
+            param_name := cn.value
+            if ir_generic_infer_subst.contains_key(param_name):
+                concrete_str := ir_generic_infer_subst[param_name]
+                concrete_tid := ir_lookup_inferred_tid(param_name, concrete_str, generic_params, arg_tids, param_type_nodes)
+                if concrete_tid < 0:
+                    continue
+                concrete_base := extract_base_type_name(concrete_str)
+                for bound_idx in cn.children:
+                    bound_node := get_node(bound_idx)
+                    iface_base := iface_type_base_name(bound_node)
+                    bound_arg_names := iface_type_arg_names(bound_node)
+                    impl_key := concrete_base + chr(9) + iface_base
+                    if impl_interface_args.contains_key(impl_key):
+                        impl_args := decode_impl_iface_args(impl_interface_args[impl_key], concrete_tid)
+                        mut k := 0
+                        while k < bound_arg_names.len() and k < impl_args.len():
+                            ban := bound_arg_names[k]
+                            mut is_gp := false
+                            for gp in generic_params:
+                                if gp == ban:
+                                    is_gp = true
+                            if is_gp and not ir_generic_infer_subst.contains_key(ban):
+                                if impl_args[k] >= 0:
+                                    ir_bind_inferred_generic_runtime_type(ban, impl_args[k])
+                            k = k + 1
+
+# Recover a tid for a substitution that was recorded as a type-name string.
+# The actual tid was passed through one of the arg positions, so walk the
+# parameter list to find the position that matches and return that arg's tid.
+fn ir_lookup_inferred_tid(param_name: String, concrete_str: String, generic_params: List[String], arg_tids: List[Int], param_type_nodes: List[Int]) -> Int:
+    mut i := 0
+    while i < param_type_nodes.len() and i < arg_tids.len():
+        ptn := param_type_nodes[i]
+        if ptn >= 0:
+            pnode := get_node(ptn)
+            if pnode.kind == "type" and pnode.value == param_name:
+                return arg_tids[i]
+        i = i + 1
+    return 0 - 1

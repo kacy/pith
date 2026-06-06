@@ -1,0 +1,28 @@
+# A generic struct can implement a generic interface using the struct's
+# own type parameters in the interface args (e.g. `impl Iterator[U] for
+# MapIter[I, T, U]`). After registration this PR makes the impl recordable
+# under base names with "param:N" markers, so check_type_implements_interface
+# and bound-based inference both succeed for generic instances.
+
+interface Holder[X]:
+    fn get() -> X
+
+struct Box[T]:
+    val: T
+
+impl Holder[T] for Box:
+    fn get() -> T:
+        return self.val
+
+# A generic function with an interface-bounded type parameter, exercising the
+# bound-based inference path against a generic-struct receiver. X is inferred
+# from H's interface bound at the call site (no explicit type args needed).
+fn unwrap_holder[H: Holder[X], X](h: H) -> X:
+    return h.get()
+
+fn main():
+    bi := Box[Int](42)
+    print("int: {unwrap_holder(bi)}")
+
+    bs := Box[String]("hello")
+    print("str: {unwrap_holder(bs)}")

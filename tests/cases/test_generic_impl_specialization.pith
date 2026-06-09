@@ -1,0 +1,53 @@
+# The IR now emits one specialized copy of each impl method per known
+# instantiation of a generic struct, with the struct's generic parameters
+# substituted with the instance's concrete type arguments. This lets calls
+# on self.<field> inside the body dispatch to the concrete source's methods
+# at the IR level instead of emitting unresolved `call <name> unknown` ops.
+
+struct Counter:
+    cur: Int
+    hi: Int
+
+impl Counter:
+    fn next() -> Int?:
+        if self.cur >= self.hi:
+            return none
+        v := self.cur
+        self.cur = self.cur + 1
+        return v
+
+    fn len_remaining() -> Int:
+        return self.hi - self.cur
+
+# A generic wrapper that holds a source iterator. Its methods reference the
+# source via the struct's type parameter `I`; PR-E3a specializes the body for
+# each instantiation so self.src.next() dispatches concretely.
+struct Wrap[I]:
+    src: I
+
+impl Wrap:
+    fn read_first() -> Int:
+        n := self.src.next()
+        if n == none:
+            return 0 - 1
+        return n.value()
+
+    fn read_three() -> Int:
+        mut total := 0
+        n1 := self.src.next()
+        if n1 != none:
+            total = total + n1.value()
+        n2 := self.src.next()
+        if n2 != none:
+            total = total + n2.value()
+        n3 := self.src.next()
+        if n3 != none:
+            total = total + n3.value()
+        return total
+
+fn main():
+    w1 := Wrap[Counter](Counter(10, 20))
+    print("first: {w1.read_first()}")
+
+    w2 := Wrap[Counter](Counter(5, 8))
+    print("sum3: {w2.read_three()}")

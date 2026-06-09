@@ -33,8 +33,8 @@
 #   concat REG A B                      — string concatenation
 
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
-from checker import c_get_expr_type
-from types import TypeInfo, get_type_info
+from checker import c_get_expr_type, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from types import TypeInfo, get_type_info, get_type_name
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
@@ -105,6 +105,12 @@ mut ir_current_func_optional_inner_kind := ""
 # the impl block's target type, set while a method body is being emitted, so
 # `self.field = ...` knows what struct fields to look up
 mut ir_current_impl_type := ""
+# When a specialized impl method body is being emitted these hold the struct's
+# generic param names and the concrete type names for this instantiation, so
+# `self.field` references whose declared type is a struct param (`I`, `T`, `U`)
+# resolve to the right concrete type for dispatch (e.g., `Range` not `I`).
+mut ir_current_impl_subst_params: List[String] := []
+mut ir_current_impl_subst_args: List[String] := []
 mut ir_preloaded_import_roots: List[Int] := []
 mut ir_preloaded_import_paths: List[String] := []
 mut ir_emit_tests := false
@@ -540,6 +546,18 @@ fn ir_record_global_type(name: String, global_type: String):
     elif global_type == "bool":
         ir_global_bool_names = ir_push_string(ir_global_bool_names, name)
 
+# Substitute a type-name string using the active impl substitution map. If the
+# name matches one of the struct's generic parameters (in ir_current_impl_subst_params)
+# the corresponding concrete type name is returned; otherwise the input is
+# returned unchanged. Used when emitting specialized impl method bodies.
+fn ir_substitute_type_name(name: String) -> String:
+    mut i := 0
+    while i < ir_current_impl_subst_params.len():
+        if ir_current_impl_subst_params[i] == name and i < ir_current_impl_subst_args.len():
+            return ir_current_impl_subst_args[i]
+        i = i + 1
+    return name
+
 fn ir_impl_target_type(node: Node) -> String:
     mut impl_type := ""
     for child in node.children:
@@ -560,6 +578,84 @@ fn ir_emit_impl_methods(node: Node, impl_type: String):
         child_node := get_node(child)
         if child_node.kind == "fn_decl":
             ir_impl_func(child, impl_type)
+    # for a generic struct, also emit one specialized copy of each method per
+    # known instantiation so calls inside the body (`self.src.next()`) can
+    # dispatch on the concrete type rather than the unresolved generic
+    # parameter (`I.next` -> `next unknown`)
+    ir_emit_impl_method_specializations(node, impl_type)
+
+fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
+    if not has_generic_declaration(impl_type):
+        return
+    sdecl := get_node(get_generic_declaration_index(impl_type))
+    struct_params := collect_generic_parameter_names(sdecl)
+    if struct_params.len() == 0:
+        return
+    instance_tids := struct_instance_tids
+    for inst_tid in instance_tids:
+        if struct_instance_base_name[inst_tid] != impl_type:
+            continue
+        if not struct_instance_type_args.contains_key(inst_tid):
+            continue
+        arg_tids := decode_tid_list(struct_instance_type_args[inst_tid])
+        mut arg_names: List[String] := []
+        for at in arg_tids:
+            arg_names.push(ir_type_from_tid(at))
+        instance_type_name := get_type_name(inst_tid)
+        for child in impl_node.children:
+            child_node := get_node(child)
+            if child_node.kind == "fn_decl":
+                ir_impl_func_specialized(child, impl_type, instance_type_name, struct_params, arg_names)
+
+fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: String, params: List[String], arg_names: List[String]):
+    node := get_node(idx)
+    orig_name := node.value
+    # specialized symbol name e.g. MapIter_Range_int_int_next
+    mut suffix := ""
+    for an in arg_names:
+        suffix = suffix + "_" + ir_sanitize_symbol(an)
+    full_name := base_impl_type + suffix + "_" + orig_name
+    method_key := ir_impl_method_key(instance_type, orig_name)
+    # don't double-register if the same instance already saw this method
+    if ir_impl_methods.contains_key(method_key):
+        return
+    ir_impl_methods.insert(method_key, full_name)
+
+    body_idx := ir_find_body(idx)
+    param_count := ir_param_count(idx) + 1
+    ret_type := ir_extract_return_type(idx)
+    ir_prepare_func_emission(ret_type)
+    ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
+    ir_current_impl_type = instance_type
+    ir_current_impl_subst_params = params
+    ir_current_impl_subst_args = arg_names
+    ir_emit_func_header(full_name, param_count, ret_type)
+    ir_emit_named_param("self", instance_type)
+    ir_emit_fn_params(idx)
+    ir_func_returns.insert(method_key, ret_type)
+    ir_func_returns.insert(full_name, ret_type)
+    ir_finish_func_emission(body_idx)
+    ir_current_impl_type = ""
+    ir_current_impl_subst_params = []
+    ir_current_impl_subst_args = []
+
+fn ir_sanitize_symbol(name: String) -> String:
+    # Pith identifiers don't contain `[`, `]`, `,`, but generic instance names
+    # like `MapIter[Range,Int,Int]` do. Map them to underscores so the symbol
+    # name remains a valid IR/runtime identifier.
+    mut out := ""
+    mut i := 0
+    while i < name.len():
+        c := name.substring(i, i + 1)
+        if c == "[" or c == "]" or c == ",":
+            out = out + "_"
+        elif c == " ":
+            i = i + 1
+            continue
+        else:
+            out = out + c
+        i = i + 1
+    return out
 
 fn ir_declared_struct_name(node: Node) -> String:
     if node.value.contains("["):
@@ -939,11 +1035,27 @@ fn ir_method_receiver_type(node: Node) -> String:
             return "task:" + ir_type_from_tid(recv_info.inner)
         known := ir_type_from_tid(recv_tid)
         if known.len() > 0:
-            return known
+            return ir_substitute_type_name(known)
     checked := ir_checked_type(node.children[0])
     if checked.len() > 0:
-        return checked
-    return ir_infer_type(node.children[0])
+        return ir_substitute_type_name(checked)
+    inferred := ir_infer_type(node.children[0])
+    if inferred.len() > 0:
+        return ir_substitute_type_name(inferred)
+    # fallback: if the receiver is `self.field` inside an impl method, look
+    # up the field's declared type from the impl struct and substitute. this
+    # is what lets a specialized MapIter[Range,_,_]_next route self.src.next()
+    # to Range_next when the checker recorded self.src as TID_ERR
+    recv_node := get_node(node.children[0])
+    if recv_node.kind == "field_access" and recv_node.children.len() > 0 and ir_current_impl_type.len() > 0:
+        inner := get_node(recv_node.children[0])
+        if inner.kind == "self":
+            fname := node_value(node.children[0])
+            base_struct := ir_strip_type_args(ir_current_impl_type)
+            field_key := base_struct + "." + fname
+            if ir_struct_field_lookup.contains_key(field_key):
+                return ir_substitute_type_name(ir_struct_field_lookup[field_key])
+    return ""
 
 fn ir_emit_optional_unwrap(node: Node) -> Int:
     recv_r := ir_expr(node.children[0])
@@ -3280,6 +3392,15 @@ fn ir_emit_method_call(idx: Int) -> Int:
                 # the optional is Some); used by iterator adapters in std.iter
                 obj_r := ir_expr(node.children[0])
                 return ir_optional_value_field(obj_r, recv_tid)
+    # In a specialized generic impl body the receiver of `.value()` may have
+    # type T? where T was suppressed at registration (so c_get_expr_type returns
+    # TID_ERR). Emit the optional value-field extract directly when we're
+    # clearly inside such a body.
+    if mname == "value" and ir_current_impl_subst_params.len() > 0 and node.children.len() == 1:
+        obj_r := ir_expr(node.children[0])
+        r := ir_reg()
+        ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 8 unknown value")
+        return r
 
     alias_fname := ir_resolve_module_alias_method_call_name(idx)
     if alias_fname.len() > 0:
@@ -4108,7 +4229,18 @@ fn ir_emit_for_stmt(node: Node):
             return
         # iterator protocol: a struct with a `next() -> T?` method drives the
         # loop via next() instead of index-based access
-        iter_struct := ir_infer_type(node.children[0])
+        mut iter_struct := ir_infer_type(node.children[0])
+        # if the inferred name is a generic struct's base and matches the base
+        # of an active generic-function concrete type, promote it to the full
+        # instance name so dispatch picks the specialized impl method
+        if iter_struct.len() > 0 and iter_struct.contains("[") == false:
+            mut gi := 0
+            while gi < ir_active_generic_concrete_types.len():
+                concrete := ir_active_generic_concrete_types[gi]
+                if ir_strip_type_args(concrete) == iter_struct:
+                    iter_struct = concrete
+                    gi = ir_active_generic_concrete_types.len()
+                gi = gi + 1
         next_name := ir_lookup_impl_method_name(iter_struct, "next")
         if next_name.len() > 0:
             ir_emit_for_iterator_stmt(node, names, next_name)

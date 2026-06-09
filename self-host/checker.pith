@@ -65,8 +65,12 @@ pub mut impl_interface_args: Map[String, String] := {}
 # generic struct instance info, keyed by the instance's tid, for dispatch-time
 # substitution: type_args is a csv of arg tids, base_name is the original
 # (un-instantiated) struct name from which the instance was built.
-mut struct_instance_type_args: Map[Int, String] := {}
-mut struct_instance_base_name: Map[Int, String] := {}
+pub mut struct_instance_type_args: Map[Int, String] := {}
+pub mut struct_instance_base_name: Map[Int, String] := {}
+# Pith's cross-module Map read is unreliable for iterating, so we also
+# maintain a parallel list of instance tids that callers can use to walk
+# every generic struct instantiation the program has registered.
+pub mut struct_instance_tids: List[Int] := []
 # names that resolve_named_type should treat as unknown without raising E202.
 # used while registering methods on a generic struct so the methods can
 # reference the struct's type parameters (T) without errors. dispatch
@@ -94,6 +98,7 @@ pub fn initialize_checker(file_path: String):
     impl_interface_args = {}
     struct_instance_type_args = {}
     struct_instance_base_name = {}
+    struct_instance_tids = []
     suppress_unknown_type_for = {}
     expression_type_cache = {}
     module_aliases = {}
@@ -738,10 +743,10 @@ fn resolve_generic_declaration_key(name: String) -> String:
                     return imported_key
     return ""
 
-fn has_generic_declaration(name: String) -> Bool:
+pub fn has_generic_declaration(name: String) -> Bool:
     return resolve_generic_declaration_key(name).len() > 0
 
-fn get_generic_declaration_index(name: String) -> Int:
+pub fn get_generic_declaration_index(name: String) -> Int:
     key := resolve_generic_declaration_key(name)
     if key.len() > 0:
         return generic_declaration_map[key]
@@ -2582,7 +2587,7 @@ fn encode_tid_list(tids: List[Int]) -> String:
         parts.push(tid.to_string())
     return parts.join(",")
 
-fn decode_tid_list(s: String) -> List[Int]:
+pub fn decode_tid_list(s: String) -> List[Int]:
     mut tids: List[Int] := []
     if s.len() == 0:
         return tids
@@ -4347,6 +4352,7 @@ fn instantiate_generic_struct_type(decl: Node, type_args: List[Int]) -> Int:
     # substitute the struct's type parameters in method signatures
     struct_instance_type_args.insert(tid, encode_tid_list(type_args))
     struct_instance_base_name.insert(tid, base_name)
+    struct_instance_tids.push(tid)
     return tid
 
 fn instantiate_generic_enum_type(decl: Node, type_args: List[Int]) -> Int:

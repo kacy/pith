@@ -1,0 +1,20 @@
+# Calling a closure stored in self.<field> dispatches through the closure
+# handle (pith_closure_get_fn) rather than emitting a literal symbol call.
+# Without this PR the body would emit `call f unknown ...` and either crash
+# at runtime or fail to link.
+
+struct Direct[T]:
+    f: fn(T) -> T
+
+impl Direct:
+    fn apply(x: T) -> T:
+        return self.f(x)
+
+# A constructor helper sidesteps the constructor's strict function-type
+# equality so we can build a Direct[Int] from a lambda.
+fn make_direct[T](f: fn(T) -> T) -> Direct[T]:
+    return Direct[T](f)
+
+fn main():
+    di := make_direct(fn(x: Int) => x * 7)
+    print("apply: {di.apply(6)}")

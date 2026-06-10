@@ -1,0 +1,35 @@
+# A lazy map adapter built on the iterator protocol:
+#
+#   - MapIter[I, T, U] wraps a source iterator and a closure;
+#   - its next() pulls from self.src.next() (closure-field call lands via
+#     #211's per-instance specialization), unwraps with n.value(), and
+#     applies self.f (the closure-field-call path from #212);
+#   - `return self.f(n.value())` from a `U?`-returning method in a generic
+#     impl body returns the closure's result without a redundant Some wrap.
+#
+# Without the PR-E3 chain (#211, #212, this PR) any of these legs falls
+# through to an unresolved IR op or an infinite loop.
+
+from std.iter import Range, to_list, Iterator
+
+struct MapIter[I, T, U]:
+    src: I
+    f: fn(T) -> U
+
+impl Iterator[U] for MapIter:
+    fn next() -> U?:
+        n := self.src.next()
+        if n == none:
+            return none
+        return self.f(n.value())
+
+fn map_iter[I: Iterator[T], T, U](src: I, f: fn(T) -> U) -> MapIter[I, T, U]:
+    return MapIter[I, T, U](src, f)
+
+fn main():
+    out := to_list(map_iter(Range(0, 5), fn(x: Int) => x * 10))
+    print("len: {out.len()}")
+    mut s := ""
+    for x in out:
+        s = s + x.to_string() + " "
+    print("vals: {s}")

@@ -1,14 +1,15 @@
 # A lazy map adapter built on the iterator protocol:
 #
 #   - MapIter[I, T, U] wraps a source iterator and a closure;
-#   - its next() pulls from self.src.next() (closure-field call lands via
-#     #211's per-instance specialization), unwraps with n.value(), and
-#     applies self.f (the closure-field-call path from #212);
+#   - its next() pulls from self.src.next() (dispatched via per-instance
+#     method specialization), unwraps with n.value(), and applies self.f
+#     (the closure-field-call path from #212);
 #   - `return self.f(n.value())` from a `U?`-returning method in a generic
 #     impl body returns the closure's result without a redundant Some wrap.
 #
-# Without the PR-E3 chain (#211, #212, this PR) any of these legs falls
-# through to an unresolved IR op or an infinite loop.
+# Defined here in the test file rather than std.iter because the cross-module
+# specialization-symbol-prefix routing is a known follow-up. Inline use works
+# end-to-end today.
 
 from std.iter import Range, to_list, Iterator
 

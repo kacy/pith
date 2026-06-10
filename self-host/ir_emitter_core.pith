@@ -96,6 +96,12 @@ mut ir_continue_stack: List[String] := []
 mut ir_lambda_bodies: List[String] := [] # deferred lambda function IR
 mut ir_module_count := 0 # increments per emit_ir call for unique naming
 mut ir_impl_methods: Map[String, String] := {}
+# Per-instantiation specialized impl method names, kept separate from
+# ir_impl_methods because that map is reset between modules and would wipe
+# specializations registered during an earlier module's emission. Key is
+# "InstanceType.method" (e.g. "MapIter[Range,Int,Int].next") and value is the
+# specialized symbol name. Read via ir_lookup_specialized_method.
+mut ir_impl_method_specializations: Map[String, String] := {}
 mut ir_import_renames: Map[String, String] := {}
 mut ir_module_aliases: Map[String, String] := {}
 mut ir_import_declared_functions: Map[String, Bool] := {}
@@ -574,15 +580,17 @@ fn ir_impl_target_type(node: Node) -> String:
     return impl_type
 
 fn ir_emit_impl_methods(node: Node, impl_type: String):
+    # for a generic struct, also emit one specialized copy of each method per
+    # known instantiation so calls inside the body (`self.src.next()`) can
+    # dispatch on the concrete type rather than the unresolved generic
+    # parameter (`I.next` -> `next unknown`). emit these BEFORE the base
+    # bodies so we can read each method's still-prefixed base symbol name
+    # out of ir_impl_methods (ir_impl_func below overwrites it).
+    ir_emit_impl_method_specializations(node, impl_type)
     for child in node.children:
         child_node := get_node(child)
         if child_node.kind == "fn_decl":
             ir_impl_func(child, impl_type)
-    # for a generic struct, also emit one specialized copy of each method per
-    # known instantiation so calls inside the body (`self.src.next()`) can
-    # dispatch on the concrete type rather than the unresolved generic
-    # parameter (`I.next` -> `next unknown`)
-    ir_emit_impl_method_specializations(node, impl_type)
 
 fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
     if not has_generic_declaration(impl_type):
@@ -617,9 +625,25 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
     full_name := base_impl_type + suffix + "_" + orig_name
     method_key := ir_impl_method_key(instance_type, orig_name)
     # don't double-register if the same instance already saw this method
+    if ir_impl_method_specializations.contains_key(method_key):
+        return
     if ir_impl_methods.contains_key(method_key):
         return
     ir_impl_methods.insert(method_key, full_name)
+    # also record in a dedicated, non-reset map keyed by the instance-typed
+    # method. derive the module-path prefix from the base method's currently
+    # registered symbol (phase-two metadata inserted it with the right
+    # prefix; this runs before ir_impl_func overwrites it for the current
+    # module's impls) so cross-module call sites use the right linker symbol.
+    base_key := ir_impl_method_key(base_impl_type, orig_name)
+    expected_base_sym := base_impl_type + "_" + orig_name
+    mut prefixed_full := full_name
+    if ir_impl_methods.contains_key(base_key):
+        base_sym := ir_impl_methods[base_key]
+        if base_sym.len() > expected_base_sym.len() and base_sym.ends_with(expected_base_sym):
+            prefix_len := base_sym.len() - expected_base_sym.len()
+            prefixed_full = base_sym.substring(0, prefix_len) + full_name
+    ir_impl_method_specializations.insert(method_key, prefixed_full)
 
     body_idx := ir_find_body(idx)
     param_count := ir_param_count(idx) + 1
@@ -638,6 +662,15 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
     ir_current_impl_type = ""
     ir_current_impl_subst_params = []
     ir_current_impl_subst_args = []
+
+# Look up a specialized impl method by its instance-typed key. Kept small and
+# separate so the module-global Map read compiles reliably (see
+# codegen-map-read-sensitivity.md in project memory).
+fn ir_lookup_specialized_method(type_name: String, method_name: String) -> String:
+    key := ir_impl_method_key(type_name, method_name)
+    if ir_impl_method_specializations.contains_key(key):
+        return ir_impl_method_specializations[key]
+    return ""
 
 fn ir_sanitize_symbol(name: String) -> String:
     # Pith identifiers don't contain `[`, `]`, `,`, but generic instance names
@@ -4286,7 +4319,12 @@ fn ir_emit_for_stmt(node: Node):
                     iter_struct = concrete
                     gi = ir_active_generic_concrete_types.len()
                 gi = gi + 1
-        next_name := ir_lookup_impl_method_name(iter_struct, "next")
+        # prefer a specialized method body (recorded by per-instantiation
+        # emission) so iterators specialized for this instance dispatch
+        # without falling back to the base body's unresolved calls
+        mut next_name := ir_lookup_specialized_method(iter_struct, "next")
+        if next_name.len() == 0:
+            next_name = ir_lookup_impl_method_name(iter_struct, "next")
         if next_name.len() > 0:
             ir_emit_for_iterator_stmt(node, names, next_name)
             return

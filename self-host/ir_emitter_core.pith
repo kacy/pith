@@ -1007,6 +1007,13 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
             actual_info := get_type_info(actual_tid)
             if actual_info.kind == "optional" or actual_info.kind == "result" or actual_info.kind == "tuple":
                 return value_r
+        # in a generic impl body, a method call's checked type is often
+        # TID_ERR because the body was checked with the struct's type
+        # params suppressed. assume `return <method_call>` from a
+        # tuple-returning function already produces the right shape rather
+        # than wrap-it-as-Some.
+        if ir_current_impl_subst_params.len() > 0 and (vn.kind == "method_call" or vn.kind == "call"):
+            return value_r
         return ir_emit_optional_some_value(value_r)
     empty_init_call := ir_empty_collection_init_call_name(vn.kind, vn.children.len(), target_type)
     if empty_init_call.len() > 0:
@@ -1192,6 +1199,16 @@ fn ir_emit_binary_expr(node: Node) -> Int:
         if right_node.kind == "none_lit" and left_info.kind == "optional":
             ir_emit_optional_none_compare(r, op, left_r)
             return r
+        # in a generic impl body, the non-none side's type may be TID_ERR
+        # because the struct's type parameters were suppressed at registration;
+        # treat `expr == none` / `expr != none` as an optional comparison anyway
+        if ir_current_impl_subst_params.len() > 0:
+            if left_node.kind == "none_lit":
+                ir_emit_optional_none_compare(r, op, right_r)
+                return r
+            if right_node.kind == "none_lit":
+                ir_emit_optional_none_compare(r, op, left_r)
+                return r
     if is_float_op and ir_is_float_arithmetic(op):
         ir_emit_float_binary(r, op, left_r, right_r)
         return r

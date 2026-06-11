@@ -1,0 +1,29 @@
+# std.iter now ships lazy MapIter and FilterIter adapters. Chains compose
+# without per-element intermediate lists: each call site monomorphizes the
+# adapter, and the for-iterator driver dispatches on the specialized method
+# of the receiver's concrete instantiation.
+
+from std.iter import Range, to_list, map_iter, filter_iter
+
+fn main():
+    doubled := to_list(map_iter(Range(0, 5), fn(x: Int) => x * 2))
+    print("doubled count: {doubled.len()}")
+    mut ds := ""
+    for x in doubled:
+        ds = ds + x.to_string() + " "
+    print("doubled: {ds}")
+
+    evens := to_list(filter_iter(Range(0, 10), fn(x: Int) => x % 2 == 0))
+    print("evens count: {evens.len()}")
+    mut es := ""
+    for x in evens:
+        es = es + x.to_string() + " "
+    print("evens: {es}")
+
+    # nested: filter then map, walked once
+    chained := to_list(map_iter(filter_iter(Range(0, 10), fn(x: Int) => x > 5), fn(x: Int) => x * 10))
+    print("chained count: {chained.len()}")
+    mut cs := ""
+    for x in chained:
+        cs = cs + x.to_string() + " "
+    print("chained: {cs}")

@@ -36,3 +36,45 @@ pub fn to_list[I: Iterator[T], T](it: I) -> List[T]:
     for x in it:
         out.push(x)
     return out
+
+# Lazy adapters. Each one wraps a source iterator + a closure and produces a
+# new iterator. A chain like `to_list(filter_iter(map_iter(src, f), p))` walks
+# the source once with a single allocation at to_list — no intermediate list
+# per pipeline stage.
+#
+# Constructors are named `map_iter` / `filter_iter` so they don't collide with
+# the eager free-function `map` / `filter` builtins on List from earlier in the
+# language.
+
+pub struct MapIter[I, T, U]:
+    src: I
+    f: fn(T) -> U
+
+impl Iterator[U] for MapIter:
+    fn next() -> U?:
+        n := self.src.next()
+        if n == none:
+            return none
+        return self.f(n.value())
+
+pub fn map_iter[I: Iterator[T], T, U](src: I, f: fn(T) -> U) -> MapIter[I, T, U]:
+    return MapIter[I, T, U](src, f)
+
+pub struct FilterIter[I, T]:
+    src: I
+    p: fn(T) -> Bool
+
+impl Iterator[T] for FilterIter:
+    fn next() -> T?:
+        # pull from the source until the predicate accepts an element or the
+        # source is exhausted
+        mut n := self.src.next()
+        while n != none:
+            v := n.value()
+            if self.p(v):
+                return v
+            n = self.src.next()
+        return none
+
+pub fn filter_iter[I: Iterator[T], T](src: I, p: fn(T) -> Bool) -> FilterIter[I, T]:
+    return FilterIter[I, T](src, p)

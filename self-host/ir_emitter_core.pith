@@ -624,9 +624,9 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
         suffix = suffix + "_" + ir_sanitize_symbol(an)
     full_name := base_impl_type + suffix + "_" + orig_name
     method_key := ir_impl_method_key(instance_type, orig_name)
-    # don't double-register if the same instance already saw this method
-    if ir_impl_method_specializations.contains_key(method_key):
-        return
+    # if ir_impl_methods already has a specialized entry (e.g. a previous
+    # ir_impl_func_specialized for the same instance ran in this emit pass)
+    # then the body is already on its way out; skip emitting it again
     if ir_impl_methods.contains_key(method_key):
         return
     ir_impl_methods.insert(method_key, full_name)
@@ -668,9 +668,23 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
 # codegen-map-read-sensitivity.md in project memory).
 fn ir_lookup_specialized_method(type_name: String, method_name: String) -> String:
     key := ir_impl_method_key(type_name, method_name)
-    if ir_impl_method_specializations.contains_key(key):
-        return ir_impl_method_specializations[key]
-    return ""
+    if ir_impl_method_specializations.contains_key(key) == false:
+        return ""
+    name := ir_impl_method_specializations[key]
+    # the specialization may have been registered un-prefixed (because the
+    # impl's source module didn't know its import prefix at emit time);
+    # if the base method now resolves to a prefixed import symbol, apply
+    # the same prefix to the specialized name so the call site links
+    base_type := ir_strip_type_args(type_name)
+    base_key := ir_impl_method_key(base_type, method_name)
+    if ir_impl_methods.contains_key(base_key):
+        base_full := ir_impl_methods[base_key]
+        expected_base := base_type + "_" + method_name
+        if base_full.len() > expected_base.len() and base_full.ends_with(expected_base):
+            prefix := base_full.substring(0, base_full.len() - expected_base.len())
+            if name.starts_with(prefix) == false:
+                return prefix + name
+    return name
 
 fn ir_sanitize_symbol(name: String) -> String:
     # Pith identifiers don't contain `[`, `]`, `,`, but generic instance names
@@ -3508,7 +3522,12 @@ fn ir_emit_method_call(idx: Int) -> Int:
     if ir_is_bool_returning_method(emit_name):
         ir_var_types.insert("__last_call", "bool")
 
-    impl_name := ir_lookup_impl_method_name(obj_type, mname)
+    # prefer a specialized impl method (registered per-instantiation) so that
+    # inside a generic body, self.src.next() dispatches to the specialized
+    # version when src's type is itself a generic instance
+    mut impl_name := ir_lookup_specialized_method(obj_type, mname)
+    if impl_name.len() == 0:
+        impl_name = ir_lookup_impl_method_name(obj_type, mname)
     impl_dispatch := impl_name.len() > 0
     if impl_dispatch:
         emit_name = impl_name
@@ -5194,9 +5213,71 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
 fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_global_bindings(root)
     ir_emit_init_globals(root)
+    # pre-register all impl method specializations across the module so that
+    # an earlier impl's specialized body can dispatch to a later impl's
+    # specialized version (e.g. MapIter[FilterIter[..], ..].next calling
+    # FilterIter[Range, Int].next)
+    ir_preregister_all_impl_specializations(root_idx, root)
     ir_emit_top_level_items(root_idx, root)
     ir_emit_generic_specializations()
     ir_append_lambda_bodies()
+
+# Walk every impl_decl in the current root and register specialization name
+# entries into ir_impl_method_specializations without emitting bodies yet.
+# Then ir_emit_impl_methods's per-impl loop can emit bodies safely; any
+# cross-impl dispatch lookup will already find the right specialized symbol.
+fn ir_preregister_all_impl_specializations(root_idx: Int, root: Node):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        mut actual_node := node
+        if node.kind == "pub":
+            actual_node = get_node(node.children[0])
+        if actual_node.kind == "impl_decl":
+            impl_type := ir_impl_target_type(actual_node)
+            if impl_type.len() > 0:
+                ir_register_impl_method_specialization_names(actual_node, impl_type)
+
+fn ir_register_impl_method_specialization_names(impl_node: Node, impl_type: String):
+    if not has_generic_declaration(impl_type):
+        return
+    sdecl := get_node(get_generic_declaration_index(impl_type))
+    struct_params := collect_generic_parameter_names(sdecl)
+    if struct_params.len() == 0:
+        return
+    instance_tids := struct_instance_tids
+    for inst_tid in instance_tids:
+        if struct_instance_base_name[inst_tid] != impl_type:
+            continue
+        if not struct_instance_type_args.contains_key(inst_tid):
+            continue
+        arg_tids := decode_tid_list(struct_instance_type_args[inst_tid])
+        mut arg_names: List[String] := []
+        for at in arg_tids:
+            arg_names.push(ir_type_from_tid(at))
+        instance_type_name := get_type_name(inst_tid)
+        for child in impl_node.children:
+            child_node := get_node(child)
+            if child_node.kind == "fn_decl":
+                ir_register_one_specialized_method_name(child_node, impl_type, instance_type_name, arg_names)
+
+fn ir_register_one_specialized_method_name(method_node: Node, base_impl_type: String, instance_type: String, arg_names: List[String]):
+    orig_name := method_node.value
+    mut suffix := ""
+    for an in arg_names:
+        suffix = suffix + "_" + ir_sanitize_symbol(an)
+    full_name := base_impl_type + suffix + "_" + orig_name
+    method_key := ir_impl_method_key(instance_type, orig_name)
+    if ir_impl_method_specializations.contains_key(method_key):
+        return
+    base_key := ir_impl_method_key(base_impl_type, orig_name)
+    expected_base_sym := base_impl_type + "_" + orig_name
+    mut prefixed_full := full_name
+    if ir_impl_methods.contains_key(base_key):
+        base_sym := ir_impl_methods[base_key]
+        if base_sym.len() > expected_base_sym.len() and base_sym.ends_with(expected_base_sym):
+            prefix_len := base_sym.len() - expected_base_sym.len()
+            prefixed_full = base_sym.substring(0, prefix_len) + full_name
+    ir_impl_method_specializations.insert(method_key, prefixed_full)
 
 fn ir_finish_module_emit():
     ir_module_count = ir_module_count + 1

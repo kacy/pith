@@ -30,21 +30,66 @@ really is the clearest expression.
 ## collections
 
 Use `for item in items` or `for item, index in items` before reaching for a
-manual `while index < items.len()` loop.
+manual `while index < items.len()` loop. When you actually need an integer
+index, use range-for instead of building a list of integers:
 
-Use `std.collections` for common transforms:
+```pith
+for i in 0..items.len():
+    print("{i}: {items[i]}")
+
+for i in 0..=10:    # inclusive upper bound
+    total = total + i
+```
+
+Both forms compile to a counted loop with no allocation. They're the
+default for "do this N times" or "index into a parallel list".
+
+For everyday list transforms, prefer the method form on the list — it
+reads top to bottom and chains:
+
+```pith
+names := records.map(fn(r: Record) => r.name)
+seniors := records.filter(fn(r: Record) => r.years >= 5)
+total := records.reduce(0, fn(acc: Int, r: Record) => acc + r.score)
+```
+
+The free-function forms in `std.collections` (`map_list`, `filter_list`,
+`fold_list`, `max_by`, …) are still there when you already hold a
+function and want to pipe it, or when you need a helper the method
+surface doesn't cover yet:
 
 ```pith
 import std.collections as collections
 
-names := collections.map_list(records, fn(record: Record) => record.name)
-engineering := collections.filter_list(records, fn(record: Record) => record.category == "engineering")
-total := collections.fold_list(records, 0, fn(acc: Int, record: Record) => acc + record.score)
 best := collections.max_by(records, fn(record: Record) => record.score)!
 ```
 
+When a pipeline runs over a large collection or you only need the first
+few elements, switch to the lazy adapters in `std.iter`. The chain
+fuses and the source is walked once. See `docs/iterators.md` for the
+protocol and worked examples.
+
 Collections are shared handles. If a function needs to mutate its own top-level
 container, start with `copy_list`, `copy_map`, or `copy_set`.
+
+Struct fields can be updated in place. Structs are heap-allocated reference
+values, so a write through one handle is visible through every other handle
+to the same instance — useful for stateful iterators and small caches, and a
+foot-gun when you actually wanted a copy:
+
+```pith
+struct Counter:
+    cur: Int
+    hi: Int
+
+impl Counter:
+    fn next() -> Int?:
+        if self.cur >= self.hi:
+            return none
+        v := self.cur
+        self.cur = self.cur + 1
+        return v
+```
 
 ## errors and tests
 

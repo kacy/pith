@@ -34,6 +34,7 @@ make self-host
 - `docs/http_apps.md` for the higher-level http request/response layer
 - `docs/text_and_bytes.md` for the string/bytes split and common helpers
 - `docs/idiomatic_pith.md` for the current everyday style
+- `docs/iterators.md` for the iterator protocol, range-for, and `std.iter`
 - `docs/contributing.md` for the development loop and smoke checks
 - `docs/tooling_stdlib.md` for glob, cli, diagnostic, and testing helpers
 - `self-host/pith_main.pith` for the self-hosted frontend (lex/parse/check/fmt/lint/doc)
@@ -109,35 +110,39 @@ that path.
 
 **language features:**
 - function declarations, typed parameters, return types, calls
-- struct declarations with typed fields, field access, constructors
+- struct declarations with typed fields, field access, constructors, and field defaults
+- struct field assignment (`p.x = 5`, `self.x = x + 1` in methods); structs are heap-allocated reference values so updates are visible through every handle to the same instance
 - enum declarations with variant data
 - interface declarations with method signatures
-- impl blocks for structs with method implementations
-- generic types, generic functions, and generic interfaces with bounds
+- impl blocks for structs with method implementations, including per-instantiation specialization of methods on generic structs
+- generic types, generic functions, and generic interfaces with bounds; type parameters are inferred through interface bounds (`fn f[I: Iterator[T], T](it: I)` infers `T` from the impl `I` provides), with multi-arg explicit calls `f[A, B](x)` as the escape hatch
 - variable bindings with type inference (`x := 42`)
 - mutability enforcement (`mut` required for reassignment)
 - if/elif/else, while, for loops over collections and strings with scoping
+- range-for `for i in 0..n` (exclusive) and `for i in 0..=n` (inclusive); both compile to a counted loop with no allocation
+- iterator protocol: `for x in it` drives any value whose type provides `fn next() -> T?`, so user-defined iterators participate in the same `for` loop as built-in collections (see `docs/iterators.md`)
 - binary operators: arithmetic, comparison, logical, string concatenation
 - unary operators: negate, not
-- string interpolation and character iteration (`for c in string`)
+- string interpolation, character iteration (`for c in string`), and `{{`/`}}` to write a literal brace inside an interpolated string
 - return type checking
 - match expressions with exhaustiveness checking
-- method calls and impl blocks
+- method calls and impl blocks; list method syntax (`xs.map(fn(x) => x * 2).filter(fn(x) => x > 0)`) alongside the eager free-function forms
 - pipe operator (`x | f`)
-- collection literals: List, Map, Set with index expressions
+- collection literals: List, Map, Set with index expressions and subscript assignment (`m[k] = v`)
 - generics with monomorphization
 - lambdas and closures (capturing lambdas with uniform closure ABI)
 - result types (`T!` and `T!E`) with try propagation (`expr!`), `fail`, `catch`, `unwrap_or`, and `or_else`
-- optional types (`T?`)
+- optional types (`T?`) with `== none` / `!= none` and `.value()` to extract the inner value once you have checked
 - tuples with field access (`t.0`, `t.1`)
 - type aliases
 - concurrency: spawn/await, Task[T], Mutex, WaitGroup, Semaphore, Channel, select, contexts, timers
 - multi-module imports with `from ... import`
 
-**standard library (58 modules):**
+**standard library (59 modules):**
 - string methods, type conversions, math builtins
 - file I/O, env, args, exit, exec
 - collection methods (push, remove, contains, keys, values, reverse, etc.)
+- std.iter — `Iterator[T]` interface, `Range`, `to_list`, and the lazy `map_iter` / `filter_iter` adapters that fuse without intermediate lists
 - std.json, std.toml, std.csv, std.config — parse/encode config and data, including typed config decode
 - std.net.tcp, std.net.dns, std.net.url, std.net.http, std.net.websocket, std.net.tls — networking
 - std.hash, std.checksum, std.encoding, std.crypto, std.bits, std.bytes, std.binary — bytes, crypto, and encoding

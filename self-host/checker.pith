@@ -2236,6 +2236,66 @@ fn check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_i
         idx = idx + 1
     return struct_tid
 
+# Walk a field's declared type node and its corresponding argument's concrete
+# type in parallel. When the field side names one of the struct's generic
+# parameters (T, U, ...), record T → arg_tid in subst_map. Handles the common
+# containers (List, Set, Map, Optional, Task, Channel, tuple) so a field like
+# `items: List[T]` matched against `List[Int]` infers T = Int.
+fn unify_field_type_against_arg(field_node_idx: Int, arg_tid: Int, generic_params: List[String], subst_map: Map[String, Int]):
+    if field_node_idx < 0:
+        return
+    if arg_tid < 0:
+        return
+    fnode := get_node(field_node_idx)
+    if fnode.kind == "type":
+        for gp in generic_params:
+            if strings_equal(gp, fnode.value):
+                if subst_map.contains_key(gp) == false:
+                    subst_map.insert(gp, arg_tid)
+                return
+        return
+    arg_info := get_type_info(arg_tid)
+    if fnode.kind == "generic_type":
+        if strings_equal(fnode.value, "List"):
+            if arg_info.kind == "list":
+                if fnode.children.len() == 1:
+                    unify_field_type_against_arg(fnode.children[0], arg_info.inner, generic_params, subst_map)
+            return
+        if strings_equal(fnode.value, "Set"):
+            if arg_info.kind == "set":
+                if fnode.children.len() == 1:
+                    unify_field_type_against_arg(fnode.children[0], arg_info.inner, generic_params, subst_map)
+            return
+        if strings_equal(fnode.value, "Map"):
+            if arg_info.kind == "map":
+                if fnode.children.len() == 2:
+                    unify_field_type_against_arg(fnode.children[0], arg_info.key_type, generic_params, subst_map)
+                    unify_field_type_against_arg(fnode.children[1], arg_info.value_type, generic_params, subst_map)
+            return
+        if strings_equal(fnode.value, "Task"):
+            if arg_info.kind == "task":
+                if fnode.children.len() == 1:
+                    unify_field_type_against_arg(fnode.children[0], arg_info.inner, generic_params, subst_map)
+            return
+        if strings_equal(fnode.value, "Channel"):
+            if arg_info.kind == "channel":
+                if fnode.children.len() == 1:
+                    unify_field_type_against_arg(fnode.children[0], arg_info.inner, generic_params, subst_map)
+            return
+        return
+    if fnode.kind == "optional_type":
+        if arg_info.kind == "optional":
+            if fnode.children.len() >= 1:
+                unify_field_type_against_arg(fnode.children[0], arg_info.inner, generic_params, subst_map)
+        return
+    if fnode.kind == "tuple_type":
+        if arg_info.kind == "tuple":
+            mut i := 0
+            for c in fnode.children:
+                if i < arg_info.elements.len():
+                    unify_field_type_against_arg(c, arg_info.elements[i], generic_params, subst_map)
+                i = i + 1
+
 fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_id: Int) -> Int:
     decl_idx := get_generic_declaration_index(name)
     decl_node := get_node(decl_idx)
@@ -2262,18 +2322,15 @@ fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_
     if arg_types.len() > field_type_nodes.len():
         report_error("E207", name + " expects at most " + field_type_nodes.len().to_string() + " fields, got " + arg_types.len().to_string())
         return TID_ERR
-    # infer type args from argument types
+    # infer type args from argument types. We walk each field's declared type
+    # node alongside the concrete arg type so containers like `List[T]` against
+    # `List[Int]` infer T = Int.
     mut subst_map: Map[String, Int] := {}
     mut fidx := 0
     for ftn in field_type_nodes:
         if ftn >= 0:
-            fnode := get_node(ftn)
-            if fnode.kind == "type":
-                for gp in generic_params:
-                    if strings_equal(gp, fnode.value):
-                        if fidx < arg_types.len():
-                            if subst_map.contains_key(gp) == false:
-                                subst_map.insert(gp, arg_types[fidx])
+            if fidx < arg_types.len():
+                unify_field_type_against_arg(ftn, arg_types[fidx], generic_params, subst_map)
         fidx = fidx + 1
     # check interface bounds
     if check_type_parameter_bounds(decl_idx, subst_map) == false:

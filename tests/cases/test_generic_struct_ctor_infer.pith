@@ -1,0 +1,52 @@
+# A generic struct constructor infers its type arguments from the argument
+# types. The inference walks each declared field type alongside the concrete
+# arg type, so containers like `List[T]` against `List[Int]` substitute
+# T = Int. Methods on the inferred instance dispatch the same way they would
+# with an explicit `Iter[Int](...)` annotation.
+
+struct Iter[T]:
+    items: List[T]
+    cur: Int
+
+impl Iter:
+    fn next() -> T?:
+        if self.cur >= self.items.len():
+            return none
+        v := self.items[self.cur]
+        self.cur = self.cur + 1
+        return v
+
+    fn count_remaining() -> Int:
+        return self.items.len() - self.cur
+
+# A second generic with a Map field exercises the recursive container shape:
+# `m: Map[String, T]` against `Map[String, Int]` infers T = Int.
+struct Tally[T]:
+    m: Map[String, T]
+    extra: T
+
+fn main():
+    # Int list — T inferred from List[Int]
+    ints := Iter([10, 20, 30], 0)
+    print("ints remaining: {ints.count_remaining()}")
+    n1 := ints.next()
+    if n1 != none:
+        print("ints first: {n1.value()}")
+    print("ints after: {ints.count_remaining()}")
+
+    # String list — T inferred from List[String]
+    words := Iter(["red", "green", "blue"], 0)
+    w1 := words.next()
+    if w1 != none:
+        print("words first: {w1.value()}")
+    w2 := words.next()
+    if w2 != none:
+        print("words second: {w2.value()}")
+
+    # Map shape — T inferred through the value position
+    mut m: Map[String, Int] := {}
+    m["a"] = 1
+    m["b"] = 2
+    t := Tally(m, 99)
+    print("tally extra: {t.extra}")
+    print("tally a: {t.m["a"]}")

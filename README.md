@@ -35,6 +35,7 @@ make self-host
 - `docs/text_and_bytes.md` for the string/bytes split and common helpers
 - `docs/idiomatic_pith.md` for the current everyday style
 - `docs/iterators.md` for the iterator protocol, range-for, and `std.iter`
+- `docs/limitations.md` for the honest list of what doesn't work yet
 - `docs/contributing.md` for the development loop and smoke checks
 - `docs/tooling_stdlib.md` for glob, cli, diagnostic, and testing helpers
 - `self-host/pith_main.pith` for the self-hosted frontend (lex/parse/check/fmt/lint/doc)

@@ -44,10 +44,12 @@ something here that now works, the page is stale and a fix to it is welcome.
 these are internal and do not usually surface in source, but they shape the
 correctness story:
 
-- the cranelift ir consumer still infers some metadata (call return kinds, field
-  offsets) rather than reading it from the ir. this is the historical source of
-  a few cross-module bugs and is being moved to explicit ir.
-- a handful of older edge cases (cross-module float returns, cross-module map
-  reads, set codegen, negative float literals like `-1.0`) were logged during
-  bring-up and may or may not still reproduce; treat them as suspect until a
-  test pins them down.
+- the ir is self-describing — calls carry an explicit return kind and field
+  loads carry their type — and the cranelift consumer reads that metadata rather
+  than guessing. the older inference path that caused a few cross-module bugs is
+  gone. the one remaining stub is `pith_string_retain`
+  (`cranelift/runtime/src/string.rs`), which has no callers yet.
+- a handful of edge cases logged during bring-up (cross-module float returns,
+  cross-module map reads, set codegen, negative float literals like `-1.0`) were
+  re-checked and all pass; they are now pinned by regression tests
+  (`tests/cases/test_xmod_float.pith` and friends).

@@ -140,21 +140,22 @@ pub unsafe extern "C" fn pith_string_from_cstr_ptr(cstr: *const i8, out_ptr: *mu
     *out_ptr = result;
 }
 
-/// Retain a string (increment reference count)
+/// Retain a string.
 ///
-/// For the hybrid approach, we need to track references separately.
-/// We'll use a global registry of active Arc pointers.
+/// Heap strings use copy-on-derive ownership: every operation that produces a
+/// string (`pith_from_internal`, concat, substring, trim, ...) allocates and
+/// owns its own buffer, so two live `PithString`s never share one allocation.
+/// With no shared buffer there is no reference count to bump, so retain is a
+/// no-op under the current model.
+///
+/// The symbol is kept so the retain/release pair stays symmetric. If strings
+/// ever move to shared ownership, the count increment belongs here — and
+/// `pith_from_internal` and `pith_string_release` would need a matching count
+/// header. (Despite the `Arc` type alias above, the heap buffer is a plain
+/// allocation today, not an `Arc`.)
 #[no_mangle]
 pub unsafe extern "C" fn pith_string_retain(s: PithString) {
-    if !s.is_heap || s.ptr.is_null() {
-        return;
-    }
-
-    // Clone the Arc to increment reference count
-    // We need to reconstruct the Arc from the raw pointer
-    // This is tricky - we need to store the Arc somewhere
-    // For now, we'll implement a simple reference count registry
-    let _ = s; // TODO: Implement proper ARC tracking
+    let _ = s;
 }
 
 /// Release a string (decrement reference count, free if zero)
@@ -435,4 +436,40 @@ pub unsafe extern "C" fn pith_string_concat_ptr(
     }
     let result = pith_string_concat(*a_ptr, *b_ptr);
     *out_ptr = result;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // a heap string owns its buffer; retain leaves it untouched and a single
+    // release frees it. this is the retain/release contract under copy-on-derive
+    // ownership — one retain, one release, no double free.
+    #[test]
+    fn retain_keeps_the_buffer_intact_then_release_frees() {
+        unsafe {
+            let data = b"hello";
+            let s = pith_string_new(data.as_ptr(), data.len() as i64);
+            assert!(s.is_heap);
+            assert_eq!(s.len, 5);
+
+            pith_string_retain(s);
+
+            // retain must not move or corrupt the bytes.
+            let bytes = std::slice::from_raw_parts(s.ptr, s.len as usize);
+            assert_eq!(bytes, b"hello");
+
+            pith_string_release(s);
+        }
+    }
+
+    // non-heap strings (static literals, the empty string) own nothing, so both
+    // calls must be safe no-ops.
+    #[test]
+    fn retain_and_release_ignore_non_heap_strings() {
+        unsafe {
+            pith_string_retain(EMPTY_STRING);
+            pith_string_release(EMPTY_STRING);
+        }
+    }
 }

@@ -61,52 +61,32 @@ support them.
 
 ## Migration Targets
 
-### Phase 1: Delete Rust-side Backend Guessing
+### Phase 1: Delete Rust-side Backend Guessing — done
 
-Status: mostly done. The IR emitter now writes explicit call return kinds, and
-field instructions carry enough type metadata for the backend to stop guessing
-common struct and string cases. The next step is enforcement: native builds
-should always ask the IR driver to validate the combined contract.
+Status: done (verified 2026-06-23). The IR is self-describing and the consumer
+trusts it:
 
-Target files:
+- calls carry an explicit return kind (`call REG NAME RETKIND NARGS ...`); the
+  consumer *requires* it. `parse_call_shape` rejects the old retkind-less form,
+  and the call handler branches on the kind rather than inferring it.
+- field loads carry `index kind name`; the consumer reads the kind directly and
+  CI rejects the 4-field legacy form.
+- the metadata-inference block and symbol-alias table that used to live in
+  `ir_consumer.rs` are gone. The file is now opcode handlers plus small helpers,
+  not a guessing engine.
 
-- `cranelift/codegen/src/ir_consumer.rs`
-- `cranelift/codegen/src/lib.rs`
+The four bugs this guessing used to cause — cross-module float returns,
+cross-module map value reads, set codegen, and negative float literals — were
+re-checked and all pass; they are pinned by regression tests
+(`tests/cases/test_xmod_float.pith` and friends).
 
-Delete candidates:
+Remaining tidy, not blocking:
 
-- metadata inference block: 359 lines
-  - `ir_consumer.rs:1317-1675`
-- symbol alias table block: about 205 lines
-  - `ir_consumer.rs:1676-1880`
-
-Why:
-
-Rust currently infers:
-
-- whether a call returns a string
-- whether a call returns a struct
-- which fields are string fields
-- which runtime symbol a Pith name should map to
-- fallback field offsets when type identity is incomplete
-
-This is the source of a large share of backend bugs. Pith should emit this
-metadata explicitly.
-
-Required additions:
-
-- IR should carry exact callee symbol names
-- IR should carry exact return kinds
-- IR should carry exact struct-return identities
-- field access should carry exact field index or offset
-- import lowering should resolve aliases before Rust sees them
-
-Acceptance criteria:
-
-- `ir_consumer.rs` no longer contains return-type inference loops
-- most symbol dispatch becomes direct rather than heuristic
-- backend bugs stop looking like “Rust guessed the wrong type”
-- native build/run/test uses validated combined IR by default
+- the `pith_string_retain` symbol is a documented no-op (strings use
+  copy-on-derive ownership, so there is no shared count to bump); real shared
+  ownership would reintroduce it. see `cranelift/runtime/src/string.rs`.
+- float typing in the consumer is per-register tracking driven by the explicit
+  `float` retkind, not a whole-function heuristic; fine as is.
 
 ### Phase 2: Move CLI Orchestration Into Pith
 
@@ -354,14 +334,13 @@ The common pattern is not “missing power”. It is “too much ceremony”.
 
 ## Immediate Next Steps
 
-If work begins now, the first concrete implementation steps should be:
+Phase 1 (explicit IR, no Rust guessing) is done. The next concrete steps:
 
-1. Use validated combined IR for native build/run/test
-2. Simplify `ir_consumer.rs` further now that it can trust emitted metadata
-3. Move the remaining CLI orchestration policy out of `cranelift/cli/src/main.rs`
-4. Decide whether JSON/TOML/URL ownership belongs primarily in Pith stdlib or
-   Rust runtime, then delete the duplicate side
-5. Keep adding small formatting, display, and collection helpers that let
+1. Move the remaining CLI orchestration policy out of `cranelift/cli/src/main.rs`
+   (phase 2)
+2. Decide whether JSON/TOML/URL ownership belongs primarily in Pith stdlib or
+   Rust runtime, then delete the duplicate side (phase 3)
+3. Keep adding small formatting, display, and collection helpers that let
    examples read like normal application code
 
 ## Proposed IR Contract For Phase 1

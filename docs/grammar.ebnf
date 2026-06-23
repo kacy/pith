@@ -46,10 +46,14 @@ FLOAT_LIT     = digit , { digit | "_" } , "." , digit , { digit | "_" }
               , [ ( "e" | "E" ) , [ "+" | "-" ] , digit , { digit | "_" } ] ;
 
 (* string literals with escape sequences and interpolation *)
-STRING_LIT    = '"' , { string_char | escape_seq | interpolation } , '"' ;
+STRING_LIT    = '"' , { string_char | escape_seq | brace_escape | interpolation } , '"' ;
 string_char   = (* any unicode char except '"', '\', '{', or newline *) ;
 escape_seq    = "\" , ( "n" | "r" | "t" | "\" | '"' | "{" | "0" ) ;
 interpolation = "{" , expression , "}" ;
+
+(* doubled braces are literal braces, not interpolation: "{{" -> "{",     *)
+(* "}}" -> "}". this lets interpolated strings carry literal braces.       *)
+brace_escape  = "{{" | "}}" ;
 
 (* the lexer emits interpolated strings as a token sequence:           *)
 (*   STRING_START  text  STRING_MID  text  STRING_END                  *)
@@ -75,7 +79,7 @@ KEYWORD       = "fn" | "if" | "elif" | "else" | "for" | "in" | "while"
               | "pub" | "mut" | "ref" | "weak"
               | "import" | "from" | "as"
               | "self" | "true" | "false" | "none"
-              | "and" | "or" | "not"
+              | "and" | "or" | "not" | "catch"
               | "spawn" | "await"
               | "test" ;
 
@@ -184,7 +188,11 @@ if_stmt       = "if" , expression , ":" , block
               , { "elif" , expression , ":" , block }
               , [ "else" , ":" , block ] ;
 
-for_stmt      = "for" , IDENT , [ "," , IDENT ] , "in" , expression , ":" , block ;
+(* for iterates a value (any type providing `fn next() -> T?`) or a range. *)
+(* `..` is exclusive of the upper bound, `..=` inclusive. ranges appear    *)
+(* only in this position, not as free-standing expressions.                *)
+for_stmt      = "for" , IDENT , [ "," , IDENT ] , "in" , for_iterable , ":" , block ;
+for_iterable  = expression , [ ( ".." | "..=" ) , expression ] ;
 
 while_stmt    = "while" , expression , ":" , block ;
 
@@ -218,6 +226,7 @@ pattern_list  = pattern , { "," , pattern } ;
 (* ------------------------------------------------------------------ *)
 
 (* precedence, lowest to highest:                                      *)
+(*   catch                                                             *)
 (*   or                                                                *)
 (*   and                                                               *)
 (*   not (prefix)                                                      *)
@@ -230,13 +239,16 @@ pattern_list  = pattern , { "," , pattern } ;
 (*   ? ! (postfix)                                                     *)
 (*   call, index, field access                                         *)
 
-expression    = select_expr | or_expr ;
+expression    = select_expr | catch_expr ;
 
 select_expr   = "select" , ":" , NEWLINE , INDENT , select_arm , { NEWLINE , select_arm } , DEDENT ;
 select_arm    = IDENT , ":=" , postfix_expr , "=>" , expression
               | postfix_expr , "=>" , expression
               | "timeout" , expression , "=>" , expression
               | "default" , "=>" , expression ;
+
+(* catch — fallback when the left side is a failed result *)
+catch_expr    = or_expr , { "catch" , or_expr } ;
 or_expr       = and_expr , { "or" , and_expr } ;
 and_expr      = not_expr , { "and" , not_expr } ;
 not_expr      = "not" , not_expr | comparison ;
@@ -257,8 +269,12 @@ postfix_expr  = primary , { postfix_op } ;
 postfix_op    = "?" | "!" | call | index | field_access | method_call ;
 
 call          = "(" , [ arg_list ] , ")" ;
-index         = "[" , expression , "]" ;
-field_access  = "." , IDENT ;
+
+(* a single index is subscripting (`xs[0]`, `m[k]`). a comma-separated   *)
+(* list supplies explicit type arguments to a following call, e.g.        *)
+(* `to_list[Counter, Int](c)`.                                            *)
+index         = "[" , expression , { "," , expression } , "]" ;
+field_access  = "." , ( IDENT | INT_LIT ) ;   (* `.name` or tuple `.0` *)
 method_call   = "." , IDENT , "(" , [ arg_list ] , ")" ;
 
 arg_list      = arg , { "," , arg } ;

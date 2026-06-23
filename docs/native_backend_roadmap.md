@@ -13,6 +13,12 @@ with `make bootstrap-ir-checks-only`. The remaining work is to make that
 validated path the only native build path and keep deleting Rust-side frontend
 policy.
 
+Since then the compiler reached a self-hosting fixed point (enforced by
+`make bootstrap-verify`), and the lazy iterator milestone shipped — the
+`Iterator[T]` protocol, range-for, list `.map`/`.filter`/`.reduce`, and the
+fusing `std.iter` adapters. That closes several of the ergonomics gaps noted
+further down; see `docs/limitations.md` for the current honest gap list.
+
 Source totals:
 
 - `self-host/*.pith`: about 22,540 lines
@@ -229,6 +235,12 @@ This order matters. Phases 2 and 3 are much easier once Rust no longer has to
 guess what the frontend meant.
 
 ## Example Ergonomics: What To Add
+
+Note: items #3 (collection combinators) and #4 (iteration) below have largely
+shipped — list `.map`/`.filter`/`.reduce`, `for x, i in list`, range-for, and
+the lazy `std.iter` adapters all exist now. They are kept here for context; the
+still-open items are formatting, generic display, a string builder, and richer
+test ergonomics.
 
 The example corpus shows the biggest quality gaps directly.
 

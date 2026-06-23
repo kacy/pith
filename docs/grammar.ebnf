@@ -278,7 +278,11 @@ field_access  = "." , ( IDENT | INT_LIT ) ;   (* `.name` or tuple `.0` *)
 method_call   = "." , IDENT , "(" , [ arg_list ] , ")" ;
 
 arg_list      = arg , { "," , arg } ;
-arg           = [ IDENT , "=" ] , expression ;    (* named or positional *)
+
+(* positional, or named. `=` names a function-call argument; `:` names a       *)
+(* struct field, as in `Point(x: 3, y: 4)`. a named struct call must name      *)
+(* every field it sets and may omit any field that has a default.              *)
+arg           = [ IDENT , ( "=" | ":" ) ] , expression ;
 
 primary       = literal
               | IDENT

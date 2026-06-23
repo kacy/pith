@@ -7,10 +7,10 @@ something here that now works, the page is stale and a fix to it is welcome.
 
 ## language
 
-- **named struct construction** — fields are positional only. `Point(3, 4)`
-  works; `Point(x: 3, y: 4)` does not. named arguments work for function and
-  method calls, just not for struct literals. adding a field is therefore a
-  breaking change to every call site.
+- **named struct construction for generic structs** — concrete structs support
+  named fields (`Point(x: 3, y: 4)`, any order, defaults may be omitted), but
+  generic structs like `Box[T]` still need positional arguments; the type
+  inference doesn't reorder named fields yet.
 - **or-patterns in match** — `1 | 2 | 3 => ...` is not parsed. write one arm per
   value, or fall through to a guard.
 - **range patterns in match** — `0..=9 => ...` is not parsed. range syntax works

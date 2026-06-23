@@ -1,0 +1,33 @@
+# Structs can be built with named fields: `Point(x: 3, y: 4)`. Fields may be
+# given in any order, and any field with a default can be omitted. Positional
+# construction still works as before.
+
+struct Point:
+    x: Int
+    y: Int
+
+struct Config:
+    host: String
+    port: Int = 8080
+    tls: Bool = false
+
+fn main():
+    # named, in declaration order
+    p := Point(x: 3, y: 4)
+    print("p.x={p.x} p.y={p.y}")
+
+    # named, out of order
+    q := Point(y: 20, x: 10)
+    print("q.x={q.x} q.y={q.y}")
+
+    # positional still works
+    r := Point(1, 2)
+    print("r.x={r.x} r.y={r.y}")
+
+    # omit defaulted fields
+    c := Config(host: "localhost")
+    print("c.host={c.host} c.port={c.port} c.tls={c.tls}")
+
+    # override defaults, out of order
+    d := Config(port: 443, host: "example.com", tls: true)
+    print("d.host={d.host} d.port={d.port} d.tls={d.tls}")

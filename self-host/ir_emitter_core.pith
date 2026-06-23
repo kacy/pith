@@ -3780,7 +3780,51 @@ fn ir_emit_ident_load(idx: Int, name: String) -> Int:
     ir_emit("load " + r.to_string() + " " + ir_resolve_storage_name(name))
     return r
 
+# True when any argument carries a field name (named construction).
+fn ir_struct_args_have_names(arg_nodes: List[Int]) -> Bool:
+    for an_idx in arg_nodes:
+        an := get_node(an_idx)
+        if an.kind == "arg" and an.value.len() > 0:
+            return true
+    return false
+
+# Emit a struct built with named fields (`Point(x: 3, y: 4)`). Fields can be
+# given in any order and any defaulted field may be omitted, so we walk the
+# struct's declaration order and pull each field's value by name, falling back
+# to its default. The checker has already validated names and required fields.
+fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int]) -> Int:
+    total_fields := ir_struct_field_count(sname)
+    mut field_regs: List[Int] := []
+    mut field_idx := 0
+    while field_idx < total_fields:
+        field_name := ir_struct_field_name_at(sname, field_idx)
+        field_type := ir_struct_field_type_name(sname, field_name)
+        mut value_node := 0 - 1
+        for an_idx in arg_nodes:
+            an := get_node(an_idx)
+            if an.kind == "arg" and an.value == field_name and an.children.len() > 0:
+                value_node = an.children[0]
+        if value_node >= 0:
+            field_regs.push(ir_emit_value_for_target(value_node, field_type))
+        else:
+            default_idx := ir_struct_field_default_node(sname, field_name)
+            if default_idx >= 0:
+                field_regs.push(ir_emit_value_for_target(default_idx, field_type))
+            else:
+                field_regs.push(ir_zero_reg())
+        field_idx = field_idx + 1
+
+    r := ir_reg()
+    field_count_r := ir_reg()
+    ir_emit("iconst " + field_count_r.to_string() + " " + total_fields.to_string())
+    ir_emit_call1(r, "__struct_alloc", "struct:" + sname, field_count_r)
+    for field_reg, fi in field_regs:
+        ir_emit("sstore " + r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    return r
+
 fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int]) -> Int:
+    if ir_struct_args_have_names(arg_nodes):
+        return ir_emit_struct_named_init(sname, arg_nodes)
     mut field_regs: List[Int] := []
     mut field_idx := 0
     while field_idx < arg_nodes.len():

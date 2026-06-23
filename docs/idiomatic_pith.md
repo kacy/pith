@@ -91,6 +91,22 @@ impl Counter:
         return v
 ```
 
+Build a struct positionally, or name the fields when that reads better. Named
+fields can come in any order, and any field with a default may be left out.
+
+```pith
+struct Config:
+    host: String
+    port: Int = 8080
+    tls: Bool = false
+
+dev := Config(host: "localhost")
+prod := Config(host: "example.com", port: 443, tls: true)
+```
+
+Named fields aren't available on generic structs yet — those still take
+positional arguments.
+
 ## errors and tests
 
 Use bare `T!` for simple string errors. Use `T!SomeError` when callers need to

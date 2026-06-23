@@ -2209,7 +2209,69 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
         idx = idx + 1
     return fn_info.return_type
 
+# Does this constructor call use named fields (e.g. `Point(x: 3)`)? True if any
+# argument carries a field name.
+fn struct_args_are_named(arg_indices: List[Int]) -> Bool:
+    for ai in arg_indices:
+        an := get_node(ai)
+        if an.kind == "arg" and an.value.len() > 0:
+            return true
+    return false
+
+fn struct_has_field(info: TypeInfo, field_name: String) -> Bool:
+    for f in info.fields:
+        if strings_equal(f, field_name):
+            return true
+    return false
+
+# Validate and type-check a named-field constructor call. Each field may be
+# given at most once, every name must exist, and any omitted field must have a
+# default. Fields can arrive in any order; the emitter reorders to declaration
+# order independently.
+fn check_named_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_indices: List[Int], scope_id: Int) -> Int:
+    mut provided: Map[String, Int] := {}
+    mut ok := true
+    for ai in arg_indices:
+        an := get_node(ai)
+        if an.kind != "arg" or an.value.len() == 0:
+            report_error("E243", name + ": cannot mix positional and named fields")
+            ok = false
+        elif struct_has_field(info, an.value) == false:
+            report_error("E240", name + " has no field '" + an.value + "'")
+            ok = false
+        elif provided.contains_key(an.value):
+            report_error("E241", name + ": field '" + an.value + "' set more than once")
+            ok = false
+        else:
+            mut expr := ai
+            if an.children.len() > 0:
+                expr = an.children[0]
+            provided.insert(an.value, expr)
+    # every field without a default must be supplied.
+    for fld in info.fields:
+        if provided.contains_key(fld) == false:
+            if struct_field_has_default(name, fld) == false:
+                report_error("E242", name + ": missing field '" + fld + "'")
+                ok = false
+    if ok == false:
+        return TID_ERR
+    # type-check each supplied field against its declared type.
+    mut idx := 0
+    for fld in info.fields:
+        if provided.contains_key(fld):
+            expr := provided[fld]
+            arg_type := c_check_expr(expr, scope_id)
+            if is_error_type(arg_type) == false:
+                expected := info.field_types[idx]
+                if value_matches_optional_target(expr, arg_type, expected) == false:
+                    if arg_type != expected:
+                        report_error("E219", "field '" + fld + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
+        idx = idx + 1
+    return struct_tid
+
 fn check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_indices: List[Int], scope_id: Int) -> Int:
+    if struct_args_are_named(arg_indices):
+        return check_named_struct_constructor(name, struct_tid, info, arg_indices, scope_id)
     # constructor calls can omit trailing fields with defaults.
     if arg_indices.len() > info.fields.len():
         report_error("E207", name + " expects at most " + info.fields.len().to_string() + " fields, got " + arg_indices.len().to_string())
@@ -2297,6 +2359,11 @@ fn unify_field_type_against_arg(field_node_idx: Int, arg_tid: Int, generic_param
                 i = i + 1
 
 fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_id: Int) -> Int:
+    # named fields on a generic struct would have to be reordered before type
+    # inference runs; that path isn't wired up yet, so ask for positional args.
+    if struct_args_are_named(arg_indices):
+        report_error("E244", name + ": named fields are not yet supported for generic structs; use positional arguments")
+        return TID_ERR
     decl_idx := get_generic_declaration_index(name)
     decl_node := get_node(decl_idx)
     generic_params := collect_generic_parameter_names(decl_node)

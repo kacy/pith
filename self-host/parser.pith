@@ -547,18 +547,24 @@ fn parse_arg_list() -> List[Int]:
     return args
 
 fn parse_arg() -> Int:
-    # check for named argument: name = expr
-    if _cur_tok_kind() == "identifier":
-        if _peek_ahead_kind(1) == "eq":
-            name := advance_token().value
-            advance_token()
-            val := parse_expression()
-            mut children: List[Int] := [val]
-            return add_node_with_position("arg", name, children)
+    # check for named argument: `name = expr` (function calls) or `name: expr`
+    # (named struct fields, e.g. Point(x: 3, y: 4)). both record the name on the
+    # arg node; the checker decides what to do with it.
+    cur_is_ident := _cur_tok_kind() == "identifier"
+    next_kind := _peek_ahead_kind(1)
+    if cur_is_ident and (next_kind == "eq" or next_kind == "colon"):
+        # bind the token before reading .value: `advance_token().value` would
+        # evaluate the call twice and consume an extra token.
+        name_tok := advance_token()
+        arg_name := name_tok.value
+        advance_token()
+        named_val := parse_expression()
+        mut named_children: List[Int] := [named_val]
+        return add_node_with_position("arg", arg_name, named_children)
 
-    val := parse_expression()
-    mut children: List[Int] := [val]
-    return add_node_with_position("arg", "", children)
+    pos_val := parse_expression()
+    mut pos_children: List[Int] := [pos_val]
+    return add_node_with_position("arg", "", pos_children)
 
 fn parse_primary() -> Int:
     # token via _cur_tok_kind/_cur_tok_value

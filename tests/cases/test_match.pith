@@ -1,0 +1,47 @@
+# match lowering: literal, bool, binding, and wildcard patterns, with guards,
+# used both as an expression (the function's tail value) and as a statement.
+
+fn classify(n: Int) -> String:
+    match n:
+        0 => "zero"
+        1 => "one"
+        _ => "many"
+
+fn sign(n: Int) -> String:
+    match n:
+        x if x < 0 => "negative"
+        0 => "zero"
+        _ => "positive"
+
+fn yes_no(b: Bool) -> String:
+    match b:
+        true => "yes"
+        false => "no"
+
+# statement-form match: arms run for their side effects.
+fn announce(n: Int):
+    match n:
+        0 => print("nothing")
+        x => print("got {x}")
+
+# match as a bound value, then returned.
+fn doubled_label(n: Int) -> String:
+    label := match n:
+        1 => "one"
+        2 => "two"
+        _ => "other"
+    return label + "!"
+
+fn main():
+    print(classify(0))
+    print(classify(1))
+    print(classify(7))
+    print(sign(0 - 4))
+    print(sign(0))
+    print(sign(9))
+    print(yes_no(true))
+    print(yes_no(false))
+    announce(0)
+    announce(5)
+    print(doubled_label(2))
+    print(doubled_label(8))

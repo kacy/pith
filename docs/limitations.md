@@ -11,6 +11,11 @@ something here that now works, the page is stale and a fix to it is welcome.
   named fields (`Point(x: 3, y: 4)`, any order, defaults may be omitted), but
   generic structs like `Box[T]` still need positional arguments; the type
   inference doesn't reorder named fields yet.
+- **match on variant payloads** — `match` lowers literals, qualified enum
+  variants (`Color.Red`), bindings, wildcards, and guards. it does not yet
+  destructure a variant's payload (`Circle(r) => r * r`) or match tuple
+  patterns. note a bare name in a pattern is a binding, not a variant — write
+  `Color.Red`, not `Red`, to match a variant.
 - **or-patterns in match** — `1 | 2 | 3 => ...` is not parsed. write one arm per
   value, or fall through to a guard.
 - **range patterns in match** — `0..=9 => ...` is not parsed. range syntax works

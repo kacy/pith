@@ -4072,8 +4072,11 @@ fn check_match_arm(arm: Node, subject_type: Int, scope_id: Int) -> Int:
     if body_idx >= arm.children.len():
         return TID_VOID
     body_node := get_node(arm.children[body_idx])
+    # an inline `=> expr` arm is wrapped in a "body" node; its type is the
+    # expression's type so the match can be used as a value.
     if body_node.kind == "body":
-        check_function_body(arm.children[body_idx], arm_scope)
+        if body_node.children.len() > 0:
+            return c_check_expr(body_node.children[0], arm_scope)
         return TID_VOID
     if body_node.kind == "block":
         check_block_statement(body_node, arm_scope)

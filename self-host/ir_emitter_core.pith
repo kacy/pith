@@ -4156,6 +4156,17 @@ fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
             return r
         ir_emit("iconst " + r.to_string() + " 0")
         return r
+    if pat.kind == "pat_or":
+        # matches when any alternative matches.
+        mut acc_r := ir_emit_match_cond(pat.children[0], subj_r)
+        mut k := 1
+        while k < pat.children.len():
+            alt_r := ir_emit_match_cond(pat.children[k], subj_r)
+            or_r := ir_reg()
+            ir_emit("or " + or_r.to_string() + " " + acc_r.to_string() + " " + alt_r.to_string())
+            acc_r = or_r
+            k = k + 1
+        return acc_r
     # pat_none, pat_tuple, and variant payload sub-patterns are not lowered yet.
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " 0")

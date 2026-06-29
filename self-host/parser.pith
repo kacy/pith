@@ -764,7 +764,14 @@ fn parse_match_expr() -> Int:
     return add_node_with_position("match_expr", "", children)
 
 fn parse_match_arm() -> Int:
-    pattern := parse_pattern()
+    mut pattern := parse_pattern()
+
+    # or-pattern: `a | b | c => ...` matches any of the alternatives.
+    if check("pipe"):
+        mut alts: List[Int] := [pattern]
+        while match_tok("pipe"):
+            alts.push(parse_pattern())
+        pattern = add_node_with_position("pat_or", "", alts)
 
     mut children: List[Int] := [pattern]
 

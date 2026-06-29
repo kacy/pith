@@ -199,7 +199,7 @@ while_stmt    = "while" , expression , ":" , block ;
 match_stmt    = "match" , expression , ":" , NEWLINE
               , INDENT , { match_arm , NEWLINE } , DEDENT ;
 
-match_arm     = pattern , [ "if" , expression ] , "=>" , ( expression | block ) ;
+match_arm     = arm_pattern , [ "if" , expression ] , "=>" , ( expression | block ) ;
 
 return_stmt   = "return" , [ expression ] ;
 fail_stmt     = "fail" , expression ;
@@ -210,6 +210,9 @@ continue_stmt = "continue" ;
 (* ------------------------------------------------------------------ *)
 (* 5. patterns                                                         *)
 (* ------------------------------------------------------------------ *)
+
+(* a match arm may list alternatives with `|`; the alternatives must not bind. *)
+arm_pattern   = pattern , { "|" , pattern } ;
 
 pattern       = "_"                                   (* wildcard *)
               | literal                               (* literal match *)

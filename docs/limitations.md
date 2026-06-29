@@ -16,10 +16,9 @@ something here that now works, the page is stale and a fix to it is welcome.
   destructure a variant's payload (`Circle(r) => r * r`) or match tuple
   patterns. note a bare name in a pattern is a binding, not a variant — write
   `Color.Red`, not `Red`, to match a variant.
-- **or-patterns in match** — `1 | 2 | 3 => ...` is not parsed. write one arm per
-  value, or fall through to a guard.
 - **range patterns in match** — `0..=9 => ...` is not parsed. range syntax works
-  in `for`, not in match arms.
+  in `for`, not in match arms. (or-patterns like `1 | 2 | 3 => ...` do work, for
+  literals and qualified variants.)
 - **`if let` / `while let`** — there is no pattern-binding unwrap. unwrap an
   optional with an explicit check: `if x != none: ... x.value()`.
 - **closure capture cap** — a closure captures at most 16 variables. captures

@@ -4034,12 +4034,19 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
         arm_node := get_node(child)
         if arm_node.kind == "arm":
             arm_type := check_match_arm(arm_node, subject_type, scope_id)
-            # collect pattern values for exhaustiveness
+            # collect pattern values for exhaustiveness; an or-pattern covers
+            # each of its alternatives.
             if arm_node.children.len() > 0:
                 pat := get_node(arm_node.children[0])
-                pv := collect_arm_pattern_bindings(pat)
-                if pv.len() > 0:
-                    arm_values.push(pv)
+                if pat.kind == "pat_or":
+                    for alt in pat.children:
+                        av := collect_arm_pattern_bindings(get_node(alt))
+                        if av.len() > 0:
+                            arm_values.push(av)
+                else:
+                    pv := collect_arm_pattern_bindings(pat)
+                    if pv.len() > 0:
+                        arm_values.push(pv)
             if is_error_type(result_type):
                 result_type = arm_type
             elif is_error_type(arm_type) == false:
@@ -4116,9 +4123,23 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
     if pat.kind == "pat_variant":
         check_variant_pattern_match(pat, expected_type, scope_id)
         return
+    if pat.kind == "pat_or":
+        check_or_pattern_match(pat, expected_type, scope_id)
+        return
     if pat.kind == "pat_tuple":
         check_tuple_pattern_match(pat, expected_type, scope_id)
         return
+
+# Each alternative of an or-pattern must match the same type. Alternatives may
+# not bind names (the arms can't tell which alternative matched), so a binding
+# or wildcard alternative is rejected.
+fn check_or_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
+    for alt in pat.children:
+        alt_node := get_node(alt)
+        if alt_node.kind == "pat_binding" or alt_node.kind == "pat_wildcard":
+            report_error("E228", "or-pattern alternatives cannot bind; use a separate arm")
+        else:
+            check_pattern_match(alt, expected_type, scope_id)
 
 fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     # value: "EnumName.VariantName"

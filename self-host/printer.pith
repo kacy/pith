@@ -688,6 +688,12 @@ fn print_pattern(idx: Int, indent: Int):
         print_line(indent, "pattern bind " + node.value)
         return
 
+    if node.kind == "pat_or":
+        print_line(indent, "pattern or")
+        for child in node.children:
+            print_pattern(child, indent + 1)
+        return
+
     if node.kind == "pat_variant":
         # value is "Type.Variant", children are field patterns
         if node.children.len() > 0:

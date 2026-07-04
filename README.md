@@ -150,6 +150,7 @@ that path.
 - std.os.path, std.os.process, std.fs, std.glob — files, paths, and file discovery
 - std.cli, std.diagnostic, std.testing, std.text.scanner — small tooling layers
 - std.log, std.metrics, std.fmt, std.math, std.rand, std.time, std.datetime, std.uuid — common app helpers
+- std.compress (gzip/zlib), std.archive (tar/zip), std.net.sse, std.data.table — compression, archives, server-sent events, and tabular data
 
 for child processes, prefer `std.os.process.command(...)` and the structured
 `run` / `output` / `start` flow. keep `std.io` for low-level stream work.
@@ -256,7 +257,7 @@ the upstream submission checklist.
 ## project layout
 
 ```
-self-host/             compiler frontend — written in pith (~22,540 lines)
+self-host/             compiler frontend — written in pith (~20,900 lines)
   pith_main.pith      CLI — check/fmt/lint/lex/parse/doc
   driver.pith          import resolution pipeline
   lexer.pith           tokenizer with indentation tracking
@@ -271,12 +272,12 @@ self-host/             compiler frontend — written in pith (~22,540 lines)
   errors.pith          human-readable error rendering
   docgen.pith          documentation generator and search
 
-cranelift/             native code backend — Rust + Cranelift (~10,650 tracked lines)
+cranelift/             native code backend — Rust + Cranelift (~11,200 tracked lines)
   cli/               CLI entry point (build/run/test + delegates to self-host)
   codegen/           AST-to-IR compilation, monomorphization, type inference
   runtime/           runtime library (ARC, collections, JSON, TOML, URL, concurrency, crypto)
 
-std/                 standard library (58 native pith modules, ~25,300 lines)
+std/                 standard library (59 native pith modules, ~25,400 lines)
   cli.pith             command-line parsing helpers
   diagnostic.pith      reusable diagnostics for tools
   encoding.pith        base64/hex encoding

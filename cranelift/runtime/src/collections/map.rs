@@ -5,7 +5,6 @@
 
 use crate::collections::list::PithList;
 use crate::handle_registry::{self, HandleKind};
-use crate::string::{pith_string_release, pith_string_retain, PithString};
 use hashbrown::HashMap;
 use std::hash::{Hash, Hasher};
 /// FFI-compatible map handle
@@ -291,17 +290,14 @@ pub unsafe extern "C" fn pith_map_insert_int(
     let val_vec = val_slice.to_vec();
 
     // Release old value if present
+    // The map owns one count per stored string value: release the value
+    // being overwritten, retain the incoming one.
     if impl_ref.val_is_heap {
         if let Some(old_val) = impl_ref.get(&MapKey::Int(key)) {
-            let s = old_val.as_ptr() as *const PithString;
-            pith_string_release(*s);
+            let old = std::ptr::read_unaligned(old_val.as_ptr() as *const i64);
+            crate::pith_cstring_release(old as *const i8);
         }
-    }
-
-    // Retain new value if heap type
-    if impl_ref.val_is_heap {
-        let s = value as *const PithString;
-        pith_string_retain(*s);
+        crate::pith_cstring_retain(value as *const i8);
     }
 
     // Insert into map
@@ -322,8 +318,8 @@ pub unsafe extern "C" fn pith_map_clear(map: *mut PithMap) {
     // Release all values if they're heap types
     if impl_ref.val_is_heap {
         for (_, val) in &impl_ref.data {
-            let s = val.as_ptr() as *const PithString;
-            pith_string_release(*s);
+            let v = std::ptr::read_unaligned(val.as_ptr() as *const i64);
+            crate::pith_cstring_release(v as *const i8);
         }
     }
 
@@ -351,10 +347,10 @@ pub unsafe extern "C" fn pith_map_values(map: PithMap) -> PithList {
     for val in impl_ref.values() {
         crate::collections::list::pith_list_push(&mut list, val.as_ptr(), impl_ref.val_size as i64);
 
-        // Retain values as they're being copied to the list
+        // The destination list gets its own count for each copied value
         if impl_ref.val_is_heap {
-            let s = val.as_ptr() as *const PithString;
-            pith_string_retain(*s);
+            let v = std::ptr::read_unaligned(val.as_ptr() as *const i64);
+            crate::pith_cstring_retain(v as *const i8);
         }
     }
 
@@ -371,8 +367,8 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     // Release all values if they're heap types
     if impl_ref.val_is_heap {
         for (_, val) in &impl_ref.data {
-            let s = val.as_ptr() as *const PithString;
-            pith_string_release(*s);
+            let v = std::ptr::read_unaligned(val.as_ptr() as *const i64);
+            crate::pith_cstring_release(v as *const i8);
         }
     }
 
@@ -435,6 +431,14 @@ pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, v
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_INSERTS, 1);
     let map_key = cstr_to_map_key(key);
+    // The map owns one count per stored string value.
+    if impl_ref.val_is_heap {
+        if let Some(old_val) = impl_ref.get(&map_key) {
+            let old = std::ptr::read_unaligned(old_val.as_ptr() as *const i64);
+            crate::pith_cstring_release(old as *const i8);
+        }
+        crate::pith_cstring_retain(value as *const i8);
+    }
     let val_bytes = value.to_le_bytes().to_vec();
     impl_ref.insert(map_key, val_bytes);
 }
@@ -554,6 +558,12 @@ pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_REMOVES, 1);
     let map_key = cstr_to_map_key(key);
+    if impl_ref.val_is_heap {
+        if let Some(old_val) = impl_ref.get(&map_key) {
+            let old = std::ptr::read_unaligned(old_val.as_ptr() as *const i64);
+            crate::pith_cstring_release(old as *const i8);
+        }
+    }
     impl_ref.remove(&map_key);
 }
 
@@ -577,6 +587,13 @@ pub unsafe extern "C" fn pith_map_insert_ikey(map_handle: i64, key: i64, value: 
         impl_ref.insert_int_value(key, value);
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
+        if impl_ref.val_is_heap {
+            if let Some(old_val) = impl_ref.get(&MapKey::Int(key)) {
+                let old = std::ptr::read_unaligned(old_val.as_ptr() as *const i64);
+                crate::pith_cstring_release(old as *const i8);
+            }
+            crate::pith_cstring_retain(value as *const i8);
+        }
         let val_bytes = value.to_le_bytes().to_vec();
         impl_ref.insert(MapKey::Int(key), val_bytes);
     }
@@ -651,6 +668,12 @@ pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
         impl_ref.remove_int_value(key);
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_REMOVES, 1);
+        if impl_ref.val_is_heap {
+            if let Some(old_val) = impl_ref.get(&MapKey::Int(key)) {
+                let old = std::ptr::read_unaligned(old_val.as_ptr() as *const i64);
+                crate::pith_cstring_release(old as *const i8);
+            }
+        }
         impl_ref.remove(&MapKey::Int(key));
     }
 }

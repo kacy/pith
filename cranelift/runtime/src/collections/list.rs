@@ -4,7 +4,6 @@
 //! but presents FFI-compatible interface matching the C runtime.
 
 use crate::handle_registry::{self, HandleKind};
-use crate::string::{pith_string_release, pith_string_retain, PithString};
 /// FFI-compatible list handle
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -332,10 +331,10 @@ pub unsafe extern "C" fn pith_list_push(list: *mut PithList, elem: *const u8, el
     // Copy element data
     let elem_slice = std::slice::from_raw_parts(elem, elem_size as usize);
 
-    // Handle string elements specially (retain)
+    // A string list stores owned cstring pointers: the list holds one count
+    // per element, released again when the element leaves the list.
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let s = elem as *const PithString;
-        pith_string_retain(*s);
+        crate::pith_cstring_retain(std::ptr::read_unaligned(elem as *const i64) as *const i8);
     }
 
     impl_ref.push(elem_slice);
@@ -350,6 +349,9 @@ pub unsafe extern "C" fn pith_list_push_value(list: PithList, value: i64) {
     };
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_LIST_PUSHES, 1);
+    if matches!(impl_ref.type_tag, ListTypeTag::String) {
+        crate::pith_cstring_retain(value as *const i8);
+    }
     impl_ref.push_value(value);
 }
 
@@ -364,6 +366,12 @@ pub unsafe extern "C" fn pith_list_set_value(list: PithList, index: i64, value: 
     let idx = index as usize;
     if idx >= impl_ref.len() {
         return;
+    }
+    if matches!(impl_ref.type_tag, ListTypeTag::String) {
+        if let Some(old) = impl_ref.get_value(idx) {
+            crate::pith_cstring_release(old as *const i8);
+        }
+        crate::pith_cstring_retain(value as *const i8);
     }
     impl_ref.set_value(idx, value);
 }
@@ -400,7 +408,7 @@ pub unsafe extern "C" fn pith_list_join(list: PithList, sep: *const i8) -> *mut 
         i += 1;
     }
 
-    let out = crate::pith_alloc(crate::pith_layout(total_len + 1, 1)) as *mut i8;
+    let out = crate::pith_alloc_cstring(total_len);
 
     let mut write = 0usize;
     let mut i = 0usize;
@@ -478,12 +486,8 @@ pub unsafe extern "C" fn pith_list_pop(list: *mut PithList, elem_size: i64, out:
             // Copy to output buffer
             std::ptr::copy_nonoverlapping(elem_data.as_ptr(), out, elem_data.len());
 
-            // Handle string elements (release the copy in the list)
-            if matches!(impl_ref.type_tag, ListTypeTag::String) {
-                let s = out as *const PithString;
-                pith_string_release(*s);
-            }
-
+            // The list's count transfers to the caller with the element,
+            // so there is no release here.
             true
         }
         None => false,
@@ -588,12 +592,8 @@ pub unsafe extern "C" fn pith_list_get(
                 return false;
             }
 
-            // Retain string elements (caller gets a reference)
-            if matches!(impl_ref.type_tag, ListTypeTag::String) {
-                let s = out as *const PithString;
-                pith_string_retain(*s);
-            }
-
+            // Reads borrow: the element stays in the list with its count,
+            // and the caller retains only if it keeps the value.
             true
         }
         None => false,
@@ -629,21 +629,17 @@ pub unsafe extern "C" fn pith_list_set(
         return false;
     }
 
-    // Release old element if it's a heap type
+    // Release the outgoing element, retain the incoming one: the list owns
+    // one count per stored string.
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         if let Some(old_s) = impl_ref.get_value(index as usize) {
-            pith_string_release(*(old_s as *const PithString));
+            crate::pith_cstring_release(old_s as *const i8);
         }
+        crate::pith_cstring_retain(std::ptr::read_unaligned(elem as *const i64) as *const i8);
     }
 
     // Copy new element
     let elem_slice = std::slice::from_raw_parts(elem, elem_size as usize);
-
-    // Retain new element
-    if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        let s = elem as *const PithString;
-        pith_string_retain(*s);
-    }
 
     impl_ref.set(index as usize, elem_slice);
     true
@@ -673,10 +669,10 @@ pub unsafe extern "C" fn pith_list_remove(list: *mut PithList, index: i64, elem_
         return false;
     }
 
-    // Release element before removal
+    // Release the list's count before removal
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         if let Some(s) = impl_ref.get_value(index as usize) {
-            pith_string_release(*(s as *const PithString));
+            crate::pith_cstring_release(s as *const i8);
         }
     }
 
@@ -697,10 +693,10 @@ pub unsafe extern "C" fn pith_list_remove_value(list: PithList, index: i64) -> i
         return 0;
     }
 
-    // Release string element if needed
+    // Release the list's count before removal
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         if let Some(s) = impl_ref.get_value(index as usize) {
-            pith_string_release(*(s as *const PithString));
+            crate::pith_cstring_release(s as *const i8);
         }
     }
 
@@ -718,7 +714,7 @@ pub unsafe extern "C" fn pith_list_clear_value(list: PithList) {
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
             if let Some(s) = impl_ref.get_value(i) {
-                pith_string_release(*(s as *const PithString));
+                crate::pith_cstring_release(s as *const i8);
             }
         }
     }
@@ -753,7 +749,7 @@ pub unsafe extern "C" fn pith_list_clear(list: *mut PithList) {
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
             if let Some(s) = impl_ref.get_value(i) {
-                pith_string_release(*(s as *const PithString));
+                crate::pith_cstring_release(s as *const i8);
             }
         }
     }
@@ -786,7 +782,7 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
     if matches!(impl_ref.type_tag, ListTypeTag::String) {
         for i in 0..impl_ref.len() {
             if let Some(s) = impl_ref.get_value(i) {
-                pith_string_release(*(s as *const PithString));
+                crate::pith_cstring_release(s as *const i8);
             }
         }
     }
@@ -820,6 +816,51 @@ mod tests {
     fn bogus_list() -> PithList {
         PithList {
             ptr: 12345usize as *mut (),
+        }
+    }
+
+    #[test]
+    fn string_lists_own_one_count_per_element() {
+        unsafe {
+            let list = pith_list_new(8, 1); // ListTypeTag::String
+            let s = crate::pith_copy_bytes_to_cstring(b"owned");
+            pith_list_push_value(list, s as i64);
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(2));
+
+            // the caller drops its count; the list's count keeps it alive
+            crate::pith_cstring_release(s);
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
+            assert_eq!(pith_list_get_value(list, 0), s as i64);
+
+            // overwriting releases the old element and retains the new one
+            let t = crate::pith_copy_bytes_to_cstring(b"next");
+            pith_list_set_value(list, 0, t as i64);
+            assert_eq!(crate::cstring_refcount_for_tests(s), None); // freed
+            assert_eq!(crate::cstring_refcount_for_tests(t), Some(2));
+
+            // freeing the list drops its count on every element
+            pith_list_release(list);
+            assert_eq!(crate::cstring_refcount_for_tests(t), Some(1));
+            crate::pith_cstring_release(t);
+        }
+    }
+
+    #[test]
+    fn string_list_pop_transfers_ownership() {
+        unsafe {
+            let list = pith_list_new(8, 1);
+            let s = crate::pith_copy_bytes_to_cstring(b"moved");
+            pith_list_push_value(list, s as i64);
+            crate::pith_cstring_release(s); // caller keeps nothing
+
+            let mut list_val = list;
+            let mut out = [0u8; 8];
+            assert!(pith_list_pop(&mut list_val, 8, out.as_mut_ptr()));
+            let popped = i64::from_ne_bytes(out) as *const i8;
+            // the list's count moved out with the element
+            assert_eq!(crate::cstring_refcount_for_tests(popped), Some(1));
+            crate::pith_cstring_release(popped);
+            pith_list_release(list);
         }
     }
 

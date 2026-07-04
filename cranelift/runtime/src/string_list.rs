@@ -120,9 +120,8 @@ pub unsafe extern "C" fn pith_cstring_char_at(s: *const i8, index: i64) -> *mut 
         return crate::pith_cstring_empty();
     }
 
-    let ptr = crate::pith_alloc(crate::pith_layout(2, 1)) as *mut i8;
+    let ptr = crate::pith_alloc_cstring(1);
     *ptr = bytes[index as usize] as i8;
-    *ptr.add(1) = 0;
     ptr
 }
 
@@ -153,13 +152,12 @@ pub unsafe extern "C" fn pith_cstring_to_upper(s: *const i8) -> *mut i8 {
     };
     let len = slice.len();
 
-    let ptr = crate::pith_alloc(crate::pith_layout(len + 1, 1)) as *mut i8;
+    let ptr = crate::pith_alloc_cstring(len);
 
     for i in 0..len {
         let c = slice[i];
         *ptr.add(i) = (c as char).to_ascii_uppercase() as u8 as i8;
     }
-    *ptr.add(len) = 0;
     ptr
 }
 
@@ -175,13 +173,12 @@ pub unsafe extern "C" fn pith_cstring_to_lower(s: *const i8) -> *mut i8 {
     };
     let len = slice.len();
 
-    let ptr = crate::pith_alloc(crate::pith_layout(len + 1, 1)) as *mut i8;
+    let ptr = crate::pith_alloc_cstring(len);
 
     for i in 0..len {
         let c = slice[i];
         *ptr.add(i) = (c as char).to_ascii_lowercase() as u8 as i8;
     }
-    *ptr.add(len) = 0;
     ptr
 }
 
@@ -197,12 +194,11 @@ pub unsafe extern "C" fn pith_cstring_reverse(s: *const i8) -> *mut i8 {
     };
     let len = slice.len();
 
-    let ptr = crate::pith_alloc(crate::pith_layout(len + 1, 1)) as *mut i8;
+    let ptr = crate::pith_alloc_cstring(len);
 
     for i in 0..len {
         *ptr.add(i) = slice[len - 1 - i] as i8;
     }
-    *ptr.add(len) = 0;
     ptr
 }
 

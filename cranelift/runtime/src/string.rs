@@ -5,8 +5,6 @@
 //! The FFI layer uses `PithString` structs that are compatible with the C runtime.
 //! Internally, we use `std::string::String` for all operations.
 
-use std::sync::Arc;
-
 use std::alloc::dealloc;
 
 /// FFI-compatible string representation
@@ -35,44 +33,39 @@ pub static EMPTY_STRING: PithString = PithString {
     is_heap: false,
 };
 
-/// Internal string representation using idiomatic Rust
+/// Borrow a PithString's bytes as &str without copying.
 ///
-/// Uses Arc for shared ownership and reference counting.
-/// The string data is stored as Arc<str> which is immutable and thread-safe.
-pub type InternalString = Arc<str>;
-
-/// Create an internal String from a PithString
+/// Falls back to "" on invalid utf-8, matching what the old arc round-trip
+/// did. The runtime only constructs valid utf-8, so the check is a guard,
+/// not a code path programs rely on.
 ///
 /// # Safety
-/// The PithString must contain valid UTF-8 data
-pub unsafe fn internal_from_pith(s: PithString) -> InternalString {
-    if s.len == 0 {
-        return Arc::from("");
+/// The PithString's ptr/len must describe live memory.
+unsafe fn as_str<'a>(s: &PithString) -> &'a str {
+    if s.len <= 0 || s.ptr.is_null() {
+        return "";
     }
-
     let slice = std::slice::from_raw_parts(s.ptr, s.len as usize);
-    match std::str::from_utf8(slice) {
-        Ok(str_ref) => Arc::from(str_ref),
-        Err(_) => Arc::from(""),
-    }
+    std::str::from_utf8(slice).unwrap_or("")
 }
 
-/// Create a PithString from an internal String
+/// Allocate one runtime buffer and copy `text` into it.
 ///
-/// Returns a heap-allocated PithString that must be released with pith_string_release
-pub fn pith_from_internal(s: InternalString) -> PithString {
-    if s.is_empty() {
+/// This is the single place a derived string touches the allocator. The old
+/// path went text → Arc<str> → runtime buffer, copying everything twice.
+pub fn pith_from_str(text: &str) -> PithString {
+    if text.is_empty() {
         return EMPTY_STRING;
     }
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_STRING_ALLOCS, 1);
-    crate::perf_count(&crate::PERF_STRING_ALLOC_BYTES, s.len());
+    crate::perf_count(&crate::PERF_STRING_ALLOC_BYTES, text.len());
 
-    let len = s.len();
+    let len = text.len();
     let layout = crate::pith_layout(len, 1);
     let ptr = unsafe { crate::pith_alloc(layout) };
     unsafe {
-        std::ptr::copy_nonoverlapping(s.as_bytes().as_ptr(), ptr, len);
+        std::ptr::copy_nonoverlapping(text.as_bytes().as_ptr(), ptr, len);
     }
 
     PithString {
@@ -94,7 +87,7 @@ pub unsafe extern "C" fn pith_string_new(data: *const u8, len: i64) -> PithStrin
 
     let slice = std::slice::from_raw_parts(data, len as usize);
     match std::str::from_utf8(slice) {
-        Ok(text) => pith_from_internal(Arc::from(text)),
+        Ok(text) => pith_from_str(text),
         Err(_) => EMPTY_STRING,
     }
 }
@@ -143,16 +136,15 @@ pub unsafe extern "C" fn pith_string_from_cstr_ptr(cstr: *const i8, out_ptr: *mu
 /// Retain a string.
 ///
 /// Heap strings use copy-on-derive ownership: every operation that produces a
-/// string (`pith_from_internal`, concat, substring, trim, ...) allocates and
-/// owns its own buffer, so two live `PithString`s never share one allocation.
+/// string (`pith_from_str`, concat, substring, trim, ...) allocates and owns
+/// its own buffer, so two live `PithString`s never share one allocation.
 /// With no shared buffer there is no reference count to bump, so retain is a
 /// no-op under the current model.
 ///
 /// The symbol is kept so the retain/release pair stays symmetric. If strings
 /// ever move to shared ownership, the count increment belongs here — and
-/// `pith_from_internal` and `pith_string_release` would need a matching count
-/// header. (Despite the `Arc` type alias above, the heap buffer is a plain
-/// allocation today, not an `Arc`.)
+/// `pith_from_str` and `pith_string_release` would need a matching count
+/// header.
 #[no_mangle]
 pub unsafe extern "C" fn pith_string_retain(s: PithString) {
     let _ = s;
@@ -185,17 +177,33 @@ pub extern "C" fn pith_string_destructor(ptr: *mut u8) {
     }
 }
 
-/// Concatenate two strings
+/// Concatenate two strings into one fresh allocation
 #[no_mangle]
 pub unsafe extern "C" fn pith_string_concat(a: PithString, b: PithString) -> PithString {
-    let a_internal = internal_from_pith(a);
-    let b_internal = internal_from_pith(b);
+    let a_str = as_str(&a);
+    let b_str = as_str(&b);
+    if a_str.is_empty() {
+        return pith_from_str(b_str);
+    }
+    if b_str.is_empty() {
+        return pith_from_str(a_str);
+    }
 
-    let mut result = String::with_capacity(a_internal.len() + b_internal.len());
-    result.push_str(&a_internal);
-    result.push_str(&b_internal);
+    let len = a_str.len() + b_str.len();
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_STRING_ALLOCS, 1);
+    crate::perf_count(&crate::PERF_STRING_ALLOC_BYTES, len);
 
-    pith_from_internal(Arc::from(result))
+    let layout = crate::pith_layout(len, 1);
+    let ptr = crate::pith_alloc(layout);
+    std::ptr::copy_nonoverlapping(a_str.as_ptr(), ptr, a_str.len());
+    std::ptr::copy_nonoverlapping(b_str.as_ptr(), ptr.add(a_str.len()), b_str.len());
+
+    PithString {
+        ptr,
+        len: len as i64,
+        is_heap: true,
+    }
 }
 
 /// Get string length in bytes
@@ -211,10 +219,12 @@ pub unsafe extern "C" fn pith_string_substring(s: PithString, start: i64, end: i
         return EMPTY_STRING;
     }
 
-    let internal = internal_from_pith(s);
-    let substr = &internal[start as usize..end as usize];
-
-    pith_from_internal(Arc::from(substr))
+    // .get() rather than slice syntax: a range that lands inside a utf-8
+    // sequence yields "" instead of a panic.
+    match as_str(&s).get(start as usize..end as usize) {
+        Some(substr) => pith_from_str(substr),
+        None => EMPTY_STRING,
+    }
 }
 
 /// Check if string contains substring
@@ -227,11 +237,7 @@ pub extern "C" fn pith_string_contains(haystack: PithString, needle: PithString)
         return false;
     }
 
-    unsafe {
-        let hay_internal = internal_from_pith(haystack);
-        let needle_internal = internal_from_pith(needle);
-        hay_internal.contains(&*needle_internal)
-    }
+    unsafe { as_str(&haystack).contains(as_str(&needle)) }
 }
 
 /// Check if string starts with prefix
@@ -244,11 +250,7 @@ pub extern "C" fn pith_string_starts_with(s: PithString, prefix: PithString) -> 
         return true;
     }
 
-    unsafe {
-        let s_internal = internal_from_pith(s);
-        let p_internal = internal_from_pith(prefix);
-        s_internal.starts_with(&*p_internal)
-    }
+    unsafe { as_str(&s).starts_with(as_str(&prefix)) }
 }
 
 /// Check if string ends with suffix
@@ -261,11 +263,7 @@ pub extern "C" fn pith_string_ends_with(s: PithString, suffix: PithString) -> bo
         return true;
     }
 
-    unsafe {
-        let s_internal = internal_from_pith(s);
-        let suf_internal = internal_from_pith(suffix);
-        s_internal.ends_with(&*suf_internal)
-    }
+    unsafe { as_str(&s).ends_with(as_str(&suffix)) }
 }
 
 /// Trim whitespace from both ends
@@ -275,14 +273,7 @@ pub unsafe extern "C" fn pith_string_trim(s: PithString) -> PithString {
         return EMPTY_STRING;
     }
 
-    let internal = internal_from_pith(s);
-    let trimmed = internal.trim();
-
-    if trimmed.is_empty() {
-        return EMPTY_STRING;
-    }
-
-    pith_from_internal(Arc::from(trimmed))
+    pith_from_str(as_str(&s).trim())
 }
 
 /// Create string from single character code

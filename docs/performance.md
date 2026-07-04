@@ -34,9 +34,12 @@ fields into fresh strings per record, and pith pays for it at ~19x go.
 
 ## why (measured, not guessed)
 
-- every string derive (`concat`, `substring`, `trim`, interpolation) copies
-  twice: once into an arc, once into the runtime allocation
-  (`cranelift/runtime/src/string.rs`).
+- ~~every string derive (`concat`, `substring`, `trim`) copies twice~~ —
+  fixed (single allocation now), but it turned out not to matter for these
+  benchmarks: the runtime perf counters (`PITH_PERF_STATS=1`) show
+  std_pipeline makes **zero** `pith_string_*` allocations. the stdlib builds
+  its string handling on byte buffers and list elements instead, so the
+  transform cost is 2.4m list pushes and 1.1m byte-buffer writes per run.
 - every list/map access takes a global mutex plus a hashset lookup to
   validate the handle (`cranelift/runtime/src/handle_registry.rs`).
 - lists and maps store non-int elements as one heap allocation per element
@@ -44,6 +47,24 @@ fields into fresh strings per record, and pith pays for it at ~19x go.
   unboxed fast path.
 - arc keeps a global object list with o(n) removal and scans for cycles
   every 100 releases (`cranelift/runtime/src/arc.rs`).
+
+## the big one: memory is never freed (found july 2026, profiling)
+
+`perf` on std_pipeline shows ~23% of wall time inside the kernel zeroing
+fresh pages (`clear_page_rep` plus fault handling). the reason: the native
+path barely releases anything. the runtime perf counters show zero arc
+allocations and zero arc releases in the whole run — bytes objects, c
+strings, and most heap allocations are simply never freed, so the heap only
+grows and every allocation touches brand-new zeroed pages.
+
+measured at 200k records: pith peaks at 1.65 gb rss, go at 313 mb. the
+benchmarks finish because the process exits before the leak matters; a
+long-running server pays this as unbounded growth.
+
+fixing this is the single biggest performance and correctness item in the
+backend — bigger than everything in the table below combined. it needs the
+compiler to emit releases (or a region strategy) for the native path, not
+just runtime tweaks.
 
 cranelift itself was generating unoptimized code until july 2026
 (`opt_level` defaulted to "none"). turning it to "speed" bought only 2-3%
@@ -57,7 +78,7 @@ the generated code.
 | baseline (july 2026) | 1273ms | 102ms |
 | opt_level=speed | 1236ms | 100ms |
 | drop per-access handle lock | 888ms | 93ms |
-| single-allocation string derives | | |
+| single-allocation string derives | no change | no change |
 | inline collection elements | | |
 | arc object-list rework | | |
 

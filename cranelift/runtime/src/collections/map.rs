@@ -44,6 +44,8 @@ impl Hash for MapKey {
 ///
 /// Uses HashMap for O(1) lookups with Vec<u8> storage for values
 pub struct MapImpl {
+    /// Magic word for the fast validity check (see map_magic_ok)
+    magic: u32,
     /// The actual hash map storing key -> value mappings
     data: HashMap<MapKey, Vec<u8>>,
     /// Specialized storage for int-key maps with 8-byte scalar values
@@ -71,6 +73,7 @@ impl MapImpl {
             None
         };
         MapImpl {
+            magic: MAP_MAGIC,
             data: HashMap::new(),
             int_values8,
             key_type,
@@ -160,29 +163,41 @@ impl MapImpl {
     }
 }
 
+/// Magic word for MapImpl ("PMAP"). Distinct per collection kind so a list
+/// handle passed where a map is expected still fails validation.
+const MAP_MAGIC: u32 = 0x504d4150;
+
+/// Fast validity check: one memory read instead of a global registry lock
+/// per access. Freed maps get their magic scrubbed in pith_map_free.
+#[inline]
+unsafe fn map_magic_ok(ptr: *const ()) -> bool {
+    handle_registry::plausibly_aligned::<MapImpl>(ptr)
+        && (*(ptr as *const MapImpl)).magic == MAP_MAGIC
+}
+
 unsafe fn map_ref<'a>(map: PithMap) -> Option<&'a MapImpl> {
-    if !handle_registry::is_valid(map.ptr as *const (), HandleKind::Map) {
+    if !map_magic_ok(map.ptr as *const ()) {
         return None;
     }
     Some(&*(map.ptr as *const MapImpl))
 }
 
 unsafe fn map_mut<'a>(map: PithMap) -> Option<&'a mut MapImpl> {
-    if !handle_registry::is_valid(map.ptr as *const (), HandleKind::Map) {
+    if !map_magic_ok(map.ptr as *const ()) {
         return None;
     }
     Some(&mut *(map.ptr as *mut MapImpl))
 }
 
 unsafe fn map_ref_from_handle<'a>(handle: i64) -> Option<&'a MapImpl> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::Map) {
+    if !map_magic_ok(handle as *const ()) {
         return None;
     }
     Some(&*(handle as *const MapImpl))
 }
 
 unsafe fn map_mut_from_handle<'a>(handle: i64) -> Option<&'a mut MapImpl> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::Map) {
+    if !map_magic_ok(handle as *const ()) {
         return None;
     }
     Some(&mut *(handle as *mut MapImpl))
@@ -361,7 +376,9 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
         }
     }
 
-    // Free the map implementation
+    // Free the map implementation. Scrub the magic first so any handle
+    // that outlives the map fails the fast validity check.
+    (*(map.ptr as *mut MapImpl)).magic = 0;
     handle_registry::unregister(map.ptr as *const (), HandleKind::Map);
     let _ = Box::from_raw(map.ptr as *mut MapImpl);
 }

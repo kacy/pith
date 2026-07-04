@@ -77,8 +77,14 @@ impl std::error::Error for CompileError {}
 pub fn create_codegen() -> Result<CodeGen, CompileError> {
     let isa_builder = cranelift_native::builder()
         .map_err(|e| CompileError::ModuleError(format!("Unsupported target: {:?}", e)))?;
+    // cranelift defaults to opt_level "none"; without this the generated
+    // code keeps every redundant load and dead value the lowering emits.
+    let mut flag_builder = settings::builder();
+    flag_builder
+        .set("opt_level", "speed")
+        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
     let isa = isa_builder
-        .finish(settings::Flags::new(settings::builder()))
+        .finish(settings::Flags::new(flag_builder))
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
     let builder = ObjectBuilder::new(
         isa,

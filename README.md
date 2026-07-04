@@ -26,6 +26,12 @@ make self-host
 ./self-host/pith_main check examples/hello.pith
 ```
 
+the first build on a fresh clone compiles the ir driver from the tracked
+seed at `self-host/bootstrap/ir_driver.ir` — the compiler is written in
+pith, so the seed is what breaks the circular dependency. after that,
+everything rebuilds from source. `make refresh-bootstrap-seed` regenerates
+the seed after ir contract changes.
+
 ## where to read first
 
 - `README.md` for the high-level map

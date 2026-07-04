@@ -48,6 +48,13 @@ fn run_cli() {
             }
             build_file(&args[2]);
         }
+        "build-ir" => {
+            if args.len() < 4 {
+                eprintln!("Error: build-ir requires an IR file and an output path");
+                std::process::exit(1);
+            }
+            build_ir_file(&args[2], &args[3]);
+        }
         "run" => {
             if args.len() < 3 {
                 eprintln!("Error: run requires a file argument");
@@ -106,6 +113,7 @@ fn print_usage() {
     println!();
     println!("Commands:");
     println!("  build <file.pith>    Compile .pith file to native binary");
+    println!("  build-ir <file.ir> <out>  Compile combined IR text to a native binary");
     println!("  run <file.pith>      Compile and run immediately");
     println!("  test <file.pith>     Compile and run tests");
     println!("  check <file.pith>    Type-check without generating code");
@@ -217,9 +225,38 @@ fn find_ir_driver() -> Option<String> {
     None
 }
 
+/// The ir_driver binary is itself compiled pith, so a fresh clone has no way
+/// to build it — pith build needs ir_driver to get IR. The tracked IR seed
+/// breaks that cycle: build ir_driver once from the seed, then everything
+/// else builds from source as usual.
+fn bootstrap_ir_driver_from_seed() -> Option<String> {
+    use pith_codegen::linker::build_executable;
+
+    for dir in &["./self-host", "../self-host"] {
+        let seed = format!("{}/bootstrap/ir_driver.ir", dir);
+        if !Path::new(&seed).exists() {
+            continue;
+        }
+        eprintln!("no ir_driver binary found; building one from {}", seed);
+        let ir_text = fs::read_to_string(&seed).ok()?;
+        let (bytes, _) = object_from_ir(&ir_text)
+            .map_err(|e| eprintln!("seed build failed: {}", e))
+            .ok()?;
+        let obj_path = format!("{}/ir_driver.o", dir);
+        let exe_path = format!("{}/ir_driver", dir);
+        fs::write(&obj_path, &bytes).ok()?;
+        build_executable(&obj_path, &exe_path)
+            .map_err(|e| eprintln!("seed link failed: {}", e))
+            .ok()?;
+        return Some(exe_path);
+    }
+    None
+}
+
 fn get_ir_from_compiler(path: &str, emit_tests: bool) -> Result<String, String> {
-    let driver =
-        find_ir_driver().ok_or("No IR driver found. Ensure ./self-host/ir_driver exists.")?;
+    let driver = find_ir_driver()
+        .or_else(bootstrap_ir_driver_from_seed)
+        .ok_or("No IR driver found. Ensure ./self-host/ir_driver exists.")?;
     let mut command = Command::new(&driver);
     command.arg("--combined");
     if emit_tests {
@@ -270,20 +307,24 @@ fn validate_combined_ir_contract(ir_text: &str) -> Result<(), String> {
 }
 
 fn compile_to_object(path: &str, emit_tests: bool) -> Result<(Vec<u8>, usize), String> {
+    let ir_text =
+        get_ir_from_compiler(path, emit_tests).map_err(|e| format!("Error getting IR: {}", e))?;
+    object_from_ir(&ir_text)
+}
+
+fn object_from_ir(ir_text: &str) -> Result<(Vec<u8>, usize), String> {
     use pith_codegen::create_codegen;
     use pith_codegen::finalize_module;
     use pith_codegen::ir_consumer::compile_from_ir;
 
-    let ir_text =
-        get_ir_from_compiler(path, emit_tests).map_err(|e| format!("Error getting IR: {}", e))?;
-    validate_combined_ir_contract(&ir_text)?;
+    validate_combined_ir_contract(ir_text)?;
 
-    dump_ir_if_requested(&ir_text);
+    dump_ir_if_requested(ir_text);
 
     let mut codegen = create_codegen().map_err(|e| format!("Error creating codegen: {}", e))?;
     let runtime_funcs = pith_codegen::declare_runtime_functions(&mut codegen.module)
         .map_err(|e| format!("Error declaring runtime: {}", e))?;
-    let funcs = compile_from_ir(&mut codegen, &ir_text, &runtime_funcs)
+    let funcs = compile_from_ir(&mut codegen, ir_text, &runtime_funcs)
         .map_err(|e| format!("Error compiling: {}", e))?;
     let bytes = finalize_module(codegen.module).map_err(|e| format!("Error finalizing: {}", e))?;
     Ok((bytes, funcs.len()))
@@ -324,6 +365,41 @@ fn unique_run_artifact_paths() -> (std::path::PathBuf, std::path::PathBuf) {
     let exe_path = env::temp_dir().join(format!("pith_ir_{}_{}", std::process::id(), stamp));
     let obj_path = env::temp_dir().join(format!("pith_ir_{}_{}.o", std::process::id(), stamp));
     (obj_path, exe_path)
+}
+
+/// Compile a combined IR text file straight to a native binary. Pairs with
+/// PITH_DUMP_IR (which writes such a file) and backs the bootstrap seed.
+fn build_ir_file(ir_path: &str, exe_path: &str) {
+    use pith_codegen::linker::build_executable;
+
+    let ir_text = match fs::read_to_string(ir_path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("Error reading {}: {}", ir_path, e);
+            std::process::exit(1);
+        }
+    };
+    let (bytes, func_count) = match object_from_ir(&ir_text) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("Compiled {} functions", func_count);
+    let obj_path = format!("{}.o", exe_path);
+    if let Err(e) = fs::write(&obj_path, &bytes) {
+        eprintln!("Error writing object: {}", e);
+        std::process::exit(1);
+    }
+    match build_executable(&obj_path, exe_path) {
+        Ok(_) => eprintln!("Created: {}", exe_path),
+        Err(e) => {
+            eprintln!("Error linking: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn run_file(path: &str) {

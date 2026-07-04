@@ -75,6 +75,12 @@ self-host: build
 self-host-ir-driver: build
 	./target/release/pith build self-host/ir_driver.pith
 
+# regenerate the tracked ir seed that lets a fresh clone build ir_driver.
+# run this after changes to the ir contract or the emitter so the seed
+# keeps working without an existing ir_driver binary.
+refresh-bootstrap-seed: self-host-ir-driver
+	PITH_DUMP_IR=self-host/bootstrap/ir_driver.ir ./target/release/pith build self-host/ir_driver.pith
+
 # rebuild the self-hosted compiler using the Cranelift-compiled version of itself
 bootstrap: self-host
 	@echo "--- stage 1: compile with current Cranelift binary ---"

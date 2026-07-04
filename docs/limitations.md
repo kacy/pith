@@ -29,8 +29,8 @@ something here that now works, the page is stale and a fix to it is welcome.
 
 - **no regex** — there is no regular-expression engine. for structured text,
   reach for `std/text/scanner` or hand-written parsing.
-- **tls server** — the client path works end to end; the server handshake is not
-  implemented yet (`std/net/tls.pith` fails with a clear message).
+- **tls 1.2** — tls is 1.3 only, client and server. there is no 1.2
+  compatibility mode, so peers that cannot speak 1.3 will not connect.
 - **testing** — `std/testing` covers assertions but not discovery, fixtures, or
   parameterized cases. the project's own suite is golden-snapshot based (see
   `tests/`).

@@ -120,12 +120,11 @@ pub unsafe extern "C" fn pith_random_string(len: i64) -> *mut i8 {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let n = len.max(0) as usize;
 
-    let ptr = crate::pith_alloc(crate::pith_layout(n + 1, 1)) as *mut i8;
+    let ptr = crate::pith_alloc_cstring(n);
     for i in 0..n {
         let idx = (pith_random_float() * CHARSET.len() as f64) as usize % CHARSET.len();
         *ptr.add(i) = CHARSET[idx] as i8;
     }
-    *ptr.add(n) = 0;
     ptr
 }
 

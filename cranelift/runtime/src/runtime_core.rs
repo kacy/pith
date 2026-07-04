@@ -40,16 +40,103 @@ pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
     ptr
 }
 
+// --- refcounted c strings ---
+//
+// generated code passes strings around as bare `*const i8`, so ownership
+// has to live behind the pointer. every heap cstring carries a 16-byte
+// header in front of its data:
+//
+//   [magic: u32][refcount: u32, atomic][data_len: u64][bytes...][NUL]
+//
+// static literals (strref data baked into the binary) have no header. the
+// magic + alignment check below turns retain/release into no-ops for them,
+// so the compiler can emit retain/release for every string register without
+// caring where the string came from.
+
+pub(crate) const CSTRING_MAGIC: u32 = 0x50435352; // "PCSR"
+const CSTRING_HEADER_SIZE: usize = 16;
+const CSTRING_ALIGN: usize = 8;
+
+/// One shared empty string. It has no header, so retain/release skip it,
+/// which is exactly right for a value that is never freed.
+static CSTRING_EMPTY: &[u8] = b"\0";
+
+fn cstring_layout(data_len: usize) -> Layout {
+    pith_layout(CSTRING_HEADER_SIZE + data_len + 1, CSTRING_ALIGN)
+}
+
+/// Allocate a heap cstring with `data_len` data bytes, refcount 1, and the
+/// trailing NUL already written. The caller fills bytes 0..data_len.
+pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
+    let base = pith_alloc(cstring_layout(data_len));
+    (base as *mut u32).write(CSTRING_MAGIC);
+    (base.add(4) as *mut u32).write(1);
+    (base.add(8) as *mut u64).write(data_len as u64);
+    let data = base.add(CSTRING_HEADER_SIZE) as *mut i8;
+    *data.add(data_len) = 0;
+    data
+}
+
+/// Find the header of a heap cstring, or None for null pointers, static
+/// literals, and anything else that never came from pith_alloc_cstring.
+/// Heap cstring data is always 8-aligned, which rejects most literals
+/// before the header word is ever read; an aligned literal gets one read
+/// of the 16 bytes in front of it (mapped binary data) and fails the magic
+/// compare. Same practical-guard contract as the collection magic words.
+unsafe fn cstring_base(s: *const i8) -> Option<*mut u8> {
+    let addr = s as usize;
+    if addr < CSTRING_HEADER_SIZE || addr % CSTRING_ALIGN != 0 {
+        return None;
+    }
+    let base = (s as *const u8).sub(CSTRING_HEADER_SIZE) as *mut u8;
+    if (base as *const u32).read() != CSTRING_MAGIC {
+        return None;
+    }
+    Some(base)
+}
+
+unsafe fn cstring_refcount(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
+    &*(base.add(4) as *const std::sync::atomic::AtomicU32)
+}
+
+/// Bump the refcount of a heap cstring. No-op for literals and null.
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
+    if let Some(base) = cstring_base(s) {
+        cstring_refcount(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Drop one count; free the allocation when the last count dies. The magic
+/// is scrubbed before the free so a stale pointer fails the header check
+/// instead of double-freeing. No-op for literals and null.
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
+    if let Some(base) = cstring_base(s) {
+        let last = cstring_refcount(base).fetch_sub(1, std::sync::atomic::Ordering::Release) == 1;
+        if last {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            let data_len = (base.add(8) as *const u64).read() as usize;
+            (base as *mut u32).write(0);
+            std::alloc::dealloc(base, cstring_layout(data_len));
+        }
+    }
+}
+
+/// Test-only view of a heap cstring's refcount (None for literals/null).
+#[cfg(test)]
+pub(crate) unsafe fn cstring_refcount_for_tests(s: *const i8) -> Option<u32> {
+    cstring_base(s).map(|base| cstring_refcount(base).load(std::sync::atomic::Ordering::Relaxed))
+}
+
 pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
-    let layout = pith_layout(bytes.len() + 1, 1);
-    let ptr = pith_alloc(layout) as *mut i8;
+    let ptr = pith_alloc_cstring(bytes.len());
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-    *ptr.add(bytes.len()) = 0;
     ptr
 }
 
 pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
-    pith_copy_bytes_to_cstring(&[])
+    CSTRING_EMPTY.as_ptr() as *mut i8
 }
 
 const PITH_CLOSURE_ENV_SLOTS: usize = 16;
@@ -133,6 +220,69 @@ pub unsafe extern "C" fn pith_print(s: string::PithString) {
 mod tests {
     use super::*;
 
+    unsafe fn heap_refcount(s: *const i8) -> u32 {
+        let base = (s as *const u8).sub(CSTRING_HEADER_SIZE);
+        (base.add(4) as *const u32).read()
+    }
+
+    #[test]
+    fn heap_cstrings_carry_a_refcount() {
+        unsafe {
+            let s = pith_copy_bytes_to_cstring(b"hello");
+            assert_eq!(heap_refcount(s), 1);
+            pith_cstring_retain(s);
+            assert_eq!(heap_refcount(s), 2);
+            pith_cstring_release(s);
+            assert_eq!(heap_refcount(s), 1);
+            pith_cstring_release(s); // frees; magic is scrubbed first
+        }
+    }
+
+    #[test]
+    fn released_cstring_fails_the_header_check() {
+        unsafe {
+            let s = pith_copy_bytes_to_cstring(b"x");
+            pith_cstring_release(s);
+            // stale pointer: magic scrubbed, so this must be a no-op,
+            // not a double free
+            pith_cstring_release(s);
+            pith_cstring_retain(s);
+        }
+    }
+
+    #[test]
+    fn literals_and_null_are_no_ops() {
+        unsafe {
+            let lit = b"static literal\0".as_ptr() as *const i8;
+            pith_cstring_retain(lit);
+            pith_cstring_release(lit);
+            pith_cstring_release(lit);
+            pith_cstring_retain(std::ptr::null());
+            pith_cstring_release(std::ptr::null());
+            // the shared empty string is header-less by design
+            let empty = pith_cstring_empty();
+            pith_cstring_release(empty);
+            assert_eq!(*empty, 0);
+        }
+    }
+
+    #[test]
+    fn concat_and_strdup_produce_owned_cstrings() {
+        unsafe {
+            let a = pith_copy_bytes_to_cstring(b"ab");
+            let b = pith_copy_bytes_to_cstring(b"cd");
+            let joined = pith_concat_cstr(a, b);
+            assert_eq!(heap_refcount(joined), 1);
+            assert_eq!(crate::string::pith_cstring_len(joined), 4);
+            let dup = pith_strdup(joined);
+            assert_eq!(heap_refcount(dup), 1);
+            pith_cstring_release(joined);
+            pith_cstring_release(dup);
+            pith_cstring_release(a);
+            pith_cstring_release(b);
+        }
+    }
+
     #[test]
     fn invalid_closure_handles_return_safe_defaults() {
         unsafe {
@@ -180,13 +330,10 @@ pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8
 
     let len_a = string::pith_cstring_len(a) as usize;
     let len_b = string::pith_cstring_len(b) as usize;
-    let total_len = len_a + len_b;
-    let layout = pith_layout(total_len + 1, 1);
-    let result = pith_alloc(layout) as *mut i8;
+    let result = pith_alloc_cstring(len_a + len_b);
 
     std::ptr::copy_nonoverlapping(a, result, len_a);
     std::ptr::copy_nonoverlapping(b, result.add(len_a), len_b);
-    *result.add(total_len) = 0;
     result
 }
 
@@ -197,9 +344,8 @@ pub unsafe extern "C" fn pith_strdup(ptr: *const i8) -> *mut i8 {
     }
 
     let len = string::pith_cstring_len(ptr) as usize;
-    let layout = pith_layout(len + 1, 1);
-    let result = pith_alloc(layout) as *mut i8;
-    std::ptr::copy_nonoverlapping(ptr, result, len + 1);
+    let result = pith_alloc_cstring(len);
+    std::ptr::copy_nonoverlapping(ptr, result, len);
 
     result
 }
@@ -277,11 +423,8 @@ pub unsafe extern "C" fn pith_ord_cstr(s: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_chr_cstr(n: i64) -> *mut i8 {
-    let layout = pith_layout(2, 1);
-    let ptr = pith_alloc(layout) as *mut i8;
+    let ptr = pith_alloc_cstring(1);
     *ptr = (n as u8) as i8;
-    *ptr.add(1) = 0;
-
     ptr
 }
 

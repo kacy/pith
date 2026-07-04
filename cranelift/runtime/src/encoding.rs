@@ -147,8 +147,7 @@ pub unsafe extern "C" fn pith_hex_encode(s: *const i8) -> *mut i8 {
 
     let len = crate::string::pith_cstring_len(s) as usize;
     let input = std::slice::from_raw_parts(s as *const u8, len);
-    let hex_len = len * 2 + 1;
-    let ptr = crate::pith_alloc(crate::pith_layout(hex_len, 1));
+    let ptr = crate::pith_alloc_cstring(len * 2) as *mut u8;
 
     for (i, &byte) in input.iter().enumerate() {
         let hi = (byte >> 4) as usize;
@@ -157,7 +156,6 @@ pub unsafe extern "C" fn pith_hex_encode(s: *const i8) -> *mut i8 {
         *ptr.add(i * 2) = HEX[hi];
         *ptr.add(i * 2 + 1) = HEX[lo];
     }
-    *ptr.add(len * 2) = 0;
     ptr as *mut i8
 }
 
@@ -177,14 +175,13 @@ pub unsafe extern "C" fn pith_from_hex(s: *const i8) -> *mut i8 {
     }
     let input = std::slice::from_raw_parts(s as *const u8, len);
     let out_len = len / 2;
-    let ptr = crate::pith_alloc(crate::pith_layout(out_len + 1, 1));
+    let ptr = crate::pith_alloc_cstring(out_len) as *mut u8;
 
     for i in 0..out_len {
         let hi = hex_digit(input[i * 2]);
         let lo = hex_digit(input[i * 2 + 1]);
         *ptr.add(i) = (hi << 4) | lo;
     }
-    *ptr.add(out_len) = 0;
     ptr as *mut i8
 }
 

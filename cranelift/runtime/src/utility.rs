@@ -97,7 +97,7 @@ pub unsafe extern "C" fn pith_b64_decode(s: *const i8) -> *mut i8 {
         in_len -= 1;
     }
     let out_len = in_len * 3 / 4;
-    let ptr = crate::pith_alloc(crate::pith_layout(out_len + 1, 1));
+    let ptr = crate::pith_alloc_cstring(out_len) as *mut u8;
 
     let mut si = 0;
     let mut di = 0;
@@ -242,12 +242,11 @@ pub unsafe extern "C" fn pith_cstring_pad_left(
         b' ' as i8
     };
     let pad = w - len;
-    let ptr = crate::pith_alloc(crate::pith_layout(w + 1, 1)) as *mut i8;
+    let ptr = crate::pith_alloc_cstring(w);
     for i in 0..pad {
         *ptr.add(i) = fill_char;
     }
     std::ptr::copy_nonoverlapping(s, ptr.add(pad), len);
-    *ptr.add(w) = 0;
     ptr
 }
 
@@ -273,12 +272,11 @@ pub unsafe extern "C" fn pith_cstring_pad_right(
     } else {
         b' ' as i8
     };
-    let ptr = crate::pith_alloc(crate::pith_layout(w + 1, 1)) as *mut i8;
+    let ptr = crate::pith_alloc_cstring(w);
     std::ptr::copy_nonoverlapping(s, ptr, len);
     for i in len..w {
         *ptr.add(i) = fill_char;
     }
-    *ptr.add(w) = 0;
     ptr
 }
 
@@ -294,11 +292,10 @@ pub unsafe extern "C" fn pith_cstring_repeat(s: *const i8, n: i64) -> *mut i8 {
     let Some(total_len) = len.checked_mul(n as usize) else {
         return crate::pith_cstring_empty();
     };
-    let ptr = crate::pith_alloc(crate::pith_layout(total_len + 1, 1)) as *mut i8;
+    let ptr = crate::pith_alloc_cstring(total_len);
     for i in 0..n as usize {
         std::ptr::copy_nonoverlapping(s, ptr.add(i * len), len);
     }
-    *ptr.add(total_len) = 0;
     ptr
 }
 

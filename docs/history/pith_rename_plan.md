@@ -1,5 +1,9 @@
 # Pith rename plan
 
+status: done. sources are `.pith`, the cli is `pith`, and runtime symbols
+use `pith_`. nothing here is pending; this file stays around as a record of
+what the rename covered.
+
 This file keeps the language rename to Pith easy to resume. The rename is
 intentionally broad: public docs, source extensions, command names, runtime
 symbols, package metadata, and build output paths should all use Pith naming.

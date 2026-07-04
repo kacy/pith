@@ -32,20 +32,22 @@ structs, enums, match, generics, lambdas/closures, collections (List/Map/Set),
 string methods, error propagation (try/fail), concurrency (spawn/await),
 JSON/TOML/URL parsing, file I/O, path/process helpers, and more.
 
-## codebase (~10,500 lines Rust)
+## codebase (~11,200 lines Rust)
+
+counts drift as the code moves; `make status-audit` prints the live totals.
 
 | Component | Lines | Purpose |
 |-----------|-------|---------|
-| `cranelift/runtime/src/` | 8,040 | runtime storage, ARC, collections, OS/IO, crypto helpers |
-| `cranelift/codegen/src/` | 1,917 | text IR → Cranelift lowering and link support |
-| `cranelift/cli/src/` | 418 | CLI (build/run/check/parse/lex) |
-| `cranelift/codegen/src/ir_consumer.rs` | 1,568 | text IR → Cranelift IR |
-| `cranelift/runtime/src/collections/list.rs` | 952 | list runtime |
-| `cranelift/runtime/src/collections/map.rs` | 719 | map runtime |
-| `cranelift/runtime/src/host_fs.rs` | 609 | file and host filesystem helpers |
-| `cranelift/runtime/src/runtime_core.rs` | 572 | core runtime glue |
-| `cranelift/runtime/src/string_list.rs` | 555 | string list helpers |
-| `cranelift/runtime/src/crypto.rs` | 354 | AEAD, x25519, signature, and TLS-facing crypto kernels |
+| `cranelift/runtime/src/` | 8,386 | runtime storage, ARC, collections, OS/IO, crypto helpers |
+| `cranelift/codegen/src/` | 2,172 | text IR → Cranelift lowering and link support |
+| `cranelift/cli/src/` | 517 | CLI (build/run/check/parse/lex) |
+| `cranelift/codegen/src/ir_consumer.rs` | 1,779 | text IR → Cranelift IR |
+| `cranelift/runtime/src/collections/list.rs` | 835 | list runtime |
+| `cranelift/runtime/src/collections/map.rs` | 767 | map runtime |
+| `cranelift/runtime/src/host_fs.rs` | 474 | file and host filesystem helpers |
+| `cranelift/runtime/src/runtime_core.rs` | 666 | core runtime glue |
+| `cranelift/runtime/src/string_list.rs` | 428 | string list helpers |
+| `cranelift/runtime/src/crypto.rs` | 396 | AEAD, x25519, signature, and TLS-facing crypto kernels |
 
 ## Self-Hosting Status: Complete
 

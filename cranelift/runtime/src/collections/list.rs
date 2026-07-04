@@ -203,29 +203,40 @@ impl ListImpl {
     }
 }
 
+/// Fast validity check for the hot accessors: one memory read against the
+/// magic word instead of a global registry lock per access. Freed lists get
+/// their magic scrubbed in pith_list_free, so stale handles fail the compare.
+/// The registry still records every list so is_list_ptr can give an exact
+/// answer where a magic collision would be unacceptable (pith_auto_len).
+#[inline]
+unsafe fn list_magic_ok(ptr: *const ()) -> bool {
+    handle_registry::plausibly_aligned::<ListImpl>(ptr)
+        && (*(ptr as *const ListImpl)).magic == LIST_MAGIC
+}
+
 unsafe fn list_ref<'a>(list: PithList) -> Option<&'a ListImpl> {
-    if !handle_registry::is_valid(list.ptr as *const (), HandleKind::List) {
+    if !list_magic_ok(list.ptr as *const ()) {
         return None;
     }
     Some(&*(list.ptr as *const ListImpl))
 }
 
 unsafe fn list_mut<'a>(list: PithList) -> Option<&'a mut ListImpl> {
-    if !handle_registry::is_valid(list.ptr as *const (), HandleKind::List) {
+    if !list_magic_ok(list.ptr as *const ()) {
         return None;
     }
     Some(&mut *(list.ptr as *mut ListImpl))
 }
 
 pub(crate) unsafe fn list_ref_from_handle<'a>(handle: i64) -> Option<&'a ListImpl> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::List) {
+    if !list_magic_ok(handle as *const ()) {
         return None;
     }
     Some(&*(handle as *const ListImpl))
 }
 
 pub(crate) unsafe fn list_mut_from_handle<'a>(handle: i64) -> Option<&'a mut ListImpl> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::List) {
+    if !list_magic_ok(handle as *const ()) {
         return None;
     }
     Some(&mut *(handle as *mut ListImpl))
@@ -269,9 +280,12 @@ pub extern "C" fn pith_list_len(list: PithList) -> i64 {
     }
 }
 
-/// Check if a raw pointer looks like a ListImpl (has the magic number)
+/// Check if a raw pointer really is a ListImpl. The magic word rejects
+/// almost everything cheaply; the registry confirms the rare match, since a
+/// C string could start with the same four bytes and this function is what
+/// keeps pith_auto_len from misreading one as a list.
 pub fn is_list_ptr(ptr: *const ()) -> bool {
-    handle_registry::is_valid(ptr, HandleKind::List)
+    (unsafe { list_magic_ok(ptr) }) && handle_registry::is_valid(ptr, HandleKind::List)
 }
 
 /// Auto-detect len: works on both lists and C strings
@@ -777,7 +791,9 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
         }
     }
 
-    // Free the list implementation
+    // Free the list implementation. Scrub the magic first so any handle
+    // that outlives the list fails the fast validity check.
+    (*(list.ptr as *mut ListImpl)).magic = 0;
     handle_registry::unregister(list.ptr as *const (), HandleKind::List);
     let _ = Box::from_raw(list.ptr as *mut ListImpl);
 }

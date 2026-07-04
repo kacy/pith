@@ -40,6 +40,8 @@ impl Hash for SetElement {
 
 /// Internal set implementation using idiomatic Rust
 pub struct SetImpl {
+    /// Magic word for the fast validity check (see set_magic_ok)
+    magic: u32,
     /// The actual hash set storing unique elements
     data: HashSet<SetElement>,
     /// Type tag for elements (0=int, 1=string)
@@ -58,6 +60,7 @@ pub enum ElemType {
 impl SetImpl {
     fn new(elem_type: ElemType, _elem_size: usize, elem_is_heap: bool) -> Self {
         SetImpl {
+            magic: SET_MAGIC,
             data: HashSet::new(),
             elem_type,
             elem_is_heap,
@@ -89,29 +92,41 @@ impl SetImpl {
     }
 }
 
+/// Magic word for SetImpl ("PSET"). Distinct per collection kind so a list
+/// handle passed where a set is expected still fails validation.
+const SET_MAGIC: u32 = 0x50534554;
+
+/// Fast validity check: one memory read instead of a global registry lock
+/// per access. Freed sets get their magic scrubbed in pith_set_free.
+#[inline]
+unsafe fn set_magic_ok(ptr: *const ()) -> bool {
+    handle_registry::plausibly_aligned::<SetImpl>(ptr)
+        && (*(ptr as *const SetImpl)).magic == SET_MAGIC
+}
+
 unsafe fn set_ref<'a>(set: PithSet) -> Option<&'a SetImpl> {
-    if !handle_registry::is_valid(set.ptr as *const (), HandleKind::Set) {
+    if !set_magic_ok(set.ptr as *const ()) {
         return None;
     }
     Some(&*(set.ptr as *const SetImpl))
 }
 
 unsafe fn set_mut<'a>(set: PithSet) -> Option<&'a mut SetImpl> {
-    if !handle_registry::is_valid(set.ptr as *const (), HandleKind::Set) {
+    if !set_magic_ok(set.ptr as *const ()) {
         return None;
     }
     Some(&mut *(set.ptr as *mut SetImpl))
 }
 
 unsafe fn set_ref_from_handle<'a>(handle: i64) -> Option<&'a SetImpl> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::Set) {
+    if !set_magic_ok(handle as *const ()) {
         return None;
     }
     Some(&*(handle as *const SetImpl))
 }
 
 unsafe fn set_mut_from_handle<'a>(handle: i64) -> Option<&'a mut SetImpl> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::Set) {
+    if !set_magic_ok(handle as *const ()) {
         return None;
     }
     Some(&mut *(handle as *mut SetImpl))
@@ -238,7 +253,9 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
         }
     }
 
-    // Free the set implementation
+    // Free the set implementation. Scrub the magic first so any handle
+    // that outlives the set fails the fast validity check.
+    (*(set.ptr as *mut SetImpl)).magic = 0;
     handle_registry::unregister(set.ptr as *const (), HandleKind::Set);
     let _ = Box::from_raw(set.ptr as *mut SetImpl);
 }
@@ -314,7 +331,7 @@ pub unsafe extern "C" fn pith_set_to_list_string(
 /// Returns the raw `ListImpl` pointer as i64 to match the Cranelift collection ABI.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_to_list_cstr(set_handle: i64) -> i64 {
-    if !handle_registry::is_valid(set_handle as *const (), HandleKind::Set) {
+    if !set_magic_ok(set_handle as *const ()) {
         let empty = crate::collections::list::pith_list_new(8, 0);
         return empty.ptr as i64;
     }
@@ -330,7 +347,7 @@ pub unsafe extern "C" fn pith_set_to_list_cstr(set_handle: i64) -> i64 {
 /// Returns the raw `ListImpl` pointer as i64 to match the Cranelift collection ABI.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_to_list_int_handle(set_handle: i64) -> i64 {
-    if !handle_registry::is_valid(set_handle as *const (), HandleKind::Set) {
+    if !set_magic_ok(set_handle as *const ()) {
         let empty = crate::collections::list::pith_list_new(8, 0);
         return empty.ptr as i64;
     }

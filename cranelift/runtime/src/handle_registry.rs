@@ -1,10 +1,18 @@
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 
+/// Pre-check before reading a magic word: dereferencing an unverified handle
+/// requires at least struct alignment. Misaligned garbage (a common
+/// corruption shape, and what the safe-defaults tests throw at us) fails
+/// here instead of faulting; stale handles fail the magic compare because
+/// free scrubs the word.
+#[inline]
+pub(crate) fn plausibly_aligned<T>(ptr: *const ()) -> bool {
+    !ptr.is_null() && (ptr as usize) % std::mem::align_of::<T>() == 0
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum HandleKind {
-    Bytes,
-    ByteBuffer,
     Channel,
     Closure,
     List,

@@ -1,28 +1,48 @@
-use crate::handle_registry::{self, HandleKind};
 use crate::{ensure_perf_stats_registered, perf_count, PERF_BYTES_ALLOCS, PERF_BYTES_ALLOC_BYTES};
 use crate::{PERF_BYTE_BUFFER_NEWS, PERF_BYTE_BUFFER_WRITES, PERF_BYTE_BUFFER_WRITE_BYTES};
 use std::io::Read;
 
 #[repr(C)]
 pub(crate) struct PithBytes {
+    // data_ptr and data_len must stay at offsets 0 and 8: the codegen
+    // inlines bytes indexing against this layout (ir_consumer.rs), so the
+    // magic word lives at the end.
     pub(crate) data_ptr: *const u8,
     pub(crate) data_len: usize,
     pub(crate) data: Vec<u8>,
+    pub(crate) magic: u32,
 }
+
+/// Magic word for PithBytes ("PBYT")
+pub(crate) const BYTES_MAGIC: u32 = 0x50425954;
+
+/// Magic word for PithByteBuffer ("PBUF")
+const BYTE_BUFFER_MAGIC: u32 = 0x50425546;
 
 pub(crate) struct PithByteBuffer {
     pub(crate) data: Vec<u8>,
+    magic: u32,
 }
 
+/// Fast validity checks: one memory read against a magic word instead of a
+/// global registry lock per access. Bytes and buffers are currently never
+/// freed, so there is no scrub-on-free here yet; the field exists so stale
+/// or wild handles fail the compare instead of being dereferenced blindly.
 pub(crate) unsafe fn pith_bytes_ref<'a>(handle: i64) -> Option<&'a PithBytes> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::Bytes) {
+    let ptr = handle as *const ();
+    if !crate::handle_registry::plausibly_aligned::<PithBytes>(ptr)
+        || (*(handle as *const PithBytes)).magic != BYTES_MAGIC
+    {
         return None;
     }
     Some(&*(handle as *const PithBytes))
 }
 
 unsafe fn pith_byte_buffer_mut<'a>(handle: i64) -> Option<&'a mut PithByteBuffer> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::ByteBuffer) {
+    let ptr = handle as *const ();
+    if !crate::handle_registry::plausibly_aligned::<PithByteBuffer>(ptr)
+        || (*(handle as *const PithByteBuffer)).magic != BYTE_BUFFER_MAGIC
+    {
         return None;
     }
     Some(&mut *(handle as *mut PithByteBuffer))
@@ -38,8 +58,8 @@ pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
         data_ptr,
         data_len,
         data,
+        magic: BYTES_MAGIC,
     }));
-    handle_registry::register(ptr as *const (), HandleKind::Bytes);
     ptr as i64
 }
 
@@ -183,8 +203,10 @@ pub extern "C" fn pith_secure_random_bytes(count: i64) -> i64 {
 pub extern "C" fn pith_byte_buffer_new() -> i64 {
     ensure_perf_stats_registered();
     perf_count(&PERF_BYTE_BUFFER_NEWS, 1);
-    let ptr = Box::into_raw(Box::new(PithByteBuffer { data: Vec::new() }));
-    handle_registry::register(ptr as *const (), HandleKind::ByteBuffer);
+    let ptr = Box::into_raw(Box::new(PithByteBuffer {
+        data: Vec::new(),
+        magic: BYTE_BUFFER_MAGIC,
+    }));
     ptr as i64
 }
 
@@ -195,8 +217,8 @@ pub extern "C" fn pith_byte_buffer_with_capacity(capacity: i64) -> i64 {
     perf_count(&PERF_BYTE_BUFFER_NEWS, 1);
     let ptr = Box::into_raw(Box::new(PithByteBuffer {
         data: Vec::with_capacity(cap),
+        magic: BYTE_BUFFER_MAGIC,
     }));
-    handle_registry::register(ptr as *const (), HandleKind::ByteBuffer);
     ptr as i64
 }
 

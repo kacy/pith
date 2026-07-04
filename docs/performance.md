@@ -56,7 +56,7 @@ the generated code.
 |---|---|---|
 | baseline (july 2026) | 1273ms | 102ms |
 | opt_level=speed | 1236ms | 100ms |
-| drop per-access handle lock | | |
+| drop per-access handle lock | 888ms | 93ms |
 | single-allocation string derives | | |
 | inline collection elements | | |
 | arc object-list rework | | |

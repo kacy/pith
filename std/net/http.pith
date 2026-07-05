@@ -416,7 +416,7 @@ fn encode_multipart(parts: List[MultipartPart], boundary: String) -> Bytes!:
             out.write(part.body)!
         out.write_string_utf8(crlf)!
     out.write_string_utf8("--" + boundary + "--" + crlf)!
-    return out.bytes()
+    return out.take_bytes()
 
 fn header_key_matches(left: String, right: String) -> Bool:
     return left.to_lower() == right.to_lower()
@@ -1092,7 +1092,7 @@ fn read_chunked_body(reader: BufferedBytesReader) -> Bytes!:
             while true:
                 trailer := reader.read_until_bytes_including(nl)!
                 if trailer.is_empty() or chunk_line_is_blank(trailer):
-                    return out.bytes()
+                    return out.take_bytes()
         out.write(reader.read_exact_bytes(chunk_size)!)!
         consume_chunk_line_ending(reader)
 
@@ -1103,12 +1103,12 @@ fn read_exact_from_tls(conn: tls.Conn, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     out := bytes.buffer_with_capacity(count)
-    while out.bytes().len() < count:
-        chunk := conn.read_bytes(count - out.bytes().len())!
+    while out.len() < count:
+        chunk := conn.read_bytes(count - out.len())!
         if chunk.is_empty():
             fail "unexpected eof"
         out.write(chunk)!
-    return out.bytes()
+    return out.take_bytes()
 
 fn read_until_including_from_tls(conn: tls.Conn, sep: Bytes) -> Bytes!:
     if sep.is_empty():
@@ -1118,13 +1118,13 @@ fn read_until_including_from_tls(conn: tls.Conn, sep: Bytes) -> Bytes!:
     while true:
         chunk := conn.read_bytes(1)!
         if chunk.is_empty():
-            return out.bytes()
+            return out.take_bytes()
         out.write(chunk)!
         if window.len() >= sep.len():
             window = window.slice(1, window.len())
         window = window.concat(chunk)
         if window == sep:
-            return out.bytes()
+            return out.take_bytes()
 
 fn consume_chunk_line_ending_tls(conn: tls.Conn):
     ending := read_exact_from_tls(conn, 1) catch bytes.empty()
@@ -1145,7 +1145,7 @@ fn read_chunked_body_tls(conn: tls.Conn) -> Bytes!:
             while true:
                 trailer := read_until_including_from_tls(conn, nl)!
                 if trailer.is_empty() or chunk_line_is_blank(trailer):
-                    return out.bytes()
+                    return out.take_bytes()
         out.write(read_exact_from_tls(conn, chunk_size)!)!
         consume_chunk_line_ending_tls(conn)
 
@@ -1752,23 +1752,28 @@ fn find_request_head_end(raw: Bytes) -> Int:
     return find_request_head_end_from(raw, 0)
 
 fn read_request_head_buffered_bytes(reader: BufferedBytesReader) -> Bytes!:
+    # a rolling four-byte window finds the blank line without copying the
+    # accumulated head per byte (the old scan rebuilt the buffer's bytes
+    # on every iteration — quadratic allocation per request)
     buf := bytes.buffer_with_capacity(1024)
-    mut head_end := -1
-    mut scan_start := 0
-    while head_end < 0:
+    mut w1 := 0
+    mut w2 := 0
+    mut w3 := 0
+    mut w4 := 0
+    while true:
         chunk := reader.read_bytes(1)!
         if chunk.is_empty():
-            if buf.bytes().is_empty():
+            if buf.len() == 0:
                 return bytes.empty()
-            break
+            return buf.take_bytes()
         buf.write(chunk)!
-        head_end = find_request_head_end_from(buf.bytes(), scan_start)
-        scan_start = buf.bytes().len() - 3
-        if scan_start < 0:
-            scan_start = 0
-    if head_end < 0:
-        return buf.bytes()
-    return buf.bytes().slice(0, head_end)
+        w1 = w2
+        w2 = w3
+        w3 = w4
+        w4 = chunk[0]
+        if w1 == 13 and w2 == 10 and w3 == 13 and w4 == 10:
+            return buf.take_bytes()
+    return bytes.empty()
 
 fn stream_request_body_buffered(head_bytes: Bytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
     if uses_chunked_transfer_encoding(head_bytes):
@@ -1784,13 +1789,13 @@ fn read_request_from_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestB
         return build_http_request(head_bytes, read_chunked_body(reader)!)
     content_length := content_length_from_head_bytes(head_bytes)!
     body_buf := bytes.buffer_with_capacity(content_length)
-    while body_buf.bytes().len() < content_length:
-        remaining := content_length - body_buf.bytes().len()
+    while body_buf.len() < content_length:
+        remaining := content_length - body_buf.len()
         chunk := reader.read_bytes(remaining)!
         if chunk.is_empty():
             break
         body_buf.write(chunk)!
-    return build_http_request(head_bytes, body_buf.bytes())
+    return build_http_request(head_bytes, body_buf.take_bytes())
 fn read_request_from_buffered_string(reader: BufferedStringReader) -> HttpRequestBytes!:
     crlf := chr(13) + chr(10)
     request_line := reader.read_line()!

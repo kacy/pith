@@ -240,6 +240,25 @@ pub extern "C" fn pith_secure_random_bytes(count: i64) -> i64 {
 }
 
 #[no_mangle]
+/// Free a byte buffer: single-owner lifecycle, no refcount. After this
+/// call the handle is dead and fails the magic check.
+///
+/// # Safety
+/// handle must be a valid PithByteBuffer or garbage.
+#[no_mangle]
+pub unsafe extern "C" fn pith_byte_buffer_free(handle: i64) {
+    if pith_byte_buffer_mut(handle).is_none() {
+        return;
+    }
+    crate::perf_count(&crate::PERF_BYTE_BUFFER_FREES, 1);
+    // scrub the magic so a stale handle fails the validity check instead
+    // of touching freed memory
+    (*(handle as *mut PithByteBuffer)).magic = 0;
+    let _ = Box::from_raw(handle as *mut PithByteBuffer);
+}
+
+/// Allocate a fresh byte buffer.
+#[no_mangle]
 pub extern "C" fn pith_byte_buffer_new() -> i64 {
     ensure_perf_stats_registered();
     perf_count(&PERF_BYTE_BUFFER_NEWS, 1);
@@ -307,6 +326,26 @@ pub unsafe extern "C" fn pith_byte_buffer_write_byte(handle: i64, value: i64) ->
     perf_count(&PERF_BYTE_BUFFER_WRITE_BYTES, 1);
     buffer.data.push(value as u8);
     1
+}
+
+/// Extract the accumulated bytes (moving the storage, no copy) and free
+/// the buffer in one step: the natural end of a build-then-extract
+/// buffer's life.
+///
+/// # Safety
+/// handle must be a valid PithByteBuffer or garbage.
+#[no_mangle]
+pub unsafe extern "C" fn pith_byte_buffer_take_bytes(handle: i64) -> i64 {
+    if pith_byte_buffer_mut(handle).is_none() {
+        return 0;
+    }
+    // reclaim the whole box: the vec moves into the bytes object, the
+    // buffer allocation dies here, and the scrubbed magic makes any stale
+    // handle fail the validity check
+    (*(handle as *mut PithByteBuffer)).magic = 0;
+    let boxed = Box::from_raw(handle as *mut PithByteBuffer);
+    crate::perf_count(&crate::PERF_BYTE_BUFFER_FREES, 1);
+    pith_bytes_from_vec(boxed.data)
 }
 
 #[no_mangle]

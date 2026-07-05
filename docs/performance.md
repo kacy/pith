@@ -86,6 +86,18 @@ structs, which have no destructors — 545 bytes objects per request,
 all). struct destructors are the piece that flattens this line, and
 they're next.
 
+third landing (byte buffer lifecycle): buffers gain free() and
+take_bytes() — extract the accumulated bytes by moving the storage and
+free the buffer in one step — and every build-then-extract site in
+std/io and std/net/http uses them. the http head reader also lost a
+quadratic allocation pattern (it copied the whole accumulated head
+once per byte to scan for the blank line; a rolling four-byte window
+does it with none). 99% of byte buffers now reclaim, per-request bytes
+allocations halve, and server throughput roughly doubles. rss still
+grows ~25 kb/request: request and response structs hold their bytes,
+strings, and maps with no destructor to release them. that's the
+last piece.
+
 build times, same machine (go 1.24.4): go cold 10.6s / warm 0.1s; pith
 compiles the same program cold in 1.2s every time — 8.5x faster than
 go's cold build, with no incremental cache to go stale.

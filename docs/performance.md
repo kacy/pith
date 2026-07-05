@@ -98,6 +98,23 @@ grows ~25 kb/request: request and response structs hold their bytes,
 strings, and maps with no destructor to release them. that's the
 last piece.
 
+fourth landing (struct destructors): structs carry a refcount header
+— 24 bytes before the fields, so codegen offsets never move — with an
+optional destructor slot. types with rc fields get a generated
+destructor that releases each one; every struct type joins the same
+ownership discipline as strings and collections. result tuples (one
+three-slot allocation per fallible call) release at their try/catch
+consumption point, and the buffered readers' cache-overwrite leak
+closes with take-then-insert.
+
+the server benchmark across the whole arc: **277 req/s at the start,
+4,683 req/s now — 17x** — and rss growth per request fell from ~60 kb
+to ~3.4 kb. per 500 requests structs are 98.6% freed and bytes 99%.
+the compiler self-compile pays ~0.7s of rc traffic (2.0s → 2.7s). the
+remaining growth is strings held in header/query maps plus a few
+residual structs; the counters attribute them and they're the
+follow-up.
+
 build times, same machine (go 1.24.4): go cold 10.6s / warm 0.1s; pith
 compiles the same program cold in 1.2s every time — 8.5x faster than
 go's cold build, with no incremental cache to go stale.

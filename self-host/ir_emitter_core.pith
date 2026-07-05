@@ -72,12 +72,14 @@ mut ir_map_value_types: Map[String, String] := {} # map variable name -> value t
 mut ir_boxed_enums: Map[String, Bool] := {}
 mut ir_enum_payload_kinds: Map[String, String] := {} # "Shape.Circle" -> "float,string"
 
-# string locals owned by the current function, in binding order. collected
-# by a pre-pass before the body emits so every name can be zero-stored in
-# the prologue; that makes the release loads at each return valid on every
-# path (releasing 0 is a no-op). a list, not a map, so cleanup order is
-# deterministic and the emitted ir stays bootstrap-stable.
+# rc-managed locals owned by the current function, in binding order, with a
+# parallel kind list (string/list/map/set). collected by a pre-pass before
+# the body emits so every name can be zero-stored in the prologue; that
+# makes the release loads at each return valid on every path (releasing 0
+# is a no-op). lists, not maps, so cleanup order is deterministic and the
+# emitted ir stays bootstrap-stable.
 mut ir_string_locals: List[String] := []
+mut ir_rc_local_kinds: List[String] := []
 
 # --- module globals collected during the prepass ---
 mut ir_global_int_names: List[String] := []
@@ -465,6 +467,57 @@ fn ir_string_retain_reg(r: Int):
 fn ir_string_release_reg(r: Int):
     ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
 
+# collections are shared handles with real refcounts; strings are
+# copy-on-derive with a header count. one kind tag picks the operation.
+fn ir_rc_kind(type_hint: String) -> String:
+    if type_hint == "string":
+        return "string"
+    if type_hint == "list" or type_hint == "list_string":
+        return "list"
+    if type_hint == "map" or type_hint == "map_int":
+        return "map"
+    if type_hint == "set" or type_hint == "set_int":
+        return "set"
+    return ""
+
+# release emission per kind is staged: strings first (landed), collections
+# once their containers are tagged so element counts balance.
+fn ir_rc_release_enabled(kind: String) -> Bool:
+    return kind == "string"
+
+fn ir_rc_retain_reg(r: Int, kind: String):
+    if kind == "string":
+        ir_emit_call1(ir_reg(), "__cstring_retain", "void", r)
+    elif kind == "list":
+        ir_emit_call1(ir_reg(), "pith_list_retain_handle", "void", r)
+    elif kind == "map":
+        ir_emit_call1(ir_reg(), "pith_map_retain_handle", "void", r)
+    elif kind == "set":
+        ir_emit_call1(ir_reg(), "pith_set_retain_handle", "void", r)
+
+fn ir_rc_release_reg(r: Int, kind: String):
+    if kind == "string":
+        ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
+    elif kind == "list":
+        ir_emit_call1(ir_reg(), "pith_list_release_handle", "void", r)
+    elif kind == "map":
+        ir_emit_call1(ir_reg(), "pith_map_release_handle", "void", r)
+    elif kind == "set":
+        ir_emit_call1(ir_reg(), "pith_set_release_handle", "void", r)
+
+fn ir_rc_local_kind(name: String) -> String:
+    mut i := 0
+    while i < ir_string_locals.len():
+        if ir_string_locals[i] == name and i < ir_rc_local_kinds.len():
+            return ir_rc_local_kinds[i]
+        i = i + 1
+    return ""
+
+fn ir_rc_track_local(name: String, kind: String):
+    if not ir_string_locals.contains(name):
+        ir_string_locals.push(name)
+        ir_rc_local_kinds.push(kind)
+
 # true when the expression reads a value some other owner keeps a count
 # for: variables, collection elements, struct fields. anything else that
 # produces a string (concat, substring, to_string, ...) hands us a fresh
@@ -500,18 +553,21 @@ fn ir_string_method_returns_fresh(mname: String) -> Bool:
         return true
     return false
 
-fn ir_string_local_tracked(name: String) -> Bool:
-    return ir_string_locals.contains(name)
-
 # release every owned string local before a return, minus the one being
 # returned (its count transfers to the caller). the prologue zero-stores
 # each tracked name, so the loads are valid on every path.
 fn ir_emit_string_cleanup(exclude: String):
-    for name in ir_string_locals:
-        if name != exclude:
+    mut i := 0
+    while i < ir_string_locals.len():
+        name := ir_string_locals[i]
+        mut kind := "string"
+        if i < ir_rc_local_kinds.len():
+            kind = ir_rc_local_kinds[i]
+        if name != exclude and ir_rc_release_enabled(kind):
             r := ir_reg()
             ir_emit("load " + r.to_string() + " " + ir_resolve_storage_name(name))
-            ir_string_release_reg(r)
+            ir_rc_release_reg(r, kind)
+        i = i + 1
 
 # pre-pass: names of string-typed binds anywhere in the body. an
 # under-approximation is safe — a missed name is never released (a leak),
@@ -523,11 +579,11 @@ fn ir_string_prepass_bind_type(parts: IrBindParts, names: List[String]) -> Strin
         bind_type = ir_resolve_type_node(parts.type_idx)
     if bind_type.len() == 0 and parts.val_idx >= 0:
         # the collected names double as a type environment: a bind from an
-        # already-collected string chains its tracking, so a later rebind of
-        # the source cannot release a buffer this variable still borrows.
+        # already-collected name chains its tracking (and kind), so a later
+        # rebind of the source cannot release a value this variable shares.
         val_node := get_node(parts.val_idx)
         if val_node.kind == "ident" and names.contains(val_node.value):
-            bind_type = "string"
+            bind_type = ir_rc_local_kind(val_node.value)
         else:
             bind_type = ir_infer_type(parts.val_idx)
     return bind_type
@@ -537,15 +593,18 @@ fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[St
     if ir_is_binding_kind(node.kind):
         parts := ir_collect_bind_parts(node)
         if parts.name.len() > 0:
-            bind_type := ir_string_prepass_bind_type(parts, names)
-            if bind_type == "string":
-                if not names.contains(parts.name):
-                    names.push(parts.name)
+            kind := ir_rc_kind(ir_string_prepass_bind_type(parts, names))
+            if kind.len() > 0:
+                if names.contains(parts.name):
+                    if ir_rc_local_kind(parts.name) != kind and not poisoned.contains(parts.name):
+                        # same name, different rc kind in a sibling branch:
+                        # tracking it would fire the wrong retain/release at
+                        # runtime. drop it — a leak, never a wild pointer.
+                        poisoned.push(parts.name)
+                else:
+                    ir_rc_track_local(parts.name, kind)
             elif not poisoned.contains(parts.name):
-                # the same name bound with a non-string (or unknown) type in
-                # a sibling branch would make retain/release fire on values
-                # that are not strings at runtime. drop it from tracking
-                # entirely — a leak, never a wild pointer.
+                # bound with a non-rc (or unknown) type somewhere: same rule.
                 poisoned.push(parts.name)
     for child in node.children:
         ir_collect_string_bind_names(child, names, poisoned)
@@ -569,8 +628,10 @@ fn ir_collect_reassigned_string_params(idx: Int, names: List[String]):
         if tn.kind == "ident":
             target = tn.value
     if target.len() > 0 and not names.contains(target):
-        if ir_var_regs.contains_key(target) and ir_lookup_name_type(target) == "string":
-            names.push(target)
+        if ir_var_regs.contains_key(target):
+            kind := ir_rc_kind(ir_lookup_name_type(target))
+            if kind.len() > 0:
+                ir_rc_track_local(target, kind)
     for child in node.children:
         ir_collect_reassigned_string_params(child, names)
 
@@ -581,10 +642,18 @@ fn ir_emit_string_prologue(body_idx: Int):
         ir_collect_string_bind_names(body_idx, ir_string_locals, poisoned)
     if poisoned.len() > 0:
         mut kept: List[String] := []
-        for name in ir_string_locals:
-            if not poisoned.contains(name):
-                kept.push(name)
+        mut kept_kinds: List[String] := []
+        mut pi := 0
+        while pi < ir_string_locals.len():
+            if not poisoned.contains(ir_string_locals[pi]):
+                kept.push(ir_string_locals[pi])
+                if pi < ir_rc_local_kinds.len():
+                    kept_kinds.push(ir_rc_local_kinds[pi])
+                else:
+                    kept_kinds.push("string")
+            pi = pi + 1
         ir_string_locals = kept
+        ir_rc_local_kinds = kept_kinds
     mut i := 0
     while i < ir_string_locals.len():
         name := ir_string_locals[i]
@@ -592,7 +661,7 @@ fn ir_emit_string_prologue(body_idx: Int):
             # param: retain the caller's value, no zero-store
             r := ir_reg()
             ir_emit("load " + r.to_string() + " " + ir_resolve_storage_name(name))
-            ir_string_retain_reg(r)
+            ir_rc_retain_reg(r, ir_rc_local_kind(name))
         else:
             z := ir_reg()
             ir_emit("iconst " + z.to_string() + " 0")
@@ -1462,10 +1531,11 @@ fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String]):
     for capture_name, i in captures:
         cap_val := ir_reg()
         ir_emit("load " + cap_val.to_string() + " " + capture_name)
-        # the closure environment keeps its own count on captured strings so
-        # the origin scope's cleanup cannot pull them out from under it
-        if ir_lookup_name_type(capture_name) == "string":
-            ir_string_retain_reg(cap_val)
+        # the closure environment keeps its own count on captured rc values
+        # so the origin scope's cleanup cannot pull them out from under it
+        cap_kind := ir_rc_kind(ir_lookup_name_type(capture_name))
+        if cap_kind.len() > 0:
+            ir_rc_retain_reg(cap_val, cap_kind)
         slot := ir_reg()
         ir_emit("iconst " + slot.to_string() + " " + i.to_string())
         ir_emit_call3(ir_reg(), "__closure_set_env", "void", closure_r, slot, cap_val)
@@ -3284,8 +3354,10 @@ fn ir_emit_tuple_stores(tuple_r: Int, elem_regs: List[Int]):
 
 fn ir_emit_tuple_literal_stores(tuple_r: Int, elem_regs: List[Int], elem_nodes: List[Int]):
     for elem_reg, i in elem_regs:
-        if i < elem_nodes.len() and ir_infer_type(elem_nodes[i]) == "string":
-            ir_string_retain_reg(elem_reg)
+        if i < elem_nodes.len():
+            tuple_kind := ir_rc_kind(ir_infer_type(elem_nodes[i]))
+            if tuple_kind.len() > 0:
+                ir_rc_retain_reg(elem_reg, tuple_kind)
         ir_emit("sstore " + tuple_r.to_string() + " " + i.to_string() + " " + elem_reg.to_string())
 
 fn ir_emit_tuple_literal(node: Node) -> Int:
@@ -3330,10 +3402,11 @@ fn ir_emit_variant_construction(node: Node, enum_name: String, variant_key: Stri
         arg_idx := ir_method_call_arg_expr(node, i)
         if arg_idx >= 0:
             arg_r := ir_expr(arg_idx)
-            # the enum value owns a count on string payloads, same as any
+            # the enum value owns a count on rc payloads, same as any
             # other struct-shaped store
-            if kinds[i] == "string" and ir_string_expr_is_borrowed(arg_idx):
-                ir_string_retain_reg(arg_r)
+            payload_kind := ir_rc_kind(kinds[i])
+            if payload_kind.len() > 0 and ir_string_expr_is_borrowed(arg_idx):
+                ir_rc_retain_reg(arg_r, payload_kind)
             ir_emit("sstore " + r.to_string() + " " + (i + 1).to_string() + " " + arg_r.to_string())
         i = i + 1
     return r
@@ -4047,7 +4120,9 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
     saved_string_locals := ir_string_locals
+    saved_rc_kinds := ir_rc_local_kinds
     ir_string_locals = []
+    ir_rc_local_kinds = []
     ir_reset_lambda_emit_state()
     ir_emit_func_header(lambda_name, parts.params.len() + 1, "unknown")
     ir_emit_lambda_hidden_param()
@@ -4057,6 +4132,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_emit_lambda_default_return()
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
     ir_string_locals = saved_string_locals
+    ir_rc_local_kinds = saved_rc_kinds
     # return closure handle and fill captures
     r := ir_reg()
     ir_emit("closure_ref " + r.to_string() + " " + lambda_name)
@@ -4204,8 +4280,9 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int]) -> Int:
                 value_node = an.children[0]
         if value_node >= 0:
             fr := ir_emit_value_for_target(value_node, field_type)
-            if field_type == "string" and ir_string_expr_is_borrowed(value_node):
-                ir_string_retain_reg(fr)
+            named_field_kind := ir_rc_kind(field_type)
+            if named_field_kind.len() > 0 and ir_string_expr_is_borrowed(value_node):
+                ir_rc_retain_reg(fr, named_field_kind)
             field_regs.push(fr)
         else:
             default_idx := ir_struct_field_default_node(sname, field_name)
@@ -4238,8 +4315,9 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int]) -> Int:
         elif cn.kind == "arg" and cn.children.len() > 0:
             value_idx = cn.children[0]
         fr := ir_emit_value_for_target(value_idx, ftype)
-        if ftype == "string" and ir_string_expr_is_borrowed(value_idx):
-            ir_string_retain_reg(fr)
+        pos_field_kind := ir_rc_kind(ftype)
+        if pos_field_kind.len() > 0 and ir_string_expr_is_borrowed(value_idx):
+            ir_rc_retain_reg(fr, pos_field_kind)
         field_regs.push(fr)
         field_idx = field_idx + 1
     total_fields := ir_struct_field_count(sname)
@@ -4809,11 +4887,12 @@ fn ir_emit_return_stmt(node: Node):
         # a fresh count. fresh results already arrive owned.
         mut exclude := ""
         expr_node := get_node(node.children[0])
-        if ir_infer_type(node.children[0]) == "string":
-            if expr_node.kind == "ident" and ir_string_local_tracked(expr_node.value):
+        ret_kind := ir_rc_kind(ir_infer_type(node.children[0]))
+        if ret_kind.len() > 0:
+            if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == ret_kind:
                 exclude = expr_node.value
             elif ir_string_expr_is_borrowed(node.children[0]):
-                ir_string_retain_reg(r)
+                ir_rc_retain_reg(r, ret_kind)
         result_kind := ir_expr_result_kind(node.children[0])
         expr_tid := c_get_expr_type(node.children[0])
         mut expr_kind := ""
@@ -4854,16 +4933,17 @@ fn ir_emit_bind_stmt(node: Node):
         # the binding) owns a count on its previous value; capture it before
         # the new value lands, release it after the new value is retained so
         # a self-referencing bind stays alive.
-        tracked := ir_string_local_tracked(name)
+        bind_kind := ir_rc_local_kind(name)
+        tracked := bind_kind.len() > 0
         mut old_r := 0 - 1
-        if tracked:
+        if tracked and ir_rc_release_enabled(bind_kind):
             old_r = ir_reg()
             ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
         r := ir_emit_value_for_target(val_idx, target_type)
         if tracked and ir_string_expr_is_borrowed(val_idx):
-            ir_string_retain_reg(r)
+            ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:
-            ir_string_release_reg(old_r)
+            ir_rc_release_reg(old_r, bind_kind)
         ir_var_regs.insert(name, r)
         ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
         if not ir_var_types.contains_key(name):
@@ -4879,17 +4959,18 @@ fn ir_emit_assign_stmt(node: Node):
     if node.children.len() > 0:
         # same ownership dance as rebinding; string globals get the
         # retain/release pair too but are never in the exit cleanup.
-        is_string := ir_lookup_name_type(name) == "string"
-        tracked := ir_string_local_tracked(name)
+        legacy_kind := ir_rc_kind(ir_lookup_name_type(name))
+        tracked := ir_rc_local_kind(name).len() > 0
         mut old_r := 0 - 1
-        if is_string and (tracked or ir_global_string_names.contains(name)):
-            old_r = ir_reg()
-            ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
+        if legacy_kind.len() > 0 and ir_rc_release_enabled(legacy_kind):
+            if tracked or (legacy_kind == "string" and ir_global_string_names.contains(name)):
+                old_r = ir_reg()
+                ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
         r := ir_emit_value_for_target(node.children[0], ir_lookup_name_type(name))
-        if is_string and ir_string_expr_is_borrowed(node.children[0]):
-            ir_string_retain_reg(r)
+        if legacy_kind.len() > 0 and ir_string_expr_is_borrowed(node.children[0]):
+            ir_rc_retain_reg(r, legacy_kind)
         if old_r >= 0:
-            ir_string_release_reg(old_r)
+            ir_rc_release_reg(old_r, legacy_kind)
         ir_var_regs.insert(name, r)
         ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
 
@@ -4934,8 +5015,9 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
     if value_type.len() == 0:
         value_type = ir_infer_type(value_idx)
     value_r := ir_emit_value_for_target(value_idx, value_type)
-    if value_type == "string" and ir_string_expr_is_borrowed(value_idx):
-        ir_string_retain_reg(value_r)
+    fassign_kind := ir_rc_kind(value_type)
+    if fassign_kind.len() > 0 and ir_string_expr_is_borrowed(value_idx):
+        ir_rc_retain_reg(value_r, fassign_kind)
     ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + value_r.to_string())
     return true
 
@@ -4972,19 +5054,20 @@ fn ir_emit_compound_assignment(node: Node):
         # same ownership dance as ir_emit_bind_stmt: retain a borrowed RHS,
         # release the value being replaced. this is the path plain
         # `name = value` statements actually take.
-        mut is_string := target_type == "string"
-        if not is_string:
-            is_string = ir_lookup_name_type(name) == "string"
-        tracked := ir_string_local_tracked(name)
+        mut assign_kind := ir_rc_kind(target_type)
+        if assign_kind.len() == 0:
+            assign_kind = ir_rc_kind(ir_lookup_name_type(name))
+        tracked := ir_rc_local_kind(name).len() > 0
         mut old_r := 0 - 1
-        if is_string and (tracked or ir_global_string_names.contains(name)):
-            old_r = ir_reg()
-            ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
+        if assign_kind.len() > 0 and ir_rc_release_enabled(assign_kind):
+            if tracked or (assign_kind == "string" and ir_global_string_names.contains(name)):
+                old_r = ir_reg()
+                ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
         r := ir_emit_value_for_target(node.children[1], target_type)
-        if is_string and ir_string_expr_is_borrowed(node.children[1]):
-            ir_string_retain_reg(r)
+        if assign_kind.len() > 0 and ir_string_expr_is_borrowed(node.children[1]):
+            ir_rc_retain_reg(r, assign_kind)
         if old_r >= 0:
-            ir_string_release_reg(old_r)
+            ir_rc_release_reg(old_r, assign_kind)
         ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
         return
     compound_op := ir_compound_assignment_ir_op(op)
@@ -5718,6 +5801,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_var_types = {}
     ir_map_value_types = {}
     ir_string_locals = []
+    ir_rc_local_kinds = []
     ir_seed_global_types()
     ir_current_func_return_kind = ret_type
     ir_current_func_optional_inner_kind = ""

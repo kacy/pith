@@ -73,8 +73,18 @@ short-lived bytes cuts the page-zeroing tax — but rss still grows
 unbounded. the remaining pin is std/io's handle registries: every
 reader and writer inserts into global maps that nothing removes, so
 each request's buffers stay reachable. that needs a remove-with-
-transfer primitive (`take`) on maps and a handle lifecycle in std/io,
-which is the next leg.
+transfer primitive (`take`) on maps and a handle lifecycle in std/io.
+
+second landing (map take + io handle lifecycle): maps gain `take(k)`
+— remove with the value's count transferred, the reclaim-safe way to
+drop a registry entry — and buffered readers and writers gain
+`free()`, called by the http request and response paths. correct and
+necessary, but the server still grows: per-request counters attribute
+the remaining leak to request/response structs (bytes fields held by
+structs, which have no destructors — 545 bytes objects per request,
+73% never freed) and byte buffers (92 per request, no refcounts at
+all). struct destructors are the piece that flattens this line, and
+they're next.
 
 build times, same machine (go 1.24.4): go cold 10.6s / warm 0.1s; pith
 compiles the same program cold in 1.2s every time — 8.5x faster than

@@ -1832,7 +1832,11 @@ pub fn read_request_buffered_bytes_into(reader: BufferedBytesReader, writer: Buf
 pub fn read_request_bytes(fd: Int) -> HttpRequestBytes!:
     stream := io.from_fd(fd)
     reader := stream.buffered_bytes_reader_chunked(512)
-    return read_request_from_buffered_bytes(reader)
+    # the request fully materializes its head and body, so the reader's
+    # registry entries can be dropped before returning
+    req := read_request_from_buffered_bytes(reader)
+    reader.free()
+    return req
 
 # reads one request from a file descriptor and streams the body into a writer.
 pub fn read_request_bytes_into(fd: Int, writer: BufferedBytesWriter) -> StreamedHttpRequest!:
@@ -1941,6 +1945,7 @@ pub fn send_response_bytes(fd: Int, response: Bytes) -> Int!:
     writer := stream.buffered_bytes_writer()
     written := writer.write_all_bytes(response)!
     writer.flush()!
+    writer.free()
     tcp_close(fd)
     return written
 # sends a raw response string to a file descriptor.

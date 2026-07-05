@@ -1010,6 +1010,10 @@ fn check_statement(node_idx: Int, scope_id: Int):
         check_if_statement(node, scope_id)
     elif node.kind == "while_stmt":
         check_while_statement(node, scope_id)
+    elif node.kind == "if_let":
+        check_if_let_statement(node, scope_id)
+    elif node.kind == "while_let":
+        check_while_let_statement(node, scope_id)
     elif node.kind == "for_stmt":
         check_for_statement(node, scope_id)
     elif node.kind == "break":
@@ -1253,6 +1257,51 @@ fn check_while_statement(node: Node, scope_id: Int):
     if body_node.kind == "body":
         check_function_body(node.children[1], loop_scope)
     elif body_node.kind == "block":
+        check_block_statement(body_node, loop_scope)
+
+# if let / while let: a one-pattern conditional. a variant pattern matches
+# and destructures like a match arm; a bare binding unwraps an optional
+# subject. bindings are visible only in the matched branch (loop body).
+fn check_let_pattern(pat_idx: Int, subj_idx: Int, branch_scope: Int, outer_scope: Int, form: String):
+    subj_type := c_check_expr(subj_idx, outer_scope)
+    if is_error_type(subj_type):
+        return
+    pat := get_node(pat_idx)
+    if pat.kind == "pat_variant":
+        check_pattern_match(pat_idx, subj_type, branch_scope)
+        return
+    if pat.kind == "pat_binding":
+        info := get_type_info(subj_type)
+        if info.kind == "optional":
+            define_binding(branch_scope, pat.value, info.inner, false)
+            return
+        report_error("E245", form + " with a bare binding needs an optional subject, got " + get_type_name(subj_type))
+        return
+    report_error("E245", form + " supports variant patterns and optional bindings")
+
+fn check_if_let_statement(node: Node, scope_id: Int):
+    # children: [pattern, subject, then-block, else-block?]
+    if node.children.len() < 3:
+        return
+    then_scope := create_scope(scope_id)
+    check_let_pattern(node.children[0], node.children[1], then_scope, scope_id, "if let")
+    then_node := get_node(node.children[2])
+    if then_node.kind == "block":
+        check_block_statement(then_node, then_scope)
+    if node.children.len() > 3:
+        else_scope := create_scope(scope_id)
+        else_node := get_node(node.children[3])
+        if else_node.kind == "block":
+            check_block_statement(else_node, else_scope)
+
+fn check_while_let_statement(node: Node, scope_id: Int):
+    # children: [pattern, subject, body]
+    if node.children.len() < 3:
+        return
+    loop_scope := create_loop_scope(scope_id)
+    check_let_pattern(node.children[0], node.children[1], loop_scope, scope_id, "while let")
+    body_node := get_node(node.children[2])
+    if body_node.kind == "block":
         check_block_statement(body_node, loop_scope)
 
 # ---------------------------------------------------------------

@@ -166,8 +166,10 @@ block         = NEWLINE , INDENT , { statement , NEWLINE } , DEDENT ;
 statement     = binding
               | assignment
               | if_stmt
+              | if_let_stmt
               | for_stmt
               | while_stmt
+              | while_let
               | match_stmt
               | return_stmt
               | fail_stmt
@@ -188,6 +190,11 @@ if_stmt       = "if" , expression , ":" , block
               , { "elif" , expression , ":" , block }
               , [ "else" , ":" , block ] ;
 
+(* one-pattern conditional. a variant pattern destructures like a match   *)
+(* arm; a bare binding unwraps an optional subject.                       *)
+if_let_stmt   = "if" , "let" , pattern , "=" , expression , ":" , block
+              , [ "else" , ":" , block ] ;
+
 (* for iterates a value (any type providing `fn next() -> T?`) or a range. *)
 (* `..` is exclusive of the upper bound, `..=` inclusive. ranges appear    *)
 (* only in this position, not as free-standing expressions.                *)
@@ -195,6 +202,7 @@ for_stmt      = "for" , IDENT , [ "," , IDENT ] , "in" , for_iterable , ":" , bl
 for_iterable  = expression , [ ( ".." | "..=" ) , expression ] ;
 
 while_stmt    = "while" , expression , ":" , block ;
+while_let     = "while" , "let" , pattern , "=" , expression , ":" , block ;
 
 match_stmt    = "match" , expression , ":" , NEWLINE
               , INDENT , { match_arm , NEWLINE } , DEDENT ;

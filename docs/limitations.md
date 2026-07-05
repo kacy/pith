@@ -21,8 +21,10 @@ something here that now works, the page is stale and a fix to it is welcome.
 - **range patterns in match** — `0..=9 => ...` is not parsed. range syntax works
   in `for`, not in match arms. (or-patterns like `1 | 2 | 3 => ...` do work, for
   literals and qualified variants.)
-- **`if let` / `while let`** — there is no pattern-binding unwrap. unwrap an
-  optional with an explicit check: `if x != none: ... x.value()`.
+- **`if let` / `while let` are statement-only** — `if let Shape.Circle(r) = s:`
+  destructures a variant and `if let v = maybe():` unwraps an optional, but
+  neither form works as an expression, and literal patterns are not allowed
+  in the let position.
 - **closure capture cap** — a closure captures at most 16 variables. captures
   are heap-allocated per closure instance, so nesting and recursion are safe;
   the cap is a fixed ceiling, not a correctness issue.

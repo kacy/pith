@@ -45,6 +45,8 @@ impl Hash for MapKey {
 pub struct MapImpl {
     /// Magic word for the fast validity check (see map_magic_ok)
     magic: u32,
+    /// Shared-handle refcount (see ListImpl.rc)
+    rc: std::sync::atomic::AtomicU32,
     /// The actual hash map storing key -> value mappings
     data: HashMap<MapKey, Vec<u8>>,
     /// Specialized storage for int-key maps with 8-byte scalar values
@@ -73,6 +75,7 @@ impl MapImpl {
         };
         MapImpl {
             magic: MAP_MAGIC,
+            rc: std::sync::atomic::AtomicU32::new(1),
             data: HashMap::new(),
             int_values8,
             key_type,
@@ -377,6 +380,17 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     let Some(impl_ref) = map_mut(map) else {
         return;
     };
+    let prev = impl_ref
+        .rc
+        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    if prev > 1 {
+        return;
+    }
+    if prev == 0 {
+        impl_ref.rc.store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
 
     // Release all values if they're heap types
     if impl_ref.val_is_heap {
@@ -391,6 +405,24 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     (*(map.ptr as *mut MapImpl)).magic = 0;
     handle_registry::unregister(map.ptr as *const (), HandleKind::Map);
     let _ = Box::from_raw(map.ptr as *mut MapImpl);
+}
+
+/// Retain a map handle: one more owner of this shared handle.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_retain_handle(handle: i64) {
+    if let Some(impl_ref) = map_mut_from_handle(handle) {
+        impl_ref
+            .rc
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Release a map handle; frees the map and its owned values at zero.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_release_handle(handle: i64) {
+    pith_map_release(PithMap {
+        ptr: handle as *mut (),
+    });
 }
 
 /// Destructor for map elements in collections

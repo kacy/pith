@@ -46,6 +46,7 @@ pub fn to_list[I: Iterator[T], T](it: I) -> List[T]:
 # the eager free-function `map` / `filter` builtins on List from earlier in the
 # language.
 
+# Lazy map adapter: yields f(x) for each x the source iterator yields.
 pub struct MapIter[I, T, U]:
     src: I
     f: fn(T) -> U
@@ -57,9 +58,11 @@ impl Iterator[U] for MapIter:
             return none
         return self.f(n.value())
 
+# Wrap an iterator so each yielded value passes through f.
 pub fn map_iter[I: Iterator[T], T, U](src: I, f: fn(T) -> U) -> MapIter[I, T, U]:
     return MapIter[I, T, U](src, f)
 
+# Lazy filter adapter: yields only the source values that satisfy p.
 pub struct FilterIter[I, T]:
     src: I
     p: fn(T) -> Bool
@@ -76,5 +79,6 @@ impl Iterator[T] for FilterIter:
             n = self.src.next()
         return none
 
+# Wrap an iterator so only values satisfying p come through.
 pub fn filter_iter[I: Iterator[T], T](src: I, p: fn(T) -> Bool) -> FilterIter[I, T]:
     return FilterIter[I, T](src, p)

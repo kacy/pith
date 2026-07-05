@@ -1164,6 +1164,15 @@ fn check_return_statement(node: Node, scope_id: Int):
     actual := c_check_expr(node.children[0], scope_id)
     actual_node := get_node(node.children[0])
     exp_info := get_type_info(expected)
+    # an empty collection literal in return position takes its type from
+    # the declared return type; recording it lets the emitter create the
+    # container tagged so it owns its elements (`return []` was producing
+    # untagged List[String] buffers).
+    if actual_node.kind == "list" or actual_node.kind == "map" or actual_node.kind == "set":
+        if actual_node.children.len() == 0 and is_error_type(actual):
+            if exp_info.kind == "list" or exp_info.kind == "map" or exp_info.kind == "set":
+                expression_type_cache.insert(node.children[0], expected)
+                return
     if actual_node.kind == "none_lit":
         if exp_info.kind == "optional":
             return

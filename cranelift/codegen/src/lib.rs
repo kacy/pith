@@ -104,8 +104,12 @@ pub fn declare_string_data(
 ) -> Result<FuncId, CompileError> {
     use cranelift_module::DataDescription;
 
-    // Create null-terminated string data
-    let mut data = content.as_bytes().to_vec();
+    // Sixteen zero bytes precede the characters: a released string is
+    // identified by a magic word at ptr-16, and a literal must never
+    // accidentally match it through whatever the linker happens to place
+    // before its data. the returned address skips the pad.
+    let mut data = vec![0u8; 16];
+    data.extend_from_slice(content.as_bytes());
     data.push(0); // Null terminator
 
     let mut data_desc = DataDescription::new();
@@ -135,9 +139,10 @@ pub fn declare_string_data(
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
-        // Get address of data
+        // Get address of data (skipping the 16-byte anti-magic pad)
         let data_ref = module.declare_data_in_func(data_id, builder.func);
-        let addr = builder.ins().global_value(types::I64, data_ref);
+        let base = builder.ins().global_value(types::I64, data_ref);
+        let addr = builder.ins().iadd_imm(base, 16);
 
         builder.ins().return_(&[addr]);
 

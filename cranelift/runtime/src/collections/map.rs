@@ -477,6 +477,13 @@ pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, v
     // released (a borrow may still be live) and leaks
     if impl_ref.val_is_heap {
         crate::pith_cstring_retain(value as *const i8);
+        if std::env::var("PITH_MAP_TRACE").is_ok() {
+            let kb = match &map_key {
+                MapKey::String(b) => String::from_utf8_lossy(b).into_owned(),
+                MapKey::Int(n) => n.to_string(),
+            };
+            eprintln!("map_ins {:?} -> {:p}", kb, value as *const i8);
+        }
     }
     let val_bytes = value.to_le_bytes().to_vec();
     impl_ref.insert(map_key, val_bytes);
@@ -502,7 +509,15 @@ pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i
 
     match impl_ref.get(&map_key) {
         Some(val_data) if val_data.len() >= 8 => {
-            i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]))
+            let v = i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]));
+            if impl_ref.val_is_heap && std::env::var("PITH_MAP_TRACE").is_ok() {
+                let kb = match &map_key {
+                    MapKey::String(b) => String::from_utf8_lossy(b).into_owned(),
+                    MapKey::Int(n) => n.to_string(),
+                };
+                eprintln!("map_get {:?} -> {:p}", kb, v as *const i8);
+            }
+            v
         }
         _ => 0,
     }

@@ -497,7 +497,7 @@ fn ir_rc_retain_reg(r: Int, kind: String):
 
 fn ir_rc_release_reg(r: Int, kind: String):
     if kind == "string":
-        ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
+        ir_string_release_reg(r)
     elif kind == "list":
         ir_emit_call1(ir_reg(), "pith_list_release_handle", "void", r)
     elif kind == "map":
@@ -545,6 +545,12 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
     # the reverse dangles a pointer.
     if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
         return false
+    if node.kind == "index" and node.children.len() > 0:
+        # s[i] on a string mints a fresh char (char_at); container indexing
+        # borrows the element. mirrors ir_emit_index_expr's dispatch.
+        if ir_expr_is_fresh_string_index(idx):
+            return false
+        return true
     if node.kind == "binary" or node.kind == "interp" or node.kind == "string_interp":
         return false
     if node.kind == "grouped" and node.children.len() > 0:
@@ -795,6 +801,26 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
 
 fn ir_emit_resolved_call(result_reg: Int, fname: String, idx: Int, arg_regs: List[Int], uses_result_abi: Bool):
     ir_emit_call_text(result_reg, fname, ir_call_retkind_for_name(idx, uses_result_abi, fname), arg_regs.len(), ir_join_arg_regs(arg_regs))
+
+# owned string arguments (fresh chars from s[i], concat results, fresh
+# method results) die once the call they fed returns: callees borrow their
+# params, and storing callees add their own count. pairs registers with the
+# same child walk ir_collect_call_arg_regs used.
+fn ir_release_owned_string_args(node: Node, start_idx: Int, arg_regs: List[Int]):
+    mut reg_i := 0
+    for child, i in node.children:
+        if i < start_idx:
+            continue
+        if reg_i >= arg_regs.len():
+            return
+        mut expr_idx := child
+        cn := get_node(child)
+        if cn.kind == "arg":
+            if cn.children.len() == 0:
+                continue
+            expr_idx = cn.children[0]
+        ir_release_owned_string_operand(expr_idx, arg_regs[reg_i], ir_infer_type(expr_idx))
+        reg_i = reg_i + 1
 
 fn ir_register_struct_layout(name: String, field_names: List[String], field_types: List[String]):
     if ir_struct_names.contains_key(name):
@@ -1606,6 +1632,42 @@ fn ir_emit_binary_neq(result_reg: Int, left_r: Int, right_r: Int, is_str_op: Boo
         return
     ir_emit("neq " + result_reg.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
 
+# an owned string operand (a fresh char from s[i], a concat result, a
+# fresh method result) dies once the operation that consumed it emits.
+# this is the loop-condition reclaim: `while s[i] == ":"` builds a fresh
+# char every iteration, and the release lands in the same block as the
+# compare, so dominance is never in question.
+# true only for s[i] with a string receiver: that lowers to char_at,
+# which always mints a fresh one-char string. everything else keeps the
+# general borrowed-by-default classification.
+fn ir_expr_is_fresh_string_index(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind != "index" or node.children.len() == 0:
+        return false
+    # inside generic or specialized bodies the checked types are suppressed
+    # and inference can misname a map or list receiver as a string; a wrong
+    # answer here frees a container's element, so freshness requires the
+    # non-generic certainty path.
+    if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+        return false
+    # replicate ir_emit_index_expr's dispatch exactly: checked type first,
+    # inference as fallback.
+    mut obj_type := ir_checked_type(node.children[0])
+    if obj_type.len() == 0:
+        obj_type = ir_infer_type(node.children[0])
+    return obj_type == "string"
+
+fn ir_binary_op_is_comparison(simple_op: String) -> Bool:
+    return simple_op == "lt" or simple_op == "gt" or simple_op == "lte" or simple_op == "gte"
+
+fn ir_release_owned_string_operand(expr_idx: Int, reg: Int, expr_type: String):
+    if expr_type == "string" and not ir_string_expr_is_borrowed(expr_idx):
+        ir_string_release_reg(reg)
+    elif ir_expr_is_fresh_string_index(expr_idx):
+        # loop-condition reclaim: `while s[i] == ":"` mints a fresh char
+        # per iteration; it dies with the compare, in the same block
+        ir_string_release_reg(reg)
+
 fn ir_emit_binary_expr(node: Node) -> Int:
     left_r := ir_expr(node.children[0])
     right_r := ir_expr(node.children[1])
@@ -1647,23 +1709,29 @@ fn ir_emit_binary_expr(node: Node) -> Int:
         # owned operands (nested concats, interpolations, fresh method
         # results) are garbage once copied into the new buffer; borrowed
         # operands keep their owner's count. literals release as no-ops.
-        if left_type == "string" and not ir_string_expr_is_borrowed(node.children[0]):
-            ir_string_release_reg(left_r)
-        if right_type == "string" and not ir_string_expr_is_borrowed(node.children[1]):
-            ir_string_release_reg(right_r)
+        ir_release_owned_string_operand(node.children[0], left_r, left_type)
+        ir_release_owned_string_operand(node.children[1], right_r, right_type)
     elif op == "eq":
         if is_str_op:
             ir_emit_call2(r, "__str_eq", "bool", left_r, right_r)
+            ir_release_owned_string_operand(node.children[0], left_r, left_type)
+            ir_release_owned_string_operand(node.children[1], right_r, right_type)
         elif is_bytes_op:
             ir_emit_call2(r, "bytes_eq", "bool", left_r, right_r)
         else:
             ir_emit_simple_binary(r, "eq", left_r, right_r)
     elif op == "neq":
         ir_emit_binary_neq(r, left_r, right_r, is_str_op, is_bytes_op)
+        if is_str_op:
+            ir_release_owned_string_operand(node.children[0], left_r, left_type)
+            ir_release_owned_string_operand(node.children[1], right_r, right_type)
     else:
         simple_op := ir_binary_simple_ir_op(op)
         if simple_op.len() > 0:
             ir_emit_simple_binary(r, simple_op, left_r, right_r)
+            if is_str_op and ir_binary_op_is_comparison(simple_op):
+                ir_release_owned_string_operand(node.children[0], left_r, left_type)
+                ir_release_owned_string_operand(node.children[1], right_r, right_type)
         else:
             ir_emit("binop " + r.to_string() + " " + op + " " + left_r.to_string() + " " + right_r.to_string())
     return r
@@ -3378,11 +3446,19 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
         return "__list_new_map"
     return "__list_new"
 
-fn ir_emit_list_literal(node: Node) -> Int:
+fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     # a tagged list owns its heap elements: the runtime push retains, and
-    # release cascades. element kind comes from the first element.
+    # release cascades. the checker's type covers empty literals in any
+    # position (a bare `return []` was creating untagged List[String]
+    # buffers whose elements nothing owned); the first element is the
+    # fallback when no checked type exists.
     mut elem_kind := ""
-    if node.children.len() > 0:
+    tid := c_get_expr_type(idx)
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "list" and info.inner >= 0:
+            elem_kind = ir_rc_kind(ir_type_from_tid(info.inner))
+    if elem_kind.len() == 0 and node.children.len() > 0:
         elem_kind = ir_rc_kind(ir_infer_type(node.children[0]))
     list_r := ir_reg()
     ir_emit_call0(list_r, ir_list_ctor_for_elem_kind(elem_kind), "list")
@@ -4894,7 +4970,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_set_literal(node)
 
     if kind == "list":
-        return ir_emit_list_literal(node)
+        return ir_emit_list_literal(idx, node)
 
     if kind == "tuple":
         return ir_emit_tuple_literal(node)

@@ -133,6 +133,31 @@ peak rss on the compiler itself barely moves: that memory is the ast and
 token structures held in globals. bytes and structs are the next
 reclamation targets, in that order.
 
+### string statement temps (landed july 2026)
+
+the remaining string leak wasn't bytes: it was per-character temps.
+`s[i]` on a string mints a fresh one-character string, and every loop
+like `while input[i] != ":"` leaked one per comparison. those chars now
+classify as owned — a bind takes the count, a comparison releases its
+operands in the same block — and empty collection literals in return
+position pick up their declared type, so containers like stringbuffer's
+parts list own their elements properly.
+
+a url/path parsing loop (200k iterations over std.net.url and
+std.os.path helpers):
+
+| | before | after |
+|---|---|---|
+| peak rss | 439 mb | 40 mb |
+| runtime | 1076ms | 1411ms |
+
+eleven times less memory, at ~30% time cost in rc traffic on
+char-heavy paths — the tradeoff favors long-running processes.
+std_pipeline's peak drops 1.45 gb to 0.88 gb. the residual 40 mb is
+`chr()` results and other call temps in comparison position, still
+classified as borrowed; that and the rc call overhead are the next
+string items.
+
 cranelift itself was generating unoptimized code until july 2026
 (`opt_level` defaulted to "none"). turning it to "speed" bought only 2-3%
 on these benchmarks, which confirms the hot path is the runtime above, not
@@ -148,6 +173,7 @@ the generated code.
 | single-allocation string derives | no change | no change |
 | string arc + o(1) cstring length | 804ms | 99ms |
 | collection arc | 904ms* | 103ms |
+| string temp reclaim | 961ms | 104ms |
 | inline collection elements | | |
 
 *collection arc costs std_pipeline ~10% in rc traffic; the churn table

@@ -4182,6 +4182,10 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
         if is_integer_type(expected_type) == false:
             report_error("E228", "integer pattern cannot match " + get_type_name(expected_type))
         return
+    if pat.kind == "pat_range":
+        if is_integer_type(expected_type) == false:
+            report_error("E228", "range pattern cannot match " + get_type_name(expected_type))
+        return
     if pat.kind == "pat_float":
         if expected_type != TID_FLOAT:
             report_error("E228", "float pattern cannot match " + get_type_name(expected_type))

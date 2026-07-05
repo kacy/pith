@@ -131,6 +131,14 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
         }
         if prev == 1 {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            if let Ok(needle) = std::env::var("PITH_CSTRING_TRACE") {
+                let data_len = (base.add(8) as *const u64).read() as usize;
+                let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
+                let content = String::from_utf8_lossy(bytes);
+                if content == needle {
+                    eprintln!("pith trace: final release of {:?} at {:p}", content, s);
+                }
+            }
             if cstring_debug_no_free() {
                 // scrub instead of freeing: a read-after-release shows up
                 // as '!' runs in program output instead of silent reuse
@@ -161,6 +169,26 @@ pub(crate) unsafe fn cstring_refcount_for_tests(s: *const i8) -> Option<u32> {
 /// O(1) length for heap cstrings via the header; None for literals.
 pub(crate) unsafe fn cstring_header_len(s: *const i8) -> Option<i64> {
     cstring_base(s).map(|base| (base.add(8) as *const u64).read() as i64)
+}
+
+/// Debug: release with an emission-site id; prints the site when the traced
+/// string takes its final release.
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_release_traced(s: *const i8, site: i64) {
+    if let Some(base) = cstring_base(s) {
+        let rc = cstring_refcount(base).load(std::sync::atomic::Ordering::Relaxed);
+        if rc == 1 {
+            if let Ok(needle) = std::env::var("PITH_CSTRING_TRACE") {
+                let data_len = (base.add(8) as *const u64).read() as usize;
+                let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
+                let content = String::from_utf8_lossy(bytes);
+                if content == needle {
+                    eprintln!("pith trace: site {} finally releases {:?}", site, content);
+                }
+            }
+        }
+    }
+    pith_cstring_release(s);
 }
 
 pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {

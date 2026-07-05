@@ -464,8 +464,15 @@ fn ir_emit_call1(result_reg: Int, fname: String, ret_type: String, arg0: Int):
 fn ir_string_retain_reg(r: Int):
     ir_emit_call1(ir_reg(), "__cstring_retain", "void", r)
 
+mut ir_release_site_counter := 0
+
 fn ir_string_release_reg(r: Int):
-    ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
+    # DEBUG (branch only): tag every release with its emission site so the
+    # runtime can name the site that frees a traced string
+    ir_release_site_counter = ir_release_site_counter + 1
+    site_r := ir_reg()
+    ir_emit("iconst " + site_r.to_string() + " " + ir_release_site_counter.to_string())
+    ir_emit_call2(ir_reg(), "pith_cstring_release_traced", "void", r, site_r)
 
 # collections are shared handles with real refcounts; strings are
 # copy-on-derive with a header count. one kind tag picks the operation.
@@ -1640,9 +1647,14 @@ fn ir_expr_is_fresh_string_index(idx: Int) -> Bool:
     node := get_node(idx)
     if node.kind != "index" or node.children.len() == 0:
         return false
+    # inside generic or specialized bodies the checked types are suppressed
+    # and inference can misname a map or list receiver as a string; a wrong
+    # answer here frees a container's element, so freshness requires the
+    # non-generic certainty path.
+    if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+        return false
     # replicate ir_emit_index_expr's dispatch exactly: checked type first,
-    # inference as fallback. anything else risks releasing a list element
-    # when the emission actually used __list_get.
+    # inference as fallback.
     mut obj_type := ir_checked_type(node.children[0])
     if obj_type.len() == 0:
         obj_type = ir_infer_type(node.children[0])

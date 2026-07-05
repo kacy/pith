@@ -403,6 +403,48 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     let _ = Box::from_raw(map.ptr as *mut MapImpl);
 }
 
+/// Remove an int-keyed entry and hand its value — count included — to the
+/// caller. The map neither retains nor releases: ownership transfers, so
+/// this is the reclaim-safe way to drop registry entries under the
+/// free-only-cascade rule.
+///
+/// # Safety
+/// map_handle must be a valid map handle or garbage (the magic check
+/// rejects garbage).
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_take_ikey(map_handle: i64, key: i64) -> i64 {
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
+        return 0;
+    };
+    if impl_ref.uses_int_values8() {
+        return impl_ref.remove_int_value(key).unwrap_or(0);
+    }
+    match impl_ref.remove(&MapKey::Int(key)) {
+        Some(val) if val.len() >= 8 => {
+            i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]))
+        }
+        _ => 0,
+    }
+}
+
+/// String-keyed take: remove and transfer the value's count to the caller.
+///
+/// # Safety
+/// map_handle must be a valid map handle; key a valid cstring.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_take(map_handle: i64, key: *const i8) -> i64 {
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
+        return 0;
+    };
+    let map_key = cstr_to_map_key(key);
+    match impl_ref.remove(&map_key) {
+        Some(val) if val.len() >= 8 => {
+            i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]))
+        }
+        _ => 0,
+    }
+}
+
 /// Retain a map handle: one more owner of this shared handle.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_retain_handle(handle: i64) {

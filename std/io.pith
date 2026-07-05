@@ -282,6 +282,9 @@ impl BufferedBytesReader:
     fn read_all_bytes_chunked(chunk_size: Int) -> Bytes!:
         return read_all_buffered_bytes_reader_chunked(self, chunk_size)
 
+    fn free():
+        free_buffered_bytes_reader(self)
+
 impl BytesReader for BufferedBytesReader:
     fn read_bytes(max_bytes: Int) -> Bytes!:
         return buffered_bytes_reader_read(self, max_bytes)
@@ -295,6 +298,9 @@ impl BufferedBytesWriter:
 
     fn flush() -> Int!:
         return buffered_bytes_writer_flush(self)
+
+    fn free():
+        free_buffered_bytes_writer(self)
 
 impl BytesWriter for BufferedBytesWriter:
     fn write_bytes(data: Bytes) -> Int!:
@@ -905,6 +911,16 @@ fn allocate_buffered_bytes_reader_handle(source_kind: Int, source_handle: Int, c
 
 fn make_buffered_bytes_reader(source_kind: Int, source_handle: Int, chunk_size: Int) -> BufferedBytesReader:
     return BufferedBytesReader(allocate_buffered_bytes_reader_handle(source_kind, source_handle, chunk_size))
+
+pub fn free_buffered_bytes_reader(reader: BufferedBytesReader):
+    cached := buffered_bytes_reader_cache.get_default(reader.handle, bytes.empty())
+    if cached.len() < 0:
+        return
+
+pub fn free_buffered_bytes_writer(writer: BufferedBytesWriter):
+    cached := buffered_bytes_writer_cache.get_default(writer.handle, bytes.empty())
+    if cached.len() < 0:
+        return
 
 fn allocate_buffered_bytes_writer_handle(target_kind: Int, target_handle: Int, chunk_size: Int) -> Int:
     handle := next_buffered_bytes_writer_handle

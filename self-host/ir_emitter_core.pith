@@ -1667,6 +1667,25 @@ fn ir_release_owned_string_operand(expr_idx: Int, reg: Int, expr_type: String):
         # loop-condition reclaim: `while s[i] == ":"` mints a fresh char
         # per iteration; it dies with the compare, in the same block
         ir_string_release_reg(reg)
+    elif ir_expr_is_transferred_call_temp(expr_idx):
+        # a call result in comparison position is a transferred count
+        # nothing else references: `c == chr(9)` leaked one string per
+        # iteration. user returns transfer, and runtime string builders
+        # (chr, conversions) mint fresh buffers.
+        ir_string_release_reg(reg)
+
+# true for call and method-call results whose checked or inferred type is
+# string, outside generic bodies where the types cannot be trusted.
+fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind != "call" and node.kind != "method_call":
+        return false
+    if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+        return false
+    mut expr_type := ir_checked_type(idx)
+    if expr_type.len() == 0:
+        expr_type = ir_infer_type(idx)
+    return expr_type == "string"
 
 fn ir_emit_binary_expr(node: Node) -> Int:
     left_r := ir_expr(node.children[0])

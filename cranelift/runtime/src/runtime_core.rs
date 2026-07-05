@@ -68,6 +68,7 @@ fn cstring_layout(data_len: usize) -> Layout {
 /// Allocate a heap cstring with `data_len` data bytes, refcount 1, and the
 /// trailing NUL already written. The caller fills bytes 0..data_len.
 pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
+    crate::perf_count(&crate::PERF_CSTRING_ALLOCS, 1);
     let base = pith_alloc(cstring_layout(data_len));
     (base as *mut u32).write(CSTRING_MAGIC);
     (base.add(4) as *mut u32).write(1);
@@ -103,6 +104,7 @@ unsafe fn cstring_refcount(base: *mut u8) -> &'static std::sync::atomic::AtomicU
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
     if let Some(base) = cstring_base(s) {
+        crate::perf_count(&crate::PERF_CSTRING_RETAINS, 1);
         cstring_refcount(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -113,6 +115,7 @@ pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
     if let Some(base) = cstring_base(s) {
+        crate::perf_count(&crate::PERF_CSTRING_RELEASES, 1);
         let prev = cstring_refcount(base).fetch_sub(1, std::sync::atomic::Ordering::Release);
         if prev == 0 {
             // an over-release means the emitter's ownership accounting is
@@ -152,6 +155,7 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
             }
             let data_len = (base.add(8) as *const u64).read() as usize;
             (base as *mut u32).write(0);
+            crate::perf_count(&crate::PERF_CSTRING_FREES, 1);
             std::alloc::dealloc(base, cstring_layout(data_len));
         }
     }
@@ -193,6 +197,16 @@ pub unsafe extern "C" fn pith_cstring_release_traced(s: *const i8, site: i64) {
         }
     }
     pith_cstring_release(s);
+}
+
+/// Debug: retain with an emission-site id, counted per site when
+/// PITH_RETAIN_SITES is set.
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_retain_traced(s: *const i8, site: i64) {
+    if cstring_base(s).is_some() && std::env::var("PITH_RETAIN_SITES").is_ok() {
+        eprintln!("retain site {}", site);
+    }
+    pith_cstring_retain(s);
 }
 
 pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {

@@ -3583,6 +3583,11 @@ fn check_map_method_call(method: String, info: TypeInfo, args: List[Int], scope_
     if method == "remove":
         expect_one_typed_argument(method, args, key_t, scope_id)
         return tid_void
+    if method == "take":
+        # remove and return the value with its count transferred: the
+        # reclaim-safe way to drop a registry entry
+        expect_one_typed_argument(method, args, key_t, scope_id)
+        return val_t
     if method == "keys":
         expect_no_arguments(method, args)
         return intern_list_type(key_t)

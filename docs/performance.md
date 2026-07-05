@@ -49,6 +49,25 @@ memory, 2.9x less than go's gc, matching rust's shape. std_pipeline's
 remaining 662 mb is bytes objects and byte buffers, which still never
 free — that's arc phase c.
 
+### the server benchmark (added july 2026): the honest one
+
+`bench/http_server.pith` + `bench/http_bench.sh` drive a json api with
+wrk for two minutes and sample rss. this is the direct test of the
+long-running-process claim, and today pith fails it:
+
+| 120s sustained load | go (1 core) | pith |
+|---|---|---|
+| throughput | 13,583 req/s | 275 req/s |
+| rss start → end | 6.9 → 12.4 mb, flat | 3.8 mb → 1.99 gb, unbounded |
+
+two named causes. memory: the http path is built on bytes objects and
+byte buffers, which never free (arc phase c) — roughly 60 kb leaks per
+request. throughput: the server is connection-per-request with no
+keep-alive, and as the heap grows every allocation touches fresh
+zeroed pages, so the leak also taxes speed. bytes reclamation and
+keep-alive are what this benchmark exists to measure; rerun it after
+each landing.
+
 build times, same machine (go 1.24.4): go cold 10.6s / warm 0.1s; pith
 compiles the same program cold in 1.2s every time — 8.5x faster than
 go's cold build, with no incremental cache to go stale.

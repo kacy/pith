@@ -484,6 +484,8 @@ fn ir_rc_kind(type_hint: String) -> String:
         return "map"
     if type_hint == "set" or type_hint == "set_int":
         return "set"
+    if type_hint == "bytes":
+        return "bytes"
     return ""
 
 # every rc kind releases: strings via their header count, collections via
@@ -500,6 +502,8 @@ fn ir_rc_retain_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_map_retain_handle", "void", r)
     elif kind == "set":
         ir_emit_call1(ir_reg(), "pith_set_retain_handle", "void", r)
+    elif kind == "bytes":
+        ir_emit_call1(ir_reg(), "pith_bytes_retain", "void", r)
 
 fn ir_rc_release_reg(r: Int, kind: String):
     if kind == "string":
@@ -510,6 +514,8 @@ fn ir_rc_release_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_map_release_handle", "void", r)
     elif kind == "set":
         ir_emit_call1(ir_reg(), "pith_set_release_handle", "void", r)
+    elif kind == "bytes":
+        ir_emit_call1(ir_reg(), "pith_bytes_release", "void", r)
 
 # a map target whose value type is string picks the heap-value
 # constructor for empty literals, so runtime inserts retain
@@ -569,7 +575,7 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
         return false
     if node.kind == "call" or node.kind == "method_call":
         expr_kind := ir_rc_kind(ir_infer_type(idx))
-        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set":
+        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes":
             return false
     if node.kind == "method_call":
         return not ir_string_method_returns_fresh(ir_plain_method_name(node.value))
@@ -620,7 +626,12 @@ fn ir_string_prepass_bind_type(parts: IrBindParts, names: List[String]) -> Strin
         if val_node.kind == "ident" and names.contains(val_node.value):
             bind_type = ir_rc_local_kind(val_node.value)
         else:
-            bind_type = ir_infer_type(parts.val_idx)
+            # the checker's recorded type resolves module-qualified calls
+            # (bytes.from_string_utf8 and friends) that local inference
+            # cannot; inference stays as the fallback
+            bind_type = ir_checked_type(parts.val_idx)
+            if bind_type.len() == 0:
+                bind_type = ir_infer_type(parts.val_idx)
     return bind_type
 
 fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[String]):
@@ -813,9 +824,13 @@ fn ir_emit_resolved_call(result_reg: Int, fname: String, idx: Int, arg_regs: Lis
 # params, and storing callees add their own count. pairs registers with the
 # same child walk ir_collect_call_arg_regs used.
 # method variant: pairs registers with ir_method_call_arg_expr so the walk
-# can never drift from the collector's
-fn ir_release_owned_method_args(node: Node, arg_regs: List[Int]):
+# can never drift from the collector's. skip_pos marks a container-store
+# argument: ownership transfers to the container there, and releasing it
+# would dangle when the container is untagged and cannot retain.
+fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
     for reg, i in arg_regs:
+        if i == skip_pos:
+            continue
         expr_idx := ir_method_call_arg_expr(node, i)
         if expr_idx >= 0:
             ir_release_owned_string_operand(expr_idx, reg, ir_infer_type(expr_idx))
@@ -1677,6 +1692,8 @@ fn ir_binary_op_is_comparison(simple_op: String) -> Bool:
 fn ir_release_owned_string_operand(expr_idx: Int, reg: Int, expr_type: String):
     if expr_type == "string" and not ir_string_expr_is_borrowed(expr_idx):
         ir_string_release_reg(reg)
+    elif expr_type == "bytes" and not ir_string_expr_is_borrowed(expr_idx):
+        ir_rc_release_reg(reg, "bytes")
     elif ir_expr_is_fresh_string_index(expr_idx):
         # loop-condition reclaim: `while s[i] == ":"` mints a fresh char
         # per iteration; it dies with the compare, in the same block
@@ -4124,6 +4141,14 @@ fn ir_emit_method_call(idx: Int) -> Int:
     # container stores keep a count for borrowed string values; owned results
     # transfer theirs. untagged containers never release, so a wrong guess
     # here can only leak, never dangle.
+    # container stores get special ownership treatment twice below: the
+    # compensation retain, and the argument-release skip (ownership
+    # transfers into the container at that position)
+    mut store_value_pos := 0 - 1
+    if emit_name == "send" or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
+        store_value_pos = 0
+    elif emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey" or emit_name == "set" or emit_name == "pith_list_set_value":
+        store_value_pos = 1
     if not impl_dispatch:
         # tagged containers retain their elements in the runtime. the
         # emitter still adds a count where tagging cannot be guaranteed:
@@ -4132,11 +4157,6 @@ fn ir_emit_method_call(idx: Int) -> Int:
         # indistinguishable from List[Int] in the type strings, so it is
         # created untagged). a double count on a tagged container is a
         # bounded leak; a missing count is a dangling element.
-        mut store_value_pos := 0 - 1
-        if emit_name == "send" or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
-            store_value_pos = 0
-        elif emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey" or emit_name == "set" or emit_name == "pith_list_set_value":
-            store_value_pos = 1
         if store_value_pos >= 0 and store_value_pos < arg_regs.len():
             value_expr := ir_method_call_arg_expr(node, store_value_pos)
             if value_expr >= 0:
@@ -4144,7 +4164,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
                 mut compensate := false
                 if emit_name == "send":
                     compensate = store_kind.len() > 0
-                elif store_kind == "list" or store_kind == "map" or store_kind == "set":
+                elif store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "bytes":
                     compensate = true
                 if compensate and ir_string_expr_is_borrowed(value_expr):
                     ir_rc_retain_reg(arg_regs[store_value_pos], store_kind)
@@ -4152,7 +4172,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
     if emit_name == "identity" and not impl_dispatch:
         return obj_r
     ir_emit_call_text(r, emit_name, ret_type, call_args.len(), ir_join_arg_regs(call_args))
-    ir_release_owned_method_args(node, arg_regs)
+    ir_release_owned_method_args(node, arg_regs, store_value_pos)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         return ir_emit_wrapped_legacy_result(r, ret_type, emit_name)
     if ir_is_void_method(emit_name):
@@ -4629,7 +4649,7 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # compensates only for maps holding lists/maps/sets, which have no
     # tagged constructor yet.
     idx_store_kind := ir_rc_kind(value_type)
-    if idx_store_kind == "list" or idx_store_kind == "map" or idx_store_kind == "set":
+    if idx_store_kind == "list" or idx_store_kind == "map" or idx_store_kind == "set" or idx_store_kind == "bytes":
         if ir_string_expr_is_borrowed(value_idx):
             ir_rc_retain_reg(value_r, idx_store_kind)
     ir_emit_call3(ir_reg(), ir_index_set_call_name(obj_type), "void", obj_r, idx_r, value_r)

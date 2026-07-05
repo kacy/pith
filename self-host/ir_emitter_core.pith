@@ -66,6 +66,12 @@ mut ir_var_regs: Map[String, Int] := {}
 mut ir_var_types: Map[String, String] := {} # variable name -> type hint or struct name
 mut ir_map_value_types: Map[String, String] := {} # map variable name -> value type
 
+# enums with at least one payload-carrying variant are boxed: a value is a
+# heap struct with the tag in slot 0 and payload values in slots 1..n.
+# payload-free enums stay plain integer tags.
+mut ir_boxed_enums: Map[String, Bool] := {}
+mut ir_enum_payload_kinds: Map[String, String] := {} # "Shape.Circle" -> "float,string"
+
 # string locals owned by the current function, in binding order. collected
 # by a pre-pass before the body emits so every name can be zero-stored in
 # the prologue; that makes the release loads at each return valid on every
@@ -907,6 +913,15 @@ fn ir_collect_enum_decl(node: Node, emit_decl: Bool):
             variant_names.push(variant_node.value)
             ir_struct_field_lookup.insert(sname + "." + variant_node.value, sname)
             ir_struct_field_index_lookup.insert(sname + "." + variant_node.value, variant_index.to_string())
+            if variant_node.children.len() > 0:
+                mut kinds: List[String] := []
+                for type_idx in variant_node.children:
+                    mut kind := ir_resolve_type_node(type_idx)
+                    if kind.len() == 0:
+                        kind = "unknown"
+                    kinds.push(kind)
+                ir_enum_payload_kinds.insert(sname + "." + variant_node.value, kinds.join(","))
+                ir_boxed_enums.insert(sname, true)
     ir_struct_names.insert(sname, variant_names.len())
     if emit_decl:
         ir_emit("struct " + sname + " " + variant_names.join(" "))
@@ -3183,6 +3198,37 @@ fn ir_field_lookup_key(recv_idx: Int, field_name: String) -> String:
 fn ir_emit_named_field_access(result_reg: Int, obj_r: Int, lookup_key: String, field_name: String, field_kind_override: String):
     ir_emit_named_field_access_with_state(result_reg, obj_r, lookup_key, field_name, field_kind_override, ir_struct_field_index_lookup, ir_struct_field_lookup, ir_type_aliases, ir_struct_names)
 
+# Allocate a boxed enum value: slot 0 is the variant tag, slots 1..n hold
+# the payload. payload_count is this variant's own arity.
+fn ir_emit_variant_alloc(enum_name: String, variant_key: String, payload_count: Int) -> Int:
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " " + (payload_count + 1).to_string())
+    r := ir_reg()
+    ir_emit_call1(r, "__struct_alloc", "struct:" + enum_name, count_r)
+    tag_r := ir_reg()
+    ir_emit("iconst " + tag_r.to_string() + " " + ir_struct_field_index_lookup[variant_key])
+    ir_emit("sstore " + r.to_string() + " 0 " + tag_r.to_string())
+    return r
+
+# Shape.Circle(2.5): build the boxed value and store each payload argument.
+fn ir_emit_variant_construction(node: Node, enum_name: String, variant_key: String) -> Int:
+    mut kinds: List[String] := []
+    if ir_enum_payload_kinds.contains_key(variant_key):
+        kinds = ir_enum_payload_kinds[variant_key].split(",")
+    r := ir_emit_variant_alloc(enum_name, variant_key, kinds.len())
+    mut i := 0
+    while i < kinds.len():
+        arg_idx := ir_method_call_arg_expr(node, i)
+        if arg_idx >= 0:
+            arg_r := ir_expr(arg_idx)
+            # the enum value owns a count on string payloads, same as any
+            # other struct-shaped store
+            if kinds[i] == "string" and ir_string_expr_is_borrowed(arg_idx):
+                ir_string_retain_reg(arg_r)
+            ir_emit("sstore " + r.to_string() + " " + (i + 1).to_string() + " " + arg_r.to_string())
+        i = i + 1
+    return r
+
 fn ir_emit_field_access(idx: Int, node: Node) -> Int:
     fname := node_value(idx)
     if node.children.len() == 0:
@@ -3195,6 +3241,8 @@ fn ir_emit_field_access(idx: Int, node: Node) -> Int:
         if ir_struct_field_index_lookup.contains_key(lookup_key):
             if ir_struct_field_lookup.contains_key(lookup_key):
                 if ir_struct_field_lookup[lookup_key] == recv_node.value:
+                    if ir_boxed_enums.contains_key(recv_node.value):
+                        return ir_emit_variant_alloc(recv_node.value, lookup_key, 0)
                     r := ir_reg()
                     ir_emit("iconst " + r.to_string() + " " + ir_struct_field_index_lookup[lookup_key])
                     return r
@@ -3618,6 +3666,15 @@ fn ir_emit_method_call(idx: Int) -> Int:
     node := get_node(idx)
     # first child is object, then args. value is method_name (may have leading dot)
     mname := ir_plain_method_name(node_value(idx))
+
+    # Shape.Circle(2.5) parses as a method call on the enum type name; it is
+    # really a variant construction
+    if node.children.len() > 0:
+        ctor_recv := get_node(node.children[0])
+        if ctor_recv.kind == "ident" and ir_boxed_enums.contains_key(ctor_recv.value):
+            ctor_key := ctor_recv.value + "." + mname
+            if ir_struct_field_index_lookup.contains_key(ctor_key):
+                return ir_emit_variant_construction(node, ctor_recv.value, ctor_key)
 
     if node.children.len() > 0:
         recv_tid := c_get_expr_type(node.children[0])
@@ -4385,8 +4442,16 @@ fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
     if pat.kind == "pat_variant":
         r := ir_reg()
         if ir_struct_field_index_lookup.contains_key(pat.value):
+            enum_name := ir_variant_enum_name(pat.value)
             lit_r := ir_reg()
             ir_emit("iconst " + lit_r.to_string() + " " + ir_struct_field_index_lookup[pat.value])
+            if ir_boxed_enums.contains_key(enum_name):
+                # boxed enum: the subject is a pointer; compare the stored tag,
+                # then fold in any literal payload sub-patterns
+                tag_r := ir_reg()
+                ir_emit("field " + tag_r.to_string() + " " + subj_r.to_string() + " 0 int __enum_tag")
+                ir_emit("eq " + r.to_string() + " " + tag_r.to_string() + " " + lit_r.to_string())
+                return ir_emit_variant_payload_conds(pat, subj_r, r)
             ir_emit("eq " + r.to_string() + " " + subj_r.to_string() + " " + lit_r.to_string())
             return r
         ir_emit("iconst " + r.to_string() + " 0")
@@ -4402,10 +4467,56 @@ fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
             acc_r = or_r
             k = k + 1
         return acc_r
-    # pat_none, pat_tuple, and variant payload sub-patterns are not lowered yet.
+    # pat_none and pat_tuple are not lowered yet.
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " 0")
     return r
+
+fn ir_variant_enum_name(variant_key: String) -> String:
+    mut i := 0
+    while i < variant_key.len():
+        if variant_key[i] == ".":
+            return variant_key.substring(0, i)
+        i = i + 1
+    return variant_key
+
+# Literal payload sub-patterns (Shape.Circle(0.0)) narrow the tag match:
+# each one loads its slot and ANDs an equality into the arm condition.
+# Binding and wildcard sub-patterns always match here; bindings are stored
+# by ir_emit_match_bindings once the arm is taken.
+fn ir_emit_variant_payload_conds(pat: Node, subj_r: Int, tag_cond_r: Int) -> Int:
+    mut acc_r := tag_cond_r
+    mut kinds: List[String] := []
+    if ir_enum_payload_kinds.contains_key(pat.value):
+        kinds = ir_enum_payload_kinds[pat.value].split(",")
+    for sub_idx, i in pat.children:
+        sub := get_node(sub_idx)
+        if sub.kind == "pat_binding" or sub.kind == "pat_wildcard":
+            continue
+        mut kind := "unknown"
+        if i < kinds.len():
+            kind = kinds[i]
+        slot_r := ir_reg()
+        ir_emit("field " + slot_r.to_string() + " " + subj_r.to_string() + " " + ((i + 1) * 8).to_string() + " " + kind + " __payload")
+        mut cond_r := ir_reg()
+        if sub.kind == "pat_int":
+            lit_r := ir_emit_int_literal(sub)
+            ir_emit("eq " + cond_r.to_string() + " " + slot_r.to_string() + " " + lit_r.to_string())
+        elif sub.kind == "pat_bool":
+            lit_r := ir_emit_bool_literal(sub)
+            ir_emit("eq " + cond_r.to_string() + " " + slot_r.to_string() + " " + lit_r.to_string())
+        elif sub.kind == "pat_float":
+            lit_r := ir_emit_float_literal(sub)
+            ir_emit("eq " + cond_r.to_string() + " " + slot_r.to_string() + " " + lit_r.to_string())
+        elif sub.kind == "pat_string":
+            lit_r := ir_emit_string_literal(sub)
+            ir_emit_call2(cond_r, "__str_eq", "bool", slot_r, lit_r)
+        else:
+            ir_emit("iconst " + cond_r.to_string() + " 0")
+        and_r := ir_reg()
+        ir_emit("and " + and_r.to_string() + " " + acc_r.to_string() + " " + cond_r.to_string())
+        acc_r = and_r
+    return acc_r
 
 # Bind any names a pattern introduces, in the branch where it matched.
 fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
@@ -4415,6 +4526,25 @@ fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
         if subj_type.len() > 0:
             ir_var_types.insert(pat.value, subj_type)
         ir_emit("store " + pat.value + " " + subj_r.to_string())
+    if pat.kind == "pat_variant" and pat.children.len() > 0:
+        # extract each bound payload slot from the boxed enum value. the
+        # binding borrows the enum's count on string payloads, matching how
+        # struct field reads behave.
+        mut kinds: List[String] := []
+        if ir_enum_payload_kinds.contains_key(pat.value):
+            kinds = ir_enum_payload_kinds[pat.value].split(",")
+        for sub_idx, i in pat.children:
+            sub := get_node(sub_idx)
+            if sub.kind == "pat_binding":
+                mut kind := "unknown"
+                if i < kinds.len():
+                    kind = kinds[i]
+                slot_r := ir_reg()
+                ir_emit("field " + slot_r.to_string() + " " + subj_r.to_string() + " " + ((i + 1) * 8).to_string() + " " + kind + " " + sub.value)
+                ir_var_regs.insert(sub.value, slot_r)
+                if kind != "unknown":
+                    ir_var_types.insert(sub.value, kind)
+                ir_emit("store " + sub.value + " " + slot_r.to_string())
 
 # Emit an arm body. A block body runs as statements (and may return); an
 # expression body produces a value stored into result_temp.

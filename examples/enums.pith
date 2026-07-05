@@ -25,5 +25,23 @@ fn describe_direction(d: Direction) -> String:
         Direction.East => "right"
         Direction.West => "left"
 
+# payload-carrying variants are constructed like calls on the enum type
+# and destructured in match arms.
+
+fn area(s: Shape) -> Float:
+    match s:
+        Shape.Circle(r) => 3.14 * r * r
+        Shape.Rectangle(w, h) => w * h
+        Shape.Point => 0.0
+
+fn outcome(r: Result) -> String:
+    match r:
+        Result.Ok(n) => "ok: {n}"
+        Result.Err(msg) => "err: " + msg
+
 fn main():
-    print("enums declared")
+    print(describe_direction(Direction.North))
+    print("circle area = {area(Shape.Circle(1.0))}")
+    print("rect area = {area(Shape.Rectangle(2.0, 3.0))}")
+    print(outcome(Result.Ok(7)))
+    print(outcome(Result.Err("nope")))

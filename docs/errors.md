@@ -477,3 +477,23 @@ warning[E305]: indentation depth 5 exceeds maximum of 4
   12 |                     if x > 0:
                             ^^
 ```
+
+### E244 — named fields on generic structs
+
+named-field construction works for concrete structs only. construct a
+generic struct positionally.
+
+```
+error[E244]: Box: named fields are not yet supported for generic structs; use positional arguments
+```
+
+### E245 — invalid if let / while let pattern
+
+`if let` and `while let` take a variant pattern (which destructures like a
+match arm) or a bare binding (which unwraps an optional subject). anything
+else — a literal pattern, or a bare binding against a non-optional — is
+rejected.
+
+```
+error[E245]: if let with a bare binding needs an optional subject, got Int
+```

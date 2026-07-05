@@ -1176,6 +1176,8 @@ fn parse_expr_stmt_or_assignment() -> Int:
 
 fn parse_if_stmt() -> Int:
     advance_token()
+    if check("kw_let"):
+        return parse_if_let_stmt()
     condition := parse_expression()
     expect("colon")
     then_block := parse_block()
@@ -1238,12 +1240,37 @@ fn parse_for_stmt() -> Int:
 
 fn parse_while_stmt() -> Int:
     advance_token()
+    if check("kw_let"):
+        advance_token()
+        pattern := parse_pattern()
+        expect("eq")
+        subject := parse_expression()
+        expect("colon")
+        body := parse_block()
+        mut let_children: List[Int] := [pattern, subject, body]
+        return add_node_with_position("while_let", "", let_children)
     condition := parse_expression()
     expect("colon")
     body := parse_block()
 
     mut children: List[Int] := [condition, body]
     return add_node_with_position("while_stmt", "", children)
+
+# if let PATTERN = expr: ... [else: ...] — a one-arm match with an optional
+# else. a bare-binding pattern unwraps an optional subject.
+fn parse_if_let_stmt() -> Int:
+    advance_token()
+    pattern := parse_pattern()
+    expect("eq")
+    subject := parse_expression()
+    expect("colon")
+    then_block := parse_block()
+    mut children: List[Int] := [pattern, subject, then_block]
+    if check("kw_else"):
+        advance_token()
+        expect("colon")
+        children.push(parse_block())
+    return add_node_with_position("if_let", "", children)
 
 fn parse_match_stmt() -> Int:
     # reuse match_expr parsing

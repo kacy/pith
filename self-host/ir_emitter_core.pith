@@ -4953,6 +4953,77 @@ fn ir_emit_if_stmt(node: Node):
         ir_block(else_idx)
     ir_emit("label " + end_label)
 
+# if let / while let share the match machinery: a variant pattern uses the
+# match condition and binding emitters, a bare binding tests an optional's
+# flag and extracts its value.
+fn ir_emit_let_cond(pat_idx: Int, subj_r: Int) -> Int:
+    pat := get_node(pat_idx)
+    if pat.kind == "pat_binding":
+        r := ir_reg()
+        ir_emit_optional_none_compare(r, "neq", subj_r)
+        return r
+    return ir_emit_match_cond(pat_idx, subj_r)
+
+fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
+    pat := get_node(pat_idx)
+    if pat.kind == "pat_binding":
+        subj_tid := c_get_expr_type(subj_idx)
+        val_r := ir_optional_value_field(subj_r, subj_tid)
+        ir_var_regs.insert(pat.value, val_r)
+        if subj_tid >= 0:
+            info := get_type_info(subj_tid)
+            if info.kind == "optional" and info.inner >= 0:
+                inner_kind := ir_type_from_tid(info.inner)
+                if inner_kind.len() > 0:
+                    ir_var_types.insert(pat.value, inner_kind)
+        ir_emit("store " + pat.value + " " + val_r.to_string())
+        return
+    ir_emit_match_bindings(pat_idx, subj_r, "")
+
+fn ir_emit_if_let_stmt(node: Node):
+    if node.children.len() < 3:
+        return
+    subj_r := ir_expr(node.children[1])
+    cond_r := ir_emit_let_cond(node.children[0], subj_r)
+    then_l := ir_label()
+    else_l := ir_label()
+    end_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + then_l + " " + else_l)
+    ir_emit("label " + then_l)
+    ir_last_was_ret = false
+    ir_emit_let_bindings(node.children[0], subj_r, node.children[1])
+    ir_block(node.children[2])
+    if not ir_last_was_ret:
+        ir_emit("jmp " + end_l)
+    ir_emit("label " + else_l)
+    ir_last_was_ret = false
+    if node.children.len() > 3:
+        ir_block(node.children[3])
+    ir_emit("label " + end_l)
+    ir_last_was_ret = false
+
+fn ir_emit_while_let_stmt(node: Node):
+    if node.children.len() < 3:
+        return
+    head_label := ir_label()
+    body_label := ir_label()
+    end_label := ir_label()
+    ir_emit("label " + head_label)
+    subj_r := ir_expr(node.children[1])
+    cond_r := ir_emit_let_cond(node.children[0], subj_r)
+    ir_emit("brif " + cond_r.to_string() + " " + body_label + " " + end_label)
+    ir_emit("label " + body_label)
+    ir_last_was_ret = false
+    ir_emit_let_bindings(node.children[0], subj_r, node.children[1])
+    ir_break_stack = ir_push_string(ir_break_stack, end_label)
+    ir_continue_stack = ir_push_string(ir_continue_stack, head_label)
+    ir_block(node.children[2])
+    ir_break_stack.remove(ir_break_stack.len() - 1)
+    ir_continue_stack.remove(ir_continue_stack.len() - 1)
+    ir_emit("jmp " + head_label)
+    ir_emit("label " + end_label)
+    ir_last_was_ret = false
+
 fn ir_emit_while_stmt(node: Node):
     head_label := ir_label()
     body_label := ir_label()
@@ -5178,6 +5249,12 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
 fn ir_stmt_control(idx: Int, node: Node):
     if node.kind == "if" or node.kind == "if_stmt":
         ir_emit_if_stmt(node)
+
+    elif node.kind == "if_let":
+        ir_emit_if_let_stmt(node)
+
+    elif node.kind == "while_let":
+        ir_emit_while_let_stmt(node)
 
     elif node.kind == "while" or node.kind == "while_stmt":
         ir_emit_while_stmt(node)

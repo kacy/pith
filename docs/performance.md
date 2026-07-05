@@ -115,6 +115,23 @@ remaining growth is strings held in header/query maps plus a few
 residual structs; the counters attribute them and they're the
 follow-up.
 
+the three-language server picture after the arc (120s sustained, one
+core, connection-per-request against pith and the rust comparator;
+go's net/http multiplexes goroutines even on one core, and the rust
+comparator is a minimal hand-rolled parser rather than a full http
+stack — read the gaps accordingly):
+
+| 120s sustained | go net/http | rust minimal | pith |
+|---|---|---|---|
+| throughput | 13,184/s | 7,938/s | 4,654/s |
+| rss | 12 mb flat | 2 mb flat | grows 3.4 kb/request |
+
+pith serves within 1.7x of the single-threaded rust comparator and
+2.8x of go through a full http stack — from 47x behind go when this
+benchmark was created. the growth line is the remaining difference:
+header/query-map strings and a few residual structs, attributed by
+the counters and queued as the next fix.
+
 build times, same machine (go 1.24.4): go cold 10.6s / warm 0.1s; pith
 compiles the same program cold in 1.2s every time — 8.5x faster than
 go's cold build, with no incremental cache to go stale.

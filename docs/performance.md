@@ -68,6 +68,14 @@ zeroed pages, so the leak also taxes speed. bytes reclamation and
 keep-alive are what this benchmark exists to measure; rerun it after
 each landing.
 
+first landing (bytes refcounts): throughput 277 → 688 req/s — freeing
+short-lived bytes cuts the page-zeroing tax — but rss still grows
+unbounded. the remaining pin is std/io's handle registries: every
+reader and writer inserts into global maps that nothing removes, so
+each request's buffers stay reachable. that needs a remove-with-
+transfer primitive (`take`) on maps and a handle lifecycle in std/io,
+which is the next leg.
+
 build times, same machine (go 1.24.4): go cold 10.6s / warm 0.1s; pith
 compiles the same program cold in 1.2s every time — 8.5x faster than
 go's cold build, with no incremental cache to go stale.

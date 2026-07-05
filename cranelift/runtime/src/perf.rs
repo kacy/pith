@@ -16,6 +16,7 @@ pub static PERF_CSTRING_RETAINS_PUSH: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_CASCADE_RELEASES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CSTRING_RELEASES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTES_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_BYTES_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTES_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_NEWS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITES: AtomicUsize = AtomicUsize::new(0);
@@ -114,8 +115,9 @@ pub fn dump_perf_stats() {
         PERF_STRING_ALLOC_BYTES.load(Ordering::Relaxed)
     );
     eprintln!(
-        "  bytes allocs: {} bytes={}",
+        "  bytes allocs: {} frees={} bytes={}",
         PERF_BYTES_ALLOCS.load(Ordering::Relaxed),
+        PERF_BYTES_FREES.load(Ordering::Relaxed),
         PERF_BYTES_ALLOC_BYTES.load(Ordering::Relaxed)
     );
     eprintln!(

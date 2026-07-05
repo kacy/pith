@@ -10,6 +10,7 @@ pub(crate) struct PithBytes {
     pub(crate) data_ptr: *const u8,
     pub(crate) data_len: usize,
     pub(crate) data: Vec<u8>,
+    pub(crate) rc: std::sync::atomic::AtomicU32,
     pub(crate) magic: u32,
 }
 
@@ -58,9 +59,48 @@ pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
         data_ptr,
         data_len,
         data,
+        rc: std::sync::atomic::AtomicU32::new(1),
         magic: BYTES_MAGIC,
     }));
     ptr as i64
+}
+
+/// One more owner of this bytes object.
+///
+/// # Safety
+/// handle must be a valid PithBytes handle or garbage (the magic check
+/// rejects garbage).
+#[no_mangle]
+pub unsafe extern "C" fn pith_bytes_retain(handle: i64) {
+    if let Some(b) = pith_bytes_ref(handle) {
+        b.rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Drop one owner; the last release frees the object and its storage.
+///
+/// # Safety
+/// handle must be a valid PithBytes handle or garbage.
+#[no_mangle]
+pub unsafe extern "C" fn pith_bytes_release(handle: i64) {
+    let Some(b) = pith_bytes_ref(handle) else {
+        return;
+    };
+    let prev = b.rc.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    if prev > 1 {
+        return;
+    }
+    if prev == 0 {
+        // over-release: put the count back and leave the object alone
+        // rather than double-freeing
+        b.rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    crate::perf_count(&crate::PERF_BYTES_FREES, 1);
+    // scrub the magic so stale handles fail the validity check
+    (*(handle as *mut PithBytes)).magic = 0;
+    let _ = Box::from_raw(handle as *mut PithBytes);
 }
 
 #[no_mangle]

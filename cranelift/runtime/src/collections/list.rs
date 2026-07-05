@@ -284,6 +284,18 @@ pub unsafe extern "C" fn pith_list_new_cstr() -> PithList {
     pith_list_new(8, 1)
 }
 
+/// List of list handles (List[List[T]]): elements retain/release recursively.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_new_nested_list() -> PithList {
+    pith_list_new(8, 2)
+}
+
+/// List of map handles (List[Map[K, V]]).
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_new_nested_map() -> PithList {
+    pith_list_new(8, 3)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithList {
     let tag = match type_tag {
@@ -398,9 +410,8 @@ pub unsafe extern "C" fn pith_list_set_value(list: PithList, index: i64, value: 
     if idx >= impl_ref.len() {
         return;
     }
-    if let Some(old) = impl_ref.get_value(idx) {
-        release_element(impl_ref.type_tag, old);
-    }
+    // retain the incoming element; the outgoing one is NOT released — a
+    // borrow of it may still be live, so it leaks (bounded by set calls)
     retain_element(impl_ref.type_tag, value);
     impl_ref.set_value(idx, value);
 }
@@ -658,11 +669,8 @@ pub unsafe extern "C" fn pith_list_set(
         return false;
     }
 
-    // Release the outgoing element, retain the incoming one: the list owns
-    // one count per heap element.
-    if let Some(old_s) = impl_ref.get_value(index as usize) {
-        release_element(impl_ref.type_tag, old_s);
-    }
+    // retain the incoming element; the outgoing one is NOT released — a
+    // borrow of it may still be live, so it leaks (bounded by set calls)
     retain_element(
         impl_ref.type_tag,
         std::ptr::read_unaligned(elem as *const i64),
@@ -699,10 +707,8 @@ pub unsafe extern "C" fn pith_list_remove(list: *mut PithList, index: i64, elem_
         return false;
     }
 
-    // Release the list's count before removal
-    if let Some(s) = impl_ref.get_value(index as usize) {
-        release_element(impl_ref.type_tag, s);
-    }
+    // the removed element is NOT released: a borrow may still be live.
+    // it leaks; only the list's free path cascades.
 
     impl_ref.remove(index as usize);
     true
@@ -721,10 +727,8 @@ pub unsafe extern "C" fn pith_list_remove_value(list: PithList, index: i64) -> i
         return 0;
     }
 
-    // Release the list's count before removal
-    if let Some(s) = impl_ref.get_value(index as usize) {
-        release_element(impl_ref.type_tag, s);
-    }
+    // the removed element is NOT released: a borrow may still be live.
+    // it leaks; only the list's free path cascades.
 
     impl_ref.remove(index as usize);
     1
@@ -737,13 +741,8 @@ pub unsafe extern "C" fn pith_list_clear_value(list: PithList) {
         return;
     };
 
-    if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        for i in 0..impl_ref.len() {
-            if let Some(s) = impl_ref.get_value(i) {
-                release_element(impl_ref.type_tag, s);
-            }
-        }
-    }
+    // cleared elements are NOT released: a borrow of one may still be
+    // live. they leak; only the list's free path cascades.
 
     impl_ref.clear();
 }
@@ -772,13 +771,8 @@ pub unsafe extern "C" fn pith_list_clear(list: *mut PithList) {
     };
 
     // Release all elements if they're heap types
-    if matches!(impl_ref.type_tag, ListTypeTag::String) {
-        for i in 0..impl_ref.len() {
-            if let Some(s) = impl_ref.get_value(i) {
-                release_element(impl_ref.type_tag, s);
-            }
-        }
-    }
+    // cleared elements are NOT released: a borrow of one may still be
+    // live. they leak; only the list's free path cascades.
 
     impl_ref.clear();
 }
@@ -931,10 +925,12 @@ mod tests {
             assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
             assert_eq!(pith_list_get_value(list, 0), s as i64);
 
-            // overwriting releases the old element and retains the new one
+            // overwriting retains the new element; the old one is NOT
+            // released (a borrow may still be live) — it leaks with the
+            // list's orphaned count
             let t = crate::pith_copy_bytes_to_cstring(b"next");
             pith_list_set_value(list, 0, t as i64);
-            assert_eq!(crate::cstring_refcount_for_tests(s), None); // freed
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
             assert_eq!(crate::cstring_refcount_for_tests(t), Some(2));
 
             // freeing the list drops its count on every element

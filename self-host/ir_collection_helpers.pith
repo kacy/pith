@@ -103,9 +103,29 @@ pub fn ir_empty_collection_init_call_name(literal_kind: String, child_count: Int
             return "__map_new"
         if target_type == "map_int":
             return "__map_new_int"
+        # composite targets from binds that know the value type: a map with
+        # string values owns a count per value at the runtime level
+        if target_type == "map_str_val":
+            return "__map_new_str_val"
+        if target_type == "map_int_str_val":
+            return "__map_new_int_str_val"
     if literal_kind == "set":
         if target_type == "set":
             return "__set_new"
         if target_type == "set_int":
             return "__set_new_int"
+    if literal_kind == "list":
+        if target_type == "list_string":
+            return "__list_new_str"
+        if target_type == "list":
+            return "__list_new"
     return ""
+
+# composite empty-init targets normalize back to the plain kind for
+# retkinds and type tracking
+pub fn ir_normalize_collection_target(target_type: String) -> String:
+    if target_type == "map_str_val":
+        return "map"
+    if target_type == "map_int_str_val":
+        return "map_int"
+    return target_type

@@ -10,40 +10,44 @@ the helpers in `bench/` before trusting them on different hardware.
 ## where pith stands
 
 `bench/catalog_workload` (in-process service shape: lookups, filtered
-searches, batch json; 200k iterations, medians of 5, july 6):
+searches, batch json; 200k iterations, medians of 5, july 5 after the
+full string/collection reclaim):
 
 | | go | rust | pith |
 |---|---|---|---|
-| total | 404 | 73 | 104 |
+| total | 403 | 69 | 112 |
 
-pith runs this 3.9x faster than go and within 1.4x of rust.
-compute-shaped code is in good shape.
+pith runs this 3.6x faster than go and within 1.6x of rust.
+compute-shaped code stays strong through the arc work.
 
 `bench/std_pipeline` (50k records: csv read/write, per-record transform,
-json, gzip; july 6):
+json, gzip):
 
 | phase | go | rust | pith |
 |---|---|---|---|
 | csv read | ~100 | 72 | 5 |
-| csv write | 190 | 60 | 315 |
-| transform | 51 | 26 | 489 |
-| total | 318 | 136 | 805 |
+| csv write | 210 | 70 | 456 |
+| transform | 53 | 26 | 684 |
+| total | 346 | 148 | 1135 |
 
-2.5x go overall (was 4.1x at the july 4 baseline). the transform gap is
-per-character string temps in the url/path helpers — see the parked
-string-temps work. peak rss on this benchmark is still ~1.45 gb vs
-~270 mb for go and rust, same cause.
+3.3x go overall. this regressed from the 805ms best: the string and
+collection reclaim added rc traffic on exactly this benchmark's hot
+paths, trading ~40% time for 2.5x less memory (below). eliding
+redundant retain/release pairs is the next perf item and should
+recover much of it.
 
-collection churn (a list and map per iteration, 200k iterations) tells
-the reclamation story:
+memory is where the arc work shows. peak rss at 200k records:
 
 | | go | rust | pith |
 |---|---|---|---|
-| peak rss | 9.3 mb | 2.1 mb | 2.6 mb |
-| runtime | 126 | 58 | 150 |
+| std_pipeline peak | 236 mb | 272 mb | 662 mb (was 1.65 gb) |
+| collection churn | 7.5 mb | 2.1 mb | **2.6 mb, alloc == free** |
+| url/path churn | — | — | **2.6 mb, zero leaks** |
 
-pith holds rust's constant-memory shape and uses 3.6x less memory than
-go's gc on this pattern, within 1.2x of go's time.
+churn-shaped work (the long-running-server case) runs in constant
+memory, 2.9x less than go's gc, matching rust's shape. std_pipeline's
+remaining 662 mb is bytes objects and byte buffers, which still never
+free — that's arc phase c.
 
 build times, same machine (go 1.24.4): go cold 10.6s / warm 0.1s; pith
 compiles the same program cold in 1.2s every time — 8.5x faster than

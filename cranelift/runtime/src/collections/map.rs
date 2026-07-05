@@ -220,6 +220,20 @@ pub unsafe extern "C" fn pith_map_new_int() -> PithMap {
     pith_map_new(0, 8, 0) // int keys, 8-byte values, not heap
 }
 
+/// String-key map that owns cstring values: insert retains; overwrite,
+/// remove, clear, and free release. The emitter uses this for
+/// Map[String, String].
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_new_cstr_val() -> PithMap {
+    pith_map_new(1, 8, 1)
+}
+
+/// Int-key map that owns cstring values (Map[Int, String]).
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_new_int_cstr_val() -> PithMap {
+    pith_map_new(0, 8, 1)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_new(key_type: i32, val_size: i64, val_is_heap: i64) -> PithMap {
     let ktype = match key_type {

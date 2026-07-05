@@ -66,6 +66,34 @@ backend — bigger than everything in the table below combined. it needs the
 compiler to emit releases (or a region strategy) for the native path, not
 just runtime tweaks.
 
+### string arc (landed july 2026)
+
+strings now reclaim. heap cstrings carry a refcount header, and the
+compiler emits the ownership operations: retain on binding a borrowed
+value, release on reassignment and at every return, transfer on returns,
+retains at each escape point (struct fields, containers, tuples, closure
+captures). params are borrows — an unmodified string parameter costs no
+rc traffic at all — and concat/interpolation chains free their
+intermediates as they fold.
+
+measured on a 300k-iteration concat/substring/trim loop:
+
+| | before | after |
+|---|---|---|
+| peak rss | 85.5 mb | 15.2 mb |
+| runtime | 131ms | 81ms |
+
+the header bought a second, unplanned win: `len()` on a heap cstring now
+reads the stored length instead of running strlen. profiling showed the
+compiler spent ~80% of its own runtime in strlen — every
+`while i < s.len()` loop over a large string was quadratic. with the
+header length, compiling the whole self-hosted frontend went from ~45
+seconds to under 2 seconds. `make self-host` is now a 1.7s operation.
+
+peak rss on the compiler itself barely moves: that memory is the ast and
+token structures, which still never free. collections, bytes, and structs
+are the next reclamation targets, in that order.
+
 cranelift itself was generating unoptimized code until july 2026
 (`opt_level` defaulted to "none"). turning it to "speed" bought only 2-3%
 on these benchmarks, which confirms the hot path is the runtime above, not
@@ -79,6 +107,7 @@ the generated code.
 | opt_level=speed | 1236ms | 100ms |
 | drop per-access handle lock | 888ms | 93ms |
 | single-allocation string derives | no change | no change |
+| string arc + o(1) cstring length | 804ms | 99ms |
 | inline collection elements | | |
 | arc object-list rework | | |
 

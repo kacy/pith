@@ -498,37 +498,74 @@ fn ir_emit_string_cleanup(exclude: String):
 # under-approximation is safe — a missed name is never released (a leak),
 # while emission-time classification only widens, never narrows, so every
 # collected name really does hold owned counts.
-fn ir_collect_string_bind_names(idx: Int, names: List[String]):
+fn ir_string_prepass_bind_type(parts: IrBindParts, names: List[String]) -> String:
+    mut bind_type := ""
+    if parts.type_idx >= 0:
+        bind_type = ir_resolve_type_node(parts.type_idx)
+    if bind_type.len() == 0 and parts.val_idx >= 0:
+        # the collected names double as a type environment: a bind from an
+        # already-collected string chains its tracking, so a later rebind of
+        # the source cannot release a buffer this variable still borrows.
+        val_node := get_node(parts.val_idx)
+        if val_node.kind == "ident" and names.contains(val_node.value):
+            bind_type = "string"
+        else:
+            bind_type = ir_infer_type(parts.val_idx)
+    return bind_type
+
+fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[String]):
     node := get_node(idx)
     if ir_is_binding_kind(node.kind):
         parts := ir_collect_bind_parts(node)
-        if parts.name.len() > 0 and not names.contains(parts.name):
-            mut bind_type := ""
-            if parts.type_idx >= 0:
-                bind_type = ir_resolve_type_node(parts.type_idx)
-            if bind_type.len() == 0 and parts.val_idx >= 0:
-                # the collected names double as a type environment: a bind
-                # from an already-collected string chains its tracking, so a
-                # later rebind of the source cannot release a buffer this
-                # variable still borrows.
-                val_node := get_node(parts.val_idx)
-                if val_node.kind == "ident" and names.contains(val_node.value):
-                    bind_type = "string"
-                else:
-                    bind_type = ir_infer_type(parts.val_idx)
+        if parts.name.len() > 0:
+            bind_type := ir_string_prepass_bind_type(parts, names)
             if bind_type == "string":
-                names.push(parts.name)
+                if not names.contains(parts.name):
+                    names.push(parts.name)
+            elif not poisoned.contains(parts.name):
+                # the same name bound with a non-string (or unknown) type in
+                # a sibling branch would make retain/release fire on values
+                # that are not strings at runtime. drop it from tracking
+                # entirely — a leak, never a wild pointer.
+                poisoned.push(parts.name)
     for child in node.children:
-        ir_collect_string_bind_names(child, names)
+        ir_collect_string_bind_names(child, names, poisoned)
 
 # prologue for the collected names: zero-store each one and retain string
 # params (params are locals under the same rule, so the exit cleanup
 # releasing them stays balanced with the caller's count).
 mut ir_current_arc_func := ""
 
+# params are borrows: the caller keeps its count alive for the whole call,
+# so an unmodified string param needs no rc traffic at all. a param the
+# body reassigns becomes an owned local — retained in the prologue so
+# release-on-reassign and exit cleanup stay balanced with the caller.
+fn ir_collect_reassigned_string_params(idx: Int, names: List[String]):
+    node := get_node(idx)
+    mut target := ""
+    if node.kind == "assign":
+        target = node.value
+    elif node.kind == "assignment" and node.children.len() > 0:
+        tn := get_node(node.children[0])
+        if tn.kind == "ident":
+            target = tn.value
+    if target.len() > 0 and not names.contains(target):
+        if ir_var_regs.contains_key(target) and ir_lookup_name_type(target) == "string":
+            names.push(target)
+    for child in node.children:
+        ir_collect_reassigned_string_params(child, names)
+
 fn ir_emit_string_prologue(body_idx: Int):
+    mut poisoned: List[String] := []
     if body_idx >= 0:
-        ir_collect_string_bind_names(body_idx, ir_string_locals)
+        ir_collect_reassigned_string_params(body_idx, ir_string_locals)
+        ir_collect_string_bind_names(body_idx, ir_string_locals, poisoned)
+    if poisoned.len() > 0:
+        mut kept: List[String] := []
+        for name in ir_string_locals:
+            if not poisoned.contains(name):
+                kept.push(name)
+        ir_string_locals = kept
     mut i := 0
     while i < ir_string_locals.len():
         name := ir_string_locals[i]
@@ -1390,6 +1427,13 @@ fn ir_emit_binary_expr(node: Node) -> Int:
         return r
     if op == "add" and is_str_op:
         ir_emit("concat " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        # owned operands (nested concats, interpolations, fresh method
+        # results) are garbage once copied into the new buffer; borrowed
+        # operands keep their owner's count. literals release as no-ops.
+        if left_type == "string" and not ir_string_expr_is_borrowed(node.children[0]):
+            ir_string_release_reg(left_r)
+        if right_type == "string" and not ir_string_expr_is_borrowed(node.children[1]):
+            ir_string_release_reg(right_r)
     elif op == "eq":
         if is_str_op:
             ir_emit_call2(r, "__str_eq", "bool", left_r, right_r)
@@ -3718,25 +3762,50 @@ fn ir_string_interp_part_reg(child: Int) -> Int:
         return part_r
     return ir_string_interp_expr_part(child)
 
+fn ir_string_interp_part_owned(child: Int) -> Bool:
+    cn := get_node(child)
+    if cn.kind == "lit":
+        # literal strrefs are static; releasing one is a no-op, so treating
+        # them as owned keeps the fold logic uniform
+        return true
+    # a string-typed expression part passes through as a borrow; any other
+    # part type goes through a to-string conversion and arrives fresh
+    return ir_infer_type(child) != "string" or not ir_string_expr_is_borrowed(child)
+
 fn ir_emit_string_interp(idx: Int) -> Int:
     node := get_node(idx)
-    # concatenate literal parts and expression parts
+    # fold the parts left to right, releasing each intermediate the moment
+    # the next concat has copied it. the fold is straight-line code, so the
+    # releases stay in the same block as the values they drop.
     mut result_r := 0 - 1
+    mut result_owned := false
     mut _fi4 := 0
     kids4_children := node.children
     while _fi4 < kids4_children.len():
         child := kids4_children[_fi4]
         part_r := ir_string_interp_part_reg(child)
+        part_owned := ir_string_interp_part_owned(child)
         if result_r < 0:
             result_r = part_r
+            result_owned = part_owned
         else:
             nr := ir_reg()
             ir_emit("concat " + nr.to_string() + " " + result_r.to_string() + " " + part_r.to_string())
+            if result_owned:
+                ir_string_release_reg(result_r)
+            if part_owned:
+                ir_string_release_reg(part_r)
             result_r = nr
+            result_owned = true
         _fi4 = _fi4 + 1
     if result_r < 0:
         result_r = ir_reg()
         ir_emit("strref " + result_r.to_string() + " " + ir_str(""))
+        result_owned = true
+    if not result_owned:
+        # single borrowed part ("{s}"): callers treat interpolation results
+        # as owned, so give this one its own count
+        ir_string_retain_reg(result_r)
     return result_r
 
 # --- lambda compilation (extracted from ir_expr) ---
@@ -4704,7 +4773,11 @@ fn ir_stmt(idx: Int):
     kind := node.kind
 
     if ir_stmt_is_expr(kind):
-        ir_expr(idx)
+        r := ir_expr(idx)
+        # a discarded owned string result (a popped element, an unused
+        # fresh string) is garbage as soon as the statement ends
+        if ir_infer_type(idx) == "string" and not ir_string_expr_is_borrowed(idx):
+            ir_string_release_reg(r)
         return
 
     if kind == "block":
@@ -5044,8 +5117,6 @@ fn ir_emit_named_param(name: String, param_type: String):
     ir_var_regs.insert(name, r)
     if param_type.len() > 0:
         ir_var_types.insert(name, param_type)
-    if param_type == "string" and not ir_string_locals.contains(name):
-        ir_string_locals.push(name)
     ir_emit("param " + name)
 
 fn ir_emit_fn_params(fn_idx: Int):

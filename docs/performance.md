@@ -10,27 +10,33 @@ the helpers in `bench/` before trusting them on different hardware.
 ## where pith stands
 
 `bench/catalog_workload` (in-process service shape: lookups, filtered
-searches, batch json; 200k iterations):
+searches, batch json; 200k iterations, medians of 5, july 6):
 
 | | go | rust | pith |
 |---|---|---|---|
-| total | 22ms* | 3ms* | 100ms / 5ms* |
+| total | 404 | 73 | 104 |
 
-*go and rust at 10k iterations for scale: go 22ms, rust 3ms, pith 5-6ms.
-pith beats go here and sits within ~2x of rust. compute-shaped code is fine.
+pith runs this 3.9x faster than go and within 1.4x of rust.
+compute-shaped code is in good shape.
 
 `bench/std_pipeline` (50k records: csv read/write, per-record transform,
-json, gzip):
+json, gzip; july 6):
 
 | phase | go | rust | pith |
 |---|---|---|---|
-| csv read | 86 | 47 | 6 |
-| csv write | 180 | 57 | 390 |
-| transform | 44 | 27 | 839 |
-| total | 308 | 133 | 1236 |
+| csv read | ~100 | 72 | 5 |
+| csv write | 190 | 60 | 315 |
+| transform | 51 | 26 | 489 |
+| total | 318 | 136 | 805 |
 
-string-heavy code is the problem: the transform phase turns url and path
-fields into fresh strings per record, and pith pays for it at ~19x go.
+2.5x go overall (was 4.1x at the july 4 baseline). the transform gap is
+per-character string temps in the url/path helpers — see the parked
+string-temps work. peak rss on this benchmark is still ~1.45 gb vs
+~270 mb for go and rust, same cause.
+
+collection churn (a list and map per iteration, 200k iterations) tells
+the reclamation story: pith 2.6 mb / 150ms vs rust 2.1 mb / 58ms — the
+same constant-memory shape, 2.6x rust's time.
 
 ## why (measured, not guessed)
 

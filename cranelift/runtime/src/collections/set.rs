@@ -42,6 +42,8 @@ impl Hash for SetElement {
 pub struct SetImpl {
     /// Magic word for the fast validity check (see set_magic_ok)
     magic: u32,
+    /// Shared-handle refcount (see ListImpl.rc)
+    rc: std::sync::atomic::AtomicU32,
     /// The actual hash set storing unique elements
     data: HashSet<SetElement>,
     /// Type tag for elements (0=int, 1=string)
@@ -61,6 +63,7 @@ impl SetImpl {
     fn new(elem_type: ElemType, _elem_size: usize, elem_is_heap: bool) -> Self {
         SetImpl {
             magic: SET_MAGIC,
+            rc: std::sync::atomic::AtomicU32::new(1),
             data: HashSet::new(),
             elem_type,
             elem_is_heap,
@@ -238,6 +241,17 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
     let Some(impl_ref) = set_mut(set) else {
         return;
     };
+    let prev = impl_ref
+        .rc
+        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    if prev > 1 {
+        return;
+    }
+    if prev == 0 {
+        impl_ref.rc.store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
 
     // Release all elements if they're heap types
     if impl_ref.elem_is_heap {
@@ -258,6 +272,24 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
     (*(set.ptr as *mut SetImpl)).magic = 0;
     handle_registry::unregister(set.ptr as *const (), HandleKind::Set);
     let _ = Box::from_raw(set.ptr as *mut SetImpl);
+}
+
+/// Retain a set handle: one more owner of this shared handle.
+#[no_mangle]
+pub unsafe extern "C" fn pith_set_retain_handle(handle: i64) {
+    if let Some(impl_ref) = set_mut_from_handle(handle) {
+        impl_ref
+            .rc
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Release a set handle; frees the set and its owned elements at zero.
+#[no_mangle]
+pub unsafe extern "C" fn pith_set_release_handle(handle: i64) {
+    pith_set_release(PithSet {
+        ptr: handle as *mut (),
+    });
 }
 
 /// Convert set to list (for int elements)

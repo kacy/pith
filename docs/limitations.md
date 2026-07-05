@@ -18,9 +18,9 @@ something here that now works, the page is stale and a fix to it is welcome.
   name in a pattern is a binding, not a variant — write `Color.Red`, not
   `Red`, to match a variant. equality (`==`) on payload-carrying enum values
   is not defined; compare through match.
-- **range patterns in match** — `0..=9 => ...` is not parsed. range syntax works
-  in `for`, not in match arms. (or-patterns like `1 | 2 | 3 => ...` do work, for
-  literals and qualified variants.)
+- **range patterns are integer-only** — `0..=9 => ...` and `0..10 => ...`
+  work in match arms (and combine with or-patterns and guards), but only for
+  integer subjects and non-negative literal bounds.
 - **`if let` / `while let` are statement-only** — `if let Shape.Circle(r) = s:`
   destructures a variant and `if let v = maybe():` unwraps an optional, but
   neither form works as an expression, and literal patterns are not allowed

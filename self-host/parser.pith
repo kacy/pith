@@ -993,6 +993,17 @@ fn parse_pattern() -> Int:
     if _cur_tok_kind() == "int_lit":
         _tv := _cur_tok_value()
         advance_token()
+        if check("dotdot") or check("dotdoteq"):
+            mut range_kind := "excl"
+            if check("dotdoteq"):
+                range_kind = "incl"
+            advance_token()
+            hi_val := _cur_tok_value()
+            expect("int_lit")
+            lo_leaf := add_leaf_with_position("pat_int", _tv)
+            hi_leaf := add_leaf_with_position("pat_int", hi_val)
+            mut range_children: List[Int] := [lo_leaf, hi_leaf]
+            return add_node_with_position("pat_range", range_kind, range_children)
         return add_leaf_with_position("pat_int", _tv)
 
     if _cur_tok_kind() == "float_lit":

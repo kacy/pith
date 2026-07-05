@@ -4456,6 +4456,20 @@ fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
             return r
         ir_emit("iconst " + r.to_string() + " 0")
         return r
+    if pat.kind == "pat_range":
+        # lo <= subject and subject <= hi ("incl") or < hi ("excl")
+        lo_r := ir_emit_int_literal(get_node(pat.children[0]))
+        hi_r := ir_emit_int_literal(get_node(pat.children[1]))
+        lo_ok := ir_reg()
+        ir_emit("gte " + lo_ok.to_string() + " " + subj_r.to_string() + " " + lo_r.to_string())
+        hi_ok := ir_reg()
+        if pat.value == "incl":
+            ir_emit("lte " + hi_ok.to_string() + " " + subj_r.to_string() + " " + hi_r.to_string())
+        else:
+            ir_emit("lt " + hi_ok.to_string() + " " + subj_r.to_string() + " " + hi_r.to_string())
+        r := ir_reg()
+        ir_emit("and " + r.to_string() + " " + lo_ok.to_string() + " " + hi_ok.to_string())
+        return r
     if pat.kind == "pat_or":
         # matches when any alternative matches.
         mut acc_r := ir_emit_match_cond(pat.children[0], subj_r)

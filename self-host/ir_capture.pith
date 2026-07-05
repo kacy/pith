@@ -35,10 +35,10 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blo
         mut updated_free := ir_copy_names(free)
         for child in node.children:
             cn := get_node(child)
-            if cn.kind == "body":
+            if cn.kind == "body" or cn.kind == "block":
                 updated_free = ir_find_free_vars_walk(child, inner_bound, updated_free, blocked_names)
         return updated_free
-    if node.kind == "body":
+    if node.kind == "body" or node.kind == "block":
         mut scoped_bound := ir_copy_names(bound)
         mut updated_free := ir_copy_names(free)
         for child in node.children:

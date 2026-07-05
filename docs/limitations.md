@@ -27,7 +27,9 @@ something here that now works, the page is stale and a fix to it is welcome.
   in the let position.
 - **closure capture cap** — a closure captures at most 16 variables. captures
   are heap-allocated per closure instance, so nesting and recursion are safe;
-  the cap is a fixed ceiling, not a correctness issue.
+  the cap is a fixed ceiling, not a correctness issue. (multi-line closure
+  bodies — `fn(x):` with an indented block — work and infer their return
+  type from their return statements.)
 
 ## standard library
 

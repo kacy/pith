@@ -912,10 +912,10 @@ fn allocate_buffered_bytes_reader_handle(source_kind: Int, source_handle: Int, c
 fn make_buffered_bytes_reader(source_kind: Int, source_handle: Int, chunk_size: Int) -> BufferedBytesReader:
     return BufferedBytesReader(allocate_buffered_bytes_reader_handle(source_kind, source_handle, chunk_size))
 
-# a reader or writer handle owns entries in the registry maps; a long-
-# running process must free them when the stream is done, or every
-# request's buffers stay reachable forever. take() hands the cached
-# bytes to a local whose cleanup releases it.
+## drop a buffered reader's registry entries. a long-running process
+## must free readers when the stream is done, or every request's
+## buffers stay reachable forever. take() hands the cached bytes to a
+## local whose cleanup releases them.
 pub fn free_buffered_bytes_reader(reader: BufferedBytesReader):
     cached := buffered_bytes_reader_cache.take(reader.handle)
     if cached.len() < 0:
@@ -924,6 +924,8 @@ pub fn free_buffered_bytes_reader(reader: BufferedBytesReader):
     buffered_bytes_reader_source_handles.remove(reader.handle)
     buffered_bytes_reader_chunk_sizes.remove(reader.handle)
 
+## drop a buffered writer's registry entries; the counterpart of
+## free_buffered_bytes_reader for the write side.
 pub fn free_buffered_bytes_writer(writer: BufferedBytesWriter):
     cached := buffered_bytes_writer_cache.take(writer.handle)
     if cached.len() < 0:

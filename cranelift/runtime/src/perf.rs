@@ -9,6 +9,10 @@ pub static PERF_RC_RETAINS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_RC_RELEASES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_STRING_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_STRING_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_CSTRING_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_CSTRING_FREES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_CSTRING_RETAINS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_CSTRING_RELEASES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTES_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTES_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_NEWS: AtomicUsize = AtomicUsize::new(0);
@@ -86,6 +90,14 @@ pub fn dump_perf_stats() {
     eprintln!(
         "  rc releases: {}",
         PERF_RC_RELEASES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  cstrings: alloc={} free={} live={} retain={} release={}",
+        PERF_CSTRING_ALLOCS.load(Ordering::Relaxed),
+        PERF_CSTRING_FREES.load(Ordering::Relaxed),
+        PERF_CSTRING_ALLOCS.load(Ordering::Relaxed) as i64 - PERF_CSTRING_FREES.load(Ordering::Relaxed) as i64,
+        PERF_CSTRING_RETAINS.load(Ordering::Relaxed),
+        PERF_CSTRING_RELEASES.load(Ordering::Relaxed),
     );
     eprintln!(
         "  string allocs: {} bytes={}",

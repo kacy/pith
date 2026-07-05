@@ -12,12 +12,16 @@ pub static PERF_STRING_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CSTRING_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CSTRING_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CSTRING_RETAINS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_CSTRING_RETAINS_PUSH: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_CASCADE_RELEASES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CSTRING_RELEASES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTES_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTES_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_NEWS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_NEWS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_LIST_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_PUSHES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_GETS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_GET_VALUE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -100,6 +104,11 @@ pub fn dump_perf_stats() {
         PERF_CSTRING_RELEASES.load(Ordering::Relaxed),
     );
     eprintln!(
+        "  cstring retains from container pushes: {} cascade releases: {}",
+        PERF_CSTRING_RETAINS_PUSH.load(Ordering::Relaxed),
+        PERF_LIST_CASCADE_RELEASES.load(Ordering::Relaxed),
+    );
+    eprintln!(
         "  string allocs: {} bytes={}",
         PERF_STRING_ALLOCS.load(Ordering::Relaxed),
         PERF_STRING_ALLOC_BYTES.load(Ordering::Relaxed)
@@ -114,6 +123,12 @@ pub fn dump_perf_stats() {
         PERF_BYTE_BUFFER_NEWS.load(Ordering::Relaxed),
         PERF_BYTE_BUFFER_WRITES.load(Ordering::Relaxed),
         PERF_BYTE_BUFFER_WRITE_BYTES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  lists: new={} free={} live={}",
+        PERF_LIST_NEWS.load(Ordering::Relaxed),
+        PERF_LIST_FREES.load(Ordering::Relaxed),
+        PERF_LIST_NEWS.load(Ordering::Relaxed) as i64 - PERF_LIST_FREES.load(Ordering::Relaxed) as i64,
     );
     eprintln!(
         "  list ops: push={} get={} get_value={} checked={} unchecked={} get_bytes={} elem8={} elem_other={} set={} insert={} remove={}",

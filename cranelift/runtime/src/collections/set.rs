@@ -346,12 +346,14 @@ pub unsafe extern "C" fn pith_set_to_list_string(
         };
     }
 
-    let list = pith_list_new(8, 0);
+    // string-tagged: the list owns the freshly copied element strings
+    let list = pith_list_new(8, 1);
 
     for elem in impl_ref.iter() {
         if let SetElement::String(bytes) = elem {
             let ptr = crate::pith_copy_bytes_to_cstring(bytes);
             pith_list_push_value(list, ptr as i64);
+            crate::pith_cstring_release(ptr as *const i8);
         }
     }
 

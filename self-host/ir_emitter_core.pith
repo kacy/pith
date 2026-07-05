@@ -52,7 +52,7 @@ from ir_call_helpers import ir_is_declared_callable_with_state, ir_declared_call
 from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_param_name_at, ir_generic_preferred_name_with_state, ir_json_generic_name_with_state, ir_config_generic_name_with_state, ir_toml_generic_name_with_state, ir_resolve_generic_module_call_name, ir_encode_type_list, ir_decode_type_list, ir_generic_specialization_key, ir_generic_specialization_name, ir_specialize_type_name_with_state, ir_resolve_type_node_with_subst_with_state, ir_extract_return_type_with_subst_with_state, ir_extract_optional_inner_type_with_subst_with_state, ir_extract_param_types_with_subst_with_state
 from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_count_with_state, ir_struct_field_name_at_with_state, ir_struct_field_type_name_with_state, ir_struct_field_kind_from_decl_with_state, ir_field_kind_tid_with_state, ir_struct_field_tid_at_with_state, ir_struct_field_default_node_with_state
 from ir_control_helpers import IrIfBranch, IrForBindingNames, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
-from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name, ir_lookup_map_value_type_for_expr_with_state, ir_index_get_call_name, ir_index_set_call_name, ir_for_loop_item_call_name, ir_for_loop_item_return_kind, ir_for_iter_item_kind, ir_for_iter_conversion_call, ir_for_iter_conversion_return_kind, ir_for_len_call_name, ir_empty_collection_init_call_name
+from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name, ir_lookup_map_value_type_for_expr_with_state, ir_index_get_call_name, ir_index_set_call_name, ir_for_loop_item_call_name, ir_for_loop_item_return_kind, ir_for_iter_item_kind, ir_for_iter_conversion_call, ir_for_iter_conversion_return_kind, ir_for_len_call_name, ir_empty_collection_init_call_name, ir_normalize_collection_target
 from ir_field_helpers import ir_emit_named_field_access_with_state, ir_emit_tuple_field_access
 from ir_operator_helpers import ir_emit_unary_op, ir_emit_simple_binary, ir_is_float_arithmetic, ir_emit_float_binary, ir_binary_simple_ir_op, ir_compound_assignment_ir_op
 from ir_list_helpers import ir_is_list_runtime_type, ir_emit_list_map_loop, ir_emit_list_filter_loop, ir_emit_list_reduce_loop, ir_emit_list_is_empty, ir_emit_list_missing_index_result, ir_emit_list_index_search_loop, ir_emit_list_contains_from_index
@@ -480,10 +480,10 @@ fn ir_rc_kind(type_hint: String) -> String:
         return "set"
     return ""
 
-# release emission per kind is staged: strings first (landed), collections
-# once their containers are tagged so element counts balance.
+# every rc kind releases: strings via their header count, collections via
+# the shared-handle count with a free-time element cascade.
 fn ir_rc_release_enabled(kind: String) -> Bool:
-    return kind == "string"
+    return kind.len() > 0
 
 fn ir_rc_retain_reg(r: Int, kind: String):
     if kind == "string":
@@ -504,6 +504,19 @@ fn ir_rc_release_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_map_release_handle", "void", r)
     elif kind == "set":
         ir_emit_call1(ir_reg(), "pith_set_release_handle", "void", r)
+
+# a map target whose value type is string picks the heap-value
+# constructor for empty literals, so runtime inserts retain
+fn ir_map_init_target(name: String, target_type: String) -> String:
+    mut val_type := ir_lookup_map_value_type(name)
+    if val_type.len() == 0 and ir_global_map_value_types.contains_key(name):
+        val_type = ir_global_map_value_types[name]
+    if val_type == "string":
+        if target_type == "map":
+            return "map_str_val"
+        if target_type == "map_int":
+            return "map_int_str_val"
+    return target_type
 
 fn ir_rc_local_kind(name: String) -> String:
     mut i := 0
@@ -536,6 +549,16 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
         return false
     if node.kind == "grouped" and node.children.len() > 0:
         return ir_string_expr_is_borrowed(node.children[0])
+    # collection literals mint fresh containers, and collection-typed call
+    # results arrive with a transferred count (user returns exclude the
+    # local, runtime producers build new containers). variable, element,
+    # and field reads stay borrows.
+    if node.kind == "list" or node.kind == "map" or node.kind == "set":
+        return false
+    if node.kind == "call" or node.kind == "method_call":
+        expr_kind := ir_rc_kind(ir_infer_type(idx))
+        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set":
+            return false
     if node.kind == "method_call":
         return not ir_string_method_returns_fresh(ir_plain_method_name(node.value))
     return true
@@ -1324,7 +1347,7 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
     empty_init_call := ir_empty_collection_init_call_name(vn.kind, vn.children.len(), target_type)
     if empty_init_call.len() > 0:
         r := ir_reg()
-        ir_emit_call0(r, empty_init_call, target_type)
+        ir_emit_call0(r, empty_init_call, ir_normalize_collection_target(target_type))
         return r
     return ir_expr(val_idx)
 
@@ -3311,8 +3334,6 @@ fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node):
         return
     k_r := ir_expr(entry.children[0])
     v_r := ir_expr(entry.children[1])
-    if ir_infer_type(entry.children[1]) == "string" and ir_string_expr_is_borrowed(entry.children[1]):
-        ir_string_retain_reg(v_r)
     if has_int_keys:
         ir_emit_call3(ir_reg(), "map_insert_ikey", "void", map_r, k_r, v_r)
     else:
@@ -3321,8 +3342,18 @@ fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node):
 fn ir_emit_map_literal(node: Node) -> Int:
     map_r := ir_reg()
     has_int_keys := ir_map_uses_int_keys(node)
+    mut val_is_string := false
+    if node.children.len() > 0:
+        entry0 := get_node(node.children[0])
+        if entry0.kind == "entry" and entry0.children.len() >= 2:
+            val_is_string = ir_infer_type(entry0.children[1]) == "string"
     if has_int_keys:
-        ir_emit_call0(map_r, "__map_new_int", "map_int")
+        if val_is_string:
+            ir_emit_call0(map_r, "__map_new_int_str_val", "map_int")
+        else:
+            ir_emit_call0(map_r, "__map_new_int", "map_int")
+    elif val_is_string:
+        ir_emit_call0(map_r, "__map_new_str_val", "map")
     else:
         ir_emit_call0(map_r, "__map_new", "map")
     for child in node.children:
@@ -3338,13 +3369,25 @@ fn ir_emit_set_literal(node: Node) -> Int:
         ir_emit_call2(ir_reg(), ir_set_add_name(literal_type), "void", set_r, elem_r)
     return set_r
 
+fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
+    if elem_kind == "string":
+        return "__list_new_str"
+    if elem_kind == "list":
+        return "__list_new_list"
+    if elem_kind == "map":
+        return "__list_new_map"
+    return "__list_new"
+
 fn ir_emit_list_literal(node: Node) -> Int:
+    # a tagged list owns its heap elements: the runtime push retains, and
+    # release cascades. element kind comes from the first element.
+    mut elem_kind := ""
+    if node.children.len() > 0:
+        elem_kind = ir_rc_kind(ir_infer_type(node.children[0]))
     list_r := ir_reg()
-    ir_emit_call0(list_r, "__list_new", "list")
+    ir_emit_call0(list_r, ir_list_ctor_for_elem_kind(elem_kind), "list")
     for child in node.children:
         elem_r := ir_expr(child)
-        if ir_infer_type(child) == "string" and ir_string_expr_is_borrowed(child):
-            ir_string_retain_reg(elem_r)
         ir_emit_call2(ir_reg(), "__list_push", "void", list_r, elem_r)
     return list_r
 
@@ -3972,15 +4015,29 @@ fn ir_emit_method_call(idx: Int) -> Int:
     # transfer theirs. untagged containers never release, so a wrong guess
     # here can only leak, never dangle.
     if not impl_dispatch:
+        # tagged containers retain their elements in the runtime. the
+        # emitter still adds a count where tagging cannot be guaranteed:
+        # channel sends, container values inside maps, and collection
+        # values inside lists (an empty-annotated List[List] is
+        # indistinguishable from List[Int] in the type strings, so it is
+        # created untagged). a double count on a tagged container is a
+        # bounded leak; a missing count is a dangling element.
         mut store_value_pos := 0 - 1
-        if emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push" or emit_name == "send":
+        if emit_name == "send" or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
             store_value_pos = 0
         elif emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey" or emit_name == "set" or emit_name == "pith_list_set_value":
             store_value_pos = 1
         if store_value_pos >= 0 and store_value_pos < arg_regs.len():
             value_expr := ir_method_call_arg_expr(node, store_value_pos)
-            if value_expr >= 0 and ir_infer_type(value_expr) == "string" and ir_string_expr_is_borrowed(value_expr):
-                ir_string_retain_reg(arg_regs[store_value_pos])
+            if value_expr >= 0:
+                store_kind := ir_rc_kind(ir_infer_type(value_expr))
+                mut compensate := false
+                if emit_name == "send":
+                    compensate = store_kind.len() > 0
+                elif store_kind == "list" or store_kind == "map" or store_kind == "set":
+                    compensate = true
+                if compensate and ir_string_expr_is_borrowed(value_expr):
+                    ir_rc_retain_reg(arg_regs[store_value_pos], store_kind)
     call_args := ir_method_call_arg_regs(obj_r, arg_regs)
     if emit_name == "identity" and not impl_dispatch:
         return obj_r
@@ -4457,11 +4514,13 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     if value_type.len() == 0:
         value_type = ir_infer_type(value_idx)
     value_r := ir_emit_value_for_target(value_idx, value_type)
-    # the container keeps a count for a stored borrowed string; owned results
-    # transfer theirs. untagged containers never release, so this can only
-    # leak, never dangle.
-    if value_type == "string" and ir_string_expr_is_borrowed(value_idx):
-        ir_string_retain_reg(value_r)
+    # tagged containers retain stored elements in the runtime; the emitter
+    # compensates only for maps holding lists/maps/sets, which have no
+    # tagged constructor yet.
+    idx_store_kind := ir_rc_kind(value_type)
+    if idx_store_kind == "list" or idx_store_kind == "map" or idx_store_kind == "set":
+        if ir_string_expr_is_borrowed(value_idx):
+            ir_rc_retain_reg(value_r, idx_store_kind)
     ir_emit_call3(ir_reg(), ir_index_set_call_name(obj_type), "void", obj_r, idx_r, value_r)
     return true
 
@@ -4939,7 +4998,7 @@ fn ir_emit_bind_stmt(node: Node):
         if tracked and ir_rc_release_enabled(bind_kind):
             old_r = ir_reg()
             ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
-        r := ir_emit_value_for_target(val_idx, target_type)
+        r := ir_emit_value_for_target(val_idx, ir_map_init_target(name, target_type))
         if tracked and ir_string_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:
@@ -4966,7 +5025,7 @@ fn ir_emit_assign_stmt(node: Node):
             if tracked or (legacy_kind == "string" and ir_global_string_names.contains(name)):
                 old_r = ir_reg()
                 ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
-        r := ir_emit_value_for_target(node.children[0], ir_lookup_name_type(name))
+        r := ir_emit_value_for_target(node.children[0], ir_map_init_target(name, ir_lookup_name_type(name)))
         if legacy_kind.len() > 0 and ir_string_expr_is_borrowed(node.children[0]):
             ir_rc_retain_reg(r, legacy_kind)
         if old_r >= 0:
@@ -5063,7 +5122,7 @@ fn ir_emit_compound_assignment(node: Node):
             if tracked or (assign_kind == "string" and ir_global_string_names.contains(name)):
                 old_r = ir_reg()
                 ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
-        r := ir_emit_value_for_target(node.children[1], target_type)
+        r := ir_emit_value_for_target(node.children[1], ir_map_init_target(name, target_type))
         if assign_kind.len() > 0 and ir_string_expr_is_borrowed(node.children[1]):
             ir_rc_retain_reg(r, assign_kind)
         if old_r >= 0:
@@ -6066,12 +6125,23 @@ fn ir_emit_collection_global_init(binding: Node):
         gcn := get_node(gc)
         if gcn.kind == "list":
             list_r := ir_reg()
-            ir_emit_call0(list_r, "__list_new", "list")
+            if ir_global_list_string_names.contains(gname):
+                ir_emit_call0(list_r, "__list_new_str", "list")
+            else:
+                ir_emit_call0(list_r, "__list_new", "list")
             ir_emit("store " + gname + " " + list_r.to_string())
         elif gcn.kind == "map":
             map_r := ir_reg()
+            mut global_str_val := false
+            if ir_global_map_value_types.contains_key(gname):
+                global_str_val = ir_global_map_value_types[gname] == "string"
             if ir_global_map_int_names.contains(gname):
-                ir_emit_call0(map_r, "__map_new_int", "map_int")
+                if global_str_val:
+                    ir_emit_call0(map_r, "__map_new_int_str_val", "map_int")
+                else:
+                    ir_emit_call0(map_r, "__map_new_int", "map_int")
+            elif global_str_val:
+                ir_emit_call0(map_r, "__map_new_str_val", "map")
             else:
                 ir_emit_call0(map_r, "__map_new", "map")
             ir_emit("store " + gname + " " + map_r.to_string())

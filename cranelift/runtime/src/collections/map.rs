@@ -307,13 +307,9 @@ pub unsafe extern "C" fn pith_map_insert_int(
     let val_vec = val_slice.to_vec();
 
     // Release old value if present
-    // The map owns one count per stored string value: release the value
-    // being overwritten, retain the incoming one.
+    // The map owns one count per stored string value. the overwritten
+    // value is NOT released — a borrow may still be live — so it leaks.
     if impl_ref.val_is_heap {
-        if let Some(old_val) = impl_ref.get(&MapKey::Int(key)) {
-            let old = std::ptr::read_unaligned(old_val.as_ptr() as *const i64);
-            crate::pith_cstring_release(old as *const i8);
-        }
         crate::pith_cstring_retain(value as *const i8);
     }
 
@@ -477,12 +473,9 @@ pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, v
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_INSERTS, 1);
     let map_key = cstr_to_map_key(key);
-    // The map owns one count per stored string value.
+    // the map retains the incoming value; an overwritten one is NOT
+    // released (a borrow may still be live) and leaks
     if impl_ref.val_is_heap {
-        if let Some(old_val) = impl_ref.get(&map_key) {
-            let old = std::ptr::read_unaligned(old_val.as_ptr() as *const i64);
-            crate::pith_cstring_release(old as *const i8);
-        }
         crate::pith_cstring_retain(value as *const i8);
     }
     let val_bytes = value.to_le_bytes().to_vec();
@@ -604,12 +597,7 @@ pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_REMOVES, 1);
     let map_key = cstr_to_map_key(key);
-    if impl_ref.val_is_heap {
-        if let Some(old_val) = impl_ref.get(&map_key) {
-            let old = std::ptr::read_unaligned(old_val.as_ptr() as *const i64);
-            crate::pith_cstring_release(old as *const i8);
-        }
-    }
+    // the removed value is NOT released: a borrow may still be live
     impl_ref.remove(&map_key);
 }
 
@@ -634,10 +622,6 @@ pub unsafe extern "C" fn pith_map_insert_ikey(map_handle: i64, key: i64, value: 
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
         if impl_ref.val_is_heap {
-            if let Some(old_val) = impl_ref.get(&MapKey::Int(key)) {
-                let old = std::ptr::read_unaligned(old_val.as_ptr() as *const i64);
-                crate::pith_cstring_release(old as *const i8);
-            }
             crate::pith_cstring_retain(value as *const i8);
         }
         let val_bytes = value.to_le_bytes().to_vec();
@@ -714,12 +698,7 @@ pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
         impl_ref.remove_int_value(key);
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_REMOVES, 1);
-        if impl_ref.val_is_heap {
-            if let Some(old_val) = impl_ref.get(&MapKey::Int(key)) {
-                let old = std::ptr::read_unaligned(old_val.as_ptr() as *const i64);
-                crate::pith_cstring_release(old as *const i8);
-            }
-        }
+        // the removed value is NOT released: a borrow may still be live
         impl_ref.remove(&MapKey::Int(key));
     }
 }

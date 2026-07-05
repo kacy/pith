@@ -90,9 +90,31 @@ compiler spent ~80% of its own runtime in strlen — every
 header length, compiling the whole self-hosted frontend went from ~45
 seconds to under 2 seconds. `make self-host` is now a 1.7s operation.
 
+### collection arc (landed july 2026)
+
+lists, maps, and sets are refcounted shared handles now: the emitter
+retains on aliasing binds and escapes, releases on rebinding and at every
+return, and containers created with a known element type release their
+elements when the last count drops. removed and overwritten elements are
+deliberately NOT released — a borrow of one may still be live — so those
+leak until escape analysis can prove otherwise; only the free path
+cascades.
+
+the payoff shows on churn-shaped work (the server case): a loop building
+a 50-element list and a small map per iteration, 200k iterations —
+
+| | before | after |
+|---|---|---|
+| peak rss | 218 mb | 2.6 mb |
+| runtime | 343ms | 179ms |
+
+constant memory where growth was unbounded. std_pipeline's peak drops
+more modestly (1.65 gb to 1.45 gb at 200k records) because its memory is
+dominated by bytes objects and buffers, which still never free.
+
 peak rss on the compiler itself barely moves: that memory is the ast and
-token structures, which still never free. collections, bytes, and structs
-are the next reclamation targets, in that order.
+token structures held in globals. bytes and structs are the next
+reclamation targets, in that order.
 
 cranelift itself was generating unoptimized code until july 2026
 (`opt_level` defaulted to "none"). turning it to "speed" bought only 2-3%
@@ -108,7 +130,11 @@ the generated code.
 | drop per-access handle lock | 888ms | 93ms |
 | single-allocation string derives | no change | no change |
 | string arc + o(1) cstring length | 804ms | 99ms |
+| collection arc | 904ms* | 103ms |
 | inline collection elements | | |
+
+*collection arc costs std_pipeline ~10% in rc traffic; the churn table
+above is what it buys.
 | arc object-list rework | | |
 
 target: std_pipeline within ~1.5x of go (about 460ms). compile time is

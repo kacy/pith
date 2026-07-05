@@ -3164,6 +3164,33 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         if is_error_type(sync_result) == false:
             return sync_result
 
+    # enum variant constructors: Shape.Circle(2.5). the receiver is the enum
+    # type itself and the variant's payload types are the parameters; the
+    # expression produces a value of the enum type.
+    if recv_info.kind == "enum":
+        mut vi := 0
+        while vi < recv_info.variants.len():
+            if recv_info.variants[vi] == method_name:
+                payload_types := recv_info.variant_types[vi]
+                if arg_indices.len() != payload_types.len():
+                    report_error("E207", method_name + " expects " + payload_types.len().to_string() + " arguments, got " + arg_indices.len().to_string())
+                    return TID_ERR
+                mut pi := 0
+                for pai in arg_indices:
+                    pa_node := get_node(pai)
+                    mut pa_expr := pai
+                    if pa_node.kind == "arg":
+                        if pa_node.children.len() > 0:
+                            pa_expr = pa_node.children[0]
+                    pa_type := c_check_expr(pa_expr, scope_id)
+                    if is_error_type(pa_type) == false and pi < payload_types.len():
+                        if pa_type != payload_types[pi]:
+                            if types_structurally_equal(pa_type, payload_types[pi]) == false:
+                                report_error("E219", "argument type mismatch: expected " + get_type_name(payload_types[pi]) + ", got " + get_type_name(pa_type))
+                    pi = pi + 1
+                return receiver_type
+            vi = vi + 1
+
     # user-defined methods. methods on a generic struct are registered under
     # the base name (e.g. "Iter"), so fall back to that if the qualified name
     # (e.g. "Iter[Int].next") doesn't match a declaration.

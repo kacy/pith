@@ -11,11 +11,13 @@ something here that now works, the page is stale and a fix to it is welcome.
   named fields (`Point(x: 3, y: 4)`, any order, defaults may be omitted), but
   generic structs like `Box[T]` still need positional arguments; the type
   inference doesn't reorder named fields yet.
-- **match on variant payloads** — `match` lowers literals, qualified enum
-  variants (`Color.Red`), bindings, wildcards, and guards. it does not yet
-  destructure a variant's payload (`Circle(r) => r * r`) or match tuple
-  patterns. note a bare name in a pattern is a binding, not a variant — write
-  `Color.Red`, not `Red`, to match a variant.
+- **match pattern gaps** — variant payloads now construct and destructure
+  (`Shape.Circle(2.0)`, `Shape.Circle(r) => r * r`, with literal sub-patterns
+  and guards). still missing: tuple patterns, `none` patterns in match, and
+  payload bindings inside or-patterns (`Circle(r) | Square(r)`). note a bare
+  name in a pattern is a binding, not a variant — write `Color.Red`, not
+  `Red`, to match a variant. equality (`==`) on payload-carrying enum values
+  is not defined; compare through match.
 - **range patterns in match** — `0..=9 => ...` is not parsed. range syntax works
   in `for`, not in match arms. (or-patterns like `1 | 2 | 3 => ...` do work, for
   literals and qualified variants.)

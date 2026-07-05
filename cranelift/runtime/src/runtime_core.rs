@@ -83,7 +83,7 @@ pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
 /// before the header word is ever read; an aligned literal gets one read
 /// of the 16 bytes in front of it (mapped binary data) and fails the magic
 /// compare. Same practical-guard contract as the collection magic words.
-unsafe fn cstring_base(s: *const i8) -> Option<*mut u8> {
+pub(crate) unsafe fn cstring_base(s: *const i8) -> Option<*mut u8> {
     let addr = s as usize;
     if addr < CSTRING_HEADER_SIZE || addr % CSTRING_ALIGN != 0 {
         return None;
@@ -113,9 +113,31 @@ pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
     if let Some(base) = cstring_base(s) {
-        let last = cstring_refcount(base).fetch_sub(1, std::sync::atomic::Ordering::Release) == 1;
-        if last {
+        let prev = cstring_refcount(base).fetch_sub(1, std::sync::atomic::Ordering::Release);
+        if prev == 0 {
+            // an over-release means the emitter's ownership accounting is
+            // wrong somewhere; report it loudly in debug runs instead of
+            // corrupting the heap.
+            if cstring_debug_no_free() {
+                let data_len = (base.add(8) as *const u64).read() as usize;
+                let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(60));
+                eprintln!(
+                    "pith debug: cstring over-release: {:?}",
+                    String::from_utf8_lossy(bytes)
+                );
+            }
+            cstring_refcount(base).store(0, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        if prev == 1 {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            if cstring_debug_no_free() {
+                // scrub instead of freeing: a read-after-release shows up
+                // as '!' runs in program output instead of silent reuse
+                let data_len = (base.add(8) as *const u64).read() as usize;
+                std::ptr::write_bytes(s as *mut u8, b'!', data_len);
+                return;
+            }
             let data_len = (base.add(8) as *const u64).read() as usize;
             (base as *mut u32).write(0);
             std::alloc::dealloc(base, cstring_layout(data_len));
@@ -123,10 +145,22 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
     }
 }
 
+/// Debug switch: keep freed cstrings alive and report over-releases, so an
+/// accounting bug in emitted code shows up as a message, not corruption.
+fn cstring_debug_no_free() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("PITH_CSTRING_NOFREE").is_ok())
+}
+
 /// Test-only view of a heap cstring's refcount (None for literals/null).
 #[cfg(test)]
 pub(crate) unsafe fn cstring_refcount_for_tests(s: *const i8) -> Option<u32> {
     cstring_base(s).map(|base| cstring_refcount(base).load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// O(1) length for heap cstrings via the header; None for literals.
+pub(crate) unsafe fn cstring_header_len(s: *const i8) -> Option<i64> {
+    cstring_base(s).map(|base| (base.add(8) as *const u64).read() as i64)
 }
 
 pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {

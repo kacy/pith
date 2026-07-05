@@ -313,6 +313,12 @@ pub extern "C" fn pith_cstring_len(cstr: *const i8) -> i64 {
         return 0;
     }
     unsafe {
+        // heap cstrings carry their length in the refcount header, which
+        // turns every s.len() — including loops over multi-megabyte
+        // strings — into one read instead of a strlen
+        if let Some(len) = crate::cstring_header_len(cstr) {
+            return len;
+        }
         let mut len = 0i64;
         let mut p = cstr;
         while *p != 0 {

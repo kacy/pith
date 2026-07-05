@@ -252,6 +252,13 @@ pub unsafe extern "C" fn pith_list_new_default() -> PithList {
     pith_list_new(8, 0)
 }
 
+/// Create a list that owns cstring elements: push/insert retain, remove and
+/// free release. The emitter uses this for List[String].
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_new_cstr() -> PithList {
+    pith_list_new(8, 1)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithList {
     let tag = match type_tag {

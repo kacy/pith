@@ -944,12 +944,13 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_args_to_list() -> i64 {
-    let list = pith_list_new(8, 0);
+    let list = pith_list_new(8, 1);
 
     for arg in std::env::args() {
         let arg_len = arg.len();
         let arg_ptr = pith_copy_bytes_to_cstring(&arg.as_bytes()[..arg_len]);
         pith_list_push_value(list, arg_ptr as i64);
+        pith_cstring_release(arg_ptr as *const i8);
     }
 
     list.ptr as i64

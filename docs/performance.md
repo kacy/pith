@@ -153,10 +153,25 @@ std.os.path helpers):
 
 eleven times less memory, at ~30% time cost in rc traffic on
 char-heavy paths — the tradeoff favors long-running processes.
-std_pipeline's peak drops 1.45 gb to 0.88 gb. the residual 40 mb is
-`chr()` results and other call temps in comparison position, still
-classified as borrowed; that and the rc call overhead are the next
-string items.
+std_pipeline's peak drops 1.45 gb to 0.88 gb.
+
+### argument temps (landed july 2026)
+
+the last string-leak class: owned temps in argument position.
+`parts.push(s.substring(start, i))` transferred the substring into the
+container (which retains), but the temp's own creation count was never
+released — the cstring counters showed container pushes and free-time
+cascades perfectly balanced at 1.2m each, with exactly the creation
+counts leaking. owned string arguments now release right after the
+call they feed: callees borrow their params, and storing callees
+(containers, struct fields, channels) add their own count.
+
+with this, the url/path churn loop runs at **2.6 mb constant with
+alloc == free exactly** — zero string leaks. std_pipeline's peak
+drops to 0.66 gb (from 1.65 gb pre-arc). the accumulated rc traffic
+now costs std_pipeline ~15% (961→1102ms); eliding provably-redundant
+retain/release pairs is the next perf item, ahead of bytes
+reclamation.
 
 cranelift itself was generating unoptimized code until july 2026
 (`opt_level` defaulted to "none"). turning it to "speed" bought only 2-3%
@@ -174,6 +189,7 @@ the generated code.
 | string arc + o(1) cstring length | 804ms | 99ms |
 | collection arc | 904ms* | 103ms |
 | string temp reclaim | 961ms | 104ms |
+| argument temp reclaim | 1102ms | 104ms |
 | inline collection elements | | |
 
 *collection arc costs std_pipeline ~10% in rc traffic; the churn table

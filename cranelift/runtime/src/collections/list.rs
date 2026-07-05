@@ -58,6 +58,7 @@ pub const LIST_IMPL_VALUES8_LEN_OFFSET: i32 = std::mem::offset_of!(ListImpl, val
 
 impl ListImpl {
     fn new(elem_size: usize, type_tag: ListTypeTag) -> Self {
+        crate::perf_count(&crate::PERF_LIST_NEWS, 1);
         let mut list = ListImpl {
             magic: LIST_MAGIC,
             rc: std::sync::atomic::AtomicU32::new(1),
@@ -211,7 +212,10 @@ impl ListImpl {
 /// and release operation for the element tag.
 unsafe fn retain_element(tag: ListTypeTag, raw: i64) {
     match tag {
-        ListTypeTag::String => crate::pith_cstring_retain(raw as *const i8),
+        ListTypeTag::String => {
+            crate::perf_count(&crate::PERF_CSTRING_RETAINS_PUSH, 1);
+            crate::pith_cstring_retain(raw as *const i8)
+        }
         ListTypeTag::List => pith_list_retain_handle(raw),
         ListTypeTag::Map => crate::collections::map::pith_map_retain_handle(raw),
         ListTypeTag::Primitive => {}
@@ -813,6 +817,7 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
     // Last count: release the elements this list owns, then free.
     for i in 0..impl_ref.len() {
         if let Some(raw) = impl_ref.get_value(i) {
+            crate::perf_count(&crate::PERF_LIST_CASCADE_RELEASES, 1);
             release_element(impl_ref.type_tag, raw);
         }
     }
@@ -821,6 +826,7 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
     // fast validity check.
     (*(list.ptr as *mut ListImpl)).magic = 0;
     handle_registry::unregister(list.ptr as *const (), HandleKind::List);
+    crate::perf_count(&crate::PERF_LIST_FREES, 1);
     let _ = Box::from_raw(list.ptr as *mut ListImpl);
 }
 

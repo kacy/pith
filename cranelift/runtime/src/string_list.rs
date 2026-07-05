@@ -13,6 +13,7 @@ pub unsafe extern "C" fn pith_args() -> PithList {
         let arg_len = arg.len();
         let arg_ptr = crate::pith_copy_bytes_to_cstring(&arg.as_bytes()[..arg_len]);
         pith_list_push_value(list, arg_ptr as i64);
+        crate::pith_cstring_release(arg_ptr as *const i8);
     }
 
     list
@@ -50,16 +51,18 @@ pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i
     use crate::collections::list::pith_list_new;
 
     let (Some(s_slice), Some(delim_slice)) = (cstr_bytes(s), cstr_bytes(delim)) else {
-        return pith_list_new(8, 0);
+        return pith_list_new(8, 1);
     };
     let s_len = s_slice.len();
     let delim_len = delim_slice.len();
 
     if s_len == 0 {
-        return pith_list_new(8, 0);
+        return pith_list_new(8, 1);
     }
 
-    let list = pith_list_new(8, 0);
+    // string-tagged: the pushes retain and the free path cascades, so the
+    // list is the sole owner of its parts
+    let list = pith_list_new(8, 1);
     let mut start = 0;
     for i in 0..=s_len {
         let is_delim = if delim_len == 0 {
@@ -75,6 +78,7 @@ pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i
             if part_len > 0 {
                 let part_ptr = crate::pith_copy_bytes_to_cstring(&s_slice[start..i]);
                 crate::collections::list::pith_list_push_value(list, part_ptr as i64);
+                crate::pith_cstring_release(part_ptr as *const i8);
             }
 
             if delim_len > 0 {
@@ -210,11 +214,12 @@ pub unsafe extern "C" fn pith_cstring_reverse(s: *const i8) -> *mut i8 {
 pub unsafe extern "C" fn pith_cstring_chars(s: *const i8) -> i64 {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
 
-    let list = pith_list_new(8, 0);
+    let list = pith_list_new(8, 1);
     if let Some(bytes) = cstr_bytes(s) {
         for &b in bytes {
             let ch_ptr = crate::pith_chr_cstr(b as i64);
             pith_list_push_value(list, ch_ptr as i64);
+            crate::pith_cstring_release(ch_ptr as *const i8);
         }
     }
     list.ptr as i64
@@ -270,7 +275,8 @@ pub unsafe extern "C" fn pith_list_sort(list_ptr: i64) {
 pub unsafe extern "C" fn pith_list_slice(list_ptr: i64, start: i64, end: i64) -> i64 {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
 
-    let new_list = pith_list_new(8, 0);
+    let src_tag = list_ref_from_handle(list_ptr).map(|r| r.type_tag as i32).unwrap_or(0);
+    let new_list = pith_list_new(8, src_tag);
     if let Some(impl_ref) = list_ref_from_handle(list_ptr) {
         let len = impl_ref.len() as i64;
         let s = start.max(0).min(len) as usize;
@@ -288,7 +294,8 @@ pub unsafe extern "C" fn pith_list_slice(list_ptr: i64, start: i64, end: i64) ->
 pub unsafe extern "C" fn pith_list_sort_copy(list_ptr: i64) -> i64 {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
 
-    let new_list = pith_list_new(8, 0);
+    let src_tag = list_ref_from_handle(list_ptr).map(|r| r.type_tag as i32).unwrap_or(0);
+    let new_list = pith_list_new(8, src_tag);
     let Some(impl_ref) = list_ref_from_handle(list_ptr) else {
         return new_list.ptr as i64;
     };
@@ -308,7 +315,8 @@ pub unsafe extern "C" fn pith_list_sort_copy(list_ptr: i64) -> i64 {
 pub unsafe extern "C" fn pith_list_sort_strings_copy(list_ptr: i64) -> i64 {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
 
-    let new_list = pith_list_new(8, 0);
+    let src_tag = list_ref_from_handle(list_ptr).map(|r| r.type_tag as i32).unwrap_or(0);
+    let new_list = pith_list_new(8, src_tag);
     let Some(impl_ref) = list_ref_from_handle(list_ptr) else {
         return new_list.ptr as i64;
     };

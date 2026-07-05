@@ -792,12 +792,14 @@ pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
         let empty = pith_list_new(8, 0);
         return empty.ptr as i64;
     };
-    let list = pith_list_new(8, 0); // list of i64 (pointer-sized primitives)
+    // string-tagged: the list owns the freshly copied key strings
+    let list = pith_list_new(8, 1);
 
     for key in impl_ref.keys() {
         if let MapKey::String(ref bytes) = key {
             let ptr = crate::pith_copy_bytes_to_cstring(bytes);
             pith_list_push_value(list, ptr as i64);
+            crate::pith_cstring_release(ptr as *const i8);
         }
     }
 

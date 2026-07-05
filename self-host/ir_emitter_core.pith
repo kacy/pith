@@ -461,8 +461,14 @@ fn ir_emit_call1(result_reg: Int, fname: String, ret_type: String, arg0: Int):
 #     excluded from cleanup, a returned borrow is retained
 #   - each return releases every string local the function owns
 
+mut ir_retain_site_counter := 0
+
 fn ir_string_retain_reg(r: Int):
-    ir_emit_call1(ir_reg(), "__cstring_retain", "void", r)
+    # DEBUG (temporary): site-tagged retains for leak attribution
+    ir_retain_site_counter = ir_retain_site_counter + 1
+    site_r := ir_reg()
+    ir_emit("iconst " + site_r.to_string() + " " + ir_retain_site_counter.to_string())
+    ir_emit_call2(ir_reg(), "pith_cstring_retain_traced", "void", r, site_r)
 
 fn ir_string_release_reg(r: Int):
     ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
@@ -806,6 +812,14 @@ fn ir_emit_resolved_call(result_reg: Int, fname: String, idx: Int, arg_regs: Lis
 # method results) die once the call they fed returns: callees borrow their
 # params, and storing callees add their own count. pairs registers with the
 # same child walk ir_collect_call_arg_regs used.
+# method variant: pairs registers with ir_method_call_arg_expr so the walk
+# can never drift from the collector's
+fn ir_release_owned_method_args(node: Node, arg_regs: List[Int]):
+    for reg, i in arg_regs:
+        expr_idx := ir_method_call_arg_expr(node, i)
+        if expr_idx >= 0:
+            ir_release_owned_string_operand(expr_idx, reg, ir_infer_type(expr_idx))
+
 fn ir_release_owned_string_args(node: Node, start_idx: Int, arg_regs: List[Int]):
     mut reg_i := 0
     for child, i in node.children:
@@ -3412,6 +3426,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     uses_result_abi := ir_callee_uses_result_abi(callee, idx)
     ret_type := ir_call_retkind_for_name(idx, uses_result_abi, callee.name)
     ir_emit_call_text(r, callee.name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
+    ir_release_owned_string_args(node, 1, arg_regs)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         return ir_emit_wrapped_legacy_result(r, ret_type, callee.name)
     return r
@@ -4137,6 +4152,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
     if emit_name == "identity" and not impl_dispatch:
         return obj_r
     ir_emit_call_text(r, emit_name, ret_type, call_args.len(), ir_join_arg_regs(call_args))
+    ir_release_owned_method_args(node, arg_regs)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         return ir_emit_wrapped_legacy_result(r, ret_type, emit_name)
     if ir_is_void_method(emit_name):

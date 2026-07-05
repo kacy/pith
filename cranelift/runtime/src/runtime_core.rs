@@ -781,6 +781,73 @@ pub extern "C" fn pith_bool_to_cstr(b: i64) -> *mut i8 {
     unsafe { pith_copy_bytes_to_cstring(&s.as_bytes()[..len]) }
 }
 
+// --- container display -------------------------------------------------
+//
+// interpolating a list or map renders it through these. the emitter passes
+// an element-kind code because the runtime cannot tell an int list from a
+// float list (both store 8-byte values): 0=int, 1=float, 2=bool, 3=string.
+
+pub(crate) unsafe fn display_value_for_map(out: &mut String, raw: i64, kind: i64) {
+    display_value(out, raw, kind)
+}
+
+unsafe fn display_value(out: &mut String, raw: i64, kind: i64) {
+    match kind {
+        1 => {
+            let f = f64::from_bits(raw as u64);
+            let ptr = pith_float_to_cstr(f);
+            out.push_str(&cstr_to_display(ptr));
+        }
+        2 => out.push_str(if raw != 0 { "true" } else { "false" }),
+        3 => out.push_str(&cstr_to_display(raw as *const i8)),
+        _ => out.push_str(&raw.to_string()),
+    }
+}
+
+unsafe fn cstr_to_display(ptr: *const i8) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let len = crate::string::pith_cstring_len(ptr) as usize;
+    let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Render a list as "[a, b, c]" for interpolation. `sorted` is set when the
+/// source is a set: hash iteration order is not part of the language, so a
+/// displayed set sorts its elements.
+#[no_mangle]
+pub unsafe extern "C" fn pith_display_list(handle: i64, elem_kind: i64, sorted: i64) -> *mut i8 {
+    let mut values: Vec<i64> = Vec::new();
+    if let Some(list) = crate::collections::list::list_ref_from_handle(handle) {
+        for i in 0..list.len() {
+            if let Some(raw) = list.get_value(i) {
+                values.push(raw);
+            }
+        }
+    }
+    if sorted != 0 {
+        match elem_kind {
+            1 => values.sort_by(|a, b| {
+                f64::from_bits(*a as u64)
+                    .partial_cmp(&f64::from_bits(*b as u64))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            3 => values.sort_by_key(|v| cstr_to_display(*v as *const i8)),
+            _ => values.sort(),
+        }
+    }
+    let mut out = String::from("[");
+    for (i, raw) in values.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        display_value(&mut out, *raw, elem_kind);
+    }
+    out.push(']');
+    pith_copy_bytes_to_cstring(out.as_bytes())
+}
+
 pub use pith_ceil as pith_math_ceil;
 pub use pith_floor as pith_math_floor;
 pub use pith_pow as pith_math_pow;

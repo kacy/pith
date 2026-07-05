@@ -15,6 +15,8 @@ pub static PERF_CSTRING_RETAINS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CSTRING_RETAINS_PUSH: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_CASCADE_RELEASES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CSTRING_RELEASES: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_STRUCT_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_STRUCT_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTES_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTES_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTES_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -114,6 +116,11 @@ pub fn dump_perf_stats() {
         "  string allocs: {} bytes={}",
         PERF_STRING_ALLOCS.load(Ordering::Relaxed),
         PERF_STRING_ALLOC_BYTES.load(Ordering::Relaxed)
+    );
+    eprintln!(
+        "  structs: alloc={} free={}",
+        PERF_STRUCT_ALLOCS.load(Ordering::Relaxed),
+        PERF_STRUCT_FREES.load(Ordering::Relaxed),
     );
     eprintln!(
         "  bytes allocs: {} frees={} bytes={}",

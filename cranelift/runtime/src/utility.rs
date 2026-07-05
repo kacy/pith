@@ -166,6 +166,9 @@ pub unsafe extern "C" fn pith_cstring_index_of(haystack: *const i8, needle: *con
     if n_len == 0 {
         return 0;
     }
+    if h_len < n_len {
+        return -1;
+    }
     for i in 0..=(h_len.saturating_sub(n_len)) {
         if &h_bytes[i..i + n_len] == n_bytes {
             return i as i64;

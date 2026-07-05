@@ -928,18 +928,98 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
 pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     use std::alloc::alloc_zeroed;
 
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_STRUCT_ALLOCS, 1);
     let size = (num_fields.max(0) as usize) * 8;
     if size == 0 {
         return 0;
     }
 
-    let layout = pith_layout(size, 8);
-    let ptr = alloc_zeroed(layout);
-    if ptr.is_null() {
+    // a 24-byte header precedes the fields so field offsets stay where
+    // the codegen baked them: [magic u32][rc u32][size u64][dtor u64].
+    // dtor is a compiled destructor's address (0 = none); the last
+    // release calls it before freeing.
+    let layout = pith_layout(size + STRUCT_HEADER, 8);
+    let base = alloc_zeroed(layout);
+    if base.is_null() {
         eprintln!("pith runtime error: allocation failed");
         std::process::exit(1);
     }
-    ptr as i64
+    (base as *mut u32).write(STRUCT_MAGIC);
+    (base.add(4) as *mut u32).write(1);
+    (base.add(8) as *mut u64).write(size as u64);
+    base.add(STRUCT_HEADER) as i64
+}
+
+pub(crate) const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
+pub(crate) const STRUCT_HEADER: usize = 24;
+
+unsafe fn struct_base(ptr: i64) -> Option<*mut u8> {
+    if ptr == 0 || (ptr as u64) % 8 != 0 {
+        return None;
+    }
+    let base = (ptr as usize).checked_sub(STRUCT_HEADER)? as *mut u8;
+    if (base as *const u32).read() != STRUCT_MAGIC {
+        return None;
+    }
+    Some(base)
+}
+
+/// Attach a compiled destructor to a struct: called with the struct
+/// pointer at its final release, before the memory is freed.
+///
+/// # Safety
+/// ptr must be a pith_struct_alloc result; dtor a compiled fn(i64).
+#[no_mangle]
+pub unsafe extern "C" fn pith_struct_set_dtor(ptr: i64, dtor: i64) {
+    if let Some(base) = struct_base(ptr) {
+        (base.add(16) as *mut u64).write(dtor as u64);
+    }
+}
+
+/// One more owner of this struct.
+///
+/// # Safety
+/// ptr must be a pith_struct_alloc result or garbage (magic-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_struct_retain(ptr: i64) {
+    if let Some(base) = struct_base(ptr) {
+        let rc = &*(base.add(4) as *const std::sync::atomic::AtomicU32);
+        rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Drop one owner; the last release runs the destructor (releasing the
+/// struct's rc fields) and frees the allocation.
+///
+/// # Safety
+/// ptr must be a pith_struct_alloc result or garbage (magic-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
+    let Some(base) = struct_base(ptr) else {
+        return;
+    };
+    let rc = &*(base.add(4) as *const std::sync::atomic::AtomicU32);
+    let prev = rc.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    if prev > 1 {
+        return;
+    }
+    if prev == 0 {
+        // over-release: restore and leave the object alone
+        rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    let dtor = (base.add(16) as *const u64).read();
+    if dtor != 0 {
+        let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
+        f(ptr);
+    }
+    let size = (base.add(8) as *const u64).read() as usize;
+    crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
+    // scrub the magic so stale pointers fail the check
+    (base as *mut u32).write(0);
+    std::alloc::dealloc(base, pith_layout(size + STRUCT_HEADER, 8));
 }
 
 #[no_mangle]

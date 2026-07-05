@@ -1749,10 +1749,10 @@ fn buffered_bytes_reader_read_until_with_sep_internal(reader: BufferedBytesReade
             buffered_bytes_reader_consume(reader.handle, flush_len)
         filled := buffered_bytes_reader_fill(reader.handle)!
         if filled <= 0:
-            cached = buffered_bytes_reader_cache_get(reader.handle)
+            cached = buffered_bytes_reader_cache.take(reader.handle)
             if not cached.is_empty():
                 buf.write(cached)!
-                buffered_bytes_reader_cache.insert(reader.handle, bytes.empty())
+            buffered_bytes_reader_cache.insert(reader.handle, bytes.empty())
             return buf.take_bytes()
     return buf.take_bytes()
 
@@ -1777,7 +1777,7 @@ fn buffered_bytes_reader_fill(handle: Int) -> Int!:
         chunk = process_stdout_read_bytes(ProcessStdout(source_handle), chunk_size)!
     elif source_kind == BUFFERED_BYTES_SOURCE_PROCESS_STDERR:
         chunk = process_stderr_read_bytes(ProcessStderr(source_handle), chunk_size)!
-    cached := buffered_bytes_reader_cache_get(handle)
+    cached := buffered_bytes_reader_cache.take(handle)
     buffered_bytes_reader_cache.insert(handle, cached.concat(chunk))
     return chunk.len()
 
@@ -1785,7 +1785,7 @@ fn buffered_bytes_writer_write_internal(writer: BufferedBytesWriter, data: Bytes
     if not buffered_bytes_writer_target_handles.contains_key(writer.handle):
         return 0
 
-    cached := buffered_bytes_writer_cache_get(writer.handle)
+    cached := buffered_bytes_writer_cache.take(writer.handle)
     buffered_bytes_writer_cache.insert(writer.handle, cached.concat(data))
     if buffered_bytes_writer_should_flush(writer.handle):
         buffered_bytes_writer_flush_internal(writer)!
@@ -1795,8 +1795,9 @@ fn buffered_bytes_writer_flush_internal(writer: BufferedBytesWriter) -> Int!:
     if not buffered_bytes_writer_target_handles.contains_key(writer.handle):
         return 0
 
-    cached := buffered_bytes_writer_cache_get(writer.handle)
+    cached := buffered_bytes_writer_cache.take(writer.handle)
     if cached.is_empty():
+        buffered_bytes_writer_cache.insert(writer.handle, cached)
         return 0
 
     target_kind := buffered_bytes_writer_target_kinds[writer.handle]
@@ -2660,7 +2661,7 @@ fn buffered_bytes_reader_cache_get(handle: Int) -> Bytes:
     return bytes.empty()
 
 fn buffered_bytes_reader_consume(handle: Int, consumed: Int):
-    cached := buffered_bytes_reader_cache_get(handle)
+    cached := buffered_bytes_reader_cache.take(handle)
     buffered_bytes_reader_cache.insert(handle, cached.slice(consumed, cached.len()))
 
 fn buffered_string_reader_consume(handle: Int, consumed: Int):

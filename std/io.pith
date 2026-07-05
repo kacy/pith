@@ -1387,7 +1387,7 @@ fn read_all_bytes_cursor_chunked(reader: BytesCursor, chunk_size: Int) -> Bytes!
     while not chunk.is_empty():
         buf.write(chunk)!
         chunk = reader.read_bytes(size)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_all_tcp_stream_bytes(stream: TcpStream) -> Bytes!:
     return read_all_tcp_stream_bytes_chunked(stream, DEFAULT_CHUNK_SIZE)
@@ -1399,7 +1399,7 @@ fn read_all_tcp_stream_bytes_chunked(stream: TcpStream, chunk_size: Int) -> Byte
     while not chunk.is_empty():
         buf.write(chunk)!
         chunk = stream.read_bytes(size)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_all_tcp_stream_bytes_ctx(stream: TcpStream, ctx: Context) -> Bytes!BlockingError:
     return read_all_tcp_stream_bytes_chunked_ctx(stream, ctx, DEFAULT_CHUNK_SIZE)
@@ -1413,7 +1413,7 @@ fn read_all_tcp_stream_bytes_chunked_ctx(stream: TcpStream, ctx: Context, chunk_
         if wrote.is_err:
             fail blocking_failed(wrote.err)
         chunk = tcp_stream_read_bytes_ctx(stream, ctx, size)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn write_all_tcp_stream_bytes(stream: TcpStream, data: Bytes) -> Int!:
     mut total := 0
@@ -1447,7 +1447,7 @@ fn read_all_file_stream_bytes_chunked(stream: FileStream, chunk_size: Int) -> By
     while not chunk.is_empty():
         buf.write(chunk)!
         chunk = stream.read_bytes(size)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn write_all_file_stream_bytes(stream: FileStream, data: Bytes) -> Int!:
     mut total := 0
@@ -1481,7 +1481,7 @@ fn read_all_process_stdout_bytes_chunked(reader: ProcessStdout, chunk_size: Int)
     while not chunk.is_empty():
         buf.write(chunk)!
         chunk = reader.read_bytes(size)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_all_process_stderr_bytes(reader: ProcessStderr) -> Bytes!:
     return read_all_process_stderr_bytes_chunked(reader, DEFAULT_CHUNK_SIZE)
@@ -1493,7 +1493,7 @@ fn read_all_process_stderr_bytes_chunked(reader: ProcessStderr, chunk_size: Int)
     while not chunk.is_empty():
         buf.write(chunk)!
         chunk = reader.read_bytes(size)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn process_stdin_write_bytes_ctx(writer: ProcessStdin, ctx: Context, data: Bytes) -> Int!BlockingError:
     task := spawn process_stdin_write_bytes_worker(writer, data)
@@ -1542,7 +1542,7 @@ fn read_all_process_stdout_bytes_chunked_ctx(reader: ProcessStdout, ctx: Context
         if wrote.is_err:
             fail blocking_failed(wrote.err)
         chunk = process_stdout_read_bytes_ctx(reader, ctx, size)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn process_stderr_read_bytes_ctx(reader: ProcessStderr, ctx: Context, max_bytes: Int) -> Bytes!BlockingError:
     task := spawn process_stderr_read_bytes_worker(reader, max_bytes)
@@ -1568,112 +1568,112 @@ fn read_all_process_stderr_bytes_chunked_ctx(reader: ProcessStderr, ctx: Context
         if wrote.is_err:
             fail blocking_failed(wrote.err)
         chunk = process_stderr_read_bytes_ctx(reader, ctx, size)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_exact_bytes_cursor(reader: BytesCursor, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
-    while buf.bytes().len() < count:
-        chunk := bytes_cursor_read(reader, count - buf.bytes().len())!
+    while buf.len() < count:
+        chunk := bytes_cursor_read(reader, count - buf.len())!
         if chunk.is_empty():
             fail "unexpected eof"
         buf.write(chunk)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_exact_buffered_bytes_reader(reader: BufferedBytesReader, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
-    while buf.bytes().len() < count:
-        chunk := buffered_bytes_reader_read(reader, count - buf.bytes().len())!
+    while buf.len() < count:
+        chunk := buffered_bytes_reader_read(reader, count - buf.len())!
         if chunk.is_empty():
             fail "unexpected eof"
         buf.write(chunk)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_exact_tcp_stream_bytes(stream: TcpStream, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
-    while buf.bytes().len() < count:
-        chunk := tcp_stream_read_bytes(stream, count - buf.bytes().len())!
+    while buf.len() < count:
+        chunk := tcp_stream_read_bytes(stream, count - buf.len())!
         if chunk.is_empty():
             fail "unexpected eof"
         buf.write(chunk)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_exact_tcp_stream_bytes_ctx(stream: TcpStream, ctx: Context, count: Int) -> Bytes!BlockingError:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
-    while buf.bytes().len() < count:
-        chunk := tcp_stream_read_bytes_ctx(stream, ctx, count - buf.bytes().len())!
+    while buf.len() < count:
+        chunk := tcp_stream_read_bytes_ctx(stream, ctx, count - buf.len())!
         if chunk.is_empty():
             fail blocking_failed("unexpected eof")
         wrote := buf.write(chunk)
         if wrote.is_err:
             fail blocking_failed(wrote.err)
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_exact_file_stream_bytes(stream: FileStream, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
-    while buf.bytes().len() < count:
-        chunk := file_stream_read_bytes(stream, count - buf.bytes().len())!
+    while buf.len() < count:
+        chunk := file_stream_read_bytes(stream, count - buf.len())!
         if chunk.is_empty():
             fail "unexpected eof"
         buf.write(chunk)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_exact_process_stdout_bytes(reader: ProcessStdout, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
-    while buf.bytes().len() < count:
-        chunk := process_stdout_read_bytes(reader, count - buf.bytes().len())!
+    while buf.len() < count:
+        chunk := process_stdout_read_bytes(reader, count - buf.len())!
         if chunk.is_empty():
             fail "unexpected eof"
         buf.write(chunk)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_exact_process_stdout_bytes_ctx(reader: ProcessStdout, ctx: Context, count: Int) -> Bytes!BlockingError:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
-    while buf.bytes().len() < count:
-        chunk := process_stdout_read_bytes_ctx(reader, ctx, count - buf.bytes().len())!
+    while buf.len() < count:
+        chunk := process_stdout_read_bytes_ctx(reader, ctx, count - buf.len())!
         if chunk.is_empty():
             fail blocking_failed("unexpected eof")
         wrote := buf.write(chunk)
         if wrote.is_err:
             fail blocking_failed(wrote.err)
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_exact_process_stderr_bytes(reader: ProcessStderr, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
-    while buf.bytes().len() < count:
-        chunk := process_stderr_read_bytes(reader, count - buf.bytes().len())!
+    while buf.len() < count:
+        chunk := process_stderr_read_bytes(reader, count - buf.len())!
         if chunk.is_empty():
             fail "unexpected eof"
         buf.write(chunk)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_exact_process_stderr_bytes_ctx(reader: ProcessStderr, ctx: Context, count: Int) -> Bytes!BlockingError:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
-    while buf.bytes().len() < count:
-        chunk := process_stderr_read_bytes_ctx(reader, ctx, count - buf.bytes().len())!
+    while buf.len() < count:
+        chunk := process_stderr_read_bytes_ctx(reader, ctx, count - buf.len())!
         if chunk.is_empty():
             fail blocking_failed("unexpected eof")
         wrote := buf.write(chunk)
         if wrote.is_err:
             fail blocking_failed(wrote.err)
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn read_all_buffered_bytes_reader(reader: BufferedBytesReader) -> Bytes!:
     return read_all_buffered_bytes_reader_chunked(reader, DEFAULT_CHUNK_SIZE)
@@ -1685,7 +1685,7 @@ fn read_all_buffered_bytes_reader_chunked(reader: BufferedBytesReader, chunk_siz
     while not chunk.is_empty():
         buf.write(chunk)!
         chunk = reader.read_bytes(size)!
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn write_all_buffered_bytes_writer(writer: BufferedBytesWriter, data: Bytes) -> Int!:
     mut total := 0
@@ -1705,19 +1705,19 @@ fn buffered_bytes_reader_read_internal(reader: BufferedBytesReader, max_bytes: I
         return bytes.empty()
 
     buf := bytes.buffer_with_capacity(max_bytes)
-    while buf.bytes().len() < max_bytes:
+    while buf.len() < max_bytes:
         mut cached := buffered_bytes_reader_cache_get(reader.handle)
         if cached.is_empty():
             filled := buffered_bytes_reader_fill(reader.handle)!
             if filled <= 0:
-                return buf.bytes()
+                return buf.take_bytes()
             cached = buffered_bytes_reader_cache_get(reader.handle)
-        mut take := max_bytes - buf.bytes().len()
+        mut take := max_bytes - buf.len()
         if take > cached.len():
             take = cached.len()
         buf.write(cached.slice(0, take))!
         buffered_bytes_reader_consume(reader.handle, take)
-    return buf.bytes()
+    return buf.take_bytes()
 
 fn buffered_bytes_reader_read_until_internal(reader: BufferedBytesReader, sep: Bytes) -> Bytes!:
     return buffered_bytes_reader_read_until_with_sep_internal(reader, sep, false)
@@ -1741,7 +1741,7 @@ fn buffered_bytes_reader_read_until_with_sep_internal(reader: BufferedBytesReade
             if include_sep:
                 buf.write(sep)!
             buffered_bytes_reader_consume(reader.handle, sep_pos + sep.len())
-            return buf.bytes()
+            return buf.take_bytes()
         keep := sep.len() - 1
         if cached.len() > keep:
             flush_len := cached.len() - keep
@@ -1753,8 +1753,8 @@ fn buffered_bytes_reader_read_until_with_sep_internal(reader: BufferedBytesReade
             if not cached.is_empty():
                 buf.write(cached)!
                 buffered_bytes_reader_cache.insert(reader.handle, bytes.empty())
-            return buf.bytes()
-    return buf.bytes()
+            return buf.take_bytes()
+    return buf.take_bytes()
 
 fn buffered_bytes_reader_fill(handle: Int) -> Int!:
     if not buffered_bytes_reader_source_handles.contains_key(handle):

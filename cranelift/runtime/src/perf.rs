@@ -19,6 +19,7 @@ pub static PERF_BYTES_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTES_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTES_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_NEWS: AtomicUsize = AtomicUsize::new(0);
+pub static PERF_BYTE_BUFFER_FREES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_BYTE_BUFFER_WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_LIST_NEWS: AtomicUsize = AtomicUsize::new(0);
@@ -121,8 +122,9 @@ pub fn dump_perf_stats() {
         PERF_BYTES_ALLOC_BYTES.load(Ordering::Relaxed)
     );
     eprintln!(
-        "  byte_buffer new: {} writes={} write_bytes={}",
+        "  byte_buffer new: {} frees={} writes={} write_bytes={}",
         PERF_BYTE_BUFFER_NEWS.load(Ordering::Relaxed),
+        PERF_BYTE_BUFFER_FREES.load(Ordering::Relaxed),
         PERF_BYTE_BUFFER_WRITES.load(Ordering::Relaxed),
         PERF_BYTE_BUFFER_WRITE_BYTES.load(Ordering::Relaxed)
     );

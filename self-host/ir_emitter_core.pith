@@ -95,6 +95,8 @@ mut ir_global_bool_names: List[String] := []
 
 # --- type and symbol metadata copied from the checker ---
 mut ir_struct_names: Map[String, Int] := {} # struct name -> field count
+mut ir_local_struct_names: List[String] := [] # structs declared by this module
+mut ir_dtor_memo: Map[String, Int] := {} # 1 needs dtor, 2 no/undecided
 mut ir_struct_field_lookup: Map[String, String] := {} # "Struct.field" -> field type
 mut ir_struct_field_index_lookup: Map[String, String] := {} # "Struct.field" -> field index string
 mut ir_struct_decl_nodes: Map[String, Int] := {} # struct name -> declaration node idx
@@ -173,6 +175,8 @@ fn ir_reset_global_state():
     ir_global_bool_names = []
 
 fn ir_reset_type_state():
+    ir_local_struct_names = []
+    ir_dtor_memo = {}
     ir_struct_names = {}
     ir_struct_field_lookup = {}
     ir_struct_field_index_lookup = {}
@@ -475,6 +479,52 @@ fn ir_string_release_reg(r: Int):
 
 # collections are shared handles with real refcounts; strings are
 # copy-on-derive with a header count. one kind tag picks the operation.
+# true when a struct owns rc fields (directly or through nested structs):
+# those types get a generated destructor that releases the fields at the
+# struct's final release.
+# a specialized generic name (Bucket[Int]) shares its base layout and
+# destructor: field kinds come from the declared layout, so a T-typed
+# field is never released (a bounded leak on rc payloads, never a wild
+# pointer)
+fn ir_struct_base_name(sname: String) -> String:
+    if sname.len() == 0:
+        return sname
+    bracket := sname.index_of("[")
+    if bracket >= 0:
+        return sname.substring(0, bracket)
+    return sname
+
+fn ir_struct_needs_dtor(raw_name: String) -> Bool:
+    sname := ir_struct_base_name(raw_name)
+    if ir_dtor_memo.contains_key(sname):
+        return ir_dtor_memo[sname] == 1
+    # mark first so self-referential fields don't recurse forever; a
+    # direct rc field still sets the final answer below
+    ir_dtor_memo.insert(sname, 2)
+    count := ir_struct_field_count(sname)
+    mut i := 0
+    mut needs := false
+    while i < count:
+        fname := ir_struct_field_name_at(sname, i)
+        ftype := ir_struct_field_type_name(sname, fname)
+        if ir_rc_field_kind(ftype).len() > 0:
+            needs = true
+        i = i + 1
+    if needs:
+        ir_dtor_memo.insert(sname, 1)
+    return needs
+
+# rc kind of a struct FIELD by its recorded type: like ir_rc_kind plus
+# nested structs (a field holding a dtor-bearing struct is releasable)
+fn ir_rc_field_kind(ftype: String) -> String:
+    base := ir_rc_kind(ftype)
+    if base.len() > 0:
+        return base
+    if ftype.starts_with("struct:"):
+        if ir_struct_needs_dtor(ftype.substring(7, ftype.len())):
+            return "struct"
+    return ""
+
 fn ir_rc_kind(type_hint: String) -> String:
     if type_hint == "string":
         return "string"
@@ -486,6 +536,14 @@ fn ir_rc_kind(type_hint: String) -> String:
         return "set"
     if type_hint == "bytes":
         return "bytes"
+    # every struct is releasable: the header-carrying allocation frees at
+    # the last count, and types with rc fields additionally run their
+    # generated destructor. checked types carry the bare name; emission
+    # hints carry the struct: prefix.
+    if type_hint.starts_with("struct:"):
+        return "struct"
+    if ir_struct_names.contains_key(ir_struct_base_name(type_hint)):
+        return "struct"
     return ""
 
 # every rc kind releases: strings via their header count, collections via
@@ -504,6 +562,8 @@ fn ir_rc_retain_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_set_retain_handle", "void", r)
     elif kind == "bytes":
         ir_emit_call1(ir_reg(), "pith_bytes_retain", "void", r)
+    elif kind == "struct":
+        ir_emit_call1(ir_reg(), "pith_struct_retain", "void", r)
 
 fn ir_rc_release_reg(r: Int, kind: String):
     if kind == "string":
@@ -516,6 +576,8 @@ fn ir_rc_release_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_set_release_handle", "void", r)
     elif kind == "bytes":
         ir_emit_call1(ir_reg(), "pith_bytes_release", "void", r)
+    elif kind == "struct":
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
 
 # a map target whose value type is string picks the heap-value
 # constructor for empty literals, so runtime inserts retain
@@ -567,15 +629,26 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
         return false
     if node.kind == "grouped" and node.children.len() > 0:
         return ir_string_expr_is_borrowed(node.children[0])
+    # a try (!) unwraps its inner result: ownership classification follows
+    # the wrapped expression (a transferred call result stays owned)
+    if (node.kind == "try" or node.kind == "try_expr") and node.children.len() > 0:
+        inner := get_node(node.children[0])
+        if inner.kind == "call" or inner.kind == "method_call":
+            # the unwrapped ok value is a transfer: result returns route
+            # through the same retain-borrowed-returns convention
+            return false
+        return ir_string_expr_is_borrowed(node.children[0])
     # collection literals mint fresh containers, and collection-typed call
     # results arrive with a transferred count (user returns exclude the
     # local, runtime producers build new containers). variable, element,
     # and field reads stay borrows.
     if node.kind == "list" or node.kind == "map" or node.kind == "set":
         return false
+    if node.kind == "struct_init":
+        return false
     if node.kind == "call" or node.kind == "method_call":
         expr_kind := ir_rc_kind(ir_infer_type(idx))
-        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes":
+        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes" or expr_kind == "struct":
             return false
     if node.kind == "method_call":
         return not ir_string_method_returns_fresh(ir_plain_method_name(node.value))
@@ -858,6 +931,8 @@ fn ir_register_struct_layout(name: String, field_names: List[String], field_type
         ir_struct_field_lookup.insert(name + "." + field_name, field_types[i])
         ir_struct_field_index_lookup.insert(name + "." + field_name, i.to_string())
     ir_struct_names.insert(name, field_names.len())
+    if not ir_local_struct_names.contains(name):
+        ir_local_struct_names.push(name)
     ir_emit("struct " + name + " " + field_names.join(" "))
 
 fn ir_record_global_type(name: String, global_type: String):
@@ -1061,6 +1136,8 @@ fn ir_collect_struct_decl(node_idx: Int, node: Node, emit_decl: Bool):
             field_names = ir_record_struct_field(sname, field_names, field_node)
     ir_struct_names.insert(sname, field_names.len())
     if emit_decl:
+        if not ir_local_struct_names.contains(sname):
+            ir_local_struct_names.push(sname)
         ir_emit("struct " + sname + " " + field_names.join(" "))
 
 fn ir_collect_enum_decl(node: Node, emit_decl: Bool):
@@ -4164,7 +4241,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
                 mut compensate := false
                 if emit_name == "send":
                     compensate = store_kind.len() > 0
-                elif store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "bytes":
+                elif store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "bytes" or store_kind == "struct":
                     compensate = true
                 if compensate and ir_string_expr_is_borrowed(value_expr):
                     ir_rc_retain_reg(arg_regs[store_value_pos], store_kind)
@@ -4486,6 +4563,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int]) -> Int:
     ir_emit_call1(r, "__struct_alloc", "struct:" + sname, field_count_r)
     for field_reg, fi in field_regs:
         ir_emit("sstore " + r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit_attach_dtor(r, sname)
     return r
 
 fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int]) -> Int:
@@ -4524,6 +4602,7 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int]) -> Int:
     ir_emit_call1(r, "__struct_alloc", "struct:" + sname, field_count_r)
     for field_reg, fi in field_regs:
         ir_emit("sstore " + r.to_string() + " " + fi.to_string() + " " + field_reg.to_string())
+    ir_emit_attach_dtor(r, sname)
     return r
 
 fn ir_emit_struct_init(node: Node) -> Int:
@@ -4553,6 +4632,11 @@ fn ir_emit_try_expr(node: Node) -> Int:
             ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
             ir_emit("label " + ok_l)
             decoded_r := ir_emit_result_ok_field_for_expr(val_r, node.children[0])
+            # the extracted payload carries the count; the tuple shell has
+            # no destructor, so this frees only the three-slot allocation.
+            # the error path returns the same tuple upward instead — its
+            # consumer releases it there.
+            ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
             ir_emit("jmp " + merge_l)
             ir_emit("label " + err_l)
             if ir_emit_tests and ir_emitting_test_func:
@@ -4649,7 +4733,7 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # compensates only for maps holding lists/maps/sets, which have no
     # tagged constructor yet.
     idx_store_kind := ir_rc_kind(value_type)
-    if idx_store_kind == "list" or idx_store_kind == "map" or idx_store_kind == "set" or idx_store_kind == "bytes":
+    if idx_store_kind == "list" or idx_store_kind == "map" or idx_store_kind == "set" or idx_store_kind == "bytes" or idx_store_kind == "struct":
         if ir_string_expr_is_borrowed(value_idx):
             ir_rc_retain_reg(value_r, idx_store_kind)
     ir_emit_call3(ir_reg(), ir_index_set_call_name(obj_type), "void", obj_r, idx_r, value_r)
@@ -4723,9 +4807,11 @@ fn ir_emit_catch_expr(node: Node) -> Int:
     ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
     ir_emit("label " + ok_l)
     ok_value_r := ir_emit_result_value_field(result_r, c_get_expr_type(node.children[0]), "ok")
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
     ir_emit("store " + temp_name + " " + ok_value_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit("label " + fallback_l)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
     ir_emit("store " + temp_name + " " + ir_expr(node.children[1]).to_string())
     ir_emit("label " + merge_l)
     r := ir_reg()
@@ -6284,6 +6370,46 @@ fn ir_emit_collection_global_init(binding: Node):
                 ir_emit_call0(set_r, "__set_new", "set")
             ir_emit("store " + gname + " " + set_r.to_string())
 
+# attach the type's destructor to a freshly built struct so its rc
+# fields release when the struct dies
+fn ir_emit_attach_dtor(struct_r: Int, raw_name: String):
+    if not ir_struct_needs_dtor(raw_name):
+        return
+    sname := ir_struct_base_name(raw_name)
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " __dtor_" + sname)
+    ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + struct_r.to_string() + " " + fr.to_string())
+
+# one destructor per known struct with rc fields: releases each such
+# field, then the runtime frees the allocation. every module emits its
+# own copy (module prefixing keeps the names distinct), so construction
+# sites never need cross-module destructor references.
+fn ir_emit_struct_dtors():
+    for sname in ir_struct_names.keys():
+        if sname.index_of("[") >= 0:
+            continue
+        if not ir_struct_needs_dtor(sname):
+            continue
+        ir_emit_func_header("__dtor_" + sname, 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        count := ir_struct_field_count(sname)
+        mut i := 0
+        while i < count:
+            fname := ir_struct_field_name_at(sname, i)
+            ftype := ir_struct_field_type_name(sname, fname)
+            fkind := ir_rc_field_kind(ftype)
+            if fkind.len() > 0:
+                fr := ir_reg()
+                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
+                ir_rc_release_reg(fr, fkind)
+            i = i + 1
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
 fn ir_emit_init_globals(root: Node):
     mut has_collection_globals := false
     for child in root.children:
@@ -6367,6 +6493,8 @@ fn ir_collect_root_phase_one_metadata(root_idx: Int):
                 ir_record_generic_function_decl(item_idx, node, "")
 
 fn ir_collect_root_phase_two_metadata(root_idx: Int):
+    ir_local_struct_names = []
+    ir_dtor_memo = {}
     ir_struct_names = {}
     ir_struct_field_lookup = {}
     ir_struct_field_index_lookup = {}
@@ -6394,6 +6522,7 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
 fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_global_bindings(root)
     ir_emit_init_globals(root)
+    ir_emit_struct_dtors()
     # pre-register all impl method specializations across the module so that
     # an earlier impl's specialized body can dispatch to a later impl's
     # specialized version (e.g. MapIter[FilterIter[..], ..].next calling

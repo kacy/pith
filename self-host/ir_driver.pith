@@ -189,6 +189,15 @@ fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix:
         callee_end := next_space(line, callee_start)
         return rewrite_declared_function_ref(line, declared, prefix, init_prefix, callee_start, callee_end)
 
+    if op == "funcref":
+        reg_start := first_end + 1
+        reg_end := next_space(line, reg_start)
+        if reg_end >= line.len():
+            return line
+        callee_start := reg_end + 1
+        callee_end := next_space(line, callee_start)
+        return rewrite_declared_function_ref(line, declared, prefix, init_prefix, callee_start, callee_end)
+
     return line
 
 fn rename_import_ir(ir: String, module_path: String, module_index: Int) -> RenamedImport:

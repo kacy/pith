@@ -35,8 +35,19 @@ string-temps work. peak rss on this benchmark is still ~1.45 gb vs
 ~270 mb for go and rust, same cause.
 
 collection churn (a list and map per iteration, 200k iterations) tells
-the reclamation story: pith 2.6 mb / 150ms vs rust 2.1 mb / 58ms — the
-same constant-memory shape, 2.6x rust's time.
+the reclamation story:
+
+| | go | rust | pith |
+|---|---|---|---|
+| peak rss | 9.3 mb | 2.1 mb | 2.6 mb |
+| runtime | 126 | 58 | 150 |
+
+pith holds rust's constant-memory shape and uses 3.6x less memory than
+go's gc on this pattern, within 1.2x of go's time.
+
+build times, same machine (go 1.24.4): go cold 10.6s / warm 0.1s; pith
+compiles the same program cold in 1.2s every time — 8.5x faster than
+go's cold build, with no incremental cache to go stale.
 
 ## why (measured, not guessed)
 

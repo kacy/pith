@@ -405,10 +405,23 @@ fn ir_collect_struct_field_strings(root_idx: Int):
     for item_idx in ir_root_items(root_idx):
         actual := ir_unwrap_pub_node(item_idx)
         if actual.kind == "struct_decl" or actual.kind == "struct":
+            # the string table is emitted before function bodies, so the
+            # labels the synthesized struct display uses must be interned
+            # here, not when the display code emits.
+            ir_str(actual.value + "(")
+            ir_str(")")
+            ir_str("...")
+            mut first := true
             for child in actual.children:
                 field_node := get_node(child)
                 if field_node.kind == "field":
-                    ir_str(ir_struct_field_name(field_node))
+                    fname := ir_struct_field_name(field_node)
+                    ir_str(fname)
+                    if first:
+                        ir_str(fname + ": ")
+                        first = false
+                    else:
+                        ir_str(", " + fname + ": ")
 
 fn ir_retkind(type_name: String) -> String:
     return ir_retkind_with_state(type_name, ir_type_aliases, ir_struct_names)
@@ -1347,7 +1360,103 @@ fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
         part_info := get_type_info(part_tid)
         if part_info.kind == "result":
             return ir_emit_result_value_to_string(part_r, part_tid)
+        if part_info.kind == "list":
+            return ir_emit_display_list(part_r, ir_type_from_tid(part_info.inner), false)
+        if part_info.kind == "map":
+            return ir_emit_display_map(part_r, ir_type_from_tid(part_info.key_type), ir_type_from_tid(part_info.value_type))
+        if part_info.kind == "set":
+            converted := ir_reg()
+            ir_emit_call1(converted, "__set_to_list", "list", part_r)
+            return ir_emit_display_list(converted, ir_type_from_tid(part_info.inner), true)
+    if part_type.len() > 0 and ir_struct_names.contains_key(part_type):
+        if not ir_boxed_enums.contains_key(part_type):
+            return ir_emit_display_struct(part_r, part_type)
     return part_r
+
+# kind codes shared with the runtime display helpers:
+# 0=int, 1=float, 2=bool, 3=string
+fn ir_display_kind_code(kind: String) -> Int:
+    if kind == "float":
+        return 1
+    if kind == "bool":
+        return 2
+    if kind == "string":
+        return 3
+    return 0
+
+fn ir_emit_display_list(list_r: Int, elem_kind: String, sorted: Bool) -> Int:
+    kind_r := ir_reg()
+    ir_emit("iconst " + kind_r.to_string() + " " + ir_display_kind_code(elem_kind).to_string())
+    sort_r := ir_reg()
+    mut sort_flag := "0"
+    if sorted:
+        sort_flag = "1"
+    ir_emit("iconst " + sort_r.to_string() + " " + sort_flag)
+    r := ir_reg()
+    ir_emit_call3(r, "pith_display_list", "string", list_r, kind_r, sort_r)
+    return r
+
+fn ir_emit_display_map(map_r: Int, key_kind: String, val_kind: String) -> Int:
+    kk_r := ir_reg()
+    ir_emit("iconst " + kk_r.to_string() + " " + ir_display_kind_code(key_kind).to_string())
+    vk_r := ir_reg()
+    ir_emit("iconst " + vk_r.to_string() + " " + ir_display_kind_code(val_kind).to_string())
+    r := ir_reg()
+    ir_emit_call3(r, "pith_display_map", "string", map_r, kk_r, vk_r)
+    return r
+
+# a struct in interpolation renders through its show() impl when one
+# exists; otherwise as "Name(field: value, ...)" with scalar and string
+# fields formatted and anything deeper shown as "...".
+fn ir_emit_display_struct(obj_r: Int, struct_name: String) -> Int:
+    show_name := ir_lookup_impl_method_name(struct_name, "show")
+    if show_name.len() > 0:
+        r := ir_reg()
+        ir_emit_call1(r, show_name, "string", obj_r)
+        return r
+    mut acc_r := ir_reg()
+    ir_emit("strref " + acc_r.to_string() + " " + ir_str(struct_name + "("))
+    total := ir_struct_field_count(struct_name)
+    mut fi := 0
+    while fi < total:
+        field_name := ir_struct_field_name_at(struct_name, fi)
+        field_kind := ir_struct_field_type_name(struct_name, field_name)
+        mut label := field_name + ": "
+        if fi > 0:
+            label = ", " + field_name + ": "
+        label_r := ir_reg()
+        ir_emit("strref " + label_r.to_string() + " " + ir_str(label))
+        with_label := ir_reg()
+        ir_emit("concat " + with_label.to_string() + " " + acc_r.to_string() + " " + label_r.to_string())
+        ir_string_release_reg(acc_r)
+        field_r := ir_reg()
+        ir_emit("field " + field_r.to_string() + " " + obj_r.to_string() + " " + (fi * 8).to_string() + " " + field_kind + " " + field_name)
+        mut text_r := field_r
+        if field_kind == "int":
+            text_r = ir_reg()
+            ir_emit_call1(text_r, "int_to_string", "string", field_r)
+        elif field_kind == "float":
+            text_r = ir_reg()
+            ir_emit_call1(text_r, "float_to_string", "string", field_r)
+        elif field_kind == "bool":
+            text_r = ir_reg()
+            ir_emit_call1(text_r, "bool_to_string", "string", field_r)
+        elif field_kind != "string":
+            text_r = ir_reg()
+            ir_emit("strref " + text_r.to_string() + " " + ir_str("..."))
+        next_acc := ir_reg()
+        ir_emit("concat " + next_acc.to_string() + " " + with_label.to_string() + " " + text_r.to_string())
+        ir_string_release_reg(with_label)
+        if field_kind == "int" or field_kind == "float" or field_kind == "bool":
+            ir_string_release_reg(text_r)
+        acc_r = next_acc
+        fi = fi + 1
+    close_r := ir_reg()
+    ir_emit("strref " + close_r.to_string() + " " + ir_str(")"))
+    out_r := ir_reg()
+    ir_emit("concat " + out_r.to_string() + " " + acc_r.to_string() + " " + close_r.to_string())
+    ir_string_release_reg(acc_r)
+    return out_r
 
 fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String]):
     for capture_name, i in captures:

@@ -692,6 +692,55 @@ pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
     }
 }
 
+/// Render a map as "{k: v, ...}" with sorted keys, for interpolation.
+/// Sorting keeps the output deterministic; hashbrown iteration is not.
+/// Kind codes match pith_display_list: 0=int, 1=float, 2=bool, 3=string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_display_map(handle: i64, key_kind: i64, val_kind: i64) -> i64 {
+    let mut out = String::from("{");
+    if let Some(impl_ref) = map_ref_from_handle(handle) {
+        let mut entries: Vec<(String, i64)> = Vec::new();
+        if let Some(fast) = &impl_ref.int_values8 {
+            for (k, v) in fast {
+                entries.push((k.to_string(), *v));
+            }
+            entries.sort_by(|a, b| {
+                a.0.parse::<i64>()
+                    .unwrap_or(0)
+                    .cmp(&b.0.parse::<i64>().unwrap_or(0))
+            });
+        } else {
+            for (k, val) in &impl_ref.data {
+                let key_text = match k {
+                    MapKey::Int(n) => n.to_string(),
+                    MapKey::String(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                };
+                let raw = if val.len() >= 8 {
+                    i64::from_le_bytes(val[..8].try_into().unwrap_or([0u8; 8]))
+                } else {
+                    0
+                };
+                entries.push((key_text, raw));
+            }
+            if key_kind == 0 {
+                entries.sort_by_key(|e| e.0.parse::<i64>().unwrap_or(0));
+            } else {
+                entries.sort();
+            }
+        }
+        for (i, (k, raw)) in entries.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(k);
+            out.push_str(": ");
+            crate::display_value_for_map(&mut out, *raw, val_kind);
+        }
+    }
+    out.push('}');
+    crate::pith_copy_bytes_to_cstring(out.as_bytes()) as i64
+}
+
 /// Get map length by handle (accepts raw MapImpl pointer as i64).
 ///
 /// # Safety

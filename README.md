@@ -68,7 +68,11 @@ for example-facing output, prefer interpolation for direct value printing:
 
 ```pith
 print("count: {items.len()}")
+print("scores: {scores}")   # lists, maps, sets, and structs all render
 ```
+
+a struct renders as `Name(field: value, ...)` unless it has a `show()`
+impl, which then controls its display everywhere it interpolates.
 
 use `std.fmt` when you need a reusable template or literal braces.
 

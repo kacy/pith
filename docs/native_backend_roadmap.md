@@ -258,6 +258,11 @@ Goal:
 
 #### 2. Generic Display / Show
 
+update (july 2026): shipped for interpolation. `"{xs}"` renders lists,
+maps (sorted keys), sets (sorted), and structs — through a `show()` impl
+when one exists, else a synthesized `Name(field: value)` form. bespoke
+renderers below are only needed for custom layouts now.
+
 Examples still write bespoke renderers for common data:
 
 - matrix pretty-printers

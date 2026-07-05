@@ -1134,8 +1134,25 @@ fn check_assignment(node: Node, scope_id: Int):
 # return statement
 # ---------------------------------------------------------------
 
+# a block-bodied lambda infers its return type from its return statements;
+# the sentinel makes the first return record instead of compare.
+TID_LAMBDA_INFER := 0 - 2
+mut lambda_inferred_return := 0 - 1
+
 fn check_return_statement(node: Node, scope_id: Int):
     expected := get_scope_return_type(scope_id)
+    if expected == TID_LAMBDA_INFER:
+        if node.children.len() == 0:
+            if lambda_inferred_return < 0:
+                lambda_inferred_return = TID_VOID
+            return
+        first := c_check_expr(node.children[0], scope_id)
+        if lambda_inferred_return < 0:
+            lambda_inferred_return = first
+        elif is_error_type(first) == false and first != lambda_inferred_return:
+            if types_structurally_equal(first, lambda_inferred_return) == false:
+                report_error("E200", "lambda returns disagree: " + get_type_name(lambda_inferred_return) + " vs " + get_type_name(first))
+        return
     if expected < 0:
         report_error("E231", "return outside of function")
         return
@@ -4397,7 +4414,13 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
             if body_node.children.len() > 0:
                 ret_type = c_check_expr(body_node.children[0], lambda_scope)
         elif body_node.kind == "block":
-            check_block_statement(body_node, lambda_scope)
+            block_scope := create_function_scope(lambda_scope, TID_LAMBDA_INFER)
+            saved_infer := lambda_inferred_return
+            lambda_inferred_return = 0 - 1
+            check_block_statement(body_node, block_scope)
+            if lambda_inferred_return >= 0:
+                ret_type = lambda_inferred_return
+            lambda_inferred_return = saved_infer
         else:
             ret_type = c_check_expr(body_idx, lambda_scope)
     return add_type_info(ti_function(params, ret_type))

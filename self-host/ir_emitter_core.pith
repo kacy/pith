@@ -3989,7 +3989,7 @@ fn ir_collect_lambda_parts(idx: Int) -> LambdaParts:
         cn := get_node(child)
         if cn.kind == "param":
             params.push(cn.value)
-        elif cn.kind == "body":
+        elif cn.kind == "body" or cn.kind == "block":
             body_idx = child
         i = i + 1
     mut captures: List[String] := []
@@ -4014,6 +4014,12 @@ fn ir_emit_lambda_body_value(body_idx: Int):
     if node_kind(body_idx) == "body" and node_child_count(body_idx) > 0:
         br := ir_expr(node_child(body_idx, 0))
         ir_emit("ret " + br.to_string())
+        return
+    if node_kind(body_idx) == "block":
+        # multi-line lambda: statements run in order, return statements
+        # produce the value, and the default return after this covers a
+        # fall-through end
+        ir_block(body_idx)
         return
     br := ir_expr(body_idx)
     ir_emit("ret " + br.to_string())
@@ -4040,6 +4046,8 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_builder := ir_builder_snapshot()
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
+    saved_string_locals := ir_string_locals
+    ir_string_locals = []
     ir_reset_lambda_emit_state()
     ir_emit_func_header(lambda_name, parts.params.len() + 1, "unknown")
     ir_emit_lambda_hidden_param()
@@ -4048,6 +4056,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_emit_lambda_body_value(parts.body_idx)
     ir_emit_lambda_default_return()
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
+    ir_string_locals = saved_string_locals
     # return closure handle and fill captures
     r := ir_reg()
     ir_emit("closure_ref " + r.to_string() + " " + lambda_name)

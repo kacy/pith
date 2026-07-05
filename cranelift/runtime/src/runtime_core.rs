@@ -143,6 +143,10 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
                 // scrub instead of freeing: a read-after-release shows up
                 // as '!' runs in program output instead of silent reuse
                 let data_len = (base.add(8) as *const u64).read() as usize;
+                if std::env::var("PITH_SCRUB_LOG").is_ok() {
+                    let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(24));
+                    eprintln!("scrub {:p} len={} {:?}", s, data_len, String::from_utf8_lossy(bytes));
+                }
                 std::ptr::write_bytes(s as *mut u8, b'!', data_len);
                 return;
             }

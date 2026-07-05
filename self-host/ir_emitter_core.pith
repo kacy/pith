@@ -464,15 +464,8 @@ fn ir_emit_call1(result_reg: Int, fname: String, ret_type: String, arg0: Int):
 fn ir_string_retain_reg(r: Int):
     ir_emit_call1(ir_reg(), "__cstring_retain", "void", r)
 
-mut ir_release_site_counter := 0
-
 fn ir_string_release_reg(r: Int):
-    # DEBUG (branch only): tag every release with its emission site so the
-    # runtime can name the site that frees a traced string
-    ir_release_site_counter = ir_release_site_counter + 1
-    site_r := ir_reg()
-    ir_emit("iconst " + site_r.to_string() + " " + ir_release_site_counter.to_string())
-    ir_emit_call2(ir_reg(), "pith_cstring_release_traced", "void", r, site_r)
+    ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
 
 # collections are shared handles with real refcounts; strings are
 # copy-on-derive with a header count. one kind tag picks the operation.
@@ -553,6 +546,10 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
     if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
         return false
     if node.kind == "index" and node.children.len() > 0:
+        # s[i] on a string mints a fresh char (char_at); container indexing
+        # borrows the element. mirrors ir_emit_index_expr's dispatch.
+        if ir_expr_is_fresh_string_index(idx):
+            return false
         return true
     if node.kind == "binary" or node.kind == "interp" or node.kind == "string_interp":
         return false
@@ -3449,11 +3446,19 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
         return "__list_new_map"
     return "__list_new"
 
-fn ir_emit_list_literal(node: Node) -> Int:
+fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     # a tagged list owns its heap elements: the runtime push retains, and
-    # release cascades. element kind comes from the first element.
+    # release cascades. the checker's type covers empty literals in any
+    # position (a bare `return []` was creating untagged List[String]
+    # buffers whose elements nothing owned); the first element is the
+    # fallback when no checked type exists.
     mut elem_kind := ""
-    if node.children.len() > 0:
+    tid := c_get_expr_type(idx)
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "list" and info.inner >= 0:
+            elem_kind = ir_rc_kind(ir_type_from_tid(info.inner))
+    if elem_kind.len() == 0 and node.children.len() > 0:
         elem_kind = ir_rc_kind(ir_infer_type(node.children[0]))
     list_r := ir_reg()
     ir_emit_call0(list_r, ir_list_ctor_for_elem_kind(elem_kind), "list")
@@ -4965,7 +4970,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_set_literal(node)
 
     if kind == "list":
-        return ir_emit_list_literal(node)
+        return ir_emit_list_literal(idx, node)
 
     if kind == "tuple":
         return ir_emit_tuple_literal(node)
@@ -5072,10 +5077,6 @@ fn ir_emit_bind_stmt(node: Node):
         r := ir_emit_value_for_target(val_idx, ir_map_init_target(name, target_type))
         if tracked and ir_string_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
-            # a fresh char from s[i] arrives with its own count on top of
-            # the retain; drop the extra so per-iteration binds reclaim
-            if ir_expr_is_fresh_string_index(val_idx):
-                ir_string_release_reg(r)
         if old_r >= 0:
             ir_rc_release_reg(old_r, bind_kind)
         ir_var_regs.insert(name, r)

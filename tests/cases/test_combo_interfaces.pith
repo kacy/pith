@@ -1,0 +1,54 @@
+# interfaces and impls crossed with structs, enums, generics, and
+# collection dispatch — the method-resolution corners.
+
+interface Describable:
+    fn describe() -> String
+
+struct Coin:
+    value: Int
+
+struct Card:
+    suit: String
+
+impl Describable for Coin:
+    fn describe() -> String:
+        return "coin:" + self.value.to_string()
+
+impl Describable for Card:
+    fn describe() -> String:
+        return "card:" + self.suit
+
+impl Coin:
+    fn doubled() -> Int:
+        return self.value * 2
+
+enum Holding:
+    Money(Coin)
+    Game(Card)
+
+fn describe_holding(h: Holding) -> String:
+    match h:
+        Holding.Money(c) => c.describe()
+        Holding.Game(c) => c.describe()
+
+fn main():
+    c := Coin(25)
+    print(c.describe())
+    print("plain impl: {c.doubled()}")
+
+    k := Card("hearts")
+    print(k.describe())
+
+    print(describe_holding(Holding.Money(Coin(5))))
+    print(describe_holding(Holding.Game(Card("spades"))))
+
+    mut coins: List[Coin] := [Coin(1), Coin(2), Coin(3)]
+    mut total := 0
+    for coin in coins:
+        total = total + coin.doubled()
+    print("impl in loop: {total}")
+
+    mut lookup: Map[String, Coin] := {}
+    lookup.insert("gold", Coin(100))
+    stored := lookup["gold"]
+    print("impl on map value: {stored.describe()}")

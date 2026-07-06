@@ -1,0 +1,40 @@
+# cross-module combinations: every value kind crossing a module
+# boundary — struct returns, enum payloads, result propagation,
+# closure arguments, shared mutable globals, and container round
+# trips. the module-qualified-call leak lived at this boundary.
+import combo_mod_helper as pkg
+from combo_mod_helper import Parcel, Grade
+
+fn double(v: Int) -> Int:
+    return v * 2
+
+fn main() -> Int!:
+    p := pkg.make_parcel(7)
+    print("struct across: {p.label} {p.weight}")
+
+    g := pkg.grade_for(15)
+    match g:
+        Grade.Express(w) => print("enum across: express {w}")
+        Grade.Standard => print("enum across: standard")
+
+    print("result across: {pkg.risky_weight(4)!}")
+    caught := pkg.risky_weight(0 - 1) catch -99
+    print("result err across: {caught}")
+
+    mut parcels: List[Parcel] := []
+    parcels.push(pkg.make_parcel(1))
+    parcels.push(pkg.make_parcel(2))
+    names := pkg.parcel_names(parcels)
+    print("list across: {names.len()} {names[1]}")
+
+    print("closure across: {pkg.apply_to(double, 21)}")
+    print("lambda across: {pkg.apply_to(fn(x: Int) => x + 100, 5)}")
+
+    pkg.register("alpha", 11)
+    pkg.register("beta", 22)
+    print("shared global: {pkg.lookup("beta")} {pkg.lookup("missing")}")
+
+    local_made := Parcel("local", 3)
+    remote_named := pkg.parcel_names([local_made])
+    print("local struct through remote fn: {remote_named[0]}")
+    return 0

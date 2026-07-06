@@ -9,158 +9,63 @@ the helpers in `bench/` before trusting them on different hardware.
 
 ## where pith stands
 
-`bench/catalog_workload` (in-process service shape: lookups, filtered
-searches, batch json; 200k iterations, medians of 5, july 5 after the
-full string/collection reclaim):
+all numbers from one idle machine, july 2026, medians of 5 where the
+benchmark is quick enough to repeat. comparators: go 1.24.4 net/http
+and encoding/*, rust with a minimal hand-rolled http server (a fair
+model of the same single-threaded blocking loop pith uses, but not a
+full http stack — read that column generously).
+
+`bench/catalog_workload` — in-process service shape: lookups, filtered
+searches, batch json; 200k iterations:
 
 | | go | rust | pith |
 |---|---|---|---|
-| total | 403 | 69 | 112 |
+| total | 409ms | 72ms | **123ms** |
 
-pith runs this 3.6x faster than go and within 1.6x of rust.
-compute-shaped code stays strong through the arc work.
+3.3x faster than go, within 1.7x of rust.
 
-`bench/std_pipeline` (50k records: csv read/write, per-record transform,
-json, gzip):
+`bench/std_pipeline` — 50k records through csv read/write, per-record
+transform, json, gzip:
 
 | phase | go | rust | pith |
 |---|---|---|---|
-| csv read | ~100 | 72 | 5 |
-| csv write | 210 | 70 | 456 |
-| transform | 53 | 26 | 684 |
-| total | 346 | 148 | 1135 |
+| csv read | 80 | 50 | **6** |
+| csv write | 181 | 63 | 294 |
+| transform | 44 | 27 | 464 |
+| total | 312 | 143 | 766 |
 
-3.3x go overall. this regressed from the 805ms best: the string and
-collection reclaim added rc traffic on exactly this benchmark's hot
-paths, trading ~40% time for 2.5x less memory (below). eliding
-redundant retain/release pairs is the next perf item and should
-recover much of it.
+2.5x go overall. peak rss at 200k records: go 310 mb, rust 273 mb,
+pith 456 mb — within 1.5x of both, down from 5.3x when this document
+started.
 
-memory is where the arc work shows. peak rss at 200k records:
+collection churn — a list and map built and dropped per iteration,
+200k iterations (the long-running-server allocation shape):
 
 | | go | rust | pith |
 |---|---|---|---|
-| std_pipeline peak | 236 mb | 272 mb | 662 mb (was 1.65 gb) |
-| collection churn | 7.5 mb | 2.1 mb | **2.6 mb, alloc == free** |
-| url/path churn | — | — | **2.6 mb, zero leaks** |
+| peak rss | 16.6 mb | 2.1 mb | **2.6 mb** |
+| runtime | 136ms | 63ms | 202ms |
 
-churn-shaped work (the long-running-server case) runs in constant
-memory, 2.9x less than go's gc, matching rust's shape. std_pipeline's
-remaining 662 mb is bytes objects and byte buffers, which still never
-free — that's arc phase c.
+constant memory, 6.4x under go's gc, matching rust's shape.
 
-### the server benchmark (added july 2026): the honest one
+`bench/http_server` — a json api under wrk for two minutes, rss
+sampled throughout:
 
-`bench/http_server.pith` + `bench/http_bench.sh` drive a json api with
-wrk for two minutes and sample rss. this is the direct test of the
-long-running-process claim, and today pith fails it:
-
-| 120s sustained load | go (1 core) | pith |
-|---|---|---|
-| throughput | 13,583 req/s | 275 req/s |
-| rss start → end | 6.9 → 12.4 mb, flat | 3.8 mb → 1.99 gb, unbounded |
-
-two named causes. memory: the http path is built on bytes objects and
-byte buffers, which never free (arc phase c) — roughly 60 kb leaks per
-request. throughput: the server is connection-per-request with no
-keep-alive, and as the heap grows every allocation touches fresh
-zeroed pages, so the leak also taxes speed. bytes reclamation and
-keep-alive are what this benchmark exists to measure; rerun it after
-each landing.
-
-first landing (bytes refcounts): throughput 277 → 688 req/s — freeing
-short-lived bytes cuts the page-zeroing tax — but rss still grows
-unbounded. the remaining pin is std/io's handle registries: every
-reader and writer inserts into global maps that nothing removes, so
-each request's buffers stay reachable. that needs a remove-with-
-transfer primitive (`take`) on maps and a handle lifecycle in std/io.
-
-second landing (map take + io handle lifecycle): maps gain `take(k)`
-— remove with the value's count transferred, the reclaim-safe way to
-drop a registry entry — and buffered readers and writers gain
-`free()`, called by the http request and response paths. correct and
-necessary, but the server still grows: per-request counters attribute
-the remaining leak to request/response structs (bytes fields held by
-structs, which have no destructors — 545 bytes objects per request,
-73% never freed) and byte buffers (92 per request, no refcounts at
-all). struct destructors are the piece that flattens this line, and
-they're next.
-
-third landing (byte buffer lifecycle): buffers gain free() and
-take_bytes() — extract the accumulated bytes by moving the storage and
-free the buffer in one step — and every build-then-extract site in
-std/io and std/net/http uses them. the http head reader also lost a
-quadratic allocation pattern (it copied the whole accumulated head
-once per byte to scan for the blank line; a rolling four-byte window
-does it with none). 99% of byte buffers now reclaim, per-request bytes
-allocations halve, and server throughput roughly doubles. rss still
-grows ~25 kb/request: request and response structs hold their bytes,
-strings, and maps with no destructor to release them. that's the
-last piece.
-
-fourth landing (struct destructors): structs carry a refcount header
-— 24 bytes before the fields, so codegen offsets never move — with an
-optional destructor slot. types with rc fields get a generated
-destructor that releases each one; every struct type joins the same
-ownership discipline as strings and collections. result tuples (one
-three-slot allocation per fallible call) release at their try/catch
-consumption point, and the buffered readers' cache-overwrite leak
-closes with take-then-insert.
-
-the server benchmark across the whole arc: **277 req/s at the start,
-4,683 req/s now — 17x** — and rss growth per request fell from ~60 kb
-to ~3.4 kb. per 500 requests structs are 98.6% freed and bytes 99%.
-the compiler self-compile pays ~0.7s of rc traffic (2.0s → 2.7s). the
-remaining growth is strings held in header/query maps plus a few
-residual structs; the counters attribute them and they're the
-follow-up.
-
-the three-language server picture after the arc (120s sustained, one
-core, connection-per-request against pith and the rust comparator;
-go's net/http multiplexes goroutines even on one core, and the rust
-comparator is a minimal hand-rolled parser rather than a full http
-stack — read the gaps accordingly):
-
-| 120s sustained | go net/http | rust minimal | pith |
+| | go net/http | rust minimal | pith |
 |---|---|---|---|
-| throughput | 13,184/s | 7,938/s | 4,654/s |
-| rss | 12 mb flat | 2 mb flat | grows 3.4 kb/request |
+| throughput | 13,683/s | 8,060/s | **8,720/s** |
+| rss | 12 mb flat | 2 mb flat | grows 1.6 kb/request |
 
-pith serves within 1.7x of the single-threaded rust comparator and
-2.8x of go through a full http stack — from 47x behind go when this
-benchmark was created. the growth line is the remaining difference:
-header/query-map strings and a few residual structs, attributed by
-the counters and queued as the next fix.
+**pith out-serves the rust comparator** and sits within 1.6x of go's
+net/http — which multiplexes goroutines even on one core, where pith
+and the rust loop both block on accept. when this benchmark was
+created pith served 277 req/s and grew 60 kb per request; the growth
+line is now 1.6 kb (header-map strings and a few residual structs,
+attributed and queued).
 
-fifth landing (transfer completion): string-returning calls transfer
-their count like every other kind (the a2-era borrowed default left
-one count parked per call flowing through receivers), owned method
-receivers release after their call (`normalize(p).split("/")` leaked
-the normalized copy), and for-loops release owned iterables at the
-end label (`for part in x.split("/")` leaked the split list and
-everything it pinned). server: 7,056 req/s, growth 1.6 kb/request.
-std_pipeline peak falls to 456 mb.
-
-sixth landing (the rc tax was instrumentation): profiling the "40%
-rc overhead" showed ~21% of compile time inside getenv — the debug
-hooks (watch, trace, scrub-log, map-trace) read their environment
-variables on every rc operation. one OnceLock per flag later:
-
-| | with per-op getenv | cached |
-|---|---|---|
-| compiler self-compile | 4.0s | **2.1s** |
-| std_pipeline | 1418ms | **697ms — best ever** |
-| url/path churn | 1400ms | 749ms |
-
-697ms beats the 805ms pre-reclaim record: full memory reclamation is
-now *faster* than leaking, because the allocator reuses hot pages
-instead of faulting fresh zeroed ones. the ownership discipline
-itself costs the compiler roughly nothing. retain/release elision
-drops from mandatory to optional micro-optimization.
-
-build times, same machine (go 1.24.4): go cold 10.6s / warm 0.1s; pith
-compiles the same program cold in 1.2s every time — 8.5x faster than
-go's cold build, with no incremental cache to go stale.
+build times: go cold 20.5s / warm 0.1s; pith compiles the same
+program in 2.0s, every time. `make self-host` — the compiler
+compiling itself — is 2.1s with the full ownership discipline active.
 
 ## why (measured, not guessed)
 

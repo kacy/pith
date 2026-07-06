@@ -188,11 +188,19 @@ fn main() -> Int!:
 ```
 
 **memory management:**
-- complete automatic reference counting (ARC) for all heap-allocated types
-- string ARC with retain/release
-- collection ARC for List, Map, Set
-- closure ARC for lambda environments
-- cycle collection with periodic mark-and-scan algorithm
+- compiler-emitted reference counting for strings, lists, maps, sets,
+  bytes, byte buffers, and structs — structs with heap fields get a
+  generated destructor that releases them
+- ownership follows a borrowed-by-default discipline: parameters are
+  borrows (an unmodified argument costs no rc traffic), returns and
+  constructions transfer, containers own their elements
+- removed and overwritten container elements are deliberately not
+  released while the container lives — a borrow of one may still be
+  in flight — so those leak until the container dies; only the free
+  path cascades
+- closure environments do not reclaim yet, and reference cycles leak
+  (there is no cycle collector in the native path)
+- measured behavior and current numbers live in `docs/performance.md`
 
 **error codes:** every diagnostic has a stable code — E0xx (lexer),
 E1xx (parser), E2xx (checker), E3xx (lint). see `docs/errors.md` for the

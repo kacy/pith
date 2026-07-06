@@ -51,13 +51,13 @@ fn main():
 
 fn lambda_collections():
     # two lambdas of one signature intern to different type ids;
-    # homogeneity checks must compare structure, not identity.
-    # (calling two closure variables in one function currently trips a
-    # cranelift verifier error — a pre-existing emitter bug unreachable
-    # before these literals type-checked; tracked separately.)
+    # homogeneity checks must compare structure, not identity. the
+    # locals here deliberately reuse runtime function names (first,
+    # second): a called local must shadow the bare runtime import.
     mut ops: List[fn(Int) -> Int] := [fn(x: Int) => x + 1, fn(x: Int) => x * 2]
     first := ops[0]
-    print("lambda list: {ops.len()} {first(10)}")
+    second := ops[1]
+    print("lambda list: {ops.len()} {first(10)} {second(10)}")
 
     mut named: Map[String, fn(Int) -> Int] := {"inc": fn(x: Int) => x + 1, "neg": fn(x: Int) => 0 - x}
     ng := named["neg"]

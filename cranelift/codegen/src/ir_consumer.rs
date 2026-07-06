@@ -1212,9 +1212,15 @@ fn compile_ir_function(
                         }
                         continue;
                     }
-                    // Look up function: user-defined first, then a direct runtime import key.
+    // Look up function: user-defined first, then a direct runtime
+                    // import key. A local variable shadows both — the checker
+                    // guarantees a called local is closure-typed, and a bare
+                    // runtime name like `second` must not capture a call to a
+                    // local that happens to share it.
                     let mut runtime_call = false;
-                    let fid = if let Some(&fid) = declared_funcs.get(fname) {
+                    let fid = if named_vars.contains_key(fname) {
+                        None
+                    } else if let Some(&fid) = declared_funcs.get(fname) {
                         Some(fid)
                     } else if let Some(&fid) = runtime_funcs.get(fname) {
                         runtime_call = true;
@@ -1634,13 +1640,27 @@ fn compile_ir_function(
         .module
         .define_function(func_id, &mut ctx)
         .map_err(|e| {
+            // the wrapped Display collapses verifier failures to the
+            // string "Verifier errors"; pull the actual list out so the
+            // failing instruction is named
+            let detail = match &e {
+                cranelift_module::ModuleError::Compilation(
+                    cranelift::codegen::CodegenError::Verifier(errors),
+                ) => errors
+                    .0
+                    .iter()
+                    .map(|err| format!("  {}", err))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                other => format!("  {}", other),
+            };
             eprintln!(
-                "IR consumer verifier error in '{}': {}\nIR:\n{}",
+                "IR consumer verifier error in '{}':\n{}\nIR:\n{}",
                 func_name,
-                e,
+                detail,
                 ctx.func.display()
             );
-            CompileError::ModuleError(format!("IR consumer: {}", e))
+            CompileError::ModuleError(format!("IR consumer: {}\n{}", e, detail))
         })?;
 
     Ok(())

@@ -9,110 +9,65 @@ the helpers in `bench/` before trusting them on different hardware.
 
 ## where pith stands
 
-all numbers from one idle machine, july 2026, medians of 5 where the
-benchmark is quick enough to repeat. comparators: go 1.24.4 net/http
-and encoding/*, rust with a minimal hand-rolled http server (a fair
-model of the same single-threaded blocking loop pith uses, but not a
-full http stack — read that column generously).
+all numbers from one 2-core machine in one sitting, july 2026,
+medians of 5 where quick enough to repeat. absolute values drift a
+few percent between days; within a table they're comparable.
+comparators: go 1.24.4 (net/http, encoding/*), rust (a minimal
+hand-rolled http server modeling the same blocking loop — not a full
+stack, read it generously).
 
-`bench/catalog_workload` — in-process service shape: lookups, filtered
+`bench/catalog_workload` — service-shaped compute: lookups, filtered
 searches, batch json; 200k iterations:
 
 | | go | rust | pith |
 |---|---|---|---|
-| total | 409ms | 72ms | **123ms** |
+| total | 401ms | 74ms | **123ms** |
 
 3.3x faster than go, within 1.7x of rust.
 
-`bench/std_pipeline` — 50k records through csv read/write, per-record
-transform, json, gzip:
+`bench/std_pipeline` — 50k records: csv read/write, transform, json,
+gzip:
 
 | phase | go | rust | pith |
 |---|---|---|---|
-| csv read | 80 | 50 | **6** |
-| csv write | 181 | 63 | 294 |
-| transform | 44 | 27 | 464 |
-| total | 312 | 143 | 766 |
+| csv read | 85 | 52 | **6** |
+| csv write | 191 | 63 | 296 |
+| transform | 51 | 29 | 423 |
+| total | 329 | 144 | 724 |
 
-2.5x go overall. peak rss at 200k records: go 310 mb, rust 273 mb,
-pith 456 mb — within 1.5x of both, down from 5.3x when this document
-started.
+2.2x go overall (4.1x when this document began). peak rss at 200k
+records: go 254 mb, rust 273 mb, pith 436 mb — 1.7x go, down from
+5.3x pre-reclaim.
 
 collection churn — a list and map built and dropped per iteration,
-200k iterations (the long-running-server allocation shape):
+200k iterations:
 
 | | go | rust | pith |
 |---|---|---|---|
-| peak rss | 16.6 mb | 2.1 mb | **2.6 mb** |
-| runtime | 136ms | 63ms | 202ms |
+| peak rss | 8.0 mb | 2.0 mb | **2.6 mb** |
+| runtime | 140ms | 61ms | 187ms |
 
-constant memory, 6.4x under go's gc, matching rust's shape.
+constant memory, 3x under go's gc, matching rust's shape. the
+url/path churn variant (heavy substring work) runs 712ms at the same
+constant 2.6 mb.
 
-`bench/http_server` — a json api under wrk for two minutes, rss
-sampled throughout:
+`bench/http_server` — a json api under wrk for two minutes:
 
-| | go net/http | rust minimal | pith |
-|---|---|---|---|
-| throughput | 13,683/s | 8,060/s | **8,720/s** |
-| rss | 12 mb flat | 2 mb flat | grows 1.6 kb/request |
+| | go 1-core | go all-cores | rust minimal | pith single | pith threaded |
+|---|---|---|---|---|---|
+| req/s | 13,838 | 14,584 | 7,606 | **7,583** | 7,916 |
+| rss | 12 mb flat | 13 mb flat | 2 mb flat | +1.3 kb/req | +1.3 kb/req |
 
-**pith out-serves the rust comparator** and sits within 1.6x of go's
-net/http — which multiplexes goroutines even on one core, where pith
-and the rust loop both block on accept. when this benchmark was
-created pith served 277 req/s and grew 60 kb per request; the growth
-line is now 1.6 kb (header-map strings and a few residual structs,
-attributed and queued).
+single-threaded pith serves at parity with the single-threaded rust
+comparator through a full http stack. the threaded server has reached
+15,800 req/s on this machine when the load generator wasn't competing
+for the same two cores; with wrk co-located it converges with the
+single-threaded number. go's netpoller stays ahead either way. the
+residual growth is ~1.3 kb/request, attributed down to header-name
+copies and a few structs in the leak reporter.
 
-the thread-per-connection story took two rounds. round one (spawn per
-accept, no keep-alive, condvar-mutex registry guards) measured 9x
-slower than the single-threaded loop — a thread spawn per request,
-and 2.3x lock overhead before any concurrency existed. round two
-supplied the three missing ingredients: http keep-alive (the servers
-now use serve_connection_fd, so a connection is one long-lived
-handler), a rewritten pith mutex (one compare-exchange each way,
-spin-then-yield — the old one paid a handle-registry lock plus a
-condvar per operation), and locked std/io registries whose critical
-sections never cover a socket read or write.
-
-| 60s sustained, 2 cores | single-threaded | thread per connection |
-|---|---|---|
-| pith keep-alive | 8,334/s | **15,823/s** |
-
-threaded pith beats go's single-core 13,683/s and sits within 1.25x
-of go using both cores (19,854/s). the io registries are now safe
-under concurrent handlers, which also makes the readme's no-data-races
-claim true for spawned code that shares streams.
-
-seventh landing (byte comparisons): `s[i] == ":"` compared two
-freshly allocated one-character strings; scanners paid an allocation,
-a refcount round-trip, and a string equality per character per test.
-single-byte comparisons — an index against a one-character literal,
-a chr(n), or another index — now lower to an allocation-free byte_at
-and an integer compare, and ord(s[i]) reads the byte directly. a
-scanner loop making three tests per character across 200k strings
-runs with zero string allocations. url/path churn drops to 643ms and
-std_pipeline to 657ms, the best recorded.
-
-eighth landing (the leak reporter and what it found): under
-PITH_CSTRING_NOFREE + PITH_LEAK_SCAN the runtime now prints every
-string whose count never reached zero, grouped by content — the
-definitive per-request leak list, no guessing. it attributed three
-classes in one afternoon: query-map values double-counted by the
-store-position rule (string-valued maps are provably tagged, so owned
-inserts now complete their transfer), the serialized response head
-abandoned once per request (module-qualified calls never released
-their owned arguments — bytes.from_string_utf8(head) leaked its head
-everywhere in the tree), and a response-buffer copy (take_bytes).
-server growth per request: 1.79 kb → 1.33 kb. the remainder is
-attributed and small: header-name copies, a few empty strings, and
-some structs. one design lesson recorded the hard way: a retain
-cannot magic-check an arbitrary integer — dereferencing value-16
-faults on ints that resemble addresses — so transfer-completion must
-be proven emitter-side per container, never assumed runtime-side.
-
-build times: go cold 20.5s / warm 0.1s; pith compiles the same
-program in 2.0s, every time. `make self-host` — the compiler
-compiling itself — is 2.1s with the full ownership discipline active.
+build times: go cold 25.0s / warm 0.1s; pith compiles the benchmark
+in 2.1s every time, and the entire self-hosted compiler in under 7s.
 
 ## why (measured, not guessed)
 

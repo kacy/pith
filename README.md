@@ -2,9 +2,9 @@
 
 a programming language where any coding agent is immediately productive.
 
-no panics, no null, no data races. automatic memory management via ARC with
-compile-time cycle prevention. result types everywhere. designed so that AI
-coding agents can read the errors, apply fixes, and iterate — fast.
+no panics, no null, no data races. automatic memory management via
+compiler-emitted reference counting. result types everywhere. designed so
+that AI coding agents can read the errors, apply fixes, and iterate — fast.
 
 **status:** the compiler self-hosts — pith is written in pith. the
 self-hosted frontend emits Pith text IR, and the Rust/Cranelift backend lowers

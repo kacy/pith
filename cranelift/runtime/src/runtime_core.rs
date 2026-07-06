@@ -105,7 +105,21 @@ unsafe fn cstring_refcount(base: *mut u8) -> &'static std::sync::atomic::AtomicU
 pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
     if let Some(base) = cstring_base(s) {
         crate::perf_count(&crate::PERF_CSTRING_RETAINS, 1);
-        cstring_refcount(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let prev = cstring_refcount(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cstring_watch(base, s, "retain", prev as i64, 1);
+    }
+}
+
+/// Debug: PITH_CSTRING_WATCH=<content> logs every rc operation on strings
+/// with that exact content, with the count before the op.
+unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delta: i64) {
+    let Ok(needle) = std::env::var("PITH_CSTRING_WATCH") else {
+        return;
+    };
+    let data_len = (base.add(8) as *const u64).read() as usize;
+    let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(64));
+    if String::from_utf8_lossy(bytes) == needle {
+        eprintln!("watch {:p} {} {} -> {}", s, op, prev, prev + delta);
     }
 }
 
@@ -117,6 +131,7 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
     if let Some(base) = cstring_base(s) {
         crate::perf_count(&crate::PERF_CSTRING_RELEASES, 1);
         let prev = cstring_refcount(base).fetch_sub(1, std::sync::atomic::Ordering::Release);
+        cstring_watch(base, s, "release", prev as i64, -1);
         if prev == 0 {
             // an over-release means the emitter's ownership accounting is
             // wrong somewhere; report it loudly in debug runs instead of
@@ -203,8 +218,14 @@ pub unsafe extern "C" fn pith_cstring_release_traced(s: *const i8, site: i64) {
 /// PITH_RETAIN_SITES is set.
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_retain_traced(s: *const i8, site: i64) {
-    if cstring_base(s).is_some() && std::env::var("PITH_RETAIN_SITES").is_ok() {
-        eprintln!("retain site {}", site);
+    if let Some(base) = cstring_base(s) {
+        if std::env::var("PITH_CSTRING_WATCH").is_ok() {
+            let data_len = (base.add(8) as *const u64).read() as usize;
+            let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(64));
+            if Ok(String::from_utf8_lossy(bytes).into_owned()) == std::env::var("PITH_CSTRING_WATCH") {
+                eprintln!("watch retain SITE {}", site);
+            }
+        }
     }
     pith_cstring_retain(s);
 }

@@ -465,14 +465,8 @@ fn ir_emit_call1(result_reg: Int, fname: String, ret_type: String, arg0: Int):
 #     excluded from cleanup, a returned borrow is retained
 #   - each return releases every string local the function owns
 
-mut ir_retain_site_counter := 0
-
 fn ir_string_retain_reg(r: Int):
-    # DEBUG (temporary): site-tagged retains for leak attribution
-    ir_retain_site_counter = ir_retain_site_counter + 1
-    site_r := ir_reg()
-    ir_emit("iconst " + site_r.to_string() + " " + ir_retain_site_counter.to_string())
-    ir_emit_call2(ir_reg(), "pith_cstring_retain_traced", "void", r, site_r)
+    ir_emit_call1(ir_reg(), "__cstring_retain", "void", r)
 
 fn ir_string_release_reg(r: Int):
     ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
@@ -553,7 +547,7 @@ fn ir_rc_release_enabled(kind: String) -> Bool:
 
 fn ir_rc_retain_reg(r: Int, kind: String):
     if kind == "string":
-        ir_emit_call1(ir_reg(), "__cstring_retain", "void", r)
+        ir_string_retain_reg(r)
     elif kind == "list":
         ir_emit_call1(ir_reg(), "pith_list_retain_handle", "void", r)
     elif kind == "map":
@@ -645,6 +639,8 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
     if node.kind == "list" or node.kind == "map" or node.kind == "set":
         return false
     if node.kind == "struct_init":
+        return false
+    if node.kind == "call" and ir_infer_type(idx) == "string":
         return false
     if node.kind == "call" or node.kind == "method_call":
         expr_kind := ir_rc_kind(ir_infer_type(idx))
@@ -4250,6 +4246,11 @@ fn ir_emit_method_call(idx: Int) -> Int:
         return obj_r
     ir_emit_call_text(r, emit_name, ret_type, call_args.len(), ir_join_arg_regs(call_args))
     ir_release_owned_method_args(node, arg_regs, store_value_pos)
+    if node.children.len() > 0:
+        recv_idx := node.children[0]
+        recv_kind := ir_rc_kind(ir_infer_type(recv_idx))
+        if recv_kind.len() > 0 and not ir_string_expr_is_borrowed(recv_idx):
+            ir_rc_release_reg(obj_r, recv_kind)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         return ir_emit_wrapped_legacy_result(r, ret_type, emit_name)
     if ir_is_void_method(emit_name):
@@ -5564,11 +5565,19 @@ fn ir_emit_for_stmt(node: Node):
         iter_type := ir_infer_type(node.children[0])
         mut iter_r := ir_expr(node.children[0])
         item_kind := ir_for_iter_item_kind(iter_type)
+        # an owned iterable (a split result, a keys() list) dies when the
+        # loop ends; a converted iterable is always a fresh container
+        mut iter_release_kind := ""
+        if not ir_string_expr_is_borrowed(node.children[0]):
+            iter_release_kind = ir_rc_kind(iter_type)
         conversion_call := ir_for_iter_conversion_call(iter_type)
         if conversion_call.len() > 0:
             converted_r := ir_reg()
             ir_emit_call1(converted_r, conversion_call, ir_for_iter_conversion_return_kind(iter_type), iter_r)
+            if iter_release_kind.len() > 0:
+                ir_rc_release_reg(iter_r, iter_release_kind)
             iter_r = converted_r
+            iter_release_kind = ir_rc_kind(ir_for_iter_conversion_return_kind(iter_type))
         fid := ir_for_count
         ir_for_count = ir_for_count + 1
         fi := "__for_idx_" + fid.to_string()
@@ -5610,6 +5619,10 @@ fn ir_emit_for_stmt(node: Node):
         ir_emit("store " + fi + " " + inc_r.to_string())
         ir_emit("jmp " + head_l)
         ir_emit("label " + end_l)
+        if iter_release_kind.len() > 0:
+            fin_r := ir_reg()
+            ir_emit("load " + fin_r.to_string() + " " + ft)
+            ir_rc_release_reg(fin_r, iter_release_kind)
 
 # `for i in lo..hi` lowers to a counted loop over an Int counter, with no
 # intermediate list allocation. exclusive (`..`) stops at hi, inclusive

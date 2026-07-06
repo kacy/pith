@@ -132,6 +132,18 @@ benchmark was created. the growth line is the remaining difference:
 header/query-map strings and a few residual structs, attributed by
 the counters and queued as the next fix.
 
+fifth landing (transfer completion): string-returning calls transfer
+their count like every other kind (the a2-era borrowed default left
+one count parked per call flowing through receivers), owned method
+receivers release after their call (`normalize(p).split("/")` leaked
+the normalized copy), and for-loops release owned iterables at the
+end label (`for part in x.split("/")` leaked the split list and
+everything it pinned). server: 7,056 req/s, growth 1.6 kb/request.
+std_pipeline peak falls to 456 mb. the accumulated rc traffic now
+costs the compiler ~2s of self-compile (2.0s → 4.0s) and std_pipeline
+~40% — eliding provably-redundant retain/release pairs is the
+standing next perf item.
+
 build times, same machine (go 1.24.4): go cold 10.6s / warm 0.1s; pith
 compiles the same program cold in 1.2s every time — 8.5x faster than
 go's cold build, with no incremental cache to go stale.

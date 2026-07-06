@@ -129,6 +129,23 @@ pub unsafe extern "C" fn pith_cstring_char_at(s: *const i8, index: i64) -> *mut 
     ptr
 }
 
+/// Read one byte of a string as an integer: the allocation-free form of
+/// s[i] for comparisons. Out of range returns -1, which matches no byte,
+/// mirroring char_at's empty-string-on-out-of-range semantics under ==.
+///
+/// # Safety
+/// s must be a valid null-terminated C string or garbage (checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_byte_at(s: *const i8, index: i64) -> i64 {
+    let Some(bytes) = cstr_bytes(s) else {
+        return -1;
+    };
+    if index < 0 || index as usize >= bytes.len() {
+        return -1;
+    }
+    bytes[index as usize] as i64
+}
+
 /// Trim ASCII whitespace from the left side of a C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_trim_left(s: *const i8) -> *mut i8 {

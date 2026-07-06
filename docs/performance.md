@@ -83,6 +83,16 @@ of go using both cores (19,854/s). the io registries are now safe
 under concurrent handlers, which also makes the readme's no-data-races
 claim true for spawned code that shares streams.
 
+seventh landing (byte comparisons): `s[i] == ":"` compared two
+freshly allocated one-character strings; scanners paid an allocation,
+a refcount round-trip, and a string equality per character per test.
+single-byte comparisons — an index against a one-character literal,
+a chr(n), or another index — now lower to an allocation-free byte_at
+and an integer compare, and ord(s[i]) reads the byte directly. a
+scanner loop making three tests per character across 200k strings
+runs with zero string allocations. url/path churn drops to 643ms and
+std_pipeline to 657ms, the best recorded.
+
 build times: go cold 20.5s / warm 0.1s; pith compiles the same
 program in 2.0s, every time. `make self-host` — the compiler
 compiling itself — is 2.1s with the full ownership discipline active.

@@ -2518,7 +2518,7 @@ fn check_assertion_equality(arg_indices: List[Int], scope_id: Int) -> Int:
     t2 := c_check_expr(second_expr, scope_id)
     if is_error_type(t1) == false:
         if is_error_type(t2) == false:
-            if t1 != t2:
+            if t1 != t2 and types_structurally_equal(t1, t2) == false:
                 report_error("E219", "assert_eq arguments must be the same type: " + get_type_name(t1) + " vs " + get_type_name(t2))
     return TID_VOID
 
@@ -4455,7 +4455,7 @@ fn check_list_expression(node: Node, scope_id: Int) -> Int:
         if is_error_type(elem_type):
             elem_type = t
         elif is_error_type(t) == false:
-            if t != elem_type:
+            if t != elem_type and types_structurally_equal(t, elem_type) == false:
                 report_error("E223", "list elements must be the same type: expected " + get_type_name(elem_type) + ", got " + get_type_name(t))
     if is_error_type(elem_type):
         return tid_err
@@ -4481,7 +4481,7 @@ fn check_map_expression(node: Node, scope_id: Int) -> Int:
                 if is_error_type(val_type):
                     val_type = vt
                 elif is_error_type(vt) == false:
-                    if vt != val_type:
+                    if vt != val_type and types_structurally_equal(vt, val_type) == false:
                         report_error("E223", "map values must be the same type")
     if is_error_type(key_type):
         return tid_err
@@ -4500,7 +4500,7 @@ fn check_set_expression(node: Node, scope_id: Int) -> Int:
         if is_error_type(elem_type):
             elem_type = t
         elif is_error_type(t) == false:
-            if t != elem_type:
+            if t != elem_type and types_structurally_equal(t, elem_type) == false:
                 report_error("E223", "set elements must be the same type")
     if is_error_type(elem_type):
         return tid_err

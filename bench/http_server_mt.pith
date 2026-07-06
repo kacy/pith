@@ -1,0 +1,66 @@
+# threaded http server benchmark: one spawned handler per connection,
+# same routes and per-request work as bench/http_server.pith. exists to
+# measure what pith's os-thread spawn buys against go's goroutine
+# multiplexing.
+#
+# run:  pith build bench/http_server_mt.pith && ./bench/http_server_mt 8080
+import std.net.http as http
+
+fn query_param(query: String, name: String) -> String:
+    if query == "":
+        return ""
+    for part in query.split("&"):
+        eq := part.index_of("=")
+        if eq < 0:
+            continue
+        if part.substring(0, eq) == name:
+            if eq + 1 < part.len():
+                return part.substring(eq + 1, part.len())
+    return ""
+
+fn item_name(id: Int) -> String:
+    kinds := ["widget", "gadget", "gizmo", "doodad", "contraption"]
+    return kinds[id % kinds.len()] + "-" + id.to_string()
+
+fn item_json(id: Int) -> String:
+    q := chr(34)
+    name := item_name(id)
+    price := (id * 37) % 10000
+    tags := name.split("-")
+    mut body := chr(123) + q + "id" + q + ":" + id.to_string()
+    body = body + "," + q + "name" + q + ":" + q + name + q
+    body = body + "," + q + "price" + q + ":" + price.to_string()
+    body = body + "," + q + "tags" + q + ":["
+    for tag, i in tags:
+        if i > 0:
+            body = body + ","
+        body = body + q + tag + q
+    body = body + "]" + chr(125)
+    return body
+
+fn handle(fd: Int) -> Int!:
+    tcp_set_timeout(fd, 2000)
+    req := http.read_request_bytes(fd)!
+    if req.is_get("/item")!:
+        id_text := query_param(req.query()!, "id")
+        id := parse_int(id_text) catch 0
+        return http.send_response(fd, http.json_response(200, item_json(id)))
+    elif req.is_get("/health")!:
+        return http.send_response(fd, http.json_response(200, chr(123) + chr(34) + "ok" + chr(34) + ":true" + chr(125)))
+    else:
+        return http.send_response(fd, http.not_found())
+
+fn main() -> Int!:
+    mut port := 8080
+    argv := args()
+    if argv.len() > 1:
+        port = parse_int(argv[1]) catch 8080
+    print("listening on {port}")
+    fd := tcp_listen("0.0.0.0", port)!
+    while true:
+        client := tcp_accept(fd)!
+        spawn handle_conn(client)
+    return 0
+
+fn handle_conn(fd: Int) -> Int:
+    return handle(fd) catch 0

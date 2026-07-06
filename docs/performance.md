@@ -63,6 +63,16 @@ created pith served 277 req/s and grew 60 kb per request; the growth
 line is now 1.6 kb (header-map strings and a few residual structs,
 attributed and queued).
 
+a thread-per-connection experiment (bench/http_server_mt.pith, one
+spawned handler per accept) measured 9x slower than the
+single-threaded loop on this 2-core machine: without keep-alive each
+request costs a thread spawn, and guarding std/io's handle registries
+with the condvar mutex costs 2.3x even single-threaded. the losing
+combination is recorded so the winning one is legible: connection
+keep-alive first (threads amortize across requests), a cheaper lock
+for short critical sections, and a worker pool instead of
+spawn-per-accept. until then the single-threaded loop stands.
+
 build times: go cold 20.5s / warm 0.1s; pith compiles the same
 program in 2.0s, every time. `make self-host` — the compiler
 compiling itself — is 2.1s with the full ownership discipline active.

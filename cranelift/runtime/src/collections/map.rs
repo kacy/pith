@@ -306,9 +306,11 @@ pub unsafe extern "C" fn pith_map_insert_int(
     crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
     let val_vec = val_slice.to_vec();
 
-    // Release old value if present
     // The map owns one count per stored string value. the overwritten
     // value is NOT released — a borrow may still be live — so it leaks.
+    // (the retain must stay gated on val_is_heap: magic-checking an
+    // arbitrary integer dereferences value-16, which faults on values
+    // that resemble unmapped addresses.)
     if impl_ref.val_is_heap {
         crate::pith_cstring_retain(value as *const i8);
     }
@@ -520,8 +522,8 @@ pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, v
     crate::ensure_perf_stats_registered();
     crate::perf_count(&crate::PERF_MAP_STRING_INSERTS, 1);
     let map_key = cstr_to_map_key(key);
-    // the map retains the incoming value; an overwritten one is NOT
-    // released (a borrow may still be live) and leaks
+    // the map retains the incoming value when it owns heap values; an
+    // overwritten one is NOT released (a borrow may still be live)
     if impl_ref.val_is_heap {
         crate::pith_cstring_retain(value as *const i8);
         if map_trace_enabled() {

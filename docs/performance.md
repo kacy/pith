@@ -93,6 +93,23 @@ scanner loop making three tests per character across 200k strings
 runs with zero string allocations. url/path churn drops to 643ms and
 std_pipeline to 657ms, the best recorded.
 
+eighth landing (the leak reporter and what it found): under
+PITH_CSTRING_NOFREE + PITH_LEAK_SCAN the runtime now prints every
+string whose count never reached zero, grouped by content — the
+definitive per-request leak list, no guessing. it attributed three
+classes in one afternoon: query-map values double-counted by the
+store-position rule (string-valued maps are provably tagged, so owned
+inserts now complete their transfer), the serialized response head
+abandoned once per request (module-qualified calls never released
+their owned arguments — bytes.from_string_utf8(head) leaked its head
+everywhere in the tree), and a response-buffer copy (take_bytes).
+server growth per request: 1.79 kb → 1.33 kb. the remainder is
+attributed and small: header-name copies, a few empty strings, and
+some structs. one design lesson recorded the hard way: a retain
+cannot magic-check an arbitrary integer — dereferencing value-16
+faults on ints that resemble addresses — so transfer-completion must
+be proven emitter-side per container, never assumed runtime-side.
+
 build times: go cold 20.5s / warm 0.1s; pith compiles the same
 program in 2.0s, every time. `make self-host` — the compiler
 compiling itself — is 2.1s with the full ownership discipline active.

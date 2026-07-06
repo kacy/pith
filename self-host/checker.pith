@@ -3515,6 +3515,13 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
     if method == "remove":
         expect_one_typed_argument(method, args, tid_int, scope_id)
         return tid_void
+    if method == "insert":
+        if args.len() != 2:
+            report_error("E207", "insert expects 2 arguments (index, value), got " + args.len().to_string())
+            return tid_void
+        check_argument_type(args[0], tid_int, scope_id)
+        check_argument_type(args[1], elem, scope_id)
+        return tid_void
     if method == "contains":
         expect_one_typed_argument(method, args, elem, scope_id)
         return tid_bool

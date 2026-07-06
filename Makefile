@@ -599,6 +599,23 @@ check-invalid-self-host-only:
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-host invalid examples passed"
 
+# --- sitegen golden check ---
+# builds the dogfood site generator, runs it over the sample site, and
+# diffs the outputs that pin the whole pipeline
+
+sitegen-check:
+	@echo "--- sitegen golden check ---"
+	@./target/release/pith build tools/sitegen/sitegen.pith > /dev/null
+	@tmpdir=$$(mktemp -d /tmp/pith-sitegen-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	./tools/sitegen/sitegen tools/sitegen/sample "$$tmpdir" > /dev/null; \
+	diff -u tools/sitegen/expected/index.html "$$tmpdir/index.html" && \
+	diff -u tools/sitegen/expected/feed.json "$$tmpdir/feed.json" && \
+	diff -u tools/sitegen/expected/post-hello-world.html "$$tmpdir/posts/hello-world.html" && \
+	diff -u tools/sitegen/expected/post-on-ownership.html "$$tmpdir/posts/on-ownership.html" && \
+	diff -u tools/sitegen/expected/tag-memory.html "$$tmpdir/tags/memory.html" && \
+	echo "sitegen output matches golden files"
+
 # --- cli regressions ---
 
 cli-regressions: build cli-regressions-only

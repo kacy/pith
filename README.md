@@ -202,6 +202,13 @@ fn main() -> Int!:
   (there is no cycle collector in the native path)
 - measured behavior and current numbers live in `docs/performance.md`
 
+**a real program, in-tree:** `tools/sitegen/` is a small static site
+generator written in pith — toml config, front-matter parsing, a
+markdown subset, html layouts, tag pages, and a json feed, in about
+250 lines. `make sitegen-check` builds it and diffs its output against
+golden files. it doubles as the honest answer to "what does non-trivial
+pith look like."
+
 **error codes:** every diagnostic has a stable code — E0xx (lexer),
 E1xx (parser), E2xx (checker), E3xx (lint). see `docs/errors.md` for the
 full reference.

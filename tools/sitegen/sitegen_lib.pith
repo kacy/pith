@@ -1,0 +1,282 @@
+# sitegen_lib — the site generator's logic as an importable module so
+# the cli binary and the golden test share one implementation.
+import std.fs as fs
+import std.toml as toml
+import std.json as json
+
+## one rendered post: parsed front matter plus the body as html.
+pub struct Post:
+    slug: String
+    title: String
+    date: String
+    tags: List[String]
+    body_html: String
+
+## site-wide settings from site.toml.
+pub struct Site:
+    title: String
+    base_url: String
+
+# --- front matter ------------------------------------------------------
+
+# a post starts with a `---` block of `key: value` lines; everything
+# after the closing `---` is markdown.
+## split a raw post into its front-matter map and markdown body.
+pub fn split_front_matter(raw: String) -> (Map[String, String], String):
+    mut meta: Map[String, String] := {}
+    lines := raw.split(chr(10))
+    if lines.len() == 0 or lines[0].trim() != "---":
+        return (meta, raw)
+    mut body_start := 0
+    mut i := 1
+    while i < lines.len():
+        line := lines[i].trim()
+        if line == "---":
+            body_start = i + 1
+            i = lines.len()
+        else:
+            sep := line.index_of(":")
+            if sep > 0:
+                meta.insert(line.substring(0, sep).trim(), line.substring(sep + 1, line.len()).trim())
+            i = i + 1
+    mut body := ""
+    mut j := body_start
+    while j < lines.len():
+        body = body + lines[j] + chr(10)
+        j = j + 1
+    return (meta, body)
+
+fn parse_tags(raw: String) -> List[String]:
+    mut out: List[String] := []
+    for part in raw.split(","):
+        t := part.trim()
+        if t != "":
+            out.push(t)
+    return out
+
+# --- markdown ----------------------------------------------------------
+
+fn escape_html(s: String) -> String:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+# inline spans: `code`, **bold**, *italic*, [text](url)
+## render inline spans: `code`, **bold**, *italic*, [text](url).
+pub fn render_inline(s: String) -> String:
+    mut out := ""
+    mut i := 0
+    n := s.len()
+    while i < n:
+        if s[i] == "`":
+            close := index_from(s, "`", i + 1)
+            if close > i:
+                out = out + "<code>" + escape_html(s.substring(i + 1, close)) + "</code>"
+                i = close + 1
+                continue
+        if i + 1 < n and s[i] == "*" and s[i + 1] == "*":
+            close := find_marker(s, "**", i + 2)
+            if close > i:
+                out = out + "<strong>" + render_inline(s.substring(i + 2, close)) + "</strong>"
+                i = close + 2
+                continue
+        if s[i] == "*":
+            close := index_from(s, "*", i + 1)
+            if close > i:
+                out = out + "<em>" + render_inline(s.substring(i + 1, close)) + "</em>"
+                i = close + 1
+                continue
+        if s[i] == "[":
+            close_text := index_from(s, "]", i + 1)
+            if close_text > i and close_text + 1 < n and s[close_text + 1] == "(":
+                close_url := index_from(s, ")", close_text + 2)
+                if close_url > close_text:
+                    text := s.substring(i + 1, close_text)
+                    url := s.substring(close_text + 2, close_url)
+                    out = out + "<a href=" + chr(34) + escape_html(url) + chr(34) + ">" + render_inline(text) + "</a>"
+                    i = close_url + 1
+                    continue
+        out = out + escape_html(s.substring(i, i + 1))
+        i = i + 1
+    return out
+
+fn index_from(s: String, needle: String, start: Int) -> Int:
+    mut i := start
+    while i < s.len():
+        if s[i] == needle:
+            return i
+        i = i + 1
+    return -1
+
+fn find_marker(s: String, marker: String, start: Int) -> Int:
+    mut i := start
+    while i + 1 < s.len():
+        if s[i] == "*" and s[i + 1] == "*":
+            return i
+        i = i + 1
+    return -1
+
+## render the markdown subset to html: headings, paragraphs,
+## lists, and fenced code blocks.
+pub fn render_markdown(md: String) -> String:
+    mut out := ""
+    mut in_code := false
+    mut in_list := false
+    for line in md.split(chr(10)):
+        trimmed := line.trim()
+        if trimmed.starts_with("```"):
+            if in_list:
+                out = out + "</ul>" + chr(10)
+                in_list = false
+            if in_code:
+                out = out + "</pre>" + chr(10)
+                in_code = false
+            else:
+                out = out + "<pre>" + chr(10)
+                in_code = true
+            continue
+        if in_code:
+            out = out + escape_html(line) + chr(10)
+            continue
+        if in_list and not trimmed.starts_with("- "):
+            out = out + "</ul>" + chr(10)
+            in_list = false
+        if trimmed == "":
+            continue
+        if trimmed.starts_with("### "):
+            out = out + "<h3>" + render_inline(trimmed.substring(4, trimmed.len())) + "</h3>" + chr(10)
+        elif trimmed.starts_with("## "):
+            out = out + "<h2>" + render_inline(trimmed.substring(3, trimmed.len())) + "</h2>" + chr(10)
+        elif trimmed.starts_with("# "):
+            out = out + "<h1>" + render_inline(trimmed.substring(2, trimmed.len())) + "</h1>" + chr(10)
+        elif trimmed.starts_with("- "):
+            if not in_list:
+                out = out + "<ul>" + chr(10)
+                in_list = true
+            out = out + "<li>" + render_inline(trimmed.substring(2, trimmed.len())) + "</li>" + chr(10)
+        else:
+            out = out + "<p>" + render_inline(trimmed) + "</p>" + chr(10)
+    if in_list:
+        out = out + "</ul>" + chr(10)
+    if in_code:
+        out = out + "</pre>" + chr(10)
+    return out
+
+# --- rendering ---------------------------------------------------------
+
+fn placeholder(name: String) -> String:
+    # {{ in a pith string literal escapes to a single brace, so the
+    # placeholder text is assembled from chr() to stay literal
+    lb := chr(123)
+    rb := chr(125)
+    return lb + lb + name + rb + rb
+
+## fill the layout's placeholders with the site and page values.
+pub fn apply_layout(layout: String, site: Site, title: String, content: String) -> String:
+    mut page := layout.replace(placeholder("site_title"), site.title)
+    page = page.replace(placeholder("title"), title)
+    page = page.replace(placeholder("content"), content)
+    return page
+
+fn post_url(site: Site, p: Post) -> String:
+    return site.base_url + "/posts/" + p.slug + ".html"
+
+fn render_index(posts: List[Post], site: Site) -> String:
+    mut items := "<ul>" + chr(10)
+    for p in posts:
+        items = items + "<li>" + p.date + " <a href=" + chr(34) + "posts/" + p.slug + ".html" + chr(34) + ">" + escape_html(p.title) + "</a></li>" + chr(10)
+    items = items + "</ul>" + chr(10)
+    return items
+
+fn render_feed(posts: List[Post], site: Site) -> String:
+    feed := json.make_object()
+    json.object_set(feed, "title", json.make_string(site.title))
+    arr := json.make_array()
+    for p in posts:
+        entry := json.make_object()
+        json.object_set(entry, "title", json.make_string(p.title))
+        json.object_set(entry, "date", json.make_string(p.date))
+        json.object_set(entry, "url", json.make_string(post_url(site, p)))
+        json.array_push(arr, entry)
+    json.object_set(feed, "posts", arr)
+    return json.encode(feed)
+
+# --- pipeline ----------------------------------------------------------
+
+fn slug_of(path: String) -> String:
+    parts := path.split("/")
+    name := parts[parts.len() - 1]
+    dot := name.index_of(".")
+    if dot > 0:
+        return name.substring(0, dot)
+    return name
+
+fn load_posts(content_dir: String) -> List[Post]!:
+    mut posts: List[Post] := []
+    for name in fs.list(content_dir):
+        if not name.ends_with(".md"):
+            continue
+        raw := fs.read(content_dir + "/" + name)!
+        parts := split_front_matter(raw)
+        meta := parts.0
+        body := parts.1
+        slug := slug_of(name)
+        title := meta.get_default("title", name)
+        date := meta.get_default("date", "1970-01-01")
+        tags := parse_tags(meta.get_default("tags", ""))
+        posts.push(Post(slug, title, date, tags, render_markdown(body)))
+    return sort_by_date(posts)
+
+fn sort_by_date(posts: List[Post]) -> List[Post]:
+    # newest first; insertion sort keeps it simple for small sites
+    mut out: List[Post] := []
+    for p in posts:
+        mut placed := false
+        mut i := 0
+        while i < out.len() and not placed:
+            if p.date > out[i].date:
+                out.insert(i, p)
+                placed = true
+            i = i + 1
+        if not placed:
+            out.push(p)
+    return out
+
+fn collect_tags(posts: List[Post]) -> Map[String, List[String]]:
+    mut by_tag: Map[String, List[String]] := {}
+    for p in posts:
+        for t in p.tags:
+            mut slugs := by_tag.get_default(t, [])
+            slugs.push(p.slug)
+            by_tag.insert(t, slugs)
+    return by_tag
+
+## build the whole site: posts, index, tag pages, and json feed.
+## returns the number of posts rendered.
+pub fn build_site(site_dir: String, out_dir: String) -> Int!:
+
+    config := toml.parse(fs.read(site_dir + "/site.toml")!)
+    site_title := toml.get_string_or(config, "title", "untitled")
+    base_url := toml.get_string_or(config, "base_url", "")
+    site := Site(site_title, base_url)
+
+    layout := fs.read(site_dir + "/layout.html")!
+    posts := load_posts(site_dir + "/content")!
+
+    fs.make_dirs(out_dir + "/posts")
+    fs.make_dirs(out_dir + "/tags")
+
+    for p in posts:
+        page := apply_layout(layout, site, p.title, p.body_html)
+        fs.write(out_dir + "/posts/" + p.slug + ".html", page)!
+
+    fs.write(out_dir + "/index.html", apply_layout(layout, site, site.title, render_index(posts, site)))!
+    fs.write(out_dir + "/feed.json", render_feed(posts, site))!
+
+    by_tag := collect_tags(posts)
+    for tag in by_tag.keys():
+        mut body := "<h2>tag: " + escape_html(tag) + "</h2>" + chr(10) + "<ul>" + chr(10)
+        for slug in by_tag[tag]:
+            body = body + "<li><a href=" + chr(34) + "../posts/" + slug + ".html" + chr(34) + ">" + slug + "</a></li>" + chr(10)
+        body = body + "</ul>" + chr(10)
+        fs.write(out_dir + "/tags/" + tag + ".html", apply_layout(layout, site, "tag: " + tag, body))!
+
+    return posts.len()

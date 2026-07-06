@@ -4222,6 +4222,9 @@ fn ir_emit_method_call(idx: Int) -> Int:
         uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(call_name, true), idx)
         ret_type := ir_call_retkind_for_name(idx, uses_result_abi, call_name)
         ir_emit_call_text(r, call_name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
+        # module-qualified calls take the same transfer convention as
+        # plain static calls: owned string temps die with the call
+        ir_release_owned_string_args(node, 1, arg_regs)
         if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
             return ir_emit_wrapped_legacy_result(r, ret_type, call_name)
         return r
@@ -4321,7 +4324,18 @@ fn ir_emit_method_call(idx: Int) -> Int:
     if emit_name == "identity" and not impl_dispatch:
         return obj_r
     ir_emit_call_text(r, emit_name, ret_type, call_args.len(), ir_join_arg_regs(call_args))
-    ir_release_owned_method_args(node, arg_regs, store_value_pos)
+    # a string-valued map is created tagged on every construction path,
+    # so its insert retains and an owned string argument can complete
+    # its transfer by releasing here. other kinds — and maps whose value
+    # type the emitter can't prove — keep the skip: their containers may
+    # not retain, and releasing would dangle the stored element.
+    mut release_skip_pos := store_value_pos
+    if store_value_pos >= 0 and (emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey") and node.children.len() > 0:
+        skip_expr := ir_method_call_arg_expr(node, store_value_pos)
+        if skip_expr >= 0 and ir_rc_kind(ir_infer_type(skip_expr)) == "string":
+            if ir_lookup_map_value_type_for_expr(node.children[0]) == "string":
+                release_skip_pos = 0 - 1
+    ir_release_owned_method_args(node, arg_regs, release_skip_pos)
     if node.children.len() > 0:
         recv_idx := node.children[0]
         recv_kind := ir_rc_kind(ir_infer_type(recv_idx))

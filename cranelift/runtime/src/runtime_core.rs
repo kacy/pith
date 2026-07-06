@@ -67,6 +67,51 @@ fn cstring_layout(data_len: usize) -> Layout {
 
 /// Allocate a heap cstring with `data_len` data bytes, refcount 1, and the
 /// trailing NUL already written. The caller fills bytes 0..data_len.
+/// Debug: under PITH_CSTRING_NOFREE + PITH_LEAK_SCAN, every allocation is
+/// remembered and the exit hook prints the ones whose count never reached
+/// zero — the definitive leak list.
+fn leak_scan_registry() -> Option<&'static std::sync::Mutex<Vec<usize>>> {
+    static REG: std::sync::OnceLock<Option<std::sync::Mutex<Vec<usize>>>> = std::sync::OnceLock::new();
+    REG.get_or_init(|| {
+        if std::env::var("PITH_LEAK_SCAN").is_ok() {
+            Some(std::sync::Mutex::new(Vec::new()))
+        } else {
+            None
+        }
+    })
+    .as_ref()
+}
+
+pub fn report_leaked_cstrings() {
+    let Some(reg) = leak_scan_registry() else {
+        return;
+    };
+    let ptrs = reg.lock().unwrap();
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for &p in ptrs.iter() {
+        unsafe {
+            let s = p as *const i8;
+            let Some(base) = cstring_base(s as i64 as *const i8 as *const i8) else {
+                continue;
+            };
+            let rc = cstring_refcount(base).load(std::sync::atomic::Ordering::Relaxed);
+            if rc == 0 {
+                continue;
+            }
+            let data_len = (base.add(8) as *const u64).read() as usize;
+            let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
+            let content = String::from_utf8_lossy(bytes).into_owned();
+            *counts.entry(format!("rc={} {:?}", rc, content)).or_insert(0) += 1;
+        }
+    }
+    let mut rows: Vec<(usize, String)> = counts.into_iter().map(|(k, v)| (v, k)).collect();
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    eprintln!("leaked cstrings ({} rows):", rows.len());
+    for (n, k) in rows.iter().take(40) {
+        eprintln!("  {} x {}", n, k);
+    }
+}
+
 pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
     crate::perf_count(&crate::PERF_CSTRING_ALLOCS, 1);
     let base = pith_alloc(cstring_layout(data_len));
@@ -75,6 +120,9 @@ pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
     (base.add(8) as *mut u64).write(data_len as u64);
     let data = base.add(CSTRING_HEADER_SIZE) as *mut i8;
     *data.add(data_len) = 0;
+    if let Some(reg) = leak_scan_registry() {
+        reg.lock().unwrap().push(data as usize);
+    }
     data
 }
 
@@ -119,7 +167,13 @@ unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delt
     };
     let data_len = (base.add(8) as *const u64).read() as usize;
     let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(64));
-    if String::from_utf8_lossy(bytes) == needle {
+    let content = String::from_utf8_lossy(bytes);
+    // a trailing '*' makes the needle a prefix match
+    let hit = match needle.strip_suffix('*') {
+        Some(prefix) => content.starts_with(prefix),
+        None => content == needle,
+    };
+    if hit {
         eprintln!("watch {:p} {} {} -> {}", s, op, prev, prev + delta);
     }
 }

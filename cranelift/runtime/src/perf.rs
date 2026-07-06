@@ -73,6 +73,7 @@ pub fn perf_count(counter: &AtomicUsize, delta: usize) {
 }
 
 extern "C" fn pith_perf_dump_stats_at_exit() {
+    crate::runtime_core::report_leaked_cstrings();
     dump_perf_stats();
 }
 

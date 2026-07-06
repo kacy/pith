@@ -1,0 +1,78 @@
+# results and optionals wrapping every heap kind, propagated through
+# try, catch, and re-wrapping layers.
+
+struct Node2:
+    key: String
+    weight: Int
+
+enum Mode:
+    Plain
+    Fancy(String)
+
+fn find_node(ok: Bool) -> Node2!:
+    if not ok:
+        fail "missing node"
+    return Node2("found", 11)
+
+fn find_mode(ok: Bool) -> Mode!:
+    if not ok:
+        fail "missing mode"
+    return Mode.Fancy("velvet")
+
+fn find_list(ok: Bool) -> List[String]!:
+    if not ok:
+        fail "missing list"
+    mut out: List[String] := []
+    out.push("alpha")
+    out.push("beta")
+    return out
+
+fn find_map(ok: Bool) -> Map[String, Int]!:
+    if not ok:
+        fail "missing map"
+    mut m: Map[String, Int] := {}
+    m.insert("k", 42)
+    return m
+
+fn relay_node(ok: Bool) -> Node2!:
+    n := find_node(ok)!
+    return Node2(n.key + "-relayed", n.weight + 1)
+
+fn maybe_name(give: Bool) -> String?:
+    if give:
+        return "given"
+    return none
+
+fn main() -> Int!:
+    n := find_node(true)!
+    print("node: {n.key} {n.weight}")
+
+    r := relay_node(true)!
+    print("relay: {r.key} {r.weight}")
+
+    fallback := relay_node(false) catch Node2("safe", 0)
+    print("catch: {fallback.key}")
+
+    m := find_mode(true)!
+    match m:
+        Mode.Fancy(s) => print("mode: {s}")
+        Mode.Plain => print("mode: plain")
+
+    xs := find_list(true)!
+    print("list: {xs.len()} {xs[0]}")
+
+    empty := find_list(false) catch []
+    print("list catch: {empty.len()}")
+
+    mp := find_map(true)!
+    print("map: {mp.get_default("k", 0)}")
+
+    name := maybe_name(true)
+    if name == none:
+        print("optional: none")
+    else:
+        print("optional: {name?}")
+
+    missing := maybe_name(false)
+    print("optional none: {missing == none}")
+    return 0

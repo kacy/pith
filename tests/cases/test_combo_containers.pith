@@ -1,0 +1,58 @@
+# containers holding every heap kind, nested two deep, iterated and
+# mutated — the cascade/tagging boundaries.
+
+struct Entry:
+    id: Int
+    text: String
+
+enum Signal:
+    Quiet
+    Loud(String)
+
+fn main():
+    mut structs: List[Entry] := []
+    structs.push(Entry(1, "one"))
+    structs.push(Entry(2, "two"))
+    mut sum := 0
+    for e in structs:
+        sum = sum + e.id
+    print("list of struct: {sum} {structs[1].text}")
+
+    mut nested: List[List[Int]] := []
+    nested.push([1, 2])
+    nested.push([3, 4, 5])
+    print("nested list: {nested.len()} {nested[1].len()} {nested[1][2]}")
+
+    mut by_name: Map[String, Entry] := {}
+    by_name.insert("first", Entry(10, "stored"))
+    got := by_name["first"]
+    print("map of struct: {got.id} {got.text}")
+
+    mut signals: List[Signal] := []
+    signals.push(Signal.Loud("beep"))
+    signals.push(Signal.Quiet)
+    match signals[0]:
+        Signal.Loud(s) => print("list of enum: {s}")
+        Signal.Quiet => print("list of enum: quiet")
+
+    mut deep: Map[String, List[String]] := {}
+    deep.insert("letters", ["x", "y", "z"])
+    letters := deep["letters"]
+    print("map of list: {letters.len()} {letters[0]}")
+
+    mut counts: Map[String, Int] := {}
+    for w in ["red", "blue", "red", "red"]:
+        counts.insert(w, counts.get_default(w, 0) + 1)
+    print("word counts: red={counts.get_default("red", 0)} blue={counts.get_default("blue", 0)}")
+
+    mut set_str: Set[String] := {}
+    set_str.add("m")
+    set_str.add("n")
+    set_str.add("m")
+    print("set: {set_str.len()}")
+
+    mut tuples: List[(String, Int)] := []
+    tuples.push(("t1", 100))
+    tuples.push(("t2", 200))
+    pair := tuples[1]
+    print("list of tuple: {pair.0} {pair.1}")

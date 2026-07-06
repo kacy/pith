@@ -1,0 +1,77 @@
+# closures crossed with every value kind they can accept or return.
+# the closure-typed-parameter-returning-a-struct miscompile lived in
+# this grid; each scenario prints a labeled line so a wrong value is
+# visible, not just a crash.
+
+struct Pair:
+    name: String
+    n: Int
+
+enum Shade:
+    Light
+    Dark(Int)
+
+fn make_pair(n: Int) -> Pair:
+    return Pair("p" + n.to_string(), n)
+
+fn pick_shade(n: Int) -> Shade:
+    if n > 0:
+        return Shade.Dark(n)
+    return Shade.Light
+
+fn fallible(n: Int) -> Int!:
+    if n < 0:
+        fail "negative"
+    return n * 2
+
+fn apply_struct(f: fn(Int) -> Pair, x: Int) -> Pair:
+    return f(x)
+
+fn apply_enum(f: fn(Int) -> Shade, x: Int) -> Shade:
+    return f(x)
+
+fn apply_result(f: fn(Int) -> Int!, x: Int) -> Int:
+    return f(x) catch -1
+
+fn apply_string(f: fn(Int) -> String, x: Int) -> String:
+    return f(x)
+
+fn apply_list(f: fn(Int) -> List[Int], x: Int) -> Int:
+    return f(x).len()
+
+fn make_list(n: Int) -> List[Int]:
+    mut out: List[Int] := []
+    mut i := 0
+    while i < n:
+        out.push(i)
+        i = i + 1
+    return out
+
+fn describe(n: Int) -> String:
+    return "desc-" + n.to_string()
+
+fn main():
+    p := apply_struct(make_pair, 4)
+    print("struct: {p.name} {p.n}")
+
+    s := apply_enum(pick_shade, 7)
+    match s:
+        Shade.Dark(v) => print("enum: dark {v}")
+        Shade.Light => print("enum: light")
+
+    print("result ok: {apply_result(fallible, 5)}")
+    print("result err: {apply_result(fallible, 0 - 3)}")
+    print("string: {apply_string(describe, 9)}")
+    print("list: {apply_list(make_list, 6)}")
+
+    doubler := fn(x: Int) => x * 2
+    print("lambda int: {doubler(21)}")
+
+    pair_maker := fn(x: Int) => Pair("lam" + x.to_string(), x)
+    lp := apply_struct(pair_maker, 3)
+    print("lambda struct: {lp.name} {lp.n}")
+
+    base := 100
+    capturing := fn(x: Int) => Pair("cap", x + base)
+    cp := apply_struct(capturing, 5)
+    print("capture struct: {cp.name} {cp.n}")

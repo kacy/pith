@@ -1,0 +1,55 @@
+# spawn, await, and channels crossed with heap-carrying values: struct
+# returns, result returns, closure captures, and string payloads
+# through channels.
+
+struct Report:
+    title: String
+    total: Int
+
+fn build_report(n: Int) -> Report:
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + i
+        i = i + 1
+    return Report("r" + n.to_string(), total)
+
+fn fallible_work(ok: Bool) -> Int!:
+    if not ok:
+        fail "work failed"
+    return 99
+
+fn main() -> Int!:
+    t1 := spawn build_report(10)
+    r1 := await t1
+    print("spawn struct: {r1.title} {r1.total}")
+
+    t2 := spawn fallible_work(true)
+    v := (await t2) catch -1
+    print("spawn result: {v}")
+
+    t3 := spawn fallible_work(false)
+    bad := (await t3) catch -1
+    print("spawn result err: {bad}")
+
+    ch := Channel[String](2)
+    ch.send("first")
+    ch.send("second")
+    print("channel: {ch.recv()?} {ch.recv()?}")
+
+    rch := Channel[Report](1)
+    rch.send(Report("sent", 55))
+    got := rch.recv()?
+    print("channel struct: {got.title} {got.total}")
+
+    mut tasks: List[Task[Report]] := []
+    mut i := 0
+    while i < 3:
+        tasks.push(spawn build_report(i + 2))
+        i = i + 1
+    mut grand := 0
+    for t in tasks:
+        rep := await t
+        grand = grand + rep.total
+    print("fanout: {grand}")
+    return 0

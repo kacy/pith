@@ -1,0 +1,65 @@
+# generic functions and structs crossed with structs, results, enums,
+# closures, and nested containers — checked types get suppressed inside
+# specializations, which is where inference-dependent bugs hide.
+
+struct Item:
+    label: String
+    score: Int
+
+struct Wrap[T]:
+    inner: T
+    tag: String
+
+enum Toggle:
+    Off
+    On(Int)
+
+fn identity[T](v: T) -> T:
+    return v
+
+fn first_of[T](xs: List[T], fallback: T) -> T:
+    if xs.len() > 0:
+        return xs[0]
+    return fallback
+
+fn wrap_up[T](v: T) -> Wrap[T]:
+    return Wrap(v, "wrapped")
+
+fn main():
+    print("int: {identity(41) + 1}")
+    print("string: {identity("gen")}")
+
+    item := identity(Item("it", 5))
+    print("struct: {item.label} {item.score}")
+
+    mut items: List[Item] := []
+    items.push(Item("a", 1))
+    items.push(Item("b", 2))
+    got := first_of(items, Item("zz", 0))
+    print("list of struct: {got.label}")
+
+    mut empty_items: List[Item] := []
+    fb := first_of(empty_items, Item("fallback", 9))
+    print("fallback: {fb.label} {fb.score}")
+
+    w: Wrap[Int] := wrap_up(7)
+    print("wrap int: {w.inner} {w.tag}")
+
+    wi: Wrap[Item] := wrap_up(Item("deep", 3))
+    print("wrap struct: {wi.inner.label} {wi.inner.score}")
+
+    ws: Wrap[String] := wrap_up("text")
+    print("wrap string: {ws.inner}")
+
+    t := identity(Toggle.On(6))
+    match t:
+        Toggle.On(v) => print("enum through generic: {v}")
+        Toggle.Off => print("enum through generic: off")
+
+    mut names: List[String] := []
+    names.push("x")
+    names.push("y")
+    print("first string: {first_of(names, "none")}")
+
+    nested: Wrap[List[Int]] := wrap_up([3, 4, 5])
+    print("wrap list: {nested.inner.len()} {nested.inner[1]}")

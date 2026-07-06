@@ -47,3 +47,18 @@ fn main():
     for c in copies:
         total = total + c.core.depth + c.scores.len()
     print("struct list walk: {total}")
+    lambda_collections()
+
+fn lambda_collections():
+    # two lambdas of one signature intern to different type ids;
+    # homogeneity checks must compare structure, not identity.
+    # (calling two closure variables in one function currently trips a
+    # cranelift verifier error — a pre-existing emitter bug unreachable
+    # before these literals type-checked; tracked separately.)
+    mut ops: List[fn(Int) -> Int] := [fn(x: Int) => x + 1, fn(x: Int) => x * 2]
+    first := ops[0]
+    print("lambda list: {ops.len()} {first(10)}")
+
+    mut named: Map[String, fn(Int) -> Int] := {"inc": fn(x: Int) => x + 1, "neg": fn(x: Int) => 0 - x}
+    ng := named["neg"]
+    print("lambda map: {ng(5)}")

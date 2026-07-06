@@ -1,0 +1,38 @@
+# helper module for the cross-module combination tests
+pub struct Parcel:
+    label: String
+    weight: Int
+
+pub enum Grade:
+    Standard
+    Express(Int)
+
+pub fn make_parcel(w: Int) -> Parcel:
+    return Parcel("boxed-" + w.to_string(), w)
+
+pub fn grade_for(w: Int) -> Grade:
+    if w > 10:
+        return Grade.Express(w)
+    return Grade.Standard
+
+pub fn risky_weight(w: Int) -> Int!:
+    if w < 0:
+        fail "negative weight"
+    return w * 2
+
+pub fn parcel_names(parcels: List[Parcel]) -> List[String]:
+    mut out: List[String] := []
+    for p in parcels:
+        out.push(p.label)
+    return out
+
+pub fn apply_to(f: fn(Int) -> Int, v: Int) -> Int:
+    return f(v)
+
+pub mut shared_registry: Map[String, Int] := {}
+
+pub fn register(name: String, v: Int):
+    shared_registry.insert(name, v)
+
+pub fn lookup(name: String) -> Int:
+    return shared_registry.get_default(name, -1)

@@ -1,0 +1,49 @@
+# structs nested in structs, enums inside structs, closure-typed
+# fields, and mutation through the layers.
+
+struct Inner:
+    note: String
+    depth: Int
+
+struct Outer:
+    name: String
+    core: Inner
+    scores: List[Int]
+
+enum State:
+    Fresh
+    Aged(Int)
+
+struct Tracker:
+    state: State
+    transform: fn(Int) -> Int
+
+fn main():
+    o := Outer("shell", Inner("deep note", 2), [10, 20])
+    print("nested read: {o.name} {o.core.note} {o.core.depth}")
+    print("nested list: {o.scores[1]}")
+
+    mut m := Outer("mut", Inner("start", 0), [])
+    m.core = Inner("replaced", 5)
+    print("field swap: {m.core.note} {m.core.depth}")
+
+    m.scores.push(77)
+    print("push through field: {m.scores.len()} {m.scores[0]}")
+
+    t := Tracker(State.Aged(12), fn(x: Int) => x * 3)
+    match t.state:
+        State.Aged(y) => print("enum field: {y}")
+        State.Fresh => print("enum field: fresh")
+    f := t.transform
+    print("closure field: {f(7)}")
+
+    mut owners: Map[String, Outer] := {}
+    owners.insert("main", o)
+    got := owners["main"]
+    print("struct in map: {got.core.note}")
+
+    copies := [Outer("c1", Inner("i1", 1), [1]), Outer("c2", Inner("i2", 2), [2, 3])]
+    mut total := 0
+    for c in copies:
+        total = total + c.core.depth + c.scores.len()
+    print("struct list walk: {total}")

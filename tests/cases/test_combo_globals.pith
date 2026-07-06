@@ -1,0 +1,42 @@
+# globals with every initializer form the startup pass must handle,
+# read and mutated from functions. the silent-zero bug lived here.
+
+struct Config:
+    host: String
+    port: Int
+
+mut g_int := 10
+mut g_expr := 4 * 25
+mut g_str := "lit"
+mut g_concat := "a" + "b" + "c"
+mut g_list := [5, 6, 7]
+mut g_list_str := ["p", "q"]
+mut g_map: Map[String, Int] := {"one": 1, "two": 2}
+mut g_map_str: Map[String, String] := {"greet": "hello"}
+mut g_config := Config("gh", 8080)
+mut g_from_fn := boot_value()
+mut g_counter := 0
+
+fn boot_value() -> Int:
+    return 7 * 3
+
+fn bump() -> Int:
+    g_counter = g_counter + 1
+    return g_counter
+
+fn main():
+    print("int: {g_int}")
+    print("expr: {g_expr}")
+    print("str: {g_str}")
+    print("concat: {g_concat}")
+    print("list: {g_list.len()} {g_list[2]}")
+    print("list_str: {g_list_str[1]}")
+    print("map: {g_map.get_default("two", 0)}")
+    print("map_str: {g_map_str.get_default("greet", "?")}")
+    print("config: {g_config.host}:{g_config.port}")
+    print("from_fn: {g_from_fn}")
+    bump()
+    bump()
+    print("counter: {bump()}")
+    g_config = Config("swapped", 9090)
+    print("swapped: {g_config.host}:{g_config.port}")

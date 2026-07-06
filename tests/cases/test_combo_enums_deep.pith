@@ -1,0 +1,56 @@
+# enum payloads of every heap kind, extracted through match, if let,
+# while let, guards, and or-patterns.
+
+struct Meta:
+    author: String
+
+enum Packet:
+    Empty
+    Text(String)
+    Tagged(String, Int)
+    Wrapped(Meta)
+    Batch(List[Int])
+
+fn make(n: Int) -> Packet:
+    if n == 0:
+        return Packet.Empty
+    if n == 1:
+        return Packet.Text("hello")
+    if n == 2:
+        return Packet.Tagged("tag", 42)
+    if n == 3:
+        return Packet.Wrapped(Meta("kacy"))
+    return Packet.Batch([7, 8, 9])
+
+fn describe(p: Packet) -> String:
+    match p:
+        Packet.Empty => "empty"
+        Packet.Text(s) => "text:" + s
+        Packet.Tagged(s, n) => "tagged:" + s + ":" + n.to_string()
+        Packet.Wrapped(m) => "by:" + m.author
+        Packet.Batch(xs) => "batch:" + xs.len().to_string()
+
+fn main():
+    mut i := 0
+    while i < 5:
+        print(describe(make(i)))
+        i = i + 1
+
+    if let Packet.Tagged(name, num) = make(2):
+        print("if let: {name} {num}")
+
+    p := make(1)
+    match p:
+        Packet.Text(s) if s.len() > 3 => print("guard hit: {s}")
+        Packet.Text(s) => print("guard miss: {s}")
+        _ => print("other")
+
+    match make(0):
+        Packet.Empty | Packet.Text(_) => print("or-pattern: simple")
+        _ => print("or-pattern: complex")
+
+    mut q: List[Packet] := []
+    q.push(make(3))
+    q.push(make(4))
+    for item in q:
+        print("queued: {describe(item)}")

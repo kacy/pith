@@ -40,17 +40,16 @@ fn item_json(id: Int) -> String:
     body = body + "]" + chr(125)
     return body
 
-fn handle(fd: Int) -> Int!:
-    tcp_set_timeout(fd, 2000)
-    req := http.read_request_bytes(fd)!
-    if req.is_get("/item")!:
-        id_text := query_param(req.query()!, "id")
+fn route(req: HttpRequestBytes) -> HttpResponse:
+    is_item := req.is_get("/item") catch false
+    if is_item:
+        id_text := query_param(req.query() catch "", "id")
         id := parse_int(id_text) catch 0
-        return http.send_response(fd, http.json_response(200, item_json(id)))
-    elif req.is_get("/health")!:
-        return http.send_response(fd, http.json_response(200, chr(123) + chr(34) + "ok" + chr(34) + ":true" + chr(125)))
-    else:
-        return http.send_response(fd, http.not_found())
+        return http.json(200, item_json(id))
+    is_health := req.is_get("/health") catch false
+    if is_health:
+        return http.json(200, chr(123) + chr(34) + "ok" + chr(34) + ":true" + chr(125))
+    return http.not_found_response()
 
 fn main() -> Int!:
     mut port := 8080
@@ -61,5 +60,6 @@ fn main() -> Int!:
     fd := tcp_listen("0.0.0.0", port)!
     while true:
         client := tcp_accept(fd)!
-        handle(client) catch 0
+        tcp_set_timeout(client, 5000)
+        http.serve_connection_fd(client, route) catch 0
     return 0

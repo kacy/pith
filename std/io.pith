@@ -18,6 +18,11 @@ from std.concurrent import Context, BlockingError, blocking_cancelled, blocking_
 
 DEFAULT_CHUNK_SIZE := 4096
 
+# guards the buffered-stream registries so handlers on different
+# threads can allocate, read, and free concurrently. it wraps only map
+# operations — never a source read or target write, which would
+# serialize every connection behind one blocked socket.
+mut io_registry_mu := Mutex()
 mut next_string_reader_handle: Int := 1
 mut string_reader_data: Map[Int, String] := {}
 mut string_reader_offsets: Map[Int, Int] := {}
@@ -901,12 +906,14 @@ fn allocate_bytes_reader_handle(data: Bytes) -> Int:
     return handle
 
 fn allocate_buffered_bytes_reader_handle(source_kind: Int, source_handle: Int, chunk_size: Int) -> Int:
+    io_registry_mu.lock()
     handle := next_buffered_bytes_reader_handle
     next_buffered_bytes_reader_handle = next_buffered_bytes_reader_handle + 1
     buffered_bytes_reader_source_kinds.insert(handle, source_kind)
     buffered_bytes_reader_source_handles.insert(handle, source_handle)
     buffered_bytes_reader_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
     buffered_bytes_reader_cache.insert(handle, bytes.empty())
+    io_registry_mu.unlock()
     return handle
 
 fn make_buffered_bytes_reader(source_kind: Int, source_handle: Int, chunk_size: Int) -> BufferedBytesReader:
@@ -917,30 +924,36 @@ fn make_buffered_bytes_reader(source_kind: Int, source_handle: Int, chunk_size: 
 ## buffers stay reachable forever. take() hands the cached bytes to a
 ## local whose cleanup releases them.
 pub fn free_buffered_bytes_reader(reader: BufferedBytesReader):
+    io_registry_mu.lock()
     cached := buffered_bytes_reader_cache.take(reader.handle)
-    if cached.len() < 0:
-        return
     buffered_bytes_reader_source_kinds.remove(reader.handle)
     buffered_bytes_reader_source_handles.remove(reader.handle)
     buffered_bytes_reader_chunk_sizes.remove(reader.handle)
+    io_registry_mu.unlock()
+    if cached.len() < 0:
+        return
 
 ## drop a buffered writer's registry entries; the counterpart of
 ## free_buffered_bytes_reader for the write side.
 pub fn free_buffered_bytes_writer(writer: BufferedBytesWriter):
+    io_registry_mu.lock()
     cached := buffered_bytes_writer_cache.take(writer.handle)
-    if cached.len() < 0:
-        return
     buffered_bytes_writer_target_kinds.remove(writer.handle)
     buffered_bytes_writer_target_handles.remove(writer.handle)
     buffered_bytes_writer_chunk_sizes.remove(writer.handle)
+    io_registry_mu.unlock()
+    if cached.len() < 0:
+        return
 
 fn allocate_buffered_bytes_writer_handle(target_kind: Int, target_handle: Int, chunk_size: Int) -> Int:
+    io_registry_mu.lock()
     handle := next_buffered_bytes_writer_handle
     next_buffered_bytes_writer_handle = next_buffered_bytes_writer_handle + 1
     buffered_bytes_writer_target_kinds.insert(handle, target_kind)
     buffered_bytes_writer_target_handles.insert(handle, target_handle)
     buffered_bytes_writer_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
     buffered_bytes_writer_cache.insert(handle, bytes.empty())
+    io_registry_mu.unlock()
     return handle
 
 fn make_buffered_bytes_writer(target_kind: Int, target_handle: Int, chunk_size: Int) -> BufferedBytesWriter:
@@ -1777,16 +1790,20 @@ fn buffered_bytes_reader_fill(handle: Int) -> Int!:
         chunk = process_stdout_read_bytes(ProcessStdout(source_handle), chunk_size)!
     elif source_kind == BUFFERED_BYTES_SOURCE_PROCESS_STDERR:
         chunk = process_stderr_read_bytes(ProcessStderr(source_handle), chunk_size)!
+    io_registry_mu.lock()
     cached := buffered_bytes_reader_cache.take(handle)
     buffered_bytes_reader_cache.insert(handle, cached.concat(chunk))
+    io_registry_mu.unlock()
     return chunk.len()
 
 fn buffered_bytes_writer_write_internal(writer: BufferedBytesWriter, data: Bytes) -> Int!:
     if not buffered_bytes_writer_target_handles.contains_key(writer.handle):
         return 0
 
+    io_registry_mu.lock()
     cached := buffered_bytes_writer_cache.take(writer.handle)
     buffered_bytes_writer_cache.insert(writer.handle, cached.concat(data))
+    io_registry_mu.unlock()
     if buffered_bytes_writer_should_flush(writer.handle):
         buffered_bytes_writer_flush_internal(writer)!
     return data.len()
@@ -1795,13 +1812,18 @@ fn buffered_bytes_writer_flush_internal(writer: BufferedBytesWriter) -> Int!:
     if not buffered_bytes_writer_target_handles.contains_key(writer.handle):
         return 0
 
+    io_registry_mu.lock()
     cached := buffered_bytes_writer_cache.take(writer.handle)
     if cached.is_empty():
         buffered_bytes_writer_cache.insert(writer.handle, cached)
+        io_registry_mu.unlock()
         return 0
 
     target_kind := buffered_bytes_writer_target_kinds[writer.handle]
     target_handle := buffered_bytes_writer_target_handles[writer.handle]
+    # the target write below must not run under the registry lock: a
+    # blocked socket would stall every other stream's registry access
+    io_registry_mu.unlock()
     mut wrote := 0
     if target_kind == BUFFERED_BYTES_TARGET_BUFFER:
         wrote = write_all_byte_buffer(ByteBuffer(target_handle), cached)!
@@ -1811,7 +1833,9 @@ fn buffered_bytes_writer_flush_internal(writer: BufferedBytesWriter) -> Int!:
         wrote = write_all_file_stream_bytes(FileStream(target_handle), cached)!
     elif target_kind == BUFFERED_BYTES_TARGET_PROCESS_STDIN:
         wrote = write_all_process_stdin_bytes(ProcessStdin(target_handle), cached)!
+    io_registry_mu.lock()
     buffered_bytes_writer_cache.insert(writer.handle, bytes.empty())
+    io_registry_mu.unlock()
     return wrote
 
 fn buffered_string_reader_read_internal(reader: BufferedStringReader, max_bytes: Int) -> String!:
@@ -2656,13 +2680,21 @@ fn buffered_string_reader_cache_get(handle: Int) -> String:
     return ""
 
 fn buffered_bytes_reader_cache_get(handle: Int) -> Bytes:
+    io_registry_mu.lock()
+    mut result := bytes.empty()
     if buffered_bytes_reader_cache.contains_key(handle):
-        return buffered_bytes_reader_cache[handle]
-    return bytes.empty()
+        # the bind takes its count while the lock is held, so a
+        # concurrent take on another thread cannot free the value
+        # between here and the caller
+        result = buffered_bytes_reader_cache[handle]
+    io_registry_mu.unlock()
+    return result
 
 fn buffered_bytes_reader_consume(handle: Int, consumed: Int):
+    io_registry_mu.lock()
     cached := buffered_bytes_reader_cache.take(handle)
     buffered_bytes_reader_cache.insert(handle, cached.slice(consumed, cached.len()))
+    io_registry_mu.unlock()
 
 fn buffered_string_reader_consume(handle: Int, consumed: Int):
     cached := buffered_string_reader_cache_get(handle)

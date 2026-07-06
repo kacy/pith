@@ -63,15 +63,25 @@ created pith served 277 req/s and grew 60 kb per request; the growth
 line is now 1.6 kb (header-map strings and a few residual structs,
 attributed and queued).
 
-a thread-per-connection experiment (bench/http_server_mt.pith, one
-spawned handler per accept) measured 9x slower than the
-single-threaded loop on this 2-core machine: without keep-alive each
-request costs a thread spawn, and guarding std/io's handle registries
-with the condvar mutex costs 2.3x even single-threaded. the losing
-combination is recorded so the winning one is legible: connection
-keep-alive first (threads amortize across requests), a cheaper lock
-for short critical sections, and a worker pool instead of
-spawn-per-accept. until then the single-threaded loop stands.
+the thread-per-connection story took two rounds. round one (spawn per
+accept, no keep-alive, condvar-mutex registry guards) measured 9x
+slower than the single-threaded loop — a thread spawn per request,
+and 2.3x lock overhead before any concurrency existed. round two
+supplied the three missing ingredients: http keep-alive (the servers
+now use serve_connection_fd, so a connection is one long-lived
+handler), a rewritten pith mutex (one compare-exchange each way,
+spin-then-yield — the old one paid a handle-registry lock plus a
+condvar per operation), and locked std/io registries whose critical
+sections never cover a socket read or write.
+
+| 60s sustained, 2 cores | single-threaded | thread per connection |
+|---|---|---|
+| pith keep-alive | 8,334/s | **15,823/s** |
+
+threaded pith beats go's single-core 13,683/s and sits within 1.25x
+of go using both cores (19,854/s). the io registries are now safe
+under concurrent handlers, which also makes the readme's no-data-races
+claim true for spawned code that shares streams.
 
 build times: go cold 20.5s / warm 0.1s; pith compiles the same
 program in 2.0s, every time. `make self-host` — the compiler

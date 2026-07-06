@@ -1,31 +1,31 @@
 //! Mutex synchronization primitive
 //!
-//! Provides FFI-compatible mutex operations for the Pith runtime.
+//! An atomic spin-then-yield lock behind a magic-tagged heap handle: the
+//! uncontended path is one compare-exchange each way, cheap enough to
+//! guard short critical sections (registry map operations) without a
+//! syscall. Contended waiters spin briefly, then yield.
 
-use crate::handle_registry::{self, HandleKind};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Opaque handle to a Pith mutex
-pub type PithMutexHandle = Arc<(Mutex<MutexState>, Condvar)>;
+const MUTEX_MAGIC: u32 = 0x504d5458; // "PMTX"
 
-pub struct MutexState {
-    locked: bool,
+#[repr(C)]
+pub struct PithMutex {
+    magic: u32,
+    state: AtomicU32,
 }
 
-unsafe fn mutex_ref<'a>(handle: *mut PithMutexHandle) -> Option<&'a PithMutexHandle> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::Mutex) {
+pub type PithMutexHandle = PithMutex;
+
+unsafe fn mutex_ref<'a>(handle: *mut PithMutexHandle) -> Option<&'a PithMutex> {
+    if handle.is_null() || (handle as usize) % 4 != 0 {
         return None;
     }
-    Some(&*handle)
-}
-
-fn lock_state(lock: &Mutex<MutexState>) -> MutexGuard<'_, MutexState> {
-    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn wait_state<'a>(cvar: &Condvar, state: MutexGuard<'a, MutexState>) -> MutexGuard<'a, MutexState> {
-    cvar.wait(state)
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    let m = &*(handle as *const PithMutex);
+    if m.magic != MUTEX_MAGIC {
+        return None;
+    }
+    Some(m)
 }
 
 /// Create a new mutex
@@ -33,10 +33,10 @@ fn wait_state<'a>(cvar: &Condvar, state: MutexGuard<'a, MutexState>) -> MutexGua
 /// Returns an opaque handle to the mutex
 #[no_mangle]
 pub extern "C" fn pith_mutex_new() -> *mut PithMutexHandle {
-    let mutex = Arc::new((Mutex::new(MutexState { locked: false }), Condvar::new()));
-    let ptr = Box::into_raw(Box::new(mutex));
-    handle_registry::register(ptr as *const (), HandleKind::Mutex);
-    ptr
+    Box::into_raw(Box::new(PithMutex {
+        magic: MUTEX_MAGIC,
+        state: AtomicU32::new(0),
+    }))
 }
 
 /// Lock the mutex
@@ -45,15 +45,25 @@ pub extern "C" fn pith_mutex_new() -> *mut PithMutexHandle {
 /// handle must be a valid mutex handle obtained from pith_mutex_new
 #[no_mangle]
 pub unsafe extern "C" fn pith_mutex_lock(handle: *mut PithMutexHandle) {
-    let Some(mutex) = mutex_ref(handle) else {
+    let Some(m) = mutex_ref(handle) else {
         return;
     };
-    let (lock, cvar) = &**mutex;
-    let mut state = lock_state(lock);
-    while state.locked {
-        state = wait_state(cvar, state);
+    let mut spins = 0u32;
+    loop {
+        if m
+            .state
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        spins += 1;
+        if spins < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
     }
-    state.locked = true;
 }
 
 /// Unlock the mutex
@@ -62,14 +72,8 @@ pub unsafe extern "C" fn pith_mutex_lock(handle: *mut PithMutexHandle) {
 /// handle must be a valid locked mutex handle
 #[no_mangle]
 pub unsafe extern "C" fn pith_mutex_unlock(handle: *mut PithMutexHandle) {
-    let Some(mutex) = mutex_ref(handle) else {
-        return;
-    };
-    let (lock, cvar) = &**mutex;
-    let mut state = lock_state(lock);
-    if state.locked {
-        state.locked = false;
-        cvar.notify_one();
+    if let Some(m) = mutex_ref(handle) {
+        m.state.store(0, Ordering::Release);
     }
 }
 

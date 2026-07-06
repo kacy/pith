@@ -2661,7 +2661,10 @@ pub fn serve_connection_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpRespons
     stream := io.from_fd(fd)
     reader := stream.buffered_bytes_reader_chunked(512)
     writer := stream.buffered_bytes_writer()
-    written := serve_connection(reader, writer, handler)!
+    written := serve_connection(reader, writer, handler) catch 0
+    # the registry entries die with the connection, not the process
+    reader.free()
+    writer.free()
     tcp_close(fd)
     return written
 

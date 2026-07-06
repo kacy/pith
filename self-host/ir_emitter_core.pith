@@ -3461,6 +3461,10 @@ fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
         return 0 - 1
     if ir_is_declared_callable(callee_name) or ir_is_sync_primitive_name(callee_name):
         return 0 - 1
+    # a closure-typed variable or parameter is an indirect call, not a
+    # construction: the consumer dispatches through the closure handle
+    if ir_lookup_name_type(callee_name) == "closure":
+        return 0 - 1
     mut arg_nodes: List[Int] := []
     for child, i in node.children:
         if i == 0:

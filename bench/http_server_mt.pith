@@ -1,9 +1,15 @@
 # threaded http server benchmark: one spawned handler per connection,
-# same routes and per-request work as bench/http_server.pith. exists to
-# measure what pith's os-thread spawn buys against go's goroutine
-# multiplexing.
+# with keep-alive each connection is one long-lived thread.
 #
-# run:  pith build bench/http_server_mt.pith && ./bench/http_server_mt 8080
+# original single-threaded notes follow.
+# http server memory benchmark
+#
+# serves a small json api with allocation-churny request handling:
+# query parsing, catalog lookups, and per-request string assembly.
+# pair with bench/http_bench.sh, which drives it with wrk and samples
+# rss over the run. the go counterpart is bench/http_server.go.
+#
+# run:  pith build bench/http_server.pith && ./bench/http_server 8080
 import std.net.http as http
 
 fn query_param(query: String, name: String) -> String:
@@ -38,17 +44,16 @@ fn item_json(id: Int) -> String:
     body = body + "]" + chr(125)
     return body
 
-fn handle(fd: Int) -> Int!:
-    tcp_set_timeout(fd, 2000)
-    req := http.read_request_bytes(fd)!
-    if req.is_get("/item")!:
-        id_text := query_param(req.query()!, "id")
+fn route(req: HttpRequestBytes) -> HttpResponse:
+    is_item := req.is_get("/item") catch false
+    if is_item:
+        id_text := query_param(req.query() catch "", "id")
         id := parse_int(id_text) catch 0
-        return http.send_response(fd, http.json_response(200, item_json(id)))
-    elif req.is_get("/health")!:
-        return http.send_response(fd, http.json_response(200, chr(123) + chr(34) + "ok" + chr(34) + ":true" + chr(125)))
-    else:
-        return http.send_response(fd, http.not_found())
+        return http.json(200, item_json(id))
+    is_health := req.is_get("/health") catch false
+    if is_health:
+        return http.json(200, chr(123) + chr(34) + "ok" + chr(34) + ":true" + chr(125))
+    return http.not_found_response()
 
 fn main() -> Int!:
     mut port := 8080
@@ -59,8 +64,9 @@ fn main() -> Int!:
     fd := tcp_listen("0.0.0.0", port)!
     while true:
         client := tcp_accept(fd)!
-        spawn handle_conn(client)
+        tcp_set_timeout(client, 5000)
+        spawn serve_conn(client)
     return 0
 
-fn handle_conn(fd: Int) -> Int:
-    return handle(fd) catch 0
+fn serve_conn(fd: Int) -> Int:
+    return http.serve_connection_fd(fd, route) catch 0

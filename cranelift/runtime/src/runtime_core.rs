@@ -113,7 +113,7 @@ pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
 /// Debug: PITH_CSTRING_WATCH=<content> logs every rc operation on strings
 /// with that exact content, with the count before the op.
 unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delta: i64) {
-    let Ok(needle) = std::env::var("PITH_CSTRING_WATCH") else {
+    let Some(needle) = debug_watch_needle() else {
         return;
     };
     let data_len = (base.add(8) as *const u64).read() as usize;
@@ -149,7 +149,7 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
         }
         if prev == 1 {
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            if let Ok(needle) = std::env::var("PITH_CSTRING_TRACE") {
+            if let Some(needle) = debug_trace_needle() {
                 let data_len = (base.add(8) as *const u64).read() as usize;
                 let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
                 let content = String::from_utf8_lossy(bytes);
@@ -161,7 +161,7 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
                 // scrub instead of freeing: a read-after-release shows up
                 // as '!' runs in program output instead of silent reuse
                 let data_len = (base.add(8) as *const u64).read() as usize;
-                if std::env::var("PITH_SCRUB_LOG").is_ok() {
+                if debug_scrub_log() {
                     let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(24));
                     eprintln!("scrub {:p} len={} {:?}", s, data_len, String::from_utf8_lossy(bytes));
                 }
@@ -178,6 +178,25 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
 
 /// Debug switch: keep freed cstrings alive and report over-releases, so an
 /// accounting bug in emitted code shows up as a message, not corruption.
+fn debug_watch_needle() -> Option<&'static str> {
+    static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NEEDLE
+        .get_or_init(|| std::env::var("PITH_CSTRING_WATCH").ok())
+        .as_deref()
+}
+
+fn debug_trace_needle() -> Option<&'static str> {
+    static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NEEDLE
+        .get_or_init(|| std::env::var("PITH_CSTRING_TRACE").ok())
+        .as_deref()
+}
+
+fn debug_scrub_log() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("PITH_SCRUB_LOG").is_ok())
+}
+
 fn cstring_debug_no_free() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("PITH_CSTRING_NOFREE").is_ok())
@@ -201,7 +220,7 @@ pub unsafe extern "C" fn pith_cstring_release_traced(s: *const i8, site: i64) {
     if let Some(base) = cstring_base(s) {
         let rc = cstring_refcount(base).load(std::sync::atomic::Ordering::Relaxed);
         if rc == 1 {
-            if let Ok(needle) = std::env::var("PITH_CSTRING_TRACE") {
+            if let Some(needle) = debug_trace_needle() {
                 let data_len = (base.add(8) as *const u64).read() as usize;
                 let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
                 let content = String::from_utf8_lossy(bytes);
@@ -219,10 +238,10 @@ pub unsafe extern "C" fn pith_cstring_release_traced(s: *const i8, site: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_retain_traced(s: *const i8, site: i64) {
     if let Some(base) = cstring_base(s) {
-        if std::env::var("PITH_CSTRING_WATCH").is_ok() {
+        if debug_watch_needle().is_some() {
             let data_len = (base.add(8) as *const u64).read() as usize;
             let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(64));
-            if Ok(String::from_utf8_lossy(bytes).into_owned()) == std::env::var("PITH_CSTRING_WATCH") {
+            if Some(String::from_utf8_lossy(bytes).into_owned().as_str()) == debug_watch_needle() {
                 eprintln!("watch retain SITE {}", site);
             }
         }

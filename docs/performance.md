@@ -139,10 +139,24 @@ receivers release after their call (`normalize(p).split("/")` leaked
 the normalized copy), and for-loops release owned iterables at the
 end label (`for part in x.split("/")` leaked the split list and
 everything it pinned). server: 7,056 req/s, growth 1.6 kb/request.
-std_pipeline peak falls to 456 mb. the accumulated rc traffic now
-costs the compiler ~2s of self-compile (2.0s → 4.0s) and std_pipeline
-~40% — eliding provably-redundant retain/release pairs is the
-standing next perf item.
+std_pipeline peak falls to 456 mb.
+
+sixth landing (the rc tax was instrumentation): profiling the "40%
+rc overhead" showed ~21% of compile time inside getenv — the debug
+hooks (watch, trace, scrub-log, map-trace) read their environment
+variables on every rc operation. one OnceLock per flag later:
+
+| | with per-op getenv | cached |
+|---|---|---|
+| compiler self-compile | 4.0s | **2.1s** |
+| std_pipeline | 1418ms | **697ms — best ever** |
+| url/path churn | 1400ms | 749ms |
+
+697ms beats the 805ms pre-reclaim record: full memory reclamation is
+now *faster* than leaking, because the allocator reuses hot pages
+instead of faulting fresh zeroed ones. the ownership discipline
+itself costs the compiler roughly nothing. retain/release elision
+drops from mandatory to optional micro-optimization.
 
 build times, same machine (go 1.24.4): go cold 10.6s / warm 0.1s; pith
 compiles the same program cold in 1.2s every time — 8.5x faster than

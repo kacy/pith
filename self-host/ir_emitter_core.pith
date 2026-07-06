@@ -1791,7 +1791,74 @@ fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
         expr_type = ir_infer_type(idx)
     return expr_type == "string"
 
+# a register holding one byte of string content as an integer, or -1
+# when the expression can't be read as a byte. covers s[i] on strings
+# (an allocation-free byte_at instead of a fresh one-char string),
+# single-character literals, and chr(n) with a literal argument.
+fn ir_emit_byte_operand(idx: Int) -> Int:
+    node := get_node(idx)
+    if node.kind == "index" and node.children.len() >= 2:
+        if ir_expr_is_fresh_string_index(idx):
+            obj_r := ir_expr(node.children[0])
+            idx_r := ir_expr(node.children[1])
+            r := ir_reg()
+            ir_emit_call2(r, "byte_at", "int", obj_r, idx_r)
+            return r
+        return 0 - 1
+    if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
+        if node.value.len() == 1:
+            r := ir_reg()
+            ir_emit("iconst " + r.to_string() + " " + ord(node.value).to_string())
+            return r
+        return 0 - 1
+    if node.kind == "call" and node.children.len() >= 2:
+        callee := get_node(node.children[0])
+        arg := get_node(node.children[1])
+        if callee.kind == "ident" and callee.value == "chr" and arg.kind == "int_lit":
+            r := ir_reg()
+            ir_emit("iconst " + r.to_string() + " " + arg.value)
+            return r
+    return 0 - 1
+
+# `s[i] == ":"` compares one byte against one byte: read both sides as
+# integers and skip the two string allocations plus their rc traffic.
+# at least one side must be an index — the scanner-loop shape this
+# exists for.
+fn ir_is_byte_operand(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind == "index" and node.children.len() >= 2:
+        return ir_expr_is_fresh_string_index(idx)
+    if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
+        return node.value.len() == 1
+    if node.kind == "call" and node.children.len() >= 2:
+        callee := get_node(node.children[0])
+        arg := get_node(node.children[1])
+        return callee.kind == "ident" and callee.value == "chr" and arg.kind == "int_lit"
+    return false
+
+fn ir_try_emit_byte_compare(node: Node, op: String) -> Int:
+    left := get_node(node.children[0])
+    right := get_node(node.children[1])
+    if left.kind != "index" and right.kind != "index":
+        return 0 - 1
+    if ir_infer_type(node.children[0]) != "string" or ir_infer_type(node.children[1]) != "string":
+        return 0 - 1
+    if not ir_is_byte_operand(node.children[0]) or not ir_is_byte_operand(node.children[1]):
+        return 0 - 1
+    left_b := ir_emit_byte_operand(node.children[0])
+    right_b := ir_emit_byte_operand(node.children[1])
+    r := ir_reg()
+    if op == "eq":
+        ir_emit("eq " + r.to_string() + " " + left_b.to_string() + " " + right_b.to_string())
+    else:
+        ir_emit("neq " + r.to_string() + " " + left_b.to_string() + " " + right_b.to_string())
+    return r
+
 fn ir_emit_binary_expr(node: Node) -> Int:
+    if node.value == "eq" or node.value == "neq":
+        fast_r := ir_try_emit_byte_compare(node, node.value)
+        if fast_r >= 0:
+            return fast_r
     left_r := ir_expr(node.children[0])
     right_r := ir_expr(node.children[1])
     r := ir_reg()
@@ -3498,6 +3565,11 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         callee = ir_resolve_static_callee(node.children[0])
         if callee.name.len() == 0:
             callee = ResolvedCallee("unknown", false)
+    # ord(s[i]) reads one byte: byte_at skips the one-character string
+    # that s[i] would otherwise allocate just to take its code point
+    if callee.name == "ord" and node.children.len() >= 2:
+        if ir_is_byte_operand(node.children[1]) and get_node(node.children[1]).kind == "index":
+            return ir_emit_byte_operand(node.children[1])
     higher_order_r := ir_emit_higher_order_list_call(idx, node, callee.name)
     if higher_order_r >= 0:
         return higher_order_r

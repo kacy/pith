@@ -112,6 +112,7 @@ pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
 
 /// Debug: PITH_CSTRING_WATCH=<content> logs every rc operation on strings
 /// with that exact content, with the count before the op.
+#[inline(always)]
 unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delta: i64) {
     let Some(needle) = debug_watch_needle() else {
         return;
@@ -178,6 +179,7 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
 
 /// Debug switch: keep freed cstrings alive and report over-releases, so an
 /// accounting bug in emitted code shows up as a message, not corruption.
+#[inline(always)]
 fn debug_watch_needle() -> Option<&'static str> {
     static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     NEEDLE

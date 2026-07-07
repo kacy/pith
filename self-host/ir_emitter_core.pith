@@ -1529,10 +1529,10 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
     none_l := ir_label()
     merge_l := ir_label()
     ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
-    ir_emit("label " + some_l)
+    ir_emit_label(some_l)
     decoded_r := ir_optional_value_field(recv_r, opt_tid)
     ir_emit("jmp " + merge_l)
-    ir_emit("label " + none_l)
+    ir_emit_label(none_l)
     if ir_emit_tests and ir_emitting_test_func:
         ir_test_assert_fail_return()
     else:
@@ -1540,7 +1540,7 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
         err_r := ir_reg()
         ir_emit("strref " + err_r.to_string() + " " + si)
         ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
-    ir_emit("label " + merge_l)
+    ir_emit_label(merge_l)
     return decoded_r
 
 fn ir_collect_method_call_regs(node: Node) -> List[Int]:
@@ -1963,11 +1963,11 @@ fn ir_emit_test_assert(arg_regs: List[Int]) -> Int:
     ok_l := ir_label()
     fail_l := ir_label()
     ir_emit("brif " + arg_regs[0].to_string() + " " + ok_l + " " + fail_l)
-    ir_emit("label " + fail_l)
+    ir_emit_label(fail_l)
     assert_r := ir_reg()
     ir_emit_call1(assert_r, "assert", "unknown", arg_regs[0])
     ir_test_assert_fail()
-    ir_emit("label " + ok_l)
+    ir_emit_label(ok_l)
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " 0")
     return r
@@ -1983,11 +1983,11 @@ fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int]) -> Int:
     ok_l := ir_label()
     fail_l := ir_label()
     ir_emit("brif " + cmp_r.to_string() + " " + ok_l + " " + fail_l)
-    ir_emit("label " + fail_l)
+    ir_emit_label(fail_l)
     fail_r := ir_reg()
     ir_emit_call2(fail_r, "assert_eq", "unknown", arg_regs[0], arg_regs[1])
     ir_test_assert_fail()
-    ir_emit("label " + ok_l)
+    ir_emit_label(ok_l)
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " 0")
     return r
@@ -2021,7 +2021,7 @@ fn ir_emit_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid: Int,
     decode_result_r := ir_reg()
     ir_emit_call1(decode_result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", child_handle_r)
     ir_emit("store " + temp_name + " " + decode_result_r.to_string())
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     result_r := ir_reg()
     ir_emit("load " + result_r.to_string() + " " + temp_name)
     return result_r
@@ -2119,19 +2119,19 @@ fn ir_begin_decode_field_branch(has_r: Int, temp_prefix: String, temp_type: Stri
     field_temp := ir_new_temp_name(temp_prefix)
     ir_var_types.insert(field_temp, temp_type)
     ir_emit("brif " + has_r.to_string() + " " + present_l + " " + missing_l)
-    ir_emit("label " + missing_l)
+    ir_emit_label(missing_l)
     return IrDecodeFieldBranch(field_temp, present_l, merge_l)
 
 fn ir_decode_field_present(branch: IrDecodeFieldBranch):
     ir_emit("jmp " + branch.merge_l)
-    ir_emit("label " + branch.present_l)
+    ir_emit_label(branch.present_l)
 
 fn ir_decode_field_store_and_merge(branch: IrDecodeFieldBranch, value_r: Int):
     ir_emit("store " + branch.field_temp + " " + value_r.to_string())
     ir_emit("jmp " + branch.merge_l)
 
 fn ir_decode_field_load_after_merge(branch: IrDecodeFieldBranch) -> Int:
-    ir_emit("label " + branch.merge_l)
+    ir_emit_label(branch.merge_l)
     loaded_r := ir_reg()
     ir_emit("load " + loaded_r.to_string() + " " + branch.field_temp)
     return loaded_r
@@ -2506,7 +2506,7 @@ fn ir_emit_config_decode_call(idx: Int, node: Node, prefixed: Bool) -> Int:
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()
     ir_emit_config_decode_value(target_info, cfg_r, prefix_r, node.children[0], temp_name, done_l)
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -2542,7 +2542,7 @@ fn ir_emit_config_loader_decode_call(idx: Int, node: Node, loader_name: String, 
     ir_emit_result_store_error_branch(load_result_r, temp_name, done_l)
     cfg_r := ir_emit_result_value_field(load_result_r, lookup_type_id("Config"), "ok")
     ir_emit_config_decode_value(target_info, cfg_r, prefix_r, node.children[0], temp_name, done_l)
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -2575,7 +2575,7 @@ fn ir_emit_local_toml_decode_text_path_call(idx: Int, node: Node, callee_node: N
     path_result_r := ir_reg()
     ir_emit_call2(path_result_r, decode_path_name, "tuple", root_r, dotted_path_r)
     ir_emit("store " + temp_name + " " + path_result_r.to_string())
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -2686,7 +2686,7 @@ fn ir_emit_toml_decode_call(idx: Int, node: Node, text_input: Bool) -> Int:
         handle_r = ir_emit_result_value_field(parse_result_r, lookup_type_id("Int"), "ok")
 
     ir_emit_toml_decode_value(target_info, handle_r, node.children[0], temp_name, done_l)
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -2729,7 +2729,7 @@ fn ir_emit_toml_decode_path_call(idx: Int, node: Node, text_input: Bool) -> Int:
     ir_var_types.insert(idx_name, "int")
     final_handle_r := ir_emit_dotted_path_lookup(handle_r, dotted_path_r, ir_resolve_toml_call_name(node.children[0], "toml_require_table"), lookup_type_id("Int"), current_name, parts_name, len_name, idx_name, temp_name, done_l)
     ir_emit_toml_decode_value(target_info, final_handle_r, node.children[0], temp_name, done_l)
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -2760,7 +2760,7 @@ fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool) -> Int:
         ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
         handle_r := ir_emit_result_value_field(parse_result_r, lookup_type_id("Int"), "ok")
         ir_emit_toml_decode_value(target_info, handle_r, node.children[0], temp_name, done_l)
-        ir_emit("label " + done_l)
+        ir_emit_label(done_l)
         r := ir_reg()
         ir_emit("load " + r.to_string() + " " + temp_name)
         return r
@@ -2797,7 +2797,7 @@ fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool) -> Int:
     ir_var_types.insert(idx_name, "int")
     final_handle_r := ir_emit_dotted_path_lookup(handle_r, dotted_path_r, ir_resolve_toml_call_name(node.children[0], "toml_require_table"), lookup_type_id("Int"), current_name, parts_name, len_name, idx_name, temp_name, done_l)
     ir_emit_toml_decode_value(target_info, final_handle_r, node.children[0], temp_name, done_l)
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -2865,7 +2865,7 @@ fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo) -> Int:
         field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
 
     ir_emit_struct_result_store(field_regs, "struct:" + target_info.name, temp_name)
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -3006,7 +3006,7 @@ fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool) -> Int:
         ir_emit_result_store_error_branch(checked_r, temp_name, done_l)
         object_r := ir_emit_result_value_field(checked_r, lookup_type_id("Int"), "ok")
         ir_emit_json_decode_object_value(target_info, object_r, node.children[0], temp_name, done_l)
-        ir_emit("label " + done_l)
+        ir_emit_label(done_l)
         r := ir_reg()
         ir_emit("load " + r.to_string() + " " + temp_name)
         return r
@@ -3039,7 +3039,7 @@ fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool) -> Int:
         field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
 
     ir_emit_struct_result_store(field_regs, "struct:" + target_info.name, temp_name)
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -3133,7 +3133,7 @@ fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: I
         i = i + 1
 
     ir_emit_struct_result_store(field_regs, "struct:" + struct_name, temp_name)
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
 
 fn ir_emit_json_decode_object_specialization_body(struct_name: String, module_path: String):
     if not ir_struct_names.contains_key(struct_name):
@@ -3234,7 +3234,7 @@ fn ir_emit_json_decode_object_call(idx: Int, node: Node) -> Int:
     ir_emit_result_store_error_branch(checked_r, temp_name, done_l)
     object_r := ir_emit_result_value_field(checked_r, lookup_type_id("Int"), "ok")
     ir_emit_json_decode_object_value(target_info, object_r, node.children[0], temp_name, done_l)
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -3281,7 +3281,7 @@ fn ir_emit_json_decode_path_call(idx: Int, node: Node, text_input: Bool) -> Int:
     root_r := ir_emit_result_value_field(root_result_r, lookup_type_id("Int"), "ok")
     final_handle_r := ir_emit_dotted_path_lookup(root_r, dotted_path_r, ir_resolve_json_call_name(node.children[0], "object_require_object"), lookup_type_id("Int"), current_name, parts_name, len_name, idx_name, temp_name, done_l)
     ir_emit_json_decode_object_value(target_info, final_handle_r, node.children[0], temp_name, done_l)
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -3314,7 +3314,7 @@ fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool) -> Int:
         ir_emit_result_store_error_branch(checked_r, temp_name, done_l)
         object_r := ir_emit_result_value_field(checked_r, lookup_type_id("Int"), "ok")
         ir_emit_json_decode_object_value(target_info, object_r, node.children[0], temp_name, done_l)
-        ir_emit("label " + done_l)
+        ir_emit_label(done_l)
         r := ir_reg()
         ir_emit("load " + r.to_string() + " " + temp_name)
         return r
@@ -3353,7 +3353,7 @@ fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool) -> Int:
     root_r := ir_emit_result_value_field(root_result_r, lookup_type_id("Int"), "ok")
     final_handle_r := ir_emit_dotted_path_lookup(root_r, dotted_path_r, ir_resolve_json_call_name(node.children[0], "object_require_object"), lookup_type_id("Int"), current_name, parts_name, len_name, idx_name, temp_name, done_l)
     ir_emit_json_decode_object_value(target_info, final_handle_r, node.children[0], temp_name, done_l)
-    ir_emit("label " + done_l)
+    ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -3800,17 +3800,17 @@ fn ir_emit_wrapped_legacy_result(raw_r: Int, legacy_kind: String, callee_name: S
     err_l := ir_label()
     merge_l := ir_label()
     ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
-    ir_emit("label " + ok_l)
+    ir_emit_label(ok_l)
     mut ok_r := raw_r
     if legacy_kind == "result_int" or legacy_kind == "result_bool":
         ok_r = ir_decode_result_value(raw_r, legacy_kind)
     ok_tuple := ir_emit_ok_result_tuple(ok_r)
     ir_emit("store " + temp_name + " " + ok_tuple.to_string())
     ir_emit("jmp " + merge_l)
-    ir_emit("label " + err_l)
+    ir_emit_label(err_l)
     err_tuple := ir_emit_err_result_tuple(ir_emit_result_error_message(callee_name))
     ir_emit("store " + temp_name + " " + err_tuple.to_string())
-    ir_emit("label " + merge_l)
+    ir_emit_label(merge_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -3848,12 +3848,12 @@ fn ir_emit_result_unwrap_or(node: Node) -> Int:
     fallback_l := ir_label()
     merge_l := ir_label()
     ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
-    ir_emit("label " + ok_l)
+    ir_emit_label(ok_l)
     ir_emit("store " + temp_name + " " + ir_emit_result_value_field(recv_r, c_get_expr_type(node.children[0]), "ok").to_string())
     ir_emit("jmp " + merge_l)
-    ir_emit("label " + fallback_l)
+    ir_emit_label(fallback_l)
     ir_emit("store " + temp_name + " " + fallback_r.to_string())
-    ir_emit("label " + merge_l)
+    ir_emit_label(merge_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -3872,14 +3872,14 @@ fn ir_emit_result_value_to_string(recv_r: Int, recv_tid: Int) -> Int:
     err_l := ir_label()
     merge_l := ir_label()
     ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
-    ir_emit("label " + ok_l)
+    ir_emit_label(ok_l)
     ok_r := ir_emit_result_value_field(recv_r, recv_tid, "ok")
     ir_emit("store " + temp_name + " " + ir_emit_stringify_value(ok_r, ok_tid).to_string())
     ir_emit("jmp " + merge_l)
-    ir_emit("label " + err_l)
+    ir_emit_label(err_l)
     err_r := ir_emit_result_value_field(recv_r, recv_tid, "err")
     ir_emit("store " + temp_name + " " + ir_emit_stringify_value(err_r, err_tid).to_string())
-    ir_emit("label " + merge_l)
+    ir_emit_label(merge_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -3942,14 +3942,14 @@ fn ir_emit_result_or_else(idx: Int, node: Node) -> Int:
     err_l := ir_label()
     merge_l := ir_label()
     ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
-    ir_emit("label " + ok_l)
+    ir_emit_label(ok_l)
     ir_emit("store " + temp_name + " " + recv_r.to_string())
     ir_emit("jmp " + merge_l)
-    ir_emit("label " + err_l)
+    ir_emit_label(err_l)
     err_r := ir_emit_result_value_field(recv_r, c_get_expr_type(node.children[0]), "err")
     handled_r := ir_emit_named_handler_call(handler_idx, err_r, ir_checked_type(idx))
     ir_emit("store " + temp_name + " " + handled_r.to_string())
-    ir_emit("label " + merge_l)
+    ir_emit_label(merge_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -4028,21 +4028,21 @@ fn ir_emit_select_probe_arm(arm_idx: Int, result_temp: String, end_l: String):
         hit_l := ir_label()
         next_l := ir_label()
         ir_emit("brif " + ready_r.to_string() + " " + hit_l + " " + next_l)
-        ir_emit("label " + hit_l)
+        ir_emit_label(hit_l)
         body_r := ir_emit_select_arm_body(arm_node.children[1], arm_node.value, maybe_r, ir_checked_type(arm_node.children[0]))
         ir_emit("store " + result_temp + " " + body_r.to_string())
         ir_emit("jmp " + end_l)
-        ir_emit("label " + next_l)
+        ir_emit_label(next_l)
     elif arm_node.kind == "select_send_arm" and arm_node.children.len() >= 2:
         ready_r := ir_emit_select_send_probe(arm_node.children[0])
         hit_l := ir_label()
         next_l := ir_label()
         ir_emit("brif " + ready_r.to_string() + " " + hit_l + " " + next_l)
-        ir_emit("label " + hit_l)
+        ir_emit_label(hit_l)
         body_r := ir_emit_select_arm_body(arm_node.children[1], "", 0, "")
         ir_emit("store " + result_temp + " " + body_r.to_string())
         ir_emit("jmp " + end_l)
-        ir_emit("label " + next_l)
+        ir_emit_label(next_l)
 
 fn ir_emit_select_deadline(timeout_idx: Int) -> String:
     if timeout_idx < 0:
@@ -4082,16 +4082,16 @@ fn ir_emit_rotated_select_probes(probe_arms: List[Int], offset_name: String, res
         ir_emit("iconst " + case_r.to_string() + " " + i.to_string())
         ir_emit("eq " + match_r.to_string() + " " + offset_r.to_string() + " " + case_r.to_string())
         ir_emit("brif " + match_r.to_string() + " " + case_l + " " + next_case_l)
-        ir_emit("label " + case_l)
+        ir_emit_label(case_l)
         mut j := 0
         while j < probe_count:
             probe_idx := (i + j) % probe_count
             ir_emit_select_probe_arm(probe_arms[probe_idx], result_temp, end_l)
             j = j + 1
         ir_emit("jmp " + probe_done_l)
-        ir_emit("label " + next_case_l)
+        ir_emit_label(next_case_l)
         i = i + 1
-    ir_emit("label " + probe_done_l)
+    ir_emit_label(probe_done_l)
 
 fn ir_emit_select_probes(probe_arms: List[Int], offset_name: String, result_temp: String, end_l: String):
     probe_count := probe_arms.len()
@@ -4124,12 +4124,12 @@ fn ir_emit_select_timeout(timeout_idx: Int, deadline_name: String, result_temp: 
     timeout_l := ir_label()
     wait_l := ir_label()
     ir_emit("brif " + expired_r.to_string() + " " + timeout_l + " " + wait_l)
-    ir_emit("label " + timeout_l)
+    ir_emit_label(timeout_l)
     timeout_node := get_node(timeout_idx)
     body_r := ir_emit_select_arm_body(timeout_node.children[1], "", 0, "")
     ir_emit("store " + result_temp + " " + body_r.to_string())
     ir_emit("jmp " + end_l)
-    ir_emit("label " + wait_l)
+    ir_emit_label(wait_l)
 
 fn ir_advance_select_offset(probe_count: Int, offset_name: String):
     if probe_count <= 1:
@@ -4162,14 +4162,14 @@ fn ir_emit_select_expr(node: Node) -> Int:
 
     loop_l := ir_label()
     end_l := ir_label()
-    ir_emit("label " + loop_l)
+    ir_emit_label(loop_l)
 
     offset_name := ir_emit_select_offset(probe_count)
     ir_emit_select_probes(parts.probe_arms, offset_name, result_temp, end_l)
     ir_emit_select_default(parts.default_idx, result_temp, end_l)
     ir_emit_select_timeout(parts.timeout_idx, deadline_name, result_temp, end_l)
     ir_emit_select_wait(loop_l, probe_count, offset_name)
-    ir_emit("label " + end_l)
+    ir_emit_label(end_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + result_temp)
     return r
@@ -4733,7 +4733,7 @@ fn ir_emit_try_expr(node: Node) -> Int:
             err_l := ir_label()
             merge_l := ir_label()
             ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
-            ir_emit("label " + ok_l)
+            ir_emit_label(ok_l)
             decoded_r := ir_emit_result_ok_field_for_expr(val_r, node.children[0])
             # the extracted payload carries the count; the tuple shell has
             # no destructor, so this frees only the three-slot allocation.
@@ -4741,12 +4741,12 @@ fn ir_emit_try_expr(node: Node) -> Int:
             # consumer releases it there.
             ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
             ir_emit("jmp " + merge_l)
-            ir_emit("label " + err_l)
+            ir_emit_label(err_l)
             if ir_emit_tests and ir_emitting_test_func:
                 ir_test_assert_fail_return()
             else:
                 ir_emit("ret " + val_r.to_string())
-            ir_emit("label " + merge_l)
+            ir_emit_label(merge_l)
             return decoded_r
         mut cond_r := val_r
         mut decoded_r := val_r
@@ -4764,16 +4764,16 @@ fn ir_emit_try_expr(node: Node) -> Int:
         err_l := ir_label()
         merge_l := ir_label()
         ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
-        ir_emit("label " + ok_l)
+        ir_emit_label(ok_l)
         ir_emit("jmp " + merge_l)
-        ir_emit("label " + err_l)
+        ir_emit_label(err_l)
         if ir_emit_tests and ir_emitting_test_func:
             ir_test_assert_fail_return()
         else:
             zero := ir_reg()
             ir_emit("iconst " + zero.to_string() + " 0")
             ir_emit("ret " + zero.to_string())
-        ir_emit("label " + merge_l)
+        ir_emit_label(merge_l)
         return decoded_r
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " 0")
@@ -4786,7 +4786,7 @@ fn ir_emit_fail_expr(node: Node) -> Int:
     else:
         ir_emit("ret " + ir_emit_err_result_tuple(ir_zero_reg()).to_string())
     ub := ir_label()
-    ir_emit("label " + ub)
+    ir_emit_label(ub)
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " 0")
     return r
@@ -4908,15 +4908,15 @@ fn ir_emit_catch_expr(node: Node) -> Int:
     fallback_l := ir_label()
     merge_l := ir_label()
     ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
-    ir_emit("label " + ok_l)
+    ir_emit_label(ok_l)
     ok_value_r := ir_emit_result_value_field(result_r, c_get_expr_type(node.children[0]), "ok")
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
     ir_emit("store " + temp_name + " " + ok_value_r.to_string())
     ir_emit("jmp " + merge_l)
-    ir_emit("label " + fallback_l)
+    ir_emit_label(fallback_l)
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
     ir_emit("store " + temp_name + " " + ir_expr(node.children[1]).to_string())
-    ir_emit("label " + merge_l)
+    ir_emit_label(merge_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -4975,15 +4975,15 @@ fn ir_emit_match_return(idx: Int, node: Node):
         cand_l := ir_label()
         next_l := ir_label()
         ir_emit("brif " + cond_r.to_string() + " " + cand_l + " " + next_l)
-        ir_emit("label " + cand_l)
+        ir_emit_label(cand_l)
         ir_emit_match_bindings(pat_idx, subj_r, subj_type)
         if guard_idx >= 0:
             g_r := ir_expr(guard_idx)
             body_l := ir_label()
             ir_emit("brif " + g_r.to_string() + " " + body_l + " " + next_l)
-            ir_emit("label " + body_l)
+            ir_emit_label(body_l)
         ir_emit_match_arm_return(body_idx)
-        ir_emit("label " + next_l)
+        ir_emit_label(next_l)
         i = i + 1
 
 # Emit a bool register that is 1 when subj_r matches pat, ignoring any bindings
@@ -5173,23 +5173,23 @@ fn ir_emit_match_expr(idx: Int, node: Node) -> Int:
         cand_l := ir_label()
         next_l := ir_label()
         ir_emit("brif " + cond_r.to_string() + " " + cand_l + " " + next_l)
-        ir_emit("label " + cand_l)
+        ir_emit_label(cand_l)
         ir_emit_match_bindings(pat_idx, subj_r, subj_type)
         if guard_idx >= 0:
             g_r := ir_expr(guard_idx)
             body_l := ir_label()
             ir_emit("brif " + g_r.to_string() + " " + body_l + " " + next_l)
-            ir_emit("label " + body_l)
+            ir_emit_label(body_l)
         ir_emit_match_arm_body(body_idx, result_temp)
         if not ir_last_was_ret:
             ir_emit("jmp " + end_l)
-        ir_emit("label " + next_l)
+        ir_emit_label(next_l)
         i = i + 1
     # no arm matched: leave a zero so the result temp is always defined.
     zero_r := ir_reg()
     ir_emit("iconst " + zero_r.to_string() + " 0")
     ir_emit("store " + result_temp + " " + zero_r.to_string())
-    ir_emit("label " + end_l)
+    ir_emit_label(end_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + result_temp)
     return r
@@ -5462,17 +5462,24 @@ fn ir_emit_compound_assignment(node: Node):
         ir_emit_simple_binary(res, compound_op, cur, rhs)
         ir_emit("store " + ir_resolve_storage_name(name) + " " + res.to_string())
 
+# emit a label and clear the return-tracking flag: a label starts a
+# fresh block, so whatever terminator came before it belongs to a
+# different path
+fn ir_emit_label(l: String):
+    ir_emit("label " + l)
+    ir_last_was_ret = false
+
 fn ir_emit_if_branch(branch: IrIfBranch, then_label: String, next_label: String, end_label: String):
     if branch.cond_idx >= 0:
         cr := ir_expr(branch.cond_idx)
         ir_emit("brif " + cr.to_string() + " " + then_label + " " + next_label)
-    ir_emit("label " + then_label)
+    ir_emit_label(then_label)
     ir_last_was_ret = false
     if branch.body_idx >= 0:
         ir_block(branch.body_idx)
     if not ir_last_was_ret:
         ir_emit("jmp " + end_label)
-    ir_emit("label " + next_label)
+    ir_emit_label(next_label)
 
 fn ir_emit_for_loop_value_binding(value_name: String, index_name: String, item_kind: String, iter_name: String, index_name_internal: String):
     it_r := ir_reg()
@@ -5495,6 +5502,12 @@ fn ir_emit_for_loop_value_binding(value_name: String, index_name: String, item_k
 fn ir_stmt(idx: Int):
     node := get_node(idx)
     kind := node.kind
+
+    # each statement speaks for itself: without this reset, a nested
+    # `if x: return` leaves the flag stuck on true, and the statements
+    # after it lose their branch-merge jump — the code falls through
+    # into the else arm
+    ir_last_was_ret = false
 
     if ir_stmt_is_expr(kind):
         r := ir_expr(idx)
@@ -5545,7 +5558,7 @@ fn ir_emit_if_stmt(node: Node):
         ir_emit_if_branch(branch, ir_label(), ir_label(), end_label)
     if else_idx >= 0:
         ir_block(else_idx)
-    ir_emit("label " + end_label)
+    ir_emit_label(end_label)
 
 # if let / while let share the match machinery: a variant pattern uses the
 # match condition and binding emitters, a bare binding tests an optional's
@@ -5583,17 +5596,17 @@ fn ir_emit_if_let_stmt(node: Node):
     else_l := ir_label()
     end_l := ir_label()
     ir_emit("brif " + cond_r.to_string() + " " + then_l + " " + else_l)
-    ir_emit("label " + then_l)
+    ir_emit_label(then_l)
     ir_last_was_ret = false
     ir_emit_let_bindings(node.children[0], subj_r, node.children[1])
     ir_block(node.children[2])
     if not ir_last_was_ret:
         ir_emit("jmp " + end_l)
-    ir_emit("label " + else_l)
+    ir_emit_label(else_l)
     ir_last_was_ret = false
     if node.children.len() > 3:
         ir_block(node.children[3])
-    ir_emit("label " + end_l)
+    ir_emit_label(end_l)
     ir_last_was_ret = false
 
 fn ir_emit_while_let_stmt(node: Node):
@@ -5602,11 +5615,11 @@ fn ir_emit_while_let_stmt(node: Node):
     head_label := ir_label()
     body_label := ir_label()
     end_label := ir_label()
-    ir_emit("label " + head_label)
+    ir_emit_label(head_label)
     subj_r := ir_expr(node.children[1])
     cond_r := ir_emit_let_cond(node.children[0], subj_r)
     ir_emit("brif " + cond_r.to_string() + " " + body_label + " " + end_label)
-    ir_emit("label " + body_label)
+    ir_emit_label(body_label)
     ir_last_was_ret = false
     ir_emit_let_bindings(node.children[0], subj_r, node.children[1])
     ir_break_stack = ir_push_string(ir_break_stack, end_label)
@@ -5615,25 +5628,25 @@ fn ir_emit_while_let_stmt(node: Node):
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit("jmp " + head_label)
-    ir_emit("label " + end_label)
+    ir_emit_label(end_label)
     ir_last_was_ret = false
 
 fn ir_emit_while_stmt(node: Node):
     head_label := ir_label()
     body_label := ir_label()
     end_label := ir_label()
-    ir_emit("label " + head_label)
+    ir_emit_label(head_label)
     if node.children.len() >= 2:
         cr := ir_expr(node.children[0])
         ir_emit("brif " + cr.to_string() + " " + body_label + " " + end_label)
-        ir_emit("label " + body_label)
+        ir_emit_label(body_label)
         ir_break_stack = ir_push_string(ir_break_stack, end_label)
         ir_continue_stack = ir_push_string(ir_continue_stack, head_label)
         ir_block(node.children[1])
         ir_break_stack.remove(ir_break_stack.len() - 1)
         ir_continue_stack.remove(ir_continue_stack.len() - 1)
         ir_emit("jmp " + head_label)
-    ir_emit("label " + end_label)
+    ir_emit_label(end_label)
 
 fn ir_emit_for_stmt(node: Node):
     names := ir_for_binding_names(node)
@@ -5696,7 +5709,7 @@ fn ir_emit_for_stmt(node: Node):
         body_l := ir_label()
         step_l := ir_label()
         end_l := ir_label()
-        ir_emit("label " + head_l)
+        ir_emit_label(head_l)
         ci := ir_reg()
         ir_emit("load " + ci.to_string() + " " + fi)
         cl := ir_reg()
@@ -5704,14 +5717,14 @@ fn ir_emit_for_stmt(node: Node):
         cmp_r := ir_reg()
         ir_emit("lt " + cmp_r.to_string() + " " + ci.to_string() + " " + cl.to_string())
         ir_emit("brif " + cmp_r.to_string() + " " + body_l + " " + end_l)
-        ir_emit("label " + body_l)
+        ir_emit_label(body_l)
         ir_emit_for_loop_value_binding(names.value_name, names.index_name, item_kind, ft, fi)
         ir_break_stack = ir_push_string(ir_break_stack, end_l)
         ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
         ir_block(node.children[1])
         ir_break_stack.remove(ir_break_stack.len() - 1)
         ir_continue_stack.remove(ir_continue_stack.len() - 1)
-        ir_emit("label " + step_l)
+        ir_emit_label(step_l)
         idx3 := ir_reg()
         ir_emit("load " + idx3.to_string() + " " + fi)
         one_r := ir_reg()
@@ -5720,7 +5733,7 @@ fn ir_emit_for_stmt(node: Node):
         ir_emit("add " + inc_r.to_string() + " " + idx3.to_string() + " " + one_r.to_string())
         ir_emit("store " + fi + " " + inc_r.to_string())
         ir_emit("jmp " + head_l)
-        ir_emit("label " + end_l)
+        ir_emit_label(end_l)
         if iter_release_kind.len() > 0:
             fin_r := ir_reg()
             ir_emit("load " + fin_r.to_string() + " " + ft)
@@ -5750,7 +5763,7 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
     body_l := ir_label()
     step_l := ir_label()
     end_l := ir_label()
-    ir_emit("label " + head_l)
+    ir_emit_label(head_l)
     cv := ir_reg()
     ir_emit("load " + cv.to_string() + " " + fv)
     ch := ir_reg()
@@ -5761,7 +5774,7 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
         cmp_op = "lte"
     ir_emit(cmp_op + " " + cmp_r.to_string() + " " + cv.to_string() + " " + ch.to_string())
     ir_emit("brif " + cmp_r.to_string() + " " + body_l + " " + end_l)
-    ir_emit("label " + body_l)
+    ir_emit_label(body_l)
     bind_r := ir_reg()
     ir_emit("load " + bind_r.to_string() + " " + fv)
     ir_var_types.insert(names.value_name, "int")
@@ -5776,7 +5789,7 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
     ir_block(node.children[1])
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
-    ir_emit("label " + step_l)
+    ir_emit_label(step_l)
     v3 := ir_reg()
     ir_emit("load " + v3.to_string() + " " + fv)
     one_r := ir_reg()
@@ -5793,7 +5806,7 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
         ir_emit("add " + pinc_r.to_string() + " " + p3.to_string() + " " + pone_r.to_string())
         ir_emit("store " + fp + " " + pinc_r.to_string())
     ir_emit("jmp " + head_l)
-    ir_emit("label " + end_l)
+    ir_emit_label(end_l)
 
 # `for x in it` where `it` is an iterator (a struct with `next() -> T?`).
 # Drives the loop by calling next() each iteration: the result is an optional
@@ -5818,14 +5831,14 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
     body_l := ir_label()
     step_l := ir_label()
     end_l := ir_label()
-    ir_emit("label " + head_l)
+    ir_emit_label(head_l)
     it_cur := ir_reg()
     ir_emit("load " + it_cur.to_string() + " " + it_var)
     opt_r := ir_reg()
     ir_emit("call " + opt_r.to_string() + " " + next_name + " tuple 1 " + it_cur.to_string())
     flag_r := ir_optional_flag_field(opt_r)
     ir_emit("brif " + flag_r.to_string() + " " + body_l + " " + end_l)
-    ir_emit("label " + body_l)
+    ir_emit_label(body_l)
     val_r := ir_reg()
     ir_emit("field " + val_r.to_string() + " " + opt_r.to_string() + " 8 " + elem_kind + " value")
     ir_var_types.insert(names.value_name, elem_kind)
@@ -5840,7 +5853,7 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
     ir_block(node.children[1])
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
-    ir_emit("label " + step_l)
+    ir_emit_label(step_l)
     if has_index:
         p3 := ir_reg()
         ir_emit("load " + p3.to_string() + " " + fp)
@@ -5850,7 +5863,7 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
         ir_emit("add " + pinc_r.to_string() + " " + p3.to_string() + " " + pone_r.to_string())
         ir_emit("store " + fp + " " + pinc_r.to_string())
     ir_emit("jmp " + head_l)
-    ir_emit("label " + end_l)
+    ir_emit_label(end_l)
 
 fn ir_stmt_control(idx: Int, node: Node):
     if node.kind == "if" or node.kind == "if_stmt":

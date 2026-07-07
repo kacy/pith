@@ -1,0 +1,49 @@
+# fixture_server — a tiny json api the apic golden check talks to.
+# serves GET /item?id=N and POST /echo on the given port, exiting
+# after a fixed number of connections so the check cannot hang.
+import std.json as json
+import std.net.http as http
+
+fn query_param(query: String, name: String) -> String:
+    for part in query.split("&"):
+        eq := part.index_of("=")
+        if eq < 0:
+            continue
+        if part.substring(0, eq) == name:
+            return part.substring(eq + 1, part.len())
+    return ""
+
+fn route(req: HttpRequestBytes) -> HttpResponse:
+    is_item := req.is_get("/item") catch false
+    if is_item:
+        id_text := query_param(req.query() catch "", "id")
+        id := parse_int(id_text) catch 0
+        item := json.make_object()
+        json.object_set(item, "id", json.make_int(id))
+        json.object_set(item, "name", json.make_string("gizmo-" + id_text))
+        tags := json.make_array()
+        json.array_push(tags, json.make_string("gizmo"))
+        json.array_push(tags, json.make_string(id_text))
+        json.object_set(item, "tags", tags)
+        return http.json(200, json.encode(item))
+    is_echo := req.is_post("/echo") catch false
+    if is_echo:
+        wrapper := json.make_object()
+        body := req.body_text() catch ""
+        json.object_set(wrapper, "received", json.parse(body))
+        json.object_set(wrapper, "method", json.make_string("POST"))
+        return http.json(200, json.encode(wrapper))
+    return http.not_found_response()
+
+fn main() -> Int!:
+    argv := args()
+    port := parse_int(argv[1]) catch 8030
+    count := parse_int(argv[2]) catch 4
+    fd := tcp_listen("127.0.0.1", port)!
+    mut served := 0
+    while served < count:
+        client := tcp_accept(fd)!
+        tcp_set_timeout(client, 5000)
+        http.serve_connection_fd(client, route) catch 0
+        served = served + 1
+    return 0

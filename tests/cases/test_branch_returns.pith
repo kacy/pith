@@ -1,0 +1,48 @@
+# pins branch-merge jumps around early returns: a nested `if: return`
+# inside a branch must not swallow the jump that keeps later
+# statements out of the else arm.
+fn walk(items: List[String]) -> Bool:
+    mut tag := ""
+    mut other := ""
+    mut i := 0
+    while i < items.len():
+        a := items[i]
+        if a == "--flag":
+            if i + 1 >= items.len():
+                return false
+            tag = items[i + 1]
+            i = i + 2
+        else:
+            other = a
+            i = i + 1
+    print("tag={tag} other={other}")
+    return true
+
+fn guard_last(x: Int) -> String:
+    if x > 0:
+        if x > 100:
+            return "huge"
+    else:
+        return "negative"
+    return "small"
+
+fn loop_tail(x: Int) -> String:
+    if x > 0:
+        mut i := 0
+        while i < x:
+            if i == 50:
+                return "hit fifty"
+            i = i + 1
+    else:
+        return "non-positive"
+    return "walked " + x.to_string()
+
+fn main():
+    ok := walk(["--flag", "v", "rest"])
+    print("{ok}")
+    print(guard_last(5))
+    print(guard_last(200))
+    print(guard_last(0 - 3))
+    print(loop_tail(3))
+    print(loop_tail(80))
+    print(loop_tail(0))

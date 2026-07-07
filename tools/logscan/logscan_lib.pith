@@ -6,6 +6,7 @@ import std.fs as fs
 import std.bytes as bytes
 import std.compress.gzip as gzip
 import std.data.table as table
+import std.regex as regex
 
 ## one parsed access-log line.
 pub struct Hit:
@@ -32,52 +33,25 @@ pub struct Report:
 # combined-log-ish format:
 #   127.0.0.1 - - [06/Jul/2026:14:03:22] "GET /path HTTP/1.1" 200 512 45
 
-fn scan_until(line: String, stop: String, start: Int) -> Int:
-    mut i := start
-    while i < line.len():
-        if line[i] == stop:
-            return i
-        i = i + 1
-    return -1
+## the line grammar as one pattern: ip, bracketed stamp, quoted
+## request (method and path captured), then status, size, and millis.
+pub fn line_pattern() -> Regex!:
+    q := chr(34)
+    return regex.compile("^([^ ]+) [^ ]+ [^ ]+ \\[([^\\]]+)\\] " + q + "([^ ]+) ([^ " + q + "]+)[^" + q + "]*" + q + " (\\d+) (\\d+) (\\d+)")
 
 ## parse one log line; none when the line is malformed.
-pub fn parse_line(line: String) -> Hit?:
-    sp1 := scan_until(line, " ", 0)
-    if sp1 < 0:
+pub fn parse_line(re: Regex, line: String) -> Hit?:
+    caps := re.captures(line)
+    if caps == none:
         return none
-    ip := line.substring(0, sp1)
-
-    lb := scan_until(line, "[", sp1)
-    if lb < 0:
-        return none
-    rb := scan_until(line, "]", lb)
-    if rb < 0:
-        return none
-    stamp := line.substring(lb + 1, rb)
-
-    q1 := scan_until(line, chr(34), rb)
-    if q1 < 0:
-        return none
-    q2 := scan_until(line, chr(34), q1 + 1)
-    if q2 < 0:
-        return none
-    request := line.substring(q1 + 1, q2)
-    req_parts := request.split(" ")
-    if req_parts.len() < 2:
-        return none
-    method := req_parts[0]
-    path := req_parts[1]
-
-    tail := line.substring(q2 + 1, line.len()).trim()
-    tail_parts := tail.split(" ")
-    if tail_parts.len() < 3:
-        return none
-    status := parse_int(tail_parts[0]) catch -1
-    size := parse_int(tail_parts[1]) catch 0
-    millis := parse_int(tail_parts[2]) catch 0
-    if status < 0:
-        return none
-    return Hit(ip, stamp, method, path, status, size, millis)
+    if let c = caps:
+        status := parse_int(c[5]) catch -1
+        if status < 0:
+            return none
+        size := parse_int(c[6]) catch 0
+        millis := parse_int(c[7]) catch 0
+        return Hit(c[1], c[2], c[3], c[4], status, size, millis)
+    return none
 
 fn status_class(status: Int) -> String:
     if status < 300:
@@ -90,7 +64,7 @@ fn status_class(status: Int) -> String:
 
 fn hour_of(stamp: String) -> String:
     # 06/Jul/2026:14:03:22 — the hour sits after the first colon
-    c := scan_until(stamp, ":", 0)
+    c := stamp.index_of(":")
     if c < 0 or c + 3 > stamp.len():
         return "??"
     return stamp.substring(c + 1, c + 3)
@@ -117,10 +91,11 @@ pub fn analyze_text(text: String) -> Report:
     mut total := 0
     mut errors := 0
     mut served := 0
+    re := line_pattern() catch Regex([], [], 0)
     for line in text.split(chr(10)):
         if line.trim() == "":
             continue
-        if let h = parse_line(line):
+        if let h = parse_line(re, line):
             total = total + 1
             served = served + h.size
             cls := status_class(h.status)

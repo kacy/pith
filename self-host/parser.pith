@@ -62,11 +62,20 @@ fn _peek_ahead_kind(offset: Int) -> String:
 # position-aware AST helpers (must come after state declarations)
 # -------------------------------------------------------------
 
-# Get line and column from current token position
+# Get line and column for the node being built. nodes are added after
+# their tokens are consumed, so the just-consumed token carries the
+# right position — the upcoming token often sits on the next line,
+# which used to shift every end-of-line construct's position down one.
 fn get_current_position() -> (Int, Int):
     tc := tok_count()
     if tc == 0:
         return (0, 0)
+    mut back := current_token_position - 1
+    while back >= 0:
+        bk := tok_kind(back)
+        if bk != "comment" and bk != "newline" and bk != "indent" and bk != "dedent":
+            return (tok_line(back), tok_col(back))
+        back = back - 1
     mut i := current_token_position
     while i < tc:
         k := tok_kind(i)

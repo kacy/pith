@@ -154,7 +154,9 @@ fn cmd_check(path: String, json_mode: Bool) -> String!:
         print(c_diagnostics_to_json(diags))
     else:
         if has_errors(diags):
-            print(render_diagnostics(diags, source))
+            # diagnostics may span modules; render each against its own
+            # source so excerpts quote the right file
+            print(render_diagnostics_for_path(diags, path, source)!)
             exit(1)
         else:
             print("ok")

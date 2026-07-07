@@ -41,6 +41,10 @@ something here that now works, the page is stale and a fix to it is welcome.
   parameterized cases. the project's own suite is golden-snapshot based (see
   `tests/`).
 - **http/2** — the http stack is 1.1 only.
+- **gzip is stored-blocks only** — `std.compress.gzip` round-trips its own
+  output but implements no huffman coding: its "compressed" data is larger
+  than the input, and it cannot read gzip files produced by other tools.
+  full deflate is an open stdlib project, alongside regex.
 
 ## tooling
 

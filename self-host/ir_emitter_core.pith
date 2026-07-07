@@ -1918,10 +1918,22 @@ fn ir_emit_binary_expr(node: Node) -> Int:
     else:
         simple_op := ir_binary_simple_ir_op(op)
         if simple_op.len() > 0:
-            ir_emit_simple_binary(r, simple_op, left_r, right_r)
             if is_str_op and ir_binary_op_is_comparison(simple_op):
+                # ordered string comparison calls the runtime: the simple
+                # op would compare the two pointers, which "works" only by
+                # allocation-address luck
+                if simple_op == "lt":
+                    ir_emit_call2(r, "pith_cstring_lt", "bool", left_r, right_r)
+                elif simple_op == "lte":
+                    ir_emit_call2(r, "pith_cstring_lte", "bool", left_r, right_r)
+                elif simple_op == "gt":
+                    ir_emit_call2(r, "pith_cstring_lt", "bool", right_r, left_r)
+                else:
+                    ir_emit_call2(r, "pith_cstring_lte", "bool", right_r, left_r)
                 ir_release_owned_string_operand(node.children[0], left_r, left_type)
                 ir_release_owned_string_operand(node.children[1], right_r, right_type)
+            else:
+                ir_emit_simple_binary(r, simple_op, left_r, right_r)
         else:
             ir_emit("binop " + r.to_string() + " " + op + " " + left_r.to_string() + " " + right_r.to_string())
     return r

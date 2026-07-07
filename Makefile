@@ -616,6 +616,22 @@ sitegen-check:
 	diff -u tools/sitegen/expected/tag-memory.html "$$tmpdir/tags/memory.html" && \
 	echo "sitegen output matches golden files"
 
+# --- logscan golden check ---
+# builds the log analyzer, runs it over the sample log both plain and
+# gzipped, and diffs the report and csv export
+
+logscan-check:
+	@echo "--- logscan golden check ---"
+	@./target/release/pith build tools/logscan/logscan.pith > /dev/null
+	@tmpdir=$$(mktemp -d /tmp/pith-logscan-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	./tools/logscan/logscan tools/logscan/sample/access.log "$$tmpdir/paths.csv" | grep -v "^csv written" > "$$tmpdir/report.txt"; \
+	diff -u tools/logscan/expected/report.txt "$$tmpdir/report.txt" && \
+	diff -u tools/logscan/expected/paths.csv "$$tmpdir/paths.csv" && \
+	./tools/logscan/logscan tools/logscan/sample/access.log.gz | grep -v "^csv written" > "$$tmpdir/report_gz.txt" && \
+	diff -u tools/logscan/expected/report.txt "$$tmpdir/report_gz.txt" && \
+	echo "logscan output matches golden files"
+
 # --- cli regressions ---
 
 cli-regressions: build cli-regressions-only

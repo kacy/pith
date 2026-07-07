@@ -1,0 +1,27 @@
+# match on optionals: `none` arms and bindings that unwrap the some
+# case, mirroring if let.
+fn pick(n: Int) -> Int?:
+    if n > 0:
+        return n * 10
+    return none
+
+fn label(o: Int?) -> String:
+    match o:
+        none => "nothing"
+        v => "got " + v.to_string()
+
+fn first_word(s: String) -> String?:
+    sp := s.index_of(" ")
+    if sp < 0:
+        return none
+    return s.substring(0, sp)
+
+fn main():
+    print(label(pick(3)))
+    print(label(pick(0 - 1)))
+    match first_word("hello world"):
+        none => print("no space")
+        w => print("first: {w} len {w.len()}")
+    match first_word("single"):
+        none => print("no space")
+        w => print("first: {w}")

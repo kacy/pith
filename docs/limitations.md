@@ -14,8 +14,9 @@ something here that now works, the page is stale and a fix to it is welcome.
 - **match pattern gaps** — variant payloads construct and destructure
   (`Shape.Circle(2.0)`, `Shape.Circle(r) => r * r`, with literal sub-patterns,
   guards, and payload bindings inside or-patterns like
-  `Circle(r) | Square(r)`, and tuple patterns with bindings, wildcards, and
-  literal elements). still missing: `none` patterns in match. note a bare name in a pattern is a binding, not a variant — write
+  `Circle(r) | Square(r)`, tuple patterns with bindings, wildcards, and
+  literal elements, and `none` patterns on optional subjects — a bare
+  binding arm unwraps the some case, mirroring `if let`). note a bare name in a pattern is a binding, not a variant — write
   `Color.Red`, not `Red`, to match a variant. equality (`==`) on
   payload-carrying enums compares structurally: tags, then payloads, with
   string payloads by content and nested enums recursively; struct payloads

@@ -72,6 +72,9 @@ mut ir_map_value_types: Map[String, String] := {} # map variable name -> value t
 mut ir_boxed_enums: Map[String, Bool] := {}
 mut ir_enum_payload_kinds: Map[String, String] := {} # "Shape.Circle" -> "float,string"
 mut ir_enum_variant_lists: Map[String, String] := {} # "Shape" -> "Circle,Square"
+# checked tid of the innermost match subject, for tuple-pattern element
+# types; set by the match emitters before lowering arms
+mut ir_match_subject_tid := 0 - 1
 
 # rc-managed locals owned by the current function, in binding order, with a
 # parallel kind list (string/list/map/set). collected by a pre-pass before
@@ -5001,6 +5004,7 @@ fn ir_emit_match_arm_return(body_idx: Int):
 fn ir_emit_match_return(idx: Int, node: Node):
     subj_r := ir_expr(node.children[0])
     subj_type := ir_checked_type(node.children[0])
+    ir_match_subject_tid = c_get_expr_type(node.children[0])
     mut i := 1
     while i < node.children.len():
         arm := get_node(node.children[i])
@@ -5101,10 +5105,42 @@ fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
             acc_r = or_r
             k = k + 1
         return acc_r
-    # pat_none and pat_tuple are not lowered yet.
+    if pat.kind == "pat_tuple":
+        # each element loads its slot and recurses into the ordinary
+        # pattern machinery; bindings and wildcards match anything
+        elems := ir_match_tuple_element_kinds(pat.children.len())
+        acc_r := ir_reg()
+        ir_emit("iconst " + acc_r.to_string() + " 1")
+        mut out_r := acc_r
+        for sub_idx, i in pat.children:
+            sub := get_node(sub_idx)
+            if sub.kind == "pat_binding" or sub.kind == "pat_wildcard":
+                continue
+            elem_r := ir_reg()
+            ir_emit("field " + elem_r.to_string() + " " + subj_r.to_string() + " " + (i * 8).to_string() + " " + elems[i] + " __t" + i.to_string())
+            sub_r := ir_emit_match_cond(sub_idx, elem_r)
+            and_r := ir_reg()
+            ir_emit("and " + and_r.to_string() + " " + out_r.to_string() + " " + sub_r.to_string())
+            out_r = and_r
+        return out_r
+    # pat_none is not lowered yet.
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " 0")
     return r
+
+# element kind names for the current match subject's tuple type;
+# "unknown" per element when the subject isn't a known tuple
+fn ir_match_tuple_element_kinds(count: Int) -> List[String]:
+    mut out: List[String] := []
+    info := get_type_info(ir_match_subject_tid)
+    mut i := 0
+    while i < count:
+        if info.kind == "tuple" and i < info.elements.len():
+            out.push(ir_type_from_tid(info.elements[i]))
+        else:
+            out.push("unknown")
+        i = i + 1
+    return out
 
 fn ir_variant_enum_name(variant_key: String) -> String:
     mut i := 0
@@ -5173,6 +5209,18 @@ fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
             k = k + 1
         ir_emit_label(done_l)
         return
+    if pat.kind == "pat_tuple":
+        elems := ir_match_tuple_element_kinds(pat.children.len())
+        for sub_idx, i in pat.children:
+            sub := get_node(sub_idx)
+            if sub.kind == "pat_binding":
+                elem_r := ir_reg()
+                ir_emit("field " + elem_r.to_string() + " " + subj_r.to_string() + " " + (i * 8).to_string() + " " + elems[i] + " " + sub.value)
+                ir_var_regs.insert(sub.value, elem_r)
+                if elems[i] != "unknown":
+                    ir_var_types.insert(sub.value, elems[i])
+                ir_emit("store " + sub.value + " " + elem_r.to_string())
+        return
     if pat.kind == "pat_binding":
         ir_var_regs.insert(pat.value, subj_r)
         if subj_type.len() > 0:
@@ -5215,6 +5263,7 @@ fn ir_emit_match_arm_body(body_idx: Int, result_temp: String):
 fn ir_emit_match_expr(idx: Int, node: Node) -> Int:
     subj_r := ir_expr(node.children[0])
     subj_type := ir_checked_type(node.children[0])
+    ir_match_subject_tid = c_get_expr_type(node.children[0])
     result_temp := ir_new_temp_name("match")
     end_l := ir_label()
     mut i := 1

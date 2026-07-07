@@ -4350,6 +4350,13 @@ fn collect_arm_pattern_bindings(pat: Node) -> String:
         return pat.value
     if pat.kind == "pat_string":
         return pat.value
+    if pat.kind == "pat_tuple":
+        # a tuple of bindings and wildcards matches anything
+        for sub_idx in pat.children:
+            sub := get_node(sub_idx)
+            if sub.kind != "pat_binding" and sub.kind != "pat_wildcard":
+                return ""
+        return "_"
     return ""
 
 fn check_match_exhaustiveness(subject_type: Int, arm_values: List[String], node_idx: Int):

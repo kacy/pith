@@ -1,11 +1,48 @@
 # checker_type_intern.pith — shared generic type interning
 
-from types import ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, get_type_count, register_type_name, lookup_type_id, get_type_name
+from types import ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, get_type_count, register_type_name, lookup_type_id, get_type_name, get_type_info
+
+# interning keys must name the type unambiguously. display names print
+# unnamed composites bare ("List", "fn"), which once merged
+# List[List[Int]] and List[List[String]] into one interned id when two
+# modules built them in the wrong order — so the key spells nested
+# structure out fully.
+fn intern_key_name(tid: Int) -> String:
+    info := get_type_info(tid)
+    if info.kind == "list":
+        return "List[" + intern_key_name(info.inner) + "]"
+    if info.kind == "set":
+        return "Set[" + intern_key_name(info.inner) + "]"
+    if info.kind == "task":
+        return "Task[" + intern_key_name(info.inner) + "]"
+    if info.kind == "channel":
+        return "Channel[" + intern_key_name(info.inner) + "]"
+    if info.kind == "map":
+        return "Map[" + intern_key_name(info.key_type) + "," + intern_key_name(info.value_type) + "]"
+    if info.kind == "optional":
+        return intern_key_name(info.inner) + "?"
+    if info.kind == "result":
+        return intern_key_name(info.value_type) + "!" + intern_key_name(info.inner)
+    if info.kind == "tuple":
+        mut out := "("
+        for e, i in info.elements:
+            if i > 0:
+                out = out + ","
+            out = out + intern_key_name(e)
+        return out + ")"
+    if info.kind == "function":
+        mut out := "fn("
+        for pt, i in info.param_types:
+            if i > 0:
+                out = out + ","
+            out = out + intern_key_name(pt)
+        return out + ")->" + intern_key_name(info.return_type)
+    return get_type_name(tid)
 
 fn build_collection_type_name(base: String, key_or_elem: Int, val: Int) -> String:
     if val < 0:
-        return base + "[" + get_type_name(key_or_elem) + "]"
-    return base + "[" + get_type_name(key_or_elem) + "," + get_type_name(val) + "]"
+        return base + "[" + intern_key_name(key_or_elem) + "]"
+    return base + "[" + intern_key_name(key_or_elem) + "," + intern_key_name(val) + "]"
 
 pub fn intern_list_type(elem: Int) -> Int:
     name := build_collection_type_name("List", elem, -1)

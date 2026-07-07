@@ -3,6 +3,7 @@
 import std.fs as fs
 import std.toml as toml
 import std.json as json
+import std.regex as regex
 
 ## one rendered post: parsed front matter plus the body as html.
 pub struct Post:
@@ -27,6 +28,7 @@ pub fn split_front_matter(raw: String) -> (Map[String, String], String):
     lines := raw.split(chr(10))
     if lines.len() == 0 or lines[0].trim() != "---":
         return (meta, raw)
+    kv := regex.compile("^([^:]+): *(.*)$") catch Regex([], [], 0)
     mut body_start := 0
     mut i := 1
     while i < lines.len():
@@ -35,9 +37,8 @@ pub fn split_front_matter(raw: String) -> (Map[String, String], String):
             body_start = i + 1
             i = lines.len()
         else:
-            sep := line.index_of(":")
-            if sep > 0:
-                meta.insert(line.substring(0, sep).trim(), line.substring(sep + 1, line.len()).trim())
+            if let c = kv.captures(line):
+                meta.insert(c[1].trim(), c[2])
             i = i + 1
     mut body := ""
     mut j := body_start

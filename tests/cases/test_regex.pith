@@ -1,0 +1,53 @@
+# the regex engine: matching, captures, find_all, replace_all across
+# the supported syntax.
+import std.regex as regex
+
+fn check(pattern: String, input: String, want: Bool) -> Int:
+    re := regex.compile(pattern) catch Regex([], [], 0)
+    if re.is_match(input) == want:
+        return 1
+    print("MISMATCH /{pattern}/ on '{input}'")
+    return 0
+
+fn main() -> Int!:
+    mut ok := 0
+    ok = ok + check("abc", "xxabcxx", true)
+    ok = ok + check("abc", "abx", false)
+    ok = ok + check("a.c", "abc", true)
+    ok = ok + check("^abc", "abcde", true)
+    ok = ok + check("^abc", "xabc", false)
+    ok = ok + check("abc$", "xxabc", true)
+    ok = ok + check("abc$", "abcx", false)
+    ok = ok + check("ab+c", "abbbc", true)
+    ok = ok + check("ab+c", "ac", false)
+    ok = ok + check("ab?c", "ac", true)
+    ok = ok + check("ab?c", "abbc", false)
+    ok = ok + check("[a-z]+", "HELLO there", true)
+    ok = ok + check("[^a-z]+", "abc", false)
+    ok = ok + check("cat|dog", "hotdog", true)
+    ok = ok + check("cat|dog", "bird", false)
+    ok = ok + check("(ab)+", "ababab", true)
+    ok = ok + check("\\d+", "no 123 here", true)
+    ok = ok + check("^(a|b)*$", "abba", true)
+    ok = ok + check("^(a|b)*$", "abca", false)
+    print("matcher: {ok} of 19")
+
+    re := regex.compile("(\\w+)@(\\w+)")!
+    if let c = re.captures("write to kacy@example today"):
+        print("captures: {c[0]} {c[1]} {c[2]}")
+
+    dates := regex.compile("(\\d\\d\\d\\d)-(\\d\\d)-(\\d\\d)")!
+    for m in dates.find_all("2026-07-07 then 2026-01-15 end"):
+        print("date: {m.text} at {m.start}")
+
+    vowels := regex.compile("[aeiou]+")!
+    print(vowels.replace_all("the quick brown fox", "_"))
+
+    greedy := regex.compile("a+")!
+    if let g = greedy.find("baaad"):
+        print("greedy: [{g.start},{g.stop}) {g.text}")
+
+    bad := regex.compile("(unclosed")
+    if bad.is_err:
+        print("compile error: {bad.err}")
+    return 0

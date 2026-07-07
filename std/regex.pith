@@ -1,0 +1,473 @@
+# std/regex — a small regular expression engine.
+#
+# the matcher is a pike vm: the pattern compiles to bytecode and the
+# vm advances every live thread one input character at a time, so
+# matching is linear in the input for any pattern — there is no
+# backtracking to go pathological.
+#
+# supported: literals, `.` (any char but newline), classes [a-z0-9]
+# and [^...], escapes \d \w \s \D \W \S \t \n and escaped metas,
+# quantifiers * + ? (greedy), alternation |, capturing groups (...),
+# and anchors ^ $. not supported: {n,m} counts, lazy quantifiers,
+# backreferences, lookaround.
+
+# instruction opcodes
+OP_CHAR := 0
+OP_ANY := 1
+OP_CLASS := 2
+OP_SPLIT := 3
+OP_JMP := 4
+OP_SAVE := 5
+OP_MATCH := 6
+OP_BOL := 7
+OP_EOL := 8
+
+## one compiled instruction: an opcode and up to two arguments.
+pub struct Inst:
+    op: Int
+    a: Int
+    b: Int
+
+## a character class: flat lo,hi code pairs, optionally negated.
+pub struct ClassDef:
+    ranges: List[Int]
+    negate: Bool
+
+## a compiled pattern, ready to match.
+pub struct Regex:
+    insts: List[Inst]
+    classes: List[ClassDef]
+    ngroups: Int
+
+## one match: the half-open [start, stop) range and its text.
+pub struct Match:
+    start: Int
+    stop: Int
+    text: String
+
+# --- pattern parsing and compilation ------------------------------------
+# the parser walks the pattern once, emitting instructions as it goes
+# and patching split/jmp targets after each fragment's size is known.
+
+struct Compiler:
+    pattern: String
+    pos: Int
+    insts: List[Inst]
+    classes: List[ClassDef]
+    ngroups: Int
+    error: String
+
+fn c_peek(c: Compiler) -> String:
+    if c.pos >= c.pattern.len():
+        return ""
+    return c.pattern[c.pos]
+
+fn c_emit(c: Compiler, op: Int, a: Int, b: Int) -> Int:
+    c.insts.push(Inst(op, a, b))
+    return c.insts.len() - 1
+
+fn c_fail(c: Compiler, msg: String):
+    if c.error == "":
+        c.error = msg + " at position " + c.pos.to_string()
+
+# alternation: concat ('|' concat)*
+fn parse_alt(c: Compiler):
+    start := c.insts.len()
+    parse_concat(c)
+    if c_peek(c) != "|":
+        return
+    # wrap the finished branch: insert a split before it and a jmp
+    # after it, then chain further branches
+    mut branch_starts: List[Int] := [start]
+    mut jmp_slots: List[Int] := []
+    while c_peek(c) == "|" and c.error == "":
+        c.pos = c.pos + 1
+        # close the previous branch with a jmp-to-end placeholder
+        jmp_slots.push(c_emit(c, OP_JMP, 0 - 1, 0))
+        branch_starts.push(c.insts.len())
+        parse_concat(c)
+    # stitch: before each branch except the last, a split must have
+    # offered "this branch or the rest". we rebuild by inserting split
+    # instructions was avoided — instead we emitted linearly, so now
+    # thread the splits through the jmp placeholders.
+    mut i := 0
+    while i + 1 < branch_starts.len():
+        insert_split(c, branch_starts[i], branch_starts[i + 1])
+        i = i + 1
+    end_pc := c.insts.len()
+    for slot in jmp_slots:
+        # each placeholder shifted once per split inserted before it
+        fixed := find_jmp_placeholder(c, slot, branch_starts.len() - 1)
+        c.insts[fixed] = Inst(OP_JMP, end_pc, 0)
+
+fn find_jmp_placeholder(c: Compiler, original: Int, inserted: Int) -> Int:
+    # placeholders were recorded before splits were inserted ahead of
+    # them; every insertion at or before the slot shifts it by one
+    mut idx := original + inserted
+    while idx >= 0:
+        if idx < c.insts.len():
+            inst := c.insts[idx]
+            if inst.op == OP_JMP and inst.a == 0 - 1:
+                return idx
+        idx = idx - 1
+    return original
+
+fn insert_split(c: Compiler, at: Int, alt_target: Int):
+    # insert OP_SPLIT at index `at`; all targets >= at shift by one
+    mut fixed: List[Inst] := []
+    mut i := 0
+    while i < c.insts.len():
+        inst := c.insts[i]
+        mut a := inst.a
+        mut b := inst.b
+        if inst.op == OP_JMP or inst.op == OP_SPLIT:
+            if a >= at:
+                a = a + 1
+            if inst.op == OP_SPLIT and b >= at:
+                b = b + 1
+        fixed.push(Inst(inst.op, a, b))
+        i = i + 1
+    mut alt := alt_target
+    if alt >= at:
+        alt = alt + 1
+    mut out: List[Inst] := []
+    mut j := 0
+    while j < fixed.len():
+        if j == at:
+            out.push(Inst(OP_SPLIT, at + 1, alt))
+        out.push(fixed[j])
+        j = j + 1
+    if at == fixed.len():
+        out.push(Inst(OP_SPLIT, at + 1, alt))
+    c.insts = out
+
+fn parse_concat(c: Compiler):
+    while c.error == "":
+        ch := c_peek(c)
+        if ch == "" or ch == "|" or ch == ")":
+            return
+        parse_repeat(c)
+
+fn parse_repeat(c: Compiler):
+    atom_start := c.insts.len()
+    parse_atom(c)
+    if c.error != "":
+        return
+    ch := c_peek(c)
+    if ch == "*":
+        c.pos = c.pos + 1
+        # split(body, out) before atom; jmp back after
+        insert_split(c, atom_start, 0)
+        jmp_pc := c_emit(c, OP_JMP, atom_start, 0)
+        # split's alternative exits past the jmp
+        c.insts[atom_start] = Inst(OP_SPLIT, atom_start + 1, jmp_pc + 1)
+    elif ch == "+":
+        c.pos = c.pos + 1
+        split_pc := c_emit(c, OP_SPLIT, atom_start, 0)
+        c.insts[split_pc] = Inst(OP_SPLIT, atom_start, split_pc + 1)
+    elif ch == "?":
+        c.pos = c.pos + 1
+        insert_split(c, atom_start, 0)
+        end_pc := c.insts.len()
+        c.insts[atom_start] = Inst(OP_SPLIT, atom_start + 1, end_pc)
+
+fn parse_atom(c: Compiler):
+    ch := c_peek(c)
+    if ch == "(":
+        c.pos = c.pos + 1
+        group := c.ngroups
+        c.ngroups = c.ngroups + 1
+        c_emit(c, OP_SAVE, group * 2, 0)
+        parse_alt(c)
+        if c_peek(c) != ")":
+            c_fail(c, "unclosed group")
+            return
+        c.pos = c.pos + 1
+        c_emit(c, OP_SAVE, group * 2 + 1, 0)
+        return
+    if ch == "[":
+        parse_class(c)
+        return
+    if ch == ".":
+        c.pos = c.pos + 1
+        c_emit(c, OP_ANY, 0, 0)
+        return
+    if ch == "^":
+        c.pos = c.pos + 1
+        c_emit(c, OP_BOL, 0, 0)
+        return
+    if ch == "$":
+        c.pos = c.pos + 1
+        c_emit(c, OP_EOL, 0, 0)
+        return
+    if ch == chr(92):
+        c.pos = c.pos + 1
+        esc := c_peek(c)
+        if esc == "":
+            c_fail(c, "trailing backslash")
+            return
+        c.pos = c.pos + 1
+        emit_escape(c, esc)
+        return
+    if ch == "*" or ch == "+" or ch == "?":
+        c_fail(c, "quantifier with nothing to repeat")
+        return
+    c.pos = c.pos + 1
+    c_emit(c, OP_CHAR, ord(ch), 0)
+
+fn emit_escape(c: Compiler, esc: String):
+    if esc == "d" or esc == "D":
+        c_emit(c, OP_CLASS, add_class(c, [48, 57], esc == "D"), 0)
+        return
+    if esc == "w" or esc == "W":
+        c_emit(c, OP_CLASS, add_class(c, [48, 57, 65, 90, 97, 122, 95, 95], esc == "W"), 0)
+        return
+    if esc == "s" or esc == "S":
+        c_emit(c, OP_CLASS, add_class(c, [32, 32, 9, 10, 13, 13], esc == "S"), 0)
+        return
+    if esc == "t":
+        c_emit(c, OP_CHAR, 9, 0)
+        return
+    if esc == "n":
+        c_emit(c, OP_CHAR, 10, 0)
+        return
+    c_emit(c, OP_CHAR, ord(esc), 0)
+
+fn add_class(c: Compiler, ranges: List[Int], negate: Bool) -> Int:
+    c.classes.push(ClassDef(ranges, negate))
+    return c.classes.len() - 1
+
+fn parse_class(c: Compiler):
+    c.pos = c.pos + 1
+    mut negate := false
+    if c_peek(c) == "^":
+        negate = true
+        c.pos = c.pos + 1
+    mut ranges: List[Int] := []
+    mut closed := false
+    while c.pos < c.pattern.len() and not closed:
+        ch := c_peek(c)
+        if ch == "]":
+            c.pos = c.pos + 1
+            closed = true
+        elif ch == chr(92):
+            c.pos = c.pos + 1
+            esc := c_peek(c)
+            c.pos = c.pos + 1
+            if esc == "d":
+                ranges.push(48)
+                ranges.push(57)
+            elif esc == "w":
+                ranges.push(48)
+                ranges.push(57)
+                ranges.push(65)
+                ranges.push(90)
+                ranges.push(97)
+                ranges.push(122)
+                ranges.push(95)
+                ranges.push(95)
+            elif esc == "s":
+                ranges.push(32)
+                ranges.push(32)
+                ranges.push(9)
+                ranges.push(10)
+                ranges.push(13)
+                ranges.push(13)
+            elif esc == "t":
+                ranges.push(9)
+                ranges.push(9)
+            elif esc == "n":
+                ranges.push(10)
+                ranges.push(10)
+            else:
+                ranges.push(ord(esc))
+                ranges.push(ord(esc))
+        else:
+            lo := ord(ch)
+            c.pos = c.pos + 1
+            if c_peek(c) == "-" and c.pos + 1 < c.pattern.len() and c.pattern[c.pos + 1] != "]":
+                c.pos = c.pos + 1
+                hi := ord(c_peek(c))
+                c.pos = c.pos + 1
+                if hi < lo:
+                    c_fail(c, "reversed class range")
+                    return
+                ranges.push(lo)
+                ranges.push(hi)
+            else:
+                ranges.push(lo)
+                ranges.push(lo)
+    if not closed:
+        c_fail(c, "unclosed class")
+        return
+    c_emit(c, OP_CLASS, add_class(c, ranges, negate), 0)
+
+## compile a pattern; errors carry the offending position.
+pub fn compile(pattern: String) -> Regex!:
+    mut insts: List[Inst] := []
+    mut classes: List[ClassDef] := []
+    c := Compiler(pattern, 0, insts, classes, 1, "")
+    c_emit(c, OP_SAVE, 0, 0)
+    parse_alt(c)
+    if c.error == "" and c.pos < c.pattern.len():
+        c_fail(c, "unexpected character '" + c_peek(c) + "'")
+    if c.error != "":
+        fail c.error
+    c_emit(c, OP_SAVE, 1, 0)
+    c_emit(c, OP_MATCH, 0, 0)
+    return Regex(c.insts, c.classes, c.ngroups)
+
+# --- the pike vm ---------------------------------------------------------
+
+fn class_matches(cd: ClassDef, code: Int) -> Bool:
+    mut hit := false
+    mut i := 0
+    while i + 1 < cd.ranges.len() and not hit:
+        if code >= cd.ranges[i] and code <= cd.ranges[i + 1]:
+            hit = true
+        i = i + 2
+    if cd.negate:
+        return not hit
+    return hit
+
+# add a thread (and everything reachable through control instructions)
+# to the next thread list. `seen` dedupes by pc: the first arrival wins,
+# which preserves greedy priority because callers add in priority order.
+fn add_thread(re: Regex, list_pcs: List[Int], list_slots: List[List[Int]], seen: Set[Int], pc: Int, slots: List[Int], pos: Int, input_len: Int):
+    if seen.contains(pc):
+        return
+    seen.add(pc)
+    inst := re.insts[pc]
+    if inst.op == OP_JMP:
+        add_thread(re, list_pcs, list_slots, seen, inst.a, slots, pos, input_len)
+        return
+    if inst.op == OP_SPLIT:
+        add_thread(re, list_pcs, list_slots, seen, inst.a, slots, pos, input_len)
+        add_thread(re, list_pcs, list_slots, seen, inst.b, slots, pos, input_len)
+        return
+    if inst.op == OP_SAVE:
+        mut copied: List[Int] := []
+        for v in slots:
+            copied.push(v)
+        while copied.len() <= inst.a:
+            copied.push(0 - 1)
+        copied[inst.a] = pos
+        add_thread(re, list_pcs, list_slots, seen, pc + 1, copied, pos, input_len)
+        return
+    if inst.op == OP_BOL:
+        if pos == 0:
+            add_thread(re, list_pcs, list_slots, seen, pc + 1, slots, pos, input_len)
+        return
+    if inst.op == OP_EOL:
+        if pos == input_len:
+            add_thread(re, list_pcs, list_slots, seen, pc + 1, slots, pos, input_len)
+        return
+    list_pcs.push(pc)
+    list_slots.push(slots)
+
+# run the vm from one starting offset. returns capture slots or an
+# empty list when no match starts here.
+fn run_from(re: Regex, input: String, start: Int) -> List[Int]:
+    mut cur_pcs: List[Int] := []
+    mut cur_slots: List[List[Int]] := []
+    mut seen: Set[Int] := {}
+    mut init: List[Int] := []
+    n := input.len()
+    add_thread(re, cur_pcs, cur_slots, seen, 0, init, start, n)
+    mut best: List[Int] := []
+    mut pos := start
+    while cur_pcs.len() > 0:
+        mut next_pcs: List[Int] := []
+        mut next_slots: List[List[Int]] := []
+        mut next_seen: Set[Int] := {}
+        mut code := 0 - 1
+        if pos < n:
+            code = ord(input[pos])
+        mut t := 0
+        mut matched_this_round := false
+        while t < cur_pcs.len() and not matched_this_round:
+            inst := re.insts[cur_pcs[t]]
+            slots := cur_slots[t]
+            if inst.op == OP_MATCH:
+                # highest-priority thread that matched at this length;
+                # later threads are lower priority, stop scanning them
+                best = slots
+                matched_this_round = true
+            elif inst.op == OP_CHAR:
+                if code == inst.a:
+                    add_thread(re, next_pcs, next_slots, next_seen, cur_pcs[t] + 1, slots, pos + 1, n)
+            elif inst.op == OP_ANY:
+                if code >= 0 and code != 10:
+                    add_thread(re, next_pcs, next_slots, next_seen, cur_pcs[t] + 1, slots, pos + 1, n)
+            elif inst.op == OP_CLASS:
+                if code >= 0 and class_matches(re.classes[inst.a], code):
+                    add_thread(re, next_pcs, next_slots, next_seen, cur_pcs[t] + 1, slots, pos + 1, n)
+            t = t + 1
+        cur_pcs = next_pcs
+        cur_slots = next_slots
+        pos = pos + 1
+        if pos > n and cur_pcs.len() == 0:
+            return best
+    return best
+
+impl Regex:
+    ## true when the pattern matches anywhere in the input.
+    pub fn is_match(input: String) -> Bool:
+        return self.find(input) != none
+
+    ## the leftmost match, or none.
+    pub fn find(input: String) -> Match?:
+        mut start := 0
+        while start <= input.len():
+            slots := run_from(self, input, start)
+            if slots.len() >= 2:
+                return Match(slots[0], slots[1], input.substring(slots[0], slots[1]))
+            start = start + 1
+        return none
+
+    ## capture groups of the leftmost match: index 0 is the whole
+    ## match, then one entry per group (empty string when unmatched).
+    pub fn captures(input: String) -> List[String]?:
+        mut start := 0
+        while start <= input.len():
+            slots := run_from(self, input, start)
+            if slots.len() >= 2:
+                mut out: List[String] := []
+                mut g := 0
+                while g < self.ngroups:
+                    lo_i := g * 2
+                    hi_i := g * 2 + 1
+                    if hi_i < slots.len() and slots[lo_i] >= 0 and slots[hi_i] >= slots[lo_i]:
+                        out.push(input.substring(slots[lo_i], slots[hi_i]))
+                    else:
+                        out.push("")
+                    g = g + 1
+                return out
+            start = start + 1
+        return none
+
+    ## every non-overlapping match, left to right.
+    pub fn find_all(input: String) -> List[Match]:
+        mut out: List[Match] := []
+        mut start := 0
+        while start <= input.len():
+            slots := run_from(self, input, start)
+            if slots.len() >= 2:
+                stop := slots[1]
+                out.push(Match(slots[0], stop, input.substring(slots[0], stop)))
+                if stop == slots[0]:
+                    start = stop + 1
+                else:
+                    start = stop
+            else:
+                start = start + 1
+        return out
+
+    ## replace every match with the replacement text.
+    pub fn replace_all(input: String, replacement: String) -> String:
+        mut out := ""
+        mut last := 0
+        for m in self.find_all(input):
+            out = out + input.substring(last, m.start) + replacement
+            last = m.stop
+        return out + input.substring(last, input.len())

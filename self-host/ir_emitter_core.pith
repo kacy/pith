@@ -37,6 +37,7 @@ from checker import c_get_expr_type, struct_instance_base_name, struct_instance_
 from types import TypeInfo, get_type_info, get_type_name
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
+from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
@@ -69,9 +70,8 @@ mut ir_map_value_types: Map[String, String] := {} # map variable name -> value t
 # enums with at least one payload-carrying variant are boxed: a value is a
 # heap struct with the tag in slot 0 and payload values in slots 1..n.
 # payload-free enums stay plain integer tags.
-mut ir_boxed_enums: Map[String, Bool] := {}
-mut ir_enum_payload_kinds: Map[String, String] := {} # "Shape.Circle" -> "float,string"
-mut ir_enum_variant_lists: Map[String, String] := {} # "Shape" -> "Circle,Square"
+
+
 # checked tid of the innermost match subject, for tuple-pattern element
 # types; set by the match emitters before lowering arms
 mut ir_match_subject_tid := 0 - 1
@@ -98,13 +98,11 @@ mut ir_global_set_int_names: List[String] := []
 mut ir_global_bool_names: List[String] := []
 
 # --- type and symbol metadata copied from the checker ---
-mut ir_struct_names: Map[String, Int] := {} # struct name -> field count
+
 mut ir_local_struct_names: List[String] := [] # structs declared by this module
 mut ir_dtor_memo: Map[String, Int] := {} # 1 needs dtor, 2 no/undecided
-mut ir_struct_field_lookup: Map[String, String] := {} # "Struct.field" -> field type
-mut ir_struct_field_index_lookup: Map[String, String] := {} # "Struct.field" -> field index string
-mut ir_struct_decl_nodes: Map[String, Int] := {} # struct name -> declaration node idx
-mut ir_struct_field_default_nodes: Map[String, Int] := {} # "Struct.field" -> default expr node idx
+
+
 mut ir_type_aliases: Map[String, String] := {} # alias name -> target type
 mut ir_last_was_ret := false # tracks if the last emitted instruction was a return
 mut ir_func_returns: Map[String, String] := {} # function name -> return type hint
@@ -475,23 +473,6 @@ fn ir_string_retain_reg(r: Int):
 fn ir_string_release_reg(r: Int):
     ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
 
-# collections are shared handles with real refcounts; strings are
-# copy-on-derive with a header count. one kind tag picks the operation.
-# true when a struct owns rc fields (directly or through nested structs):
-# those types get a generated destructor that releases the fields at the
-# struct's final release.
-# a specialized generic name (Bucket[Int]) shares its base layout and
-# destructor: field kinds come from the declared layout, so a T-typed
-# field is never released (a bounded leak on rc payloads, never a wild
-# pointer)
-fn ir_struct_base_name(sname: String) -> String:
-    if sname.len() == 0:
-        return sname
-    bracket := sname.index_of("[")
-    if bracket >= 0:
-        return sname.substring(0, bracket)
-    return sname
-
 fn ir_struct_needs_dtor(raw_name: String) -> Bool:
     sname := ir_struct_base_name(raw_name)
     if ir_dtor_memo.contains_key(sname):
@@ -523,29 +504,6 @@ fn ir_rc_field_kind(ftype: String) -> String:
             return "struct"
     return ""
 
-fn ir_rc_kind(type_hint: String) -> String:
-    if type_hint == "string":
-        return "string"
-    if type_hint == "list" or type_hint == "list_string":
-        return "list"
-    if type_hint == "map" or type_hint == "map_int":
-        return "map"
-    if type_hint == "set" or type_hint == "set_int":
-        return "set"
-    if type_hint == "bytes":
-        return "bytes"
-    # every struct is releasable: the header-carrying allocation frees at
-    # the last count, and types with rc fields additionally run their
-    # generated destructor. checked types carry the bare name; emission
-    # hints carry the struct: prefix.
-    if type_hint.starts_with("struct:"):
-        return "struct"
-    if ir_struct_names.contains_key(ir_struct_base_name(type_hint)):
-        return "struct"
-    return ""
-
-# every rc kind releases: strings via their header count, collections via
-# the shared-handle count with a free-time element cascade.
 fn ir_rc_release_enabled(kind: String) -> Bool:
     return kind.len() > 0
 
@@ -1247,17 +1205,6 @@ fn ir_call_retkind_for_name(idx: Int, uses_result_abi: Bool, callee_name: String
             return declared_kind
     return ir_call_retkind(idx, uses_result_abi)
 
-fn ir_known_struct_return_type(fname: String) -> String:
-    if ir_struct_names.contains_key(fname):
-        return fname
-    if fname == "get_node":
-        return "Node"
-    if fname == "advance_token" or fname == "expect":
-        return "Token"
-    if fname == "ti_primitive" or fname == "ti_struct" or fname == "ti_enum" or fname == "ti_function" or fname == "ti_optional" or fname == "ti_result" or fname == "ti_tuple" or fname == "ti_list" or fname == "ti_map" or fname == "ti_set" or fname == "ti_task" or fname == "ti_channel" or fname == "get_type_info":
-        return "TypeInfo"
-    return ""
-
 fn ir_known_callable_return_type(fname: String) -> String:
     struct_type := ir_known_struct_return_type(fname)
     if struct_type.len() > 0:
@@ -1791,17 +1738,6 @@ fn ir_emit_unary_expr(node: Node) -> Int:
     operand_r := ir_expr(node.children[0])
     return ir_emit_unary_op(node.value, operand_r)
 
-# the boxed-enum name for an eq/neq node, or "" when neither side is
-# one. checked types name enums; the emitter's own inference doesn't.
-fn ir_binary_enum_eq_name(node: Node) -> String:
-    left_name := get_type_name(c_get_expr_type(node.children[0]))
-    if ir_boxed_enums.contains_key(left_name):
-        return left_name
-    right_name := get_type_name(c_get_expr_type(node.children[1]))
-    if ir_boxed_enums.contains_key(right_name):
-        return right_name
-    return ""
-
 fn ir_emit_binary_neq(result_reg: Int, left_r: Int, right_r: Int, is_str_op: Bool, is_bytes_op: Bool):
     if is_str_op:
         eq_r := ir_reg()
@@ -2146,9 +2082,6 @@ fn ir_emit_toml_nested_decode_path_specialized(handle_r: Int, key_r: Int, target
     decode_name := ir_toml_generic_name("decode", module_path)
     return ir_emit_nested_decode_path(handle_r, key_r, target_tid, ir_resolve_generic_module_call_name(module_path, "toml_require_table"), decode_name, "toml_nested_decode")
 
-fn ir_struct_has_default_fields(target_info: TypeInfo) -> Bool:
-    return ir_struct_has_default_fields_with_state(target_info, ir_struct_field_default_nodes)
-
 fn ir_emit_result_ok_field_typed(result_r: Int, field_type_name: String) -> Int:
     return ir_emit_result_ok_field_typed_with_state(result_r, field_type_name, ir_type_aliases, ir_struct_names)
 
@@ -2170,20 +2103,8 @@ fn ir_emit_config_field_key(field_name: String, prefix_r: Int, index_idx: Int) -
     ir_emit_call2(full_key_r, ir_resolve_config_call_name(index_idx, "dotted_key"), "string", prefix_r, key_r)
     return full_key_r
 
-fn ir_struct_field_count(struct_name: String) -> Int:
-    return ir_struct_field_count_with_state(struct_name, ir_struct_names)
-
-fn ir_struct_field_name_at(struct_name: String, field_index: Int) -> String:
-    return ir_struct_field_name_at_with_state(struct_name, field_index, ir_struct_names, ir_struct_field_index_lookup)
-
-fn ir_struct_field_type_name(struct_name: String, field_name: String) -> String:
-    return ir_struct_field_type_name_with_state(struct_name, field_name, ir_struct_names, ir_struct_field_lookup)
-
 fn ir_struct_field_tid_at(struct_name: String, field_index: Int, fallback_tid: Int) -> Int:
     return ir_struct_field_tid_at_with_state(struct_name, field_index, fallback_tid, ir_struct_names, ir_struct_decl_nodes, ir_struct_field_index_lookup, ir_struct_field_lookup, ir_type_aliases)
-
-fn ir_struct_field_default_node(struct_name: String, field_name: String) -> Int:
-    return ir_struct_field_default_node_with_state(struct_name, field_name, ir_struct_names, ir_struct_field_default_nodes)
 
 fn ir_emit_config_specialized_field_key(field_name: String, prefix_r: Int) -> Int:
     key_r := ir_reg()

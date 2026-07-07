@@ -1,0 +1,196 @@
+# logscan_lib — parse web access logs and build a traffic report. the
+# second dogfood program: it leans on the stdlib surfaces sitegen
+# didn't touch — gzip decompression, per-character scanning of the
+# combined log format, tabular aggregation, and csv export.
+import std.fs as fs
+import std.bytes as bytes
+import std.compress.gzip as gzip
+import std.data.table as table
+
+## one parsed access-log line.
+pub struct Hit:
+    ip: String
+    stamp: String
+    method: String
+    path: String
+    status: Int
+    size: Int
+    millis: Int
+
+## the whole analysis: parsed hits plus the derived aggregates the
+## report and csv export read.
+pub struct Report:
+    total: Int
+    parse_errors: Int
+    bytes_served: Int
+    by_class: Map[String, Int]
+    by_path_hits: Map[String, Int]
+    by_path_millis: Map[String, Int]
+    by_hour: Map[String, Int]
+
+# --- line parsing ------------------------------------------------------
+# combined-log-ish format:
+#   127.0.0.1 - - [06/Jul/2026:14:03:22] "GET /path HTTP/1.1" 200 512 45
+
+fn scan_until(line: String, stop: String, start: Int) -> Int:
+    mut i := start
+    while i < line.len():
+        if line[i] == stop:
+            return i
+        i = i + 1
+    return -1
+
+## parse one log line; none when the line is malformed.
+pub fn parse_line(line: String) -> Hit?:
+    sp1 := scan_until(line, " ", 0)
+    if sp1 < 0:
+        return none
+    ip := line.substring(0, sp1)
+
+    lb := scan_until(line, "[", sp1)
+    if lb < 0:
+        return none
+    rb := scan_until(line, "]", lb)
+    if rb < 0:
+        return none
+    stamp := line.substring(lb + 1, rb)
+
+    q1 := scan_until(line, chr(34), rb)
+    if q1 < 0:
+        return none
+    q2 := scan_until(line, chr(34), q1 + 1)
+    if q2 < 0:
+        return none
+    request := line.substring(q1 + 1, q2)
+    req_parts := request.split(" ")
+    if req_parts.len() < 2:
+        return none
+    method := req_parts[0]
+    path := req_parts[1]
+
+    tail := line.substring(q2 + 1, line.len()).trim()
+    tail_parts := tail.split(" ")
+    if tail_parts.len() < 3:
+        return none
+    status := parse_int(tail_parts[0]) catch -1
+    size := parse_int(tail_parts[1]) catch 0
+    millis := parse_int(tail_parts[2]) catch 0
+    if status < 0:
+        return none
+    return Hit(ip, stamp, method, path, status, size, millis)
+
+fn status_class(status: Int) -> String:
+    if status < 300:
+        return "2xx"
+    if status < 400:
+        return "3xx"
+    if status < 500:
+        return "4xx"
+    return "5xx"
+
+fn hour_of(stamp: String) -> String:
+    # 06/Jul/2026:14:03:22 — the hour sits after the first colon
+    c := scan_until(stamp, ":", 0)
+    if c < 0 or c + 3 > stamp.len():
+        return "??"
+    return stamp.substring(c + 1, c + 3)
+
+# --- aggregation -------------------------------------------------------
+
+## read a log (gzip-decompressed when the path ends in .gz) and fold
+## every line into a report.
+pub fn analyze_file(path: String) -> Report!:
+    mut text := ""
+    if path.ends_with(".gz"):
+        raw := fs.read_bytes(path)!
+        text = gzip.decompress(raw)!.to_string_utf8()!
+    else:
+        text = fs.read(path)!
+    return analyze_text(text)
+
+## fold raw log text into a report.
+pub fn analyze_text(text: String) -> Report:
+    mut by_class: Map[String, Int] := {}
+    mut by_path_hits: Map[String, Int] := {}
+    mut by_path_millis: Map[String, Int] := {}
+    mut by_hour: Map[String, Int] := {}
+    mut total := 0
+    mut errors := 0
+    mut served := 0
+    for line in text.split(chr(10)):
+        if line.trim() == "":
+            continue
+        if let h = parse_line(line):
+            total = total + 1
+            served = served + h.size
+            cls := status_class(h.status)
+            by_class.insert(cls, by_class.get_default(cls, 0) + 1)
+            by_path_hits.insert(h.path, by_path_hits.get_default(h.path, 0) + 1)
+            by_path_millis.insert(h.path, by_path_millis.get_default(h.path, 0) + h.millis)
+            hr := hour_of(h.stamp)
+            by_hour.insert(hr, by_hour.get_default(hr, 0) + 1)
+        else:
+            errors = errors + 1
+    return Report(total, errors, served, by_class, by_path_hits, by_path_millis, by_hour)
+
+fn top_paths(r: Report, n: Int) -> List[String]:
+    # selection of the n highest-hit paths, ties broken by name for
+    # deterministic output
+    mut chosen: List[String] := []
+    while chosen.len() < n:
+        mut best := ""
+        mut best_hits := -1
+        for p in r.by_path_hits.keys():
+            if chosen.contains(p):
+                continue
+            hits := r.by_path_hits.get_default(p, 0)
+            if hits > best_hits or (hits == best_hits and p < best):
+                best = p
+                best_hits = hits
+        if best == "":
+            return chosen
+        chosen.push(best)
+    return chosen
+
+# --- output ------------------------------------------------------------
+
+## the human-readable summary printed by the cli.
+pub fn render_report(r: Report) -> String:
+    nl := chr(10)
+    mut out := "requests: " + r.total.to_string() + "  malformed: " + r.parse_errors.to_string() + "  bytes: " + r.bytes_served.to_string() + nl
+    out = out + "status:" + nl
+    for cls in ["2xx", "3xx", "4xx", "5xx"]:
+        out = out + "  " + cls + ": " + r.by_class.get_default(cls, 0).to_string() + nl
+    out = out + "busiest hours:" + nl
+    for hr in sorted_keys(r.by_hour):
+        out = out + "  " + hr + ":00  " + r.by_hour.get_default(hr, 0).to_string() + nl
+    out = out + "top paths:" + nl
+    for p in top_paths(r, 5):
+        hits := r.by_path_hits.get_default(p, 0)
+        avg := r.by_path_millis.get_default(p, 0) / hits
+        out = out + "  " + p + "  hits=" + hits.to_string() + "  avg_ms=" + avg.to_string() + nl
+    return out
+
+fn sorted_keys(m: Map[String, Int]) -> List[String]:
+    mut ks: List[String] := []
+    for k in m.keys():
+        mut placed := false
+        mut i := 0
+        while i < ks.len() and not placed:
+            if k < ks[i]:
+                ks.insert(i, k)
+                placed = true
+            i = i + 1
+        if not placed:
+            ks.push(k)
+    return ks
+
+## per-path stats as csv, via the data.table module.
+pub fn export_csv(r: Report) -> String:
+    mut rows: List[List[String]] := []
+    for p in top_paths(r, 1000000):
+        hits := r.by_path_hits.get_default(p, 0)
+        avg := r.by_path_millis.get_default(p, 0) / hits
+        rows.push([p, hits.to_string(), avg.to_string()])
+    t := table.from_rows(["path", "hits", "avg_ms"], rows)
+    return table.to_csv(t)

@@ -1,0 +1,19 @@
+# logscan — analyze a web access log (plain or gzipped) and print a
+# traffic report. `--csv` writes per-path stats alongside the report.
+#
+#   pith build tools/logscan/logscan.pith
+#   ./tools/logscan/logscan access.log [out.csv]
+import std.fs as fs
+from logscan_lib import analyze_file, render_report, export_csv
+
+fn main() -> Int!:
+    argv := args()
+    if argv.len() < 2:
+        print("usage: logscan <access.log[.gz]> [out.csv]")
+        return 1
+    report := analyze_file(argv[1])!
+    print(render_report(report))
+    if argv.len() > 2:
+        fs.write(argv[2], export_csv(report))!
+        print("csv written: {argv[2]}")
+    return 0

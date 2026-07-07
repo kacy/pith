@@ -1567,6 +1567,84 @@ fn ir_collect_method_call_regs(node: Node) -> List[Int]:
                 regs.push(ir_expr(child))
     return regs
 
+# {x:8.2}-style parts: convert with precision when asked, then pad.
+# the spec was validated by the parser, so parsing here is positional.
+fn ir_interp_spec_width(spec: String) -> Int:
+    mut i := 0
+    c0 := spec[0]
+    if c0 == "<" or c0 == ">" or c0 == "^":
+        i = 1
+    if i < spec.len() and spec[i] == "0":
+        i = i + 1
+    mut w := 0
+    mut saw := false
+    while i < spec.len() and spec[i] != ".":
+        w = w * 10 + (ord(spec[i]) - 48)
+        saw = true
+        i = i + 1
+    if not saw:
+        return 0 - 1
+    return w
+
+fn ir_interp_spec_precision(spec: String) -> Int:
+    dot := spec.index_of(".")
+    if dot < 0:
+        return 0 - 1
+    mut p := 0
+    mut i := dot + 1
+    while i < spec.len():
+        p = p * 10 + (ord(spec[i]) - 48)
+        i = i + 1
+    return p
+
+fn ir_interp_spec_align(spec: String) -> Int:
+    c0 := spec[0]
+    if c0 == "<":
+        return 60
+    if c0 == "^":
+        return 94
+    return 62
+
+fn ir_interp_spec_fill(spec: String) -> Int:
+    mut i := 0
+    c0 := spec[0]
+    if c0 == "<" or c0 == ">" or c0 == "^":
+        i = 1
+    if i < spec.len() and spec[i] == "0":
+        return 48
+    return 32
+
+fn ir_emit_interp_spec_part(node: Node) -> Int:
+    spec := node.value
+    expr_idx := node.children[0]
+    prec := ir_interp_spec_precision(spec)
+    part_type := ir_infer_type(expr_idx)
+    mut str_r := 0 - 1
+    if prec >= 0 and part_type == "float":
+        raw_r := ir_expr(expr_idx)
+        prec_r := ir_reg()
+        ir_emit("iconst " + prec_r.to_string() + " " + prec.to_string())
+        str_r = ir_reg()
+        ir_emit_call2(str_r, "float_format", "string", raw_r, prec_r)
+    else:
+        str_r = ir_string_interp_expr_part(expr_idx)
+    width := ir_interp_spec_width(spec)
+    if width <= 0:
+        return str_r
+    w_r := ir_reg()
+    ir_emit("iconst " + w_r.to_string() + " " + width.to_string())
+    a_r := ir_reg()
+    ir_emit("iconst " + a_r.to_string() + " " + ir_interp_spec_align(spec).to_string())
+    f_r := ir_reg()
+    ir_emit("iconst " + f_r.to_string() + " " + ir_interp_spec_fill(spec).to_string())
+    padded_r := ir_reg()
+    ir_emit("call " + padded_r.to_string() + " format_pad string 4 " + str_r.to_string() + " " + w_r.to_string() + " " + a_r.to_string() + " " + f_r.to_string())
+    # the unpadded intermediate is garbage once copied, unless it was a
+    # borrowed string passed straight through
+    if ir_infer_type(node.children[0]) != "string" or not ir_string_expr_is_borrowed(node.children[0]):
+        ir_string_release_reg(str_r)
+    return padded_r
+
 fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
     mut part_r := ir_expr(expr_idx)
     part_tid := c_get_expr_type(expr_idx)
@@ -4424,10 +4502,15 @@ fn ir_string_interp_part_reg(child: Int) -> Int:
         part_r := ir_reg()
         ir_emit("strref " + part_r.to_string() + " " + si)
         return part_r
+    if cn.kind == "interp_spec":
+        return ir_emit_interp_spec_part(cn)
     return ir_string_interp_expr_part(child)
 
 fn ir_string_interp_part_owned(child: Int) -> Bool:
     cn := get_node(child)
+    if cn.kind == "interp_spec":
+        # spec parts allocate fresh output in every shape
+        return true
     if cn.kind == "lit":
         # literal strrefs are static; releasing one is a no-op, so treating
         # them as owned keeps the fold logic uniform

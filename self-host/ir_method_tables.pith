@@ -1,0 +1,104 @@
+# ir_method_tables.pith — the compiler's record of callable signatures:
+# every function's return-type hint, every impl method, and every
+# generic-method specialization. filled during collection, consulted
+# at every call site the emitter lowers.
+
+from ast import Node
+from ir_call_helpers import ir_is_declared_callable_with_state, ir_declared_callable_ir_retkind_with_state, ir_lookup_specialized_method_with_state
+
+pub mut ir_func_returns: Map[String, String] := {} # function name -> return type hint
+pub mut ir_impl_methods: Map[String, String] := {}
+pub mut ir_impl_method_specializations: Map[String, String] := {}
+
+# # the lookup key for a method on a type: "Type.method".
+pub fn ir_impl_method_key(type_name: String, method_name: String) -> String:
+    return type_name + "." + method_name
+
+# # turn a type-qualified name into a legal ir symbol.
+pub fn ir_sanitize_symbol(name: String) -> String:
+    # Pith identifiers don't contain `[`, `]`, `,`, but generic instance names
+    # like `MapIter[Range,Int,Int]` do. Map them to underscores so the symbol
+    # name remains a valid IR/runtime identifier.
+    mut out := ""
+    mut i := 0
+    while i < name.len():
+        c := name.substring(i, i + 1)
+        if c == "[" or c == "]" or c == ",":
+            out = out + "_"
+        elif c == " ":
+            i = i + 1
+            continue
+        else:
+            out = out + c
+        i = i + 1
+    return out
+
+# # drop [T] arguments from a type name.
+pub fn ir_strip_type_args(name: String) -> String:
+    mut i := 0
+    while i < name.len():
+        if name.substring(i, i + 1) == "[":
+            return name.substring(0, i)
+        i = i + 1
+    return name
+
+# Resolve a field-write lookup key, falling back to the receiver's base type
+# name so writes work on generic struct instances (Iter[Int] -> Iter). Returns
+# the matching key or "" if neither the qualified nor base form is registered.
+
+# # a function's recorded return-type hint, or "".
+pub fn ir_lookup_func_return(full_name: String, base_name: String) -> String:
+    if ir_func_returns.contains_key(full_name):
+        return ir_func_returns[full_name]
+    if ir_func_returns.contains_key(base_name):
+        return ir_func_returns[base_name]
+    return "unknown"
+
+# # true when the name is a recorded function or impl method.
+pub fn ir_is_declared_callable(name: String) -> Bool:
+    return ir_is_declared_callable_with_state(name, ir_func_returns)
+
+# # the ir return kind for a declared callable, or "unknown".
+pub fn ir_declared_callable_ir_retkind(fname: String) -> String:
+    return ir_declared_callable_ir_retkind_with_state(fname, ir_func_returns)
+
+# # the specialized symbol for a generic method instantiation, or "".
+pub fn ir_lookup_specialized_method(type_name: String, method_name: String) -> String:
+    key := ir_impl_method_key(type_name, method_name)
+    if ir_impl_method_specializations.contains_key(key) == false:
+        return ""
+    name := ir_impl_method_specializations[key]
+    # the specialization may have been registered un-prefixed (because the
+    # impl's source module didn't know its import prefix at emit time);
+    # if the base method now resolves to a prefixed import symbol, apply
+    # the same prefix to the specialized name so the call site links
+    base_type := ir_strip_type_args(type_name)
+    base_key := ir_impl_method_key(base_type, method_name)
+    if ir_impl_methods.contains_key(base_key):
+        base_full := ir_impl_methods[base_key]
+        expected_base := base_type + "_" + method_name
+        if base_full.len() > expected_base.len() and base_full.ends_with(expected_base):
+            prefix := base_full.substring(0, base_full.len() - expected_base.len())
+            if name.starts_with(prefix) == false:
+                return prefix + name
+    return name
+
+# # record one generic-method specialization under its instance key.
+pub fn ir_register_one_specialized_method_name(method_node: Node, base_impl_type: String, instance_type: String, arg_names: List[String]):
+    orig_name := method_node.value
+    mut suffix := ""
+    for an in arg_names:
+        suffix = suffix + "_" + ir_sanitize_symbol(an)
+    full_name := base_impl_type + suffix + "_" + orig_name
+    method_key := ir_impl_method_key(instance_type, orig_name)
+    if ir_impl_method_specializations.contains_key(method_key):
+        return
+    base_key := ir_impl_method_key(base_impl_type, orig_name)
+    expected_base_sym := base_impl_type + "_" + orig_name
+    mut prefixed_full := full_name
+    if ir_impl_methods.contains_key(base_key):
+        base_sym := ir_impl_methods[base_key]
+        if base_sym.len() > expected_base_sym.len() and base_sym.ends_with(expected_base_sym):
+            prefix_len := base_sym.len() - expected_base_sym.len()
+            prefixed_full = base_sym.substring(0, prefix_len) + full_name
+    ir_impl_method_specializations.insert(method_key, prefixed_full)

@@ -120,6 +120,10 @@ mut done := false
 
 # indent stack — tracks indentation levels
 mut indent_stack: List[Int] := [0]
+# depth of open (, [, { groups: newlines and indentation inside a
+# group don't produce layout tokens, so call arguments and literals
+# can span lines
+mut group_depth := 0
 mut pending_dedents := 0
 
 # pending tokens from string interpolation
@@ -253,6 +257,13 @@ fn next_token():
     if at_line_start:
         at_line_start = false
 
+        # inside a bracketed group the line break is cosmetic: no
+        # indent or dedent bookkeeping applies
+        if group_depth > 0:
+            skip_spaces()
+            next_token()
+            return
+
         if is_blank_line():
             skip_to_next_line()
             at_line_start = true
@@ -301,6 +312,9 @@ fn next_token():
         current_line = current_line + 1
         current_column = 0
         at_line_start = true
+        if group_depth > 0:
+            next_token()
+            return
         emit("newline", "")
         return
 
@@ -842,26 +856,35 @@ fn scan_operator():
         return
 
     if character == "(":
+        group_depth = group_depth + 1
         emit("lparen", "(")
         return
 
     if character == ")":
+        if group_depth > 0:
+            group_depth = group_depth - 1
         emit("rparen", ")")
         return
 
     if character == "[":
+        group_depth = group_depth + 1
         emit("lbracket", "[")
         return
 
     if character == "]":
+        if group_depth > 0:
+            group_depth = group_depth - 1
         emit("rbracket", "]")
         return
 
     if is_lbrace(character):
+        group_depth = group_depth + 1
         emit("lbrace", LBRACE)
         return
 
     if is_rbrace(character):
+        if group_depth > 0:
+            group_depth = group_depth - 1
         emit("rbrace", RBRACE)
         return
 
@@ -886,6 +909,7 @@ pub fn init_lexer(src: String):
     at_line_start = true
     done = false
     indent_stack = [0]
+    group_depth = 0
     pending_token_kinds = []
     pending_token_values = []
     pending_token_lines = []

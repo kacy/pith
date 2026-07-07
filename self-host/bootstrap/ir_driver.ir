@@ -169,6 +169,7 @@ global lexer_current_column 0
 global lexer_at_line_start 1
 global lexer_done 0
 global lexer_indent_stack list
+global lexer_group_depth 0
 global lexer_pending_dedents 0
 global lexer_pending_token_kinds list
 global lexer_pending_token_values list
@@ -1135,332 +1136,365 @@ brif 109 L150 L151
 label L150
 iconst 110 0
 store lexer_at_line_start 110
-call 111 lexer_is_blank_line bool 0
-brif 111 L153 L154
+load 111 lexer_group_depth
+iconst 112 0
+gt 113 111 112
+brif 113 L153 L154
 label L153
-call 112 lexer_skip_to_next_line unknown 0
-iconst 113 1
-store lexer_at_line_start 113
-call 114 lexer_next_token unknown 0
-load 115 kind
-call 116 pith_cstring_release void 1 115
-load 117 value
-call 118 pith_cstring_release void 1 117
-load 119 character
-call 120 pith_cstring_release void 1 119
-iconst 121 0
-ret 121
+call 114 lexer_skip_spaces unknown 0
+call 115 lexer_next_token unknown 0
+load 116 kind
+call 117 pith_cstring_release void 1 116
+load 118 value
+call 119 pith_cstring_release void 1 118
+load 120 character
+call 121 pith_cstring_release void 1 120
+iconst 122 0
+ret 122
 label L154
 label L152
-call 122 lexer_measure_indent int 0
-store level 122
-load 123 lexer_indent_stack
-load 124 lexer_indent_stack
-call 125 pith_list_len int 1 124
-iconst 126 1
-sub 127 125 126
-call 128 pith_list_get_value int 2 123 127
-store current_indent 128
-load 129 level
-load 130 current_indent
-gt 131 129 130
-brif 131 L156 L157
+call 123 lexer_is_blank_line bool 0
+brif 123 L156 L157
 label L156
-load 132 lexer_indent_stack
-load 133 level
-call 134 pith_list_push_value void 2 132 133
-strref 135 m0s96
-strref 136 m0s92
-call 137 lexer_emit unknown 2 135 136
-call 138 pith_cstring_release void 1 135
-call 139 pith_cstring_release void 1 136
-load 140 kind
-call 141 pith_cstring_release void 1 140
-load 142 value
-call 143 pith_cstring_release void 1 142
-load 144 character
-call 145 pith_cstring_release void 1 144
-iconst 146 0
-ret 146
+call 124 lexer_skip_to_next_line unknown 0
+iconst 125 1
+store lexer_at_line_start 125
+call 126 lexer_next_token unknown 0
+load 127 kind
+call 128 pith_cstring_release void 1 127
+load 129 value
+call 130 pith_cstring_release void 1 129
+load 131 character
+call 132 pith_cstring_release void 1 131
+iconst 133 0
+ret 133
 label L157
-load 147 level
-load 148 current_indent
-lt 149 147 148
-brif 149 L158 L159
-label L158
-iconst 150 0
-store dedents 150
+label L155
+call 134 lexer_measure_indent int 0
+store level 134
+load 135 lexer_indent_stack
+load 136 lexer_indent_stack
+call 137 pith_list_len int 1 136
+iconst 138 1
+sub 139 137 138
+call 140 pith_list_get_value int 2 135 139
+store current_indent 140
+load 141 level
+load 142 current_indent
+gt 143 141 142
+brif 143 L159 L160
+label L159
+load 144 lexer_indent_stack
+load 145 level
+call 146 pith_list_push_value void 2 144 145
+strref 147 m0s96
+strref 148 m0s92
+call 149 lexer_emit unknown 2 147 148
+call 150 pith_cstring_release void 1 147
+call 151 pith_cstring_release void 1 148
+load 152 kind
+call 153 pith_cstring_release void 1 152
+load 154 value
+call 155 pith_cstring_release void 1 154
+load 156 character
+call 157 pith_cstring_release void 1 156
+iconst 158 0
+ret 158
 label L160
-load 151 lexer_indent_stack
-call 152 pith_list_len int 1 151
-iconst 153 1
-gt 154 152 153
-brif 154 L161 L162
+load 159 level
+load 160 current_indent
+lt 161 159 160
+brif 161 L161 L162
 label L161
-load 155 lexer_indent_stack
-load 156 lexer_indent_stack
-call 157 pith_list_len int 1 156
-iconst 158 1
-sub 159 157 158
-call 160 pith_list_get_value int 2 155 159
-load 161 level
-gt 162 160 161
-brif 162 L164 L165
-label L164
+iconst 162 0
+store dedents 162
+label L163
 load 163 lexer_indent_stack
-load 164 lexer_indent_stack
-call 165 pith_list_len int 1 164
-iconst 166 1
-sub 167 165 166
-call 168 remove void 2 163 167
-load 169 dedents
+call 164 pith_list_len int 1 163
+iconst 165 1
+gt 166 164 165
+brif 166 L164 L165
+label L164
+load 167 lexer_indent_stack
+load 168 lexer_indent_stack
+call 169 pith_list_len int 1 168
 iconst 170 1
-add 171 169 170
-store dedents 171
+sub 171 169 170
+call 172 pith_list_get_value int 2 167 171
+load 173 level
+gt 174 172 173
+brif 174 L167 L168
+label L167
+load 175 lexer_indent_stack
+load 176 lexer_indent_stack
+call 177 pith_list_len int 1 176
+iconst 178 1
+sub 179 177 178
+call 180 remove void 2 175 179
+load 181 dedents
+iconst 182 1
+add 183 181 182
+store dedents 183
+jmp L166
+label L168
+jmp L165
+label L166
 jmp L163
 label L165
-jmp L162
-label L163
-jmp L160
-label L162
-load 172 lexer_indent_stack
-load 173 lexer_indent_stack
-call 174 pith_list_len int 1 173
-iconst 175 1
-sub 176 174 175
-call 177 pith_list_get_value int 2 172 176
-load 178 level
-neq 179 177 178
-brif 179 L167 L168
-label L167
-strref 180 m0s1
-strref 181 m0s95
-call 182 lexer_emit unknown 2 180 181
-call 183 pith_cstring_release void 1 180
-call 184 pith_cstring_release void 1 181
-load 185 kind
-call 186 pith_cstring_release void 1 185
-load 187 value
-call 188 pith_cstring_release void 1 187
-load 189 character
-call 190 pith_cstring_release void 1 189
-iconst 191 0
-ret 191
-label L168
-label L166
-load 192 dedents
-iconst 193 0
-gt 194 192 193
-brif 194 L170 L171
+load 184 lexer_indent_stack
+load 185 lexer_indent_stack
+call 186 pith_list_len int 1 185
+iconst 187 1
+sub 188 186 187
+call 189 pith_list_get_value int 2 184 188
+load 190 level
+neq 191 189 190
+brif 191 L170 L171
 label L170
-load 195 dedents
-iconst 196 1
-sub 197 195 196
-store lexer_pending_dedents 197
-strref 198 m0s94
-strref 199 m0s92
-call 200 lexer_emit unknown 2 198 199
-call 201 pith_cstring_release void 1 198
-call 202 pith_cstring_release void 1 199
-load 203 kind
-call 204 pith_cstring_release void 1 203
-load 205 value
-call 206 pith_cstring_release void 1 205
-load 207 character
-call 208 pith_cstring_release void 1 207
-iconst 209 0
-ret 209
+strref 192 m0s1
+strref 193 m0s95
+call 194 lexer_emit unknown 2 192 193
+call 195 pith_cstring_release void 1 192
+call 196 pith_cstring_release void 1 193
+load 197 kind
+call 198 pith_cstring_release void 1 197
+load 199 value
+call 200 pith_cstring_release void 1 199
+load 201 character
+call 202 pith_cstring_release void 1 201
+iconst 203 0
+ret 203
 label L171
 label L169
-jmp L155
-label L159
-label L155
+load 204 dedents
+iconst 205 0
+gt 206 204 205
+brif 206 L173 L174
+label L173
+load 207 dedents
+iconst 208 1
+sub 209 207 208
+store lexer_pending_dedents 209
+strref 210 m0s94
+strref 211 m0s92
+call 212 lexer_emit unknown 2 210 211
+call 213 pith_cstring_release void 1 210
+call 214 pith_cstring_release void 1 211
+load 215 kind
+call 216 pith_cstring_release void 1 215
+load 217 value
+call 218 pith_cstring_release void 1 217
+load 219 character
+call 220 pith_cstring_release void 1 219
+iconst 221 0
+ret 221
+label L174
+label L172
+jmp L158
+label L162
+label L158
 jmp L149
 label L151
 label L149
-call 210 lexer_skip_spaces unknown 0
-load 211 lexer_current_position
-load 212 lexer_source
-call 213 string_len int 1 212
-gte 214 211 213
-brif 214 L173 L174
-label L173
-call 215 lexer_next_token unknown 0
-load 216 kind
-call 217 pith_cstring_release void 1 216
-load 218 value
-call 219 pith_cstring_release void 1 218
-load 220 character
-call 221 pith_cstring_release void 1 220
-iconst 222 0
-ret 222
-label L174
-label L172
-load 223 character
-call 224 lexer_peek string 0
-call 225 pith_cstring_release void 1 223
-store character 224
-load 226 character
-call 227 lexer_is_newline_char bool 1 226
-brif 227 L176 L177
+call 222 lexer_skip_spaces unknown 0
+load 223 lexer_current_position
+load 224 lexer_source
+call 225 string_len int 1 224
+gte 226 223 225
+brif 226 L176 L177
 label L176
-load 228 lexer_current_position
-iconst 229 1
-add 230 228 229
-store lexer_current_position 230
-load 231 lexer_current_line
-iconst 232 1
-add 233 231 232
-store lexer_current_line 233
+call 227 lexer_next_token unknown 0
+load 228 kind
+call 229 pith_cstring_release void 1 228
+load 230 value
+call 231 pith_cstring_release void 1 230
+load 232 character
+call 233 pith_cstring_release void 1 232
 iconst 234 0
-store lexer_current_column 234
-iconst 235 1
-store lexer_at_line_start 235
-strref 236 m0s93
-strref 237 m0s92
-call 238 lexer_emit unknown 2 236 237
-call 239 pith_cstring_release void 1 236
-call 240 pith_cstring_release void 1 237
-load 241 kind
-call 242 pith_cstring_release void 1 241
-load 243 value
-call 244 pith_cstring_release void 1 243
-load 245 character
-call 246 pith_cstring_release void 1 245
-iconst 247 0
-ret 247
+ret 234
 label L177
 label L175
-load 248 character
-strref 249 m0s91
-call 250 pith_cstring_eq bool 2 248 249
-call 251 pith_cstring_release void 1 249
-brif 250 L179 L180
+load 235 character
+call 236 lexer_peek string 0
+call 237 pith_cstring_release void 1 235
+store character 236
+load 238 character
+call 239 lexer_is_newline_char bool 1 238
+brif 239 L179 L180
 label L179
-load 252 lexer_current_position
-store start 252
-label L181
-load 253 lexer_current_position
-load 254 lexer_source
-call 255 string_len int 1 254
-lt 256 253 255
-brif 256 L182 L183
+load 240 lexer_current_position
+iconst 241 1
+add 242 240 241
+store lexer_current_position 242
+load 243 lexer_current_line
+iconst 244 1
+add 245 243 244
+store lexer_current_line 245
+iconst 246 0
+store lexer_current_column 246
+iconst 247 1
+store lexer_at_line_start 247
+load 248 lexer_group_depth
+iconst 249 0
+gt 250 248 249
+brif 250 L182 L183
 label L182
-load 257 lexer_current_position
-call 258 lexer_source_char string 1 257
-call 259 lexer_is_newline_char bool 1 258
-call 260 pith_cstring_release void 1 258
-brif 259 L185 L186
-label L185
-jmp L183
-label L186
-label L184
-load 261 lexer_current_position
-iconst 262 1
-add 263 261 262
-store lexer_current_position 263
-load 264 lexer_current_column
-iconst 265 1
-add 266 264 265
-store lexer_current_column 266
-jmp L181
+call 251 lexer_next_token unknown 0
+load 252 kind
+call 253 pith_cstring_release void 1 252
+load 254 value
+call 255 pith_cstring_release void 1 254
+load 256 character
+call 257 pith_cstring_release void 1 256
+iconst 258 0
+ret 258
 label L183
-strref 267 m0s90
-load 268 lexer_source
-load 269 start
-load 270 lexer_current_position
-call 271 pith_cstring_substring string 3 268 269 270
-call 272 lexer_emit unknown 2 267 271
-call 273 pith_cstring_release void 1 267
-call 274 pith_cstring_release void 1 271
-load 275 kind
-call 276 pith_cstring_release void 1 275
-load 277 value
-call 278 pith_cstring_release void 1 277
-load 279 character
-call 280 pith_cstring_release void 1 279
-iconst 281 0
-ret 281
+label L181
+strref 259 m0s93
+strref 260 m0s92
+call 261 lexer_emit unknown 2 259 260
+call 262 pith_cstring_release void 1 259
+call 263 pith_cstring_release void 1 260
+load 264 kind
+call 265 pith_cstring_release void 1 264
+load 266 value
+call 267 pith_cstring_release void 1 266
+load 268 character
+call 269 pith_cstring_release void 1 268
+iconst 270 0
+ret 270
 label L180
 label L178
-load 282 character
-call 283 lexer_is_quote bool 1 282
-brif 283 L188 L189
-label L188
-call 284 lexer_scan_string unknown 0
-load 285 kind
-call 286 pith_cstring_release void 1 285
-load 287 value
-call 288 pith_cstring_release void 1 287
-load 289 character
-call 290 pith_cstring_release void 1 289
-iconst 291 0
-ret 291
-label L189
+load 271 character
+strref 272 m0s91
+call 273 pith_cstring_eq bool 2 271 272
+call 274 pith_cstring_release void 1 272
+brif 273 L185 L186
+label L185
+load 275 lexer_current_position
+store start 275
 label L187
-load 292 character
-call 293 lexer_is_digit bool 1 292
-brif 293 L191 L192
+load 276 lexer_current_position
+load 277 lexer_source
+call 278 string_len int 1 277
+lt 279 276 278
+brif 279 L188 L189
+label L188
+load 280 lexer_current_position
+call 281 lexer_source_char string 1 280
+call 282 lexer_is_newline_char bool 1 281
+call 283 pith_cstring_release void 1 281
+brif 282 L191 L192
 label L191
-call 294 lexer_scan_number unknown 0
-load 295 kind
-call 296 pith_cstring_release void 1 295
-load 297 value
-call 298 pith_cstring_release void 1 297
-load 299 character
-call 300 pith_cstring_release void 1 299
-iconst 301 0
-ret 301
+jmp L189
 label L192
 label L190
+load 284 lexer_current_position
+iconst 285 1
+add 286 284 285
+store lexer_current_position 286
+load 287 lexer_current_column
+iconst 288 1
+add 289 287 288
+store lexer_current_column 289
+jmp L187
+label L189
+strref 290 m0s90
+load 291 lexer_source
+load 292 start
+load 293 lexer_current_position
+call 294 pith_cstring_substring string 3 291 292 293
+call 295 lexer_emit unknown 2 290 294
+call 296 pith_cstring_release void 1 290
+call 297 pith_cstring_release void 1 294
+load 298 kind
+call 299 pith_cstring_release void 1 298
+load 300 value
+call 301 pith_cstring_release void 1 300
 load 302 character
-call 303 lexer_is_alpha bool 1 302
-brif 303 L194 L195
+call 303 pith_cstring_release void 1 302
+iconst 304 0
+ret 304
+label L186
+label L184
+load 305 character
+call 306 lexer_is_quote bool 1 305
+brif 306 L194 L195
 label L194
-call 304 lexer_scan_identifier unknown 0
-load 305 kind
-call 306 pith_cstring_release void 1 305
-load 307 value
-call 308 pith_cstring_release void 1 307
-load 309 character
-call 310 pith_cstring_release void 1 309
-iconst 311 0
-ret 311
+call 307 lexer_scan_string unknown 0
+load 308 kind
+call 309 pith_cstring_release void 1 308
+load 310 value
+call 311 pith_cstring_release void 1 310
+load 312 character
+call 313 pith_cstring_release void 1 312
+iconst 314 0
+ret 314
 label L195
 label L193
-call 312 lexer_scan_operator unknown 0
-load 313 kind
-call 314 pith_cstring_release void 1 313
-load 315 value
-call 316 pith_cstring_release void 1 315
-load 317 character
-call 318 pith_cstring_release void 1 317
-iconst 319 0
-ret 319
+load 315 character
+call 316 lexer_is_digit bool 1 315
+brif 316 L197 L198
+label L197
+call 317 lexer_scan_number unknown 0
+load 318 kind
+call 319 pith_cstring_release void 1 318
+load 320 value
+call 321 pith_cstring_release void 1 320
+load 322 character
+call 323 pith_cstring_release void 1 322
+iconst 324 0
+ret 324
+label L198
+label L196
+load 325 character
+call 326 lexer_is_alpha bool 1 325
+brif 326 L200 L201
+label L200
+call 327 lexer_scan_identifier unknown 0
+load 328 kind
+call 329 pith_cstring_release void 1 328
+load 330 value
+call 331 pith_cstring_release void 1 330
+load 332 character
+call 333 pith_cstring_release void 1 332
+iconst 334 0
+ret 334
+label L201
+label L199
+call 335 lexer_scan_operator unknown 0
+load 336 kind
+call 337 pith_cstring_release void 1 336
+load 338 value
+call 339 pith_cstring_release void 1 338
+load 340 character
+call 341 pith_cstring_release void 1 340
+iconst 342 0
+ret 342
 endfunc
 func lexer_scan_identifier 0 unknown
 iconst 0 0
 store word 0
 load 1 lexer_current_position
 store start 1
-label L196
+label L202
 load 2 lexer_current_position
 load 3 lexer_source
 call 4 string_len int 1 3
 lt 5 2 4
-brif 5 L197 L198
-label L197
+brif 5 L203 L204
+label L203
 load 6 lexer_current_position
 call 7 lexer_source_char string 1 6
 call 8 lexer_is_alnum bool 1 7
 call 9 pith_cstring_release void 1 7
 iconst 11 1
 sub 10 11 8
-brif 10 L200 L201
-label L200
-jmp L198
-label L201
-label L199
+brif 10 L206 L207
+label L206
+jmp L204
+label L207
+label L205
 load 12 lexer_current_position
 iconst 13 1
 add 14 12 13
@@ -1469,8 +1503,8 @@ load 15 lexer_current_column
 iconst 16 1
 add 17 15 16
 store lexer_current_column 17
-jmp L196
-label L198
+jmp L202
+label L204
 load 18 word
 load 19 lexer_source
 load 20 start
@@ -1482,8 +1516,8 @@ load 24 word
 strref 25 m0s77
 call 26 pith_cstring_eq bool 2 24 25
 call 27 pith_cstring_release void 1 25
-brif 26 L203 L204
-label L203
+brif 26 L209 L210
+label L209
 strref 28 m0s89
 strref 29 m0s77
 call 30 lexer_emit unknown 2 28 29
@@ -1493,8 +1527,8 @@ load 33 word
 call 34 pith_cstring_release void 1 33
 iconst 35 0
 ret 35
-label L204
-label L202
+label L210
+label L208
 load 36 lexer_KEYWORDS
 strref 37 m0s14
 load 38 word
@@ -1506,20 +1540,20 @@ call 43 pith_cstring_release void 1 39
 call 44 pith_cstring_release void 1 41
 call 45 pith_cstring_contains bool 2 36 42
 call 46 pith_cstring_release void 1 42
-brif 45 L206 L207
-label L206
+brif 45 L212 L213
+label L212
 load 47 word
 call 48 lexer_keyword_token_kind string 1 47
 load 49 word
 call 50 lexer_emit unknown 2 48 49
 call 51 pith_cstring_release void 1 48
-jmp L205
-label L207
+jmp L211
+label L213
 strref 52 m0s88
 load 53 word
 call 54 lexer_emit unknown 2 52 53
 call 55 pith_cstring_release void 1 52
-label L205
+label L211
 load 56 word
 call 57 pith_cstring_release void 1 56
 iconst 58 0
@@ -1540,16 +1574,16 @@ strref 6 m0s83
 call 7 pith_cstring_eq bool 2 5 6
 call 8 pith_cstring_release void 1 5
 call 9 pith_cstring_release void 1 6
-brif 7 L209 L210
-label L209
+brif 7 L215 L216
+label L215
 load 10 lexer_current_position
 iconst 11 1
 add 12 10 11
 load 13 lexer_source
 call 14 string_len int 1 13
 lt 15 12 14
-brif 15 L212 L213
-label L212
+brif 15 L218 L219
+label L218
 load 16 next_char
 load 17 lexer_current_position
 iconst 18 1
@@ -1561,8 +1595,8 @@ load 22 next_char
 strref 23 m0s87
 call 24 pith_cstring_eq bool 2 22 23
 call 25 pith_cstring_release void 1 23
-brif 24 L215 L216
-label L215
+brif 24 L221 L222
+label L221
 load 26 lexer_current_position
 iconst 27 2
 add 28 26 27
@@ -1571,13 +1605,13 @@ load 29 lexer_current_column
 iconst 30 2
 add 31 29 30
 store lexer_current_column 31
-label L217
+label L223
 load 32 lexer_current_position
 load 33 lexer_source
 call 34 string_len int 1 33
 lt 35 32 34
-brif 35 L218 L219
-label L218
+brif 35 L224 L225
+label L224
 load 36 scan_char
 load 37 lexer_current_position
 call 38 lexer_source_char string 1 37
@@ -1585,8 +1619,8 @@ call 39 pith_cstring_release void 1 36
 store scan_char 38
 load 40 scan_char
 call 41 lexer_is_hex_digit bool 1 40
-brif 41 L221 L222
-label L221
+brif 41 L227 L228
+label L227
 load 42 lexer_current_position
 iconst 43 1
 add 44 42 43
@@ -1595,14 +1629,14 @@ load 45 lexer_current_column
 iconst 46 1
 add 47 45 46
 store lexer_current_column 47
-jmp L220
-label L222
+jmp L226
+label L228
 load 48 scan_char
 strref 49 m0s77
 call 50 pith_cstring_eq bool 2 48 49
 call 51 pith_cstring_release void 1 49
-brif 50 L223 L224
-label L223
+brif 50 L229 L230
+label L229
 load 52 lexer_current_position
 iconst 53 1
 add 54 52 53
@@ -1611,12 +1645,12 @@ load 55 lexer_current_column
 iconst 56 1
 add 57 55 56
 store lexer_current_column 57
-jmp L220
-label L224
-jmp L219
-label L220
-jmp L217
-label L219
+jmp L226
+label L230
+jmp L225
+label L226
+jmp L223
+label L225
 strref 58 m0s75
 load 59 lexer_source
 load 60 start
@@ -1633,14 +1667,14 @@ load 70 exp_char
 call 71 pith_cstring_release void 1 70
 iconst 72 0
 ret 72
-label L216
-label L214
+label L222
+label L220
 load 73 next_char
 strref 74 m0s86
 call 75 pith_cstring_eq bool 2 73 74
 call 76 pith_cstring_release void 1 74
-brif 75 L226 L227
-label L226
+brif 75 L232 L233
+label L232
 load 77 lexer_current_position
 iconst 78 2
 add 79 77 78
@@ -1649,13 +1683,13 @@ load 80 lexer_current_column
 iconst 81 2
 add 82 80 81
 store lexer_current_column 82
-label L228
+label L234
 load 83 lexer_current_position
 load 84 lexer_source
 call 85 string_len int 1 84
 lt 86 83 85
-brif 86 L229 L230
-label L229
+brif 86 L235 L236
+label L235
 load 87 scan_char
 load 88 lexer_current_position
 call 89 lexer_source_char string 1 88
@@ -1663,8 +1697,8 @@ call 90 pith_cstring_release void 1 87
 store scan_char 89
 load 91 scan_char
 call 92 lexer_is_hex_digit bool 1 91
-brif 92 L232 L233
-label L232
+brif 92 L238 L239
+label L238
 load 93 lexer_current_position
 iconst 94 1
 add 95 93 94
@@ -1673,14 +1707,14 @@ load 96 lexer_current_column
 iconst 97 1
 add 98 96 97
 store lexer_current_column 98
-jmp L231
-label L233
+jmp L237
+label L239
 load 99 scan_char
 strref 100 m0s77
 call 101 pith_cstring_eq bool 2 99 100
 call 102 pith_cstring_release void 1 100
-brif 101 L234 L235
-label L234
+brif 101 L240 L241
+label L240
 load 103 lexer_current_position
 iconst 104 1
 add 105 103 104
@@ -1689,12 +1723,12 @@ load 106 lexer_current_column
 iconst 107 1
 add 108 106 107
 store lexer_current_column 108
-jmp L231
-label L235
-jmp L230
-label L231
-jmp L228
-label L230
+jmp L237
+label L241
+jmp L236
+label L237
+jmp L234
+label L236
 strref 109 m0s75
 load 110 lexer_source
 load 111 start
@@ -1711,14 +1745,14 @@ load 121 exp_char
 call 122 pith_cstring_release void 1 121
 iconst 123 0
 ret 123
-label L227
-label L225
+label L233
+label L231
 load 124 next_char
 strref 125 m0s85
 call 126 pith_cstring_eq bool 2 124 125
 call 127 pith_cstring_release void 1 125
-brif 126 L237 L238
-label L237
+brif 126 L243 L244
+label L243
 load 128 lexer_current_position
 iconst 129 2
 add 130 128 129
@@ -1727,13 +1761,13 @@ load 131 lexer_current_column
 iconst 132 2
 add 133 131 132
 store lexer_current_column 133
-label L239
+label L245
 load 134 lexer_current_position
 load 135 lexer_source
 call 136 string_len int 1 135
 lt 137 134 136
-brif 137 L240 L241
-label L240
+brif 137 L246 L247
+label L246
 load 138 scan_char
 load 139 lexer_current_position
 call 140 lexer_source_char string 1 139
@@ -1743,8 +1777,8 @@ load 142 scan_char
 strref 143 m0s83
 call 144 pith_cstring_eq bool 2 142 143
 call 145 pith_cstring_release void 1 143
-brif 144 L243 L244
-label L243
+brif 144 L249 L250
+label L249
 load 146 lexer_current_position
 iconst 147 1
 add 148 146 147
@@ -1753,14 +1787,14 @@ load 149 lexer_current_column
 iconst 150 1
 add 151 149 150
 store lexer_current_column 151
-jmp L242
-label L244
+jmp L248
+label L250
 load 152 scan_char
 strref 153 m0s82
 call 154 pith_cstring_eq bool 2 152 153
 call 155 pith_cstring_release void 1 153
-brif 154 L245 L246
-label L245
+brif 154 L251 L252
+label L251
 load 156 lexer_current_position
 iconst 157 1
 add 158 156 157
@@ -1769,14 +1803,14 @@ load 159 lexer_current_column
 iconst 160 1
 add 161 159 160
 store lexer_current_column 161
-jmp L242
-label L246
+jmp L248
+label L252
 load 162 scan_char
 strref 163 m0s77
 call 164 pith_cstring_eq bool 2 162 163
 call 165 pith_cstring_release void 1 163
-brif 164 L247 L248
-label L247
+brif 164 L253 L254
+label L253
 load 166 lexer_current_position
 iconst 167 1
 add 168 166 167
@@ -1785,12 +1819,12 @@ load 169 lexer_current_column
 iconst 170 1
 add 171 169 170
 store lexer_current_column 171
-jmp L242
+jmp L248
+label L254
+jmp L247
 label L248
-jmp L241
-label L242
-jmp L239
-label L241
+jmp L245
+label L247
 strref 172 m0s75
 load 173 lexer_source
 load 174 start
@@ -1807,14 +1841,14 @@ load 184 exp_char
 call 185 pith_cstring_release void 1 184
 iconst 186 0
 ret 186
-label L238
-label L236
+label L244
+label L242
 load 187 next_char
 strref 188 m0s84
 call 189 pith_cstring_eq bool 2 187 188
 call 190 pith_cstring_release void 1 188
-brif 189 L250 L251
-label L250
+brif 189 L256 L257
+label L256
 load 191 lexer_current_position
 iconst 192 2
 add 193 191 192
@@ -1823,13 +1857,13 @@ load 194 lexer_current_column
 iconst 195 2
 add 196 194 195
 store lexer_current_column 196
-label L252
+label L258
 load 197 lexer_current_position
 load 198 lexer_source
 call 199 string_len int 1 198
 lt 200 197 199
-brif 200 L253 L254
-label L253
+brif 200 L259 L260
+label L259
 load 201 scan_char
 load 202 lexer_current_position
 call 203 lexer_source_char string 1 202
@@ -1839,8 +1873,8 @@ load 205 scan_char
 strref 206 m0s83
 call 207 pith_cstring_eq bool 2 205 206
 call 208 pith_cstring_release void 1 206
-brif 207 L256 L257
-label L256
+brif 207 L262 L263
+label L262
 load 209 lexer_current_position
 iconst 210 1
 add 211 209 210
@@ -1849,14 +1883,14 @@ load 212 lexer_current_column
 iconst 213 1
 add 214 212 213
 store lexer_current_column 214
-jmp L255
-label L257
+jmp L261
+label L263
 load 215 scan_char
 strref 216 m0s82
 call 217 pith_cstring_eq bool 2 215 216
 call 218 pith_cstring_release void 1 216
-brif 217 L258 L259
-label L258
+brif 217 L264 L265
+label L264
 load 219 lexer_current_position
 iconst 220 1
 add 221 219 220
@@ -1865,14 +1899,14 @@ load 222 lexer_current_column
 iconst 223 1
 add 224 222 223
 store lexer_current_column 224
-jmp L255
-label L259
+jmp L261
+label L265
 load 225 scan_char
 strref 226 m0s77
 call 227 pith_cstring_eq bool 2 225 226
 call 228 pith_cstring_release void 1 226
-brif 227 L260 L261
-label L260
+brif 227 L266 L267
+label L266
 load 229 lexer_current_position
 iconst 230 1
 add 231 229 230
@@ -1881,12 +1915,12 @@ load 232 lexer_current_column
 iconst 233 1
 add 234 232 233
 store lexer_current_column 234
-jmp L255
+jmp L261
+label L267
+jmp L260
 label L261
-jmp L254
-label L255
-jmp L252
-label L254
+jmp L258
+label L260
 strref 235 m0s75
 load 236 lexer_source
 load 237 start
@@ -1903,14 +1937,14 @@ load 247 exp_char
 call 248 pith_cstring_release void 1 247
 iconst 249 0
 ret 249
-label L251
-label L249
+label L257
+label L255
 load 250 next_char
 strref 251 m0s81
 call 252 pith_cstring_eq bool 2 250 251
 call 253 pith_cstring_release void 1 251
-brif 252 L263 L264
-label L263
+brif 252 L269 L270
+label L269
 load 254 lexer_current_position
 iconst 255 2
 add 256 254 255
@@ -1919,24 +1953,24 @@ load 257 lexer_current_column
 iconst 258 2
 add 259 257 258
 store lexer_current_column 259
-label L265
+label L271
 load 260 lexer_current_position
 load 261 lexer_source
 call 262 string_len int 1 261
 lt 263 260 262
-brif 263 L266 L267
-label L266
+brif 263 L272 L273
+label L272
 load 264 lexer_current_position
 call 265 lexer_source_char string 1 264
 call 266 lexer_is_octal_char bool 1 265
 call 267 pith_cstring_release void 1 265
 iconst 269 1
 sub 268 269 266
-brif 268 L269 L270
-label L269
-jmp L267
-label L270
-label L268
+brif 268 L275 L276
+label L275
+jmp L273
+label L276
+label L274
 load 270 lexer_current_position
 iconst 271 1
 add 272 270 271
@@ -1945,8 +1979,8 @@ load 273 lexer_current_column
 iconst 274 1
 add 275 273 274
 store lexer_current_column 275
-jmp L265
-label L267
+jmp L271
+label L273
 strref 276 m0s75
 load 277 lexer_source
 load 278 start
@@ -1963,14 +1997,14 @@ load 288 exp_char
 call 289 pith_cstring_release void 1 288
 iconst 290 0
 ret 290
-label L264
-label L262
+label L270
+label L268
 load 291 next_char
 strref 292 m0s80
 call 293 pith_cstring_eq bool 2 291 292
 call 294 pith_cstring_release void 1 292
-brif 293 L272 L273
-label L272
+brif 293 L278 L279
+label L278
 load 295 lexer_current_position
 iconst 296 2
 add 297 295 296
@@ -1979,24 +2013,24 @@ load 298 lexer_current_column
 iconst 299 2
 add 300 298 299
 store lexer_current_column 300
-label L274
+label L280
 load 301 lexer_current_position
 load 302 lexer_source
 call 303 string_len int 1 302
 lt 304 301 303
-brif 304 L275 L276
-label L275
+brif 304 L281 L282
+label L281
 load 305 lexer_current_position
 call 306 lexer_source_char string 1 305
 call 307 lexer_is_octal_char bool 1 306
 call 308 pith_cstring_release void 1 306
 iconst 310 1
 sub 309 310 307
-brif 309 L278 L279
-label L278
-jmp L276
-label L279
-label L277
+brif 309 L284 L285
+label L284
+jmp L282
+label L285
+label L283
 load 311 lexer_current_position
 iconst 312 1
 add 313 311 312
@@ -2005,8 +2039,8 @@ load 314 lexer_current_column
 iconst 315 1
 add 316 314 315
 store lexer_current_column 316
-jmp L274
-label L276
+jmp L280
+label L282
 strref 317 m0s75
 load 318 lexer_source
 load 319 start
@@ -2023,21 +2057,21 @@ load 329 exp_char
 call 330 pith_cstring_release void 1 329
 iconst 331 0
 ret 331
-label L273
-label L271
-jmp L211
-label L213
-label L211
-jmp L208
-label L210
-label L208
-label L280
+label L279
+label L277
+jmp L217
+label L219
+label L217
+jmp L214
+label L216
+label L214
+label L286
 load 332 lexer_current_position
 load 333 lexer_source
 call 334 string_len int 1 333
 lt 335 332 334
-brif 335 L281 L282
-label L281
+brif 335 L287 L288
+label L287
 load 336 scan_char
 load 337 lexer_current_position
 call 338 lexer_source_char string 1 337
@@ -2045,8 +2079,8 @@ call 339 pith_cstring_release void 1 336
 store scan_char 338
 load 340 scan_char
 call 341 lexer_is_digit bool 1 340
-brif 341 L284 L285
-label L284
+brif 341 L290 L291
+label L290
 load 342 lexer_current_position
 iconst 343 1
 add 344 342 343
@@ -2055,14 +2089,14 @@ load 345 lexer_current_column
 iconst 346 1
 add 347 345 346
 store lexer_current_column 347
-jmp L283
-label L285
+jmp L289
+label L291
 load 348 scan_char
 strref 349 m0s77
 call 350 pith_cstring_eq bool 2 348 349
 call 351 pith_cstring_release void 1 349
-brif 350 L286 L287
-label L286
+brif 350 L292 L293
+label L292
 load 352 lexer_current_position
 iconst 353 1
 add 354 352 353
@@ -2071,44 +2105,44 @@ load 355 lexer_current_column
 iconst 356 1
 add 357 355 356
 store lexer_current_column 357
-jmp L283
-label L287
-jmp L282
-label L283
-jmp L280
-label L282
+jmp L289
+label L293
+jmp L288
+label L289
+jmp L286
+label L288
 iconst 358 0
 store is_float 358
 load 359 lexer_current_position
 load 360 lexer_source
 call 361 string_len int 1 360
 lt 362 359 361
-brif 362 L289 L290
-label L289
+brif 362 L295 L296
+label L295
 load 363 lexer_current_position
 call 364 lexer_source_char string 1 363
 strref 365 m0s16
 call 366 pith_cstring_eq bool 2 364 365
 call 367 pith_cstring_release void 1 364
 call 368 pith_cstring_release void 1 365
-brif 366 L292 L293
-label L292
+brif 366 L298 L299
+label L298
 load 369 lexer_current_position
 iconst 370 1
 add 371 369 370
 load 372 lexer_source
 call 373 string_len int 1 372
 lt 374 371 373
-brif 374 L295 L296
-label L295
+brif 374 L301 L302
+label L301
 load 375 lexer_current_position
 iconst 376 1
 add 377 375 376
 call 378 lexer_source_char string 1 377
 call 379 lexer_is_digit bool 1 378
 call 380 pith_cstring_release void 1 378
-brif 379 L298 L299
-label L298
+brif 379 L304 L305
+label L304
 iconst 381 1
 store is_float 381
 load 382 lexer_current_position
@@ -2119,13 +2153,13 @@ load 385 lexer_current_column
 iconst 386 1
 add 387 385 386
 store lexer_current_column 387
-label L300
+label L306
 load 388 lexer_current_position
 load 389 lexer_source
 call 390 string_len int 1 389
 lt 391 388 390
-brif 391 L301 L302
-label L301
+brif 391 L307 L308
+label L307
 load 392 scan_char
 load 393 lexer_current_position
 call 394 lexer_source_char string 1 393
@@ -2133,8 +2167,8 @@ call 395 pith_cstring_release void 1 392
 store scan_char 394
 load 396 scan_char
 call 397 lexer_is_digit bool 1 396
-brif 397 L304 L305
-label L304
+brif 397 L310 L311
+label L310
 load 398 lexer_current_position
 iconst 399 1
 add 400 398 399
@@ -2143,14 +2177,14 @@ load 401 lexer_current_column
 iconst 402 1
 add 403 401 402
 store lexer_current_column 403
-jmp L303
-label L305
+jmp L309
+label L311
 load 404 scan_char
 strref 405 m0s77
 call 406 pith_cstring_eq bool 2 404 405
 call 407 pith_cstring_release void 1 405
-brif 406 L306 L307
-label L306
+brif 406 L312 L313
+label L312
 load 408 lexer_current_position
 iconst 409 1
 add 410 408 409
@@ -2159,30 +2193,30 @@ load 411 lexer_current_column
 iconst 412 1
 add 413 411 412
 store lexer_current_column 413
+jmp L309
+label L313
+jmp L308
+label L309
+jmp L306
+label L308
 jmp L303
-label L307
-jmp L302
+label L305
 label L303
 jmp L300
 label L302
+label L300
 jmp L297
 label L299
 label L297
 jmp L294
 label L296
 label L294
-jmp L291
-label L293
-label L291
-jmp L288
-label L290
-label L288
 load 414 lexer_current_position
 load 415 lexer_source
 call 416 string_len int 1 415
 lt 417 414 416
-brif 417 L309 L310
-label L309
+brif 417 L315 L316
+label L315
 load 418 exp_char
 load 419 lexer_current_position
 call 420 lexer_source_char string 1 419
@@ -2192,8 +2226,8 @@ load 422 exp_char
 strref 423 m0s79
 call 424 pith_cstring_eq bool 2 422 423
 call 425 pith_cstring_release void 1 423
-brif 424 L312 L313
-label L312
+brif 424 L318 L319
+label L318
 iconst 426 1
 store is_float 426
 load 427 lexer_current_position
@@ -2208,8 +2242,8 @@ load 433 lexer_current_position
 load 434 lexer_source
 call 435 string_len int 1 434
 lt 436 433 435
-brif 436 L315 L316
-label L315
+brif 436 L321 L322
+label L321
 load 437 scan_char
 load 438 lexer_current_position
 call 439 lexer_source_char string 1 438
@@ -2219,8 +2253,8 @@ load 441 scan_char
 strref 442 m0s62
 call 443 pith_cstring_eq bool 2 441 442
 call 444 pith_cstring_release void 1 442
-brif 443 L318 L319
-label L318
+brif 443 L324 L325
+label L324
 load 445 lexer_current_position
 iconst 446 1
 add 447 445 446
@@ -2229,14 +2263,14 @@ load 448 lexer_current_column
 iconst 449 1
 add 450 448 449
 store lexer_current_column 450
-jmp L317
-label L319
+jmp L323
+label L325
 load 451 scan_char
 strref 452 m0s56
 call 453 pith_cstring_eq bool 2 451 452
 call 454 pith_cstring_release void 1 452
-brif 453 L320 L321
-label L320
+brif 453 L326 L327
+label L326
 load 455 lexer_current_position
 iconst 456 1
 add 457 455 456
@@ -2245,19 +2279,19 @@ load 458 lexer_current_column
 iconst 459 1
 add 460 458 459
 store lexer_current_column 460
-jmp L317
-label L321
-label L317
-jmp L314
-label L316
-label L314
+jmp L323
+label L327
+label L323
+jmp L320
 label L322
+label L320
+label L328
 load 461 lexer_current_position
 load 462 lexer_source
 call 463 string_len int 1 462
 lt 464 461 463
-brif 464 L323 L324
-label L323
+brif 464 L329 L330
+label L329
 load 465 scan_char
 load 466 lexer_current_position
 call 467 lexer_source_char string 1 466
@@ -2265,8 +2299,8 @@ call 468 pith_cstring_release void 1 465
 store scan_char 467
 load 469 scan_char
 call 470 lexer_is_digit bool 1 469
-brif 470 L326 L327
-label L326
+brif 470 L332 L333
+label L332
 load 471 lexer_current_position
 iconst 472 1
 add 473 471 472
@@ -2275,14 +2309,14 @@ load 474 lexer_current_column
 iconst 475 1
 add 476 474 475
 store lexer_current_column 476
-jmp L325
-label L327
+jmp L331
+label L333
 load 477 scan_char
 strref 478 m0s77
 call 479 pith_cstring_eq bool 2 477 478
 call 480 pith_cstring_release void 1 478
-brif 479 L328 L329
-label L328
+brif 479 L334 L335
+label L334
 load 481 lexer_current_position
 iconst 482 1
 add 483 481 482
@@ -2291,20 +2325,20 @@ load 484 lexer_current_column
 iconst 485 1
 add 486 484 485
 store lexer_current_column 486
-jmp L325
-label L329
-jmp L324
-label L325
-jmp L322
-label L324
-jmp L311
-label L313
+jmp L331
+label L335
+jmp L330
+label L331
+jmp L328
+label L330
+jmp L317
+label L319
 load 487 exp_char
 strref 488 m0s78
 call 489 pith_cstring_eq bool 2 487 488
 call 490 pith_cstring_release void 1 488
-brif 489 L330 L331
-label L330
+brif 489 L336 L337
+label L336
 iconst 491 1
 store is_float 491
 load 492 lexer_current_position
@@ -2319,8 +2353,8 @@ load 498 lexer_current_position
 load 499 lexer_source
 call 500 string_len int 1 499
 lt 501 498 500
-brif 501 L333 L334
-label L333
+brif 501 L339 L340
+label L339
 load 502 scan_char
 load 503 lexer_current_position
 call 504 lexer_source_char string 1 503
@@ -2330,8 +2364,8 @@ load 506 scan_char
 strref 507 m0s62
 call 508 pith_cstring_eq bool 2 506 507
 call 509 pith_cstring_release void 1 507
-brif 508 L336 L337
-label L336
+brif 508 L342 L343
+label L342
 load 510 lexer_current_position
 iconst 511 1
 add 512 510 511
@@ -2340,14 +2374,14 @@ load 513 lexer_current_column
 iconst 514 1
 add 515 513 514
 store lexer_current_column 515
-jmp L335
-label L337
+jmp L341
+label L343
 load 516 scan_char
 strref 517 m0s56
 call 518 pith_cstring_eq bool 2 516 517
 call 519 pith_cstring_release void 1 517
-brif 518 L338 L339
-label L338
+brif 518 L344 L345
+label L344
 load 520 lexer_current_position
 iconst 521 1
 add 522 520 521
@@ -2356,19 +2390,19 @@ load 523 lexer_current_column
 iconst 524 1
 add 525 523 524
 store lexer_current_column 525
-jmp L335
-label L339
-label L335
-jmp L332
-label L334
-label L332
+jmp L341
+label L345
+label L341
+jmp L338
 label L340
+label L338
+label L346
 load 526 lexer_current_position
 load 527 lexer_source
 call 528 string_len int 1 527
 lt 529 526 528
-brif 529 L341 L342
-label L341
+brif 529 L347 L348
+label L347
 load 530 scan_char
 load 531 lexer_current_position
 call 532 lexer_source_char string 1 531
@@ -2376,8 +2410,8 @@ call 533 pith_cstring_release void 1 530
 store scan_char 532
 load 534 scan_char
 call 535 lexer_is_digit bool 1 534
-brif 535 L344 L345
-label L344
+brif 535 L350 L351
+label L350
 load 536 lexer_current_position
 iconst 537 1
 add 538 536 537
@@ -2386,14 +2420,14 @@ load 539 lexer_current_column
 iconst 540 1
 add 541 539 540
 store lexer_current_column 541
-jmp L343
-label L345
+jmp L349
+label L351
 load 542 scan_char
 strref 543 m0s77
 call 544 pith_cstring_eq bool 2 542 543
 call 545 pith_cstring_release void 1 543
-brif 544 L346 L347
-label L346
+brif 544 L352 L353
+label L352
 load 546 lexer_current_position
 iconst 547 1
 add 548 546 547
@@ -2402,21 +2436,21 @@ load 549 lexer_current_column
 iconst 550 1
 add 551 549 550
 store lexer_current_column 551
-jmp L343
-label L347
-jmp L342
-label L343
-jmp L340
-label L342
-jmp L311
-label L331
-label L311
-jmp L308
-label L310
-label L308
-load 552 is_float
-brif 552 L349 L350
+jmp L349
+label L353
+jmp L348
 label L349
+jmp L346
+label L348
+jmp L317
+label L337
+label L317
+jmp L314
+label L316
+label L314
+load 552 is_float
+brif 552 L355 L356
+label L355
 strref 553 m0s76
 load 554 lexer_source
 load 555 start
@@ -2425,8 +2459,8 @@ call 557 pith_cstring_substring string 3 554 555 556
 call 558 lexer_emit unknown 2 553 557
 call 559 pith_cstring_release void 1 553
 call 560 pith_cstring_release void 1 557
-jmp L348
-label L350
+jmp L354
+label L356
 strref 561 m0s75
 load 562 lexer_source
 load 563 start
@@ -2435,7 +2469,7 @@ call 565 pith_cstring_substring string 3 562 563 564
 call 566 lexer_emit unknown 2 561 565
 call 567 pith_cstring_release void 1 561
 call 568 pith_cstring_release void 1 565
-label L348
+label L354
 load 569 next_char
 call 570 pith_cstring_release void 1 569
 load 571 scan_char
@@ -2466,19 +2500,19 @@ load 10 lexer_current_position
 store i 10
 iconst 11 0
 store found_string_boundary 11
-label L351
+label L357
 load 12 i
 load 13 lexer_source
 call 14 string_len int 1 13
 lt 15 12 14
-brif 15 L352 L353
-label L352
+brif 15 L358 L359
+label L358
 load 16 found_string_boundary
-brif 16 L355 L356
-label L355
-jmp L353
-label L356
-label L354
+brif 16 L361 L362
+label L361
+jmp L359
+label L362
+label L360
 load 17 scan_char
 load 18 i
 call 19 lexer_source_char string 1 18
@@ -2486,31 +2520,31 @@ call 20 pith_cstring_release void 1 17
 store scan_char 19
 load 21 scan_char
 call 22 lexer_is_backslash bool 1 21
-brif 22 L358 L359
-label L358
+brif 22 L364 L365
+label L364
 load 23 i
 iconst 24 1
 add 25 23 24
 load 26 lexer_source
 call 27 string_len int 1 26
 gte 28 25 27
-brif 28 L361 L362
-label L361
+brif 28 L367 L368
+label L367
 iconst 29 1
 store found_string_boundary 29
-jmp L360
-label L362
+jmp L366
+label L368
 load 30 i
 iconst 31 2
 add 32 30 31
 store i 32
-label L360
-jmp L357
-label L359
+label L366
+jmp L363
+label L365
 load 33 scan_char
 call 34 lexer_is_lbrace bool 1 33
-brif 34 L363 L364
-label L363
+brif 34 L369 L370
+label L369
 load 35 i
 iconst 36 1
 add 37 35 36
@@ -2524,56 +2558,56 @@ call 44 lexer_source_char string 1 43
 call 45 lexer_is_lbrace bool 1 44
 call 46 pith_cstring_release void 1 44
 and 47 40 45
-brif 47 L366 L367
-label L366
+brif 47 L372 L373
+label L372
 load 48 i
 iconst 49 2
 add 50 48 49
 store i 50
-jmp L365
-label L367
+jmp L371
+label L373
 iconst 51 1
 store has_interpolation 51
 iconst 52 1
 store found_string_boundary 52
-label L365
-jmp L357
-label L364
+label L371
+jmp L363
+label L370
 load 53 scan_char
 call 54 lexer_is_quote bool 1 53
-brif 54 L368 L369
-label L368
+brif 54 L374 L375
+label L374
 iconst 55 1
 store found_string_boundary 55
-jmp L357
-label L369
+jmp L363
+label L375
 load 56 scan_char
 call 57 lexer_is_newline_char bool 1 56
-brif 57 L370 L371
-label L370
+brif 57 L376 L377
+label L376
 iconst 58 1
 store found_string_boundary 58
-jmp L357
-label L371
+jmp L363
+label L377
 load 59 i
 iconst 60 1
 add 61 59 60
 store i 61
-label L357
-jmp L351
-label L353
+label L363
+jmp L357
+label L359
 load 62 has_interpolation
 iconst 64 1
 sub 63 64 62
-brif 63 L373 L374
-label L373
-label L375
+brif 63 L379 L380
+label L379
+label L381
 load 65 lexer_current_position
 load 66 lexer_source
 call 67 string_len int 1 66
 lt 68 65 67
-brif 68 L376 L377
-label L376
+brif 68 L382 L383
+label L382
 load 69 scan_char
 load 70 lexer_current_position
 call 71 lexer_source_char string 1 70
@@ -2581,16 +2615,16 @@ call 72 pith_cstring_release void 1 69
 store scan_char 71
 load 73 scan_char
 call 74 lexer_is_backslash bool 1 73
-brif 74 L379 L380
-label L379
+brif 74 L385 L386
+label L385
 load 75 lexer_current_position
 iconst 76 1
 add 77 75 76
 load 78 lexer_source
 call 79 string_len int 1 78
 gte 80 77 79
-brif 80 L382 L383
-label L382
+brif 80 L388 L389
+label L388
 strref 81 m0s1
 strref 82 m0s74
 call 83 lexer_emit unknown 2 81 82
@@ -2602,8 +2636,8 @@ load 88 string_start_value
 call 89 pith_cstring_release void 1 88
 iconst 90 0
 ret 90
-label L383
-label L381
+label L389
+label L387
 load 91 lexer_current_position
 iconst 92 2
 add 93 91 92
@@ -2612,12 +2646,12 @@ load 94 lexer_current_column
 iconst 95 2
 add 96 94 95
 store lexer_current_column 96
-jmp L378
-label L380
+jmp L384
+label L386
 load 97 scan_char
 call 98 lexer_is_quote bool 1 97
-brif 98 L384 L385
-label L384
+brif 98 L390 L391
+label L390
 load 99 lexer_current_position
 iconst 100 1
 add 101 99 100
@@ -2640,11 +2674,11 @@ load 115 string_start_value
 call 116 pith_cstring_release void 1 115
 iconst 117 0
 ret 117
-label L385
+label L391
 load 118 scan_char
 call 119 lexer_is_newline_char bool 1 118
-brif 119 L386 L387
-label L386
+brif 119 L392 L393
+label L392
 strref 120 m0s1
 strref 121 m0s72
 call 122 lexer_emit unknown 2 120 121
@@ -2656,7 +2690,7 @@ load 127 string_start_value
 call 128 pith_cstring_release void 1 127
 iconst 129 0
 ret 129
-label L387
+label L393
 load 130 lexer_current_position
 iconst 131 1
 add 132 130 131
@@ -2665,9 +2699,9 @@ load 133 lexer_current_column
 iconst 134 1
 add 135 133 134
 store lexer_current_column 135
-label L378
-jmp L375
-label L377
+label L384
+jmp L381
+label L383
 strref 136 m0s1
 strref 137 m0s71
 call 138 lexer_emit unknown 2 136 137
@@ -2679,23 +2713,23 @@ load 143 string_start_value
 call 144 pith_cstring_release void 1 143
 iconst 145 0
 ret 145
-label L374
-label L372
+label L380
+label L378
 iconst 146 0
 store found_interp_start 146
-label L388
+label L394
 load 147 lexer_current_position
 load 148 lexer_source
 call 149 string_len int 1 148
 lt 150 147 149
-brif 150 L389 L390
-label L389
+brif 150 L395 L396
+label L395
 load 151 found_interp_start
-brif 151 L392 L393
-label L392
-jmp L390
-label L393
-label L391
+brif 151 L398 L399
+label L398
+jmp L396
+label L399
+label L397
 load 152 scan_char
 load 153 lexer_current_position
 call 154 lexer_source_char string 1 153
@@ -2703,16 +2737,16 @@ call 155 pith_cstring_release void 1 152
 store scan_char 154
 load 156 scan_char
 call 157 lexer_is_backslash bool 1 156
-brif 157 L395 L396
-label L395
+brif 157 L401 L402
+label L401
 load 158 lexer_current_position
 iconst 159 1
 add 160 158 159
 load 161 lexer_source
 call 162 string_len int 1 161
 gte 163 160 162
-brif 163 L398 L399
-label L398
+brif 163 L404 L405
+label L404
 strref 164 m0s1
 strref 165 m0s70
 call 166 lexer_emit unknown 2 164 165
@@ -2724,8 +2758,8 @@ load 171 string_start_value
 call 172 pith_cstring_release void 1 171
 iconst 173 0
 ret 173
-label L399
-label L397
+label L405
+label L403
 load 174 lexer_current_position
 iconst 175 2
 add 176 174 175
@@ -2734,12 +2768,12 @@ load 177 lexer_current_column
 iconst 178 2
 add 179 177 178
 store lexer_current_column 179
-jmp L394
-label L396
+jmp L400
+label L402
 load 180 scan_char
 call 181 lexer_is_lbrace bool 1 180
-brif 181 L400 L401
-label L400
+brif 181 L406 L407
+label L406
 load 182 lexer_current_position
 iconst 183 1
 add 184 182 183
@@ -2753,8 +2787,8 @@ call 191 lexer_source_char string 1 190
 call 192 lexer_is_lbrace bool 1 191
 call 193 pith_cstring_release void 1 191
 and 194 187 192
-brif 194 L403 L404
-label L403
+brif 194 L409 L410
+label L409
 load 195 lexer_current_position
 iconst 196 2
 add 197 195 196
@@ -2763,29 +2797,29 @@ load 198 lexer_current_column
 iconst 199 2
 add 200 198 199
 store lexer_current_column 200
-jmp L402
-label L404
+jmp L408
+label L410
 iconst 201 1
 store found_interp_start 201
-label L402
-jmp L394
-label L401
+label L408
+jmp L400
+label L407
 load 202 scan_char
 call 203 lexer_is_quote bool 1 202
-brif 203 L405 L406
-label L405
+brif 203 L411 L412
+label L411
 iconst 204 1
 store found_interp_start 204
-jmp L394
-label L406
+jmp L400
+label L412
 load 205 scan_char
 call 206 lexer_is_newline_char bool 1 205
-brif 206 L407 L408
-label L407
+brif 206 L413 L414
+label L413
 iconst 207 1
 store found_interp_start 207
-jmp L394
-label L408
+jmp L400
+label L414
 load 208 lexer_current_position
 iconst 209 1
 add 210 208 209
@@ -2794,9 +2828,9 @@ load 211 lexer_current_column
 iconst 212 1
 add 213 211 212
 store lexer_current_column 213
-label L394
-jmp L388
-label L390
+label L400
+jmp L394
+label L396
 load 214 string_start_value
 load 215 lexer_source
 load 216 start
@@ -2825,21 +2859,21 @@ iconst 2 0
 store scan_char 2
 iconst 3 0
 store end_text 3
-label L409
+label L415
 load 4 lexer_current_position
 load 5 lexer_source
 call 6 string_len int 1 5
 lt 7 4 6
-brif 7 L410 L411
-label L410
+brif 7 L416 L417
+label L416
 load 8 lexer_current_position
 call 9 lexer_source_char string 1 8
 call 10 lexer_is_lbrace bool 1 9
 call 11 pith_cstring_release void 1 9
 iconst 13 1
 sub 12 13 10
-brif 12 L413 L414
-label L413
+brif 12 L419 L420
+label L419
 load 14 input_char
 call 15 pith_cstring_release void 1 14
 load 16 expr_text
@@ -2850,8 +2884,8 @@ load 20 end_text
 call 21 pith_cstring_release void 1 20
 iconst 22 0
 ret 22
-label L414
-label L412
+label L420
+label L418
 load 23 lexer_current_position
 iconst 24 1
 add 25 23 24
@@ -2866,19 +2900,19 @@ load 30 lexer_current_position
 store expression_start 30
 iconst 31 0
 store found_expr_end 31
-label L415
+label L421
 load 32 lexer_current_position
 load 33 lexer_source
 call 34 string_len int 1 33
 lt 35 32 34
-brif 35 L416 L417
-label L416
+brif 35 L422 L423
+label L422
 load 36 found_expr_end
-brif 36 L419 L420
-label L419
-jmp L417
-label L420
-label L418
+brif 36 L425 L426
+label L425
+jmp L423
+label L426
+label L424
 load 37 input_char
 load 38 lexer_current_position
 call 39 lexer_source_char string 1 38
@@ -2886,8 +2920,8 @@ call 40 pith_cstring_release void 1 37
 store input_char 39
 load 41 input_char
 call 42 lexer_is_lbrace bool 1 41
-brif 42 L422 L423
-label L422
+brif 42 L428 L429
+label L428
 load 43 brace_depth
 iconst 44 1
 add 45 43 44
@@ -2900,12 +2934,12 @@ load 49 lexer_current_column
 iconst 50 1
 add 51 49 50
 store lexer_current_column 51
-jmp L421
-label L423
+jmp L427
+label L429
 load 52 input_char
 call 53 lexer_is_rbrace bool 1 52
-brif 53 L424 L425
-label L424
+brif 53 L430 L431
+label L430
 load 54 brace_depth
 iconst 55 1
 sub 56 54 55
@@ -2913,12 +2947,12 @@ store brace_depth 56
 load 57 brace_depth
 iconst 58 0
 eq 59 57 58
-brif 59 L427 L428
-label L427
+brif 59 L433 L434
+label L433
 iconst 60 1
 store found_expr_end 60
-jmp L426
-label L428
+jmp L432
+label L434
 load 61 lexer_current_position
 iconst 62 1
 add 63 61 62
@@ -2927,9 +2961,9 @@ load 64 lexer_current_column
 iconst 65 1
 add 66 64 65
 store lexer_current_column 66
-label L426
-jmp L421
-label L425
+label L432
+jmp L427
+label L431
 load 67 lexer_current_position
 iconst 68 1
 add 69 67 68
@@ -2938,9 +2972,9 @@ load 70 lexer_current_column
 iconst 71 1
 add 72 70 71
 store lexer_current_column 72
-label L421
-jmp L415
-label L417
+label L427
+jmp L421
+label L423
 load 73 expr_text
 load 74 lexer_source
 load 75 expression_start
@@ -2952,23 +2986,23 @@ load 79 expr_text
 call 80 string_len int 1 79
 iconst 81 0
 gt 82 80 81
-brif 82 L430 L431
-label L430
+brif 82 L436 L437
+label L436
 load 83 lexer_pending_token_kinds
 strref 84 m0s68
 call 85 pith_list_push_value void 2 83 84
 load 86 lexer_pending_token_values
 load 87 expr_text
 call 88 pith_list_push_value void 2 86 87
-jmp L429
-label L431
-label L429
+jmp L435
+label L437
+label L435
 load 89 lexer_current_position
 load 90 lexer_source
 call 91 string_len int 1 90
 gte 92 89 91
-brif 92 L433 L434
-label L433
+brif 92 L439 L440
+label L439
 load 93 input_char
 call 94 pith_cstring_release void 1 93
 load 95 expr_text
@@ -2979,8 +3013,8 @@ load 99 end_text
 call 100 pith_cstring_release void 1 99
 iconst 101 0
 ret 101
-label L434
-label L432
+label L440
+label L438
 load 102 lexer_current_position
 iconst 103 1
 add 104 102 103
@@ -2993,19 +3027,19 @@ load 108 lexer_current_position
 store middle_start 108
 iconst 109 0
 store found_middle_end 109
-label L435
+label L441
 load 110 lexer_current_position
 load 111 lexer_source
 call 112 string_len int 1 111
 lt 113 110 112
-brif 113 L436 L437
-label L436
+brif 113 L442 L443
+label L442
 load 114 found_middle_end
-brif 114 L439 L440
-label L439
-jmp L437
-label L440
-label L438
+brif 114 L445 L446
+label L445
+jmp L443
+label L446
+label L444
 load 115 scan_char
 load 116 lexer_current_position
 call 117 lexer_source_char string 1 116
@@ -3013,16 +3047,16 @@ call 118 pith_cstring_release void 1 115
 store scan_char 117
 load 119 scan_char
 call 120 lexer_is_backslash bool 1 119
-brif 120 L442 L443
-label L442
+brif 120 L448 L449
+label L448
 load 121 lexer_current_position
 iconst 122 1
 add 123 121 122
 load 124 lexer_source
 call 125 string_len int 1 124
 gte 126 123 125
-brif 126 L445 L446
-label L445
+brif 126 L451 L452
+label L451
 load 127 input_char
 call 128 pith_cstring_release void 1 127
 load 129 expr_text
@@ -3033,8 +3067,8 @@ load 133 end_text
 call 134 pith_cstring_release void 1 133
 iconst 135 0
 ret 135
-label L446
-label L444
+label L452
+label L450
 load 136 lexer_current_position
 iconst 137 2
 add 138 136 137
@@ -3043,12 +3077,12 @@ load 139 lexer_current_column
 iconst 140 2
 add 141 139 140
 store lexer_current_column 141
-jmp L441
-label L443
+jmp L447
+label L449
 load 142 scan_char
 call 143 lexer_is_lbrace bool 1 142
-brif 143 L447 L448
-label L447
+brif 143 L453 L454
+label L453
 load 144 lexer_current_position
 iconst 145 1
 add 146 144 145
@@ -3062,8 +3096,8 @@ call 153 lexer_source_char string 1 152
 call 154 lexer_is_lbrace bool 1 153
 call 155 pith_cstring_release void 1 153
 and 156 149 154
-brif 156 L450 L451
-label L450
+brif 156 L456 L457
+label L456
 load 157 lexer_current_position
 iconst 158 2
 add 159 157 158
@@ -3072,29 +3106,29 @@ load 160 lexer_current_column
 iconst 161 2
 add 162 160 161
 store lexer_current_column 162
-jmp L449
-label L451
+jmp L455
+label L457
 iconst 163 1
 store found_middle_end 163
-label L449
-jmp L441
-label L448
+label L455
+jmp L447
+label L454
 load 164 scan_char
 call 165 lexer_is_quote bool 1 164
-brif 165 L452 L453
-label L452
+brif 165 L458 L459
+label L458
 iconst 166 1
 store found_middle_end 166
-jmp L441
-label L453
+jmp L447
+label L459
 load 167 scan_char
 call 168 lexer_is_newline_char bool 1 167
-brif 168 L454 L455
-label L454
+brif 168 L460 L461
+label L460
 iconst 169 1
 store found_middle_end 169
-jmp L441
-label L455
+jmp L447
+label L461
 load 170 lexer_current_position
 iconst 171 1
 add 172 170 171
@@ -3103,15 +3137,15 @@ load 173 lexer_current_column
 iconst 174 1
 add 175 173 174
 store lexer_current_column 175
-label L441
-jmp L435
-label L437
+label L447
+jmp L441
+label L443
 load 176 lexer_current_position
 load 177 lexer_source
 call 178 string_len int 1 177
 gte 179 176 178
-brif 179 L457 L458
-label L457
+brif 179 L463 L464
+label L463
 load 180 input_char
 call 181 pith_cstring_release void 1 180
 load 182 expr_text
@@ -3122,14 +3156,14 @@ load 186 end_text
 call 187 pith_cstring_release void 1 186
 iconst 188 0
 ret 188
-label L458
-label L456
+label L464
+label L462
 load 189 lexer_current_position
 call 190 lexer_source_char string 1 189
 call 191 lexer_is_quote bool 1 190
 call 192 pith_cstring_release void 1 190
-brif 191 L460 L461
-label L460
+brif 191 L466 L467
+label L466
 load 193 end_text
 load 194 lexer_source
 load 195 middle_start
@@ -3161,14 +3195,14 @@ load 217 end_text
 call 218 pith_cstring_release void 1 217
 iconst 219 0
 ret 219
-label L461
-label L459
+label L467
+label L465
 load 220 lexer_current_position
 call 221 lexer_source_char string 1 220
 call 222 lexer_is_newline_char bool 1 221
 call 223 pith_cstring_release void 1 221
-brif 222 L463 L464
-label L463
+brif 222 L469 L470
+label L469
 load 224 input_char
 call 225 pith_cstring_release void 1 224
 load 226 expr_text
@@ -3179,8 +3213,8 @@ load 230 end_text
 call 231 pith_cstring_release void 1 230
 iconst 232 0
 ret 232
-label L464
-label L462
+label L470
+label L468
 load 233 lexer_pending_token_kinds
 strref 234 m0s66
 call 235 pith_list_push_value void 2 233 234
@@ -3190,8 +3224,8 @@ load 238 middle_start
 load 239 lexer_current_position
 call 240 pith_cstring_substring string 3 237 238 239
 call 241 pith_list_push_value void 2 236 240
-jmp L409
-label L411
+jmp L415
+label L417
 load 242 input_char
 call 243 pith_cstring_release void 1 242
 load 244 expr_text
@@ -3214,22 +3248,22 @@ load 4 character
 strref 5 m0s62
 call 6 pith_cstring_eq bool 2 4 5
 call 7 pith_cstring_release void 1 5
-brif 6 L466 L467
-label L466
+brif 6 L472 L473
+label L472
 load 8 lexer_current_position
 load 9 lexer_source
 call 10 string_len int 1 9
 lt 11 8 10
-brif 11 L469 L470
-label L469
+brif 11 L475 L476
+label L475
 load 12 lexer_current_position
 call 13 lexer_source_char string 1 12
 strref 14 m0s22
 call 15 pith_cstring_eq bool 2 13 14
 call 16 pith_cstring_release void 1 13
 call 17 pith_cstring_release void 1 14
-brif 15 L472 L473
-label L472
+brif 15 L478 L479
+label L478
 load 18 lexer_current_position
 iconst 19 1
 add 20 18 19
@@ -3247,11 +3281,11 @@ load 29 character
 call 30 pith_cstring_release void 1 29
 iconst 31 0
 ret 31
-label L473
-label L471
-jmp L468
-label L470
-label L468
+label L479
+label L477
+jmp L474
+label L476
+label L474
 strref 32 m0s63
 strref 33 m0s62
 call 34 lexer_emit unknown 2 32 33
@@ -3261,28 +3295,28 @@ load 37 character
 call 38 pith_cstring_release void 1 37
 iconst 39 0
 ret 39
-label L467
-label L465
+label L473
+label L471
 load 40 character
 strref 41 m0s56
 call 42 pith_cstring_eq bool 2 40 41
 call 43 pith_cstring_release void 1 41
-brif 42 L475 L476
-label L475
+brif 42 L481 L482
+label L481
 load 44 lexer_current_position
 load 45 lexer_source
 call 46 string_len int 1 45
 lt 47 44 46
-brif 47 L478 L479
-label L478
+brif 47 L484 L485
+label L484
 load 48 lexer_current_position
 call 49 lexer_source_char string 1 48
 strref 50 m0s29
 call 51 pith_cstring_eq bool 2 49 50
 call 52 pith_cstring_release void 1 49
 call 53 pith_cstring_release void 1 50
-brif 51 L481 L482
-label L481
+brif 51 L487 L488
+label L487
 load 54 lexer_current_position
 iconst 55 1
 add 56 54 55
@@ -3300,16 +3334,16 @@ load 65 character
 call 66 pith_cstring_release void 1 65
 iconst 67 0
 ret 67
-label L482
-label L480
+label L488
+label L486
 load 68 lexer_current_position
 call 69 lexer_source_char string 1 68
 strref 70 m0s22
 call 71 pith_cstring_eq bool 2 69 70
 call 72 pith_cstring_release void 1 69
 call 73 pith_cstring_release void 1 70
-brif 71 L484 L485
-label L484
+brif 71 L490 L491
+label L490
 load 74 lexer_current_position
 iconst 75 1
 add 76 74 75
@@ -3327,11 +3361,11 @@ load 85 character
 call 86 pith_cstring_release void 1 85
 iconst 87 0
 ret 87
+label L491
+label L489
+jmp L483
 label L485
 label L483
-jmp L477
-label L479
-label L477
 strref 88 m0s57
 strref 89 m0s56
 call 90 lexer_emit unknown 2 88 89
@@ -3341,28 +3375,28 @@ load 93 character
 call 94 pith_cstring_release void 1 93
 iconst 95 0
 ret 95
-label L476
-label L474
+label L482
+label L480
 load 96 character
 strref 97 m0s52
 call 98 pith_cstring_eq bool 2 96 97
 call 99 pith_cstring_release void 1 97
-brif 98 L487 L488
-label L487
+brif 98 L493 L494
+label L493
 load 100 lexer_current_position
 load 101 lexer_source
 call 102 string_len int 1 101
 lt 103 100 102
-brif 103 L490 L491
-label L490
+brif 103 L496 L497
+label L496
 load 104 lexer_current_position
 call 105 lexer_source_char string 1 104
 strref 106 m0s22
 call 107 pith_cstring_eq bool 2 105 106
 call 108 pith_cstring_release void 1 105
 call 109 pith_cstring_release void 1 106
-brif 107 L493 L494
-label L493
+brif 107 L499 L500
+label L499
 load 110 lexer_current_position
 iconst 111 1
 add 112 110 111
@@ -3380,11 +3414,11 @@ load 121 character
 call 122 pith_cstring_release void 1 121
 iconst 123 0
 ret 123
-label L494
-label L492
-jmp L489
-label L491
-label L489
+label L500
+label L498
+jmp L495
+label L497
+label L495
 strref 124 m0s53
 strref 125 m0s52
 call 126 lexer_emit unknown 2 124 125
@@ -3394,28 +3428,28 @@ load 129 character
 call 130 pith_cstring_release void 1 129
 iconst 131 0
 ret 131
-label L488
-label L486
+label L494
+label L492
 load 132 character
 strref 133 m0s48
 call 134 pith_cstring_eq bool 2 132 133
 call 135 pith_cstring_release void 1 133
-brif 134 L496 L497
-label L496
+brif 134 L502 L503
+label L502
 load 136 lexer_current_position
 load 137 lexer_source
 call 138 string_len int 1 137
 lt 139 136 138
-brif 139 L499 L500
-label L499
+brif 139 L505 L506
+label L505
 load 140 lexer_current_position
 call 141 lexer_source_char string 1 140
 strref 142 m0s22
 call 143 pith_cstring_eq bool 2 141 142
 call 144 pith_cstring_release void 1 141
 call 145 pith_cstring_release void 1 142
-brif 143 L502 L503
-label L502
+brif 143 L508 L509
+label L508
 load 146 lexer_current_position
 iconst 147 1
 add 148 146 147
@@ -3433,11 +3467,11 @@ load 157 character
 call 158 pith_cstring_release void 1 157
 iconst 159 0
 ret 159
-label L503
-label L501
-jmp L498
-label L500
-label L498
+label L509
+label L507
+jmp L504
+label L506
+label L504
 strref 160 m0s49
 strref 161 m0s48
 call 162 lexer_emit unknown 2 160 161
@@ -3447,14 +3481,14 @@ load 165 character
 call 166 pith_cstring_release void 1 165
 iconst 167 0
 ret 167
-label L497
-label L495
+label L503
+label L501
 load 168 character
 strref 169 m0s46
 call 170 pith_cstring_eq bool 2 168 169
 call 171 pith_cstring_release void 1 169
-brif 170 L505 L506
-label L505
+brif 170 L511 L512
+label L511
 strref 172 m0s47
 strref 173 m0s46
 call 174 lexer_emit unknown 2 172 173
@@ -3464,28 +3498,28 @@ load 177 character
 call 178 pith_cstring_release void 1 177
 iconst 179 0
 ret 179
-label L506
-label L504
+label L512
+label L510
 load 180 character
 strref 181 m0s22
 call 182 pith_cstring_eq bool 2 180 181
 call 183 pith_cstring_release void 1 181
-brif 182 L508 L509
-label L508
+brif 182 L514 L515
+label L514
 load 184 lexer_current_position
 load 185 lexer_source
 call 186 string_len int 1 185
 lt 187 184 186
-brif 187 L511 L512
-label L511
+brif 187 L517 L518
+label L517
 load 188 lexer_current_position
 call 189 lexer_source_char string 1 188
 strref 190 m0s22
 call 191 pith_cstring_eq bool 2 189 190
 call 192 pith_cstring_release void 1 189
 call 193 pith_cstring_release void 1 190
-brif 191 L514 L515
-label L514
+brif 191 L520 L521
+label L520
 load 194 lexer_current_position
 iconst 195 1
 add 196 194 195
@@ -3503,16 +3537,16 @@ load 205 character
 call 206 pith_cstring_release void 1 205
 iconst 207 0
 ret 207
-label L515
-label L513
+label L521
+label L519
 load 208 lexer_current_position
 call 209 lexer_source_char string 1 208
 strref 210 m0s29
 call 211 pith_cstring_eq bool 2 209 210
 call 212 pith_cstring_release void 1 209
 call 213 pith_cstring_release void 1 210
-brif 211 L517 L518
-label L517
+brif 211 L523 L524
+label L523
 load 214 lexer_current_position
 iconst 215 1
 add 216 214 215
@@ -3530,11 +3564,11 @@ load 225 character
 call 226 pith_cstring_release void 1 225
 iconst 227 0
 ret 227
+label L524
+label L522
+jmp L516
 label L518
 label L516
-jmp L510
-label L512
-label L510
 strref 228 m0s41
 strref 229 m0s22
 call 230 lexer_emit unknown 2 228 229
@@ -3544,28 +3578,28 @@ load 233 character
 call 234 pith_cstring_release void 1 233
 iconst 235 0
 ret 235
-label L509
-label L507
+label L515
+label L513
 load 236 character
 strref 237 m0s37
 call 238 pith_cstring_eq bool 2 236 237
 call 239 pith_cstring_release void 1 237
-brif 238 L520 L521
-label L520
+brif 238 L526 L527
+label L526
 load 240 lexer_current_position
 load 241 lexer_source
 call 242 string_len int 1 241
 lt 243 240 242
-brif 243 L523 L524
-label L523
+brif 243 L529 L530
+label L529
 load 244 lexer_current_position
 call 245 lexer_source_char string 1 244
 strref 246 m0s22
 call 247 pith_cstring_eq bool 2 245 246
 call 248 pith_cstring_release void 1 245
 call 249 pith_cstring_release void 1 246
-brif 247 L526 L527
-label L526
+brif 247 L532 L533
+label L532
 load 250 lexer_current_position
 iconst 251 1
 add 252 250 251
@@ -3583,11 +3617,11 @@ load 261 character
 call 262 pith_cstring_release void 1 261
 iconst 263 0
 ret 263
-label L527
-label L525
-jmp L522
-label L524
-label L522
+label L533
+label L531
+jmp L528
+label L530
+label L528
 strref 264 m0s38
 strref 265 m0s37
 call 266 lexer_emit unknown 2 264 265
@@ -3597,28 +3631,28 @@ load 269 character
 call 270 pith_cstring_release void 1 269
 iconst 271 0
 ret 271
-label L521
-label L519
+label L527
+label L525
 load 272 character
 strref 273 m0s33
 call 274 pith_cstring_eq bool 2 272 273
 call 275 pith_cstring_release void 1 273
-brif 274 L529 L530
-label L529
+brif 274 L535 L536
+label L535
 load 276 lexer_current_position
 load 277 lexer_source
 call 278 string_len int 1 277
 lt 279 276 278
-brif 279 L532 L533
-label L532
+brif 279 L538 L539
+label L538
 load 280 lexer_current_position
 call 281 lexer_source_char string 1 280
 strref 282 m0s22
 call 283 pith_cstring_eq bool 2 281 282
 call 284 pith_cstring_release void 1 281
 call 285 pith_cstring_release void 1 282
-brif 283 L535 L536
-label L535
+brif 283 L541 L542
+label L541
 load 286 lexer_current_position
 iconst 287 1
 add 288 286 287
@@ -3636,11 +3670,11 @@ load 297 character
 call 298 pith_cstring_release void 1 297
 iconst 299 0
 ret 299
-label L536
-label L534
-jmp L531
-label L533
-label L531
+label L542
+label L540
+jmp L537
+label L539
+label L537
 strref 300 m0s34
 strref 301 m0s33
 call 302 lexer_emit unknown 2 300 301
@@ -3650,28 +3684,28 @@ load 305 character
 call 306 pith_cstring_release void 1 305
 iconst 307 0
 ret 307
-label L530
-label L528
+label L536
+label L534
 load 308 character
 strref 309 m0s29
 call 310 pith_cstring_eq bool 2 308 309
 call 311 pith_cstring_release void 1 309
-brif 310 L538 L539
-label L538
+brif 310 L544 L545
+label L544
 load 312 lexer_current_position
 load 313 lexer_source
 call 314 string_len int 1 313
 lt 315 312 314
-brif 315 L541 L542
-label L541
+brif 315 L547 L548
+label L547
 load 316 lexer_current_position
 call 317 lexer_source_char string 1 316
 strref 318 m0s22
 call 319 pith_cstring_eq bool 2 317 318
 call 320 pith_cstring_release void 1 317
 call 321 pith_cstring_release void 1 318
-brif 319 L544 L545
-label L544
+brif 319 L550 L551
+label L550
 load 322 lexer_current_position
 iconst 323 1
 add 324 322 323
@@ -3689,11 +3723,11 @@ load 333 character
 call 334 pith_cstring_release void 1 333
 iconst 335 0
 ret 335
-label L545
-label L543
-jmp L540
-label L542
-label L540
+label L551
+label L549
+jmp L546
+label L548
+label L546
 strref 336 m0s30
 strref 337 m0s29
 call 338 lexer_emit unknown 2 336 337
@@ -3703,28 +3737,28 @@ load 341 character
 call 342 pith_cstring_release void 1 341
 iconst 343 0
 ret 343
-label L539
-label L537
+label L545
+label L543
 load 344 character
 strref 345 m0s25
 call 346 pith_cstring_eq bool 2 344 345
 call 347 pith_cstring_release void 1 345
-brif 346 L547 L548
-label L547
+brif 346 L553 L554
+label L553
 load 348 lexer_current_position
 load 349 lexer_source
 call 350 string_len int 1 349
 lt 351 348 350
-brif 351 L550 L551
-label L550
+brif 351 L556 L557
+label L556
 load 352 lexer_current_position
 call 353 lexer_source_char string 1 352
 strref 354 m0s22
 call 355 pith_cstring_eq bool 2 353 354
 call 356 pith_cstring_release void 1 353
 call 357 pith_cstring_release void 1 354
-brif 355 L553 L554
-label L553
+brif 355 L559 L560
+label L559
 load 358 lexer_current_position
 iconst 359 1
 add 360 358 359
@@ -3742,11 +3776,11 @@ load 369 character
 call 370 pith_cstring_release void 1 369
 iconst 371 0
 ret 371
-label L554
-label L552
-jmp L549
-label L551
-label L549
+label L560
+label L558
+jmp L555
+label L557
+label L555
 strref 372 m0s26
 strref 373 m0s25
 call 374 lexer_emit unknown 2 372 373
@@ -3756,14 +3790,14 @@ load 377 character
 call 378 pith_cstring_release void 1 377
 iconst 379 0
 ret 379
-label L548
-label L546
+label L554
+label L552
 load 380 character
 strref 381 m0s23
 call 382 pith_cstring_eq bool 2 380 381
 call 383 pith_cstring_release void 1 381
-brif 382 L556 L557
-label L556
+brif 382 L562 L563
+label L562
 strref 384 m0s24
 strref 385 m0s23
 call 386 lexer_emit unknown 2 384 385
@@ -3773,14 +3807,14 @@ load 389 character
 call 390 pith_cstring_release void 1 389
 iconst 391 0
 ret 391
-label L557
-label L555
+label L563
+label L561
 load 392 character
 strref 393 m0s16
 call 394 pith_cstring_eq bool 2 392 393
 call 395 pith_cstring_release void 1 393
-brif 394 L559 L560
-label L559
+brif 394 L565 L566
+label L565
 load 396 lexer_current_position
 load 397 lexer_source
 call 398 string_len int 1 397
@@ -3792,8 +3826,8 @@ call 403 pith_cstring_eq bool 2 401 402
 call 404 pith_cstring_release void 1 401
 call 405 pith_cstring_release void 1 402
 and 406 399 403
-brif 406 L562 L563
-label L562
+brif 406 L568 L569
+label L568
 load 407 lexer_current_position
 iconst 408 1
 add 409 407 408
@@ -3813,8 +3847,8 @@ call 420 pith_cstring_eq bool 2 418 419
 call 421 pith_cstring_release void 1 418
 call 422 pith_cstring_release void 1 419
 and 423 416 420
-brif 423 L565 L566
-label L565
+brif 423 L571 L572
+label L571
 load 424 lexer_current_position
 iconst 425 1
 add 426 424 425
@@ -3832,8 +3866,8 @@ load 435 character
 call 436 pith_cstring_release void 1 435
 iconst 437 0
 ret 437
-label L566
-label L564
+label L572
+label L570
 strref 438 m0s19
 strref 439 m0s18
 call 440 lexer_emit unknown 2 438 439
@@ -3843,8 +3877,8 @@ load 443 character
 call 444 pith_cstring_release void 1 443
 iconst 445 0
 ret 445
-label L563
-label L561
+label L569
+label L567
 strref 446 m0s17
 strref 447 m0s16
 call 448 lexer_emit unknown 2 446 447
@@ -3854,14 +3888,14 @@ load 451 character
 call 452 pith_cstring_release void 1 451
 iconst 453 0
 ret 453
-label L560
-label L558
+label L566
+label L564
 load 454 character
 strref 455 m0s14
 call 456 pith_cstring_eq bool 2 454 455
 call 457 pith_cstring_release void 1 455
-brif 456 L568 L569
-label L568
+brif 456 L574 L575
+label L574
 strref 458 m0s15
 strref 459 m0s14
 call 460 lexer_emit unknown 2 458 459
@@ -3871,67 +3905,70 @@ load 463 character
 call 464 pith_cstring_release void 1 463
 iconst 465 0
 ret 465
-label L569
-label L567
+label L575
+label L573
 load 466 character
 strref 467 m0s12
 call 468 pith_cstring_eq bool 2 466 467
 call 469 pith_cstring_release void 1 467
-brif 468 L571 L572
-label L571
-strref 470 m0s13
-strref 471 m0s12
-call 472 lexer_emit unknown 2 470 471
-call 473 pith_cstring_release void 1 470
-call 474 pith_cstring_release void 1 471
-load 475 character
-call 476 pith_cstring_release void 1 475
-iconst 477 0
-ret 477
-label L572
-label L570
-load 478 character
-strref 479 m0s10
-call 480 pith_cstring_eq bool 2 478 479
-call 481 pith_cstring_release void 1 479
-brif 480 L574 L575
-label L574
-strref 482 m0s11
-strref 483 m0s10
-call 484 lexer_emit unknown 2 482 483
-call 485 pith_cstring_release void 1 482
-call 486 pith_cstring_release void 1 483
-load 487 character
-call 488 pith_cstring_release void 1 487
-iconst 489 0
-ret 489
-label L575
-label L573
-load 490 character
-strref 491 m0s8
-call 492 pith_cstring_eq bool 2 490 491
-call 493 pith_cstring_release void 1 491
-brif 492 L577 L578
+brif 468 L577 L578
 label L577
-strref 494 m0s9
-strref 495 m0s8
-call 496 lexer_emit unknown 2 494 495
-call 497 pith_cstring_release void 1 494
-call 498 pith_cstring_release void 1 495
-load 499 character
-call 500 pith_cstring_release void 1 499
-iconst 501 0
-ret 501
+load 470 lexer_group_depth
+iconst 471 1
+add 472 470 471
+store lexer_group_depth 472
+strref 473 m0s13
+strref 474 m0s12
+call 475 lexer_emit unknown 2 473 474
+call 476 pith_cstring_release void 1 473
+call 477 pith_cstring_release void 1 474
+load 478 character
+call 479 pith_cstring_release void 1 478
+iconst 480 0
+ret 480
 label L578
 label L576
-load 502 character
-strref 503 m0s6
-call 504 pith_cstring_eq bool 2 502 503
-call 505 pith_cstring_release void 1 503
-brif 504 L580 L581
+load 481 character
+strref 482 m0s10
+call 483 pith_cstring_eq bool 2 481 482
+call 484 pith_cstring_release void 1 482
+brif 483 L580 L581
 label L580
-strref 506 m0s7
-strref 507 m0s6
+load 485 lexer_group_depth
+iconst 486 0
+gt 487 485 486
+brif 487 L583 L584
+label L583
+load 488 lexer_group_depth
+iconst 489 1
+sub 490 488 489
+store lexer_group_depth 490
+jmp L582
+label L584
+label L582
+strref 491 m0s11
+strref 492 m0s10
+call 493 lexer_emit unknown 2 491 492
+call 494 pith_cstring_release void 1 491
+call 495 pith_cstring_release void 1 492
+load 496 character
+call 497 pith_cstring_release void 1 496
+iconst 498 0
+ret 498
+label L581
+label L579
+load 499 character
+strref 500 m0s8
+call 501 pith_cstring_eq bool 2 499 500
+call 502 pith_cstring_release void 1 500
+brif 501 L586 L587
+label L586
+load 503 lexer_group_depth
+iconst 504 1
+add 505 503 504
+store lexer_group_depth 505
+strref 506 m0s9
+strref 507 m0s8
 call 508 lexer_emit unknown 2 506 507
 call 509 pith_cstring_release void 1 506
 call 510 pith_cstring_release void 1 507
@@ -3939,61 +3976,106 @@ load 511 character
 call 512 pith_cstring_release void 1 511
 iconst 513 0
 ret 513
-label L581
-label L579
+label L587
+label L585
 load 514 character
-call 515 lexer_is_lbrace bool 1 514
-brif 515 L583 L584
-label L583
-strref 516 m0s5
-load 517 lexer_LBRACE
-call 518 lexer_emit unknown 2 516 517
-call 519 pith_cstring_release void 1 516
-load 520 character
-call 521 pith_cstring_release void 1 520
-iconst 522 0
-ret 522
-label L584
-label L582
-load 523 character
-call 524 lexer_is_rbrace bool 1 523
-brif 524 L586 L587
-label L586
-strref 525 m0s4
-load 526 lexer_RBRACE
-call 527 lexer_emit unknown 2 525 526
+strref 515 m0s6
+call 516 pith_cstring_eq bool 2 514 515
+call 517 pith_cstring_release void 1 515
+brif 516 L589 L590
+label L589
+load 518 lexer_group_depth
+iconst 519 0
+gt 520 518 519
+brif 520 L592 L593
+label L592
+load 521 lexer_group_depth
+iconst 522 1
+sub 523 521 522
+store lexer_group_depth 523
+jmp L591
+label L593
+label L591
+strref 524 m0s7
+strref 525 m0s6
+call 526 lexer_emit unknown 2 524 525
+call 527 pith_cstring_release void 1 524
 call 528 pith_cstring_release void 1 525
 load 529 character
 call 530 pith_cstring_release void 1 529
 iconst 531 0
 ret 531
-label L587
-label L585
+label L590
+label L588
 load 532 character
-strref 533 m0s2
-call 534 pith_cstring_eq bool 2 532 533
-call 535 pith_cstring_release void 1 533
-brif 534 L589 L590
-label L589
-strref 536 m0s3
-strref 537 m0s2
-call 538 lexer_emit unknown 2 536 537
-call 539 pith_cstring_release void 1 536
+call 533 lexer_is_lbrace bool 1 532
+brif 533 L595 L596
+label L595
+load 534 lexer_group_depth
+iconst 535 1
+add 536 534 535
+store lexer_group_depth 536
+strref 537 m0s5
+load 538 lexer_LBRACE
+call 539 lexer_emit unknown 2 537 538
 call 540 pith_cstring_release void 1 537
 load 541 character
 call 542 pith_cstring_release void 1 541
 iconst 543 0
 ret 543
-label L590
-label L588
-strref 544 m0s1
-load 545 character
-call 546 lexer_emit unknown 2 544 545
-call 547 pith_cstring_release void 1 544
-load 548 character
-call 549 pith_cstring_release void 1 548
-iconst 550 0
-ret 550
+label L596
+label L594
+load 544 character
+call 545 lexer_is_rbrace bool 1 544
+brif 545 L598 L599
+label L598
+load 546 lexer_group_depth
+iconst 547 0
+gt 548 546 547
+brif 548 L601 L602
+label L601
+load 549 lexer_group_depth
+iconst 550 1
+sub 551 549 550
+store lexer_group_depth 551
+jmp L600
+label L602
+label L600
+strref 552 m0s4
+load 553 lexer_RBRACE
+call 554 lexer_emit unknown 2 552 553
+call 555 pith_cstring_release void 1 552
+load 556 character
+call 557 pith_cstring_release void 1 556
+iconst 558 0
+ret 558
+label L599
+label L597
+load 559 character
+strref 560 m0s2
+call 561 pith_cstring_eq bool 2 559 560
+call 562 pith_cstring_release void 1 560
+brif 561 L604 L605
+label L604
+strref 563 m0s3
+strref 564 m0s2
+call 565 lexer_emit unknown 2 563 564
+call 566 pith_cstring_release void 1 563
+call 567 pith_cstring_release void 1 564
+load 568 character
+call 569 pith_cstring_release void 1 568
+iconst 570 0
+ret 570
+label L605
+label L603
+strref 571 m0s1
+load 572 character
+call 573 lexer_emit unknown 2 571 572
+call 574 pith_cstring_release void 1 571
+load 575 character
+call 576 pith_cstring_release void 1 575
+iconst 577 0
+ret 577
 endfunc
 func lexer_init_lexer 1 unknown
 param src
@@ -4026,18 +4108,20 @@ call 18 pith_list_new_default list 0
 iconst 19 0
 call 20 pith_list_push_value void 2 18 19
 store lexer_indent_stack 18
-call 21 pith_list_new_cstr list_string 0
-store lexer_pending_token_kinds 21
+iconst 21 0
+store lexer_group_depth 21
 call 22 pith_list_new_cstr list_string 0
-store lexer_pending_token_values 22
-call 23 pith_list_new_default list 0
-store lexer_pending_token_lines 23
+store lexer_pending_token_kinds 22
+call 23 pith_list_new_cstr list_string 0
+store lexer_pending_token_values 23
 call 24 pith_list_new_default list 0
-store lexer_pending_token_columns 24
-iconst 25 0
-store lexer_pending_dedents 25
+store lexer_pending_token_lines 24
+call 25 pith_list_new_default list 0
+store lexer_pending_token_columns 25
 iconst 26 0
-ret 26
+store lexer_pending_dedents 26
+iconst 27 0
+ret 27
 endfunc
 func lexer_tok_kind 1 string
 param i
@@ -4100,12 +4184,12 @@ iconst 7 0
 store __for_idx_0 7
 store __for_len_0 6
 store __for_iter_0 5
-label L591
+label L606
 load 8 __for_idx_0
 load 9 __for_len_0
 lt 10 8 9
-brif 10 L592 L594
-label L592
+brif 10 L607 L609
+label L607
 load 11 __for_iter_0
 load 12 __for_idx_0
 call 13 pith_list_get_value unknown 2 11 12
@@ -4130,13 +4214,13 @@ load 30 tok
 load 31 tok
 field 32 31 24 int current_column
 call 33 pith_list_push_value void 2 29 32
-label L593
+label L608
 load 34 __for_idx_0
 iconst 35 1
 add 36 34 35
 store __for_idx_0 36
-jmp L591
-label L594
+jmp L606
+label L609
 iconst 37 0
 ret 37
 endfunc
@@ -4159,12 +4243,12 @@ iconst 10 0
 store __for_idx_1 10
 store __for_len_1 9
 store __for_iter_1 8
-label L595
+label L610
 load 11 __for_idx_1
 load 12 __for_len_1
 lt 13 11 12
-brif 13 L596 L598
-label L596
+brif 13 L611 L613
+label L611
 load 14 __for_iter_1
 load 15 __for_idx_1
 call 16 pith_list_get_value_unchecked string 2 14 15
@@ -4172,25 +4256,25 @@ store kind 16
 load 17 lexer__tok_kinds
 load 18 kind
 call 19 pith_list_push_value void 2 17 18
-label L597
+label L612
 load 20 __for_idx_1
 iconst 21 1
 add 22 20 21
 store __for_idx_1 22
-jmp L595
-label L598
+jmp L610
+label L613
 load 23 values
 call 24 pith_auto_len int 1 23
 iconst 25 0
 store __for_idx_2 25
 store __for_len_2 24
 store __for_iter_2 23
-label L599
+label L614
 load 26 __for_idx_2
 load 27 __for_len_2
 lt 28 26 27
-brif 28 L600 L602
-label L600
+brif 28 L615 L617
+label L615
 load 29 __for_iter_2
 load 30 __for_idx_2
 call 31 pith_list_get_value_unchecked string 2 29 30
@@ -4198,25 +4282,25 @@ store value 31
 load 32 lexer__tok_values
 load 33 value
 call 34 pith_list_push_value void 2 32 33
-label L601
+label L616
 load 35 __for_idx_2
 iconst 36 1
 add 37 35 36
 store __for_idx_2 37
-jmp L599
-label L602
+jmp L614
+label L617
 load 38 lines
 call 39 pith_auto_len int 1 38
 iconst 40 0
 store __for_idx_3 40
 store __for_len_3 39
 store __for_iter_3 38
-label L603
+label L618
 load 41 __for_idx_3
 load 42 __for_len_3
 lt 43 41 42
-brif 43 L604 L606
-label L604
+brif 43 L619 L621
+label L619
 load 44 __for_iter_3
 load 45 __for_idx_3
 call 46 pith_list_get_value unknown 2 44 45
@@ -4224,25 +4308,25 @@ store line 46
 load 47 lexer__tok_lines
 load 48 line
 call 49 pith_list_push_value void 2 47 48
-label L605
+label L620
 load 50 __for_idx_3
 iconst 51 1
 add 52 50 51
 store __for_idx_3 52
-jmp L603
-label L606
+jmp L618
+label L621
 load 53 cols
 call 54 pith_auto_len int 1 53
 iconst 55 0
 store __for_idx_4 55
 store __for_len_4 54
 store __for_iter_4 53
-label L607
+label L622
 load 56 __for_idx_4
 load 57 __for_len_4
 lt 58 56 57
-brif 58 L608 L610
-label L608
+brif 58 L623 L625
+label L623
 load 59 __for_iter_4
 load 60 __for_idx_4
 call 61 pith_list_get_value unknown 2 59 60
@@ -4250,13 +4334,13 @@ store col 61
 load 62 lexer__tok_cols
 load 63 col
 call 64 pith_list_push_value void 2 62 63
-label L609
+label L624
 load 65 __for_idx_4
 iconst 66 1
 add 67 65 66
 store __for_idx_4 67
-jmp L607
-label L610
+jmp L622
+label L625
 iconst 68 0
 ret 68
 endfunc
@@ -4280,10 +4364,10 @@ call 10 pith_list_release_handle void 1 8
 store tokens 9
 iconst 11 1
 store keep_going 11
-label L611
+label L626
 load 12 keep_going
-brif 12 L612 L613
-label L612
+brif 12 L627 L628
+label L627
 call 13 lexer_next_token unknown 0
 load 14 tokens
 load 15 lexer_current_token_kind
@@ -4317,15 +4401,15 @@ load 38 lexer_current_token_kind
 strref 39 m0s0
 call 40 pith_cstring_eq bool 2 38 39
 call 41 pith_cstring_release void 1 39
-brif 40 L615 L616
-label L615
+brif 40 L630 L631
+label L630
 iconst 42 0
 store keep_going 42
-jmp L614
-label L616
-label L614
-jmp L611
-label L613
+jmp L629
+label L631
+label L629
+jmp L626
+label L628
 load 43 tokens
 ret 43
 load 44 tokens

@@ -1,0 +1,44 @@
+# arguments and literals spanning lines: inside (, [, { the lexer
+# treats newlines as spaces, so long calls can break naturally.
+struct Post:
+    title: String
+    year: Int
+    tags: List[String]
+
+fn add3(a: Int, b: Int, c: Int) -> Int:
+    return a + b + c
+
+fn main():
+    p := Post(
+        "spanning lines",
+        2026,
+        ["multi", "line"])
+    print("{p.title} {p.year} {p.tags[1]}")
+
+    total := add3(
+        1,
+        2,
+        3)
+    print("{total}")
+
+    xs := [
+        10,
+        20,
+        30,
+    ]
+    print("{xs.len()} {xs[2]}")
+
+    m := {
+        "a": 1,
+        "b": 2,
+    }
+    print("{m["b"]}")
+
+    nested := add3(add3(1, 1, 1),
+        add3(2, 2,
+            2),
+        3)
+    print("{nested}")
+
+    interp_still_works := "paren ( in string"
+    print("{interp_still_works} {add3(1, 1, 1)}")

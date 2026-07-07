@@ -991,9 +991,12 @@ fn ir_emit_impl_methods(node: Node, impl_type: String):
     # out of ir_impl_methods (ir_impl_func below overwrites it).
     ir_emit_impl_method_specializations(node, impl_type)
     for child in node.children:
-        child_node := get_node(child)
+        # a pub method sits behind a pub wrapper node; without this
+        # unwrap the method silently never emits and calls return zero
+        method_idx := ir_unwrap_pub_child(child)
+        child_node := get_node(method_idx)
         if child_node.kind == "fn_decl":
-            ir_impl_func(child, impl_type)
+            ir_impl_func(method_idx, impl_type)
 
 fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
     if not has_generic_declaration(impl_type):
@@ -1014,9 +1017,10 @@ fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
             arg_names.push(ir_type_from_tid(at))
         instance_type_name := get_type_name(inst_tid)
         for child in impl_node.children:
-            child_node := get_node(child)
+            method_idx := ir_unwrap_pub_child(child)
+            child_node := get_node(method_idx)
             if child_node.kind == "fn_decl":
-                ir_impl_func_specialized(child, impl_type, instance_type_name, struct_params, arg_names)
+                ir_impl_func_specialized(method_idx, impl_type, instance_type_name, struct_params, arg_names)
 
 fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: String, params: List[String], arg_names: List[String]):
     node := get_node(idx)

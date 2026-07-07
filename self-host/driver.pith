@@ -21,22 +21,6 @@ pub fn get_directory(path: String) -> String:
         return "."
     return path.substring(0, last_slash)
 
-# extract filename without extension from a path.
-pub fn get_stem(path: String) -> String:
-    # find last slash
-    mut last_slash := 0 - 1
-    for ch, i in path:
-        if ch == "/":
-            last_slash = i
-    mut name := path
-    if last_slash >= 0:
-        name = path.substring(last_slash + 1, path.len())
-    # strip .pith extension
-    if name.len() > 5:
-        if name.substring(name.len() - 5, name.len()) == ".pith":
-            return name.substring(0, name.len() - 5)
-    return name
-
 # scan an AST root for import declarations and return the module paths.
 # from_import values are "path name1 name2 ..." - we extract the path.
 # plain import values are "path" or "path as alias" - we extract the path.
@@ -273,9 +257,6 @@ fn dr_resolve_module_file(mod_path: String, source_path: String) -> String:
 
     return local_file
 
-pub fn package_root_for_source(source_path: String) -> String:
-    return dr_find_package_root(source_path)
-
 pub fn package_root_file(package_root: String) -> String:
     return dr_root_file_for_package(package_root)
 
@@ -412,57 +393,3 @@ mut module_aliases: Map[String, String] := {}
 # Add a module alias mapping
 pub fn add_module_alias(alias: String, module_path: String):
     module_aliases.insert(alias, module_path)
-
-# Lookup a module path by alias
-pub fn resolve_module_alias(name: String) -> String:
-    if module_aliases.contains_key(name):
-        return module_aliases[name]
-    return ""
-
-# Clear all aliases (call at start of compilation)
-pub fn clear_module_aliases():
-    module_aliases = {}
-
-# Parse import declarations and extract aliases
-# Returns the module path and populates the alias map
-pub fn find_imports_with_aliases(root_idx: Int) -> List[String]:
-    root := get_node(root_idx)
-    mut imports: List[String] := []
-    for child in root.children:
-        node := get_node(child)
-        mut kind := node.kind
-        mut value := node.value
-        if kind == "pub":
-            inner := get_node(node.children[0])
-            kind = inner.kind
-            value = inner.value
-        if kind == "import":
-            # Format: "path" or "path as alias"
-            mut path := value
-            mut has_alias := false
-            mut alias := ""
-            mut si := 0
-            while si < value.len() - 3:
-                if value[si] == " " and value[si + 1] == "a" and value[si + 2] == "s" and value[si + 3] == " ":
-                    path = value.substring(0, si)
-                    alias = value.substring(si + 4, value.len())
-                    has_alias = true
-                    break
-                si = si + 1
-            imports.push(path)
-            if has_alias:
-                add_module_alias(alias, path)
-        elif kind == "from_import":
-            # Format: "path name1 name2 ..."
-            mut space_pos := 0 - 1
-            mut si := 0
-            while si < value.len():
-                if value[si] == " ":
-                    space_pos = si
-                    break
-                si = si + 1
-            mut mod_path := value
-            if space_pos >= 0:
-                mod_path = value.substring(0, space_pos)
-            imports.push(mod_path)
-    return imports

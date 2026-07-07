@@ -185,42 +185,6 @@ pub fn process_import_aliases(root_idx: Int):
                                 generic_named_import_entries.push(current_checker_module_path + chr(9) + imported_name + chr(9) + mod_path)
                             pi = pi + 1
 
-# Collect all pub exports from a module.
-pub fn collect_module_exports(module_path: String, root_idx: Int):
-    root := get_node(root_idx)
-
-    for child in root.children:
-        node := get_node(child)
-        if node.kind == "pub":
-            if node.children.len() > 0:
-                inner := get_node(node.children[0])
-                if inner.kind == "fn_decl":
-                    module_export_entries.push(module_path + chr(9) + inner.value)
-                elif inner.kind == "struct_decl":
-                    module_export_entries.push(module_path + chr(9) + inner.value)
-                elif inner.kind == "enum_decl":
-                    module_export_entries.push(module_path + chr(9) + inner.value)
-                elif inner.kind == "type_alias":
-                    module_export_entries.push(module_path + chr(9) + inner.value)
-                elif inner.kind == "binding":
-                    # Extract binding name from value (format: "name mut" or "name")
-                    mut name_end := inner.value.len()
-                    mut si := 0
-                    while si < inner.value.len():
-                        if ord(inner.value[si]) == 32:
-                            name_end = si
-                            break
-                        si = si + 1
-                    binding_name := inner.value.substring(0, name_end)
-                    module_export_entries.push(module_path + chr(9) + binding_name)
-
-pub fn debug_intern_list_string() -> Int:
-    return intern_list_type(lookup_type_id("String"))
-
-pub fn debug_add_list_type_direct() -> Int:
-    add_type_info(ti_list(lookup_type_id("String")))
-    return get_type_count()
-
 # build an instantiation name like "Pair[Int,String]"
 fn build_instantiated_type_name(base: String, type_args: List[Int]) -> String:
     mut result := base + "["
@@ -236,9 +200,6 @@ fn build_instantiated_type_name(base: String, type_args: List[Int]) -> String:
 # ---------------------------------------------------------------
 
 mut type_resolve_depth := 0
-
-pub fn c_resolve_type(node_idx: Int) -> Int:
-    return resolve_type_with_substitution(node_idx, false, "")
 
 # resolve a type expression node, with optional generic substitution
 # subst_active: if true, subst_params/subst_args provide substitution
@@ -2744,15 +2705,6 @@ pub fn iface_type_arg_names(node: Node) -> List[String]:
             for part in parts:
                 names.push(part.trim())
     return names
-
-# Resolve the type-argument names of a bound to tids. Unknown names map to -1
-# (not an error here; impl registration runs before all types may be known).
-fn iface_type_arg_tids(node: Node) -> List[Int]:
-    mut tids: List[Int] := []
-    arg_names := iface_type_arg_names(node)
-    for n in arg_names:
-        tids.push(lookup_type_id(n))
-    return tids
 
 # Encode an impl's interface arguments so bound-based inference can resolve
 # them later against a concrete instance. Each arg is one of:

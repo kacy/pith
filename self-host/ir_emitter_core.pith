@@ -787,22 +787,11 @@ fn ir_emit_string_prologue(body_idx: Int):
             ir_emit("store " + ir_resolve_storage_name(name) + " " + z.to_string())
         i = i + 1
 
-fn ir_module_alias_member_name(alias: String, member: String) -> String:
-    return ir_module_alias_member_name_with_state(alias, member, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
-
 fn ir_import_declares_function(module_path: String, name: String) -> Bool:
     return ir_import_declares_function_with_state(module_path, name, ir_import_declared_functions)
 
 fn ir_import_declares_global(module_path: String, name: String) -> Bool:
     return ir_import_declares_global_with_state(module_path, name, ir_import_declared_globals)
-
-fn ir_collect_import_declared_functions(root_idx: Int, module_path: String):
-    for item_idx in ir_root_items(root_idx):
-        node := get_node(item_idx)
-        if ir_is_fn_decl_kind(node.kind):
-            ir_import_declared_functions.insert(module_path + "." + ir_base_decl_name(node.value), true)
-        elif ir_is_binding_kind(node.kind):
-            ir_import_declared_globals.insert(module_path + "." + ir_binding_name(node), true)
 
 fn ir_record_generic_function_decl(item_idx: Int, node: Node, module_path: String):
     mut full_name := node.value
@@ -821,9 +810,6 @@ fn ir_collect_preloaded_root_metadata(root_idx: Int, module_path: String):
 
 fn ir_ident_callee(name: String) -> ResolvedCallee:
     return ir_ident_callee_with_state(name, ir_import_renames, ir_active_generic_module_path, ir_import_declared_functions)
-
-fn ir_resolve_module_alias_call_name(idx: Int) -> String:
-    return ir_resolve_module_alias_call_name_with_state(idx, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
 fn ir_resolve_module_alias_method_call_name(idx: Int) -> String:
     return ir_resolve_module_alias_method_call_name_with_state(idx, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
@@ -888,9 +874,6 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
         else:
             arg_regs.push(ir_expr(child))
     return arg_regs
-
-fn ir_emit_resolved_call(result_reg: Int, fname: String, idx: Int, arg_regs: List[Int], uses_result_abi: Bool):
-    ir_emit_call_text(result_reg, fname, ir_call_retkind_for_name(idx, uses_result_abi, fname), arg_regs.len(), ir_join_arg_regs(arg_regs))
 
 # owned string arguments (fresh chars from s[i], concat results, fresh
 # method results) die once the call they fed returns: callees borrow their
@@ -2187,9 +2170,6 @@ fn ir_emit_config_field_key(field_name: String, prefix_r: Int, index_idx: Int) -
     ir_emit_call2(full_key_r, ir_resolve_config_call_name(index_idx, "dotted_key"), "string", prefix_r, key_r)
     return full_key_r
 
-fn ir_struct_layout_name(struct_name: String) -> String:
-    return ir_struct_layout_name_with_state(struct_name, ir_struct_names)
-
 fn ir_struct_field_count(struct_name: String) -> Int:
     return ir_struct_field_count_with_state(struct_name, ir_struct_names)
 
@@ -2198,12 +2178,6 @@ fn ir_struct_field_name_at(struct_name: String, field_index: Int) -> String:
 
 fn ir_struct_field_type_name(struct_name: String, field_name: String) -> String:
     return ir_struct_field_type_name_with_state(struct_name, field_name, ir_struct_names, ir_struct_field_lookup)
-
-fn ir_struct_field_kind_from_decl(struct_name: String, field_index: Int) -> String:
-    return ir_struct_field_kind_from_decl_with_state(struct_name, field_index, ir_struct_names, ir_struct_decl_nodes, ir_type_aliases)
-
-fn ir_field_kind_tid(kind: String) -> Int:
-    return ir_field_kind_tid_with_state(kind, ir_struct_names)
 
 fn ir_struct_field_tid_at(struct_name: String, field_index: Int, fallback_tid: Int) -> Int:
     return ir_struct_field_tid_at_with_state(struct_name, field_index, fallback_tid, ir_struct_names, ir_struct_decl_nodes, ir_struct_field_index_lookup, ir_struct_field_lookup, ir_type_aliases)
@@ -3796,10 +3770,6 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
         elem_r := ir_expr(child)
         ir_emit_call2(ir_reg(), "__list_push", "void", list_r, elem_r)
     return list_r
-
-fn ir_emit_tuple_stores(tuple_r: Int, elem_regs: List[Int]):
-    for elem_reg, i in elem_regs:
-        ir_emit("sstore " + tuple_r.to_string() + " " + i.to_string() + " " + elem_reg.to_string())
 
 fn ir_emit_tuple_literal_stores(tuple_r: Int, elem_regs: List[Int], elem_nodes: List[Int]):
     for elem_reg, i in elem_regs:
@@ -6256,15 +6226,6 @@ fn ir_collect_generic_function_decls_from_root(root_idx: Int, module_path: Strin
         if ir_is_fn_decl_kind(node.kind) and ir_has_generic_params(node):
             ir_record_generic_function_decl(item_idx, node, module_path)
 
-fn ir_collect_generic_function_decls(root_idx: Int):
-    ir_generic_decl_indices = {}
-    for root, preload_i in ir_preloaded_import_roots:
-        mut module_path := ""
-        if preload_i < ir_preloaded_import_paths.len():
-            module_path = ir_preloaded_import_paths[preload_i]
-        ir_collect_generic_function_decls_from_root(root, module_path)
-    ir_collect_generic_function_decls_from_root(root_idx, "")
-
 fn ir_is_generic_function_name(name: String) -> Bool:
     return ir_generic_decl_indices.contains_key(name)
 
@@ -6597,20 +6558,6 @@ fn ir_collect_import_item(node: Node):
     elif node.kind == "from_import":
         ir_collect_from_import_renames(node.value)
 
-# --- collect import renames ---
-fn ir_collect_imports(root_idx: Int):
-    for item_idx in ir_root_items(root_idx):
-        ir_collect_import_item(get_node(item_idx))
-
-fn ir_collect_type_aliases(root_idx: Int):
-    ir_type_aliases = {}
-    for item_idx in ir_root_items(root_idx):
-        cn := get_node(item_idx)
-        if cn.kind == "type_alias":
-            target := ir_type_alias_target(cn)
-            if target.len() > 0:
-                ir_type_aliases.insert(cn.value, target)
-
 fn ir_register_alias_structs(root_idx: Int):
     for item_idx in ir_root_items(root_idx):
         cn := get_node(item_idx)
@@ -6621,13 +6568,6 @@ fn ir_register_alias_structs(root_idx: Int):
                 if ir_struct_names.contains_key(target):
                     ir_struct_names.insert(aname, ir_struct_names[target])
                     ir_emit("struct_alias " + aname + " " + target)
-
-fn ir_collect_function_returns(root_idx: Int):
-    ir_func_returns = {}
-    for item_idx in ir_root_items(root_idx):
-        node := get_node(item_idx)
-        if ir_is_fn_decl_kind(node.kind):
-            ir_record_function_return(node)
 
 fn ir_record_function_return(node: Node):
     for returns_idx in node.children:
@@ -6704,40 +6644,6 @@ fn ir_emit_global_bindings(root: Node):
         cn := ir_unwrap_pub_node(child)
         if ir_is_binding_kind(cn.kind):
             ir_emit_global_binding(cn)
-
-fn ir_emit_collection_global_init(binding: Node):
-    gname := ir_binding_name(binding)
-    for gc in binding.children:
-        gcn := get_node(gc)
-        if gcn.kind == "list":
-            list_r := ir_reg()
-            if ir_global_list_string_names.contains(gname):
-                ir_emit_call0(list_r, "__list_new_str", "list")
-            else:
-                ir_emit_call0(list_r, "__list_new", "list")
-            ir_emit("store " + gname + " " + list_r.to_string())
-        elif gcn.kind == "map":
-            map_r := ir_reg()
-            mut global_str_val := false
-            if ir_global_map_value_types.contains_key(gname):
-                global_str_val = ir_global_map_value_types[gname] == "string"
-            if ir_global_map_int_names.contains(gname):
-                if global_str_val:
-                    ir_emit_call0(map_r, "__map_new_int_str_val", "map_int")
-                else:
-                    ir_emit_call0(map_r, "__map_new_int", "map_int")
-            elif global_str_val:
-                ir_emit_call0(map_r, "__map_new_str_val", "map")
-            else:
-                ir_emit_call0(map_r, "__map_new", "map")
-            ir_emit("store " + gname + " " + map_r.to_string())
-        elif gcn.kind == "set":
-            set_r := ir_reg()
-            if ir_global_set_int_names.contains(gname):
-                ir_emit_call0(set_r, "__set_new_int", "set_int")
-            else:
-                ir_emit_call0(set_r, "__set_new", "set")
-            ir_emit("store " + gname + " " + set_r.to_string())
 
 # attach the type's destructor to a freshly built struct so its rc
 # fields release when the struct dies

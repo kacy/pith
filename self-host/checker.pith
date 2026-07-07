@@ -1488,10 +1488,16 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
             return c_check_expr(node.children[0], scope_id)
         return TID_ERR
     if node.kind == "string_interp":
-        # check all interpolated expressions
+        # check all interpolated expressions; a format-spec part wraps
+        # its expression one level down
         for child in node.children:
             cn := get_node(child)
-            if cn.kind != "lit":
+            if cn.kind == "interp_spec":
+                spec_tid := c_check_expr(cn.children[0], scope_id)
+                if is_error_type(spec_tid) == false:
+                    if type_supports_stringify(spec_tid) == false:
+                        report_error("E219", "string interpolation requires a stringifiable value, got " + get_type_name(spec_tid))
+            elif cn.kind != "lit":
                 expr_tid := c_check_expr(child, scope_id)
                 if is_error_type(expr_tid) == false:
                     if type_supports_stringify(expr_tid) == false:

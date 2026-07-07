@@ -214,6 +214,11 @@ pool. `make sitegen-check`, `make logscan-check`, `make apic-check`,
 and `make parq-check` diff all four against golden files. they double
 as the honest answer to "what does non-trivial pith look like."
 
+**format specs:** interpolation takes rust-style specs after a colon:
+`{total:8.2}` pads to width 8 with 2 decimals, `{n:04}` zero-pads,
+`{name:<12}` and `{name:^12}` left-align and center. colons inside
+strings or brackets never start a spec.
+
 **error codes:** every diagnostic has a stable code — E0xx (lexer),
 E1xx (parser), E2xx (checker), E3xx (lint). see `docs/errors.md` for the
 full reference.

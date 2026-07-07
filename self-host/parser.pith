@@ -933,8 +933,12 @@ fn parse_string_interpolation() -> Int:
         if check("interpolation_expr"):
             _tv := _cur_tok_value()
             advance_token()
-            interp_expr := parse_interp_expr(_tv)
-            parts.push(interp_expr)
+            split := split_format_spec(_tv)
+            interp_expr := parse_interp_expr(split.0)
+            if split.1.len() > 0:
+                parts.push(add_node_with_position("interp_spec", split.1, [interp_expr]))
+            else:
+                parts.push(interp_expr)
             matched_part = true
 
         # string_mid — more interpolations follow
@@ -961,6 +965,65 @@ fn parse_string_interpolation() -> Int:
             keep_parsing = false
 
     return add_node_with_position("string_interp", "", parts)
+
+# split "expr:spec" at a top-level colon when the suffix reads as a
+# format spec: optional alignment (< > ^), optional zero flag, width
+# digits, optional .precision. colons inside strings or brackets never
+# split, and a suffix that isn't a spec leaves the text untouched.
+fn split_format_spec(text: String) -> (String, String):
+    mut depth := 0
+    mut in_str := false
+    mut i := 0
+    mut colon := 0 - 1
+    while i < text.len():
+        c := text[i]
+        if in_str:
+            if c == chr(34):
+                in_str = false
+        elif c == chr(34):
+            in_str = true
+        elif c == "(" or c == "[":
+            depth = depth + 1
+        elif c == ")" or c == "]":
+            depth = depth - 1
+        elif c == ":" and depth == 0:
+            colon = i
+            i = text.len()
+        i = i + 1
+    if colon <= 0:
+        return (text, "")
+    spec := text.substring(colon + 1, text.len())
+    if is_format_spec(spec):
+        return (text.substring(0, colon), spec)
+    return (text, "")
+
+fn is_format_spec(spec: String) -> Bool:
+    if spec.len() == 0:
+        return false
+    mut i := 0
+    c0 := spec[0]
+    if c0 == "<" or c0 == ">" or c0 == "^":
+        i = 1
+    mut digits := 0
+    mut dot := false
+    mut frac_digits := 0
+    while i < spec.len():
+        c := spec[i]
+        if c == ".":
+            if dot:
+                return false
+            dot = true
+        elif c >= "0" and c <= "9":
+            if dot:
+                frac_digits = frac_digits + 1
+            else:
+                digits = digits + 1
+        else:
+            return false
+        i = i + 1
+    if dot and frac_digits == 0:
+        return false
+    return digits > 0 or frac_digits > 0
 
 fn parse_interp_expr(text: String) -> Int:
     # save parser state

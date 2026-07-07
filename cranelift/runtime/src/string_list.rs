@@ -129,11 +129,69 @@ pub unsafe extern "C" fn pith_cstring_char_at(s: *const i8, index: i64) -> *mut 
     ptr
 }
 
+/// Format a float with a fixed number of decimal places.
+///
+/// # Safety
+/// Pure math in, fresh allocation out.
+#[no_mangle]
+pub unsafe extern "C" fn pith_float_format(value: f64, precision: i64) -> i64 {
+    let prec = precision.clamp(0, 17) as usize;
+    let text = format!("{:.*}", prec, value);
+    crate::runtime_core::pith_copy_bytes_to_cstring(text.as_bytes()) as i64
+}
+
+/// Pad a string to a width: align is '<', '>', or '^' as a byte, fill
+/// is the pad byte (space or '0'). Strings already at or over the
+/// width pass through as a fresh copy.
+///
+/// # Safety
+/// handle must be a valid cstring pointer or 0.
+#[no_mangle]
+pub unsafe extern "C" fn pith_format_pad(handle: i64, width: i64, align: i64, fill: i64) -> i64 {
+    let text = if handle == 0 {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(handle as *const i8)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let width = width.max(0) as usize;
+    let fill_ch = (fill as u8) as char;
+    let out = if text.chars().count() >= width {
+        text
+    } else {
+        let pad = width - text.chars().count();
+        match align as u8 {
+            b'<' => format!("{}{}", text, fill_ch.to_string().repeat(pad)),
+            b'^' => {
+                let left = pad / 2;
+                let right = pad - left;
+                format!(
+                    "{}{}{}",
+                    fill_ch.to_string().repeat(left),
+                    text,
+                    fill_ch.to_string().repeat(right)
+                )
+            }
+            _ => {
+                // right alignment; zero-fill tucks behind a leading sign
+                if fill_ch == '0' && (text.starts_with('-') || text.starts_with('+')) {
+                    format!("{}{}{}", &text[..1], "0".repeat(pad), &text[1..])
+                } else {
+                    format!("{}{}", fill_ch.to_string().repeat(pad), text)
+                }
+            }
+        }
+    };
+    crate::runtime_core::pith_copy_bytes_to_cstring(out.as_bytes()) as i64
+}
+
 /// Read one byte of a string as an integer: the allocation-free form of
 /// s[i] for comparisons. Out of range returns -1, which matches no byte,
 /// mirroring char_at's empty-string-on-out-of-range semantics under ==.
 ///
 /// # Safety
+
 /// s must be a valid null-terminated C string or garbage (checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_byte_at(s: *const i8, index: i64) -> i64 {

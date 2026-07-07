@@ -1,0 +1,50 @@
+# structural == on boxed enums, or-pattern payload bindings, and
+# optional unwrap_or.
+enum Shade:
+    Light
+    Dark
+    Custom(Int)
+
+enum Wrap:
+    Tagged(String, Int)
+    Plain
+
+enum Cmd:
+    Add(Int)
+    Sub(Int)
+    Note(String)
+    Tag(String)
+    Quit
+
+fn eval(c: Cmd) -> Int:
+    match c:
+        Cmd.Add(n) | Cmd.Sub(n) => n
+        Cmd.Note(s) | Cmd.Tag(s) => s.len()
+        Cmd.Quit => 0 - 1
+
+fn pick(n: Int) -> Int?:
+    if n > 0:
+        return n
+    return none
+
+fn name_of(n: Int) -> String?:
+    if n == 1:
+        return "one"
+    return none
+
+fn main():
+    a := Shade.Custom(3)
+    b := Shade.Custom(3)
+    c := Shade.Custom(4)
+    d := Shade.Light
+    e := Shade.Light
+    print("{a == b} {a == c} {a == d} {d == e}")
+    print("{a != b} {a != c}")
+    s1 := Wrap.Tagged("k", 9)
+    s2 := Wrap.Tagged("k", 9)
+    s3 := Wrap.Tagged("k", 8)
+    s4 := Wrap.Tagged("x", 9)
+    print("{s1 == s2} {s1 == s3} {s1 == s4} {s1 == Wrap.Plain}")
+    print("{eval(Cmd.Add(4))} {eval(Cmd.Sub(9))} {eval(Cmd.Note("hello"))} {eval(Cmd.Tag("xy"))} {eval(Cmd.Quit)}")
+    print("{pick(5).unwrap_or(0)} {pick(0 - 2).unwrap_or(99)}")
+    print("{name_of(1).unwrap_or("?")} {name_of(7).unwrap_or("?")}")

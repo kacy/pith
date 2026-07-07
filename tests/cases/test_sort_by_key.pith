@@ -1,0 +1,16 @@
+# std.algo.sort_by_key: string-keyed struct sorts, ascending and
+# descending, with stable ties.
+import std.algo as algo
+
+struct Person:
+    name: String
+    role: String
+
+fn main():
+    people := [Person("carol", "dev"), Person("alice", "ops"), Person("bob", "dev"), Person("alice", "dev")]
+    for p in algo.sort_by_key(people, fn(x: Person) => x.name):
+        print("{p.name} {p.role}")
+    for p in algo.sort_by_key_desc(people, fn(x: Person) => x.name):
+        print("desc {p.name}")
+    empty: List[Person] := []
+    print("{algo.sort_by_key(empty, fn(x: Person) => x.name).len()}")

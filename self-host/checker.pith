@@ -3194,35 +3194,38 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     if dispatch_type == tid_bool:
         return check_bool_method_call(method_name, arg_indices, scope_id)
 
-    # collection methods
+    # collection methods. each table answers -1 for "not my method";
+    # a non-error type id means it handled the call. (a table that
+    # reports an error and returns TID_ERR still falls through to the
+    # user-defined lookup — a long-standing wart, kept for now.)
     if recv_info.kind == "list":
         result := check_list_method_call(method_name, recv_info, arg_indices, scope_id)
-        if result >= 0 and is_error_type(result) == false:
+        if method_table_answered(result):
             return result
     if recv_info.kind == "map":
         result := check_map_method_call(method_name, recv_info, arg_indices, scope_id)
-        if result >= 0 and is_error_type(result) == false:
+        if method_table_answered(result):
             return result
     if recv_info.kind == "set":
         result := check_set_method_call(method_name, recv_info, arg_indices, scope_id)
-        if result >= 0 and is_error_type(result) == false:
+        if method_table_answered(result):
             return result
 
     # channel methods
     if recv_info.kind == "channel":
         ch_result := check_channel_method_call(method_name, recv_info, arg_indices, scope_id)
-        if ch_result >= 0 and is_error_type(ch_result) == false:
+        if method_table_answered(ch_result):
             return ch_result
 
     if recv_info.kind == "task":
         task_result := check_task_method_call(method_name, recv_info, arg_indices, scope_id)
-        if task_result >= 0 and is_error_type(task_result) == false:
+        if method_table_answered(task_result):
             return task_result
 
     # sync primitive methods
     if recv_info.kind == "struct":
         sync_result := check_sync_primitive_method_call(recv_info.name, method_name, arg_indices, scope_id)
-        if sync_result >= 0 and is_error_type(sync_result) == false:
+        if method_table_answered(sync_result):
             return sync_result
 
     # enum variant constructors: Shape.Circle(2.5). the receiver is the enum
@@ -3302,6 +3305,13 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
 # ---------------------------------------------------------------
 # string methods
 # ---------------------------------------------------------------
+
+# a method table's answer counts when it is a real non-error type id:
+# negative means "not my method, keep dispatching". this predicate is
+# the whole contract — the set-insert segfault came from one gate
+# testing it wrong.
+fn method_table_answered(result: Int) -> Bool:
+    return result >= 0 and is_error_type(result) == false
 
 fn check_string_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
     tid_int := lookup_type_id("Int")

@@ -2,17 +2,18 @@
 # a channel and reports results back on another. the fourth dogfood
 # program, aimed at spawn, channels, tasks, and shared state — the one
 # surface the earlier programs never exercised hard.
+import std.algo as algo
 import std.fs as fs
 
-## one unit of work: a named computation over a payload.
+# # one unit of work: a named computation over a payload.
 pub struct Job:
     name: String
     op: String
     payload: String
 
-## a finished job: its name, the computed value, and the worker that
-## ran it (used for a total-count sanity check, never for output
-## ordering — scheduling isn't deterministic).
+# # a finished job: its name, the computed value, and the worker that
+# # ran it (used for a total-count sanity check, never for output
+# # ordering — scheduling isn't deterministic).
 pub struct Done:
     name: String
     value: Int
@@ -51,7 +52,7 @@ fn collatz_steps(n: Int) -> Int:
         steps = steps + 1
     return steps
 
-## run one job to its integer result.
+# # run one job to its integer result.
 pub fn run_job(job: Job) -> Int:
     if job.op == "checksum":
         return checksum(job.payload)
@@ -71,7 +72,7 @@ fn worker(id: Int, jobs: Channel[Job], results: Channel[Done]):
                 return
             results.send(Done(job.name, run_job(job), id))
 
-## parse the jobs file: one job per line, `name op payload`.
+# # parse the jobs file: one job per line, `name op payload`.
 pub fn load_jobs(path: String) -> List[Job]!:
     mut out: List[Job] := []
     for line in fs.read(path)!.split(chr(10)):
@@ -88,9 +89,9 @@ pub fn load_jobs(path: String) -> List[Job]!:
         out.push(Job(t.substring(0, sp1), rest.substring(0, sp2), rest.substring(sp2 + 1, rest.len())))
     return out
 
-## dispatch every job to a pool of `workers` workers and gather the
-## results, sorted by job name so output is deterministic no matter
-## which worker won which job.
+# # dispatch every job to a pool of `workers` workers and gather the
+# # results, sorted by job name so output is deterministic no matter
+# # which worker won which job.
 pub fn run_pool(all_jobs: List[Job], workers: Int) -> List[Done]:
     jobs := Channel[Job](all_jobs.len() + workers)
     results := Channel[Done](all_jobs.len())
@@ -121,21 +122,10 @@ fn worker_entry(id: Int, jobs: Channel[Job], results: Channel[Done]) -> Int:
     return id
 
 fn sort_done(items: List[Done]) -> List[Done]:
-    mut out: List[Done] := []
-    for d in items:
-        mut placed := false
-        mut i := 0
-        while i < out.len() and not placed:
-            if d.name < out[i].name:
-                out.insert(i, d)
-                placed = true
-            i = i + 1
-        if not placed:
-            out.push(d)
-    return out
+    return algo.sort_by_key(items, fn(d: Done) => d.name)
 
-## the report: per-job lines sorted by name, then totals. worker ids
-## are counted but never printed per-job.
+# # the report: per-job lines sorted by name, then totals. worker ids
+# # are counted but never printed per-job.
 pub fn render(done: List[Done], workers: Int) -> String:
     nl := chr(10)
     mut out := ""

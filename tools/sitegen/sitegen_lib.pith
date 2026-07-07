@@ -1,11 +1,12 @@
 # sitegen_lib — the site generator's logic as an importable module so
 # the cli binary and the golden test share one implementation.
+import std.algo as algo
 import std.fs as fs
 import std.toml as toml
 import std.json as json
 import std.regex as regex
 
-## one rendered post: parsed front matter plus the body as html.
+# # one rendered post: parsed front matter plus the body as html.
 pub struct Post:
     slug: String
     title: String
@@ -13,7 +14,7 @@ pub struct Post:
     tags: List[String]
     body_html: String
 
-## site-wide settings from site.toml.
+# # site-wide settings from site.toml.
 pub struct Site:
     title: String
     base_url: String
@@ -22,7 +23,7 @@ pub struct Site:
 
 # a post starts with a `---` block of `key: value` lines; everything
 # after the closing `---` is markdown.
-## split a raw post into its front-matter map and markdown body.
+# # split a raw post into its front-matter map and markdown body.
 pub fn split_front_matter(raw: String) -> (Map[String, String], String):
     mut meta: Map[String, String] := {}
     lines := raw.split(chr(10))
@@ -61,7 +62,7 @@ fn escape_html(s: String) -> String:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # inline spans: `code`, **bold**, *italic*, [text](url)
-## render inline spans: `code`, **bold**, *italic*, [text](url).
+# # render inline spans: `code`, **bold**, *italic*, [text](url).
 pub fn render_inline(s: String) -> String:
     mut out := ""
     mut i := 0
@@ -105,7 +106,7 @@ fn index_from(s: String, needle: String, start: Int) -> Int:
         if s[i] == needle:
             return i
         i = i + 1
-    return -1
+    return - 1
 
 fn find_marker(s: String, marker: String, start: Int) -> Int:
     mut i := start
@@ -113,10 +114,10 @@ fn find_marker(s: String, marker: String, start: Int) -> Int:
         if s[i] == "*" and s[i + 1] == "*":
             return i
         i = i + 1
-    return -1
+    return - 1
 
-## render the markdown subset to html: headings, paragraphs,
-## lists, and fenced code blocks.
+# # render the markdown subset to html: headings, paragraphs,
+# # lists, and fenced code blocks.
 pub fn render_markdown(md: String) -> String:
     mut out := ""
     mut in_code := false
@@ -170,7 +171,7 @@ fn placeholder(name: String) -> String:
     rb := chr(125)
     return lb + lb + name + rb + rb
 
-## fill the layout's placeholders with the site and page values.
+# # fill the layout's placeholders with the site and page values.
 pub fn apply_layout(layout: String, site: Site, title: String, content: String) -> String:
     mut page := layout.replace(placeholder("site_title"), site.title)
     page = page.replace(placeholder("title"), title)
@@ -227,19 +228,8 @@ fn load_posts(content_dir: String) -> List[Post]!:
     return sort_by_date(posts)
 
 fn sort_by_date(posts: List[Post]) -> List[Post]:
-    # newest first; insertion sort keeps it simple for small sites
-    mut out: List[Post] := []
-    for p in posts:
-        mut placed := false
-        mut i := 0
-        while i < out.len() and not placed:
-            if p.date > out[i].date:
-                out.insert(i, p)
-                placed = true
-            i = i + 1
-        if not placed:
-            out.push(p)
-    return out
+    # newest first
+    return algo.sort_by_key_desc(posts, fn(p: Post) => p.date)
 
 fn collect_tags(posts: List[Post]) -> Map[String, List[String]]:
     mut by_tag: Map[String, List[String]] := {}
@@ -250,8 +240,8 @@ fn collect_tags(posts: List[Post]) -> Map[String, List[String]]:
             by_tag.insert(t, slugs)
     return by_tag
 
-## build the whole site: posts, index, tag pages, and json feed.
-## returns the number of posts rendered.
+# # build the whole site: posts, index, tag pages, and json feed.
+# # returns the number of posts rendered.
 pub fn build_site(site_dir: String, out_dir: String) -> Int!:
 
     config := toml.parse(fs.read(site_dir + "/site.toml")!)

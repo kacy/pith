@@ -117,6 +117,32 @@ fn merge_strings(a: List[String], b: List[String]) -> List[String]:
 # ===============================================================
 
 # Binary search on a sorted list. Returns index or -1.
+# # sort a list by a string key drawn from each element, ascending.
+# # ties keep their input order (the sort is stable), so sorting by a
+# # secondary key first gives a compound order.
+pub fn sort_by_key[T](items: List[T], key: fn(T) -> String) -> List[T]:
+    mut out: List[T] := []
+    for item in items:
+        item_key := key(item)
+        mut placed := false
+        mut i := 0
+        while i < out.len() and not placed:
+            # strcmp instead of `<`: inside a generic body the checker
+            # suppresses type parameters, and an ordered string compare
+            # currently falls back to comparing pointers there
+            if strcmp(item_key, key(out[i])) < 0:
+                out.insert(i, item)
+                placed = true
+            i = i + 1
+        if not placed:
+            out.push(item)
+    return out
+
+# # sort by a string key, descending: the reverse of sort_by_key.
+pub fn sort_by_key_desc[T](items: List[T], key: fn(T) -> String) -> List[T]:
+    return sort_by_key(items, key).reverse()
+
+# # index of a value in a sorted int list, or -1.
 pub fn binary_search(list: List[Int], value: Int) -> Int:
     mut lo := 0
     mut hi := list.len() - 1

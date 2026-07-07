@@ -1,0 +1,31 @@
+# apic — a small json api client. issue a get or post against a host,
+# then pretty-print the response or extract a dotted path from it.
+#
+#   pith build tools/apic/apic.pith
+#   ./tools/apic/apic localhost:8080/item?id=3 --extract name
+import std.json as json
+import std.net.http as http
+from apic_lib import parse_args, json_at, render_node, pretty
+
+fn main() -> Int!:
+    parsed := parse_args(args())
+    if parsed == none:
+        print("usage: apic [--post body] [--extract path] [--pretty] host:port/path")
+        return 1
+    if let inv = parsed:
+        mut req := http.request(inv.method, inv.host, inv.port, inv.path)
+        if inv.body != "":
+            req = req.text_body(inv.body).header("Content-Type", "application/json")
+        resp := req.send()!
+        print("status: {resp.status_code()}")
+        text := resp.body_text() catch ""
+        if text == "":
+            return 0
+        root := json.parse(text)
+        if inv.extract != "":
+            print(render_node(json_at(root, inv.extract)))
+        elif inv.pretty:
+            print(pretty(root, 0))
+        else:
+            print(text)
+    return 0

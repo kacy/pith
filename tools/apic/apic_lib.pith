@@ -1,0 +1,140 @@
+# apic_lib — a json api client: issue a request, parse the response,
+# and pretty-print it or extract a dotted path. the third dogfood
+# program, aimed at the http-client and json-navigation surfaces.
+import std.json as json
+
+## everything one invocation needs, parsed from argv.
+pub struct Invocation:
+    method: String
+    host: String
+    port: Int
+    path: String
+    body: String
+    extract: String
+    pretty: Bool
+
+## navigate a parsed json tree by dotted path: "posts.1.title" walks
+## object keys and array indexes. -1 when the path doesn't resolve.
+pub fn json_at(root: Int, path: String) -> Int:
+    if path == "":
+        return root
+    mut cur := root
+    for part in path.split("."):
+        if cur < 0:
+            return -1
+        kind := json.type_of(cur)
+        if kind == "array":
+            idx := parse_int(part) catch -1
+            if idx < 0 or idx >= json.array_len(cur):
+                return -1
+            cur = json.array_get(cur, idx)
+        elif kind == "object":
+            cur = json.object_get(cur, part)
+        else:
+            return -1
+    return cur
+
+## render a json node as a plain scalar when possible, encoded json
+## otherwise — the shape `--extract` prints.
+pub fn render_node(handle: Int) -> String:
+    if handle < 0:
+        return "(not found)"
+    kind := json.type_of(handle)
+    if kind == "string":
+        return json.get_string(handle)
+    if kind == "int":
+        return json.get_int(handle).to_string()
+    if kind == "bool":
+        if json.get_bool(handle):
+            return "true"
+        return "false"
+    if kind == "null":
+        return "null"
+    return json.encode(handle)
+
+## re-encode with two-space indentation. the std encoder is compact;
+## this walks the tree recursively.
+pub fn pretty(handle: Int, depth: Int) -> String:
+    kind := json.type_of(handle)
+    pad := indent(depth)
+    inner_pad := indent(depth + 1)
+    nl := chr(10)
+    q := chr(34)
+    if kind == "object":
+        keys := json.object_keys(handle)
+        if keys.len() == 0:
+            return "{{}}"
+        mut out := "{{" + nl
+        for k, i in keys:
+            out = out + inner_pad + q + k + q + ": " + pretty(json.object_get(handle, k), depth + 1)
+            if i < keys.len() - 1:
+                out = out + ","
+            out = out + nl
+        return out + pad + "}}"
+    if kind == "array":
+        n := json.array_len(handle)
+        if n == 0:
+            return "[]"
+        mut out := "[" + nl
+        mut i := 0
+        while i < n:
+            out = out + inner_pad + pretty(json.array_get(handle, i), depth + 1)
+            if i < n - 1:
+                out = out + ","
+            out = out + nl
+            i = i + 1
+        return out + pad + "]"
+    return json.encode(handle)
+
+fn indent(depth: Int) -> String:
+    mut out := ""
+    mut i := 0
+    while i < depth:
+        out = out + "  "
+        i = i + 1
+    return out
+
+## parse argv into an invocation. understands:
+##   apic [--post body] [--extract path] [--pretty] host:port/path
+pub fn parse_args(argv: List[String]) -> Invocation?:
+    mut method := "GET"
+    mut body := ""
+    mut extract := ""
+    mut want_pretty := false
+    mut target := ""
+    mut i := 1
+    while i < argv.len():
+        a := argv[i]
+        if a == "--post":
+            if i + 1 >= argv.len():
+                return none
+            method = "POST"
+            body = argv[i + 1]
+            i = i + 2
+        elif a == "--extract":
+            if i + 1 >= argv.len():
+                return none
+            extract = argv[i + 1]
+            i = i + 2
+        elif a == "--pretty":
+            want_pretty = true
+            i = i + 1
+        else:
+            target = a
+            i = i + 1
+    if target == "":
+        return none
+    colon := target.index_of(":")
+    if colon < 0:
+        return none
+    mut slash := target.index_of("/")
+    if slash < 0:
+        slash = target.len()
+    host := target.substring(0, colon)
+    port := parse_int(target.substring(colon + 1, slash)) catch 0
+    mut path := "/"
+    if slash < target.len():
+        path = target.substring(slash, target.len())
+    if port <= 0:
+        return none
+    return Invocation(method, host, port, path, body, extract, want_pretty)

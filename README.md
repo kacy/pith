@@ -204,11 +204,14 @@ fn main() -> Int!:
 
 **real programs, in-tree:** `tools/sitegen/` is a small static site
 generator (toml config, front matter, a markdown subset, layouts, tag
-pages, a json feed) and `tools/logscan/` analyzes web access logs
-(combined-format parsing, gzip input, tabular aggregation, csv export).
-`make sitegen-check` and `make logscan-check` diff both against golden
-files. they double as the honest answer to "what does non-trivial pith
-look like."
+pages, a json feed), `tools/logscan/` analyzes web access logs
+(combined-format parsing, gzip input, tabular aggregation, csv export),
+and `tools/apic/` is a json api client (http requests, dotted-path
+extraction, pretty printing) whose golden check runs it against a pith
+http server — both ends of the conversation in pith. `make
+sitegen-check`, `make logscan-check`, and `make apic-check` diff all
+three against golden files. they double as the honest answer to "what
+does non-trivial pith look like."
 
 **error codes:** every diagnostic has a stable code — E0xx (lexer),
 E1xx (parser), E2xx (checker), E3xx (lint). see `docs/errors.md` for the

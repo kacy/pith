@@ -632,6 +632,28 @@ logscan-check:
 	diff -u tools/logscan/expected/report.txt "$$tmpdir/report_gz.txt" && \
 	echo "logscan output matches golden files"
 
+# --- apic golden check ---
+# builds the json api client and its fixture server, runs the client
+# against the live server, and diffs the outputs
+
+apic-check:
+	@echo "--- apic golden check ---"
+	@./target/release/pith build tools/apic/apic.pith > /dev/null
+	@./target/release/pith build tools/apic/fixture_server.pith > /dev/null
+	@tmpdir=$$(mktemp -d /tmp/pith-apic-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	./tools/apic/fixture_server 8047 3 & \
+	server_pid=$$!; \
+	sleep 1; \
+	./tools/apic/apic localhost:8047/item?id=7 --extract name > "$$tmpdir/extract.txt"; \
+	./tools/apic/apic localhost:8047/item?id=7 --pretty > "$$tmpdir/pretty.txt"; \
+	./tools/apic/apic localhost:8047/echo --post '{"ping":1}' --extract received.ping > "$$tmpdir/post.txt"; \
+	wait $$server_pid; \
+	diff -u tools/apic/expected/extract.txt "$$tmpdir/extract.txt" && \
+	diff -u tools/apic/expected/pretty.txt "$$tmpdir/pretty.txt" && \
+	diff -u tools/apic/expected/post.txt "$$tmpdir/post.txt" && \
+	echo "apic output matches golden files"
+
 # --- cli regressions ---
 
 cli-regressions: build cli-regressions-only

@@ -8,7 +8,7 @@ import std.compress.gzip as gzip
 import std.data.table as table
 import std.regex as regex
 
-## one parsed access-log line.
+# # one parsed access-log line.
 pub struct Hit:
     ip: String
     stamp: String
@@ -18,8 +18,8 @@ pub struct Hit:
     size: Int
     millis: Int
 
-## the whole analysis: parsed hits plus the derived aggregates the
-## report and csv export read.
+# # the whole analysis: parsed hits plus the derived aggregates the
+# # report and csv export read.
 pub struct Report:
     total: Int
     parse_errors: Int
@@ -33,19 +33,19 @@ pub struct Report:
 # combined-log-ish format:
 #   127.0.0.1 - - [06/Jul/2026:14:03:22] "GET /path HTTP/1.1" 200 512 45
 
-## the line grammar as one pattern: ip, bracketed stamp, quoted
-## request (method and path captured), then status, size, and millis.
+# # the line grammar as one pattern: ip, bracketed stamp, quoted
+# # request (method and path captured), then status, size, and millis.
 pub fn line_pattern() -> Regex!:
     q := chr(34)
     return regex.compile("^([^ ]+) [^ ]+ [^ ]+ \\[([^\\]]+)\\] " + q + "([^ ]+) ([^ " + q + "]+)[^" + q + "]*" + q + " (\\d+) (\\d+) (\\d+)")
 
-## parse one log line; none when the line is malformed.
+# # parse one log line; none when the line is malformed.
 pub fn parse_line(re: Regex, line: String) -> Hit?:
     caps := re.captures(line)
     if caps == none:
         return none
     if let c = caps:
-        status := parse_int(c[5]) catch -1
+        status := parse_int(c[5]) catch - 1
         if status < 0:
             return none
         size := parse_int(c[6]) catch 0
@@ -71,8 +71,8 @@ fn hour_of(stamp: String) -> String:
 
 # --- aggregation -------------------------------------------------------
 
-## read a log (gzip-decompressed when the path ends in .gz) and fold
-## every line into a report.
+# # read a log (gzip-decompressed when the path ends in .gz) and fold
+# # every line into a report.
 pub fn analyze_file(path: String) -> Report!:
     mut text := ""
     if path.ends_with(".gz"):
@@ -82,7 +82,7 @@ pub fn analyze_file(path: String) -> Report!:
         text = fs.read(path)!
     return analyze_text(text)
 
-## fold raw log text into a report.
+# # fold raw log text into a report.
 pub fn analyze_text(text: String) -> Report:
     mut by_class: Map[String, Int] := {}
     mut by_path_hits: Map[String, Int] := {}
@@ -129,7 +129,7 @@ fn top_paths(r: Report, n: Int) -> List[String]:
 
 # --- output ------------------------------------------------------------
 
-## the human-readable summary printed by the cli.
+# # the human-readable summary printed by the cli.
 pub fn render_report(r: Report) -> String:
     nl := chr(10)
     mut out := "requests: " + r.total.to_string() + "  malformed: " + r.parse_errors.to_string() + "  bytes: " + r.bytes_served.to_string() + nl
@@ -147,20 +147,9 @@ pub fn render_report(r: Report) -> String:
     return out
 
 fn sorted_keys(m: Map[String, Int]) -> List[String]:
-    mut ks: List[String] := []
-    for k in m.keys():
-        mut placed := false
-        mut i := 0
-        while i < ks.len() and not placed:
-            if k < ks[i]:
-                ks.insert(i, k)
-                placed = true
-            i = i + 1
-        if not placed:
-            ks.push(k)
-    return ks
+    return m.keys().sort()
 
-## per-path stats as csv, via the data.table module.
+# # per-path stats as csv, via the data.table module.
 pub fn export_csv(r: Report) -> String:
     mut rows: List[List[String]] := []
     for p in top_paths(r, 1000000):

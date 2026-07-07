@@ -1483,13 +1483,19 @@ fn ir_interp_spec_precision(spec: String) -> Int:
         i = i + 1
     return p
 
+ALIGN_LEFT_BYTE := 60 # '<'
+ALIGN_CENTER_BYTE := 94 # '^'
+ALIGN_RIGHT_BYTE := 62 # '>'
+FILL_ZERO_BYTE := 48 # '0'
+FILL_SPACE_BYTE := 32 # ' '
+
 fn ir_interp_spec_align(spec: String) -> Int:
     c0 := spec[0]
     if c0 == "<":
-        return 60
+        return ALIGN_LEFT_BYTE
     if c0 == "^":
-        return 94
-    return 62
+        return ALIGN_CENTER_BYTE
+    return ALIGN_RIGHT_BYTE
 
 fn ir_interp_spec_fill(spec: String) -> Int:
     mut i := 0
@@ -1497,8 +1503,8 @@ fn ir_interp_spec_fill(spec: String) -> Int:
     if c0 == "<" or c0 == ">" or c0 == "^":
         i = 1
     if i < spec.len() and spec[i] == "0":
-        return 48
-    return 32
+        return FILL_ZERO_BYTE
+    return FILL_SPACE_BYTE
 
 fn ir_emit_interp_spec_part(node: Node) -> Int:
     spec := node.value

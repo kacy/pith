@@ -3188,6 +3188,13 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         if method_name == "value":
             expect_no_arguments(method_name, arg_indices)
             return recv_info.inner
+        if method_name == "unwrap_or":
+            # T?.unwrap_or(default: T) -> T
+            if arg_indices.len() != 1:
+                report_error("E207", "unwrap_or expects 1 argument, got " + arg_indices.len().to_string())
+                return recv_info.inner
+            check_argument_type(arg_indices[0], recv_info.inner, scope_id)
+            return recv_info.inner
         dispatch_type = recv_info.inner
         recv_info = get_type_info(dispatch_type)
     elif recv_info.kind == "result":

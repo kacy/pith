@@ -11,13 +11,15 @@ something here that now works, the page is stale and a fix to it is welcome.
   named fields (`Point(x: 3, y: 4)`, any order, defaults may be omitted), but
   generic structs like `Box[T]` still need positional arguments; the type
   inference doesn't reorder named fields yet.
-- **match pattern gaps** — variant payloads now construct and destructure
-  (`Shape.Circle(2.0)`, `Shape.Circle(r) => r * r`, with literal sub-patterns
-  and guards). still missing: tuple patterns, `none` patterns in match, and
-  payload bindings inside or-patterns (`Circle(r) | Square(r)`). note a bare
-  name in a pattern is a binding, not a variant — write `Color.Red`, not
-  `Red`, to match a variant. equality (`==`) on payload-carrying enum values
-  is not defined; compare through match.
+- **match pattern gaps** — variant payloads construct and destructure
+  (`Shape.Circle(2.0)`, `Shape.Circle(r) => r * r`, with literal sub-patterns,
+  guards, and payload bindings inside or-patterns like
+  `Circle(r) | Square(r)`). still missing: tuple patterns and `none` patterns
+  in match. note a bare name in a pattern is a binding, not a variant — write
+  `Color.Red`, not `Red`, to match a variant. equality (`==`) on
+  payload-carrying enums compares structurally: tags, then payloads, with
+  string payloads by content and nested enums recursively; struct payloads
+  compare by identity.
 - **range patterns are integer-only** — `0..=9 => ...` and `0..10 => ...`
   work in match arms (and combine with or-patterns and guards), but only for
   integer subjects and non-negative literal bounds.

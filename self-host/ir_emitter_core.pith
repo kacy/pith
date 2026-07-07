@@ -71,6 +71,7 @@ mut ir_map_value_types: Map[String, String] := {} # map variable name -> value t
 # payload-free enums stay plain integer tags.
 mut ir_boxed_enums: Map[String, Bool] := {}
 mut ir_enum_payload_kinds: Map[String, String] := {} # "Shape.Circle" -> "float,string"
+mut ir_enum_variant_lists: Map[String, String] := {} # "Shape" -> "Circle,Square"
 
 # rc-managed locals owned by the current function, in binding order, with a
 # parallel kind list (string/list/map/set). collected by a pre-pass before
@@ -1155,6 +1156,7 @@ fn ir_collect_enum_decl(node: Node, emit_decl: Bool):
                     kinds.push(kind)
                 ir_enum_payload_kinds.insert(sname + "." + variant_node.value, kinds.join(","))
                 ir_boxed_enums.insert(sname, true)
+    ir_enum_variant_lists.insert(sname, variant_names.join(","))
     ir_struct_names.insert(sname, variant_names.len())
     if emit_decl:
         ir_emit("struct " + sname + " " + variant_names.join(" "))
@@ -1717,6 +1719,17 @@ fn ir_emit_unary_expr(node: Node) -> Int:
     operand_r := ir_expr(node.children[0])
     return ir_emit_unary_op(node.value, operand_r)
 
+# the boxed-enum name for an eq/neq node, or "" when neither side is
+# one. checked types name enums; the emitter's own inference doesn't.
+fn ir_binary_enum_eq_name(node: Node) -> String:
+    left_name := get_type_name(c_get_expr_type(node.children[0]))
+    if ir_boxed_enums.contains_key(left_name):
+        return left_name
+    right_name := get_type_name(c_get_expr_type(node.children[1]))
+    if ir_boxed_enums.contains_key(right_name):
+        return right_name
+    return ""
+
 fn ir_emit_binary_neq(result_reg: Int, left_r: Int, right_r: Int, is_str_op: Bool, is_bytes_op: Bool):
     if is_str_op:
         eq_r := ir_reg()
@@ -1908,13 +1921,24 @@ fn ir_emit_binary_expr(node: Node) -> Int:
             ir_release_owned_string_operand(node.children[1], right_r, right_type)
         elif is_bytes_op:
             ir_emit_call2(r, "bytes_eq", "bool", left_r, right_r)
+        elif ir_binary_enum_eq_name(node) != "":
+            # boxed enum values are pointers; a raw eq is identity, not
+            # equality — call the per-enum structural helper
+            ir_emit_call2(r, "__enum_eq_" + ir_binary_enum_eq_name(node), "bool", left_r, right_r)
         else:
             ir_emit_simple_binary(r, "eq", left_r, right_r)
     elif op == "neq":
-        ir_emit_binary_neq(r, left_r, right_r, is_str_op, is_bytes_op)
-        if is_str_op:
-            ir_release_owned_string_operand(node.children[0], left_r, left_type)
-            ir_release_owned_string_operand(node.children[1], right_r, right_type)
+        if ir_binary_enum_eq_name(node) != "":
+            eq_r := ir_reg()
+            ir_emit_call2(eq_r, "__enum_eq_" + ir_binary_enum_eq_name(node), "bool", left_r, right_r)
+            zr := ir_reg()
+            ir_emit("iconst " + zr.to_string() + " 0")
+            ir_emit("eq " + r.to_string() + " " + eq_r.to_string() + " " + zr.to_string())
+        else:
+            ir_emit_binary_neq(r, left_r, right_r, is_str_op, is_bytes_op)
+            if is_str_op:
+                ir_release_owned_string_operand(node.children[0], left_r, left_type)
+                ir_release_owned_string_operand(node.children[1], right_r, right_type)
     else:
         simple_op := ir_binary_simple_ir_op(op)
         if simple_op.len() > 0:
@@ -4211,6 +4235,27 @@ fn ir_emit_method_call(idx: Int) -> Int:
                 # the optional is Some); used by iterator adapters in std.iter
                 obj_r := ir_expr(node.children[0])
                 return ir_optional_value_field(obj_r, recv_tid)
+            if recv_info.kind == "optional" and mname == "unwrap_or":
+                # some(v) -> v, none -> the default argument
+                obj_r := ir_expr(node.children[0])
+                flag_r := ir_optional_flag_field(obj_r)
+                tmp := ir_new_temp_name("unwrap_or")
+                some_l := ir_label()
+                none_l := ir_label()
+                end_l := ir_label()
+                ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
+                ir_emit_label(some_l)
+                inner_r := ir_optional_value_field(obj_r, recv_tid)
+                ir_emit("store " + tmp + " " + inner_r.to_string())
+                ir_emit("jmp " + end_l)
+                ir_emit_label(none_l)
+                default_idx := ir_method_call_arg_expr(node, 0)
+                default_r := ir_expr(default_idx)
+                ir_emit("store " + tmp + " " + default_r.to_string())
+                ir_emit_label(end_l)
+                out_r := ir_reg()
+                ir_emit("load " + out_r.to_string() + " " + tmp)
+                return out_r
     # In a specialized generic impl body the receiver of `.value()` may have
     # type T? where T was suppressed at registration (so c_get_expr_type returns
     # TID_ERR). Emit the optional value-field extract directly when we're
@@ -5110,6 +5155,24 @@ fn ir_emit_variant_payload_conds(pat: Node, subj_r: Int, tag_cond_r: Int) -> Int
 # Bind any names a pattern introduces, in the branch where it matched.
 fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
     pat := get_node(pat_idx)
+    if pat.kind == "pat_or":
+        # the alternatives bind the same names but may pull them from
+        # different payload slots, so each alternative re-tests its own
+        # condition and binds from its own shape
+        done_l := ir_label()
+        mut k := 0
+        while k < pat.children.len():
+            cond_r := ir_emit_match_cond(pat.children[k], subj_r)
+            bind_l := ir_label()
+            next_l := ir_label()
+            ir_emit("brif " + cond_r.to_string() + " " + bind_l + " " + next_l)
+            ir_emit_label(bind_l)
+            ir_emit_match_bindings(pat.children[k], subj_r, subj_type)
+            ir_emit("jmp " + done_l)
+            ir_emit_label(next_l)
+            k = k + 1
+        ir_emit_label(done_l)
+        return
     if pat.kind == "pat_binding":
         ir_var_regs.insert(pat.value, subj_r)
         if subj_type.len() > 0:
@@ -6538,6 +6601,83 @@ fn ir_emit_struct_dtors():
         ir_emit("ret " + zr.to_string())
         ir_emit("endfunc")
 
+# one equality helper per boxed enum: same pointer or same tag with
+# equal payloads. string payloads compare by content and nested boxed
+# enums recurse; struct payloads keep pointer identity.
+fn ir_emit_enum_eq_fns():
+    for ename in ir_boxed_enums.keys():
+        if not ir_enum_variant_lists.contains_key(ename):
+            continue
+        ir_emit_func_header("__enum_eq_" + ename, 2, "bool")
+        ir_emit("param a")
+        ir_emit("param b")
+        ra := ir_reg()
+        ir_emit("load " + ra.to_string() + " a")
+        rb := ir_reg()
+        ir_emit("load " + rb.to_string() + " b")
+        true_l := ir_label()
+        false_l := ir_label()
+        check_l := ir_label()
+        same_r := ir_reg()
+        ir_emit("eq " + same_r.to_string() + " " + ra.to_string() + " " + rb.to_string())
+        ir_emit("brif " + same_r.to_string() + " " + true_l + " " + check_l)
+        ir_emit_label(check_l)
+        ta := ir_reg()
+        ir_emit("field " + ta.to_string() + " " + ra.to_string() + " 0 int __enum_tag")
+        tb := ir_reg()
+        ir_emit("field " + tb.to_string() + " " + rb.to_string() + " 0 int __enum_tag")
+        tags_r := ir_reg()
+        ir_emit("eq " + tags_r.to_string() + " " + ta.to_string() + " " + tb.to_string())
+        # only payload variants need slot comparison; for the rest an
+        # equal tag is the whole story
+        variants := ir_enum_variant_lists[ename].split(",")
+        mut vi := 0
+        mut chain_l := ir_label()
+        ir_emit("brif " + tags_r.to_string() + " " + chain_l + " " + false_l)
+        while vi < variants.len():
+            vkey := ename + "." + variants[vi]
+            if ir_enum_payload_kinds.contains_key(vkey):
+                ir_emit_label(chain_l)
+                chain_l = ir_label()
+                vtag := ir_reg()
+                ir_emit("iconst " + vtag.to_string() + " " + vi.to_string())
+                is_v := ir_reg()
+                ir_emit("eq " + is_v.to_string() + " " + ta.to_string() + " " + vtag.to_string())
+                slots_l := ir_label()
+                ir_emit("brif " + is_v.to_string() + " " + slots_l + " " + chain_l)
+                ir_emit_label(slots_l)
+                kinds := ir_enum_payload_kinds[vkey].split(",")
+                mut k := 0
+                while k < kinds.len():
+                    fa := ir_reg()
+                    ir_emit("field " + fa.to_string() + " " + ra.to_string() + " " + ((k + 1) * 8).to_string() + " unknown __p" + k.to_string())
+                    fb := ir_reg()
+                    ir_emit("field " + fb.to_string() + " " + rb.to_string() + " " + ((k + 1) * 8).to_string() + " unknown __p" + k.to_string())
+                    cmp_r := ir_reg()
+                    if kinds[k] == "string":
+                        ir_emit_call2(cmp_r, "__str_eq", "bool", fa, fb)
+                    elif ir_boxed_enums.contains_key(kinds[k]):
+                        ir_emit_call2(cmp_r, "__enum_eq_" + kinds[k], "bool", fa, fb)
+                    else:
+                        ir_emit("eq " + cmp_r.to_string() + " " + fa.to_string() + " " + fb.to_string())
+                    next_slot_l := ir_label()
+                    ir_emit("brif " + cmp_r.to_string() + " " + next_slot_l + " " + false_l)
+                    ir_emit_label(next_slot_l)
+                    k = k + 1
+                ir_emit("jmp " + true_l)
+            vi = vi + 1
+        ir_emit_label(chain_l)
+        ir_emit("jmp " + true_l)
+        ir_emit_label(false_l)
+        f_r := ir_reg()
+        ir_emit("iconst " + f_r.to_string() + " 0")
+        ir_emit("ret " + f_r.to_string())
+        ir_emit_label(true_l)
+        t_r := ir_reg()
+        ir_emit("iconst " + t_r.to_string() + " 1")
+        ir_emit("ret " + t_r.to_string())
+        ir_emit("endfunc")
+
 # a global whose initializer is a bare literal gets its value through
 # the declaration; anything else — calls, operators, interpolation,
 # collection literals with elements — must run at startup. previously
@@ -6680,6 +6820,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_global_bindings(root)
     ir_emit_init_globals(root)
     ir_emit_struct_dtors()
+    ir_emit_enum_eq_fns()
     # pre-register all impl method specializations across the module so that
     # an earlier impl's specialized body can dispatch to a later impl's
     # specialized version (e.g. MapIter[FilterIter[..], ..].next calling

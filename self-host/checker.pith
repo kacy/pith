@@ -1075,6 +1075,13 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
         val_node := get_node(node.children[1])
         val_type := c_check_expr(node.children[1], scope_id)
         if is_error_type(annotated) == false:
+            # an empty collection literal types as an error on its own;
+            # under an annotation it takes the annotated type, and the
+            # cache entry is what tells the emitter which container (and
+            # element kind) to construct
+            if is_error_type(val_type):
+                if val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set":
+                    expression_type_cache.insert(node.children[1], annotated)
             if value_matches_optional_target(node.children[1], val_type, annotated):
                 define_binding(scope_id, name, annotated, is_mut)
                 return
@@ -1083,11 +1090,14 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
                     if types_structurally_equal(annotated, val_type):
                         define_binding(scope_id, name, annotated, is_mut)
                         return
-                    # special case: allow empty collections with annotations
-                    if val_node.kind != "list":
-                        if val_node.kind != "map":
-                            if val_node.kind != "set":
-                                report_error("E200", "type mismatch: expected " + get_type_name(annotated) + ", got " + get_type_name(val_type))
+                    # special case: allow empty collections with annotations,
+                    # and record the annotated type as the literal's type so
+                    # the emitter builds the right container (an empty {} under
+                    # a Set[Int] annotation must construct an int set)
+                    if val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set":
+                        expression_type_cache.insert(node.children[1], annotated)
+                    else:
+                        report_error("E200", "type mismatch: expected " + get_type_name(annotated) + ", got " + get_type_name(val_type))
         define_binding(scope_id, name, annotated, is_mut)
     elif node.children.len() == 1:
         val_type := c_check_expr(node.children[0], scope_id)
@@ -3616,6 +3626,11 @@ fn check_map_method_call(method: String, info: TypeInfo, args: List[Int], scope_
 
 fn check_set_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
     elem := info.inner
+    if method == "insert":
+        # the map spelling; without this rejection it falls through to
+        # the map dispatch and the emitter builds a three-argument call
+        report_error_with_fix("E209", "Set has no method 'insert'", "use add(value)")
+        return TID_ERR
     if method == "add":
         expect_one_typed_argument(method, args, elem, scope_id)
         return TID_VOID

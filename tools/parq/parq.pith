@@ -1,0 +1,18 @@
+# parq — run a jobs file through a parallel worker pool.
+#
+#   pith build tools/parq/parq.pith
+#   ./tools/parq/parq tools/parq/sample/jobs.txt 4
+from parq_lib import load_jobs, run_pool, render
+
+fn main() -> Int!:
+    argv := args()
+    if argv.len() < 2:
+        print("usage: parq <jobs-file> [workers]")
+        return 1
+    mut workers := 4
+    if argv.len() > 2:
+        workers = parse_int(argv[2]) catch 4
+    jobs := load_jobs(argv[1])!
+    done := run_pool(jobs, workers)
+    print(render(done, workers))
+    return 0

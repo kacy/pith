@@ -90,6 +90,10 @@ pub fn ir_resolve_generic_type_node(tn: Node) -> String:
                 return "map_int"
         return "map"
     if tn.value == "Set":
+        if tn.children.len() > 0:
+            first := get_node(tn.children[0])
+            if first.kind == "type" and first.value == "Int":
+                return "set_int"
         return "set"
     return ""
 

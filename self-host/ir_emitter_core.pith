@@ -5048,9 +5048,26 @@ fn ir_emit_match_return(idx: Int, node: Node):
 # (those are emitted separately, only in the branch where the pattern matched).
 fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
     pat := get_node(pat_idx)
-    if pat.kind == "pat_wildcard" or pat.kind == "pat_binding":
+    if pat.kind == "pat_wildcard":
         r := ir_reg()
         ir_emit("iconst " + r.to_string() + " 1")
+        return r
+    if pat.kind == "pat_binding":
+        # on an optional subject a binding matches only the some case
+        # (the none arm is spelled `none`); anywhere else it always
+        # matches
+        subj_info := get_type_info(ir_match_subject_tid)
+        if subj_info.kind == "optional":
+            return ir_optional_flag_field(subj_r)
+        r := ir_reg()
+        ir_emit("iconst " + r.to_string() + " 1")
+        return r
+    if pat.kind == "pat_none":
+        flag_r := ir_optional_flag_field(subj_r)
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        r := ir_reg()
+        ir_emit("eq " + r.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
         return r
     if pat.kind == "pat_int":
         lit_r := ir_emit_int_literal(pat)
@@ -5231,6 +5248,16 @@ fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
                 ir_emit("store " + sub.value + " " + elem_r.to_string())
         return
     if pat.kind == "pat_binding":
+        subj_info := get_type_info(ir_match_subject_tid)
+        if subj_info.kind == "optional":
+            # the binding is the unwrapped inner value, mirroring if let
+            inner_r := ir_optional_value_field(subj_r, ir_match_subject_tid)
+            ir_var_regs.insert(pat.value, inner_r)
+            inner_kind := ir_type_from_tid(subj_info.inner)
+            if inner_kind.len() > 0:
+                ir_var_types.insert(pat.value, inner_kind)
+            ir_emit("store " + pat.value + " " + inner_r.to_string())
+            return
         ir_var_regs.insert(pat.value, subj_r)
         if subj_type.len() > 0:
             ir_var_types.insert(pat.value, subj_type)

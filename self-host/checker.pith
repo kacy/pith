@@ -3236,32 +3236,32 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     # collection methods
     if recv_info.kind == "list":
         result := check_list_method_call(method_name, recv_info, arg_indices, scope_id)
-        if is_error_type(result) == false:
+        if result >= 0 and is_error_type(result) == false:
             return result
     if recv_info.kind == "map":
         result := check_map_method_call(method_name, recv_info, arg_indices, scope_id)
-        if is_error_type(result) == false:
+        if result >= 0 and is_error_type(result) == false:
             return result
     if recv_info.kind == "set":
         result := check_set_method_call(method_name, recv_info, arg_indices, scope_id)
-        if is_error_type(result) == false:
+        if result >= 0 and is_error_type(result) == false:
             return result
 
     # channel methods
     if recv_info.kind == "channel":
         ch_result := check_channel_method_call(method_name, recv_info, arg_indices, scope_id)
-        if is_error_type(ch_result) == false:
+        if ch_result >= 0 and is_error_type(ch_result) == false:
             return ch_result
 
     if recv_info.kind == "task":
         task_result := check_task_method_call(method_name, recv_info, arg_indices, scope_id)
-        if is_error_type(task_result) == false:
+        if task_result >= 0 and is_error_type(task_result) == false:
             return task_result
 
     # sync primitive methods
     if recv_info.kind == "struct":
         sync_result := check_sync_primitive_method_call(recv_info.name, method_name, arg_indices, scope_id)
-        if is_error_type(sync_result) == false:
+        if sync_result >= 0 and is_error_type(sync_result) == false:
             return sync_result
 
     # enum variant constructors: Shape.Circle(2.5). the receiver is the enum
@@ -4244,6 +4244,11 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
     if pat.kind == "pat_wildcard":
         return
     if pat.kind == "pat_binding":
+        # a binding on an optional subject unwraps, mirroring if let
+        info := get_type_info(expected_type)
+        if info.kind == "optional":
+            define_binding(scope_id, pat.value, info.inner, false)
+            return
         define_binding(scope_id, pat.value, expected_type, false)
         return
     if pat.kind == "pat_int":
@@ -4372,6 +4377,8 @@ fn collect_arm_pattern_bindings(pat: Node) -> String:
             if sub.kind != "pat_binding" and sub.kind != "pat_wildcard":
                 return ""
         return "_"
+    if pat.kind == "pat_none":
+        return "None"
     return ""
 
 fn check_match_exhaustiveness(subject_type: Int, arm_values: List[String], node_idx: Int):

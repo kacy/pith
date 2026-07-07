@@ -253,6 +253,23 @@ fn bootstrap_ir_driver_from_seed() -> Option<String> {
     None
 }
 
+fn describe_exit(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(sig) = status.signal() {
+        let name = match sig {
+            11 => " (segmentation fault)",
+            6 => " (abort)",
+            9 => " (killed)",
+            _ => "",
+        };
+        return format!("crashed with signal {}{}", sig, name);
+    }
+    match status.code() {
+        Some(c) => format!("failed with exit code {}", c),
+        None => "failed".to_string(),
+    }
+}
+
 fn get_ir_from_compiler(path: &str, emit_tests: bool) -> Result<String, String> {
     let driver = find_ir_driver()
         .or_else(bootstrap_ir_driver_from_seed)
@@ -268,12 +285,27 @@ fn get_ir_from_compiler(path: &str, emit_tests: bool) -> Result<String, String> 
         .map_err(|e| format!("run ir_driver: {}", e))?;
     if !output.status.success() {
         let combined = combined_output(&output);
+        let status = describe_exit(&output.status);
         if combined.trim().is_empty() {
-            return Err(format!("IR driver failed on {}", path));
+            return Err(format!(
+                "IR driver {} on {} with no diagnostics — this is a compiler bug, not a problem in your program",
+                status, path
+            ));
         }
         return Err(format!("IR driver failed on {}: {}", path, combined));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let ir = String::from_utf8_lossy(&output.stdout).to_string();
+    // a clean exit with no emitted functions means the driver died
+    // silently (an emitter bug); linking would fail later with a
+    // baffling "undefined reference to main"
+    if !ir.lines().any(|l| l.starts_with("func ")) {
+        return Err(format!(
+            "IR driver exited cleanly but emitted no functions for {} ({} bytes of IR) — this is a compiler bug, not a problem in your program",
+            path,
+            ir.len()
+        ));
+    }
+    Ok(ir)
 }
 
 fn validate_combined_ir_contract(ir_text: &str) -> Result<(), String> {

@@ -1,0 +1,21 @@
+# tuple patterns in match: bindings, wildcards, and literal elements
+# that narrow (ints and strings), across arities.
+fn describe(pair: (Int, String)) -> String:
+    match pair:
+        (0, s) => "zero " + s
+        (n, "x") => "x'd " + n.to_string()
+        (n, s) => "pair " + n.to_string() + " " + s
+
+fn spot(t: (Int, Int, Int)) -> String:
+    match t:
+        (1, _, c) => "one ends " + c.to_string()
+        (a, 5, _) => "mid five from " + a.to_string()
+        (a, b, c) => "sum " + (a + b + c).to_string()
+
+fn main():
+    print(describe((0, "start")))
+    print(describe((7, "x")))
+    print(describe((3, "y")))
+    print(spot((1, 9, 4)))
+    print(spot((2, 5, 8)))
+    print(spot((2, 2, 2)))

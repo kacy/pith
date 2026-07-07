@@ -1,0 +1,17 @@
+# empty {} under set annotations must build the right container and
+# element kind; Set[Int] historically constructed a string set.
+fn main():
+    mut si: Set[Int] := {}
+    si.add(3)
+    si.add(3)
+    si.add(9)
+    print("{si.len()} {si.contains(3)} {si.contains(4)}")
+    mut ss: Set[String] := {}
+    ss.add("a")
+    ss.add("a")
+    print("{ss.len()} {ss.contains("a")}")
+    mut ni: Set[Int] := {5, 6, 5}
+    print("{ni.len()}")
+    mut mi: Map[Int, String] := {}
+    mi.insert(5, "five")
+    print("{mi.len()} {mi.get_default(5, "?")}")

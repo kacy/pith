@@ -1414,6 +1414,10 @@ fn ir_field_expr_type(node: Node) -> String:
 # Returns: "int", "float", "bool", "string", "list", "list_string",
 #          "map", "map_int", "set", "set_int", or "" (unknown)
 fn ir_infer_type(idx: Int) -> String:
+    # a missing child (an absent optional argument) has index -1;
+    # asking its type is a normal question with an unknown answer
+    if idx < 0:
+        return ""
     checked := ir_checked_type(idx)
     if checked.len() > 0:
         return checked
@@ -3667,9 +3671,14 @@ fn ir_emit_map_literal(node: Node) -> Int:
         ir_emit_map_entry_insert(map_r, has_int_keys, get_node(child))
     return map_r
 
-fn ir_emit_set_literal(node: Node) -> Int:
+fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
     set_r := ir_reg()
-    literal_type := ir_literal_expr_type(node, "set")
+    # an empty literal carries no element evidence; the checked type
+    # decides between the string and int constructors
+    mut literal_type := ir_literal_expr_type(node, "set")
+    checked := ir_checked_type(idx)
+    if checked == "set_int" or checked == "set":
+        literal_type = checked
     ir_emit_call0(set_r, ir_set_new_name(literal_type), literal_type)
     for child in node.children:
         elem_r := ir_expr(child)
@@ -5320,10 +5329,16 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_string_interp(idx)
 
     if kind == "map":
+        # an empty {} annotated as a set must build a set, not a map:
+        # the wrong container silently swallows inserts and its method
+        # calls take the map arg shapes
+        checked_lit := ir_checked_type(idx)
+        if checked_lit == "set" or checked_lit == "set_int":
+            return ir_emit_set_literal(idx, node)
         return ir_emit_map_literal(node)
 
     if kind == "set":
-        return ir_emit_set_literal(node)
+        return ir_emit_set_literal(idx, node)
 
     if kind == "list":
         return ir_emit_list_literal(idx, node)

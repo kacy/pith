@@ -1,0 +1,150 @@
+# parq_lib — a parallel task runner: a worker pool consumes jobs from
+# a channel and reports results back on another. the fourth dogfood
+# program, aimed at spawn, channels, tasks, and shared state — the one
+# surface the earlier programs never exercised hard.
+import std.fs as fs
+
+## one unit of work: a named computation over a payload.
+pub struct Job:
+    name: String
+    op: String
+    payload: String
+
+## a finished job: its name, the computed value, and the worker that
+## ran it (used for a total-count sanity check, never for output
+## ordering — scheduling isn't deterministic).
+pub struct Done:
+    name: String
+    value: Int
+    worker: Int
+
+fn checksum(s: String) -> Int:
+    mut h := 7
+    mut i := 0
+    while i < s.len():
+        h = (h * 31 + ord(s[i])) % 1000003
+        i = i + 1
+    return h
+
+fn word_count(s: String) -> Int:
+    mut count := 0
+    mut in_word := false
+    mut i := 0
+    while i < s.len():
+        if s[i] == " ":
+            in_word = false
+        else:
+            if not in_word:
+                count = count + 1
+            in_word = true
+        i = i + 1
+    return count
+
+fn collatz_steps(n: Int) -> Int:
+    mut cur := n
+    mut steps := 0
+    while cur > 1:
+        if cur % 2 == 0:
+            cur = cur / 2
+        else:
+            cur = cur * 3 + 1
+        steps = steps + 1
+    return steps
+
+## run one job to its integer result.
+pub fn run_job(job: Job) -> Int:
+    if job.op == "checksum":
+        return checksum(job.payload)
+    if job.op == "words":
+        return word_count(job.payload)
+    if job.op == "collatz":
+        return collatz_steps(parse_int(job.payload) catch 1)
+    return 0 - 1
+
+fn worker(id: Int, jobs: Channel[Job], results: Channel[Done]):
+    while true:
+        got := jobs.recv()
+        if got == none:
+            return
+        if let job = got:
+            if job.op == "stop":
+                return
+            results.send(Done(job.name, run_job(job), id))
+
+## parse the jobs file: one job per line, `name op payload`.
+pub fn load_jobs(path: String) -> List[Job]!:
+    mut out: List[Job] := []
+    for line in fs.read(path)!.split(chr(10)):
+        t := line.trim()
+        if t == "" or t.starts_with("#"):
+            continue
+        sp1 := t.index_of(" ")
+        if sp1 < 0:
+            continue
+        rest := t.substring(sp1 + 1, t.len())
+        sp2 := rest.index_of(" ")
+        if sp2 < 0:
+            continue
+        out.push(Job(t.substring(0, sp1), rest.substring(0, sp2), rest.substring(sp2 + 1, rest.len())))
+    return out
+
+## dispatch every job to a pool of `workers` workers and gather the
+## results, sorted by job name so output is deterministic no matter
+## which worker won which job.
+pub fn run_pool(all_jobs: List[Job], workers: Int) -> List[Done]:
+    jobs := Channel[Job](all_jobs.len() + workers)
+    results := Channel[Done](all_jobs.len())
+    mut handles: List[Task[Int]] := []
+    mut w := 0
+    while w < workers:
+        handles.push(spawn worker_entry(w, jobs, results))
+        w = w + 1
+    for j in all_jobs:
+        jobs.send(j)
+    mut s := 0
+    while s < workers:
+        jobs.send(Job("", "stop", ""))
+        s = s + 1
+    mut done: List[Done] := []
+    mut got := 0
+    while got < all_jobs.len():
+        r := results.recv()
+        if let d = r:
+            done.push(d)
+        got = got + 1
+    for h in handles:
+        await h
+    return sort_done(done)
+
+fn worker_entry(id: Int, jobs: Channel[Job], results: Channel[Done]) -> Int:
+    worker(id, jobs, results)
+    return id
+
+fn sort_done(items: List[Done]) -> List[Done]:
+    mut out: List[Done] := []
+    for d in items:
+        mut placed := false
+        mut i := 0
+        while i < out.len() and not placed:
+            if d.name < out[i].name:
+                out.insert(i, d)
+                placed = true
+            i = i + 1
+        if not placed:
+            out.push(d)
+    return out
+
+## the report: per-job lines sorted by name, then totals. worker ids
+## are counted but never printed per-job.
+pub fn render(done: List[Done], workers: Int) -> String:
+    nl := chr(10)
+    mut out := ""
+    mut sum := 0
+    mut seen_workers: Set[Int] := {}
+    for d in done:
+        out = out + d.name + " = " + d.value.to_string() + nl
+        sum = sum + d.value
+        seen_workers.add(d.worker)
+    out = out + "jobs: " + done.len().to_string() + "  value sum: " + sum.to_string() + nl
+    out = out + "workers used: " + seen_workers.len().to_string() + " of " + workers.to_string() + nl
+    return out

@@ -654,6 +654,21 @@ apic-check:
 	diff -u tools/apic/expected/post.txt "$$tmpdir/post.txt" && \
 	echo "apic output matches golden files"
 
+# --- parq golden check ---
+# builds the parallel task runner and diffs its report; the
+# workers-used line depends on scheduling and is excluded
+
+parq-check:
+	@echo "--- parq golden check ---"
+	@./target/release/pith build tools/parq/parq.pith > /dev/null
+	@tmpdir=$$(mktemp -d /tmp/pith-parq-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	./tools/parq/parq tools/parq/sample/jobs.txt 4 | grep -v "^workers used" > "$$tmpdir/report.txt"; \
+	diff -u tools/parq/expected/report.txt "$$tmpdir/report.txt" && \
+	./tools/parq/parq tools/parq/sample/jobs.txt 1 | grep -v "^workers used" > "$$tmpdir/report1.txt"; \
+	diff -u tools/parq/expected/report.txt "$$tmpdir/report1.txt" && \
+	echo "parq output matches golden files"
+
 # --- cli regressions ---
 
 cli-regressions: build cli-regressions-only

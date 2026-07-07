@@ -1,0 +1,15 @@
+# sitegen — build a static site from markdown content. the logic
+# lives in sitegen_lib; this is the command-line shell.
+#
+#   pith build tools/sitegen/sitegen.pith
+#   ./tools/sitegen/sitegen tools/sitegen/sample out
+from sitegen_lib import build_site
+
+fn main() -> Int!:
+    argv := args()
+    if argv.len() < 3:
+        print("usage: sitegen <site-dir> <out-dir>")
+        return 1
+    count := build_site(argv[1], argv[2])!
+    print("built {count} posts")
+    return 0

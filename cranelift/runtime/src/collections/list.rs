@@ -109,6 +109,19 @@ impl ListImpl {
         }
     }
 
+    fn insert_value_at(&mut self, index: usize, value: i64) {
+        if self.uses_value_storage() {
+            let idx = index.min(self.values8.len());
+            self.values8.insert(idx, value);
+            self.sync_value_view();
+        } else {
+            let bytes = value.to_ne_bytes();
+            let elem_len = self.elem_size.min(bytes.len());
+            let idx = index.min(self.elements.len());
+            self.elements.insert(idx, bytes[..elem_len].to_vec());
+        }
+    }
+
     fn push_value(&mut self, value: i64) {
         if self.uses_value_storage() {
             self.values8.push(value);
@@ -400,6 +413,20 @@ pub unsafe extern "C" fn pith_list_push_value(list: PithList, value: i64) {
     crate::perf_count(&crate::PERF_LIST_PUSHES, 1);
     retain_element(impl_ref.type_tag, value);
     impl_ref.push_value(value);
+}
+
+/// Insert an element at an index, shifting the tail right. A negative
+/// index clamps to the front, past-the-end clamps to a push. The list
+/// takes an owner's count for tagged element kinds, like push.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_insert_value(list: PithList, index: i64, value: i64) {
+    let Some(impl_ref) = list_mut(list) else {
+        return;
+    };
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_INSERTS, 1);
+    retain_element(impl_ref.type_tag, value);
+    impl_ref.insert_value_at(index.max(0) as usize, value);
 }
 
 /// Set element at index (value-based API, stores i64).

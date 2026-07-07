@@ -912,10 +912,16 @@ fn parse_lambda_param() -> Int:
     return add_node_with_position("param", name_tok.value, children)
 
 fn parse_string_interpolation() -> Int:
-    _tv := _cur_tok_value()
+    mut _tv := _cur_tok_value()
     advance_token()
     mut parts: List[Int] := []
 
+    # the string_start token spans from the opening quote to the first
+    # brace; drop the quote here so a lone leading part (just the quote)
+    # doesn't survive the emitter's len>=2 quote stripping as a literal
+    # quote character
+    if _tv.len() > 0 and _tv.substring(0, 1) == chr(34):
+        _tv = _tv.substring(1, _tv.len())
     if _tv.len() > 0:
         parts.push(add_leaf_with_position("lit", _tv))
 

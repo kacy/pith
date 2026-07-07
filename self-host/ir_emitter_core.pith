@@ -37,6 +37,7 @@ from checker import c_get_expr_type, struct_instance_base_name, struct_instance_
 from types import TypeInfo, get_type_info, get_type_name
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
+from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_specializations, ir_impl_method_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
@@ -103,7 +104,7 @@ mut ir_dtor_memo: Map[String, Int] := {} # 1 needs dtor, 2 no/undecided
 
 mut ir_type_aliases: Map[String, String] := {} # alias name -> target type
 mut ir_last_was_ret := false # tracks if the last emitted instruction was a return
-mut ir_func_returns: Map[String, String] := {} # function name -> return type hint
+
 mut ir_func_result_ok_kinds: Map[String, String] := {}
 mut ir_named_fn_value_wrappers: Map[String, String] := {}
 mut ir_lambda_count := 0
@@ -112,13 +113,13 @@ mut ir_break_stack: List[String] := []
 mut ir_continue_stack: List[String] := []
 mut ir_lambda_bodies: List[String] := [] # deferred lambda function IR
 mut ir_module_count := 0 # increments per emit_ir call for unique naming
-mut ir_impl_methods: Map[String, String] := {}
+
 # Per-instantiation specialized impl method names, kept separate from
 # ir_impl_methods because that map is reset between modules and would wipe
 # specializations registered during an earlier module's emission. Key is
 # "InstanceType.method" (e.g. "MapIter[Range,Int,Int].next") and value is the
 # specialized symbol name. Read via ir_lookup_specialized_method.
-mut ir_impl_method_specializations: Map[String, String] := {}
+
 mut ir_import_renames: Map[String, String] := {}
 mut ir_module_aliases: Map[String, String] := {}
 mut ir_import_declared_functions: Map[String, Bool] := {}
@@ -177,14 +178,14 @@ fn ir_reset_global_state():
 fn ir_reset_type_state():
     ir_local_struct_names = []
     ir_dtor_memo = {}
-    ir_struct_names = {}
-    ir_struct_field_lookup = {}
-    ir_struct_field_index_lookup = {}
-    ir_struct_decl_nodes = {}
-    ir_struct_field_default_nodes = {}
-    ir_impl_methods = {}
+    ir_struct_names.clear()
+    ir_struct_field_lookup.clear()
+    ir_struct_field_index_lookup.clear()
+    ir_struct_decl_nodes.clear()
+    ir_struct_field_default_nodes.clear()
+    ir_impl_methods.clear()
     ir_import_renames = {}
-    ir_func_returns = {}
+    ir_func_returns.clear()
     ir_func_result_ok_kinds = {}
     ir_named_fn_value_wrappers = {}
     ir_module_aliases = {}
@@ -434,9 +435,6 @@ fn ir_retkind(type_name: String) -> String:
 
 fn ir_is_sync_primitive_name(name: String) -> Bool:
     return name == "Mutex" or name == "WaitGroup" or name == "Semaphore"
-
-fn ir_is_declared_callable(name: String) -> Bool:
-    return ir_is_declared_callable_with_state(name, ir_func_returns)
 
 fn ir_emit_func_header(name: String, param_count: Int, ret_type: String):
     ir_emit("func " + name + " " + param_count.to_string() + " " + ir_retkind(ret_type))
@@ -811,9 +809,6 @@ fn ir_emit_call3(result_reg: Int, fname: String, ret_type: String, arg0: Int, ar
 fn ir_temp_name(prefix: String) -> String:
     return prefix + "_" + ir_label()
 
-fn ir_declared_callable_ir_retkind(fname: String) -> String:
-    return ir_declared_callable_ir_retkind_with_state(fname, ir_func_returns)
-
 fn ir_declared_callable_return_type(fname: String) -> String:
     return ir_declared_callable_return_type_with_state(fname, ir_func_returns, ir_type_aliases, ir_struct_names)
 
@@ -1008,47 +1003,6 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
     ir_current_impl_type = ""
     ir_current_impl_subst_params = []
     ir_current_impl_subst_args = []
-
-# Look up a specialized impl method by its instance-typed key. Kept small and
-# separate so the module-global Map read compiles reliably (see
-# codegen-map-read-sensitivity.md in project memory).
-fn ir_lookup_specialized_method(type_name: String, method_name: String) -> String:
-    key := ir_impl_method_key(type_name, method_name)
-    if ir_impl_method_specializations.contains_key(key) == false:
-        return ""
-    name := ir_impl_method_specializations[key]
-    # the specialization may have been registered un-prefixed (because the
-    # impl's source module didn't know its import prefix at emit time);
-    # if the base method now resolves to a prefixed import symbol, apply
-    # the same prefix to the specialized name so the call site links
-    base_type := ir_strip_type_args(type_name)
-    base_key := ir_impl_method_key(base_type, method_name)
-    if ir_impl_methods.contains_key(base_key):
-        base_full := ir_impl_methods[base_key]
-        expected_base := base_type + "_" + method_name
-        if base_full.len() > expected_base.len() and base_full.ends_with(expected_base):
-            prefix := base_full.substring(0, base_full.len() - expected_base.len())
-            if name.starts_with(prefix) == false:
-                return prefix + name
-    return name
-
-fn ir_sanitize_symbol(name: String) -> String:
-    # Pith identifiers don't contain `[`, `]`, `,`, but generic instance names
-    # like `MapIter[Range,Int,Int]` do. Map them to underscores so the symbol
-    # name remains a valid IR/runtime identifier.
-    mut out := ""
-    mut i := 0
-    while i < name.len():
-        c := name.substring(i, i + 1)
-        if c == "[" or c == "]" or c == ",":
-            out = out + "_"
-        elif c == " ":
-            i = i + 1
-            continue
-        else:
-            out = out + c
-        i = i + 1
-    return out
 
 fn ir_declared_struct_name(node: Node) -> String:
     if node.value.contains("["):
@@ -5483,18 +5437,6 @@ fn ir_emit_assign_stmt(node: Node):
         ir_var_regs.insert(name, r)
         ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
 
-# Strip generic type-args from a type name: "Iter[Int]" -> "Iter".
-fn ir_strip_type_args(name: String) -> String:
-    mut i := 0
-    while i < name.len():
-        if name.substring(i, i + 1) == "[":
-            return name.substring(0, i)
-        i = i + 1
-    return name
-
-# Resolve a field-write lookup key, falling back to the receiver's base type
-# name so writes work on generic struct instances (Iter[Int] -> Iter). Returns
-# the matching key or "" if neither the qualified nor base form is registered.
 fn ir_resolve_field_lookup_key(recv_idx: Int, fname: String) -> String:
     direct := ir_field_lookup_key(recv_idx, fname)
     if ir_struct_field_index_lookup.contains_key(direct):
@@ -6104,16 +6046,6 @@ fn ir_extract_optional_inner_type(fn_idx: Int) -> String:
                 if rn.kind == "optional_type" and rn.children.len() > 0:
                     return ir_resolve_type_node(rn.children[0])
     return ""
-
-fn ir_lookup_func_return(full_name: String, base_name: String) -> String:
-    if ir_func_returns.contains_key(full_name):
-        return ir_func_returns[full_name]
-    if ir_func_returns.contains_key(base_name):
-        return ir_func_returns[base_name]
-    return "unknown"
-
-fn ir_impl_method_key(type_name: String, method_name: String) -> String:
-    return type_name + "." + method_name
 
 fn ir_lookup_impl_method_name(type_name: String, method_name: String) -> String:
     if type_name.len() == 0:
@@ -6765,7 +6697,7 @@ fn ir_collect_root_import_metadata(root_idx: Int):
         ir_collect_preloaded_root_metadata(root, ir_preloaded_import_paths[i])
 
 fn ir_collect_root_phase_one_metadata(root_idx: Int):
-    ir_func_returns = {}
+    ir_func_returns.clear()
     ir_type_aliases = {}
     ir_generic_decl_indices = {}
     ir_generic_decl_module_paths = {}
@@ -6795,11 +6727,11 @@ fn ir_collect_root_phase_one_metadata(root_idx: Int):
 fn ir_collect_root_phase_two_metadata(root_idx: Int):
     ir_local_struct_names = []
     ir_dtor_memo = {}
-    ir_struct_names = {}
-    ir_struct_field_lookup = {}
-    ir_struct_field_index_lookup = {}
-    ir_struct_decl_nodes = {}
-    ir_impl_methods = {}
+    ir_struct_names.clear()
+    ir_struct_field_lookup.clear()
+    ir_struct_field_index_lookup.clear()
+    ir_struct_decl_nodes.clear()
+    ir_impl_methods.clear()
     ir_register_known_import_structs()
 
     mut preload_i := 0
@@ -6870,25 +6802,6 @@ fn ir_register_impl_method_specialization_names(impl_node: Node, impl_type: Stri
             child_node := get_node(child)
             if child_node.kind == "fn_decl":
                 ir_register_one_specialized_method_name(child_node, impl_type, instance_type_name, arg_names)
-
-fn ir_register_one_specialized_method_name(method_node: Node, base_impl_type: String, instance_type: String, arg_names: List[String]):
-    orig_name := method_node.value
-    mut suffix := ""
-    for an in arg_names:
-        suffix = suffix + "_" + ir_sanitize_symbol(an)
-    full_name := base_impl_type + suffix + "_" + orig_name
-    method_key := ir_impl_method_key(instance_type, orig_name)
-    if ir_impl_method_specializations.contains_key(method_key):
-        return
-    base_key := ir_impl_method_key(base_impl_type, orig_name)
-    expected_base_sym := base_impl_type + "_" + orig_name
-    mut prefixed_full := full_name
-    if ir_impl_methods.contains_key(base_key):
-        base_sym := ir_impl_methods[base_key]
-        if base_sym.len() > expected_base_sym.len() and base_sym.ends_with(expected_base_sym):
-            prefix_len := base_sym.len() - expected_base_sym.len()
-            prefixed_full = base_sym.substring(0, prefix_len) + full_name
-    ir_impl_method_specializations.insert(method_key, prefixed_full)
 
 fn ir_finish_module_emit():
     ir_module_count = ir_module_count + 1

@@ -19,7 +19,7 @@ from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 from checker_builtins import register_builtin_types
-from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning
+from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning
 from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration
 from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index
 
@@ -997,6 +997,7 @@ fn check_test_declaration(node: Node):
 # ---------------------------------------------------------------
 
 fn check_statement(node_idx: Int, scope_id: Int):
+    checker_set_current_node(node_idx)
     node := get_node(node_idx)
     if node.kind == "binding":
         check_binding_statement(node_idx, scope_id)
@@ -1448,7 +1449,9 @@ fn check_for_statement(node: Node, scope_id: Int):
 # ---------------------------------------------------------------
 
 pub fn c_check_expr(node_idx: Int, scope_id: Int) -> Int:
+    prev := checker_set_current_node(node_idx)
     result := check_expression_implementation(node_idx, scope_id)
+    checker_restore_current_node(prev)
     expression_type_cache.insert(node_idx, result)
     return result
 

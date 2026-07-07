@@ -5,6 +5,18 @@ from errors import Diagnostic
 
 mut checker_diagnostics: List[Diagnostic] := []
 mut checker_file_path := ""
+# the node currently being checked: plain report_error calls carry its
+# position, so errors land on a line even when the reporting site
+# doesn't thread a node through
+mut checker_current_node := 0 - 1
+
+pub fn checker_set_current_node(idx: Int) -> Int:
+    prev := checker_current_node
+    checker_current_node = idx
+    return prev
+
+pub fn checker_restore_current_node(prev: Int):
+    checker_current_node = prev
 
 fn checker_node_position(node_idx: Int) -> (Int, Int):
     if node_idx < 0:
@@ -27,14 +39,16 @@ pub fn report_error_at(node_idx: Int, code: String, message: String):
     checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, ""))
 
 pub fn report_error(code: String, message: String):
-    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, 0, 0, ""))
+    pos := checker_node_position(checker_current_node)
+    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, ""))
 
 pub fn report_error_with_fix_at(node_idx: Int, code: String, message: String, fix: String):
     pos := checker_node_position(node_idx)
     checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, fix))
 
 pub fn report_error_with_fix(code: String, message: String, fix: String):
-    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, 0, 0, fix))
+    pos := checker_node_position(checker_current_node)
+    checker_diagnostics.push(Diagnostic("error", code, message, checker_file_path, pos.0, pos.1, fix))
 
 pub fn report_warning_at(node_idx: Int, code: String, message: String):
     pos := checker_node_position(node_idx)

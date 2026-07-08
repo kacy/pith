@@ -13,13 +13,13 @@
 # globals in the flat C namespace.
 
 from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, get_type_count, register_type_name, lookup_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
-from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
+from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, binding_visible_from, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 from checker_builtins import register_builtin_types
-from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning
+from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning
 from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration
 from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index
 
@@ -113,6 +113,7 @@ pub fn initialize_checker(file_path: String):
 
 pub fn set_checker_module_path(module_path: String):
     current_checker_module_path = module_path
+    set_defining_module(module_path)
 
 pub fn set_checker_file_path(file_path: String):
     checker_set_file_path(file_path)
@@ -1527,9 +1528,31 @@ fn type_supports_stringify(tid: Int) -> Bool:
 # identifier lookup
 # ---------------------------------------------------------------
 
+# true when the current module from-imported the name (from any
+# module) or wildcard-imports anything. name-level, deliberately loose:
+# it never rejects a genuine import, only names no import mentions.
+fn current_module_imports_name(name: String) -> Bool:
+    wildcard_needle := current_checker_module_path + chr(9)
+    for w in generic_wildcard_import_entries:
+        if w.starts_with(wildcard_needle):
+            return true
+    needle := current_checker_module_path + chr(9) + name + chr(9)
+    for entry in generic_named_import_entries:
+        if entry.starts_with(needle):
+            return true
+    return false
+
 fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
     tid := lookup_binding(scope_id, name)
     if tid >= 0:
+        # a name defined by another module resolves only through an
+        # import; the shared global scope would otherwise let it leak
+        # across modules and die later in emission. builtins and the
+        # current module's own names always pass.
+        if binding_visible_from(scope_id, name, current_checker_module_path) == false:
+            if current_module_imports_name(name) == false:
+                report_error_with_fix_at(node_idx, "E201", "'" + name + "' belongs to another module and is not imported here", "import it where it is defined")
+                return TID_ERR
         return tid
     # check if it's a generic decl name — suppress false "undefined" errors
     if has_generic_declaration(name):
@@ -3195,9 +3218,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         return check_bool_method_call(method_name, arg_indices, scope_id)
 
     # collection methods. each table answers -1 for "not my method";
-    # a non-error type id means it handled the call. (a table that
-    # reports an error and returns TID_ERR still falls through to the
-    # user-defined lookup — a long-standing wart, kept for now.)
+    # any real type id — TID_ERR included — means it handled the call.
     if recv_info.kind == "list":
         result := check_list_method_call(method_name, recv_info, arg_indices, scope_id)
         if method_table_answered(result):
@@ -3299,17 +3320,21 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                             report_error("E219", "argument type mismatch: expected " + get_type_name(param_types[aidx]) + ", got " + get_type_name(atype))
             aidx = aidx + 1
         return ret_type
-    report_error("E209", get_type_name(receiver_type) + " has no method '" + method_name + "'")
+    # a table that recognized the method may have reported already;
+    # don't stack the generic "no method" on top of its specific error
+    if checker_reported_at_current() == false:
+        report_error("E209", get_type_name(receiver_type) + " has no method '" + method_name + "'")
     return TID_ERR
 
 # ---------------------------------------------------------------
 # string methods
 # ---------------------------------------------------------------
 
-# a method table's answer counts when it is a real non-error type id:
-# negative means "not my method, keep dispatching". this predicate is
-# the whole contract — the set-insert segfault came from one gate
-# testing it wrong.
+# a method table's answer counts when it is any real type id,
+# TID_ERR included: an error id means the table recognized the method
+# and already reported. only a negative answer means "not my method,
+# keep dispatching". this predicate is the whole contract — the
+# set-insert segfault came from one gate testing it wrong.
 fn method_table_answered(result: Int) -> Bool:
     return result >= 0 and is_error_type(result) == false
 

@@ -6,6 +6,7 @@
 
 import std.bytes as bytes
 import std.compress.inflate as inflate
+import std.compress.deflate as deflate
 import std.binary as binary
 import std.bits as bits
 import std.checksum as checksum
@@ -158,17 +159,7 @@ fn gzip_decompress_stored(data: Bytes) -> Bytes!:
 fn gzip_compress_result(data: Bytes) -> Bytes!:
     out := bytes.buffer_with_capacity(10 + data.len() + 5 + 8)
     gzip_write_header(out)!
-    if data.len() == 0:
-        gzip_write_stored_block(out, true, data)!
-    else:
-        mut offset := 0
-        while offset < data.len():
-            mut end := offset + GZIP_STORED_BLOCK_SIZE
-            if end > data.len():
-                end = data.len()
-            chunk := data.slice(offset, end)
-            gzip_write_stored_block(out, end == data.len(), chunk)!
-            offset = end
+    out.write(deflate.deflate(data)!)!
     gzip_write_u32_le(out, checksum.crc32(data))!
     gzip_write_u32_le(out, bits.mask32(data.len()))!
     return out.bytes()
@@ -177,9 +168,6 @@ fn gzip_compress_result(data: Bytes) -> Bytes!:
 pub fn compress(data: Bytes) -> Bytes:
     return gzip_compress_result(data) catch bytes.empty()
 
-# # decompress a gzip stream: any deflate block type — stored, fixed
-# # huffman, or dynamic huffman — so files produced by other tools read
-# # correctly. the crc32 and length trailer are verified.
 pub fn decompress(data: Bytes) -> Bytes!:
     if data.len() < 18:
         fail gzip_invalid()

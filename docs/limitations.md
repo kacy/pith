@@ -49,11 +49,11 @@ something here that now works, the page is stale and a fix to it is welcome.
   groups, and `^ $` anchors. it does not support `{n,m}` counts, lazy
   quantifiers, backreferences, or lookaround. matching is a pike vm, so
   time is linear in the input for any pattern.
-- **gzip compression writes stored blocks** — `std.compress.gzip` now
-  reads any deflate stream (stored, fixed, and dynamic huffman — files
-  from other tools decompress correctly, crc-verified), but its own
-  compress() still emits stored blocks, so pith-written .gz files are
-  larger than their input. a real compressor is the remaining half.
+- **gzip compresses with fixed huffman only** — `std.compress.gzip`
+  reads any deflate stream and writes real compression (greedy lz77
+  over fixed huffman codes; system gunzip reads its output). dynamic
+  huffman trees would shave a few more percent and are not
+  implemented.
 
 ## tooling
 

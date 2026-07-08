@@ -670,6 +670,19 @@ parq-check:
 	diff -u tools/parq/expected/report.txt "$$tmpdir/report1.txt" && \
 	echo "parq output matches golden files"
 
+# --- gzip interop check ---
+# both directions against the system tool: pith reads gzip's output
+# (covered in logscan-check too) and gzip reads pith's
+
+gzip-interop-check:
+	@echo "--- gzip interop check ---"
+	@tmpdir=$$(mktemp -d /tmp/pith-gzip-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	printf 'import std.fs as fs\nimport std.compress.gzip as gzip\n\nfn main() -> Int!:\n    raw := fs.read_bytes("README.md")!\n    fs.write_bytes("'"$$tmpdir"'/out.gz", gzip.compress(raw))!\n    return 0\n' > "$$tmpdir/pack.pith"; \
+	./target/release/pith run "$$tmpdir/pack.pith" > /dev/null 2>&1 && \
+	gunzip -c "$$tmpdir/out.gz" | cmp - README.md && \
+	echo "system gunzip reads pith output byte-identical"
+
 # --- cli regressions ---
 
 cli-regressions: build cli-regressions-only

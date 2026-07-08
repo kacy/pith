@@ -160,7 +160,7 @@ that path.
 - std.os.path, std.os.process, std.fs, std.glob — files, paths, and file discovery
 - std.cli, std.diagnostic, std.testing, std.text.scanner — small tooling layers
 - std.log, std.metrics, std.fmt, std.math, std.rand, std.time, std.datetime, std.uuid — common app helpers
-- std.compress (gzip/zlib containers, stored blocks only — see limitations), std.archive (tar/zip), std.net.sse, std.data.table — archives, server-sent events, and tabular data
+- std.compress (gzip reads any deflate stream — dynamic huffman included — via an inflate engine written in pith; compression still writes stored blocks), std.archive (tar/zip), std.net.sse, std.data.table — archives, server-sent events, and tabular data
 - std.regex — a pike-vm regular expression engine written in pith itself: linear-time matching with no pathological backtracking, capture groups, classes, alternation, anchors (no {n,m}, lazy quantifiers, backreferences, or lookaround)
 
 for child processes, prefer `std.os.process.command(...)` and the structured

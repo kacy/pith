@@ -5,6 +5,7 @@
 # slice favors compatibility over smaller files.
 
 import std.bytes as bytes
+import std.compress.inflate as inflate
 import std.binary as binary
 import std.bits as bits
 import std.checksum as checksum
@@ -176,9 +177,21 @@ fn gzip_compress_result(data: Bytes) -> Bytes!:
 pub fn compress(data: Bytes) -> Bytes:
     return gzip_compress_result(data) catch bytes.empty()
 
-# decompress a gzip stream created with stored deflate blocks.
+# # decompress a gzip stream: any deflate block type — stored, fixed
+# # huffman, or dynamic huffman — so files produced by other tools read
+# # correctly. the crc32 and length trailer are verified.
 pub fn decompress(data: Bytes) -> Bytes!:
-    return gzip_decompress_stored(data)
+    if data.len() < 18:
+        fail gzip_invalid()
+    start := gzip_parse_header(data)!
+    payload := inflate.inflate(data, start)!
+    expected_crc := gzip_read_u32_le_at(data, data.len() - 8)!
+    expected_len := gzip_read_u32_le_at(data, data.len() - 4)!
+    if payload.len() != expected_len:
+        fail "gzip: length trailer mismatch"
+    if checksum.crc32(payload) != expected_crc:
+        fail "gzip: crc mismatch"
+    return payload
 
 # true when the data is a gzip stream this module can read.
 pub fn is_valid(data: Bytes) -> Bool:

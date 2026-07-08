@@ -628,7 +628,8 @@ logscan-check:
 	./tools/logscan/logscan tools/logscan/sample/access.log "$$tmpdir/paths.csv" | grep -v "^csv written" > "$$tmpdir/report.txt"; \
 	diff -u tools/logscan/expected/report.txt "$$tmpdir/report.txt" && \
 	diff -u tools/logscan/expected/paths.csv "$$tmpdir/paths.csv" && \
-	./tools/logscan/logscan tools/logscan/sample/access.log.gz | grep -v "^csv written" > "$$tmpdir/report_gz.txt" && \
+	gzip -c tools/logscan/sample/access.log > "$$tmpdir/sys.gz" && \
+	./tools/logscan/logscan "$$tmpdir/sys.gz" | grep -v "^csv written" > "$$tmpdir/report_gz.txt" && \
 	diff -u tools/logscan/expected/report.txt "$$tmpdir/report_gz.txt" && \
 	echo "logscan output matches golden files"
 

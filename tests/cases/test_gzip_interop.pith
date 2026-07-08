@@ -1,0 +1,12 @@
+# the committed fixture was produced by system gzip -9 (dynamic
+# huffman blocks); reading it proves interop with the outside world.
+import std.fs as fs
+import std.compress.gzip as gzip
+
+fn main() -> Int!:
+    raw := fs.read_bytes("tests/cases/gzip_interop_fixture.gz")!
+    text := gzip.decompress(raw)!.to_string_utf8()!
+    print(text)
+    round := gzip.decompress(gzip.compress_string("stored-block round trip"))!
+    print(round.to_string_utf8()!)
+    return 0

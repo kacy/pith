@@ -1,0 +1,232 @@
+# std/compress/inflate — the deflate decompressor (rfc 1951).
+#
+# a bit reader walks the stream lsb-first; huffman codes decode
+# bit-by-bit against canonical first-code tables (no lookup tables to
+# build, a few comparisons per symbol); back-references copy from a
+# List[Int] window that doubles as the output.
+import std.bits as bits
+import std.bytes as bytes
+
+# # reader state over the deflate stream: byte position and bit offset.
+pub struct BitReader:
+    data: Bytes
+    pos: Int
+    bit: Int
+
+# # a canonical huffman decoder: per-length symbol counts and the
+# # symbols ordered by (length, symbol) — enough to decode bit-by-bit.
+pub struct Huffman:
+    counts: List[Int]
+    symbols: List[Int]
+
+fn br_read_bit(r: BitReader) -> Int!:
+    if r.pos >= r.data.len():
+        fail "inflate: unexpected end of stream"
+    b := bytes.get(r.data, r.pos)
+    v := bits.band(bits.shr(b, r.bit), 1)
+    r.bit = r.bit + 1
+    if r.bit == 8:
+        r.bit = 0
+        r.pos = r.pos + 1
+    return v
+
+fn br_read_bits(r: BitReader, n: Int) -> Int!:
+    mut v := 0
+    mut i := 0
+    while i < n:
+        v = bits.bor(v, bits.shl(br_read_bit(r)!, i))
+        i = i + 1
+    return v
+
+fn br_align(r: BitReader):
+    if r.bit != 0:
+        r.bit = 0
+        r.pos = r.pos + 1
+
+# build a canonical decoder from code lengths (0 = unused symbol)
+fn huffman_from_lengths(lengths: List[Int]) -> Huffman:
+    mut counts: List[Int] := [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for l in lengths:
+        if l > 0:
+            counts[l] = counts[l] + 1
+    mut symbols: List[Int] := []
+    mut length := 1
+    while length < 16:
+        mut sym := 0
+        while sym < lengths.len():
+            if lengths[sym] == length:
+                symbols.push(sym)
+            sym = sym + 1
+        length = length + 1
+    return Huffman(counts, symbols)
+
+fn huffman_decode(r: BitReader, h: Huffman) -> Int!:
+    mut code := 0
+    mut first := 0
+    mut index := 0
+    mut length := 1
+    while length < 16:
+        code = bits.bor(code, br_read_bit(r)!)
+        count := h.counts[length]
+        if code - first < count:
+            return h.symbols[index + (code - first)]
+        index = index + count
+        first = bits.shl(first + count, 1)
+        code = bits.shl(code, 1)
+        length = length + 1
+    fail "inflate: invalid huffman code"
+
+# length and distance tables (rfc 1951 section 3.2.5)
+fn length_base(sym: Int) -> Int:
+    table := [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+    return table[sym - 257]
+
+fn length_extra(sym: Int) -> Int:
+    table := [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+    return table[sym - 257]
+
+fn dist_base(sym: Int) -> Int:
+    table := [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+    return table[sym]
+
+fn dist_extra(sym: Int) -> Int:
+    table := [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+    return table[sym]
+
+fn fixed_literal_huffman() -> Huffman:
+    mut lengths: List[Int] := []
+    mut i := 0
+    while i < 288:
+        if i < 144:
+            lengths.push(8)
+        elif i < 256:
+            lengths.push(9)
+        elif i < 280:
+            lengths.push(7)
+        else:
+            lengths.push(8)
+        i = i + 1
+    return huffman_from_lengths(lengths)
+
+fn fixed_distance_huffman() -> Huffman:
+    mut lengths: List[Int] := []
+    mut i := 0
+    while i < 30:
+        lengths.push(5)
+        i = i + 1
+    return huffman_from_lengths(lengths)
+
+# the code-length alphabet arrives in this fixed order
+fn clen_order(i: Int) -> Int:
+    order := [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+    return order[i]
+
+struct HuffmanPair:
+    lit: Huffman
+    dist: Huffman
+
+fn read_dynamic_huffmans(r: BitReader) -> HuffmanPair!:
+    hlit := br_read_bits(r, 5)! + 257
+    hdist := br_read_bits(r, 5)! + 1
+    hclen := br_read_bits(r, 4)! + 4
+    mut clen_lengths: List[Int] := [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    mut i := 0
+    while i < hclen:
+        clen_lengths[clen_order(i)] = br_read_bits(r, 3)!
+        i = i + 1
+    clen_tree := huffman_from_lengths(clen_lengths)
+
+    # literal and distance lengths share one run-length-coded sequence
+    mut lengths: List[Int] := []
+    while lengths.len() < hlit + hdist:
+        sym := huffman_decode(r, clen_tree)!
+        if sym < 16:
+            lengths.push(sym)
+        elif sym == 16:
+            if lengths.len() == 0:
+                fail "inflate: repeat with no previous length"
+            prev := lengths[lengths.len() - 1]
+            mut rep := br_read_bits(r, 2)! + 3
+            while rep > 0:
+                lengths.push(prev)
+                rep = rep - 1
+        elif sym == 17:
+            mut rep := br_read_bits(r, 3)! + 3
+            while rep > 0:
+                lengths.push(0)
+                rep = rep - 1
+        else:
+            mut rep := br_read_bits(r, 7)! + 11
+            while rep > 0:
+                lengths.push(0)
+                rep = rep - 1
+    mut lit_lengths: List[Int] := []
+    mut dist_lengths: List[Int] := []
+    i = 0
+    while i < hlit:
+        lit_lengths.push(lengths[i])
+        i = i + 1
+    while i < hlit + hdist:
+        dist_lengths.push(lengths[i])
+        i = i + 1
+    return HuffmanPair(huffman_from_lengths(lit_lengths), huffman_from_lengths(dist_lengths))
+
+fn inflate_block(r: BitReader, out: List[Int], lit: Huffman, dist: Huffman) -> Bool!:
+    while true:
+        sym := huffman_decode(r, lit)!
+        if sym < 256:
+            out.push(sym)
+        elif sym == 256:
+            return true
+        else:
+            if sym > 285:
+                fail "inflate: invalid length symbol"
+            mut length := length_base(sym) + br_read_bits(r, length_extra(sym))!
+            dsym := huffman_decode(r, dist)!
+            if dsym > 29:
+                fail "inflate: invalid distance symbol"
+            distance := dist_base(dsym) + br_read_bits(r, dist_extra(dsym))!
+            if distance > out.len():
+                fail "inflate: distance beyond output"
+            mut src := out.len() - distance
+            while length > 0:
+                out.push(out[src])
+                src = src + 1
+                length = length - 1
+    return true
+
+# # decompress a raw deflate stream starting at `start`; returns the
+# # payload and leaves nothing implicit — bad streams fail with a
+# # message naming what was malformed.
+pub fn inflate(data: Bytes, start: Int) -> Bytes!:
+    r := BitReader(data, start, 0)
+    mut out: List[Int] := []
+    mut final_block := false
+    while not final_block:
+        final_block = br_read_bits(r, 1)! == 1
+        btype := br_read_bits(r, 2)!
+        if btype == 0:
+            br_align(r)
+            if r.pos + 4 > data.len():
+                fail "inflate: truncated stored block"
+            block_len := bytes.get(data, r.pos) + bits.shl(bytes.get(data, r.pos + 1), 8)
+            nlen := bytes.get(data, r.pos + 2) + bits.shl(bytes.get(data, r.pos + 3), 8)
+            if bits.band(block_len + nlen, 65535) != 65535:
+                fail "inflate: stored block length check failed"
+            r.pos = r.pos + 4
+            mut i := 0
+            while i < block_len:
+                out.push(bytes.get(data, r.pos + i))
+                i = i + 1
+            r.pos = r.pos + block_len
+        elif btype == 1:
+            inflate_block(r, out, fixed_literal_huffman(), fixed_distance_huffman())!
+        elif btype == 2:
+            trees := read_dynamic_huffmans(r)!
+            inflate_block(r, out, trees.lit, trees.dist)!
+        else:
+            fail "inflate: reserved block type"
+    buf := bytes.buffer_with_capacity(out.len())
+    for b in out:
+        buf.write_byte(b)!
+    return buf.take_bytes()

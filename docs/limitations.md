@@ -49,10 +49,11 @@ something here that now works, the page is stale and a fix to it is welcome.
   groups, and `^ $` anchors. it does not support `{n,m}` counts, lazy
   quantifiers, backreferences, or lookaround. matching is a pike vm, so
   time is linear in the input for any pattern.
-- **gzip is stored-blocks only** — `std.compress.gzip` round-trips its own
-  output but implements no huffman coding: its "compressed" data is larger
-  than the input, and it cannot read gzip files produced by other tools.
-  full deflate is an open stdlib project, alongside regex.
+- **gzip compression writes stored blocks** — `std.compress.gzip` now
+  reads any deflate stream (stored, fixed, and dynamic huffman — files
+  from other tools decompress correctly, crc-verified), but its own
+  compress() still emits stored blocks, so pith-written .gz files are
+  larger than their input. a real compressor is the remaining half.
 
 ## tooling
 

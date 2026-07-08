@@ -50,10 +50,12 @@ something here that now works, the page is stale and a fix to it is welcome.
   quantifiers, backreferences, or lookaround. matching is a pike vm, so
   time is linear in the input for any pattern.
 - **gzip compresses with fixed huffman only** — `std.compress.gzip`
-  reads any deflate stream and writes real compression (greedy lz77
-  over fixed huffman codes; system gunzip reads its output). dynamic
-  huffman trees would shave a few more percent and are not
-  implemented.
+  reads any deflate stream (multi-member files included) and writes
+  real compression (greedy lz77 over fixed huffman, stored-block
+  fallback for incompressible data; system gunzip reads its output,
+  and zlib routes through the same engine). dynamic huffman trees on
+  the write side would shave a few more percent and are the one
+  remaining refinement.
 
 ## tooling
 

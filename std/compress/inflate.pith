@@ -195,10 +195,20 @@ fn inflate_block(r: BitReader, out: List[Int], lit: Huffman, dist: Huffman) -> B
                 length = length - 1
     return true
 
-# # decompress a raw deflate stream starting at `start`; returns the
-# # payload and leaves nothing implicit — bad streams fail with a
-# # message naming what was malformed.
+# # an inflate result that also reports where the stream ended, so a
+# # caller reading concatenated members knows where the next begins.
+pub struct InflateResult:
+    payload: Bytes
+    next_pos: Int
+
+# # decompress a raw deflate stream starting at `start`; bad streams
+# # fail with a message naming what was malformed.
 pub fn inflate(data: Bytes, start: Int) -> Bytes!:
+    return inflate_with_end(data, start)!.payload
+
+# # inflate, also reporting the byte position just past the stream —
+# # a partly consumed final byte counts as consumed.
+pub fn inflate_with_end(data: Bytes, start: Int) -> InflateResult!:
     r := BitReader(data, start, 0)
     mut out: List[Int] := []
     mut final_block := false
@@ -226,7 +236,10 @@ pub fn inflate(data: Bytes, start: Int) -> Bytes!:
             inflate_block(r, out, trees.lit, trees.dist)!
         else:
             fail "inflate: reserved block type"
+    mut end_pos := r.pos
+    if r.bit > 0:
+        end_pos = end_pos + 1
     buf := bytes.buffer_with_capacity(out.len())
     for b in out:
         buf.write_byte(b)!
-    return buf.take_bytes()
+    return InflateResult(buf.take_bytes(), end_pos)

@@ -97,8 +97,44 @@ fn write_match(w: BitWriter, length: Int, distance: Int):
 fn hash3(a: Int, b: Int, c: Int) -> Int:
     return bits.band(a * 2654435 + b * 40503 + c * 809, 32767)
 
-# # compress raw bytes into a single fixed-huffman deflate block.
+# stored blocks cost 5 framing bytes per 65535-byte chunk — the
+# fallback for data fixed huffman would expand (full-range random
+# bytes cost 9 bits for half the alphabet)
+fn deflate_stored(data: Bytes) -> Bytes!:
+    out := bytes.buffer_with_capacity(data.len() + 16)
+    mut offset := 0
+    mut wrote_any := false
+    while offset < data.len() or not wrote_any:
+        mut end := offset + 65535
+        if end > data.len():
+            end = data.len()
+        chunk_len := end - offset
+        mut final_flag := 0
+        if end == data.len():
+            final_flag = 1
+        out.write_byte(final_flag)!
+        out.write_byte(bits.band(chunk_len, 255))!
+        out.write_byte(bits.band(bits.shr(chunk_len, 8), 255))!
+        nlen := bits.band(bits.invert(chunk_len), 65535)
+        out.write_byte(bits.band(nlen, 255))!
+        out.write_byte(bits.band(bits.shr(nlen, 8), 255))!
+        mut i := offset
+        while i < end:
+            out.write_byte(bytes.get(data, i))!
+            i = i + 1
+        offset = end
+        wrote_any = true
+    return out.take_bytes()
+
+# # compress raw bytes: fixed-huffman lz77, falling back to stored
+# # blocks when the encoded form would be larger than the input.
 pub fn deflate(data: Bytes) -> Bytes!:
+    packed := deflate_huffman(data)!
+    if packed.len() > data.len() + 5:
+        return deflate_stored(data)
+    return packed
+
+fn deflate_huffman(data: Bytes) -> Bytes!:
     w := BitWriter([], 0, 0)
     # final block, fixed huffman
     bw_write_bits(w, 1, 1)

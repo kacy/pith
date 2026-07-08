@@ -7,6 +7,11 @@ fn main() -> Int!:
     raw := fs.read_bytes("tests/cases/gzip_interop_fixture.gz")!
     text := gzip.decompress(raw)!.to_string_utf8()!
     print(text)
-    round := gzip.decompress(gzip.compress_string("stored-block round trip"))!
+    round := gzip.decompress(gzip.compress_string("compressor round trip"))!
     print(round.to_string_utf8()!)
+    big := fs.read_bytes("tests/cases/test_combo_containers.pith")!
+    packed := gzip.compress(big)
+    print("shrinks: {packed.len() < big.len()}")
+    back := gzip.decompress(packed)!
+    print("restores: {back.len() == big.len()}")
     return 0

@@ -1,0 +1,168 @@
+# std/compress/deflate — the deflate compressor (rfc 1951), fixed
+# huffman blocks over greedy lz77.
+#
+# a hash chain over 3-byte prefixes finds back-references (longest
+# match wins, up to 258 bytes within a 32k window); the token stream
+# encodes with the fixed huffman tables, so no tree serialization is
+# needed. dynamic huffman would shave a few more percent and is left
+# for later — this already produces real compression that any inflate
+# implementation reads.
+import std.bits as bits
+import std.bytes as bytes
+
+# # bit writer state: bits accumulate lsb-first into an output list.
+pub struct BitWriter:
+    out: List[Int]
+    acc: Int
+    nbits: Int
+
+fn bw_write_bits(w: BitWriter, value: Int, n: Int):
+    w.acc = bits.bor(w.acc, bits.shl(value, w.nbits))
+    w.nbits = w.nbits + n
+    while w.nbits >= 8:
+        w.out.push(bits.band(w.acc, 255))
+        w.acc = bits.shr(w.acc, 8)
+        w.nbits = w.nbits - 8
+
+fn bw_flush(w: BitWriter):
+    if w.nbits > 0:
+        w.out.push(bits.band(w.acc, 255))
+        w.acc = 0
+        w.nbits = 0
+
+# huffman codes transmit most-significant-bit first; the writer is
+# lsb-first, so codes are stored pre-reversed
+fn reverse_bits(value: Int, n: Int) -> Int:
+    mut v := value
+    mut r := 0
+    mut i := 0
+    while i < n:
+        r = bits.bor(bits.shl(r, 1), bits.band(v, 1))
+        v = bits.shr(v, 1)
+        i = i + 1
+    return r
+
+fn write_literal(w: BitWriter, sym: Int):
+    if sym < 144:
+        bw_write_bits(w, reverse_bits(48 + sym, 8), 8)
+    elif sym < 256:
+        bw_write_bits(w, reverse_bits(400 + (sym - 144), 9), 9)
+    elif sym < 280:
+        bw_write_bits(w, reverse_bits(sym - 256, 7), 7)
+    else:
+        bw_write_bits(w, reverse_bits(192 + (sym - 280), 8), 8)
+
+fn length_symbol(length: Int) -> Int:
+    base := [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+    mut sym := 28
+    while sym > 0 and base[sym] > length:
+        sym = sym - 1
+    return 257 + sym
+
+fn length_extra_bits(sym: Int) -> Int:
+    table := [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+    return table[sym - 257]
+
+fn length_symbol_base(sym: Int) -> Int:
+    base := [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+    return base[sym - 257]
+
+fn distance_symbol(distance: Int) -> Int:
+    base := [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+    mut sym := 29
+    while sym > 0 and base[sym] > distance:
+        sym = sym - 1
+    return sym
+
+fn distance_extra_bits(sym: Int) -> Int:
+    table := [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+    return table[sym]
+
+fn distance_symbol_base(sym: Int) -> Int:
+    base := [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+    return base[sym]
+
+fn write_match(w: BitWriter, length: Int, distance: Int):
+    lsym := length_symbol(length)
+    write_literal(w, lsym)
+    lextra := length_extra_bits(lsym)
+    if lextra > 0:
+        bw_write_bits(w, length - length_symbol_base(lsym), lextra)
+    dsym := distance_symbol(distance)
+    bw_write_bits(w, reverse_bits(dsym, 5), 5)
+    dextra := distance_extra_bits(dsym)
+    if dextra > 0:
+        bw_write_bits(w, distance - distance_symbol_base(dsym), dextra)
+
+fn hash3(a: Int, b: Int, c: Int) -> Int:
+    return bits.band(a * 2654435 + b * 40503 + c * 809, 32767)
+
+# # compress raw bytes into a single fixed-huffman deflate block.
+pub fn deflate(data: Bytes) -> Bytes!:
+    w := BitWriter([], 0, 0)
+    # final block, fixed huffman
+    bw_write_bits(w, 1, 1)
+    bw_write_bits(w, 1, 2)
+
+    n := data.len()
+    # hash heads and chains over 3-byte prefixes; -1 marks empty
+    mut heads: List[Int] := []
+    mut i := 0
+    while i < 32768:
+        heads.push(0 - 1)
+        i = i + 1
+    mut chain: List[Int] := []
+    i = 0
+    while i < n:
+        chain.push(0 - 1)
+        i = i + 1
+
+    mut pos := 0
+    while pos < n:
+        mut best_len := 0
+        mut best_dist := 0
+        if pos + 2 < n:
+            h := hash3(bytes.get(data, pos), bytes.get(data, pos + 1), bytes.get(data, pos + 2))
+            mut cand := heads[h]
+            mut tries := 0
+            while cand >= 0 and tries < 32:
+                dist := pos - cand
+                if dist > 32768:
+                    cand = 0 - 1
+                else:
+                    mut match_len := 0
+                    limit := n - pos
+                    mut cap := 258
+                    if limit < cap:
+                        cap = limit
+                    while match_len < cap and bytes.get(data, cand + match_len) == bytes.get(data, pos + match_len):
+                        match_len = match_len + 1
+                    if match_len > best_len:
+                        best_len = match_len
+                        best_dist = dist
+                    cand = chain[cand]
+                tries = tries + 1
+            chain[pos] = heads[h]
+            heads[h] = pos
+        if best_len >= 3:
+            write_match(w, best_len, best_dist)
+            # insert hash entries for the skipped positions so later
+            # matches can reference into this run
+            mut j := pos + 1
+            stop := pos + best_len
+            while j < stop and j + 2 < n:
+                hj := hash3(bytes.get(data, j), bytes.get(data, j + 1), bytes.get(data, j + 2))
+                chain[j] = heads[hj]
+                heads[hj] = j
+                j = j + 1
+            pos = pos + best_len
+        else:
+            write_literal(w, bytes.get(data, pos))
+            pos = pos + 1
+
+    write_literal(w, 256)
+    bw_flush(w)
+    buf := bytes.buffer_with_capacity(w.out.len())
+    for b in w.out:
+        buf.write_byte(b)!
+    return buf.take_bytes()

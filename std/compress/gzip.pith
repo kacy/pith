@@ -6,6 +6,7 @@
 
 import std.bytes as bytes
 import std.compress.inflate as inflate
+import std.compress.deflate as deflate
 import std.binary as binary
 import std.bits as bits
 import std.checksum as checksum
@@ -115,60 +116,10 @@ fn gzip_parse_header(data: Bytes) -> Int!:
         pos = gzip_skip(data, pos, 2)!
     return pos
 
-fn gzip_decompress_stored(data: Bytes) -> Bytes!:
-    if data.len() < 18:
-        fail gzip_invalid()
-    mut pos := gzip_parse_header(data)!
-    out := bytes.buffer()
-    deflate_limit := data.len() - 8
-    while true:
-        if pos + 1 > deflate_limit:
-            fail gzip_invalid()
-        block_header := gzip_read_u8_at(data, pos)!
-        pos = pos + 1
-        is_final := bits.band(block_header, 1) != 0
-        block_type := bits.band(bits.shr(block_header, 1), 3)
-        if block_type != 0:
-            fail gzip_invalid()
-        if pos + 4 > deflate_limit:
-            fail gzip_invalid()
-        block_len := gzip_read_u16_le_at(data, pos)!
-        block_nlen := gzip_read_u16_le_at(data, pos + 2)!
-        pos = pos + 4
-        if block_len + block_nlen != GZIP_STORED_BLOCK_SIZE:
-            fail gzip_invalid()
-        if pos + block_len > deflate_limit:
-            fail gzip_invalid()
-        if block_len > 0:
-            out.write(data.slice(pos, pos + block_len))!
-        pos = pos + block_len
-        if is_final:
-            break
-    if pos + 8 != data.len():
-        fail gzip_invalid()
-    expected_crc := gzip_read_u32_le_at(data, pos)!
-    expected_size := gzip_read_u32_le_at(data, pos + 4)!
-    result := out.bytes()
-    if checksum.crc32(result) != expected_crc:
-        fail gzip_invalid()
-    if bits.mask32(result.len()) != expected_size:
-        fail gzip_invalid()
-    return result
-
 fn gzip_compress_result(data: Bytes) -> Bytes!:
     out := bytes.buffer_with_capacity(10 + data.len() + 5 + 8)
     gzip_write_header(out)!
-    if data.len() == 0:
-        gzip_write_stored_block(out, true, data)!
-    else:
-        mut offset := 0
-        while offset < data.len():
-            mut end := offset + GZIP_STORED_BLOCK_SIZE
-            if end > data.len():
-                end = data.len()
-            chunk := data.slice(offset, end)
-            gzip_write_stored_block(out, end == data.len(), chunk)!
-            offset = end
+    out.write(deflate.deflate(data)!)!
     gzip_write_u32_le(out, checksum.crc32(data))!
     gzip_write_u32_le(out, bits.mask32(data.len()))!
     return out.bytes()
@@ -177,9 +128,9 @@ fn gzip_compress_result(data: Bytes) -> Bytes!:
 pub fn compress(data: Bytes) -> Bytes:
     return gzip_compress_result(data) catch bytes.empty()
 
-# # decompress a gzip stream: any deflate block type — stored, fixed
-# # huffman, or dynamic huffman — so files produced by other tools read
-# # correctly. the crc32 and length trailer are verified.
+# # decompress a gzip stream: stored, fixed-huffman, and
+# # dynamic-huffman blocks all read, with the crc32 and length trailer
+# # verified — files from other tools decompress correctly.
 pub fn decompress(data: Bytes) -> Bytes!:
     if data.len() < 18:
         fail gzip_invalid()
@@ -195,7 +146,7 @@ pub fn decompress(data: Bytes) -> Bytes!:
 
 # true when the data is a gzip stream this module can read.
 pub fn is_valid(data: Bytes) -> Bool:
-    result := gzip_decompress_stored(data)
+    result := decompress(data)
     return result.is_ok
 
 # compress utf-8 text into gzip bytes.
@@ -220,7 +171,8 @@ test "gzip round trips bytes and strings":
     data := bytes.from_string_utf8("pith gzip data")
     compressed := compress(data)
 
-    assert(compressed.len() > data.len())
+    # tiny inputs carry header overhead; the payload itself encodes
+    # with real compression now, so no size relation is guaranteed here
     assert(is_valid(compressed))
     assert_eq(decompress(compressed)!.to_string_utf8()!, "pith gzip data")
     assert_eq(decompress_string(compress_string("hello gzip"))!, "hello gzip")

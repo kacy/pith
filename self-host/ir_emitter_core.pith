@@ -107,6 +107,10 @@ mut ir_global_bool_names: List[String] := []
 mut ir_local_struct_names: List[String] := [] # structs declared by this module
 mut ir_dtor_memo: Map[String, Int] := {} # 1 needs dtor, 2 no/undecided
 
+mut ir_module_aliases: Map[String, String] := {}
+mut ir_import_declared_functions: Map[String, Bool] := {}
+mut ir_import_declared_globals: Map[String, Bool] := {}
+mut ir_import_renames: Map[String, String] := {}
 mut ir_type_aliases: Map[String, String] := {} # alias name -> target type
 mut ir_last_was_ret := false # tracks if the last emitted instruction was a return
 
@@ -125,10 +129,6 @@ mut ir_module_count := 0 # increments per emit_ir call for unique naming
 # "InstanceType.method" (e.g. "MapIter[Range,Int,Int].next") and value is the
 # specialized symbol name. Read via ir_lookup_specialized_method.
 
-mut ir_import_renames: Map[String, String] := {}
-mut ir_module_aliases: Map[String, String] := {}
-mut ir_import_declared_functions: Map[String, Bool] := {}
-mut ir_import_declared_globals: Map[String, Bool] := {}
 mut ir_current_func_return_kind := ""
 mut ir_current_func_optional_inner_kind := ""
 # the impl block's target type, set while a method body is being emitted, so
@@ -747,12 +747,6 @@ fn ir_emit_string_prologue(body_idx: Int):
             ir_emit("store " + ir_resolve_storage_name(name) + " " + z.to_string())
         i = i + 1
 
-fn ir_import_declares_function(module_path: String, name: String) -> Bool:
-    return ir_import_declares_function_with_state(module_path, name, ir_import_declared_functions)
-
-fn ir_import_declares_global(module_path: String, name: String) -> Bool:
-    return ir_import_declares_global_with_state(module_path, name, ir_import_declared_globals)
-
 fn ir_record_generic_function_decl(item_idx: Int, node: Node, module_path: String):
     mut full_name := node.value
     if module_path.len() > 0:
@@ -767,6 +761,30 @@ fn ir_collect_preloaded_root_metadata(root_idx: Int, module_path: String):
             ir_import_declared_functions.insert(module_path + "." + ir_base_decl_name(node.value), true)
         elif ir_is_binding_kind(node.kind):
             ir_import_declared_globals.insert(module_path + "." + ir_binding_name(node), true)
+            ir_record_imported_global_kind(node)
+
+# an imported global's type kind travels with the import: without it,
+# assigning a fresh {} to an imported Map[String, String] built the
+# untagged map flavor, its values went in without retains, and the
+# renames table came back as dangling pointers — the bug that sank
+# two attempts to split this file.
+fn ir_record_imported_global_kind(node: Node):
+    gname := ir_binding_name(node)
+    for gc in node.children:
+        gcn := get_node(gc)
+        if gcn.kind == "type" or gcn.kind == "generic_type" or gcn.kind == "optional_type":
+            kind := ir_resolve_type_node(gc)
+            if kind.len() > 0:
+                ir_record_global_type(gname, kind)
+            value_kind := ir_resolve_map_value_type_node(gc)
+            if value_kind.len() > 0:
+                ir_global_map_value_types.insert(gname, value_kind)
+
+fn ir_import_declares_function(module_path: String, name: String) -> Bool:
+    return ir_import_declares_function_with_state(module_path, name, ir_import_declared_functions)
+
+fn ir_import_declares_global(module_path: String, name: String) -> Bool:
+    return ir_import_declares_global_with_state(module_path, name, ir_import_declared_globals)
 
 fn ir_ident_callee(name: String) -> ResolvedCallee:
     return ir_ident_callee_with_state(name, ir_import_renames, ir_active_generic_module_path, ir_import_declared_functions)

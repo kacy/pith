@@ -1,0 +1,18 @@
+# reassigning an imported Map[String, String] must keep the
+# string-value flavor: without the imported-kind record, the fresh {}
+# built an untagged map whose heap-string values dangled.
+from imported_mut_helper import registry, owner_read
+
+fn build(tag: String, n: Int) -> String:
+    return tag + "-" + n.to_string()
+
+fn main():
+    registry = {}
+    mut i := 0
+    while i < 50:
+        registry.insert("k" + i.to_string(), build("value", i))
+        i = i + 1
+    print("{owner_read("k0")} {owner_read("k49")} {registry.len()}")
+    registry = {}
+    registry.insert("fresh", build("after-reset", 1))
+    print("{owner_read("fresh")} {registry.len()}")

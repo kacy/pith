@@ -128,6 +128,9 @@ fn gzip_compress_result(data: Bytes) -> Bytes!:
 pub fn compress(data: Bytes) -> Bytes:
     return gzip_compress_result(data) catch bytes.empty()
 
+# # decompress a gzip stream: stored, fixed-huffman, and
+# # dynamic-huffman blocks all read, with the crc32 and length trailer
+# # verified — files from other tools decompress correctly.
 pub fn decompress(data: Bytes) -> Bytes!:
     if data.len() < 18:
         fail gzip_invalid()

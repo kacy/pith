@@ -95,16 +95,16 @@ fn gzip_skip_zero_terminated(data: Bytes, pos: Int) -> Int!:
             return cursor
     fail gzip_invalid()
 
-fn gzip_parse_header(data: Bytes) -> Int!:
-    id1 := gzip_read_u8_at(data, 0)!
-    id2 := gzip_read_u8_at(data, 1)!
-    method := gzip_read_u8_at(data, 2)!
-    flags := gzip_read_u8_at(data, 3)!
+fn gzip_parse_header_at(data: Bytes, base: Int) -> Int!:
+    id1 := gzip_read_u8_at(data, base)!
+    id2 := gzip_read_u8_at(data, base + 1)!
+    method := gzip_read_u8_at(data, base + 2)!
+    flags := gzip_read_u8_at(data, base + 3)!
     if id1 != 31 or id2 != 139 or method != 8:
         fail gzip_invalid()
     if bits.band(flags, GZIP_FLAG_RESERVED) != 0:
         fail gzip_invalid()
-    mut pos := gzip_skip(data, 4, 6)!
+    mut pos := gzip_skip(data, base + 4, 6)!
     if bits.band(flags, GZIP_FLAG_EXTRA) != 0:
         extra_len := gzip_read_u16_le_at(data, pos)!
         pos = gzip_skip(data, pos + 2, extra_len)!
@@ -129,20 +129,30 @@ pub fn compress(data: Bytes) -> Bytes:
     return gzip_compress_result(data) catch bytes.empty()
 
 # # decompress a gzip stream: stored, fixed-huffman, and
-# # dynamic-huffman blocks all read, with the crc32 and length trailer
-# # verified — files from other tools decompress correctly.
+# # dynamic-huffman blocks all read, with each member's crc32 and
+# # length trailer verified. concatenated members (cat a.gz b.gz)
+# # decompress to their concatenated payloads, as gunzip does.
 pub fn decompress(data: Bytes) -> Bytes!:
     if data.len() < 18:
         fail gzip_invalid()
-    start := gzip_parse_header(data)!
-    payload := inflate.inflate(data, start)!
-    expected_crc := gzip_read_u32_le_at(data, data.len() - 8)!
-    expected_len := gzip_read_u32_le_at(data, data.len() - 4)!
-    if payload.len() != expected_len:
-        fail "gzip: length trailer mismatch"
-    if checksum.crc32(payload) != expected_crc:
-        fail "gzip: crc mismatch"
-    return payload
+    out := bytes.buffer()
+    mut pos := 0
+    while pos < data.len():
+        start := gzip_parse_header_at(data, pos)!
+        result := inflate.inflate_with_end(data, start)!
+        payload := result.payload
+        trailer := result.next_pos
+        if trailer + 8 > data.len():
+            fail "gzip: truncated trailer"
+        expected_crc := gzip_read_u32_le_at(data, trailer)!
+        expected_len := gzip_read_u32_le_at(data, trailer + 4)!
+        if bits.mask32(payload.len()) != expected_len:
+            fail "gzip: length trailer mismatch"
+        if checksum.crc32(payload) != expected_crc:
+            fail "gzip: crc mismatch"
+        out.write(payload)!
+        pos = trailer + 8
+    return out.take_bytes()
 
 # true when the data is a gzip stream this module can read.
 pub fn is_valid(data: Bytes) -> Bool:

@@ -4,6 +4,8 @@
 # gzip module, this first slice favors compatibility over smaller output.
 
 import std.bytes as bytes
+import std.compress.inflate as inflate
+import std.compress.deflate as deflate_engine
 import std.binary as binary
 import std.bits as bits
 import std.checksum as checksum
@@ -87,76 +89,45 @@ fn zlib_parse_header(data: Bytes) -> Int!:
         fail zlib_invalid()
     return 2
 
-fn zlib_decompress_stored(data: Bytes) -> Bytes!:
-    mut pos := zlib_parse_header(data)!
-    out := bytes.buffer()
-    deflate_limit := data.len() - 4
-    while true:
-        if pos + 1 > deflate_limit:
-            fail zlib_invalid()
-        block_header := zlib_read_u8_at(data, pos)!
-        pos = pos + 1
-        is_final := bits.band(block_header, 1) != 0
-        block_type := bits.band(bits.shr(block_header, 1), 3)
-        if block_type != 0:
-            fail zlib_invalid()
-        if pos + 4 > deflate_limit:
-            fail zlib_invalid()
-        block_len := zlib_read_u16_le_at(data, pos)!
-        block_nlen := zlib_read_u16_le_at(data, pos + 2)!
-        pos = pos + 4
-        if block_len + block_nlen != ZLIB_STORED_BLOCK_SIZE:
-            fail zlib_invalid()
-        if pos + block_len > deflate_limit:
-            fail zlib_invalid()
-        if block_len > 0:
-            out.write(data.slice(pos, pos + block_len))!
-        pos = pos + block_len
-        if is_final:
-            break
-    if pos + 4 != data.len():
+fn zlib_decompress_result(data: Bytes) -> Bytes!:
+    start := zlib_parse_header(data)!
+    payload := inflate.inflate(data, start)!
+    if data.len() < 4:
         fail zlib_invalid()
-    result := out.bytes()
-    expected_adler := zlib_read_u32_be_at(data, pos)!
-    if checksum.adler32(result) != expected_adler:
-        fail zlib_invalid()
-    return result
+    expected := zlib_read_u32_be_at(data, data.len() - 4)!
+    if checksum.adler32(payload) != expected:
+        fail "zlib: adler32 mismatch"
+    return payload
 
 fn zlib_compress_result(data: Bytes) -> Bytes!:
-    out := bytes.buffer_with_capacity(2 + data.len() + 5 + 4)
+    out := bytes.buffer_with_capacity(2 + data.len() + 4)
     zlib_write_header(out)!
-    if data.len() == 0:
-        zlib_write_stored_block(out, true, data)!
-    else:
-        mut offset := 0
-        while offset < data.len():
-            mut end := offset + ZLIB_STORED_BLOCK_SIZE
-            if end > data.len():
-                end = data.len()
-            chunk := data.slice(offset, end)
-            zlib_write_stored_block(out, end == data.len(), chunk)!
-            offset = end
+    out.write(deflate_engine.deflate(data)!)!
     zlib_write_u32_be(out, checksum.adler32(data))!
     return out.bytes()
 
-# compress bytes into a zlib stream.
+# # compress bytes into a zlib stream (deflate + adler32).
 pub fn compress(data: Bytes) -> Bytes:
     return zlib_compress_result(data) catch bytes.empty()
 
 # decompress a zlib stream created with stored deflate blocks.
+# # decompress a zlib stream; the adler32 trailer is verified.
 pub fn decompress(data: Bytes) -> Bytes!:
-    return zlib_decompress_stored(data)
+    return zlib_decompress_result(data)
 
 # true when the data is a zlib stream this module can read.
+# # true when the data is a zlib stream this module can read.
 pub fn is_valid(data: Bytes) -> Bool:
-    result := zlib_decompress_stored(data)
+    result := zlib_decompress_result(data)
     return result.is_ok
 
 # compress utf-8 text into zlib bytes.
+# # compress utf-8 text into zlib bytes.
 pub fn compress_string(text: String) -> Bytes:
     return compress(bytes.from_string_utf8(text))
 
 # decompress zlib bytes and decode the result as utf-8 text.
+# # decompress zlib bytes and decode as utf-8 text.
 pub fn decompress_string(data: Bytes) -> String!:
     return decompress(data)!.to_string_utf8()!
 

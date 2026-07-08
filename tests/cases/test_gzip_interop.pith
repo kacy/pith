@@ -2,6 +2,7 @@
 # huffman blocks); reading it proves interop with the outside world.
 import std.fs as fs
 import std.compress.gzip as gzip
+import std.compress.zlib as zlib
 
 fn main() -> Int!:
     raw := fs.read_bytes("tests/cases/gzip_interop_fixture.gz")!
@@ -14,4 +15,11 @@ fn main() -> Int!:
     print("shrinks: {packed.len() < big.len()}")
     back := gzip.decompress(packed)!
     print("restores: {back.len() == big.len()}")
+
+    multi := fs.read_bytes("tests/cases/gzip_multimember_fixture.gz")!
+    print(gzip.decompress(multi)!.to_string_utf8()!)
+
+    zpacked := zlib.compress(big)
+    zback := zlib.decompress(zpacked)!
+    print("zlib shrinks: {zpacked.len() < big.len()} restores: {zback.len() == big.len()}")
     return 0

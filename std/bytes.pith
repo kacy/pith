@@ -106,6 +106,10 @@ pub fn array_filled(count: Int, value: Int) -> ByteArray!:
 
 impl ByteBuffer:
     fn write(data: Bytes) -> Int!:
+        # the builtin reports bytes written and the result convention
+        # reads 0 as failure; an empty write is a legitimate no-op
+        if data.len() == 0:
+            return 0
         return byte_buffer_write(self.handle, data)
 
     fn free():

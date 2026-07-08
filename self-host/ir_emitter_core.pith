@@ -75,6 +75,11 @@ mut ir_map_value_types: Map[String, String] := {} # map variable name -> value t
 # checked tid of the innermost match subject, for tuple-pattern element
 # types; set by the match emitters before lowering arms
 mut ir_match_subject_tid := 0 - 1
+# declared return kinds of closure-typed parameters in the current
+# function: `key: fn(T) -> String` records "string" under "key", so a
+# call through the parameter infers its result kind even where checked
+# types are suppressed (generic bodies)
+mut ir_closure_return_kinds: Map[String, String] := {}
 
 # rc-managed locals owned by the current function, in binding order, with a
 # parallel kind list (string/list/map/set). collected by a pre-pass before
@@ -161,6 +166,7 @@ fn ir_reset_local_state():
     ir_builder_set_string_module_count(ir_module_count)
     ir_var_regs = {}
     ir_var_types = {}
+    ir_closure_return_kinds.clear()
     ir_map_value_types = {}
 
 fn ir_reset_global_state():
@@ -1241,6 +1247,9 @@ fn ir_index_expr_type(idx: Int, node: Node) -> String:
 fn ir_call_expr_type(idx: Int, node: Node) -> String:
     if node.children.len() == 0:
         return ""
+    callee_node := get_node(node.children[0])
+    if callee_node.kind == "ident" and ir_closure_return_kinds.contains_key(callee_node.value):
+        return ir_closure_return_kinds[callee_node.value]
     callee := ir_resolve_static_callee(node.children[0])
     if callee.name.len() == 0:
         return ""
@@ -4435,6 +4444,7 @@ fn ir_reset_lambda_emit_state():
     ir_builder_reset_function()
     ir_var_regs = {}
     ir_var_types = {}
+    ir_closure_return_kinds.clear()
 
 fn ir_emit_lambda_params(params: List[String]):
     for param in params:
@@ -4442,12 +4452,20 @@ fn ir_emit_lambda_params(params: List[String]):
         ir_var_regs.insert(param, lr)
         ir_emit("param " + param)
 
+# a lambda's returned value transfers to the caller, like any function
+# return: a borrowed string (a field read, a parameter) takes a count
+# on the way out, so the caller's release is balanced.
+fn ir_emit_lambda_expr_return(expr_idx: Int):
+    br := ir_expr(expr_idx)
+    if ir_infer_type(expr_idx) == "string" and ir_string_expr_is_borrowed(expr_idx):
+        ir_rc_retain_reg(br, "string")
+    ir_emit("ret " + br.to_string())
+
 fn ir_emit_lambda_body_value(body_idx: Int):
     if body_idx < 0:
         return
     if node_kind(body_idx) == "body" and node_child_count(body_idx) > 0:
-        br := ir_expr(node_child(body_idx, 0))
-        ir_emit("ret " + br.to_string())
+        ir_emit_lambda_expr_return(node_child(body_idx, 0))
         return
     if node_kind(body_idx) == "block":
         # multi-line lambda: statements run in order, return statements
@@ -4455,8 +4473,7 @@ fn ir_emit_lambda_body_value(body_idx: Int):
         # fall-through end
         ir_block(body_idx)
         return
-    br := ir_expr(body_idx)
-    ir_emit("ret " + br.to_string())
+    ir_emit_lambda_expr_return(body_idx)
 
 fn ir_emit_lambda_default_return():
     dr := ir_reg()
@@ -5389,6 +5406,15 @@ fn ir_emit_bind_stmt(node: Node):
     name := parts.name
     val_idx := parts.val_idx
     type_idx := parts.type_idx
+    # a bind from a call through a closure-typed parameter carries the
+    # closure's declared return kind — the one type source that stays
+    # reliable in generic bodies, where checked types are suppressed
+    if type_idx < 0 and val_idx >= 0:
+        vn := get_node(val_idx)
+        if vn.kind == "call" and vn.children.len() > 0:
+            callee_n := get_node(vn.children[0])
+            if callee_n.kind == "ident" and ir_closure_return_kinds.contains_key(callee_n.value):
+                ir_var_types.insert(name, ir_closure_return_kinds[callee_n.value])
     mut target_type := ""
     if type_idx >= 0:
         target_type = ir_resolve_type_node(type_idx)
@@ -6016,6 +6042,22 @@ fn ir_param_count(fn_idx: Int) -> Int:
             count = count + 1
     return count
 
+fn ir_record_closure_param_return(param_idx: Int):
+    node := get_node(param_idx)
+    if node.kind != "param" or node.children.len() == 0:
+        return
+    tn := get_node(node.children[0])
+    if tn.kind != "fn_type" or tn.children.len() == 0:
+        return
+    # a fn_type node's last child wraps its return type in a "returns"
+    # node; a fn type without one returns nothing
+    last := get_node(tn.children[tn.children.len() - 1])
+    if last.kind != "returns" or last.children.len() == 0:
+        return
+    ret_kind := ir_resolve_type_node(last.children[0])
+    if ret_kind.len() > 0:
+        ir_closure_return_kinds.insert(node.value, ret_kind)
+
 fn ir_emit_named_param(name: String, param_type: String):
     r := ir_reg()
     ir_var_regs.insert(name, r)
@@ -6030,6 +6072,7 @@ fn ir_emit_fn_params(fn_idx: Int):
         cn := get_node(child)
         if cn.kind == "param":
             ir_emit_named_param(cn.value, ir_extract_param_type(child))
+            ir_record_closure_param_return(child)
 
 fn ir_extract_return_type(fn_idx: Int) -> String:
     node := get_node(fn_idx)
@@ -6133,6 +6176,7 @@ fn ir_emit_fn_params_with_types(fn_idx: Int, param_types: List[String]):
             if param_idx < param_types.len():
                 param_type = param_types[param_idx]
             ir_emit_named_param(cn.value, param_type)
+            ir_record_closure_param_return(child)
             param_idx = param_idx + 1
 
 fn ir_generic_arg_types(node: Node) -> List[String]:
@@ -6262,6 +6306,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_builder_reset_registers()
     ir_var_regs = {}
     ir_var_types = {}
+    ir_closure_return_kinds.clear()
     ir_map_value_types = {}
     ir_string_locals = []
     ir_rc_local_kinds = []

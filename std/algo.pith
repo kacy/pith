@@ -127,10 +127,7 @@ pub fn sort_by_key[T](items: List[T], key: fn(T) -> String) -> List[T]:
         mut placed := false
         mut i := 0
         while i < out.len() and not placed:
-            # strcmp instead of `<`: inside a generic body the checker
-            # suppresses type parameters, and an ordered string compare
-            # currently falls back to comparing pointers there
-            if strcmp(item_key, key(out[i])) < 0:
+            if item_key < key(out[i]):
                 out.insert(i, item)
                 placed = true
             i = i + 1

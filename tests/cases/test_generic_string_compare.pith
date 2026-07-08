@@ -1,0 +1,23 @@
+# ordered string comparison inside generic bodies: closure-returned
+# strings must compare by content, both bound and inline.
+fn pick_first[T](items: List[T], key: fn(T) -> String) -> String:
+    mut best := key(items[0])
+    mut i := 1
+    while i < items.len():
+        k := key(items[i])
+        if k < best:
+            best = k
+        i = i + 1
+    return best
+
+fn ordered[T](a: T, b: T, key: fn(T) -> String) -> Bool:
+    return key(a) < key(b)
+
+struct P:
+    name: String
+
+fn main():
+    ps := [P("carol"), P("alice"), P("bob")]
+    print(pick_first(ps, fn(x: P) => x.name))
+    print("{ordered(ps[1], ps[0], fn(x: P) => x.name)}")
+    print("{ordered(ps[0], ps[1], fn(x: P) => x.name)}")

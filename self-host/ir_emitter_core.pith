@@ -38,6 +38,7 @@ from types import TypeInfo, get_type_info, get_type_name, lookup_type_id
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_specializations, ir_impl_method_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name
+from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_record_generic_function_decl, ir_is_generic_function_name, ir_generic_preferred_name, ir_queue_generic_specialization
 from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_toml_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_toml_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label
@@ -130,12 +131,6 @@ mut ir_preloaded_import_roots: List[Int] := []
 mut ir_preloaded_import_paths: List[String] := []
 mut ir_emit_tests := false
 mut ir_emitting_test_func := false
-mut ir_generic_decl_indices: Map[String, Int] := {}
-mut ir_generic_decl_module_paths: Map[String, String] := {}
-mut ir_generic_specialization_keys: List[String] := []
-mut ir_generic_specialization_names: Map[String, String] := {}
-mut ir_generic_specialization_type_lists: Map[String, String] := {}
-mut ir_generic_emitted_specializations: Map[String, Int] := {}
 
 pub fn set_import_roots(roots: List[Int], paths: List[String]):
     ir_preloaded_import_roots = roots
@@ -679,13 +674,6 @@ fn ir_emit_string_prologue(body_idx: Int):
             ir_emit("iconst " + z.to_string() + " 0")
             ir_emit("store " + ir_resolve_storage_name(name) + " " + z.to_string())
         i = i + 1
-
-fn ir_record_generic_function_decl(item_idx: Int, node: Node, module_path: String):
-    mut full_name := node.value
-    if module_path.len() > 0:
-        full_name = ir_import_target_name(module_path, node.value)
-    ir_generic_decl_indices.insert(full_name, item_idx)
-    ir_generic_decl_module_paths.insert(full_name, module_path)
 
 fn ir_ident_callee(name: String) -> ResolvedCallee:
     return ir_ident_callee_with_state(name, ir_import_renames, ir_active_generic_module_path, ir_import_declared_functions)
@@ -1867,9 +1855,6 @@ fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int]) -> Int:
     r := ir_reg()
     ir_emit("iconst " + r.to_string() + " 0")
     return r
-
-fn ir_generic_preferred_name(preferred: String, fallback: String) -> String:
-    return ir_generic_preferred_name_with_state(preferred, fallback, ir_generic_decl_indices)
 
 fn ir_json_generic_name(base_name: String) -> String:
     return ir_json_generic_name_with_state(base_name, ir_generic_decl_indices)
@@ -5977,9 +5962,6 @@ fn ir_collect_generic_function_decls_from_root(root_idx: Int, module_path: Strin
         if ir_is_fn_decl_kind(node.kind) and ir_has_generic_params(node):
             ir_record_generic_function_decl(item_idx, node, module_path)
 
-fn ir_is_generic_function_name(name: String) -> Bool:
-    return ir_generic_decl_indices.contains_key(name)
-
 fn ir_infer_generic_concrete_types(name: String, node: Node) -> List[String]:
     if not ir_generic_decl_indices.contains_key(name):
         return ir_generic_arg_types(node)
@@ -6032,17 +6014,6 @@ fn ir_generic_arg_types(node: Node) -> List[String]:
         else:
             arg_types.push(ir_infer_type(expr_idx))
     return arg_types
-
-fn ir_queue_generic_specialization(name: String, arg_types: List[String], ret_type: String) -> String:
-    key := ir_generic_specialization_key(name, arg_types)
-    if ir_generic_specialization_names.contains_key(key):
-        return ir_generic_specialization_names[key]
-    spec_name := ir_generic_specialization_name(name, arg_types)
-    ir_generic_specialization_keys = ir_push_string(ir_generic_specialization_keys, key)
-    ir_generic_specialization_names.insert(key, spec_name)
-    ir_generic_specialization_type_lists.insert(key, ir_encode_type_list(arg_types))
-    ir_func_returns.insert(spec_name, ret_type)
-    return spec_name
 
 fn ir_emit_generic_specialization(key: String):
     if not ir_generic_specialization_names.contains_key(key):

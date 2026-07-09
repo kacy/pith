@@ -757,6 +757,13 @@ cli-regressions-self-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -ne 0 ]; then pass=$$((pass+1)); echo "ok   test declarations fail"; else echo "FAIL test declarations fail"; fail=$$((fail+1)); fi; \
+	printf '## doc comment stays doubled\n#regular gets a space\nfn main():\n    print("x")\n' > "$$tmpdir/fmt_doc.pith"; \
+	./self-host/pith_main fmt "$$tmpdir/fmt_doc.pith" >/dev/null 2>&1; \
+	if head -1 "$$tmpdir/fmt_doc.pith" | grep -q '^## doc' && sed -n 2p "$$tmpdir/fmt_doc.pith" | grep -q '^# regular'; then \
+		pass=$$((pass+1)); echo "ok   fmt preserves doc comments"; \
+	else \
+		echo "FAIL fmt preserves doc comments"; fail=$$((fail+1)); \
+	fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-host cli regressions passed"

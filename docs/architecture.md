@@ -58,9 +58,21 @@ if a change only affects object output or linking, it belongs in `cranelift/`.
 
 ### add or change code generation
 
-- IR emitter: `self-host/ir_emitter.pith`
+- lowering engine (expressions, statements, ownership, function
+  lifecycle): `self-host/ir_emitter_core.pith`
+- its satellites, each owning one concern: `ir_builder` (output
+  buffer and per-function state), `ir_alias_registry` (aliases,
+  import renames, global kinds), `ir_struct_registry` and
+  `ir_method_tables` (shapes and symbols), `ir_generics`
+  (declarations and specializations), `ir_decode_emit` (json/toml/
+  config decode calls), `ir_match_emit` (match lowering),
+  `ir_call_emit` (call/label wrappers)
+- the satellites never import the core back; where one needs an
+  expression emitted in place it takes the emitter as an explicit
+  fn-value parameter (grep for `emit_expr`)
 - IR driver: `self-host/ir_driver.pith`
-- Cranelift lowering: `cranelift/codegen/src/ir_consumer.rs`
+- Cranelift lowering: `cranelift/codegen/src/ir_consumer.rs` (the ir
+  instruction format is documented at the top of that file)
 - runtime support: `cranelift/runtime/src/` if native code needs new helpers
 
 ### add or change tls or protocol behavior

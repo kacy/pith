@@ -10,15 +10,15 @@ from ir_struct_registry import ir_struct_names
 
 pub mut ir_last_was_ret := false # tracks if the last emitted instruction was a return
 
-# # emit a call with pre-rendered argument text.
+## emit a call with pre-rendered argument text.
 pub fn ir_emit_call_text(result_reg: Int, fname: String, ret_type: String, arg_count: Int, arg_text: String):
     ir_emit_call_text_with_state(result_reg, fname, ret_type, arg_count, arg_text, ir_func_returns, ir_type_aliases, ir_struct_names)
 
-# # emit a zero-argument call.
+## emit a zero-argument call.
 pub fn ir_emit_call0(result_reg: Int, fname: String, ret_type: String):
     ir_emit_call_text(result_reg, fname, ret_type, 0, "")
 
-# # emit a one-argument call.
+## emit a one-argument call.
 pub fn ir_emit_call1(result_reg: Int, fname: String, ret_type: String, arg0: Int):
     ir_emit_call_text(result_reg, fname, ret_type, 1, " " + arg0.to_string())
 
@@ -37,15 +37,15 @@ pub fn ir_emit_call1(result_reg: Int, fname: String, ret_type: String, arg0: Int
 #     excluded from cleanup, a returned borrow is retained
 #   - each return releases every string local the function owns
 
-# # emit a two-argument call.
+## emit a two-argument call.
 pub fn ir_emit_call2(result_reg: Int, fname: String, ret_type: String, arg0: Int, arg1: Int):
     ir_emit_call_text(result_reg, fname, ret_type, 2, " " + arg0.to_string() + " " + arg1.to_string())
 
-# # emit a three-argument call.
+## emit a three-argument call.
 pub fn ir_emit_call3(result_reg: Int, fname: String, ret_type: String, arg0: Int, arg1: Int, arg2: Int):
     ir_emit_call_text(result_reg, fname, ret_type, 3, " " + arg0.to_string() + " " + arg1.to_string() + " " + arg2.to_string())
 
-# # emit a label and reset return tracking.
+## emit a label and reset return tracking.
 pub fn ir_emit_label(l: String):
     ir_emit("label " + l)
     ir_last_was_ret = false

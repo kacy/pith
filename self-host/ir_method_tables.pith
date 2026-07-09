@@ -10,11 +10,11 @@ pub mut ir_func_returns: Map[String, String] := {} # function name -> return typ
 pub mut ir_impl_methods: Map[String, String] := {}
 pub mut ir_impl_method_specializations: Map[String, String] := {}
 
-# # the lookup key for a method on a type: "Type.method".
+## the lookup key for a method on a type: "Type.method".
 pub fn ir_impl_method_key(type_name: String, method_name: String) -> String:
     return type_name + "." + method_name
 
-# # turn a type-qualified name into a legal ir symbol.
+## turn a type-qualified name into a legal ir symbol.
 pub fn ir_sanitize_symbol(name: String) -> String:
     # Pith identifiers don't contain `[`, `]`, `,`, but generic instance names
     # like `MapIter[Range,Int,Int]` do. Map them to underscores so the symbol
@@ -33,7 +33,7 @@ pub fn ir_sanitize_symbol(name: String) -> String:
         i = i + 1
     return out
 
-# # drop [T] arguments from a type name.
+## drop [T] arguments from a type name.
 pub fn ir_strip_type_args(name: String) -> String:
     mut i := 0
     while i < name.len():
@@ -46,7 +46,7 @@ pub fn ir_strip_type_args(name: String) -> String:
 # name so writes work on generic struct instances (Iter[Int] -> Iter). Returns
 # the matching key or "" if neither the qualified nor base form is registered.
 
-# # a function's recorded return-type hint, or "".
+## a function's recorded return-type hint, or "".
 pub fn ir_lookup_func_return(full_name: String, base_name: String) -> String:
     if ir_func_returns.contains_key(full_name):
         return ir_func_returns[full_name]
@@ -54,15 +54,15 @@ pub fn ir_lookup_func_return(full_name: String, base_name: String) -> String:
         return ir_func_returns[base_name]
     return "unknown"
 
-# # true when the name is a recorded function or impl method.
+## true when the name is a recorded function or impl method.
 pub fn ir_is_declared_callable(name: String) -> Bool:
     return ir_is_declared_callable_with_state(name, ir_func_returns)
 
-# # the ir return kind for a declared callable, or "unknown".
+## the ir return kind for a declared callable, or "unknown".
 pub fn ir_declared_callable_ir_retkind(fname: String) -> String:
     return ir_declared_callable_ir_retkind_with_state(fname, ir_func_returns)
 
-# # the specialized symbol for a generic method instantiation, or "".
+## the specialized symbol for a generic method instantiation, or "".
 pub fn ir_lookup_specialized_method(type_name: String, method_name: String) -> String:
     key := ir_impl_method_key(type_name, method_name)
     if ir_impl_method_specializations.contains_key(key) == false:
@@ -83,7 +83,7 @@ pub fn ir_lookup_specialized_method(type_name: String, method_name: String) -> S
                 return prefix + name
     return name
 
-# # record one generic-method specialization under its instance key.
+## record one generic-method specialization under its instance key.
 pub fn ir_register_one_specialized_method_name(method_node: Node, base_impl_type: String, instance_type: String, arg_names: List[String]):
     orig_name := method_node.value
     mut suffix := ""

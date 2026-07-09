@@ -1,50 +1,60 @@
-# ir_emitter.pith — Pith-to-IR compiler (Stage 2)
+# ir_emitter_core.pith — the lowering engine
 #
-# reads the parsed AST and emits a simple text IR that a thin Rust
-# wrapper translates to Cranelift API calls.
+# turns a checked ast into text ir. this module owns the parts of
+# lowering that are mutually recursive by nature and share the
+# per-function state below: expressions, statements, ownership
+# (retain/release insertion), and the function lifecycle around them.
 #
-# IR format:
-#   string N "content"                  — string data
-#   func NAME NPARAM RETTYPE            — function header (RETTYPE uses IR return-kind vocabulary)
-#   param NAME                          — function parameter
-#   endfunc                             — end of function
-#   iconst REG VALUE                    — integer constant
-#   strref REG STRIDX                   — reference to string data
-#   call REG FNAME RETTYPE NARGS ARG... — function call
-#   closure_ref REG FNAME               — closure handle for a lambda function
-#   callv FNAME NARGS ARG...            — void call (no return)
-#   add REG A B                         — integer add
-#   sub REG A B                         — integer sub
-#   mul REG A B                         — integer mul
-#   div REG A B                         — integer div
-#   mod REG A B                         — integer mod
-#   eq REG A B                          — compare equal
-#   neq REG A B                         — compare not equal
-#   lt REG A B                          — compare less than
-#   gt REG A B                          — compare greater than
-#   lte REG A B                         — compare less or equal
-#   gte REG A B                         — compare greater or equal
-#   brif COND THEN_LABEL ELSE_LABEL     — conditional branch
-#   label NAME                          — label
-#   jmp LABEL                           — unconditional jump
-#   ret REG                             — return value
-#   load REG VARNAME                    — load variable
-#   store VARNAME REG                   — store variable
-#   concat REG A B                      — string concatenation
+# everything else lives in a named satellite and is imported here:
+#
+#   ir_builder          the output buffer, registers, labels, strings,
+#                       and the current function's variable maps
+#   ir_call_emit        call and label instruction wrappers
+#   ir_alias_registry   names that stand for other names: type and
+#                       module aliases, import renames, global kinds
+#   ir_struct_registry  struct and enum shapes
+#   ir_method_tables    method symbols and return kinds
+#   ir_generics         generic declarations and specializations
+#   ir_decode_emit      json / toml / config decode-call emission
+#   ir_match_emit       match lowering
+#
+# the satellites never import this module back. where one needs an
+# expression or a block emitted in place, it takes the emitter as an
+# explicit fn-value parameter (emit_expr, emit_block, ...) — grep for
+# those names to see every seam.
+#
+# two type vocabularies meet here. the checker speaks tids (integer
+# type ids, TID_INT and friends); emission speaks kind strings
+# ("int", "string", "map_str_val", ...) that pick runtime calls and
+# retain/release behavior. ir_type_from_tid and ir_retkind translate.
+#
+# a function compiles in one pass: ir_emit_fn resets the per-function
+# state, emits the header and parameters, walks the body once
+# (ir_block -> ir_stmt -> ir_expr), then closes with cleanup and a
+# default return. deferred lambda bodies emit after the function that
+# captured them.
+#
+# the ir instruction format itself is documented where it is consumed:
+# cranelift/codegen/src/ir_consumer.rs.
 
+# the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
 from checker import c_get_expr_type, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id
+# satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_specializations, ir_impl_method_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_record_generic_function_decl, ir_is_generic_function_name, ir_generic_preferred_name, ir_queue_generic_specialization
+# extracted lowering families (called through here, never back)
 from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node
 from ir_decode_emit import ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_toml_decode_call, ir_emit_toml_decode_file_call, ir_emit_toml_decode_path_call, ir_emit_toml_decode_path_specialization_body, ir_emit_toml_decode_specialization_body, ir_emit_toml_decode_text_path_specialization_body, ir_emit_toml_decode_text_specialization_body
+# emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label, ir_last_was_ret
 from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_toml_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_toml_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind
+# shared helpers: ast shapes, captures, results, optionals, literals
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
@@ -2646,7 +2656,7 @@ fn ir_emit_select_expr(node: Node) -> Int:
     ir_emit("load " + r.to_string() + " " + result_temp)
     return r
 
-# --- method call dispatch (extracted from ir_expr) ---
+# --- method call dispatch ---
 fn ir_emit_method_call(idx: Int) -> Int:
     node := get_node(idx)
     # first child is object, then args. value is method_name (may have leading dot)
@@ -2852,7 +2862,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
         return obj_r
     return r
 
-# --- string interpolation (extracted from ir_expr) ---
+# --- string interpolation ---
 fn ir_string_interp_part_reg(child: Int) -> Int:
     cn := get_node(child)
     if cn.kind == "lit":
@@ -2913,7 +2923,7 @@ fn ir_emit_string_interp(idx: Int) -> Int:
         ir_string_retain_reg(result_r)
     return result_r
 
-# --- lambda compilation (extracted from ir_expr) ---
+# --- lambda compilation ---
 struct LambdaParts:
     params: List[String]
     body_idx: Int
@@ -3348,7 +3358,12 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     ir_emit_call3(ir_reg(), ir_index_set_call_name(obj_type), "void", obj_r, idx_r, value_r)
     return true
 
-# --- emit expression, return register ---
+# --- expression lowering ---
+#
+# ir_expr is the recursion root: every value-producing node comes
+# through here and leaves its result in a register. simple shapes are
+# handled inline; anything with control flow or ownership subtlety
+# gets its own ir_emit_* function below.
 fn ir_expr(idx: Int) -> Int:
     node := get_node(idx)
 
@@ -3432,7 +3447,6 @@ fn ir_emit_grouped_expr(node: Node) -> Int:
         return ir_expr(node.children[0])
     return ir_emit_zero_value()
 
-# --- match lowering ---------------------------------------------------------
 # A match compiles to a linear chain of pattern tests. The subject is evaluated
 # once; each arm tests its pattern (and guard) and, on a match, runs its body
 # and jumps to the end. Arm bodies that are expressions store their value into a
@@ -3747,7 +3761,12 @@ fn ir_emit_for_loop_value_binding(value_name: String, index_name: String, item_k
         ir_emit("store " + index_name + " " + idx_val.to_string())
         ir_var_types.insert(index_name, "int")
 
-# --- emit statement ---
+# --- statement lowering ---
+#
+# statements are where ownership moves: binds and assigns retain,
+# rebinds release the old value, returns hand the value out. the
+# string-ownership rules live in the long comment above
+# ir_emit_call2; every statement shape here follows them.
 fn ir_stmt(idx: Int):
     node := get_node(idx)
     kind := node.kind
@@ -4130,7 +4149,10 @@ fn ir_stmt_control(idx: Int, node: Node):
     elif node.kind == "for" or node.kind == "for_stmt":
         ir_emit_for_stmt(node)
 
-# --- emit block ---
+# --- block lowering ---
+#
+# a block is statements plus the two loop-control jumps that need to
+# know their enclosing labels (break, continue).
 # Recursive block walker — unwrap block/body/then/else wrappers
 # and emits statements in source order.
 # returns a throwaway 0 so it can travel as a fn value: void
@@ -4936,6 +4958,10 @@ fn ir_finish_module_emit():
     ir_emitting_test_func = false
 
 # --- main entry ---
+#
+# per module: intern every string first (the table heads the output),
+# collect import metadata so names resolve, then emit globals and
+# functions in declaration order.
 pub fn emit_ir(root_idx: Int) -> String:
     ir_reset()
 

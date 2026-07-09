@@ -20,7 +20,7 @@ pub mut ir_match_subject_tid := 0 - 1
 
 pub mut ir_tail_match_node := 0 - 1
 
-# # emit one arm's body as the function's return value.
+## emit one arm's body as the function's return value.
 pub fn ir_emit_match_arm_return(body_idx: Int, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int):
     body := get_node(body_idx)
     if body.kind == "block":
@@ -36,7 +36,7 @@ pub fn ir_emit_match_arm_return(body_idx: Int, emit_expr: fn(Int) -> Int, emit_b
 # Lower a tail-position match: each matching arm returns its value. A no-match
 # fall-through lands on the function's default return.
 
-# # lower a function-tail match directly into returns.
+## lower a function-tail match directly into returns.
 pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int):
     subj_r := emit_expr(node.children[0])
     subj_type := ir_checked_type(node.children[0])
@@ -74,7 +74,7 @@ pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emi
 # Emit a bool register that is 1 when subj_r matches pat, ignoring any bindings
 # (those are emitted separately, only in the branch where the pattern matched).
 
-# # the boolean register deciding whether an arm matches.
+## the boolean register deciding whether an arm matches.
 pub fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
     pat := get_node(pat_idx)
     if pat.kind == "pat_wildcard":
@@ -186,7 +186,7 @@ pub fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
 # element kind names for the current match subject's tuple type;
 # "unknown" per element when the subject isn't a known tuple
 
-# # element kinds for a tuple-pattern subject.
+## element kinds for a tuple-pattern subject.
 pub fn ir_match_tuple_element_kinds(count: Int) -> List[String]:
     mut out: List[String] := []
     info := get_type_info(ir_match_subject_tid)
@@ -199,7 +199,7 @@ pub fn ir_match_tuple_element_kinds(count: Int) -> List[String]:
         i = i + 1
     return out
 
-# # the enum a variant pattern name belongs to, or "".
+## the enum a variant pattern name belongs to, or "".
 pub fn ir_variant_enum_name(variant_key: String) -> String:
     mut i := 0
     while i < variant_key.len():
@@ -213,7 +213,7 @@ pub fn ir_variant_enum_name(variant_key: String) -> String:
 # Binding and wildcard sub-patterns always match here; bindings are stored
 # by ir_emit_match_bindings once the arm is taken.
 
-# # extend an arm condition with variant payload checks.
+## extend an arm condition with variant payload checks.
 pub fn ir_emit_variant_payload_conds(pat: Node, subj_r: Int, tag_cond_r: Int) -> Int:
     mut acc_r := tag_cond_r
     mut kinds: List[String] := []
@@ -250,7 +250,7 @@ pub fn ir_emit_variant_payload_conds(pat: Node, subj_r: Int, tag_cond_r: Int) ->
 
 # Bind any names a pattern introduces, in the branch where it matched.
 
-# # bind pattern names to the matched subject's pieces.
+## bind pattern names to the matched subject's pieces.
 pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
     pat := get_node(pat_idx)
     if pat.kind == "pat_or":
@@ -321,7 +321,7 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
 # Emit an arm body. A block body runs as statements (and may return); an
 # expression body produces a value stored into result_temp.
 
-# # emit one arm's body and jump to the merge label.
+## emit one arm's body and jump to the merge label.
 pub fn ir_emit_match_arm_body(body_idx: Int, result_temp: String, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int):
     body := get_node(body_idx)
     if body.kind == "block":
@@ -334,7 +334,7 @@ pub fn ir_emit_match_arm_body(body_idx: Int, result_temp: String, emit_expr: fn(
     ir_emit("store " + result_temp + " " + val_r.to_string())
     ir_last_was_ret = false
 
-# # lower a match used as an expression.
+## lower a match used as an expression.
 pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int) -> Int:
     subj_r := emit_expr(node.children[0])
     subj_type := ir_checked_type(node.children[0])
@@ -381,7 +381,7 @@ pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_
     ir_emit("load " + r.to_string() + " " + result_temp)
     return r
 
-# # the tail match node of a function body, or -1.
+## the tail match node of a function body, or -1.
 pub fn ir_function_tail_match(body_idx: Int) -> Int:
     if ir_current_func_return_kind.len() == 0:
         return 0 - 1
@@ -389,7 +389,7 @@ pub fn ir_function_tail_match(body_idx: Int) -> Int:
         return 0 - 1
     return ir_unwrap_tail_match(body_idx)
 
-# # unwrap a returns-wrapped tail match node.
+## unwrap a returns-wrapped tail match node.
 pub fn ir_unwrap_tail_match(idx: Int) -> Int:
     n := get_node(idx)
     if n.kind == "match_expr":

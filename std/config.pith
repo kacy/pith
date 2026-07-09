@@ -9,11 +9,11 @@ import std.fs as fs
 import std.os.path as path
 import std.text.scanner as scanner
 
-# # config values flattened by dotted key.
+## config values flattened by dotted key.
 pub struct Config:
     pub values: Map[String, String]
 
-# # error returned when config loading or required lookup fails.
+## error returned when config loading or required lookup fails.
 pub struct ConfigError:
     pub message: String
 
@@ -241,20 +241,20 @@ fn config_parse_bool_required(key: String, value: String) -> Bool!ConfigError:
         return false
     fail config_fail("invalid bool config key: " + key)
 
-# # create an empty config.
+## create an empty config.
 pub fn empty() -> Config:
     mut values: Map[String, String] := {}
     return Config(values)
 
-# # create a config from a string map.
+## create a config from a string map.
 pub fn from_map(values: Map[String, String]) -> Config:
     return Config(config_copy_values(values))
 
-# # join a section prefix and field name into a dotted config key.
+## join a section prefix and field name into a dotted config key.
 pub fn dotted_key(prefix: String, key: String) -> String:
     return config_join_key(prefix, key)
 
-# # parse toml text into a config.
+## parse toml text into a config.
 pub fn from_toml(text: String) -> Config!ConfigError:
     root := toml.parse(text)
     if root < 0 or toml.type_of(root) != "table":
@@ -263,7 +263,7 @@ pub fn from_toml(text: String) -> Config!ConfigError:
     config_flatten_toml_text(values, text)
     return Config(values)
 
-# # read and parse a toml config file.
+## read and parse a toml config file.
 pub fn from_toml_file(file_path: String) -> Config!ConfigError:
     if not file_exists(file_path):
         fail config_fail("could not read config file: " + file_path)
@@ -272,7 +272,7 @@ pub fn from_toml_file(file_path: String) -> Config!ConfigError:
         fail config_fail("could not read config file: " + file_path)
     return from_toml(data.ok)
 
-# # parse json text into a config.
+## parse json text into a config.
 pub fn from_json(text: String) -> Config!ConfigError:
     root := json.parse(text)
     if root < 0 or json.type_of(root) != "object":
@@ -281,7 +281,7 @@ pub fn from_json(text: String) -> Config!ConfigError:
     config_json_flatten_object(text, 0, "", values)
     return Config(values)
 
-# # read and parse a json config file.
+## read and parse a json config file.
 pub fn from_json_file(file_path: String) -> Config!ConfigError:
     if not file_exists(file_path):
         fail config_fail("could not read config file: " + file_path)
@@ -290,14 +290,14 @@ pub fn from_json_file(file_path: String) -> Config!ConfigError:
         fail config_fail("could not read config file: " + file_path)
     return from_json(data.ok)
 
-# # merge two configs, with values from overrides winning.
+## merge two configs, with values from overrides winning.
 pub fn merge(base: Config, overrides: Config) -> Config:
     mut values := config_copy_values(base.values)
     for key in overrides.values:
         values.insert(key, overrides.values[key])
     return Config(values)
 
-# # return true when a key exists.
+## return true when a key exists.
 pub fn has(cfg: Config, key: String) -> Bool:
     return cfg.values.contains_key(key)
 
@@ -311,7 +311,7 @@ pub fn has_prefix(cfg: Config, prefix: String) -> Bool:
             return true
     return false
 
-# # return sorted config keys.
+## return sorted config keys.
 pub fn keys(cfg: Config) -> List[String]:
     mut result: List[String] := []
     for key in cfg.values:
@@ -323,27 +323,27 @@ fn config_get_string(cfg: Config, key: String) -> String:
         return ""
     return cfg.values[key]
 
-# # return a config value or an empty string.
+## return a config value or an empty string.
 pub fn get_string(cfg: Config, key: String) -> String:
     return config_get_string(cfg, key)
 
-# # return a config value or an empty string.
+## return a config value or an empty string.
 pub fn get(cfg: Config, key: String) -> String:
     return config_get_string(cfg, key)
 
-# # return a config value or the fallback.
+## return a config value or the fallback.
 pub fn get_or(cfg: Config, key: String, fallback: String) -> String:
     if not has(cfg, key):
         return fallback
     return cfg.values[key]
 
-# # return a required config value.
+## return a required config value.
 pub fn require(cfg: Config, key: String) -> String!ConfigError:
     if not has(cfg, key):
         fail config_fail("missing config key: " + key)
     return cfg.values[key]
 
-# # return a required config value parsed as an int.
+## return a required config value parsed as an int.
 pub fn require_int(cfg: Config, key: String) -> Int!ConfigError:
     value := require(cfg, key)!
     parsed := parse_int(value)
@@ -351,12 +351,12 @@ pub fn require_int(cfg: Config, key: String) -> Int!ConfigError:
         fail config_fail("invalid int config key: " + key)
     return parsed.ok
 
-# # return a required config value parsed as a bool.
+## return a required config value parsed as a bool.
 pub fn require_bool(cfg: Config, key: String) -> Bool!ConfigError:
     value := require(cfg, key)!
     return config_parse_bool_required(key, value)!
 
-# # return a config value parsed as an int, or the fallback.
+## return a config value parsed as an int, or the fallback.
 pub fn get_int_or(cfg: Config, key: String, fallback: Int) -> Int:
     if not has(cfg, key):
         return fallback
@@ -365,13 +365,13 @@ pub fn get_int_or(cfg: Config, key: String, fallback: Int) -> Int:
         return fallback
     return parsed.ok
 
-# # return a config value parsed as a bool, or the fallback.
+## return a config value parsed as a bool, or the fallback.
 pub fn get_bool_or(cfg: Config, key: String, fallback: Bool) -> Bool:
     if not has(cfg, key):
         return fallback
     return config_parse_bool(cfg.values[key], fallback)
 
-# # return a config value parsed as a float, or the fallback.
+## return a config value parsed as a float, or the fallback.
 pub fn get_float_or(cfg: Config, key: String, fallback: Float) -> Float:
     if not has(cfg, key):
         return fallback
@@ -380,45 +380,45 @@ pub fn get_float_or(cfg: Config, key: String, fallback: Float) -> Float:
         return fallback
     return parsed.ok
 
-# # decode a config into a concrete struct.
-# # this is lowered by the compiler so structs do not need runtime reflection.
+## decode a config into a concrete struct.
+## this is lowered by the compiler so structs do not need runtime reflection.
 pub fn decode[T](cfg: Config) -> T!ConfigError:
     fail config_fail("config.decode requires compiler support")
 
-# # decode a config subtree into a concrete struct using dotted keys.
-# # this is lowered by the compiler so structs do not need runtime reflection.
+## decode a config subtree into a concrete struct using dotted keys.
+## this is lowered by the compiler so structs do not need runtime reflection.
 pub fn decode_prefix[T](cfg: Config, prefix: String) -> T!ConfigError:
     fail config_fail("config.decode_prefix requires compiler support")
 
-# # load a toml file and decode it into a concrete struct.
+## load a toml file and decode it into a concrete struct.
 pub fn from_toml_file_typed[T](file_path: String) -> T!ConfigError:
     return decode[T](from_toml_file(file_path)!)
 
-# # parse toml text and decode it into a concrete struct.
+## parse toml text and decode it into a concrete struct.
 pub fn from_toml_typed[T](text: String) -> T!ConfigError:
     return decode[T](from_toml(text)!)
 
-# # parse toml text and decode a dotted subtree into a concrete struct.
+## parse toml text and decode a dotted subtree into a concrete struct.
 pub fn from_toml_typed_prefix[T](text: String, prefix: String) -> T!ConfigError:
     return decode_prefix[T](from_toml(text)!, prefix)!
 
-# # load a toml file and decode a dotted subtree into a concrete struct.
+## load a toml file and decode a dotted subtree into a concrete struct.
 pub fn from_toml_file_typed_prefix[T](file_path: String, prefix: String) -> T!ConfigError:
     return decode_prefix[T](from_toml_file(file_path)!, prefix)!
 
-# # load a json file and decode it into a concrete struct.
+## load a json file and decode it into a concrete struct.
 pub fn from_json_file_typed[T](file_path: String) -> T!ConfigError:
     return decode[T](from_json_file(file_path)!)
 
-# # parse json text and decode it into a concrete struct.
+## parse json text and decode it into a concrete struct.
 pub fn from_json_typed[T](text: String) -> T!ConfigError:
     return decode[T](from_json(text)!)
 
-# # parse json text and decode a dotted subtree into a concrete struct.
+## parse json text and decode a dotted subtree into a concrete struct.
 pub fn from_json_typed_prefix[T](text: String, prefix: String) -> T!ConfigError:
     return decode_prefix[T](from_json(text)!, prefix)!
 
-# # load a json file and decode a dotted subtree into a concrete struct.
+## load a json file and decode a dotted subtree into a concrete struct.
 pub fn from_json_file_typed_prefix[T](file_path: String, prefix: String) -> T!ConfigError:
     return decode_prefix[T](from_json_file(file_path)!, prefix)!
 

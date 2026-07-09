@@ -1329,12 +1329,32 @@ fn compile_ir_function(
                         string_regs.remove(&reg);
                         bytes_regs.remove(&reg);
                         float_regs.remove(&reg);
-                    } else {
-                        regs.insert(reg, builder.ins().iconst(types::I64, 0));
+                    } else if runtime_funcs.contains_key("pith_runtime_error") {
+                        // a call that resolves to nothing is a compiler bug
+                        // upstream (a phantom import, a missed rename, an
+                        // unlowered interface dispatch). generic template
+                        // bodies keep dead unresolved calls, so this cannot
+                        // be a compile error yet — but a live path must fail
+                        // loudly instead of silently returning zero.
+                        let result = emit_runtime_error_value(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            5,
+                        )?;
+                        regs.insert(reg, result);
                         struct_regs.remove(&reg);
                         string_regs.remove(&reg);
                         bytes_regs.remove(&reg);
                         float_regs.remove(&reg);
+                    } else {
+                        // no runtime registered (unit-test harness): keep the
+                        // strict answer.
+                        return Err(CompileError::ModuleError(format!(
+                            "ir consumer: call to unknown function '{}' in {}",
+                            fname, func_name
+                        )));
                     }
                 } // end struct constructor else
             }
@@ -1782,6 +1802,12 @@ mod tests {
     fn malformed_store_returns_compile_error() {
         let err = compile_err_for_ir("func main 0 int\niconst 17 1\nstore  17\nendfunc\n");
         assert!(err.contains("unknown or malformed instruction"));
+    }
+
+    #[test]
+    fn call_to_unknown_function_returns_compile_error() {
+        let err = compile_err_for_ir("func main 0 int\ncall 1 vanished int 0\nendfunc\n");
+        assert!(err.contains("call to unknown function 'vanished'"));
     }
 
     #[test]

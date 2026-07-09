@@ -670,15 +670,16 @@ parq-check:
 	diff -u tools/parq/expected/report.txt "$$tmpdir/report1.txt" && \
 	echo "parq output matches golden files"
 
-# the ci gate runs generated programs only (--no-mutate): fixed seed,
-# deterministic, green today. it asserts the frontend never crashes,
-# exits silent, or drops a valid program. the corpus-mutation half (make
-# fuzz) currently surfaces known-open loud-failure gaps tracked for the
-# hardening work, so it stays out of the gate until those are closed.
+# the ci gate: a fixed seed over both generated programs and mutated
+# corpus cases, deterministic and green. it asserts the frontend never
+# crashes, exits silent, or drops a valid program. the two silent-input
+# gaps the mutation half first surfaced are now fixed (E243 for stray
+# characters, E247 for missing modules), so the mutation half joins the
+# gate. use `make fuzz` for a wider, longer search.
 fuzz-check: build
-	@echo "--- fuzz check (generated programs, deterministic) ---"
+	@echo "--- fuzz check (generated + mutated corpus, deterministic) ---"
 	@./target/release/pith build tools/fuzz/fuzz.pith > /dev/null
-	@./tools/fuzz/fuzz --count 120 --build-every 8 --no-mutate
+	@./tools/fuzz/fuzz --count 120 --build-every 8
 
 # open-ended fuzzing: generated + corpus mutation. pass --count / --seed
 # to explore. known findings live in the bulletproof plan; use this to

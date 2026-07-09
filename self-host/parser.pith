@@ -113,8 +113,36 @@ fn parser_report_error_here(code: String, message: String, fix: String):
     pos := parser_error_position()
     parser_report_error_at(pos.0, pos.1, code, message, fix)
 
+# lexer error tokens are all reported up front by
+# report_lexer_error_tokens; the in-parse recovery paths still advance
+# past them but no longer re-report, so each error appears once.
 fn parser_report_lexer_error_here():
-    parser_report_error_here("E243", _cur_tok_value(), "")
+    return
+
+# an error token's value is either a descriptive message the lexer
+# built (an unterminated string, a bad dedent) or the raw offending
+# character. a multi-word value is already a message; anything else is
+# a stray character we name plainly.
+fn lexer_error_message(value: String) -> String:
+    if value.contains(" "):
+        return value
+    return "unexpected character in source"
+
+# report every lexer error token in the stream, collapsing a run of
+# adjacent error tokens into one diagnostic — a multi-byte character
+# lexes to one error token per byte, and one message is enough. runs
+# before parsing so recovery can never skip an error silently.
+fn report_lexer_error_tokens():
+    mut i := 0
+    mut prev_was_err := false
+    while i < tok_count():
+        if tok_kind(i) == "err":
+            if not prev_was_err:
+                parser_report_error_at(tok_line(i), tok_col(i), "E243", lexer_error_message(tok_value(i)), "")
+            prev_was_err = true
+        else:
+            prev_was_err = false
+        i = i + 1
 
 pub fn parser_diagnostics() -> List[Diagnostic]:
     return parser_diag_list
@@ -1395,6 +1423,13 @@ pub fn parse_with_file(token_list: List[Token], file_path: String) -> Int:
     recursion_depth = 0
     parser_file_path = file_path
     parser_diag_list = []
+
+    # a lexer error token is a hard lexical error. surface every one up
+    # front: statement recovery skips stray tokens to the next newline,
+    # and an error token caught in that skip would otherwise vanish
+    # silently — a stray character like `1 € + 2` would compile as
+    # `1 + 2`. reporting here means no lexer error is ever swallowed.
+    report_lexer_error_tokens()
 
     mut imports: List[Int] := []
     mut decls: List[Int] := []

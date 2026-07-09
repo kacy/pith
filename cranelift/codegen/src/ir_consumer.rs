@@ -1329,6 +1329,50 @@ fn compile_ir_function(
                         string_regs.remove(&reg);
                         bytes_regs.remove(&reg);
                         float_regs.remove(&reg);
+                    } else if let Some(&data_id) = global_data.get(fname) {
+                        // a module-level global holding a closure value,
+                        // called by name. the checker only allows calling a
+                        // global that is closure-typed, so load the handle
+                        // and dispatch indirectly — the same path a local
+                        // closure variable takes, sourced from the global
+                        // slot instead of a named variable.
+                        let gv = codegen.module.declare_data_in_func(data_id, builder.func);
+                        let addr = builder.ins().global_value(types::I64, gv);
+                        let closure_handle = builder.ins().load(
+                            types::I64,
+                            cranelift::codegen::ir::MemFlags::new(),
+                            addr,
+                            0,
+                        );
+                        let fn_ptr = if let Some(&closure_get_id) =
+                            runtime_funcs.get("pith_closure_get_fn")
+                        {
+                            let closure_get_ref =
+                                *func_ref_cache.entry(closure_get_id).or_insert_with(|| {
+                                    codegen
+                                        .module
+                                        .declare_func_in_func(closure_get_id, builder.func)
+                                });
+                            let call = builder.ins().call(closure_get_ref, &[closure_handle]);
+                            builder.func.dfg.first_result(call)
+                        } else {
+                            closure_handle
+                        };
+                        let mut sig = codegen.module.make_signature();
+                        sig.params.push(AbiParam::new(types::I64));
+                        for _ in &args {
+                            sig.params.push(AbiParam::new(types::I64));
+                        }
+                        sig.returns.push(AbiParam::new(types::I64));
+                        let sig_ref = builder.import_signature(sig);
+                        let mut indirect_args = vec![closure_handle];
+                        indirect_args.extend(args.iter().copied());
+                        let call = builder.ins().call_indirect(sig_ref, fn_ptr, &indirect_args);
+                        regs.insert(reg, builder.func.dfg.first_result(call));
+                        struct_regs.remove(&reg);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
                     } else if runtime_funcs.contains_key("pith_runtime_error") {
                         // a call that resolves to nothing is a compiler bug
                         // upstream (a phantom import, a missed rename, an

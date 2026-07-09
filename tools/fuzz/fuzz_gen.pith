@@ -1,0 +1,169 @@
+# fuzz_gen.pith — program generation and mutation for the fuzzer.
+#
+# the generator builds small random programs from the grammar out.
+# most will not type-check, and that is the point: the parse, fmt,
+# and check paths must survive anything. the mutator takes working
+# programs from the corpus and damages them in ways a hasty edit
+# might.
+
+import std.rand as rand
+
+## a random identifier from a small fixed pool.
+pub fn gen_ident() -> String:
+    names := ["x", "y", "count", "total", "name", "items", "flag", "acc", "left", "right"]
+    return rand.choice_string(names)
+
+fn gen_type() -> String:
+    types := ["Int", "String", "Bool", "Float", "List[Int]", "Map[String, Int]", "Int!", "String?"]
+    return rand.choice_string(types)
+
+fn gen_literal() -> String:
+    pick := rand.int(0, 5)
+    if pick == 0:
+        return rand.int(0 - 100, 1000).to_string()
+    if pick == 1:
+        return "\"" + rand.string(rand.int(0, 8)) + "\""
+    if pick == 2:
+        return "true"
+    if pick == 3:
+        return "[1, 2, 3]"
+    if pick == 4:
+        return "{{\"k\": " + rand.int(0, 9).to_string() + "}}"
+    return "none"
+
+## a random expression, recursing up to depth.
+pub fn gen_expr(depth: Int) -> String:
+    if depth <= 0:
+        pick := rand.int(0, 2)
+        if pick == 0:
+            return gen_literal()
+        return gen_ident()
+    pick := rand.int(0, 7)
+    if pick == 0:
+        return gen_literal()
+    if pick == 1:
+        return gen_ident()
+    if pick == 2:
+        ops := ["+", "-", "*", "==", "!=", "<", "and", "or"]
+        return gen_expr(depth - 1) + " " + rand.choice_string(ops) + " " + gen_expr(depth - 1)
+    if pick == 3:
+        return gen_ident() + "(" + gen_expr(depth - 1) + ")"
+    if pick == 4:
+        return "\"v: {{" + gen_expr(depth - 1) + "}}\""
+    if pick == 5:
+        return "fn(a: Int) => " + gen_expr(depth - 1)
+    if pick == 6:
+        return gen_ident() + "." + gen_ident() + "(" + gen_expr(depth - 1) + ")"
+    return "(" + gen_expr(depth - 1) + ")"
+
+fn gen_stmt(indent: String, depth: Int) -> String:
+    pick := rand.int(0, 7)
+    if pick == 0:
+        return indent + gen_ident() + " := " + gen_expr(depth) + "\n"
+    if pick == 1:
+        return indent + "mut " + gen_ident() + " := " + gen_expr(depth) + "\n"
+    if pick == 2:
+        return indent + gen_ident() + " = " + gen_expr(depth) + "\n"
+    if pick == 3:
+        return indent + "print(\"{{" + gen_expr(depth - 1) + "}}\")\n"
+    if pick == 4:
+        block := indent + "if " + gen_expr(depth - 1) + ":\n"
+        return block + gen_stmt(indent + "    ", depth - 1)
+    if pick == 5:
+        block := indent + "while " + gen_expr(depth - 1) + ":\n"
+        return block + gen_stmt(indent + "    ", depth - 1)
+    if pick == 6:
+        block := indent + "for " + gen_ident() + " in 0.." + rand.int(1, 10).to_string() + ":\n"
+        return block + gen_stmt(indent + "    ", depth - 1)
+    return indent + "return " + gen_expr(depth) + "\n"
+
+fn gen_fn_decl() -> String:
+    name := "fn_" + gen_ident()
+    mut params := ""
+    n := rand.int(0, 3)
+    for i in 0..n:
+        if i > 0:
+            params = params + ", "
+        params = params + gen_ident() + ": " + gen_type()
+    mut body := ""
+    m := rand.int(1, 4)
+    for _i in 0..m:
+        body = body + gen_stmt("    ", 2)
+    return "fn " + name + "(" + params + ") -> " + gen_type() + ":\n" + body
+
+fn gen_struct_decl() -> String:
+    mut fields := ""
+    n := rand.int(1, 3)
+    for _i in 0..n:
+        fields = fields + "    pub " + gen_ident() + ": " + gen_type() + "\n"
+    return "struct S" + rand.int(0, 99).to_string() + ":\n" + fields
+
+fn gen_enum_decl() -> String:
+    mut variants := ""
+    n := rand.int(2, 4)
+    for i in 0..n:
+        mut payload := ""
+        if rand.int(0, 2) == 0:
+            payload = "(Int)"
+        variants = variants + "    V" + i.to_string() + payload + "\n"
+    return "enum E" + rand.int(0, 99).to_string() + ":\n" + variants
+
+## one whole random program.
+pub fn gen_program() -> String:
+    mut out := ""
+    n := rand.int(0, 3)
+    for _i in 0..n:
+        pick := rand.int(0, 3)
+        if pick == 0:
+            out = out + gen_struct_decl() + "\n"
+        elif pick == 1:
+            out = out + gen_enum_decl() + "\n"
+        else:
+            out = out + gen_fn_decl() + "\n"
+    mut body := ""
+    m := rand.int(1, 5)
+    for _i in 0..m:
+        body = body + gen_stmt("    ", 2)
+    return out + "fn main():\n" + body
+
+fn splice_line(line: String) -> String:
+    if line.len() == 0:
+        return line
+    pos := rand.int(0, line.len())
+    junk := ["{{", "}}", "(", ")", ":", "!", "?", "=>", "..", "\"", "\\", "#", "match", "fn", "€", "\t"]
+    return line.substring(0, pos) + rand.choice_string(junk) + line.substring(pos, line.len())
+
+## damage a working program the way a hasty edit might.
+pub fn mutate(source: String) -> String:
+    lines := source.split("\n")
+    if lines.len() < 2:
+        return splice_line(source)
+    mut out: List[String] := []
+    n_mutations := rand.int(1, 4)
+    mut drop_at := 0 - 1
+    mut dup_at := 0 - 1
+    mut splice_at := 0 - 1
+    for _i in 0..n_mutations:
+        pick := rand.int(0, 3)
+        target := rand.int(0, lines.len())
+        if pick == 0:
+            drop_at = target
+        elif pick == 1:
+            dup_at = target
+        else:
+            splice_at = target
+    mut truncate_at := lines.len()
+    if rand.int(0, 10) == 0:
+        truncate_at = rand.int(1, lines.len())
+    for line, i in lines:
+        if i >= truncate_at:
+            break
+        if i == drop_at:
+            continue
+        mut current := line
+        if i == splice_at:
+            current = splice_line(current)
+        out.push(current)
+        if i == dup_at:
+            out.push(current)
+    return out.join("\n") + "\n"

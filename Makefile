@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -669,6 +669,23 @@ parq-check:
 	./tools/parq/parq tools/parq/sample/jobs.txt 1 | grep -v "^workers used" > "$$tmpdir/report1.txt"; \
 	diff -u tools/parq/expected/report.txt "$$tmpdir/report1.txt" && \
 	echo "parq output matches golden files"
+
+# the ci gate runs generated programs only (--no-mutate): fixed seed,
+# deterministic, green today. it asserts the frontend never crashes,
+# exits silent, or drops a valid program. the corpus-mutation half (make
+# fuzz) currently surfaces known-open loud-failure gaps tracked for the
+# hardening work, so it stays out of the gate until those are closed.
+fuzz-check: build
+	@echo "--- fuzz check (generated programs, deterministic) ---"
+	@./target/release/pith build tools/fuzz/fuzz.pith > /dev/null
+	@./tools/fuzz/fuzz --count 120 --build-every 8 --no-mutate
+
+# open-ended fuzzing: generated + corpus mutation. pass --count / --seed
+# to explore. known findings live in the bulletproof plan; use this to
+# hunt for new silent seams.
+fuzz: build
+	@./target/release/pith build tools/fuzz/fuzz.pith > /dev/null
+	@./tools/fuzz/fuzz --count 300 --build-every 5
 
 # --- gzip interop check ---
 # both directions against the system tool: pith reads gzip's output

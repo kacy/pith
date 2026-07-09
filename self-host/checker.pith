@@ -13,7 +13,7 @@
 # globals in the flat C namespace.
 
 from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, get_type_count, register_type_name, lookup_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
-from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, binding_visible_from, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
+from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
@@ -37,6 +37,7 @@ mut wildcard_imports: List[String] := []
 mut generic_named_import_entries: List[String] := []
 mut generic_wildcard_import_entries: List[String] := []
 mut current_checker_module_path: String := ""
+mut checked_module_paths: Map[String, Bool] := {}
 mut generic_inference_subst: Map[String, Int] := {}
 
 fn copy_string_map(src: Map[String, String]) -> Map[String, String]:
@@ -107,11 +108,13 @@ pub fn initialize_checker(file_path: String):
     generic_named_import_entries = []
     generic_wildcard_import_entries = []
     current_checker_module_path = ""
+    checked_module_paths = {}
     generic_inference_subst = {}
     current_scope = create_scope(-1)
     register_builtin_types(current_scope)
 
 pub fn set_checker_module_path(module_path: String):
+    checked_module_paths.insert(module_path, true)
     current_checker_module_path = module_path
     set_defining_module(module_path)
 
@@ -183,6 +186,26 @@ pub fn process_import_aliases(root_idx: Int):
                         while pi < parts.len():
                             imported_name := clean_import_part(parts[pi])
                             if imported_name.len() > 0:
+                                # a phantom import (a name the source module never
+                                # declares) otherwise sails through and dies much
+                                # later as a silent unknown call in the backend.
+                                # only enforced for modules this run has actually
+                                # registered, so single-file checks stay quiet.
+                                if checked_module_paths.contains_key(mod_path):
+                                    # generic functions never define a binding; they
+                                    # live only in the generic declaration map under
+                                    # their module-qualified name. interfaces and type
+                                    # names register globally without a module tag, so
+                                    # for those only existence can be checked.
+                                    mut declared := module_declared_top_level(imported_name, mod_path)
+                                    if declared == false:
+                                        declared = generic_declaration_map.contains_key(module_generic_target_name(mod_path, imported_name))
+                                    if declared == false:
+                                        declared = has_interface_declaration(imported_name)
+                                    if declared == false:
+                                        declared = lookup_type_id(imported_name) >= 0
+                                    if declared == false:
+                                        report_error_with_fix_at(child, "E246", "'" + imported_name + "' is not declared by module '" + mod_path + "'", "import it from the module that defines it")
                                 generic_named_import_entries.push(current_checker_module_path + chr(9) + imported_name + chr(9) + mod_path)
                             pi = pi + 1
 

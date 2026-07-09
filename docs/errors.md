@@ -497,3 +497,13 @@ rejected.
 ```
 error[E245]: if let with a bare binding needs an optional subject, got Int
 ```
+
+### E246 — import of an undeclared name
+
+a `from` import must name something its source module actually declares
+at the top level. a wrong module name in an import otherwise compiles
+clean and dies much later as a silent unknown call in the backend.
+
+```
+error[E246]: 'imaginary_helper' is not declared by module 'helper'
+```

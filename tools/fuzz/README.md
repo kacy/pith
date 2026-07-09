@@ -46,6 +46,7 @@ green.
 
 the **mutation** half takes working programs from `tests/cases` and
 damages them the way a hasty edit might — dropping lines, splicing in
-stray punctuation, truncating mid-block. it's a wider net and stays
-out of the gate while known loud-failure gaps are still open; run it
-with `make fuzz` to hunt.
+stray punctuation, truncating mid-block. it first surfaced two
+silent-input gaps (a stray character dropped between valid tokens, an
+unresolvable import accepted quietly); with those closed it runs
+inside the gate too. `make fuzz` runs a wider, longer search on top.

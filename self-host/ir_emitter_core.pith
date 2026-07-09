@@ -2048,6 +2048,35 @@ fn ir_specialize_static_callee(idx: Int, node: Node, callee: ResolvedCallee, exp
         concrete_types = ir_infer_generic_concrete_types(callee.name, node)
     return ResolvedCallee(ir_queue_generic_specialization(callee.name, concrete_types, generic_ret_type), false)
 
+# a call whose callee is an expression rather than a name — a function
+# value fetched from a list, a field, or another call. emit the callee
+# to a register, stash it in a fresh temp so the consumer sees a named
+# closure handle, and dispatch through it. without this the callee's
+# base name was mistaken for the target (`ops[0](x)` called `ops`, the
+# list itself, and segfaulted).
+fn ir_emit_indirect_expr_call(idx: Int, node: Node, callee_idx: Int) -> Int:
+    callee_r := ir_expr(callee_idx)
+    tmp := ir_new_temp_name("__callee")
+    ir_emit("store " + tmp + " " + callee_r.to_string())
+    arg_regs := ir_collect_call_arg_regs(node, 1)
+    mut ret_kind := ir_function_return_kind(callee_idx)
+    if ret_kind == "unknown":
+        ret_kind = "int"
+    r := ir_reg()
+    ir_emit_call_text(r, tmp, ret_kind, arg_regs.len(), ir_join_arg_regs(arg_regs))
+    ir_release_owned_string_args(node, 1, arg_regs)
+    return r
+
+# true when the callee node is an expression (not a plain name) whose
+# checked type is a function value.
+fn ir_callee_is_function_expr(callee_idx: Int, callee_node: Node) -> Bool:
+    if callee_node.kind == "ident":
+        return false
+    callee_tid := c_get_expr_type(callee_idx)
+    if callee_tid < 0:
+        return false
+    return get_type_info(callee_tid).kind == "function"
+
 fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     mut explicit_generic_types: List[String] := []
     if node.children.len() > 0:
@@ -2057,6 +2086,8 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
             if special_r >= 0:
                 return special_r
             explicit_generic_types = ir_explicit_generic_concrete_types(callee_node)
+        if ir_callee_is_function_expr(node.children[0], callee_node):
+            return ir_emit_indirect_expr_call(idx, node, node.children[0])
 
     mut callee := ResolvedCallee("unknown", false)
     if node.children.len() > 0:

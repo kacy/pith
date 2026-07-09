@@ -1,0 +1,24 @@
+# calling a function value that comes from an expression rather than a
+# plain name: a list index, a returned value, a map lookup. each must
+# dispatch through the value, not mistake its base for the target.
+fn double(x: Int) -> Int:
+    return x * 2
+
+fn tag(x: Int) -> String:
+    return "n=" + x.to_string()
+
+fn pick() -> fn(Int) -> Int:
+    return double
+
+fn main():
+    ops := [double, double]
+    print(ops[0](7).to_string())
+
+    strs := [tag, tag]
+    print(strs[1](42))
+
+    print(pick()(9).to_string())
+
+    mut m: Map[String, fn(Int) -> Int] := {}
+    m.insert("d", double)
+    print(m.get_default("d", double)(3).to_string())

@@ -33,6 +33,12 @@ something here that now works, the page is stale and a fix to it is welcome.
   the cap is a fixed ceiling, not a correctness issue. (multi-line closure
   bodies — `fn(x):` with an indented block — work and infer their return
   type from their return statements.)
+- **function-value struct fields aren't callable through a field** —
+  a function value stored in a struct field can be passed and returned,
+  but `instance.field(args)` parses as a method call and is rejected
+  (E209). bind it to a name first (`f := instance.field; f(args)`).
+  function values held in locals, globals, list and map elements, and
+  returned from calls are all directly callable.
 
 ## standard library
 

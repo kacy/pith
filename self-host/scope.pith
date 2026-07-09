@@ -88,6 +88,20 @@ pub fn binding_visible_from(scope_id: Int, name: String, module_path: String) ->
         return binding_visible_from(entry.parent, name, module_path)
     return false
 
+# # true when the module declared a top-level binding of the name.
+# # the root scope is always id 0 (first created after reset); builtin
+# # registrations carry an empty tag and count as declared everywhere.
+pub fn module_declared_top_level(name: String, module_path: String) -> Bool:
+    mut i := binding_scope_ids.len() - 1
+    while i >= 0:
+        if binding_scope_ids[i] == 0:
+            if binding_names_equal(binding_names[i], name):
+                tag := binding_module_tags[i]
+                if tag == "" or tag == module_path:
+                    return true
+        i = i - 1
+    return false
+
 pub fn lookup_binding(scope_id: Int, name: String) -> Int:
     # search bindings in reverse order (latest first) for this scope
     mut i := binding_scope_ids.len() - 1

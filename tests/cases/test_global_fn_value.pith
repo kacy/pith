@@ -1,0 +1,17 @@
+# a function value held in a module-level mut is callable, can be
+# reassigned, and can hold a capturing closure — the same as a local.
+fn double(x: Int) -> Int:
+    return x * 2
+
+fn negate(x: Int) -> Int:
+    return 0 - x
+
+mut op: fn(Int) -> Int := double
+
+fn main():
+    print(op(10).to_string())
+    op = negate
+    print(op(10).to_string())
+    base := 100
+    op = fn(x: Int) => x + base
+    print(op(10).to_string())

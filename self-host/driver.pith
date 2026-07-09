@@ -24,6 +24,20 @@ pub fn get_directory(path: String) -> String:
 # scan an AST root for import declarations and return the module paths.
 # from_import values are "path name1 name2 ..." - we extract the path.
 # plain import values are "path" or "path as alias" - we extract the path.
+# the line and column of the import declaration for a module path, so
+# a resolution error points at the offending line. falls back to the
+# file start if the node can't be matched.
+fn dr_import_position(root_idx: Int, mod_path: String) -> (Int, Int):
+    root := get_node(root_idx)
+    for child in root.children:
+        mut node := get_node(child)
+        if node.kind == "pub":
+            node = get_node(node.children[0])
+        if node.kind == "import" or node.kind == "from_import":
+            if node.value == mod_path or node.value.starts_with(mod_path + " "):
+                return (node.line, node.col)
+    return (1, 1)
+
 pub fn find_imports(root_idx: Int) -> List[String]:
     root := get_node(root_idx)
     mut imports: List[String] := []
@@ -314,6 +328,14 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
     imports := find_imports(root_idx)
     for mod_path in imports:
         file_path := dr_resolve_module_file(mod_path, source_path)
+        # an unresolvable import used to fail silently: read_file below
+        # would return an error result that vanished on the way out, so
+        # `import fs` (should be `std.fs`) checked clean and emitted
+        # nothing. report it here as a proper diagnostic instead.
+        if not file_exists(file_path):
+            pos := dr_import_position(root_idx, mod_path)
+            driver_parse_diagnostics = [Diagnostic("error", "E247", "cannot find module '" + mod_path + "'", source_path, pos.0, pos.1, "check the module path; standard modules are imported as std.<name>")]
+            return roots
         if visited_files.contains_key(file_path):
             continue
         # Check for import cycles (must check this AFTER checking visited)

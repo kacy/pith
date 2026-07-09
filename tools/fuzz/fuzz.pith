@@ -1,0 +1,144 @@
+# fuzz.pith — feed the frontend programs it never asked for.
+#
+# three oracles, all cheap to judge thanks to the loud-failure gates:
+#
+#   1. the compiler never crashes and never exits silent, no matter
+#      the input. exit 0 and exit 1 are answers; a signal, a timeout,
+#      or an empty-handed exit is a bug.
+#   2. anything that parses formats to a fixed point: fmt is
+#      idempotent, and fmt output still parses.
+#   3. anything that checks clean builds clean. a program the checker
+#      accepted and the emitter rejected is exactly the seam class
+#      this fuzzer exists to catch.
+#
+# deterministic by default (fixed seed) so ci runs are reproducible;
+# pass --seed to explore.
+#
+#   pith run tools/fuzz/fuzz.pith -- --count 150 --seed 42
+
+import std.rand as rand
+import std.os.process as process
+import std.fs as fs
+import std.glob as glob
+from fuzz_gen import gen_program, mutate
+
+struct Finding:
+    kind: String
+    path: String
+    detail: String
+
+struct RunResult:
+    status: Int
+    output: String
+
+mut findings: List[Finding] := []
+mut work_dir := "/tmp/pith-fuzz"
+mut pith_bin := "./target/release/pith"
+
+fn run_pith(command: String, path: String, seconds: String) -> RunResult!:
+    out := process.command("timeout").args([seconds, pith_bin, command, path]).output()!
+    return RunResult(out.status, out.stdout + out.stderr)
+
+fn record(kind: String, path: String, detail: String, source: String):
+    saved := "tools/fuzz/findings/" + kind + "_" + findings.len().to_string() + ".pith"
+    fs.write(saved, source) catch false
+    findings.push(Finding(kind, saved, detail))
+    print("FINDING [{kind}] saved to {saved}: {detail}")
+
+## oracle 1: the frontend answers loudly or not at all.
+fn check_survives(path: String, source: String) -> Bool:
+    result := run_pith("check", path, "10") catch RunResult(0 - 1, "spawn failed")
+    status := result.status
+    output := result.output
+    if status == 124:
+        record("hang", path, "check timed out", source)
+        return false
+    if status != 0 and status != 1:
+        record("crash", path, "check exited with status {status}", source)
+        return false
+    if output.trim() == "":
+        record("silent", path, "check exited {status} with no output", source)
+        return false
+    return status == 0
+
+## oracle 2: formatting reaches a fixed point and stays parseable.
+fn check_fmt_stable(path: String, source: String):
+    once := run_pith("fmt", path, "10") catch RunResult(0 - 1, "")
+    if once.status != 0:
+        record("fmt_reject", path, "fmt failed on a program that checks clean", source)
+        return
+    first := fs.read(path) catch ""
+    twice := run_pith("fmt", path, "10") catch RunResult(0 - 1, "")
+    second := fs.read(path) catch ""
+    if first != second:
+        record("fmt_unstable", path, "fmt output changed on second run", source)
+        return
+    recheck := run_pith("check", path, "10") catch RunResult(0 - 1, "")
+    if recheck.status != 0:
+        record("fmt_breaks", path, "formatted output no longer checks", source)
+
+## oracle 3: what the checker accepts, the backend must build.
+fn check_builds(path: String, source: String):
+    result := run_pith("build", path, "45") catch RunResult(0 - 1, "spawn failed")
+    if result.status == 124:
+        record("build_hang", path, "build timed out", source)
+        return
+    if result.status != 0:
+        record("seam", path, "checked clean but build failed: " + result.output.substring(0, 160), source)
+
+fn exercise(source: String, index: Int, build_every: Int):
+    path := work_dir + "/case_" + index.to_string() + ".pith"
+    fs.write(path, source) catch false
+    checked_ok := check_survives(path, source)
+    if checked_ok:
+        check_fmt_stable(path, source)
+        if build_every > 0 and index % build_every == 0:
+            check_builds(path, source)
+
+fn corpus_seeds(limit: Int) -> List[String]:
+    mut sources: List[String] := []
+    paths := glob.find(".", ["tests/cases/*.pith"]) catch []
+    for p, i in paths:
+        if i >= limit:
+            break
+        sources.push(fs.read(p) catch "")
+    return sources
+
+fn main() -> Int!:
+    mut count := 150
+    mut seed := 20260709
+    mut build_every := 10
+    mut mutate_corpus := true
+    argv := args()
+    for a, i in argv:
+        if a == "--count" and i + 1 < argv.len():
+            count = parse_int(argv[i + 1]) catch count
+        if a == "--seed" and i + 1 < argv.len():
+            seed = parse_int(argv[i + 1]) catch seed
+        if a == "--build-every" and i + 1 < argv.len():
+            build_every = parse_int(argv[i + 1]) catch build_every
+        if a == "--no-mutate":
+            mutate_corpus = false
+    rand.seed(seed)
+    process.command("mkdir").args(["-p", work_dir]).run()!
+    process.command("mkdir").args(["-p", "tools/fuzz/findings"]).run()!
+
+    mut index := 0
+    for _i in 0..count:
+        exercise(gen_program(), index, build_every)
+        index = index + 1
+
+    if mutate_corpus:
+        seeds := corpus_seeds(40)
+        for source in seeds:
+            if source == "":
+                continue
+            exercise(mutate(source), index, build_every)
+            index = index + 1
+
+    print("fuzz: {index} programs, {findings.len()} findings (seed {seed})")
+    if findings.len() > 0:
+        for f in findings:
+            print("  [{f.kind}] {f.path}: {f.detail}")
+        fail "fuzzing found {findings.len()} problems"
+    return 0

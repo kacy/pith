@@ -15,6 +15,7 @@ pub unsafe extern "C" fn pith_runtime_error(code: i64) -> i64 {
         2 => "integer division overflow",
         3 => "allocation failed",
         4 => "invalid allocation layout",
+        5 => "call to a function the compiler could not resolve — a compiler bug, not a problem in your program",
         _ => "runtime error",
     };
     eprintln!("pith runtime error: {message}");

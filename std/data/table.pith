@@ -6,12 +6,12 @@ import std.csv as csv
 import std.fs as fs
 import std.os.path as path
 
-# # tabular data with ordered headers and row maps.
+## tabular data with ordered headers and row maps.
 pub struct Table:
     pub headers: List[String]
     pub rows: List[Map[String, String]]
 
-# # error returned when table operations see bad input.
+## error returned when table operations see bad input.
 pub struct DataError:
     pub message: String
 
@@ -87,13 +87,13 @@ fn require_column(table: Table, name: String) -> Bool!DataError:
         fail data_fail("missing column: " + name)
     return true
 
-# # create an empty table.
+## create an empty table.
 pub fn empty() -> Table:
     mut headers: List[String] := []
     mut rows: List[Map[String, String]] := []
     return Table(headers, rows)
 
-# # build a table from explicit headers and positional rows.
+## build a table from explicit headers and positional rows.
 pub fn from_rows(headers: List[String], rows: List[List[String]]) -> Table:
     mut records: List[Map[String, String]] := []
     for row in rows:
@@ -106,43 +106,43 @@ pub fn from_rows(headers: List[String], rows: List[List[String]]) -> Table:
         records.push(record)
     return Table(copy_headers(headers), records)
 
-# # build a table from record maps with sorted headers.
+## build a table from record maps with sorted headers.
 pub fn from_records(rows: List[Map[String, String]]) -> Table:
     return Table(derived_headers(rows), copy_rows(rows))
 
-# # parse csv text into a table, using the first row as headers.
+## parse csv text into a table, using the first row as headers.
 pub fn from_csv(text: String) -> Table:
     return table_from_csv_rows(csv.parse(text))
 
-# # parse a csv file into a table.
+## parse a csv file into a table.
 pub fn from_csv_file(path: String) -> Table!:
     return table_from_csv_rows(csv.parse_file(path)!)
 
-# # encode a table as csv.
+## encode a table as csv.
 pub fn to_csv(table: Table) -> String:
     return csv.encode(rows_to_csv_rows(table))
 
-# # save a table as csv.
+## save a table as csv.
 pub fn save_csv(path: String, table: Table) -> Int!:
     return csv.save(path, rows_to_csv_rows(table))
 
-# # return the number of rows.
+## return the number of rows.
 pub fn row_count(table: Table) -> Int:
     return table.rows.len()
 
-# # return the number of columns.
+## return the number of columns.
 pub fn column_count(table: Table) -> Int:
     return table.headers.len()
 
-# # return a copy of the table headers.
+## return a copy of the table headers.
 pub fn columns(table: Table) -> List[String]:
     return copy_headers(table.headers)
 
-# # return true when the table has a column.
+## return true when the table has a column.
 pub fn has_column(table: Table, name: String) -> Bool:
     return header_has(table.headers, name)
 
-# # select a subset of columns in the requested order.
+## select a subset of columns in the requested order.
 pub fn select_columns(table: Table, names: List[String]) -> Table!DataError:
     for name in names:
         require_column(table, name)!
@@ -161,11 +161,11 @@ fn table_filter(table: Table, keep: fn(Map[String, String]) -> Bool) -> Table:
             rows.push(copy_row(row))
     return Table(copy_headers(table.headers), rows)
 
-# # return rows matching a predicate.
+## return rows matching a predicate.
 pub fn filter(table: Table, keep: fn(Map[String, String]) -> Bool) -> Table:
     return table_filter(table, keep)
 
-# # add or replace a derived column.
+## add or replace a derived column.
 pub fn with_column(table: Table, name: String, mapper: fn(Map[String, String]) -> String) -> Table:
     headers := copy_headers(table.headers)
     if not header_has(headers, name):
@@ -177,7 +177,7 @@ pub fn with_column(table: Table, name: String, mapper: fn(Map[String, String]) -
         rows.push(next)
     return Table(headers, rows)
 
-# # count rows by column value.
+## count rows by column value.
 pub fn group_count(table: Table, column: String) -> Map[String, Int]!DataError:
     require_column(table, column)!
     mut counts: Map[String, Int] := {}
@@ -194,21 +194,21 @@ fn table_get_string(row: Map[String, String], column: String) -> String:
         return row[column]
     return ""
 
-# # return a row value or an empty string.
+## return a row value or an empty string.
 pub fn get_string(row: Map[String, String], column: String) -> String:
     return table_get_string(row, column)
 
-# # return a row value or an empty string.
+## return a row value or an empty string.
 pub fn get(row: Map[String, String], column: String) -> String:
     return table_get_string(row, column)
 
-# # return a row value or the fallback.
+## return a row value or the fallback.
 pub fn get_or(row: Map[String, String], column: String, fallback: String) -> String:
     if row_has(row, column):
         return row[column]
     return fallback
 
-# # return a row value parsed as an int, or the fallback.
+## return a row value parsed as an int, or the fallback.
 pub fn get_int_or(row: Map[String, String], column: String, fallback: Int) -> Int:
     if not row_has(row, column):
         return fallback

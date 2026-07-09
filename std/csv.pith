@@ -1,18 +1,18 @@
-# # std.csv — CSV parsing and encoding
+## std.csv — CSV parsing and encoding
 # #
-# # Functions:
-# #   parse(text: String) -> List[List[String]]
-# #   fold_bytes[T](data: Bytes, init: T, reducer: fn(T, Row, Int) -> T) -> T
-# #   fold_file[T](path: String, init: T, reducer: fn(T, Row, Int) -> T) -> T!
-# #   rows_bytes(data: Bytes) -> List[Row]
-# #   rows_file(path: String) -> List[Row]!
-# #   parse_file(path: String) -> List[List[String]]!
-# #   parse_with_headers(text: String) -> List[Map[String, String]]
-# #   parse_with_headers_file(path: String) -> List[Map[String, String]]!
-# #   encode(rows: List[List[String]]) -> String
-# #   save(path: String, rows: List[List[String]]) -> Int!
-# #   save_chunked(path: String, rows: List[List[String]], chunk_size: Int) -> Int!
-# #   encode_row(row: List[String]) -> String
+## Functions:
+##   parse(text: String) -> List[List[String]]
+##   fold_bytes[T](data: Bytes, init: T, reducer: fn(T, Row, Int) -> T) -> T
+##   fold_file[T](path: String, init: T, reducer: fn(T, Row, Int) -> T) -> T!
+##   rows_bytes(data: Bytes) -> List[Row]
+##   rows_file(path: String) -> List[Row]!
+##   parse_file(path: String) -> List[List[String]]!
+##   parse_with_headers(text: String) -> List[Map[String, String]]
+##   parse_with_headers_file(path: String) -> List[Map[String, String]]!
+##   encode(rows: List[List[String]]) -> String
+##   save(path: String, rows: List[List[String]]) -> Int!
+##   save_chunked(path: String, rows: List[List[String]], chunk_size: Int) -> Int!
+##   encode_row(row: List[String]) -> String
 
 import std.bytes as bytes
 from std.bytes import ByteBuffer
@@ -25,8 +25,8 @@ CSV_LF := 10
 CSV_SPACE := 32
 CSV_TAB := 9
 
-# # byte-backed csv row view.
-# # fields are converted to strings only when callers ask for them.
+## byte-backed csv row view.
+## fields are converted to strings only when callers ask for them.
 pub struct Row:
     pub data: Bytes
     pub starts: List[Int]
@@ -271,7 +271,7 @@ impl Row:
     fn to_list() -> List[String]:
         return csv_row_to_list(self)
 
-# # Parse CSV text into a list of rows, each row a list of fields
+## Parse CSV text into a list of rows, each row a list of fields
 pub fn parse(text: String) -> List[List[String]]:
     return parse_bytes(bytes.from_string_utf8(text))
 
@@ -332,8 +332,8 @@ pub fn parse_file_chunked(path: String, chunk_size: Int) -> List[List[String]]!:
 pub fn parse_file_bytes(path: String) -> List[List[String]]!:
     return parse_file_chunked(path, CSV_FILE_CHUNK_SIZE)
 
-# # Parse CSV text with the first row as headers.
-# # Returns a list of maps, one per data row.
+## Parse CSV text with the first row as headers.
+## Returns a list of maps, one per data row.
 pub fn parse_with_headers(text: String) -> List[Map[String, String]]:
     return rows_with_headers(parse(text))
 
@@ -362,7 +362,7 @@ fn rows_with_headers(all_rows: List[List[String]]) -> List[Map[String, String]]:
         result.push(record)
     return result
 
-# # Encode a list of rows into CSV text
+## Encode a list of rows into CSV text
 pub fn encode(rows: List[List[String]]) -> String:
     return encode_bytes(rows).to_string_utf8() catch ""
 
@@ -393,7 +393,7 @@ pub fn save_bytes_chunked(path: String, rows: List[List[String]], chunk_size: In
     write_file_bytes(path, data)!
     return data.len()
 
-# # Encode a single row into a CSV line
+## Encode a single row into a CSV line
 pub fn encode_row(row: List[String]) -> String:
     mut fields: List[String] := []
     for field in row:

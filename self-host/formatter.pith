@@ -79,6 +79,15 @@ fn format_comment(comment: String) -> String:
     if comment.len() == 1:
         if comment[0] == "#":
             return "#"
+    # doc comments open with two hashes; normalize after the pair so
+    # "##text" becomes "## text" and "## text" stays put
+    if comment.len() >= 2:
+        if comment[1] == "#":
+            if comment.len() == 2:
+                return "##"
+            if comment[2] != " ":
+                return "## " + comment.substring(2, comment.len())
+            return comment
     if comment.len() >= 2:
         if comment[1] != " ":
             return "# " + comment.substring(1, comment.len())

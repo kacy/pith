@@ -34,7 +34,7 @@ pub mut ir_global_map_value_types: Map[String, String] := {}
 pub mut ir_global_set_names: List[String] := []
 pub mut ir_global_set_int_names: List[String] := []
 pub mut ir_global_bool_names: List[String] := []
-# # file a global under its emission kind for per-function seeding.
+## file a global under its emission kind for per-function seeding.
 pub fn ir_record_global_type(name: String, global_type: String):
     if global_type == "int":
         ir_global_int_names = ir_push_string(ir_global_int_names, name)
@@ -64,8 +64,8 @@ pub mut ir_active_generic_params: List[String] := []
 pub mut ir_active_generic_concrete_types: List[String] := []
 pub mut ir_active_generic_module_path := ""
 
-# # resolve a type annotation node to an emission kind, honoring
-# # any active generic substitution.
+## resolve a type annotation node to an emission kind, honoring
+## any active generic substitution.
 pub fn ir_resolve_type_node(type_idx: Int) -> String:
     if ir_active_generic_params.len() > 0:
         resolved := ir_resolve_type_node_with_subst(type_idx, ir_active_generic_params, ir_active_generic_concrete_types)
@@ -90,7 +90,7 @@ pub fn ir_resolve_type_node(type_idx: Int) -> String:
         return "tuple"
     return ""
 
-# # a map annotation's value-type kind, or "".
+## a map annotation's value-type kind, or "".
 pub fn ir_resolve_map_value_type_node(type_idx: Int) -> String:
     tn := get_node(type_idx)
     if tn.kind == "generic_type" and tn.value == "Map" and tn.children.len() > 1:
@@ -105,11 +105,11 @@ pub mut ir_module_aliases: Map[String, String] := {}
 pub mut ir_import_declared_functions: Map[String, Bool] := {}
 pub mut ir_import_declared_globals: Map[String, Bool] := {}
 
-# # resolve a type name through aliases to an emission hint.
+## resolve a type name through aliases to an emission hint.
 pub fn ir_resolve_type_hint(type_name: String) -> String:
     return ir_resolve_type_hint_with_state(type_name, ir_type_aliases, ir_struct_names)
 
-# # names a closure may not capture: aliases and import renames.
+## names a closure may not capture: aliases and import renames.
 pub fn ir_capture_blocked_names() -> Map[String, Bool]:
     mut blocked: Map[String, Bool] := {}
     for name in ir_module_aliases.keys():
@@ -122,19 +122,19 @@ pub fn ir_capture_blocked_names() -> Map[String, Bool]:
         blocked.insert(name, true)
     return blocked
 
-# # the ir return kind for a declared type name.
+## the ir return kind for a declared type name.
 pub fn ir_retkind(type_name: String) -> String:
     return ir_retkind_with_state(type_name, ir_type_aliases, ir_struct_names)
 
-# # true when the import declares the function.
+## true when the import declares the function.
 pub fn ir_import_declares_function(module_path: String, name: String) -> Bool:
     return ir_import_declares_function_with_state(module_path, name, ir_import_declared_functions)
 
-# # true when the import declares the global.
+## true when the import declares the global.
 pub fn ir_import_declares_global(module_path: String, name: String) -> Bool:
     return ir_import_declares_global_with_state(module_path, name, ir_import_declared_globals)
 
-# # record what a preloaded module root declares and aliases.
+## record what a preloaded module root declares and aliases.
 pub fn ir_collect_preloaded_root_metadata(root_idx: Int, module_path: String):
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
@@ -150,8 +150,8 @@ pub fn ir_collect_preloaded_root_metadata(root_idx: Int, module_path: String):
 # renames table came back as dangling pointers — the bug that sank
 # two attempts to split this file.
 
-# # record an imported global's type kind so empty literals
-# # assigned to it keep the right container flavor.
+## record an imported global's type kind so empty literals
+## assigned to it keep the right container flavor.
 pub fn ir_record_imported_global_kind(node: Node):
     gname := ir_binding_name(node)
     for gc in node.children:
@@ -164,86 +164,86 @@ pub fn ir_record_imported_global_kind(node: Node):
             if value_kind.len() > 0:
                 ir_global_map_value_types.insert(gname, value_kind)
 
-# # resolve alias.method() to its qualified symbol, or "".
+## resolve alias.method() to its qualified symbol, or "".
 pub fn ir_resolve_module_alias_method_call_name(idx: Int) -> String:
     return ir_resolve_module_alias_method_call_name_with_state(idx, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
-# # true when the callee is json.decode under any alias.
+## true when the callee is json.decode under any alias.
 pub fn ir_is_json_decode_callee(index_idx: Int, member_name: String) -> Bool:
     return ir_is_json_decode_callee_with_aliases(index_idx, member_name, ir_module_aliases)
 
-# # true when the callee is config.decode under any alias.
+## true when the callee is config.decode under any alias.
 pub fn ir_is_config_decode_callee(index_idx: Int, member_name: String) -> Bool:
     return ir_is_config_decode_callee_with_aliases(index_idx, member_name, ir_module_aliases)
 
-# # true when the callee is toml.decode under any alias.
+## true when the callee is toml.decode under any alias.
 pub fn ir_is_toml_decode_callee(index_idx: Int, member_name: String) -> Bool:
     return ir_is_toml_decode_callee_with_aliases(index_idx, member_name, ir_module_aliases)
 
-# # true when the callee is config.decode_file under any alias.
+## true when the callee is config.decode_file under any alias.
 pub fn ir_is_config_file_decode_callee(index_idx: Int, member_name: String) -> Bool:
     return ir_is_config_file_decode_callee_with_aliases(index_idx, member_name, ir_module_aliases)
 
-# # a declared callable's return-type name, or "".
+## a declared callable's return-type name, or "".
 pub fn ir_declared_callable_return_type(fname: String) -> String:
     return ir_declared_callable_return_type_with_state(fname, ir_func_returns, ir_type_aliases, ir_struct_names)
 
-# # qualified config require-helper name for a type.
+## qualified config require-helper name for a type.
 pub fn ir_config_require_full_name_for_type_name(type_name: String) -> String:
     return ir_config_require_full_name_for_type_name_with_state(type_name, ir_type_aliases, ir_struct_names)
 
-# # qualified toml require-helper name for a type.
+## qualified toml require-helper name for a type.
 pub fn ir_toml_require_full_name_for_type_name(type_name: String, module_path: String) -> String:
     return ir_toml_require_full_name_for_type_name_with_state(type_name, module_path, ir_type_aliases, ir_struct_names)
 
-# # read a result's ok field with its recorded type.
+## read a result's ok field with its recorded type.
 pub fn ir_emit_result_ok_field_typed(result_r: Int, field_type_name: String) -> Int:
     return ir_emit_result_ok_field_typed_with_state(result_r, field_type_name, ir_type_aliases, ir_struct_names)
 
-# # resolve a config.* call through module aliases.
+## resolve a config.* call through module aliases.
 pub fn ir_resolve_config_call_name(index_idx: Int, member_name: String) -> String:
     return ir_resolve_decode_call_name_with_state(index_idx, member_name, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
-# # resolve a json.* call through module aliases.
+## resolve a json.* call through module aliases.
 pub fn ir_resolve_json_call_name(index_idx: Int, member_name: String) -> String:
     return ir_resolve_decode_call_name_with_state(index_idx, member_name, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
-# # resolve a toml.* call through module aliases.
+## resolve a toml.* call through module aliases.
 pub fn ir_resolve_toml_call_name(index_idx: Int, member_name: String) -> String:
     return ir_resolve_decode_call_name_with_state(index_idx, member_name, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals)
 
-# # checked tid of a struct field by index, or -1.
+## checked tid of a struct field by index, or -1.
 pub fn ir_struct_field_tid_at(struct_name: String, field_index: Int, fallback_tid: Int) -> Int:
     return ir_struct_field_tid_at_with_state(struct_name, field_index, fallback_tid, ir_struct_names, ir_struct_decl_nodes, ir_struct_field_index_lookup, ir_struct_field_lookup, ir_type_aliases)
 
-# # emit a field read on a named struct, alias-aware.
+## emit a field read on a named struct, alias-aware.
 pub fn ir_emit_named_field_access(result_reg: Int, obj_r: Int, lookup_key: String, field_name: String, field_kind_override: String):
     ir_emit_named_field_access_with_state(result_reg, obj_r, lookup_key, field_name, field_kind_override, ir_struct_field_index_lookup, ir_struct_field_lookup, ir_type_aliases, ir_struct_names)
 
 # Allocate a boxed enum value: slot 0 is the variant tag, slots 1..n hold
 # the payload. payload_count is this variant's own arity.
 
-# # substitute generic parameters in a type name.
+## substitute generic parameters in a type name.
 pub fn ir_specialize_type_name(name: String, generic_params: List[String], concrete_types: List[String]) -> String:
     return ir_specialize_type_name_with_state(name, generic_params, concrete_types, ir_type_aliases, ir_struct_names)
 
-# # resolve a type node under a generic substitution.
+## resolve a type node under a generic substitution.
 pub fn ir_resolve_type_node_with_subst(type_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:
     return ir_resolve_type_node_with_subst_with_state(type_idx, generic_params, concrete_types, ir_type_aliases, ir_struct_names)
 
-# # a function node's return type under substitution.
+## a function node's return type under substitution.
 pub fn ir_extract_return_type_with_subst(fn_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:
     return ir_extract_return_type_with_subst_with_state(fn_idx, generic_params, concrete_types, ir_type_aliases, ir_struct_names)
 
-# # the inner type of an optional return under substitution.
+## the inner type of an optional return under substitution.
 pub fn ir_extract_optional_inner_type_with_subst(fn_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:
     return ir_extract_optional_inner_type_with_subst_with_state(fn_idx, generic_params, concrete_types, ir_type_aliases, ir_struct_names)
 
-# # parameter type names under a generic substitution.
+## parameter type names under a generic substitution.
 pub fn ir_extract_param_types_with_subst(fn_idx: Int, generic_params: List[String], concrete_types: List[String]) -> List[String]:
     return ir_extract_param_types_with_subst_with_state(fn_idx, generic_params, concrete_types, ir_type_aliases, ir_struct_names)
 
-# # record one import's alias, renames, and declarations.
+## record one import's alias, renames, and declarations.
 pub fn ir_register_import_alias(value: String):
     mut path := value
     mut alias := ""
@@ -261,7 +261,7 @@ pub fn ir_register_import_alias(value: String):
     else:
         ir_module_aliases.insert(ir_module_default_alias(path), path)
 
-# # record from-import renames for a module root.
+## record from-import renames for a module root.
 pub fn ir_collect_from_import_renames(value: String):
     parts := value.split(" ")
     if parts.len() <= 1:

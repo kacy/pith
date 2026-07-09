@@ -28,7 +28,7 @@ mut binding_mutable_flags: List[Bool] := []
 mut binding_module_tags: List[String] := []
 mut defining_module := ""
 
-# # set the module path tagged onto bindings defined from here on.
+## set the module path tagged onto bindings defined from here on.
 pub fn set_defining_module(module_path: String):
     defining_module = module_path
 
@@ -69,11 +69,11 @@ pub fn define_binding(scope_id: Int, name: String, type_id: Int, is_mut: Bool):
     binding_mutable_flags.push(is_mut)
     binding_module_tags.push(defining_module)
 
-# # the module that defined the binding a lookup would find, or "".
-# # true when any binding of the name reachable from the scope was
-# # defined by the given module or by the builtins ("") — a name can
-# # be registered by several modules (a builtin re-exported by std),
-# # and local visibility means any one of them suffices.
+## the module that defined the binding a lookup would find, or "".
+## true when any binding of the name reachable from the scope was
+## defined by the given module or by the builtins ("") — a name can
+## be registered by several modules (a builtin re-exported by std),
+## and local visibility means any one of them suffices.
 pub fn binding_visible_from(scope_id: Int, name: String, module_path: String) -> Bool:
     mut i := binding_scope_ids.len() - 1
     while i >= 0:
@@ -88,9 +88,9 @@ pub fn binding_visible_from(scope_id: Int, name: String, module_path: String) ->
         return binding_visible_from(entry.parent, name, module_path)
     return false
 
-# # true when the module declared a top-level binding of the name.
-# # the root scope is always id 0 (first created after reset); builtin
-# # registrations carry an empty tag and count as declared everywhere.
+## true when the module declared a top-level binding of the name.
+## the root scope is always id 0 (first created after reset); builtin
+## registrations carry an empty tag and count as declared everywhere.
 pub fn module_declared_top_level(name: String, module_path: String) -> Bool:
     mut i := binding_scope_ids.len() - 1
     while i >= 0:

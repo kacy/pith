@@ -13,7 +13,7 @@ import std.io as io
 
 TOML_FILE_CHUNK_SIZE := 4096
 
-# # TOML decode failure with a human-readable message.
+## TOML decode failure with a human-readable message.
 pub struct TomlDecodeError:
     pub message: String
 
@@ -418,14 +418,14 @@ fn toml_parse_file_chunked(path: String, chunk_size: Int) -> Int:
         return 0 - 1
     return toml_parse(data_result.ok)
 
-# # Parse TOML and fail if the input is invalid.
+## Parse TOML and fail if the input is invalid.
 pub fn parse_required(input: String) -> Int!TomlDecodeError:
     root := parse(input)
     if root < 0 or type_of(root) != "table":
         fail toml_decode_fail("invalid toml document")
     return root
 
-# # parses a toml file and returns the root table handle or a typed error.
+## parses a toml file and returns the root table handle or a typed error.
 pub fn parse_file_required(file_path: String) -> Int!TomlDecodeError:
     root := parse_file(file_path)
     if root < 0 or type_of(root) != "table":
@@ -464,7 +464,7 @@ fn toml_get_string(handle: Int, key: String) -> String:
         return string_values[v]
     return ""
 
-# # get a required string field or return a typed decode error.
+## get a required string field or return a typed decode error.
 pub fn require_string(handle: Int, key: String) -> String!TomlDecodeError:
     v := table_lookup(handle, key)
     if v < 0:
@@ -490,7 +490,7 @@ fn toml_get_int(handle: Int, key: String) -> Int:
         return integer_values[v]
     return 0
 
-# # get a required int field or return a typed decode error.
+## get a required int field or return a typed decode error.
 pub fn require_int(handle: Int, key: String) -> Int!TomlDecodeError:
     v := table_lookup(handle, key)
     if v < 0:
@@ -533,7 +533,7 @@ fn toml_get_bool(handle: Int, key: String) -> Bool:
         return boolean_values[v]
     return false
 
-# # get a required bool field or return a typed decode error.
+## get a required bool field or return a typed decode error.
 pub fn require_bool(handle: Int, key: String) -> Bool!TomlDecodeError:
     v := table_lookup(handle, key)
     if v < 0:
@@ -620,11 +620,11 @@ pub fn has(handle: Int, key: String) -> Bool:
 fn toml_has(handle: Int, key: String) -> Bool:
     return table_lookup(handle, key) >= 0
 
-# # decode a toml table handle into a concrete struct with public string/int/bool fields.
+## decode a toml table handle into a concrete struct with public string/int/bool fields.
 pub fn decode[T](handle: Int) -> T!TomlDecodeError:
     fail toml_decode_fail("toml.decode requires compiler support")
 
-# # parse toml text and decode it into a concrete struct.
+## parse toml text and decode it into a concrete struct.
 pub fn decode_text[T](input: String) -> T!TomlDecodeError:
     fail toml_decode_fail("toml.decode_text requires compiler support")
 
@@ -636,7 +636,7 @@ fn toml_require_table(handle: Int, key: String) -> Int!TomlDecodeError:
         fail toml_decode_fail("expected table field: " + key)
     return child
 
-# # decode a nested table selected by a dotted path.
+## decode a nested table selected by a dotted path.
 pub fn decode_path[T](handle: Int, dotted_path: String) -> T!TomlDecodeError:
     mut current := handle
     for part in dotted_path.split("."):
@@ -645,16 +645,16 @@ pub fn decode_path[T](handle: Int, dotted_path: String) -> T!TomlDecodeError:
         current = toml_require_table(current, part)!
     return decode[T](current)!
 
-# # parse toml text and decode a nested table selected by a dotted path.
+## parse toml text and decode a nested table selected by a dotted path.
 pub fn decode_text_path[T](input: String, dotted_path: String) -> T!TomlDecodeError:
     root := parse_required(input)!
     return decode_path[T](root, dotted_path)!
 
-# # loads a toml file and decodes it into a concrete struct.
+## loads a toml file and decodes it into a concrete struct.
 pub fn decode_file[T](file_path: String) -> T!TomlDecodeError:
     return decode[T](parse_file_required(file_path)!)!
 
-# # loads a toml file and decodes a nested table selected by a dotted path.
+## loads a toml file and decodes a nested table selected by a dotted path.
 pub fn decode_file_path[T](file_path: String, dotted_path: String) -> T!TomlDecodeError:
     return decode_path[T](parse_file_required(file_path)!, dotted_path)!
 

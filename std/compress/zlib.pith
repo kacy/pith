@@ -106,28 +106,28 @@ fn zlib_compress_result(data: Bytes) -> Bytes!:
     zlib_write_u32_be(out, checksum.adler32(data))!
     return out.bytes()
 
-# # compress bytes into a zlib stream (deflate + adler32).
+## compress bytes into a zlib stream (deflate + adler32).
 pub fn compress(data: Bytes) -> Bytes:
     return zlib_compress_result(data) catch bytes.empty()
 
 # decompress a zlib stream created with stored deflate blocks.
-# # decompress a zlib stream; the adler32 trailer is verified.
+## decompress a zlib stream; the adler32 trailer is verified.
 pub fn decompress(data: Bytes) -> Bytes!:
     return zlib_decompress_result(data)
 
 # true when the data is a zlib stream this module can read.
-# # true when the data is a zlib stream this module can read.
+## true when the data is a zlib stream this module can read.
 pub fn is_valid(data: Bytes) -> Bool:
     result := zlib_decompress_result(data)
     return result.is_ok
 
 # compress utf-8 text into zlib bytes.
-# # compress utf-8 text into zlib bytes.
+## compress utf-8 text into zlib bytes.
 pub fn compress_string(text: String) -> Bytes:
     return compress(bytes.from_string_utf8(text))
 
 # decompress zlib bytes and decode the result as utf-8 text.
-# # decompress zlib bytes and decode as utf-8 text.
+## decompress zlib bytes and decode as utf-8 text.
 pub fn decompress_string(data: Bytes) -> String!:
     return decompress(data)!.to_string_utf8()!
 

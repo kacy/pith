@@ -24,7 +24,7 @@ from ir_type_helpers import ir_type_from_tid
 from types import get_type_info, lookup_type_id
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label
 
-# # per-argument expression emission through the threaded hook.
+## per-argument expression emission through the threaded hook.
 fn ir_decode_collect_arg_regs(node: Node, start_idx: Int, emit_expr: fn(Int) -> Int) -> List[Int]:
     mut arg_regs: List[Int] := []
     for child, i in node.children:
@@ -38,19 +38,19 @@ fn ir_decode_collect_arg_regs(node: Node, start_idx: Int, emit_expr: fn(Int) -> 
             arg_regs.push(emit_expr(child))
     return arg_regs
 
-# # emit the json generic name sequence.
+## emit the json generic name sequence.
 pub fn ir_json_generic_name(base_name: String) -> String:
     return ir_json_generic_name_with_state(base_name, ir_generic_decl_indices)
 
-# # emit the config generic name sequence.
+## emit the config generic name sequence.
 pub fn ir_config_generic_name(base_name: String) -> String:
     return ir_config_generic_name_with_state(base_name, ir_generic_decl_indices)
 
-# # emit the toml generic name sequence.
+## emit the toml generic name sequence.
 pub fn ir_toml_generic_name(base_name: String, module_path: String) -> String:
     return ir_toml_generic_name_with_state(base_name, module_path, ir_generic_decl_indices)
 
-# # decode a nested struct field through its helper.
+## decode a nested struct field through its helper.
 pub fn ir_emit_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid: Int, require_name: String, decode_name: String, temp_prefix: String) -> Int:
     child_result_r := ir_reg()
     ir_emit_call2(child_result_r, require_name, "tuple", parent_handle_r, key_r)
@@ -67,36 +67,36 @@ pub fn ir_emit_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid: 
     ir_emit("load " + result_r.to_string() + " " + temp_name)
     return result_r
 
-# # emit the json nested decode path sequence.
+## emit the json nested decode path sequence.
 pub fn ir_emit_json_nested_decode_path(parent_handle_r: Int, key_r: Int, target_tid: Int, index_idx: Int) -> Int:
     decode_name := ir_generic_preferred_name(ir_resolve_json_call_name(index_idx, "decode_object"), "decode_object")
     return ir_emit_nested_decode_path(parent_handle_r, key_r, target_tid, ir_resolve_json_call_name(index_idx, "object_require_object"), decode_name, "json_nested_decode")
 
-# # emit the config nested decode prefix sequence.
+## emit the config nested decode prefix sequence.
 pub fn ir_emit_config_nested_decode_prefix(cfg_r: Int, prefix_r: Int, target_tid: Int, index_idx: Int) -> Int:
     decode_name := ir_generic_preferred_name(ir_resolve_config_call_name(index_idx, "decode_prefix"), "decode_prefix")
     result_r := ir_reg()
     ir_emit_call2(result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", cfg_r, prefix_r)
     return result_r
 
-# # emit the config nested decode prefix specialized sequence.
+## emit the config nested decode prefix specialized sequence.
 pub fn ir_emit_config_nested_decode_prefix_specialized(cfg_r: Int, prefix_r: Int, target_tid: Int) -> Int:
     decode_name := ir_config_generic_name("decode_prefix")
     result_r := ir_reg()
     ir_emit_call2(result_r, ir_queue_generic_specialization(decode_name, [ir_type_from_tid(target_tid)], "tuple"), "tuple", cfg_r, prefix_r)
     return result_r
 
-# # emit the toml nested decode path sequence.
+## emit the toml nested decode path sequence.
 pub fn ir_emit_toml_nested_decode_path(handle_r: Int, key_r: Int, target_tid: Int, index_idx: Int) -> Int:
     decode_name := ir_generic_preferred_name(ir_resolve_toml_call_name(index_idx, "decode"), "decode")
     return ir_emit_nested_decode_path(handle_r, key_r, target_tid, ir_resolve_toml_call_name(index_idx, "toml_require_table"), decode_name, "toml_nested_decode")
 
-# # emit the toml nested decode path specialized sequence.
+## emit the toml nested decode path specialized sequence.
 pub fn ir_emit_toml_nested_decode_path_specialized(handle_r: Int, key_r: Int, target_tid: Int, module_path: String) -> Int:
     decode_name := ir_toml_generic_name("decode", module_path)
     return ir_emit_nested_decode_path(handle_r, key_r, target_tid, ir_resolve_generic_module_call_name(module_path, "toml_require_table"), decode_name, "toml_nested_decode")
 
-# # emit the config field key sequence.
+## emit the config field key sequence.
 pub fn ir_emit_config_field_key(field_name: String, prefix_r: Int, index_idx: Int) -> Int:
     key_r := ir_reg()
     ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
@@ -106,7 +106,7 @@ pub fn ir_emit_config_field_key(field_name: String, prefix_r: Int, index_idx: In
     ir_emit_call2(full_key_r, ir_resolve_config_call_name(index_idx, "dotted_key"), "string", prefix_r, key_r)
     return full_key_r
 
-# # emit the config specialized field key sequence.
+## emit the config specialized field key sequence.
 pub fn ir_emit_config_specialized_field_key(field_name: String, prefix_r: Int) -> Int:
     key_r := ir_reg()
     ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
@@ -121,7 +121,7 @@ struct IrDecodeFieldBranch:
     present_l: String
     merge_l: String
 
-# # open the has-field branch pair for one field.
+## open the has-field branch pair for one field.
 pub fn ir_begin_decode_field_branch(has_r: Int, temp_prefix: String, temp_type: String) -> IrDecodeFieldBranch:
     present_l := ir_label()
     missing_l := ir_label()
@@ -132,31 +132,31 @@ pub fn ir_begin_decode_field_branch(has_r: Int, temp_prefix: String, temp_type: 
     ir_emit_label(missing_l)
     return IrDecodeFieldBranch(field_temp, present_l, merge_l)
 
-# # begin the field-present branch.
+## begin the field-present branch.
 pub fn ir_decode_field_present(branch: IrDecodeFieldBranch):
     ir_emit("jmp " + branch.merge_l)
     ir_emit_label(branch.present_l)
 
-# # store the branch value and jump to the merge point.
+## store the branch value and jump to the merge point.
 pub fn ir_decode_field_store_and_merge(branch: IrDecodeFieldBranch, value_r: Int):
     ir_emit("store " + branch.field_temp + " " + value_r.to_string())
     ir_emit("jmp " + branch.merge_l)
 
-# # load the merged field value after both branches join.
+## load the merged field value after both branches join.
 pub fn ir_decode_field_load_after_merge(branch: IrDecodeFieldBranch) -> Int:
     ir_emit_label(branch.merge_l)
     loaded_r := ir_reg()
     ir_emit("load " + loaded_r.to_string() + " " + branch.field_temp)
     return loaded_r
 
-# # missing optional field: store none.
+## missing optional field: store none.
 pub fn ir_decode_field_store_missing_optional(branch: IrDecodeFieldBranch, default_idx: Int, emit_value: fn(Int, String) -> Int):
     if default_idx >= 0:
         ir_decode_field_store_and_merge(branch, emit_value(default_idx, "tuple"))
     else:
         ir_decode_field_store_and_merge(branch, ir_emit_optional_none_value())
 
-# # missing field with a default: store the default.
+## missing field with a default: store the default.
 pub fn ir_decode_field_store_missing_default(branch: IrDecodeFieldBranch, default_idx: Int, target_kind: String, emit_value: fn(Int, String) -> Int):
     ir_decode_field_store_and_merge(branch, emit_value(default_idx, target_kind))
 
@@ -164,12 +164,12 @@ struct IrDecodeFieldValue:
     ok: Bool
     value_r: Int
 
-# # the value a missing decode helper yields.
+## the value a missing decode helper yields.
 pub fn ir_decode_missing_helper_value(emit_default_ret: fn() -> Int) -> IrDecodeFieldValue:
     emit_default_ret()
     return IrDecodeFieldValue(false, 0 - 1)
 
-# # emit the config spec optional struct field sequence.
+## emit the config spec optional struct field sequence.
 pub fn ir_emit_config_spec_optional_struct_field(cfg_r: Int, full_key_r: Int, default_idx: Int, optional_struct_tid: Int, emit_value: fn(Int, String) -> Int) -> IrDecodeFieldValue:
     has_r := ir_reg()
     ir_emit_call2(has_r, "std_config_has_prefix", "bool", cfg_r, full_key_r)
@@ -181,7 +181,7 @@ pub fn ir_emit_config_spec_optional_struct_field(cfg_r: Int, full_key_r: Int, de
     ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
-# # emit the config spec nested struct field sequence.
+## emit the config spec nested struct field sequence.
 pub fn ir_emit_config_spec_nested_struct_field(cfg_r: Int, full_key_r: Int, field_tid: Int, default_idx: Int, nested_struct_tid: Int, emit_value: fn(Int, String) -> Int) -> IrDecodeFieldValue:
     if default_idx < 0:
         field_result_r := ir_emit_config_nested_decode_prefix_specialized(cfg_r, full_key_r, nested_struct_tid)
@@ -198,7 +198,7 @@ pub fn ir_emit_config_spec_nested_struct_field(cfg_r: Int, full_key_r: Int, fiel
     ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
-# # emit the config spec optional scalar field sequence.
+## emit the config spec optional scalar field sequence.
 pub fn ir_emit_config_spec_optional_scalar_field(cfg_r: Int, full_key_r: Int, default_idx: Int, optional_inner_tid: Int, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int) -> IrDecodeFieldValue:
     helper_name := ir_config_require_full_name_for_type_name(ir_type_from_tid(optional_inner_tid))
     if helper_name.len() == 0:
@@ -214,7 +214,7 @@ pub fn ir_emit_config_spec_optional_scalar_field(cfg_r: Int, full_key_r: Int, de
     ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
-# # emit the config spec scalar field sequence.
+## emit the config spec scalar field sequence.
 pub fn ir_emit_config_spec_scalar_field(cfg_r: Int, full_key_r: Int, field_tid: Int, default_idx: Int, emit_expr: fn(Int) -> Int, emit_default_ret: fn() -> Int) -> IrDecodeFieldValue:
     helper_name := ir_config_require_full_name_for_type_name(ir_type_from_tid(field_tid))
     if helper_name.len() == 0:
@@ -236,7 +236,7 @@ pub fn ir_emit_config_spec_scalar_field(cfg_r: Int, full_key_r: Int, field_tid: 
     ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
-# # emit the config spec field sequence.
+## emit the config spec field sequence.
 pub fn ir_emit_config_spec_field(cfg_r: Int, prefix_r: Int, field_name: String, field_tid: Int, default_idx: Int, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int) -> IrDecodeFieldValue:
     full_key_r := ir_emit_config_specialized_field_key(field_name, prefix_r)
     optional_inner_tid := ir_optional_inner_tid(field_tid)
@@ -251,7 +251,7 @@ pub fn ir_emit_config_spec_field(cfg_r: Int, prefix_r: Int, field_name: String, 
         return ir_emit_config_spec_optional_scalar_field(cfg_r, full_key_r, default_idx, optional_inner_tid, emit_value, emit_default_ret)
     return ir_emit_config_spec_scalar_field(cfg_r, full_key_r, field_tid, default_idx, emit_expr, emit_default_ret)
 
-# # emit the config decode specialization body sequence.
+## emit the config decode specialization body sequence.
 pub fn ir_emit_config_decode_specialization_body(struct_name: String, prefixed: Bool, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int):
     if not ir_struct_names.contains_key(struct_name):
         emit_default_ret()
@@ -283,7 +283,7 @@ pub fn ir_emit_config_decode_specialization_body(struct_name: String, prefixed: 
 
     ir_emit_struct_result_return(field_regs, "struct:" + struct_name)
 
-# # emit the config decode value sequence.
+## emit the config decode value sequence.
 pub fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: Int, index_idx: Int, temp_name: String, done_l: String, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int):
     mut field_regs: List[Int] := []
     for field_name, i in target_info.fields:
@@ -361,7 +361,7 @@ pub fn ir_emit_config_decode_value(target_info: TypeInfo, cfg_r: Int, prefix_r: 
 
     ir_emit_struct_result_store(field_regs, "struct:" + target_info.name, temp_name)
 
-# # emit the toml spec optional struct field sequence.
+## emit the toml spec optional struct field sequence.
 pub fn ir_emit_toml_spec_optional_struct_field(handle_r: Int, key_r: Int, module_path: String, default_idx: Int, optional_struct_tid: Int, emit_value: fn(Int, String) -> Int) -> IrDecodeFieldValue:
     has_r := ir_reg()
     ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "has"), "bool", handle_r, key_r)
@@ -373,7 +373,7 @@ pub fn ir_emit_toml_spec_optional_struct_field(handle_r: Int, key_r: Int, module
     ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_struct_tid)))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
-# # emit the toml spec nested struct field sequence.
+## emit the toml spec nested struct field sequence.
 pub fn ir_emit_toml_spec_nested_struct_field(handle_r: Int, key_r: Int, module_path: String, field_tid: Int, default_idx: Int, nested_struct_tid: Int, emit_value: fn(Int, String) -> Int) -> IrDecodeFieldValue:
     if default_idx < 0:
         field_result_r := ir_emit_toml_nested_decode_path_specialized(handle_r, key_r, nested_struct_tid, module_path)
@@ -390,7 +390,7 @@ pub fn ir_emit_toml_spec_nested_struct_field(handle_r: Int, key_r: Int, module_p
     ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
-# # emit the toml spec optional scalar field sequence.
+## emit the toml spec optional scalar field sequence.
 pub fn ir_emit_toml_spec_optional_scalar_field(handle_r: Int, key_r: Int, module_path: String, default_idx: Int, optional_inner_tid: Int, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int) -> IrDecodeFieldValue:
     helper_name := ir_toml_require_full_name_for_type_name(ir_type_from_tid(optional_inner_tid), module_path)
     if helper_name.len() == 0:
@@ -406,7 +406,7 @@ pub fn ir_emit_toml_spec_optional_scalar_field(handle_r: Int, key_r: Int, module
     ir_decode_field_store_and_merge(branch, ir_emit_optional_some_value(ir_emit_json_field_ok(field_result_r, optional_inner_tid)))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
-# # emit the toml spec scalar field sequence.
+## emit the toml spec scalar field sequence.
 pub fn ir_emit_toml_spec_scalar_field(handle_r: Int, key_r: Int, module_path: String, field_tid: Int, default_idx: Int, emit_expr: fn(Int) -> Int, emit_default_ret: fn() -> Int) -> IrDecodeFieldValue:
     helper_name := ir_toml_require_full_name_for_type_name(ir_type_from_tid(field_tid), module_path)
     if helper_name.len() == 0:
@@ -428,7 +428,7 @@ pub fn ir_emit_toml_spec_scalar_field(handle_r: Int, key_r: Int, module_path: St
     ir_decode_field_store_and_merge(branch, ir_emit_json_field_ok(field_result_r, field_tid))
     return IrDecodeFieldValue(true, ir_decode_field_load_after_merge(branch))
 
-# # emit the toml spec field sequence.
+## emit the toml spec field sequence.
 pub fn ir_emit_toml_spec_field(handle_r: Int, module_path: String, field_name: String, field_tid: Int, default_idx: Int, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int) -> IrDecodeFieldValue:
     key_r := ir_reg()
     ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
@@ -444,7 +444,7 @@ pub fn ir_emit_toml_spec_field(handle_r: Int, module_path: String, field_name: S
         return ir_emit_toml_spec_optional_scalar_field(handle_r, key_r, module_path, default_idx, optional_inner_tid, emit_value, emit_default_ret)
     return ir_emit_toml_spec_scalar_field(handle_r, key_r, module_path, field_tid, default_idx, emit_expr, emit_default_ret)
 
-# # emit the toml decode struct from handle sequence.
+## emit the toml decode struct from handle sequence.
 pub fn ir_emit_toml_decode_struct_from_handle(struct_name: String, module_path: String, handle_name: String, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int):
     if not ir_struct_names.contains_key(struct_name):
         emit_default_ret()
@@ -467,11 +467,11 @@ pub fn ir_emit_toml_decode_struct_from_handle(struct_name: String, module_path: 
 
     ir_emit_struct_result_return(field_regs, "struct:" + struct_name)
 
-# # emit the toml decode specialization body sequence.
+## emit the toml decode specialization body sequence.
 pub fn ir_emit_toml_decode_specialization_body(struct_name: String, module_path: String, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int):
     ir_emit_toml_decode_struct_from_handle(struct_name, module_path, "handle", emit_expr, emit_value, emit_default_ret)
 
-# # emit the toml decode path specialization body sequence.
+## emit the toml decode path specialization body sequence.
 pub fn ir_emit_toml_decode_path_specialization_body(struct_name: String, module_path: String, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int):
     handle_r := ir_reg()
     ir_emit("load " + handle_r.to_string() + " handle")
@@ -480,7 +480,7 @@ pub fn ir_emit_toml_decode_path_specialization_body(struct_name: String, module_
     ir_emit_dotted_path_lookup_or_return(handle_r, dotted_path_r, ir_resolve_generic_module_call_name(module_path, "toml_require_table"), "current", "__for_iter_toml_path", "__for_len_toml_path", "__for_idx_toml_path")
     ir_emit_toml_decode_struct_from_handle(struct_name, module_path, "current", emit_expr, emit_value, emit_default_ret)
 
-# # emit the toml decode text specialization body sequence.
+## emit the toml decode text specialization body sequence.
 pub fn ir_emit_toml_decode_text_specialization_body(struct_name: String, module_path: String, concrete_types: List[String], ret_type: String):
     input_r := ir_reg()
     ir_emit("load " + input_r.to_string() + " input")
@@ -495,7 +495,7 @@ pub fn ir_emit_toml_decode_text_specialization_body(struct_name: String, module_
     ir_emit("ret " + decode_result_r.to_string())
     ir_emit("endfunc")
 
-# # emit the toml decode text path specialization body sequence.
+## emit the toml decode text path specialization body sequence.
 pub fn ir_emit_toml_decode_text_path_specialization_body(struct_name: String, module_path: String, concrete_types: List[String], ret_type: String):
     input_r := ir_reg()
     ir_emit("load " + input_r.to_string() + " input")
@@ -512,7 +512,7 @@ pub fn ir_emit_toml_decode_text_path_specialization_body(struct_name: String, mo
     ir_emit("ret " + path_result_r.to_string())
     ir_emit("endfunc")
 
-# # emit the config decode call sequence.
+## emit the config decode call sequence.
 pub fn ir_emit_config_decode_call(idx: Int, node: Node, prefixed: Bool, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     arg_regs := ir_decode_collect_arg_regs(node, 1, emit_expr)
     if arg_regs.len() == 0:
@@ -545,7 +545,7 @@ pub fn ir_emit_config_decode_call(idx: Int, node: Node, prefixed: Bool, emit_exp
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
-# # emit the config loader decode call sequence.
+## emit the config loader decode call sequence.
 pub fn ir_emit_config_loader_decode_call(idx: Int, node: Node, loader_name: String, prefixed: Bool, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     arg_regs := ir_decode_collect_arg_regs(node, 1, emit_expr)
     if arg_regs.len() == 0:
@@ -582,11 +582,11 @@ pub fn ir_emit_config_loader_decode_call(idx: Int, node: Node, loader_name: Stri
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
-# # emit the config file decode call sequence.
+## emit the config file decode call sequence.
 pub fn ir_emit_config_file_decode_call(idx: Int, node: Node, loader_name: String, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     return ir_emit_config_loader_decode_call(idx, node, loader_name, false, emit_expr, emit_value)
 
-# # emit the toml decode value sequence.
+## emit the toml decode value sequence.
 pub fn ir_emit_toml_decode_value(target_info: TypeInfo, handle_r: Int, index_idx: Int, temp_name: String, done_l: String, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int):
     mut field_regs: List[Int] := []
 
@@ -666,7 +666,7 @@ pub fn ir_emit_toml_decode_value(target_info: TypeInfo, handle_r: Int, index_idx
 
     ir_emit_struct_result_store(field_regs, "struct:" + target_info.name, temp_name)
 
-# # emit the toml decode call sequence.
+## emit the toml decode call sequence.
 pub fn ir_emit_toml_decode_call(idx: Int, node: Node, text_input: Bool, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     arg_regs := ir_decode_collect_arg_regs(node, 1, emit_expr)
     if arg_regs.len() == 0:
@@ -699,7 +699,7 @@ pub fn ir_emit_toml_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
-# # emit the toml decode path call sequence.
+## emit the toml decode path call sequence.
 pub fn ir_emit_toml_decode_path_call(idx: Int, node: Node, text_input: Bool, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     arg_regs := ir_decode_collect_arg_regs(node, 1, emit_expr)
     if arg_regs.len() < 2:
@@ -743,7 +743,7 @@ pub fn ir_emit_toml_decode_path_call(idx: Int, node: Node, text_input: Bool, emi
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
-# # emit the toml decode file call sequence.
+## emit the toml decode file call sequence.
 pub fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     arg_regs := ir_decode_collect_arg_regs(node, 1, emit_expr)
     if arg_regs.len() == 0:
@@ -812,7 +812,7 @@ pub fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
-# # emit the json decode map call sequence.
+## emit the json decode map call sequence.
 pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     temp_name := ir_new_temp_name("json_decode")
     ir_var_types.insert(temp_name, "tuple")
@@ -881,7 +881,7 @@ pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_ex
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
-# # emit the json decode object value sequence.
+## emit the json decode object value sequence.
 pub fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, index_idx: Int, temp_name: String, done_l: String, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int):
     mut field_regs: List[Int] := []
     for field_name, i in target_info.fields:
@@ -960,7 +960,7 @@ pub fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, in
 
     ir_emit_struct_result_store(field_regs, "struct:" + target_info.name, temp_name)
 
-# # emit the json decode flat6 call sequence.
+## emit the json decode flat6 call sequence.
 pub fn ir_emit_json_decode_flat6_call(input_r: Int, target_info: TypeInfo) -> Int:
     result_r := ir_reg()
     mut arg_text := " " + input_r.to_string()
@@ -981,7 +981,7 @@ pub fn ir_emit_json_decode_flat6_call(input_r: Int, target_info: TypeInfo) -> In
     ir_emit_call_text(result_r, "json_decode_flat6", "tuple", 13, arg_text)
     return result_r
 
-# # emit the json decode call sequence.
+## emit the json decode call sequence.
 pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     arg_regs := ir_decode_collect_arg_regs(node, 1, emit_expr)
     if arg_regs.len() == 0:
@@ -1058,18 +1058,18 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
-# # emit the json nested decode path specialized sequence.
+## emit the json nested decode path specialized sequence.
 pub fn ir_emit_json_nested_decode_path_specialized(parent_handle_r: Int, key_r: Int, target_tid: Int, module_path: String) -> Int:
     decode_name := ir_json_generic_name("decode_object")
     return ir_emit_nested_decode_path(parent_handle_r, key_r, target_tid, ir_resolve_generic_module_call_name(module_path, "object_require_object"), decode_name, "json_nested_decode")
 
-# # emit the json object has sequence.
+## emit the json object has sequence.
 pub fn ir_emit_json_object_has(handle_r: Int, key_r: Int, module_path: String) -> Int:
     has_r := ir_reg()
     ir_emit_call2(has_r, ir_resolve_generic_module_call_name(module_path, "object_has"), "bool", handle_r, key_r)
     return has_r
 
-# # emit the json decode object value specialized sequence.
+## emit the json decode object value specialized sequence.
 pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_r: Int, module_path: String, temp_name: String, done_l: String, emit_value: fn(Int, String) -> Int):
     mut field_regs: List[Int] := []
     field_count := ir_struct_field_count(struct_name)
@@ -1152,7 +1152,7 @@ pub fn ir_emit_json_decode_object_value_specialized(struct_name: String, handle_
     ir_emit_struct_result_store(field_regs, "struct:" + struct_name, temp_name)
     ir_emit_label(done_l)
 
-# # emit the json decode object specialization body sequence.
+## emit the json decode object specialization body sequence.
 pub fn ir_emit_json_decode_object_specialization_body(struct_name: String, module_path: String, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int):
     if not ir_struct_names.contains_key(struct_name):
         emit_default_ret()
@@ -1168,7 +1168,7 @@ pub fn ir_emit_json_decode_object_specialization_body(struct_name: String, modul
     ir_emit("ret " + r.to_string())
     ir_emit("endfunc")
 
-# # emit the json decode specialization body sequence.
+## emit the json decode specialization body sequence.
 pub fn ir_emit_json_decode_specialization_body(struct_name: String, module_path: String, text_input: Bool, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int):
     if not ir_struct_names.contains_key(struct_name):
         emit_default_ret()
@@ -1198,7 +1198,7 @@ pub fn ir_emit_json_decode_specialization_body(struct_name: String, module_path:
     ir_emit("ret " + r.to_string())
     ir_emit("endfunc")
 
-# # emit the json decode path specialization body sequence.
+## emit the json decode path specialization body sequence.
 pub fn ir_emit_json_decode_path_specialization_body(struct_name: String, module_path: String, emit_value: fn(Int, String) -> Int, emit_default_ret: fn() -> Int):
     if not ir_struct_names.contains_key(struct_name):
         emit_default_ret()
@@ -1229,7 +1229,7 @@ pub fn ir_emit_json_decode_path_specialization_body(struct_name: String, module_
     ir_emit("ret " + r.to_string())
     ir_emit("endfunc")
 
-# # emit the json decode object call sequence.
+## emit the json decode object call sequence.
 pub fn ir_emit_json_decode_object_call(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     arg_regs := ir_decode_collect_arg_regs(node, 1, emit_expr)
     if arg_regs.len() == 0:
@@ -1260,7 +1260,7 @@ pub fn ir_emit_json_decode_object_call(idx: Int, node: Node, emit_expr: fn(Int) 
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
-# # emit the json decode path call sequence.
+## emit the json decode path call sequence.
 pub fn ir_emit_json_decode_path_call(idx: Int, node: Node, text_input: Bool, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     arg_regs := ir_decode_collect_arg_regs(node, 1, emit_expr)
     if arg_regs.len() < 2:
@@ -1308,7 +1308,7 @@ pub fn ir_emit_json_decode_path_call(idx: Int, node: Node, text_input: Bool, emi
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
-# # emit the json decode file call sequence.
+## emit the json decode file call sequence.
 pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     arg_regs := ir_decode_collect_arg_regs(node, 1, emit_expr)
     if arg_regs.len() == 0:
@@ -1381,7 +1381,7 @@ pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
-# # emit the index config decode call sequence.
+## emit the index config decode call sequence.
 pub fn ir_emit_index_config_decode_call(idx: Int, node: Node, callee_idx: Int, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     if ir_is_config_decode_callee(callee_idx, "decode"):
         return ir_emit_config_decode_call(idx, node, false, emit_expr, emit_value)

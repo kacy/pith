@@ -7,14 +7,14 @@
 import std.bits as bits
 import std.bytes as bytes
 
-# # reader state over the deflate stream: byte position and bit offset.
+## reader state over the deflate stream: byte position and bit offset.
 pub struct BitReader:
     data: Bytes
     pos: Int
     bit: Int
 
-# # a canonical huffman decoder: per-length symbol counts and the
-# # symbols ordered by (length, symbol) — enough to decode bit-by-bit.
+## a canonical huffman decoder: per-length symbol counts and the
+## symbols ordered by (length, symbol) — enough to decode bit-by-bit.
 pub struct Huffman:
     counts: List[Int]
     symbols: List[Int]
@@ -195,19 +195,19 @@ fn inflate_block(r: BitReader, out: List[Int], lit: Huffman, dist: Huffman) -> B
                 length = length - 1
     return true
 
-# # an inflate result that also reports where the stream ended, so a
-# # caller reading concatenated members knows where the next begins.
+## an inflate result that also reports where the stream ended, so a
+## caller reading concatenated members knows where the next begins.
 pub struct InflateResult:
     payload: Bytes
     next_pos: Int
 
-# # decompress a raw deflate stream starting at `start`; bad streams
-# # fail with a message naming what was malformed.
+## decompress a raw deflate stream starting at `start`; bad streams
+## fail with a message naming what was malformed.
 pub fn inflate(data: Bytes, start: Int) -> Bytes!:
     return inflate_with_end(data, start)!.payload
 
-# # inflate, also reporting the byte position just past the stream —
-# # a partly consumed final byte counts as consumed.
+## inflate, also reporting the byte position just past the stream —
+## a partly consumed final byte counts as consumed.
 pub fn inflate_with_end(data: Bytes, start: Int) -> InflateResult!:
     r := BitReader(data, start, 0)
     mut out: List[Int] := []

@@ -19,7 +19,7 @@ pub mut ir_struct_field_index_lookup: Map[String, String] := {} # "Struct.field"
 pub mut ir_struct_decl_nodes: Map[String, Int] := {} # struct name -> declaration node idx
 pub mut ir_struct_field_default_nodes: Map[String, Int] := {} # "Struct.field" -> default expr node idx
 
-# # strip type arguments: Box[Int] and Box share one layout.
+## strip type arguments: Box[Int] and Box share one layout.
 pub fn ir_struct_base_name(sname: String) -> String:
     if sname.len() == 0:
         return sname
@@ -28,8 +28,8 @@ pub fn ir_struct_base_name(sname: String) -> String:
         return sname.substring(0, bracket)
     return sname
 
-# # the reference-counting kind for an emission type hint, or ""
-# # for kinds that never own heap memory.
+## the reference-counting kind for an emission type hint, or ""
+## for kinds that never own heap memory.
 pub fn ir_rc_kind(type_hint: String) -> String:
     if type_hint == "string":
         return "string"
@@ -54,7 +54,7 @@ pub fn ir_rc_kind(type_hint: String) -> String:
 # every rc kind releases: strings via their header count, collections via
 # the shared-handle count with a free-time element cascade.
 
-# # struct name returned by well-known builtin constructors, or "".
+## struct name returned by well-known builtin constructors, or "".
 pub fn ir_known_struct_return_type(fname: String) -> String:
     if ir_struct_names.contains_key(fname):
         return fname
@@ -66,8 +66,8 @@ pub fn ir_known_struct_return_type(fname: String) -> String:
         return "TypeInfo"
     return ""
 
-# # the boxed-enum name for an eq/neq node, or "" when neither side
-# # is one. checked types name enums; emission inference doesn't.
+## the boxed-enum name for an eq/neq node, or "" when neither side
+## is one. checked types name enums; emission inference doesn't.
 pub fn ir_binary_enum_eq_name(node: Node) -> String:
     left_name := get_type_name(c_get_expr_type(node.children[0]))
     if ir_boxed_enums.contains_key(left_name):
@@ -77,22 +77,22 @@ pub fn ir_binary_enum_eq_name(node: Node) -> String:
         return right_name
     return ""
 
-# # true when any field of the struct declares a default value.
+## true when any field of the struct declares a default value.
 pub fn ir_struct_has_default_fields(target_info: TypeInfo) -> Bool:
     return ir_struct_has_default_fields_with_state(target_info, ir_struct_field_default_nodes)
 
-# # number of fields in a registered struct, or -1 when unknown.
+## number of fields in a registered struct, or -1 when unknown.
 pub fn ir_struct_field_count(struct_name: String) -> Int:
     return ir_struct_field_count_with_state(struct_name, ir_struct_names)
 
-# # field name at an index in declaration order, or "".
+## field name at an index in declaration order, or "".
 pub fn ir_struct_field_name_at(struct_name: String, field_index: Int) -> String:
     return ir_struct_field_name_at_with_state(struct_name, field_index, ir_struct_names, ir_struct_field_index_lookup)
 
-# # a field's declared type name, or "".
+## a field's declared type name, or "".
 pub fn ir_struct_field_type_name(struct_name: String, field_name: String) -> String:
     return ir_struct_field_type_name_with_state(struct_name, field_name, ir_struct_names, ir_struct_field_lookup)
 
-# # the ast node of a field's default expression, or -1.
+## the ast node of a field's default expression, or -1.
 pub fn ir_struct_field_default_node(struct_name: String, field_name: String) -> Int:
     return ir_struct_field_default_node_with_state(struct_name, field_name, ir_struct_names, ir_struct_field_default_nodes)

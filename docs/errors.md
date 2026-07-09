@@ -418,7 +418,11 @@ pattern, or declaration.
 
 ### E243 — lexer error
 
-the lexer produced an invalid token, such as an unterminated string literal.
+the lexer produced an invalid token — an unterminated string literal, a
+stray character that starts no valid token, or a bad indentation change.
+every lexer error is reported, even one that lands between two otherwise
+valid tokens (`1 € + 2`), so an invalid character can never be silently
+dropped.
 
 ---
 
@@ -506,4 +510,17 @@ clean and dies much later as a silent unknown call in the backend.
 
 ```
 error[E246]: 'imaginary_helper' is not declared by module 'helper'
+```
+
+### E247 — cannot find module
+
+an `import` or `from ... import` names a module whose file cannot be
+found. standard-library modules are imported with the `std.` prefix
+(`import std.fs as fs`, not `import fs`); local modules resolve
+relative to the importing file.
+
+```
+error[E247]: cannot find module 'fs'
+  1 | import fs
+             ^
 ```

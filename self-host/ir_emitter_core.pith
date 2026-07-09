@@ -39,11 +39,12 @@ from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_metho
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_specializations, ir_impl_method_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_record_generic_function_decl, ir_is_generic_function_name, ir_generic_preferred_name, ir_queue_generic_specialization
+from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node
 from ir_decode_emit import ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_toml_decode_call, ir_emit_toml_decode_file_call, ir_emit_toml_decode_path_call, ir_emit_toml_decode_path_specialization_body, ir_emit_toml_decode_specialization_body, ir_emit_toml_decode_text_path_specialization_body, ir_emit_toml_decode_text_specialization_body
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label, ir_last_was_ret
 from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_toml_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_toml_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
-from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types
+from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
@@ -68,7 +69,6 @@ from ir_result_flow import ir_emit_result_store_error_branch, ir_emit_result_ret
 from ir_struct_result_helpers import ir_emit_struct_result_store, ir_emit_struct_result_return
 
 # --- current function locals ---
-mut ir_var_regs: Map[String, Int] := {}
 mut ir_map_value_types: Map[String, String] := {} # map variable name -> value type
 
 # enums with at least one payload-carrying variant are boxed: a value is a
@@ -77,7 +77,6 @@ mut ir_map_value_types: Map[String, String] := {} # map variable name -> value t
 
 # checked tid of the innermost match subject, for tuple-pattern element
 # types; set by the match emitters before lowering arms
-mut ir_match_subject_tid := 0 - 1
 # declared return kinds of closure-typed parameters in the current
 # function: `key: fn(T) -> String` records "string" under "key", so a
 # call through the parameter infers its result kind even where checked
@@ -115,7 +114,6 @@ mut ir_module_count := 0 # increments per emit_ir call for unique naming
 # "InstanceType.method" (e.g. "MapIter[Range,Int,Int].next") and value is the
 # specialized symbol name. Read via ir_lookup_specialized_method.
 
-mut ir_current_func_return_kind := ""
 mut ir_current_func_optional_inner_kind := ""
 # the impl block's target type, set while a method body is being emitted, so
 # `self.field = ...` knows what struct fields to look up
@@ -3443,363 +3441,16 @@ fn ir_emit_grouped_expr(node: Node) -> Int:
 
 # When a match sits in a function's tail position its value is the function's
 # implicit return. This holds that match node so its arms emit `ret` directly.
-mut ir_tail_match_node := 0 - 1
 
 # Emit an arm body that returns its value (tail-position match). Block bodies
 # run as statements (and return on their own).
-fn ir_emit_match_arm_return(body_idx: Int):
-    body := get_node(body_idx)
-    if body.kind == "block":
-        ir_block(body_idx)
-        return
-    mut expr_idx := body_idx
-    if body.kind == "body" and body.children.len() > 0:
-        expr_idx = body.children[0]
-    val_r := ir_expr(expr_idx)
-    ir_emit("ret " + val_r.to_string())
-    ir_last_was_ret = true
-
-# Lower a tail-position match: each matching arm returns its value. A no-match
-# fall-through lands on the function's default return.
-fn ir_emit_match_return(idx: Int, node: Node):
-    subj_r := ir_expr(node.children[0])
-    subj_type := ir_checked_type(node.children[0])
-    ir_match_subject_tid = c_get_expr_type(node.children[0])
-    mut i := 1
-    while i < node.children.len():
-        arm := get_node(node.children[i])
-        pat_idx := arm.children[0]
-        mut guard_idx := 0 - 1
-        mut body_idx := 0 - 1
-        mut j := 1
-        while j < arm.children.len():
-            cn := get_node(arm.children[j])
-            if cn.kind == "guard":
-                if cn.children.len() > 0:
-                    guard_idx = cn.children[0]
-            else:
-                body_idx = arm.children[j]
-            j = j + 1
-        cond_r := ir_emit_match_cond(pat_idx, subj_r)
-        cand_l := ir_label()
-        next_l := ir_label()
-        ir_emit("brif " + cond_r.to_string() + " " + cand_l + " " + next_l)
-        ir_emit_label(cand_l)
-        ir_emit_match_bindings(pat_idx, subj_r, subj_type)
-        if guard_idx >= 0:
-            g_r := ir_expr(guard_idx)
-            body_l := ir_label()
-            ir_emit("brif " + g_r.to_string() + " " + body_l + " " + next_l)
-            ir_emit_label(body_l)
-        ir_emit_match_arm_return(body_idx)
-        ir_emit_label(next_l)
-        i = i + 1
-
-# Emit a bool register that is 1 when subj_r matches pat, ignoring any bindings
-# (those are emitted separately, only in the branch where the pattern matched).
-fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
-    pat := get_node(pat_idx)
-    if pat.kind == "pat_wildcard":
-        r := ir_reg()
-        ir_emit("iconst " + r.to_string() + " 1")
-        return r
-    if pat.kind == "pat_binding":
-        # on an optional subject a binding matches only the some case
-        # (the none arm is spelled `none`); anywhere else it always
-        # matches
-        subj_info := get_type_info(ir_match_subject_tid)
-        if subj_info.kind == "optional":
-            return ir_optional_flag_field(subj_r)
-        r := ir_reg()
-        ir_emit("iconst " + r.to_string() + " 1")
-        return r
-    if pat.kind == "pat_none":
-        flag_r := ir_optional_flag_field(subj_r)
-        zero_r := ir_reg()
-        ir_emit("iconst " + zero_r.to_string() + " 0")
-        r := ir_reg()
-        ir_emit("eq " + r.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
-        return r
-    if pat.kind == "pat_int":
-        lit_r := ir_emit_int_literal(pat)
-        r := ir_reg()
-        ir_emit("eq " + r.to_string() + " " + subj_r.to_string() + " " + lit_r.to_string())
-        return r
-    if pat.kind == "pat_bool":
-        lit_r := ir_emit_bool_literal(pat)
-        r := ir_reg()
-        ir_emit("eq " + r.to_string() + " " + subj_r.to_string() + " " + lit_r.to_string())
-        return r
-    if pat.kind == "pat_float":
-        lit_r := ir_emit_float_literal(pat)
-        r := ir_reg()
-        ir_emit("eq " + r.to_string() + " " + subj_r.to_string() + " " + lit_r.to_string())
-        return r
-    if pat.kind == "pat_string":
-        lit_r := ir_emit_string_literal(pat)
-        r := ir_reg()
-        ir_emit_call2(r, "__str_eq", "bool", subj_r, lit_r)
-        return r
-    if pat.kind == "pat_variant":
-        r := ir_reg()
-        if ir_struct_field_index_lookup.contains_key(pat.value):
-            enum_name := ir_variant_enum_name(pat.value)
-            lit_r := ir_reg()
-            ir_emit("iconst " + lit_r.to_string() + " " + ir_struct_field_index_lookup[pat.value])
-            if ir_boxed_enums.contains_key(enum_name):
-                # boxed enum: the subject is a pointer; compare the stored tag,
-                # then fold in any literal payload sub-patterns
-                tag_r := ir_reg()
-                ir_emit("field " + tag_r.to_string() + " " + subj_r.to_string() + " 0 int __enum_tag")
-                ir_emit("eq " + r.to_string() + " " + tag_r.to_string() + " " + lit_r.to_string())
-                return ir_emit_variant_payload_conds(pat, subj_r, r)
-            ir_emit("eq " + r.to_string() + " " + subj_r.to_string() + " " + lit_r.to_string())
-            return r
-        ir_emit("iconst " + r.to_string() + " 0")
-        return r
-    if pat.kind == "pat_range":
-        # lo <= subject and subject <= hi ("incl") or < hi ("excl")
-        lo_r := ir_emit_int_literal(get_node(pat.children[0]))
-        hi_r := ir_emit_int_literal(get_node(pat.children[1]))
-        lo_ok := ir_reg()
-        ir_emit("gte " + lo_ok.to_string() + " " + subj_r.to_string() + " " + lo_r.to_string())
-        hi_ok := ir_reg()
-        if pat.value == "incl":
-            ir_emit("lte " + hi_ok.to_string() + " " + subj_r.to_string() + " " + hi_r.to_string())
-        else:
-            ir_emit("lt " + hi_ok.to_string() + " " + subj_r.to_string() + " " + hi_r.to_string())
-        r := ir_reg()
-        ir_emit("and " + r.to_string() + " " + lo_ok.to_string() + " " + hi_ok.to_string())
-        return r
-    if pat.kind == "pat_or":
-        # matches when any alternative matches.
-        mut acc_r := ir_emit_match_cond(pat.children[0], subj_r)
-        mut k := 1
-        while k < pat.children.len():
-            alt_r := ir_emit_match_cond(pat.children[k], subj_r)
-            or_r := ir_reg()
-            ir_emit("or " + or_r.to_string() + " " + acc_r.to_string() + " " + alt_r.to_string())
-            acc_r = or_r
-            k = k + 1
-        return acc_r
-    if pat.kind == "pat_tuple":
-        # each element loads its slot and recurses into the ordinary
-        # pattern machinery; bindings and wildcards match anything
-        elems := ir_match_tuple_element_kinds(pat.children.len())
-        acc_r := ir_reg()
-        ir_emit("iconst " + acc_r.to_string() + " 1")
-        mut out_r := acc_r
-        for sub_idx, i in pat.children:
-            sub := get_node(sub_idx)
-            if sub.kind == "pat_binding" or sub.kind == "pat_wildcard":
-                continue
-            elem_r := ir_reg()
-            ir_emit("field " + elem_r.to_string() + " " + subj_r.to_string() + " " + (i * 8).to_string() + " " + elems[i] + " __t" + i.to_string())
-            sub_r := ir_emit_match_cond(sub_idx, elem_r)
-            and_r := ir_reg()
-            ir_emit("and " + and_r.to_string() + " " + out_r.to_string() + " " + sub_r.to_string())
-            out_r = and_r
-        return out_r
-    # pat_none is not lowered yet.
-    r := ir_reg()
-    ir_emit("iconst " + r.to_string() + " 0")
-    return r
-
-# element kind names for the current match subject's tuple type;
-# "unknown" per element when the subject isn't a known tuple
-fn ir_match_tuple_element_kinds(count: Int) -> List[String]:
-    mut out: List[String] := []
-    info := get_type_info(ir_match_subject_tid)
-    mut i := 0
-    while i < count:
-        if info.kind == "tuple" and i < info.elements.len():
-            out.push(ir_type_from_tid(info.elements[i]))
-        else:
-            out.push("unknown")
-        i = i + 1
-    return out
-
-fn ir_variant_enum_name(variant_key: String) -> String:
-    mut i := 0
-    while i < variant_key.len():
-        if variant_key[i] == ".":
-            return variant_key.substring(0, i)
-        i = i + 1
-    return variant_key
-
-# Literal payload sub-patterns (Shape.Circle(0.0)) narrow the tag match:
-# each one loads its slot and ANDs an equality into the arm condition.
-# Binding and wildcard sub-patterns always match here; bindings are stored
-# by ir_emit_match_bindings once the arm is taken.
-fn ir_emit_variant_payload_conds(pat: Node, subj_r: Int, tag_cond_r: Int) -> Int:
-    mut acc_r := tag_cond_r
-    mut kinds: List[String] := []
-    if ir_enum_payload_kinds.contains_key(pat.value):
-        kinds = ir_enum_payload_kinds[pat.value].split(",")
-    for sub_idx, i in pat.children:
-        sub := get_node(sub_idx)
-        if sub.kind == "pat_binding" or sub.kind == "pat_wildcard":
-            continue
-        mut kind := "unknown"
-        if i < kinds.len():
-            kind = kinds[i]
-        slot_r := ir_reg()
-        ir_emit("field " + slot_r.to_string() + " " + subj_r.to_string() + " " + ((i + 1) * 8).to_string() + " " + kind + " __payload")
-        mut cond_r := ir_reg()
-        if sub.kind == "pat_int":
-            lit_r := ir_emit_int_literal(sub)
-            ir_emit("eq " + cond_r.to_string() + " " + slot_r.to_string() + " " + lit_r.to_string())
-        elif sub.kind == "pat_bool":
-            lit_r := ir_emit_bool_literal(sub)
-            ir_emit("eq " + cond_r.to_string() + " " + slot_r.to_string() + " " + lit_r.to_string())
-        elif sub.kind == "pat_float":
-            lit_r := ir_emit_float_literal(sub)
-            ir_emit("eq " + cond_r.to_string() + " " + slot_r.to_string() + " " + lit_r.to_string())
-        elif sub.kind == "pat_string":
-            lit_r := ir_emit_string_literal(sub)
-            ir_emit_call2(cond_r, "__str_eq", "bool", slot_r, lit_r)
-        else:
-            ir_emit("iconst " + cond_r.to_string() + " 0")
-        and_r := ir_reg()
-        ir_emit("and " + and_r.to_string() + " " + acc_r.to_string() + " " + cond_r.to_string())
-        acc_r = and_r
-    return acc_r
-
-# Bind any names a pattern introduces, in the branch where it matched.
-fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
-    pat := get_node(pat_idx)
-    if pat.kind == "pat_or":
-        # the alternatives bind the same names but may pull them from
-        # different payload slots, so each alternative re-tests its own
-        # condition and binds from its own shape
-        done_l := ir_label()
-        mut k := 0
-        while k < pat.children.len():
-            cond_r := ir_emit_match_cond(pat.children[k], subj_r)
-            bind_l := ir_label()
-            next_l := ir_label()
-            ir_emit("brif " + cond_r.to_string() + " " + bind_l + " " + next_l)
-            ir_emit_label(bind_l)
-            ir_emit_match_bindings(pat.children[k], subj_r, subj_type)
-            ir_emit("jmp " + done_l)
-            ir_emit_label(next_l)
-            k = k + 1
-        ir_emit_label(done_l)
-        return
-    if pat.kind == "pat_tuple":
-        elems := ir_match_tuple_element_kinds(pat.children.len())
-        for sub_idx, i in pat.children:
-            sub := get_node(sub_idx)
-            if sub.kind == "pat_binding":
-                elem_r := ir_reg()
-                ir_emit("field " + elem_r.to_string() + " " + subj_r.to_string() + " " + (i * 8).to_string() + " " + elems[i] + " " + sub.value)
-                ir_var_regs.insert(sub.value, elem_r)
-                if elems[i] != "unknown":
-                    ir_var_types.insert(sub.value, elems[i])
-                ir_emit("store " + sub.value + " " + elem_r.to_string())
-        return
-    if pat.kind == "pat_binding":
-        subj_info := get_type_info(ir_match_subject_tid)
-        if subj_info.kind == "optional":
-            # the binding is the unwrapped inner value, mirroring if let
-            inner_r := ir_optional_value_field(subj_r, ir_match_subject_tid)
-            ir_var_regs.insert(pat.value, inner_r)
-            inner_kind := ir_type_from_tid(subj_info.inner)
-            if inner_kind.len() > 0:
-                ir_var_types.insert(pat.value, inner_kind)
-            ir_emit("store " + pat.value + " " + inner_r.to_string())
-            return
-        ir_var_regs.insert(pat.value, subj_r)
-        if subj_type.len() > 0:
-            ir_var_types.insert(pat.value, subj_type)
-        ir_emit("store " + pat.value + " " + subj_r.to_string())
-    if pat.kind == "pat_variant" and pat.children.len() > 0:
-        # extract each bound payload slot from the boxed enum value. the
-        # binding borrows the enum's count on string payloads, matching how
-        # struct field reads behave.
-        mut kinds: List[String] := []
-        if ir_enum_payload_kinds.contains_key(pat.value):
-            kinds = ir_enum_payload_kinds[pat.value].split(",")
-        for sub_idx, i in pat.children:
-            sub := get_node(sub_idx)
-            if sub.kind == "pat_binding":
-                mut kind := "unknown"
-                if i < kinds.len():
-                    kind = kinds[i]
-                slot_r := ir_reg()
-                ir_emit("field " + slot_r.to_string() + " " + subj_r.to_string() + " " + ((i + 1) * 8).to_string() + " " + kind + " " + sub.value)
-                ir_var_regs.insert(sub.value, slot_r)
-                if kind != "unknown":
-                    ir_var_types.insert(sub.value, kind)
-                ir_emit("store " + sub.value + " " + slot_r.to_string())
-
-# Emit an arm body. A block body runs as statements (and may return); an
-# expression body produces a value stored into result_temp.
-fn ir_emit_match_arm_body(body_idx: Int, result_temp: String):
-    body := get_node(body_idx)
-    if body.kind == "block":
-        ir_block(body_idx)
-        return
-    mut expr_idx := body_idx
-    if body.kind == "body" and body.children.len() > 0:
-        expr_idx = body.children[0]
-    val_r := ir_expr(expr_idx)
-    ir_emit("store " + result_temp + " " + val_r.to_string())
-    ir_last_was_ret = false
-
-fn ir_emit_match_expr(idx: Int, node: Node) -> Int:
-    subj_r := ir_expr(node.children[0])
-    subj_type := ir_checked_type(node.children[0])
-    ir_match_subject_tid = c_get_expr_type(node.children[0])
-    result_temp := ir_new_temp_name("match")
-    end_l := ir_label()
-    mut i := 1
-    while i < node.children.len():
-        arm := get_node(node.children[i])
-        pat_idx := arm.children[0]
-        mut guard_idx := 0 - 1
-        mut body_idx := 0 - 1
-        mut j := 1
-        while j < arm.children.len():
-            cn := get_node(arm.children[j])
-            if cn.kind == "guard":
-                if cn.children.len() > 0:
-                    guard_idx = cn.children[0]
-            else:
-                body_idx = arm.children[j]
-            j = j + 1
-        cond_r := ir_emit_match_cond(pat_idx, subj_r)
-        cand_l := ir_label()
-        next_l := ir_label()
-        ir_emit("brif " + cond_r.to_string() + " " + cand_l + " " + next_l)
-        ir_emit_label(cand_l)
-        ir_emit_match_bindings(pat_idx, subj_r, subj_type)
-        if guard_idx >= 0:
-            g_r := ir_expr(guard_idx)
-            body_l := ir_label()
-            ir_emit("brif " + g_r.to_string() + " " + body_l + " " + next_l)
-            ir_emit_label(body_l)
-        ir_emit_match_arm_body(body_idx, result_temp)
-        if not ir_last_was_ret:
-            ir_emit("jmp " + end_l)
-        ir_emit_label(next_l)
-        i = i + 1
-    # no arm matched: leave a zero so the result temp is always defined.
-    zero_r := ir_reg()
-    ir_emit("iconst " + zero_r.to_string() + " 0")
-    ir_emit("store " + result_temp + " " + zero_r.to_string())
-    ir_emit_label(end_l)
-    r := ir_reg()
-    ir_emit("load " + r.to_string() + " " + result_temp)
-    return r
-
 fn ir_expr_complex(idx: Int, node: Node) -> Int:
     kind := node_kind(idx)
     if kind == "match_expr":
         if idx == ir_tail_match_node:
-            ir_emit_match_return(idx, node)
+            ir_emit_match_return(idx, node, ir_expr, ir_block)
             return ir_emit_zero_value()
-        return ir_emit_match_expr(idx, node)
+        return ir_emit_match_expr(idx, node, ir_expr, ir_block)
     if kind == "method_call":
         return ir_emit_method_call(idx)
 
@@ -4482,7 +4133,9 @@ fn ir_stmt_control(idx: Int, node: Node):
 # --- emit block ---
 # Recursive block walker — unwrap block/body/then/else wrappers
 # and emits statements in source order.
-fn ir_block(idx: Int):
+# returns a throwaway 0 so it can travel as a fn value: void
+# functions are not yet recognized by the function-value path.
+fn ir_block(idx: Int) -> Int:
     kind := node_kind(idx)
     if kind == "block" or kind == "then" or kind == "else" or kind == "body":
         mut i := 0
@@ -4497,13 +4150,14 @@ fn ir_block(idx: Int):
             if ir_break_stack.len() > 0:
                 ir_emit("jmp " + ir_break_stack[ir_break_stack.len() - 1])
                 ir_last_was_ret = true
-            return
+            return 0
         if kind == "continue":
             if ir_continue_stack.len() > 0:
                 ir_emit("jmp " + ir_continue_stack[ir_continue_stack.len() - 1])
                 ir_last_was_ret = true
-            return
+            return 0
         ir_stmt(idx)
+    return 0
 
 # --- helpers for function emission ---
 
@@ -4790,23 +4444,6 @@ fn ir_prepare_func_emission(ret_type: String):
 # and report it if it is a match in a value-returning function. Such a function
 # returns 0 today (no implicit-return support), so honoring the tail match can
 # only fix behavior.
-fn ir_function_tail_match(body_idx: Int) -> Int:
-    if ir_current_func_return_kind.len() == 0:
-        return 0 - 1
-    if ir_current_func_return_kind == "void":
-        return 0 - 1
-    return ir_unwrap_tail_match(body_idx)
-
-fn ir_unwrap_tail_match(idx: Int) -> Int:
-    n := get_node(idx)
-    if n.kind == "match_expr":
-        return idx
-    if n.kind == "body" or n.kind == "block" or n.kind == "then" or n.kind == "else":
-        if n.children.len() == 0:
-            return 0 - 1
-        return ir_unwrap_tail_match(n.children[n.children.len() - 1])
-    return 0 - 1
-
 fn ir_finish_func_emission(body_idx: Int):
     if body_idx >= 0:
         # mark the tail match (if any) so it returns its value instead of

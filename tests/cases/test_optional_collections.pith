@@ -1,7 +1,7 @@
-# a collection literal whose element type is optional (or a result)
-# must wrap each element, not push the raw value. before this, a
-# List[Int?] literal stored bare ints and a later .value() dereferenced
-# an integer as a heap tuple and crashed.
+# a collection literal whose element or value type is optional (or a
+# result) must wrap each value, not store the raw one. before this, the
+# raw values were stored and a later .value() dereferenced an integer
+# as a heap tuple and crashed.
 fn ok_val(x: Int) -> Int!:
     return x
 
@@ -18,6 +18,13 @@ fn main():
     rs: List[Int!] := [ok_val(5), ok_val(10)]
     r := rs[1]
     print((r catch 0).to_string())
+
+    mstr: Map[String, Int?] := {"a": 1, "b": 3}
+    print(mstr.get_default("a", none).value().to_string())
+    print(mstr.get_default("b", none).value().to_string())
+
+    mint: Map[Int, String?] := {1: "x", 2: "y"}
+    print(mint.get_default(2, none).value())
 
     nums := [10, 20, 30]
     print(nums[2].to_string())

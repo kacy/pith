@@ -2187,17 +2187,23 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     # buffers whose elements nothing owned); the first element is the
     # fallback when no checked type exists.
     mut elem_kind := ""
+    # the element's own emission kind: for an optional element it is
+    # "tuple", which tells ir_emit_value_for_target to wrap each value as
+    # Some. without this, `[1, none, 3]` typed List[Int?] pushed raw ints
+    # and a later .value() dereferenced an integer as a heap tuple.
+    mut elem_target := ""
     tid := c_get_expr_type(idx)
     if tid >= 0:
         info := get_type_info(tid)
         if info.kind == "list" and info.inner >= 0:
-            elem_kind = ir_rc_kind(ir_type_from_tid(info.inner))
+            elem_target = ir_type_from_tid(info.inner)
+            elem_kind = ir_rc_kind(elem_target)
     if elem_kind.len() == 0 and node.children.len() > 0:
         elem_kind = ir_rc_kind(ir_infer_type(node.children[0]))
     list_r := ir_reg()
     ir_emit_call0(list_r, ir_list_ctor_for_elem_kind(elem_kind), "list")
     for child in node.children:
-        elem_r := ir_expr(child)
+        elem_r := ir_emit_value_for_target(child, elem_target)
         ir_emit_call2(ir_reg(), "__list_push", "void", list_r, elem_r)
     return list_r
 

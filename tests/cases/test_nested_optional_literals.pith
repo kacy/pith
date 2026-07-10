@@ -1,0 +1,27 @@
+# a collection literal nested inside another literal must push the
+# expected element type inward so its optional leaves are wrapped.
+# before, the inner literal typed itself without the optional and a
+# later unwrap dereferenced a raw value and crashed. bindings,
+# assignments, and struct fields all propagate the expected type.
+struct Box:
+    pub items: List[Int?]
+
+fn main():
+    a: List[List[Int?]] := [[1, none, 3]]
+    print(a[0][0].value().to_string())
+    print(a[0][2].value().to_string())
+
+    b: List[Map[String, Int?]] := [{"k": 9}]
+    mb := b[0]
+    print(mb.get_default("k", none).value().to_string())
+
+    c: Map[String, Map[String, Int?]] := {"o": {"i": 42}}
+    mc := c.get_default("o", {})
+    print(mc.get_default("i", none).value().to_string())
+
+    mut m: List[List[Int?]] := []
+    m = [[7, none]]
+    print(m[0][0].value().to_string())
+
+    box := Box([5, none])
+    print(box.items[0].value().to_string())

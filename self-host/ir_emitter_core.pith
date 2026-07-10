@@ -2241,9 +2241,29 @@ fn ir_emit_tuple_literal(node: Node) -> Int:
 fn ir_field_lookup_key(recv_idx: Int, field_name: String) -> String:
     return ir_field_receiver_type(recv_idx) + "." + field_name
 
+# the widest payload across an enum's variants. every variant is boxed
+# at this size so a match arm can read a payload slot of a value that
+# turned out to be a different, narrower variant without running past
+# the allocation — the tag check still gates whether the comparison
+# counts, but the read itself must stay in bounds and land on a zeroed
+# slot (Event.Ping carries no payload, yet a Code(0) arm reads slot 1).
+fn ir_enum_max_payload_count(enum_name: String) -> Int:
+    mut max_count := 0
+    if ir_enum_variant_lists.contains_key(enum_name):
+        for vname in ir_enum_variant_lists[enum_name].split(","):
+            vkey := enum_name + "." + vname
+            if ir_enum_payload_kinds.contains_key(vkey):
+                count := ir_enum_payload_kinds[vkey].split(",").len()
+                if count > max_count:
+                    max_count = count
+    return max_count
+
 fn ir_emit_variant_alloc(enum_name: String, variant_key: String, payload_count: Int) -> Int:
+    mut slots := ir_enum_max_payload_count(enum_name)
+    if payload_count > slots:
+        slots = payload_count
     count_r := ir_reg()
-    ir_emit("iconst " + count_r.to_string() + " " + (payload_count + 1).to_string())
+    ir_emit("iconst " + count_r.to_string() + " " + (slots + 1).to_string())
     r := ir_reg()
     ir_emit_call1(r, "__struct_alloc", "struct:" + enum_name, count_r)
     tag_r := ir_reg()

@@ -80,7 +80,7 @@ the honest list lives in [docs/limitations.md](docs/limitations.md)
 and stays current. highlights you should know before diving in:
 reference cycles and closure environments leak (no cycle collector),
 removed container elements aren't reclaimed until the container dies,
-the TLS server side is not implemented (client works), and
+tls is 1.3-only with no 1.2 fallback, and
 performance sits between go and rust on service-shaped work but
 behind go on heavy string churn — measured numbers, not vibes, in
 [docs/performance.md](docs/performance.md).

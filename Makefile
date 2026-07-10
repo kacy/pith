@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz memcheck test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -687,6 +687,36 @@ fuzz-check: build
 fuzz: build
 	@./target/release/pith build tools/fuzz/fuzz.pith > /dev/null
 	@./tools/fuzz/fuzz --count 300 --build-every 5
+
+# --- memcheck ---
+# run a curated set of memory-management-heavy programs under valgrind
+# with an error exit code, so a use-after-free or an out-of-bounds read
+# fails ci even when the program happens to print the right answer (an
+# enum-payload overread did exactly that until it was caught here). the
+# full example + regression corpus is valgrind-clean; this subset keeps
+# the gate fast.
+MEMCHECK_CASES := \
+	tests/cases/test_match_payload tests/cases/test_combo_enums_deep \
+	tests/cases/test_fn_value_positions tests/cases/test_global_fn_value \
+	tests/cases/test_optional_collections tests/cases/test_nested_optional_literals \
+	tests/cases/test_optional_value tests/cases/test_closure_struct_return \
+	tests/cases/test_combo_closures tests/cases/test_combo_structs_deep \
+	tests/cases/test_generic_to_string tests/cases/test_map_int_string_buffered
+
+memcheck: build
+	@echo "--- memcheck (valgrind, curated) ---"
+	@command -v valgrind > /dev/null || { echo "valgrind not installed; skipping"; exit 0; }
+	@fail=0; \
+	for base in $(MEMCHECK_CASES); do \
+		./target/release/pith build "$$base.pith" > /dev/null 2>&1 || { echo "FAIL build $$base"; fail=1; continue; }; \
+		if valgrind --error-exitcode=99 --leak-check=no --errors-for-leak-kinds=none -q "$$base" > /dev/null 2>/tmp/pith-memcheck.txt; then \
+			echo "ok   $$base"; \
+		else \
+			echo "FAIL $$base (valgrind)"; head -6 /tmp/pith-memcheck.txt; fail=1; \
+		fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then exit 1; fi; \
+	echo "all memcheck cases clean"
 
 # --- gzip interop check ---
 # both directions against the system tool: pith reads gzip's output

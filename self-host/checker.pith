@@ -1169,13 +1169,11 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
                     if types_structurally_equal(annotated, val_type):
                         define_binding(scope_id, name, annotated, is_mut)
                         return
-                    # special case: allow empty collections with annotations,
-                    # and record the annotated type as the literal's type so
-                    # the emitter builds the right container (an empty {} under
-                    # a Set[Int] annotation must construct an int set)
-                    if val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set":
-                        propagate_expected_collection_type(node.children[1], annotated)
-                    else:
+                    # a collection literal takes the annotated type when its
+                    # elements are compatible (allowing optional wrapping),
+                    # which also records the type for the emitter's container
+                    # choice; a genuinely wrong element type still fails.
+                    if collection_literal_matches_target(node.children[1], annotated, scope_id) == false:
                         report_error("E200", "type mismatch: expected " + get_type_name(annotated) + ", got " + get_type_name(val_type))
         define_binding(scope_id, name, annotated, is_mut)
     elif node.children.len() == 1:

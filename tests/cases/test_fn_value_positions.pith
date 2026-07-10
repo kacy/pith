@@ -1,6 +1,8 @@
 # calling a function value that comes from an expression rather than a
-# plain name: a list index, a returned value, a map lookup. each must
-# dispatch through the value, not mistake its base for the target.
+# plain name, across every position a value can take: list and map
+# elements, tuple fields, returned values, nested indexing, a bound
+# struct field, an immediately-invoked lambda, and a higher-order
+# parameter. each must dispatch through the value.
 fn double(x: Int) -> Int:
     return x * 2
 
@@ -9,6 +11,12 @@ fn tag(x: Int) -> String:
 
 fn pick() -> fn(Int) -> Int:
     return double
+
+fn apply_it(f: fn(Int) -> Int, v: Int) -> Int:
+    return f(v)
+
+struct Holder:
+    pub op: fn(Int) -> Int
 
 fn main():
     ops := [double, double]
@@ -22,3 +30,18 @@ fn main():
     mut m: Map[String, fn(Int) -> Int] := {}
     m.insert("d", double)
     print(m.get_default("d", double)(3).to_string())
+
+    t := (double, 3)
+    g := t.0
+    print(g(6).to_string())
+
+    print(apply_it(double, 5).to_string())
+
+    h := Holder(double)
+    hf := h.op
+    print(hf(8).to_string())
+
+    print((fn(x: Int) => x + 1)(41).to_string())
+
+    grid := [[double]]
+    print(grid[0][0](11).to_string())

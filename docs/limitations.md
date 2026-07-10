@@ -37,7 +37,7 @@ something here that now works, the page is stale and a fix to it is welcome.
   a function value stored in a struct field can be passed and returned,
   but `instance.field(args)` parses as a method call and is rejected
   (E209). bind it to a name first (`f := instance.field; f(args)`).
-  function values held in locals, globals, list and map elements, and
+  function values held in locals, globals, list/map/tuple elements, and
   returned from calls are all directly callable.
 
 ## standard library

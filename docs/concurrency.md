@@ -129,7 +129,24 @@ the current concurrency story is strong enough for:
 - bounded channel coordination with `select`
 - process timeout helpers through `std.os.process`
 
+## sharing between tasks
+
+`spawn` runs on a real os thread. reference counts are atomic, so
+handing a value to another task and letting both hold a count is safe.
+what is *not* safe is two tasks mutating the same collection at once —
+a list or map is a plain buffer behind a handle, and concurrent
+mutation races on that buffer.
+
+pass data between tasks through a channel rather than sharing a
+mutable collection. a channel hands the value over instead of aliasing
+it, so each task mutates its own. immutable values and independent
+copies (`std.collections.copy_list` and friends) are also safe to
+hand off. this rule is convention today, not yet enforced by the
+checker.
+
 things that are still intentionally explicit or still growing:
 
 - task cancellation is cooperative, not forceful
 - plain file io still does not have `_ctx` variants
+- sharing a mutable collection across tasks is a data race (above);
+  use channels

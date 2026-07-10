@@ -11,7 +11,6 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-pub mod arc;
 pub mod bytes;
 pub mod collections;
 pub mod concurrency;

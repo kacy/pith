@@ -67,9 +67,48 @@ flavor.
   `self-host/ir_emitter_core.pith` (binds, assigns, returns)
 - the argument rules: `ir_release_owned_method_args` and the call
   paths near it
-- the runtime counts: `cranelift/runtime/src/runtime_core.rs` and
-  `arc.rs`
+- the runtime counts: `cranelift/runtime/src/runtime_core.rs` and the
+  per-type files under `collections/`
 
 if you are adding a statement or call shape, decide explicitly which
 of the rules above applies to every string that flows through it —
 "it seemed to work" is how the dangling ones got in.
+
+## what is and isn't reclaimed
+
+reference counting frees a value the moment its last count drops, with
+no gc pause. that covers the common case completely. the deliberate
+gaps, all bounded leaks rather than dangling pointers:
+
+- **reference cycles are not collected.** there is no cycle collector.
+  in practice a cycle is hard to even construct: structs cannot be
+  self-referential (a field cannot name its own struct type), and a
+  collection literal cannot contain itself. a cycle needs mutation to
+  close, so most programs never form one.
+- **closure environments are never freed.** a closure allocates a
+  capture environment that outlives its last use — a fixed leak per
+  closure created, plus a count on each heap value it captured. this
+  is the one routinely-reachable leak; see the closure-lifecycle note
+  in the memory hardening plan.
+- **removed or overwritten container elements are not released until
+  the container itself dies.** a borrow of an element may still be in
+  flight, so the free is deferred to the container's own cleanup.
+- **an error-path early return skips the normal exit cleanup.** the
+  values a function held leak on the failing path.
+
+none of these produce a dangling pointer; the discipline trades a
+bounded leak for that guarantee.
+
+## threads and tasks
+
+`spawn` runs a closure on a real os thread. reference counts are
+atomic, so retaining and releasing the same value from two threads is
+safe. the container *contents* are not synchronized, though: a list or
+map is a plain buffer behind a handle, so two tasks mutating the same
+collection race on that buffer.
+
+the rule, until a checker enforces it: **do not share a mutable
+collection across tasks — pass data through a channel instead.** a
+channel hands the value over rather than aliasing it, which keeps each
+task's mutations to itself. immutable values and independent copies
+(`std.collections.copy_list` and friends) are also safe to hand off.

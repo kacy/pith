@@ -32,7 +32,7 @@ structs, enums, match, generics, lambdas/closures, collections (List/Map/Set),
 string methods, error propagation (try/fail), concurrency (spawn/await),
 JSON/TOML/URL parsing, file I/O, path/process helpers, and more.
 
-## codebase (~11,200 lines Rust)
+## codebase (~12,500 lines Rust)
 
 counts drift as the code moves; `make status-audit` prints the live totals.
 

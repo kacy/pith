@@ -1,0 +1,23 @@
+# a collection literal whose element type is optional (or a result)
+# must wrap each element, not push the raw value. before this, a
+# List[Int?] literal stored bare ints and a later .value() dereferenced
+# an integer as a heap tuple and crashed.
+fn ok_val(x: Int) -> Int!:
+    return x
+
+fn main():
+    opts: List[Int?] := [1, none, 3]
+    a := opts[0]
+    print(a.value().to_string())
+    b := opts[1]
+    if b == none:
+        print("none")
+    c := opts[2]
+    print(c.value().to_string())
+
+    rs: List[Int!] := [ok_val(5), ok_val(10)]
+    r := rs[1]
+    print((r catch 0).to_string())
+
+    nums := [10, 20, 30]
+    print(nums[2].to_string())

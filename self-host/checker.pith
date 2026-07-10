@@ -1048,6 +1048,99 @@ fn struct_min_required_fields(struct_name: String, info: TypeInfo) -> Int:
             break
     return min_required
 
+# record a collection literal's type as the annotated one, and push the
+# expected element type into any collection literal nested inside it. a
+# literal takes its own type from its elements, so `[[1, none]]` under a
+# List[List[Int?]] annotation would type the inner list List[Int] and
+# lose the optional; the emitter wraps elements from the container's
+# recorded type, so recording the right type on every nested literal is
+# what makes deep literals build correct values.
+fn propagate_expected_collection_type(literal_idx: Int, expected_tid: Int):
+    if expected_tid < 0:
+        return
+    node := get_node(literal_idx)
+    expected_info := get_type_info(expected_tid)
+    if node.kind == "list" and expected_info.kind == "list":
+        expression_type_cache.insert(literal_idx, expected_tid)
+        for child in node.children:
+            propagate_expected_collection_type(child, expected_info.inner)
+    elif node.kind == "set" and expected_info.kind == "set":
+        expression_type_cache.insert(literal_idx, expected_tid)
+        for child in node.children:
+            propagate_expected_collection_type(child, expected_info.inner)
+    elif node.kind == "map" and expected_info.kind == "map":
+        expression_type_cache.insert(literal_idx, expected_tid)
+        for entry_idx in node.children:
+            entry := get_node(entry_idx)
+            if entry.kind == "entry" and entry.children.len() >= 2:
+                propagate_expected_collection_type(entry.children[1], expected_info.value_type)
+
+# true when a single value can build an element of the expected type:
+# a nested collection literal recurses, an optional target accepts none
+# or the bare inner value, everything else must be type-compatible. this
+# is what keeps the coercion honest — a String element for a List[Int]
+# still fails.
+fn literal_element_coerces(value_idx: Int, expected_tid: Int, scope_id: Int) -> Bool:
+    if expected_tid < 0:
+        return false
+    node := get_node(value_idx)
+    if node.kind == "list" or node.kind == "set" or node.kind == "map":
+        return collection_literal_coerces(value_idx, expected_tid, scope_id)
+    expected_info := get_type_info(expected_tid)
+    if expected_info.kind == "optional":
+        if node.kind == "none_lit":
+            return true
+        inner_type := c_check_expr(value_idx, scope_id)
+        if is_error_type(inner_type):
+            return false
+        return inner_type == expected_info.inner or types_compatible(inner_type, expected_info.inner)
+    actual := c_check_expr(value_idx, scope_id)
+    if is_error_type(actual):
+        return false
+    return types_compatible(actual, expected_tid)
+
+# true when a collection literal can validly build the expected
+# collection type, allowing optional wrapping of its leaves but
+# rejecting genuinely wrong element types. on success it records the
+# expected type through the literal (and its nested literals) so the
+# emitter wraps each element correctly.
+fn collection_literal_coerces(value_idx: Int, target_tid: Int, scope_id: Int) -> Bool:
+    if target_tid < 0:
+        return false
+    node := get_node(value_idx)
+    target_info := get_type_info(target_tid)
+    if node.kind == "list" and target_info.kind == "list":
+        for child in node.children:
+            if literal_element_coerces(child, target_info.inner, scope_id) == false:
+                return false
+        propagate_expected_collection_type(value_idx, target_tid)
+        return true
+    if node.kind == "set" and target_info.kind == "set":
+        for child in node.children:
+            if literal_element_coerces(child, target_info.inner, scope_id) == false:
+                return false
+        propagate_expected_collection_type(value_idx, target_tid)
+        return true
+    if node.kind == "map" and target_info.kind == "map":
+        for entry_idx in node.children:
+            entry := get_node(entry_idx)
+            if entry.kind == "entry" and entry.children.len() >= 2:
+                if literal_element_coerces(entry.children[0], target_info.key_type, scope_id) == false:
+                    return false
+                if literal_element_coerces(entry.children[1], target_info.value_type, scope_id) == false:
+                    return false
+        propagate_expected_collection_type(value_idx, target_tid)
+        return true
+    return false
+
+# a value is a collection literal that coerces to an expected collection
+# type. lets assignments and struct fields accept the same optional-in-a-
+# collection literals an annotated binding does, without masking real
+# element-type errors. the scope must be the one the value was checked
+# in — its element expressions are re-checked to verify compatibility.
+fn collection_literal_matches_target(value_idx: Int, target_tid: Int, scope_id: Int) -> Bool:
+    return collection_literal_coerces(value_idx, target_tid, scope_id)
+
 fn check_binding_statement(node_idx: Int, scope_id: Int):
     node := get_node(node_idx)
     name := extract_binding_name(node.value)
@@ -1067,7 +1160,7 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
             # element kind) to construct
             if is_error_type(val_type):
                 if val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set":
-                    expression_type_cache.insert(node.children[1], annotated)
+                    propagate_expected_collection_type(node.children[1], annotated)
             if value_matches_optional_target(node.children[1], val_type, annotated):
                 define_binding(scope_id, name, annotated, is_mut)
                 return
@@ -1081,7 +1174,7 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
                     # the emitter builds the right container (an empty {} under
                     # a Set[Int] annotation must construct an int set)
                     if val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set":
-                        expression_type_cache.insert(node.children[1], annotated)
+                        propagate_expected_collection_type(node.children[1], annotated)
                     else:
                         report_error("E200", "type mismatch: expected " + get_type_name(annotated) + ", got " + get_type_name(val_type))
         define_binding(scope_id, name, annotated, is_mut)
@@ -1111,6 +1204,8 @@ fn check_assignment(node: Node, scope_id: Int):
     if is_error_type(target_type):
         return
     if value_matches_optional_target(value_idx, val_type, target_type):
+        return
+    if collection_literal_matches_target(value_idx, target_type, scope_id):
         return
     if is_error_type(val_type):
         return
@@ -2373,8 +2468,9 @@ fn check_named_struct_constructor(name: String, struct_tid: Int, info: TypeInfo,
             if is_error_type(arg_type) == false:
                 expected := info.field_types[idx]
                 if value_matches_optional_target(expr, arg_type, expected) == false:
-                    if types_compatible(arg_type, expected) == false:
-                        report_error("E219", "field '" + fld + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
+                    if collection_literal_matches_target(expr, expected, scope_id) == false:
+                        if types_compatible(arg_type, expected) == false:
+                            report_error("E219", "field '" + fld + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return struct_tid
 
@@ -2402,8 +2498,9 @@ fn check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_i
             if idx < info.field_types.len():
                 expected := info.field_types[idx]
                 if value_matches_optional_target(arg_expr_idx, arg_type, expected) == false:
-                    if types_compatible(arg_type, expected) == false:
-                        report_error("E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
+                    if collection_literal_matches_target(arg_expr_idx, expected, scope_id) == false:
+                        if types_compatible(arg_type, expected) == false:
+                            report_error("E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return struct_tid
 
@@ -4605,8 +4702,9 @@ fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
             if idx < info.field_types.len():
                 expected := info.field_types[idx]
                 if value_matches_optional_target(child, arg_type, expected) == false:
-                    if types_compatible(arg_type, expected) == false:
-                        report_error("E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
+                    if collection_literal_matches_target(child, expected, scope_id) == false:
+                        if types_compatible(arg_type, expected) == false:
+                            report_error("E219", "field '" + info.fields[idx] + "' type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
 
     return struct_tid

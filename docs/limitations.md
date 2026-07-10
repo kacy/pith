@@ -33,15 +33,6 @@ something here that now works, the page is stale and a fix to it is welcome.
   the cap is a fixed ceiling, not a correctness issue. (multi-line closure
   bodies — `fn(x):` with an indented block — work and infer their return
   type from their return statements.)
-- **nested collection literals don't push an optional element type
-  inward** — a top-level literal takes its type from the binding
-  (`x: List[Int?] := [1, none]` wraps correctly, and so does a
-  `Map[K, Int?]` literal), but a collection literal *nested inside
-  another literal* — `[[1, none]]` typed `List[List[Int?]]`, or a
-  `Map[K, List[Int?]]` literal — infers the inner list as `List[Int]`
-  and stores raw values, which crash when later unwrapped. build the
-  inner collection as a typed local first and insert it
-  (`inner: List[Int?] := [...]; m.insert(k, inner)`).
 - **function-value struct fields aren't callable through a field** —
   a function value stored in a struct field can be passed and returned,
   but `instance.field(args)` parses as a method call and is rejected

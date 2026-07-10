@@ -1,0 +1,30 @@
+# build and match enum values of different variant sizes in loops and
+# collections. every variant is boxed at the enum's widest payload, so
+# a match arm reading a payload slot of a narrower variant stays in
+# bounds — this is the case the memcheck gate guards.
+enum Tree:
+    Leaf(Int)
+    Node(String, Int)
+    Empty
+
+fn sum(t: Tree) -> Int:
+    match t:
+        Tree.Leaf(v) => v
+        Tree.Node(name, v) => v + name.len()
+        Tree.Empty => 0
+
+fn main():
+    mut total := 0
+    mut i := 0
+    while i < 100:
+        total = total + sum(Tree.Leaf(i))
+        total = total + sum(Tree.Node("node" + i.to_string(), i))
+        total = total + sum(Tree.Empty)
+        i = i + 1
+    print(total.to_string())
+
+    ts: List[Tree] := [Tree.Leaf(1), Tree.Empty, Tree.Node("x", 5)]
+    mut s := 0
+    for t in ts:
+        s = s + sum(t)
+    print(s.to_string())

@@ -1,0 +1,43 @@
+# exercise the string-ownership rules under repeated churn: payloads
+# extracted from enums and kept, strings rebound in a loop, closures
+# capturing heap strings and called after their maker returns, and
+# structs with rc fields living in a collection.
+enum Msg:
+    Text(String)
+    Empty
+
+fn extract(m: Msg) -> String:
+    match m:
+        Msg.Text(s) => s
+        Msg.Empty => "none"
+
+struct Person:
+    pub name: String
+    pub tags: List[String]
+
+fn make_greeter(greeting: String) -> fn(String) -> String:
+    return fn(who: String) => greeting + ", " + who
+
+fn main():
+    mut collected: List[String] := []
+    mut i := 0
+    while i < 50:
+        collected.push(extract(Msg.Text("item" + i.to_string())))
+        i = i + 1
+    print(collected.len().to_string() + " " + collected[49])
+
+    mut acc := ""
+    for w in collected:
+        acc = w + "!"
+    print(acc)
+
+    greeter := make_greeter("hello")
+    print(greeter("world"))
+
+    mut people: List[Person] := []
+    mut j := 0
+    while j < 30:
+        people.push(Person("p" + j.to_string(), ["a", "b"]))
+        j = j + 1
+    p := people[15]
+    print(p.name + " " + p.tags[1])

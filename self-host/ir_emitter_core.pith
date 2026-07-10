@@ -2126,19 +2126,29 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         return ir_emit_wrapped_legacy_result(r, ret_type, callee.name)
     return r
 
-fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node):
+fn ir_emit_map_entry_insert(map_r: Int, has_int_keys: Bool, entry: Node, val_target: String):
     if entry.kind != "entry" or entry.children.len() < 2:
         return
     k_r := ir_expr(entry.children[0])
-    v_r := ir_expr(entry.children[1])
+    # wrap the value to its declared kind so an optional value type
+    # stores Some(v), not the raw v — the same fix collection element
+    # literals need (a map literal typed Map[K, Int?] otherwise stored
+    # bare ints and a later .value() dereferenced one as a heap tuple).
+    v_r := ir_emit_value_for_target(entry.children[1], val_target)
     if has_int_keys:
         ir_emit_call3(ir_reg(), "map_insert_ikey", "void", map_r, k_r, v_r)
     else:
         ir_emit_call3(ir_reg(), "map_insert", "void", map_r, k_r, v_r)
 
-fn ir_emit_map_literal(node: Node) -> Int:
+fn ir_emit_map_literal(idx: Int, node: Node) -> Int:
     map_r := ir_reg()
     has_int_keys := ir_map_uses_int_keys(node)
+    mut val_target := ""
+    tid := c_get_expr_type(idx)
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "map" and info.value_type >= 0:
+            val_target = ir_type_from_tid(info.value_type)
     mut val_is_string := false
     if node.children.len() > 0:
         entry0 := get_node(node.children[0])
@@ -2154,7 +2164,7 @@ fn ir_emit_map_literal(node: Node) -> Int:
     else:
         ir_emit_call0(map_r, "__map_new", "map")
     for child in node.children:
-        ir_emit_map_entry_insert(map_r, has_int_keys, get_node(child))
+        ir_emit_map_entry_insert(map_r, has_int_keys, get_node(child), val_target)
     return map_r
 
 fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
@@ -3515,7 +3525,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         checked_lit := ir_checked_type(idx)
         if checked_lit == "set" or checked_lit == "set_int":
             return ir_emit_set_literal(idx, node)
-        return ir_emit_map_literal(node)
+        return ir_emit_map_literal(idx, node)
 
     if kind == "set":
         return ir_emit_set_literal(idx, node)

@@ -90,8 +90,6 @@ in 2.1s every time, and the entire self-hosted compiler in under 7s.
 - lists and maps store non-int elements as one heap allocation per element
   (`collections/list.rs`, `collections/map.rs`); ints already have an
   unboxed fast path.
-- arc keeps a global object list with o(n) removal and scans for cycles
-  every 100 releases (`cranelift/runtime/src/arc.rs`).
 
 ## the big one: memory is never freed (found july 2026, profiling)
 

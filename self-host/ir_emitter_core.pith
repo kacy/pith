@@ -433,6 +433,8 @@ fn ir_rc_retain_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_bytes_retain", "void", r)
     elif kind == "struct":
         ir_emit_call1(ir_reg(), "pith_struct_retain", "void", r)
+    elif kind == "closure":
+        ir_emit_call1(ir_reg(), "pith_closure_retain", "void", r)
 
 fn ir_rc_release_reg(r: Int, kind: String):
     if kind == "string":
@@ -447,6 +449,8 @@ fn ir_rc_release_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_bytes_release", "void", r)
     elif kind == "struct":
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
+    elif kind == "closure":
+        ir_emit_call1(ir_reg(), "pith_closure_release", "void", r)
 
 # a map target whose value type is string picks the heap-value
 # constructor for empty literals, so runtime inserts retain
@@ -515,11 +519,15 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
         return false
     if node.kind == "struct_init":
         return false
+    # a lambda mints a fresh closure with its own count; returning or
+    # binding it transfers that count rather than borrowing one.
+    if node.kind == "lambda":
+        return false
     if node.kind == "call" and ir_infer_type(idx) == "string":
         return false
     if node.kind == "call" or node.kind == "method_call":
         expr_kind := ir_rc_kind(ir_infer_type(idx))
-        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes" or expr_kind == "struct":
+        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes" or expr_kind == "struct" or expr_kind == "closure":
             return false
     if node.kind == "method_call":
         return not ir_string_method_returns_fresh(ir_plain_method_name(node.value))
@@ -1508,18 +1516,43 @@ fn ir_emit_display_struct(obj_r: Int, struct_name: String) -> Int:
     ir_string_release_reg(acc_r)
     return out_r
 
+# the runtime tag telling a closure how to release a captured slot when
+# the closure is freed. matches the CLOSURE_TAG_* constants in the
+# runtime; 0 means a plain value with nothing to release.
+fn ir_closure_capture_tag(kind: String) -> Int:
+    if kind == "string":
+        return 1
+    if kind == "list":
+        return 2
+    if kind == "map":
+        return 3
+    if kind == "set":
+        return 4
+    if kind == "bytes":
+        return 5
+    if kind == "struct":
+        return 6
+    if kind == "closure":
+        return 7
+    return 0
+
 fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String]):
     for capture_name, i in captures:
         cap_val := ir_reg()
         ir_emit("load " + cap_val.to_string() + " " + capture_name)
+        slot := ir_reg()
+        ir_emit("iconst " + slot.to_string() + " " + i.to_string())
         # the closure environment keeps its own count on captured rc values
-        # so the origin scope's cleanup cannot pull them out from under it
+        # so the origin scope's cleanup cannot pull them out from under it;
+        # the tag lets the closure drop that count when it is freed.
         cap_kind := ir_rc_kind(ir_lookup_name_type(capture_name))
         if cap_kind.len() > 0:
             ir_rc_retain_reg(cap_val, cap_kind)
-        slot := ir_reg()
-        ir_emit("iconst " + slot.to_string() + " " + i.to_string())
-        ir_emit_call3(ir_reg(), "__closure_set_env", "void", closure_r, slot, cap_val)
+            tag_r := ir_reg()
+            ir_emit("iconst " + tag_r.to_string() + " " + ir_closure_capture_tag(cap_kind).to_string())
+            ir_emit_call_text(ir_reg(), "pith_closure_set_env_rc", "void", 4, " " + closure_r.to_string() + " " + slot.to_string() + " " + cap_val.to_string() + " " + tag_r.to_string())
+        else:
+            ir_emit_call3(ir_reg(), "__closure_set_env", "void", closure_r, slot, cap_val)
 
 fn ir_emit_lambda_hidden_param():
     closure_r := ir_reg()

@@ -318,9 +318,36 @@ pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
 
 const PITH_CLOSURE_ENV_SLOTS: usize = 16;
 
+// release-kind tags for captured environment slots, so the closure can
+// drop the counts it took on its captures when it is itself freed. 0
+// means the slot holds a plain value (int/bool/float) with nothing to
+// release. the numbers match the emitter's rc kinds.
+const CLOSURE_TAG_STRING: u8 = 1;
+const CLOSURE_TAG_LIST: u8 = 2;
+const CLOSURE_TAG_MAP: u8 = 3;
+const CLOSURE_TAG_SET: u8 = 4;
+const CLOSURE_TAG_BYTES: u8 = 5;
+const CLOSURE_TAG_STRUCT: u8 = 6;
+const CLOSURE_TAG_CLOSURE: u8 = 7;
+
 struct PithClosure {
     func_ptr: i64,
+    ref_count: std::sync::atomic::AtomicI64,
     env: [i64; PITH_CLOSURE_ENV_SLOTS],
+    env_tags: [u8; PITH_CLOSURE_ENV_SLOTS],
+}
+
+unsafe fn release_captured_value(value: i64, tag: u8) {
+    match tag {
+        CLOSURE_TAG_STRING => pith_cstring_release(value as *const i8),
+        CLOSURE_TAG_LIST => crate::collections::list::pith_list_release_handle(value),
+        CLOSURE_TAG_MAP => crate::collections::map::pith_map_release_handle(value),
+        CLOSURE_TAG_SET => crate::collections::set::pith_set_release_handle(value),
+        CLOSURE_TAG_BYTES => crate::bytes::pith_bytes_release(value),
+        CLOSURE_TAG_STRUCT => pith_struct_release(value),
+        CLOSURE_TAG_CLOSURE => pith_closure_release(value),
+        _ => {}
+    }
 }
 
 unsafe fn pith_closure_mut<'a>(handle: i64) -> Option<&'a mut PithClosure> {
@@ -341,10 +368,58 @@ unsafe fn pith_closure_ref<'a>(handle: i64) -> Option<&'a PithClosure> {
 pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
     let ptr = Box::into_raw(Box::new(PithClosure {
         func_ptr,
+        ref_count: std::sync::atomic::AtomicI64::new(1),
         env: [0; PITH_CLOSURE_ENV_SLOTS],
+        env_tags: [0; PITH_CLOSURE_ENV_SLOTS],
     }));
     handle_registry::register(ptr as *const (), HandleKind::Closure);
     ptr as i64
+}
+
+/// One more owner of this closure.
+///
+/// # Safety
+/// handle must be a valid closure handle or garbage (registry-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
+    if let Some(closure) = pith_closure_ref(handle) {
+        closure
+            .ref_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Drop one owner; the last release drops the counts the closure took
+/// on its captured values, then frees the closure. this is the fix for
+/// the closure-environment leak — closures used to allocate with no
+/// release path at all.
+///
+/// # Safety
+/// handle must be a valid closure handle or garbage (registry-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_closure_release(handle: i64) {
+    let Some(closure) = pith_closure_ref(handle) else {
+        return;
+    };
+    let prev = closure
+        .ref_count
+        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    if prev > 1 {
+        return;
+    }
+    if prev <= 0 {
+        // over-release: restore and leave it alone
+        closure
+            .ref_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    for slot in 0..PITH_CLOSURE_ENV_SLOTS {
+        release_captured_value(closure.env[slot], closure.env_tags[slot]);
+    }
+    handle_registry::unregister(handle as *const (), HandleKind::Closure);
+    drop(Box::from_raw(handle as *mut PithClosure));
 }
 
 #[no_mangle]
@@ -363,6 +438,23 @@ pub unsafe extern "C" fn pith_closure_set_env(handle: i64, slot: i64, value: i64
     }
     if let Some(closure) = pith_closure_mut(handle) {
         closure.env[slot as usize] = value;
+    }
+}
+
+/// Store a captured value that carries a reference count, tagging the
+/// slot so the closure releases that count when it is freed. the caller
+/// has already retained the value into the closure.
+///
+/// # Safety
+/// handle must be a valid closure handle or garbage (registry-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_closure_set_env_rc(handle: i64, slot: i64, value: i64, tag: i64) {
+    if slot < 0 || (slot as usize) >= PITH_CLOSURE_ENV_SLOTS {
+        return;
+    }
+    if let Some(closure) = pith_closure_mut(handle) {
+        closure.env[slot as usize] = value;
+        closure.env_tags[slot as usize] = tag as u8;
     }
 }
 

@@ -1,0 +1,21 @@
+# a closure and its captures are reclaimed when the closure is dropped.
+# built and discarded many times in a loop; before the closure got a
+# release path this leaked one environment (plus its captured string)
+# per iteration. run under memcheck to keep it honest.
+fn make_adder(base: Int) -> fn(Int) -> Int:
+    return fn(y: Int) => base + y
+
+fn make_tagger(prefix: String) -> fn(Int) -> String:
+    return fn(n: Int) => prefix + n.to_string()
+
+fn main():
+    mut total := 0
+    mut i := 0
+    while i < 500:
+        add := make_adder(i)
+        total = total + add(1)
+        tag := make_tagger("n" + i.to_string())
+        if tag(i).len() > 100:
+            print("unreachable")
+        i = i + 1
+    print(total.to_string())

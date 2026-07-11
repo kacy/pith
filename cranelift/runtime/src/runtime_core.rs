@@ -330,11 +330,35 @@ const CLOSURE_TAG_BYTES: u8 = 5;
 const CLOSURE_TAG_STRUCT: u8 = 6;
 const CLOSURE_TAG_CLOSURE: u8 = 7;
 
+// closures validate the same way strings and structs do: a magic word
+// at the front of the allocation, read without a lock. `#[repr(C)]`
+// pins `magic` to offset 0 so a stale or garbage handle is rejected by
+// reading the first four bytes rather than by consulting a global set.
+const CLOSURE_MAGIC: u32 = 0x50434c53; // "PCLS"
+
+#[repr(C)]
 struct PithClosure {
+    magic: u32,
     func_ptr: i64,
     ref_count: std::sync::atomic::AtomicI64,
     env: [i64; PITH_CLOSURE_ENV_SLOTS],
     env_tags: [u8; PITH_CLOSURE_ENV_SLOTS],
+}
+
+/// Validate a closure handle by its magic word. Returns the typed
+/// pointer only when the handle is non-null, aligned, and still carries
+/// the magic — the lock-free equivalent of the old registry lookup.
+/// Same practical-guard contract as the string and struct magic words:
+/// a stale pointer whose magic was scrubbed on free reads as invalid.
+unsafe fn closure_base<'a>(handle: i64) -> Option<&'a PithClosure> {
+    if handle == 0 || (handle as u64) % 8 != 0 {
+        return None;
+    }
+    let ptr = handle as *const PithClosure;
+    if (ptr as *const u32).read() != CLOSURE_MAGIC {
+        return None;
+    }
+    Some(&*ptr)
 }
 
 unsafe fn release_captured_value(value: i64, tag: u8) {
@@ -351,28 +375,23 @@ unsafe fn release_captured_value(value: i64, tag: u8) {
 }
 
 unsafe fn pith_closure_mut<'a>(handle: i64) -> Option<&'a mut PithClosure> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::Closure) {
-        return None;
-    }
+    closure_base(handle)?;
     Some(&mut *(handle as *mut PithClosure))
 }
 
 unsafe fn pith_closure_ref<'a>(handle: i64) -> Option<&'a PithClosure> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::Closure) {
-        return None;
-    }
-    Some(&*(handle as *const PithClosure))
+    closure_base(handle)
 }
 
 #[no_mangle]
 pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
     let ptr = Box::into_raw(Box::new(PithClosure {
+        magic: CLOSURE_MAGIC,
         func_ptr,
         ref_count: std::sync::atomic::AtomicI64::new(1),
         env: [0; PITH_CLOSURE_ENV_SLOTS],
         env_tags: [0; PITH_CLOSURE_ENV_SLOTS],
     }));
-    handle_registry::register(ptr as *const (), HandleKind::Closure);
     ptr as i64
 }
 
@@ -418,7 +437,9 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     for slot in 0..PITH_CLOSURE_ENV_SLOTS {
         release_captured_value(closure.env[slot], closure.env_tags[slot]);
     }
-    handle_registry::unregister(handle as *const (), HandleKind::Closure);
+    // scrub the magic so a stale handle fails closure_base before we
+    // hand the box back to the allocator.
+    (handle as *mut u32).write(0);
     drop(Box::from_raw(handle as *mut PithClosure));
 }
 

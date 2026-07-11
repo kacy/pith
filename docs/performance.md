@@ -10,16 +10,21 @@ the helpers in `bench/` before trusting them on different hardware.
 ## where pith stands
 
 all numbers from one 2-core machine in one sitting, july 2026,
-medians of 5 where quick enough to repeat. rerun 2026-07-09 after the
-emitter restructuring (the alias/generic registry extractions, the
-decode and match family moves, and the import-kind fix): catalog
-111ms, pipeline 671ms (csv write 274, transform 385) — both a shade
-better than the recorded numbers, go and rust comparators unchanged
-(go catalog 403, go pipeline 301, rust catalog 68). the restructuring
-cost nothing at runtime; treat the small gains as drift until
-something targets them on purpose. the rust pipeline comparator's
-source is no longer in bench/, so its column is historical. absolute values drift a
-few percent between days; within a table they're comparable.
+medians of 5 where quick enough to repeat. rerun 2026-07-11 after a
+long correctness and memory pass — the value-lowering fixes, the
+closure lifecycle (closures are reference counted now, not leaked),
+error-path cleanup, wider enum payload boxing, and atomic-cell
+contexts. catalog 111ms (median of 104-130), pipeline 683ms (659-762),
+go and rust comparators steady (go catalog ~393, go pipeline ~303,
+rust catalog 68). flat against the previous 111ms / 671ms — the extra
+retain/release traffic and cleanup those fixes add never shows on
+these benchmarks, which build and drop collections rather than
+closures or error paths. peak rss stayed healthy: catalog 51 mb at
+200k iterations, pipeline 108 mb at 50k records. the takeaway held one
+more time: correctness came free. the rust pipeline comparator's
+source is no longer in bench/, so its column is historical. absolute
+values drift a few percent between days; within a table they're
+comparable.
 comparators: go 1.24.4 (net/http, encoding/*), rust (a minimal
 hand-rolled http server modeling the same blocking loop — not a full
 stack, read it generously).
@@ -29,9 +34,9 @@ searches, batch json; 200k iterations:
 
 | | go | rust | pith |
 |---|---|---|---|
-| total | 401ms | 74ms | **123ms** |
+| total | 393ms | 68ms | **111ms** |
 
-3.3x faster than go, within 1.7x of rust.
+3.5x faster than go, within 1.6x of rust.
 
 `bench/std_pipeline` — 50k records: csv read/write, transform, json,
 gzip:
@@ -39,9 +44,9 @@ gzip:
 | phase | go | rust | pith |
 |---|---|---|---|
 | csv read | 85 | 52 | **6** |
-| csv write | 191 | 63 | 296 |
-| transform | 51 | 29 | 423 |
-| total | 329 | 144 | 724 |
+| csv write | 191 | 63 | 271 |
+| transform | 51 | 29 | 395 |
+| total | 303 | 144 | 683 |
 
 2.2x go overall (4.1x when this document began). peak rss at 200k
 records: go 254 mb, rust 273 mb, pith 436 mb — 1.7x go, down from

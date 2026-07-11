@@ -1,6 +1,7 @@
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::collections::list::{pith_list_new, pith_list_push_value};
 use crate::ffi_util::{cstr_bytes, cstr_str};
+use crate::runtime_core::optional_tuple;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::File;
@@ -372,6 +373,24 @@ pub unsafe extern "C" fn pith_env(name: *const i8) -> *const i8 {
         }
     }
     crate::pith_strdup_string("")
+}
+
+/// Get environment variable value wrapped in an Optional tuple. Returns
+/// `Some(value)` when the variable is set and `None` otherwise — the
+/// `pith_env` version collapses both to `""`, which is indistinguishable
+/// from a variable set to the empty string.
+///
+/// # Safety
+/// name must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn pith_env_opt(name: *const i8) -> i64 {
+    if let Some(name_str) = cstr_str(name) {
+        if let Ok(var) = std::env::var(name_str) {
+            let cstr = crate::pith_copy_bytes_to_cstring(var.as_bytes());
+            return optional_tuple(true, cstr as i64);
+        }
+    }
+    optional_tuple(false, 0)
 }
 
 #[no_mangle]

@@ -1164,6 +1164,23 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
 pub(crate) const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
 pub(crate) const STRUCT_HEADER: usize = 24;
 
+/// Build a pith `T?` optional value in the on-heap tuple layout the codegen
+/// expects: field 0 is `is_some` (0 or 1), field 1 is the payload. Used by
+/// runtime accessors that want to hand back "not present" without collapsing
+/// it to a zero/empty sentinel.
+pub(crate) fn optional_tuple(is_some: bool, value: i64) -> i64 {
+    unsafe {
+        let tuple = pith_struct_alloc(2);
+        if tuple == 0 {
+            return 0;
+        }
+        let ptr = tuple as *mut i64;
+        *ptr = if is_some { 1 } else { 0 };
+        *ptr.add(1) = value;
+        tuple
+    }
+}
+
 unsafe fn struct_base(ptr: i64) -> Option<*mut u8> {
     if ptr == 0 || (ptr as u64) % 8 != 0 {
         return None;

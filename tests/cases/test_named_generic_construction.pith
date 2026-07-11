@@ -1,0 +1,36 @@
+# named-field construction of a generic struct, with the type arguments
+# inferred from the field values. positional construction already worked;
+# this wires the same inference through named (and out-of-order) fields.
+
+struct Box[T]:
+    value: T
+    label: String
+
+struct Holder[T]:
+    items: List[T]
+    count: Int
+
+struct Pair[K, V]:
+    key: K
+    val: V
+
+fn main() -> Int:
+    b := Box(value: 42, label: "answer")
+    print("box " + b.label + " " + b.value.to_string())
+
+    # fields out of declaration order
+    c := Box(label: "reversed", value: 7)
+    print("reordered " + c.label + " " + c.value.to_string())
+
+    # a type parameter buried in a container field
+    h := Holder(items: [10, 20, 30], count: 3)
+    print("holder " + h.count.to_string() + " " + h.items[1].to_string())
+
+    # two type parameters, inferred independently
+    p := Pair(key: "size", val: 99)
+    print("pair " + p.key + " " + p.val.to_string())
+
+    # string type argument
+    s := Box(value: "hi", label: "greeting")
+    print("strbox " + s.label + " " + s.value)
+    return 0

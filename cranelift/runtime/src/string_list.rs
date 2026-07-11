@@ -1,5 +1,6 @@
 use crate::collections::list::{list_mut_from_handle, list_ref_from_handle, PithList};
 use crate::ffi_util::{cstr_bytes, cstr_str};
+use crate::runtime_core::optional_tuple;
 
 /// Get command line arguments as a Pith list of C string pointers.
 #[no_mangle]
@@ -127,6 +128,23 @@ pub unsafe extern "C" fn pith_cstring_char_at(s: *const i8, index: i64) -> *mut 
     let ptr = crate::pith_alloc_cstring(1);
     *ptr = bytes[index as usize] as i8;
     ptr
+}
+
+/// Get a single character at index wrapped in an Optional tuple. Returns
+/// `Some(char_string)` when `0 <= index < len`, and `None` otherwise —
+/// callers of `s.get(i)` can distinguish an out-of-bounds miss from an
+/// intentional empty result.
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_char_at_opt(s: *const i8, index: i64) -> i64 {
+    let Some(bytes) = cstr_bytes(s) else {
+        return optional_tuple(false, 0);
+    };
+    if index < 0 || index as usize >= bytes.len() {
+        return optional_tuple(false, 0);
+    }
+    let ptr = crate::pith_alloc_cstring(1);
+    *ptr = bytes[index as usize] as i8;
+    optional_tuple(true, ptr as i64)
 }
 
 /// Format a float with a fixed number of decimal places.

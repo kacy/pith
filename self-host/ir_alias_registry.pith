@@ -64,6 +64,15 @@ pub mut ir_active_generic_params: List[String] := []
 pub mut ir_active_generic_concrete_types: List[String] := []
 pub mut ir_active_generic_module_path := ""
 
+## Per-specialization map from parameter name to the concrete Optional tid
+## of that parameter (only params whose substituted type is Optional[X] get
+## an entry). Empty outside a generic specialization. Used by the binop
+## path to recover Optional-ness after check-time saw only the un-
+## specialized generic tid — arg tids are threaded through the spec
+## pipeline via `ir_record_generic_spec_arg_tids`, decoded at spec entry,
+## and looked up here.
+pub mut ir_active_param_optional_tids: Map[String, Int] := {}
+
 ## resolve a type annotation node to an emission kind, honoring
 ## any active generic substitution.
 pub fn ir_resolve_type_node(type_idx: Int) -> String:
@@ -226,6 +235,7 @@ pub fn ir_emit_named_field_access(result_reg: Int, obj_r: Int, lookup_key: Strin
 ## substitute generic parameters in a type name.
 pub fn ir_specialize_type_name(name: String, generic_params: List[String], concrete_types: List[String]) -> String:
     return ir_specialize_type_name_with_state(name, generic_params, concrete_types, ir_type_aliases, ir_struct_names)
+
 
 ## resolve a type node under a generic substitution.
 pub fn ir_resolve_type_node_with_subst(type_idx: Int, generic_params: List[String], concrete_types: List[String]) -> String:

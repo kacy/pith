@@ -1,0 +1,20 @@
+fn main() -> Int!:
+    xs: List[Int] := [10, 20, 30]
+    m: Map[String, Int] := {"a": 1}
+
+    # Valid access still works.
+    print("xs0:" + xs[0].to_string())
+    print("xs2:" + xs[2].to_string())
+    print("ma:" + m["a"].to_string())
+
+    # Guarded access — short-circuit prevents the OOB from evaluating.
+    if xs.len() > 5 and xs[5] == 999:
+        print("unreached")
+    else:
+        print("bounds_guard_ok")
+
+    if m.contains_key("nope") and m["nope"] > 0:
+        print("unreached")
+    else:
+        print("map_guard_ok")
+    return 0

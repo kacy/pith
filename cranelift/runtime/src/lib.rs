@@ -46,6 +46,7 @@ pub(crate) use runtime_core::{
 };
 
 pub use concurrency::{
+    pith_atomic_int_compare_set, pith_atomic_int_get, pith_atomic_int_new, pith_atomic_int_set,
     pith_mutex_lock, pith_mutex_new, pith_mutex_unlock, pith_semaphore_acquire, pith_semaphore_new,
     pith_semaphore_release, pith_waitgroup_add, pith_waitgroup_done, pith_waitgroup_new,
     pith_waitgroup_wait,

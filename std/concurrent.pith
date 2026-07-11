@@ -12,15 +12,20 @@ pub struct BlockingError:
     pub kind: Int
     pub message: String
 
-# cancellation context shared across blocking helpers.
+# cancellation context shared across blocking helpers. the error cell
+# is an atomic int (0 = active, 1 = cancelled, 2 = deadline) so the
+# watcher task and the waiting task can read and write it safely; the
+# deadline is set once at creation and never changes.
 pub struct Context:
     pub done_ch: Channel[Bool]
-    pub state: Map[String, Int]
+    pub err: AtomicInt
+    pub deadline_ms: Int
 
-# handle used to cancel a derived context.
+# handle used to cancel a derived context. it shares the context's done
+# channel and error cell, so cancelling the token cancels the context.
 pub struct CancelToken:
     pub done_ch: Channel[Bool]
-    pub state: Map[String, Int]
+    pub err: AtomicInt
 
 # periodic timer that sends timestamps on a channel.
 pub struct Ticker:
@@ -32,52 +37,40 @@ pub enum RecvResult[T]:
     Value(T)
     Closed
 
-fn state_error_code(state: Map[String, Int]) -> Int:
-    return state.get_default("err", 0)
-
-fn state_deadline(state: Map[String, Int]) -> Int:
-    return state.get_default("deadline", -1)
-
 fn error_code_to_wait(code: Int) -> WaitError:
     if code == 2:
         return WaitError.DeadlineExceeded
     return WaitError.Cancelled
 
 fn context_wait_error(ctx: Context) -> WaitError:
-    return error_code_to_wait(state_error_code(ctx.state))
+    return error_code_to_wait(ctx.err.load())
 
-fn copy_state(state: Map[String, Int]) -> Map[String, Int]:
-    mut copied: Map[String, Int] := {}
-    for key in state:
-        copied.insert(key, state[key])
-    return copied
-
-fn make_child_context(parent: Context) -> (Context, CancelToken):
-    mut state := copy_state(parent.state)
-    state.insert("err", 0)
+fn make_child_context(parent: Context, deadline_ms: Int) -> (Context, CancelToken):
+    err := AtomicInt(0)
     done_ch := Channel[Bool]()
-    ctx := Context(done_ch, state)
-    token := CancelToken(done_ch, state)
-    spawn watch_parent(parent, done_ch, state)
+    ctx := Context(done_ch, err, deadline_ms)
+    token := CancelToken(done_ch, err)
+    spawn watch_parent(parent, done_ch, err)
     return (ctx, token)
 
-fn mark_context(done_ch: Channel[Bool], state: Map[String, Int], code: Int):
-    if state_error_code(state) != 0:
-        return
-    state.insert("err", code)
-    done_ch.close()
+# claim the error cell for one reason and, if we won the claim, signal
+# cancellation by closing the done channel. compare_set makes the claim
+# atomic, so a deadline and a manual cancel racing settle on one winner.
+fn mark_context(done_ch: Channel[Bool], err: AtomicInt, code: Int):
+    if err.compare_set(0, code):
+        done_ch.close()
 
-fn watch_parent(parent: Context, done_ch: Channel[Bool], state: Map[String, Int]):
+fn watch_parent(parent: Context, done_ch: Channel[Bool], err: AtomicInt):
     parent.done().recv()
     mut code := parent.error_code()
     if code == 0:
         code = 1
-    mark_context(done_ch, state, code)
+    mark_context(done_ch, err, code)
 
-fn watch_deadline(done_ch: Channel[Bool], state: Map[String, Int], at_ms: Int):
-    while state_error_code(state) == 0:
+fn watch_deadline(done_ch: Channel[Bool], err: AtomicInt, at_ms: Int):
+    while err.load() == 0:
         if time.now() >= at_ms:
-            mark_context(done_ch, state, 2)
+            mark_context(done_ch, err, 2)
             return
         time.delay(1)
 
@@ -95,24 +88,18 @@ fn ticker_worker(ch: Channel[Int], stop_ch: Channel[Bool], ms: Int):
 
 ## return a root context that is never cancelled on its own.
 pub fn background() -> Context:
-    mut state: Map[String, Int] := {}
-    state.insert("err", 0)
-    state.insert("deadline", -1)
-    done_ch := Channel[Bool]()
-    return Context(done_ch, state)
+    return Context(Channel[Bool](), AtomicInt(0), -1)
 
 # derive a child context with manual cancellation.
 pub fn with_cancel(parent: Context) -> (Context, CancelToken):
-    return make_child_context(parent)
+    return make_child_context(parent, -1)
 
 # derive a child context that cancels at a deadline.
 pub fn with_deadline(parent: Context, at_ms: Int) -> (Context, CancelToken):
-    pair := make_child_context(parent)
+    pair := make_child_context(parent, at_ms)
     ctx := pair.0
-    token := pair.1
-    ctx.state.insert("deadline", at_ms)
-    spawn watch_deadline(ctx.done_ch, ctx.state, at_ms)
-    return (ctx, token)
+    spawn watch_deadline(ctx.done_ch, ctx.err, at_ms)
+    return (ctx, pair.1)
 
 # derive a child context that cancels after a timeout.
 pub fn with_timeout(parent: Context, ms: Int) -> (Context, CancelToken):
@@ -189,17 +176,16 @@ impl Context:
         return self.error_code() != 0
 
     fn error_code() -> Int:
-        return state_error_code(self.state)
+        return self.err.load()
 
     fn deadline() -> Int?:
-        at_ms := state_deadline(self.state)
-        if at_ms < 0:
+        if self.deadline_ms < 0:
             return none
-        return at_ms
+        return self.deadline_ms
 
 impl CancelToken:
     fn cancel():
-        mark_context(self.done_ch, self.state, 1)
+        mark_context(self.done_ch, self.err, 1)
 
 impl Ticker:
     fn channel() -> Channel[Int]:

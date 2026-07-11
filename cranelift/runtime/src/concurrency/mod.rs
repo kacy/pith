@@ -1,5 +1,6 @@
 //! Concurrency primitives: Task, Channel, Mutex, WaitGroup, Semaphore
 
+pub mod atomic_int;
 pub mod channel;
 pub mod mutex;
 pub mod semaphore;
@@ -7,6 +8,9 @@ pub mod task;
 pub mod waitgroup;
 
 // Re-export FFI functions for use by the codegen
+pub use atomic_int::{
+    pith_atomic_int_compare_set, pith_atomic_int_get, pith_atomic_int_new, pith_atomic_int_set,
+};
 pub use channel::{
     pith_channel_cap, pith_channel_close, pith_channel_is_closed, pith_channel_len,
     pith_channel_new, pith_channel_recv, pith_channel_send, pith_channel_try_recv,

@@ -831,12 +831,12 @@ fn normalized_chunk_size(chunk_size: Int) -> Int:
     return chunk_size
 
 fn context_blocking_error(ctx: Context) -> BlockingError:
-    if ctx.state.get_default("err", 0) == 2:
+    if ctx.error_code() == 2:
         return blocking_deadline_exceeded()
     return blocking_cancelled()
 
 fn context_wait_slice_ms(ctx: Context) -> Int:
-    deadline := ctx.state.get_default("deadline", -1)
+    deadline := ctx.deadline_ms
     if deadline < 0:
         return 10
     remaining := deadline - time.now()

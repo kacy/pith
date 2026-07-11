@@ -1,0 +1,32 @@
+# the atomic cell and the context mechanism it backs. run under memcheck
+# so a leak or a race in the shared cell shows up. the context state used
+# to be a map shared across tasks; it is an atomic int now, which is both
+# safe and what lets a spawned task hold it without tripping E248.
+import std.concurrent as conc
+import std.time as time
+
+fn main():
+    a := AtomicInt(10)
+    a.store(a.load() + 5)
+    print(a.load().to_string())
+    print(a.compare_set(15, 20).to_string())
+    print(a.compare_set(15, 99).to_string())
+    print(a.load().to_string())
+
+    root := conc.background()
+    mut cancelled := 0
+    mut i := 0
+    while i < 200:
+        pair := conc.with_cancel(root)
+        ctx := pair.0
+        token := pair.1
+        token.cancel()
+        if ctx.is_cancelled():
+            cancelled = cancelled + 1
+        i = i + 1
+    print(cancelled.to_string())
+
+    dpair := conc.with_deadline(root, time.now() + 3)
+    dctx := dpair.0
+    time.delay(15)
+    print(dctx.is_cancelled().to_string())

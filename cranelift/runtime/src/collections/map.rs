@@ -600,6 +600,45 @@ pub unsafe extern "C" fn pith_map_get_cstr_opt(map_handle: i64, key: *const i8) 
     }
 }
 
+/// Get an i64 value by C-string key. If the key is not present, prints a
+/// structured diagnostic to stderr and exits non-zero — the strict path
+/// for `map[k]`, replacing the old silent-zero behavior. Callers that
+/// want fallback behavior have `.get_default(k, d)` and `.get(k)`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_cstr_strict(map_handle: i64, key: *const i8) -> i64 {
+    if key.is_null() {
+        eprintln!("pith runtime error: map key not found: <null>");
+        std::process::exit(1);
+    }
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        eprintln!("pith runtime error: map indexing on invalid map handle");
+        std::process::exit(1);
+    };
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_STRING_GETS, 1);
+    let map_key = cstr_to_map_key(key);
+    match impl_ref.get(&map_key) {
+        Some(val_data) if val_data.len() >= 8 => {
+            i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]))
+        }
+        _ => {
+            let key_display = match &map_key {
+                MapKey::String(b) => format!("{:?}", String::from_utf8_lossy(b)),
+                MapKey::Int(n) => n.to_string(),
+            };
+            eprintln!(
+                "pith runtime error: map key not found: {} (use .contains_key first, .get(k) for Optional, or .get_default(k, d) for a fallback)",
+                key_display
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Check if a C-string key exists in the map. Returns 1 if present, 0 otherwise.
 ///
 /// # Safety
@@ -773,6 +812,43 @@ pub unsafe extern "C" fn pith_map_get_ikey_opt(map_handle: i64, key: i64) -> i64
                 i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8])),
             ),
             _ => optional_tuple(false, 0),
+        }
+    }
+}
+
+/// Strict integer-key lookup for `map[k]`. Aborts with a structured
+/// diagnostic on miss instead of returning a silent zero.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_ikey_strict(map_handle: i64, key: i64) -> i64 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        eprintln!("pith runtime error: map indexing on invalid map handle");
+        std::process::exit(1);
+    };
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_INT_GETS, 1);
+    let found = if impl_ref.uses_int_values8() {
+        crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
+        impl_ref.get_int_value(key)
+    } else {
+        crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
+        match impl_ref.get(&MapKey::Int(key)) {
+            Some(val_data) if val_data.len() >= 8 => Some(i64::from_le_bytes(
+                val_data[..8].try_into().unwrap_or([0u8; 8]),
+            )),
+            _ => None,
+        }
+    };
+    match found {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "pith runtime error: map key not found: {} (use .contains_key first, .get(k) for Optional, or .get_default(k, d) for a fallback)",
+                key
+            );
+            std::process::exit(1);
         }
     }
 }

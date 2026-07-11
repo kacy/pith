@@ -624,6 +624,38 @@ pub unsafe extern "C" fn pith_list_last_opt(list: PithList) -> i64 {
     optional_tuple(true, impl_ref.get_value_unchecked(impl_ref.len() - 1))
 }
 
+/// Strict pointer-sized indexed access for `list[i]`. Aborts with a
+/// structured diagnostic on out-of-bounds instead of returning a silent
+/// zero. Callers that want a checked shape have `.get(i)` (returns T?).
+///
+/// # Safety
+/// * `list` must be a valid `PithList` handle or all-zero.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_get_value_strict(list: PithList, index: i64) -> i64 {
+    let Some(impl_ref) = list_ref(list) else {
+        eprintln!("pith runtime error: list indexing on invalid list handle");
+        std::process::exit(1);
+    };
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_GETS, 1);
+    let len = impl_ref.len() as i64;
+    if index < 0 || index >= len {
+        eprintln!(
+            "pith runtime error: list index out of bounds: {} for list of length {} (use .get(i) for Optional access)",
+            index, len
+        );
+        std::process::exit(1);
+    }
+    if impl_ref.elem_size != 8 {
+        eprintln!(
+            "pith runtime error: list index requires 8-byte element (elem_size={})",
+            impl_ref.elem_size
+        );
+        std::process::exit(1);
+    }
+    impl_ref.get_value_unchecked(index as usize)
+}
+
 /// Get element at index for pointer-sized elements (returns i64 directly)
 /// Returns 0 if out of bounds or on error
 #[no_mangle]

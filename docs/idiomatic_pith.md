@@ -136,15 +136,30 @@ distinct outcomes — usually one or the other tells the whole story.
 
 ## safe access on containers
 
-`map[k]` and `list[i]` return the element type directly. If the key or
-index isn't there the runtime hands back a zero-shaped value that looks
-like real data — a `0` for `Map[String, Int]`, an empty `""` for
-`Map[String, String]`. That's fine when the invariant is "the value is
-there" (a table you just populated, a loop that already bounded `i`).
-It's a trap when the value might legitimately be zero-shaped.
+`map[k]`, `list[i]`, `s[i]`, and `bytes[i]` are the "I know it's there"
+form. If the key or index isn't there, the runtime prints a structured
+`pith runtime error: ...` and exits. That's the right behavior for
+tables you just populated, loops that already bounded `i`, and struct
+fields you invariantly initialized — a miss is a real bug and should
+crash loudly, not flow through as a zero.
 
-Reach for the `.get()` methods when a miss and a real zero are both
-plausible:
+Inside a `T!` function, `map[k]` and `list[i]` instead propagate the
+miss as `fail "index out of bounds"`, which the caller can `catch` or
+`unwrap_or`. So the same syntax means "assert" outside a Result context
+and "propagate" inside — no special operator required:
+
+```pith
+fn config_value(cfg: Map[String, Int], key: String) -> Int!:
+    return cfg[key]                              # propagates on miss
+
+fn main() -> Int!:
+    port := config_value(cfg, "PORT") catch 8080 # recover here
+    ...
+```
+
+When you want to _observe_ the miss without crashing or propagating —
+distinguishing "not present" from "present with value 0" — reach for
+the `.get()` methods, which return `T?`:
 
 ```pith
 count := stats.get("hits").unwrap_or(0)          # None -> 0, Some(0) -> 0
@@ -154,7 +169,12 @@ if hit != none:                                  #   Some means it was recorded,
 first := xs.first()                              # List[T] -> T?
 last := xs.last()                                # ditto
 peek := xs.get(i)                                # index-checked
+letter := s.get(i)                               # String -> String?
 ```
+
+Prefer `.get(k).unwrap_or(d)` over `Map.get_default(k, d)`. Both work,
+but the composed form is more general (chains with `.map`, `.and_then`,
+etc.) and reads left-to-right.
 
 `env.get(key)` returns `String?` — `Some(value)` when set (including
 empty string), `none` when unset.

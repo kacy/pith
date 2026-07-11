@@ -260,6 +260,84 @@ target: std_pipeline within ~1.5x of go (about 460ms). compile time is
 tracked too: `pith build bench/std_pipeline.pith` went 4.24s to 4.34s with
 opt_level=speed.
 
+## closure performance plan (open, july 2026)
+
+`bench/closure_error` put a number on the one workload the collection
+benchmarks never reach: closures are ~135x slower than go (407ms vs
+3ms for 200k iterations building and dropping ~400k closures). the
+error phase in the same benchmark is fine (2.5x go), so this section
+is about closures.
+
+**root cause, confirmed by reading the runtime.** a list validates a
+handle with `list_magic_ok` — read a magic tag from the object's own
+header, no lock (`collections/list.rs`). a closure validates with
+`handle_registry::is_valid`, which takes a global `Mutex<HashSet>`
+(`runtime_core.rs:354,361`). and it takes that lock on *every* closure
+operation: `new` registers, `retain`/`release` and every `get_fn` /
+`get_env` / `set_env` check validity, `release` at zero unregisters.
+the "drop per-access handle lock" row in the sprint table above did
+this for collections and bought 888ms on std_pipeline. closures were
+never converted. so the fix is not new design — it is finishing a
+migration that already happened for every other heap type.
+
+### stage A — closures onto a magic header (the win)
+
+give `PithClosure` a magic tag at offset 0, the same shape structs use
+(`STRUCT_MAGIC` / `struct_base`, `runtime_core.rs:1137,1146`). then:
+
+- `pith_closure_new` writes the tag instead of calling `register`
+- a `closure_base(handle)` helper null-checks, alignment-checks, and
+  reads the tag; every `is_valid(.., Closure)` call site uses it
+- `pith_closure_release` at its last count scrubs the tag (writes 0)
+  before `dealloc`, instead of calling `unregister` — a use-after-free
+  then reads a dead tag and returns the safe default, exactly as a
+  freed struct does
+- `HandleKind::Closure` and its registry calls come out
+
+nothing about the closure lifecycle changes — the ref count, the
+captured-slot release from #303, and the indirect-call abi all stay.
+only the *validity mechanism* moves off the lock.
+
+**risk.** the magic read dereferences the handle, where the registry
+check did not. closures only ever reach these functions from the
+checker's closure-typed path (a real box) or as 0 (null-guarded), the
+same risk profile lists and structs already accept. the scrub-on-free
+turns a stale handle into a safe miss rather than a wild call.
+
+**verify.** `bench/closure_error` is the measuring stick — closure_ms
+should fall from ~407 toward single or low-double digits. valgrind the
+churn (it must stay clean — the scrub is what makes a double-free or
+use-after-free impossible, not just unlikely). full suite + fixed
+point + seed, since the runtime `.a` relinks into every program.
+
+**expected result.** the lock is the dominant cost, so this should
+close most of the gap. a residual stays: pith heap-allocates a box per
+closure where go and rust can keep the environment on the stack or
+inline it. that is a separate, harder optimization (a closure arena or
+escape analysis) and only worth it if a real workload still shows the
+box allocation after the lock is gone.
+
+### stage B — the same lock on `AtomicInt` and the other primitives
+
+`AtomicInt` (added for thread-safe contexts) went onto the registry
+too, mirroring `Semaphore`. contexts are not a hot loop today, so it is
+not proven costly — but it is the identical one-line-per-callsite
+conversion and worth doing in the same pass. `Channel`, `Task`,
+`Process`, `Mutex`, `Semaphore`, `WaitGroup` also use the registry;
+most are created rarely, but channel send/recv could be hot in
+channel-heavy code and deserves a measurement before converting. the
+end state is that nothing validates a live handle through a global
+lock.
+
+### order and stopping rule
+
+stage A first and alone — it is the measured win, and its valgrind +
+suite pass is the gate for touching the others. stage B only where a
+benchmark shows the lock (a channel microbench for `Channel`, the
+context path for `AtomicInt`); do not convert a primitive just for
+symmetry without a number. the goal is `bench/closure_error` total
+from 543ms toward go's ~57ms, closures leading the drop.
+
 ## how to rerun
 
 ```
@@ -267,6 +345,10 @@ opt_level=speed.
 for i in 1 2 3 4 5; do ./bench/std_pipeline 50000; done   # take medians
 ./target/release/pith build bench/catalog_workload.pith
 for i in 1 2 3 4 5; do ./bench/catalog_workload 200000; done
+./target/release/pith build bench/closure_error.pith      # closures + error paths
+for i in 1 2 3 4 5; do ./bench/closure_error 200000; done
 ```
 
-go and rust counterparts build per `bench/README.md`.
+go and rust counterparts build per `bench/README.md`; `closure_error`
+builds with `go build -o bench/closure_error_go bench/closure_error.go`
+and `rustc -O bench/closure_error.rs -o bench/closure_error_rust`.

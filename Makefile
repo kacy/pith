@@ -703,7 +703,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_combo_closures tests/cases/test_combo_structs_deep \
 	tests/cases/test_generic_to_string tests/cases/test_map_int_string_buffered \
 	tests/cases/test_enum_payload_churn tests/cases/test_ownership_stress \
-	tests/cases/test_closure_lifecycle tests/cases/test_error_path_cleanup
+	tests/cases/test_closure_lifecycle tests/cases/test_error_path_cleanup \
+	tests/cases/test_atomic_context
 
 memcheck: build
 	@echo "--- memcheck (valgrind, curated) ---"

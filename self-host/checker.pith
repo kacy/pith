@@ -3797,6 +3797,17 @@ fn check_sync_primitive_method_call(type_name: String, method: String, args: Lis
         if method == "release":
             expect_no_arguments("Semaphore.release", args)
             return tid_void
+    if type_name == "AtomicInt":
+        tid_bool := lookup_type_id("Bool")
+        if method == "load":
+            expect_no_arguments("AtomicInt.load", args)
+            return tid_int
+        if method == "store":
+            expect_one_typed_argument("AtomicInt.store", args, tid_int, scope_id)
+            return tid_void
+        if method == "compare_set":
+            expect_two_typed_arguments("AtomicInt.compare_set", args, tid_int, tid_int, scope_id)
+            return tid_bool
     return tid_err
 
 fn check_channel_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
@@ -3884,6 +3895,13 @@ fn expect_one_typed_argument(method: String, args: List[Int], expected: Int, sco
         report_error("E207", method + " expects 1 argument, got " + args.len().to_string())
         return
     check_argument_type(args[0], expected, scope_id)
+
+fn expect_two_typed_arguments(method: String, args: List[Int], first: Int, second: Int, scope_id: Int):
+    if args.len() != 2:
+        report_error("E207", method + " expects 2 arguments, got " + args.len().to_string())
+        return
+    check_argument_type(args[0], first, scope_id)
+    check_argument_type(args[1], second, scope_id)
 
 fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
     arg_node := get_node(arg_idx)
@@ -4722,7 +4740,39 @@ fn check_spawn_expression(node: Node, scope_id: Int) -> Int:
     inner := c_check_expr(node.children[0], scope_id)
     if is_error_type(inner):
         return TID_ERR
+    check_spawn_shared_collections(inner_node)
     return add_type_info(ti_task(inner))
+
+# a spawned task runs on its own os thread. reference counts are atomic,
+# but a list, map, or set is an unsynchronized buffer behind a handle,
+# so handing one that this scope still holds to a task lets both threads
+# mutate the same buffer. a fresh collection (a literal, a copy, a call
+# result) is not shared and is fine — that is also the escape hatch. a
+# value meant to cross tasks belongs in a channel or an atomic cell.
+fn check_spawn_shared_collections(call_node: Node):
+    for child, i in call_node.children:
+        if i == 0:
+            continue
+        mut expr_idx := child
+        arg_node := get_node(child)
+        if arg_node.kind == "arg" and arg_node.children.len() > 0:
+            expr_idx = arg_node.children[0]
+        if spawn_arg_shares_collection(expr_idx):
+            kind := get_type_info(c_get_expr_type(expr_idx)).kind
+            report_error_with_fix_at(expr_idx, "E248", "a spawned task cannot take a " + kind + " this scope still holds; both threads would mutate the same buffer", "send it through a channel, or pass a copy (copy_" + kind + ")")
+
+# true when the argument names a collection some other scope keeps a
+# handle to: a variable, a struct field, or a container element. fresh
+# collections (literals, copies, call results) transfer cleanly.
+fn spawn_arg_shares_collection(expr_idx: Int) -> Bool:
+    node := get_node(expr_idx)
+    if node.kind != "ident" and node.kind != "field_access" and node.kind != "index":
+        return false
+    tid := c_get_expr_type(expr_idx)
+    if tid < 0:
+        return false
+    kind := get_type_info(tid).kind
+    return kind == "list" or kind == "map" or kind == "set"
 
 fn check_await_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:

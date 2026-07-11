@@ -28,6 +28,50 @@ pub fn ir_emit_optional_none_compare(result_reg: Int, op: String, optional_r: In
     else:
         ir_emit("neq " + result_reg.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
 
+# Structural equality between two Optionals of the same type. `opt_tid` is
+# the shared optional type id; used to pick the right value comparison
+# (String is content-compared, everything else falls back to i64 equality
+# which is what the bare type's `==` would do).
+#
+# Result semantics (for eq; neq negates):
+#   None == None       -> true
+#   Some(x) == Some(y) -> x == y
+#   Some/None mismatch -> false
+pub fn ir_emit_optional_optional_compare(result_reg: Int, op: String, left_r: Int, right_r: Int, opt_tid: Int):
+    info := get_type_info(opt_tid)
+    lf := ir_optional_flag_field(left_r)
+    rf := ir_optional_flag_field(right_r)
+    lv := ir_optional_value_field(left_r, opt_tid)
+    rv := ir_optional_value_field(right_r, opt_tid)
+
+    flag_eq := ir_reg()
+    ir_emit("eq " + flag_eq.to_string() + " " + lf.to_string() + " " + rf.to_string())
+
+    val_eq := ir_reg()
+    inner_kind := ir_type_from_tid(info.inner)
+    if inner_kind == "string":
+        str_eq_name := ir_runtime_call_name("__str_eq")
+        ir_emit("call " + val_eq.to_string() + " " + str_eq_name + " bool 2 " + lv.to_string() + " " + rv.to_string())
+    else:
+        ir_emit("eq " + val_eq.to_string() + " " + lv.to_string() + " " + rv.to_string())
+
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    both_none := ir_reg()
+    ir_emit("eq " + both_none.to_string() + " " + lf.to_string() + " " + zero_r.to_string())
+
+    tail := ir_reg()
+    ir_emit("or " + tail.to_string() + " " + both_none.to_string() + " " + val_eq.to_string())
+
+    if op == "eq":
+        ir_emit("and " + result_reg.to_string() + " " + flag_eq.to_string() + " " + tail.to_string())
+    else:
+        eq_result := ir_reg()
+        ir_emit("and " + eq_result.to_string() + " " + flag_eq.to_string() + " " + tail.to_string())
+        one_r := ir_reg()
+        ir_emit("iconst " + one_r.to_string() + " 1")
+        ir_emit("neq " + result_reg.to_string() + " " + eq_result.to_string() + " " + one_r.to_string())
+
 fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
     ir_emit("call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " 1 " + arg0.to_string())
 

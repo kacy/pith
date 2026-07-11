@@ -425,15 +425,6 @@ valid tokens (`1 € + 2`), so an invalid character can never be silently
 dropped.
 
 
-### E244 — named fields on generic structs
-
-named-field construction works for concrete structs only. construct a
-generic struct positionally.
-
-```
-error[E244]: Box: named fields are not yet supported for generic structs; use positional arguments
-```
-
 ### E245 — invalid if let / while let pattern
 
 `if let` and `while let` take a variant pattern (which destructures like a

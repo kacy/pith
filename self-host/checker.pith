@@ -2568,26 +2568,26 @@ fn unify_field_type_against_arg(field_node_idx: Int, arg_tid: Int, generic_param
                     unify_field_type_against_arg(c, arg_info.elements[i], generic_params, subst_map)
                 i = i + 1
 
+# the type of the value a named-field call gives to `fname`, or -1 when
+# the field is not named (it either has a default or the call is invalid,
+# and the concrete constructor check reports that precisely).
+fn named_arg_type_for_field(arg_indices: List[Int], fname: String, scope_id: Int) -> Int:
+    for ai in arg_indices:
+        an := get_node(ai)
+        if an.kind == "arg":
+            if strings_equal(an.value, fname):
+                if an.children.len() > 0:
+                    return c_check_expr(an.children[0], scope_id)
+    return - 1
+
 fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_id: Int) -> Int:
-    # named fields on a generic struct would have to be reordered before type
-    # inference runs; that path isn't wired up yet, so ask for positional args.
-    if struct_args_are_named(arg_indices):
-        report_error("E244", name + ": named fields are not yet supported for generic structs; use positional arguments")
-        return TID_ERR
     decl_idx := get_generic_declaration_index(name)
     decl_node := get_node(decl_idx)
     generic_params := collect_generic_parameter_names(decl_node)
-    # evaluate all argument types
-    mut arg_types: List[Int] := []
-    for ai in arg_indices:
-        arg_node := get_node(ai)
-        mut arg_expr := ai
-        if arg_node.kind == "arg":
-            if arg_node.children.len() > 0:
-                arg_expr = arg_node.children[0]
-        arg_types.push(c_check_expr(arg_expr, scope_id))
-    # collect field type nodes from the struct declaration
+    named := struct_args_are_named(arg_indices)
+    # collect field type nodes and names from the declaration, in order.
     mut field_type_nodes: List[Int] := []
+    mut field_names: List[String] := []
     for child in decl_node.children:
         cn := get_node(child)
         if cn.kind == "field":
@@ -2595,10 +2595,27 @@ fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_
                 field_type_nodes.push(cn.children[0])
             else:
                 field_type_nodes.push(-1)
-    # generic constructor calls can omit trailing fields with defaults.
-    if arg_types.len() > field_type_nodes.len():
-        report_error("E207", name + " expects at most " + field_type_nodes.len().to_string() + " fields, got " + arg_types.len().to_string())
-        return TID_ERR
+            field_names.push(extract_field_name(cn.value))
+    # evaluate argument types aligned to declaration field order, so the
+    # inference walk below lines up whether the call is positional or named.
+    # named args are matched to fields by name; an omitted (defaulted) field
+    # gets -1 and contributes nothing to inference.
+    mut arg_types: List[Int] := []
+    if named:
+        for fname in field_names:
+            arg_types.push(named_arg_type_for_field(arg_indices, fname, scope_id))
+    else:
+        for ai in arg_indices:
+            arg_node := get_node(ai)
+            mut arg_expr := ai
+            if arg_node.kind == "arg":
+                if arg_node.children.len() > 0:
+                    arg_expr = arg_node.children[0]
+            arg_types.push(c_check_expr(arg_expr, scope_id))
+        # generic constructor calls can omit trailing fields with defaults.
+        if arg_types.len() > field_type_nodes.len():
+            report_error("E207", name + " expects at most " + field_type_nodes.len().to_string() + " fields, got " + arg_types.len().to_string())
+            return TID_ERR
     # infer type args from argument types. We walk each field's declared type
     # node alongside the concrete arg type so containers like `List[T]` against
     # `List[Int]` infer T = Int.
@@ -2606,7 +2623,7 @@ fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_
     mut fidx := 0
     for ftn in field_type_nodes:
         if ftn >= 0:
-            if fidx < arg_types.len():
+            if fidx < arg_types.len() and arg_types[fidx] >= 0 and is_error_type(arg_types[fidx]) == false:
                 unify_field_type_against_arg(ftn, arg_types[fidx], generic_params, subst_map)
         fidx = fidx + 1
     # check interface bounds

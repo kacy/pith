@@ -7,10 +7,6 @@ something here that now works, the page is stale and a fix to it is welcome.
 
 ## language
 
-- **named struct construction for generic structs** — concrete structs support
-  named fields (`Point(x: 3, y: 4)`, any order, defaults may be omitted), but
-  generic structs like `Box[T]` still need positional arguments; the type
-  inference doesn't reorder named fields yet.
 - **match pattern gaps** — variant payloads construct and destructure
   (`Shape.Circle(2.0)`, `Shape.Circle(r) => r * r`, with literal sub-patterns,
   guards, and payload bindings inside or-patterns like

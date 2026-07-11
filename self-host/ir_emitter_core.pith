@@ -126,6 +126,12 @@ mut ir_module_count := 0 # increments per emit_ir call for unique naming
 # specialized symbol name. Read via ir_lookup_specialized_method.
 
 mut ir_current_func_optional_inner_kind := ""
+
+# True while emitting the body of a function that returns a Result (T! or
+# T!E). Used by the index expression codegen to decide whether `map[k]` /
+# `list[i]` should propagate a fail on miss (T! context) or fall through
+# to the loud-miss runtime (non-T! context).
+mut ir_current_func_returns_result := false
 # the impl block's target type, set while a method body is being emitted, so
 # `self.field = ...` knows what struct fields to look up
 mut ir_current_impl_type := ""
@@ -186,6 +192,7 @@ fn ir_reset_type_state():
     ir_import_declared_globals = {}
     ir_current_func_return_kind = ""
     ir_current_func_optional_inner_kind = ""
+    ir_current_func_returns_result = false
     ir_generic_decl_indices = {}
     ir_generic_decl_module_paths = {}
     ir_generic_specialization_keys = []
@@ -854,6 +861,7 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
     ret_type := ir_extract_return_type(idx)
     ir_prepare_func_emission(ret_type)
     ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
+    ir_current_func_returns_result = ir_fn_returns_result(idx)
     ir_current_impl_type = instance_type
     ir_current_impl_subst_params = params
     ir_current_impl_subst_args = arg_names
@@ -3641,6 +3649,11 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
         value_type = ir_lookup_map_value_type_for_expr(node.children[0])
     if value_type.len() == 0:
         value_type = ir_infer_type(idx)
+    # In a T! function, propagate on miss instead of aborting. Callers
+    # can `catch` or `unwrap_or` at their level. Outside T! context, the
+    # strict variants keep aborting cleanly.
+    if ir_current_func_returns_result and ir_index_supports_propagate(obj_type):
+        return ir_emit_index_expr_propagate(obj_r, idx_r, obj_type, value_type)
     call_name := ir_index_get_call_name(obj_type)
     if obj_type == "string":
         ir_emit_call2(r, call_name, "string", obj_r, idx_r)
@@ -3653,6 +3666,58 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     else:
         ir_emit_call2(r, call_name, ir_infer_type(idx), obj_r, idx_r)
     return r
+
+# True when obj_type has an `_opt` runtime we can dispatch to for
+# fail-propagate. Maps and lists ship the opt variants; string, bytes,
+# and set fall through to the strict runtime (they don't have _opt
+# accessors yet).
+fn ir_index_supports_propagate(obj_type: String) -> Bool:
+    if obj_type == "map":
+        return true
+    if obj_type == "map_int":
+        return true
+    if obj_type == "list":
+        return true
+    if obj_type == "list_string":
+        return true
+    return false
+
+# Emit `map[k]` / `list[i]` as a fail-propagate: call the _opt runtime,
+# branch on is_some, on none return the fail result tuple, on some
+# continue with the unwrapped value. Mirrors ir_emit_optional_unwrap.
+fn ir_emit_index_expr_propagate(obj_r: Int, idx_r: Int, obj_type: String, value_type: String) -> Int:
+    opt_name := ir_index_get_opt_call_name(obj_type)
+    opt_r := ir_reg()
+    ir_emit_call2(opt_r, opt_name, "tuple", obj_r, idx_r)
+    flag_r := ir_optional_flag_field(opt_r)
+    some_l := ir_label()
+    none_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
+    ir_emit_label(some_l)
+    mut val_kind := value_type
+    if val_kind.len() == 0:
+        val_kind = "unknown"
+    unwrapped_r := ir_reg()
+    ir_emit("field " + unwrapped_r.to_string() + " " + opt_r.to_string() + " 8 " + val_kind + " value")
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(none_l)
+    if ir_emit_tests and ir_emitting_test_func:
+        ir_test_assert_fail_return()
+    else:
+        msg := ir_str("index out of bounds")
+        err_r := ir_reg()
+        ir_emit("strref " + err_r.to_string() + " " + msg)
+        ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
+    ir_emit_label(merge_l)
+    return unwrapped_r
+
+fn ir_index_get_opt_call_name(obj_type: String) -> String:
+    if obj_type == "map":
+        return "map_get_opt"
+    if obj_type == "map_int":
+        return "map_get_ikey_opt"
+    return "pith_list_get_opt"
 
 fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     target := get_node(target_idx)
@@ -4601,6 +4666,20 @@ fn ir_extract_optional_inner_type(fn_idx: Int) -> String:
                     return ir_resolve_type_node(rn.children[0])
     return ""
 
+# True when the function declared at `fn_idx` returns a Result (T! or T!E).
+# Used to decide whether index-expression codegen should propagate a fail
+# on miss.
+fn ir_fn_returns_result(fn_idx: Int) -> Bool:
+    node := get_node(fn_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(returns_child)
+                if rn.kind == "result_type":
+                    return true
+    return false
+
 fn ir_lookup_impl_method_name(type_name: String, method_name: String) -> String:
     if type_name.len() == 0:
         return ""
@@ -4726,6 +4805,7 @@ fn ir_emit_generic_specialization(key: String):
         ir_active_generic_module_path = ""
     ir_prepare_func_emission(ret_type)
     ir_current_func_optional_inner_kind = ir_extract_optional_inner_type_with_subst(decl_idx, generic_params, concrete_types)
+    ir_current_func_returns_result = ir_fn_returns_result(decl_idx)
     ir_emit_func_header(spec_name, param_count, ret_type)
     ir_emit_fn_params_with_types(decl_idx, param_types)
     ir_func_returns.insert(spec_name, ret_type)
@@ -4883,6 +4963,7 @@ fn ir_func(idx: Int):
     ir_prepare_func_emission(ret_type)
     ir_current_arc_func = name
     ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
+    ir_current_func_returns_result = ir_fn_returns_result(idx)
     ir_emit_func_header(name, param_count, ret_type)
     ir_emit_fn_params(idx)
     ir_emit_string_prologue(body_idx)

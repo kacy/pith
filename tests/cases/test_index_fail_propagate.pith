@@ -1,0 +1,31 @@
+fn map_lookup(m: Map[String, Int], k: String) -> Int!:
+    return m[k]
+
+fn list_at(xs: List[Int], i: Int) -> Int!:
+    return xs[i]
+
+fn chain(m: Map[String, Int], k: String) -> Int!:
+    # In T! context, m[k] transparently propagates on miss.
+    v := m[k]
+    return v * 10
+
+fn main() -> Int!:
+    m: Map[String, Int] := {"a": 1, "b": 2, "zero": 0}
+    xs: List[Int] := [10, 20, 30]
+
+    # Hit case: valid access in a T! function returns the value.
+    print("hit_a:" + (map_lookup(m, "a") catch -1).to_string())
+    print("hit_zero:" + (map_lookup(m, "zero") catch -1).to_string())
+
+    # Miss case: propagates as fail, caught here.
+    print("miss:" + (map_lookup(m, "nope") catch -1).to_string())
+    print("miss_err_flag:" + map_lookup(m, "nope").is_err.to_string())
+
+    # List propagates too.
+    print("xs0:" + (list_at(xs, 0) catch -1).to_string())
+    print("xs_oob:" + (list_at(xs, 99) catch -1).to_string())
+    print("xs_neg:" + (list_at(xs, -1) catch -1).to_string())
+
+    # Chained `[]!` inside a T! caller: value flows normally when present.
+    print("chain_hit:" + (chain(m, "a") catch -1).to_string())
+    return 0

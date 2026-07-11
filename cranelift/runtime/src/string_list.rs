@@ -130,6 +130,28 @@ pub unsafe extern "C" fn pith_cstring_char_at(s: *const i8, index: i64) -> *mut 
     ptr
 }
 
+/// Strict indexed character access for `s[i]` on a String. Aborts with a
+/// structured diagnostic on out-of-bounds instead of returning silent "".
+/// Callers who want the checked shape have `.get(i)` (returns String?).
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_char_at_strict(s: *const i8, index: i64) -> *mut i8 {
+    let Some(bytes) = cstr_bytes(s) else {
+        eprintln!("pith runtime error: string indexing on invalid string handle");
+        std::process::exit(1);
+    };
+    let len = bytes.len() as i64;
+    if index < 0 || index >= len {
+        eprintln!(
+            "pith runtime error: string index out of bounds: {} for string of length {} (use .get(i) for Optional access)",
+            index, len
+        );
+        std::process::exit(1);
+    }
+    let ptr = crate::pith_alloc_cstring(1);
+    *ptr = bytes[index as usize] as i8;
+    ptr
+}
+
 /// Get a single character at index wrapped in an Optional tuple. Returns
 /// `Some(char_string)` when `0 <= index < len`, and `None` otherwise —
 /// callers of `s.get(i)` can distinguish an out-of-bounds miss from an

@@ -1,0 +1,30 @@
+import std.bytes as bytes
+
+fn main() -> Int!:
+    s := "hello"
+    # Valid indexing still works.
+    print("s0:" + s[0])
+    print("s4:" + s[4])
+    print("s_ord:" + ord(s[1]).to_string())
+
+    # Guarded access via short-circuit — s[99] never evaluates.
+    if s.len() > 99 and s[99] == "x":
+        print("unexpected")
+    else:
+        print("guard_ok")
+
+    # Safe access via .get().
+    print("get_miss:" + (s.get(99) == none).to_string())
+    print("get_hit:" + s.get(0).unwrap_or("MISS"))
+
+    # bytes[i]: valid access.
+    b := bytes.from_string_utf8("hi")
+    print("b0:" + b[0].to_string())
+    print("b1:" + b[1].to_string())
+
+    # bytes guard.
+    if b.len() > 99 and b[99] == 0:
+        print("unexpected")
+    else:
+        print("bguard_ok")
+    return 0

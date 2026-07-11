@@ -155,6 +155,25 @@ pub unsafe extern "C" fn pith_bytes_get(handle: i64, idx: i64) -> i64 {
     bytes.data.get(idx as usize).copied().unwrap_or(0) as i64
 }
 
+/// Strict indexed byte access for `bytes[i]`. Aborts with a structured
+/// diagnostic on out-of-bounds instead of returning silent 0.
+#[no_mangle]
+pub unsafe extern "C" fn pith_bytes_get_strict(handle: i64, idx: i64) -> i64 {
+    let Some(bytes) = pith_bytes_ref(handle) else {
+        eprintln!("pith runtime error: bytes indexing on invalid bytes handle");
+        std::process::exit(1);
+    };
+    let len = bytes.data.len() as i64;
+    if idx < 0 || idx >= len {
+        eprintln!(
+            "pith runtime error: bytes index out of bounds: {} for bytes of length {}",
+            idx, len
+        );
+        std::process::exit(1);
+    }
+    bytes.data[idx as usize] as i64
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_slice(handle: i64, start: i64, end: i64) -> i64 {
     let Some(bytes) = pith_bytes_ref(handle) else {

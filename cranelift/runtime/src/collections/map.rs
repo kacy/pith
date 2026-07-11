@@ -5,6 +5,7 @@
 
 use crate::collections::list::PithList;
 use crate::handle_registry::{self, HandleKind};
+use crate::runtime_core::optional_tuple;
 use hashbrown::HashMap;
 use std::hash::{Hash, Hasher};
 /// FFI-compatible map handle
@@ -572,6 +573,33 @@ pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i
     }
 }
 
+/// Get an i64 value by C-string key, wrapped in an Optional tuple. Returns
+/// `Some(value)` when the key is present and `None` otherwise — so callers
+/// can distinguish "not present" from a legitimately-stored `0`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_cstr_opt(map_handle: i64, key: *const i8) -> i64 {
+    if key.is_null() {
+        return optional_tuple(false, 0);
+    }
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        return optional_tuple(false, 0);
+    };
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_STRING_GETS, 1);
+    let map_key = cstr_to_map_key(key);
+    match impl_ref.get(&map_key) {
+        Some(val_data) if val_data.len() >= 8 => optional_tuple(
+            true,
+            i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8])),
+        ),
+        _ => optional_tuple(false, 0),
+    }
+}
+
 /// Check if a C-string key exists in the map. Returns 1 if present, 0 otherwise.
 ///
 /// # Safety
@@ -715,6 +743,36 @@ pub unsafe extern "C" fn pith_map_get_ikey(map_handle: i64, key: i64) -> i64 {
                 i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8]))
             }
             _ => 0,
+        }
+    }
+}
+
+/// Get an i64 value by integer key, wrapped in an Optional tuple. Returns
+/// `Some(value)` when the key is present and `None` otherwise.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_ikey_opt(map_handle: i64, key: i64) -> i64 {
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        return optional_tuple(false, 0);
+    };
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_MAP_INT_GETS, 1);
+    if impl_ref.uses_int_values8() {
+        crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
+        match impl_ref.get_int_value(key) {
+            Some(v) => optional_tuple(true, v),
+            None => optional_tuple(false, 0),
+        }
+    } else {
+        crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
+        match impl_ref.get(&MapKey::Int(key)) {
+            Some(val_data) if val_data.len() >= 8 => optional_tuple(
+                true,
+                i64::from_le_bytes(val_data[..8].try_into().unwrap_or([0u8; 8])),
+            ),
+            _ => optional_tuple(false, 0),
         }
     }
 }

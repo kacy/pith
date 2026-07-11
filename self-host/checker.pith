@@ -1018,6 +1018,24 @@ fn check_statement(node_idx: Int, scope_id: Int):
 # binding statement
 # ---------------------------------------------------------------
 
+# True when both types are Optional wrappings of the same inner type. Type
+# interning duplicates `T?` on every annotation site (add_type_info doesn't
+# dedupe), so `mut a: Int? := 5; mut b: Int? := 5` gives `a` and `b`
+# different tids even though the shape is identical. Used to let == and !=
+# pass structural check when both sides are the same Optional.
+fn optional_types_match(a: Int, b: Int) -> Bool:
+    if a < 0 or b < 0:
+        return false
+    a_info := get_type_info(a)
+    b_info := get_type_info(b)
+    if a_info.kind != "optional" or b_info.kind != "optional":
+        return false
+    if a_info.inner < 0 or b_info.inner < 0:
+        return false
+    if a_info.inner == b_info.inner:
+        return true
+    return types_structurally_equal(a_info.inner, b_info.inner)
+
 fn value_matches_optional_target(value_idx: Int, actual_tid: Int, expected_tid: Int) -> Bool:
     if expected_tid < 0:
         return false
@@ -1766,12 +1784,12 @@ fn check_binary_expression(node: Node, scope_id: Int) -> Int:
 
     # comparison operators: eq, neq
     if op == "eq":
-        if left != right:
+        if left != right and optional_types_match(left, right) == false:
             report_error("E217", "operator == type mismatch: " + get_type_name(left) + " vs " + get_type_name(right))
             return TID_ERR
         return tid_bool
     if op == "neq":
-        if left != right:
+        if left != right and optional_types_match(left, right) == false:
             report_error("E217", "operator != type mismatch: " + get_type_name(left) + " vs " + get_type_name(right))
             return TID_ERR
         return tid_bool
@@ -3701,6 +3719,15 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
         return check_list_filter_method(info, args, scope_id)
     if method == "reduce":
         return check_list_reduce_method(info, args, scope_id)
+    if method == "get":
+        expect_one_typed_argument(method, args, tid_int, scope_id)
+        return add_type_info(ti_optional(elem))
+    if method == "first":
+        expect_no_arguments(method, args)
+        return add_type_info(ti_optional(elem))
+    if method == "last":
+        expect_no_arguments(method, args)
+        return add_type_info(ti_optional(elem))
     # not a built-in list method
     return - 1
 
@@ -3734,6 +3761,9 @@ fn check_map_method_call(method: String, info: TypeInfo, args: List[Int], scope_
     if method == "contains_key":
         expect_one_typed_argument(method, args, key_t, scope_id)
         return tid_bool
+    if method == "get":
+        expect_one_typed_argument(method, args, key_t, scope_id)
+        return add_type_info(ti_optional(val_t))
     if method == "get_default":
         if args.len() != 2:
             report_error("E207", "get_default expects 2 arguments, got " + args.len().to_string())

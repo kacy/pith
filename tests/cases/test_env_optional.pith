@@ -1,0 +1,22 @@
+import std.env as env
+import std.os as os
+
+fn main() -> Int!:
+    unset_key := "PITH_STD_ENV_TEST_UNSET"
+    set_key := "PITH_STD_ENV_TEST_SET"
+    os.unset_env(unset_key)
+    os.unset_env(set_key)
+
+    print("unset_none:" + (env.get(unset_key) == none).to_string())
+
+    os.set_env(set_key, "hello")
+    print("set_present:" + (env.get(set_key) != none).to_string())
+    print("set_value:" + env.get(set_key).unwrap_or(""))
+
+    os.set_env(set_key, "")
+    print("empty_present:" + (env.get(set_key) != none).to_string())
+    print("empty_value:[" + env.get(set_key).unwrap_or("MISS") + "]")
+
+    os.unset_env(set_key)
+    print("after_unset_none:" + (env.get(set_key) == none).to_string())
+    return 0

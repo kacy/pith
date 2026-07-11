@@ -4,6 +4,7 @@
 //! but presents FFI-compatible interface matching the C runtime.
 
 use crate::handle_registry::{self, HandleKind};
+use crate::runtime_core::optional_tuple;
 /// FFI-compatible list handle
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -563,6 +564,64 @@ pub unsafe extern "C" fn pith_list_pop(list: *mut PithList, elem_size: i64, out:
         }
         None => false,
     }
+}
+
+/// Get element at index wrapped in an Optional tuple. Returns `Some(value)`
+/// when `0 <= index < len`, and `None` otherwise — so callers can
+/// distinguish an out-of-bounds miss from a legitimately stored `0`.
+///
+/// # Safety
+/// * `list` must be a valid `PithList` handle or all-zero.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_get_opt(list: PithList, index: i64) -> i64 {
+    let Some(impl_ref) = list_ref(list) else {
+        return optional_tuple(false, 0);
+    };
+    if index < 0 || index >= impl_ref.len() as i64 {
+        return optional_tuple(false, 0);
+    }
+    if impl_ref.elem_size != 8 {
+        return optional_tuple(false, 0);
+    }
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_GETS, 1);
+    optional_tuple(true, impl_ref.get_value_unchecked(index as usize))
+}
+
+/// Return the first element of the list wrapped in an Optional tuple, or
+/// `None` when the list is empty.
+///
+/// # Safety
+/// * `list` must be a valid `PithList` handle or all-zero.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_first_opt(list: PithList) -> i64 {
+    let Some(impl_ref) = list_ref(list) else {
+        return optional_tuple(false, 0);
+    };
+    if impl_ref.len() == 0 || impl_ref.elem_size != 8 {
+        return optional_tuple(false, 0);
+    }
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_GETS, 1);
+    optional_tuple(true, impl_ref.get_value_unchecked(0))
+}
+
+/// Return the last element of the list wrapped in an Optional tuple, or
+/// `None` when the list is empty.
+///
+/// # Safety
+/// * `list` must be a valid `PithList` handle or all-zero.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_last_opt(list: PithList) -> i64 {
+    let Some(impl_ref) = list_ref(list) else {
+        return optional_tuple(false, 0);
+    };
+    if impl_ref.len() == 0 || impl_ref.elem_size != 8 {
+        return optional_tuple(false, 0);
+    }
+    crate::ensure_perf_stats_registered();
+    crate::perf_count(&crate::PERF_LIST_GETS, 1);
+    optional_tuple(true, impl_ref.get_value_unchecked(impl_ref.len() - 1))
 }
 
 /// Get element at index for pointer-sized elements (returns i64 directly)

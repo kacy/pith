@@ -134,6 +134,35 @@ Rule of thumb: if the caller would write `if x == none: ...` more often than
 Don't double-wrap (`T?!` or `T!?`) unless absence and failure are genuinely
 distinct outcomes — usually one or the other tells the whole story.
 
+## safe access on containers
+
+`map[k]` and `list[i]` return the element type directly. If the key or
+index isn't there the runtime hands back a zero-shaped value that looks
+like real data — a `0` for `Map[String, Int]`, an empty `""` for
+`Map[String, String]`. That's fine when the invariant is "the value is
+there" (a table you just populated, a loop that already bounded `i`).
+It's a trap when the value might legitimately be zero-shaped.
+
+Reach for the `.get()` methods when a miss and a real zero are both
+plausible:
+
+```pith
+count := stats.get("hits").unwrap_or(0)          # None -> 0, Some(0) -> 0
+hit := stats.get("hits")                         # distinguishes the two:
+if hit != none:                                  #   Some means it was recorded,
+    record(hit?)                                 #   none means missing
+first := xs.first()                              # List[T] -> T?
+last := xs.last()                                # ditto
+peek := xs.get(i)                                # index-checked
+```
+
+`env.get(key)` returns `String?` — `Some(value)` when set (including
+empty string), `none` when unset.
+
+The same rule applies to iterators (`std.iter.next() -> T?`) and channel
+receives (`Channel[T].recv() -> T?`): the safe-access surface uses `T?`,
+the assertion surface uses direct dereference.
+
 Write colocated `test` declarations for stdlib behavior. Use
 `std.testing.assert_eq` and `assert_ne` for normal comparisons, and keep golden
 stdout examples for end-to-end behavior.

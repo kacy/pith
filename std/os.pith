@@ -21,8 +21,8 @@ pub fn temp_dir() -> String:
 pub fn home_dir() -> String:
     return os_home_dir()
 
-# read an environment variable.
-pub fn get_env(name: String) -> String:
+# read an environment variable. returns none when the variable is not set.
+pub fn get_env(name: String) -> String?:
     return env.get(name)
 
 # set an environment variable.
@@ -42,7 +42,7 @@ pub fn which(program: String) -> String:
             return program
         return ""
 
-    search_path := env.get("PATH")
+    search_path := env.get("PATH").unwrap_or("")
     if search_path == "":
         return ""
 
@@ -63,8 +63,8 @@ test "os can set and unset environment variables":
     key := "PITH_STD_OS_TEST_KEY"
     unset_env(key)
 
-    assert_eq(get_env(key), "")
+    assert(get_env(key) == none)
     assert(set_env(key, "value"))
-    assert_eq(get_env(key), "value")
+    assert_eq(get_env(key).unwrap_or(""), "value")
     assert(unset_env(key))
-    assert_eq(get_env(key), "")
+    assert(get_env(key) == none)

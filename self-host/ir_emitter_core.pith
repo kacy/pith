@@ -2422,6 +2422,7 @@ fn ir_method_call_arg_expr(node: Node, arg_index: Int) -> Int:
 
 fn ir_emit_result_unwrap_or(node: Node) -> Int:
     recv_r := ir_expr(node.children[0])
+    recv_tid := c_get_expr_type(node.children[0])
     cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
     temp_name := ir_new_temp_name("unwrap_or")
     arg_idx := ir_method_call_arg_expr(node, 0)
@@ -2431,9 +2432,13 @@ fn ir_emit_result_unwrap_or(node: Node) -> Int:
     merge_l := ir_label()
     ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
     ir_emit_label(ok_l)
-    ir_emit("store " + temp_name + " " + ir_emit_result_value_field(recv_r, c_get_expr_type(node.children[0]), "ok").to_string())
+    ok_value_r := ir_emit_result_value_field(recv_r, recv_tid, "ok")
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
+    ir_emit("store " + temp_name + " " + ok_value_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(fallback_l)
+    ir_emit_release_result_error(recv_r, recv_tid)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
     ir_emit("store " + temp_name + " " + fallback_r.to_string())
     ir_emit_label(merge_l)
     r := ir_reg()
@@ -2516,6 +2521,7 @@ fn ir_emit_named_handler_call(handler_idx: Int, arg_r: Int, ret_type: String) ->
 
 fn ir_emit_result_or_else(idx: Int, node: Node) -> Int:
     recv_r := ir_expr(node.children[0])
+    recv_tid := c_get_expr_type(node.children[0])
     cond_r := ir_emit_result_flag_field(recv_r, "is_ok")
     temp_name := ir_new_temp_name("or_else")
     ir_var_types.insert(temp_name, "tuple")
@@ -2528,8 +2534,12 @@ fn ir_emit_result_or_else(idx: Int, node: Node) -> Int:
     ir_emit("store " + temp_name + " " + recv_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(err_l)
-    err_r := ir_emit_result_value_field(recv_r, c_get_expr_type(node.children[0]), "err")
+    err_r := ir_emit_result_value_field(recv_r, recv_tid, "err")
     handled_r := ir_emit_named_handler_call(handler_idx, err_r, ir_checked_type(idx))
+    # the handler borrowed the error; the original result is spent now,
+    # so drop the error value and the tuple shell before continuing
+    ir_emit_release_result_error(recv_r, recv_tid)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
     ir_emit("store " + temp_name + " " + handled_r.to_string())
     ir_emit_label(merge_l)
     r := ir_reg()
@@ -3361,6 +3371,10 @@ fn ir_emit_try_expr(node: Node) -> Int:
             if ir_emit_tests and ir_emitting_test_func:
                 ir_test_assert_fail_return()
             else:
+                # propagating the error out early skips the normal return,
+                # so release the function's owned locals here too; the error
+                # tuple being returned is a fresh value, not a tracked local
+                ir_emit_string_cleanup("")
                 ir_emit("ret " + val_r.to_string())
             ir_emit_label(merge_l)
             return decoded_r
@@ -3386,6 +3400,7 @@ fn ir_emit_try_expr(node: Node) -> Int:
         if ir_emit_tests and ir_emitting_test_func:
             ir_test_assert_fail_return()
         else:
+            ir_emit_string_cleanup("")
             zero := ir_reg()
             ir_emit("iconst " + zero.to_string() + " 0")
             ir_emit("ret " + zero.to_string())
@@ -3398,8 +3413,24 @@ fn ir_emit_try_expr(node: Node) -> Int:
 fn ir_emit_fail_expr(node: Node) -> Int:
     if node.children.len() > 0:
         err_r := ir_expr(node.children[0])
-        ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
+        # the error value transfers to the caller the same way a normal
+        # return's value does: a returned local is skipped in cleanup, a
+        # returned borrow gets a fresh count. the result tuple only borrows
+        # the error slot, so without this the function's other owned locals
+        # leaked on every fail (cleanup ran only on the normal return).
+        mut exclude := ""
+        expr_node := get_node(node.children[0])
+        err_kind := ir_rc_kind(ir_infer_type(node.children[0]))
+        if err_kind.len() > 0:
+            if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == err_kind:
+                exclude = expr_node.value
+            elif ir_string_expr_is_borrowed(node.children[0]):
+                ir_rc_retain_reg(err_r, err_kind)
+        tuple_r := ir_emit_err_result_tuple(err_r)
+        ir_emit_string_cleanup(exclude)
+        ir_emit("ret " + tuple_r.to_string())
     else:
+        ir_emit_string_cleanup("")
         ir_emit("ret " + ir_emit_err_result_tuple(ir_zero_reg()).to_string())
     ub := ir_label()
     ir_emit_label(ub)
@@ -3521,8 +3552,19 @@ fn ir_emit_await_expr(node: Node) -> Int:
     ir_emit_call1(r, "await", "unknown", task_r)
     return r
 
+# release a result's error value when it is being discarded. the result
+# tuple is a shell with no destructor, so releasing the tuple frees only
+# its three slots — a heap error value (a string message, a struct error)
+# would leak unless dropped here first.
+fn ir_emit_release_result_error(result_r: Int, result_tid: Int):
+    err_kind := ir_rc_kind(ir_result_field_kind(result_tid, "err"))
+    if err_kind.len() > 0:
+        err_r := ir_emit_result_value_field(result_r, result_tid, "err")
+        ir_rc_release_reg(err_r, err_kind)
+
 fn ir_emit_catch_expr(node: Node) -> Int:
     result_r := ir_expr(node.children[0])
+    result_tid := c_get_expr_type(node.children[0])
     cond_r := ir_emit_result_flag_field(result_r, "is_ok")
     temp_name := ir_new_temp_name("catch")
     ok_l := ir_label()
@@ -3530,11 +3572,13 @@ fn ir_emit_catch_expr(node: Node) -> Int:
     merge_l := ir_label()
     ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + fallback_l)
     ir_emit_label(ok_l)
-    ok_value_r := ir_emit_result_value_field(result_r, c_get_expr_type(node.children[0]), "ok")
+    ok_value_r := ir_emit_result_value_field(result_r, result_tid, "ok")
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
     ir_emit("store " + temp_name + " " + ok_value_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(fallback_l)
+    # the error is being thrown away for the fallback value; drop it first
+    ir_emit_release_result_error(result_r, result_tid)
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
     ir_emit("store " + temp_name + " " + ir_expr(node.children[1]).to_string())
     ir_emit_label(merge_l)

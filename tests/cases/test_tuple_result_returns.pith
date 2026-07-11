@@ -1,0 +1,45 @@
+# tuple-typed result returns, plus the tuple ownership they lean on:
+# a fallible function can return a tuple, and tuples that hold heap
+# values release those values when the tuple dies (valgrind-gated in
+# MEMCHECK_CASES).
+
+fn divmod(a: Int, b: Int) -> (Int, Int)!:
+    if b == 0:
+        fail "divide by zero"
+    return (a / b, a % b)
+
+# a mixed-type tuple inner, reached through `!` propagation
+fn labeled(a: Int, b: Int) -> (Int, String)!:
+    q := divmod(a, b)!
+    return (q.0, "ok")
+
+# a tuple holding a freshly built heap string, plus a nested tuple
+fn described(n: Int) -> (String, Int):
+    return ("value-" + n.to_string(), n * n)
+
+fn main() -> Int:
+    r := divmod(17, 5) catch (0, 0)
+    print("divmod " + r.0.to_string() + " " + r.1.to_string())
+
+    bad := divmod(1, 0) catch (0 - 1, 0 - 1)
+    print("caught " + bad.0.to_string())
+
+    lab := labeled(20, 3) catch (0, "err")
+    print("labeled " + lab.0.to_string() + " " + lab.1)
+
+    labfail := labeled(20, 0) catch (0, "err")
+    print("labeled-fail " + labfail.1)
+
+    d := described(7)
+    print("described " + d.0 + " " + d.1.to_string())
+
+    # churn a tuple with a heap element in a loop to exercise the
+    # per-iteration alloc/free of the element cascade
+    mut total := 0
+    mut i := 0
+    while i < 50:
+        t := described(i)
+        total = total + t.1 + t.0.len()
+        i = i + 1
+    print("churn " + total.to_string())
+    return 0

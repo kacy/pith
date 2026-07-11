@@ -108,6 +108,7 @@ mut ir_rc_local_kinds: List[String] := []
 
 mut ir_local_struct_names: List[String] := [] # structs declared by this module
 mut ir_dtor_memo: Map[String, Int] := {} # 1 needs dtor, 2 no/undecided
+mut ir_tuple_dtor_sigs: List[String] := [] # rc-element signatures seen this module
 
 mut ir_func_result_ok_kinds: Map[String, String] := {}
 mut ir_named_fn_value_wrappers: Map[String, String] := {}
@@ -169,6 +170,7 @@ fn ir_reset_global_state():
 fn ir_reset_type_state():
     ir_local_struct_names = []
     ir_dtor_memo = {}
+    ir_tuple_dtor_sigs = []
     ir_struct_names.clear()
     ir_struct_field_lookup.clear()
     ir_struct_field_index_lookup.clear()
@@ -431,7 +433,7 @@ fn ir_rc_retain_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_set_retain_handle", "void", r)
     elif kind == "bytes":
         ir_emit_call1(ir_reg(), "pith_bytes_retain", "void", r)
-    elif kind == "struct":
+    elif kind == "struct" or kind == "tuple":
         ir_emit_call1(ir_reg(), "pith_struct_retain", "void", r)
     elif kind == "closure":
         ir_emit_call1(ir_reg(), "pith_closure_retain", "void", r)
@@ -447,7 +449,7 @@ fn ir_rc_release_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_set_release_handle", "void", r)
     elif kind == "bytes":
         ir_emit_call1(ir_reg(), "pith_bytes_release", "void", r)
-    elif kind == "struct":
+    elif kind == "struct" or kind == "tuple":
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
     elif kind == "closure":
         ir_emit_call1(ir_reg(), "pith_closure_release", "void", r)
@@ -519,6 +521,10 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
         return false
     if node.kind == "struct_init":
         return false
+    # a tuple literal mints a fresh struct:tuple allocation with its own
+    # count, the same as a struct_init.
+    if node.kind == "tuple":
+        return false
     # a lambda mints a fresh closure with its own count; returning or
     # binding it transfers that count rather than borrowing one.
     if node.kind == "lambda":
@@ -527,7 +533,7 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
         return false
     if node.kind == "call" or node.kind == "method_call":
         expr_kind := ir_rc_kind(ir_infer_type(idx))
-        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes" or expr_kind == "struct" or expr_kind == "closure":
+        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes" or expr_kind == "struct" or expr_kind == "closure" or expr_kind == "tuple":
             return false
     if node.kind == "method_call":
         return not ir_string_method_returns_fresh(ir_plain_method_name(node.value))
@@ -2254,9 +2260,84 @@ fn ir_emit_tuple_literal_stores(tuple_r: Int, elem_regs: List[Int], elem_nodes: 
     for elem_reg, i in elem_regs:
         if i < elem_nodes.len():
             tuple_kind := ir_rc_kind(ir_infer_type(elem_nodes[i]))
-            if tuple_kind.len() > 0:
+            # a fresh element transfers its count into the tuple; only a
+            # borrow needs a retain, mirroring struct construction. the
+            # tuple's destructor releases the slot on free either way.
+            if tuple_kind.len() > 0 and ir_string_expr_is_borrowed(elem_nodes[i]):
                 ir_rc_retain_reg(elem_reg, tuple_kind)
         ir_emit("sstore " + tuple_r.to_string() + " " + i.to_string() + " " + elem_reg.to_string())
+
+# one letter per element kind, so a tuple type maps to a short signature
+# ("s0" is (String, Int)). the destructor for a signature releases just
+# its rc slots; two tuples with the same signature share one destructor.
+fn ir_tuple_elem_code(kind: String) -> String:
+    if kind == "string":
+        return "s"
+    if kind == "list":
+        return "l"
+    if kind == "map":
+        return "m"
+    if kind == "set":
+        return "t"
+    if kind == "bytes":
+        return "b"
+    if kind == "struct":
+        return "u"
+    if kind == "closure":
+        return "c"
+    if kind == "tuple":
+        return "p"
+    return "0"
+
+fn ir_tuple_dtor_code_kind(code: String) -> String:
+    if code == "s":
+        return "string"
+    if code == "l":
+        return "list"
+    if code == "m":
+        return "map"
+    if code == "t":
+        return "set"
+    if code == "b":
+        return "bytes"
+    if code == "u":
+        return "struct"
+    if code == "c":
+        return "closure"
+    if code == "p":
+        return "tuple"
+    return ""
+
+fn ir_tuple_dtor_signature(elem_nodes: List[Int]) -> String:
+    mut sig := ""
+    for child in elem_nodes:
+        sig = sig + ir_tuple_elem_code(ir_rc_kind(ir_infer_type(child)))
+    return sig
+
+# module-suffixed so each module carries its own copy, exactly like the
+# struct destructors — no cross-module references, no name clashes.
+fn ir_tuple_dtor_name(sig: String) -> String:
+    return "__tuple_dtor_" + sig + "_m" + ir_module_count.to_string()
+
+fn ir_tuple_sig_has_rc(sig: String) -> Bool:
+    mut i := 0
+    while i < sig.len():
+        if sig.substring(i, i + 1) != "0":
+            return true
+        i = i + 1
+    return false
+
+# attach the shared destructor when a tuple holds any rc element; an
+# all-scalar tuple needs none (its box frees with no cascade).
+fn ir_emit_attach_tuple_dtor(tuple_r: Int, elem_nodes: List[Int]):
+    sig := ir_tuple_dtor_signature(elem_nodes)
+    if not ir_tuple_sig_has_rc(sig):
+        return
+    if not ir_tuple_dtor_sigs.contains(sig):
+        ir_tuple_dtor_sigs.push(sig)
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " " + ir_tuple_dtor_name(sig))
+    ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + tuple_r.to_string() + " " + fr.to_string())
 
 fn ir_emit_tuple_literal(node: Node) -> Int:
     mut elem_regs: List[Int] := []
@@ -2269,6 +2350,7 @@ fn ir_emit_tuple_literal(node: Node) -> Int:
     ir_emit("iconst " + nf.to_string() + " " + elem_regs.len().to_string())
     ir_emit_call1(r, "__struct_alloc", "struct:tuple", nf)
     ir_emit_tuple_literal_stores(r, elem_regs, elem_nodes)
+    ir_emit_attach_tuple_dtor(r, elem_nodes)
     return r
 
 fn ir_field_lookup_key(recv_idx: Int, field_name: String) -> String:
@@ -4830,6 +4912,29 @@ fn ir_emit_struct_dtors():
 # one equality helper per boxed enum: same pointer or same tag with
 # equal payloads. string payloads compare by content and nested boxed
 # enums recurse; struct payloads keep pointer identity.
+# one destructor per rc-bearing tuple signature seen in this module.
+# emitted after the bodies, since tuple shapes are only discovered at
+# their literal sites. mirrors ir_emit_struct_dtors, keyed by the
+# structural signature instead of a declared name.
+fn ir_emit_tuple_dtors():
+    for sig in ir_tuple_dtor_sigs:
+        ir_emit_func_header(ir_tuple_dtor_name(sig), 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        mut i := 0
+        while i < sig.len():
+            kind := ir_tuple_dtor_code_kind(sig.substring(i, i + 1))
+            if kind.len() > 0:
+                fr := ir_reg()
+                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown __tuple_" + i.to_string())
+                ir_rc_release_reg(fr, kind)
+            i = i + 1
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
 fn ir_emit_enum_eq_fns():
     for ename in ir_boxed_enums.keys():
         if not ir_enum_variant_lists.contains_key(ename):
@@ -5053,6 +5158,9 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # FilterIter[Range, Int].next)
     ir_preregister_all_impl_specializations(root_idx, root)
     ir_emit_top_level_items(root_idx, root)
+    # tuple destructors last: their shapes are only known once every
+    # tuple literal in the module body has been emitted.
+    ir_emit_tuple_dtors()
     ir_emit_generic_specializations()
     ir_append_lambda_bodies()
 

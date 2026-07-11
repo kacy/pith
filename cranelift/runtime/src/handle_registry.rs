@@ -15,7 +15,6 @@ pub(crate) fn plausibly_aligned<T>(ptr: *const ()) -> bool {
 pub(crate) enum HandleKind {
     AtomicInt,
     Channel,
-    Closure,
     List,
     Map,
     Mutex,

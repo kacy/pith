@@ -70,28 +70,32 @@ and functions that fail with a heap error, propagate it up with `!`,
 and get handled with catch and unwrap_or. 200k iterations, medians of
 5 (checksums match across all three, so the work is equivalent):
 
-| phase | go | rust | pith |
-|---|---|---|---|
-| closures | 3 | 0 | **407** |
-| errors | 54 | 33 | **137** |
-| total | 57 | 33 | **543** |
+| phase | go | rust | pith (before) | pith (now) |
+|---|---|---|---|---|
+| closures | 3 | 0 | 407 | **45** |
+| errors | 54 | 33 | 137 | 133 |
+| total | 57 | 33 | 543 | **178** |
 
-this is where pith is genuinely slow — about 9x go on the total, and
-the closures alone are two orders of magnitude off. the error phase is
-closer (2.5x go) and reasonable: it allocates a three-slot result
-tuple and a heap error string per failure, work go and rust do too.
+the closure column is stage A of the plan below, now landed: closures
+moved onto a magic-tagged header and off the global handle registry,
+and the phase dropped from 407ms to 45ms — a 9x cut, checksum
+unchanged. that takes the total from ~9x go down to ~3x. the residual
+45ms (vs go's 3ms) is the heap box each closure still allocates, which
+is separate, harder work — see the plan.
 
-the closure gap is a fixable one and the cause is known. a closure
-still validates and refcounts through the global handle registry — a
-`Mutex<HashSet>` locked on every new, retain, release, and validity
-check. strings and structs left that registry for a magic-tag header
-(see the sprint below) and got much faster; closures never did. so
-every one of the ~400k closures this benchmark builds and drops takes
-that lock several times. giving closures a magic-tagged header, the
-same treatment collections got, is the obvious next optimization and
-this benchmark is here to measure it. the memory work that prompted
-this rerun (reference-counting closures instead of leaking them) added
-the release lock, so the fix pays that back too.
+the error phase is untouched at ~133ms and reasonable: it allocates a
+three-slot result tuple and a heap error string per failure, work go
+and rust do too (2.5x go).
+
+for the record, the slow version: a closure used to validate and
+refcount through the global handle registry — a `Mutex<HashSet>`
+locked on every new, retain, release, and validity check — while
+strings and structs had already left that registry for a magic-tag
+header (see the sprint below). the ~400k closures this benchmark
+builds and drops took that lock several times each. the memory work
+that prompted the rerun (reference-counting closures instead of
+leaking them) had added the release lock, so removing the registry
+paid that back too.
 
 `bench/http_server` — a json api under wrk for two minutes:
 
@@ -260,13 +264,15 @@ target: std_pipeline within ~1.5x of go (about 460ms). compile time is
 tracked too: `pith build bench/std_pipeline.pith` went 4.24s to 4.34s with
 opt_level=speed.
 
-## closure performance plan (open, july 2026)
+## closure performance plan (stage A landed, july 2026)
 
 `bench/closure_error` put a number on the one workload the collection
-benchmarks never reach: closures are ~135x slower than go (407ms vs
+benchmarks never reach: closures were ~135x slower than go (407ms vs
 3ms for 200k iterations building and dropping ~400k closures). the
 error phase in the same benchmark is fine (2.5x go), so this section
-is about closures.
+is about closures. stage A has since landed and cut the closure phase
+to 45ms (9x); the write-up below is kept as the record of what changed
+and what is left.
 
 **root cause, confirmed by reading the runtime.** a list validates a
 handle with `list_magic_ok` — read a magic tag from the object's own
@@ -280,10 +286,11 @@ this for collections and bought 888ms on std_pipeline. closures were
 never converted. so the fix is not new design — it is finishing a
 migration that already happened for every other heap type.
 
-### stage A — closures onto a magic header (the win)
+### stage A — closures onto a magic header (landed, 407ms → 45ms)
 
-give `PithClosure` a magic tag at offset 0, the same shape structs use
-(`STRUCT_MAGIC` / `struct_base`, `runtime_core.rs:1137,1146`). then:
+`PithClosure` got a magic tag at offset 0 (`CLOSURE_MAGIC`), the same
+shape structs use (`STRUCT_MAGIC` / `struct_base`,
+`runtime_core.rs:1137,1146`):
 
 - `pith_closure_new` writes the tag instead of calling `register`
 - a `closure_base(handle)` helper null-checks, alignment-checks, and
@@ -304,18 +311,20 @@ checker's closure-typed path (a real box) or as 0 (null-guarded), the
 same risk profile lists and structs already accept. the scrub-on-free
 turns a stale handle into a safe miss rather than a wild call.
 
-**verify.** `bench/closure_error` is the measuring stick — closure_ms
-should fall from ~407 toward single or low-double digits. valgrind the
-churn (it must stay clean — the scrub is what makes a double-free or
-use-after-free impossible, not just unlikely). full suite + fixed
-point + seed, since the runtime `.a` relinks into every program.
+**verified.** `bench/closure_error` closure_ms fell from 407 to 45
+(median of 5), checksum unchanged. valgrind stayed clean on the churn
+(0 errors, 0 definite leaks — the scrub is what makes a double-free or
+use-after-free a safe miss, not just unlikely). full suite, fixed
+point, and seed all passed, since the runtime `.a` relinks into every
+program.
 
-**expected result.** the lock is the dominant cost, so this should
-close most of the gap. a residual stays: pith heap-allocates a box per
-closure where go and rust can keep the environment on the stack or
-inline it. that is a separate, harder optimization (a closure arena or
-escape analysis) and only worth it if a real workload still shows the
-box allocation after the lock is gone.
+**the residual, as predicted.** the lock was the dominant cost, and
+removing it closed most of the gap. what stays is the 45ms vs go's
+3ms: pith heap-allocates a box per closure where go and rust keep the
+environment on the stack or inline it. that is a separate, harder
+optimization (a closure arena or escape analysis) and only worth it if
+a real workload still shows the box allocation now that the lock is
+gone.
 
 ### stage B — the same lock on `AtomicInt` and the other primitives
 
@@ -331,12 +340,13 @@ lock.
 
 ### order and stopping rule
 
-stage A first and alone — it is the measured win, and its valgrind +
-suite pass is the gate for touching the others. stage B only where a
-benchmark shows the lock (a channel microbench for `Channel`, the
-context path for `AtomicInt`); do not convert a primitive just for
-symmetry without a number. the goal is `bench/closure_error` total
-from 543ms toward go's ~57ms, closures leading the drop.
+stage A landed first and alone — the measured win, its valgrind +
+suite pass the gate for touching the others. that took the benchmark
+total from 543ms to 178ms. stage B stays open and stays conditional:
+convert a primitive only where a benchmark shows the lock (a channel
+microbench for `Channel`, the context path for `AtomicInt`), not for
+symmetry. the remaining gap to go's ~57ms total is now the error phase
+and the per-closure box, not the lock.
 
 ## how to rerun
 

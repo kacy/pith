@@ -187,6 +187,12 @@ pub mut ir_generic_specialization_keys: List[String] := []
 pub mut ir_generic_specialization_names: Map[String, String] := {}
 pub mut ir_generic_specialization_type_lists: Map[String, String] := {}
 pub mut ir_generic_emitted_specializations: Map[String, Int] := {}
+## Per-spec arg-tid list encoded as tab-joined ints. Populated on demand at
+## call sites where the arg tids are structurally richer than the
+## emission-kind concrete_types list. Used by the emitter to recover the
+## concrete Optional tid inside a specialization body (concrete_types
+## flattens Optional to "tuple").
+pub mut ir_generic_specialization_arg_tids: Map[String, String] := {}
 
 ## file a generic declaration under its module-qualified name.
 pub fn ir_record_generic_function_decl(item_idx: Int, node: Node, module_path: String):
@@ -215,3 +221,44 @@ pub fn ir_queue_generic_specialization(name: String, arg_types: List[String], re
     ir_generic_specialization_type_lists.insert(key, ir_encode_type_list(arg_types))
     ir_func_returns.insert(spec_name, ret_type)
     return spec_name
+
+## record arg tids for a spec-key so the emitter can recover Optional
+## inner types the emission-kind concrete_types list flattened. Safe to
+## call multiple times per key — first record wins (later callers of the
+## same spec have equivalent arg tids by construction).
+pub fn ir_record_generic_spec_arg_tids(name: String, arg_types: List[String], arg_tids: List[Int]):
+    key := ir_generic_specialization_key(name, arg_types)
+    if ir_generic_specialization_arg_tids.contains_key(key):
+        return
+    mut encoded := ""
+    for tid, i in arg_tids:
+        if i > 0:
+            encoded = encoded + chr(9)
+        encoded = encoded + tid.to_string()
+    ir_generic_specialization_arg_tids.insert(key, encoded)
+
+## decode a spec's arg tids, or an empty list if none were recorded.
+pub fn ir_decode_generic_spec_arg_tids(key: String) -> List[Int]:
+    result: List[Int] := []
+    if not ir_generic_specialization_arg_tids.contains_key(key):
+        return result
+    encoded := ir_generic_specialization_arg_tids[key]
+    if encoded.len() == 0:
+        return result
+    for part in encoded.split(chr(9)):
+        # parse_int-ish: rebuild the integer manually to avoid stdlib dep
+        mut val := 0
+        mut neg := false
+        mut i := 0
+        if part.len() > 0 and part[0] == "-":
+            neg = true
+            i = 1
+        while i < part.len():
+            c := part[i]
+            if c >= "0" and c <= "9":
+                val = val * 10 + (ord(c) - 48)
+            i = i + 1
+        if neg:
+            val = 0 - val
+        result.push(val)
+    return result

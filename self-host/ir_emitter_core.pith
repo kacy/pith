@@ -40,7 +40,7 @@
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
 from checker import c_get_expr_type, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
-from types import TypeInfo, get_type_info, get_type_name, lookup_type_id
+from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, ti_optional, add_type_info
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
@@ -51,7 +51,7 @@ from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_ma
 from ir_decode_emit import ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_toml_decode_call, ir_emit_toml_decode_file_call, ir_emit_toml_decode_path_call, ir_emit_toml_decode_path_specialization_body, ir_emit_toml_decode_specialization_body, ir_emit_toml_decode_text_path_specialization_body, ir_emit_toml_decode_text_specialization_body
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label, ir_last_was_ret
-from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_toml_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_toml_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
+from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_param_optional_tids, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_toml_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_toml_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind
 # shared helpers: ast shapes, captures, results, optionals, literals
@@ -66,7 +66,7 @@ from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_sta
 from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_toml_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_config_require_full_name_for_type_name_with_state, ir_toml_require_full_name_for_type_name_with_state, ir_is_config_decode_specialization, ir_is_toml_decode_specialization, ir_is_toml_decode_path_specialization, ir_is_toml_decode_text_path_specialization, ir_is_toml_decode_text_specialization, ir_is_json_decode_object_specialization, ir_is_json_decode_specialization, ir_is_json_decode_path_specialization, ir_resolve_decode_call_name_with_state, ir_json_field_helper_name, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_config_require_helper_name, ir_toml_require_helper_name, ir_struct_decode_field_tid, ir_json_field_type_tag, ir_optional_inner_tid, ir_struct_has_optional_fields, ir_struct_has_default_fields_with_state, ir_struct_has_nested_decode_fields
 from ir_callees import ResolvedCallee, ir_import_declares_function_with_state, ir_import_declares_global_with_state, ir_module_alias_member_name_with_state, ir_plain_method_name, ir_ident_callee_with_state, ir_resolve_module_alias_call_name_with_state, ir_resolve_module_alias_method_call_name_with_state, ir_resolve_static_callee_with_state
 from ir_call_helpers import ir_is_declared_callable_with_state, ir_declared_callable_ir_retkind_with_state, ir_declared_callable_return_type_with_state, ir_emit_call_text_with_state, ir_join_arg_regs, ir_method_call_arg_regs, ir_call_arg_expr_index
-from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_param_name_at, ir_generic_preferred_name_with_state, ir_json_generic_name_with_state, ir_config_generic_name_with_state, ir_toml_generic_name_with_state, ir_resolve_generic_module_call_name, ir_encode_type_list, ir_decode_type_list, ir_generic_specialization_key, ir_generic_specialization_name, ir_specialize_type_name_with_state, ir_resolve_type_node_with_subst_with_state, ir_extract_return_type_with_subst_with_state, ir_extract_optional_inner_type_with_subst_with_state, ir_extract_param_types_with_subst_with_state
+from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_param_name_at, ir_generic_preferred_name_with_state, ir_json_generic_name_with_state, ir_config_generic_name_with_state, ir_toml_generic_name_with_state, ir_resolve_generic_module_call_name, ir_encode_type_list, ir_decode_type_list, ir_generic_specialization_key, ir_generic_specialization_name, ir_specialize_type_name_with_state, ir_resolve_type_node_with_subst_with_state, ir_extract_return_type_with_subst_with_state, ir_extract_optional_inner_type_with_subst_with_state, ir_extract_param_types_with_subst_with_state, ir_record_generic_spec_arg_tids, ir_decode_generic_spec_arg_tids
 from ir_struct_layouts import ir_struct_layout_name_with_state, ir_struct_field_count_with_state, ir_struct_field_name_at_with_state, ir_struct_field_type_name_with_state, ir_struct_field_kind_from_decl_with_state, ir_field_kind_tid_with_state, ir_struct_field_tid_at_with_state, ir_struct_field_default_node_with_state
 from ir_control_helpers import IrIfBranch, IrForBindingNames, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
 from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name, ir_lookup_map_value_type_for_expr_with_state, ir_index_get_call_name, ir_index_set_call_name, ir_for_loop_item_call_name, ir_for_loop_item_return_kind, ir_for_iter_item_kind, ir_for_iter_conversion_call, ir_for_iter_conversion_return_kind, ir_for_len_call_name, ir_empty_collection_init_call_name, ir_normalize_collection_target
@@ -233,6 +233,7 @@ fn ir_expr_result_kind(idx: Int) -> String:
                 mut generic_ret_type := ir_checked_type(idx)
                 if generic_ret_type.len() == 0:
                     generic_ret_type = ir_infer_type(idx)
+                ir_record_generic_spec_arg_tids(callee.name, concrete_types, ir_generic_arg_tids(node))
                 callee = ResolvedCallee(ir_queue_generic_specialization(callee.name, concrete_types, generic_ret_type), false)
             declared_kind := ir_declared_callable_ir_retkind(callee.name)
             if declared_kind.len() > 0:
@@ -1753,6 +1754,20 @@ fn ir_emit_short_circuit_logic(node: Node) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+# For an operand node, return the concrete Optional tid when the node is
+# a param identifier whose substituted type is Optional. Returns -1
+# otherwise. The tid comes from the arg-tid map populated at spec entry —
+# the emission-kind concrete_types list flattens Optional to "tuple" and
+# would lose the inner type, so we route through the arg tids recorded at
+# call sites.
+fn ir_generic_param_optional_tid(operand_node: Node) -> Int:
+    if operand_node.kind != "ident":
+        return - 1
+    name := operand_node.value
+    if not ir_active_param_optional_tids.contains_key(name):
+        return - 1
+    return ir_active_param_optional_tids[name]
+
 fn ir_emit_binary_expr(node: Node) -> Int:
     if node.value == "eq" or node.value == "neq":
         fast_r := ir_try_emit_byte_compare(node, node.value)
@@ -1800,6 +1815,27 @@ fn ir_emit_binary_expr(node: Node) -> Int:
         if left_info.kind == "optional" and right_info.kind == "optional" and left_info.inner >= 0 and left_info.inner == right_info.inner:
             ir_emit_optional_optional_compare(r, op, left_r, right_r, left_tid)
             return r
+        # Inside a generic specialization the check-time tid is the un-
+        # specialized generic marker, so left_info.kind isn't "optional"
+        # even when the concrete substituted type is. Recover the tid from
+        # the per-spec param map and dispatch structurally. Match by inner
+        # type since add_type_info doesn't intern (the two params get
+        # different Optional tids for the same shape).
+        if ir_active_param_optional_tids.len() > 0:
+            gen_left_tid := ir_generic_param_optional_tid(left_node)
+            gen_right_tid := ir_generic_param_optional_tid(right_node)
+            if gen_left_tid >= 0 and gen_right_tid >= 0:
+                lg := get_type_info(gen_left_tid)
+                rg := get_type_info(gen_right_tid)
+                if lg.inner >= 0 and lg.inner == rg.inner:
+                    ir_emit_optional_optional_compare(r, op, left_r, right_r, gen_left_tid)
+                    return r
+            if gen_left_tid >= 0 and right_node.kind == "none_lit":
+                ir_emit_optional_none_compare(r, op, left_r)
+                return r
+            if gen_right_tid >= 0 and left_node.kind == "none_lit":
+                ir_emit_optional_none_compare(r, op, right_r)
+                return r
     if is_float_op and ir_is_float_arithmetic(op):
         ir_emit_float_binary(r, op, left_r, right_r)
         return r
@@ -2125,6 +2161,7 @@ fn ir_specialize_static_callee(idx: Int, node: Node, callee: ResolvedCallee, exp
     mut concrete_types := explicit_generic_types
     if concrete_types.len() == 0:
         concrete_types = ir_infer_generic_concrete_types(callee.name, node)
+    ir_record_generic_spec_arg_tids(callee.name, concrete_types, ir_generic_arg_tids(node))
     return ResolvedCallee(ir_queue_generic_specialization(callee.name, concrete_types, generic_ret_type), false)
 
 # a call whose callee is an expression rather than a name — a function
@@ -2963,7 +3000,9 @@ fn ir_emit_method_call(idx: Int) -> Int:
             mut generic_ret_type := ir_checked_type(idx)
             if generic_ret_type.len() == 0:
                 generic_ret_type = ir_infer_type(idx)
-            call_name = ir_queue_generic_specialization(call_name, ir_infer_generic_concrete_types(call_name, node), generic_ret_type)
+            mct := ir_infer_generic_concrete_types(call_name, node)
+            ir_record_generic_spec_arg_tids(call_name, mct, ir_generic_arg_tids(node))
+            call_name = ir_queue_generic_specialization(call_name, mct, generic_ret_type)
         arg_regs := ir_collect_call_arg_regs(node, 1)
         r := ir_reg()
         uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(call_name, true), idx)
@@ -4615,6 +4654,20 @@ fn ir_generic_arg_types(node: Node) -> List[String]:
             arg_types.push(ir_infer_type(expr_idx))
     return arg_types
 
+fn ir_generic_arg_tids(node: Node) -> List[Int]:
+    mut arg_tids: List[Int] := []
+    for child, i in node.children:
+        if i == 0:
+            continue
+        child_kind := node_kind(child)
+        mut expr_idx := child
+        if child_kind == "arg":
+            cn := get_node(child)
+            if cn.children.len() > 0:
+                expr_idx = cn.children[0]
+        arg_tids.push(c_get_expr_type(expr_idx))
+    return arg_tids
+
 fn ir_emit_generic_specialization(key: String):
     if not ir_generic_specialization_names.contains_key(key):
         return
@@ -4633,8 +4686,10 @@ fn ir_emit_generic_specialization(key: String):
     saved_params := ir_active_generic_params
     saved_types := ir_active_generic_concrete_types
     saved_module_path := ir_active_generic_module_path
+    saved_param_optional_tids := ir_active_param_optional_tids
     ir_active_generic_params = generic_params
     ir_active_generic_concrete_types = concrete_types
+    ir_active_param_optional_tids = ir_collect_param_optional_tids(decl_idx, key)
     if ir_generic_decl_module_paths.contains_key(base_name):
         ir_active_generic_module_path = ir_generic_decl_module_paths[base_name]
     else:
@@ -4669,6 +4724,24 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_generic_params = saved_params
     ir_active_generic_concrete_types = saved_types
     ir_active_generic_module_path = saved_module_path
+    ir_active_param_optional_tids = saved_param_optional_tids
+
+fn ir_collect_param_optional_tids(fn_idx: Int, spec_key: String) -> Map[String, Int]:
+    result: Map[String, Int] := {}
+    arg_tids := ir_decode_generic_spec_arg_tids(spec_key)
+    if arg_tids.len() == 0:
+        return result
+    node := get_node(fn_idx)
+    mut param_idx := 0
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            if param_idx < arg_tids.len():
+                tid := arg_tids[param_idx]
+                if tid >= 0 and get_type_info(tid).kind == "optional":
+                    result.insert(cn.value, tid)
+            param_idx = param_idx + 1
+    return result
 
 fn ir_emit_generic_specializations():
     mut i := 0

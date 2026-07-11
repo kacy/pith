@@ -3552,6 +3552,9 @@ fn check_string_method_call(method: String, args: List[Int], scope_id: Int) -> I
     if method == "chars":
         expect_no_arguments(method, args)
         return intern_list_type(tid_string)
+    if method == "get":
+        expect_one_typed_argument(method, args, tid_int, scope_id)
+        return add_type_info(ti_optional(tid_string))
     report_error("E209", "String has no method '" + method + "'")
     return TID_ERR
 
@@ -3706,7 +3709,7 @@ fn check_list_method_call(method: String, info: TypeInfo, args: List[Int], scope
         return tid_string
     if method == "index_of":
         expect_one_typed_argument(method, args, elem, scope_id)
-        return tid_int
+        return add_type_info(ti_optional(tid_int))
     if method == "slice":
         expect_two_int_arguments(method, args, scope_id)
         return intern_list_type(elem)

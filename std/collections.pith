@@ -378,12 +378,12 @@ pub fn all[T](items: List[T], keep: fn(T) -> Bool) -> Bool:
             return false
     return true
 
-# return the index of the first item that matches, or -1.
-pub fn find_index[T](items: List[T], keep: fn(T) -> Bool) -> Int:
+# return the index of the first item that matches, or none when nothing matches.
+pub fn find_index[T](items: List[T], keep: fn(T) -> Bool) -> Int?:
     for item, i in items:
         if keep(item):
             return i
-    return - 1
+    return none
 
 # return the first matching item or fail when nothing matches.
 pub fn find[T](items: List[T], keep: fn(T) -> Bool) -> T!CollectionError:
@@ -628,7 +628,7 @@ test "collection predicate helpers find values":
     nums := [1, 2, 3, 4]
     assert(any(nums, fn(n: Int) => n > 3))
     assert(all(nums, fn(n: Int) => n > 0))
-    assert_eq(find_index(nums, fn(n: Int) => n == 3), 2)
+    assert_eq(find_index(nums, fn(n: Int) => n == 3).unwrap_or(-1), 2)
     assert_eq(find(nums, fn(n: Int) => n == 4)!, 4)
     assert_eq(find_first(nums, fn(n: Int) => n == 2)!, 2)
     assert_eq(count_where(nums, fn(n: Int) => n % 2 == 0), 2)
@@ -742,7 +742,7 @@ test "collection ordering and search helpers keep stable results":
     assert_eq(collection_test_names(ranked_by_key), "bob,carol,dave,alice")
     assert(any(items, fn(item: CollectionTestItem) => item.team == "red"))
     assert(all(items, fn(item: CollectionTestItem) => item.score > 0))
-    assert_eq(find_index(items, fn(item: CollectionTestItem) => item.team == "blue"), 1)
+    assert_eq(find_index(items, fn(item: CollectionTestItem) => item.team == "blue").unwrap_or(-1), 1)
     assert_eq(find(items, fn(item: CollectionTestItem) => item.name == "carol")!.score, 5)
     assert(find(items, fn(item: CollectionTestItem) => item.name == "zoe").is_err)
 

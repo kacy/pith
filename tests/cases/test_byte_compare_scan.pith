@@ -15,6 +15,9 @@ fn main():
     print(count_marks("a:b:c,d:e").to_string())
     print(count_marks("").to_string())
     s := "xy"
-    ok := s[5] == "x"
+    # s.get(i) returns String?, safe for potentially-oob access. The
+    # comparison unwraps with an empty-string default so the miss reads
+    # as a plain "not equal".
+    ok := s.get(5).unwrap_or("") == "x"
     print(ok.to_string())
     print(ord(s[1]).to_string())

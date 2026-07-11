@@ -64,6 +64,35 @@ constant memory, 3x under go's gc, matching rust's shape. the
 url/path churn variant (heavy substring work) runs 712ms at the same
 constant 2.6 mb.
 
+`bench/closure_error` — the workload the collection benchmarks don't
+reach: closures built, captured, called, and dropped every iteration,
+and functions that fail with a heap error, propagate it up with `!`,
+and get handled with catch and unwrap_or. 200k iterations, medians of
+5 (checksums match across all three, so the work is equivalent):
+
+| phase | go | rust | pith |
+|---|---|---|---|
+| closures | 3 | 0 | **407** |
+| errors | 54 | 33 | **137** |
+| total | 57 | 33 | **543** |
+
+this is where pith is genuinely slow — about 9x go on the total, and
+the closures alone are two orders of magnitude off. the error phase is
+closer (2.5x go) and reasonable: it allocates a three-slot result
+tuple and a heap error string per failure, work go and rust do too.
+
+the closure gap is a fixable one and the cause is known. a closure
+still validates and refcounts through the global handle registry — a
+`Mutex<HashSet>` locked on every new, retain, release, and validity
+check. strings and structs left that registry for a magic-tag header
+(see the sprint below) and got much faster; closures never did. so
+every one of the ~400k closures this benchmark builds and drops takes
+that lock several times. giving closures a magic-tagged header, the
+same treatment collections got, is the obvious next optimization and
+this benchmark is here to measure it. the memory work that prompted
+this rerun (reference-counting closures instead of leaking them) added
+the release lock, so the fix pays that back too.
+
 `bench/http_server` — a json api under wrk for two minutes:
 
 | | go 1-core | go all-cores | rust minimal | pith single | pith threaded |

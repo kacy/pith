@@ -1,0 +1,90 @@
+# closure_error — stresses the paths the memory hardening actually
+# changed: closures (now reference counted, not leaked) and error
+# returns (now cleaned up). the collection benchmarks never exercise
+# these, so this is where the retain/release traffic and error-path
+# cleanup would show up if they were expensive.
+
+# --- closures -------------------------------------------------------
+# each iteration builds two closures that capture, calls them, and
+# drops them, so the closure lifecycle (alloc, capture retain, call,
+# release) runs on every pass.
+
+fn make_adder(base: Int) -> fn(Int) -> Int:
+    return fn(x: Int) => base + x
+
+fn apply_twice(f: fn(Int) -> Int, x: Int) -> Int:
+    return f(f(x))
+
+fn bench_closures(iterations: Int) -> Int:
+    mut total := 0
+    mut i := 0
+    while i < iterations:
+        add := make_adder(i)
+        step := i % 7 + 1
+        mul := fn(x: Int) => x * step
+        mut j := 0
+        while j < 8:
+            total = total + add(j) - mul(j) + apply_twice(add, j)
+            j = j + 1
+        i = i + 1
+    return total
+
+# --- error paths ----------------------------------------------------
+# functions that fail with a heap-allocated error while holding owned
+# locals, propagate the failure up with `!`, and get handled with catch
+# and unwrap_or — exercising fail cleanup, propagation cleanup, and the
+# error-value release at the consuming site.
+
+fn checked(n: Int) -> Int!:
+    label := "value-" + n.to_string()
+    tags := ["a", "b", label]
+    if n % 5 == 0:
+        fail "rejected: " + label
+    return n * 2 + tags.len()
+
+fn two_layers(n: Int) -> Int!:
+    a := checked(n)!
+    b := checked(n + 1)!
+    return a + b
+
+fn bench_errors(iterations: Int) -> Int:
+    mut total := 0
+    mut i := 0
+    while i < iterations:
+        total = total + (two_layers(i) catch 0)
+        total = total + checked(i).unwrap_or(0 - 1)
+        i = i + 1
+    return total
+
+fn iterations_from_args() -> Int:
+    argv := args()
+    for a, idx in argv:
+        if idx > 0:
+            parsed := parse_int(a) catch 0
+            if parsed > 0:
+                return parsed
+    return 200000
+
+fn main() -> Int:
+    iterations := iterations_from_args()
+    print("closure/error benchmark")
+    print("iterations=" + iterations.to_string())
+
+    total_start := time()
+
+    t0 := time()
+    closure_total := bench_closures(iterations)
+    closure_ms := time() - t0
+
+    t1 := time()
+    error_total := bench_errors(iterations)
+    error_ms := time() - t1
+
+    total_ms := time() - total_start
+    checksum := closure_total + error_total
+
+    print("closure_ms=" + closure_ms.to_string())
+    print("error_ms=" + error_ms.to_string())
+    print("total_ms=" + total_ms.to_string())
+    print("checksum=" + checksum.to_string())
+    return 0

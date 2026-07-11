@@ -1,0 +1,39 @@
+fn side_effect(marker: String, value: Bool) -> Bool:
+    print("eval:" + marker)
+    return value
+
+fn main() -> Int!:
+    print("or_left_true:")
+    a := true or side_effect("or-r", true)
+    print("a:" + a.to_string())
+
+    print("or_left_false:")
+    b := false or side_effect("or-r", true)
+    print("b:" + b.to_string())
+
+    print("and_left_false:")
+    c := false and side_effect("and-r", true)
+    print("c:" + c.to_string())
+
+    print("and_left_true:")
+    d := true and side_effect("and-r", true)
+    print("d:" + d.to_string())
+
+    # The idiom that the eager evaluation used to break: guard an OOB
+    # index with an earlier check. Under eager and, list[-1] evaluated
+    # eagerly. Under short-circuit, list[-1] never runs because i == 0
+    # is true.
+    xs: List[Int] := [10, 20, 30]
+    mut i := 0
+    while i < xs.len():
+        if i == 0 or xs[i] != xs[i - 1]:
+            print("keep:" + xs[i].to_string())
+        i = i + 1
+
+    # The and equivalent: check bounds before the access.
+    j := 5
+    if j >= 0 and j < xs.len() and xs[j] == 10:
+        print("unexpected")
+    else:
+        print("guarded_ok")
+    return 0

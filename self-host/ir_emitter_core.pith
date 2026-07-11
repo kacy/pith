@@ -1723,11 +1723,43 @@ fn ir_try_emit_byte_compare(node: Node, op: String) -> Int:
         ir_emit("neq " + r.to_string() + " " + left_b.to_string() + " " + right_b.to_string())
     return r
 
+# Short-circuit `and` / `or`. Pith's other IR operators lower with both
+# operands eagerly evaluated, but that means guards like
+# `if i == 0 or item != list[i-1]` still index `list[-1]` on the LHS-true
+# path. Emit a labeled branch instead so the RHS only runs when the LHS
+# doesn't decide the result.
+#
+#   or:  eval L; if L => merge (result = L); else => eval R (result = R)
+#   and: eval L; if L => eval R (result = R); else => merge (result = L)
+fn ir_emit_short_circuit_logic(node: Node) -> Int:
+    op := node.value
+    temp_name := ir_new_temp_name(op)
+    default_r := ir_reg()
+    ir_emit("iconst " + default_r.to_string() + " 0")
+    ir_emit("store " + temp_name + " " + default_r.to_string())
+    left_r := ir_expr(node.children[0])
+    ir_emit("store " + temp_name + " " + left_r.to_string())
+    right_l := ir_label()
+    merge_l := ir_label()
+    if op == "or":
+        ir_emit("brif " + left_r.to_string() + " " + merge_l + " " + right_l)
+    else:
+        ir_emit("brif " + left_r.to_string() + " " + right_l + " " + merge_l)
+    ir_emit("label " + right_l)
+    right_r := ir_expr(node.children[1])
+    ir_emit("store " + temp_name + " " + right_r.to_string())
+    ir_emit("label " + merge_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
 fn ir_emit_binary_expr(node: Node) -> Int:
     if node.value == "eq" or node.value == "neq":
         fast_r := ir_try_emit_byte_compare(node, node.value)
         if fast_r >= 0:
             return fast_r
+    if node.value == "and" or node.value == "or":
+        return ir_emit_short_circuit_logic(node)
     left_r := ir_expr(node.children[0])
     right_r := ir_expr(node.children[1])
     r := ir_reg()

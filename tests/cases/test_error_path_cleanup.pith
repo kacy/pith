@@ -1,0 +1,43 @@
+# error paths must reclaim what they hold. a function that fails cleans
+# up its owned locals the same as a normal return, error propagation
+# (`!`) does too, and the sites that discard an error value (catch,
+# unwrap_or, or_else) release it and the result shell. run under
+# memcheck; before this, each of these leaked per call.
+struct Failure:
+    pub reason: String
+
+fn holds_and_fails(n: Int) -> Int!:
+    label := "item-" + n.to_string()
+    tags := ["a", "b", label]
+    if tags.len() > 0:
+        fail "boom-" + n.to_string()
+    return tags.len()
+
+fn fails_typed(n: Int) -> Int!Failure:
+    held := "held-" + n.to_string()
+    if held.len() > 0:
+        fail Failure{"typed-" + n.to_string()}
+    return n
+
+fn inner(n: Int) -> Int!:
+    fail "inner"
+
+fn propagates(n: Int) -> Int!:
+    owned := "owned-" + n.to_string()
+    rest := [owned, "z"]
+    v := inner(n)!
+    return v + rest.len()
+
+fn recover(f: Failure) -> Int!Failure:
+    return f.reason.len()
+
+fn main():
+    mut total := 0
+    mut i := 0
+    while i < 300:
+        total = total + (holds_and_fails(i) catch 0)
+        total = total + fails_typed(i).unwrap_or(0)
+        total = total + (fails_typed(i).or_else(recover) catch 0)
+        total = total + (propagates(i) catch 0)
+        i = i + 1
+    print(total.to_string())

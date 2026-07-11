@@ -91,7 +91,7 @@ fn run_cli() {
             lex_file(&args[2]);
         }
         "version" => {
-            println!("Pith Cranelift Compiler v0.2.4");
+            println!("Pith Cranelift Compiler v0.2.5");
             println!("Using IR path: source → ir_emitter.pith → ir_consumer.rs → native");
         }
         "fmt" | "lint" | "doc" | "new" | "package" => {

@@ -1,9 +1,8 @@
-# Pith vs Go — HTTP Server Benchmark
+# Pith benchmarks
 
-Identical HTTP servers in Pith and Go, measured on the same machine.
-Both run sequentially (one request at a time) for a fair comparison.
-
-## Build
+A few Pith vs Go (and sometimes Rust) benchmarks, measured on the same
+machine. Compile times give a sense of the toolchain; the workload and
+pipeline benchmarks below isolate runtime and service-logic costs.
 
 | | Go | Pith |
 |---|---|---|
@@ -13,51 +12,29 @@ Both run sequentially (one request at a time) for a fair comparison.
 
 Pith compiles from scratch every time — no incremental build cache yet.
 Go's first build pulls and compiles the standard library; subsequent builds
-use the cache. Binary size difference comes from Go embedding its runtime
+use the cache. The binary-size difference comes from Go embedding its runtime
 and GC, while Pith statically links a smaller Rust runtime.
 
-## Latency (March 2026)
+## http server benchmark
 
-Sequential requests, one connection at a time, measured from a Go benchmark
-client on the same machine. Each endpoint hit 50-200 times.
+`bench/http_server.pith` serves a small JSON API with allocation-churny
+request handling — query parsing, catalog lookups, and per-request string
+assembly. `bench/http_server_mt.pith` is the threaded variant, and
+`bench/http_server.go` is the Go counterpart.
 
-| Endpoint | Go p50 | Pith p50 | Ratio |
-|----------|--------|-----------|-------|
-| `GET /` (HTML) | 941us | 1031us | 1.1x |
-| `GET /json` | 931us | 993us | 1.1x |
-| `GET /echo?msg=test` | 899us | 1066us | 1.2x |
-| `GET /compute?n=100` | 982us | 1114us | 1.1x |
-| `GET /compute?n=1000` | 1082us | 1146us | 1.1x |
-
-At median latency, Pith is within 10-20% of Go across all endpoints.
-The gap is almost entirely TCP and syscall overhead — both servers spend
-most of their time in the kernel, not in application code.
-
-Tail latency (p95/p99) is noisier on both sides and varies between runs.
-
-## Endpoints
-
-Both servers implement the same four routes:
-
-- `/` — return a small HTML page
-- `/json` — return a JSON object
-- `/echo?msg=X` — repeat the message 10 times
-- `/compute?n=N` — sum of a math series (integer work)
-
-## Running
+`bench/http_bench.sh` drives a server with `wrk` and samples RSS across the
+run, so it doubles as a memory-growth check:
 
 ```
-# compile
-go build -o bench/server_go bench/server.go
-pith build bench/server.pith && mv bench/server bench/server_pith
+pith build bench/http_server.pith
+go build -o bench/http_server_go bench/http_server.go
 
-# start servers
-./bench/server_go &     # port 9001
-./bench/server_pith &  # port 9002
-
-# run benchmark
-go run bench/bench.go
+bench/http_bench.sh ./bench/http_server 8080 120
+bench/http_bench.sh ./bench/http_server_go 8081 120
 ```
+
+It prints a per-10s RSS table and a summary line (requests, throughput, and
+RSS start / end / peak). The Pith server holds flat RSS across the run.
 
 ## catalog service benchmark
 

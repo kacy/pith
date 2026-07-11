@@ -1,11 +1,26 @@
-# tuples
+# tuples: group a few values without declaring a struct
 
+# a plain tuple return
 fn swap(a: Int, b: Int) -> (Int, Int):
     return (b, a)
 
+# a fallible function can return a tuple too
+fn divmod(a: Int, b: Int) -> (Int, Int)!:
+    if b == 0:
+        fail "divide by zero"
+    return (a / b, a % b)
+
 fn main():
+    # mixed-type tuple, accessed by position
     pair := (1, "hello")
-    number_value := pair.0
-    name := pair.1
+    print("first {pair.0}, second {pair.1}")
+
     swapped := swap(10, 20)
-    print("tuples work")
+    print("swapped {swapped.0} {swapped.1}")
+
+    # the ok case carries the tuple; the failing case takes the fallback
+    q := divmod(17, 5) catch (0, 0)
+    print("17 / 5 = {q.0} rem {q.1}")
+
+    safe := divmod(1, 0) catch (0 - 1, 0 - 1)
+    print("1 / 0 caught, quotient {safe.0}")

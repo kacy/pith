@@ -95,6 +95,14 @@ gaps, all bounded leaks rather than dangling pointers:
   flight, so the free is deferred to the container's own cleanup.
 - **an error-path early return skips the normal exit cleanup.** the
   values a function held leak on the failing path.
+- **a result consumed with `catch` or `unwrap_or` can leak its ok
+  value** when that value was freshly built (a returned tuple, a
+  concatenated string). the consumer has no way to tell a fresh ok
+  value from a borrowed one — a returned collection element — so it
+  cannot release without risking a double-free on the borrowed case,
+  and errs toward the leak. tuples themselves are fully reclaimed:
+  a tuple frees its box at the last count and releases any heap value
+  it holds, the same as a struct.
 
 none of these produce a dangling pointer; the discipline trades a
 bounded leak for that guarantee.

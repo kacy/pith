@@ -1,0 +1,42 @@
+# tuple ownership: a tuple frees its box at the last count, and a tuple
+# holding heap values releases those values when it dies. valgrind-gated
+# in MEMCHECK_CASES — the point of this case is zero leaks, not output.
+
+fn described(n: Int) -> (String, Int):
+    return ("value-" + n.to_string(), n * n)
+
+fn pair(a: Int, b: Int) -> (Int, Int):
+    return (a + b, a * b)
+
+fn first_label(n: Int) -> String:
+    # an element read escapes its tuple; the string must outlive the box
+    t := described(n)
+    return t.0
+
+fn main() -> Int:
+    # heap-element churn: each iteration builds and drops a tuple whose
+    # first slot is a fresh string
+    mut total := 0
+    mut i := 0
+    while i < 100:
+        t := described(i)
+        total = total + t.1 + t.0.len()
+        i = i + 1
+
+    # nested tuple holding a heap string
+    inner := described(5)
+    outer := (inner, "top")
+    got := outer.0
+    total = total + got.1 + outer.1.len()
+
+    # rebinding a tuple local releases the old one
+    mut p := pair(1, 2)
+    p = pair(3, 4)
+    total = total + p.0 + p.1
+
+    # escaping element read
+    s := first_label(9)
+    total = total + s.len()
+
+    print("total " + total.to_string())
+    return 0

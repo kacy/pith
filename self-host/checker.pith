@@ -1269,13 +1269,19 @@ fn check_return_statement(node: Node, scope_id: Int):
         return
     if actual == expected:
         return
-    # allow returning inner type from result-returning function
+    # allow returning inner type from result-returning function. the
+    # structural check covers a tuple inner ((Int, Int)!), whose tid is
+    # not interned to a single value the way named types are.
     if exp_info.kind == "result":
         if actual == exp_info.inner:
+            return
+        if types_structurally_equal(actual, exp_info.inner):
             return
     # allow returning inner type from optional-returning function
     if exp_info.kind == "optional":
         if actual == exp_info.inner:
+            return
+        if types_structurally_equal(actual, exp_info.inner):
             return
     # check structural equality (tuples)
     if types_structurally_equal(actual, expected):

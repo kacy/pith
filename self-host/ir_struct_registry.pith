@@ -43,6 +43,10 @@ pub fn ir_rc_kind(type_hint: String) -> String:
         return "bytes"
     if type_hint == "closure":
         return "closure"
+    # a tuple is a struct:tuple header allocation, so it releases through
+    # the same struct header count.
+    if type_hint == "tuple":
+        return "tuple"
     # every struct is releasable: the header-carrying allocation frees at
     # the last count, and types with rc fields additionally run their
     # generated destructor. checked types carry the bare name; emission

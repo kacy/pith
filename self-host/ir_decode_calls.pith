@@ -215,6 +215,21 @@ pub fn ir_json_require_helper_name(field_tid: Int) -> String:
             return "std_json_require_bool"
     return ""
 
+# the per-key byte scanner for a scalar field, or "" when the field is
+# not a plain scalar. these scan the object bytes directly for one key,
+# which lets a flat all-required-scalar struct decode without building
+# the intermediate scalar-object with its three maps.
+pub fn ir_json_scan_required_helper_name(field_tid: Int) -> String:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        if info.name == "String":
+            return "std_json_scan_required_string_bytes"
+        if info.name == "Int":
+            return "std_json_scan_required_int_bytes"
+        if info.name == "Bool":
+            return "std_json_scan_required_bool_bytes"
+    return ""
+
 pub fn ir_json_scalar_has_helper_name(field_tid: Int) -> String:
     info := get_type_info(field_tid)
     if info.kind == "primitive":

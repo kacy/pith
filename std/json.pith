@@ -49,6 +49,50 @@ struct JsonByteFieldPos:
     found: Bool
     pos: Int
 
+struct JsonByteSpan:
+    ok: Bool
+    start: Int
+    end: Int
+    next_pos: Int
+    escaped: Bool
+
+# read a json string's content span (between the quotes) without
+# allocating it, reporting whether it contained an escape so callers can
+# fall back to a full read when they need the decoded text.
+fn json_byte_string_span(input: Bytes, pos: Int) -> JsonByteSpan:
+    if pos < 0 or pos >= input.len() or input[pos] != 34:
+        return JsonByteSpan(false, 0, 0, pos, false)
+    mut i := pos + 1
+    start := i
+    mut esc := false
+    mut had_escape := false
+    while i < input.len():
+        b := input[i]
+        if esc:
+            esc = false
+            i = i + 1
+            continue
+        if b == 92:
+            esc = true
+            had_escape = true
+            i = i + 1
+            continue
+        if b == 34:
+            return JsonByteSpan(true, start, i, i + 1, had_escape)
+        i = i + 1
+    return JsonByteSpan(false, 0, 0, i, false)
+
+# compare a byte span against a target byte string with no allocation.
+fn json_span_equals(input: Bytes, start: Int, end: Int, target: Bytes) -> Bool:
+    if end - start != target.len():
+        return false
+    mut i := 0
+    while i < target.len():
+        if input[start + i] != target[i]:
+            return false
+        i = i + 1
+    return true
+
 # ===============================================================
 # Node Pool
 # ===============================================================
@@ -315,7 +359,7 @@ fn json_byte_read_string(input: Bytes, pos: Int) -> JsonByteString:
             i = i + 1
             continue
         if b == 34:
-            text := bytes.to_string_utf8(bytes.slice(input, start, i))
+            text := bytes.substring_utf8(input, start, i)
             if text.is_err:
                 return JsonByteString(false, "", i)
             return JsonByteString(true, text.ok, i + 1)
@@ -380,17 +424,27 @@ fn json_byte_find_field_value(input: Bytes, key: String) -> JsonByteFieldPos:
         pos = json_byte_skip_whitespace(input, pos + 1)
         return JsonByteFieldPos(pos == input.len(), false, pos)
 
+    key_bytes := bytes.from_string_utf8(key)
     while pos < input.len():
-        field_key := json_byte_read_string(input, pos)
-        if not field_key.ok:
+        key_quote_pos := pos
+        span := json_byte_string_span(input, pos)
+        if not span.ok:
             return JsonByteFieldPos(false, false, pos)
-        pos = json_byte_skip_whitespace(input, field_key.next_pos)
+        pos = json_byte_skip_whitespace(input, span.next_pos)
         if pos >= input.len() or input[pos] != 58:
             return JsonByteFieldPos(false, false, pos)
         pos = json_byte_skip_whitespace(input, pos + 1)
         if pos >= input.len():
             return JsonByteFieldPos(false, false, pos)
-        if field_key.value == key:
+        # the common case compares the key bytes in place; a key with an
+        # escape falls back to a full decoded read so it still matches.
+        mut matched := false
+        if span.escaped:
+            slow := json_byte_read_string(input, key_quote_pos)
+            matched = slow.value == key
+        else:
+            matched = json_span_equals(input, span.start, span.end, key_bytes)
+        if matched:
             return JsonByteFieldPos(true, true, pos)
 
         pos = json_byte_skip_scalar_value(input, pos)

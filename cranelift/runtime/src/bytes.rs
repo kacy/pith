@@ -124,6 +124,28 @@ pub unsafe extern "C" fn pith_bytes_to_string_utf8(handle: i64) -> *mut i8 {
     crate::pith_copy_bytes_to_cstring(&bytes.data)
 }
 
+/// Slice a byte range and decode it as UTF-8 in one step, returning a
+/// pith C-string (null on invalid UTF-8). This avoids the intermediate
+/// Bytes handle that `slice` then `to_string_utf8` would allocate and
+/// register — a real cost in tight scanning loops (json, csv).
+#[no_mangle]
+pub unsafe extern "C" fn pith_bytes_substring_utf8(handle: i64, start: i64, end: i64) -> *mut i8 {
+    let Some(bytes) = pith_bytes_ref(handle) else {
+        return std::ptr::null_mut();
+    };
+    let len = bytes.data.len() as i64;
+    let mut start_idx = start.max(0).min(len);
+    let mut end_idx = end.max(0).min(len);
+    if end_idx < start_idx {
+        std::mem::swap(&mut start_idx, &mut end_idx);
+    }
+    let slice = &bytes.data[start_idx as usize..end_idx as usize];
+    if std::str::from_utf8(slice).is_err() {
+        return std::ptr::null_mut();
+    }
+    crate::pith_copy_bytes_to_cstring(slice)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_len(handle: i64) -> i64 {
     let Some(bytes) = pith_bytes_ref(handle) else {

@@ -189,24 +189,24 @@ candidate index lists for common region/active filters, which is closer to how
 an actual in-memory service would avoid rescanning the full catalog on every
 request.
 
-latest measured results on this machine, using the median of 7 trials:
+latest measured results on this machine, using the median of 5 trials:
 
 | iterations | go total | pith total | ratio | go batch | pith batch |
 |---|---:|---:|---:|---:|---:|
-| `1000000` | `3128 ms` | `851 ms` | `0.27x` | `2993 ms` | `802 ms` |
+| `1000000` | `1977 ms` | `654 ms` | `0.33x` | `1878 ms` | `593 ms` |
 
 with the optional rust workload binary built:
 
 | iterations | rust total | pith/rust | rust batch | pith/rust batch |
 |---|---:|---:|---:|---:|
-| `1000000` | `689 ms` | `1.24x` | `616 ms` | `1.30x` |
+| `1000000` | `369 ms` | `1.77x` | `323 ms` | `1.84x` |
 
 the current pith workload uses derived json struct decoding for the batch
-request. six-field flat structs now use a generated one-pass decode helper,
-while other wider structs still use one shallow scalar scan before generated
-struct construction. the rust workload uses a tiny standalone json field
-scanner, so treat it as a lower-bound runtime comparison rather than a
-serde-style library comparison.
+request. a flat struct of required scalars decodes in a single pass, filled
+straight into the struct — see the event_ledger benchmark for the details.
+the rust workload uses a tiny standalone json field scanner, so treat it as
+a lower-bound runtime comparison rather than a serde-style library
+comparison.
 
 binary size from the same build:
 
@@ -249,18 +249,18 @@ latest measured results on this machine, using the median of 5 trials:
 
 | records | go total | rust total | pith total | pith/go | pith/rust |
 |---|---:|---:|---:|---:|---:|
-| `50000` | `366 ms` | `212 ms` | `1198 ms` | `3.27x` | `5.65x` |
+| `50000` | `322 ms` | `135 ms` | `658 ms` | `2.04x` | `4.87x` |
 
 phase breakdown from the same run:
 
 | phase | go | rust | pith |
 |---|---:|---:|---:|
 | config | `0 ms` | `0 ms` | `0 ms` |
-| csv write | `204 ms` | `96 ms` | `475 ms` |
-| csv read | `106 ms` | `72 ms` | `5 ms` |
-| transform | `59 ms` | `42 ms` | `711 ms` |
+| csv write | `190 ms` | `60 ms` | `265 ms` |
+| csv read | `81 ms` | `46 ms` | `5 ms` |
+| transform | `44 ms` | `29 ms` | `382 ms` |
 | json | `0 ms` | `0 ms` | `0 ms` |
-| gzip + hash | `0 ms` | `0 ms` | `0 ms` |
+| gzip + hash | `1 ms` | `0 ms` | `1 ms` |
 | fs | `0 ms` | `0 ms` | `0 ms` |
 
 all three implementations report the same checksum:
@@ -282,8 +282,10 @@ bytes path and avoiding per-row maps brought that down to `2023 ms`. the
 url/path/hash fast paths brought it down again to about `1400 ms`. lazy csv row
 views brought it to about `1230 ms` by avoiding the full `List[List[String]]`
 read path. folding csv rows through the public module API keeps the same
-zero-copy shape and lands around `1200 ms`; the remaining gap is mostly csv
-write overhead and transform work that still turns url and path fields into
+zero-copy shape and landed around `1200 ms`; string-derive and byte-scanning
+work since (single-allocation string derives, a combined bytes-substring
+decode) took it to about `658 ms`. the remaining gap is mostly csv write
+overhead and transform work that still turns url and path fields into
 strings.
 
 three caveats matter when reading this benchmark:

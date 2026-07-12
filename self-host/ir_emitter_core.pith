@@ -4103,6 +4103,21 @@ fn ir_emit_zero_value() -> Int:
 fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
     fname := node_value(idx)
     if node.children.len() > 0:
+        # a module function used as a value: `hash.sha256_bytes` where `hash`
+        # is a module alias and the member is a function. resolve it the way a
+        # call would and wrap it into a closure value, the same as a bare
+        # function name. this must run before the receiver is evaluated — a
+        # module alias is not a loadable value.
+        recv_node := get_node(node.children[0])
+        if recv_node.kind == "ident" and ir_module_aliases.contains_key(recv_node.value):
+            expr_tid := c_get_expr_type(idx)
+            if expr_tid >= 0 and get_type_info(expr_tid).kind == "function":
+                callee := ir_resolve_static_callee(idx)
+                if callee.name.len() > 0:
+                    r := ir_reg()
+                    wrapper := ir_named_function_value_wrapper(idx, callee.name)
+                    ir_emit("closure_ref " + r.to_string() + " " + wrapper)
+                    return r
         obj_r := ir_expr(node.children[0])
         # result fields are special: `.ok` and status checks read the tagged value,
         # not a struct field.

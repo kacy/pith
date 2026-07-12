@@ -67,6 +67,10 @@ mut interface_decl_index: Map[String, Int] := {}
 mut interface_assoc_types: Map[String, String] := {}
 # an impl's bindings, keyed "ConcreteType.Item" -> bound type TID.
 mut assoc_type_binding: Map[String, Int] := {}
+# the bound type's *node* (not the resolved tid), so a binding written in terms
+# of the type's own generic params (`type Item = U`, `type Item = I.Item`) can
+# be resolved per instance with the instance's type args substituted in.
+mut assoc_type_binding_node: Map[String, Int] := {}
 # ConcreteType -> csv of the associated-type names it binds, so a call site can
 # substitute them (Item -> Int) when resolving a method's return/param types.
 mut type_assoc_names: Map[String, String] := {}
@@ -368,6 +372,27 @@ fn resolve_type_with_substitution(node_idx: Int, subst_active: Bool, subst_key: 
     # no substitution — use the normal path
     return resolve_type_implementation(node_idx)
 
+# resolve the associated type `member` of a concrete or generic-instance type.
+# for a concrete impl (IntBox.Item = Int) this is just the bound type; for a
+# generic instance (MapIter[Range,Int].Item = U) the binding is resolved with
+# the instance's type args substituted in, which recurses for `I.Item` bindings.
+fn resolve_assoc_type_of_instance(inst_tid: Int, member: String) -> Int:
+    if inst_tid < 0:
+        return TID_ERR
+    base := extract_base_type_name(get_type_name(inst_tid))
+    bkey := base + "." + member
+    if assoc_type_binding_node.contains_key(bkey) == false:
+        return TID_ERR
+    binding_node := assoc_type_binding_node[bkey]
+    mut params: List[String] := []
+    mut args: List[Int] := []
+    if struct_instance_type_args.contains_key(inst_tid):
+        args = decode_tid_list(struct_instance_type_args[inst_tid])
+        if has_generic_declaration(base):
+            bdecl := get_node(get_generic_declaration_index(base))
+            params = collect_generic_parameter_names(bdecl)
+    return resolve_type_with_substitution_map(binding_node, params, args)
+
 # resolve with a substitution map for generic params
 fn resolve_type_with_substitution_map(node_idx: Int, subst_params: List[String], subst_args: List[Int]) -> Int:
     if node_idx < 0:
@@ -375,7 +400,8 @@ fn resolve_type_with_substitution_map(node_idx: Int, subst_params: List[String],
     node := get_node(node_idx)
     if node.kind == "type":
         # a dotted `T.Item`: substitute T to its concrete type, then resolve
-        # that type's associated-type binding (Item -> the bound tid)
+        # that type's associated-type binding through the instance (which
+        # recurses when the binding is itself another type's associated type)
         if node.value.contains("."):
             dparts := node.value.split(".")
             if dparts.len() == 2:
@@ -383,10 +409,9 @@ fn resolve_type_with_substitution_map(node_idx: Int, subst_params: List[String],
                 for p in subst_params:
                     if strings_equal(p, dparts[0]):
                         if bi < subst_args.len():
-                            concrete := extract_base_type_name(get_type_name(subst_args[bi]))
-                            bkey := concrete + "." + dparts[1]
-                            if assoc_type_binding.contains_key(bkey):
-                                return assoc_type_binding[bkey]
+                            resolved := resolve_assoc_type_of_instance(subst_args[bi], dparts[1])
+                            if is_error_type(resolved) == false:
+                                return resolved
                         bi = bi + 1
         # check if this type name is a generic param that should be substituted
         mut i := 0
@@ -670,6 +695,7 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             bound_tid := resolve_type_implementation(cn.children[0])
             active_assoc_bindings.insert(cn.value, bound_tid)
             assoc_type_binding.insert(concrete_name + "." + cn.value, bound_tid)
+            assoc_type_binding_node.insert(concrete_name + "." + cn.value, cn.children[0])
             assoc_names_for_type.push(cn.value)
     if assoc_names_for_type.len() > 0:
         type_assoc_names.insert(concrete_name, assoc_names_for_type.join(","))

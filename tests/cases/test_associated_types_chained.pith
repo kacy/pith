@@ -1,0 +1,55 @@
+pub interface Iterator:
+    type Item
+    fn next() -> Item?
+
+pub struct Range:
+    cur: Int
+    hi: Int
+
+impl Iterator for Range:
+    type Item = Int
+    fn next() -> Item?:
+        if self.cur >= self.hi:
+            return none
+        v := self.cur
+        self.cur = self.cur + 1
+        return v
+
+pub struct MapIter[I, U]:
+    src: I
+    f: fn(I.Item) -> U
+
+impl Iterator for MapIter:
+    type Item = U
+    fn next() -> U?:
+        n := self.src.next()
+        if n == none:
+            return none
+        return self.f(n.value())
+
+pub struct FilterIter[I]:
+    src: I
+    p: fn(I.Item) -> Bool
+
+impl Iterator for FilterIter:
+    type Item = I.Item
+    fn next() -> I.Item?:
+        mut n := self.src.next()
+        while n != none:
+            v := n.value()
+            if self.p(v):
+                return v
+            n = self.src.next()
+        return none
+
+pub fn map_iter[I: Iterator, U](src: I, f: fn(I.Item) -> U) -> MapIter[I, U]:
+    return MapIter[I, U](src, f)
+
+pub fn filter_iter[I: Iterator](src: I, p: fn(I.Item) -> Bool) -> FilterIter[I]:
+    return FilterIter[I](src, p)
+
+fn main():
+    r := Range(cur: 0, hi: 6)
+    pipeline := filter_iter(map_iter(r, fn(x: Int) => x * x), fn(y: Int) => y > 4)
+    for z in pipeline:
+        print("{z}")

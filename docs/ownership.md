@@ -81,15 +81,15 @@ no gc pause. that covers the common case completely. the deliberate
 gaps, all bounded leaks rather than dangling pointers:
 
 - **reference cycles are not collected.** there is no cycle collector.
-  in practice a cycle is hard to even construct: structs cannot be
-  self-referential (a field cannot name its own struct type), and a
-  collection literal cannot contain itself. a cycle needs mutation to
-  close, so most programs never form one.
-- **closure environments are never freed.** a closure allocates a
-  capture environment that outlives its last use — a fixed leak per
-  closure created, plus a count on each heap value it captured. this
-  is the one routinely-reachable leak; see the closure-lifecycle note
-  in the memory hardening plan.
+  this is the one remaining reachable leak, and the vector is narrow:
+  structs cannot be self-referential (a field cannot name its own
+  struct type) and two structs cannot reference each other (the second
+  type is unknown when the first is checked), so a struct graph can
+  never close a loop. the way left to build a cycle is a closure that
+  captures a binding which transitively holds the closure — for
+  example a list that contains a closure capturing that same list.
+  such a cycle keeps its own count above zero and leaks. most programs
+  never write this shape.
 - **removed or overwritten container elements are not released until
   the container itself dies.** a borrow of an element may still be in
   flight, so the free is deferred to the container's own cleanup.
@@ -106,6 +106,14 @@ gaps, all bounded leaks rather than dangling pointers:
 
 none of these produce a dangling pointer; the discipline trades a
 bounded leak for that guarantee.
+
+closures are reference counted like any other heap value. a closure
+carries its own count and a release tag per captured slot; the last
+release walks the environment, drops the count the closure took on
+each captured value, and frees the box. a closure that dies locally is
+released at scope exit, and one that escapes transfers its count the
+same way a returned struct does — so building and discarding closures
+in a loop holds flat, outside the cycle case above.
 
 ## threads and tasks
 

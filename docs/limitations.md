@@ -74,10 +74,13 @@ correctness story:
   than guessing. the older inference path that caused a few cross-module bugs is
   gone.
 - memory reclamation is compiler-emitted reference counting (see the readme's
-  memory section). the deliberate gaps: closure environments never free,
-  reference cycles leak, container element removal leaks until the container
-  dies, and error-path early returns skip cleanup. all are bounded-leak by
-  design — the discipline never produces a dangling pointer in exchange.
+  memory section). closures are reference counted and freed like other heap
+  values. the deliberate gaps that remain: reference cycles leak (a narrow
+  case — only a closure that captures a binding reaching back to it can close
+  a loop, since struct graphs cannot), container element removal leaks until
+  the container dies, and error-path early returns skip cleanup. all are
+  bounded-leak by design — the discipline never produces a dangling pointer in
+  exchange.
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests

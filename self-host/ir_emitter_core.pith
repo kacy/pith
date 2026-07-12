@@ -618,6 +618,13 @@ fn ir_string_prepass_bind_type(parts: IrBindParts, names: List[String]) -> Strin
             bind_type = ir_checked_type(parts.val_idx)
             if bind_type.len() == 0:
                 bind_type = ir_infer_type(parts.val_idx)
+            # in a generic impl body the checker suppresses the struct's type
+            # params, so a bind from a method/call comes back with no rc kind
+            # (or an unresolved optional). the emitter's own result kind still
+            # resolves — the impl-subst context is active during the prologue —
+            # and it is exactly the lowered kind the exit cleanup releases.
+            if ir_rc_kind(bind_type).len() == 0 and (val_node.kind == "method_call" or val_node.kind == "call"):
+                bind_type = ir_expr_result_kind(parts.val_idx)
     return bind_type
 
 fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[String]):
@@ -964,6 +971,11 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
     ir_emit_func_header(full_name, param_count, ret_type)
     ir_emit_named_param("self", instance_type)
     ir_emit_fn_params(idx)
+    # like every other function body, track owned locals so the exit cleanup
+    # releases them. the impl-subst context (set above) is active here, so the
+    # prologue's bind prepass can resolve a method result's lowered kind even
+    # though the checker suppressed the struct's type params in this body.
+    ir_emit_string_prologue(body_idx)
     ir_func_returns.insert(method_key, ret_type)
     ir_func_returns.insert(full_name, ret_type)
     ir_finish_func_emission(body_idx)
@@ -4131,11 +4143,16 @@ fn ir_emit_return_stmt(node: Node):
         # a fresh count. fresh results already arrive owned.
         mut exclude := ""
         expr_node := get_node(node.children[0])
-        ret_kind := ir_rc_kind(ir_infer_type(node.children[0]))
-        if ret_kind.len() > 0:
-            if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == ret_kind:
-                exclude = expr_node.value
-            elif ir_string_expr_is_borrowed(node.children[0]):
+        # a returned tracked local transfers its count to the caller, so it
+        # must be skipped in the exit cleanup. trust the tracked kind directly:
+        # in a generic body the inferred type can miss (a tuple-lowered
+        # optional reads back as the optional type, whose rc_kind is empty),
+        # yet the local is still tracked and returning it must not release it.
+        if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value).len() > 0:
+            exclude = expr_node.value
+        else:
+            ret_kind := ir_rc_kind(ir_infer_type(node.children[0]))
+            if ret_kind.len() > 0 and ir_string_expr_is_borrowed(node.children[0]):
                 ir_rc_retain_reg(r, ret_kind)
         result_kind := ir_expr_result_kind(node.children[0])
         expr_tid := c_get_expr_type(node.children[0])
@@ -4150,7 +4167,12 @@ fn ir_emit_return_stmt(node: Node):
             # emitter's own retkind — an optional lowers to a tuple, and a
             # tuple retkind can only be the optional wrapper unless the inner
             # value is itself tuple-shaped.
-            already_optional := expr_kind == "optional" or (result_kind == "tuple" and ir_current_func_optional_inner_kind != "tuple")
+            # a local tracked as a tuple already holds the optional wrapper, so
+            # forwarding it (rather than wrapping in Some again) is the same
+            # signal as a tuple retkind — the guard against an Optional[Tuple]
+            # inner still applies.
+            ident_tuple_local := expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == "tuple"
+            already_optional := expr_kind == "optional" or ((result_kind == "tuple" or ident_tuple_local) and ir_current_func_optional_inner_kind != "tuple")
             if expr_node.kind == "none_lit":
                 r = ir_emit_optional_none_value()
             elif already_optional == false:

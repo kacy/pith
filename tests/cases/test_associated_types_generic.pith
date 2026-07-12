@@ -1,0 +1,33 @@
+# a generic function can name the associated type of its bound parameter as
+# T.Item; it resolves per concrete T at each call site. here the same function
+# returns an Int for one impl and a String for another.
+
+interface Container:
+    type Item
+    fn first() -> Item
+
+struct IntBox:
+    pub value: Int
+
+struct Tag:
+    pub label: String
+
+impl Container for IntBox:
+    type Item = Int
+    fn first() -> Item:
+        return self.value
+
+impl Container for Tag:
+    type Item = String
+    fn first() -> Item:
+        return self.label
+
+fn first_of[T: Container](c: T) -> T.Item:
+    return c.first()
+
+fn main():
+    b := IntBox(value: 42)
+    t := Tag(label: "hi")
+    print("{first_of(b)}")
+    s := first_of(t)
+    print("{s} {s.len()}")

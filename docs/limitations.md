@@ -39,12 +39,12 @@ something here that now works, the page is stale and a fix to it is welcome.
   methods (a member with a body that implementors inherit unless they
   override it), associated types (`type Item` on the interface, bound
   per impl with `type Item = Int`), single and multiple bounds, and
-  generic interfaces. an associated type is usable in the impl's own
-  method signatures; it is not yet resolvable in generic `T.Item`
-  position (a `fn f[T: Container](x: T) -> T.Item` still reports the
-  associated type as unknown). `where` clauses are unsupported. there is
-  no method-completeness check: an impl that omits a non-default method
-  is caught at the call site (E209), not at the impl block.
+  generic interfaces. an associated type resolves both inside the impl's
+  own methods and in generic `T.Item` position — a
+  `fn f[T: Container](c: T) -> T.Item` returns the right type for each
+  concrete `T`. `where` clauses are unsupported. there is no
+  method-completeness check: an impl that omits a non-default method is
+  caught at the call site (E209), not at the impl block.
 
 ## standard library
 

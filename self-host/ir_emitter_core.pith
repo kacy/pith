@@ -4869,6 +4869,23 @@ fn ir_generic_arg_tids(node: Node) -> List[Int]:
         arg_tids.push(c_get_expr_type(expr_idx))
     return arg_tids
 
+# resolve a `T.Item` type name through a generic specialization: substitute the
+# base param (T -> the concrete type) then look up that type's assoc binding.
+fn ir_resolve_assoc_in_generic(type_name: String, params: List[String], concrete: List[String]) -> String:
+    if type_name.contains(".") == false:
+        return type_name
+    parts := type_name.split(".")
+    if parts.len() != 2:
+        return type_name
+    mut i := 0
+    for p in params:
+        if p == parts[0] and i < concrete.len():
+            akey := ir_strip_type_args(concrete[i]) + "." + parts[1]
+            if ir_assoc_bindings.contains_key(akey):
+                return ir_assoc_bindings[akey]
+        i = i + 1
+    return type_name
+
 fn ir_emit_generic_specialization(key: String):
     if not ir_generic_specialization_names.contains_key(key):
         return
@@ -4882,8 +4899,12 @@ fn ir_emit_generic_specialization(key: String):
     spec_name := ir_generic_specialization_names[key]
     body_idx := ir_find_body(decl_idx)
     param_count := ir_param_count(decl_idx)
-    ret_type := ir_extract_return_type_with_subst(decl_idx, generic_params, concrete_types)
-    param_types := ir_extract_param_types_with_subst(decl_idx, generic_params, concrete_types)
+    ret_type := ir_resolve_assoc_in_generic(ir_extract_return_type_with_subst(decl_idx, generic_params, concrete_types), generic_params, concrete_types)
+    mut param_types := ir_extract_param_types_with_subst(decl_idx, generic_params, concrete_types)
+    mut resolved_param_types: List[String] := []
+    for pt in param_types:
+        resolved_param_types.push(ir_resolve_assoc_in_generic(pt, generic_params, concrete_types))
+    param_types = resolved_param_types
     saved_params := ir_active_generic_params
     saved_types := ir_active_generic_concrete_types
     saved_module_path := ir_active_generic_module_path
@@ -4896,7 +4917,7 @@ fn ir_emit_generic_specialization(key: String):
     else:
         ir_active_generic_module_path = ""
     ir_prepare_func_emission(ret_type)
-    ir_current_func_optional_inner_kind = ir_extract_optional_inner_type_with_subst(decl_idx, generic_params, concrete_types)
+    ir_current_func_optional_inner_kind = ir_resolve_assoc_in_generic(ir_extract_optional_inner_type_with_subst(decl_idx, generic_params, concrete_types), generic_params, concrete_types)
     ir_current_func_returns_result = ir_fn_returns_result(decl_idx)
     ir_emit_func_header(spec_name, param_count, ret_type)
     ir_emit_fn_params_with_types(decl_idx, param_types)

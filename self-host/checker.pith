@@ -304,6 +304,12 @@ fn resolve_named_type(name: String) -> Int:
     # being processed (e.g. `Item` -> `Int` inside `impl Container for IntBox`)
     if active_assoc_bindings.contains_key(name):
         return active_assoc_bindings[name]
+    # a dotted `T.Item` where T is a suppressed generic param isn't a real type
+    # yet — dispatch substitutes T and resolves the binding later
+    if name.contains("."):
+        dparts := name.split(".")
+        if dparts.len() == 2 and suppress_unknown_type_for.contains_key(dparts[0]):
+            return TID_ERR
     resolved_name := resolve_imported_type_name(name)
     tid := lookup_type_id(resolved_name)
     if tid < 0:
@@ -368,6 +374,20 @@ fn resolve_type_with_substitution_map(node_idx: Int, subst_params: List[String],
         return TID_ERR
     node := get_node(node_idx)
     if node.kind == "type":
+        # a dotted `T.Item`: substitute T to its concrete type, then resolve
+        # that type's associated-type binding (Item -> the bound tid)
+        if node.value.contains("."):
+            dparts := node.value.split(".")
+            if dparts.len() == 2:
+                mut bi := 0
+                for p in subst_params:
+                    if strings_equal(p, dparts[0]):
+                        if bi < subst_args.len():
+                            concrete := extract_base_type_name(get_type_name(subst_args[bi]))
+                            bkey := concrete + "." + dparts[1]
+                            if assoc_type_binding.contains_key(bkey):
+                                return assoc_type_binding[bkey]
+                        bi = bi + 1
         # check if this type name is a generic param that should be substituted
         mut i := 0
         for p in subst_params:

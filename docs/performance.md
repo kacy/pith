@@ -10,47 +10,63 @@ the helpers in `bench/` before trusting them on different hardware.
 ## where pith stands
 
 all numbers from one 2-core machine in one sitting, july 2026,
-medians of 5 where quick enough to repeat. rerun 2026-07-11 after a
-long correctness and memory pass — the value-lowering fixes, the
-closure lifecycle (closures are reference counted now, not leaked),
-error-path cleanup, wider enum payload boxing, and atomic-cell
-contexts. catalog 111ms (median of 104-130), pipeline 683ms (659-762),
-go and rust comparators steady (go catalog ~393, go pipeline ~303,
-rust catalog 68). flat against the previous 111ms / 671ms — the extra
-retain/release traffic and cleanup those fixes add never shows on
-these benchmarks, which build and drop collections rather than
-closures or error paths. peak rss stayed healthy: catalog 51 mb at
-200k iterations, pipeline 108 mb at 50k records. the takeaway held one
-more time: correctness came free. the rust pipeline comparator's
-source is no longer in bench/, so its column is historical. absolute
-values drift a few percent between days; within a table they're
-comparable.
-comparators: go 1.24.4 (net/http, encoding/*), rust (a minimal
-hand-rolled http server modeling the same blocking loop — not a full
-stack, read it generously).
+medians of 5 where quick enough to repeat. rerun 2026-07-12 after a
+json-decoding pass: a flat struct of required scalars now decodes in a
+single pass, filled straight into the struct (see event_ledger below).
+that turned json struct decode from pith's slowest per-record step into
+one of its fastest — faster than go's reflection decode.
+
+the comparators drift a few percent between days; within a table they
+are comparable. go 1.24.4 (net/http, encoding/*); rust either a pinned
+crate set (std_pipeline) or a tiny hand-rolled scanner (catalog), read
+those generously.
 
 `bench/catalog_workload` — service-shaped compute: lookups, filtered
 searches, batch json; 200k iterations:
 
 | | go | rust | pith |
 |---|---|---|---|
-| total | 393ms | 68ms | **111ms** |
+| total | 401ms | 73ms | **131ms** |
 
-3.5x faster than go, within 1.6x of rust.
+3x faster than go, within 1.8x of rust. the batch json phase (~120ms)
+dominates. this rose from ~111ms when the old six-field decode helper
+was retired for the general single-pass decoder — the specialized
+helper was a little quicker but never freed the strings it decoded;
+the general one attaches the struct destructor, so it is a touch slower
+and no longer leaks.
 
 `bench/std_pipeline` — 50k records: csv read/write, transform, json,
 gzip:
 
 | phase | go | rust | pith |
 |---|---|---|---|
-| csv read | 85 | 52 | **6** |
-| csv write | 191 | 63 | 271 |
-| transform | 51 | 29 | 395 |
-| total | 303 | 144 | 683 |
+| csv read | 81 | 46 | **5** |
+| csv write | 190 | 60 | 265 |
+| transform | 44 | 29 | 382 |
+| total | 322 | 135 | 658 |
 
-2.2x go overall (4.1x when this document began). peak rss at 200k
+2.0x go overall (4.1x when this document began). peak rss at 200k
 records: go 254 mb, rust 273 mb, pith 436 mb — 1.7x go, down from
 5.3x pre-reclaim.
+
+`bench/event_ledger` — an ndjson event pipeline in four languages
+(pith, go, rust, zig): decode json into structs, aggregate with maps
+and a set, sign an hmac-sha256 summary. 200k events:
+
+| phase | go | rust | zig | pith |
+|---|---|---|---|---|
+| gen | 105 | 31 | 21 | 317 |
+| parse | 337 | 57 | 97 | **179** |
+| analyze | 15 | 25 | 9 | 55 |
+| total | 457 | 114 | 128 | **551** |
+
+about 1.2x go on the total, and `parse` — decoding json into a struct —
+is now faster than go's reflection decode: a flat scalar struct is
+filled in a single pass straight into the struct, no intermediate map
+and no per-field allocation. the remaining gap to go is `gen`, which is
+string assembly. the aggregate checksum and the hmac digest come out
+identical across all four languages, which is how the benchmark proves
+they do the same work.
 
 collection churn — a list and map built and dropped per iteration,
 200k iterations:

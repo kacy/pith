@@ -1,0 +1,26 @@
+# a method that returns a freshly built string transfers ownership to the
+# caller; the caller must not retain the result again. bound to a local in a
+# loop, this must stay balanced (before, the caller over-retained and one
+# string leaked per call). a method returning a borrowed field must still be
+# retained, so both are exercised here.
+
+struct SBox:
+    pub seed: String
+
+impl SBox:
+    fn wrap(x: String) -> String:
+        return "{self.seed}:{x}"
+
+    fn label() -> String:
+        return self.seed
+
+fn main():
+    mut total := 0
+    mut i := 0
+    while i < 1000:
+        b := SBox(seed: "s")
+        fresh := b.wrap("x")
+        borrowed := b.label()
+        total = total + fresh.len() + borrowed.len()
+        i = i + 1
+    print("{total}")

@@ -706,7 +706,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_closure_lifecycle tests/cases/test_error_path_cleanup \
 	tests/cases/test_atomic_context tests/cases/test_tuple_ownership \
 	tests/cases/test_struct_closure_field tests/cases/test_generic_struct_field_dtor \
-	tests/cases/test_iterator_drain
+	tests/cases/test_iterator_drain tests/cases/test_method_fresh_string_return
 
 memcheck: build
 	@echo "--- memcheck (valgrind, curated) ---"

@@ -12,7 +12,7 @@ from ast import Node, get_node, node_kind
 from ir_builder import ir_emit, ir_reg, ir_str, ir_label, ir_new_temp_name, ir_var_types
 from checker import c_get_expr_type
 from ir_alias_registry import ir_config_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_is_config_decode_callee, ir_is_config_file_decode_callee, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_toml_require_full_name_for_type_name
-from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_tag, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_toml_require_helper_name
+from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_tag, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_toml_require_helper_name
 from ir_generics import ir_generic_decl_indices, ir_config_generic_name_with_state, ir_generic_preferred_name, ir_json_generic_name_with_state, ir_queue_generic_specialization, ir_resolve_generic_module_call_name, ir_toml_generic_name_with_state
 from ir_optionals import ir_emit_optional_none_value, ir_emit_optional_some_value
 from ir_path_helpers import ir_emit_dotted_path_lookup, ir_emit_dotted_path_lookup_or_return
@@ -812,8 +812,50 @@ pub fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+# a flat struct whose fields are all plain required scalars can decode
+# straight from the object bytes with per-key scanners, skipping the
+# intermediate scalar-object (and its three maps and key allocations).
+fn ir_json_decode_all_required_scalar(target_info: TypeInfo) -> Bool:
+    if target_info.fields.len() == 0:
+        return false
+    for field_name, i in target_info.fields:
+        if i >= target_info.field_types.len():
+            return false
+        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
+        if ir_optional_inner_tid(field_tid) >= 0:
+            return false
+        if ir_struct_field_default_node(target_info.name, field_name) >= 0:
+            return false
+        if ir_json_scan_required_helper_name(field_tid).len() == 0:
+            return false
+    return true
+
+# the fast path: one per-key byte scan per field, no scalar-object.
+fn ir_emit_json_decode_scan_fields(input_r: Int, target_info: TypeInfo) -> Int:
+    temp_name := ir_new_temp_name("json_decode")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    mut field_regs: List[Int] := []
+    for field_name, i in target_info.fields:
+        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
+        helper_name := ir_json_scan_required_helper_name(field_tid)
+        key_r := ir_reg()
+        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
+        field_result_r := ir_reg()
+        ir_emit_call2(field_result_r, helper_name, "tuple", input_r, key_r)
+        ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
+        field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
+    ir_emit_struct_result_store(field_regs, "struct:" + target_info.name, temp_name)
+    ir_emit_label(done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    return r
+
 ## emit the json decode map call sequence.
 pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
+    if ir_json_decode_all_required_scalar(target_info):
+        return ir_emit_json_decode_scan_fields(input_r, target_info)
+
     temp_name := ir_new_temp_name("json_decode")
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()

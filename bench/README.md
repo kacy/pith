@@ -43,20 +43,23 @@ Latest measured results on this machine, 200000 events, median of 5:
 
 | lang | gen | parse | analyze | sign | total |
 |---|---:|---:|---:|---:|---:|
-| pith | 305 | 1084 | 99 | 1 | 1472 |
-| go | 102 | 346 | 14 | 0 | 501 |
-| rust | 29 | 59 | 22 | 0 | 111 |
-| zig | 19 | 103 | 9 | 0 | 135 |
+| pith | 311 | 810 | 65 | 0 | 1172 |
+| go | 106 | 336 | 15 | 0 | 465 |
+| rust | 27 | 57 | 23 | 0 | 110 |
+| zig | 20 | 103 | 9 | 0 | 135 |
 
 (ms; `gen` builds the stream, `parse` decodes it into structs, `analyze`
 runs the map/set rollup, `sign` is the HMAC.)
 
 Read this honestly: Rust and Zig are fastest, Go sits in the middle, and
-Pith is about 3x Go and roughly 12x the systems languages. The gap is
-concentrated in `parse` — decoding JSON into a struct line by line is
-Pith's slowest step here; its map-and-set `analyze` phase is closer but
-still behind. Pith is a young self-hosted compiler and it shows on raw
-throughput. What the benchmark does show in Pith's favor is reach: the
+Pith is about 2.5x Go and roughly 10x the systems languages. The gap is
+still concentrated in `parse` — decoding JSON into a struct line by line
+is Pith's slowest step — but it used to be worse. The first cut of this
+benchmark put Pith's parse at 1084ms; a flat struct of required scalars
+now decodes straight from the object bytes (one keyed scan per field, no
+intermediate map), which brought parse to about 810ms and the total from
+1472ms to 1172ms. Pith is a young self-hosted compiler and it still shows
+on raw throughput. What the benchmark shows in Pith's favor is reach: the
 whole pipeline — JSON, collections, HMAC-SHA256 — is standard library
 with no dependencies to add, and it compiles in a fraction of the time
 the others take to build. Speed is the honest weak spot; breadth and

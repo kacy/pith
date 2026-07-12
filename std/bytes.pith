@@ -71,6 +71,12 @@ pub fn to_string_utf8(data: Bytes) -> String!:
         fail text.err.message
     return text.ok
 
+# decode a byte range as utf-8 in one step. equivalent to
+# to_string_utf8(slice(data, start, end)) but without the intermediate
+# byte-slice allocation, which matters in tight scanning loops.
+pub fn substring_utf8(data: Bytes, start: Int, end: Int) -> String!:
+    return bytes_substring_utf8(data, start, end)
+
 # create an empty byte buffer.
 pub fn buffer() -> ByteBuffer:
     return ByteBuffer(byte_buffer_handle(0))

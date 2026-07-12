@@ -967,7 +967,9 @@ fn ir_record_struct_field(struct_name: String, field_names: List[String], field_
     updated_fields.push(field_name)
     if field_node.children.len() > 0:
         type_node := get_node(field_node.children[0])
-        if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "optional_type":
+        # a closure field (fn_type) must be recorded too, or the struct's
+        # destructor won't know to release it and the closure leaks
+        if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "optional_type" or type_node.kind == "fn_type":
             ir_struct_field_lookup.insert(struct_name + "." + field_name, ir_resolve_type_node(field_node.children[0]))
         if field_node.children.len() > 1:
             ir_struct_field_default_nodes.insert(struct_name + "." + field_name, field_node.children[1])

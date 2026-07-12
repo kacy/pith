@@ -1,0 +1,19 @@
+# a struct that holds a closure field must retain it on store and release it
+# when the struct is destroyed, or the closure leaks. built and dropped in a
+# loop, this must stay balanced (no leak, no double free).
+
+struct Adder:
+    f: fn(Int) -> Int
+
+fn apply(a: Adder, x: Int) -> Int:
+    g := a.f
+    return g(x)
+
+fn main():
+    mut total := 0
+    mut i := 0
+    while i < 1000:
+        a := Adder(f: fn(n: Int) => n + i)
+        total = total + apply(a, i)
+        i = i + 1
+    print("{total}")

@@ -1,0 +1,18 @@
+# a module-qualified function can be passed as a fn value, not only called.
+# `hash.sha256_bytes` resolves to the module function and is wrapped into a
+# closure the same way a bare function name is.
+
+import std.hash as hash
+import std.bytes as bytes
+
+fn digest_len(f: fn(Bytes) -> Bytes, v: Bytes) -> Int:
+    return f(v).len()
+
+fn main():
+    d := bytes.from_string_utf8("abc")
+    # different module functions selected at the call site
+    print("{digest_len(hash.sha256_bytes, d)}")
+    print("{digest_len(hash.sha512_bytes, d)}")
+    # also bound to a local first, then called
+    g := hash.sha1_bytes
+    print("{g(d).len()}")

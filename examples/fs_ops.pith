@@ -23,13 +23,13 @@ fn do_test() -> String!:
 
     # read it back with the whole-file helper
     content := fs.read(text_path)!
-    print("content: " + content)
+    print("content: {content}")
 
     # stream the same file through std.io
     reader := fs.open(text_path)!
     streamed := reader.read_all()!
     reader.close()
-    print("streamed: " + streamed)
+    print("streamed: {streamed}")
 
     # list directory
     entries := fs.list("/tmp")
@@ -46,7 +46,7 @@ fn do_test() -> String!:
 
     # recursive copy keeps nested files
     fs.copy_tree(src_root, tree_root)!
-    print("tree copy: " + fs.read(path.join(path.join(tree_root, "nested"), "leaf.txt"))!)
+    print("tree copy: {fs.read(path.join(path.join(tree_root, "nested"), "leaf.txt"))!}")
 
     # temp files are handy for scratch output
     temp_file := fs.make_temp_file("pith_fs_example_", ".txt")!

@@ -13,8 +13,8 @@ fn handle_app(req: HttpRequestBytes, reader: BufferedBytesReader, writer: Buffer
         mut name := req.query_param("name")!
         if name == "":
             name = "stranger"
-        http.send_buffered(writer, http.html(200, "<h1>Hello, " + name + "!</h1>"))!
-        return "http:" + name
+        http.send_buffered(writer, http.html(200, "<h1>Hello, {name}!</h1>"))!
+        return "http:{name}"
     http.send_buffered(writer, http.not_found_response())!
     return "http:404"
 fn main() -> Int!:

@@ -1,31 +1,25 @@
-# A lazy map adapter built on the iterator protocol:
-#
-#   - MapIter[I, T, U] wraps a source iterator and a closure;
-#   - its next() pulls from self.src.next() (dispatched via per-instance
-#     method specialization), unwraps with n.value(), and applies self.f
-#     (the closure-field-call path from #212);
-#   - `return self.f(n.value())` from a `U?`-returning method in a generic
-#     impl body returns the closure's result without a redundant Some wrap.
-#
-# Defined here in the test file rather than std.iter because the cross-module
-# specialization-symbol-prefix routing is a known follow-up. Inline use works
-# end-to-end today.
+# a user-defined lazy map adapter on the associated-type iterator protocol: a
+# struct with an associated Item and a next() -> Item?, wrapping a source
+# iterator and a closure. confirms a user can define their own adapter against
+# the stdlib Iterator interface, not just the ones std.iter ships. next() pulls
+# from self.src.next(), unwraps with n.value(), and applies the closure field.
 
 from std.iter import Range, to_list, Iterator
 
-struct MapIter[I, T, U]:
+struct MapIter[I, U]:
     src: I
-    f: fn(T) -> U
+    f: fn(I.Item) -> U
 
-impl Iterator[U] for MapIter:
+impl Iterator for MapIter:
+    type Item = U
     fn next() -> U?:
         n := self.src.next()
         if n == none:
             return none
         return self.f(n.value())
 
-fn map_iter[I: Iterator[T], T, U](src: I, f: fn(T) -> U) -> MapIter[I, T, U]:
-    return MapIter[I, T, U](src, f)
+fn map_iter[I: Iterator, U](src: I, f: fn(I.Item) -> U) -> MapIter[I, U]:
+    return MapIter[I, U](src, f)
 
 fn main():
     out := to_list(map_iter(Range(0, 5), fn(x: Int) => x * 10))

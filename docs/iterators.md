@@ -68,15 +68,17 @@ hand to an adapter; the sugar is faster otherwise.
 from std.iter import Iterator, Range, to_list, map_iter, filter_iter
 ```
 
-- `Iterator[T]` — the interface (`fn next() -> T?`). Bound on it when
-  you want a generic function that walks any iterator:
-  `fn to_list[I: Iterator[T], T](it: I) -> List[T]`.
+- `Iterator` — the interface. It declares an associated element type and
+  a `next()` over it: `type Item` and `fn next() -> Item?`. Bound on it
+  when you want a generic function that walks any iterator, and name the
+  element type as `I.Item`:
+  `fn to_list[I: Iterator](it: I) -> List[I.Item]`.
 - `Range(lo, hi)` — a `[lo, hi)` value you can hold. Carries its own
   cursor and follows the protocol, so it plugs into the adapters. The
   for-loop sugar is faster when you just want a counted loop.
-- `to_list(it)` — drains any iterator into a `List[T]`. `T` is
-  inferred from the `Iterator[T]` bound, so you don't write the type
-  argument.
+- `to_list(it)` — drains any iterator into a `List[I.Item]`. The element
+  type comes from the iterator's associated `Item`, so you never write a
+  type argument.
 - `map_iter(src, f)` / `filter_iter(src, p)` — lazy adapters. Each call
   wraps the source iterator with a closure and produces a new iterator
   whose `next()` pulls from the source on demand.
@@ -117,27 +119,32 @@ why nested adapters fuse.
 ## writing your own adapter
 
 The same pattern works for adapters you write yourself. The shape is:
-hold a source iterator (and any state you need), implement
-`Iterator[T]` on the struct, and write `next()` to pull from
-`self.src.next()`:
+hold a source iterator (and any state you need), implement `Iterator` on
+the struct — binding `Item` to whatever it yields — and write `next()` to
+pull from `self.src.next()`:
 
 ```pith
 from std.iter import Iterator
 
-struct Take[I, T]:
+struct Take[I]:
     src: I
     left: Int
 
-impl Iterator[T] for Take:
-    fn next() -> T?:
+impl Iterator for Take:
+    type Item = I.Item
+    fn next() -> I.Item?:
         if self.left <= 0:
             return none
         self.left = self.left - 1
         return self.src.next()
 
-fn take[I: Iterator[T], T](src: I, n: Int) -> Take[I, T]:
-    return Take[I, T](src, n)
+fn take[I: Iterator](src: I, n: Int) -> Take[I]:
+    return Take[I](src, n)
 ```
+
+A `Take` passes its source's elements straight through, so its `Item` is
+the source's `Item`. A `map`-style adapter that transforms elements binds
+`Item` to the closure's result type instead (`type Item = U`).
 
 A few practical notes:
 
@@ -146,10 +153,9 @@ A few practical notes:
   source's `next` at IR time.
 - When you've already checked an optional, `n.value()` extracts the
   inner value: `if n == none: return none; return f(n.value())`.
-- The compiler infers `T` from the `Iterator[T]` bound on the source
-  type. If inference can't see through a particular call (rare in
-  practice), the multi-arg explicit form `take[Range, Int](r, 3)`
-  is always available as the escape hatch.
+- The element type is the source's associated `Item` — no redundant type
+  parameter to thread. `I.Item` resolves through a chain of adapters, so
+  `Take[MapIter[Range, Int]]` yields the right element type on its own.
 
 ## when to use what
 

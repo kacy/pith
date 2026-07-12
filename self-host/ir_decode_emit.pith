@@ -9,17 +9,18 @@
 # the module graph a dag.
 
 from ast import Node, get_node, node_kind
+from ir_ast_helpers import ir_unwrap_pub_node
 from ir_builder import ir_emit, ir_reg, ir_str, ir_label, ir_new_temp_name, ir_var_types
 from checker import c_get_expr_type
 from ir_alias_registry import ir_config_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_is_config_decode_callee, ir_is_config_file_decode_callee, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_toml_require_full_name_for_type_name
-from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_tag, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_toml_require_helper_name
+from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_tag, ir_json_field_type_char, ir_json_type_name_char, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_toml_require_helper_name
 from ir_generics import ir_generic_decl_indices, ir_config_generic_name_with_state, ir_generic_preferred_name, ir_json_generic_name_with_state, ir_queue_generic_specialization, ir_resolve_generic_module_call_name, ir_toml_generic_name_with_state
 from ir_optionals import ir_emit_optional_none_value, ir_emit_optional_some_value
 from ir_path_helpers import ir_emit_dotted_path_lookup, ir_emit_dotted_path_lookup_or_return
 from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_zero_reg
 from ir_result_flow import ir_emit_result_return_error_branch, ir_emit_result_store_error_branch
-from ir_struct_registry import ir_struct_field_count, ir_struct_field_default_node, ir_struct_field_name_at, ir_struct_has_default_fields, ir_struct_names
-from ir_struct_result_helpers import ir_emit_struct_result_return, ir_emit_struct_result_store
+from ir_struct_registry import ir_struct_base_name, ir_struct_decl_nodes, ir_struct_field_count, ir_struct_field_default_node, ir_struct_field_name_at, ir_struct_has_default_fields, ir_struct_names
+from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_struct_result_return, ir_emit_struct_result_store
 from ir_type_helpers import ir_type_from_tid
 from types import get_type_info, lookup_type_id
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label
@@ -818,6 +819,8 @@ pub fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
 fn ir_json_decode_all_required_scalar(target_info: TypeInfo) -> Bool:
     if target_info.fields.len() == 0:
         return false
+    if not ir_struct_decl_nodes.contains_key(target_info.name):
+        return false
     for field_name, i in target_info.fields:
         if i >= target_info.field_types.len():
             return false
@@ -831,21 +834,86 @@ fn ir_json_decode_all_required_scalar(target_info: TypeInfo) -> Bool:
     return true
 
 # the fast path: one per-key byte scan per field, no scalar-object.
+# build the packed field spec ("<type><name>,..." in declaration order,
+# so a field's position is its struct slot) from a struct's decl node.
+# used both when interning the spec in the string prepass and when the
+# decoder references it, so the two always produce the identical string.
+pub fn ir_json_decode_spec_from_decl(decl: Node) -> String:
+    mut spec := ""
+    mut first := true
+    for child in decl.children:
+        fnode := ir_unwrap_pub_node(child)
+        if fnode.kind == "field" and fnode.children.len() > 0:
+            if not first:
+                spec = spec + ","
+            first = false
+            fname := fnode.value.split(" ")[0]
+            type_node := get_node(fnode.children[0])
+            spec = spec + ir_json_type_name_char(type_node.value) + fname
+    return spec
+
+# 2^n - 1: one bit per field, the mask when every field was filled.
+fn ir_json_required_mask(n: Int) -> Int:
+    mut mask := 0
+    mut i := 0
+    while i < n:
+        mask = mask * 2 + 1
+        i = i + 1
+    return mask
+
+# string is the only rc scalar, so the struct needs its destructor when
+# any field is a string — otherwise those field strings would leak.
+fn ir_json_decode_has_string(target_info: TypeInfo) -> Bool:
+    for field_name, i in target_info.fields:
+        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
+        if ir_json_field_type_char(field_tid) == "s":
+            return true
+    return false
+
+# the fast path: decode a flat scalar struct in a single pass. the
+# runtime fills a pre-allocated struct — destructor attached — in place,
+# so there is no scalar-object, no per-field result tuple, and no leaked
+# field strings. a mask of the filled fields is checked against the
+# required set; any miss releases the struct and returns the decode error.
 fn ir_emit_json_decode_scan_fields(input_r: Int, target_info: TypeInfo) -> Int:
     temp_name := ir_new_temp_name("json_decode")
     ir_var_types.insert(temp_name, "tuple")
+    ok_l := ir_label()
+    err_l := ir_label()
     done_l := ir_label()
-    mut field_regs: List[Int] := []
-    for field_name, i in target_info.fields:
-        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
-        helper_name := ir_json_scan_required_helper_name(field_tid)
-        key_r := ir_reg()
-        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
-        field_result_r := ir_reg()
-        ir_emit_call2(field_result_r, helper_name, "tuple", input_r, key_r)
-        ir_emit_result_store_error_branch(field_result_r, temp_name, done_l)
-        field_regs.push(ir_emit_json_field_ok(field_result_r, field_tid))
-    ir_emit_struct_result_store(field_regs, "struct:" + target_info.name, temp_name)
+    n := target_info.fields.len()
+
+    struct_r := ir_reg()
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " " + n.to_string())
+    ir_emit_call1(struct_r, "__struct_alloc", "struct:" + target_info.name, count_r)
+    if ir_json_decode_has_string(target_info):
+        dtor_r := ir_reg()
+        ir_emit("funcref " + dtor_r.to_string() + " __dtor_" + ir_struct_base_name(target_info.name))
+        ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + struct_r.to_string() + " " + dtor_r.to_string())
+
+    spec_r := ir_reg()
+    ir_emit("strref " + spec_r.to_string() + " " + ir_str(ir_json_decode_spec_from_decl(get_node(ir_struct_decl_nodes[target_info.name]))))
+
+    mask_r := ir_reg()
+    ir_emit_call_text(mask_r, "pith_json_fill_struct", "int", 3, " " + input_r.to_string() + " " + spec_r.to_string() + " " + struct_r.to_string())
+
+    req_r := ir_reg()
+    ir_emit("iconst " + req_r.to_string() + " " + ir_json_required_mask(n).to_string())
+    eq_r := ir_reg()
+    ir_emit("eq " + eq_r.to_string() + " " + mask_r.to_string() + " " + req_r.to_string())
+    ir_emit("brif " + eq_r.to_string() + " " + ok_l + " " + err_l)
+
+    ir_emit_label(err_l)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", struct_r)
+    err_res_r := ir_reg()
+    ir_emit_call_text(err_res_r, "pith_json_decode_missing_error", "tuple", 2, " " + mask_r.to_string() + " " + spec_r.to_string())
+    ir_emit("store " + temp_name + " " + err_res_r.to_string())
+    ir_emit("jmp " + done_l)
+
+    ir_emit_label(ok_l)
+    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple_raw(struct_r).to_string())
+
     ir_emit_label(done_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
@@ -1003,26 +1071,6 @@ pub fn ir_emit_json_decode_object_value(target_info: TypeInfo, handle_r: Int, in
     ir_emit_struct_result_store(field_regs, "struct:" + target_info.name, temp_name)
 
 ## emit the json decode flat6 call sequence.
-pub fn ir_emit_json_decode_flat6_call(input_r: Int, target_info: TypeInfo) -> Int:
-    result_r := ir_reg()
-    mut arg_text := " " + input_r.to_string()
-
-    for field_name, i in target_info.fields:
-        if i >= target_info.field_types.len():
-            continue
-        field_tid := target_info.field_types[i]
-        tag := ir_json_field_type_tag(field_tid)
-        if tag < 0:
-            return ir_zero_reg()
-        key_r := ir_reg()
-        ir_emit("strref " + key_r.to_string() + " " + ir_str(field_name))
-        tag_r := ir_reg()
-        ir_emit("iconst " + tag_r.to_string() + " " + tag.to_string())
-        arg_text = arg_text + " " + key_r.to_string() + " " + tag_r.to_string()
-
-    ir_emit_call_text(result_r, "json_decode_flat6", "tuple", 13, arg_text)
-    return result_r
-
 ## emit the json decode call sequence.
 pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
     arg_regs := ir_decode_collect_arg_regs(node, 1, emit_expr)
@@ -1070,8 +1118,10 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
         converted_r := ir_reg()
         ir_emit_call1(converted_r, "std_bytes_from_string_utf8", "bytes", input_r)
         input_r = converted_r
-    if target_info.fields.len() == 6 and not has_optional_fields and not has_default_fields:
-        return ir_emit_json_decode_flat6_call(input_r, target_info)
+    # any flat struct of required scalars decodes in one pass straight
+    # into a pre-allocated struct, whatever its field count.
+    if ir_json_decode_all_required_scalar(target_info):
+        return ir_emit_json_decode_scan_fields(input_r, target_info)
     if target_info.fields.len() > 3 or has_optional_fields or has_default_fields:
         return ir_emit_json_decode_map_call(input_r, target_info, emit_expr, emit_value)
 

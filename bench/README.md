@@ -43,27 +43,29 @@ Latest measured results on this machine, 200000 events, median of 5:
 
 | lang | gen | parse | analyze | sign | total |
 |---|---:|---:|---:|---:|---:|
-| pith | 311 | 810 | 65 | 0 | 1172 |
-| go | 106 | 336 | 15 | 0 | 465 |
-| rust | 27 | 57 | 23 | 0 | 110 |
-| zig | 20 | 103 | 9 | 0 | 135 |
+| pith | 317 | 179 | 55 | 0 | 551 |
+| go | 105 | 337 | 15 | 0 | 457 |
+| rust | 31 | 57 | 25 | 0 | 114 |
+| zig | 21 | 97 | 9 | 0 | 128 |
 
 (ms; `gen` builds the stream, `parse` decodes it into structs, `analyze`
 runs the map/set rollup, `sign` is the HMAC.)
 
-Read this honestly: Rust and Zig are fastest, Go sits in the middle, and
-Pith is about 2.5x Go and roughly 10x the systems languages. The gap is
-still concentrated in `parse` — decoding JSON into a struct line by line
-is Pith's slowest step — but it used to be worse. The first cut of this
-benchmark put Pith's parse at 1084ms; a flat struct of required scalars
-now decodes straight from the object bytes (one keyed scan per field, no
-intermediate map), which brought parse to about 810ms and the total from
-1472ms to 1172ms. Pith is a young self-hosted compiler and it still shows
-on raw throughput. What the benchmark shows in Pith's favor is reach: the
-whole pipeline — JSON, collections, HMAC-SHA256 — is standard library
-with no dependencies to add, and it compiles in a fraction of the time
-the others take to build. Speed is the honest weak spot; breadth and
-build time are the honest strengths.
+Read this honestly. Rust and Zig are fastest; Pith and Go are close, with
+Pith about 1.2x Go on the total. The interesting part is `parse`: a flat
+struct of required scalars decodes in a single pass, straight into the
+struct — Pith's runtime fills it in place, no intermediate map and no
+per-field allocation. That makes Pith's `parse` the second-fastest of
+the four here, ahead of Go's reflection-based decode. It was not always
+so: the first cut of this benchmark had Pith at 1084ms on parse and
+1472ms total; the single-pass decoder took parse to ~179ms and the total
+to ~551ms.
+
+What's left of the gap is now the `gen` phase — building the event stream
+is string-assembly, still Pith's slower area — and the map/set rollup.
+And the whole pipeline — JSON, collections, HMAC-SHA256 — is standard
+library with no dependencies to add, and compiles in a fraction of the
+time the others take to build.
 
 | | Go | Pith |
 |---|---|---|

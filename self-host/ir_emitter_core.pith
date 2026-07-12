@@ -141,6 +141,13 @@ mut ir_current_impl_type := ""
 # resolve to the right concrete type for dispatch (e.g., `Range` not `I`).
 mut ir_current_impl_subst_params: List[String] := []
 mut ir_current_impl_subst_args: List[String] := []
+# per-instance destructors needed for generic structs built via the backend
+# constructor call (`Name[params](...)` inside a generic function). keyed by the
+# sanitized instance symbol: one map holds the base struct name, the other the
+# instance's concrete type-arg names (joined by chr(1), which never appears in a
+# type name) so the destructor body can substitute them into each field type.
+mut ir_generic_dtor_base: Map[String, String] := {}
+mut ir_generic_dtor_args: Map[String, String] := {}
 mut ir_preloaded_import_roots: List[Int] := []
 mut ir_preloaded_import_paths: List[String] := []
 mut ir_emit_tests := false
@@ -2279,6 +2286,93 @@ fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
         arg_nodes.push(child)
     return ir_emit_struct_positional_init(expr_info.name, arg_nodes)
 
+# substitute a base field type name that is a bare generic param (I, T, U) with
+# the instance's concrete type name; anything else passes through unchanged.
+fn ir_subst_generic_field_type(base_ftype: String, params: List[String], arg_names: List[String]) -> String:
+    mut i := 0
+    while i < params.len():
+        if params[i] == base_ftype and i < arg_names.len():
+            return arg_names[i]
+        i = i + 1
+    return base_ftype
+
+# does a generic struct instance have any field that must be released once its
+# type params are substituted in (e.g. `src: I` bound to a struct)?
+fn ir_generic_instance_needs_dtor(base: String, params: List[String], arg_names: List[String]) -> Bool:
+    count := ir_struct_field_count(base)
+    mut i := 0
+    while i < count:
+        fname := ir_struct_field_name_at(base, i)
+        base_ftype := ir_struct_field_type_name(base, fname)
+        if ir_rc_field_kind(ir_subst_generic_field_type(base_ftype, params, arg_names)).len() > 0:
+            return true
+        i = i + 1
+    return false
+
+# a generic struct built inside a generic function lowers to a backend
+# constructor call (`call MapIter struct:MapIter`) which attaches no destructor,
+# because the checker typed the construction as TID_ERR (its params were
+# suppressed). at the specialization site we do know the concrete type args, so
+# resolve them and attach a per-instance destructor to the freshly built struct.
+fn ir_attach_generic_construction_dtor(node: Node, ret_type: String, struct_r: Int):
+    # the callee is `Base[args]` — an index node whose base names a generic
+    # struct; that identifies this call as a generic struct construction.
+    callee_node := get_node(node.children[0])
+    if callee_node.kind != "index" or callee_node.children.len() < 2:
+        return
+    base_node := get_node(callee_node.children[0])
+    if base_node.kind != "ident":
+        return
+    base := base_node.value
+    if not ir_struct_names.contains_key(base):
+        return
+    if not has_generic_declaration(base):
+        return
+    arg_names := ir_explicit_generic_concrete_types(callee_node)
+    if arg_names.len() == 0:
+        return
+    params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
+    if not ir_generic_instance_needs_dtor(base, params, arg_names):
+        return
+    sym := ir_sanitize_symbol(base + "[" + arg_names.join(",") + "]")
+    ir_generic_dtor_base.insert(sym, base)
+    ir_generic_dtor_args.insert(sym, arg_names.join(chr(1)))
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " __dtor_" + sym)
+    ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + struct_r.to_string() + " " + fr.to_string())
+
+# one destructor per generic struct instance that was constructed via a backend
+# constructor call, emitted after the body so every construction site recorded
+# its instance. resolves each field type with the instance's args before
+# deciding whether to release it.
+fn ir_emit_generic_instance_dtors():
+    for sym in ir_generic_dtor_base.keys():
+        base := ir_generic_dtor_base[sym]
+        mut arg_names: List[String] := []
+        args_str := ir_generic_dtor_args[sym]
+        if args_str.len() > 0:
+            arg_names = args_str.split(chr(1))
+        params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
+        ir_emit_func_header("__dtor_" + sym, 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        count := ir_struct_field_count(base)
+        mut i := 0
+        while i < count:
+            fname := ir_struct_field_name_at(base, i)
+            base_ftype := ir_struct_field_type_name(base, fname)
+            fkind := ir_rc_field_kind(ir_subst_generic_field_type(base_ftype, params, arg_names))
+            if fkind.len() > 0:
+                fr := ir_reg()
+                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
+                ir_rc_release_reg(fr, fkind)
+            i = i + 1
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
 fn ir_specialize_static_callee(idx: Int, node: Node, callee: ResolvedCallee, explicit_generic_types: List[String]) -> ResolvedCallee:
     if not ir_is_generic_function_name(callee.name):
         return callee
@@ -2364,6 +2458,9 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     uses_result_abi := ir_callee_uses_result_abi(callee, idx)
     ret_type := ir_call_retkind_for_name(idx, uses_result_abi, callee.name)
     ir_emit_call_text(r, callee.name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
+    # a generic struct built here (backend constructor call) gets no destructor
+    # from the backend; attach a per-instance one so its rc fields release
+    ir_attach_generic_construction_dtor(node, ret_type, r)
     ir_release_owned_string_args(node, 1, arg_regs)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         return ir_emit_wrapped_legacy_result(r, ret_type, callee.name)
@@ -5516,6 +5613,8 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     ir_register_alias_structs(root_idx)
 
 fn ir_emit_root_module(root_idx: Int, root: Node):
+    ir_generic_dtor_base = {}
+    ir_generic_dtor_args = {}
     ir_emit_global_bindings(root)
     ir_emit_init_globals(root)
     ir_emit_struct_dtors()
@@ -5530,6 +5629,10 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # tuple literal in the module body has been emitted.
     ir_emit_tuple_dtors()
     ir_emit_generic_specializations()
+    # per-instance destructors for generic structs built via a backend
+    # constructor call: emitted after the specializations, since those bodies
+    # are where such constructions (and their attaches) are recorded.
+    ir_emit_generic_instance_dtors()
     ir_append_lambda_bodies()
 
 # Walk every impl_decl in the current root and register specialization name

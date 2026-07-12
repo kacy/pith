@@ -1,0 +1,24 @@
+# a generic struct built inside a generic function (`Holder[T](...)`) is
+# constructed by the backend, which attaches no destructor on its own. the
+# emitter must attach a per-instance destructor so the struct's fields whose
+# type is a bare param (`inner: T`, here a struct with a string) and its closure
+# field both release. built and dropped in a loop, this must stay balanced.
+
+pub struct Boxed:
+    tag: String
+
+pub struct Holder[T]:
+    inner: T
+    f: fn(Int) -> Int
+
+pub fn make[T](inner: T, f: fn(Int) -> Int) -> Holder[T]:
+    return Holder[T](inner, f)
+
+fn main():
+    mut total := 0
+    mut k := 0
+    while k < 1000:
+        h := make(Boxed(tag: "count"), fn(x: Int) => x + 1)
+        total = total + h.inner.tag.len()
+        k = k + 1
+    print("{total}")

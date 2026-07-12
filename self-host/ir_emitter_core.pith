@@ -4035,9 +4035,17 @@ fn ir_emit_return_stmt(node: Node):
         if expr_tid >= 0:
             expr_kind = get_type_info(expr_tid).kind
         if ir_current_func_optional_inner_kind.len() > 0:
+            # is the returned expression already an optional (so forward it),
+            # or the inner value (so wrap in Some)? the checker knows in the
+            # normal case; in a generic body a call like `c.maybe()` isn't
+            # resolved to optional at declaration time, so also trust the
+            # emitter's own retkind — an optional lowers to a tuple, and a
+            # tuple retkind can only be the optional wrapper unless the inner
+            # value is itself tuple-shaped.
+            already_optional := expr_kind == "optional" or (result_kind == "tuple" and ir_current_func_optional_inner_kind != "tuple")
             if expr_node.kind == "none_lit":
                 r = ir_emit_optional_none_value()
-            elif expr_kind != "optional":
+            elif already_optional == false:
                 r = ir_emit_optional_some_value(r)
         elif ir_current_func_return_kind == "tuple":
             if result_kind != "tuple":

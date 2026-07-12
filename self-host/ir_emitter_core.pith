@@ -1772,6 +1772,18 @@ fn ir_release_owned_string_operand(expr_idx: Int, reg: Int, expr_type: String):
         # iteration. user returns transfer, and runtime string builders
         # (chr, conversions) mint fresh buffers.
         ir_string_release_reg(reg)
+    else:
+        # an owned struct/closure/collection argument dies when the call it
+        # fed returns, exactly like an owned string (docs/ownership.md): the
+        # callee borrowed it and a storing callee took its own count, so the
+        # caller releases the count it still holds. a borrowed arg (a
+        # variable/field/element the caller keeps) is not released; a fresh
+        # literal (a struct init, a lambda) or a transferred result is.
+        mut arg_kind := ir_rc_kind(expr_type)
+        if arg_kind.len() == 0 and get_node(expr_idx).kind == "lambda":
+            arg_kind = "closure"
+        if (arg_kind == "struct" or arg_kind == "closure") and not ir_string_expr_is_borrowed(expr_idx):
+            ir_rc_release_reg(reg, arg_kind)
 
 # true for call and method-call results whose checked or inferred type is
 # string, outside generic bodies where the types cannot be trusted.
@@ -2335,10 +2347,63 @@ fn ir_generic_instance_needs_dtor(base: String, params: List[String], arg_names:
 # because the checker typed the construction as TID_ERR (its params were
 # suppressed). at the specialization site we do know the concrete type args, so
 # resolve them and attach a per-instance destructor to the freshly built struct.
-fn ir_attach_generic_construction_dtor(node: Node, ret_type: String, struct_r: Int):
+# a generic struct built by base name (`Wrap(v, ...)` with no explicit `[args]`)
+# lowers to a plain backend `call Wrap` that stores its fields as-is and gets no
+# per-instance destructor. it still keeps only the caller's count for a borrowed
+# rc field arg, so the caller's owned-arg release would free a value the struct
+# still holds. retain each borrowed rc arg here to give the field its own count;
+# the value's own kind classifies it, since the field's declared type is a bare
+# generic param the checker leaves unresolved in a generic body.
+fn ir_retain_base_name_construction_fields(node: Node, callee_name: String, arg_regs: List[Int]):
+    if not ir_struct_names.contains_key(callee_name):
+        return
+    if not has_generic_declaration(callee_name):
+        return
+    mut reg_i := 0
+    for child, i in node.children:
+        if i == 0:
+            continue
+        if reg_i >= arg_regs.len():
+            return
+        mut expr_idx := child
+        cn := get_node(child)
+        if cn.kind == "arg":
+            if cn.children.len() == 0:
+                reg_i = reg_i + 1
+                continue
+            expr_idx = cn.children[0]
+        arg_kind := ir_rc_kind(ir_infer_type(expr_idx))
+        if arg_kind.len() > 0 and ir_string_expr_is_borrowed(expr_idx):
+            ir_rc_retain_reg(arg_regs[reg_i], arg_kind)
+        reg_i = reg_i + 1
+
+# true when a static call is really a generic struct being built through the
+# backend constructor path (`Wrap(...)` or `Wrap[T](...)` whose base names a
+# generic struct). such a call stores every argument into a field, so its
+# arguments follow the container-store transfer rule rather than the
+# owned-argument release rule.
+fn ir_is_generic_struct_construction_call(node: Node) -> Bool:
+    if node.children.len() == 0:
+        return false
+    cn := get_node(node.children[0])
+    mut base := ""
+    if cn.kind == "ident":
+        base = cn.value
+    elif cn.kind == "index" and cn.children.len() >= 2:
+        bn := get_node(cn.children[0])
+        if bn.kind == "ident":
+            base = bn.value
+    if base.len() == 0:
+        return false
+    return ir_struct_names.contains_key(base) and has_generic_declaration(base)
+
+fn ir_attach_generic_construction_dtor(node: Node, ret_type: String, struct_r: Int, arg_regs: List[Int]):
     # the callee is `Base[args]` — an index node whose base names a generic
     # struct; that identifies this call as a generic struct construction.
     callee_node := get_node(node.children[0])
+    if callee_node.kind == "ident":
+        ir_retain_base_name_construction_fields(node, callee_node.value, arg_regs)
+        return
     if callee_node.kind != "index" or callee_node.children.len() < 2:
         return
     base_node := get_node(callee_node.children[0])
@@ -2355,12 +2420,45 @@ fn ir_attach_generic_construction_dtor(node: Node, ret_type: String, struct_r: I
     params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
     if not ir_generic_instance_needs_dtor(base, params, arg_names):
         return
+    # the backend stored the field args as-is; a borrowed rc arg (a field
+    # holding another struct/closure passed by value from a local or param)
+    # keeps only its caller's count. the per-instance dtor below releases it,
+    # so retain it here to give the field its own count — otherwise the caller
+    # and the dtor both release the one count and free it twice. a fresh arg
+    # already arrives owned, so is_borrowed gates the retain exactly like the
+    # non-generic ir_emit_struct_positional_init path.
+    ir_retain_generic_construction_fields(node, base, params, arg_names, arg_regs)
     sym := ir_sanitize_symbol(base + "[" + arg_names.join(",") + "]")
     ir_generic_dtor_base.insert(sym, base)
     ir_generic_dtor_args.insert(sym, arg_names.join(chr(1)))
     fr := ir_reg()
     ir_emit("funcref " + fr.to_string() + " __dtor_" + sym)
     ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + struct_r.to_string() + " " + fr.to_string())
+
+# retain each borrowed rc field arg of a backend-constructed generic struct so
+# the field owns its own count, balancing the per-instance destructor's release.
+fn ir_retain_generic_construction_fields(node: Node, base: String, params: List[String], arg_names: List[String], arg_regs: List[Int]):
+    mut reg_i := 0
+    for child, i in node.children:
+        if i == 0:
+            continue
+        if reg_i >= arg_regs.len():
+            return
+        mut expr_idx := child
+        cn := get_node(child)
+        if cn.kind == "arg":
+            if cn.children.len() == 0:
+                reg_i = reg_i + 1
+                continue
+            expr_idx = cn.children[0]
+        field_pos := reg_i
+        if field_pos < ir_struct_field_count(base):
+            fname := ir_struct_field_name_at(base, field_pos)
+            base_ftype := ir_struct_field_type_name(base, fname)
+            fkind := ir_rc_field_kind(ir_subst_generic_field_type(base_ftype, params, arg_names))
+            if fkind.len() > 0 and ir_string_expr_is_borrowed(expr_idx):
+                ir_rc_retain_reg(arg_regs[reg_i], fkind)
+        reg_i = reg_i + 1
 
 # one destructor per generic struct instance that was constructed via a backend
 # constructor call, emitted after the body so every construction site recorded
@@ -2481,8 +2579,14 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     ir_emit_call_text(r, callee.name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
     # a generic struct built here (backend constructor call) gets no destructor
     # from the backend; attach a per-instance one so its rc fields release
-    ir_attach_generic_construction_dtor(node, ret_type, r)
-    ir_release_owned_string_args(node, 1, arg_regs)
+    ir_attach_generic_construction_dtor(node, ret_type, r, arg_regs)
+    # a generic construction stores every argument into a field: a borrowed one
+    # is retained above, a fresh one transfers its count. either way the count
+    # now belongs to the struct, so the caller must not also release it here —
+    # that is the container-store transfer rule (docs/ownership.md) applied to a
+    # backend struct build. ordinary calls still release their owned arguments.
+    if not ir_is_generic_struct_construction_call(node):
+        ir_release_owned_string_args(node, 1, arg_regs)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         return ir_emit_wrapped_legacy_result(r, ret_type, callee.name)
     return r
@@ -3328,7 +3432,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
     # compensation retain, and the argument-release skip (ownership
     # transfers into the container at that position)
     mut store_value_pos := 0 - 1
-    if emit_name == "send" or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
+    if emit_name == "send" or emit_name == "pith_channel_send" or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
         store_value_pos = 0
     elif emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey" or emit_name == "set" or emit_name == "pith_list_set_value":
         store_value_pos = 1
@@ -3345,7 +3449,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
             if value_expr >= 0:
                 store_kind := ir_rc_kind(ir_infer_type(value_expr))
                 mut compensate := false
-                if emit_name == "send":
+                if emit_name == "send" or emit_name == "pith_channel_send":
                     compensate = store_kind.len() > 0
                 elif store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "bytes" or store_kind == "struct":
                     compensate = true

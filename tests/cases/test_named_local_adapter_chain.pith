@@ -1,0 +1,67 @@
+# a generic struct built from a named local — `m := map_iter(r, ...)` — stores
+# that local in a field. the local is a borrow the caller still owns and
+# releases at scope exit, and the struct's destructor also releases the field:
+# without a count for the field, both releases free the one value and the next
+# read of it is a use-after-free. the fix retains the borrowed field at
+# construction and releases the caller's owned arguments after the call, so the
+# named local, the built struct, and the fresh closures all stay balanced.
+# built and drained in a loop here through a two-stage map/filter chain whose
+# every intermediate is a named local, this must be leak- and double-free-free.
+
+pub interface Iterator[T]:
+    fn next() -> T?
+
+pub struct Range:
+    mut cur: Int
+    hi: Int
+
+impl Iterator[Int] for Range:
+    fn next() -> Int?:
+        if self.cur >= self.hi:
+            return none
+        v := self.cur
+        self.cur = self.cur + 1
+        return v
+
+pub struct MapIter[I, T, U]:
+    src: I
+    f: fn(T) -> U
+
+impl Iterator[U] for MapIter:
+    fn next() -> U?:
+        n := self.src.next()
+        if n == none:
+            return none
+        return self.f(n.value())
+
+pub struct FilterIter[I, T]:
+    src: I
+    keep: fn(T) -> Bool
+
+impl Iterator[T] for FilterIter:
+    fn next() -> T?:
+        while true:
+            n := self.src.next()
+            if n == none:
+                return none
+            if self.keep(n.value()):
+                return n
+        return none
+
+pub fn map_iter[I: Iterator[T], T, U](src: I, f: fn(T) -> U) -> MapIter[I, T, U]:
+    return MapIter[I, T, U](src, f)
+
+pub fn filter_iter[I: Iterator[T], T](src: I, keep: fn(T) -> Bool) -> FilterIter[I, T]:
+    return FilterIter[I, T](src, keep)
+
+fn main():
+    mut total := 0
+    mut k := 0
+    while k < 1000:
+        r := Range(cur: 0, hi: 6)
+        m := map_iter(r, fn(x: Int) => x * x)
+        fl := filter_iter(m, fn(y: Int) => y > 4)
+        for z in fl:
+            total = total + z
+        k = k + 1
+    print("{total}")

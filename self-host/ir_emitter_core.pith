@@ -4716,6 +4716,11 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit_label(step_l)
+    # release the optional next() returned this iteration; the element was
+    # borrowed into the loop var (the body retained it if it kept it), so the
+    # tuple's own count is dropped here. without this, one optional per step
+    # (and the none that ends the loop) leaks.
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", opt_r)
     if has_index:
         p3 := ir_reg()
         ir_emit("load " + p3.to_string() + " " + fp)
@@ -4726,6 +4731,7 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
         ir_emit("store " + fp + " " + pinc_r.to_string())
     ir_emit("jmp " + head_l)
     ir_emit_label(end_l)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", opt_r)
 
 fn ir_stmt_control(idx: Int, node: Node):
     if node.kind == "if" or node.kind == "if_stmt":

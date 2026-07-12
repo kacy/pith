@@ -1,0 +1,29 @@
+# a `for x in iterator` loop pulls an optional from next() each step; that
+# optional must be released, or one leaks per element (plus the none that ends
+# the loop). drained in a loop here, this must stay balanced with no double
+# free of the element the loop borrows out of each optional.
+
+pub interface Iterator[T]:
+    fn next() -> T?
+
+pub struct Range:
+    mut cur: Int
+    hi: Int
+
+impl Iterator[Int] for Range:
+    fn next() -> Int?:
+        if self.cur >= self.hi:
+            return none
+        v := self.cur
+        self.cur = self.cur + 1
+        return v
+
+fn main():
+    mut total := 0
+    mut k := 0
+    while k < 1000:
+        it := Range(cur: 0, hi: 5)
+        for x in it:
+            total = total + x
+        k = k + 1
+    print("{total}")

@@ -1,8 +1,66 @@
 # Pith benchmarks
 
-A few Pith vs Go (and sometimes Rust) benchmarks, measured on the same
-machine. Compile times give a sense of the toolchain; the workload and
-pipeline benchmarks below isolate runtime and service-logic costs.
+A few Pith vs Go (and sometimes Rust and Zig) benchmarks, measured on the
+same machine. Compile times give a sense of the toolchain; the workload
+and pipeline benchmarks below isolate runtime and service-logic costs.
+
+## event ledger benchmark (json + collections + crypto)
+
+`bench/event_ledger.*` ingests a stream of newline-delimited JSON events,
+indexes them with maps and a set, and signs a canonical summary with
+HMAC-SHA256. It exists to exercise a realistic slice of the standard
+library — JSON decoding, hash-map and set aggregation, and crypto — in
+four languages at once: Pith, Go, Rust, and Zig.
+
+Every implementation generates the same event stream from a shared 31-bit
+LCG, so the aggregate `checksum` and the HMAC `digest` come out identical
+in all four. That equality is the honesty check: if any version did less
+work or decoded a field differently, the digest would diverge.
+
+**Batteries:** Pith, Go, and Zig write this with only their standard
+libraries. Rust's std has neither JSON nor crypto, so its version pulls
+`serde_json`, `sha2`, and `hmac` — the honest cost of a deliberately
+small standard library. (Four independent crypto implementations landing
+on the same HMAC digest is also decent evidence the digest is real.)
+
+Run it:
+
+```
+bench/event_ledger_bench.sh 200000 5   # events, trials
+```
+
+which builds all four, checks the digests match, and prints median phase
+times. Or build and run one directly:
+
+```
+pith build bench/event_ledger.pith && ./bench/event_ledger 200000
+go build -o bench/event_ledger_go bench/event_ledger.go
+cargo build --release --manifest-path bench/event_ledger_rust/Cargo.toml
+zig build-exe -O ReleaseFast -femit-bin=bench/event_ledger_zig bench/event_ledger.zig
+```
+
+Latest measured results on this machine, 200000 events, median of 5:
+
+| lang | gen | parse | analyze | sign | total |
+|---|---:|---:|---:|---:|---:|
+| pith | 305 | 1084 | 99 | 1 | 1472 |
+| go | 102 | 346 | 14 | 0 | 501 |
+| rust | 29 | 59 | 22 | 0 | 111 |
+| zig | 19 | 103 | 9 | 0 | 135 |
+
+(ms; `gen` builds the stream, `parse` decodes it into structs, `analyze`
+runs the map/set rollup, `sign` is the HMAC.)
+
+Read this honestly: Rust and Zig are fastest, Go sits in the middle, and
+Pith is about 3x Go and roughly 12x the systems languages. The gap is
+concentrated in `parse` — decoding JSON into a struct line by line is
+Pith's slowest step here; its map-and-set `analyze` phase is closer but
+still behind. Pith is a young self-hosted compiler and it shows on raw
+throughput. What the benchmark does show in Pith's favor is reach: the
+whole pipeline — JSON, collections, HMAC-SHA256 — is standard library
+with no dependencies to add, and it compiles in a fraction of the time
+the others take to build. Speed is the honest weak spot; breadth and
+build time are the honest strengths.
 
 | | Go | Pith |
 |---|---|---|

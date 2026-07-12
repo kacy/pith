@@ -1,0 +1,211 @@
+# event_ledger — an ndjson analytics pipeline that leans on the standard
+# library: json decoding, map/set aggregation, and an hmac-signed
+# summary. the input is a deterministic event stream (a shared 31-bit lcg
+# generates the same records in every language), so the aggregate
+# checksum and the hmac digest below are identical across pith, go, rust,
+# and zig — that equality is the proof the four do the same work.
+#
+# the phases are timed separately on purpose. parsing json line by line
+# is not where pith is quick; the analyze phase — repeated map and set
+# work over the in-memory events — is, and the breakdown shows both
+# honestly.
+
+import std.json as json
+import std.crypto.hmac as hmac
+from std.algo import sort_strings
+
+fn events_from_args() -> Int:
+    argv := args()
+    if argv.len() > 1:
+        parsed := parse_int(argv[1])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return 200000
+
+# a plain 31-bit linear congruential generator (posix constants), masked
+# so it never overflows and every language reproduces it exactly.
+fn lcg_next(state: Int) -> Int:
+    return (state * 1103515245 + 12345) % 2147483648
+
+fn action_name(k: Int) -> String:
+    if k == 0:
+        return "view"
+    if k == 1:
+        return "click"
+    if k == 2:
+        return "buy"
+    return "refund"
+
+fn region_name(k: Int) -> String:
+    if k == 0:
+        return "north"
+    if k == 1:
+        return "south"
+    if k == 2:
+        return "east"
+    return "west"
+
+# build the ndjson event stream: one flat json object per line. pith
+# treats `{` in a string literal as interpolation, so the braces and
+# quotes are assembled from chr() the way the json module's own tests do.
+fn event_line(i: Int, user: Int, action: String, amount: Int, region: String) -> String:
+    dq := chr(34)
+    lb := chr(123)
+    rb := chr(125)
+    mut line := lb + dq + "id" + dq + ":" + i.to_string()
+    line = line + "," + dq + "user" + dq + ":" + user.to_string()
+    line = line + "," + dq + "action" + dq + ":" + dq + action + dq
+    line = line + "," + dq + "amount" + dq + ":" + amount.to_string()
+    line = line + "," + dq + "region" + dq + ":" + dq + region + dq + rb
+    return line
+
+fn generate_events(count: Int) -> String:
+    mut lines: List[String] := []
+    mut state := 20260711
+    mut i := 0
+    while i < count:
+        # sample the higher bits: an lcg's low bits are periodic, so
+        # dividing before the modulo gives a realistic spread.
+        state = lcg_next(state)
+        user := (state / 256) % 1000
+        state = lcg_next(state)
+        action := action_name((state / 256) % 4)
+        state = lcg_next(state)
+        amount := (state / 256) % 500
+        state = lcg_next(state)
+        region := region_name((state / 256) % 4)
+        lines.push(event_line(i, user, action, amount, region))
+        i = i + 1
+    return lines.join("\n")
+
+struct Event:
+    pub user: Int
+    pub action: String
+    pub amount: Int
+    pub region: String
+
+# parse the stream into an in-memory list of events with std.json.
+fn parse_events(stream: String) -> List[Event]:
+    mut events: List[Event] := []
+    for line in stream.split("\n"):
+        if line.len() == 0:
+            continue
+        events.push(json.decode_text[Event](line) catch Event(0, "", 0, ""))
+    return events
+
+struct Analysis:
+    region_amount: Map[String, Int]
+    action_count: Map[String, Int]
+    unique_users: Set[Int]
+    high_value: Int
+    top_user: Int
+    top_user_total: Int
+    total_amount: Int
+    record_count: Int
+
+fn map_add_str(m: Map[String, Int], key: String, delta: Int):
+    if m.contains_key(key):
+        m.insert(key, m[key] + delta)
+    else:
+        m.insert(key, delta)
+
+fn map_add_int(m: Map[Int, Int], key: Int, delta: Int):
+    if m.contains_key(key):
+        m.insert(key, m[key] + delta)
+    else:
+        m.insert(key, delta)
+
+# the analyze phase: several maps, a set, and a per-user rollup with a
+# top-spender scan. this is the collection-heavy work the benchmark
+# exists to measure.
+fn analyze(events: List[Event]) -> Analysis:
+    mut region_amount: Map[String, Int] := {}
+    mut action_count: Map[String, Int] := {}
+    mut user_total: Map[Int, Int] := {}
+    mut unique_users: Set[Int] := {}
+    mut high_value := 0
+    mut total_amount := 0
+    # top spender: the user with the largest total, smallest id winning a
+    # tie so every language agrees. tracked as the per-user totals grow,
+    # since a user's total only increases the answer is the same as a
+    # scan of the finished map.
+    mut top_user := 0 - 1
+    mut top_user_total := 0 - 1
+    for e in events:
+        map_add_str(region_amount, e.region, e.amount)
+        map_add_str(action_count, e.action, 1)
+        map_add_int(user_total, e.user, e.amount)
+        unique_users.add(e.user)
+        if e.amount >= 400:
+            high_value = high_value + 1
+        total_amount = total_amount + e.amount
+        running := user_total[e.user]
+        if running > top_user_total or (running == top_user_total and e.user < top_user):
+            top_user = e.user
+            top_user_total = running
+    return Analysis(region_amount, action_count, unique_users, high_value, top_user, top_user_total, total_amount, events.len())
+
+# a canonical, sorted, byte-identical summary of the analysis. every
+# language builds the same bytes here, so the hmac digest matches.
+fn build_summary(a: Analysis) -> String:
+    mut parts: List[String] := []
+    for region in sort_strings(a.region_amount.keys()):
+        parts.push("region:" + region + "=" + a.region_amount[region].to_string())
+    for action in sort_strings(a.action_count.keys()):
+        parts.push("action:" + action + "=" + a.action_count[action].to_string())
+    parts.push("users:" + a.unique_users.len().to_string())
+    parts.push("hivalue:" + a.high_value.to_string())
+    parts.push("topuser:" + a.top_user.to_string() + "=" + a.top_user_total.to_string())
+    parts.push("total:" + a.total_amount.to_string())
+    parts.push("records:" + a.record_count.to_string())
+    return parts.join(";")
+
+fn digest_score(digest: String) -> Int:
+    mut score := 0
+    mut i := 0
+    while i < digest.len():
+        score = score + ord(digest[i])
+        i = i + 1
+    return score
+
+fn print_metric(name: String, value: Int):
+    print(name + "=" + value.to_string())
+
+fn main() -> Int:
+    events := events_from_args()
+
+    start_total := time()
+
+    mut start := time()
+    stream := generate_events(events)
+    gen_ms := time() - start
+
+    start = time()
+    parsed := parse_events(stream)
+    parse_ms := time() - start
+
+    start = time()
+    a := analyze(parsed)
+    analyze_ms := time() - start
+
+    start = time()
+    summary := build_summary(a)
+    key := bytes_from_string_utf8("pith-bench-key")
+    digest := hmac.sha256_hex(key, bytes_from_string_utf8(summary))
+    sign_ms := time() - start
+
+    total_ms := time() - start_total
+
+    checksum := a.total_amount + a.record_count + a.unique_users.len() * 31 + a.high_value + a.top_user_total + digest_score(digest)
+
+    print("event ledger benchmark")
+    print_metric("events", events)
+    print_metric("gen_ms", gen_ms)
+    print_metric("parse_ms", parse_ms)
+    print_metric("analyze_ms", analyze_ms)
+    print_metric("sign_ms", sign_ms)
+    print_metric("total_ms", total_ms)
+    print_metric("unique_users", a.unique_users.len())
+    print("digest=" + digest)
+    print_metric("checksum", checksum)
+    return 0

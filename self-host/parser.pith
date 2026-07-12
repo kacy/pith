@@ -1760,7 +1760,11 @@ fn parse_interface_decl() -> Int:
         children.push(g)
     while not check("dedent") and not check("eof"):
         before := current_token_position
-        children.push(parse_fn_sig())
+        # an associated type member: `type Item` (no binding on the interface)
+        if check("kw_type"):
+            children.push(parse_assoc_type_decl())
+        else:
+            children.push(parse_fn_sig())
         if current_token_position == before:
             children.push(add_leaf_with_position("error", "parser stalled in interface"))
             advance_token()
@@ -1819,6 +1823,11 @@ fn parse_impl_decl() -> Int:
     expect("indent")
 
     while not check("dedent") and not check("eof"):
+        # an associated type binding: `type Item = Int`
+        if check("kw_type"):
+            children.push(parse_assoc_type_bind())
+            skip_newlines()
+            continue
         mut method_pub := false
         if match_tok("kw_pub"):
             method_pub = true
@@ -1850,3 +1859,19 @@ fn parse_type_alias_decl() -> Int:
     for g in generics:
         children.push(g)
     return add_node_with_position("type_alias", name_tok.value, children)
+
+# `type Item` inside an interface: declares an associated type with no binding.
+fn parse_assoc_type_decl() -> Int:
+    advance_token()
+    name_tok := expect("identifier")
+    mut children: List[Int] := []
+    return add_node_with_position("assoc_type", name_tok.value, children)
+
+# `type Item = Int` inside an impl: binds the associated type to a concrete type.
+fn parse_assoc_type_bind() -> Int:
+    advance_token()
+    name_tok := expect("identifier")
+    expect("eq")
+    type_node := parse_type_expr()
+    mut children: List[Int] := [type_node]
+    return add_node_with_position("assoc_type_bind", name_tok.value, children)

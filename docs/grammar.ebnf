@@ -145,17 +145,22 @@ interface_decl = "interface" , IDENT , [ generic_params ] , ":" , NEWLINE
                , INDENT , { interface_member NEWLINE } , DEDENT ;
 
 (* a member with a body is a default method: implementors inherit it
-   unless they override it. a bare signature is abstract. *)
-interface_member = fn_sig | default_method ;
+   unless they override it. a bare signature is abstract. an assoc_type
+   declares an associated type the implementor must bind. *)
+interface_member = fn_sig | default_method | assoc_type ;
 
 fn_sig        = "fn" , IDENT , [ generic_params ] , "(" , [ param_list ] , ")"
               , [ "->" , type_expr ] ;
 
 default_method = fn_sig , ":" , NEWLINE , INDENT , { statement } , DEDENT ;
 
-(* impl blocks *)
+assoc_type    = "type" , IDENT ;
+
+(* impl blocks — a method, or an associated-type binding `type Item = T` *)
 impl_decl     = "impl" , type_expr , [ "for" , type_expr ] , ":" , NEWLINE
-              , INDENT , { [ "pub" ] , fn_decl , NEWLINE } , DEDENT ;
+              , INDENT , { [ "pub" ] , fn_decl | assoc_type_bind } , NEWLINE , DEDENT ;
+
+assoc_type_bind = "type" , IDENT , "=" , type_expr ;
 
 (* type alias *)
 type_alias    = "type" , IDENT , [ generic_params ] , "=" , type_expr ;

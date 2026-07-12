@@ -1,0 +1,36 @@
+# an interface may declare an associated type; each impl binds it, and the
+# interface's methods resolve that name to the bound type for that impl.
+# here two impls bind Item to different types (Int and String).
+
+interface Container:
+    type Item
+    fn first() -> Item
+    fn describe() -> String
+
+struct IntBox:
+    pub value: Int
+
+struct Tag:
+    pub label: String
+
+impl Container for IntBox:
+    type Item = Int
+    fn first() -> Item:
+        return self.value
+    fn describe() -> String:
+        return "int box"
+
+impl Container for Tag:
+    type Item = String
+    fn first() -> Item:
+        return self.label
+    fn describe() -> String:
+        return "tag"
+
+fn main():
+    b := IntBox(value: 42)
+    t := Tag(label: "hello")
+    print("{b.first()} {b.describe()}")
+    # the string binding flows through with correct length and refcounting
+    got := t.first()
+    print("{got} {got.len()} {t.describe()}")

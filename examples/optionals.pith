@@ -1,11 +1,30 @@
 # optional types
 
+# an optional return signals "maybe no answer" without a sentinel value
 fn find_positive(n: Int) -> Int?:
     if n > 0:
         return n
     return none
 
+# look up a value that might not be there
+fn lookup(scores: Map[String, Int], name: String) -> Int?:
+    return scores.get(name)
+
 fn main():
-    result := find_positive(42)
-    missing := find_positive(-5)
-    print("optionals work")
+    # if let runs the branch only when the optional has a value
+    if let n = find_positive(42):
+        print("found {n}")
+    if let n = find_positive(0 - 5):
+        print("found {n}")
+    else:
+        print("nothing positive")
+
+    scores := {"ada": 95, "grace": 88}
+    # unwrap_or supplies a fallback when the key is missing
+    print("ada: {lookup(scores, "ada").unwrap_or(0)}")
+    print("carol: {lookup(scores, "carol").unwrap_or(0)}")
+
+    # match handles both cases explicitly
+    match lookup(scores, "grace"):
+        none => print("grace: unranked")
+        score => print("grace: {score}")

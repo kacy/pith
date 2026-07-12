@@ -1,78 +1,51 @@
-# test std.net.http — request parsing, headers, query params, responses
-import std.bytes as bytes
+# std.net.http — build requests with the client builder, route them on
+# the server side, and inspect typed responses.
+
 import std.net.http as http
 import std.io as io
+
+# parse wire bytes into the typed, method-style request.
+fn parse(wire: Bytes) -> http.HttpRequestBytes!:
+    return http.read_request_buffered_bytes(io.bytes_reader(wire).buffered_chunked(64))
+
+# a tiny router: dispatch on method and path, return a typed response.
+fn route(req: http.HttpRequestBytes) -> http.HttpResponse!:
+    method := req.method()!
+    path := req.path()!
+    if method == "GET" and path == "/":
+        return http.html(200, "<h1>welcome</h1>")
+    if method == "GET" and path.starts_with("/users/"):
+        id := req.path_param_or("/users/:id", "id", "?")
+        return http.text(200, "user {id}")
+    if method == "GET" and path == "/search":
+        q := req.query_param_or("q", "everything")
+        return http.text(200, "results for {q}")
+    if method == "POST" and path == "/submit":
+        body := req.body_text_or("")
+        return http.text(201, "stored: {body}")
+    return http.not_found_response()
+
+# route one built request and print a one-line summary of the response.
+fn serve(label: String, req: http.ClientRequest) -> Int!:
+    response := route(parse(req.to_bytes()!)!)!
+    mut status := "ok"
+    if not response.is_success():
+        status = "not ok"
+    body := response.body_bytes().to_string_utf8()!
+    print("{label}: {response.status_code()} ({status}) - {body}")
+    return 0
+
 fn main() -> Int!:
-    crlf := chr(13) + chr(10)
-    # parse a GET with headers and query string
-    mut raw := "GET /search?q=pith&lang=en HTTP/1.1" + crlf
-    raw = raw + "Host: example.com" + crlf
-    raw = raw + "User-Agent: PithTest/1.0" + crlf
-    raw = raw + "Accept: text/html" + crlf
-    raw = raw + crlf
-    req := http.parse_request(raw)
-    print("method: " + http.method(req))
-    print("path: " + http.path(req))
-    print("query: " + http.query(req))
-    print("version: " + http.version(req))
-    # header access (case-insensitive)
-    print("host: " + http.get_header(req, "Host"))
-    print("agent: " + http.get_header(req, "user-agent"))
-    print("missing: " + http.get_header(req, "X-Missing"))
-    # query param access
-    print("q: " + http.get_query_param(req, "q"))
-    print("lang: " + http.get_query_param(req, "lang"))
-    print("missing: " + http.get_query_param(req, "foo"))
-    # parse a POST with body
-    mut raw2 := "POST /api/data HTTP/1.1" + crlf
-    raw2 = raw2 + "Content-Type: application/json" + crlf
-    raw2 = raw2 + "Content-Length: 15" + crlf
-    raw2 = raw2 + crlf
-    raw2 = raw2 + "hello post body"
-    req2 := http.parse_request(raw2)
-    print("post method: " + http.method(req2))
-    print("post path: " + http.path(req2))
-    print("post type: " + http.get_header(req2, "Content-Type"))
-    print("post body: " + http.body(req2))
-    raw2_bytes := bytes.buffer()
-    raw2_bytes.write(bytes.from_string_utf8(raw2))!
-    req2_bytes := http.read_request_buffered_bytes(io.bytes_reader(raw2_bytes.bytes()).buffered_chunked(4))!
-    print("post body bytes: " + req2_bytes.body_bytes().len().to_string())
-    print("post type bytes: " + req2_bytes.header_bytes("Content-Type").to_string_utf8()!)
-    # response builders
-    r1 := http.html_response(200, "<h1>ok</h1>")
-    if r1.contains("200 OK"):
-        print("html 200: ok")
-    if r1.contains("text/html"):
-        print("html mime: ok")
-    r2 := http.json_response(201, "[]")
-    if r2.contains("201 Created"):
-        print("json 201: ok")
-    r3 := http.not_found()
-    if r3.contains("404"):
-        print("not found: ok")
-    r4 := http.redirect("/new")
-    if r4.contains("301"):
-        print("redirect: ok")
-    if r4.contains("/new"):
-        print("redirect location: ok")
-    # request builders
-    mut req_builder := http.post_request("example.com", 80, "/submit")
-    req_builder = req_builder.query_param("mode", "fast path")
-    req_builder = req_builder.accept("application/json")
-    req_builder = req_builder.bearer("token123")
-    req_builder = req_builder.text_body("hello")
-    parsed_req := http.read_request_buffered_bytes(io.bytes_reader(req_builder.to_bytes()!).buffered_chunked(4))!
-    print("builder method: " + parsed_req.method()!)
-    print("builder mode: " + parsed_req.query_param_or("mode", ""))
-    print("builder accept: " + parsed_req.header_or("Accept", ""))
-    print("builder auth: " + parsed_req.header_or("Authorization", ""))
-    # form helper
-    mut form_fields: Map[String, String] := {}
-    form_fields.insert("name", "pith cli")
-    form_req := http.post_request("example.com", 80, "/form").form_body(form_fields)
-    parsed_form := http.read_request_buffered_bytes(io.bytes_reader(form_req.to_bytes()!).buffered_chunked(4))!
-    print("form type: " + parsed_form.header_or("Content-Type", ""))
-    print("form body: " + parsed_form.body_text_or(""))
-    print("http api works")
+    serve("home", http.get_request("example.com", 80, "/"))!
+    serve("user", http.get_request("example.com", 80, "/users/42"))!
+    serve("search", http.get_request("example.com", 80, "/search?q=pith"))!
+    serve("submit", http.post_request("example.com", 80, "/submit").text_body("hello"))!
+    serve("missing", http.get_request("example.com", 80, "/nope"))!
+
+    # a request also carries headers and auth, read back the same way.
+    signed := http.get_request("example.com", 80, "/search?q=lang").accept("application/json").bearer("token123")
+    req := parse(signed.to_bytes()!)!
+    print("accept: {req.header_or("Accept", "-")}")
+    print("auth: {req.header_or("Authorization", "-")}")
+    print("q: {req.query_param_or("q", "-")}")
     return 0

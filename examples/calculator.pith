@@ -1,20 +1,23 @@
-fn calc(input: String) -> Int:
-    if input == "3 + 4":
-        return 7
-    elif input == "10 - 3":
-        return 7
-    elif input == "100 + 200 + 300":
-        return 600
-    elif input == "50 - 20 + 5":
-        return 35
-    elif input == "0 + 0":
-        return 0
-    return 0
+# a small left-to-right calculator over space-separated expressions
 
-fn main():
-    print("3 + 4 = " + calc("3 + 4").to_string())
-    print("10 - 3 = " + calc("10 - 3").to_string())
-    print("100 + 200 + 300 = " + calc("100 + 200 + 300").to_string())
-    print("50 - 20 + 5 = " + calc("50 - 20 + 5").to_string())
-    print("0 + 0 = " + calc("0 + 0").to_string())
-    print("calculator works")
+fn calc(input: String) -> Int!:
+    parts := input.split(" ")
+    mut acc := parse_int(parts[0])!
+    mut i := 1
+    while i + 1 < parts.len():
+        op := parts[i]
+        n := parse_int(parts[i + 1])!
+        if op == "+":
+            acc = acc + n
+        elif op == "-":
+            acc = acc - n
+        else:
+            fail "unknown operator: {op}"
+        i = i + 2
+    return acc
+
+fn main() -> Int!:
+    for expr in ["3 + 4", "10 - 3", "100 + 200 + 300", "50 - 20 + 5", "0 + 0"]:
+        result := calc(expr)!
+        print("{expr} = {result}")
+    return 0

@@ -19,10 +19,10 @@ enum Either[L, R]:
 # each unique combination produces a separate concrete type.
 
 fn show_pair(p: Pair[Int, String]) -> String:
-    return "pair"
+    return "({p.first}, {p.second})"
 
-fn show_box(b: Box[Bool]) -> String:
-    return "box"
+fn show_box(b: Box[Float]) -> String:
+    return "box of {b.value}"
 
 # generic functions — type args are inferred from call-site arguments.
 # no need to write identity[Int](42), just identity(42).
@@ -69,22 +69,20 @@ struct Wrapper[T: Display]:
 fn main():
     p: Pair[Int, String] := Pair(1, "hello")
     b: Box[Float] := Box(3.14)
+    print("pair {show_pair(p)}")
+    print("{show_box(b)}")
 
-    # generic function calls — T is inferred
-    n := identity(42)
-    s := identity("hello")
-    result := second(1, "world")
+    # generic function calls — T is inferred from the arguments
+    print("identity int {identity(42)}")
+    print("identity str {identity("hello")}")
+    print("second {second(1, "world")}")
 
     # bounded generic calls — Point implements Display and Hash
     pt := Point(1, 2)
-    shown := show(pt)
-    both := show_and_hash(pt)
-
-    # bounded generic struct instantiation
-    w: Wrapper[Point] := Wrapper(pt)
+    print("{show(pt)}")
+    print("{show_and_hash(pt)}")
 
     # named fields work on generic structs too — the type arguments are
     # inferred from the values, in any field order
     named := Pair(second: "answer", first: 42)
-
-    print("generics work")
+    print("named {show_pair(named)}")

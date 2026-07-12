@@ -9,26 +9,26 @@ struct Color:
     pub g: Int
     pub b: Int
 
-# structs can be used as parameter and return types.
-# the checker resolves field access on struct-typed values.
-
-fn get_x(p: Point) -> Int:
-    return p.x
-
-fn get_y(p: Point) -> Int:
-    return p.y
-
-fn is_bright(c: Color) -> Bool:
-    return c.r > 200
-
+# structs pass by value and their fields are read directly
 fn describe_point(p: Point) -> String:
     return "({p.x}, {p.y})"
 
-fn make_origin() -> Point:
-    return Point(0, 0)
+fn is_bright(c: Color) -> Bool:
+    return c.r > 200 or c.g > 200 or c.b > 200
 
-fn make_red() -> Color:
-    return Color(255, 0, 0)
+fn report(name: String, c: Color):
+    mut label := "bright"
+    if not is_bright(c):
+        label = "dim"
+    print("{name} ({c.r}, {c.g}, {c.b}) {label}")
 
 fn main():
-    print("structs declared")
+    # positional construction
+    origin := Point(0, 0)
+    # named construction reads well when there are several fields
+    corner := Point(x: 3, y: 4)
+    print("origin {describe_point(origin)}")
+    print("corner {describe_point(corner)}")
+
+    report("red", Color(r: 255, g: 0, b: 0))
+    report("slate", Color(r: 40, g: 44, b: 52))

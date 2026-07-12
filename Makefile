@@ -704,7 +704,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_generic_to_string tests/cases/test_map_int_string_buffered \
 	tests/cases/test_enum_payload_churn tests/cases/test_ownership_stress \
 	tests/cases/test_closure_lifecycle tests/cases/test_error_path_cleanup \
-	tests/cases/test_atomic_context tests/cases/test_tuple_ownership
+	tests/cases/test_atomic_context tests/cases/test_tuple_ownership \
+	tests/cases/test_struct_closure_field
 
 memcheck: build
 	@echo "--- memcheck (valgrind, curated) ---"

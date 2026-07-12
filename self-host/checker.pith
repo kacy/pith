@@ -1649,6 +1649,16 @@ fn iterator_element_type(iter_type: Int) -> Int:
             if has_generic_declaration(base):
                 sdecl := get_node(get_generic_declaration_index(base))
                 struct_params = collect_generic_parameter_names(sdecl)
+    # resolve the iterator's associated types (e.g. `Item` -> Int for Range,
+    # or -> the source's element for a MapIter/FilterIter instance) so next()'s
+    # `-> Item?` return resolves to the concrete element type
+    assoc_base := extract_base_type_name(type_name)
+    if type_assoc_names.contains_key(assoc_base):
+        for an in type_assoc_names[assoc_base].split(","):
+            resolved := resolve_assoc_type_of_instance(iter_type, an)
+            if is_error_type(resolved) == false:
+                struct_params.push(an)
+                struct_args.push(resolved)
     ret_tid := collect_function_return_type_with_subst(method_node, struct_params, struct_args)
     ret_info := get_type_info(ret_tid)
     if ret_info.kind != "optional":

@@ -1,0 +1,35 @@
+# a generic function that returns an optional by forwarding an
+# already-optional value must forward it, not wrap it in a second Some.
+# (the receiver's method return isn't resolved to optional at the generic
+# function's declaration, so the emitter has to recognize it on its own.)
+
+interface HasMaybe:
+    fn maybe() -> Int?
+
+struct IntBox:
+    pub value: Int
+
+impl HasMaybe for IntBox:
+    fn maybe() -> Int?:
+        return self.value
+
+fn forward[T: HasMaybe](c: T) -> Int?:
+    return c.maybe()
+
+# an optional whose payload is itself a tuple must still be wrapped once
+fn pair_or_none(a: Int, b: Int) -> (Int, Int)?:
+    if a > b:
+        return none
+    return (a, b)
+
+fn main():
+    b := IntBox(value: 40)
+    if let g = forward(b):
+        print("{g}")
+    else:
+        print("none")
+    if let p = pair_or_none(1, 2):
+        print("{p.0} {p.1}")
+    match pair_or_none(5, 3):
+        none => print("none")
+        got => print("{got.0}")

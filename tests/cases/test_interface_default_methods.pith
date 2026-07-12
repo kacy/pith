@@ -1,0 +1,41 @@
+# interface methods may carry a body, which makes them default methods:
+# an impl inherits the default unless it provides its own. a default can
+# call the interface's other methods on self, and is monomorphized per
+# implementing type so self resolves to that type.
+
+interface Animal:
+    fn name() -> String
+    fn sound() -> String
+    fn describe() -> String:
+        return "{self.name()} says {self.sound()}"
+    fn greet(times: Int) -> String:
+        return "{self.describe()} x{times}"
+
+struct Dog:
+    pub tag: String
+
+struct Cat:
+    pub tag: String
+
+impl Animal for Dog:
+    fn name() -> String:
+        return self.tag
+    fn sound() -> String:
+        return "woof"
+
+impl Animal for Cat:
+    fn name() -> String:
+        return self.tag
+    fn sound() -> String:
+        return "meow"
+    # override just the one default; greet still comes from the interface
+    fn describe() -> String:
+        return "the cat {self.name()} ignores you"
+
+fn main():
+    d := Dog(tag: "rex")
+    c := Cat(tag: "mia")
+    print(d.describe()) # inherited default
+    print(c.describe()) # overridden
+    print(d.greet(3)) # default greet -> inherited describe
+    print(c.greet(2)) # default greet -> overridden describe

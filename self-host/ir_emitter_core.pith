@@ -44,7 +44,7 @@ from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, ti_opt
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
-from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_specializations, ir_impl_method_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name
+from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_specializations, ir_impl_method_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_record_generic_function_decl, ir_is_generic_function_name, ir_generic_preferred_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
 from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node
@@ -790,6 +790,59 @@ fn ir_impl_target_type(node: Node) -> String:
             impl_type = child_node.value
     return impl_type
 
+# for `impl Iface for Concrete`, the interface's base name; "" for a plain
+# `impl T:` block. the first type child is the interface, a for_type follows.
+fn ir_impl_interface_base(node: Node) -> String:
+    mut has_for := false
+    mut first_type := ""
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "type" and first_type == "":
+            first_type = cn.value
+        elif cn.kind == "generic_type" and first_type == "":
+            first_type = cn.value
+        elif cn.kind == "for_type":
+            has_for = true
+    if has_for == false:
+        return ""
+    return ir_strip_type_args(first_type)
+
+fn ir_impl_defines_method(node: Node, method_name: String) -> Bool:
+    for child in node.children:
+        mn := get_node(ir_unwrap_pub_child(child))
+        if ir_is_fn_decl_kind(mn.kind) and mn.value == method_name:
+            return true
+    return false
+
+# the interface-default fn_decl nodes an impl inherits: each default method on
+# the interface (a fn_decl member) that the impl did not override itself.
+fn ir_inherited_default_indices(node: Node) -> List[Int]:
+    mut result: List[Int] := []
+    iface_base := ir_impl_interface_base(node)
+    if iface_base.len() == 0:
+        return result
+    if ir_interface_decl_index.contains_key(iface_base) == false:
+        return result
+    iface_node := get_node(ir_interface_decl_index[iface_base])
+    for member in iface_node.children:
+        mn := get_node(member)
+        if ir_is_fn_decl_kind(mn.kind):
+            if ir_impl_defines_method(node, mn.value) == false:
+                result.push(member)
+    return result
+
+# index every interface_decl in a root by its base name so impls can find the
+# defaults they inherit. must run before impl signatures are collected.
+fn ir_index_interfaces_in_root(root_idx: Int):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        mut actual_idx := item_idx
+        if node.kind == "pub":
+            actual_idx = node.children[0]
+        actual := get_node(actual_idx)
+        if actual.kind == "interface_decl":
+            ir_interface_decl_index.insert(actual.value, actual_idx)
+
 fn ir_emit_impl_methods(node: Node, impl_type: String):
     # for a generic struct, also emit one specialized copy of each method per
     # known instantiation so calls inside the body (`self.src.next()`) can
@@ -805,6 +858,9 @@ fn ir_emit_impl_methods(node: Node, impl_type: String):
         child_node := get_node(method_idx)
         if child_node.kind == "fn_decl":
             ir_impl_func(method_idx, impl_type)
+    # emit a per-type copy of each interface default this impl didn't override
+    for default_idx in ir_inherited_default_indices(node):
+        ir_impl_func(default_idx, impl_type)
 
 fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
     if not has_generic_declaration(impl_type):
@@ -1263,6 +1319,13 @@ fn ir_checked_target_type(target_idx: Int, fallback_name: String) -> String:
 fn ir_method_receiver_type(node: Node) -> String:
     if node.children.len() == 0:
         return ""
+    # `self` is always the impl type currently being emitted. reading the
+    # checker's recorded type would be wrong for a shared interface-default
+    # body, which is type-checked once per implementing type — the last one
+    # wins and would misroute self.method() to that type.
+    recv0 := get_node(node.children[0])
+    if recv0.kind == "self" and ir_current_impl_type.len() > 0:
+        return ir_current_impl_type
     recv_tid := c_get_expr_type(node.children[0])
     if recv_tid >= 0:
         recv_info := get_type_info(recv_tid)
@@ -4875,6 +4938,9 @@ fn ir_collect_impl_method_signatures(node: Node, module_path: String):
         method_node := get_node(method_idx)
         if ir_is_fn_decl_kind(method_node.kind):
             ir_record_impl_method_signature(impl_type, method_idx, method_node, module_path)
+    # inherited interface defaults get a signature under this concrete type too
+    for default_idx in ir_inherited_default_indices(node):
+        ir_record_impl_method_signature(impl_type, default_idx, get_node(default_idx), module_path)
 
 fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_node: Node, module_path: String):
     method_name := method_node.value
@@ -5356,7 +5422,17 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     ir_struct_field_index_lookup.clear()
     ir_struct_decl_nodes.clear()
     ir_impl_methods.clear()
+    ir_interface_decl_index.clear()
     ir_register_known_import_structs()
+
+    # index every interface (imports + root) before any impl signatures are
+    # collected, so an impl can find its interface's defaults regardless of
+    # declaration order across modules
+    mut iface_i := 0
+    while iface_i < ir_preloaded_import_roots.len():
+        ir_index_interfaces_in_root(ir_preloaded_import_roots[iface_i])
+        iface_i = iface_i + 1
+    ir_index_interfaces_in_root(root_idx)
 
     mut preload_i := 0
     while preload_i < ir_preloaded_import_roots.len():

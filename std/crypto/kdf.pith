@@ -45,59 +45,70 @@ fn xor_digest(left: List[Int], right: Bytes) -> List[Int]:
         i = i + 1
     return out
 
-# hkdf extract with hmac-sha256.
-pub fn hkdf_extract_sha256(salt: Bytes, secret: Bytes) -> Bytes:
+# HKDF and PBKDF2 over any HMAC. `mac` is the HMAC function and `hash_len` its
+# output size, so the sha256/sha512 variants are just the right pair passed in.
+
+fn hkdf_extract(mac: fn(Bytes, Bytes) -> Bytes, hash_len: Int, salt: Bytes, secret: Bytes) -> Bytes:
     mut actual_salt := salt
     if actual_salt.len() == 0:
-        actual_salt = zero_bytes(32)
-    return hmac.sha256(actual_salt, secret)
+        actual_salt = zero_bytes(hash_len)
+    return mac(actual_salt, secret)
+
+fn hkdf_expand(mac: fn(Bytes, Bytes) -> Bytes, hash_len: Int, prk: Bytes, info: Bytes, length: Int) -> Bytes!:
+    if length < 0:
+        fail "hkdf length out of range"
+    if length > 255 * hash_len:
+        fail "hkdf length out of range"
+    mut okm := bytes.buffer_with_capacity(length)
+    mut previous := bytes.empty()
+    mut counter := 1
+    while okm.bytes().len() < length:
+        input := previous.concat(info).concat(int32_be(counter).slice(3, 4))
+        previous = mac(prk, input)
+        need := length - okm.bytes().len()
+        mut take := previous.len()
+        if take > need:
+            take = need
+        okm.write(previous.slice(0, take))!
+        counter = counter + 1
+    return okm.bytes()
+
+fn pbkdf2(mac: fn(Bytes, Bytes) -> Bytes, password: Bytes, salt: Bytes, iterations: Int, length: Int) -> Bytes!:
+    if iterations <= 0:
+        fail "pbkdf2 iterations must be positive"
+    if length < 0:
+        fail "pbkdf2 length out of range"
+    out := bytes.buffer_with_capacity(length)
+    mut block_index := 1
+    while out.bytes().len() < length:
+        mut u := mac(password, salt.concat(int32_be(block_index)))
+        mut mixed := bytes_to_list(u)
+        mut round := 2
+        while round <= iterations:
+            u = mac(password, u)
+            mixed = xor_digest(mixed, u)
+            round = round + 1
+        need := length - out.bytes().len()
+        block := list_to_bytes(mixed, need)
+        out.write(block)!
+        block_index = block_index + 1
+    return out.bytes()
+
+# hkdf extract with hmac-sha256.
+pub fn hkdf_extract_sha256(salt: Bytes, secret: Bytes) -> Bytes:
+    return hkdf_extract(hmac.sha256, 32, salt, secret)
 
 # hkdf expand with hmac-sha256.
 pub fn hkdf_expand_sha256(prk: Bytes, info: Bytes, length: Int) -> Bytes!:
-    if length < 0:
-        fail "hkdf length out of range"
-    if length > 8160:
-        fail "hkdf length out of range"
-    mut okm := bytes.buffer_with_capacity(length)
-    mut previous := bytes.empty()
-    mut counter := 1
-    while okm.bytes().len() < length:
-        input := previous.concat(info).concat(int32_be(counter).slice(3, 4))
-        previous = hmac.sha256(prk, input)
-        need := length - okm.bytes().len()
-        mut take := previous.len()
-        if take > need:
-            take = need
-        okm.write(previous.slice(0, take))!
-        counter = counter + 1
-    return okm.bytes()
+    return hkdf_expand(hmac.sha256, 32, prk, info, length)
 
 # hkdf extract with hmac-sha512.
 pub fn hkdf_extract_sha512(salt: Bytes, secret: Bytes) -> Bytes:
-    mut actual_salt := salt
-    if actual_salt.len() == 0:
-        actual_salt = zero_bytes(64)
-    return hmac.sha512(actual_salt, secret)
+    return hkdf_extract(hmac.sha512, 64, salt, secret)
 
 # hkdf expand with hmac-sha512.
 pub fn hkdf_expand_sha512(prk: Bytes, info: Bytes, length: Int) -> Bytes!:
-    if length < 0:
-        fail "hkdf length out of range"
-    if length > 16320:
-        fail "hkdf length out of range"
-    mut okm := bytes.buffer_with_capacity(length)
-    mut previous := bytes.empty()
-    mut counter := 1
-    while okm.bytes().len() < length:
-        input := previous.concat(info).concat(int32_be(counter).slice(3, 4))
-        previous = hmac.sha512(prk, input)
-        need := length - okm.bytes().len()
-        mut take := previous.len()
-        if take > need:
-            take = need
-        okm.write(previous.slice(0, take))!
-        counter = counter + 1
-    return okm.bytes()
+    return hkdf_expand(hmac.sha512, 64, prk, info, length)
 
 # derive bytes with HKDF-SHA256.
 pub fn hkdf_sha256(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Bytes!:
@@ -109,47 +120,11 @@ pub fn hkdf_sha512(secret: Bytes, salt: Bytes, info: Bytes, length: Int) -> Byte
 
 # derive bytes with PBKDF2-HMAC-SHA256.
 pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int, length: Int) -> Bytes!:
-    if iterations <= 0:
-        fail "pbkdf2 iterations must be positive"
-    if length < 0:
-        fail "pbkdf2 length out of range"
-    out := bytes.buffer_with_capacity(length)
-    mut block_index := 1
-    while out.bytes().len() < length:
-        mut u := hmac.sha256(password, salt.concat(int32_be(block_index)))
-        mut mixed := bytes_to_list(u)
-        mut round := 2
-        while round <= iterations:
-            u = hmac.sha256(password, u)
-            mixed = xor_digest(mixed, u)
-            round = round + 1
-        need := length - out.bytes().len()
-        block := list_to_bytes(mixed, need)
-        out.write(block)!
-        block_index = block_index + 1
-    return out.bytes()
+    return pbkdf2(hmac.sha256, password, salt, iterations, length)
 
 # derive bytes with PBKDF2-HMAC-SHA512.
 pub fn pbkdf2_sha512(password: Bytes, salt: Bytes, iterations: Int, length: Int) -> Bytes!:
-    if iterations <= 0:
-        fail "pbkdf2 iterations must be positive"
-    if length < 0:
-        fail "pbkdf2 length out of range"
-    out := bytes.buffer_with_capacity(length)
-    mut block_index := 1
-    while out.bytes().len() < length:
-        mut u := hmac.sha512(password, salt.concat(int32_be(block_index)))
-        mut mixed := bytes_to_list(u)
-        mut round := 2
-        while round <= iterations:
-            u = hmac.sha512(password, u)
-            mixed = xor_digest(mixed, u)
-            round = round + 1
-        need := length - out.bytes().len()
-        block := list_to_bytes(mixed, need)
-        out.write(block)!
-        block_index = block_index + 1
-    return out.bytes()
+    return pbkdf2(hmac.sha512, password, salt, iterations, length)
 
 test "hkdf sha256 matches rfc 5869 vector":
     ikm := encoding.from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")!

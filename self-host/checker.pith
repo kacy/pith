@@ -63,6 +63,16 @@ mut implementation_set: Map[String, Int] := {}
 # interface base name -> its interface_decl node index, so an impl can find
 # the interface's default methods (fn_decl members) to inherit.
 mut interface_decl_index: Map[String, Int] := {}
+# associated types: interface base name -> csv of declared type-member names.
+mut interface_assoc_types: Map[String, String] := {}
+# an impl's bindings, keyed "ConcreteType.Item" -> bound type TID.
+mut assoc_type_binding: Map[String, Int] := {}
+# ConcreteType -> csv of the associated-type names it binds, so a call site can
+# substitute them (Item -> Int) when resolving a method's return/param types.
+mut type_assoc_names: Map[String, String] := {}
+# bindings of the impl currently being processed, consulted in resolve_named_type
+# so `Item` resolves to the bound type inside that impl's methods.
+mut active_assoc_bindings: Map[String, Int] := {}
 # impl interface args: "Type\tIfaceBase" -> "tid1,tid2,..." (tid list as csv)
 # (Pith Maps can't hold List values reliably; encode the tid list as a string.)
 pub mut impl_interface_args: Map[String, String] := {}
@@ -290,6 +300,10 @@ fn resolve_imported_type_name(name: String) -> String:
     return name
 
 fn resolve_named_type(name: String) -> Int:
+    # an associated type name resolves to the binding of the impl currently
+    # being processed (e.g. `Item` -> `Int` inside `impl Container for IntBox`)
+    if active_assoc_bindings.contains_key(name):
+        return active_assoc_bindings[name]
     resolved_name := resolve_imported_type_name(name)
     tid := lookup_type_id(resolved_name)
     if tid < 0:
@@ -553,10 +567,15 @@ fn register_interface_declaration(node_idx: Int, node: Node):
     base_name := node.value
     mut name := base_name
     mut generic_names: List[String] := []
+    mut assoc_names: List[String] := []
     for child in node.children:
         cn := get_node(child)
         if cn.kind == "generic_param":
             generic_names.push(cn.value)
+        elif cn.kind == "assoc_type":
+            assoc_names.push(cn.value)
+    if assoc_names.len() > 0:
+        interface_assoc_types.insert(base_name, assoc_names.join(","))
     if generic_names.len() > 0:
         name = build_interface_type_name(name, generic_names)
     # register as a zero-field struct in type table (so it's resolvable)
@@ -621,6 +640,20 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
         for sp in suppressed_params:
             suppress_unknown_type_for.insert(sp, 1)
 
+    # collect associated-type bindings first, so the interface's method
+    # signatures (`-> Item`) resolve to the bound type as methods register
+    active_assoc_bindings = {}
+    mut assoc_names_for_type: List[String] := []
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "assoc_type_bind":
+            bound_tid := resolve_type_implementation(cn.children[0])
+            active_assoc_bindings.insert(cn.value, bound_tid)
+            assoc_type_binding.insert(concrete_name + "." + cn.value, bound_tid)
+            assoc_names_for_type.push(cn.value)
+    if assoc_names_for_type.len() > 0:
+        type_assoc_names.insert(concrete_name, assoc_names_for_type.join(","))
+
     # register each method (skip first method_start children)
     mut skip := method_start
     for child in node.children:
@@ -636,6 +669,7 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             cn = get_node(method_node_idx)
         if cn.kind == "fn_decl":
             register_method_declaration(concrete_name, method_node_idx, cn, method_is_pub)
+    active_assoc_bindings = {}
 
     # clear the suppression for the next impl block
     for sp in suppressed_params:
@@ -981,6 +1015,16 @@ fn check_implementation_declaration(node: Node):
     if concrete_tid < 0:
         return
 
+    # activate this impl's associated-type bindings so `Item` resolves inside
+    # the method bodies, and check that every declared associated type is bound
+    active_assoc_bindings = {}
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "assoc_type_bind":
+            active_assoc_bindings.insert(cn.value, resolve_type_implementation(cn.children[0]))
+    if method_start == 2:
+        check_assoc_types_bound(first_type_node, concrete_name)
+
     # check each method body (skip first method_start children)
     mut skip := method_start
     for child in node.children:
@@ -1004,6 +1048,16 @@ fn check_implementation_declaration(node: Node):
                 if mn.kind == "fn_decl":
                     if is_impl_own_method(node, method_start, mn.value) == false:
                         check_method_body(concrete_name, concrete_tid, mn)
+    active_assoc_bindings = {}
+
+# an impl of an interface with associated types must bind every one of them.
+fn check_assoc_types_bound(iface_type_node: Node, concrete_name: String):
+    iface_base := iface_type_base_name(iface_type_node)
+    if interface_assoc_types.contains_key(iface_base) == false:
+        return
+    for req_name in interface_assoc_types[iface_base].split(","):
+        if active_assoc_bindings.contains_key(req_name) == false:
+            report_error("E229", "impl of " + iface_base + " for " + concrete_name + " is missing associated type: " + req_name)
 
 # is a method name provided directly by the impl block (vs inherited)?
 fn is_impl_own_method(node: Node, method_start: Int, method_name: String) -> Bool:
@@ -3532,6 +3586,15 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 if has_generic_declaration(base):
                     sdecl := get_node(get_generic_declaration_index(base))
                     struct_params = collect_generic_parameter_names(sdecl)
+        # associated-type bindings for the receiver resolve like extra type
+        # params (Item -> Int) so a method typed `-> Item` resolves here too
+        assoc_base := extract_base_type_name(type_name)
+        if type_assoc_names.contains_key(assoc_base):
+            for an in type_assoc_names[assoc_base].split(","):
+                bkey := assoc_base + "." + an
+                if assoc_type_binding.contains_key(bkey):
+                    struct_params.push(an)
+                    struct_args.push(assoc_type_binding[bkey])
         param_types := collect_function_param_types_with_subst(method_node, struct_params, struct_args)
         ret_type := collect_function_return_type_with_subst(method_node, struct_params, struct_args)
         # check arg count

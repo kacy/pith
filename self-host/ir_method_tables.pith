@@ -12,6 +12,18 @@ pub mut ir_impl_method_specializations: Map[String, String] := {}
 # interface base name -> its interface_decl node index, so an impl can emit
 # the interface's default methods it did not override.
 pub mut ir_interface_decl_index: Map[String, Int] := {}
+# associated-type bindings for emission: "ConcreteType.Item" -> bound type name,
+# and "ConcreteType" -> csv of the associated-type names it binds.
+pub mut ir_assoc_bindings: Map[String, String] := {}
+pub mut ir_type_assoc_names: Map[String, String] := {}
+
+## the bound type name for an associated type on a concrete impl, else the
+## name unchanged. e.g. ("Tag", "Item") -> "string".
+pub fn ir_resolve_assoc_type(impl_type: String, type_name: String) -> String:
+    key := impl_type + "." + type_name
+    if ir_assoc_bindings.contains_key(key):
+        return ir_assoc_bindings[key]
+    return type_name
 
 ## the lookup key for a method on a type: "Type.method".
 pub fn ir_impl_method_key(type_name: String, method_name: String) -> String:

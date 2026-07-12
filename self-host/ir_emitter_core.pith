@@ -44,7 +44,7 @@ from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, ti_opt
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name
 from ir_names import ir_module_default_alias, ir_import_target_name, ir_base_decl_name, ir_import_impl_method_name
-from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_specializations, ir_impl_method_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index
+from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_specializations, ir_impl_method_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_record_generic_function_decl, ir_is_generic_function_name, ir_generic_preferred_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
 from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node
@@ -830,6 +830,26 @@ fn ir_inherited_default_indices(node: Node) -> List[Int]:
             if ir_impl_defines_method(node, mn.value) == false:
                 result.push(member)
     return result
+
+# collect each impl's associated-type bindings so a method's `-> Item` header
+# resolves to the bound type (and, for heap types, gets the right return kind).
+fn ir_collect_assoc_bindings_in_root(root_idx: Int):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        mut actual := node
+        if node.kind == "pub":
+            actual = get_node(node.children[0])
+        if actual.kind == "impl_decl":
+            impl_type := ir_impl_target_type(actual)
+            if impl_type.len() > 0:
+                mut names: List[String] := []
+                for child in actual.children:
+                    cn := get_node(child)
+                    if cn.kind == "assoc_type_bind":
+                        ir_assoc_bindings.insert(impl_type + "." + cn.value, ir_resolve_type_node(cn.children[0]))
+                        names.push(cn.value)
+                if names.len() > 0:
+                    ir_type_assoc_names.insert(impl_type, names.join(","))
 
 # index every interface_decl in a root by its base name so impls can find the
 # defaults they inherit. must run before impl signatures are collected.
@@ -4708,7 +4728,12 @@ fn ir_emit_fn_params(fn_idx: Int):
     for child in nk:
         cn := get_node(child)
         if cn.kind == "param":
-            ir_emit_named_param(cn.value, ir_extract_param_type(child))
+            mut ptype := ir_extract_param_type(child)
+            # inside an impl method, an associated-type param (`x: Item`)
+            # resolves to the bound type so it gets the right arc treatment
+            if ir_current_impl_type.len() > 0:
+                ptype = ir_resolve_assoc_type(ir_current_impl_type, ptype)
+            ir_emit_named_param(cn.value, ptype)
             ir_record_closure_param_return(child)
 
 fn ir_extract_return_type(fn_idx: Int) -> String:
@@ -4948,7 +4973,7 @@ fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_no
     if module_path.len() > 0:
         full_name = ir_import_impl_method_name(module_path, impl_type, method_name)
     key := ir_impl_method_key(impl_type, method_name)
-    ret_type := ir_extract_return_type(method_idx)
+    ret_type := ir_resolve_assoc_type(impl_type, ir_extract_return_type(method_idx))
     ir_impl_methods.insert(key, full_name)
     ir_func_returns.insert(key, ret_type)
     ir_func_returns.insert(full_name, ret_type)
@@ -5049,9 +5074,13 @@ fn ir_impl_func(idx: Int, impl_type: String):
 
     body_idx := ir_find_body(idx)
     param_count := ir_param_count(idx) + 1
-    ret_type := ir_extract_return_type(idx)
+    # resolve an associated-type return (`-> Item`) to the impl's bound type so
+    # the function's return kind is right — critical for heap types and arc
+    ret_type := ir_resolve_assoc_type(impl_type, ir_extract_return_type(idx))
     ir_prepare_func_emission(ret_type)
-    ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
+    # an `-> Item?` return: resolve the inner kind too so the optional's
+    # payload is reclaimed correctly for heap-typed bindings
+    ir_current_func_optional_inner_kind = ir_resolve_assoc_type(impl_type, ir_extract_optional_inner_type(idx))
     ir_current_impl_type = impl_type
     ir_current_arc_func = full_name
     ir_emit_func_header(full_name, param_count, ret_type)
@@ -5423,6 +5452,8 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     ir_struct_decl_nodes.clear()
     ir_impl_methods.clear()
     ir_interface_decl_index.clear()
+    ir_assoc_bindings.clear()
+    ir_type_assoc_names.clear()
     ir_register_known_import_structs()
 
     # index every interface (imports + root) before any impl signatures are
@@ -5431,8 +5462,10 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     mut iface_i := 0
     while iface_i < ir_preloaded_import_roots.len():
         ir_index_interfaces_in_root(ir_preloaded_import_roots[iface_i])
+        ir_collect_assoc_bindings_in_root(ir_preloaded_import_roots[iface_i])
         iface_i = iface_i + 1
     ir_index_interfaces_in_root(root_idx)
+    ir_collect_assoc_bindings_in_root(root_idx)
 
     mut preload_i := 0
     while preload_i < ir_preloaded_import_roots.len():

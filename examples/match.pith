@@ -5,24 +5,43 @@ enum Shape:
     Rectangle(Float, Float)
     Point
 
-# match as an expression — arms must agree on type
-fn describe(s: Shape) -> String:
+# destructure a variant and use its payload
+fn area(s: Shape) -> Float:
     match s:
-        Shape.Circle(r) => "circle"
-        Shape.Rectangle(w, h) => "rectangle"
-        Shape.Point => "point"
+        Shape.Circle(r) => 3.14159 * r * r
+        Shape.Rectangle(w, h) => w * h
+        Shape.Point => 0.0
 
-# match on literal values
-fn classify(n: Int) -> String:
-    match n:
-        0 => "zero"
-        1 => "one"
-        _ => "other"
+# literal, range, and guarded patterns over an integer
+fn grade(score: Int) -> String:
+    match score:
+        0 => "absent"
+        90..=100 => "A"
+        80..=89 => "B"
+        n if n >= 60 => "pass"
+        _ => "fail"
 
-# binding pattern captures the matched value
-fn echo(n: Int) -> Int:
-    match n:
-        x => x
+# find the first positive number, or none
+fn first_positive(nums: List[Int]) -> Int?:
+    for n in nums:
+        if n > 0:
+            return n
+    return none
 
 fn main():
-    print("match patterns work")
+    for s in [Shape.Circle(2.0), Shape.Rectangle(3.0, 4.0), Shape.Point]:
+        a := area(s)
+        print("area {a:.2}")
+
+    for score in [100, 85, 72, 40, 0]:
+        print("{score}: {grade(score)}")
+
+    # if let destructures a variant when it matches
+    box := Shape.Rectangle(5.0, 6.0)
+    if let Shape.Rectangle(w, h) = box:
+        print("rectangle {w} by {h}")
+
+    # match the none and some cases of an optional
+    match first_positive([0 - 4, 0 - 1, 7, 9]):
+        none => print("no positive value")
+        v => print("first positive is {v}")

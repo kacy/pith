@@ -42,9 +42,9 @@ something here that now works, the page is stale and a fix to it is welcome.
   generic interfaces. an associated type resolves both inside the impl's
   own methods and in generic `T.Item` position — a
   `fn f[T: Container](c: T) -> T.Item` returns the right type for each
-  concrete `T`. `where` clauses are unsupported. there is no
-  method-completeness check: an impl that omits a non-default method is
-  caught at the call site (E209), not at the impl block.
+  concrete `T`. an impl that omits an abstract (non-default) interface
+  method is rejected at the impl block (E235). `where` clauses are the
+  remaining gap — bounds must be written inline (`[T: Display + Hash]`).
 
 ## standard library
 

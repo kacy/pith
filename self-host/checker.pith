@@ -1092,8 +1092,15 @@ fn check_implementation_declaration(node: Node):
             for member in iface_node.children:
                 mn := get_node(member)
                 if mn.kind == "fn_decl":
+                    # a default the impl didn't override: type-check it here
                     if is_impl_own_method(node, method_start, mn.value) == false:
                         check_method_body(concrete_name, concrete_tid, mn)
+                elif mn.kind == "fn_sig":
+                    # an abstract method: the impl must provide it directly.
+                    # catching it here names the gap at the impl block instead
+                    # of leaving a confusing "no method" error at the call site
+                    if is_impl_own_method(node, method_start, mn.value) == false:
+                        report_error("E235", "impl of " + iface_base + " for " + concrete_name + " is missing method: " + mn.value)
     active_assoc_bindings = {}
 
 # an impl of an interface with associated types must bind every one of them.

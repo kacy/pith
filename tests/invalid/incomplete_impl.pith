@@ -1,0 +1,18 @@
+# an impl that omits an abstract interface method is rejected at the impl
+# block (E235), instead of the old behavior where the gap only showed up as
+# a "no method" error at some later call site.
+
+interface Greeter:
+    fn name() -> String
+    fn greet() -> String
+
+struct Person:
+    pub who: String
+
+impl Greeter for Person:
+    fn name() -> String:
+        return self.who
+
+fn main():
+    p := Person(who: "ada")
+    print(p.name())

@@ -555,7 +555,16 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
         if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes" or expr_kind == "struct" or expr_kind == "closure" or expr_kind == "tuple":
             return false
     if node.kind == "method_call":
-        return not ir_string_method_returns_fresh(ir_plain_method_name(node.value))
+        # a user-defined method already settled its result's ownership on the
+        # way out: it retains a returned borrow and transfers a fresh value, so
+        # the result arrives owned — the caller must not retain it again (that
+        # over-retain is a leak when the method returns a fresh string). only
+        # builtin string methods, which don't route through that return path,
+        # fall back to the known-fresh list.
+        mname := ir_plain_method_name(node.value)
+        if ir_lookup_impl_method_name(ir_method_receiver_type(node), mname).len() > 0:
+            return false
+        return not ir_string_method_returns_fresh(mname)
     return true
 
 fn ir_string_method_returns_fresh(mname: String) -> Bool:

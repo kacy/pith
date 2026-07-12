@@ -113,20 +113,24 @@ that prompted the rerun (reference-counting closures instead of
 leaking them) had added the release lock, so removing the registry
 paid that back too.
 
-`bench/http_server` — a json api under wrk for two minutes:
+`bench/http_server` — a json api under `wrk -t2 -c8` on `/item?id=12345`,
+this 2-core machine:
 
-| | go 1-core | go all-cores | rust minimal | pith single | pith threaded |
-|---|---|---|---|---|---|
-| req/s | 13,838 | 14,584 | 7,606 | **7,583** | 7,916 |
-| rss | 12 mb flat | 13 mb flat | 2 mb flat | +1.3 kb/req | +1.3 kb/req |
+| | go | pith single | pith threaded |
+|---|---|---|---|
+| req/s | ~30,800 | 8,580 | **15,700** |
+| cores used | | ~0.6 | ~1.3 |
+| rss | flat | +1.3 kb/req | +1.3 kb/req |
 
-single-threaded pith serves at parity with the single-threaded rust
-comparator through a full http stack. the threaded server has reached
-15,800 req/s on this machine when the load generator wasn't competing
-for the same two cores; with wrk co-located it converges with the
-single-threaded number. go's netpoller stays ahead either way. the
-residual growth is ~1.3 kb/request, attributed down to header-name
-copies and a few structs in the leak reporter.
+the threaded server — one spawned os thread per connection — runs about
+**2x** the single-threaded one, ~15.7k vs ~8.6k req/s, using ~1.3 cores
+against ~0.6, even with wrk competing for the same two cores. an earlier
+version of this table put the two at parity (7.9k vs 7.6k), which
+contradicted the doc's own note that the threaded server reaches ~15.8k;
+that table value was anomalous — this run confirms the ~2x holds with
+wrk co-located. go's netpoller stays well ahead. the residual growth is
+~1.3–1.6 kb/request in the request path, a real per-request leak that is
+still unfixed.
 
 build times: go cold 25.0s / warm 0.1s; pith compiles the benchmark
 in 2.1s every time, and the entire self-hosted compiler in under 7s.

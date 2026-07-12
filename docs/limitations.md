@@ -35,6 +35,12 @@ something here that now works, the page is stale and a fix to it is welcome.
   (E209). bind it to a name first (`f := instance.field; f(args)`).
   function values held in locals, globals, list/map/tuple elements, and
   returned from calls are all directly callable.
+- **interface depth** — interfaces support method signatures, default
+  methods (a member with a body that implementors inherit unless they
+  override it), single and multiple bounds, and generic interfaces.
+  they do not yet support associated types or `where` clauses, and there
+  is no completeness check: an impl that omits a non-default method is
+  caught at the call site (E209), not at the impl block.
 
 ## standard library
 

@@ -1790,6 +1790,16 @@ fn parse_fn_sig() -> Int:
         mut ret_children: List[Int] := [ret]
         children.push(add_node_with_position("returns", "", ret_children))
 
+    # an interface member may carry a body, which makes it a default:
+    # implementors inherit it unless they provide their own. a default
+    # is shaped as a fn_decl so it reuses the ordinary method machinery;
+    # an abstract member (no body) stays a bare fn_sig.
+    if match_tok("colon"):
+        body := parse_block()
+        mut body_children: List[Int] := [body]
+        children.push(add_node_with_position("body", "", body_children))
+        return add_node_with_position("fn_decl", name_tok.value, children)
+
     return add_node_with_position("fn_sig", name_tok.value, children)
 
 fn parse_impl_decl() -> Int:

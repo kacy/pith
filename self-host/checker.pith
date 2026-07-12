@@ -60,6 +60,9 @@ mut generic_declaration_names: List[String] := []
 mut checking_test_decl := false
 # impl set: "Type\tInterface" -> 1
 mut implementation_set: Map[String, Int] := {}
+# interface base name -> its interface_decl node index, so an impl can find
+# the interface's default methods (fn_decl members) to inherit.
+mut interface_decl_index: Map[String, Int] := {}
 # impl interface args: "Type\tIfaceBase" -> "tid1,tid2,..." (tid list as csv)
 # (Pith Maps can't hold List values reliably; encode the tid list as a string.)
 pub mut impl_interface_args: Map[String, String] := {}
@@ -401,6 +404,10 @@ pub fn c_register_all(root_idx: Int):
     root := get_node(root_idx)
     for child in root.children:
         register_top_level_declarations(child)
+    # with every interface and impl now registered, let impls inherit any
+    # interface default methods they did not override
+    for child in root.children:
+        fill_interface_defaults_for(child)
 
 fn register_top_level_declarations(node_idx: Int):
     node := get_node(node_idx)
@@ -562,6 +569,8 @@ fn register_interface_declaration(node_idx: Int, node: Node):
         register_type_name(base_name, tid)
         register_interface_declaration_name(base_name)
     register_interface_declaration_name(name)
+    # remember the node so impls can find this interface's default methods
+    interface_decl_index.insert(base_name, node_idx)
 
 # ---------------------------------------------------------------
 # pass 1 — impl declarations
@@ -639,6 +648,45 @@ fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_
     method_type_map.insert(key, fn_tid)
     method_visibility_map.insert(key, is_pub)
     register_method_signature(key, node_idx)
+
+# after all interfaces and impls are registered, an `impl Iface for T`
+# inherits every default method (a fn_decl member of the interface) that
+# T did not provide itself. we register the interface's default node under
+# "T.method" so calls resolve; the emitter emits a per-type copy, and the
+# body is type-checked against T in check_implementation_declaration.
+fn fill_interface_defaults_for(node_idx: Int):
+    node := get_node(node_idx)
+    if node.kind == "pub":
+        fill_interface_defaults_for(node.children[0])
+        return
+    if node.kind == "impl_decl":
+        fill_impl_defaults(node)
+
+fn fill_impl_defaults(node: Node):
+    # only `impl Iface for Concrete` inherits defaults
+    if node.children.len() < 2:
+        return
+    second_node := get_node(node.children[1])
+    if second_node.kind != "for_type":
+        return
+    first_type_node := get_node(node.children[0])
+    iface_base := iface_type_base_name(first_type_node)
+    for_inner := get_node(second_node.children[0])
+    concrete_name := get_type_node_name(for_inner)
+    if concrete_name == "" or iface_base == "":
+        return
+    if interface_decl_index.contains_key(iface_base) == false:
+        return
+    iface_node := get_node(interface_decl_index[iface_base])
+    for member in iface_node.children:
+        mn := get_node(member)
+        # a fn_decl member carries a body: it is a default. an abstract
+        # member is a bare fn_sig and is skipped.
+        if mn.kind == "fn_decl":
+            key := concrete_name + "." + mn.value
+            # a method the type provides itself always wins over the default
+            if method_type_map.contains_key(key) == false:
+                register_method_declaration(concrete_name, member, mn, true)
 
 fn check_type_implements_interface(type_name: String, iface_name: String) -> Bool:
     # match on base names so a generic instance like FilterIter[Range, Int]
@@ -944,6 +992,33 @@ fn check_implementation_declaration(node: Node):
             cn = get_node(cn.children[0])
         if cn.kind == "fn_decl":
             check_method_body(concrete_name, concrete_tid, cn)
+
+    # type-check any inherited interface defaults against this concrete type,
+    # so `self` inside a default resolves to the implementing type
+    if method_start == 2:
+        iface_base := iface_type_base_name(first_type_node)
+        if interface_decl_index.contains_key(iface_base):
+            iface_node := get_node(interface_decl_index[iface_base])
+            for member in iface_node.children:
+                mn := get_node(member)
+                if mn.kind == "fn_decl":
+                    if is_impl_own_method(node, method_start, mn.value) == false:
+                        check_method_body(concrete_name, concrete_tid, mn)
+
+# is a method name provided directly by the impl block (vs inherited)?
+fn is_impl_own_method(node: Node, method_start: Int, method_name: String) -> Bool:
+    mut skip := method_start
+    for child in node.children:
+        if skip > 0:
+            skip = skip - 1
+            continue
+        mut cn := get_node(child)
+        if cn.kind == "pub":
+            cn = get_node(cn.children[0])
+        if cn.kind == "fn_decl":
+            if cn.value == method_name:
+                return true
+    return false
 
 fn check_method_body(type_name: String, type_tid: Int, node: Node):
     param_types := collect_function_param_types(node)

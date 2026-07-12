@@ -42,7 +42,7 @@ fn test_string_methods() -> String:
     has := s.contains("world")
     trimmed := "  hi  ".trim()
     starts := s.starts_with("hello")
-    return sub + "|" + parts.join("+") + "|" + has.to_string() + "|" + trimmed + "|" + starts.to_string()
+    return "{sub}|{parts.join("+")}|{has}|{trimmed}|{starts}"
 
 # --- map operations (insert 40x, contains_key 27x, keys 3x) ---
 fn test_map_ops():
@@ -50,19 +50,19 @@ fn test_map_ops():
     m.insert("a", 1)
     m.insert("b", 2)
     m.insert("c", 3)
-    print("has a: " + m.contains_key("a").to_string())
-    print("has z: " + m.contains_key("z").to_string())
+    print("has a: {m.contains_key("a")}")
+    print("has z: {m.contains_key("z")}")
     k := m.keys()
-    print("key count: " + k.len().to_string())
+    print("key count: {k.len()}")
 
 # --- integer-key maps (checker.pith pattern) ---
 fn test_int_key_map():
     mut cache: Map[Int, Int] := {}
     cache.insert(10, 100)
     cache.insert(20, 200)
-    print("cache has 10: " + cache.contains_key(10).to_string())
-    print("cache has 99: " + cache.contains_key(99).to_string())
-    print("cache[10]: " + cache[10].to_string())
+    print("cache has 10: {cache.contains_key(10)}")
+    print("cache has 99: {cache.contains_key(99)}")
+    print("cache[10]: {cache[10]}")
 
 # --- recursive function (scope.pith parent chain pattern) ---
 struct Scope:
@@ -76,7 +76,7 @@ fn lookup(scope_id: Int, target: String) -> String:
         return "not found"
     s := scopes[scope_id]
     if s.name == target:
-        return "found at " + scope_id.to_string()
+        return "found at {scope_id}"
     return lookup(s.parent, target)
 
 fn main():
@@ -87,9 +87,9 @@ fn main():
     parent := add_node("binary", "+", [leaf1, leaf2])
     root := add_node("call", "add", [parent, leaf3])
 
-    print("nodes: " + nodes.len().to_string())
-    print("root children: " + count_children(root).to_string())
-    print("child kinds: " + collect_child_kinds(root).join(", "))
+    print("nodes: {nodes.len()}")
+    print("root children: {count_children(root)}")
+    print("child kinds: {collect_child_kinds(root).join(", ")}")
 
     # nested iteration
     root_node := nodes[root]
@@ -101,10 +101,10 @@ fn main():
         else:
             for grandchild in nodes[child].children:
                 all_leaves = all_leaves + 1
-    print("leaf count: " + all_leaves.to_string())
+    print("leaf count: {all_leaves}")
 
     # string methods
-    print("strings: " + test_string_methods())
+    print("strings: {test_string_methods()}")
 
     # map operations
     test_map_ops()
@@ -116,8 +116,8 @@ fn main():
     scopes.push(Scope(-1, "global"))
     scopes.push(Scope(0, "func"))
     scopes.push(Scope(1, "block"))
-    print("lookup block: " + lookup(2, "block"))
-    print("lookup global: " + lookup(2, "global"))
-    print("lookup missing: " + lookup(2, "missing"))
+    print("lookup block: {lookup(2, "block")}")
+    print("lookup global: {lookup(2, "global")}")
+    print("lookup missing: {lookup(2, "missing")}")
 
     print("self host patterns work")

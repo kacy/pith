@@ -36,22 +36,22 @@ fn parse_request(raw: String) -> Request:
     return Request(method, path, version, body, hdr_count)
 
 fn respond(status: Int, body: String) -> String:
-    return "HTTP/1.1 {status} OK" + chr(10) + body
+    return "HTTP/1.1 {status} OK{chr(10)}{body}"
 
 fn main():
     # parse a GET request
     nl := chr(10)
-    raw := "GET /api/users HTTP/1.1" + nl + "Host: example.com" + nl + nl
+    raw := "GET /api/users HTTP/1.1{nl}Host: example.com{nl}{nl}"
     req := parse_request(raw)
-    print("method: " + req.method)
-    print("path: " + req.path)
+    print("method: {req.method}")
+    print("path: {req.path}")
     print("headers: {req.header_count}")
 
     # parse a POST with body
-    raw2 := "POST /login HTTP/1.1" + nl + "Content-Type: json" + nl + nl + "hello body"
+    raw2 := "POST /login HTTP/1.1{nl}Content-Type: json{nl}{nl}hello body"
     req2 := parse_request(raw2)
-    print("post method: " + req2.method)
-    print("post body: " + req2.body)
+    print("post method: {req2.method}")
+    print("post body: {req2.body}")
 
     # build response
     resp := respond(200, "hello")

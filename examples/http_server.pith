@@ -42,15 +42,15 @@ fn handle(fd: Int) -> Int!:
         lb := chr(123)
         rb := chr(125)
         quote := chr(34)
-        mut body := lb + quote + "status" + quote + ":" + quote + "ok" + quote
-        body = body + "," + quote + "agent" + quote + ":" + quote + ua + quote + rb
+        mut body := "{lb}{quote}status{quote}:{quote}ok{quote}"
+        body = "{body},{quote}agent{quote}:{quote}{ua}{quote}{rb}"
         return http.send_response(fd, http.json_response(200, body))
     elif req.is_get("/greet")!:
         name := query_param(req.query()!, "name")
         if name == "":
             return http.send_response(fd, http.html_response(200, "<h1>Hello, stranger!</h1>"))
         else:
-            greeting := "<h1>Hello, " + name + "!</h1>"
+            greeting := "<h1>Hello, {name}!</h1>"
             return http.send_response(fd, http.html_response(200, greeting))
     elif req.is_get("/redirect")!:
         return http.send_response(fd, http.redirect("/"))
@@ -58,7 +58,7 @@ fn handle(fd: Int) -> Int!:
         return http.send_response(fd, http.not_found())
 fn main() -> Int!:
     port := 8080
-    print("http://localhost:" + port.to_string())
+    print("http://localhost:{port}")
     fd := tcp_listen("0.0.0.0", port)!
     while true:
         client := tcp_accept(fd)!

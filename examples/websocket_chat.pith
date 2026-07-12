@@ -14,12 +14,12 @@ fn main() -> Int!:
     right := websocket.from_buffered(io.bytes_reader(chat_client_wire("right", "hello from right")!).buffered_chunked(4), right_out.buffered_chunked(4), false)
     left_name := left.recv_text()!
     right_name := right.recv_text()!
-    left.send_text("welcome " + left_name)!
-    right.send_text("welcome " + right_name)!
+    left.send_text("welcome {left_name}")!
+    right.send_text("welcome {right_name}")!
     left_msg := left.recv_text()!
-    right.send_text(left_name + ": " + left_msg)!
+    right.send_text("{left_name}: {left_msg}")!
     right_msg := right.recv_text()!
-    left.send_text(right_name + ": " + right_msg)!
+    left.send_text("{right_name}: {right_msg}")!
     left_reader := io.bytes_reader(left_out.bytes()).buffered_chunked(4)
     right_reader := io.bytes_reader(right_out.bytes()).buffered_chunked(4)
     print(websocket.read_frame_buffered(left_reader)!.payload_text()!)

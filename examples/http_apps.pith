@@ -35,7 +35,7 @@ fn build_payload() -> Int:
     return obj
 
 fn temp_file_path(prefix: String, ext: String) -> String:
-    return "/tmp/" + prefix + time.now().to_string() + ext
+    return "/tmp/{prefix}{time.now()}{ext}"
 
 fn demo_saved_download(output_path: String) -> String!:
     download_req := http.get_request("example.com", 80, "/download")
@@ -56,46 +56,46 @@ fn main() -> String!:
     req_bytes := req_builder.to_bytes()!
 
     req := http.read_request_buffered_bytes(io.bytes_reader(req_bytes).buffered_chunked(4))!
-    print("method: " + req.method()!)
-    print("path: " + req.path()!)
-    print("mode: " + req.query_param_or("mode", ""))
-    print("parts: " + req.path_parts()!.join(","))
-    print("cookie: " + req.cookie_or("session", "missing"))
+    print("method: {req.method()!}")
+    print("path: {req.path()!}")
+    print("mode: {req.query_param_or("mode", "")}")
+    print("parts: {req.path_parts()!.join(",")}")
+    print("cookie: {req.cookie_or("session", "missing")}")
 
     out := bytes.buffer()
     handled := app(req).header("X-Trace", req.header_or("X-Trace", "trace-generated"))
     http.send_buffered(out.buffered_chunked(4), handled)!
     resp := http.parse_response_bytes(out.bytes())!
     body := resp.body_json()!
-    print("status: " + resp.status_code().to_string())
-    print("success: " + resp.is_success().to_string())
-    print("route: " + resp.header_value("X-Route"))
-    print("trace: " + resp.header_value("X-Trace"))
-    print("set-cookie: " + resp.cookies()[0])
-    print("body id: " + json.get_string(json.object_get(body, "id")))
-    print("body kind: " + json.get_string(json.object_get(body, "kind")))
+    print("status: {resp.status_code()}")
+    print("success: {resp.is_success()}")
+    print("route: {resp.header_value("X-Route")}")
+    print("trace: {resp.header_value("X-Trace")}")
+    print("set-cookie: {resp.cookies()[0]}")
+    print("body id: {json.get_string(json.object_get(body, "id"))}")
+    print("body kind: {json.get_string(json.object_get(body, "kind"))}")
 
     html := http.html(200, "<h1>ok</h1>").to_string()!
-    print("html has status: " + html.contains("200 OK").to_string())
+    print("html has status: {html.contains("200 OK")}")
     redirect := http.redirect_response("/next").to_string()!
-    print("redirect has location: " + redirect.contains("/next").to_string())
-    print("no content status: " + http.no_content().status_code().to_string())
+    print("redirect has location: {redirect.contains("/next")}")
+    print("no content status: {http.no_content().status_code()}")
 
     asset_path := temp_file_path("pith-http-apps-", ".html")
     fs.write(asset_path, "<h1>asset</h1>")!
     asset_out := bytes.buffer()
     http.send_static_path(asset_out.buffered_chunked(5), http.response(200).keep_alive(), asset_path)!
     asset_resp := http.parse_response_bytes(asset_out.bytes())!
-    print("static type: " + asset_resp.header_value("Content-Type"))
+    print("static type: {asset_resp.header_value("Content-Type")}")
 
     download_out := bytes.buffer()
     http.send_download_path(download_out.buffered_chunked(5), http.response(200).keep_alive(), asset_path, "asset.html")!
     download_resp := http.parse_response_bytes(download_out.bytes())!
-    print("download disposition: " + download_resp.header_value("Content-Disposition"))
+    print("download disposition: {download_resp.header_value("Content-Disposition")}")
 
     save_path := temp_file_path("pith-http-download-", ".txt")
     demo_saved_download(save_path)!
-    print("saved body: " + fs.read(save_path)!)
+    print("saved body: {fs.read(save_path)!}")
     fs.remove(save_path)
     fs.remove(asset_path)
     print("http apps work")

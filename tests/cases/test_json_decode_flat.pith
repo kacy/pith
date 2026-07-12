@@ -1,0 +1,46 @@
+# single-pass decoding of flat scalar structs, including an unknown field
+# that must be skipped and a missing required field that must fail.
+# valgrind-gated in MEMCHECK_CASES: the decoder fills a struct in place,
+# and the struct's destructor must release the field strings.
+
+import std.json as json
+
+struct Row:
+    pub id: Int
+    pub name: String
+    pub active: Bool
+
+fn obj(id_val: Int, name_val: String, active_val: String, extra: Bool) -> String:
+    dq := chr(34)
+    lb := chr(123)
+    rb := chr(125)
+    mut s := lb + dq + "id" + dq + ":" + id_val.to_string()
+    s = s + "," + dq + "name" + dq + ":" + dq + name_val + dq
+    s = s + "," + dq + "active" + dq + ":" + active_val
+    if extra:
+        s = s + "," + dq + "note" + dq + ":" + dq + "skip me" + dq
+    return s + rb
+
+fn main() -> Int:
+    # exact fields
+    a := json.decode_text[Row](obj(1, "alice", "true", false)) catch Row(0 - 1, "ERR", false)
+    print("a " + a.id.to_string() + " " + a.name + " " + a.active.to_string())
+    # extra unknown field (must be skipped)
+    b := json.decode_text[Row](obj(2, "bob", "false", true)) catch Row(0 - 1, "ERR", false)
+    print("b " + b.id.to_string() + " " + b.name + " " + b.active.to_string())
+    # missing required field -> error
+    dq := chr(34)
+    lb := chr(123)
+    rb := chr(125)
+    missing := lb + dq + "id" + dq + ":3" + rb
+    c := json.decode_text[Row](missing)
+    print("c_is_err " + c.is_err.to_string())
+    # churn: decode many, keeping the strings, to exercise the destructor
+    mut total := 0
+    mut i := 0
+    while i < 100:
+        r := json.decode_text[Row](obj(i, "user-" + i.to_string(), "true", true)) catch Row(0, "", false)
+        total = total + r.id + r.name.len()
+        i = i + 1
+    print("churn " + total.to_string())
+    return 0

@@ -1,9 +1,5 @@
 use crate::bytes::pith_bytes_ref;
 
-const TYPE_STRING: i64 = 0;
-const TYPE_INT: i64 = 1;
-const TYPE_BOOL: i64 = 2;
-
 unsafe fn cstr_bytes<'a>(ptr: i64) -> &'a [u8] {
     if ptr == 0 {
         return &[];
@@ -102,10 +98,6 @@ unsafe fn alloc_result(is_ok: i64, ok: i64, err: i64) -> i64 {
     tuple as i64
 }
 
-unsafe fn ok_result(value: i64) -> i64 {
-    alloc_result(1, value, 0)
-}
-
 unsafe fn err_result(message: &[u8]) -> i64 {
     let error = crate::pith_struct_alloc(1) as *mut i64;
     if error.is_null() {
@@ -115,105 +107,105 @@ unsafe fn err_result(message: &[u8]) -> i64 {
     alloc_result(0, 0, error as i64)
 }
 
-fn match_field(key: &[u8], keys: &[&[u8]; 6]) -> Option<usize> {
-    let mut i = 0;
-    while i < keys.len() {
-        if key == keys[i] {
-            return Some(i);
+/// Look up a key in a packed field spec. The spec is comma-separated
+/// fields, each `<type_char><name>` (i=int, s=string, b=bool); a field's
+/// position is its struct slot. Returns (slot, type_char) or None.
+fn spec_lookup(spec: &[u8], key: &[u8]) -> Option<(usize, u8)> {
+    let mut idx = 0;
+    for field in spec.split(|&b| b == b',') {
+        if field.is_empty() {
+            idx += 1;
+            continue;
         }
-        i += 1;
+        if &field[1..] == key {
+            return Some((idx, field[0]));
+        }
+        idx += 1;
     }
     None
 }
 
-unsafe fn parse_field_value(input: &[u8], pos: usize, field_type: i64) -> Option<(i64, usize)> {
-    if field_type == TYPE_STRING {
-        let end = read_string_end(input, pos)?;
-        let value = crate::pith_copy_bytes_to_cstring(&input[pos + 1..end]) as i64;
-        return Some((value, end + 1));
-    }
-    if field_type == TYPE_INT {
-        return read_int(input, pos);
-    }
-    if field_type == TYPE_BOOL {
-        if input[pos..].starts_with(b"true") {
-            return Some((1, pos + 4));
-        }
-        if input[pos..].starts_with(b"false") {
-            return Some((0, pos + 5));
-        }
-    }
-    None
-}
-
+/// Decode a flat object of scalar fields straight into a pre-allocated
+/// struct in a single pass. The caller allocates the struct (with its
+/// destructor attached) and passes its data pointer; this writes each
+/// matched field into its slot — ints and bools inline, strings as fresh
+/// counted cstrings the struct then owns. Returns a bitmask of the fields
+/// it filled, or -1 on a malformed object. The caller checks the mask
+/// against the required set and, on any miss, releases the struct.
 #[no_mangle]
-pub unsafe extern "C" fn pith_json_decode_flat6(
+pub unsafe extern "C" fn pith_json_fill_struct(
     bytes_handle: i64,
-    key0: i64,
-    type0: i64,
-    key1: i64,
-    type1: i64,
-    key2: i64,
-    type2: i64,
-    key3: i64,
-    type3: i64,
-    key4: i64,
-    type4: i64,
-    key5: i64,
-    type5: i64,
+    spec_ptr: i64,
+    struct_ptr: i64,
 ) -> i64 {
     let Some(bytes) = pith_bytes_ref(bytes_handle) else {
-        return err_result(b"invalid json object");
+        return -1;
     };
     let input = bytes.data.as_slice();
-    let keys = [
-        cstr_bytes(key0),
-        cstr_bytes(key1),
-        cstr_bytes(key2),
-        cstr_bytes(key3),
-        cstr_bytes(key4),
-        cstr_bytes(key5),
-    ];
-    let types = [type0, type1, type2, type3, type4, type5];
-    let mut values = [0i64; 6];
-    let mut seen = [false; 6];
+    let spec = cstr_bytes(spec_ptr);
+    let obj = struct_ptr as *mut i64;
+    let mut mask: i64 = 0;
 
     let mut pos = skip_ws(input, 0);
     if pos >= input.len() || input[pos] != b'{' {
-        return err_result(b"invalid json object");
+        return -1;
     }
     pos = skip_ws(input, pos + 1);
     if pos < input.len() && input[pos] == b'}' {
-        return err_result(b"missing json field");
+        return 0;
     }
 
     loop {
         let key_start = pos + 1;
         let Some(key_end) = read_string_end(input, pos) else {
-            return err_result(b"invalid json object");
+            return -1;
         };
         let key = &input[key_start..key_end];
         pos = skip_ws(input, key_end + 1);
         if pos >= input.len() || input[pos] != b':' {
-            return err_result(b"invalid json object");
+            return -1;
         }
         pos = skip_ws(input, pos + 1);
         if pos >= input.len() {
-            return err_result(b"invalid json object");
+            return -1;
         }
 
-        if let Some(field_idx) = match_field(key, &keys) {
-            let Some((value, next_pos)) = parse_field_value(input, pos, types[field_idx]) else {
-                return err_result(b"wrong json field type");
+        if let Some((idx, field_type)) = spec_lookup(spec, key) {
+            let next = match field_type {
+                b'i' => {
+                    let Some((value, n)) = read_int(input, pos) else {
+                        return -1;
+                    };
+                    *obj.add(idx) = value;
+                    n
+                }
+                b's' => {
+                    let Some(end) = read_string_end(input, pos) else {
+                        return -1;
+                    };
+                    *obj.add(idx) = crate::pith_copy_bytes_to_cstring(&input[pos + 1..end]) as i64;
+                    end + 1
+                }
+                b'b' => {
+                    if input[pos..].starts_with(b"true") {
+                        *obj.add(idx) = 1;
+                        pos + 4
+                    } else if input[pos..].starts_with(b"false") {
+                        *obj.add(idx) = 0;
+                        pos + 5
+                    } else {
+                        return -1;
+                    }
+                }
+                _ => return -1,
             };
-            values[field_idx] = value;
-            seen[field_idx] = true;
-            pos = next_pos;
+            mask |= 1i64 << idx;
+            pos = next;
         } else {
-            let Some(next_pos) = skip_scalar(input, pos) else {
-                return err_result(b"invalid json object");
+            let Some(next) = skip_scalar(input, pos) else {
+                return -1;
             };
-            pos = next_pos;
+            pos = next;
         }
 
         pos = skip_ws(input, pos);
@@ -222,31 +214,27 @@ pub unsafe extern "C" fn pith_json_decode_flat6(
             continue;
         }
         if pos < input.len() && input[pos] == b'}' {
-            pos = skip_ws(input, pos + 1);
-            if pos != input.len() {
-                return err_result(b"invalid json object");
-            }
             break;
         }
-        return err_result(b"invalid json object");
+        return -1;
     }
+    mask
+}
 
-    let mut i = 0;
-    while i < seen.len() {
-        if !seen[i] {
-            return err_result(b"missing json field");
+/// The Err result a caller returns when the fill mask shows a required
+/// field was missing. Names the first missing field (in spec order) so
+/// the message matches the field-by-field decoder's errors.
+#[no_mangle]
+pub unsafe extern "C" fn pith_json_decode_missing_error(mask: i64, spec_ptr: i64) -> i64 {
+    let spec = cstr_bytes(spec_ptr);
+    let mut idx = 0;
+    for field in spec.split(|&b| b == b',') {
+        if !field.is_empty() && (mask & (1i64 << idx)) == 0 {
+            let mut msg = b"missing json field: ".to_vec();
+            msg.extend_from_slice(&field[1..]);
+            return err_result(&msg);
         }
-        i += 1;
+        idx += 1;
     }
-
-    let object = crate::pith_struct_alloc(6) as *mut i64;
-    if object.is_null() {
-        return 0;
-    }
-    i = 0;
-    while i < values.len() {
-        *object.add(i) = values[i];
-        i += 1;
-    }
-    ok_result(object as i64)
+    err_result(b"missing json field")
 }

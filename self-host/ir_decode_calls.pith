@@ -230,6 +230,23 @@ pub fn ir_json_scan_required_helper_name(field_tid: Int) -> String:
             return "std_json_scan_required_bool_bytes"
     return ""
 
+# the single-character type code for a scalar type name, used in the
+# packed spec the single-pass fill decoder reads. "" for a non-scalar.
+pub fn ir_json_type_name_char(name: String) -> String:
+    if name == "String":
+        return "s"
+    if name == "Int":
+        return "i"
+    if name == "Bool":
+        return "b"
+    return ""
+
+pub fn ir_json_field_type_char(field_tid: Int) -> String:
+    info := get_type_info(field_tid)
+    if info.kind == "primitive":
+        return ir_json_type_name_char(info.name)
+    return ""
+
 pub fn ir_json_scalar_has_helper_name(field_tid: Int) -> String:
     info := get_type_info(field_tid)
     if info.kind == "primitive":

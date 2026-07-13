@@ -3411,28 +3411,31 @@ fn ir_emit_method_call(idx: Int) -> Int:
     # into a named local and emit a `call result <tmp> ...` so the consumer's
     # named-vars path routes through pith_closure_get_fn (the same pattern a
     # local `f := fn(...) ...; f(x)` uses).
-    if ir_current_impl_type.len() > 0:
-        recv_node := get_node(node.children[0])
-        if recv_node.kind == "self":
-            base_struct := ir_strip_type_args(ir_current_impl_type)
-            field_key := base_struct + "." + mname
-            existing_method := ir_lookup_impl_method_name(obj_type, mname)
-            if ir_struct_field_index_lookup.contains_key(field_key) and existing_method.len() == 0:
-                self_r := ir_expr(node.children[0])
-                field_idx := ir_unpack_field_index(ir_struct_field_index_lookup[field_key])
-                handle_r := ir_reg()
-                ir_emit("field " + handle_r.to_string() + " " + self_r.to_string() + " " + (field_idx * 8).to_string() + " unknown " + mname)
-                tmp_name := ir_temp_name("__cl_field")
-                ir_emit("store " + tmp_name + " " + handle_r.to_string())
-                mut arg_regs: List[Int] := []
-                mut ai := 0
-                while ai < node.children.len() - 1:
-                    arg_idx := ir_method_call_arg_expr(node, ai)
-                    arg_regs.push(ir_expr(arg_idx))
-                    ai = ai + 1
-                r := ir_reg()
-                ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
-                return r
+    # `recv.f(args)` where `f` is a closure-typed field of recv's struct (and
+    # not a method of it): load the field and call it through the closure abi,
+    # the same as a local `f := ...; f(x)`. covers `self.f()` inside a generic
+    # impl and `h.f(x)` on any struct value. the checker only reaches emission
+    # for this shape when `f` is genuinely a fn-value field.
+    cf_struct := ir_strip_type_args(obj_type)
+    if cf_struct.len() > 0:
+        field_key := cf_struct + "." + mname
+        existing_method := ir_lookup_impl_method_name(obj_type, mname)
+        if ir_struct_field_index_lookup.contains_key(field_key) and existing_method.len() == 0:
+            recv_r := ir_expr(node.children[0])
+            field_idx := ir_unpack_field_index(ir_struct_field_index_lookup[field_key])
+            handle_r := ir_reg()
+            ir_emit("field " + handle_r.to_string() + " " + recv_r.to_string() + " " + (field_idx * 8).to_string() + " unknown " + mname)
+            tmp_name := ir_temp_name("__cl_field")
+            ir_emit("store " + tmp_name + " " + handle_r.to_string())
+            mut arg_regs: List[Int] := []
+            mut ai := 0
+            while ai < node.children.len() - 1:
+                arg_idx := ir_method_call_arg_expr(node, ai)
+                arg_regs.push(ir_expr(arg_idx))
+                ai = ai + 1
+            r := ir_reg()
+            ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
+            return r
     mut emit_name := ir_method_emit_name(mname, obj_type)
     if emit_name == "list_join" and ir_list_element_kind(node.children[0]) == "int":
         # list_join assumes string elements; Int lists need decimal formatting
@@ -5491,16 +5494,26 @@ fn ir_register_alias_structs(root_idx: Int):
                     ir_emit("struct_alias " + aname + " " + target)
 
 fn ir_record_function_return(node: Node):
+    mut has_returns := false
     for returns_idx in node.children:
         returns_node := get_node(returns_idx)
         if returns_node.kind == "returns":
             ir_record_returns_clause(node.value, returns_node)
+            has_returns = true
+    # a function with no returns clause returns void; still record it so it is
+    # recognized as a declared callable (e.g. usable as a fn-value).
+    if not has_returns:
+        ir_func_returns.insert(node.value, "void")
 
 fn ir_record_function_return_as(name: String, node: Node):
+    mut has_returns := false
     for returns_idx in node.children:
         returns_node := get_node(returns_idx)
         if returns_node.kind == "returns":
             ir_record_returns_clause(name, returns_node)
+            has_returns = true
+    if not has_returns:
+        ir_func_returns.insert(name, "void")
 
 fn ir_record_returns_clause(name: String, returns_node: Node):
     for type_idx in returns_node.children:

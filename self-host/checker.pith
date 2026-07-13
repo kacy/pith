@@ -3680,6 +3680,15 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                             report_error("E219", "argument type mismatch: expected " + get_type_name(param_types[aidx]) + ", got " + get_type_name(atype))
             aidx = aidx + 1
         return ret_type
+    # a fn-value field invoked like a method: `h.shut(x)` where `shut: fn(C)` is
+    # a field, not a method. resolve it as a call on the field's function type.
+    if recv_info.kind == "struct":
+        mut ffi := 0
+        while ffi < recv_info.fields.len():
+            if strings_equal(recv_info.fields[ffi], method_name):
+                if ffi < recv_info.field_types.len() and get_type_info(recv_info.field_types[ffi]).kind == "function":
+                    return check_callable_type_with_args(recv_info.field_types[ffi], arg_indices, scope_id)
+            ffi = ffi + 1
     # a table that recognized the method may have reported already;
     # don't stack the generic "no method" on top of its specific error
     if checker_reported_at_current() == false:

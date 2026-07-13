@@ -51,6 +51,7 @@ from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_ma
 from ir_decode_emit import ir_json_decode_spec_from_decl, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_toml_decode_call, ir_emit_toml_decode_file_call, ir_emit_toml_decode_path_call, ir_emit_toml_decode_path_specialization_body, ir_emit_toml_decode_specialization_body, ir_emit_toml_decode_text_path_specialization_body, ir_emit_toml_decode_text_specialization_body
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label, ir_last_was_ret
+from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_rc_retain_reg, ir_rc_release_reg
 from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_param_optional_tids, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_function, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_record_imported_global_kind, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_config_decode_callee, ir_is_toml_decode_callee, ir_is_config_file_decode_callee, ir_declared_callable_return_type, ir_config_require_full_name_for_type_name, ir_toml_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_has_default_fields, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind
@@ -401,11 +402,18 @@ fn ir_is_sync_primitive_name(name: String) -> Bool:
 fn ir_emit_func_header(name: String, param_count: Int, ret_type: String):
     ir_emit("func " + name + " " + param_count.to_string() + " " + ir_retkind(ret_type))
 
-fn ir_string_retain_reg(r: Int):
-    ir_emit_call1(ir_reg(), "__cstring_retain", "void", r)
-
-fn ir_string_release_reg(r: Int):
-    ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
+# true when any variant of a boxed enum carries an rc payload, so the enum
+# needs a tag-aware destructor to release it.
+fn ir_enum_needs_dtor(ename: String) -> Bool:
+    if not ir_enum_variant_lists.contains_key(ename):
+        return false
+    for variant in ir_enum_variant_lists[ename].split(","):
+        vkey := ename + "." + variant
+        if ir_enum_payload_kinds.contains_key(vkey):
+            for pk in ir_enum_payload_kinds[vkey].split(","):
+                if ir_rc_field_kind(pk).len() > 0:
+                    return true
+    return false
 
 fn ir_struct_needs_dtor(raw_name: String) -> Bool:
     sname := ir_struct_base_name(raw_name)
@@ -414,6 +422,13 @@ fn ir_struct_needs_dtor(raw_name: String) -> Bool:
     # mark first so self-referential fields don't recurse forever; a
     # direct rc field still sets the final answer below
     ir_dtor_memo.insert(sname, 2)
+    # a boxed enum is a struct-shaped allocation but its releasable slots are
+    # tagged payloads, not declared fields, so answer from the variants.
+    if ir_boxed_enums.contains_key(sname):
+        enum_needs := ir_enum_needs_dtor(sname)
+        if enum_needs:
+            ir_dtor_memo.insert(sname, 1)
+        return enum_needs
     count := ir_struct_field_count(sname)
     mut i := 0
     mut needs := false
@@ -437,41 +452,6 @@ fn ir_rc_field_kind(ftype: String) -> String:
         if ir_struct_needs_dtor(ftype.substring(7, ftype.len())):
             return "struct"
     return ""
-
-fn ir_rc_release_enabled(kind: String) -> Bool:
-    return kind.len() > 0
-
-fn ir_rc_retain_reg(r: Int, kind: String):
-    if kind == "string":
-        ir_string_retain_reg(r)
-    elif kind == "list":
-        ir_emit_call1(ir_reg(), "pith_list_retain_handle", "void", r)
-    elif kind == "map":
-        ir_emit_call1(ir_reg(), "pith_map_retain_handle", "void", r)
-    elif kind == "set":
-        ir_emit_call1(ir_reg(), "pith_set_retain_handle", "void", r)
-    elif kind == "bytes":
-        ir_emit_call1(ir_reg(), "pith_bytes_retain", "void", r)
-    elif kind == "struct" or kind == "tuple":
-        ir_emit_call1(ir_reg(), "pith_struct_retain", "void", r)
-    elif kind == "closure":
-        ir_emit_call1(ir_reg(), "pith_closure_retain", "void", r)
-
-fn ir_rc_release_reg(r: Int, kind: String):
-    if kind == "string":
-        ir_string_release_reg(r)
-    elif kind == "list":
-        ir_emit_call1(ir_reg(), "pith_list_release_handle", "void", r)
-    elif kind == "map":
-        ir_emit_call1(ir_reg(), "pith_map_release_handle", "void", r)
-    elif kind == "set":
-        ir_emit_call1(ir_reg(), "pith_set_release_handle", "void", r)
-    elif kind == "bytes":
-        ir_emit_call1(ir_reg(), "pith_bytes_release", "void", r)
-    elif kind == "struct" or kind == "tuple":
-        ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
-    elif kind == "closure":
-        ir_emit_call1(ir_reg(), "pith_closure_release", "void", r)
 
 # a map target whose value type is string picks the heap-value
 # constructor for empty literals, so runtime inserts retain
@@ -645,6 +625,25 @@ fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[St
             elif not poisoned.contains(parts.name):
                 # bound with a non-rc (or unknown) type somewhere: same rule.
                 poisoned.push(parts.name)
+    # a match arm's payload bindings are owned locals too: ir_match_emit
+    # retains each rc payload, so track them here for the exit cleanup to
+    # release (or transfer on escape), same as any other owned local.
+    if node.kind == "pat_variant" and node.children.len() > 0:
+        mut variant_kinds: List[String] := []
+        if ir_enum_payload_kinds.contains_key(node.value):
+            variant_kinds = ir_enum_payload_kinds[node.value].split(",")
+        for sub_idx, pi in node.children:
+            sub := get_node(sub_idx)
+            if sub.kind == "pat_binding":
+                mut payload_kind := ""
+                if pi < variant_kinds.len():
+                    payload_kind = ir_rc_kind(variant_kinds[pi])
+                if payload_kind.len() > 0:
+                    if names.contains(sub.value):
+                        if ir_rc_local_kind(sub.value) != payload_kind and not poisoned.contains(sub.value):
+                            poisoned.push(sub.value)
+                    else:
+                        ir_rc_track_local(sub.value, payload_kind)
     for child in node.children:
         ir_collect_string_bind_names(child, names, poisoned)
 
@@ -2810,6 +2809,9 @@ fn ir_emit_variant_alloc(enum_name: String, variant_key: String, payload_count: 
     tag_r := ir_reg()
     ir_emit("iconst " + tag_r.to_string() + " " + ir_struct_field_index_lookup[variant_key])
     ir_emit("sstore " + r.to_string() + " 0 " + tag_r.to_string())
+    # attach the tag-aware destructor so the box releases its rc payloads when
+    # it dies (self-guards: a no-op for enums with no releasable payloads).
+    ir_emit_attach_dtor(r, enum_name)
     return r
 
 # Shape.Circle(2.5): build the boxed value and store each payload argument.
@@ -5504,6 +5506,10 @@ fn ir_emit_struct_dtors():
     for sname in ir_struct_names.keys():
         if sname.index_of("[") >= 0:
             continue
+        # boxed enums live in ir_struct_names too but their releasable slots
+        # are tagged payloads, not fields — ir_emit_enum_dtors handles them.
+        if ir_boxed_enums.contains_key(sname):
+            continue
         if not ir_struct_needs_dtor(sname):
             continue
         ir_emit_func_header("__dtor_" + sname, 1, "void")
@@ -5521,6 +5527,58 @@ fn ir_emit_struct_dtors():
                 ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
                 ir_rc_release_reg(fr, fkind)
             i = i + 1
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
+# one tag-aware destructor per boxed enum with rc payloads: read the tag,
+# and for the matching variant release each releasable payload slot. the box
+# layout is [tag, payload0, payload1, ...] at offsets 0, 8, 16, mirroring the
+# variant allocator and the equality helper.
+fn ir_emit_enum_dtors():
+    for ename in ir_boxed_enums.keys():
+        if not ir_enum_needs_dtor(ename):
+            continue
+        if not ir_enum_variant_lists.contains_key(ename):
+            continue
+        ir_emit_func_header("__dtor_" + ename, 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        tag_r := ir_reg()
+        ir_emit("field " + tag_r.to_string() + " " + pr.to_string() + " 0 int __enum_tag")
+        variants := ir_enum_variant_lists[ename].split(",")
+        mut vi := 0
+        while vi < variants.len():
+            vkey := ename + "." + variants[vi]
+            if ir_enum_payload_kinds.contains_key(vkey):
+                kinds := ir_enum_payload_kinds[vkey].split(",")
+                mut has_rc := false
+                mut c := 0
+                while c < kinds.len():
+                    if ir_rc_field_kind(kinds[c]).len() > 0:
+                        has_rc = true
+                    c = c + 1
+                if has_rc:
+                    vtag := ir_reg()
+                    ir_emit("iconst " + vtag.to_string() + " " + vi.to_string())
+                    is_v := ir_reg()
+                    ir_emit("eq " + is_v.to_string() + " " + tag_r.to_string() + " " + vtag.to_string())
+                    hit_l := ir_label()
+                    skip_l := ir_label()
+                    ir_emit("brif " + is_v.to_string() + " " + hit_l + " " + skip_l)
+                    ir_emit_label(hit_l)
+                    mut s := 0
+                    while s < kinds.len():
+                        rk := ir_rc_field_kind(kinds[s])
+                        if rk.len() > 0:
+                            slot_r := ir_reg()
+                            ir_emit("field " + slot_r.to_string() + " " + pr.to_string() + " " + ((s + 1) * 8).to_string() + " unknown __p" + s.to_string())
+                            ir_rc_release_reg(slot_r, rk)
+                        s = s + 1
+                    ir_emit_label(skip_l)
+            vi = vi + 1
         zr := ir_reg()
         ir_emit("iconst " + zr.to_string() + " 0")
         ir_emit("ret " + zr.to_string())
@@ -5784,6 +5842,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_global_bindings(root)
     ir_emit_init_globals(root)
     ir_emit_struct_dtors()
+    ir_emit_enum_dtors()
     ir_emit_enum_eq_fns()
     # pre-register all impl method specializations across the module so that
     # an earlier impl's specialized body can dispatch to a later impl's

@@ -1,0 +1,35 @@
+# boxed enums are released at scope exit, and a match payload binding owns its
+# count: rebinding the same name in a loop releases the previous payload, a
+# non-escaping binding is released at the arm, and an escaping binding (a
+# returned payload) transfers out instead of being freed. in the memcheck set
+# so the release logic stays free of double-frees.
+enum Reply:
+    Text(String)
+    Num(Int)
+
+fn make_reply(i: Int) -> Reply:
+    if i > 40:
+        return Reply.Num(1)
+    return Reply.Text("item{i}")
+
+# the bound payload escapes the arm as the return value.
+fn first_word(r: Reply) -> String:
+    return match r:
+        Reply.Text(s) => s
+        Reply.Num(n) => "num"
+
+fn main():
+    mut texts := 0
+    mut i := 0
+    while i < 50:
+        r := make_reply(i)
+        tag := match r:
+            Reply.Text(s) => s.len()
+            Reply.Num(n) => 0 - n
+        if tag > 0:
+            texts = texts + 1
+        i = i + 1
+    print("texts {texts}")
+
+    kept := Reply.Text("hello")
+    print(first_word(kept))

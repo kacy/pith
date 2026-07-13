@@ -13,7 +13,8 @@ from ir_builder import ir_emit, ir_label, ir_new_temp_name, ir_reg, ir_var_regs,
 from ir_call_emit import ir_emit_call2, ir_emit_label, ir_last_was_ret
 from ir_literals import ir_emit_bool_literal, ir_emit_float_literal, ir_emit_int_literal, ir_emit_string_literal
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field
-from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_struct_field_index_lookup
+from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_struct_field_index_lookup, ir_rc_kind
+from ir_ownership import ir_rc_retain_reg, ir_rc_release_reg
 from ir_type_helpers import ir_checked_type, ir_type_from_tid
 
 pub mut ir_match_subject_tid := 0 - 1
@@ -299,9 +300,11 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
             ir_var_types.insert(pat.value, subj_type)
         ir_emit("store " + pat.value + " " + subj_r.to_string())
     if pat.kind == "pat_variant" and pat.children.len() > 0:
-        # extract each bound payload slot from the boxed enum value. the
-        # binding borrows the enum's count on string payloads, matching how
-        # struct field reads behave.
+        # extract each bound payload slot from the boxed enum value. an rc
+        # payload is retained so the binding owns its own count: the enum box
+        # is released at scope exit (which frees the payload), so a plain
+        # borrow would dangle once the box dies. the prepass tracks these
+        # names, so the exit cleanup releases them (or transfers on escape).
         mut kinds: List[String] := []
         if ir_enum_payload_kinds.contains_key(pat.value):
             kinds = ir_enum_payload_kinds[pat.value].split(",")
@@ -313,6 +316,16 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
                     kind = kinds[i]
                 slot_r := ir_reg()
                 ir_emit("field " + slot_r.to_string() + " " + subj_r.to_string() + " " + ((i + 1) * 8).to_string() + " " + kind + " " + sub.value)
+                rc_kind := ir_rc_kind(kind)
+                if rc_kind.len() > 0:
+                    # release whatever the binding held before (it is zero on
+                    # first reach and a stale payload when an arm rebinds the
+                    # name in a loop), then retain the new one so it owns its
+                    # count, mirroring the reassign dance for ordinary locals.
+                    old_r := ir_reg()
+                    ir_emit("load " + old_r.to_string() + " " + sub.value)
+                    ir_rc_release_reg(old_r, rc_kind)
+                    ir_rc_retain_reg(slot_r, rc_kind)
                 ir_var_regs.insert(sub.value, slot_r)
                 if kind != "unknown":
                     ir_var_types.insert(sub.value, kind)

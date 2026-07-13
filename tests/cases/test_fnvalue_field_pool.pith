@@ -1,0 +1,62 @@
+# two fn-value fixes, exercised through a generic pool:
+#  - a void function can be used as a fn-value (void fns were not recorded as
+#    declared callables, so they couldn't be passed as values)
+#  - a fn-value field called like a method (`s.emit(x)`, `self.shut(c)`) resolves
+#    to a closure call instead of a nonexistent method
+# together these let a generic Pool[C] over a `fn() -> C!` factory and a void
+# `fn(C)` closer hand out distinct connections and close overflow.
+struct Conn:
+    mut alive: Int
+
+mut opened := 0
+mut closed := 0
+
+fn dial() -> Conn!:
+    opened = opened + 1
+    return Conn(alive: opened)
+
+fn hang_up(c: Conn):
+    closed = closed + 1
+
+# a concrete struct with a fn-value field, invoked like a method
+struct Sink:
+    emit: fn(Conn)
+
+struct Pool[C]:
+    open: fn() -> C!
+    shut: fn(C)
+    mut idle: List[C]
+    max_idle: Int
+
+impl Pool:
+    fn acquire() -> C!:
+        n := self.idle.len()
+        if n > 0:
+            c := self.idle[n - 1]
+            self.idle = self.idle.slice(0, n - 1)
+            return c
+        return self.open()
+    fn release(c: C):
+        if self.idle.len() < self.max_idle:
+            self.idle.push(c)
+        else:
+            self.shut(c)
+    fn close():
+        for c in self.idle:
+            self.shut(c)
+        self.idle = []
+
+fn main() -> Int!:
+    s := Sink(emit: hang_up)
+    s.emit(Conn(alive: 9))
+    print("sink closed {closed}")
+
+    p := Pool[Conn](open: dial, shut: hang_up, idle: [], max_idle: 1)
+    a := p.acquire()!
+    b := p.acquire()!
+    print("acquire {a.alive} {b.alive}")
+    p.release(a)
+    p.release(b)
+    print("idle {p.idle.len()} closed {closed}")
+    p.close()
+    return 0

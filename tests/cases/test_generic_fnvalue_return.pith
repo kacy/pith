@@ -1,0 +1,42 @@
+# a specialized generic method that returns a fn-value field call typed T! must
+# forward that Result, not wrap it in a second one. before the fix both the
+# direct form (return self.make()) and the local-bind form (f := self.make;
+# return f()) read back the inner is_ok flag, so distinct factory results all
+# collapsed to "1". this is exactly the pattern a generic connection pool's
+# acquire() needs. in the memcheck set so the closure-field call stays
+# double-free-safe.
+struct Item:
+    id: Int
+
+mut counter := 0
+
+fn fresh() -> Item!:
+    counter = counter + 1
+    return Item(id: counter)
+
+struct Direct[T]:
+    make: fn() -> T!
+
+impl Direct:
+    fn get() -> T!:
+        return self.make()
+
+struct Local[T]:
+    make: fn() -> T!
+
+impl Local:
+    fn get() -> T!:
+        f := self.make
+        return f()
+
+fn main() -> Int!:
+    d := Direct[Item](make: fresh)
+    a := d.get()!
+    b := d.get()!
+    print("direct {a.id} {b.id}")
+
+    l := Local[Item](make: fresh)
+    c := l.get()!
+    e := l.get()!
+    print("local {c.id} {e.id}")
+    return 0

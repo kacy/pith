@@ -229,12 +229,37 @@ fn ir_lookup_map_value_type(name: String) -> String:
 fn ir_lookup_map_value_type_for_expr(idx: Int) -> String:
     return ir_lookup_map_value_type_for_expr_with_state(idx, ir_map_value_types)
 
+# the ir return kind of a struct's fn-value field (e.g. `make: fn() -> T!`),
+# or "" when the field isn't a fn_type. a `self.make()` call is a closure-field
+# call, not a method, so this lets its result kind be reported correctly — a
+# Result-returning factory forwards its result instead of being re-wrapped.
+fn ir_struct_fn_field_return_kind(struct_name: String, field_name: String) -> String:
+    if not ir_struct_decl_nodes.contains_key(struct_name):
+        return ""
+    decl := get_node(ir_struct_decl_nodes[struct_name])
+    for child in decl.children:
+        field_node := ir_unwrap_pub_node(child)
+        if field_node.kind == "field" and ir_struct_field_name(field_node) == field_name:
+            if field_node.children.len() > 0:
+                tn := get_node(field_node.children[0])
+                if tn.kind == "fn_type" and tn.children.len() > 0:
+                    last := get_node(tn.children[tn.children.len() - 1])
+                    if last.kind == "returns" and last.children.len() > 0:
+                        return ir_resolve_type_node(last.children[0])
+    return ""
+
 fn ir_expr_result_kind(idx: Int) -> String:
     checked_kind := ir_checked_result_kind(idx)
     if checked_kind.len() > 0:
         return checked_kind
     node := get_node(idx)
     if node.kind == "call" and node.children.len() > 0:
+        # a call through a fn-value local (`f()` where `f := self.make`) carries
+        # its recorded closure return kind, so a `fn() -> T!` factory forwards
+        # its Result rather than getting re-wrapped.
+        fn_local := get_node(node.children[0])
+        if fn_local.kind == "ident" and ir_closure_return_kinds.contains_key(fn_local.value):
+            return ir_closure_return_kinds[fn_local.value]
         mut callee := ir_resolve_static_callee(node.children[0])
         if callee.name.len() > 0:
             if ir_is_generic_function_name(callee.name):
@@ -279,6 +304,16 @@ fn ir_expr_result_kind(idx: Int) -> String:
             declared_kind := ir_declared_callable_ir_retkind(impl_name)
             if declared_kind.len() > 0:
                 return declared_kind
+        # `self.make()` inside a generic impl where `make` is a closure field:
+        # no method of that name, so the result kind is the field's declared
+        # fn_type return kind. without this a `fn() -> T!` factory reads back as
+        # "unknown" and its Result gets wrapped in a second Result.
+        if impl_name.len() == 0 and ir_current_impl_type.len() > 0:
+            recv_node := get_node(node.children[0])
+            if recv_node.kind == "self":
+                field_kind := ir_struct_fn_field_return_kind(ir_strip_type_args(ir_current_impl_type), method_name)
+                if field_kind.len() > 0:
+                    return field_kind
         emit_name := ir_method_emit_name(method_name, obj_type)
         declared_kind := ir_declared_callable_ir_retkind(emit_name)
         if declared_kind.len() > 0:
@@ -4350,6 +4385,15 @@ fn ir_emit_bind_stmt(node: Node):
             callee_n := get_node(vn.children[0])
             if callee_n.kind == "ident" and ir_closure_return_kinds.contains_key(callee_n.value):
                 ir_var_types.insert(name, ir_closure_return_kinds[callee_n.value])
+        # `f := self.make` binds a closure-typed field to a local; carry the
+        # field's fn_type return kind so a later `f()` reports the right result
+        # kind (the same reason a closure-typed parameter does).
+        elif vn.kind == "field_access" and vn.children.len() > 0 and ir_current_impl_type.len() > 0:
+            recv := get_node(vn.children[0])
+            if recv.kind == "self":
+                field_kind := ir_struct_fn_field_return_kind(ir_strip_type_args(ir_current_impl_type), vn.value)
+                if field_kind.len() > 0:
+                    ir_closure_return_kinds.insert(name, field_kind)
     mut target_type := ""
     if type_idx >= 0:
         target_type = ir_resolve_type_node(type_idx)

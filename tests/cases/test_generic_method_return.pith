@@ -1,0 +1,27 @@
+# a specialized generic method that returns a borrowed value (a param, or a
+# stored field) must retain it before handing it back. the caller releases the
+# argument after the call, so without the retain the returned value is freed and
+# later reads see a reused slot. before the fix this printed "2 2"; each call's
+# result aliased the last. in the memcheck set so the retain can't regress into
+# a use-after-free.
+struct Wrapper[T]:
+    tag: Int
+
+impl Wrapper:
+    fn identity(v: T) -> T:
+        return v
+
+struct Item:
+    id: Int
+
+mut counter := 0
+
+fn fresh() -> Item:
+    counter = counter + 1
+    return Item(id: counter)
+
+fn main():
+    w := Wrapper[Item](tag: 0)
+    a := w.identity(fresh())
+    b := w.identity(fresh())
+    print("{a.id} {b.id}")

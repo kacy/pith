@@ -1,0 +1,24 @@
+# discarding a bare `!`-returning call must release the result box and its live
+# payload. before the fix, each such statement leaked its result shell (and any
+# heap ok/err value). this covers a non-rc ok (Int!), an rc ok (a fresh String),
+# and the error path (an rc error message). it lives in the memcheck set so the
+# release can never regress into a double-free.
+fn make_int(x: Int) -> Int!:
+    return x
+
+fn make_text(x: Int) -> String!:
+    return "v{x}"
+
+fn maybe_fail(x: Int) -> Int!:
+    if x > 5:
+        fail "too big"
+    return x
+
+fn main():
+    mut i := 0
+    while i < 100:
+        make_int(i)
+        make_text(i)
+        maybe_fail(i)
+        i = i + 1
+    print("discarded 300 results")

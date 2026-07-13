@@ -4146,6 +4146,28 @@ fn ir_emit_release_result_error(result_r: Int, result_tid: Int):
         err_r := ir_emit_result_value_field(result_r, result_tid, "err")
         ir_rc_release_reg(err_r, err_kind)
 
+# fully release a discarded result: drop its live payload (the ok value or the
+# err value, depending on the tag) and then free the shell. a bare call
+# statement like `buf.write_byte(x)` leaves the result unowned, so without this
+# its box — and any heap payload — leaks. mirrors the ownership dance in catch.
+fn ir_emit_discard_result(result_r: Int, result_tid: Int):
+    cond_r := ir_emit_result_flag_field(result_r, "is_ok")
+    ok_l := ir_label()
+    err_l := ir_label()
+    done_l := ir_label()
+    ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit_label(ok_l)
+    ok_kind := ir_rc_kind(ir_result_field_kind(result_tid, "ok"))
+    if ok_kind.len() > 0:
+        ok_r := ir_emit_result_value_field(result_r, result_tid, "ok")
+        ir_rc_release_reg(ok_r, ok_kind)
+    ir_emit("jmp " + done_l)
+    ir_emit_label(err_l)
+    ir_emit_release_result_error(result_r, result_tid)
+    ir_emit("jmp " + done_l)
+    ir_emit_label(done_l)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
+
 fn ir_emit_catch_expr(node: Node) -> Int:
     result_r := ir_expr(node.children[0])
     result_tid := c_get_expr_type(node.children[0])
@@ -4535,6 +4557,14 @@ fn ir_stmt(idx: Int):
 
     if ir_stmt_is_expr(kind):
         r := ir_expr(idx)
+        # a discarded result from a bare `foo()!`-less call owns its box: free
+        # its live payload and the shell, or both leak (this is what a bare
+        # `buf.write_byte(x)` did before).
+        if kind == "call" or kind == "method_call":
+            stmt_tid := c_get_expr_type(idx)
+            if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "result":
+                ir_emit_discard_result(r, stmt_tid)
+                return
         # a discarded owned string result (a popped element, an unused
         # fresh string) is garbage as soon as the statement ends
         if ir_infer_type(idx) == "string" and not ir_string_expr_is_borrowed(idx):

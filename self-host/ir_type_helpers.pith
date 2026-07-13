@@ -143,6 +143,14 @@ pub fn ir_type_from_tid(tid: Int) -> String:
     if info.kind == "tuple":
         return "tuple"
     if info.kind == "enum":
+        # a boxed enum (some variant carries a payload) is a heap allocation
+        # that must be rc-tracked and released like a struct; a tag-only enum
+        # is just an integer.
+        mut vi := 0
+        while vi < info.variant_types.len():
+            if info.variant_types[vi].len() > 0:
+                return info.name
+            vi = vi + 1
         return "int"
     if info.kind == "struct":
         return info.name

@@ -1,0 +1,50 @@
+# low-level rc retain/release helpers, split out so both the core emitter
+# and the match emitter can reach them without forming a module cycle
+# (ir_emitter_core imports ir_match_emit, so the helpers can't live there).
+# these are stateless: they emit a retain or release for a register holding
+# a value of a given rc kind. the owned-locals tracking state and the exit
+# cleanup stay in ir_emitter_core.
+
+from ir_builder import ir_reg
+from ir_call_emit import ir_emit_call1
+
+pub fn ir_string_retain_reg(r: Int):
+    ir_emit_call1(ir_reg(), "__cstring_retain", "void", r)
+
+pub fn ir_string_release_reg(r: Int):
+    ir_emit_call1(ir_reg(), "__cstring_release", "void", r)
+
+pub fn ir_rc_release_enabled(kind: String) -> Bool:
+    return kind.len() > 0
+
+pub fn ir_rc_retain_reg(r: Int, kind: String):
+    if kind == "string":
+        ir_string_retain_reg(r)
+    elif kind == "list":
+        ir_emit_call1(ir_reg(), "pith_list_retain_handle", "void", r)
+    elif kind == "map":
+        ir_emit_call1(ir_reg(), "pith_map_retain_handle", "void", r)
+    elif kind == "set":
+        ir_emit_call1(ir_reg(), "pith_set_retain_handle", "void", r)
+    elif kind == "bytes":
+        ir_emit_call1(ir_reg(), "pith_bytes_retain", "void", r)
+    elif kind == "struct" or kind == "tuple":
+        ir_emit_call1(ir_reg(), "pith_struct_retain", "void", r)
+    elif kind == "closure":
+        ir_emit_call1(ir_reg(), "pith_closure_retain", "void", r)
+
+pub fn ir_rc_release_reg(r: Int, kind: String):
+    if kind == "string":
+        ir_string_release_reg(r)
+    elif kind == "list":
+        ir_emit_call1(ir_reg(), "pith_list_release_handle", "void", r)
+    elif kind == "map":
+        ir_emit_call1(ir_reg(), "pith_map_release_handle", "void", r)
+    elif kind == "set":
+        ir_emit_call1(ir_reg(), "pith_set_release_handle", "void", r)
+    elif kind == "bytes":
+        ir_emit_call1(ir_reg(), "pith_bytes_release", "void", r)
+    elif kind == "struct" or kind == "tuple":
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", r)
+    elif kind == "closure":
+        ir_emit_call1(ir_reg(), "pith_closure_release", "void", r)

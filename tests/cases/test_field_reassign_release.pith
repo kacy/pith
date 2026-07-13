@@ -1,0 +1,42 @@
+# reassigning a refcounted struct field must release the value already in it
+# before storing the new one, the same ownership dance local and global
+# assignment already do. this covers both a self-referential rhs (the field
+# read on the right must still see the old value) and a plain overwrite, for
+# string and list fields. it lives in the curated memcheck set so the release
+# can never regress into a double-free.
+struct Buffer:
+    mut data: String
+    mut tags: List[String]
+
+impl Buffer:
+    fn feed(chunk: String):
+        self.data = self.data + chunk
+
+    fn reset(seed: String):
+        self.data = seed
+        self.tags = []
+
+    fn tag(name: String):
+        self.tags.push(name)
+
+fn main():
+    b := Buffer(data: "", tags: [])
+
+    # grow a field by self-referential concat many times
+    mut i := 0
+    while i < 100:
+        b.feed("x")
+        i = i + 1
+    print("grown: {b.data.len()}")
+
+    # overwrite both fields repeatedly; each store drops the previous value.
+    # reset replaces the list field (releasing the prior two-element list),
+    # then two pushes rebuild it for the next round to release.
+    mut j := 0
+    while j < 100:
+        b.reset("seed{j}")
+        b.tag("t{j}")
+        b.tag("u{j}")
+        j = j + 1
+    print("data: {b.data}")
+    print("tags: {b.tags.len()}")

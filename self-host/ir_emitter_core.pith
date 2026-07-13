@@ -4404,11 +4404,21 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
     mut value_type := ir_checked_struct_field_type(recv_idx, fname)
     if value_type.len() == 0:
         value_type = ir_infer_type(value_idx)
-    value_r := ir_emit_value_for_target(value_idx, value_type)
     fassign_kind := ir_rc_kind(value_type)
+    # release the value already in the field before overwriting it, the same
+    # ownership dance local and global assignment do. load the old value first
+    # so a self-referential rhs (obj.f = obj.f...) still sees it, then release
+    # after the store.
+    mut old_r := 0 - 1
+    if fassign_kind.len() > 0 and ir_rc_release_enabled(fassign_kind):
+        old_r = ir_reg()
+        ir_emit_named_field_access(old_r, obj_r, lookup_key, fname, value_type)
+    value_r := ir_emit_value_for_target(value_idx, value_type)
     if fassign_kind.len() > 0 and ir_string_expr_is_borrowed(value_idx):
         ir_rc_retain_reg(value_r, fassign_kind)
     ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + value_r.to_string())
+    if old_r >= 0:
+        ir_rc_release_reg(old_r, fassign_kind)
     return true
 
 # Compound assign to a struct field: `obj.field += value` (and -=, *=, /=).

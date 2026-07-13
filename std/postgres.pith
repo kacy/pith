@@ -1,0 +1,318 @@
+# std.postgres — a pure-pith postgresql client (version 3 wire protocol).
+#
+# connect with host/port/user/password/database, run a query, and iterate the
+# rows as std.sql values:
+#
+#   conn := postgres.connect("127.0.0.1", 5432, "me", "pw", "mydb")!
+#   for row in postgres.query(conn, "select id, name from users")!:
+#       print("{row.as_int(0)} {row.as_text(1)}")
+#   conn.close()
+#
+# authentication is SCRAM-SHA-256 (the modern postgres default) with a
+# cleartext-password fallback. queries use the simple query protocol, so values
+# arrive in text form and are decoded by their column type.
+#
+# note: connecting currently leaks memory inside std.crypto's pbkdf2/hmac (the
+# SCRAM key derivation), once per connection. the driver itself is correct; the
+# leak clears when that crypto issue is fixed, with no change here.
+
+import std.sql as sql
+import std.bytes as bytes
+import std.bits as bits
+import std.encoding as encoding
+import std.hash as hash
+import std.crypto.hmac as hmac
+import std.crypto.kdf as kdf
+import std.crypto.random as random
+from std.iter import Iterator
+
+# --- byte helpers ---
+
+# a 4-byte big-endian integer.
+fn be32(n: Int) -> Bytes:
+    out := bytes.buffer()
+    out.write_byte(bits.mask8(bits.shr(n, 24))) catch 0
+    out.write_byte(bits.mask8(bits.shr(n, 16))) catch 0
+    out.write_byte(bits.mask8(bits.shr(n, 8))) catch 0
+    out.write_byte(bits.mask8(n)) catch 0
+    return out.bytes()
+
+# read a big-endian integer of `width` bytes at `off`.
+fn read_be(data: Bytes, off: Int, width: Int) -> Int:
+    mut value := 0
+    mut i := 0
+    while i < width:
+        value = bits.bor(bits.shl(value, 8), bytes.get(data, off + i))
+        i = i + 1
+    return value
+
+# xor two equal-length byte strings.
+fn xor_bytes(a: Bytes, b: Bytes) -> Bytes:
+    out := bytes.buffer()
+    mut i := 0
+    while i < bytes.len(a):
+        out.write_byte(bits.xor(bytes.get(a, i), bytes.get(b, i))) catch 0
+        i = i + 1
+    return out.bytes()
+
+# a decoded backend message: a type byte and its payload.
+struct Message:
+    mtype: Int
+    payload: Bytes
+
+# --- connection ---
+
+pub struct Conn:
+    fd: Int
+    mut buf: Bytes
+    mut pos: Int
+
+impl Conn:
+    # read exactly `n` bytes, pulling more from the socket as needed.
+    fn recv_exact(n: Int) -> Bytes!:
+        while bytes.len(self.buf) - self.pos < n:
+            chunk := tcp_read_bytes(self.fd, 4096)!
+            if bytes.len(chunk) == 0:
+                fail "postgres: connection closed"
+            self.buf = bytes.concat(bytes.slice(self.buf, self.pos, bytes.len(self.buf)), chunk)
+            self.pos = 0
+        out := bytes.slice(self.buf, self.pos, self.pos + n)
+        self.pos = self.pos + n
+        return out
+
+    # read one framed backend message: [type:1][length:4][payload:length-4].
+    fn read_message() -> Message!:
+        head := self.recv_exact(1)!
+        mtype := bytes.get(head, 0)
+        len_bytes := self.recv_exact(4)!
+        total := read_be(len_bytes, 0, 4)
+        payload := self.recv_exact(total - 4)!
+        return Message(mtype: mtype, payload: payload)
+
+    # frame and send a message. a `type_byte` of 0 omits the type prefix, as the
+    # startup message requires.
+    fn send(type_byte: Int, payload: Bytes) -> Int!:
+        out := bytes.buffer()
+        if type_byte != 0:
+            out.write_byte(type_byte) catch 0
+        out.write(be32(bytes.len(payload) + 4)) catch 0
+        out.write(payload) catch 0
+        return tcp_write_bytes(self.fd, out.bytes())!
+
+    pub fn close():
+        tcp_close(self.fd)
+
+# a string followed by a null terminator, the wire's cstring form.
+fn cstring(text: String) -> Bytes:
+    out := bytes.buffer()
+    out.write_string_utf8(text) catch 0
+    out.write_byte(0) catch 0
+    return out.bytes()
+
+# pull the human-readable message out of an ErrorResponse payload: a series of
+# type-tagged cstrings, where 'M' holds the message.
+fn error_text(payload: Bytes) -> String:
+    mut i := 0
+    while i < bytes.len(payload):
+        field := bytes.get(payload, i)
+        if field == 0:
+            return "unknown error"
+        start := i + 1
+        mut j := start
+        while j < bytes.len(payload) and bytes.get(payload, j) != 0:
+            j = j + 1
+        if field == 77:
+            return bytes.to_string_utf8(bytes.slice(payload, start, j)) catch "error"
+        i = j + 1
+    return "unknown error"
+
+# --- startup and authentication ---
+
+pub fn connect(host: String, port: Int, user: String, password: String, database: String) -> Conn!:
+    fd := tcp_connect(host, port)!
+    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0)
+    conn.handshake(user, password, database)!
+    return conn
+
+impl Conn:
+    fn handshake(user: String, password: String, database: String) -> Bool!:
+        # StartupMessage: protocol 3.0, then null-terminated key/value pairs.
+        params := bytes.buffer()
+        params.write(be32(196608)) catch 0
+        params.write(cstring("user")) catch 0
+        params.write(cstring(user)) catch 0
+        params.write(cstring("database")) catch 0
+        params.write(cstring(database)) catch 0
+        params.write_byte(0) catch 0
+        self.send(0, params.bytes())!
+
+        # SCRAM state carried across the two AuthenticationSASL rounds.
+        mut client_nonce := ""
+        mut client_first_bare := ""
+        while true:
+            msg := self.read_message()!
+            if msg.mtype == 69:
+                fail "postgres: {error_text(msg.payload)}"
+            elif msg.mtype == 82:
+                auth := read_be(msg.payload, 0, 4)
+                if auth == 0:
+                    # AuthenticationOk — keep reading until ReadyForQuery.
+                    continue
+                elif auth == 3:
+                    # cleartext password
+                    self.send(112, cstring(password))!
+                elif auth == 10:
+                    # AuthenticationSASL: begin SCRAM-SHA-256.
+                    client_nonce = encoding.b64_encode(random.bytes(18)!)
+                    client_first_bare = "n=,r=" + client_nonce
+                    client_first := "n,," + client_first_bare
+                    initial := bytes.buffer()
+                    initial.write(cstring("SCRAM-SHA-256")) catch 0
+                    initial.write(be32(client_first.len())) catch 0
+                    initial.write_string_utf8(client_first) catch 0
+                    self.send(112, initial.bytes())!
+                elif auth == 11:
+                    # AuthenticationSASLContinue: server-first-message.
+                    server_first := bytes.to_string_utf8(bytes.slice(msg.payload, 4, bytes.len(msg.payload)))!
+                    final := scram_client_final(server_first, client_first_bare, password)!
+                    self.send(112, bytes.from_string_utf8(final))!
+                elif auth == 12:
+                    # AuthenticationSASLFinal — server signature, accepted as-is.
+                    continue
+                else:
+                    fail "postgres: unsupported auth method {auth}"
+            elif msg.mtype == 90:
+                # ReadyForQuery
+                return true
+            else:
+                # ParameterStatus (83), BackendKeyData (75), NoticeResponse (78) — ignore.
+                continue
+
+# build the SCRAM client-final-message from the server-first-message.
+fn scram_client_final(server_first: String, client_first_bare: String, password: String) -> String!:
+    mut server_nonce := ""
+    mut salt_b64 := ""
+    mut iterations := 0
+    for part in server_first.split(","):
+        if part.starts_with("r="):
+            server_nonce = part.substring(2, part.len())
+        elif part.starts_with("s="):
+            salt_b64 = part.substring(2, part.len())
+        elif part.starts_with("i="):
+            iterations = parse_int(part.substring(2, part.len()))!
+
+    salt := encoding.b64_decode(salt_b64)!
+    pw := bytes.from_string_utf8(password)
+    salted := kdf.pbkdf2_sha256(pw, salt, iterations, 32)!
+    client_key := hmac.sha256(salted, bytes.from_string_utf8("Client Key"))
+    stored_key := hash.sha256_bytes(client_key)
+
+    client_final_bare := "c=biws,r=" + server_nonce
+    auth_message := client_first_bare + "," + server_first + "," + client_final_bare
+    client_sig := hmac.sha256(stored_key, bytes.from_string_utf8(auth_message))
+    proof := xor_bytes(client_key, client_sig)
+    return client_final_bare + ",p=" + encoding.b64_encode(proof)
+
+# --- queries ---
+
+# a result set: rows buffered from one simple query, iterated as sql.Row.
+pub struct Rows:
+    mut rows: List[sql.Row]
+    mut pos: Int
+
+impl Iterator for Rows:
+    type Item = sql.Row
+    fn next() -> sql.Row?:
+        if self.pos >= self.rows.len():
+            return none
+        r := self.rows[self.pos]
+        self.pos = self.pos + 1
+        return r
+
+# run a query through the simple query protocol and collect its rows.
+pub fn query(conn: Conn, text: String) -> Rows!:
+    conn.send(81, cstring(text))!
+    mut names: List[String] := []
+    mut oids: List[Int] := []
+    mut rows: List[sql.Row] := []
+    while true:
+        msg := conn.read_message()!
+        if msg.mtype == 69:
+            fail "postgres: {error_text(msg.payload)}"
+        elif msg.mtype == 84:
+            # RowDescription: field count, then a descriptor per field.
+            count := read_be(msg.payload, 0, 2)
+            mut off := 2
+            mut f := 0
+            while f < count:
+                start := off
+                while bytes.get(msg.payload, off) != 0:
+                    off = off + 1
+                names.push(bytes.to_string_utf8(bytes.slice(msg.payload, start, off))!)
+                # skip null + table_oid(4) + col(2), then read type_oid(4)
+                oids.push(read_be(msg.payload, off + 7, 4))
+                # advance past name-null(1) + 18 fixed descriptor bytes
+                off = off + 1 + 18
+                f = f + 1
+        elif msg.mtype == 68:
+            # DataRow: field count, then length-prefixed values (text format).
+            count := read_be(msg.payload, 0, 2)
+            mut values: List[sql.Value] := []
+            mut off := 2
+            mut c := 0
+            while c < count:
+                vlen := read_be(msg.payload, off, 4)
+                off = off + 4
+                if vlen == bits.mask32(0 - 1):
+                    values.push(sql.null_value())
+                else:
+                    raw := bytes.to_string_utf8(bytes.slice(msg.payload, off, off + vlen))!
+                    values.push(decode_value(raw, oids[c]))
+                    off = off + vlen
+                c = c + 1
+            rows.push(sql.row(values, names))
+        elif msg.mtype == 90:
+            # ReadyForQuery
+            return Rows(rows: rows, pos: 0)
+        else:
+            # CommandComplete (67), RowDescription handled, notices — ignore.
+            continue
+
+# decode a text-format value by its column type oid.
+fn decode_value(raw: String, oid: Int) -> sql.Value:
+    # int2, int4, int8, oid
+    if oid == 21 or oid == 23 or oid == 20 or oid == 26:
+        return sql.integer(parse_int(raw) catch 0)
+    # float4, float8, numeric
+    if oid == 700 or oid == 701 or oid == 1700:
+        return sql.real(parse_float(raw) catch 0.0)
+    # bool
+    if oid == 16:
+        if raw == "t":
+            return sql.integer(1)
+        return sql.integer(0)
+    return sql.text(raw)
+
+# --- tests (pure logic; no server needed) ---
+
+test "scram-sha-256 client-final matches the RFC 7677 vector":
+    server_first := "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+    client_first_bare := "n=user,r=rOprNGfwEbeRWgbNEkqO"
+    final := scram_client_final(server_first, client_first_bare, "pencil")!
+    assert_eq(final, "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=")
+
+test "big-endian int32 round-trips":
+    assert_eq(read_be(be32(196608), 0, 4), 196608)
+    assert_eq(read_be(be32(0), 0, 4), 0)
+    assert_eq(read_be(be32(65535), 0, 4), 65535)
+
+test "value decode honors column type oids":
+    row := sql.row([decode_value("42", 23), decode_value("hi", 25), decode_value("9.5", 701), decode_value("t", 16)], ["a", "b", "c", "d"])
+    assert_eq(row.as_int(0), 42)
+    assert_eq(row.as_text(1), "hi")
+    assert_eq(row.as_real(2), 9.5)
+    assert_eq(row.as_int(3), 1)
+
+test "error text extracts the message field":
+    payload := bytes.concat(bytes.from_string_utf8("SERROR"), bytes.concat(bytes.from_string_utf8(chr(0)), bytes.concat(bytes.from_string_utf8("Mrole does not exist"), bytes.from_string_utf8(chr(0)))))
+    assert_eq(error_text(payload), "role does not exist")

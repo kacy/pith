@@ -164,3 +164,41 @@ impl Client:
     # KEYS pattern, returning the matching keys.
     pub fn keys(pattern: String) -> List[String]!:
         return self.command_list(["KEYS", pattern])!
+
+# --- connection pool ---
+
+# a small connection pool: hand out live clients and take them back for reuse,
+# so callers skip the tcp connect on every command. it keeps up to `max_idle`
+# clients around; extras are closed on release.
+pub struct Pool:
+    mut idle: List[Client]
+    host: String
+    port: Int
+    max_idle: Int
+
+# create a pool that dials the given server, opening clients lazily.
+pub fn pool(host: String, port: Int, max_idle: Int) -> Pool:
+    return Pool(idle: [], host: host, port: port, max_idle: max_idle)
+
+impl Pool:
+    # take a client from the pool, opening a fresh one if none are idle.
+    pub fn acquire() -> Client!:
+        n := self.idle.len()
+        if n > 0:
+            client := self.idle[n - 1]
+            self.idle = self.idle.slice(0, n - 1)
+            return client
+        return connect(self.host, self.port)!
+
+    # return a client for reuse, or close it if the pool is already full.
+    pub fn release(client: Client):
+        if self.idle.len() < self.max_idle:
+            self.idle.push(client)
+        else:
+            client.close()
+
+    # close every idle client.
+    pub fn close():
+        for client in self.idle:
+            client.close()
+        self.idle = []

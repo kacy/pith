@@ -301,6 +301,47 @@ fn decode_value(raw: String, mysql_type: Int) -> sql.Value:
         return sql.real(parse_float(raw) catch 0.0)
     return sql.text(raw)
 
+# --- connection pool ---
+
+# a small connection pool: hand out live connections and take them back for
+# reuse, so callers skip the tcp + auth handshake on every query. it keeps up
+# to `max_idle` connections around; extras are closed on release.
+pub struct Pool:
+    mut idle: List[Conn]
+    host: String
+    port: Int
+    user: String
+    password: String
+    database: String
+    max_idle: Int
+
+# create a pool that dials the given server, opening connections lazily.
+pub fn pool(host: String, port: Int, user: String, password: String, database: String, max_idle: Int) -> Pool:
+    return Pool(idle: [], host: host, port: port, user: user, password: password, database: database, max_idle: max_idle)
+
+impl Pool:
+    # take a connection from the pool, opening a fresh one if none are idle.
+    pub fn acquire() -> Conn!:
+        n := self.idle.len()
+        if n > 0:
+            conn := self.idle[n - 1]
+            self.idle = self.idle.slice(0, n - 1)
+            return conn
+        return connect(self.host, self.port, self.user, self.password, self.database)!
+
+    # return a connection for reuse, or close it if the pool is already full.
+    pub fn release(conn: Conn):
+        if self.idle.len() < self.max_idle:
+            self.idle.push(conn)
+        else:
+            conn.close()
+
+    # close every idle connection.
+    pub fn close():
+        for conn in self.idle:
+            conn.close()
+        self.idle = []
+
 # --- tests (pure logic; no server needed) ---
 
 test "mysql_native_password scramble matches a known vector":

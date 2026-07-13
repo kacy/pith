@@ -1,0 +1,51 @@
+# interface idioms: associated types and default methods
+#
+# an interface can declare an associated `type Item` that each impl binds to a
+# concrete type, so the same method yields the right type per impl. an
+# interface method with a body is a default: impls inherit it unless they
+# override, and the default can call the interface's other methods on self.
+
+interface Source:
+    type Item
+    fn value() -> Item
+    fn label() -> String
+    # default method: inherited unless an impl provides its own
+    fn describe() -> String:
+        return "source: {self.label()}"
+
+struct Counter:
+    pub n: Int
+
+struct Greeter:
+    pub who: String
+
+# binds Item to Int and inherits the default describe()
+impl Source for Counter:
+    type Item = Int
+    fn value() -> Item:
+        return self.n
+    fn label() -> String:
+        return "counter"
+
+# binds Item to String and overrides describe()
+impl Source for Greeter:
+    type Item = String
+    fn value() -> Item:
+        return self.who
+    fn label() -> String:
+        return "greeter"
+    fn describe() -> String:
+        return "greeter for {self.who}"
+
+fn main():
+    c := Counter(n: 7)
+    g := Greeter(who: "ada")
+
+    # value() returns Int here, String there — the associated type per impl
+    print("counter value: {c.value()}")
+    got := g.value()
+    print("greeter value: {got} (len {got.len()})")
+
+    # default describe() vs the overridden one
+    print(c.describe()) # inherited default
+    print(g.describe()) # overridden

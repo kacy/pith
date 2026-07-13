@@ -98,6 +98,8 @@ impl Reader:
 
 # --- connection ---
 
+# an open connection to a mysql/mariadb server; `buf` holds bytes read past
+# the current packet.
 pub struct Conn:
     fd: Int
     mut buf: Bytes
@@ -132,6 +134,7 @@ impl Conn:
         out.free()
         return n
 
+    # close the connection.
     pub fn close():
         tcp_close(self.fd)
 
@@ -150,6 +153,7 @@ fn err_text(payload: Bytes) -> String:
         return "unknown error"
     return bytes.to_string_utf8(bytes.slice(payload, 9, bytes.len(payload))) catch "error"
 
+# open a connection and complete the handshake and native-password auth.
 pub fn connect(host: String, port: Int, user: String, password: String, database: String) -> Conn!:
     fd := tcp_connect(host, port)!
     conn := Conn(fd: fd, buf: bytes.empty(), pos: 0)
@@ -221,6 +225,7 @@ fn parse_salt(greeting: Bytes) -> Bytes!:
 
 # --- queries ---
 
+# a buffered result set from one query, iterated as sql.Row.
 pub struct Rows:
     mut rows: List[sql.Row]
     mut pos: Int
@@ -234,6 +239,7 @@ impl Iterator for Rows:
         self.pos = self.pos + 1
         return row
 
+# run a query through the text protocol and collect its rows.
 pub fn query(conn: Conn, text: String) -> Rows!:
     cmd := bytes.buffer()
     cmd.write_byte(3) catch 0

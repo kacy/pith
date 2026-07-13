@@ -9,8 +9,10 @@ import std.crypto.subtle as subtle
 fn list_to_bytes(data: List[Int]) -> Bytes:
     out := bytes.buffer_with_capacity(data.len())
     for value in data:
-        out.write_byte(value)
-    return out.bytes()
+        out.write_byte(value) catch 0
+    result := out.bytes()
+    out.free()
+    return result
 
 fn hmac_pad(key: Bytes, pad: Int, block_size: Int) -> Bytes:
     out := bytes.buffer_with_capacity(block_size)
@@ -19,24 +21,46 @@ fn hmac_pad(key: Bytes, pad: Int, block_size: Int) -> Bytes:
         mut value := 0
         if i < key.len():
             value = key[i]
-        out.write_byte(bits.xor(value, pad))
+        out.write_byte(bits.xor(value, pad)) catch 0
         i = i + 1
-    return out.bytes()
+    result := out.bytes()
+    out.free()
+    return result
+
+# the hash to key an hmac with, dispatched by a small kind tag.
+SHA1 := 1
+SHA256 := 2
+SHA384 := 3
+SHA512 := 4
+
+# run the concrete hash for `kind`. we dispatch and call directly rather than
+# taking the hash as a function value: a function-value call leaks the value it
+# produces, and hmac runs the hash three times, so pbkdf2's thousands of
+# iterations would leak heavily.
+fn hmac_digest(kind: Int, data: Bytes) -> Bytes:
+    if kind == SHA1:
+        return hash.sha1_bytes(data)
+    if kind == SHA256:
+        return hash.sha256_bytes(data)
+    if kind == SHA384:
+        return hash.sha384_bytes(data)
+    return hash.sha512_bytes(data)
 
 # HMAC over any hash function (RFC 2104): hash an oversized key down to size,
-# then digest the inner- and outer-padded blocks. `digest` is the hash and
-# `block_size` its block size (64 for sha1/sha256, 128 for sha384/sha512).
-fn hmac(digest: fn(Bytes) -> Bytes, block_size: Int, key: Bytes, message: Bytes) -> Bytes:
+# then digest the inner- and outer-padded blocks. `block_size` is the hash's
+# block size (64 for sha1/sha256, 128 for sha384/sha512).
+fn hmac(kind: Int, block_size: Int, key: Bytes, message: Bytes) -> Bytes:
     mut k := key
     if k.len() > block_size:
-        k = digest(k)
+        k = hmac_digest(kind, k)
     inner := hmac_pad(k, 54, block_size).concat(message)
-    outer := hmac_pad(k, 92, block_size).concat(digest(inner))
-    return digest(outer)
+    inner_hash := hmac_digest(kind, inner)
+    outer := hmac_pad(k, 92, block_size).concat(inner_hash)
+    return hmac_digest(kind, outer)
 
 # compute HMAC-SHA1 and return raw bytes.
 pub fn sha1(key: Bytes, message: Bytes) -> Bytes:
-    return hmac(hash.sha1_bytes, 64, key, message)
+    return hmac(SHA1, 64, key, message)
 
 # compute HMAC-SHA1 and return lowercase hex.
 pub fn sha1_hex(key: Bytes, message: Bytes) -> String:
@@ -44,7 +68,7 @@ pub fn sha1_hex(key: Bytes, message: Bytes) -> String:
 
 # compute HMAC-SHA256 and return raw bytes.
 pub fn sha256(key: Bytes, message: Bytes) -> Bytes:
-    return hmac(hash.sha256_bytes, 64, key, message)
+    return hmac(SHA256, 64, key, message)
 
 # compute HMAC-SHA256 and return lowercase hex.
 pub fn sha256_hex(key: Bytes, message: Bytes) -> String:
@@ -52,7 +76,7 @@ pub fn sha256_hex(key: Bytes, message: Bytes) -> String:
 
 # compute HMAC-SHA384 and return raw bytes.
 pub fn sha384(key: Bytes, message: Bytes) -> Bytes:
-    return hmac(hash.sha384_bytes, 128, key, message)
+    return hmac(SHA384, 128, key, message)
 
 # compute HMAC-SHA384 and return lowercase hex.
 pub fn sha384_hex(key: Bytes, message: Bytes) -> String:
@@ -60,7 +84,7 @@ pub fn sha384_hex(key: Bytes, message: Bytes) -> String:
 
 # compute HMAC-SHA512 and return raw bytes.
 pub fn sha512(key: Bytes, message: Bytes) -> Bytes:
-    return hmac(hash.sha512_bytes, 128, key, message)
+    return hmac(SHA512, 128, key, message)
 
 # compute HMAC-SHA512 and return lowercase hex.
 pub fn sha512_hex(key: Bytes, message: Bytes) -> String:

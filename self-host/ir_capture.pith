@@ -10,18 +10,23 @@ fn ir_copy_names(names: List[String]) -> List[String]:
         copy.push(name)
     return copy
 
-fn ir_should_capture_name(name: String, bound: List[String], free: List[String], blocked_names: Map[String, Bool]) -> Bool:
+fn ir_should_capture_name(name: String, bound: List[String], free: List[String], blocked_names: Map[String, Bool], locals: Map[String, Int]) -> Bool:
     if ir_list_contains(bound, name) or ir_list_contains(free, name):
         return false
+    # a real variable in the enclosing scope must be captured even if a global
+    # function or type shares its name — the local shadows the global (e.g. a
+    # parameter named `host` alongside std.net.url.host).
+    if locals.contains_key(name):
+        return true
     if blocked_names.contains_key(name):
         return false
     return not ir_is_known_returning_func(name)
 
-fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blocked_names: Map[String, Bool]) -> List[String]:
+fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blocked_names: Map[String, Bool], locals: Map[String, Int]) -> List[String]:
     node := get_node(idx)
     if node.kind == "ident":
         name := node.value
-        if ir_should_capture_name(name, bound, free, blocked_names):
+        if ir_should_capture_name(name, bound, free, blocked_names, locals):
             mut updated := ir_copy_names(free)
             updated.push(name)
             return updated
@@ -36,13 +41,13 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blo
         for child in node.children:
             cn := get_node(child)
             if cn.kind == "body" or cn.kind == "block":
-                updated_free = ir_find_free_vars_walk(child, inner_bound, updated_free, blocked_names)
+                updated_free = ir_find_free_vars_walk(child, inner_bound, updated_free, blocked_names, locals)
         return updated_free
     if node.kind == "body" or node.kind == "block":
         mut scoped_bound := ir_copy_names(bound)
         mut updated_free := ir_copy_names(free)
         for child in node.children:
-            updated_free = ir_find_free_vars_walk(child, scoped_bound, updated_free, blocked_names)
+            updated_free = ir_find_free_vars_walk(child, scoped_bound, updated_free, blocked_names, locals)
             child_node := get_node(child)
             if ir_is_binding_kind(child_node.kind):
                 bind_name := ir_binding_name(child_node)
@@ -51,8 +56,8 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blo
         return updated_free
     mut updated_free := ir_copy_names(free)
     for child in node.children:
-        updated_free = ir_find_free_vars_walk(child, bound, updated_free, blocked_names)
+        updated_free = ir_find_free_vars_walk(child, bound, updated_free, blocked_names, locals)
     return updated_free
 
-pub fn ir_capture_find_free_vars(idx: Int, bound: List[String], blocked_names: Map[String, Bool]) -> List[String]:
-    return ir_find_free_vars_walk(idx, bound, [], blocked_names)
+pub fn ir_capture_find_free_vars(idx: Int, bound: List[String], blocked_names: Map[String, Bool], locals: Map[String, Int]) -> List[String]:
+    return ir_find_free_vars_walk(idx, bound, [], blocked_names, locals)

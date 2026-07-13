@@ -391,7 +391,9 @@ fn ir_emit_result_ok_field_for_expr(obj_r: Int, expr_idx: Int) -> Int:
     return r
 
 fn ir_find_free_vars(idx: Int, bound: List[String]) -> List[String]:
-    return ir_capture_find_free_vars(idx, bound, ir_capture_blocked_names())
+    # ir_var_regs holds the enclosing scope's live variables, so a captured name
+    # that shadows a same-named global is recognized as a real local.
+    return ir_capture_find_free_vars(idx, bound, ir_capture_blocked_names(), ir_var_regs)
 
 # --- collect strings (iterative to avoid deep recursion crashes) ---
 fn ir_collect_strings(idx: Int):

@@ -4087,8 +4087,13 @@ fn ir_emit_index_expr_propagate(obj_r: Int, idx_r: Int, obj_type: String, value_
         val_kind = "unknown"
     unwrapped_r := ir_reg()
     ir_emit("field " + unwrapped_r.to_string() + " " + opt_r.to_string() + " 8 " + val_kind + " value")
+    # the _opt wrapper is a throwaway tuple shell; free it now that the value is
+    # extracted. releasing it frees only the tuple's slots (no destructor), so
+    # the extracted value is untouched — without this every `list[i]` leaks it.
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", opt_r)
     ir_emit("jmp " + merge_l)
     ir_emit_label(none_l)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", opt_r)
     if ir_emit_tests and ir_emitting_test_func:
         ir_test_assert_fail_return()
     else:

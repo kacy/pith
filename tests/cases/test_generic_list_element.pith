@@ -1,0 +1,26 @@
+# a specialized generic method that reads an element out of a `List[T]` field,
+# removes it, and returns it must retain the element — otherwise mutating the
+# list frees it and the returned value dangles. before the fix, writing to the
+# returned value hit freed memory (a generic connection pool's acquire()).
+# in the memcheck set so the retain stays use-after-free-safe.
+struct Item:
+    mut v: Int
+
+struct Holder[T]:
+    mut items: List[T]
+
+impl Holder:
+    fn take() -> T!:
+        n := self.items.len()
+        c := self.items[n - 1]
+        self.items = self.items.slice(0, n - 1)
+        return c
+
+fn main() -> Int!:
+    h := Holder[Item](items: [Item(v: 1), Item(v: 2)])
+    a := h.take()!
+    b := h.take()!
+    a.v = 99
+    b.v = 42
+    print("{a.v} {b.v}")
+    return 0

@@ -1,0 +1,43 @@
+# std.sql core: the shared Value/Row types and the "a result set is an iterator
+# over rows" convention, exercised through a mock in-memory result set that
+# stands in for a driver.
+
+import std.sql as sql
+from std.iter import Iterator, to_list
+
+# a driver's result set is just an iterator yielding sql.Row. this mock holds
+# its rows in memory; a real driver pulls them from the database on next().
+struct MemRows:
+    mut rows: List[sql.Row]
+    mut pos: Int
+
+impl Iterator for MemRows:
+    type Item = sql.Row
+    fn next() -> sql.Row?:
+        if self.pos >= self.rows.len():
+            return none
+        r := self.rows[self.pos]
+        self.pos = self.pos + 1
+        return r
+
+fn make_users() -> MemRows:
+    names := ["id", "name", "score"]
+    data := [sql.row([sql.integer(1), sql.text("ada"), sql.real(9.5)], names), sql.row([sql.integer(2), sql.text("grace"), sql.null_value()], names)]
+    return MemRows(rows: data, pos: 0)
+
+fn main():
+    # drive the result set with the for-protocol and typed accessors
+    for row in make_users():
+        mut score := "null"
+        if not row.is_null(2):
+            score = "{row.as_real(2)}"
+        print("{row.as_int(0)} {row.as_text(1)} {score}")
+
+    # or drain it eagerly with the iterator terminal
+    all := to_list(make_users())
+    print("count {all.len()}")
+
+    # look up a column by name
+    first := all[0]
+    idx := first.column("name").unwrap_or(0 - 1)
+    print("name at col {idx}: {first.as_text(idx)}")

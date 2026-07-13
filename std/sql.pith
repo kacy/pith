@@ -1,0 +1,94 @@
+# std.sql — the database abstraction shared across drivers.
+#
+# pith dispatches statically, so there is no runtime driver registry like Go's
+# database/sql. instead each driver (std.sql.sqlite, std.sql.postgres, ...)
+# ships concrete `open` / connection / rows types that implement the interfaces
+# below, and the shared `Value` / `Row` types unify results across all of them.
+# generic code binds on the interfaces to stay driver-agnostic; a result set is
+# an iterator, so `for row in rows:` and `to_list(rows)` work everywhere.
+
+import std.bytes as bytes
+
+# a column value crossing the driver boundary, in either direction. this is the
+# null-safe boundary — a missing value is `Null`, never a zero in disguise.
+pub enum Value:
+    Null
+    Integer(Int)
+    Real(Float)
+    Text(String)
+    Blob(Bytes)
+
+# constructors for values and rows. call these rather than the enum/struct
+# forms directly: they build the type inside std.sql, which keeps callers in
+# other modules working regardless of cross-module construction support.
+pub fn integer(n: Int) -> Value:
+    return Value.Integer(n)
+
+pub fn real(f: Float) -> Value:
+    return Value.Real(f)
+
+pub fn text(s: String) -> Value:
+    return Value.Text(s)
+
+pub fn blob(b: Bytes) -> Value:
+    return Value.Blob(b)
+
+pub fn null_value() -> Value:
+    return Value.Null
+
+# a materialized result row: the column values in order, alongside their names.
+pub struct Row:
+    pub values: List[Value]
+    pub names: List[String]
+
+pub fn row(values: List[Value], names: List[String]) -> Row:
+    return Row(values: values, names: names)
+
+impl Row:
+    # the raw value at a column index.
+    pub fn get(col: Int) -> Value:
+        return self.values[col]
+
+    # typed accessors. they coerce where it is lossless (an Integer read as Real)
+    # and fall back to a zero value otherwise, so callers that know their schema
+    # stay terse; use `get` + a match when a column may be null or of mixed type.
+    pub fn as_int(col: Int) -> Int:
+        return match self.values[col]:
+            Value.Integer(n) => n
+            Value.Real(f) => f.to_int()
+            _ => 0
+
+    pub fn as_real(col: Int) -> Float:
+        return match self.values[col]:
+            Value.Real(f) => f
+            Value.Integer(n) => n.to_float()
+            _ => 0.0
+
+    pub fn as_text(col: Int) -> String:
+        return match self.values[col]:
+            Value.Text(s) => s
+            _ => ""
+
+    pub fn as_blob(col: Int) -> Bytes:
+        return match self.values[col]:
+            Value.Blob(b) => b
+            _ => bytes.empty()
+
+    pub fn is_null(col: Int) -> Bool:
+        return match self.values[col]:
+            Value.Null => true
+            _ => false
+
+    # the index of a column by name, or none when the name is not present.
+    pub fn column(name: String) -> Int?:
+        for n, i in self.names:
+            if n == name:
+                return i
+        return none
+
+# a driver's result set implements std.iter.Iterator with `type Item = Row`, so
+# it drops straight into `for row in rows:` and `std.iter.to_list(rows)`. (there
+# is no separate Rows interface: pith interfaces don't compose, so a second
+# interface would not also be an Iterator — the convention is simpler and
+# works.) drivers add `columns()` and `close()` as plain methods on their
+# concrete rows type.

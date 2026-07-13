@@ -1,0 +1,332 @@
+# std.mysql — a pure-pith mysql/mariadb client (protocol version 10).
+#
+# connect with host/port/user/password/database, run a query, and iterate the
+# rows as std.sql values:
+#
+#   conn := mysql.connect("127.0.0.1", 3306, "me", "pw", "mydb")!
+#   for row in mysql.query(conn, "select id, name from users")!:
+#       print("{row.as_int(0)} {row.as_text(1)}")
+#   conn.close()
+#
+# authentication is mysql_native_password (the SHA-1 scramble). queries use the
+# text protocol, so values arrive as strings and are decoded by column type.
+
+import std.sql as sql
+import std.bytes as bytes
+import std.bits as bits
+import std.hash as hash
+import std.encoding as encoding
+from std.iter import Iterator
+
+# --- byte helpers (mysql is little-endian) ---
+
+# an n-byte little-endian integer.
+fn le_int(value: Int, width: Int) -> Bytes:
+    out := bytes.buffer()
+    mut i := 0
+    while i < width:
+        out.write_byte(bits.band(bits.shr(value, i * 8), 255)) catch 0
+        i = i + 1
+    result := out.bytes()
+    out.free()
+    return result
+
+# xor two equal-length byte strings.
+fn xor_bytes(a: Bytes, b: Bytes) -> Bytes:
+    out := bytes.buffer()
+    mut i := 0
+    while i < bytes.len(a):
+        out.write_byte(bits.xor(bytes.get(a, i), bytes.get(b, i))) catch 0
+        i = i + 1
+    result := out.bytes()
+    out.free()
+    return result
+
+# a cursor over a packet payload; mysql packs everything little-endian with
+# length-encoded integers and strings, so a small stateful reader keeps the
+# parsing readable.
+struct Reader:
+    data: Bytes
+    mut pos: Int
+
+impl Reader:
+    fn u8() -> Int:
+        v := bytes.get(self.data, self.pos)
+        self.pos = self.pos + 1
+        return v
+
+    fn le(width: Int) -> Int:
+        mut value := 0
+        mut i := 0
+        while i < width:
+            value = bits.bor(value, bits.shl(bytes.get(self.data, self.pos + i), i * 8))
+            i = i + 1
+        self.pos = self.pos + width
+        return value
+
+    fn skip(n: Int):
+        self.pos = self.pos + n
+
+    # a length-encoded integer.
+    fn lenenc() -> Int:
+        first := self.u8()
+        if first < 251:
+            return first
+        if first == 252:
+            return self.le(2)
+        if first == 253:
+            return self.le(3)
+        if first == 254:
+            return self.le(8)
+        return 0
+
+    # a length-encoded string.
+    fn lenenc_str() -> String!:
+        n := self.lenenc()
+        s := bytes.to_string_utf8(bytes.slice(self.data, self.pos, self.pos + n))!
+        self.pos = self.pos + n
+        return s
+
+    # a null-terminated string.
+    fn cstring() -> String!:
+        start := self.pos
+        while bytes.get(self.data, self.pos) != 0:
+            self.pos = self.pos + 1
+        s := bytes.to_string_utf8(bytes.slice(self.data, start, self.pos))!
+        self.pos = self.pos + 1
+        return s
+
+# --- connection ---
+
+pub struct Conn:
+    fd: Int
+    mut buf: Bytes
+    mut pos: Int
+
+impl Conn:
+    fn recv_exact(n: Int) -> Bytes!:
+        while bytes.len(self.buf) - self.pos < n:
+            chunk := tcp_read_bytes(self.fd, 4096)!
+            if bytes.len(chunk) == 0:
+                fail "mysql: connection closed"
+            self.buf = bytes.concat(bytes.slice(self.buf, self.pos, bytes.len(self.buf)), chunk)
+            self.pos = 0
+        out := bytes.slice(self.buf, self.pos, self.pos + n)
+        self.pos = self.pos + n
+        return out
+
+    # read one packet, returning its payload. the 3-byte little-endian length
+    # and 1-byte sequence id are consumed; the sequence id is returned to the
+    # caller so replies can echo the next one.
+    fn read_packet() -> Bytes!:
+        head := self.recv_exact(4)!
+        length := bytes.get(head, 0) + bytes.get(head, 1) * 256 + bytes.get(head, 2) * 65536
+        return self.recv_exact(length)!
+
+    fn send_packet(seq: Int, payload: Bytes) -> Int!:
+        out := bytes.buffer()
+        out.write(le_int(bytes.len(payload), 3)) catch 0
+        out.write_byte(seq) catch 0
+        out.write(payload) catch 0
+        n := tcp_write_bytes(self.fd, out.bytes())!
+        out.free()
+        return n
+
+    pub fn close():
+        tcp_close(self.fd)
+
+# the mysql_native_password scramble:
+#   SHA1(password) XOR SHA1(salt + SHA1(SHA1(password)))
+fn native_scramble(password: String, salt: Bytes) -> Bytes:
+    sha_pw := hash.sha1_bytes(bytes.from_string_utf8(password))
+    double := hash.sha1_bytes(sha_pw)
+    seeded := hash.sha1_bytes(bytes.concat(salt, double))
+    return xor_bytes(sha_pw, seeded)
+
+# read the error message from an ERR packet payload (after the 0xff marker):
+# 2-byte code, a 6-byte sql-state marker, then the message.
+fn err_text(payload: Bytes) -> String:
+    if bytes.len(payload) <= 9:
+        return "unknown error"
+    return bytes.to_string_utf8(bytes.slice(payload, 9, bytes.len(payload))) catch "error"
+
+pub fn connect(host: String, port: Int, user: String, password: String, database: String) -> Conn!:
+    fd := tcp_connect(host, port)!
+    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0)
+    conn.handshake(user, password, database)!
+    return conn
+
+impl Conn:
+    fn handshake(user: String, password: String, database: String) -> Bool!:
+        greeting := self.read_packet()!
+        salt := parse_salt(greeting)!
+
+        # capabilities: PROTOCOL_41 | SECURE_CONNECTION | PLUGIN_AUTH |
+        # CONNECT_WITH_DB | LONG_PASSWORD. DEPRECATE_EOF is left off so the
+        # server frames result sets with EOF packets.
+        caps := 557577
+        scramble := native_scramble(password, salt)
+
+        out := bytes.buffer()
+        out.write(le_int(caps, 4)) catch 0
+        out.write(le_int(16777216, 4)) catch 0
+        out.write_byte(45) catch 0
+        mut z := 0
+        while z < 23:
+            out.write_byte(0) catch 0
+            z = z + 1
+        out.write(cstring_bytes(user)) catch 0
+        out.write_byte(bytes.len(scramble)) catch 0
+        out.write(scramble) catch 0
+        out.write(cstring_bytes(database)) catch 0
+        out.write(cstring_bytes("mysql_native_password")) catch 0
+        self.send_packet(1, out.bytes())!
+        out.free()
+
+        reply := self.read_packet()!
+        marker := bytes.get(reply, 0)
+        if marker == 255:
+            fail "mysql: {err_text(reply)}"
+        if marker == 254:
+            fail "mysql: server requested an unsupported auth switch"
+        return true
+
+# a string plus a null terminator.
+fn cstring_bytes(text: String) -> Bytes:
+    out := bytes.buffer()
+    out.write_string_utf8(text) catch 0
+    out.write_byte(0) catch 0
+    result := out.bytes()
+    out.free()
+    return result
+
+# the 20-byte auth salt from the initial handshake packet: an 8-byte part, then
+# fixed fields, then 12 more salt bytes.
+fn parse_salt(greeting: Bytes) -> Bytes!:
+    r := Reader(data: greeting, pos: 0)
+    r.skip(1)
+    r.cstring()!
+    r.skip(4)
+    salt1 := bytes.slice(greeting, r.pos, r.pos + 8)
+    r.skip(8)
+    r.skip(1)
+    r.skip(2)
+    r.skip(1)
+    r.skip(2)
+    r.skip(2)
+    r.skip(1)
+    r.skip(10)
+    salt2 := bytes.slice(greeting, r.pos, r.pos + 12)
+    return bytes.concat(salt1, salt2)
+
+# --- queries ---
+
+pub struct Rows:
+    mut rows: List[sql.Row]
+    mut pos: Int
+
+impl Iterator for Rows:
+    type Item = sql.Row
+    fn next() -> sql.Row?:
+        if self.pos >= self.rows.len():
+            return none
+        row := self.rows[self.pos]
+        self.pos = self.pos + 1
+        return row
+
+pub fn query(conn: Conn, text: String) -> Rows!:
+    cmd := bytes.buffer()
+    cmd.write_byte(3) catch 0
+    cmd.write_string_utf8(text) catch 0
+    conn.send_packet(0, cmd.bytes())!
+    cmd.free()
+
+    first := conn.read_packet()!
+    lead := bytes.get(first, 0)
+    if lead == 255:
+        fail "mysql: {err_text(first)}"
+    if lead == 0:
+        # OK packet: a statement with no result set.
+        return Rows(rows: [], pos: 0)
+
+    count_reader := Reader(data: first, pos: 0)
+    column_count := count_reader.lenenc()
+
+    # column definitions: keep each column's name and mysql type.
+    mut names: List[String] := []
+    mut types: List[Int] := []
+    mut c := 0
+    while c < column_count:
+        col := conn.read_packet()!
+        r := Reader(data: col, pos: 0)
+        r.lenenc_str()!
+        r.lenenc_str()!
+        r.lenenc_str()!
+        r.lenenc_str()!
+        names.push(r.lenenc_str()!)
+        r.lenenc_str()!
+        r.skip(1)
+        r.skip(2)
+        r.skip(4)
+        types.push(r.u8())
+        c = c + 1
+
+    conn.read_packet()!
+
+    # rows, until the trailing EOF packet (0xfe with a short payload).
+    mut rows: List[sql.Row] := []
+    while true:
+        pkt := conn.read_packet()!
+        if bytes.get(pkt, 0) == 254 and bytes.len(pkt) < 9:
+            return Rows(rows: rows, pos: 0)
+        r := Reader(data: pkt, pos: 0)
+        mut values: List[sql.Value] := []
+        mut i := 0
+        while i < column_count:
+            if bytes.get(pkt, r.pos) == 251:
+                r.skip(1)
+                values.push(sql.null_value())
+            else:
+                values.push(decode_value(r.lenenc_str()!, types[i]))
+            i = i + 1
+        rows.push(sql.row(values, names))
+
+# decode a text value by its mysql column type.
+fn decode_value(raw: String, mysql_type: Int) -> sql.Value:
+    # tiny, short, long, longlong, int24, year
+    if mysql_type == 1 or mysql_type == 2 or mysql_type == 3 or mysql_type == 8 or mysql_type == 9 or mysql_type == 13:
+        return sql.integer(parse_int(raw) catch 0)
+    # float, double, decimal, newdecimal
+    if mysql_type == 4 or mysql_type == 5 or mysql_type == 0 or mysql_type == 246:
+        return sql.real(parse_float(raw) catch 0.0)
+    return sql.text(raw)
+
+# --- tests (pure logic; no server needed) ---
+
+test "mysql_native_password scramble matches a known vector":
+    salt := encoding.from_hex("000102030405060708090a0b0c0d0e0f10111213")!
+    scramble := native_scramble("secret", salt)
+    assert_eq(encoding.to_hex(scramble), "21b3ff405f32cbe4aafff291396046ea29fa3a4d")
+
+test "little-endian integers round-trip":
+    four := Reader(data: le_int(305419896, 4), pos: 0)
+    assert_eq(four.le(4), 305419896)
+    two := Reader(data: le_int(258, 2), pos: 0)
+    assert_eq(two.le(2), 258)
+
+test "length-encoded values parse":
+    buf := bytes.buffer()
+    buf.write_byte(5) catch 0
+    buf.write_byte(5) catch 0
+    buf.write_string_utf8("hello") catch 0
+    data := buf.bytes()
+    buf.free()
+    r := Reader(data: data, pos: 0)
+    assert_eq(r.lenenc(), 5)
+    assert_eq(r.lenenc_str()!, "hello")
+
+test "value decode honors mysql types":
+    row := sql.row([decode_value("42", 3), decode_value("hi", 253), decode_value("9.5", 5)], ["a", "b", "c"])
+    assert_eq(row.as_int(0), 42)
+    assert_eq(row.as_text(1), "hi")
+    assert_eq(row.as_real(2), 9.5)

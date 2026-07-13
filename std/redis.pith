@@ -1,0 +1,166 @@
+# std.redis — a small redis client speaking RESP over a tcp socket.
+#
+# connect to a server, then send commands with `command` (the general form) or
+# the typed helpers (get/set/del/incr/...). replies come back as a `Reply`,
+# a tagged value that mirrors RESP: a status line, an error, an integer, a bulk
+# string, nil, or an array of nested replies.
+#
+# i/o goes straight to the tcp_* builtins, the same ones std.io wraps; the
+# std.net.tcp module is a thin alias over them and isn't needed here.
+
+# a reply from redis. `Bulk` and `Array` may be absent, reported as `Nil`.
+# an array's elements are flattened to strings (a scalar becomes its text, a
+# nil becomes ""), which covers the common list-returning commands; reach for
+# `command` and parse yourself if you need nested structure.
+pub enum Reply:
+    Status(String)
+    Error(String)
+    Integer(Int)
+    Bulk(String)
+    Nil
+    Array(List[String])
+
+# the scalar text of a reply, for flattening array elements.
+fn reply_text(r: Reply) -> String:
+    return match r:
+        Reply.Status(s) => s
+        Reply.Error(s) => s
+        Reply.Integer(n) => n.to_string()
+        Reply.Bulk(s) => s
+        Reply.Nil => ""
+        Reply.Array(_) => ""
+
+# a connection to a redis server. `buf` holds bytes read past the current reply.
+pub struct Client:
+    fd: Int
+    mut buf: String
+
+# open a connection to a redis server.
+pub fn connect(host: String, port: Int) -> Client!:
+    fd := tcp_connect(host, port)!
+    return Client(fd: fd, buf: "")
+
+impl Client:
+    # pull one more chunk from the socket into the buffer; false at end of stream.
+    fn fill() -> Bool!:
+        chunk := tcp_read(self.fd, 4096)!
+        if chunk.len() == 0:
+            return false
+        self.buf = self.buf + chunk
+        return true
+
+    # read one CRLF-terminated line, returning it without the terminator.
+    fn read_line() -> String!:
+        mut idx := self.buf.index_of("\r\n")
+        while idx < 0:
+            if not self.fill()!:
+                fail "redis: connection closed"
+            idx = self.buf.index_of("\r\n")
+        line := self.buf.substring(0, idx)
+        self.buf = self.buf.substring(idx + 2, self.buf.len())
+        return line
+
+    # read exactly `count` payload bytes plus the trailing CRLF.
+    fn read_payload(count: Int) -> String!:
+        while self.buf.len() < count + 2:
+            if not self.fill()!:
+                fail "redis: connection closed"
+        data := self.buf.substring(0, count)
+        self.buf = self.buf.substring(count + 2, self.buf.len())
+        return data
+
+    # parse one reply off the wire, recursing for arrays.
+    fn read_reply() -> Reply!:
+        line := self.read_line()!
+        tag := line.substring(0, 1)
+        body := line.substring(1, line.len())
+        if tag == "+":
+            return Reply.Status(body)
+        if tag == "-":
+            return Reply.Error(body)
+        if tag == ":":
+            return Reply.Integer(parse_int(body)!)
+        if tag == "$":
+            n := parse_int(body)!
+            if n < 0:
+                return Reply.Nil
+            return Reply.Bulk(self.read_payload(n)!)
+        if tag == "*":
+            n := parse_int(body)!
+            if n < 0:
+                return Reply.Nil
+            mut items: List[String] := []
+            mut i := 0
+            while i < n:
+                items.push(reply_text(self.read_reply()!))
+                i = i + 1
+            return Reply.Array(items)
+        fail "redis: unexpected reply: {line}"
+
+    # send a command as a RESP array of bulk strings, then read one reply.
+    pub fn command(args: List[String]) -> Reply!:
+        mut out := "*{args.len()}\r\n"
+        for a in args:
+            out = out + "${a.len()}\r\n{a}\r\n"
+        tcp_write(self.fd, out)!
+        return self.read_reply()!
+
+    # send a command expecting an array reply, returning its elements as
+    # strings (empty when the reply is nil or not an array).
+    pub fn command_list(args: List[String]) -> List[String]!:
+        reply := self.command(args)!
+        return match reply:
+            Reply.Array(items) => items
+            _ => []
+
+    pub fn close():
+        tcp_close(self.fd)
+
+    # --- typed helpers over `command` ---
+
+    # PING, returning the pong text ("PONG" normally).
+    pub fn ping() -> String!:
+        reply := self.command(["PING"])!
+        return match reply:
+            Reply.Status(s) => s
+            _ => ""
+
+    # SET key value, true when the server replies OK.
+    pub fn set(key: String, value: String) -> Bool!:
+        reply := self.command(["SET", key, value])!
+        return match reply:
+            Reply.Status(s) => s == "OK"
+            _ => false
+
+    # GET key. a missing key (nil bulk) comes back as the empty string; use
+    # `exists` first when you need to tell "" apart from absent.
+    pub fn get(key: String) -> String!:
+        reply := self.command(["GET", key])!
+        return match reply:
+            Reply.Bulk(s) => s
+            _ => ""
+
+    # DEL key, returning the number of keys removed (0 or 1).
+    pub fn del(key: String) -> Int!:
+        reply := self.command(["DEL", key])!
+        return match reply:
+            Reply.Integer(n) => n
+            _ => 0
+
+    # INCR key, returning the new value.
+    pub fn incr(key: String) -> Int!:
+        reply := self.command(["INCR", key])!
+        return match reply:
+            Reply.Integer(n) => n
+            _ => 0
+
+    # EXISTS key.
+    pub fn exists(key: String) -> Bool!:
+        reply := self.command(["EXISTS", key])!
+        return match reply:
+            Reply.Integer(n) => n > 0
+            _ => false
+
+    # KEYS pattern, returning the matching keys.
+    pub fn keys(pattern: String) -> List[String]!:
+        return self.command_list(["KEYS", pattern])!

@@ -4294,7 +4294,11 @@ fn ir_emit_return_stmt(node: Node):
         if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value).len() > 0:
             exclude = expr_node.value
         else:
-            ret_kind := ir_rc_kind(ir_infer_type(node.children[0]))
+            # substitute struct params (T -> the concrete type) so a specialized
+            # impl method returning a borrowed T still retains it. without this
+            # the inferred type stays "T", rc_kind reads empty, no retain fires,
+            # and the caller's arg release frees the value the method handed back.
+            ret_kind := ir_rc_kind(ir_substitute_type_name(ir_infer_type(node.children[0])))
             if ret_kind.len() > 0 and ir_string_expr_is_borrowed(node.children[0]):
                 ir_rc_retain_reg(r, ret_kind)
         result_kind := ir_expr_result_kind(node.children[0])

@@ -1,0 +1,22 @@
+# reading an element out of a list in a result-returning function goes through
+# the bounds-checked _opt runtime, which returns a throwaway optional tuple.
+# that wrapper must be freed after the value is extracted (it was leaking one
+# allocation per `list[i]`), and freeing it must not touch the extracted value.
+# in the memcheck set so the wrapper release stays double-free-safe.
+struct Item:
+    mut v: Int
+
+fn main() -> Int!:
+    xs := [Item(v: 10), Item(v: 20), Item(v: 30)]
+    mut total := 0
+    mut i := 0
+    while i < 3:
+        c := xs[i]
+        total = total + c.v
+        i = i + 1
+    # keep a reference to a read element and mutate it, to prove the wrapper
+    # release left the element alone
+    last := xs[2]
+    last.v = 99
+    print("{total} {last.v} {xs[2].v}")
+    return 0

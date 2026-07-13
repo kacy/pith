@@ -1,0 +1,37 @@
+# a closure that captures an enclosing variable and escapes must load that
+# capture from its environment — even when the captured name shadows a global
+# function (a parameter named `host` alongside std.net.url.host). before the fix
+# the capture analysis treated such a name as the global and never wrote it into
+# the closure env, so the body loaded an undefined name. this covers the shapes
+# that failed: a 0-arg factory closure (what a connection pool's `open` field
+# is), a capture used in an expression, and a capturing closure stored in a
+# struct field that escapes. in the memcheck set so the captured rc value's
+# retain/release stays double-free-safe.
+
+# 0-arg closure capturing a shadowing name, returned (escapes)
+fn greeter(host: String) -> fn() -> String:
+    return fn() => host
+
+# 1-arg closure capturing an int, used in an expression
+fn adder(base: Int) -> fn(Int) -> Int:
+    return fn(x: Int) => base + x
+
+# a capturing factory stored in a struct field that escapes — the exact shape a
+# generic pool's `open: fn() -> C!` field takes
+struct Factory:
+    make: fn() -> String
+
+fn factory_for(label: String) -> Factory:
+    return Factory(make: fn() => label)
+
+fn main() -> Int!:
+    g := greeter("db.local")
+    print("greet {g()} {g()}")
+
+    a := adder(100)
+    print("add {a(1)} {a(2)}")
+
+    f := factory_for("conn")
+    m := f.make
+    print("factory {m()} {m()}")
+    return 0

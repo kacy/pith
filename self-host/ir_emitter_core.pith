@@ -642,14 +642,48 @@ fn ir_string_prepass_bind_type(parts: IrBindParts, names: List[String]) -> Strin
             # and it is exactly the lowered kind the exit cleanup releases.
             if ir_rc_kind(bind_type).len() == 0 and (val_node.kind == "method_call" or val_node.kind == "call"):
                 bind_type = ir_expr_result_kind(parts.val_idx)
+            # `c := self.list[i]` on a generic list field: the checked/inferred
+            # element type is suppressed to "unknown", so recover the element
+            # type name from the field's declared `List[T]` node (the caller
+            # substitutes T -> concrete). without this the element isn't tracked
+            # and the returned value dangles once the list is mutated.
+            if ir_rc_kind(ir_substitute_type_name(bind_type)).len() == 0 and val_node.kind == "index" and val_node.children.len() > 0 and ir_current_impl_type.len() > 0:
+                list_node := get_node(val_node.children[0])
+                if list_node.kind == "field_access":
+                    elem := ir_self_list_field_element(list_node.value)
+                    if elem.len() > 0:
+                        bind_type = elem
     return bind_type
+
+# the element type name of a `self`-list field declared `List[T]` on the
+# current generic impl's struct (e.g. "T"/"C"), or "". reads the declaration
+# node because the resolved field kind is just "list".
+fn ir_self_list_field_element(field_name: String) -> String:
+    if ir_current_impl_type.len() == 0:
+        return ""
+    base := ir_strip_type_args(ir_current_impl_type)
+    if not ir_struct_decl_nodes.contains_key(base):
+        return ""
+    decl := get_node(ir_struct_decl_nodes[base])
+    for child in decl.children:
+        fnode := ir_unwrap_pub_node(child)
+        if fnode.kind == "field" and ir_struct_field_name(fnode) == field_name:
+            if fnode.children.len() > 0:
+                tnode := get_node(fnode.children[0])
+                if tnode.kind == "generic_type" and tnode.value == "List" and tnode.children.len() > 0:
+                    return get_node(tnode.children[0]).value
+    return ""
 
 fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[String]):
     node := get_node(idx)
     if ir_is_binding_kind(node.kind):
         parts := ir_collect_bind_parts(node)
         if parts.name.len() > 0:
-            kind := ir_rc_kind(ir_string_prepass_bind_type(parts, names))
+            # substitute struct params (C -> the concrete type) so a bind of a
+            # generic element (c := list[i] in a generic impl) is tracked and
+            # retained; otherwise the element frees when the list is mutated and
+            # the returned value dangles. no-op outside a specialized body.
+            kind := ir_rc_kind(ir_substitute_type_name(ir_string_prepass_bind_type(parts, names)))
             if kind.len() > 0:
                 if names.contains(parts.name):
                     if ir_rc_local_kind(parts.name) != kind and not poisoned.contains(parts.name):

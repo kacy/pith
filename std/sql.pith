@@ -24,15 +24,19 @@ pub enum Value:
 pub fn integer(n: Int) -> Value:
     return Value.Integer(n)
 
+# the Value wrapping a real number.
 pub fn real(f: Float) -> Value:
     return Value.Real(f)
 
+# the Value wrapping a text string.
 pub fn text(s: String) -> Value:
     return Value.Text(s)
 
+# the Value wrapping a byte blob.
 pub fn blob(b: Bytes) -> Value:
     return Value.Blob(b)
 
+# the null Value.
 pub fn null_value() -> Value:
     return Value.Null
 
@@ -41,6 +45,7 @@ pub struct Row:
     pub values: List[Value]
     pub names: List[String]
 
+# build a Row from its column values and their names.
 pub fn row(values: List[Value], names: List[String]) -> Row:
     return Row(values: values, names: names)
 
@@ -58,22 +63,26 @@ impl Row:
             Value.Real(f) => f.to_int()
             _ => 0
 
+    # the column read as a Float (an Integer coerces).
     pub fn as_real(col: Int) -> Float:
         return match self.values[col]:
             Value.Real(f) => f
             Value.Integer(n) => n.to_float()
             _ => 0.0
 
+    # the column read as text, or "" when it is not text.
     pub fn as_text(col: Int) -> String:
         return match self.values[col]:
             Value.Text(s) => s
             _ => ""
 
+    # the column read as a byte blob, or empty when it is not a blob.
     pub fn as_blob(col: Int) -> Bytes:
         return match self.values[col]:
             Value.Blob(b) => b
             _ => bytes.empty()
 
+    # true when the column is null.
     pub fn is_null(col: Int) -> Bool:
         return match self.values[col]:
             Value.Null => true

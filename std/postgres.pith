@@ -377,6 +377,48 @@ pub fn exec_params(conn: Conn, text: String, params: List[String]) -> Int!:
     result := read_response(conn)!
     return result.affected
 
+# --- connection pool ---
+
+# a small connection pool: it hands out live connections and takes them back
+# for reuse, so callers skip the tcp + SCRAM handshake on every query. it keeps
+# up to `max_idle` connections around; extras are closed on release.
+pub struct Pool:
+    mut idle: List[Conn]
+    host: String
+    port: Int
+    user: String
+    password: String
+    database: String
+    max_idle: Int
+
+# create a pool that dials the given server. it opens connections lazily, on
+# the first acquire that has nothing idle to reuse.
+pub fn pool(host: String, port: Int, user: String, password: String, database: String, max_idle: Int) -> Pool:
+    return Pool(idle: [], host: host, port: port, user: user, password: password, database: database, max_idle: max_idle)
+
+impl Pool:
+    # take a connection from the pool, opening a fresh one if none are idle.
+    pub fn acquire() -> Conn!:
+        n := self.idle.len()
+        if n > 0:
+            conn := self.idle[n - 1]
+            self.idle = self.idle.slice(0, n - 1)
+            return conn
+        return connect(self.host, self.port, self.user, self.password, self.database)!
+
+    # return a connection for reuse, or close it if the pool is already full.
+    pub fn release(conn: Conn):
+        if self.idle.len() < self.max_idle:
+            self.idle.push(conn)
+        else:
+            conn.close()
+
+    # close every idle connection.
+    pub fn close():
+        for conn in self.idle:
+            conn.close()
+        self.idle = []
+
 # decode a text-format value by its column type oid.
 fn decode_value(raw: String, oid: Int) -> sql.Value:
     # int2, int4, int8, oid

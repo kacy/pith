@@ -9,12 +9,9 @@
 #   conn.close()
 #
 # authentication is SCRAM-SHA-256 (the modern postgres default) with a
-# cleartext-password fallback. queries use the simple query protocol, so values
-# arrive in text form and are decoded by their column type.
-#
-# note: connecting currently leaks memory inside std.crypto's pbkdf2/hmac (the
-# SCRAM key derivation), once per connection. the driver itself is correct; the
-# leak clears when that crypto issue is fixed, with no change here.
+# cleartext-password fallback. `query` uses the simple protocol; `query_params`
+# and `exec_params` use the extended protocol to bind `$1`, `$2`, ... values off
+# the sql string. results come back in text form and are decoded by column type.
 
 import std.sql as sql
 import std.bytes as bytes
@@ -35,7 +32,18 @@ fn be32(n: Int) -> Bytes:
     out.write_byte(bits.mask8(bits.shr(n, 16))) catch 0
     out.write_byte(bits.mask8(bits.shr(n, 8))) catch 0
     out.write_byte(bits.mask8(n)) catch 0
-    return out.bytes()
+    result := out.bytes()
+    out.free()
+    return result
+
+# a 2-byte big-endian integer.
+fn be16(n: Int) -> Bytes:
+    out := bytes.buffer()
+    out.write_byte(bits.mask8(bits.shr(n, 8))) catch 0
+    out.write_byte(bits.mask8(n)) catch 0
+    result := out.bytes()
+    out.free()
+    return result
 
 # read a big-endian integer of `width` bytes at `off`.
 fn read_be(data: Bytes, off: Int, width: Int) -> Int:
@@ -97,7 +105,9 @@ impl Conn:
             out.write_byte(type_byte) catch 0
         out.write(be32(bytes.len(payload) + 4)) catch 0
         out.write(payload) catch 0
-        return tcp_write_bytes(self.fd, out.bytes())!
+        n := tcp_write_bytes(self.fd, out.bytes())!
+        out.free()
+        return n
 
     pub fn close():
         tcp_close(self.fd)
@@ -107,7 +117,9 @@ fn cstring(text: String) -> Bytes:
     out := bytes.buffer()
     out.write_string_utf8(text) catch 0
     out.write_byte(0) catch 0
-    return out.bytes()
+    result := out.bytes()
+    out.free()
+    return result
 
 # pull the human-readable message out of an ErrorResponse payload: a series of
 # type-tagged cstrings, where 'M' holds the message.
@@ -229,12 +241,31 @@ impl Iterator for Rows:
         self.pos = self.pos + 1
         return r
 
-# run a query through the simple query protocol and collect its rows.
-pub fn query(conn: Conn, text: String) -> Rows!:
-    conn.send(81, cstring(text))!
+# the outcome of one round-trip: the rows (empty for a non-select) and the
+# number of rows the command affected (from the CommandComplete tag).
+struct QueryResult:
+    rows: List[sql.Row]
+    affected: Int
+
+# the affected-row count from a CommandComplete tag ("INSERT 0 3", "UPDATE 2",
+# "SELECT 5"): the last space-separated token.
+fn command_affected(payload: Bytes) -> Int:
+    mut end := 0
+    while end < bytes.len(payload) and bytes.get(payload, end) != 0:
+        end = end + 1
+    tag := bytes.to_string_utf8(bytes.slice(payload, 0, end)) catch ""
+    parts := tag.split(" ")
+    if parts.len() == 0:
+        return 0
+    return parse_int(parts[parts.len() - 1]) catch 0
+
+# read the backend's reply stream up to ReadyForQuery, collecting rows and the
+# affected-row count. shared by the simple and extended query paths.
+fn read_response(conn: Conn) -> QueryResult!:
     mut names: List[String] := []
     mut oids: List[Int] := []
     mut rows: List[sql.Row] := []
+    mut affected := 0
     while true:
         msg := conn.read_message()!
         if msg.mtype == 69:
@@ -271,12 +302,80 @@ pub fn query(conn: Conn, text: String) -> Rows!:
                     off = off + vlen
                 c = c + 1
             rows.push(sql.row(values, names))
+        elif msg.mtype == 67:
+            # CommandComplete
+            affected = command_affected(msg.payload)
         elif msg.mtype == 90:
             # ReadyForQuery
-            return Rows(rows: rows, pos: 0)
+            return QueryResult(rows: rows, affected: affected)
         else:
-            # CommandComplete (67), RowDescription handled, notices — ignore.
+            # ParseComplete (49), BindComplete (50), notices, etc. — ignore.
             continue
+
+impl Conn:
+    # Parse/Bind/Describe/Execute/Sync for one parameterized statement. `$1`,
+    # `$2`, ... bind to `params` in order, sent in text form (unnamed statement
+    # and portal, so nothing is left prepared on the server).
+    fn send_extended(text: String, params: List[String]):
+        parse := bytes.buffer()
+        parse.write(cstring("")) catch 0
+        parse.write(cstring(text)) catch 0
+        parse.write(be16(0)) catch 0
+        self.send(80, parse.bytes()) catch 0
+        parse.free()
+
+        bind := bytes.buffer()
+        bind.write(cstring("")) catch 0
+        bind.write(cstring("")) catch 0
+        bind.write(be16(0)) catch 0
+        bind.write(be16(params.len())) catch 0
+        for param in params:
+            value := bytes.from_string_utf8(param)
+            bind.write(be32(bytes.len(value))) catch 0
+            bind.write(value) catch 0
+        bind.write(be16(0)) catch 0
+        self.send(66, bind.bytes()) catch 0
+        bind.free()
+
+        describe := bytes.buffer()
+        describe.write_byte(80) catch 0
+        describe.write(cstring("")) catch 0
+        self.send(68, describe.bytes()) catch 0
+        describe.free()
+
+        execute := bytes.buffer()
+        execute.write(cstring("")) catch 0
+        execute.write(be32(0)) catch 0
+        self.send(69, execute.bytes()) catch 0
+        execute.free()
+
+        self.send(83, bytes.empty()) catch 0
+
+# run a query through the simple query protocol and collect its rows.
+pub fn query(conn: Conn, text: String) -> Rows!:
+    conn.send(81, cstring(text))!
+    result := read_response(conn)!
+    return Rows(rows: result.rows, pos: 0)
+
+# run a parameterized query. `$1`, `$2`, ... bind to `params` (in text form),
+# which keeps values off the sql string.
+pub fn query_params(conn: Conn, text: String, params: List[String]) -> Rows!:
+    conn.send_extended(text, params)
+    result := read_response(conn)!
+    return Rows(rows: result.rows, pos: 0)
+
+# run a statement for its effect (insert/update/delete/ddl), returning the
+# number of rows it affected.
+pub fn exec(conn: Conn, text: String) -> Int!:
+    conn.send(81, cstring(text))!
+    result := read_response(conn)!
+    return result.affected
+
+# like exec, but with `$1`, `$2`, ... bound to `params`.
+pub fn exec_params(conn: Conn, text: String, params: List[String]) -> Int!:
+    conn.send_extended(text, params)
+    result := read_response(conn)!
+    return result.affected
 
 # decode a text-format value by its column type oid.
 fn decode_value(raw: String, oid: Int) -> sql.Value:
@@ -316,3 +415,10 @@ test "value decode honors column type oids":
 test "error text extracts the message field":
     payload := bytes.concat(bytes.from_string_utf8("SERROR"), bytes.concat(bytes.from_string_utf8(chr(0)), bytes.concat(bytes.from_string_utf8("Mrole does not exist"), bytes.from_string_utf8(chr(0)))))
     assert_eq(error_text(payload), "role does not exist")
+
+test "command tag affected-row count is the last token":
+    update := bytes.concat(bytes.from_string_utf8("UPDATE 5"), bytes.from_string_utf8(chr(0)))
+    insert := bytes.concat(bytes.from_string_utf8("INSERT 0 3"), bytes.from_string_utf8(chr(0)))
+    assert_eq(command_affected(update), 5)
+    assert_eq(command_affected(insert), 3)
+    assert_eq(read_be(be16(258), 0, 2), 258)

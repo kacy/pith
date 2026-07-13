@@ -1,0 +1,30 @@
+# std.iter — the iterator protocol, lazily
+#
+# Range is an iterator value: a for-loop drives it via the next() protocol,
+# and to_list drains it into a List. map_iter and filter_iter are lazy
+# adapters, so a chain is walked once with a single allocation at to_list.
+
+from std.iter import Range, to_list, map_iter, filter_iter
+
+fn main():
+    # a for-loop drives a Range directly, no list in between
+    mut sum := 0
+    for x in Range(1, 6):
+        sum = sum + x
+    print("sum 1..6: {sum}")
+
+    # to_list drains an iterator into a List
+    xs := to_list(Range(0, 5))
+    print("range as list: len {xs.len()}")
+    mut vals := ""
+    for x in xs:
+        vals = vals + x.to_string() + " "
+    print("values: {vals}")
+
+    # lazy fused chain: map then filter, walked once, one allocation at to_list
+    result := to_list(filter_iter(map_iter(Range(0, 6), fn(x: Int) => x * x), fn(x: Int) => x % 2 == 0))
+    print("even squares of 0..6: len {result.len()}")
+    mut rs := ""
+    for x in result:
+        rs = rs + x.to_string() + " "
+    print("even squares: {rs}")

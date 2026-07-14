@@ -6,9 +6,10 @@
 a small language that compiles to native code and is written in
 itself. python-shaped syntax, result types instead of exceptions,
 reference counting instead of a garbage collector. the compiler is
-about 23,000 lines of pith; the standard library is another 26,000,
+about 23,000 lines of pith; the standard library is another 28,000,
 and it goes deeper than you'd guess — the TLS 1.3 client, the regex
-engine, and gzip compression are all pith source you can read.
+engine, the postgres and mysql wire protocols, and gzip compression
+are all pith source you can read.
 
 ```pith
 enum Shape:
@@ -137,13 +138,15 @@ with idioms is [docs/idiomatic_pith.md](docs/idiomatic_pith.md).
 
 ## the standard library, briefly
 
-62 modules, ~26,000 lines, all pith. the areas: io and filesystems
+66 modules, ~28,000 lines, all pith. the areas: io and filesystems
 (fs, glob, path, process), networking (tcp, dns, url, http,
-websocket, tls, sse), data (json, toml, csv, config, table),
-bytes and crypto (hash, checksum, encoding, crypto, bits, binary),
-compression and archives (gzip/zlib, tar, zip), text (regex, scanner,
-fmt), app plumbing (log, metrics, cli, testing, diagnostic, time,
-datetime, rand, uuid, math), and lazy iterators (std.iter).
+websocket, tls, sse), databases (sql, postgres, mysql, redis — pure-pith
+wire protocols with tls, prepared statements, and pooling), data (json,
+toml, csv, config, table), bytes and crypto (hash, checksum, encoding,
+crypto, bits, binary), compression and archives (gzip/zlib, tar, zip),
+text (regex, scanner, fmt), app plumbing (log, metrics, cli, testing,
+diagnostic, time, datetime, rand, uuid, math), and lazy iterators
+(std.iter).
 
 ## proof it's usable
 
@@ -186,7 +189,7 @@ from greeter import greet
 make build            # native backend
 make self-host        # the compiler, compiled by itself
 make test             # the full suite
-make run-examples     # 89 example programs against snapshots
+make run-examples     # 92 example programs against snapshots
 make status-audit     # current corpus and size numbers
 ```
 
@@ -197,8 +200,8 @@ self-host/     the compiler, in pith (~23,000 lines): lexer, parser,
                checker, formatter, linter, docgen, ir emitter
 cranelift/     the native backend, in rust (~12,500 lines): ir
                consumer, codegen, runtime (arc, collections, net)
-std/           the standard library (62 modules)
-examples/      89 runnable programs with expected output
+std/           the standard library (66 modules)
+examples/      92 runnable programs with expected output
 tests/         regression, invalid-program, and golden fixtures
 tools/         the four real programs
 docs/          architecture, ownership, errors, grammar, limitations

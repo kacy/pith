@@ -5465,6 +5465,11 @@ fn ir_emit_test_func(idx: Int, ordinal: Int):
     ir_finish_func_emission(body_idx)
     ir_emitting_test_func = false
 
+# the generated test main is a pure dispatcher: for each test it forks, runs the
+# test in the child, and records the outcome in the parent. isolating each test
+# in its own process means a failing assert (which exits) or a crash ends only
+# that test — the rest still run and every result is reported. the parent never
+# runs a test body, so no test's state leaks into the next child.
 fn ir_emit_test_main(root_idx: Int):
     tests := ir_collect_test_decls(root_idx)
     if tests.len() == 0:
@@ -5472,11 +5477,37 @@ fn ir_emit_test_main(root_idx: Int):
     ir_prepare_func_emission("int")
     ir_emit_func_header("main", 0, "int")
 
-    for _test_idx, i in tests:
-        test_r := ir_reg()
-        ir_emit_call0(test_r, "__test_" + i.to_string(), "int")
+    for test_idx, i in tests:
+        name_r := ir_reg()
+        ir_emit("strref " + name_r.to_string() + " " + ir_str(get_node(test_idx).value))
 
-    ir_emit_default_return()
+        pid_r := ir_reg()
+        ir_emit_call0(pid_r, "pith_test_fork", "int")
+        parent_l := ir_label()
+        child_l := ir_label()
+        ir_emit("brif " + pid_r.to_string() + " " + parent_l + " " + child_l)
+
+        # child: run the one test, then exit cleanly (a failed assert exits first)
+        ir_emit_label(child_l)
+        ir_emit_call0(ir_reg(), "__test_" + i.to_string(), "int")
+        ir_emit_call0(ir_reg(), "pith_test_child_ok", "int")
+        term_r := ir_reg()
+        ir_emit("iconst " + term_r.to_string() + " 0")
+        ir_emit("ret " + term_r.to_string())
+
+        # parent: wait for the child and record pass/fail
+        ir_emit_label(parent_l)
+        ir_emit_call2(ir_reg(), "pith_test_record", "int", name_r, pid_r)
+
+    # exit with the failure count so `pith test` fails the process on any failure,
+    # regardless of how the entry wrapper treats main's return value.
+    summary_r := ir_reg()
+    ir_emit_call0(summary_r, "pith_test_summary", "int")
+    ir_emit_call1(ir_reg(), "exit", "unknown", summary_r)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("ret " + zero_r.to_string())
+    ir_emit("endfunc")
 
 # --- emit function ---
 fn ir_func(idx: Int):
@@ -6067,6 +6098,12 @@ pub fn emit_ir(root_idx: Int) -> String:
     ir_collect_strings(root_idx)
     ir_collect_struct_field_strings(root_idx)
     ir_preseed_result_error_strings()
+    # test names live on the test_decl node, not in a string literal the collector
+    # would see, so intern them here — before the table is emitted — for the test
+    # main's per-test report line.
+    if ir_emit_tests:
+        for test_idx in ir_collect_test_decls(root_idx):
+            _name_id := ir_str(get_node(test_idx).value)
     ir_emit_string_table()
 
     # collect aliases first so both type and callable metadata can resolve

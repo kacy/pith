@@ -29,6 +29,8 @@ pub fn register_builtin_types(scope_id: Int):
     void_to_int := create_function_type([], TID_INT)
     define_builtin_function("time", void_to_int)
     define_builtin_function("random_float", create_function_type([], TID_FLOAT))
+    define_builtin_function("float_from_bits", create_function_type([TID_INT], TID_FLOAT))
+    define_builtin_function("float_to_bits", create_function_type([TID_FLOAT], TID_INT))
     define_builtin_function("input", create_function_type([], TID_STRING))
     define_builtin_function("args", create_function_type([], list_string))
 
@@ -205,6 +207,8 @@ pub fn register_builtin_types(scope_id: Int):
 
     fix_builtin_binding("time", [], tid_int)
     fix_builtin_binding("random_float", [], tid_float)
+    fix_builtin_binding("float_from_bits", [tid_int], tid_float)
+    fix_builtin_binding("float_to_bits", [tid_float], tid_int)
     fix_builtin_binding("input", [], tid_string)
     fix_builtin_binding("args", [], list_string)
     fix_builtin_binding("assert", [tid_bool], tid_void)

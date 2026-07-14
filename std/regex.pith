@@ -471,3 +471,82 @@ impl Regex:
             out = out + input.substring(last, m.start) + replacement
             last = m.stop
         return out + input.substring(last, input.len())
+
+test "zero-width patterns match the empty string":
+    assert(compile("a*")!.is_match(""))
+    assert(compile("^$")!.is_match(""))
+    assert(compile("")!.is_match("anything"))
+
+test "greedy quantifier takes the longest run and reports its span":
+    m := compile("a+")!.find("baaad")
+    assert(m != none)
+    assert_eq(m.value().text, "aaa")
+    assert_eq(m.value().start, 1)
+    assert_eq(m.value().stop, 4)
+
+test "optional and star quantifiers":
+    assert(compile("ab?c")!.is_match("ac"))
+    assert(not compile("ab?c")!.is_match("abbc"))
+    assert(compile("ab*c")!.is_match("ac"))
+    assert(compile("ab*c")!.is_match("abbbc"))
+
+test "shorthand classes and their negations":
+    assert(compile("\\d+")!.is_match("x9"))
+    assert(not compile("\\D+")!.is_match("123"))
+    assert(compile("\\w+")!.is_match("a_1"))
+    assert(compile("\\S+")!.is_match("  x"))
+
+test "character classes, ranges, and negation":
+    assert(compile("[a-z]+")!.is_match("HI there"))
+    assert(not compile("[^a-z]+")!.is_match("abc"))
+    assert(compile("[.+*]")!.is_match("a+b"))
+    assert(compile("[a-]")!.is_match("-"))
+
+test "anchored alternation with groups":
+    re := compile("^(cat|dog)$")!
+    assert(re.is_match("cat"))
+    assert(re.is_match("dog"))
+    assert(not re.is_match("cats"))
+
+test "escaped metacharacters match literally":
+    re := compile("a\\.c")!
+    assert(re.is_match("a.c"))
+    assert(not re.is_match("abc"))
+
+test "dot does not match a newline":
+    assert(not compile("a.b")!.is_match("a\nb"))
+
+test "captures return the full match then each group":
+    c := compile("(\\w+)@(\\w+)")!.captures("to kacy@example now")
+    assert(c != none)
+    assert_eq(c.value(), ["kacy@example", "kacy", "example"])
+
+test "a non-participating group captures the empty string":
+    c := compile("(a)?(b)")!.captures("b")
+    assert(c != none)
+    assert_eq(c.value(), ["b", "", "b"])
+
+test "find and captures return none when nothing matches":
+    re := compile("xyz")!
+    assert(re.find("abc") == none)
+    assert(re.captures("abc") == none)
+
+test "find_all returns non-overlapping matches with spans":
+    ms := compile("[0-9]+")!.find_all("a12b345c")
+    assert_eq(ms.len(), 2)
+    assert_eq(ms[0].text, "12")
+    assert_eq(ms[0].start, 1)
+    assert_eq(ms[1].text, "345")
+
+test "find_all terminates on a nullable pattern":
+    ms := compile("a*")!.find_all("aaa")
+    assert(ms.len() >= 1)
+
+test "replace_all handles every match, no match, and vowels":
+    assert_eq(compile("[0-9]")!.replace_all("a1b2c3", "#"), "a#b#c#")
+    assert_eq(compile("x")!.replace_all("abc", "_"), "abc")
+    assert_eq(compile("[aeiou]+")!.replace_all("the quick", "_"), "th_ q_ck")
+
+test "compile rejects unclosed constructs":
+    assert(compile("(abc").is_err)
+    assert(compile("[a-z").is_err)

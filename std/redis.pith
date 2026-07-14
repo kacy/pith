@@ -30,6 +30,12 @@ fn reply_text(r: Reply) -> String:
         Reply.Nil => ""
         Reply.Array(_) => ""
 
+# true when the reply is a server error (RESP `-ERR ...`).
+fn reply_is_error(r: Reply) -> Bool:
+    return match r:
+        Reply.Error(_) => true
+        _ => false
+
 # a connection to a redis server. `buf` holds bytes read past the current reply.
 pub struct Client:
     fd: Int
@@ -97,13 +103,18 @@ impl Client:
             return Reply.Array(items)
         fail "redis: unexpected reply: {line}"
 
-    # send a command as a RESP array of bulk strings, then read one reply.
+    # send a command as a RESP array of bulk strings, then read one reply. a
+    # server error reply (RESP `-ERR ...`) surfaces as a failed result rather
+    # than a value, so callers do not silently read a default past an error.
     pub fn command(args: List[String]) -> Reply!:
         mut out := "*{args.len()}\r\n"
         for a in args:
             out = out + "${a.len()}\r\n{a}\r\n"
         tcp_write(self.fd, out)!
-        return self.read_reply()!
+        reply := self.read_reply()!
+        if reply_is_error(reply):
+            fail "redis: {reply_text(reply)}"
+        return reply
 
     # send a command expecting an array reply, returning its elements as
     # strings (empty when the reply is nil or not an array).

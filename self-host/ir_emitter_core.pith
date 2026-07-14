@@ -4632,8 +4632,11 @@ fn ir_emit_for_loop_value_binding(value_name: String, index_name: String, item_k
     elem_r := ir_reg()
     item_ret_kind := ir_for_loop_item_return_kind(item_kind)
     ir_emit_call2(elem_r, ir_for_loop_item_call_name(item_kind), item_ret_kind, it_r, idx_r)
-    if item_ret_kind != "unknown":
-        ir_var_types.insert(value_name, item_ret_kind)
+    # always register the loop variable as a local, even when its element type
+    # is unknown (as in a generic body where the element is T). otherwise a loop
+    # var whose name matches a module function is mistaken for that function and
+    # loaded as a fn-value. "unknown" carries no rc kind, so this is release-safe.
+    ir_var_types.insert(value_name, item_ret_kind)
     ir_emit("store " + value_name + " " + elem_r.to_string())
     if index_name.len() > 0:
         idx_val := ir_reg()

@@ -43,3 +43,9 @@ test "a prepared statement reports a null column":
     mysql.close_stmt(conn, stmt)!
     conn.close()
     assert(saw_null)
+
+test "a query against a missing table surfaces the server error":
+    conn := open_or_skip()
+    result := mysql.query(conn, "select 1 from no_such_table_pith_xyz")
+    conn.close()
+    assert(result.is_err)

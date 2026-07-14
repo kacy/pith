@@ -41,3 +41,10 @@ test "del removes a key that exists":
     after := client.exists("pith:test:temp")!
     assert(before)
     assert(not after)
+
+test "incr on a non-integer value surfaces an error":
+    client := open_or_skip()
+    client.set("pith:test:notanumber", "abc")!
+    result := client.incr("pith:test:notanumber")
+    client.del("pith:test:notanumber")!
+    assert(result.is_err)

@@ -392,3 +392,50 @@ test "datetime comparison and epoch conversion are stable":
     assert(in_range(date(2026, 3, 5), a, b))
     assert_eq(from_timestamp(0), date(1970, 1, 1))
     assert_eq(to_timestamp(date(1970, 1, 2)), 86400000)
+
+test "leap year follows the full gregorian rule":
+    assert(not is_leap_year(1900))
+    assert(is_leap_year(2000))
+    assert(is_leap_year(2024))
+    assert(not is_leap_year(2023))
+    assert_eq(days_in_month(2024, 2), 29)
+    assert_eq(days_in_month(2023, 2), 28)
+    assert_eq(days_in_year(2024), 366)
+
+test "add_months clamps to the last valid day of the target month":
+    d := add_months(date(2024, 1, 31), 1)
+    assert_eq(month(d), 2)
+    assert_eq(day(d), 29)
+    y := add_months(date(2023, 11, 15), 3)
+    assert_eq(year(y), 2024)
+    assert_eq(month(y), 2)
+
+test "add_years clamps a leap day to february 28":
+    d := add_years(date(2024, 2, 29), 1)
+    assert_eq(year(d), 2025)
+    assert_eq(month(d), 2)
+    assert_eq(day(d), 28)
+
+test "add_days crosses month and year boundaries in both directions":
+    forward := add_days(date(2023, 12, 31), 1)
+    assert_eq(forward, date(2024, 1, 1))
+    back := add_days(date(2024, 3, 1), 0 - 1)
+    assert_eq(month(back), 2)
+    assert_eq(day(back), 29)
+
+test "day_of_year counts the leap day":
+    assert_eq(day_of_year(date(2024, 12, 31)), 366)
+    assert_eq(day_of_year(date(2023, 12, 31)), 365)
+    assert_eq(day_of_year(date(2026, 1, 1)), 1)
+
+test "is_valid rejects impossible dates":
+    assert(is_valid(date(2024, 2, 29)))
+    assert(not is_valid(date(2023, 2, 29)))
+    assert(not is_valid(date(2023, 13, 1)))
+    assert(not is_valid(date(2023, 1, 0)))
+
+test "weekday and diff_days line up with the calendar":
+    assert_eq(weekday_name(date(2026, 7, 7)), "Tuesday")
+    assert_eq(diff_days(date(2024, 2, 1), date(2024, 3, 1)), 29)
+    assert_eq(year(parse_date("2026-07-04")), 2026)
+    assert_eq(day(parse_date("2026-07-04")), 4)

@@ -1,0 +1,24 @@
+# a generic higher-order function whose loop variable shares its name with an
+# in-scope function must load the loop variable, not build a fn-value wrapper
+# for the function. in a generic body the element type is "unknown", so the loop
+# var went untracked and `f(item)` resolved `item` to the function `item()` —
+# emitting a broken fn-value call (0 args where 2 were expected). this is the
+# pattern std.sql.scan uses to map rows into typed values.
+
+fn item(a: Int, b: Int) -> Int:
+    return a + b
+
+fn map_each[T](xs: List[Int], f: fn(Int) -> T) -> List[T]:
+    mut out: List[T] := []
+    for item in xs:
+        out.push(f(item))
+    return out
+
+fn double(n: Int) -> Int:
+    return n + n
+
+fn main() -> Int!:
+    xs := [1, 2, 3]
+    ys := map_each(xs, double)
+    print("{ys[0]} {ys[1]} {ys[2]}")
+    return 0

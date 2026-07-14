@@ -789,6 +789,12 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -ne 0 ] && echo "$$out" | grep -q "c after failure ... ok" && echo "$$out" | grep -q "2 passed, 1 failed"; then pass=$$((pass+1)); echo "ok   test harness runs every test after a failure"; else echo "FAIL test harness record-and-continue"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf 'test "equal lists match":\n    assert_eq([1, 2, 3], [1, 2, 3])\ntest "unequal lists differ":\n    assert_eq([1, 2], [1, 3])\n' > "$$tmpdir/eq.pith"; \
+	set +e; \
+	out=$$(./target/release/pith test "$$tmpdir/eq.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "equal lists match ... ok" && echo "$$out" | grep -q "\[1, 2\] != \[1, 3\]"; then pass=$$((pass+1)); echo "ok   assert_eq compares collections by value"; else echo "FAIL assert_eq value equality"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"

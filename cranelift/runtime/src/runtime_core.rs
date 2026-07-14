@@ -744,6 +744,107 @@ pub extern "C" fn pith_assert_ne(a: i64, b: i64) {
     }
 }
 
+// --- test value equality ----------------------------------------------------
+//
+// assert_eq compares by value. bytes and lists are heap handles, so comparing
+// the raw handles would report two equal-content collections as different; these
+// walk the contents instead. a handle that does not resolve falls back to
+// identity so a malformed value still gives a definite answer.
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_eq_scalar(a: i64, b: i64) -> i64 {
+    let (Some(x), Some(y)) = (
+        crate::collections::list::list_ref_from_handle(a),
+        crate::collections::list::list_ref_from_handle(b),
+    ) else {
+        return (a == b) as i64;
+    };
+    if x.len() != y.len() {
+        return 0;
+    }
+    for i in 0..x.len() {
+        if x.get_value(i) != y.get_value(i) {
+            return 0;
+        }
+    }
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_eq_string(a: i64, b: i64) -> i64 {
+    let (Some(x), Some(y)) = (
+        crate::collections::list::list_ref_from_handle(a),
+        crate::collections::list::list_ref_from_handle(b),
+    ) else {
+        return (a == b) as i64;
+    };
+    if x.len() != y.len() {
+        return 0;
+    }
+    for i in 0..x.len() {
+        let pa = x.get_value(i).unwrap_or(0) as *const i8;
+        let pb = y.get_value(i).unwrap_or(0) as *const i8;
+        if pith_cstring_eq(pa, pb) == 0 {
+            return 0;
+        }
+    }
+    1
+}
+
+unsafe fn bytes_hex(handle: i64) -> String {
+    if let Some(b) = crate::bytes::pith_bytes_ref(handle) {
+        let mut s = String::from("0x");
+        for byte in &b.data {
+            s.push_str(&format!("{:02x}", byte));
+        }
+        s
+    } else {
+        format!("<bytes {}>", handle)
+    }
+}
+
+unsafe fn list_display(handle: i64, string_elems: bool) -> String {
+    let Some(list) = crate::collections::list::list_ref_from_handle(handle) else {
+        return format!("<list {}>", handle);
+    };
+    let mut s = String::from("[");
+    for i in 0..list.len() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        let v = list.get_value(i).unwrap_or(0);
+        if string_elems {
+            s.push_str(&format!("\"{}\"", cstr_to_display(v as *const i8)));
+        } else {
+            s.push_str(&v.to_string());
+        }
+    }
+    s.push(']');
+    s
+}
+
+/// Report an assert_eq failure with both sides decoded per `kind`
+/// (0 int, 1 float, 2 string, 3 bytes, 4 bool, 5 int-list, 6 string-list).
+///
+/// # Safety
+/// `a`/`b` must be valid values of the given `kind` for this call.
+#[no_mangle]
+pub unsafe extern "C" fn pith_assert_eq_fail(a: i64, b: i64, kind: i64) {
+    TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let show = |v: i64| -> String {
+        match kind {
+            1 => f64::from_bits(v as u64).to_string(),
+            2 => format!("\"{}\"", cstr_to_display(v as *const i8)),
+            3 => bytes_hex(v),
+            4 => if v != 0 { "true".to_string() } else { "false".to_string() },
+            5 => list_display(v, false),
+            6 => list_display(v, true),
+            _ => v.to_string(),
+        }
+    };
+    eprintln!("assertion failed: {} != {}", show(a), show(b));
+}
+
 // --- test runner ------------------------------------------------------------
 //
 // each `test "..."` block compiles to a `__test_i` function; the generated main

@@ -800,6 +800,12 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -eq 0 ] && echo "$$out" | grep -q "a first ... ok" && ! echo "$$out" | grep -q "c after failure" && echo "$$out" | grep -q "1 passed, 0 failed, 2 filtered out"; then pass=$$((pass+1)); echo "ok   test --filter runs only matching tests"; else echo "FAIL test --filter"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf 'test "runs":\n    assert(true)\ntest "skips":\n    skip_test("not today")\n    assert(false)\n' > "$$tmpdir/skip.pith"; \
+	set +e; \
+	out=$$(./target/release/pith test "$$tmpdir/skip.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && echo "$$out" | grep -q "skips ... skipped (not today)" && echo "$$out" | grep -q "1 passed, 0 failed, 1 skipped"; then pass=$$((pass+1)); echo "ok   skip_test skips a test without failing the run"; else echo "FAIL skip_test"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"

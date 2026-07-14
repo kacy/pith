@@ -857,6 +857,41 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static TEST_PASS: AtomicUsize = AtomicUsize::new(0);
 static TEST_FAIL: AtomicUsize = AtomicUsize::new(0);
 static TEST_FILTERED: AtomicUsize = AtomicUsize::new(0);
+static TEST_SKIPPED: AtomicUsize = AtomicUsize::new(0);
+
+// the name of the test running in the current child, so skip_test can print a
+// full result line. set once at the top of each child.
+static CURRENT_TEST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+// a child that skipped exits with this code; the parent tells it apart from a
+// pass (0) or a failure (anything else).
+const TEST_SKIP_CODE: i32 = 42;
+
+/// Record the name of the test about to run in this child.
+///
+/// # Safety
+/// `name` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn pith_test_enter(name: *const i8) -> i64 {
+    if let Ok(mut current) = CURRENT_TEST.lock() {
+        *current = cstr_to_display(name);
+    }
+    0
+}
+
+/// Skip the current test with a reason: print the result line and exit the child
+/// with the skip code, which the parent tallies as skipped rather than run.
+///
+/// # Safety
+/// `reason` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn pith_test_skip(reason: *const i8) -> i64 {
+    use std::io::Write;
+    let name = CURRENT_TEST.lock().map(|n| n.clone()).unwrap_or_default();
+    println!("  {} ... skipped ({})", name, cstr_to_display(reason));
+    let _ = std::io::stdout().flush();
+    std::process::exit(TEST_SKIP_CODE);
+}
 
 /// Whether a test should run under the current `PITH_TEST_FILTER`. With no
 /// filter every test runs; otherwise only names containing the substring do,
@@ -909,7 +944,11 @@ pub unsafe extern "C" fn pith_test_record(name: *const i8, pid: i64) -> i64 {
     let mut status: i32 = 0;
     libc::waitpid(pid as i32, &mut status, 0);
     let name_str = cstr_to_display(name);
-    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == TEST_SKIP_CODE {
+        // the child already printed its own "... skipped (reason)" line
+        TEST_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        0
+    } else if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
         TEST_PASS.fetch_add(1, Ordering::Relaxed);
         println!("  {} ... ok", name_str);
         0
@@ -931,12 +970,16 @@ pub extern "C" fn pith_test_summary() -> i64 {
     let passed = TEST_PASS.load(Ordering::Relaxed);
     let failed = TEST_FAIL.load(Ordering::Relaxed);
     let filtered = TEST_FILTERED.load(Ordering::Relaxed);
+    let skipped = TEST_SKIPPED.load(Ordering::Relaxed);
     println!();
-    if filtered > 0 {
-        println!("{} passed, {} failed, {} filtered out", passed, failed, filtered);
-    } else {
-        println!("{} passed, {} failed", passed, failed);
+    let mut line = format!("{} passed, {} failed", passed, failed);
+    if skipped > 0 {
+        line.push_str(&format!(", {} skipped", skipped));
     }
+    if filtered > 0 {
+        line.push_str(&format!(", {} filtered out", filtered));
+    }
+    println!("{}", line);
     if failed > 0 {
         1
     } else {

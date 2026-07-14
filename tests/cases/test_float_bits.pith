@@ -1,0 +1,31 @@
+# float_from_bits / float_to_bits reinterpret the raw ieee754 bits rather than
+# converting the value, so a float survives a trip through an integer and back.
+# this is what binary wire formats (the mysql binary protocol, for one) need to
+# reassemble a double from its eight bytes.
+
+fn main() -> Int!:
+    # 3.14 is 0x40091EB851EB851F.
+    bits := float_to_bits(3.14)
+    print("bits={bits}")
+    print("round={float_from_bits(bits)}")
+
+    # reassemble a double from little-endian bytes, then read it as a float.
+    bytes := [31, 133, 235, 81, 184, 30, 9, 64]
+    mut acc := 0
+    mut shift := 0
+    for b in bytes:
+        acc = acc + b * pow_int(2, shift)
+        shift = shift + 8
+    print("reassembled={float_from_bits(acc)}")
+
+    # the reinterpreted value is a real float you can compute with.
+    print("plus_one={float_from_bits(bits) + 1.0}")
+    return 0
+
+fn pow_int(base: Int, exp: Int) -> Int:
+    mut out := 1
+    mut i := 0
+    while i < exp:
+        out = out * base
+        i = i + 1
+    return out

@@ -1129,6 +1129,19 @@ pub extern "C" fn pith_float_to_int(n: f64) -> i64 {
     n as i64
 }
 
+// Reinterpret the raw bits, not the numeric value: the bit pattern of a float
+// read as an integer and vice versa. `to_float`/`to_int` above convert values
+// (5 -> 5.0); these preserve bits, which is what binary wire formats need.
+#[no_mangle]
+pub extern "C" fn pith_float_from_bits(bits: i64) -> f64 {
+    f64::from_bits(bits as u64)
+}
+
+#[no_mangle]
+pub extern "C" fn pith_float_to_bits(value: f64) -> i64 {
+    value.to_bits() as i64
+}
+
 #[no_mangle]
 pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
     b

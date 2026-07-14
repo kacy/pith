@@ -16,6 +16,8 @@ import std.bytes as bytes
 import std.bits as bits
 import std.hash as hash
 import std.encoding as encoding
+import std.net.tls as tls
+from std.io import TcpStream
 from std.iter import Iterator
 
 # --- byte helpers (mysql is little-endian) ---
@@ -104,11 +106,21 @@ pub struct Conn:
     fd: Int
     mut buf: Bytes
     mut pos: Int
+    mut secure: Bool
+    mut tls_handle: Int
+    mut last_seq: Int
 
 impl Conn:
+    # read one chunk from the transport: the tls session when secure, the plain
+    # socket otherwise.
+    fn recv_chunk() -> Bytes!:
+        if self.secure:
+            return tls.conn_from_handle(self.tls_handle).read_bytes(4096)!
+        return tcp_read_bytes(self.fd, 4096)!
+
     fn recv_exact(n: Int) -> Bytes!:
         while bytes.len(self.buf) - self.pos < n:
-            chunk := tcp_read_bytes(self.fd, 4096)!
+            chunk := self.recv_chunk()!
             if bytes.len(chunk) == 0:
                 fail "mysql: connection closed"
             self.buf = bytes.concat(bytes.slice(self.buf, self.pos, bytes.len(self.buf)), chunk)
@@ -118,25 +130,42 @@ impl Conn:
         return out
 
     # read one packet, returning its payload. the 3-byte little-endian length
-    # and 1-byte sequence id are consumed; the sequence id is returned to the
-    # caller so replies can echo the next one.
+    # and 1-byte sequence id are consumed; the sequence id is stashed in
+    # last_seq so an auth reply can echo the next one.
     fn read_packet() -> Bytes!:
         head := self.recv_exact(4)!
         length := bytes.get(head, 0) + bytes.get(head, 1) * 256 + bytes.get(head, 2) * 65536
+        self.last_seq = bytes.get(head, 3)
         return self.recv_exact(length)!
+
+    # write raw bytes to the transport: the tls session when secure, the plain
+    # socket otherwise.
+    fn send_raw(data: Bytes) -> Int!:
+        if self.secure:
+            return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
+        return tcp_write_bytes(self.fd, data)!
 
     fn send_packet(seq: Int, payload: Bytes) -> Int!:
         out := bytes.buffer()
         out.write(le_int(bytes.len(payload), 3)) catch 0
         out.write_byte(seq) catch 0
         out.write(payload) catch 0
-        n := tcp_write_bytes(self.fd, out.bytes())!
+        n := self.send_raw(out.bytes())!
         out.free()
         return n
 
     # close the connection.
     pub fn close():
+        if self.secure:
+            tls.conn_from_handle(self.tls_handle).close()
         tcp_close(self.fd)
+
+# base capabilities: PROTOCOL_41 | SECURE_CONNECTION | PLUGIN_AUTH |
+# CONNECT_WITH_DB | LONG_PASSWORD. DEPRECATE_EOF is left off so the server frames
+# result sets with EOF packets.
+CAPS_BASE := 557577
+# CLIENT_SSL, added to request a tls upgrade before the handshake response.
+CAP_SSL := 2048
 
 # the mysql_native_password scramble:
 #   SHA1(password) XOR SHA1(salt + SHA1(SHA1(password)))
@@ -146,6 +175,23 @@ fn native_scramble(password: String, salt: Bytes) -> Bytes:
     seeded := hash.sha1_bytes(bytes.concat(salt, double))
     return xor_bytes(sha_pw, seeded)
 
+# the caching_sha2_password fast-auth scramble:
+#   SHA256(password) XOR SHA256(SHA256(SHA256(password)) + salt)
+fn caching_sha2_scramble(password: String, salt: Bytes) -> Bytes:
+    sha_pw := hash.sha256_bytes(bytes.from_string_utf8(password))
+    double := hash.sha256_bytes(sha_pw)
+    seeded := hash.sha256_bytes(bytes.concat(double, salt))
+    return xor_bytes(sha_pw, seeded)
+
+# the scramble for a given auth plugin. an empty password always scrambles to
+# nothing.
+fn scramble_for(plugin: String, password: String, salt: Bytes) -> Bytes:
+    if password.len() == 0:
+        return bytes.empty()
+    if plugin == "caching_sha2_password":
+        return caching_sha2_scramble(password, salt)
+    return native_scramble(password, salt)
+
 # read the error message from an ERR packet payload (after the 0xff marker):
 # 2-byte code, a 6-byte sql-state marker, then the message.
 fn err_text(payload: Bytes) -> String:
@@ -153,23 +199,50 @@ fn err_text(payload: Bytes) -> String:
         return "unknown error"
     return bytes.to_string_utf8(bytes.slice(payload, 9, bytes.len(payload))) catch "error"
 
-# open a connection and complete the handshake and native-password auth.
+# open a connection and complete the handshake and authentication.
 pub fn connect(host: String, port: Int, user: String, password: String, database: String) -> Conn!:
     fd := tcp_connect(host, port)!
-    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0)
-    conn.handshake(user, password, database)!
+    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: false, tls_handle: 0, last_seq: 0)
+    greeting := conn.read_packet()!
+    conn.authenticate(greeting, user, password, database, 1)!
+    return conn
+
+# like connect, but upgrade the socket to tls before sending credentials. the
+# server must advertise ssl support; the mysql SSLRequest is an abbreviated
+# handshake response carrying only the capability flags with CLIENT_SSL set.
+pub fn connect_tls(host: String, port: Int, user: String, password: String, database: String, server_name: String, config: tls.Config) -> Conn!:
+    fd := tcp_connect(host, port)!
+    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: false, tls_handle: 0, last_seq: 0)
+    greeting := conn.read_packet()!
+
+    ssl := bytes.buffer()
+    ssl.write(le_int(CAPS_BASE + CAP_SSL, 4)) catch 0
+    ssl.write(le_int(16777216, 4)) catch 0
+    ssl.write_byte(45) catch 0
+    mut z := 0
+    while z < 23:
+        ssl.write_byte(0) catch 0
+        z = z + 1
+    conn.send_packet(1, ssl.bytes())!
+    ssl.free()
+
+    session := tls.client(TcpStream(fd), server_name, config)!
+    conn.secure = true
+    conn.tls_handle = session.handle
+    conn.authenticate(greeting, user, password, database, 2)!
     return conn
 
 impl Conn:
-    fn handshake(user: String, password: String, database: String) -> Bool!:
-        greeting := self.read_packet()!
+    # send the handshake response for `plugin` and run the auth exchange to
+    # completion. `response_seq` is 1 for a plain connection and 2 after a tls
+    # upgrade (the SSLRequest took sequence 1).
+    fn authenticate(greeting: Bytes, user: String, password: String, database: String, response_seq: Int) -> Bool!:
         salt := parse_salt(greeting)!
-
-        # capabilities: PROTOCOL_41 | SECURE_CONNECTION | PLUGIN_AUTH |
-        # CONNECT_WITH_DB | LONG_PASSWORD. DEPRECATE_EOF is left off so the
-        # server frames result sets with EOF packets.
-        caps := 557577
-        scramble := native_scramble(password, salt)
+        plugin := parse_auth_plugin(greeting)!
+        mut caps := CAPS_BASE
+        if self.secure:
+            caps = caps + CAP_SSL
+        scramble := scramble_for(plugin, password, salt)
 
         out := bytes.buffer()
         out.write(le_int(caps, 4)) catch 0
@@ -183,17 +256,42 @@ impl Conn:
         out.write_byte(bytes.len(scramble)) catch 0
         out.write(scramble) catch 0
         out.write(cstring_bytes(database)) catch 0
-        out.write(cstring_bytes("mysql_native_password")) catch 0
-        self.send_packet(1, out.bytes())!
+        out.write(cstring_bytes(plugin)) catch 0
+        self.send_packet(response_seq, out.bytes())!
         out.free()
+        return self.finish_auth(password)
 
-        reply := self.read_packet()!
-        marker := bytes.get(reply, 0)
-        if marker == 255:
-            fail "mysql: {err_text(reply)}"
-        if marker == 254:
-            fail "mysql: server requested an unsupported auth switch"
-        return true
+    # drive the post-response auth exchange: an OK ends it, an auth-switch
+    # re-scrambles for the requested plugin, and caching_sha2 AuthMoreData either
+    # signals a cache hit or asks for the password (sent in the clear, which is
+    # why full auth is only allowed over tls).
+    fn finish_auth(password: String) -> Bool!:
+        while true:
+            reply := self.read_packet()!
+            marker := bytes.get(reply, 0)
+            if marker == 0:
+                return true
+            if marker == 255:
+                fail "mysql: {err_text(reply)}"
+            if marker == 254:
+                r := Reader(data: reply, pos: 1)
+                switch_plugin := r.cstring()!
+                mut switch_salt := bytes.slice(reply, r.pos, bytes.len(reply))
+                if switch_salt.len() > 20:
+                    switch_salt = bytes.slice(switch_salt, 0, 20)
+                self.send_packet(self.last_seq + 1, scramble_for(switch_plugin, password, switch_salt))!
+            elif marker == 1:
+                sub := bytes.get(reply, 1)
+                if sub == 3:
+                    continue
+                elif sub == 4:
+                    if not self.secure:
+                        fail "mysql: caching_sha2_password full auth needs tls"
+                    self.send_packet(self.last_seq + 1, cstring_bytes(password))!
+                else:
+                    fail "mysql: unexpected auth data {sub}"
+            else:
+                fail "mysql: unexpected auth reply {marker}"
 
 # a string plus a null terminator.
 fn cstring_bytes(text: String) -> Bytes:
@@ -222,6 +320,27 @@ fn parse_salt(greeting: Bytes) -> Bytes!:
     r.skip(10)
     salt2 := bytes.slice(greeting, r.pos, r.pos + 12)
     return bytes.concat(salt1, salt2)
+
+# the auth plugin name the server advertises: it follows the second salt part
+# (12 bytes plus a null terminator). a server that omits it defaults to
+# mysql_native_password.
+fn parse_auth_plugin(greeting: Bytes) -> String!:
+    r := Reader(data: greeting, pos: 0)
+    r.skip(1)
+    r.cstring()!
+    r.skip(4)
+    r.skip(8)
+    r.skip(1)
+    r.skip(2)
+    r.skip(1)
+    r.skip(2)
+    r.skip(2)
+    r.skip(1)
+    r.skip(10)
+    r.skip(13)
+    if r.pos >= bytes.len(greeting):
+        return "mysql_native_password"
+    return r.cstring()!
 
 # --- queries ---
 
@@ -568,6 +687,15 @@ test "mysql_native_password scramble matches a known vector":
     salt := encoding.from_hex("000102030405060708090a0b0c0d0e0f10111213")!
     scramble := native_scramble("secret", salt)
     assert_eq(encoding.to_hex(scramble), "21b3ff405f32cbe4aafff291396046ea29fa3a4d")
+
+test "caching_sha2_password scramble matches a known vector":
+    # cross-checked against a reference sha-256 implementation, since the
+    # available server offers only mysql_native_password.
+    salt := encoding.from_hex("000102030405060708090a0b0c0d0e0f10111213")!
+    scramble := caching_sha2_scramble("secret", salt)
+    assert_eq(encoding.to_hex(scramble), "6c84c617ec1f26456a02c42ed7cb02eca7d8511333f98bc9b31e5f68ce1665d5")
+    # an empty password scrambles to nothing regardless of plugin
+    assert_eq(scramble_for("caching_sha2_password", "", salt).len(), 0)
 
 test "little-endian integers round-trip":
     four := Reader(data: le_int(305419896, 4), pos: 0)

@@ -1037,6 +1037,14 @@ pub fn client(stream: TcpStream, server_name: String, config: Config) -> Conn!:
         return native_client_handshake(stream, server_name, config)
     fail "native tls client config required"
 
+# rebuild a Conn from a handle taken from `conn.handle`. all connection state
+# lives in handle-keyed tables, so a Conn is just its handle — this lets a
+# caller stash the handle as a plain Int (for example in a driver's connection
+# struct) and recover a usable Conn later, sidestepping storing the struct in an
+# optional field.
+pub fn conn_from_handle(handle: Int) -> Conn:
+    return Conn(handle)
+
 # listen for tls connections.
 pub fn listen(host: String, port: Int, config: Config) -> Listener!:
     if is_native_server_config(config):

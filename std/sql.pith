@@ -101,3 +101,40 @@ impl Row:
 # interface would not also be an Iterator — the convention is simpler and
 # works.) drivers add `columns()` and `close()` as plain methods on their
 # concrete rows type.
+
+# --- typed scanning ---
+
+# map every row through `f`, collecting the results into a typed list. pair it
+# with `std.iter.to_list(rows)` to scan a driver's result set into your own type:
+#   users := sql.scan(to_list(rows), fn(r: sql.Row) => User(id: r.as_int(0)))
+pub fn scan[T](rows: List[Row], f: fn(Row) -> T) -> List[T]:
+    mut out: List[T] := []
+    for row in rows:
+        out.push(f(row))
+    return out
+
+# map the first row through `f`, or none when there are no rows.
+pub fn scan_one[T](rows: List[Row], f: fn(Row) -> T) -> T?:
+    if rows.len() == 0:
+        return none
+    return f(rows[0])
+
+test "scan maps rows into typed values":
+    rows := [row([integer(1), text("ada")], ["id", "name"]), row([integer(2), text("grace")], ["id", "name"])]
+    ids := scan(rows, fn(r: Row) => r.as_int(0))
+    names := scan(rows, fn(r: Row) => r.as_text(1))
+
+    assert_eq(ids.len(), 2)
+    assert_eq(ids[0], 1)
+    assert_eq(ids[1], 2)
+    assert_eq(names[0], "ada")
+    assert_eq(names[1], "grace")
+
+test "scan_one maps the first row or none":
+    rows := [row([integer(7)], ["n"])]
+    top := scan_one(rows, fn(r: Row) => r.as_int(0))
+    empty := scan_one([], fn(r: Row) => r.as_int(0))
+
+    assert(top != none)
+    assert_eq(top.value(), 7)
+    assert(empty == none)

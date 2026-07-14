@@ -317,20 +317,24 @@ fn read_response(conn: Conn) -> QueryResult!:
             continue
 
 impl Conn:
-    # Parse/Bind/Describe/Execute/Sync for one parameterized statement. `$1`,
-    # `$2`, ... bind to `params` in order, sent in text form (unnamed statement
-    # and portal, so nothing is left prepared on the server).
-    fn send_extended(text: String, params: List[String]):
+    # Parse a statement under `name` (empty for the unnamed statement). the query
+    # text carries `$1`, `$2`, ... placeholders; no parameter types are declared,
+    # so the server infers them.
+    fn send_parse(name: String, text: String):
         parse := bytes.buffer()
-        parse.write(cstring("")) catch 0
+        parse.write(cstring(name)) catch 0
         parse.write(cstring(text)) catch 0
         parse.write(be16(0)) catch 0
         self.send(80, parse.bytes()) catch 0
         parse.free()
 
+    # Bind `params` (in text form) to the statement `stmt_name` through the
+    # unnamed portal, then Describe/Execute/Sync it. shared by the one-shot and
+    # prepared paths.
+    fn send_bind_execute(stmt_name: String, params: List[String]):
         bind := bytes.buffer()
         bind.write(cstring("")) catch 0
-        bind.write(cstring("")) catch 0
+        bind.write(cstring(stmt_name)) catch 0
         bind.write(be16(0)) catch 0
         bind.write(be16(params.len())) catch 0
         for param in params:
@@ -355,6 +359,12 @@ impl Conn:
 
         self.send(83, bytes.empty()) catch 0
 
+    # Parse/Bind/Describe/Execute/Sync for one parameterized statement using the
+    # unnamed statement and portal, so nothing is left prepared on the server.
+    fn send_extended(text: String, params: List[String]):
+        self.send_parse("", text)
+        self.send_bind_execute("", params)
+
 # run a query through the simple query protocol and collect its rows.
 pub fn query(conn: Conn, text: String) -> Rows!:
     conn.send(81, cstring(text))!
@@ -378,6 +388,31 @@ pub fn exec(conn: Conn, text: String) -> Int!:
 # like exec, but with `$1`, `$2`, ... bound to `params`.
 pub fn exec_params(conn: Conn, text: String, params: List[String]) -> Int!:
     conn.send_extended(text, params)
+    result := read_response(conn)!
+    return result.affected
+
+# --- prepared statements ---
+
+# parse a statement once under `name` so it can run many times without
+# re-parsing. run it with query_prepared / exec_prepared, passing the same name.
+# names live for the session; re-preparing an existing name is an error on the
+# server, so pick a fresh one per distinct query.
+pub fn prepare(conn: Conn, name: String, text: String) -> Int!:
+    conn.send_parse(name, text)
+    conn.send(83, bytes.empty())!
+    read_response(conn)!
+    return 0
+
+# run a prepared statement, binding `params`, and collect its rows.
+pub fn query_prepared(conn: Conn, name: String, params: List[String]) -> Rows!:
+    conn.send_bind_execute(name, params)
+    result := read_response(conn)!
+    return Rows(rows: result.rows, pos: 0)
+
+# run a prepared statement for its effect, returning the number of rows it
+# affected.
+pub fn exec_prepared(conn: Conn, name: String, params: List[String]) -> Int!:
+    conn.send_bind_execute(name, params)
     result := read_response(conn)!
     return result.affected
 

@@ -1,0 +1,12 @@
+# constructing an imported enum's variant by its qualified name
+# (mod.Enum.Variant(...)) must resolve the boxed-enum layout through the import
+# alias, like the local Enum.Variant(...) form. before the fix this crashed the
+# backend with "field instructions must include an explicit offset".
+import std.sql as sql
+
+fn main() -> Int!:
+    v := sql.Value.Integer(7)
+    t := sql.Value.Text("hi")
+    r := sql.row([v, t], ["n", "s"])
+    print("{r.as_int(0)} {r.as_text(1)}")
+    return 0

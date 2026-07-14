@@ -3361,6 +3361,16 @@ fn ir_emit_method_call(idx: Int) -> Int:
             ctor_key := ctor_recv.value + "." + mname
             if ir_struct_field_index_lookup.contains_key(ctor_key):
                 return ir_emit_variant_construction(node, ctor_recv.value, ctor_key)
+        # a module-qualified variant, `mod.Enum.Variant(...)`: the receiver is a
+        # field access `mod.Enum` where mod is an import alias and Enum is a
+        # boxed enum (registered by its base name across modules). resolve it the
+        # same as the local `Enum.Variant(...)` form.
+        if ctor_recv.kind == "field_access" and ctor_recv.children.len() > 0:
+            qual_mod := get_node(ctor_recv.children[0])
+            if qual_mod.kind == "ident" and ir_module_aliases.contains_key(qual_mod.value) and ir_boxed_enums.contains_key(ctor_recv.value):
+                qual_key := ctor_recv.value + "." + mname
+                if ir_struct_field_index_lookup.contains_key(qual_key):
+                    return ir_emit_variant_construction(node, ctor_recv.value, qual_key)
 
     if node.children.len() > 0:
         recv_tid := c_get_expr_type(node.children[0])

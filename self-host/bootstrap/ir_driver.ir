@@ -19209,6 +19209,17 @@ ret 8
 iconst 9 0
 ret 9
 endfunc
+func types_set_type_info 2 void
+param tid
+param info
+load 2 types_tt_types
+load 3 tid
+load 4 info
+call 5 pith_struct_retain void 1 4
+call 6 pith_list_set_value void 3 2 3 4
+iconst 7 0
+ret 7
+endfunc
 func types_register_type_name 2 void
 param name
 param tid
@@ -30327,339 +30338,378 @@ store name 2
 iconst 3 0
 store base_name 3
 iconst 4 0
-store field_names 4
+store empty_names 4
 iconst 5 0
-store field_types 5
+store empty_ints 5
 iconst 6 0
-store field_pub 6
+store empty_bools 6
 iconst 7 0
-store field_mut 7
+store field_names 7
 iconst 8 0
-store cn 8
+store field_types 8
 iconst 9 0
-store fname 9
-load 10 name
-load 11 node
-load 12 node
-field 13 12 8 string value
-call 14 pith_cstring_retain void 1 13
-call 15 pith_cstring_release void 1 10
-store name 13
-load 16 node
-call 17 checker_declaration_has_generic_params bool 1 16
-brif 17 L331 L332
+store field_pub 9
+iconst 10 0
+store field_mut 10
+iconst 11 0
+store cn 11
+iconst 12 0
+store fname 12
+load 13 name
+load 14 node
+load 15 node
+field 16 15 8 string value
+call 17 pith_cstring_retain void 1 16
+call 18 pith_cstring_release void 1 13
+store name 16
+load 19 node
+call 20 checker_declaration_has_generic_params bool 1 19
+brif 20 L331 L332
 label L331
-load 18 name
-load 19 node_idx
-call 20 checker_register_generic_declaration void 2 18 19
-load 21 checker_current_scope
-load 22 name
-load 23 types_TID_ERR
-iconst 24 0
-call 25 scope_define_binding void 4 21 22 23 24
-load 26 name
-call 27 pith_cstring_release void 1 26
-load 28 base_name
-call 29 pith_cstring_release void 1 28
-load 30 field_names
-call 31 pith_list_release_handle void 1 30
-load 32 field_types
-call 33 pith_list_release_handle void 1 32
-load 34 field_pub
-call 35 pith_list_release_handle void 1 34
-load 36 field_mut
-call 37 pith_list_release_handle void 1 36
-load 38 cn
-call 39 pith_struct_release void 1 38
-load 40 fname
-call 41 pith_cstring_release void 1 40
-iconst 42 0
-ret 42
+load 21 name
+load 22 node_idx
+call 23 checker_register_generic_declaration void 2 21 22
+load 24 checker_current_scope
+load 25 name
+load 26 types_TID_ERR
+iconst 27 0
+call 28 scope_define_binding void 4 24 25 26 27
+load 29 name
+call 30 pith_cstring_release void 1 29
+load 31 base_name
+call 32 pith_cstring_release void 1 31
+load 33 empty_names
+call 34 pith_list_release_handle void 1 33
+load 35 empty_ints
+call 36 pith_list_release_handle void 1 35
+load 37 empty_bools
+call 38 pith_list_release_handle void 1 37
+load 39 field_names
+call 40 pith_list_release_handle void 1 39
+load 41 field_types
+call 42 pith_list_release_handle void 1 41
+load 43 field_pub
+call 44 pith_list_release_handle void 1 43
+load 45 field_mut
+call 46 pith_list_release_handle void 1 45
+load 47 cn
+call 48 pith_struct_release void 1 47
+load 49 fname
+call 50 pith_cstring_release void 1 49
+iconst 51 0
+ret 51
 label L332
 label L330
-load 43 base_name
-load 44 name
-call 45 pith_cstring_retain void 1 44
-call 46 pith_cstring_release void 1 43
-store base_name 44
-load 47 field_names
-call 48 pith_list_new_cstr list_string 0
-call 49 pith_list_release_handle void 1 47
-store field_names 48
-load 50 field_types
-call 51 pith_list_new_default list 0
-call 52 pith_list_release_handle void 1 50
-store field_types 51
-load 53 field_pub
-call 54 pith_list_new_default list 0
-call 55 pith_list_release_handle void 1 53
-store field_pub 54
-load 56 field_mut
-call 57 pith_list_new_default list 0
+load 52 base_name
+load 53 name
+call 54 pith_cstring_retain void 1 53
+call 55 pith_cstring_release void 1 52
+store base_name 53
+load 56 empty_names
+call 57 pith_list_new_cstr list_string 0
 call 58 pith_list_release_handle void 1 56
-store field_mut 57
-load 59 node
-load 60 node
-field 61 60 16 list children
-call 62 pith_auto_len int 1 61
-iconst 63 0
-store __for_idx_78 63
-store __for_len_78 62
-store __for_iter_78 61
+store empty_names 57
+load 59 empty_ints
+call 60 pith_list_new_default list 0
+call 61 pith_list_release_handle void 1 59
+store empty_ints 60
+load 62 empty_bools
+call 63 pith_list_new_default list 0
+call 64 pith_list_release_handle void 1 62
+store empty_bools 63
+load 65 base_name
+load 66 empty_names
+load 67 empty_ints
+load 68 empty_bools
+load 69 empty_bools
+call 70 types_ti_struct struct:TypeInfo 5 65 66 67 68 69
+call 71 types_add_type_info int 1 70
+call 72 pith_struct_release void 1 70
+store tid 71
+load 73 base_name
+load 74 tid
+call 75 types_register_type_name void 2 73 74
+load 76 checker_current_scope
+load 77 base_name
+load 78 tid
+iconst 79 0
+call 80 scope_define_binding void 4 76 77 78 79
+load 81 field_names
+call 82 pith_list_new_cstr list_string 0
+call 83 pith_list_release_handle void 1 81
+store field_names 82
+load 84 field_types
+call 85 pith_list_new_default list 0
+call 86 pith_list_release_handle void 1 84
+store field_types 85
+load 87 field_pub
+call 88 pith_list_new_default list 0
+call 89 pith_list_release_handle void 1 87
+store field_pub 88
+load 90 field_mut
+call 91 pith_list_new_default list 0
+call 92 pith_list_release_handle void 1 90
+store field_mut 91
+load 93 node
+load 94 node
+field 95 94 16 list children
+call 96 pith_auto_len int 1 95
+iconst 97 0
+store __for_idx_78 97
+store __for_len_78 96
+store __for_iter_78 95
 label L333
-load 64 __for_idx_78
-load 65 __for_len_78
-lt 66 64 65
-brif 66 L334 L336
+load 98 __for_idx_78
+load 99 __for_len_78
+lt 100 98 99
+brif 100 L334 L336
 label L334
-load 67 __for_iter_78
-load 68 __for_idx_78
-call 69 pith_list_get_value unknown 2 67 68
-store child 69
-load 70 cn
-load 71 child
-call 72 ast_get_node struct:Node 1 71
-call 73 pith_struct_release void 1 70
-store cn 72
-load 74 cn
-load 75 cn
-field 76 75 0 string kind
-strref 77 m13s281
-call 78 pith_cstring_eq bool 2 76 77
-call 79 pith_cstring_release void 1 77
-brif 78 L338 L339
-label L338
-load 80 fname
-load 81 cn
-load 82 cn
-field 83 82 8 string value
-call 84 checker_extract_field_name string 1 83
-call 85 pith_cstring_release void 1 80
-store fname 84
-load 86 cn
-load 87 cn
-field 88 87 8 string value
-strref 89 m13s280
-call 90 pith_cstring_contains bool 2 88 89
-call 91 pith_cstring_release void 1 89
-store is_pub 90
-load 92 cn
-load 93 cn
-field 94 93 8 string value
-strref 95 m13s279
-call 96 pith_cstring_contains bool 2 94 95
-call 97 pith_cstring_release void 1 95
-store is_mut 96
-load 98 field_names
-load 99 fname
-call 100 pith_list_push_value void 2 98 99
-load 101 cn
-load 102 cn
-field 103 102 16 list children
-call 104 pith_list_len int 1 103
-iconst 105 0
-gt 106 104 105
-brif 106 L341 L342
-label L341
-load 107 cn
+load 101 __for_iter_78
+load 102 __for_idx_78
+call 103 pith_list_get_value unknown 2 101 102
+store child 103
+load 104 cn
+load 105 child
+call 106 ast_get_node struct:Node 1 105
+call 107 pith_struct_release void 1 104
+store cn 106
 load 108 cn
-field 109 108 16 list children
-iconst 110 0
-call 111 pith_list_get_value_strict int 2 109 110
-call 112 checker_resolve_type_implementation int 1 111
-store ftid 112
-load 113 field_types
-load 114 ftid
-call 115 pith_list_push_value void 2 113 114
+load 109 cn
+field 110 109 0 string kind
+strref 111 m13s281
+call 112 pith_cstring_eq bool 2 110 111
+call 113 pith_cstring_release void 1 111
+brif 112 L338 L339
+label L338
+load 114 fname
+load 115 cn
 load 116 cn
-load 117 cn
-field 118 117 16 list children
-call 119 pith_list_len int 1 118
-iconst 120 1
-gt 121 119 120
-brif 121 L344 L345
+field 117 116 8 string value
+call 118 checker_extract_field_name string 1 117
+call 119 pith_cstring_release void 1 114
+store fname 118
+load 120 cn
+load 121 cn
+field 122 121 8 string value
+strref 123 m13s280
+call 124 pith_cstring_contains bool 2 122 123
+call 125 pith_cstring_release void 1 123
+store is_pub 124
+load 126 cn
+load 127 cn
+field 128 127 8 string value
+strref 129 m13s279
+call 130 pith_cstring_contains bool 2 128 129
+call 131 pith_cstring_release void 1 129
+store is_mut 130
+load 132 field_names
+load 133 fname
+call 134 pith_list_push_value void 2 132 133
+load 135 cn
+load 136 cn
+field 137 136 16 list children
+call 138 pith_list_len int 1 137
+iconst 139 0
+gt 140 138 139
+brif 140 L341 L342
+label L341
+load 141 cn
+load 142 cn
+field 143 142 16 list children
+iconst 144 0
+call 145 pith_list_get_value_strict int 2 143 144
+call 146 checker_resolve_type_implementation int 1 145
+store ftid 146
+load 147 field_types
+load 148 ftid
+call 149 pith_list_push_value void 2 147 148
+load 150 cn
+load 151 cn
+field 152 151 16 list children
+call 153 pith_list_len int 1 152
+iconst 154 1
+gt 155 153 154
+brif 155 L344 L345
 label L344
-load 122 cn
-load 123 cn
-field 124 123 16 list children
-iconst 125 1
-call 126 pith_list_get_value_strict int 2 124 125
-load 127 checker_current_scope
-call 128 checker_c_check_expr int 2 126 127
-store default_tid 128
-load 129 cn
-load 130 cn
-field 131 130 16 list children
-iconst 132 1
-call 133 pith_list_get_value_strict int 2 131 132
-load 134 default_tid
-load 135 ftid
-call 136 checker_value_matches_optional_target bool 3 133 134 135
-brif 136 L347 L348
+load 156 cn
+load 157 cn
+field 158 157 16 list children
+iconst 159 1
+call 160 pith_list_get_value_strict int 2 158 159
+load 161 checker_current_scope
+call 162 checker_c_check_expr int 2 160 161
+store default_tid 162
+load 163 cn
+load 164 cn
+field 165 164 16 list children
+iconst 166 1
+call 167 pith_list_get_value_strict int 2 165 166
+load 168 default_tid
+load 169 ftid
+call 170 checker_value_matches_optional_target bool 3 167 168 169
+brif 170 L347 L348
 label L347
-load 137 checker_struct_field_default_nodes
-load 138 base_name
-strref 139 m13s123
-concat 140 138 139
-call 141 pith_cstring_release void 1 139
-load 142 fname
-concat 143 140 142
-call 144 pith_cstring_release void 1 140
-load 145 cn
-load 146 cn
-field 147 146 16 list children
-iconst 148 1
-call 149 pith_list_get_value_strict int 2 147 148
-call 150 map_insert void 3 137 143 149
-call 151 pith_cstring_release void 1 143
+load 171 checker_struct_field_default_nodes
+load 172 base_name
+strref 173 m13s123
+concat 174 172 173
+call 175 pith_cstring_release void 1 173
+load 176 fname
+concat 177 174 176
+call 178 pith_cstring_release void 1 174
+load 179 cn
+load 180 cn
+field 181 180 16 list children
+iconst 182 1
+call 183 pith_list_get_value_strict int 2 181 182
+call 184 map_insert void 3 171 177 183
+call 185 pith_cstring_release void 1 177
 jmp L346
 label L348
-iconst 152 0
-store __and_152_351 152
-load 153 default_tid
-call 154 types_is_error_type bool 1 153
-iconst 155 0
-eq 156 154 155
-store __and_152_351 156
-brif 156 L351 L352
+iconst 186 0
+store __and_186_351 186
+load 187 default_tid
+call 188 types_is_error_type bool 1 187
+iconst 189 0
+eq 190 188 189
+store __and_186_351 190
+brif 190 L351 L352
 label L351
-load 157 default_tid
-load 158 ftid
-neq 159 157 158
-store __and_152_351 159
+load 191 default_tid
+load 192 ftid
+neq 193 191 192
+store __and_186_351 193
 label L352
-load 160 __and_152_351
-brif 160 L349 L350
+load 194 __and_186_351
+brif 194 L349 L350
 label L349
-load 161 default_tid
-load 162 ftid
-call 163 checker_types_structurally_equal bool 2 161 162
-iconst 164 0
-eq 165 163 164
-brif 165 L354 L355
+load 195 default_tid
+load 196 ftid
+call 197 checker_types_structurally_equal bool 2 195 196
+iconst 198 0
+eq 199 197 198
+brif 199 L354 L355
 label L354
-strref 166 m13s300
-strref 167 m13s788
-load 168 fname
-concat 169 167 168
-call 170 pith_cstring_release void 1 167
-strref 171 m13s787
-concat 172 169 171
-call 173 pith_cstring_release void 1 169
-call 174 pith_cstring_release void 1 171
-load 175 ftid
-call 176 types_get_type_name string 1 175
-concat 177 172 176
-call 178 pith_cstring_release void 1 172
-call 179 pith_cstring_release void 1 176
-strref 180 m13s297
-concat 181 177 180
-call 182 pith_cstring_release void 1 177
-call 183 pith_cstring_release void 1 180
-load 184 default_tid
-call 185 types_get_type_name string 1 184
-concat 186 181 185
-call 187 pith_cstring_release void 1 181
-call 188 pith_cstring_release void 1 185
-call 189 checker_diagnostics_report_error void 2 166 186
-call 190 pith_cstring_release void 1 166
-call 191 pith_cstring_release void 1 186
+strref 200 m13s300
+strref 201 m13s788
+load 202 fname
+concat 203 201 202
+call 204 pith_cstring_release void 1 201
+strref 205 m13s787
+concat 206 203 205
+call 207 pith_cstring_release void 1 203
+call 208 pith_cstring_release void 1 205
+load 209 ftid
+call 210 types_get_type_name string 1 209
+concat 211 206 210
+call 212 pith_cstring_release void 1 206
+call 213 pith_cstring_release void 1 210
+strref 214 m13s297
+concat 215 211 214
+call 216 pith_cstring_release void 1 211
+call 217 pith_cstring_release void 1 214
+load 218 default_tid
+call 219 types_get_type_name string 1 218
+concat 220 215 219
+call 221 pith_cstring_release void 1 215
+call 222 pith_cstring_release void 1 219
+call 223 checker_diagnostics_report_error void 2 200 220
+call 224 pith_cstring_release void 1 200
+call 225 pith_cstring_release void 1 220
 jmp L353
 label L355
-load 192 checker_struct_field_default_nodes
-load 193 base_name
-strref 194 m13s123
-concat 195 193 194
-call 196 pith_cstring_release void 1 194
-load 197 fname
-concat 198 195 197
-call 199 pith_cstring_release void 1 195
-load 200 cn
-load 201 cn
-field 202 201 16 list children
-iconst 203 1
-call 204 pith_list_get_value_strict int 2 202 203
-call 205 map_insert void 3 192 198 204
-call 206 pith_cstring_release void 1 198
+load 226 checker_struct_field_default_nodes
+load 227 base_name
+strref 228 m13s123
+concat 229 227 228
+call 230 pith_cstring_release void 1 228
+load 231 fname
+concat 232 229 231
+call 233 pith_cstring_release void 1 229
+load 234 cn
+load 235 cn
+field 236 235 16 list children
+iconst 237 1
+call 238 pith_list_get_value_strict int 2 236 237
+call 239 map_insert void 3 226 232 238
+call 240 pith_cstring_release void 1 232
 label L353
 jmp L346
 label L350
-load 207 checker_struct_field_default_nodes
-load 208 base_name
-strref 209 m13s123
-concat 210 208 209
-call 211 pith_cstring_release void 1 209
-load 212 fname
-concat 213 210 212
-call 214 pith_cstring_release void 1 210
-load 215 cn
-load 216 cn
-field 217 216 16 list children
-iconst 218 1
-call 219 pith_list_get_value_strict int 2 217 218
-call 220 map_insert void 3 207 213 219
-call 221 pith_cstring_release void 1 213
+load 241 checker_struct_field_default_nodes
+load 242 base_name
+strref 243 m13s123
+concat 244 242 243
+call 245 pith_cstring_release void 1 243
+load 246 fname
+concat 247 244 246
+call 248 pith_cstring_release void 1 244
+load 249 cn
+load 250 cn
+field 251 250 16 list children
+iconst 252 1
+call 253 pith_list_get_value_strict int 2 251 252
+call 254 map_insert void 3 241 247 253
+call 255 pith_cstring_release void 1 247
 label L346
 jmp L343
 label L345
 label L343
 jmp L340
 label L342
-load 222 field_types
-load 223 types_TID_ERR
-call 224 pith_list_push_value void 2 222 223
+load 256 field_types
+load 257 types_TID_ERR
+call 258 pith_list_push_value void 2 256 257
 label L340
-load 225 field_pub
-load 226 is_pub
-call 227 pith_list_push_value void 2 225 226
-load 228 field_mut
-load 229 is_mut
-call 230 pith_list_push_value void 2 228 229
+load 259 field_pub
+load 260 is_pub
+call 261 pith_list_push_value void 2 259 260
+load 262 field_mut
+load 263 is_mut
+call 264 pith_list_push_value void 2 262 263
 jmp L337
 label L339
 label L337
 label L335
-load 231 __for_idx_78
-iconst 232 1
-add 233 231 232
-store __for_idx_78 233
+load 265 __for_idx_78
+iconst 266 1
+add 267 265 266
+store __for_idx_78 267
 jmp L333
 label L336
-load 234 base_name
-load 235 field_names
-load 236 field_types
-load 237 field_pub
-load 238 field_mut
-call 239 types_ti_struct struct:TypeInfo 5 234 235 236 237 238
-call 240 types_add_type_info int 1 239
-call 241 pith_struct_release void 1 239
-store tid 240
-load 242 base_name
-load 243 tid
-call 244 types_register_type_name void 2 242 243
-load 245 checker_current_scope
-load 246 base_name
-load 247 tid
-iconst 248 0
-call 249 scope_define_binding void 4 245 246 247 248
-load 250 name
-call 251 pith_cstring_release void 1 250
-load 252 base_name
-call 253 pith_cstring_release void 1 252
-load 254 field_names
-call 255 pith_list_release_handle void 1 254
-load 256 field_types
-call 257 pith_list_release_handle void 1 256
-load 258 field_pub
-call 259 pith_list_release_handle void 1 258
-load 260 field_mut
-call 261 pith_list_release_handle void 1 260
-load 262 cn
-call 263 pith_struct_release void 1 262
-load 264 fname
-call 265 pith_cstring_release void 1 264
-iconst 266 0
-ret 266
+load 268 tid
+load 269 base_name
+load 270 field_names
+load 271 field_types
+load 272 field_pub
+load 273 field_mut
+call 274 types_ti_struct struct:TypeInfo 5 269 270 271 272 273
+call 275 types_set_type_info void 2 268 274
+call 276 pith_struct_release void 1 274
+load 277 name
+call 278 pith_cstring_release void 1 277
+load 279 base_name
+call 280 pith_cstring_release void 1 279
+load 281 empty_names
+call 282 pith_list_release_handle void 1 281
+load 283 empty_ints
+call 284 pith_list_release_handle void 1 283
+load 285 empty_bools
+call 286 pith_list_release_handle void 1 285
+load 287 field_names
+call 288 pith_list_release_handle void 1 287
+load 289 field_types
+call 290 pith_list_release_handle void 1 289
+load 291 field_pub
+call 292 pith_list_release_handle void 1 291
+load 293 field_mut
+call 294 pith_list_release_handle void 1 293
+load 295 cn
+call 296 pith_struct_release void 1 295
+load 297 fname
+call 298 pith_cstring_release void 1 297
+iconst 299 0
+ret 299
 endfunc
 func checker_register_enum_declaration 2 void
 param node_idx

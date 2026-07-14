@@ -1,0 +1,38 @@
+# a struct may now reference its own type in a field, so linked lists and
+# trees can be written directly instead of through integer handles.
+
+struct Node:
+    value: Int
+    next: Node?
+
+fn sum(head: Node) -> Int:
+    mut total := head.value
+    mut cur := head.next
+    while cur != none:
+        n := cur.value()
+        total = total + n.value
+        cur = n.next
+    return total
+
+struct Tree:
+    label: String
+    left: Tree?
+    right: Tree?
+
+fn count(t: Tree) -> Int:
+    mut n := 1
+    if t.left != none:
+        n = n + count(t.left.value())
+    if t.right != none:
+        n = n + count(t.right.value())
+    return n
+
+fn main() -> Int!:
+    a := Node(value: 1, next: none)
+    b := Node(value: 2, next: a)
+    c := Node(value: 3, next: b)
+    print("list sum: {sum(c)}")
+
+    root := Tree(label: "root", left: Tree(label: "l", left: none, right: none), right: Tree(label: "r", left: none, right: none))
+    print("tree nodes: {count(root)}")
+    return 0

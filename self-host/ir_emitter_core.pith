@@ -5539,8 +5539,10 @@ fn ir_emit_test_main(root_idx: Int):
         child_l := ir_label()
         ir_emit("brif " + pid_r.to_string() + " " + parent_l + " " + child_l)
 
-        # child: run the one test, then exit cleanly (a failed assert exits first)
+        # child: remember the test name (so skip_test can name it), run the one
+        # test, then exit cleanly (a failed assert or skip exits first)
         ir_emit_label(child_l)
+        ir_emit_call1(ir_reg(), "pith_test_enter", "int", name_r)
         ir_emit_call0(ir_reg(), "__test_" + i.to_string(), "int")
         ir_emit_call0(ir_reg(), "pith_test_child_ok", "int")
         term_r := ir_reg()

@@ -52,6 +52,27 @@ maps, sets, and structs still compare by identity — `assert_eq` on those check
 whether they are the same value, not whether their contents match. compare their
 fields or elements directly when you need a deep check.
 
+## skipping a test
+
+`skip_test(reason)` marks the current test skipped and stops it right there.
+nothing after the call runs, the runner counts it as skipped rather than passed
+or failed, and a skipped test never fails the run. it is the way to fold a test
+that needs something it might not have — a database, a network peer — into the
+same file as everything else:
+
+```pith
+test "reads rows from the live database":
+    if not database_reachable():
+        skip_test("no database reachable")
+    ...
+```
+
+```
+  reads rows from the live database ... skipped (no database reachable)
+
+0 passed, 0 failed, 1 skipped
+```
+
 ## running a subset
 
 pass `--filter` to run only the tests whose name contains a substring:

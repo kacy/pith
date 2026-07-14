@@ -67,6 +67,21 @@ fn run_cli() {
                 eprintln!("Error: test requires a file argument");
                 std::process::exit(1);
             }
+            // `--filter <substr>` (or `--filter=<substr>`) runs only the tests
+            // whose name contains the substring. it reaches the test binary
+            // through the environment, which the subprocess inherits.
+            let mut i = 3;
+            while i < args.len() {
+                if args[i] == "--filter" && i + 1 < args.len() {
+                    env::set_var("PITH_TEST_FILTER", &args[i + 1]);
+                    i += 2;
+                } else if let Some(f) = args[i].strip_prefix("--filter=") {
+                    env::set_var("PITH_TEST_FILTER", f);
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
             test_file(&args[2]);
         }
         "check" => {
@@ -115,7 +130,7 @@ fn print_usage() {
     println!("  build <file.pith>    Compile .pith file to native binary");
     println!("  build-ir <file.ir> <out>  Compile combined IR text to a native binary");
     println!("  run <file.pith>      Compile and run immediately");
-    println!("  test <file.pith>     Compile and run tests");
+    println!("  test <file.pith> [--filter <substr>]  Compile and run tests");
     println!("  check <file.pith>    Type-check without generating code");
     println!("  fmt [args...]      Format source files");
     println!("  lint [args...]     Lint source files");

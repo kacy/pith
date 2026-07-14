@@ -92,4 +92,6 @@ coupling every caller to compiler internals.
 - `with_temp_dir(prefix, run)` for scoped filesystem tests
 
 prefer these in examples and small helper programs when they make the test
-intent clearer than hand-written checks.
+intent clearer than hand-written checks. note that a failing `std.testing` check
+only tallies — it does not fail a colocated `test` block, which uses the built-in
+`assert` / `assert_eq`. see [testing.md](testing.md) for the full picture.

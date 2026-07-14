@@ -53,7 +53,7 @@ make bootstrap
 - use `std.collections` helpers like `map_list`, `filter_list`, `fold_list`, and `count_by` for straightforward list transforms
 - use `std.io.string_buffer()` for incremental text assembly in loops or builders
 - avoid long chains of `"..." + value.to_string()` in user-facing examples unless interpolation would be awkward
-- prefer `std.testing.assert_eq(...)` / `assert_ne(...)` for straightforward test comparisons
+- inside a `test` block use the built-in `assert(...)` / `assert_eq(...)`; a failing `std.testing` check only tallies and will not fail the test (see [docs/testing.md](testing.md))
 - prefer `std.os.process.command(...)` for child processes; use `std.io` when you specifically need lower-level stream types
 - remember that collections are shared handles; reach for `std.collections.copy_list(...)`, `copy_map(...)`, or `copy_set(...)` when an example wants an independent top-level container
 - prefer typed results like `T!E` when callers need to inspect the error payload; keep bare `T!` for simpler string-error paths

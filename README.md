@@ -160,7 +160,7 @@ non-trivial pith look like."
 ```
 pith run <file>          compile and run
 pith build <file>        compile to a native binary
-pith test <file>         run test declarations
+pith test <file>         run test declarations (--filter <substr> to select)
 pith check <file>        type check (--json for machine output)
 pith fmt <file>          format (--check to verify)
 pith lint <file>         conventions (--json available)
@@ -205,8 +205,9 @@ docs/          architecture, ownership, errors, grammar, limitations
 ```
 
 start with [docs/architecture.md](docs/architecture.md) if you want
-to change the compiler, and [docs/contributing.md](docs/contributing.md)
-for the development loop.
+to change the compiler, [docs/contributing.md](docs/contributing.md)
+for the development loop, and [docs/testing.md](docs/testing.md) for how
+tests are written and run.
 
 ## syntax highlighting on github
 

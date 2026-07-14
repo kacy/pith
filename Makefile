@@ -795,6 +795,11 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -ne 0 ] && echo "$$out" | grep -q "equal lists match ... ok" && echo "$$out" | grep -q "\[1, 2\] != \[1, 3\]"; then pass=$$((pass+1)); echo "ok   assert_eq compares collections by value"; else echo "FAIL assert_eq value equality"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith test "$$tmpdir/harness.pith" --filter "first" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && echo "$$out" | grep -q "a first ... ok" && ! echo "$$out" | grep -q "c after failure" && echo "$$out" | grep -q "1 passed, 0 failed, 2 filtered out"; then pass=$$((pass+1)); echo "ok   test --filter runs only matching tests"; else echo "FAIL test --filter"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"

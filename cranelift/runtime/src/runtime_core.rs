@@ -856,6 +856,27 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static TEST_PASS: AtomicUsize = AtomicUsize::new(0);
 static TEST_FAIL: AtomicUsize = AtomicUsize::new(0);
+static TEST_FILTERED: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a test should run under the current `PITH_TEST_FILTER`. With no
+/// filter every test runs; otherwise only names containing the substring do,
+/// and the rest are tallied as filtered out.
+///
+/// # Safety
+/// `name` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn pith_test_should_run(name: *const i8) -> i64 {
+    let filter = match std::env::var("PITH_TEST_FILTER") {
+        Ok(f) if !f.is_empty() => f,
+        _ => return 1,
+    };
+    if cstr_to_display(name).contains(&filter) {
+        1
+    } else {
+        TEST_FILTERED.fetch_add(1, Ordering::Relaxed);
+        0
+    }
+}
 
 /// Flush pending output and fork. Returns the child pid to the parent and 0 to
 /// the child, matching the C fork contract. Flushing first keeps the child from
@@ -909,8 +930,13 @@ pub unsafe extern "C" fn pith_test_record(name: *const i8, pid: i64) -> i64 {
 pub extern "C" fn pith_test_summary() -> i64 {
     let passed = TEST_PASS.load(Ordering::Relaxed);
     let failed = TEST_FAIL.load(Ordering::Relaxed);
+    let filtered = TEST_FILTERED.load(Ordering::Relaxed);
     println!();
-    println!("{} passed, {} failed", passed, failed);
+    if filtered > 0 {
+        println!("{} passed, {} failed, {} filtered out", passed, failed, filtered);
+    } else {
+        println!("{} passed, {} failed", passed, failed);
+    }
     if failed > 0 {
         1
     } else {

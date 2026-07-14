@@ -125,7 +125,10 @@ other kinds of test, all wired through the `Makefile`:
   that must fail to compile, guarding error messages and negative cases. run with
   `make check-invalid`.
 - **live servers** — integration tests under `tests/live/` that need a real
-  server (a database, a tls peer) and are run on demand.
+  server and are run on demand. the database ones (`db_postgres_live`,
+  `db_mysql_live`, `db_redis_live`) are `test` blocks that `skip_test` when their
+  server is not reachable, so `make db-live-tests` stays green with or without a
+  running server and verifies the drivers where one exists.
 - **leak checks** — `make memcheck` runs a curated set under valgrind, so an arc
   regression that double-frees or leaks is caught before it lands.
 

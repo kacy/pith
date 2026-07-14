@@ -1,0 +1,53 @@
+# live integration tests for std.postgres. they need a postgres server on
+# 127.0.0.1:5432 with the pithtest fixtures; when none is reachable each test
+# skips rather than fails, so `pith test` stays green on a machine without one.
+#
+# run with: pith test tests/live/db_postgres_live.pith
+
+import std.postgres as postgres
+import std.sql as sql
+
+fn open_or_skip() -> postgres.Conn:
+    attempt := postgres.connect("127.0.0.1", 5432, "pith", "pith_pw", "pithtest")
+    if attempt.is_err:
+        skip_test("no postgres server at 127.0.0.1:5432")
+    return attempt.ok
+
+test "a simple query returns the seeded rows":
+    conn := open_or_skip()
+    mut ids: List[Int] := []
+    for row in postgres.query(conn, "select id, name from users order by id")!:
+        ids.push(row.as_int(0))
+    conn.close()
+    assert(ids.len() >= 3)
+    assert_eq(ids[0], 1)
+
+test "a parameterized query binds its argument":
+    conn := open_or_skip()
+    mut names: List[String] := []
+    for row in postgres.query_params(conn, "select name from users where id = $1", ["2"])!:
+        names.push(row.as_text(0))
+    conn.close()
+    assert_eq(names, ["grace"])
+
+test "a prepared statement runs more than once":
+    conn := open_or_skip()
+    postgres.prepare(conn, "by_id", "select id from users where id = $1")!
+    mut first: List[Int] := []
+    for row in postgres.query_prepared(conn, "by_id", ["1"])!:
+        first.push(row.as_int(0))
+    mut second: List[Int] := []
+    for row in postgres.query_prepared(conn, "by_id", ["3"])!:
+        second.push(row.as_int(0))
+    conn.close()
+    assert_eq(first, [1])
+    assert_eq(second, [3])
+
+test "a null column reads back as null":
+    conn := open_or_skip()
+    mut saw_null := false
+    for row in postgres.query(conn, "select id, score from users order by id")!:
+        if row.is_null(1):
+            saw_null = true
+    conn.close()
+    assert(saw_null)

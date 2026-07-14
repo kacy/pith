@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz memcheck test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz memcheck test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -19,6 +19,7 @@ LIVE_EXPECTED := $(wildcard tests/live/expected/*.txt)
 LIVE_CASES := $(basename $(notdir $(LIVE_EXPECTED)))
 LIVE_WEBSOCKET_EXPECTED := $(LIVE_EXPECTED)
 LIVE_WEBSOCKET_CASES := $(LIVE_CASES)
+DB_LIVE_CASES := db_postgres_live db_mysql_live db_redis_live
 PARSE_INVALID_EXAMPLES := $(wildcard tests/invalid_parse/*.pith)
 INVALID_EXAMPLES := $(wildcard tests/invalid/*.pith)
 PARITY_EXAMPLES := \
@@ -347,6 +348,20 @@ test-fast-self: self-host self-host-ir-driver
 	@$(MAKE) --no-print-directory test-std-self-only
 	@$(MAKE) --no-print-directory test-self-host-only
 	@$(MAKE) --no-print-directory run-regressions-self-only
+
+# colocated live database tests, run through the test harness. each test skips
+# when its server is unreachable, so this target stays green with or without a
+# running postgres/mysql/redis — it verifies behavior where the servers exist.
+db-live-tests: build
+	@echo "--- live database tests (test harness) ---"
+	@fail=0; \
+	for name in $(DB_LIVE_CASES); do \
+		if ! ./target/release/pith test "tests/live/$$name.pith"; then \
+			fail=1; \
+		fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then exit 1; fi; \
+	echo "all live database tests passed"
 
 run-live-websocket-tests: build
 	@echo "--- live smoke tests (Cranelift backend) ---"

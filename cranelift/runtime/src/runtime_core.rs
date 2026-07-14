@@ -573,6 +573,67 @@ mod tests {
         }
     }
 
+    unsafe fn struct_counts(ptr: i64) -> (u32, u32) {
+        let base = (ptr as usize - STRUCT_HEADER) as *const u8;
+        (
+            (base.add(STRUCT_OFF_STRONG) as *const u32).read(),
+            (base.add(STRUCT_OFF_WEAK) as *const u32).read(),
+        )
+    }
+
+    #[test]
+    fn struct_without_weak_refs_frees_on_last_strong_release() {
+        unsafe {
+            let s = pith_struct_alloc(2);
+            assert_eq!(struct_counts(s), (1, 1)); // strong 1, implicit weak 1
+            pith_struct_retain(s);
+            assert_eq!(struct_counts(s).0, 2);
+            pith_struct_release(s);
+            assert_eq!(struct_counts(s).0, 1);
+            pith_struct_release(s); // frees; magic scrubbed. no leak, no crash.
+        }
+    }
+
+    #[test]
+    fn weak_ref_keeps_the_header_alive_past_the_strong_release() {
+        unsafe {
+            let s = pith_struct_alloc(1);
+            pith_struct_weak_retain(s);
+            assert_eq!(struct_counts(s), (1, 2)); // implicit + one weak
+
+            // the target is alive: a weak read returns the pointer
+            assert_eq!(pith_struct_weak_load(s), s);
+
+            // drop the only strong owner: value dies, header stays (weak > 0)
+            pith_struct_release(s);
+            assert_eq!(pith_struct_weak_load(s), 0); // dead -> none
+
+            // dropping the last weak frees the header
+            pith_struct_weak_release(s);
+        }
+    }
+
+    #[test]
+    fn weak_load_on_a_dead_or_invalid_pointer_is_none() {
+        unsafe {
+            assert_eq!(pith_struct_weak_load(0), 0);
+            assert_eq!(pith_struct_weak_load(12345), 0);
+            let s = pith_struct_alloc(1);
+            pith_struct_release(s); // fully freed, no weak refs
+            assert_eq!(pith_struct_weak_load(s), 0); // magic scrubbed -> none
+        }
+    }
+
+    #[test]
+    fn weak_ops_on_invalid_pointers_are_no_ops() {
+        unsafe {
+            pith_struct_weak_retain(0);
+            pith_struct_weak_release(0);
+            pith_struct_weak_retain(12345);
+            pith_struct_weak_release(12345);
+        }
+    }
+
     #[test]
     fn invalid_closure_handles_return_safe_defaults() {
         unsafe {
@@ -1401,10 +1462,17 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
         return 0;
     }
 
-    // a 24-byte header precedes the fields so field offsets stay where
-    // the codegen baked them: [magic u32][rc u32][size u64][dtor u64].
-    // dtor is a compiled destructor's address (0 = none); the last
-    // release calls it before freeing.
+    // a 32-byte header precedes the fields so field offsets stay where the
+    // codegen baked them (offsets are relative to the returned pointer, so the
+    // header size is a pure runtime detail):
+    //   [magic u32][strong u32][weak u32][dead u32][size u64][dtor u64]
+    // this follows Rust's Rc/Weak split. `strong` counts owners; `weak` counts
+    // non-owning references plus one implicit unit held collectively by the
+    // strong refs. when strong hits 0 the destructor runs, the value is dead,
+    // and the implicit weak is dropped; the allocation is freed only when weak
+    // also hits 0, so a weak reference can always safely read the header to see
+    // whether the target is still alive. dtor is a compiled destructor's
+    // address (0 = none).
     let layout = pith_layout(size + STRUCT_HEADER, 8);
     let base = alloc_zeroed(layout);
     if base.is_null() {
@@ -1412,13 +1480,44 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
         std::process::exit(1);
     }
     (base as *mut u32).write(STRUCT_MAGIC);
-    (base.add(4) as *mut u32).write(1);
-    (base.add(8) as *mut u64).write(size as u64);
+    (base.add(4) as *mut u32).write(1); // strong
+    (base.add(8) as *mut u32).write(1); // weak: the implicit unit for strong refs
+    (base.add(16) as *mut u64).write(size as u64);
     base.add(STRUCT_HEADER) as i64
 }
 
 pub(crate) const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
-pub(crate) const STRUCT_HEADER: usize = 24;
+pub(crate) const STRUCT_HEADER: usize = 32;
+
+// header field offsets within the base allocation
+const STRUCT_OFF_STRONG: usize = 4;
+const STRUCT_OFF_WEAK: usize = 8;
+const STRUCT_OFF_DEAD: usize = 12;
+const STRUCT_OFF_SIZE: usize = 16;
+const STRUCT_OFF_DTOR: usize = 24;
+
+unsafe fn struct_strong(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
+    &*(base.add(STRUCT_OFF_STRONG) as *const std::sync::atomic::AtomicU32)
+}
+
+unsafe fn struct_weak(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
+    &*(base.add(STRUCT_OFF_WEAK) as *const std::sync::atomic::AtomicU32)
+}
+
+// drop one unit of weak; free the allocation when it reaches zero. this is the
+// single place a struct header is deallocated, so the strong path and every
+// weak reference funnel their final drop through here.
+unsafe fn struct_weak_drop(base: *mut u8) {
+    let weak = struct_weak(base);
+    if weak.fetch_sub(1, std::sync::atomic::Ordering::Release) != 1 {
+        return;
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    let size = (base.add(STRUCT_OFF_SIZE) as *const u64).read() as usize;
+    // scrub the magic so any stale pointer fails the check
+    (base as *mut u32).write(0);
+    std::alloc::dealloc(base, pith_layout(size + STRUCT_HEADER, 8));
+}
 
 /// Build a pith `T?` optional value in the on-heap tuple layout the codegen
 /// expects: field 0 is `is_some` (0 or 1), field 1 is the payload. Used by
@@ -1456,7 +1555,7 @@ unsafe fn struct_base(ptr: i64) -> Option<*mut u8> {
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_set_dtor(ptr: i64, dtor: i64) {
     if let Some(base) = struct_base(ptr) {
-        (base.add(16) as *mut u64).write(dtor as u64);
+        (base.add(STRUCT_OFF_DTOR) as *mut u64).write(dtor as u64);
     }
 }
 
@@ -1467,13 +1566,13 @@ pub unsafe extern "C" fn pith_struct_set_dtor(ptr: i64, dtor: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_retain(ptr: i64) {
     if let Some(base) = struct_base(ptr) {
-        let rc = &*(base.add(4) as *const std::sync::atomic::AtomicU32);
-        rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        struct_strong(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// Drop one owner; the last release runs the destructor (releasing the
-/// struct's rc fields) and frees the allocation.
+/// Drop one owner; the last strong release runs the destructor (releasing the
+/// struct's rc fields), marks the value dead, and drops the implicit weak unit
+/// — which frees the allocation unless a weak reference is still holding it.
 ///
 /// # Safety
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
@@ -1482,27 +1581,68 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
     let Some(base) = struct_base(ptr) else {
         return;
     };
-    let rc = &*(base.add(4) as *const std::sync::atomic::AtomicU32);
-    let prev = rc.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    let strong = struct_strong(base);
+    let prev = strong.fetch_sub(1, std::sync::atomic::Ordering::Release);
     if prev > 1 {
         return;
     }
     if prev == 0 {
         // over-release: restore and leave the object alone
-        rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        strong.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-    let dtor = (base.add(16) as *const u64).read();
+    let dtor = (base.add(STRUCT_OFF_DTOR) as *const u64).read();
     if dtor != 0 {
         let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
         f(ptr);
     }
-    let size = (base.add(8) as *const u64).read() as usize;
     crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
-    // scrub the magic so stale pointers fail the check
-    (base as *mut u32).write(0);
-    std::alloc::dealloc(base, pith_layout(size + STRUCT_HEADER, 8));
+    // the value is now dead; a weak read after this returns none. drop the
+    // implicit weak unit, which frees the header if no weak refs remain.
+    (base.add(STRUCT_OFF_DEAD) as *mut u32).write(1);
+    struct_weak_drop(base);
+}
+
+/// One more weak (non-owning) reference to this struct. Does not affect the
+/// strong count, so it never keeps the value alive — only the header.
+///
+/// # Safety
+/// ptr must be a pith_struct_alloc result or garbage (magic-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_struct_weak_retain(ptr: i64) {
+    if let Some(base) = struct_base(ptr) {
+        struct_weak(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Drop one weak reference; frees the header if this was the last hold on it.
+///
+/// # Safety
+/// ptr must be a pith_struct_alloc result or garbage (magic-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_struct_weak_release(ptr: i64) {
+    if let Some(base) = struct_base(ptr) {
+        struct_weak_drop(base);
+    }
+}
+
+/// Read a weak reference: returns the struct pointer if the target is still
+/// alive, or 0 if it has been released. Never dereferences dead field data —
+/// the header stays valid while any weak reference holds it, and the dead flag
+/// is set the instant the last strong owner goes away.
+///
+/// # Safety
+/// ptr must be a pith_struct_alloc result, 0, or garbage (magic-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_struct_weak_load(ptr: i64) -> i64 {
+    let Some(base) = struct_base(ptr) else {
+        return 0;
+    };
+    if (base.add(STRUCT_OFF_DEAD) as *const u32).read() != 0 {
+        return 0;
+    }
+    ptr
 }
 
 #[no_mangle]

@@ -2135,20 +2135,64 @@ fn ir_emit_test_assert(arg_regs: List[Int]) -> Int:
     ir_emit("iconst " + r.to_string() + " 0")
     return r
 
+# the kind that drives assert_eq's value comparison and its decoded failure
+# message. string wins so a string-vs-int typo still compares as text; otherwise
+# the most specific known collection/scalar kind is used.
+fn ir_assert_eq_kind(left: String, right: String) -> String:
+    if left == "string" or right == "string":
+        return "string"
+    if left == "bytes" or right == "bytes":
+        return "bytes"
+    if left == "list_string" or right == "list_string":
+        return "list_string"
+    if left == "list" or right == "list":
+        return "list"
+    if left == "float" or right == "float":
+        return "float"
+    if left == "bool" or right == "bool":
+        return "bool"
+    return "int"
+
+# the kind code pith_assert_eq_fail uses to decode both sides for the message.
+fn ir_assert_eq_kind_code(kind: String) -> Int:
+    if kind == "float":
+        return 1
+    if kind == "string":
+        return 2
+    if kind == "bytes":
+        return 3
+    if kind == "bool":
+        return 4
+    if kind == "list":
+        return 5
+    if kind == "list_string":
+        return 6
+    return 0
+
 fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int]) -> Int:
     cmp_r := ir_reg()
-    left_type := ir_assert_eq_operand_type(node, 1)
-    right_type := ir_assert_eq_operand_type(node, 2)
-    if left_type == "string" or right_type == "string":
+    kind := ir_assert_eq_kind(ir_assert_eq_operand_type(node, 1), ir_assert_eq_operand_type(node, 2))
+    # compare by value: bytes and lists otherwise compare heap handles, so two
+    # equal-content collections would wrongly differ. maps/sets fall through to
+    # identity for now (assert_eq on them is uncommon).
+    if kind == "string":
         ir_emit_call2(cmp_r, "__str_eq", "bool", arg_regs[0], arg_regs[1])
+    elif kind == "bytes":
+        ir_emit_call2(cmp_r, "bytes_eq", "bool", arg_regs[0], arg_regs[1])
+    elif kind == "list_string":
+        ir_emit_call2(cmp_r, "pith_list_eq_string", "bool", arg_regs[0], arg_regs[1])
+    elif kind == "list":
+        ir_emit_call2(cmp_r, "pith_list_eq_scalar", "bool", arg_regs[0], arg_regs[1])
     else:
         ir_emit_simple_binary(cmp_r, "eq", arg_regs[0], arg_regs[1])
     ok_l := ir_label()
     fail_l := ir_label()
     ir_emit("brif " + cmp_r.to_string() + " " + ok_l + " " + fail_l)
     ir_emit_label(fail_l)
+    kind_r := ir_reg()
+    ir_emit("iconst " + kind_r.to_string() + " " + ir_assert_eq_kind_code(kind).to_string())
     fail_r := ir_reg()
-    ir_emit_call2(fail_r, "assert_eq", "unknown", arg_regs[0], arg_regs[1])
+    ir_emit_call3(fail_r, "pith_assert_eq_fail", "unknown", arg_regs[0], arg_regs[1], kind_r)
     ir_test_assert_fail()
     ir_emit_label(ok_l)
     r := ir_reg()

@@ -1,0 +1,43 @@
+# live integration tests for std.redis. they need a redis server on
+# 127.0.0.1:6379; without one each test skips. keys are namespaced and cleaned
+# up so runs do not collide.
+#
+# run with: pith test tests/live/db_redis_live.pith
+
+import std.redis as redis
+
+fn open_or_skip() -> redis.Client:
+    attempt := redis.connect("127.0.0.1", 6379)
+    if attempt.is_err:
+        skip_test("no redis server at 127.0.0.1:6379")
+    return attempt.ok
+
+test "ping answers pong":
+    client := open_or_skip()
+    reply := client.ping()!
+    assert_eq(reply, "PONG")
+
+test "set then get round-trips a value":
+    client := open_or_skip()
+    client.set("pith:test:greeting", "hello")!
+    value := client.get("pith:test:greeting")!
+    client.del("pith:test:greeting")!
+    assert_eq(value, "hello")
+
+test "incr counts up from a fresh key":
+    client := open_or_skip()
+    client.del("pith:test:counter")!
+    first := client.incr("pith:test:counter")!
+    second := client.incr("pith:test:counter")!
+    client.del("pith:test:counter")!
+    assert_eq(first, 1)
+    assert_eq(second, 2)
+
+test "del removes a key that exists":
+    client := open_or_skip()
+    client.set("pith:test:temp", "x")!
+    before := client.exists("pith:test:temp")!
+    client.del("pith:test:temp")!
+    after := client.exists("pith:test:temp")!
+    assert(before)
+    assert(not after)

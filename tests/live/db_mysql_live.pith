@@ -1,0 +1,45 @@
+# live integration tests for std.mysql. they need a mysql/mariadb server on
+# 127.0.0.1:3306 with the pithtest fixtures; without one each test skips.
+#
+# run with: pith test tests/live/db_mysql_live.pith
+
+import std.mysql as mysql
+import std.sql as sql
+
+fn open_or_skip() -> mysql.Conn:
+    attempt := mysql.connect("127.0.0.1", 3306, "pith", "pith_pw", "pithtest")
+    if attempt.is_err:
+        skip_test("no mysql server at 127.0.0.1:3306")
+    return attempt.ok
+
+test "a text-protocol query returns the seeded rows":
+    conn := open_or_skip()
+    mut names: List[String] := []
+    for row in mysql.query(conn, "select id, name from users order by id")!:
+        names.push(row.as_text(0))
+    conn.close()
+    assert(names.len() >= 3)
+
+test "a prepared statement decodes ints, text, and a double":
+    conn := open_or_skip()
+    stmt := mysql.prepare(conn, "select id, name, score from users where id = ?")!
+    mut ids: List[Int] := []
+    mut score := 0.0
+    for row in mysql.query_prepared(conn, stmt, ["1"])!:
+        ids.push(row.as_int(0))
+        score = row.as_real(2)
+    mysql.close_stmt(conn, stmt)!
+    conn.close()
+    assert_eq(ids, [1])
+    assert(score > 0.0)
+
+test "a prepared statement reports a null column":
+    conn := open_or_skip()
+    stmt := mysql.prepare(conn, "select id, score from users order by id")!
+    mut saw_null := false
+    for row in mysql.query_prepared(conn, stmt, [])!:
+        if row.is_null(1):
+            saw_null = true
+    mysql.close_stmt(conn, stmt)!
+    conn.close()
+    assert(saw_null)

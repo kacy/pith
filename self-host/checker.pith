@@ -12,7 +12,7 @@
 # all globals use c_ prefix to avoid collisions with lexer/parser
 # globals in the flat C namespace.
 
-from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, get_type_count, register_type_name, lookup_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
+from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, lookup_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
 from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
@@ -544,6 +544,15 @@ fn register_struct_declaration(node_idx: Int, node: Node):
         define_binding(current_scope, name, TID_ERR, false)
         return
     base_name := name
+    # register the name first, with a placeholder, so a field can reference the
+    # struct's own type (a self-referential `next: Node?`). the real fields fill
+    # in once every field type is resolved below.
+    mut empty_names: List[String] := []
+    mut empty_ints: List[Int] := []
+    mut empty_bools: List[Bool] := []
+    tid := add_type_info(ti_struct(base_name, empty_names, empty_ints, empty_bools, empty_bools))
+    register_type_name(base_name, tid)
+    define_binding(current_scope, base_name, tid, false)
     # non-generic: resolve field types immediately
     mut field_names: List[String] := []
     mut field_types: List[Int] := []
@@ -574,9 +583,7 @@ fn register_struct_declaration(node_idx: Int, node: Node):
                 field_types.push(TID_ERR)
             field_pub.push(is_pub)
             field_mut.push(is_mut)
-    tid := add_type_info(ti_struct(base_name, field_names, field_types, field_pub, field_mut))
-    register_type_name(base_name, tid)
-    define_binding(current_scope, base_name, tid, false)
+    set_type_info(tid, ti_struct(base_name, field_names, field_types, field_pub, field_mut))
 
 # ---------------------------------------------------------------
 # pass 1 — enum declarations

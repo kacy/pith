@@ -537,6 +537,18 @@ fn resolve_function_signature(node: Node) -> Int:
 # pass 1 — struct declarations
 # ---------------------------------------------------------------
 
+# a weak field must be an optional reference to a struct — that is the only
+# thing weak can meaningfully not-own, and the only shape a cycle forms through.
+# reading one back as T? relies on the optional machinery, so the type must be
+# `SomeStruct?`.
+fn check_weak_field(fname: String, ftid: Int):
+    if is_error_type(ftid):
+        return
+    info := get_type_info(ftid)
+    if info.kind == "optional" and info.inner >= 0 and get_type_info(info.inner).kind == "struct":
+        return
+    report_error("E249", "weak field '" + fname + "' must be an optional struct type (T?)")
+
 fn register_struct_declaration(node_idx: Int, node: Node):
     name := node.value
     if declaration_has_generic_params(node):
@@ -568,6 +580,8 @@ fn register_struct_declaration(node_idx: Int, node: Node):
             if cn.children.len() > 0:
                 ftid := resolve_type_implementation(cn.children[0])
                 field_types.push(ftid)
+                if cn.value.contains(" weak"):
+                    check_weak_field(fname, ftid)
                 if cn.children.len() > 1:
                     default_tid := c_check_expr(cn.children[1], current_scope)
                     if value_matches_optional_target(cn.children[1], default_tid, ftid):

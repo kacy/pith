@@ -12,6 +12,14 @@
 # cleartext-password fallback. `query` uses the simple protocol; `query_params`
 # and `exec_params` use the extended protocol to bind `$1`, `$2`, ... values off
 # the sql string. results come back in text form and are decoded by column type.
+#
+# `connect_tls` upgrades the socket with the postgres SSLRequest dance before
+# the startup message. for a server with a self-signed certificate, pass its
+# own pem as the ca file — the verifier treats an exact match as a pinned
+# certificate:
+#
+#   cfg := tls.client_config_with_ca_file("/etc/ssl/certs/server.pem")!
+#   conn := postgres.connect_tls("db.internal", 5432, "me", "pw", "mydb", "db.internal", cfg)!
 
 import std.sql as sql
 import std.bytes as bytes
@@ -21,6 +29,8 @@ import std.hash as hash
 import std.crypto.hmac as hmac
 import std.crypto.kdf as kdf
 import std.crypto.random as random
+import std.net.tls as tls
+from std.io import TcpStream
 from std.iter import Iterator
 
 # --- byte helpers ---
@@ -71,17 +81,27 @@ struct Message:
 # --- connection ---
 
 # an open connection to a postgres server; `buf` holds bytes read past the
-# current message.
+# current message. when `secure` is set the socket was upgraded by connect_tls
+# and all reads and writes go through the tls session identified by `tls_handle`.
 pub struct Conn:
     fd: Int
     mut buf: Bytes
     mut pos: Int
+    secure: Bool
+    tls_handle: Int
 
 impl Conn:
-    # read exactly `n` bytes, pulling more from the socket as needed.
+    # read one chunk from the transport: the tls session when secure, the plain
+    # socket otherwise.
+    fn recv_chunk() -> Bytes!:
+        if self.secure:
+            return tls.conn_from_handle(self.tls_handle).read_bytes(4096)!
+        return tcp_read_bytes(self.fd, 4096)!
+
+    # read exactly `n` bytes, pulling more from the transport as needed.
     fn recv_exact(n: Int) -> Bytes!:
         while bytes.len(self.buf) - self.pos < n:
-            chunk := tcp_read_bytes(self.fd, 4096)!
+            chunk := self.recv_chunk()!
             if bytes.len(chunk) == 0:
                 fail "postgres: connection closed"
             self.buf = bytes.concat(bytes.slice(self.buf, self.pos, bytes.len(self.buf)), chunk)
@@ -99,6 +119,13 @@ impl Conn:
         payload := self.recv_exact(total - 4)!
         return Message(mtype: mtype, payload: payload)
 
+    # write raw bytes to the transport: the tls session when secure, the plain
+    # socket otherwise.
+    fn send_raw(data: Bytes) -> Int!:
+        if self.secure:
+            return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
+        return tcp_write_bytes(self.fd, data)!
+
     # frame and send a message. a `type_byte` of 0 omits the type prefix, as the
     # startup message requires.
     fn send(type_byte: Int, payload: Bytes) -> Int!:
@@ -107,12 +134,14 @@ impl Conn:
             out.write_byte(type_byte) catch 0
         out.write(be32(bytes.len(payload) + 4)) catch 0
         out.write(payload) catch 0
-        n := tcp_write_bytes(self.fd, out.bytes())!
+        n := self.send_raw(out.bytes())!
         out.free()
         return n
 
     # close the connection.
     pub fn close():
+        if self.secure:
+            tls.conn_from_handle(self.tls_handle).close()
         tcp_close(self.fd)
 
 # a string followed by a null terminator, the wire's cstring form.
@@ -146,7 +175,23 @@ fn error_text(payload: Bytes) -> String:
 # open a connection and complete the startup handshake and authentication.
 pub fn connect(host: String, port: Int, user: String, password: String, database: String) -> Conn!:
     fd := tcp_connect(host, port)!
-    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0)
+    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: false, tls_handle: 0)
+    conn.handshake(user, password, database)!
+    return conn
+
+# like connect, but upgrade the socket to tls first: send SSLRequest, expect
+# the server's 'S', run the tls handshake against `server_name` with `config`,
+# then run startup and authentication over the encrypted channel.
+pub fn connect_tls(host: String, port: Int, user: String, password: String, database: String, server_name: String, config: tls.Config) -> Conn!:
+    fd := tcp_connect(host, port)!
+    request := bytes.concat(be32(8), be32(80877103))
+    tcp_write_bytes(fd, request)!
+    reply := tcp_read_bytes(fd, 1)!
+    if bytes.len(reply) == 0 or bytes.get(reply, 0) != 83:
+        tcp_close(fd)
+        fail "postgres: server refused tls"
+    session := tls.client(TcpStream(fd), server_name, config)!
+    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: true, tls_handle: session.handle)
     conn.handshake(user, password, database)!
     return conn
 

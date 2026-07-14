@@ -39,6 +39,7 @@ EXT_KEY_SHARE := 51
 CIPHER_TLS_AES_128_GCM_SHA256 := 4865
 CIPHER_TLS_CHACHA20_POLY1305_SHA256 := 4867
 GROUP_X25519 := 29
+GROUP_SECP256R1 := 23
 PSK_MODE_DHE_KE := 1
 SIG_RSA_PKCS1_SHA256 := 1025
 SIG_ECDSA_SECP256R1_SHA256 := 1027
@@ -252,16 +253,23 @@ fn psk_key_exchange_modes_extension(modes: List[Int]) -> Bytes!:
         write_u8(data, mode)!
     return extension_record(EXT_PSK_KEY_EXCHANGE_MODES, data.bytes())
 
-fn key_share_client_extension(group: Int, public_key: Bytes) -> Bytes!:
-    if public_key.len() == 0:
+# the client key_share extension: an x25519 entry, plus a p-256 entry when a
+# p-256 public key is offered. offering both lets servers pinned to either
+# curve (postgres defaults to prime256v1) pick without a hello retry.
+fn key_share_client_extension(x25519_public_key: Bytes, p256_public_key: Bytes) -> Bytes!:
+    if x25519_public_key.len() == 0:
         fail "tls key share cannot be empty"
-    entry := bytes.buffer_with_capacity(public_key.len() + 4)
-    write_u16_be(entry, group)!
-    write_u16_be(entry, public_key.len())!
-    write_bytes_if_any(entry, public_key)!
-    data := bytes.buffer_with_capacity(entry.len() + 2)
-    write_u16_be(data, entry.len())!
-    write_bytes_if_any(data, entry.bytes())!
+    entries := bytes.buffer()
+    write_u16_be(entries, GROUP_X25519)!
+    write_u16_be(entries, x25519_public_key.len())!
+    write_bytes_if_any(entries, x25519_public_key)!
+    if p256_public_key.len() > 0:
+        write_u16_be(entries, GROUP_SECP256R1)!
+        write_u16_be(entries, p256_public_key.len())!
+        write_bytes_if_any(entries, p256_public_key)!
+    data := bytes.buffer_with_capacity(entries.len() + 2)
+    write_u16_be(data, entries.len())!
+    write_bytes_if_any(data, entries.bytes())!
     return extension_record(EXT_KEY_SHARE, data.bytes())
 
 fn supported_versions_server_extension(version: Int) -> Bytes!:
@@ -320,31 +328,36 @@ fn pre_shared_key_server_extension(selected_identity: Int) -> Bytes!:
     write_u16_be(data, selected_identity)!
     return extension_record(EXT_PRE_SHARED_KEY, data.bytes())
 
-fn write_common_client_extensions(out: ByteBuffer, server_name: String, x25519_public_key: Bytes, alpn_protocols: List[String]) -> Bool!:
+fn write_common_client_extensions(out: ByteBuffer, server_name: String, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String]) -> Bool!:
     if x25519_public_key.len() != 32:
         fail "x25519 public key must be 32 bytes"
+    if p256_public_key.len() != 0 and p256_public_key.len() != 65:
+        fail "p-256 public key must be a 65-byte uncompressed point"
+    mut groups := [GROUP_X25519]
+    if p256_public_key.len() > 0:
+        groups.push(GROUP_SECP256R1)
     write_bytes_if_any(out, server_name_extension(server_name)!)!
     write_bytes_if_any(out, alpn_extension(alpn_protocols)!)!
     write_bytes_if_any(out, supported_versions_client_extension()!)!
-    write_bytes_if_any(out, supported_groups_extension([GROUP_X25519])!)!
+    write_bytes_if_any(out, supported_groups_extension(groups)!)!
     write_bytes_if_any(out, signature_algorithms_extension([SIG_ECDSA_SECP256R1_SHA256, SIG_RSA_PSS_RSAE_SHA256, SIG_RSA_PKCS1_SHA256, SIG_ED25519])!)!
-    write_bytes_if_any(out, key_share_client_extension(GROUP_X25519, x25519_public_key)!)!
+    write_bytes_if_any(out, key_share_client_extension(x25519_public_key, p256_public_key)!)!
     return true
 
-fn default_client_extensions_with_options(server_name: String, x25519_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_binder: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
+fn default_client_extensions_with_options(server_name: String, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_binder: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
     out := bytes.buffer()
-    write_common_client_extensions(out, server_name, x25519_public_key, alpn_protocols)!
+    write_common_client_extensions(out, server_name, x25519_public_key, p256_public_key, alpn_protocols)!
     if psk_identity.len() > 0:
         write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
         write_bytes_if_any(out, pre_shared_key_client_extension(psk_identity, psk_obfuscated_ticket_age, psk_binder)!)!
     return out.bytes()
 
 fn default_client_extensions(server_name: String, x25519_public_key: Bytes) -> Bytes!:
-    return default_client_extensions_with_options(server_name, x25519_public_key, [], bytes.empty(), bytes.empty(), 0)
+    return default_client_extensions_with_options(server_name, x25519_public_key, bytes.empty(), [], bytes.empty(), bytes.empty(), 0)
 
-fn default_client_extensions_partial_psk(server_name: String, x25519_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
+fn default_client_extensions_partial_psk(server_name: String, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
     out := bytes.buffer()
-    write_common_client_extensions(out, server_name, x25519_public_key, alpn_protocols)!
+    write_common_client_extensions(out, server_name, x25519_public_key, p256_public_key, alpn_protocols)!
     write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
     write_bytes_if_any(out, pre_shared_key_client_partial_extension(psk_identity, psk_obfuscated_ticket_age, 32)!)!
     return out.bytes()
@@ -509,17 +522,19 @@ pub fn decode_handshakes(data: Bytes) -> List[HandshakeMessage]!:
         messages.push(HandshakeMessage(message_type, body))
     return messages
 
-# encode a tls 1.3 client hello with x25519 key share support.
+# encode a tls 1.3 client hello offering only an x25519 key share.
 pub fn encode_client_hello(server_name: String, random: Bytes, session_id: Bytes, x25519_public_key: Bytes) -> Bytes!:
-    return encode_client_hello_with_options(server_name, random, session_id, x25519_public_key, [], bytes.empty(), 0, bytes.empty())
+    return encode_client_hello_with_options(server_name, random, session_id, x25519_public_key, bytes.empty(), [], bytes.empty(), 0, bytes.empty())
 
-## Encode a ClientHello with optional ALPN and PSK extensions.
-pub fn encode_client_hello_with_options(server_name: String, random: Bytes, session_id: Bytes, x25519_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_obfuscated_ticket_age: Int, psk_binder: Bytes) -> Bytes!:
+## Encode a ClientHello with optional ALPN and PSK extensions. A non-empty
+## p256_public_key adds a second key share so servers pinned to that curve can
+## complete without a hello retry.
+pub fn encode_client_hello_with_options(server_name: String, random: Bytes, session_id: Bytes, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_obfuscated_ticket_age: Int, psk_binder: Bytes) -> Bytes!:
     if random.len() != 32:
         fail "tls client random must be 32 bytes"
     if session_id.len() > 32:
         fail "tls session id too long"
-    extensions := default_client_extensions_with_options(server_name, x25519_public_key, alpn_protocols, psk_identity, psk_binder, psk_obfuscated_ticket_age)!
+    extensions := default_client_extensions_with_options(server_name, x25519_public_key, p256_public_key, alpn_protocols, psk_identity, psk_binder, psk_obfuscated_ticket_age)!
     body := bytes.buffer()
     write_u16_be(body, TLS_LEGACY_VERSION)!
     write_bytes_if_any(body, random)!
@@ -532,15 +547,17 @@ pub fn encode_client_hello_with_options(server_name: String, random: Bytes, sess
     write_bytes_if_any(body, extensions)!
     return encode_handshake(HANDSHAKE_CLIENT_HELLO, body.bytes())
 
-## Encode the ClientHello prefix used when computing a PSK binder.
-pub fn client_hello_psk_binder_input(server_name: String, random: Bytes, session_id: Bytes, x25519_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
+## Encode the ClientHello prefix used when computing a PSK binder. The key
+## share offer must match the real ClientHello exactly, so this takes the same
+## p256_public_key.
+pub fn client_hello_psk_binder_input(server_name: String, random: Bytes, session_id: Bytes, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
     if random.len() != 32:
         fail "tls client random must be 32 bytes"
     if session_id.len() > 32:
         fail "tls session id too long"
     if psk_identity.len() == 0:
         fail "tls psk identity cannot be empty"
-    extensions := default_client_extensions_partial_psk(server_name, x25519_public_key, alpn_protocols, psk_identity, psk_obfuscated_ticket_age)!
+    extensions := default_client_extensions_partial_psk(server_name, x25519_public_key, p256_public_key, alpn_protocols, psk_identity, psk_obfuscated_ticket_age)!
     body := bytes.buffer()
     write_u16_be(body, TLS_LEGACY_VERSION)!
     write_bytes_if_any(body, random)!
@@ -582,11 +599,20 @@ fn parse_client_key_share(data: Bytes) -> ClientKeyShareExtension!:
     list_len := checked_read(binary.read_u16_be(r))!
     list := checked_bytes(binary.read_bytes(r, list_len))!
     kr := binary.reader(list)
-    if binary.remaining(kr) == 0:
-        return ClientKeyShareExtension(0, bytes.empty())
-    group := checked_read(binary.read_u16_be(kr))!
-    key_len := checked_read(binary.read_u16_be(kr))!
-    return ClientKeyShareExtension(group, checked_bytes(binary.read_bytes(kr, key_len))!)
+    # clients may offer several key shares; the pith server keys with x25519,
+    # so pick that entry when present and otherwise report the first.
+    mut first := ClientKeyShareExtension(0, bytes.empty())
+    mut seen := false
+    while binary.remaining(kr) > 0:
+        group := checked_read(binary.read_u16_be(kr))!
+        key_len := checked_read(binary.read_u16_be(kr))!
+        key := checked_bytes(binary.read_bytes(kr, key_len))!
+        if group == GROUP_X25519:
+            return ClientKeyShareExtension(group, key)
+        if not seen:
+            first = ClientKeyShareExtension(group, key)
+            seen = true
+    return first
 
 fn parse_signature_scheme_list(data: Bytes) -> List[Int]!:
     out: List[Int] := []
@@ -1198,9 +1224,9 @@ test "tls13 encodes client hello with alpn and psk":
     session := encoding.from_hex("aabbccdd")!
     public_key := encoding.from_hex("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")!
     ticket := bytes.from_string_utf8("ticket")
-    binder_input := client_hello_psk_binder_input("example.com", random, session, public_key, ["pith.rpc"], ticket, 7)!
+    binder_input := client_hello_psk_binder_input("example.com", random, session, public_key, bytes.empty(), ["pith.rpc"], ticket, 7)!
     binder := resumption_binder_verify_data_sha256(bytes.from_string_utf8("pith-resume"), binder_input)!
-    hello := encode_client_hello_with_options("example.com", random, session, public_key, ["pith.rpc"], ticket, 7, binder)!
+    hello := encode_client_hello_with_options("example.com", random, session, public_key, bytes.empty(), ["pith.rpc"], ticket, 7, binder)!
     parsed := parse_client_hello(decode_handshakes(hello)![0].body)!
 
     assert_eq(parsed.alpn_protocols.len(), 1)
@@ -1210,6 +1236,25 @@ test "tls13 encodes client hello with alpn and psk":
     assert_eq(parsed.psk_obfuscated_ticket_age, 7)
     assert(bytes.eq(parsed.psk_binder, binder))
     assert(bytes.eq(parsed.psk_binder_input, binder_input))
+
+test "tls13 offers a second p-256 key share when given one":
+    random := encoding.from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")!
+    x_pub := encoding.from_hex("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")!
+    # a 65-byte uncompressed point (only the shape matters for encoding)
+    mut p := bytes.buffer()
+    p.write_byte(4)
+    mut i := 0
+    while i < 64:
+        p.write_byte(i)
+        i = i + 1
+    p_pub := p.bytes()
+    hello := encode_client_hello_with_options("example.com", random, bytes.empty(), x_pub, p_pub, [], bytes.empty(), 0, bytes.empty())!
+    parsed := parse_client_hello(decode_handshakes(hello)![0].body)!
+
+    # the pith server keys with x25519, so the parse picks that entry even
+    # though the hello carries both shares.
+    assert_eq(parsed.key_share_group, GROUP_X25519)
+    assert(bytes.eq(parsed.key_share, x_pub))
 
 test "tls13 rejects malformed records":
     assert(encode_record(99, bytes.empty()).is_err)

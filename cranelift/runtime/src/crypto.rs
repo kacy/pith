@@ -107,10 +107,9 @@ fn sign_rsa_with(
     pith_bytes_from_vec(sig)
 }
 
-#[no_mangle]
-pub extern "C" fn pith_crypto_x25519_keygen() -> i64 {
+fn ecdh_keygen(alg: &'static agreement::Algorithm) -> i64 {
     let rng = rand::SystemRandom::new();
-    let Ok(key) = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng) else {
+    let Ok(key) = agreement::EphemeralPrivateKey::generate(alg, &rng) else {
         return 0;
     };
     let Ok(public_key) = key.compute_public_key() else {
@@ -122,6 +121,18 @@ pub extern "C" fn pith_crypto_x25519_keygen() -> i64 {
     }));
     handle_registry::register(ptr as *const (), HandleKind::X25519Key);
     ptr as i64
+}
+
+#[no_mangle]
+pub extern "C" fn pith_crypto_x25519_keygen() -> i64 {
+    ecdh_keygen(&agreement::X25519)
+}
+
+// a p-256 key rides the same handle plumbing as x25519: the private key
+// remembers its own algorithm, so public_key/shared_secret/close serve both.
+#[no_mangle]
+pub extern "C" fn pith_crypto_p256_keygen() -> i64 {
+    ecdh_keygen(&agreement::ECDH_P256)
 }
 
 #[no_mangle]
@@ -146,7 +157,7 @@ pub unsafe extern "C" fn pith_crypto_x25519_shared_secret(
     let Some(private_key) = key.key.take() else {
         return 0;
     };
-    let peer_key = agreement::UnparsedPublicKey::new(&agreement::X25519, peer);
+    let peer_key = agreement::UnparsedPublicKey::new(private_key.algorithm(), peer);
     agreement::agree_ephemeral(private_key, &peer_key, |secret| {
         pith_bytes_from_vec(secret.to_vec())
     })

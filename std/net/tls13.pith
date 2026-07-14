@@ -1013,12 +1013,20 @@ pub fn derive_secret_from_hash_sha256(secret: Bytes, label: String, transcript_h
 
 # derive the tls 1.3 handshake secret from an x25519 shared secret.
 pub fn handshake_secret_sha256(shared_secret: Bytes) -> Bytes!:
-    early_secret := kdf.hkdf_extract_sha256(zero_secret_sha256(), bytes.empty())
+    # rfc 8446: Early-Secret = HKDF-Extract(salt = "", ikm = 32 zero bytes).
+    # these arguments were swapped for a long time, which self-cancelled
+    # between pith peers (an empty hmac key pads to the zero key, so the salt
+    # side matched) but derived a different secret than every other tls
+    # implementation. rfc 8448 vectors now pin this down in the tests below.
+    early_secret := kdf.hkdf_extract_sha256(bytes.empty(), zero_secret_sha256())
     return handshake_secret_from_early_secret_sha256(early_secret, shared_secret)
 
 ## Derive the TLS 1.3 early secret from a PSK.
 pub fn early_secret_from_psk_sha256(psk: Bytes) -> Bytes:
-    return kdf.hkdf_extract_sha256(zero_secret_sha256(), psk)
+    # rfc 8446: Early-Secret = HKDF-Extract(salt = "", ikm = psk). an empty
+    # salt happens to equal the zero salt after hmac key padding, but spell it
+    # the way the rfc does.
+    return kdf.hkdf_extract_sha256(bytes.empty(), psk)
 
 ## Derive the TLS 1.3 handshake secret from an early secret and shared secret.
 pub fn handshake_secret_from_early_secret_sha256(early_secret: Bytes, shared_secret: Bytes) -> Bytes!:
@@ -1028,7 +1036,9 @@ pub fn handshake_secret_from_early_secret_sha256(early_secret: Bytes, shared_sec
 # derive the tls 1.3 master secret from the handshake secret.
 pub fn master_secret_sha256(handshake_secret: Bytes) -> Bytes!:
     derived := derive_secret_sha256(handshake_secret, "derived", bytes.empty())!
-    return kdf.hkdf_extract_sha256(derived, bytes.empty())
+    # rfc 8446: Master-Secret = HKDF-Extract(derived, 32 zero bytes) — the ikm
+    # is the zero secret, not an empty string (see handshake_secret_sha256).
+    return kdf.hkdf_extract_sha256(derived, zero_secret_sha256())
 
 # derive the client handshake traffic secret.
 pub fn client_handshake_traffic_secret_sha256(handshake_secret: Bytes, transcript: Bytes) -> Bytes!:
@@ -1348,3 +1358,30 @@ test "tls13 seals and opens chacha application records":
 
     assert_eq(opened.content_type, CONTENT_HANDSHAKE)
     assert_eq(opened.payload.to_string_utf8()!, "finished")
+
+test "tls13 key schedule matches the rfc 8448 vectors":
+    # rfc 8448 section 3, the simple 1-rtt handshake. these pin the key
+    # schedule to what every other tls 1.3 implementation derives; the suite
+    # above only proves the two pith ends agree with each other.
+    shared := encoding.from_hex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d")!
+    hs := handshake_secret_sha256(shared)!
+    assert(bytes.eq(hs, encoding.from_hex("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")!))
+
+    # traffic secrets over the client-hello..server-hello transcript hash
+    hello_hash := encoding.from_hex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8")!
+    c_hs := derive_secret_from_hash_sha256(hs, "c hs traffic", hello_hash)!
+    s_hs := derive_secret_from_hash_sha256(hs, "s hs traffic", hello_hash)!
+    assert(bytes.eq(c_hs, encoding.from_hex("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21")!))
+    assert(bytes.eq(s_hs, encoding.from_hex("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")!))
+
+    # the server handshake write key and iv expanded from its traffic secret
+    keys := traffic_keys_aes_128_gcm_sha256(s_hs)!
+    assert(bytes.eq(keys.key, encoding.from_hex("3fce516009c21727d0f2e4e86ee403bc")!))
+    assert(bytes.eq(keys.iv, encoding.from_hex("5d313eb2671276ee13000b30")!))
+
+    # master secret and the application traffic secret over the full transcript
+    master := master_secret_sha256(hs)!
+    assert(bytes.eq(master, encoding.from_hex("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919")!))
+    app_hash := encoding.from_hex("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13")!
+    c_ap := derive_secret_from_hash_sha256(master, "c ap traffic", app_hash)!
+    assert(bytes.eq(c_ap, encoding.from_hex("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5")!))

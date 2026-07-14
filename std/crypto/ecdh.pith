@@ -15,10 +15,21 @@ pub fn x25519_keypair() -> X25519KeyPair!:
     public_key := crypto_x25519_public_key(handle)!
     return X25519KeyPair(handle, public_key)
 
+# generate a fresh p-256 (secp256r1) ephemeral key pair. its public key is the
+# 65-byte uncompressed point. the private key remembers its curve, so the same
+# shared_secret and close calls serve both curves.
+pub fn p256_keypair() -> X25519KeyPair!:
+    handle := crypto_p256_keygen()!
+    public_key := crypto_x25519_public_key(handle)!
+    return X25519KeyPair(handle, public_key)
+
 # derive a shared secret with a peer public key. this consumes the private key.
+# an x25519 peer key is 32 bytes; a p-256 peer key is a 65-byte uncompressed
+# point. the runtime rejects a peer key that does not match the private key's
+# curve.
 pub fn x25519_shared_secret(key: X25519KeyPair, peer_public_key: Bytes) -> Bytes!:
-    if peer_public_key.len() != 32:
-        fail "x25519 peer public key must be 32 bytes"
+    if peer_public_key.len() != 32 and peer_public_key.len() != 65:
+        fail "ecdh peer public key must be 32 or 65 bytes"
     return crypto_x25519_shared_secret(key.handle, peer_public_key)!
 
 impl X25519KeyPair:
@@ -44,3 +55,23 @@ test "x25519 rejects malformed peer keys":
     key := x25519_keypair()!
     assert(key.shared_secret(bytes.from_string_utf8("bad")).is_err)
     key.close()
+
+test "p256 derives matching shared secrets":
+    alice := p256_keypair()!
+    bob := p256_keypair()!
+    alice_secret := alice.shared_secret(bob.public_key)!
+    bob_secret := bob.shared_secret(alice.public_key)!
+
+    assert_eq(alice.public_key.len(), 65)
+    assert_eq(alice.public_key[0], 4)
+    assert_eq(alice_secret.len(), 32)
+    assert(bytes.eq(alice_secret, bob_secret))
+    alice.close()
+    bob.close()
+
+test "p256 rejects a peer key from the wrong curve":
+    p := p256_keypair()!
+    x := x25519_keypair()!
+    assert(p.shared_secret(x.public_key).is_err)
+    p.close()
+    x.close()

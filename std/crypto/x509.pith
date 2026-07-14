@@ -366,7 +366,9 @@ fn wildcard_matches(pattern: String, host: String) -> Bool:
         return false
     return not host.substring(0, prefix_len).contains(".")
 
-# match a hostname or ip address against the certificate's san list.
+# match a hostname or ip address against the certificate's san list. legacy
+# certificates without any san entries (auto-generated database certs are the
+# common case) fall back to the subject common name.
 pub fn matches_hostname(cert: Certificate, host: String) -> Bool:
     target := host.to_lower()
     for ip in cert.ip_addresses:
@@ -378,6 +380,8 @@ pub fn matches_hostname(cert: Certificate, host: String) -> Bool:
         pattern := name.to_lower()
         if pattern == target or wildcard_matches(pattern, target):
             return true
+    if cert.dns_names.len() == 0 and cert.ip_addresses.len() == 0:
+        return cert.subject_common_name.to_lower() == target
     return false
 
 impl Certificate:
@@ -429,6 +433,13 @@ fn find_issuer_in_roots(cert: Certificate, roots: List[Certificate]) -> Certific
     fail "issuer not found in trusted roots"
 
 fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificate], hostname_ok: Bool) -> VerificationResult:
+    # a trust anchor byte-identical to the leaf is a pinned certificate:
+    # trusting the exact certificate needs no ca bit and no chain walk. this
+    # is how self-signed servers (a dev postgres or a database with an
+    # auto-generated cert) verify — pass the server's own pem as the ca file.
+    for root in trusted_roots:
+        if bytes.eq(root.der, chain[0].der):
+            return VerificationResult(hostname_ok, hostname_ok, true, true, true, verification_reason(hostname_ok, true, true, true))
     mut current := chain[0]
     mut next_chain_index := 1
     mut issuer_ok := false

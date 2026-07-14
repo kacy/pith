@@ -744,6 +744,79 @@ pub extern "C" fn pith_assert_ne(a: i64, b: i64) {
     }
 }
 
+// --- test runner ------------------------------------------------------------
+//
+// each `test "..."` block compiles to a `__test_i` function; the generated main
+// is a pure dispatcher that forks once per test and records the outcome. running
+// each test in its own child means a failing assert's exit(1), or even a crash,
+// ends only that test — the others still run, and the parent reports every one.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static TEST_PASS: AtomicUsize = AtomicUsize::new(0);
+static TEST_FAIL: AtomicUsize = AtomicUsize::new(0);
+
+/// Flush pending output and fork. Returns the child pid to the parent and 0 to
+/// the child, matching the C fork contract. Flushing first keeps the child from
+/// inheriting (and re-emitting) the parent's buffered stdout.
+#[no_mangle]
+pub extern "C" fn pith_test_fork() -> i64 {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    unsafe { libc::fork() as i64 }
+}
+
+/// Called at the end of a test in the child process: flush and exit cleanly.
+/// A test that failed an assert has already exited(1) before reaching here.
+#[no_mangle]
+pub extern "C" fn pith_test_child_ok() -> i64 {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(0);
+}
+
+/// Parent side: wait for a test's child, print its result line, and tally it. A
+/// clean exit(0) passes; any non-zero exit or a killing signal fails.
+///
+/// # Safety
+/// `name` must point to a valid NUL-terminated string for this call.
+#[no_mangle]
+pub unsafe extern "C" fn pith_test_record(name: *const i8, pid: i64) -> i64 {
+    let mut status: i32 = 0;
+    libc::waitpid(pid as i32, &mut status, 0);
+    let name_str = cstr_to_display(name);
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        TEST_PASS.fetch_add(1, Ordering::Relaxed);
+        println!("  {} ... ok", name_str);
+        0
+    } else {
+        TEST_FAIL.fetch_add(1, Ordering::Relaxed);
+        if libc::WIFSIGNALED(status) {
+            println!("  {} ... FAILED (killed by signal {})", name_str, libc::WTERMSIG(status));
+        } else {
+            println!("  {} ... FAILED", name_str);
+        }
+        1
+    }
+}
+
+/// Print the final tally and return the process exit code (non-zero on any
+/// failure).
+#[no_mangle]
+pub extern "C" fn pith_test_summary() -> i64 {
+    let passed = TEST_PASS.load(Ordering::Relaxed);
+    let failed = TEST_FAIL.load(Ordering::Relaxed);
+    println!();
+    println!("{} passed, {} failed", passed, failed);
+    if failed > 0 {
+        1
+    } else {
+        0
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn pith_bit_and(a: i64, b: i64) -> i64 {
     a & b

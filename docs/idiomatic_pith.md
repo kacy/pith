@@ -183,9 +183,10 @@ The same rule applies to iterators (`std.iter.next() -> T?`) and channel
 receives (`Channel[T].recv() -> T?`): the safe-access surface uses `T?`,
 the assertion surface uses direct dereference.
 
-Write colocated `test` declarations for stdlib behavior. Use
-`std.testing.assert_eq` and `assert_ne` for normal comparisons, and keep golden
-stdout examples for end-to-end behavior.
+Write colocated `test` declarations for stdlib behavior. Inside a `test` block
+use the built-in `assert` and `assert_eq` (which compares by value and reports
+decoded failures); keep golden stdout examples for end-to-end behavior. See
+[testing.md](testing.md) for the full picture.
 
 ## packages
 

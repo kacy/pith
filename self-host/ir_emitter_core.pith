@@ -5525,6 +5525,14 @@ fn ir_emit_test_main(root_idx: Int):
         name_r := ir_reg()
         ir_emit("strref " + name_r.to_string() + " " + ir_str(get_node(test_idx).value))
 
+        # skip tests filtered out by PITH_TEST_FILTER before doing any work
+        run_r := ir_reg()
+        ir_emit_call1(run_r, "pith_test_should_run", "int", name_r)
+        run_l := ir_label()
+        skip_l := ir_label()
+        ir_emit("brif " + run_r.to_string() + " " + run_l + " " + skip_l)
+
+        ir_emit_label(run_l)
         pid_r := ir_reg()
         ir_emit_call0(pid_r, "pith_test_fork", "int")
         parent_l := ir_label()
@@ -5539,9 +5547,11 @@ fn ir_emit_test_main(root_idx: Int):
         ir_emit("iconst " + term_r.to_string() + " 0")
         ir_emit("ret " + term_r.to_string())
 
-        # parent: wait for the child and record pass/fail
+        # parent: wait for the child and record pass/fail, then rejoin
         ir_emit_label(parent_l)
         ir_emit_call2(ir_reg(), "pith_test_record", "int", name_r, pid_r)
+        ir_emit("jmp " + skip_l)
+        ir_emit_label(skip_l)
 
     # exit with the failure count so `pith test` fails the process on any failure,
     # regardless of how the entry wrapper treats main's return value.

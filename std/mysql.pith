@@ -239,6 +239,29 @@ impl Iterator for Rows:
         self.pos = self.pos + 1
         return row
 
+# a column's name and mysql type code, the two fields we need from a column
+# definition packet.
+struct ColumnDef:
+    name: String
+    kind: Int
+
+# read and parse one column-definition packet: five length-encoded strings
+# (catalog, schema, table, org_table, name), the org_name, then fixed fields
+# up to the 1-byte type code.
+fn read_column_def(conn: Conn) -> ColumnDef!:
+    col := conn.read_packet()!
+    r := Reader(data: col, pos: 0)
+    r.lenenc_str()!
+    r.lenenc_str()!
+    r.lenenc_str()!
+    r.lenenc_str()!
+    name := r.lenenc_str()!
+    r.lenenc_str()!
+    r.skip(1)
+    r.skip(2)
+    r.skip(4)
+    return ColumnDef(name: name, kind: r.u8())
+
 # run a query through the text protocol and collect its rows.
 pub fn query(conn: Conn, text: String) -> Rows!:
     cmd := bytes.buffer()
@@ -263,18 +286,9 @@ pub fn query(conn: Conn, text: String) -> Rows!:
     mut types: List[Int] := []
     mut c := 0
     while c < column_count:
-        col := conn.read_packet()!
-        r := Reader(data: col, pos: 0)
-        r.lenenc_str()!
-        r.lenenc_str()!
-        r.lenenc_str()!
-        r.lenenc_str()!
-        names.push(r.lenenc_str()!)
-        r.lenenc_str()!
-        r.skip(1)
-        r.skip(2)
-        r.skip(4)
-        types.push(r.u8())
+        def := read_column_def(conn)!
+        names.push(def.name)
+        types.push(def.kind)
         c = c + 1
 
     conn.read_packet()!
@@ -306,6 +320,206 @@ fn decode_value(raw: String, mysql_type: Int) -> sql.Value:
     if mysql_type == 4 or mysql_type == 5 or mysql_type == 0 or mysql_type == 246:
         return sql.real(parse_float(raw) catch 0.0)
     return sql.text(raw)
+
+# --- prepared statements (binary protocol) ---
+
+# a server-side prepared statement: its id and how many parameters it expects.
+pub struct Stmt:
+    id: Int
+    num_params: Int
+
+# a length-encoded integer, the wire form mysql uses for lengths and counts.
+fn lenenc_bytes(n: Int) -> Bytes:
+    out := bytes.buffer()
+    if n < 251:
+        out.write_byte(n) catch 0
+    elif n < 65536:
+        out.write_byte(252) catch 0
+        out.write(le_int(n, 2)) catch 0
+    else:
+        out.write_byte(253) catch 0
+        out.write(le_int(n, 3)) catch 0
+    result := out.bytes()
+    out.free()
+    return result
+
+# read `count` column-definition packets and the EOF packet that ends them.
+fn skip_defs(conn: Conn, count: Int) -> Bool!:
+    mut i := 0
+    while i < count:
+        conn.read_packet()!
+        i = i + 1
+    conn.read_packet()!
+    return true
+
+# prepare a statement on the server (COM_STMT_PREPARE). run it with
+# query_prepared / exec_prepared, which bind parameters and reuse the parse.
+pub fn prepare(conn: Conn, text: String) -> Stmt!:
+    cmd := bytes.buffer()
+    cmd.write_byte(22) catch 0
+    cmd.write_string_utf8(text) catch 0
+    conn.send_packet(0, cmd.bytes())!
+    cmd.free()
+
+    resp := conn.read_packet()!
+    if bytes.get(resp, 0) == 255:
+        fail "mysql: {err_text(resp)}"
+    r := Reader(data: resp, pos: 0)
+    r.skip(1)
+    stmt_id := r.le(4)
+    num_columns := r.le(2)
+    num_params := r.le(2)
+
+    if num_params > 0:
+        skip_defs(conn, num_params)!
+    if num_columns > 0:
+        skip_defs(conn, num_columns)!
+    return Stmt(id: stmt_id, num_params: num_params)
+
+# sign-extend an unsigned little-endian value of `width` bytes to a signed int.
+fn sign_extend(value: Int, width: Int) -> Int:
+    high := bits.shl(1, width * 8 - 1)
+    if bits.band(value, high) != 0:
+        return value - bits.shl(1, width * 8)
+    return value
+
+# widen a 32-bit float's bit pattern into a 64-bit double, exact for normal
+# numbers, zero, and inf/nan. subnormal floats (vanishingly rare in stored data)
+# are not reconstructed precisely.
+fn f32_to_f64(raw: Int) -> Float:
+    sign := bits.band(bits.shr(raw, 31), 1)
+    exp := bits.band(bits.shr(raw, 23), 255)
+    mant := bits.band(raw, 8388607)
+    mant64 := bits.shl(mant, 29)
+    mut exp64 := exp - 127 + 1023
+    if exp == 255:
+        exp64 = 2047
+    elif exp == 0 and mant == 0:
+        exp64 = 0
+    combined := bits.bor(bits.bor(bits.shl(sign, 63), bits.shl(exp64, 52)), mant64)
+    return float_from_bits(combined)
+
+# decode one value from a binary result row by its mysql type: integers arrive
+# little-endian, float/double as raw ieee754 bits, everything else as a
+# length-encoded string.
+fn decode_binary(r: Reader, mysql_type: Int) -> sql.Value!:
+    if mysql_type == 1:
+        return sql.integer(sign_extend(r.u8(), 1))
+    if mysql_type == 2 or mysql_type == 13:
+        return sql.integer(sign_extend(r.le(2), 2))
+    if mysql_type == 3 or mysql_type == 9:
+        return sql.integer(sign_extend(r.le(4), 4))
+    if mysql_type == 8:
+        return sql.integer(r.le(8))
+    if mysql_type == 5:
+        return sql.real(float_from_bits(r.le(8)))
+    if mysql_type == 4:
+        return sql.real(f32_to_f64(r.le(4)))
+    return sql.text(r.lenenc_str()!)
+
+# build a COM_STMT_EXECUTE payload, binding every parameter as a string (the
+# server coerces to the column type). null parameters are not supported here.
+fn build_execute(stmt: Stmt, params: List[String]) -> Bytes:
+    out := bytes.buffer()
+    out.write_byte(23) catch 0
+    out.write(le_int(stmt.id, 4)) catch 0
+    out.write_byte(0) catch 0
+    out.write(le_int(1, 4)) catch 0
+    if stmt.num_params > 0:
+        null_bytes := (stmt.num_params + 7) / 8
+        mut i := 0
+        while i < null_bytes:
+            out.write_byte(0) catch 0
+            i = i + 1
+        out.write_byte(1) catch 0
+        mut j := 0
+        while j < stmt.num_params:
+            out.write_byte(253) catch 0
+            out.write_byte(0) catch 0
+            j = j + 1
+        for p in params:
+            value := bytes.from_string_utf8(p)
+            out.write(lenenc_bytes(bytes.len(value))) catch 0
+            out.write(value) catch 0
+    result := out.bytes()
+    out.free()
+    return result
+
+# the outcome of one execute: rows for a select, affected count otherwise.
+struct BinaryResult:
+    rows: List[sql.Row]
+    affected: Int
+
+# run a prepared statement and read its reply: an OK packet (no result set) or a
+# binary result set of column definitions followed by binary rows.
+fn run_stmt(conn: Conn, stmt: Stmt, params: List[String]) -> BinaryResult!:
+    if params.len() != stmt.num_params:
+        fail "mysql: statement expects {stmt.num_params} params, got {params.len()}"
+    conn.send_packet(0, build_execute(stmt, params))!
+
+    first := conn.read_packet()!
+    lead := bytes.get(first, 0)
+    if lead == 255:
+        fail "mysql: {err_text(first)}"
+    if lead == 0:
+        ok := Reader(data: first, pos: 1)
+        return BinaryResult(rows: [], affected: ok.lenenc())
+
+    header := Reader(data: first, pos: 0)
+    column_count := header.lenenc()
+    mut names: List[String] := []
+    mut types: List[Int] := []
+    mut c := 0
+    while c < column_count:
+        def := read_column_def(conn)!
+        names.push(def.name)
+        types.push(def.kind)
+        c = c + 1
+    conn.read_packet()!
+
+    # binary rows: a 0x00 header, a null bitmap offset by two reserved bits,
+    # then each non-null value in binary form. an EOF packet ends the set.
+    mut rows: List[sql.Row] := []
+    while true:
+        pkt := conn.read_packet()!
+        if bytes.get(pkt, 0) == 254 and bytes.len(pkt) < 9:
+            return BinaryResult(rows: rows, affected: 0)
+        r := Reader(data: pkt, pos: 1)
+        null_bytes := (column_count + 9) / 8
+        bitmap := bytes.slice(pkt, r.pos, r.pos + null_bytes)
+        r.skip(null_bytes)
+        mut values: List[sql.Value] := []
+        mut k := 0
+        while k < column_count:
+            slot := k + 2
+            flag := bits.band(bits.shr(bytes.get(bitmap, slot / 8), slot % 8), 1)
+            if flag == 1:
+                values.push(sql.null_value())
+            else:
+                values.push(decode_binary(r, types[k])!)
+            k = k + 1
+        rows.push(sql.row(values, names))
+
+# run a prepared statement, binding `params`, and collect its rows.
+pub fn query_prepared(conn: Conn, stmt: Stmt, params: List[String]) -> Rows!:
+    result := run_stmt(conn, stmt, params)!
+    return Rows(rows: result.rows, pos: 0)
+
+# run a prepared statement for its effect, returning the number of rows it
+# affected.
+pub fn exec_prepared(conn: Conn, stmt: Stmt, params: List[String]) -> Int!:
+    result := run_stmt(conn, stmt, params)!
+    return result.affected
+
+# release a prepared statement on the server (COM_STMT_CLOSE), which sends no
+# reply.
+pub fn close_stmt(conn: Conn, stmt: Stmt) -> Bool!:
+    cmd := bytes.buffer()
+    cmd.write_byte(25) catch 0
+    cmd.write(le_int(stmt.id, 4)) catch 0
+    conn.send_packet(0, cmd.bytes())!
+    cmd.free()
+    return true
 
 # --- connection pool ---
 

@@ -9,12 +9,14 @@ the helpers in `bench/` before trusting them on different hardware.
 
 ## where pith stands
 
-all numbers from one 2-core machine in one sitting, july 2026,
-medians of 5 where quick enough to repeat. rerun 2026-07-12 after a
-json-decoding pass: a flat struct of required scalars now decodes in a
-single pass, filled straight into the struct (see event_ledger below).
-that turned json struct decode from pith's slowest per-record step into
-one of its fastest — faster than go's reflection decode.
+all numbers from one 2-core machine, medians of 5 where quick enough to
+repeat; the tables below were fully rerun 2026-07-15 (after the arc
+reclamation and weak-reference work). the standout change since the last
+rerun: std_pipeline's peak rss fell to parity with go (239 vs 238 mb,
+was 1.7x), and the cyclic-graph benchmark below shows weak references
+reclaiming reference cycles refcounting alone can't. json struct decode
+stays faster than go's reflection decode — a flat struct of required
+scalars decodes in a single pass, filled straight into the struct.
 
 the comparators drift a few percent between days; within a table they
 are comparable. go 1.24.4 (net/http, encoding/*); rust either a pinned
@@ -26,10 +28,12 @@ searches, batch json; 200k iterations:
 
 | | go | rust | pith |
 |---|---|---|---|
-| total | 401ms | 73ms | **131ms** |
+| total | 386ms | 67ms | **133ms** |
 
-3x faster than go, within 1.8x of rust. the batch json phase (~120ms)
-dominates. this rose from ~111ms when the old six-field decode helper
+2.9x faster than go, within 2x of rust (2026-07-15 rerun). the batch
+json phase (~119ms) dominates. peak rss at 200k: go 10 mb, rust 10 mb,
+pith 43 mb — pith holds the whole catalog resident where the comparators
+stream it. this rose from ~111ms when the old six-field decode helper
 was retired for the general single-pass decoder — the specialized
 helper was a little quicker but never freed the strings it decoded;
 the general one attaches the struct destructor, so it is a touch slower
@@ -40,14 +44,18 @@ gzip:
 
 | phase | go | rust | pith |
 |---|---|---|---|
-| csv read | 81 | 46 | **5** |
-| csv write | 190 | 60 | 265 |
-| transform | 44 | 29 | 382 |
-| total | 322 | 135 | 658 |
+| csv read | 72 | 47 | **4** |
+| csv write | 198 | 61 | 250 |
+| transform | 38 | 25 | 348 |
+| total | 310 | 134 | 610 |
 
-2.0x go overall (4.1x when this document began). peak rss at 200k
-records: go 254 mb, rust 273 mb, pith 436 mb — 1.7x go, down from
-5.3x pre-reclaim.
+2.0x go overall (4.1x when this document began), 2026-07-15 rerun.
+`transform` — heavy per-row string building — is the whole gap; pith's
+csv read is the fastest of the three. peak rss at 200k records: go
+238 mb, rust 266 mb, pith 239 mb — now at parity with go and below rust,
+down from 436 mb (1.7x go) earlier and 5.3x go pre-reclaim. the
+reclamation work closed the memory gap entirely on this workload; the
+runtime gap is string-assembly throughput, not allocation.
 
 `bench/event_ledger` — an ndjson event pipeline in four languages
 (pith, go, rust, zig): decode json into structs, aggregate with maps
@@ -55,12 +63,13 @@ and a set, sign an hmac-sha256 summary. 200k events:
 
 | phase | go | rust | zig | pith |
 |---|---|---|---|---|
-| gen | 105 | 31 | 21 | 317 |
-| parse | 337 | 57 | 97 | **179** |
-| analyze | 15 | 25 | 9 | 55 |
-| total | 457 | 114 | 128 | **551** |
+| gen | 118 | 29 | 19 | 307 |
+| parse | 353 | 60 | 104 | **186** |
+| analyze | 14 | 24 | 9 | 59 |
+| total | 486 | 111 | 129 | **566** |
 
-about 1.2x go on the total, and `parse` — decoding json into a struct —
+about 1.2x go on the total (2026-07-15 rerun), and `parse` — decoding
+json into a struct —
 is now faster than go's reflection decode: a flat scalar struct is
 filled in a single pass straight into the struct, no intermediate map
 and no per-field allocation. the remaining gap to go is `gen`, which is
@@ -79,6 +88,20 @@ collection churn — a list and map built and dropped per iteration,
 constant memory, 3x under go's gc, matching rust's shape. the
 url/path churn variant (heavy substring work) runs 712ms at the same
 constant 2.6 mb.
+
+`bench/cyclic_graph` — struct nodes wired into reference cycles
+(parent<->child) and dropped, 2m of them. refcounting alone cannot
+reclaim a cycle, so the strong version leaks; marking one edge of each
+cycle `weak` breaks it and the whole graph reclaims:
+
+| | strong (no weak) | weak edge |
+|---|---|---|
+| peak rss | 368 mb | **10 mb** |
+
+this is the escape hatch for the one thing reference counting can't do
+on its own. pith has no cycle collector by design (no gc pauses); a
+`weak` field is a non-owning reference that reads back as `none` once
+its target is freed. see docs/ownership.md.
 
 `bench/closure_error` — the workload the collection benchmarks don't
 reach: closures built, captured, called, and dropped every iteration,
@@ -116,21 +139,17 @@ paid that back too.
 `bench/http_server` — a json api under `wrk -t2 -c8` on `/item?id=12345`,
 this 2-core machine:
 
-| | go | pith single | pith threaded |
-|---|---|---|---|
-| req/s | ~30,800 | 8,580 | **15,700** |
-| cores used | | ~0.6 | ~1.3 |
-| rss | flat | +1.3 kb/req | +1.3 kb/req |
+| | go | pith threaded |
+|---|---|---|
+| req/s | ~31,600 | **16,800** |
+| rss | flat ~13 mb | +0.8 kb/req |
 
-the threaded server — one spawned os thread per connection — runs about
-**2x** the single-threaded one, ~15.7k vs ~8.6k req/s, using ~1.3 cores
-against ~0.6, even with wrk competing for the same two cores. an earlier
-version of this table put the two at parity (7.9k vs 7.6k), which
-contradicted the doc's own note that the threaded server reaches ~15.8k;
-that table value was anomalous — this run confirms the ~2x holds with
-wrk co-located. go's netpoller stays well ahead. the residual growth is
-~1.3–1.6 kb/request in the request path, a real per-request leak that is
-still unfixed.
+2026-07-15 rerun (20s, `wrk -t2 -c8`): the threaded server — one spawned
+os thread per connection — sustains ~16,800 req/s on this 2-core machine,
+a bit over half go's ~31,600. go's netpoller stays well ahead. the
+residual growth is down to ~0.8 kb/request (from ~1.3–1.6 earlier), a
+real per-request leak in the request path that is still unfixed —
+throughput is steady but rss climbs under sustained load.
 
 build times: go cold 25.0s / warm 0.1s; pith compiles the benchmark
 in 2.1s every time, and the entire self-hosted compiler in under 7s.

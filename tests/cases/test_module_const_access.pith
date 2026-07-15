@@ -1,0 +1,15 @@
+# reading another module's pub constant through an import alias
+# (`consts.SMALL`) used to emit an offsetless `field` instruction — the
+# emitter treated the alias member as a struct field. it now resolves to
+# the aliased module's qualified global and loads it.
+
+import module_const_helper as consts
+
+fn main() -> Int:
+    print(consts.SMALL.to_string())
+    print(consts.LARGE.to_string())
+    print(consts.LABEL)
+    print(consts.ENABLED.to_string())
+    # also exercise a constant used in an expression, not just printed
+    print((consts.LARGE + consts.SMALL).to_string())
+    return 0

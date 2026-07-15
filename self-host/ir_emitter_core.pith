@@ -4334,6 +4334,16 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
                     wrapper := ir_named_function_value_wrapper(idx, callee.name)
                     ir_emit("closure_ref " + r.to_string() + " " + wrapper)
                     return r
+            # `frames.FRAME_DATA` where the member is a module-level constant,
+            # not a function. a module alias is not a loadable value, so this
+            # can't fall through to a struct field access — resolve it to the
+            # aliased module's qualified global and load it, the same as a
+            # same-module global reference does.
+            module_path := ir_module_aliases[recv_node.value]
+            if ir_import_declares_global(module_path, fname):
+                r := ir_reg()
+                ir_emit("load " + r.to_string() + " " + ir_import_target_name(module_path, fname))
+                return r
         obj_r := ir_expr(node.children[0])
         # result fields are special: `.ok` and status checks read the tagged value,
         # not a struct field.

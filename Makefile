@@ -728,7 +728,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_iterator_drain tests/cases/test_method_fresh_string_return \
 	tests/cases/test_lazy_adapter_pipeline tests/cases/test_named_local_adapter_chain \
 	tests/cases/test_loop_var_shadows_fn tests/cases/test_weak_reference \
-	tests/cases/test_http2_concurrent_events
+	tests/cases/test_http2_concurrent_events tests/cases/test_http2_send_body
 
 memcheck: build
 	@echo "--- memcheck (valgrind, curated) ---"

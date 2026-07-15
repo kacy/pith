@@ -9,6 +9,7 @@
 # included) with no pinning.
 
 import std.net.http2.connection as http2
+import std.net.http2.hpack as hpack
 import std.bytes as bytes
 
 # a concurrent fetch worker: GET a path over a shared multiplexed client and
@@ -68,3 +69,35 @@ test "many native http/2 GETs multiplex over one connection":
     assert(r3.body_len > 65535)
     assert(r2.body_len > 0)
     assert(r4.body_len > 0)
+
+# build a body of `n` bytes of repeating digits, for the POST send-path test.
+fn filler(n: Int) -> Bytes!:
+    buf := bytes.buffer()
+    chunk := bytes.from_string_utf8("0123456789")
+    mut i := 0
+    while i < n:
+        buf.write(chunk)!
+        i = i + 10
+    result := buf.bytes()
+    buf.free()
+    return result
+
+test "a native http/2 POST streams a body past the send window":
+    host := "nghttp2.org"
+    opened := http2.open(host, 443)
+    if opened.is_err:
+        skip_test("no verifiable http/2 server reachable")
+    client := opened.ok
+    # 100000 bytes crosses both the 16384 max frame size (so the body splits into
+    # several DATA frames) and the 65535 initial send window (so the sender blocks
+    # until the server's WINDOW_UPDATE), exercising the whole send-side flow path.
+    body := filler(100000)!
+    headers := [hpack.header_field("content-type", "text/plain")]
+    attempt := client.request("POST", host, "/httpbin/post", headers, body)
+    client.close()
+    if attempt.is_err:
+        skip_test("http/2 POST endpoint unreachable")
+    r := attempt.ok
+    # httpbin echoes the request; a 200 means the server accepted the full body.
+    assert_eq(r.status, 200)
+    assert(r.body.len() > 0)

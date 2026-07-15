@@ -1,0 +1,81 @@
+# exercises the arc surface of the http/2 send-side flow control: a body sliced
+# into Bytes chunks and streamed across a channel to a consumer, with a
+# mutex-guarded send window and a credit channel a third task pokes to unblock
+# the sender when the window is exhausted — the same shape as the send_body loop
+# in std.net.http2.connection. under valgrind (make memcheck) it guards against a
+# use-after-free on the body chunks as they cross task boundaries.
+
+import std.bytes as bytes
+
+# a mutex-guarded send window, mirroring the client's per-stream credit.
+struct Window:
+    mu: Mutex
+    mut remaining: Int
+
+# reserve up to `want` bytes of window, debiting it; 0 when exhausted.
+fn reserve(w: Window, want: Int) -> Int:
+    w.mu.lock()
+    mut grant := want
+    if grant > w.remaining:
+        grant = w.remaining
+    if grant > 0:
+        w.remaining = w.remaining - grant
+    w.mu.unlock()
+    if grant < 0:
+        return 0
+    return grant
+
+# slice `body` into window-bounded chunks and hand each across the outbound
+# channel, blocking on `credit` when the window is empty. closes the channel when
+# the whole body is sent so the consumer stops.
+fn stream_body(w: Window, credit: Channel[Int], outbound: Channel[Bytes], body: Bytes) -> Int:
+    total := body.len()
+    mut off := 0
+    while off < total:
+        grant := reserve(w, total - off)
+        if grant <= 0:
+            opt := credit.recv()
+            if opt == none:
+                outbound.close()
+                return off
+            continue
+        stop := off + grant
+        outbound.send(body.slice(off, stop))
+        off = stop
+    outbound.close()
+    return off
+
+# repeatedly top up the window and poke the sender, so the blocked stream_body
+# makes progress a chunk at a time.
+fn granter(w: Window, credit: Channel[Int], rounds: Int) -> Int:
+    mut i := 0
+    while i < rounds:
+        w.mu.lock()
+        w.remaining = w.remaining + 8
+        w.mu.unlock()
+        credit.try_send(1)
+        i = i + 1
+    return rounds
+
+# drain the chunks and touch every byte so a use-after-free would trip valgrind.
+fn consume(outbound: Channel[Bytes]) -> Int:
+    mut touched := 0
+    while true:
+        opt := outbound.recv()
+        if opt == none:
+            return touched
+        chunk := opt.unwrap_or(bytes.empty())
+        touched = touched + chunk.len()
+
+fn main():
+    body := bytes.from_string_utf8("0123456789abcdefghijklmnopqrstuvwxyz-http2-send-side-payload")
+    w := Window(Mutex(), 4)
+    credit := Channel[Int](1)
+    outbound := Channel[Bytes](64)
+    sender := spawn stream_body(w, credit, outbound, body)
+    pokes := spawn granter(w, credit, 40)
+    reader := spawn consume(outbound)
+    sent := await sender
+    await pokes
+    touched := await reader
+    print("streamed {sent} bytes, consumed {touched}")

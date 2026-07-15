@@ -378,6 +378,14 @@ STREAM_INBOX_CAP := 256
 # the shared outbound frame buffer. the writer drains it continuously, so a
 # generous buffer keeps request() and the reader from stalling as they enqueue.
 OUTBOUND_CAP := 256
+# a per-stream flow-control credit poke: capacity one, since a blocked body
+# sender only needs to learn "a send window grew, re-check it". coalesced pokes
+# never lose a wakeup — if one is already buffered, the sender will still wake.
+CREDIT_POKE_CAP := 1
+# the concurrent-stream admission poke buffer: a freed stream slot pokes a
+# waiting request(). a generous buffer keeps freed slots from being lost when
+# several requests are queued behind the peer's MAX_CONCURRENT_STREAMS limit.
+SLOT_POKE_CAP := 256
 
 # a multiplexed http/2 client over one connection. many request() calls share
 # it: the reader and writer tasks run for the client's lifetime, and the mutex
@@ -403,6 +411,20 @@ pub struct Client:
     # header footprint before it is sent.
     mut peer_max_frame_size: Int
     mut peer_max_header_list: Int
+    # send-side flow control (RFC 9113 §6.9). we may not send more DATA than the
+    # peer's windows allow. `conn_send_window` is the connection-level credit
+    # (starts at the default, grows only on a stream-0 WINDOW_UPDATE);
+    # `send_windows` holds each open stream's credit; `peer_initial_window` is
+    # the value new stream windows start at (the peer's SETTINGS_INITIAL_WINDOW_SIZE).
+    # `credit` pokes a stream's blocked body sender when a window grows.
+    mut conn_send_window: Int
+    mut peer_initial_window: Int
+    send_windows: Map[Int, Int]
+    credit: Map[Int, Channel[Int]]
+    # the peer's SETTINGS_MAX_CONCURRENT_STREAMS (0 = unlimited). request() waits
+    # on `slot_free` for a slot when the cap is reached; forget() pokes it.
+    mut max_concurrent: Int
+    slot_free: Channel[Int]
 
 # a placeholder write task for offline clients, which drive the reader directly
 # and never spawn a real writer over the shared outbound channel.
@@ -415,12 +437,14 @@ pub fn open(host: String, port: Int) -> Client!:
     conn := connect(host, port)!
     ids: List[Int] := []
     table: Map[Int, Channel[StreamEvent]] := {}
+    windows: Map[Int, Int] := {}
+    credit: Map[Int, Channel[Int]] := {}
     outbound := Channel[Bytes](OUTBOUND_CAP)
     closed := AtomicInt(0)
     # the writer owns the send direction; spawn it before the client exists so
     # its handle can be stored for a clean, flushing shutdown.
     writer := spawn writer_loop(outbound, conn, closed)
-    client := Client(conn, Mutex(), 1, table, ids, outbound, closed, false, 0, writer, frames.DEFAULT_MAX_FRAME_SIZE, 0)
+    client := Client(conn, Mutex(), 1, table, ids, outbound, closed, false, 0, writer, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP))
     spawn reader_loop(client)
     return client
 
@@ -488,10 +512,11 @@ fn handle_frame(client: Client, frame: frames.Frame) -> Bool!:
         return true
     if t == frames.FRAME_WINDOW_UPDATE:
         wu := frames.parse_window_update(frame)!
-        # a zero increment is a protocol error (RFC 9113 §6.9); otherwise the
-        # credit only grows our send window, which a GET never uses, so ignore it.
+        # a zero increment is a protocol error (RFC 9113 §6.9). otherwise the
+        # credit grows a send window; apply it and wake any blocked body sender.
         if wu.increment == 0:
             fail "http2: WINDOW_UPDATE with a zero increment"
+        grant_send_credit(client, wu.stream_id, wu.increment)
         return true
     if t == frames.FRAME_GOAWAY:
         ga := frames.parse_goaway(frame)!
@@ -517,6 +542,12 @@ fn handle_goaway(client: Client, ga: frames.GoawayFrame) -> Bool!:
             if client.streams.contains_key(sid):
                 client.streams[sid].close()
                 client.streams.remove(sid)
+            # wake any body sender on a dropped stream so it stops.
+            if client.credit.contains_key(sid):
+                client.credit[sid].close()
+                client.credit.remove(sid)
+            if client.send_windows.contains_key(sid):
+                client.send_windows.remove(sid)
         else:
             survivors.push(sid)
     client.active = survivors
@@ -558,13 +589,22 @@ fn fail_all(client: Client):
     for stream_id in client.active:
         if client.streams.contains_key(stream_id):
             client.streams[stream_id].close()
+        # closing the credit channel wakes a blocked body sender to give up.
+        if client.credit.contains_key(stream_id):
+            client.credit[stream_id].close()
     empty: Map[Int, Channel[StreamEvent]] := {}
+    empty_windows: Map[Int, Int] := {}
+    empty_credit: Map[Int, Channel[Int]] := {}
     client.streams = empty
+    client.send_windows = empty_windows
+    client.credit = empty_credit
     client.active = []
     client.mu.unlock()
     # unblock any request waiting on a full outbound channel now the writer is
     # stopping, so it fails fast instead of hanging.
     client.outbound.close()
+    # unblock any request queued for a concurrency slot.
+    client.slot_free.close()
 
 # the writer task: drain the outbound channel and write each serialized frame in
 # order. stops when the channel is closed (close()) or a write fails. it owns the
@@ -616,11 +656,13 @@ fn assemble_response(inbox: Channel[StreamEvent]) -> Response!:
 
 # apply the peer's SETTINGS (RFC 9113 §6.5.2). the header-table-size bounds our
 # hpack encoder so the indices we emit stay valid for the peer's decoder; the
-# frame size and header-list size are recorded to shape and gate what we send.
-# unknown or push-related identifiers are ignored — a client never sends bodies
-# yet, so the send-window and push settings have nothing to act on here.
+# frame size and header-list size shape and gate what we send; the initial
+# window size sets new streams' send credit and retroactively resizes open ones;
+# max-concurrent-streams caps how many streams we open at once. push-related and
+# unknown identifiers are ignored.
 fn apply_settings(client: Client, settings: List[frames.Setting]):
     client.mu.lock()
+    mut admit_more := false
     for s in settings:
         if s.id == SETTINGS_HEADER_TABLE_SIZE:
             client.conn.encoder.set_max_table_size(s.value)
@@ -628,7 +670,21 @@ fn apply_settings(client: Client, settings: List[frames.Setting]):
             client.peer_max_frame_size = s.value
         elif s.id == SETTINGS_MAX_HEADER_LIST_SIZE:
             client.peer_max_header_list = s.value
+        elif s.id == SETTINGS_INITIAL_WINDOW_SIZE:
+            # RFC 9113 §6.9.2: a change adjusts every open stream's send window
+            # by the delta from the previous initial value.
+            delta := s.value - client.peer_initial_window
+            client.peer_initial_window = s.value
+            for sid in client.active:
+                if client.send_windows.contains_key(sid):
+                    client.send_windows.insert(sid, client.send_windows[sid] + delta)
+        elif s.id == SETTINGS_MAX_CONCURRENT_STREAMS:
+            client.max_concurrent = s.value
+            admit_more = true
     client.mu.unlock()
+    # a raised (or first-seen) limit may let a queued request() proceed.
+    if admit_more:
+        client.slot_free.try_send(1)
 
 # the uncompressed size an hpack header list counts against
 # SETTINGS_MAX_HEADER_LIST_SIZE: each field is its name and value octets plus a
@@ -666,7 +722,99 @@ fn header_block_wire(stream_id: Int, block: Bytes, end_stream: Bool, max_frame_s
     out.free()
     return result
 
+# apply an inbound WINDOW_UPDATE to our send windows and wake any body sender
+# waiting on the affected stream. a stream-0 update grows the connection window,
+# which may unblock any stream, so it pokes them all; a stream id grows just
+# that one stream. pokes are sent outside the mutex so a full poke channel (one
+# already pending) never blocks the reader.
+fn grant_send_credit(client: Client, stream_id: Int, increment: Int):
+    client.mu.lock()
+    if stream_id == 0:
+        client.conn_send_window = client.conn_send_window + increment
+        mut waiters: List[Channel[Int]] := []
+        for sid in client.active:
+            if client.credit.contains_key(sid):
+                waiters.push(client.credit[sid])
+        client.mu.unlock()
+        for ch in waiters:
+            ch.try_send(1)
+        return
+    if client.send_windows.contains_key(stream_id):
+        client.send_windows.insert(stream_id, client.send_windows[stream_id] + increment)
+    if client.credit.contains_key(stream_id):
+        ch := client.credit[stream_id]
+        client.mu.unlock()
+        ch.try_send(1)
+        return
+    client.mu.unlock()
+
+# stream a request body as DATA frames over the client, honoring the peer's send
+# windows (RFC 9113 §6.9): reserve credit bounded by the stream window, the
+# connection window, and the max frame size; send that much; and block on the
+# stream's credit signal when no window is available, until a WINDOW_UPDATE grows
+# one. runs as its own task so the response can be read while the body sends. it
+# stops early (returning the bytes sent so far) if the connection drops — the
+# waiting request() then fails on the closed inbox. an empty body sends nothing;
+# its END_STREAM rode on the HEADERS frame.
+fn send_body(client: Client, stream_id: Int, body: Bytes) -> Int:
+    total := body.len()
+    mut off := 0
+    while off < total:
+        grant := client.reserve_send(stream_id, total - off)
+        if grant <= 0:
+            # no credit right now: wait for a poke, or give up if the connection
+            # closed (its credit channel is then closed and recv reports none).
+            if not client.await_credit(stream_id):
+                return off
+            continue
+        stop := off + grant
+        frame := frames.data_frame(stream_id, body.slice(off, stop), stop == total)
+        wire := frames.frame_bytes(frame)
+        if wire.is_err:
+            return off
+        if not client.outbound.send(wire.ok):
+            return off
+        off = stop
+    return off
+
 impl Client:
+    # reserve up to `want` bytes of send credit for `stream_id`, bounded by the
+    # stream window, the connection window, and the peer's max frame size.
+    # returns the bytes reserved (0 when no credit is available), debiting both
+    # windows by that amount. a window can be negative after a settings shrink,
+    # so a non-positive result just means "wait".
+    fn reserve_send(stream_id: Int, want: Int) -> Int:
+        self.mu.lock()
+        mut win := 0
+        if self.send_windows.contains_key(stream_id):
+            win = self.send_windows[stream_id]
+        mut grant := want
+        if grant > win:
+            grant = win
+        if grant > self.conn_send_window:
+            grant = self.conn_send_window
+        if grant > self.peer_max_frame_size:
+            grant = self.peer_max_frame_size
+        if grant > 0:
+            self.send_windows.insert(stream_id, win - grant)
+            self.conn_send_window = self.conn_send_window - grant
+        self.mu.unlock()
+        if grant < 0:
+            return 0
+        return grant
+
+    # block until this stream's credit is poked (a WINDOW_UPDATE grew a window),
+    # returning false if the connection closed instead (the channel was closed).
+    fn await_credit(stream_id: Int) -> Bool:
+        self.mu.lock()
+        if not self.credit.contains_key(stream_id):
+            self.mu.unlock()
+            return false
+        ch := self.credit[stream_id]
+        self.mu.unlock()
+        opt := ch.recv()
+        return opt != none
+
     # serialize a frame and queue it for the writer task.
     fn enqueue(frame: frames.Frame) -> Bool!:
         return self.outbound.send(frames.frame_bytes(frame)!)
@@ -681,26 +829,45 @@ impl Client:
             self.enqueue(frames.window_update_frame(stream_id, amount)!)!
         return true
 
-    # remove a finished stream from the table.
+    # remove a finished stream from the table and its flow-control state, then
+    # free a concurrency slot so a request queued behind the peer's limit can go.
     fn forget(stream_id: Int):
         self.mu.lock()
         if self.streams.contains_key(stream_id):
             self.streams.remove(stream_id)
+        if self.send_windows.contains_key(stream_id):
+            self.send_windows.remove(stream_id)
+        if self.credit.contains_key(stream_id):
+            self.credit[stream_id].close()
+            self.credit.remove(stream_id)
         self.active = list_remove_int(self.active, stream_id)
         self.mu.unlock()
+        self.slot_free.try_send(1)
 
-    # send a request with the given header fields and read its response. safe to
-    # call from many tasks concurrently; each call drives its own stream. the id
-    # is allocated and the HEADERS frame enqueued under the mutex so ids stay
-    # monotonic and hpack encoding matches wire order.
-    fn request(fields: List[hpack.HeaderField]) -> Response!:
+    # send a request with the given header fields and body, and read its
+    # response. an empty body sends END_STREAM on the HEADERS frame; a non-empty
+    # body streams as flow-controlled DATA frames on its own task while the
+    # response is read. safe to call from many tasks concurrently; each call
+    # drives its own stream. a slot is awaited first when the peer caps
+    # concurrency; the id is allocated and the HEADERS enqueued under the mutex so
+    # ids stay monotonic and hpack encoding matches wire order.
+    fn do_request(fields: List[hpack.HeaderField], body: Bytes) -> Response!:
         self.mu.lock()
-        if self.closed.load() != 0:
+        # wait for a stream slot when the peer caps concurrency (RFC 9113 §5.1.2).
+        while true:
+            if self.closed.load() != 0:
+                self.mu.unlock()
+                fail "http2: client is closed"
+            if self.going_away:
+                self.mu.unlock()
+                fail "http2: peer sent GOAWAY; not opening new streams"
+            if self.max_concurrent <= 0 or self.active.len() < self.max_concurrent:
+                break
             self.mu.unlock()
-            fail "http2: client is closed"
-        if self.going_away:
-            self.mu.unlock()
-            fail "http2: peer sent GOAWAY; not opening new streams"
+            slot := self.slot_free.recv()
+            if slot == none:
+                fail "http2: client is closed"
+            self.mu.lock()
         if self.peer_max_header_list > 0 and header_list_size(fields) > self.peer_max_header_list:
             self.mu.unlock()
             fail "http2: request header list exceeds the peer's limit"
@@ -709,8 +876,11 @@ impl Client:
         inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
         self.streams.insert(stream_id, inbox)
         self.active.push(stream_id)
+        self.send_windows.insert(stream_id, self.peer_initial_window)
+        self.credit.insert(stream_id, Channel[Int](CREDIT_POKE_CAP))
+        has_body := body.len() > 0
         block := self.conn.encoder.encode(fields)
-        built := header_block_wire(stream_id, block, true, self.peer_max_frame_size)
+        built := header_block_wire(stream_id, block, not has_body, self.peer_max_frame_size)
         if built.is_err:
             self.mu.unlock()
             self.forget(stream_id)
@@ -720,16 +890,39 @@ impl Client:
         if not accepted:
             self.forget(stream_id)
             fail "http2: connection closed"
+        if has_body:
+            # send the body concurrently so response frames are read as it flows.
+            # bind self to a local: a spawn thunk cannot load `self` directly.
+            me := self
+            sender := spawn send_body(me, stream_id, body)
+            attempt := assemble_response(inbox)
+            await sender
+            self.forget(stream_id)
+            if attempt.is_err:
+                fail attempt.err
+            return attempt.ok
+        # no body: END_STREAM already rode on the HEADERS frame.
         attempt := assemble_response(inbox)
         self.forget(stream_id)
         if attempt.is_err:
             fail attempt.err
         return attempt.ok
 
+    # send a request built from a method, authority, path, extra header fields,
+    # and a body, returning the response. the four pseudo-headers are filled in;
+    # `extra` carries regular headers such as content-type. this is the entry
+    # point for non-GET verbs and request bodies — a grpc unary call is a POST
+    # whose body is a length-prefixed protobuf message.
+    pub fn request(method: String, authority: String, path: String, extra: List[hpack.HeaderField], body: Bytes) -> Response!:
+        mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
+        for f in extra:
+            fields.push(f)
+        return self.do_request(fields, body)!
+
     # GET a path on the given authority over this client.
     pub fn get(authority: String, path: String) -> Response!:
-        request := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
-        return self.request(request)!
+        fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
+        return self.do_request(fields, bytes.empty())!
 
     # stop the reader and writer tasks and close the connection. a GOAWAY is
     # queued first and the writer is awaited so it flushes before the transport
@@ -873,7 +1066,9 @@ test "a RST_STREAM on our stream fails the response":
 fn offline_client(conn: Connection) -> Client:
     ids: List[Int] := []
     table: Map[Int, Channel[StreamEvent]] := {}
-    return Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), frames.DEFAULT_MAX_FRAME_SIZE, 0)
+    windows: Map[Int, Int] := {}
+    credit: Map[Int, Channel[Int]] := {}
+    return Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP))
 
 # pull the next event off an inbox, failing if the channel closed first.
 fn next_event(inbox: Channel[StreamEvent]) -> StreamEvent!:
@@ -1099,3 +1294,83 @@ test "header_block_wire splits a large block into HEADERS + CONTINUATION":
     out.free()
     # the split frames reassemble to exactly the original block.
     assert_eq(hx(reassembled), hx(block))
+
+# --- send-side flow control tests (phase 5a) ---
+
+# register a stream on an offline client with the given send windows, ready for
+# the flow-control helpers to act on it.
+fn arm_send_stream(client: Client, stream_id: Int, stream_window: Int, conn_window: Int, max_frame: Int):
+    client.streams.insert(stream_id, Channel[StreamEvent](STREAM_INBOX_CAP))
+    client.active.push(stream_id)
+    client.send_windows.insert(stream_id, stream_window)
+    client.credit.insert(stream_id, Channel[Int](CREDIT_POKE_CAP))
+    client.conn_send_window = conn_window
+    client.peer_max_frame_size = max_frame
+
+# read the next DATA frame off an outbound channel, failing if it closed first.
+fn next_data_frame(ch: Channel[Bytes]) -> frames.DataFrame!:
+    opt := ch.recv()
+    if opt == none:
+        fail "expected a DATA frame but the outbound channel was closed"
+    frame := frames.read_frame(binary.reader(opt?), frames.MAX_ALLOWED_FRAME_SIZE)!
+    return frames.parse_data(frame)!
+
+test "reserve_send is bounded by the stream and connection windows":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    arm_send_stream(client, 1, 10, 6, 100)
+    # min(want 8, stream 10, conn 6, frame 100) = 6, debited from both windows.
+    assert_eq(client.reserve_send(1, 8), 6)
+    assert_eq(client.send_windows[1], 4)
+    assert_eq(client.conn_send_window, 0)
+    # no connection credit left: nothing can be reserved.
+    assert_eq(client.reserve_send(1, 4), 0)
+    assert_eq(client.send_windows[1], 4)
+
+test "reserve_send caps a chunk at the peer's max frame size":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    arm_send_stream(client, 1, 1000, 1000, 16)
+    assert_eq(client.reserve_send(1, 1000), 16)
+
+test "grant_send_credit grows the stream and connection windows":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    arm_send_stream(client, 1, 0, 0, 100)
+    grant_send_credit(client, 1, 50)
+    assert_eq(client.send_windows[1], 50)
+    grant_send_credit(client, 0, 30)
+    assert_eq(client.conn_send_window, 30)
+
+test "a new SETTINGS_INITIAL_WINDOW_SIZE resizes open stream windows by the delta":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    client.streams.insert(1, Channel[StreamEvent](1))
+    client.active.push(1)
+    client.send_windows.insert(1, DEFAULT_INITIAL_WINDOW)
+    # the peer shrinks the initial window; the open stream shrinks by the delta.
+    apply_settings(client, [frames.setting(SETTINGS_INITIAL_WINDOW_SIZE, 1000)])
+    assert_eq(client.peer_initial_window, 1000)
+    assert_eq(client.send_windows[1], 1000)
+
+test "apply_settings records the peer's max concurrent streams":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    apply_settings(client, [frames.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 3)])
+    assert_eq(client.max_concurrent, 3)
+
+test "send_body splits a body across the window and finishes after a WINDOW_UPDATE":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    # a 4-byte window on both the stream and the connection, a large frame cap.
+    arm_send_stream(client, 1, 4, 4, 100)
+    body := bytes.from_string_utf8("abcdefghij")
+    sender := spawn send_body(client, 1, body)
+    # the first DATA carries the initial 4-byte window. reading it proves the
+    # sender sent it and is now blocked waiting for more credit, which makes the
+    # split deterministic rather than a race with the grants below.
+    first := next_data_frame(client.outbound)!
+    assert_eq(first.data.to_string_utf8()!, "abcd")
+    assert(not first.end_stream)
+    # grant the remaining six bytes on both windows; the sender wakes and sends.
+    grant_send_credit(client, 1, 6)
+    grant_send_credit(client, 0, 6)
+    total := await sender
+    assert_eq(total, 10)
+    second := next_data_frame(client.outbound)!
+    assert_eq(second.data.to_string_utf8()!, "efghij")
+    assert(second.end_stream)

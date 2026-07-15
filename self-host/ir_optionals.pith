@@ -95,3 +95,20 @@ pub fn ir_emit_optional_some_value(value_r: Int) -> Int:
     flag_r := ir_reg()
     ir_emit("iconst " + flag_r.to_string() + " 1")
     return ir_emit_optional_tuple(flag_r, value_r)
+
+# like ir_emit_optional_some_value, but the optional OWNS its rc payload: it
+# carries a destructor that releases the payload when the optional dies, so a
+# `Node?` field keeps its target alive instead of borrowing a pointer that
+# dangles once the target's other owner goes out of scope. the caller is
+# responsible for the balancing retain when the payload arrives borrowed.
+# `payload_kind` is an rc kind (struct/list/map/set/bytes/closure); the matching
+# __opt_dtor_<kind> is emitted once per module by ir_emit_optional_dtors.
+pub fn ir_emit_optional_owned_some(value_r: Int, payload_kind: String) -> Int:
+    flag_r := ir_reg()
+    ir_emit("iconst " + flag_r.to_string() + " 1")
+    tuple_r := ir_emit_optional_tuple(flag_r, value_r)
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " __opt_dtor_" + payload_kind)
+    dr := ir_reg()
+    ir_emit("call " + dr.to_string() + " pith_struct_set_dtor void 2 " + tuple_r.to_string() + " " + fr.to_string())
+    return tuple_r

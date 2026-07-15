@@ -1,0 +1,42 @@
+# an optional struct field keeps its target alive: a chain built in a helper and
+# returned survives later allocations that would otherwise reuse the freed nodes.
+# before optionals owned their payload, the tail nodes dangled and this read
+# garbage.
+
+struct Node:
+    value: Int
+    next: Node?
+
+fn build_chain() -> Node:
+    a := Node(value: 10, next: none)
+    b := Node(value: 20, next: a)
+    c := Node(value: 30, next: b)
+    return c
+
+fn churn():
+    mut i := 0
+    while i < 100:
+        junk := Node(value: 0 - 1, next: none)
+        i = i + 1
+
+fn sum_from(head: Node) -> Int:
+    mut total := head.value
+    mut cur := head.next
+    while cur != none:
+        n := cur.value()
+        total = total + n.value
+        cur = n.next
+    return total
+
+fn main() -> Int!:
+    head := build_chain()
+    churn()
+    print("chain sum after churn: {sum_from(head)}")
+
+    # reassigning an optional field releases the old target and owns the new one
+    mut node := Node(value: 1, next: none)
+    node.next = Node(value: 5, next: none)
+    node.next = Node(value: 9, next: none)
+    if node.next != none:
+        print("reassigned next: {node.next.value().value}")
+    return 0

@@ -59,7 +59,7 @@ from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_fun
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
-from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_none_value, ir_emit_optional_some_value
+from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
@@ -1412,6 +1412,13 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
         if actual_tid >= 0:
             actual_info := get_type_info(actual_tid)
             if actual_info.kind == "optional" or actual_info.kind == "result" or actual_info.kind == "tuple":
+                # a passed-through optional/result/tuple is owned at this
+                # position; take a count when it arrives borrowed so the holder
+                # can release it. freshly wrapped optionals below are already
+                # owned, and the struct-construction site no longer retains
+                # tuple-typed fields, so this is the single owning retain.
+                if ir_string_expr_is_borrowed(val_idx):
+                    ir_rc_retain_reg(value_r, "tuple")
                 return value_r
         # in a generic impl body, a method call's checked type is often
         # TID_ERR because the body was checked with the struct's type
@@ -1420,6 +1427,16 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
         # than wrap-it-as-Some.
         if ir_current_impl_subst_params.len() > 0 and (vn.kind == "method_call" or vn.kind == "call"):
             return value_r
+        # an optional wrapping an rc payload (a struct, list, map, set, bytes, or
+        # closure) OWNS it: take a count when the value arrives borrowed, and
+        # attach a destructor so the payload is released when the optional dies.
+        # this keeps a `Node?` field's target alive instead of dangling. strings
+        # stay borrowed (copy-on-derive already keeps them safe).
+        payload_kind := ir_rc_kind(ir_infer_type(val_idx))
+        if payload_kind == "struct" or payload_kind == "list" or payload_kind == "map" or payload_kind == "set" or payload_kind == "bytes" or payload_kind == "closure":
+            if ir_string_expr_is_borrowed(val_idx):
+                ir_rc_retain_reg(value_r, payload_kind)
+            return ir_emit_optional_owned_some(value_r, payload_kind)
         return ir_emit_optional_some_value(value_r)
     empty_init_call := ir_empty_collection_init_call_name(vn.kind, vn.children.len(), target_type)
     if empty_init_call.len() > 0:
@@ -3915,7 +3932,9 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int]) -> Int:
         if value_node >= 0:
             fr := ir_emit_value_for_target(value_node, field_type)
             named_field_kind := ir_rc_kind(field_type)
-            if named_field_kind.len() > 0 and ir_string_expr_is_borrowed(value_node):
+            # tuple-typed (optional) field values arrive already owned from
+            # ir_emit_value_for_target, so they must not be retained again.
+            if named_field_kind.len() > 0 and named_field_kind != "tuple" and ir_string_expr_is_borrowed(value_node):
                 ir_rc_retain_reg(fr, named_field_kind)
             field_regs.push(fr)
         else:
@@ -3951,7 +3970,8 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int]) -> Int:
             value_idx = cn.children[0]
         fr := ir_emit_value_for_target(value_idx, ftype)
         pos_field_kind := ir_rc_kind(ftype)
-        if pos_field_kind.len() > 0 and ir_string_expr_is_borrowed(value_idx):
+        # tuple-typed (optional) field values arrive already owned; don't retain.
+        if pos_field_kind.len() > 0 and pos_field_kind != "tuple" and ir_string_expr_is_borrowed(value_idx):
             ir_rc_retain_reg(fr, pos_field_kind)
         field_regs.push(fr)
         field_idx = field_idx + 1
@@ -4511,8 +4531,9 @@ fn ir_emit_bind_stmt(node: Node):
         if tracked and ir_rc_release_enabled(bind_kind):
             old_r = ir_reg()
             ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
-        r := ir_emit_value_for_target(val_idx, ir_map_init_target(name, target_type))
-        if tracked and ir_string_expr_is_borrowed(val_idx):
+        bind_target := ir_map_init_target(name, target_type)
+        r := ir_emit_value_for_target(val_idx, bind_target)
+        if tracked and bind_target != "tuple" and ir_string_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:
             ir_rc_release_reg(old_r, bind_kind)
@@ -4538,8 +4559,9 @@ fn ir_emit_assign_stmt(node: Node):
             if tracked or (legacy_kind == "string" and ir_global_string_names.contains(name)):
                 old_r = ir_reg()
                 ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
-        r := ir_emit_value_for_target(node.children[0], ir_map_init_target(name, ir_lookup_name_type(name)))
-        if legacy_kind.len() > 0 and ir_string_expr_is_borrowed(node.children[0]):
+        legacy_target := ir_map_init_target(name, ir_lookup_name_type(name))
+        r := ir_emit_value_for_target(node.children[0], legacy_target)
+        if legacy_kind.len() > 0 and legacy_target != "tuple" and ir_string_expr_is_borrowed(node.children[0]):
             ir_rc_retain_reg(r, legacy_kind)
         if old_r >= 0:
             ir_rc_release_reg(old_r, legacy_kind)
@@ -4584,7 +4606,10 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
         old_r = ir_reg()
         ir_emit_named_field_access(old_r, obj_r, lookup_key, fname, value_type)
     value_r := ir_emit_value_for_target(value_idx, value_type)
-    if fassign_kind.len() > 0 and ir_string_expr_is_borrowed(value_idx):
+    # a tuple-typed (optional) rhs is already owned from ir_emit_value_for_target,
+    # so it must not be retained again; the old value is still released below, so
+    # its payload is freed via the optional's destructor.
+    if fassign_kind.len() > 0 and fassign_kind != "tuple" and ir_string_expr_is_borrowed(value_idx):
         ir_rc_retain_reg(value_r, fassign_kind)
     ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + value_r.to_string())
     if old_r >= 0:
@@ -4633,8 +4658,10 @@ fn ir_emit_compound_assignment(node: Node):
             if tracked or (assign_kind == "string" and ir_global_string_names.contains(name)):
                 old_r = ir_reg()
                 ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
-        r := ir_emit_value_for_target(node.children[1], ir_map_init_target(name, target_type))
-        if assign_kind.len() > 0 and ir_string_expr_is_borrowed(node.children[1]):
+        assign_target := ir_map_init_target(name, target_type)
+        r := ir_emit_value_for_target(node.children[1], assign_target)
+        # a tuple (optional) rhs is owned from ir_emit_value_for_target; don't retain.
+        if assign_kind.len() > 0 and assign_target != "tuple" and ir_string_expr_is_borrowed(node.children[1]):
             ir_rc_retain_reg(r, assign_kind)
         if old_r >= 0:
             ir_rc_release_reg(old_r, assign_kind)
@@ -5734,6 +5761,26 @@ fn ir_emit_attach_dtor(struct_r: Int, raw_name: String):
 # field, then the runtime frees the allocation. every module emits its
 # own copy (module prefixing keeps the names distinct), so construction
 # sites never need cross-module destructor references.
+# one destructor per rc payload kind for owned optionals. an optional that owns
+# a struct/list/map/set/bytes/closure payload attaches the matching dtor, which
+# releases the payload (slot 1) when the optional tuple dies. release on a null
+# payload is a no-op, so no is_some guard is needed — none tuples never carry a
+# dtor anyway.
+fn ir_emit_optional_dtors():
+    kinds := ["struct", "list", "map", "set", "bytes", "closure"]
+    for k in kinds:
+        ir_emit_func_header("__opt_dtor_" + k, 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        vr := ir_reg()
+        ir_emit("field " + vr.to_string() + " " + pr.to_string() + " 8 unknown value")
+        ir_rc_release_reg(vr, k)
+        zr := ir_reg()
+        ir_emit("iconst " + zr.to_string() + " 0")
+        ir_emit("ret " + zr.to_string())
+        ir_emit("endfunc")
+
 fn ir_emit_struct_dtors():
     for sname in ir_struct_names.keys():
         if sname.index_of("[") >= 0:
@@ -5954,9 +6001,10 @@ fn ir_emit_init_globals(root: Node):
                 target = ir_resolve_type_node(parts.type_idx)
             if target.len() == 0:
                 target = ir_infer_type(parts.val_idx)
-            r := ir_emit_value_for_target(parts.val_idx, ir_map_init_target(gname, target))
+            gtarget := ir_map_init_target(gname, target)
+            r := ir_emit_value_for_target(parts.val_idx, gtarget)
             gkind := ir_rc_kind(target)
-            if gkind.len() > 0 and ir_string_expr_is_borrowed(parts.val_idx):
+            if gkind.len() > 0 and gtarget != "tuple" and ir_string_expr_is_borrowed(parts.val_idx):
                 ir_rc_retain_reg(r, gkind)
             ir_emit("store " + gname + " " + r.to_string())
     dr := ir_reg()
@@ -6073,6 +6121,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_generic_dtor_args = {}
     ir_emit_global_bindings(root)
     ir_emit_init_globals(root)
+    ir_emit_optional_dtors()
     ir_emit_struct_dtors()
     ir_emit_enum_dtors()
     ir_emit_enum_eq_fns()

@@ -1,34 +1,24 @@
 # std.net.http2 — a minimal http/2 client.
 #
 # http/2 is a different protocol from http/1.1 (binary framing, multiplexed
-# streams, hpack header compression), so this is a separate module built on the
-# native h2 facade rather than the http/1.1 code in std.net.http. it is the
+# streams, hpack header compression), so this is a separate module from the
+# http/1.1 code in std.net.http. it is written entirely in pith on top of the
+# native frame codec, hpack, and connection layer under std.net.http2, riding on
+# pith's own tls 1.3 with alpn "h2" — no third-party http/2 stack. it is the
 # transport a future grpc client sits on: grpc is http/2 plus length-prefixed
 # protobuf messages and a `grpc-status` trailer.
 #
 #   r := http2.get("https://www.cloudflare.com/")!
 #   print("status {r.status}, {r.body.len()} bytes")
 #
-# the h2 + tokio + rustls stack this rides on is opt-in: build the runtime with
-# `make http2` (or `cargo build --release --features http2`) to use this module,
-# so programs that do not need http/2 keep a lean runtime. linking a program
-# that imports this module against a runtime built without the feature fails
-# with an undefined `pith_h2_*` reference.
+# get() drives a single request on a fresh connection and returns the connection
+# layer's Response (status, headers, trailers, body). to multiplex several
+# requests over one connection, use the Client in std.net.http2.connection
+# (open / open_url / request).
 
-import std.bytes as bytes
-
-# an http/2 response: the status code and the raw body bytes.
-pub struct Response:
-    pub status: Int
-    pub body: Bytes
+import std.net.http2.connection as connection
 
 # GET an https url over http/2, negotiating alpn "h2". fails when the request
 # cannot complete (connection, tls, or protocol error).
-pub fn get(url: String) -> Response!:
-    handle := pith_h2_get(url)
-    if handle == 0:
-        fail "http2: request to {url} failed"
-    status := pith_h2_response_status(handle)
-    body := pith_h2_response_body(handle)
-    pith_h2_response_free(handle)
-    return Response(status: status, body: body)
+pub fn get(url: String) -> connection.Response!:
+    return connection.get(url)!

@@ -394,8 +394,12 @@ fn issuer_matches(cert: Certificate, issuer: Certificate) -> Bool:
 fn verify_signature_for_algorithm(cert: Certificate, issuer: Certificate) -> Bool:
     if cert.signature_algorithm == "1.2.840.113549.1.1.11":
         return signature.verify_rsa_pkcs1_sha256(issuer.subject_public_key, cert.tbs_der, cert.signature)
+    if cert.signature_algorithm == "1.2.840.113549.1.1.12":
+        return signature.verify_rsa_pkcs1_sha384(issuer.subject_public_key, cert.tbs_der, cert.signature)
     if cert.signature_algorithm == "1.2.840.10045.4.3.2":
         return signature.verify_ecdsa_p256_sha256_asn1(issuer.subject_public_key, cert.tbs_der, cert.signature)
+    if cert.signature_algorithm == "1.2.840.10045.4.3.3":
+        return signature.verify_ecdsa_p384_sha384_asn1(issuer.subject_public_key, cert.tbs_der, cert.signature)
     if cert.signature_algorithm == "1.3.101.112":
         return signature.verify_ed25519(issuer.subject_public_key, cert.tbs_der, cert.signature)
     return false
@@ -586,6 +590,25 @@ test "x509 verifies client chains against trusted roots":
     assert(good.root_ca_ok)
     assert(good.signature_verified)
     assert(not bad_roots.ok)
+
+test "x509 verifies an ecdsa p-384 sha-384 chain signature":
+    leaf := parse_pem(read_file("tests/live/fixtures/p384-leaf.crt")!)!
+    ca := parse_pem(read_file("tests/live/fixtures/p384-ca.crt")!)!
+
+    # public ca intermediates sign with ecdsa-with-sha384; this is the
+    # algorithm the tls client needs to walk a real chain to a public root.
+    assert_eq(leaf.signature_algorithm, "1.2.840.10045.4.3.3")
+    assert(verify_signature(leaf, ca))
+    # a leaf does not verify against its own key.
+    assert(not verify_signature(leaf, leaf))
+
+test "x509 verifies an rsa sha-384 chain signature":
+    leaf := parse_pem(read_file("tests/live/fixtures/rsa384-leaf.crt")!)!
+    ca := parse_pem(read_file("tests/live/fixtures/rsa384-ca.crt")!)!
+
+    assert_eq(leaf.signature_algorithm, "1.2.840.113549.1.1.12")
+    assert(verify_signature(leaf, ca))
+    assert(not verify_signature(leaf, leaf))
 
 test "x509 fixture key signs rsa pss messages":
     cert := parse_pem(read_file("tests/live/fixtures/localhost.crt")!)!

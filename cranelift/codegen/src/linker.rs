@@ -20,7 +20,15 @@ pub fn link_executable(
         .arg(runtime_lib)
         .arg("-lpthread") // Required by our runtime
         .arg("-ldl") // Required by our runtime
-        .arg("-lm"); // Math library
+        .arg("-lm") // Math library
+        // Drop runtime code the program never references — a hello world pulls
+        // in `print` but not the crypto/net/json it doesn't call. Runtime
+        // functions the compiler emits are referenced by name, so anything a
+        // program actually uses stays live; only genuinely dead sections go.
+        .arg("-Wl,--gc-sections")
+        // Strip symbols and debug info from the release binary. This is the
+        // bulk of the size — an unstripped hello world is ~4x its stripped self.
+        .arg("-s");
 
     let output_result = cmd
         .output()

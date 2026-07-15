@@ -1,0 +1,413 @@
+# std.net.http2.connection — the http/2 connection lifecycle and a GET.
+#
+# a connection runs the http/2 handshake (the client preface plus a SETTINGS
+# exchange) over a transport, then drives one request stream to completion. it
+# builds on the frame codec (std.net.http2.frames) and hpack header compression
+# (std.net.http2.hpack): the request is a HEADERS frame carrying an hpack block,
+# the response is a HEADERS block followed by DATA frames until end-of-stream.
+#
+#   r := connection.get("https://www.cloudflare.com/")!
+#   print("status {r.status}, {r.body.len()} bytes")
+#
+# this is the synchronous, single-stream core. it reads and writes frames in
+# lockstep on one caller, which trivially honors http/2's rule that one reader
+# hpack-decodes header blocks in receive order. the concurrent multiplexing
+# layer (a spawned reader loop and per-stream channels) sits on top of this in a
+# later phase and reuses the same codec.
+#
+# it coexists with the h2-crate-backed std.net.http2.get during the migration;
+# both target the same servers so they can be checked against each other.
+
+# the http2 codec modules are imported before std.net.tls on purpose. the
+# self-hosted checker's module loader currently gives std.binary's Reader type
+# two identities when tls's large import graph is visited before the codec
+# modules that also import std.binary, which surfaces as spurious "expected
+# Reader, got Reader" errors. importing frames and hpack first keeps binary
+# single-identity. this is a loader-ordering bug worth fixing at the source.
+import std.net.http2.frames as frames
+import std.net.http2.hpack as hpack
+import std.bytes as bytes
+import std.binary as binary
+import std.encoding as encoding
+import std.net.url as url
+import std.net.tls as tls
+
+# --- settings identifiers (RFC 9113 §6.5.2) ---
+
+# SETTINGS_HEADER_TABLE_SIZE — the peer's hpack dynamic table bound.
+pub SETTINGS_HEADER_TABLE_SIZE := 1
+# SETTINGS_ENABLE_PUSH — whether the peer may push streams (0 disables it).
+pub SETTINGS_ENABLE_PUSH := 2
+# SETTINGS_MAX_CONCURRENT_STREAMS — the cap on simultaneously open streams.
+pub SETTINGS_MAX_CONCURRENT_STREAMS := 3
+# SETTINGS_INITIAL_WINDOW_SIZE — the initial per-stream flow-control window.
+pub SETTINGS_INITIAL_WINDOW_SIZE := 4
+# SETTINGS_MAX_FRAME_SIZE — the largest frame payload the peer will accept.
+pub SETTINGS_MAX_FRAME_SIZE := 5
+# SETTINGS_MAX_HEADER_LIST_SIZE — the largest header list the peer will accept.
+pub SETTINGS_MAX_HEADER_LIST_SIZE := 6
+
+# the default connection and stream flow-control window (RFC 9113 §6.9.2).
+pub DEFAULT_INITIAL_WINDOW := 65535
+
+# the hex of the 24-byte client connection preface,
+# "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (RFC 9113 §3.4). encoded as hex so the
+# carriage returns and line feeds are unambiguous in source.
+PREFACE_HEX := "505249202a20485454502f322e300d0a0d0a534d0d0a0d0a"
+
+# the client connection preface bytes, sent before any frame.
+fn client_preface() -> Bytes:
+    return encoding.from_hex(PREFACE_HEX) catch bytes.empty()
+
+# --- response ---
+
+# an http/2 response: the status code, decoded header fields, and body bytes.
+pub struct Response:
+    pub status: Int
+    pub headers: List[hpack.HeaderField]
+    pub body: Bytes
+
+# --- connection ---
+
+# a synchronous http/2 connection over one transport. `tls_handle` addresses
+# the tls session when `live`; when not live the connection reads from a
+# preloaded `buf` and records writes in `sent`, which the tests drive. `buf`
+# and `pos` are the receive buffer coalescing partial socket reads (frames can
+# span reads), and the encoder/decoder carry the two hpack dynamic tables.
+pub struct Connection:
+    mut tls_handle: Int
+    mut live: Bool
+    mut buf: Bytes
+    mut pos: Int
+    mut encoder: hpack.Encoder
+    mut decoder: hpack.Decoder
+    mut next_stream_id: Int
+    mut sent: Bytes
+
+# build a live connection over an established tls session handle.
+fn new_live_connection(handle: Int) -> Connection:
+    return Connection(handle, true, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty())
+
+# build an offline connection that reads `data` as if it arrived from a peer.
+# used by the tests to drive the read loop over a constructed frame stream.
+fn connection_from_frames(data: Bytes) -> Connection:
+    return Connection(0, false, data, 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty())
+
+# the SETTINGS frame the client opens with: no server push, the default window,
+# and the default max frame size (so a peer must not send larger frames).
+fn initial_settings_frame() -> frames.Frame!:
+    params := [frames.setting(SETTINGS_ENABLE_PUSH, 0), frames.setting(SETTINGS_INITIAL_WINDOW_SIZE, DEFAULT_INITIAL_WINDOW), frames.setting(SETTINGS_MAX_FRAME_SIZE, frames.DEFAULT_MAX_FRAME_SIZE)]
+    return frames.settings_frame(params)!
+
+# find the ":status" pseudo-header and parse it, or 0 when absent.
+fn status_from(headers: List[hpack.HeaderField]) -> Int:
+    for header in headers:
+        if header.name == ":status":
+            return parse_int(header.value).unwrap_or(0)
+    return 0
+
+impl Connection:
+    # read one transport chunk: the tls session when live, otherwise nothing
+    # (the offline buffer is exhausted, which reads as end-of-stream).
+    fn recv_chunk() -> Bytes!:
+        if self.live:
+            return tls.conn_from_handle(self.tls_handle).read_bytes(16384)!
+        return bytes.empty()
+
+    # read exactly `n` bytes, coalescing partial reads. fails if the transport
+    # closes first. mirrors the db drivers' buffered reader.
+    fn recv_exact(n: Int) -> Bytes!:
+        while self.buf.len() - self.pos < n:
+            chunk := self.recv_chunk()!
+            if chunk.len() == 0:
+                fail "http2: connection closed"
+            self.buf = bytes.concat(self.buf.slice(self.pos, self.buf.len()), chunk)
+            self.pos = 0
+        out := self.buf.slice(self.pos, self.pos + n)
+        self.pos = self.pos + n
+        return out
+
+    # read one frame off the transport: the 9-byte header, then its payload.
+    # the length prefix tells us how many payload bytes to pull; the whole
+    # frame is then handed back to the codec's reader, which parses and
+    # bounds-checks it against the max frame size we advertised.
+    fn read_frame() -> frames.Frame!:
+        head := self.recv_exact(9)!
+        length := length_prefix(head)!
+        payload := self.recv_exact(length)!
+        full := bytes.concat(head, payload)
+        return frames.read_frame(binary.reader(full), frames.DEFAULT_MAX_FRAME_SIZE)!
+
+    # write raw bytes to the transport, or record them when offline.
+    fn send(data: Bytes) -> Int!:
+        if self.live:
+            return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
+        self.sent = bytes.concat(self.sent, data)
+        return data.len()
+
+    # serialize and send one frame.
+    fn send_frame(frame: frames.Frame) -> Int!:
+        wire := frames.frame_bytes(frame)!
+        n := self.send(wire)!
+        return n
+
+    # send the preface and the opening SETTINGS. the response read loop acks the
+    # peer's SETTINGS when it arrives, so no separate wait is needed here.
+    fn handshake() -> Bool!:
+        self.send(client_preface())!
+        self.send_frame(initial_settings_frame()!)!
+        return true
+
+    # read a complete header block, following CONTINUATION frames until the
+    # END_HEADERS flag. per RFC 9113 §6.10 nothing else may interleave, so this
+    # reads frames directly rather than going through the main loop.
+    fn read_header_block(first: frames.HeadersFrame) -> Bytes!:
+        out := bytes.buffer()
+        out.write(first.block_fragment)!
+        mut done := first.end_headers
+        while not done:
+            frame := self.read_frame()!
+            if frame.header.frame_type != frames.FRAME_CONTINUATION:
+                out.free()
+                fail "http2: expected a CONTINUATION frame to complete the header block"
+            if frame.header.stream_id != first.stream_id:
+                out.free()
+                fail "http2: CONTINUATION frame on the wrong stream"
+            cont := frames.parse_continuation(frame)!
+            out.write(cont.block_fragment)!
+            done = cont.end_headers
+        result := out.bytes()
+        out.free()
+        return result
+
+    # grant flow-control credit for `amount` consumed body bytes: always at the
+    # connection level, and at the stream level while the stream stays open.
+    fn replenish(stream_id: Int, amount: Int, end_stream: Bool) -> Bool!:
+        if amount <= 0:
+            return true
+        self.send_frame(frames.window_update_frame(0, amount)!)!
+        if not end_stream:
+            self.send_frame(frames.window_update_frame(stream_id, amount)!)!
+        return true
+
+    # read frames until `stream_id` ends, assembling the response. servicing
+    # connection housekeeping along the way: ack SETTINGS, answer PING, honor
+    # GOAWAY and RST_STREAM, and replenish flow-control credit as body arrives.
+    fn read_response(stream_id: Int) -> Response!:
+        body := bytes.buffer()
+        mut status := 0
+        mut headers: List[hpack.HeaderField] := []
+        mut got_headers := false
+        while true:
+            frame := self.read_frame()!
+            t := frame.header.frame_type
+            if t == frames.FRAME_HEADERS:
+                hf := frames.parse_headers(frame)!
+                block := self.read_header_block(hf)!
+                # always decode to keep the hpack dynamic table in lockstep.
+                decoded := self.decoder.decode(block)!
+                if hf.stream_id == stream_id and not got_headers:
+                    headers = decoded
+                    status = status_from(decoded)
+                    got_headers = true
+                if hf.stream_id == stream_id and hf.end_stream:
+                    data := body.bytes()
+                    body.free()
+                    return Response(status, headers, data)
+            elif t == frames.FRAME_DATA:
+                df := frames.parse_data(frame)!
+                if df.stream_id == stream_id:
+                    body.write(df.data)!
+                    # flow control counts the whole frame payload, padding included.
+                    self.replenish(stream_id, frame.header.length, df.end_stream)!
+                    if df.end_stream:
+                        data := body.bytes()
+                        body.free()
+                        return Response(status, headers, data)
+            elif t == frames.FRAME_SETTINGS:
+                sf := frames.parse_settings(frame)!
+                if not sf.ack:
+                    self.send_frame(frames.settings_ack_frame())!
+            elif t == frames.FRAME_PING:
+                pf := frames.parse_ping(frame)!
+                if not pf.ack:
+                    self.send_frame(frames.ping_ack_frame(pf.opaque)!)!
+            elif t == frames.FRAME_GOAWAY:
+                ga := frames.parse_goaway(frame)!
+                if ga.last_stream_id < stream_id:
+                    body.free()
+                    fail "http2: server sent GOAWAY (error {ga.error_code}) before serving stream {stream_id}"
+            elif t == frames.FRAME_RST_STREAM:
+                rs := frames.parse_rst_stream(frame)!
+                if rs.stream_id == stream_id:
+                    body.free()
+                    fail "http2: stream {stream_id} was reset by the peer (error {rs.error_code})"
+            # WINDOW_UPDATE, PRIORITY, PUSH_PROMISE and unknown types need no
+            # action to complete a single response, so they are ignored here.
+
+    # send a GET on the next client stream and read its response.
+    fn request_get(authority: String, path: String) -> Response!:
+        stream_id := self.next_stream_id
+        self.next_stream_id = self.next_stream_id + 2
+        request := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
+        block := self.encoder.encode(request)
+        self.send_frame(frames.headers_frame(stream_id, block, true, true))!
+        return self.read_response(stream_id)!
+
+    # close the underlying transport.
+    fn close():
+        if self.live:
+            tls.conn_from_handle(self.tls_handle).close()
+
+# open a connection to `host`:`port` over tls with alpn "h2" and run the
+# handshake. fails if the peer does not negotiate http/2.
+pub fn connect(host: String, port: Int) -> Connection!:
+    config := tls.client_config()!.with_alpn(["h2"])
+    session := tls.dial_with_config(host, port, host, config)!
+    negotiated := session.negotiated_protocol()
+    if negotiated != "h2":
+        session.close()
+        fail "http2: server did not negotiate h2 (alpn '{negotiated}')"
+    conn := new_live_connection(session.handle)
+    conn.handshake()!
+    return conn
+
+# GET an https url over native http/2 and return the response. fails on a
+# connection, tls, alpn, or protocol error.
+pub fn get(url_string: String) -> Response!:
+    handle := url.parse(url_string)
+    scheme := url.scheme(handle)
+    host := url.host(handle)
+    if host == "":
+        fail "http2: could not parse a host from '{url_string}'"
+    if scheme != "https":
+        fail "http2: only https urls are supported (got scheme '{scheme}')"
+    mut port := url.port(handle)
+    if port <= 0:
+        port = 443
+    mut path := url.path(handle)
+    if path == "":
+        path = "/"
+    query := url.query(handle)
+    if query != "":
+        path = path + "?" + query
+    mut authority := host
+    if port != 443:
+        authority = "{host}:{port}"
+    conn := connect(host, port)!
+    attempt := conn.request_get(authority, path)
+    conn.close()
+    if attempt.is_err:
+        fail attempt.err
+    return attempt.ok
+
+# read the 24-bit big-endian length prefix that opens a frame header. reading
+# straight off the bytes (rather than through a Reader) keeps the frame-length
+# peek independent of the codec's reader.
+fn length_prefix(head: Bytes) -> Int!:
+    result := binary.read_u24_be_at(head, 0)
+    if result.is_err:
+        fail result.err.message
+    return result.ok
+
+# --- tests ---
+
+fn hx(data: Bytes) -> String:
+    return encoding.to_hex(data)
+
+# build a server-style frame stream in memory to drive the read loop.
+fn encode_frames(list: List[frames.Frame]) -> Bytes!:
+    out := bytes.buffer()
+    for frame in list:
+        out.write(frames.frame_bytes(frame)!)!
+    result := out.bytes()
+    out.free()
+    return result
+
+# hpack-encode a header list into a block with a fresh encoder, so a fresh
+# decoder (empty dynamic table) stays in sync.
+fn header_block(fields: List[hpack.HeaderField]) -> Bytes:
+    encoder := hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false)
+    return encoder.encode(fields)
+
+# collect the WINDOW_UPDATE frames recorded in a connection's sent stream.
+fn sent_window_updates(conn: Connection) -> List[frames.WindowUpdateFrame]!:
+    reader := binary.reader(conn.sent)
+    mut updates: List[frames.WindowUpdateFrame] := []
+    while binary.remaining(reader) > 0:
+        frame := frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!
+        if frame.header.frame_type == frames.FRAME_WINDOW_UPDATE:
+            updates.push(frames.parse_window_update(frame)!)
+    return updates
+
+test "the client preface is the exact 24-byte RFC 9113 token":
+    preface := client_preface()
+    assert_eq(preface.len(), 24)
+    assert_eq(hx(preface), PREFACE_HEX)
+    # cross-check against the human-readable form with its crlf pairs.
+    assert_eq(hx(preface), hx(bytes.from_string_utf8("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")))
+
+test "the opening SETTINGS disables push and states our limits":
+    parsed := frames.parse_settings(initial_settings_frame()!)!
+    assert(not parsed.ack)
+    assert_eq(parsed.settings.len(), 3)
+    assert_eq(parsed.settings[0].id, SETTINGS_ENABLE_PUSH)
+    assert_eq(parsed.settings[0].value, 0)
+    assert_eq(parsed.settings[2].id, SETTINGS_MAX_FRAME_SIZE)
+    assert_eq(parsed.settings[2].value, frames.DEFAULT_MAX_FRAME_SIZE)
+
+test "the read loop assembles a response from HEADERS and DATA":
+    block := header_block([hpack.header_field(":status", "200"), hpack.header_field("content-type", "text/plain")])
+    stream := encode_frames([frames.headers_frame(1, block, false, true), frames.data_frame(1, bytes.from_string_utf8("hello world"), true)])!
+    conn := connection_from_frames(stream)
+    response := conn.read_response(1)!
+    assert_eq(response.status, 200)
+    assert_eq(response.body.to_string_utf8()!, "hello world")
+    assert_eq(response.headers.len(), 2)
+    assert_eq(response.headers[1].name, "content-type")
+
+test "the read loop acks server SETTINGS before the response":
+    block := header_block([hpack.header_field(":status", "204")])
+    server_settings := frames.settings_frame([frames.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 100)])!
+    stream := encode_frames([server_settings, frames.headers_frame(1, block, true, true)])!
+    conn := connection_from_frames(stream)
+    response := conn.read_response(1)!
+    assert_eq(response.status, 204)
+    # a SETTINGS ack must have gone back to the peer.
+    reader := binary.reader(conn.sent)
+    ack := frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!
+    settings := frames.parse_settings(ack)!
+    assert(settings.ack)
+
+test "the read loop replenishes flow control as body arrives":
+    block := header_block([hpack.header_field(":status", "200")])
+    stream := encode_frames([frames.headers_frame(1, block, false, true), frames.data_frame(1, bytes.from_string_utf8("hello"), false), frames.data_frame(1, bytes.empty(), true)])!
+    conn := connection_from_frames(stream)
+    response := conn.read_response(1)!
+    assert_eq(response.body.to_string_utf8()!, "hello")
+    updates := sent_window_updates(conn)!
+    # the 5-byte DATA frame yields a connection and a stream WINDOW_UPDATE; the
+    # empty end-of-stream DATA yields none.
+    assert_eq(updates.len(), 2)
+    assert_eq(updates[0].stream_id, 0)
+    assert_eq(updates[0].increment, 5)
+    assert_eq(updates[1].stream_id, 1)
+    assert_eq(updates[1].increment, 5)
+
+test "the read loop follows CONTINUATION frames to finish a header block":
+    full := header_block([hpack.header_field(":status", "200"), hpack.header_field("x-note", "split-across-frames")])
+    first_half := full.slice(0, 3)
+    second_half := full.slice(3, full.len())
+    stream := encode_frames([frames.headers_frame(1, first_half, false, false), frames.continuation_frame(1, second_half, true), frames.data_frame(1, bytes.from_string_utf8("body"), true)])!
+    conn := connection_from_frames(stream)
+    response := conn.read_response(1)!
+    assert_eq(response.status, 200)
+    assert_eq(response.body.to_string_utf8()!, "body")
+    assert_eq(response.headers[1].name, "x-note")
+    assert_eq(response.headers[1].value, "split-across-frames")
+
+test "a RST_STREAM on our stream fails the response":
+    block := header_block([hpack.header_field(":status", "200")])
+    stream := encode_frames([frames.headers_frame(1, block, false, true), frames.rst_stream_frame(1, frames.ERROR_INTERNAL_ERROR)!])!
+    conn := connection_from_frames(stream)
+    assert(conn.read_response(1).is_err)

@@ -1274,6 +1274,39 @@ fn ir_field_receiver_type(recv_idx: Int) -> String:
             obj_type = ir_current_impl_type
     return obj_type
 
+# emit a struct field read using the checker's authoritative layout: the field's
+# position in the struct type gives the offset, its declared type gives the kind.
+# this is independent of module emission order, unlike the name-keyed lookup map
+# (which is filled as each module is emitted). a struct reached only through
+# another module's return type — one the current module never imports — is
+# emitted after its user, so it is absent from the map when the user's field
+# access is lowered, and the offset falls back to an unsound name-based guess: a
+# String field read lands on the wrong slot, silently corrupting the value.
+# returns the result register, or -1 when the checker does not type the receiver
+# as a plain (non-weak) struct, so the caller falls back to the map path.
+fn ir_try_checked_field_read(obj_r: Int, recv_idx: Int, field_name: String) -> Int:
+    recv_tid := c_get_expr_type(recv_idx)
+    if recv_tid < 0:
+        return 0 - 1
+    recv_info := get_type_info(recv_tid)
+    if recv_info.kind != "struct":
+        return 0 - 1
+    mut field_index := 0 - 1
+    for name, i in recv_info.fields:
+        if name == field_name:
+            field_index = i
+    if field_index < 0 or field_index >= recv_info.field_types.len():
+        return 0 - 1
+    # a weak field needs the optional-synthesizing read path; leave those to the
+    # map path, which already handles them.
+    if ir_struct_field_is_weak(recv_info.name, field_name):
+        return 0 - 1
+    field_offset := field_index * 8
+    field_kind := ir_type_from_tid(recv_info.field_types[field_index])
+    r := ir_reg()
+    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " " + field_offset.to_string() + " " + field_kind + " " + field_name)
+    return r
+
 fn ir_known_method_return_type(obj_type: String, meth: String) -> String:
     impl_name := ir_lookup_impl_method_name(obj_type, meth)
     if impl_name.len() > 0:
@@ -3028,6 +3061,13 @@ fn ir_emit_field_access(idx: Int, node: Node) -> Int:
     if ir_emit_tuple_field_access(r, obj_r, recv_idx, fname):
         return r
     lk := ir_field_lookup_key(recv_idx, fname)
+    # when the name-keyed layout is missing (a struct emitted after this access,
+    # reached only through another module's return type), resolve the offset from
+    # the checker instead of the unsound name-based guess the map path falls to.
+    if not ir_struct_field_index_lookup.contains_key(lk):
+        checked_r := ir_try_checked_field_read(obj_r, recv_idx, fname)
+        if checked_r >= 0:
+            return checked_r
     ir_emit_named_field_access(r, obj_r, lk, fname, ir_checked_struct_field_type(recv_idx, fname))
     # a weak field's slot holds the bare target pointer; synthesize the optional
     # the rest of the pipeline expects, resolving liveness so a reclaimed target

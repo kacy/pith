@@ -1,0 +1,510 @@
+# std.net.http2.hpack — HPACK header compression (RFC 7541).
+#
+# hpack compresses http/2 header lists against two tables: a fixed 61-entry
+# static table of common header fields, and a per-connection dynamic table
+# that both peers evolve in lockstep as fields are added. a header field is
+# encoded as either an index into a table or a literal name/value pair, and
+# strings may be Huffman-coded (see std.net.http2.huffman).
+#
+# the encoder and decoder each own a dynamic table; a connection keeps one of
+# each. because the dynamic table is stateful and order-dependent, a single
+# decoder must process inbound header blocks in the order they arrive.
+
+import std.bytes as bytes
+import std.bits as bits
+import std.binary as binary
+import std.encoding as encoding
+import std.net.http2.huffman as huffman
+
+# a decoded header field: a lowercase name and its value.
+pub struct HeaderField:
+    pub name: String
+    pub value: String
+
+# the default SETTINGS_HEADER_TABLE_SIZE (RFC 9113 §6.5.2).
+pub DEFAULT_HEADER_TABLE_SIZE := 4096
+
+# the per-entry size overhead the dynamic table charges (RFC 7541 §4.1).
+ENTRY_OVERHEAD := 32
+# the number of entries in the static table.
+STATIC_TABLE_LEN := 61
+
+# the fixed static table, cached after first use.
+mut static_cache: List[HeaderField] := []
+mut static_ready := false
+
+# build (once) and return the RFC 7541 Appendix A static table. entry N in the
+# spec is at index N-1 here.
+fn static_table() -> List[HeaderField]:
+    if static_ready:
+        return static_cache
+    static_cache = [
+        HeaderField(":authority", ""),
+        HeaderField(":method", "GET"),
+        HeaderField(":method", "POST"),
+        HeaderField(":path", "/"),
+        HeaderField(":path", "/index.html"),
+        HeaderField(":scheme", "http"),
+        HeaderField(":scheme", "https"),
+        HeaderField(":status", "200"),
+        HeaderField(":status", "204"),
+        HeaderField(":status", "206"),
+        HeaderField(":status", "304"),
+        HeaderField(":status", "400"),
+        HeaderField(":status", "404"),
+        HeaderField(":status", "500"),
+        HeaderField("accept-charset", ""),
+        HeaderField("accept-encoding", "gzip, deflate"),
+        HeaderField("accept-language", ""),
+        HeaderField("accept-ranges", ""),
+        HeaderField("accept", ""),
+        HeaderField("access-control-allow-origin", ""),
+        HeaderField("age", ""),
+        HeaderField("allow", ""),
+        HeaderField("authorization", ""),
+        HeaderField("cache-control", ""),
+        HeaderField("content-disposition", ""),
+        HeaderField("content-encoding", ""),
+        HeaderField("content-language", ""),
+        HeaderField("content-length", ""),
+        HeaderField("content-location", ""),
+        HeaderField("content-range", ""),
+        HeaderField("content-type", ""),
+        HeaderField("cookie", ""),
+        HeaderField("date", ""),
+        HeaderField("etag", ""),
+        HeaderField("expect", ""),
+        HeaderField("expires", ""),
+        HeaderField("from", ""),
+        HeaderField("host", ""),
+        HeaderField("if-match", ""),
+        HeaderField("if-modified-since", ""),
+        HeaderField("if-none-match", ""),
+        HeaderField("if-range", ""),
+        HeaderField("if-unmodified-since", ""),
+        HeaderField("last-modified", ""),
+        HeaderField("link", ""),
+        HeaderField("location", ""),
+        HeaderField("max-forwards", ""),
+        HeaderField("proxy-authenticate", ""),
+        HeaderField("proxy-authorization", ""),
+        HeaderField("range", ""),
+        HeaderField("referer", ""),
+        HeaderField("refresh", ""),
+        HeaderField("retry-after", ""),
+        HeaderField("server", ""),
+        HeaderField("set-cookie", ""),
+        HeaderField("strict-transport-security", ""),
+        HeaderField("transfer-encoding", ""),
+        HeaderField("user-agent", ""),
+        HeaderField("vary", ""),
+        HeaderField("via", ""),
+        HeaderField("www-authenticate", ""),
+]
+    static_ready = true
+    return static_cache
+
+# --- error and byte helpers ---
+
+fn read_u8(reader: binary.Reader) -> Int!:
+    result := binary.read_u8(reader)
+    if result.is_err:
+        fail result.err.message
+    return result.ok
+
+fn read_bytes(reader: binary.Reader, count: Int) -> Bytes!:
+    result := binary.read_bytes(reader, count)
+    if result.is_err:
+        fail result.err.message
+    return result.ok
+
+fn decode_utf8(data: Bytes) -> String!:
+    text := data.to_string_utf8()
+    if text.is_err:
+        fail text.err
+    return text.ok
+
+# a low bit mask of `n` ones.
+fn low_mask(n: Int) -> Int:
+    return bits.shl(1, n) - 1
+
+# --- integer coding (RFC 7541 §5.1) ---
+
+# write an integer with an `prefix_bits`-bit prefix, OR-ing `high_bits` into
+# the first octet's unused top bits.
+fn write_integer(out: ByteBuffer, value: Int, prefix_bits: Int, high_bits: Int):
+    limit := low_mask(prefix_bits)
+    if value < limit:
+        out.write_byte(bits.bor(high_bits, value)) catch 0
+        return
+    out.write_byte(bits.bor(high_bits, limit)) catch 0
+    mut rest := value - limit
+    while rest >= 128:
+        out.write_byte(bits.bor(bits.band(rest, 127), 128)) catch 0
+        rest = bits.shr(rest, 7)
+    out.write_byte(rest) catch 0
+
+# read an integer whose first octet is `first` and prefix is `prefix_bits`.
+fn read_integer(reader: binary.Reader, prefix_bits: Int, first: Int) -> Int!:
+    limit := low_mask(prefix_bits)
+    prefix := bits.band(first, limit)
+    if prefix < limit:
+        return prefix
+    mut result := limit
+    mut shift := 0
+    mut more := true
+    while more:
+        b := read_u8(reader)!
+        result = result + bits.shl(bits.band(b, 127), shift)
+        shift = shift + 7
+        if bits.band(b, 128) == 0:
+            more = false
+        if shift > 35:
+            fail "hpack integer is too large"
+    return result
+
+# --- string coding (RFC 7541 §5.2) ---
+
+# write a string literal, Huffman-coding it when that is shorter and allowed.
+fn write_string(out: ByteBuffer, text: String, use_huffman: Bool):
+    raw := bytes.from_string_utf8(text)
+    if use_huffman:
+        encoded := huffman.encode(raw)
+        if encoded.len() < raw.len():
+            write_integer(out, encoded.len(), 7, 128)
+            out.write(encoded) catch 0
+            return
+    write_integer(out, raw.len(), 7, 0)
+    out.write(raw) catch 0
+
+# read a string literal, undoing Huffman coding when the H bit is set.
+fn read_string(reader: binary.Reader) -> String!:
+    first := read_u8(reader)!
+    is_huffman := bits.band(first, 128) != 0
+    length := read_integer(reader, 7, first)!
+    raw := read_bytes(reader, length)!
+    if is_huffman:
+        return decode_utf8(huffman.decode(raw)!)!
+    return decode_utf8(raw)!
+
+# --- dynamic table (RFC 7541 §2.3.2, §4) ---
+
+# a connection's dynamic table: newest entry last, with size accounting.
+pub struct DynamicTable:
+    mut entries: List[HeaderField]
+    mut size: Int
+    mut max_size: Int
+
+# create an empty dynamic table with the given maximum size in octets.
+pub fn new_dynamic_table(max_size: Int) -> DynamicTable:
+    return DynamicTable([], 0, max_size)
+
+impl DynamicTable:
+    # the current table size in octets.
+    fn current_size() -> Int:
+        return self.size
+
+    # evict oldest entries until `incoming` more octets would fit.
+    fn evict_to_fit(incoming: Int):
+        while self.size + incoming > self.max_size and self.entries.len() > 0:
+            oldest := self.entries[0]
+            self.size = self.size - (oldest.name.len() + oldest.value.len() + ENTRY_OVERHEAD)
+            self.entries.remove(0)
+
+    # insert a field, evicting as needed. an entry larger than the whole table
+    # empties it and is not stored (RFC 7541 §4.4).
+    fn add(name: String, value: String):
+        incoming := name.len() + value.len() + ENTRY_OVERHEAD
+        self.evict_to_fit(incoming)
+        if incoming > self.max_size:
+            return
+        self.entries.push(HeaderField(name, value))
+        self.size = self.size + incoming
+
+    # apply a dynamic table size update, evicting to the new bound.
+    fn set_max_size(new_max: Int):
+        self.max_size = new_max
+        self.evict_to_fit(0)
+
+    # resolve a 1-based hpack index to its field (static then dynamic).
+    fn get_field(index: Int) -> HeaderField!:
+        if index <= 0:
+            fail "hpack index must be positive"
+        table := static_table()
+        if index <= table.len():
+            return table[index - 1]
+        position := index - table.len()
+        if position > self.entries.len():
+            fail "hpack index is out of range"
+        return self.entries[self.entries.len() - position]
+
+    # the hpack index of an exact name/value match, or 0 if none.
+    fn find_full(name: String, value: String) -> Int:
+        table := static_table()
+        mut i := 0
+        while i < table.len():
+            if table[i].name == name and table[i].value == value:
+                return i + 1
+            i = i + 1
+        mut position := 1
+        while position <= self.entries.len():
+            entry := self.entries[self.entries.len() - position]
+            if entry.name == name and entry.value == value:
+                return table.len() + position
+            position = position + 1
+        return 0
+
+    # the hpack index of a name match, or 0 if none (static preferred).
+    fn find_name(name: String) -> Int:
+        table := static_table()
+        mut i := 0
+        while i < table.len():
+            if table[i].name == name:
+                return i + 1
+            i = i + 1
+        mut position := 1
+        while position <= self.entries.len():
+            entry := self.entries[self.entries.len() - position]
+            if entry.name == name:
+                return table.len() + position
+            position = position + 1
+        return 0
+
+# --- encoder ---
+
+# an hpack encoder: a dynamic table plus a Huffman policy.
+pub struct Encoder:
+    mut table: DynamicTable
+    use_huffman: Bool
+
+# create an encoder. `use_huffman` Huffman-codes strings when that is shorter.
+pub fn new_encoder(max_size: Int, use_huffman: Bool) -> Encoder:
+    return Encoder(new_dynamic_table(max_size), use_huffman)
+
+impl Encoder:
+    # encode a header list into one header block. fields not already indexed
+    # are emitted with incremental indexing and added to the dynamic table.
+    fn encode(headers: List[HeaderField]) -> Bytes:
+        out := bytes.buffer()
+        for header in headers:
+            full := self.table.find_full(header.name, header.value)
+            if full > 0:
+                write_integer(out, full, 7, 128)
+            else:
+                name_index := self.table.find_name(header.name)
+                write_integer(out, name_index, 6, 64)
+                if name_index == 0:
+                    write_string(out, header.name, self.use_huffman)
+                write_string(out, header.value, self.use_huffman)
+                self.table.add(header.name, header.value)
+        result := out.bytes()
+        out.free()
+        return result
+
+# --- decoder ---
+
+# an hpack decoder: a dynamic table evolved by the inbound header stream.
+pub struct Decoder:
+    mut table: DynamicTable
+
+# create a decoder with the given maximum dynamic table size.
+pub fn new_decoder(max_size: Int) -> Decoder:
+    return Decoder(new_dynamic_table(max_size))
+
+# read a header-field name that is either an index or an inline literal.
+fn read_name(table: DynamicTable, reader: binary.Reader, first: Int, prefix_bits: Int) -> String!:
+    index := read_integer(reader, prefix_bits, first)!
+    if index == 0:
+        return read_string(reader)!
+    return table.get_field(index)!.name
+
+impl Decoder:
+    # decode a complete header block into its header list, updating the
+    # dynamic table as indexed and size-update instructions are processed.
+    fn decode(block: Bytes) -> List[HeaderField]!:
+        reader := binary.reader(block)
+        mut out: List[HeaderField] := []
+        while binary.remaining(reader) > 0:
+            first := read_u8(reader)!
+            if bits.band(first, 128) != 0:
+                index := read_integer(reader, 7, first)!
+                if index == 0:
+                    fail "hpack indexed field with index 0"
+                out.push(self.table.get_field(index)!)
+            elif bits.band(first, 64) != 0:
+                name := read_name(self.table, reader, first, 6)!
+                value := read_string(reader)!
+                out.push(HeaderField(name, value))
+                self.table.add(name, value)
+            elif bits.band(first, 32) != 0:
+                new_size := read_integer(reader, 5, first)!
+                self.table.set_max_size(new_size)
+            else:
+                name := read_name(self.table, reader, first, 4)!
+                value := read_string(reader)!
+                out.push(HeaderField(name, value))
+        return out
+
+# --- tests ---
+
+fn hx(data: Bytes) -> String:
+    return encoding.to_hex(data)
+
+fn field(name: String, value: String) -> HeaderField:
+    return HeaderField(name, value)
+
+# encode a single integer to hex, for the RFC 7541 C.1 examples.
+fn int_hex(value: Int, prefix_bits: Int) -> String:
+    out := bytes.buffer()
+    write_integer(out, value, prefix_bits, 0)
+    result := hx(out.bytes())
+    out.free()
+    return result
+
+# decode a single integer from a whole byte string.
+fn int_from(hex: String, prefix_bits: Int) -> Int!:
+    raw := encoding.from_hex(hex)!
+    reader := binary.reader(raw)
+    first := read_u8(reader)!
+    return read_integer(reader, prefix_bits, first)!
+
+test "hpack integer coding matches RFC 7541 C.1":
+    assert_eq(int_hex(10, 5), "0a")
+    assert_eq(int_hex(1337, 5), "1f9a0a")
+    assert_eq(int_hex(42, 8), "2a")
+    assert_eq(int_from("0a", 5)!, 10)
+    assert_eq(int_from("1f9a0a", 5)!, 1337)
+    assert_eq(int_from("2a", 8)!, 42)
+
+test "hpack integer coding survives prefix boundaries":
+    mut value := 0
+    while value < 300:
+        out := bytes.buffer()
+        write_integer(out, value, 5, 0)
+        reader := binary.reader(out.bytes())
+        first := read_u8(reader)!
+        assert_eq(read_integer(reader, 5, first)!, value)
+        out.free()
+        value = value + 1
+
+test "hpack static table has the expected shape":
+    table := static_table()
+    assert_eq(table.len(), 61)
+    assert_eq(table[1].name, ":method")
+    assert_eq(table[1].value, "GET")
+    assert_eq(table[15].value, "gzip, deflate")
+    assert_eq(table[60].name, "www-authenticate")
+
+test "hpack encodes RFC 7541 C.2.1 literal with incremental indexing":
+    encoder := new_encoder(DEFAULT_HEADER_TABLE_SIZE, false)
+    block := encoder.encode([field("custom-key", "custom-header")])
+    assert_eq(hx(block), "400a637573746f6d2d6b65790d637573746f6d2d686561646572")
+    assert_eq(encoder.table.current_size(), 55)
+
+test "hpack decodes RFC 7541 C.2.2 literal without indexing":
+    decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
+    headers := decoder.decode(encoding.from_hex("040c2f73616d706c652f70617468")!)!
+    assert_eq(headers.len(), 1)
+    assert_eq(headers[0].name, ":path")
+    assert_eq(headers[0].value, "/sample/path")
+    assert_eq(decoder.table.current_size(), 0)
+
+test "hpack decodes RFC 7541 C.2.3 literal never indexed":
+    decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
+    headers := decoder.decode(encoding.from_hex("100870617373776f726406736563726574")!)!
+    assert_eq(headers.len(), 1)
+    assert_eq(headers[0].name, "password")
+    assert_eq(headers[0].value, "secret")
+    assert_eq(decoder.table.current_size(), 0)
+
+test "hpack decodes RFC 7541 C.2.4 indexed field":
+    decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
+    headers := decoder.decode(encoding.from_hex("82")!)!
+    assert_eq(headers.len(), 1)
+    assert_eq(headers[0].name, ":method")
+    assert_eq(headers[0].value, "GET")
+
+test "hpack encodes RFC 7541 C.3.1 and C.3.2 request bytes":
+    encoder := new_encoder(DEFAULT_HEADER_TABLE_SIZE, false)
+    request1 := [field(":method", "GET"), field(":scheme", "http"), field(":path", "/"), field(":authority", "www.example.com")]
+    block1 := encoder.encode(request1)
+    assert_eq(hx(block1), "828684410f7777772e6578616d706c652e636f6d")
+    assert_eq(encoder.table.current_size(), 57)
+    request2 := [field(":method", "GET"), field(":scheme", "http"), field(":path", "/"), field(":authority", "www.example.com"), field("cache-control", "no-cache")]
+    block2 := encoder.encode(request2)
+    assert_eq(hx(block2), "828684be58086e6f2d6361636865")
+    assert_eq(encoder.table.current_size(), 110)
+
+test "hpack encodes RFC 7541 C.4.1 request with Huffman coding":
+    encoder := new_encoder(DEFAULT_HEADER_TABLE_SIZE, true)
+    request1 := [field(":method", "GET"), field(":scheme", "http"), field(":path", "/"), field(":authority", "www.example.com")]
+    block := encoder.encode(request1)
+    assert_eq(hx(block), "828684418cf1e3c2e5f23a6ba0ab90f4ff")
+    assert_eq(encoder.table.current_size(), 57)
+
+test "hpack round-trips the RFC 7541 C.3 request sequence":
+    encoder := new_encoder(DEFAULT_HEADER_TABLE_SIZE, false)
+    decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
+    request1 := [field(":method", "GET"), field(":scheme", "http"), field(":path", "/"), field(":authority", "www.example.com")]
+    request2 := [field(":method", "GET"), field(":scheme", "http"), field(":path", "/"), field(":authority", "www.example.com"), field("cache-control", "no-cache")]
+    request3 := [field(":method", "GET"), field(":scheme", "https"), field(":path", "/"), field(":authority", "www.example.com"), field("custom-key", "custom-value")]
+    out1 := decoder.decode(encoder.encode(request1))!
+    assert_eq(out1.len(), 4)
+    assert_eq(out1[3].name, ":authority")
+    assert_eq(out1[3].value, "www.example.com")
+    assert_eq(decoder.table.current_size(), 57)
+    out2 := decoder.decode(encoder.encode(request2))!
+    assert_eq(out2.len(), 5)
+    assert_eq(out2[4].value, "no-cache")
+    assert_eq(decoder.table.current_size(), 110)
+    out3 := decoder.decode(encoder.encode(request3))!
+    assert_eq(out3.len(), 5)
+    assert_eq(out3[1].value, "https")
+    assert_eq(out3[4].name, "custom-key")
+    assert_eq(out3[4].value, "custom-value")
+    assert_eq(decoder.table.current_size(), 164)
+
+test "hpack round-trips a Huffman-coded response through both tables":
+    encoder := new_encoder(DEFAULT_HEADER_TABLE_SIZE, true)
+    decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
+    response := [field(":status", "302"), field("cache-control", "private"), field("date", "Mon, 21 Oct 2013 20:13:21 GMT"), field("location", "https://www.example.com")]
+    decoded := decoder.decode(encoder.encode(response))!
+    assert_eq(decoded.len(), 4)
+    assert_eq(decoded[0].value, "302")
+    assert_eq(decoded[2].value, "Mon, 21 Oct 2013 20:13:21 GMT")
+    assert_eq(decoded[3].value, "https://www.example.com")
+
+test "hpack dynamic table evicts oldest entries to fit":
+    table := new_dynamic_table(256)
+    table.add(":authority", "www.example.com")
+    table.add("cache-control", "no-cache")
+    table.add("custom-key", "custom-value")
+    # three entries: 57 + 53 + 54 = 164 octets, all fit under 256.
+    assert_eq(table.current_size(), 164)
+    assert_eq(table.entries.len(), 3)
+    # a 110-octet entry forces eviction of the two oldest (57 + 53).
+    table.add("x-big", "0123456789012345678901234567890123456789012345678901234567890123456789012")
+    assert(table.current_size() <= 256)
+    # the oldest surviving lookups must no longer resolve :authority.
+    assert_eq(table.find_full(":authority", "www.example.com"), 0)
+
+test "hpack an entry larger than the table empties it":
+    table := new_dynamic_table(40)
+    table.add("cache-control", "no-cache")
+    # 8 + 8 + 32 = 48 octets exceeds the 40-octet table, so nothing is stored.
+    assert_eq(table.current_size(), 0)
+    assert_eq(table.entries.len(), 0)
+
+test "hpack applies a dynamic table size update from the stream":
+    decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
+    # 0x3f 0xe1 0x1f = dynamic table size update to 4096, then indexed :method GET.
+    decoder.decode(encoding.from_hex("3fe11f82")!)!
+    assert_eq(decoder.table.max_size, 4096)
+
+test "hpack rejects an indexed field with index zero":
+    decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
+    assert(decoder.decode(encoding.from_hex("80")!).is_err)
+
+test "hpack rejects an out-of-range table index":
+    decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
+    assert(decoder.decode(encoding.from_hex("ff00")!).is_err)

@@ -1,0 +1,43 @@
+# exercises std.protobuf encode/decode and buffer release under valgrind
+# (make memcheck): builds a message with mixed field types, parses every field
+# back, and frees the writer buffers. guards against a use-after-free or an
+# invalid read on the encoded bytes once the buffer that produced them is gone.
+
+import std.protobuf as protobuf
+
+fn nested() -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_int32(1, 42)!
+    out := w.bytes()
+    w.free()
+    return out
+
+fn run() -> Int!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_int32(1, 150)!
+    w.write_string(2, "pith")!
+    w.write_message(3, nested()!)!
+    w.write_packed_varints(4, [3, 270, 86942])!
+    encoded := w.bytes()
+    w.free()
+
+    r := protobuf.reader(encoded)
+    mut total := 0
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            total = total + r.read_int32()!
+        elif tag.field == 2:
+            total = total + r.read_string()!.len()
+        elif tag.field == 3:
+            total = total + r.read_message()!.len()
+        elif tag.field == 4:
+            for value in r.read_packed_varints()!:
+                total = total + value
+        else:
+            r.skip(tag.wire)!
+    return total
+
+fn main():
+    total := run() catch 0
+    print("protobuf roundtrip total {total}")

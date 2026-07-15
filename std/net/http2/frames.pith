@@ -1,0 +1,662 @@
+# std.net.http2.frames — the HTTP/2 frame codec (RFC 9113 §4-6).
+#
+# every http/2 message is a frame: a fixed 9-byte header followed by a
+# type-specific payload. the header carries the payload length, the frame
+# type, a byte of flags, and the 31-bit stream id it belongs to.
+#
+#   +-----------------------------------------------+
+#   |                 length (24)                   |
+#   +---------------+---------------+---------------+
+#   |    type (8)   |   flags (8)   |
+#   +-+-------------+---------------+-------------------------------+
+#   |r|                  stream identifier (31)                    |
+#   +=+=============================================================+
+#   |                       payload (0...)                       ...
+#   +---------------------------------------------------------------+
+#
+# this module reads and writes raw frames and encodes/decodes each typed
+# frame's payload. it holds no connection state — that lives one layer up.
+
+import std.bytes as bytes
+import std.bits as bits
+import std.binary as binary
+import std.encoding as encoding
+
+# --- frame types (RFC 9113 §6) ---
+
+# DATA frame — carries request/response body octets.
+pub FRAME_DATA := 0
+# HEADERS frame — opens a stream and carries an hpack header block.
+pub FRAME_HEADERS := 1
+# PRIORITY frame — advises the peer on stream dependency and weight.
+pub FRAME_PRIORITY := 2
+# RST_STREAM frame — abruptly terminates a stream with an error code.
+pub FRAME_RST_STREAM := 3
+# SETTINGS frame — negotiates connection-level parameters.
+pub FRAME_SETTINGS := 4
+# PUSH_PROMISE frame — reserves a stream for a server push.
+pub FRAME_PUSH_PROMISE := 5
+# PING frame — measures round-trip time and checks liveness.
+pub FRAME_PING := 6
+# GOAWAY frame — begins connection shutdown.
+pub FRAME_GOAWAY := 7
+# WINDOW_UPDATE frame — grants additional flow-control credit.
+pub FRAME_WINDOW_UPDATE := 8
+# CONTINUATION frame — continues a header block that spanned frames.
+pub FRAME_CONTINUATION := 9
+
+# --- frame flags (RFC 9113 §6) ---
+
+# END_STREAM (DATA, HEADERS) — no more frames will arrive on this stream.
+pub FLAG_END_STREAM := 1
+# ACK (SETTINGS, PING) — acknowledges a peer's frame.
+pub FLAG_ACK := 1
+# END_HEADERS (HEADERS, PUSH_PROMISE, CONTINUATION) — header block is complete.
+pub FLAG_END_HEADERS := 4
+# PADDED (DATA, HEADERS, PUSH_PROMISE) — payload begins with a pad-length byte.
+pub FLAG_PADDED := 8
+# PRIORITY (HEADERS) — the header payload carries a priority section.
+pub FLAG_PRIORITY := 32
+
+# --- error codes (RFC 9113 §7) ---
+
+# graceful shutdown, no error.
+pub ERROR_NO_ERROR := 0
+# a general protocol violation.
+pub ERROR_PROTOCOL_ERROR := 1
+# an unrecoverable implementation fault.
+pub ERROR_INTERNAL_ERROR := 2
+# a flow-control window was exceeded.
+pub ERROR_FLOW_CONTROL_ERROR := 3
+# a settings acknowledgement was not received in time.
+pub ERROR_SETTINGS_TIMEOUT := 4
+# a frame was received on a half-closed or closed stream.
+pub ERROR_STREAM_CLOSED := 5
+# a frame had an invalid size for its type.
+pub ERROR_FRAME_SIZE_ERROR := 6
+# the peer refused the stream before doing any work.
+pub ERROR_REFUSED_STREAM := 7
+# the stream is no longer needed.
+pub ERROR_CANCEL := 8
+# the hpack decoder state is corrupt.
+pub ERROR_COMPRESSION_ERROR := 9
+# a connect request was reset.
+pub ERROR_CONNECT_ERROR := 10
+# the peer is generating excessive load.
+pub ERROR_ENHANCE_YOUR_CALM := 11
+# the negotiated tls is below the http/2 requirement.
+pub ERROR_INADEQUATE_SECURITY := 12
+# the request must be retried over http/1.1.
+pub ERROR_HTTP_1_1_REQUIRED := 13
+
+# the default SETTINGS_MAX_FRAME_SIZE — the smallest a peer may advertise.
+pub DEFAULT_MAX_FRAME_SIZE := 16384
+# the largest value SETTINGS_MAX_FRAME_SIZE may take (2^24 - 1).
+pub MAX_ALLOWED_FRAME_SIZE := 16777215
+
+# clears the reserved high bit so only the 31-bit identifier remains.
+STREAM_ID_MASK := 2147483647
+# the reserved high bit, reused as the "exclusive" flag in priority sections.
+HIGH_BIT := 2147483648
+
+# --- typed frame values ---
+
+# a decoded frame header: the four fields of the 9-byte prefix.
+pub struct FrameHeader:
+    pub length: Int
+    pub frame_type: Int
+    pub flags: Int
+    pub stream_id: Int
+
+# a raw frame: its header plus the undecoded payload octets.
+pub struct Frame:
+    pub header: FrameHeader
+    pub payload: Bytes
+
+# a DATA frame's body and end-of-stream marker.
+pub struct DataFrame:
+    pub stream_id: Int
+    pub data: Bytes
+    pub end_stream: Bool
+
+# a HEADERS frame: its hpack block plus optional priority and end markers.
+pub struct HeadersFrame:
+    pub stream_id: Int
+    pub block_fragment: Bytes
+    pub end_stream: Bool
+    pub end_headers: Bool
+    pub has_priority: Bool
+    pub exclusive: Bool
+    pub stream_dependency: Int
+    pub weight: Int
+
+# a PRIORITY frame's dependency, exclusivity, and weight.
+pub struct PriorityFrame:
+    pub stream_id: Int
+    pub exclusive: Bool
+    pub stream_dependency: Int
+    pub weight: Int
+
+# a RST_STREAM frame's termination code.
+pub struct RstStreamFrame:
+    pub stream_id: Int
+    pub error_code: Int
+
+# a single SETTINGS key/value entry.
+pub struct Setting:
+    pub id: Int
+    pub value: Int
+
+# a SETTINGS frame: either an acknowledgement or a list of parameters.
+pub struct SettingsFrame:
+    pub ack: Bool
+    pub settings: List[Setting]
+
+# a PUSH_PROMISE frame: the promised stream id and its header block.
+pub struct PushPromiseFrame:
+    pub stream_id: Int
+    pub promised_stream_id: Int
+    pub block_fragment: Bytes
+    pub end_headers: Bool
+
+# a PING frame: eight opaque octets echoed back on acknowledgement.
+pub struct PingFrame:
+    pub ack: Bool
+    pub opaque: Bytes
+
+# a GOAWAY frame: the last processed stream, an error code, and debug data.
+pub struct GoawayFrame:
+    pub last_stream_id: Int
+    pub error_code: Int
+    pub debug_data: Bytes
+
+# a WINDOW_UPDATE frame's flow-control credit increment.
+pub struct WindowUpdateFrame:
+    pub stream_id: Int
+    pub increment: Int
+
+# a CONTINUATION frame: a trailing slice of a header block.
+pub struct ContinuationFrame:
+    pub stream_id: Int
+    pub block_fragment: Bytes
+    pub end_headers: Bool
+
+# --- internal helpers ---
+
+fn checked_write(result: Int!binary.BinaryError) -> Int!:
+    if result.is_err:
+        fail result.err.message
+    return result.ok
+
+fn checked_read(result: Int!binary.BinaryError) -> Int!:
+    if result.is_err:
+        fail result.err.message
+    return result.ok
+
+fn checked_bytes(result: Bytes!binary.BinaryError) -> Bytes!:
+    if result.is_err:
+        fail result.err.message
+    return result.ok
+
+# true when a flag bit is set in a flags byte.
+fn flag_set(flags: Int, flag: Int) -> Bool:
+    return bits.band(flags, flag) != 0
+
+# assemble a frame from its parts, deriving the length from the payload.
+fn make_frame(frame_type: Int, flags: Int, stream_id: Int, payload: Bytes) -> Frame:
+    header := FrameHeader(payload.len(), frame_type, flags, stream_id)
+    return Frame(header, payload)
+
+# strip padding from a payload that carries a leading pad-length byte.
+# `already_read` counts payload bytes consumed before the fragment (the pad
+# byte itself plus any priority section), so the slice bounds stay correct.
+fn strip_padding(payload: Bytes, pad_length: Int, already_read: Int) -> Bytes!:
+    total := payload.len()
+    if already_read + pad_length > total:
+        fail "padding exceeds frame payload"
+    return payload.slice(already_read, total - pad_length)
+
+# --- raw frame read/write ---
+
+# serialize a frame (9-byte header + payload) to bytes.
+pub fn frame_bytes(frame: Frame) -> Bytes!:
+    out := bytes.buffer()
+    checked_write(binary.write_u24_be(out, frame.payload.len()))!
+    checked_write(binary.write_u8(out, frame.header.frame_type))!
+    checked_write(binary.write_u8(out, frame.header.flags))!
+    checked_write(binary.write_u32_be(out, bits.band(frame.header.stream_id, STREAM_ID_MASK)))!
+    out.write(frame.payload)!
+    result := out.bytes()
+    out.free()
+    return result
+
+# read one frame from a binary reader, rejecting payloads larger than
+# `max_frame_size`. the reserved high bit of the stream id is masked off.
+pub fn read_frame(reader: binary.Reader, max_frame_size: Int) -> Frame!:
+    length := checked_read(binary.read_u24_be(reader))!
+    if length > max_frame_size:
+        fail "frame length exceeds max frame size"
+    frame_type := checked_read(binary.read_u8(reader))!
+    flags := checked_read(binary.read_u8(reader))!
+    raw_stream := checked_read(binary.read_u32_be(reader))!
+    stream_id := bits.band(raw_stream, STREAM_ID_MASK)
+    payload := checked_bytes(binary.read_bytes(reader, length))!
+    return Frame(FrameHeader(length, frame_type, flags, stream_id), payload)
+
+# --- DATA ---
+
+# build a DATA frame carrying `data` on `stream_id`.
+pub fn data_frame(stream_id: Int, data: Bytes, end_stream: Bool) -> Frame:
+    mut flags := 0
+    if end_stream:
+        flags = bits.bor(flags, FLAG_END_STREAM)
+    return make_frame(FRAME_DATA, flags, stream_id, data)
+
+# decode a DATA frame, removing any padding.
+pub fn parse_data(frame: Frame) -> DataFrame!:
+    mut data := frame.payload
+    if flag_set(frame.header.flags, FLAG_PADDED):
+        if frame.payload.len() < 1:
+            fail "padded DATA frame missing pad length"
+        pad_length := frame.payload[0]
+        data = strip_padding(frame.payload, pad_length, 1)!
+    return DataFrame(frame.header.stream_id, data, flag_set(frame.header.flags, FLAG_END_STREAM))
+
+# --- HEADERS ---
+
+# build a HEADERS frame with an hpack block and no priority section.
+pub fn headers_frame(stream_id: Int, block_fragment: Bytes, end_stream: Bool, end_headers: Bool) -> Frame:
+    mut flags := 0
+    if end_stream:
+        flags = bits.bor(flags, FLAG_END_STREAM)
+    if end_headers:
+        flags = bits.bor(flags, FLAG_END_HEADERS)
+    return make_frame(FRAME_HEADERS, flags, stream_id, block_fragment)
+
+# decode a HEADERS frame, unpacking any padding and priority section.
+pub fn parse_headers(frame: Frame) -> HeadersFrame!:
+    reader := binary.reader(frame.payload)
+    mut consumed := 0
+    mut pad_length := 0
+    if flag_set(frame.header.flags, FLAG_PADDED):
+        pad_length = checked_read(binary.read_u8(reader))!
+        consumed = consumed + 1
+    mut has_priority := false
+    mut exclusive := false
+    mut dependency := 0
+    mut weight := 0
+    if flag_set(frame.header.flags, FLAG_PRIORITY):
+        has_priority = true
+        raw := checked_read(binary.read_u32_be(reader))!
+        exclusive = bits.band(raw, HIGH_BIT) != 0
+        dependency = bits.band(raw, STREAM_ID_MASK)
+        weight = checked_read(binary.read_u8(reader))!
+        consumed = consumed + 5
+    fragment := strip_padding(frame.payload, pad_length, consumed)!
+    end_stream := flag_set(frame.header.flags, FLAG_END_STREAM)
+    end_headers := flag_set(frame.header.flags, FLAG_END_HEADERS)
+    return HeadersFrame(frame.header.stream_id, fragment, end_stream, end_headers, has_priority, exclusive, dependency, weight)
+
+# --- PRIORITY ---
+
+# build a PRIORITY frame advising dependency and weight for a stream.
+pub fn priority_frame(stream_id: Int, exclusive: Bool, dependency: Int, weight: Int) -> Frame!:
+    out := bytes.buffer()
+    mut raw := bits.band(dependency, STREAM_ID_MASK)
+    if exclusive:
+        raw = bits.bor(raw, HIGH_BIT)
+    checked_write(binary.write_u32_be(out, raw))!
+    checked_write(binary.write_u8(out, weight))!
+    payload := out.bytes()
+    out.free()
+    return make_frame(FRAME_PRIORITY, 0, stream_id, payload)
+
+# decode a PRIORITY frame; its payload must be exactly five octets.
+pub fn parse_priority(frame: Frame) -> PriorityFrame!:
+    if frame.payload.len() != 5:
+        fail "PRIORITY frame payload must be 5 bytes"
+    reader := binary.reader(frame.payload)
+    raw := checked_read(binary.read_u32_be(reader))!
+    exclusive := bits.band(raw, HIGH_BIT) != 0
+    dependency := bits.band(raw, STREAM_ID_MASK)
+    weight := checked_read(binary.read_u8(reader))!
+    return PriorityFrame(frame.header.stream_id, exclusive, dependency, weight)
+
+# --- RST_STREAM ---
+
+# build a RST_STREAM frame terminating a stream with an error code.
+pub fn rst_stream_frame(stream_id: Int, error_code: Int) -> Frame!:
+    out := bytes.buffer()
+    checked_write(binary.write_u32_be(out, error_code))!
+    payload := out.bytes()
+    out.free()
+    return make_frame(FRAME_RST_STREAM, 0, stream_id, payload)
+
+# decode a RST_STREAM frame; its payload must be exactly four octets.
+pub fn parse_rst_stream(frame: Frame) -> RstStreamFrame!:
+    if frame.payload.len() != 4:
+        fail "RST_STREAM frame payload must be 4 bytes"
+    reader := binary.reader(frame.payload)
+    error_code := checked_read(binary.read_u32_be(reader))!
+    return RstStreamFrame(frame.header.stream_id, error_code)
+
+# --- SETTINGS ---
+
+# build a SETTINGS frame carrying a list of parameters.
+pub fn settings_frame(settings: List[Setting]) -> Frame!:
+    out := bytes.buffer()
+    for setting in settings:
+        checked_write(binary.write_u16_be(out, setting.id))!
+        checked_write(binary.write_u32_be(out, setting.value))!
+    payload := out.bytes()
+    out.free()
+    return make_frame(FRAME_SETTINGS, 0, 0, payload)
+
+# build an empty SETTINGS frame with the ACK flag set.
+pub fn settings_ack_frame() -> Frame:
+    return make_frame(FRAME_SETTINGS, FLAG_ACK, 0, bytes.empty())
+
+# decode a SETTINGS frame into its acknowledgement flag and parameters.
+pub fn parse_settings(frame: Frame) -> SettingsFrame!:
+    if frame.header.stream_id != 0:
+        fail "SETTINGS frame must use stream 0"
+    ack := flag_set(frame.header.flags, FLAG_ACK)
+    if ack:
+        if frame.payload.len() != 0:
+            fail "SETTINGS ack frame must be empty"
+        return SettingsFrame(true, [])
+    if frame.payload.len() % 6 != 0:
+        fail "SETTINGS payload must be a multiple of 6 bytes"
+    reader := binary.reader(frame.payload)
+    mut settings: List[Setting] := []
+    mut remaining := frame.payload.len()
+    while remaining > 0:
+        id := checked_read(binary.read_u16_be(reader))!
+        value := checked_read(binary.read_u32_be(reader))!
+        settings.push(Setting(id, value))
+        remaining = remaining - 6
+    return SettingsFrame(false, settings)
+
+# --- PUSH_PROMISE ---
+
+# build a PUSH_PROMISE frame reserving `promised_stream_id`.
+pub fn push_promise_frame(stream_id: Int, promised_stream_id: Int, block_fragment: Bytes, end_headers: Bool) -> Frame!:
+    out := bytes.buffer()
+    checked_write(binary.write_u32_be(out, bits.band(promised_stream_id, STREAM_ID_MASK)))!
+    out.write(block_fragment)!
+    payload := out.bytes()
+    out.free()
+    mut flags := 0
+    if end_headers:
+        flags = bits.bor(flags, FLAG_END_HEADERS)
+    return make_frame(FRAME_PUSH_PROMISE, flags, stream_id, payload)
+
+# decode a PUSH_PROMISE frame, unpacking any padding.
+pub fn parse_push_promise(frame: Frame) -> PushPromiseFrame!:
+    reader := binary.reader(frame.payload)
+    mut consumed := 0
+    mut pad_length := 0
+    if flag_set(frame.header.flags, FLAG_PADDED):
+        pad_length = checked_read(binary.read_u8(reader))!
+        consumed = consumed + 1
+    raw := checked_read(binary.read_u32_be(reader))!
+    consumed = consumed + 4
+    promised := bits.band(raw, STREAM_ID_MASK)
+    fragment := strip_padding(frame.payload, pad_length, consumed)!
+    return PushPromiseFrame(frame.header.stream_id, promised, fragment, flag_set(frame.header.flags, FLAG_END_HEADERS))
+
+# --- PING ---
+
+# build a PING frame with eight opaque octets.
+pub fn ping_frame(opaque: Bytes) -> Frame!:
+    if opaque.len() != 8:
+        fail "PING opaque data must be 8 bytes"
+    return make_frame(FRAME_PING, 0, 0, opaque)
+
+# build a PING acknowledgement echoing the peer's opaque octets.
+pub fn ping_ack_frame(opaque: Bytes) -> Frame!:
+    if opaque.len() != 8:
+        fail "PING opaque data must be 8 bytes"
+    return make_frame(FRAME_PING, FLAG_ACK, 0, opaque)
+
+# decode a PING frame; its payload must be exactly eight octets on stream 0.
+pub fn parse_ping(frame: Frame) -> PingFrame!:
+    if frame.header.stream_id != 0:
+        fail "PING frame must use stream 0"
+    if frame.payload.len() != 8:
+        fail "PING frame payload must be 8 bytes"
+    return PingFrame(flag_set(frame.header.flags, FLAG_ACK), frame.payload)
+
+# --- GOAWAY ---
+
+# build a GOAWAY frame beginning connection shutdown.
+pub fn goaway_frame(last_stream_id: Int, error_code: Int, debug_data: Bytes) -> Frame!:
+    out := bytes.buffer()
+    checked_write(binary.write_u32_be(out, bits.band(last_stream_id, STREAM_ID_MASK)))!
+    checked_write(binary.write_u32_be(out, error_code))!
+    out.write(debug_data)!
+    payload := out.bytes()
+    out.free()
+    return make_frame(FRAME_GOAWAY, 0, 0, payload)
+
+# decode a GOAWAY frame; the fixed section is eight octets plus debug data.
+pub fn parse_goaway(frame: Frame) -> GoawayFrame!:
+    if frame.header.stream_id != 0:
+        fail "GOAWAY frame must use stream 0"
+    if frame.payload.len() < 8:
+        fail "GOAWAY frame payload must be at least 8 bytes"
+    reader := binary.reader(frame.payload)
+    raw := checked_read(binary.read_u32_be(reader))!
+    last_stream_id := bits.band(raw, STREAM_ID_MASK)
+    error_code := checked_read(binary.read_u32_be(reader))!
+    debug_data := frame.payload.slice(8, frame.payload.len())
+    return GoawayFrame(last_stream_id, error_code, debug_data)
+
+# --- WINDOW_UPDATE ---
+
+# build a WINDOW_UPDATE frame granting `increment` bytes of credit.
+# a zero stream id targets the whole connection.
+pub fn window_update_frame(stream_id: Int, increment: Int) -> Frame!:
+    out := bytes.buffer()
+    checked_write(binary.write_u32_be(out, bits.band(increment, STREAM_ID_MASK)))!
+    payload := out.bytes()
+    out.free()
+    return make_frame(FRAME_WINDOW_UPDATE, 0, stream_id, payload)
+
+# decode a WINDOW_UPDATE frame; its payload must be exactly four octets.
+pub fn parse_window_update(frame: Frame) -> WindowUpdateFrame!:
+    if frame.payload.len() != 4:
+        fail "WINDOW_UPDATE frame payload must be 4 bytes"
+    reader := binary.reader(frame.payload)
+    raw := checked_read(binary.read_u32_be(reader))!
+    increment := bits.band(raw, STREAM_ID_MASK)
+    return WindowUpdateFrame(frame.header.stream_id, increment)
+
+# --- CONTINUATION ---
+
+# build a CONTINUATION frame carrying a trailing header-block slice.
+pub fn continuation_frame(stream_id: Int, block_fragment: Bytes, end_headers: Bool) -> Frame:
+    mut flags := 0
+    if end_headers:
+        flags = bits.bor(flags, FLAG_END_HEADERS)
+    return make_frame(FRAME_CONTINUATION, flags, stream_id, block_fragment)
+
+# decode a CONTINUATION frame.
+pub fn parse_continuation(frame: Frame) -> ContinuationFrame!:
+    return ContinuationFrame(frame.header.stream_id, frame.payload, flag_set(frame.header.flags, FLAG_END_HEADERS))
+
+# --- tests ---
+
+# serialize a frame to the wire and read it straight back.
+fn roundtrip(frame: Frame) -> Frame!:
+    wire := frame_bytes(frame)!
+    reader := binary.reader(wire)
+    return read_frame(reader, MAX_ALLOWED_FRAME_SIZE)!
+
+fn hex(data: Bytes) -> String:
+    return encoding.to_hex(data)
+
+test "frame header carries length, type, flags, and stream id":
+    frame := data_frame(7, bytes.from_string_utf8("body"), false)
+    back := roundtrip(frame)!
+    assert_eq(back.header.length, 4)
+    assert_eq(back.header.frame_type, FRAME_DATA)
+    assert_eq(back.header.flags, 0)
+    assert_eq(back.header.stream_id, 7)
+    assert_eq(hex(back.payload), hex(bytes.from_string_utf8("body")))
+
+test "frame_bytes lays out the 9-byte prefix big-endian":
+    frame := make_frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, bytes.from_string_utf8("ab"))
+    wire := frame_bytes(frame)!
+    # length 2, type 1, flags 4, stream 1, then payload "ab" (0x6162)
+    assert_eq(hex(wire), "0000020104000000016162")
+
+test "read_frame masks the reserved high bit of the stream id":
+    # a 9-byte header with the reserved bit and stream id 1 both set, no payload.
+    raw := encoding.from_hex("000000060080000001")!
+    reader := binary.reader(raw)
+    frame := read_frame(reader, DEFAULT_MAX_FRAME_SIZE)!
+    assert_eq(frame.header.stream_id, 1)
+    assert_eq(frame.header.frame_type, FRAME_PING)
+
+test "DATA round-trips with the end-stream flag":
+    frame := data_frame(3, bytes.from_string_utf8("hello"), true)
+    parsed := parse_data(roundtrip(frame)!)!
+    assert_eq(parsed.stream_id, 3)
+    assert_eq(hex(parsed.data), hex(bytes.from_string_utf8("hello")))
+    assert(parsed.end_stream)
+
+test "DATA strips trailing padding":
+    # padded payload: pad length 2, data "hi", two padding bytes.
+    payload := encoding.from_hex("026869" + "0000")!
+    frame := make_frame(FRAME_DATA, FLAG_PADDED, 5, payload)
+    parsed := parse_data(frame)!
+    assert_eq(hex(parsed.data), hex(bytes.from_string_utf8("hi")))
+
+test "HEADERS round-trips with end flags":
+    frame := headers_frame(1, bytes.from_string_utf8("blk"), true, true)
+    parsed := parse_headers(roundtrip(frame)!)!
+    assert_eq(parsed.stream_id, 1)
+    assert_eq(hex(parsed.block_fragment), hex(bytes.from_string_utf8("blk")))
+    assert(parsed.end_stream)
+    assert(parsed.end_headers)
+    assert(not parsed.has_priority)
+
+test "HEADERS decodes a padded priority section":
+    # pad length 1, priority (exclusive + dep 3, weight 15), fragment "z", 1 pad byte.
+    payload := encoding.from_hex("01" + "80000003" + "0f" + "7a" + "00")!
+    frame := make_frame(FRAME_HEADERS, bits.bor(FLAG_PADDED, FLAG_PRIORITY), 9, payload)
+    parsed := parse_headers(frame)!
+    assert(parsed.has_priority)
+    assert(parsed.exclusive)
+    assert_eq(parsed.stream_dependency, 3)
+    assert_eq(parsed.weight, 15)
+    assert_eq(hex(parsed.block_fragment), hex(bytes.from_string_utf8("z")))
+
+test "PRIORITY round-trips dependency, exclusivity, and weight":
+    frame := priority_frame(3, true, 1, 200)!
+    parsed := parse_priority(roundtrip(frame)!)!
+    assert(parsed.exclusive)
+    assert_eq(parsed.stream_dependency, 1)
+    assert_eq(parsed.weight, 200)
+
+test "RST_STREAM round-trips its error code":
+    frame := rst_stream_frame(3, ERROR_CANCEL)!
+    parsed := parse_rst_stream(roundtrip(frame)!)!
+    assert_eq(parsed.stream_id, 3)
+    assert_eq(parsed.error_code, ERROR_CANCEL)
+
+test "SETTINGS round-trips a parameter list":
+    params := [Setting(3, 100), Setting(4, 65535)]
+    frame := settings_frame(params)!
+    parsed := parse_settings(roundtrip(frame)!)!
+    assert(not parsed.ack)
+    assert_eq(parsed.settings.len(), 2)
+    assert_eq(parsed.settings[0].id, 3)
+    assert_eq(parsed.settings[0].value, 100)
+    assert_eq(parsed.settings[1].id, 4)
+    assert_eq(parsed.settings[1].value, 65535)
+
+test "SETTINGS ack is an empty acknowledgement":
+    parsed := parse_settings(roundtrip(settings_ack_frame())!)!
+    assert(parsed.ack)
+    assert_eq(parsed.settings.len(), 0)
+
+test "PUSH_PROMISE round-trips the promised stream and block":
+    frame := push_promise_frame(1, 2, bytes.from_string_utf8("hdr"), true)!
+    parsed := parse_push_promise(roundtrip(frame)!)!
+    assert_eq(parsed.promised_stream_id, 2)
+    assert(parsed.end_headers)
+    assert_eq(hex(parsed.block_fragment), hex(bytes.from_string_utf8("hdr")))
+
+test "PING round-trips opaque data and acks":
+    data := encoding.from_hex("0011223344556677")!
+    parsed := parse_ping(roundtrip(ping_frame(data)!)!)!
+    assert(not parsed.ack)
+    assert_eq(hex(parsed.opaque), "0011223344556677")
+    ack := parse_ping(roundtrip(ping_ack_frame(data)!)!)!
+    assert(ack.ack)
+
+test "GOAWAY round-trips last stream, error, and debug data":
+    frame := goaway_frame(7, ERROR_PROTOCOL_ERROR, bytes.from_string_utf8("bye"))!
+    parsed := parse_goaway(roundtrip(frame)!)!
+    assert_eq(parsed.last_stream_id, 7)
+    assert_eq(parsed.error_code, ERROR_PROTOCOL_ERROR)
+    assert_eq(hex(parsed.debug_data), hex(bytes.from_string_utf8("bye")))
+
+test "WINDOW_UPDATE round-trips its increment":
+    frame := window_update_frame(3, 32768)!
+    parsed := parse_window_update(roundtrip(frame)!)!
+    assert_eq(parsed.stream_id, 3)
+    assert_eq(parsed.increment, 32768)
+
+test "CONTINUATION round-trips a trailing block":
+    frame := continuation_frame(1, bytes.from_string_utf8("more"), true)
+    parsed := parse_continuation(roundtrip(frame)!)!
+    assert_eq(parsed.stream_id, 1)
+    assert(parsed.end_headers)
+    assert_eq(hex(parsed.block_fragment), hex(bytes.from_string_utf8("more")))
+
+test "read_frame rejects a payload larger than the max frame size":
+    # header claims 100 payload bytes; the limit is 10.
+    raw := encoding.from_hex("000064000000000001")!
+    reader := binary.reader(raw)
+    result := read_frame(reader, 10)
+    assert(result.is_err)
+
+test "read_frame rejects a truncated payload":
+    # header claims 5 payload bytes but only 2 follow.
+    raw := encoding.from_hex("0000050000000000016869")!
+    reader := binary.reader(raw)
+    result := read_frame(reader, DEFAULT_MAX_FRAME_SIZE)
+    assert(result.is_err)
+
+test "SETTINGS rejects a payload that is not a multiple of six":
+    frame := make_frame(FRAME_SETTINGS, 0, 0, bytes.from_string_utf8("abcd"))
+    assert(parse_settings(frame).is_err)
+
+test "PING rejects a payload that is not eight bytes":
+    frame := make_frame(FRAME_PING, 0, 0, bytes.from_string_utf8("short"))
+    assert(parse_ping(frame).is_err)
+
+test "WINDOW_UPDATE rejects a payload that is not four bytes":
+    frame := make_frame(FRAME_WINDOW_UPDATE, 0, 3, bytes.from_string_utf8("ab"))
+    assert(parse_window_update(frame).is_err)
+
+test "RST_STREAM rejects a payload that is not four bytes":
+    frame := make_frame(FRAME_RST_STREAM, 0, 3, bytes.from_string_utf8("ab"))
+    assert(parse_rst_stream(frame).is_err)
+
+test "PRIORITY rejects a payload that is not five bytes":
+    frame := make_frame(FRAME_PRIORITY, 0, 3, bytes.from_string_utf8("abc"))
+    assert(parse_priority(frame).is_err)
+
+test "DATA rejects padding longer than the payload":
+    # pad length 9 with only three payload bytes after it.
+    payload := encoding.from_hex("09414243")!
+    frame := make_frame(FRAME_DATA, FLAG_PADDED, 5, payload)
+    assert(parse_data(frame).is_err)
+
+test "SETTINGS rejects a non-zero stream id":
+    frame := make_frame(FRAME_SETTINGS, 0, 1, bytes.empty())
+    assert(parse_settings(frame).is_err)

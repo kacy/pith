@@ -61,10 +61,13 @@ fn client_preface() -> Bytes:
 
 # --- response ---
 
-# an http/2 response: the status code, decoded header fields, and body bytes.
+# an http/2 response: the status code, decoded header fields, the trailing
+# header fields (empty when the peer sends none), and the body bytes. trailers
+# are a second header block after the body; grpc carries its grpc-status there.
 pub struct Response:
     pub status: Int
     pub headers: List[hpack.HeaderField]
+    pub trailers: List[hpack.HeaderField]
     pub body: Bytes
 
 # --- connection ---
@@ -197,6 +200,7 @@ impl Connection:
         body := bytes.buffer()
         mut status := 0
         mut headers: List[hpack.HeaderField] := []
+        mut trailers: List[hpack.HeaderField] := []
         mut got_headers := false
         while true:
             frame := self.read_frame()!
@@ -206,14 +210,19 @@ impl Connection:
                 block := self.read_header_block(hf)!
                 # always decode to keep the hpack dynamic table in lockstep.
                 decoded := self.decoder.decode(block)!
-                if hf.stream_id == stream_id and not got_headers:
-                    headers = decoded
-                    status = status_from(decoded)
-                    got_headers = true
-                if hf.stream_id == stream_id and hf.end_stream:
-                    data := body.bytes()
-                    body.free()
-                    return Response(status, headers, data)
+                if hf.stream_id == stream_id:
+                    # the first header block is the response; a later one (after
+                    # the body has begun) is the trailers.
+                    if not got_headers:
+                        headers = decoded
+                        status = status_from(decoded)
+                        got_headers = true
+                    else:
+                        trailers = decoded
+                    if hf.end_stream:
+                        data := body.bytes()
+                        body.free()
+                        return Response(status, headers, trailers, data)
             elif t == frames.FRAME_DATA:
                 df := frames.parse_data(frame)!
                 if df.stream_id == stream_id:
@@ -223,7 +232,7 @@ impl Connection:
                     if df.end_stream:
                         data := body.bytes()
                         body.free()
-                        return Response(status, headers, data)
+                        return Response(status, headers, trailers, data)
             elif t == frames.FRAME_SETTINGS:
                 sf := frames.parse_settings(frame)!
                 if not sf.ack:
@@ -236,12 +245,12 @@ impl Connection:
                 ga := frames.parse_goaway(frame)!
                 if ga.last_stream_id < stream_id:
                     body.free()
-                    fail "http2: server sent GOAWAY (error {ga.error_code}) before serving stream {stream_id}"
+                    fail "http2: server sent GOAWAY ({frames.error_name(ga.error_code)}) before serving stream {stream_id}"
             elif t == frames.FRAME_RST_STREAM:
                 rs := frames.parse_rst_stream(frame)!
                 if rs.stream_id == stream_id:
                     body.free()
-                    fail "http2: stream {stream_id} was reset by the peer (error {rs.error_code})"
+                    fail "http2: stream {stream_id} was reset by the peer ({frames.error_name(rs.error_code)})"
             # WINDOW_UPDATE, PRIORITY, PUSH_PROMISE and unknown types need no
             # action to complete a single response, so they are ignored here.
 
@@ -372,9 +381,11 @@ OUTBOUND_CAP := 256
 
 # a multiplexed http/2 client over one connection. many request() calls share
 # it: the reader and writer tasks run for the client's lifetime, and the mutex
-# guards the stream table, the id counter, and the closed flag. the channels are
-# already safe to use across tasks. `active` mirrors the stream-table keys
-# because Map[Int, _].keys() does not yet enumerate int keys.
+# guards the stream table, the id counter, the closed/going-away flags, and the
+# last stream the peer promised to serve. the channels are already safe to use
+# across tasks. `active` mirrors the stream-table keys because Map[Int, _].keys()
+# does not yet enumerate int keys. `writer` is the write task's handle, awaited on
+# close() so a final GOAWAY flushes before the transport drops.
 pub struct Client:
     conn: Connection
     mu: Mutex
@@ -383,6 +394,14 @@ pub struct Client:
     mut active: List[Int]
     outbound: Channel[Bytes]
     closed: AtomicInt
+    mut going_away: Bool
+    mut last_peer_stream: Int
+    writer: Task[Int]
+
+# a placeholder write task for offline clients, which drive the reader directly
+# and never spawn a real writer over the shared outbound channel.
+fn idle_writer() -> Int:
+    return 0
 
 # open a multiplexed client to host:port over tls with alpn "h2". spawns the
 # reader and writer tasks; call close() to stop them and drop the connection.
@@ -390,8 +409,12 @@ pub fn open(host: String, port: Int) -> Client!:
     conn := connect(host, port)!
     ids: List[Int] := []
     table: Map[Int, Channel[StreamEvent]] := {}
-    client := Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0))
-    spawn writer_loop(client)
+    outbound := Channel[Bytes](OUTBOUND_CAP)
+    closed := AtomicInt(0)
+    # the writer owns the send direction; spawn it before the client exists so
+    # its handle can be stored for a clean, flushing shutdown.
+    writer := spawn writer_loop(outbound, conn, closed)
+    client := Client(conn, Mutex(), 1, table, ids, outbound, closed, false, 0, writer)
     spawn reader_loop(client)
     return client
 
@@ -409,8 +432,9 @@ fn list_remove_int(items: List[Int], target: Int) -> List[Int]:
     return out
 
 # the reader task: read frames until the connection ends, demuxing each to its
-# stream and servicing connection housekeeping. on any read or protocol error,
-# or a GOAWAY, it closes every waiting stream so their request() calls unblock.
+# stream and servicing connection housekeeping. a read error tears the whole
+# connection down; a protocol error additionally sends a GOAWAY naming the fault
+# before failing every waiting stream so their request() calls unblock.
 fn reader_loop(client: Client):
     while true:
         attempt := client.conn.read_frame()
@@ -419,13 +443,17 @@ fn reader_loop(client: Client):
             return
         outcome := handle_frame(client, attempt.ok)
         if outcome.is_err:
+            # a frame we could not process is a connection-level protocol error:
+            # tell the peer why, then drop every stream.
+            send_goaway(client, frames.ERROR_PROTOCOL_ERROR)
             fail_all(client)
             return
         if not outcome.ok:
             fail_all(client)
             return
 
-# dispatch one frame. returns false when the reader should stop (a GOAWAY).
+# dispatch one frame. returns false when the reader should stop (the connection
+# has fully wound down after a GOAWAY).
 fn handle_frame(client: Client, frame: frames.Frame) -> Bool!:
     t := frame.header.frame_type
     if t == frames.FRAME_HEADERS:
@@ -451,15 +479,56 @@ fn handle_frame(client: Client, frame: frames.Frame) -> Bool!:
         if not pf.ack:
             client.enqueue(frames.ping_ack_frame(pf.opaque)!)!
         return true
+    if t == frames.FRAME_WINDOW_UPDATE:
+        wu := frames.parse_window_update(frame)!
+        # a zero increment is a protocol error (RFC 9113 §6.9); otherwise the
+        # credit only grows our send window, which a GET never uses, so ignore it.
+        if wu.increment == 0:
+            fail "http2: WINDOW_UPDATE with a zero increment"
+        return true
     if t == frames.FRAME_GOAWAY:
-        return false
+        ga := frames.parse_goaway(frame)!
+        return handle_goaway(client, ga)
     if t == frames.FRAME_RST_STREAM:
         rs := frames.parse_rst_stream(frame)!
         deliver(client, rs.stream_id, reset_event(rs.error_code))
         return true
-    # WINDOW_UPDATE, PRIORITY, PUSH_PROMISE and unknown types need no action to
-    # complete our requests, so they are ignored.
+    # PRIORITY, PUSH_PROMISE and unknown types need no action to complete our
+    # requests, so they are ignored.
     return true
+
+# apply a GOAWAY: stop opening new streams and fail every stream the peer will
+# not serve (id above last_stream_id), while leaving lower-id streams to finish.
+# returns true so the reader keeps draining those until the peer closes.
+fn handle_goaway(client: Client, ga: frames.GoawayFrame) -> Bool!:
+    client.mu.lock()
+    client.going_away = true
+    client.last_peer_stream = ga.last_stream_id
+    mut survivors: List[Int] := []
+    for sid in client.active:
+        if sid > ga.last_stream_id:
+            if client.streams.contains_key(sid):
+                client.streams[sid].close()
+                client.streams.remove(sid)
+        else:
+            survivors.push(sid)
+    client.active = survivors
+    remaining := survivors.len()
+    client.mu.unlock()
+    # nothing left to wait for: the connection is done.
+    return remaining > 0
+
+# best-effort GOAWAY to the peer. try_send so a full or closed outbound channel
+# never blocks the reader; the writer is still draining when this runs after a
+# protocol error, so a queued frame flushes.
+fn send_goaway(client: Client, error_code: Int):
+    frame := frames.goaway_frame(client.last_peer_stream, error_code, bytes.empty())
+    if frame.is_err:
+        return
+    wire := frames.frame_bytes(frame.ok)
+    if wire.is_err:
+        return
+    client.outbound.try_send(wire.ok)
 
 # hand an event to a waiting stream, dropping it if the stream is already gone
 # (e.g. a trailing frame after the response finished). the channel handle is
@@ -491,23 +560,29 @@ fn fail_all(client: Client):
     client.outbound.close()
 
 # the writer task: drain the outbound channel and write each serialized frame in
-# order. stops when the channel is closed (close()) or a write fails.
-fn writer_loop(client: Client):
+# order. stops when the channel is closed (close()) or a write fails. it owns the
+# send direction only — the outbound channel, the connection, and the closed
+# flag — so its handle can be held before the full client is built. a closed
+# channel still yields its buffered frames before recv reports none, so a GOAWAY
+# queued just before close() is flushed here.
+fn writer_loop(outbound: Channel[Bytes], conn: Connection, closed: AtomicInt) -> Int:
     while true:
-        opt := client.outbound.recv()
+        opt := outbound.recv()
         if opt == none:
-            return
-        sent := client.conn.send(opt.unwrap_or(bytes.empty()))
+            return 0
+        sent := conn.send(opt.unwrap_or(bytes.empty()))
         if sent.is_err:
-            client.closed.store(1)
-            return
+            closed.store(1)
+            return 0
 
 # read stream events until end-of-stream, assembling the response. a closed
-# inbox (connection dropped) or a RST_STREAM fails the request.
+# inbox (connection dropped) or a RST_STREAM fails the request. a header block
+# that arrives after the body has begun is the trailers.
 fn assemble_response(inbox: Channel[StreamEvent]) -> Response!:
     body := bytes.buffer()
     mut status := 0
     mut headers: List[hpack.HeaderField] := []
+    mut trailers: List[hpack.HeaderField] := []
     mut got_headers := false
     while true:
         opt := inbox.recv()
@@ -517,18 +592,20 @@ fn assemble_response(inbox: Channel[StreamEvent]) -> Response!:
         event := opt?
         if event.kind == STREAM_RESET:
             body.free()
-            fail "http2: stream was reset by the peer (error {event.error_code})"
+            fail "http2: stream was reset by the peer ({frames.error_name(event.error_code)})"
         if event.kind == STREAM_HEADERS:
             if not got_headers:
                 headers = event.headers
                 status = status_from(event.headers)
                 got_headers = true
+            else:
+                trailers = event.headers
         elif event.kind == STREAM_DATA:
             body.write(event.data)!
         if event.end:
             data := body.bytes()
             body.free()
-            return Response(status, headers, data)
+            return Response(status, headers, trailers, data)
 
 impl Client:
     # serialize a frame and queue it for the writer task.
@@ -562,6 +639,9 @@ impl Client:
         if self.closed.load() != 0:
             self.mu.unlock()
             fail "http2: client is closed"
+        if self.going_away:
+            self.mu.unlock()
+            fail "http2: peer sent GOAWAY; not opening new streams"
         stream_id := self.next_stream_id
         self.next_stream_id = self.next_stream_id + 2
         inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
@@ -589,10 +669,17 @@ impl Client:
         request := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
         return self.request(request)!
 
-    # stop the reader and writer tasks and close the connection.
+    # stop the reader and writer tasks and close the connection. a GOAWAY is
+    # queued first and the writer is awaited so it flushes before the transport
+    # drops; the reader then unblocks on the closed transport.
     pub fn close():
+        self.mu.lock()
+        self.going_away = true
+        self.mu.unlock()
+        send_goaway(self, frames.ERROR_NO_ERROR)
         self.closed.store(1)
         self.outbound.close()
+        await self.writer
         self.conn.close()
 
 # read the 24-bit big-endian length prefix that opens a frame header. reading
@@ -633,6 +720,16 @@ fn sent_window_updates(conn: Connection) -> List[frames.WindowUpdateFrame]!:
         if frame.header.frame_type == frames.FRAME_WINDOW_UPDATE:
             updates.push(frames.parse_window_update(frame)!)
     return updates
+
+# collect the PING frames recorded in a connection's sent stream.
+fn sent_pings(conn: Connection) -> List[frames.PingFrame]!:
+    reader := binary.reader(conn.sent)
+    mut pings: List[frames.PingFrame] := []
+    while binary.remaining(reader) > 0:
+        frame := frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!
+        if frame.header.frame_type == frames.FRAME_PING:
+            pings.push(frames.parse_ping(frame)!)
+    return pings
 
 test "the client preface is the exact 24-byte RFC 9113 token":
     preface := client_preface()
@@ -709,11 +806,12 @@ test "a RST_STREAM on our stream fails the response":
 # --- concurrent multiplexing tests ---
 
 # build a Client over an offline connection without spawning the reader/writer
-# tasks, so a test can drive reader_loop directly and inspect the results.
+# tasks, so a test can drive reader_loop directly and inspect the results. the
+# writer is an idle placeholder — the test owns the outbound channel itself.
 fn offline_client(conn: Connection) -> Client:
     ids: List[Int] := []
     table: Map[Int, Channel[StreamEvent]] := {}
-    return Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0))
+    return Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer())
 
 # pull the next event off an inbox, failing if the channel closed first.
 fn next_event(inbox: Channel[StreamEvent]) -> StreamEvent!:
@@ -809,3 +907,85 @@ test "assemble_response fails when the connection closes early":
 test "list_remove_int drops the target id":
     assert_eq(list_remove_int([1, 3, 5, 7], 5), [1, 3, 7])
     assert_eq(list_remove_int([1, 3], 9), [1, 3])
+
+# --- robustness tests (phase 4) ---
+
+test "read_response captures trailers after the body":
+    # one shared encoder so the single decoder stays in step across both blocks.
+    enc := hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false)
+    head := enc.encode([hpack.header_field(":status", "200")])
+    trail := enc.encode([hpack.header_field("grpc-status", "0")])
+    stream := encode_frames([frames.headers_frame(1, head, false, true), frames.data_frame(1, bytes.from_string_utf8("payload"), false), frames.headers_frame(1, trail, true, true)])!
+    conn := connection_from_frames(stream)
+    response := conn.read_response(1)!
+    assert_eq(response.status, 200)
+    assert_eq(response.body.to_string_utf8()!, "payload")
+    assert_eq(response.headers.len(), 1)
+    assert_eq(response.trailers.len(), 1)
+    assert_eq(response.trailers[0].name, "grpc-status")
+    assert_eq(response.trailers[0].value, "0")
+
+test "a non-CONTINUATION frame interrupting a header block is rejected":
+    block := header_block([hpack.header_field(":status", "200")])
+    # a HEADERS without END_HEADERS, then a DATA frame instead of a CONTINUATION.
+    stream := encode_frames([frames.headers_frame(1, block, false, false), frames.data_frame(1, bytes.from_string_utf8("x"), true)])!
+    conn := connection_from_frames(stream)
+    assert(conn.read_response(1).is_err)
+
+test "a PING is answered with an exact-echo ACK and a PING ACK is ignored":
+    opaque := encoding.from_hex("1122334455667788")!
+    block := header_block([hpack.header_field(":status", "200")])
+    stream := encode_frames([frames.ping_frame(opaque)!, frames.headers_frame(1, block, true, true)])!
+    conn := connection_from_frames(stream)
+    conn.read_response(1)!
+    pings := sent_pings(conn)!
+    assert_eq(pings.len(), 1)
+    assert(pings[0].ack)
+    assert_eq(hx(pings[0].opaque), "1122334455667788")
+    # a PING that is already an ACK must not be answered.
+    stream2 := encode_frames([frames.ping_ack_frame(opaque)!, frames.headers_frame(1, header_block([hpack.header_field(":status", "200")]), true, true)])!
+    conn2 := connection_from_frames(stream2)
+    conn2.read_response(1)!
+    assert_eq(sent_pings(conn2)!.len(), 0)
+
+test "assemble_response captures trailers after the body":
+    inbox := Channel[StreamEvent](8)
+    inbox.send(headers_event([hpack.header_field(":status", "200")], false))
+    inbox.send(data_event(bytes.from_string_utf8("hi"), false))
+    inbox.send(headers_event([hpack.header_field("grpc-status", "0")], true))
+    r := assemble_response(inbox)!
+    assert_eq(r.status, 200)
+    assert_eq(r.body.to_string_utf8()!, "hi")
+    assert_eq(r.trailers.len(), 1)
+    assert_eq(r.trailers[0].name, "grpc-status")
+    assert_eq(r.trailers[0].value, "0")
+
+test "a reset names the error code in the failure":
+    inbox := Channel[StreamEvent](4)
+    inbox.send(reset_event(frames.ERROR_REFUSED_STREAM))
+    r := assemble_response(inbox)
+    assert(r.is_err)
+    assert(r.err.contains("REFUSED_STREAM"))
+
+test "a GOAWAY drops streams above last-stream-id and keeps the rest":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    inbox1 := Channel[StreamEvent](4)
+    inbox3 := Channel[StreamEvent](4)
+    client.streams.insert(1, inbox1)
+    client.active.push(1)
+    client.streams.insert(3, inbox3)
+    client.active.push(3)
+    # last-stream-id 1: the peer served stream 1 but not stream 3.
+    ga := frames.parse_goaway(frames.goaway_frame(1, frames.ERROR_NO_ERROR, bytes.empty())!)!
+    keep := handle_goaway(client, ga)!
+    assert(keep)
+    assert(client.going_away)
+    assert(client.streams.contains_key(1))
+    assert(not client.streams.contains_key(3))
+    # stream 3's inbox was closed, so its waiting request() unblocks with none.
+    assert(inbox3.recv() == none)
+
+test "a WINDOW_UPDATE with a zero increment is a protocol error":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    frame := frames.window_update_frame(1, 0)!
+    assert(handle_frame(client, frame).is_err)

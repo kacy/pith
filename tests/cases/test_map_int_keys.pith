@@ -1,0 +1,35 @@
+fn main():
+    # int-keyed, int-valued map: keys() must enumerate every key, and each
+    # key must index back to its value (regression: keys() used to return an
+    # empty list for int-keyed maps while len() was correct)
+    mut m: Map[Int, Int] := {}
+    m.insert(10, 100)
+    m.insert(20, 200)
+    m.insert(563, 5630)
+    print(m.keys().len().to_string())
+    mut ksum := 0
+    mut vsum := 0
+    for k in m.keys():
+        ksum = ksum + k
+        vsum = vsum + m[k]
+    print(ksum.to_string())
+    print(vsum.to_string())
+
+    # iterating the map directly yields its keys too
+    mut direct := 0
+    for k in m:
+        direct = direct + k
+    print(direct.to_string())
+
+    # int-keyed, string-valued map: keys() enumerates the int keys as well
+    mut s: Map[Int, String] := {}
+    s.insert(1, "a")
+    s.insert(2, "b")
+    print(s.keys().len().to_string())
+
+    # string-keyed map: keys() still works (guard against a regression the
+    # other way)
+    mut t: Map[String, Int] := {}
+    t.insert("x", 1)
+    t.insert("y", 2)
+    print(t.keys().len().to_string())

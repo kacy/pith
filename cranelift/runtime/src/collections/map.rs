@@ -989,6 +989,33 @@ pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
     list.ptr as i64
 }
 
+/// Return all int keys as a PithList of i64 values (each element is a raw
+/// key). The counterpart to `pith_map_keys_cstr` for integer-keyed maps,
+/// whose keys the string variant drops. The PithList pointer is returned as
+/// i64.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_keys_ikey(map_handle: i64) -> i64 {
+    use crate::collections::list::{pith_list_new, pith_list_push_value};
+
+    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
+        let empty = pith_list_new(8, 0);
+        return empty.ptr as i64;
+    };
+    // int-tagged: 8-byte, non-heap values, matching pith_map_values_handle
+    let list = pith_list_new(8, 0);
+
+    for key in impl_ref.keys() {
+        if let MapKey::Int(k) = key {
+            pith_list_push_value(list, k);
+        }
+    }
+
+    list.ptr as i64
+}
+
 /// Clear all entries from map (handle-based API).
 ///
 /// # Safety

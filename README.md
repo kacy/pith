@@ -6,10 +6,10 @@
 a small language that compiles to native code and is written in
 itself. python-shaped syntax, result types instead of exceptions,
 reference counting instead of a garbage collector. the compiler is
-about 23,000 lines of pith; the standard library is another 28,000,
-and it goes deeper than you'd guess — the TLS 1.3 client, the regex
-engine, the postgres and mysql wire protocols, and gzip compression
-are all pith source you can read.
+about 23,000 lines of pith; the standard library is another 31,000,
+and it goes deeper than you'd guess — the TLS 1.3 client, the native
+http/2 client, the regex engine, the postgres and mysql wire protocols,
+and gzip compression are all pith source you can read.
 
 ```pith
 enum Shape:
@@ -64,7 +64,7 @@ small language carry on its own back? the answer so far:
   discipline (docs/ownership.md). no gc pauses. there is no cycle
   collector, but a struct graph can break its own cycles with a `weak`
   field — mark the back edge `weak` and a parent/child ring reclaims.
-- **the stdlib doesn't shell out.** TLS 1.3, http, websockets, json,
+- **the stdlib doesn't shell out.** TLS 1.3, http/1.1 and http/2, websockets, json,
   toml, csv, tar, zip, gzip (interops with system gzip in both
   directions), sha-256, a linear-time regex engine — written in pith.
   when the language couldn't express something well, that became a
@@ -140,8 +140,8 @@ with idioms is [docs/idiomatic_pith.md](docs/idiomatic_pith.md).
 
 ## the standard library, briefly
 
-66 modules, ~28,000 lines, all pith. the areas: io and filesystems
-(fs, glob, path, process), networking (tcp, dns, url, http,
+71 modules, ~31,000 lines, all pith. the areas: io and filesystems
+(fs, glob, path, process), networking (tcp, dns, url, http, http2,
 websocket, tls, sse), databases (sql, postgres, mysql, redis — pure-pith
 wire protocols with tls, prepared statements, and pooling), data (json,
 toml, csv, config, table), bytes and crypto (hash, checksum, encoding,

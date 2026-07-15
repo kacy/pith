@@ -53,7 +53,9 @@ something here that now works, the page is stale and a fix to it is welcome.
 - **testing** — `std/testing` covers assertions but not discovery, fixtures, or
   parameterized cases. the project's own suite is golden-snapshot based (see
   `tests/`).
-- **http/2** — the http stack is 1.1 only.
+- **http/2 is client-only** — `std.net.http2` is a native http/2 client
+  (multiplexed streams, hpack, tls with alpn). there is no http/2 server yet,
+  and `std.net.http` stays http/1.1.
 - **regex is deliberately small** — `std.regex` covers literals, `.`,
   classes, `\d \w \s` escapes, `* + ?` (greedy), alternation, capturing
   groups, and `^ $` anchors. it does not support `{n,m}` counts, lazy

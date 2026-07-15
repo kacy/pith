@@ -59,7 +59,7 @@ from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_fun
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
-from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some
+from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_weak_read
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
@@ -406,6 +406,45 @@ fn ir_struct_field_name(field_node: Node) -> String:
     if field_name.contains(" "):
         field_name = field_name.split(" ")[0]
     return field_name
+
+# a `weak` field holds its optional target without keeping it alive, so a
+# parent<->child ring reclaims instead of leaking. the parser stashes the
+# modifier in the field node's value ("parent weak"), which is where the
+# checker's E249 validation reads it from too.
+fn ir_struct_field_is_weak(struct_name: String, field_name: String) -> Bool:
+    layout_name := ir_struct_layout_name_with_state(struct_name, ir_struct_names)
+    if not ir_struct_decl_nodes.contains_key(layout_name):
+        return false
+    decl := get_node(ir_struct_decl_nodes[layout_name])
+    for child in decl.children:
+        field_node := ir_unwrap_pub_node(child)
+        if field_node.kind != "field":
+            continue
+        if ir_struct_field_name(field_node) == field_name:
+            return field_node.value.contains(" weak")
+    return false
+
+# lower a weak field's incoming value to the bare target pointer it should
+# store, taking a weak reference in the process. `none` collapses to 0; an
+# already-optional value is unwrapped to its payload (0 when none); a bare
+# struct value is the target directly. pith_struct_weak_retain(0) is a no-op,
+# so the null cases need no branch. the returned pointer is what the field
+# slot holds — no owning tuple, which is what keeps the ring from cycling.
+fn ir_emit_weak_payload(val_idx: Int) -> Int:
+    vnode := get_node(val_idx)
+    if vnode.kind == "none":
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        return zero_r
+    val_r := ir_expr(val_idx)
+    mut payload_r := val_r
+    if ir_rc_kind(ir_infer_type(val_idx)) == "tuple":
+        # already an optional tuple: the payload sits at offset 8 (0 when none)
+        payload_r = ir_reg()
+        ir_emit("field " + payload_r.to_string() + " " + val_r.to_string() + " 8 unknown value")
+    retain_r := ir_reg()
+    ir_emit("call " + retain_r.to_string() + " pith_struct_weak_retain void 1 " + payload_r.to_string())
+    return payload_r
 
 fn ir_collect_struct_field_strings(root_idx: Int):
     for item_idx in ir_root_items(root_idx):
@@ -2988,7 +3027,15 @@ fn ir_emit_field_access(idx: Int, node: Node) -> Int:
     r := ir_reg()
     if ir_emit_tuple_field_access(r, obj_r, recv_idx, fname):
         return r
-    ir_emit_named_field_access(r, obj_r, ir_field_lookup_key(recv_idx, fname), fname, ir_checked_struct_field_type(recv_idx, fname))
+    lk := ir_field_lookup_key(recv_idx, fname)
+    ir_emit_named_field_access(r, obj_r, lk, fname, ir_checked_struct_field_type(recv_idx, fname))
+    # a weak field's slot holds the bare target pointer; synthesize the optional
+    # the rest of the pipeline expects, resolving liveness so a reclaimed target
+    # reads back as none.
+    if lk.len() > fname.len() + 1:
+        weak_struct := lk.substring(0, lk.len() - fname.len() - 1)
+        if ir_struct_field_is_weak(weak_struct, fname):
+            return ir_emit_weak_read(r)
     return r
 
 fn ir_emit_result_tuple(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
@@ -3929,7 +3976,17 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int]) -> Int:
             an := get_node(an_idx)
             if an.kind == "arg" and an.value == field_name and an.children.len() > 0:
                 value_node = an.children[0]
-        if value_node >= 0:
+        if ir_struct_field_is_weak(sname, field_name):
+            # a weak field stores the bare target pointer (0 = none), not an
+            # owning tuple, so it never keeps the target alive.
+            mut init_node := value_node
+            if init_node < 0:
+                init_node = ir_struct_field_default_node(sname, field_name)
+            if init_node >= 0:
+                field_regs.push(ir_emit_weak_payload(init_node))
+            else:
+                field_regs.push(ir_zero_reg())
+        elif value_node >= 0:
             fr := ir_emit_value_for_target(value_node, field_type)
             named_field_kind := ir_rc_kind(field_type)
             # tuple-typed (optional) field values arrive already owned from
@@ -3968,6 +4025,10 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int]) -> Int:
             value_idx = cn.children[0]
         elif cn.kind == "arg" and cn.children.len() > 0:
             value_idx = cn.children[0]
+        if ir_struct_field_is_weak(sname, ir_struct_field_name_at(sname, field_idx)):
+            field_regs.push(ir_emit_weak_payload(value_idx))
+            field_idx = field_idx + 1
+            continue
         fr := ir_emit_value_for_target(value_idx, ftype)
         pos_field_kind := ir_rc_kind(ftype)
         # tuple-typed (optional) field values arrive already owned; don't retain.
@@ -4597,6 +4658,18 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
     if value_type.len() == 0:
         value_type = ir_infer_type(value_idx)
     fassign_kind := ir_rc_kind(value_type)
+    # a weak field stores the bare target pointer: drop the old weak reference,
+    # take a new one, and never touch the strong count. no owning tuple is
+    # involved, so the strong release/retain dance below is skipped entirely.
+    weak_struct := lookup_key.substring(0, lookup_key.len() - fname.len() - 1)
+    if ir_struct_field_is_weak(weak_struct, fname):
+        old_w := ir_reg()
+        ir_emit_named_field_access(old_w, obj_r, lookup_key, fname, value_type)
+        new_w := ir_emit_weak_payload(value_idx)
+        ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + new_w.to_string())
+        rel_r := ir_reg()
+        ir_emit("call " + rel_r.to_string() + " pith_struct_weak_release void 1 " + old_w.to_string())
+        return true
     # release the value already in the field before overwriting it, the same
     # ownership dance local and global assignment do. load the old value first
     # so a self-referential rhs (obj.f = obj.f...) still sees it, then release
@@ -5801,7 +5874,14 @@ fn ir_emit_struct_dtors():
             fname := ir_struct_field_name_at(sname, i)
             ftype := ir_struct_field_type_name(sname, fname)
             fkind := ir_rc_field_kind(ftype)
-            if fkind.len() > 0:
+            if ir_struct_field_is_weak(sname, fname):
+                # a weak field holds a bare target pointer, so drop its weak
+                # reference rather than a strong one; weak_release(0) is a no-op.
+                fr := ir_reg()
+                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
+                rel_r := ir_reg()
+                ir_emit("call " + rel_r.to_string() + " pith_struct_weak_release void 1 " + fr.to_string())
+            elif fkind.len() > 0:
                 fr := ir_reg()
                 ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
                 ir_rc_release_reg(fr, fkind)

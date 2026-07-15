@@ -229,6 +229,40 @@ note: the live HTTP catalog benchmark is still exploratory on the Pith side.
 the Pith service currently exits after its first successful request, so the
 stable comparison point today is the workload benchmark above.
 
+## cyclic graph benchmark (weak references)
+
+`bench/cyclic_graph.pith` and `bench/cyclic_graph_strong.pith` build many
+parent<->child rings and drop them. each ring has a strong forward edge
+(`next`) and a back edge (`parent`). the two programs differ in one word:
+the back edge is `weak` in one and a plain optional in the other.
+
+a `weak` back edge holds the parent without owning it, so the ring closes
+no strong cycle and every ring reclaims as the loop moves on. a strong
+back edge closes a real cycle — `next` owns forward, `parent` owns back —
+so neither node's refcount reaches zero and every ring leaks. the two
+binaries print the same checksum; only their memory behavior differs.
+
+run them:
+
+```
+pith build bench/cyclic_graph.pith
+pith build bench/cyclic_graph_strong.pith
+./bench/cyclic_graph 2000000
+./bench/cyclic_graph_strong 2000000
+```
+
+peak resident memory on this machine, two million rings:
+
+| back edge | peak RSS | structs freed |
+|---|---:|---|
+| `weak` | ~2 MB | all (flat) |
+| strong | ~730 MB | none (leaks every ring) |
+
+the `weak` run holds flat because the rings free as fast as they are
+built; the strong run grows without bound. `PITH_PERF_STATS=1` prints the
+underlying struct alloc/free counts — balanced for the weak variant,
+alloc-heavy with almost no frees for the strong one.
+
 ## std pipeline benchmark
 
 `bench/std_pipeline.*` is a batteries-included data pipeline benchmark. it

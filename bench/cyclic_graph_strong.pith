@@ -1,0 +1,40 @@
+# cyclic graph benchmark, strong-back-edge variant (the leaking baseline).
+#
+# identical to bench/cyclic_graph.pith except the back edge (`parent`) is a
+# plain optional field instead of `weak`. that closes a real strong cycle:
+# `next` owns forward, `parent` owns back, so neither node's refcount ever
+# reaches zero and every ring leaks. run both under a memory sampler to see
+# the difference the `weak` keyword makes.
+#
+# usage: cyclic_graph_strong <rings>
+
+struct Node:
+    value: Int
+    mut next: Node?
+    mut parent: Node?
+
+# build one ring and drop it. both edges are strong, so `next` owns forward
+# and `parent` owns back: a real cycle that never reaches refcount zero. every
+# ring leaks. the checksum reads node values directly to match the weak variant.
+fn build_ring(seed: Int) -> Int:
+    a := Node(value: seed, next: none, parent: none)
+    b := Node(value: seed + 1, next: none, parent: none)
+    a.next = b
+    b.parent = a
+    return a.value + b.value
+
+fn main() -> Int!:
+    argv := args()
+    mut rings := 1000000
+    if argv.len() > 1:
+        parsed := parse_int(argv[1])
+        if parsed.is_ok and parsed.ok > 0:
+            rings = parsed.ok
+
+    mut i := 0
+    mut checksum := 0
+    while i < rings:
+        checksum = checksum + build_ring(i)
+        i = i + 1
+    print("rings: {rings} checksum: {checksum}")
+    return 0

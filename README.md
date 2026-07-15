@@ -61,8 +61,9 @@ small language carry on its own back? the answer so far:
   fallback. functions that can't fail can't lie about it.
 - **memory is reference-counted by the compiler.** retain/release
   pairs are emitted at compile time following a borrowed-by-default
-  discipline (docs/ownership.md). no gc pauses; also no cycle
-  collector yet — cycles leak, and the limitations page says so.
+  discipline (docs/ownership.md). no gc pauses. there is no cycle
+  collector, but a struct graph can break its own cycles with a `weak`
+  field — mark the back edge `weak` and a parent/child ring reclaims.
 - **the stdlib doesn't shell out.** TLS 1.3, http, websockets, json,
   toml, csv, tar, zip, gzip (interops with system gzip in both
   directions), sha-256, a linear-time regex engine — written in pith.
@@ -79,7 +80,8 @@ small language carry on its own back? the answer so far:
 
 the honest list lives in [docs/limitations.md](docs/limitations.md)
 and stays current. highlights you should know before diving in:
-reference cycles and closure environments leak (no cycle collector),
+strong reference cycles leak unless broken with a `weak` field, closure
+environments that capture back to themselves leak (no weak captures yet),
 removed container elements aren't reclaimed until the container dies,
 tls is 1.3-only with no 1.2 fallback, and
 performance sits between go and rust on service-shaped work but

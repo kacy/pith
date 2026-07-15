@@ -96,6 +96,22 @@ pub fn ir_emit_optional_some_value(value_r: Int) -> Int:
     ir_emit("iconst " + flag_r.to_string() + " 1")
     return ir_emit_optional_tuple(flag_r, value_r)
 
+# read a weak optional field. the slot holds the target pointer directly
+# (0 = none) rather than an owning tuple, so liveness is resolved through
+# pith_struct_weak_load: it returns the pointer while the target is still
+# alive and 0 once the target has been reclaimed. that lets a dropped target
+# read back as none instead of dangling. the caller gets a fresh, borrowing
+# optional tuple (Some(ptr) when alive, none otherwise) that behaves like any
+# other `T?` for `.value()` and `!= none`.
+pub fn ir_emit_weak_read(raw_r: Int) -> Int:
+    alive_r := ir_reg()
+    ir_emit("call " + alive_r.to_string() + " pith_struct_weak_load int 1 " + raw_r.to_string())
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    flag_r := ir_reg()
+    ir_emit("neq " + flag_r.to_string() + " " + alive_r.to_string() + " " + zero_r.to_string())
+    return ir_emit_optional_tuple(flag_r, alive_r)
+
 # like ir_emit_optional_some_value, but the optional OWNS its rc payload: it
 # carries a destructor that releases the payload when the optional dies, so a
 # `Node?` field keeps its target alive instead of borrowing a pointer that

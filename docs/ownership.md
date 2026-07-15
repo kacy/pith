@@ -80,16 +80,16 @@ reference counting frees a value the moment its last count drops, with
 no gc pause. that covers the common case completely. the deliberate
 gaps, all bounded leaks rather than dangling pointers:
 
-- **reference cycles are not collected.** there is no cycle collector.
-  this is the one remaining reachable leak, and the vector is narrow:
-  structs cannot be self-referential (a field cannot name its own
-  struct type) and two structs cannot reference each other (the second
-  type is unknown when the first is checked), so a struct graph can
-  never close a loop. the way left to build a cycle is a closure that
-  captures a binding which transitively holds the closure — for
-  example a list that contains a closure capturing that same list.
-  such a cycle keeps its own count above zero and leaks. most programs
-  never write this shape.
+- **reference cycles are not collected.** there is no cycle collector,
+  so a graph that closes a loop of strong references keeps its own count
+  above zero and leaks. a struct can name its own type in a field and an
+  optional field owns its target, so a linked structure — a parent that
+  owns a child which points back at the parent — closes a strong cycle.
+  the fix is the `weak` keyword (below): mark the back edge `weak` and
+  the ring reclaims. the other way to build a cycle is a closure that
+  captures a binding which transitively holds the closure — for example
+  a list that contains a closure capturing that same list; there is no
+  weak capture yet, so that shape still leaks.
 - **removed or overwritten container elements are not released until
   the container itself dies.** a borrow of an element may still be in
   flight, so the free is deferred to the container's own cleanup.
@@ -106,6 +106,47 @@ gaps, all bounded leaks rather than dangling pointers:
 
 none of these produce a dangling pointer; the discipline trades a
 bounded leak for that guarantee.
+
+## weak references
+
+a `weak` field holds an optional target without keeping it alive. it is
+how you break a strong cycle: in a parent/child graph, let the parent own
+the child through a normal optional field and mark the child's back
+pointer `weak`.
+
+```pith
+struct Node:
+    value: Int
+    mut next: Node?      # owns the next node
+    weak parent: Node?   # refers back without owning
+```
+
+only an optional struct field can be `weak` — the checker rejects
+anything else (E249). a weak field never touches its target's strong
+count, so it cannot be the reference that holds a node alive. when the
+last strong owner drops, the target is reclaimed even while weak
+references still point at it.
+
+reading a weak field resolves liveness on the spot. while the target is
+alive the field reads back as `Some(target)`; once the target has been
+reclaimed it reads back as `none`, so a weak reference never dangles:
+
+```pith
+if node.parent != none:
+    print("parent: {node.parent.value().value}")   # alive
+# ... after the parent's last strong owner drops ...
+if node.parent != none:                             # now false
+    ...                                             # not taken
+```
+
+under the hood a weak field stores the target pointer directly rather
+than an owning box, takes a weak reference on assignment, and drops it in
+the struct's destructor. the target's header carries a separate weak
+count and a dead flag; the header outlives the value just long enough for
+weak reads to observe that the value is gone and return `none`. the
+`bench/cyclic_graph` benchmark builds and drops two million parent/child
+rings: with the back edge `weak` peak memory stays flat (about 2 MB),
+and with a strong back edge the same run leaks every ring (about 730 MB).
 
 closures are reference counted like any other heap value. a closure
 carries its own count and a release tag per captured slot; the last

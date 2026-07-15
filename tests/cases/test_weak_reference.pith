@@ -1,0 +1,42 @@
+# a `weak` field points at its target without keeping it alive, so a
+# parent<->child ring reclaims instead of leaking. reads resolve liveness:
+# while the target is alive the field reads back as the value, and once the
+# target is gone it reads back as none rather than dangling.
+
+struct Node:
+    value: Int
+    mut next: Node?
+    weak parent: Node?
+
+fn parent_value(n: Node) -> Int:
+    if n.parent != none:
+        return n.parent.value().value
+    return 0 - 1
+
+# link a fresh child under a parent that is dropped when this returns. the
+# child survives (it is returned), but its weak parent pointer must not.
+fn orphan() -> Node:
+    p := Node(value: 99, next: none, parent: none)
+    c := Node(value: 1, next: none, parent: none)
+    c.parent = p
+    print("while parent alive: {parent_value(c)}")
+    return c
+
+fn main() -> Int!:
+    # a two-node ring: next owns forward, parent references back weakly.
+    a := Node(value: 10, next: none, parent: none)
+    b := Node(value: 20, next: none, parent: none)
+    a.next = b
+    b.parent = a
+    print("forward: {a.next.value().value}")
+    print("weak back: {parent_value(b)}")
+
+    # reassigning a weak field drops the old reference and takes a new one.
+    c := Node(value: 30, next: none, parent: none)
+    b.parent = c
+    print("weak back after reassign: {parent_value(b)}")
+
+    # a weak pointer to a dropped target reads as none.
+    orphaned := orphan()
+    print("after parent dropped: {parent_value(orphaned)}")
+    return 0

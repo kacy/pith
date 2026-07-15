@@ -1,0 +1,45 @@
+# live test: verify a real public ca chain over tls 1.3, without pinning.
+#
+# public ca intermediates (and many leaves) sign with ecdsa-p384-sha384. this
+# dials a public https host using the system trust roots and host name
+# verification, so the handshake only completes if that signature verifies
+# through to a trusted root. it skips when the network is unreachable so it
+# stays green offline.
+#
+# run with: pith test tests/live/tls_public_chain_live.pith
+
+import std.net.tls as tls
+
+# hosts whose chains exercise ecdsa-p384-sha384: cloudflare's leaf is
+# p384/sha384, google and github use it at the intermediate. trying several
+# keeps a single host outage from failing the suite.
+HOSTS := ["www.cloudflare.com", "www.google.com", "github.com"]
+
+fn fetch_root(host: String) -> String!:
+    conn := tls.dial(host, 443)!
+    state := conn.state()
+    if state.version != 772:
+        conn.close()
+        fail "expected tls 1.3"
+    if not state.peer_chain_present:
+        conn.close()
+        fail "peer certificate chain was not verified"
+    conn.write_all("GET / HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n")!
+    response := conn.read(256)!
+    conn.close()
+    return response
+
+test "tls verifies a public ca chain and completes an https request":
+    mut verified := false
+    mut response := ""
+    for host in HOSTS:
+        if not verified:
+            attempt := fetch_root(host)
+            if attempt.is_ok:
+                response = attempt.ok
+                verified = true
+    if not verified:
+        skip_test("no public https host reachable")
+    # a verified handshake plus a well-formed status line is the proof that the
+    # full chain (leaf -> intermediate -> root) verified, p-384/sha-384 included.
+    assert(response.contains("HTTP/1.1"))

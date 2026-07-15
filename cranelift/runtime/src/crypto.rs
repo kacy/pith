@@ -298,6 +298,24 @@ pub unsafe extern "C" fn pith_crypto_verify_ecdsa_p256_sha256_asn1(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pith_crypto_verify_ecdsa_p384_sha384_asn1(
+    public_key: i64,
+    message: i64,
+    sig: i64,
+) -> i64 {
+    let Some(public_key) = bytes_slice(public_key) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    let Some(sig) = bytes_slice(sig) else {
+        return 0;
+    };
+    verify_with(&signature::ECDSA_P384_SHA384_ASN1, public_key, message, sig)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pith_crypto_verify_rsa_pkcs1_sha256(
     public_key: i64,
     message: i64,
@@ -314,6 +332,29 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pkcs1_sha256(
     };
     verify_with(
         &signature::RSA_PKCS1_2048_8192_SHA256,
+        public_key,
+        message,
+        sig,
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_verify_rsa_pkcs1_sha384(
+    public_key: i64,
+    message: i64,
+    sig: i64,
+) -> i64 {
+    let Some(public_key) = bytes_slice(public_key) else {
+        return 0;
+    };
+    let Some(message) = bytes_slice(message) else {
+        return 0;
+    };
+    let Some(sig) = bytes_slice(sig) else {
+        return 0;
+    };
+    verify_with(
+        &signature::RSA_PKCS1_2048_8192_SHA384,
         public_key,
         message,
         sig,

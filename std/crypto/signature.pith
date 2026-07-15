@@ -13,9 +13,17 @@ pub fn verify_ed25519(public_key: Bytes, message: Bytes, signature: Bytes) -> Bo
 pub fn verify_ecdsa_p256_sha256_asn1(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
     return crypto_verify_ecdsa_p256_sha256_asn1(public_key, message, signature)
 
+# verify an ecdsa p-384 sha-384 signature encoded as asn.1 der.
+pub fn verify_ecdsa_p384_sha384_asn1(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
+    return crypto_verify_ecdsa_p384_sha384_asn1(public_key, message, signature)
+
 # verify an rsa pkcs#1 v1.5 sha-256 signature.
 pub fn verify_rsa_pkcs1_sha256(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
     return crypto_verify_rsa_pkcs1_sha256(public_key, message, signature)
+
+# verify an rsa pkcs#1 v1.5 sha-384 signature.
+pub fn verify_rsa_pkcs1_sha384(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
+    return crypto_verify_rsa_pkcs1_sha384(public_key, message, signature)
 
 # verify an rsa-pss sha-256 signature.
 pub fn verify_rsa_pss_sha256(public_key: Bytes, message: Bytes, signature: Bytes) -> Bool:
@@ -35,5 +43,7 @@ test "ed25519 verification matches rfc 8032 empty message vector":
 test "signature verifiers reject malformed inputs":
     bad := bytes.from_string_utf8("bad")
     assert(not verify_ecdsa_p256_sha256_asn1(bad, bad, bad))
+    assert(not verify_ecdsa_p384_sha384_asn1(bad, bad, bad))
     assert(not verify_rsa_pkcs1_sha256(bad, bad, bad))
+    assert(not verify_rsa_pkcs1_sha384(bad, bad, bad))
     assert(not verify_rsa_pss_sha256(bad, bad, bad))

@@ -89,6 +89,39 @@ pub ERROR_INADEQUATE_SECURITY := 12
 # the request must be retried over http/1.1.
 pub ERROR_HTTP_1_1_REQUIRED := 13
 
+# the short RFC 9113 §7 name for an error code, for readable failures. an
+# unknown code is rendered with its number so nothing is lost.
+pub fn error_name(code: Int) -> String:
+    if code == ERROR_NO_ERROR:
+        return "NO_ERROR"
+    if code == ERROR_PROTOCOL_ERROR:
+        return "PROTOCOL_ERROR"
+    if code == ERROR_INTERNAL_ERROR:
+        return "INTERNAL_ERROR"
+    if code == ERROR_FLOW_CONTROL_ERROR:
+        return "FLOW_CONTROL_ERROR"
+    if code == ERROR_SETTINGS_TIMEOUT:
+        return "SETTINGS_TIMEOUT"
+    if code == ERROR_STREAM_CLOSED:
+        return "STREAM_CLOSED"
+    if code == ERROR_FRAME_SIZE_ERROR:
+        return "FRAME_SIZE_ERROR"
+    if code == ERROR_REFUSED_STREAM:
+        return "REFUSED_STREAM"
+    if code == ERROR_CANCEL:
+        return "CANCEL"
+    if code == ERROR_COMPRESSION_ERROR:
+        return "COMPRESSION_ERROR"
+    if code == ERROR_CONNECT_ERROR:
+        return "CONNECT_ERROR"
+    if code == ERROR_ENHANCE_YOUR_CALM:
+        return "ENHANCE_YOUR_CALM"
+    if code == ERROR_INADEQUATE_SECURITY:
+        return "INADEQUATE_SECURITY"
+    if code == ERROR_HTTP_1_1_REQUIRED:
+        return "HTTP_1_1_REQUIRED"
+    return "error {code}"
+
 # the default SETTINGS_MAX_FRAME_SIZE — the smallest a peer may advertise.
 pub DEFAULT_MAX_FRAME_SIZE := 16384
 # the largest value SETTINGS_MAX_FRAME_SIZE may take (2^24 - 1).
@@ -665,3 +698,10 @@ test "DATA rejects padding longer than the payload":
 test "SETTINGS rejects a non-zero stream id":
     frame := make_frame(FRAME_SETTINGS, 0, 1, bytes.empty())
     assert(parse_settings(frame).is_err)
+
+test "error_name renders known codes and falls back on unknown ones":
+    assert_eq(error_name(ERROR_NO_ERROR), "NO_ERROR")
+    assert_eq(error_name(ERROR_PROTOCOL_ERROR), "PROTOCOL_ERROR")
+    assert_eq(error_name(ERROR_FRAME_SIZE_ERROR), "FRAME_SIZE_ERROR")
+    assert_eq(error_name(ERROR_HTTP_1_1_REQUIRED), "HTTP_1_1_REQUIRED")
+    assert_eq(error_name(99), "error 99")

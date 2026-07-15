@@ -1,0 +1,438 @@
+# std.net.http2.huffman — the canonical HPACK Huffman coding (RFC 7541 App B).
+#
+# hpack may compress a header string with a fixed Huffman code. the code is a
+# complete prefix code over the 256 byte values plus a 30-bit end-of-string
+# symbol (256). encoding packs each symbol's bits most-significant-first and
+# pads the final byte with the EOS prefix (all ones). decoding walks the bit
+# stream, emitting a symbol as soon as the accumulated bits match a codeword.
+
+import std.bytes as bytes
+import std.bits as bits
+import std.encoding as encoding
+
+# one code table entry: the codeword value and its length in bits.
+struct HuffEntry:
+    code: Int
+    length: Int
+
+# the largest codeword length in the table (the EOS symbol).
+MAX_CODE_LENGTH := 30
+# the end-of-string symbol; it must never appear whole in valid input.
+EOS_SYMBOL := 256
+
+# the fixed RFC 7541 Appendix B table, indexed by symbol (0..255, EOS at 256).
+fn huff_table() -> List[HuffEntry]:
+    return [
+        HuffEntry(0x1ff8, 13),
+        HuffEntry(0x7fffd8, 23),
+        HuffEntry(0xfffffe2, 28),
+        HuffEntry(0xfffffe3, 28),
+        HuffEntry(0xfffffe4, 28),
+        HuffEntry(0xfffffe5, 28),
+        HuffEntry(0xfffffe6, 28),
+        HuffEntry(0xfffffe7, 28),
+        HuffEntry(0xfffffe8, 28),
+        HuffEntry(0xffffea, 24),
+        HuffEntry(0x3ffffffc, 30),
+        HuffEntry(0xfffffe9, 28),
+        HuffEntry(0xfffffea, 28),
+        HuffEntry(0x3ffffffd, 30),
+        HuffEntry(0xfffffeb, 28),
+        HuffEntry(0xfffffec, 28),
+        HuffEntry(0xfffffed, 28),
+        HuffEntry(0xfffffee, 28),
+        HuffEntry(0xfffffef, 28),
+        HuffEntry(0xffffff0, 28),
+        HuffEntry(0xffffff1, 28),
+        HuffEntry(0xffffff2, 28),
+        HuffEntry(0x3ffffffe, 30),
+        HuffEntry(0xffffff3, 28),
+        HuffEntry(0xffffff4, 28),
+        HuffEntry(0xffffff5, 28),
+        HuffEntry(0xffffff6, 28),
+        HuffEntry(0xffffff7, 28),
+        HuffEntry(0xffffff8, 28),
+        HuffEntry(0xffffff9, 28),
+        HuffEntry(0xffffffa, 28),
+        HuffEntry(0xffffffb, 28),
+        HuffEntry(0x14, 6),
+        HuffEntry(0x3f8, 10),
+        HuffEntry(0x3f9, 10),
+        HuffEntry(0xffa, 12),
+        HuffEntry(0x1ff9, 13),
+        HuffEntry(0x15, 6),
+        HuffEntry(0xf8, 8),
+        HuffEntry(0x7fa, 11),
+        HuffEntry(0x3fa, 10),
+        HuffEntry(0x3fb, 10),
+        HuffEntry(0xf9, 8),
+        HuffEntry(0x7fb, 11),
+        HuffEntry(0xfa, 8),
+        HuffEntry(0x16, 6),
+        HuffEntry(0x17, 6),
+        HuffEntry(0x18, 6),
+        HuffEntry(0x0, 5),
+        HuffEntry(0x1, 5),
+        HuffEntry(0x2, 5),
+        HuffEntry(0x19, 6),
+        HuffEntry(0x1a, 6),
+        HuffEntry(0x1b, 6),
+        HuffEntry(0x1c, 6),
+        HuffEntry(0x1d, 6),
+        HuffEntry(0x1e, 6),
+        HuffEntry(0x1f, 6),
+        HuffEntry(0x5c, 7),
+        HuffEntry(0xfb, 8),
+        HuffEntry(0x7ffc, 15),
+        HuffEntry(0x20, 6),
+        HuffEntry(0xffb, 12),
+        HuffEntry(0x3fc, 10),
+        HuffEntry(0x1ffa, 13),
+        HuffEntry(0x21, 6),
+        HuffEntry(0x5d, 7),
+        HuffEntry(0x5e, 7),
+        HuffEntry(0x5f, 7),
+        HuffEntry(0x60, 7),
+        HuffEntry(0x61, 7),
+        HuffEntry(0x62, 7),
+        HuffEntry(0x63, 7),
+        HuffEntry(0x64, 7),
+        HuffEntry(0x65, 7),
+        HuffEntry(0x66, 7),
+        HuffEntry(0x67, 7),
+        HuffEntry(0x68, 7),
+        HuffEntry(0x69, 7),
+        HuffEntry(0x6a, 7),
+        HuffEntry(0x6b, 7),
+        HuffEntry(0x6c, 7),
+        HuffEntry(0x6d, 7),
+        HuffEntry(0x6e, 7),
+        HuffEntry(0x6f, 7),
+        HuffEntry(0x70, 7),
+        HuffEntry(0x71, 7),
+        HuffEntry(0x72, 7),
+        HuffEntry(0xfc, 8),
+        HuffEntry(0x73, 7),
+        HuffEntry(0xfd, 8),
+        HuffEntry(0x1ffb, 13),
+        HuffEntry(0x7fff0, 19),
+        HuffEntry(0x1ffc, 13),
+        HuffEntry(0x3ffc, 14),
+        HuffEntry(0x22, 6),
+        HuffEntry(0x7ffd, 15),
+        HuffEntry(0x3, 5),
+        HuffEntry(0x23, 6),
+        HuffEntry(0x4, 5),
+        HuffEntry(0x24, 6),
+        HuffEntry(0x5, 5),
+        HuffEntry(0x25, 6),
+        HuffEntry(0x26, 6),
+        HuffEntry(0x27, 6),
+        HuffEntry(0x6, 5),
+        HuffEntry(0x74, 7),
+        HuffEntry(0x75, 7),
+        HuffEntry(0x28, 6),
+        HuffEntry(0x29, 6),
+        HuffEntry(0x2a, 6),
+        HuffEntry(0x7, 5),
+        HuffEntry(0x2b, 6),
+        HuffEntry(0x76, 7),
+        HuffEntry(0x2c, 6),
+        HuffEntry(0x8, 5),
+        HuffEntry(0x9, 5),
+        HuffEntry(0x2d, 6),
+        HuffEntry(0x77, 7),
+        HuffEntry(0x78, 7),
+        HuffEntry(0x79, 7),
+        HuffEntry(0x7a, 7),
+        HuffEntry(0x7b, 7),
+        HuffEntry(0x7ffe, 15),
+        HuffEntry(0x7fc, 11),
+        HuffEntry(0x3ffd, 14),
+        HuffEntry(0x1ffd, 13),
+        HuffEntry(0xffffffc, 28),
+        HuffEntry(0xfffe6, 20),
+        HuffEntry(0x3fffd2, 22),
+        HuffEntry(0xfffe7, 20),
+        HuffEntry(0xfffe8, 20),
+        HuffEntry(0x3fffd3, 22),
+        HuffEntry(0x3fffd4, 22),
+        HuffEntry(0x3fffd5, 22),
+        HuffEntry(0x7fffd9, 23),
+        HuffEntry(0x3fffd6, 22),
+        HuffEntry(0x7fffda, 23),
+        HuffEntry(0x7fffdb, 23),
+        HuffEntry(0x7fffdc, 23),
+        HuffEntry(0x7fffdd, 23),
+        HuffEntry(0x7fffde, 23),
+        HuffEntry(0xffffeb, 24),
+        HuffEntry(0x7fffdf, 23),
+        HuffEntry(0xffffec, 24),
+        HuffEntry(0xffffed, 24),
+        HuffEntry(0x3fffd7, 22),
+        HuffEntry(0x7fffe0, 23),
+        HuffEntry(0xffffee, 24),
+        HuffEntry(0x7fffe1, 23),
+        HuffEntry(0x7fffe2, 23),
+        HuffEntry(0x7fffe3, 23),
+        HuffEntry(0x7fffe4, 23),
+        HuffEntry(0x1fffdc, 21),
+        HuffEntry(0x3fffd8, 22),
+        HuffEntry(0x7fffe5, 23),
+        HuffEntry(0x3fffd9, 22),
+        HuffEntry(0x7fffe6, 23),
+        HuffEntry(0x7fffe7, 23),
+        HuffEntry(0xffffef, 24),
+        HuffEntry(0x3fffda, 22),
+        HuffEntry(0x1fffdd, 21),
+        HuffEntry(0xfffe9, 20),
+        HuffEntry(0x3fffdb, 22),
+        HuffEntry(0x3fffdc, 22),
+        HuffEntry(0x7fffe8, 23),
+        HuffEntry(0x7fffe9, 23),
+        HuffEntry(0x1fffde, 21),
+        HuffEntry(0x7fffea, 23),
+        HuffEntry(0x3fffdd, 22),
+        HuffEntry(0x3fffde, 22),
+        HuffEntry(0xfffff0, 24),
+        HuffEntry(0x1fffdf, 21),
+        HuffEntry(0x3fffdf, 22),
+        HuffEntry(0x7fffeb, 23),
+        HuffEntry(0x7fffec, 23),
+        HuffEntry(0x1fffe0, 21),
+        HuffEntry(0x1fffe1, 21),
+        HuffEntry(0x3fffe0, 22),
+        HuffEntry(0x1fffe2, 21),
+        HuffEntry(0x7fffed, 23),
+        HuffEntry(0x3fffe1, 22),
+        HuffEntry(0x7fffee, 23),
+        HuffEntry(0x7fffef, 23),
+        HuffEntry(0xfffea, 20),
+        HuffEntry(0x3fffe2, 22),
+        HuffEntry(0x3fffe3, 22),
+        HuffEntry(0x3fffe4, 22),
+        HuffEntry(0x7ffff0, 23),
+        HuffEntry(0x3fffe5, 22),
+        HuffEntry(0x3fffe6, 22),
+        HuffEntry(0x7ffff1, 23),
+        HuffEntry(0x3ffffe0, 26),
+        HuffEntry(0x3ffffe1, 26),
+        HuffEntry(0xfffeb, 20),
+        HuffEntry(0x7fff1, 19),
+        HuffEntry(0x3fffe7, 22),
+        HuffEntry(0x7ffff2, 23),
+        HuffEntry(0x3fffe8, 22),
+        HuffEntry(0x1ffffec, 25),
+        HuffEntry(0x3ffffe2, 26),
+        HuffEntry(0x3ffffe3, 26),
+        HuffEntry(0x3ffffe4, 26),
+        HuffEntry(0x7ffffde, 27),
+        HuffEntry(0x7ffffdf, 27),
+        HuffEntry(0x3ffffe5, 26),
+        HuffEntry(0xfffff1, 24),
+        HuffEntry(0x1ffffed, 25),
+        HuffEntry(0x7fff2, 19),
+        HuffEntry(0x1fffe3, 21),
+        HuffEntry(0x3ffffe6, 26),
+        HuffEntry(0x7ffffe0, 27),
+        HuffEntry(0x7ffffe1, 27),
+        HuffEntry(0x3ffffe7, 26),
+        HuffEntry(0x7ffffe2, 27),
+        HuffEntry(0xfffff2, 24),
+        HuffEntry(0x1fffe4, 21),
+        HuffEntry(0x1fffe5, 21),
+        HuffEntry(0x3ffffe8, 26),
+        HuffEntry(0x3ffffe9, 26),
+        HuffEntry(0xffffffd, 28),
+        HuffEntry(0x7ffffe3, 27),
+        HuffEntry(0x7ffffe4, 27),
+        HuffEntry(0x7ffffe5, 27),
+        HuffEntry(0xfffec, 20),
+        HuffEntry(0xfffff3, 24),
+        HuffEntry(0xfffed, 20),
+        HuffEntry(0x1fffe6, 21),
+        HuffEntry(0x3fffe9, 22),
+        HuffEntry(0x1fffe7, 21),
+        HuffEntry(0x1fffe8, 21),
+        HuffEntry(0x7ffff3, 23),
+        HuffEntry(0x3fffea, 22),
+        HuffEntry(0x3fffeb, 22),
+        HuffEntry(0x1ffffee, 25),
+        HuffEntry(0x1ffffef, 25),
+        HuffEntry(0xfffff4, 24),
+        HuffEntry(0xfffff5, 24),
+        HuffEntry(0x3ffffea, 26),
+        HuffEntry(0x7ffff4, 23),
+        HuffEntry(0x3ffffeb, 26),
+        HuffEntry(0x7ffffe6, 27),
+        HuffEntry(0x3ffffec, 26),
+        HuffEntry(0x3ffffed, 26),
+        HuffEntry(0x7ffffe7, 27),
+        HuffEntry(0x7ffffe8, 27),
+        HuffEntry(0x7ffffe9, 27),
+        HuffEntry(0x7ffffea, 27),
+        HuffEntry(0x7ffffeb, 27),
+        HuffEntry(0xffffffe, 28),
+        HuffEntry(0x7ffffec, 27),
+        HuffEntry(0x7ffffed, 27),
+        HuffEntry(0x7ffffee, 27),
+        HuffEntry(0x7ffffef, 27),
+        HuffEntry(0x7fffff0, 27),
+        HuffEntry(0x3ffffee, 26),
+        HuffEntry(0x3fffffff, 30),
+]
+
+# reverse lookup for decoding, keyed by "length:code", built once on demand.
+mut decode_map: Map[String, Int] := {}
+mut decode_ready := false
+
+# a low bit mask of `n` ones (0 for n == 0).
+fn low_mask(n: Int) -> Int:
+    return bits.shl(1, n) - 1
+
+# the decode-map key that uniquely identifies a codeword.
+fn decode_key(length: Int, code: Int) -> String:
+    return length.to_string() + ":" + code.to_string()
+
+# populate the decode map on first use.
+fn ensure_decode_map():
+    if decode_ready:
+        return
+    table := huff_table()
+    mut i := 0
+    while i < table.len():
+        entry := table[i]
+        decode_map.insert(decode_key(entry.length, entry.code), i)
+        i = i + 1
+    decode_ready = true
+
+# huffman-encode bytes. the result is padded to a byte boundary with the
+# most-significant bits of the EOS symbol, per RFC 7541 §5.2.
+pub fn encode(input: Bytes) -> Bytes:
+    table := huff_table()
+    out := bytes.buffer()
+    mut acc := 0
+    mut nbits := 0
+    mut i := 0
+    while i < input.len():
+        entry := table[input[i]]
+        acc = bits.bor(bits.shl(acc, entry.length), entry.code)
+        nbits = nbits + entry.length
+        while nbits >= 8:
+            nbits = nbits - 8
+            out.write_byte(bits.band(bits.shr(acc, nbits), 255)) catch 0
+        acc = bits.band(acc, low_mask(nbits))
+        i = i + 1
+    if nbits > 0:
+        pad := 8 - nbits
+        final := bits.bor(bits.shl(acc, pad), low_mask(pad))
+        out.write_byte(bits.band(final, 255)) catch 0
+    result := out.bytes()
+    out.free()
+    return result
+
+# the number of bytes `encode` would produce for `input`, without encoding.
+# hpack uses this to choose the shorter of the raw and Huffman forms.
+pub fn encoded_length(input: Bytes) -> Int:
+    table := huff_table()
+    mut total_bits := 0
+    mut i := 0
+    while i < input.len():
+        total_bits = total_bits + table[input[i]].length
+        i = i + 1
+    return (total_bits + 7) / 8
+
+# huffman-decode bytes, rejecting a whole EOS symbol and malformed padding.
+pub fn decode(input: Bytes) -> Bytes!:
+    ensure_decode_map()
+    out := bytes.buffer()
+    mut code := 0
+    mut length := 0
+    mut i := 0
+    while i < input.len():
+        byte := input[i]
+        mut bit := 7
+        while bit >= 0:
+            code = bits.bor(bits.shl(code, 1), bits.band(bits.shr(byte, bit), 1))
+            length = length + 1
+            if length > MAX_CODE_LENGTH:
+                out.free()
+                fail "invalid huffman code"
+            key := decode_key(length, code)
+            if decode_map.contains_key(key):
+                symbol := decode_map[key]
+                if symbol == EOS_SYMBOL:
+                    out.free()
+                    fail "huffman EOS symbol is not allowed in input"
+                out.write_byte(symbol) catch 0
+                code = 0
+                length = 0
+            bit = bit - 1
+        i = i + 1
+    if length >= 8:
+        out.free()
+        fail "huffman padding is too long"
+    if length > 0:
+        if code != low_mask(length):
+            out.free()
+            fail "huffman padding must be the EOS prefix"
+    result := out.bytes()
+    out.free()
+    return result
+
+# --- tests ---
+
+fn hx(data: Bytes) -> String:
+    return encoding.to_hex(data)
+
+test "huffman table is complete and well-formed":
+    table := huff_table()
+    assert_eq(table.len(), 257)
+    assert_eq(table[48].length, 5)
+    assert_eq(table[48].code, 0)
+    assert_eq(table[EOS_SYMBOL].length, 30)
+
+test "huffman encodes the RFC 7541 C.4.1 authority":
+    # "www.example.com" -> f1e3 c2e5 f23a 6ba0 ab90 f4ff
+    encoded := encode(bytes.from_string_utf8("www.example.com"))
+    assert_eq(hx(encoded), "f1e3c2e5f23a6ba0ab90f4ff")
+
+test "huffman round-trips the RFC 7541 C.4.1 authority":
+    decoded := decode(encode(bytes.from_string_utf8("www.example.com")))!
+    assert_eq(decoded.to_string_utf8()!, "www.example.com")
+
+test "huffman encodes the RFC 7541 C.4.3 cache-control":
+    # "no-cache" -> a8eb 1064 9cbf
+    encoded := encode(bytes.from_string_utf8("no-cache"))
+    assert_eq(hx(encoded), "a8eb10649cbf")
+
+test "huffman encodes the RFC 7541 C.6.1 date value":
+    # "Mon, 21 Oct 2013 20:13:21 GMT"
+    encoded := encode(bytes.from_string_utf8("Mon, 21 Oct 2013 20:13:21 GMT"))
+    assert_eq(hx(encoded), "d07abe941054d444a8200595040b8166e082a62d1bff")
+
+test "huffman round-trips every byte value":
+    out := bytes.buffer()
+    mut i := 0
+    while i < 256:
+        out.write_byte(i) catch 0
+        i = i + 1
+    original := out.bytes()
+    out.free()
+    decoded := decode(encode(original))!
+    assert_eq(hx(decoded), hx(original))
+
+test "huffman round-trips an empty input":
+    assert_eq(decode(encode(bytes.empty()))!.len(), 0)
+
+test "huffman rejects an incomplete non-EOS padding":
+    # a single zero byte decodes '0' (00000) then leaves 000 padding, which is
+    # not the all-ones EOS prefix.
+    result := decode(bytes.from_string_utf8(chr(0)))
+    assert(result.is_err)
+
+test "huffman rejects padding longer than seven bits":
+    # 0xff is the 6-bit symbol '&' plus two 1 bits; a second 0xff pushes the
+    # pending run past a full byte of padding.
+    result := decode(encoding.from_hex("ffff")!)
+    assert(result.is_err)

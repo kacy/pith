@@ -1,0 +1,75 @@
+# exercises the arc-across-tasks surface the native http/2 client relies on:
+# struct events carrying a List[HeaderField] and Bytes handed across a channel
+# from a producer task to a consumer task, three streams at once. this mirrors
+# how the http/2 reader task delivers decoded events (the same List + Bytes
+# shape) to requests running on other tasks. run under valgrind (make memcheck)
+# it guards against a use-after-free on the payloads as they cross task
+# boundaries.
+#
+# a local Event mirrors std.net.http2.connection.StreamEvent; Channel's type
+# argument must be a bare local name, so the channel cannot carry the qualified
+# type directly. the arc behaviour under test is identical.
+
+import std.net.http2.hpack as hpack
+import std.bytes as bytes
+
+HEADERS := 1
+DATA := 2
+
+struct Event:
+    kind: Int
+    headers: List[hpack.HeaderField]
+    data: Bytes
+    end: Bool
+
+fn empty_fields() -> List[hpack.HeaderField]:
+    out: List[hpack.HeaderField] := []
+    return out
+
+fn placeholder_event() -> Event:
+    return Event(0, empty_fields(), bytes.empty(), false)
+
+# a producer task: build events carrying header lists and body bytes and hand
+# them across the channel to a consumer on another task.
+fn produce(id: Int, inbox: Channel[Event]):
+    mut i := 0
+    while i < 50:
+        fields := [hpack.header_field(":status", "200"), hpack.header_field("x-stream", id.to_string()), hpack.header_field("x-seq", i.to_string())]
+        inbox.send(Event(HEADERS, fields, bytes.empty(), false))
+        body := bytes.from_string_utf8("chunk-{id}-{i}-payload-bytes")
+        inbox.send(Event(DATA, empty_fields(), body, false))
+        i = i + 1
+    inbox.send(Event(DATA, empty_fields(), bytes.empty(), true))
+
+# a consumer task: read events until end-of-stream, touching every arc'd payload
+# (header names/values and body bytes) so a use-after-free would trip valgrind.
+fn consume(inbox: Channel[Event]) -> Int:
+    mut count := 0
+    mut touched := 0
+    while true:
+        opt := inbox.recv()
+        if opt == none:
+            return count
+        ev := opt.unwrap_or(placeholder_event())
+        count = count + 1
+        for h in ev.headers:
+            touched = touched + h.name.len() + h.value.len()
+        touched = touched + ev.data.len()
+        if ev.end:
+            return count
+
+fn main():
+    inbox1 := Channel[Event](8)
+    inbox2 := Channel[Event](8)
+    inbox3 := Channel[Event](8)
+    p1 := spawn produce(1, inbox1)
+    p2 := spawn produce(2, inbox2)
+    p3 := spawn produce(3, inbox3)
+    c1 := spawn consume(inbox1)
+    c2 := spawn consume(inbox2)
+    c3 := spawn consume(inbox3)
+    await p1
+    await p2
+    await p3
+    total := (await c1) + (await c2) + (await c3)
+    print("consumed {total} events across 3 concurrent streams")

@@ -1,0 +1,40 @@
+# cyclic graph benchmark: build many parent<->child rings and drop them.
+#
+# each ring is a strong forward edge (`next`) and a back edge (`parent`).
+# with a `weak` back edge the ring holds no strong cycle, so every ring
+# reclaims as it goes and resident memory stays flat. the strong-back-edge
+# variant (bench/cyclic_graph_strong.pith) leaks every ring for contrast.
+#
+# usage: cyclic_graph <rings>
+
+struct Node:
+    value: Int
+    mut next: Node?
+    weak parent: Node?
+
+# build one ring and drop it. `next` owns forward, `parent` refers back
+# weakly, so the ring holds no strong cycle and both nodes reclaim on return.
+# the checksum reads the node values directly (not through the optional edges)
+# so the loop measures ring construction and teardown, not optional reads.
+fn build_ring(seed: Int) -> Int:
+    a := Node(value: seed, next: none, parent: none)
+    b := Node(value: seed + 1, next: none, parent: none)
+    a.next = b
+    b.parent = a
+    return a.value + b.value
+
+fn main() -> Int!:
+    argv := args()
+    mut rings := 1000000
+    if argv.len() > 1:
+        parsed := parse_int(argv[1])
+        if parsed.is_ok and parsed.ok > 0:
+            rings = parsed.ok
+
+    mut i := 0
+    mut checksum := 0
+    while i < rings:
+        checksum = checksum + build_ring(i)
+        i = i + 1
+    print("rings: {rings} checksum: {checksum}")
+    return 0

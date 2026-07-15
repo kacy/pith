@@ -85,12 +85,20 @@ correctness story:
   gone.
 - memory reclamation is compiler-emitted reference counting (see the readme's
   memory section). closures are reference counted and freed like other heap
-  values. the deliberate gaps that remain: reference cycles leak (a narrow
-  case — only a closure that captures a binding reaching back to it can close
-  a loop, since struct graphs cannot), container element removal leaks until
-  the container dies, and error-path early returns skip cleanup. all are
-  bounded-leak by design — the discipline never produces a dangling pointer in
-  exchange.
+  values. the deliberate gaps that remain: strong reference cycles leak, but a
+  struct graph can break its own cycle with a `weak` field (see
+  docs/ownership.md) — the only cycle with no weak escape hatch today is a
+  closure that captures a binding reaching back to it, since closure captures
+  cannot yet be weak. container element removal leaks until the container dies,
+  and error-path early returns skip cleanup. all are bounded-leak by design —
+  the discipline never produces a dangling pointer in exchange.
+- reading an optional that is synthesized rather than stored leaks a small
+  optional box per read. this covers a `weak` field read and an indexed read
+  of a collection whose element type is a struct (`items[i]` where `items` is
+  `List[Node]`): both build a fresh optional to carry the liveness/`some`
+  result, and that box is not reclaimed. a stored optional field read does not
+  synthesize and does not leak. the leak is bounded per read and never
+  dangles; releasing synthesized optional temporaries is a known follow-up.
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests

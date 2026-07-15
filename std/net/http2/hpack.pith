@@ -306,6 +306,12 @@ impl Encoder:
         out.free()
         return result
 
+    # bound the encoder's dynamic table, evicting to fit. a peer advertises this
+    # via SETTINGS_HEADER_TABLE_SIZE; keeping our table within it ensures the
+    # indices we emit stay valid for the peer's decoder.
+    fn set_max_table_size(new_max: Int):
+        self.table.set_max_size(new_max)
+
 # --- decoder ---
 
 # an hpack decoder: a dynamic table evolved by the inbound header stream.
@@ -513,3 +519,12 @@ test "hpack rejects an indexed field with index zero":
 test "hpack rejects an out-of-range table index":
     decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
     assert(decoder.decode(encoding.from_hex("ff00")!).is_err)
+
+test "hpack bounds the encoder table via set_max_table_size":
+    encoder := new_encoder(DEFAULT_HEADER_TABLE_SIZE, false)
+    # index two fields into the dynamic table, then shrink below their footprint.
+    encoder.encode([HeaderField("x-a", "1"), HeaderField("x-b", "2")])
+    assert(encoder.table.current_size() > 0)
+    encoder.set_max_table_size(0)
+    assert_eq(encoder.table.current_size(), 0)
+    assert_eq(encoder.table.max_size, 0)

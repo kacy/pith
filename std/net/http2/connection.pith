@@ -397,6 +397,12 @@ pub struct Client:
     mut going_away: Bool
     mut last_peer_stream: Int
     writer: Task[Int]
+    # the peer's advertised limits (RFC 9113 §6.5.2), applied from its SETTINGS.
+    # the frame size bounds our outbound HEADERS (split into CONTINUATION past
+    # it); the header-list size, when non-zero, caps a request's uncompressed
+    # header footprint before it is sent.
+    mut peer_max_frame_size: Int
+    mut peer_max_header_list: Int
 
 # a placeholder write task for offline clients, which drive the reader directly
 # and never spawn a real writer over the shared outbound channel.
@@ -414,7 +420,7 @@ pub fn open(host: String, port: Int) -> Client!:
     # the writer owns the send direction; spawn it before the client exists so
     # its handle can be stored for a clean, flushing shutdown.
     writer := spawn writer_loop(outbound, conn, closed)
-    client := Client(conn, Mutex(), 1, table, ids, outbound, closed, false, 0, writer)
+    client := Client(conn, Mutex(), 1, table, ids, outbound, closed, false, 0, writer, frames.DEFAULT_MAX_FRAME_SIZE, 0)
     spawn reader_loop(client)
     return client
 
@@ -472,6 +478,7 @@ fn handle_frame(client: Client, frame: frames.Frame) -> Bool!:
     if t == frames.FRAME_SETTINGS:
         sf := frames.parse_settings(frame)!
         if not sf.ack:
+            apply_settings(client, sf.settings)
             client.enqueue(frames.settings_ack_frame())!
         return true
     if t == frames.FRAME_PING:
@@ -607,6 +614,58 @@ fn assemble_response(inbox: Channel[StreamEvent]) -> Response!:
             body.free()
             return Response(status, headers, trailers, data)
 
+# apply the peer's SETTINGS (RFC 9113 §6.5.2). the header-table-size bounds our
+# hpack encoder so the indices we emit stay valid for the peer's decoder; the
+# frame size and header-list size are recorded to shape and gate what we send.
+# unknown or push-related identifiers are ignored — a client never sends bodies
+# yet, so the send-window and push settings have nothing to act on here.
+fn apply_settings(client: Client, settings: List[frames.Setting]):
+    client.mu.lock()
+    for s in settings:
+        if s.id == SETTINGS_HEADER_TABLE_SIZE:
+            client.conn.encoder.set_max_table_size(s.value)
+        elif s.id == SETTINGS_MAX_FRAME_SIZE:
+            client.peer_max_frame_size = s.value
+        elif s.id == SETTINGS_MAX_HEADER_LIST_SIZE:
+            client.peer_max_header_list = s.value
+    client.mu.unlock()
+
+# the uncompressed size an hpack header list counts against
+# SETTINGS_MAX_HEADER_LIST_SIZE: each field is its name and value octets plus a
+# fixed 32-octet overhead (RFC 9113 §6.5.2, RFC 7541 §4.1).
+fn header_list_size(fields: List[hpack.HeaderField]) -> Int:
+    mut total := 0
+    for f in fields:
+        total = total + f.name.len() + f.value.len() + 32
+    return total
+
+# serialize an hpack block into a HEADERS frame followed by as many CONTINUATION
+# frames as the block needs to stay within `max_frame_size`, concatenated into
+# one contiguous buffer. sending it as a single write keeps the block whole on
+# the wire — a header block must not be split by another stream's frames (RFC
+# 9113 §6.10).
+fn header_block_wire(stream_id: Int, block: Bytes, end_stream: Bool, max_frame_size: Int) -> Bytes!:
+    out := bytes.buffer()
+    total := block.len()
+    if total <= max_frame_size:
+        out.write(frames.frame_bytes(frames.headers_frame(stream_id, block, end_stream, true))!)!
+        result := out.bytes()
+        out.free()
+        return result
+    # first slice goes in the HEADERS frame without END_HEADERS; the rest follow
+    # in CONTINUATION frames, the last of which carries END_HEADERS.
+    out.write(frames.frame_bytes(frames.headers_frame(stream_id, block.slice(0, max_frame_size), end_stream, false))!)!
+    mut pos := max_frame_size
+    while pos < total:
+        mut stop := pos + max_frame_size
+        if stop > total:
+            stop = total
+        out.write(frames.frame_bytes(frames.continuation_frame(stream_id, block.slice(pos, stop), stop == total))!)!
+        pos = stop
+    result := out.bytes()
+    out.free()
+    return result
+
 impl Client:
     # serialize a frame and queue it for the writer task.
     fn enqueue(frame: frames.Frame) -> Bool!:
@@ -642,13 +701,16 @@ impl Client:
         if self.going_away:
             self.mu.unlock()
             fail "http2: peer sent GOAWAY; not opening new streams"
+        if self.peer_max_header_list > 0 and header_list_size(fields) > self.peer_max_header_list:
+            self.mu.unlock()
+            fail "http2: request header list exceeds the peer's limit"
         stream_id := self.next_stream_id
         self.next_stream_id = self.next_stream_id + 2
         inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
         self.streams.insert(stream_id, inbox)
         self.active.push(stream_id)
         block := self.conn.encoder.encode(fields)
-        built := frames.frame_bytes(frames.headers_frame(stream_id, block, true, true))
+        built := header_block_wire(stream_id, block, true, self.peer_max_frame_size)
         if built.is_err:
             self.mu.unlock()
             self.forget(stream_id)
@@ -811,7 +873,7 @@ test "a RST_STREAM on our stream fails the response":
 fn offline_client(conn: Connection) -> Client:
     ids: List[Int] := []
     table: Map[Int, Channel[StreamEvent]] := {}
-    return Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer())
+    return Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), frames.DEFAULT_MAX_FRAME_SIZE, 0)
 
 # pull the next event off an inbox, failing if the channel closed first.
 fn next_event(inbox: Channel[StreamEvent]) -> StreamEvent!:
@@ -989,3 +1051,51 @@ test "a WINDOW_UPDATE with a zero increment is a protocol error":
     client := offline_client(connection_from_frames(bytes.empty()))
     frame := frames.window_update_frame(1, 0)!
     assert(handle_frame(client, frame).is_err)
+
+# --- settings enforcement tests (phase 4) ---
+
+test "header_list_size sums names, values, and per-field overhead":
+    fields := [hpack.header_field(":method", "GET"), hpack.header_field("x", "yz")]
+    # (7 + 3 + 32) + (1 + 2 + 32) = 42 + 35 = 77
+    assert_eq(header_list_size(fields), 77)
+
+test "apply_settings records the peer's frame and header-list limits":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    apply_settings(client, [frames.setting(SETTINGS_MAX_FRAME_SIZE, 32768), frames.setting(SETTINGS_MAX_HEADER_LIST_SIZE, 8192), frames.setting(SETTINGS_HEADER_TABLE_SIZE, 0)])
+    assert_eq(client.peer_max_frame_size, 32768)
+    assert_eq(client.peer_max_header_list, 8192)
+
+test "header_block_wire emits a single HEADERS when the block fits":
+    block := bytes.from_string_utf8("small")
+    wire := header_block_wire(3, block, false, frames.DEFAULT_MAX_FRAME_SIZE)!
+    reader := binary.reader(wire)
+    frame := frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!
+    parsed := frames.parse_headers(frame)!
+    assert(parsed.end_headers)
+    assert(not parsed.end_stream)
+    assert_eq(hx(parsed.block_fragment), hx(block))
+    assert_eq(binary.remaining(reader), 0)
+
+test "header_block_wire splits a large block into HEADERS + CONTINUATION":
+    block := bytes.from_string_utf8("abcdefghij")
+    # a 4-byte cap over 10 bytes yields HEADERS(4) + CONTINUATION(4) + CONTINUATION(2).
+    wire := header_block_wire(1, block, true, 4)!
+    reader := binary.reader(wire)
+    first := frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!
+    assert_eq(first.header.frame_type, frames.FRAME_HEADERS)
+    head := frames.parse_headers(first)!
+    assert(not head.end_headers)
+    assert(head.end_stream)
+    out := bytes.buffer()
+    out.write(head.block_fragment)!
+    mut done := false
+    while not done:
+        frame := frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!
+        assert_eq(frame.header.frame_type, frames.FRAME_CONTINUATION)
+        cont := frames.parse_continuation(frame)!
+        out.write(cont.block_fragment)!
+        done = cont.end_headers
+    reassembled := out.bytes()
+    out.free()
+    # the split frames reassemble to exactly the original block.
+    assert_eq(hx(reassembled), hx(block))

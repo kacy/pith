@@ -1,0 +1,17 @@
+# reading a struct field of a type reached only through another module's return
+# type — one this module never imports — used to resolve the field offset from a
+# name-keyed map filled in module-emission order. the struct is emitted after
+# this access, so the lookup missed and the offset fell back to an unsound
+# name-based guess: `.name` read the `.value` slot, silently corrupting the
+# value. the offset now comes from the checker's authoritative layout.
+
+import field_offset_mid as mid
+
+fn main() -> Int:
+    ps := mid.pairs()
+    mut i := 0
+    while i < ps.len():
+        p := ps[i]
+        print(p.name + " = " + p.value)
+        i = i + 1
+    return 0

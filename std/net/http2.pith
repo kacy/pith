@@ -1,0 +1,28 @@
+# std.net.http2 — a minimal http/2 client.
+#
+# http/2 is a different protocol from http/1.1 (binary framing, multiplexed
+# streams, hpack header compression), so this is a separate module built on the
+# native h2 facade rather than the http/1.1 code in std.net.http. it is the
+# transport a future grpc client sits on: grpc is http/2 plus length-prefixed
+# protobuf messages and a `grpc-status` trailer.
+#
+#   r := http2.get("https://www.cloudflare.com/")!
+#   print("status {r.status}, {r.body.len()} bytes")
+
+import std.bytes as bytes
+
+# an http/2 response: the status code and the raw body bytes.
+pub struct Response:
+    pub status: Int
+    pub body: Bytes
+
+# GET an https url over http/2, negotiating alpn "h2". fails when the request
+# cannot complete (connection, tls, or protocol error).
+pub fn get(url: String) -> Response!:
+    handle := pith_h2_get(url)
+    if handle == 0:
+        fail "http2: request to {url} failed"
+    status := pith_h2_response_status(handle)
+    body := pith_h2_response_body(handle)
+    pith_h2_response_free(handle)
+    return Response(status: status, body: body)

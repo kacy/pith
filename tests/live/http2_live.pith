@@ -1,0 +1,16 @@
+# live http/2 test — needs external network to reach a public h2 server.
+# skips when unreachable so it stays green offline.
+#
+# run with: pith test tests/live/http2_live.pith
+
+import std.net.http2 as http2
+import std.bytes as bytes
+
+test "an http/2 GET returns a status and body":
+    attempt := http2.get("https://www.cloudflare.com/")
+    if attempt.is_err:
+        skip_test("no http/2 server reachable")
+    r := attempt.ok
+    assert(r.status >= 200)
+    assert(r.status < 600)
+    assert(bytes.len(r.body) > 0)

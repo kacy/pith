@@ -4,22 +4,67 @@
 # run with: pith test tests/live/http2_native_live.pith
 #
 # this drives std.net.http2.connection — pith's own frame codec, hpack, and tls
-# 1.3 with alpn "h2" — rather than the h2-crate binding in std.net.http2.
-#
-# one known limitation still gates a full assertion here, so this asserts on the
-# status and body only (both correct) and skips when the network is unreachable:
-#   - the decoded response header list is currently corrupted on the way back
-#     from the request call under live socket i/o, so the header fields are not
-#     asserted yet (tracked for its own fix).
+# 1.3 with alpn "h2" — rather than the h2-crate binding in std.net.http2. it
+# verifies the real public certificate chain (ecdsa p-384 / sha-384 intermediate
+# included) with no pinning.
 
 import std.net.http2.connection as http2
 import std.bytes as bytes
 
-test "a native http/2 GET returns a status and body":
+# a concurrent fetch worker: GET a path over a shared multiplexed client and
+# report just the status and body size.
+struct FetchResult:
+    status: Int
+    body_len: Int
+
+fn fetch(client: http2.Client, authority: String, path: String) -> FetchResult:
+    attempt := client.get(authority, path)
+    if attempt.is_err:
+        return FetchResult(0, 0)
+    r := attempt.ok
+    return FetchResult(r.status, r.body.len())
+
+test "a native http/2 GET returns a decoded response":
     attempt := http2.get("https://www.cloudflare.com/")
     if attempt.is_err:
         skip_test("no verifiable http/2 server reachable")
     r := attempt.ok
-    assert(r.status >= 200)
-    assert(r.status < 600)
+    assert_eq(r.status, 200)
     assert(bytes.len(r.body) > 0)
+    # the header list decodes correctly: several fields, with names distinct
+    # from values (the transitive field-offset bug used to return names as their
+    # values).
+    assert(r.headers.len() > 3)
+    mut saw_distinct := false
+    for h in r.headers:
+        if h.name != "" and h.name != h.value:
+            saw_distinct = true
+    assert(saw_distinct)
+
+test "many native http/2 GETs multiplex over one connection":
+    host := "www.cloudflare.com"
+    opened := http2.open(host, 443)
+    if opened.is_err:
+        skip_test("no verifiable http/2 server reachable")
+    client := opened.ok
+    # four concurrent streams over the single connection. the large "/" body is
+    # well over the initial 65535 flow-control window, so it exercises the
+    # reader's WINDOW_UPDATE replenishment while other streams are in flight.
+    t1 := spawn fetch(client, host, "/")
+    t2 := spawn fetch(client, host, "/robots.txt")
+    t3 := spawn fetch(client, host, "/")
+    t4 := spawn fetch(client, host, "/robots.txt")
+    r1 := await t1
+    r2 := await t2
+    r3 := await t3
+    r4 := await t4
+    client.close()
+    assert_eq(r1.status, 200)
+    assert_eq(r2.status, 200)
+    assert_eq(r3.status, 200)
+    assert_eq(r4.status, 200)
+    # the two "/" streams each pulled a body larger than one flow-control window.
+    assert(r1.body_len > 65535)
+    assert(r3.body_len > 65535)
+    assert(r2.body_len > 0)
+    assert(r4.body_len > 0)

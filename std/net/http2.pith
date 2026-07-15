@@ -8,6 +8,12 @@
 #
 #   r := http2.get("https://www.cloudflare.com/")!
 #   print("status {r.status}, {r.body.len()} bytes")
+#
+# the h2 + tokio + rustls stack this rides on is opt-in: build the runtime with
+# `make http2` (or `cargo build --release --features http2`) to use this module,
+# so programs that do not need http/2 keep a lean runtime. linking a program
+# that imports this module against a runtime built without the feature fails
+# with an undefined `pith_h2_*` reference.
 
 import std.bytes as bytes
 

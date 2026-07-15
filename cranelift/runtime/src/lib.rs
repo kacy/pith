@@ -19,6 +19,7 @@ pub mod encoding;
 pub mod ffi_util;
 pub mod handle_registry;
 pub mod host_fs;
+#[cfg(feature = "http2")]
 pub mod http2;
 pub mod json;
 pub mod network;

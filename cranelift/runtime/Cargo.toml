@@ -11,13 +11,21 @@ parking_lot = { workspace = true }
 threadpool = { workspace = true }
 libc = { workspace = true }
 ring = "0.17.14"
-h2 = "0.4"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"] }
-http = "1"
-bytes = "1"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-webpki-roots = "1"
+
+# http/2 (std.net.http2) is opt-in behind the `http2` feature. the async stack
+# it pulls in — h2 + tokio + rustls — roughly triples the runtime size and adds
+# ~90s to a cold build, so programs that do not use http/2 should not pay for
+# it. build with `cargo build --release --features http2` to enable it.
+h2 = { version = "0.4", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"], optional = true }
+http = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+
+[features]
+http2 = ["dep:h2", "dep:tokio", "dep:http", "dep:bytes", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 
 [lib]
 name = "pith_runtime"

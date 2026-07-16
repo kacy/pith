@@ -376,15 +376,23 @@ pub struct StreamEvent:
 pub fn headers_event(fields: List[hpack.HeaderField], end: Bool) -> StreamEvent:
     return StreamEvent(STREAM_HEADERS, fields, bytes.empty(), end, 0)
 
+# DATA and RESET events carry no header fields; they share one empty list rather
+# than allocating a fresh one per frame (data events are the response hot path).
+# consumers only read `.fields` on HEADERS events, so the shared list is never
+# mutated.
+fn empty_fields() -> List[hpack.HeaderField]:
+    fields: List[hpack.HeaderField] := []
+    return fields
+
+NO_FIELDS := empty_fields()
+
 # build a DATA stream event carrying a body chunk; `end` marks end-of-stream.
 pub fn data_event(chunk: Bytes, end: Bool) -> StreamEvent:
-    empty: List[hpack.HeaderField] := []
-    return StreamEvent(STREAM_DATA, empty, chunk, end, 0)
+    return StreamEvent(STREAM_DATA, NO_FIELDS, chunk, end, 0)
 
 # build a RESET stream event carrying the peer's error code.
 pub fn reset_event(code: Int) -> StreamEvent:
-    empty: List[hpack.HeaderField] := []
-    return StreamEvent(STREAM_RESET, empty, bytes.empty(), false, code)
+    return StreamEvent(STREAM_RESET, NO_FIELDS, bytes.empty(), false, code)
 
 impl StreamEvent:
     # whether this event carries a decoded header block (response headers or,

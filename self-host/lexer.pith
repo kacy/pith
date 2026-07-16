@@ -637,6 +637,29 @@ fn scan_string():
 
     emit("string_start", string_start_value)
 
+# the raw text between {} keeps the backslash-escapes it needed to sit
+# inside the surrounding string literal: `\"` for a string argument's
+# quotes and `\\` for a literal backslash. undo those so the expression
+# re-lexes as real code — without this, `f(\"x\", 1)` re-lexes as a
+# single string argument and the call looks like it has one argument.
+fn unescape_interp_expr(text: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < text.len():
+        ch := text.substring(i, i + 1)
+        if ord(ch) == 92 and i + 1 < text.len():
+            nxt := text.substring(i + 1, i + 2)
+            if ord(nxt) == 34 or ord(nxt) == 92:
+                out = out + nxt
+                i = i + 2
+            else:
+                out = out + ch
+                i = i + 1
+        else:
+            out = out + ch
+            i = i + 1
+    return out
+
 fn scan_interpolation_parts():
     while current_position < source.len():
         if not is_lbrace(source_char(current_position)):
@@ -654,7 +677,13 @@ fn scan_interpolation_parts():
             if found_expr_end:
                 break
             input_char := source_char(current_position)
-            if is_lbrace(input_char):
+            if is_backslash(input_char) and current_position + 1 < source.len():
+                # skip an escaped char so a `\"` or `\}` inside the
+                # expression (e.g. a string argument's quotes) doesn't
+                # throw off the brace matching
+                current_position = current_position + 2
+                current_column = current_column + 2
+            elif is_lbrace(input_char):
                 brace_depth = brace_depth + 1
                 current_position = current_position + 1
                 current_column = current_column + 1
@@ -669,7 +698,7 @@ fn scan_interpolation_parts():
                 current_position = current_position + 1
                 current_column = current_column + 1
 
-        expr_text := source.substring(expression_start, current_position)
+        expr_text := unescape_interp_expr(source.substring(expression_start, current_position))
         if expr_text.len() > 0:
             pending_token_kinds.push("interpolation_expr")
             pending_token_values.push(expr_text)

@@ -366,16 +366,35 @@ pub struct StreamEvent:
     pub end: Bool
     pub error_code: Int
 
-fn headers_event(fields: List[hpack.HeaderField], end: Bool) -> StreamEvent:
+# build a HEADERS stream event (response headers, or trailers once the body has
+# begun); `end` marks it as the stream's final event.
+pub fn headers_event(fields: List[hpack.HeaderField], end: Bool) -> StreamEvent:
     return StreamEvent(STREAM_HEADERS, fields, bytes.empty(), end, 0)
 
-fn data_event(chunk: Bytes, end: Bool) -> StreamEvent:
+# build a DATA stream event carrying a body chunk; `end` marks end-of-stream.
+pub fn data_event(chunk: Bytes, end: Bool) -> StreamEvent:
     empty: List[hpack.HeaderField] := []
     return StreamEvent(STREAM_DATA, empty, chunk, end, 0)
 
-fn reset_event(code: Int) -> StreamEvent:
+# build a RESET stream event carrying the peer's error code.
+pub fn reset_event(code: Int) -> StreamEvent:
     empty: List[hpack.HeaderField] := []
     return StreamEvent(STREAM_RESET, empty, bytes.empty(), false, code)
+
+impl StreamEvent:
+    # whether this event carries a decoded header block (response headers or,
+    # once the body has begun, trailers).
+    pub fn is_headers() -> Bool:
+        return self.kind == STREAM_HEADERS
+
+    # whether this event carries a body chunk.
+    pub fn is_data() -> Bool:
+        return self.kind == STREAM_DATA
+
+    # whether this event is a stream reset (RST_STREAM); `error_code` carries the
+    # peer's reason.
+    pub fn is_reset() -> Bool:
+        return self.kind == STREAM_RESET
 
 # the per-stream inbox capacity. large enough that the reader rarely blocks
 # handing an event to a stream whose consumer is momentarily behind.

@@ -119,9 +119,13 @@ const file_echo_proto_rawDesc = "" +
 	"\vEchoRequest\x12\x18\n" +
 	"\apayload\x18\x01 \x01(\fR\apayload\"(\n" +
 	"\fEchoResponse\x12\x18\n" +
-	"\apayload\x18\x01 \x01(\fR\apayload2@\n" +
+	"\apayload\x18\x01 \x01(\fR\apayload2\x89\x02\n" +
 	"\x04Echo\x128\n" +
-	"\x05Unary\x12\x16.echobench.EchoRequest\x1a\x17.echobench.EchoResponseB\x16Z\x14pithgrpcbench/echopbb\x06proto3"
+	"\x05Unary\x12\x16.echobench.EchoRequest\x1a\x17.echobench.EchoResponse\x12A\n" +
+	"\fServerStream\x12\x16.echobench.EchoRequest\x1a\x17.echobench.EchoResponse0\x01\x12A\n" +
+	"\fClientStream\x12\x16.echobench.EchoRequest\x1a\x17.echobench.EchoResponse(\x01\x12A\n" +
+	"\n" +
+	"BidiStream\x12\x16.echobench.EchoRequest\x1a\x17.echobench.EchoResponse(\x010\x01B\x16Z\x14pithgrpcbench/echopbb\x06proto3"
 
 var (
 	file_echo_proto_rawDescOnce sync.Once
@@ -142,9 +146,15 @@ var file_echo_proto_goTypes = []any{
 }
 var file_echo_proto_depIdxs = []int32{
 	0, // 0: echobench.Echo.Unary:input_type -> echobench.EchoRequest
-	1, // 1: echobench.Echo.Unary:output_type -> echobench.EchoResponse
-	1, // [1:2] is the sub-list for method output_type
-	0, // [0:1] is the sub-list for method input_type
+	0, // 1: echobench.Echo.ServerStream:input_type -> echobench.EchoRequest
+	0, // 2: echobench.Echo.ClientStream:input_type -> echobench.EchoRequest
+	0, // 3: echobench.Echo.BidiStream:input_type -> echobench.EchoRequest
+	1, // 4: echobench.Echo.Unary:output_type -> echobench.EchoResponse
+	1, // 5: echobench.Echo.ServerStream:output_type -> echobench.EchoResponse
+	1, // 6: echobench.Echo.ClientStream:output_type -> echobench.EchoResponse
+	1, // 7: echobench.Echo.BidiStream:output_type -> echobench.EchoResponse
+	4, // [4:8] is the sub-list for method output_type
+	0, // [0:4] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name

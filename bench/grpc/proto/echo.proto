@@ -13,7 +13,11 @@ message EchoResponse {
   bytes payload = 1;
 }
 
-// one unary method: the server returns the request payload unchanged.
+// unary plus the three streaming shapes, all echoing the payload — enough to
+// exercise every grpc client mode against a server whose behavior is known.
 service Echo {
   rpc Unary(EchoRequest) returns (EchoResponse);
+  rpc ServerStream(EchoRequest) returns (stream EchoResponse);
+  rpc ClientStream(stream EchoRequest) returns (EchoResponse);
+  rpc BidiStream(stream EchoRequest) returns (stream EchoResponse);
 }

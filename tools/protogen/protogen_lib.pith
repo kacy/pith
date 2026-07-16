@@ -1,0 +1,609 @@
+# protogen_lib — a proto3 to pith code generator.
+#
+# lexes a .proto file, parses a focused proto3 subset (messages, enums, and
+# scalar / message / enum fields, singular and repeated), and generates a pith
+# module: a struct per message plus `encode_<Msg>` / `decode_<Msg>` functions
+# that ride on std.protobuf's wire codec. the generated messages are what a grpc
+# call carries — bytes in, bytes out.
+#
+# supported: the scalar types (int32/int64/uint32/uint64/sint32/sint64/bool/
+# string/bytes/double/fixed32/fixed64/sfixed32/sfixed64), enums (as Int fields
+# plus named constants), singular message fields (as optionals), and repeated
+# int-varint / enum / message / string / bytes fields.
+#
+# deferred (a parse error names them): grpc `service` stubs, `oneof`, `map<>`,
+# 32-bit `float`, well-known types, proto2, and repeated sint/fixed/double.
+
+import std.bytes as bytes
+import std.strings as strings
+
+# --- tokens -----------------------------------------------------------------
+
+fn is_space(c: Int) -> Bool:
+    return c == 32 or c == 9 or c == 10 or c == 13
+
+fn is_ident_char(c: Int) -> Bool:
+    if c >= 65 and c <= 90:
+        return true
+    if c >= 97 and c <= 122:
+        return true
+    if c >= 48 and c <= 57:
+        return true
+    return c == 95 or c == 46
+
+fn is_punct(c: Int) -> Bool:
+    return c == 123 or c == 125 or c == 59 or c == 61 or c == 60 or c == 62 or c == 44 or c == 40 or c == 41 or c == 91 or c == 93
+
+# split proto source into a flat token stream: identifiers/numbers, string
+# contents (quotes dropped), and single-character punctuation. whitespace and
+# `//` / `/* */` comments are discarded.
+pub fn lex(src: String) -> List[String]:
+    data := bytes.from_string_utf8(src)
+    n := data.len()
+    toks: List[String] := []
+    mut i := 0
+    while i < n:
+        c := data[i]
+        if is_space(c):
+            i = i + 1
+            continue
+        if c == 47 and i + 1 < n and data[i + 1] == 47:
+            i = i + 2
+            while i < n and data[i] != 10:
+                i = i + 1
+            continue
+        if c == 47 and i + 1 < n and data[i + 1] == 42:
+            i = i + 2
+            while i + 1 < n and not (data[i] == 42 and data[i + 1] == 47):
+                i = i + 1
+            i = i + 2
+            continue
+        if c == 34:
+            i = i + 1
+            start := i
+            while i < n and data[i] != 34:
+                i = i + 1
+            toks.push(slice_text(data, start, i))
+            i = i + 1
+            continue
+        if is_punct(c):
+            toks.push(slice_text(data, i, i + 1))
+            i = i + 1
+            continue
+        start := i
+        while i < n and is_ident_char(data[i]):
+            i = i + 1
+        if i == start:
+            # a stray character we do not tokenize; skip it
+            i = i + 1
+            continue
+        toks.push(slice_text(data, start, i))
+    return toks
+
+fn slice_text(data: Bytes, start: Int, end: Int) -> String:
+    return data.slice(start, end).to_string_utf8() catch ""
+
+# --- ast --------------------------------------------------------------------
+
+# one message field: its label ("repeated"/"optional"/""), proto type name,
+# pith field name, and wire field number.
+pub struct Field:
+    pub label: String
+    pub ptype: String
+    pub name: String
+    pub number: Int
+
+# a message: its (simple) name and its fields. nested messages are lifted to
+# the top level.
+pub struct Message:
+    pub name: String
+    pub fields: List[Field]
+
+# one enum constant: its name and integer value.
+pub struct EnumValue:
+    pub name: String
+    pub value: Int
+
+# an enum: its name and constants.
+pub struct EnumDef:
+    pub name: String
+    pub values: List[EnumValue]
+
+# a parsed proto file.
+pub struct ProtoFile:
+    pub package: String
+    pub messages: List[Message]
+    pub enums: List[EnumDef]
+
+# raised on unsupported or malformed proto input.
+pub struct ParseError:
+    pub message: String
+
+fn parse_fail(message: String) -> ParseError:
+    return ParseError(message)
+
+# --- parser -----------------------------------------------------------------
+
+struct Parser:
+    toks: List[String]
+    pos: Int
+
+fn new_parser(toks: List[String]) -> Parser:
+    return Parser(toks: toks, pos: 0)
+
+impl Parser:
+    fn done() -> Bool:
+        return self.pos >= self.toks.len()
+
+    fn peek() -> String:
+        if self.pos >= self.toks.len():
+            return ""
+        return self.toks[self.pos]
+
+    fn advance() -> String:
+        t := self.peek()
+        self.pos = self.pos + 1
+        return t
+
+    fn expect(tok: String) -> Bool!ParseError:
+        got := self.advance()
+        if got != tok:
+            fail parse_fail("expected '{tok}' but found '{got}'")
+        return true
+
+    # skip a `[ ... ]` field-options block if present.
+    fn skip_options() -> Bool!ParseError:
+        if self.peek() != "[":
+            return true
+        self.advance()
+        while not self.done() and self.peek() != "]":
+            self.advance()
+        self.expect("]")!
+        return true
+
+fn to_int(text: String, fallback: Int) -> Int:
+    digits := bytes.from_string_utf8(text)
+    mut value := 0
+    mut i := 0
+    while i < digits.len():
+        c := digits[i]
+        if c < 48 or c > 57:
+            return fallback
+        value = (value * 10) + (c - 48)
+        i = i + 1
+    return value
+
+# parse a whole proto3 file into its messages and enums.
+pub fn parse(src: String) -> ProtoFile!ParseError:
+    p := new_parser(lex(src))
+    mut package := ""
+    messages: List[Message] := []
+    enums: List[EnumDef] := []
+    while not p.done():
+        kw := p.peek()
+        if kw == "syntax":
+            p.advance()
+            p.expect("=")!
+            p.advance()
+            p.expect(";")!
+        elif kw == "package":
+            p.advance()
+            package = p.advance()
+            p.expect(";")!
+        elif kw == "import" or kw == "option":
+            # skip to the terminating semicolon
+            p.advance()
+            while not p.done() and p.peek() != ";":
+                p.advance()
+            p.expect(";")!
+        elif kw == "message":
+            parse_message(p, messages, enums)!
+        elif kw == "enum":
+            enums.push(parse_enum(p)!)
+        elif kw == "service":
+            fail parse_fail("grpc 'service' stubs are not generated yet")
+        elif kw == ";":
+            p.advance()
+        else:
+            fail parse_fail("unexpected token '{kw}' at top level")
+    return ProtoFile(package: package, messages: messages, enums: enums)
+
+# parse `message Name { ... }`, appending it and any nested messages/enums.
+fn parse_message(p: Parser, messages: List[Message], enums: List[EnumDef]) -> Bool!ParseError:
+    p.expect("message")!
+    name := p.advance()
+    p.expect(chr(123))!
+    fields: List[Field] := []
+    while not p.done() and p.peek() != chr(125):
+        kw := p.peek()
+        if kw == "message":
+            parse_message(p, messages, enums)!
+        elif kw == "enum":
+            enums.push(parse_enum(p)!)
+        elif kw == "oneof":
+            fail parse_fail("'oneof' is not supported yet")
+        elif kw == "map":
+            fail parse_fail("'map' fields are not supported yet")
+        elif kw == "reserved":
+            p.advance()
+            while not p.done() and p.peek() != ";":
+                p.advance()
+            p.expect(";")!
+        elif kw == ";":
+            p.advance()
+        else:
+            fields.push(parse_field(p)!)
+    p.expect(chr(125))!
+    messages.push(Message(name: name, fields: fields))
+    return true
+
+# parse one field: `[repeated|optional] <type> <name> = <number> [options];`
+fn parse_field(p: Parser) -> Field!ParseError:
+    mut label := ""
+    head := p.peek()
+    if head == "repeated" or head == "optional":
+        label = p.advance()
+    ptype := p.advance()
+    name := p.advance()
+    p.expect("=")!
+    number := to_int(p.advance(), 0)
+    p.skip_options()!
+    p.expect(";")!
+    return Field(label: label, ptype: ptype, name: name, number: number)
+
+# parse `enum Name { NAME = n; ... }`.
+fn parse_enum(p: Parser) -> EnumDef!ParseError:
+    p.expect("enum")!
+    name := p.advance()
+    p.expect(chr(123))!
+    values: List[EnumValue] := []
+    while not p.done() and p.peek() != chr(125):
+        if p.peek() == ";" or p.peek() == "option":
+            p.advance()
+            if not p.done() and p.toks[p.pos - 1] == "option":
+                while not p.done() and p.peek() != ";":
+                    p.advance()
+                p.expect(";")!
+            continue
+        vname := p.advance()
+        p.expect("=")!
+        vnum := to_int(p.advance(), 0)
+        p.skip_options()!
+        p.expect(";")!
+        values.push(EnumValue(name: vname, value: vnum))
+    p.expect(chr(125))!
+    return EnumDef(name: name, values: values)
+
+# --- type resolution --------------------------------------------------------
+
+# the last dotted component of a (possibly package-qualified) type name.
+fn simple_name(ptype: String) -> String:
+    parts := ptype.split(".")
+    if parts.len() == 0:
+        return ptype
+    return parts[parts.len() - 1]
+
+fn list_has(names: List[String], target: String) -> Bool:
+    for n in names:
+        if n == target:
+            return true
+    return false
+
+# whether a proto type names a message defined in this file.
+fn is_message(ptype: String, message_names: List[String]) -> Bool:
+    return list_has(message_names, simple_name(ptype))
+
+fn is_enum(ptype: String, enum_names: List[String]) -> Bool:
+    return list_has(enum_names, simple_name(ptype))
+
+# the pith field type for a proto field.
+fn pith_type(f: Field, message_names: List[String], enum_names: List[String]) -> String:
+    base := scalar_pith_type(f.ptype, message_names, enum_names)
+    if f.label == "repeated":
+        return "List[{base}]"
+    if is_message(f.ptype, message_names):
+        return "{base}?"
+    return base
+
+fn scalar_pith_type(ptype: String, message_names: List[String], enum_names: List[String]) -> String:
+    if is_message(ptype, message_names):
+        return simple_name(ptype)
+    if is_enum(ptype, enum_names):
+        return "Int"
+    if ptype == "string":
+        return "String"
+    if ptype == "bytes":
+        return "Bytes"
+    if ptype == "bool":
+        return "Bool"
+    if ptype == "double":
+        return "Float"
+    return "Int"
+
+# the zero/default value literal for a pith field type, for the constructor.
+fn default_value(f: Field, message_names: List[String], enum_names: List[String]) -> String:
+    if f.label == "repeated":
+        return "[]"
+    if is_message(f.ptype, message_names):
+        return "none"
+    t := scalar_pith_type(f.ptype, message_names, enum_names)
+    if t == "String":
+        return "\"\""
+    if t == "Bytes":
+        return "bytes.empty()"
+    if t == "Bool":
+        return "false"
+    if t == "Float":
+        return "0.0"
+    return "0"
+
+# --- code generation --------------------------------------------------------
+
+fn message_names_of(pf: ProtoFile) -> List[String]:
+    names: List[String] := []
+    for m in pf.messages:
+        names.push(m.name)
+    return names
+
+fn enum_names_of(pf: ProtoFile) -> List[String]:
+    names: List[String] := []
+    for e in pf.enums:
+        names.push(e.name)
+    return names
+
+# the message types a message refers to through its fields (its dependencies).
+fn message_deps(m: Message, message_names: List[String]) -> List[String]:
+    deps: List[String] := []
+    for f in m.fields:
+        if is_message(f.ptype, message_names):
+            dep := simple_name(f.ptype)
+            if dep != m.name and not list_has(deps, dep):
+                deps.push(dep)
+    return deps
+
+# order messages so a referenced message is defined before the message that
+# uses it (pith does not resolve a struct field whose type appears later). a
+# self-reference is fine; a mutual cycle falls back to declaration order.
+fn topo_sort(messages: List[Message], message_names: List[String]) -> List[Message]:
+    ordered: List[Message] := []
+    emitted: List[String] := []
+    mut remaining := messages.len()
+    while remaining > 0:
+        mut progress := false
+        for m in messages:
+            if list_has(emitted, m.name):
+                continue
+            mut ready := true
+            for dep in message_deps(m, message_names):
+                if not list_has(emitted, dep):
+                    ready = false
+            if ready:
+                ordered.push(m)
+                emitted.push(m.name)
+                remaining = remaining - 1
+                progress = true
+        if not progress:
+            for m in messages:
+                if not list_has(emitted, m.name):
+                    ordered.push(m)
+                    emitted.push(m.name)
+            remaining = 0
+    return ordered
+
+# the std.protobuf Writer method for a singular scalar field, or "" if the type
+# is not supported for a singular field.
+fn write_method(ptype: String, enum_names: List[String]) -> String:
+    if is_enum(ptype, enum_names):
+        return "write_enum"
+    if ptype == "int32" or ptype == "int64" or ptype == "uint32" or ptype == "uint64":
+        return "write_int32"
+    if ptype == "sint32" or ptype == "sint64":
+        return "write_sint32"
+    if ptype == "bool":
+        return "write_bool"
+    if ptype == "string":
+        return "write_string"
+    if ptype == "bytes":
+        return "write_bytes"
+    if ptype == "double":
+        return "write_double"
+    if ptype == "fixed32":
+        return "write_fixed32"
+    if ptype == "sfixed32":
+        return "write_sfixed32"
+    if ptype == "fixed64":
+        return "write_fixed64"
+    if ptype == "sfixed64":
+        return "write_sfixed64"
+    return ""
+
+# the std.protobuf Reader method for a singular scalar field.
+fn read_method(ptype: String, enum_names: List[String]) -> String:
+    if is_enum(ptype, enum_names):
+        return "read_enum"
+    if ptype == "int32" or ptype == "int64" or ptype == "uint32" or ptype == "uint64":
+        return "read_int64"
+    if ptype == "sint32" or ptype == "sint64":
+        return "read_sint64"
+    if ptype == "bool":
+        return "read_bool"
+    if ptype == "string":
+        return "read_string"
+    if ptype == "bytes":
+        return "read_bytes"
+    if ptype == "double":
+        return "read_double"
+    if ptype == "fixed32":
+        return "read_fixed32"
+    if ptype == "sfixed32":
+        return "read_sfixed32"
+    if ptype == "fixed64":
+        return "read_fixed64"
+    if ptype == "sfixed64":
+        return "read_sfixed64"
+    return "read_int64"
+
+# a repeated scalar packs as varints only for the plain integer and enum types.
+fn is_packable_varint(ptype: String, enum_names: List[String]) -> Bool:
+    if is_enum(ptype, enum_names):
+        return true
+    return ptype == "int32" or ptype == "int64" or ptype == "uint32" or ptype == "uint64"
+
+# the proto3 "is this field non-default" guard for a singular scalar.
+fn zero_guard(fieldname: String, ptype: String, enum_names: List[String]) -> String:
+    fref := "m.{fieldname}"
+    if ptype == "bool":
+        return "if {fref}:"
+    if ptype == "string":
+        return "if {fref} != \"\":"
+    if ptype == "bytes":
+        return "if {fref}.len() > 0:"
+    if ptype == "double":
+        return "if {fref} != 0.0:"
+    return "if {fref} != 0:"
+
+# the encode-body lines for one field (already indented four spaces).
+fn encode_field(f: Field, message_names: List[String], enum_names: List[String]) -> List[String]!ParseError:
+    out: List[String] := []
+    num := "{f.number}"
+    fref := "m.{f.name}"
+    if f.label == "repeated":
+        if is_message(f.ptype, message_names):
+            tn := simple_name(f.ptype)
+            out.push("    for item in {fref}:")
+            out.push("        w.write_message({num}, encode_{tn}(item)) catch false")
+        elif f.ptype == "string":
+            out.push("    for item in {fref}:")
+            out.push("        w.write_string({num}, item) catch false")
+        elif f.ptype == "bytes":
+            out.push("    for item in {fref}:")
+            out.push("        w.write_bytes({num}, item) catch false")
+        elif is_packable_varint(f.ptype, enum_names):
+            out.push("    if {fref}.len() > 0:")
+            out.push("        w.write_packed_varints({num}, {fref}) catch false")
+        else:
+            fail parse_fail("repeated '{f.ptype}' fields are not supported yet")
+        return out
+    if is_message(f.ptype, message_names):
+        tn := simple_name(f.ptype)
+        out.push("    if let sub = {fref}:")
+        out.push("        w.write_message({num}, encode_{tn}(sub)) catch false")
+        return out
+    method := write_method(f.ptype, enum_names)
+    if method == "":
+        fail parse_fail("field type '{f.ptype}' is not supported yet")
+    guard := zero_guard(f.name, f.ptype, enum_names)
+    out.push("    {guard}")
+    out.push("        w.{method}({num}, {fref}) catch false")
+    return out
+
+# the decode arm for one field. `first` picks `if` vs `elif` for the dispatch.
+fn decode_field(f: Field, first: Bool, message_names: List[String], enum_names: List[String]) -> List[String]!ParseError:
+    out: List[String] := []
+    num := "{f.number}"
+    fref := "m.{f.name}"
+    mut keyword := "elif"
+    if first:
+        keyword = "if"
+    out.push("        {keyword} tag.field == {num}:")
+    if f.label == "repeated":
+        if is_message(f.ptype, message_names):
+            tn := simple_name(f.ptype)
+            out.push("            {fref}.push(decode_{tn}(r.read_message()!)!)")
+        elif f.ptype == "string":
+            out.push("            {fref}.push(r.read_string()!)")
+        elif f.ptype == "bytes":
+            out.push("            {fref}.push(r.read_bytes()!)")
+        elif is_packable_varint(f.ptype, enum_names):
+            out.push("            if tag.wire == WIRE_LEN:")
+            out.push("                for v in r.read_packed_varints()!:")
+            out.push("                    {fref}.push(v)")
+            out.push("            else:")
+            out.push("                {fref}.push(r.read_int64()!)")
+        else:
+            fail parse_fail("repeated '{f.ptype}' fields are not supported yet")
+        return out
+    if is_message(f.ptype, message_names):
+        tn := simple_name(f.ptype)
+        out.push("            {fref} = decode_{tn}(r.read_message()!)!")
+        return out
+    rmethod := read_method(f.ptype, enum_names)
+    out.push("            {fref} = r.{rmethod}()!")
+    return out
+
+# generate the full pith module for a parsed proto file.
+pub fn generate(pf: ProtoFile) -> String!ParseError:
+    message_names := message_names_of(pf)
+    enum_names := enum_names_of(pf)
+    lines: List[String] := []
+    lines.push("# generated from a .proto file by tools/protogen; do not edit by hand.")
+    pkg := pf.package
+    if pkg != "":
+        lines.push("# proto package: {pkg}")
+    lines.push("")
+    lines.push("from std.protobuf import ProtoError, writer, reader, WIRE_LEN")
+    lines.push("import std.bytes as bytes")
+    lines.push("")
+
+    for e in pf.enums:
+        lines.push("# enum {e.name}")
+        for v in e.values:
+            cname := "{e.name}_{v.name}"
+            cval := "{v.value}"
+            lines.push("pub {cname} := {cval}")
+        lines.push("")
+
+    ordered := topo_sort(pf.messages, message_names)
+    for m in ordered:
+        # struct
+        lines.push("# message {m.name}")
+        lines.push("pub struct {m.name}:")
+        if m.fields.len() == 0:
+            lines.push("    pub _empty: Bool")
+        for f in m.fields:
+            ft := pith_type(f, message_names, enum_names)
+            lines.push("    pub {f.name}: {ft}")
+        lines.push("")
+
+        # a default-valued constructor value, for decode to start from
+        ctor_args: List[String] := []
+        for f in m.fields:
+            dv := default_value(f, message_names, enum_names)
+            ctor_args.push("{f.name}: {dv}")
+        mut ctor := strings.join_nonempty(ctor_args, ", ")
+        if m.fields.len() == 0:
+            ctor = "_empty: false"
+
+        # encode
+        lines.push("# encode a {m.name} to protobuf wire bytes.")
+        lines.push("pub fn encode_{m.name}(m: {m.name}) -> Bytes:")
+        lines.push("    w := writer()")
+        for f in m.fields:
+            for ln in encode_field(f, message_names, enum_names)!:
+                lines.push(ln)
+        lines.push("    out := w.bytes()")
+        lines.push("    w.free()")
+        lines.push("    return out")
+        lines.push("")
+
+        # decode
+        lines.push("# decode a {m.name} from protobuf wire bytes.")
+        lines.push("pub fn decode_{m.name}(data: Bytes) -> {m.name}!ProtoError:")
+        lines.push("    m := {m.name}({ctor})")
+        lines.push("    r := reader(data)")
+        lines.push("    while not r.at_end():")
+        lines.push("        tag := r.read_tag()!")
+        if m.fields.len() == 0:
+            lines.push("        r.skip(tag.wire)!")
+        else:
+            mut first := true
+            for f in m.fields:
+                for ln in decode_field(f, first, message_names, enum_names)!:
+                    lines.push(ln)
+                first = false
+            lines.push("        else:")
+            lines.push("            r.skip(tag.wire)!")
+        lines.push("    return m")
+        lines.push("")
+
+    return strings.join_lines(lines)

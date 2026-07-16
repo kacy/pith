@@ -1,0 +1,43 @@
+# protogen — generate pith message types from a .proto file.
+#
+#   pith build tools/protogen/protogen.pith
+#   ./tools/protogen/protogen schema.proto schema_gen.pith
+#
+# the generated module has a struct per message and encode_<Msg>/decode_<Msg>
+# functions over std.protobuf, so a grpc call can carry typed messages without
+# hand-writing the wire format. see protogen_lib for the supported proto3 subset.
+import std.fs as fs
+from protogen_lib import parse, generate
+
+fn main() -> Int!:
+    argv := args()
+    if argv.len() < 2:
+        print("usage: protogen <input.proto> <output.pith>")
+        return 1
+    in_path := argv[argv.len() - 2]
+    out_path := argv[argv.len() - 1]
+
+    read := fs.read(in_path)
+    if read.is_err:
+        print("protogen: cannot read {in_path}")
+        return 1
+
+    parsed := parse(read.ok)
+    if parsed.is_err:
+        problem := parsed.err
+        print("protogen: {problem.message}")
+        return 1
+
+    gen := generate(parsed.ok)
+    if gen.is_err:
+        problem := gen.err
+        print("protogen: {problem.message}")
+        return 1
+
+    written := fs.write(out_path, gen.ok)
+    if written.is_err:
+        print("protogen: cannot write {out_path}")
+        return 1
+
+    print("wrote {out_path}")
+    return 0

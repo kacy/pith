@@ -685,6 +685,27 @@ parq-check:
 	diff -u tools/parq/expected/report.txt "$$tmpdir/report1.txt" && \
 	echo "parq output matches golden files"
 
+# --- protogen golden check ---
+# builds the proto3 code generator, regenerates the sample module and checks it
+# is byte-for-byte the committed one (determinism), runs the generated code's
+# round-trip and wire-vector tests, and valgrinds a driver over encode/decode
+
+protogen-check:
+	@echo "--- protogen golden check ---"
+	@./target/release/pith build tools/protogen/protogen.pith > /dev/null
+	@tmpdir=$$(mktemp -d /tmp/pith-protogen-XXXXXX); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	./tools/protogen/protogen tools/protogen/sample.proto "$$tmpdir/sample_gen.pith" > /dev/null; \
+	diff -u tools/protogen/sample_gen.pith "$$tmpdir/sample_gen.pith" && \
+	./target/release/pith test tools/protogen/protogen_test.pith && \
+	if command -v valgrind > /dev/null; then \
+		./target/release/pith build tools/protogen/protogen_memcheck.pith > /dev/null; \
+		valgrind --error-exitcode=99 --leak-check=no --errors-for-leak-kinds=none -q ./tools/protogen/protogen_memcheck > /dev/null && \
+		echo "protogen output matches golden, tests pass, valgrind clean"; \
+	else \
+		echo "protogen output matches golden and tests pass (valgrind absent)"; \
+	fi
+
 # the ci gate: a fixed seed over both generated programs and mutated
 # corpus cases, deterministic and green. it asserts the frontend never
 # crashes, exits silent, or drops a valid program. the two silent-input

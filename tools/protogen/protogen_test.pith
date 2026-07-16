@@ -1,0 +1,67 @@
+# tests for the code protogen generates from sample.proto (sample_gen.pith).
+# round-trips exercise every field kind; the hex assertions check the generated
+# encoder emits the canonical protobuf wire bytes, byte for byte.
+
+from sample_gen import Point, Shape, encode_Point, decode_Point, encode_Shape, decode_Shape, Color_RED
+import std.bytes as bytes
+import std.encoding as encoding
+
+test "a point round-trips":
+    p := Point(x: 150, y: 7)
+    back := decode_Point(encode_Point(p))!
+    assert_eq(back.x, 150)
+    assert_eq(back.y, 7)
+
+test "a point encodes to the canonical wire bytes":
+    # field 1 = 150 is 08 96 01; y = 0 is the default and is skipped.
+    p := Point(x: 150, y: 0)
+    assert_eq(encoding.to_hex(encode_Point(p)), "089601")
+
+test "a shape round-trips every field kind":
+    s := Shape(name: "sq", id: 42, filled: true, color: Color_RED, center: Point(x: 1, y: 2), vertices: [Point(x: 3, y: 4), Point(x: 5, y: 6)], tags: [10, 20, 30], labels: ["a", "b"], blob: bytes.from_string_utf8("xy"), area: 2.5, offset: 0 - 7)
+    back := decode_Shape(encode_Shape(s))!
+    assert_eq(back.name, "sq")
+    assert_eq(back.id, 42)
+    assert(back.filled)
+    assert_eq(back.color, Color_RED)
+    if let c = back.center:
+        assert_eq(c.x, 1)
+        assert_eq(c.y, 2)
+    else:
+        assert(false)
+    assert_eq(back.vertices.len(), 2)
+    assert_eq(back.vertices[1].x, 5)
+    assert_eq(back.tags, [10, 20, 30])
+    assert_eq(back.labels, ["a", "b"])
+    assert_eq(encoding.to_hex(back.blob), "7879")
+    assert_eq(back.area, 2.5)
+    assert_eq(back.offset, 0 - 7)
+
+test "a string field is the canonical tag-length-utf8":
+    s := empty_shape()
+    s.name = "pith"
+    # field 1, wire 2 (length-delimited): 0a 04 then "pith".
+    assert_eq(encoding.to_hex(encode_Shape(s)), "0a0470697468")
+
+test "a nested message field is length-prefixed":
+    s := empty_shape()
+    s.center = Point(x: 150, y: 0)
+    # field 5, wire 2: 2a 03 then the Point's 08 96 01.
+    assert_eq(encoding.to_hex(encode_Shape(s)), "2a03089601")
+
+test "a repeated scalar field packs its varints":
+    s := empty_shape()
+    s.tags = [3, 270, 86942]
+    # field 7, wire 2, a 6-byte packed payload of three varints.
+    assert_eq(encoding.to_hex(encode_Shape(s)), "3a06038e029ea705")
+
+test "unset fields decode back to their defaults":
+    back := decode_Shape(encode_Shape(empty_shape()))!
+    assert_eq(back.name, "")
+    assert_eq(back.id, 0)
+    assert(not back.filled)
+    assert_eq(back.vertices.len(), 0)
+    assert(back.center == none)
+
+fn empty_shape() -> Shape:
+    return Shape(name: "", id: 0, filled: false, color: 0, center: none, vertices: [], tags: [], labels: [], blob: bytes.empty(), area: 0.0, offset: 0)

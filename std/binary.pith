@@ -6,33 +6,29 @@
 import std.bytes as bytes
 import std.bits as bits
 
-mut next_reader_handle := 1
-mut reader_data: Map[Int, Bytes] := {}
-mut reader_positions: Map[Int, Int] := {}
-
 ## error returned when a binary reader runs out of bytes or sees bad input.
 pub struct BinaryError:
     pub message: String
 
-# cursor over a bytes value.
+# cursor over a bytes value. the data and cursor live in the struct itself
+# (reference-semantic, so advancing the cursor persists to the caller), so a
+# reader is self-contained — no shared table — and safe to use concurrently
+# from separate threads, each with its own reader.
 pub struct Reader:
-    pub handle: Int
+    pub data: Bytes
+    pub mut pos: Int
 
 fn binary_fail(message: String) -> BinaryError:
     return BinaryError(message)
 
 fn reader_bytes(reader: Reader) -> Bytes:
-    if reader_data.contains_key(reader.handle):
-        return reader_data[reader.handle]
-    return bytes.empty()
+    return reader.data
 
 fn reader_pos(reader: Reader) -> Int:
-    if reader_positions.contains_key(reader.handle):
-        return reader_positions[reader.handle]
-    return 0
+    return reader.pos
 
 fn set_reader_pos(reader: Reader, position: Int):
-    reader_positions.insert(reader.handle, position)
+    reader.pos = position
 
 fn check_range(value: Int, max_value: Int, name: String) -> Int!BinaryError:
     if value < 0 or value > max_value:
@@ -55,11 +51,7 @@ fn max_i64() -> Int:
 
 # make a reader for a bytes value.
 pub fn reader(data: Bytes) -> Reader:
-    handle := next_reader_handle
-    next_reader_handle = next_reader_handle + 1
-    reader_data.insert(handle, data)
-    reader_positions.insert(handle, 0)
-    return Reader(handle)
+    return Reader(data: data, pos: 0)
 
 # return the current cursor position.
 pub fn position(reader: Reader) -> Int:

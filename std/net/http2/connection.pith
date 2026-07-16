@@ -1034,8 +1034,19 @@ impl Client:
         has_body := body.len() > 0
         stream := self.open_stream_with_fields(fields, not has_body)!
         stream_id := stream.id
+        if has_body and body.len() <= self.peer_max_frame_size:
+            # the body is a single frame within the initial window, so sending it
+            # never waits on flow control and the small write drains immediately
+            # — no need to send on a task. this is the common grpc unary case.
+            send_stream_data(self, stream_id, body, true)
+            attempt := assemble_response(stream.inbox)
+            self.forget(stream_id)
+            if attempt.is_err:
+                fail attempt.err
+            return attempt.ok
         if has_body:
-            # send the body concurrently so response frames are read as it flows.
+            # a larger body may span frames and block on flow-control credit, so
+            # send it on a task while this call keeps draining the response inbox.
             # bind self to a local: a spawn thunk cannot load `self` directly.
             me := self
             sender := spawn send_stream_data(me, stream_id, body, true)

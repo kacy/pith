@@ -63,6 +63,18 @@ stall per round-trip — the pith client measured 22 calls/sec before the
 fix and 2269 after. one socket option, and every request/response path
 (http, grpc, the db drivers) benefits.
 
+a later perf pass trimmed the client's per-call overhead: the four constant
+grpc request headers are cached, the http/2 writer coalesces queued frames
+into one write, data events share one empty header list, and — the largest
+win — a single-frame request body is now sent inline rather than on a
+spawned task, dropping one os thread per call. apples-to-apples best-of-7,
+sequential 16 B went from ~2550 to ~3120 calls/sec (+23%) and 8-concurrent
+from ~4860 to ~6260 (+29%). so the pith column above is the pre-sprint
+baseline and now understates the client — sequential pith is ~75% of
+grpc-go and about matches tonic. a full re-sweep on a quiet machine (this
+one is too noisy to resolve deltas below its own variance) would refresh
+the table.
+
 `bench/std_pipeline` — 50k records: csv read/write, transform, json,
 gzip:
 

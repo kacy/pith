@@ -13,39 +13,33 @@
 #   encode("hello world")  # "hello%20world"
 
 # ===============================================================
-# URL Node Pool
+# URL
 # ===============================================================
 
-# Pool of parsed URL components indexed by handle
-mut next_url_id: Int := 0
-mut url_schemes: Map[Int, String] := {}
-mut url_hosts: Map[Int, String] := {}
-mut url_ports: Map[Int, Int] := {}
-mut url_paths: Map[Int, String] := {}
-mut url_queries: Map[Int, String] := {}
-mut url_fragments: Map[Int, String] := {}
-
-# Allocates a new URL node and returns its handle
-fn allocate_url() -> Int:
-    idx := next_url_id
-    next_url_id = next_url_id + 1
-    url_schemes.insert(idx, "")
-    url_hosts.insert(idx, "")
-    url_ports.insert(idx, 0 - 1)
-    url_paths.insert(idx, "")
-    url_queries.insert(idx, "")
-    url_fragments.insert(idx, "")
-    return idx
+# a parsed url. the components live in the struct itself rather than a shared
+# node pool, so a url is self-contained and safe to build and read from
+# separate threads concurrently. port is -1 when the url has no explicit port.
+pub struct URL:
+    pub scheme: String
+    pub host: String
+    pub port: Int
+    pub path: String
+    pub query: String
+    pub fragment: String
 
 # ===============================================================
 # URL Parsing
 # ===============================================================
 
 # Parses a URL string into its components.
-# Returns a handle that can be used with accessor functions.
 # Supports: scheme://host:port/path?query#fragment
-pub fn parse(input: String) -> Int:
-    idx := allocate_url()
+pub fn parse(input: String) -> URL:
+    mut r_scheme := ""
+    mut r_host := ""
+    mut r_port := 0 - 1
+    mut r_path := ""
+    mut r_query := ""
+    mut r_fragment := ""
     mut pos := 0
 
     # scheme: find "://"
@@ -57,7 +51,7 @@ pub fn parse(input: String) -> Int:
             i = input.len()
         i = i + 1
     if scheme_end > 0:
-        url_schemes.insert(idx, input.substring(0, scheme_end))
+        r_scheme = input.substring(0, scheme_end)
         pos = scheme_end + 3
 
     # host: up to : / ? # or end
@@ -79,7 +73,7 @@ pub fn parse(input: String) -> Int:
             i = host_end
         i = i + 1
     if colon >= 0:
-        url_hosts.insert(idx, input.substring(host_start, colon))
+        r_host = input.substring(host_start, colon)
         # parse port number
         mut port_val := 0
         i = colon + 1
@@ -88,9 +82,9 @@ pub fn parse(input: String) -> Int:
             if c >= "0" and c <= "9":
                 port_val = port_val * 10 + (ord(c) - 48)
             i = i + 1
-        url_ports.insert(idx, port_val)
+        r_port = port_val
     if colon < 0:
-        url_hosts.insert(idx, input.substring(host_start, host_end))
+        r_host = input.substring(host_start, host_end)
     pos = host_end
 
     # path: up to ? # or end
@@ -103,7 +97,7 @@ pub fn parse(input: String) -> Int:
             path_end = i
         i = i + 1
     if path_end > path_start:
-        url_paths.insert(idx, input.substring(path_start, path_end))
+        r_path = input.substring(path_start, path_end)
     pos = path_end
 
     # query: after ? before #
@@ -116,15 +110,15 @@ pub fn parse(input: String) -> Int:
             if input[i] == "#":
                 qend = i
             i = i + 1
-        url_queries.insert(idx, input.substring(qstart, qend))
+        r_query = input.substring(qstart, qend)
         pos = qend
 
     # fragment: after #
     if pos < input.len() and input[pos] == "#":
         pos = pos + 1
-        url_fragments.insert(idx, input.substring(pos, input.len()))
+        r_fragment = input.substring(pos, input.len())
 
-    return idx
+    return URL(scheme: r_scheme, host: r_host, port: r_port, path: r_path, query: r_query, fragment: r_fragment)
 
 # ===============================================================
 # URL Component Accessors
@@ -132,30 +126,22 @@ pub fn parse(input: String) -> Int:
 
 # Returns the URL scheme (e.g., "https", "http", "ftp").
 # Returns empty string if no scheme was present.
-pub fn scheme(handle: Int) -> String:
-    if handle < 0 or handle >= next_url_id:
-        return ""
-    return url_schemes[handle]
+pub fn scheme(u: URL) -> String:
+    return u.scheme
 
 # Returns the hostname (e.g., "example.com").
 # Returns empty string if parse failed or no host.
-pub fn host(handle: Int) -> String:
-    if handle < 0 or handle >= next_url_id:
-        return ""
-    return url_hosts[handle]
+pub fn host(u: URL) -> String:
+    return u.host
 
 # Returns the port number, or -1 if not specified in the URL.
-pub fn port(handle: Int) -> Int:
-    if handle < 0 or handle >= next_url_id:
-        return 0 - 1
-    return url_ports[handle]
+pub fn port(u: URL) -> Int:
+    return u.port
 
 # Returns the path component (e.g., "/api/v1/users").
 # Returns empty string if no path.
-pub fn path(handle: Int) -> String:
-    if handle < 0 or handle >= next_url_id:
-        return ""
-    return url_paths[handle]
+pub fn path(u: URL) -> String:
+    return u.path
 
 # return the length of the path component without allocating a parsed url node.
 pub fn path_len(input: String) -> Int:
@@ -189,38 +175,27 @@ pub fn path_len(input: String) -> Int:
 
 # Returns the query string without the leading "?".
 # Returns empty string if no query.
-pub fn query(handle: Int) -> String:
-    if handle < 0 or handle >= next_url_id:
-        return ""
-    return url_queries[handle]
+pub fn query(u: URL) -> String:
+    return u.query
 
 # Returns the fragment without the leading "#".
 # Returns empty string if no fragment.
-pub fn fragment(handle: Int) -> String:
-    if handle < 0 or handle >= next_url_id:
-        return ""
-    return url_fragments[handle]
+pub fn fragment(u: URL) -> String:
+    return u.fragment
 
 # Reconstructs the full URL string from its components.
-# Returns empty string if handle is invalid.
-pub fn to_string(handle: Int) -> String:
-    if handle < 0 or handle >= next_url_id:
-        return ""
+pub fn to_string(u: URL) -> String:
     mut result := ""
-    s := url_schemes[handle]
-    if s.len() > 0:
-        result = result + s + "://"
-    result = result + url_hosts[handle]
-    p := url_ports[handle]
-    if p >= 0:
-        result = result + ":" + p.to_string()
-    result = result + url_paths[handle]
-    q := url_queries[handle]
-    if q.len() > 0:
-        result = result + "?" + q
-    f := url_fragments[handle]
-    if f.len() > 0:
-        result = result + "#" + f
+    if u.scheme.len() > 0:
+        result = result + u.scheme + "://"
+    result = result + u.host
+    if u.port >= 0:
+        result = result + ":" + u.port.to_string()
+    result = result + u.path
+    if u.query.len() > 0:
+        result = result + "?" + u.query
+    if u.fragment.len() > 0:
+        result = result + "#" + u.fragment
     return result
 
 # ===============================================================
@@ -320,3 +295,26 @@ test "url percent encoding round trips reserved chars":
     assert_eq(decode(encoded), "hello world/a+b")
     assert_eq(decode("hello+world"), "hello world")
     assert_eq(decode("%zz"), "%zz")
+
+# a worker for the concurrency test: parse and read urls in a tight loop,
+# counting how many come back with every component intact.
+fn concurrent_url_worker(rounds: Int) -> Int:
+    mut ok := 0
+    mut i := 0
+    while i < rounds:
+        u := parse("https://example.com:8443/api/v1?q=pith#docs")
+        if host(u) == "example.com" and port(u) == 8443 and path(u) == "/api/v1" and query(u) == "q=pith" and scheme(u) == "https" and fragment(u) == "docs":
+            ok = ok + 1
+        i = i + 1
+    return ok
+
+test "url parsing is safe from concurrent threads":
+    mut tasks := []
+    mut w := 0
+    while w < 8:
+        tasks.push(spawn concurrent_url_worker(300))
+        w = w + 1
+    mut total := 0
+    for t in tasks:
+        total = total + await t
+    assert_eq(total, 2400)

@@ -52,3 +52,24 @@ test "two unary calls reuse one grpc channel":
     if second.is_err:
         skip_test("second grpc call did not complete: {second.err.message}")
     assert_eq(dummy_echo(second.ok)!, "grpc")
+
+test "server streaming reads the echoed message stream":
+    opened := grpc.dial("grpcb.in", 9001)
+    if opened.is_err:
+        skip_test("grpc dial did not complete: {opened.err}")
+    channel := opened.ok
+
+    started := channel.server_stream("/grpcbin.GRPCBin/DummyServerStream", dummy_request("pith")!)
+    if started.is_err:
+        channel.close()
+        skip_test("server stream did not start: {started.err.message}")
+
+    collected := grpc.collect_server_stream(started.ok)
+    channel.close()
+    if collected.is_err:
+        skip_test("server stream did not complete: {collected.err.message}")
+
+    messages := collected.ok
+    assert(messages.len() >= 1)
+    for m in messages:
+        assert_eq(dummy_echo(m)!, "pith")

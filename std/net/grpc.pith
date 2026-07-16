@@ -219,6 +219,162 @@ fn has_header(fields: List[hpack.HeaderField], name: String) -> Bool:
             return true
     return false
 
+# --- streaming --------------------------------------------------------------
+
+# a grpc message deframer: incoming DATA chunks arrive on arbitrary boundaries,
+# so it accumulates bytes and hands back complete length-prefixed messages
+# ([1-byte compression flag][4-byte big-endian length][message]) one at a time.
+# a chunk may hold zero, one, or many messages, and a message may span chunks.
+pub struct Deframer:
+    mut buf: Bytes
+    mut pos: Int
+
+# a fresh, empty deframer.
+pub fn new_deframer() -> Deframer:
+    return Deframer(bytes.empty(), 0)
+
+impl Deframer:
+    # add a chunk of received bytes. drops the already-consumed prefix first so
+    # the buffer stays bounded across a long stream.
+    pub fn push(chunk: Bytes):
+        if self.pos > 0:
+            self.buf = self.buf.slice(self.pos, self.buf.len())
+            self.pos = 0
+        if chunk.len() > 0:
+            self.buf = bytes.concat(self.buf, chunk)
+
+    # whether a complete message is buffered and ready to take with next().
+    pub fn ready() -> Bool:
+        avail := self.buf.len() - self.pos
+        if avail < 5:
+            return false
+        length := read_u32(self.buf, self.pos + 1)
+        return avail >= 5 + length
+
+    # take the next complete message and advance past it. precondition: ready().
+    # fails if the message is flagged compressed, which this client does not read.
+    pub fn next() -> Bytes!GrpcError:
+        if self.buf[self.pos] != 0:
+            fail GrpcError(GRPC_UNIMPLEMENTED, "grpc message compression is not supported")
+        length := read_u32(self.buf, self.pos + 1)
+        msg := self.buf.slice(self.pos + 5, self.pos + 5 + length)
+        self.pos = self.pos + 5 + length
+        return msg
+
+# one step of a streaming read: `done` is false with the next response `message`,
+# or true (with an empty message) once the server has finished the stream.
+pub struct StreamMessage:
+    pub done: Bool
+    pub message: Bytes
+
+# the response-decoding state of a streaming rpc, fed one http/2 stream event at
+# a time: a deframer that reassembles messages from DATA chunks, plus the
+# response's initial headers and trailers so the terminal grpc-status can be read
+# when the stream ends. transport-independent — a live stream and the offline
+# tests both drive it the same way.
+pub struct StreamReader:
+    mut deframer: Deframer
+    mut done: Bool
+    mut headers: List[hpack.HeaderField]
+    mut trailers: List[hpack.HeaderField]
+
+fn new_stream_reader() -> StreamReader:
+    empty: List[hpack.HeaderField] := []
+    return StreamReader(new_deframer(), false, empty, empty)
+
+impl StreamReader:
+    # apply one stream event: a HEADERS block is stored as the response headers or,
+    # if it carries grpc-status, the trailers; a DATA chunk feeds the deframer; a
+    # RESET fails. an event with `end` finishes the stream.
+    fn feed(ev: http2.StreamEvent) -> Int!GrpcError:
+        if ev.is_reset():
+            fail GrpcError(GRPC_INTERNAL, "grpc: stream reset (error code {ev.error_code})")
+        if ev.is_headers():
+            if has_header(ev.headers, "grpc-status"):
+                self.trailers = ev.headers
+            else:
+                self.headers = ev.headers
+            if ev.end:
+                self.done = true
+        elif ev.is_data():
+            if ev.data.len() > 0:
+                self.deframer.push(ev.data)
+            if ev.end:
+                self.done = true
+        return 0
+
+    fn ready() -> Bool:
+        return self.deframer.ready()
+
+    fn take() -> Bytes!GrpcError:
+        return self.deframer.next()!
+
+    fn finished() -> Bool:
+        return self.done
+
+    # the terminal grpc-status, from the trailers (or the initial headers / the
+    # http status), read once the stream has finished.
+    fn final_status() -> Int:
+        mut http_status := parse_status(find_header(self.headers, ":status"))
+        if http_status == 0:
+            http_status = 200
+        return status_from(self.headers, self.trailers, http_status)
+
+    fn final_message() -> String:
+        return message_from(self.headers, self.trailers)
+
+# a server-streaming call in progress: one request was sent, and recv() pulls the
+# response messages as they arrive. `reader` decodes the responses from the
+# incremental stream events.
+pub struct ServerStream:
+    stream: http2.Stream
+    reader: StreamReader
+
+impl ServerStream:
+    # pull the next response message. returns a StreamMessage whose `done` is
+    # false with the message, or true (empty) once the server has finished. fails
+    # with a GrpcError if the terminal grpc-status is not OK or the stream resets.
+    pub fn recv() -> StreamMessage!GrpcError:
+        s := self.stream
+        r := self.reader
+        while true:
+            if r.ready():
+                return StreamMessage(false, r.take()!)
+            if r.finished():
+                status := r.final_status()
+                if status != GRPC_OK:
+                    fail GrpcError(status, r.final_message())
+                return StreamMessage(true, bytes.empty())
+            evr := s.recv()
+            if evr.is_err:
+                fail GrpcError(GRPC_UNAVAILABLE, "grpc: connection closed mid-stream")
+            r.feed(evr.ok)!
+        return StreamMessage(true, bytes.empty())
+
+impl Conn:
+    # open a server-streaming rpc: send one request message, then read the stream
+    # of responses. `full_method` is "/package.Service/Method". call recv() on the
+    # returned ServerStream to pull response messages until it reports done; a
+    # non-OK grpc-status surfaces as a GrpcError from recv().
+    pub fn server_stream(full_method: String, request: Bytes) -> ServerStream!GrpcError:
+        opened := self.client.open_stream("POST", self.authority, full_method, grpc_headers(), false)
+        if opened.is_err:
+            fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
+        stream := opened.ok
+        stream.send(frame_message(request), true)
+        return ServerStream(stream, new_stream_reader())
+
+# collect every message of a server-streaming response into a list, failing on a
+# non-OK grpc-status. a convenience for callers that want the whole stream.
+pub fn collect_server_stream(stream: ServerStream) -> List[Bytes]!GrpcError:
+    mut out: List[Bytes] := []
+    while true:
+        step := stream.recv()!
+        if step.done:
+            return out
+        out.push(step.message)
+    return out
+
 # ----------------------------------------------------------------------------
 
 fn trailer(status: Int) -> List[hpack.HeaderField]:
@@ -300,3 +456,85 @@ test "a private-ca h2 config builds for the dial_with_config path":
     cfg := tls.client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!.with_alpn(["h2"])
     # a real config has a non-negative handle; the error sentinels are negative.
     assert(cfg.handle >= 0)
+
+# --- deframer ---------------------------------------------------------------
+
+test "deframer yields a single message from one push":
+    d := new_deframer()
+    msg := encoding.from_hex("0a03616263")!
+    d.push(frame_message(msg))
+    assert(d.ready())
+    assert_eq(d.next()!, msg)
+    assert(not d.ready())
+
+test "deframer yields two messages from one push":
+    d := new_deframer()
+    a := encoding.from_hex("01")!
+    b := encoding.from_hex("0203")!
+    d.push(bytes.concat(frame_message(a), frame_message(b)))
+    assert(d.ready())
+    assert_eq(d.next()!, a)
+    assert(d.ready())
+    assert_eq(d.next()!, b)
+    assert(not d.ready())
+
+test "deframer reassembles a message split across two pushes":
+    d := new_deframer()
+    framed := frame_message(encoding.from_hex("deadbeef")!)
+    d.push(framed.slice(0, 3))
+    assert(not d.ready())
+    d.push(framed.slice(3, framed.len()))
+    assert(d.ready())
+    assert_eq(d.next()!, encoding.from_hex("deadbeef")!)
+
+test "deframer waits for a five-byte prefix split across pushes":
+    d := new_deframer()
+    framed := frame_message(encoding.from_hex("ff")!)
+    d.push(framed.slice(0, 2))
+    assert(not d.ready())
+    d.push(framed.slice(2, framed.len()))
+    assert(d.ready())
+    assert_eq(d.next()!, encoding.from_hex("ff")!)
+
+test "deframer handles an empty message":
+    d := new_deframer()
+    d.push(frame_message(bytes.empty()))
+    assert(d.ready())
+    assert_eq(d.next()!.len(), 0)
+    assert(not d.ready())
+
+test "deframer rejects a compressed message":
+    d := new_deframer()
+    d.push(encoding.from_hex("010000000155")!)
+    assert(d.ready())
+    assert(d.next().is_err)
+
+# --- server-stream reader ---------------------------------------------------
+
+test "stream reader deframes messages across events then reads OK status":
+    r := new_stream_reader()
+    r.feed(http2.headers_event([hpack.header_field(":status", "200"), hpack.header_field("content-type", "application/grpc")], false))!
+    r.feed(http2.data_event(frame_message(encoding.from_hex("0a0161")!), false))!
+    assert(r.ready())
+    assert_eq(r.take()!, encoding.from_hex("0a0161")!)
+    framed := frame_message(encoding.from_hex("0a0263")!)
+    r.feed(http2.data_event(framed.slice(0, 3), false))!
+    assert(not r.ready())
+    r.feed(http2.data_event(framed.slice(3, framed.len()), false))!
+    assert(r.ready())
+    assert_eq(r.take()!, encoding.from_hex("0a0263")!)
+    r.feed(http2.headers_event([hpack.header_field("grpc-status", "0")], true))!
+    assert(r.finished())
+    assert_eq(r.final_status(), GRPC_OK)
+
+test "stream reader surfaces a non-OK trailer status":
+    r := new_stream_reader()
+    r.feed(http2.headers_event([hpack.header_field(":status", "200")], false))!
+    r.feed(http2.headers_event([hpack.header_field("grpc-status", "5"), hpack.header_field("grpc-message", "gone")], true))!
+    assert(r.finished())
+    assert_eq(r.final_status(), GRPC_NOT_FOUND)
+    assert_eq(r.final_message(), "gone")
+
+test "stream reader treats a reset as an error":
+    r := new_stream_reader()
+    assert(r.feed(http2.reset_event(8)).is_err)

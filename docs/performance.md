@@ -46,16 +46,18 @@ no async runtime. 20,000 calls each, july 2026:
 
 | calls/sec | go | rust (tonic) | pith |
 |---|---|---|---|
-| 16 B, sequential | 4095 | 3037 | **2269** |
-| 1 KiB, sequential | 3959 | 2853 | **2202** |
-| 16 B, 8 concurrent | 14315 | 11918 | **4224** |
-| 1 KiB, 8 concurrent | 12333 | 10411 | **3800** |
+| 16 B, sequential | 3955 | 3002 | **2850** |
+| 1 KiB, sequential | 3820 | 2786 | **2657** |
+| 16 B, 8 concurrent | 13585 | 11224 | **5105** |
+| 1 KiB, 8 concurrent | 10990 | 8981 | **4609** |
 
-sequentially pith holds ~55% of grpc-go and ~75% of tonic — the same
-order of magnitude for an all-pith stack. concurrency is the weak spot:
-eight streams over one connection lift pith only ~1.9x where go and rust
-scale ~3.5x, so something in the client serializes under load (the single
-writer path, or per-call refcount atomics) — a real follow-up.
+sequentially pith is ~72% of grpc-go and about matches tonic — close, for
+a stack that is pith all the way down (its own tls 1.3, http/2, hpack,
+protobuf). concurrency is the weak spot: eight streams over one connection
+lift pith ~1.8x where go and rust scale ~3.4x, so per-frame overhead
+(interpreter plus refcount atomics vs native buffered frames), not stream
+count, is the ceiling — the single reader/writer is correct and required
+for hpack ordering.
 
 this benchmark paid for itself on the first run: client sockets had no
 `TCP_NODELAY`, so nagle collided with the peer's delayed acks for a ~40ms
@@ -69,11 +71,12 @@ into one write, data events share one empty header list, and — the largest
 win — a single-frame request body is now sent inline rather than on a
 spawned task, dropping one os thread per call. apples-to-apples best-of-7,
 sequential 16 B went from ~2550 to ~3120 calls/sec (+23%) and 8-concurrent
-from ~4860 to ~6260 (+29%). so the pith column above is the pre-sprint
-baseline and now understates the client — sequential pith is ~75% of
-grpc-go and about matches tonic. a full re-sweep on a quiet machine (this
-one is too noisy to resolve deltas below its own variance) would refresh
-the table.
+from ~4860 to ~6260 (+29%). those gains are already in the table above,
+which is a fresh post-sprint sweep — sequential pith moved from ~2100 to
+~2850, roughly ~50% to ~72% of grpc-go. the box is too noisy to resolve
+the smaller items (cached headers, coalescing, shared event list) on
+wall-clock, so they stand on counted structural reductions; a quiet
+machine would sharpen the numbers further.
 
 `bench/std_pipeline` — 50k records: csv read/write, transform, json,
 gzip:

@@ -117,28 +117,33 @@ impl Connection:
             return tls.conn_from_handle(self.tls_handle).read_bytes(16384)!
         return bytes.empty()
 
-    # read exactly `n` bytes, coalescing partial reads. fails if the transport
-    # closes first. mirrors the db drivers' buffered reader.
-    fn recv_exact(n: Int) -> Bytes!:
+    # ensure at least `n` unread bytes are buffered, pulling transport chunks as
+    # needed. fails if the transport closes first. the read cursor (`pos`) means
+    # a frame can be sliced out in one piece rather than copying its header and
+    # payload separately; the consumed prefix is dropped only when a new chunk is
+    # pulled, so steady-state reading does not re-concat the buffer per frame.
+    fn fill(n: Int) -> Int!:
         while self.buf.len() - self.pos < n:
             chunk := self.recv_chunk()!
             if chunk.len() == 0:
                 fail "http2: connection closed"
             self.buf = bytes.concat(self.buf.slice(self.pos, self.buf.len()), chunk)
             self.pos = 0
-        out := self.buf.slice(self.pos, self.pos + n)
-        self.pos = self.pos + n
-        return out
+        return 0
 
-    # read one frame off the transport: the 9-byte header, then its payload.
-    # the length prefix tells us how many payload bytes to pull; the whole
-    # frame is then handed back to the codec's reader, which parses and
-    # bounds-checks it against the max frame size we advertised.
+    # read one frame off the transport: the 9-byte header gives the payload
+    # length, then the whole frame (header + payload) is sliced out in one piece
+    # and the cursor advanced — no separate head/payload slices, no concat to
+    # rejoin them. the codec's reader then parses and bounds-checks it.
     fn read_frame() -> frames.Frame!:
-        head := self.recv_exact(9)!
-        length := length_prefix(head)!
-        payload := self.recv_exact(length)!
-        full := bytes.concat(head, payload)
+        self.fill(9)!
+        length_res := binary.read_u24_be_at(self.buf, self.pos)
+        if length_res.is_err:
+            fail length_res.err.message
+        total := 9 + length_res.ok
+        self.fill(total)!
+        full := self.buf.slice(self.pos, self.pos + total)
+        self.pos = self.pos + total
         return frames.read_frame(binary.reader(full), frames.DEFAULT_MAX_FRAME_SIZE)!
 
     # write raw bytes to the transport, or record them when offline.
@@ -1042,15 +1047,6 @@ impl Client:
         self.outbound.close()
         await self.writer
         self.conn.close()
-
-# read the 24-bit big-endian length prefix that opens a frame header. reading
-# straight off the bytes (rather than through a Reader) keeps the frame-length
-# peek independent of the codec's reader.
-fn length_prefix(head: Bytes) -> Int!:
-    result := binary.read_u24_be_at(head, 0)
-    if result.is_err:
-        fail result.err.message
-    return result.ok
 
 # --- tests ---
 

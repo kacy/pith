@@ -3524,6 +3524,28 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         recv_name := recv_node.value
         if module_aliases.contains_key(recv_name):
             module_path := module_aliases[recv_name]
+            # cross-module struct construction: `m.S(...)` where S is a struct
+            # type the aliased module declares. resolve the type the same way the
+            # same-module ident path does and build it, instead of falling through
+            # to the function-binding lookup (which reports "not callable").
+            ctor_type_name := resolve_imported_type_name(recv_name + "." + method_name)
+            ctor_tid := lookup_type_id(ctor_type_name)
+            if ctor_tid >= 0:
+                ctor_info := get_type_info(ctor_tid)
+                if ctor_info.kind == "struct":
+                    # opaque zero-field types built with args use a constructor
+                    # function (e.g. sync primitives), so leave those to the
+                    # function path; only intercept real field structs.
+                    if ctor_info.fields.len() > 0 or arg_indices.len() == 0:
+                        return check_struct_constructor(ctor_type_name, ctor_tid, ctor_info, arg_indices, scope_id)
+            # a cross-module generic struct: `m.Pair(...)`
+            gen_ctor_name := module_generic_target_name(module_path, method_name)
+            if has_generic_declaration(gen_ctor_name):
+                if get_node(get_generic_declaration_index(gen_ctor_name)).kind == "struct_decl":
+                    return check_generic_struct_constructor(gen_ctor_name, arg_indices, scope_id)
+            if has_generic_declaration(method_name):
+                if get_node(get_generic_declaration_index(method_name)).kind == "struct_decl":
+                    return check_generic_struct_constructor(method_name, arg_indices, scope_id)
             qualified_name := module_import_target_name(module_path, method_name)
             module_name := module_generic_target_name(module_path, method_name)
             mut callee_type := lookup_binding(scope_id, module_name)

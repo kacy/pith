@@ -1,0 +1,28 @@
+# constructing another module's pub struct by name through an import alias
+# (`shapes.Point(x: 1, y: 2)`) used to fail the checker with E208 "not
+# callable" — the module-qualified call path only resolved functions. it now
+# recognizes a struct member and builds it, positionally and by name.
+
+import module_struct_helper as shapes
+
+fn main() -> Int:
+    # named construction across the module boundary
+    p := shapes.Point(x: 3, y: 7)
+    print((p.x + p.y).to_string())
+
+    # positional construction across the module boundary
+    q := shapes.Point(10, 20)
+    print((q.x + q.y).to_string())
+
+    # a struct with mixed field types, read each field back to prove layout
+    r := shapes.Record(name: "pith", count: 5, on: true)
+    print(r.name)
+    print(r.count.to_string())
+    print(r.on.to_string())
+
+    # positional form of the same struct
+    s := shapes.Record("grpc", 9, false)
+    print(s.name)
+    print(s.count.to_string())
+    print(s.on.to_string())
+    return 0

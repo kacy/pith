@@ -25,6 +25,11 @@ mut histogram_mins: Map[String, Int] := {}
 mut histogram_maxs: Map[String, Int] := {}
 mut histogram_bucket_counts: Map[String, Int] := {}
 
+# guards all the metric maps so concurrent updates from separate threads do not
+# race. each public operation takes it around its whole read-modify-write; the
+# internal helpers (ensure_*, *_value, render_*) assume it is already held.
+mut metrics_mu := Mutex()
+
 fn default_histogram_buckets() -> List[Int]:
     return [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000]
 
@@ -115,6 +120,7 @@ fn metric_names() -> List[String]:
 
 # drop all in-memory metric values. useful for tests and short-lived tools.
 pub fn reset():
+    metrics_mu.lock()
     counter_values = {}
     gauge_values = {}
     histogram_counts = {}
@@ -122,23 +128,30 @@ pub fn reset():
     histogram_mins = {}
     histogram_maxs = {}
     histogram_bucket_counts = {}
+    metrics_mu.unlock()
 
 # create or reopen a counter by name.
 pub fn counter(name: String) -> Counter:
     normalized := normalize_metric_name(name)
+    metrics_mu.lock()
     ensure_counter(normalized)
+    metrics_mu.unlock()
     return Counter(normalized)
 
 # create or reopen a gauge by name.
 pub fn gauge(name: String) -> Gauge:
     normalized := normalize_metric_name(name)
+    metrics_mu.lock()
     ensure_gauge(normalized)
+    metrics_mu.unlock()
     return Gauge(normalized)
 
 # create or reopen a histogram by name.
 pub fn histogram(name: String) -> Histogram:
     normalized := normalize_metric_name(name)
+    metrics_mu.lock()
     ensure_histogram(normalized)
+    metrics_mu.unlock()
     return Histogram(normalized)
 
 impl Counter:
@@ -146,26 +159,39 @@ impl Counter:
         self.add(1)
 
     fn add(delta: Int):
+        metrics_mu.lock()
         ensure_counter(self.name)
         counter_values.insert(self.name, counter_values[self.name] + delta)
+        metrics_mu.unlock()
 
     fn value() -> Int:
-        return counter_value(self.name)
+        metrics_mu.lock()
+        result := counter_value(self.name)
+        metrics_mu.unlock()
+        return result
 
 impl Gauge:
     fn set(value: Int):
+        metrics_mu.lock()
         ensure_gauge(self.name)
         gauge_values.insert(self.name, value)
+        metrics_mu.unlock()
 
     fn add(delta: Int):
+        metrics_mu.lock()
         ensure_gauge(self.name)
         gauge_values.insert(self.name, gauge_values[self.name] + delta)
+        metrics_mu.unlock()
 
     fn value() -> Int:
-        return gauge_value(self.name)
+        metrics_mu.lock()
+        result := gauge_value(self.name)
+        metrics_mu.unlock()
+        return result
 
 impl Histogram:
     fn observe(value: Int):
+        metrics_mu.lock()
         ensure_histogram(self.name)
         next_count := histogram_counts[self.name] + 1
         histogram_counts.insert(self.name, next_count)
@@ -182,18 +208,31 @@ impl Histogram:
             if value <= bucket:
                 key := bucket_key(self.name, bucket)
                 histogram_bucket_counts.insert(key, histogram_bucket_counts[key] + 1)
+        metrics_mu.unlock()
 
     fn count() -> Int:
-        return histogram_count(self.name)
+        metrics_mu.lock()
+        result := histogram_count(self.name)
+        metrics_mu.unlock()
+        return result
 
     fn sum() -> Int:
-        return histogram_sum(self.name)
+        metrics_mu.lock()
+        result := histogram_sum(self.name)
+        metrics_mu.unlock()
+        return result
 
     fn min() -> Int:
-        return histogram_min(self.name)
+        metrics_mu.lock()
+        result := histogram_min(self.name)
+        metrics_mu.unlock()
+        return result
 
     fn max() -> Int:
-        return histogram_max(self.name)
+        metrics_mu.lock()
+        result := histogram_max(self.name)
+        metrics_mu.unlock()
+        return result
 
 fn render_counter_lines(name: String) -> List[String]:
     mut lines := ["# TYPE " + name + " counter"]
@@ -268,3 +307,56 @@ test "metrics histograms export bucketed text":
     assert(snapshot.contains("request_latency_ms_bucket" + chr(123) + "le=" + chr(34) + "+Inf" + chr(34) + chr(125) + " 2"))
     assert(snapshot.contains("request_latency_ms_count 2"))
     assert(snapshot.contains("request_latency_ms_sum 34"))
+
+fn stress_counter(name: String, times: Int) -> Int:
+    c := counter(name)
+    mut i := 0
+    while i < times:
+        c.inc()
+        i = i + 1
+    return times
+
+fn stress_histogram(name: String, times: Int) -> Int:
+    h := histogram(name)
+    mut i := 0
+    while i < times:
+        h.observe(7)
+        i = i + 1
+    return times
+
+test "metrics stay exact under concurrent updates":
+    reset()
+    per := 2000
+    ca := spawn stress_counter("concurrent hits", per)
+    cb := spawn stress_counter("concurrent hits", per)
+    cc := spawn stress_counter("concurrent hits", per)
+    cd := spawn stress_counter("concurrent hits", per)
+    ce := spawn stress_counter("concurrent hits", per)
+    cf := spawn stress_counter("concurrent hits", per)
+    cg := spawn stress_counter("concurrent hits", per)
+    ch := spawn stress_counter("concurrent hits", per)
+    ha := spawn stress_histogram("concurrent obs", per)
+    hb := spawn stress_histogram("concurrent obs", per)
+    hc := spawn stress_histogram("concurrent obs", per)
+    hd := spawn stress_histogram("concurrent obs", per)
+
+    mut counted := 0
+    counted = counted + await ca
+    counted = counted + await cb
+    counted = counted + await cc
+    counted = counted + await cd
+    counted = counted + await ce
+    counted = counted + await cf
+    counted = counted + await cg
+    counted = counted + await ch
+    mut observed := 0
+    observed = observed + await ha
+    observed = observed + await hb
+    observed = observed + await hc
+    observed = observed + await hd
+
+    assert_eq(counted, per * 8)
+    assert_eq(counter("concurrent hits").value(), per * 8)
+    assert_eq(observed, per * 4)
+    assert_eq(histogram("concurrent obs").count(), per * 4)
+    assert_eq(histogram("concurrent obs").sum(), per * 4 * 7)

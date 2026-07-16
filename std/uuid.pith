@@ -20,6 +20,9 @@ pub struct UuidError:
 
 mut last_v7_ms: Int := 0
 mut last_v7_counter: Int := -1
+# guards the v7 monotonic clock/counter so concurrent v7 generation from
+# separate threads stays race-free and monotonic within a millisecond.
+mut v7_mu := Mutex()
 
 fn uuid_error(message: String) -> UuidError:
     return UuidError(message)
@@ -102,15 +105,18 @@ fn random_uuid_bytes() -> List[Int]!:
     return uuid_bytes_to_list(crypto_random.bytes(16)!)
 
 fn next_v7_counter(ms: Int) -> Int:
+    v7_mu.lock()
     if ms != last_v7_ms:
         last_v7_ms = ms
         last_v7_counter = 0
-        return last_v7_counter
-    if last_v7_counter >= 4095:
-        last_v7_counter = 0
     else:
-        last_v7_counter = last_v7_counter + 1
-    return last_v7_counter
+        if last_v7_counter >= 4095:
+            last_v7_counter = 0
+        else:
+            last_v7_counter = last_v7_counter + 1
+    result := last_v7_counter
+    v7_mu.unlock()
+    return result
 
 fn timestamp48_bytes(ms: Int) -> List[Int]:
     mut out: List[Int] := []
@@ -283,3 +289,35 @@ test "uuid nil max and namespaces are typed":
     assert_eq(max().version(), 15)
     assert_eq(namespace_url().version(), 1)
     assert_eq(namespace_oid().to_string(), "6ba7b812-9dad-11d1-80b4-00c04fd430c8")
+
+fn stress_v7_batch(count: Int) -> List[String]:
+    mut out: List[String] := []
+    mut i := 0
+    while i < count:
+        out.push(v7() catch "")
+        i = i + 1
+    return out
+
+test "uuid v7 generation is race-free across concurrent tasks":
+    per := 300
+    a := spawn stress_v7_batch(per)
+    b := spawn stress_v7_batch(per)
+    c := spawn stress_v7_batch(per)
+    d := spawn stress_v7_batch(per)
+    e := spawn stress_v7_batch(per)
+    f := spawn stress_v7_batch(per)
+    g := spawn stress_v7_batch(per)
+    h := spawn stress_v7_batch(per)
+    batches := [await a, await b, await c, await d, await e, await f, await g, await h]
+
+    mut seen: Map[String, Bool] := {}
+    mut total := 0
+    for batch in batches:
+        for id in batch:
+            total = total + 1
+            assert_eq(id.len(), 36)
+            assert_eq(id[14], "7")
+            assert(not seen.contains_key(id))
+            seen.insert(id, true)
+    assert_eq(total, per * 8)
+    assert_eq(seen.len(), per * 8)

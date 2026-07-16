@@ -19,16 +19,23 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Echo_Unary_FullMethodName = "/echobench.Echo/Unary"
+	Echo_Unary_FullMethodName        = "/echobench.Echo/Unary"
+	Echo_ServerStream_FullMethodName = "/echobench.Echo/ServerStream"
+	Echo_ClientStream_FullMethodName = "/echobench.Echo/ClientStream"
+	Echo_BidiStream_FullMethodName   = "/echobench.Echo/BidiStream"
 )
 
 // EchoClient is the client API for Echo service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// one unary method: the server returns the request payload unchanged.
+// unary plus the three streaming shapes, all echoing the payload — enough to
+// exercise every grpc client mode against a server whose behavior is known.
 type EchoClient interface {
 	Unary(ctx context.Context, in *EchoRequest, opts ...grpc.CallOption) (*EchoResponse, error)
+	ServerStream(ctx context.Context, in *EchoRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EchoResponse], error)
+	ClientStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[EchoRequest, EchoResponse], error)
+	BidiStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[EchoRequest, EchoResponse], error)
 }
 
 type echoClient struct {
@@ -49,13 +56,62 @@ func (c *echoClient) Unary(ctx context.Context, in *EchoRequest, opts ...grpc.Ca
 	return out, nil
 }
 
+func (c *echoClient) ServerStream(ctx context.Context, in *EchoRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[EchoResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Echo_ServiceDesc.Streams[0], Echo_ServerStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[EchoRequest, EchoResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Echo_ServerStreamClient = grpc.ServerStreamingClient[EchoResponse]
+
+func (c *echoClient) ClientStream(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[EchoRequest, EchoResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Echo_ServiceDesc.Streams[1], Echo_ClientStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[EchoRequest, EchoResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Echo_ClientStreamClient = grpc.ClientStreamingClient[EchoRequest, EchoResponse]
+
+func (c *echoClient) BidiStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[EchoRequest, EchoResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Echo_ServiceDesc.Streams[2], Echo_BidiStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[EchoRequest, EchoResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Echo_BidiStreamClient = grpc.BidiStreamingClient[EchoRequest, EchoResponse]
+
 // EchoServer is the server API for Echo service.
 // All implementations must embed UnimplementedEchoServer
 // for forward compatibility.
 //
-// one unary method: the server returns the request payload unchanged.
+// unary plus the three streaming shapes, all echoing the payload — enough to
+// exercise every grpc client mode against a server whose behavior is known.
 type EchoServer interface {
 	Unary(context.Context, *EchoRequest) (*EchoResponse, error)
+	ServerStream(*EchoRequest, grpc.ServerStreamingServer[EchoResponse]) error
+	ClientStream(grpc.ClientStreamingServer[EchoRequest, EchoResponse]) error
+	BidiStream(grpc.BidiStreamingServer[EchoRequest, EchoResponse]) error
 	mustEmbedUnimplementedEchoServer()
 }
 
@@ -68,6 +124,15 @@ type UnimplementedEchoServer struct{}
 
 func (UnimplementedEchoServer) Unary(context.Context, *EchoRequest) (*EchoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Unary not implemented")
+}
+func (UnimplementedEchoServer) ServerStream(*EchoRequest, grpc.ServerStreamingServer[EchoResponse]) error {
+	return status.Error(codes.Unimplemented, "method ServerStream not implemented")
+}
+func (UnimplementedEchoServer) ClientStream(grpc.ClientStreamingServer[EchoRequest, EchoResponse]) error {
+	return status.Error(codes.Unimplemented, "method ClientStream not implemented")
+}
+func (UnimplementedEchoServer) BidiStream(grpc.BidiStreamingServer[EchoRequest, EchoResponse]) error {
+	return status.Error(codes.Unimplemented, "method BidiStream not implemented")
 }
 func (UnimplementedEchoServer) mustEmbedUnimplementedEchoServer() {}
 func (UnimplementedEchoServer) testEmbeddedByValue()              {}
@@ -108,6 +173,31 @@ func _Echo_Unary_Handler(srv interface{}, ctx context.Context, dec func(interfac
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Echo_ServerStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(EchoRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(EchoServer).ServerStream(m, &grpc.GenericServerStream[EchoRequest, EchoResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Echo_ServerStreamServer = grpc.ServerStreamingServer[EchoResponse]
+
+func _Echo_ClientStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(EchoServer).ClientStream(&grpc.GenericServerStream[EchoRequest, EchoResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Echo_ClientStreamServer = grpc.ClientStreamingServer[EchoRequest, EchoResponse]
+
+func _Echo_BidiStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(EchoServer).BidiStream(&grpc.GenericServerStream[EchoRequest, EchoResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Echo_BidiStreamServer = grpc.BidiStreamingServer[EchoRequest, EchoResponse]
+
 // Echo_ServiceDesc is the grpc.ServiceDesc for Echo service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -120,6 +210,23 @@ var Echo_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Echo_Unary_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "ServerStream",
+			Handler:       _Echo_ServerStream_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ClientStream",
+			Handler:       _Echo_ClientStream_Handler,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "BidiStream",
+			Handler:       _Echo_BidiStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "echo.proto",
 }

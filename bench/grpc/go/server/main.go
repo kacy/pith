@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"log"
 	"net"
 
@@ -20,6 +21,47 @@ type echoServer struct {
 
 func (s *echoServer) Unary(ctx context.Context, req *echopb.EchoRequest) (*echopb.EchoResponse, error) {
 	return &echopb.EchoResponse{Payload: req.Payload}, nil
+}
+
+// server streaming: echo the request payload back three times.
+func (s *echoServer) ServerStream(req *echopb.EchoRequest, stream grpc.ServerStreamingServer[echopb.EchoResponse]) error {
+	for i := 0; i < 3; i++ {
+		if err := stream.Send(&echopb.EchoResponse{Payload: req.Payload}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// client streaming: consume the request stream and return the last payload.
+func (s *echoServer) ClientStream(stream grpc.ClientStreamingServer[echopb.EchoRequest, echopb.EchoResponse]) error {
+	var last []byte
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			return stream.SendAndClose(&echopb.EchoResponse{Payload: last})
+		}
+		if err != nil {
+			return err
+		}
+		last = req.Payload
+	}
+}
+
+// bidi streaming: echo each request message straight back.
+func (s *echoServer) BidiStream(stream grpc.BidiStreamingServer[echopb.EchoRequest, echopb.EchoResponse]) error {
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := stream.Send(&echopb.EchoResponse{Payload: req.Payload}); err != nil {
+			return err
+		}
+	}
 }
 
 func main() {

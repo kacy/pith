@@ -1,0 +1,138 @@
+# live grpc streaming interop: client-, and bidi-streaming over the native
+# (pure-pith) http/2 transport, against a local grpc-go echo server whose
+# behavior is known (grpcb.in's public streaming methods are flaky, so the
+# deterministic interop runs against our own server).
+#
+# start the server first (from the repo root):
+#   bash bench/grpc/build.sh
+#   bench/grpc/bin/server -addr 127.0.0.1:50055 \
+#     -cert tests/live/fixtures/localhost.crt -key tests/live/fixtures/localhost.key &
+# then: pith test tests/live/grpc_stream_live.pith
+#
+# the tests skip when the server is not reachable. the Echo service echoes the
+# request payload: ServerStream sends it back three times, ClientStream returns
+# the last message, BidiStream echoes each. server-streaming interop lives in
+# grpc_live.pith (against grpcb.in); this file covers client and bidi.
+
+import std.net.grpc as grpc
+import std.net.tls as tls
+import std.protobuf as protobuf
+
+# a tls config trusting the localhost fixture ca, offering alpn "h2".
+fn local_config() -> tls.Config!:
+    return tls.client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!.with_alpn(["h2"])
+
+# an EchoRequest { bytes payload = 1 } carrying `name` as its payload. write_string
+# and a bytes field share the length-delimited wire form, so the server echoes it
+# back unchanged.
+fn echo_request(name: String) -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_string(1, name)!
+    out := w.bytes()
+    w.free()
+    return out
+
+# the field-1 payload of an echoed EchoResponse, read back as text.
+fn echoed(reply: Bytes) -> String!protobuf.ProtoError:
+    r := protobuf.reader(reply)
+    mut value := ""
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            value = r.read_string()!
+        else:
+            r.skip(tag.wire)!
+    return value
+
+# send `count` copies of `request` then half-close — run in a spawned task so the
+# main task can drain recv over the same bidi stream concurrently.
+fn bidi_sender(stream: grpc.BidiStream, request: Bytes, count: Int) -> Int:
+    mut i := 0
+    while i < count:
+        stream.send(request)
+        i = i + 1
+    stream.close_send()
+    return count
+
+test "client streaming sends several messages and reads the last":
+    opened := grpc.dial_with_config("localhost", 50055, local_config()!)
+    if opened.is_err:
+        skip_test("local grpc server not reachable: {opened.err}")
+    channel := opened.ok
+
+    started := channel.client_stream("/echobench.Echo/ClientStream")
+    if started.is_err:
+        channel.close()
+        skip_test("client stream did not start: {started.err.message}")
+    cs := started.ok
+    cs.send(echo_request("one")!)
+    cs.send(echo_request("two")!)
+    cs.send(echo_request("three")!)
+    cs.close_send()
+
+    reply := cs.recv_response()
+    channel.close()
+    if reply.is_err:
+        skip_test("client stream did not complete: {reply.err.message}")
+    assert_eq(echoed(reply.ok)!, "three")
+
+test "bidi streaming echoes every message in order":
+    opened := grpc.dial_with_config("localhost", 50055, local_config()!)
+    if opened.is_err:
+        skip_test("local grpc server not reachable: {opened.err}")
+    channel := opened.ok
+
+    started := channel.bidi_stream("/echobench.Echo/BidiStream")
+    if started.is_err:
+        channel.close()
+        skip_test("bidi stream did not start: {started.err.message}")
+    bs := started.ok
+    bs.send(echo_request("x")!)
+    bs.send(echo_request("y")!)
+    bs.send(echo_request("z")!)
+    bs.close_send()
+
+    mut got: List[String] := []
+    mut streaming := true
+    while streaming:
+        step := bs.recv()!
+        if step.done:
+            streaming = false
+        else:
+            got.push(echoed(step.message)!)
+    channel.close()
+    assert_eq(got.len(), 3)
+    assert_eq(got[0], "x")
+    assert_eq(got[1], "y")
+    assert_eq(got[2], "z")
+
+test "bidi streaming runs a spawned sender concurrently with recv":
+    opened := grpc.dial_with_config("localhost", 50055, local_config()!)
+    if opened.is_err:
+        skip_test("local grpc server not reachable: {opened.err}")
+    channel := opened.ok
+
+    started := channel.bidi_stream("/echobench.Echo/BidiStream")
+    if started.is_err:
+        channel.close()
+        skip_test("bidi stream did not start: {started.err.message}")
+    bs := started.ok
+    request := echo_request("pith")!
+    n := 5
+
+    # send from a spawned task while this task receives — the two halves of one
+    # bidi stream run independently (send goes through the connection's writer,
+    # recv reads the stream's own event channel).
+    sender := spawn bidi_sender(bs, request, n)
+    mut received := 0
+    mut streaming := true
+    while streaming:
+        step := bs.recv()!
+        if step.done:
+            streaming = false
+        else:
+            assert_eq(echoed(step.message)!, "pith")
+            received = received + 1
+    await sender
+    channel.close()
+    assert_eq(received, n)

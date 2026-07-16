@@ -323,6 +323,36 @@ impl StreamReader:
     fn final_message() -> String:
         return message_from(self.headers, self.trailers)
 
+# pull one message from an in-progress stream: hand back a buffered message if the
+# reader has one, else read stream events until a message completes or the stream
+# ends. a StreamMessage with `done` true (empty) marks the end; a non-OK terminal
+# grpc-status or a reset fails. shared by server-, and bidi-streaming recv.
+fn recv_stream_message(stream: http2.Stream, reader: StreamReader) -> StreamMessage!GrpcError:
+    while true:
+        if reader.ready():
+            return StreamMessage(false, reader.take()!)
+        if reader.finished():
+            status := reader.final_status()
+            if status != GRPC_OK:
+                fail GrpcError(status, reader.final_message())
+            return StreamMessage(true, bytes.empty())
+        evr := stream.recv()
+        if evr.is_err:
+            fail GrpcError(GRPC_UNAVAILABLE, "grpc: connection closed mid-stream")
+        reader.feed(evr.ok)!
+    return StreamMessage(true, bytes.empty())
+
+# frame `message` and send it on `stream` without ending the stream. shared by
+# client- and bidi-streaming send. returns the byte count the transport queued;
+# a broken connection surfaces on the receive side, not here.
+fn send_framed_message(stream: http2.Stream, message: Bytes) -> Int:
+    return stream.send(frame_message(message), false)
+
+# half-close the send side: a lone empty DATA frame with END_STREAM, telling the
+# server no more request messages follow.
+fn half_close_stream(stream: http2.Stream) -> Int:
+    return stream.send(bytes.empty(), true)
+
 # a server-streaming call in progress: one request was sent, and recv() pulls the
 # response messages as they arrive. `reader` decodes the responses from the
 # incremental stream events.
@@ -335,21 +365,7 @@ impl ServerStream:
     # false with the message, or true (empty) once the server has finished. fails
     # with a GrpcError if the terminal grpc-status is not OK or the stream resets.
     pub fn recv() -> StreamMessage!GrpcError:
-        s := self.stream
-        r := self.reader
-        while true:
-            if r.ready():
-                return StreamMessage(false, r.take()!)
-            if r.finished():
-                status := r.final_status()
-                if status != GRPC_OK:
-                    fail GrpcError(status, r.final_message())
-                return StreamMessage(true, bytes.empty())
-            evr := s.recv()
-            if evr.is_err:
-                fail GrpcError(GRPC_UNAVAILABLE, "grpc: connection closed mid-stream")
-            r.feed(evr.ok)!
-        return StreamMessage(true, bytes.empty())
+        return recv_stream_message(self.stream, self.reader)!
 
 impl Conn:
     # open a server-streaming rpc: send one request message, then read the stream
@@ -374,6 +390,82 @@ pub fn collect_server_stream(stream: ServerStream) -> List[Bytes]!GrpcError:
             return out
         out.push(step.message)
     return out
+
+# a client-streaming call in progress: the client sends a sequence of request
+# messages with send(), calls close_send() to finish sending, then reads the one
+# response with recv_response().
+pub struct ClientStream:
+    stream: http2.Stream
+    reader: StreamReader
+
+impl ClientStream:
+    # send one request message. call as many times as needed before close_send().
+    pub fn send(message: Bytes) -> Int:
+        return send_framed_message(self.stream, message)
+
+    # finish sending: half-close the stream so the server knows the request
+    # sequence is complete. call recv_response() after this.
+    pub fn close_send() -> Int:
+        return half_close_stream(self.stream)
+
+    # read the single response message and the terminal grpc-status. fails with a
+    # GrpcError on a non-OK status, a reset, or if the server sent no message.
+    pub fn recv_response() -> Bytes!GrpcError:
+        mut message := bytes.empty()
+        mut got := false
+        while true:
+            step := recv_stream_message(self.stream, self.reader)!
+            if step.done:
+                if not got:
+                    fail GrpcError(GRPC_INTERNAL, "grpc: client-streaming response carried no message")
+                return message
+            message = step.message
+            got = true
+        return message
+
+# a bidirectional-streaming call in progress. the send side (send/close_send) and
+# the receive side (recv) are independent — send goes through the connection's
+# writer task, recv reads this stream's own event channel — so a caller may drive
+# them from two tasks: spawn a sender while the main task recvs.
+pub struct BidiStream:
+    stream: http2.Stream
+    reader: StreamReader
+
+impl BidiStream:
+    # send one request message.
+    pub fn send(message: Bytes) -> Int:
+        return send_framed_message(self.stream, message)
+
+    # finish sending: half-close so the server sees the end of the request stream.
+    # the receive side stays open until the server finishes its own stream.
+    pub fn close_send() -> Int:
+        return half_close_stream(self.stream)
+
+    # pull the next response message: a StreamMessage with `done` false and the
+    # message, or true (empty) once the server has finished. fails on a non-OK
+    # terminal grpc-status or a reset.
+    pub fn recv() -> StreamMessage!GrpcError:
+        return recv_stream_message(self.stream, self.reader)!
+
+impl Conn:
+    # open a client-streaming rpc: send a sequence of request messages, then read
+    # one response. `full_method` is "/package.Service/Method". send() each
+    # request, close_send() to finish, then recv_response().
+    pub fn client_stream(full_method: String) -> ClientStream!GrpcError:
+        opened := self.client.open_stream("POST", self.authority, full_method, grpc_headers(), false)
+        if opened.is_err:
+            fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
+        return ClientStream(opened.ok, new_stream_reader())
+
+    # open a bidirectional-streaming rpc: send and receive message streams
+    # independently. `full_method` is "/package.Service/Method". send()/close_send()
+    # drive the request stream, recv() drains the response stream — the two can run
+    # in separate tasks.
+    pub fn bidi_stream(full_method: String) -> BidiStream!GrpcError:
+        opened := self.client.open_stream("POST", self.authority, full_method, grpc_headers(), false)
+        if opened.is_err:
+            fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
+        return BidiStream(opened.ok, new_stream_reader())
 
 # ----------------------------------------------------------------------------
 
@@ -538,3 +630,36 @@ test "stream reader surfaces a non-OK trailer status":
 test "stream reader treats a reset as an error":
     r := new_stream_reader()
     assert(r.feed(http2.reset_event(8)).is_err)
+
+# --- client / bidi shapes ---------------------------------------------------
+
+test "client-stream reader yields one response then finishes OK":
+    r := new_stream_reader()
+    r.feed(http2.headers_event([hpack.header_field(":status", "200")], false))!
+    msg := encoding.from_hex("0a0470697468")!
+    r.feed(http2.data_event(frame_message(msg), false))!
+    assert(r.ready())
+    assert_eq(r.take()!, msg)
+    r.feed(http2.headers_event([hpack.header_field("grpc-status", "0")], true))!
+    assert(r.finished())
+    assert_eq(r.final_status(), GRPC_OK)
+
+test "bidi reader deframes several echoed messages in order":
+    r := new_stream_reader()
+    r.feed(http2.headers_event([hpack.header_field(":status", "200")], false))!
+    a := encoding.from_hex("0a0161")!
+    b := encoding.from_hex("0a0162")!
+    c := encoding.from_hex("0a0163")!
+    r.feed(http2.data_event(frame_message(a), false))!
+    r.feed(http2.data_event(frame_message(b), false))!
+    r.feed(http2.data_event(frame_message(c), false))!
+    assert(r.ready())
+    assert_eq(r.take()!, a)
+    assert(r.ready())
+    assert_eq(r.take()!, b)
+    assert(r.ready())
+    assert_eq(r.take()!, c)
+    assert(not r.ready())
+    r.feed(http2.headers_event([hpack.header_field("grpc-status", "0")], true))!
+    assert(r.finished())
+    assert_eq(r.final_status(), GRPC_OK)

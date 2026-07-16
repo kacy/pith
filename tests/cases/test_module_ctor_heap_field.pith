@@ -1,0 +1,19 @@
+# constructing another module's struct across the boundary must give every field
+# its value, including a fresh heap value like a Bytes built inline. the backend
+# constructor path used to release that argument before the field kept it, so the
+# data field came back empty.
+
+import module_ctor_heap_helper as m
+import std.bytes as bytes
+
+fn main() -> Int:
+    # named construction with a fresh inline Bytes for the last field
+    p := m.Payload(code: 7, label: "hi", data: bytes.from_string_utf8("hello"))
+    print(p.code.to_string())
+    print(p.label)
+    print(p.data.len().to_string())
+
+    # positional construction
+    q := m.Payload(9, "yo", bytes.from_string_utf8("worldwide"))
+    print(q.data.len().to_string())
+    return 0

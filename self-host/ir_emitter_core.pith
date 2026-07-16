@@ -3576,6 +3576,22 @@ fn ir_emit_method_call(idx: Int) -> Int:
     alias_fname := ir_resolve_module_alias_method_call_name(idx)
     if alias_fname.len() > 0:
         mut call_name := alias_fname
+        # a module-qualified struct construction (`mod.Struct(...)`) resolves the
+        # alias member to the struct name. emit it through the same inline path as
+        # a same-module construction so each field takes ownership and the struct
+        # gets its destructor. the generic function-call path below would instead
+        # emit a backend constructor call and then release the owned args the
+        # struct just stored — dropping a fresh heap value (e.g. `body: bytes...`).
+        alias_expr_tid := c_get_expr_type(idx)
+        if alias_expr_tid >= 0:
+            alias_expr_info := get_type_info(alias_expr_tid)
+            if alias_expr_info.kind == "struct" and alias_expr_info.name == call_name:
+                mut ctor_args: List[Int] := []
+                for child, ci in node.children:
+                    if ci == 0:
+                        continue
+                    ctor_args.push(child)
+                return ir_emit_struct_positional_init(call_name, ctor_args)
         if ir_is_generic_function_name(call_name):
             mut generic_ret_type := ir_checked_type(idx)
             if generic_ret_type.len() == 0:

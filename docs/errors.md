@@ -476,6 +476,23 @@ error[E248]: a spawned task cannot take a list this scope still holds; both thre
 
 ---
 
+### E250 — builtin type name
+
+a struct or enum cannot reuse the name of a builtin type (`Channel`, `Task`,
+`List`, `Map`, `Mutex`, `WaitGroup`, `Semaphore`, `AtomicInt`, or a primitive
+like `Int`). the declaration would shadow the builtin and silently miscompile
+anything that uses it — a `struct Channel`, for instance, corrupts every
+`Channel[T]` in scope, so an imported module's own channels stop working with
+no error. rename the type.
+
+```
+error[E250]: 'Channel' is a builtin type name and cannot be used as a struct name
+  2 |     n: Int
+                ^
+```
+
+---
+
 ## lint errors (E3xx)
 
 reported by `pith lint`. naming violations are errors; style issues are warnings.

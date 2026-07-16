@@ -688,18 +688,43 @@ fn fail_all(client: Client):
     # unblock any request queued for a concurrency slot.
     client.slot_free.close()
 
-# the writer task: drain the outbound channel and write each serialized frame in
+# given the frame just pulled from the outbound channel, drain any frames already
+# queued behind it (with try_recv) and return them concatenated in FIFO order, so
+# a burst can go out in one write. returns `first` untouched when nothing else is
+# queued — the common single-frame case, with no extra allocation.
+fn drain_coalesced(first: Bytes, outbound: Channel[Bytes]) -> Bytes:
+    next := outbound.try_recv()
+    if next == none:
+        return first
+    buf := bytes.buffer()
+    buf.write(first) catch 0
+    mut more := next
+    while more != none:
+        buf.write(more.unwrap_or(bytes.empty())) catch 0
+        more = outbound.try_recv()
+    out := buf.bytes()
+    buf.free()
+    return out
+
+# the writer task: drain the outbound channel and write serialized frames in
 # order. stops when the channel is closed (close()) or a write fails. it owns the
 # send direction only — the outbound channel, the connection, and the closed
 # flag — so its handle can be held before the full client is built. a closed
 # channel still yields its buffered frames before recv reports none, so a GOAWAY
 # queued just before close() is flushed here.
+#
+# frames already queued behind the one recv() returns are coalesced into a single
+# write (see drain_coalesced), preserving FIFO order so the wire bytes — and thus
+# hpack/DATA ordering — are unchanged. under concurrency many streams queue frames
+# between writer wakeups, collapsing a burst of one-record-per-frame writes into
+# one record and syscall.
 fn writer_loop(outbound: Channel[Bytes], conn: Connection, closed: AtomicInt) -> Int:
     while true:
         opt := outbound.recv()
         if opt == none:
             return 0
-        sent := conn.send(opt.unwrap_or(bytes.empty()))
+        wire := drain_coalesced(opt.unwrap_or(bytes.empty()), outbound)
+        sent := conn.send(wire)
         if sent.is_err:
             closed.store(1)
             return 0
@@ -1532,3 +1557,19 @@ test "open_stream registers a stream that recv reads incrementally":
     d2 := stream.recv()!
     assert_eq(d2.data.to_string_utf8()!, "two")
     assert(d2.end)
+
+test "drain_coalesced leaves a single frame untouched":
+    outbound := Channel[Bytes](8)
+    only := drain_coalesced(bytes.from_string_utf8("solo"), outbound)
+    assert_eq(only.to_string_utf8()!, "solo")
+
+test "drain_coalesced merges queued frames into one buffer in fifo order":
+    outbound := Channel[Bytes](8)
+    outbound.send(bytes.from_string_utf8("BB"))
+    outbound.send(bytes.from_string_utf8("CC"))
+    # "AA" stands in for the frame recv() already pulled; BB and CC were queued
+    # behind it and must come out concatenated, in order, in one buffer.
+    merged := drain_coalesced(bytes.from_string_utf8("AA"), outbound)
+    assert_eq(merged.to_string_utf8()!, "AABBCC")
+    # the channel is fully drained afterwards
+    assert(outbound.try_recv() == none)

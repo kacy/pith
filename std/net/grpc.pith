@@ -122,19 +122,27 @@ pub fn call(host: String, port: Int, full_method: String, request: Bytes) -> Byt
 
 # --- framing ----------------------------------------------------------------
 
-# the request headers a grpc call sends alongside the four http/2 pseudo-headers.
+# the request headers every grpc call sends alongside the four http/2
+# pseudo-headers. they are the same on every call, so they are built once and
+# shared — the request path only reads them (it copies each field into its own
+# list), so a single cached list saves four header allocations per call.
+REQUEST_HEADERS := [hpack.header_field("content-type", "application/grpc"), hpack.header_field("te", "trailers"), hpack.header_field("grpc-encoding", "identity"), hpack.header_field("grpc-accept-encoding", "identity")]
+
 fn grpc_headers() -> List[hpack.HeaderField]:
-    return [hpack.header_field("content-type", "application/grpc"), hpack.header_field("te", "trailers"), hpack.header_field("grpc-encoding", "identity"), hpack.header_field("grpc-accept-encoding", "identity")]
+    return REQUEST_HEADERS
 
 # frame a message for the wire: a one-byte compression flag (0 = identity), a
-# big-endian uint32 length, then the message bytes. writes to a fresh in-memory
-# buffer cannot fail, so their results are discarded.
+# big-endian uint32 length, then the message bytes. the five prefix bytes are
+# written directly rather than through an intermediate list. writes to a fresh
+# in-memory buffer cannot fail, so their results are discarded.
 fn frame_message(message: Bytes) -> Bytes:
     buf := bytes.buffer()
     n := message.len()
-    header := [0, bits.band(bits.shr(n, 24), 255), bits.band(bits.shr(n, 16), 255), bits.band(bits.shr(n, 8), 255), bits.band(n, 255)]
-    for b in header:
-        buf.write_byte(b) catch 0
+    buf.write_byte(0) catch 0
+    buf.write_byte(bits.band(bits.shr(n, 24), 255)) catch 0
+    buf.write_byte(bits.band(bits.shr(n, 16), 255)) catch 0
+    buf.write_byte(bits.band(bits.shr(n, 8), 255)) catch 0
+    buf.write_byte(bits.band(n, 255)) catch 0
     if n > 0:
         buf.write(message) catch 0
     out := buf.bytes()

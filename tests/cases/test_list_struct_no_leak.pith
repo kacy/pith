@@ -1,0 +1,47 @@
+# a list literal of structs used to leak each element's header: the list was
+# built untagged (like a primitive list), so its free-time cascade never
+# released the struct handles. it now uses a struct-tagged list that retains on
+# push and releases on free, and the fresh element temp is dropped so the list
+# owns exactly one count. run under valgrind (memcheck) to prove no leak, and
+# the borrow/shared/nested cases to prove no double-free.
+
+import std.bytes as bytes
+
+struct Field:
+    pub name: String
+    pub value: String
+
+# fresh elements built inline — the grpc `[header_field(...), ...]` shape.
+fn make_fields() -> List[Field]:
+    return [Field("aa".repeat(3), "bb".repeat(3)), Field("cc".repeat(3), "dd".repeat(3))]
+
+fn total(fields: List[Field]) -> Int:
+    mut n := 0
+    for f in fields:
+        n = n + f.name.len() + f.value.len()
+    return n
+
+fn main() -> Int:
+    mut sum := 0
+    mut i := 0
+    while i < 300:
+        # fresh-element list literal
+        a := make_fields()
+        sum = sum + total(a)
+
+        # a borrowed struct pushed into a literal (both stay live)
+        h := Field("x".repeat(4), "y".repeat(4))
+        b := [h]
+        sum = sum + b[0].name.len() + h.value.len()
+
+        # the same struct in two lists (shared, rc > 1)
+        c := [h]
+        sum = sum + c[0].value.len()
+
+        # nested list of struct lists
+        outer := [make_fields()]
+        sum = sum + outer[0][1].name.len()
+        i = i + 1
+
+    print(sum.to_string())
+    return 0

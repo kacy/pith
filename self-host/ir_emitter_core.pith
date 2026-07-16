@@ -2871,6 +2871,8 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
         return "__list_new_list"
     if elem_kind == "map":
         return "__list_new_map"
+    if elem_kind == "struct":
+        return "__list_new_struct"
     return "__list_new"
 
 fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
@@ -2894,10 +2896,20 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     if elem_kind.len() == 0 and node.children.len() > 0:
         elem_kind = ir_rc_kind(ir_infer_type(node.children[0]))
     list_r := ir_reg()
-    ir_emit_call0(list_r, ir_list_ctor_for_elem_kind(elem_kind), "list")
+    ctor := ir_list_ctor_for_elem_kind(elem_kind)
+    ir_emit_call0(list_r, ctor, "list")
+    # a retaining ctor (string/list/map/struct) makes __list_push retain the
+    # element, so a freshly built element carries a count the list now also
+    # holds — drop the fresh temp's count so the list owns exactly one, and the
+    # free-time cascade balances it. a borrow keeps its owner's count (released
+    # at that owner's scope), so only release non-borrowed elements. untagged
+    # (primitive) lists don't retain, so nothing to drop.
+    retaining := ctor != "__list_new"
     for child in node.children:
         elem_r := ir_emit_value_for_target(child, elem_target)
         ir_emit_call2(ir_reg(), "__list_push", "void", list_r, elem_r)
+        if retaining and not ir_string_expr_is_borrowed(child):
+            ir_rc_release_reg(elem_r, elem_kind)
     return list_r
 
 fn ir_emit_tuple_literal_stores(tuple_r: Int, elem_regs: List[Int], elem_nodes: List[Int]):

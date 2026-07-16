@@ -1,0 +1,25 @@
+# a fresh collection passed directly as a call argument (not bound to a local)
+# used to leak its container every call, because the caller only released
+# owned struct/closure arguments and skipped list/map/set. this loops enough
+# to make a per-call container leak obvious under the memcheck suite.
+
+fn make_ints() -> List[Int]:
+    return [1, 2, 3]
+
+fn make_strs() -> List[String]:
+    return ["a", "b"]
+
+fn count_ints(xs: List[Int]) -> Int:
+    return xs.len()
+
+fn count_strs(xs: List[String]) -> Int:
+    return xs.len()
+
+fn main():
+    mut total := 0
+    mut i := 0
+    while i < 1000:
+        total = total + count_ints(make_ints())
+        total = total + count_strs(make_strs())
+        i = i + 1
+    print("{total}")

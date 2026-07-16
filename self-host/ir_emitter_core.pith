@@ -1956,7 +1956,11 @@ fn ir_release_owned_string_operand(expr_idx: Int, reg: Int, expr_type: String):
         mut arg_kind := ir_rc_kind(expr_type)
         if arg_kind.len() == 0 and get_node(expr_idx).kind == "lambda":
             arg_kind = "closure"
-        if (arg_kind == "struct" or arg_kind == "closure") and not ir_string_expr_is_borrowed(expr_idx):
+        # any owned rc kind dies here: struct/closure/tuple and the
+        # collections (list/map/set). collections were previously omitted, so
+        # a fresh `f(g())` where g returns a List/Map/Set leaked its container
+        # (and elements) every call.
+        if arg_kind.len() > 0 and not ir_string_expr_is_borrowed(expr_idx):
             ir_rc_release_reg(reg, arg_kind)
 
 # true for call and method-call results whose checked or inferred type is

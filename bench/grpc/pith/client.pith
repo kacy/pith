@@ -1,0 +1,126 @@
+# the pith grpc benchmark client: warm up, then time many unary echo calls over
+# one channel and print calls/sec. parameters come from the environment so the
+# runner can drive it the same way it drives the go and rust clients:
+#   PITH_GRPC_SIZE, PITH_GRPC_CALLS, PITH_GRPC_WARMUP, PITH_GRPC_CONC, PITH_GRPC_CA
+#
+# pith has only millisecond wall-clock resolution, so the batch (thousands of
+# calls, seconds long) gives the throughput and an average latency — the fair
+# common metric across all three clients. per-call percentiles are left to the
+# go and rust clients.
+
+import std.net.http2.connection as http2
+import std.net.grpc as grpc
+import std.net.tls as tls
+import std.protobuf as protobuf
+import std.bytes as bytes
+import std.time as time
+import std.os as os
+import std.concurrent as concurrent
+
+fn env_str(name: String, fallback: String) -> String:
+    value := os.get_env(name).unwrap_or(fallback)
+    if value == "":
+        return fallback
+    return value
+
+fn to_int(text: String, fallback: Int) -> Int:
+    digits := bytes.from_string_utf8(text)
+    mut value := 0
+    mut i := 0
+    while i < digits.len():
+        c := digits[i]
+        if c < 48 or c > 57:
+            return fallback
+        value = (value * 10) + (c - 48)
+        i = i + 1
+    return value
+
+fn env_int(name: String, fallback: Int) -> Int:
+    return to_int(env_str(name, ""), fallback)
+
+# a payload of n zero bytes.
+fn zeros(n: Int) -> Bytes:
+    buf := bytes.buffer()
+    mut i := 0
+    while i < n:
+        buf.write_byte(0) catch 0
+        i = i + 1
+    out := buf.bytes()
+    buf.free()
+    return out
+
+# serialize an EchoRequest { bytes payload = 1 }.
+fn echo_request(payload: Bytes) -> Bytes:
+    w := protobuf.writer()
+    w.write_bytes(1, payload) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+fn run_serial(ch: grpc.Conn, method: String, request: Bytes, calls: Int):
+    mut i := 0
+    while i < calls:
+        ch.unary(method, request) catch bytes.empty()
+        i = i + 1
+
+fn worker(ch: grpc.Conn, method: String, request: Bytes, count: Int) -> Int:
+    mut i := 0
+    while i < count:
+        ch.unary(method, request) catch bytes.empty()
+        i = i + 1
+    return count
+
+fn run_concurrent(ch: grpc.Conn, method: String, request: Bytes, calls: Int, conc: Int):
+    per := calls / conc
+    mut tasks := []
+    mut w := 0
+    while w < conc:
+        tasks.push(spawn worker(ch, method, request, per))
+        w = w + 1
+    for t in tasks:
+        await t
+
+fn report(size: Int, conc: Int, calls: Int, elapsed_ms: Int):
+    mut ms := elapsed_ms
+    if ms <= 0:
+        ms = 1
+    throughput := (calls * 1000) / ms
+    avg_us := (ms * 1000) / calls
+    print("pith   size={size}   conc={conc}   calls={calls}  avg={avg_us}us   {throughput} calls/sec")
+
+fn main():
+    size := env_int("PITH_GRPC_SIZE", 16)
+    calls := env_int("PITH_GRPC_CALLS", 20000)
+    warmup := env_int("PITH_GRPC_WARMUP", 2000)
+    conc := env_int("PITH_GRPC_CONC", 1)
+    ca_path := env_str("PITH_GRPC_CA", "tests/live/fixtures/localhost-ca.crt")
+    method := "/echobench.Echo/Unary"
+
+    cfg := tls.client_config_with_ca_file(ca_path)
+    if cfg.is_err:
+        print("pith: cannot load ca")
+        return
+    config := cfg.ok.with_alpn(["h2"])
+
+    dialed := grpc.dial_with_config("localhost", 50051, config)
+    if dialed.is_err:
+        print("pith: cannot connect to localhost:50051")
+        return
+    ch := dialed.ok
+
+    request := echo_request(zeros(size))
+
+    mut w := 0
+    while w < warmup:
+        ch.unary(method, request) catch bytes.empty()
+        w = w + 1
+
+    start := time.now()
+    if conc <= 1:
+        run_serial(ch, method, request, calls)
+    else:
+        run_concurrent(ch, method, request, calls, conc)
+    elapsed := time.now() - start
+
+    report(size, conc, calls, elapsed)
+    ch.close()

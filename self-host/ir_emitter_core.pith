@@ -588,6 +588,12 @@ fn ir_string_expr_is_borrowed(idx: Int) -> Bool:
             # through the same retain-borrowed-returns convention
             return false
         return ir_string_expr_is_borrowed(node.children[0])
+    # a catch normalizes both arms to owned (the ok arm transfers the result
+    # payload out of the shell; the fallback arm retains a borrow — see
+    # ir_emit_catch_expr), so the result arrives owned. treating it as borrowed
+    # makes the binding retain again and leaks the payload.
+    if node.kind == "catch_expr":
+        return false
     # collection literals mint fresh containers, and collection-typed call
     # results arrive with a transferred count (user returns exclude the
     # local, runtime producers build new containers). variable, element,
@@ -681,6 +687,15 @@ fn ir_string_prepass_bind_type(parts: IrBindParts, names: List[String]) -> Strin
             # and it is exactly the lowered kind the exit cleanup releases.
             if ir_rc_kind(bind_type).len() == 0 and (val_node.kind == "method_call" or val_node.kind == "call"):
                 bind_type = ir_expr_result_kind(parts.val_idx)
+            # a catch binds the guarded result's OK value. the checker leaves
+            # the catch node's type empty for collections (and inference reports
+            # the underlying result tuple), so a list/map/set binding would be
+            # released with the wrong struct-shaped kind and leak its backing.
+            # take the ok kind the emitter itself uses for the ok field.
+            if val_node.kind == "catch_expr" and val_node.children.len() > 0:
+                catch_ok := ir_result_ok_kind_for_expr(val_node.children[0])
+                if ir_rc_kind(catch_ok).len() > 0:
+                    bind_type = catch_ok
             # `c := self.list[i]` on a generic list field: the checked/inferred
             # element type is suppressed to "unknown", so recover the element
             # type name from the field's declared `List[T]` node (the caller
@@ -4466,7 +4481,15 @@ fn ir_emit_catch_expr(node: Node) -> Int:
     # the error is being thrown away for the fallback value; drop it first
     ir_emit_release_result_error(result_r, result_tid)
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
-    ir_emit("store " + temp_name + " " + ir_expr(node.children[1]).to_string())
+    # both arms must hand back an OWNED value: the ok arm transferred the
+    # result payload out of the destructor-less tuple shell, so a borrowed
+    # fallback needs its own count. the whole catch is classified owned
+    # (ir_string_expr_is_borrowed), so without this the payload would leak
+    # (fallback) or the binding would not know to release it.
+    fallback_r := ir_expr(node.children[1])
+    if ir_string_expr_is_borrowed(node.children[1]):
+        ir_rc_retain_reg(fallback_r, ir_rc_kind(ir_infer_type(node.children[1])))
+    ir_emit("store " + temp_name + " " + fallback_r.to_string())
     ir_emit_label(merge_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)

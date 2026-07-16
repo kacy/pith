@@ -30,3 +30,12 @@ message Shape {
   double area = 10;
   sint32 offset = 11;
 }
+
+// exercises all four rpc shapes: unary, server-streaming, client-streaming,
+// and bidirectional-streaming.
+service Geometry {
+  rpc Describe(Point) returns (Shape);
+  rpc Corners(Shape) returns (stream Point);
+  rpc Assemble(stream Point) returns (Shape);
+  rpc Reflect(stream Point) returns (stream Point);
+}

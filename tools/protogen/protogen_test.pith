@@ -3,8 +3,11 @@
 # encoder emits the canonical protobuf wire bytes, byte for byte.
 
 from sample_gen import Point, Shape, encode_Point, decode_Point, encode_Shape, decode_Shape, Color_RED
+from protogen_lib import parse, generate
 import std.bytes as bytes
 import std.encoding as encoding
+import std.fs as fs
+import std.strings as strings
 
 test "a point round-trips":
     p := Point(x: 150, y: 7)
@@ -65,3 +68,41 @@ test "unset fields decode back to their defaults":
 
 fn empty_shape() -> Shape:
     return Shape(name: "", id: 0, filled: false, color: 0, center: none, vertices: [], tags: [], labels: [], blob: bytes.empty(), area: 0.0, offset: 0)
+
+fn has(text: String, needle: String) -> Bool:
+    return strings.find_all(text, needle).len() > 0
+
+# the service in sample.proto exercises all four rpc shapes; assert the
+# generator emits a typed client with the right method signatures and paths.
+# (the generated GeometryClient itself is compiled by the sample_gen import
+# above, which type-checks the stubs against std.net.grpc.)
+test "the geometry service generates typed client stubs":
+    read := fs.read("tools/protogen/sample.proto")
+    assert(not read.is_err)
+    parsed := parse(read.ok)
+    assert(not parsed.is_err)
+    gen := generate(parsed.ok)
+    assert(not gen.is_err)
+    out := gen.ok
+
+    # the client wrapper and its unary method, with the full rpc path
+    assert(has(out, "pub struct GeometryClient:"))
+    assert(has(out, "pub fn Describe(req: Point) -> Shape!grpc.GrpcError:"))
+    assert(has(out, "self.conn.unary("))
+    assert(has(out, "/sample.Geometry/Describe"))
+
+    # server-streaming: a typed handle with a collect(), reached via server_stream
+    assert(has(out, "pub struct GeometryCornersCall:"))
+    assert(has(out, "pub fn Corners(req: Shape) -> GeometryCornersCall!grpc.GrpcError:"))
+    assert(has(out, "self.conn.server_stream("))
+    assert(has(out, "pub fn collect() -> List[Point]!grpc.GrpcError:"))
+
+    # client-streaming: send / close_send / recv_response
+    assert(has(out, "pub struct GeometryAssembleCall:"))
+    assert(has(out, "self.conn.client_stream("))
+    assert(has(out, "pub fn recv_response() -> Shape!grpc.GrpcError:"))
+
+    # bidi: send / close_send / collect
+    assert(has(out, "pub struct GeometryReflectCall:"))
+    assert(has(out, "self.conn.bidi_stream("))
+    assert(has(out, "pub fn send(req: Point) -> Int:"))

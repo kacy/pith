@@ -1,0 +1,36 @@
+# `expr catch <fallback>` must not leak the heap value when expr succeeds: the ok
+# arm transfers the result payload out of the destructor-less tuple shell, so the
+# binding owns it and releases it once. it must also release the payload with the
+# right kind (a list freed as a struct leaks its backing), and a borrowed fallback
+# needs its own count. run in a loop under valgrind to catch a per-iteration leak.
+import std.bytes as bytes
+
+struct Box:
+    v: Int
+
+fn ok_bytes() -> Bytes!:
+    return bytes.from_string_utf8("abcdefgh")
+fn bad_bytes() -> Bytes!:
+    fail "no"
+fn ok_list() -> List[Int]!:
+    return [1, 2, 3, 4]
+fn ok_struct() -> Box!:
+    return Box(42)
+fn ok_str() -> String!:
+    return "streamvalue"
+
+fn main() -> Int:
+    var := bytes.from_string_utf8("fallbackvalue")
+    mut n := 0
+    mut i := 0
+    while i < 200:
+        a := ok_bytes() catch bytes.empty()   # ok arm, owned fallback
+        b := ok_bytes() catch var             # ok arm, borrowed fallback
+        c := bad_bytes() catch var            # fallback taken, borrowed
+        l := ok_list() catch []               # list: released as list, not struct
+        st := ok_struct() catch Box(0)        # struct
+        s := ok_str() catch "sfb"             # string
+        n = n + a.len() + b.len() + c.len() + l.len() + st.v + s.len()
+        i = i + 1
+    print(n.to_string())
+    return 0

@@ -3,16 +3,18 @@
 # lexes a .proto file, parses a focused proto3 subset (messages, enums, and
 # scalar / message / enum fields, singular and repeated), and generates a pith
 # module: a struct per message plus `encode_<Msg>` / `decode_<Msg>` functions
-# that ride on std.protobuf's wire codec. the generated messages are what a grpc
-# call carries — bytes in, bytes out.
+# that ride on std.protobuf's wire codec, and — for each `service` — a typed
+# `<Svc>Client` whose methods wrap std.net.grpc's unary and streaming calls.
+# messages are bytes in, bytes out; the service client encodes and decodes them.
 #
 # supported: the scalar types (int32/int64/uint32/uint64/sint32/sint64/bool/
 # string/bytes/double/fixed32/fixed64/sfixed32/sfixed64), enums (as Int fields
-# plus named constants), singular message fields (as optionals), and repeated
-# int-varint / enum / message / string / bytes fields.
+# plus named constants), singular message fields (as optionals), repeated
+# int-varint / enum / message / string / bytes fields, and grpc `service` stubs
+# for all four rpc shapes (unary, server-, client-, and bidi-streaming).
 #
-# deferred (a parse error names them): grpc `service` stubs, `oneof`, `map<>`,
-# 32-bit `float`, well-known types, proto2, and repeated sint/fixed/double.
+# deferred (a parse error names them): `oneof`, `map<>`, 32-bit `float`,
+# well-known types, proto2, and repeated sint/fixed/double.
 
 import std.bytes as bytes
 import std.strings as strings
@@ -109,11 +111,26 @@ pub struct EnumDef:
     pub name: String
     pub values: List[EnumValue]
 
+# one rpc in a service: its name, request/response message types, and whether
+# each side streams (`stream` in the .proto).
+pub struct Rpc:
+    pub name: String
+    pub req_type: String
+    pub resp_type: String
+    pub client_streaming: Bool
+    pub server_streaming: Bool
+
+# a grpc service: its name and rpcs.
+pub struct Service:
+    pub name: String
+    pub rpcs: List[Rpc]
+
 # a parsed proto file.
 pub struct ProtoFile:
     pub package: String
     pub messages: List[Message]
     pub enums: List[EnumDef]
+    pub services: List[Service]
 
 # raised on unsupported or malformed proto input.
 pub struct ParseError:
@@ -179,6 +196,7 @@ pub fn parse(src: String) -> ProtoFile!ParseError:
     mut package := ""
     messages: List[Message] := []
     enums: List[EnumDef] := []
+    services: List[Service] := []
     while not p.done():
         kw := p.peek()
         if kw == "syntax":
@@ -201,12 +219,63 @@ pub fn parse(src: String) -> ProtoFile!ParseError:
         elif kw == "enum":
             enums.push(parse_enum(p)!)
         elif kw == "service":
-            fail parse_fail("grpc 'service' stubs are not generated yet")
+            services.push(parse_service(p)!)
         elif kw == ";":
             p.advance()
         else:
             fail parse_fail("unexpected token '{kw}' at top level")
-    return ProtoFile(package: package, messages: messages, enums: enums)
+    return ProtoFile(package: package, messages: messages, enums: enums, services: services)
+
+# parse `service Name { rpc Method([stream] Req) returns ([stream] Resp); ... }`.
+fn parse_service(p: Parser) -> Service!ParseError:
+    p.expect("service")!
+    name := p.advance()
+    p.expect(chr(123))!
+    rpcs: List[Rpc] := []
+    while not p.done() and p.peek() != chr(125):
+        kw := p.peek()
+        if kw == "rpc":
+            rpcs.push(parse_rpc(p)!)
+        elif kw == "option":
+            p.advance()
+            while not p.done() and p.peek() != ";":
+                p.advance()
+            p.expect(";")!
+        elif kw == ";":
+            p.advance()
+        else:
+            fail parse_fail("unexpected token '{kw}' in service '{name}'")
+    p.expect(chr(125))!
+    return Service(name: name, rpcs: rpcs)
+
+# parse one `rpc Method([stream] Req) returns ([stream] Resp) [{}|;]`.
+fn parse_rpc(p: Parser) -> Rpc!ParseError:
+    p.expect("rpc")!
+    name := p.advance()
+    p.expect("(")!
+    mut client_streaming := false
+    if p.peek() == "stream":
+        p.advance()
+        client_streaming = true
+    req := p.advance()
+    p.expect(")")!
+    p.expect("returns")!
+    p.expect("(")!
+    mut server_streaming := false
+    if p.peek() == "stream":
+        p.advance()
+        server_streaming = true
+    resp := p.advance()
+    p.expect(")")!
+    # an rpc body `{ ... }` (method options) or a bare `;`.
+    if p.peek() == chr(123):
+        p.advance()
+        while not p.done() and p.peek() != chr(125):
+            p.advance()
+        p.expect(chr(125))!
+    else:
+        p.expect(";")!
+    return Rpc(name: name, req_type: simple_name(req), resp_type: simple_name(resp), client_streaming: client_streaming, server_streaming: server_streaming)
 
 # parse `message Name { ... }`, appending it and any nested messages/enums.
 fn parse_message(p: Parser, messages: List[Message], enums: List[EnumDef]) -> Bool!ParseError:
@@ -543,6 +612,8 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
     lines.push("")
     lines.push("from std.protobuf import ProtoError, writer, reader, WIRE_LEN")
     lines.push("import std.bytes as bytes")
+    if pf.services.len() > 0:
+        lines.push("import std.net.grpc as grpc")
     lines.push("")
 
     for e in pf.enums:
@@ -606,4 +677,129 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
         lines.push("    return m")
         lines.push("")
 
+    for svc in pf.services:
+        for ln in gen_service_lines(svc, pf.package):
+            lines.push(ln)
+
     return strings.join_lines(lines)
+
+# generate the typed client stubs for one service: a `<Svc>Client` wrapping a
+# grpc.Conn with a method per rpc, plus a handle struct for each streaming rpc.
+# the handle structs come first so the client impl can name them.
+fn gen_service_lines(svc: Service, pkg: String) -> List[String]:
+    out: List[String] := []
+    q := chr(34)
+    mut svc_path := svc.name
+    if pkg != "":
+        svc_path = "{pkg}.{svc.name}"
+
+    for rpc in svc.rpcs:
+        handle := "{svc.name}{rpc.name}Call"
+        req := rpc.req_type
+        resp := rpc.resp_type
+        derr := "{q}grpc: decode {resp} failed{q}"
+        if rpc.server_streaming and not rpc.client_streaming:
+            out.push("# a typed server-stream of {resp} messages from {svc.name}.{rpc.name}.")
+            out.push("pub struct {handle}:")
+            out.push("    pub inner: grpc.ServerStream")
+            out.push("")
+            out.push("impl {handle}:")
+            out.push("    # gather and decode every response message.")
+            out.push("    pub fn collect() -> List[{resp}]!grpc.GrpcError:")
+            out.push("        items: List[{resp}] := []")
+            out.push("        raw := grpc.collect_server_stream(self.inner)!")
+            out.push("        for frame in raw:")
+            out.push("            decoded := decode_{resp}(frame)")
+            out.push("            if decoded.is_err:")
+            out.push("                fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: {derr})")
+            out.push("            items.push(decoded.ok)")
+            out.push("        return items")
+            out.push("")
+        elif rpc.client_streaming and not rpc.server_streaming:
+            out.push("# a typed client-stream to {svc.name}.{rpc.name}.")
+            out.push("pub struct {handle}:")
+            out.push("    pub inner: grpc.ClientStream")
+            out.push("")
+            out.push("impl {handle}:")
+            out.push("    # send one request message.")
+            out.push("    pub fn send(req: {req}) -> Int:")
+            out.push("        return self.inner.send(encode_{req}(req))")
+            out.push("    # half-close the request stream.")
+            out.push("    pub fn close_send() -> Int:")
+            out.push("        return self.inner.close_send()")
+            out.push("    # read and decode the single response.")
+            out.push("    pub fn recv_response() -> {resp}!grpc.GrpcError:")
+            out.push("        raw := self.inner.recv_response()!")
+            out.push("        decoded := decode_{resp}(raw)")
+            out.push("        if decoded.is_err:")
+            out.push("            fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: {derr})")
+            out.push("        return decoded.ok")
+            out.push("")
+        elif rpc.client_streaming and rpc.server_streaming:
+            out.push("# a typed bidirectional stream for {svc.name}.{rpc.name}.")
+            out.push("pub struct {handle}:")
+            out.push("    pub inner: grpc.BidiStream")
+            out.push("")
+            out.push("impl {handle}:")
+            out.push("    # send one request message.")
+            out.push("    pub fn send(req: {req}) -> Int:")
+            out.push("        return self.inner.send(encode_{req}(req))")
+            out.push("    # half-close the request stream.")
+            out.push("    pub fn close_send() -> Int:")
+            out.push("        return self.inner.close_send()")
+            out.push("    # gather and decode every response message.")
+            out.push("    pub fn collect() -> List[{resp}]!grpc.GrpcError:")
+            out.push("        items: List[{resp}] := []")
+            out.push("        mut done := false")
+            out.push("        while not done:")
+            out.push("            msg := self.inner.recv()!")
+            out.push("            if msg.done:")
+            out.push("                done = true")
+            out.push("            else:")
+            out.push("                decoded := decode_{resp}(msg.message)")
+            out.push("                if decoded.is_err:")
+            out.push("                    fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: {derr})")
+            out.push("                items.push(decoded.ok)")
+            out.push("        return items")
+            out.push("")
+
+    out.push("# a typed grpc client for the {svc.name} service.")
+    out.push("pub struct {svc.name}Client:")
+    out.push("    conn: grpc.Conn")
+    out.push("")
+    out.push("# wrap a grpc connection in a typed {svc.name} client.")
+    out.push("pub fn new_{svc.name}Client(conn: grpc.Conn) -> {svc.name}Client:")
+    out.push("    return {svc.name}Client(conn: conn)")
+    out.push("")
+    out.push("impl {svc.name}Client:")
+    for rpc in svc.rpcs:
+        handle := "{svc.name}{rpc.name}Call"
+        req := rpc.req_type
+        resp := rpc.resp_type
+        derr := "{q}grpc: decode {resp} failed{q}"
+        path := "{q}/{svc_path}/{rpc.name}{q}"
+        if not rpc.client_streaming and not rpc.server_streaming:
+            out.push("    # unary rpc {rpc.name}.")
+            out.push("    pub fn {rpc.name}(req: {req}) -> {resp}!grpc.GrpcError:")
+            out.push("        raw := self.conn.unary({path}, encode_{req}(req))!")
+            out.push("        decoded := decode_{resp}(raw)")
+            out.push("        if decoded.is_err:")
+            out.push("            fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: {derr})")
+            out.push("        return decoded.ok")
+        elif rpc.server_streaming and not rpc.client_streaming:
+            out.push("    # server-streaming rpc {rpc.name}.")
+            out.push("    pub fn {rpc.name}(req: {req}) -> {handle}!grpc.GrpcError:")
+            out.push("        inner := self.conn.server_stream({path}, encode_{req}(req))!")
+            out.push("        return {handle}(inner: inner)")
+        elif rpc.client_streaming and not rpc.server_streaming:
+            out.push("    # client-streaming rpc {rpc.name}.")
+            out.push("    pub fn {rpc.name}() -> {handle}!grpc.GrpcError:")
+            out.push("        inner := self.conn.client_stream({path})!")
+            out.push("        return {handle}(inner: inner)")
+        else:
+            out.push("    # bidirectional-streaming rpc {rpc.name}.")
+            out.push("    pub fn {rpc.name}() -> {handle}!grpc.GrpcError:")
+            out.push("        inner := self.conn.bidi_stream({path})!")
+            out.push("        return {handle}(inner: inner)")
+    out.push("")
+    return out

@@ -18,17 +18,37 @@ pith build tools/protogen/protogen.pith
 - enums, as `Int` fields plus named `Enum_VALUE` constants
 - singular message fields, as pith optionals (`Sub?`)
 - repeated message / string / bytes / int-varint / enum fields
+- grpc `service` stubs — a typed client per service (see below)
 
 singular message fields have presence (optionals); other singular fields follow
 proto3 and skip their zero value on the wire. `decode_*` skips unknown fields, so
 it stays forward compatible.
 
+## services
+
+each `service Foo { ... }` becomes a `FooClient` wrapping a `grpc.Conn`, with a
+typed method per rpc that encodes the request and decodes the reply:
+
+- unary `rpc Bar(Req) returns (Resp)` → `client.Bar(req: Req) -> Resp!`
+- server-streaming `returns (stream Resp)` → a handle with `collect() -> List[Resp]!`
+- client-streaming `(stream Req)` → a handle with `send(req)`, `close_send()`,
+  `recv_response() -> Resp!`
+- bidi `(stream Req) returns (stream Resp)` → a handle with `send(req)`,
+  `close_send()`, `collect() -> List[Resp]!`
+
+```
+conn := grpc.dial("localhost", 50051)!
+client := new_FooClient(conn)
+resp := client.Bar(Req(...))!
+```
+
+the streaming handles wrap `std.net.grpc`'s `ServerStream` / `ClientStream` /
+`BidiStream`; reach through `.inner` for incremental, non-collecting access.
+
 ## not yet supported
 
-a clear parse error names these: grpc `service` stubs (the next step —
-generating typed client methods over `grpc.unary` and the streaming calls),
-`oneof`, `map<>`, 32-bit `float`, the well-known types, proto2, and repeated
-`sint`/`fixed`/`double`.
+a clear parse error names these: `oneof`, `map<>`, 32-bit `float`, the well-known
+types, proto2, and repeated `sint`/`fixed`/`double`.
 
 ## example
 

@@ -3,6 +3,7 @@
 
 from std.protobuf import ProtoError, writer, reader, WIRE_LEN
 import std.bytes as bytes
+import std.net.grpc as grpc
 
 # enum Color
 pub Color_UNKNOWN := 0
@@ -118,3 +119,93 @@ pub fn decode_Shape(data: Bytes) -> Shape!ProtoError:
         else:
             r.skip(tag.wire)!
     return m
+
+# a typed server-stream of Point messages from Geometry.Corners.
+pub struct GeometryCornersCall:
+    pub inner: grpc.ServerStream
+
+impl GeometryCornersCall:
+    # gather and decode every response message.
+    pub fn collect() -> List[Point]!grpc.GrpcError:
+        items: List[Point] := []
+        raw := grpc.collect_server_stream(self.inner)!
+        for frame in raw:
+            decoded := decode_Point(frame)
+            if decoded.is_err:
+                fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Point failed")
+            items.push(decoded.ok)
+        return items
+
+# a typed client-stream to Geometry.Assemble.
+pub struct GeometryAssembleCall:
+    pub inner: grpc.ClientStream
+
+impl GeometryAssembleCall:
+    # send one request message.
+    pub fn send(req: Point) -> Int:
+        return self.inner.send(encode_Point(req))
+    # half-close the request stream.
+    pub fn close_send() -> Int:
+        return self.inner.close_send()
+    # read and decode the single response.
+    pub fn recv_response() -> Shape!grpc.GrpcError:
+        raw := self.inner.recv_response()!
+        decoded := decode_Shape(raw)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Shape failed")
+        return decoded.ok
+
+# a typed bidirectional stream for Geometry.Reflect.
+pub struct GeometryReflectCall:
+    pub inner: grpc.BidiStream
+
+impl GeometryReflectCall:
+    # send one request message.
+    pub fn send(req: Point) -> Int:
+        return self.inner.send(encode_Point(req))
+    # half-close the request stream.
+    pub fn close_send() -> Int:
+        return self.inner.close_send()
+    # gather and decode every response message.
+    pub fn collect() -> List[Point]!grpc.GrpcError:
+        items: List[Point] := []
+        mut done := false
+        while not done:
+            msg := self.inner.recv()!
+            if msg.done:
+                done = true
+            else:
+                decoded := decode_Point(msg.message)
+                if decoded.is_err:
+                    fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Point failed")
+                items.push(decoded.ok)
+        return items
+
+# a typed grpc client for the Geometry service.
+pub struct GeometryClient:
+    conn: grpc.Conn
+
+# wrap a grpc connection in a typed Geometry client.
+pub fn new_GeometryClient(conn: grpc.Conn) -> GeometryClient:
+    return GeometryClient(conn: conn)
+
+impl GeometryClient:
+    # unary rpc Describe.
+    pub fn Describe(req: Point) -> Shape!grpc.GrpcError:
+        raw := self.conn.unary("/sample.Geometry/Describe", encode_Point(req))!
+        decoded := decode_Shape(raw)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Shape failed")
+        return decoded.ok
+    # server-streaming rpc Corners.
+    pub fn Corners(req: Shape) -> GeometryCornersCall!grpc.GrpcError:
+        inner := self.conn.server_stream("/sample.Geometry/Corners", encode_Shape(req))!
+        return GeometryCornersCall(inner: inner)
+    # client-streaming rpc Assemble.
+    pub fn Assemble() -> GeometryAssembleCall!grpc.GrpcError:
+        inner := self.conn.client_stream("/sample.Geometry/Assemble")!
+        return GeometryAssembleCall(inner: inner)
+    # bidirectional-streaming rpc Reflect.
+    pub fn Reflect() -> GeometryReflectCall!grpc.GrpcError:
+        inner := self.conn.bidi_stream("/sample.Geometry/Reflect")!
+        return GeometryReflectCall(inner: inner)

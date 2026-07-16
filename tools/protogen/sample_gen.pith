@@ -1,0 +1,120 @@
+# generated from a .proto file by tools/protogen; do not edit by hand.
+# proto package: sample
+
+from std.protobuf import ProtoError, writer, reader, WIRE_LEN
+import std.bytes as bytes
+
+# enum Color
+pub Color_UNKNOWN := 0
+pub Color_RED := 1
+pub Color_GREEN := 2
+pub Color_BLUE := 3
+
+# message Point
+pub struct Point:
+    pub x: Int
+    pub y: Int
+
+# encode a Point to protobuf wire bytes.
+pub fn encode_Point(m: Point) -> Bytes:
+    w := writer()
+    if m.x != 0:
+        w.write_int32(1, m.x) catch false
+    if m.y != 0:
+        w.write_int32(2, m.y) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Point from protobuf wire bytes.
+pub fn decode_Point(data: Bytes) -> Point!ProtoError:
+    m := Point(x: 0, y: 0)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.x = r.read_int64()!
+        elif tag.field == 2:
+            m.y = r.read_int64()!
+        else:
+            r.skip(tag.wire)!
+    return m
+
+# message Shape
+pub struct Shape:
+    pub name: String
+    pub id: Int
+    pub filled: Bool
+    pub color: Int
+    pub center: Point?
+    pub vertices: List[Point]
+    pub tags: List[Int]
+    pub labels: List[String]
+    pub blob: Bytes
+    pub area: Float
+    pub offset: Int
+
+# encode a Shape to protobuf wire bytes.
+pub fn encode_Shape(m: Shape) -> Bytes:
+    w := writer()
+    if m.name != "":
+        w.write_string(1, m.name) catch false
+    if m.id != 0:
+        w.write_int32(2, m.id) catch false
+    if m.filled:
+        w.write_bool(3, m.filled) catch false
+    if m.color != 0:
+        w.write_enum(4, m.color) catch false
+    if let sub = m.center:
+        w.write_message(5, encode_Point(sub)) catch false
+    for item in m.vertices:
+        w.write_message(6, encode_Point(item)) catch false
+    if m.tags.len() > 0:
+        w.write_packed_varints(7, m.tags) catch false
+    for item in m.labels:
+        w.write_string(8, item) catch false
+    if m.blob.len() > 0:
+        w.write_bytes(9, m.blob) catch false
+    if m.area != 0.0:
+        w.write_double(10, m.area) catch false
+    if m.offset != 0:
+        w.write_sint32(11, m.offset) catch false
+    out := w.bytes()
+    w.free()
+    return out
+
+# decode a Shape from protobuf wire bytes.
+pub fn decode_Shape(data: Bytes) -> Shape!ProtoError:
+    m := Shape(name: "", id: 0, filled: false, color: 0, center: none, vertices: [], tags: [], labels: [], blob: bytes.empty(), area: 0.0, offset: 0)
+    r := reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == 1:
+            m.name = r.read_string()!
+        elif tag.field == 2:
+            m.id = r.read_int64()!
+        elif tag.field == 3:
+            m.filled = r.read_bool()!
+        elif tag.field == 4:
+            m.color = r.read_enum()!
+        elif tag.field == 5:
+            m.center = decode_Point(r.read_message()!)!
+        elif tag.field == 6:
+            m.vertices.push(decode_Point(r.read_message()!)!)
+        elif tag.field == 7:
+            if tag.wire == WIRE_LEN:
+                for v in r.read_packed_varints()!:
+                    m.tags.push(v)
+            else:
+                m.tags.push(r.read_int64()!)
+        elif tag.field == 8:
+            m.labels.push(r.read_string()!)
+        elif tag.field == 9:
+            m.blob = r.read_bytes()!
+        elif tag.field == 10:
+            m.area = r.read_double()!
+        elif tag.field == 11:
+            m.offset = r.read_sint64()!
+        else:
+            r.skip(tag.wire)!
+    return m

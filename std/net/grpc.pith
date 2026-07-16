@@ -17,8 +17,13 @@
 #   r := protobuf.reader(reply)           # the echoed DummyMessage
 #   ...
 #
-# for several calls over one connection, dial() once and pass the client to
-# unary() (multiplexed over http/2). call() is the one-shot form.
+# call() opens a connection, runs one method, and closes. for several calls,
+# dial() a channel once and reuse it — each unary() multiplexes over the one
+# http/2 connection:
+#
+#   ch := grpc.dial("grpcb.in", 9001)!
+#   reply := ch.unary("/grpcbin.GRPCBin/DummyUnary", request)!
+#   ch.close()
 #
 # deferred: streaming rpcs (client/server/bidi), message compression, deadlines
 # and metadata beyond the basics, grpc-message percent-decoding, and .proto code
@@ -63,35 +68,47 @@ pub fn status_name(status: Int) -> String:
         return names[status]
     return "CODE_{status}"
 
-# open a grpc channel: an http/2 client to host:port over tls with alpn "h2".
-# reuse the returned client for many unary calls and close() it when done. pass
-# the same host to unary as the authority — grpc addresses a service by host.
-pub fn dial(host: String, port: Int) -> http2.Client!:
-    return http2.open(host, port)!
+# a grpc channel: a reusable connection to one server. dial() opens it, unary()
+# runs a method over it — as many as you like, multiplexed over the one http/2
+# connection — and close() shuts it down. `authority` is the server host, which
+# grpc uses to address the service.
+pub struct Conn:
+    client: http2.Client
+    authority: String
 
-# make a unary rpc call over an http/2 client. `authority` is the server host,
-# `full_method` is "/package.Service/Method", and `request` is the serialized
-# protobuf request message; the returned bytes are the serialized response
-# message. fails with a GrpcError on a non-OK grpc-status, a malformed response,
-# or a transport error. the client is passed in directly (rather than wrapped in
-# a channel struct) so its reader and writer tasks stay bound to the caller.
-pub fn unary(client: http2.Client, authority: String, full_method: String, request: Bytes) -> Bytes!GrpcError:
-    framed := frame_message(request)
-    resp := client.request("POST", authority, full_method, grpc_headers(), framed)
-    if resp.is_err:
-        fail GrpcError(GRPC_UNAVAILABLE, "grpc transport error: {resp.err}")
-    return handle_response(resp.ok)!
+impl Conn:
+    # run a unary rpc over this channel. `full_method` is "/package.Service/Method"
+    # and `request` is the serialized protobuf request message; the returned bytes
+    # are the serialized response message. fails with a GrpcError on a non-OK
+    # grpc-status, a malformed response, or a transport error.
+    pub fn unary(full_method: String, request: Bytes) -> Bytes!GrpcError:
+        framed := frame_message(request)
+        resp := self.client.request("POST", self.authority, full_method, grpc_headers(), framed)
+        if resp.is_err:
+            fail GrpcError(GRPC_UNAVAILABLE, "grpc transport error: {resp.err}")
+        return handle_response(resp.ok)!
 
-# make a one-shot unary call: open a connection to host:port, run the method,
-# and close. `request` is the serialized protobuf request and the result is the
-# serialized response message. this is the simplest entry point; for several
-# calls over one connection, dial() once and reuse the client with unary().
+    # close the underlying http/2 connection. the channel cannot be used after.
+    pub fn close():
+        self.client.close()
+
+# dial a grpc server: open an http/2 connection to host:port over tls with alpn
+# "h2" and return a reusable channel. reuse it for many unary() calls and
+# close() it when done.
+pub fn dial(host: String, port: Int) -> Conn!:
+    client := http2.open(host, port)!
+    return Conn(client: client, authority: host)
+
+# make a one-shot unary call: dial host:port, run the method, and close. this is
+# the simplest entry point; for several calls over one connection, dial() a
+# channel once and reuse it with unary().
 pub fn call(host: String, port: Int, full_method: String, request: Bytes) -> Bytes!GrpcError:
-    opened := http2.open(host, port)
+    opened := dial(host, port)
     if opened.is_err:
         fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot connect to {host}:{port}: {opened.err}")
-    result := unary(opened.ok, host, full_method, request)
-    opened.ok.close()
+    channel := opened.ok
+    result := channel.unary(full_method, request)
+    channel.close()
     return result!
 
 # --- framing ----------------------------------------------------------------

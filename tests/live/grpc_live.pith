@@ -1,4 +1,4 @@
-# live grpc interop: a real unary call over the native (pure-pith) http/2
+# live grpc interop: real unary calls over the native (pure-pith) http/2
 # transport. needs external network to reach a public grpc server, and skips
 # when unreachable so the deterministic coverage stays in std/net/grpc's own
 # tests.
@@ -9,25 +9,22 @@
 # and parses the reply, std.net.grpc frames it and reads the grpc-status
 # trailer, and std.net.http2 carries it over pith's own tls 1.3 with alpn "h2".
 # grpcb.in's GRPCBin/DummyUnary echoes the DummyMessage back, so a correct
-# round-trip returns our own field 1 string.
+# round-trip returns our own field 1 string. the test dials one channel and
+# runs two calls over it, so it also proves the connection is reusable.
 
 import std.net.grpc as grpc
 import std.protobuf as protobuf
-import std.bytes as bytes
 
-test "a unary call round-trips through grpcb.in":
-    # DummyMessage { f_string = 1 }
+# a DummyMessage { f_string = 1 } request carrying `name`.
+fn dummy_request(name: String) -> Bytes!protobuf.ProtoError:
     w := protobuf.writer()
-    w.write_string(1, "pith")!
-    request := w.bytes()
+    w.write_string(1, name)!
+    out := w.bytes()
     w.free()
+    return out
 
-    attempt := grpc.call("grpcb.in", 9001, "/grpcbin.GRPCBin/DummyUnary", request)
-    if attempt.is_err:
-        skip_test("grpc call did not complete: {attempt.err.message}")
-    reply := attempt.ok
-
-    # the echoed DummyMessage carries our string back in field 1.
+# the f_string (field 1) the echoed DummyMessage carries back.
+fn dummy_echo(reply: Bytes) -> String!protobuf.ProtoError:
     r := protobuf.reader(reply)
     mut echoed := ""
     while not r.at_end():
@@ -36,4 +33,22 @@ test "a unary call round-trips through grpcb.in":
             echoed = r.read_string()!
         else:
             r.skip(tag.wire)!
-    assert_eq(echoed, "pith")
+    return echoed
+
+test "two unary calls reuse one grpc channel":
+    opened := grpc.dial("grpcb.in", 9001)
+    if opened.is_err:
+        skip_test("grpc dial did not complete: {opened.err}")
+    channel := opened.ok
+
+    first := channel.unary("/grpcbin.GRPCBin/DummyUnary", dummy_request("pith")!)
+    if first.is_err:
+        channel.close()
+        skip_test("grpc call did not complete: {first.err.message}")
+    assert_eq(dummy_echo(first.ok)!, "pith")
+
+    second := channel.unary("/grpcbin.GRPCBin/DummyUnary", dummy_request("grpc")!)
+    channel.close()
+    if second.is_err:
+        skip_test("second grpc call did not complete: {second.err.message}")
+    assert_eq(dummy_echo(second.ok)!, "grpc")

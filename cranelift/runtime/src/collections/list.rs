@@ -51,6 +51,7 @@ pub enum ListTypeTag {
     String,    // PithString - needs retain/release
     List,      // Nested list - needs retain/release
     Map,       // Map - needs retain/release
+    Struct,    // struct handle - needs retain/release (rc-counted, magic-checked)
 }
 
 pub const LIST_IMPL_ELEM_SIZE_OFFSET: i32 = std::mem::offset_of!(ListImpl, elem_size) as i32;
@@ -232,6 +233,7 @@ unsafe fn retain_element(tag: ListTypeTag, raw: i64) {
         }
         ListTypeTag::List => pith_list_retain_handle(raw),
         ListTypeTag::Map => crate::collections::map::pith_map_retain_handle(raw),
+        ListTypeTag::Struct => crate::runtime_core::pith_struct_retain(raw),
         ListTypeTag::Primitive => {}
     }
 }
@@ -241,6 +243,7 @@ unsafe fn release_element(tag: ListTypeTag, raw: i64) {
         ListTypeTag::String => crate::pith_cstring_release(raw as *const i8),
         ListTypeTag::List => pith_list_release_handle(raw),
         ListTypeTag::Map => crate::collections::map::pith_map_release_handle(raw),
+        ListTypeTag::Struct => crate::runtime_core::pith_struct_release(raw),
         ListTypeTag::Primitive => {}
     }
 }
@@ -314,12 +317,22 @@ pub unsafe extern "C" fn pith_list_new_nested_map() -> PithList {
     pith_list_new(8, 3)
 }
 
+/// List that owns struct-handle elements (List[SomeStruct]): push/insert
+/// retain, and the free-time cascade releases each element so the struct
+/// headers don't leak. rc-counted and magic-checked, so a struct shared with
+/// a variable or another list is not double-freed.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_new_struct() -> PithList {
+    pith_list_new(8, 4)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithList {
     let tag = match type_tag {
         1 => ListTypeTag::String,
         2 => ListTypeTag::List,
         3 => ListTypeTag::Map,
+        4 => ListTypeTag::Struct,
         _ => ListTypeTag::Primitive,
     };
 

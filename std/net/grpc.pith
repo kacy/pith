@@ -35,6 +35,7 @@ import std.protobuf as protobuf
 import std.bytes as bytes
 import std.bits as bits
 import std.encoding as encoding
+import std.net.tls as tls
 
 # grpc status codes (the grpc-status trailer). 0 is success; the rest are
 # errors. see https://grpc.io/docs/guides/status-codes/.
@@ -97,6 +98,14 @@ impl Conn:
 # close() it when done.
 pub fn dial(host: String, port: Int) -> Conn!:
     client := http2.open(host, port)!
+    return Conn(client: client, authority: host)
+
+# dial a grpc server using the caller's tls `config` (which must offer alpn
+# "h2") — for example one built with tls.client_config_with_ca_file to trust a
+# private ca, for a server whose cert the system roots don't cover. otherwise
+# like dial.
+pub fn dial_with_config(host: String, port: Int, config: tls.Config) -> Conn!:
+    client := http2.open_with_config(host, port, config)!
     return Conn(client: client, authority: host)
 
 # make a one-shot unary call: dial host:port, run the method, and close. this is
@@ -282,3 +291,12 @@ test "a protobuf request round-trips through grpc framing":
     tag := r.read_tag()!
     assert_eq(tag.field, 1)
     assert_eq(r.read_string()!, "pith")
+
+test "a private-ca h2 config builds for the dial_with_config path":
+    # the config dial_with_config (and http2.open_with_config) accept: trust a
+    # private ca from a file and offer alpn "h2". this is what lets a grpc client
+    # reach a server whose cert the system roots don't cover — e.g. a local
+    # benchmark server. a live dial with it is exercised in tests/live.
+    cfg := tls.client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!.with_alpn(["h2"])
+    # a real config has a non-negative handle; the error sentinels are negative.
+    assert(cfg.handle >= 0)

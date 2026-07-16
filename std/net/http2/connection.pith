@@ -268,10 +268,10 @@ impl Connection:
         if self.live:
             tls.conn_from_handle(self.tls_handle).close()
 
-# open a connection to `host`:`port` over tls with alpn "h2" and run the
-# handshake. fails if the peer does not negotiate http/2.
-pub fn connect(host: String, port: Int) -> Connection!:
-    config := tls.client_config()!.with_alpn(["h2"])
+# open a connection to `host`:`port` using the caller's tls `config` and run the
+# handshake. the config must offer alpn "h2"; use this to trust a private ca or
+# otherwise customize tls. fails if the peer does not negotiate http/2.
+pub fn connect_with_config(host: String, port: Int, config: tls.Config) -> Connection!:
     session := tls.dial_with_config(host, port, host, config)!
     negotiated := session.negotiated_protocol()
     if negotiated != "h2":
@@ -280,6 +280,11 @@ pub fn connect(host: String, port: Int) -> Connection!:
     conn := new_live_connection(session.handle)
     conn.handshake()!
     return conn
+
+# open a connection to `host`:`port` over tls with alpn "h2", trusting the system
+# roots, and run the handshake. fails if the peer does not negotiate http/2.
+pub fn connect(host: String, port: Int) -> Connection!:
+    return connect_with_config(host, port, tls.client_config()!.with_alpn(["h2"]))!
 
 # the parts of an https url a request needs: where to connect and what to ask
 # for. `authority` is the value of the :authority pseudo-header (host, plus the
@@ -431,10 +436,10 @@ pub struct Client:
 fn idle_writer() -> Int:
     return 0
 
-# open a multiplexed client to host:port over tls with alpn "h2". spawns the
-# reader and writer tasks; call close() to stop them and drop the connection.
-pub fn open(host: String, port: Int) -> Client!:
-    conn := connect(host, port)!
+# build a multiplexed client over an already-open connection: spawn the reader
+# and writer tasks and wire up the stream table. shared by open and
+# open_with_config.
+fn client_from_connection(conn: Connection) -> Client:
     ids: List[Int] := []
     table: Map[Int, Channel[StreamEvent]] := {}
     windows: Map[Int, Int] := {}
@@ -447,6 +452,19 @@ pub fn open(host: String, port: Int) -> Client!:
     client := Client(conn, Mutex(), 1, table, ids, outbound, closed, false, 0, writer, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP))
     spawn reader_loop(client)
     return client
+
+# open a multiplexed client to host:port over tls with alpn "h2", trusting the
+# system roots. spawns the reader and writer tasks; call close() to stop them and
+# drop the connection.
+pub fn open(host: String, port: Int) -> Client!:
+    conn := connect(host, port)!
+    return client_from_connection(conn)
+
+# open a multiplexed client using the caller's tls `config` (which must offer
+# alpn "h2") — for example one that trusts a private ca. otherwise like open.
+pub fn open_with_config(host: String, port: Int, config: tls.Config) -> Client!:
+    conn := connect_with_config(host, port, config)!
+    return client_from_connection(conn)
 
 # open a multiplexed client from an https url (using its host and port).
 pub fn open_url(url_string: String) -> Client!:

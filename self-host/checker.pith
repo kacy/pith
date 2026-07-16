@@ -549,8 +549,23 @@ fn check_weak_field(fname: String, ftid: Int):
         return
     report_error("E249", "weak field '" + fname + "' must be an optional struct type (T?)")
 
+# builtin type names the compiler special-cases. a user struct or enum that
+# reuses one of these silently shadows the builtin and miscompiles anything that
+# relies on it — e.g. a `struct Channel` corrupts every `Channel[T]` in scope, so
+# an imported module's internal channels stop working with no error. reject the
+# name instead of letting it shadow.
+fn is_reserved_type_name(name: String) -> Bool:
+    reserved := ["Int", "Float", "Bool", "String", "Bytes", "Void", "List", "Map", "Channel", "Task", "Mutex", "WaitGroup", "Semaphore", "AtomicInt"]
+    for r in reserved:
+        if strings_equal(name, r):
+            return true
+    return false
+
 fn register_struct_declaration(node_idx: Int, node: Node):
     name := node.value
+    if is_reserved_type_name(name):
+        report_error_at(node_idx, "E250", "'" + name + "' is a builtin type name and cannot be used as a struct name")
+        return
     if declaration_has_generic_params(node):
         register_generic_declaration(name, node_idx)
         define_binding(current_scope, name, TID_ERR, false)
@@ -605,6 +620,9 @@ fn register_struct_declaration(node_idx: Int, node: Node):
 
 fn register_enum_declaration(node_idx: Int, node: Node):
     name := node.value
+    if is_reserved_type_name(name):
+        report_error_at(node_idx, "E250", "'" + name + "' is a builtin type name and cannot be used as an enum name")
+        return
     if declaration_has_generic_params(node):
         register_generic_declaration(name, node_idx)
         define_binding(current_scope, name, TID_ERR, false)

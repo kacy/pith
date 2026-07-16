@@ -1,0 +1,267 @@
+# std.net.grpc — a minimal unary grpc client over pith's native http/2.
+#
+# grpc is http/2 with a fixed message framing and a status carried in the
+# trailers. a unary call POSTs to /<package>.<Service>/<Method> with
+# content-type application/grpc, sends one length-prefixed protobuf message as
+# the request body, and reads one length-prefixed message back plus a
+# grpc-status trailer.
+#
+# this layer handles the transport and the message framing; it moves raw message
+# bytes. build the request and parse the response with std.protobuf (bytes in,
+# bytes out), which keeps grpc usable without code generation:
+#
+#   w := protobuf.writer()
+#   w.write_string(1, "pith")!            # DummyMessage { f_string = 1 }
+#   reply := grpc.call("grpcb.in", 9001, "/grpcbin.GRPCBin/DummyUnary", w.bytes())!
+#   w.free()
+#   r := protobuf.reader(reply)           # the echoed DummyMessage
+#   ...
+#
+# for several calls over one connection, dial() once and pass the client to
+# unary() (multiplexed over http/2). call() is the one-shot form.
+#
+# deferred: streaming rpcs (client/server/bidi), message compression, deadlines
+# and metadata beyond the basics, grpc-message percent-decoding, and .proto code
+# generation.
+
+import std.net.http2.hpack as hpack
+import std.net.http2.connection as http2
+import std.protobuf as protobuf
+import std.bytes as bytes
+import std.bits as bits
+import std.encoding as encoding
+
+# grpc status codes (the grpc-status trailer). 0 is success; the rest are
+# errors. see https://grpc.io/docs/guides/status-codes/.
+pub GRPC_OK := 0
+pub GRPC_CANCELLED := 1
+pub GRPC_UNKNOWN := 2
+pub GRPC_INVALID_ARGUMENT := 3
+pub GRPC_DEADLINE_EXCEEDED := 4
+pub GRPC_NOT_FOUND := 5
+pub GRPC_ALREADY_EXISTS := 6
+pub GRPC_PERMISSION_DENIED := 7
+pub GRPC_RESOURCE_EXHAUSTED := 8
+pub GRPC_FAILED_PRECONDITION := 9
+pub GRPC_ABORTED := 10
+pub GRPC_OUT_OF_RANGE := 11
+pub GRPC_UNIMPLEMENTED := 12
+pub GRPC_INTERNAL := 13
+pub GRPC_UNAVAILABLE := 14
+pub GRPC_DATA_LOSS := 15
+pub GRPC_UNAUTHENTICATED := 16
+
+# a failed grpc call: the numeric grpc-status and the server's message.
+pub struct GrpcError:
+    pub status: Int
+    pub message: String
+
+# the human name of a grpc-status code, for error messages and logging.
+pub fn status_name(status: Int) -> String:
+    names := ["OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED"]
+    if status >= 0 and status < names.len():
+        return names[status]
+    return "CODE_{status}"
+
+# open a grpc channel: an http/2 client to host:port over tls with alpn "h2".
+# reuse the returned client for many unary calls and close() it when done. pass
+# the same host to unary as the authority — grpc addresses a service by host.
+pub fn dial(host: String, port: Int) -> http2.Client!:
+    return http2.open(host, port)!
+
+# make a unary rpc call over an http/2 client. `authority` is the server host,
+# `full_method` is "/package.Service/Method", and `request` is the serialized
+# protobuf request message; the returned bytes are the serialized response
+# message. fails with a GrpcError on a non-OK grpc-status, a malformed response,
+# or a transport error. the client is passed in directly (rather than wrapped in
+# a channel struct) so its reader and writer tasks stay bound to the caller.
+pub fn unary(client: http2.Client, authority: String, full_method: String, request: Bytes) -> Bytes!GrpcError:
+    framed := frame_message(request)
+    resp := client.request("POST", authority, full_method, grpc_headers(), framed)
+    if resp.is_err:
+        fail GrpcError(GRPC_UNAVAILABLE, "grpc transport error: {resp.err}")
+    return handle_response(resp.ok)!
+
+# make a one-shot unary call: open a connection to host:port, run the method,
+# and close. `request` is the serialized protobuf request and the result is the
+# serialized response message. this is the simplest entry point; for several
+# calls over one connection, dial() once and reuse the client with unary().
+pub fn call(host: String, port: Int, full_method: String, request: Bytes) -> Bytes!GrpcError:
+    opened := http2.open(host, port)
+    if opened.is_err:
+        fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot connect to {host}:{port}: {opened.err}")
+    result := unary(opened.ok, host, full_method, request)
+    opened.ok.close()
+    return result!
+
+# --- framing ----------------------------------------------------------------
+
+# the request headers a grpc call sends alongside the four http/2 pseudo-headers.
+fn grpc_headers() -> List[hpack.HeaderField]:
+    return [hpack.header_field("content-type", "application/grpc"), hpack.header_field("te", "trailers"), hpack.header_field("grpc-encoding", "identity"), hpack.header_field("grpc-accept-encoding", "identity")]
+
+# frame a message for the wire: a one-byte compression flag (0 = identity), a
+# big-endian uint32 length, then the message bytes. writes to a fresh in-memory
+# buffer cannot fail, so their results are discarded.
+fn frame_message(message: Bytes) -> Bytes:
+    buf := bytes.buffer()
+    n := message.len()
+    header := [0, bits.band(bits.shr(n, 24), 255), bits.band(bits.shr(n, 16), 255), bits.band(bits.shr(n, 8), 255), bits.band(n, 255)]
+    for b in header:
+        buf.write_byte(b) catch 0
+    if n > 0:
+        buf.write(message) catch 0
+    out := buf.bytes()
+    buf.free()
+    return out
+
+# read one length-prefixed message out of a response body: skip the flag, read
+# the big-endian length, and return the message bytes. compression is rejected.
+fn parse_message(body: Bytes) -> Bytes!GrpcError:
+    if body.len() < 5:
+        fail GrpcError(GRPC_INTERNAL, "grpc response frame is shorter than its five-byte header")
+    if body[0] != 0:
+        fail GrpcError(GRPC_UNIMPLEMENTED, "grpc message compression is not supported")
+    length := read_u32(body, 1)
+    if 5 + length > body.len():
+        fail GrpcError(GRPC_INTERNAL, "grpc response frame length runs past the body")
+    return body.slice(5, 5 + length)
+
+# read a big-endian uint32 from `data` at `off`.
+fn read_u32(data: Bytes, off: Int) -> Int:
+    return bits.bor(bits.bor(bits.shl(data[off], 24), bits.shl(data[off + 1], 16)), bits.bor(bits.shl(data[off + 2], 8), data[off + 3]))
+
+# --- response handling ------------------------------------------------------
+
+# turn a completed http/2 response into the grpc result: the response message
+# bytes on OK, or a GrpcError carrying the server's status and message.
+fn handle_response(response: http2.Response) -> Bytes!GrpcError:
+    return grpc_result(response.status, response.headers, response.trailers, response.body)!
+
+# the core of handle_response, over the response parts directly, so it can be
+# driven in tests without constructing a transport Response.
+fn grpc_result(http_status: Int, headers: List[hpack.HeaderField], trailers: List[hpack.HeaderField], body: Bytes) -> Bytes!GrpcError:
+    status := status_from(headers, trailers, http_status)
+    if status != GRPC_OK:
+        fail GrpcError(status, message_from(headers, trailers))
+    return parse_message(body)!
+
+# the grpc-status: from the trailers if present, else the initial headers (a
+# trailers-only error response), else derived from the http status (grpc
+# requires 200, so anything else is an error).
+fn status_from(headers: List[hpack.HeaderField], trailers: List[hpack.HeaderField], http_status: Int) -> Int:
+    if has_header(trailers, "grpc-status"):
+        return parse_status(find_header(trailers, "grpc-status"))
+    if has_header(headers, "grpc-status"):
+        return parse_status(find_header(headers, "grpc-status"))
+    if http_status != 200:
+        return GRPC_UNKNOWN
+    return GRPC_OK
+
+# the grpc-message (the human-readable error detail), from the trailers or the
+# initial headers; "" when the server sends none.
+fn message_from(headers: List[hpack.HeaderField], trailers: List[hpack.HeaderField]) -> String:
+    message := find_header(trailers, "grpc-message")
+    if message != "":
+        return message
+    return find_header(headers, "grpc-message")
+
+# parse a decimal grpc-status value; an empty or non-numeric value reads as 0.
+fn parse_status(text: String) -> Int:
+    digits := bytes.from_string_utf8(text)
+    mut value := 0
+    mut i := 0
+    while i < digits.len():
+        c := digits[i]
+        if c < 48 or c > 57:
+            return value
+        value = (value * 10) + (c - 48)
+        i = i + 1
+    return value
+
+# the value of a header field by name, or "" when absent.
+fn find_header(fields: List[hpack.HeaderField], name: String) -> String:
+    for f in fields:
+        if f.name == name:
+            return f.value
+    return ""
+
+# whether a header field is present.
+fn has_header(fields: List[hpack.HeaderField], name: String) -> Bool:
+    for f in fields:
+        if f.name == name:
+            return true
+    return false
+
+# ----------------------------------------------------------------------------
+
+fn trailer(status: Int) -> List[hpack.HeaderField]:
+    return [hpack.header_field("grpc-status", "{status}")]
+
+test "a message frames with a zero flag and a big-endian length":
+    framed := frame_message(encoding.from_hex("089601")!)
+    assert_eq(encoding.to_hex(framed), "0000000003089601")
+
+test "an empty message frames to just the five-byte header":
+    assert_eq(encoding.to_hex(frame_message(bytes.empty())), "0000000000")
+
+test "parse_message round-trips a framed message":
+    payload := encoding.from_hex("08961a")!
+    assert_eq(parse_message(frame_message(payload))!, payload)
+
+test "parse_message rejects a truncated frame":
+    result := parse_message(encoding.from_hex("000000")!)
+    assert(result.is_err)
+    assert_eq(result.err.status, GRPC_INTERNAL)
+
+test "parse_message rejects a compressed frame":
+    result := parse_message(encoding.from_hex("0100000000")!)
+    assert(result.is_err)
+    assert_eq(result.err.status, GRPC_UNIMPLEMENTED)
+
+test "parse_status reads a decimal grpc-status":
+    assert_eq(parse_status("0"), 0)
+    assert_eq(parse_status("5"), 5)
+    assert_eq(parse_status("16"), 16)
+    assert_eq(parse_status(""), 0)
+
+test "status_name maps the standard codes":
+    assert_eq(status_name(GRPC_OK), "OK")
+    assert_eq(status_name(GRPC_NOT_FOUND), "NOT_FOUND")
+    assert_eq(status_name(GRPC_UNAUTHENTICATED), "UNAUTHENTICATED")
+
+test "an OK response yields the message bytes":
+    message := encoding.from_hex("0a0470697468")!
+    assert_eq(grpc_result(200, [], trailer(GRPC_OK), frame_message(message))!, message)
+
+test "a non-OK grpc-status becomes a typed error":
+    trailers := [hpack.header_field("grpc-status", "5"), hpack.header_field("grpc-message", "missing")]
+    result := grpc_result(200, [], trailers, bytes.empty())
+    assert(result.is_err)
+    assert_eq(result.err.status, GRPC_NOT_FOUND)
+    assert_eq(result.err.message, "missing")
+
+test "a trailers-only error is read from the initial headers":
+    headers := [hpack.header_field("grpc-status", "12")]
+    result := grpc_result(200, headers, [], bytes.empty())
+    assert(result.is_err)
+    assert_eq(result.err.status, GRPC_UNIMPLEMENTED)
+
+test "a non-200 response without a grpc-status is an error":
+    result := grpc_result(502, [], [], bytes.empty())
+    assert(result.is_err)
+    assert_eq(result.err.status, GRPC_UNKNOWN)
+
+test "a protobuf request round-trips through grpc framing":
+    w := protobuf.writer()
+    w.write_string(1, "pith")!
+    request := w.bytes()
+    w.free()
+
+    # the server echoes: frame the request as if it were the response body.
+    reply := grpc_result(200, [], trailer(GRPC_OK), frame_message(request))!
+
+    r := protobuf.reader(reply)
+    tag := r.read_tag()!
+    assert_eq(tag.field, 1)
+    assert_eq(r.read_string()!, "pith")

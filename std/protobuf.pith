@@ -82,7 +82,7 @@ impl Writer:
     # write a base-128 varint. a 64-bit value takes at most ten bytes; negative
     # ints are encoded as their full two's-complement width, matching how
     # protobuf sign-extends an int32/int64.
-    fn write_varint(value: Int) -> Bool!ProtoError:
+    pub fn write_varint(value: Int) -> Bool!ProtoError:
         mut v := value
         mut i := 0
         while i < 10:
@@ -96,57 +96,66 @@ impl Writer:
         fail proto_fail("varint encoding overflow")
 
     # write a field key: (field_number << 3) | wire_type.
-    fn write_tag(field: Int, wire: Int) -> Bool!ProtoError:
+    pub fn write_tag(field: Int, wire: Int) -> Bool!ProtoError:
         return self.write_varint(bits.bor(bits.shl(field, 3), wire))
 
     # write an int32/int64/uint32/uint64/enum field (a varint).
-    fn write_int32(field: Int, value: Int) -> Bool!ProtoError:
+    pub fn write_int32(field: Int, value: Int) -> Bool!ProtoError:
         self.write_tag(field, WIRE_VARINT)!
         return self.write_varint(value)
 
-    fn write_int64(field: Int, value: Int) -> Bool!ProtoError:
+    # write an int64 field (a varint; same wire form as int32).
+    pub fn write_int64(field: Int, value: Int) -> Bool!ProtoError:
         return self.write_int32(field, value)
 
-    fn write_uint32(field: Int, value: Int) -> Bool!ProtoError:
+    # write a uint32 field (a varint).
+    pub fn write_uint32(field: Int, value: Int) -> Bool!ProtoError:
         return self.write_int32(field, value)
 
-    fn write_uint64(field: Int, value: Int) -> Bool!ProtoError:
+    # write a uint64 field (a varint).
+    pub fn write_uint64(field: Int, value: Int) -> Bool!ProtoError:
         return self.write_int32(field, value)
 
-    fn write_enum(field: Int, value: Int) -> Bool!ProtoError:
+    # write an enum field (a varint).
+    pub fn write_enum(field: Int, value: Int) -> Bool!ProtoError:
         return self.write_int32(field, value)
 
     # write a bool field (varint 0 or 1).
-    fn write_bool(field: Int, value: Bool) -> Bool!ProtoError:
+    pub fn write_bool(field: Int, value: Bool) -> Bool!ProtoError:
         self.write_tag(field, WIRE_VARINT)!
         if value:
             return self.write_varint(1)
         return self.write_varint(0)
 
     # write a sint32/sint64 field, zigzag-encoded so small negatives stay small.
-    fn write_sint32(field: Int, value: Int) -> Bool!ProtoError:
+    pub fn write_sint32(field: Int, value: Int) -> Bool!ProtoError:
         self.write_tag(field, WIRE_VARINT)!
         return self.write_varint(zigzag_encode(value))
 
-    fn write_sint64(field: Int, value: Int) -> Bool!ProtoError:
+    # write a sint64 field, zigzag-encoded.
+    pub fn write_sint64(field: Int, value: Int) -> Bool!ProtoError:
         return self.write_sint32(field, value)
 
-    fn write_fixed32(field: Int, value: Int) -> Bool!ProtoError:
+    # write a fixed32 field (little-endian 32-bit).
+    pub fn write_fixed32(field: Int, value: Int) -> Bool!ProtoError:
         self.write_tag(field, WIRE_I32)!
         return self.put_fixed32(value)
 
-    fn write_sfixed32(field: Int, value: Int) -> Bool!ProtoError:
+    # write an sfixed32 field (little-endian 32-bit).
+    pub fn write_sfixed32(field: Int, value: Int) -> Bool!ProtoError:
         return self.write_fixed32(field, value)
 
-    fn write_fixed64(field: Int, value: Int) -> Bool!ProtoError:
+    # write a fixed64 field (little-endian 64-bit).
+    pub fn write_fixed64(field: Int, value: Int) -> Bool!ProtoError:
         self.write_tag(field, WIRE_I64)!
         return self.put_fixed64(value)
 
-    fn write_sfixed64(field: Int, value: Int) -> Bool!ProtoError:
+    # write an sfixed64 field (little-endian 64-bit).
+    pub fn write_sfixed64(field: Int, value: Int) -> Bool!ProtoError:
         return self.write_fixed64(field, value)
 
     # write a double field (64-bit ieee754, little-endian).
-    fn write_double(field: Int, value: Float) -> Bool!ProtoError:
+    pub fn write_double(field: Int, value: Float) -> Bool!ProtoError:
         return self.write_fixed64(field, float_to_bits(value))
 
     fn put_fixed32(value: Int) -> Bool!ProtoError:
@@ -161,22 +170,22 @@ impl Writer:
         return self.put_fixed32(bits.shr(value, 32))
 
     # write a utf8 string field (length-delimited).
-    fn write_string(field: Int, text: String) -> Bool!ProtoError:
+    pub fn write_string(field: Int, text: String) -> Bool!ProtoError:
         return self.write_bytes(field, bytes.from_string_utf8(text))
 
     # write a bytes field (length-delimited).
-    fn write_bytes(field: Int, data: Bytes) -> Bool!ProtoError:
+    pub fn write_bytes(field: Int, data: Bytes) -> Bool!ProtoError:
         self.write_tag(field, WIRE_LEN)!
         self.write_varint(data.len())!
         return self.put_bytes(data)
 
     # write an embedded message field: its own encoded bytes, length-prefixed.
-    fn write_message(field: Int, message: Bytes) -> Bool!ProtoError:
+    pub fn write_message(field: Int, message: Bytes) -> Bool!ProtoError:
         return self.write_bytes(field, message)
 
     # write a packed repeated varint field (proto3's default for repeated
     # scalars): all the varints back to back inside one length-delimited field.
-    fn write_packed_varints(field: Int, values: List[Int]) -> Bool!ProtoError:
+    pub fn write_packed_varints(field: Int, values: List[Int]) -> Bool!ProtoError:
         inner := writer()
         for value in values:
             inner.write_varint(value)!
@@ -186,11 +195,11 @@ impl Writer:
         return true
 
     # the encoded bytes so far. the writer is still usable after this.
-    fn bytes() -> Bytes:
+    pub fn bytes() -> Bytes:
         return self.buf.bytes()
 
     # release the underlying buffer.
-    fn free():
+    pub fn free():
         self.buf.free()
 
 # --- reader -----------------------------------------------------------------
@@ -206,11 +215,11 @@ pub fn reader(data: Bytes) -> Reader:
 
 impl Reader:
     # true once every byte has been consumed.
-    fn at_end() -> Bool:
+    pub fn at_end() -> Bool:
         return self.pos >= self.data.len()
 
     # bytes left from the cursor.
-    fn remaining() -> Int:
+    pub fn remaining() -> Int:
         if self.pos >= self.data.len():
             return 0
         return self.data.len() - self.pos
@@ -233,7 +242,7 @@ impl Reader:
         return out
 
     # read a base-128 varint.
-    fn read_varint() -> Int!ProtoError:
+    pub fn read_varint() -> Int!ProtoError:
         mut result := 0
         mut shift := 0
         mut count := 0
@@ -247,40 +256,45 @@ impl Reader:
         fail proto_fail("varint too long")
 
     # read a field key into its field number and wire type.
-    fn read_tag() -> Tag!ProtoError:
+    pub fn read_tag() -> Tag!ProtoError:
         key := self.read_varint()!
         return Tag(field: bits.shr(key, 3), wire: bits.band(key, 7))
 
     # read an int32/int64/uint field (a varint); negatives come back as
     # sign-extended ints.
-    fn read_int64() -> Int!ProtoError:
+    pub fn read_int64() -> Int!ProtoError:
         return self.read_varint()
 
-    fn read_int32() -> Int!ProtoError:
+    # read an int32 field (a varint).
+    pub fn read_int32() -> Int!ProtoError:
         return self.read_varint()
 
-    fn read_uint64() -> Int!ProtoError:
+    # read a uint64 field (a varint).
+    pub fn read_uint64() -> Int!ProtoError:
         return self.read_varint()
 
-    fn read_uint32() -> Int!ProtoError:
+    # read a uint32 field (a varint).
+    pub fn read_uint32() -> Int!ProtoError:
         return self.read_varint()
 
-    fn read_enum() -> Int!ProtoError:
+    # read an enum field (a varint).
+    pub fn read_enum() -> Int!ProtoError:
         return self.read_varint()
 
     # read a bool field.
-    fn read_bool() -> Bool!ProtoError:
+    pub fn read_bool() -> Bool!ProtoError:
         return self.read_varint()! != 0
 
     # read a zigzag-encoded sint32/sint64 field.
-    fn read_sint64() -> Int!ProtoError:
+    pub fn read_sint64() -> Int!ProtoError:
         return zigzag_decode(self.read_varint()!)
 
-    fn read_sint32() -> Int!ProtoError:
+    # read a zigzag-encoded sint32 field.
+    pub fn read_sint32() -> Int!ProtoError:
         return self.read_sint64()
 
     # read a little-endian 32-bit fixed field (unsigned).
-    fn read_fixed32() -> Int!ProtoError:
+    pub fn read_fixed32() -> Int!ProtoError:
         b0 := self.read_byte()!
         b1 := self.read_byte()!
         b2 := self.read_byte()!
@@ -288,36 +302,37 @@ impl Reader:
         return bits.bor(bits.bor(b0, bits.shl(b1, 8)), bits.bor(bits.shl(b2, 16), bits.shl(b3, 24)))
 
     # read a little-endian 64-bit fixed field (raw bits).
-    fn read_fixed64() -> Int!ProtoError:
+    pub fn read_fixed64() -> Int!ProtoError:
         low := self.read_fixed32()!
         high := self.read_fixed32()!
         return bits.bor(low, bits.shl(high, 32))
 
     # read a signed little-endian 32-bit fixed field (sign-extended).
-    fn read_sfixed32() -> Int!ProtoError:
+    pub fn read_sfixed32() -> Int!ProtoError:
         raw := self.read_fixed32()!
         if raw >= 2147483648:
             return raw - 4294967296
         return raw
 
-    fn read_sfixed64() -> Int!ProtoError:
+    # read a signed little-endian 64-bit fixed field.
+    pub fn read_sfixed64() -> Int!ProtoError:
         return self.read_fixed64()
 
     # read a double field (64-bit ieee754).
-    fn read_double() -> Float!ProtoError:
+    pub fn read_double() -> Float!ProtoError:
         return float_from_bits(self.read_fixed64()!)
 
     # read a length-delimited field's raw bytes.
-    fn read_bytes() -> Bytes!ProtoError:
+    pub fn read_bytes() -> Bytes!ProtoError:
         length := self.read_varint()!
         return self.read_raw(length)
 
     # read a length-delimited field as an embedded message's bytes.
-    fn read_message() -> Bytes!ProtoError:
+    pub fn read_message() -> Bytes!ProtoError:
         return self.read_bytes()
 
     # read a length-delimited field as a utf8 string.
-    fn read_string() -> String!ProtoError:
+    pub fn read_string() -> String!ProtoError:
         raw := self.read_bytes()!
         decoded := bytes.decode_utf8(raw)
         if decoded.is_err:
@@ -325,7 +340,7 @@ impl Reader:
         return decoded.ok
 
     # read a packed repeated varint field into a list.
-    fn read_packed_varints() -> List[Int]!ProtoError:
+    pub fn read_packed_varints() -> List[Int]!ProtoError:
         payload := self.read_bytes()!
         sub := reader(payload)
         out: List[Int] := []
@@ -335,7 +350,7 @@ impl Reader:
 
     # skip an unknown field of the given wire type, leaving the cursor on the
     # next field. this is what keeps a decoder forward-compatible.
-    fn skip(wire: Int) -> Bool!ProtoError:
+    pub fn skip(wire: Int) -> Bool!ProtoError:
         if wire == WIRE_VARINT:
             self.read_varint()!
             return true

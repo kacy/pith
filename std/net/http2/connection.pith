@@ -264,7 +264,7 @@ impl Connection:
         return self.read_response(stream_id)!
 
     # close the underlying transport.
-    fn close():
+    pub fn close():
         if self.live:
             tls.conn_from_handle(self.tls_handle).close()
 
@@ -430,6 +430,46 @@ pub struct Client:
     # on `slot_free` for a slot when the cap is reached; forget() pokes it.
     mut max_concurrent: Int
     slot_free: Channel[Int]
+
+# a single http/2 stream: an opened request whose body and response flow
+# incrementally, for streaming rpcs (grpc server-, client-, and bidi-streaming).
+# `send` writes DATA (half-closing on the last), `recv` pulls the next event
+# (response headers, a body chunk, trailers, or a reset) as the reader delivers
+# it. the client's request()/get() ride the same machinery but accumulate the
+# events into a Response. `inbox` is the same channel registered in the client's
+# stream table, held directly so recv() avoids a per-call table lookup.
+pub struct Stream:
+    client: Client
+    pub id: Int
+    inbox: Channel[StreamEvent]
+
+impl Stream:
+    # send a chunk of the request body, half-closing the stream (END_STREAM on the
+    # final DATA frame) when `end_stream` is set. flow-controlled and chunked to
+    # the peer's max frame size. blocks until the chunk is sent or the connection
+    # drops; the reader task grants credit meanwhile, so this never deadlocks.
+    # returns the bytes sent.
+    pub fn send(data: Bytes, end_stream: Bool) -> Int:
+        return send_stream_data(self.client, self.id, data, end_stream)
+
+    # pull the next event off this stream: a HEADERS event (response headers, or
+    # trailers if the body has begun), a DATA chunk with its end flag, or a RESET.
+    # fails when the connection closed before the stream completed.
+    pub fn recv() -> StreamEvent!:
+        opt := self.inbox.recv()
+        if opt == none:
+            fail "http2: connection closed before the stream completed"
+        return opt?
+
+    # abandon the stream: reset it (CANCEL) if it is still open, then drop it from
+    # the client's table and free its concurrency slot. safe to call once done.
+    fn close():
+        rst := frames.rst_stream_frame(self.id, frames.ERROR_CANCEL)
+        if not rst.is_err:
+            wire := frames.frame_bytes(rst.ok)
+            if not wire.is_err:
+                self.client.outbound.send(wire.ok)
+        self.client.forget(self.id)
 
 # a placeholder write task for offline clients, which drive the reader directly
 # and never spawn a real writer over the shared outbound channel.
@@ -766,16 +806,26 @@ fn grant_send_credit(client: Client, stream_id: Int, increment: Int):
         return
     client.mu.unlock()
 
-# stream a request body as DATA frames over the client, honoring the peer's send
-# windows (RFC 9113 §6.9): reserve credit bounded by the stream window, the
-# connection window, and the max frame size; send that much; and block on the
-# stream's credit signal when no window is available, until a WINDOW_UPDATE grows
-# one. runs as its own task so the response can be read while the body sends. it
-# stops early (returning the bytes sent so far) if the connection drops — the
-# waiting request() then fails on the closed inbox. an empty body sends nothing;
-# its END_STREAM rode on the HEADERS frame.
-fn send_body(client: Client, stream_id: Int, body: Bytes) -> Int:
-    total := body.len()
+# stream `data` as DATA frames over the client, honoring the peer's send windows
+# (RFC 9113 §6.9): reserve credit bounded by the stream window, the connection
+# window, and the max frame size; send that much; and block on the stream's
+# credit signal when no window is available, until a WINDOW_UPDATE grows one.
+# END_STREAM rides on the final DATA frame only when `end_stream` is set, so a
+# streaming caller can send many chunks and half-close on the last. an empty
+# `data` sends nothing unless `end_stream` is set, in which case it sends a lone
+# empty END_STREAM DATA frame to half-close (as client-streaming's close does).
+# returns the bytes sent; stops early if the connection drops (the waiting reader
+# then fails on the closed inbox). runs on its own task for a unary body so the
+# response is read as the body flows.
+fn send_stream_data(client: Client, stream_id: Int, data: Bytes, end_stream: Bool) -> Int:
+    total := data.len()
+    if total == 0:
+        if end_stream:
+            wire := frames.frame_bytes(frames.data_frame(stream_id, bytes.empty(), true))
+            if wire.is_err:
+                return 0
+            client.outbound.send(wire.ok)
+        return 0
     mut off := 0
     while off < total:
         grant := client.reserve_send(stream_id, total - off)
@@ -786,7 +836,8 @@ fn send_body(client: Client, stream_id: Int, body: Bytes) -> Int:
                 return off
             continue
         stop := off + grant
-        frame := frames.data_frame(stream_id, body.slice(off, stop), stop == total)
+        last := stop == total
+        frame := frames.data_frame(stream_id, data.slice(off, stop), last and end_stream)
         wire := frames.frame_bytes(frame)
         if wire.is_err:
             return off
@@ -862,16 +913,14 @@ impl Client:
         self.mu.unlock()
         self.slot_free.try_send(1)
 
-    # send a request with the given header fields and body, and read its
-    # response. an empty body sends END_STREAM on the HEADERS frame; a non-empty
-    # body streams as flow-controlled DATA frames on its own task while the
-    # response is read. safe to call from many tasks concurrently; each call
-    # drives its own stream. a slot is awaited first when the peer caps
-    # concurrency; the id is allocated and the HEADERS enqueued under the mutex so
-    # ids stay monotonic and hpack encoding matches wire order.
-    fn do_request(fields: List[hpack.HeaderField], body: Bytes) -> Response!:
+    # open a stream from a full header-field list: wait for a slot when the peer
+    # caps concurrency (RFC 9113 §5.1.2), allocate the id, register the stream's
+    # inbox, and enqueue the HEADERS — all under the mutex so ids stay monotonic
+    # and hpack encoding matches wire order. END_STREAM rides on the HEADERS when
+    # `end_stream` is set (no body will follow). the returned Stream carries the
+    # id and inbox for incremental send/recv.
+    fn open_stream_with_fields(fields: List[hpack.HeaderField], end_stream: Bool) -> Stream!:
         self.mu.lock()
-        # wait for a stream slot when the peer caps concurrency (RFC 9113 §5.1.2).
         while true:
             if self.closed.load() != 0:
                 self.mu.unlock()
@@ -896,9 +945,8 @@ impl Client:
         self.active.push(stream_id)
         self.send_windows.insert(stream_id, self.peer_initial_window)
         self.credit.insert(stream_id, Channel[Int](CREDIT_POKE_CAP))
-        has_body := body.len() > 0
         block := self.conn.encoder.encode(fields)
-        built := header_block_wire(stream_id, block, not has_body, self.peer_max_frame_size)
+        built := header_block_wire(stream_id, block, end_stream, self.peer_max_frame_size)
         if built.is_err:
             self.mu.unlock()
             self.forget(stream_id)
@@ -908,19 +956,40 @@ impl Client:
         if not accepted:
             self.forget(stream_id)
             fail "http2: connection closed"
+        return Stream(self, stream_id, inbox)
+
+    # open a stream for a streaming rpc: fills the four pseudo-headers from the
+    # method, authority, and path, appends `extra` (e.g. content-type), and sends
+    # the HEADERS. pass end_stream=true to half-close immediately (a
+    # server-streaming request has no body); false to keep sending DATA with
+    # Stream.send. safe to call from many tasks concurrently.
+    pub fn open_stream(method: String, authority: String, path: String, extra: List[hpack.HeaderField], end_stream: Bool) -> Stream!:
+        mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
+        for f in extra:
+            fields.push(f)
+        return self.open_stream_with_fields(fields, end_stream)!
+
+    # send a request with the given header fields and body, and read its full
+    # response. built on open_stream_with_fields: an empty body half-closes on the
+    # HEADERS frame; a non-empty body streams as flow-controlled DATA on its own
+    # task while the response is read. safe to call from many tasks concurrently.
+    fn do_request(fields: List[hpack.HeaderField], body: Bytes) -> Response!:
+        has_body := body.len() > 0
+        stream := self.open_stream_with_fields(fields, not has_body)!
+        stream_id := stream.id
         if has_body:
             # send the body concurrently so response frames are read as it flows.
             # bind self to a local: a spawn thunk cannot load `self` directly.
             me := self
-            sender := spawn send_body(me, stream_id, body)
-            attempt := assemble_response(inbox)
+            sender := spawn send_stream_data(me, stream_id, body, true)
+            attempt := assemble_response(stream.inbox)
             await sender
             self.forget(stream_id)
             if attempt.is_err:
                 fail attempt.err
             return attempt.ok
         # no body: END_STREAM already rode on the HEADERS frame.
-        attempt := assemble_response(inbox)
+        attempt := assemble_response(stream.inbox)
         self.forget(stream_id)
         if attempt.is_err:
             fail attempt.err
@@ -1372,12 +1441,12 @@ test "apply_settings records the peer's max concurrent streams":
     apply_settings(client, [frames.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 3)])
     assert_eq(client.max_concurrent, 3)
 
-test "send_body splits a body across the window and finishes after a WINDOW_UPDATE":
+test "send_stream_data splits a body across the window and finishes after a WINDOW_UPDATE":
     client := offline_client(connection_from_frames(bytes.empty()))
     # a 4-byte window on both the stream and the connection, a large frame cap.
     arm_send_stream(client, 1, 4, 4, 100)
     body := bytes.from_string_utf8("abcdefghij")
-    sender := spawn send_body(client, 1, body)
+    sender := spawn send_stream_data(client, 1, body, true)
     # the first DATA carries the initial 4-byte window. reading it proves the
     # sender sent it and is now blocked waiting for more credit, which makes the
     # split deterministic rather than a race with the grants below.
@@ -1392,3 +1461,59 @@ test "send_body splits a body across the window and finishes after a WINDOW_UPDA
     second := next_data_frame(client.outbound)!
     assert_eq(second.data.to_string_utf8()!, "efghij")
     assert(second.end_stream)
+
+test "a stream's recv yields its events one at a time":
+    inbox := Channel[StreamEvent](8)
+    inbox.send(headers_event([hpack.header_field(":status", "200")], false))
+    inbox.send(data_event(bytes.from_string_utf8("chunk-a"), false))
+    inbox.send(data_event(bytes.from_string_utf8("chunk-b"), true))
+    stream := Stream(offline_client(connection_from_frames(bytes.empty())), 1, inbox)
+    h := stream.recv()!
+    assert_eq(h.kind, STREAM_HEADERS)
+    assert_eq(status_from(h.headers), 200)
+    a := stream.recv()!
+    assert_eq(a.kind, STREAM_DATA)
+    assert_eq(a.data.to_string_utf8()!, "chunk-a")
+    assert(not a.end)
+    b := stream.recv()!
+    assert_eq(b.data.to_string_utf8()!, "chunk-b")
+    assert(b.end)
+
+test "send_stream_data half-closes only on the chunk that asks":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    client.send_windows.insert(1, DEFAULT_INITIAL_WINDOW)
+    client.credit.insert(1, Channel[Int](CREDIT_POKE_CAP))
+    assert_eq(send_stream_data(client, 1, bytes.from_string_utf8("hello"), false), 5)
+    assert_eq(send_stream_data(client, 1, bytes.from_string_utf8("bye"), true), 3)
+    first := next_data_frame(client.outbound)!
+    assert_eq(first.data.to_string_utf8()!, "hello")
+    assert(not first.end_stream)
+    last := next_data_frame(client.outbound)!
+    assert_eq(last.data.to_string_utf8()!, "bye")
+    assert(last.end_stream)
+
+test "send_stream_data half-closes with a lone empty frame when there is no data":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    assert_eq(send_stream_data(client, 1, bytes.empty(), true), 0)
+    frame := next_data_frame(client.outbound)!
+    assert_eq(frame.data.len(), 0)
+    assert(frame.end_stream)
+
+test "open_stream registers a stream that recv reads incrementally":
+    no_extra: List[hpack.HeaderField] := []
+    block := header_block([hpack.header_field(":status", "200")])
+    server := encode_frames([frames.headers_frame(1, block, false, true), frames.data_frame(1, bytes.from_string_utf8("one"), false), frames.data_frame(1, bytes.from_string_utf8("two"), true)])!
+    client := offline_client(connection_from_frames(server))
+    opened := client.open_stream("POST", "example.com", "/svc/method", no_extra, true)
+    assert(not opened.is_err)
+    stream := opened.ok
+    assert_eq(stream.id, 1)
+    reader_loop(client)
+    h := stream.recv()!
+    assert_eq(status_from(h.headers), 200)
+    d1 := stream.recv()!
+    assert_eq(d1.data.to_string_utf8()!, "one")
+    assert(not d1.end)
+    d2 := stream.recv()!
+    assert_eq(d2.data.to_string_utf8()!, "two")
+    assert(d2.end)

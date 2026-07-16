@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package echobench;
+
+option go_package = "pithgrpcbench/echopb";
+
+// a byte payload we can size up or down to stress serialization.
+message EchoRequest {
+  bytes payload = 1;
+}
+
+message EchoResponse {
+  bytes payload = 1;
+}
+
+// one unary method: the server returns the request payload unchanged.
+service Echo {
+  rpc Unary(EchoRequest) returns (EchoResponse);
+}

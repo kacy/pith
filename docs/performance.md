@@ -39,6 +39,30 @@ helper was a little quicker but never freed the strings it decoded;
 the general one attaches the struct destructor, so it is a touch slower
 and no longer leaks.
 
+`bench/grpc` — unary echo calls over tls on loopback, the same grpc-go
+server for all three clients so the numbers reflect the client. pith is
+`std.net.grpc` over its own tls 1.3, http/2, hpack, and protobuf — no c,
+no async runtime. 20,000 calls each, july 2026:
+
+| calls/sec | go | rust (tonic) | pith |
+|---|---|---|---|
+| 16 B, sequential | 4095 | 3037 | **2269** |
+| 1 KiB, sequential | 3959 | 2853 | **2202** |
+| 16 B, 8 concurrent | 14315 | 11918 | **4224** |
+| 1 KiB, 8 concurrent | 12333 | 10411 | **3800** |
+
+sequentially pith holds ~55% of grpc-go and ~75% of tonic — the same
+order of magnitude for an all-pith stack. concurrency is the weak spot:
+eight streams over one connection lift pith only ~1.9x where go and rust
+scale ~3.5x, so something in the client serializes under load (the single
+writer path, or per-call refcount atomics) — a real follow-up.
+
+this benchmark paid for itself on the first run: client sockets had no
+`TCP_NODELAY`, so nagle collided with the peer's delayed acks for a ~40ms
+stall per round-trip — the pith client measured 22 calls/sec before the
+fix and 2269 after. one socket option, and every request/response path
+(http, grpc, the db drivers) benefits.
+
 `bench/std_pipeline` — 50k records: csv read/write, transform, json,
 gzip:
 

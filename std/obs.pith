@@ -1,0 +1,160 @@
+# std.obs - turn on tracing and metrics export with one call.
+#
+# obs.init() reads the standard OTEL_* environment variables, flips std.trace
+# on, tells std.metrics to start collecting, and spawns a background exporter
+# that periodically ships finished spans and the current metric snapshot to an
+# OTLP/HTTP collector (see std.otlp).
+#
+#     import std.obs as obs
+#
+#     fn main():
+#         obs.init()          # reads OTEL_EXPORTER_OTLP_ENDPOINT et al.
+#         ... run your app; spans and metrics now export in the background ...
+#         obs.shutdown()      # optional: stop the loop and flush one last time.
+#
+# with no OTEL_EXPORTER_OTLP_ENDPOINT set, init() does nothing and the program
+# runs uninstrumented, so leaving the call in costs nothing in production.
+
+import std.env as env
+import std.metrics as metrics
+import std.otlp as otlp
+import std.time as time
+import std.trace as trace
+
+# environment variable names, matching the OpenTelemetry SDK conventions.
+OTEL_SERVICE_NAME := "OTEL_SERVICE_NAME"
+OTEL_ENDPOINT := "OTEL_EXPORTER_OTLP_ENDPOINT"
+OTEL_PROTOCOL := "OTEL_EXPORTER_OTLP_PROTOCOL"
+OTEL_METRIC_INTERVAL := "OTEL_METRIC_EXPORT_INTERVAL"
+# the batch-span-processor schedule delay controls how often spans are flushed.
+OTEL_SPAN_DELAY := "OTEL_BSP_SCHEDULE_DELAY"
+
+# the default service.name when OTEL_SERVICE_NAME is unset.
+DEFAULT_SERVICE_NAME := "pith-service"
+# default metric export interval (ms) and span flush interval (ms).
+DEFAULT_METRIC_INTERVAL_MS := 60000
+DEFAULT_SPAN_DELAY_MS := 5000
+
+# guards the two flags below so init/shutdown and the loop agree on state.
+mut obs_mu := Mutex()
+# whether init has already run (init is idempotent).
+mut started := false
+# whether the exporter loop should keep going; shutdown() clears it.
+mut running := false
+
+fn set_running(on: Bool):
+    obs_mu.lock()
+    running = on
+    obs_mu.unlock()
+
+fn is_running() -> Bool:
+    obs_mu.lock()
+    r := running
+    obs_mu.unlock()
+    return r
+
+# flush all finished spans to the collector, best effort (a failed POST is
+# swallowed so the loop keeps running).
+fn flush_spans(dest: otlp.Target):
+    spans := trace.drain_finished_spans()
+    otlp.export_traces(dest, spans) catch false
+
+# flush the current metric snapshot to the collector, best effort.
+fn flush_metrics(dest: otlp.Target):
+    otlp.export_metrics(dest, metrics.snapshot()) catch false
+
+# the background loop: wake every `tick` ms to flush spans, and flush metrics
+# once every `metric_interval` ms. on shutdown it does one last flush of both.
+fn run_exporter(dest: otlp.Target, tick: Int, metric_interval: Int):
+    mut since_metrics := 0
+    while is_running():
+        time.delay(tick)
+        flush_spans(dest)
+        since_metrics = since_metrics + tick
+        if since_metrics >= metric_interval:
+            flush_metrics(dest)
+            since_metrics = 0
+    # a clean shutdown drains whatever is left.
+    flush_spans(dest)
+    flush_metrics(dest)
+
+# the smaller of two positive intervals, but never below 1ms so the loop cannot
+# busy-spin. the tick is min(span delay, metric interval) so neither signal is
+# starved when one interval is much shorter than the other.
+fn loop_tick(span_delay: Int, metric_interval: Int) -> Int:
+    mut tick := span_delay
+    if metric_interval < tick:
+        tick = metric_interval
+    if tick < 1:
+        return 1
+    return tick
+
+# start tracing + metrics export against an explicit target and intervals. this
+# is what init() calls after reading the environment; call it directly to
+# configure the exporter in code rather than from OTEL_* variables. idempotent.
+pub fn start(service_name: String, endpoint: String, protocol: String, metric_interval_ms: Int, span_delay_ms: Int):
+    if endpoint == "":
+        return
+    obs_mu.lock()
+    if started:
+        obs_mu.unlock()
+        return
+    started = true
+    running = true
+    obs_mu.unlock()
+
+    dest := otlp.target(service_name, endpoint, protocol)
+    trace.set_active(true)
+    trace.set_sink(true)
+    tick := loop_tick(span_delay_ms, metric_interval_ms)
+    # a bare, unqualified call so `spawn` accepts it; the task detaches and runs
+    # for the process lifetime (until shutdown()).
+    spawn run_exporter(dest, tick, metric_interval_ms)
+
+# read the OTEL_* environment and turn observability on. with no
+# OTEL_EXPORTER_OTLP_ENDPOINT set, this does nothing. one call wires up tracing,
+# metrics collection, and the background exporter.
+pub fn init():
+    endpoint := env.str_or(OTEL_ENDPOINT, "")
+    if endpoint == "":
+        return
+    service_name := env.str_or(OTEL_SERVICE_NAME, DEFAULT_SERVICE_NAME)
+    protocol := env.str_or(OTEL_PROTOCOL, otlp.PROTOCOL_HTTP)
+    metric_interval := env.int_or(OTEL_METRIC_INTERVAL, DEFAULT_METRIC_INTERVAL_MS)
+    span_delay := env.int_or(OTEL_SPAN_DELAY, DEFAULT_SPAN_DELAY_MS)
+    start(service_name, endpoint, protocol, metric_interval, span_delay)
+
+# whether the exporter is currently running (init has run and shutdown has not).
+pub fn active() -> Bool:
+    return is_running()
+
+# stop the background exporter and let it flush one final time. safe to call
+# even if init() never ran. after shutdown, a later init() can start again.
+pub fn shutdown():
+    obs_mu.lock()
+    was_running := running
+    running = false
+    started = false
+    obs_mu.unlock()
+    if not was_running:
+        return
+    # give the loop a moment to observe the flag, wake, and do its final flush.
+    time.delay(50)
+
+# --- tests ------------------------------------------------------------------
+
+test "init stays off when no endpoint is configured":
+    # OTEL_EXPORTER_OTLP_ENDPOINT is unset in the test environment.
+    init()
+    assert(not active())
+    shutdown()
+
+test "the loop tick is the smaller interval and never zero":
+    assert_eq(loop_tick(5000, 60000), 5000)
+    assert_eq(loop_tick(60000, 1000), 1000)
+    assert_eq(loop_tick(0, 60000), 1)
+
+test "start with an empty endpoint is a no-op":
+    start("svc", "", otlp.PROTOCOL_HTTP, 60000, 5000)
+    assert(not active())
+    shutdown()

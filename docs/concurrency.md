@@ -163,6 +163,12 @@ set of `threadlocal` globals small and the values scratch-sized. use it
 for state that is genuinely per-task; a value shared *across* tasks still
 belongs in a struct or behind a channel.
 
+this is what lets the std parsers and buffers be used from many tasks at
+once: `std.json` and `std.toml` keep their parse arena in `threadlocal`
+globals, and `std.io`'s readers/writers keep their per-instance state the
+same way, so two tasks parsing or buffering concurrently each work in
+their own state with no lock and no race.
+
 things that are still intentionally explicit or still growing:
 
 - task cancellation is cooperative, not forceful

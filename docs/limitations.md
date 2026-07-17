@@ -94,13 +94,15 @@ correctness story:
   cannot yet be weak. container element removal leaks until the container dies,
   and error-path early returns skip cleanup. all are bounded-leak by design —
   the discipline never produces a dangling pointer in exchange.
-- reading an optional that is synthesized rather than stored leaks a small
-  optional box per read. this covers a `weak` field read and an indexed read
-  of a collection whose element type is a struct (`items[i]` where `items` is
-  `List[Node]`): both build a fresh optional to carry the liveness/`some`
-  result, and that box is not reclaimed. a stored optional field read does not
-  synthesize and does not leak. the leak is bounded per read and never
-  dangles; releasing synthesized optional temporaries is a known follow-up.
+- reading an optional that is synthesized rather than stored can leak a small
+  optional box per read. a `weak` field read builds a fresh optional to carry
+  the liveness result; the common consumers — `!= none` / `== none` and
+  `.value()` — now free that shell once the value is extracted, so the common
+  idiom no longer leaks. an indexed read of a collection whose element type is a
+  struct (`items[i]` where `items` is `List[Node]`) still synthesizes an optional
+  that is not reclaimed. a stored optional field read does not synthesize and
+  does not leak. the leak is bounded per read and never dangles; reclaiming the
+  remaining synthesized-optional temporaries is a known follow-up.
 - a handful of edge cases logged during bring-up (cross-module float returns,
   cross-module map reads, set codegen, negative float literals like `-1.0`) were
   re-checked and all pass; they are now pinned by regression tests

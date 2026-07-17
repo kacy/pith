@@ -80,6 +80,21 @@ below, at ~3175 (~77%). the box is too noisy to resolve the smaller items
 (cached headers, coalescing, shared event list) on wall-clock, so they stand
 on counted structural reductions; a quiet machine would sharpen the numbers.
 
+the newest pass inlines the whole request, not just its body. a client now
+starts single-threaded: one in-flight call runs synchronously on the caller
+over the same lockstep codec the one-shot get() uses — no reader or writer
+task, no channel handoff — and the client promotes to the multiplexing pipeline
+exactly once, the first time a second stream appears (the inline fast-path in
+std/net/http2/connection.pith). because promotion latches to the old pipeline
+the instant there is concurrency, the 8-concurrent path is unchanged by design;
+the win is entirely on sequential traffic, the common grpc unary shape. a
+controlled before/after on the same box put a sequential unary call at ~340 µs,
+down from ~368 (~8%), and a clean sweep read 16 B sequential around 3400
+calls/sec, up from 3175 — still ~80% of grpc-go, which drifted up the same day.
+a full three-client re-sweep for the table above is pending a quieter machine:
+this dev box was too contended to trust the comparators, which swung roughly 2x
+between back-to-back runs.
+
 past a single connection there is a connection pool: `grpc.dial_pool` (and
 `http2.open_pool`) opens n independent connections and rotates calls across
 them round-robin, the same subchannel trick real grpc clients use. each

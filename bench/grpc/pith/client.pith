@@ -70,12 +70,15 @@ fn worker(ch: grpc.Conn, method: String, request: Bytes, count: Int) -> Int:
         i = i + 1
     return count
 
-fn run_concurrent(ch: grpc.Conn, method: String, request: Bytes, calls: Int, conc: Int):
+# each worker gets its OWN connection from the pool (round-robin) and keeps its
+# calls on that one connection's pipeline, so the pool spreads load across cores.
+fn run_concurrent(pool: grpc.PoolConn, method: String, request: Bytes, calls: Int, conc: Int):
     per := calls / conc
     mut tasks := []
     mut w := 0
     while w < conc:
-        tasks.push(spawn worker(ch, method, request, per))
+        c := pool.at(w % pool.size())
+        tasks.push(spawn worker(c, method, request, per))
         w = w + 1
     for t in tasks:
         await t
@@ -93,6 +96,7 @@ fn main():
     calls := env_int("PITH_GRPC_CALLS", 20000)
     warmup := env_int("PITH_GRPC_WARMUP", 2000)
     conc := env_int("PITH_GRPC_CONC", 1)
+    pool := env_int("PITH_GRPC_POOL", 1)
     ca_path := env_str("PITH_GRPC_CA", "tests/live/fixtures/localhost-ca.crt")
     method := "/echobench.Echo/Unary"
 
@@ -102,7 +106,10 @@ fn main():
         return
     config := cfg.ok.with_alpn(["h2"])
 
-    dialed := grpc.dial_with_config("localhost", 50051, config)
+    # a pool of `pool` connections (pool=1 is a single connection). concurrent
+    # calls spread round-robin across the pool's independent reader/writer
+    # pipelines, so throughput scales with cores past a single connection.
+    dialed := grpc.dial_pool_with_config("localhost", 50051, pool, config)
     if dialed.is_err:
         print("pith: cannot connect to localhost:50051")
         return
@@ -117,7 +124,7 @@ fn main():
 
     start := time.now()
     if conc <= 1:
-        run_serial(ch, method, request, calls)
+        run_serial(ch.at(0), method, request, calls)
     else:
         run_concurrent(ch, method, request, calls, conc)
     elapsed := time.now() - start

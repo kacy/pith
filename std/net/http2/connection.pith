@@ -543,6 +543,58 @@ pub fn open_url(url_string: String) -> Client!:
     target := parse_target(url_string)!
     return open(target.host, target.port)!
 
+# a pool of n independent http/2 connections to the same host:port. a single
+# connection's reader/writer pipeline is ~one-core-bound, so concurrent requests
+# spread round-robin across the pool run on separate cores — the same reason
+# grpc clients open multiple subchannels. keep n at or below the core count for
+# a throughput gain; close() shuts every connection down.
+pub struct Pool:
+    clients: List[Client]
+    mut next: Int
+    pick: Mutex
+
+impl Pool:
+    # the index of the next connection, round-robin, safe across concurrent callers.
+    fn choose() -> Int:
+        self.pick.lock()
+        i := self.next
+        self.next = (self.next + 1) % self.clients.len()
+        self.pick.unlock()
+        return i
+
+    # send a request over the next pooled connection; otherwise like Client.request.
+    pub fn request(method: String, authority: String, path: String, extra: List[hpack.HeaderField], body: Bytes) -> Response!:
+        return self.clients[self.choose()].request(method, authority, path, extra, body)
+
+    # open a stream over the next pooled connection; otherwise like Client.open_stream.
+    pub fn open_stream(method: String, authority: String, path: String, extra: List[hpack.HeaderField], end_stream: Bool) -> Stream!:
+        return self.clients[self.choose()].open_stream(method, authority, path, extra, end_stream)
+
+    # close every pooled connection.
+    pub fn close():
+        for c in self.clients:
+            c.close()
+
+# open a pool of n http/2 connections to host:port over tls (alpn "h2"), trusting
+# the system roots. reuse it for many concurrent requests; close() when done.
+pub fn open_pool(host: String, port: Int, n: Int) -> Pool!:
+    mut clients: List[Client] := []
+    mut i := 0
+    while i < n:
+        clients.push(open(host, port)!)
+        i = i + 1
+    return Pool(clients: clients, next: 0, pick: Mutex())
+
+# like open_pool but dialing each connection with the caller's tls `config`
+# (which must offer alpn "h2") — e.g. one trusting a private ca.
+pub fn open_pool_with_config(host: String, port: Int, n: Int, config: tls.Config) -> Pool!:
+    mut clients: List[Client] := []
+    mut i := 0
+    while i < n:
+        clients.push(open_with_config(host, port, config)!)
+        i = i + 1
+    return Pool(clients: clients, next: 0, pick: Mutex())
+
 # drop `target` from an id list, returning the remaining ids.
 fn list_remove_int(items: List[Int], target: Int) -> List[Int]:
     mut out: List[Int] := []

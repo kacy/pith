@@ -671,3 +671,75 @@ test "bidi reader deframes several echoed messages in order":
     r.feed(http2.headers_event([hpack.header_field("grpc-status", "0")], true))!
     assert(r.finished())
     assert_eq(r.final_status(), GRPC_OK)
+
+# a pool of n grpc channels to the same server, each its own http/2 connection.
+# a single channel's reader/writer pipeline is ~one-core-bound, so concurrent
+# rpcs spread round-robin across the pool run on separate cores (the same reason
+# real grpc clients open multiple subchannels). use it in place of a single
+# dial() channel for many concurrent calls; keep n at or below the core count
+# for a throughput gain. close() shuts every channel down.
+pub struct PoolConn:
+    conns: List[Conn]
+    mut next: Int
+    pick: Mutex
+
+impl PoolConn:
+    # the index of the next channel, round-robin, safe across concurrent callers.
+    fn choose() -> Int:
+        self.pick.lock()
+        i := self.next
+        self.next = (self.next + 1) % self.conns.len()
+        self.pick.unlock()
+        return i
+
+    # unary rpc over the next pooled channel; see Conn.unary.
+    pub fn unary(full_method: String, request: Bytes) -> Bytes!GrpcError:
+        return self.conns[self.choose()].unary(full_method, request)
+
+    # server-streaming rpc over the next pooled channel; see Conn.server_stream.
+    pub fn server_stream(full_method: String, request: Bytes) -> ServerStream!GrpcError:
+        return self.conns[self.choose()].server_stream(full_method, request)
+
+    # client-streaming rpc over the next pooled channel; see Conn.client_stream.
+    pub fn client_stream(full_method: String) -> ClientStream!GrpcError:
+        return self.conns[self.choose()].client_stream(full_method)
+
+    # bidi-streaming rpc over the next pooled channel; see Conn.bidi_stream.
+    pub fn bidi_stream(full_method: String) -> BidiStream!GrpcError:
+        return self.conns[self.choose()].bidi_stream(full_method)
+
+    # the number of channels in the pool.
+    pub fn size() -> Int:
+        return self.conns.len()
+
+    # the i-th channel. hand a long-lived task its own channel with this (rather
+    # than sharing the pool across tasks) so each task's calls stay on one
+    # connection's pipeline.
+    pub fn at(i: Int) -> Conn:
+        return self.conns[i]
+
+    # close every pooled channel.
+    pub fn close():
+        for c in self.conns:
+            c.close()
+
+# dial a pool of n grpc channels to host:port (each its own http/2 connection
+# over tls, alpn "h2"). issue concurrent rpcs across it to use multiple cores;
+# n above the core count gives no further gain. close() shuts them all down.
+pub fn dial_pool(host: String, port: Int, n: Int) -> PoolConn!:
+    mut conns: List[Conn] := []
+    mut i := 0
+    while i < n:
+        conns.push(dial(host, port)!)
+        i = i + 1
+    return PoolConn(conns: conns, next: 0, pick: Mutex())
+
+# like dial_pool but dialing each channel with the caller's tls `config` (which
+# must offer alpn "h2") — e.g. one trusting a private ca.
+pub fn dial_pool_with_config(host: String, port: Int, n: Int, config: tls.Config) -> PoolConn!:
+    mut conns: List[Conn] := []
+    mut i := 0
+    while i < n:
+        conns.push(dial_with_config(host, port, config)!)
+        i = i + 1
+    return PoolConn(conns: conns, next: 0, pick: Mutex())

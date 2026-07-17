@@ -367,6 +367,22 @@ fn scan_identifier():
     else:
         emit("identifier", word)
 
+# drop `_` digit separators from a numeric literal's text. the scanner consumes
+# them so `1_000_000` reads as one token, but the token VALUE must be the clean
+# number — otherwise downstream int/float parsing chokes on the underscores and
+# yields 0.
+fn strip_digit_separators(text: String) -> String:
+    if not text.contains("_"):
+        return text
+    mut out := ""
+    mut i := 0
+    while i < text.len():
+        c := text.substring(i, i + 1)
+        if c != "_":
+            out = out + c
+        i = i + 1
+    return out
+
 fn scan_number():
     start := current_position
 
@@ -387,7 +403,7 @@ fn scan_number():
                         current_column = current_column + 1
                     else:
                         break
-                emit("int_lit", source.substring(start, current_position))
+                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
                 return
             if next_char == "X":
                 current_position = current_position + 2
@@ -402,7 +418,7 @@ fn scan_number():
                         current_column = current_column + 1
                     else:
                         break
-                emit("int_lit", source.substring(start, current_position))
+                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
                 return
             if next_char == "b":
                 current_position = current_position + 2
@@ -420,7 +436,7 @@ fn scan_number():
                         current_column = current_column + 1
                     else:
                         break
-                emit("int_lit", source.substring(start, current_position))
+                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
                 return
             if next_char == "B":
                 current_position = current_position + 2
@@ -438,7 +454,7 @@ fn scan_number():
                         current_column = current_column + 1
                     else:
                         break
-                emit("int_lit", source.substring(start, current_position))
+                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
                 return
             if next_char == "o":
                 current_position = current_position + 2
@@ -448,7 +464,7 @@ fn scan_number():
                         break
                     current_position = current_position + 1
                     current_column = current_column + 1
-                emit("int_lit", source.substring(start, current_position))
+                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
                 return
             if next_char == "O":
                 current_position = current_position + 2
@@ -458,7 +474,7 @@ fn scan_number():
                         break
                     current_position = current_position + 1
                     current_column = current_column + 1
-                emit("int_lit", source.substring(start, current_position))
+                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
                 return
 
     # decimal digits
@@ -542,9 +558,9 @@ fn scan_number():
                     break
 
     if is_float:
-        emit("float_lit", source.substring(start, current_position))
+        emit("float_lit", strip_digit_separators(source.substring(start, current_position)))
     else:
-        emit("int_lit", source.substring(start, current_position))
+        emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
 
 fn scan_string():
     start := current_position

@@ -30,6 +30,73 @@ mut histogram_bucket_counts: Map[String, Int] := {}
 # internal helpers (ensure_*, *_value, render_*) assume it is already held.
 mut metrics_mu := Mutex()
 
+# label support. a metric can have several series, one per distinct label set
+# (e.g. requests_total{route="/api"} vs {route="/"}). an instrument's `name`
+# field holds the full SERIES KEY — the bare name for an unlabeled metric, or
+# name{k="v",...} for a labeled one — so every op keys off it unchanged. these
+# registries map a series key back to its bare name and its label pairs so the
+# prometheus text can group series under one # TYPE line and the structured
+# snapshot (for OTLP) can hand back typed name/labels/value. guarded by
+# metrics_mu like the value maps.
+mut series_bare_name: Map[String, String] := {}
+mut series_label_pairs: Map[String, List[String]] := {}
+
+# label names follow the same rule as metric names.
+fn normalize_label_name(name: String) -> String:
+    return normalize_metric_name(name)
+
+# escape a label value for prometheus text: backslash, double-quote, newline.
+fn escape_label_value(value: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < value.len():
+        c := value[i]
+        if c == chr(92):
+            out = out + chr(92) + chr(92)
+        elif c == chr(34):
+            out = out + chr(92) + chr(34)
+        elif c == chr(10):
+            out = out + chr(92) + "n"
+        else:
+            out = out + c
+        i = i + 1
+    return out
+
+# build the {k="v",...} suffix from [k1,v1,k2,v2,...] with keys sorted so a label
+# set has one canonical series key regardless of argument order. empty -> "".
+fn label_suffix(pairs: List[String]) -> String:
+    if pairs.len() < 2:
+        return ""
+    mut kv: Map[String, String] := {}
+    mut keys: List[String] := []
+    mut i := 0
+    while i + 1 < pairs.len():
+        k := normalize_label_name(pairs[i])
+        if not kv.contains_key(k):
+            keys.push(k)
+        kv.insert(k, pairs[i + 1])
+        i = i + 2
+    if keys.len() == 0:
+        return ""
+    sorted := keys.sort()
+    mut out := chr(123)
+    mut first := true
+    for k in sorted:
+        if not first:
+            out = out + ","
+        out = out + k + "=" + chr(34) + escape_label_value(kv[k]) + chr(34)
+        first = false
+    return out + chr(125)
+
+fn make_series_key(name: String, pairs: List[String]) -> String:
+    return name + label_suffix(pairs)
+
+# record a series' bare name and label pairs (idempotent). caller holds the lock.
+fn register_series(key: String, name: String, pairs: List[String]):
+    if not series_bare_name.contains_key(key):
+        series_bare_name.insert(key, name)
+        series_label_pairs.insert(key, pairs)
+
 fn default_histogram_buckets() -> List[Int]:
     return [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000]
 
@@ -128,12 +195,15 @@ pub fn reset():
     histogram_mins = {}
     histogram_maxs = {}
     histogram_bucket_counts = {}
+    series_bare_name = {}
+    series_label_pairs = {}
     metrics_mu.unlock()
 
 # create or reopen a counter by name.
 pub fn counter(name: String) -> Counter:
     normalized := normalize_metric_name(name)
     metrics_mu.lock()
+    register_series(normalized, normalized, [])
     ensure_counter(normalized)
     metrics_mu.unlock()
     return Counter(normalized)
@@ -142,6 +212,7 @@ pub fn counter(name: String) -> Counter:
 pub fn gauge(name: String) -> Gauge:
     normalized := normalize_metric_name(name)
     metrics_mu.lock()
+    register_series(normalized, normalized, [])
     ensure_gauge(normalized)
     metrics_mu.unlock()
     return Gauge(normalized)
@@ -150,9 +221,19 @@ pub fn gauge(name: String) -> Gauge:
 pub fn histogram(name: String) -> Histogram:
     normalized := normalize_metric_name(name)
     metrics_mu.lock()
+    register_series(normalized, normalized, [])
     ensure_histogram(normalized)
     metrics_mu.unlock()
     return Histogram(normalized)
+
+# the bare metric name behind an instrument's series key.
+fn instrument_bare_name(key: String) -> String:
+    metrics_mu.lock()
+    mut bare := key
+    if series_bare_name.contains_key(key):
+        bare = series_bare_name[key]
+    metrics_mu.unlock()
+    return bare
 
 impl Counter:
     fn inc():
@@ -169,6 +250,19 @@ impl Counter:
         result := counter_value(self.name)
         metrics_mu.unlock()
         return result
+
+    # a counter for this metric with the given label set. pairs is [k1,v1,k2,v2,
+    # ...]; each distinct set is its own series. requests.labels(["route","/api"]).
+    fn labels(pairs: List[String]) -> Counter:
+        metrics_mu.lock()
+        mut bare := self.name
+        if series_bare_name.contains_key(self.name):
+            bare = series_bare_name[self.name]
+        key := make_series_key(bare, pairs)
+        register_series(key, bare, pairs)
+        ensure_counter(key)
+        metrics_mu.unlock()
+        return Counter(key)
 
 impl Gauge:
     fn set(value: Int):
@@ -188,6 +282,18 @@ impl Gauge:
         result := gauge_value(self.name)
         metrics_mu.unlock()
         return result
+
+    # a gauge for this metric with the given label set (see Counter.labels).
+    fn labels(pairs: List[String]) -> Gauge:
+        metrics_mu.lock()
+        mut bare := self.name
+        if series_bare_name.contains_key(self.name):
+            bare = series_bare_name[self.name]
+        key := make_series_key(bare, pairs)
+        register_series(key, bare, pairs)
+        ensure_gauge(key)
+        metrics_mu.unlock()
+        return Gauge(key)
 
 impl Histogram:
     fn observe(value: Int):
@@ -234,42 +340,116 @@ impl Histogram:
         metrics_mu.unlock()
         return result
 
-fn render_counter_lines(name: String) -> List[String]:
-    mut lines := ["# TYPE " + name + " counter"]
-    lines.push(name + " " + counter_value(name).to_string())
-    return lines
+    # a histogram for this metric with the given label set (see Counter.labels).
+    fn labels(pairs: List[String]) -> Histogram:
+        metrics_mu.lock()
+        mut bare := self.name
+        if series_bare_name.contains_key(self.name):
+            bare = series_bare_name[self.name]
+        key := make_series_key(bare, pairs)
+        register_series(key, bare, pairs)
+        ensure_histogram(key)
+        metrics_mu.unlock()
+        return Histogram(key)
 
-fn render_gauge_lines(name: String) -> List[String]:
-    mut lines := ["# TYPE " + name + " gauge"]
-    lines.push(name + " " + gauge_value(name).to_string())
-    return lines
+# which value maps hold this series key. caller holds the lock.
+fn series_kind(key: String) -> String:
+    if counter_values.contains_key(key):
+        return "counter"
+    if gauge_values.contains_key(key):
+        return "gauge"
+    return "histogram"
 
-fn render_histogram_lines(name: String) -> List[String]:
-    mut lines := ["# TYPE " + name + " histogram"]
-    for bucket in default_histogram_buckets():
-        lines.push(name + "_bucket" + chr(123) + "le=" + chr(34) + bucket.to_string() + chr(34) + chr(125) + " " + histogram_bucket_value(name, bucket).to_string())
-    lines.push(name + "_bucket" + chr(123) + "le=" + chr(34) + "+Inf" + chr(34) + chr(125) + " " + histogram_count(name).to_string())
-    lines.push(name + "_count " + histogram_count(name).to_string())
-    lines.push(name + "_sum " + histogram_sum(name).to_string())
-    if histogram_count(name) > 0:
-        lines.push(name + "_min " + histogram_min(name).to_string())
-        lines.push(name + "_max " + histogram_max(name).to_string())
-    return lines
+fn series_pairs(key: String) -> List[String]:
+    if series_label_pairs.contains_key(key):
+        return series_label_pairs[key]
+    return []
 
-fn render_metric_lines(name: String) -> List[String]:
-    if counter_values.contains_key(name):
-        return render_counter_lines(name)
-    if gauge_values.contains_key(name):
-        return render_gauge_lines(name)
-    return render_histogram_lines(name)
+# a copy of `pairs` with one more k=v appended, for adding le to a bucket line.
+fn append_pair(pairs: List[String], k: String, v: String) -> List[String]:
+    mut out: List[String] := []
+    for p in pairs:
+        out.push(p)
+    out.push(k)
+    out.push(v)
+    return out
 
-# export a stable text snapshot of all registered metrics.
-pub fn snapshot_text() -> String:
+# the value line(s) for one series. the # TYPE line is emitted once per metric
+# name by snapshot_text. `key` is the full series key (name{labels}); `bare` is
+# the metric name; `pairs` are its [k,v,...] labels. caller holds the lock.
+fn render_series_lines(key: String, bare: String, pairs: List[String], kind: String) -> List[String]:
     mut lines: List[String] := []
-    for name in metric_names():
-        for line in render_metric_lines(name):
+    if kind == "counter":
+        lines.push(key + " " + counter_value(key).to_string())
+        return lines
+    if kind == "gauge":
+        lines.push(key + " " + gauge_value(key).to_string())
+        return lines
+    # histogram: buckets carry the series labels plus le; count/sum/min/max carry
+    # just the series labels.
+    for bucket in default_histogram_buckets():
+        le := append_pair(pairs, "le", bucket.to_string())
+        lines.push(bare + "_bucket" + label_suffix(le) + " " + histogram_bucket_value(key, bucket).to_string())
+    inf := append_pair(pairs, "le", "+Inf")
+    lines.push(bare + "_bucket" + label_suffix(inf) + " " + histogram_count(key).to_string())
+    suffix := label_suffix(pairs)
+    lines.push(bare + "_count" + suffix + " " + histogram_count(key).to_string())
+    lines.push(bare + "_sum" + suffix + " " + histogram_sum(key).to_string())
+    if histogram_count(key) > 0:
+        lines.push(bare + "_min" + suffix + " " + histogram_min(key).to_string())
+        lines.push(bare + "_max" + suffix + " " + histogram_max(key).to_string())
+    return lines
+
+# export a stable prometheus-text snapshot of all series. series of the same
+# metric share one # TYPE line; each series carries its labels.
+pub fn snapshot_text() -> String:
+    metrics_mu.lock()
+    keys := metric_names()
+    mut lines: List[String] := []
+    mut typed: Map[String, Bool] := {}
+    for key in keys:
+        mut bare := key
+        if series_bare_name.contains_key(key):
+            bare = series_bare_name[key]
+        kind := series_kind(key)
+        if not typed.contains_key(bare):
+            lines.push("# TYPE " + bare + " " + kind)
+            typed.insert(bare, true)
+        for line in render_series_lines(key, bare, series_pairs(key), kind):
             lines.push(line)
+    metrics_mu.unlock()
     return lines.join(chr(10))
+
+# a typed view of one metric series, for building OTLP data points.
+pub struct MetricSample:
+    pub name: String        # bare metric name
+    pub kind: String        # "counter" | "gauge" | "histogram"
+    pub labels: List[String]  # [k1,v1,k2,v2,...]
+    pub value: Int          # counter/gauge value, or histogram observation count
+    pub sum: Int            # histogram sum of observations (0 for counter/gauge)
+
+# a structured snapshot of every series, one MetricSample each. gives an OTLP
+# exporter typed name/labels/value without parsing the prometheus text.
+pub fn snapshot() -> List[MetricSample]:
+    metrics_mu.lock()
+    mut out: List[MetricSample] := []
+    for key in metric_names():
+        mut bare := key
+        if series_bare_name.contains_key(key):
+            bare = series_bare_name[key]
+        kind := series_kind(key)
+        mut value := 0
+        mut sum := 0
+        if kind == "counter":
+            value = counter_value(key)
+        elif kind == "gauge":
+            value = gauge_value(key)
+        else:
+            value = histogram_count(key)
+            sum = histogram_sum(key)
+        out.push(MetricSample(bare, kind, series_pairs(key), value, sum))
+    metrics_mu.unlock()
+    return out
 
 test "metrics counters and gauges normalize names and store values":
     reset()
@@ -360,3 +540,40 @@ test "metrics stay exact under concurrent updates":
     assert_eq(observed, per * 4)
     assert_eq(histogram("concurrent obs").count(), per * 4)
     assert_eq(histogram("concurrent obs").sum(), per * 4 * 7)
+
+test "labels create independent series and render with a shared TYPE line":
+    reset()
+    reqs := counter("http_requests_total")
+    reqs.labels(["route", "/api", "method", "GET"]).inc()
+    reqs.labels(["route", "/api", "method", "GET"]).add(2)
+    reqs.labels(["route", "/health", "method", "GET"]).inc()
+
+    # each distinct label set is its own series; keys are sorted for a canonical form
+    assert_eq(reqs.labels(["method", "GET", "route", "/api"]).value(), 3)
+    assert_eq(reqs.labels(["route", "/health", "method", "GET"]).value(), 1)
+
+    text := snapshot_text()
+    # one TYPE line for the metric, one line per series with sorted labels
+    assert(text.contains("# TYPE http_requests_total counter"))
+    assert(text.contains("http_requests_total" + chr(123) + "method=" + chr(34) + "GET" + chr(34) + ",route=" + chr(34) + "/api" + chr(34) + chr(125) + " 3"))
+
+test "structured snapshot reports typed samples with labels":
+    reset()
+    gauge("inflight").labels(["pool", "db"]).set(4)
+    histogram("latency_ms").labels(["route", "/api"]).observe(7)
+    histogram("latency_ms").labels(["route", "/api"]).observe(120)
+
+    mut found_gauge := false
+    mut found_hist := false
+    for s in snapshot():
+        if s.name == "inflight" and s.labels.len() == 2:
+            assert_eq(s.kind, "gauge")
+            assert_eq(s.value, 4)
+            found_gauge = true
+        if s.name == "latency_ms" and s.labels.len() == 2:
+            assert_eq(s.kind, "histogram")
+            assert_eq(s.value, 2)
+            assert_eq(s.sum, 127)
+            found_hist = true
+    assert(found_gauge)
+    assert(found_hist)

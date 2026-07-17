@@ -1588,9 +1588,36 @@ fn ir_method_receiver_type(node: Node) -> String:
                 return ir_substitute_type_name(ir_struct_field_lookup[field_key])
     return ""
 
+# a read of a `weak` field synthesizes a FRESH borrowing optional shell each time
+# (ir_emit_weak_read) — unlike a normal optional field, which reads the stored
+# value in place. that shell has no destructor and holds a borrowed pointer, so
+# releasing it just frees the shell. this predicate lets the optional consumers
+# (`.value()`, `!= none`) free the throwaway shell instead of leaking one per read.
+fn ir_node_is_weak_field_read(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind != "field_access":
+        return false
+    if node.children.len() == 0:
+        return false
+    recv_tid := c_get_expr_type(node.children[0])
+    if recv_tid < 0:
+        return false
+    recv_info := get_type_info(recv_tid)
+    if recv_info.kind != "struct":
+        return false
+    return ir_struct_field_is_weak(recv_info.name, node_value(idx))
+
+# free a fresh weak-read optional shell after its value has been extracted; the
+# shell has no destructor so this reclaims only the 3-slot allocation, leaving the
+# borrowed target untouched.
+fn ir_release_weak_shell(operand_idx: Int, shell_r: Int):
+    if ir_node_is_weak_field_read(operand_idx):
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", shell_r)
+
 fn ir_emit_optional_unwrap(node: Node) -> Int:
     recv_r := ir_expr(node.children[0])
     opt_tid := c_get_expr_type(node.children[0])
+    weak_shell := ir_node_is_weak_field_read(node.children[0])
     flag_r := ir_optional_flag_field(recv_r)
     some_l := ir_label()
     none_l := ir_label()
@@ -1598,8 +1625,13 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
     ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
     ir_emit_label(some_l)
     decoded_r := ir_optional_value_field(recv_r, opt_tid)
+    if weak_shell:
+        # extracted the borrowed target above; the shell is now dead on this path.
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
     ir_emit("jmp " + merge_l)
     ir_emit_label(none_l)
+    if weak_shell:
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
     if ir_emit_tests and ir_emitting_test_func:
         ir_test_assert_fail_return()
     else:
@@ -2111,9 +2143,11 @@ fn ir_emit_binary_expr(node: Node) -> Int:
     if op == "eq" or op == "neq":
         if left_node.kind == "none_lit" and right_info.kind == "optional":
             ir_emit_optional_none_compare(r, op, right_r)
+            ir_release_weak_shell(node.children[1], right_r)
             return r
         if right_node.kind == "none_lit" and left_info.kind == "optional":
             ir_emit_optional_none_compare(r, op, left_r)
+            ir_release_weak_shell(node.children[0], left_r)
             return r
         # in a generic impl body, the non-none side's type may be TID_ERR
         # because the struct's type parameters were suppressed at registration;
@@ -3575,7 +3609,10 @@ fn ir_emit_method_call(idx: Int) -> Int:
                 # unchecked extraction of the inner value (caller has verified
                 # the optional is Some); used by iterator adapters in std.iter
                 obj_r := ir_expr(node.children[0])
-                return ir_optional_value_field(obj_r, recv_tid)
+                val_r := ir_optional_value_field(obj_r, recv_tid)
+                # free a fresh weak-read shell once its value is extracted
+                ir_release_weak_shell(node.children[0], obj_r)
+                return val_r
             if recv_info.kind == "optional" and mname == "unwrap_or":
                 # some(v) -> v, none -> the default argument
                 obj_r := ir_expr(node.children[0])

@@ -476,6 +476,18 @@ error[E248]: a spawned task cannot take a list this scope still holds; both thre
 
 ---
 
+### E249 — weak field must be an optional struct
+
+```
+error[E249]: weak field 'parent' must be an optional struct type (T?)
+```
+
+a `weak` field points at a struct without keeping it alive, so it must be able
+to read back as "gone" once the target is reclaimed — which means it has to be
+an optional struct type, `T?`. `weak parent: Node` is rejected; write
+`weak parent: Node?`. weak is for breaking reference cycles (a parent/child back
+pointer, a doubly-linked list's back link); see docs/ownership.md.
+
 ### E250 — builtin type name
 
 a struct or enum cannot reuse the name of a builtin type (`Channel`, `Task`,

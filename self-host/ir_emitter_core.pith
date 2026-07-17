@@ -5925,9 +5925,12 @@ fn ir_emit_global_binding(node: Node, is_threadlocal: Bool):
         # per-thread storage: no shared data slot. record a unique slot and the
         # global's kind so reads/writes route through the tls runtime calls, and
         # so ir_emit_tls_thunks can generate its lazy per-thread initializer.
-        ir_threadlocal_slots.insert(gname, ir_next_tls_slot)
+        # assign the slot once so re-processing the same global (across emission
+        # passes) can never hand two access sites different slots.
+        if not ir_threadlocal_slots.contains_key(gname):
+            ir_threadlocal_slots.insert(gname, ir_next_tls_slot)
+            ir_next_tls_slot = ir_next_tls_slot + 1
         ir_threadlocal_kinds.insert(gname, global_type)
-        ir_next_tls_slot = ir_next_tls_slot + 1
         return
     ir_emit("global " + gname + " " + init_val)
 

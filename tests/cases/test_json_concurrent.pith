@@ -1,0 +1,27 @@
+# json keeps its parse arena in threadlocal globals, so two tasks parsing at the
+# same time each build into their own arena with no lock and no race. before the
+# conversion this same program corrupted the heap (the arena maps were shared
+# module globals). the total is order-independent, so it pins the fix without
+# being timing-sensitive.
+
+import std.json as json
+
+fn build_input(i: Int) -> String:
+    lb := chr(123)
+    rb := chr(125)
+    return lb + "\"id\":" + i.to_string() + ",\"name\":\"item\"" + rb
+
+fn parse_many(n: Int) -> Int:
+    mut ok := 0
+    mut i := 0
+    while i < n:
+        root := json.parse(build_input(i))
+        if json.type_of(root) == "object" and json.object_get_string(root, "name") == "item":
+            ok = ok + 1
+        i = i + 1
+    return ok
+
+fn main():
+    t1 := spawn parse_many(1000)
+    t2 := spawn parse_many(1000)
+    print("total_ok=" + (await t1 + await t2).to_string())

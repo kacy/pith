@@ -2,6 +2,8 @@
 #
 # functions:
 #   now() -> Int                 unix timestamp in milliseconds
+#   mono_nanos() -> Int          monotonic timestamp in nanoseconds
+#   mono_millis() -> Int         monotonic timestamp in milliseconds
 #   delay(ms: Int)               sleep for the given milliseconds
 #   format_now() -> String       format the current time
 
@@ -12,6 +14,19 @@ fn time_now_ms() -> Int:
 ## this matches the builtin time() value.
 pub fn now() -> Int:
     return time_now_ms()
+
+## return a monotonic timestamp in nanoseconds.
+## the value only ever increases and is unaffected by wall-clock changes, so it
+## is meant for measuring durations rather than telling the time of day. it is
+## relative to an arbitrary process-start point, not the unix epoch.
+pub fn mono_nanos() -> Int:
+    return time_nanos()
+
+## return a monotonic timestamp in milliseconds.
+## this is mono_nanos() scaled down, sharing the same guarantees.
+pub fn mono_millis() -> Int:
+    nanos_per_milli := 1000000
+    return mono_nanos() / nanos_per_milli
 
 # sleep for the given number of milliseconds
 pub fn delay(ms: Int):

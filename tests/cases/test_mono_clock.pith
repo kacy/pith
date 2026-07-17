@@ -1,0 +1,17 @@
+# the monotonic nanosecond clock. raw timestamps are non-deterministic, so we
+# only assert the properties that must always hold: the clock advances across a
+# delay, the delta covers at least the delay, and the millisecond view tracks it.
+import std.time as time
+
+fn main():
+    before := time.mono_nanos()
+    time.delay(10)
+    after := time.mono_nanos()
+    delta := after - before
+
+    ten_ms_in_nanos := 10000000
+
+    print("increases: {after > before}")
+    print("delta_covers_delay: {delta >= ten_ms_in_nanos}")
+    print("millis_tracks_nanos: {time.mono_millis() >= after / 1000000}")
+    print("ok")

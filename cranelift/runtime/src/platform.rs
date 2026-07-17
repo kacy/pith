@@ -1,7 +1,16 @@
 use crate::ffi_util::cstr_str;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 static RANDOM_SEED: AtomicU64 = AtomicU64::new(123456789);
+
+/// Process-start reference point for the monotonic clock.
+///
+/// `Instant` is guaranteed monotonic (never runs backwards), so measuring
+/// against a fixed start gives us a stable nanosecond timeline for the life
+/// of the process.
+static MONO_START: OnceLock<Instant> = OnceLock::new();
 
 /// Exit the program with given status code
 #[no_mangle]
@@ -23,6 +32,17 @@ pub extern "C" fn pith_time() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Get a monotonic timestamp in nanoseconds.
+///
+/// Unlike `pith_time`, this is not wall-clock time: it only ever increases and
+/// is unaffected by clock adjustments, so it is safe for measuring durations.
+/// The value is relative to a fixed process-start point, not any epoch.
+#[no_mangle]
+pub extern "C" fn pith_time_nanos() -> i64 {
+    let start = MONO_START.get_or_init(Instant::now);
+    start.elapsed().as_nanos() as i64
 }
 
 /// Read a line from stdin

@@ -424,13 +424,58 @@ CREDIT_POKE_CAP := 1
 # several requests are queued behind the peer's MAX_CONCURRENT_STREAMS limit.
 SLOT_POKE_CAP := 256
 
+# the client's socket-ownership mode (see the "inline fast-path" note below).
+# INLINE runs a single in-flight request synchronously on the caller; PROMOTING
+# is the brief transition; THREADED is the reader/writer pipeline. mode only ever
+# moves forward, INLINE -> PROMOTING -> THREADED, never back.
+MODE_INLINE := 0
+MODE_PROMOTING := 1
+MODE_THREADED := 2
+
 # a multiplexed http/2 client over one connection. many request() calls share
-# it: the reader and writer tasks run for the client's lifetime, and the mutex
-# guards the stream table, the id counter, the closed/going-away flags, and the
-# last stream the peer promised to serve. the channels are already safe to use
-# across tasks. `active` mirrors the stream-table keys because Map[Int, _].keys()
-# does not yet enumerate int keys. `writer` is the write task's handle, awaited on
-# close() so a final GOAWAY flushes before the transport drops.
+# it. the mutex guards the stream table, the id counter, the closed/going-away
+# flags, and the last stream the peer promised to serve; the channels are
+# already safe to use across tasks. `active` mirrors the stream-table keys
+# because Map[Int, _].keys() does not yet enumerate int keys.
+#
+# --- the inline fast-path ---
+#
+# a client starts in MODE_INLINE and runs a single in-flight request/response
+# synchronously on the calling thread — the same lockstep codec the one-shot
+# get() uses — with no channel handoffs. this is the whole win for sequential
+# traffic (the common grpc unary case): one thread, one write, no arbitration,
+# because with only one stream in flight there is nothing to coalesce and no
+# hpack ordering to referee.
+#
+# the client promotes to the threaded pipeline, exactly once, the first time a
+# second stream wants the connection at the same time (a concurrent request, or
+# any streaming rpc). promotion is a one-way latch: a client that has ever seen
+# concurrency stays THREADED for the rest of its life, and concurrent behaviour
+# is then exactly what it was before this fast-path existed.
+#
+# both the reader and the writer tasks are spawned up front, but they stay parked
+# through the inline phase so they never touch the socket while an inline call
+# owns it. the writer parks on `outbound` (an inline call writes to the socket
+# directly, so nothing is ever queued); the reader parks on `promote_gate` and
+# does not read a single frame until it is released. parking them costs no
+# latency — the inline hot path never hands off to either — and it keeps the spawn
+# out of the request path, where spawning the reader has proven unreliable. the
+# tasks also hold the live references that keep the connection pinned for the
+# client's lifetime.
+#
+# promotion is the delicate part: the reader must not read the socket or touch
+# the hpack decoder while an inline call still owns them (two readers on one tls
+# session are illegal, and the decoder is single-owner by protocol). `gate`
+# guards the small state machine (`mode` and `inline_busy`, an inline call's
+# lease on the socket + codec). the promoter latches `mode`, waits on `handoff`
+# for any in-flight inline call to drop its lease, releases the reader through
+# `promote_gate`, and closes `ready` to wake any other caller that was waiting on
+# the promotion. `gate` is deliberately a separate lock from `mu`: the inline
+# lease is released under `gate` only, so it can never be blocked behind a
+# threaded caller that is holding `mu` while it waits on a full `outbound`.
+#
+# `writer` is the writer's handle, awaited on close() so a final GOAWAY flushes
+# before the transport drops.
 pub struct Client:
     conn: Connection
     mu: Mutex
@@ -462,6 +507,21 @@ pub struct Client:
     # on `slot_free` for a slot when the cap is reached; forget() pokes it.
     mut max_concurrent: Int
     slot_free: Channel[Int]
+    # the inline fast-path state (see the struct note above). `gate` guards `mode`
+    # and `inline_busy`; `handoff` (capacity 1) lets the promoter wait for an
+    # in-flight inline call to release the socket; `promote_gate` (capacity 1)
+    # releases the parked reader when the client promotes; `ready` is closed once
+    # the pipeline is up so any threaded caller that arrived mid-promotion can
+    # proceed. `inline_body_sent` totals the request-body bytes the inline path
+    # wrote, debited from the connection send window at promotion so the threaded
+    # sender does not over-count the peer's connection-level receive window.
+    gate: Mutex
+    mut mode: Int
+    mut inline_busy: Bool
+    handoff: Channel[Int]
+    ready: Channel[Int]
+    promote_gate: Channel[Int]
+    mut inline_body_sent: Int
 
 # a single http/2 stream: an opened request whose body and response flow
 # incrementally, for streaming rpcs (grpc server-, client-, and bidi-streaming).
@@ -508,8 +568,11 @@ impl Stream:
 fn idle_writer() -> Int:
     return 0
 
-# build a multiplexed client over an already-open connection: spawn the reader
-# and writer tasks and wire up the stream table. shared by open and
+# build a multiplexed client over an already-open connection, ready to serve
+# requests inline. the client starts in MODE_INLINE; the reader and writer tasks
+# are spawned now but stay parked (the reader on `promote_gate`, the writer on
+# `outbound`) until the client promotes, so an inline call has the socket to
+# itself (see the Client note and ensure_threaded). shared by open and
 # open_with_config.
 fn client_from_connection(conn: Connection) -> Client:
     ids: List[Int] := []
@@ -518,16 +581,21 @@ fn client_from_connection(conn: Connection) -> Client:
     credit: Map[Int, Channel[Int]] := {}
     outbound := Channel[Bytes](OUTBOUND_CAP)
     closed := AtomicInt(0)
-    # the writer owns the send direction; spawn it before the client exists so
-    # its handle can be stored for a clean, flushing shutdown.
+    # spawn the writer before the client exists so its handle can be stored. it
+    # parks on `outbound` through the inline phase (inline calls write directly)
+    # and is ready to drain it the moment the client promotes.
     writer := spawn writer_loop(outbound, conn, closed)
-    client := Client(conn, Mutex(), 1, table, ids, outbound, closed, false, 0, writer, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP))
+    client := Client(conn, Mutex(), 1, table, ids, outbound, closed, false, 0, writer, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_INLINE, false, Channel[Int](1), Channel[Int](1), Channel[Int](1), 0)
+    # spawn the reader too, but it parks on `promote_gate` and reads nothing until
+    # promotion releases it. spawning both tasks here — never from the request
+    # path — keeps task startup off the hot path and has proven the reliable place
+    # to start the reader.
     spawn reader_loop(client)
     return client
 
 # open a multiplexed client to host:port over tls with alpn "h2", trusting the
-# system roots. spawns the reader and writer tasks; call close() to stop them and
-# drop the connection.
+# system roots. the first sequential requests run inline; the client promotes to
+# the reader/writer pipeline once concurrency appears. call close() when done.
 pub fn open(host: String, port: Int) -> Client!:
     conn := connect(host, port)!
     return client_from_connection(conn)
@@ -603,11 +671,18 @@ fn list_remove_int(items: List[Int], target: Int) -> List[Int]:
             out.push(item)
     return out
 
-# the reader task: read frames until the connection ends, demuxing each to its
-# stream and servicing connection housekeeping. a read error tears the whole
-# connection down; a protocol error additionally sends a GOAWAY naming the fault
-# before failing every waiting stream so their request() calls unblock.
+# the reader task: once released, read frames until the connection ends, demuxing
+# each to its stream and servicing connection housekeeping. a read error tears the
+# whole connection down; a protocol error additionally sends a GOAWAY naming the
+# fault before failing every waiting stream so their request() calls unblock.
 fn reader_loop(client: Client):
+    # park until the client promotes. through the inline phase the inline call
+    # owns the socket, so the reader must not read a single frame. close() before
+    # any promotion closes the gate instead, which also releases us; either way we
+    # bail immediately if the client has been closed.
+    client.promote_gate.recv()
+    if client.closed.load() != 0:
+        return
     while true:
         attempt := client.conn.read_frame()
         if attempt.is_err:
@@ -1076,13 +1151,126 @@ impl Client:
         mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
         for f in extra:
             fields.push(f)
+        # a stream is long-lived and its events flow through the reader, so it can
+        # never run on the inline path: promote to the pipeline before opening it.
+        self.ensure_threaded()
         return self.open_stream_with_fields(fields, end_stream)!
 
+    # --- inline fast-path plumbing (see the Client note) ---
+
+    # try to take the inline lease: succeed only while the connection is still
+    # single-stream (MODE_INLINE) and no other inline call holds it. on success
+    # the caller owns the socket, the encoder and the decoder until end_inline().
+    fn try_begin_inline() -> Bool:
+        self.gate.lock()
+        if self.closed.load() != 0 or self.mode != MODE_INLINE or self.inline_busy:
+            self.gate.unlock()
+            return false
+        self.inline_busy = true
+        self.gate.unlock()
+        return true
+
+    # release the inline lease. if a promotion latched while this call held the
+    # socket, hand it over — the promoter is (or will soon be) waiting on
+    # `handoff`. the poke is capacity-1 and coalesced, so a stray poke (the
+    # promoter already saw us idle) is harmless: promotion happens at most once.
+    fn end_inline():
+        self.gate.lock()
+        self.inline_busy = false
+        promoting := self.mode != MODE_INLINE
+        self.gate.unlock()
+        if promoting:
+            self.handoff.try_send(1)
+
+    # promote to the threaded pipeline, exactly once, releasing the parked reader
+    # so it takes over the socket. safe to call from many threads: the first mover
+    # promotes, the rest wait on `ready`. because a caller returns only after any
+    # in-flight inline call has released the socket and the reader owns it, the
+    # caller can then open a stream with no risk of racing the inline codec.
+    fn ensure_threaded():
+        self.gate.lock()
+        m := self.mode
+        if m == MODE_THREADED:
+            self.gate.unlock()
+            return
+        if m == MODE_PROMOTING:
+            self.gate.unlock()
+            # another caller is promoting; wait for it. recv returns once `ready`
+            # is closed (or at once if it already is).
+            self.ready.recv()
+            return
+        # m == MODE_INLINE: we are the promoter.
+        self.mode = MODE_PROMOTING
+        must_wait := self.inline_busy
+        self.gate.unlock()
+        if must_wait:
+            # an inline call still owns the socket + decoder; wait for it to drop
+            # its lease before we hand them to the reader. two readers on one tls
+            # session are illegal, and the decoder is single-owner by protocol.
+            self.handoff.recv()
+        # the inline path is fully drained now, and no new inline call can start
+        # (mode is past INLINE), so its bookkeeping is stable.
+        if self.closed.load() == 0:
+            # debit the send window by what the inline path already put on the
+            # wire, so the threaded sender does not over-count the peer's
+            # connection-level receive window (RFC 9113 §6.9.1). the peer's later
+            # WINDOW_UPDATE(0) frames — now handled by the reader — top it back up.
+            self.mu.lock()
+            self.conn_send_window = self.conn_send_window - self.inline_body_sent
+            self.mu.unlock()
+            # the writer already runs and the reader is already spawned (parked
+            # on promote_gate); release it to take over the socket now.
+            self.promote_gate.send(1)
+        self.gate.lock()
+        self.mode = MODE_THREADED
+        self.gate.unlock()
+        # release every caller that was waiting on the promotion.
+        self.ready.close()
+
+    # run one request/response synchronously on the caller, holding the inline
+    # lease. with a single stream in flight this reuses the lockstep codec — no
+    # reader/writer tasks, no channel handoffs. precondition: try_begin_inline()
+    # returned true, and the body fits one DATA frame within the send window (so
+    # the write never blocks on flow control before the response is read).
+    fn inline_round_trip(fields: List[hpack.HeaderField], body: Bytes) -> Response!:
+        has_body := body.len() > 0
+        # the inline lease makes this the sole user of the socket, the encoder,
+        # the decoder and next_stream_id (the reader/writer are not spawned until
+        # this call releases the lease), so no mutex is needed here.
+        stream_id := self.next_stream_id
+        self.next_stream_id = self.next_stream_id + 2
+        block := self.conn.encoder.encode(fields)
+        self.conn.send_frame(frames.headers_frame(stream_id, block, not has_body, true))!
+        if has_body:
+            self.conn.send_frame(frames.data_frame(stream_id, body, true))!
+            self.inline_body_sent = self.inline_body_sent + body.len()
+        return self.conn.read_response(stream_id)!
+
     # send a request with the given header fields and body, and read its full
-    # response. built on open_stream_with_fields: an empty body half-closes on the
-    # HEADERS frame; a non-empty body streams as flow-controlled DATA on its own
-    # task while the response is read. safe to call from many tasks concurrently.
+    # response. runs inline (synchronously on the caller) while the connection is
+    # still single-stream, else through the multiplexing pipeline. safe to call
+    # from many tasks concurrently.
     fn do_request(fields: List[hpack.HeaderField], body: Bytes) -> Response!:
+        # fast path: a body small enough to ride one DATA frame within the send
+        # window, on a connection no other inline call is using. this is the
+        # common grpc unary shape, and it avoids the pipeline entirely.
+        if body.len() <= self.peer_max_frame_size and self.try_begin_inline():
+            result := self.inline_round_trip(fields, body)
+            # release the lease before propagating, so an error never leaks it.
+            self.end_inline()
+            if result.is_err:
+                fail result.err
+            return result.ok
+        # slow path: concurrency, or a body large enough to need flow control.
+        # bring up the pipeline (once) and multiplex exactly as before.
+        self.ensure_threaded()
+        return self.threaded_request(fields, body)!
+
+    # the multiplexing request path: open a stream, send the body, and assemble
+    # the response from the reader's stream events. built on open_stream_with_fields:
+    # an empty body half-closes on the HEADERS frame; a non-empty body streams as
+    # flow-controlled DATA on its own task while the response is read.
+    fn threaded_request(fields: List[hpack.HeaderField], body: Bytes) -> Response!:
         has_body := body.len() > 0
         stream := self.open_stream_with_fields(fields, not has_body)!
         stream_id := stream.id
@@ -1131,15 +1319,21 @@ impl Client:
         fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", "https"), hpack.header_field(":authority", authority)]
         return self.do_request(fields, bytes.empty())!
 
-    # stop the reader and writer tasks and close the connection. a GOAWAY is
-    # queued first and the writer is awaited so it flushes before the transport
-    # drops; the reader then unblocks on the closed transport.
+    # stop the client and close the connection. call it when no request is in
+    # flight. a GOAWAY is queued first and the writer (which runs for the whole
+    # client lifetime) is awaited so it flushes before the transport drops; a
+    # promoted client's reader then unblocks on the closed transport.
     pub fn close():
         self.mu.lock()
         self.going_away = true
         self.mu.unlock()
-        send_goaway(self, frames.ERROR_NO_ERROR)
+        # mark closed first, so a concurrent promoter sees it and does not spawn a
+        # reader over a transport we are about to drop.
         self.closed.store(1)
+        # release the reader if it is still parked (client never promoted), so it
+        # observes closed and exits instead of parking forever.
+        self.promote_gate.close()
+        send_goaway(self, frames.ERROR_NO_ERROR)
         self.outbound.close()
         await self.writer
         self.conn.close()
@@ -1260,13 +1454,19 @@ test "a RST_STREAM on our stream fails the response":
 
 # build a Client over an offline connection without spawning the reader/writer
 # tasks, so a test can drive reader_loop directly and inspect the results. the
-# writer is an idle placeholder — the test owns the outbound channel itself.
+# writer is an idle placeholder — the test owns the outbound channel itself. the
+# client starts already in MODE_THREADED so the tests exercise the multiplexing
+# path directly, as they did before the inline fast-path existed. `promote_gate`
+# is pre-filled so a test that calls reader_loop directly runs it straight
+# through instead of parking (there is no promoter to release it).
 fn offline_client(conn: Connection) -> Client:
     ids: List[Int] := []
     table: Map[Int, Channel[StreamEvent]] := {}
     windows: Map[Int, Int] := {}
     credit: Map[Int, Channel[Int]] := {}
-    return Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP))
+    gate := Channel[Int](1)
+    gate.send(1)
+    return Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_THREADED, false, Channel[Int](1), Channel[Int](1), gate, 0)
 
 # pull the next event off an inbox, failing if the channel closed first.
 fn next_event(inbox: Channel[StreamEvent]) -> StreamEvent!:
@@ -1644,3 +1844,85 @@ test "drain_coalesced merges queued frames into one buffer in fifo order":
     assert_eq(merged.to_string_utf8()!, "AABBCC")
     # the channel is fully drained afterwards
     assert(outbound.try_recv() == none)
+
+# --- inline fast-path tests ---
+#
+# these drive the fast path over an offline connection: the request frames are
+# recorded in conn.sent and the response is read out of a preloaded frame buffer,
+# so a whole unary round-trip runs synchronously on the caller with no reader or
+# writer task. the promotion tests then check the one-way latch and its send-window
+# bookkeeping without needing a live socket.
+
+test "an inline request runs synchronously and leaves the client single-stream":
+    block := header_block([hpack.header_field(":status", "200"), hpack.header_field("content-type", "application/grpc")])
+    server := encode_frames([frames.headers_frame(1, block, false, true), frames.data_frame(1, bytes.from_string_utf8("pong"), true)])!
+    client := client_from_connection(connection_from_frames(server))
+    no_extra: List[hpack.HeaderField] := []
+    resp := client.request("POST", "example.com", "/svc/method", no_extra, bytes.from_string_utf8("ping"))!
+    assert_eq(resp.status, 200)
+    assert_eq(resp.body.to_string_utf8()!, "pong")
+    # no second stream ever appeared, so the client stayed inline: no pipeline.
+    assert_eq(client.mode, MODE_INLINE)
+    assert(not client.inline_busy)
+    # the 4-byte request body was sent and counted for the promotion debit.
+    assert_eq(client.inline_body_sent, 4)
+    # the stream id advanced by two, ready for the next inline call.
+    assert_eq(client.next_stream_id, 3)
+    client.close()
+
+test "sequential inline requests reuse the fast path with monotonic ids":
+    # one shared encoder builds both response blocks so the client's single
+    # decoder stays in step reading them in order, just as it will on the wire.
+    enc := hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false)
+    b1 := enc.encode([hpack.header_field(":status", "200")])
+    b2 := enc.encode([hpack.header_field(":status", "200")])
+    server := encode_frames([frames.headers_frame(1, b1, false, true), frames.data_frame(1, bytes.from_string_utf8("one"), true), frames.headers_frame(3, b2, false, true), frames.data_frame(3, bytes.from_string_utf8("two"), true)])!
+    client := client_from_connection(connection_from_frames(server))
+    r1 := client.get("example.com", "/a")!
+    assert_eq(r1.body.to_string_utf8()!, "one")
+    r2 := client.get("example.com", "/b")!
+    assert_eq(r2.body.to_string_utf8()!, "two")
+    # both ran inline; the ids used were 1 then 3.
+    assert_eq(client.mode, MODE_INLINE)
+    assert_eq(client.next_stream_id, 5)
+    client.close()
+
+test "the inline lease is exclusive and released again by end_inline":
+    client := client_from_connection(connection_from_frames(bytes.empty()))
+    assert_eq(client.mode, MODE_INLINE)
+    assert(client.try_begin_inline())
+    # a second attempt fails while the lease is held.
+    assert(not client.try_begin_inline())
+    client.end_inline()
+    # released, the lease can be retaken.
+    assert(client.try_begin_inline())
+    client.end_inline()
+    client.close()
+
+test "a closed client refuses the inline lease":
+    client := client_from_connection(connection_from_frames(bytes.empty()))
+    client.closed.store(1)
+    assert(not client.try_begin_inline())
+    client.close()
+
+test "ensure_threaded is a no-op once the client is already threaded":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    assert_eq(client.mode, MODE_THREADED)
+    client.ensure_threaded()
+    assert_eq(client.mode, MODE_THREADED)
+
+test "the first concurrency promotes the client and debits the inline bytes":
+    client := client_from_connection(connection_from_frames(bytes.empty()))
+    assert_eq(client.mode, MODE_INLINE)
+    # stand in for an inline call that already put 20 body bytes on the wire.
+    client.inline_body_sent = 20
+    client.ensure_threaded()
+    # the one-way latch is now set and the pipeline owns the socket.
+    assert_eq(client.mode, MODE_THREADED)
+    # the send window was debited by the inline body bytes, so the threaded
+    # sender does not over-count the peer's connection receive window.
+    assert_eq(client.conn_send_window, DEFAULT_INITIAL_WINDOW - 20)
+    # promotion is idempotent.
+    client.ensure_threaded()
+    assert_eq(client.mode, MODE_THREADED)
+    client.close()

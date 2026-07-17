@@ -144,6 +144,25 @@ copies (`std.collections.copy_list` and friends) are also safe to
 hand off. this rule is convention today, not yet enforced by the
 checker.
 
+## per-thread globals
+
+a module global marked `threadlocal` gets a separate copy per os thread,
+created lazily the first time a thread reads it. each task mutates its
+own copy with no lock and no race, which is exactly what you want for
+per-task scratch state — a parser's cursor, a buffer, a request-scoped
+counter:
+
+```
+threadlocal mut counter := 0
+threadlocal mut arena: Map[Int, Node] := {}
+```
+
+it reads and writes like any other global; only the storage is
+per-thread. a copy is not reclaimed when its thread exits, so keep the
+set of `threadlocal` globals small and the values scratch-sized. use it
+for state that is genuinely per-task; a value shared *across* tasks still
+belongs in a struct or behind a channel.
+
 things that are still intentionally explicit or still growing:
 
 - task cancellation is cooperative, not forceful

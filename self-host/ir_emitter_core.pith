@@ -112,6 +112,13 @@ mut ir_dtor_memo: Map[String, Int] := {} # 1 needs dtor, 2 no/undecided
 mut ir_tuple_dtor_sigs: List[String] := [] # rc-element signatures seen this module
 
 mut ir_func_result_ok_kinds: Map[String, String] := {}
+# `threadlocal` module globals: name -> a process-unique slot id, and name ->
+# the global's ir retkind (for the init thunk header + access typing). Reads and
+# writes of these names route through pith_tls_get_or_init / pith_tls_set instead
+# of a shared data slot. Accumulated across modules; slots stay unique.
+mut ir_threadlocal_slots: Map[String, Int] := {}
+mut ir_threadlocal_kinds: Map[String, String] := {}
+mut ir_next_tls_slot := 0
 mut ir_named_fn_value_wrappers: Map[String, String] := {}
 mut ir_lambda_count := 0
 mut ir_for_count := 0
@@ -654,7 +661,7 @@ fn ir_emit_string_cleanup(exclude: String):
             kind = ir_rc_local_kinds[i]
         if name != exclude and ir_rc_release_enabled(kind):
             r := ir_reg()
-            ir_emit("load " + r.to_string() + " " + ir_resolve_storage_name(name))
+            ir_emit_name_load(r, name)
             ir_rc_release_reg(r, kind)
         i = i + 1
 
@@ -823,12 +830,12 @@ fn ir_emit_string_prologue(body_idx: Int):
         if ir_var_regs.contains_key(name):
             # param: retain the caller's value, no zero-store
             r := ir_reg()
-            ir_emit("load " + r.to_string() + " " + ir_resolve_storage_name(name))
+            ir_emit_name_load(r, name)
             ir_rc_retain_reg(r, ir_rc_local_kind(name))
         else:
             z := ir_reg()
             ir_emit("iconst " + z.to_string() + " 0")
-            ir_emit("store " + ir_resolve_storage_name(name) + " " + z.to_string())
+            ir_emit_name_store(name, z)
         i = i + 1
 
 fn ir_ident_callee(name: String) -> ResolvedCallee:
@@ -4031,8 +4038,9 @@ fn ir_emit_ident_load(idx: Int, name: String) -> Int:
         wrapper_name := ir_named_function_value_wrapper(idx, callee.name)
         ir_emit("closure_ref " + r.to_string() + " " + wrapper_name)
         return r
-    # normal variables and globals still load through storage.
-    ir_emit("load " + r.to_string() + " " + ir_resolve_storage_name(name))
+    # normal variables and globals still load through storage; threadlocal
+    # globals route through the tls runtime inside ir_emit_name_load.
+    ir_emit_name_load(r, name)
     return r
 
 # True when any argument carries a field name (named construction).
@@ -4692,7 +4700,7 @@ fn ir_emit_bind_stmt(node: Node):
         mut old_r := 0 - 1
         if tracked and ir_rc_release_enabled(bind_kind):
             old_r = ir_reg()
-            ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
+            ir_emit_name_load(old_r, name)
         bind_target := ir_map_init_target(name, target_type)
         r := ir_emit_value_for_target(val_idx, bind_target)
         if tracked and bind_target != "tuple" and ir_string_expr_is_borrowed(val_idx):
@@ -4700,7 +4708,7 @@ fn ir_emit_bind_stmt(node: Node):
         if old_r >= 0:
             ir_rc_release_reg(old_r, bind_kind)
         ir_var_regs.insert(name, r)
-        ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
+        ir_emit_name_store(name, r)
         if not ir_var_types.contains_key(name):
             inferred := ir_infer_type(val_idx)
             if inferred.len() > 0:
@@ -4720,7 +4728,7 @@ fn ir_emit_assign_stmt(node: Node):
         if legacy_kind.len() > 0 and ir_rc_release_enabled(legacy_kind):
             if tracked or (legacy_kind == "string" and ir_global_string_names.contains(name)):
                 old_r = ir_reg()
-                ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
+                ir_emit_name_load(old_r, name)
         legacy_target := ir_map_init_target(name, ir_lookup_name_type(name))
         r := ir_emit_value_for_target(node.children[0], legacy_target)
         if legacy_kind.len() > 0 and legacy_target != "tuple" and ir_string_expr_is_borrowed(node.children[0]):
@@ -4728,7 +4736,7 @@ fn ir_emit_assign_stmt(node: Node):
         if old_r >= 0:
             ir_rc_release_reg(old_r, legacy_kind)
         ir_var_regs.insert(name, r)
-        ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
+        ir_emit_name_store(name, r)
 
 fn ir_resolve_field_lookup_key(recv_idx: Int, fname: String) -> String:
     direct := ir_field_lookup_key(recv_idx, fname)
@@ -4831,7 +4839,7 @@ fn ir_emit_compound_assignment(node: Node):
         if assign_kind.len() > 0 and ir_rc_release_enabled(assign_kind):
             if tracked or (assign_kind == "string" and ir_global_string_names.contains(name)):
                 old_r = ir_reg()
-                ir_emit("load " + old_r.to_string() + " " + ir_resolve_storage_name(name))
+                ir_emit_name_load(old_r, name)
         assign_target := ir_map_init_target(name, target_type)
         r := ir_emit_value_for_target(node.children[1], assign_target)
         # a tuple (optional) rhs is owned from ir_emit_value_for_target; don't retain.
@@ -4839,7 +4847,7 @@ fn ir_emit_compound_assignment(node: Node):
             ir_rc_retain_reg(r, assign_kind)
         if old_r >= 0:
             ir_rc_release_reg(old_r, assign_kind)
-        ir_emit("store " + ir_resolve_storage_name(name) + " " + r.to_string())
+        ir_emit_name_store(name, r)
         return
     compound_op := ir_compound_assignment_ir_op(op)
     if compound_op.len() > 0 and node.children.len() >= 2:
@@ -4848,11 +4856,11 @@ fn ir_emit_compound_assignment(node: Node):
         tn := get_node(node.children[0])
         name := tn.value
         cur := ir_reg()
-        ir_emit("load " + cur.to_string() + " " + ir_resolve_storage_name(name))
+        ir_emit_name_load(cur, name)
         rhs := ir_expr(node.children[1])
         res := ir_reg()
         ir_emit_simple_binary(res, compound_op, cur, rhs)
-        ir_emit("store " + ir_resolve_storage_name(name) + " " + res.to_string())
+        ir_emit_name_store(name, res)
 
 # emit a label and clear the return-tracking flag: a label starts a
 # fresh block, so whatever terminator came before it belongs to a
@@ -5866,7 +5874,7 @@ fn ir_record_returns_clause(name: String, returns_node: Node):
             if type_node.children.len() > 0:
                 ir_func_result_ok_kinds.insert(name, ir_retkind(ir_resolve_type_node(type_node.children[0])))
 
-fn ir_emit_global_binding(node: Node):
+fn ir_emit_global_binding(node: Node, is_threadlocal: Bool):
     gname := ir_binding_name(node)
     mut init_val := "0"
     mut global_type := ""
@@ -5913,13 +5921,91 @@ fn ir_emit_global_binding(node: Node):
         ir_record_global_type(gname, global_type)
     if global_map_value_type.len() > 0:
         ir_global_map_value_types.insert(gname, global_map_value_type)
+    if is_threadlocal:
+        # per-thread storage: no shared data slot. record a unique slot and the
+        # global's kind so reads/writes route through the tls runtime calls, and
+        # so ir_emit_tls_thunks can generate its lazy per-thread initializer.
+        ir_threadlocal_slots.insert(gname, ir_next_tls_slot)
+        ir_threadlocal_kinds.insert(gname, global_type)
+        ir_next_tls_slot = ir_next_tls_slot + 1
+        return
     ir_emit("global " + gname + " " + init_val)
+
+# generate the per-thread lazy initializer for each threadlocal global: a
+# `() -> kind` thunk that builds the same initial value a plain global would get
+# at startup. pith_tls_get_or_init calls it the first time a thread reads the
+# global. mirrors the value-building in ir_emit_init_globals, but returns the
+# value instead of storing it into a shared slot.
+fn ir_emit_tls_thunks(root: Node):
+    for child in root.children:
+        cn := ir_unwrap_pub_node(child)
+        if cn.kind != "threadlocal":
+            continue
+        binding := get_node(cn.children[0])
+        if not ir_is_binding_kind(binding.kind):
+            continue
+        gname := ir_binding_name(binding)
+        parts := ir_collect_bind_parts(binding)
+        mut target := ""
+        if parts.type_idx >= 0:
+            target = ir_resolve_type_node(parts.type_idx)
+        if target.len() == 0:
+            target = ir_infer_type(parts.val_idx)
+        ir_prepare_func_emission(target)
+        ir_emit_func_header("__tlsinit_" + gname, 0, target)
+        gtarget := ir_map_init_target(gname, target)
+        r := ir_emit_value_for_target(parts.val_idx, gtarget)
+        gkind := ir_rc_kind(target)
+        if gkind.len() > 0 and gtarget != "tuple" and ir_string_expr_is_borrowed(parts.val_idx):
+            ir_rc_retain_reg(r, gkind)
+        ir_emit("ret " + r.to_string())
+        ir_emit("endfunc")
+
+# read a threadlocal global into dest_r: call the runtime, which returns this
+# thread's value (initializing it via the thunk on first access).
+fn ir_emit_tls_load(dest_r: Int, name: String):
+    slot_r := ir_reg()
+    ir_emit("iconst " + slot_r.to_string() + " " + ir_threadlocal_slots[name].to_string())
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " __tlsinit_" + name)
+    ir_emit("call " + dest_r.to_string() + " pith_tls_get_or_init " + ir_threadlocal_kinds[name] + " 2 " + slot_r.to_string() + " " + fr.to_string())
+
+# write val_r into a threadlocal global for this thread.
+fn ir_emit_tls_store(name: String, val_r: Int):
+    slot_r := ir_reg()
+    ir_emit("iconst " + slot_r.to_string() + " " + ir_threadlocal_slots[name].to_string())
+    ir_emit("call " + ir_reg().to_string() + " pith_tls_set void 2 " + slot_r.to_string() + " " + val_r.to_string())
+
+# a name refers to a threadlocal global only when it is a recorded threadlocal
+# and not shadowed by a local of the same name in the current function.
+fn ir_name_is_threadlocal(name: String) -> Bool:
+    return ir_threadlocal_slots.contains_key(name) and not ir_var_regs.contains_key(name)
+
+# emit a load of `name`, routing threadlocal globals through the tls runtime and
+# everything else (locals, plain globals) through the normal storage slot.
+fn ir_emit_name_load(dest_r: Int, name: String):
+    if ir_name_is_threadlocal(name):
+        ir_emit_tls_load(dest_r, name)
+    else:
+        ir_emit("load " + dest_r.to_string() + " " + ir_resolve_storage_name(name))
+
+# emit a store of val_r into `name`, routing threadlocal globals through the tls
+# runtime and everything else through the normal storage slot.
+fn ir_emit_name_store(name: String, val_r: Int):
+    if ir_name_is_threadlocal(name):
+        ir_emit_tls_store(name, val_r)
+    else:
+        ir_emit("store " + ir_resolve_storage_name(name) + " " + val_r.to_string())
 
 fn ir_emit_global_bindings(root: Node):
     for child in root.children:
         cn := ir_unwrap_pub_node(child)
-        if ir_is_binding_kind(cn.kind):
-            ir_emit_global_binding(cn)
+        if cn.kind == "threadlocal":
+            inner := get_node(cn.children[0])
+            if ir_is_binding_kind(inner.kind):
+                ir_emit_global_binding(inner, true)
+        elif ir_is_binding_kind(cn.kind):
+            ir_emit_global_binding(cn, false)
 
 # attach the type's destructor to a freshly built struct so its rc
 # fields release when the struct dies
@@ -6301,6 +6387,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_generic_dtor_base = {}
     ir_generic_dtor_args = {}
     ir_emit_global_bindings(root)
+    ir_emit_tls_thunks(root)
     ir_emit_init_globals(root)
     ir_emit_optional_dtors()
     ir_emit_struct_dtors()

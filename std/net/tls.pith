@@ -28,17 +28,10 @@ mut native_server_key_der: Map[Int, Bytes] := {}
 mut native_server_client_ca_pem: Map[Int, String] := {}
 mut native_server_client_ca_optional: Map[Int, Bool] := {}
 mut native_listener_config: Map[Int, Int] := {}
-mut native_conn_fd: Map[Int, Int] := {}
-mut native_conn_cipher: Map[Int, Int] := {}
-mut native_conn_read_key: Map[Int, Bytes] := {}
-mut native_conn_read_iv: Map[Int, Bytes] := {}
-mut native_conn_write_key: Map[Int, Bytes] := {}
-mut native_conn_write_iv: Map[Int, Bytes] := {}
-mut native_conn_read_seq: Map[Int, Int] := {}
-mut native_conn_write_seq: Map[Int, Int] := {}
-mut native_conn_pending: Map[Int, Bytes] := {}
-mut native_conn_cache_key: Map[Int, String] := {}
-mut native_conn_resumption_master_secret: Map[Int, Bytes] := {}
+# per-connection tls state was 12 module-global maps keyed by conn handle,
+# raced by two connections doing i/o at once. it now lives in one
+# NativeConnState struct in a single mutex-guarded map (defined just after
+# ConnectionState below).
 TLS_CONTENT_CHANGE_CIPHER_SPEC := 20
 TLS_CONTENT_ALERT := 21
 TLS_CONTENT_HANDSHAKE := 22
@@ -128,6 +121,56 @@ pub struct ConnectionState:
     pub client_auth_requested: Bool
     pub client_auth_verified: Bool
 
+# per-connection native tls state. a connection's reader advances read_seq and
+# pending while its writer advances write_seq — disjoint fields — so only the
+# map that holds these structs needs a lock; the struct itself does not.
+struct NativeConnState:
+    fd: Int
+    cipher: Int
+    read_key: Bytes
+    read_iv: Bytes
+    write_key: Bytes
+    write_iv: Bytes
+    mut read_seq: Int
+    mut write_seq: Int
+    mut pending: Bytes
+    cache_key: String
+    resumption_master_secret: Bytes
+    state: ConnectionState
+
+mut native_conn_mu := Mutex()
+mut native_conn_states: Map[Int, NativeConnState] := {}
+
+# register a new connection's state and return its handle. the counter bump and
+# the insert run under the lock so concurrent handshakes can't collide.
+fn native_conn_register(state: NativeConnState) -> Int:
+    native_conn_mu.lock()
+    handle := next_native_conn_handle
+    next_native_conn_handle = next_native_conn_handle - 1
+    native_conn_states.insert(handle, state)
+    native_conn_mu.unlock()
+    return handle
+
+# fetch a connection's state struct. it is a reference, so mutating its read_seq
+# / write_seq / pending persists; the lock guards only the map lookup.
+fn native_conn_get(handle: Int) -> NativeConnState:
+    native_conn_mu.lock()
+    state := native_conn_states[handle]
+    native_conn_mu.unlock()
+    return state
+
+fn native_conn_has(handle: Int) -> Bool:
+    native_conn_mu.lock()
+    present := native_conn_states.contains_key(handle)
+    native_conn_mu.unlock()
+    return present
+
+fn native_conn_drop(handle: Int):
+    native_conn_mu.lock()
+    if native_conn_states.contains_key(handle):
+        native_conn_states.remove(handle)
+    native_conn_mu.unlock()
+
 # parsed client hello data used for server-side config selection.
 pub struct ClientHelloInfo:
     pub server_name: String
@@ -167,7 +210,6 @@ pub struct Listener:
 
 mut native_config_verify_connection: Map[Int, fn(ConfigHookContext) -> ConfigHookResult] := {}
 mut native_server_config_selector: Map[Int, fn(ConfigHookContext) -> ConfigHookResult] := {}
-mut native_conn_state: Map[Int, ConnectionState] := {}
 
 fn native_config_handle(roots_pem: String) -> Config!:
     if roots_pem == "":
@@ -247,7 +289,7 @@ fn is_native_server_config(config: Config) -> Bool:
     return native_server_cert_pem.contains_key(config.handle)
 
 fn is_native_conn(handle: Int) -> Bool:
-    return native_conn_fd.contains_key(handle)
+    return native_conn_has(handle)
 
 fn native_server_certificate_chain(config: Config) -> List[Bytes]!:
     if not native_server_cert_pem.contains_key(config.handle):
@@ -596,22 +638,8 @@ fn touch_client_cached_session(cache_key: String):
         native_client_session_cache_order.push(cache_key)
 
 fn allocate_native_conn(stream: TcpStream, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState) -> Conn:
-    handle := next_native_conn_handle
-    next_native_conn_handle = next_native_conn_handle - 1
-    native_conn_fd.insert(handle, stream.fd)
-    native_conn_cipher.insert(handle, cipher)
-    native_conn_read_key.insert(handle, read_keys.key)
-    native_conn_read_iv.insert(handle, read_keys.iv)
-    native_conn_write_key.insert(handle, write_keys.key)
-    native_conn_write_iv.insert(handle, write_keys.iv)
-    native_conn_read_seq.insert(handle, read_seq)
-    native_conn_write_seq.insert(handle, write_seq)
-    native_conn_pending.insert(handle, bytes.empty())
-    native_conn_cache_key.insert(handle, cache_key)
-    native_conn_state.insert(handle, copy_connection_state(state))
-    if not resumption_master_secret.is_empty():
-        native_conn_resumption_master_secret.insert(handle, resumption_master_secret)
-    return Conn(handle)
+    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state))
+    return Conn(native_conn_register(cs))
 
 fn native_fail_alert(record: tls13.Record) -> Bool!:
     alert := tls13.parse_alert(record.payload)
@@ -907,19 +935,18 @@ fn record_bytes(record: tls13.Record) -> Bytes!:
     return out.bytes()
 
 fn remember_client_ticket_from_message(handle: Int, cipher: Int, message: tls13.HandshakeMessage) -> Bool!:
-    if message.message_type != TLS_HANDSHAKE_NEW_SESSION_TICKET or not native_conn_resumption_master_secret.contains_key(handle):
+    cs := native_conn_get(handle)
+    if message.message_type != TLS_HANDSHAKE_NEW_SESSION_TICKET or cs.resumption_master_secret.is_empty():
         return false
-    cache_key := native_conn_cache_key[handle]
+    cache_key := cs.cache_key
     if cache_key == "":
         return false
     ticket_message := tls13.parse_new_session_ticket(message.body)!
     if ticket_message.ticket_lifetime <= 0:
         return false
-    psk := tls13.resumption_psk_sha256(native_conn_resumption_master_secret[handle], ticket_message.nonce)!
+    psk := tls13.resumption_psk_sha256(cs.resumption_master_secret, ticket_message.nonce)!
     expires_at_ms := time.now() + ttl_ms(ticket_message.ticket_lifetime)
-    mut state := empty_connection_state()
-    if native_conn_state.contains_key(handle):
-        state = native_conn_state[handle]
+    state := cs.state
     peer := peer_identity_from_connection_state(state)
     remember_client_cached_session(cache_key, cached_session_from_peer(ticket_message.ticket, psk, cipher, state.negotiated_protocol, peer, expires_at_ms))
     return true
@@ -928,26 +955,27 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     mut size := max_bytes
     if size <= 0:
         size = 4096
-    pending := native_conn_pending[handle]
+    cs := native_conn_get(handle)
+    pending := cs.pending
     if pending.len() > 0:
         if pending.len() > size:
             out := pending.slice(0, size)
-            native_conn_pending.insert(handle, pending.slice(size, pending.len()))
+            cs.pending = pending.slice(size, pending.len())
             return out
-        native_conn_pending.insert(handle, bytes.empty())
+        cs.pending = bytes.empty()
         return pending
 
-    stream := TcpStream(native_conn_fd[handle])
-    cipher := native_conn_cipher[handle]
+    stream := TcpStream(cs.fd)
+    cipher := cs.cipher
     while true:
         record := native_read_record(stream)!
         if record.content_type == TLS_CONTENT_ALERT:
             return bytes.empty()
         if record.content_type != TLS_CONTENT_APPLICATION_DATA:
             continue
-        seq := native_conn_read_seq[handle]
-        inner := open_record_for_cipher(cipher, native_conn_read_key[handle], native_conn_read_iv[handle], seq, record_bytes(record)!)!
-        native_conn_read_seq.insert(handle, seq + 1)
+        seq := cs.read_seq
+        inner := open_record_for_cipher(cipher, cs.read_key, cs.read_iv, seq, record_bytes(record)!)!
+        cs.read_seq = seq + 1
         if inner.content_type == TLS_CONTENT_ALERT:
             return bytes.empty()
         if inner.content_type == TLS_CONTENT_HANDSHAKE:
@@ -958,51 +986,32 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
         if inner.content_type == TLS_CONTENT_APPLICATION_DATA:
             payload := inner.payload
             if payload.len() > size:
-                native_conn_pending.insert(handle, payload.slice(size, payload.len()))
+                cs.pending = payload.slice(size, payload.len())
                 return payload.slice(0, size)
             return payload
 
 fn native_conn_write_bytes(handle: Int, data: Bytes) -> Int!:
     if data.len() == 0:
         return 0
-    stream := TcpStream(native_conn_fd[handle])
-    cipher := native_conn_cipher[handle]
+    cs := native_conn_get(handle)
+    stream := TcpStream(cs.fd)
+    cipher := cs.cipher
     mut count := data.len()
     if count > TLS_MAX_PLAINTEXT_RECORD:
         count = TLS_MAX_PLAINTEXT_RECORD
     chunk := data.slice(0, count)
-    seq := native_conn_write_seq[handle]
-    record := seal_record_for_cipher(cipher, native_conn_write_key[handle], native_conn_write_iv[handle], seq, TLS_CONTENT_APPLICATION_DATA, chunk)!
+    seq := cs.write_seq
+    record := seal_record_for_cipher(cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_APPLICATION_DATA, chunk)!
     native_write_all(stream, record)!
-    native_conn_write_seq.insert(handle, seq + 1)
+    cs.write_seq = seq + 1
     return count
 
 fn native_conn_close(handle: Int):
-    if native_conn_fd.contains_key(handle):
-        tcp_close(native_conn_fd[handle])
-        native_conn_fd.remove(handle)
-    if native_conn_cipher.contains_key(handle):
-        native_conn_cipher.remove(handle)
-    if native_conn_read_key.contains_key(handle):
-        native_conn_read_key.remove(handle)
-    if native_conn_read_iv.contains_key(handle):
-        native_conn_read_iv.remove(handle)
-    if native_conn_write_key.contains_key(handle):
-        native_conn_write_key.remove(handle)
-    if native_conn_write_iv.contains_key(handle):
-        native_conn_write_iv.remove(handle)
-    if native_conn_read_seq.contains_key(handle):
-        native_conn_read_seq.remove(handle)
-    if native_conn_write_seq.contains_key(handle):
-        native_conn_write_seq.remove(handle)
-    if native_conn_pending.contains_key(handle):
-        native_conn_pending.remove(handle)
-    if native_conn_cache_key.contains_key(handle):
-        native_conn_cache_key.remove(handle)
-    if native_conn_resumption_master_secret.contains_key(handle):
-        native_conn_resumption_master_secret.remove(handle)
-    if native_conn_state.contains_key(handle):
-        native_conn_state.remove(handle)
+    if not native_conn_has(handle):
+        return
+    fd := native_conn_get(handle).fd
+    tcp_close(fd)
+    native_conn_drop(handle)
 
 # create a client config using system certificate roots.
 pub fn client_config() -> Config!:
@@ -1153,8 +1162,8 @@ impl Listener:
 
 impl Conn:
     fn state() -> ConnectionState:
-        if native_conn_state.contains_key(self.handle):
-            return copy_connection_state(native_conn_state[self.handle])
+        if native_conn_has(self.handle):
+            return copy_connection_state(native_conn_get(self.handle).state)
         return empty_connection_state()
 
     fn version() -> Int:

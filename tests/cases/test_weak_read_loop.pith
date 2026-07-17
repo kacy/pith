@@ -1,0 +1,25 @@
+# reading a `weak` field synthesizes a fresh borrowing optional each time; those
+# shells used to leak (one per read) and are now freed once the value is
+# extracted by `!= none` / `.value()`. this reads a weak parent pointer many
+# times and sums it — a use-after-free from the shell release would corrupt the
+# total or crash, and the leak-freedom itself is checked under valgrind.
+
+struct Node:
+    value: Int
+    mut next: Node?
+    weak parent: Node?
+
+fn read_parent(n: Node) -> Int:
+    if n.parent != none:
+        return n.parent.value().value
+    return 0
+
+fn main():
+    p := Node(value: 7, next: none, parent: none)
+    c := Node(value: 1, next: none, parent: p)
+    mut total := 0
+    mut i := 0
+    while i < 1000:
+        total = total + read_parent(c)
+        i = i + 1
+    print("total=" + total.to_string())

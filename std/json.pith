@@ -98,22 +98,22 @@ fn json_span_equals(input: Bytes, start: Int, end: Int, target: Bytes) -> Bool:
 # ===============================================================
 
 # Global node counter and type storage
-mut next_node_id: Int := 0
-mut node_types: Map[Int, String] := {}
-mut string_values: Map[Int, String] := {}
-mut integer_values: Map[Int, Int] := {}
-mut float_values: Map[Int, Float] := {}
-mut boolean_values: Map[Int, Bool] := {}
+threadlocal mut next_node_id: Int := 0
+threadlocal mut node_types: Map[Int, String] := {}
+threadlocal mut string_values: Map[Int, String] := {}
+threadlocal mut integer_values: Map[Int, Int] := {}
+threadlocal mut float_values: Map[Int, Float] := {}
+threadlocal mut boolean_values: Map[Int, Bool] := {}
 
 # Object children: per-object append-only storage keyed by object/id slot
-mut object_key_counts: Map[Int, Int] := {}
-mut object_keys_by_slot: Map[String, String] := {}
-mut object_values_by_slot: Map[String, Int] := {}
+threadlocal mut object_key_counts: Map[Int, Int] := {}
+threadlocal mut object_keys_by_slot: Map[String, String] := {}
+threadlocal mut object_values_by_slot: Map[String, Int] := {}
 
 # Array children: flat append-only storage with offset/count
-mut array_items_flat: List[Int] := []
-mut array_item_offsets: Map[Int, Int] := {}
-mut array_item_counts: Map[Int, Int] := {}
+threadlocal mut array_items_flat: List[Int] := []
+threadlocal mut array_item_offsets: Map[Int, Int] := {}
+threadlocal mut array_item_counts: Map[Int, Int] := {}
 
 # Allocates a new node of the specified type and returns its handle
 fn allocate_node(kind: String) -> Int:
@@ -170,9 +170,9 @@ fn push_array_element(handle: Int, value: Int):
 # ===============================================================
 
 # Parser state
-mut parser_input: String := ""
-mut parser_position: Int := 0
-mut parser_error: Bool := false
+threadlocal mut parser_input: String := ""
+threadlocal mut parser_position: Int := 0
+threadlocal mut parser_error: Bool := false
 
 # Returns character at position or empty string if out of bounds
 fn get_char_at(position: Int) -> String:

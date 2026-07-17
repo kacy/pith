@@ -1,0 +1,23 @@
+# io keeps every reader/writer/buffer's state in threadlocal globals, so tasks
+# using io.string_buffer (and the other buffered types) at the same time each
+# work in their own registry with no lock and no race. before the conversion
+# this same program corrupted the heap on every run. the total is
+# order-independent, so it pins the fix without being timing-sensitive.
+
+import std.io as io
+
+fn build(n: Int) -> Int:
+    mut total := 0
+    mut i := 0
+    while i < n:
+        buf := io.string_buffer()
+        buf.write("item-") catch 0
+        buf.write(i.to_string()) catch 0
+        total = total + buf.string().len()
+        i = i + 1
+    return total
+
+fn main():
+    t1 := spawn build(1500)
+    t2 := spawn build(1500)
+    print("total=" + (await t1 + await t2).to_string())

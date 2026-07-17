@@ -23,69 +23,69 @@ DEFAULT_CHUNK_SIZE := 4096
 # operations — never a source read or target write, which would
 # serialize every connection behind one blocked socket.
 mut io_registry_mu := Mutex()
-mut next_string_reader_handle: Int := 1
-mut string_reader_data: Map[Int, String] := {}
-mut string_reader_offsets: Map[Int, Int] := {}
+threadlocal mut next_string_reader_handle: Int := 1
+threadlocal mut string_reader_data: Map[Int, String] := {}
+threadlocal mut string_reader_offsets: Map[Int, Int] := {}
 
-mut next_string_buffer_handle: Int := 1
-mut string_buffer_parts: Map[Int, List[String]] := {}
-mut string_buffer_lengths: Map[Int, Int] := {}
+threadlocal mut next_string_buffer_handle: Int := 1
+threadlocal mut string_buffer_parts: Map[Int, List[String]] := {}
+threadlocal mut string_buffer_lengths: Map[Int, Int] := {}
 
-mut next_bytes_reader_handle: Int := 1
-mut bytes_reader_data: Map[Int, Bytes] := {}
-mut bytes_reader_offsets: Map[Int, Int] := {}
+threadlocal mut next_bytes_reader_handle: Int := 1
+threadlocal mut bytes_reader_data: Map[Int, Bytes] := {}
+threadlocal mut bytes_reader_offsets: Map[Int, Int] := {}
 
-mut next_buffered_bytes_reader_handle: Int := 1
-mut buffered_bytes_reader_source_kinds: Map[Int, Int] := {}
-mut buffered_bytes_reader_source_handles: Map[Int, Int] := {}
-mut buffered_bytes_reader_chunk_sizes: Map[Int, Int] := {}
-mut buffered_bytes_reader_cache: Map[Int, Bytes] := {}
+threadlocal mut next_buffered_bytes_reader_handle: Int := 1
+threadlocal mut buffered_bytes_reader_source_kinds: Map[Int, Int] := {}
+threadlocal mut buffered_bytes_reader_source_handles: Map[Int, Int] := {}
+threadlocal mut buffered_bytes_reader_chunk_sizes: Map[Int, Int] := {}
+threadlocal mut buffered_bytes_reader_cache: Map[Int, Bytes] := {}
 
-mut next_buffered_bytes_writer_handle: Int := 1
-mut buffered_bytes_writer_target_kinds: Map[Int, Int] := {}
-mut buffered_bytes_writer_target_handles: Map[Int, Int] := {}
-mut buffered_bytes_writer_chunk_sizes: Map[Int, Int] := {}
-mut buffered_bytes_writer_cache: Map[Int, Bytes] := {}
+threadlocal mut next_buffered_bytes_writer_handle: Int := 1
+threadlocal mut buffered_bytes_writer_target_kinds: Map[Int, Int] := {}
+threadlocal mut buffered_bytes_writer_target_handles: Map[Int, Int] := {}
+threadlocal mut buffered_bytes_writer_chunk_sizes: Map[Int, Int] := {}
+threadlocal mut buffered_bytes_writer_cache: Map[Int, Bytes] := {}
 
-mut next_buffered_string_reader_handle: Int := 1
-mut buffered_string_reader_sources: Map[Int, Int] := {}
-mut buffered_string_reader_chunk_sizes: Map[Int, Int] := {}
-mut buffered_string_reader_cache: Map[Int, String] := {}
+threadlocal mut next_buffered_string_reader_handle: Int := 1
+threadlocal mut buffered_string_reader_sources: Map[Int, Int] := {}
+threadlocal mut buffered_string_reader_chunk_sizes: Map[Int, Int] := {}
+threadlocal mut buffered_string_reader_cache: Map[Int, String] := {}
 
-mut next_buffered_string_writer_handle: Int := 1
-mut buffered_string_writer_targets: Map[Int, Int] := {}
-mut buffered_string_writer_chunk_sizes: Map[Int, Int] := {}
-mut buffered_string_writer_cache: Map[Int, String] := {}
+threadlocal mut next_buffered_string_writer_handle: Int := 1
+threadlocal mut buffered_string_writer_targets: Map[Int, Int] := {}
+threadlocal mut buffered_string_writer_chunk_sizes: Map[Int, Int] := {}
+threadlocal mut buffered_string_writer_cache: Map[Int, String] := {}
 
-mut next_buffered_tcp_stream_handle: Int := 1
-mut buffered_tcp_stream_fds: Map[Int, Int] := {}
-mut buffered_tcp_stream_chunk_sizes: Map[Int, Int] := {}
-mut buffered_tcp_stream_cache: Map[Int, String] := {}
+threadlocal mut next_buffered_tcp_stream_handle: Int := 1
+threadlocal mut buffered_tcp_stream_fds: Map[Int, Int] := {}
+threadlocal mut buffered_tcp_stream_chunk_sizes: Map[Int, Int] := {}
+threadlocal mut buffered_tcp_stream_cache: Map[Int, String] := {}
 
-mut next_buffered_tcp_writer_handle: Int := 1
-mut buffered_tcp_writer_fds: Map[Int, Int] := {}
-mut buffered_tcp_writer_chunk_sizes: Map[Int, Int] := {}
-mut buffered_tcp_writer_cache: Map[Int, String] := {}
+threadlocal mut next_buffered_tcp_writer_handle: Int := 1
+threadlocal mut buffered_tcp_writer_fds: Map[Int, Int] := {}
+threadlocal mut buffered_tcp_writer_chunk_sizes: Map[Int, Int] := {}
+threadlocal mut buffered_tcp_writer_cache: Map[Int, String] := {}
 
-mut next_buffered_file_reader_handle: Int := 1
-mut buffered_file_reader_handles: Map[Int, Int] := {}
-mut buffered_file_reader_chunk_sizes: Map[Int, Int] := {}
-mut buffered_file_reader_cache: Map[Int, String] := {}
+threadlocal mut next_buffered_file_reader_handle: Int := 1
+threadlocal mut buffered_file_reader_handles: Map[Int, Int] := {}
+threadlocal mut buffered_file_reader_chunk_sizes: Map[Int, Int] := {}
+threadlocal mut buffered_file_reader_cache: Map[Int, String] := {}
 
-mut next_buffered_file_writer_handle: Int := 1
-mut buffered_file_writer_handles: Map[Int, Int] := {}
-mut buffered_file_writer_chunk_sizes: Map[Int, Int] := {}
-mut buffered_file_writer_cache: Map[Int, String] := {}
+threadlocal mut next_buffered_file_writer_handle: Int := 1
+threadlocal mut buffered_file_writer_handles: Map[Int, Int] := {}
+threadlocal mut buffered_file_writer_chunk_sizes: Map[Int, Int] := {}
+threadlocal mut buffered_file_writer_cache: Map[Int, String] := {}
 
-mut next_buffered_process_stdout_handle: Int := 1
-mut buffered_process_stdout_handles: Map[Int, Int] := {}
-mut buffered_process_stdout_chunk_sizes: Map[Int, Int] := {}
-mut buffered_process_stdout_cache: Map[Int, String] := {}
+threadlocal mut next_buffered_process_stdout_handle: Int := 1
+threadlocal mut buffered_process_stdout_handles: Map[Int, Int] := {}
+threadlocal mut buffered_process_stdout_chunk_sizes: Map[Int, Int] := {}
+threadlocal mut buffered_process_stdout_cache: Map[Int, String] := {}
 
-mut next_buffered_process_stderr_handle: Int := 1
-mut buffered_process_stderr_handles: Map[Int, Int] := {}
-mut buffered_process_stderr_chunk_sizes: Map[Int, Int] := {}
-mut buffered_process_stderr_cache: Map[Int, String] := {}
+threadlocal mut next_buffered_process_stderr_handle: Int := 1
+threadlocal mut buffered_process_stderr_handles: Map[Int, Int] := {}
+threadlocal mut buffered_process_stderr_chunk_sizes: Map[Int, Int] := {}
+threadlocal mut buffered_process_stderr_cache: Map[Int, String] := {}
 
 interface Reader:
     fn read(max_bytes: Int) -> String!

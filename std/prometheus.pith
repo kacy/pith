@@ -1,0 +1,53 @@
+# std.prometheus - expose pith metrics for prometheus to scrape.
+#
+# spawn serve() alongside your app to answer GET /metrics with the text
+# exposition of every registered std.metrics series (labels included):
+#
+#     import std.metrics as metrics
+#     import std.prometheus as prometheus
+#
+#     fn main():
+#         spawn prometheus.serve("0.0.0.0", 9464)
+#         metrics.counter("requests_total").labels(["route", "/api"]).inc()
+#         ... run your app ...
+#
+# the endpoint is read-only and pull-based: prometheus scrapes it on an interval,
+# so serve() just renders the current snapshot on each request.
+
+import std.metrics as metrics
+import std.net.http as http
+
+# prometheus's text-exposition format content type.
+PROMETHEUS_CONTENT_TYPE := "text/plain; version=0.0.4; charset=utf-8"
+
+# the /metrics response for the current metric snapshot.
+pub fn metrics_response() -> http.HttpResponse:
+    body := metrics.snapshot_text() + chr(10)
+    return http.response(200).with_body_text(body).header("Content-Type", PROMETHEUS_CONTENT_TYPE)
+
+# handle one scrape connection: answer GET /metrics, 404 for anything else. a
+# request that fails to parse is dropped so it can't wedge the accept loop.
+fn handle_scrape(fd: Int) -> Int!:
+    tcp_set_timeout(fd, 2000)
+    req := http.read_request_bytes(fd)!
+    if req.is_get("/metrics")!:
+        return http.send(fd, metrics_response())
+    return http.send(fd, http.not_found_response())
+
+# serve the /metrics endpoint on host:port. this blocks in an accept loop, so run
+# it in the background: `spawn prometheus.serve("0.0.0.0", 9464)`.
+pub fn serve(host: String, port: Int) -> Int!:
+    fd := tcp_listen(host, port)!
+    while true:
+        client := tcp_accept(fd)!
+        handle_scrape(client) catch 0
+    return 0
+
+test "metrics_response carries the prometheus content type and current snapshot":
+    metrics.reset()
+    metrics.counter("http_requests_total").labels(["route", "/api"]).inc()
+    resp := metrics_response()
+    rendered := resp.to_bytes()!.to_string_utf8()!
+    assert(rendered.contains("Content-Type: text/plain; version=0.0.4"))
+    assert(rendered.contains("# TYPE http_requests_total counter"))
+    assert(rendered.contains("http_requests_total" + chr(123) + "route=" + chr(34) + "/api" + chr(34) + chr(125) + " 1"))

@@ -76,7 +76,7 @@ KEYWORD       = "fn" | "if" | "elif" | "else" | "for" | "in" | "while"
               | "match" | "select" | "default" | "timeout"
               | "return" | "fail" | "break" | "continue"
               | "struct" | "enum" | "interface" | "impl" | "type"
-              | "pub" | "mut" | "ref" | "weak"
+              | "pub" | "mut" | "ref" | "weak" | "threadlocal"
               | "import" | "from" | "as"
               | "self" | "true" | "false" | "none"
               | "and" | "or" | "not" | "catch"
@@ -98,6 +98,7 @@ import_list   = import_name , { "," , import_name }
 
 import_name   = IDENT , [ "as" , IDENT ] ;
 
+(* a top-level binding may be marked `threadlocal` for per-os-thread storage *)
 top_level_decl = [ "pub" ] , ( fn_decl
                               | struct_decl
                               | enum_decl
@@ -105,7 +106,7 @@ top_level_decl = [ "pub" ] , ( fn_decl
                               | impl_decl
                               | type_alias
                               | test_decl
-                              | binding ) , NEWLINE ;
+                              | [ "threadlocal" ] , binding ) , NEWLINE ;
 
 test_decl     = "test" , STRING_LIT , ":" , block ;
 

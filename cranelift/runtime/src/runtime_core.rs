@@ -1451,6 +1451,49 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
     b
 }
 
+// Thread-local storage for `threadlocal` module globals. Each os thread gets its
+// own value per slot; the compiler assigns each threadlocal global a unique i64
+// slot and generates a `() -> i64` init thunk that builds the correctly-typed
+// initial value. A slot is materialized lazily the first time a thread touches
+// it. Entries are not reclaimed at thread exit — bounded by the number of
+// threadlocal globals, the same acceptable one-time leak as the struct pool.
+thread_local! {
+    static TLS_GLOBALS: std::cell::RefCell<std::collections::HashMap<i64, i64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Read this thread's value for a threadlocal global, initializing it on first
+/// access by calling the compiler-generated init thunk. The thunk runs outside
+/// the map borrow so it may touch other threadlocal globals without a re-entrant
+/// borrow panic.
+///
+/// # Safety
+/// `init_thunk` must be the address of a compiled `extern "C" fn() -> i64`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64 {
+    if let Some(v) = TLS_GLOBALS.with(|t| t.borrow().get(&slot).copied()) {
+        return v;
+    }
+    let thunk: extern "C" fn() -> i64 = std::mem::transmute(init_thunk as usize);
+    let value = thunk();
+    TLS_GLOBALS.with(|t| {
+        // another access on this thread during the thunk can't have run (single
+        // thread), so a plain insert is correct.
+        t.borrow_mut().insert(slot, value);
+    });
+    value
+}
+
+/// Set this thread's value for a threadlocal global (a reassignment). The old
+/// value's refcount is dropped by the compiler-emitted release before this call,
+/// the same as a plain global assignment.
+#[no_mangle]
+pub unsafe extern "C" fn pith_tls_set(slot: i64, value: i64) {
+    TLS_GLOBALS.with(|t| {
+        t.borrow_mut().insert(slot, value);
+    });
+}
+
 // Small structs are allocated and freed constantly — the result box built for
 // every `T!` return is the worst offender — and the malloc/free round-trip for
 // each one shows up plainly in profiles. These keep a per-thread freelist of

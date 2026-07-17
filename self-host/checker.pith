@@ -482,6 +482,11 @@ fn register_top_level_declarations(node_idx: Int):
 
 fn register_declaration(node_idx: Int, is_pub: Bool):
     node := get_node(node_idx)
+    if node.kind == "threadlocal":
+        # a threadlocal global is an ordinary module global to the checker; the
+        # wrapper is only a storage marker the emitter reads.
+        register_declaration(node.children[0], is_pub)
+        return
     if node.kind == "fn_decl":
         register_function_declaration(node_idx, node)
     elif node.kind == "struct_decl":
@@ -1024,6 +1029,9 @@ fn check_top_level_declarations(node_idx: Int):
 
 fn check_declaration(node_idx: Int):
     node := get_node(node_idx)
+    if node.kind == "threadlocal":
+        check_declaration(node.children[0])
+        return
     if node.kind == "fn_decl":
         check_function_declaration(node)
     elif node.kind == "binding":

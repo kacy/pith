@@ -1523,6 +1523,12 @@ fn parse_top_level_decl() -> Int:
     if match_tok("kw_pub"):
         is_pub = true
 
+    # `threadlocal` marks a module global as per-os-thread storage; it only
+    # makes sense on a binding, and wraps it the same way `pub` does.
+    mut is_threadlocal := false
+    if match_tok("kw_threadlocal"):
+        is_threadlocal = true
+
     # token via _cur_tok_kind/_cur_tok_value
     cur_kind := _cur_tok_kind()
 
@@ -1560,6 +1566,9 @@ fn parse_top_level_decl() -> Int:
         advance_token()
         decl = add_leaf_with_position("error", "expected declaration")
 
+    if is_threadlocal:
+        mut tl_children: List[Int] := [decl]
+        decl = add_node_with_position("threadlocal", "", tl_children)
     if is_pub:
         mut children: List[Int] := [decl]
         return add_node_with_position("pub", "", children)

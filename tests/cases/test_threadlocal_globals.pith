@@ -1,0 +1,26 @@
+# threadlocal module globals give every os thread its own copy, materialized
+# lazily on first access. two spawned tasks each mutate their own `counter` and
+# `seen` with no lock and no race; the main thread's copies stay untouched. a
+# shared global would race the counter and share the map, changing the totals.
+
+threadlocal mut counter := 0
+threadlocal mut seen: Map[Int, Int] := {}
+
+fn work(n: Int) -> Int:
+    mut i := 0
+    while i < n:
+        counter = counter + 1
+        seen.insert(i, counter)
+        i = i + 1
+    return seen.len() + counter
+
+fn main():
+    t1 := spawn work(300)
+    t2 := spawn work(300)
+    a := await t1
+    b := await t2
+    # each task: seen.len()=300 + counter=300 => 600; total 1200, order-independent
+    print("total=" + (a + b).to_string())
+    # main never called work, so its own threadlocal copies are still the defaults
+    print("main_counter=" + counter.to_string())
+    print("main_seen=" + seen.len().to_string())

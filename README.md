@@ -147,8 +147,9 @@ wire protocols with tls, prepared statements, and pooling), data (json,
 toml, csv, config, table), bytes and crypto (hash, checksum, encoding,
 crypto, bits, binary), compression and archives (gzip/zlib, tar, zip),
 text (regex, scanner, fmt), app plumbing (log, metrics, cli, env, testing,
-diagnostic, time, datetime, rand, uuid, math), and lazy iterators
-(std.iter).
+diagnostic, time, datetime, rand, uuid, math), observability (trace,
+prometheus, otlp, obs — opentelemetry traces and metrics, see
+[docs/telemetry.md](docs/telemetry.md)), and lazy iterators (std.iter).
 
 ## proof it's usable
 

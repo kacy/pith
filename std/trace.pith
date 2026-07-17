@@ -1,0 +1,263 @@
+# std.trace - opentelemetry-style distributed tracing.
+#
+# a span records one unit of work: a name, timing, attributes, a status, and its
+# place in a trace (a trace id shared by the whole request, a span id, and the
+# parent span). spans nest: the "current" span is tracked per os thread, so
+# starting a span inside another parents it automatically without threading a
+# context through every call.
+#
+#     span := trace.start("handle_request")
+#     span.set_attr("http.route", "/api")
+#     ... work, possibly starting child spans ...
+#     span.end()
+#
+# tracing is OFF until trace.set_active(true) (std.obs.init does this from the
+# environment), so start() is a cheap no-op in an uninstrumented program. ended
+# spans collect in a buffer that the OTLP exporter drains; see std.otlp.
+
+import std.log as log
+import std.time as time
+
+# span kinds (OTel SpanKind).
+pub INTERNAL := 1
+pub SERVER := 2
+pub CLIENT := 3
+pub PRODUCER := 4
+pub CONSUMER := 5
+
+# status codes (OTel StatusCode).
+pub STATUS_UNSET := 0
+pub STATUS_OK := 1
+pub STATUS_ERROR := 2
+
+# global on/off. off => start() returns a non-recording span and touches no
+# per-thread state, so the overhead of leaving trace calls in is negligible.
+mut trace_active := false
+
+# turn tracing on or off process-wide. std.obs.init sets this from the
+# environment; until then start() is a no-op.
+pub fn set_active(on: Bool):
+    trace_active = on
+
+# whether tracing is currently active.
+pub fn is_active() -> Bool:
+    return trace_active
+
+# the current span per os thread. a fresh thread (including a spawned task)
+# starts with no active span; propagate across a spawn with current_context()
+# then with_context() inside the task.
+threadlocal mut cur_trace_id := ""
+threadlocal mut cur_span_id := ""
+threadlocal mut cur_sampled := false
+
+# a span's identity and sampling decision — the part that crosses process
+# boundaries (see traceparent) and the part a child inherits.
+pub struct SpanContext:
+    pub trace_id: String
+    pub span_id: String
+    pub sampled: Bool
+
+fn empty_context() -> SpanContext:
+    return SpanContext("", "", false)
+
+# whether a context carries a well-formed trace id and span id.
+pub fn context_is_valid(ctx: SpanContext) -> Bool:
+    return ctx.trace_id.len() == 32 and ctx.span_id.len() == 16
+
+# the active span's context on this thread, or an empty (invalid) context.
+pub fn current_context() -> SpanContext:
+    return SpanContext(cur_trace_id, cur_span_id, cur_sampled)
+
+# make `ctx` the current context on this thread (used to re-establish a parent
+# inside a spawned task, or from an inbound traceparent).
+pub fn with_context(ctx: SpanContext):
+    cur_trace_id = ctx.trace_id
+    cur_span_id = ctx.span_id
+    cur_sampled = ctx.sampled
+
+# drop the current context on this thread (no active span).
+pub fn clear_context():
+    cur_trace_id = ""
+    cur_span_id = ""
+    cur_sampled = false
+
+# one span: a named, timed unit of work with attributes, a status, and its
+# place in a trace. a non-recording span (recording=false) is the no-op returned
+# when tracing is inactive.
+pub struct Span:
+    pub trace_id: String
+    pub span_id: String
+    pub parent_id: String
+    pub name: String
+    pub kind: Int
+    pub start_unix_ns: Int
+    start_mono_ns: Int
+    mut end_unix_ns: Int
+    mut attr_pairs: List[String]
+    mut status: Int
+    mut status_message: String
+    pub recording: Bool
+    # the context to restore as current when this span ends (its parent).
+    saved_trace_id: String
+    saved_span_id: String
+    saved_sampled: Bool
+
+fn new_id(width: Int) -> String:
+    if width == 32:
+        return log.new_trace_id() catch "00000000000000000000000000000000"
+    return log.new_span_id() catch "0000000000000000"
+
+# unix time in nanoseconds, at millisecond resolution (the wall clock is ms; a
+# span's duration is measured separately with the monotonic clock for precision).
+fn unix_nanos() -> Int:
+    return time.now() * 1000000
+
+fn no_op_span() -> Span:
+    return Span("", "", "", "", INTERNAL, 0, 0, 0, [], STATUS_UNSET, "", false, "", "", false)
+
+# start a span of the given kind, parented under the current span on this thread
+# (or a new root trace if there is none), and make it the current span. returns a
+# no-op span when tracing is inactive.
+pub fn start_kind(name: String, kind: Int) -> Span:
+    if not trace_active:
+        return no_op_span()
+    mut trace_id := cur_trace_id
+    parent_id := cur_span_id
+    mut sampled := cur_sampled
+    if trace_id.len() != 32:
+        # no active trace on this thread: begin a new one.
+        trace_id = new_id(32)
+        sampled = true
+    span_id := new_id(16)
+    span := Span(trace_id, span_id, parent_id, name, kind, unix_nanos(), time.mono_nanos(), 0, [], STATUS_UNSET, "", true, cur_trace_id, cur_span_id, cur_sampled)
+    # this span is now current; it restores the saved parent on end.
+    cur_trace_id = trace_id
+    cur_span_id = span_id
+    cur_sampled = sampled
+    return span
+
+# start an INTERNAL span (the common case).
+pub fn start(name: String) -> Span:
+    return start_kind(name, INTERNAL)
+
+impl Span:
+    # attach a string attribute; returns self so calls can chain.
+    fn set_attr(key: String, value: String) -> Span:
+        if self.recording:
+            self.attr_pairs.push(key)
+            self.attr_pairs.push(value)
+        return self
+
+    fn set_status(code: Int, message: String):
+        if self.recording:
+            self.status = code
+            self.status_message = message
+
+    fn context() -> SpanContext:
+        return SpanContext(self.trace_id, self.span_id, self.sampled_flag())
+
+    fn sampled_flag() -> Bool:
+        return self.trace_id.len() == 32
+
+    # finish the span: stamp its end time, restore the parent as the current
+    # span, and hand it to the export buffer.
+    fn end():
+        if not self.recording:
+            return
+        self.end_unix_ns = self.start_unix_ns + (time.mono_nanos() - self.start_mono_ns)
+        cur_trace_id = self.saved_trace_id
+        cur_span_id = self.saved_span_id
+        cur_sampled = self.saved_sampled
+        record_finished_span(self)
+
+# --- export buffer: ended spans wait here for the OTLP exporter to drain ---
+mut sink_mu := Mutex()
+mut sink_spans: List[Span] := []
+mut sink_active := false
+FINISHED_SPANS_CAP := 2048
+
+# enable collecting ended spans (the exporter turns this on). off => end() keeps
+# nothing, so a program tracing without an exporter does not accumulate spans.
+pub fn set_sink(on: Bool):
+    sink_mu.lock()
+    sink_active = on
+    if not on:
+        sink_spans = []
+    sink_mu.unlock()
+
+fn record_finished_span(span: Span):
+    sink_mu.lock()
+    if sink_active and sink_spans.len() < FINISHED_SPANS_CAP:
+        sink_spans.push(span)
+    sink_mu.unlock()
+
+# take and clear the finished spans collected so far (the exporter calls this).
+pub fn drain_finished_spans() -> List[Span]:
+    sink_mu.lock()
+    out := sink_spans
+    sink_spans = []
+    sink_mu.unlock()
+    return out
+
+# --- W3C trace-context propagation (the `traceparent` header) ---
+
+# format a context as a W3C traceparent: version-trace-span-flags.
+pub fn format_traceparent(ctx: SpanContext) -> String:
+    mut flags := "00"
+    if ctx.sampled:
+        flags = "01"
+    return "00-" + ctx.trace_id + "-" + ctx.span_id + "-" + flags
+
+# parse a W3C traceparent header into a context, or none when malformed.
+pub fn parse_traceparent(header: String) -> SpanContext?:
+    parts := header.split("-")
+    if parts.len() < 4:
+        return none
+    if parts[0] != "00":
+        return none
+    trace_id := parts[1]
+    span_id := parts[2]
+    if trace_id.len() != 32 or span_id.len() != 16:
+        return none
+    sampled := parts[3].len() >= 2 and parts[3].substring(1, 2) == "1"
+    return SpanContext(trace_id, span_id, sampled)
+
+test "spans nest through the per-thread current span":
+    set_active(true)
+    clear_context()
+    root := start("root")
+    assert_eq(root.trace_id.len(), 32)
+    assert_eq(root.span_id.len(), 16)
+    assert_eq(root.parent_id, "")
+
+    child := start("child")
+    assert_eq(child.trace_id, root.trace_id)      # same trace
+    assert_eq(child.parent_id, root.span_id)      # parented under root
+    assert(child.span_id != root.span_id)
+
+    child.end()
+    # current is back to root after the child ends
+    assert_eq(current_context().span_id, root.span_id)
+    root.end()
+    assert_eq(current_context().trace_id, "")
+    set_active(false)
+
+test "inactive tracer returns cheap no-op spans":
+    set_active(false)
+    clear_context()
+    s := start("noop")
+    assert(not s.recording)
+    assert_eq(s.trace_id, "")
+    s.end()
+    assert_eq(current_context().trace_id, "")
+
+test "traceparent round-trips":
+    ctx := SpanContext("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331", true)
+    header := format_traceparent(ctx)
+    assert_eq(header, "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+    back := parse_traceparent(header)
+    assert(back != none)
+    assert_eq(back.value().trace_id, ctx.trace_id)
+    assert_eq(back.value().span_id, ctx.span_id)
+    assert(back.value().sampled)
+    assert(parse_traceparent("garbage") == none)

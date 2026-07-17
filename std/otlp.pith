@@ -1,0 +1,506 @@
+# std.otlp - encode pith spans and metrics as OTLP protobuf and push them.
+#
+# OTLP (the OpenTelemetry protocol) is how a program ships its traces and
+# metrics to a collector. this module does two things:
+#
+#   - encode: turn std.trace spans and std.metrics samples into the protobuf
+#     wire form of an ExportTraceServiceRequest / ExportMetricsServiceRequest,
+#     built by hand on top of std.protobuf the same way the database drivers
+#     hand-write their wire protocols. there is no `.proto` code generation.
+#   - export: POST that protobuf to an OTLP/HTTP collector at /v1/traces or
+#     /v1/metrics with content-type application/x-protobuf.
+#
+# std.obs.init wires this up from the environment; you rarely call it directly.
+#
+# scope (v1): spans with string attributes and a status; counter and gauge
+# metrics in full; histograms as a count+sum data point (no per-bucket detail,
+# see encode_metrics). transport is OTLP/HTTP only — grpc is not implemented.
+
+import std.bytes as bytes
+import std.encoding as encoding
+import std.metrics as metrics
+import std.net.http as http
+import std.net.tls as tls
+import std.net.url as url_mod
+import std.protobuf as protobuf
+import std.time as time
+import std.trace as trace
+
+# the OTLP/HTTP protocol value obs uses by default.
+pub PROTOCOL_HTTP := "http/protobuf"
+# the OTLP/grpc protocol value (recognized but not implemented in v1).
+pub PROTOCOL_GRPC := "grpc"
+
+# the content type an OTLP/HTTP collector expects for a protobuf body.
+pub OTLP_CONTENT_TYPE := "application/x-protobuf"
+
+# the standard OTLP/HTTP port, used when an endpoint gives no explicit port.
+pub DEFAULT_HTTP_PORT := 4318
+
+# OTLP AggregationTemporality.CUMULATIVE — the only temporality pith reports,
+# since std.metrics counters and histograms accumulate for the process lifetime.
+CUMULATIVE := 2
+
+# where to send exported telemetry: a collector origin plus the resource's
+# service.name. build one with target() from an OTEL_EXPORTER_OTLP_ENDPOINT.
+pub struct Target:
+    pub service_name: String
+    pub host: String
+    pub port: Int
+    pub use_tls: Bool
+    # any path prefix from the endpoint (usually ""); /v1/traces is appended.
+    pub base_path: String
+    # "http/protobuf" or "grpc"; only http/protobuf is implemented.
+    pub protocol: String
+
+# build a Target from a service name, an endpoint like http://host:4318, and a
+# protocol. an https endpoint turns tls on; a missing port defaults to 4318. a
+# trailing "/" on the endpoint path is dropped so /v1/traces joins cleanly.
+pub fn target(service_name: String, endpoint: String, protocol: String) -> Target:
+    parsed := url_mod.parse(endpoint)
+    use_tls := parsed.scheme == "https"
+    mut port := parsed.port
+    if port < 0:
+        port = DEFAULT_HTTP_PORT
+    mut base_path := parsed.path
+    if base_path == "/":
+        base_path = ""
+    if base_path.len() > 0 and base_path.ends_with("/"):
+        base_path = base_path.substring(0, base_path.len() - 1)
+    return Target(service_name, parsed.host, port, use_tls, base_path, protocol)
+
+# --- trace encoding ---------------------------------------------------------
+
+# decode a hex id (32 chars for a trace id, 16 for a span id) into exactly
+# `width` bytes, since OTLP carries ids as raw bytes rather than hex. a
+# malformed or short id falls back to zero-fill so encoding never fails on it.
+fn id_bytes(hex: String, width: Int) -> Bytes:
+    decoded := encoding.from_hex(hex) catch bytes.empty()
+    if decoded.len() == width:
+        return decoded
+    # normalize to exactly `width` bytes: copy what we have, zero-pad the rest.
+    buf := bytes.buffer_with_capacity(width)
+    mut i := 0
+    while i < width:
+        if i < decoded.len():
+            buf.write_byte(decoded[i]) catch 0
+        else:
+            buf.write_byte(0) catch 0
+        i = i + 1
+    out := buf.bytes()
+    buf.free()
+    return out
+
+# encode one KeyValue { key = 1, value = AnyValue { string_value = 1 } }. every
+# pith attribute value is a string, so string_value is all we need.
+fn encode_key_value(key: String, value: String) -> Bytes!protobuf.ProtoError:
+    any_value := protobuf.writer()
+    any_value.write_string(1, value)!
+    any_bytes := any_value.bytes()
+    any_value.free()
+
+    kv := protobuf.writer()
+    kv.write_string(1, key)!
+    kv.write_message(2, any_bytes)!
+    out := kv.bytes()
+    kv.free()
+    return out
+
+# write a flat [k1,v1,k2,v2,...] attribute list as repeated KeyValue messages
+# under the given field number.
+fn write_attributes(w: protobuf.Writer, field: Int, pairs: List[String]) -> Bool!protobuf.ProtoError:
+    mut i := 0
+    while i + 1 < pairs.len():
+        w.write_message(field, encode_key_value(pairs[i], pairs[i + 1])!)!
+        i = i + 2
+    return true
+
+# encode a Status { message = 2, code = 3 }.
+fn encode_status(code: Int, message: String) -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    if message != "":
+        w.write_string(2, message)!
+    w.write_enum(3, code)!
+    out := w.bytes()
+    w.free()
+    return out
+
+# encode one Span. field numbers follow opentelemetry.proto.trace.v1.Span:
+# trace_id=1, span_id=2, parent_span_id=4, name=5, kind=6, start=7, end=8,
+# attributes=9, status=15. ids are bytes; the two timestamps are fixed64.
+fn encode_span(span: trace.Span) -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_bytes(1, id_bytes(span.trace_id, 16))!
+    w.write_bytes(2, id_bytes(span.span_id, 8))!
+    if span.parent_id != "":
+        w.write_bytes(4, id_bytes(span.parent_id, 8))!
+    w.write_string(5, span.name)!
+    w.write_enum(6, span.kind)!
+    w.write_fixed64(7, span.start_unix_ns)!
+    w.write_fixed64(8, span.end_unix_ns)!
+    write_attributes(w, 9, span.attr_pairs)!
+    if span.status != trace.STATUS_UNSET or span.status_message != "":
+        w.write_message(15, encode_status(span.status, span.status_message)!)!
+    out := w.bytes()
+    w.free()
+    return out
+
+# encode a Resource { attributes = 1 } carrying just service.name.
+fn encode_resource(service_name: String) -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_message(1, encode_key_value("service.name", service_name)!)!
+    out := w.bytes()
+    w.free()
+    return out
+
+# encode an InstrumentationScope { name = 1 } naming this library.
+fn encode_scope() -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_string(1, "pith")!
+    out := w.bytes()
+    w.free()
+    return out
+
+# encode an ExportTraceServiceRequest for these spans: a single ResourceSpans
+# (resource=1, scope_spans=2) with one ScopeSpans (scope=1, spans=2) holding
+# every span. an empty span list still produces a valid (empty-of-spans) request.
+pub fn encode_traces(service_name: String, spans: List[trace.Span]) -> Bytes!protobuf.ProtoError:
+    scope_spans := protobuf.writer()
+    scope_spans.write_message(1, encode_scope()!)!
+    for span in spans:
+        scope_spans.write_message(2, encode_span(span)!)!
+    scope_spans_bytes := scope_spans.bytes()
+    scope_spans.free()
+
+    resource_spans := protobuf.writer()
+    resource_spans.write_message(1, encode_resource(service_name)!)!
+    resource_spans.write_message(2, scope_spans_bytes)!
+    resource_spans_bytes := resource_spans.bytes()
+    resource_spans.free()
+
+    request := protobuf.writer()
+    request.write_message(1, resource_spans_bytes)!
+    out := request.bytes()
+    request.free()
+    return out
+
+# --- metric encoding --------------------------------------------------------
+
+# encode a NumberDataPoint for a counter or gauge: time_unix_nano=3 (fixed64),
+# as_int=6 (sfixed64), attributes=7. the value is an integer, so as_int fits.
+fn encode_number_point(value: Int, now_ns: Int, labels: List[String]) -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_fixed64(3, now_ns)!
+    w.write_sfixed64(6, value)!
+    write_attributes(w, 7, labels)!
+    out := w.bytes()
+    w.free()
+    return out
+
+# encode a HistogramDataPoint: time_unix_nano=3 (fixed64), count=4 (fixed64),
+# sum=5 (double), attributes=9. v1 simplification: we report only the aggregate
+# count and sum, not the per-bucket boundaries and counts, which is enough for
+# rate and average but not for percentile estimation.
+fn encode_histogram_point(count: Int, sum: Int, now_ns: Int, labels: List[String]) -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_fixed64(3, now_ns)!
+    w.write_fixed64(4, count)!
+    w.write_double(5, sum.to_float())!
+    write_attributes(w, 9, labels)!
+    out := w.bytes()
+    w.free()
+    return out
+
+# encode a Sum { data_points=1, aggregation_temporality=2, is_monotonic=3 }.
+# pith counters only ever increase, so is_monotonic is true.
+fn encode_sum(point: Bytes) -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_message(1, point)!
+    w.write_enum(2, CUMULATIVE)!
+    w.write_bool(3, true)!
+    out := w.bytes()
+    w.free()
+    return out
+
+# encode a Gauge { data_points = 1 }.
+fn encode_gauge(point: Bytes) -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_message(1, point)!
+    out := w.bytes()
+    w.free()
+    return out
+
+# encode a Histogram { data_points=1, aggregation_temporality=2 }.
+fn encode_histogram(point: Bytes) -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_message(1, point)!
+    w.write_enum(2, CUMULATIVE)!
+    out := w.bytes()
+    w.free()
+    return out
+
+# encode one Metric { name=1, gauge=5 | sum=7 | histogram=9 } from a sample,
+# mapping the pith metric kind to the matching OTLP data type.
+fn encode_metric(sample: metrics.MetricSample, now_ns: Int) -> Bytes!protobuf.ProtoError:
+    w := protobuf.writer()
+    w.write_string(1, sample.name)!
+    if sample.kind == "gauge":
+        point := encode_number_point(sample.value, now_ns, sample.labels)!
+        w.write_message(5, encode_gauge(point)!)!
+    elif sample.kind == "histogram":
+        point := encode_histogram_point(sample.value, sample.sum, now_ns, sample.labels)!
+        w.write_message(9, encode_histogram(point)!)!
+    else:
+        point := encode_number_point(sample.value, now_ns, sample.labels)!
+        w.write_message(7, encode_sum(point)!)!
+    out := w.bytes()
+    w.free()
+    return out
+
+# encode an ExportMetricsServiceRequest for these samples: a single
+# ResourceMetrics (resource=1, scope_metrics=2) with one ScopeMetrics
+# (scope=1, metrics=2) holding every metric.
+pub fn encode_metrics(service_name: String, samples: List[metrics.MetricSample]) -> Bytes!protobuf.ProtoError:
+    now_ns := time.now() * 1000000
+    scope_metrics := protobuf.writer()
+    scope_metrics.write_message(1, encode_scope()!)!
+    for sample in samples:
+        scope_metrics.write_message(2, encode_metric(sample, now_ns)!)!
+    scope_metrics_bytes := scope_metrics.bytes()
+    scope_metrics.free()
+
+    resource_metrics := protobuf.writer()
+    resource_metrics.write_message(1, encode_resource(service_name)!)!
+    resource_metrics.write_message(2, scope_metrics_bytes)!
+    resource_metrics_bytes := resource_metrics.bytes()
+    resource_metrics.free()
+
+    request := protobuf.writer()
+    request.write_message(1, resource_metrics_bytes)!
+    out := request.bytes()
+    request.free()
+    return out
+
+# --- export over OTLP/HTTP --------------------------------------------------
+
+# POST an encoded protobuf body to a signal path (e.g. /v1/traces) on the
+# collector. returns true on a 2xx. a plain http endpoint uses send(); an https
+# one uses the system trust roots.
+fn post_signal(cfg: Target, signal_path: String, body: Bytes) -> Bool!:
+    full_path := cfg.base_path + signal_path
+    req := http.post_request(cfg.host, cfg.port, full_path).body_bytes(body).header("Content-Type", OTLP_CONTENT_TYPE)
+    mut status := 0
+    if cfg.use_tls:
+        status = req.send_tls_with_config(cfg.host, tls.client_config()!)!.status
+    else:
+        status = req.send()!.status
+    return status >= 200 and status < 300
+
+# export these spans to the collector's /v1/traces. an empty list is a no-op
+# (returns true). grpc endpoints fail with a clear message until implemented.
+pub fn export_traces(cfg: Target, spans: List[trace.Span]) -> Bool!:
+    if spans.len() == 0:
+        return true
+    if cfg.protocol == PROTOCOL_GRPC:
+        fail "otlp: grpc transport is not implemented; use http/protobuf"
+    encoded := encode_traces(cfg.service_name, spans)
+    if encoded.is_err:
+        fail "otlp: encode traces: " + encoded.err.message
+    return post_signal(cfg, "/v1/traces", encoded.ok)
+
+# export these metric samples to the collector's /v1/metrics. an empty list is
+# a no-op (returns true). grpc endpoints fail until implemented.
+pub fn export_metrics(cfg: Target, samples: List[metrics.MetricSample]) -> Bool!:
+    if samples.len() == 0:
+        return true
+    if cfg.protocol == PROTOCOL_GRPC:
+        fail "otlp: grpc transport is not implemented; use http/protobuf"
+    encoded := encode_metrics(cfg.service_name, samples)
+    if encoded.is_err:
+        fail "otlp: encode metrics: " + encoded.err.message
+    return post_signal(cfg, "/v1/metrics", encoded.ok)
+
+# --- tests ------------------------------------------------------------------
+
+# read the first embedded message at `field` from an encoded message, skipping
+# any other fields. a small helper the round-trip tests use to descend the
+# nested OTLP structure.
+fn first_message(data: Bytes, field: Int) -> Bytes!protobuf.ProtoError:
+    r := protobuf.reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == field and tag.wire == protobuf.WIRE_LEN:
+            return r.read_message()!
+        r.skip(tag.wire)!
+    fail protobuf.ProtoError("field not found")
+
+fn sample_span() -> trace.Span:
+    trace.set_active(true)
+    trace.set_sink(true)
+    trace.clear_context()
+    root := trace.start("parent")
+    child := trace.start_kind("db.query", trace.CLIENT)
+    child.set_attr("db.system", "postgres")
+    child.set_status(trace.STATUS_ERROR, "timeout")
+    child.end()
+    root.end()
+    spans := trace.drain_finished_spans()
+    trace.set_active(false)
+    trace.set_sink(false)
+    # the child ends first, so it is spans[0].
+    return spans[0]
+
+test "config parses an http endpoint into host, port, and tls off":
+    cfg := target("svc", "http://collector.local:4318", PROTOCOL_HTTP)
+    assert_eq(cfg.host, "collector.local")
+    assert_eq(cfg.port, 4318)
+    assert(not cfg.use_tls)
+    assert_eq(cfg.base_path, "")
+
+test "config defaults the port and reads https as tls":
+    cfg := target("svc", "https://collector.example.com", PROTOCOL_HTTP)
+    assert_eq(cfg.port, DEFAULT_HTTP_PORT)
+    assert(cfg.use_tls)
+
+test "a trace request round-trips through the reader":
+    span := sample_span()
+    encoded := encode_traces("checkout", [span])!
+
+    # ExportTraceServiceRequest.resource_spans[0]
+    resource_spans := first_message(encoded, 1)!
+    # ResourceSpans.resource -> Resource.attributes[0] -> KeyValue
+    resource := first_message(resource_spans, 1)!
+    kv := first_message(resource, 1)!
+    kr := protobuf.reader(kv)
+    kr.read_tag()!
+    assert_eq(kr.read_string()!, "service.name")
+    kr.read_tag()!
+    any_value := kr.read_message()!
+    ar := protobuf.reader(any_value)
+    ar.read_tag()!
+    assert_eq(ar.read_string()!, "checkout")
+
+    # ResourceSpans.scope_spans -> ScopeSpans.spans[0] -> Span
+    scope_spans := first_message(resource_spans, 2)!
+    span_msg := first_message(scope_spans, 2)!
+    mut trace_id_len := 0
+    mut span_id_len := 0
+    mut name := ""
+    mut kind := 0
+    sr := protobuf.reader(span_msg)
+    while not sr.at_end():
+        tag := sr.read_tag()!
+        if tag.field == 1:
+            trace_id_len = sr.read_bytes()!.len()
+        elif tag.field == 2:
+            span_id_len = sr.read_bytes()!.len()
+        elif tag.field == 5:
+            name = sr.read_string()!
+        elif tag.field == 6:
+            kind = sr.read_enum()!
+        else:
+            sr.skip(tag.wire)!
+    assert_eq(trace_id_len, 16)
+    assert_eq(span_id_len, 8)
+    assert_eq(name, "db.query")
+    assert_eq(kind, trace.CLIENT)
+
+# the string value inside the first KeyValue attribute of a data point message
+# (attributes are field 7 on a NumberDataPoint), or "" when there are none.
+fn first_attr_value(point: Bytes) -> String!protobuf.ProtoError:
+    pr := protobuf.reader(point)
+    while not pr.at_end():
+        tag := pr.read_tag()!
+        if tag.field == 7:
+            kv := protobuf.reader(pr.read_message()!)
+            kv.read_tag()!            # key
+            kv.read_string()!
+            kv.read_tag()!            # value (AnyValue)
+            any_value := protobuf.reader(kv.read_message()!)
+            any_value.read_tag()!     # string_value
+            return any_value.read_string()!
+        pr.skip(tag.wire)!
+    return ""
+
+test "a counter encodes as a monotonic sum with an int data point":
+    metrics.reset()
+    metrics.counter("requests_total").labels(["route", "/api"]).add(5)
+    encoded := encode_metrics("checkout", metrics.snapshot())!
+
+    resource_metrics := first_message(encoded, 1)!
+    scope_metrics := first_message(resource_metrics, 2)!
+
+    # creating a labeled counter also registers the bare series (value 0), so we
+    # scan every Metric and look for the labeled one carrying as_int == 5.
+    mut found := false
+    mut monotonic := false
+    mut temporality := 0
+    mut route := ""
+    sm := protobuf.reader(scope_metrics)
+    while not sm.at_end():
+        tag := sm.read_tag()!
+        if tag.field != 2:
+            sm.skip(tag.wire)!
+            continue
+        metric := sm.read_message()!
+        sum_bytes := first_message(metric, 7)!    # Sum
+        point := first_message(sum_bytes, 1)!      # NumberDataPoint
+
+        mut as_int := 0
+        pr := protobuf.reader(point)
+        while not pr.at_end():
+            inner := pr.read_tag()!
+            if inner.field == 6:
+                as_int = pr.read_sfixed64()!
+            else:
+                pr.skip(inner.wire)!
+        if as_int == 5:
+            found = true
+            route = first_attr_value(point)!
+            su := protobuf.reader(sum_bytes)
+            while not su.at_end():
+                st := su.read_tag()!
+                if st.field == 2:
+                    temporality = su.read_enum()!
+                elif st.field == 3:
+                    monotonic = su.read_bool()!
+                else:
+                    su.skip(st.wire)!
+    assert(found)
+    assert(monotonic)
+    assert_eq(temporality, CUMULATIVE)
+    assert_eq(route, "/api")
+
+test "a histogram encodes count and sum on its data point":
+    metrics.reset()
+    h := metrics.histogram("latency_ms")
+    h.observe(10)
+    h.observe(30)
+    encoded := encode_metrics("checkout", metrics.snapshot())!
+
+    resource_metrics := first_message(encoded, 1)!
+    scope_metrics := first_message(resource_metrics, 2)!
+    metric := first_message(scope_metrics, 2)!
+    histogram_bytes := first_message(metric, 9)!
+    point := first_message(histogram_bytes, 1)!
+
+    mut count := 0
+    mut sum := 0.0
+    hr := protobuf.reader(point)
+    while not hr.at_end():
+        tag := hr.read_tag()!
+        if tag.field == 4:
+            count = hr.read_fixed64()!
+        elif tag.field == 5:
+            sum = hr.read_double()!
+        else:
+            hr.skip(tag.wire)!
+    assert_eq(count, 2)
+    assert_eq(sum, 40.0)
+
+test "empty exports are a no-op":
+    empty_spans: List[trace.Span] := []
+    empty_samples: List[metrics.MetricSample] := []
+    cfg := target("svc", "http://127.0.0.1:4318", PROTOCOL_HTTP)
+    assert(export_traces(cfg, empty_spans)!)
+    assert(export_metrics(cfg, empty_samples)!)

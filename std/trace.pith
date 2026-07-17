@@ -15,7 +15,7 @@
 # environment), so start() is a cheap no-op in an uninstrumented program. ended
 # spans collect in a buffer that the OTLP exporter drains; see std.otlp.
 
-import std.log as log
+import std.uuid as uuid
 import std.time as time
 
 # span kinds (OTel SpanKind).
@@ -102,10 +102,22 @@ pub struct Span:
     saved_span_id: String
     saved_sampled: Bool
 
+# a compact 32-hex-character id from a uuid (dashes stripped) — the trace-id
+# width; a 16-hex span id is its first half. these match std.log's id format so
+# a trace id lines up whether it came from here or from a log record.
+fn compact_uuid() -> String:
+    raw := uuid.v7() catch (uuid.v4() catch "")
+    return raw.replace("-", "")
+
 fn new_id(width: Int) -> String:
+    hex := compact_uuid()
     if width == 32:
-        return log.new_trace_id() catch "00000000000000000000000000000000"
-    return log.new_span_id() catch "0000000000000000"
+        if hex.len() == 32:
+            return hex
+        return "00000000000000000000000000000000"
+    if hex.len() >= 16:
+        return hex.substring(0, 16)
+    return "0000000000000000"
 
 # unix time in nanoseconds, at millisecond resolution (the wall clock is ms; a
 # span's duration is measured separately with the monotonic clock for precision).

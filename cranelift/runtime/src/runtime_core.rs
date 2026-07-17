@@ -1451,6 +1451,94 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
     b
 }
 
+// Small structs are allocated and freed constantly — the result box built for
+// every `T!` return is the worst offender — and the malloc/free round-trip for
+// each one shows up plainly in profiles. These keep a per-thread freelist of
+// dead blocks, bucketed by total byte size, so a fresh struct of a common size
+// reuses a recycled block instead of hitting the global allocator. A reused
+// block is re-zeroed, so it is indistinguishable from an alloc_zeroed one.
+//
+// Per-thread means no locking and no cross-thread races: a block freed on
+// another thread simply lands in that thread's pool. Blocks retained at thread
+// exit leak, but the pool is capped, so the leak is bounded and one-time.
+//
+// The pool is disabled when PITH_STRUCT_FREELIST=0 so `make memcheck` runs see
+// every real free — valgrind can only track use-after-free if the block is
+// actually handed back to the allocator.
+const STRUCT_POOL_MAX_TOTAL: usize = 256; // total bytes incl the 32-byte header
+const STRUCT_POOL_CAP: usize = 512; // max retained blocks per size bucket
+
+fn struct_pool_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("PITH_STRUCT_FREELIST").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
+}
+
+thread_local! {
+    // indexed by total_size / 8; each entry is a stack of reusable blocks.
+    static STRUCT_POOL: std::cell::RefCell<Vec<Vec<*mut u8>>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+#[inline]
+fn struct_pool_bucket(total: usize) -> Option<usize> {
+    if total == 0 || total > STRUCT_POOL_MAX_TOTAL || total % 8 != 0 {
+        return None;
+    }
+    Some(total / 8)
+}
+
+/// Reuse a recycled block of exactly `total` bytes, re-zeroed like alloc_zeroed.
+/// Returns null on a pool miss (the caller then allocates fresh).
+unsafe fn struct_pool_take(total: usize) -> *mut u8 {
+    if !struct_pool_enabled() {
+        return std::ptr::null_mut();
+    }
+    let Some(bucket) = struct_pool_bucket(total) else {
+        return std::ptr::null_mut();
+    };
+    let block = STRUCT_POOL.with(|pool| {
+        pool.borrow_mut()
+            .get_mut(bucket)
+            .and_then(|stack| stack.pop())
+    });
+    match block {
+        Some(ptr) => {
+            std::ptr::write_bytes(ptr, 0, total);
+            ptr
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Hand a dead block back to the per-thread pool. Returns false (caller should
+/// dealloc) when the block is too large or the bucket is full.
+unsafe fn struct_pool_return(base: *mut u8, total: usize) -> bool {
+    if !struct_pool_enabled() {
+        return false;
+    }
+    let Some(bucket) = struct_pool_bucket(total) else {
+        return false;
+    };
+    STRUCT_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() <= bucket {
+            pool.resize(bucket + 1, Vec::new());
+        }
+        let stack = &mut pool[bucket];
+        if stack.len() >= STRUCT_POOL_CAP {
+            return false;
+        }
+        stack.push(base);
+        true
+    })
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     use std::alloc::alloc_zeroed;
@@ -1473,12 +1561,18 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     // also hits 0, so a weak reference can always safely read the header to see
     // whether the target is still alive. dtor is a compiled destructor's
     // address (0 = none).
-    let layout = pith_layout(size + STRUCT_HEADER, 8);
-    let base = alloc_zeroed(layout);
-    if base.is_null() {
-        eprintln!("pith runtime error: allocation failed");
-        std::process::exit(1);
-    }
+    let total = size + STRUCT_HEADER;
+    let base = struct_pool_take(total);
+    let base = if base.is_null() {
+        let allocated = alloc_zeroed(pith_layout(total, 8));
+        if allocated.is_null() {
+            eprintln!("pith runtime error: allocation failed");
+            std::process::exit(1);
+        }
+        allocated
+    } else {
+        base
+    };
     (base as *mut u32).write(STRUCT_MAGIC);
     (base.add(4) as *mut u32).write(1); // strong
     (base.add(8) as *mut u32).write(1); // weak: the implicit unit for strong refs
@@ -1516,7 +1610,11 @@ unsafe fn struct_weak_drop(base: *mut u8) {
     let size = (base.add(STRUCT_OFF_SIZE) as *const u64).read() as usize;
     // scrub the magic so any stale pointer fails the check
     (base as *mut u32).write(0);
-    std::alloc::dealloc(base, pith_layout(size + STRUCT_HEADER, 8));
+    let total = size + STRUCT_HEADER;
+    // keep the block on the per-thread freelist when it fits; otherwise free it.
+    if !struct_pool_return(base, total) {
+        std::alloc::dealloc(base, pith_layout(total, 8));
+    }
 }
 
 /// Build a pith `T?` optional value in the on-heap tuple layout the codegen

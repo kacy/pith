@@ -700,7 +700,7 @@ protogen-check:
 	./target/release/pith test tools/protogen/protogen_test.pith && \
 	if command -v valgrind > /dev/null; then \
 		./target/release/pith build tools/protogen/protogen_memcheck.pith > /dev/null; \
-		valgrind --error-exitcode=99 --leak-check=no --errors-for-leak-kinds=none -q ./tools/protogen/protogen_memcheck > /dev/null && \
+		PITH_STRUCT_FREELIST=0 valgrind --error-exitcode=99 --leak-check=no --errors-for-leak-kinds=none -q ./tools/protogen/protogen_memcheck > /dev/null && \
 		echo "protogen output matches golden, tests pass, valgrind clean"; \
 	else \
 		echo "protogen output matches golden and tests pass (valgrind absent)"; \
@@ -759,7 +759,7 @@ memcheck: build
 	@fail=0; \
 	for base in $(MEMCHECK_CASES); do \
 		./target/release/pith build "$$base.pith" > /dev/null 2>&1 || { echo "FAIL build $$base"; fail=1; continue; }; \
-		if valgrind --error-exitcode=99 --leak-check=no --errors-for-leak-kinds=none -q "$$base" > /dev/null 2>/tmp/pith-memcheck.txt; then \
+		if PITH_STRUCT_FREELIST=0 valgrind --error-exitcode=99 --leak-check=no --errors-for-leak-kinds=none -q "$$base" > /dev/null 2>/tmp/pith-memcheck.txt; then \
 			echo "ok   $$base"; \
 		else \
 			echo "FAIL $$base (valgrind)"; head -6 /tmp/pith-memcheck.txt; fail=1; \

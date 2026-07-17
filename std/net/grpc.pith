@@ -36,6 +36,9 @@ import std.bytes as bytes
 import std.bits as bits
 import std.encoding as encoding
 import std.net.tls as tls
+import std.trace as trace
+import std.metrics as metrics
+import std.time as time
 
 # grpc status codes (the grpc-status trailer). 0 is success; the rest are
 # errors. see https://grpc.io/docs/guides/status-codes/.
@@ -83,11 +86,28 @@ impl Conn:
     # are the serialized response message. fails with a GrpcError on a non-OK
     # grpc-status, a malformed response, or a transport error.
     pub fn unary(full_method: String, request: Bytes) -> Bytes!GrpcError:
+        if not trace.is_active():
+            framed := frame_message(request)
+            resp := self.client.request("POST", self.authority, full_method, grpc_headers(), framed)
+            if resp.is_err:
+                fail GrpcError(GRPC_UNAVAILABLE, "grpc transport error: {resp.err}")
+            return handle_response(resp.ok)!
+        # observability on: a CLIENT span, a traceparent injected into the request
+        # headers, and RED metrics — all invisible to the caller.
+        span := trace.start_kind(full_method, trace.CLIENT)
+        span.set_attr("rpc.system", "grpc").set_attr("rpc.method", full_method)
         framed := frame_message(request)
-        resp := self.client.request("POST", self.authority, full_method, grpc_headers(), framed)
+        started := time.mono_nanos()
+        resp := self.client.request("POST", self.authority, full_method, headers_with_traceparent(span.context()), framed)
         if resp.is_err:
+            finish_client_span(span, full_method, GRPC_UNAVAILABLE, started)
             fail GrpcError(GRPC_UNAVAILABLE, "grpc transport error: {resp.err}")
-        return handle_response(resp.ok)!
+        result := handle_response(resp.ok)
+        mut status := GRPC_OK
+        if result.is_err:
+            status = result.err.status
+        finish_client_span(span, full_method, status, started)
+        return result!
 
     # close the underlying http/2 connection. the channel cannot be used after.
     pub fn close():
@@ -130,6 +150,39 @@ REQUEST_HEADERS := [hpack.header_field("content-type", "application/grpc"), hpac
 
 fn grpc_headers() -> List[hpack.HeaderField]:
     return REQUEST_HEADERS
+
+# the standard grpc headers plus a W3C traceparent for `ctx`, so the server joins
+# this trace. builds a fresh list rather than pushing onto the shared cached one.
+fn headers_with_traceparent(ctx: trace.SpanContext) -> List[hpack.HeaderField]:
+    mut fields: List[hpack.HeaderField] := []
+    for f in grpc_headers():
+        fields.push(f)
+    fields.push(hpack.header_field("traceparent", trace.format_traceparent(ctx)))
+    return fields
+
+# the headers for a streaming open: the base grpc headers, plus a traceparent
+# carrying the current trace context when one is active — so a streaming rpc
+# started inside a span propagates it. off (or no active span) => base headers.
+fn stream_headers() -> List[hpack.HeaderField]:
+    if not trace.is_active():
+        return grpc_headers()
+    ctx := trace.current_context()
+    if not trace.context_is_valid(ctx):
+        return grpc_headers()
+    return headers_with_traceparent(ctx)
+
+# set a grpc client span's status from the grpc-status, end it, and record the RED
+# metrics (a request counter and a duration histogram) for the call.
+fn finish_client_span(span: trace.Span, full_method: String, status: Int, start_ns: Int):
+    if status == GRPC_OK:
+        span.set_status(trace.STATUS_OK, "")
+    else:
+        span.set_status(trace.STATUS_ERROR, status_name(status))
+    span.set_attr("rpc.grpc.status_code", status.to_string())
+    span.end()
+    elapsed_ms := (time.mono_nanos() - start_ns) / 1000000
+    metrics.counter("rpc_client_requests_total").labels(["rpc_method", full_method, "grpc_status", status_name(status)]).inc()
+    metrics.histogram("rpc_client_duration_ms").labels(["rpc_method", full_method]).observe(elapsed_ms)
 
 # frame a message for the wire: a one-byte compression flag (0 = identity), a
 # big-endian uint32 length, then the message bytes. the five prefix bytes are
@@ -381,7 +434,7 @@ impl Conn:
     # returned ServerStream to pull response messages until it reports done; a
     # non-OK grpc-status surfaces as a GrpcError from recv().
     pub fn server_stream(full_method: String, request: Bytes) -> ServerStream!GrpcError:
-        opened := self.client.open_stream("POST", self.authority, full_method, grpc_headers(), false)
+        opened := self.client.open_stream("POST", self.authority, full_method, stream_headers(), false)
         if opened.is_err:
             fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
         stream := opened.ok
@@ -460,7 +513,7 @@ impl Conn:
     # one response. `full_method` is "/package.Service/Method". send() each
     # request, close_send() to finish, then recv_response().
     pub fn client_stream(full_method: String) -> ClientStream!GrpcError:
-        opened := self.client.open_stream("POST", self.authority, full_method, grpc_headers(), false)
+        opened := self.client.open_stream("POST", self.authority, full_method, stream_headers(), false)
         if opened.is_err:
             fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
         return ClientStream(opened.ok, new_stream_reader())
@@ -470,7 +523,7 @@ impl Conn:
     # drive the request stream, recv() drains the response stream — the two can run
     # in separate tasks.
     pub fn bidi_stream(full_method: String) -> BidiStream!GrpcError:
-        opened := self.client.open_stream("POST", self.authority, full_method, grpc_headers(), false)
+        opened := self.client.open_stream("POST", self.authority, full_method, stream_headers(), false)
         if opened.is_err:
             fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
         return BidiStream(opened.ok, new_stream_reader())

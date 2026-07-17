@@ -22,6 +22,7 @@ import std.net.tls as tls
 import std.os.path as path_mod
 import std.text.scanner as scanner
 import std.time as time_mod
+import std.trace as trace
 import std.uuid as uuid
 from std.concurrent import Context, BlockingError, blocking_cancelled, blocking_deadline_exceeded, blocking_failed
 from std.io import BufferedBytesReader, BufferedBytesWriter, BufferedStringReader, TcpStream, FileStream
@@ -2354,6 +2355,90 @@ fn send_request_following_redirects_with_tls_config(req: ClientRequest, tls_conf
         current = redirect_request(current, resp)!
         redirects_left = redirects_left - 1
 
+# the tls send path shared by send_tls_with_config and its traced wrapper: force
+# tls on, then dispatch to the plain-host redirect path or a single sni request.
+fn send_tls_request(req: ClientRequest, server_name: String, config: tls.Config) -> HttpResponse!:
+    current := ClientRequest(req.method, req.host, req.port, req.path, copy_headers_map(req.headers), req.body, true, req.timeout_ms, req.redirect_limit)
+    if server_name != req.host:
+        return send_request_tls(current, server_name, config)
+    return send_request_following_redirects_with_tls_config(current, config)
+
+# --- client-side tracing ----------------------------------------------------
+# these run only when tracing is active (the send methods gate on
+# trace.is_active() first), so an uninstrumented program pays a single bool check.
+
+# start a CLIENT span for an outbound request and tag it with the method and url.
+fn start_http_client_span(method: String, host: String, path: String) -> trace.Span:
+    span := trace.start_kind("HTTP " + method, trace.CLIENT)
+    span.set_attr("http.request.method", method).set_attr("http.url", host + path)
+    return span
+
+# set a client span's status from the response (>= 400, or `status` < 0 for a
+# transport error, is an error), end it, and record the RED metrics.
+fn finish_http_client_span(span: trace.Span, method: String, status: Int, start_ns: Int):
+    mut status_label := "error"
+    if status < 0:
+        span.set_status(trace.STATUS_ERROR, "transport error")
+    else:
+        status_label = status.to_string()
+        span.set_attr("http.response.status_code", status_label)
+        if status >= 400:
+            span.set_status(trace.STATUS_ERROR, "http status " + status_label)
+        else:
+            span.set_status(trace.STATUS_OK, "")
+    span.end()
+    elapsed_ms := (time_mod.mono_nanos() - start_ns) / 1000000
+    metrics.counter("http_client_requests_total").labels(["method", method, "status", status_label]).inc()
+    metrics.histogram("http_client_duration_ms").labels(["method", method]).observe(elapsed_ms)
+
+# --- server-side tracing ----------------------------------------------------
+
+# begin a SERVER span for an inbound request. it extracts any W3C `traceparent`
+# header so the span joins the caller's trace, then starts a span named
+# "METHOD path". pair it with end_server_span once the response status is known;
+# there is no server framework, so a handler wires the two calls in by hand:
+#
+#     span := http.begin_server_span(req)
+#     resp := handle(req)
+#     http.end_server_span(span, resp.status)
+#
+# a cheap no-op (a non-recording span) when tracing is inactive.
+pub fn begin_server_span(req: HttpRequestBytes) -> trace.Span:
+    if not trace.is_active():
+        return trace.start_kind("", trace.SERVER)
+    incoming := req.header("traceparent") catch ""
+    if incoming != "":
+        parsed := trace.parse_traceparent(incoming)
+        if parsed != none:
+            trace.with_context(parsed.value())
+    span := trace.start_kind(req.method_text + " " + req.path_text, trace.SERVER)
+    span.set_attr("http.request.method", req.method_text).set_attr("url.path", req.path_text)
+    return span
+
+# finish a server span from begin_server_span: set its status from the response
+# code (>= 500 is an error), end it, and record the http_server RED metrics
+# labeled by method, route, and status. a no-op when tracing is inactive.
+pub fn end_server_span(span: trace.Span, status: Int):
+    if not trace.is_active():
+        return
+    status_label := status.to_string()
+    span.set_attr("http.response.status_code", status_label)
+    if status >= 500:
+        span.set_status(trace.STATUS_ERROR, "http status " + status_label)
+    else:
+        span.set_status(trace.STATUS_OK, "")
+    span.end()
+    # the span name is "METHOD path"; split it back into the metric labels.
+    space := span.name.index_of(" ")
+    mut method := span.name
+    mut route := ""
+    if space >= 0:
+        method = span.name.substring(0, space)
+        route = span.name.substring(space + 1, span.name.len())
+    elapsed_ms := time_mod.now() - (span.start_unix_ns / 1000000)
+    metrics.counter("http_server_requests_total").labels(["method", method, "route", route, "status", status_label]).inc()
+    metrics.histogram("http_server_duration_ms").labels(["method", method, "route", route]).observe(elapsed_ms)
+
 fn send_request_following_redirects_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
     mut current := req
     mut redirects_left := req.redirect_limit
@@ -2478,7 +2563,17 @@ impl ClientRequest:
         return buf.bytes()
 
     fn send() -> HttpResponse!:
-        return send_request_following_redirects(self)
+        if not trace.is_active():
+            return send_request_following_redirects(self)
+        span := start_http_client_span(self.method, self.host, self.path)
+        traced := self.header("traceparent", trace.format_traceparent(span.context()))
+        started := time_mod.mono_nanos()
+        result := send_request_following_redirects(traced)
+        if result.is_err:
+            finish_http_client_span(span, self.method, - 1, started)
+        else:
+            finish_http_client_span(span, self.method, result.ok.status, started)
+        return result!
 
     fn send_tls() -> HttpResponse!:
         return self.send_tls_with_config(self.host, tls.client_config()!)
@@ -2487,10 +2582,17 @@ impl ClientRequest:
         return self.send_tls()
 
     fn send_tls_with_config(server_name: String, config: tls.Config) -> HttpResponse!:
-        current := ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, true, self.timeout_ms, self.redirect_limit)
-        if server_name != self.host:
-            return send_request_tls(current, server_name, config)
-        return send_request_following_redirects_with_tls_config(current, config)
+        if not trace.is_active():
+            return send_tls_request(self, server_name, config)
+        span := start_http_client_span(self.method, self.host, self.path)
+        traced := self.header("traceparent", trace.format_traceparent(span.context()))
+        started := time_mod.mono_nanos()
+        result := send_tls_request(traced, server_name, config)
+        if result.is_err:
+            finish_http_client_span(span, self.method, - 1, started)
+        else:
+            finish_http_client_span(span, self.method, result.ok.status, started)
+        return result!
 
     fn send_into(writer: BufferedBytesWriter) -> StreamedHttpResponse!:
         return send_request_following_redirects_into(self, writer)

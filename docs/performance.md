@@ -46,18 +46,20 @@ no async runtime. 20,000 calls each, july 2026:
 
 | calls/sec | go | rust (tonic) | pith |
 |---|---|---|---|
-| 16 B, sequential | 3955 | 3002 | **2850** |
-| 1 KiB, sequential | 3820 | 2786 | **2657** |
-| 16 B, 8 concurrent | 13585 | 11224 | **5105** |
-| 1 KiB, 8 concurrent | 10990 | 8981 | **4609** |
+| 16 B, sequential | 3955 | 3002 | **3175** |
+| 1 KiB, sequential | 3820 | 2786 | **2943** |
+| 16 B, 8 concurrent, one connection | 13585 | 11224 | **5753** |
+| 1 KiB, 8 concurrent, one connection | 10990 | 8981 | **5600** |
 
-sequentially pith is ~72% of grpc-go and about matches tonic — close, for
+sequentially pith is ~77% of grpc-go and about matches tonic — close, for
 a stack that is pith all the way down (its own tls 1.3, http/2, hpack,
-protobuf). concurrency is the weak spot: eight streams over one connection
-lift pith ~1.8x where go and rust scale ~3.4x, so per-frame overhead
-(interpreter plus refcount atomics vs native buffered frames), not stream
-count, is the ceiling — the single reader/writer is correct and required
-for hpack ordering.
+protobuf). concurrency over a single connection is the weak spot: eight
+streams lift pith ~1.8x where go and rust scale ~3.4x. the ceiling there is
+not stream count but the per-call latency of the internal pipeline — every
+frame crosses worker → writer → socket → reader → worker, and each hop is a
+thread handoff (a futex wake plus a context switch). the single reader/writer
+is correct and required for hpack ordering, so the way past one connection is
+more connections, below.
 
 this benchmark paid for itself on the first run: client sockets had no
 `TCP_NODELAY`, so nagle collided with the peer's delayed acks for a ~40ms
@@ -71,12 +73,38 @@ into one write, data events share one empty header list, and — the largest
 win — a single-frame request body is now sent inline rather than on a
 spawned task, dropping one os thread per call. apples-to-apples best-of-7,
 sequential 16 B went from ~2550 to ~3120 calls/sec (+23%) and 8-concurrent
-from ~4860 to ~6260 (+29%). those gains are already in the table above,
-which is a fresh post-sprint sweep — sequential pith moved from ~2100 to
-~2850, roughly ~50% to ~72% of grpc-go. the box is too noisy to resolve
-the smaller items (cached headers, coalescing, shared event list) on
-wall-clock, so they stand on counted structural reductions; a quiet
-machine would sharpen the numbers further.
+from ~4860 to ~6260 (+29%); over the whole line that pass moved sequential
+pith from ~2100 to ~2850, roughly ~50% to ~72% of grpc-go. the table above
+is a later sweep still, after the std thread-safety fixes and the freelist
+below, at ~3175 (~77%). the box is too noisy to resolve the smaller items
+(cached headers, coalescing, shared event list) on wall-clock, so they stand
+on counted structural reductions; a quiet machine would sharpen the numbers.
+
+past a single connection there is a connection pool: `grpc.dial_pool` (and
+`http2.open_pool`) opens n independent connections and rotates calls across
+them round-robin, the same subchannel trick real grpc clients use. each
+connection is its own tls session and reader/writer pipeline, so calls on
+different connections run on different cores. it took landing the std
+thread-safety fixes first — a shared per-connection reader was racing global
+state and segfaulting under true parallelism. on this 2-core dev box the pool
+buys only ~11% at pool=2 and ~15% at pool=4, because eight concurrent streams
+already saturate both cores (the client shares them with the go server); the
+pool pays off on hardware where a single connection's ~one-core pipeline is
+the real ceiling.
+
+worth recording what did *not* help grpc: allocation. profiling flagged
+~13% of cpu in malloc/free, and a sequential call does ~800 small struct
+allocations (mostly the result box built for every `T!` return). but a
+sequential call is ~760 µs, nearly all of it blocked on socket, tls, and
+those thread handoffs — the allocation is cpu time that barely touches
+wall-clock. a per-thread struct freelist (recycling small blocks instead of
+round-tripping the allocator) moved grpc by ~0% and struct-alloc-bound
+compute by up to ~29%; it is a compute win, kept because it is free and
+safe, not a grpc one. a deeper swing at the same target — returning small
+results in two registers instead of a heap box — was prototyped and shelved:
+it needs boxing thunks wherever such a function is used as a value (every
+higher-order call), which is a large, delicate change for a compute-only
+gain the freelist already mostly captures.
 
 `bench/std_pipeline` — 50k records: csv read/write, transform, json,
 gzip:

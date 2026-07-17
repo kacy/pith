@@ -78,6 +78,16 @@ the smaller items (cached headers, coalescing, shared event list) on
 wall-clock, so they stand on counted structural reductions; a quiet
 machine would sharpen the numbers further.
 
+a later thread-safety pass moved `std.binary`'s reader off shared global
+maps into its own struct fields (so two http/2 reader threads can't race
+them). that also dropped a global-map access per frame parse: a
+re-measurement put pith at ~3040 calls/sec sequential 16 B (now matching
+tonic, ~74% of grpc-go) and ~6300 8-concurrent (~2x scaling, up from
+~1.8x) — the concurrent path gains more because it parses more frames.
+the point of that change was correctness, not speed: before it, running
+several pooled connections in parallel raced the global maps and crashed;
+the throughput bump was a free side effect.
+
 `bench/std_pipeline` — 50k records: csv read/write, transform, json,
 gzip:
 

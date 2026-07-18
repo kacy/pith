@@ -8,7 +8,7 @@ of it.
 
 there are three moving parts, and you can adopt them in any order:
 
-- `std.metrics` — counters, gauges, and histograms, with labels.
+- `std.metrics` — counters, gauges, and histograms, with labels and units.
 - `std.prometheus` — serve those metrics at `/metrics` for prometheus to scrape.
 - `std.trace` + `std.otlp` + `std.obs` — distributed tracing and OTLP push export.
 
@@ -44,23 +44,31 @@ need to guard it behind a build flag.
 ## metrics
 
 `std.metrics` is a small registry of three instrument types. you name an
-instrument, optionally attach labels, and record into it.
+instrument, optionally give it labels, a unit, and help text, and record into it.
+values are floats, so seconds and ratios are as natural as counts.
 
 ```pith
 import std.metrics as metrics
 
 metrics.counter("orders_total").inc()
 metrics.counter("orders_total").labels(["region", "eu"]).inc()
-metrics.gauge("queue_depth").set(work.len())
-metrics.histogram("job_duration_ms").observe(elapsed)
+metrics.gauge("cpu_load").set(0.7)
+
+metrics.histogram("request_seconds")
+    .buckets([0.005, 0.01, 0.05, 0.1, 0.5, 1.0])
+    .describe("request latency", "s")
+    .observe(0.234)
 ```
 
 `labels(["k1", "v1", "k2", "v2"])` takes a flat key/value list and returns an
 instrument bound to that label set. each distinct set accumulates on its own, so
 the two `orders_total` lines above are separate series that render under one
-`# TYPE` line. values are integers today, and histogram buckets are fixed.
+`# TYPE` line. `buckets([...])` sets a histogram's boundaries (choose them before
+the first observation; the default is a 1..5000 ladder). `describe(help, unit)`
+attaches a `# HELP` line and feeds the OTLP description and unit. whole-number
+values still render cleanly — a count reads `5`, not `5.0`.
 
-the std clients already register these on your behalf:
+the std clients register these on your behalf:
 
 | metric | labels | source |
 |--------|--------|--------|
@@ -86,11 +94,10 @@ fn main() -> Int!:
     return 0
 ```
 
-`serve` answers `GET /metrics` with the current snapshot and 404s everything
-else. it's pull-based, so there's no interval to configure here — prometheus
-scrapes on its own schedule and each request renders whatever the registry holds
-at that moment. prometheus metrics and OTLP push are independent; use either,
-both, or neither.
+`serve` answers `GET /metrics` with the current snapshot (including any `# HELP`
+lines) and 404s everything else. it's pull-based, so there's no interval to
+configure — prometheus scrapes on its own schedule. prometheus metrics and OTLP
+push are independent; use either, both, or neither.
 
 ## tracing
 
@@ -102,15 +109,21 @@ import std.trace as trace
 
 fn handle_request():
     span := trace.start("handle_request")
-    span.set_attr("http.route", "/api").set_attr("user.tier", "pro")
+    span.set_attr("http.route", "/api").set_attr_int("http.status_code", 200)
+    span.add_event("cache.miss")
     ... work ...
     span.set_status(trace.STATUS_OK, "")
     span.end()
 ```
 
-`set_attr` returns the span so calls chain. `start_kind(name, kind)` picks the
-span kind (`SERVER`, `CLIENT`, `PRODUCER`, `CONSUMER`, or the default
-`INTERNAL`); the auto-instrumentation uses `CLIENT` and `SERVER`.
+attributes are typed: `set_attr` (string), `set_attr_int`, `set_attr_bool`, and
+`set_attr_float`, each chainable. `add_event(name)` records a timestamped point
+on the span (`add_event_attrs` adds attributes to it), and `add_link(ctx)` links
+to another span's context. a span caps its attributes, events, and links at 128
+each and counts what it drops, so a runaway loop can't grow one without bound.
+`start_kind(name, kind)` picks the span kind (`SERVER`, `CLIENT`, `PRODUCER`,
+`CONSUMER`, or the default `INTERNAL`); the auto-instrumentation uses `CLIENT`
+and `SERVER`.
 
 ### spans nest on their own
 
@@ -146,6 +159,28 @@ fn work_item(ctx: trace.SpanContext):
     span.end()
 ```
 
+## sampling
+
+by default every span in an active trace is recorded (the `parentbased_always_on`
+sampler). in production you usually sample a fraction to control volume and cost.
+`std.obs` reads the standard variables:
+
+```
+OTEL_TRACES_SAMPLER=parentbased_traceidratio
+OTEL_TRACES_SAMPLER_ARG=0.1        # keep 10%
+```
+
+the samplers are `always_on`, `always_off`, `traceidratio`, and the `parentbased_`
+variants of each. the ratio decision is deterministic on the trace id, so every
+service that sees a trace makes the same call and a trace is kept or dropped as a
+whole. the `parentbased_` samplers inherit an incoming decision from the
+`traceparent`, which is what keeps a distributed trace intact — a downstream
+service records its spans only if the caller's were sampled.
+
+an unsampled span is not a no-op: it still carries a valid context and propagates
+(so downstream and child spans agree), it just isn't recorded or exported. the
+sampling decision rides out in the `traceparent` flags (`-01` sampled, `-00` not).
+
 ## propagation across services
 
 trace context crosses a process boundary as a W3C `traceparent` header
@@ -168,36 +203,60 @@ and `parse_traceparent` give you the raw header both ways.
 
 ## OTLP export
 
-`std.obs.init()` reads the environment and wires everything up. to configure the
-exporter from code instead, call `obs.start(...)` directly. the environment
-variables follow the opentelemetry sdk names:
+`std.obs.init()` reads the environment and wires everything up. the variables
+follow the opentelemetry sdk names:
 
 | variable | meaning | default |
 |----------|---------|---------|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | collector base url; unset means off | — |
 | `OTEL_SERVICE_NAME` | `service.name` on exported data | `pith-service` |
+| `OTEL_SERVICE_VERSION` | `service.version` | — |
+| `OTEL_RESOURCE_ATTRIBUTES` | extra resource attrs, `k1=v1,k2=v2` | — |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` or `grpc` | `http/protobuf` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | auth/tenant headers, `k1=v1,k2=v2` | — |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | per-request timeout (ms) | `10000` |
+| `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` to compress request bodies | none |
+| `OTEL_TRACES_SAMPLER` / `_ARG` | sampler + argument (see sampling) | `parentbased_always_on` |
 | `OTEL_METRIC_EXPORT_INTERVAL` | ms between metric flushes | `60000` |
 | `OTEL_BSP_SCHEDULE_DELAY` | ms between span flushes | `5000` |
 
 the exporter batches in the background: it drains finished spans on the span
 interval, POSTs a metric snapshot on the metric interval, and does one final
-flush on `shutdown()`. a failed POST is swallowed so a flaky collector never
-wedges your app. spans that finish faster than the collector drains them are
-capped, so a burst can't grow the buffer without bound.
+flush on `shutdown()`. it retries transient failures (a timeout, a dropped
+connection, `429`, or any `5xx`) with exponential backoff, honoring a
+`Retry-After` header; a permanent `4xx` is dropped without retry. spans that
+finish faster than the collector drains them are capped, so a burst can't grow
+the buffer without bound.
 
-export goes over OTLP/HTTP with protobuf bodies (to `/v1/traces` and
-`/v1/metrics`), encoded by hand in `std.otlp` on top of `std.protobuf`. that's
-the default and the recommended transport.
+the exported data is complete: spans carry typed attributes, events, links, and a
+status; histograms carry their explicit bucket bounds, per-bucket counts, and
+min/max (so a backend can estimate percentiles); and the resource carries
+`service.name`/`version`/`instance.id`, the `telemetry.sdk.*` identity, and any
+`OTEL_RESOURCE_ATTRIBUTES`. `OTEL_EXPORTER_OTLP_HEADERS` is what lets you reach a
+hosted backend — an api key or tenant header rides on every request over both
+transports.
+
+### transports
+
+`http/protobuf` (the default) POSTs protobuf to `/v1/traces` and `/v1/metrics`,
+optionally gzip-compressed. `grpc` makes a unary call to the collector's
+`TraceService`/`MetricsService` `Export` methods carrying the identical protobuf,
+with the auth headers as grpc metadata. the grpc transport is tls-only — pith's
+grpc client has no cleartext h2c — so a `grpc` target needs an `https://`
+endpoint; a plain `http://` grpc endpoint fails with a clear message rather than
+mis-dialing.
 
 ## what isn't here yet
 
-- **OTLP/grpc transport** — `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` is recognized but
-  not implemented; export fails with a clear message. use `http/protobuf`.
 - **OTLP logs** — logs aren't exported over OTLP. `std.log` records already carry
   the current trace and span ids, so they correlate in a backend that ingests
   logs separately.
-- **histogram shape** — buckets are fixed and metric values are integers; there's
-  no per-metric bucket configuration or exemplars.
-- **sampling** — every started span is recorded when tracing is on; there's no
-  head or tail sampler yet.
+- **grpc without tls** — the OTLP/grpc transport requires tls; there's no
+  cleartext h2c for a bare local collector on `:4317`. use `http/protobuf` or an
+  `https` grpc endpoint.
+- **`prometheus.serve` runs single-threaded** — it handles one scrape at a time.
+  that's fine for a normal scrape interval; concurrent scrape handling is held up
+  by a compiler limitation (a spawned task can't yet call certain cross-module std
+  functions).
+- **exemplars and delta temporality** — metrics export as cumulative (which
+  matches how pith accumulates them); there are no exemplars or delta temporality.

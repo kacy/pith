@@ -47,6 +47,26 @@ pub struct Attr:
     pub b: Bool
     pub f: Float
 
+# per-span caps on collected data, matching the OTel default span limits. once a
+# list is full the extra item is dropped and the matching dropped_* counter is
+# bumped, so a runaway span cannot grow without bound.
+MAX_SPAN_ATTRIBUTES := 128
+MAX_SPAN_EVENTS := 128
+MAX_SPAN_LINKS := 128
+
+# a timestamped named point on a span (an OTel span Event) with its own
+# attributes — e.g. "exception" or "cache.miss" at a moment during the span.
+pub struct Event:
+    pub name: String
+    pub time_unix_ns: Int
+    pub attrs: List[Attr]
+
+# a reference from this span to another span's context (an OTel span Link),
+# carrying just the linked trace and span ids.
+pub struct Link:
+    pub trace_id: String
+    pub span_id: String
+
 # global on/off. off => start() returns a non-recording span and touches no
 # per-thread state, so the overhead of leaving trace calls in is negligible.
 mut trace_active := false
@@ -118,6 +138,12 @@ pub struct Span:
     saved_trace_id: String
     saved_span_id: String
     saved_sampled: Bool
+    mut events: List[Event]
+    mut links: List[Link]
+    # counts of items dropped because a span limit was hit (reported to OTLP).
+    mut dropped_attributes_count: Int
+    mut dropped_events_count: Int
+    mut dropped_links_count: Int
 
 # a compact 32-hex-character id from a uuid (dashes stripped) — the trace-id
 # width; a 16-hex span id is its first half. these match std.log's id format so
@@ -142,8 +168,12 @@ fn unix_nanos() -> Int:
     return time.now() * 1000000
 
 fn no_op_span() -> Span:
+    # a bare [] does not infer its element type as a positional constructor arg,
+    # so each empty list needs an explicitly-typed local.
     empty_attrs: List[Attr] := []
-    return Span("", "", "", "", INTERNAL, 0, 0, 0, empty_attrs, STATUS_UNSET, "", false, "", "", false)
+    empty_events: List[Event] := []
+    empty_links: List[Link] := []
+    return Span("", "", "", "", INTERNAL, 0, 0, 0, empty_attrs, STATUS_UNSET, "", false, "", "", false, empty_events, empty_links, 0, 0, 0)
 
 # start a span of the given kind, parented under the current span on this thread
 # (or a new root trace if there is none), and make it the current span. returns a
@@ -160,7 +190,9 @@ pub fn start_kind(name: String, kind: Int) -> Span:
         sampled = true
     span_id := new_id(16)
     empty_attrs: List[Attr] := []
-    span := Span(trace_id, span_id, parent_id, name, kind, unix_nanos(), time.mono_nanos(), 0, empty_attrs, STATUS_UNSET, "", true, cur_trace_id, cur_span_id, cur_sampled)
+    empty_events: List[Event] := []
+    empty_links: List[Link] := []
+    span := Span(trace_id, span_id, parent_id, name, kind, unix_nanos(), time.mono_nanos(), 0, empty_attrs, STATUS_UNSET, "", true, cur_trace_id, cur_span_id, cur_sampled, empty_events, empty_links, 0, 0, 0)
     # this span is now current; it restores the saved parent on end.
     cur_trace_id = trace_id
     cur_span_id = span_id
@@ -172,28 +204,63 @@ pub fn start(name: String) -> Span:
     return start_kind(name, INTERNAL)
 
 impl Span:
+    # whether another attribute fits under MAX_SPAN_ATTRIBUTES; when the cap is
+    # reached it records the drop instead so the counter reflects what was lost.
+    fn can_add_attr() -> Bool:
+        if self.attrs.len() >= MAX_SPAN_ATTRIBUTES:
+            self.dropped_attributes_count = self.dropped_attributes_count + 1
+            return false
+        return true
+
     # attach a string attribute; returns self so calls can chain.
     fn set_attr(key: String, value: String) -> Span:
-        if self.recording:
+        if self.recording and self.can_add_attr():
             self.attrs.push(Attr(key, ATTR_STRING, value, 0, false, 0.0))
         return self
 
     # attach an integer attribute; returns self so calls can chain.
     fn set_attr_int(key: String, value: Int) -> Span:
-        if self.recording:
+        if self.recording and self.can_add_attr():
             self.attrs.push(Attr(key, ATTR_INT, "", value, false, 0.0))
         return self
 
     # attach a boolean attribute; returns self so calls can chain.
     fn set_attr_bool(key: String, value: Bool) -> Span:
-        if self.recording:
+        if self.recording and self.can_add_attr():
             self.attrs.push(Attr(key, ATTR_BOOL, "", 0, value, 0.0))
         return self
 
     # attach a floating-point attribute; returns self so calls can chain.
     fn set_attr_float(key: String, value: Float) -> Span:
-        if self.recording:
+        if self.recording and self.can_add_attr():
             self.attrs.push(Attr(key, ATTR_FLOAT, "", 0, false, value))
+        return self
+
+    # record a named event at the current time; returns self so calls can chain.
+    fn add_event(name: String) -> Span:
+        empty_attrs: List[Attr] := []
+        return self.add_event_attrs(name, empty_attrs)
+
+    # record a named event with its own attributes, timestamped like end() does
+    # (the span's wall-clock start plus the monotonic time elapsed since). drops
+    # the event past MAX_SPAN_EVENTS, bumping dropped_events_count. chainable.
+    fn add_event_attrs(name: String, attrs: List[Attr]) -> Span:
+        if self.recording:
+            if self.events.len() >= MAX_SPAN_EVENTS:
+                self.dropped_events_count = self.dropped_events_count + 1
+            else:
+                time_ns := self.start_unix_ns + (time.mono_nanos() - self.start_mono_ns)
+                self.events.push(Event(name, time_ns, attrs))
+        return self
+
+    # record a link to another span's context. drops the link past
+    # MAX_SPAN_LINKS, bumping dropped_links_count. returns self so calls can chain.
+    fn add_link(ctx: SpanContext) -> Span:
+        if self.recording:
+            if self.links.len() >= MAX_SPAN_LINKS:
+                self.dropped_links_count = self.dropped_links_count + 1
+            else:
+                self.links.push(Link(ctx.trace_id, ctx.span_id))
         return self
 
     fn set_status(code: Int, message: String):
@@ -342,3 +409,90 @@ test "an inactive span records no attributes":
     span := start("noop")
     span.set_attr("k", "v").set_attr_int("n", 1).set_attr_bool("flag", true).set_attr_float("x", 2.0)
     assert_eq(span.attrs.len(), 0)
+
+test "add_event records a named event with a timestamp":
+    set_active(true)
+    clear_context()
+    span := start("work")
+    span.add_event("cache.miss")
+    assert_eq(span.events.len(), 1)
+    assert_eq(span.events[0].name, "cache.miss")
+    assert(span.events[0].time_unix_ns > 0)
+    assert_eq(span.events[0].attrs.len(), 0)
+    span.end()
+    set_active(false)
+
+test "add_event_attrs records the event's attributes":
+    set_active(true)
+    clear_context()
+    span := start("work")
+    attrs: List[Attr] := [Attr("exception.type", ATTR_STRING, "IOError", 0, false, 0.0)]
+    span.add_event_attrs("exception", attrs)
+    assert_eq(span.events.len(), 1)
+    assert_eq(span.events[0].name, "exception")
+    assert_eq(span.events[0].attrs.len(), 1)
+    assert_eq(span.events[0].attrs[0].key, "exception.type")
+    assert_eq(span.events[0].attrs[0].s, "IOError")
+    span.end()
+    set_active(false)
+
+test "add_link records the linked context's ids":
+    set_active(true)
+    clear_context()
+    other := SpanContext("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331", true)
+    span := start("work")
+    span.add_link(other)
+    assert_eq(span.links.len(), 1)
+    assert_eq(span.links[0].trace_id, other.trace_id)
+    assert_eq(span.links[0].span_id, other.span_id)
+    span.end()
+    set_active(false)
+
+test "an inactive span records no events or links":
+    set_active(false)
+    clear_context()
+    span := start("noop")
+    span.add_event("e")
+    span.add_link(SpanContext("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331", true))
+    assert_eq(span.events.len(), 0)
+    assert_eq(span.links.len(), 0)
+
+test "the attribute cap drops extras and counts them":
+    set_active(true)
+    clear_context()
+    span := start("work")
+    mut i := 0
+    while i < MAX_SPAN_ATTRIBUTES + 2:
+        span.set_attr_int("k", i)
+        i = i + 1
+    assert_eq(span.attrs.len(), MAX_SPAN_ATTRIBUTES)
+    assert_eq(span.dropped_attributes_count, 2)
+    span.end()
+    set_active(false)
+
+test "the event cap drops extras and counts them":
+    set_active(true)
+    clear_context()
+    span := start("work")
+    mut i := 0
+    while i < MAX_SPAN_EVENTS + 3:
+        span.add_event("e")
+        i = i + 1
+    assert_eq(span.events.len(), MAX_SPAN_EVENTS)
+    assert_eq(span.dropped_events_count, 3)
+    span.end()
+    set_active(false)
+
+test "the link cap drops extras and counts them":
+    set_active(true)
+    clear_context()
+    ctx := SpanContext("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331", true)
+    span := start("work")
+    mut i := 0
+    while i < MAX_SPAN_LINKS + 1:
+        span.add_link(ctx)
+        i = i + 1
+    assert_eq(span.links.len(), MAX_SPAN_LINKS)
+    assert_eq(span.dropped_links_count, 1)
+    span.end()
+    set_active(false)

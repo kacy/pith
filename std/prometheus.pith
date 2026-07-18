@@ -16,9 +16,22 @@
 
 import std.metrics as metrics
 import std.net.http as http
+import std.net.tcp as tcp
+import std.time as time
 
 # prometheus's text-exposition format content type.
 PROMETHEUS_CONTENT_TYPE := "text/plain; version=0.0.4; charset=utf-8"
+
+# the most scrapes serve() handles at once. beyond this the accept loop waits for
+# an in-flight scrape to finish (backpressure) rather than spawning without
+# bound, so a slow or stuck client can't fan out into unbounded tasks.
+MAX_CONCURRENT_SCRAPES := 64
+
+# the in-flight permits, shared between the accept loop and the scrape tasks. a
+# Semaphore is safe to share across threads; it lives as a module global rather
+# than a spawned-task argument (which the compiler can't yet dispatch for a
+# sync-primitive type).
+mut scrape_slots := Semaphore(MAX_CONCURRENT_SCRAPES)
 
 # the /metrics response for the current metric snapshot.
 pub fn metrics_response() -> http.HttpResponse:
@@ -34,13 +47,24 @@ fn handle_scrape(fd: Int) -> Int!:
         return http.send(fd, metrics_response())
     return http.send(fd, http.not_found_response())
 
+# handle one scrape to completion on its own task: answer it, close the socket,
+# and release the concurrency permit. errors are swallowed so a slow or broken
+# client only affects its own connection, never the accept loop.
+fn serve_scrape(fd: Int):
+    handle_scrape(fd) catch 0
+    tcp_close(fd)
+    scrape_slots.release()
+
 # serve the /metrics endpoint on host:port. this blocks in an accept loop, so run
-# it in the background: `spawn prometheus.serve("0.0.0.0", 9464)`.
+# it in the background: `spawn prometheus.serve("0.0.0.0", 9464)`. each scrape is
+# handled on its own task, up to MAX_CONCURRENT_SCRAPES at once, so a slow scrape
+# does not hold up the next one.
 pub fn serve(host: String, port: Int) -> Int!:
     fd := tcp_listen(host, port)!
     while true:
         client := tcp_accept(fd)!
-        handle_scrape(client) catch 0
+        scrape_slots.acquire()
+        spawn serve_scrape(client)
     return 0
 
 test "metrics_response carries the prometheus content type and current snapshot":
@@ -51,3 +75,51 @@ test "metrics_response carries the prometheus content type and current snapshot"
     assert(rendered.contains("Content-Type: text/plain; version=0.0.4"))
     assert(rendered.contains("# TYPE http_requests_total counter"))
     assert(rendered.contains("http_requests_total" + chr(123) + "route=" + chr(34) + "/api" + chr(34) + chr(125) + " 1"))
+
+test "metrics_response includes help text for described metrics":
+    metrics.reset()
+    metrics.counter("http_requests_total").describe("total http requests handled", "1").inc()
+    resp := metrics_response()
+    rendered := resp.to_bytes()!.to_string_utf8()!
+    assert(rendered.contains("# HELP http_requests_total total http requests handled"))
+    assert(rendered.contains("# TYPE http_requests_total counter"))
+
+# a background serve() for tests: swallow the (never-returned) result so it can be
+# spawned as a plain call. serve loops forever, so the test process reaps it on exit.
+fn serve_bg(port: Int) -> Int:
+    return serve("127.0.0.1", port) catch 0
+
+# a minimal GET /metrics over a socket, returning the whole response text (or ""
+# on a connection failure). used to drive concurrent scrapes in the test below.
+fn raw_scrape(port: Int) -> String:
+    connected := tcp.connect("127.0.0.1", port)
+    if connected.is_err:
+        return ""
+    fd := connected.ok
+    tcp.set_timeout(fd, 2000)
+    crlf := chr(13) + chr(10)
+    tcp.write(fd, "GET /metrics HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf) catch 0
+    body := tcp.read(fd, 65536) catch ""
+    tcp.close(fd)
+    return body
+
+test "serve answers several concurrent scrapes":
+    metrics.reset()
+    metrics.counter("scrape_hits_total").describe("scrapes served", "1").inc()
+    port := 19464
+    spawn serve_bg(port)
+    time.delay(200)   # let the listener bind before scraping
+
+    ta := spawn raw_scrape(port)
+    tb := spawn raw_scrape(port)
+    tc := spawn raw_scrape(port)
+    td := spawn raw_scrape(port)
+    ra := await ta
+    rb := await tb
+    rc := await tc
+    rd := await td
+
+    for r in [ra, rb, rc, rd]:
+        assert(r.contains("200"))
+        assert(r.contains("# HELP scrape_hits_total scrapes served"))
+        assert(r.contains("scrape_hits_total 1"))

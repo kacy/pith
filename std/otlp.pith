@@ -7,25 +7,37 @@
 #     wire form of an ExportTraceServiceRequest / ExportMetricsServiceRequest,
 #     built by hand on top of std.protobuf the same way the database drivers
 #     hand-write their wire protocols. there is no `.proto` code generation.
-#   - export: POST that protobuf to an OTLP/HTTP collector at /v1/traces or
-#     /v1/metrics with content-type application/x-protobuf. the export path is
-#     production-grade: it sends configured auth headers, honors a per-request
-#     timeout, optionally gzip-compresses the body, and retries transient
-#     failures (429/5xx and transport errors) with exponential backoff.
+#   - export: ship that protobuf to a collector over one of two transports:
+#       * OTLP/HTTP: POST to /v1/traces or /v1/metrics with content-type
+#         application/x-protobuf.
+#       * OTLP/grpc: a unary grpc call to the TraceService / MetricsService
+#         Export method, carrying the identical ExportServiceRequest protobuf.
+#     the export path is production-grade: it sends configured auth headers,
+#     honors a per-request timeout, optionally gzip-compresses the body (http),
+#     and retries transient failures with exponential backoff.
 #
 # std.obs.init wires this up from the environment; you rarely call it directly.
 #
 # scope (v1): spans with typed (string/int/bool/double) attributes and a status;
 # counter and gauge metrics in full; histograms as a count+sum data point (no
-# per-bucket detail, see encode_metrics). transport is OTLP/HTTP only — grpc is
-# not implemented.
+# per-bucket detail, see encode_metrics). both OTLP/HTTP and OTLP/grpc transports
+# are supported. note pith's grpc client speaks http/2 only over tls (alpn "h2"),
+# so an OTLP/grpc target must use an https endpoint; a cleartext h2c grpc endpoint
+# is not reachable and is rejected with a clear error.
 
 import std.bytes as bytes
-import std.compress.gzip as gzip
 import std.encoding as encoding
 import std.env as env
 import std.metrics as metrics
+# the net imports below are ordered deliberately, not alphabetically: std.net.http
+# must come before std.net.grpc, and std.compress.gzip must come after grpc (which
+# pulls in the http/2 codec). otherwise the self-hosted module loader gives
+# std.binary's Reader and http's Conn two identities and the checker reports
+# spurious "expected X, got X" errors — the same loader-ordering bug documented in
+# std/net/http2/connection.pith. keep this order until that loader bug is fixed.
 import std.net.http as http
+import std.net.grpc as grpc
+import std.compress.gzip as gzip
 import std.net.tls as tls
 import std.net.url as url_mod
 import std.protobuf as protobuf
@@ -38,7 +50,7 @@ SDK_VERSION := "0.1.0"
 
 # the OTLP/HTTP protocol value obs uses by default.
 pub PROTOCOL_HTTP := "http/protobuf"
-# the OTLP/grpc protocol value (recognized but not implemented in v1).
+# the OTLP/grpc protocol value; exported over a unary grpc call (tls only).
 pub PROTOCOL_GRPC := "grpc"
 
 # the content type an OTLP/HTTP collector expects for a protobuf body.
@@ -544,28 +556,91 @@ fn post_with_retry(cfg: Target, signal_path: String, body: Bytes) -> Bool:
         attempt = attempt + 1
     return false
 
+# --- export over OTLP/grpc ---------------------------------------------------
+
+# the grpc full method ("/package.Service/Method") that carries an OTLP signal.
+# OTLP/grpc sends the same ExportServiceRequest protobuf as OTLP/HTTP — only the
+# addressing differs — so the http signal path selects the grpc method:
+# /v1/traces -> the TraceService, anything else -> the MetricsService.
+fn grpc_method_for(signal_path: String) -> String:
+    if signal_path == "/v1/metrics":
+        return "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export"
+    return "/opentelemetry.proto.collector.trace.v1.TraceService/Export"
+
+# whether a failed grpc export is worth retrying. UNAVAILABLE (the collector is
+# down or the connection dropped) is transient like an http 5xx; every other
+# status — a bad request, an auth failure, an unimplemented method — is permanent
+# and dropped immediately, the grpc analogue of a non-retryable http 4xx.
+fn grpc_is_retryable(status: Int) -> Bool:
+    return status == grpc.GRPC_UNAVAILABLE
+
+# make one grpc export attempt and return its grpc-status: GRPC_OK when the
+# collector accepted the request, otherwise the error status (a dial or transport
+# failure reads as UNAVAILABLE). dials the collector fresh, makes the unary call
+# for `full_method` with the target's auth headers as grpc metadata, and closes.
+# never propagates — the retry loop decides whether to try again.
+fn grpc_export_attempt(cfg: Target, full_method: String, body: Bytes) -> Int:
+    # grpc.dial opens http/2 over tls with alpn "h2", trusting the system roots —
+    # the same trust the http path's tls.client_config() uses.
+    opened := grpc.dial(cfg.host, cfg.port)
+    if opened.is_err:
+        return grpc.GRPC_UNAVAILABLE
+    channel := opened.ok
+    result := channel.unary_with_headers(full_method, body, cfg.headers)
+    channel.close()
+    if result.is_err:
+        return result.err.status
+    return grpc.GRPC_OK
+
+# export an already-encoded OTLP request over grpc, best-effort with the same
+# retry policy as the http path: an UNAVAILABLE backs off and retries up to
+# MAX_EXPORT_ATTEMPTS, any other error is permanent and dropped, and an exhausted
+# retry returns false. never propagates a failed export — but a non-tls grpc
+# target is a configuration error (pith's grpc client has no cleartext h2c
+# transport, only tls), so that case fails loudly rather than breaking silently.
+fn export_over_grpc(cfg: Target, full_method: String, body: Bytes) -> Bool!:
+    if not cfg.use_tls:
+        fail "otlp: grpc transport requires tls (h2c cleartext is unsupported); use an https endpoint or http/protobuf"
+    mut attempt := 0
+    while attempt < MAX_EXPORT_ATTEMPTS:
+        status := grpc_export_attempt(cfg, full_method, body)
+        if status == grpc.GRPC_OK:
+            return true
+        last_attempt := attempt + 1 >= MAX_EXPORT_ATTEMPTS
+        if last_attempt or not grpc_is_retryable(status):
+            return false
+        time.delay(backoff_ms(attempt))
+        attempt = attempt + 1
+    return false
+
+# --- export dispatch --------------------------------------------------------
+
 # export these spans to the collector's /v1/traces. an empty list is a no-op
-# (returns true). grpc endpoints fail with a clear message until implemented.
+# (returns true). the target's protocol selects the transport: http/protobuf
+# POSTs the body, grpc makes a unary TraceService/Export call with the identical
+# protobuf. best-effort: a failed export returns false rather than propagating.
 pub fn export_traces(cfg: Target, spans: List[trace.Span]) -> Bool!:
     if spans.len() == 0:
         return true
-    if cfg.protocol == PROTOCOL_GRPC:
-        fail "otlp: grpc transport is not implemented; use http/protobuf"
     encoded := encode_traces(cfg, spans)
     if encoded.is_err:
         fail "otlp: encode traces: " + encoded.err.message
+    if cfg.protocol == PROTOCOL_GRPC:
+        return export_over_grpc(cfg, grpc_method_for("/v1/traces"), encoded.ok)!
     return post_with_retry(cfg, "/v1/traces", encoded.ok)
 
-# export these metric samples to the collector's /v1/metrics. an empty list is
-# a no-op (returns true). grpc endpoints fail until implemented.
+# export these metric samples to the collector's /v1/metrics. an empty list is a
+# no-op (returns true). the target's protocol selects the transport: http/protobuf
+# POSTs the body, grpc makes a unary MetricsService/Export call with the identical
+# protobuf. best-effort: a failed export returns false rather than propagating.
 pub fn export_metrics(cfg: Target, samples: List[metrics.MetricSample]) -> Bool!:
     if samples.len() == 0:
         return true
-    if cfg.protocol == PROTOCOL_GRPC:
-        fail "otlp: grpc transport is not implemented; use http/protobuf"
     encoded := encode_metrics(cfg, samples)
     if encoded.is_err:
         fail "otlp: encode metrics: " + encoded.err.message
+    if cfg.protocol == PROTOCOL_GRPC:
+        return export_over_grpc(cfg, grpc_method_for("/v1/metrics"), encoded.ok)!
     return post_with_retry(cfg, "/v1/metrics", encoded.ok)
 
 # --- tests ------------------------------------------------------------------
@@ -1082,3 +1157,32 @@ test "retry_delay prefers a larger Retry-After over the backoff":
     small_headers: Map[String, String] := {"Retry-After": "1"}
     smaller := http.HttpResponse(503, "", small_headers, bytes.empty(), [])
     assert_eq(retry_delay_ms(smaller, 3), backoff_ms(3))
+
+test "grpc_method_for maps each signal path to its Export method":
+    assert_eq(grpc_method_for("/v1/traces"), "/opentelemetry.proto.collector.trace.v1.TraceService/Export")
+    assert_eq(grpc_method_for("/v1/metrics"), "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export")
+
+test "grpc carries the same encoded protobuf as the http transport":
+    # OTLP/grpc and OTLP/HTTP send the identical ExportServiceRequest; only the
+    # addressing differs. the encoded body must not depend on the protocol.
+    span := sample_span()
+    http_cfg := target("checkout", "https://collector.local:4317", PROTOCOL_HTTP)
+    grpc_cfg := target("checkout", "https://collector.local:4317", PROTOCOL_GRPC)
+    assert_eq(encode_traces(grpc_cfg, [span])!, encode_traces(http_cfg, [span])!)
+
+test "grpc_is_retryable retries only UNAVAILABLE":
+    # transient collector-down errors retry; permanent errors are dropped.
+    assert(grpc_is_retryable(grpc.GRPC_UNAVAILABLE))
+    assert(not grpc_is_retryable(grpc.GRPC_OK))
+    assert(not grpc_is_retryable(grpc.GRPC_INVALID_ARGUMENT))
+    assert(not grpc_is_retryable(grpc.GRPC_UNAUTHENTICATED))
+    assert(not grpc_is_retryable(grpc.GRPC_UNIMPLEMENTED))
+
+test "a non-tls grpc target fails with a clear message instead of breaking silently":
+    # pith's grpc client has no cleartext h2c transport, so a plain http:// grpc
+    # endpoint is unreachable — we reject it loudly rather than mis-dialing.
+    span := sample_span()
+    cfg := target("svc", "http://127.0.0.1:4317", PROTOCOL_GRPC)
+    result := export_traces(cfg, [span])
+    assert(result.is_err)
+    assert(result.err.contains("h2c cleartext is unsupported"))

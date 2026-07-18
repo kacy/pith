@@ -512,16 +512,13 @@ pub struct Client:
     # in-flight inline call to release the socket; `promote_gate` (capacity 1)
     # releases the parked reader when the client promotes; `ready` is closed once
     # the pipeline is up so any threaded caller that arrived mid-promotion can
-    # proceed. `inline_body_sent` totals the request-body bytes the inline path
-    # wrote, debited from the connection send window at promotion so the threaded
-    # sender does not over-count the peer's connection-level receive window.
+    # proceed.
     gate: Mutex
     mut mode: Int
     mut inline_busy: Bool
     handoff: Channel[Int]
     ready: Channel[Int]
     promote_gate: Channel[Int]
-    mut inline_body_sent: Int
 
 # a single http/2 stream: an opened request whose body and response flow
 # incrementally, for streaming rpcs (grpc server-, client-, and bidi-streaming).
@@ -585,7 +582,7 @@ fn client_from_connection(conn: Connection) -> Client:
     # parks on `outbound` through the inline phase (inline calls write directly)
     # and is ready to drain it the moment the client promotes.
     writer := spawn writer_loop(outbound, conn, closed)
-    client := Client(conn, Mutex(), 1, table, ids, outbound, closed, false, 0, writer, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_INLINE, false, Channel[Int](1), Channel[Int](1), Channel[Int](1), 0)
+    client := Client(conn, Mutex(), 1, table, ids, outbound, closed, false, 0, writer, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_INLINE, false, Channel[Int](1), Channel[Int](1), Channel[Int](1))
     # spawn the reader too, but it parks on `promote_gate` and reads nothing until
     # promotion releases it. spawning both tasks here — never from the request
     # path — keeps task startup off the hot path and has proven the reliable place
@@ -1211,13 +1208,16 @@ impl Client:
         # the inline path is fully drained now, and no new inline call can start
         # (mode is past INLINE), so its bookkeeping is stable.
         if self.closed.load() == 0:
-            # debit the send window by what the inline path already put on the
-            # wire, so the threaded sender does not over-count the peer's
-            # connection-level receive window (RFC 9113 §6.9.1). the peer's later
-            # WINDOW_UPDATE(0) frames — now handled by the reader — top it back up.
-            self.mu.lock()
-            self.conn_send_window = self.conn_send_window - self.inline_body_sent
-            self.mu.unlock()
+            # the connection send window is left untouched at promotion. inline is
+            # strictly sequential, so by the time each response was read the peer
+            # had consumed that request and re-granted the bytes with a
+            # WINDOW_UPDATE(0); those grants were read and dropped by the inline
+            # codec. sends and grants therefore net out, and the window is back at
+            # its initial value — exactly what conn_send_window still holds, since
+            # the inline path never debited it. (an earlier version subtracted the
+            # cumulative inline bytes here, which drove the window deeply negative
+            # after a long warmup and stalled the first thousands of concurrent
+            # sends.)
             # the writer already runs and the reader is already spawned (parked
             # on promote_gate); release it to take over the socket now.
             self.promote_gate.send(1)
@@ -1243,7 +1243,6 @@ impl Client:
         self.conn.send_frame(frames.headers_frame(stream_id, block, not has_body, true))!
         if has_body:
             self.conn.send_frame(frames.data_frame(stream_id, body, true))!
-            self.inline_body_sent = self.inline_body_sent + body.len()
         return self.conn.read_response(stream_id)!
 
     # send a request with the given header fields and body, and read its full
@@ -1466,7 +1465,7 @@ fn offline_client(conn: Connection) -> Client:
     credit: Map[Int, Channel[Int]] := {}
     gate := Channel[Int](1)
     gate.send(1)
-    return Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_THREADED, false, Channel[Int](1), Channel[Int](1), gate, 0)
+    return Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_THREADED, false, Channel[Int](1), Channel[Int](1), gate)
 
 # pull the next event off an inbox, failing if the channel closed first.
 fn next_event(inbox: Channel[StreamEvent]) -> StreamEvent!:
@@ -1864,8 +1863,6 @@ test "an inline request runs synchronously and leaves the client single-stream":
     # no second stream ever appeared, so the client stayed inline: no pipeline.
     assert_eq(client.mode, MODE_INLINE)
     assert(not client.inline_busy)
-    # the 4-byte request body was sent and counted for the promotion debit.
-    assert_eq(client.inline_body_sent, 4)
     # the stream id advanced by two, ready for the next inline call.
     assert_eq(client.next_stream_id, 3)
     client.close()
@@ -1911,17 +1908,15 @@ test "ensure_threaded is a no-op once the client is already threaded":
     client.ensure_threaded()
     assert_eq(client.mode, MODE_THREADED)
 
-test "the first concurrency promotes the client and debits the inline bytes":
+test "the first concurrency promotes the client and leaves the send window whole":
     client := client_from_connection(connection_from_frames(bytes.empty()))
     assert_eq(client.mode, MODE_INLINE)
-    # stand in for an inline call that already put 20 body bytes on the wire.
-    client.inline_body_sent = 20
     client.ensure_threaded()
     # the one-way latch is now set and the pipeline owns the socket.
     assert_eq(client.mode, MODE_THREADED)
-    # the send window was debited by the inline body bytes, so the threaded
-    # sender does not over-count the peer's connection receive window.
-    assert_eq(client.conn_send_window, DEFAULT_INITIAL_WINDOW - 20)
+    # promotion does not touch the connection send window: inline's sends were
+    # already re-granted by the peer, so it stays at the initial value.
+    assert_eq(client.conn_send_window, DEFAULT_INITIAL_WINDOW)
     # promotion is idempotent.
     client.ensure_threaded()
     assert_eq(client.mode, MODE_THREADED)

@@ -1,0 +1,9 @@
+# two modules each declare `struct Event`, and a third references both. this
+# used to miscompile: the checker kept one global name -> type table, so the
+# second Event to register overwrote the first and cross-module references
+# resolved to the wrong struct. module-scoped type resolution keeps them apart.
+import clash_event_reader
+
+fn main():
+    print(clash_event_reader.describe_a("cache.miss", 1700))
+    print(clash_event_reader.describe_b("orders", "created"))

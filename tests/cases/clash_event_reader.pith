@@ -1,0 +1,15 @@
+# clash_event_reader references clash_event_a.Event by qualified name while
+# also importing clash_event_b's same-named Event. clash_event_b is imported
+# second, so before module-scoped type resolution its Event won the shared
+# global "Event" entry and `clash_event_a.Event` resolved to the wrong struct —
+# the field reads below then failed to type-check (E200 / E209).
+import clash_event_a
+import clash_event_b
+
+pub fn describe_a(name: String, time_ns: Int) -> String:
+    e: clash_event_a.Event := clash_event_a.at(name, time_ns)
+    return e.name + "@" + e.time_ns.to_string()
+
+pub fn describe_b(topic: String, payload: String) -> String:
+    e: clash_event_b.Event := clash_event_b.published(topic, payload)
+    return e.topic + "=" + e.payload

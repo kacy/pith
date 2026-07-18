@@ -46,15 +46,15 @@ no async runtime. 20,000 calls each, july 2026:
 
 | calls/sec | go | rust (tonic) | pith |
 |---|---|---|---|
-| 16 B, sequential | 3955 | 3002 | **3175** |
-| 1 KiB, sequential | 3820 | 2786 | **2943** |
-| 16 B, 8 concurrent, one connection | 13585 | 11224 | **5753** |
-| 1 KiB, 8 concurrent, one connection | 10990 | 8981 | **5600** |
+| 16 B, sequential | 4073 | 2944 | **3375** |
+| 1 KiB, sequential | 4073 | 2826 | **3303** |
+| 16 B, 8 concurrent, one connection | 14852 | 11891 | **5832** |
+| 1 KiB, 8 concurrent, one connection | 12383 | 10143 | **5659** |
 
-sequentially pith is ~77% of grpc-go and about matches tonic — close, for
+sequentially pith is ~82% of grpc-go and a bit ahead of tonic — close, for
 a stack that is pith all the way down (its own tls 1.3, http/2, hpack,
 protobuf). concurrency over a single connection is the weak spot: eight
-streams lift pith ~1.8x where go and rust scale ~3.4x. the ceiling there is
+streams lift pith ~1.7x where go and rust scale ~3.5x. the ceiling there is
 not stream count but the per-call latency of the internal pipeline — every
 frame crosses worker → writer → socket → reader → worker, and each hop is a
 thread handoff (a futex wake plus a context switch). the single reader/writer
@@ -74,26 +74,33 @@ win — a single-frame request body is now sent inline rather than on a
 spawned task, dropping one os thread per call. apples-to-apples best-of-7,
 sequential 16 B went from ~2550 to ~3120 calls/sec (+23%) and 8-concurrent
 from ~4860 to ~6260 (+29%); over the whole line that pass moved sequential
-pith from ~2100 to ~2850, roughly ~50% to ~72% of grpc-go. the table above
-is a later sweep still, after the std thread-safety fixes and the freelist
-below, at ~3175 (~77%). the box is too noisy to resolve the smaller items
-(cached headers, coalescing, shared event list) on wall-clock, so they stand
-on counted structural reductions; a quiet machine would sharpen the numbers.
+pith from ~2100 to ~2850, roughly ~50% to ~72% of grpc-go. a sweep after the
+std thread-safety fixes and the freelist below put it at ~3175 (~77%). the box
+is too noisy to resolve the smaller items (cached headers, coalescing, shared
+event list) on wall-clock, so they stand on counted structural reductions.
 
-the newest pass inlines the whole request, not just its body. a client now
-starts single-threaded: one in-flight call runs synchronously on the caller
-over the same lockstep codec the one-shot get() uses — no reader or writer
-task, no channel handoff — and the client promotes to the multiplexing pipeline
-exactly once, the first time a second stream appears (the inline fast-path in
-std/net/http2/connection.pith). because promotion latches to the old pipeline
-the instant there is concurrency, the 8-concurrent path is unchanged by design;
-the win is entirely on sequential traffic, the common grpc unary shape. a
-controlled before/after on the same box put a sequential unary call at ~340 µs,
-down from ~368 (~8%), and a clean sweep read 16 B sequential around 3400
-calls/sec, up from 3175 — still ~80% of grpc-go, which drifted up the same day.
-a full three-client re-sweep for the table above is pending a quieter machine:
-this dev box was too contended to trust the comparators, which swung roughly 2x
-between back-to-back runs.
+the newest pass inlines the whole request, not just its body. a client starts
+single-threaded: one in-flight call runs synchronously on the caller over the
+same lockstep codec the one-shot get() uses — no reader or writer task, no
+channel handoff — and promotes to the multiplexing pipeline once, the first
+time a second stream appears (the inline fast-path in
+std/net/http2/connection.pith). a controlled before/after put a sequential
+unary call at ~340 µs, down from ~368 (~8%); the table above is a fresh
+quiet-machine sweep after the change, 16 B sequential at ~3375 (~83% of grpc-go).
+
+the first cut of this shipped a flow-control bug worth recording. at promotion
+it debited the connection send window by the total body bytes the inline phase
+had put on the wire — reasoning that the threaded sender would otherwise
+over-count the peer's receive window. but inline is strictly sequential, so by
+the time each response was read the peer had already consumed that request and
+re-granted the bytes; the debit double-counted. after a warmup of a few thousand
+1 KiB calls it drove the window ~2 MB negative, and the first concurrent sends
+stalled waiting for it to climb back — 1 KiB/8-concurrent fell ~25% (to ~3850)
+while 16 B, whose debit stayed within the 64 KiB window, was untouched. the
+fix is to leave the window alone at promotion: sends and grants already net out.
+that restored 1 KiB/8-concurrent to ~5660, at or above where it began. the bug
+hid because the fast-path's own tests used a 20-byte stand-in for the inline
+total; it took a full grpc sweep on a quiet box to surface it.
 
 past a single connection there is a connection pool: `grpc.dial_pool` (and
 `http2.open_pool`) opens n independent connections and rotates calls across

@@ -6270,21 +6270,21 @@ fn ir_emit_enum_eq_fns():
         ir_emit("ret " + t_r.to_string())
         ir_emit("endfunc")
 
-# a global whose initializer is a bare literal gets its value through
-# the declaration; anything else — calls, operators, interpolation,
-# collection literals with elements — must run at startup. previously
-# only empty collection constructors ran, and every other initializer
-# silently left its global zeroed.
+# a global whose initializer is a bare literal that ir_emit_global_binding can
+# inline gets its value through the declaration; anything else — calls,
+# operators, interpolation, collection literals with elements — must run at
+# startup. only the literal kinds ir_emit_global_binding actually inlines (a
+# positive int, a string, a bool) count as inlined here. a float literal and a
+# negative/unary literal are NOT inlined there (the declaration would zero them),
+# so they must run at startup like any other computed initializer.
 fn ir_global_needs_runtime_init(cn: Node) -> Bool:
     parts := ir_collect_bind_parts(cn)
     if parts.val_idx < 0:
         return false
     vk := get_node(parts.val_idx).kind
-    if vk == "int_lit" or vk == "float_lit" or vk == "bool_lit" or vk == "true" or vk == "false":
+    if vk == "int_lit" or vk == "bool_lit" or vk == "true" or vk == "false":
         return false
     if vk == "string_lit" or vk == "string" or vk == "str_lit":
-        return false
-    if vk == "unary" or vk == "neg":
         return false
     return true
 

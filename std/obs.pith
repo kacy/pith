@@ -18,6 +18,7 @@
 import std.env as env
 import std.metrics as metrics
 import std.otlp as otlp
+import std.strings as strings
 import std.time as time
 import std.trace as trace
 import std.uuid as uuid
@@ -29,6 +30,11 @@ OTEL_SERVICE_INSTANCE_ID := "OTEL_SERVICE_INSTANCE_ID"
 OTEL_ENDPOINT := "OTEL_EXPORTER_OTLP_ENDPOINT"
 OTEL_PROTOCOL := "OTEL_EXPORTER_OTLP_PROTOCOL"
 OTEL_METRIC_INTERVAL := "OTEL_METRIC_EXPORT_INTERVAL"
+# extra export headers ("k1=v1,k2=v2"), the per-request timeout (ms), and the
+# body compression ("gzip" turns it on; "none"/unset leaves it off).
+OTEL_HEADERS := "OTEL_EXPORTER_OTLP_HEADERS"
+OTEL_TIMEOUT := "OTEL_EXPORTER_OTLP_TIMEOUT"
+OTEL_COMPRESSION := "OTEL_EXPORTER_OTLP_COMPRESSION"
 # the batch-span-processor schedule delay controls how often spans are flushed.
 OTEL_SPAN_DELAY := "OTEL_BSP_SCHEDULE_DELAY"
 # the head sampler and its argument (a probability for the traceidratio modes).
@@ -99,6 +105,24 @@ fn loop_tick(span_delay: Int, metric_interval: Int) -> Int:
         return 1
     return tick
 
+# parse an OTEL_EXPORTER_OTLP_HEADERS spec ("k1=v1,k2=v2") into a flat
+# [k1, v1, k2, v2, ...] header list for the exporter. each entry is split once on
+# "=", key and value are trimmed, and any entry without a "=" or with an empty key
+# is skipped, so malformed headers are dropped rather than sent.
+fn parse_headers(spec: String) -> List[String]:
+    mut out: List[String] := []
+    for entry in spec.split(","):
+        pair := strings.split_once(entry, "=")
+        if not pair.found:
+            continue
+        key := pair.left.trim()
+        value := pair.right.trim()
+        if key == "":
+            continue
+        out.push(key)
+        out.push(value)
+    return out
+
 # the service.instance.id to report: the explicit id when given, otherwise a
 # freshly generated uuid so each process is distinguishable in the collector.
 fn resolve_instance_id(explicit: String) -> String:
@@ -110,9 +134,11 @@ fn resolve_instance_id(explicit: String) -> String:
 # is what init() calls after reading the environment; call it directly to
 # configure the exporter in code rather than from OTEL_* variables. the version
 # and instance id enrich the OTLP resource (either may be "" to omit it). the
-# sampler_name/sampler_arg pick the head sampler (see std.trace, e.g.
-# "parentbased_always_on" or "traceidratio" with a probability). idempotent.
-pub fn start(service_name: String, service_version: String, service_instance_id: String, endpoint: String, protocol: String, metric_interval_ms: Int, span_delay_ms: Int, sampler_name: String, sampler_arg: Float):
+# headers (a flat [k1, v1, ...] list) carry export auth, timeout_ms bounds each
+# POST, and use_gzip compresses the body. the sampler_name/sampler_arg pick the
+# head sampler (see std.trace, e.g. "parentbased_always_on" or "traceidratio"
+# with a probability). idempotent.
+pub fn start(service_name: String, service_version: String, service_instance_id: String, endpoint: String, protocol: String, headers: List[String], timeout_ms: Int, use_gzip: Bool, metric_interval_ms: Int, span_delay_ms: Int, sampler_name: String, sampler_arg: Float):
     if endpoint == "":
         return
     obs_mu.lock()
@@ -123,7 +149,7 @@ pub fn start(service_name: String, service_version: String, service_instance_id:
     running = true
     obs_mu.unlock()
 
-    dest := otlp.target_with_resource(service_name, service_version, service_instance_id, endpoint, protocol)
+    dest := otlp.target_with_resource(service_name, service_version, service_instance_id, endpoint, protocol).with_headers(headers).with_timeout(timeout_ms).with_gzip(use_gzip)
     # install the sampler before turning tracing on so the first span already
     # sees the right decision.
     trace.set_sampler_from_name(sampler_name, sampler_arg)
@@ -145,11 +171,14 @@ pub fn init():
     service_version := env.str_or(OTEL_SERVICE_VERSION, "")
     service_instance_id := resolve_instance_id(env.str_or(OTEL_SERVICE_INSTANCE_ID, ""))
     protocol := env.str_or(OTEL_PROTOCOL, otlp.PROTOCOL_HTTP)
+    headers := parse_headers(env.str_or(OTEL_HEADERS, ""))
+    timeout_ms := env.int_or(OTEL_TIMEOUT, otlp.DEFAULT_TIMEOUT_MS)
+    use_gzip := env.str_or(OTEL_COMPRESSION, "") == "gzip"
     metric_interval := env.int_or(OTEL_METRIC_INTERVAL, DEFAULT_METRIC_INTERVAL_MS)
     span_delay := env.int_or(OTEL_SPAN_DELAY, DEFAULT_SPAN_DELAY_MS)
     sampler := env.str_or(OTEL_SAMPLER, DEFAULT_SAMPLER)
     sampler_arg := env.float_or(OTEL_SAMPLER_ARG, 1.0)
-    start(service_name, service_version, service_instance_id, endpoint, protocol, metric_interval, span_delay, sampler, sampler_arg)
+    start(service_name, service_version, service_instance_id, endpoint, protocol, headers, timeout_ms, use_gzip, metric_interval, span_delay, sampler, sampler_arg)
 
 # whether the exporter is currently running (init has run and shutdown has not).
 pub fn active() -> Bool:
@@ -182,7 +211,8 @@ test "the loop tick is the smaller interval and never zero":
     assert_eq(loop_tick(0, 60000), 1)
 
 test "start with an empty endpoint is a no-op":
-    start("svc", "1.0.0", "instance-1", "", otlp.PROTOCOL_HTTP, 60000, 5000, "parentbased_always_on", 1.0)
+    no_headers: List[String] := []
+    start("svc", "1.0.0", "instance-1", "", otlp.PROTOCOL_HTTP, no_headers, 10000, false, 60000, 5000, "parentbased_always_on", 1.0)
     assert(not active())
     shutdown()
 
@@ -190,3 +220,19 @@ test "resolve_instance_id keeps an explicit id and generates one otherwise":
     assert_eq(resolve_instance_id("instance-1"), "instance-1")
     generated := resolve_instance_id("")
     assert(generated.len() > 0)
+
+test "the header parser splits k=v pairs, trims, and skips junk":
+    parsed := parse_headers("x-api-key=secret, x-tenant = acme ,,broken")
+    # two valid pairs -> four flat entries; the empty and "="-less bits are dropped.
+    assert_eq(parsed.len(), 4)
+    assert_eq(parsed[0], "x-api-key")
+    assert_eq(parsed[1], "secret")
+    assert_eq(parsed[2], "x-tenant")     # surrounding spaces trimmed
+    assert_eq(parsed[3], "acme")
+    assert_eq(parse_headers("").len(), 0)
+
+test "the header parser drops an entry with an empty key":
+    parsed := parse_headers("=noKey,good=value")
+    assert_eq(parsed.len(), 2)
+    assert_eq(parsed[0], "good")
+    assert_eq(parsed[1], "value")

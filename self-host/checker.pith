@@ -12,7 +12,7 @@
 # all globals use c_ prefix to avoid collisions with lexer/parser
 # globals in the flat C namespace.
 
-from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, lookup_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
+from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, initialize_type_table, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_FIRST_USER
 from scope import reset_scope_arena, create_scope, define_binding, lookup_binding, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope
 from ast import Node, get_node, add_node, add_leaf
 from errors import Diagnostic, render_diagnostics_json
@@ -303,6 +303,30 @@ fn resolve_imported_type_name(name: String) -> String:
             return member
     return name
 
+# resolve a type name to the declaration that is actually in scope, honoring
+# module boundaries. the global type table (tt_names) is a single namespace, so
+# two modules that declare a struct of the same name overwrite each other there.
+# this consults the module-qualified table first: a bare name binds to the
+# current module's own struct, and an `alias.Type` binds to the aliased module's
+# struct. returns -1 when no module-scoped entry applies, so the caller falls
+# back to the global table (builtins and single-definition types resolve there).
+fn resolve_type_name_module_scoped(name: String) -> Int:
+    parts := split_qualified_name(name)
+    alias := parts.0
+    member := parts.1
+    if member != "" and module_aliases.contains_key(alias):
+        # `alias.Type` — bind to the aliased module's own declaration, never to
+        # whatever module last registered this name into the global table.
+        module_path := module_aliases[alias]
+        by_import_name := lookup_qualified_type_id(module_path, module_import_target_name(module_path, member))
+        if by_import_name >= 0:
+            return by_import_name
+        return lookup_qualified_type_id(module_path, member)
+    if member == "" and current_checker_module_path.len() > 0:
+        # a bare name — prefer the current module's own declaration.
+        return lookup_qualified_type_id(current_checker_module_path, name)
+    return - 1
+
 fn resolve_named_type(name: String) -> Int:
     # an associated type name resolves to the binding of the impl currently
     # being processed (e.g. `Item` -> `Int` inside `impl Container for IntBox`)
@@ -314,6 +338,11 @@ fn resolve_named_type(name: String) -> Int:
         dparts := name.split(".")
         if dparts.len() == 2 and suppress_unknown_type_for.contains_key(dparts[0]):
             return TID_ERR
+    # module-scoped resolution wins so same-named structs in different modules
+    # never collide; it falls through to the global table when it doesn't apply.
+    scoped := resolve_type_name_module_scoped(name)
+    if scoped >= 0:
+        return scoped
     resolved_name := resolve_imported_type_name(name)
     tid := lookup_type_id(resolved_name)
     if tid < 0:
@@ -566,6 +595,14 @@ fn is_reserved_type_name(name: String) -> Bool:
             return true
     return false
 
+# register a user-declared type name both globally and under the module that
+# declared it. the qualified entry lets resolve_named_type prefer this module's
+# own struct over a same-named struct another module registered into the shared
+# global table.
+fn register_module_type_name(name: String, tid: Int):
+    register_type_name(name, tid)
+    register_qualified_type_name(current_checker_module_path, name, tid)
+
 fn register_struct_declaration(node_idx: Int, node: Node):
     name := node.value
     if is_reserved_type_name(name):
@@ -583,7 +620,7 @@ fn register_struct_declaration(node_idx: Int, node: Node):
     mut empty_ints: List[Int] := []
     mut empty_bools: List[Bool] := []
     tid := add_type_info(ti_struct(base_name, empty_names, empty_ints, empty_bools, empty_bools))
-    register_type_name(base_name, tid)
+    register_module_type_name(base_name, tid)
     define_binding(current_scope, base_name, tid, false)
     # non-generic: resolve field types immediately
     mut field_names: List[String] := []
@@ -645,7 +682,7 @@ fn register_enum_declaration(node_idx: Int, node: Node):
                 vtypes.push(resolve_type_implementation(vc))
             variant_types.push(vtypes)
     tid := add_type_info(ti_enum(base_name, variant_names, variant_types))
-    register_type_name(base_name, tid)
+    register_module_type_name(base_name, tid)
     define_binding(current_scope, base_name, tid, false)
 
 # ---------------------------------------------------------------
@@ -838,7 +875,7 @@ fn register_type_alias_declaration(node: Node):
     name := node.value
     if node.children.len() > 0:
         target := resolve_type_implementation(node.children[0])
-        register_type_name(name, target)
+        register_module_type_name(name, target)
 
 # ---------------------------------------------------------------
 # helpers

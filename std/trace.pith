@@ -30,6 +30,23 @@ pub STATUS_UNSET := 0
 pub STATUS_OK := 1
 pub STATUS_ERROR := 2
 
+# attribute value kinds. an Attr's `kind` picks which of its value fields is
+# live; these mirror the OTLP AnyValue variants the exporter can encode.
+pub ATTR_STRING := 0
+pub ATTR_INT := 1
+pub ATTR_BOOL := 2
+pub ATTR_FLOAT := 3
+
+# one span attribute: a key plus a value of one of four types (kind selects
+# which field is live). mirrors OTLP AnyValue's string/bool/int/double.
+pub struct Attr:
+    pub key: String
+    pub kind: Int      # ATTR_STRING | ATTR_INT | ATTR_BOOL | ATTR_FLOAT
+    pub s: String
+    pub i: Int
+    pub b: Bool
+    pub f: Float
+
 # global on/off. off => start() returns a non-recording span and touches no
 # per-thread state, so the overhead of leaving trace calls in is negligible.
 mut trace_active := false
@@ -93,7 +110,7 @@ pub struct Span:
     pub start_unix_ns: Int
     start_mono_ns: Int
     mut end_unix_ns: Int
-    mut attr_pairs: List[String]
+    mut attrs: List[Attr]
     mut status: Int
     mut status_message: String
     pub recording: Bool
@@ -125,7 +142,8 @@ fn unix_nanos() -> Int:
     return time.now() * 1000000
 
 fn no_op_span() -> Span:
-    return Span("", "", "", "", INTERNAL, 0, 0, 0, [], STATUS_UNSET, "", false, "", "", false)
+    empty_attrs: List[Attr] := []
+    return Span("", "", "", "", INTERNAL, 0, 0, 0, empty_attrs, STATUS_UNSET, "", false, "", "", false)
 
 # start a span of the given kind, parented under the current span on this thread
 # (or a new root trace if there is none), and make it the current span. returns a
@@ -141,7 +159,8 @@ pub fn start_kind(name: String, kind: Int) -> Span:
         trace_id = new_id(32)
         sampled = true
     span_id := new_id(16)
-    span := Span(trace_id, span_id, parent_id, name, kind, unix_nanos(), time.mono_nanos(), 0, [], STATUS_UNSET, "", true, cur_trace_id, cur_span_id, cur_sampled)
+    empty_attrs: List[Attr] := []
+    span := Span(trace_id, span_id, parent_id, name, kind, unix_nanos(), time.mono_nanos(), 0, empty_attrs, STATUS_UNSET, "", true, cur_trace_id, cur_span_id, cur_sampled)
     # this span is now current; it restores the saved parent on end.
     cur_trace_id = trace_id
     cur_span_id = span_id
@@ -156,8 +175,25 @@ impl Span:
     # attach a string attribute; returns self so calls can chain.
     fn set_attr(key: String, value: String) -> Span:
         if self.recording:
-            self.attr_pairs.push(key)
-            self.attr_pairs.push(value)
+            self.attrs.push(Attr(key, ATTR_STRING, value, 0, false, 0.0))
+        return self
+
+    # attach an integer attribute; returns self so calls can chain.
+    fn set_attr_int(key: String, value: Int) -> Span:
+        if self.recording:
+            self.attrs.push(Attr(key, ATTR_INT, "", value, false, 0.0))
+        return self
+
+    # attach a boolean attribute; returns self so calls can chain.
+    fn set_attr_bool(key: String, value: Bool) -> Span:
+        if self.recording:
+            self.attrs.push(Attr(key, ATTR_BOOL, "", 0, value, 0.0))
+        return self
+
+    # attach a floating-point attribute; returns self so calls can chain.
+    fn set_attr_float(key: String, value: Float) -> Span:
+        if self.recording:
+            self.attrs.push(Attr(key, ATTR_FLOAT, "", 0, false, value))
         return self
 
     fn set_status(code: Int, message: String):
@@ -273,3 +309,36 @@ test "traceparent round-trips":
     assert_eq(back.value().span_id, ctx.span_id)
     assert(back.value().sampled)
     assert(parse_traceparent("garbage") == none)
+
+test "typed attributes record their kind and value":
+    set_active(true)
+    clear_context()
+    span := start("work")
+    span.set_attr("db.system", "postgres").set_attr_int("rows", 42).set_attr_bool("cache.hit", true).set_attr_float("ratio", 0.75)
+    assert_eq(span.attrs.len(), 4)
+
+    assert_eq(span.attrs[0].key, "db.system")
+    assert_eq(span.attrs[0].kind, ATTR_STRING)
+    assert_eq(span.attrs[0].s, "postgres")
+
+    assert_eq(span.attrs[1].key, "rows")
+    assert_eq(span.attrs[1].kind, ATTR_INT)
+    assert_eq(span.attrs[1].i, 42)
+
+    assert_eq(span.attrs[2].key, "cache.hit")
+    assert_eq(span.attrs[2].kind, ATTR_BOOL)
+    assert(span.attrs[2].b)
+
+    assert_eq(span.attrs[3].key, "ratio")
+    assert_eq(span.attrs[3].kind, ATTR_FLOAT)
+    assert_eq(span.attrs[3].f, 0.75)
+
+    span.end()
+    set_active(false)
+
+test "an inactive span records no attributes":
+    set_active(false)
+    clear_context()
+    span := start("noop")
+    span.set_attr("k", "v").set_attr_int("n", 1).set_attr_bool("flag", true).set_attr_float("x", 2.0)
+    assert_eq(span.attrs.len(), 0)

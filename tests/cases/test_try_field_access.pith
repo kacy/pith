@@ -1,0 +1,36 @@
+# a chained `expr!.field` must evaluate `expr` exactly once. the dispatcher used
+# to evaluate the receiver once to check for result fields, then the field read
+# evaluated it again — harmless for a pure receiver, but a stateful one (like a
+# reader's read_tag advancing its cursor) returned a different value the second
+# time. this guards the single-evaluation fix.
+struct FieldErr:
+    msg: String
+
+struct Reading:
+    value: Int
+    doubled: Int
+
+struct Counter:
+    mut n: Int
+
+impl Counter:
+    # stateful: each call advances the counter, standing in for a reader.
+    fn take() -> Reading!FieldErr:
+        self.n = self.n + 1
+        return Reading(self.n, self.n * 10)
+
+fn first_value(c: Counter) -> Int!FieldErr:
+    return c.take()!.value
+
+fn first_doubled(c: Counter) -> Int!FieldErr:
+    return c.take()!.doubled
+
+fn main() -> Int!:
+    c := Counter(0)
+    v := first_value(c) catch (0 - 1)
+    print(v.to_string())        # 1: one advance, not 2
+    print(c.n.to_string())      # 1 total advance
+    d := first_doubled(c) catch (0 - 1)
+    print(d.to_string())        # advance to 2, doubled -> 20
+    print(c.n.to_string())      # 2 total advances
+    return 0

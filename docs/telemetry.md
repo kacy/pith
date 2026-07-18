@@ -254,9 +254,5 @@ mis-dialing.
 - **grpc without tls** — the OTLP/grpc transport requires tls; there's no
   cleartext h2c for a bare local collector on `:4317`. use `http/protobuf` or an
   `https` grpc endpoint.
-- **`prometheus.serve` runs single-threaded** — it handles one scrape at a time.
-  that's fine for a normal scrape interval; concurrent scrape handling is held up
-  by a compiler limitation (a spawned task can't yet call certain cross-module std
-  functions).
 - **exemplars and delta temporality** — metrics export as cumulative (which
   matches how pith accumulates them); there are no exemplars or delta temporality.

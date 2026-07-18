@@ -182,7 +182,7 @@ fn finish_client_span(span: trace.Span, full_method: String, status: Int, start_
     span.end()
     elapsed_ms := (time.mono_nanos() - start_ns) / 1000000
     metrics.counter("rpc_client_requests_total").labels(["rpc_method", full_method, "grpc_status", status_name(status)]).inc()
-    metrics.histogram("rpc_client_duration_ms").labels(["rpc_method", full_method]).observe(elapsed_ms)
+    metrics.histogram("rpc_client_duration_ms").labels(["rpc_method", full_method]).observe(elapsed_ms.to_float())
 
 # frame a message for the wire: a one-byte compression flag (0 = identity), a
 # big-endian uint32 length, then the message bytes. the five prefix bytes are

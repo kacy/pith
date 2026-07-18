@@ -187,11 +187,12 @@ pub fn encode_traces(service_name: String, spans: List[trace.Span]) -> Bytes!pro
 # --- metric encoding --------------------------------------------------------
 
 # encode a NumberDataPoint for a counter or gauge: time_unix_nano=3 (fixed64),
-# as_int=6 (sfixed64), attributes=7. the value is an integer, so as_int fits.
-fn encode_number_point(value: Int, now_ns: Int, labels: List[String]) -> Bytes!protobuf.ProtoError:
+# as_double=1 (double), attributes=7. metric values are floats, so as_double is
+# the right representation (integers ride along exactly).
+fn encode_number_point(value: Float, now_ns: Int, labels: List[String]) -> Bytes!protobuf.ProtoError:
     w := protobuf.writer()
+    w.write_double(1, value)!
     w.write_fixed64(3, now_ns)!
-    w.write_sfixed64(6, value)!
     write_attributes(w, 7, labels)!
     out := w.bytes()
     w.free()
@@ -201,11 +202,11 @@ fn encode_number_point(value: Int, now_ns: Int, labels: List[String]) -> Bytes!p
 # sum=5 (double), attributes=9. v1 simplification: we report only the aggregate
 # count and sum, not the per-bucket boundaries and counts, which is enough for
 # rate and average but not for percentile estimation.
-fn encode_histogram_point(count: Int, sum: Int, now_ns: Int, labels: List[String]) -> Bytes!protobuf.ProtoError:
+fn encode_histogram_point(count: Int, sum: Float, now_ns: Int, labels: List[String]) -> Bytes!protobuf.ProtoError:
     w := protobuf.writer()
     w.write_fixed64(3, now_ns)!
     w.write_fixed64(4, count)!
-    w.write_double(5, sum.to_float())!
+    w.write_double(5, sum)!
     write_attributes(w, 9, labels)!
     out := w.bytes()
     w.free()
@@ -248,7 +249,7 @@ fn encode_metric(sample: metrics.MetricSample, now_ns: Int) -> Bytes!protobuf.Pr
         point := encode_number_point(sample.value, now_ns, sample.labels)!
         w.write_message(5, encode_gauge(point)!)!
     elif sample.kind == "histogram":
-        point := encode_histogram_point(sample.value, sample.sum, now_ns, sample.labels)!
+        point := encode_histogram_point(sample.value.to_int(), sample.sum, now_ns, sample.labels)!
         w.write_message(9, encode_histogram(point)!)!
     else:
         point := encode_number_point(sample.value, now_ns, sample.labels)!
@@ -424,7 +425,7 @@ fn first_attr_value(point: Bytes) -> String!protobuf.ProtoError:
 
 test "a counter encodes as a monotonic sum with an int data point":
     metrics.reset()
-    metrics.counter("requests_total").labels(["route", "/api"]).add(5)
+    metrics.counter("requests_total").labels(["route", "/api"]).add(5.0)
     encoded := encode_metrics("checkout", metrics.snapshot())!
 
     resource_metrics := first_message(encoded, 1)!
@@ -446,15 +447,15 @@ test "a counter encodes as a monotonic sum with an int data point":
         sum_bytes := first_message(metric, 7)!    # Sum
         point := first_message(sum_bytes, 1)!      # NumberDataPoint
 
-        mut as_int := 0
+        mut as_double := 0.0
         pr := protobuf.reader(point)
         while not pr.at_end():
             inner := pr.read_tag()!
-            if inner.field == 6:
-                as_int = pr.read_sfixed64()!
+            if inner.field == 1:
+                as_double = pr.read_double()!
             else:
                 pr.skip(inner.wire)!
-        if as_int == 5:
+        if as_double == 5.0:
             found = true
             route = first_attr_value(point)!
             su := protobuf.reader(sum_bytes)
@@ -474,8 +475,8 @@ test "a counter encodes as a monotonic sum with an int data point":
 test "a histogram encodes count and sum on its data point":
     metrics.reset()
     h := metrics.histogram("latency_ms")
-    h.observe(10)
-    h.observe(30)
+    h.observe(10.0)
+    h.observe(30.0)
     encoded := encode_metrics("checkout", metrics.snapshot())!
 
     resource_metrics := first_message(encoded, 1)!

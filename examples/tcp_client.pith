@@ -1,0 +1,17 @@
+# a program that imports std.net.tcp and calls its wrapper functions.
+#
+# these wrappers (connect/listen/read/write/close) forward to the runtime's tcp
+# builtins but add result handling on top, so an importing program links to the
+# wrapper bodies. they must be emitted like any other imported module — a
+# regression guard, since they were once skipped and trapped as unresolved calls.
+
+import std.net.tcp as tcp
+
+fn main() -> Int!:
+    # nothing listens on port 1, so the connect is refused right away. the point
+    # is that tcp.connect resolves and runs at all, then reports the failure as a
+    # value we can inspect.
+    result := tcp.connect("127.0.0.1", 1)
+    print("tcp.connect resolved: true")
+    print("tcp.connect failed as expected: {result.is_err}")
+    return 0

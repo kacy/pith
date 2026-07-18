@@ -318,8 +318,15 @@ fn validate_combined_ir_contract(ir: String):
         line_no = line_no + 1
     return
 
+# whether an imported module's body can be skipped because it is nothing but the
+# runtime provides directly. no module qualifies today: std.net.tcp and
+# std.net.dns look like thin builtin wrappers, but their functions wrap the
+# builtin's result (tcp.connect returns Int!, dns.resolve returns String!), so a
+# caller links to those wrapper bodies, not the raw builtin. skipping them left
+# an imported `tcp.connect`/`dns.resolve` call pointing at a function that was
+# never emitted, which trapped at runtime as an unresolved call.
 fn is_runtime_builtin_module(module_path: String) -> Bool:
-    return module_path == "std.net.tcp" or module_path == "std.net.dns"
+    return false
 
 fn parse_args() -> CliArgs:
     a := args()

@@ -16,8 +16,14 @@ import std.os.certs as os_certs
 import std.time as time
 from std.io import TcpStream
 
-mut next_native_config_handle := -1
-mut next_native_conn_handle := -1000000
+# handle allocators. valid handles are non-negative (error paths fail with a
+# Result, they don't hand back a config); the two ranges are kept apart — configs
+# from 0, connections from a high base — so a handle reads unambiguously in a
+# trace. they count up so every handle stays non-negative. (these start values
+# used to be negative literals that a module-const compiler bug silently zeroed,
+# which is why the first handle landed at 0; now the intended values are honored.)
+mut next_native_config_handle := 0
+mut next_native_conn_handle := 1000000
 mut native_config_roots_pem: Map[Int, String] := {}
 mut native_config_alpn: Map[Int, List[String]] := {}
 mut native_config_resumption_enabled: Map[Int, Bool] := {}
@@ -146,7 +152,7 @@ mut native_conn_states: Map[Int, NativeConnState] := {}
 fn native_conn_register(state: NativeConnState) -> Int:
     native_conn_mu.lock()
     handle := next_native_conn_handle
-    next_native_conn_handle = next_native_conn_handle - 1
+    next_native_conn_handle = next_native_conn_handle + 1
     native_conn_states.insert(handle, state)
     native_conn_mu.unlock()
     return handle
@@ -217,7 +223,7 @@ fn native_config_handle(roots_pem: String) -> Config!:
     # parse once here so config creation fails early for bad pem data.
     x509.parse_pem_chain(roots_pem)!
     handle := next_native_config_handle
-    next_native_config_handle = next_native_config_handle - 1
+    next_native_config_handle = next_native_config_handle + 1
     native_config_roots_pem.insert(handle, roots_pem)
     return Config(handle)
 
@@ -229,7 +235,7 @@ fn native_server_config_handle(cert_pem: String, key_pem: String) -> Config!:
     if key.kind != "PRIVATE KEY":
         fail "tls private key must be pkcs#8 pem"
     handle := next_native_config_handle
-    next_native_config_handle = next_native_config_handle - 1
+    next_native_config_handle = next_native_config_handle + 1
     native_server_cert_pem.insert(handle, cert_pem)
     native_server_key_der.insert(handle, key.body)
     return Config(handle)

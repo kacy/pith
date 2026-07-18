@@ -8,7 +8,10 @@
 #     built by hand on top of std.protobuf the same way the database drivers
 #     hand-write their wire protocols. there is no `.proto` code generation.
 #   - export: POST that protobuf to an OTLP/HTTP collector at /v1/traces or
-#     /v1/metrics with content-type application/x-protobuf.
+#     /v1/metrics with content-type application/x-protobuf. the export path is
+#     production-grade: it sends configured auth headers, honors a per-request
+#     timeout, optionally gzip-compresses the body, and retries transient
+#     failures (429/5xx and transport errors) with exponential backoff.
 #
 # std.obs.init wires this up from the environment; you rarely call it directly.
 #
@@ -18,6 +21,7 @@
 # not implemented.
 
 import std.bytes as bytes
+import std.compress.gzip as gzip
 import std.encoding as encoding
 import std.env as env
 import std.metrics as metrics
@@ -43,6 +47,18 @@ pub OTLP_CONTENT_TYPE := "application/x-protobuf"
 # the standard OTLP/HTTP port, used when an endpoint gives no explicit port.
 pub DEFAULT_HTTP_PORT := 4318
 
+# the default per-request timeout (ms) for an export POST when the target sets
+# none. obs also uses this as the OTEL_EXPORTER_OTLP_TIMEOUT fallback.
+pub DEFAULT_TIMEOUT_MS := 10000
+
+# retry policy for a transient export failure. we try an export up to
+# MAX_EXPORT_ATTEMPTS times, backing off BACKOFF_BASE_MS and doubling each retry
+# up to BACKOFF_MAX_MS. the exporter is best-effort, so once these are exhausted
+# the batch is dropped rather than blocking the program.
+MAX_EXPORT_ATTEMPTS := 5
+BACKOFF_BASE_MS := 1000
+BACKOFF_MAX_MS := 30000
+
 # OTLP AggregationTemporality.CUMULATIVE — the only temporality pith reports,
 # since std.metrics counters and histograms accumulate for the process lifetime.
 CUMULATIVE := 2
@@ -62,6 +78,14 @@ pub struct Target:
     pub base_path: String
     # "http/protobuf" or "grpc"; only http/protobuf is implemented.
     pub protocol: String
+    # extra request headers as a flat [k1, v1, k2, v2, ...] list, sent on every
+    # export POST. this is how OTEL_EXPORTER_OTLP_HEADERS auth/tenant headers
+    # (e.g. "x-honeycomb-team=KEY") reach a SaaS collector.
+    pub headers: List[String]
+    # per-request timeout in ms; 0 or less leaves the http client default.
+    pub timeout_ms: Int
+    # when true, gzip-compress each export body and set Content-Encoding: gzip.
+    pub use_gzip: Bool
 
 # build a Target from a service name, an endpoint like http://host:4318, and a
 # protocol. an https endpoint turns tls on; a missing port defaults to 4318. a
@@ -85,7 +109,24 @@ pub fn target_with_resource(service_name: String, service_version: String, servi
         base_path = ""
     if base_path.len() > 0 and base_path.ends_with("/"):
         base_path = base_path.substring(0, base_path.len() - 1)
-    return Target(service_name, service_version, service_instance_id, parsed.host, port, use_tls, base_path, protocol)
+    # start with no extra headers, the default timeout, and gzip off; callers
+    # layer transport options on with the with_* setters below.
+    no_headers: List[String] := []
+    return Target(service_name, service_version, service_instance_id, parsed.host, port, use_tls, base_path, protocol, no_headers, DEFAULT_TIMEOUT_MS, false)
+
+impl Target:
+    # a copy of this target that sends `headers` (a flat [k1, v1, ...] list) on
+    # every export request, carrying OTEL_EXPORTER_OTLP_HEADERS auth/tenant headers.
+    fn with_headers(headers: List[String]) -> Target:
+        return Target(self.service_name, self.service_version, self.service_instance_id, self.host, self.port, self.use_tls, self.base_path, self.protocol, headers, self.timeout_ms, self.use_gzip)
+
+    # a copy with a per-request timeout in ms; 0 or less leaves the client default.
+    fn with_timeout(timeout_ms: Int) -> Target:
+        return Target(self.service_name, self.service_version, self.service_instance_id, self.host, self.port, self.use_tls, self.base_path, self.protocol, self.headers, timeout_ms, self.use_gzip)
+
+    # a copy that gzip-compresses each export body and sets Content-Encoding: gzip.
+    fn with_gzip(use_gzip: Bool) -> Target:
+        return Target(self.service_name, self.service_version, self.service_instance_id, self.host, self.port, self.use_tls, self.base_path, self.protocol, self.headers, self.timeout_ms, use_gzip)
 
 # --- trace encoding ---------------------------------------------------------
 
@@ -413,18 +454,95 @@ pub fn encode_metrics(cfg: Target, samples: List[metrics.MetricSample]) -> Bytes
 
 # --- export over OTLP/HTTP --------------------------------------------------
 
+# prepare the request body for a target: gzip it when compression is enabled,
+# otherwise pass it through unchanged. returns the bytes to send and whether they
+# are gzipped (so the caller can set Content-Encoding). factored out so the
+# compression path is unit-testable without a live collector.
+fn prepare_body(cfg: Target, body: Bytes) -> (Bytes, Bool):
+    if cfg.use_gzip:
+        return (gzip.compress(body), true)
+    return (body, false)
+
+# whether an OTLP/HTTP response status should be retried. 429 (too many requests)
+# and any 5xx are transient, so we back off and retry; every other 4xx is a
+# permanent client error (bad request, unauthorized, ...) and a 2xx already
+# succeeded, so neither is retried.
+pub fn is_retryable(status: Int) -> Bool:
+    return status == 429 or status >= 500
+
+# exponential backoff for retry `attempt` (0-indexed): BACKOFF_BASE_MS, then
+# double each step, capped at BACKOFF_MAX_MS. deterministic (no jitter) so the
+# behavior is easy to test and reason about.
+fn backoff_ms(attempt: Int) -> Int:
+    mut delay := BACKOFF_BASE_MS
+    mut i := 0
+    while i < attempt:
+        delay = delay * 2
+        if delay >= BACKOFF_MAX_MS:
+            return BACKOFF_MAX_MS
+        i = i + 1
+    return delay
+
+# how long to wait before the next retry: the exponential backoff, unless the
+# collector sent a larger Retry-After (in seconds) we should honor instead.
+fn retry_delay_ms(resp: http.HttpResponse, attempt: Int) -> Int:
+    backoff := backoff_ms(attempt)
+    retry_after := resp.header_value("Retry-After")
+    if retry_after == "":
+        return backoff
+    server_ms := (parse_int(retry_after) catch 0) * 1000
+    if server_ms > backoff:
+        return server_ms
+    return backoff
+
 # POST an encoded protobuf body to a signal path (e.g. /v1/traces) on the
-# collector. returns true on a 2xx. a plain http endpoint uses send(); an https
-# one uses the system trust roots.
-fn post_signal(cfg: Target, signal_path: String, body: Bytes) -> Bool!:
+# collector, returning the response. sends the target's configured headers, the
+# content type, and (when enabled) gzip; applies the per-request timeout. a plain
+# http endpoint uses send(); an https one uses the system trust roots. a failed
+# send propagates as an error so the retry loop can treat it as transient.
+fn post_signal(cfg: Target, signal_path: String, body: Bytes) -> http.HttpResponse!:
     full_path := cfg.base_path + signal_path
-    req := http.post_request(cfg.host, cfg.port, full_path).body_bytes(body).header("Content-Type", OTLP_CONTENT_TYPE)
-    mut status := 0
+    prepared := prepare_body(cfg, body)
+    mut req := http.post_request(cfg.host, cfg.port, full_path).body_bytes(prepared.0).header("Content-Type", OTLP_CONTENT_TYPE)
+    if prepared.1:
+        req = req.header("Content-Encoding", "gzip")
+    # layer on the configured auth/tenant headers (flat [k1, v1, ...] pairs).
+    mut i := 0
+    while i + 1 < cfg.headers.len():
+        req = req.header(cfg.headers[i], cfg.headers[i + 1])
+        i = i + 2
+    if cfg.timeout_ms > 0:
+        req = req.with_timeout(cfg.timeout_ms)
     if cfg.use_tls:
-        status = req.send_tls_with_config(cfg.host, tls.client_config()!)!.status
-    else:
-        status = req.send()!.status
-    return status >= 200 and status < 300
+        return req.send_tls_with_config(cfg.host, tls.client_config()!)!
+    return req.send()!
+
+# POST a signal with retries. best-effort: returns true once the collector
+# accepts the body (2xx). a transport error or a retryable status (429/5xx) backs
+# off and retries until MAX_EXPORT_ATTEMPTS is reached; a permanent rejection (any
+# other 4xx) is dropped immediately. never propagates, so callers keep running.
+fn post_with_retry(cfg: Target, signal_path: String, body: Bytes) -> Bool:
+    mut attempt := 0
+    while attempt < MAX_EXPORT_ATTEMPTS:
+        result := post_signal(cfg, signal_path, body)
+        last_attempt := attempt + 1 >= MAX_EXPORT_ATTEMPTS
+        if result.is_err:
+            # transport failure (connect/timeout/reset): retry while attempts remain.
+            if last_attempt:
+                return false
+            time.delay(backoff_ms(attempt))
+        else:
+            status := result.ok.status
+            if status >= 200 and status < 300:
+                return true
+            if not is_retryable(status):
+                # a permanent client error: drop the batch, no point retrying.
+                return false
+            if last_attempt:
+                return false
+            time.delay(retry_delay_ms(result.ok, attempt))
+        attempt = attempt + 1
+    return false
 
 # export these spans to the collector's /v1/traces. an empty list is a no-op
 # (returns true). grpc endpoints fail with a clear message until implemented.
@@ -436,7 +554,7 @@ pub fn export_traces(cfg: Target, spans: List[trace.Span]) -> Bool!:
     encoded := encode_traces(cfg, spans)
     if encoded.is_err:
         fail "otlp: encode traces: " + encoded.err.message
-    return post_signal(cfg, "/v1/traces", encoded.ok)
+    return post_with_retry(cfg, "/v1/traces", encoded.ok)
 
 # export these metric samples to the collector's /v1/metrics. an empty list is
 # a no-op (returns true). grpc endpoints fail until implemented.
@@ -448,7 +566,7 @@ pub fn export_metrics(cfg: Target, samples: List[metrics.MetricSample]) -> Bool!
     encoded := encode_metrics(cfg, samples)
     if encoded.is_err:
         fail "otlp: encode metrics: " + encoded.err.message
-    return post_signal(cfg, "/v1/metrics", encoded.ok)
+    return post_with_retry(cfg, "/v1/metrics", encoded.ok)
 
 # --- tests ------------------------------------------------------------------
 
@@ -911,3 +1029,56 @@ test "the resource-attributes parser splits k=v pairs and skips junk":
     assert_eq(parsed[2].key, "empty")    # empty value is kept
     assert_eq(parsed[2].s, "")
     assert_eq(parse_resource_attributes("").len(), 0)
+
+test "is_retryable retries 429 and 5xx but not other statuses":
+    # 2xx already succeeded; other 4xx are permanent client errors.
+    assert(not is_retryable(200))
+    assert(not is_retryable(400))
+    assert(not is_retryable(404))
+    assert(is_retryable(429))
+    assert(is_retryable(500))
+    assert(is_retryable(502))
+    assert(is_retryable(503))
+    assert(is_retryable(504))
+
+test "backoff doubles each attempt and caps at the maximum":
+    assert_eq(backoff_ms(0), BACKOFF_BASE_MS)          # first retry waits the base
+    assert_eq(backoff_ms(1), BACKOFF_BASE_MS * 2)
+    assert_eq(backoff_ms(2), BACKOFF_BASE_MS * 4)
+    assert_eq(backoff_ms(3), BACKOFF_BASE_MS * 8)
+    # it is monotonic increasing until it saturates.
+    assert(backoff_ms(1) > backoff_ms(0))
+    assert(backoff_ms(2) > backoff_ms(1))
+    # a late attempt saturates at the cap and stays there.
+    assert_eq(backoff_ms(5), BACKOFF_MAX_MS)
+    assert_eq(backoff_ms(20), BACKOFF_MAX_MS)
+
+test "prepare_body gzips only when the target enables compression":
+    body := bytes.from_string_utf8("an otlp protobuf body")
+    plain_cfg := target("svc", "http://collector.local:4318", PROTOCOL_HTTP)
+    off := prepare_body(plain_cfg, body)
+    # compression off: the body is passed through and not marked gzipped.
+    assert(not off.1)
+    assert_eq(off.0.to_string_utf8()!, "an otlp protobuf body")
+
+    gzip_cfg := plain_cfg.with_gzip(true)
+    on := prepare_body(gzip_cfg, body)
+    # compression on: the body is gzipped and decompresses back to the original.
+    assert(on.1)
+    assert_eq(gzip.decompress(on.0)!.to_string_utf8()!, "an otlp protobuf body")
+
+test "retry_delay prefers a larger Retry-After over the backoff":
+    empty_headers: Map[String, String] := {}
+    # no Retry-After header: fall back to the exponential backoff.
+    without := http.HttpResponse(503, "", empty_headers, bytes.empty(), [])
+    assert_eq(retry_delay_ms(without, 0), backoff_ms(0))
+
+    # a Retry-After larger than the backoff wins (5s vs the 1s base backoff).
+    big_headers: Map[String, String] := {"Retry-After": "5"}
+    bigger := http.HttpResponse(503, "", big_headers, bytes.empty(), [])
+    assert_eq(retry_delay_ms(bigger, 0), 5000)
+
+    # a Retry-After smaller than the backoff is ignored in favor of the backoff.
+    small_headers: Map[String, String] := {"Retry-After": "1"}
+    smaller := http.HttpResponse(503, "", small_headers, bytes.empty(), [])
+    assert_eq(retry_delay_ms(smaller, 3), backoff_ms(3))

@@ -140,7 +140,7 @@ with idioms is [docs/idiomatic_pith.md](docs/idiomatic_pith.md).
 
 ## the standard library, briefly
 
-71 modules, ~31,000 lines, all pith. the areas: io and filesystems
+77 modules, ~36,000 lines, all pith. the areas: io and filesystems
 (fs, glob, path, process), networking (tcp, dns, url, http, http2,
 websocket, tls, sse), databases (sql, postgres, mysql, redis — pure-pith
 wire protocols with tls, prepared statements, and pooling), data (json,
@@ -203,8 +203,8 @@ self-host/     the compiler, in pith (~23,000 lines): lexer, parser,
                checker, formatter, linter, docgen, ir emitter
 cranelift/     the native backend, in rust (~12,500 lines): ir
                consumer, codegen, runtime (arc, collections, net)
-std/           the standard library (66 modules)
-examples/      92 runnable programs with expected output
+std/           the standard library (77 modules)
+examples/      94 runnable programs with expected output
 tests/         regression, invalid-program, and golden fixtures
 tools/         the four real programs
 docs/          architecture, ownership, errors, grammar, limitations

@@ -46,10 +46,10 @@ no async runtime. 20,000 calls each, july 2026:
 
 | calls/sec | go | rust (tonic) | pith |
 |---|---|---|---|
-| 16 B, sequential | 4073 | 2944 | **3375** |
-| 1 KiB, sequential | 4073 | 2826 | **3303** |
-| 16 B, 8 concurrent, one connection | 14852 | 11891 | **5832** |
-| 1 KiB, 8 concurrent, one connection | 12383 | 10143 | **5659** |
+| 16 B, sequential | 4112 | 2952 | **3318** |
+| 1 KiB, sequential | 3978 | 2782 | **3102** |
+| 16 B, 8 concurrent, one connection | 13816 | 11594 | **6025** |
+| 1 KiB, 8 concurrent, one connection | 11677 | 9837 | **5096** |
 
 sequentially pith is ~82% of grpc-go and a bit ahead of tonic — close, for
 a stack that is pith all the way down (its own tls 1.3, http/2, hpack,
@@ -143,12 +143,12 @@ gzip:
 
 | phase | go | rust | pith |
 |---|---|---|---|
-| csv read | 72 | 47 | **4** |
-| csv write | 198 | 61 | 250 |
-| transform | 38 | 25 | 348 |
-| total | 310 | 134 | 610 |
+| csv read | 85 | 45 | **5** |
+| csv write | 185 | 59 | 265 |
+| transform | 44 | 26 | 347 |
+| total | 316 | 132 | 634 |
 
-2.0x go overall (4.1x when this document began), 2026-07-15 rerun.
+2.0x go overall (4.1x when this document began), 2026-07-18 rerun.
 `transform` — heavy per-row string building — is the whole gap; pith's
 csv read is the fastest of the three. peak rss at 200k records: go
 238 mb, rust 266 mb, pith 239 mb — now at parity with go and below rust,
@@ -162,12 +162,12 @@ and a set, sign an hmac-sha256 summary. 200k events:
 
 | phase | go | rust | zig | pith |
 |---|---|---|---|---|
-| gen | 118 | 29 | 19 | 307 |
-| parse | 353 | 60 | 104 | **186** |
-| analyze | 14 | 24 | 9 | 59 |
-| total | 486 | 111 | 129 | **566** |
+| gen | 127 | 31 | 19 | 322 |
+| parse | 354 | 62 | 104 | **199** |
+| analyze | 16 | 24 | 9 | 56 |
+| total | 490 | 122 | 136 | **575** |
 
-about 1.2x go on the total (2026-07-15 rerun), and `parse` — decoding
+about 1.2x go on the total (2026-07-18 rerun), and `parse` — decoding
 json into a struct —
 is now faster than go's reflection decode: a flat scalar struct is
 filled in a single pass straight into the struct, no intermediate map

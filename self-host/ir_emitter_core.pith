@@ -3106,7 +3106,12 @@ fn ir_emit_variant_construction(node: Node, enum_name: String, variant_key: Stri
         i = i + 1
     return r
 
-fn ir_emit_field_access(idx: Int, node: Node) -> Int:
+# `pre_obj_r` is the receiver register when the caller already evaluated it (the
+# ir_expr dispatch does, to check for result fields first); pass -1 to have this
+# evaluate the receiver itself. reusing it matters: evaluating a stateful
+# receiver twice — e.g. reader.read_tag() — would advance it and read the wrong
+# value, which is what a chained `reader.read_tag()!.field` used to do.
+fn ir_emit_field_access(idx: Int, node: Node, pre_obj_r: Int) -> Int:
     fname := node_value(idx)
     if node.children.len() == 0:
         r := ir_reg()
@@ -3124,7 +3129,9 @@ fn ir_emit_field_access(idx: Int, node: Node) -> Int:
                     ir_emit("iconst " + r.to_string() + " " + ir_struct_field_index_lookup[lookup_key])
                     return r
     recv_idx := node.children[0]
-    obj_r := ir_expr(recv_idx)
+    mut obj_r := pre_obj_r
+    if obj_r < 0:
+        obj_r = ir_expr(recv_idx)
     r := ir_reg()
     if ir_emit_tuple_field_access(r, obj_r, recv_idx, fname):
         return r
@@ -4478,7 +4485,10 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
         result_r := ir_emit_result_field_access(idx, obj_r, fname)
         if result_r >= 0:
             return result_r
-    return ir_emit_field_access(idx, node)
+        # hand the already-evaluated receiver to the field read so it is not
+        # emitted a second time (a stateful receiver would advance and misread).
+        return ir_emit_field_access(idx, node, obj_r)
+    return ir_emit_field_access(idx, node, 0 - 1)
 
 fn ir_emit_await_expr(node: Node) -> Int:
     if node.children.len() == 0:

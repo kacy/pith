@@ -86,9 +86,17 @@ impl Conn:
     # are the serialized response message. fails with a GrpcError on a non-OK
     # grpc-status, a malformed response, or a transport error.
     pub fn unary(full_method: String, request: Bytes) -> Bytes!GrpcError:
+        no_metadata: List[String] := []
+        return self.unary_with_headers(full_method, request, no_metadata)!
+
+    # like unary, but also sends `extra_headers` — a flat [k1, v1, k2, v2, ...]
+    # list — as grpc metadata: custom http/2 request headers layered on top of the
+    # standard grpc set. this is how a caller passes auth/tenant credentials (e.g.
+    # an api key) to a collector. an empty list behaves exactly like unary.
+    pub fn unary_with_headers(full_method: String, request: Bytes, extra_headers: List[String]) -> Bytes!GrpcError:
         if not trace.is_active():
             framed := frame_message(request)
-            resp := self.client.request("POST", self.authority, full_method, grpc_headers(), framed)
+            resp := self.client.request("POST", self.authority, full_method, with_metadata(grpc_headers(), extra_headers), framed)
             if resp.is_err:
                 fail GrpcError(GRPC_UNAVAILABLE, "grpc transport error: {resp.err}")
             return handle_response(resp.ok)!
@@ -98,7 +106,7 @@ impl Conn:
         span.set_attr("rpc.system", "grpc").set_attr("rpc.method", full_method)
         framed := frame_message(request)
         started := time.mono_nanos()
-        resp := self.client.request("POST", self.authority, full_method, headers_with_traceparent(span.context()), framed)
+        resp := self.client.request("POST", self.authority, full_method, with_metadata(headers_with_traceparent(span.context()), extra_headers), framed)
         if resp.is_err:
             finish_client_span(span, full_method, GRPC_UNAVAILABLE, started)
             fail GrpcError(GRPC_UNAVAILABLE, "grpc transport error: {resp.err}")
@@ -150,6 +158,23 @@ REQUEST_HEADERS := [hpack.header_field("content-type", "application/grpc"), hpac
 
 fn grpc_headers() -> List[hpack.HeaderField]:
     return REQUEST_HEADERS
+
+# the base grpc headers plus `extra` metadata (a flat [k1, v1, k2, v2, ...] list)
+# appended as http/2 header fields. an empty list returns `base` unchanged so the
+# common no-metadata call keeps sharing the cached header list; otherwise a fresh
+# list is built so the cached one is never mutated. an odd trailing key with no
+# value is ignored.
+fn with_metadata(base: List[hpack.HeaderField], extra: List[String]) -> List[hpack.HeaderField]:
+    if extra.len() == 0:
+        return base
+    mut fields: List[hpack.HeaderField] := []
+    for f in base:
+        fields.push(f)
+    mut i := 0
+    while i + 1 < extra.len():
+        fields.push(hpack.header_field(extra[i], extra[i + 1]))
+        i = i + 2
+    return fields
 
 # the standard grpc headers plus a W3C traceparent for `ctx`, so the server joins
 # this trace. builds a fresh list rather than pushing onto the shared cached one.
@@ -532,6 +557,26 @@ impl Conn:
 
 fn trailer(status: Int) -> List[hpack.HeaderField]:
     return [hpack.header_field("grpc-status", "{status}")]
+
+test "with_metadata appends extra pairs after the base grpc headers":
+    extra := ["x-api-key", "secret", "x-tenant", "acme"]
+    fields := with_metadata(grpc_headers(), extra)
+    # the four cached grpc headers come first, then the two metadata pairs.
+    assert_eq(fields.len(), grpc_headers().len() + 2)
+    assert_eq(find_header(fields, "x-api-key"), "secret")
+    assert_eq(find_header(fields, "x-tenant"), "acme")
+    # the standard grpc headers are still present.
+    assert_eq(find_header(fields, "content-type"), "application/grpc")
+
+test "with_metadata returns the base list unchanged when there is no metadata":
+    empty: List[String] := []
+    fields := with_metadata(grpc_headers(), empty)
+    # no extra headers: unary's byte-identical behavior is preserved.
+    assert_eq(fields.len(), grpc_headers().len())
+
+test "with_metadata ignores a trailing key that has no value":
+    fields := with_metadata(grpc_headers(), ["x-only-key"])
+    assert_eq(fields.len(), grpc_headers().len())
 
 test "a message frames with a zero flag and a big-endian length":
     framed := frame_message(encoding.from_hex("089601")!)

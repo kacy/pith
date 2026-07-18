@@ -17,6 +17,10 @@
 
 import std.uuid as uuid
 import std.time as time
+import std.encoding as encoding
+import std.binary as binary
+import std.bits as bits
+import std.bytes as bytes
 
 # span kinds (OTel SpanKind).
 pub INTERNAL := 1
@@ -175,24 +179,136 @@ fn no_op_span() -> Span:
     empty_links: List[Link] := []
     return Span("", "", "", "", INTERNAL, 0, 0, 0, empty_attrs, STATUS_UNSET, "", false, "", "", false, empty_events, empty_links, 0, 0, 0)
 
+# --- head-based sampling (OpenTelemetry sampler) ---
+#
+# sampling is decided once, when a span starts (head sampling), and the decision
+# rides along the whole trace via the traceparent flags. an unsampled span is
+# still given real ids and still becomes the current context, so downstream work
+# and outgoing traceparents stay linked — it just isn't recorded or exported.
+# std.obs.init picks the sampler from OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG.
+
+# sampler modes. the parentbased_* modes honor an existing parent's decision and
+# only fall back to their named root sampler when there is no parent; they are
+# the OpenTelemetry defaults and what you almost always want.
+pub SAMPLER_ALWAYS_ON := 0
+pub SAMPLER_ALWAYS_OFF := 1
+pub SAMPLER_TRACEIDRATIO := 2
+pub SAMPLER_PARENT_ALWAYS_ON := 3      # OTel default
+pub SAMPLER_PARENT_ALWAYS_OFF := 4
+pub SAMPLER_PARENT_TRACEIDRATIO := 5
+
+# the active sampler and its ratio (only used by the traceidratio modes).
+mut sampler_mode := SAMPLER_PARENT_ALWAYS_ON
+mut sampler_ratio := 1.0
+
+# choose the sampler mode and ratio. the ratio is only consulted by the
+# traceidratio modes; the others ignore it.
+pub fn set_sampler(mode: Int, ratio: Float):
+    sampler_mode = mode
+    sampler_ratio = ratio
+
+# map an OTEL_TRACES_SAMPLER name onto a sampler mode and install it. an
+# unrecognized name falls back to the OTel default (parentbased_always_on).
+pub fn set_sampler_from_name(name: String, ratio: Float):
+    mut mode := SAMPLER_PARENT_ALWAYS_ON
+    if name == "always_on":
+        mode = SAMPLER_ALWAYS_ON
+    elif name == "always_off":
+        mode = SAMPLER_ALWAYS_OFF
+    elif name == "traceidratio":
+        mode = SAMPLER_TRACEIDRATIO
+    elif name == "parentbased_always_on":
+        mode = SAMPLER_PARENT_ALWAYS_ON
+    elif name == "parentbased_always_off":
+        mode = SAMPLER_PARENT_ALWAYS_OFF
+    elif name == "parentbased_traceidratio":
+        mode = SAMPLER_PARENT_TRACEIDRATIO
+    set_sampler(mode, ratio)
+
+# we sample on the low 62 bits of a trace id. the OTel convention is the low 63
+# bits of the rightmost 8 bytes, but pith trace ids are uuids: the 9th byte holds
+# the 2-bit uuid variant marker in its high bits, so only 62 of those bits are
+# random. taking the low 62 gives an even split for both pith-generated ids and
+# fully-random inbound trace ids, and it is purely a function of the id, so every
+# service that sees the trace reaches the same decision.
+SAMPLE_MASK := 4611686018427387903      # 2^62 - 1
+# 2^62 as a float, the scale we compare ratio against. it lives inside
+# ratio_sampled as a local because a module-level float constant is miscompiled
+# to zero; keeping it local sidesteps that.
+
+# the rightmost 8 bytes of a trace id as a non-negative integer, most significant
+# byte first. we build it a byte at a time (clearing the top bit of the leading
+# byte) rather than calling binary.read_u64_be_at, because that reader rejects a
+# value whose top bit is set — which would send roughly half of all trace ids
+# down the error path and bias the decision.
+fn trace_id_sample_value(decoded: Bytes) -> Int:
+    mut value := bits.band(binary.read_u8_at(decoded, 8) catch 0, 127)
+    mut i := 9
+    while i < 16:
+        byte := binary.read_u8_at(decoded, i) catch 0
+        value = bits.shl(value, 8) + byte
+        i = i + 1
+    return value
+
+# the deterministic trace-id-ratio decision: the same trace id always yields the
+# same answer, so every service that sees a trace agrees on whether to sample it.
+# a trace is sampled when its low 62 bits fall below ratio * 2^62.
+fn ratio_sampled(trace_id: String, ratio: Float) -> Bool:
+    if ratio >= 1.0:
+        return true
+    if ratio <= 0.0:
+        return false
+    decoded := encoding.from_hex(trace_id) catch bytes.empty()
+    if decoded.len() < 16:
+        return false
+    sample_scale := 4611686018427387904.0   # 2^62
+    value := bits.band(trace_id_sample_value(decoded), SAMPLE_MASK)
+    threshold := (ratio * sample_scale).to_int()
+    return value < threshold
+
+# the root sampling decision (no parent to inherit from): always_on/off resolve
+# directly, and the traceidratio modes defer to the deterministic hash.
+fn sample_root(trace_id: String) -> Bool:
+    if sampler_mode == SAMPLER_ALWAYS_ON or sampler_mode == SAMPLER_PARENT_ALWAYS_ON:
+        return true
+    if sampler_mode == SAMPLER_ALWAYS_OFF or sampler_mode == SAMPLER_PARENT_ALWAYS_OFF:
+        return false
+    return ratio_sampled(trace_id, sampler_ratio)
+
+# the child decision. parentbased modes inherit the parent's decision so a whole
+# trace is sampled or not as a unit; the non-parent modes make a fresh decision
+# (traceidratio on the inherited trace id lands the same way as the root did,
+# which is exactly the consistency we want).
+fn sample_child(trace_id: String, parent_sampled: Bool) -> Bool:
+    if sampler_mode == SAMPLER_PARENT_ALWAYS_ON or sampler_mode == SAMPLER_PARENT_ALWAYS_OFF or sampler_mode == SAMPLER_PARENT_TRACEIDRATIO:
+        return parent_sampled
+    return sample_root(trace_id)
+
 # start a span of the given kind, parented under the current span on this thread
 # (or a new root trace if there is none), and make it the current span. returns a
-# no-op span when tracing is inactive.
+# no-op span when tracing is inactive. when tracing is active but the sampler
+# says no, the span still gets ids and becomes current (so context propagates)
+# but is not recorded — recording=false keeps it out of the export buffer.
 pub fn start_kind(name: String, kind: Int) -> Span:
     if not trace_active:
         return no_op_span()
     mut trace_id := cur_trace_id
     parent_id := cur_span_id
-    mut sampled := cur_sampled
-    if trace_id.len() != 32:
-        # no active trace on this thread: begin a new one.
+    # no active trace on this thread means this is a root span.
+    is_root := cur_trace_id.len() != 32
+    mut sampled := false
+    if is_root:
         trace_id = new_id(32)
-        sampled = true
+        sampled = sample_root(trace_id)
+    else:
+        sampled = sample_child(trace_id, cur_sampled)
     span_id := new_id(16)
     empty_attrs: List[Attr] := []
     empty_events: List[SpanEvent] := []
     empty_links: List[Link] := []
-    span := Span(trace_id, span_id, parent_id, name, kind, unix_nanos(), time.mono_nanos(), 0, empty_attrs, STATUS_UNSET, "", true, cur_trace_id, cur_span_id, cur_sampled, empty_events, empty_links, 0, 0, 0)
+    # recording follows the sampling decision: a sampled span records and exports,
+    # an unsampled one only propagates context.
+    span := Span(trace_id, span_id, parent_id, name, kind, unix_nanos(), time.mono_nanos(), 0, empty_attrs, STATUS_UNSET, "", sampled, cur_trace_id, cur_span_id, cur_sampled, empty_events, empty_links, 0, 0, 0)
     # this span is now current; it restores the saved parent on end.
     cur_trace_id = trace_id
     cur_span_id = span_id
@@ -271,19 +387,26 @@ impl Span:
     fn context() -> SpanContext:
         return SpanContext(self.trace_id, self.span_id, self.sampled_flag())
 
+    # the sampling decision this span carries, which drives the traceparent
+    # flags. recording is set from the sampler at start, so it is exactly the
+    # sampled bit: a recording span is sampled, a propagating one is not.
     fn sampled_flag() -> Bool:
-        return self.trace_id.len() == 32
+        return self.recording
 
-    # finish the span: stamp its end time, restore the parent as the current
-    # span, and hand it to the export buffer.
+    # finish the span: stamp its end time and restore the parent as the current
+    # span. a no-op span (tracing was off) never became current, so it has no
+    # parent to restore and nothing to record — it is recognized by its empty
+    # trace id. an unsampled-but-propagating span still restores its parent here;
+    # only a recording span is handed to the export buffer.
     fn end():
-        if not self.recording:
+        if self.trace_id == "":
             return
         self.end_unix_ns = self.start_unix_ns + (time.mono_nanos() - self.start_mono_ns)
         cur_trace_id = self.saved_trace_id
         cur_span_id = self.saved_span_id
         cur_sampled = self.saved_sampled
-        record_finished_span(self)
+        if self.recording:
+            record_finished_span(self)
 
 # --- export buffer: ended spans wait here for the OTLP exporter to drain ---
 mut sink_mu := Mutex()
@@ -495,4 +618,111 @@ test "the link cap drops extras and counts them":
     assert_eq(span.links.len(), MAX_SPAN_LINKS)
     assert_eq(span.dropped_links_count, 1)
     span.end()
+    set_active(false)
+
+# --- sampling ---------------------------------------------------------------
+
+test "ratio_sampled is deterministic for a fixed trace id":
+    fixed := "0af7651916cd43dd8448eb211c80319c"
+    first := ratio_sampled(fixed, 0.5)
+    mut i := 0
+    while i < 10:
+        assert_eq(ratio_sampled(fixed, 0.5), first)
+        i = i + 1
+
+test "ratio_sampled samples everything at 1.0 and nothing at 0.0":
+    fixed := "0af7651916cd43dd8448eb211c80319c"
+    assert(ratio_sampled(fixed, 1.0))
+    assert(not ratio_sampled(fixed, 0.0))
+
+test "trace-id-ratio sampling picks a fraction of traces":
+    # over many distinct ids at 0.5, we expect roughly half sampled — assert only
+    # loose bounds, enough to prove it is neither sampling all nor none.
+    mut sampled_count := 0
+    mut i := 0
+    while i < 200:
+        id := new_id(32)
+        if ratio_sampled(id, 0.5):
+            sampled_count = sampled_count + 1
+        i = i + 1
+    assert(sampled_count > 40)
+    assert(sampled_count < 160)
+
+test "always_off spans propagate context but record nothing":
+    set_active(true)
+    set_sink(true)
+    clear_context()
+    drain_finished_spans()          # clear anything left by an earlier test
+    set_sampler(SAMPLER_ALWAYS_OFF, 1.0)
+
+    span := start("root")
+    assert(not span.recording)
+    # it still became the current context, with valid ids, so it propagates.
+    assert_eq(current_context().trace_id.len(), 32)
+    assert(not current_context().sampled)
+    span.end()
+    # the parent (empty, since this was a root) is restored on end.
+    assert_eq(current_context().trace_id, "")
+    # and nothing was buffered for export.
+    assert_eq(drain_finished_spans().len(), 0)
+
+    # for contrast, an always_on root does record one finished span.
+    set_sampler(SAMPLER_ALWAYS_ON, 1.0)
+    on := start("root-on")
+    assert(on.recording)
+    on.end()
+    assert_eq(drain_finished_spans().len(), 1)
+
+    set_sampler(SAMPLER_PARENT_ALWAYS_ON, 1.0)
+    set_sink(false)
+    set_active(false)
+
+test "parentbased sampler inherits the parent's decision":
+    set_active(true)
+    set_sink(true)
+    clear_context()
+    drain_finished_spans()
+    set_sampler(SAMPLER_PARENT_ALWAYS_OFF, 1.0)
+
+    parent := "0af7651916cd43dd8448eb211c80319c"
+    # a sampled parent context (as if from an inbound traceparent).
+    with_context(SpanContext(parent, "b7ad6b7169203331", true))
+    child := start("child")
+    # parentbased_always_off records the child anyway, because the parent is
+    # sampled — parentbased means "do what the parent did".
+    assert(child.recording)
+    assert_eq(child.trace_id, parent)
+    child.end()
+    assert_eq(drain_finished_spans().len(), 1)
+
+    # with an unsampled parent, the same sampler drops the child.
+    with_context(SpanContext(parent, "b7ad6b7169203331", false))
+    child2 := start("child2")
+    assert(not child2.recording)
+    child2.end()
+    assert_eq(drain_finished_spans().len(), 0)
+
+    clear_context()
+    set_sampler(SAMPLER_PARENT_ALWAYS_ON, 1.0)
+    set_sink(false)
+    set_active(false)
+
+test "the traceparent flag reflects the sampling decision":
+    set_active(true)
+    clear_context()
+
+    set_sampler(SAMPLER_ALWAYS_OFF, 1.0)
+    off := start("off")
+    off_header := format_traceparent(off.context())
+    assert_eq(off_header.substring(off_header.len() - 3, off_header.len()), "-00")
+    off.end()
+
+    clear_context()
+    set_sampler(SAMPLER_ALWAYS_ON, 1.0)
+    on := start("on")
+    on_header := format_traceparent(on.context())
+    assert_eq(on_header.substring(on_header.len() - 3, on_header.len()), "-01")
+    on.end()
+
+    set_sampler(SAMPLER_PARENT_ALWAYS_ON, 1.0)
     set_active(false)

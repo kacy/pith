@@ -2389,7 +2389,7 @@ fn finish_http_client_span(span: trace.Span, method: String, status: Int, start_
     span.end()
     elapsed_ms := (time_mod.mono_nanos() - start_ns) / 1000000
     metrics.counter("http_client_requests_total").labels(["method", method, "status", status_label]).inc()
-    metrics.histogram("http_client_duration_ms").labels(["method", method]).observe(elapsed_ms)
+    metrics.histogram("http_client_duration_ms").labels(["method", method]).observe(elapsed_ms.to_float())
 
 # --- server-side tracing ----------------------------------------------------
 
@@ -2437,7 +2437,7 @@ pub fn end_server_span(span: trace.Span, status: Int):
         route = span.name.substring(space + 1, span.name.len())
     elapsed_ms := time_mod.now() - (span.start_unix_ns / 1000000)
     metrics.counter("http_server_requests_total").labels(["method", method, "route", route, "status", status_label]).inc()
-    metrics.histogram("http_server_duration_ms").labels(["method", method, "route", route]).observe(elapsed_ms)
+    metrics.histogram("http_server_duration_ms").labels(["method", method, "route", route]).observe(elapsed_ms.to_float())
 
 fn send_request_following_redirects_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
     mut current := req
@@ -2716,14 +2716,14 @@ fn instrument_request(handler: fn(HttpRequestBytes) -> HttpResponse, logger: log
     started := time_mod.now()
     metrics.counter(instrumentation_metric_name(metric_prefix, "requests_total")).inc()
     inflight := metrics.gauge(instrumentation_metric_name(metric_prefix, "in_flight"))
-    inflight.add(1)
+    inflight.add(1.0)
 
     resp := handler(req)
 
-    inflight.add(0 - 1)
+    inflight.add(0.0 - 1.0)
     elapsed := time_mod.now() - started
     metrics.counter(instrumentation_metric_name(metric_prefix, "responses_total_" + resp.status.to_string())).inc()
-    metrics.histogram(instrumentation_metric_name(metric_prefix, "request_duration_ms")).observe(elapsed)
+    metrics.histogram(instrumentation_metric_name(metric_prefix, "request_duration_ms")).observe(elapsed.to_float())
     instrumented_logger(logger, req).info().int("status", resp.status).duration_ms("elapsed_ms", elapsed).msg("request complete")
     return resp
 
@@ -3131,12 +3131,12 @@ test "http instrumentation logs requests and records metrics":
     started := time_mod.now()
     metrics.counter(instrumentation_metric_name("http_test", "requests_total")).inc()
     inflight := metrics.gauge(instrumentation_metric_name("http_test", "in_flight"))
-    inflight.add(1)
+    inflight.add(1.0)
     resp := text(201, req.method_text)
-    inflight.add(0 - 1)
+    inflight.add(0.0 - 1.0)
     elapsed := time_mod.now() - started
     metrics.counter(instrumentation_metric_name("http_test", "responses_total_" + resp.status.to_string())).inc()
-    metrics.histogram(instrumentation_metric_name("http_test", "request_duration_ms")).observe(elapsed)
+    metrics.histogram(instrumentation_metric_name("http_test", "request_duration_ms")).observe(elapsed.to_float())
     instrumented_logger(logger, req).info().int("status", resp.status).duration_ms("elapsed_ms", elapsed).msg("request complete")
 
     snapshot := metrics.snapshot_text()

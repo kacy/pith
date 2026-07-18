@@ -17,13 +17,18 @@ pub struct Gauge:
 pub struct Histogram:
     pub name: String
 
-mut counter_values: Map[String, Int] := {}
-mut gauge_values: Map[String, Int] := {}
+mut counter_values: Map[String, Float] := {}
+mut gauge_values: Map[String, Float] := {}
 mut histogram_counts: Map[String, Int] := {}
-mut histogram_sums: Map[String, Int] := {}
-mut histogram_mins: Map[String, Int] := {}
-mut histogram_maxs: Map[String, Int] := {}
+mut histogram_sums: Map[String, Float] := {}
+mut histogram_mins: Map[String, Float] := {}
+mut histogram_maxs: Map[String, Float] := {}
 mut histogram_bucket_counts: Map[String, Int] := {}
+
+# custom bucket boundaries per bare metric name (see Histogram.buckets). a metric
+# with no entry here uses default_histogram_buckets(). all series of one metric
+# share its boundaries, so this is keyed by the bare name, not the series key.
+mut histogram_bucket_defs: Map[String, List[Float]] := {}
 
 # guards all the metric maps so concurrent updates from separate threads do not
 # race. each public operation takes it around its whole read-modify-write; the
@@ -97,11 +102,39 @@ fn register_series(key: String, name: String, pairs: List[String]):
         series_bare_name.insert(key, name)
         series_label_pairs.insert(key, pairs)
 
-fn default_histogram_buckets() -> List[Int]:
-    return [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000]
+fn default_histogram_buckets() -> List[Float]:
+    return [1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 5000.0]
 
-fn bucket_key(name: String, upper_bound: Int) -> String:
-    return name + "|" + upper_bound.to_string()
+# the bucket boundaries for a bare metric name: its custom set if one was
+# registered (Histogram.buckets), else the defaults. caller holds the lock.
+fn buckets_for(bare: String) -> List[Float]:
+    if histogram_bucket_defs.contains_key(bare):
+        return histogram_bucket_defs[bare]
+    return default_histogram_buckets()
+
+# register custom bucket boundaries for a bare metric, first call wins so a
+# metric's boundaries stay stable once observations start. caller holds the lock.
+fn register_buckets(bare: String, bounds: List[Float]):
+    if not histogram_bucket_defs.contains_key(bare):
+        histogram_bucket_defs.insert(bare, bounds)
+
+# a stable, human-readable rendering of a float bound or value: whole numbers
+# print without a trailing ".0" (so a bucket reads le="5", a count reads "3"),
+# fractions print in full. used for prometheus text and bucket keys alike.
+fn render_value(v: Float) -> String:
+    whole := v.to_int()
+    if whole.to_float() == v:
+        return whole.to_string()
+    return v.to_string()
+
+fn bucket_key(name: String, upper_bound: Float) -> String:
+    return name + "|" + render_value(upper_bound)
+
+# the bare metric name behind a series key. caller holds the lock.
+fn bare_of(key: String) -> String:
+    if series_bare_name.contains_key(key):
+        return series_bare_name[key]
+    return key
 
 fn metric_name_char(c: String) -> String:
     if (c >= "a" and c <= "z") or (c >= "A" and c <= "Z") or (c >= "0" and c <= "9") or c == "_":
@@ -124,27 +157,27 @@ fn normalize_metric_name(name: String) -> String:
 
 fn ensure_counter(name: String):
     if not counter_values.contains_key(name):
-        counter_values.insert(name, 0)
+        counter_values.insert(name, 0.0)
 
 fn ensure_gauge(name: String):
     if not gauge_values.contains_key(name):
-        gauge_values.insert(name, 0)
+        gauge_values.insert(name, 0.0)
 
+# bucket counts are created lazily on first observe, so the boundary set can be
+# chosen with Histogram.buckets any time before the first observation.
 fn ensure_histogram(name: String):
     if histogram_counts.contains_key(name):
         return
     histogram_counts.insert(name, 0)
-    histogram_sums.insert(name, 0)
-    histogram_mins.insert(name, 0)
-    histogram_maxs.insert(name, 0)
-    for bucket in default_histogram_buckets():
-        histogram_bucket_counts.insert(bucket_key(name, bucket), 0)
+    histogram_sums.insert(name, 0.0)
+    histogram_mins.insert(name, 0.0)
+    histogram_maxs.insert(name, 0.0)
 
-fn counter_value(name: String) -> Int:
+fn counter_value(name: String) -> Float:
     ensure_counter(name)
     return counter_values[name]
 
-fn gauge_value(name: String) -> Int:
+fn gauge_value(name: String) -> Float:
     ensure_gauge(name)
     return gauge_values[name]
 
@@ -152,23 +185,28 @@ fn histogram_count(name: String) -> Int:
     ensure_histogram(name)
     return histogram_counts[name]
 
-fn histogram_sum(name: String) -> Int:
+fn histogram_sum(name: String) -> Float:
     ensure_histogram(name)
     return histogram_sums[name]
 
-fn histogram_min(name: String) -> Int:
+fn histogram_min(name: String) -> Float:
     ensure_histogram(name)
     return histogram_mins[name]
 
-fn histogram_max(name: String) -> Int:
+fn histogram_max(name: String) -> Float:
     ensure_histogram(name)
     return histogram_maxs[name]
 
-fn histogram_bucket_value(name: String, upper_bound: Int) -> Int:
-    ensure_histogram(name)
-    return histogram_bucket_counts[bucket_key(name, upper_bound)]
+fn histogram_bucket_value(name: String, upper_bound: Float) -> Int:
+    key := bucket_key(name, upper_bound)
+    if histogram_bucket_counts.contains_key(key):
+        return histogram_bucket_counts[key]
+    return 0
 
-fn metric_names_from_values(values: Map[String, Int], names: List[String], seen: Map[String, Bool]) -> List[String]:
+# collect the series keys of one value map (counter/gauge floats or histogram
+# counts) into `names`, skipping any already seen. generic over the value type so
+# the same walk serves every map.
+fn metric_names_from_values[V](values: Map[String, V], names: List[String], seen: Map[String, Bool]) -> List[String]:
     mut out := names
     for name in values:
         if seen.contains_key(name):
@@ -195,6 +233,7 @@ pub fn reset():
     histogram_mins = {}
     histogram_maxs = {}
     histogram_bucket_counts = {}
+    histogram_bucket_defs = {}
     series_bare_name = {}
     series_label_pairs = {}
     metrics_mu.unlock()
@@ -237,15 +276,15 @@ fn instrument_bare_name(key: String) -> String:
 
 impl Counter:
     fn inc():
-        self.add(1)
+        self.add(1.0)
 
-    fn add(delta: Int):
+    fn add(delta: Float):
         metrics_mu.lock()
         ensure_counter(self.name)
         counter_values.insert(self.name, counter_values[self.name] + delta)
         metrics_mu.unlock()
 
-    fn value() -> Int:
+    fn value() -> Float:
         metrics_mu.lock()
         result := counter_value(self.name)
         metrics_mu.unlock()
@@ -265,19 +304,19 @@ impl Counter:
         return Counter(key)
 
 impl Gauge:
-    fn set(value: Int):
+    fn set(value: Float):
         metrics_mu.lock()
         ensure_gauge(self.name)
         gauge_values.insert(self.name, value)
         metrics_mu.unlock()
 
-    fn add(delta: Int):
+    fn add(delta: Float):
         metrics_mu.lock()
         ensure_gauge(self.name)
         gauge_values.insert(self.name, gauge_values[self.name] + delta)
         metrics_mu.unlock()
 
-    fn value() -> Int:
+    fn value() -> Float:
         metrics_mu.lock()
         result := gauge_value(self.name)
         metrics_mu.unlock()
@@ -296,7 +335,7 @@ impl Gauge:
         return Gauge(key)
 
 impl Histogram:
-    fn observe(value: Int):
+    fn observe(value: Float):
         metrics_mu.lock()
         ensure_histogram(self.name)
         next_count := histogram_counts[self.name] + 1
@@ -310,11 +349,23 @@ impl Histogram:
                 histogram_mins.insert(self.name, value)
             if value > histogram_maxs[self.name]:
                 histogram_maxs.insert(self.name, value)
-        for bucket in default_histogram_buckets():
+        for bucket in buckets_for(bare_of(self.name)):
             if value <= bucket:
                 key := bucket_key(self.name, bucket)
-                histogram_bucket_counts.insert(key, histogram_bucket_counts[key] + 1)
+                mut current := 0
+                if histogram_bucket_counts.contains_key(key):
+                    current = histogram_bucket_counts[key]
+                histogram_bucket_counts.insert(key, current + 1)
         metrics_mu.unlock()
+
+    # choose this histogram's bucket boundaries (upper bounds, ascending). set it
+    # before the first observe; the first call for a metric wins. returns self so
+    # it chains: histogram("latency_ms").buckets([0.005, 0.01, 0.05]).
+    fn buckets(bounds: List[Float]) -> Histogram:
+        metrics_mu.lock()
+        register_buckets(bare_of(self.name), bounds)
+        metrics_mu.unlock()
+        return self
 
     fn count() -> Int:
         metrics_mu.lock()
@@ -322,19 +373,19 @@ impl Histogram:
         metrics_mu.unlock()
         return result
 
-    fn sum() -> Int:
+    fn sum() -> Float:
         metrics_mu.lock()
         result := histogram_sum(self.name)
         metrics_mu.unlock()
         return result
 
-    fn min() -> Int:
+    fn min() -> Float:
         metrics_mu.lock()
         result := histogram_min(self.name)
         metrics_mu.unlock()
         return result
 
-    fn max() -> Int:
+    fn max() -> Float:
         metrics_mu.lock()
         result := histogram_max(self.name)
         metrics_mu.unlock()
@@ -380,24 +431,24 @@ fn append_pair(pairs: List[String], k: String, v: String) -> List[String]:
 fn render_series_lines(key: String, bare: String, pairs: List[String], kind: String) -> List[String]:
     mut lines: List[String] := []
     if kind == "counter":
-        lines.push(key + " " + counter_value(key).to_string())
+        lines.push(key + " " + render_value(counter_value(key)))
         return lines
     if kind == "gauge":
-        lines.push(key + " " + gauge_value(key).to_string())
+        lines.push(key + " " + render_value(gauge_value(key)))
         return lines
     # histogram: buckets carry the series labels plus le; count/sum/min/max carry
     # just the series labels.
-    for bucket in default_histogram_buckets():
-        le := append_pair(pairs, "le", bucket.to_string())
+    for bucket in buckets_for(bare):
+        le := append_pair(pairs, "le", render_value(bucket))
         lines.push(bare + "_bucket" + label_suffix(le) + " " + histogram_bucket_value(key, bucket).to_string())
     inf := append_pair(pairs, "le", "+Inf")
     lines.push(bare + "_bucket" + label_suffix(inf) + " " + histogram_count(key).to_string())
     suffix := label_suffix(pairs)
     lines.push(bare + "_count" + suffix + " " + histogram_count(key).to_string())
-    lines.push(bare + "_sum" + suffix + " " + histogram_sum(key).to_string())
+    lines.push(bare + "_sum" + suffix + " " + render_value(histogram_sum(key)))
     if histogram_count(key) > 0:
-        lines.push(bare + "_min" + suffix + " " + histogram_min(key).to_string())
-        lines.push(bare + "_max" + suffix + " " + histogram_max(key).to_string())
+        lines.push(bare + "_min" + suffix + " " + render_value(histogram_min(key)))
+        lines.push(bare + "_max" + suffix + " " + render_value(histogram_max(key)))
     return lines
 
 # export a stable prometheus-text snapshot of all series. series of the same
@@ -425,8 +476,8 @@ pub struct MetricSample:
     pub name: String        # bare metric name
     pub kind: String        # "counter" | "gauge" | "histogram"
     pub labels: List[String]  # [k1,v1,k2,v2,...]
-    pub value: Int          # counter/gauge value, or histogram observation count
-    pub sum: Int            # histogram sum of observations (0 for counter/gauge)
+    pub value: Float        # counter/gauge value, or histogram observation count
+    pub sum: Float          # histogram sum of observations (0 for counter/gauge)
 
 # a structured snapshot of every series, one MetricSample each. gives an OTLP
 # exporter typed name/labels/value without parsing the prometheus text.
@@ -434,18 +485,16 @@ pub fn snapshot() -> List[MetricSample]:
     metrics_mu.lock()
     mut out: List[MetricSample] := []
     for key in metric_names():
-        mut bare := key
-        if series_bare_name.contains_key(key):
-            bare = series_bare_name[key]
+        bare := bare_of(key)
         kind := series_kind(key)
-        mut value := 0
-        mut sum := 0
+        mut value := 0.0
+        mut sum := 0.0
         if kind == "counter":
             value = counter_value(key)
         elif kind == "gauge":
             value = gauge_value(key)
         else:
-            value = histogram_count(key)
+            value = histogram_count(key).to_float()
             sum = histogram_sum(key)
         out.push(MetricSample(bare, kind, series_pairs(key), value, sum))
     metrics_mu.unlock()
@@ -457,13 +506,13 @@ test "metrics counters and gauges normalize names and store values":
     inflight := gauge("requests in flight")
 
     requests.inc()
-    requests.add(2)
-    inflight.set(3)
-    inflight.add(0 - 1)
+    requests.add(2.0)
+    inflight.set(3.0)
+    inflight.add(0.0 - 1.0)
 
     snapshot := snapshot_text()
-    assert_eq(requests.value(), 3)
-    assert_eq(inflight.value(), 2)
+    assert_eq(requests.value(), 3.0)
+    assert_eq(inflight.value(), 2.0)
     assert(snapshot.contains("# TYPE requests_total counter"))
     assert(snapshot.contains("requests_total 3"))
     assert(snapshot.contains("# TYPE requests_in_flight gauge"))
@@ -473,14 +522,14 @@ test "metrics histograms export bucketed text":
     reset()
     latency := histogram("request latency ms")
 
-    latency.observe(4)
-    latency.observe(30)
+    latency.observe(4.0)
+    latency.observe(30.0)
 
     snapshot := snapshot_text()
     assert_eq(latency.count(), 2)
-    assert_eq(latency.sum(), 34)
-    assert_eq(latency.min(), 4)
-    assert_eq(latency.max(), 30)
+    assert_eq(latency.sum(), 34.0)
+    assert_eq(latency.min(), 4.0)
+    assert_eq(latency.max(), 30.0)
     assert(snapshot.contains("# TYPE request_latency_ms histogram"))
     assert(snapshot.contains("request_latency_ms_bucket" + chr(123) + "le=" + chr(34) + "5" + chr(34) + chr(125) + " 1"))
     assert(snapshot.contains("request_latency_ms_bucket" + chr(123) + "le=" + chr(34) + "50" + chr(34) + chr(125) + " 2"))
@@ -500,7 +549,7 @@ fn stress_histogram(name: String, times: Int) -> Int:
     h := histogram(name)
     mut i := 0
     while i < times:
-        h.observe(7)
+        h.observe(7.0)
         i = i + 1
     return times
 
@@ -536,21 +585,21 @@ test "metrics stay exact under concurrent updates":
     observed = observed + await hd
 
     assert_eq(counted, per * 8)
-    assert_eq(counter("concurrent hits").value(), per * 8)
+    assert_eq(counter("concurrent hits").value(), (per * 8).to_float())
     assert_eq(observed, per * 4)
     assert_eq(histogram("concurrent obs").count(), per * 4)
-    assert_eq(histogram("concurrent obs").sum(), per * 4 * 7)
+    assert_eq(histogram("concurrent obs").sum(), (per * 4 * 7).to_float())
 
 test "labels create independent series and render with a shared TYPE line":
     reset()
     reqs := counter("http_requests_total")
     reqs.labels(["route", "/api", "method", "GET"]).inc()
-    reqs.labels(["route", "/api", "method", "GET"]).add(2)
+    reqs.labels(["route", "/api", "method", "GET"]).add(2.0)
     reqs.labels(["route", "/health", "method", "GET"]).inc()
 
     # each distinct label set is its own series; keys are sorted for a canonical form
-    assert_eq(reqs.labels(["method", "GET", "route", "/api"]).value(), 3)
-    assert_eq(reqs.labels(["route", "/health", "method", "GET"]).value(), 1)
+    assert_eq(reqs.labels(["method", "GET", "route", "/api"]).value(), 3.0)
+    assert_eq(reqs.labels(["route", "/health", "method", "GET"]).value(), 1.0)
 
     text := snapshot_text()
     # one TYPE line for the metric, one line per series with sorted labels
@@ -559,21 +608,66 @@ test "labels create independent series and render with a shared TYPE line":
 
 test "structured snapshot reports typed samples with labels":
     reset()
-    gauge("inflight").labels(["pool", "db"]).set(4)
-    histogram("latency_ms").labels(["route", "/api"]).observe(7)
-    histogram("latency_ms").labels(["route", "/api"]).observe(120)
+    gauge("inflight").labels(["pool", "db"]).set(4.0)
+    histogram("latency_ms").labels(["route", "/api"]).observe(7.0)
+    histogram("latency_ms").labels(["route", "/api"]).observe(120.0)
 
     mut found_gauge := false
     mut found_hist := false
     for s in snapshot():
         if s.name == "inflight" and s.labels.len() == 2:
             assert_eq(s.kind, "gauge")
-            assert_eq(s.value, 4)
+            assert_eq(s.value, 4.0)
             found_gauge = true
         if s.name == "latency_ms" and s.labels.len() == 2:
             assert_eq(s.kind, "histogram")
-            assert_eq(s.value, 2)
-            assert_eq(s.sum, 127)
+            assert_eq(s.value, 2.0)
+            assert_eq(s.sum, 127.0)
             found_hist = true
     assert(found_gauge)
     assert(found_hist)
+
+test "counters and gauges carry fractional values":
+    reset()
+    errors := counter("error_ratio")
+    errors.add(0.5)
+    errors.add(0.25)
+    temp := gauge("cpu_load")
+    temp.set(1.75)
+
+    assert_eq(errors.value(), 0.75)
+    assert_eq(temp.value(), 1.75)
+    text := snapshot_text()
+    assert(text.contains("error_ratio 0.75"))
+    assert(text.contains("cpu_load 1.75"))
+
+test "whole float values render without a trailing decimal":
+    reset()
+    counter("requests_total").add(5.0)
+    gauge("workers").set(3.0)
+    histogram("latency_ms").observe(2.0)
+
+    text := snapshot_text()
+    # prometheus is happy with 5.0, but 5 is the conventional rendering and what
+    # the pre-float text emitted, so whole numbers stay integer-clean.
+    assert(text.contains("requests_total 5"))
+    assert(not text.contains("requests_total 5.0"))
+    assert(text.contains("workers 3"))
+    assert(text.contains("latency_ms_sum 2"))
+
+test "custom histogram buckets replace the defaults":
+    reset()
+    # a latency histogram in seconds wants sub-second boundaries, not the 1..5000 default.
+    lat := histogram("request_seconds").buckets([0.005, 0.01, 0.025, 0.1, 0.5])
+    lat.observe(0.003)
+    lat.observe(0.02)
+    lat.observe(0.2)
+
+    text := snapshot_text()
+    # 0.003 and 0.02 fall at/under 0.025; 0.2 only at/under 0.5.
+    assert(text.contains("request_seconds_bucket" + chr(123) + "le=" + chr(34) + "0.025" + chr(34) + chr(125) + " 2"))
+    assert(text.contains("request_seconds_bucket" + chr(123) + "le=" + chr(34) + "0.5" + chr(34) + chr(125) + " 3"))
+    assert(text.contains("request_seconds_bucket" + chr(123) + "le=" + chr(34) + "+Inf" + chr(34) + chr(125) + " 3"))
+    # the default 1..5000 boundaries must not appear for this metric.
+    assert(not text.contains("request_seconds_bucket" + chr(123) + "le=" + chr(34) + "5000" + chr(34)))
+    assert_eq(lat.count(), 3)

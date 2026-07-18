@@ -46,6 +46,46 @@ mut metrics_mu := Mutex()
 mut series_bare_name: Map[String, String] := {}
 mut series_label_pairs: Map[String, List[String]] := {}
 
+# optional help text and unit per bare metric name (see describe). the help
+# renders as a prometheus `# HELP` line; both feed the OTLP Metric.description
+# and .unit fields. guarded by metrics_mu.
+mut metric_descriptions: Map[String, String] := {}
+mut metric_units: Map[String, String] := {}
+
+# record a metric's help text and/or unit (first non-empty value wins). caller
+# holds the lock.
+fn register_description(bare: String, help: String, unit: String):
+    if help != "" and not metric_descriptions.contains_key(bare):
+        metric_descriptions.insert(bare, help)
+    if unit != "" and not metric_units.contains_key(bare):
+        metric_units.insert(bare, unit)
+
+fn description_of(bare: String) -> String:
+    if metric_descriptions.contains_key(bare):
+        return metric_descriptions[bare]
+    return ""
+
+fn unit_of(bare: String) -> String:
+    if metric_units.contains_key(bare):
+        return metric_units[bare]
+    return ""
+
+# escape help text for a prometheus `# HELP` line: backslash and newline only
+# (unlike a label value, a double-quote needs no escaping here).
+fn escape_help(text: String) -> String:
+    mut out := ""
+    mut i := 0
+    while i < text.len():
+        c := text[i]
+        if c == chr(92):
+            out = out + chr(92) + chr(92)
+        elif c == chr(10):
+            out = out + chr(92) + "n"
+        else:
+            out = out + c
+        i = i + 1
+    return out
+
 # label names follow the same rule as metric names.
 fn normalize_label_name(name: String) -> String:
     return normalize_metric_name(name)
@@ -236,6 +276,8 @@ pub fn reset():
     histogram_bucket_defs = {}
     series_bare_name = {}
     series_label_pairs = {}
+    metric_descriptions = {}
+    metric_units = {}
     metrics_mu.unlock()
 
 # create or reopen a counter by name.
@@ -303,6 +345,14 @@ impl Counter:
         metrics_mu.unlock()
         return Counter(key)
 
+    # attach help text and a unit to this metric (renders as a prometheus
+    # `# HELP` line and fills OTLP description/unit). chainable; first call wins.
+    fn describe(help: String, unit: String) -> Counter:
+        metrics_mu.lock()
+        register_description(bare_of(self.name), help, unit)
+        metrics_mu.unlock()
+        return self
+
 impl Gauge:
     fn set(value: Float):
         metrics_mu.lock()
@@ -333,6 +383,13 @@ impl Gauge:
         ensure_gauge(key)
         metrics_mu.unlock()
         return Gauge(key)
+
+    # attach help text and a unit to this metric (see Counter.describe).
+    fn describe(help: String, unit: String) -> Gauge:
+        metrics_mu.lock()
+        register_description(bare_of(self.name), help, unit)
+        metrics_mu.unlock()
+        return self
 
 impl Histogram:
     fn observe(value: Float):
@@ -403,6 +460,13 @@ impl Histogram:
         metrics_mu.unlock()
         return Histogram(key)
 
+    # attach help text and a unit to this metric (see Counter.describe).
+    fn describe(help: String, unit: String) -> Histogram:
+        metrics_mu.lock()
+        register_description(bare_of(self.name), help, unit)
+        metrics_mu.unlock()
+        return self
+
 # which value maps hold this series key. caller holds the lock.
 fn series_kind(key: String) -> String:
     if counter_values.contains_key(key):
@@ -464,6 +528,9 @@ pub fn snapshot_text() -> String:
             bare = series_bare_name[key]
         kind := series_kind(key)
         if not typed.contains_key(bare):
+            help := description_of(bare)
+            if help != "":
+                lines.push("# HELP " + bare + " " + escape_help(help))
             lines.push("# TYPE " + bare + " " + kind)
             typed.insert(bare, true)
         for line in render_series_lines(key, bare, series_pairs(key), kind):
@@ -471,13 +538,31 @@ pub fn snapshot_text() -> String:
     metrics_mu.unlock()
     return lines.join(chr(10))
 
-# a typed view of one metric series, for building OTLP data points.
+# a typed view of one metric series, for building OTLP data points. the
+# histogram fields are empty/zero for counters and gauges. bucket_bounds are the
+# upper bounds and bucket_cumulative[i] is the count of observations <= bounds[i]
+# (prometheus le semantics); an OTLP exporter differences them into per-bucket
+# counts and adds the implicit +Inf overflow bucket.
 pub struct MetricSample:
     pub name: String        # bare metric name
     pub kind: String        # "counter" | "gauge" | "histogram"
     pub labels: List[String]  # [k1,v1,k2,v2,...]
     pub value: Float        # counter/gauge value, or histogram observation count
     pub sum: Float          # histogram sum of observations (0 for counter/gauge)
+    pub description: String  # help text, or ""
+    pub unit: String         # unit, or ""
+    pub bucket_bounds: List[Float]   # histogram upper bounds (empty otherwise)
+    pub bucket_cumulative: List[Int] # cumulative count <= each bound
+    pub min: Float           # histogram min observation (0 otherwise)
+    pub max: Float           # histogram max observation (0 otherwise)
+
+# the cumulative bucket counts for a histogram series, aligned with `bounds`.
+# caller holds the lock.
+fn cumulative_buckets(key: String, bounds: List[Float]) -> List[Int]:
+    mut out: List[Int] := []
+    for bound in bounds:
+        out.push(histogram_bucket_value(key, bound))
+    return out
 
 # a structured snapshot of every series, one MetricSample each. gives an OTLP
 # exporter typed name/labels/value without parsing the prometheus text.
@@ -487,8 +572,14 @@ pub fn snapshot() -> List[MetricSample]:
     for key in metric_names():
         bare := bare_of(key)
         kind := series_kind(key)
+        desc := description_of(bare)
+        unit := unit_of(bare)
         mut value := 0.0
         mut sum := 0.0
+        mut bounds: List[Float] := []
+        mut cumulative: List[Int] := []
+        mut lo := 0.0
+        mut hi := 0.0
         if kind == "counter":
             value = counter_value(key)
         elif kind == "gauge":
@@ -496,7 +587,11 @@ pub fn snapshot() -> List[MetricSample]:
         else:
             value = histogram_count(key).to_float()
             sum = histogram_sum(key)
-        out.push(MetricSample(bare, kind, series_pairs(key), value, sum))
+            bounds = buckets_for(bare)
+            cumulative = cumulative_buckets(key, bounds)
+            lo = histogram_min(key)
+            hi = histogram_max(key)
+        out.push(MetricSample(bare, kind, series_pairs(key), value, sum, desc, unit, bounds, cumulative, lo, hi))
     metrics_mu.unlock()
     return out
 
@@ -671,3 +766,42 @@ test "custom histogram buckets replace the defaults":
     # the default 1..5000 boundaries must not appear for this metric.
     assert(not text.contains("request_seconds_bucket" + chr(123) + "le=" + chr(34) + "5000" + chr(34)))
     assert_eq(lat.count(), 3)
+
+test "describe renders a HELP line and fills the sample":
+    reset()
+    counter("http_requests_total").describe("total http requests handled", "requests").inc()
+
+    text := snapshot_text()
+    # the HELP line renders immediately before the TYPE line for the metric.
+    assert(text.contains("# HELP http_requests_total total http requests handled" + chr(10) + "# TYPE http_requests_total counter"))
+
+    mut checked := false
+    for s in snapshot():
+        if s.name == "http_requests_total":
+            assert_eq(s.description, "total http requests handled")
+            assert_eq(s.unit, "requests")
+            checked = true
+    assert(checked)
+
+test "snapshot carries cumulative histogram buckets, min, and max":
+    reset()
+    h := histogram("latency_ms")
+    h.observe(3.0)
+    h.observe(30.0)
+    h.observe(3000.0)
+
+    mut checked := false
+    for s in snapshot():
+        if s.name == "latency_ms":
+            # default bounds 1,5,10,25,50,100,250,500,1000,5000
+            assert_eq(s.bucket_bounds.len(), 10)
+            assert_eq(s.bucket_cumulative.len(), 10)
+            assert_eq(s.bucket_cumulative[0], 0)   # <=1
+            assert_eq(s.bucket_cumulative[1], 1)   # <=5 (3)
+            assert_eq(s.bucket_cumulative[4], 2)   # <=50 (3, 30)
+            assert_eq(s.bucket_cumulative[9], 3)   # <=5000 (all)
+            assert_eq(s.value, 3.0)
+            assert_eq(s.min, 3.0)
+            assert_eq(s.max, 3000.0)
+            checked = true
+    assert(checked)

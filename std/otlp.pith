@@ -199,15 +199,31 @@ fn encode_number_point(value: Float, now_ns: Int, labels: List[String]) -> Bytes
     return out
 
 # encode a HistogramDataPoint: time_unix_nano=3 (fixed64), count=4 (fixed64),
-# sum=5 (double), attributes=9. v1 simplification: we report only the aggregate
-# count and sum, not the per-bucket boundaries and counts, which is enough for
-# rate and average but not for percentile estimation.
-fn encode_histogram_point(count: Int, sum: Float, now_ns: Int, labels: List[String]) -> Bytes!protobuf.ProtoError:
+# sum=5 (double), bucket_counts=6 (repeated fixed64), explicit_bounds=7 (repeated
+# double), attributes=9, min=11 (double), max=12 (double). the metric sample
+# carries cumulative le-counts (prometheus semantics); OTLP wants per-bucket
+# counts with one extra entry for the implicit +Inf overflow bucket, so we
+# difference them here. this is a real explicit-bucket histogram, enough for
+# percentile estimation, not just a count+sum.
+fn encode_histogram_point(sample: metrics.MetricSample, now_ns: Int) -> Bytes!protobuf.ProtoError:
     w := protobuf.writer()
+    count := sample.value.to_int()
     w.write_fixed64(3, now_ns)!
     w.write_fixed64(4, count)!
-    w.write_double(5, sum)!
-    write_attributes(w, 9, labels)!
+    w.write_double(5, sample.sum)!
+    # per-bucket counts = differences of the cumulative counts, plus the overflow
+    # bucket (everything above the last bound).
+    mut prev := 0
+    for cumulative in sample.bucket_cumulative:
+        w.write_fixed64(6, cumulative - prev)!
+        prev = cumulative
+    w.write_fixed64(6, count - prev)!
+    for bound in sample.bucket_bounds:
+        w.write_double(7, bound)!
+    write_attributes(w, 9, sample.labels)!
+    if count > 0:
+        w.write_double(11, sample.min)!
+        w.write_double(12, sample.max)!
     out := w.bytes()
     w.free()
     return out
@@ -240,16 +256,21 @@ fn encode_histogram(point: Bytes) -> Bytes!protobuf.ProtoError:
     w.free()
     return out
 
-# encode one Metric { name=1, gauge=5 | sum=7 | histogram=9 } from a sample,
-# mapping the pith metric kind to the matching OTLP data type.
+# encode one Metric { name=1, description=2, unit=3, gauge=5 | sum=7 |
+# histogram=9 } from a sample, mapping the pith metric kind to the matching OTLP
+# data type.
 fn encode_metric(sample: metrics.MetricSample, now_ns: Int) -> Bytes!protobuf.ProtoError:
     w := protobuf.writer()
     w.write_string(1, sample.name)!
+    if sample.description != "":
+        w.write_string(2, sample.description)!
+    if sample.unit != "":
+        w.write_string(3, sample.unit)!
     if sample.kind == "gauge":
         point := encode_number_point(sample.value, now_ns, sample.labels)!
         w.write_message(5, encode_gauge(point)!)!
     elif sample.kind == "histogram":
-        point := encode_histogram_point(sample.value.to_int(), sample.sum, now_ns, sample.labels)!
+        point := encode_histogram_point(sample, now_ns)!
         w.write_message(9, encode_histogram(point)!)!
     else:
         point := encode_number_point(sample.value, now_ns, sample.labels)!
@@ -498,6 +519,89 @@ test "a histogram encodes count and sum on its data point":
             hr.skip(tag.wire)!
     assert_eq(count, 2)
     assert_eq(sum, 40.0)
+
+test "a histogram encodes explicit buckets, min, and max":
+    metrics.reset()
+    h := metrics.histogram("latency_ms").buckets([10.0, 100.0])
+    h.observe(5.0)      # falls in the <=10 bucket
+    h.observe(50.0)     # falls in the (10,100] bucket
+    h.observe(500.0)    # overflow, above the last bound
+    encoded := encode_metrics("checkout", metrics.snapshot())!
+
+    resource_metrics := first_message(encoded, 1)!
+    scope_metrics := first_message(resource_metrics, 2)!
+    metric := first_message(scope_metrics, 2)!
+    histogram_bytes := first_message(metric, 9)!
+    point := first_message(histogram_bytes, 1)!
+
+    mut count := 0
+    mut bounds: List[Float] := []
+    mut counts: List[Int] := []
+    mut lo := 0.0
+    mut hi := 0.0
+    hr := protobuf.reader(point)
+    while not hr.at_end():
+        tag := hr.read_tag()!
+        if tag.field == 4:
+            count = hr.read_fixed64()!
+        elif tag.field == 6:
+            counts.push(hr.read_fixed64()!)
+        elif tag.field == 7:
+            bounds.push(hr.read_double()!)
+        elif tag.field == 11:
+            lo = hr.read_double()!
+        elif tag.field == 12:
+            hi = hr.read_double()!
+        else:
+            hr.skip(tag.wire)!
+    assert_eq(count, 3)
+    assert_eq(bounds.len(), 2)
+    assert_eq(bounds[0], 10.0)
+    assert_eq(bounds[1], 100.0)
+    # per-bucket, non-cumulative, with a +Inf overflow entry: 1, 1, 1.
+    assert_eq(counts.len(), 3)
+    assert_eq(counts[0], 1)
+    assert_eq(counts[1], 1)
+    assert_eq(counts[2], 1)
+    assert_eq(lo, 5.0)
+    assert_eq(hi, 500.0)
+
+test "a metric encodes its description and unit":
+    metrics.reset()
+    metrics.counter("requests_total").describe("total requests handled", "1").inc()
+    encoded := encode_metrics("svc", metrics.snapshot())!
+
+    resource_metrics := first_message(encoded, 1)!
+    scope_metrics := first_message(resource_metrics, 2)!
+
+    mut desc := ""
+    mut unit := ""
+    sm := protobuf.reader(scope_metrics)
+    while not sm.at_end():
+        tag := sm.read_tag()!
+        if tag.field != 2:
+            sm.skip(tag.wire)!
+            continue
+        metric := sm.read_message()!
+        mut name := ""
+        mut d := ""
+        mut u := ""
+        mr := protobuf.reader(metric)
+        while not mr.at_end():
+            mt := mr.read_tag()!
+            if mt.field == 1:
+                name = mr.read_string()!
+            elif mt.field == 2:
+                d = mr.read_string()!
+            elif mt.field == 3:
+                u = mr.read_string()!
+            else:
+                mr.skip(mt.wire)!
+        if name == "requests_total":
+            desc = d
+            unit = u
+    assert_eq(desc, "total requests handled")
+    assert_eq(unit, "1")
 
 test "empty exports are a no-op":
     empty_spans: List[trace.Span] := []

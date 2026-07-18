@@ -31,12 +31,19 @@ OTEL_PROTOCOL := "OTEL_EXPORTER_OTLP_PROTOCOL"
 OTEL_METRIC_INTERVAL := "OTEL_METRIC_EXPORT_INTERVAL"
 # the batch-span-processor schedule delay controls how often spans are flushed.
 OTEL_SPAN_DELAY := "OTEL_BSP_SCHEDULE_DELAY"
+# the head sampler and its argument (a probability for the traceidratio modes).
+OTEL_SAMPLER := "OTEL_TRACES_SAMPLER"
+OTEL_SAMPLER_ARG := "OTEL_TRACES_SAMPLER_ARG"
 
 # the default service.name when OTEL_SERVICE_NAME is unset.
 DEFAULT_SERVICE_NAME := "pith-service"
 # default metric export interval (ms) and span flush interval (ms).
 DEFAULT_METRIC_INTERVAL_MS := 60000
 DEFAULT_SPAN_DELAY_MS := 5000
+# the OTel-default sampler: honor a parent's decision, sample new roots. its
+# probability default (1.0) is passed as a literal at the call site rather than a
+# module constant, because a module-level float constant is miscompiled to zero.
+DEFAULT_SAMPLER := "parentbased_always_on"
 
 # guards the two flags below so init/shutdown and the loop agree on state.
 mut obs_mu := Mutex()
@@ -102,9 +109,10 @@ fn resolve_instance_id(explicit: String) -> String:
 # start tracing + metrics export against an explicit target and intervals. this
 # is what init() calls after reading the environment; call it directly to
 # configure the exporter in code rather than from OTEL_* variables. the version
-# and instance id enrich the OTLP resource (either may be "" to omit it).
-# idempotent.
-pub fn start(service_name: String, service_version: String, service_instance_id: String, endpoint: String, protocol: String, metric_interval_ms: Int, span_delay_ms: Int):
+# and instance id enrich the OTLP resource (either may be "" to omit it). the
+# sampler_name/sampler_arg pick the head sampler (see std.trace, e.g.
+# "parentbased_always_on" or "traceidratio" with a probability). idempotent.
+pub fn start(service_name: String, service_version: String, service_instance_id: String, endpoint: String, protocol: String, metric_interval_ms: Int, span_delay_ms: Int, sampler_name: String, sampler_arg: Float):
     if endpoint == "":
         return
     obs_mu.lock()
@@ -116,6 +124,9 @@ pub fn start(service_name: String, service_version: String, service_instance_id:
     obs_mu.unlock()
 
     dest := otlp.target_with_resource(service_name, service_version, service_instance_id, endpoint, protocol)
+    # install the sampler before turning tracing on so the first span already
+    # sees the right decision.
+    trace.set_sampler_from_name(sampler_name, sampler_arg)
     trace.set_active(true)
     trace.set_sink(true)
     tick := loop_tick(span_delay_ms, metric_interval_ms)
@@ -136,7 +147,9 @@ pub fn init():
     protocol := env.str_or(OTEL_PROTOCOL, otlp.PROTOCOL_HTTP)
     metric_interval := env.int_or(OTEL_METRIC_INTERVAL, DEFAULT_METRIC_INTERVAL_MS)
     span_delay := env.int_or(OTEL_SPAN_DELAY, DEFAULT_SPAN_DELAY_MS)
-    start(service_name, service_version, service_instance_id, endpoint, protocol, metric_interval, span_delay)
+    sampler := env.str_or(OTEL_SAMPLER, DEFAULT_SAMPLER)
+    sampler_arg := env.float_or(OTEL_SAMPLER_ARG, 1.0)
+    start(service_name, service_version, service_instance_id, endpoint, protocol, metric_interval, span_delay, sampler, sampler_arg)
 
 # whether the exporter is currently running (init has run and shutdown has not).
 pub fn active() -> Bool:
@@ -169,7 +182,7 @@ test "the loop tick is the smaller interval and never zero":
     assert_eq(loop_tick(0, 60000), 1)
 
 test "start with an empty endpoint is a no-op":
-    start("svc", "1.0.0", "instance-1", "", otlp.PROTOCOL_HTTP, 60000, 5000)
+    start("svc", "1.0.0", "instance-1", "", otlp.PROTOCOL_HTTP, 60000, 5000, "parentbased_always_on", 1.0)
     assert(not active())
     shutdown()
 

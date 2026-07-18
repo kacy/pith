@@ -12,19 +12,25 @@
 #
 # std.obs.init wires this up from the environment; you rarely call it directly.
 #
-# scope (v1): spans with string attributes and a status; counter and gauge
-# metrics in full; histograms as a count+sum data point (no per-bucket detail,
-# see encode_metrics). transport is OTLP/HTTP only — grpc is not implemented.
+# scope (v1): spans with typed (string/int/bool/double) attributes and a status;
+# counter and gauge metrics in full; histograms as a count+sum data point (no
+# per-bucket detail, see encode_metrics). transport is OTLP/HTTP only — grpc is
+# not implemented.
 
 import std.bytes as bytes
 import std.encoding as encoding
+import std.env as env
 import std.metrics as metrics
 import std.net.http as http
 import std.net.tls as tls
 import std.net.url as url_mod
 import std.protobuf as protobuf
+import std.strings as strings
 import std.time as time
 import std.trace as trace
+
+# the telemetry.sdk.version reported on every exported resource.
+SDK_VERSION := "0.1.0"
 
 # the OTLP/HTTP protocol value obs uses by default.
 pub PROTOCOL_HTTP := "http/protobuf"
@@ -45,6 +51,10 @@ CUMULATIVE := 2
 # service.name. build one with target() from an OTEL_EXPORTER_OTLP_ENDPOINT.
 pub struct Target:
     pub service_name: String
+    # the resource's service.version ("" when unset); reported as a resource attr.
+    pub service_version: String
+    # the resource's service.instance.id ("" when unset); reported as a resource attr.
+    pub service_instance_id: String
     pub host: String
     pub port: Int
     pub use_tls: Bool
@@ -55,8 +65,16 @@ pub struct Target:
 
 # build a Target from a service name, an endpoint like http://host:4318, and a
 # protocol. an https endpoint turns tls on; a missing port defaults to 4318. a
-# trailing "/" on the endpoint path is dropped so /v1/traces joins cleanly.
+# trailing "/" on the endpoint path is dropped so /v1/traces joins cleanly. the
+# resource carries only service.name; use target_with_resource to add a version
+# and instance id.
 pub fn target(service_name: String, endpoint: String, protocol: String) -> Target:
+    return target_with_resource(service_name, "", "", endpoint, protocol)
+
+# like target(), but also records a service.version and service.instance.id on
+# the resource (either may be "" to omit it). std.obs fills these in from the
+# environment and a generated instance id.
+pub fn target_with_resource(service_name: String, service_version: String, service_instance_id: String, endpoint: String, protocol: String) -> Target:
     parsed := url_mod.parse(endpoint)
     use_tls := parsed.scheme == "https"
     mut port := parsed.port
@@ -67,7 +85,7 @@ pub fn target(service_name: String, endpoint: String, protocol: String) -> Targe
         base_path = ""
     if base_path.len() > 0 and base_path.ends_with("/"):
         base_path = base_path.substring(0, base_path.len() - 1)
-    return Target(service_name, parsed.host, port, use_tls, base_path, protocol)
+    return Target(service_name, service_version, service_instance_id, parsed.host, port, use_tls, base_path, protocol)
 
 # --- trace encoding ---------------------------------------------------------
 
@@ -91,27 +109,48 @@ fn id_bytes(hex: String, width: Int) -> Bytes:
     buf.free()
     return out
 
-# encode one KeyValue { key = 1, value = AnyValue { string_value = 1 } }. every
-# pith attribute value is a string, so string_value is all we need.
-fn encode_key_value(key: String, value: String) -> Bytes!protobuf.ProtoError:
+# encode one KeyValue { key = 1, value = AnyValue { ... } } for a typed span
+# attribute. the AnyValue field is chosen by the attribute's kind:
+# string_value=1, bool_value=2, int_value=3, double_value=4.
+fn encode_attr(attr: trace.Attr) -> Bytes!protobuf.ProtoError:
     any_value := protobuf.writer()
-    any_value.write_string(1, value)!
+    if attr.kind == trace.ATTR_INT:
+        any_value.write_int64(3, attr.i)!
+    elif attr.kind == trace.ATTR_BOOL:
+        any_value.write_bool(2, attr.b)!
+    elif attr.kind == trace.ATTR_FLOAT:
+        any_value.write_double(4, attr.f)!
+    else:
+        any_value.write_string(1, attr.s)!
     any_bytes := any_value.bytes()
     any_value.free()
 
     kv := protobuf.writer()
-    kv.write_string(1, key)!
+    kv.write_string(1, attr.key)!
     kv.write_message(2, any_bytes)!
     out := kv.bytes()
     kv.free()
     return out
 
-# write a flat [k1,v1,k2,v2,...] attribute list as repeated KeyValue messages
-# under the given field number.
-fn write_attributes(w: protobuf.Writer, field: Int, pairs: List[String]) -> Bool!protobuf.ProtoError:
+# encode one KeyValue with a plain string value — used for resource attributes,
+# which are always strings. a thin wrapper over encode_attr.
+fn encode_string_key_value(key: String, value: String) -> Bytes!protobuf.ProtoError:
+    return encode_attr(trace.Attr(key, trace.ATTR_STRING, value, 0, false, 0.0))!
+
+# write a list of typed attributes as repeated KeyValue messages under the given
+# field number (span attributes are field 9).
+fn write_attributes(w: protobuf.Writer, field: Int, attrs: List[trace.Attr]) -> Bool!protobuf.ProtoError:
+    for attr in attrs:
+        w.write_message(field, encode_attr(attr)!)!
+    return true
+
+# write a flat [k1,v1,k2,v2,...] string attribute list as repeated KeyValue
+# messages under the given field number. metric labels are string-only, so they
+# ride the simpler flat representation rather than typed Attrs.
+fn write_string_attributes(w: protobuf.Writer, field: Int, pairs: List[String]) -> Bool!protobuf.ProtoError:
     mut i := 0
     while i + 1 < pairs.len():
-        w.write_message(field, encode_key_value(pairs[i], pairs[i + 1])!)!
+        w.write_message(field, encode_string_key_value(pairs[i], pairs[i + 1])!)!
         i = i + 2
     return true
 
@@ -138,17 +177,52 @@ fn encode_span(span: trace.Span) -> Bytes!protobuf.ProtoError:
     w.write_enum(6, span.kind)!
     w.write_fixed64(7, span.start_unix_ns)!
     w.write_fixed64(8, span.end_unix_ns)!
-    write_attributes(w, 9, span.attr_pairs)!
+    write_attributes(w, 9, span.attrs)!
     if span.status != trace.STATUS_UNSET or span.status_message != "":
         w.write_message(15, encode_status(span.status, span.status_message)!)!
     out := w.bytes()
     w.free()
     return out
 
-# encode a Resource { attributes = 1 } carrying just service.name.
-fn encode_resource(service_name: String) -> Bytes!protobuf.ProtoError:
+# the environment variable carrying extra resource attributes, as "k1=v1,k2=v2".
+OTEL_RESOURCE_ATTRIBUTES := "OTEL_RESOURCE_ATTRIBUTES"
+
+# parse an OTEL_RESOURCE_ATTRIBUTES spec ("k1=v1,k2=v2") into string attributes.
+# each entry is split once on "=", key and value are trimmed, and any entry
+# without a "=" or with an empty key is skipped.
+fn parse_resource_attributes(spec: String) -> List[trace.Attr]:
+    mut out: List[trace.Attr] := []
+    for entry in spec.split(","):
+        pair := strings.split_once(entry, "=")
+        if not pair.found:
+            continue
+        key := pair.left.trim()
+        value := pair.right.trim()
+        if key == "":
+            continue
+        out.push(trace.Attr(key, trace.ATTR_STRING, value, 0, false, 0.0))
+    return out
+
+# the extra resource attributes from OTEL_RESOURCE_ATTRIBUTES, or an empty list.
+fn resource_env_attrs() -> List[trace.Attr]:
+    return parse_resource_attributes(env.str_or(OTEL_RESOURCE_ATTRIBUTES, ""))
+
+# encode a Resource { attributes = 1 }. it always carries service.name and the
+# telemetry.sdk.* identity; service.version and service.instance.id are included
+# when set on the target. `extra` holds any OTEL_RESOURCE_ATTRIBUTES pairs, which
+# are appended as-is (they do not replace the reserved keys above).
+fn encode_resource(cfg: Target, extra: List[trace.Attr]) -> Bytes!protobuf.ProtoError:
     w := protobuf.writer()
-    w.write_message(1, encode_key_value("service.name", service_name)!)!
+    w.write_message(1, encode_string_key_value("service.name", cfg.service_name)!)!
+    if cfg.service_version != "":
+        w.write_message(1, encode_string_key_value("service.version", cfg.service_version)!)!
+    if cfg.service_instance_id != "":
+        w.write_message(1, encode_string_key_value("service.instance.id", cfg.service_instance_id)!)!
+    w.write_message(1, encode_string_key_value("telemetry.sdk.name", "pith")!)!
+    w.write_message(1, encode_string_key_value("telemetry.sdk.language", "pith")!)!
+    w.write_message(1, encode_string_key_value("telemetry.sdk.version", SDK_VERSION)!)!
+    for attr in extra:
+        w.write_message(1, encode_attr(attr)!)!
     out := w.bytes()
     w.free()
     return out
@@ -163,8 +237,9 @@ fn encode_scope() -> Bytes!protobuf.ProtoError:
 
 # encode an ExportTraceServiceRequest for these spans: a single ResourceSpans
 # (resource=1, scope_spans=2) with one ScopeSpans (scope=1, spans=2) holding
-# every span. an empty span list still produces a valid (empty-of-spans) request.
-pub fn encode_traces(service_name: String, spans: List[trace.Span]) -> Bytes!protobuf.ProtoError:
+# every span. the target supplies the resource; an empty span list still
+# produces a valid (empty-of-spans) request.
+pub fn encode_traces(cfg: Target, spans: List[trace.Span]) -> Bytes!protobuf.ProtoError:
     scope_spans := protobuf.writer()
     scope_spans.write_message(1, encode_scope()!)!
     for span in spans:
@@ -173,7 +248,7 @@ pub fn encode_traces(service_name: String, spans: List[trace.Span]) -> Bytes!pro
     scope_spans.free()
 
     resource_spans := protobuf.writer()
-    resource_spans.write_message(1, encode_resource(service_name)!)!
+    resource_spans.write_message(1, encode_resource(cfg, resource_env_attrs())!)!
     resource_spans.write_message(2, scope_spans_bytes)!
     resource_spans_bytes := resource_spans.bytes()
     resource_spans.free()
@@ -193,7 +268,7 @@ fn encode_number_point(value: Float, now_ns: Int, labels: List[String]) -> Bytes
     w := protobuf.writer()
     w.write_double(1, value)!
     w.write_fixed64(3, now_ns)!
-    write_attributes(w, 7, labels)!
+    write_string_attributes(w, 7, labels)!
     out := w.bytes()
     w.free()
     return out
@@ -220,7 +295,7 @@ fn encode_histogram_point(sample: metrics.MetricSample, now_ns: Int) -> Bytes!pr
     w.write_fixed64(6, count - prev)!
     for bound in sample.bucket_bounds:
         w.write_double(7, bound)!
-    write_attributes(w, 9, sample.labels)!
+    write_string_attributes(w, 9, sample.labels)!
     if count > 0:
         w.write_double(11, sample.min)!
         w.write_double(12, sample.max)!
@@ -281,8 +356,8 @@ fn encode_metric(sample: metrics.MetricSample, now_ns: Int) -> Bytes!protobuf.Pr
 
 # encode an ExportMetricsServiceRequest for these samples: a single
 # ResourceMetrics (resource=1, scope_metrics=2) with one ScopeMetrics
-# (scope=1, metrics=2) holding every metric.
-pub fn encode_metrics(service_name: String, samples: List[metrics.MetricSample]) -> Bytes!protobuf.ProtoError:
+# (scope=1, metrics=2) holding every metric. the target supplies the resource.
+pub fn encode_metrics(cfg: Target, samples: List[metrics.MetricSample]) -> Bytes!protobuf.ProtoError:
     now_ns := time.now() * 1000000
     scope_metrics := protobuf.writer()
     scope_metrics.write_message(1, encode_scope()!)!
@@ -292,7 +367,7 @@ pub fn encode_metrics(service_name: String, samples: List[metrics.MetricSample])
     scope_metrics.free()
 
     resource_metrics := protobuf.writer()
-    resource_metrics.write_message(1, encode_resource(service_name)!)!
+    resource_metrics.write_message(1, encode_resource(cfg, resource_env_attrs())!)!
     resource_metrics.write_message(2, scope_metrics_bytes)!
     resource_metrics_bytes := resource_metrics.bytes()
     resource_metrics.free()
@@ -325,7 +400,7 @@ pub fn export_traces(cfg: Target, spans: List[trace.Span]) -> Bool!:
         return true
     if cfg.protocol == PROTOCOL_GRPC:
         fail "otlp: grpc transport is not implemented; use http/protobuf"
-    encoded := encode_traces(cfg.service_name, spans)
+    encoded := encode_traces(cfg, spans)
     if encoded.is_err:
         fail "otlp: encode traces: " + encoded.err.message
     return post_signal(cfg, "/v1/traces", encoded.ok)
@@ -337,7 +412,7 @@ pub fn export_metrics(cfg: Target, samples: List[metrics.MetricSample]) -> Bool!
         return true
     if cfg.protocol == PROTOCOL_GRPC:
         fail "otlp: grpc transport is not implemented; use http/protobuf"
-    encoded := encode_metrics(cfg.service_name, samples)
+    encoded := encode_metrics(cfg, samples)
     if encoded.is_err:
         fail "otlp: encode metrics: " + encoded.err.message
     return post_signal(cfg, "/v1/metrics", encoded.ok)
@@ -355,6 +430,33 @@ fn first_message(data: Bytes, field: Int) -> Bytes!protobuf.ProtoError:
             return r.read_message()!
         r.skip(tag.wire)!
     fail protobuf.ProtoError("field not found")
+
+# read every embedded message at `field`, in order. the attribute round-trip
+# tests use it to pull out each KeyValue.
+fn read_messages(data: Bytes, field: Int) -> List[Bytes]!protobuf.ProtoError:
+    mut out: List[Bytes] := []
+    r := protobuf.reader(data)
+    while not r.at_end():
+        tag := r.read_tag()!
+        if tag.field == field and tag.wire == protobuf.WIRE_LEN:
+            out.push(r.read_message()!)
+        else:
+            r.skip(tag.wire)!
+    return out
+
+# the string value of the resource attribute named `key`, or "" when absent.
+# resource attributes are all strings, so their AnyValue is always string_value.
+fn resource_attr(resource: Bytes, key: String) -> String!protobuf.ProtoError:
+    for kv in read_messages(resource, 1)!:
+        r := protobuf.reader(kv)
+        r.read_tag()!                 # key
+        found_key := r.read_string()!
+        r.read_tag()!                 # value (AnyValue)
+        any_value := protobuf.reader(r.read_message()!)
+        any_value.read_tag()!         # string_value
+        if found_key == key:
+            return any_value.read_string()!
+    return ""
 
 fn sample_span() -> trace.Span:
     trace.set_active(true)
@@ -386,7 +488,8 @@ test "config defaults the port and reads https as tls":
 
 test "a trace request round-trips through the reader":
     span := sample_span()
-    encoded := encode_traces("checkout", [span])!
+    cfg := target("checkout", "http://collector.local:4318", PROTOCOL_HTTP)
+    encoded := encode_traces(cfg, [span])!
 
     # ExportTraceServiceRequest.resource_spans[0]
     resource_spans := first_message(encoded, 1)!
@@ -447,7 +550,7 @@ fn first_attr_value(point: Bytes) -> String!protobuf.ProtoError:
 test "a counter encodes as a monotonic sum with an int data point":
     metrics.reset()
     metrics.counter("requests_total").labels(["route", "/api"]).add(5.0)
-    encoded := encode_metrics("checkout", metrics.snapshot())!
+    encoded := encode_metrics(target("checkout", "http://collector.local:4318", PROTOCOL_HTTP), metrics.snapshot())!
 
     resource_metrics := first_message(encoded, 1)!
     scope_metrics := first_message(resource_metrics, 2)!
@@ -498,7 +601,7 @@ test "a histogram encodes count and sum on its data point":
     h := metrics.histogram("latency_ms")
     h.observe(10.0)
     h.observe(30.0)
-    encoded := encode_metrics("checkout", metrics.snapshot())!
+    encoded := encode_metrics(target("checkout", "http://collector.local:4318", PROTOCOL_HTTP), metrics.snapshot())!
 
     resource_metrics := first_message(encoded, 1)!
     scope_metrics := first_message(resource_metrics, 2)!
@@ -526,7 +629,7 @@ test "a histogram encodes explicit buckets, min, and max":
     h.observe(5.0)      # falls in the <=10 bucket
     h.observe(50.0)     # falls in the (10,100] bucket
     h.observe(500.0)    # overflow, above the last bound
-    encoded := encode_metrics("checkout", metrics.snapshot())!
+    encoded := encode_metrics(target("checkout", "http://collector.local:4318", PROTOCOL_HTTP), metrics.snapshot())!
 
     resource_metrics := first_message(encoded, 1)!
     scope_metrics := first_message(resource_metrics, 2)!
@@ -569,7 +672,7 @@ test "a histogram encodes explicit buckets, min, and max":
 test "a metric encodes its description and unit":
     metrics.reset()
     metrics.counter("requests_total").describe("total requests handled", "1").inc()
-    encoded := encode_metrics("svc", metrics.snapshot())!
+    encoded := encode_metrics(target("svc", "http://collector.local:4318", PROTOCOL_HTTP), metrics.snapshot())!
 
     resource_metrics := first_message(encoded, 1)!
     scope_metrics := first_message(resource_metrics, 2)!
@@ -609,3 +712,90 @@ test "empty exports are a no-op":
     cfg := target("svc", "http://127.0.0.1:4318", PROTOCOL_HTTP)
     assert(export_traces(cfg, empty_spans)!)
     assert(export_metrics(cfg, empty_samples)!)
+
+test "each attribute type encodes to its AnyValue field":
+    trace.set_active(true)
+    trace.set_sink(true)
+    trace.clear_context()
+    span := trace.start("work")
+    span.set_attr("str", "hi").set_attr_int("num", 7).set_attr_bool("flag", true).set_attr_float("ratio", 1.5)
+    span.end()
+    spans := trace.drain_finished_spans()
+    trace.set_active(false)
+    trace.set_sink(false)
+
+    span_bytes := encode_span(spans[0])!
+    attrs := read_messages(span_bytes, 9)!    # Span.attributes
+    assert_eq(attrs.len(), 4)
+
+    # string -> AnyValue.string_value = 1
+    sr := protobuf.reader(attrs[0])
+    sr.read_tag()!
+    assert_eq(sr.read_string()!, "str")
+    sr.read_tag()!
+    sv := protobuf.reader(sr.read_message()!)
+    s_tag := sv.read_tag()!
+    assert_eq(s_tag.field, 1)
+    assert_eq(sv.read_string()!, "hi")
+
+    # int -> AnyValue.int_value = 3
+    ir := protobuf.reader(attrs[1])
+    ir.read_tag()!
+    assert_eq(ir.read_string()!, "num")
+    ir.read_tag()!
+    iv := protobuf.reader(ir.read_message()!)
+    i_tag := iv.read_tag()!
+    assert_eq(i_tag.field, 3)
+    assert_eq(iv.read_int64()!, 7)
+
+    # bool -> AnyValue.bool_value = 2
+    br := protobuf.reader(attrs[2])
+    br.read_tag()!
+    assert_eq(br.read_string()!, "flag")
+    br.read_tag()!
+    bv := protobuf.reader(br.read_message()!)
+    b_tag := bv.read_tag()!
+    assert_eq(b_tag.field, 2)
+    assert(bv.read_bool()!)
+
+    # float -> AnyValue.double_value = 4
+    fr := protobuf.reader(attrs[3])
+    fr.read_tag()!
+    assert_eq(fr.read_string()!, "ratio")
+    fr.read_tag()!
+    fv := protobuf.reader(fr.read_message()!)
+    f_tag := fv.read_tag()!
+    assert_eq(f_tag.field, 4)
+    assert_eq(fv.read_double()!, 1.5)
+
+test "the resource carries service identity, sdk info, and extra attributes":
+    cfg := target_with_resource("checkout", "1.2.3", "instance-7", "http://collector.local:4318", PROTOCOL_HTTP)
+    extra := parse_resource_attributes("deployment.environment=prod")
+    resource := encode_resource(cfg, extra)!
+    assert_eq(resource_attr(resource, "service.name")!, "checkout")
+    assert_eq(resource_attr(resource, "service.version")!, "1.2.3")
+    assert_eq(resource_attr(resource, "service.instance.id")!, "instance-7")
+    assert_eq(resource_attr(resource, "telemetry.sdk.name")!, "pith")
+    assert_eq(resource_attr(resource, "telemetry.sdk.language")!, "pith")
+    assert_eq(resource_attr(resource, "telemetry.sdk.version")!, SDK_VERSION)
+    assert_eq(resource_attr(resource, "deployment.environment")!, "prod")
+
+test "the resource omits an unset version and instance id":
+    cfg := target("svc", "http://collector.local:4318", PROTOCOL_HTTP)
+    no_extra: List[trace.Attr] := []
+    resource := encode_resource(cfg, no_extra)!
+    assert_eq(resource_attr(resource, "service.name")!, "svc")
+    # absent optional keys read back as "".
+    assert_eq(resource_attr(resource, "service.version")!, "")
+    assert_eq(resource_attr(resource, "service.instance.id")!, "")
+
+test "the resource-attributes parser splits k=v pairs and skips junk":
+    parsed := parse_resource_attributes("region=us-east, tier = gold ,,broken,empty=")
+    assert_eq(parsed.len(), 3)
+    assert_eq(parsed[0].key, "region")
+    assert_eq(parsed[0].s, "us-east")
+    assert_eq(parsed[1].key, "tier")     # surrounding spaces trimmed
+    assert_eq(parsed[1].s, "gold")
+    assert_eq(parsed[2].key, "empty")    # empty value is kept
+    assert_eq(parsed[2].s, "")
+    assert_eq(parse_resource_attributes("").len(), 0)

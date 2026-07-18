@@ -20,9 +20,12 @@ import std.metrics as metrics
 import std.otlp as otlp
 import std.time as time
 import std.trace as trace
+import std.uuid as uuid
 
 # environment variable names, matching the OpenTelemetry SDK conventions.
 OTEL_SERVICE_NAME := "OTEL_SERVICE_NAME"
+OTEL_SERVICE_VERSION := "OTEL_SERVICE_VERSION"
+OTEL_SERVICE_INSTANCE_ID := "OTEL_SERVICE_INSTANCE_ID"
 OTEL_ENDPOINT := "OTEL_EXPORTER_OTLP_ENDPOINT"
 OTEL_PROTOCOL := "OTEL_EXPORTER_OTLP_PROTOCOL"
 OTEL_METRIC_INTERVAL := "OTEL_METRIC_EXPORT_INTERVAL"
@@ -89,10 +92,19 @@ fn loop_tick(span_delay: Int, metric_interval: Int) -> Int:
         return 1
     return tick
 
+# the service.instance.id to report: the explicit id when given, otherwise a
+# freshly generated uuid so each process is distinguishable in the collector.
+fn resolve_instance_id(explicit: String) -> String:
+    if explicit != "":
+        return explicit
+    return uuid.v7() catch (uuid.v4() catch "")
+
 # start tracing + metrics export against an explicit target and intervals. this
 # is what init() calls after reading the environment; call it directly to
-# configure the exporter in code rather than from OTEL_* variables. idempotent.
-pub fn start(service_name: String, endpoint: String, protocol: String, metric_interval_ms: Int, span_delay_ms: Int):
+# configure the exporter in code rather than from OTEL_* variables. the version
+# and instance id enrich the OTLP resource (either may be "" to omit it).
+# idempotent.
+pub fn start(service_name: String, service_version: String, service_instance_id: String, endpoint: String, protocol: String, metric_interval_ms: Int, span_delay_ms: Int):
     if endpoint == "":
         return
     obs_mu.lock()
@@ -103,7 +115,7 @@ pub fn start(service_name: String, endpoint: String, protocol: String, metric_in
     running = true
     obs_mu.unlock()
 
-    dest := otlp.target(service_name, endpoint, protocol)
+    dest := otlp.target_with_resource(service_name, service_version, service_instance_id, endpoint, protocol)
     trace.set_active(true)
     trace.set_sink(true)
     tick := loop_tick(span_delay_ms, metric_interval_ms)
@@ -119,10 +131,12 @@ pub fn init():
     if endpoint == "":
         return
     service_name := env.str_or(OTEL_SERVICE_NAME, DEFAULT_SERVICE_NAME)
+    service_version := env.str_or(OTEL_SERVICE_VERSION, "")
+    service_instance_id := resolve_instance_id(env.str_or(OTEL_SERVICE_INSTANCE_ID, ""))
     protocol := env.str_or(OTEL_PROTOCOL, otlp.PROTOCOL_HTTP)
     metric_interval := env.int_or(OTEL_METRIC_INTERVAL, DEFAULT_METRIC_INTERVAL_MS)
     span_delay := env.int_or(OTEL_SPAN_DELAY, DEFAULT_SPAN_DELAY_MS)
-    start(service_name, endpoint, protocol, metric_interval, span_delay)
+    start(service_name, service_version, service_instance_id, endpoint, protocol, metric_interval, span_delay)
 
 # whether the exporter is currently running (init has run and shutdown has not).
 pub fn active() -> Bool:
@@ -155,6 +169,11 @@ test "the loop tick is the smaller interval and never zero":
     assert_eq(loop_tick(0, 60000), 1)
 
 test "start with an empty endpoint is a no-op":
-    start("svc", "", otlp.PROTOCOL_HTTP, 60000, 5000)
+    start("svc", "1.0.0", "instance-1", "", otlp.PROTOCOL_HTTP, 60000, 5000)
     assert(not active())
     shutdown()
+
+test "resolve_instance_id keeps an explicit id and generates one otherwise":
+    assert_eq(resolve_instance_id("instance-1"), "instance-1")
+    generated := resolve_instance_id("")
+    assert(generated.len() > 0)

@@ -1,0 +1,11 @@
+# a same-named enum (Color) in two modules must not collide: each module's match
+# resolves to its own Color. regression for the cross-module type-name clash.
+from clash_color_reader import describe_a
+from clash_color_b import b_pick
+
+fn main() -> Int!:
+    print(describe_a())
+    match b_pick():
+        Color.Circle(n) => print("circle {n}")
+        Color.Square(n) => print("square {n}")
+    return 0

@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore memcheck test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier memcheck test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -847,6 +847,29 @@ green-semaphore: build
 		echo "FAIL output differs"; \
 		echo "  os-thread: $$off"; \
 		echo "  green:     $$on"; \
+		exit 1; \
+	fi
+
+# --- green-thread barrier drain/release test ---
+# several workers park on one channel while a coordinator drains their arrivals
+# and then releases them. this is the shape that live-locked the single worker:
+# a channel op woke every parked green task, not just the opposite role, so two
+# workers parked on the release channel woke each other forever and starved the
+# coordinator. it completed at two+ workers and on the os-thread backend, so we
+# run it at BOTH a single worker and the default count — a regression here can
+# only be caught at one worker.
+green-barrier: build
+	@echo "--- green-thread barrier drain/release (byte-identical off vs on, 1 and default workers) ---"
+	@off=$$(./target/release/pith run tests/green/barrier.pith 2>/dev/null); \
+	on1=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/barrier.pith 2>/dev/null); \
+	onN=$$(PITH_GREEN=1 ./target/release/pith run tests/green/barrier.pith 2>/dev/null); \
+	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ]; then \
+		echo "ok   identical output at 1 and default workers: $$on1"; \
+	else \
+		echo "FAIL output differs"; \
+		echo "  os-thread:        $$off"; \
+		echo "  green 1 worker:   $$on1"; \
+		echo "  green default:    $$onN"; \
 		exit 1; \
 	fi
 

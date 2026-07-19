@@ -4,15 +4,18 @@
 //! (the main thread, or the whole os-thread task backend) that would block waits
 //! on the channel's `Condvar`, exactly as it always has. a **green task** (under
 //! `PITH_GREEN`) must not park its worker OS thread — instead it registers itself
-//! on the channel's `green_waiters` list and suspends its coroutine back to the
-//! scheduler, freeing the worker to run other tasks; a later send/recv re-enqueues
-//! it. every state change that would `notify` a condvar waiter therefore also
-//! wakes the green waiters, so whichever kind is parked makes progress.
+//! on the channel's green-waiter list *for its role* (sender or receiver) and
+//! suspends its coroutine back to the scheduler, freeing the worker to run other
+//! tasks; a later send/recv re-enqueues it. every state change that would `notify`
+//! a condvar waiter therefore also wakes the green tasks blocked on the opposite
+//! role, so whichever kind is parked makes progress. waking only the opposite role
+//! (never a same-role sibling) is what keeps the backend from live-locking — see
+//! the role note on `wake_green`.
 //!
 //! ## lock order
 //!
 //! when the channel lock and the scheduler's locks nest, the channel lock is
-//! always the outer one: `wake_green_waiters` runs while holding the channel lock
+//! always the outer one: `wake_green` runs while holding the channel lock
 //! and calls `green::wake`, which takes the slab lock and then a queue lock —
 //! channel -> slab -> queue. a parking green task does the reverse-free thing: it
 //! *releases* the channel lock before it suspends (see `block_on_channel`),
@@ -43,13 +46,27 @@ struct ChannelState {
     pending_value: Option<i64>,
     receiver_waiting: usize,
     sender_waiting: usize,
-    /// slab ids of green tasks currently suspended on this channel (senders and
-    /// receivers together). woken on every notify point; each re-checks its own
-    /// condition on resume and re-registers if it still cannot proceed, so mixing
-    /// the two kinds in one list only ever costs a spurious wakeup. empty (and so
-    /// free) whenever no green task is parked here — the os-thread path is
-    /// untouched.
-    green_waiters: Vec<usize>,
+    /// slab ids of green *receivers* suspended on this channel, and of green
+    /// *senders*, kept apart. a notify only ever needs to wake the opposite role:
+    /// a receiver becomes runnable when a sender makes room or deposits a value,
+    /// and vice versa. waking a same-role sibling would only ever wake a task that
+    /// still cannot proceed — harmless for a one-shot os-thread condvar wait, but
+    /// under the green backend that sibling re-parks and re-notifies, so with two+
+    /// same-role green tasks on one worker they wake each other in a tight loop
+    /// that starves everything else (see the role note on `wake_green`). closing
+    /// the channel wakes both lists. empty (and so free) whenever no green task is
+    /// parked here — the os-thread path is untouched.
+    green_receivers: Vec<usize>,
+    green_senders: Vec<usize>,
+}
+
+/// which side of the channel a green task is blocked on. a parking task registers
+/// under its role so a later notify can wake only the opposite role (see
+/// `green_receivers`/`green_senders`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Sender,
+    Receiver,
 }
 
 type PithChannelHandle = Arc<(Mutex<ChannelState>, Condvar)>;
@@ -73,43 +90,59 @@ fn wait_state<'a>(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// wake every green task parked on this channel so it re-checks the condition it
-/// blocked on. paired with each `cvar.notify_all()` so green and os-thread
-/// waiters are signaled together. over-waking is safe: a woken task re-evaluates
-/// under the channel lock and re-parks if it still cannot proceed — the same
-/// tolerance the condvar loops already rely on.
+/// wake the green tasks parked on this channel in the given role so each
+/// re-checks the condition it blocked on. paired with a matching
+/// `cvar.notify_all()` so green and os-thread waiters are signaled together.
+///
+/// `role` says which side to wake, and it is always the *opposite* of whoever is
+/// notifying: a send wakes receivers, a recv wakes senders, a close wakes both.
+/// waking only the opposite role is what keeps the green backend from live-
+/// locking — two receivers (or two senders) parked on one worker must never wake
+/// each other, because the woken sibling cannot make progress and would just
+/// re-park and re-notify forever. over-waking *within* the opposite role is still
+/// safe: a woken task re-evaluates under the channel lock and re-parks if it
+/// still cannot proceed, the same tolerance the condvar loops rely on.
 ///
 /// called while holding the channel lock; `green::wake` nests the slab and queue
 /// locks under it (see the lock-order note above).
-fn wake_green_waiters(state: &mut ChannelState) {
-    if state.green_waiters.is_empty() {
-        return;
-    }
+fn wake_green(state: &mut ChannelState, role: Role) {
     // drain first: a woken task that re-parks will re-add itself, and draining
     // keeps a task from being enqueued twice for one notify.
-    for id in std::mem::take(&mut state.green_waiters) {
+    let list = match role {
+        Role::Receiver => &mut state.green_receivers,
+        Role::Sender => &mut state.green_senders,
+    };
+    if list.is_empty() {
+        return;
+    }
+    for id in std::mem::take(list) {
         green::wake(id);
     }
 }
 
 /// block the current caller until the next notify on this channel, returning the
 /// re-acquired guard. an os-thread caller condvar-waits exactly as before. a
-/// green task registers itself on `green_waiters` (under the channel lock),
-/// releases the lock, and suspends its coroutine back to the scheduler; it
+/// green task registers itself on its role's green-waiter list (under the channel
+/// lock), releases the lock, and suspends its coroutine back to the scheduler; it
 /// re-locks and continues its loop when a later send/recv wakes it.
 fn block_on_channel<'a>(
     lock: &'a Mutex<ChannelState>,
     cvar: &Condvar,
     mut state: MutexGuard<'a, ChannelState>,
     green_task: Option<usize>,
+    role: Role,
 ) -> MutexGuard<'a, ChannelState> {
     match green_task {
         None => wait_state(cvar, state),
         Some(id) => {
-            // register under the lock so a concurrent send cannot miss us, then
+            // register under the lock so a concurrent notify cannot miss us, then
             // release the lock *before* suspending — suspend returns control to
-            // the worker, which may touch this same channel.
-            state.green_waiters.push(id);
+            // the worker, which may touch this same channel. registering under our
+            // role lets the opposite side wake us without waking same-role peers.
+            match role {
+                Role::Receiver => state.green_receivers.push(id),
+                Role::Sender => state.green_senders.push(id),
+            }
             drop(state);
             green::park_current();
             lock_state(lock)
@@ -140,7 +173,8 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
         pending_value: None,
         receiver_waiting: 0,
         sender_waiting: 0,
-        green_waiters: Vec::new(),
+        green_receivers: Vec::new(),
+        green_senders: Vec::new(),
     };
     let channel = Arc::new((Mutex::new(state), Condvar::new()));
     let ptr = Box::into_raw(Box::new(channel));
@@ -170,14 +204,14 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
             if state.receiver_waiting > 0 && state.pending_value.is_none() {
                 state.pending_value = Some(value);
                 cvar.notify_all();
-                wake_green_waiters(&mut state);
+                wake_green(&mut state, Role::Receiver);
                 while !state.closed && state.pending_value.is_some() {
-                    state = block_on_channel(lock, cvar, state, green_task);
+                    state = block_on_channel(lock, cvar, state, green_task, Role::Sender);
                 }
                 return if state.closed { 0 } else { 1 };
             }
             state.sender_waiting += 1;
-            state = block_on_channel(lock, cvar, state, green_task);
+            state = block_on_channel(lock, cvar, state, green_task, Role::Sender);
             state.sender_waiting -= 1;
         }
         return 0;
@@ -185,7 +219,7 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
 
     while !state.closed && state.queue.len() >= state.capacity {
         state.sender_waiting += 1;
-        state = block_on_channel(lock, cvar, state, green_task);
+        state = block_on_channel(lock, cvar, state, green_task, Role::Sender);
         state.sender_waiting -= 1;
     }
 
@@ -195,7 +229,7 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
 
     state.queue.push_back(value);
     cvar.notify_all();
-    wake_green_waiters(&mut state);
+    wake_green(&mut state, Role::Receiver);
     1
 }
 
@@ -217,7 +251,7 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
         }
         state.pending_value = Some(value);
         cvar.notify_all();
-        wake_green_waiters(&mut state);
+        wake_green(&mut state, Role::Receiver);
         1
     } else {
         if state.queue.len() >= state.capacity {
@@ -225,7 +259,7 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
         }
         state.queue.push_back(value);
         cvar.notify_all();
-        wake_green_waiters(&mut state);
+        wake_green(&mut state, Role::Receiver);
         1
     }
 }
@@ -241,15 +275,18 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
 
     loop {
         if let Some(value) = state.queue.pop_front() {
+            // took a queued value: a blocked sender may now have room.
             cvar.notify_all();
-            wake_green_waiters(&mut state);
+            wake_green(&mut state, Role::Sender);
             return optional_tuple(true, value);
         }
 
         if state.capacity == 0 {
             if let Some(value) = state.pending_value.take() {
+                // completed a rendezvous: wake the sender waiting for its value
+                // to be taken.
                 cvar.notify_all();
-                wake_green_waiters(&mut state);
+                wake_green(&mut state, Role::Sender);
                 return optional_tuple(true, value);
             }
         }
@@ -258,10 +295,13 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
             return optional_tuple(false, 0);
         }
 
+        // announce that a receiver is now waiting so a blocked sender can deposit
+        // (the unbuffered rendezvous handshake). only senders need this — waking a
+        // sibling receiver here is exactly what caused the single-worker livelock.
         state.receiver_waiting += 1;
         cvar.notify_all();
-        wake_green_waiters(&mut state);
-        state = block_on_channel(lock, cvar, state, green_task);
+        wake_green(&mut state, Role::Sender);
+        state = block_on_channel(lock, cvar, state, green_task, Role::Receiver);
         state.receiver_waiting -= 1;
     }
 }
@@ -276,13 +316,13 @@ pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
 
     if let Some(value) = state.queue.pop_front() {
         cvar.notify_all();
-        wake_green_waiters(&mut state);
+        wake_green(&mut state, Role::Sender);
         return optional_tuple(true, value);
     }
     if state.capacity == 0 {
         if let Some(value) = state.pending_value.take() {
             cvar.notify_all();
-            wake_green_waiters(&mut state);
+            wake_green(&mut state, Role::Sender);
             return optional_tuple(true, value);
         }
     }
@@ -302,8 +342,10 @@ pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
     state.closed = true;
     state.pending_value = None;
     cvar.notify_all();
-    // wake every parked green sender/receiver so they resume and observe `closed`.
-    wake_green_waiters(&mut state);
+    // wake every parked green sender and receiver so they resume and observe
+    // `closed` — the one notify that legitimately targets both roles.
+    wake_green(&mut state, Role::Sender);
+    wake_green(&mut state, Role::Receiver);
     1
 }
 

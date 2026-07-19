@@ -2,6 +2,7 @@
 
 pub mod atomic_int;
 pub mod channel;
+pub mod green;
 pub mod mutex;
 pub mod scheduler;
 pub mod semaphore;

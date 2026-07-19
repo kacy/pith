@@ -135,8 +135,15 @@ pub(crate) unsafe fn os_thread_await(task_handle: i64) -> i64 {
     }
 }
 
+/// Codegen-facing "is this task done?" entrypoint. Routed through the scheduler
+/// seam so it consults whichever backend actually owns the task.
 #[no_mangle]
-pub unsafe extern "C" fn pith_task_is_done(task_handle: i64) -> i64 {
+pub extern "C" fn pith_task_is_done(task_handle: i64) -> i64 {
+    crate::concurrency::scheduler::task_is_done(task_handle)
+}
+
+/// Poll an os-thread task's done flag: the original, default implementation.
+pub(crate) fn os_thread_is_done(task_handle: i64) -> i64 {
     if !handle_registry::is_valid_id(task_handle, HandleKind::Task) {
         return 0;
     }
@@ -161,8 +168,16 @@ pub unsafe extern "C" fn pith_task_is_done(task_handle: i64) -> i64 {
     0
 }
 
+/// Codegen-facing detach entrypoint. Routed through the scheduler seam, the
+/// mirror of `pith_task_is_done`.
 #[no_mangle]
-pub unsafe extern "C" fn pith_task_detach(task_handle: i64) {
+pub extern "C" fn pith_task_detach(task_handle: i64) {
+    crate::concurrency::scheduler::task_detach(task_handle)
+}
+
+/// Detach an os-thread task (drop its JoinHandle): the original, default
+/// implementation.
+pub(crate) fn os_thread_detach(task_handle: i64) {
     if !handle_registry::is_valid_id(task_handle, HandleKind::Task) {
         return;
     }

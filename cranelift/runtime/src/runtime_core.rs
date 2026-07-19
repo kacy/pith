@@ -1462,6 +1462,21 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// Under the green backend, the map backing the currently-running task's
+/// `threadlocal` globals, or `None` on the default os-thread path (and on any
+/// green worker moment with no task active). Returning `None` means the caller
+/// falls back to the per-OS-thread `TLS_GLOBALS`, so the os-thread path is
+/// untouched: one worker OS thread per task there means per-OS-thread already is
+/// per-task. Under green, one worker runs many tasks, so we must route to the
+/// task's own map instead of sharing the worker's.
+fn green_task_tls() -> Option<*mut std::collections::HashMap<i64, i64>> {
+    use crate::concurrency::scheduler::{backend, Backend};
+    if backend() != Backend::Green {
+        return None;
+    }
+    crate::concurrency::green::current_task_tls()
+}
+
 /// Read this thread's value for a threadlocal global, initializing it on first
 /// access by calling the compiler-generated init thunk. The thunk runs outside
 /// the map borrow so it may touch other threadlocal globals without a re-entrant
@@ -1471,6 +1486,24 @@ thread_local! {
 /// `init_thunk` must be the address of a compiled `extern "C" fn() -> i64`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64 {
+    if let Some(map) = green_task_tls() {
+        // SAFETY: `map` points into the `Box<HashMap>` owned by the green task
+        // currently running on this worker thread. `green` installs it around
+        // `resume` and clears it after, so it is valid for the whole synchronous
+        // duration of this pith call, and only this worker thread touches it. we
+        // take only short-lived borrows: the read borrow ends before we call the
+        // thunk, and the write borrow is created fresh afterward. that mirrors
+        // the `TLS_GLOBALS` path — the thunk may itself touch other threadlocal
+        // slots on the same map without a live borrow being held across it.
+        if let Some(v) = (*map).get(&slot).copied() {
+            return v;
+        }
+        let thunk: extern "C" fn() -> i64 = std::mem::transmute(init_thunk as usize);
+        let value = thunk();
+        (*map).insert(slot, value);
+        return value;
+    }
+
     if let Some(v) = TLS_GLOBALS.with(|t| t.borrow().get(&slot).copied()) {
         return v;
     }
@@ -1489,6 +1522,13 @@ pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64
 /// the same as a plain global assignment.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_set(slot: i64, value: i64) {
+    if let Some(map) = green_task_tls() {
+        // SAFETY: same as `pith_tls_get_or_init` — the pointer targets the
+        // running task's own map, valid and unaliased for this synchronous call
+        // on this worker thread. a single short-lived write borrow.
+        (*map).insert(slot, value);
+        return;
+    }
     TLS_GLOBALS.with(|t| {
         t.borrow_mut().insert(slot, value);
     });

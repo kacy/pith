@@ -41,7 +41,8 @@
 use crate::handle_registry::{self, HandleKind};
 use corosensei::{Coroutine, CoroutineResult};
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::ptr;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock};
 use std::time::Duration;
 
@@ -106,6 +107,17 @@ struct Task {
     state: RunState,
     result: i64,
     join: Arc<(Mutex<Join>, Condvar)>,
+    /// this task's own `threadlocal` module-global storage. under the green
+    /// backend one worker OS thread runs many tasks, so the runtime's per-OS-
+    /// thread `TLS_GLOBALS` map would be shared between them — task B would see
+    /// task A's leftover values. giving each task its own map restores the
+    /// "one set of thread-locals per logical thread of execution" semantics.
+    ///
+    /// boxed on purpose: the `Task` lives in the `Vec` slab, which can reallocate
+    /// (and move every `Task`) when another task spawns mid-run. the `Box`'s heap
+    /// allocation does not move, so a raw pointer to the map stays valid across
+    /// such a realloc. see `run_task` and `current_task_tls`.
+    tls: Box<HashMap<i64, i64>>,
 }
 
 /// one worker's private run queue plus the shared bits it needs. workers are
@@ -137,6 +149,33 @@ thread_local! {
     /// (spawned from inside a task) versus the global injector (spawned from
     /// `main`). a `Cell` because it is written once at worker startup.
     static CURRENT_WORKER: Cell<Option<usize>> = const { Cell::new(None) };
+
+    /// raw pointer to the `tls` map of the task this worker is currently
+    /// resuming, or null when no green task is running on this thread (between
+    /// tasks, or on a non-worker thread). set immediately before `resume` and
+    /// restored immediately after, both inside `run_task`. the runtime's
+    /// `threadlocal` FFI reads it (via `current_task_tls`) to route accesses to
+    /// the running task's own storage instead of the shared per-OS-thread map.
+    static CURRENT_TLS: Cell<*mut HashMap<i64, i64>> = const { Cell::new(ptr::null_mut()) };
+}
+
+/// the `tls` map of the green task currently running on this thread, or `None`
+/// when no green task is active here. the runtime's `threadlocal` FFI consults
+/// this so that, under the green backend, each task reads and writes its own
+/// thread-local globals rather than sharing the worker OS thread's map.
+///
+/// the returned pointer is only valid to dereference synchronously, from this
+/// same thread, before control returns to the scheduler — that is, from within
+/// the pith call that produced this access. `run_task` guarantees the pointed-to
+/// `Box` outlives the whole `resume`, and only this worker thread ever touches
+/// its own current task, so there is no aliasing across threads.
+pub(crate) fn current_task_tls() -> Option<*mut HashMap<i64, i64>> {
+    let ptr = CURRENT_TLS.with(|c| c.get());
+    if ptr.is_null() {
+        None
+    } else {
+        Some(ptr)
+    }
 }
 
 fn lock_slab() -> MutexGuard<'static, Vec<Option<Task>>> {
@@ -326,14 +365,19 @@ fn worker_loop(index: usize) {
 /// code, which may itself spawn), resumed, then either dropped (returned) or put
 /// back (yielded).
 fn run_task(id: TaskId) {
-    // take the coroutine out under the lock, mark it running.
-    let mut coro = {
+    // take the coroutine out under the lock, mark it running, and grab a raw
+    // pointer to this task's boxed thread-local map. the pointer is captured here,
+    // while we still hold the lock, so it is read from a stable view of the slab;
+    // the `Box` it points into does not move even if the slab reallocates later
+    // (see the `tls` field doc).
+    let (mut coro, tls_ptr) = {
         let mut slab = lock_slab();
         match slab.get_mut(id).and_then(|slot| slot.as_mut()) {
             Some(task) if task.state == RunState::Ready => {
                 task.state = RunState::Running;
+                let tls_ptr: *mut HashMap<i64, i64> = &mut *task.tls;
                 match task.coro.take() {
-                    Some(c) => c,
+                    Some(c) => (c, tls_ptr),
                     // a Ready task with no coroutine should be impossible; skip
                     // defensively rather than panic on a corrupt slot.
                     None => return,
@@ -344,9 +388,26 @@ fn run_task(id: TaskId) {
         }
     };
 
+    // install this task's thread-local map for the duration of the resume, then
+    // restore whatever was there before (null in the common case; save/restore
+    // keeps us correct even if resumes ever nest on one worker).
+    //
+    // SAFETY: `tls_ptr` points into the `Box<HashMap>` owned by this task's slab
+    // entry. nothing removes a task from the slab (it only grows), the entry is
+    // not dropped while this coroutine runs, and the `Box` heap allocation is
+    // stable across slab reallocation — so the pointer is valid for the whole
+    // `resume` call below. it is only ever dereferenced by the runtime's
+    // `threadlocal` FFI, synchronously on this same worker thread while this task
+    // is the one running, so no other thread and no other task aliases the map.
+    let prev_tls = CURRENT_TLS.with(|c| c.replace(tls_ptr));
+
     // run outside the lock. SAFETY of the transmute-and-call lives inside the
     // coroutine body (see green_spawn); here we just drive the coroutine.
-    match coro.0.resume(()) {
+    let outcome = coro.0.resume(());
+
+    CURRENT_TLS.with(|c| c.set(prev_tls));
+
+    match outcome {
         CoroutineResult::Return(result) => {
             // record the result, flip done, wake awaiters. drop the coroutine
             // (and its stack) by simply not putting it back.
@@ -449,6 +510,9 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
             state: RunState::Ready,
             result: 0,
             join,
+            // fresh, empty thread-local storage: this task starts with no
+            // threadlocal slots materialized, exactly like a brand-new OS thread.
+            tls: Box::new(HashMap::new()),
         }));
         id
     };

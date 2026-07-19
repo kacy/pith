@@ -3,6 +3,7 @@
 pub mod atomic_int;
 pub mod channel;
 pub mod mutex;
+pub mod scheduler;
 pub mod semaphore;
 pub mod task;
 pub mod waitgroup;

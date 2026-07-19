@@ -1,5 +1,34 @@
 //! channel support for task communication
+//!
+//! a channel serves two kinds of blocked caller at once. an **os-thread** caller
+//! (the main thread, or the whole os-thread task backend) that would block waits
+//! on the channel's `Condvar`, exactly as it always has. a **green task** (under
+//! `PITH_GREEN`) must not park its worker OS thread — instead it registers itself
+//! on the channel's `green_waiters` list and suspends its coroutine back to the
+//! scheduler, freeing the worker to run other tasks; a later send/recv re-enqueues
+//! it. every state change that would `notify` a condvar waiter therefore also
+//! wakes the green waiters, so whichever kind is parked makes progress.
+//!
+//! ## lock order
+//!
+//! when the channel lock and the scheduler's locks nest, the channel lock is
+//! always the outer one: `wake_green_waiters` runs while holding the channel lock
+//! and calls `green::wake`, which takes the slab lock and then a queue lock —
+//! channel -> slab -> queue. a parking green task does the reverse-free thing: it
+//! *releases* the channel lock before it suspends (see `block_on_channel`),
+//! because `suspend` hands control to the worker, which may re-enter this same
+//! channel. so we never hold the channel lock across a suspend, and never take
+//! the channel lock while holding a scheduler lock.
+//!
+//! ## the wake/park race
+//!
+//! a value can arrive between a green task's would-block check and its suspend.
+//! that window is closed on the scheduler side: `green::wake` sees the task still
+//! `Running` (not yet `Parked`) and records a `wake_pending` flag that the park
+//! path re-checks, so the wake is never lost. here we just have to register the
+//! waiter *under the channel lock* before releasing it, which we do.
 
+use crate::concurrency::green;
 use crate::handle_registry::{self, HandleKind};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -14,6 +43,13 @@ struct ChannelState {
     pending_value: Option<i64>,
     receiver_waiting: usize,
     sender_waiting: usize,
+    /// slab ids of green tasks currently suspended on this channel (senders and
+    /// receivers together). woken on every notify point; each re-checks its own
+    /// condition on resume and re-registers if it still cannot proceed, so mixing
+    /// the two kinds in one list only ever costs a spurious wakeup. empty (and so
+    /// free) whenever no green task is parked here — the os-thread path is
+    /// untouched.
+    green_waiters: Vec<usize>,
 }
 
 type PithChannelHandle = Arc<(Mutex<ChannelState>, Condvar)>;
@@ -35,6 +71,50 @@ fn wait_state<'a>(
 ) -> MutexGuard<'a, ChannelState> {
     cvar.wait(state)
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// wake every green task parked on this channel so it re-checks the condition it
+/// blocked on. paired with each `cvar.notify_all()` so green and os-thread
+/// waiters are signaled together. over-waking is safe: a woken task re-evaluates
+/// under the channel lock and re-parks if it still cannot proceed — the same
+/// tolerance the condvar loops already rely on.
+///
+/// called while holding the channel lock; `green::wake` nests the slab and queue
+/// locks under it (see the lock-order note above).
+fn wake_green_waiters(state: &mut ChannelState) {
+    if state.green_waiters.is_empty() {
+        return;
+    }
+    // drain first: a woken task that re-parks will re-add itself, and draining
+    // keeps a task from being enqueued twice for one notify.
+    for id in std::mem::take(&mut state.green_waiters) {
+        green::wake(id);
+    }
+}
+
+/// block the current caller until the next notify on this channel, returning the
+/// re-acquired guard. an os-thread caller condvar-waits exactly as before. a
+/// green task registers itself on `green_waiters` (under the channel lock),
+/// releases the lock, and suspends its coroutine back to the scheduler; it
+/// re-locks and continues its loop when a later send/recv wakes it.
+fn block_on_channel<'a>(
+    lock: &'a Mutex<ChannelState>,
+    cvar: &Condvar,
+    mut state: MutexGuard<'a, ChannelState>,
+    green_task: Option<usize>,
+) -> MutexGuard<'a, ChannelState> {
+    match green_task {
+        None => wait_state(cvar, state),
+        Some(id) => {
+            // register under the lock so a concurrent send cannot miss us, then
+            // release the lock *before* suspending — suspend returns control to
+            // the worker, which may touch this same channel.
+            state.green_waiters.push(id);
+            drop(state);
+            green::park_current();
+            lock_state(lock)
+        }
+    }
 }
 
 fn optional_tuple(is_some: bool, value: i64) -> i64 {
@@ -60,6 +140,7 @@ pub extern "C" fn pith_channel_new(capacity: i64) -> i64 {
         pending_value: None,
         receiver_waiting: 0,
         sender_waiting: 0,
+        green_waiters: Vec::new(),
     };
     let channel = Arc::new((Mutex::new(state), Condvar::new()));
     let ptr = Box::into_raw(Box::new(channel));
@@ -73,6 +154,11 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
         return 0;
     };
     let (lock, cvar) = &**channel;
+    // is this send running inside a green task? if so it yields on a would-block
+    // instead of parking the worker; if not (main thread / os-thread backend) it
+    // condvar-waits exactly as before. computed once — the running task does not
+    // change under us across a suspend/resume.
+    let green_task = green::current_task();
     let mut state = lock_state(lock);
 
     if state.closed {
@@ -84,13 +170,14 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
             if state.receiver_waiting > 0 && state.pending_value.is_none() {
                 state.pending_value = Some(value);
                 cvar.notify_all();
+                wake_green_waiters(&mut state);
                 while !state.closed && state.pending_value.is_some() {
-                    state = wait_state(cvar, state);
+                    state = block_on_channel(lock, cvar, state, green_task);
                 }
                 return if state.closed { 0 } else { 1 };
             }
             state.sender_waiting += 1;
-            state = wait_state(cvar, state);
+            state = block_on_channel(lock, cvar, state, green_task);
             state.sender_waiting -= 1;
         }
         return 0;
@@ -98,7 +185,7 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
 
     while !state.closed && state.queue.len() >= state.capacity {
         state.sender_waiting += 1;
-        state = wait_state(cvar, state);
+        state = block_on_channel(lock, cvar, state, green_task);
         state.sender_waiting -= 1;
     }
 
@@ -108,6 +195,7 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
 
     state.queue.push_back(value);
     cvar.notify_all();
+    wake_green_waiters(&mut state);
     1
 }
 
@@ -129,6 +217,7 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
         }
         state.pending_value = Some(value);
         cvar.notify_all();
+        wake_green_waiters(&mut state);
         1
     } else {
         if state.queue.len() >= state.capacity {
@@ -136,6 +225,7 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
         }
         state.queue.push_back(value);
         cvar.notify_all();
+        wake_green_waiters(&mut state);
         1
     }
 }
@@ -146,17 +236,20 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
         return optional_tuple(false, 0);
     };
     let (lock, cvar) = &**channel;
+    let green_task = green::current_task();
     let mut state = lock_state(lock);
 
     loop {
         if let Some(value) = state.queue.pop_front() {
             cvar.notify_all();
+            wake_green_waiters(&mut state);
             return optional_tuple(true, value);
         }
 
         if state.capacity == 0 {
             if let Some(value) = state.pending_value.take() {
                 cvar.notify_all();
+                wake_green_waiters(&mut state);
                 return optional_tuple(true, value);
             }
         }
@@ -167,7 +260,8 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
 
         state.receiver_waiting += 1;
         cvar.notify_all();
-        state = wait_state(cvar, state);
+        wake_green_waiters(&mut state);
+        state = block_on_channel(lock, cvar, state, green_task);
         state.receiver_waiting -= 1;
     }
 }
@@ -182,11 +276,13 @@ pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
 
     if let Some(value) = state.queue.pop_front() {
         cvar.notify_all();
+        wake_green_waiters(&mut state);
         return optional_tuple(true, value);
     }
     if state.capacity == 0 {
         if let Some(value) = state.pending_value.take() {
             cvar.notify_all();
+            wake_green_waiters(&mut state);
             return optional_tuple(true, value);
         }
     }
@@ -206,6 +302,8 @@ pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
     state.closed = true;
     state.pending_value = None;
     cvar.notify_all();
+    // wake every parked green sender/receiver so they resume and observe `closed`.
+    wake_green_waiters(&mut state);
     1
 }
 

@@ -1,0 +1,45 @@
+# green-thread semaphore — N workers contend for a single permit.
+#
+# every worker loops many times taking and releasing one permit from a semaphore
+# seeded with permits < N. whenever two workers run at once (multiple green
+# workers), the second to call acquire() finds the permit gone and must block;
+# under the green backend that acquire yields the worker instead of parking it,
+# and each release() wakes exactly one waiter (mirroring the condvar notify_one).
+# a lost permit or a missed wake would deadlock the run; a broken counter would
+# drop completions.
+#
+# the invariant is that all N workers finish exactly once: the completion total
+# is the fixed sum of the worker ids, independent of scheduling, so the output is
+# byte-identical to the os-thread backend. bounded concurrency (never more than
+# `permits` inside at a time) is guaranteed by the semaphore itself.
+
+fn worker(sem: Semaphore, done: Channel[Int], id: Int, iters: Int):
+    mut i := 0
+    while i < iters:
+        sem.acquire()
+        # a trivial critical section; the point is the acquire/release contention.
+        sem.release()
+        i = i + 1
+    done.send(id)
+
+fn main() -> Int!:
+    n := 6
+    permits := 1
+    iters := 200
+    sem := Semaphore(permits)
+    done := Channel[Int](n)
+
+    mut i := 0
+    while i < n:
+        spawn worker(sem, done, i, iters)
+        i = i + 1
+
+    # collect one completion per worker; the sum proves each finished exactly once.
+    mut total := 0
+    mut k := 0
+    while k < n:
+        total = total + done.recv().unwrap_or(0)
+        k = k + 1
+
+    print("semaphore: n {n}, permits {permits}, total {total}")
+    return 0

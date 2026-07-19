@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer memcheck test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore memcheck test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -787,6 +787,60 @@ green-producer-consumer: build
 	@echo "--- green-thread producer/consumer (byte-identical off vs on) ---"
 	@off=$$(./target/release/pith run tests/green/producer_consumer.pith 2>/dev/null); \
 	on=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/producer_consumer.pith 2>/dev/null); \
+	if [ "$$off" = "$$on" ]; then \
+		echo "ok   identical output: $$on"; \
+	else \
+		echo "FAIL output differs"; \
+		echo "  os-thread: $$off"; \
+		echo "  green:     $$on"; \
+		exit 1; \
+	fi
+
+# --- green-thread blocking-primitive coordination tests (P2b) ---
+# P2 made channel ops yield the green worker instead of parking it; P2b extends
+# that to waitgroup, semaphore, and mutex. each of these programs coordinates
+# green tasks through one of those primitives such that a would-block op must
+# yield or the run deadlocks.
+#
+# waitgroup and mutex are pinned to a single worker (PITH_GREEN_WORKERS=1): a
+# green task blocks on the primitive while it is the only worker, so the pre-P2b
+# "park the worker" behavior would hang outright. P2b yields instead and the
+# program completes with output byte-identical to the os-thread backend.
+green-waitgroup: build
+	@echo "--- green-thread waitgroup fan-out (byte-identical off vs on) ---"
+	@off=$$(./target/release/pith run tests/green/waitgroup.pith 2>/dev/null); \
+	on=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/waitgroup.pith 2>/dev/null); \
+	if [ "$$off" = "$$on" ]; then \
+		echo "ok   identical output: $$on"; \
+	else \
+		echo "FAIL output differs"; \
+		echo "  os-thread: $$off"; \
+		echo "  green:     $$on"; \
+		exit 1; \
+	fi
+
+green-mutex: build
+	@echo "--- green-thread mutex shared-counter (byte-identical off vs on) ---"
+	@off=$$(./target/release/pith run tests/green/mutex.pith 2>/dev/null); \
+	on=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/mutex.pith 2>/dev/null); \
+	if [ "$$off" = "$$on" ]; then \
+		echo "ok   identical output: $$on"; \
+	else \
+		echo "FAIL output differs"; \
+		echo "  os-thread: $$off"; \
+		echo "  green:     $$on"; \
+		exit 1; \
+	fi
+
+# the semaphore contention only materializes with more than one worker (a single
+# worker runs the tasks serially and never overlaps in the critical section), so
+# this one runs at the default worker count. with permits < tasks the workers
+# repeatedly block acquiring the permit, exercising the green acquire/release
+# yield-and-wake path; the completion total must match the os-thread backend.
+green-semaphore: build
+	@echo "--- green-thread semaphore contention (byte-identical off vs on) ---"
+	@off=$$(./target/release/pith run tests/green/semaphore.pith 2>/dev/null); \
+	on=$$(PITH_GREEN=1 ./target/release/pith run tests/green/semaphore.pith 2>/dev/null); \
 	if [ "$$off" = "$$on" ]; then \
 		echo "ok   identical output: $$on"; \
 	else \

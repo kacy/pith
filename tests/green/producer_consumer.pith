@@ -1,0 +1,43 @@
+# green-thread producer/consumer — a bounded buffer that forces coordination.
+#
+# the producer sends N values through a small buffered channel; the consumer
+# receives N and sums them. both run as green tasks. because the buffer is much
+# smaller than N, the producer must block (buffer full) and the consumer must
+# block (buffer empty) many times, and each only unblocks the other. under the
+# pre-P2 green backend a blocked channel op parked the worker, so with a single
+# worker (PITH_GREEN_WORKERS=1) the producer fills the buffer, blocks, parks the
+# only worker, and the consumer never runs — deadlock. P2 yields on a would-block
+# so the two tasks hand the buffer back and forth to completion.
+#
+# the sum is fully determined by N, so the output is byte-identical to the
+# os-thread backend.
+
+fn producer(ch: Channel[Int], count: Int):
+    mut i := 0
+    while i < count:
+        ch.send(i)
+        i = i + 1
+    ch.close()
+
+fn consumer(ch: Channel[Int]) -> Int:
+    mut total := 0
+    # drain until the producer closes the channel: `while let` loops while recv
+    # yields a value and exits when a closed, empty channel returns none.
+    while let v = ch.recv():
+        total = total + v
+    return total
+
+fn main() -> Int!:
+    count := 50000
+
+    # a buffer far smaller than the message count, so both sides block often.
+    ch := Channel[Int](4)
+
+    p := spawn producer(ch, count)
+    c := spawn consumer(ch)
+
+    total := await c
+    await p
+
+    print("producer/consumer: count {count}, total {total}")
+    return 0

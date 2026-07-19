@@ -1,0 +1,48 @@
+# green-thread ping-pong — two tasks that must coordinate to make progress.
+#
+# unlike the smoke and threadlocal tests, these two tasks are NOT independent:
+# each round the pinger hands a token to the ponger over one rendezvous channel
+# and waits for it back over another. neither can finish without the other
+# running. under the pre-P2 green backend a task that blocks on a channel parked
+# its whole worker OS thread, so with a single worker (PITH_GREEN_WORKERS=1) the
+# first task to block parks the only worker and the program deadlocks. P2 makes a
+# blocked channel op yield the coroutine instead, so the worker runs the other
+# task and the token bounces to completion.
+#
+# the result is fully determined by the inputs, so it is byte-identical to the
+# os-thread backend (which never had this restriction — one OS thread per task).
+
+fn pinger(to_b: Channel[Int], from_b: Channel[Int], rounds: Int) -> Int:
+    mut token := 0
+    mut i := 0
+    while i < rounds:
+        to_b.send(token)
+        token = from_b.recv().unwrap_or(0)
+        i = i + 1
+    return token
+
+fn ponger(from_a: Channel[Int], to_a: Channel[Int], rounds: Int) -> Int:
+    mut seen := 0
+    mut i := 0
+    while i < rounds:
+        v := from_a.recv().unwrap_or(0)
+        # bump the token so the final value encodes how many hops it made.
+        to_a.send(v + 1)
+        seen = seen + 1
+        i = i + 1
+    return seen
+
+fn main() -> Int!:
+    rounds := 100000
+
+    a_to_b := Channel[Int]()
+    b_to_a := Channel[Int]()
+
+    p := spawn pinger(a_to_b, b_to_a, rounds)
+    q := spawn ponger(a_to_b, b_to_a, rounds)
+
+    final := await p
+    seen := await q
+
+    print("pingpong: rounds {rounds}, final {final}, seen {seen}")
+    return 0

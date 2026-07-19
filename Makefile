@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal memcheck test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer memcheck test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -754,6 +754,39 @@ green-threadlocal: build
 	@echo "--- green-thread threadlocal isolation (byte-identical off vs on) ---"
 	@off=$$(./target/release/pith run tests/green/threadlocal.pith 2>/dev/null); \
 	on=$$(PITH_GREEN=1 ./target/release/pith run tests/green/threadlocal.pith 2>/dev/null); \
+	if [ "$$off" = "$$on" ]; then \
+		echo "ok   identical output: $$on"; \
+	else \
+		echo "FAIL output differs"; \
+		echo "  os-thread: $$off"; \
+		echo "  green:     $$on"; \
+		exit 1; \
+	fi
+
+# --- green-thread channel coordination tests (P2) ---
+# these two tasks are NOT independent: they coordinate through channels, so each
+# blocks waiting on the other. we force a single worker (PITH_GREEN_WORKERS=1) so
+# the pre-P2 "block the worker" behavior would deadlock outright — the first task
+# to block parks the only worker and nothing else can run. P2 makes a would-block
+# channel op yield the coroutine instead, so one worker cooperatively runs both
+# tasks to completion. output must stay byte-identical to the os-thread backend.
+green-pingpong: build
+	@echo "--- green-thread channel ping-pong (byte-identical off vs on) ---"
+	@off=$$(./target/release/pith run tests/green/pingpong.pith 2>/dev/null); \
+	on=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/pingpong.pith 2>/dev/null); \
+	if [ "$$off" = "$$on" ]; then \
+		echo "ok   identical output: $$on"; \
+	else \
+		echo "FAIL output differs"; \
+		echo "  os-thread: $$off"; \
+		echo "  green:     $$on"; \
+		exit 1; \
+	fi
+
+green-producer-consumer: build
+	@echo "--- green-thread producer/consumer (byte-identical off vs on) ---"
+	@off=$$(./target/release/pith run tests/green/producer_consumer.pith 2>/dev/null); \
+	on=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/producer_consumer.pith 2>/dev/null); \
 	if [ "$$off" = "$$on" ]; then \
 		echo "ok   identical output: $$on"; \
 	else \

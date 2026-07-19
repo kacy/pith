@@ -1,0 +1,57 @@
+# green-thread threadlocal isolation test — independent fan-out, then join.
+#
+# each task uses a `threadlocal` module global as private, per-task scratch: it
+# reads the global (which lazily initializes to 0 the first time a task touches
+# it), adds its own id, and returns the result. with correct per-task storage
+# every task therefore returns exactly its own id.
+#
+# under the green backend one worker OS thread runs many tasks. if threadlocals
+# were backed by the worker's storage (as they were before P1b) a task would
+# read the *previous* task's leftover value instead of a fresh 0, so `acc + id`
+# would come out wrong for every task after the first on each worker. the pass
+# line below ("bad 0") is what proves each task got its own storage.
+#
+# like the smoke test, the tasks are fully independent — no channels, no shared
+# mutex — so the program is valid under both backends and the output must be
+# byte-identical with PITH_GREEN off and on.
+
+# a threadlocal module global: per (logical) thread of execution, starts at 0.
+threadlocal mut acc := 0
+
+# read-modify-write that relies on `acc` being this task's own fresh storage.
+fn compute(id: Int) -> Int:
+    # reading `acc` lazily initializes it to 0 for this task; if the task were
+    # instead seeing a sibling's leftover value, this sum would be wrong.
+    acc = acc + id
+    # burn a few cycles so many tasks are genuinely in flight on the workers,
+    # making it likely that several land on the same worker back-to-back.
+    mut i := 0
+    while i < 3000:
+        i = i + 1
+    return acc
+
+fn main() -> Int!:
+    # more tasks than any plausible worker count, so many workers run several
+    # tasks in sequence — the exact condition that exposes shared storage.
+    task_count := 200
+
+    mut tasks: List[Task[Int]] := []
+    mut i := 0
+    while i < task_count:
+        tasks.push(spawn compute(i))
+        i = i + 1
+
+    # join in spawn order and check each task returned its own id.
+    mut ok := 0
+    mut bad := 0
+    mut idx := 0
+    for t in tasks:
+        got := await t
+        if got == idx:
+            ok = ok + 1
+        else:
+            bad = bad + 1
+        idx = idx + 1
+
+    print("threadlocal: {task_count} tasks, ok {ok}, bad {bad}")
+    return 0

@@ -11,7 +11,8 @@ the helpers in `bench/` before trusting them on different hardware.
 
 all numbers from one 2-core machine, medians of 5 where quick enough to
 repeat; the tables below were fully rerun 2026-07-15 (after the arc
-reclamation and weak-reference work). the standout change since the last
+reclamation and weak-reference work), and the grpc table again on 2026-07-19
+after the unary-response coalescing. the standout change since the last
 rerun: std_pipeline's peak rss fell to parity with go (239 vs 238 mb,
 was 1.7x), and the cyclic-graph benchmark below shows weak references
 reclaiming reference cycles refcounting alone can't. json struct decode
@@ -46,20 +47,22 @@ no async runtime. 20,000 calls each, july 2026:
 
 | calls/sec | go | rust (tonic) | pith |
 |---|---|---|---|
-| 16 B, sequential | 4112 | 2952 | **3318** |
-| 1 KiB, sequential | 3978 | 2782 | **3102** |
-| 16 B, 8 concurrent, one connection | 13816 | 11594 | **6025** |
-| 1 KiB, 8 concurrent, one connection | 11677 | 9837 | **5096** |
+| 16 B, sequential | 4011 | 2750 | **3353** |
+| 1 KiB, sequential | 3862 | 2601 | **3220** |
+| 16 B, 8 concurrent, one connection | 13845 | 11435 | **6832** |
+| 1 KiB, 8 concurrent, one connection | 11242 | 9287 | **6084** |
 
-sequentially pith is ~82% of grpc-go and a bit ahead of tonic — close, for
+sequentially pith is ~84% of grpc-go and a bit ahead of tonic — close, for
 a stack that is pith all the way down (its own tls 1.3, http/2, hpack,
-protobuf). concurrency over a single connection is the weak spot: eight
-streams lift pith ~1.7x where go and rust scale ~3.5x. the ceiling there is
+protobuf). concurrency over a single connection is the weaker spot: eight
+streams lift pith ~2x where go and rust scale ~3.5x. the ceiling there is
 not stream count but the per-call latency of the internal pipeline — every
 frame crosses worker → writer → socket → reader → worker, and each hop is a
 thread handoff (a futex wake plus a context switch). the single reader/writer
-is correct and required for hpack ordering, so the way past one connection is
-more connections, below.
+is correct and required for hpack ordering. coalescing removed the redundant
+handoffs on that path (below); the ones that remain are structural — one
+context switch per pipeline thread per call — so the way to more parallelism
+past that is more connections, also below.
 
 this benchmark paid for itself on the first run: client sockets had no
 `TCP_NODELAY`, so nagle collided with the peer's delayed acks for a ~40ms
@@ -79,7 +82,7 @@ std thread-safety fixes and the freelist below put it at ~3175 (~77%). the box
 is too noisy to resolve the smaller items (cached headers, coalescing, shared
 event list) on wall-clock, so they stand on counted structural reductions.
 
-the newest pass inlines the whole request, not just its body. a client starts
+a later pass inlined the whole request, not just its body. a client starts
 single-threaded: one in-flight call runs synchronously on the caller over the
 same lockstep codec the one-shot get() uses — no reader or writer task, no
 channel handoff — and promotes to the multiplexing pipeline once, the first
@@ -101,6 +104,25 @@ fix is to leave the window alone at promotion: sends and grants already net out.
 that restored 1 KiB/8-concurrent to ~5660, at or above where it began. the bug
 hid because the fast-path's own tests used a 20-byte stand-in for the inline
 total; it took a full grpc sweep on a quiet box to surface it.
+
+the newest pass cuts handoffs on the concurrent path. a unary response is three
+frames — response headers, the data message, trailer headers — and the reader
+used to hand each to the waiting worker as its own event, waking it three times,
+where each wake is a kernel context switch. now the reader marks a unary stream
+when it opens, accumulates that stream's frames in a lock-free per-reader map,
+and delivers one combined event at end-of-stream: one wake instead of three.
+streaming rpcs are never marked, so their frames still arrive one at a time and a
+server-streaming response stays incremental — it is never buffered to the end.
+`perf stat` put context switches per call at 7.8 before and 5.0 after (-35%);
+16 B/8-concurrent rose ~6025 to ~6832 (+13%) and 1 KiB ~5096 to ~6084 (+19%), at
+equal or slightly lower cpu, taking single-connection scaling from ~1.7x to ~2x.
+that was the last clearly-redundant handoff: the switches left over are one per
+pipeline thread per call — the worker blocking for its reply, the reader on the
+socket, the writer draining its queue — the floor for a reader/writer/worker
+pipeline built on real os threads. go pays the same handoffs in userspace through
+its m:n scheduler, which is most of why it does ~2x the calls at lower cpu;
+closing that gap on one connection would need the same, and the cheaper lever is
+more connections.
 
 past a single connection there is a connection pool: `grpc.dial_pool` (and
 `http2.open_pool`) opens n independent connections and rotates calls across

@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz memcheck test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke memcheck test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -723,6 +723,26 @@ fuzz-check: build
 fuzz: build
 	@./target/release/pith build tools/fuzz/fuzz.pith > /dev/null
 	@./tools/fuzz/fuzz --count 300 --build-every 5
+
+# --- green-thread smoke test ---
+# the experimental green backend (PITH_GREEN=1) must produce byte-identical
+# output to the default os-thread backend on independent, non-coordinating
+# tasks. this builds the fan-out/join smoke program once and compares the two
+# runs. it does NOT run the wider suite green: many programs coordinate via
+# channels and would deadlock under the P1a "block the worker" await — that is
+# expected and is what a later phase fixes.
+green-smoke: build
+	@echo "--- green-thread smoke (byte-identical off vs on) ---"
+	@off=$$(./target/release/pith run tests/green/smoke.pith 2>/dev/null); \
+	on=$$(PITH_GREEN=1 ./target/release/pith run tests/green/smoke.pith 2>/dev/null); \
+	if [ "$$off" = "$$on" ]; then \
+		echo "ok   identical output: $$on"; \
+	else \
+		echo "FAIL output differs"; \
+		echo "  os-thread: $$off"; \
+		echo "  green:     $$on"; \
+		exit 1; \
+	fi
 
 # --- memcheck ---
 # run a curated set of memory-management-heavy programs under valgrind

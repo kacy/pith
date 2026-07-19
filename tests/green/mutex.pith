@@ -1,0 +1,59 @@
+# green-thread mutex — many tasks increment a shared counter under one mutex.
+#
+# a holder task takes the mutex and parks on a channel while still holding it;
+# once it announces it holds the lock, the coordinator spawns N bumper tasks that
+# each loop lock/increment/unlock. those bumpers contend for a mutex that is
+# currently held by a parked task — exactly the case the green backend must
+# survive: a task blocked acquiring a mutex must yield its worker, not park it,
+# or the holder (waiting to be resumed) can never unlock. once the coordinator
+# releases the holder, the mutex frees and every bumper drains through it.
+#
+# the final total is exact only if the mutex actually serializes the updates
+# (no lost increments) and no acquirer is ever lost (no deadlock): 100 from the
+# holder plus n*times from the bumpers. it is byte-identical to the os-thread
+# backend.
+
+struct Counter:
+    mu: Mutex
+    mut value: Int
+
+fn holder(c: Counter, ready: Channel[Int], gate: Channel[Int], wg: WaitGroup):
+    c.mu.lock()
+    ready.send(0)          # announce: the mutex is now held
+    gate.recv()            # keep holding while parked, forcing contenders to wait
+    c.value = c.value + 100
+    c.mu.unlock()
+    wg.done()
+
+fn bumper(c: Counter, wg: WaitGroup, times: Int):
+    mut i := 0
+    while i < times:
+        c.mu.lock()
+        c.value = c.value + 1
+        c.mu.unlock()
+        i = i + 1
+    wg.done()
+
+fn main() -> Int!:
+    n := 8
+    times := 500
+    c := Counter(Mutex(), 0)
+    ready := Channel[Int]()
+    gate := Channel[Int]()
+    wg := WaitGroup()
+    wg.add(n + 1)
+
+    spawn holder(c, ready, gate, wg)
+    ready.recv()           # wait until the holder actually holds the mutex
+
+    mut i := 0
+    while i < n:
+        spawn bumper(c, wg, times)
+        i = i + 1
+
+    gate.send(0)           # release the holder; contenders can now make progress
+    wg.wait()
+
+    total := c.value
+    print("mutex: n {n}, times {times}, total {total}")
+    return 0

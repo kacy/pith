@@ -1,0 +1,41 @@
+# green-thread waitgroup fan-out — a parent task waits on K workers.
+#
+# a coordinator task adds K to a waitgroup, spawns K workers, then waits for the
+# group to drain; each worker records a result and calls done(). the waiter is a
+# green task, so under the pre-P2b backend its wait() parked the worker OS thread
+# outright. with a single worker (PITH_GREEN_WORKERS=1) that parks the ONLY
+# worker before any child runs, so the group never drains and the program hangs.
+# P2b makes a would-block wait() yield the coroutine instead, freeing the worker
+# to run the children; the last done() wakes the coordinator.
+#
+# the total is a fixed sum of the worker ids, independent of scheduling order, so
+# the output is byte-identical to the os-thread backend.
+
+fn worker(wg: WaitGroup, results: Channel[Int], id: Int):
+    results.send(id)
+    wg.done()
+
+fn coordinator(n: Int, results: Channel[Int]) -> Int:
+    wg := WaitGroup()
+    wg.add(n)
+    mut i := 0
+    while i < n:
+        spawn worker(wg, results, i)
+        i = i + 1
+    # block until every worker has called done(). this is the yield point P2b adds.
+    wg.wait()
+    mut total := 0
+    mut j := 0
+    while j < n:
+        total = total + results.recv().unwrap_or(0)
+        j = j + 1
+    return total
+
+fn main() -> Int!:
+    n := 100
+    # buffered to n so a worker's send never blocks — this test isolates the
+    # waitgroup, not the channel.
+    results := Channel[Int](n)
+    total := await spawn coordinator(n, results)
+    print("waitgroup: n {n}, total {total}")
+    return 0

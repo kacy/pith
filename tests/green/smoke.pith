@@ -1,0 +1,39 @@
+# green-thread smoke test — independent fan-out, then join.
+#
+# spawns many tasks that each do a chunk of pure arithmetic and return a value,
+# with NO coordination between them (no channels, no shared mutex). that keeps
+# it valid under both backends: the os-thread backend and the experimental
+# green backend (PITH_GREEN=1). in green mode a task that blocks parks its
+# worker, so only independent tasks like these are safe today — see the green
+# scheduler docs. the output must be byte-identical with the flag on and off.
+
+# a deliberately loopy pure computation so the task actually spends CPU: this is
+# what makes the context-switch difference between backends observable, and it
+# gives every task a distinct, deterministic result.
+fn work(seed: Int) -> Int:
+    mut acc := seed
+    mut i := 0
+    while i < 5000:
+        acc = (acc * 31 + i) % 1000003
+        i = i + 1
+    return acc
+
+fn main() -> Int!:
+    task_count := 500
+
+    # fan out: spawn every task up front so many are in flight at once,
+    # exercising the worker pool and work-stealing rather than running serially.
+    mut tasks: List[Task[Int]] := []
+    mut i := 0
+    while i < task_count:
+        tasks.push(spawn work(i))
+        i = i + 1
+
+    # join: sum the results. the total is fully determined by the inputs, so it
+    # does not depend on which worker ran which task or in what order.
+    mut total := 0
+    for t in tasks:
+        total = total + await t
+
+    print("green smoke: {task_count} tasks, total {total}")
+    return 0

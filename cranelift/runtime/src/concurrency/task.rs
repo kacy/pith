@@ -38,8 +38,17 @@ struct TaskShared {
     result: i64,
 }
 
+/// Codegen-facing spawn entrypoint. Routes through the scheduler seam so the
+/// task backend (os threads today, green threads later) is chosen behind the
+/// `PITH_GREEN` flag without the compiler ever caring which one runs.
 #[no_mangle]
 pub unsafe extern "C" fn pith_spawn(closure_handle: i64) -> i64 {
+    crate::concurrency::scheduler::spawn(closure_handle)
+}
+
+/// One OS thread per task: the original, default spawn implementation. Kept
+/// as a named backend so the scheduler can pick it explicitly.
+pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
     if closure_handle == 0 {
         return 0;
     }
@@ -83,8 +92,16 @@ pub unsafe extern "C" fn pith_spawn(closure_handle: i64) -> i64 {
     task_handle
 }
 
+/// Codegen-facing await entrypoint. Routes through the scheduler seam, the
+/// mirror of `pith_spawn`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_await(task_handle: i64) -> i64 {
+    crate::concurrency::scheduler::await_task(task_handle)
+}
+
+/// Join an os-thread task and return its result: the original, default await
+/// implementation.
+pub(crate) unsafe fn os_thread_await(task_handle: i64) -> i64 {
     if !handle_registry::is_valid_id(task_handle, HandleKind::Task) {
         return 0;
     }

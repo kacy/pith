@@ -360,39 +360,52 @@ pub fn get(url_string: String) -> Response!:
 STREAM_HEADERS := 1
 STREAM_DATA := 2
 STREAM_RESET := 3
+# a whole unary response coalesced into one event: `headers`, `trailers`, and the
+# full body together (see the reader's unary batching below). the streaming path
+# never uses this kind — it must see each frame incrementally.
+STREAM_UNARY := 4
 
 # an event the reader task delivers to a waiting stream. headers carry the
 # decoded fields, data carries a body chunk, and reset carries the peer's error
-# code; `end` marks the final event of the stream.
+# code; `end` marks the final event of the stream. `trailers` is populated only
+# on a STREAM_UNARY event, which carries a whole unary response at once.
 pub struct StreamEvent:
     pub kind: Int
     pub headers: List[hpack.HeaderField]
+    pub trailers: List[hpack.HeaderField]
     pub data: Bytes
     pub end: Bool
     pub error_code: Int
 
-# build a HEADERS stream event (response headers, or trailers once the body has
-# begun); `end` marks it as the stream's final event.
-pub fn headers_event(fields: List[hpack.HeaderField], end: Bool) -> StreamEvent:
-    return StreamEvent(STREAM_HEADERS, fields, bytes.empty(), end, 0)
-
-# DATA and RESET events carry no header fields; they share one empty list rather
-# than allocating a fresh one per frame (data events are the response hot path).
-# consumers only read `.fields` on HEADERS events, so the shared list is never
-# mutated.
+# DATA, RESET, and the trailer slot of HEADERS events carry no header fields; they
+# share one empty list rather than allocating a fresh one per frame (data events
+# are the response hot path). consumers only read the shared list, never mutate it.
 fn empty_fields() -> List[hpack.HeaderField]:
     fields: List[hpack.HeaderField] := []
     return fields
 
 NO_FIELDS := empty_fields()
 
+# build a HEADERS stream event (response headers, or trailers once the body has
+# begun); `end` marks it as the stream's final event.
+pub fn headers_event(fields: List[hpack.HeaderField], end: Bool) -> StreamEvent:
+    return StreamEvent(STREAM_HEADERS, fields, NO_FIELDS, bytes.empty(), end, 0)
+
+# build a coalesced unary response event: the response headers, the trailers, and
+# the full body in one event. the reader accumulates a unary stream's three frames
+# (headers, data, trailer headers) and delivers this single event at end-of-stream,
+# so the waiting worker wakes once instead of once per frame. always the final
+# event of its stream.
+pub fn unary_event(headers: List[hpack.HeaderField], trailers: List[hpack.HeaderField], body: Bytes) -> StreamEvent:
+    return StreamEvent(STREAM_UNARY, headers, trailers, body, true, 0)
+
 # build a DATA stream event carrying a body chunk; `end` marks end-of-stream.
 pub fn data_event(chunk: Bytes, end: Bool) -> StreamEvent:
-    return StreamEvent(STREAM_DATA, NO_FIELDS, chunk, end, 0)
+    return StreamEvent(STREAM_DATA, NO_FIELDS, NO_FIELDS, chunk, end, 0)
 
 # build a RESET stream event carrying the peer's error code.
 pub fn reset_event(code: Int) -> StreamEvent:
-    return StreamEvent(STREAM_RESET, NO_FIELDS, bytes.empty(), false, code)
+    return StreamEvent(STREAM_RESET, NO_FIELDS, NO_FIELDS, bytes.empty(), false, code)
 
 impl StreamEvent:
     # whether this event carries a decoded header block (response headers or,
@@ -482,6 +495,11 @@ pub struct Client:
     mut next_stream_id: Int
     streams: Map[Int, Channel[StreamEvent]]
     mut active: List[Int]
+    # the ids of streams the reader should coalesce: a unary request()/get() marks
+    # its stream here so the reader batches its three response frames into one
+    # STREAM_UNARY event. a streaming stream is never marked, so its events flow
+    # incrementally. presence means unary; removed when the stream is forgotten.
+    unary: Map[Int, Bool]
     outbound: Channel[Bytes]
     closed: AtomicInt
     mut going_away: Bool
@@ -574,6 +592,7 @@ fn idle_writer() -> Int:
 fn client_from_connection(conn: Connection) -> Client:
     ids: List[Int] := []
     table: Map[Int, Channel[StreamEvent]] := {}
+    unary_streams: Map[Int, Bool] := {}
     windows: Map[Int, Int] := {}
     credit: Map[Int, Channel[Int]] := {}
     outbound := Channel[Bytes](OUTBOUND_CAP)
@@ -582,7 +601,7 @@ fn client_from_connection(conn: Connection) -> Client:
     # parks on `outbound` through the inline phase (inline calls write directly)
     # and is ready to drain it the moment the client promotes.
     writer := spawn writer_loop(outbound, conn, closed)
-    client := Client(conn, Mutex(), 1, table, ids, outbound, closed, false, 0, writer, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_INLINE, false, Channel[Int](1), Channel[Int](1), Channel[Int](1))
+    client := Client(conn, Mutex(), 1, table, ids, unary_streams, outbound, closed, false, 0, writer, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_INLINE, false, Channel[Int](1), Channel[Int](1), Channel[Int](1))
     # spawn the reader too, but it parks on `promote_gate` and reads nothing until
     # promotion releases it. spawning both tasks here — never from the request
     # path — keeps task startup off the hot path and has proven the reliable place
@@ -680,12 +699,16 @@ fn reader_loop(client: Client):
     client.promote_gate.recv()
     if client.closed.load() != 0:
         return
+    # per-stream accumulators for unary streams, private to this one reader thread
+    # so no lock guards them. a unary stream's response frames are gathered here
+    # and flushed as a single event (see handle_frame's unary batching).
+    accums: Map[Int, UnaryAccum] := {}
     while true:
         attempt := client.conn.read_frame()
         if attempt.is_err:
             fail_all(client)
             return
-        outcome := handle_frame(client, attempt.ok)
+        outcome := handle_frame(client, attempt.ok, accums)
         if outcome.is_err:
             # a frame we could not process is a connection-level protocol error:
             # tell the peer why, then drop every stream.
@@ -696,20 +719,82 @@ fn reader_loop(client: Client):
             fail_all(client)
             return
 
+# the reader's running state for a unary stream: the response headers, the
+# trailers, and the body assembled from its DATA frames. it lives only on the
+# reader thread (in the reader's `accums` map), so it needs no lock. `to_event`
+# packs it into the single event the worker receives.
+struct UnaryAccum:
+    mut headers: List[hpack.HeaderField]
+    mut trailers: List[hpack.HeaderField]
+    mut body: Bytes
+    mut got_headers: Bool
+
+# a fresh accumulator with empty headers, trailers, and body.
+fn new_unary_accum() -> UnaryAccum:
+    empty_headers: List[hpack.HeaderField] := []
+    empty_trailers: List[hpack.HeaderField] := []
+    return UnaryAccum(empty_headers, empty_trailers, bytes.empty(), false)
+
+impl UnaryAccum:
+    # the coalesced event carrying the whole response.
+    fn to_event() -> StreamEvent:
+        return unary_event(self.headers, self.trailers, self.body)
+
+# whether the reader should coalesce this stream's frames. an already-open
+# accumulator answers yes immediately; otherwise the first frame of a stream the
+# caller marked unary opens one. a streaming stream is never marked, so this stays
+# false and its frames are delivered one at a time.
+fn accumulating(client: Client, accums: Map[Int, UnaryAccum], stream_id: Int) -> Bool:
+    if accums.contains_key(stream_id):
+        return true
+    if client.is_unary(stream_id):
+        accums.insert(stream_id, new_unary_accum())
+        return true
+    return false
+
 # dispatch one frame. returns false when the reader should stop (the connection
-# has fully wound down after a GOAWAY).
-fn handle_frame(client: Client, frame: frames.Frame) -> Bool!:
+# has fully wound down after a GOAWAY). `accums` holds the reader's per-stream
+# state for unary streams whose frames are being coalesced.
+#
+# a unary response is three frames — response HEADERS, DATA, trailer HEADERS —
+# and delivering each as its own event wakes the waiting worker three times, one
+# kernel context switch each. for a stream the caller marked unary we instead
+# accumulate the three frames here and deliver a single STREAM_UNARY event at
+# end-of-stream, so the worker wakes once. streaming streams are never marked, so
+# their events still flow one frame at a time (a server-streaming response must
+# reach the caller incrementally, never buffered to end-of-stream).
+fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum]) -> Bool!:
     t := frame.header.frame_type
     if t == frames.FRAME_HEADERS:
         hf := frames.parse_headers(frame)!
         block := client.conn.read_header_block(hf)!
         # decode in receive order to keep the single hpack table in step.
         decoded := client.conn.decoder.decode(block)!
-        deliver(client, hf.stream_id, headers_event(decoded, hf.end_stream))
+        if accumulating(client, accums, hf.stream_id):
+            a := accums[hf.stream_id]
+            # the first header block is the response headers; a later one (after
+            # the body has begun) is the trailers.
+            if not a.got_headers:
+                a.headers = decoded
+                a.got_headers = true
+            else:
+                a.trailers = decoded
+            if hf.end_stream:
+                deliver(client, hf.stream_id, a.to_event())
+                accums.remove(hf.stream_id)
+        else:
+            deliver(client, hf.stream_id, headers_event(decoded, hf.end_stream))
         return true
     if t == frames.FRAME_DATA:
         df := frames.parse_data(frame)!
-        deliver(client, df.stream_id, data_event(df.data, df.end_stream))
+        if accumulating(client, accums, df.stream_id):
+            a := accums[df.stream_id]
+            a.body = bytes.concat(a.body, df.data)
+            if df.end_stream:
+                deliver(client, df.stream_id, a.to_event())
+                accums.remove(df.stream_id)
+        else:
+            deliver(client, df.stream_id, data_event(df.data, df.end_stream))
         # flow control counts the whole frame payload, padding included.
         client.replenish(df.stream_id, frame.header.length, df.end_stream)!
         return true
@@ -737,6 +822,9 @@ fn handle_frame(client: Client, frame: frames.Frame) -> Bool!:
         return handle_goaway(client, ga)
     if t == frames.FRAME_RST_STREAM:
         rs := frames.parse_rst_stream(frame)!
+        # drop any half-built unary accumulator; the reset ends the stream.
+        if accums.contains_key(rs.stream_id):
+            accums.remove(rs.stream_id)
         deliver(client, rs.stream_id, reset_event(rs.error_code))
         return true
     # PRIORITY, PUSH_PROMISE and unknown types need no action to complete our
@@ -807,9 +895,11 @@ fn fail_all(client: Client):
         if client.credit.contains_key(stream_id):
             client.credit[stream_id].close()
     empty: Map[Int, Channel[StreamEvent]] := {}
+    empty_unary: Map[Int, Bool] := {}
     empty_windows: Map[Int, Int] := {}
     empty_credit: Map[Int, Channel[Int]] := {}
     client.streams = empty
+    client.unary = empty_unary
     client.send_windows = empty_windows
     client.credit = empty_credit
     client.active = []
@@ -876,6 +966,11 @@ fn assemble_response(inbox: Channel[StreamEvent]) -> Response!:
             body.free()
             fail "http2: connection closed before the response completed"
         event := opt?
+        if event.kind == STREAM_UNARY:
+            # the reader coalesced the whole response into one event, so there is
+            # nothing to assemble across frames — return it directly.
+            body.free()
+            return Response(status_from(event.headers), event.headers, event.trailers, event.data)
         if event.kind == STREAM_RESET:
             body.free()
             fail "http2: stream was reset by the peer ({frames.error_name(event.error_code)})"
@@ -1079,12 +1174,23 @@ impl Client:
             self.enqueue(frames.window_update_frame(stream_id, amount)!)!
         return true
 
+    # whether the reader should coalesce this stream into one unary event. read
+    # once per stream when the reader sees its first frame; a streaming stream is
+    # never marked, so this is false and its events flow incrementally.
+    fn is_unary(stream_id: Int) -> Bool:
+        self.mu.lock()
+        marked := self.unary.contains_key(stream_id)
+        self.mu.unlock()
+        return marked
+
     # remove a finished stream from the table and its flow-control state, then
     # free a concurrency slot so a request queued behind the peer's limit can go.
     fn forget(stream_id: Int):
         self.mu.lock()
         if self.streams.contains_key(stream_id):
             self.streams.remove(stream_id)
+        if self.unary.contains_key(stream_id):
+            self.unary.remove(stream_id)
         if self.send_windows.contains_key(stream_id):
             self.send_windows.remove(stream_id)
         if self.credit.contains_key(stream_id):
@@ -1099,8 +1205,10 @@ impl Client:
     # inbox, and enqueue the HEADERS — all under the mutex so ids stay monotonic
     # and hpack encoding matches wire order. END_STREAM rides on the HEADERS when
     # `end_stream` is set (no body will follow). the returned Stream carries the
-    # id and inbox for incremental send/recv.
-    fn open_stream_with_fields(fields: List[hpack.HeaderField], end_stream: Bool) -> Stream!:
+    # id and inbox for incremental send/recv. `unary` marks the stream so the
+    # reader coalesces its response into one event (see handle_frame); a streaming
+    # caller passes false so its events flow one frame at a time.
+    fn open_stream_with_fields(fields: List[hpack.HeaderField], end_stream: Bool, unary: Bool) -> Stream!:
         self.mu.lock()
         while true:
             if self.closed.load() != 0:
@@ -1123,6 +1231,8 @@ impl Client:
         self.next_stream_id = self.next_stream_id + 2
         inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
         self.streams.insert(stream_id, inbox)
+        if unary:
+            self.unary.insert(stream_id, true)
         self.active.push(stream_id)
         self.send_windows.insert(stream_id, self.peer_initial_window)
         self.credit.insert(stream_id, Channel[Int](CREDIT_POKE_CAP))
@@ -1151,7 +1261,7 @@ impl Client:
         # a stream is long-lived and its events flow through the reader, so it can
         # never run on the inline path: promote to the pipeline before opening it.
         self.ensure_threaded()
-        return self.open_stream_with_fields(fields, end_stream)!
+        return self.open_stream_with_fields(fields, end_stream, false)!
 
     # --- inline fast-path plumbing (see the Client note) ---
 
@@ -1271,7 +1381,7 @@ impl Client:
     # flow-controlled DATA on its own task while the response is read.
     fn threaded_request(fields: List[hpack.HeaderField], body: Bytes) -> Response!:
         has_body := body.len() > 0
-        stream := self.open_stream_with_fields(fields, not has_body)!
+        stream := self.open_stream_with_fields(fields, not has_body, true)!
         stream_id := stream.id
         if has_body and body.len() <= self.peer_max_frame_size:
             # the body is a single frame within the initial window, so sending it
@@ -1461,11 +1571,12 @@ test "a RST_STREAM on our stream fails the response":
 fn offline_client(conn: Connection) -> Client:
     ids: List[Int] := []
     table: Map[Int, Channel[StreamEvent]] := {}
+    unary_streams: Map[Int, Bool] := {}
     windows: Map[Int, Int] := {}
     credit: Map[Int, Channel[Int]] := {}
     gate := Channel[Int](1)
     gate.send(1)
-    return Client(conn, Mutex(), 1, table, ids, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_THREADED, false, Channel[Int](1), Channel[Int](1), gate)
+    return Client(conn, Mutex(), 1, table, ids, unary_streams, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_THREADED, false, Channel[Int](1), Channel[Int](1), gate)
 
 # pull the next event off an inbox, failing if the channel closed first.
 fn next_event(inbox: Channel[StreamEvent]) -> StreamEvent!:
@@ -1642,7 +1753,8 @@ test "a GOAWAY drops streams above last-stream-id and keeps the rest":
 test "a WINDOW_UPDATE with a zero increment is a protocol error":
     client := offline_client(connection_from_frames(bytes.empty()))
     frame := frames.window_update_frame(1, 0)!
-    assert(handle_frame(client, frame).is_err)
+    accums: Map[Int, UnaryAccum] := {}
+    assert(handle_frame(client, frame, accums).is_err)
 
 # --- settings enforcement tests (phase 4) ---
 

@@ -86,8 +86,45 @@ use corosensei::{Coroutine, CoroutineResult, Yielder};
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock};
 use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// opt-in scheduler-locality profiling, gated behind `PITH_GREEN_STATS=1`. it
+// counts how wakes break down for a run — same-worker vs cross-worker vs reactor
+// handoffs — and how many actually cost a futex wake (the target's owner was
+// parked) vs were absorbed by a busy pool. the dump prints once at process exit.
+// default-off and read-only, so the normal path never pays for it; this is the
+// lens that showed the pinned-wake herd, kept for the next scheduler pass.
+// ---------------------------------------------------------------------------
+static STATS_ON: OnceLock<bool> = OnceLock::new();
+static WAKE_SAME: AtomicU64 = AtomicU64::new(0);
+static WAKE_CROSS: AtomicU64 = AtomicU64::new(0);
+static WAKE_REACTOR: AtomicU64 = AtomicU64::new(0);
+static WAKE_FUTEX: AtomicU64 = AtomicU64::new(0);
+static WAKE_ABSORBED: AtomicU64 = AtomicU64::new(0);
+static PARKED_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+fn stats_on() -> bool {
+    *STATS_ON.get_or_init(|| {
+        std::env::var("PITH_GREEN_STATS")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false)
+    })
+}
+
+extern "C" fn dump_stats() {
+    let same = WAKE_SAME.load(AtomicOrdering::Relaxed);
+    let cross = WAKE_CROSS.load(AtomicOrdering::Relaxed);
+    let reactor = WAKE_REACTOR.load(AtomicOrdering::Relaxed);
+    let futex = WAKE_FUTEX.load(AtomicOrdering::Relaxed);
+    let absorbed = WAKE_ABSORBED.load(AtomicOrdering::Relaxed);
+    eprintln!(
+        "[green-stats] wakes: same-worker={same} cross-worker={cross} reactor={reactor} \
+         | futex-wakes={futex} absorbed={absorbed}"
+    );
+}
 
 /// index into the task slab. the pith-facing task handle is always `id + 1`, so
 /// that handle 0 stays reserved for "no task" as in the os-thread backend.
@@ -226,9 +263,9 @@ struct Task {
     tls: Box<HashMap<i64, i64>>,
 }
 
-/// one worker's private run queues. workers are created once and live for the
-/// process; there is no shutdown path (the pool dies with the process, like a
-/// daemon thread pool).
+/// one worker's private run queues plus its own park spot. workers are created
+/// once and live for the process; there is no shutdown path (the pool dies with
+/// the process, like a daemon thread pool).
 struct Worker {
     /// fresh, never-resumed tasks. stealable by peers because a fresh coroutine
     /// carries no live stack (see the pinning note).
@@ -236,18 +273,25 @@ struct Worker {
     /// woken started tasks pinned to this worker. only this worker drains it, so
     /// a suspended coroutine only ever resumes on the thread that first ran it.
     pinned: Mutex<VecDeque<TaskId>>,
+    /// this worker's private park spot. an idle worker waits on its own condvar,
+    /// so a wake can target exactly the worker that is able to run the task —
+    /// crucially, a *pinned* wake nudges only the task's owner instead of a
+    /// pool-wide notify that also wakes idle peers which have nothing to run. on
+    /// a single-connection pipeline every task pins to one worker, so a shared
+    /// park spot made every wake needlessly wake (and CPU-spin, and lock-contend)
+    /// the other worker — that thundering herd is what made two workers slower
+    /// than one. the guarded unit plus the short wait-timeout in `park` bounds any
+    /// lost-wakeup window exactly as the old single spot did.
+    park_lock: Mutex<()>,
+    park_cv: Condvar,
 }
 
-/// the whole green runtime: the task slab, the worker queues, the injector for
-/// off-worker spawns, and a single park spot idle workers wait on.
+/// the whole green runtime: the task slab, the per-worker queues + park spots,
+/// and the injector for off-worker spawns.
 struct Scheduler {
     slab: Mutex<Vec<Option<Task>>>,
     workers: Vec<Worker>,
     injector: Mutex<VecDeque<TaskId>>,
-    /// idle workers park here; every enqueue notifies. the guarded unit plus a
-    /// short wait-timeout bounds any lost-wakeup window (see `park`).
-    park_lock: Mutex<()>,
-    park_cv: Condvar,
 }
 
 /// the scheduler is built lazily on the first green spawn so a process that
@@ -341,6 +385,19 @@ pub(crate) fn wake(id: TaskId) {
             RunState::Ready | RunState::Done => return,
         }
     };
+    // profiling: categorize this wake by where the waker sits relative to the
+    // task's owner worker (read-only, gated).
+    if stats_on() {
+        let caller = CURRENT_WORKER.with(|c| c.get());
+        match (caller, owner) {
+            (Some(w), Some(o)) if w == o => WAKE_SAME.fetch_add(1, AtomicOrdering::Relaxed),
+            (Some(_), Some(_)) => WAKE_CROSS.fetch_add(1, AtomicOrdering::Relaxed),
+            // waker is not a worker: the reactor thread or main. either way it
+            // must cross into a worker's queue.
+            _ => WAKE_REACTOR.fetch_add(1, AtomicOrdering::Relaxed),
+        };
+    }
+
     // enqueue outside the slab lock. a parked task always ran, so `owner` is set;
     // fall back to the injector only defensively.
     match owner {
@@ -386,19 +443,28 @@ fn lock_join(lock: &Mutex<Join>) -> MutexGuard<'_, Join> {
 /// count, with a floor of 1.
 fn scheduler() -> &'static Scheduler {
     SCHEDULER.get_or_init(|| {
+        // register the profiling dump once, at first scheduler build, so the
+        // breakdown prints as the process exits. no-op when stats are off.
+        if stats_on() {
+            // SAFETY: `dump_stats` is a plain `extern "C"` fn that only reads
+            // atomics and writes to stderr; libc atexit accepts exactly this.
+            unsafe {
+                libc::atexit(dump_stats);
+            }
+        }
         let n = worker_count();
         let workers = (0..n)
             .map(|_| Worker {
                 local: Mutex::new(VecDeque::new()),
                 pinned: Mutex::new(VecDeque::new()),
+                park_lock: Mutex::new(()),
+                park_cv: Condvar::new(),
             })
             .collect();
         Scheduler {
             slab: Mutex::new(Vec::new()),
             workers,
             injector: Mutex::new(VecDeque::new()),
-            park_lock: Mutex::new(()),
-            park_cv: Condvar::new(),
         }
     })
 }
@@ -457,9 +523,13 @@ fn enqueue_fresh(id: TaskId) {
             .unwrap_or_else(|p| p.into_inner())
             .push_back(id),
     }
-    // wake a parked worker. notify_all (not one) plus the re-check in `park`
-    // keeps this correct even if several tasks land at once.
-    sched.park_cv.notify_all();
+    // a fresh task is stealable by any worker, so nudge the whole pool: whoever
+    // is idle picks it up (or steals it), which is what keeps an independent
+    // fan-out spread across cores. fresh spawns are comparatively rare (task
+    // startup, not the per-message hot path), so the pool-wide nudge here is not
+    // the herd the pinned path had to shed.
+    note_notify();
+    wake_pool();
 }
 
 /// re-enqueue a *woken started* task onto its owner worker's pinned queue and
@@ -474,9 +544,49 @@ fn enqueue_woken(owner: usize, id: TaskId) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .push_back(id);
-    // the owner may be parked; wake the pool so it comes back and drains its
-    // pinned queue. notify_all + the re-check in `park` tolerates extra wakeups.
-    sched.park_cv.notify_all();
+    // a pinned task can only ever run on its owner, and only the owner drains its
+    // pinned queue — so nudge *only* the owner. if the owner is busy the notify is
+    // a cheap no-op (no waiter), and it never wakes an idle peer that has nothing
+    // to run. that is the locality lever: on a single-connection pipeline whose
+    // tasks all pin to one worker, the other worker now stays parked instead of
+    // spinning and contending on the shared slab lock.
+    note_notify();
+    wake_worker(owner);
+}
+
+/// nudge one worker's private park spot. acquiring the worker's park lock before
+/// notifying serializes against `park`'s check-then-wait, so a wake landing just
+/// as the worker decides to sleep is not lost (and the wait-timeout backstops any
+/// residual window). a `notify_one` on a worker that is not parked is a no-op.
+fn wake_worker(index: usize) {
+    let worker = &scheduler().workers[index];
+    let _g = worker.park_lock.lock().unwrap_or_else(|p| p.into_inner());
+    worker.park_cv.notify_one();
+}
+
+/// nudge every worker. used for fresh, stealable work (injector or a worker's
+/// local queue), where any worker is a valid taker, so an idle peer wakes to run
+/// or steal it. this keeps independent fan-out spread across cores; it is not on
+/// the per-message hot path, so it is not a herd.
+fn wake_pool() {
+    let n = scheduler().workers.len();
+    for i in 0..n {
+        wake_worker(i);
+    }
+}
+
+/// profiling helper: record whether a wake actually had to rouse a parked worker
+/// (a real futex cost) or was absorbed because the pool was busy. read-only,
+/// gated behind `PITH_GREEN_STATS`.
+fn note_notify() {
+    if !stats_on() {
+        return;
+    }
+    if PARKED_WORKERS.load(AtomicOrdering::Relaxed) > 0 {
+        WAKE_FUTEX.fetch_add(1, AtomicOrdering::Relaxed);
+    } else {
+        WAKE_ABSORBED.fetch_add(1, AtomicOrdering::Relaxed);
+    }
 }
 
 /// find the next ready task for worker `index`: its pinned queue first (resume
@@ -555,24 +665,44 @@ fn steal_start(n: usize) -> usize {
 /// between our empty `find_work` and this wait; a short timeout closes the
 /// window entirely, so a missed wakeup costs latency, never a hang.
 fn park(index: usize) {
-    let sched = scheduler();
-    let guard = sched
-        .park_lock
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let worker = &scheduler().workers[index];
+    let guard = worker.park_lock.lock().unwrap_or_else(|p| p.into_inner());
     // one last check under the lock: if work appeared, don't sleep.
     if has_any_work(index) {
         return;
     }
-    let _ = sched
-        .park_cv
-        .wait_timeout(guard, Duration::from_millis(1));
+    // profiling: mark ourselves parked so a concurrent wake can be attributed as
+    // a real futex wake vs one absorbed by a busy pool.
+    if stats_on() {
+        PARKED_WORKERS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    let _ = worker.park_cv.wait_timeout(guard, Duration::from_millis(1));
+    if stats_on() {
+        PARKED_WORKERS.fetch_sub(1, AtomicOrdering::Relaxed);
+    }
 }
 
-/// is there any work anywhere this worker could take? used only to avoid
-/// parking on a false-empty; the authoritative pop is still `find_work`.
-fn has_any_work(_index: usize) -> bool {
+/// is there any work *this* worker could actually take? used only to avoid
+/// parking on a false-empty; the authoritative pop is still `find_work`, and it
+/// must consider exactly the same sources: this worker's own pinned queue, its
+/// own local queue, the injector, and any peer's *local* (stealable) queue.
+///
+/// it must NOT count a *peer's pinned* queue: a pinned task only ever runs on
+/// its owner, so peer-pinned work this worker can never reach would otherwise
+/// keep it falsely "busy" — spinning through `find_work` and re-checking here
+/// instead of parking. that false-busy spin (a worker kept awake by the other
+/// worker's pinned pipeline) was a large part of why two workers lost to one.
+fn has_any_work(index: usize) -> bool {
     let sched = scheduler();
+    // own pinned first — the woken work this worker must resume itself.
+    if !sched.workers[index]
+        .pinned
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_empty()
+    {
+        return true;
+    }
     if !sched
         .injector
         .lock()
@@ -581,10 +711,11 @@ fn has_any_work(_index: usize) -> bool {
     {
         return true;
     }
-    sched.workers.iter().any(|w| {
-        !w.local.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
-            || !w.pinned.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
-    })
+    // any worker's local queue is stealable (own or a peer's).
+    sched
+        .workers
+        .iter()
+        .any(|w| !w.local.lock().unwrap_or_else(|p| p.into_inner()).is_empty())
 }
 
 /// the worker thread body: take work, run it, park when there is none.

@@ -133,37 +133,49 @@ per-call counts over warmup+calls:
 
 | 16 B, conc=8 | calls/sec | ctx-switches/call | cpu |
 |---|---|---|---|
-| os-thread | 7072 | 4.7 | 1.00 |
-| green, 1 worker | 10537 | 0.52 | 0.68 |
-| green, 2 workers | 5995 | 1.83 | 1.09 |
+| os-thread | 7017 | 4.7 | 0.99 |
+| green, 1 worker | 10598 | 0.54 | 0.85 |
+| green, 2 workers | 8074 | 1.64 | 0.94 |
 
 | 1 KiB, conc=8 | calls/sec | ctx-switches/call | cpu |
 |---|---|---|---|
-| os-thread | 6112 | 4.9 | 1.04 |
-| green, 1 worker | 9070 | 0.55 | 0.69 |
-| green, 2 workers | 5614 | 1.79 | 1.11 |
+| os-thread | 5938 | 5.0 | 1.00 |
+| green, 1 worker | 9119 | 0.54 | 0.84 |
+| green, 2 workers | 7415 | 1.62 | 0.96 |
 
 at one worker the mechanism does exactly what it was meant to: context switches
 per call fall from ~4.7 to ~0.5 (the pipeline stops touching the kernel to hand a
-frame between tasks), and that shows up in the wall clock — throughput up ~49% at
-16 B and ~48% at 1 KiB while cpu drops from a full core to ~0.68. that is the
-same ~0.68 cpu grpc-go spends here, so green-at-one-worker gets pith to about
-three quarters of go's throughput at go's efficiency, from about half at 1.5x the
-cost on the os-thread backend.
+frame between tasks), and that shows up in the wall clock — throughput up ~51% at
+16 B and ~54% at 1 KiB while cpu drops below a core. that is close to the cpu
+grpc-go spends here, so green-at-one-worker gets pith to about three quarters of
+go's throughput at go's efficiency, from about half at 1.5x the cost on the
+os-thread backend.
 
-the honest catch is the default worker count. at two workers on this box green is
-slower than the os-thread backend, not faster: the reader, writer, and worker
-tasks now land on different workers, so the handoffs that were free at one worker
-become cross-worker futex wakes again, and two busy workers plus the go server
-oversubscribe two cores (the client shares them with the server it is calling).
-context switches per call stay well under the os-thread baseline (~1.8 vs ~4.7),
-but cpu climbs back over a core and throughput drops. so on this hardware the win
-is real but it is a one-worker, one-connection win — the shape where a single
-pipeline's kernel switches were the whole cost. more cores, or a server that is
-not fighting the client for them, is what would let more workers pay off; the
-context-switch numbers say the scheduler is doing its job, the two-core wall clock
-just can't cash it at more than one worker. green is off by default, so the table
-at the top of this section is the os-thread backend.
+the default worker count used to lose this: at two workers green was *slower*
+than the os-thread backend, because a pinned task's wake did a pool-wide notify
+that also roused the second worker, which then spun through its (empty) queues and
+contended on the shared task lock instead of parking — pure overhead, since a
+single connection's pipeline pins to one worker and the other has nothing it can
+run. giving each worker its own park spot (a pinned wake now nudges only the
+task's owner, and an idle worker no longer counts a peer's un-stealable pinned
+work as a reason to stay awake) removes that herd: at two workers green now beats
+the os-thread backend, ~15% at 16 B and ~25% at 1 KiB, at lower cpu.
+
+two workers still trails one, though, and the reason is locality, not the herd.
+the eight request tasks are spawned from the main thread, so they scatter across
+both workers while the reader and writer sit on whichever worker promoted the
+connection; the roughly half of calls whose task lands away from the reader/writer
+pay a cross-worker wake per hop. one worker keeps the whole pipeline together and
+pays none, which is why it is fastest for a single connection. closing that last
+gap would need connection-aware placement — pinning a connection's request tasks
+to the worker that owns its reader/writer — which the scheduler can't infer from a
+plain spawn (a single connection wants its tasks packed onto one worker; an
+independent fan-out or a larger connection pool wants them spread), so it is a
+task-placement change above the scheduler, not a scheduler-locality one. on this
+two-core box a connection pool can't show the spread paying off anyway: the client
+already shares both cores with the go server it calls. more cores, or a server not
+fighting the client for them, is what a pool would need to scale. green is off by
+default, so the table at the top of this section is the os-thread backend.
 
 past a single connection there is a connection pool: `grpc.dial_pool` (and
 `http2.open_pool`) opens n independent connections and rotates calls across

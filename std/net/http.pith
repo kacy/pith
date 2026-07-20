@@ -2790,6 +2790,65 @@ pub fn serve_connection_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpRespons
     tcp_close(fd)
     return written
 
+# read one http/1.1 request head off a tls conn, a byte at a time until the blank
+# line. reading one byte at a time stops exactly on the head boundary, so the
+# body (and any following request) is never over-read — the same rolling-window
+# scan read_request_head_buffered_bytes uses, only sourced from the tls conn.
+fn read_request_head_tls(conn: tls.Conn) -> Bytes!:
+    buf := bytes.buffer_with_capacity(1024)
+    mut w1 := 0
+    mut w2 := 0
+    mut w3 := 0
+    mut w4 := 0
+    while true:
+        chunk := conn.read_bytes(1)!
+        if chunk.is_empty():
+            if buf.len() == 0:
+                return bytes.empty()
+            return buf.take_bytes()
+        buf.write(chunk)!
+        w1 = w2
+        w2 = w3
+        w3 = w4
+        w4 = chunk[0]
+        if w1 == 13 and w2 == 10 and w3 == 13 and w4 == 10:
+            return buf.take_bytes()
+    return bytes.empty()
+
+# read one http/1.1 request off a tls conn: the head, then a content-length body.
+# an empty head means the peer closed with nothing pending, which ends the loop
+# in serve_connection_tls.
+fn read_request_from_tls(conn: tls.Conn) -> HttpRequestBytes!:
+    head_bytes := read_request_head_tls(conn)!
+    if head_bytes.is_empty():
+        return build_http_request(bytes.empty(), bytes.empty())
+    content_length := content_length_from_head_bytes(head_bytes)!
+    body_buf := bytes.buffer_with_capacity(content_length)
+    while body_buf.len() < content_length:
+        remaining := content_length - body_buf.len()
+        chunk := conn.read_bytes(remaining)!
+        if chunk.is_empty():
+            break
+        body_buf.write(chunk)!
+    return build_http_request(head_bytes, body_buf.take_bytes())
+
+# serve http/1.1 requests over an already-handshaken tls conn until either side
+# closes. this is the http/1.1 fallback for a tls listener that offers alpn "h2"
+# and "http/1.1": a peer that negotiated "http/1.1" (or sent no alpn) is served
+# here over the same tls session. it mirrors serve_connection, only reading and
+# writing through the tls conn's own byte i/o rather than a buffered socket
+# stream. the caller closes the conn.
+pub fn serve_connection_tls(conn: tls.Conn, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
+    mut total := 0
+    while true:
+        req := read_request_from_tls(conn)!
+        if req.head.is_empty() and req.method_text == "":
+            return total
+        resp := response_for_connection(req, handler(req))
+        total = total + conn.write_all_bytes(resp.to_bytes()!)!
+        if response_closes_connection(req, resp):
+            return total
+
 # accepts one client from a listener fd and serves exactly one request.
 pub fn serve_listener_once(listener_fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
     return serve_fd(tcp_accept(listener_fd)!, handler)

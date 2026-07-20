@@ -1,0 +1,59 @@
+# capturing a fn-value into a closure and calling it through the capture.
+# a struct-returning fn-value used to be miscompiled here: inside the closure
+# body the captured name's type was unknown, so `f(x)` (whose result is a
+# struct) was mistaken for a construction of that struct and never called the
+# captured function. these cases exercise capture from a local, a parameter,
+# and a list element, plus the middleware-style fold that motivated the fix.
+
+struct Resp:
+    body: String
+
+# capture a struct-returning fn-value held in a local, call it through the
+# closure, then read a field off the returned struct.
+fn from_local() -> String:
+    f := make
+    g := fn(n: Int) => f(n)
+    return g(1).body
+
+fn make(n: Int) -> Resp:
+    return Resp("made-" + n.to_string())
+
+# capture a struct-returning fn-value passed in as a parameter.
+fn from_param(f: fn(Int) -> Resp) -> String:
+    g := fn(n: Int) => f(n)
+    return g(2).body
+
+# capture a struct-returning fn-value read out of a list element.
+fn from_list() -> String:
+    fns: List[fn(Int) -> Resp] := [make]
+    f := fns[0]
+    g := fn(n: Int) => f(n)
+    return g(3).body
+
+# the middleware fold: each step captures the previous stage (a fn-value) and
+# the current middleware (another fn-value read from a list) into a closure.
+fn handler(r: Resp) -> Resp:
+    return r
+
+fn wrap_a(next: fn(Resp) -> Resp, r: Resp) -> Resp:
+    return Resp("a(" + next(r).body + ")")
+
+fn wrap_b(next: fn(Resp) -> Resp, r: Resp) -> Resp:
+    return Resp("b(" + next(r).body + ")")
+
+fn fold() -> String:
+    mws: List[fn(fn(Resp) -> Resp, Resp) -> Resp] := [wrap_a, wrap_b]
+    mut current: fn(Resp) -> Resp := handler
+    mut i := mws.len() - 1
+    while i >= 0:
+        mw := mws[i]
+        prev := current
+        current = fn(r: Resp) => mw(prev, r)
+        i = i - 1
+    return current(Resp("core")).body
+
+fn main():
+    print(from_local())
+    print(from_param(make))
+    print(from_list())
+    print(fold())

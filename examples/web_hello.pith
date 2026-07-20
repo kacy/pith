@@ -1,0 +1,51 @@
+# a tiny web server with std.web.
+#
+# the server itself is just build_app() plus listen(): a couple of routes, one
+# with a `:name` path parameter. in a real program main would end with
+#
+#     build_app().listen("0.0.0.0", 8080)!
+#
+# and stay up until you stop it. so this can run as a self-checking example, we
+# instead spawn the server, make a few requests against it, print the replies,
+# and exit.
+import std.web as web
+import std.net.http as http
+import std.net.tcp as tcp
+
+# GET /hello/:name — greet whoever is named in the path.
+fn greet(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "hello, " + req.param("name"))
+
+# the whole application: a welcome page and the greeting route. routes are added
+# one per line because a builder chain has to stay on a single line.
+fn build_app() -> web.App:
+    mut app := web.new()
+    app = app.get("/", fn(req: web.Request) => http.text(200, "welcome to pith"))
+    app = app.get("/hello/:name", greet)
+    return app
+
+# run the server in the background so main can act as a client against it.
+fn serve_bg(port: Int) -> Int:
+    return build_app().listen("127.0.0.1", port) catch 0
+
+# a minimal GET that returns just the response body, so we can print it.
+fn fetch(port: Int, path: String) -> String:
+    fd := tcp.connect("127.0.0.1", port) catch 0
+    crlf := chr(13) + chr(10)
+    tcp.write(fd, "GET " + path + " HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf) catch 0
+    raw := tcp.read(fd, 65536) catch ""
+    tcp.close(fd)
+    split := raw.index_of(crlf + crlf)
+    if split < 0:
+        return raw
+    return raw.substring(split + 4, raw.len())
+
+fn main() -> Int!:
+    port := 18080
+    spawn serve_bg(port)
+    sleep(200)   # give the listener a moment to bind
+
+    print(fetch(port, "/"))
+    print(fetch(port, "/hello/ada"))
+    print(fetch(port, "/healthz"))
+    return 0

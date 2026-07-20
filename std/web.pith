@@ -40,7 +40,13 @@
 # when you want the framework and none of that — e.g. a benchmark.
 
 import std.net.http as http
+import std.net.http2.server as http2server
+import std.net.http2.frames as frames
+import std.net.http2.hpack as hpack
 import std.net.tcp as tcp
+import std.net.tls as tls
+import std.binary as binary
+import std.bytes as bytes
 import std.metrics as metrics
 import std.prometheus as prometheus
 import std.time as time_mod
@@ -264,6 +270,18 @@ fn handle_conn(app: App, fd: Int):
     tcp_set_timeout(fd, CONNECTION_TIMEOUT_MS)
     http.serve_connection_fd(fd, fn(req: http.HttpRequestBytes) => dispatch(app, req)) catch 0
 
+# serve one accepted tls connection: native http/2 when the client negotiated
+# alpn "h2", http/1.1 over the same tls session otherwise. either way the request
+# funnels through dispatch, so routing, middleware, and observability are the same
+# as the plaintext listen. the http/2 server closes the conn itself; the http/1.1
+# fallback does not, so we close it here. spawned per connection by listen_tls.
+fn handle_tls_conn(app: App, conn: tls.Conn):
+    if conn.negotiated_protocol() == "h2":
+        http2server.serve_h2_tls_connection(conn, fn(req: http.HttpRequestBytes) => dispatch(app, req))
+        return
+    http.serve_connection_tls(conn, fn(req: http.HttpRequestBytes) => dispatch(app, req)) catch 0
+    conn.close()
+
 impl App:
     # register a GET route. returns a new App, so calls chain:
     # `web.new().get("/", home).get("/users/:id", show)`.
@@ -302,6 +320,33 @@ impl App:
         while true:
             client := tcp_accept(fd)!
             spawn handle_conn(app, client)
+        return 0
+
+    # bind host:port and serve forever over cleartext http/2 (h2c), one task per
+    # connection. the whole app runs unchanged — every request funnels through the
+    # same dispatch listen uses, so routing, middleware, and observability behave
+    # identically, only over http/2. h2c has no tls, so this needs no certificate;
+    # reach for listen_tls when you want http/2 with encryption. this blocks, like
+    # listen; spawn it if you need to keep going.
+    fn listen_h2c(host: String, port: Int) -> Int!:
+        app := self
+        return http2server.listen_h2c(host, port, fn(req: http.HttpRequestBytes) => dispatch(app, req))!
+
+    # bind host:port and serve forever over tls, negotiating http/2 when the client
+    # supports it and falling back to http/1.1 on the same connection otherwise.
+    # the listener offers alpn ["h2", "http/1.1"]: a client that selects "h2" is
+    # served by the native http/2 server, and anything else (http/1.1, or a client
+    # that sends no alpn) is served as http/1.1 over the same tls session. either
+    # way every request runs through dispatch, so the app behaves exactly as it
+    # does on the plaintext listen. `cert` and `key` are paths to pem files. this
+    # blocks, like listen; spawn it if you need to keep going.
+    fn listen_tls(host: String, port: Int, cert: String, key: String) -> Int!:
+        app := self
+        config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
+        listener := tls.listen(host, port, config)!
+        while true:
+            client := tls.accept(listener)!
+            spawn handle_tls_conn(app, client)
         return 0
 
 # --- tests ---
@@ -472,3 +517,124 @@ test "metrics are recorded with tracing off, and the span is a no-op":
     assert_eq(get_body(port, "/obs-count"), "pong")
     after := metrics.counter(OBS_REQUESTS_TOTAL).labels(series).value()
     assert_eq(after - before, 1.0)
+
+# --- http/2 (h2c) tests ---
+#
+# these serve a real web.App over cleartext http/2 and drive it with the tiny
+# h2c client below, proving the whole routing/middleware stack answers the same
+# over http/2 as it does over http/1.1. the client speaks just enough http/2 for
+# one request: the connection preface, an empty SETTINGS frame, and a GET as a
+# single HEADERS frame; it then reads response frames until the stream ends and
+# returns the DATA payload as the body.
+
+H2C_PREFACE := "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+# a background listen_h2c() for tests: swallow the (never-returned) result so it
+# can be spawned as a plain call, exactly like serve_bg does for listen.
+fn serve_h2c_bg(app: App, port: Int) -> Int:
+    return app.listen_h2c("127.0.0.1", port) catch 0
+
+# a framed reader over a tcp fd: buffer bytes and slice out one whole frame at a
+# time, pulling more from the socket when the buffer is short (a frame can span
+# reads). the same shape the server's ServerConn uses to read frames.
+struct FrameStream:
+    mut fd: Int
+    mut buf: Bytes
+    mut pos: Int
+
+impl FrameStream:
+    fn fill(n: Int) -> Int!:
+        while self.buf.len() - self.pos < n:
+            chunk := tcp_read_bytes(self.fd, 16384)!
+            if chunk.len() == 0:
+                fail "h2c client: connection closed"
+            self.buf = bytes.concat(self.buf.slice(self.pos, self.buf.len()), chunk)
+            self.pos = 0
+        return 0
+
+    fn next_frame() -> frames.Frame!:
+        self.fill(9)!
+        length_res := binary.read_u24_be_at(self.buf, self.pos)
+        if length_res.is_err:
+            fail length_res.err.message
+        total := 9 + length_res.ok
+        self.fill(total)!
+        full := self.buf.slice(self.pos, self.pos + total)
+        self.pos = self.pos + total
+        return frames.read_frame(binary.reader(full), frames.MAX_ALLOWED_FRAME_SIZE)!
+
+# send the preface, an empty SETTINGS, and a bodiless GET as one HEADERS frame
+# (END_STREAM + END_HEADERS). :authority is a fixed "localhost" — the app does
+# not route on it.
+fn send_h2c_get(fd: Int, path: String) -> Int!:
+    tcp_write_bytes(fd, bytes.from_string_utf8(H2C_PREFACE))!
+    no_settings: List[frames.Setting] := []
+    tcp_write_bytes(fd, frames.frame_bytes(frames.settings_frame(no_settings)!)!)!
+    encoder := hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false)
+    fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", "http"), hpack.header_field(":authority", "localhost")]
+    block := encoder.encode(fields)
+    tcp_write_bytes(fd, frames.frame_bytes(frames.headers_frame(1, block, true, true))!)!
+    return 0
+
+# read response frames until stream 1 ends, returning the DATA payload as text.
+# the server's SETTINGS and WINDOW_UPDATE housekeeping is ignored — a single
+# short-lived request need not ack it.
+fn read_h2c_body(fd: Int) -> String:
+    stream := FrameStream(fd, bytes.empty(), 0)
+    body := bytes.buffer()
+    while true:
+        attempt := stream.next_frame()
+        if attempt.is_err:
+            break
+        frame := attempt.ok
+        t := frame.header.frame_type
+        if t == frames.FRAME_HEADERS:
+            parsed := frames.parse_headers(frame)
+            if parsed.is_ok and parsed.ok.end_stream:
+                break
+        elif t == frames.FRAME_DATA:
+            data := frames.parse_data(frame)
+            if data.is_ok:
+                body.write(data.ok.data) catch 0
+                if data.ok.end_stream:
+                    break
+        elif t == frames.FRAME_GOAWAY:
+            break
+    result := body.bytes()
+    body.free()
+    return result.to_string_utf8() catch ""
+
+# GET `path` from an h2c server on `port` and return the response body, or "" on
+# any connection error. mirrors get_body's role for the http/1.1 tests.
+fn h2c_get_body(port: Int, path: String) -> String:
+    connected := tcp.connect("127.0.0.1", port)
+    if connected.is_err:
+        return ""
+    fd := connected.ok
+    tcp.set_timeout(fd, 2000)
+    send_h2c_get(fd, path) catch 0
+    body := read_h2c_body(fd)
+    tcp.close(fd)
+    return body
+
+test "a web.App served over h2c routes a param path":
+    show := fn(req: Request) => http.text(200, "user " + req.param("id"))
+    app := new().get("/users/:id", show)
+    port := 18993
+    spawn serve_h2c_bg(app, port)
+    sleep(200)
+    assert_eq(h2c_get_body(port, "/users/42"), "user 42")
+
+test "a web.App served over h2c answers the default health check":
+    app := new()
+    port := 18994
+    spawn serve_h2c_bg(app, port)
+    sleep(200)
+    assert_eq(h2c_get_body(port, "/healthz"), "ok")
+
+test "a web.App served over h2c returns a 404 body for an unmatched path":
+    app := new().get("/", fn(req: Request) => http.text(200, "home"))
+    port := 18995
+    spawn serve_h2c_bg(app, port)
+    sleep(200)
+    assert(h2c_get_body(port, "/missing").contains("404"))

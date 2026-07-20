@@ -255,10 +255,40 @@ PITH_GREEN=1 ./your_server
 on the green runtime those per-connection tasks are green threads, so a server can
 carry many more connections than it has os threads.
 
+## http/2
+
+the same app serves http/2 with a different call. `listen_h2c` speaks cleartext
+http/2 (h2c), and `listen_tls` speaks http/2 over tls with an http/1.1 fallback.
+either way the request runs through the same routing, middleware, and
+observability as `listen`. only the transport changes, so nothing in your app
+has to know which one it is.
+
+```
+# cleartext http/2, no certificate needed
+app.listen_h2c("0.0.0.0", 8080)!
+```
+
+`listen_tls` offers alpn `["h2", "http/1.1"]` and branches per connection. a
+client that negotiates `h2` is served over http/2; anything else, including a
+client that sends no alpn, is served as http/1.1 over the same tls session. one
+listener handles a modern http/2 client and a plain https client alike.
+
+```
+# http/2 over tls, falling back to http/1.1 for clients that ask for it
+app.listen_tls("0.0.0.0", 8443, "cert.pem", "key.pem")!
+```
+
+`cert` and `key` are paths to pem files: the server certificate and its private
+key. h2c needs neither, which makes it the easy choice behind a load balancer
+that terminates tls. reach for `listen_tls` when the pith server terminates tls
+itself.
+
 ## a runnable example
 
 `examples/web_hello.pith` is a complete, self-checking server: it defines a couple of
 routes, spawns the server, makes a few requests against itself, and prints the
 replies. `examples/web_observability.pith` does the same and then scrapes `/metrics` to
-show the request counter the framework kept on its own. `bench/web_hello.pith` is the
-same idea as a real blocking server, wired up for `bench/http_bench.sh`.
+show the request counter the framework kept on its own. `examples/web_h2.pith` serves
+the same kind of app over http/2 (h2c) and drives it with a small built-in h2c client.
+`bench/web_hello.pith` is the same idea as a real blocking server, wired up for
+`bench/http_bench.sh`.

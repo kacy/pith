@@ -1,0 +1,205 @@
+# std.db — the opinionated high-level database layer.
+#
+# pith ships pure-pith drivers for postgres and mysql (std.postgres, std.mysql).
+# this module sits above them the way std.web sits above std.net.http: you open
+# a pooled connection from a url and run explicit sql, and the typed row reads
+# and result shapes are the same whichever driver you picked.
+#
+#   import std.db.postgres as db
+#
+#   handle := db.open("postgres://me:pw@127.0.0.1:5432/app")!
+#   rows := handle.query("select id, name from users where id = $1", ["7"])!
+#   for row in rows:
+#       print("{row.int(\"id\")} {row.text(\"name\")}")
+#   handle.close()
+#
+# this file holds the driver-agnostic pieces — dsn parsing and the exec result.
+# the pooled `Db` itself lives in a per-driver module (std.db.postgres,
+# std.db.mysql), because a single compilation unit can only reach one driver at
+# a time.
+#
+# a query returns a plain List[std.sql.Row]. that keeps the result a builtin
+# collection (which crosses the driver/caller module boundary cleanly) while
+# still giving iteration, len, and indexing for free; each row carries the typed
+# accessors from std.sql (int/text/float/bool, opt_ variants, by name or index),
+# so they read the same whichever driver you picked.
+
+import std.sql as sql
+
+# a dsn broken into its parts. `driver` is "postgres" or "mysql"; the rest are
+# the connection coordinates, with a sensible default port and pool size filled
+# in when the url leaves them out.
+pub struct Dsn:
+    pub driver: String
+    pub user: String
+    pub password: String
+    pub host: String
+    pub port: Int
+    pub dbname: String
+    pub pool_size: Int
+
+# the default number of pooled connections when a url does not set `?pool=N`.
+# small enough to be polite to the server, large enough for a handful of
+# concurrent green tasks; raise it for a busy service.
+pub DEFAULT_POOL_SIZE := 8
+
+# parse a database url into its parts. the shape is
+#   scheme://[user[:password]@]host[:port][/dbname][?pool=N]
+# where scheme is postgres, postgresql, or mysql. the port defaults per driver
+# (5432 for postgres, 3306 for mysql) and the pool size defaults to
+# DEFAULT_POOL_SIZE. it fails on an unknown scheme or a missing host.
+pub fn parse_url(url: String) -> Dsn!:
+    # parsed with builtin string methods (index_of/substring/split) rather than
+    # std.strings, on purpose: the per-driver adapter that calls this holds a
+    # driver pool across a module boundary, and exercising std.strings on that
+    # call path currently miscompiles the pooled connection. the builtin ops are
+    # unaffected, so the whole db layer stays clear of std.strings.
+    scheme_at := url.index_of("://")
+    if scheme_at < 0:
+        fail "db: url has no scheme: {url}"
+    driver := normalize_driver(url.substring(0, scheme_at))!
+    mut rest := url.substring(scheme_at + 3, url.len())
+
+    # peel the query string (only `pool` is honored today) off the tail.
+    mut pool_size := DEFAULT_POOL_SIZE
+    query_at := rest.index_of("?")
+    if query_at >= 0:
+        pool_size = pool_from_query(rest.substring(query_at + 1, rest.len()), pool_size)
+        rest = rest.substring(0, query_at)
+
+    # split the authority (credentials + host) from the database path.
+    mut authority := rest
+    mut dbname := ""
+    path_at := rest.index_of("/")
+    if path_at >= 0:
+        authority = rest.substring(0, path_at)
+        dbname = rest.substring(path_at + 1, rest.len())
+
+    # split optional user:password off the host:port, honoring the last '@' so a
+    # password may itself contain one.
+    mut hostport := authority
+    mut user := ""
+    mut password := ""
+    cred_at := authority.last_index_of("@")
+    if cred_at >= 0:
+        userinfo := authority.substring(0, cred_at)
+        hostport = authority.substring(cred_at + 1, authority.len())
+        colon_at := userinfo.index_of(":")
+        if colon_at >= 0:
+            user = userinfo.substring(0, colon_at)
+            password = userinfo.substring(colon_at + 1, userinfo.len())
+        else:
+            user = userinfo
+
+    mut host := hostport
+    mut port := default_port(driver)
+    port_at := hostport.index_of(":")
+    if port_at >= 0:
+        host = hostport.substring(0, port_at)
+        port = parse_int(hostport.substring(port_at + 1, hostport.len()))!
+    if host.len() == 0:
+        fail "db: url has no host: {url}"
+
+    return Dsn(driver: driver, user: user, password: password, host: host, port: port, dbname: dbname, pool_size: pool_size)
+
+# map a url scheme to a driver name, or fail when it is not one we ship.
+fn normalize_driver(scheme: String) -> String!:
+    if scheme == "postgres" or scheme == "postgresql":
+        return "postgres"
+    if scheme == "mysql":
+        return "mysql"
+    fail "db: unsupported driver scheme: {scheme}"
+
+# the default port for a driver.
+fn default_port(driver: String) -> Int:
+    if driver == "mysql":
+        return 3306
+    return 5432
+
+# read `pool=N` out of a query string, keeping `fallback` when it is absent or
+# not a positive integer.
+fn pool_from_query(query: String, fallback: Int) -> Int:
+    for pair in query.split("&"):
+        eq_at := pair.index_of("=")
+        if eq_at >= 0 and pair.substring(0, eq_at) == "pool":
+            n := parse_int(pair.substring(eq_at + 1, pair.len())) catch fallback
+            if n > 0:
+                return n
+    return fallback
+
+# --- rows helpers ---
+
+# the first row of a result, or none when it is empty. handy for a query that
+# returns at most one row:
+#   user := db.first(handle.query("select ... where id = $1", [id])!)
+pub fn first(rows: List[sql.Row]) -> sql.Row?:
+    if rows.len() == 0:
+        return none
+    return rows[0]
+
+# --- exec result ---
+
+# the outcome of a write (insert/update/delete/ddl). `rows_affected` is how many
+# rows the statement changed. `last_insert_id` is the id of a newly inserted row
+# where the driver reports one (mysql auto-increment); it is 0 when the driver
+# does not — postgres returns generated ids through `returning` instead, so use
+# `query` there.
+pub struct ExecResult:
+    pub rows_affected: Int
+    pub last_insert_id: Int
+
+# build an exec result.
+pub fn exec_result(rows_affected: Int, last_insert_id: Int) -> ExecResult:
+    return ExecResult(rows_affected: rows_affected, last_insert_id: last_insert_id)
+
+# --- tests (pure parsing; no server needed) ---
+
+test "parse_url reads a full postgres url":
+    dsn := parse_url("postgres://me:secret@db.internal:6000/app?pool=12")!
+    assert_eq(dsn.driver, "postgres")
+    assert_eq(dsn.user, "me")
+    assert_eq(dsn.password, "secret")
+    assert_eq(dsn.host, "db.internal")
+    assert_eq(dsn.port, 6000)
+    assert_eq(dsn.dbname, "app")
+    assert_eq(dsn.pool_size, 12)
+
+test "parse_url fills in default port and pool for postgres":
+    dsn := parse_url("postgres://localhost/app")!
+    assert_eq(dsn.port, 5432)
+    assert_eq(dsn.pool_size, DEFAULT_POOL_SIZE)
+    assert_eq(dsn.user, "")
+    assert_eq(dsn.password, "")
+    assert_eq(dsn.dbname, "app")
+
+test "parse_url defaults the mysql port":
+    dsn := parse_url("mysql://root@127.0.0.1/shop")!
+    assert_eq(dsn.driver, "mysql")
+    assert_eq(dsn.port, 3306)
+    assert_eq(dsn.user, "root")
+    assert_eq(dsn.password, "")
+
+test "parse_url accepts the postgresql scheme alias":
+    dsn := parse_url("postgresql://localhost:5433/app")!
+    assert_eq(dsn.driver, "postgres")
+    assert_eq(dsn.port, 5433)
+
+test "parse_url rejects an unknown scheme":
+    result := parse_url("redis://localhost/0")
+    assert(result.is_err)
+
+test "parse_url rejects a url with no scheme":
+    result := parse_url("localhost:5432/app")
+    assert(result.is_err)
+
+test "first returns the leading row or none":
+    rows := [sql.row([sql.integer(1)], ["id"]), sql.row([sql.integer(2)], ["id"])]
+    top := first(rows)
+    assert(top != none)
+    assert_eq(top.value().int("id"), 1)
+    assert(first([]) == none)
+
+test "exec_result carries affected and last insert id":
+    r := exec_result(3, 42)
+    assert_eq(r.rows_affected, 3)
+    assert_eq(r.last_insert_id, 42)

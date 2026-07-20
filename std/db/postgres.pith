@@ -1,0 +1,141 @@
+# std.db.postgres — the pooled, opinionated postgres entry point.
+#
+# open a pool from a url and run explicit sql; every query and exec borrows a
+# connection from the pool and returns it, so many green tasks can share one
+# `Db`:
+#
+#   import std.db.postgres as db
+#   import std.sql as sql
+#
+#   handle := db.open("postgres://me:pw@127.0.0.1:5432/app")!
+#   rows := handle.query("select id, name from users where id = $1", ["7"])!
+#   for row in rows:
+#       print("{row.int(\"id\")} {row.text(\"name\")}")
+#   handle.close()
+#
+# parameters bind postgres-style with `$1`, `$2`, ... placeholders. use `query`
+# for selects and `exec` for writes; to read back a generated id, add
+# `returning id` to the insert and read it with `query`.
+#
+# query and exec are observable in the box: each records a RED metric (a
+# db_queries_total counter and a db_query_duration_ms histogram, labeled by
+# driver and op) and opens a client trace span, the same story as the http and
+# grpc clients.
+
+import std.db as db
+import std.postgres as postgres
+import std.sql as sql
+import std.metrics as metrics
+import std.trace as trace
+import std.time as time
+from std.iter import Iterator
+
+# the open pools, indexed by the handle a Db carries, and a mutex guarding both
+# the list and each pool's idle set. the pool lives here rather than inside Db
+# for two reasons: a Db then carries only a plain handle, which sidesteps a
+# cross-module retain bug when a caller holds the handle; and one lock covers
+# every pool, so concurrent tasks borrow and return connections safely.
+mut pools: List[postgres.Pool] := []
+mut registry_mu := Mutex()
+
+# a pooled handle to a postgres database. it is just an index into the pool
+# registry, so it is cheap to copy and safe to share across tasks.
+pub struct Db:
+    handle: Int
+
+# open a pooled postgres database from a url. the url sets the host, port,
+# credentials, database, and optional `?pool=N` size; see std.db.parse_url for
+# the full shape. connections open lazily, on first use.
+pub fn open(url: String) -> Db!:
+    dsn := db.parse_url(url)!
+    if dsn.driver != "postgres":
+        fail "db.postgres: url is not a postgres url: {url}"
+    pool := postgres.pool(dsn.host, dsn.port, dsn.user, dsn.password, dsn.dbname, dsn.pool_size)
+    registry_mu.lock()
+    pools.push(pool)
+    handle := pools.len() - 1
+    registry_mu.unlock()
+    return Db(handle: handle)
+
+impl Db:
+    # run a parameterized query and buffer its rows. `$1`, `$2`, ... bind to
+    # `params` (in text form), keeping values off the sql string. the result is a
+    # list of std.sql.Row — iterate it, index it, or pass it to std.db.first; each
+    # row carries the typed accessors (row.int("id"), row.opt_text("email"), ...).
+    pub fn query(text: String, params: List[String]) -> List[sql.Row]!:
+        span := trace.start_kind("db.query", trace.CLIENT)
+        start := time.mono_millis()
+        outcome := self.run_query(text, params)
+        span.end()
+        record("query", outcome.is_err, time.mono_millis() - start)
+        if outcome.is_err:
+            fail outcome.err
+        return outcome.ok
+
+    # run a write (insert/update/delete/ddl) and report the rows it affected.
+    # postgres does not return a generated id here — add `returning id` and use
+    # `query` for that — so `last_insert_id` is always 0.
+    pub fn exec(text: String, params: List[String]) -> db.ExecResult!:
+        span := trace.start_kind("db.exec", trace.CLIENT)
+        start := time.mono_millis()
+        outcome := self.run_exec(text, params)
+        span.end()
+        record("exec", outcome.is_err, time.mono_millis() - start)
+        if outcome.is_err:
+            fail outcome.err
+        return outcome.ok
+
+    # borrow a connection, run the query, and return the connection to the pool.
+    # a failed query leaves the connection out of protocol sync, so it is closed
+    # rather than reused.
+    fn run_query(text: String, params: List[String]) -> List[sql.Row]!:
+        conn := self.borrow()!
+        attempt := postgres.query_params(conn, text, params)
+        if attempt.is_err:
+            conn.close()
+            fail attempt.err
+        mut rows: List[sql.Row] := []
+        for row in attempt.ok:
+            rows.push(row)
+        self.giveback(conn)
+        return rows
+
+    # borrow a connection, run the write, and return the connection to the pool.
+    fn run_exec(text: String, params: List[String]) -> db.ExecResult!:
+        conn := self.borrow()!
+        attempt := postgres.exec_params(conn, text, params)
+        if attempt.is_err:
+            conn.close()
+            fail attempt.err
+        self.giveback(conn)
+        return db.exec_result(attempt.ok, 0)
+
+    # take a connection from this handle's pool, under the registry lock.
+    fn borrow() -> postgres.Conn!:
+        registry_mu.lock()
+        attempt := pools[self.handle].acquire()
+        registry_mu.unlock()
+        if attempt.is_err:
+            fail attempt.err
+        return attempt.ok
+
+    # return a connection to this handle's pool, under the registry lock.
+    fn giveback(conn: postgres.Conn):
+        registry_mu.lock()
+        pools[self.handle].release(conn)
+        registry_mu.unlock()
+
+    # drain the pool, closing every idle connection.
+    pub fn close():
+        registry_mu.lock()
+        pools[self.handle].close()
+        registry_mu.unlock()
+
+# record the RED metrics for one operation: a count labeled ok/err and the
+# duration in the shared histogram.
+fn record(op: String, failed: Bool, elapsed_ms: Int):
+    mut status := "ok"
+    if failed:
+        status = "err"
+    metrics.counter("db_queries_total").labels(["driver", "postgres", "op", op, "status", status]).inc()
+    metrics.histogram("db_query_duration_ms").labels(["driver", "postgres", "op", op]).observe(elapsed_ms.to_float())

@@ -1,0 +1,87 @@
+# drives the native h2c server over a loopback socket with a hand-written
+# prior-knowledge client: preface, SETTINGS, one GET, then reads the response
+# frames. this exercises the server's live arc surface — the per-stream inbox and
+# handler task, the response descriptor crossing the outbound channel to the
+# writer, and the reader/writer teardown — end to end. under valgrind (make
+# memcheck) it guards against a use-after-free on any of those as they cross task
+# boundaries. serve_h2c_connection returns when the client closes, so the process
+# exits cleanly.
+
+import std.net.http2.server as server
+import std.net.http2.frames as frames
+import std.net.http2.hpack as hpack
+import std.net.http as http
+import std.bytes as bytes
+import std.binary as binary
+import std.encoding as encoding
+
+fn hello(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "/"
+    return http.text(200, "hello " + path)
+
+# accept one connection and serve it to completion.
+fn serve_once(listener: Int):
+    client_fd := tcp_accept(listener) catch 0
+    if client_fd != 0:
+        server.serve_h2c_connection(client_fd, hello)
+
+# send the 24-byte connection preface, an empty SETTINGS, and one GET on stream 1.
+fn send_request(fd: Int):
+    preface := encoding.from_hex("505249202a20485454502f322e300d0a0d0a534d0d0a0d0a") catch bytes.empty()
+    tcp_write_bytes(fd, preface) catch 0
+    settings := frames.frame_bytes(frames.settings_frame([]) catch frames.settings_ack_frame()) catch bytes.empty()
+    tcp_write_bytes(fd, settings) catch 0
+    encoder := hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false)
+    block := encoder.encode([hpack.header_field(":method", "GET"), hpack.header_field(":path", "/hi"), hpack.header_field(":scheme", "http"), hpack.header_field(":authority", "localhost")])
+    headers := frames.frame_bytes(frames.headers_frame(1, block, true, true)) catch bytes.empty()
+    tcp_write_bytes(fd, headers) catch 0
+
+# read frames until a DATA frame ends stream 1, collecting the body bytes.
+fn read_body(fd: Int) -> Bytes:
+    body := bytes.buffer()
+    mut buf := bytes.empty()
+    mut pos := 0
+    mut rounds := 0
+    while rounds < 200:
+        rounds = rounds + 1
+        # top up the buffer until a full frame header is available.
+        while buf.len() - pos < 9:
+            chunk := tcp_read_bytes(fd, 4096) catch bytes.empty()
+            if chunk.len() == 0:
+                out := body.bytes()
+                body.free()
+                return out
+            buf = bytes.concat(buf.slice(pos, buf.len()), chunk)
+            pos = 0
+        length := binary.read_u24_be_at(buf, pos).unwrap_or(0)
+        total := 9 + length
+        while buf.len() - pos < total:
+            chunk := tcp_read_bytes(fd, 4096) catch bytes.empty()
+            if chunk.len() == 0:
+                out := body.bytes()
+                body.free()
+                return out
+            buf = bytes.concat(buf.slice(pos, buf.len()), chunk)
+            pos = 0
+        full := buf.slice(pos, pos + total)
+        pos = pos + total
+        frame := frames.read_frame(binary.reader(full), frames.MAX_ALLOWED_FRAME_SIZE) catch frames.settings_ack_frame()
+        if frame.header.frame_type == frames.FRAME_DATA:
+            df := frames.parse_data(frame) catch frames.DataFrame(0, bytes.empty(), true)
+            body.write(df.data) catch 0
+            if df.end_stream:
+                out := body.bytes()
+                body.free()
+                return out
+
+fn main():
+    port := 17399
+    listener := tcp_listen("127.0.0.1", port) catch 0
+    task := spawn serve_once(listener)
+    fd := tcp_connect("127.0.0.1", port) catch 0
+    send_request(fd)
+    body := read_body(fd)
+    print("response: " + (body.to_string_utf8() catch "?"))
+    tcp_close(fd)
+    await task
+    tcp_close(listener)

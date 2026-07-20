@@ -216,9 +216,18 @@ it is off by default and still experimental. the known rough edges:
 
 - dns resolution at dial still blocks the worker (`getaddrinfo` is
   synchronous); only the tcp handshake and the bytes after it yield
-- there is no preemption yet, so a task that loops without ever yielding or
-  touching i/o can hold its worker; cooperative code that uses channels and
-  sockets shares fine
+- a compute-bound task that loops without ever touching a channel, await, or
+  socket can now be preempted, but you opt in at build time. compile with
+  `PITH_GREEN_PREEMPT=1` and the backend puts a safe-point at every loop
+  back-edge; run that binary under `PITH_GREEN=1` and a monitor thread makes a
+  task that has held its worker past its time slice yield, so its peers on the
+  same worker get to run. it is opt-in because that safe-point costs a bit on
+  every loop iteration (nothing you would notice on real work, but real on a
+  tight arithmetic loop), and the default build is almost always run os-thread,
+  so it plants no check and pays nothing. code that uses channels and sockets
+  already yields on its own and never needs this. one gap in this first version:
+  a task sitting inside a long native runtime call (a slow `getaddrinfo`, say)
+  is not preempted until it returns to pith code and hits the next back-edge
 - fewer workers means more locality: a task pins to the first worker that runs
   it and every later wake goes back to that one worker, never the whole pool, so
   a coordinated pipeline stays put and its handoffs stay in userspace. at

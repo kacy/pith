@@ -57,9 +57,23 @@ impl Request:
     fn query(name: String) -> String:
         return self.raw.query_param(name) catch ""
 
+    # the value of a query-string parameter, or `fallback` when it is missing
+    # or empty. reads cleaner than query() for optional parameters that have a
+    # sensible default, e.g. req.query_or("limit", "20").
+    fn query_or(name: String, fallback: String) -> String:
+        value := self.raw.query_param(name) catch ""
+        if value == "":
+            return fallback
+        return value
+
     # the value of a request header, or "" when it is absent.
     fn header(name: String) -> String:
         return self.raw.header(name) catch ""
+
+    # true when the request carries a json body, i.e. its Content-Type is
+    # application/json. use it to guard a handler before decoding the body.
+    fn is_json() -> Bool:
+        return self.header("Content-Type").contains("application/json")
 
     # the request body decoded as text, or "" when there is none.
     fn body() -> String:
@@ -232,6 +246,23 @@ fn get_body(port: Int, path: String) -> String:
     tcp.set_timeout(fd, 2000)
     crlf := chr(13) + chr(10)
     tcp.write(fd, "GET " + path + " HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf) catch 0
+    return read_response_body(fd)
+
+# same as get_body but sends a Content-Type header, so a handler can test what
+# req.is_json() makes of the request.
+fn get_body_with_content_type(port: Int, path: String, content_type: String) -> String:
+    connected := tcp.connect("127.0.0.1", port)
+    if connected.is_err:
+        return ""
+    fd := connected.ok
+    tcp.set_timeout(fd, 2000)
+    crlf := chr(13) + chr(10)
+    tcp.write(fd, "GET " + path + " HTTP/1.1" + crlf + "Host: localhost" + crlf + "Content-Type: " + content_type + crlf + "Connection: close" + crlf + crlf) catch 0
+    return read_response_body(fd)
+
+# read a whole response off a socket and return only the body.
+fn read_response_body(fd: Int) -> String:
+    crlf := chr(13) + chr(10)
     raw := tcp.read(fd, 65536) catch ""
     tcp.close(fd)
     split := raw.index_of(crlf + crlf)
@@ -303,3 +334,27 @@ test "a trailing slash matches the same route":
     spawn serve_bg(app, port)
     sleep(200)
     assert_eq(get_body(port, "/about/"), "about")
+
+# echoes a query parameter through query_or so a test can see the fallback.
+fn echo_limit(req: Request) -> http.HttpResponse:
+    return http.text(200, req.query_or("limit", "20"))
+
+test "query_or returns the value when present and the fallback when not":
+    app := new().get("/items", echo_limit)
+    port := 18988
+    spawn serve_bg(app, port)
+    sleep(200)
+    assert_eq(get_body(port, "/items?limit=5"), "5")
+    assert_eq(get_body(port, "/items"), "20")
+
+# reports whether the request looked like json, so a test can check is_json.
+fn echo_is_json(req: Request) -> http.HttpResponse:
+    return http.text(200, req.is_json().to_string())
+
+test "is_json is true only for an application/json content type":
+    app := new().get("/probe", echo_is_json)
+    port := 18989
+    spawn serve_bg(app, port)
+    sleep(200)
+    assert_eq(get_body_with_content_type(port, "/probe", "application/json"), "true")
+    assert_eq(get_body_with_content_type(port, "/probe", "text/plain"), "false")

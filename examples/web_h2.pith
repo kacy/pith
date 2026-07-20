@@ -1,0 +1,146 @@
+# a std.web server over http/2.
+#
+# this is web_hello with one line changed: listen_h2c instead of listen. the app
+# is exactly the same — a couple of routes, one with a `:name` parameter and one
+# that returns json — and every request runs through the same routing and
+# middleware. only the transport is different: cleartext http/2 (h2c) instead of
+# http/1.1. in a real program main would end with
+#
+#     build_app().listen_h2c("0.0.0.0", 8080)!
+#
+# and stay up. so this can run as a self-checking example, we spawn the server,
+# make a few requests against it with a tiny built-in h2c client, print the reply
+# bodies, and exit. h2c needs no tls, so there is no certificate to manage — use
+# app.listen_tls(host, port, cert, key) for http/2 with encryption.
+import std.web as web
+import std.net.http as http
+import std.net.http2.frames as frames
+import std.net.http2.hpack as hpack
+import std.binary as binary
+import std.bytes as bytes
+import std.json as json
+import std.net.tcp as tcp
+
+# GET /hello/:name — greet whoever is named in the path.
+fn greet(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "hello, " + req.param("name"))
+
+# GET /time/:zone — a small json route, to show json flows over http/2 unchanged.
+fn zone_info(req: web.Request) -> http.HttpResponse:
+    obj := json.make_object()
+    json.object_set(obj, "zone", json.make_string(req.param("zone")))
+    json.object_set(obj, "protocol", json.make_string("h2c"))
+    return http.json(200, json.encode(obj))
+
+# the whole application: a greeting route and a json route. routes are added one
+# per line because a builder chain has to stay on a single line.
+fn build_app() -> web.App:
+    mut app := web.new()
+    app = app.get("/hello/:name", greet)
+    app = app.get("/time/:zone", zone_info)
+    return app
+
+# run the server in the background so main can act as a client against it. this
+# is the whole point of the example: a full web.App, served over http/2 with a
+# single method call.
+fn serve_bg(port: Int) -> Int:
+    return build_app().listen_h2c("127.0.0.1", port) catch 0
+
+# --- a tiny h2c client ---
+#
+# enough http/2 to make one request: the connection preface, an empty SETTINGS
+# frame, and a bodiless GET as a single HEADERS frame; then read response frames
+# until the stream ends and return the DATA payload as the body. the server's own
+# SETTINGS and WINDOW_UPDATE housekeeping is ignored — one short request need not
+# ack it.
+
+H2C_PREFACE := "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+# a framed reader over a tcp fd: buffer bytes and slice out one whole frame at a
+# time, pulling more from the socket when the buffer is short (a frame can span
+# reads).
+struct FrameStream:
+    mut fd: Int
+    mut buf: Bytes
+    mut pos: Int
+
+impl FrameStream:
+    fn fill(n: Int) -> Int!:
+        while self.buf.len() - self.pos < n:
+            chunk := tcp_read_bytes(self.fd, 16384)!
+            if chunk.len() == 0:
+                fail "h2c client: connection closed"
+            self.buf = bytes.concat(self.buf.slice(self.pos, self.buf.len()), chunk)
+            self.pos = 0
+        return 0
+
+    fn next_frame() -> frames.Frame!:
+        self.fill(9)!
+        length_res := binary.read_u24_be_at(self.buf, self.pos)
+        if length_res.is_err:
+            fail length_res.err.message
+        total := 9 + length_res.ok
+        self.fill(total)!
+        full := self.buf.slice(self.pos, self.pos + total)
+        self.pos = self.pos + total
+        return frames.read_frame(binary.reader(full), frames.MAX_ALLOWED_FRAME_SIZE)!
+
+# send the preface, an empty SETTINGS, and a bodiless GET as one HEADERS frame
+# (END_STREAM + END_HEADERS). :authority is a fixed "localhost" — the app does
+# not route on it.
+fn send_get(fd: Int, path: String) -> Int!:
+    tcp_write_bytes(fd, bytes.from_string_utf8(H2C_PREFACE))!
+    no_settings: List[frames.Setting] := []
+    tcp_write_bytes(fd, frames.frame_bytes(frames.settings_frame(no_settings)!)!)!
+    encoder := hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false)
+    fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", "http"), hpack.header_field(":authority", "localhost")]
+    block := encoder.encode(fields)
+    tcp_write_bytes(fd, frames.frame_bytes(frames.headers_frame(1, block, true, true))!)!
+    return 0
+
+# read response frames until stream 1 ends, returning the DATA payload as text.
+fn read_body(fd: Int) -> String:
+    stream := FrameStream(fd, bytes.empty(), 0)
+    body := bytes.buffer()
+    while true:
+        attempt := stream.next_frame()
+        if attempt.is_err:
+            break
+        frame := attempt.ok
+        t := frame.header.frame_type
+        if t == frames.FRAME_HEADERS:
+            parsed := frames.parse_headers(frame)
+            if parsed.is_ok and parsed.ok.end_stream:
+                break
+        elif t == frames.FRAME_DATA:
+            data := frames.parse_data(frame)
+            if data.is_ok:
+                body.write(data.ok.data) catch 0
+                if data.ok.end_stream:
+                    break
+        elif t == frames.FRAME_GOAWAY:
+            break
+    result := body.bytes()
+    body.free()
+    return result.to_string_utf8() catch ""
+
+# GET `path` over h2c and return just the response body, so we can print it.
+fn fetch(port: Int, path: String) -> String:
+    fd := tcp.connect("127.0.0.1", port) catch 0
+    tcp.set_timeout(fd, 2000)
+    send_get(fd, path) catch 0
+    body := read_body(fd)
+    tcp.close(fd)
+    return body
+
+fn main() -> Int!:
+    port := 18096
+    spawn serve_bg(port)
+    sleep(200)   # give the listener a moment to bind
+
+    # the same routing and middleware as http/1.1, answered over http/2.
+    print(fetch(port, "/hello/ada"))
+    print(fetch(port, "/time/utc"))
+    # the default health check web.new() installs, served over http/2 too.
+    print(fetch(port, "/healthz"))
+    return 0

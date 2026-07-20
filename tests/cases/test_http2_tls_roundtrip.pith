@@ -1,16 +1,21 @@
 # the phase payoff: pith's own http/2 client talks to pith's own http/2 server
 # over pith's own tls 1.3 with alpn "h2" — pure pith end to end, no external
 # stack. the server (std.net.http2.server.serve_h2_tls_connection) accepts tls
-# connections that negotiated "h2" and serves GETs; the client
+# connections that negotiated "h2" and serves GETs and POSTs; the client
 # (std.net.http2.connection) dials with alpn "h2", verifies the fixture ca, and
 # multiplexes concurrent streams.
 #
-# two concurrency cases run: several concurrent streams over one multiplexed
-# client (which promotes the client to its reader/writer pipeline), then a Pool
-# of independent connections serving concurrent requests. under valgrind (make
-# memcheck) this guards the arc surface as request state crosses the per-stream
-# handler tasks and the tls transport. the server awaits every serve task before
-# returning, so teardown is clean and the process exits deterministically.
+# the cases run: several concurrent GET streams over one multiplexed client (which
+# promotes the client to its reader/writer pipeline); POST bodies echoed back over
+# the same client — a small body, then a 200000-byte body larger than the 65535
+# initial window in both directions, which forces the server to replenish its
+# receive window on the upload and to chunk-and-gate the echoed response on the
+# client's send window, asserting the >window payload survives both halves of the
+# flow control byte for byte; then a Pool of independent connections serving
+# concurrent requests. under valgrind (make memcheck) this guards the arc surface
+# as request and body state crosses the per-stream handler tasks and the tls
+# transport. the server awaits every serve task before returning, so teardown is
+# clean and the process exits deterministically.
 
 import std.net.http2.server as server
 import std.net.http2.connection as http2
@@ -23,11 +28,28 @@ CERT_PATH := "tests/live/fixtures/localhost.crt"
 KEY_PATH := "tests/live/fixtures/localhost.key"
 CA_PATH := "tests/live/fixtures/localhost-ca.crt"
 
-# the handler: echo the request path back so each concurrent stream has a
-# distinct, checkable response body.
+# the handler: a POST echoes its request body back (so the body assembly and the
+# flow control in both directions are checked end to end), and any other verb
+# echoes the request path (so each concurrent GET stream has a distinct body).
 fn hello(req: http.HttpRequestBytes) -> http.HttpResponse:
+    method := req.method() catch "GET"
+    if method == "POST":
+        return http.response(200).with_body_bytes(req.body_bytes()).content_type("application/octet-stream")
     path := req.path() catch "/"
     return http.text(200, "hello " + path)
+
+# build an n-byte deterministic payload (a repeated 16-byte pattern). n is chosen
+# as a multiple of 16 by the caller so the buffer lands exactly on n bytes.
+fn make_payload(n: Int) -> Bytes:
+    buf := bytes.buffer()
+    chunk := bytes.from_string_utf8("0123456789abcdef")
+    mut written := 0
+    while written < n:
+        buf.write(chunk) catch 0
+        written = written + 16
+    out := buf.bytes()
+    buf.free()
+    return out
 
 # find a free loopback port so repeated runs (build, then valgrind) never collide
 # with a socket still in TIME_WAIT.
@@ -113,6 +135,25 @@ fn main() -> Int!:
     assert(r3.ok)
     assert(r4.ok)
     assert(r1.status == 200)
+
+    # --- case 1b: POST bodies with real flow control, over the same client ---
+    # a small POST body echoed back verifies request-body assembly end to end.
+    no_extra: List[hpack.HeaderField] := []
+    small := bytes.from_string_utf8("ping over pith h2 tls")
+    echo_small := client.request("POST", authority, "/echo", no_extra, small)!
+    assert(echo_small.status == 200)
+    assert(bytes.eq(echo_small.body, small))
+
+    # a body larger than the 65535-byte initial window in BOTH directions: the
+    # upload forces the server to replenish its receive window (WINDOW_UPDATE), and
+    # the echoed response forces the server to chunk and gate on the client's send
+    # window, resuming as the client replenishes. asserting exact bytes proves both
+    # halves of the flow control carry a >window payload intact.
+    big := make_payload(200000)
+    echo_big := client.request("POST", authority, "/echo", no_extra, big)!
+    assert(echo_big.status == 200)
+    assert(echo_big.body.len() == 200000)
+    assert(bytes.eq(echo_big.body, big))
     client.close()
 
     # --- case 2: concurrent requests across a pool of connections ---
@@ -131,5 +172,5 @@ fn main() -> Int!:
     pool.close()
 
     await server_task
-    print("pith h2 client <-> pith h2 server over tls: all responses correct")
+    print("pith h2 client <-> pith h2 server over tls: gets, post echoes, and a >window body all correct")
     return 0

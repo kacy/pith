@@ -86,7 +86,7 @@ use corosensei::{Coroutine, CoroutineResult, Yielder};
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock};
 use std::time::Duration;
 
@@ -124,6 +124,109 @@ extern "C" fn dump_stats() {
         "[green-stats] wakes: same-worker={same} cross-worker={cross} reactor={reactor} \
          | futex-wakes={futex} absorbed={absorbed}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// cooperative preemption (P5). a compute-only green task that never blocks would
+// otherwise hold its worker forever and starve every other task pinned to it.
+// the fix is a safe-point at every loop back-edge: the cranelift backend emits,
+// before the branch, a single load of `PITH_PREEMPT_REQUESTED` and — only when
+// it is set — a call to `pith_green_maybe_yield`. a `sysmon` thread (see
+// `monitor_loop`) watches the workers and sets the flag when a task outruns its
+// quantum. the flag is process-global and the epoch is a coarse tick, so the hot
+// path (flag clear) is one relaxed i8 load and a predicted-not-taken branch, no
+// call and no clock syscall.
+// ---------------------------------------------------------------------------
+
+/// process-global preemption request flag. the monitor sets it to 1 when some
+/// worker's running green task has outrun its quantum; the JIT-emitted
+/// safe-points at loop back-edges load it inline and, only when it is nonzero,
+/// call `pith_green_maybe_yield`. exported unmangled so the cranelift backend can
+/// import it as an external data symbol and load it directly from generated code.
+///
+/// it is only ever set by the monitor thread, which runs only under the green
+/// backend. under the os-thread backend the monitor never starts, so the flag
+/// stays 0 and the inline safe-point branch is never taken — and even if it were,
+/// `pith_green_maybe_yield` is a no-op off a green task (see there). that is what
+/// makes emitting the check into all code harmless off-green.
+#[no_mangle]
+pub static PITH_PREEMPT_REQUESTED: AtomicU8 = AtomicU8::new(0);
+
+/// coarse monotonic tick, bumped once per monitor pass (~10 ms). a worker stamps
+/// its `running_since` with this value when it resumes a task; the monitor and
+/// `pith_green_maybe_yield` compare against it to decide whether a task has
+/// overrun. a tick rather than a wall clock keeps the hot resume path to a single
+/// relaxed load instead of a clock syscall.
+static PREEMPT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// how many monitor epochs a task may run before it is asked to yield. with the
+/// ~10 ms monitor pass, one epoch is roughly a 10-20 ms slice — the same ballpark
+/// as go's 10 ms preemption quantum. small enough to keep a compute task from
+/// starving its peers, large enough that ordinary cooperative code (which yields
+/// far more often) never trips it.
+const QUANTUM_EPOCHS: u64 = 1;
+
+/// how often the monitor thread wakes to bump the epoch and scan the workers.
+const MONITOR_INTERVAL: Duration = Duration::from_millis(10);
+
+/// has the task the given worker is running exceeded its quantum as of `now`?
+/// factored out so both the monitor and `pith_green_maybe_yield` share one
+/// definition of "overrun", and so the epoch arithmetic is unit-testable.
+fn task_overrun(running_since: u64, now: u64) -> bool {
+    now.saturating_sub(running_since) >= QUANTUM_EPOCHS
+}
+
+/// safe-point slow path, called from JIT-emitted code at a loop back-edge only
+/// when `PITH_PREEMPT_REQUESTED` is set. three cheap gates, in order:
+///
+/// 1. not inside a green task (os-thread backend, the main thread, between tasks)
+///    → return immediately. this is the hard no-op that makes the flag-off and
+///    os-thread paths safe even though the check is emitted into all code.
+/// 2. inside a green task but this task has not actually outrun its quantum →
+///    return. the flag is process-global and coarse, so a set flag wakes *every*
+///    running task at its next back-edge; this gate absorbs those spurious wakes
+///    so only the genuinely-overrunning task yields.
+/// 3. overrun → set `wake_pending` so `run_task`'s yield path re-enqueues us onto
+///    our owner worker (pinning holds — we resume on the same worker), then
+///    `park_current` to suspend the coroutine back to the scheduler. this reuses
+///    the P2 park/wake protocol wholesale; no new scheduler path is added.
+///
+/// # Safety
+/// must be called only from generated pith code running on a worker thread, the
+/// same contract as any other runtime FFI reached from JIT code.
+#[no_mangle]
+pub extern "C" fn pith_green_maybe_yield() {
+    // gate 1: are we inside a green task at all?
+    let Some(id) = current_task() else {
+        return;
+    };
+    let Some(worker_index) = CURRENT_WORKER.with(|c| c.get()) else {
+        return;
+    };
+
+    // gate 2: has *this* task actually outrun its quantum? read our worker's
+    // running_since and compare to the current epoch; a task that just started
+    // (or a spurious flag set) fails this and returns without yielding.
+    let now = PREEMPT_EPOCH.load(AtomicOrdering::Relaxed);
+    let running_since = scheduler().workers[worker_index]
+        .running_since
+        .load(AtomicOrdering::Relaxed);
+    if !task_overrun(running_since, now) {
+        return;
+    }
+
+    // gate 3: we are overrunning. arrange to be re-enqueued, then suspend. set
+    // wake_pending *before* parking so run_task's yield path (which checks it)
+    // re-enqueues us instead of leaving us parked with no block site to wake us.
+    {
+        let mut slab = lock_slab();
+        if let Some(task) = slab.get_mut(id).and_then(|slot| slot.as_mut()) {
+            task.wake_pending = true;
+        } else {
+            return;
+        }
+    }
+    park_current();
 }
 
 /// index into the task slab. the pith-facing task handle is always `id + 1`, so
@@ -284,6 +387,16 @@ struct Worker {
     /// lost-wakeup window exactly as the old single spot did.
     park_lock: Mutex<()>,
     park_cv: Condvar,
+    /// the slab id (`id + 1`, 0 = none) of the task this worker is currently
+    /// resuming. written right before `resume` and cleared right after, so the
+    /// monitor thread can spot a task that has been on-CPU too long. the monitor
+    /// only ever reads this (and `running_since`) via atomics — it never touches a
+    /// queue or coroutine — so it cannot race the worker over shared structure.
+    running_task: AtomicUsize,
+    /// the epoch (`PREEMPT_EPOCH`) at which this worker began resuming its current
+    /// task. the monitor and `pith_green_maybe_yield` compare it against the
+    /// current epoch to detect a quantum overrun.
+    running_since: AtomicU64,
 }
 
 /// the whole green runtime: the task slab, the per-worker queues + park spots,
@@ -459,6 +572,8 @@ fn scheduler() -> &'static Scheduler {
                 pinned: Mutex::new(VecDeque::new()),
                 park_lock: Mutex::new(()),
                 park_cv: Condvar::new(),
+                running_task: AtomicUsize::new(0),
+                running_since: AtomicU64::new(0),
             })
             .collect();
         Scheduler {
@@ -490,7 +605,8 @@ fn worker_count() -> usize {
 
 /// start the worker threads exactly once. called from the first green spawn, by
 /// which point `scheduler()` is initialized, so each worker can resolve the
-/// static safely inside its loop.
+/// static safely inside its loop. also starts the preemption monitor (sysmon)
+/// thread, so the monitor exists exactly when — and only when — green workers do.
 fn ensure_workers_started() {
     static WORKERS_STARTED: Once = Once::new();
     WORKERS_STARTED.call_once(|| {
@@ -501,7 +617,54 @@ fn ensure_workers_started() {
                 .spawn(move || worker_loop(i))
                 .expect("spawn green worker");
         }
+        start_monitor();
     });
+}
+
+/// start the preemption monitor (sysmon) thread. it is the only thing that ever
+/// sets `PITH_PREEMPT_REQUESTED`, and it starts only here alongside the green
+/// workers — so under the os-thread backend it never runs and the flag stays 0.
+fn start_monitor() {
+    std::thread::Builder::new()
+        .name("pith-green-sysmon".to_string())
+        .spawn(monitor_loop)
+        .expect("spawn green monitor");
+}
+
+/// the monitor loop: every `MONITOR_INTERVAL`, bump the epoch and scan the
+/// workers. if any worker's running task has outrun its quantum, request a
+/// preemption; otherwise clear the request. it only ever reads/writes atomics —
+/// each worker's `running_task`/`running_since` and the global flag/epoch — and
+/// never touches a queue or a coroutine, so it cannot race the workers over
+/// shared structure. the request is coarse (one process-global flag): a set flag
+/// nudges *every* running task at its next back-edge, and each task's own
+/// `pith_green_maybe_yield` decides whether it is the one that must yield.
+fn monitor_loop() {
+    let sched = scheduler();
+    loop {
+        std::thread::sleep(MONITOR_INTERVAL);
+        // advance time by one tick. workers stamp `running_since` with the epoch
+        // as they resume, so a task that spans a tick boundary shows an overrun.
+        let now = PREEMPT_EPOCH.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+
+        let mut any_overrun = false;
+        for worker in &sched.workers {
+            // a running task shows a nonzero id here; 0 means the worker is idle
+            // or between tasks, nothing to preempt.
+            if worker.running_task.load(AtomicOrdering::Relaxed) == 0 {
+                continue;
+            }
+            let running_since = worker.running_since.load(AtomicOrdering::Relaxed);
+            if task_overrun(running_since, now) {
+                any_overrun = true;
+                break;
+            }
+        }
+
+        // set when something is overrunning, clear otherwise. clearing each quiet
+        // pass keeps a stale request from waking tasks after the offender yields.
+        PITH_PREEMPT_REQUESTED.store(u8::from(any_overrun), AtomicOrdering::Relaxed);
+    }
 }
 
 /// push a *fresh* (never-resumed) task onto a stealable queue and wake one idle
@@ -781,9 +944,31 @@ fn run_task(id: TaskId) {
     let prev_task = CURRENT_TASK.with(|c| c.replace(Some(id)));
     let prev_yielder = CURRENT_YIELDER.with(|c| c.replace(yielder_ptr));
 
+    // publish this task as the worker's running task and stamp the epoch, so the
+    // monitor thread can detect a quantum overrun and set the preempt flag. only
+    // the monitor reads these, and only via atomics, so this never races the
+    // coroutine. cleared right after the resume returns.
+    let worker_index = CURRENT_WORKER.with(|c| c.get());
+    if let Some(w) = worker_index {
+        let worker = &scheduler().workers[w];
+        worker
+            .running_since
+            .store(PREEMPT_EPOCH.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
+        worker
+            .running_task
+            .store(id + 1, AtomicOrdering::Relaxed);
+    }
+
     // run outside the lock. SAFETY of the transmute-and-call lives inside the
     // coroutine body (see green_spawn); here we just drive the coroutine.
     let outcome = coro.0.resume(());
+
+    // no task running on this worker until it picks up the next one.
+    if let Some(w) = worker_index {
+        scheduler().workers[w]
+            .running_task
+            .store(0, AtomicOrdering::Relaxed);
+    }
 
     // on its first resume the body published its yielder pointer here; read it
     // back so we can re-install it on later resumes (the body's top does not run
@@ -1047,5 +1232,118 @@ mod tests {
             CoroutineResult::Return(v) => assert_eq!(v, 42),
             CoroutineResult::Yield(()) => panic!("unexpected yield"),
         }
+    }
+
+    // the preemption tests share the process-global epoch/flag and the task slab,
+    // so they must not run concurrently. this lock serializes them; the rest of
+    // the suite never touches those globals.
+    static PREEMPT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // the overrun predicate is the single definition of "this task has run too
+    // long" shared by the monitor and the safe-point. check the boundary: a task
+    // stamped at the current epoch has not overrun; one epoch later it has.
+    #[test]
+    fn task_overrun_triggers_after_one_epoch() {
+        assert!(!task_overrun(5, 5));
+        assert!(task_overrun(5, 5 + QUANTUM_EPOCHS));
+        assert!(task_overrun(5, 100));
+        // saturating: a stale `now` behind `running_since` never reports overrun.
+        assert!(!task_overrun(10, 3));
+    }
+
+    // off a green task (`current_task()` is None — the os-thread backend, main,
+    // or between tasks), the safe-point slow path must do nothing even with the
+    // flag forced on. this is the invariant that makes emitting the check into
+    // all code harmless off-green.
+    #[test]
+    fn maybe_yield_is_noop_without_running_task() {
+        let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(current_task().is_none());
+        PITH_PREEMPT_REQUESTED.store(1, AtomicOrdering::Relaxed);
+        // must return promptly without parking; if it tried to park with no
+        // running coroutine the debug_assert in park_current would fire.
+        pith_green_maybe_yield();
+        PITH_PREEMPT_REQUESTED.store(0, AtomicOrdering::Relaxed);
+    }
+
+    // full path: a green task that overruns its quantum hits a safe-point, parks,
+    // and is re-enqueued onto its owner worker's pinned queue — then resumes there
+    // and runs to completion. drives the real run_task/maybe_yield/park machinery
+    // on the test thread (no worker threads started), pinning the task to worker 0.
+    #[test]
+    fn maybe_yield_parks_and_requeues_on_owner() {
+        let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // act as worker 0 for the duration of this test.
+        CURRENT_WORKER.with(|c| c.set(Some(0)));
+
+        // a task body that, on its first resume, simulates the monitor observing
+        // time pass (bumps the epoch past the quantum) and then hits a safe-point;
+        // after it is resumed the second time it runs to completion.
+        let coro = TaskCoroutine::with_stack(
+            corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+            move |yielder: &TaskYielder, _input: ()| -> i64 {
+                CURRENT_YIELDER.with(|c| c.set(yielder as *const TaskYielder));
+                PREEMPT_EPOCH.fetch_add(QUANTUM_EPOCHS + 1, AtomicOrdering::Relaxed);
+                pith_green_maybe_yield();
+                99
+            },
+        );
+
+        let join = Arc::new((
+            Mutex::new(Join {
+                done: false,
+                result: 0,
+                green_waiters: Vec::new(),
+            }),
+            Condvar::new(),
+        ));
+        let id = {
+            let mut slab = lock_slab();
+            let id = slab.len();
+            slab.push(Some(Task {
+                coro: Some(SendCoroutine(coro)),
+                closure_handle: 0,
+                state: RunState::Ready,
+                result: 0,
+                owner: None,
+                yielder_ptr: YielderPtr(ptr::null()),
+                wake_pending: false,
+                join,
+                tls: Box::new(HashMap::new()),
+            }));
+            id
+        };
+
+        // force the flag on so the safe-point takes its slow path.
+        PITH_PREEMPT_REQUESTED.store(1, AtomicOrdering::Relaxed);
+
+        // first resume: the body overruns and parks at the safe-point. run_task's
+        // yield path must see wake_pending and re-enqueue onto owner 0.
+        run_task(id);
+        {
+            let slab = lock_slab();
+            let task = slab[id].as_ref().unwrap();
+            assert_eq!(task.owner, Some(0), "task should pin to worker 0");
+            assert!(task.state == RunState::Ready, "should be re-enqueued, not parked");
+        }
+        {
+            let mut pinned = scheduler().workers[0]
+                .pinned
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            assert_eq!(pinned.pop_front(), Some(id), "task should be on owner's pinned queue");
+        }
+
+        // second resume: runs to completion, records the result.
+        run_task(id);
+        {
+            let slab = lock_slab();
+            let task = slab[id].as_ref().unwrap();
+            assert!(task.state == RunState::Done);
+            assert_eq!(task.result, 99);
+        }
+
+        PITH_PREEMPT_REQUESTED.store(0, AtomicOrdering::Relaxed);
+        CURRENT_WORKER.with(|c| c.set(None));
     }
 }

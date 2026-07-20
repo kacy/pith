@@ -1,0 +1,135 @@
+# the phase payoff: pith's own http/2 client talks to pith's own http/2 server
+# over pith's own tls 1.3 with alpn "h2" — pure pith end to end, no external
+# stack. the server (std.net.http2.server.serve_h2_tls_connection) accepts tls
+# connections that negotiated "h2" and serves GETs; the client
+# (std.net.http2.connection) dials with alpn "h2", verifies the fixture ca, and
+# multiplexes concurrent streams.
+#
+# two concurrency cases run: several concurrent streams over one multiplexed
+# client (which promotes the client to its reader/writer pipeline), then a Pool
+# of independent connections serving concurrent requests. under valgrind (make
+# memcheck) this guards the arc surface as request state crosses the per-stream
+# handler tasks and the tls transport. the server awaits every serve task before
+# returning, so teardown is clean and the process exits deterministically.
+
+import std.net.http2.server as server
+import std.net.http2.connection as http2
+import std.net.http2.hpack as hpack
+import std.net.http as http
+import std.net.tls as tls
+import std.bytes as bytes
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+# the handler: echo the request path back so each concurrent stream has a
+# distinct, checkable response body.
+fn hello(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "/"
+    return http.text(200, "hello " + path)
+
+# find a free loopback port so repeated runs (build, then valgrind) never collide
+# with a socket still in TIME_WAIT.
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+# serve one accepted tls connection to completion, wrapped to return an Int so its
+# task handle can be collected and awaited (serve_h2_tls_connection is void).
+fn serve_one(conn: tls.Conn) -> Int:
+    server.serve_h2_tls_connection(conn, hello)
+    return 0
+
+# accept exactly `count` tls connections, serving each on its own task, then wait
+# for them all to finish before tearing the listener down.
+fn run_server(port: Int, count: Int) -> Int!:
+    config := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["h2", "http/1.1"])
+    listener := tls.listen("127.0.0.1", port, config)!
+    mut tasks: List[Task[Int]] := []
+    mut i := 0
+    while i < count:
+        conn := listener.accept()!
+        tasks.push(spawn serve_one(conn))
+        i = i + 1
+    for t in tasks:
+        await t
+    listener.close()
+    config.close()
+    return 0
+
+# a concurrent fetch worker over the shared multiplexed client. it checks the
+# response itself and returns just a pass/fail so nothing large crosses the await.
+struct FetchResult:
+    status: Int
+    ok: Bool
+
+fn fetch(client: http2.Client, authority: String, path: String) -> FetchResult:
+    attempt := client.get(authority, path)
+    if attempt.is_err:
+        return FetchResult(0, false)
+    r := attempt.ok
+    body := r.body.to_string_utf8() catch ""
+    return FetchResult(r.status, r.status == 200 and body == "hello " + path)
+
+# the same, but over a pooled set of connections.
+fn pool_fetch(pool: http2.Pool, authority: String, path: String) -> FetchResult:
+    extra: List[hpack.HeaderField] := []
+    attempt := pool.request("GET", authority, path, extra, bytes.empty())
+    if attempt.is_err:
+        return FetchResult(0, false)
+    r := attempt.ok
+    body := r.body.to_string_utf8() catch ""
+    return FetchResult(r.status, r.status == 200 and body == "hello " + path)
+
+fn client_config() -> tls.Config!:
+    return tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["h2"])
+
+fn main() -> Int!:
+    authority := "localhost"
+    port := choose_port(18760)!
+    # one connection for the multiplexed client, three for the pool below.
+    server_task := spawn run_server(port, 4)
+    sleep(200)
+
+    # --- case 1: concurrent streams over one multiplexed client ---
+    client := http2.open_with_config("127.0.0.1", port, client_config()!)!
+    t1 := spawn fetch(client, authority, "/one")
+    t2 := spawn fetch(client, authority, "/two")
+    t3 := spawn fetch(client, authority, "/three")
+    t4 := spawn fetch(client, authority, "/four")
+    r1 := await t1
+    r2 := await t2
+    r3 := await t3
+    r4 := await t4
+    assert(r1.ok)
+    assert(r2.ok)
+    assert(r3.ok)
+    assert(r4.ok)
+    assert(r1.status == 200)
+    client.close()
+
+    # --- case 2: concurrent requests across a pool of connections ---
+    pool := http2.open_pool_with_config("127.0.0.1", port, 3, client_config()!)!
+    p1 := spawn pool_fetch(pool, authority, "/alpha")
+    p2 := spawn pool_fetch(pool, authority, "/beta")
+    p3 := spawn pool_fetch(pool, authority, "/gamma")
+    p4 := spawn pool_fetch(pool, authority, "/delta")
+    p5 := spawn pool_fetch(pool, authority, "/epsilon")
+    p6 := spawn pool_fetch(pool, authority, "/zeta")
+    mut ok_count := 0
+    for res in [await p1, await p2, await p3, await p4, await p5, await p6]:
+        if res.ok:
+            ok_count = ok_count + 1
+    assert(ok_count == 6)
+    pool.close()
+
+    await server_task
+    print("pith h2 client <-> pith h2 server over tls: all responses correct")
+    return 0

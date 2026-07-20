@@ -2571,6 +2571,16 @@ fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
     # construction: the consumer dispatches through the closure handle
     if ir_lookup_name_type(callee_name) == "closure":
         return 0 - 1
+    # the scope check above reads ir_var_types, which only tracks the current
+    # scope's locals. a captured fn-value read inside a closure body isn't in
+    # there (captures are borrowed from the env, so they're deliberately left
+    # out of the type map), so its call would slip through and be miscompiled
+    # as a construction of its struct return type. consult the checker's type
+    # for the callee instead: any function-typed callee is an indirect call.
+    if node.children.len() > 0:
+        callee_tid := c_get_expr_type(node.children[0])
+        if callee_tid >= 0 and get_type_info(callee_tid).kind == "function":
+            return 0 - 1
     mut arg_nodes: List[Int] := []
     for child, i in node.children:
         if i == 0:

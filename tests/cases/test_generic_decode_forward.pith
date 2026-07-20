@@ -1,0 +1,44 @@
+# a generic wrapper that forwards its type parameter into json.decode_text
+# must decode into the concrete struct chosen by the caller. the decode
+# lowering recovers the concrete struct from the call's explicit type
+# argument under the active generic substitution, so parse[User] decodes a
+# User even though the wrapper body only ever mentions T.
+
+import std.json as json
+
+struct User:
+    pub name: String
+    pub age: Int
+
+# one layer of forwarding
+fn parse[T](s: String) -> T!json.JsonDecodeError:
+    return json.decode_text[T](s)!
+
+# two layers of forwarding
+fn parse_twice[T](s: String) -> T!json.JsonDecodeError:
+    return parse[T](s)!
+
+fn main() -> String!:
+    lb := chr(123)
+    rb := chr(125)
+    body := "{lb}\"name\":\"ada\",\"age\":36{rb}"
+
+    one := parse[User](body)
+    if one.is_ok:
+        print("one: {one.ok.name}@{one.ok.age}")
+    else:
+        print("one err: {one.err.message}")
+
+    two := parse_twice[User](body)
+    if two.is_ok:
+        print("two: {two.ok.name}@{two.ok.age}")
+    else:
+        print("two err: {two.err.message}")
+
+    # a decode failure must surface as a clean error, not a crash
+    bad := parse[User]("{lb}\"name\":\"ada\"{rb}")
+    if bad.is_ok:
+        print("bad: unexpected ok")
+    else:
+        print("bad: clean error")
+    return ""

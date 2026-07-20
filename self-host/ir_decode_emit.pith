@@ -12,9 +12,9 @@ from ast import Node, get_node, node_kind
 from ir_ast_helpers import ir_unwrap_pub_node
 from ir_builder import ir_emit, ir_reg, ir_str, ir_label, ir_new_temp_name, ir_var_types
 from checker import c_get_expr_type
-from ir_alias_registry import ir_config_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_is_config_decode_callee, ir_is_config_file_decode_callee, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_toml_require_full_name_for_type_name
+from ir_alias_registry import ir_config_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_is_config_decode_callee, ir_is_config_file_decode_callee, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_toml_call_name, ir_struct_field_tid_at, ir_toml_require_full_name_for_type_name, ir_active_generic_params, ir_active_generic_concrete_types, ir_type_aliases
 from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_tag, ir_json_field_type_char, ir_json_type_name_char, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_toml_require_helper_name
-from ir_generics import ir_generic_decl_indices, ir_config_generic_name_with_state, ir_generic_preferred_name, ir_json_generic_name_with_state, ir_queue_generic_specialization, ir_resolve_generic_module_call_name, ir_toml_generic_name_with_state
+from ir_generics import ir_generic_decl_indices, ir_config_generic_name_with_state, ir_generic_preferred_name, ir_json_generic_name_with_state, ir_queue_generic_specialization, ir_resolve_generic_module_call_name, ir_toml_generic_name_with_state, ir_specialize_type_name_with_state
 from ir_optionals import ir_emit_optional_none_value, ir_emit_optional_some_value
 from ir_path_helpers import ir_emit_dotted_path_lookup, ir_emit_dotted_path_lookup_or_return
 from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_zero_reg
@@ -24,6 +24,36 @@ from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_struct
 from ir_type_helpers import ir_type_from_tid
 from types import get_type_info, lookup_type_id
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_label
+
+# the concrete struct tid a decode call targets, or -1 when there is none.
+#
+# at a plain call site (json.decode_text[User](...)) the checker already
+# knows the result is User!, so we take the struct straight from the
+# expression type. inside a generic wrapper body — parse[T] specialized as
+# parse__User — the checker only ever saw the abstract T, so the expression
+# type is the type parameter, not the concrete struct. in that case we
+# recover the struct from the call's explicit type argument ([T]) by
+# substituting it through the active generic bindings (T -> User).
+pub fn ir_decode_target_tid(idx: Int, node: Node) -> Int:
+    ret_tid := c_get_expr_type(idx)
+    if ret_tid >= 0:
+        ret_info := get_type_info(ret_tid)
+        if ret_info.kind == "result" and get_type_info(ret_info.inner).kind == "struct":
+            return ret_info.inner
+    # fall back to the explicit type argument under the active substitution.
+    if node.children.len() == 0:
+        return 0 - 1
+    index_node := get_node(node.children[0])
+    if index_node.kind != "index" or index_node.children.len() < 2:
+        return 0 - 1
+    type_arg := get_node(index_node.children[1])
+    concrete_name := ir_specialize_type_name_with_state(type_arg.value, ir_active_generic_params, ir_active_generic_concrete_types, ir_type_aliases, ir_struct_names)
+    concrete_tid := lookup_type_id(concrete_name)
+    if concrete_tid < 0:
+        return 0 - 1
+    if get_type_info(concrete_tid).kind != "struct":
+        return 0 - 1
+    return concrete_tid
 
 ## per-argument expression emission through the threaded hook.
 fn ir_decode_collect_arg_regs(node: Node, start_idx: Int, emit_expr: fn(Int) -> Int) -> List[Int]:
@@ -526,16 +556,10 @@ pub fn ir_emit_config_decode_call(idx: Int, node: Node, prefixed: Bool, emit_exp
             return ir_zero_reg()
         prefix_r = arg_regs[1]
 
-    ret_tid := c_get_expr_type(idx)
-    if ret_tid < 0:
+    target_tid := ir_decode_target_tid(idx, node)
+    if target_tid < 0:
         return ir_zero_reg()
-    ret_info := get_type_info(ret_tid)
-    if ret_info.kind != "result":
-        return ir_zero_reg()
-    target_tid := ret_info.inner
     target_info := get_type_info(target_tid)
-    if target_info.kind != "struct":
-        return ir_zero_reg()
 
     temp_name := ir_new_temp_name("config_decode")
     ir_var_types.insert(temp_name, "tuple")
@@ -559,16 +583,10 @@ pub fn ir_emit_config_loader_decode_call(idx: Int, node: Node, loader_name: Stri
             return ir_zero_reg()
         prefix_r = arg_regs[1]
 
-    ret_tid := c_get_expr_type(idx)
-    if ret_tid < 0:
+    target_tid := ir_decode_target_tid(idx, node)
+    if target_tid < 0:
         return ir_zero_reg()
-    ret_info := get_type_info(ret_tid)
-    if ret_info.kind != "result":
-        return ir_zero_reg()
-    target_tid := ret_info.inner
     target_info := get_type_info(target_tid)
-    if target_info.kind != "struct":
-        return ir_zero_reg()
 
     temp_name := ir_new_temp_name("config_loader_decode")
     ir_var_types.insert(temp_name, "tuple")
@@ -674,16 +692,10 @@ pub fn ir_emit_toml_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
         return ir_zero_reg()
 
     mut handle_r := arg_regs[0]
-    ret_tid := c_get_expr_type(idx)
-    if ret_tid < 0:
+    target_tid := ir_decode_target_tid(idx, node)
+    if target_tid < 0:
         return ir_zero_reg()
-    ret_info := get_type_info(ret_tid)
-    if ret_info.kind != "result":
-        return ir_zero_reg()
-    target_tid := ret_info.inner
     target_info := get_type_info(target_tid)
-    if target_info.kind != "struct":
-        return ir_zero_reg()
 
     temp_name := ir_new_temp_name("toml_decode")
     ir_var_types.insert(temp_name, "tuple")
@@ -708,16 +720,10 @@ pub fn ir_emit_toml_decode_path_call(idx: Int, node: Node, text_input: Bool, emi
 
     mut handle_r := arg_regs[0]
     dotted_path_r := arg_regs[1]
-    ret_tid := c_get_expr_type(idx)
-    if ret_tid < 0:
+    target_tid := ir_decode_target_tid(idx, node)
+    if target_tid < 0:
         return ir_zero_reg()
-    ret_info := get_type_info(ret_tid)
-    if ret_info.kind != "result":
-        return ir_zero_reg()
-    target_tid := ret_info.inner
     target_info := get_type_info(target_tid)
-    if target_info.kind != "struct":
-        return ir_zero_reg()
 
     temp_name := ir_new_temp_name("toml_decode_path")
     ir_var_types.insert(temp_name, "tuple")
@@ -752,16 +758,10 @@ pub fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
 
     file_path_r := arg_regs[0]
     if not path_input:
-        ret_tid := c_get_expr_type(idx)
-        if ret_tid < 0:
+        target_tid := ir_decode_target_tid(idx, node)
+        if target_tid < 0:
             return ir_zero_reg()
-        ret_info := get_type_info(ret_tid)
-        if ret_info.kind != "result":
-            return ir_zero_reg()
-        target_tid := ret_info.inner
         target_info := get_type_info(target_tid)
-        if target_info.kind != "struct":
-            return ir_zero_reg()
 
         temp_name := ir_new_temp_name("toml_decode_file")
         ir_var_types.insert(temp_name, "tuple")
@@ -779,16 +779,10 @@ pub fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
     if arg_regs.len() < 2:
         return ir_zero_reg()
     dotted_path_r := arg_regs[1]
-    ret_tid := c_get_expr_type(idx)
-    if ret_tid < 0:
+    target_tid := ir_decode_target_tid(idx, node)
+    if target_tid < 0:
         return ir_zero_reg()
-    ret_info := get_type_info(ret_tid)
-    if ret_info.kind != "result":
-        return ir_zero_reg()
-    target_tid := ret_info.inner
     target_info := get_type_info(target_tid)
-    if target_info.kind != "struct":
-        return ir_zero_reg()
 
     temp_name := ir_new_temp_name("toml_decode_file_path")
     ir_var_types.insert(temp_name, "tuple")
@@ -1077,16 +1071,10 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
     if arg_regs.len() == 0:
         return ir_zero_reg()
 
-    ret_tid := c_get_expr_type(idx)
-    if ret_tid < 0:
+    target_tid := ir_decode_target_tid(idx, node)
+    if target_tid < 0:
         return ir_zero_reg()
-    ret_info := get_type_info(ret_tid)
-    if ret_info.kind != "result":
-        return ir_zero_reg()
-    target_tid := ret_info.inner
     target_info := get_type_info(target_tid)
-    if target_info.kind != "struct":
-        return ir_zero_reg()
     mut input_r := arg_regs[0]
     has_optional_fields := ir_struct_has_optional_fields(target_info)
     has_default_fields := ir_struct_has_default_fields(target_info)
@@ -1328,16 +1316,10 @@ pub fn ir_emit_json_decode_object_call(idx: Int, node: Node, emit_expr: fn(Int) 
         return ir_zero_reg()
 
     handle_r := arg_regs[0]
-    ret_tid := c_get_expr_type(idx)
-    if ret_tid < 0:
+    target_tid := ir_decode_target_tid(idx, node)
+    if target_tid < 0:
         return ir_zero_reg()
-    ret_info := get_type_info(ret_tid)
-    if ret_info.kind != "result":
-        return ir_zero_reg()
-    target_tid := ret_info.inner
     target_info := get_type_info(target_tid)
-    if target_info.kind != "struct":
-        return ir_zero_reg()
 
     temp_name := ir_new_temp_name("json_decode_object")
     ir_var_types.insert(temp_name, "tuple")
@@ -1360,16 +1342,10 @@ pub fn ir_emit_json_decode_path_call(idx: Int, node: Node, text_input: Bool, emi
 
     mut handle_r := arg_regs[0]
     dotted_path_r := arg_regs[1]
-    ret_tid := c_get_expr_type(idx)
-    if ret_tid < 0:
+    target_tid := ir_decode_target_tid(idx, node)
+    if target_tid < 0:
         return ir_zero_reg()
-    ret_info := get_type_info(ret_tid)
-    if ret_info.kind != "result":
-        return ir_zero_reg()
-    target_tid := ret_info.inner
     target_info := get_type_info(target_tid)
-    if target_info.kind != "struct":
-        return ir_zero_reg()
 
     temp_name := ir_new_temp_name("json_decode_path")
     ir_var_types.insert(temp_name, "tuple")
@@ -1408,16 +1384,10 @@ pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
 
     file_path_r := arg_regs[0]
     if not path_input:
-        ret_tid := c_get_expr_type(idx)
-        if ret_tid < 0:
+        target_tid := ir_decode_target_tid(idx, node)
+        if target_tid < 0:
             return ir_zero_reg()
-        ret_info := get_type_info(ret_tid)
-        if ret_info.kind != "result":
-            return ir_zero_reg()
-        target_tid := ret_info.inner
         target_info := get_type_info(target_tid)
-        if target_info.kind != "struct":
-            return ir_zero_reg()
 
         temp_name := ir_new_temp_name("json_decode_file")
         ir_var_types.insert(temp_name, "tuple")
@@ -1437,16 +1407,10 @@ pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
     if arg_regs.len() < 2:
         return ir_zero_reg()
     dotted_path_r := arg_regs[1]
-    ret_tid := c_get_expr_type(idx)
-    if ret_tid < 0:
+    target_tid := ir_decode_target_tid(idx, node)
+    if target_tid < 0:
         return ir_zero_reg()
-    ret_info := get_type_info(ret_tid)
-    if ret_info.kind != "result":
-        return ir_zero_reg()
-    target_tid := ret_info.inner
     target_info := get_type_info(target_tid)
-    if target_info.kind != "struct":
-        return ir_zero_reg()
 
     temp_name := ir_new_temp_name("json_decode_file_path")
     ir_var_types.insert(temp_name, "tuple")

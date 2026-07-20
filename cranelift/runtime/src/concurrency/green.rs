@@ -57,12 +57,16 @@
 //!   code can spawn more tasks, which needs the same lock. so a worker *takes*
 //!   the coroutine out of the slab, drops the lock, resumes it, then re-locks to
 //!   record the result. see `run_task`.
-//! - each worker owns two run queues: a `local` queue of fresh, stealable tasks,
-//!   and a `pinned` queue of woken started tasks that only the owner drains. a
-//!   global injector receives fresh spawns from non-worker threads (e.g.
-//!   `main`). an idle worker checks its pinned queue, then local, then injector,
-//!   then steals from a random peer's *local* queue only. plain `Mutex<VecDeque>`
-//!   — readable first; lock-free deques are a later perf phase.
+//! - each worker owns three run queues: a `local` queue of fresh, stealable
+//!   tasks; a `pinned` queue of woken started tasks that only the owner drains;
+//!   and a `deferred` queue of *preempted* started tasks (P5), also owner-only but
+//!   drained at the lowest priority. a global injector receives fresh spawns from
+//!   non-worker threads (e.g. `main`). an idle worker checks pinned, then local,
+//!   then injector, then steals from a random peer's *local* queue, and only if
+//!   all of that is empty does it resume a `deferred` (preempted) task — so a
+//!   compute hog that overran its quantum yields to every other ready task before
+//!   it runs again. plain `Mutex<VecDeque>` — readable first; lock-free deques are
+//!   a later perf phase.
 //! - **lock order.** when a block-site lock (a channel lock, or a task's join
 //!   lock) and the scheduler locks nest, the block-site lock is always taken
 //!   first: a channel send holds the channel lock and calls `wake`, which takes
@@ -215,13 +219,19 @@ pub extern "C" fn pith_green_maybe_yield() {
         return;
     }
 
-    // gate 3: we are overrunning. arrange to be re-enqueued, then suspend. set
-    // wake_pending *before* parking so run_task's yield path (which checks it)
-    // re-enqueues us instead of leaving us parked with no block site to wake us.
+    // gate 3: we are overrunning. flag ourselves for re-enqueue *before* parking,
+    // so run_task's yield path re-enqueues us instead of leaving us parked with no
+    // block site to wake us. we use a distinct `preempt_pending` flag (not the
+    // channel/await `wake_pending`) so run_task routes us onto our owner's
+    // lowest-priority `deferred` queue: a preempted compute task must yield to
+    // every other ready task on the worker, or it would simply be re-selected and
+    // keep monopolizing the worker (`pinned`/woken work is served first). nothing
+    // else writes this flag and preemption registers no waiter, so there is no
+    // wake/park race to close here.
     {
         let mut slab = lock_slab();
         if let Some(task) = slab.get_mut(id).and_then(|slot| slot.as_mut()) {
-            task.wake_pending = true;
+            task.preempt_pending = true;
         } else {
             return;
         }
@@ -352,6 +362,12 @@ struct Task {
     /// in `run_task` checks this and re-enqueues instead of parking, closing the
     /// wake/park race so a wake in that window is never lost.
     wake_pending: bool,
+    /// set by `pith_green_maybe_yield` right before it parks a task that has
+    /// overrun its quantum. distinct from `wake_pending`: `run_task`'s yield path
+    /// routes a preempted task onto its owner's lowest-priority `deferred` queue
+    /// (see `enqueue_preempted`) so it yields to all other ready work, whereas a
+    /// woken task goes onto the higher-priority `pinned` queue to resume promptly.
+    preempt_pending: bool,
     join: Arc<(Mutex<Join>, Condvar)>,
     /// this task's own `threadlocal` module-global storage. under the green
     /// backend one worker OS thread runs many tasks, so the runtime's per-OS-
@@ -376,6 +392,13 @@ struct Worker {
     /// woken started tasks pinned to this worker. only this worker drains it, so
     /// a suspended coroutine only ever resumes on the thread that first ran it.
     pinned: Mutex<VecDeque<TaskId>>,
+    /// preempted started tasks pinned to this worker, drained at the *lowest*
+    /// priority (after pinned, local, injector, and stealing). a compute task that
+    /// overran its quantum lands here so it yields to every other ready task on the
+    /// worker; without this it would sit at the front of `pinned` and simply be
+    /// re-selected, right back into the loop that got it preempted. also pinned to
+    /// the owner, so a suspended coroutine still never crosses a worker.
+    deferred: Mutex<VecDeque<TaskId>>,
     /// this worker's private park spot. an idle worker waits on its own condvar,
     /// so a wake can target exactly the worker that is able to run the task —
     /// crucially, a *pinned* wake nudges only the task's owner instead of a
@@ -570,6 +593,7 @@ fn scheduler() -> &'static Scheduler {
             .map(|_| Worker {
                 local: Mutex::new(VecDeque::new()),
                 pinned: Mutex::new(VecDeque::new()),
+                deferred: Mutex::new(VecDeque::new()),
                 park_lock: Mutex::new(()),
                 park_cv: Condvar::new(),
                 running_task: AtomicUsize::new(0),
@@ -717,6 +741,24 @@ fn enqueue_woken(owner: usize, id: TaskId) {
     wake_worker(owner);
 }
 
+/// re-enqueue a *preempted* started task onto its owner worker's `deferred`
+/// queue, the lowest-priority spot. like `enqueue_woken` it always targets the
+/// owner (pinning holds — the suspended coroutine resumes on the same worker) and
+/// nudges only the owner. the difference is purely priority: `find_work` drains
+/// this queue only when the worker has nothing else to do, so a preempted compute
+/// task cannot crowd out other ready work — that is what makes preemption
+/// actually relieve starvation rather than just re-select the same hog.
+fn enqueue_preempted(owner: usize, id: TaskId) {
+    let sched = scheduler();
+    sched.workers[owner]
+        .deferred
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push_back(id);
+    note_notify();
+    wake_worker(owner);
+}
+
 /// nudge one worker's private park spot. acquiring the worker's park lock before
 /// notifying serializes against `park`'s check-then-wait, so a wake landing just
 /// as the worker decides to sleep is not lost (and the wait-timeout backstops any
@@ -807,6 +849,19 @@ fn find_work(index: usize) -> Option<TaskId> {
             return Some(id);
         }
     }
+
+    // deferred last: only resume a preempted compute task once there is genuinely
+    // nothing else — no owned woken work, no fresh work anywhere to run or steal.
+    // this is what lets the other tasks on this worker make progress before the
+    // hog runs again.
+    if let Some(id) = sched.workers[index]
+        .deferred
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pop_front()
+    {
+        return Some(id);
+    }
     None
 }
 
@@ -875,10 +930,20 @@ fn has_any_work(index: usize) -> bool {
         return true;
     }
     // any worker's local queue is stealable (own or a peer's).
-    sched
+    if sched
         .workers
         .iter()
         .any(|w| !w.local.lock().unwrap_or_else(|p| p.into_inner()).is_empty())
+    {
+        return true;
+    }
+    // own deferred (preempted) work — reachable only by this worker, so like the
+    // pinned queue it must count here or the worker would park on a task it owns.
+    !sched.workers[index]
+        .deferred
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_empty()
 }
 
 /// the worker thread body: take work, run it, park when there is none.
@@ -890,6 +955,16 @@ fn worker_loop(index: usize) {
             None => park(index),
         }
     }
+}
+
+/// how `run_task` re-enqueues a task that just suspended, carrying the task's
+/// owner worker. `Woken` and `Preempted` differ only in queue priority (see the
+/// `Yield` arm of `run_task`); `None` means the task parked and its block site
+/// owns waking it.
+enum Requeue {
+    Woken(Option<usize>),
+    Preempted(Option<usize>),
+    None,
 }
 
 /// resume one task's coroutine to its next suspension point. the coroutine is
@@ -1016,35 +1091,44 @@ fn run_task(id: TaskId) {
             }
         }
         CoroutineResult::Yield(()) => {
-            // the task parked on a blocking op — a channel, a P2b primitive, or an
-            // await (all suspend the coroutine the same way). put the coroutine
-            // back and record where its yielder lives. then, if a wake landed while
-            // we were still Running (the wake/park race), the block site already
-            // wants us runnable — re-enqueue instead of parking. otherwise settle
-            // into Parked and let the block site re-enqueue us when it unblocks.
-            let requeue_owner = {
+            // the task suspended: either it parked on a blocking op (a channel, a
+            // P2b primitive, or an await), or it was preempted at a safe-point. put
+            // the coroutine back and record where its yielder lives, then decide how
+            // to re-enqueue:
+            //   - `preempt_pending`: overran its quantum -> `deferred` (lowest
+            //     priority), so it yields to every other ready task on the worker.
+            //   - `wake_pending`: a block-site wake landed while we were still
+            //     Running (the wake/park race) -> `pinned`, resume promptly.
+            //   - neither: a plain block -> Parked; the block site re-enqueues us.
+            let requeue = {
                 let mut slab = lock_slab();
                 if let Some(task) = slab.get_mut(id).and_then(|slot| slot.as_mut()) {
                     task.coro = Some(coro);
                     task.yielder_ptr = YielderPtr(new_yielder);
-                    if task.wake_pending {
+                    if task.preempt_pending {
+                        task.preempt_pending = false;
+                        task.state = RunState::Ready;
+                        Requeue::Preempted(task.owner)
+                    } else if task.wake_pending {
                         task.wake_pending = false;
                         task.state = RunState::Ready;
-                        Some(task.owner)
+                        Requeue::Woken(task.owner)
                     } else {
                         task.state = RunState::Parked;
-                        None
+                        Requeue::None
                     }
                 } else {
                     return;
                 }
             };
             // enqueue outside the slab lock to keep the slab -> queue order clean.
-            if let Some(owner) = requeue_owner {
-                match owner {
-                    Some(w) => enqueue_woken(w, id),
-                    None => enqueue_fresh(id),
-                }
+            match requeue {
+                Requeue::Woken(Some(w)) => enqueue_woken(w, id),
+                Requeue::Preempted(Some(w)) => enqueue_preempted(w, id),
+                // a task that yielded must have already run, so `owner` is set; fall
+                // back to the fresh path only defensively.
+                Requeue::Woken(None) | Requeue::Preempted(None) => enqueue_fresh(id),
+                Requeue::None => {}
             }
         }
     }
@@ -1113,6 +1197,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
             owner: None,
             yielder_ptr: YielderPtr(ptr::null()),
             wake_pending: false,
+            preempt_pending: false,
             join,
             // fresh, empty thread-local storage: this task starts with no
             // threadlocal slots materialized, exactly like a brand-new OS thread.
@@ -1308,6 +1393,7 @@ mod tests {
                 owner: None,
                 yielder_ptr: YielderPtr(ptr::null()),
                 wake_pending: false,
+                preempt_pending: false,
                 join,
                 tls: Box::new(HashMap::new()),
             }));
@@ -1318,7 +1404,8 @@ mod tests {
         PITH_PREEMPT_REQUESTED.store(1, AtomicOrdering::Relaxed);
 
         // first resume: the body overruns and parks at the safe-point. run_task's
-        // yield path must see wake_pending and re-enqueue onto owner 0.
+        // yield path must see preempt_pending and re-enqueue onto owner 0's
+        // lowest-priority deferred queue.
         run_task(id);
         {
             let slab = lock_slab();
@@ -1327,11 +1414,15 @@ mod tests {
             assert!(task.state == RunState::Ready, "should be re-enqueued, not parked");
         }
         {
-            let mut pinned = scheduler().workers[0]
-                .pinned
+            let mut deferred = scheduler().workers[0]
+                .deferred
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            assert_eq!(pinned.pop_front(), Some(id), "task should be on owner's pinned queue");
+            assert_eq!(
+                deferred.pop_front(),
+                Some(id),
+                "preempted task should be on owner's deferred queue"
+            );
         }
 
         // second resume: runs to completion, records the result.

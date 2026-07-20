@@ -1,0 +1,48 @@
+# green-thread cooperative preemption — a compute-only task must not starve peers.
+#
+# `spinner` runs a tight arithmetic loop with no channel, await, or i/o — nothing
+# that yields cooperatively — and only stops once every reporter has checked in.
+# `report` bumps a shared atomic counter once. under a single worker
+# (PITH_GREEN_WORKERS=1) and WITHOUT preemption the spinner holds the only worker
+# forever: the reporters never run, the counter never reaches n, and the program
+# hangs. with preemption (a build compiled `PITH_GREEN_PREEMPT=1`, run under
+# `PITH_GREEN=1`) the spinner is descheduled at its loop back-edge, the worker
+# runs the reporters, and once the counter reaches n the spinner sees it and
+# returns.
+#
+# the printed total is the fixed counter value n, independent of scheduling, so
+# the output is byte-identical to the os-thread backend.
+
+fn report(counter: AtomicInt):
+    # bump the shared counter once. a compare-and-set retry keeps it correct even
+    # when several reporters overlap on more than one worker.
+    mut done := false
+    while not done:
+        cur := counter.load()
+        done = counter.compare_set(cur, cur + 1)
+
+fn spinner(counter: AtomicInt, target: Int) -> Int:
+    # pure compute: spin until every reporter has bumped the counter. the loop
+    # body touches nothing that would yield, so only a preemption safe-point at
+    # the back-edge can hand the worker to the reporters.
+    mut x := 0
+    while counter.load() < target:
+        x = x + 1
+        if x >= 1000000:
+            x = 0
+    return x
+
+fn main():
+    n := 50
+    counter := AtomicInt(0)
+    # spawn the compute hog first so the single worker picks it up first and would
+    # monopolize it without preemption.
+    hog := spawn spinner(counter, n)
+    mut i := 0
+    while i < n:
+        spawn report(counter)
+        i = i + 1
+    # the hog returns only once the counter has reached n — i.e. once every
+    # reporter has run — so awaiting it is our join for the whole fan-out.
+    await hog
+    print(counter.load().to_string())

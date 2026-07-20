@@ -75,14 +75,12 @@ when you need more, like cookies, multipart parts, or the raw bytes, reach throu
 
 ## request bodies & json
 
-most json apis read a struct out of the request body. `json.decode_text[T]` does
-exactly that: give it the body text and the struct you expect, and it hands back a
-typed value or a decode error. the struct's fields have to be `pub` so the decoder
-can fill them in.
+most json apis read a struct out of the request body. `web.parse[T]` does exactly
+that: give it the request and the struct you expect, and it hands back a typed value
+or a decode error. the struct's fields have to be `pub` so the decoder can fill them
+in.
 
 ```pith
-import std.json as json
-
 struct NewUser:
     pub name: String
     pub age: Int
@@ -90,7 +88,7 @@ struct NewUser:
 fn create_user(req: web.Request) -> http.HttpResponse:
     if not req.is_json():
         return http.bad_request_response()
-    parsed := json.decode_text[NewUser](req.body())
+    parsed := web.parse[NewUser](req)
     if parsed.is_err:
         return http.bad_request_response()
     user := parsed.ok
@@ -102,6 +100,9 @@ a handler returns a response rather than propagating an error, so check
 away anything that is not `application/json` before you even try to decode, and a
 malformed body still lands in the `is_err` branch, so both cases come back as a clean
 400.
+
+under the hood `web.parse[T]` is just `json.decode_text[T](req.body())`. reach for
+`json.decode_text` directly when you already have the body text and not a request.
 
 going the other way, build the response body with the `std.json` constructors and
 send it with `http.json`:

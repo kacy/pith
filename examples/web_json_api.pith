@@ -13,8 +13,8 @@ import std.net.http as http
 import std.net.tcp as tcp
 import std.json as json
 
-# the shape we expect in a POST /users body. json.decode_text reads the fields
-# straight off the struct, so they have to be `pub`.
+# the shape we expect in a POST /users body. web.parse reads the fields straight
+# off the struct, so they have to be `pub`.
 struct NewUser:
     pub name: String
     pub age: Int
@@ -38,7 +38,7 @@ fn show_user(req: web.Request) -> http.HttpResponse:
 fn create_user(req: web.Request) -> http.HttpResponse:
     if not req.is_json():
         return http.bad_request_response()
-    parsed := json.decode_text[NewUser](req.body())
+    parsed := web.parse[NewUser](req)
     if parsed.is_err:
         return http.bad_request_response()
     return http.json(201, user_json(parsed.ok))

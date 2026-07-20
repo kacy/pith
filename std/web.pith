@@ -47,6 +47,7 @@ import std.net.tcp as tcp
 import std.net.tls as tls
 import std.binary as binary
 import std.bytes as bytes
+import std.json as json
 import std.metrics as metrics
 import std.prometheus as prometheus
 import std.time as time_mod
@@ -107,6 +108,21 @@ impl Request:
     # the request path, without the query string.
     fn path() -> String:
         return self.raw.path() catch "/"
+
+# decode the request body as json into a typed struct `T` — the one-liner most
+# json handlers reach for. it forwards to json.decode_text, so `T`'s fields must
+# be `pub` and the body must be a json object with matching fields; a missing
+# field or malformed json comes back as a JsonDecodeError. a handler returns a
+# response rather than propagating, so check the result's `.is_err` and answer
+# with a 400 instead of using `!`:
+#
+#   fn create_user(req: web.Request) -> http.HttpResponse:
+#       parsed := web.parse[NewUser](req)
+#       if parsed.is_err:
+#           return http.bad_request_response()
+#       return http.json(201, user_json(parsed.ok))
+pub fn parse[T](req: Request) -> T!json.JsonDecodeError:
+    return json.decode_text[T](req.body())!
 
 # one registered route: a method, a path pattern, and the handler to run when
 # both match. the fn-type is written inline on purpose — a type-aliased handler
@@ -478,6 +494,30 @@ test "is_json is true only for an application/json content type":
     sleep(200)
     assert_eq(get_body_with_content_type(port, "/probe", "application/json"), "true")
     assert_eq(get_body_with_content_type(port, "/probe", "text/plain"), "false")
+
+# a flat struct for the web.parse tests: json.decode_text fills its pub fields.
+struct ParsedUser:
+    pub name: String
+    pub age: Int
+
+# build a Request carrying `body` as its json body, so the parse tests can run
+# without standing up a server. only body() is exercised here, so the rest of the
+# request fields are left empty.
+fn request_with_body(body: String) -> Request:
+    raw := http.HttpRequestBytes(bytes.empty(), bytes.from_string_utf8(body), "POST", "/users", "", "HTTP/1.1", "", body, {}, {}, [])
+    return Request(raw, {}, "/users")
+
+test "web.parse decodes a valid json body into a typed struct":
+    dq := chr(34)
+    body := chr(123) + dq + "name" + dq + ":" + dq + "ada" + dq + "," + dq + "age" + dq + ":36" + chr(125)
+    parsed := parse[ParsedUser](request_with_body(body))
+    assert(parsed.is_ok)
+    assert_eq(parsed.ok.name, "ada")
+    assert_eq(parsed.ok.age, 36)
+
+test "web.parse reports an error for a malformed json body":
+    parsed := parse[ParsedUser](request_with_body("not json"))
+    assert(parsed.is_err)
 
 # a trivial handler used by the observability tests.
 fn ping(req: Request) -> http.HttpResponse:

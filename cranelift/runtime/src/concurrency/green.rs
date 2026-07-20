@@ -21,14 +21,22 @@
 //! the worker; the worker runs other tasks; a later send/recv re-enqueues the
 //! suspended task. so tasks that coordinate through channels (ping-pong,
 //! producer/consumer, rings larger than the worker count) run correctly and
-//! cheaply. `await` still uses stance (a) — a task that only ever awaits other
-//! tasks is fine because the awaited tasks make progress on other workers; the
-//! same yield treatment for mutex/waitgroup/semaphore is the next slice (P2b).
+//! cheaply. P2b extends the same yield treatment to mutex/waitgroup/semaphore.
+//!
+//! P2c closes the last hard-park: **`await`**. a green task that awaits another
+//! task now registers on the target's join-waiter list and suspends its
+//! coroutine instead of parking the worker (see `green_await`); the completing
+//! task wakes it the same way a channel send wakes a parked receiver. so a green
+//! coordinator can fan out green children and await them from inside a task —
+//! before, that hung at one worker, because awaiting the first child parked the
+//! only worker and the child could never run. an os-thread awaiter (the main
+//! thread, or the flag-off backend) still condvar-waits, byte for byte.
 //!
 //! the park/wake protocol lives partly here (`park_current`, `wake`, the
-//! `Parked` state and `wake_pending` flag) and partly in `channel.rs`, which
-//! registers a would-block green task as a waiter under the channel lock and
-//! then calls `park_current`. see those sites for the race and lock-order notes.
+//! `Parked` state and `wake_pending` flag) and partly at the block sites:
+//! `channel.rs` registers a would-block green task as a waiter under the channel
+//! lock and then calls `park_current`, and `green_await` does the same under the
+//! join lock. see those sites for the race and lock-order notes.
 //!
 //! ## pinning (what keeps `SendCoroutine` sound under yielding)
 //!
@@ -55,18 +63,23 @@
 //!   `main`). an idle worker checks its pinned queue, then local, then injector,
 //!   then steals from a random peer's *local* queue only. plain `Mutex<VecDeque>`
 //!   — readable first; lock-free deques are a later perf phase.
-//! - **lock order.** when the channel and scheduler locks nest, the channel lock
-//!   is always taken first: a channel send holds the channel lock and calls
-//!   `wake`, which takes the slab lock and then a queue lock. run_task and
-//!   find_work take slab/queue locks but never a channel lock, and a parking
-//!   task *releases* the channel lock before it suspends. so the acquire order
-//!   is channel -> slab -> queue, never the reverse — no deadlock cycle.
-//! - a task's join state (done flag + result) lives behind its own
-//!   `Arc<(Mutex, Condvar)>`, exactly like the os-thread backend. await clones
-//!   the arc and waits; the worker flips done + notifies when the coroutine
-//!   returns. reusing that shape keeps ARC/refcount balance identical to the
-//!   os-thread path — the same pith code runs, retains and releases the same
-//!   way, across the coroutine boundary.
+//! - **lock order.** when a block-site lock (a channel lock, or a task's join
+//!   lock) and the scheduler locks nest, the block-site lock is always taken
+//!   first: a channel send holds the channel lock and calls `wake`, which takes
+//!   the slab lock and then a queue lock. run_task and find_work take slab/queue
+//!   locks but never a block-site lock, and a parking task *releases* its
+//!   block-site lock before it suspends. `green_await` obeys the same rule: it
+//!   holds a task's join lock only to check `done` and register a waiter, and
+//!   releases it before suspending. so the acquire order is block-site -> slab ->
+//!   queue, never the reverse — no deadlock cycle.
+//! - a task's join state (done flag + result + green-waiter list) lives behind
+//!   its own `Arc<(Mutex, Condvar)>`, exactly like the os-thread backend. await
+//!   clones the arc; an os-thread awaiter waits on the condvar, a green awaiter
+//!   registers on the waiter list and suspends. the worker flips done, notifies
+//!   the condvar, and wakes the green waiters when the coroutine returns. reusing
+//!   that shape keeps ARC/refcount balance identical to the os-thread path — the
+//!   same pith code runs, retains and releases the same way, across the coroutine
+//!   boundary.
 
 use crate::handle_registry::{self, HandleKind};
 use corosensei::{Coroutine, CoroutineResult, Yielder};
@@ -91,9 +104,9 @@ const STACK_SIZE: usize = 1024 * 1024;
 ///
 /// - `Ready`: sitting in a run queue with its coroutine present, waiting to run.
 /// - `Running`: coroutine taken out and being resumed on some worker.
-/// - `Parked`: suspended on a channel; coroutine is back in the slab, the task
-///   is in no queue, and the channel it parked on owns re-enqueueing it (see the
-///   park/wake protocol). only reachable under P2.
+/// - `Parked`: suspended on a blocking op (a channel, a P2b primitive, or an
+///   await); coroutine is back in the slab, the task is in no queue, and the
+///   block site it parked on owns re-enqueueing it (see the park/wake protocol).
 /// - `Done`: coroutine returned; result recorded.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunState {
@@ -156,9 +169,20 @@ unsafe impl Send for YielderPtr {}
 /// join channel between a task and whoever awaits it: the done flag plus the
 /// result, guarded so an awaiting thread can block on the condvar until the
 /// worker records completion. one allocation per task, shared via `Arc`.
+///
+/// a task may be awaited by an os-thread caller (the main thread, or the whole
+/// os-thread backend), a green task, or both at once. an os-thread awaiter blocks
+/// on the condvar; a green awaiter must not park its worker, so it registers its
+/// slab id in `green_waiters` and suspends its coroutine instead. when the task
+/// completes it flips `done` + `result`, `notify_all`s the condvar (os-thread
+/// awaiters), and drains `green_waiters` to `green::wake` each green awaiter. the
+/// list is empty (and so free) whenever no green task is awaiting — the os-thread
+/// path is untouched. mirrors the channel's green-waiter list, guarded by this
+/// same join mutex the way the channel's list is guarded by the channel lock.
 struct Join {
     done: bool,
     result: i64,
+    green_waiters: Vec<TaskId>,
 }
 
 struct Task {
@@ -641,8 +665,8 @@ fn run_task(id: TaskId) {
 
     match outcome {
         CoroutineResult::Return(result) => {
-            // record the result, flip done, wake awaiters. drop the coroutine
-            // (and its stack) by simply not putting it back.
+            // record the result, flip done, wake awaiters of both kinds. drop the
+            // coroutine (and its stack) by simply not putting it back.
             let join = {
                 let mut slab = lock_slab();
                 if let Some(task) = slab.get_mut(id).and_then(|slot| slot.as_mut()) {
@@ -654,18 +678,34 @@ fn run_task(id: TaskId) {
                 }
             };
             let (lock, cvar) = &*join;
-            let mut j = lock_join(lock);
-            j.done = true;
-            j.result = result;
-            cvar.notify_all();
+            // flip done + notify os-thread awaiters, and take the green-waiter
+            // list, all under the join lock. once `done` is set, a fresh
+            // `green_await` sees it and returns without registering, so no new
+            // waiter can appear after this — draining here loses none.
+            let green_waiters = {
+                let mut j = lock_join(lock);
+                j.done = true;
+                j.result = result;
+                cvar.notify_all();
+                std::mem::take(&mut j.green_waiters)
+            };
+            // wake green awaiters after releasing the join lock: `green::wake`
+            // takes the slab and queue locks, and keeping the join lock out of
+            // that nest keeps the hold short (the lock order still permits it —
+            // join is the outer lock, like a channel lock). a waiter that already
+            // parked is re-enqueued; one still mid-suspend gets `wake_pending` set
+            // and re-enqueues itself from the park path, so the wake is never lost.
+            for waiter in green_waiters {
+                wake(waiter);
+            }
         }
         CoroutineResult::Yield(()) => {
-            // the task parked on a channel (the only reason a green task yields).
-            // put the coroutine back and record where its yielder lives. then, if
-            // a wake landed while we were still Running (the wake/park race), the
-            // channel already wants us runnable — re-enqueue instead of parking.
-            // otherwise settle into Parked and let the channel re-enqueue us on a
-            // later send/recv.
+            // the task parked on a blocking op — a channel, a P2b primitive, or an
+            // await (all suspend the coroutine the same way). put the coroutine
+            // back and record where its yielder lives. then, if a wake landed while
+            // we were still Running (the wake/park race), the block site already
+            // wants us runnable — re-enqueue instead of parking. otherwise settle
+            // into Parked and let the block site re-enqueue us when it unblocks.
             let requeue_owner = {
                 let mut slab = lock_slab();
                 if let Some(task) = slab.get_mut(id).and_then(|slot| slot.as_mut()) {
@@ -710,6 +750,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
         Mutex::new(Join {
             done: false,
             result: 0,
+            green_waiters: Vec::new(),
         }),
         Condvar::new(),
     ));
@@ -770,12 +811,30 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
     task_handle
 }
 
-/// green await (stance (a)): if the task is already done, return its result;
-/// otherwise block *this* thread on the task's condvar until a worker completes
-/// it. blocking the OS thread — rather than yielding the coroutine — is the P1a
-/// simplification that constrains green mode to independent tasks (see module
-/// docs). the arc keeps the join state alive even after the slab entry is
-/// eventually reused.
+/// green await: return the target task's result, blocking until it completes.
+///
+/// how it blocks depends on the caller. an **os-thread** caller (the main thread,
+/// or the whole os-thread backend, where `current_task()` is always `None`) waits
+/// on the target's condvar exactly as it always has — byte for byte. a **green
+/// task** must not park its worker OS thread, so instead of condvar-waiting it
+/// registers its slab id on the target's join-waiter list (under the join lock)
+/// and suspends its coroutine back to the scheduler; the worker is then free to
+/// run the very task being awaited. when the target completes it drains that list
+/// and `wake`s each green awaiter (see the `Return` path in `run_task`).
+///
+/// this is what lets a green coordinator await green children from inside a task:
+/// under the old condvar-wait, awaiting the first child parked the only worker
+/// and the child could never run, so a single-worker fan-in hung. now the await
+/// yields and the child runs on the freed worker.
+///
+/// the wake/park race is closed the same way the channel path closes it: we
+/// register the waiter *under the join lock*, and the lock serializes our
+/// check-and-register against the completer's set-done-and-drain — so the
+/// completer either sees our id (and wakes us) or has already set `done` (and we
+/// return without parking). if the wake lands while we are still `Running`
+/// (between releasing the lock and suspending), `wake` records `wake_pending` and
+/// the park path re-enqueues us, so the wake is never lost. the arc keeps the
+/// join state alive even after the slab entry is eventually reused.
 ///
 /// # Safety
 /// `task_handle` came from spawn or is garbage; validated against the registry.
@@ -785,9 +844,24 @@ pub(crate) unsafe fn green_await(task_handle: i64) -> i64 {
         None => return 0,
     };
     let (lock, cvar) = &*join;
+    // resolve once whether we are inside a green task; the running task does not
+    // change under us across a suspend/resume.
+    let green_task = current_task();
     let mut j = lock_join(lock);
     while !j.done {
-        j = cvar.wait(j).unwrap_or_else(|p| p.into_inner());
+        match green_task {
+            // os-thread awaiter: condvar-wait, unchanged from the P1a path.
+            None => j = cvar.wait(j).unwrap_or_else(|p| p.into_inner()),
+            // green awaiter: register under the join lock, release it, and suspend
+            // the coroutine. re-lock and re-check `done` on resume — a completing
+            // task drains the list, so we are woken exactly when `done` is set.
+            Some(id) => {
+                j.green_waiters.push(id);
+                drop(j);
+                park_current();
+                j = lock_join(lock);
+            }
+        }
     }
     j.result
 }

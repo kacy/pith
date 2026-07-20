@@ -1,0 +1,36 @@
+# green-thread await fan-in — a green coordinator awaits green children.
+#
+# unlike the smoke test, the fan-in here happens from *inside* a green task: a
+# coordinator task spawns K children and awaits each one. under the pre-P2c
+# backend a green task that awaits another parked its whole worker OS thread, so
+# with a single worker (PITH_GREEN_WORKERS=1) the coordinator parks the only
+# worker awaiting its first child — the child can never run and the program
+# hangs. P2c makes await yield the coroutine instead, freeing the worker to run
+# the children; each child's completion wakes the coordinator to take the next.
+#
+# the total is a fixed sum (i*i over the children), independent of scheduling
+# order, so the output is byte-identical to the os-thread backend.
+
+fn child(id: Int) -> Int:
+    return id * id
+
+fn coordinator(n: Int) -> Int:
+    # spawn every child up front, then fan in by awaiting each. the await is the
+    # yield point P2c adds — before it, this hung at one worker.
+    mut children: List[Task[Int]] := []
+    mut i := 0
+    while i < n:
+        children.push(spawn child(i))
+        i = i + 1
+
+    mut total := 0
+    for c in children:
+        total = total + await c
+    return total
+
+fn main() -> Int!:
+    n := 100
+    # the coordinator is itself a green task, so its awaits run inside a task.
+    total := await spawn coordinator(n)
+    print("await fan-in: n {n}, total {total}")
+    return 0

@@ -1,0 +1,59 @@
+# green-thread tcp echo — a green echo server and a green client, both running
+# under the green backend, exercising the socket-yield path end to end.
+#
+# the server accepts `rounds` connections and echoes each message straight back;
+# the client opens `rounds` connections in sequence, sends a message, and reads
+# the echo. both run as spawned green tasks, so on a single worker the reactor
+# must hand the worker back and forth between them: the server yields waiting to
+# accept and to read, the client yields on connect and on the echo read. before
+# P3a a would-block socket op parked the only worker and this deadlocked at one
+# worker; the epoll reactor yields the coroutine instead.
+#
+# the total (sum of echoed response lengths) is input-determined, so the output
+# is byte-identical to the os-thread backend.
+
+fn echo_one(conn: Int) -> Int!:
+    # echo the exact bytes we read straight back to the client.
+    data := tcp_read(conn, 1024)!
+    n := tcp_write(conn, data)!
+    tcp_close(conn)
+    return n
+
+fn server(port: Int, rounds: Int) -> Int!:
+    s := tcp_listen("127.0.0.1", port)!
+    mut served := 0
+    mut i := 0
+    while i < rounds:
+        c := tcp_accept(s)!
+        echo_one(c)!
+        served = served + 1
+        i = i + 1
+    tcp_close(s)
+    return served
+
+fn client(port: Int, rounds: Int) -> Int!:
+    mut total := 0
+    mut i := 0
+    while i < rounds:
+        conn := tcp_connect("127.0.0.1", port)!
+        n := tcp_write(conn, "ping")!
+        resp := tcp_read(conn, 1024)!
+        total = total + resp.len()
+        tcp_close(conn)
+        i = i + 1
+    return total
+
+fn main() -> Int:
+    port := 18560
+    rounds := 20
+
+    srv := spawn server(port, rounds)
+    # give the server a moment to bind and start accepting before we connect.
+    sleep(100)
+    cli := spawn client(port, rounds)
+
+    total := await cli
+    served := await srv
+
+    print("green echo: rounds {rounds}, served {served.unwrap_or(-1)}, total {total.unwrap_or(-1)}")
+    return 0

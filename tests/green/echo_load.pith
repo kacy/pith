@@ -1,0 +1,63 @@
+# green tcp echo under load — many concurrent connections handled on the green
+# backend. used to measure the socket-yield win: at a single worker
+# (PITH_GREEN_WORKERS=1) every readiness handoff between connections is a
+# userspace coroutine switch, not an OS-thread park, so the green run should show
+# far fewer involuntary context switches than the os-thread backend, which parks
+# a worker thread per blocked socket.
+#
+# the server spawns one handler task per accepted connection; the clients are
+# spawned up front and run concurrently. the printed total is input-determined
+# (each echo is "echo: ping N"), so it stays identical across backends.
+
+fn echo_one(conn: Int) -> Int:
+    data := tcp_read(conn, 1024).unwrap_or("")
+    sent := tcp_write(conn, "echo: {data}").unwrap_or(0)
+    tcp_close(conn)
+    return sent
+
+fn server(port: Int, conns: Int) -> Int:
+    s := tcp_listen("127.0.0.1", port).unwrap_or(0)
+    mut handlers: List[Task[Int]] := []
+    mut i := 0
+    while i < conns:
+        c := tcp_accept(s).unwrap_or(0)
+        # one handler task per connection: these overlap, so a blocked read on
+        # one connection must not stall the others.
+        handlers.push(spawn echo_one(c))
+        i = i + 1
+    # fan in: only return once every echo has gone out.
+    mut served := 0
+    for h in handlers:
+        if await h > 0:
+            served = served + 1
+    tcp_close(s)
+    return served
+
+fn client(port: Int, id: Int) -> Int:
+    conn := tcp_connect("127.0.0.1", port).unwrap_or(0)
+    wrote := tcp_write(conn, "ping {id}").unwrap_or(0)
+    resp := tcp_read(conn, 1024).unwrap_or("")
+    tcp_close(conn)
+    return resp.len()
+
+fn main() -> Int:
+    port := 18570
+    conns := 200
+
+    srv := spawn server(port, conns)
+    sleep(150)
+
+    # fan out all clients concurrently, then total their response lengths.
+    mut clients: List[Task[Int]] := []
+    mut spawned := 0
+    while spawned < conns:
+        clients.push(spawn client(port, spawned))
+        spawned = spawned + 1
+
+    mut total := 0
+    for c in clients:
+        total = total + await c
+
+    served := await srv
+    print("green echo load: conns {conns}, served {served}, total {total}")
+    return 0

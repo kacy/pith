@@ -20,6 +20,7 @@ pub mod ffi_util;
 pub mod handle_registry;
 pub mod host_fs;
 pub mod json;
+pub mod netpoll;
 pub mod network;
 pub mod perf;
 pub mod platform;

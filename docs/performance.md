@@ -124,6 +124,47 @@ its m:n scheduler, which is most of why it does ~2x the calls at lower cpu;
 closing that gap on one connection would need the same, and the cheaper lever is
 more connections.
 
+the experimental green backend (`PITH_GREEN=1`, see `docs/concurrency.md`) is
+that same in-userspace scheduler, and this benchmark is the case it was built
+for. running the reader, writer, and worker tasks as coroutines on one worker
+(`PITH_GREEN_WORKERS=1`) turns every per-call handoff from a futex wake into a
+userspace switch. measured on the 2-core dev box, conc=8, medians of 5 runs,
+per-call counts over warmup+calls:
+
+| 16 B, conc=8 | calls/sec | ctx-switches/call | cpu |
+|---|---|---|---|
+| os-thread | 7072 | 4.7 | 1.00 |
+| green, 1 worker | 10537 | 0.52 | 0.68 |
+| green, 2 workers | 5995 | 1.83 | 1.09 |
+
+| 1 KiB, conc=8 | calls/sec | ctx-switches/call | cpu |
+|---|---|---|---|
+| os-thread | 6112 | 4.9 | 1.04 |
+| green, 1 worker | 9070 | 0.55 | 0.69 |
+| green, 2 workers | 5614 | 1.79 | 1.11 |
+
+at one worker the mechanism does exactly what it was meant to: context switches
+per call fall from ~4.7 to ~0.5 (the pipeline stops touching the kernel to hand a
+frame between tasks), and that shows up in the wall clock — throughput up ~49% at
+16 B and ~48% at 1 KiB while cpu drops from a full core to ~0.68. that is the
+same ~0.68 cpu grpc-go spends here, so green-at-one-worker gets pith to about
+three quarters of go's throughput at go's efficiency, from about half at 1.5x the
+cost on the os-thread backend.
+
+the honest catch is the default worker count. at two workers on this box green is
+slower than the os-thread backend, not faster: the reader, writer, and worker
+tasks now land on different workers, so the handoffs that were free at one worker
+become cross-worker futex wakes again, and two busy workers plus the go server
+oversubscribe two cores (the client shares them with the server it is calling).
+context switches per call stay well under the os-thread baseline (~1.8 vs ~4.7),
+but cpu climbs back over a core and throughput drops. so on this hardware the win
+is real but it is a one-worker, one-connection win — the shape where a single
+pipeline's kernel switches were the whole cost. more cores, or a server that is
+not fighting the client for them, is what would let more workers pay off; the
+context-switch numbers say the scheduler is doing its job, the two-core wall clock
+just can't cash it at more than one worker. green is off by default, so the table
+at the top of this section is the os-thread backend.
+
 past a single connection there is a connection pool: `grpc.dial_pool` (and
 `http2.open_pool`) opens n independent connections and rotates calls across
 them round-robin, the same subchannel trick real grpc clients use. each

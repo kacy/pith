@@ -175,3 +175,51 @@ things that are still intentionally explicit or still growing:
 - plain file io still does not have `_ctx` variants
 - sharing a mutable collection across tasks is a data race (above);
   use channels
+
+## the green backend (experimental)
+
+by default each `spawn` runs on its own os thread, so every channel send,
+mutex, or await that has to wait hands off through the kernel — a futex wake
+and a context switch. that is fine when tasks mostly compute, but a program
+built out of many small tasks that pass values to each other pays a kernel
+switch on every hop.
+
+`PITH_GREEN=1` switches on a second backend. tasks become coroutines that run
+on a small pool of worker threads (`available_parallelism()` by default,
+`PITH_GREEN_WORKERS=n` to pin the count). channel, mutex, waitgroup,
+semaphore, and await operations that would block yield to the scheduler
+instead of parking their worker, so a handoff between two tasks on the same
+worker is a userspace switch with no kernel involved. socket i/o goes through
+an epoll reactor: a read or write that would block parks the task on the
+reactor and frees the worker to run something else, so the whole net stack —
+raw tcp, tls, http/2, grpc — yields the same way without any code of its own.
+
+nothing in your program changes. the same `spawn`, `Channel`, `Mutex`, and
+`await` run on either backend, and a correct program prints the same thing
+both ways. the two green examples in this repo run identically with the flag
+on or off:
+
+```
+pith run examples/worker_pool.pith
+PITH_GREEN=1 pith run examples/worker_pool.pith
+```
+
+it helps most when tasks coordinate a lot and compute little — a fan-out of
+short jobs over channels, or a network client whose reader, writer, and
+worker tasks trade a request back and forth per call. on that last shape the
+green backend cut internal context switches from about five per grpc call to
+well under one and raised throughput on a two-core box (see the grpc section
+of `docs/performance.md`). it does the least for tasks that are already
+cpu-bound and rarely wait — those never hit the handoffs green makes cheap.
+
+it is off by default and still experimental. the known rough edges:
+
+- dns resolution at dial still blocks the worker (`getaddrinfo` is
+  synchronous); only the tcp handshake and the bytes after it yield
+- there is no preemption yet, so a task that loops without ever yielding or
+  touching i/o can hold its worker; cooperative code that uses channels and
+  sockets shares fine
+- fewer workers means more locality: at `PITH_GREEN_WORKERS=1` a coordinated
+  pipeline runs entirely in one worker with no cross-thread wakes, which is
+  often the fastest setting for a single connection even though it uses one
+  core

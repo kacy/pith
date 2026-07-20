@@ -1,0 +1,60 @@
+# middleware with std.web.
+#
+# middleware wraps every matched route in an onion. each one takes `next` (the
+# rest of the chain) and the request, and returns a response, so it can run code
+# before or after next, or answer on its own without calling next at all. the
+# first middleware registered runs outermost: it sees the request first and the
+# response last.
+#
+# to make the ordering visible, the two middleware here bracket the response body
+# with a marker. a real middleware would log the request, start a timer, check
+# auth, and so on. as with web_hello, we spawn the server, make a request against
+# it, print the reply, and exit so this can run as a self-checking example.
+import std.web as web
+import std.net.http as http
+import std.net.tcp as tcp
+
+# outermost middleware: wraps the response body in [ ... ]. registered first.
+fn outer(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    return http.text(200, "[" + (next(req).body_text() catch "") + "]")
+
+# inner middleware: wraps the response body in ( ... ). registered second.
+fn inner(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    return http.text(200, "(" + (next(req).body_text() catch "") + ")")
+
+# the application: two middleware wrapping a single route. because outer is
+# registered first it ends up outermost, so a body of "home" comes back as
+# "[(home)]" — outer(inner(home)).
+fn build_app() -> web.App:
+    mut app := web.new()
+    app = app.use_mw(outer)
+    app = app.use_mw(inner)
+    app = app.get("/", fn(req: web.Request) => http.text(200, "home"))
+    return app
+
+# run the server in the background so main can act as a client against it.
+fn serve_bg(port: Int) -> Int:
+    return build_app().listen("127.0.0.1", port) catch 0
+
+# a minimal GET that returns just the response body, so we can print it.
+fn fetch(port: Int, path: String) -> String:
+    fd := tcp.connect("127.0.0.1", port) catch 0
+    crlf := chr(13) + chr(10)
+    tcp.write(fd, "GET " + path + " HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf) catch 0
+    raw := tcp.read(fd, 65536) catch ""
+    tcp.close(fd)
+    split := raw.index_of(crlf + crlf)
+    if split < 0:
+        return raw
+    return raw.substring(split + 4, raw.len())
+
+fn main() -> Int!:
+    port := 18081
+    spawn serve_bg(port)
+    sleep(200)   # give the listener a moment to bind
+
+    # "[(home)]" proves both middleware ran and outer wrapped inner.
+    print(fetch(port, "/"))
+    # the default health check is wrapped too: "[(ok)]".
+    print(fetch(port, "/healthz"))
+    return 0

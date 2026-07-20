@@ -1,0 +1,55 @@
+# green-thread barrier — several workers park on one channel while a coordinator
+# drains and then releases them.
+#
+# each worker announces its arrival on the `arrive` channel, then blocks on the
+# `release` channel until the coordinator lets it go. because `release` is
+# unbuffered and the coordinator only sends after every worker has arrived, three
+# or more workers are parked on `release` at the same time.
+#
+# this is the shape that used to live-lock the green backend at a single worker.
+# a channel op woke *every* parked green task on the channel, not just the ones
+# whose role could make progress, so two workers parked on `release` woke each
+# other on every re-park and spun the only worker forever — the coordinator never
+# ran to release them. it completed at two workers (the coordinator made progress
+# on the second worker) and on the os-thread backend, which is what made it easy
+# to miss. the make target runs it at one worker AND the default count so a
+# regression can't hide behind extra workers.
+#
+# the total is a fixed sum of the worker ids, independent of scheduling order, so
+# the output is byte-identical to the os-thread backend.
+
+fn worker(arrive: Channel[Int], release: Channel[Int], done: Channel[Int], id: Int):
+    arrive.send(id)
+    release.recv()
+    done.send(id)
+
+fn coordinator(n: Int) -> Int:
+    arrive := Channel[Int]()
+    release := Channel[Int]()
+    done := Channel[Int](n)
+    mut i := 0
+    while i < n:
+        spawn worker(arrive, release, done, i)
+        i = i + 1
+    # drain the barrier: wait for every worker to arrive.
+    mut a := 0
+    while a < n:
+        arrive.recv()
+        a = a + 1
+    # release them one at a time; several are parked on `release` at once.
+    mut r := 0
+    while r < n:
+        release.send(0)
+        r = r + 1
+    mut total := 0
+    mut j := 0
+    while j < n:
+        total = total + done.recv().unwrap_or(0)
+        j = j + 1
+    return total
+
+fn main() -> Int!:
+    n := 5
+    total := await spawn coordinator(n)
+    print("barrier: n {n}, total {total}")
+    return 0

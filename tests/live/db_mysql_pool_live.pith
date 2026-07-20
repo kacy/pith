@@ -1,0 +1,62 @@
+# live integration tests for the pooled std.db.mysql layer. they need a
+# mysql/mariadb server on 127.0.0.1:3306 with the pithtest fixtures; without one
+# each test skips.
+#
+# run with: pith test tests/live/db_mysql_pool_live.pith
+
+import std.db.mysql as db
+import std.sql as sql
+
+# open a pooled handle, or skip when no server answers. the pool connects
+# lazily, so a trivial query is what actually probes the server.
+fn open_or_skip() -> db.Db:
+    attempt := db.open("mysql://pith:pith_pw@127.0.0.1:3306/pithtest")
+    if attempt.is_err:
+        skip_test("no mysql server at 127.0.0.1:3306")
+    handle := attempt.ok
+    probe := handle.query("select 1", [])
+    if probe.is_err:
+        skip_test("no mysql server at 127.0.0.1:3306")
+    return handle
+
+test "a round trip through the pooled layer reads typed columns":
+    handle := open_or_skip()
+    handle.exec("drop table if exists db_pool_my", [])!
+    handle.exec("create table db_pool_my (id int auto_increment primary key, name varchar(64), score double)", [])!
+
+    handle.exec("insert into db_pool_my (name, score) values (?, ?)", ["ada", "9.5"])!
+    handle.exec("insert into db_pool_my (name) values (?)", ["grace"])!
+
+    rows := handle.query("select id, name, score from db_pool_my order by id", [])!
+    assert_eq(rows.len(), 2)
+    assert_eq(rows[0].int("id"), 1)
+    assert_eq(rows[0].text("name"), "ada")
+    assert_eq(rows[0].float("score"), 9.5)
+    # the second row's score is null
+    assert(rows[1].opt_float("score") == none)
+
+    handle.exec("drop table db_pool_my", [])!
+    handle.close()
+
+test "exec reports the auto-increment id and affected count":
+    handle := open_or_skip()
+    handle.exec("drop table if exists db_pool_my_ins", [])!
+    handle.exec("create table db_pool_my_ins (id int auto_increment primary key, name varchar(64))", [])!
+
+    first := handle.exec("insert into db_pool_my_ins (name) values (?)", ["ada"])!
+    assert_eq(first.rows_affected, 1)
+    assert_eq(first.last_insert_id, 1)
+    second := handle.exec("insert into db_pool_my_ins (name) values (?)", ["grace"])!
+    assert_eq(second.last_insert_id, 2)
+
+    deleted := handle.exec("delete from db_pool_my_ins where id = ?", ["1"])!
+    assert_eq(deleted.rows_affected, 1)
+
+    handle.exec("drop table db_pool_my_ins", [])!
+    handle.close()
+
+test "a query error surfaces rather than crashing":
+    handle := open_or_skip()
+    result := handle.query("select 1 from no_such_table_pith_xyz", [])
+    handle.close()
+    assert(result.is_err)

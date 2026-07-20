@@ -1,0 +1,61 @@
+# live integration tests for the pooled std.db.postgres layer. they need a
+# postgres server on 127.0.0.1:5432 with the pithtest fixtures; when none is
+# reachable each test skips rather than fails, so `pith test` stays green on a
+# machine without one.
+#
+# run with: pith test tests/live/db_postgres_pool_live.pith
+
+import std.db.postgres as db
+import std.sql as sql
+
+# open a pooled handle, or skip when no server answers. the pool connects
+# lazily, so a trivial query is what actually probes the server.
+fn open_or_skip() -> db.Db:
+    attempt := db.open("postgres://pith:pith_pw@127.0.0.1:5432/pithtest")
+    if attempt.is_err:
+        skip_test("no postgres server at 127.0.0.1:5432")
+    handle := attempt.ok
+    probe := handle.query("select 1", [])
+    if probe.is_err:
+        skip_test("no postgres server at 127.0.0.1:5432")
+    return handle
+
+test "a round trip through the pooled layer reads typed columns":
+    handle := open_or_skip()
+    handle.exec("drop table if exists db_pool_pg", [])!
+    handle.exec("create table db_pool_pg (id int primary key, name text, score double precision)", [])!
+
+    handle.exec("insert into db_pool_pg (id, name, score) values ($1, $2, $3)", ["1", "ada", "9.5"])!
+    handle.exec("insert into db_pool_pg (id, name) values ($1, $2)", ["2", "grace"])!
+
+    rows := handle.query("select id, name, score from db_pool_pg order by id", [])!
+    assert_eq(rows.len(), 2)
+    assert_eq(rows[0].int("id"), 1)
+    assert_eq(rows[0].text("name"), "ada")
+    assert_eq(rows[0].float("score"), 9.5)
+    # the second row's score is null
+    assert(rows[1].opt_float("score") == none)
+
+    handle.exec("drop table db_pool_pg", [])!
+    handle.close()
+
+test "exec reports the affected-row count":
+    handle := open_or_skip()
+    handle.exec("drop table if exists db_pool_pg_exec", [])!
+    handle.exec("create table db_pool_pg_exec (id int primary key, name text)", [])!
+    handle.exec("insert into db_pool_pg_exec (id, name) values ($1, $2)", ["1", "ada"])!
+    handle.exec("insert into db_pool_pg_exec (id, name) values ($1, $2)", ["2", "grace"])!
+
+    updated := handle.exec("update db_pool_pg_exec set name = $1 where id = $2", ["ada2", "1"])!
+    assert_eq(updated.rows_affected, 1)
+    deleted := handle.exec("delete from db_pool_pg_exec where id = $1", ["2"])!
+    assert_eq(deleted.rows_affected, 1)
+
+    handle.exec("drop table db_pool_pg_exec", [])!
+    handle.close()
+
+test "a query error surfaces rather than crashing":
+    handle := open_or_skip()
+    result := handle.query("select 1 from no_such_table_pith_xyz", [])
+    handle.close()
+    assert(result.is_err)

@@ -169,6 +169,79 @@ write middleware as a named function, as above. `examples/web_middleware.pith` i
 complete, self-checking example: two middleware bracket the response body with markers
 so the nesting is visible in the output.
 
+## observability
+
+a server built with `web.new()` is observable out of the box. every route is wrapped
+in a built-in middleware that records metrics and opens a trace span, and `web.new()`
+serves a `/metrics` endpoint — none of which you write. this built-in middleware sits
+outside any middleware you add, so it measures the whole request.
+
+### metrics
+
+for every request the middleware records three series, labeled by method and route
+pattern. the label is the pattern (`/users/:id`), not the concrete path, so a busy
+route stays one series instead of thousands:
+
+- `http_server_requests_total{method,route,status}` — a request counter
+- `http_server_requests_in_flight{method,route}` — a gauge of in-flight requests
+- `http_server_duration_ms{method,route}` — a request-duration histogram
+
+these live in memory and are always on: they need no setup and cost a map update per
+request. `web.new()` also registers `GET /metrics`, which renders every `std.metrics`
+series as prometheus text, so a scraper reads them straight off your server:
+
+```pith
+app := web.new().get("/users/:id", show)
+# GET /metrics now returns the prometheus exposition, including
+# http_server_requests_total{method="GET",route="/users/:id",status="200"} 12
+```
+
+`examples/web_observability.pith` runs the whole loop: it makes a few requests to a
+route, then reads the request count back out of `/metrics` — with no instrumentation
+code in the handler.
+
+### traces
+
+the same middleware opens a server span per request, tagged with the method, path, and
+status. it reads an inbound `traceparent` header, so a request that arrives already in
+a trace joins it. until you turn tracing on the span is a cheap no-op: it takes no ids
+and records nothing, so an app without an exporter pays nothing for it.
+
+to export spans, initialize `std.obs` before you start serving. `obs.init()` reads the
+standard `OTEL_*` environment variables and, when `OTEL_EXPORTER_OTLP_ENDPOINT` is set,
+turns tracing on and starts the OTLP exporter:
+
+```pith
+import std.obs as obs
+
+fn main() -> Int!:
+    obs.init()
+    web.new().get("/", home).listen("0.0.0.0", 8080)!
+    return 0
+```
+
+spans then flow to your collector; `docs/telemetry.md` covers the exporter and the
+sampler in full.
+
+### access logs
+
+access logging is opt-in rather than on by default. metrics and traces carry the
+observable-by-default story quietly, and a log line per request would clutter an
+example or a benchmark, so you add it when you want it:
+
+```pith
+app := web.new().use_mw(web.access_log).get("/", home)
+```
+
+`web.access_log` writes one structured line per request to `std.log` (which goes to
+stderr) with the method, route, path, status, and elapsed time.
+
+### opting out
+
+observability adds a little work to every request, so for a benchmark or a bare-bones
+server, build the app with `web.bare()` instead of `web.new()`. a bare app has only the
+default `/healthz` route: no observability middleware and no `/metrics`.
+
 ## a task per connection
 
 `listen` accepts connections in a loop and hands each one to its own task with
@@ -186,5 +259,6 @@ carry many more connections than it has os threads.
 
 `examples/web_hello.pith` is a complete, self-checking server: it defines a couple of
 routes, spawns the server, makes a few requests against itself, and prints the
-replies. `bench/web_hello.pith` is the same idea as a real blocking server, wired up
-for `bench/http_bench.sh`.
+replies. `examples/web_observability.pith` does the same and then scrapes `/metrics` to
+show the request counter the framework kept on its own. `bench/web_hello.pith` is the
+same idea as a real blocking server, wired up for `bench/http_bench.sh`.

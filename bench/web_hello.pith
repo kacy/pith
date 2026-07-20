@@ -44,7 +44,9 @@ fn main() -> Int!:
     if argv.len() > 1:
         port = parse_int(argv[1]) catch 8080
 
-    mut app := web.new()
+    # bare() skips the default observability middleware and /metrics endpoint so
+    # the benchmark measures raw routing throughput, not the metric bookkeeping.
+    mut app := web.bare()
     app = app.get("/health", health)
     app = app.get("/item", item)
 

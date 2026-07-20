@@ -63,12 +63,60 @@ a handler receives a `web.Request`. the common accessors are right there:
 
 - `req.param(name)` — a path parameter, or `""`
 - `req.query(name)` — a query-string value, or `""`
+- `req.query_or(name, fallback)` — a query-string value, or `fallback` when it is
+  missing or empty
 - `req.header(name)` — a request header, or `""`
 - `req.body()` — the body as text
+- `req.is_json()` — true when the `Content-Type` is `application/json`
 - `req.method()` and `req.path()`
 
 when you need more, like cookies, multipart parts, or the raw bytes, reach through
 `req.raw`, which is the underlying `std.net.http` request.
+
+## request bodies & json
+
+most json apis read a struct out of the request body. `json.decode_text[T]` does
+exactly that: give it the body text and the struct you expect, and it hands back a
+typed value or a decode error. the struct's fields have to be `pub` so the decoder
+can fill them in.
+
+```pith
+import std.json as json
+
+struct NewUser:
+    pub name: String
+    pub age: Int
+
+fn create_user(req: web.Request) -> http.HttpResponse:
+    if not req.is_json():
+        return http.bad_request_response()
+    parsed := json.decode_text[NewUser](req.body())
+    if parsed.is_err:
+        return http.bad_request_response()
+    user := parsed.ok
+    return http.json(201, user_json(user))
+```
+
+a handler returns a response rather than propagating an error, so check
+`parsed.is_err` and answer with a 400 instead of using `!`. `req.is_json()` turns
+away anything that is not `application/json` before you even try to decode, and a
+malformed body still lands in the `is_err` branch, so both cases come back as a clean
+400.
+
+going the other way, build the response body with the `std.json` constructors and
+send it with `http.json`:
+
+```pith
+fn user_json(user: NewUser) -> String:
+    obj := json.make_object()
+    json.object_set(obj, "name", json.make_string(user.name))
+    json.object_set(obj, "age", json.make_int(user.age))
+    return json.encode(obj)
+```
+
+`examples/web_json_api.pith` is a complete, self-checking version of this: a
+`GET /users/:id` that echoes the path parameter as json and a `POST /users` that
+decodes a `NewUser` from the body and echoes it back.
 
 ## responses
 

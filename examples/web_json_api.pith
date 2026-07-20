@@ -1,0 +1,101 @@
+# a small json api with std.web.
+#
+# two routes tell the whole story: GET /users/:id echoes the path parameter
+# back as json, and POST /users reads a typed struct out of the request body
+# and echoes it back — or answers 400 when the body is missing or malformed.
+#
+# in a real program main would end with build_app().listen(...) and stay up.
+# so this can run as a self-checking example, we instead spawn the server, make
+# a few requests against it (including a POST with a json body), print the
+# replies, and exit.
+import std.web as web
+import std.net.http as http
+import std.net.tcp as tcp
+import std.json as json
+
+# the shape we expect in a POST /users body. json.decode_text reads the fields
+# straight off the struct, so they have to be `pub`.
+struct NewUser:
+    pub name: String
+    pub age: Int
+
+# encode a user back into json text for the response body.
+fn user_json(user: NewUser) -> String:
+    obj := json.make_object()
+    json.object_set(obj, "name", json.make_string(user.name))
+    json.object_set(obj, "age", json.make_int(user.age))
+    return json.encode(obj)
+
+# GET /users/:id — echo the path parameter back as a small json object.
+fn show_user(req: web.Request) -> http.HttpResponse:
+    obj := json.make_object()
+    json.object_set(obj, "id", json.make_string(req.param("id")))
+    return http.json(200, json.encode(obj))
+
+# POST /users — decode a NewUser from the json body and echo it back. is_json()
+# turns away anything that is not application/json, and a decode error (a
+# missing field or malformed json) becomes a 400 rather than a crash.
+fn create_user(req: web.Request) -> http.HttpResponse:
+    if not req.is_json():
+        return http.bad_request_response()
+    parsed := json.decode_text[NewUser](req.body())
+    if parsed.is_err:
+        return http.bad_request_response()
+    return http.json(201, user_json(parsed.ok))
+
+# the whole application: one route to read a user, one to create one. routes are
+# added one per line because a builder chain has to stay on a single line.
+fn build_app() -> web.App:
+    mut app := web.new()
+    app = app.get("/users/:id", show_user)
+    app = app.post("/users", create_user)
+    return app
+
+# run the server in the background so main can act as a client against it.
+fn serve_bg(port: Int) -> Int:
+    return build_app().listen("127.0.0.1", port) catch 0
+
+# a minimal GET that returns just the response body, so we can print it.
+fn get_body(port: Int, path: String) -> String:
+    fd := tcp.connect("127.0.0.1", port) catch 0
+    crlf := chr(13) + chr(10)
+    tcp.write(fd, "GET " + path + " HTTP/1.1" + crlf + "Host: localhost" + crlf + "Connection: close" + crlf + crlf) catch 0
+    return read_body(fd)
+
+# a minimal POST with a json body, returning just the response body.
+fn post_json(port: Int, path: String, body: String) -> String:
+    fd := tcp.connect("127.0.0.1", port) catch 0
+    crlf := chr(13) + chr(10)
+    mut request := "POST " + path + " HTTP/1.1" + crlf
+    request = request + "Host: localhost" + crlf
+    request = request + "Content-Type: application/json" + crlf
+    request = request + "Content-Length: " + body.len().to_string() + crlf
+    request = request + "Connection: close" + crlf + crlf + body
+    tcp.write(fd, request) catch 0
+    return read_body(fd)
+
+# read a whole response off the socket and return only the body.
+fn read_body(fd: Int) -> String:
+    crlf := chr(13) + chr(10)
+    raw := tcp.read(fd, 65536) catch ""
+    tcp.close(fd)
+    split := raw.index_of(crlf + crlf)
+    if split < 0:
+        return raw
+    return raw.substring(split + 4, raw.len())
+
+fn main() -> Int!:
+    port := 18082
+    spawn serve_bg(port)
+    sleep(200)   # give the listener a moment to bind
+
+    dq := chr(34)
+    body := chr(123) + dq + "name" + dq + ":" + dq + "ada" + dq + "," + dq + "age" + dq + ":36" + chr(125)
+
+    # GET echoes the path parameter as json.
+    print(get_body(port, "/users/42"))
+    # POST decodes the body into a NewUser and echoes it back.
+    print(post_json(port, "/users", body))
+    # a malformed body is turned away with a 400.
+    print(post_json(port, "/users", "not json"))
+    return 0

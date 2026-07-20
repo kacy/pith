@@ -2415,10 +2415,12 @@ pub fn begin_server_span(req: HttpRequestBytes) -> trace.Span:
     span.set_attr("http.request.method", req.method_text).set_attr("url.path", req.path_text)
     return span
 
-# finish a server span from begin_server_span: set its status from the response
-# code (>= 500 is an error), end it, and record the http_server RED metrics
-# labeled by method, route, and status. a no-op when tracing is inactive.
-pub fn end_server_span(span: trace.Span, status: Int):
+# close a server span opened by begin_server_span: tag it with the response
+# status, mark it an error on a 5xx, and end it. it records no metrics — a
+# framework that keeps its own per-request metrics (std.web does) closes the span
+# with this and counts separately, so the RED series are not recorded twice. a
+# no-op when tracing is inactive.
+pub fn finish_server_span(span: trace.Span, status: Int):
     if not trace.is_active():
         return
     status_label := status.to_string()
@@ -2428,14 +2430,27 @@ pub fn end_server_span(span: trace.Span, status: Int):
     else:
         span.set_status(trace.STATUS_OK, "")
     span.end()
-    # the span name is "METHOD path"; split it back into the metric labels.
-    space := span.name.index_of(" ")
-    mut method := span.name
+
+# finish a server span from begin_server_span: close it (finish_server_span) and
+# record the http_server RED metrics labeled by method, route, and status. a
+# no-op when tracing is inactive. std.web keeps its own always-on metrics, so it
+# closes spans with finish_server_span instead of this.
+pub fn end_server_span(span: trace.Span, status: Int):
+    if not trace.is_active():
+        return
+    # the span name is "METHOD path"; read it before finishing, then split it
+    # back into the metric labels.
+    name := span.name
+    started_ns := span.start_unix_ns
+    finish_server_span(span, status)
+    status_label := status.to_string()
+    space := name.index_of(" ")
+    mut method := name
     mut route := ""
     if space >= 0:
-        method = span.name.substring(0, space)
-        route = span.name.substring(space + 1, span.name.len())
-    elapsed_ms := time_mod.now() - (span.start_unix_ns / 1000000)
+        method = name.substring(0, space)
+        route = name.substring(space + 1, name.len())
+    elapsed_ms := time_mod.now() - (started_ns / 1000000)
     metrics.counter("http_server_requests_total").labels(["method", method, "route", route, "status", status_label]).inc()
     metrics.histogram("http_server_duration_ms").labels(["method", method, "route", route]).observe(elapsed_ms.to_float())
 

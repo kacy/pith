@@ -129,24 +129,24 @@ that same in-userspace scheduler, and this benchmark is the case it was built
 for. running the reader, writer, and worker tasks as coroutines on one worker
 (`PITH_GREEN_WORKERS=1`) turns every per-call handoff from a futex wake into a
 userspace switch. measured on the 2-core dev box, conc=8, medians of 5 runs,
-per-call counts over warmup+calls:
+per-call counts over warmup+calls (2026-07-20 rerun):
 
 | 16 B, conc=8 | calls/sec | ctx-switches/call | cpu |
 |---|---|---|---|
-| os-thread | 7017 | 4.7 | 0.99 |
-| green, 1 worker | 10598 | 0.54 | 0.85 |
-| green, 2 workers | 8074 | 1.64 | 0.94 |
+| os-thread | 6887 | 4.9 | 0.98 |
+| green, 1 worker | 10570 | 0.55 | 0.69 |
+| green, 2 workers | 9689 | 0.93 | 0.78 |
 
 | 1 KiB, conc=8 | calls/sec | ctx-switches/call | cpu |
 |---|---|---|---|
-| os-thread | 5938 | 5.0 | 1.00 |
-| green, 1 worker | 9119 | 0.54 | 0.84 |
-| green, 2 workers | 7415 | 1.62 | 0.96 |
+| os-thread | 6422 | 4.6 | 1.02 |
+| green, 1 worker | 9090 | 0.57 | 0.70 |
+| green, 2 workers | 7215 | 1.72 | 0.93 |
 
 at one worker the mechanism does exactly what it was meant to: context switches
-per call fall from ~4.7 to ~0.5 (the pipeline stops touching the kernel to hand a
-frame between tasks), and that shows up in the wall clock — throughput up ~51% at
-16 B and ~54% at 1 KiB while cpu drops below a core. that is close to the cpu
+per call fall from ~4.9 to ~0.55 (the pipeline stops touching the kernel to hand a
+frame between tasks), and that shows up in the wall clock — throughput up ~53% at
+16 B and ~42% at 1 KiB while cpu drops below a core. that is close to the cpu
 grpc-go spends here, so green-at-one-worker gets pith to about three quarters of
 go's throughput at go's efficiency, from about half at 1.5x the cost on the
 os-thread backend.
@@ -159,7 +159,8 @@ single connection's pipeline pins to one worker and the other has nothing it can
 run. giving each worker its own park spot (a pinned wake now nudges only the
 task's owner, and an idle worker no longer counts a peer's un-stealable pinned
 work as a reason to stay awake) removes that herd: at two workers green now beats
-the os-thread backend, ~15% at 16 B and ~25% at 1 KiB, at lower cpu.
+the os-thread backend, ~41% at 16 B and ~12% at 1 KiB, at lower cpu (the 16 B
+margin is the noisier of the two — the two-worker path varies run to run).
 
 two workers still trails one, though, and the reason is locality, not the herd.
 the eight request tasks are spawned from the main thread, so they scatter across

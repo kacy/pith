@@ -564,10 +564,12 @@ fn build_execute(stmt: Stmt, params: List[String]) -> Bytes:
     out.free()
     return result
 
-# the outcome of one execute: rows for a select, affected count otherwise.
+# the outcome of one execute: rows for a select, or the affected count and the
+# auto-increment id the server assigned (both from the OK packet) otherwise.
 struct BinaryResult:
     rows: List[sql.Row]
     affected: Int
+    last_insert_id: Int
 
 # run a prepared statement and read its reply: an OK packet (no result set) or a
 # binary result set of column definitions followed by binary rows.
@@ -581,8 +583,10 @@ fn run_stmt(conn: Conn, stmt: Stmt, params: List[String]) -> BinaryResult!:
     if lead == 255:
         fail "mysql: {err_text(first)}"
     if lead == 0:
+        # OK packet: affected-rows lenenc, then the last-insert-id lenenc.
         ok := Reader(data: first, pos: 1)
-        return BinaryResult(rows: [], affected: ok.lenenc())
+        affected := ok.lenenc()
+        return BinaryResult(rows: [], affected: affected, last_insert_id: ok.lenenc())
 
     header := Reader(data: first, pos: 0)
     column_count := header.lenenc()
@@ -602,7 +606,7 @@ fn run_stmt(conn: Conn, stmt: Stmt, params: List[String]) -> BinaryResult!:
     while true:
         pkt := conn.read_packet()!
         if bytes.get(pkt, 0) == 254 and bytes.len(pkt) < 9:
-            return BinaryResult(rows: rows, affected: 0)
+            return BinaryResult(rows: rows, affected: 0, last_insert_id: 0)
         r := Reader(data: pkt, pos: 1)
         null_bytes := (column_count + 9) / 8
         bitmap := bytes.slice(pkt, r.pos, r.pos + null_bytes)
@@ -629,6 +633,18 @@ pub fn query_prepared(conn: Conn, stmt: Stmt, params: List[String]) -> Rows!:
 pub fn exec_prepared(conn: Conn, stmt: Stmt, params: List[String]) -> Int!:
     result := run_stmt(conn, stmt, params)!
     return result.affected
+
+# the affected-row count and auto-increment id from one execute. `last_insert_id`
+# is the id the server assigned an auto_increment column, or 0 when the statement
+# inserted none.
+pub struct ExecInfo:
+    pub affected: Int
+    pub last_insert_id: Int
+
+# like exec_prepared, but also report the auto-increment id the insert produced.
+pub fn exec_prepared_info(conn: Conn, stmt: Stmt, params: List[String]) -> ExecInfo!:
+    result := run_stmt(conn, stmt, params)!
+    return ExecInfo(affected: result.affected, last_insert_id: result.last_insert_id)
 
 # release a prepared statement on the server (COM_STMT_CLOSE), which sends no
 # reply.

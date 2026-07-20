@@ -205,18 +205,30 @@ fn fill_sockaddr(
 /// returns the fd on success or `0` on failure, matching the blocking path.
 ///
 /// dns resolution stays blocking here (getaddrinfo, a documented gap) — only the
-/// TCP handshake yields.
+/// TCP handshake yields. we try every resolved address in order and keep the
+/// first that connects, matching `TcpStream::connect`: a name like `localhost`
+/// often resolves to `::1` before `127.0.0.1`, and a server bound only to IPv4
+/// refuses the first before the second succeeds.
 fn green_connect(host: &str, port: i64) -> i64 {
     use std::net::ToSocketAddrs;
 
     let target = format!("{}:{}", host, port);
-    let addr = match target.to_socket_addrs() {
-        Ok(mut it) => match it.next() {
-            Some(a) => a,
-            None => return 0,
-        },
+    let addrs = match target.to_socket_addrs() {
+        Ok(it) => it,
         Err(_) => return 0,
     };
+    for addr in addrs {
+        let fd = green_connect_addr(&addr);
+        if fd != 0 {
+            return fd;
+        }
+    }
+    0
+}
+
+/// green-mode connect to a single resolved address. returns the fd on success or
+/// `0` on failure so the caller can fall through to the next resolved address.
+fn green_connect_addr(addr: &std::net::SocketAddr) -> i64 {
     let family = match addr {
         std::net::SocketAddr::V4(_) => libc::AF_INET,
         std::net::SocketAddr::V6(_) => libc::AF_INET6,
@@ -232,7 +244,7 @@ fn green_connect(host: &str, port: i64) -> i64 {
 
     // SAFETY: sockaddr_storage is plain-old-data; zeroing it is a valid start.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let len = fill_sockaddr(&addr, &mut storage);
+    let len = fill_sockaddr(addr, &mut storage);
     // SAFETY: connecting a non-blocking socket to a valid sockaddr of `len` bytes.
     let rc = unsafe {
         libc::connect(

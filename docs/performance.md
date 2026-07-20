@@ -271,7 +271,7 @@ cycle `weak` breaks it and the whole graph reclaims:
 
 | | strong (no weak) | weak edge |
 |---|---|---|
-| peak rss | 368 mb | **10 mb** |
+| peak rss | 708 mb | **2 mb** |
 
 this is the escape hatch for the one thing reference counting can't do
 on its own. pith has no cycle collector by design (no gc pauses); a

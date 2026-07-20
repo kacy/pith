@@ -30,9 +30,21 @@
 #       return next(req)
 #
 #   app := web.new().use_mw(logging).get("/", home)
+#
+# a server built with new() is observable out of the box: a built-in middleware
+# records in-memory metrics for every request (a request counter, an in-flight
+# gauge, and a duration histogram, labeled by method and route) and opens a trace
+# span that stays a cheap no-op until std.obs is configured. new() also serves
+# GET /metrics with the prometheus text of everything std.metrics has collected,
+# so you can scrape a pith server with zero instrumentation code. use web.bare()
+# when you want the framework and none of that — e.g. a benchmark.
 
 import std.net.http as http
 import std.net.tcp as tcp
+import std.metrics as metrics
+import std.prometheus as prometheus
+import std.time as time_mod
+import std.log as log
 
 # how long a connection may sit idle before the server hangs up on it, in
 # milliseconds. keeps a stalled client from tying up a task forever.
@@ -40,10 +52,13 @@ CONNECTION_TIMEOUT_MS := 5000
 
 # an incoming request, handed to every route handler. `raw` is the underlying
 # std.net.http request if you need headers, cookies, or the body as bytes;
-# `params` holds the path parameters the router pulled out of the pattern.
+# `params` holds the path parameters the router pulled out of the pattern; and
+# `pattern` is the matched route pattern (e.g. "/users/:id"), which the
+# observability middleware uses as a low-cardinality metric label.
 pub struct Request:
     pub raw: http.HttpRequestBytes
     pub params: Map[String, String]
+    pub pattern: String
 
 impl Request:
     # the value of a path parameter, e.g. req.param("id") for a `/users/:id`
@@ -106,10 +121,22 @@ pub struct App:
     routes: List[Route]
     middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]
 
-# a new App with a default `GET /healthz` route that answers 200 "ok", so a
-# fresh server is immediately checkable by a load balancer or uptime probe, and
-# no middleware yet.
+# a batteries-included App: the default `GET /healthz`, the built-in
+# observability middleware wrapping every route (metrics + a per-request trace
+# span), and a `GET /metrics` endpoint that serves the prometheus text of
+# everything std.metrics has collected. so a server built with new() is
+# instrumented and scrapable with no extra code. reach for bare() when you want
+# the framework and none of the observability.
 pub fn new() -> App:
+    metrics_route := fn(req: Request) => prometheus.metrics_response()
+    return bare().use_mw(observe).get("/metrics", metrics_route)
+
+# a bare App with only the default `GET /healthz` route: no observability
+# middleware and no `/metrics` endpoint, so every request skips the metric
+# bookkeeping and the trace span. use it for a benchmark or a minimal server
+# where you want the routing and the accept loop and nothing else; new() is the
+# opinionated, observable default.
+pub fn bare() -> App:
     healthz := fn(req: Request) => http.text(200, "ok")
     return App([Route("GET", "/healthz", healthz)], [])
 
@@ -160,6 +187,54 @@ fn wrap_middleware(middleware: List[fn(fn(Request) -> http.HttpResponse, Request
     chain := Chain(middleware, handler)
     return fn(req: Request) => run_chain(chain, 0, req)
 
+# the metric names the observability middleware records. they follow the RED
+# convention — a request counter (errors show up in the status label), an
+# in-flight gauge, and a duration histogram — and match the names
+# begin/end_server_span use, so a program that mixes the two sees one metric
+# family rather than two.
+OBS_REQUESTS_TOTAL := "http_server_requests_total"
+OBS_IN_FLIGHT := "http_server_requests_in_flight"
+OBS_DURATION_MS := "http_server_duration_ms"
+
+# the built-in observability middleware new() installs on every app. it records
+# in-memory RED metrics for each request — labeled by method and route pattern so
+# cardinality stays bounded — and opens a server trace span. the metrics are
+# always on and need no setup: they accumulate in std.metrics and are scraped at
+# GET /metrics. the span is a cheap no-op until std.obs configures tracing, so an
+# app that never wires up OTLP pays only the metric bookkeeping.
+fn observe(next: fn(Request) -> http.HttpResponse, req: Request) -> http.HttpResponse:
+    method := req.method()
+    route := req.pattern
+    labels := ["method", method, "route", route]
+    started := time_mod.now()
+    inflight := metrics.gauge(OBS_IN_FLIGHT).labels(labels)
+    inflight.add(1.0)
+    span := http.begin_server_span(req.raw)
+
+    resp := next(req)
+
+    http.finish_server_span(span, resp.status)
+    inflight.add(0.0 - 1.0)
+    elapsed := time_mod.now() - started
+    status_label := resp.status.to_string()
+    metrics.counter(OBS_REQUESTS_TOTAL).labels(["method", method, "route", route, "status", status_label]).inc()
+    metrics.histogram(OBS_DURATION_MS).labels(labels).observe(elapsed.to_float())
+    return resp
+
+# a built-in access-log middleware. opt in with app.use_mw(web.access_log): it
+# writes one structured line per request to std.log (which goes to stderr) with
+# the method, route pattern, path, status, and elapsed time. it is not installed
+# by default — metrics and traces carry the observable-by-default story silently,
+# while an access log adds a write per request and would clutter an example or
+# benchmark, so you turn it on when you want it (the same choice most servers
+# make).
+pub fn access_log(next: fn(Request) -> http.HttpResponse, req: Request) -> http.HttpResponse:
+    started := time_mod.now()
+    resp := next(req)
+    elapsed := time_mod.now() - started
+    log.root().target("http.access").info().str("method", req.method()).str("route", req.pattern).str("path", req.path()).int("status", resp.status).duration_ms("elapsed_ms", elapsed).msg("request")
+    return resp
+
 # the path parameters named in `pattern` (its `:name` segments), pulled out of
 # the request's actual path so a handler can read them by name.
 fn params_for(pattern: String, req: http.HttpRequestBytes) -> Map[String, String]:
@@ -180,7 +255,7 @@ fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
         matched := req.matches_path(route.pattern) catch false
         if route.method == method and matched:
             handler := wrap_middleware(app.middleware, route.handler)
-            return handler(Request(req, params_for(route.pattern, req)))
+            return handler(Request(req, params_for(route.pattern, req), route.pattern))
     return http.not_found_response()
 
 # serve one accepted connection to completion on its own task, then close it.
@@ -358,3 +433,42 @@ test "is_json is true only for an application/json content type":
     sleep(200)
     assert_eq(get_body_with_content_type(port, "/probe", "application/json"), "true")
     assert_eq(get_body_with_content_type(port, "/probe", "text/plain"), "false")
+
+# a trivial handler used by the observability tests.
+fn ping(req: Request) -> http.HttpResponse:
+    return http.text(200, "pong")
+
+test "the default app serves /metrics and records the request counter":
+    app := new().get("/obs-ping", ping)
+    port := 18990
+    spawn serve_bg(app, port)
+    sleep(200)
+    assert_eq(get_body(port, "/obs-ping"), "pong")
+    assert_eq(get_body(port, "/obs-ping"), "pong")
+    # scraping /metrics returns the prometheus text with the auto-recorded counter.
+    metrics_text := get_body(port, "/metrics")
+    assert(metrics_text.contains("# TYPE http_server_requests_total counter"))
+    assert(metrics_text.contains("route=" + chr(34) + "/obs-ping" + chr(34)))
+
+test "a bare app has no observability middleware and no /metrics":
+    app := bare().get("/", ping)
+    port := 18991
+    spawn serve_bg(app, port)
+    sleep(200)
+    assert_eq(get_body(port, "/"), "pong")
+    # bare() registers no /metrics route, so a scrape falls through to a 404.
+    assert(get_body(port, "/metrics").contains("404"))
+
+test "metrics are recorded with tracing off, and the span is a no-op":
+    # no std.obs.init, so tracing is inactive: the per-request span is a cheap
+    # no-op, but the in-memory metrics still increment. this is the
+    # observable-by-default guarantee — metrics with zero setup.
+    series := ["method", "GET", "route", "/obs-count", "status", "200"]
+    before := metrics.counter(OBS_REQUESTS_TOTAL).labels(series).value()
+    app := new().get("/obs-count", ping)
+    port := 18992
+    spawn serve_bg(app, port)
+    sleep(200)
+    assert_eq(get_body(port, "/obs-count"), "pong")
+    after := metrics.counter(OBS_REQUESTS_TOTAL).labels(series).value()
+    assert_eq(after - before, 1.0)

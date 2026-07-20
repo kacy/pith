@@ -219,7 +219,10 @@ it is off by default and still experimental. the known rough edges:
 - there is no preemption yet, so a task that loops without ever yielding or
   touching i/o can hold its worker; cooperative code that uses channels and
   sockets shares fine
-- fewer workers means more locality: at `PITH_GREEN_WORKERS=1` a coordinated
-  pipeline runs entirely in one worker with no cross-thread wakes, which is
-  often the fastest setting for a single connection even though it uses one
-  core
+- fewer workers means more locality: a task pins to the first worker that runs
+  it and every later wake goes back to that one worker, never the whole pool, so
+  a coordinated pipeline stays put and its handoffs stay in userspace. at
+  `PITH_GREEN_WORKERS=1` the whole pipeline shares one worker with no cross-thread
+  wakes at all, which is often the fastest setting for a single connection even
+  though it uses one core; more workers only pay off when the work genuinely
+  spreads across connections or cores

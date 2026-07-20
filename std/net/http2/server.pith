@@ -1,4 +1,4 @@
-# std.net.http2.server — a native http/2 server over cleartext tcp (h2c).
+# std.net.http2.server — a native http/2 server over h2c or tls (alpn "h2").
 #
 # this is the mirror of the http/2 client in std.net.http2.connection: the same
 # frame codec (std.net.http2.frames), the same hpack compression
@@ -30,9 +30,12 @@
 # the transport. the small amount of shared state — the stream table — is guarded
 # by a mutex, exactly as the client guards its own.
 #
-# this phase serves cleartext h2c and bodiless GET requests. tls/alpn, request
-# bodies, and full flow-control tuning arrive in later phases; the shape here is
-# built to grow into them.
+# the server runs over either transport: cleartext h2c (serve_h2c_connection /
+# listen_h2c) or http/2 over tls with alpn "h2" (serve_h2_tls_connection /
+# listen_h2_tls). the transport is a byte-level swap inside ServerConn; the
+# reader, writer, and per-stream handlers are identical for both. this phase
+# serves bodiless GET requests; request bodies and full flow-control tuning
+# arrive in later phases, but the shape here is built to grow into them.
 
 # the codec modules are imported before std.net.http on purpose, for the same
 # loader-ordering reason documented in std.net.http2.connection: importing frames
@@ -42,6 +45,7 @@ import std.net.http2.hpack as hpack
 import std.bytes as bytes
 import std.binary as binary
 import std.net.http as http
+import std.net.tls as tls
 # the request-side stream event and its constructors, plus the settings ids and
 # the default window, are shared as-is with the client — the server reads the
 # same events the client writes. imported by name because a Channel's element
@@ -71,6 +75,22 @@ STREAM_INBOX_CAP := 64
 
 # how much of the receive buffer to pull from the socket per read.
 RECV_CHUNK := 16384
+
+# --- the transport ---
+#
+# a ServerConn speaks over one of three transports, chosen once at construction.
+# everything above the transport — the reader, the writer, the per-stream
+# handlers, the frame codec — is identical for all three; only recv_chunk, send,
+# and close differ, so switching h2c for tls is a byte-transport swap, not a new
+# protocol path.
+#   * TRANSPORT_OFFLINE feeds a preloaded buffer and records writes in `sent`, so
+#     the frame tests drive the codec deterministically with no socket.
+#   * TRANSPORT_TCP is cleartext h2c over an accepted tcp fd (P3a).
+#   * TRANSPORT_TLS is h2 over an accepted tls session that negotiated alpn "h2",
+#     using the same read_bytes/write_all_bytes the h2 client uses over tls.
+TRANSPORT_OFFLINE := 0
+TRANSPORT_TCP := 1
+TRANSPORT_TLS := 2
 
 # --- outbound work items ---
 
@@ -107,40 +127,47 @@ fn no_fields() -> List[hpack.HeaderField]:
 fn raw_item(wire: Bytes) -> Outbound:
     return Outbound(OUT_RAW, wire, 0, no_fields(), bytes.empty())
 
-# --- the h2c transport ---
-
-# an http/2 connection over one cleartext tcp socket. this mirrors the client's
-# Connection transport but speaks plain tcp (h2c has no tls) and reads requests
-# rather than responses. `fd` is the socket when `live`; when not live the tests
-# preload `buf` with a constructed request stream and reads record into `sent`,
-# so the offline frame tests can drive the codec deterministically. `buf`/`pos`
-# coalesce partial socket reads (a frame can span reads). the encoder is owned by
-# the writer task, the decoder by the reader task; they are never touched
-# concurrently.
+# an http/2 connection over one transport. it mirrors the client's Connection but
+# reads requests rather than responses. `transport` selects the byte transport:
+# TRANSPORT_TCP uses `fd` (cleartext h2c), TRANSPORT_TLS uses `tls_handle` (h2
+# over tls), and TRANSPORT_OFFLINE preloads `buf` with a constructed request
+# stream and records writes into `sent` so the frame tests drive the codec with
+# no socket. `buf`/`pos` coalesce partial reads (a frame can span reads). the
+# encoder is owned by the writer task, the decoder by the reader task; they are
+# never touched concurrently.
 struct ServerConn:
     mut fd: Int
-    mut live: Bool
+    mut tls_handle: Int
+    mut transport: Int
     mut buf: Bytes
     mut pos: Int
     mut encoder: hpack.Encoder
     mut decoder: hpack.Decoder
     mut sent: Bytes
 
-# build a live server connection over an accepted tcp socket.
+# build a live server connection over an accepted cleartext tcp socket (h2c).
 fn new_live_server_conn(fd: Int) -> ServerConn:
-    return ServerConn(fd, true, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), bytes.empty())
+    return ServerConn(fd, 0, TRANSPORT_TCP, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), bytes.empty())
+
+# build a live server connection over an accepted tls session (h2 via alpn). the
+# handle addresses the same tls session the h2 client reads and writes over.
+fn new_tls_server_conn(handle: Int) -> ServerConn:
+    return ServerConn(0, handle, TRANSPORT_TLS, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), bytes.empty())
 
 # build an offline server connection that reads `data` as if it arrived from a
 # client. used by the tests to drive the reader over a constructed frame stream.
 fn server_conn_from_bytes(data: Bytes) -> ServerConn:
-    return ServerConn(0, false, data, 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), bytes.empty())
+    return ServerConn(0, 0, TRANSPORT_OFFLINE, data, 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), bytes.empty())
 
 impl ServerConn:
-    # read one transport chunk: the socket when live, otherwise nothing (the
-    # offline buffer is exhausted, which reads as end-of-stream).
+    # read one transport chunk: from the tcp socket or the tls session when live,
+    # otherwise nothing (the offline buffer is exhausted, which reads as
+    # end-of-stream).
     fn recv_chunk() -> Bytes!:
-        if self.live:
+        if self.transport == TRANSPORT_TCP:
             return tcp_read_bytes(self.fd, RECV_CHUNK)!
+        if self.transport == TRANSPORT_TLS:
+            return tls.conn_from_handle(self.tls_handle).read_bytes(RECV_CHUNK)!
         return bytes.empty()
 
     # ensure at least `n` unread bytes are buffered, pulling transport chunks as
@@ -181,10 +208,14 @@ impl ServerConn:
         self.pos = self.pos + total
         return frames.read_frame(binary.reader(full), frames.DEFAULT_MAX_FRAME_SIZE)!
 
-    # write raw bytes to the transport, or record them when offline.
+    # write raw bytes to the transport, or record them when offline. the tls path
+    # uses write_all_bytes so a short tls write is retried until the whole frame
+    # is sent, exactly as the h2 client writes.
     fn send(data: Bytes) -> Int!:
-        if self.live:
+        if self.transport == TRANSPORT_TCP:
             return tcp_write_bytes(self.fd, data)!
+        if self.transport == TRANSPORT_TLS:
+            return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
         self.sent = bytes.concat(self.sent, data)
         return data.len()
 
@@ -214,10 +245,12 @@ impl ServerConn:
         out.free()
         return result
 
-    # close the underlying socket.
+    # close the underlying transport.
     fn close():
-        if self.live:
+        if self.transport == TRANSPORT_TCP:
             tcp_close(self.fd)
+        elif self.transport == TRANSPORT_TLS:
+            tls.conn_from_handle(self.tls_handle).close()
 
 # the SETTINGS frame the server opens with: it advertises the concurrent-stream
 # cap, the default flow-control window, and the default max frame size (so a
@@ -652,6 +685,35 @@ pub fn listen_h2c(host: String, port: Int, handler: fn(http.HttpRequestBytes) ->
     while true:
         client := tcp_accept(fd)!
         spawn serve_h2c_connection(client, handler)
+    return 0
+
+# serve one accepted tls connection as http/2 to completion. the tls handshake
+# (with its alpn negotiation) has already happened; this checks that the peer
+# negotiated "h2" and then runs the same reader/writer/handler loop as h2c, only
+# over the tls session instead of a plain socket. a peer that did not negotiate
+# "h2" is closed without serving — an http/1.1 fallback over the same listener is
+# std.web's concern (a later phase), not this native h2 server's. spawn this per
+# accepted tls connection, or call it directly to serve one.
+pub fn serve_h2_tls_connection(tls_conn: tls.Conn, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+    if tls_conn.negotiated_protocol() != "h2":
+        tls_conn.close()
+        return
+    conn := new_tls_server_conn(tls_conn.handle)
+    serve_connection(conn, handler) catch false
+    conn.close()
+
+# bind host:port for http/2 over tls and serve forever. it builds a tls server
+# config from the pem `cert`/`key` files, offers alpn "h2" (and "http/1.1", which
+# a peer may pick but this server does not yet serve — see serve_h2_tls_connection),
+# accepts tls connections, and runs each on its own task. this blocks, so it is
+# usually the last thing main does; spawn it if you need to keep going. mirrors
+# listen_h2c, only over tls.
+pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Int!:
+    config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
+    listener := tls.listen(host, port, config)!
+    while true:
+        client := tls.accept(listener)!
+        spawn serve_h2_tls_connection(client, handler)
     return 0
 
 # --- offline frame tests ---

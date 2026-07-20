@@ -219,6 +219,68 @@ fn runtime_func_ref(
         .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func)))
 }
 
+/// Whether this build should emit green-preemption safe-points. Off by default —
+/// the default binary is run os-thread and a flat loop pays a large relative cost
+/// for the per-iteration check — so it is opt-in via `PITH_GREEN_PREEMPT`. Set it
+/// at build time on the same binary you intend to run under `PITH_GREEN=1` to make
+/// compute-bound green tasks preemptible.
+fn green_preempt_enabled() -> bool {
+    matches!(
+        std::env::var("PITH_GREEN_PREEMPT").as_deref(),
+        Ok("1") | Ok("on") | Ok("true")
+    )
+}
+
+/// Emit a cooperative-preemption safe-point inline, just before a loop back-edge
+/// branch. Loads the process-global `PITH_PREEMPT_REQUESTED` flag (declared in
+/// the runtime, see `green.rs`); on the hot path — the flag clear — this is a
+/// single i8 load and a predicted-not-taken branch, no call. Only when the green
+/// monitor has set the flag do we call `pith_green_maybe_yield`, which itself
+/// decides whether the running task must actually yield (and is a no-op off the
+/// green backend, so this is inert under os threads even when reached).
+///
+/// Leaves the builder positioned on a fresh continuation block; the caller then
+/// emits the original back-edge branch there.
+fn emit_preempt_safepoint(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, cranelift::codegen::ir::FuncRef>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    preempt_flag: cranelift_module::DataId,
+) -> Result<(), CompileError> {
+    // Load the flag byte from the imported global.
+    let gv = codegen.module.declare_data_in_func(preempt_flag, builder.func);
+    let addr = builder.ins().global_value(types::I64, gv);
+    let flag = builder
+        .ins()
+        .load(types::I8, MemFlags::new(), addr, 0);
+    let requested = builder.ins().icmp_imm(IntCC::NotEqual, flag, 0);
+
+    let yield_block = builder.create_block();
+    let cont_block = builder.create_block();
+    // flag set -> slow path; clear -> straight to the continuation.
+    builder
+        .ins()
+        .brif(requested, yield_block, &[], cont_block, &[]);
+
+    // Slow path: call into the runtime, then fall through to the continuation.
+    builder.switch_to_block(yield_block);
+    let yield_ref = runtime_func_ref(
+        codegen,
+        builder,
+        func_ref_cache,
+        runtime_funcs,
+        "pith_green_maybe_yield",
+    )?;
+    builder.ins().call(yield_ref, &[]);
+    builder.ins().jump(cont_block, &[]);
+
+    // Continuation: the caller emits the original back-edge branch here. Blocks
+    // are sealed en masse at the end of the function, so no seal is needed now.
+    builder.switch_to_block(cont_block);
+    Ok(())
+}
+
 fn emit_runtime_error_value(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
@@ -307,6 +369,25 @@ pub fn compile_from_ir(
     let mut str_globals: Vec<(String, String)> = Vec::new(); // (global_name, string_id)
     let mut string_global_names: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+
+    // green preemption safe-points are opt-in at compile time. a flat arithmetic
+    // loop pays a large relative cost for the inline flag check (its body is a
+    // couple of instructions, so the extra load+test+branch per iteration is a
+    // big fraction), and the default binary is almost always run os-thread. so
+    // the default codegen emits no check at all — exactly zero cost — and only a
+    // build that asks for preemption (`PITH_GREEN_PREEMPT=1`, the same build you
+    // then run under `PITH_GREEN=1`) inserts the safe-points. `None` here means
+    // "emit nothing"; `Some(flag)` carries the imported flag symbol.
+    let preempt_flag = if green_preempt_enabled() {
+        Some(
+            codegen
+                .module
+                .declare_data("PITH_PREEMPT_REQUESTED", Linkage::Import, false, false)
+                .map_err(|e| CompileError::ModuleError(e.to_string()))?,
+        )
+    } else {
+        None
+    };
 
     // Pass 1: collect string data and declare functions
     for line in &lines {
@@ -527,6 +608,7 @@ pub fn compile_from_ir(
                 &global_data,
                 &str_globals,
                 &string_global_names,
+                preempt_flag,
             )?;
         }
     }
@@ -563,6 +645,7 @@ fn compile_ir_function(
     global_data: &HashMap<String, cranelift_module::DataId>,
     str_globals: &[(String, String)],
     string_global_names: &std::collections::HashSet<String>,
+    preempt_flag: Option<cranelift_module::DataId>,
 ) -> Result<(), CompileError> {
     let mut ctx = codegen.module.make_context();
 
@@ -595,6 +678,12 @@ fn compile_ir_function(
     let mut struct_vars: HashMap<String, String> = HashMap::new();
     let mut named_vars: HashMap<String, Variable> = HashMap::new();
     let mut labels: HashMap<String, Block> = HashMap::new();
+    // labels already emitted, in stream order, as we walk the instructions. a
+    // jmp/brif whose target is in here is jumping *backward* to an earlier label
+    // — a loop back-edge — which is where we insert a preemption safe-point. a
+    // target not yet seen is a forward jump (if/else/result merge, break) and is
+    // correctly excluded.
+    let mut defined_labels: HashSet<String> = HashSet::new();
     #[cfg(not(pith_cranelift_new_api))]
     let mut next_var_id: u32 = 0;
 
@@ -749,6 +838,13 @@ fn compile_ir_function(
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.is_empty() || parts[0].starts_with(';') {
             continue;
+        }
+
+        // Record a label as "defined" the moment we reach it in the stream, in
+        // both the terminated and live paths below. A later jmp/brif to a label
+        // already in this set is a back-edge (see `defined_labels`).
+        if parts[0] == "label" && parts.len() >= 2 {
+            defined_labels.insert(parts[1].to_string());
         }
 
         // If current block is terminated, skip until next label
@@ -1650,6 +1746,21 @@ fn compile_ir_function(
                 let cond = get_reg(&regs, parts[1])?;
                 let then_label = parts[2];
                 let else_label = parts[3];
+                // a brif with a back-edge arm closes a loop (e.g. a bottom-test
+                // `while cond` that branches back to the header). insert the
+                // preemption safe-point before the branch itself (only when this
+                // build opted into preemption — otherwise `preempt_flag` is None).
+                if let Some(flag) = preempt_flag {
+                    if defined_labels.contains(then_label) || defined_labels.contains(else_label) {
+                        emit_preempt_safepoint(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            flag,
+                        )?;
+                    }
+                }
                 let cond_bool = builder.ins().icmp_imm(IntCC::NotEqual, cond, 0);
                 let then_block = get_label(&labels, then_label, func_name)?;
                 let else_block = get_label(&labels, else_label, func_name)?;
@@ -1666,6 +1777,22 @@ fn compile_ir_function(
                     .get(target)
                     .map(|s| s.as_str())
                     .unwrap_or(target);
+                // a jump back to an already-defined label is a loop back-edge
+                // (`while`/`for`/`loop` tail, or `continue`). insert the
+                // preemption safe-point before the jump (only when this build
+                // opted into preemption). forward jumps (if/else merges, `break`)
+                // target not-yet-defined labels and are skipped either way.
+                if let Some(flag) = preempt_flag {
+                    if defined_labels.contains(actual_target) {
+                        emit_preempt_safepoint(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            flag,
+                        )?;
+                    }
+                }
                 let block = get_label(&labels, actual_target, func_name)?;
                 builder.ins().jump(block, &[]);
                 terminated = true;

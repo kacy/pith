@@ -1,4 +1,4 @@
-.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo memcheck test clean
+.PHONY: build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation memcheck test clean
 
 NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
@@ -911,6 +911,33 @@ green-echo: build
 	@off=$$(./target/release/pith run tests/green/echo.pith 2>/dev/null); \
 	on1=$$(PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/echo.pith 2>/dev/null); \
 	onN=$$(PITH_GREEN=1 ./target/release/pith run tests/green/echo.pith 2>/dev/null); \
+	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ]; then \
+		echo "ok   identical output at 1 and default workers: $$on1"; \
+	else \
+		echo "FAIL output differs"; \
+		echo "  os-thread:        $$off"; \
+		echo "  green 1 worker:   $$on1"; \
+		echo "  green default:    $$onN"; \
+		exit 1; \
+	fi
+
+# --- green-thread cooperative preemption (P5: the safe-point + monitor) ---
+# a compute-only task spins in a tight loop with no yield point while N reporter
+# tasks must each bump a shared counter. WITHOUT preemption the spinner holds its
+# worker forever and the reporters never run, so at a single worker
+# (PITH_GREEN_WORKERS=1) the program hangs. the green runs here compile with
+# PITH_GREEN_PREEMPT=1 so the backend inserts safe-points at loop back-edges; the
+# monitor then deschedules the overrunning spinner onto its worker's lowest-
+# priority queue and the reporters run. the os-thread run needs no safe-points, so
+# `off` compiles at the default (zero-overhead) setting. the printed total is the
+# fixed counter value, so all three runs are byte-identical. we run the green side
+# at BOTH one and the default worker count — the single-worker hang can only be
+# caught at one worker.
+green-starvation: build
+	@echo "--- green-thread cooperative preemption (byte-identical off vs on, 1 and default workers) ---"
+	@off=$$(./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
+	on1=$$(PITH_GREEN_PREEMPT=1 PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
+	onN=$$(PITH_GREEN_PREEMPT=1 PITH_GREEN=1 ./target/release/pith run tests/green/starvation.pith 2>/dev/null); \
 	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ]; then \
 		echo "ok   identical output at 1 and default workers: $$on1"; \
 	else \

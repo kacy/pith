@@ -1,0 +1,53 @@
+# std.web throughput / memory benchmark.
+#
+# the same allocation-churny json api as bench/http_server.pith (query parsing,
+# catalog lookups, per-request string assembly), but built on std.web instead of
+# a hand-rolled accept loop — so the two can be compared head to head.
+#
+# pair with bench/http_bench.sh, which drives it with wrk and samples rss:
+#   pith build bench/web_hello.pith && bench/http_bench.sh ./bench/web_hello 8080 120
+import std.web as web
+import std.net.http as http
+
+fn item_name(id: Int) -> String:
+    kinds := ["widget", "gadget", "gizmo", "doodad", "contraption"]
+    return kinds[id % kinds.len()] + "-" + id.to_string()
+
+fn item_json(id: Int) -> String:
+    q := chr(34)
+    name := item_name(id)
+    price := (id * 37) % 10000
+    tags := name.split("-")
+    mut body := chr(123) + q + "id" + q + ":" + id.to_string()
+    body = body + "," + q + "name" + q + ":" + q + name + q
+    body = body + "," + q + "price" + q + ":" + price.to_string()
+    body = body + "," + q + "tags" + q + ":["
+    for tag, i in tags:
+        if i > 0:
+            body = body + ","
+        body = body + q + tag + q
+    body = body + "]" + chr(125)
+    return body
+
+# GET /item?id=N — the load path wrk hammers.
+fn item(req: web.Request) -> http.HttpResponse:
+    id := parse_int(req.query("id")) catch 0
+    return http.json(200, item_json(id))
+
+# GET /health — the readiness probe http_bench.sh curls before the run.
+fn health(req: web.Request) -> http.HttpResponse:
+    return http.json(200, chr(123) + chr(34) + "ok" + chr(34) + ":true" + chr(125))
+
+fn main() -> Int!:
+    mut port := 8080
+    argv := args()
+    if argv.len() > 1:
+        port = parse_int(argv[1]) catch 8080
+
+    mut app := web.new()
+    app = app.get("/health", health)
+    app = app.get("/item", item)
+
+    print("listening on {port}")
+    app.listen("0.0.0.0", port)!
+    return 0

@@ -1,0 +1,53 @@
+# a worker pool: fan work out to a few tasks over a channel, fan the results
+# back in over another. this is the shape the green backend is built for — many
+# small tasks handing values to each other — and it runs the same either way:
+#
+#     pith run examples/worker_pool.pith            # one os thread per task
+#     PITH_GREEN=1 pith run examples/worker_pool.pith   # tasks share a worker pool
+#
+# the total is a sum, so it does not depend on which worker takes which job and
+# the output is identical on both backends.
+
+# pull jobs off the shared channel until it drains, square each one, and push
+# the result back. a closed, empty channel returns none, which ends the loop.
+fn worker(jobs: Channel[Int], results: Channel[Int]):
+    while true:
+        if let job = jobs.recv():
+            results.send(job * job)
+        else:
+            break
+
+fn main() -> Int!:
+    job_count := 20
+    worker_count := 4
+
+    jobs := Channel[Int](job_count)
+    results := Channel[Int](job_count)
+
+    # start the workers; they block on recv until work shows up.
+    mut pool := []
+    mut w := 0
+    while w < worker_count:
+        pool.push(spawn worker(jobs, results))
+        w = w + 1
+
+    # hand out the work, then close so the workers know to stop.
+    mut n := 1
+    while n <= job_count:
+        jobs.send(n)
+        n = n + 1
+    jobs.close()
+
+    # collect one result per job, then wait for the workers to finish.
+    mut total := 0
+    mut got := 0
+    while got < job_count:
+        total = total + results.recv().unwrap_or(0)
+        got = got + 1
+    for t in pool:
+        await t
+
+    print("workers: {worker_count}")
+    print("jobs: {job_count}")
+    print("sum of squares: {total}")
+    return 0

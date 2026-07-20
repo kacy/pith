@@ -18,6 +18,18 @@
 # handler just calls req.param("id"). the response builders live in std.net.http
 # (http.text / http.json / http.html / http.not_found_response); web only owns
 # the routing and the accept loop.
+#
+# middleware wraps every matched route in an onion. register it with use_mw();
+# the first one registered runs outermost, so it sees the request first and the
+# response last. a middleware takes the rest of the chain (`next`) plus the
+# request and returns a response, so it can run code before or after next, or
+# short-circuit by skipping next entirely:
+#
+#   fn logging(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+#       print(req.method() + " " + req.path())
+#       return next(req)
+#
+#   app := web.new().use_mw(logging).get("/", home)
 
 import std.net.http as http
 import std.net.tcp as tcp
@@ -69,16 +81,23 @@ struct Route:
     pattern: String
     handler: fn(Request) -> http.HttpResponse
 
-# a web application: an ordered list of routes. build one with new(), add routes
-# with get/post/put/delete, then call listen().
+# a web application: an ordered list of routes plus the middleware that wraps
+# them. build one with new(), add routes with get/post/put/delete and middleware
+# with use_mw, then call listen().
+#
+# the middleware fn-type is written inline here (and everywhere it appears) on
+# purpose: a type-aliased fn field is miscopied when the App builder clones
+# itself, the same reason Route.handler is written out longhand.
 pub struct App:
     routes: List[Route]
+    middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]
 
 # a new App with a default `GET /healthz` route that answers 200 "ok", so a
-# fresh server is immediately checkable by a load balancer or uptime probe.
+# fresh server is immediately checkable by a load balancer or uptime probe, and
+# no middleware yet.
 pub fn new() -> App:
     healthz := fn(req: Request) => http.text(200, "ok")
-    return App([Route("GET", "/healthz", healthz)])
+    return App([Route("GET", "/healthz", healthz)], [])
 
 # return a copy of `routes` with `route` appended. building a new list keeps the
 # App builder pure: adding a route never mutates an App someone else is holding.
@@ -88,6 +107,44 @@ fn with_route(routes: List[Route], route: Route) -> List[Route]:
         out.push(existing)
     out.push(route)
     return out
+
+# return a copy of `middleware` with `mw` appended, so registering middleware
+# never mutates an App someone else is holding. same pure-copy pattern as
+# with_route, just for the middleware list.
+fn with_mw(middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse], mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse) -> List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]:
+    mut out: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse] := []
+    for existing in middleware:
+        out.push(existing)
+    out.push(mw)
+    return out
+
+# the pieces the chain runner walks: the middleware list and the route handler at
+# the bottom. bundling them in a struct lets the `next` closure below close over
+# a single struct value and an index, rather than over the bare middleware and
+# handler fn-values — the compiler miscompiles a closure that captures a fn-value
+# held in a variable, but capturing a struct whose fields we read and call in
+# place is fine.
+struct Chain:
+    middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]
+    handler: fn(Request) -> http.HttpResponse
+
+# run the onion from `index` outward. call middleware[index] with a `next` that
+# recurses one level deeper; when we run past the end, call the handler. this is
+# the recursive form of the fold: the first middleware (index 0) runs outermost
+# and the handler sits innermost, which is the ordering use_mw promises.
+fn run_chain(chain: Chain, index: Int, req: Request) -> http.HttpResponse:
+    if index >= chain.middleware.len():
+        return chain.handler(req)
+    mw := chain.middleware[index]
+    next := fn(r: Request) => run_chain(chain, index + 1, r)
+    return mw(next, req)
+
+# wrap `handler` in the middleware onion and return the composed handler. the
+# returned closure captures only the Chain struct, so calling it kicks off
+# run_chain from the outermost middleware down to the handler.
+fn wrap_middleware(middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse], handler: fn(Request) -> http.HttpResponse) -> fn(Request) -> http.HttpResponse:
+    chain := Chain(middleware, handler)
+    return fn(req: Request) => run_chain(chain, 0, req)
 
 # the path parameters named in `pattern` (its `:name` segments), pulled out of
 # the request's actual path so a handler can read them by name.
@@ -99,15 +156,17 @@ fn params_for(pattern: String, req: http.HttpRequestBytes) -> Map[String, String
             params.insert(name, req.path_param(pattern, name) catch "")
     return params
 
-# find the first route whose method and path match, run its handler, and return
-# the response. a request that matches nothing gets a 404. this is the single
-# place every request funnels through, which is where middleware will wrap in.
+# find the first route whose method and path match, wrap its handler in the
+# middleware onion, run it, and return the response. a request that matches
+# nothing gets a 404 and skips middleware entirely. this is the single place
+# every request funnels through, and where the middleware chain wraps in.
 fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
     method := req.method() catch "GET"
     for route in app.routes:
         matched := req.matches_path(route.pattern) catch false
         if route.method == method and matched:
-            return route.handler(Request(req, params_for(route.pattern, req)))
+            handler := wrap_middleware(app.middleware, route.handler)
+            return handler(Request(req, params_for(route.pattern, req)))
     return http.not_found_response()
 
 # serve one accepted connection to completion on its own task, then close it.
@@ -120,19 +179,31 @@ impl App:
     # register a GET route. returns a new App, so calls chain:
     # `web.new().get("/", home).get("/users/:id", show)`.
     fn get(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("GET", pattern, handler)))
+        return App(with_route(self.routes, Route("GET", pattern, handler)), self.middleware)
 
     # register a POST route. returns a new App.
     fn post(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("POST", pattern, handler)))
+        return App(with_route(self.routes, Route("POST", pattern, handler)), self.middleware)
 
     # register a PUT route. returns a new App.
     fn put(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("PUT", pattern, handler)))
+        return App(with_route(self.routes, Route("PUT", pattern, handler)), self.middleware)
 
     # register a DELETE route. returns a new App.
     fn delete(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("DELETE", pattern, handler)))
+        return App(with_route(self.routes, Route("DELETE", pattern, handler)), self.middleware)
+
+    # register a middleware. returns a new App, so calls chain alongside routes.
+    # the first middleware registered runs outermost: it sees the request first
+    # and the response last. middleware wraps every matched route, including the
+    # default `GET /healthz`. a middleware takes `next` (the rest of the chain)
+    # and the request, and returns a response:
+    #
+    #   app := web.new().use_mw(logging).use_mw(auth).get("/", home)
+    #
+    # here logging wraps auth wraps home.
+    fn use_mw(mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse) -> App:
+        return App(self.routes, with_mw(self.middleware, mw))
 
     # bind host:port and serve forever, one task per connection. this blocks, so
     # it is usually the last thing main does; spawn it if you need to keep going.
@@ -167,6 +238,42 @@ fn get_body(port: Int, path: String) -> String:
     if split < 0:
         return raw
     return raw.substring(split + 4, raw.len())
+
+# two test middleware that bracket the response body with a fixed marker, so the
+# nesting is visible in the output: an outer middleware produces `outer(inner)`.
+fn bracket_a(next: fn(Request) -> http.HttpResponse, req: Request) -> http.HttpResponse:
+    return http.text(200, "a(" + (next(req).body_text() catch "?") + ")")
+
+fn bracket_b(next: fn(Request) -> http.HttpResponse, req: Request) -> http.HttpResponse:
+    return http.text(200, "b(" + (next(req).body_text() catch "?") + ")")
+
+# a middleware that answers on its own without calling next, to prove a
+# middleware can short-circuit the chain.
+fn short_circuit(next: fn(Request) -> http.HttpResponse, req: Request) -> http.HttpResponse:
+    return http.text(200, "blocked")
+
+test "middleware composes as an onion, first registered outermost":
+    handler := fn(req: Request) => http.text(200, "core")
+    app := new().use_mw(bracket_a).use_mw(bracket_b).get("/", handler)
+    port := 18985
+    spawn serve_bg(app, port)
+    sleep(200)
+    # a registered first so it wraps b, which wraps the handler.
+    assert_eq(get_body(port, "/"), "a(b(core))")
+
+test "middleware also wraps the default health check":
+    app := new().use_mw(bracket_a)
+    port := 18986
+    spawn serve_bg(app, port)
+    sleep(200)
+    assert_eq(get_body(port, "/healthz"), "a(ok)")
+
+test "a middleware can short-circuit without calling next":
+    app := new().use_mw(short_circuit).get("/", fn(req: Request) => http.text(200, "core"))
+    port := 18987
+    spawn serve_bg(app, port)
+    sleep(200)
+    assert_eq(get_body(port, "/"), "blocked")
 
 test "routes match by method and path, params are injected":
     show := fn(req: Request) => http.text(200, "user " + req.param("id"))

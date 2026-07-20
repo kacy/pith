@@ -84,6 +84,43 @@ http.not_found_response()
 
 a request that matches no route gets `http.not_found_response()` automatically.
 
+## middleware
+
+middleware wraps every matched route. a middleware is a function that takes `next`
+— the rest of the chain — and the request, and returns a response:
+
+```pith
+fn logging(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    print(req.method() + " " + req.path())
+    return next(req)
+```
+
+register it with `use_mw`, which returns a new app just like the route builders:
+
+```pith
+app := web.new().use_mw(logging).get("/", home)
+```
+
+because a middleware receives `next`, it decides what happens around it. run code
+before calling `next` to inspect or rewrite the request; run code after to touch the
+response; or skip `next` entirely to answer on your own — an auth check that rejects a
+request never has to reach the handler.
+
+order is the thing to keep straight. the first middleware you register runs
+outermost, so it sees the request first and the response last:
+
+```pith
+app := web.new().use_mw(logging).use_mw(auth).get("/", home)
+```
+
+here `logging` wraps `auth` wraps `home`. a request goes `logging` → `auth` → `home`,
+and the response comes back the other way. middleware wraps every route, including the
+default `GET /healthz`.
+
+write middleware as a named function, as above. `examples/web_middleware.pith` is a
+complete, self-checking example: two middleware bracket the response body with markers
+so the nesting is visible in the output.
+
 ## a task per connection
 
 `listen` accepts connections in a loop and hands each one to its own task with

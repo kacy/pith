@@ -820,7 +820,12 @@ fn request_headers_map(raw_head: Bytes) -> Map[String, String]!:
         pos = pos + 1
     return result
 
-fn build_http_request(head: Bytes, body: Bytes) -> HttpRequestBytes!:
+# parse a raw request head (the request line plus header lines) and body bytes
+# into an HttpRequestBytes, decoding the method, path, query, version, and
+# headers. other transports (e.g. the http/2 server, which synthesizes an
+# http/1.1 head from the request pseudo-headers) build a request through here so
+# they reuse the same parsing, params, and query handling.
+pub fn build_http_request(head: Bytes, body: Bytes) -> HttpRequestBytes!:
     method_text := decode_utf8(request_line_field_bytes(head, 0))!
     path_text := decode_utf8(request_target_path_bytes(head))!
     query_text := decode_utf8(request_target_query_bytes(head))!

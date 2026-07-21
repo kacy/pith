@@ -17,6 +17,11 @@
 # for selects and `exec` for writes; to read back a generated id, add
 # `returning id` to the insert and read it with `query`.
 #
+# for a group of statements that must succeed or fail together, open a
+# transaction with `begin` and finish it with `commit` or `rollback`; for a hot
+# query run many times, prepare it once with `prepare`. both pin a single
+# connection for their lifetime — see the sections below.
+#
 # query and exec are observable in the box: each records a RED metric (a
 # db_queries_total counter and a db_query_duration_ms histogram, labeled by
 # driver and op) and opens a client trace span, the same story as the http and
@@ -55,6 +60,253 @@ pub fn open(url: String) -> Db!:
     handle := pools.len() - 1
     registry_mu.unlock()
     return Db(handle: handle)
+
+# take a connection from pool `pool_handle`, under the registry lock.
+fn acquire_from_pool(pool_handle: Int) -> postgres.Conn!:
+    registry_mu.lock()
+    attempt := pools[pool_handle].acquire()
+    registry_mu.unlock()
+    if attempt.is_err:
+        fail attempt.err
+    return attempt.ok
+
+# return a connection to pool `pool_handle`, under the registry lock.
+fn release_to_pool(pool_handle: Int, conn: postgres.Conn):
+    registry_mu.lock()
+    pools[pool_handle].release(conn)
+    registry_mu.unlock()
+
+# --- pinned connections (transactions and prepared statements) ---
+#
+# a transaction runs every statement on one connection, and a prepared statement
+# is parsed once on one connection and reused; both therefore pin a connection
+# out of the pool for their lifetime and return it when they finish. the pinned
+# connection lives here in a module-global registry, exactly like the pools
+# above, so the Tx or Stmt a caller holds carries only a plain Int handle.
+#
+# a finished pin keeps its slot rather than freeing it — a `finished` handle held
+# past its end reads as such and errors, instead of silently landing on a reused
+# connection. the registry therefore only grows; reclaiming spent slots safely is
+# a later refinement.
+
+# a connection pinned out of a pool. `pool` is the handle of the pool it came
+# from, so it can be returned there. `broken` turns true when a statement on it
+# fails: a failed statement leaves the connection out of protocol sync, so it is
+# discarded rather than returned to the pool. `finished` guards against use after
+# the transaction or statement has ended.
+struct Pin:
+    conn: postgres.Conn
+    pool: Int
+    mut broken: Bool
+    mut finished: Bool
+
+mut pins: List[Pin] := []
+mut pins_mu := Mutex()
+
+# every prepared statement is parsed under this one name. a Stmt pins its own
+# connection, so the fixed name never collides across statements; it is
+# deallocated when the Stmt closes, before the connection returns to the pool.
+PREPARED_NAME := "pith_db_stmt"
+
+# pin a fresh connection from pool `pool_handle` and register it, returning the
+# pin handle. the caller then runs BEGIN or PREPARE on the pinned connection.
+fn pin_connection(pool_handle: Int) -> Int!:
+    conn := acquire_from_pool(pool_handle)!
+    pins_mu.lock()
+    pins.push(Pin(conn: conn, pool: pool_handle, broken: false, finished: false))
+    handle := pins.len() - 1
+    pins_mu.unlock()
+    return handle
+
+# the pinned connection for a handle.
+fn pin_conn(handle: Int) -> postgres.Conn:
+    pins_mu.lock()
+    conn := pins[handle].conn
+    pins_mu.unlock()
+    return conn
+
+# whether the pinned connection has ended (committed, closed, or discarded).
+fn pin_finished(handle: Int) -> Bool:
+    pins_mu.lock()
+    done := pins[handle].finished
+    pins_mu.unlock()
+    return done
+
+# whether a statement on the pinned connection has failed.
+fn pin_broken(handle: Int) -> Bool:
+    pins_mu.lock()
+    broken := pins[handle].broken
+    pins_mu.unlock()
+    return broken
+
+# mark the pinned connection out of sync after a failed statement.
+fn pin_mark_broken(handle: Int):
+    pins_mu.lock()
+    pins[handle].broken = true
+    pins_mu.unlock()
+
+# finish the pin and return its connection to the pool for reuse.
+fn pin_release(handle: Int):
+    pins_mu.lock()
+    conn := pins[handle].conn
+    pool := pins[handle].pool
+    pins[handle].finished = true
+    pins_mu.unlock()
+    release_to_pool(pool, conn)
+
+# finish the pin and close its connection instead of reusing it, for when it is
+# out of protocol sync.
+fn pin_discard(handle: Int):
+    pins_mu.lock()
+    conn := pins[handle].conn
+    pins[handle].finished = true
+    pins_mu.unlock()
+    conn.close()
+
+# a transaction: a connection pinned out of the pool with BEGIN already sent. it
+# carries only the pin handle, so it crosses module boundaries cleanly.
+pub struct Tx:
+    handle: Int
+
+impl Tx:
+    # run a query inside the transaction, on its pinned connection. the rows read
+    # the same as Db.query's.
+    pub fn query(text: String, params: List[String]) -> List[sql.Row]!:
+        span := trace.start_kind("db.query", trace.CLIENT)
+        start := time.mono_millis()
+        outcome := self.run_query(text, params)
+        span.end()
+        record("query", outcome.is_err, time.mono_millis() - start)
+        if outcome.is_err:
+            fail outcome.err
+        return outcome.ok
+
+    # run a write inside the transaction, on its pinned connection.
+    pub fn exec(text: String, params: List[String]) -> db.ExecResult!:
+        span := trace.start_kind("db.exec", trace.CLIENT)
+        start := time.mono_millis()
+        outcome := self.run_exec(text, params)
+        span.end()
+        record("exec", outcome.is_err, time.mono_millis() - start)
+        if outcome.is_err:
+            fail outcome.err
+        return outcome.ok
+
+    fn run_query(text: String, params: List[String]) -> List[sql.Row]!:
+        if pin_finished(self.handle):
+            fail "db.postgres: transaction already finished"
+        attempt := postgres.query_params(pin_conn(self.handle), text, params)
+        if attempt.is_err:
+            pin_mark_broken(self.handle)
+            fail attempt.err
+        mut rows: List[sql.Row] := []
+        for row in attempt.ok:
+            rows.push(row)
+        return rows
+
+    fn run_exec(text: String, params: List[String]) -> db.ExecResult!:
+        if pin_finished(self.handle):
+            fail "db.postgres: transaction already finished"
+        attempt := postgres.exec_params(pin_conn(self.handle), text, params)
+        if attempt.is_err:
+            pin_mark_broken(self.handle)
+            fail attempt.err
+        return db.exec_result(attempt.ok, 0)
+
+    # commit the transaction and return the connection to the pool. a
+    # transaction with a failed statement cannot commit — it is rolled back (its
+    # connection discarded) and this fails.
+    pub fn commit() -> Bool!:
+        if pin_finished(self.handle):
+            fail "db.postgres: transaction already finished"
+        if pin_broken(self.handle):
+            pin_discard(self.handle)
+            fail "db.postgres: transaction has a failed statement; rolled back"
+        committed := postgres.exec(pin_conn(self.handle), "commit")
+        if committed.is_err:
+            pin_discard(self.handle)
+            fail committed.err
+        pin_release(self.handle)
+        return true
+
+    # roll back the transaction, discarding its changes, and return the
+    # connection to the pool. it is always safe to call — on a failed statement
+    # it discards the out-of-sync connection — so it fits an error path directly
+    # without itself failing.
+    pub fn rollback():
+        if pin_finished(self.handle):
+            return
+        if pin_broken(self.handle):
+            pin_discard(self.handle)
+            return
+        rolled := postgres.exec(pin_conn(self.handle), "rollback")
+        if rolled.is_err:
+            pin_discard(self.handle)
+            return
+        pin_release(self.handle)
+
+# a prepared statement: a connection pinned out of the pool with the statement
+# parsed on it. like Tx it carries only the pin handle.
+pub struct Stmt:
+    handle: Int
+
+impl Stmt:
+    # run the prepared statement as a query, binding `params`.
+    pub fn query(params: List[String]) -> List[sql.Row]!:
+        span := trace.start_kind("db.query", trace.CLIENT)
+        start := time.mono_millis()
+        outcome := self.run_query(params)
+        span.end()
+        record("query", outcome.is_err, time.mono_millis() - start)
+        if outcome.is_err:
+            fail outcome.err
+        return outcome.ok
+
+    # run the prepared statement as a write, binding `params`.
+    pub fn exec(params: List[String]) -> db.ExecResult!:
+        span := trace.start_kind("db.exec", trace.CLIENT)
+        start := time.mono_millis()
+        outcome := self.run_exec(params)
+        span.end()
+        record("exec", outcome.is_err, time.mono_millis() - start)
+        if outcome.is_err:
+            fail outcome.err
+        return outcome.ok
+
+    fn run_query(params: List[String]) -> List[sql.Row]!:
+        if pin_finished(self.handle):
+            fail "db.postgres: prepared statement already closed"
+        attempt := postgres.query_prepared(pin_conn(self.handle), PREPARED_NAME, params)
+        if attempt.is_err:
+            pin_mark_broken(self.handle)
+            fail attempt.err
+        mut rows: List[sql.Row] := []
+        for row in attempt.ok:
+            rows.push(row)
+        return rows
+
+    fn run_exec(params: List[String]) -> db.ExecResult!:
+        if pin_finished(self.handle):
+            fail "db.postgres: prepared statement already closed"
+        attempt := postgres.exec_prepared(pin_conn(self.handle), PREPARED_NAME, params)
+        if attempt.is_err:
+            pin_mark_broken(self.handle)
+            fail attempt.err
+        return db.exec_result(attempt.ok, 0)
+
+    # deallocate the statement and return its connection to the pool. always safe
+    # to call; a broken or already-closed statement simply drops its connection.
+    pub fn close():
+        if pin_finished(self.handle):
+            return
+        if pin_broken(self.handle):
+            pin_discard(self.handle)
+            return
+        freed := postgres.exec(pin_conn(self.handle), "deallocate {PREPARED_NAME}")
+        if freed.is_err:
+            pin_discard(self.handle)
+            return
+        pin_release(self.handle)
 
 impl Db:
     # run a parameterized query and buffer its rows. `$1`, `$2`, ... bind to
@@ -111,18 +363,34 @@ impl Db:
 
     # take a connection from this handle's pool, under the registry lock.
     fn borrow() -> postgres.Conn!:
-        registry_mu.lock()
-        attempt := pools[self.handle].acquire()
-        registry_mu.unlock()
-        if attempt.is_err:
-            fail attempt.err
-        return attempt.ok
+        return acquire_from_pool(self.handle)!
 
     # return a connection to this handle's pool, under the registry lock.
     fn giveback(conn: postgres.Conn):
-        registry_mu.lock()
-        pools[self.handle].release(conn)
-        registry_mu.unlock()
+        release_to_pool(self.handle, conn)
+
+    # begin a transaction on a single pinned connection. every statement you run
+    # on the returned Tx uses that same connection; finish with commit() to keep
+    # the changes or rollback() to discard them, and either way the connection
+    # returns to the pool. see the Tx methods above.
+    pub fn begin() -> Tx!:
+        handle := pin_connection(self.handle)!
+        started := postgres.exec(pin_conn(handle), "begin")
+        if started.is_err:
+            pin_discard(handle)
+            fail started.err
+        return Tx(handle: handle)
+
+    # prepare `text` once on a pinned connection so a hot query can run many
+    # times without re-parsing. run it with Stmt.query / Stmt.exec and free it
+    # with Stmt.close(), which returns the connection to the pool.
+    pub fn prepare(text: String) -> Stmt!:
+        handle := pin_connection(self.handle)!
+        prepared := postgres.prepare(pin_conn(handle), PREPARED_NAME, text)
+        if prepared.is_err:
+            pin_discard(handle)
+            fail prepared.err
+        return Stmt(handle: handle)
 
     # drain the pool, closing every idle connection.
     pub fn close():

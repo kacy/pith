@@ -49,8 +49,9 @@ pub struct Db:
     handle: Int
 
 # open a pooled mysql database from a url. the url sets the host, port,
-# credentials, database, and optional `?pool=N` size; see std.db.parse_url for
-# the full shape. connections open lazily, on first use.
+# credentials, database, and optional `?pool=N` cap on open connections; see
+# std.db.parse_url for the full shape. connections open lazily, on first use, and
+# past the cap an acquirer waits for one to free rather than opening more.
 pub fn open(url: String) -> Db!:
     dsn := db.parse_url(url)!
     if dsn.driver != "mysql":
@@ -62,20 +63,31 @@ pub fn open(url: String) -> Db!:
     registry_mu.unlock()
     return Db(handle: handle)
 
-# take a connection from pool `pool_handle`, under the registry lock.
+# take a connection from pool `pool_handle`. the registry lock only covers
+# looking the pool up; the pool then caps and dials on its own, so a slow
+# connect never blocks other tasks' lookups (the pool is self-synchronizing).
 fn acquire_from_pool(pool_handle: Int) -> mysql.Conn!:
     registry_mu.lock()
-    attempt := pools[pool_handle].acquire()
+    pool := pools[pool_handle]
     registry_mu.unlock()
-    if attempt.is_err:
-        fail attempt.err
-    return attempt.ok
+    return pool.acquire()!
 
-# return a connection to pool `pool_handle`, under the registry lock.
+# return a connection to pool `pool_handle`. as with acquire, the lock only
+# covers the lookup; any close network i/o happens in the pool, off the lock.
 fn release_to_pool(pool_handle: Int, conn: mysql.Conn):
     registry_mu.lock()
-    pools[pool_handle].release(conn)
+    pool := pools[pool_handle]
     registry_mu.unlock()
+    pool.release(conn)
+
+# discard a poisoned connection back to pool `pool_handle`: it is closed rather
+# than reused, but its slot still returns so the cap does not leak. use this on
+# every error path instead of closing the connection directly.
+fn discard_to_pool(pool_handle: Int, conn: mysql.Conn):
+    registry_mu.lock()
+    pool := pools[pool_handle]
+    registry_mu.unlock()
+    pool.discard(conn)
 
 # --- pinned connections (transactions and prepared statements) ---
 #
@@ -95,8 +107,12 @@ fn release_to_pool(pool_handle: Int, conn: mysql.Conn):
 # fails: a failed statement leaves the connection out of protocol sync, so it is
 # discarded rather than returned to the pool. `finished` guards against use after
 # the transaction or statement has ended.
+# `conn` is optional and cleared to none the moment the pin finishes, so a spent
+# slot (the registry never frees slots) stops retaining a live connection that
+# has meanwhile returned to the pool or closed. it is always set while the pin is
+# in use; every reader guards with `pin_finished` first.
 struct Pin:
-    conn: mysql.Conn
+    mut conn: mysql.Conn?
     pool: Int
     mut broken: Bool
     mut finished: Bool
@@ -119,12 +135,13 @@ fn pin_connection(pool_handle: Int) -> Int!:
     pins_mu.unlock()
     return handle
 
-# the pinned connection for a handle.
+# the pinned connection for a handle. only call it while the pin is live (its
+# callers all guard with pin_finished first); a finished pin has cleared it.
 fn pin_conn(handle: Int) -> mysql.Conn:
     pins_mu.lock()
     conn := pins[handle].conn
     pins_mu.unlock()
-    return conn
+    return conn.value()
 
 # whether the pinned connection has ended (committed, closed, or discarded).
 fn pin_finished(handle: Int) -> Bool:
@@ -146,23 +163,28 @@ fn pin_mark_broken(handle: Int):
     pins[handle].broken = true
     pins_mu.unlock()
 
-# finish the pin and return its connection to the pool for reuse.
+# finish the pin and return its connection to the pool for reuse. the slot drops
+# its reference to the connection so a spent pin retains nothing.
 fn pin_release(handle: Int):
     pins_mu.lock()
     conn := pins[handle].conn
     pool := pins[handle].pool
+    pins[handle].conn = none
     pins[handle].finished = true
     pins_mu.unlock()
-    release_to_pool(pool, conn)
+    release_to_pool(pool, conn.value())
 
 # finish the pin and close its connection instead of reusing it, for when it is
-# out of protocol sync.
+# out of protocol sync. the slot drops its reference the same way, and the
+# connection is discarded back to the pool so its cap slot returns.
 fn pin_discard(handle: Int):
     pins_mu.lock()
     conn := pins[handle].conn
+    pool := pins[handle].pool
+    pins[handle].conn = none
     pins[handle].finished = true
     pins_mu.unlock()
-    conn.close()
+    discard_to_pool(pool, conn.value())
 
 # register a prepared statement and return its slot.
 fn register_prepared(stmt: mysql.Stmt) -> Int:
@@ -359,7 +381,7 @@ impl Db:
         conn := self.borrow()!
         gathered := gather(conn, text, params)
         if gathered.is_err:
-            conn.close()
+            self.discard(conn)
             fail gathered.err
         self.giveback(conn)
         return gathered.ok
@@ -370,18 +392,23 @@ impl Db:
         conn := self.borrow()!
         info := apply(conn, text, params)
         if info.is_err:
-            conn.close()
+            self.discard(conn)
             fail info.err
         self.giveback(conn)
         return info.ok
 
-    # take a connection from this handle's pool, under the registry lock.
+    # take a connection from this handle's pool.
     fn borrow() -> mysql.Conn!:
         return acquire_from_pool(self.handle)!
 
-    # return a connection to this handle's pool, under the registry lock.
+    # return a connection to this handle's pool for reuse.
     fn giveback(conn: mysql.Conn):
         release_to_pool(self.handle, conn)
+
+    # discard a poisoned connection back to this handle's pool: closed, not
+    # reused, but its cap slot still returns.
+    fn discard(conn: mysql.Conn):
+        discard_to_pool(self.handle, conn)
 
     # begin a transaction on a single pinned connection. every statement you run
     # on the returned Tx uses that same connection; finish with commit() to keep
@@ -407,11 +434,13 @@ impl Db:
         slot := register_prepared(attempt.ok)
         return Stmt(handle: handle, slot: slot)
 
-    # drain the pool, closing every idle connection.
+    # drain the pool, closing every idle connection. the lock only covers the
+    # lookup; the connection close network i/o happens in the pool, off the lock.
     pub fn close():
         registry_mu.lock()
-        pools[self.handle].close()
+        pool := pools[self.handle]
         registry_mu.unlock()
+        pool.close()
 
 # prepare, run, and free a select on `conn`, collecting the rows into a list.
 fn gather(conn: mysql.Conn, text: String, params: List[String]) -> List[sql.Row]!:

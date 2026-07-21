@@ -7,11 +7,17 @@
 
 import std.db.postgres as db
 import std.sql as sql
+import std.time as time
 
 # open a pooled handle, or skip when no server answers. the pool connects
 # lazily, so a trivial query is what actually probes the server.
 fn open_or_skip() -> db.Db:
-    attempt := db.open("postgres://pith:pith_pw@127.0.0.1:5432/pithtest")
+    return open_capped_or_skip("postgres://pith:pith_pw@127.0.0.1:5432/pithtest")
+
+# open a handle from an explicit url (used to set a small `?pool=N` cap), or
+# skip when no server answers.
+fn open_capped_or_skip(url: String) -> db.Db:
+    attempt := db.open(url)
     if attempt.is_err:
         skip_test("no postgres server at 127.0.0.1:5432")
     handle := attempt.ok
@@ -19,6 +25,30 @@ fn open_or_skip() -> db.Db:
     if probe.is_err:
         skip_test("no postgres server at 127.0.0.1:5432")
     return handle
+
+# run one slow, marked query and report the value it selected back, or a
+# negative code on failure. the `worker_pool_cap_probe` alias is what the
+# observer counts in pg_stat_activity to see how many run at once.
+fn cap_worker(handle: db.Db, i: Int) -> Int:
+    attempt := handle.query("select {i} as worker_pool_cap_probe, pg_sleep(0.3)", [])
+    if attempt.is_err:
+        return -1
+    rows := attempt.ok
+    if rows.len() != 1:
+        return -2
+    return rows[0].int("worker_pool_cap_probe")
+
+# how many cap_worker queries are running on the server right now. it excludes
+# its own row (which names pg_stat_activity) so it counts only the workers.
+fn active_workers(observer: db.Db) -> Int:
+    q := "select count(*) as n from pg_stat_activity where state = 'active' and query like '%worker_pool_cap_probe%' and query not like '%pg_stat_activity%'"
+    attempt := observer.query(q, [])
+    if attempt.is_err:
+        return 0
+    rows := attempt.ok
+    if rows.len() != 1:
+        return 0
+    return rows[0].int("n")
 
 test "a round trip through the pooled layer reads typed columns":
     handle := open_or_skip()
@@ -59,3 +89,63 @@ test "a query error surfaces rather than crashing":
     result := handle.query("select 1 from no_such_table_pith_xyz", [])
     handle.close()
     assert(result.is_err)
+
+# many green tasks share one small-capped handle. the cap must hold — never more
+# than `?pool=4` connections open at once — and every task must still get the
+# right answer. without the cap all 16 would open at once; with it, an observer
+# watching pg_stat_activity should never see more than four workers running.
+test "a small pool cap holds under many concurrent tasks":
+    handle := open_capped_or_skip("postgres://pith:pith_pw@127.0.0.1:5432/pithtest?pool=4")
+    observer := open_capped_or_skip("postgres://pith:pith_pw@127.0.0.1:5432/pithtest?pool=2")
+
+    worker_count := 16
+    mut tasks := []
+    mut i := 0
+    while i < worker_count:
+        tasks.push(spawn cap_worker(handle, i))
+        i = i + 1
+
+    # watch how many workers run at once while the storm is in flight.
+    mut peak := 0
+    mut s := 0
+    while s < 60:
+        running := active_workers(observer)
+        if running > peak:
+            peak = running
+        time.delay(25)
+        s = s + 1
+
+    # every task got its own answer back...
+    mut ok_count := 0
+    mut j := 0
+    while j < tasks.len():
+        if await tasks[j] == j:
+            ok_count = ok_count + 1
+        j = j + 1
+    assert_eq(ok_count, worker_count)
+
+    # ...and the pool never ran more than the cap (plus a little slack for
+    # sampling), while still running several at once.
+    assert(peak >= 2)
+    assert(peak <= 6)
+
+    observer.close()
+    handle.close()
+
+# a failed query poisons its connection and closes it, which must also return
+# the connection's slot to the cap. run more failures than the cap allows: if a
+# slot leaked on the close path, the pool would run out and this would hang.
+test "failed queries return their slot so the pool does not deadlock":
+    handle := open_capped_or_skip("postgres://pith:pith_pw@127.0.0.1:5432/pithtest?pool=2")
+
+    mut n := 0
+    while n < 5:
+        bad := handle.query("select 1 from no_such_table_pith_cap", [])
+        assert(bad.is_err)
+        n = n + 1
+
+    good := handle.query("select 42 as v", [])!
+    assert_eq(good.len(), 1)
+    assert_eq(good[0].int("v"), 42)
+
+    handle.close()

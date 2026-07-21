@@ -85,6 +85,13 @@ fn push_array_element(handle: Int, val: Int):
 threadlocal mut parser_input: String := ""
 threadlocal mut parser_position: Int := 0
 threadlocal mut parser_error: Bool := false
+threadlocal mut parser_depth: Int := 0
+
+# Maximum nested-array depth. Deep enough for any real document, shallow
+# enough that the recursive value parser can't overflow the native stack.
+# A stack overflow is a SIGSEGV, which no error handler can catch, so we have
+# to stop before it happens rather than recover from it.
+MAX_PARSE_DEPTH := 128
 
 # Returns character at position i or empty string if out of bounds
 fn get_char_at(i: Int) -> String:
@@ -219,8 +226,20 @@ fn parse_float_manual(s: String) -> Float:
         return 0.0 - result
     return result
 
-# Main recursive value parser
+# Main recursive value parser.
+# Guards nesting depth so a pathological "k = [[[[..." value fails cleanly
+# instead of crashing the process with a stack overflow.
 fn parse_value() -> Int:
+    parser_depth = parser_depth + 1
+    if parser_depth > MAX_PARSE_DEPTH:
+        parser_error = true
+        parser_depth = parser_depth - 1
+        return 0 - 1
+    result := parse_value_node()
+    parser_depth = parser_depth - 1
+    return result
+
+fn parse_value_node() -> Int:
     skip_whitespace()
     if parser_position >= parser_input.len():
         parser_error = true
@@ -358,6 +377,7 @@ fn toml_parse(input: String) -> Int:
     parser_input = input
     parser_position = 0
     parser_error = false
+    parser_depth = 0
     root := allocate_node("table")
     mut current_table := root
 

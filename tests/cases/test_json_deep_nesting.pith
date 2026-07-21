@@ -1,0 +1,29 @@
+import std.json as json
+
+# a pathologically deep document ("[[[[..." or "{\"a\":{...") must fail
+# cleanly with a -1 handle instead of crashing the process with a stack
+# overflow. we build ~131072 levels by doubling a prefix so the test stays
+# fast; before the depth cap this input hard-crashed the interpreter.
+
+fn deep_prefix(unit: String, doublings: Int) -> String:
+    mut s := unit
+    mut i := 0
+    while i < doublings:
+        s = s + s
+        i = i + 1
+    return s
+
+fn main() -> Int!:
+    deep_array := deep_prefix("[", 17)
+    array_handle := json.parse(deep_array)
+    print("deep_array:{array_handle}")
+
+    unit := chr(123) + chr(34) + "a" + chr(34) + ":"
+    deep_object := deep_prefix(unit, 17)
+    object_handle := json.parse(deep_object)
+    print("deep_object:{object_handle}")
+
+    # a normally nested document still parses fine
+    normal := json.parse("[[[[1]]]]")
+    print("normal_ok:{normal >= 0}")
+    return 0

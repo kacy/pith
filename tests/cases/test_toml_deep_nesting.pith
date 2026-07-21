@@ -1,0 +1,24 @@
+import std.toml as toml
+
+# a deeply nested toml array value ("k = [[[[...") must fail cleanly instead
+# of crashing the process with a stack overflow. we build ~131072 levels by
+# doubling a prefix so the test stays fast; before the depth cap this input
+# hard-crashed the interpreter.
+
+fn deep_prefix(unit: String, doublings: Int) -> String:
+    mut s := unit
+    mut i := 0
+    while i < doublings:
+        s = s + s
+        i = i + 1
+    return s
+
+fn main() -> Int!:
+    deep := "k = " + deep_prefix("[", 17)
+    deep_handle := toml.parse(deep)
+    print("deep_toml_failed:{deep_handle < 0}")
+
+    # a normally nested document still parses fine
+    normal := toml.parse("k = [[1]]")
+    print("normal_ok:{normal >= 0}")
+    return 0

@@ -116,6 +116,10 @@ impl Conn:
         mtype := bytes.get(head, 0)
         len_bytes := self.recv_exact(4)!
         total := read_be(len_bytes, 0, 4)
+        # the length covers its own 4 bytes, so anything below 4 would ask
+        # recv_exact for a negative payload. reject a malformed/hostile frame.
+        if total < 4:
+            fail "postgres: backend message length {total} is too small"
         payload := self.recv_exact(total - 4)!
         return Message(mtype: mtype, payload: payload)
 
@@ -603,3 +607,11 @@ test "command tag affected-row count is the last token":
     assert_eq(command_affected(update), 5)
     assert_eq(command_affected(insert), 3)
     assert_eq(read_be(be16(258), 0, 2), 258)
+
+test "read_message rejects a length below its own header":
+    # a length field of 3 covers only part of its own 4 bytes, so total - 4
+    # would ask recv_exact for a negative payload. the frame is pre-buffered,
+    # so no real socket is touched.
+    framed := bytes.concat(bytes.from_string_utf8("E"), be32(3))
+    conn := Conn(fd: - 1, buf: framed, pos: 0, secure: false, tls_handle: 0)
+    assert(conn.read_message().is_err)

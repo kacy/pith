@@ -2011,6 +2011,41 @@ fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
         expr_type = ir_infer_type(idx)
     return expr_type == "string"
 
+# the byte value (0-255) of a single-character string literal, or -1 if the
+# literal is empty, multi-character, or a non-ascii/unknown escape. `raw` is the
+# literal's source form *including its surrounding quotes* — e.g. `"/"` (three
+# chars) or `"\n"` (four) — so it must be unquoted and unescaped before its
+# length means anything. only the escapes a byte scanner actually compares
+# against are decoded; anything else falls back to the normal string path.
+fn ir_string_lit_single_byte(raw: String) -> Int:
+    n := raw.len()
+    if n < 3:
+        return 0 - 1
+    inner_len := n - 2
+    if inner_len == 1:
+        # a plain character; a lone backslash is an incomplete escape, not a byte
+        c := raw[1]
+        if c == "\\":
+            return 0 - 1
+        return ord(c)
+    if inner_len == 2 and raw[1] == "\\":
+        e := raw[2]
+        if e == "n":
+            return 10
+        if e == "t":
+            return 9
+        if e == "r":
+            return 13
+        if e == "0":
+            return 0
+        if e == "\\":
+            return 92
+        if e == "\"":
+            return 34
+        if e == "'":
+            return 39
+    return 0 - 1
+
 # a register holding one byte of string content as an integer, or -1
 # when the expression can't be read as a byte. covers s[i] on strings
 # (an allocation-free byte_at instead of a fresh one-char string),
@@ -2026,9 +2061,10 @@ fn ir_emit_byte_operand(idx: Int) -> Int:
             return r
         return 0 - 1
     if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
-        if node.value.len() == 1:
+        b := ir_string_lit_single_byte(node.value)
+        if b >= 0:
             r := ir_reg()
-            ir_emit("iconst " + r.to_string() + " " + ord(node.value).to_string())
+            ir_emit("iconst " + r.to_string() + " " + b.to_string())
             return r
         return 0 - 1
     if node.kind == "call" and node.children.len() >= 2:
@@ -2049,7 +2085,7 @@ fn ir_is_byte_operand(idx: Int) -> Bool:
     if node.kind == "index" and node.children.len() >= 2:
         return ir_expr_is_fresh_string_index(idx)
     if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
-        return node.value.len() == 1
+        return ir_string_lit_single_byte(node.value) >= 0
     if node.kind == "call" and node.children.len() >= 2:
         callee := get_node(node.children[0])
         arg := get_node(node.children[1])

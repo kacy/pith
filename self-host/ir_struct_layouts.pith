@@ -21,16 +21,24 @@ pub fn ir_struct_field_count_with_state(struct_name: String, struct_names: Map[S
     return 0
 
 pub fn ir_struct_field_name_at_with_state(struct_name: String, field_index: Int, struct_names: Map[String, Int], struct_field_index_lookup: Map[String, String]) -> String:
-    struct_tid := lookup_type_id(struct_name)
-    if struct_tid >= 0:
-        struct_info := get_type_info(struct_tid)
-        if struct_info.kind == "struct" and field_index >= 0 and field_index < struct_info.fields.len():
-            return struct_info.fields[field_index]
+    # the per-module registry is authoritative: it is rebuilt for each module
+    # being emitted, so it names the struct that this module actually declares.
+    # the whole-program checker type table (lookup_type_id) is keyed by the bare
+    # struct name across every module, so two modules that each export a struct
+    # named `S` collapse to a single entry there. consulting the module registry
+    # first keeps each module's `S` on its own field layout.
     prefix := ir_struct_layout_name_with_state(struct_name, struct_names) + "."
     want := field_index.to_string()
     for key in struct_field_index_lookup:
         if key.starts_with(prefix) and struct_field_index_lookup[key] == want:
             return key.substring(prefix.len(), key.len())
+    # fall back to the checker table for structs the local registry never
+    # recorded (for example a generic instantiation named only by the checker).
+    struct_tid := lookup_type_id(struct_name)
+    if struct_tid >= 0:
+        struct_info := get_type_info(struct_tid)
+        if struct_info.kind == "struct" and field_index >= 0 and field_index < struct_info.fields.len():
+            return struct_info.fields[field_index]
     return ""
 
 pub fn ir_struct_field_type_name_with_state(struct_name: String, field_name: String, struct_names: Map[String, Int], struct_field_lookup: Map[String, String]) -> String:

@@ -1,0 +1,15 @@
+# two modules each declare `struct Box` with different field layouts, and both
+# build theirs with named fields. the emitter used to resolve a field name
+# through a whole-program type table keyed by the bare struct name, so the second
+# Box to register hijacked the first: clash_layout_a's named construction
+# resolved its fields against clash_layout_b's layout, the names didn't match, and
+# every field silently fell back to zero. per-module field resolution keeps them
+# apart.
+from clash_layout_a import make_a
+from clash_layout_b import make_b
+
+fn main():
+    a := make_a()
+    b := make_b()
+    print(a.tag + "/" + a.size.to_string())
+    print(b.count.to_string() + "/" + b.kind + "/" + b.note)

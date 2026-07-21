@@ -2855,11 +2855,13 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         callee = ir_resolve_static_callee(node.children[0])
         if callee.name.len() == 0:
             callee = ResolvedCallee("unknown", false)
-    # ord(s[i]) reads one byte: byte_at skips the one-character string
-    # that s[i] would otherwise allocate just to take its code point
+    # ord of any byte operand is just that byte: ord(s[i]) reads it with byte_at
+    # instead of minting a one-character string, and ord("/") folds to a
+    # constant. the argument is wrapped in an "arg" node, so unwrap it first.
     if callee.name == "ord" and node.children.len() >= 2:
-        if ir_is_byte_operand(node.children[1]) and get_node(node.children[1]).kind == "index":
-            return ir_emit_byte_operand(node.children[1])
+        byte_r := ir_emit_byte_operand(ir_call_arg_expr_index(node.children[1]))
+        if byte_r >= 0:
+            return byte_r
     higher_order_r := ir_emit_higher_order_list_call(idx, node, callee.name)
     if higher_order_r >= 0:
         return higher_order_r

@@ -794,6 +794,35 @@ fn note_notify() {
     }
 }
 
+/// debug-only invariant guard for a task pulled from a *stealable* source: a
+/// worker's own `local` queue, the global injector, or a peer's `local` on a
+/// steal. the pinning discipline the whole `SendCoroutine` soundness rests on
+/// (see the module doc) is exactly: only fresh, never-resumed tasks are ever
+/// moved between workers. a fresh task has no `owner` yet and sits `Ready`. if
+/// either were false here we would be about to run — possibly on a different
+/// worker than last time — a coroutine that may carry live pith stack, the
+/// unsound case the manual `Send` forbids. cheap, and compiled out in release.
+///
+/// the slab lock is taken with no queue lock held (the caller pops into a local
+/// first), so this never nests queue-inside-slab.
+#[cfg(debug_assertions)]
+fn debug_assert_stealable(id: TaskId) {
+    let slab = lock_slab();
+    if let Some(task) = slab.get(id).and_then(|slot| slot.as_ref()) {
+        debug_assert!(
+            task.owner.is_none(),
+            "stole/ran-fresh a task already pinned to a worker (id {id})"
+        );
+        debug_assert!(
+            task.state == RunState::Ready,
+            "a stealable task must be Ready, never mid-run (id {id})"
+        );
+    }
+}
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn debug_assert_stealable(_id: TaskId) {}
+
 /// find the next ready task for worker `index`: its pinned queue first (resume
 /// suspended work it owns), then its own local queue, then the injector, then a
 /// steal from a random peer's local queue. returns `None` if the whole pool is
@@ -811,21 +840,25 @@ fn find_work(index: usize) -> Option<TaskId> {
         return Some(id);
     }
 
-    if let Some(id) = sched.workers[index]
+    // own local queue (stealable): pop into a local so the queue lock is released
+    // before the debug invariant check locks the slab.
+    let from_local = sched.workers[index]
         .local
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .pop_front()
-    {
+        .pop_front();
+    if let Some(id) = from_local {
+        debug_assert_stealable(id);
         return Some(id);
     }
 
-    if let Some(id) = sched
+    let from_injector = sched
         .injector
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .pop_front()
-    {
+        .pop_front();
+    if let Some(id) = from_injector {
+        debug_assert_stealable(id);
         return Some(id);
     }
 
@@ -840,12 +873,13 @@ fn find_work(index: usize) -> Option<TaskId> {
         if victim == index {
             continue;
         }
-        if let Some(id) = sched.workers[victim]
+        let stolen = sched.workers[victim]
             .local
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .pop_front()
-        {
+            .pop_front();
+        if let Some(id) = stolen {
+            debug_assert_stealable(id);
             return Some(id);
         }
     }
@@ -967,6 +1001,43 @@ enum Requeue {
     None,
 }
 
+/// record a task's completion and unblock everyone awaiting it: flip the slab
+/// entry to `Done` with `result`, then set the join's `done` flag, notify
+/// os-thread awaiters on the condvar, and `wake` every registered green awaiter.
+///
+/// both `run_task` completion paths funnel through here — a clean return and the
+/// panic boundary — so an awaiter gets the same defined outcome whether its task
+/// returned normally or its coroutine panicked. once `done` is set under the join
+/// lock, a fresh `green_await` sees it and returns without registering, so no
+/// waiter can be added after we take the list: draining here loses none.
+fn finish_task(id: TaskId, result: i64) {
+    let join = {
+        let mut slab = lock_slab();
+        if let Some(task) = slab.get_mut(id).and_then(|slot| slot.as_mut()) {
+            task.state = RunState::Done;
+            task.result = result;
+            task.join.clone()
+        } else {
+            return;
+        }
+    };
+    let (lock, cvar) = &*join;
+    // flip done + notify os-thread awaiters and take the green-waiter list under
+    // the join lock; wake the green awaiters after releasing it, since
+    // `green::wake` takes the slab and queue locks and the join lock must stay
+    // out of that nest (join is the outer lock, like a channel lock).
+    let green_waiters = {
+        let mut j = lock_join(lock);
+        j.done = true;
+        j.result = result;
+        cvar.notify_all();
+        std::mem::take(&mut j.green_waiters)
+    };
+    for waiter in green_waiters {
+        wake(waiter);
+    }
+}
+
 /// resume one task's coroutine to its next suspension point. the coroutine is
 /// taken out of the slab (so we don't hold the slab lock across arbitrary pith
 /// code, which may itself spawn), resumed, then either dropped (returned) or put
@@ -1036,7 +1107,21 @@ fn run_task(id: TaskId) {
 
     // run outside the lock. SAFETY of the transmute-and-call lives inside the
     // coroutine body (see green_spawn); here we just drive the coroutine.
-    let outcome = coro.0.resume(());
+    //
+    // wrap the resume in `catch_unwind` so a panic raised in pith JIT/FFI code
+    // (a trap that surfaces as a Rust panic, an FFI panic) does not unwind
+    // through the coroutine into the worker thread and kill it. neither cargo
+    // profile sets `panic = "abort"`, so without this a single panicking task
+    // would silently retire a worker AND leave its `join.done` unset, hanging
+    // every awaiter forever. corosensei re-raises a coroutine panic out of
+    // `resume` (it has already unwound the coroutine's own stack, so `coro` is
+    // complete and must never be resumed again — the panic arm drops it).
+    //
+    // AssertUnwindSafe: `coro` (a `SendCoroutine`) is not `UnwindSafe`, but a
+    // caught panic here does not observe it in a broken state — we never resume
+    // the coroutine after a panic, we drop it. no other captured state crosses
+    // the boundary. so asserting unwind-safety is sound.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| coro.0.resume(())));
 
     // no task running on this worker until it picks up the next one.
     if let Some(w) = worker_index {
@@ -1055,42 +1140,24 @@ fn run_task(id: TaskId) {
     CURRENT_TLS.with(|c| c.set(prev_tls));
 
     match outcome {
-        CoroutineResult::Return(result) => {
-            // record the result, flip done, wake awaiters of both kinds. drop the
-            // coroutine (and its stack) by simply not putting it back.
-            let join = {
-                let mut slab = lock_slab();
-                if let Some(task) = slab.get_mut(id).and_then(|slot| slot.as_mut()) {
-                    task.state = RunState::Done;
-                    task.result = result;
-                    task.join.clone()
-                } else {
-                    return;
-                }
-            };
-            let (lock, cvar) = &*join;
-            // flip done + notify os-thread awaiters, and take the green-waiter
-            // list, all under the join lock. once `done` is set, a fresh
-            // `green_await` sees it and returns without registering, so no new
-            // waiter can appear after this — draining here loses none.
-            let green_waiters = {
-                let mut j = lock_join(lock);
-                j.done = true;
-                j.result = result;
-                cvar.notify_all();
-                std::mem::take(&mut j.green_waiters)
-            };
-            // wake green awaiters after releasing the join lock: `green::wake`
-            // takes the slab and queue locks, and keeping the join lock out of
-            // that nest keeps the hold short (the lock order still permits it —
-            // join is the outer lock, like a channel lock). a waiter that already
-            // parked is re-enqueued; one still mid-suspend gets `wake_pending` set
-            // and re-enqueues itself from the park path, so the wake is never lost.
-            for waiter in green_waiters {
-                wake(waiter);
-            }
+        Ok(CoroutineResult::Return(result)) => {
+            // clean return: record the result, flip done, wake awaiters of both
+            // kinds, and drop the coroutine (and its stack) by not putting it
+            // back. see `finish_task` for the join-lock / wake ordering.
+            finish_task(id, result);
         }
-        CoroutineResult::Yield(()) => {
+        Err(_panic) => {
+            // the coroutine's body panicked. corosensei already unwound the
+            // coroutine's own stack, so `coro` is complete — we drop it here and
+            // never resume it again. the default panic hook has already printed
+            // the message to stderr; our job is to make sure the task's awaiters
+            // do not hang. mark the task done with a zero result (a failed task
+            // reports 0, matching the os-thread path when a closure lookup fails)
+            // and wake every awaiter so they unblock with a defined outcome. the
+            // worker itself is unharmed and goes on to run the next task.
+            finish_task(id, 0);
+        }
+        Ok(CoroutineResult::Yield(())) => {
             // the task suspended: either it parked on a blocking op (a channel, a
             // P2b primitive, or an await), or it was preempted at a safe-point. put
             // the coroutine back and record where its yielder lives, then decide how
@@ -1435,6 +1502,101 @@ mod tests {
         }
 
         PITH_PREEMPT_REQUESTED.store(0, AtomicOrdering::Relaxed);
+        CURRENT_WORKER.with(|c| c.set(None));
+    }
+
+    // push a Ready task wrapping `coro` (with its own fresh join) into the slab
+    // and return its id. shared by the preempt and panic tests to cut the
+    // slab-push boilerplate.
+    fn push_ready_task(coro: TaskCoroutine, join: Arc<(Mutex<Join>, Condvar)>) -> TaskId {
+        let mut slab = lock_slab();
+        let id = slab.len();
+        slab.push(Some(Task {
+            coro: Some(SendCoroutine(coro)),
+            closure_handle: 0,
+            state: RunState::Ready,
+            result: 0,
+            owner: None,
+            yielder_ptr: YielderPtr(ptr::null()),
+            wake_pending: false,
+            preempt_pending: false,
+            join,
+            tls: Box::new(HashMap::new()),
+        }));
+        id
+    }
+
+    fn fresh_join() -> Arc<(Mutex<Join>, Condvar)> {
+        Arc::new((
+            Mutex::new(Join {
+                done: false,
+                result: 0,
+                green_waiters: Vec::new(),
+            }),
+            Condvar::new(),
+        ))
+    }
+
+    // the panic boundary: a green task whose body panics (a pith trap or an FFI
+    // panic surfaces exactly as a Rust panic unwinding out of the coroutine) must
+    // NOT take the worker down with it. run_task's `catch_unwind` catches the
+    // panic, marks the task done (so its awaiters unblock instead of hanging),
+    // drops the dead coroutine, and returns normally — and the same worker goes on
+    // to run the next task. drives run_task directly on the test thread, standing
+    // in for a worker, so a missing boundary would unwind this test and fail it.
+    #[test]
+    fn panicking_task_marks_done_and_keeps_worker_alive() {
+        let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        CURRENT_WORKER.with(|c| c.set(Some(0)));
+
+        let coro = TaskCoroutine::with_stack(
+            corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+            move |yielder: &TaskYielder, _input: ()| -> i64 {
+                CURRENT_YIELDER.with(|c| c.set(yielder as *const TaskYielder));
+                panic!("boom from a green task");
+            },
+        );
+        let join = fresh_join();
+        let awaiter_view = join.clone();
+        let id = push_ready_task(coro, join);
+
+        // must return, not unwind. without the boundary this call propagates the
+        // panic and the test aborts.
+        run_task(id);
+
+        // the task is recorded done and its coroutine dropped (never re-enqueued).
+        {
+            let slab = lock_slab();
+            let task = slab[id].as_ref().unwrap();
+            assert!(task.state == RunState::Done, "panicked task must be Done");
+            assert!(task.coro.is_none(), "dead coroutine must not be put back");
+        }
+        // an awaiter sees done=true, so it unblocks with a defined (zero) result
+        // rather than hanging forever.
+        {
+            let (lock, _) = &*awaiter_view;
+            let j = lock_join(lock);
+            assert!(j.done, "awaiters must see done=true");
+            assert_eq!(j.result, 0, "a failed task reports a zero result");
+        }
+
+        // the worker (this thread) survived: a fresh task still runs to completion.
+        let coro2 = TaskCoroutine::with_stack(
+            corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+            move |yielder: &TaskYielder, _input: ()| -> i64 {
+                CURRENT_YIELDER.with(|c| c.set(yielder as *const TaskYielder));
+                7
+            },
+        );
+        let id2 = push_ready_task(coro2, fresh_join());
+        run_task(id2);
+        {
+            let slab = lock_slab();
+            let task = slab[id2].as_ref().unwrap();
+            assert!(task.state == RunState::Done);
+            assert_eq!(task.result, 7, "worker still runs tasks after a panic");
+        }
+
         CURRENT_WORKER.with(|c| c.set(None));
     }
 }

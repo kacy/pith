@@ -98,6 +98,10 @@ impl Interest {
 const PENDING: i32 = 0;
 const READY: i32 = 1;
 const TIMED_OUT: i32 = 2;
+/// the fd was closed out from under a still-parked waiter (see `on_close`). the
+/// woken task reports it as an I/O error so its read/write unwinds cleanly
+/// instead of hanging or retrying a syscall on a dead fd.
+const CLOSED: i32 = 3;
 
 /// the epoll token used for the eventfd. real fds are stored as their own value
 /// in `epoll_event.u64`; `u64::MAX` can never collide with a real fd.
@@ -378,6 +382,10 @@ pub(crate) fn wait_io(fd: RawFd, read: bool, timeout_ms: i64, task: usize) -> i6
     match outcome.load(AtomicOrdering::Acquire) {
         READY => 1,
         TIMED_OUT => 0,
+        // the fd was closed under us while we were parked: report an error so the
+        // caller's read/write returns an error and the task unwinds, rather than
+        // retrying a syscall on a dead (or worse, recycled) fd.
+        CLOSED => -1,
         // a wake with no terminal outcome should not happen; treat it as ready so
         // the caller re-runs its syscall (the source of truth) rather than
         // mistaking it for a timeout.
@@ -562,23 +570,61 @@ fn drain_eventfd(eventfd: RawFd) {
     }
 }
 
-/// drop any waiter registry state for `fd` when it is closed. epoll auto-removes a
-/// closed fd, but a still-open dup could keep it alive, so we `EPOLL_CTL_DEL`
-/// explicitly (ignoring ENOENT) and clear the waiter lists. any task still parked
-/// on this fd will be woken by nothing — but a close under it means the program is
-/// tearing the connection down, and the parked task is being abandoned by design.
+/// clean up the waiter registry for `fd` when it is closed, and WAKE any task
+/// still parked on it with a closed/error outcome. epoll auto-removes a closed fd,
+/// but a still-open dup could keep it alive, so we `EPOLL_CTL_DEL` explicitly
+/// (ignoring ENOENT) too.
+///
+/// waking the parked waiters is the point: the common server teardown pattern is
+/// one task closing a connection another task is blocked reading. dropping the
+/// reader's registration silently (the old behavior) left its coroutine parked
+/// forever — leaking its stack and slab slot and hanging anyone awaiting it. now
+/// each parked waiter's outcome is flipped to `CLOSED` and the task is woken, so
+/// its `wait_io` returns an error, its read/write unwinds, and its resources are
+/// reclaimed. a `compare_exchange` from `PENDING` means a readiness or timeout
+/// that already claimed the waiter still wins — we only close out a truly-pending
+/// wait, never double-resolve one.
 pub(crate) fn on_close(fd: RawFd) {
     // only touch the reactor if it was ever built; a process that never waited on
     // a socket has no registry to clean.
     let Some(reactor) = REACTOR.get() else {
         return;
     };
-    let mut inner = lock_inner(reactor);
-    inner.waiters.remove(&(fd, Interest::Read));
-    inner.waiters.remove(&(fd, Interest::Write));
-    if inner.fds.remove(&fd).is_some() {
-        // fd was in the epoll set; remove it. errors (already gone) are ignored.
-        epoll_apply(reactor.epfd, libc::EPOLL_CTL_DEL, fd, 0);
+
+    // collect the tasks to wake, then wake them AFTER dropping the registry lock:
+    // `green::wake` takes green's own slab/queue locks, and this lock must never
+    // nest inside them (the module's lock discipline).
+    let mut to_wake: Vec<usize> = Vec::new();
+    {
+        let mut inner = lock_inner(reactor);
+        for interest in [Interest::Read, Interest::Write] {
+            if let Some(waiters) = inner.waiters.remove(&(fd, interest)) {
+                for w in waiters {
+                    if w
+                        .outcome
+                        .compare_exchange(
+                            PENDING,
+                            CLOSED,
+                            AtomicOrdering::AcqRel,
+                            AtomicOrdering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        to_wake.push(w.task);
+                    }
+                }
+            }
+        }
+        if inner.fds.remove(&fd).is_some() {
+            // fd was in the epoll set; remove it. errors (already gone) ignored.
+            epoll_apply(reactor.epfd, libc::EPOLL_CTL_DEL, fd, 0);
+        }
+        // any deadline heap entries for this fd are now stale; they match no
+        // waiter and are dropped when they surface (same as a fired waiter's).
+    }
+
+    for task in to_wake {
+        green::wake(task);
     }
 }
 
@@ -634,5 +680,73 @@ mod tests {
             inner.desired_mask(7),
             libc::EPOLLIN as u32 | libc::EPOLLOUT as u32
         );
+    }
+
+    // close-during-wait: a task blocked reading an fd that another task closes
+    // must be woken with a CLOSED outcome (so its wait_io returns an error and the
+    // task unwinds and reclaims its stack/slot), not silently dropped and parked
+    // forever. we register a waiter by hand and drive on_close directly, since
+    // wait_io itself needs a live coroutine to suspend into. the fd is a bogus
+    // value that no real socket test uses, so the epoll DEL just fails harmlessly.
+    #[test]
+    fn on_close_wakes_parked_waiter_with_closed_outcome() {
+        let reactor = reactor();
+        let fd: RawFd = 424_242;
+        let outcome = Arc::new(AtomicI32::new(PENDING));
+        {
+            let mut inner = lock_inner(reactor);
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            inner
+                .waiters
+                .entry((fd, Interest::Read))
+                .or_default()
+                .push(Waiter {
+                    // a slab id far beyond any real task: green::wake finds no such
+                    // slot and no-ops, which is all we need to exercise on_close.
+                    task: usize::MAX,
+                    seq,
+                    outcome: outcome.clone(),
+                });
+            inner.fds.insert(fd, FdReg { armed: libc::EPOLLIN as u32 });
+        }
+
+        on_close(fd);
+
+        // the waiter's outcome was flipped to CLOSED (wait_io maps that to -1), and
+        // the registry no longer holds the waiter or the fd.
+        assert_eq!(outcome.load(AtomicOrdering::Acquire), CLOSED);
+        let inner = lock_inner(reactor);
+        assert!(inner.waiters.get(&(fd, Interest::Read)).is_none());
+        assert!(inner.fds.get(&fd).is_none());
+    }
+
+    // on_close must only close out a *pending* wait: a waiter a readiness or
+    // timeout already claimed keeps its terminal outcome, so a close racing a
+    // fire never double-resolves the wait.
+    #[test]
+    fn on_close_leaves_already_resolved_waiter() {
+        let reactor = reactor();
+        let fd: RawFd = 424_243;
+        let outcome = Arc::new(AtomicI32::new(READY));
+        {
+            let mut inner = lock_inner(reactor);
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
+            inner
+                .waiters
+                .entry((fd, Interest::Write))
+                .or_default()
+                .push(Waiter {
+                    task: usize::MAX,
+                    seq,
+                    outcome: outcome.clone(),
+                });
+        }
+
+        on_close(fd);
+
+        // still READY: on_close's compare_exchange only fires on a PENDING waiter.
+        assert_eq!(outcome.load(AtomicOrdering::Acquire), READY);
     }
 }

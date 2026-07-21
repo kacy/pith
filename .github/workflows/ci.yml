@@ -13,6 +13,9 @@ jobs:
       - name: check rust crash guards
         run: make check-no-panics
 
+      - name: rust unit tests
+        run: cargo test --release --workspace --locked
+
       - name: test
         run: |
           ./target/release/pith run tests/cases/test_suite.pith
@@ -25,6 +28,9 @@ jobs:
           ./target/release/pith run examples/collection_methods.pith >/dev/null
           ./target/release/pith run examples/string_collection_methods.pith >/dev/null
           ./target/release/pith run examples/stdlib_algo.pith >/dev/null
+
+      - name: green-thread runtime tests
+        run: make green-tests
 
       - name: build self-hosted compiler
         run: make self-host

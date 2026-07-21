@@ -204,6 +204,122 @@ fn inline_bytes_get(builder: &mut FunctionBuilder<'_>, bytes: Value, index: Valu
     builder.block_params(done)[0]
 }
 
+// The magic word every heap cstring carries at `ptr - 16`. This mirrors
+// `runtime_core::CSTRING_MAGIC` and must stay in sync with it. A drift is not a
+// safety problem — the fast path below simply stops matching and every access
+// falls back to the FFI helper, which is correct but slow — so keep the two
+// definitions together.
+const CSTRING_MAGIC: i64 = 0x5043_5352;
+
+// The 16-byte header in front of heap cstring data: [magic: u32][rc: u32,
+// atomic][data_len: u64], so the length lives 8 bytes before the pointer.
+const CSTRING_LEN_OFFSET: i32 = -8;
+const CSTRING_MAGIC_OFFSET: i32 = -16;
+
+/// Narrow `s` to a confirmed heap cstring, branching to `slow` for anything
+/// else. This mirrors `runtime_core::cstring_base`: heap cstring data is at an
+/// address >= 16 (which also rejects null), is 8-aligned, and carries the magic
+/// word 16 bytes in front of it. Literals and the shared empty string fail one
+/// of these checks and take the slow path. On return the builder sits in a
+/// fresh block where `s` is known to be a heap cstring.
+fn branch_if_not_heap_cstring(builder: &mut FunctionBuilder<'_>, s: Value, slow: Block) {
+    // addr >= 16, unsigned so null and any stray small pointer are rejected
+    // before the header word is read.
+    let too_small = builder.ins().icmp_imm(IntCC::UnsignedLessThan, s, 16);
+    let check_align = builder.create_block();
+    builder.ins().brif(too_small, slow, &[], check_align, &[]);
+    builder.switch_to_block(check_align);
+
+    // heap cstring data is always 8-aligned; this rejects most literals cheaply.
+    let low_bits = builder.ins().band_imm(s, 7);
+    let unaligned = builder.ins().icmp_imm(IntCC::NotEqual, low_bits, 0);
+    let check_magic = builder.create_block();
+    builder.ins().brif(unaligned, slow, &[], check_magic, &[]);
+    builder.switch_to_block(check_magic);
+
+    // read the 4-byte magic in front of the data and compare. an aligned
+    // literal reads mapped binary data here and simply fails the compare, the
+    // same contract the runtime relies on for retain/release.
+    let magic = builder
+        .ins()
+        .load(types::I32, MemFlags::new(), s, CSTRING_MAGIC_OFFSET);
+    let not_magic = builder.ins().icmp_imm(IntCC::NotEqual, magic, CSTRING_MAGIC);
+    let confirmed = builder.create_block();
+    builder.ins().brif(not_magic, slow, &[], confirmed, &[]);
+    builder.switch_to_block(confirmed);
+}
+
+/// Inline `s[i]` (byte_at) for heap cstrings: read the length from the header,
+/// bounds-check, and index the byte directly, skipping the FFI dispatch that
+/// dominates tight character-scanning loops. Literals and wild pointers fall
+/// back to `fallback` (pith_cstring_byte_at) for identical semantics — out of
+/// range returns -1.
+fn inline_cstring_byte_at(
+    builder: &mut FunctionBuilder<'_>,
+    s: Value,
+    index: Value,
+    fallback: cranelift::codegen::ir::FuncRef,
+) -> Value {
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let slow = builder.create_block();
+
+    branch_if_not_heap_cstring(builder, s, slow);
+    let len = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), s, CSTRING_LEN_OFFSET);
+    // one unsigned compare catches both a negative index and one past the end.
+    let out_of_bounds = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
+    let oob = builder.create_block();
+    let read = builder.create_block();
+    builder.ins().brif(out_of_bounds, oob, &[], read, &[]);
+    builder.switch_to_block(oob);
+    let neg_one = builder.ins().iconst(types::I64, -1);
+    jump_with_i64_arg(builder, done, neg_one);
+    builder.switch_to_block(read);
+    let elem_addr = builder.ins().iadd(s, index);
+    let byte = builder.ins().load(types::I8, MemFlags::new(), elem_addr, 0);
+    let value = builder.ins().uextend(types::I64, byte);
+    jump_with_i64_arg(builder, done, value);
+
+    builder.switch_to_block(slow);
+    let call = builder.ins().call(fallback, &[s, index]);
+    let fallback_result = builder.func.dfg.inst_results(call)[0];
+    jump_with_i64_arg(builder, done, fallback_result);
+
+    builder.switch_to_block(done);
+    builder.block_params(done)[0]
+}
+
+/// Inline `s.len()` (string_len) for heap cstrings: one header read instead of
+/// an FFI call. Literals fall back to `fallback` (pith_cstring_len), which
+/// strlen-scans them.
+fn inline_cstring_len(
+    builder: &mut FunctionBuilder<'_>,
+    s: Value,
+    fallback: cranelift::codegen::ir::FuncRef,
+) -> Value {
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let slow = builder.create_block();
+
+    branch_if_not_heap_cstring(builder, s, slow);
+    let len = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), s, CSTRING_LEN_OFFSET);
+    jump_with_i64_arg(builder, done, len);
+
+    builder.switch_to_block(slow);
+    let call = builder.ins().call(fallback, &[s]);
+    let fallback_result = builder.func.dfg.inst_results(call)[0];
+    jump_with_i64_arg(builder, done, fallback_result);
+
+    builder.switch_to_block(done);
+    builder.block_params(done)[0]
+}
+
 fn runtime_func_ref(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
@@ -1281,6 +1397,43 @@ fn compile_ir_function(
                     }
                     if fname == "bytes_get" && args.len() == 2 {
                         let inlined = inline_bytes_get(&mut builder, args[0], args[1]);
+                        regs.insert(reg, inlined);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        struct_regs.remove(&reg);
+                        continue;
+                    }
+                    // string indexing and length: inline the heap-cstring fast
+                    // path (header read instead of an FFI call per character),
+                    // falling back to the runtime helper for literals. these
+                    // names are emitted only for strings (bytes use bytes_get).
+                    if fname == "byte_at" && args.len() == 2 {
+                        let fallback = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "byte_at",
+                        )?;
+                        let inlined =
+                            inline_cstring_byte_at(&mut builder, args[0], args[1], fallback);
+                        regs.insert(reg, inlined);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        struct_regs.remove(&reg);
+                        continue;
+                    }
+                    if fname == "string_len" && args.len() == 1 {
+                        let fallback = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "string_len",
+                        )?;
+                        let inlined = inline_cstring_len(&mut builder, args[0], fallback);
                         regs.insert(reg, inlined);
                         string_regs.remove(&reg);
                         bytes_regs.remove(&reg);

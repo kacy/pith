@@ -51,7 +51,9 @@ fn csv_trim_end(data: Bytes, start: Int, end: Int) -> Int:
 fn csv_field_from_bytes(data: Bytes, start: Int, end: Int) -> String:
     trimmed_start := csv_trim_start(data, start, end)
     trimmed_end := csv_trim_end(data, trimmed_start, end)
-    return data.slice(trimmed_start, trimmed_end).to_string_utf8() catch ""
+    # decode the range directly instead of slice().to_string_utf8(), which
+    # allocates a throwaway byte-slice handle per field.
+    return bytes.substring_utf8(data, trimmed_start, trimmed_end) catch ""
 
 fn csv_line_has_content(data: Bytes, start: Int, end: Int) -> Bool:
     return csv_trim_start(data, start, end) < csv_trim_end(data, start, end)
@@ -94,7 +96,7 @@ fn csv_field_from_quoted_bytes(data: Bytes, start: Int, end: Int) -> String:
                 escaped = true
             scan = scan + 1
         if not escaped:
-            return data.slice(trimmed_start + 1, trimmed_end - 1).to_string_utf8() catch ""
+            return bytes.substring_utf8(data, trimmed_start + 1, trimmed_end - 1) catch ""
     out := bytes.buffer()
     mut field_start := start
     mut quoted := false

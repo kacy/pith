@@ -152,28 +152,31 @@ pub fn path(u: URL) -> String:
 
 # return the length of the path component without allocating a parsed url node.
 pub fn path_len(input: String) -> Int:
+    # cache the length once: each input.len() is an out-of-line call, and this
+    # scanner reads it in every loop condition.
+    n := input.len()
     mut pos := 0
     mut i := 0
-    while i + 2 < input.len():
+    while i + 2 < n:
         if input[i] == ":" and input[i + 1] == "/" and input[i + 2] == "/":
             pos = i + 3
-            i = input.len()
+            i = n
         i = i + 1
 
-    mut host_end := input.len()
+    mut host_end := n
     i = pos
-    while i < input.len() and host_end == input.len():
+    while i < n and host_end == n:
         c := input[i]
         if c == "/" or c == "?" or c == "#":
             host_end = i
         i = i + 1
 
-    if host_end >= input.len() or input[host_end] != "/":
+    if host_end >= n or input[host_end] != "/":
         return 0
 
-    mut path_end := input.len()
+    mut path_end := n
     i = host_end
-    while i < input.len() and path_end == input.len():
+    while i < n and path_end == n:
         c := input[i]
         if c == "?" or c == "#":
             path_end = i

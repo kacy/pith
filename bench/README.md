@@ -283,16 +283,16 @@ latest measured results on this machine, using the median of 5 trials:
 
 | records | go total | rust total | pith total | pith/go | pith/rust |
 |---|---:|---:|---:|---:|---:|
-| `50000` | `316 ms` | `132 ms` | `634 ms` | `2.01x` | `4.80x` |
+| `50000` | `324 ms` | `136 ms` | `482 ms` | `1.49x` | `3.54x` |
 
 phase breakdown from the same run:
 
 | phase | go | rust | pith |
 |---|---:|---:|---:|
 | config | `0 ms` | `0 ms` | `0 ms` |
-| csv write | `190 ms` | `60 ms` | `265 ms` |
-| csv read | `81 ms` | `46 ms` | `5 ms` |
-| transform | `44 ms` | `26 ms` | `347 ms` |
+| csv write | `191 ms` | `60 ms` | `257 ms` |
+| csv read | `87 ms` | `47 ms` | `5 ms` |
+| transform | `48 ms` | `27 ms` | `218 ms` |
 | json | `0 ms` | `0 ms` | `0 ms` |
 | gzip + hash | `1 ms` | `0 ms` | `1 ms` |
 | fs | `0 ms` | `0 ms` | `0 ms` |
@@ -318,9 +318,11 @@ views brought it to about `1230 ms` by avoiding the full `List[List[String]]`
 read path. folding csv rows through the public module API keeps the same
 zero-copy shape and landed around `1200 ms`; string-derive and byte-scanning
 work since (single-allocation string derives, a combined bytes-substring
-decode) took it to about `634 ms`. the remaining gap is mostly csv write
-overhead and transform work that still turns url and path fields into
-strings.
+decode) took it to about `634 ms`. finally, rewriting the url and path
+scanners to compare raw bytes — instead of minting a one-character string
+per position — cut the `transform` phase from `347 ms` to `218 ms` and the
+total to about `482 ms`, dropping the run's cstring allocations from 7.1m to
+2.9m. what's left is mostly csv write overhead.
 
 three caveats matter when reading this benchmark:
 

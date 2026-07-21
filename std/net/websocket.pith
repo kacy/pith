@@ -36,6 +36,16 @@ WS_VERSION := "13"
 DEFAULT_MESSAGE_FRAGMENT_SIZE := 64
 DEFAULT_READ_CHUNK_SIZE := 1024
 MAX_CONTROL_PAYLOAD := 125
+# the largest reassembled message the receiver will buffer. a message may span many
+# continuation fragments (FIN=0); without a ceiling an endless stream of fragments
+# grows the reassembly buffer without bound. on exceed the peer is closed with 1009
+# ("message too big", RFC 6455 §7.4.1) and the read fails. the fragment-count cap
+# stops a flood of tiny or empty fragments that never grows past the byte cap; it is
+# sized to the byte cap at our own minimum fragment size, so it never rejects a
+# message the byte cap would admit.
+MAX_MESSAGE_BYTES := 16777216
+MAX_MESSAGE_FRAGMENTS := 262144
+WS_CLOSE_MESSAGE_TOO_BIG := 1009
 WS_CLOSE_NONE := 0
 WS_CLOSE_TCP := 1
 threadlocal mut next_websocket_handle: Int := 1
@@ -619,11 +629,21 @@ fn handle_control_frame(ws: WebSocket, frame: WebSocketFrame) -> Bool!:
         fail "websocket closed"
     return false
 
+# fail the read when a reassembled message outgrows its caps, closing the peer with
+# 1009 first so it learns why. the reassembly buffer is freed on the way out.
+fn enforce_message_limits(ws: WebSocket, message_buf: ByteBuffer, fragments: Int) -> Int!:
+    if message_buf.len() <= MAX_MESSAGE_BYTES and fragments <= MAX_MESSAGE_FRAGMENTS:
+        return 0
+    message_buf.free()
+    ws.close(WS_CLOSE_MESSAGE_TOO_BIG, "message too big") catch 0
+    fail "websocket message exceeds the maximum size"
+
 fn receive_message(ws: WebSocket) -> WebSocketMessage!:
     if ws.is_closed():
         fail "websocket is closed"
     mut message_opcode := OP_CONTINUATION
     mut message_buf := bytes.buffer()
+    mut fragments := 0
     reader := websocket_reader(ws)
     while true:
         frame := read_frame_buffered(reader)!
@@ -634,6 +654,8 @@ fn receive_message(ws: WebSocket) -> WebSocketMessage!:
             if message_opcode == OP_CONTINUATION:
                 fail "unexpected websocket continuation frame"
             message_buf.write(frame.payload)!
+            fragments = fragments + 1
+            enforce_message_limits(ws, message_buf, fragments)!
             if frame.fin:
                 return WebSocketMessage(message_opcode, message_buf.bytes())
             continue
@@ -643,6 +665,8 @@ fn receive_message(ws: WebSocket) -> WebSocketMessage!:
             return WebSocketMessage(frame.opcode, frame.payload)
         message_opcode = frame.opcode
         message_buf.write(frame.payload)!
+        fragments = fragments + 1
+        enforce_message_limits(ws, message_buf, fragments)!
 fn send_message(ws: WebSocket, opcode: Int, payload: Bytes) -> Int!:
     if payload.len() <= DEFAULT_MESSAGE_FRAGMENT_SIZE:
         return send_frame(ws, opcode, payload, true)
@@ -758,3 +782,26 @@ test "websocket buffered frame reads consume full payloads":
 
     assert(frame.is_text())
     assert_eq(frame.payload_text()!, "chunked")
+
+test "websocket receive rejects a message past the size cap":
+    # a large-fragment message that never sets FIN, pushing the reassembly buffer
+    # past MAX_MESSAGE_BYTES. before the cap this buffers without bound; now the read
+    # aborts and the peer is closed with 1009.
+    mut chunk := bytes.from_string_utf8("a")
+    while chunk.len() < 65536:
+        chunk = bytes.concat(chunk, chunk)
+    chunk = chunk.slice(0, 65535)
+    frames_buf := bytes.buffer()
+    frames_buf.write(frame_bytes_with_fin(OP_BINARY, chunk, false)!)!
+    mut total := chunk.len()
+    while total <= MAX_MESSAGE_BYTES:
+        frames_buf.write(frame_bytes_with_fin(OP_CONTINUATION, chunk, false)!)!
+        total = total + chunk.len()
+    sink := bytes.buffer()
+    # a client-side socket accepts unmasked server frames, so the test frames need no
+    # masking.
+    ws := from_buffered(io.bytes_reader(frames_buf.bytes()).buffered_chunked(4096), sink.buffered(), true)
+    result := ws.recv()
+    assert(result.is_err)
+    # the peer was told the message was too big (a close frame was written).
+    assert(sink.bytes().len() > 0)

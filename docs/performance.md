@@ -11,13 +11,17 @@ the helpers in `bench/` before trusting them on different hardware.
 
 all numbers from one 2-core machine, medians of 5 where quick enough to
 repeat; the tables below were fully rerun 2026-07-15 (after the arc
-reclamation and weak-reference work), and the grpc table again on 2026-07-19
-after the unary-response coalescing. the standout change since the last
-rerun: std_pipeline's peak rss fell to parity with go (239 vs 238 mb,
-was 1.7x), and the cyclic-graph benchmark below shows weak references
-reclaiming reference cycles refcounting alone can't. json struct decode
-stays faster than go's reflection decode — a flat struct of required
-scalars decodes in a single pass, filled straight into the struct.
+reclamation and weak-reference work), the grpc table again on 2026-07-19
+after the unary-response coalescing, and std_pipeline again on 2026-07-21
+after the byte-level scanner work. the standout change in the latest
+rerun: std_pipeline's `transform` phase fell from 347ms to 218ms once the
+url and path scanners stopped minting a one-character string per byte,
+taking the workload from 2.0x go to 1.5x. earlier work had already put
+std_pipeline's peak rss at parity with go (239 vs 238 mb, was 1.7x), and
+the cyclic-graph benchmark below shows weak references reclaiming
+reference cycles refcounting alone can't. json struct decode stays faster
+than go's reflection decode — a flat struct of required scalars decodes
+in a single pass, filled straight into the struct.
 
 the comparators drift a few percent between days; within a table they
 are comparable. go 1.24.4 (net/http, encoding/*); rust either a pinned
@@ -219,18 +223,24 @@ gzip:
 
 | phase | go | rust | pith |
 |---|---|---|---|
-| csv read | 85 | 45 | **5** |
-| csv write | 185 | 59 | 265 |
-| transform | 44 | 26 | 347 |
-| total | 316 | 132 | 634 |
+| csv read | 87 | 47 | **5** |
+| csv write | 191 | 60 | 257 |
+| transform | 48 | 27 | 218 |
+| total | 324 | 136 | 482 |
 
-2.0x go overall (4.1x when this document began), 2026-07-18 rerun.
-`transform` — heavy per-row string building — is the whole gap; pith's
-csv read is the fastest of the three. peak rss at 200k records: go
-238 mb, rust 266 mb, pith 239 mb — now at parity with go and below rust,
-down from 436 mb (1.7x go) earlier and 5.3x go pre-reclaim. the
-reclamation work closed the memory gap entirely on this workload; the
-runtime gap is string-assembly throughput, not allocation.
+1.5x go overall (4.1x when this document began), 2026-07-21 rerun.
+`transform` — per-row field extraction, url and path scanning, and a
+hash — used to be the whole gap at 347ms. it walked each url a character
+at a time with `s[i] == "/"`, and every one of those reads minted a
+one-character heap string just to compare it. rewriting the url and path
+scanners to compare raw bytes — and fixing the compiler to actually emit
+the byte compare it had been silently skipping for character literals —
+cut the phase to 218ms and dropped the run's cstring allocations from
+7.1m to 2.9m. pith's csv read is still the fastest of the three. peak
+rss at 200k records: go 238 mb, rust 266 mb, pith 239 mb — at parity
+with go and below rust, down from 436 mb (1.7x go) earlier and 5.3x go
+pre-reclaim. what remains of the gap is byte-buffer string assembly in
+`csv write`, not per-character allocation.
 
 `bench/event_ledger` — an ndjson event pipeline in four languages
 (pith, go, rust, zig): decode json into structs, aggregate with maps
@@ -332,11 +342,15 @@ in 2.1s every time, and the entire self-hosted compiler in under 7s.
 ## why (measured, not guessed)
 
 - ~~every string derive (`concat`, `substring`, `trim`) copies twice~~ —
-  fixed (single allocation now), but it turned out not to matter for these
-  benchmarks: the runtime perf counters (`PITH_PERF_STATS=1`) show
-  std_pipeline makes **zero** `pith_string_*` allocations. the stdlib builds
-  its string handling on byte buffers and list elements instead, so the
-  transform cost is 2.4m list pushes and 1.1m byte-buffer writes per run.
+  fixed (single allocation now). the runtime perf counters
+  (`PITH_PERF_STATS=1`) show std_pipeline makes **zero** `pith_string_*`
+  allocations (the copy-on-derive string type); the stdlib builds its
+  string handling on byte buffers and list elements instead. the churn that
+  was left hid in a different counter: indexing a string with `s[i]` mints a
+  one-character heap **cstring**, so the url and path scanners allocated one
+  per byte. moving them to byte-level scanning cut the run from 7.1m to 2.9m
+  cstring allocations (the remaining 2.9m are csv field materialization),
+  alongside 2.4m list pushes and 1.1m byte-buffer writes.
 - every list/map access takes a global mutex plus a hashset lookup to
   validate the handle (`cranelift/runtime/src/handle_registry.rs`).
 - lists and maps store non-int elements as one heap allocation per element
@@ -432,6 +446,16 @@ std.os.path helpers):
 eleven times less memory, at ~30% time cost in rc traffic on
 char-heavy paths — the tradeoff favors long-running processes.
 std_pipeline's peak drops 1.45 gb to 0.88 gb.
+
+a later pass (2026-07-21) removed that tradeoff for the common case.
+`s[i] == "/"` and `ord(s[i])` in a scan now read a raw byte instead of
+minting a char at all — so there is no allocation to reclaim and no rc
+traffic to pay — once two long-dead emitter optimizations were fixed to
+actually fire (a single-character literal's stored value carries its
+quotes, and a call argument is wrapped in an `arg` node; both checks were
+looking straight past that). the comparison-heavy url and path scanners
+were rewritten onto it, which is what took std_pipeline's transform from
+347ms to 218ms above.
 
 ### argument temps (landed july 2026)
 

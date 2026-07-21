@@ -90,6 +90,16 @@ RECV_CHUNK := 16384
 MAX_HEADER_LIST_BYTES := 65536
 MAX_HEADER_COUNT := 100
 
+# the compressed HEADERS + CONTINUATION block is bounded while it is read, before
+# it is handed to hpack, so a client cannot stream endless CONTINUATION frames that
+# never set END_HEADERS to grow an unbounded buffer (the CVE-2024-27316 flood). the
+# wire block is normally far smaller than the decoded header list, so a ceiling a
+# little above MAX_HEADER_LIST_BYTES admits any legitimate block while refusing a
+# flood. the frame-count cap independently stops a stream of tiny (or empty)
+# CONTINUATION frames that would loop forever without growing the buffer.
+MAX_HEADER_BLOCK_BYTES := 81920
+MAX_CONTINUATION_FRAMES := 64
+
 # the message assemble_request fails with when a request body outgrows
 # http.MAX_REQUEST_BODY, so handle_stream can answer it with a stream reset rather
 # than dropping the stream silently.
@@ -259,6 +269,7 @@ impl ServerConn:
         out := bytes.buffer()
         out.write(first.block_fragment)!
         mut done := first.end_headers
+        mut continuations := 0
         while not done:
             frame := self.read_frame()!
             if frame.header.frame_type != frames.FRAME_CONTINUATION:
@@ -267,8 +278,15 @@ impl ServerConn:
             if frame.header.stream_id != first.stream_id:
                 out.free()
                 fail "http2: CONTINUATION frame on the wrong stream"
+            continuations = continuations + 1
+            if continuations > MAX_CONTINUATION_FRAMES:
+                out.free()
+                fail "http2: too many CONTINUATION frames in one header block"
             cont := frames.parse_continuation(frame)!
             out.write(cont.block_fragment)!
+            if out.len() > MAX_HEADER_BLOCK_BYTES:
+                out.free()
+                fail "http2: header block exceeds the maximum size"
             done = cont.end_headers
         result := out.bytes()
         out.free()
@@ -1176,6 +1194,36 @@ test "open_stream refuses an over-large header list with RST_STREAM":
     assert_eq(rst.header.frame_type, frames.FRAME_RST_STREAM)
     assert_eq(frames.parse_rst_stream(rst)!.error_code, frames.ERROR_ENHANCE_YOUR_CALM)
     assert_eq(server.active_count(), 0)
+
+test "read_header_block refuses a CONTINUATION flood":
+    # a header block that never sets END_HEADERS, followed by more CONTINUATION
+    # frames than the cap allows. before the frame-count cap this loops forever,
+    # buffering every fragment; now it aborts instead of exhausting memory.
+    flood := bytes.buffer()
+    mut i := 0
+    while i <= MAX_CONTINUATION_FRAMES:
+        flood.write(frames.frame_bytes(frames.continuation_frame(1, bytes.from_string_utf8("x"), false))!)!
+        i = i + 1
+    conn := server_conn_from_bytes(flood.bytes())
+    hf := frames.parse_headers(frames.headers_frame(1, bytes.from_string_utf8("start"), false, false))!
+    result := conn.read_header_block(hf)
+    assert(result.is_err)
+
+test "read_header_block refuses a header block past the byte cap":
+    # a handful of large CONTINUATION fragments push the accumulated block past the
+    # byte ceiling well before the frame-count cap; the read aborts on size.
+    mut big := bytes.from_string_utf8("aaaaaaaa")
+    while big.len() < 16384:
+        big = bytes.concat(big, big)
+    flood := bytes.buffer()
+    mut i := 0
+    while i < 8:
+        flood.write(frames.frame_bytes(frames.continuation_frame(1, big, false))!)!
+        i = i + 1
+    conn := server_conn_from_bytes(flood.bytes())
+    hf := frames.parse_headers(frames.headers_frame(1, bytes.empty(), false, false))!
+    result := conn.read_header_block(hf)
+    assert(result.is_err)
 
 test "assemble_request rejects a request body larger than the limit":
     # a single DATA event just past http.MAX_REQUEST_BODY: the accumulation cap must

@@ -1122,10 +1122,13 @@ fn read_chunked_body(reader: BufferedBytesReader, limit: Int) -> Bytes!:
                 trailer := reader.read_until_bytes_including(nl)!
                 if trailer.is_empty() or chunk_line_is_blank(trailer):
                     return out.take_bytes()
-        out.write(reader.read_exact_bytes(chunk_size)!)!
-        if limit > 0 and out.len() > limit:
+        # check the declared chunk size against the limit BEFORE reading it, so a
+        # bogus chunk-size line (e.g. 7fffffff) cannot trigger a huge pre-allocation
+        # inside read_exact_bytes ahead of the cap check.
+        if limit > 0 and out.len() + chunk_size > limit:
             out.free()
             fail BODY_LIMIT_MESSAGE
+        out.write(reader.read_exact_bytes(chunk_size)!)!
         consume_chunk_line_ending(reader)
 
 fn decode_chunked_body(raw: Bytes) -> Bytes!:
@@ -1181,10 +1184,13 @@ fn read_chunked_body_tls(conn: tls.Conn, limit: Int) -> Bytes!:
                 trailer := read_until_including_from_tls(conn, nl)!
                 if trailer.is_empty() or chunk_line_is_blank(trailer):
                     return out.take_bytes()
-        out.write(read_exact_from_tls(conn, chunk_size)!)!
-        if limit > 0 and out.len() > limit:
+        # check the declared chunk size against the limit BEFORE reading it, so a
+        # bogus chunk-size line cannot trigger a huge pre-allocation inside
+        # read_exact_from_tls ahead of the cap check (mirrors read_chunked_body).
+        if limit > 0 and out.len() + chunk_size > limit:
             out.free()
             fail BODY_LIMIT_MESSAGE
+        out.write(read_exact_from_tls(conn, chunk_size)!)!
         consume_chunk_line_ending_tls(conn)
 
 fn read_response_head_buffered(reader: BufferedBytesReader) -> Bytes!:
@@ -3066,6 +3072,16 @@ test "http decodes chunked request and response bodies":
     raw_resp := "HTTP/1.1 200 OK" + crlf + "Transfer-Encoding: chunked" + crlf + crlf + "4" + crlf + "pong" + crlf + "0" + crlf + crlf
     resp := parse_response(raw_resp)!
     assert_eq(resp.body_text()!, "pong")
+
+test "read_chunked_body rejects an oversized chunk size before allocating":
+    crlf := chr(13) + chr(10)
+    # a tiny request body whose chunk-size line claims ~2 GiB. with a limit the guard
+    # must reject it on the declared size, before read_exact_bytes pre-allocates.
+    raw := "7fffffff" + crlf + "AAAA" + crlf + "0" + crlf + crlf
+    reader := io.bytes_reader(bytes.from_string_utf8(raw)).buffered_chunked(8)
+    result := read_chunked_body(reader, MAX_REQUEST_BODY)
+    assert(result.is_err)
+    assert_eq(result.err, BODY_LIMIT_MESSAGE)
 
 test "http rejects a request head that exceeds the size limit":
     crlf := chr(13) + chr(10)

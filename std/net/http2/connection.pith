@@ -50,6 +50,14 @@ pub SETTINGS_MAX_HEADER_LIST_SIZE := 6
 # the default connection and stream flow-control window (RFC 9113 §6.9.2).
 pub DEFAULT_INITIAL_WINDOW := 65535
 
+# bound a header block while following CONTINUATION frames, so a hostile server
+# cannot stream endless CONTINUATION frames that never set END_HEADERS to grow an
+# unbounded buffer. mirrors the http/2 server's caps: a byte ceiling a little above
+# a typical header list, plus a frame-count cap that stops a flood of tiny or empty
+# CONTINUATION frames.
+MAX_HEADER_BLOCK_BYTES := 81920
+MAX_CONTINUATION_FRAMES := 64
+
 # the hex of the 24-byte client connection preface,
 # "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (RFC 9113 §3.4). encoded as hex so the
 # carriage returns and line feeds are unambiguous in source.
@@ -173,6 +181,7 @@ impl Connection:
         out := bytes.buffer()
         out.write(first.block_fragment)!
         mut done := first.end_headers
+        mut continuations := 0
         while not done:
             frame := self.read_frame()!
             if frame.header.frame_type != frames.FRAME_CONTINUATION:
@@ -181,8 +190,15 @@ impl Connection:
             if frame.header.stream_id != first.stream_id:
                 out.free()
                 fail "http2: CONTINUATION frame on the wrong stream"
+            continuations = continuations + 1
+            if continuations > MAX_CONTINUATION_FRAMES:
+                out.free()
+                fail "http2: too many CONTINUATION frames in one header block"
             cont := frames.parse_continuation(frame)!
             out.write(cont.block_fragment)!
+            if out.len() > MAX_HEADER_BLOCK_BYTES:
+                out.free()
+                fail "http2: header block exceeds the maximum size"
             done = cont.end_headers
         result := out.bytes()
         out.free()

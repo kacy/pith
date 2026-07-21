@@ -11,6 +11,18 @@ fn count_marks(s: String) -> Int:
         i = i + 1
     return n
 
+# escape literals also lower to a byte compare: "\t" decodes to byte 9. this
+# guards the escape-decoding path, which is easy to get wrong because the
+# literal's stored form still carries its quotes and backslash.
+fn count_tabs(s: String) -> Int:
+    mut n := 0
+    mut i := 0
+    while i < s.len():
+        if s[i] == "\t":
+            n = n + 1
+        i = i + 1
+    return n
+
 fn main():
     print(count_marks("a:b:c,d:e").to_string())
     print(count_marks("").to_string())
@@ -21,3 +33,4 @@ fn main():
     ok := s.get(5).unwrap_or("") == "x"
     print(ok.to_string())
     print(ord(s[1]).to_string())
+    print(count_tabs("x\ty\tz\tw").to_string())

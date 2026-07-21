@@ -137,6 +137,11 @@ bootstrap-ir-invariants-only:
 	else \
 		echo "FAIL explicit struct call retkinds"; fail=$$((fail+1)); \
 	fi; \
+	if timeout 15 ./self-host/ir_driver --combined tests/cases/test_byte_compare_scan.pith | awk 'BEGIN { b=0 } /^call [0-9]+ byte_at / { b=1 } END { if (b) exit 0; exit 1 }'; then \
+		pass=$$((pass+1)); echo "ok   single-char comparison lowers to byte_at"; \
+	else \
+		echo "FAIL single-char comparison lowers to byte_at"; fail=$$((fail+1)); \
+	fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all combined ir invariant checks passed"

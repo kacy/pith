@@ -28,7 +28,10 @@ import std.sql as sql
 
 # a dsn broken into its parts. `driver` is "postgres" or "mysql"; the rest are
 # the connection coordinates, with a sensible default port and pool size filled
-# in when the url leaves them out.
+# in when the url leaves them out. `pool_size` is the max number of open
+# connections the pool may hold at once — `?pool=N` sets it — and once the pool
+# is at that many, further acquirers wait for one to come back rather than
+# opening more.
 pub struct Dsn:
     pub driver: String
     pub user: String
@@ -38,9 +41,9 @@ pub struct Dsn:
     pub dbname: String
     pub pool_size: Int
 
-# the default number of pooled connections when a url does not set `?pool=N`.
-# small enough to be polite to the server, large enough for a handful of
-# concurrent green tasks; raise it for a busy service.
+# the default max open connections a pool may hold when a url does not set
+# `?pool=N`. small enough to be polite to the server, large enough for a handful
+# of concurrent green tasks; raise it for a busy service.
 pub DEFAULT_POOL_SIZE := 8
 
 # parse a database url into its parts. the shape is

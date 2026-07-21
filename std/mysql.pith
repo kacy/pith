@@ -659,8 +659,19 @@ pub fn close_stmt(conn: Conn, stmt: Stmt) -> Bool!:
 # --- connection pool ---
 
 # a small connection pool: hand out live connections and take them back for
-# reuse, so callers skip the tcp + auth handshake on every query. it keeps up
-# to `max_idle` connections around; extras are closed on release.
+# reuse, so callers skip the tcp + auth handshake on every query.
+#
+# `max_open` is a hard cap on how many connections exist at once. a `slots`
+# channel holds one token per allowed connection; acquire() takes a token and
+# release() returns it, so when every connection is checked out the next
+# acquirer blocks on the channel — yielding under the green scheduler — until
+# one comes back, rather than opening an unbounded number and exhausting the
+# server. an idle connection is reused before a token buys a fresh one, so the
+# pool never holds more than `max_open` connections live at a time.
+#
+# the pool is self-synchronizing: `mu` guards the idle list and `slots` is a
+# channel (already safe across tasks), so many green tasks can share one pool
+# without an outer lock, and the connect/close network i/o stays outside `mu`.
 pub struct Pool:
     mut idle: List[Conn]
     host: String
@@ -668,34 +679,78 @@ pub struct Pool:
     user: String
     password: String
     database: String
-    max_idle: Int
+    max_open: Int
+    mu: Mutex
+    slots: Channel[Bool]
 
-# create a pool that dials the given server, opening connections lazily.
-pub fn pool(host: String, port: Int, user: String, password: String, database: String, max_idle: Int) -> Pool:
-    return Pool(idle: [], host: host, port: port, user: user, password: password, database: database, max_idle: max_idle)
+# create a pool that dials the given server. it opens connections lazily and
+# never holds more than `max_open` connections at once (clamped to at least one).
+pub fn pool(host: String, port: Int, user: String, password: String, database: String, max_open: Int) -> Pool:
+    cap := clamp_open(max_open)
+    slots := Channel[Bool](cap)
+    mut i := 0
+    while i < cap:
+        slots.send(true)
+        i = i + 1
+    return Pool(idle: [], host: host, port: port, user: user, password: password, database: database, max_open: cap, mu: Mutex(), slots: slots)
+
+# a pool must allow at least one connection.
+fn clamp_open(max_open: Int) -> Int:
+    if max_open < 1:
+        return 1
+    return max_open
 
 impl Pool:
-    # take a connection from the pool, opening a fresh one if none are idle.
+    # take a connection from the pool. it first claims a slot — blocking (and
+    # yielding) when all `max_open` connections are checked out — then reuses an
+    # idle connection or, failing that, opens a fresh one outside the lock. on a
+    # failed dial it hands the slot back so the cap does not leak.
     pub fn acquire() -> Conn!:
+        self.slots.recv()
+        self.mu.lock()
         n := self.idle.len()
+        mut reused: Conn? := none
         if n > 0:
-            conn := self.idle[n - 1]
+            reused = self.idle[n - 1]
             self.idle = self.idle.slice(0, n - 1)
-            return conn
-        return connect(self.host, self.port, self.user, self.password, self.database)!
+        self.mu.unlock()
+        if reused != none:
+            return reused?
+        fresh := connect(self.host, self.port, self.user, self.password, self.database)
+        if fresh.is_err:
+            self.slots.send(true)
+            fail fresh.err
+        return fresh.ok
 
-    # return a connection for reuse, or close it if the pool is already full.
+    # return a connection for reuse, or close it if the pool is already full,
+    # then hand its slot back. the idle list is updated before the slot returns,
+    # so an acquirer woken by that slot finds the connection waiting for it and
+    # does not open a redundant one.
     pub fn release(conn: Conn):
-        if self.idle.len() < self.max_idle:
+        self.mu.lock()
+        keep := self.idle.len() < self.max_open
+        if keep:
             self.idle.push(conn)
-        else:
+        self.mu.unlock()
+        if not keep:
             conn.close()
+        self.slots.send(true)
+
+    # close a checked-out connection that must not go back into rotation (it is
+    # out of protocol sync after a failed statement) and hand its slot back. like
+    # release it returns the slot, so a discarded connection never leaks the cap.
+    pub fn discard(conn: Conn):
+        conn.close()
+        self.slots.send(true)
 
     # close every idle connection.
     pub fn close():
-        for conn in self.idle:
-            conn.close()
+        self.mu.lock()
+        idle := self.idle
         self.idle = []
+        self.mu.unlock()
+        for conn in idle:
+            conn.close()
 
 # --- tests (pure logic; no server needed) ---
 

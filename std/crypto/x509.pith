@@ -7,6 +7,7 @@ import std.bits as bits
 import std.bytes as bytes
 import std.encoding as encoding
 import std.crypto.signature as signature
+import std.time as time
 
 TAG_BOOLEAN := 1
 TAG_INTEGER := 2
@@ -391,6 +392,81 @@ impl Certificate:
 fn issuer_matches(cert: Certificate, issuer: Certificate) -> Bool:
     return cert.issuer_common_name != "" and cert.issuer_common_name == issuer.subject_common_name
 
+# read two ascii digits at `start` as an integer.
+fn parse_two_digits(text: String, start: Int) -> Int!:
+    n := parse_int(text.substring(start, start + 2))
+    if n.is_err:
+        fail "invalid der time digits"
+    return n.ok
+
+# days from the unix epoch (1970-01-01) to a civil date, via howard hinnant's
+# well-known algorithm. valid for any proleptic gregorian date; certificate
+# dates are always well inside its range.
+fn days_from_civil(year: Int, month: Int, day: Int) -> Int:
+    mut y := year
+    if month <= 2:
+        y = y - 1
+    era := y / 400
+    year_of_era := y - era * 400
+    # shift so march is month 0, which keeps the leap day at the year's end.
+    mut month_index := month + 9
+    if month > 2:
+        month_index = month - 3
+    day_of_year := (153 * month_index + 2) / 5 + day - 1
+    day_of_era := year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
+    return era * 146097 + day_of_era - 719468
+
+# convert an x.509 validity timestamp to unix epoch milliseconds.
+#
+# rfc 5280 pins both encodings to utc with whole seconds: utctime as
+# yymmddhhmmssz (13 chars) and generalizedtime as yyyymmddhhmmssz (15 chars).
+# we reject anything else rather than risk reading a local time as utc.
+fn der_time_to_epoch_ms(text: String) -> Int!:
+    if not text.ends_with("Z"):
+        fail "der time is not utc"
+    mut year := 0
+    mut idx := 0
+    if text.len() == 13:
+        # utctime two-digit year: rfc 5280 reads >= 50 as 19yy, else 20yy.
+        yy := parse_two_digits(text, 0)!
+        if yy >= 50:
+            year = 1900 + yy
+        else:
+            year = 2000 + yy
+        idx = 2
+    elif text.len() == 15:
+        year = parse_two_digits(text, 0)! * 100 + parse_two_digits(text, 2)!
+        idx = 4
+    else:
+        fail "unsupported der time length"
+    month := parse_two_digits(text, idx)!
+    day := parse_two_digits(text, idx + 2)!
+    hour := parse_two_digits(text, idx + 4)!
+    minute := parse_two_digits(text, idx + 6)!
+    second := parse_two_digits(text, idx + 8)!
+    if month < 1 or month > 12 or day < 1 or day > 31:
+        fail "der time has an invalid date"
+    days := days_from_civil(year, month, day)
+    epoch_seconds := ((days * 24 + hour) * 60 + minute) * 60 + second
+    return epoch_seconds * 1000
+
+# true when `now_ms` falls inside the certificate's validity window. a leaked
+# but expired (or not-yet-valid) certificate must not verify, otherwise an
+# attacker holding an old cert+key for the hostname could impersonate the
+# server indefinitely. an unparseable timestamp fails closed.
+fn validity_contains(cert: Certificate, now_ms: Int) -> Bool:
+    not_before := der_time_to_epoch_ms(cert.not_before)
+    not_after := der_time_to_epoch_ms(cert.not_after)
+    if not_before.is_err or not_after.is_err:
+        return false
+    if now_ms < not_before.ok:
+        return false
+    if now_ms > not_after.ok:
+        return false
+    return true
+
+EXPIRED_REASON := "certificate is expired or not yet valid"
+
 fn verify_signature_for_algorithm(cert: Certificate, issuer: Certificate) -> Bool:
     if cert.signature_algorithm == "1.2.840.113549.1.1.11":
         return signature.verify_rsa_pkcs1_sha256(issuer.subject_public_key, cert.tbs_der, cert.signature)
@@ -437,6 +513,13 @@ fn find_issuer_in_roots(cert: Certificate, roots: List[Certificate]) -> Certific
     fail "issuer not found in trusted roots"
 
 fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificate], hostname_ok: Bool) -> VerificationResult:
+    # one clock read for the whole walk so every certificate is judged against
+    # the same instant.
+    now_ms := time.now()
+    # the leaf must be within its validity window before we trust it, even on
+    # the pinned-certificate fast path below.
+    if not validity_contains(chain[0], now_ms):
+        return VerificationResult(false, hostname_ok, false, false, false, EXPIRED_REASON)
     # a trust anchor byte-identical to the leaf is a pinned certificate:
     # trusting the exact certificate needs no ca bit and no chain walk. this
     # is how self-signed servers (a dev postgres or a database with an
@@ -454,6 +537,9 @@ fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificat
         issuer_from_chain := find_issuer_in_chain(current, chain, next_chain_index)
         if issuer_from_chain.is_ok:
             issuer := issuer_from_chain.ok
+            # an expired intermediate breaks trust just as a bad signature does.
+            if not validity_contains(issuer, now_ms):
+                return VerificationResult(false, hostname_ok, true, false, false, EXPIRED_REASON)
             issuer_ok = true
             root_ca_ok = issuer.is_ca
             signature_verified = verify_signature(current, issuer)
@@ -466,6 +552,9 @@ fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificat
             if root_result.is_err:
                 return VerificationResult(false, hostname_ok, false, false, false, "certificate issuer is not trusted")
             root := root_result.ok
+            # the trust anchor is rejected once it falls outside its window.
+            if not validity_contains(root, now_ms):
+                return VerificationResult(false, hostname_ok, true, false, false, EXPIRED_REASON)
             issuer_ok = true
             root_ca_ok = root.is_ca
             signature_verified = verify_signature(current, root)
@@ -484,6 +573,10 @@ pub fn verify_hostname(cert: Certificate, host: String) -> VerificationResult:
 # this checks hostname, issuer metadata, ca constraints, and certificate signature.
 pub fn preflight_server_certificate(cert: Certificate, trusted_root: Certificate, host: String) -> VerificationResult:
     hostname_ok := matches_hostname(cert, host)
+    # both the leaf and the trust anchor must be inside their validity windows.
+    now_ms := time.now()
+    if not validity_contains(cert, now_ms) or not validity_contains(trusted_root, now_ms):
+        return VerificationResult(false, hostname_ok, false, false, false, EXPIRED_REASON)
     issuer_ok := issuer_matches(cert, trusted_root)
     root_ca_ok := trusted_root.is_ca
     signature_verified := verify_signature(cert, trusted_root)
@@ -609,6 +702,29 @@ test "x509 verifies an rsa sha-384 chain signature":
     assert_eq(leaf.signature_algorithm, "1.2.840.113549.1.1.12")
     assert(verify_signature(leaf, ca))
     assert(not verify_signature(leaf, leaf))
+
+test "x509 der time parses utctime and generalizedtime to epoch millis":
+    # unix epoch expressed as a two-digit utctime year.
+    assert_eq(der_time_to_epoch_ms("700101000000Z")!, 0)
+    # a full generalizedtime; 2020-01-01 00:00:00 utc.
+    assert_eq(der_time_to_epoch_ms("20200101000000Z")!, 1577836800000)
+    # utctime years below 50 resolve into the 2000s, matching generalizedtime.
+    assert_eq(der_time_to_epoch_ms("260721123456Z")!, der_time_to_epoch_ms("20260721123456Z")!)
+    # a timestamp without the mandatory utc marker is rejected, not misread.
+    assert(der_time_to_epoch_ms("20200101000000").is_err)
+
+test "x509 rejects an expired certificate":
+    expired := parse_pem(read_file("tests/live/fixtures/expired-localhost.crt")!)!
+    # the hostname still matches, but the window closed in 2021, so both the
+    # pinned-trust fast path and the preflight must refuse the certificate.
+    pinned := verify_server_chain([expired], [expired], "localhost")
+    preflight := preflight_server_certificate(expired, expired, "localhost")
+
+    assert(expired.matches_hostname("localhost"))
+    assert(not pinned.ok)
+    assert_eq(pinned.reason, EXPIRED_REASON)
+    assert(not preflight.ok)
+    assert_eq(preflight.reason, EXPIRED_REASON)
 
 test "x509 fixture key signs rsa pss messages":
     cert := parse_pem(read_file("tests/live/fixtures/localhost.crt")!)!

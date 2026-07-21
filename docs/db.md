@@ -121,6 +121,72 @@ id an auto_increment column produced — mysql reports it directly; postgres doe
 not, so it is always 0 there. to read a generated id on postgres, add
 `returning id` to the insert and read it with `query`.
 
+## transactions
+
+when a group of statements has to succeed or fail as a unit, open a transaction.
+`begin` pins one connection from the pool and sends `begin`; every statement you
+run on the returned `Tx` uses that same connection. finish with `commit` to keep
+the changes or `rollback` to throw them away — either one returns the connection
+to the pool.
+
+```pith
+t := handle.begin()!
+t.exec("update accounts set balance = balance - $1 where id = $2", ["100", "1"])!
+t.exec("update accounts set balance = balance + $1 where id = $2", ["100", "2"])!
+t.commit()!
+```
+
+the important case is the one where something goes wrong partway through: the
+transaction must roll back so a half-applied change never lands. run the body
+where you can catch a failure, and roll back before propagating it:
+
+```pith
+fn transfer(handle: db.Db, from: String, to: String, cents: String) -> Bool!:
+    t := handle.begin()!
+    moved := move_money(t, from, to, cents)
+    if moved.is_err:
+        t.rollback()
+        fail moved.err
+    t.commit()!
+    return true
+
+# the two writes that must land together; a `!` failure on either one returns an
+# error to `transfer`, which then rolls back.
+fn move_money(t: db.Tx, from: String, to: String, cents: String) -> Bool!:
+    t.exec("update accounts set balance = balance - $1 where id = $2", [cents, from])!
+    t.exec("update accounts set balance = balance + $1 where id = $2", [cents, to])!
+    return true
+```
+
+`rollback` never fails, so it drops straight onto the error path. it is also
+safe after a statement has already failed: such a statement leaves its connection
+out of protocol sync, so `rollback` discards the connection instead of returning
+it to the pool, and a `commit` on that transaction fails rather than pretending
+to succeed.
+
+`Tx` exposes the same `query` and `exec` as `Db`, so typed reads and
+`ExecResult` writes work exactly as they do outside a transaction.
+
+## prepared statements
+
+for a query you run many times with different parameters, prepare it once.
+`prepare` pins a connection and parses the statement on it; each `query` or
+`exec` on the returned `Stmt` binds fresh parameters and reuses that parse.
+`close` frees the statement and returns the connection to the pool.
+
+```pith
+stmt := handle.prepare("select name from users where id = $1")!
+for id in ["1", "2", "3"]:
+    for row in stmt.query([id])!:
+        print(row.text("name"))
+stmt.close()
+```
+
+a `Stmt` holds its connection for its whole lifetime, so close it when you are
+done — a long-lived one keeps a connection out of the pool. reach for a prepared
+statement on a hot path; plain `query`/`exec` already bind parameters safely for
+everything else.
+
 ## pooling and concurrency
 
 pooling is transparent. every `query` and `exec` borrows a connection from the

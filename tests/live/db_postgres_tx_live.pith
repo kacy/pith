@@ -1,0 +1,81 @@
+# live integration tests for std.db.postgres transactions and prepared
+# statements. they need a postgres server on 127.0.0.1:5432 with the pithtest
+# fixtures; when none is reachable each test skips rather than fails, so
+# `pith test` stays green on a machine without one.
+#
+# run with: pith test tests/live/db_postgres_tx_live.pith
+
+import std.db.postgres as db
+import std.sql as sql
+
+# open a pooled handle, or skip when no server answers. the pool connects
+# lazily, so a trivial query is what actually probes the server.
+fn open_or_skip() -> db.Db:
+    attempt := db.open("postgres://pith:pith_pw@127.0.0.1:5432/pithtest")
+    if attempt.is_err:
+        skip_test("no postgres server at 127.0.0.1:5432")
+    handle := attempt.ok
+    probe := handle.query("select 1", [])
+    if probe.is_err:
+        skip_test("no postgres server at 127.0.0.1:5432")
+    return handle
+
+# (re)create the two-account ledger the transaction tests move money between.
+fn seed_accounts(handle: db.Db) -> Bool!:
+    handle.exec("drop table if exists db_tx_pg", [])!
+    handle.exec("create table db_tx_pg (id int primary key, balance int)", [])!
+    handle.exec("insert into db_tx_pg (id, balance) values ($1, $2)", ["1", "100"])!
+    handle.exec("insert into db_tx_pg (id, balance) values ($1, $2)", ["2", "0"])!
+    return true
+
+# the balance of one account.
+fn balance(handle: db.Db, id: String) -> Int!:
+    rows := handle.query("select balance from db_tx_pg where id = $1", [id])!
+    return rows[0].int("balance")
+
+test "a committed transaction moves money between accounts":
+    handle := open_or_skip()
+    seed_accounts(handle)!
+
+    t := handle.begin()!
+    t.exec("update db_tx_pg set balance = balance - $1 where id = $2", ["30", "1"])!
+    t.exec("update db_tx_pg set balance = balance + $1 where id = $2", ["30", "2"])!
+    t.commit()!
+
+    assert_eq(balance(handle, "1")!, 70)
+    assert_eq(balance(handle, "2")!, 30)
+
+    handle.exec("drop table db_tx_pg", [])!
+    handle.close()
+
+test "a failed transaction rolls back and leaves balances unchanged":
+    handle := open_or_skip()
+    seed_accounts(handle)!
+
+    t := handle.begin()!
+    # debit the first account, then run a statement that the server rejects
+    # (a duplicate primary key). the transaction must undo the debit.
+    t.exec("update db_tx_pg set balance = balance - $1 where id = $2", ["50", "1"])!
+    doomed := t.exec("insert into db_tx_pg (id, balance) values ($1, $2)", ["1", "999"])
+    assert(doomed.is_err)
+    t.rollback()
+
+    assert_eq(balance(handle, "1")!, 100)
+    assert_eq(balance(handle, "2")!, 0)
+
+    handle.exec("drop table db_tx_pg", [])!
+    handle.close()
+
+test "a prepared statement runs many times with different params":
+    handle := open_or_skip()
+    seed_accounts(handle)!
+
+    stmt := handle.prepare("select balance from db_tx_pg where id = $1")!
+    first := stmt.query(["1"])!
+    second := stmt.query(["2"])!
+    assert_eq(first[0].int("balance"), 100)
+    assert_eq(second[0].int("balance"), 0)
+    stmt.close()
+
+    handle.exec("drop table db_tx_pg", [])!
+    handle.close()

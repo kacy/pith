@@ -95,6 +95,133 @@ impl Row:
                 return i
         return none
 
+    # --- accessors by column name ---
+    #
+    # these read a column by name and coerce like the index accessors above: an
+    # unknown name or a type mismatch yields the zero value, and the opt_ forms
+    # return none for a null or missing column. names come straight off the
+    # result's column descriptions, so `row.int("id")` reads how the query is
+    # written.
+
+    # the named column as an Int (zero when missing, null, or non-numeric).
+    pub fn int(name: String) -> Int:
+        col := self.column(name)
+        if col == none:
+            return 0
+        return self.as_int(col.value())
+
+    # the named column as a Float (zero when missing, null, or non-numeric).
+    pub fn float(name: String) -> Float:
+        col := self.column(name)
+        if col == none:
+            return 0.0
+        return self.as_real(col.value())
+
+    # the named column as text ("" when missing or not text).
+    pub fn text(name: String) -> String:
+        col := self.column(name)
+        if col == none:
+            return ""
+        return self.as_text(col.value())
+
+    # the named column as a bool. databases hand booleans back as 0/1, so any
+    # nonzero integer reads true; a missing or null column reads false.
+    pub fn bool(name: String) -> Bool:
+        col := self.column(name)
+        if col == none:
+            return false
+        return self.as_int(col.value()) != 0
+
+    # the named column as a byte blob (empty when missing or not a blob).
+    pub fn blob(name: String) -> Bytes:
+        col := self.column(name)
+        if col == none:
+            return bytes.empty()
+        return self.as_blob(col.value())
+
+    # --- accessors by column index ---
+    #
+    # the same coercions, addressed positionally. `int_at(0)` mirrors `as_int(0)`;
+    # the shorter names line up with the by-name and opt_ families.
+
+    # the column at `col` as an Int.
+    pub fn int_at(col: Int) -> Int:
+        return self.as_int(col)
+
+    # the column at `col` as a Float.
+    pub fn float_at(col: Int) -> Float:
+        return self.as_real(col)
+
+    # the column at `col` as text.
+    pub fn text_at(col: Int) -> String:
+        return self.as_text(col)
+
+    # the column at `col` as a bool (any nonzero integer is true).
+    pub fn bool_at(col: Int) -> Bool:
+        return self.as_int(col) != 0
+
+    # the column at `col` as a byte blob.
+    pub fn blob_at(col: Int) -> Bytes:
+        return self.as_blob(col)
+
+    # --- nullable accessors ---
+    #
+    # for columns that may be null: these return none for a null or missing
+    # column and the typed value otherwise, so a nullable column reads as an
+    # Int?, Float?, and so on rather than collapsing to a zero.
+
+    # the named column as an Int?, or none when null or missing.
+    pub fn opt_int(name: String) -> Int?:
+        col := self.column(name)
+        if col == none:
+            return none
+        return self.opt_int_at(col.value())
+
+    # the named column as a Float?, or none when null or missing.
+    pub fn opt_float(name: String) -> Float?:
+        col := self.column(name)
+        if col == none:
+            return none
+        return self.opt_float_at(col.value())
+
+    # the named column as a String?, or none when null or missing.
+    pub fn opt_text(name: String) -> String?:
+        col := self.column(name)
+        if col == none:
+            return none
+        return self.opt_text_at(col.value())
+
+    # the named column as a Bool?, or none when null or missing.
+    pub fn opt_bool(name: String) -> Bool?:
+        col := self.column(name)
+        if col == none:
+            return none
+        return self.opt_bool_at(col.value())
+
+    # the column at `col` as an Int?, or none when null.
+    pub fn opt_int_at(col: Int) -> Int?:
+        if self.is_null(col):
+            return none
+        return self.as_int(col)
+
+    # the column at `col` as a Float?, or none when null.
+    pub fn opt_float_at(col: Int) -> Float?:
+        if self.is_null(col):
+            return none
+        return self.as_real(col)
+
+    # the column at `col` as a String?, or none when null.
+    pub fn opt_text_at(col: Int) -> String?:
+        if self.is_null(col):
+            return none
+        return self.as_text(col)
+
+    # the column at `col` as a Bool?, or none when null.
+    pub fn opt_bool_at(col: Int) -> Bool?:
+        if self.is_null(col):
+            return none
+        return self.as_int(col) != 0
+
 # a driver's result set implements std.iter.Iterator with `type Item = Row`, so
 # it drops straight into `for row in rows:` and `std.iter.to_list(rows)`. (there
 # is no separate Rows interface: pith interfaces don't compose, so a second
@@ -138,3 +265,32 @@ test "scan_one maps the first row or none":
     assert(top != none)
     assert_eq(top.value(), 7)
     assert(empty == none)
+
+test "typed accessors read a column by name":
+    r := row([integer(42), text("ada"), real(9.5), integer(1)], ["id", "name", "score", "active"])
+    assert_eq(r.int("id"), 42)
+    assert_eq(r.text("name"), "ada")
+    assert_eq(r.float("score"), 9.5)
+    assert_eq(r.bool("active"), true)
+
+test "typed accessors read a column by index":
+    r := row([integer(42), text("ada"), integer(0)], ["id", "name", "active"])
+    assert_eq(r.int_at(0), 42)
+    assert_eq(r.text_at(1), "ada")
+    assert_eq(r.bool_at(2), false)
+
+test "a missing column reads as a zero value":
+    r := row([integer(1)], ["id"])
+    assert_eq(r.int("nope"), 0)
+    assert_eq(r.text("nope"), "")
+    assert_eq(r.float("nope"), 0.0)
+    assert_eq(r.bool("nope"), false)
+
+test "opt_ accessors return none for null or missing":
+    r := row([integer(5), null_value()], ["id", "score"])
+    present := r.opt_int("id")
+    assert(present != none)
+    assert_eq(present.value(), 5)
+    assert(r.opt_float("score") == none)
+    assert(r.opt_text("missing") == none)
+    assert(r.opt_int_at(1) == none)

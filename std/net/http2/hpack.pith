@@ -205,14 +205,17 @@ fn read_string(reader: binary.Reader) -> String!:
 # --- dynamic table (RFC 7541 §2.3.2, §4) ---
 
 # a connection's dynamic table: newest entry last, with size accounting.
+# `limit` is the largest size the owner ever advertised; an inbound size-update
+# may shrink or grow `max_size` up to it, but never past it (RFC 7541 §6.3).
 pub struct DynamicTable:
     mut entries: List[HeaderField]
     mut size: Int
     mut max_size: Int
+    limit: Int
 
 # create an empty dynamic table with the given maximum size in octets.
 pub fn new_dynamic_table(max_size: Int) -> DynamicTable:
-    return DynamicTable([], 0, max_size)
+    return DynamicTable([], 0, max_size, max_size)
 
 impl DynamicTable:
     # the current table size in octets.
@@ -375,6 +378,11 @@ impl Decoder:
                 decoded_bytes = decoded_bytes + name.len() + value.len()
             elif bits.band(first, 32) != 0:
                 new_size := read_integer(reader, 5, first)!
+                # a peer must not grow our decoder table past the size we
+                # advertised; an unbounded update would let indexable headers
+                # accumulate without eviction (RFC 7541 §6.3).
+                if new_size > self.table.limit:
+                    fail "hpack: dynamic table size update exceeds advertised limit"
                 self.table.set_max_size(new_size)
             else:
                 name := read_name(self.table, reader, first, 4)!
@@ -561,6 +569,11 @@ test "hpack applies a dynamic table size update from the stream":
     # 0x3f 0xe1 0x1f = dynamic table size update to 4096, then indexed :method GET.
     decoder.decode(encoding.from_hex("3fe11f82")!)!
     assert_eq(decoder.table.max_size, 4096)
+
+test "hpack rejects a size update above the advertised limit":
+    decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
+    # 0x3f 0xe2 0x1f = size update to 4097, one octet past the 4096 we advertised.
+    assert(decoder.decode(encoding.from_hex("3fe21f")!).is_err)
 
 test "hpack rejects an indexed field with index zero":
     decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)

@@ -74,15 +74,22 @@ pub fn parse(input: String) -> URL:
         i = i + 1
     if colon >= 0:
         r_host = input.substring(host_start, colon)
-        # parse port number
+        # parse port number. valid ports are 0-65535; anything larger (or a
+        # value crafted to overflow) is rejected and leaves port unset (-1)
+        # rather than wrapping into a bogus in-range number.
         mut port_val := 0
+        mut port_valid := true
         i = colon + 1
         while i < host_end:
             c := input[i]
             if c >= "0" and c <= "9":
-                port_val = port_val * 10 + (ord(c) - 48)
+                if port_val > 65535:
+                    port_valid = false
+                else:
+                    port_val = port_val * 10 + (ord(c) - 48)
             i = i + 1
-        r_port = port_val
+        if port_valid and port_val <= 65535:
+            r_port = port_val
     if colon < 0:
         r_host = input.substring(host_start, host_end)
     pos = host_end

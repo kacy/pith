@@ -33,9 +33,10 @@
 # the server runs over either transport: cleartext h2c (serve_h2c_connection /
 # listen_h2c) or http/2 over tls with alpn "h2" (serve_h2_tls_connection /
 # listen_h2_tls). the transport is a byte-level swap inside ServerConn; the
-# reader, writer, and per-stream handlers are identical for both. this phase
-# serves bodiless GET requests; request bodies and full flow-control tuning
-# arrive in later phases, but the shape here is built to grow into them.
+# reader, writer, and per-stream handlers are identical for both. requests with
+# bodies and full send/receive flow control are implemented and tested; the
+# request-size limits below bound how much one connection can make the server
+# buffer.
 
 # the codec modules are imported before std.net.http on purpose, for the same
 # loader-ordering reason documented in std.net.http2.connection: importing frames
@@ -75,6 +76,24 @@ STREAM_INBOX_CAP := 64
 
 # how much of the receive buffer to pull from the socket per read.
 RECV_CHUNK := 16384
+
+# request-size limits, enforced before the server buffers or bridges a request, so
+# a hostile client cannot exhaust memory or splice extra headers into the request.
+# these are conservative fixed defaults; a later revision may make them per-server
+# configurable.
+#   * MAX_HEADER_LIST_BYTES caps the total size of a request's decoded header
+#     fields (every name plus value), so a giant HEADERS block — even one that only
+#     balloons after hpack decompression — is refused rather than buffered.
+#   * MAX_HEADER_COUNT caps how many header fields one request may carry.
+# the request body cap is shared with the http/1.1 server (http.MAX_REQUEST_BODY),
+# so both front doors buffer at most the same amount.
+MAX_HEADER_LIST_BYTES := 65536
+MAX_HEADER_COUNT := 100
+
+# the message assemble_request fails with when a request body outgrows
+# http.MAX_REQUEST_BODY, so handle_stream can answer it with a stream reset rather
+# than dropping the stream silently.
+BODY_TOO_LARGE := "http2: request body exceeds the maximum"
 
 # a per-stream send-credit poke: capacity one, since a body sender blocked on the
 # peer's flow-control window only needs to learn "a window grew, re-check it". a
@@ -638,6 +657,7 @@ fn assemble_request(inbox: Channel[StreamEvent]) -> http.HttpRequestBytes!:
     body := bytes.buffer()
     mut fields: List[hpack.HeaderField] := []
     mut got_headers := false
+    mut received := 0
     while true:
         opt := inbox.recv()
         if opt == none:
@@ -656,6 +676,12 @@ fn assemble_request(inbox: Channel[StreamEvent]) -> http.HttpRequestBytes!:
                 body.free()
                 return build_request(fields, data)!
         elif event.is_data():
+            # cap the accumulated body so an endless DATA stream cannot exhaust
+            # memory; the handler answers this with a stream reset.
+            received = received + event.data.len()
+            if received > http.MAX_REQUEST_BODY:
+                body.free()
+                fail BODY_TOO_LARGE
             body.write(event.data)!
             if event.end:
                 data := body.bytes()
@@ -669,7 +695,13 @@ fn assemble_request(inbox: Channel[StreamEvent]) -> http.HttpRequestBytes!:
 fn handle_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
     result := assemble_request(inbox)
     if result.is_err:
-        server.forget(stream_id)
+        # a body that outgrew the size cap gets an explicit stream reset so the
+        # client stops sending; any other failure (the client reset the stream, or
+        # it dropped) just drops the handler.
+        if result.err == BODY_TOO_LARGE:
+            server.reset(stream_id, frames.ERROR_ENHANCE_YOUR_CALM)
+        else:
+            server.forget(stream_id)
         return
     response := server.handler(result.ok)
     # flatten the response to plain header fields here, in the handler task, so no
@@ -709,8 +741,7 @@ fn handle_frame(server: Server, frame: frames.Frame) -> Bool!:
         df := frames.parse_data(frame)!
         server.deliver(df.stream_id, data_event(df.data, df.end_stream))
         # flow control counts the whole frame payload; grant the credit back so a
-        # larger request body keeps flowing (bodies are a later phase, but the
-        # accounting is correct now).
+        # larger request body keeps flowing.
         replenish(server, df.stream_id, frame.header.length, df.end_stream)
         return true
     if t == frames.FRAME_SETTINGS:
@@ -766,12 +797,53 @@ fn apply_peer_settings(server: Server, settings: List[frames.Setting]):
                     server.send_windows.insert(sid, server.send_windows[sid] + delta)
     server.mu.unlock()
 
+# whether a decoded header name or value is free of the octets that MUST NOT
+# appear in an http/2 field: NUL, CR, and LF. bridging such a field into an
+# http/1.1 head would splice new header lines (RFC 9113 §8.2.1 treats a field
+# carrying one as malformed), so a request that contains one is refused before it
+# is ever assembled.
+fn field_text_is_clean(text: String) -> Bool:
+    data := bytes.from_string_utf8(text)
+    mut i := 0
+    while i < data.len():
+        b := data[i]
+        if b == 0 or b == 10 or b == 13:
+            return false
+        i = i + 1
+    return true
+
+fn header_fields_are_clean(fields: List[hpack.HeaderField]) -> Bool:
+    for field in fields:
+        if not field_text_is_clean(field.name) or not field_text_is_clean(field.value):
+            return false
+    return true
+
+# whether a decoded header list stays within the server's size limits, so a giant
+# header block cannot exhaust memory even after hpack decompression.
+fn header_list_within_limits(fields: List[hpack.HeaderField]) -> Bool:
+    if fields.len() > MAX_HEADER_COUNT:
+        return false
+    mut total := 0
+    for field in fields:
+        total = total + field.name.len() + field.value.len()
+    return total <= MAX_HEADER_LIST_BYTES
+
 # open (or feed) a request stream from a decoded HEADERS block. a new odd stream
 # id that passes validation gets an inbox and a handler task; a duplicate id feeds
 # the existing stream (trailers). malformed requests and over-cap streams are
 # refused with RST_STREAM.
 fn open_stream(server: Server, hf: frames.HeadersFrame, fields: List[hpack.HeaderField]):
     stream_id := hf.stream_id
+    # refuse a request whose headers would splice extra lines when bridged to
+    # http/1.1, or whose header list is over-large, before opening or feeding any
+    # stream. the block was already decoded by the caller, so the shared hpack
+    # decoder stays in step even though we drop the request.
+    if not header_fields_are_clean(fields):
+        server.reset(stream_id, frames.ERROR_PROTOCOL_ERROR)
+        return
+    if not header_list_within_limits(fields):
+        server.reset(stream_id, frames.ERROR_ENHANCE_YOUR_CALM)
+        return
     # a header block for a stream we already know is the request trailers.
     server.mu.lock()
     known := server.streams.contains_key(stream_id)
@@ -1060,6 +1132,62 @@ test "open_stream refuses a request missing :path with RST_STREAM":
     rst := frames.read_frame(binary.reader(item.raw), frames.MAX_ALLOWED_FRAME_SIZE)!
     parsed := frames.parse_rst_stream(rst)!
     assert_eq(parsed.error_code, frames.ERROR_PROTOCOL_ERROR)
+
+# --- request-hardening tests ---
+
+test "the header octet check rejects CR, LF, and NUL but passes clean text":
+    assert(field_text_is_clean("text/plain"))
+    assert(not field_text_is_clean("a" + chr(13) + chr(10) + "b"))
+    assert(not field_text_is_clean("a" + chr(10) + "b"))
+    assert(not field_text_is_clean("a" + chr(0) + "b"))
+
+test "open_stream refuses a header value carrying a CRLF injection with RST_STREAM":
+    server := test_server(server_conn_from_bytes(bytes.empty()))
+    # a value that, if concatenated into an http/1.1 head, would splice a new
+    # header line — exactly the request-smuggling vector the guard closes.
+    evil := "keep" + chr(13) + chr(10) + "x-injected: yes"
+    fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field("x-note", evil)]
+    hf := frames.parse_headers(frames.headers_frame(1, encode_block(fields), true, true))!
+    open_stream(server, hf, fields)
+    # rejected with a stream error, and no stream was opened for it.
+    opt := server.outbound.try_recv()
+    assert(opt != none)
+    item := opt.unwrap_or(raw_item(bytes.empty()))
+    rst := frames.read_frame(binary.reader(item.raw), frames.MAX_ALLOWED_FRAME_SIZE)!
+    assert_eq(rst.header.frame_type, frames.FRAME_RST_STREAM)
+    assert_eq(frames.parse_rst_stream(rst)!.error_code, frames.ERROR_PROTOCOL_ERROR)
+    assert_eq(server.active_count(), 0)
+
+test "open_stream refuses an over-large header list with RST_STREAM":
+    server := test_server(server_conn_from_bytes(bytes.empty()))
+    mut fields: List[hpack.HeaderField] := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/")]
+    # push the field count past MAX_HEADER_COUNT so the size guard trips.
+    mut n := 0
+    while n <= MAX_HEADER_COUNT:
+        fields.push(hpack.header_field("x-pad", "v"))
+        n = n + 1
+    assert(not header_list_within_limits(fields))
+    hf := frames.parse_headers(frames.headers_frame(1, encode_block(fields), true, true))!
+    open_stream(server, hf, fields)
+    opt := server.outbound.try_recv()
+    assert(opt != none)
+    item := opt.unwrap_or(raw_item(bytes.empty()))
+    rst := frames.read_frame(binary.reader(item.raw), frames.MAX_ALLOWED_FRAME_SIZE)!
+    assert_eq(rst.header.frame_type, frames.FRAME_RST_STREAM)
+    assert_eq(frames.parse_rst_stream(rst)!.error_code, frames.ERROR_ENHANCE_YOUR_CALM)
+    assert_eq(server.active_count(), 0)
+
+test "assemble_request rejects a request body larger than the limit":
+    # a single DATA event just past http.MAX_REQUEST_BODY: the accumulation cap must
+    # trip before the body is fully buffered.
+    mut block := bytes.from_string_utf8("0123456789abcdef")
+    while block.len() <= http.MAX_REQUEST_BODY:
+        block = bytes.concat(block, block)
+    inbox := Channel[StreamEvent](2)
+    inbox.send(data_event(block, false))
+    result := assemble_request(inbox)
+    assert(result.is_err)
+    assert_eq(result.err, BODY_TOO_LARGE)
 
 # --- send-side flow-control tests ---
 

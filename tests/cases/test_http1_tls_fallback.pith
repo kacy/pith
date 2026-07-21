@@ -1,0 +1,100 @@
+# the http/1.1-over-tls fallback, exercised end to end. a tls listener offers alpn
+# ["h2", "http/1.1"]; a client that negotiates "http/1.1" is served by
+# http.serve_connection_tls — the same fallback std.web's listen_tls uses for a
+# peer that does not speak h2.
+#
+# the point of the test is the two things that path previously got wrong:
+#   * a chunked request body was ignored (read by content-length only), so the
+#     handler saw an empty body and the chunk octets were left in the stream.
+#   * because the fallback is keep-alive, those leftover octets then desynced the
+#     next request on the same connection.
+# so this sends three requests over one kept-alive tls connection — two chunked,
+# one content-length — and asserts every echoed body is exact. a desync would
+# corrupt the second or third response.
+
+import std.net.http2.server as server
+import std.net.http as http
+import std.net.tls as tls
+import std.bytes as bytes
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+# the handler echoes the request body back verbatim, so a correct body assembly
+# shows up as a byte-exact response and a mis-parse shows up as a wrong one.
+fn echo(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.response(200).with_body_bytes(req.body_bytes()).content_type("text/plain")
+
+# find a free loopback port so repeated runs never collide with TIME_WAIT.
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+# serve one accepted tls connection: h2 if the peer negotiated it, otherwise the
+# http/1.1 fallback — exactly the split std.web makes.
+fn serve_one(conn: tls.Conn) -> Int:
+    if conn.negotiated_protocol() == "h2":
+        server.serve_h2_tls_connection(conn, echo)
+    else:
+        http.serve_connection_tls(conn, echo) catch 0
+        conn.close()
+    return 0
+
+# accept exactly one connection and serve it to completion.
+fn run_server(port: Int) -> Int!:
+    config := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["h2", "http/1.1"])
+    listener := tls.listen("127.0.0.1", port, config)!
+    conn := listener.accept()!
+    task := spawn serve_one(conn)
+    await task
+    listener.close()
+    config.close()
+    return 0
+
+# send one raw http/1.1 request over the tls conn and read the framed response.
+fn round_trip(conn: tls.Conn, raw: String) -> http.HttpResponse!:
+    conn.write_all_bytes(bytes.from_string_utf8(raw))!
+    return http.read_response_tls(conn)!
+
+fn main() -> Int!:
+    port := choose_port(18980)!
+    server_task := spawn run_server(port)
+    sleep(200)
+
+    config := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["http/1.1"])
+    conn := tls.dial_with_config("127.0.0.1", port, "localhost", config)!
+    assert(conn.negotiated_protocol() == "http/1.1")
+
+    crlf := chr(13) + chr(10)
+
+    # request 1: a chunked body split across three chunks -> "hello world".
+    chunked_one := "POST /echo HTTP/1.1" + crlf + "Host: localhost" + crlf + "Transfer-Encoding: chunked" + crlf + crlf + "5" + crlf + "hello" + crlf + "1" + crlf + " " + crlf + "5" + crlf + "world" + crlf + "0" + crlf + crlf
+    first := round_trip(conn, chunked_one)!
+    assert(first.status == 200)
+    assert(first.body_text()! == "hello world")
+
+    # request 2: another chunked body on the SAME connection. if the first chunked
+    # body had desynced the stream, this response would be wrong.
+    chunked_two := "POST /echo HTTP/1.1" + crlf + "Host: localhost" + crlf + "Transfer-Encoding: chunked" + crlf + crlf + "6" + crlf + "second" + crlf + "0" + crlf + crlf
+    next := round_trip(conn, chunked_two)!
+    assert(next.status == 200)
+    assert(next.body_text()! == "second")
+
+    # request 3: a plain content-length body, to prove the two framings interleave
+    # cleanly on one kept-alive connection.
+    sized := "POST /echo HTTP/1.1" + crlf + "Host: localhost" + crlf + "Content-Length: 5" + crlf + crlf + "third"
+    last := round_trip(conn, sized)!
+    assert(last.status == 200)
+    assert(last.body_text()! == "third")
+
+    conn.close()
+    await server_task
+    print("http/1.1-over-tls fallback: chunked and sized bodies correct across a keep-alive connection")
+    return 0

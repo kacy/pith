@@ -44,6 +44,26 @@ pub MIME_WEBP := "image/webp"
 pub MIME_WASM := "application/wasm"
 pub MIME_BINARY := "application/octet-stream"
 HTTP_FILE_STREAM_CHUNK_SIZE := 4096
+
+# request-size limits for the http/1.1 server paths (plaintext and tls). they
+# bound how much one request can make the server buffer, so a client cannot
+# exhaust memory with an endless head (slowloris) or a declared-enormous body
+# (a content-length DoS). these are conservative fixed defaults; a later revision
+# may make them per-server configurable.
+#   * MAX_HEADER_BYTES caps the request head — the request line plus header fields.
+#   * MAX_REQUEST_BODY caps the request body, whether it is declared by
+#     content-length or streamed as chunked. shared with the http/2 server so both
+#     front doors buffer at most the same amount.
+pub MAX_HEADER_BYTES := 65536
+pub MAX_REQUEST_BODY := 10485760
+
+# the messages the head and body readers fail with when a limit is exceeded. the
+# serve loops match on them to answer with the right status (431 / 413) and then
+# close the connection, so a rejected request never leaves unread body bytes to be
+# mis-parsed as the next request on a keep-alive connection.
+HEADER_LIMIT_MESSAGE := "http: request header fields exceed the maximum"
+BODY_LIMIT_MESSAGE := "http: request body exceeds the maximum"
+
 HTTP_RESPONSE_BODY_NONE := 0
 HTTP_RESPONSE_BODY_EXACT := 1
 HTTP_RESPONSE_BODY_CHUNKED := 2
@@ -1086,7 +1106,10 @@ fn consume_chunk_line_ending(reader: BufferedBytesReader):
     if ending[0] == 13:
         reader.read_exact_bytes(1) catch bytes.empty()
 
-fn read_chunked_body(reader: BufferedBytesReader) -> Bytes!:
+# decode a chunked body from a buffered reader. `limit` caps the decoded size
+# (0 means no cap): the request server passes MAX_REQUEST_BODY so a chunked upload
+# is bounded like a content-length one, while the client response path passes 0.
+fn read_chunked_body(reader: BufferedBytesReader, limit: Int) -> Bytes!:
     nl := bytes.from_string_utf8(chr(10))
     out := bytes.buffer()
     while true:
@@ -1100,10 +1123,13 @@ fn read_chunked_body(reader: BufferedBytesReader) -> Bytes!:
                 if trailer.is_empty() or chunk_line_is_blank(trailer):
                     return out.take_bytes()
         out.write(reader.read_exact_bytes(chunk_size)!)!
+        if limit > 0 and out.len() > limit:
+            out.free()
+            fail BODY_LIMIT_MESSAGE
         consume_chunk_line_ending(reader)
 
 fn decode_chunked_body(raw: Bytes) -> Bytes!:
-    return read_chunked_body(io.bytes_reader(raw).buffered_chunked(64))!
+    return read_chunked_body(io.bytes_reader(raw).buffered_chunked(64), 0)!
 
 fn read_exact_from_tls(conn: tls.Conn, count: Int) -> Bytes!:
     if count <= 0:
@@ -1139,7 +1165,10 @@ fn consume_chunk_line_ending_tls(conn: tls.Conn):
     if ending[0] == 13:
         read_exact_from_tls(conn, 1) catch bytes.empty()
 
-fn read_chunked_body_tls(conn: tls.Conn) -> Bytes!:
+# decode a chunked body from a tls conn. `limit` caps the decoded size (0 means no
+# cap), mirroring read_chunked_body: the request fallback passes MAX_REQUEST_BODY,
+# the client response path passes 0.
+fn read_chunked_body_tls(conn: tls.Conn, limit: Int) -> Bytes!:
     nl := bytes.from_string_utf8(chr(10))
     out := bytes.buffer()
     while true:
@@ -1153,6 +1182,9 @@ fn read_chunked_body_tls(conn: tls.Conn) -> Bytes!:
                 if trailer.is_empty() or chunk_line_is_blank(trailer):
                     return out.take_bytes()
         out.write(read_exact_from_tls(conn, chunk_size)!)!
+        if limit > 0 and out.len() > limit:
+            out.free()
+            fail BODY_LIMIT_MESSAGE
         consume_chunk_line_ending_tls(conn)
 
 fn read_response_head_buffered(reader: BufferedBytesReader) -> Bytes!:
@@ -1229,7 +1261,7 @@ fn streamed_response_from_head(head: Bytes, body_size: Int) -> StreamedHttpRespo
 fn read_response_body_buffered(head: Bytes, reader: BufferedBytesReader) -> Bytes!:
     plan := response_body_plan(head)!
     if plan.kind == HTTP_RESPONSE_BODY_CHUNKED:
-        return read_chunked_body(reader)!
+        return read_chunked_body(reader, 0)!
     if plan.kind == HTTP_RESPONSE_BODY_EXACT:
         return reader.read_exact_bytes(plan.content_length)!
     if plan.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
@@ -1239,7 +1271,7 @@ fn read_response_body_buffered(head: Bytes, reader: BufferedBytesReader) -> Byte
 fn read_response_body_tls(head: Bytes, conn: tls.Conn) -> Bytes!:
     plan := response_body_plan(head)!
     if plan.kind == HTTP_RESPONSE_BODY_CHUNKED:
-        return read_chunked_body_tls(conn)!
+        return read_chunked_body_tls(conn, 0)!
     if plan.kind == HTTP_RESPONSE_BODY_EXACT:
         return read_exact_from_tls(conn, plan.content_length)!
     if plan.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
@@ -1441,6 +1473,12 @@ fn status_line(status: Int) -> String:
         return "HTTP/1.1 404 Not Found" + crlf
     if status == 405:
         return "HTTP/1.1 405 Method Not Allowed" + crlf
+    if status == 411:
+        return "HTTP/1.1 411 Length Required" + crlf
+    if status == 413:
+        return "HTTP/1.1 413 Payload Too Large" + crlf
+    if status == 431:
+        return "HTTP/1.1 431 Request Header Fields Too Large" + crlf
     if status == 500:
         return "HTTP/1.1 500 Internal Server Error" + crlf
     # uncommon status
@@ -1713,6 +1751,15 @@ pub fn redirect(url: String) -> String:
 # ===============================================================
 # Server Helpers
 # ===============================================================
+
+# the response for an over-large request head: 431, connection closed.
+fn header_too_large_response() -> HttpResponse:
+    return text(431, "Request Header Fields Too Large").close_connection()
+
+# the response for an over-large request body: 413, connection closed.
+fn payload_too_large_response() -> HttpResponse:
+    return text(413, "Payload Too Large").close_connection()
+
 fn request_connection_value(req: HttpRequestBytes) -> String:
     return req.header_or("Connection", "").to_lower()
 
@@ -1773,6 +1820,11 @@ fn read_request_head_buffered_bytes(reader: BufferedBytesReader) -> Bytes!:
                 return bytes.empty()
             return buf.take_bytes()
         buf.write(chunk)!
+        # refuse a head that grows past the limit rather than buffering it forever
+        # (an endless head is a slowloris / memory-exhaustion vector).
+        if buf.len() > MAX_HEADER_BYTES:
+            buf.free()
+            fail HEADER_LIMIT_MESSAGE
         w1 = w2
         w2 = w3
         w3 = w4
@@ -1792,8 +1844,12 @@ fn read_request_from_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestB
     if head_bytes.is_empty():
         return build_http_request(bytes.empty(), bytes.empty())
     if uses_chunked_transfer_encoding(head_bytes):
-        return build_http_request(head_bytes, read_chunked_body(reader)!)
+        return build_http_request(head_bytes, read_chunked_body(reader, MAX_REQUEST_BODY)!)
     content_length := content_length_from_head_bytes(head_bytes)!
+    # reject an over-large declared length before allocating for it, so a hostile
+    # "Content-Length: 10000000000" cannot force a giant up-front allocation.
+    if content_length > MAX_REQUEST_BODY:
+        fail BODY_LIMIT_MESSAGE
     body_buf := bytes.buffer_with_capacity(content_length)
     while body_buf.len() < content_length:
         remaining := content_length - body_buf.len()
@@ -1812,9 +1868,16 @@ fn read_request_from_buffered_string(reader: BufferedStringReader) -> HttpReques
     mut line := reader.read_line()!
     while line.len() > 0:
         raw.write(bytes.from_string_utf8(line + crlf))!
+        # bound the head here too, so this legacy path shares the same limit.
+        if raw.len() > MAX_HEADER_BYTES:
+            raw.free()
+            fail HEADER_LIMIT_MESSAGE
         line = reader.read_line()!
     raw.write(bytes.from_string_utf8(crlf))!
     content_length := content_length_from_head_bytes(raw.bytes())!
+    if content_length > MAX_REQUEST_BODY:
+        raw.free()
+        fail BODY_LIMIT_MESSAGE
     if content_length > 0:
         raw.write(bytes.from_string_utf8(reader.read(content_length)!))!
     body_start := find_request_head_end(raw.bytes())
@@ -2765,7 +2828,18 @@ pub fn serve_one(reader: BufferedBytesReader, writer: BufferedBytesWriter, handl
 pub fn serve_connection(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
     mut total := 0
     while true:
-        req := read_request_buffered_bytes(reader)!
+        req_result := read_request_buffered_bytes(reader)
+        if req_result.is_err:
+            # a size-limit violation gets the right status and then closes; any
+            # other read failure (a dropped socket, malformed framing) just ends
+            # the connection. either way we stop reading, so nothing desyncs.
+            message := req_result.err
+            if message == HEADER_LIMIT_MESSAGE:
+                total = total + send_buffered(writer, header_too_large_response())!
+            elif message == BODY_LIMIT_MESSAGE:
+                total = total + send_buffered(writer, payload_too_large_response())!
+            return total
+        req := req_result.ok
         if req.head.is_empty() and req.method_text == "":
             return total
         resp := response_for_connection(req, handler(req))
@@ -2807,6 +2881,11 @@ fn read_request_head_tls(conn: tls.Conn) -> Bytes!:
                 return bytes.empty()
             return buf.take_bytes()
         buf.write(chunk)!
+        # refuse a head that grows past the limit, exactly as the plaintext reader
+        # does, so the tls fallback bounds an endless head too.
+        if buf.len() > MAX_HEADER_BYTES:
+            buf.free()
+            fail HEADER_LIMIT_MESSAGE
         w1 = w2
         w2 = w3
         w3 = w4
@@ -2815,14 +2894,23 @@ fn read_request_head_tls(conn: tls.Conn) -> Bytes!:
             return buf.take_bytes()
     return bytes.empty()
 
-# read one http/1.1 request off a tls conn: the head, then a content-length body.
-# an empty head means the peer closed with nothing pending, which ends the loop
-# in serve_connection_tls.
+# read one http/1.1 request off a tls conn: the head, then the body. a chunked
+# body is decoded with the tls chunked reader (the same logic the plaintext path
+# uses), and a content-length body is read exactly; either way the stream is left
+# positioned at the next request, so the keep-alive loop in serve_connection_tls
+# does not desync. an empty head means the peer closed with nothing pending, which
+# ends that loop.
 fn read_request_from_tls(conn: tls.Conn) -> HttpRequestBytes!:
     head_bytes := read_request_head_tls(conn)!
     if head_bytes.is_empty():
         return build_http_request(bytes.empty(), bytes.empty())
+    if uses_chunked_transfer_encoding(head_bytes):
+        return build_http_request(head_bytes, read_chunked_body_tls(conn, MAX_REQUEST_BODY)!)
     content_length := content_length_from_head_bytes(head_bytes)!
+    # reject an over-large declared length before allocating for it, matching the
+    # plaintext path.
+    if content_length > MAX_REQUEST_BODY:
+        fail BODY_LIMIT_MESSAGE
     body_buf := bytes.buffer_with_capacity(content_length)
     while body_buf.len() < content_length:
         remaining := content_length - body_buf.len()
@@ -2841,7 +2929,17 @@ fn read_request_from_tls(conn: tls.Conn) -> HttpRequestBytes!:
 pub fn serve_connection_tls(conn: tls.Conn, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
     mut total := 0
     while true:
-        req := read_request_from_tls(conn)!
+        req_result := read_request_from_tls(conn)
+        if req_result.is_err:
+            # answer a size-limit violation with the right status, then close; any
+            # other read failure just ends the connection. mirrors serve_connection.
+            message := req_result.err
+            if message == HEADER_LIMIT_MESSAGE:
+                total = total + conn.write_all_bytes(header_too_large_response().to_bytes()!)!
+            elif message == BODY_LIMIT_MESSAGE:
+                total = total + conn.write_all_bytes(payload_too_large_response().to_bytes()!)!
+            return total
+        req := req_result.ok
         if req.head.is_empty() and req.method_text == "":
             return total
         resp := response_for_connection(req, handler(req))
@@ -2968,6 +3066,34 @@ test "http decodes chunked request and response bodies":
     raw_resp := "HTTP/1.1 200 OK" + crlf + "Transfer-Encoding: chunked" + crlf + crlf + "4" + crlf + "pong" + crlf + "0" + crlf + crlf
     resp := parse_response(raw_resp)!
     assert_eq(resp.body_text()!, "pong")
+
+test "http rejects a request head that exceeds the size limit":
+    crlf := chr(13) + chr(10)
+    # a single header value long enough to push the head past MAX_HEADER_BYTES.
+    mut big := "x"
+    while big.len() < MAX_HEADER_BYTES + 16:
+        big = big + big
+    raw := "GET / HTTP/1.1" + crlf + "X-Big: " + big + crlf + crlf
+    result := read_request_buffered_bytes(io.bytes_reader(bytes.from_string_utf8(raw)).buffered_chunked(64))
+    assert(result.is_err)
+    assert_eq(result.err, HEADER_LIMIT_MESSAGE)
+
+test "http rejects an over-large content-length before allocating for it":
+    crlf := chr(13) + chr(10)
+    # the body never arrives; the declared length alone must be refused, so a
+    # hostile "Content-Length: 10000000000" cannot force a giant allocation.
+    raw := "POST / HTTP/1.1" + crlf + "Host: example.test" + crlf + "Content-Length: 10000000000" + crlf + crlf
+    result := read_request_buffered_bytes(io.bytes_reader(bytes.from_string_utf8(raw)).buffered_chunked(64))
+    assert(result.is_err)
+    assert_eq(result.err, BODY_LIMIT_MESSAGE)
+
+test "http maps size-limit failures to 431 and 413 responses that close the connection":
+    header_response := header_too_large_response()
+    assert_eq(header_response.status_code(), 431)
+    assert_eq(header_response.header_value("Connection").to_lower(), "close")
+    body_response := payload_too_large_response()
+    assert_eq(body_response.status_code(), 413)
+    assert_eq(body_response.header_value("Connection").to_lower(), "close")
 
 test "http streams chunked request bodies into writers":
     crlf := chr(13) + chr(10)

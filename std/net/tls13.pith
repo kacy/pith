@@ -21,6 +21,10 @@ CONTENT_APPLICATION_DATA := 23
 TLS_LEGACY_VERSION := 771
 TLS13_VERSION := 772
 MAX_PLAINTEXT_RECORD := 16384
+# rfc 8446 §5.2 caps a tlsciphertext at 2^14 + 256 bytes: the plaintext limit
+# plus room for the content type byte and aead expansion. anything larger is a
+# malformed (or hostile) record and is rejected before it is buffered.
+pub MAX_CIPHERTEXT_RECORD := 16640
 HANDSHAKE_CLIENT_HELLO := 1
 HANDSHAKE_SERVER_HELLO := 2
 HANDSHAKE_NEW_SESSION_TICKET := 4
@@ -488,6 +492,8 @@ pub fn decode_record(data: Bytes) -> Record!:
     content_type := checked_read(binary.read_u8_at(data, 0))!
     version := checked_read(binary.read_u16_be_at(data, 1))!
     length := checked_read(binary.read_u16_be_at(data, 3))!
+    if length > MAX_CIPHERTEXT_RECORD:
+        fail tls13_fail("tls record overflow")
     if data.len() < 5 + length:
         fail tls13_fail("truncated tls record payload")
     return Record(content_type, version, data.slice(5, 5 + length))
@@ -1264,6 +1270,16 @@ test "tls13 offers a second p-256 key share when given one":
 test "tls13 rejects malformed records":
     assert(encode_record(99, bytes.empty()).is_err)
     assert(decode_record(bytes.from_string_utf8(chr(CONTENT_HANDSHAKE))).is_err)
+
+test "tls13 rejects an oversized record before buffering it":
+    # a header claiming 2^14 + 257 payload bytes exceeds the rfc 8446 ciphertext
+    # cap and must be refused on the length alone, before any body is read.
+    oversized := MAX_CIPHERTEXT_RECORD + 1
+    header := bytes.buffer_with_capacity(5)
+    write_u8(header, CONTENT_APPLICATION_DATA)!
+    write_u16_be(header, TLS_LEGACY_VERSION)!
+    write_u16_be(header, oversized)!
+    assert(decode_record(header.bytes()).is_err)
     assert(decode_handshakes(bytes.from_string_utf8(chr(1) + chr(0))).is_err)
     assert(encode_client_hello("", bytes.empty(), bytes.empty(), bytes.empty()).is_err)
 

@@ -337,6 +337,10 @@ fn native_read_record(stream: TcpStream) -> tls13.Record!:
     if header.len() != 5:
         fail "truncated tls record header"
     length := checked_read(binary.read_u16_be_at(header, 3))!
+    # bound the record before reading its body so a hostile peer cannot make us
+    # buffer up to 64 kib per record (rfc 8446 §5.2 caps ciphertext at 2^14+256).
+    if length > tls13.MAX_CIPHERTEXT_RECORD:
+        fail "tls record overflow"
     payload := stream.read_exact_bytes(length)!
     if payload.len() != length:
         fail "truncated tls record payload"

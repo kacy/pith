@@ -34,6 +34,16 @@ ENTRY_OVERHEAD := 32
 # the number of entries in the static table.
 STATIC_TABLE_LEN := 61
 
+# a decompression-bomb backstop for the decoder. hpack lets a small block of indexed
+# references expand into a much larger header list — a ~4 KB dynamic-table entry
+# referenced a thousand times materializes megabytes — so the decoder tracks the
+# running decoded size and field count and fails the moment either budget is
+# crossed, before the whole list exists. these are deliberately generous absolute
+# ceilings, well above any legitimate header list; a server layers its own stricter
+# policy limit on top (see the http/2 server's MAX_HEADER_LIST_BYTES).
+DECODE_MAX_HEADER_BYTES := 1048576
+DECODE_MAX_HEADER_COUNT := 10000
+
 # the fixed static table, cached after first use.
 mut static_cache: List[HeaderField] := []
 mut static_ready := false
@@ -331,22 +341,38 @@ fn read_name(table: DynamicTable, reader: binary.Reader, first: Int, prefix_bits
 
 impl Decoder:
     # decode a complete header block into its header list, updating the
-    # dynamic table as indexed and size-update instructions are processed.
+    # dynamic table as indexed and size-update instructions are processed. the
+    # decoded output is bounded by a generous absolute backstop so a decompression
+    # bomb is refused mid-decode; callers that need a tighter budget use
+    # decode_bounded directly.
     fn decode(block: Bytes) -> List[HeaderField]!:
+        return self.decode_bounded(block, DECODE_MAX_HEADER_BYTES, DECODE_MAX_HEADER_COUNT)!
+
+    # decode a header block while bounding its decoded output. `max_bytes` caps the
+    # total name+value octets and `max_fields` the field count; the decoder fails as
+    # soon as either is crossed, so a bomb is stopped before the full list is built
+    # rather than checked after. the dynamic table is still updated for the fields
+    # processed before an abort, but a caller that hits the bound tears the
+    # connection down, so table state past that point does not matter.
+    fn decode_bounded(block: Bytes, max_bytes: Int, max_fields: Int) -> List[HeaderField]!:
         reader := binary.reader(block)
         mut out: List[HeaderField] := []
+        mut decoded_bytes := 0
         while binary.remaining(reader) > 0:
             first := read_u8(reader)!
             if bits.band(first, 128) != 0:
                 index := read_integer(reader, 7, first)!
                 if index == 0:
                     fail "hpack indexed field with index 0"
-                out.push(self.table.get_field(index)!)
+                indexed := self.table.get_field(index)!
+                out.push(indexed)
+                decoded_bytes = decoded_bytes + indexed.name.len() + indexed.value.len()
             elif bits.band(first, 64) != 0:
                 name := read_name(self.table, reader, first, 6)!
                 value := read_string(reader)!
                 out.push(HeaderField(name, value))
                 self.table.add(name, value)
+                decoded_bytes = decoded_bytes + name.len() + value.len()
             elif bits.band(first, 32) != 0:
                 new_size := read_integer(reader, 5, first)!
                 self.table.set_max_size(new_size)
@@ -354,6 +380,10 @@ impl Decoder:
                 name := read_name(self.table, reader, first, 4)!
                 value := read_string(reader)!
                 out.push(HeaderField(name, value))
+                decoded_bytes = decoded_bytes + name.len() + value.len()
+            # bound the decoded output as it grows, so a bomb is refused mid-decode.
+            if out.len() > max_fields or decoded_bytes > max_bytes:
+                fail "hpack: decoded header list exceeds the budget"
         return out
 
 # --- tests ---
@@ -434,6 +464,26 @@ test "hpack decodes RFC 7541 C.2.4 indexed field":
     assert_eq(headers.len(), 1)
     assert_eq(headers[0].name, ":method")
     assert_eq(headers[0].value, "GET")
+
+test "hpack decode refuses a decompression bomb":
+    decoder := new_decoder(DEFAULT_HEADER_TABLE_SIZE)
+    # seed one ~2 KB dynamic-table entry, then flood the block with 1-byte indexed
+    # references to it. the tiny block would materialize well over a megabyte, so the
+    # running budget must abort the decode before the full list is built.
+    mut big := "aaaaaaaa"
+    while big.len() < 2048:
+        big = big + big
+    block := bytes.buffer()
+    write_integer(block, 0, 6, 64)   # literal with incremental indexing, new name
+    write_string(block, "x", false)
+    write_string(block, big, false)  # a ~2 KB value stored at dynamic index 62
+    mut i := 0
+    while i < 600:
+        block.write_byte(bits.bor(128, 62)) catch 0
+        i = i + 1
+    result := decoder.decode(block.bytes())
+    block.free()
+    assert(result.is_err)
 
 test "hpack encodes RFC 7541 C.3.1 and C.3.2 request bytes":
     encoder := new_encoder(DEFAULT_HEADER_TABLE_SIZE, false)

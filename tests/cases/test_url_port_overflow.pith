@@ -1,0 +1,19 @@
+import std.net.url as url
+
+# an out-of-range or overflowing port must be rejected (reported as -1, the
+# "no valid port" sentinel) instead of silently wrapping into a bogus in-range
+# number that could slip past a downstream check.
+
+fn main() -> Int!:
+    valid := url.parse("http://example.com:8080/path")
+    print("valid_port:{url.port(valid)}")
+
+    too_large := url.parse("http://example.com:70000/path")
+    print("too_large_port:{url.port(too_large)}")
+
+    overflow := url.parse("http://example.com:99999999999999999999999/path")
+    print("overflow_port:{url.port(overflow)}")
+
+    unspecified := url.parse("http://example.com/path")
+    print("no_port:{url.port(unspecified)}")
+    return 0

@@ -75,6 +75,10 @@ fn csv_parse_int_bytes(data: Bytes, start: Int, end: Int) -> Int:
         digit := data[pos]
         if digit < 48 or digit > 57:
             return 0
+        # guard against overflow so a huge field can't silently wrap into a
+        # small number and slip past a downstream range check
+        if value > 922337203685477580 / 10:
+            return 0
         value = value * 10 + (digit - 48)
         pos = pos + 1
     return value * sign

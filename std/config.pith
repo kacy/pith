@@ -21,6 +21,11 @@ struct ConfigStringScan:
     value: String
     position: Int
 
+# maximum nesting depth for the recursive flatteners. deep enough for any real
+# config, shallow enough that a hostile deeply-nested document can't overflow
+# the native stack (which would crash the process, not raise a catchable error).
+CONFIG_MAX_DEPTH := 128
+
 fn config_fail(message: String) -> ConfigError:
     return ConfigError(message)
 
@@ -85,13 +90,15 @@ fn config_flatten_toml_text(out: Map[String, String], text: String):
             i = i + 1
         config_store_toml_scalar(out, config_join_key(section, key), raw_value)
 
-fn config_flatten_toml_table(out: Map[String, String], prefix: String, handle: Int):
+fn config_flatten_toml_table(out: Map[String, String], prefix: String, handle: Int, depth: Int):
+    if depth > CONFIG_MAX_DEPTH:
+        return
     for key in toml.keys(handle):
         child_key := config_join_key(prefix, key)
         child := toml.get_value(handle, key)
         kind := toml.type_of(child)
         if kind == "table":
-            config_flatten_toml_table(out, child_key, child)
+            config_flatten_toml_table(out, child_key, child, depth + 1)
         elif kind == "string":
             config_set_scalar(out, child_key, toml.get_string(handle, key))
         elif kind == "int":
@@ -157,12 +164,12 @@ fn config_json_skip_array(input: String, position: Int) -> Int:
         pos = pos + 1
     return pos
 
-fn config_json_flatten_value(input: String, position: Int, key: String, out: Map[String, String]) -> Int:
+fn config_json_flatten_value(input: String, position: Int, key: String, out: Map[String, String], depth: Int) -> Int:
     mut pos := config_json_skip_ws(input, position)
     if pos >= input.len():
         return pos
     if input[pos] == chr(123):
-        return config_json_flatten_object(input, pos, key, out)
+        return config_json_flatten_object(input, pos, key, out, depth)
     if input[pos] == "[":
         return config_json_skip_array(input, pos)
     if input[pos] == chr(34):
@@ -184,7 +191,11 @@ fn config_json_flatten_value(input: String, position: Int, key: String, out: Map
         config_set_scalar(out, key, input.substring(start, pos))
     return pos
 
-fn config_json_flatten_object(input: String, position: Int, prefix: String, out: Map[String, String]) -> Int:
+fn config_json_flatten_object(input: String, position: Int, prefix: String, out: Map[String, String], depth: Int) -> Int:
+    # over-deep nesting bails out cleanly instead of recursing into a stack
+    # overflow. returning the end position stops the caller's scan.
+    if depth > CONFIG_MAX_DEPTH:
+        return input.len()
     mut pos := config_json_skip_ws(input, position)
     if pos >= input.len() or input[pos] != chr(123):
         return pos
@@ -200,7 +211,7 @@ fn config_json_flatten_object(input: String, position: Int, prefix: String, out:
         pos = config_json_skip_ws(input, key_scan.position)
         if pos < input.len() and input[pos] == ":":
             pos = pos + 1
-        pos = config_json_flatten_value(input, pos, config_join_key(prefix, key), out)
+        pos = config_json_flatten_value(input, pos, config_join_key(prefix, key), out, depth + 1)
         pos = config_json_skip_ws(input, pos)
         if pos < input.len() and input[pos] == ",":
             pos = pos + 1
@@ -209,13 +220,15 @@ fn config_json_flatten_object(input: String, position: Int, prefix: String, out:
             return pos + 1
     return pos
 
-fn config_flatten_json_object(out: Map[String, String], prefix: String, handle: Int):
+fn config_flatten_json_object(out: Map[String, String], prefix: String, handle: Int, depth: Int):
+    if depth > CONFIG_MAX_DEPTH:
+        return
     for key in json.object_keys(handle):
         child_key := config_join_key(prefix, key)
         value := json.object_get(handle, key)
         kind := json.type_of(value)
         if kind == "object":
-            config_flatten_json_object(out, child_key, value)
+            config_flatten_json_object(out, child_key, value, depth + 1)
         elif kind == "string":
             config_set_scalar(out, child_key, json.get_string(value))
         elif kind == "int":
@@ -278,7 +291,7 @@ pub fn from_json(text: String) -> Config!ConfigError:
     if root < 0 or json.type_of(root) != "object":
         fail config_fail("could not parse config")
     mut values: Map[String, String] := {}
-    config_json_flatten_object(text, 0, "", values)
+    config_json_flatten_object(text, 0, "", values, 0)
     return Config(values)
 
 ## read and parse a json config file.

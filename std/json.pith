@@ -173,6 +173,13 @@ fn push_array_element(handle: Int, value: Int):
 threadlocal mut parser_input: String := ""
 threadlocal mut parser_position: Int := 0
 threadlocal mut parser_error: Bool := false
+threadlocal mut parser_depth: Int := 0
+
+# Maximum container-nesting depth. Deep enough for any real document,
+# shallow enough that the recursive value parser can't overflow the native
+# stack. A stack overflow is a SIGSEGV, which no error handler can catch, so
+# we have to stop before it happens rather than recover from it.
+MAX_PARSE_DEPTH := 128
 
 # Returns character at position or empty string if out of bounds
 fn get_char_at(position: Int) -> String:
@@ -375,6 +382,10 @@ fn json_byte_read_int(input: Bytes, pos: Int) -> JsonByteInt:
     digits_start := i
     mut value := 0
     while i < input.len() and json_byte_is_digit(input[i]):
+        # guard against overflow before it silently wraps a huge integer
+        # into a small one and bypasses a downstream size/count check
+        if value > 922337203685477580 / 10:
+            return JsonByteInt(false, 0, pos)
         value = (value * 10) + (input[i] - 48)
         i = i + 1
     if i == digits_start:
@@ -577,8 +588,20 @@ fn parse_string_raw() -> String:
         parser_position = parser_position + 1
     return val
 
-# Main recursive value parser - handles all JSON types
+# Main recursive value parser - handles all JSON types.
+# Guards nesting depth so a pathological "[[[[..." or "{\"a\":{..." body
+# fails cleanly instead of crashing the process with a stack overflow.
 fn parse_value() -> Int:
+    parser_depth = parser_depth + 1
+    if parser_depth > MAX_PARSE_DEPTH:
+        parser_error = true
+        parser_depth = parser_depth - 1
+        return 0 - 1
+    result := parse_value_node()
+    parser_depth = parser_depth - 1
+    return result
+
+fn parse_value_node() -> Int:
     skip_whitespace()
     if parser_position >= parser_input.len():
         parser_error = true
@@ -701,6 +724,7 @@ fn json_parse(input: String) -> Int:
     parser_input = input
     parser_position = 0
     parser_error = false
+    parser_depth = 0
     result := parse_value()
     if parser_error:
         return 0 - 1

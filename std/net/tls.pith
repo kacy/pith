@@ -42,6 +42,13 @@ TLS_CONTENT_CHANGE_CIPHER_SPEC := 20
 TLS_CONTENT_ALERT := 21
 TLS_CONTENT_HANDSHAKE := 22
 TLS_CONTENT_APPLICATION_DATA := 23
+
+# a read deadline for an accepted server connection. without it a client can
+# open a tls connection and then send nothing (or dribble ChangeCipherSpec /
+# handshake records slowly), pinning the pre-auth handshake indefinitely; many
+# such clients starve the accept loop. the deadline bounds the whole
+# handshake — and the connection's later reads — to a wall-clock window.
+SERVER_HANDSHAKE_TIMEOUT_MS := 10000
 TLS_HANDSHAKE_CLIENT_HELLO := 1
 TLS_HANDSHAKE_SERVER_HELLO := 2
 TLS_HANDSHAKE_NEW_SESSION_TICKET := 4
@@ -1160,6 +1167,9 @@ impl Listener:
     fn accept() -> Conn!:
         if native_listener_config.contains_key(self.handle):
             fd := tcp_accept(self.handle)!
+            # bound the handshake (and the connection's reads) so a slow or
+            # silent client can't pin a server task before it authenticates.
+            tcp_set_timeout(fd, SERVER_HANDSHAKE_TIMEOUT_MS)
             return native_server_handshake(TcpStream(fd), Config(native_listener_config[self.handle]))
         fail "native tls listener not found"
 

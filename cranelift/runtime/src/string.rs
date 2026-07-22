@@ -162,50 +162,6 @@ pub unsafe extern "C" fn pith_string_release(s: PithString) {
     dealloc(s.ptr as *mut u8, layout);
 }
 
-/// Destructor for string elements in collections
-///
-/// Called by cycle collector when freeing cyclic string objects
-#[no_mangle]
-pub extern "C" fn pith_string_destructor(ptr: *mut u8) {
-    if ptr.is_null() {
-        return;
-    }
-
-    unsafe {
-        let s = ptr as *const PithString;
-        pith_string_release(*s);
-    }
-}
-
-/// Concatenate two strings into one fresh allocation
-#[no_mangle]
-pub unsafe extern "C" fn pith_string_concat(a: PithString, b: PithString) -> PithString {
-    let a_str = as_str(&a);
-    let b_str = as_str(&b);
-    if a_str.is_empty() {
-        return pith_from_str(b_str);
-    }
-    if b_str.is_empty() {
-        return pith_from_str(a_str);
-    }
-
-    let len = a_str.len() + b_str.len();
-    crate::ensure_perf_stats_registered();
-    crate::perf_count(&crate::PERF_STRING_ALLOCS, 1);
-    crate::perf_count(&crate::PERF_STRING_ALLOC_BYTES, len);
-
-    let layout = crate::pith_layout(len, 1);
-    let ptr = crate::pith_alloc(layout);
-    std::ptr::copy_nonoverlapping(a_str.as_ptr(), ptr, a_str.len());
-    std::ptr::copy_nonoverlapping(b_str.as_ptr(), ptr.add(a_str.len()), b_str.len());
-
-    PithString {
-        ptr,
-        len: len as i64,
-        is_heap: true,
-    }
-}
-
 /// Get string length in bytes
 #[no_mangle]
 pub extern "C" fn pith_string_len(s: PithString) -> i64 {
@@ -274,32 +230,6 @@ pub unsafe extern "C" fn pith_string_trim(s: PithString) -> PithString {
     }
 
     pith_from_str(as_str(&s).trim())
-}
-
-/// Create string from single character code
-#[no_mangle]
-pub unsafe extern "C" fn pith_chr(code: i64) -> PithString {
-    let byte = (code & 0xFF) as u8;
-
-    let mut buf = vec![byte];
-    buf.push(0);
-
-    let ptr = Box::into_raw(buf.into_boxed_slice()) as *const u8;
-
-    PithString {
-        ptr,
-        len: 1,
-        is_heap: true,
-    }
-}
-
-/// Get character code at index (or -1 if out of bounds)
-#[no_mangle]
-pub extern "C" fn pith_ord(s: PithString, index: i64) -> i64 {
-    if index < 0 || index >= s.len {
-        return -1;
-    }
-    unsafe { *s.ptr.add(index as usize) as i64 }
 }
 
 // ============================================================================
@@ -419,20 +349,6 @@ pub extern "C" fn pith_string_ends_with_ptr(
             0
         }
     }
-}
-
-/// ABI wrapper for pith_string_concat - returns result on stack
-#[no_mangle]
-pub unsafe extern "C" fn pith_string_concat_ptr(
-    a_ptr: *const PithString,
-    b_ptr: *const PithString,
-    out_ptr: *mut PithString,
-) {
-    if a_ptr.is_null() || b_ptr.is_null() || out_ptr.is_null() {
-        return;
-    }
-    let result = pith_string_concat(*a_ptr, *b_ptr);
-    *out_ptr = result;
 }
 
 #[cfg(test)]

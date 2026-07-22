@@ -1,0 +1,37 @@
+# defer plus arc must stay flat across a loop: the deferred statement reads an
+# owned local, so it has to run before the arc cleanup that frees it. exercises
+# fall-through, the fail path, and `!` propagation. run under memcheck; a
+# skipped cleanup or a release-before-defer would show up as a leak or a
+# use-after-free here.
+struct Handle:
+    pub name: String
+
+fn use_handle(n: Int) -> Int!:
+    h := Handle{"handle-" + n.to_string()}
+    tags := ["open", h.name]
+    # the defer reads h and tags, which arc releases at the exit right after it
+    defer note(h.name, tags.len())
+    if n % 3 == 0:
+        fail "rejected-" + n.to_string()
+    return tags.len()
+
+fn note(name: String, count: Int):
+    combined := name + ":" + count.to_string()
+    if combined.len() == 0:
+        print(combined)
+
+fn relay(n: Int) -> Int!:
+    owned := "relay-" + n.to_string()
+    parts := [owned, "tail"]
+    defer note(owned, parts.len())
+    v := use_handle(n)!
+    return v + parts.len()
+
+fn main():
+    mut total := 0
+    mut i := 0
+    while i < 400:
+        total = total + (use_handle(i) catch 0)
+        total = total + (relay(i) catch 0)
+        i = i + 1
+    print(total.to_string())

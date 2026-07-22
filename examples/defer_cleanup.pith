@@ -1,0 +1,48 @@
+# defer: cleanup that runs on every exit, including the error path.
+#
+# a File here stands in for any resource you must release. the point is
+# that `defer file.close()` sits right next to the open, and runs whether
+# the function returns normally, fails, or propagates an error with `!` —
+# so no exit can forget it.
+
+mut open_files := 0
+
+struct File:
+    pub name: String
+
+fn open(name: String) -> File:
+    open_files = open_files + 1
+    print("opened {name} (open={open_files})")
+    return File{name}
+
+fn close(f: File):
+    open_files = open_files - 1
+    print("closed {f.name} (open={open_files})")
+
+# writing an empty line is treated as an error to show the failing path.
+fn write_line(f: File, line: String) -> Int!:
+    if line.len() == 0:
+        fail "refusing to write an empty line to {f.name}"
+    print("wrote to {f.name}: {line}")
+    return line.len()
+
+fn save(name: String, lines: List[String]) -> Int!:
+    f := open(name)
+    defer close(f)
+
+    mut total := 0
+    for line in lines:
+        total = total + write_line(f, line)!
+    return total
+
+fn main():
+    # normal path: the defer closes the file after the last write
+    good := save("report.txt", ["alpha", "beta"]) catch 0 - 1
+    print("save returned {good}")
+
+    # error path: the second write fails, `!` propagates out of save, and
+    # the defer still closes the file on the way out
+    bad := save("broken.txt", ["ok", "", "never"]) catch 0 - 1
+    print("save returned {bad}")
+
+    print("files still open: {open_files}")

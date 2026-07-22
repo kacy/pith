@@ -1,0 +1,50 @@
+# a defer inside a loop body runs once per iteration, and also runs on the
+# way out through break and continue. nested block scopes unwind innermost
+# first at every exit.
+fn per_iteration():
+    mut i := 0
+    while i < 3:
+        defer print("iter defer i={i}")
+        print("iter body i={i}")
+        i = i + 1
+
+fn on_break():
+    mut i := 0
+    while i < 5:
+        defer print("break defer i={i}")
+        if i == 2:
+            print("breaking at i={i}")
+            break
+        print("break body i={i}")
+        i = i + 1
+
+fn on_continue():
+    mut i := 0
+    while i < 3:
+        defer print("continue defer i={i}")
+        i = i + 1
+        if i == 2:
+            print("continuing at i={i}")
+            continue
+        print("continue body i={i}")
+
+fn nested():
+    defer print("outer defer")
+    print("outer body")
+    if true:
+        defer print("inner defer")
+        print("inner body")
+    print("between blocks")
+
+fn main():
+    print("--- per iteration ---")
+    per_iteration()
+
+    print("--- break ---")
+    on_break()
+
+    print("--- continue ---")
+    on_continue()
+
+    print("--- nested scopes ---")
+    nested()

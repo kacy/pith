@@ -7,14 +7,14 @@ fn main() -> String!:
 
     # write through the shared file stream path
     writer := fs.create(path)!
+    defer writer.close()
     writer.write_all("hello from pith")!
-    writer.close()
     print("write: ok")
 
     # read back through the same stream surface
     reader := fs.open(path)!
+    defer reader.close()
     content := reader.read_all()!
-    reader.close()
     if content.contains("hello"):
         print("read: ok")
 
@@ -33,8 +33,8 @@ fn main() -> String!:
 
     # stream a known file too
     hello_reader := fs.open("examples/hello.pith")!
+    defer hello_reader.close()
     hello := hello_reader.read_all()!
-    hello_reader.close()
     if hello.contains("greet"):
         print("read hello.pith: ok")
 

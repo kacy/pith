@@ -2,11 +2,11 @@
 
 fn run_server(port: Int) -> Int!:
     s := tcp_listen("127.0.0.1", port)!
+    defer tcp_close(s)
     c := tcp_accept(s)!
+    defer tcp_close(c)
     data := tcp_read(c, 1024)!
     tcp_write(c, "echo: {data}")!
-    tcp_close(c)
-    tcp_close(s)
     return 0
 
 fn run() -> String!:
@@ -18,10 +18,10 @@ fn run() -> String!:
 
     # connect client
     conn := tcp_connect("127.0.0.1", port)!
+    defer tcp_close(conn)
     tcp_write(conn, "hello pith")!
     response := tcp_read(conn, 1024)!
     print(response)
-    tcp_close(conn)
 
     await task
     print("net echo works")

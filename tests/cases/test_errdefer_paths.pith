@@ -1,0 +1,60 @@
+# errdefer stays silent on every success exit — a block that falls off its
+# end, break, and continue — and fires only when an error leaves the scope.
+# `!`-propagation is an error exit, so it fires there.
+mut counter := 0
+
+fn bump(label: String):
+    counter = counter + 1
+    print("{label} c={counter}")
+
+# the errdefer lives in the if-block. control enters it, then falls off the
+# block end (a success exit) and reaches the normal return, so it never fires.
+fn falls_off(x: Int) -> Int!:
+    if x > 0:
+        errdefer bump("block errdefer")
+        print("inside block")
+    print("after block")
+    return x
+
+# break and continue are success exits, so the loop-body errdefer stays
+# silent even though the function itself can fail.
+fn loops(n: Int) -> Int!:
+    mut i := 0
+    while i < n:
+        errdefer bump("loop errdefer")
+        if i == 1:
+            i = i + 1
+            continue
+        if i == 2:
+            break
+        i = i + 1
+    return i
+
+fn step(x: Int) -> Int!:
+    if x == 0:
+        fail "zero"
+    return x + 1
+
+# the `!` propagates step's failure outward — an error exit, so the errdefer
+# fires. on the ok path it stays silent.
+fn propagate(x: Int) -> Int!:
+    errdefer bump("propagate errdefer")
+    y := step(x)!
+    return y + 1
+
+fn main():
+    print("--- falls off the end (ok, silent) ---")
+    a := falls_off(3) catch 0 - 1
+    print("a={a}")
+
+    print("--- break/continue (silent) ---")
+    b := loops(5) catch 0 - 1
+    print("b={b}")
+
+    print("--- propagate ok (silent) ---")
+    c := propagate(4) catch 0 - 1
+    print("c={c}")
+
+    print("--- propagate fail (fires) ---")
+    d := propagate(0) catch 0 - 1
+    print("d={d}")

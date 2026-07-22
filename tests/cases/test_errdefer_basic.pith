@@ -1,0 +1,24 @@
+# errdefer runs only when the scope exits via an error (`fail` or `!`); a
+# plain defer always runs. the two sit side by side so the difference is
+# visible: on the ok path only the defer fires, on the fail path both do.
+mut counter := 0
+
+fn bump(label: String):
+    counter = counter + 1
+    print("{label} counter={counter}")
+
+fn guarded(x: Int) -> Int!:
+    defer bump("defer")
+    errdefer bump("errdefer")
+    if x < 0:
+        fail "negative"
+    return x * 2
+
+fn main():
+    print("--- ok path (errdefer silent) ---")
+    a := guarded(5) catch 0 - 1
+    print("result={a}")
+
+    print("--- fail path (errdefer fires) ---")
+    b := guarded(0 - 3) catch 0 - 1
+    print("result={b}")

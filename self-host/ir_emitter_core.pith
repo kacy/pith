@@ -128,11 +128,14 @@ mut ir_continue_stack: List[String] := []
 # defer support (statically emitted, zero runtime machinery). deferred
 # statements are re-emitted at every scope-exit edge in LIFO order, before the
 # ARC cleanup. ir_defer_nodes is a flat stack of the inner statement node
-# indices currently in scope; ir_defer_scope_starts marks where each open
-# block scope begins in that flat stack; ir_defer_loop_base_stack records the
-# flat-stack length at each loop entry so break/continue emit only the defers
-# registered inside the loop. all three reset per function.
+# indices currently in scope; ir_defer_is_err is a parallel stack marking each
+# entry as an `errdefer` (1) or plain `defer` (0) — errdefers are skipped at
+# success exits and emitted only at error exits. ir_defer_scope_starts marks
+# where each open block scope begins in the flat stack; ir_defer_loop_base_stack
+# records the flat-stack length at each loop entry so break/continue emit only
+# the defers registered inside the loop. all four reset per function.
 mut ir_defer_nodes: List[Int] := []
+mut ir_defer_is_err: List[Int] := []
 mut ir_defer_scope_starts: List[Int] := []
 mut ir_defer_loop_base_stack: List[Int] := []
 mut ir_lambda_bodies: List[String] := [] # deferred lambda function IR
@@ -675,28 +678,35 @@ fn ir_string_method_returns_fresh(mname: String) -> Bool:
 fn ir_defer_push_scope():
     ir_defer_scope_starts = ir_push_int(ir_defer_scope_starts, ir_defer_nodes.len())
 
-# record a deferred statement in the innermost open scope.
-fn ir_defer_register(inner_idx: Int):
+# record a deferred statement in the innermost open scope. is_err is 1 for an
+# `errdefer` (runs only on error exits) and 0 for a plain `defer`.
+fn ir_defer_register(inner_idx: Int, is_err: Int):
     ir_defer_nodes.push(inner_idx)
+    ir_defer_is_err.push(is_err)
 
 # emit deferred nodes from the top of the flat stack down to `stop` (inclusive
 # of `stop`), in LIFO order, WITHOUT truncating the stack. used at early exits
-# where control leaves several scopes at once.
-fn ir_defer_emit_through(stop: Int):
+# where control leaves several scopes at once. at a success exit
+# (is_error_exit false) the errdefer entries are filtered out; at an error exit
+# every entry runs.
+fn ir_defer_emit_through(stop: Int, is_error_exit: Bool):
     mut i := ir_defer_nodes.len() - 1
     while i >= stop:
-        ir_stmt(ir_defer_nodes[i])
+        if is_error_exit or ir_defer_is_err[i] == 0:
+            ir_stmt(ir_defer_nodes[i])
         i = i - 1
 
-# emit every deferred statement still in scope. used at the function-level exit
-# edges (return / fail / `!` / `?` / index-miss) before the ARC cleanup.
-fn ir_defer_emit_to_function_frame():
-    ir_defer_emit_through(0)
+# emit every deferred statement still in scope, before the ARC cleanup. used at
+# the function-level exit edges: pass is_error_exit true at the error edges
+# (fail / `!` / `?` / index-miss) so errdefers run, false at the success edges
+# (return, default return) so they are skipped.
+fn ir_defer_emit_to_function_frame(is_error_exit: Bool):
+    ir_defer_emit_through(0, is_error_exit)
 
-# close the innermost block scope. on fall-through (control really reaches the
-# end of the block) its defers run in LIFO order; if the block already ended in
-# a terminator they were emitted at that edge, so skip them here. either way the
-# scope's entries are dropped from the flat stack.
+# close the innermost block scope. falling off the end of a block is a success
+# exit, so its plain defers run in LIFO order and its errdefers are skipped; if
+# the block already ended in a terminator they were emitted at that edge, so
+# skip them here. either way the scope's entries are dropped from both stacks.
 fn ir_defer_pop_scope_emit():
     if ir_defer_scope_starts.len() == 0:
         return
@@ -705,10 +715,12 @@ fn ir_defer_pop_scope_emit():
     if not ir_last_was_ret:
         mut i := ir_defer_nodes.len() - 1
         while i >= start:
-            ir_stmt(ir_defer_nodes[i])
+            if ir_defer_is_err[i] == 0:
+                ir_stmt(ir_defer_nodes[i])
             i = i - 1
     while ir_defer_nodes.len() > start:
         ir_defer_nodes.remove(ir_defer_nodes.len() - 1)
+        ir_defer_is_err.remove(ir_defer_is_err.len() - 1)
 
 # a loop records the flat-stack length at entry so break/continue emit only the
 # defers registered inside the loop body, not the enclosing function's.
@@ -719,10 +731,11 @@ fn ir_defer_loop_exit():
     if ir_defer_loop_base_stack.len() > 0:
         ir_defer_loop_base_stack.remove(ir_defer_loop_base_stack.len() - 1)
 
-# emit the current loop body's defers before a break/continue jump.
+# emit the current loop body's defers before a break/continue jump. break and
+# continue are success exits, so errdefers are skipped here.
 fn ir_defer_emit_for_loop_jump():
     if ir_defer_loop_base_stack.len() > 0:
-        ir_defer_emit_through(ir_defer_loop_base_stack[ir_defer_loop_base_stack.len() - 1])
+        ir_defer_emit_through(ir_defer_loop_base_stack[ir_defer_loop_base_stack.len() - 1], false)
 
 fn ir_emit_string_cleanup(exclude: String):
     mut i := 0
@@ -1710,7 +1723,7 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
         # `?` on a none propagates out of the function, an early exit like a
         # fail: run the deferred statements, then release owned locals, before
         # returning the error tuple.
-        ir_defer_emit_to_function_frame()
+        ir_defer_emit_to_function_frame(true)
         ir_emit_string_cleanup("")
         si := ir_str("unwrap of none")
         err_r := ir_reg()
@@ -4365,7 +4378,7 @@ fn ir_emit_try_expr(node: Node) -> Int:
                 # propagating the error out early skips the normal return,
                 # so release the function's owned locals here too; the error
                 # tuple being returned is a fresh value, not a tracked local
-                ir_defer_emit_to_function_frame()
+                ir_defer_emit_to_function_frame(true)
                 ir_emit_string_cleanup("")
                 ir_emit("ret " + val_r.to_string())
             ir_emit_label(merge_l)
@@ -4392,7 +4405,7 @@ fn ir_emit_try_expr(node: Node) -> Int:
         if ir_emit_tests and ir_emitting_test_func:
             ir_test_assert_fail_return()
         else:
-            ir_defer_emit_to_function_frame()
+            ir_defer_emit_to_function_frame(true)
             ir_emit_string_cleanup("")
             zero := ir_reg()
             ir_emit("iconst " + zero.to_string() + " 0")
@@ -4420,11 +4433,11 @@ fn ir_emit_fail_expr(node: Node) -> Int:
             elif ir_string_expr_is_borrowed(node.children[0]):
                 ir_rc_retain_reg(err_r, err_kind)
         tuple_r := ir_emit_err_result_tuple(err_r)
-        ir_defer_emit_to_function_frame()
+        ir_defer_emit_to_function_frame(true)
         ir_emit_string_cleanup(exclude)
         ir_emit("ret " + tuple_r.to_string())
     else:
-        ir_defer_emit_to_function_frame()
+        ir_defer_emit_to_function_frame(true)
         ir_emit_string_cleanup("")
         ir_emit("ret " + ir_emit_err_result_tuple(ir_zero_reg()).to_string())
     ub := ir_label()
@@ -4509,7 +4522,7 @@ fn ir_emit_index_expr_propagate(obj_r: Int, idx_r: Int, obj_type: String, value_
         # this early return skips the normal exit, so run the deferred
         # statements and then release the function's owned locals here too —
         # without the cleanup every owned local leaked on an index miss.
-        ir_defer_emit_to_function_frame()
+        ir_defer_emit_to_function_frame(true)
         ir_emit_string_cleanup("")
         msg := ir_str("index out of bounds")
         err_r := ir_reg()
@@ -4841,11 +4854,11 @@ fn ir_emit_return_stmt(node: Node):
         elif ir_current_func_return_kind == "tuple":
             if result_kind != "tuple":
                 r = ir_emit_ok_result_tuple(r)
-        ir_defer_emit_to_function_frame()
+        ir_defer_emit_to_function_frame(false)
         ir_emit_string_cleanup(exclude)
         ir_emit("ret " + r.to_string())
     else:
-        ir_defer_emit_to_function_frame()
+        ir_defer_emit_to_function_frame(false)
         ir_emit_string_cleanup("")
         r := ir_reg()
         ir_emit("iconst " + r.to_string() + " 0")
@@ -5107,10 +5120,15 @@ fn ir_stmt(idx: Int):
     ir_last_was_ret = false
 
     # a defer emits nothing here: record its inner statement so it can be
-    # re-emitted at each exit edge of the enclosing scope.
+    # re-emitted at each exit edge of the enclosing scope. errdefer is the same
+    # registration tagged as error-only (is_err = 1).
     if kind == "defer":
         if node.children.len() > 0:
-            ir_defer_register(node.children[0])
+            ir_defer_register(node.children[0], 0)
+        return
+    if kind == "errdefer":
+        if node.children.len() > 0:
+            ir_defer_register(node.children[0], 1)
         return
 
     if ir_stmt_is_expr(kind):
@@ -5909,7 +5927,7 @@ fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_no
 # returns a throwaway 0 so it can travel as a fn value: void
 # functions are not yet recognized by the function-value path.
 fn ir_emit_default_return() -> Int:
-    ir_defer_emit_to_function_frame()
+    ir_defer_emit_to_function_frame(false)
     ir_emit_string_cleanup("")
     dr := ir_reg()
     ir_emit("iconst " + dr.to_string() + " 0")
@@ -5929,6 +5947,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_rc_local_kinds = []
     # defers are function-scoped: start each function with empty scope stacks
     ir_defer_nodes = []
+    ir_defer_is_err = []
     ir_defer_scope_starts = []
     ir_defer_loop_base_stack = []
     ir_seed_global_types()

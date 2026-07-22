@@ -1,0 +1,41 @@
+# interleaved defer/errdefer run LIFO by registration. a scope registers
+# `defer A`, `errdefer B`, `defer C`: a success exit drops the errdefer and
+# runs C then A; an error exit runs all three, C then B then A.
+mut counter := 0
+
+fn tick(label: String):
+    counter = counter + 1
+    print("{label} c={counter}")
+
+fn interleaved(x: Int) -> Int!:
+    defer tick("A defer")
+    errdefer tick("B errdefer")
+    defer tick("C defer")
+    if x < 0:
+        fail "bad"
+    return x
+
+# nested scopes: the inner block's defers resolve at the inner exit, the
+# outer ones at the function exit. a fail inside the inner block leaves
+# through both levels, so every entry runs, innermost first.
+fn nested(x: Int) -> Int!:
+    errdefer tick("outer errdefer")
+    defer tick("outer defer")
+    if x > 0:
+        errdefer tick("inner errdefer")
+        defer tick("inner defer")
+        fail "inner fail"
+    return x
+
+fn main():
+    print("--- success (C, A) ---")
+    a := interleaved(7) catch 0 - 1
+    print("a={a}")
+
+    print("--- error (C, B, A) ---")
+    b := interleaved(0 - 2) catch 0 - 1
+    print("b={b}")
+
+    print("--- nested error (all fire, inner first) ---")
+    c := nested(1) catch 0 - 1
+    print("c={c}")

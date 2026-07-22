@@ -1234,6 +1234,8 @@ fn parse_statement() -> Int:
         return add_leaf_with_position("continue", "")
     if _cur_tok_kind() == "kw_defer":
         return parse_defer_stmt()
+    if _cur_tok_kind() == "kw_errdefer":
+        return parse_errdefer_stmt()
 
     return parse_expr_stmt_or_assignment()
 
@@ -1245,6 +1247,15 @@ fn parse_defer_stmt() -> Int:
     inner := parse_statement()
     mut children: List[Int] := [inner]
     return add_node_with_position("defer", "", children)
+
+# `errdefer <stmt>`: same shape as defer, but the emitter only re-emits it at
+# the error-exit edges (fail / `!`-propagation), never on a normal return or
+# fall-through. the node carries the inner statement as its sole child.
+fn parse_errdefer_stmt() -> Int:
+    advance_token()
+    inner := parse_statement()
+    mut children: List[Int] := [inner]
+    return add_node_with_position("errdefer", "", children)
 
 fn looks_like_binding() -> Bool:
     mut i := 2

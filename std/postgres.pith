@@ -180,7 +180,13 @@ fn error_text(payload: Bytes) -> String:
 pub fn connect(host: String, port: Int, user: String, password: String, database: String) -> Conn!:
     fd := tcp_connect(host, port)!
     conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: false, tls_handle: 0)
-    conn.handshake(user, password, database)!
+    # the conn now owns the socket, but nothing closes it until the caller does.
+    # if the handshake fails the caller never sees this conn, so close the socket
+    # here rather than leak it on every failed dial.
+    started := conn.handshake(user, password, database)
+    if started.is_err:
+        conn.close()
+        fail started.err
     return conn
 
 # like connect, but upgrade the socket to tls first: send SSLRequest, expect
@@ -188,15 +194,34 @@ pub fn connect(host: String, port: Int, user: String, password: String, database
 # then run startup and authentication over the encrypted channel.
 pub fn connect_tls(host: String, port: Int, user: String, password: String, database: String, server_name: String, config: tls.Config) -> Conn!:
     fd := tcp_connect(host, port)!
+    # until the socket is wrapped in a Conn (or handed to the tls session), no
+    # owner will close it, so every failure below closes the fd by hand.
     request := bytes.concat(be32(8), be32(80877103))
-    tcp_write_bytes(fd, request)!
-    reply := tcp_read_bytes(fd, 1)!
+    sent := tcp_write_bytes(fd, request)
+    if sent.is_err:
+        tcp_close(fd)
+        fail sent.err
+    reply_result := tcp_read_bytes(fd, 1)
+    if reply_result.is_err:
+        tcp_close(fd)
+        fail reply_result.err
+    reply := reply_result.ok
     if bytes.len(reply) == 0 or bytes.get(reply, 0) != 83:
         tcp_close(fd)
         fail "postgres: server refused tls"
-    session := tls.client(TcpStream(fd), server_name, config)!
+    session_result := tls.client(TcpStream(fd), server_name, config)
+    if session_result.is_err:
+        tcp_close(fd)
+        fail session_result.err
+    session := session_result.ok
     conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: true, tls_handle: session.handle)
-    conn.handshake(user, password, database)!
+    # from here the tls session owns the socket and will close it. on a failed
+    # handshake close through the session once — not conn.close(), which would
+    # also tcp_close the same fd a second time.
+    started := conn.handshake(user, password, database)
+    if started.is_err:
+        tls.conn_from_handle(session.handle).close()
+        fail started.err
     return conn
 
 impl Conn:

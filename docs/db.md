@@ -137,26 +137,27 @@ t.commit()!
 ```
 
 the important case is the one where something goes wrong partway through: the
-transaction must roll back so a half-applied change never lands. run the body
-where you can catch a failure, and roll back before propagating it:
+transaction must roll back so a half-applied change never lands. reach for
+`errdefer` — it runs only when the function leaves through an error, which is
+exactly the rollback case. schedule it right after `begin`, then write the body
+straight through:
 
 ```pith
-fn transfer(handle: db.Db, from: String, to: String, cents: String) -> Bool!:
+fn transfer(handle: db.Db, src: String, dst: String, cents: String) -> Bool!:
     t := handle.begin()!
-    moved := move_money(t, from, to, cents)
-    if moved.is_err:
-        t.rollback()
-        fail moved.err
+    errdefer t.rollback()       # only if a `!` below propagates
+
+    t.exec("update accounts set balance = balance - $1 where id = $2", [cents, src])!
+    t.exec("update accounts set balance = balance + $1 where id = $2", [cents, dst])!
     t.commit()!
     return true
-
-# the two writes that must land together; a `!` failure on either one returns an
-# error to `transfer`, which then rolls back.
-fn move_money(t: db.Tx, from: String, to: String, cents: String) -> Bool!:
-    t.exec("update accounts set balance = balance - $1 where id = $2", [cents, from])!
-    t.exec("update accounts set balance = balance + $1 where id = $2", [cents, to])!
-    return true
 ```
+
+if either write fails, its `!` propagates out of `transfer` and the `errdefer`
+rolls the transaction back on the way. if both land and the `commit` succeeds,
+the function returns normally and the `errdefer` stays quiet — no rollback after
+a good commit. a plain `defer t.rollback()` would fire on every exit and undo the
+commit you just made. see [defer.md](defer.md) for the full rules.
 
 `rollback` never fails, so it drops straight onto the error path. it is also
 safe after a statement has already failed: such a statement leaves its connection

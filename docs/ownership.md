@@ -99,7 +99,10 @@ gaps, all bounded leaks rather than dangling pointers:
   where it is easy to forget. reach for `defer` (see [defer.md](defer.md)):
   a deferred statement runs on every exit from its scope — fall-through,
   `return`, `fail`, and `!` propagation alike — right before arc frees the
-  locals, so the cleanup still sees them.
+  locals, so the cleanup still sees them. for cleanup that should happen
+  only when something went wrong — roll back a half-finished transaction,
+  delete a partial file — use `errdefer`, which runs on the error exits
+  and stays quiet on a normal return.
 - **a result consumed with `catch` or `unwrap_or` can leak its ok
   value** when that value was freshly built (a returned tuple, a
   concatenated string). the consumer has no way to tell a fresh ok

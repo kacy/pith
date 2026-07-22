@@ -69,6 +69,77 @@ fn ir_decode_collect_arg_regs(node: Node, start_idx: Int, emit_expr: fn(Int) -> 
             arg_regs.push(emit_expr(child))
     return arg_regs
 
+# the two temp vars that hold a json node-pool mark across a lowered decode
+# body, so it can be reloaded and handed to pool_restore at every exit.
+struct IrJsonPoolMark:
+    node_id_var: String
+    array_len_var: String
+
+# emit `node_mark := json.pool_mark_node_id()` and the array-length mark,
+# storing both in fresh int temps. the returned handle carries their names so
+# the matching restore can reload them after the decode's single exit label.
+# mark_node_id_name / mark_array_len_name are the already-resolved std symbols
+# (they differ between a plain call site and a generic specialization body).
+fn ir_emit_json_pool_mark(mark_node_id_name: String, mark_array_len_name: String) -> IrJsonPoolMark:
+    node_r := ir_reg()
+    ir_emit_call0(node_r, mark_node_id_name, "int")
+    node_var := ir_new_temp_name("json_pool_node_mark")
+    ir_var_types.insert(node_var, "int")
+    ir_emit("store " + node_var + " " + node_r.to_string())
+    array_r := ir_reg()
+    ir_emit_call0(array_r, mark_array_len_name, "int")
+    array_var := ir_new_temp_name("json_pool_array_mark")
+    ir_var_types.insert(array_var, "int")
+    ir_emit("store " + array_var + " " + array_r.to_string())
+    return IrJsonPoolMark(node_var, array_var)
+
+# emit `json.pool_restore(node_mark, array_mark)`, reclaiming every pool node
+# the decode allocated. call this after the result struct is materialized and
+# just before the body returns it.
+fn ir_emit_json_pool_restore(mark: IrJsonPoolMark, restore_name: String):
+    node_r := ir_reg()
+    ir_emit("load " + node_r.to_string() + " " + mark.node_id_var)
+    array_r := ir_reg()
+    ir_emit("load " + array_r.to_string() + " " + mark.array_len_var)
+    ir_emit_call2(ir_reg(), restore_name, "void", node_r, array_r)
+
+# the toml node pool splits table children and array children into separate flat
+# lists, so its mark carries three positions instead of json's two.
+struct IrTomlPoolMark:
+    node_id_var: String
+    table_len_var: String
+    array_len_var: String
+
+# emit the three toml pool marks into fresh int temps. the names are the
+# already-resolved std symbols (they differ between a call site and a spec body).
+fn ir_emit_toml_pool_mark(mark_node_id_name: String, mark_table_len_name: String, mark_array_len_name: String) -> IrTomlPoolMark:
+    node_r := ir_reg()
+    ir_emit_call0(node_r, mark_node_id_name, "int")
+    node_var := ir_new_temp_name("toml_pool_node_mark")
+    ir_var_types.insert(node_var, "int")
+    ir_emit("store " + node_var + " " + node_r.to_string())
+    table_r := ir_reg()
+    ir_emit_call0(table_r, mark_table_len_name, "int")
+    table_var := ir_new_temp_name("toml_pool_table_mark")
+    ir_var_types.insert(table_var, "int")
+    ir_emit("store " + table_var + " " + table_r.to_string())
+    array_r := ir_reg()
+    ir_emit_call0(array_r, mark_array_len_name, "int")
+    array_var := ir_new_temp_name("toml_pool_array_mark")
+    ir_var_types.insert(array_var, "int")
+    ir_emit("store " + array_var + " " + array_r.to_string())
+    return IrTomlPoolMark(node_var, table_var, array_var)
+
+# emit `toml.pool_restore(node_mark, table_mark, array_mark)`.
+fn ir_emit_toml_pool_restore(mark: IrTomlPoolMark, restore_name: String):
+    node_r := ir_reg()
+    ir_emit("load " + node_r.to_string() + " " + mark.node_id_var)
+    table_r := ir_reg()
+    ir_emit("load " + table_r.to_string() + " " + mark.table_len_var)
+    array_r := ir_reg()
+    ir_emit("load " + array_r.to_string() + " " + mark.array_len_var)
+    ir_emit_call3(ir_reg(), restore_name, "void", node_r, table_r, array_r)
+
 ## emit the json generic name sequence.
 pub fn ir_json_generic_name(base_name: String) -> String:
     return ir_json_generic_name_with_state(base_name, ir_generic_decl_indices)
@@ -515,24 +586,41 @@ pub fn ir_emit_toml_decode_path_specialization_body(struct_name: String, module_
 pub fn ir_emit_toml_decode_text_specialization_body(struct_name: String, module_path: String, concrete_types: List[String], ret_type: String):
     input_r := ir_reg()
     ir_emit("load " + input_r.to_string() + " input")
+    temp_name := ir_new_temp_name("toml_decode_text")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    # this body owns the parse that fills the pool, so mark it now and reclaim
+    # at the single exit. the decode sub-call materializes the struct (copying
+    # strings out), so the nodes are dead by the time we restore.
+    mark := ir_emit_toml_pool_mark(ir_resolve_generic_module_call_name(module_path, "pool_mark_node_id"), ir_resolve_generic_module_call_name(module_path, "pool_mark_table_len"), ir_resolve_generic_module_call_name(module_path, "pool_mark_array_len"))
     parse_result_r := ir_reg()
     ir_emit_call1(parse_result_r, ir_resolve_generic_module_call_name(module_path, "parse_required"), "tuple", input_r)
-    ir_emit_result_return_error_branch(parse_result_r)
+    ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
     root_r := ir_emit_result_ok_field_typed(parse_result_r, "Int")
     decode_base := ir_resolve_generic_module_call_name(module_path, "decode")
     decode_name := ir_queue_generic_specialization(decode_base, concrete_types, ret_type)
     decode_result_r := ir_reg()
     ir_emit_call1(decode_result_r, decode_name, "tuple", root_r)
-    ir_emit("ret " + decode_result_r.to_string())
+    ir_emit("store " + temp_name + " " + decode_result_r.to_string())
+    ir_emit_label(done_l)
+    ir_emit_toml_pool_restore(mark, ir_resolve_generic_module_call_name(module_path, "pool_restore"))
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    ir_emit("ret " + r.to_string())
     ir_emit("endfunc")
 
 ## emit the toml decode text path specialization body sequence.
 pub fn ir_emit_toml_decode_text_path_specialization_body(struct_name: String, module_path: String, concrete_types: List[String], ret_type: String):
     input_r := ir_reg()
     ir_emit("load " + input_r.to_string() + " input")
+    temp_name := ir_new_temp_name("toml_decode_text_path")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    # owns the parse, so bracket it and reclaim at the single exit.
+    mark := ir_emit_toml_pool_mark(ir_resolve_generic_module_call_name(module_path, "pool_mark_node_id"), ir_resolve_generic_module_call_name(module_path, "pool_mark_table_len"), ir_resolve_generic_module_call_name(module_path, "pool_mark_array_len"))
     parse_result_r := ir_reg()
     ir_emit_call1(parse_result_r, ir_resolve_generic_module_call_name(module_path, "parse_required"), "tuple", input_r)
-    ir_emit_result_return_error_branch(parse_result_r)
+    ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
     root_r := ir_emit_result_ok_field_typed(parse_result_r, "Int")
     path_r := ir_reg()
     ir_emit("load " + path_r.to_string() + " dotted_path")
@@ -540,7 +628,12 @@ pub fn ir_emit_toml_decode_text_path_specialization_body(struct_name: String, mo
     decode_path_name := ir_queue_generic_specialization(decode_path_base, concrete_types, ret_type)
     path_result_r := ir_reg()
     ir_emit_call2(path_result_r, decode_path_name, "tuple", root_r, path_r)
-    ir_emit("ret " + path_result_r.to_string())
+    ir_emit("store " + temp_name + " " + path_result_r.to_string())
+    ir_emit_label(done_l)
+    ir_emit_toml_pool_restore(mark, ir_resolve_generic_module_call_name(module_path, "pool_restore"))
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + temp_name)
+    ir_emit("ret " + r.to_string())
     ir_emit("endfunc")
 
 ## emit the config decode call sequence.
@@ -700,7 +793,11 @@ pub fn ir_emit_toml_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
     temp_name := ir_new_temp_name("toml_decode")
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()
+    # only the text form owns the parse that fills the pool; the handle form is
+    # handed an already-parsed root the caller owns and must not roll back.
+    mut mark := IrTomlPoolMark("", "", "")
     if text_input:
+        mark = ir_emit_toml_pool_mark(ir_resolve_toml_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_toml_call_name(node.children[0], "pool_mark_table_len"), ir_resolve_toml_call_name(node.children[0], "pool_mark_array_len"))
         parse_result_r := ir_reg()
         ir_emit_call1(parse_result_r, "std_toml_parse_required", "tuple", handle_r)
         ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
@@ -708,6 +805,8 @@ pub fn ir_emit_toml_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
 
     ir_emit_toml_decode_value(target_info, handle_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
     ir_emit_label(done_l)
+    if text_input:
+        ir_emit_toml_pool_restore(mark, ir_resolve_toml_call_name(node.children[0], "pool_restore"))
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -729,7 +828,10 @@ pub fn ir_emit_toml_decode_path_call(idx: Int, node: Node, text_input: Bool, emi
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()
 
+    # only the text form owns the parse; the handle form must not roll back.
+    mut mark := IrTomlPoolMark("", "", "")
     if text_input:
+        mark = ir_emit_toml_pool_mark(ir_resolve_toml_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_toml_call_name(node.children[0], "pool_mark_table_len"), ir_resolve_toml_call_name(node.children[0], "pool_mark_array_len"))
         parse_result_r := ir_reg()
         ir_emit_call1(parse_result_r, ir_resolve_toml_call_name(node.children[0], "parse_required"), "tuple", handle_r)
         ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
@@ -746,6 +848,8 @@ pub fn ir_emit_toml_decode_path_call(idx: Int, node: Node, text_input: Bool, emi
     final_handle_r := ir_emit_dotted_path_lookup(handle_r, dotted_path_r, ir_resolve_toml_call_name(node.children[0], "toml_require_table"), lookup_type_id("Int"), current_name, parts_name, len_name, idx_name, temp_name, done_l)
     ir_emit_toml_decode_value(target_info, final_handle_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
     ir_emit_label(done_l)
+    if text_input:
+        ir_emit_toml_pool_restore(mark, ir_resolve_toml_call_name(node.children[0], "pool_restore"))
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -766,12 +870,15 @@ pub fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
         temp_name := ir_new_temp_name("toml_decode_file")
         ir_var_types.insert(temp_name, "tuple")
         done_l := ir_label()
+        # reads and parses the file itself, so it owns the pool nodes.
+        mark := ir_emit_toml_pool_mark(ir_resolve_toml_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_toml_call_name(node.children[0], "pool_mark_table_len"), ir_resolve_toml_call_name(node.children[0], "pool_mark_array_len"))
         parse_result_r := ir_reg()
         ir_emit_call1(parse_result_r, ir_resolve_toml_call_name(node.children[0], "parse_file_required"), "tuple", file_path_r)
         ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
         handle_r := ir_emit_result_value_field(parse_result_r, lookup_type_id("Int"), "ok")
         ir_emit_toml_decode_value(target_info, handle_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
         ir_emit_label(done_l)
+        ir_emit_toml_pool_restore(mark, ir_resolve_toml_call_name(node.children[0], "pool_restore"))
         r := ir_reg()
         ir_emit("load " + r.to_string() + " " + temp_name)
         return r
@@ -787,6 +894,8 @@ pub fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
     temp_name := ir_new_temp_name("toml_decode_file_path")
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()
+    # owns the file parse, so bracket the pool and reclaim at done_l.
+    mark := ir_emit_toml_pool_mark(ir_resolve_toml_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_toml_call_name(node.children[0], "pool_mark_table_len"), ir_resolve_toml_call_name(node.children[0], "pool_mark_array_len"))
     parse_result_r := ir_reg()
     ir_emit_call1(parse_result_r, ir_resolve_toml_call_name(node.children[0], "parse_file_required"), "tuple", file_path_r)
     ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
@@ -803,6 +912,7 @@ pub fn ir_emit_toml_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
     final_handle_r := ir_emit_dotted_path_lookup(handle_r, dotted_path_r, ir_resolve_toml_call_name(node.children[0], "toml_require_table"), lookup_type_id("Int"), current_name, parts_name, len_name, idx_name, temp_name, done_l)
     ir_emit_toml_decode_value(target_info, final_handle_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
     ir_emit_label(done_l)
+    ir_emit_toml_pool_restore(mark, ir_resolve_toml_call_name(node.children[0], "pool_restore"))
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -1083,6 +1193,9 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
         temp_name := ir_new_temp_name("json_decode_nested")
         ir_var_types.insert(temp_name, "tuple")
         done_l := ir_label()
+        # this call owns the parse below, so bracket it: mark the pool now and
+        # reclaim the nodes once the struct is built (all paths reach done_l).
+        mark := ir_emit_json_pool_mark(ir_resolve_json_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_json_call_name(node.children[0], "pool_mark_array_len"))
         mut handle_r := input_r
         if text_input:
             parsed_r := ir_reg()
@@ -1099,6 +1212,7 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
         object_r := ir_emit_result_value_field(checked_r, lookup_type_id("Int"), "ok")
         ir_emit_json_decode_object_value(target_info, object_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
         ir_emit_label(done_l)
+        ir_emit_json_pool_restore(mark, ir_resolve_json_call_name(node.children[0], "pool_restore"))
         r := ir_reg()
         ir_emit("load " + r.to_string() + " " + temp_name)
         return r
@@ -1255,6 +1369,13 @@ pub fn ir_emit_json_decode_specialization_body(struct_name: String, module_path:
         return
     input_r := ir_reg()
     ir_emit("load " + input_r.to_string() + " input")
+    temp_name := ir_new_temp_name("json_decode")
+    ir_var_types.insert(temp_name, "tuple")
+    done_l := ir_label()
+    # bracket the whole body: this decode owns the parse below, so mark the pool
+    # now and reclaim its nodes at the single exit (done_l). every error path
+    # routes through done_l, so one restore covers success and failure alike.
+    mark := ir_emit_json_pool_mark(ir_resolve_generic_module_call_name(module_path, "pool_mark_node_id"), ir_resolve_generic_module_call_name(module_path, "pool_mark_array_len"))
     mut handle_r := input_r
     if text_input:
         parsed_r := ir_reg()
@@ -1263,16 +1384,14 @@ pub fn ir_emit_json_decode_specialization_body(struct_name: String, module_path:
     else:
         parse_result_r := ir_reg()
         ir_emit_call1(parse_result_r, ir_resolve_generic_module_call_name(module_path, "parse_bytes_required"), "tuple", input_r)
-        ir_emit_result_return_error_branch(parse_result_r)
+        ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
         handle_r = ir_emit_result_value_field(parse_result_r, 0, "ok")
     checked_r := ir_reg()
     ir_emit_call1(checked_r, ir_resolve_generic_module_call_name(module_path, "require_object_handle"), "tuple", handle_r)
-    temp_name := ir_new_temp_name("json_decode")
-    ir_var_types.insert(temp_name, "tuple")
-    done_l := ir_label()
     ir_emit_result_store_error_branch(checked_r, temp_name, done_l)
     object_r := ir_emit_result_value_field(checked_r, 0, "ok")
     ir_emit_json_decode_object_value_specialized(struct_name, object_r, module_path, temp_name, done_l, emit_value)
+    ir_emit_json_pool_restore(mark, ir_resolve_generic_module_call_name(module_path, "pool_restore"))
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     ir_emit("ret " + r.to_string())
@@ -1351,7 +1470,12 @@ pub fn ir_emit_json_decode_path_call(idx: Int, node: Node, text_input: Bool, emi
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()
 
+    # only the text form owns the parse that fills the pool; the handle form is
+    # handed an already-parsed root the caller still owns, so it must not roll
+    # the pool back. bracket the parse only when we did it ourselves.
+    mut mark := IrJsonPoolMark("", "")
     if text_input:
+        mark = ir_emit_json_pool_mark(ir_resolve_json_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_json_call_name(node.children[0], "pool_mark_array_len"))
         parsed_r := ir_reg()
         ir_emit_call1(parsed_r, ir_resolve_json_call_name(node.children[0], "parse"), "int", handle_r)
         handle_r = parsed_r
@@ -1372,6 +1496,8 @@ pub fn ir_emit_json_decode_path_call(idx: Int, node: Node, text_input: Bool, emi
     final_handle_r := ir_emit_dotted_path_lookup(root_r, dotted_path_r, ir_resolve_json_call_name(node.children[0], "object_require_object"), lookup_type_id("Int"), current_name, parts_name, len_name, idx_name, temp_name, done_l)
     ir_emit_json_decode_object_value(target_info, final_handle_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
     ir_emit_label(done_l)
+    if text_input:
+        ir_emit_json_pool_restore(mark, ir_resolve_json_call_name(node.children[0], "pool_restore"))
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -1392,6 +1518,9 @@ pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
         temp_name := ir_new_temp_name("json_decode_file")
         ir_var_types.insert(temp_name, "tuple")
         done_l := ir_label()
+        # this call reads and parses the file itself, so it owns the pool nodes
+        # and reclaims them at done_l once the struct is built.
+        mark := ir_emit_json_pool_mark(ir_resolve_json_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_json_call_name(node.children[0], "pool_mark_array_len"))
         parsed_r := ir_reg()
         ir_emit_call1(parsed_r, ir_resolve_json_call_name(node.children[0], "parse_file"), "int", file_path_r)
         checked_r := ir_reg()
@@ -1400,6 +1529,7 @@ pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
         object_r := ir_emit_result_value_field(checked_r, lookup_type_id("Int"), "ok")
         ir_emit_json_decode_object_value(target_info, object_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
         ir_emit_label(done_l)
+        ir_emit_json_pool_restore(mark, ir_resolve_json_call_name(node.children[0], "pool_restore"))
         r := ir_reg()
         ir_emit("load " + r.to_string() + " " + temp_name)
         return r
@@ -1415,6 +1545,8 @@ pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
     temp_name := ir_new_temp_name("json_decode_file_path")
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()
+    # owns the file parse, so bracket the pool and reclaim at done_l.
+    mark := ir_emit_json_pool_mark(ir_resolve_json_call_name(node.children[0], "pool_mark_node_id"), ir_resolve_json_call_name(node.children[0], "pool_mark_array_len"))
     parsed_r := ir_reg()
     ir_emit_call1(parsed_r, ir_resolve_json_call_name(node.children[0], "parse_file"), "int", file_path_r)
     root_result_r := ir_reg()
@@ -1433,6 +1565,7 @@ pub fn ir_emit_json_decode_file_call(idx: Int, node: Node, path_input: Bool, emi
     final_handle_r := ir_emit_dotted_path_lookup(root_r, dotted_path_r, ir_resolve_json_call_name(node.children[0], "object_require_object"), lookup_type_id("Int"), current_name, parts_name, len_name, idx_name, temp_name, done_l)
     ir_emit_json_decode_object_value(target_info, final_handle_r, node.children[0], temp_name, done_l, emit_expr, emit_value)
     ir_emit_label(done_l)
+    ir_emit_json_pool_restore(mark, ir_resolve_json_call_name(node.children[0], "pool_restore"))
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r

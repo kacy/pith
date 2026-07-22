@@ -1,0 +1,59 @@
+import std.json as json
+import std.toml as toml
+
+# regression for the typed-decode node-pool leak: decode[T]/decode_text[T]
+# own the parse that fills the json/toml node pool, so the compiler brackets
+# the lowered body with a pool mark and reclaims the nodes on every exit.
+# without that, next_node_id grew on every decode and never came back down.
+
+struct Addr:
+    pub city: String
+
+struct Person:
+    pub name: String
+    pub addr: Addr
+
+struct Server:
+    pub host: String
+    pub port: Int
+
+# a generic wrapper forces the compiler's decode specialization body (the
+# path web.parse takes), which always parses regardless of struct shape.
+fn jdecode[T](s: String) -> T!json.JsonDecodeError:
+    return json.decode_text[T](s)!
+
+fn tdecode[T](s: String) -> T!toml.TomlDecodeError:
+    return toml.decode_text[T](s)!
+
+fn main():
+    dq := chr(34)
+    lb := chr(123)
+    rb := chr(125)
+    nested := lb + dq + "name" + dq + ":" + dq + "bob" + dq + "," + dq + "addr" + dq + ":" + lb + dq + "city" + dq + ":" + dq + "paris" + dq + rb + rb
+    tdoc := "host = " + dq + "localhost" + dq + chr(10) + "port = 8080"
+
+    mut acc := 0
+    mut i := 0
+    while i < 1000:
+        pr := json.decode_text[Person](nested)   # inline nested-struct decode
+        wr := jdecode[Person](nested)            # json specialization body
+        sr := tdecode[Server](tdoc)              # toml specialization body
+        if pr.is_err or wr.is_err or sr.is_err:
+            print("decode failed")
+            return
+        acc = acc + pr.ok.name.len() + pr.ok.addr.city.len() + wr.ok.name.len() + sr.ok.port
+        i = i + 1
+
+    # after a thousand typed decodes both pools are fully reclaimed.
+    print("json_nodes=" + json.pool_mark_node_id().to_string())
+    print("toml_nodes=" + toml.pool_mark_node_id().to_string())
+    print("acc=" + acc.to_string())
+
+    # and the materialized fields survive the reclaim (independent heap copies).
+    fr := json.decode_text[Person](nested)
+    srv := tdecode[Server](tdoc)
+    if fr.is_err or srv.is_err:
+        print("decode failed")
+        return
+    print(fr.ok.name + "/" + fr.ok.addr.city)
+    print(srv.ok.host + "/" + srv.ok.port.to_string())

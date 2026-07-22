@@ -901,8 +901,14 @@ pub fn restore(mark: JsonCheckpoint):
     json_restore(mark)
 
 fn json_restore(mark: JsonCheckpoint):
+    json_restore_to(mark.next_node_id, mark.array_item_len)
+
+# reclaims every node allocated since the (node_id, array_len) mark. this is
+# the integer-based core so a caller can roll the pool back without first
+# building a checkpoint struct.
+fn json_restore_to(node_id_mark: Int, array_len_mark: Int):
     mut node_id := next_node_id - 1
-    while node_id >= mark.next_node_id:
+    while node_id >= node_id_mark:
         node_types.remove(node_id)
         string_values.remove(node_id)
         integer_values.remove(node_id)
@@ -913,9 +919,30 @@ fn json_restore(mark: JsonCheckpoint):
         array_item_offsets.remove(node_id)
         array_item_counts.remove(node_id)
         node_id = node_id - 1
-    while array_items_flat.len() > mark.array_item_len:
+    while array_items_flat.len() > array_len_mark:
         array_items_flat.remove(array_items_flat.len() - 1)
-    next_node_id = mark.next_node_id
+    next_node_id = node_id_mark
+
+# the typed decoders (decode[T], decode_text[T], ...) own the parse that fills
+# the node pool, then copy scalars and strings out into a concrete struct. once
+# that struct is materialized the nodes are dead, so the compiler brackets the
+# lowered decode body with a mark taken here and a pool_restore() on every exit.
+# the two calls below return the mark as plain ints so the bracket costs no
+# per-decode allocation of its own.
+
+# node-pool position a compiler-lowered typed decode rolls back to.
+pub fn pool_mark_node_id() -> Int:
+    return next_node_id
+
+# flat-array position a compiler-lowered typed decode rolls back to.
+pub fn pool_mark_array_len() -> Int:
+    return array_items_flat.len()
+
+# reclaims the pool nodes a compiler-lowered typed decode allocated. safe once
+# the concrete struct is built: its string fields are independent heap copies
+# taken out of string_values, not references back into the pool.
+pub fn pool_restore(node_id_mark: Int, array_len_mark: Int):
+    json_restore_to(node_id_mark, array_len_mark)
 
 # ===============================================================
 # Public API — Type and Value Accessors

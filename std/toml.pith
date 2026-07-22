@@ -78,6 +78,58 @@ fn push_array_element(handle: Int, val: Int):
     array_item_counts.insert(handle, cnt + 1)
 
 # ===============================================================
+# Node-pool reclamation
+# ===============================================================
+#
+# the typed decoders (decode_text[T], decode_text_path[T]) own the parse that
+# fills the node pool, then copy scalars and strings out into a concrete struct.
+# once that struct is materialized the nodes are dead, so the compiler brackets
+# the lowered decode body with a mark taken here and a pool_restore() on every
+# exit. the marks are plain ints so the bracket costs no allocation of its own.
+
+# reclaims every node allocated since the given marks. table and array children
+# live in append-only flat lists, so truncating them to the marked lengths drops
+# exactly the entries added since. safe once the struct is built: its string
+# fields are independent heap copies, not references back into the pool.
+fn toml_restore_to(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int):
+    mut node_id := next_node_id - 1
+    while node_id >= node_id_mark:
+        node_types.remove(node_id)
+        string_values.remove(node_id)
+        integer_values.remove(node_id)
+        float_values.remove(node_id)
+        boolean_values.remove(node_id)
+        table_key_offsets.remove(node_id)
+        table_key_counts.remove(node_id)
+        array_item_offsets.remove(node_id)
+        array_item_counts.remove(node_id)
+        node_id = node_id - 1
+    # table_keys_flat and table_values_flat grow in lockstep, so one mark covers both.
+    while table_keys_flat.len() > table_flat_mark:
+        table_keys_flat.remove(table_keys_flat.len() - 1)
+    while table_values_flat.len() > table_flat_mark:
+        table_values_flat.remove(table_values_flat.len() - 1)
+    while array_items_flat.len() > array_flat_mark:
+        array_items_flat.remove(array_items_flat.len() - 1)
+    next_node_id = node_id_mark
+
+# node-pool position a compiler-lowered typed decode rolls back to.
+pub fn pool_mark_node_id() -> Int:
+    return next_node_id
+
+# table-children position a compiler-lowered typed decode rolls back to.
+pub fn pool_mark_table_len() -> Int:
+    return table_keys_flat.len()
+
+# array-children position a compiler-lowered typed decode rolls back to.
+pub fn pool_mark_array_len() -> Int:
+    return array_items_flat.len()
+
+# reclaims the pool nodes a compiler-lowered typed decode allocated.
+pub fn pool_restore(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int):
+    toml_restore_to(node_id_mark, table_flat_mark, array_flat_mark)
+
+# ===============================================================
 # Parser (Internal)
 # ===============================================================
 

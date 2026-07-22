@@ -1179,9 +1179,8 @@ pub fn read_file_text(path: String) -> String!:
 # read a whole file as text with an explicit chunk size.
 pub fn read_file_text_chunked(path: String, chunk_size: Int) -> String!:
     stream := file_stream_open_read(path)!
-    content := read_all_file_stream_chunked(stream, chunk_size)!
-    stream.close()
-    return content
+    defer stream.close()
+    return read_all_file_stream_chunked(stream, chunk_size)
 
 # write text to a file, replacing existing contents.
 pub fn write_file_text(path: String, data: String) -> Int!:
@@ -1190,10 +1189,10 @@ pub fn write_file_text(path: String, data: String) -> Int!:
 # write text to a file with an explicit chunk size.
 pub fn write_file_text_chunked(path: String, data: String, chunk_size: Int) -> Int!:
     stream := file_stream_open_write(path)!
+    defer stream.close()
     writer := stream.buffered_writer_chunked(chunk_size)
     mut total := writer.write(data)!
     total = total + writer.flush()!
-    stream.close()
     return total
 
 # append text to a file.
@@ -1203,10 +1202,10 @@ pub fn append_file_text(path: String, data: String) -> Int!:
 # append text to a file with an explicit chunk size.
 pub fn append_file_text_chunked(path: String, data: String, chunk_size: Int) -> Int!:
     stream := file_stream_open_append(path)!
+    defer stream.close()
     writer := stream.buffered_writer_chunked(chunk_size)
     mut total := writer.write(data)!
     total = total + writer.flush()!
-    stream.close()
     return total
 
 fn write_all_process_stdin(writer: ProcessStdin, data: String) -> Int!:

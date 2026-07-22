@@ -267,30 +267,25 @@ impl ServerConn:
     # reads frames directly rather than going through the reader loop.
     fn read_header_block(first: frames.HeadersFrame) -> Bytes!:
         out := bytes.buffer()
+        defer out.free()
         out.write(first.block_fragment)!
         mut done := first.end_headers
         mut continuations := 0
         while not done:
             frame := self.read_frame()!
             if frame.header.frame_type != frames.FRAME_CONTINUATION:
-                out.free()
                 fail "http2: expected a CONTINUATION frame to complete the header block"
             if frame.header.stream_id != first.stream_id:
-                out.free()
                 fail "http2: CONTINUATION frame on the wrong stream"
             continuations = continuations + 1
             if continuations > MAX_CONTINUATION_FRAMES:
-                out.free()
                 fail "http2: too many CONTINUATION frames in one header block"
             cont := frames.parse_continuation(frame)!
             out.write(cont.block_fragment)!
             if out.len() > MAX_HEADER_BLOCK_BYTES:
-                out.free()
                 fail "http2: header block exceeds the maximum size"
             done = cont.end_headers
-        result := out.bytes()
-        out.free()
-        return result
+        return out.bytes()
 
     # close the underlying transport.
     fn close():
@@ -673,38 +668,32 @@ fn writer_loop(conn: ServerConn, outbound: Channel[Outbound], closed: AtomicInt)
 # has begun is trailers, which this phase ignores.
 fn assemble_request(inbox: Channel[StreamEvent]) -> http.HttpRequestBytes!:
     body := bytes.buffer()
+    defer body.free()
     mut fields: List[hpack.HeaderField] := []
     mut got_headers := false
     mut received := 0
     while true:
         opt := inbox.recv()
         if opt == none:
-            body.free()
             fail "http2: stream closed before the request completed"
         event := opt?
         if event.is_reset():
-            body.free()
             fail "http2: stream reset by the client"
         if event.is_headers():
             if not got_headers:
                 fields = event.headers
                 got_headers = true
             if event.end:
-                data := body.bytes()
-                body.free()
-                return build_request(fields, data)!
+                return build_request(fields, body.bytes())!
         elif event.is_data():
             # cap the accumulated body so an endless DATA stream cannot exhaust
             # memory; the handler answers this with a stream reset.
             received = received + event.data.len()
             if received > http.MAX_REQUEST_BODY:
-                body.free()
                 fail BODY_TOO_LARGE
             body.write(event.data)!
             if event.end:
-                data := body.bytes()
-                body.free()
-                return build_request(fields, data)!
+                return build_request(fields, body.bytes())!
 
 # run one request stream to completion: assemble the request, call the user
 # handler, and submit the response to the writer. an assemble failure (the client

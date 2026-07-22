@@ -423,6 +423,7 @@ fn multipart_random_boundary() -> String!:
 fn encode_multipart(parts: List[MultipartPart], boundary: String) -> Bytes!:
     crlf := chr(13) + chr(10)
     out := bytes.buffer()
+    errdefer out.free()
     for part in parts:
         out.write_string_utf8("--" + boundary + crlf)!
         out.write_string_utf8("Content-Disposition: " + multipart_content_disposition(part) + crlf)!
@@ -1112,6 +1113,7 @@ fn consume_chunk_line_ending(reader: BufferedBytesReader):
 fn read_chunked_body(reader: BufferedBytesReader, limit: Int) -> Bytes!:
     nl := bytes.from_string_utf8(chr(10))
     out := bytes.buffer()
+    errdefer out.free()
     while true:
         line := reader.read_until_bytes_including(nl)!
         if line.is_empty():
@@ -1126,7 +1128,6 @@ fn read_chunked_body(reader: BufferedBytesReader, limit: Int) -> Bytes!:
         # bogus chunk-size line (e.g. 7fffffff) cannot trigger a huge pre-allocation
         # inside read_exact_bytes ahead of the cap check.
         if limit > 0 and out.len() + chunk_size > limit:
-            out.free()
             fail BODY_LIMIT_MESSAGE
         out.write(reader.read_exact_bytes(chunk_size)!)!
         consume_chunk_line_ending(reader)
@@ -1138,6 +1139,7 @@ fn read_exact_from_tls(conn: tls.Conn, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     out := bytes.buffer_with_capacity(count)
+    errdefer out.free()
     while out.len() < count:
         chunk := conn.read_bytes(count - out.len())!
         if chunk.is_empty():
@@ -1149,6 +1151,7 @@ fn read_until_including_from_tls(conn: tls.Conn, sep: Bytes) -> Bytes!:
     if sep.is_empty():
         fail "empty separator"
     out := bytes.buffer()
+    errdefer out.free()
     mut window := bytes.empty()
     while true:
         chunk := conn.read_bytes(1)!
@@ -1174,6 +1177,7 @@ fn consume_chunk_line_ending_tls(conn: tls.Conn):
 fn read_chunked_body_tls(conn: tls.Conn, limit: Int) -> Bytes!:
     nl := bytes.from_string_utf8(chr(10))
     out := bytes.buffer()
+    errdefer out.free()
     while true:
         line := read_until_including_from_tls(conn, nl)!
         if line.is_empty():
@@ -1188,13 +1192,13 @@ fn read_chunked_body_tls(conn: tls.Conn, limit: Int) -> Bytes!:
         # bogus chunk-size line cannot trigger a huge pre-allocation inside
         # read_exact_from_tls ahead of the cap check (mirrors read_chunked_body).
         if limit > 0 and out.len() + chunk_size > limit:
-            out.free()
             fail BODY_LIMIT_MESSAGE
         out.write(read_exact_from_tls(conn, chunk_size)!)!
         consume_chunk_line_ending_tls(conn)
 
 fn read_response_head_buffered(reader: BufferedBytesReader) -> Bytes!:
     buf := bytes.buffer_with_capacity(1024)
+    defer buf.free()
     mut head_end := -1
     mut scan_start := 0
     while head_end < 0:
@@ -1214,6 +1218,7 @@ fn read_response_head_buffered(reader: BufferedBytesReader) -> Bytes!:
 
 fn read_response_head_tls(conn: tls.Conn) -> Bytes!:
     buf := bytes.buffer_with_capacity(1024)
+    defer buf.free()
     mut head_end := -1
     mut scan_start := 0
     while head_end < 0:
@@ -1673,6 +1678,7 @@ impl HttpResponse:
     fn to_bytes() -> Bytes!:
         header_bytes := response_head_bytes(self, self.body.len(), false)!
         buf := bytes.buffer_with_capacity(header_bytes.len() + self.body.len())
+        errdefer buf.free()
         buf.write(header_bytes)!
         if self.body.len() > 0:
             buf.write(self.body)!
@@ -1832,6 +1838,7 @@ fn read_request_head_buffered_bytes(reader: BufferedBytesReader) -> Bytes!:
     # accumulated head per byte (the old scan rebuilt the buffer's bytes
     # on every iteration — quadratic allocation per request)
     buf := bytes.buffer_with_capacity(1024)
+    errdefer buf.free()
     mut w1 := 0
     mut w2 := 0
     mut w3 := 0
@@ -1839,14 +1846,13 @@ fn read_request_head_buffered_bytes(reader: BufferedBytesReader) -> Bytes!:
     while true:
         chunk := reader.read_bytes(1)!
         if chunk.is_empty():
-            if buf.len() == 0:
-                return bytes.empty()
+            # take_bytes frees the buffer; on an empty head it yields empty bytes,
+            # the same value the old early return produced.
             return buf.take_bytes()
         buf.write(chunk)!
         # refuse a head that grows past the limit rather than buffering it forever
         # (an endless head is a slowloris / memory-exhaustion vector).
         if buf.len() > MAX_HEADER_BYTES:
-            buf.free()
             fail HEADER_LIMIT_MESSAGE
         w1 = w2
         w2 = w3
@@ -1874,6 +1880,7 @@ fn read_request_from_buffered_bytes(reader: BufferedBytesReader) -> HttpRequestB
     if content_length > MAX_REQUEST_BODY:
         fail BODY_LIMIT_MESSAGE
     body_buf := bytes.buffer_with_capacity(content_length)
+    errdefer body_buf.free()
     while body_buf.len() < content_length:
         remaining := content_length - body_buf.len()
         chunk := reader.read_bytes(remaining)!
@@ -1887,19 +1894,18 @@ fn read_request_from_buffered_string(reader: BufferedStringReader) -> HttpReques
     if request_line == "":
         return build_http_request(bytes.empty(), bytes.empty())
     raw := bytes.buffer_with_capacity(1024)
+    defer raw.free()
     raw.write(bytes.from_string_utf8(request_line + crlf))!
     mut line := reader.read_line()!
     while line.len() > 0:
         raw.write(bytes.from_string_utf8(line + crlf))!
         # bound the head here too, so this legacy path shares the same limit.
         if raw.len() > MAX_HEADER_BYTES:
-            raw.free()
             fail HEADER_LIMIT_MESSAGE
         line = reader.read_line()!
     raw.write(bytes.from_string_utf8(crlf))!
     content_length := content_length_from_head_bytes(raw.bytes())!
     if content_length > MAX_REQUEST_BODY:
-        raw.free()
         fail BODY_LIMIT_MESSAGE
     if content_length > 0:
         raw.write(bytes.from_string_utf8(reader.read(content_length)!))!
@@ -2040,10 +2046,13 @@ pub fn send(fd: Int, response: HttpResponse) -> Int!:
 pub fn send_response_bytes(fd: Int, response: Bytes) -> Int!:
     stream := io.from_fd(fd)
     writer := stream.buffered_bytes_writer()
+    # close the fd and drop the writer's registry entry on every exit, so a failed
+    # write or flush cannot leak them. last-in-first-out runs the free before the
+    # close, matching the original order.
+    defer tcp_close(fd)
+    defer writer.free()
     written := writer.write_all_bytes(response)!
     writer.flush()!
-    writer.free()
-    tcp_close(fd)
     return written
 # sends a raw response string to a file descriptor.
 pub fn send_response(fd: Int, response: String) -> Int!:
@@ -2339,13 +2348,13 @@ fn redirect_request(req: ClientRequest, resp: HttpResponse) -> ClientRequest!:
 
 fn send_request_plain(req: ClientRequest) -> HttpResponse!:
     stream := io.connect(req.host, req.port)!
+    defer stream.close()
     if req.timeout_ms >= 0:
         stream.set_timeout(req.timeout_ms)
     writer := stream.buffered_bytes_writer()
     writer.write_all_bytes(req.to_bytes()!)!
     writer.flush()!
     raw := stream.read_all_bytes_chunked(4096)!
-    stream.close()
     return parse_response_bytes(raw)
 
 fn send_request_tls(req: ClientRequest, server_name: String, config: tls.Config) -> HttpResponse!:
@@ -2353,20 +2362,20 @@ fn send_request_tls(req: ClientRequest, server_name: String, config: tls.Config)
     if req.timeout_ms >= 0:
         stream.set_timeout(req.timeout_ms)
     conn := tls.client(stream, server_name, config)!
+    defer conn.close()
     conn.write_all_bytes(req.to_bytes()!)!
     raw := conn.read_all_bytes_chunked(4096)!
-    conn.close()
     return parse_response_bytes(raw)
 
 fn send_request_plain_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
     stream := io.connect(req.host, req.port)!
+    defer stream.close()
     if req.timeout_ms >= 0:
         stream.set_timeout(req.timeout_ms)
     req_writer := stream.buffered_bytes_writer()
     req_writer.write_all_bytes(req.to_bytes()!)!
     req_writer.flush()!
     streamed := read_response_buffered_bytes_into(stream.buffered_bytes_reader_chunked(512), writer)!
-    stream.close()
     return streamed
 
 fn send_request_tls_into(req: ClientRequest, server_name: String, config: tls.Config, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
@@ -2374,9 +2383,9 @@ fn send_request_tls_into(req: ClientRequest, server_name: String, config: tls.Co
     if req.timeout_ms >= 0:
         stream.set_timeout(req.timeout_ms)
     conn := tls.client(stream, server_name, config)!
+    defer conn.close()
     conn.write_all_bytes(req.to_bytes()!)!
     streamed := read_response_tls_into(conn, writer)!
-    conn.close()
     return streamed
 
 fn discard_response_writer() -> BufferedBytesWriter:
@@ -2384,6 +2393,7 @@ fn discard_response_writer() -> BufferedBytesWriter:
 
 fn send_request_plain_into_with_redirects(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
     stream := io.connect(req.host, req.port)!
+    defer stream.close()
     if req.timeout_ms >= 0:
         stream.set_timeout(req.timeout_ms)
     req_writer := stream.buffered_bytes_writer()
@@ -2394,10 +2404,8 @@ fn send_request_plain_into_with_redirects(req: ClientRequest, writer: BufferedBy
     resp := response_from_head_and_body(head, bytes.empty())!
     if req.redirect_limit > 0 and redirect_status(resp.status):
         stream_response_body_buffered(head, reader, discard_response_writer())!
-        stream.close()
         return StreamedHttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), copy_string_list(resp.set_cookie_headers), 0)
     body_size := stream_response_body_buffered(head, reader, writer)!
-    stream.close()
     return streamed_response_from_head(head, body_size)
 
 fn send_request_tls_into_with_redirects(req: ClientRequest, server_name: String, config: tls.Config, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
@@ -2405,15 +2413,14 @@ fn send_request_tls_into_with_redirects(req: ClientRequest, server_name: String,
     if req.timeout_ms >= 0:
         stream.set_timeout(req.timeout_ms)
     conn := tls.client(stream, server_name, config)!
+    defer conn.close()
     conn.write_all_bytes(req.to_bytes()!)!
     head := read_response_head_tls(conn)!
     resp := response_from_head_and_body(head, bytes.empty())!
     if req.redirect_limit > 0 and redirect_status(resp.status):
         stream_response_body_tls(head, conn, discard_response_writer())!
-        conn.close()
         return StreamedHttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), copy_string_list(resp.set_cookie_headers), 0)
     body_size := stream_response_body_tls(head, conn, writer)!
-    conn.close()
     return streamed_response_from_head(head, body_size)
 
 fn send_request_once(req: ClientRequest) -> HttpResponse!:
@@ -2663,6 +2670,7 @@ impl ClientRequest:
         req = req + "Content-Length: " + self.body.len().to_string() + crlf + crlf
         head := bytes.from_string_utf8(req)
         buf := bytes.buffer_with_capacity(head.len() + self.body.len())
+        defer buf.free()
         buf.write(head)!
         if not self.body.is_empty():
             buf.write(self.body)!
@@ -2893,6 +2901,7 @@ pub fn serve_connection_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpRespons
 # scan read_request_head_buffered_bytes uses, only sourced from the tls conn.
 fn read_request_head_tls(conn: tls.Conn) -> Bytes!:
     buf := bytes.buffer_with_capacity(1024)
+    errdefer buf.free()
     mut w1 := 0
     mut w2 := 0
     mut w3 := 0
@@ -2900,14 +2909,13 @@ fn read_request_head_tls(conn: tls.Conn) -> Bytes!:
     while true:
         chunk := conn.read_bytes(1)!
         if chunk.is_empty():
-            if buf.len() == 0:
-                return bytes.empty()
+            # take_bytes frees the buffer; an empty head yields empty bytes, the
+            # same value the old early return produced.
             return buf.take_bytes()
         buf.write(chunk)!
         # refuse a head that grows past the limit, exactly as the plaintext reader
         # does, so the tls fallback bounds an endless head too.
         if buf.len() > MAX_HEADER_BYTES:
-            buf.free()
             fail HEADER_LIMIT_MESSAGE
         w1 = w2
         w2 = w3
@@ -2935,6 +2943,7 @@ fn read_request_from_tls(conn: tls.Conn) -> HttpRequestBytes!:
     if content_length > MAX_REQUEST_BODY:
         fail BODY_LIMIT_MESSAGE
     body_buf := bytes.buffer_with_capacity(content_length)
+    errdefer body_buf.free()
     while body_buf.len() < content_length:
         remaining := content_length - body_buf.len()
         chunk := conn.read_bytes(remaining)!

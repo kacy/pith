@@ -1,0 +1,57 @@
+# errdefer: cleanup that runs only on the error path.
+#
+# a transaction is the classic case. you begin it, do the work, and commit.
+# if a step fails the change must roll back — but a successful commit must
+# NOT be undone. `errdefer rollback(tx)` runs on exactly the error exits (a
+# `fail` or an `!` that propagates) and stays out of the way on success.
+#
+# the store here is in memory so the example is self-contained, but the
+# shape is the one you'd write against std.db: begin, errdefer rollback,
+# work, commit.
+
+mut balance := 100
+mut open_tx := 0
+
+struct Tx:
+    pub staged: Int
+
+fn begin() -> Tx:
+    open_tx = open_tx + 1
+    print("begin (balance={balance}, open={open_tx})")
+    return Tx{balance}
+
+fn commit(tx: Tx):
+    balance = tx.staged
+    open_tx = open_tx - 1
+    print("commit (balance={balance}, open={open_tx})")
+
+fn rollback(tx: Tx):
+    open_tx = open_tx - 1
+    print("rollback (balance={balance}, open={open_tx})")
+
+# stage a withdrawal on the transaction; fails if it would overdraw.
+fn withdraw(tx: Tx, amount: Int) -> Tx!:
+    if amount > tx.staged:
+        fail "insufficient funds"
+    remaining := tx.staged - amount
+    print("withdraw {amount} (staged {tx.staged} -> {remaining})")
+    return Tx{remaining}
+
+fn transfer(amount: Int) -> Int!:
+    tx := begin()
+    errdefer rollback(tx)
+
+    staged := withdraw(tx, amount)!
+    commit(staged)
+    return staged.staged
+
+fn main():
+    print("--- succeeds: commit, no rollback ---")
+    a := transfer(30) catch 0 - 1
+    print("transfer returned {a}")
+
+    print("--- fails: errdefer rolls back ---")
+    b := transfer(500) catch 0 - 1
+    print("transfer returned {b}")
+
+    print("balance={balance}, open transactions={open_tx}")

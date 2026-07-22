@@ -218,6 +218,26 @@ the point of that change was correctness, not speed: before it, running
 several pooled connections in parallel raced the global maps and crashed;
 the throughput bump was a free side effect.
 
+`bench/green_fanout` — spawn short tasks in batches of 64, await each,
+repeat, and read peak rss from `/proc/self/status`. this is the shape a
+server takes when it fans work out per request, and green now bounds its
+memory: a finished task hands its slab slot back for the next spawn to
+reuse and releases the closure it was spawned with, so the working set is
+the tasks alive at once, not the total ever spawned.
+
+| green, batch 64 | 200k tasks | 500k tasks |
+|---|---:|---:|
+| before reclaim | 90 mb | 226 mb |
+| after reclaim | 3.1 mb | 3.1 mb |
+
+before, rss climbed ~460 bytes per task and never came back — the slab
+grew one entry per spawn and each task's closure was never freed. after,
+it is flat: 500k tasks or five million, the peak is the batch. the default
+os-thread backend still keeps a record per task it has run, so its rss
+still grows with the total (the closure release lands there too, but the
+slot does not); giving that slab the same reclamation is a tracked
+follow-up, and until then this bound is a green-only property.
+
 `bench/std_pipeline` — 50k records: csv read/write, transform, json,
 gzip:
 
@@ -595,6 +615,9 @@ for i in 1 2 3 4 5; do ./bench/std_pipeline 50000; done   # take medians
 for i in 1 2 3 4 5; do ./bench/catalog_workload 200000; done
 ./target/release/pith build bench/closure_error.pith      # closures + error paths
 for i in 1 2 3 4 5; do ./bench/closure_error 200000; done
+./target/release/pith build bench/green_fanout.pith       # per-task memory under fan-out
+PITH_GREEN=1 ./bench/green_fanout 200000                  # green: flat rss; drop the flag to see os-thread grow
+PITH_GREEN=1 ./bench/green_fanout 500000                  # peak rss should barely move
 ```
 
 go and rust counterparts build per `bench/README.md`; `closure_error`

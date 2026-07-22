@@ -133,13 +133,20 @@ pub fn compress(data: Bytes) -> Bytes:
 ## length trailer verified. concatenated members (cat a.gz b.gz)
 ## decompress to their concatenated payloads, as gunzip does.
 pub fn decompress(data: Bytes) -> Bytes!:
+    return decompress_bounded(data, inflate.DEFAULT_MAX_OUTPUT)!
+
+## decompress with an explicit ceiling on the total decoded size across all
+## members; fails once the output would exceed `max_output`. use this on
+## untrusted input (an upload, a `Content-Encoding: gzip` body) to bound the
+## damage a decompression bomb can do.
+pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
     if data.len() < 18:
         fail gzip_invalid()
     out := bytes.buffer()
     mut pos := 0
     while pos < data.len():
         start := gzip_parse_header_at(data, pos)!
-        result := inflate.inflate_with_end(data, start)!
+        result := inflate.inflate_with_end_bounded(data, start, max_output - out.len())!
         payload := result.payload
         trailer := result.next_pos
         if trailer + 8 > data.len():
@@ -192,6 +199,20 @@ test "gzip rejects invalid input":
 
     assert(not is_valid(bad))
     assert(decompress(bad).is_err)
+
+test "gzip decompress is bounded against a bomb":
+    # 64k of one byte compresses tiny but expands well past a small cap;
+    # decompress_bounded must refuse it rather than allocate the full output.
+    big := bytes.buffer_with_capacity(65536)
+    mut i := 0
+    while i < 65536:
+        big.write_byte(65)!
+        i = i + 1
+    archive := compress(big.bytes())
+    assert(decompress_bounded(archive, 1024).is_err)
+    # a cap at or above the true size still decompresses cleanly.
+    ok := decompress_bounded(archive, 65536)!
+    assert_eq(ok.len(), 65536)
 
 test "gzip handles empty large and file round trips":
     empty_roundtrip := decompress(compress(bytes.empty()))!

@@ -212,6 +212,15 @@ well under one and raised throughput on a two-core box (see the grpc section
 of `docs/performance.md`). it does the least for tasks that are already
 cpu-bound and rarely wait — those never hit the handoffs green makes cheap.
 
+it also keeps memory flat under fan-out. when a task finishes, the green
+backend reclaims its slot and releases the closure it was spawned with, so a
+server that spawns one task per request holds only the tasks running at once,
+not one record for every request it has ever served. a fan-out of 500k short
+tasks that used to climb to ~226 mb now holds around 3 mb, flat no matter how
+many run in total — see the green fan-out row in `docs/performance.md`. (the default
+os-thread backend still keeps a record per task it has run; teaching it the
+same reclamation is the next step.)
+
 it is off by default and still experimental. the known rough edges:
 
 - dns resolution at dial still blocks the worker (`getaddrinfo` is

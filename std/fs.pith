@@ -137,8 +137,8 @@ pub fn write_atomic(target_path: String, data: String) -> Bool!:
             fail "could not create parent dir: " + parent
     temp_path := atomic_temp_path(target_path)
     write(temp_path, data)!
+    errdefer remove(temp_path)
     if not rename(temp_path, target_path):
-        remove(temp_path)
         fail "could not replace file atomically: " + target_path
     return true
 
@@ -150,8 +150,8 @@ pub fn write_bytes_atomic(target_path: String, data: Bytes) -> Bool!:
             fail "could not create parent dir: " + parent
     temp_path := atomic_temp_path(target_path)
     write_bytes(temp_path, data)!
+    errdefer remove(temp_path)
     if not rename(temp_path, target_path):
-        remove(temp_path)
         fail "could not replace file atomically: " + target_path
     return true
 

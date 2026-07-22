@@ -132,8 +132,10 @@ per-instantiation specialization, closures with capture, tuples,
 type aliases. `mut` is required for reassignment. `for` drives
 collections, strings, ranges (`0..n`, `0..=n`), and anything with a
 `fn next() -> T?` method. match checks exhaustiveness. generics
-monomorphize. concurrency is structured: spawn/await with `Task[T]`,
-channels, select, mutexes, wait groups, contexts, timers.
+monomorphize. `defer` runs cleanup on every exit from a scope and
+`errdefer` runs it only on the error exit (docs/defer.md). concurrency
+is structured: spawn/await with `Task[T]`, channels, select, mutexes,
+wait groups, contexts, timers.
 
 the full grammar is [docs/grammar.ebnf](docs/grammar.ebnf); the tour
 with idioms is [docs/idiomatic_pith.md](docs/idiomatic_pith.md).

@@ -115,6 +115,47 @@ inspect the error payload.
 Prefer `catch`, `unwrap_or`, and `or_else` when they make recovery clearer than
 manual `is_err` branching.
 
+## cleanup with `defer` and `errdefer`
+
+Pair a cleanup with the thing it cleans up, right where you acquire it. `defer`
+schedules a statement to run on every exit from the block — falling off the end,
+a `return`, a `fail`, or a `!` that propagates. You write the close once, next to
+the open, and the error path can't skip it:
+
+```pith
+fn write_report(path: String) -> Int!:
+    f := open(path)!
+    defer f.close()
+
+    f.write("line one")!    # if this fails, f still closes on the way out
+    f.write("line two")!
+    return 2
+```
+
+Reach for it wherever you'd otherwise close a file, unlock a mutex, or release
+any resource by hand. Defers within a block run last-in-first-out, and a defer
+inside a loop belongs to that iteration.
+
+`errdefer` is the error-only sibling: it runs when the block exits through a
+`fail` or a `!`, and stays quiet on a normal return. Use it to undo a
+half-finished change — the transaction rollback is the motivating case:
+
+```pith
+fn transfer(db: Db, src: Int, dst: Int, cents: Int) -> Int!:
+    tx := db.begin()!
+    errdefer tx.rollback()   # only if we leave through an error
+
+    tx.debit(src, cents)!
+    tx.credit(dst, cents)!
+    tx.commit()!
+    return cents
+```
+
+If `debit` or `credit` fails, the `!` propagates and the rollback runs. If the
+`commit` succeeds, the `errdefer` does not fire — a plain `defer` would roll back
+the commit you just made. See [defer.md](defer.md) for the full rules, including
+what you can and can't defer.
+
 ## absence: `T?` vs `T!`
 
 Pith has two distinct shapes for "no value here". Pick by intent, not by mood:

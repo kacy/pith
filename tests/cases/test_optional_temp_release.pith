@@ -1,0 +1,43 @@
+# exercises the if-let / while-let / unwrap_or paths on a *fresh* optional (a
+# call or method result). such an optional is an owned shell the consumer must
+# release after use — without leaking it or double-freeing its heap payload.
+# run under valgrind, this catches a use-after-free in the shell release or the
+# unwrap_or retain-transfer; the printed sum catches a behavior regression.
+
+struct Bag:
+    mut items: List[String]
+
+impl Bag:
+    fn pop() -> String?:
+        if self.items.len() == 0:
+            return none
+        n := self.items.len() - 1
+        last := self.items[n]
+        self.items.remove(n)
+        return last
+
+fn main() -> Int!:
+    mut m: Map[String, String] := {}
+    m.insert("k", "value-string")
+    mut sum := 0
+    mut i := 0
+    while i < 500:
+        # if-let on a fresh String? — the some path borrows the heap payload
+        if let v = m.get("k"):
+            sum = sum + v.len()
+        # if-let none path — the shell exists but has no payload
+        if let miss = m.get("absent"):
+            sum = sum + miss.len()
+        # unwrap_or whose result escapes: the some path must retain the payload
+        # out of the shell before it is freed
+        got := m.get("k").unwrap_or("fallback")
+        sum = sum + got.len()
+        missed := m.get("absent").unwrap_or("fallback")
+        sum = sum + missed.len()
+        i = i + 1
+    # while-let draining a fresh optional each iteration
+    mut bag := Bag(items: ["a", "bb", "ccc"])
+    while let item = bag.pop():
+        sum = sum + item.len()
+    print("sum=" + sum.to_string())
+    return 0

@@ -3671,6 +3671,10 @@ fn ir_emit_method_call(idx: Int) -> Int:
             if recv_info.kind == "optional" and mname == "unwrap_or":
                 # some(v) -> v, none -> the default argument
                 obj_r := ir_expr(node.children[0])
+                # a fresh optional (a call/method result) is an owned shell that
+                # would otherwise leak; release it once at the merge below.
+                owns_subject := ir_optional_subject_is_owned(node.children[0])
+                inner_kind := ir_rc_kind(ir_type_from_tid(recv_info.inner))
                 flag_r := ir_optional_flag_field(obj_r)
                 tmp := ir_new_temp_name("unwrap_or")
                 some_l := ir_label()
@@ -3679,6 +3683,10 @@ fn ir_emit_method_call(idx: Int) -> Int:
                 ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
                 ir_emit_label(some_l)
                 inner_r := ir_optional_value_field(obj_r, recv_tid)
+                # the result escapes to the caller, so a heap inner must be
+                # retained out of the shell before the shell is freed below.
+                if owns_subject and inner_kind.len() > 0:
+                    ir_rc_retain_reg(inner_r, inner_kind)
                 ir_emit("store " + tmp + " " + inner_r.to_string())
                 ir_emit("jmp " + end_l)
                 ir_emit_label(none_l)
@@ -3686,6 +3694,8 @@ fn ir_emit_method_call(idx: Int) -> Int:
                 default_r := ir_expr(default_idx)
                 ir_emit("store " + tmp + " " + default_r.to_string())
                 ir_emit_label(end_l)
+                if owns_subject:
+                    ir_emit_call1(ir_reg(), "pith_struct_release", "void", obj_r)
                 out_r := ir_reg()
                 ir_emit("load " + out_r.to_string() + " " + tmp)
                 return out_r
@@ -5094,10 +5104,27 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
         return
     ir_emit_match_bindings(pat_idx, subj_r, "")
 
+# true when an optional subject is a fresh shell the consumer owns and must
+# release after use — a call or method-call result mints one (map.get(k), f()).
+# borrowed subjects (a variable, field, element, self) are owned at their own
+# scope and released there, so releasing here would double-free. suppressed
+# inside generic/specialized bodies where the shape can't be trusted, mirroring
+# ir_expr_is_transferred_call_temp.
+fn ir_optional_subject_is_owned(idx: Int) -> Bool:
+    if ir_active_generic_params.len() > 0 or ir_current_impl_subst_params.len() > 0:
+        return false
+    kind := node_kind(idx)
+    return kind == "call" or kind == "method_call"
+
 fn ir_emit_if_let_stmt(node: Node):
     if node.children.len() < 3:
         return
     subj_r := ir_expr(node.children[1])
+    # a fresh optional (a call/method result) is an owned shell; the binding
+    # below borrows its value into the loop-style scope, so the shell is
+    # released once at the merge — mirroring the for-each next() path — instead
+    # of leaking one shell (and its payload) per evaluation.
+    owns_subject := ir_optional_subject_is_owned(node.children[1])
     cond_r := ir_emit_let_cond(node.children[0], subj_r)
     then_l := ir_label()
     else_l := ir_label()
@@ -5114,6 +5141,8 @@ fn ir_emit_if_let_stmt(node: Node):
     if node.children.len() > 3:
         ir_block(node.children[3])
     ir_emit_label(end_l)
+    if owns_subject:
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
     ir_last_was_ret = false
 
 fn ir_emit_while_let_stmt(node: Node):
@@ -5124,6 +5153,7 @@ fn ir_emit_while_let_stmt(node: Node):
     end_label := ir_label()
     ir_emit_label(head_label)
     subj_r := ir_expr(node.children[1])
+    owns_subject := ir_optional_subject_is_owned(node.children[1])
     cond_r := ir_emit_let_cond(node.children[0], subj_r)
     ir_emit("brif " + cond_r.to_string() + " " + body_label + " " + end_label)
     ir_emit_label(body_label)
@@ -5134,8 +5164,14 @@ fn ir_emit_while_let_stmt(node: Node):
     ir_block(node.children[2])
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
+    # release this iteration's owned shell before looping (the body borrowed its
+    # value); the shell that fails the condition is released after the loop.
+    if owns_subject:
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
     ir_emit("jmp " + head_label)
     ir_emit_label(end_label)
+    if owns_subject:
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
     ir_last_was_ret = false
 
 fn ir_emit_while_stmt(node: Node):

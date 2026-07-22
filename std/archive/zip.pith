@@ -247,6 +247,7 @@ pub fn list(data: Bytes) -> List[ZipEntry]!:
 # create a zip archive from paths.
 pub fn create(paths: List[String]) -> Bytes!:
     out := bytes.buffer()
+    defer out.free()
     mut records: List[ZipRecord] := []
     for input_path in paths:
         if not fs.exists(input_path):
@@ -296,6 +297,7 @@ pub fn extract_file(archive_path: String, output_dir: String) -> Bool!:
 
 fn zip_test_manual_archive(name: String, content: Bytes, method: Int, crc_value: Int) -> Bytes!:
     out := bytes.buffer()
+    defer out.free()
     name_bytes := bytes.from_string_utf8(name)
     zip_write_u32(out, LOCAL_HEADER_SIG)!
     zip_write_u16(out, VERSION_NEEDED)!

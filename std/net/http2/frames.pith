@@ -259,14 +259,13 @@ fn strip_padding(payload: Bytes, pad_length: Int, already_read: Int) -> Bytes!:
 # serialize a frame (9-byte header + payload) to bytes.
 pub fn frame_bytes(frame: Frame) -> Bytes!:
     out := bytes.buffer()
+    defer out.free()
     checked_write(binary.write_u24_be(out, frame.payload.len()))!
     checked_write(binary.write_u8(out, frame.header.frame_type))!
     checked_write(binary.write_u8(out, frame.header.flags))!
     checked_write(binary.write_u32_be(out, bits.band(frame.header.stream_id, STREAM_ID_MASK)))!
     out.write(frame.payload)!
-    result := out.bytes()
-    out.free()
-    return result
+    return out.bytes()
 
 # read one frame from a binary reader, rejecting payloads larger than
 # `max_frame_size`. the reserved high bit of the stream id is masked off.
@@ -340,14 +339,13 @@ pub fn parse_headers(frame: Frame) -> HeadersFrame!:
 # build a PRIORITY frame advising dependency and weight for a stream.
 pub fn priority_frame(stream_id: Int, exclusive: Bool, dependency: Int, weight: Int) -> Frame!:
     out := bytes.buffer()
+    defer out.free()
     mut raw := bits.band(dependency, STREAM_ID_MASK)
     if exclusive:
         raw = bits.bor(raw, HIGH_BIT)
     checked_write(binary.write_u32_be(out, raw))!
     checked_write(binary.write_u8(out, weight))!
-    payload := out.bytes()
-    out.free()
-    return make_frame(FRAME_PRIORITY, 0, stream_id, payload)
+    return make_frame(FRAME_PRIORITY, 0, stream_id, out.bytes())
 
 # decode a PRIORITY frame; its payload must be exactly five octets.
 pub fn parse_priority(frame: Frame) -> PriorityFrame!:
@@ -365,10 +363,9 @@ pub fn parse_priority(frame: Frame) -> PriorityFrame!:
 # build a RST_STREAM frame terminating a stream with an error code.
 pub fn rst_stream_frame(stream_id: Int, error_code: Int) -> Frame!:
     out := bytes.buffer()
+    defer out.free()
     checked_write(binary.write_u32_be(out, error_code))!
-    payload := out.bytes()
-    out.free()
-    return make_frame(FRAME_RST_STREAM, 0, stream_id, payload)
+    return make_frame(FRAME_RST_STREAM, 0, stream_id, out.bytes())
 
 # decode a RST_STREAM frame; its payload must be exactly four octets.
 pub fn parse_rst_stream(frame: Frame) -> RstStreamFrame!:
@@ -383,12 +380,11 @@ pub fn parse_rst_stream(frame: Frame) -> RstStreamFrame!:
 # build a SETTINGS frame carrying a list of parameters.
 pub fn settings_frame(settings: List[Setting]) -> Frame!:
     out := bytes.buffer()
+    defer out.free()
     for setting in settings:
         checked_write(binary.write_u16_be(out, setting.id))!
         checked_write(binary.write_u32_be(out, setting.value))!
-    payload := out.bytes()
-    out.free()
-    return make_frame(FRAME_SETTINGS, 0, 0, payload)
+    return make_frame(FRAME_SETTINGS, 0, 0, out.bytes())
 
 # build an empty SETTINGS frame with the ACK flag set.
 pub fn settings_ack_frame() -> Frame:
@@ -420,10 +416,10 @@ pub fn parse_settings(frame: Frame) -> SettingsFrame!:
 # build a PUSH_PROMISE frame reserving `promised_stream_id`.
 pub fn push_promise_frame(stream_id: Int, promised_stream_id: Int, block_fragment: Bytes, end_headers: Bool) -> Frame!:
     out := bytes.buffer()
+    defer out.free()
     checked_write(binary.write_u32_be(out, bits.band(promised_stream_id, STREAM_ID_MASK)))!
     out.write(block_fragment)!
     payload := out.bytes()
-    out.free()
     mut flags := 0
     if end_headers:
         flags = bits.bor(flags, FLAG_END_HEADERS)
@@ -470,12 +466,11 @@ pub fn parse_ping(frame: Frame) -> PingFrame!:
 # build a GOAWAY frame beginning connection shutdown.
 pub fn goaway_frame(last_stream_id: Int, error_code: Int, debug_data: Bytes) -> Frame!:
     out := bytes.buffer()
+    defer out.free()
     checked_write(binary.write_u32_be(out, bits.band(last_stream_id, STREAM_ID_MASK)))!
     checked_write(binary.write_u32_be(out, error_code))!
     out.write(debug_data)!
-    payload := out.bytes()
-    out.free()
-    return make_frame(FRAME_GOAWAY, 0, 0, payload)
+    return make_frame(FRAME_GOAWAY, 0, 0, out.bytes())
 
 # decode a GOAWAY frame; the fixed section is eight octets plus debug data.
 pub fn parse_goaway(frame: Frame) -> GoawayFrame!:
@@ -496,10 +491,9 @@ pub fn parse_goaway(frame: Frame) -> GoawayFrame!:
 # a zero stream id targets the whole connection.
 pub fn window_update_frame(stream_id: Int, increment: Int) -> Frame!:
     out := bytes.buffer()
+    defer out.free()
     checked_write(binary.write_u32_be(out, bits.band(increment, STREAM_ID_MASK)))!
-    payload := out.bytes()
-    out.free()
-    return make_frame(FRAME_WINDOW_UPDATE, 0, stream_id, payload)
+    return make_frame(FRAME_WINDOW_UPDATE, 0, stream_id, out.bytes())
 
 # decode a WINDOW_UPDATE frame; its payload must be exactly four octets.
 pub fn parse_window_update(frame: Frame) -> WindowUpdateFrame!:

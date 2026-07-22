@@ -86,6 +86,7 @@ struct FrameHeader:
 # 3. Base64 encode the hash
 pub fn compute_accept_bytes(key: Bytes) -> String!:
     buf := bytes.buffer_with_capacity(key.len() + WS_MAGIC.len())
+    defer buf.free()
     buf.write(key)!
     buf.write(bytes.from_string_utf8(WS_MAGIC))!
     combined := buf.bytes()
@@ -229,6 +230,7 @@ fn find_http_head_end(raw: Bytes) -> Int:
     return - 1
 fn read_http_head(reader: BufferedBytesReader) -> Bytes!:
     buf := bytes.buffer_with_capacity(DEFAULT_READ_CHUNK_SIZE)
+    defer buf.free()
     mut head_end := -1
     while head_end < 0:
         chunk := reader.read_bytes(1)!
@@ -293,6 +295,9 @@ pub fn dial(host: String, port: Int, path: String) -> WebSocket!:
 # dials a websocket endpoint with custom headers.
 pub fn dial_with_headers(host: String, port: Int, path: String, headers: Map[String, String]) -> WebSocket!:
     conn := io.connect(host, port)!
+    # close the connection on any error exit before the handshake completes; on
+    # success it lives on inside the returned websocket, so errdefer stays silent.
+    errdefer conn.close()
     key := random_client_key()!
     key_text := encoding.b64_encode(key)
     request := client_request_with_key(default_host_header(host, port), path, headers, key)!
@@ -301,7 +306,6 @@ pub fn dial_with_headers(host: String, port: Int, path: String, headers: Map[Str
     ensure_writer_flushed(writer)!
     response_head := read_http_head(conn.buffered_bytes_reader_chunked(1))!
     if not validate_upgrade_response(response_head, bytes.from_string_utf8(key_text))!:
-        conn.close()
         fail "invalid websocket handshake response"
     return register_websocket(conn, true)
 # upgrades an accepted http connection to a websocket.
@@ -437,6 +441,7 @@ fn apply_mask(payload: Bytes, mask_key: Bytes) -> Bytes!:
     if mask_key.len() != 4:
         fail "websocket mask key must be 4 bytes"
     buf := bytes.buffer_with_capacity(payload.len())
+    defer buf.free()
     mut i := 0
     while i < payload.len():
         buf.write_byte(bits.xor(payload[i], mask_key[i % 4]))!
@@ -532,6 +537,7 @@ fn frame_bytes_with_fin(opcode: Int, payload: Bytes, fin: Bool) -> Bytes!:
     if fin:
         first = bits.bor(first, 128)
     buf := bytes.buffer_with_capacity(payload.len() + 10)
+    defer buf.free()
     buf.write_byte(first)!
     append_frame_length(buf, payload.len(), false)!
     buf.write(payload)!
@@ -546,6 +552,7 @@ fn masked_payload(payload: Bytes, mask_key: Bytes) -> Bytes!:
     return apply_mask(payload, mask_key)
 fn close_payload(code: Int, reason: String) -> Bytes!:
     payload := bytes.buffer_with_capacity(reason.len() + 2)
+    defer payload.free()
     wrote := bin.write_u16_be(payload, code)
     if wrote.is_err:
         fail wrote.err.message
@@ -565,6 +572,7 @@ fn masked_frame_bytes_with_fin(opcode: Int, payload: Bytes, mask_key: Bytes, fin
     if fin:
         first = bits.bor(first, 128)
     buf := bytes.buffer_with_capacity(payload.len() + 14)
+    defer buf.free()
     buf.write_byte(first)!
     append_frame_length(buf, payload.len(), true)!
     buf.write(mask_key)!
@@ -586,6 +594,7 @@ fn read_exact_bytes(reader: BufferedBytesReader, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
+    defer buf.free()
     while buf.bytes().len() < count:
         remaining := count - buf.bytes().len()
         chunk := reader.read_bytes(remaining)!
@@ -630,11 +639,11 @@ fn handle_control_frame(ws: WebSocket, frame: WebSocketFrame) -> Bool!:
     return false
 
 # fail the read when a reassembled message outgrows its caps, closing the peer with
-# 1009 first so it learns why. the reassembly buffer is freed on the way out.
+# 1009 first so it learns why. the caller owns the reassembly buffer and frees it
+# on the way out, so this only signals the peer and reports the error.
 fn enforce_message_limits(ws: WebSocket, message_buf: ByteBuffer, fragments: Int) -> Int!:
     if message_buf.len() <= MAX_MESSAGE_BYTES and fragments <= MAX_MESSAGE_FRAGMENTS:
         return 0
-    message_buf.free()
     ws.close(WS_CLOSE_MESSAGE_TOO_BIG, "message too big") catch 0
     fail "websocket message exceeds the maximum size"
 
@@ -643,6 +652,9 @@ fn receive_message(ws: WebSocket) -> WebSocketMessage!:
         fail "websocket is closed"
     mut message_opcode := OP_CONTINUATION
     mut message_buf := bytes.buffer()
+    # the reassembly buffer is a native allocation arc won't reclaim; free it on
+    # every exit. the returned message copies its bytes, so freeing after is safe.
+    defer message_buf.free()
     mut fragments := 0
     reader := websocket_reader(ws)
     while true:

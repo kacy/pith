@@ -179,30 +179,25 @@ impl Connection:
     # reads frames directly rather than going through the main loop.
     fn read_header_block(first: frames.HeadersFrame) -> Bytes!:
         out := bytes.buffer()
+        defer out.free()
         out.write(first.block_fragment)!
         mut done := first.end_headers
         mut continuations := 0
         while not done:
             frame := self.read_frame()!
             if frame.header.frame_type != frames.FRAME_CONTINUATION:
-                out.free()
                 fail "http2: expected a CONTINUATION frame to complete the header block"
             if frame.header.stream_id != first.stream_id:
-                out.free()
                 fail "http2: CONTINUATION frame on the wrong stream"
             continuations = continuations + 1
             if continuations > MAX_CONTINUATION_FRAMES:
-                out.free()
                 fail "http2: too many CONTINUATION frames in one header block"
             cont := frames.parse_continuation(frame)!
             out.write(cont.block_fragment)!
             if out.len() > MAX_HEADER_BLOCK_BYTES:
-                out.free()
                 fail "http2: header block exceeds the maximum size"
             done = cont.end_headers
-        result := out.bytes()
-        out.free()
-        return result
+        return out.bytes()
 
     # grant flow-control credit for `amount` consumed body bytes: always at the
     # connection level, and at the stream level while the stream stays open.
@@ -219,6 +214,7 @@ impl Connection:
     # GOAWAY and RST_STREAM, and replenish flow-control credit as body arrives.
     fn read_response(stream_id: Int) -> Response!:
         body := bytes.buffer()
+        defer body.free()
         mut status := 0
         mut headers: List[hpack.HeaderField] := []
         mut trailers: List[hpack.HeaderField] := []
@@ -241,9 +237,7 @@ impl Connection:
                     else:
                         trailers = decoded
                     if hf.end_stream:
-                        data := body.bytes()
-                        body.free()
-                        return Response(status, headers, trailers, data)
+                        return Response(status, headers, trailers, body.bytes())
             elif t == frames.FRAME_DATA:
                 df := frames.parse_data(frame)!
                 if df.stream_id == stream_id:
@@ -251,9 +245,7 @@ impl Connection:
                     # flow control counts the whole frame payload, padding included.
                     self.replenish(stream_id, frame.header.length, df.end_stream)!
                     if df.end_stream:
-                        data := body.bytes()
-                        body.free()
-                        return Response(status, headers, trailers, data)
+                        return Response(status, headers, trailers, body.bytes())
             elif t == frames.FRAME_SETTINGS:
                 sf := frames.parse_settings(frame)!
                 if not sf.ack:
@@ -265,12 +257,10 @@ impl Connection:
             elif t == frames.FRAME_GOAWAY:
                 ga := frames.parse_goaway(frame)!
                 if ga.last_stream_id < stream_id:
-                    body.free()
                     fail "http2: server sent GOAWAY ({frames.error_name(ga.error_code)}) before serving stream {stream_id}"
             elif t == frames.FRAME_RST_STREAM:
                 rs := frames.parse_rst_stream(frame)!
                 if rs.stream_id == stream_id:
-                    body.free()
                     fail "http2: stream {stream_id} was reset by the peer ({frames.error_name(rs.error_code)})"
             # WINDOW_UPDATE, PRIORITY, PUSH_PROMISE and unknown types need no
             # action to complete a single response, so they are ignored here.
@@ -972,6 +962,7 @@ fn writer_loop(outbound: Channel[Bytes], conn: Connection, closed: AtomicInt) ->
 # that arrives after the body has begun is the trailers.
 fn assemble_response(inbox: Channel[StreamEvent]) -> Response!:
     body := bytes.buffer()
+    defer body.free()
     mut status := 0
     mut headers: List[hpack.HeaderField] := []
     mut trailers: List[hpack.HeaderField] := []
@@ -979,16 +970,13 @@ fn assemble_response(inbox: Channel[StreamEvent]) -> Response!:
     while true:
         opt := inbox.recv()
         if opt == none:
-            body.free()
             fail "http2: connection closed before the response completed"
         event := opt?
         if event.kind == STREAM_UNARY:
             # the reader coalesced the whole response into one event, so there is
             # nothing to assemble across frames — return it directly.
-            body.free()
             return Response(status_from(event.headers), event.headers, event.trailers, event.data)
         if event.kind == STREAM_RESET:
-            body.free()
             fail "http2: stream was reset by the peer ({frames.error_name(event.error_code)})"
         if event.kind == STREAM_HEADERS:
             if not got_headers:
@@ -1000,9 +988,7 @@ fn assemble_response(inbox: Channel[StreamEvent]) -> Response!:
         elif event.kind == STREAM_DATA:
             body.write(event.data)!
         if event.end:
-            data := body.bytes()
-            body.free()
-            return Response(status, headers, trailers, data)
+            return Response(status, headers, trailers, body.bytes())
 
 # apply the peer's SETTINGS (RFC 9113 §6.5.2). the header-table-size bounds our
 # hpack encoder so the indices we emit stay valid for the peer's decoder; the
@@ -1052,12 +1038,11 @@ fn header_list_size(fields: List[hpack.HeaderField]) -> Int:
 # 9113 §6.10).
 fn header_block_wire(stream_id: Int, block: Bytes, end_stream: Bool, max_frame_size: Int) -> Bytes!:
     out := bytes.buffer()
+    defer out.free()
     total := block.len()
     if total <= max_frame_size:
         out.write(frames.frame_bytes(frames.headers_frame(stream_id, block, end_stream, true))!)!
-        result := out.bytes()
-        out.free()
-        return result
+        return out.bytes()
     # first slice goes in the HEADERS frame without END_HEADERS; the rest follow
     # in CONTINUATION frames, the last of which carries END_HEADERS.
     out.write(frames.frame_bytes(frames.headers_frame(stream_id, block.slice(0, max_frame_size), end_stream, false))!)!
@@ -1068,9 +1053,7 @@ fn header_block_wire(stream_id: Int, block: Bytes, end_stream: Bool, max_frame_s
             stop = total
         out.write(frames.frame_bytes(frames.continuation_frame(stream_id, block.slice(pos, stop), stop == total))!)!
         pos = stop
-    result := out.bytes()
-    out.free()
-    return result
+    return out.bytes()
 
 # apply an inbound WINDOW_UPDATE to our send windows and wake any body sender
 # waiting on the affected stream. a stream-0 update grows the connection window,

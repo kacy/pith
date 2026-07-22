@@ -61,6 +61,8 @@ fn serve_scrape(fd: Int):
 # does not hold up the next one.
 pub fn serve(host: String, port: Int) -> Int!:
     fd := tcp_listen(host, port)!
+    # close the listener if the accept loop ever exits through an error.
+    defer tcp_close(fd)
     while true:
         client := tcp_accept(fd)!
         scrape_slots.acquire()
@@ -108,7 +110,7 @@ test "serve answers several concurrent scrapes":
     metrics.counter("scrape_hits_total").describe("scrapes served", "1").inc()
     port := 19464
     spawn serve_bg(port)
-    time.delay(200)   # let the listener bind before scraping
+    time.delay(200) # let the listener bind before scraping
 
     ta := spawn raw_scrape(port)
     tb := spawn raw_scrape(port)

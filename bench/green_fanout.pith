@@ -1,0 +1,72 @@
+# green fan-out benchmark: spawn a batch of short tasks, await the batch,
+# repeat. this is the shape a server takes when it fans work out per
+# request, and it is what the task-slab + spawn-closure reclamation bounds:
+# peak memory tracks the tasks alive at once, not the total ever spawned.
+#
+# it reports both throughput (spawn/await round-trips per second) and peak
+# rss, read straight from /proc/self/status. run it at two different task
+# counts and the peak rss should barely move — that flat line is the point.
+#
+#   pith build bench/green_fanout.pith
+#   ./bench/green_fanout 1000000        # tasks (default 500000)
+#   PITH_GREEN=1 ./bench/green_fanout 1000000
+#
+# batch size is fixed small so the working set is a handful of tasks; the
+# leak, if it were still there, would show as rss climbing with the total.
+
+import std.fs as fs
+
+BATCH := 64
+
+fn tasks_from_args() -> Int:
+    argv := args()
+    if argv.len() > 1:
+        parsed := parse_int(argv[1])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return 500000
+
+fn worker(id: Int) -> Int:
+    return id * 2 + 1
+
+# spawn a batch of workers, then fan in by awaiting each.
+fn run_batch(batch: Int) -> Int:
+    mut tasks: List[Task[Int]] := []
+    mut i := 0
+    while i < batch:
+        tasks.push(spawn worker(i))
+        i = i + 1
+    mut total := 0
+    for t in tasks:
+        total = total + await t
+    return total
+
+fn peak_rss_kb() -> Int:
+    status := fs.read("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            digits := line.replace("VmHWM:", "").replace("kB", "").trim()
+            parsed := parse_int(digits)
+            if parsed.is_ok:
+                return parsed.ok
+    return 0
+
+fn main() -> Int!:
+    total_tasks := tasks_from_args()
+    rounds := total_tasks / BATCH
+
+    start := time()
+    mut checksum := 0
+    mut r := 0
+    while r < rounds:
+        checksum = checksum + run_batch(BATCH)
+        r = r + 1
+    elapsed := time() - start
+
+    tasks_run := rounds * BATCH
+    mut rate := 0
+    if elapsed > 0:
+        rate = tasks_run * 1000 / elapsed
+    peak := peak_rss_kb()
+    print("green_fanout: tasks {tasks_run} batch {BATCH} time {elapsed}ms rate {rate}/s peak_rss {peak}kb checksum {checksum}")
+    return 0

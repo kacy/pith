@@ -65,6 +65,7 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
     let handle = std::thread::spawn(move || {
         let func_ptr = crate::pith_closure_get_fn(closure_handle);
         if func_ptr == 0 {
+            crate::pith_closure_release(closure_handle);
             let (lock, cvar) = &*shared_clone;
             let mut state = lock_shared(lock);
             state.done = true;
@@ -74,6 +75,11 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
         }
         let func: extern "C" fn(i64) -> i64 = std::mem::transmute(func_ptr as *const ());
         let result = func(closure_handle);
+        // the body has run, so release the one closure reference the task owned —
+        // otherwise every spawned task leaks its closure environment (the emitter
+        // moves the closure into `spawn` and never releases it). mirrors the green
+        // backend's release in `finish_task`.
+        crate::pith_closure_release(closure_handle);
         let (lock, cvar) = &*shared_clone;
         let mut state = lock_shared(lock);
         state.done = true;

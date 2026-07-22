@@ -104,6 +104,7 @@ fn zlib_decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
 
 fn zlib_compress_result(data: Bytes) -> Bytes!:
     out := bytes.buffer_with_capacity(2 + data.len() + 4)
+    defer out.free()
     zlib_write_header(out)!
     out.write(deflate_engine.deflate(data)!)!
     zlib_write_u32_be(out, checksum.adler32(data))!
@@ -161,6 +162,7 @@ test "zlib round trips bytes and strings":
 
 test "zlib reads a stored deflate fixture":
     fixture_buf := bytes.buffer()
+    defer fixture_buf.free()
     fixture_buf.write_byte(120)!
     fixture_buf.write_byte(1)!
     fixture_buf.write_byte(1)!
@@ -181,6 +183,7 @@ test "zlib reads a stored deflate fixture":
 test "zlib rejects invalid input":
     bad := bytes.from_string_utf8("not zlib")
     bad_buf := bytes.buffer()
+    defer bad_buf.free()
     bad_buf.write_byte(120)!
     bad_buf.write_byte(1)!
     bad_buf.write_byte(1)!
@@ -205,6 +208,7 @@ test "zlib handles empty large and file round trips":
     assert(empty_roundtrip.is_empty())
 
     large := bytes.buffer_with_capacity(66000)
+    defer large.free()
     mut i := 0
     while i < 66000:
         large.write_byte(65)!

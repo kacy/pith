@@ -234,6 +234,7 @@ pub fn inflate_with_end(data: Bytes, start: Int) -> InflateResult!:
 pub fn inflate_with_end_bounded(data: Bytes, start: Int, max_output: Int) -> InflateResult!:
     r := BitReader(data, start, 0)
     out := bytes.buffer()
+    errdefer out.free()
     mut final_block := false
     while not final_block:
         final_block = br_read_bits(r, 1)! == 1

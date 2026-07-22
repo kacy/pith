@@ -203,8 +203,18 @@ fn err_text(payload: Bytes) -> String:
 pub fn connect(host: String, port: Int, user: String, password: String, database: String) -> Conn!:
     fd := tcp_connect(host, port)!
     conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: false, tls_handle: 0, last_seq: 0)
-    greeting := conn.read_packet()!
-    conn.authenticate(greeting, user, password, database, 1)!
+    # the conn owns the socket but nothing closes it until the caller does. a
+    # failed greeting or auth never reaches the caller, so close it here rather
+    # than leak the socket on every failed dial (the conn is plain, so close()
+    # just tcp_closes the fd once).
+    greeting := conn.read_packet()
+    if greeting.is_err:
+        conn.close()
+        fail greeting.err
+    started := conn.authenticate(greeting.ok, user, password, database, 1)
+    if started.is_err:
+        conn.close()
+        fail started.err
     return conn
 
 # like connect, but upgrade the socket to tls before sending credentials. the
@@ -213,7 +223,12 @@ pub fn connect(host: String, port: Int, user: String, password: String, database
 pub fn connect_tls(host: String, port: Int, user: String, password: String, database: String, server_name: String, config: tls.Config) -> Conn!:
     fd := tcp_connect(host, port)!
     conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: false, tls_handle: 0, last_seq: 0)
-    greeting := conn.read_packet()!
+    # the conn is plain until the tls upgrade lands, so every failure up to that
+    # point closes it with conn.close() (a single tcp_close on the fd).
+    greeting := conn.read_packet()
+    if greeting.is_err:
+        conn.close()
+        fail greeting.err
 
     ssl := bytes.buffer()
     ssl.write(le_int(CAPS_BASE + CAP_SSL, 4)) catch 0
@@ -223,13 +238,26 @@ pub fn connect_tls(host: String, port: Int, user: String, password: String, data
     while z < 23:
         ssl.write_byte(0) catch 0
         z = z + 1
-    conn.send_packet(1, ssl.bytes())!
+    sent := conn.send_packet(1, ssl.bytes())
+    if sent.is_err:
+        conn.close()
+        fail sent.err
     ssl.free()
 
-    session := tls.client(TcpStream(fd), server_name, config)!
+    session_result := tls.client(TcpStream(fd), server_name, config)
+    if session_result.is_err:
+        # the tls upgrade never completed, so the fd is still a plain socket.
+        conn.close()
+        fail session_result.err
+    session := session_result.ok
     conn.secure = true
     conn.tls_handle = session.handle
-    conn.authenticate(greeting, user, password, database, 2)!
+    # from here the tls session owns the socket. on a failed auth close through
+    # the session once — not conn.close(), which would tcp_close the fd twice.
+    started := conn.authenticate(greeting.ok, user, password, database, 2)
+    if started.is_err:
+        tls.conn_from_handle(session.handle).close()
+        fail started.err
     return conn
 
 impl Conn:

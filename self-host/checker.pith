@@ -1278,6 +1278,8 @@ fn check_statement(node_idx: Int, scope_id: Int):
         check_match_expression(node_idx, scope_id)
     elif node.kind == "defer":
         check_defer_statement(node, scope_id)
+    elif node.kind == "errdefer":
+        check_errdefer_statement(node, scope_id)
     else:
         # expression statement
         c_check_expr(node_idx, scope_id)
@@ -1291,6 +1293,25 @@ fn check_defer_statement(node: Node, scope_id: Int):
     if get_scope_return_type(scope_id) < 0:
         report_error("E260", "defer is only allowed inside a function")
         return
+    check_defer_body(node, scope_id)
+
+# `errdefer` shares every restriction with `defer` on its inner statement, but
+# it only runs on an error exit (fail / `!`-propagation), so it is meaningless
+# in a function that can't return an error. require a result (`T!`) return type.
+fn check_errdefer_statement(node: Node, scope_id: Int):
+    ret_type := get_scope_return_type(scope_id)
+    if ret_type < 0:
+        report_error("E260", "errdefer is only allowed inside a function")
+        return
+    if get_type_info(ret_type).kind != "result":
+        report_error_with_fix("E260", "errdefer is only meaningful in a function returning a result (`T!`)", "use `defer` for cleanup that must always run, or give the function a `T!` return type")
+        return
+    check_defer_body(node, scope_id)
+
+# shared inner-statement validation for `defer` and `errdefer`: both re-emit
+# their inner statement at scope-exit edges, so both forbid the same unsafe
+# shapes and both need the inner statement type-checked for the emitter.
+fn check_defer_body(node: Node, scope_id: Int):
     if node.children.len() < 1:
         return
     inner_idx := node.children[0]
@@ -1311,7 +1332,7 @@ fn defer_body_has_forbidden_node(idx: Int) -> Bool:
     k := node.kind
     if k == "return" or k == "fail" or k == "break" or k == "continue":
         return true
-    if k == "defer" or k == "binding" or k == "bind":
+    if k == "defer" or k == "errdefer" or k == "binding" or k == "bind":
         return true
     if k == "try" or k == "try_expr" or k == "unwrap":
         return true

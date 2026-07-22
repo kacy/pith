@@ -1,0 +1,37 @@
+# defer + errdefer + arc must stay flat across a loop. each cleanup reads an
+# owned local, so on the error paths it has to run before the arc cleanup that
+# frees it, and on the ok paths the errdefer must be skipped without disturbing
+# cleanup. run under memcheck: a skipped cleanup or a release-before-defer bug
+# shows up here as a leak or a use-after-free.
+struct Handle:
+    pub name: String
+
+fn note(name: String, count: Int):
+    combined := name + ":" + count.to_string()
+    if combined.len() == 0:
+        print(combined)
+
+fn use_handle(n: Int) -> Int!:
+    h := Handle{"handle-" + n.to_string()}
+    tags := ["open", h.name]
+    defer note(h.name, tags.len())
+    errdefer note("rollback-" + h.name, tags.len())
+    if n % 3 == 0:
+        fail "rejected-" + n.to_string()
+    return tags.len()
+
+fn relay(n: Int) -> Int!:
+    owned := "relay-" + n.to_string()
+    parts := [owned, "tail"]
+    errdefer note(owned, parts.len())
+    v := use_handle(n)!
+    return v + parts.len()
+
+fn main():
+    mut total := 0
+    mut i := 0
+    while i < 400:
+        total = total + (use_handle(i) catch 0)
+        total = total + (relay(i) catch 0)
+        i = i + 1
+    print(total.to_string())

@@ -1,0 +1,10 @@
+--- succeeds: commit, no rollback ---
+begin (balance=100, open=1)
+withdraw 30 (staged 100 -> 70)
+commit (balance=70, open=0)
+transfer returned 70
+--- fails: errdefer rolls back ---
+begin (balance=70, open=1)
+rollback (balance=70, open=0)
+transfer returned -1
+balance=70, open transactions=0

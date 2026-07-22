@@ -379,9 +379,11 @@ impl Db:
     # of protocol sync, so it is closed rather than reused.
     fn run_query(text: String, params: List[String]) -> List[sql.Row]!:
         conn := self.borrow()!
+        # any error before the giveback leaves the connection out of protocol
+        # sync, so discard it (closed, its slot returned) rather than reuse it.
+        errdefer self.discard(conn)
         gathered := gather(conn, text, params)
         if gathered.is_err:
-            self.discard(conn)
             fail gathered.err
         self.giveback(conn)
         return gathered.ok
@@ -390,9 +392,9 @@ impl Db:
     # return the connection to the pool.
     fn run_exec(text: String, params: List[String]) -> db.ExecResult!:
         conn := self.borrow()!
+        errdefer self.discard(conn)
         info := apply(conn, text, params)
         if info.is_err:
-            self.discard(conn)
             fail info.err
         self.giveback(conn)
         return info.ok
@@ -416,9 +418,11 @@ impl Db:
     # returns to the pool. see the Tx methods above.
     pub fn begin() -> Tx!:
         handle := pin_connection(self.handle)!
+        # if BEGIN fails the pinned connection never becomes a live transaction,
+        # so discard it; on success the Tx keeps the pin and this does not run.
+        errdefer pin_discard(handle)
         started := mysql.query(pin_conn(handle), "begin")
         if started.is_err:
-            pin_discard(handle)
             fail started.err
         return Tx(handle: handle)
 
@@ -427,9 +431,9 @@ impl Db:
     # with Stmt.close(), which returns the connection to the pool.
     pub fn prepare(text: String) -> Stmt!:
         handle := pin_connection(self.handle)!
+        errdefer pin_discard(handle)
         attempt := mysql.prepare(pin_conn(handle), text)
         if attempt.is_err:
-            pin_discard(handle)
             fail attempt.err
         slot := register_prepared(attempt.ok)
         return Stmt(handle: handle, slot: slot)

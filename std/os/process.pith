@@ -116,15 +116,9 @@ fn start_or_fail(cmd: Command) -> Process!BlockingError:
         fail blocking_failed(started.err)
     return started.ok
 
-fn kill_and_reap(process: Process):
-    process.kill()
-    process.wait()
-    process.close()
-
-fn await_output_or_fail(process: Process, task: Task[String!]) -> String!BlockingError:
+fn await_output_or_fail(task: Task[String!]) -> String!BlockingError:
     result := await task
     if result.is_err:
-        process.close()
         fail blocking_failed(result.err)
     return result.ok
 
@@ -176,13 +170,13 @@ pub fn run(cmd: Command) -> Int!:
 # runs a command with cancellation and deadline support.
 pub fn run_ctx(cmd: Command, ctx: Context) -> Int!BlockingError:
     process := start_or_fail(cmd)!
+    defer process.close()
     wait_result := process.wait_ctx(ctx)
     if wait_result.is_err:
-        kill_and_reap(process)
+        process.kill()
+        process.wait()
         fail blocking_from_wait(wait_result.err)
-    status := wait_result.ok
-    process.close()
-    return status
+    return wait_result.ok
 
 # runs a command and captures its stdout and stderr.
 pub fn output(cmd: Command) -> Output!:
@@ -217,6 +211,7 @@ pub fn text_trimmed(cmd: Command) -> String!ExitError:
 # runs a command with cancellation and captures stdout and stderr.
 pub fn output_ctx(cmd: Command, ctx: Context) -> Output!BlockingError:
     process := start_or_fail(cmd)!
+    defer process.close()
     stdout_task := spawn read_stdout_worker(process)
     stderr_task := spawn read_stderr_worker(process)
     wait_result := process.wait_ctx(ctx)
@@ -225,13 +220,10 @@ pub fn output_ctx(cmd: Command, ctx: Context) -> Output!BlockingError:
         process.wait()
         await stdout_task
         await stderr_task
-        process.close()
         fail blocking_from_wait(wait_result.err)
-    stdout := await_output_or_fail(process, stdout_task)!
-    stderr := await_output_or_fail(process, stderr_task)!
-    status := wait_result.ok
-    process.close()
-    return Output(status, stdout, stderr)
+    stdout := await_output_or_fail(stdout_task)!
+    stderr := await_output_or_fail(stderr_task)!
+    return Output(wait_result.ok, stdout, stderr)
 
 impl Process:
     fn stdin() -> ProcessStdin:

@@ -1232,8 +1232,19 @@ fn parse_statement() -> Int:
     if _cur_tok_kind() == "kw_continue":
         advance_token()
         return add_leaf_with_position("continue", "")
+    if _cur_tok_kind() == "kw_defer":
+        return parse_defer_stmt()
 
     return parse_expr_stmt_or_assignment()
+
+# `defer <stmt>`: the inner statement is parsed like any other and stored as
+# the sole child. the emitter re-emits it at each scope-exit edge, so the
+# node itself carries no extra state.
+fn parse_defer_stmt() -> Int:
+    advance_token()
+    inner := parse_statement()
+    mut children: List[Int] := [inner]
+    return add_node_with_position("defer", "", children)
 
 fn looks_like_binding() -> Bool:
     mut i := 2

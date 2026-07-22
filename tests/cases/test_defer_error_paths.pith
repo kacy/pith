@@ -1,0 +1,35 @@
+# defer runs on the error exits too: a `fail`, and a `!` that propagates.
+# each cleanup prints so the order relative to the error is observable.
+fn open_and_fail(x: Int) -> Int!:
+    defer print("cleanup ran")
+    if x < 0:
+        fail "negative input"
+    return x * 2
+
+fn step(x: Int) -> Int!:
+    if x == 0:
+        fail "zero not allowed"
+    return x + 1
+
+fn propagate(x: Int) -> Int!:
+    defer print("propagate cleanup")
+    y := step(x)!
+    print("step gave {y}")
+    return y
+
+fn main():
+    print("--- fail path ---")
+    a := open_and_fail(0 - 1) catch 0 - 100
+    print("result={a}")
+
+    print("--- ok path ---")
+    b := open_and_fail(5) catch 0 - 100
+    print("result={b}")
+
+    print("--- propagate through ! (fails) ---")
+    c := propagate(0) catch 0 - 7
+    print("result={c}")
+
+    print("--- propagate through ! (ok) ---")
+    d := propagate(4) catch 0 - 7
+    print("result={d}")

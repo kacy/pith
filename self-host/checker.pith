@@ -1276,9 +1276,49 @@ fn check_statement(node_idx: Int, scope_id: Int):
             report_error("E215", "continue outside of loop")
     elif node.kind == "match_expr":
         check_match_expression(node_idx, scope_id)
+    elif node.kind == "defer":
+        check_defer_statement(node, scope_id)
     else:
         # expression statement
         c_check_expr(node_idx, scope_id)
+
+# a deferred statement runs on every exit from its enclosing scope, including
+# error paths. to keep that re-emission safe we only allow a plain side-effect
+# statement: no control transfer (return/fail/break/continue), no `!`/`?`
+# propagation (which would exit again mid-cleanup), no nested defer, and no
+# binding (its name would never be visible anyway).
+fn check_defer_statement(node: Node, scope_id: Int):
+    if get_scope_return_type(scope_id) < 0:
+        report_error("E260", "defer is only allowed inside a function")
+        return
+    if node.children.len() < 1:
+        return
+    inner_idx := node.children[0]
+    # reject the shapes we can't re-emit safely before type-checking, so a
+    # forbidden statement reports one clear error instead of a cascade.
+    if defer_body_has_forbidden_node(inner_idx):
+        report_error_with_fix("E260", "a deferred statement must be a plain side-effect (no return/fail/break/continue, no `!`/`?`, no defer or binding)", "move the control flow out of the defer, or wrap the cleanup in a helper function")
+        return
+    # type-check the inner statement so its expression types are recorded for
+    # the emitter.
+    check_statement(inner_idx, scope_id)
+
+# recursively scan a deferred statement for shapes that would make re-emitting
+# it at a scope exit unsafe. an early exit inside a defer would re-trigger the
+# very cleanup we are in the middle of, and a binding leaks no usable name.
+fn defer_body_has_forbidden_node(idx: Int) -> Bool:
+    node := get_node(idx)
+    k := node.kind
+    if k == "return" or k == "fail" or k == "break" or k == "continue":
+        return true
+    if k == "defer" or k == "binding" or k == "bind":
+        return true
+    if k == "try" or k == "try_expr" or k == "unwrap":
+        return true
+    for child in node.children:
+        if defer_body_has_forbidden_node(child):
+            return true
+    return false
 
 # ---------------------------------------------------------------
 # binding statement

@@ -1,0 +1,62 @@
+# defer runs on fall-through, on return, and in LIFO order. a module-global
+# counter observes each cleanup so the ordering is visible in the output.
+mut counter := 0
+
+fn bump(label: String):
+    counter = counter + 1
+    print("{label} counter={counter}")
+
+fn fallthrough():
+    defer bump("fallthrough defer")
+    print("fallthrough body")
+
+fn on_return(x: Int):
+    defer bump("return defer")
+    if x > 0:
+        print("early return")
+        return
+    print("no early return")
+
+fn lifo():
+    defer bump("first registered")
+    defer bump("second registered")
+    print("lifo body")
+
+fn untaken(x: Int):
+    if x > 0:
+        defer bump("untaken defer")
+        print("inside if")
+    print("after if")
+
+# a defer only applies to exits that happen after it is reached. the first
+# defer runs on the early return; the second is registered past that return,
+# so it only runs when the early return was not taken.
+fn before_after(x: Int):
+    defer bump("before-return defer")
+    if x > 0:
+        print("early exit")
+        return
+    defer bump("after-return defer")
+    print("past the return")
+
+fn main():
+    print("--- fall-through ---")
+    fallthrough()
+
+    print("--- return ---")
+    on_return(1)
+
+    print("--- lifo (second runs first) ---")
+    lifo()
+
+    print("--- untaken branch (x=0) ---")
+    untaken(0)
+
+    print("--- taken branch (x=1) ---")
+    untaken(1)
+
+    print("--- defer before an early return (x=1) ---")
+    before_after(1)
+
+    print("--- defer after the return point (x=0) ---")
+    before_after(0)

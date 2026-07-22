@@ -302,7 +302,6 @@ fn parse_class(c: Compiler):
         return
     c_emit(c, OP_CLASS, add_class(c, ranges, negate), 0)
 
-## compile a pattern; errors carry the offending position.
 # a pattern is usually dev-controlled, but a server that compiles a user-
 # supplied one must not be crashable by it: the parser recurses per group
 # nesting (deep nesting overflows the native stack) and quantifier handling is
@@ -310,6 +309,7 @@ fn parse_class(c: Compiler):
 # danger zone — real patterns are far shorter than this.
 MAX_PATTERN_LEN := 4096
 
+## compile a pattern; errors carry the offending position.
 pub fn compile(pattern: String) -> Regex!:
     if pattern.len() > MAX_PATTERN_LEN:
         fail "regex: pattern exceeds maximum length"

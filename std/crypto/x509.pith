@@ -25,10 +25,19 @@ TAG_GENERALIZED_TIME := 24
 TAG_DNS_NAME := 130
 TAG_IP_ADDRESS := 135
 TAG_EXTENSIONS := 163
+# name-constraints subtrees are implicitly tagged [0] (permitted) and [1]
+# (excluded); both are constructed context tags wrapping a sequence of subtrees.
+TAG_PERMITTED_SUBTREES := 160
+TAG_EXCLUDED_SUBTREES := 161
 
 OID_COMMON_NAME := "2.5.4.3"
 OID_SUBJECT_ALT_NAME := "2.5.29.17"
 OID_BASIC_CONSTRAINTS := "2.5.29.19"
+OID_EXTENDED_KEY_USAGE := "2.5.29.37"
+OID_NAME_CONSTRAINTS := "2.5.29.30"
+# extendedKeyUsage purpose ids we recognise for a tls server certificate.
+OID_SERVER_AUTH := "1.3.6.1.5.5.7.3.1"
+OID_ANY_EKU := "2.5.29.37.0"
 
 # one der tag-length-value entry.
 pub struct DerValue:
@@ -57,6 +66,19 @@ pub struct Certificate:
     pub dns_names: List[String]
     pub ip_addresses: List[String]
     pub is_ca: Bool
+    # raw der of the issuer and subject distinguished names, used for exact
+    # full-dn matching when selecting the issuer of a certificate.
+    pub issuer_dn: Bytes
+    pub subject_dn: Bytes
+    # extendedKeyUsage: has_eku is false when the extension is absent (which
+    # rfc 5280 treats as "valid for any purpose"). when present, eku_oids holds
+    # every listed purpose object identifier.
+    pub has_eku: Bool
+    pub eku_oids: List[String]
+    # dnsname name-constraints copied from this certificate when it is a ca.
+    # empty lists mean the certificate constrains no dnsnames.
+    pub permitted_dns: List[String]
+    pub excluded_dns: List[String]
 
 # result from native certificate verification preflight.
 pub struct VerificationResult:
@@ -251,9 +273,50 @@ fn parse_basic_constraints(data: Bytes, extn_value: DerValue) -> Bool!:
     body := value_bytes(inner, first)
     return body.len() > 0 and body[0] != 0
 
-fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_addresses: List[String]) -> Bool!:
+fn parse_eku(data: Bytes, extn_value: DerValue, eku_oids: List[String]) -> Bool!:
+    inner := value_bytes(data, extn_value)
+    seq := expect_tag(inner, 0, TAG_SEQUENCE)!
+    mut pos := seq.value_start
+    while pos < seq.value_end:
+        oid_value := expect_tag(inner, pos, TAG_OBJECT_ID)!
+        eku_oids.push(read_oid_value(inner, oid_value)!)
+        pos = oid_value.next
+    return true
+
+# collect the dnsname bases from one generalsubtrees value. we only look at
+# dnsname (context tag [2]); other name types are left unconstrained here.
+fn collect_dns_subtrees(inner: Bytes, subtrees: DerValue, out: List[String]) -> Bool!:
+    mut pos := subtrees.value_start
+    while pos < subtrees.value_end:
+        subtree := expect_tag(inner, pos, TAG_SEQUENCE)!
+        base := read_value(inner, subtree.value_start)!
+        if base.tag == TAG_DNS_NAME:
+            out.push(value_bytes(inner, base).to_string_utf8()!)
+        pos = subtree.next
+    return true
+
+fn parse_name_constraints(data: Bytes, extn_value: DerValue, permitted_dns: List[String], excluded_dns: List[String]) -> Bool!:
+    inner := value_bytes(data, extn_value)
+    constraints := expect_tag(inner, 0, TAG_SEQUENCE)!
+    mut pos := constraints.value_start
+    while pos < constraints.value_end:
+        field := read_value(inner, pos)!
+        if field.tag == TAG_PERMITTED_SUBTREES:
+            collect_dns_subtrees(inner, field, permitted_dns)!
+        elif field.tag == TAG_EXCLUDED_SUBTREES:
+            collect_dns_subtrees(inner, field, excluded_dns)!
+        pos = field.next
+    return true
+
+# extension data gathered in one pass over the certificate's extensions.
+struct ParsedExtensions:
+    is_ca: Bool
+    has_eku: Bool
+
+fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_addresses: List[String], eku_oids: List[String], permitted_dns: List[String], excluded_dns: List[String]) -> ParsedExtensions!:
     extensions := expect_tag(data, value.value_start, TAG_SEQUENCE)!
     mut is_ca := false
+    mut has_eku := false
     mut pos := extensions.value_start
     while pos < extensions.value_end:
         ext := expect_tag(data, pos, TAG_SEQUENCE)!
@@ -270,8 +333,13 @@ fn parse_extensions(data: Bytes, value: DerValue, dns_names: List[String], ip_ad
             parse_san(data, child, dns_names, ip_addresses)!
         elif oid == OID_BASIC_CONSTRAINTS:
             is_ca = parse_basic_constraints(data, child)!
+        elif oid == OID_EXTENDED_KEY_USAGE:
+            has_eku = true
+            parse_eku(data, child, eku_oids)!
+        elif oid == OID_NAME_CONSTRAINTS:
+            parse_name_constraints(data, child, permitted_dns, excluded_dns)!
         pos = ext.next
-    return is_ca
+    return ParsedExtensions(is_ca, has_eku)
 
 fn skip_optional_tbs_field(tag: Int) -> Bool:
     return tag == 129 or tag == 161 or tag == 130 or tag == 162
@@ -303,16 +371,24 @@ fn parse_tbs(data: Bytes, tbs: DerValue, signature_value: Bytes) -> Certificate!
     validity_parts := parse_validity(data, validity)!
     mut dns_names: List[String] := []
     mut ip_addresses: List[String] := []
+    mut eku_oids: List[String] := []
+    mut permitted_dns: List[String] := []
+    mut excluded_dns: List[String] := []
     mut is_ca := false
+    mut has_eku := false
     while pos < tbs.value_end:
         child := read_value(data, pos)!
         if child.tag == TAG_EXTENSIONS:
-            is_ca = parse_extensions(data, child, dns_names, ip_addresses)!
+            parsed := parse_extensions(data, child, dns_names, ip_addresses, eku_oids, permitted_dns, excluded_dns)!
+            is_ca = parsed.is_ca
+            has_eku = parsed.has_eku
         elif not skip_optional_tbs_field(child.tag):
             fail "unexpected tbs certificate field"
         pos = child.next
 
-    return Certificate(data, data.slice(tbs.header_start, tbs.next), data.slice(spki.header_start, spki.next), parse_spki_public_key(data, spki)!, signature_value, version, read_int_hex(data, serial)!, read_algorithm_oid(data, signature_alg)!, parse_spki_algorithm(data, spki)!, parse_name_common_name(data, issuer)!, parse_name_common_name(data, subject)!, validity_parts[0], validity_parts[1], dns_names, ip_addresses, is_ca)
+    issuer_dn := data.slice(issuer.header_start, issuer.next)
+    subject_dn := data.slice(subject.header_start, subject.next)
+    return Certificate(data, data.slice(tbs.header_start, tbs.next), data.slice(spki.header_start, spki.next), parse_spki_public_key(data, spki)!, signature_value, version, read_int_hex(data, serial)!, read_algorithm_oid(data, signature_alg)!, parse_spki_algorithm(data, spki)!, parse_name_common_name(data, issuer)!, parse_name_common_name(data, subject)!, validity_parts[0], validity_parts[1], dns_names, ip_addresses, is_ca, issuer_dn, subject_dn, has_eku, eku_oids, permitted_dns, excluded_dns)
 
 # parse a der-encoded x.509 certificate.
 pub fn parse_der(data: Bytes) -> Certificate!:
@@ -389,8 +465,58 @@ impl Certificate:
     fn matches_hostname(host: String) -> Bool:
         return matches_hostname(self, host)
 
+# candidate-selection check: does `issuer` look like the certificate that
+# signed `cert`? we compare the full distinguished names byte-for-byte rather
+# than just the common name. this only narrows which issuer we try; the
+# signature check in verify_signature is the real gate.
 fn issuer_matches(cert: Certificate, issuer: Certificate) -> Bool:
-    return cert.issuer_common_name != "" and cert.issuer_common_name == issuer.subject_common_name
+    return cert.issuer_dn.len() > 0 and bytes.eq(cert.issuer_dn, issuer.subject_dn)
+
+# a tls server leaf may carry an extendedKeyUsage extension. when it does, it
+# must allow serverAuth (or the anyExtendedKeyUsage escape hatch); a cert that
+# lists only clientAuth, emailProtection, codeSigning, etc. is being misused as
+# a server certificate and is rejected. an absent eku extension permits any
+# purpose per rfc 5280, so those certs pass.
+fn leaf_permits_server_auth(cert: Certificate) -> Bool:
+    if not cert.has_eku:
+        return true
+    for oid in cert.eku_oids:
+        if oid == OID_SERVER_AUTH or oid == OID_ANY_EKU:
+            return true
+    return false
+
+# rfc 5280 dnsname constraint match: a constraint of "example.com" matches
+# "example.com" and any subdomain; a leading-dot constraint (".example.com")
+# matches subdomains only. an empty constraint matches everything.
+fn dns_constraint_matches(constraint: String, name: String) -> Bool:
+    c := constraint.to_lower()
+    n := name.to_lower()
+    if c == "":
+        return true
+    if c.starts_with("."):
+        return n.ends_with(c)
+    if n == c:
+        return true
+    return n.ends_with("." + c)
+
+# enforce a ca's dnsname name-constraints against the leaf's dns sans. a leaf
+# name inside an excluded subtree is rejected; when the ca lists permitted
+# dnsname subtrees, every leaf dns name must fall inside one of them. only
+# dnsname constraints are enforced (see module notes); other name types pass.
+fn name_constraints_permit_leaf(leaf: Certificate, ca: Certificate) -> Bool:
+    for name in leaf.dns_names:
+        for excluded in ca.excluded_dns:
+            if dns_constraint_matches(excluded, name):
+                return false
+    if ca.permitted_dns.len() > 0:
+        for name in leaf.dns_names:
+            mut inside := false
+            for permitted in ca.permitted_dns:
+                if dns_constraint_matches(permitted, name):
+                    inside = true
+            if not inside:
+                return false
+    return true
 
 # read two ascii digits at `start` as an integer.
 fn parse_two_digits(text: String, start: Int) -> Int!:
@@ -466,6 +592,8 @@ fn validity_contains(cert: Certificate, now_ms: Int) -> Bool:
     return true
 
 EXPIRED_REASON := "certificate is expired or not yet valid"
+EKU_REASON := "certificate is not valid for tls server authentication"
+NAME_CONSTRAINT_REASON := "certificate name is outside a ca name constraint"
 
 fn verify_signature_for_algorithm(cert: Certificate, issuer: Certificate) -> Bool:
     if cert.signature_algorithm == "1.2.840.113549.1.1.11":
@@ -545,6 +673,9 @@ fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificat
             signature_verified = verify_signature(current, issuer)
             if not root_ca_ok or not signature_verified:
                 return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, verification_reason(hostname_ok, issuer_ok, root_ca_ok, signature_verified))
+            # a name-constrained intermediate may not sign outside its namespace.
+            if not name_constraints_permit_leaf(chain[0], issuer):
+                return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, NAME_CONSTRAINT_REASON)
             current = issuer
             next_chain_index = next_chain_index + 1
         else:
@@ -558,6 +689,9 @@ fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificat
             issuer_ok = true
             root_ca_ok = root.is_ca
             signature_verified = verify_signature(current, root)
+            # a name-constrained root may not anchor a chain outside its namespace.
+            if root_ca_ok and signature_verified and not name_constraints_permit_leaf(chain[0], root):
+                return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, NAME_CONSTRAINT_REASON)
             ok := hostname_ok and issuer_ok and root_ca_ok and signature_verified
             return VerificationResult(ok, hostname_ok, issuer_ok, root_ca_ok, signature_verified, verification_reason(hostname_ok, issuer_ok, root_ca_ok, signature_verified))
         depth = depth + 1
@@ -577,6 +711,10 @@ pub fn preflight_server_certificate(cert: Certificate, trusted_root: Certificate
     now_ms := time.now()
     if not validity_contains(cert, now_ms) or not validity_contains(trusted_root, now_ms):
         return VerificationResult(false, hostname_ok, false, false, false, EXPIRED_REASON)
+    # a leaf whose eku forbids server authentication is being misused as a
+    # server certificate, even if it chains and its name matches.
+    if not leaf_permits_server_auth(cert):
+        return VerificationResult(false, hostname_ok, false, false, false, EKU_REASON)
     issuer_ok := issuer_matches(cert, trusted_root)
     root_ca_ok := trusted_root.is_ca
     signature_verified := verify_signature(cert, trusted_root)
@@ -593,6 +731,10 @@ pub fn verify_server_chain(chain: List[Certificate], trusted_roots: List[Certifi
     hostname_ok := matches_hostname(leaf, host)
     if not hostname_ok:
         return VerificationResult(false, false, true, true, true, verification_reason(false, true, true, true))
+    # reject a leaf whose extendedKeyUsage does not permit tls server auth
+    # before doing the more expensive chain walk.
+    if not leaf_permits_server_auth(leaf):
+        return VerificationResult(false, hostname_ok, false, false, false, EKU_REASON)
 
     return verify_chain_issuers(chain, trusted_roots, hostname_ok)
 
@@ -603,6 +745,56 @@ pub fn verify_client_chain(chain: List[Certificate], trusted_roots: List[Certifi
     if trusted_roots.len() == 0:
         return VerificationResult(false, true, false, false, false, "trusted roots are empty")
     return verify_chain_issuers(chain, trusted_roots, true)
+
+test "x509 rejects a clientauth-only leaf used as a server certificate":
+    # this leaf is legitimately issued and chains to its ca, but its
+    # extendedKeyUsage lists only clientAuth. it must not verify as a server
+    # certificate even though the hostname and signature are fine.
+    leaf := parse_pem(read_file("tests/live/fixtures/clientauth-leaf.crt")!)!
+    ca := parse_pem(read_file("tests/live/fixtures/eku-ca.crt")!)!
+
+    assert(leaf.has_eku)
+    assert(not leaf.eku_oids.contains(OID_SERVER_AUTH))
+
+    server := verify_server_chain([leaf], [ca], "localhost")
+    assert(not server.ok)
+    assert_eq(server.reason, EKU_REASON)
+
+    # the same certificate is valid for client authentication, proving it is a
+    # real chain that we reject only for the wrong purpose.
+    client := verify_client_chain([leaf], [ca])
+    assert(client.ok)
+
+test "x509 accepts a serverauth leaf and an eku-less leaf":
+    # localhost.crt carries a serverAuth eku and must be accepted.
+    with_eku := parse_pem(read_file("tests/live/fixtures/localhost.crt")!)!
+    ca := parse_pem(read_file("tests/live/fixtures/localhost-ca.crt")!)!
+    assert(with_eku.has_eku)
+    assert(with_eku.eku_oids.contains(OID_SERVER_AUTH))
+    good := verify_server_chain([with_eku], [ca], "localhost")
+    assert(good.ok)
+
+    # a certificate with no eku extension is valid for any purpose, so the
+    # server-auth check must not reject it.
+    assert(not ca.has_eku)
+    assert(leaf_permits_server_auth(ca))
+
+test "x509 enforces dnsname name-constraints on the chain":
+    good := parse_pem(read_file("tests/live/fixtures/nc-good-leaf.crt")!)!
+    bad := parse_pem(read_file("tests/live/fixtures/nc-bad-leaf.crt")!)!
+    ca := parse_pem(read_file("tests/live/fixtures/nc-ca.crt")!)!
+
+    assert(ca.permitted_dns.contains("example.com"))
+
+    # good.example.com falls inside the permitted example.com subtree.
+    inside := verify_server_chain([good], [ca], "good.example.com")
+    assert(inside.ok)
+
+    # evil.com is outside the permitted subtree; the constrained ca may not
+    # anchor it even though the signature verifies and the hostname matches.
+    outside := verify_server_chain([bad], [ca], "evil.com")
+    assert(not outside.ok)
+    assert_eq(outside.reason, NAME_CONSTRAINT_REASON)
 
 test "der oid decoder reads common object ids":
     data := encoding.from_hex("0603551D11")!

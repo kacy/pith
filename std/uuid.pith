@@ -76,7 +76,9 @@ fn uuid_and_name_bytes(namespace: Uuid, name: String) -> Bytes:
     for value in namespace_bytes:
         out.write_byte(value)
     out.write_string_utf8(name)
-    return out.bytes()
+    result := out.bytes()
+    out.free()
+    return result
 
 fn format_uuid_bytes(raw: List[Int], version: Int) -> String:
     mut parts: List[String] := []

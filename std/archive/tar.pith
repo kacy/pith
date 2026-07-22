@@ -96,6 +96,7 @@ fn tar_push_checksum_field(out: List[Int], value: Int) -> Bool!:
 
 fn tar_bytes_from_list(values: List[Int]) -> Bytes!:
     out := bytes.buffer_with_capacity(values.len())
+    defer out.free()
     for value in values:
         out.write_byte(value)!
     return out.bytes()
@@ -284,6 +285,7 @@ pub fn list(data: Bytes) -> List[TarEntry]!:
 # create a tar archive from paths.
 pub fn create(paths: List[String]) -> Bytes!:
     out := bytes.buffer()
+    defer out.free()
     for input_path in paths:
         if not fs.exists(input_path):
             fail tar_fail("path does not exist: " + input_path)
@@ -378,6 +380,7 @@ fn tar_test_unsafe_archive() -> Bytes!:
     tar_push_zeroes(final_header, 12)
 
     out := bytes.buffer()
+    defer out.free()
     tar_write_bytes(out, tar_bytes_from_list(final_header)!)!
     mut i := 0
     while i < BLOCK_SIZE * 2:

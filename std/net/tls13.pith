@@ -196,6 +196,7 @@ fn write_u16_vector(out: ByteBuffer, values: List[Int]) -> Bool!:
 
 fn extension_record(extension_type: Int, data: Bytes) -> Bytes!:
     out := bytes.buffer_with_capacity(data.len() + 4)
+    defer out.free()
     write_u16_be(out, extension_type)!
     write_u16_be(out, data.len())!
     write_bytes_if_any(out, data)!
@@ -208,10 +209,12 @@ fn server_name_extension(server_name: String) -> Bytes!:
     if host.len() > 65535:
         fail "tls server name too long"
     name := bytes.buffer_with_capacity(host.len() + 3)
+    defer name.free()
     write_u8(name, 0)!
     write_u16_be(name, host.len())!
     write_bytes_if_any(name, host)!
     data := bytes.buffer_with_capacity(name.len() + 2)
+    defer data.free()
     write_u16_be(data, name.len())!
     write_bytes_if_any(data, name.bytes())!
     return extension_record(EXT_SERVER_NAME, data.bytes())
@@ -220,7 +223,9 @@ fn alpn_extension(protocols: List[String]) -> Bytes!:
     if protocols.len() == 0:
         return bytes.empty()
     data := bytes.buffer()
+    defer data.free()
     names := bytes.buffer()
+    defer names.free()
     for protocol in protocols:
         encoded := bytes.from_string_utf8(protocol)
         if encoded.len() == 0:
@@ -235,17 +240,20 @@ fn alpn_extension(protocols: List[String]) -> Bytes!:
 
 fn supported_versions_client_extension() -> Bytes!:
     data := bytes.buffer_with_capacity(3)
+    defer data.free()
     write_u8(data, 2)!
     write_u16_be(data, TLS13_VERSION)!
     return extension_record(EXT_SUPPORTED_VERSIONS, data.bytes())
 
 fn supported_groups_extension(groups: List[Int]) -> Bytes!:
     data := bytes.buffer()
+    defer data.free()
     write_u16_vector(data, groups)!
     return extension_record(EXT_SUPPORTED_GROUPS, data.bytes())
 
 fn signature_algorithms_extension(schemes: List[Int]) -> Bytes!:
     data := bytes.buffer()
+    defer data.free()
     write_u16_vector(data, schemes)!
     return extension_record(EXT_SIGNATURE_ALGORITHMS, data.bytes())
 
@@ -253,6 +261,7 @@ fn psk_key_exchange_modes_extension(modes: List[Int]) -> Bytes!:
     if modes.len() == 0:
         return bytes.empty()
     data := bytes.buffer()
+    defer data.free()
     write_u8(data, modes.len())!
     for mode in modes:
         write_u8(data, mode)!
@@ -265,6 +274,7 @@ fn key_share_client_extension(x25519_public_key: Bytes, p256_public_key: Bytes) 
     if x25519_public_key.len() == 0:
         fail "tls key share cannot be empty"
     entries := bytes.buffer()
+    defer entries.free()
     write_u16_be(entries, GROUP_X25519)!
     write_u16_be(entries, x25519_public_key.len())!
     write_bytes_if_any(entries, x25519_public_key)!
@@ -273,12 +283,14 @@ fn key_share_client_extension(x25519_public_key: Bytes, p256_public_key: Bytes) 
         write_u16_be(entries, p256_public_key.len())!
         write_bytes_if_any(entries, p256_public_key)!
     data := bytes.buffer_with_capacity(entries.len() + 2)
+    defer data.free()
     write_u16_be(data, entries.len())!
     write_bytes_if_any(data, entries.bytes())!
     return extension_record(EXT_KEY_SHARE, data.bytes())
 
 fn supported_versions_server_extension(version: Int) -> Bytes!:
     data := bytes.buffer_with_capacity(2)
+    defer data.free()
     write_u16_be(data, version)!
     return extension_record(EXT_SUPPORTED_VERSIONS, data.bytes())
 
@@ -286,6 +298,7 @@ fn key_share_server_extension(group: Int, public_key: Bytes) -> Bytes!:
     if public_key.len() == 0:
         fail "tls key share cannot be empty"
     data := bytes.buffer_with_capacity(public_key.len() + 4)
+    defer data.free()
     write_u16_be(data, group)!
     write_u16_be(data, public_key.len())!
     write_bytes_if_any(data, public_key)!
@@ -297,13 +310,16 @@ fn pre_shared_key_client_extension(identity: Bytes, obfuscated_ticket_age: Int, 
     if binder.len() == 0:
         fail "tls psk binder cannot be empty"
     identities := bytes.buffer()
+    defer identities.free()
     write_u16_be(identities, identity.len())!
     write_bytes_if_any(identities, identity)!
     checked_write(binary.write_u32_be(identities, obfuscated_ticket_age))!
     binders := bytes.buffer()
+    defer binders.free()
     write_u8(binders, binder.len())!
     write_bytes_if_any(binders, binder)!
     data := bytes.buffer()
+    defer data.free()
     write_u16_be(data, identities.len())!
     write_bytes_if_any(data, identities.bytes())!
     write_u16_be(data, binders.len())!
@@ -316,10 +332,12 @@ fn pre_shared_key_client_partial_extension(identity: Bytes, obfuscated_ticket_ag
     if binder_len <= 0 or binder_len > 255:
         fail "tls psk binder length out of range"
     identities := bytes.buffer()
+    defer identities.free()
     write_u16_be(identities, identity.len())!
     write_bytes_if_any(identities, identity)!
     checked_write(binary.write_u32_be(identities, obfuscated_ticket_age))!
     extension := bytes.buffer()
+    defer extension.free()
     write_u16_be(extension, EXT_PRE_SHARED_KEY)!
     write_u16_be(extension, 2 + identities.len() + 2 + 1 + binder_len)!
     write_u16_be(extension, identities.len())!
@@ -330,6 +348,7 @@ fn pre_shared_key_server_extension(selected_identity: Int) -> Bytes!:
     if selected_identity < 0 or selected_identity > 65535:
         fail "tls selected psk identity out of range"
     data := bytes.buffer_with_capacity(2)
+    defer data.free()
     write_u16_be(data, selected_identity)!
     return extension_record(EXT_PRE_SHARED_KEY, data.bytes())
 
@@ -351,6 +370,7 @@ fn write_common_client_extensions(out: ByteBuffer, server_name: String, x25519_p
 
 fn default_client_extensions_with_options(server_name: String, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_binder: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
     out := bytes.buffer()
+    defer out.free()
     write_common_client_extensions(out, server_name, x25519_public_key, p256_public_key, alpn_protocols)!
     if psk_identity.len() > 0:
         write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
@@ -362,6 +382,7 @@ fn default_client_extensions(server_name: String, x25519_public_key: Bytes) -> B
 
 fn default_client_extensions_partial_psk(server_name: String, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
     out := bytes.buffer()
+    defer out.free()
     write_common_client_extensions(out, server_name, x25519_public_key, p256_public_key, alpn_protocols)!
     write_bytes_if_any(out, psk_key_exchange_modes_extension([PSK_MODE_DHE_KE])!)!
     write_bytes_if_any(out, pre_shared_key_client_partial_extension(psk_identity, psk_obfuscated_ticket_age, 32)!)!
@@ -373,6 +394,7 @@ fn sequence_nonce(static_iv: Bytes, sequence: Int) -> Bytes!:
     if sequence < 0:
         fail "tls sequence must be non-negative"
     out := bytes.buffer_with_capacity(12)
+    defer out.free()
     mut i := 0
     while i < 12:
         mut seq_byte := 0
@@ -385,6 +407,7 @@ fn sequence_nonce(static_iv: Bytes, sequence: Int) -> Bytes!:
 
 fn record_header(content_type: Int, length: Int) -> Bytes!:
     out := bytes.buffer_with_capacity(5)
+    defer out.free()
     write_u8(out, content_type)!
     write_u16_be(out, TLS_LEGACY_VERSION)!
     write_u16_be(out, length)!
@@ -394,6 +417,7 @@ fn inner_plaintext(content_type: Int, plaintext: Bytes) -> Bytes!:
     if not valid_content_type(content_type):
         fail tls13_fail("invalid tls inner content type")
     out := bytes.buffer_with_capacity(plaintext.len() + 1)
+    defer out.free()
     write_bytes_if_any(out, plaintext)!
     write_u8(out, content_type)!
     return out.bytes()
@@ -439,6 +463,7 @@ fn open_record_with_chacha(key: Bytes, static_iv: Bytes, sequence: Int, record: 
 
 fn zero_secret_sha256() -> Bytes:
     out := bytes.buffer_with_capacity(32)
+    defer out.free()
     mut i := 0
     while i < 32:
         out.write_byte(0)
@@ -449,6 +474,7 @@ fn certificate_verify_context(context: String, transcript_hash: Bytes) -> Bytes!
     if transcript_hash.len() != 32:
         fail "tls transcript hash must be 32 bytes"
     out := bytes.buffer_with_capacity(64 + context.len() + 1 + transcript_hash.len())
+    defer out.free()
     mut i := 0
     while i < 64:
         out.write_byte(32)
@@ -479,6 +505,7 @@ pub fn encode_record(content_type: Int, payload: Bytes) -> Bytes!:
     if payload.len() > MAX_PLAINTEXT_RECORD:
         fail tls13_fail("tls record payload too large")
     out := bytes.buffer_with_capacity(payload.len() + 5)
+    defer out.free()
     write_u8(out, content_type)!
     write_u16_be(out, TLS_LEGACY_VERSION)!
     write_u16_be(out, payload.len())!
@@ -513,6 +540,7 @@ pub fn encode_handshake(message_type: Int, body: Bytes) -> Bytes!:
     if message_type < 0 or message_type > 255:
         fail tls13_fail("invalid handshake message type")
     out := bytes.buffer_with_capacity(body.len() + 4)
+    defer out.free()
     write_u8(out, message_type)!
     write_u24_be(out, body.len())!
     write_bytes_if_any(out, body)!
@@ -543,6 +571,7 @@ pub fn encode_client_hello_with_options(server_name: String, random: Bytes, sess
         fail "tls session id too long"
     extensions := default_client_extensions_with_options(server_name, x25519_public_key, p256_public_key, alpn_protocols, psk_identity, psk_binder, psk_obfuscated_ticket_age)!
     body := bytes.buffer()
+    defer body.free()
     write_u16_be(body, TLS_LEGACY_VERSION)!
     write_bytes_if_any(body, random)!
     write_u8(body, session_id.len())!
@@ -566,6 +595,7 @@ pub fn client_hello_psk_binder_input(server_name: String, random: Bytes, session
         fail "tls psk identity cannot be empty"
     extensions := default_client_extensions_partial_psk(server_name, x25519_public_key, p256_public_key, alpn_protocols, psk_identity, psk_obfuscated_ticket_age)!
     body := bytes.buffer()
+    defer body.free()
     write_u16_be(body, TLS_LEGACY_VERSION)!
     write_bytes_if_any(body, random)!
     write_u8(body, session_id.len())!
@@ -771,6 +801,7 @@ pub fn encode_server_hello_with_options(random: Bytes, session_id: Bytes, cipher
     if selected_psk_identity >= 0:
         extensions = extensions.concat(pre_shared_key_server_extension(selected_psk_identity)!)
     body := bytes.buffer()
+    defer body.free()
     write_u16_be(body, TLS_LEGACY_VERSION)!
     write_bytes_if_any(body, random)!
     write_u8(body, session_id.len())!
@@ -874,9 +905,11 @@ pub fn encode_encrypted_extensions() -> Bytes!:
 ## Encode EncryptedExtensions with an optional selected ALPN protocol.
 pub fn encode_encrypted_extensions_with_alpn(alpn_protocol: String) -> Bytes!:
     extensions := bytes.buffer()
+    defer extensions.free()
     if alpn_protocol != "":
         write_bytes_if_any(extensions, alpn_extension([alpn_protocol])!)!
     body := bytes.buffer_with_capacity(extensions.len() + 2)
+    defer body.free()
     write_u16_be(body, extensions.len())!
     write_bytes_if_any(body, extensions.bytes())!
     return encode_handshake(HANDSHAKE_ENCRYPTED_EXTENSIONS, body.bytes())
@@ -908,8 +941,10 @@ pub fn parse_certificate_request(body: Bytes) -> CertificateRequestMessage!:
 ## Encode a CertificateRequest handshake message.
 pub fn encode_certificate_request(signature_schemes: List[Int]) -> Bytes!:
     body := bytes.buffer()
+    defer body.free()
     write_u8(body, 0)!
     extensions := bytes.buffer()
+    defer extensions.free()
     write_bytes_if_any(extensions, signature_algorithms_extension(signature_schemes)!)!
     write_u16_be(body, extensions.len())!
     write_bytes_if_any(body, extensions.bytes())!
@@ -918,11 +953,13 @@ pub fn encode_certificate_request(signature_schemes: List[Int]) -> Bytes!:
 # encode a tls 1.3 Certificate handshake message.
 pub fn encode_certificate_message(certs_der: List[Bytes]) -> Bytes!:
     entries := bytes.buffer()
+    defer entries.free()
     for cert in certs_der:
         write_u24_be(entries, cert.len())!
         write_bytes_if_any(entries, cert)!
         write_u16_be(entries, 0)!
     body := bytes.buffer()
+    defer body.free()
     write_u8(body, 0)!
     write_u24_be(body, entries.len())!
     write_bytes_if_any(body, entries.bytes())!
@@ -943,6 +980,7 @@ pub fn encode_certificate_verify(signature_scheme: Int, signed: Bytes) -> Bytes!
     if signed.len() == 0:
         fail "empty tls certificate verify signature"
     body := bytes.buffer_with_capacity(signed.len() + 4)
+    defer body.free()
     write_u16_be(body, signature_scheme)!
     write_u16_be(body, signed.len())!
     write_bytes_if_any(body, signed)!
@@ -982,6 +1020,7 @@ pub fn encode_new_session_ticket(ticket_lifetime: Int, ticket_age_add: Int, nonc
     if ticket.len() == 0:
         fail "tls session ticket cannot be empty"
     body := bytes.buffer()
+    defer body.free()
     checked_write(binary.write_u32_be(body, ticket_lifetime))!
     checked_write(binary.write_u32_be(body, ticket_age_add))!
     write_u8(body, nonce.len())!
@@ -1012,6 +1051,7 @@ pub fn hkdf_label(label: String, context: Bytes, length: Int) -> Bytes!:
     if context.len() > 255:
         fail "tls hkdf context too long"
     out := bytes.buffer_with_capacity(4 + label_bytes.len() + context.len())
+    defer out.free()
     write_u16_be(out, length)!
     write_u8(out, label_bytes.len())!
     write_bytes_if_any(out, label_bytes)!
@@ -1030,6 +1070,7 @@ pub fn transcript_hash_sha256(transcript: Bytes) -> Bytes:
 # hash a list of decoded handshake messages with sha-256.
 pub fn handshake_transcript_hash_sha256(messages: List[HandshakeMessage]) -> Bytes!:
     out := bytes.buffer()
+    defer out.free()
     for message in messages:
         write_bytes_if_any(out, encode_handshake(message.message_type, message.body)!)!
     return transcript_hash_sha256(out.bytes())
@@ -1253,6 +1294,7 @@ test "tls13 offers a second p-256 key share when given one":
     x_pub := encoding.from_hex("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")!
     # a 65-byte uncompressed point (only the shape matters for encoding)
     mut p := bytes.buffer()
+    defer p.free()
     p.write_byte(4)
     mut i := 0
     while i < 64:
@@ -1276,6 +1318,7 @@ test "tls13 rejects an oversized record before buffering it":
     # cap and must be refused on the length alone, before any body is read.
     oversized := MAX_CIPHERTEXT_RECORD + 1
     header := bytes.buffer_with_capacity(5)
+    defer header.free()
     write_u8(header, CONTENT_APPLICATION_DATA)!
     write_u16_be(header, TLS_LEGACY_VERSION)!
     write_u16_be(header, oversized)!
@@ -1288,13 +1331,16 @@ test "tls13 parses server hello":
     session := encoding.from_hex("aabbccdd")!
     public_key := encoding.from_hex("303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f")!
     version_data := bytes.buffer()
+    defer version_data.free()
     write_u16_be(version_data, TLS13_VERSION)!
     key_data := bytes.buffer()
+    defer key_data.free()
     write_u16_be(key_data, GROUP_X25519)!
     write_u16_be(key_data, public_key.len())!
     write_bytes_if_any(key_data, public_key)!
     extensions := extension_record(EXT_SUPPORTED_VERSIONS, version_data.bytes())!.concat(extension_record(EXT_KEY_SHARE, key_data.bytes())!)
     body := bytes.buffer()
+    defer body.free()
     write_u16_be(body, TLS_LEGACY_VERSION)!
     write_bytes_if_any(body, random)!
     write_u8(body, session.len())!

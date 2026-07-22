@@ -364,9 +364,11 @@ impl Db:
     # discarded (closed, its slot returned) rather than reused.
     fn run_query(text: String, params: List[String]) -> List[sql.Row]!:
         conn := self.borrow()!
+        # any error before the giveback leaves the connection out of protocol
+        # sync, so discard it (closed, its slot returned) rather than reuse it.
+        errdefer self.discard(conn)
         attempt := postgres.query_params(conn, text, params)
         if attempt.is_err:
-            self.discard(conn)
             fail attempt.err
         mut rows: List[sql.Row] := []
         for row in attempt.ok:
@@ -377,9 +379,9 @@ impl Db:
     # borrow a connection, run the write, and return the connection to the pool.
     fn run_exec(text: String, params: List[String]) -> db.ExecResult!:
         conn := self.borrow()!
+        errdefer self.discard(conn)
         attempt := postgres.exec_params(conn, text, params)
         if attempt.is_err:
-            self.discard(conn)
             fail attempt.err
         self.giveback(conn)
         return db.exec_result(attempt.ok, 0)
@@ -403,9 +405,11 @@ impl Db:
     # returns to the pool. see the Tx methods above.
     pub fn begin() -> Tx!:
         handle := pin_connection(self.handle)!
+        # if BEGIN fails the pinned connection never becomes a live transaction,
+        # so discard it; on success the Tx keeps the pin and this does not run.
+        errdefer pin_discard(handle)
         started := postgres.exec(pin_conn(handle), "begin")
         if started.is_err:
-            pin_discard(handle)
             fail started.err
         return Tx(handle: handle)
 
@@ -414,9 +418,9 @@ impl Db:
     # with Stmt.close(), which returns the connection to the pool.
     pub fn prepare(text: String) -> Stmt!:
         handle := pin_connection(self.handle)!
+        errdefer pin_discard(handle)
         prepared := postgres.prepare(pin_conn(handle), PREPARED_NAME, text)
         if prepared.is_err:
-            pin_discard(handle)
             fail prepared.err
         return Stmt(handle: handle)
 

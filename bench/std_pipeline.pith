@@ -133,6 +133,7 @@ fn print_metric(name: String, value: Int):
 fn main() -> Int!:
     records := records_from_args()
     work_dir := fs.make_temp_dir("pith-std-pipeline-")!
+    defer fs.remove_tree(work_dir)
     csv_path := path.join(work_dir, "input.csv")
     json_path := path.join(work_dir, "report.json")
     gzip_path := path.join(work_dir, "report.json.gz")
@@ -174,8 +175,6 @@ fn main() -> Int!:
 
     checksum := stats.score_sum + stats.quota_sum + stats.url_path_sum + stats.path_part_sum + stats.note_hash_sum + digest_score(digest) + decompressed.len() + fs_score * 0
     total_ms := time() - start_total
-
-    fs.remove_tree(work_dir)
 
     print("std pipeline benchmark")
     print_metric("records", records)

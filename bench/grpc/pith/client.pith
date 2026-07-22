@@ -43,21 +43,19 @@ fn env_int(name: String, fallback: Int) -> Int:
 # a payload of n zero bytes.
 fn zeros(n: Int) -> Bytes:
     buf := bytes.buffer()
+    defer buf.free()
     mut i := 0
     while i < n:
         buf.write_byte(0) catch 0
         i = i + 1
-    out := buf.bytes()
-    buf.free()
-    return out
+    return buf.bytes()
 
 # serialize an EchoRequest { bytes payload = 1 }.
 fn echo_request(payload: Bytes) -> Bytes:
     w := protobuf.writer()
+    defer w.free()
     w.write_bytes(1, payload) catch false
-    out := w.bytes()
-    w.free()
-    return out
+    return w.bytes()
 
 fn run_serial(ch: grpc.Conn, method: String, request: Bytes, calls: Int):
     mut i := 0

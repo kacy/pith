@@ -653,16 +653,14 @@ fn handle_request(req: HttpRequestBytes) -> HttpResponse:
 
 fn handle_client(fd: Int) -> Int!:
     stream := io.from_fd(fd)
+    defer stream.close()
     stream.set_timeout(1000)
     reader := stream.buffered_bytes_reader_chunked(1024)
     writer := stream.buffered_bytes_writer_chunked(1024)
     req := http.read_request_buffered_bytes(reader)
     if req.is_err:
-        stream.close()
         fail req.err
-    sent := http.send_buffered(writer, handle_request(req.ok))
-    stream.close()
-    return sent!
+    return http.send_buffered(writer, handle_request(req.ok))!
 
 fn main() -> Int!:
     init_catalog()

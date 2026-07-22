@@ -7,6 +7,7 @@ import std.crypto.hmac as hmac
 
 fn zero_bytes(count: Int) -> Bytes:
     out := bytes.buffer_with_capacity(count)
+    defer out.free()
     mut i := 0
     while i < count:
         out.write_byte(0) catch 0
@@ -15,6 +16,7 @@ fn zero_bytes(count: Int) -> Bytes:
 
 fn int32_be(value: Int) -> Bytes:
     out := bytes.buffer_with_capacity(4)
+    defer out.free()
     out.write_byte(bits.band(bits.shr(value, 24), 255)) catch 0
     out.write_byte(bits.band(bits.shr(value, 16), 255)) catch 0
     out.write_byte(bits.band(bits.shr(value, 8), 255)) catch 0
@@ -31,6 +33,7 @@ fn bytes_to_list(data: Bytes) -> List[Int]:
 
 fn list_to_bytes(data: List[Int], limit: Int) -> Bytes:
     out := bytes.buffer_with_capacity(limit)
+    defer out.free()
     mut i := 0
     while i < data.len() and i < limit:
         out.write_byte(data[i]) catch 0
@@ -60,6 +63,7 @@ fn hkdf_expand(mac: fn(Bytes, Bytes) -> Bytes, hash_len: Int, prk: Bytes, info: 
     if length > 255 * hash_len:
         fail "hkdf length out of range"
     mut okm := bytes.buffer_with_capacity(length)
+    defer okm.free()
     mut previous := bytes.empty()
     mut counter := 1
     while okm.bytes().len() < length:
@@ -79,6 +83,7 @@ fn pbkdf2(mac: fn(Bytes, Bytes) -> Bytes, password: Bytes, salt: Bytes, iteratio
     if length < 0:
         fail "pbkdf2 length out of range"
     out := bytes.buffer_with_capacity(length)
+    defer out.free()
     mut block_index := 1
     while out.bytes().len() < length:
         mut u := mac(password, salt.concat(int32_be(block_index)))

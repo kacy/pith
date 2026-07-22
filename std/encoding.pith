@@ -405,6 +405,7 @@ pub fn from_hex(input: String) -> Bytes!:
         fail "invalid hex: odd length"
 
     buf := bytes.buffer_with_capacity(input.len() / 2)
+    defer buf.free()
     mut position := 0
     while position < input.len():
         high_nibble := hex_nibble(input[position])
@@ -413,9 +414,7 @@ pub fn from_hex(input: String) -> Bytes!:
             fail "invalid hex character"
         buf.write_byte(high_nibble * 16 + low_nibble)!
         position = position + 2
-    result := buf.bytes()
-    buf.free()
-    return result
+    return buf.bytes()
 
 fn encoding_from_hex(input: String) -> Bytes!:
     return from_hex(input)

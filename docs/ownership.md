@@ -93,8 +93,13 @@ gaps, all bounded leaks rather than dangling pointers:
 - **removed or overwritten container elements are not released until
   the container itself dies.** a borrow of an element may still be in
   flight, so the free is deferred to the container's own cleanup.
-- **an error-path early return skips the normal exit cleanup.** the
-  values a function held leak on the failing path.
+- **arc reclaims memory, but it does not run your cleanup.** closing a
+  file, rolling back a transaction, or releasing a lock is a side effect
+  arc knows nothing about, and the error path (`fail`, `!`) is exactly
+  where it is easy to forget. reach for `defer` (see [defer.md](defer.md)):
+  a deferred statement runs on every exit from its scope — fall-through,
+  `return`, `fail`, and `!` propagation alike — right before arc frees the
+  locals, so the cleanup still sees them.
 - **a result consumed with `catch` or `unwrap_or` can leak its ok
   value** when that value was freshly built (a returned tuple, a
   concatenated string). the consumer has no way to tell a fresh ok

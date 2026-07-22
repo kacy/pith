@@ -61,7 +61,7 @@ from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_uses_result_abi, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_weak_read
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
-from ir_utils import ir_push_string, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
+from ir_utils import ir_push_string, ir_push_int, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
 from ir_type_helpers import ir_resolve_type_hint_with_state, ir_retkind_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_lookup_name_type_with_state, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type, ir_list_element_kind, ir_function_return_kind
 from ir_decode_calls import ir_is_json_decode_callee_with_aliases, ir_is_config_decode_callee_with_aliases, ir_is_toml_decode_callee_with_aliases, ir_is_config_file_decode_callee_with_aliases, ir_config_require_full_name_for_type_name_with_state, ir_toml_require_full_name_for_type_name_with_state, ir_is_config_decode_specialization, ir_is_toml_decode_specialization, ir_is_toml_decode_path_specialization, ir_is_toml_decode_text_path_specialization, ir_is_toml_decode_text_specialization, ir_is_json_decode_object_specialization, ir_is_json_decode_specialization, ir_is_json_decode_path_specialization, ir_resolve_decode_call_name_with_state, ir_json_field_helper_name, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scalar_has_helper_name, ir_config_require_helper_name, ir_toml_require_helper_name, ir_struct_decode_field_tid, ir_json_field_type_tag, ir_optional_inner_tid, ir_struct_has_optional_fields, ir_struct_has_default_fields_with_state, ir_struct_has_nested_decode_fields
@@ -124,6 +124,17 @@ mut ir_lambda_count := 0
 mut ir_for_count := 0
 mut ir_break_stack: List[String] := []
 mut ir_continue_stack: List[String] := []
+
+# defer support (statically emitted, zero runtime machinery). deferred
+# statements are re-emitted at every scope-exit edge in LIFO order, before the
+# ARC cleanup. ir_defer_nodes is a flat stack of the inner statement node
+# indices currently in scope; ir_defer_scope_starts marks where each open
+# block scope begins in that flat stack; ir_defer_loop_base_stack records the
+# flat-stack length at each loop entry so break/continue emit only the defers
+# registered inside the loop. all three reset per function.
+mut ir_defer_nodes: List[Int] := []
+mut ir_defer_scope_starts: List[Int] := []
+mut ir_defer_loop_base_stack: List[Int] := []
 mut ir_lambda_bodies: List[String] := [] # deferred lambda function IR
 mut ir_module_count := 0 # increments per emit_ir call for unique naming
 
@@ -652,6 +663,67 @@ fn ir_string_method_returns_fresh(mname: String) -> Bool:
 # release every owned string local before a return, minus the one being
 # returned (its count transfers to the caller). the prologue zero-stores
 # each tracked name, so the loads are valid on every path.
+# --- defer scope machinery ---
+#
+# the delicate invariant lives here: at every exit edge the deferred user
+# statements run (innermost scope first) BEFORE ir_emit_string_cleanup, so a
+# deferred `conn.close()` still sees the locals ARC is about to release.
+# emitting one deferred entry is just ir_stmt on its stored node — fresh
+# registers every time, so re-emitting at several exits is safe.
+
+# open a new block scope: remember where its defers will start.
+fn ir_defer_push_scope():
+    ir_defer_scope_starts = ir_push_int(ir_defer_scope_starts, ir_defer_nodes.len())
+
+# record a deferred statement in the innermost open scope.
+fn ir_defer_register(inner_idx: Int):
+    ir_defer_nodes.push(inner_idx)
+
+# emit deferred nodes from the top of the flat stack down to `stop` (inclusive
+# of `stop`), in LIFO order, WITHOUT truncating the stack. used at early exits
+# where control leaves several scopes at once.
+fn ir_defer_emit_through(stop: Int):
+    mut i := ir_defer_nodes.len() - 1
+    while i >= stop:
+        ir_stmt(ir_defer_nodes[i])
+        i = i - 1
+
+# emit every deferred statement still in scope. used at the function-level exit
+# edges (return / fail / `!` / `?` / index-miss) before the ARC cleanup.
+fn ir_defer_emit_to_function_frame():
+    ir_defer_emit_through(0)
+
+# close the innermost block scope. on fall-through (control really reaches the
+# end of the block) its defers run in LIFO order; if the block already ended in
+# a terminator they were emitted at that edge, so skip them here. either way the
+# scope's entries are dropped from the flat stack.
+fn ir_defer_pop_scope_emit():
+    if ir_defer_scope_starts.len() == 0:
+        return
+    start := ir_defer_scope_starts[ir_defer_scope_starts.len() - 1]
+    ir_defer_scope_starts.remove(ir_defer_scope_starts.len() - 1)
+    if not ir_last_was_ret:
+        mut i := ir_defer_nodes.len() - 1
+        while i >= start:
+            ir_stmt(ir_defer_nodes[i])
+            i = i - 1
+    while ir_defer_nodes.len() > start:
+        ir_defer_nodes.remove(ir_defer_nodes.len() - 1)
+
+# a loop records the flat-stack length at entry so break/continue emit only the
+# defers registered inside the loop body, not the enclosing function's.
+fn ir_defer_loop_enter():
+    ir_defer_loop_base_stack = ir_push_int(ir_defer_loop_base_stack, ir_defer_nodes.len())
+
+fn ir_defer_loop_exit():
+    if ir_defer_loop_base_stack.len() > 0:
+        ir_defer_loop_base_stack.remove(ir_defer_loop_base_stack.len() - 1)
+
+# emit the current loop body's defers before a break/continue jump.
+fn ir_defer_emit_for_loop_jump():
+    if ir_defer_loop_base_stack.len() > 0:
+        ir_defer_emit_through(ir_defer_loop_base_stack[ir_defer_loop_base_stack.len() - 1])
+
 fn ir_emit_string_cleanup(exclude: String):
     mut i := 0
     while i < ir_string_locals.len():
@@ -1635,6 +1707,11 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
     if ir_emit_tests and ir_emitting_test_func:
         ir_test_assert_fail_return()
     else:
+        # `?` on a none propagates out of the function, an early exit like a
+        # fail: run the deferred statements, then release owned locals, before
+        # returning the error tuple.
+        ir_defer_emit_to_function_frame()
+        ir_emit_string_cleanup("")
         si := ir_str("unwrap of none")
         err_r := ir_reg()
         ir_emit("strref " + err_r.to_string() + " " + si)
@@ -4288,6 +4365,7 @@ fn ir_emit_try_expr(node: Node) -> Int:
                 # propagating the error out early skips the normal return,
                 # so release the function's owned locals here too; the error
                 # tuple being returned is a fresh value, not a tracked local
+                ir_defer_emit_to_function_frame()
                 ir_emit_string_cleanup("")
                 ir_emit("ret " + val_r.to_string())
             ir_emit_label(merge_l)
@@ -4314,6 +4392,7 @@ fn ir_emit_try_expr(node: Node) -> Int:
         if ir_emit_tests and ir_emitting_test_func:
             ir_test_assert_fail_return()
         else:
+            ir_defer_emit_to_function_frame()
             ir_emit_string_cleanup("")
             zero := ir_reg()
             ir_emit("iconst " + zero.to_string() + " 0")
@@ -4341,9 +4420,11 @@ fn ir_emit_fail_expr(node: Node) -> Int:
             elif ir_string_expr_is_borrowed(node.children[0]):
                 ir_rc_retain_reg(err_r, err_kind)
         tuple_r := ir_emit_err_result_tuple(err_r)
+        ir_defer_emit_to_function_frame()
         ir_emit_string_cleanup(exclude)
         ir_emit("ret " + tuple_r.to_string())
     else:
+        ir_defer_emit_to_function_frame()
         ir_emit_string_cleanup("")
         ir_emit("ret " + ir_emit_err_result_tuple(ir_zero_reg()).to_string())
     ub := ir_label()
@@ -4425,6 +4506,11 @@ fn ir_emit_index_expr_propagate(obj_r: Int, idx_r: Int, obj_type: String, value_
     if ir_emit_tests and ir_emitting_test_func:
         ir_test_assert_fail_return()
     else:
+        # this early return skips the normal exit, so run the deferred
+        # statements and then release the function's owned locals here too —
+        # without the cleanup every owned local leaked on an index miss.
+        ir_defer_emit_to_function_frame()
+        ir_emit_string_cleanup("")
         msg := ir_str("index out of bounds")
         err_r := ir_reg()
         ir_emit("strref " + err_r.to_string() + " " + msg)
@@ -4755,9 +4841,11 @@ fn ir_emit_return_stmt(node: Node):
         elif ir_current_func_return_kind == "tuple":
             if result_kind != "tuple":
                 r = ir_emit_ok_result_tuple(r)
+        ir_defer_emit_to_function_frame()
         ir_emit_string_cleanup(exclude)
         ir_emit("ret " + r.to_string())
     else:
+        ir_defer_emit_to_function_frame()
         ir_emit_string_cleanup("")
         r := ir_reg()
         ir_emit("iconst " + r.to_string() + " 0")
@@ -5018,6 +5106,13 @@ fn ir_stmt(idx: Int):
     # into the else arm
     ir_last_was_ret = false
 
+    # a defer emits nothing here: record its inner statement so it can be
+    # re-emitted at each exit edge of the enclosing scope.
+    if kind == "defer":
+        if node.children.len() > 0:
+            ir_defer_register(node.children[0])
+        return
+
     if ir_stmt_is_expr(kind):
         r := ir_expr(idx)
         # a discarded result from a bare `foo()!`-less call owns its box: free
@@ -5161,7 +5256,9 @@ fn ir_emit_while_let_stmt(node: Node):
     ir_emit_let_bindings(node.children[0], subj_r, node.children[1])
     ir_break_stack = ir_push_string(ir_break_stack, end_label)
     ir_continue_stack = ir_push_string(ir_continue_stack, head_label)
+    ir_defer_loop_enter()
     ir_block(node.children[2])
+    ir_defer_loop_exit()
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     # release this iteration's owned shell before looping (the body borrowed its
@@ -5185,7 +5282,9 @@ fn ir_emit_while_stmt(node: Node):
         ir_emit_label(body_label)
         ir_break_stack = ir_push_string(ir_break_stack, end_label)
         ir_continue_stack = ir_push_string(ir_continue_stack, head_label)
+        ir_defer_loop_enter()
         ir_block(node.children[1])
+        ir_defer_loop_exit()
         ir_break_stack.remove(ir_break_stack.len() - 1)
         ir_continue_stack.remove(ir_continue_stack.len() - 1)
         ir_emit("jmp " + head_label)
@@ -5264,7 +5363,9 @@ fn ir_emit_for_stmt(node: Node):
         ir_emit_for_loop_value_binding(names.value_name, names.index_name, item_kind, ft, fi)
         ir_break_stack = ir_push_string(ir_break_stack, end_l)
         ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
+        ir_defer_loop_enter()
         ir_block(node.children[1])
+        ir_defer_loop_exit()
         ir_break_stack.remove(ir_break_stack.len() - 1)
         ir_continue_stack.remove(ir_continue_stack.len() - 1)
         ir_emit_label(step_l)
@@ -5329,7 +5430,9 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
         ir_emit("store " + names.index_name + " " + pos_r.to_string())
     ir_break_stack = ir_push_string(ir_break_stack, end_l)
     ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
+    ir_defer_loop_enter()
     ir_block(node.children[1])
+    ir_defer_loop_exit()
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit_label(step_l)
@@ -5393,7 +5496,9 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
         ir_emit("store " + names.index_name + " " + pos_r.to_string())
     ir_break_stack = ir_push_string(ir_break_stack, end_l)
     ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
+    ir_defer_loop_enter()
     ir_block(node.children[1])
+    ir_defer_loop_exit()
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit_label(step_l)
@@ -5441,21 +5546,29 @@ fn ir_stmt_control(idx: Int, node: Node):
 fn ir_block(idx: Int) -> Int:
     kind := node_kind(idx)
     if kind == "block" or kind == "then" or kind == "else" or kind == "body":
+        ir_defer_push_scope()
         mut i := 0
         child_count := node_child_count(idx)
         while i < child_count:
             ir_block(node_child(idx, i))
             i = i + 1
+        # fall-through off the end of the block runs its defers, then the
+        # enclosing exit edge (or default return) runs the ARC cleanup.
+        ir_defer_pop_scope_emit()
     else:
         # loop control jumps are the one statement shape that still needs
         # direct block-level handling. everything else goes through ir_stmt.
         if kind == "break":
             if ir_break_stack.len() > 0:
+                # run the loop body's defers before leaving the loop
+                ir_defer_emit_for_loop_jump()
                 ir_emit("jmp " + ir_break_stack[ir_break_stack.len() - 1])
                 ir_last_was_ret = true
             return 0
         if kind == "continue":
             if ir_continue_stack.len() > 0:
+                # this iteration's defers run before jumping to the loop head
+                ir_defer_emit_for_loop_jump()
                 ir_emit("jmp " + ir_continue_stack[ir_continue_stack.len() - 1])
                 ir_last_was_ret = true
             return 0
@@ -5796,6 +5909,7 @@ fn ir_record_impl_method_signature(impl_type: String, method_idx: Int, method_no
 # returns a throwaway 0 so it can travel as a fn value: void
 # functions are not yet recognized by the function-value path.
 fn ir_emit_default_return() -> Int:
+    ir_defer_emit_to_function_frame()
     ir_emit_string_cleanup("")
     dr := ir_reg()
     ir_emit("iconst " + dr.to_string() + " 0")
@@ -5813,6 +5927,10 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_map_value_types = {}
     ir_string_locals = []
     ir_rc_local_kinds = []
+    # defers are function-scoped: start each function with empty scope stacks
+    ir_defer_nodes = []
+    ir_defer_scope_starts = []
+    ir_defer_loop_base_stack = []
     ir_seed_global_types()
     ir_current_func_return_kind = ret_type
     ir_current_func_optional_inner_kind = ""

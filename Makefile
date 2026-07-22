@@ -982,6 +982,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_generic_method_return tests/cases/test_generic_fnvalue_return \
 	tests/cases/test_fnvalue_field_pool tests/cases/test_closure_capture_escape \
 	tests/cases/test_closure_lifecycle tests/cases/test_error_path_cleanup \
+	tests/cases/test_defer_leak \
 	tests/cases/test_atomic_context tests/cases/test_tuple_ownership \
 	tests/cases/test_struct_closure_field tests/cases/test_generic_struct_field_dtor \
 	tests/cases/test_iterator_drain tests/cases/test_method_fresh_string_return \

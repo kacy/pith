@@ -155,9 +155,12 @@ fn parse_key() -> String:
         start := parser_position
         while parser_position < parser_input.len() and get_char_at(parser_position) != chr(34):
             parser_position = parser_position + 1
+        if parser_position >= parser_input.len():
+            # unterminated quoted key
+            parser_error = true
+            return ""
         result := parser_input.substring(start, parser_position)
-        if parser_position < parser_input.len():
-            parser_position = parser_position + 1
+        parser_position = parser_position + 1
         return result
     # bare key
     start := parser_position
@@ -254,9 +257,12 @@ fn parse_value_node() -> Int:
             if get_char_at(parser_position) == chr(92):
                 parser_position = parser_position + 1
             parser_position = parser_position + 1
+        if parser_position >= parser_input.len():
+            # unterminated string — reject rather than accept the truncation
+            parser_error = true
+            return 0 - 1
         val := parser_input.substring(start, parser_position)
-        if parser_position < parser_input.len():
-            parser_position = parser_position + 1
+        parser_position = parser_position + 1
         idx := allocate_node("string")
         string_values.insert(idx, val)
         return idx
@@ -692,6 +698,15 @@ test "toml parses scalar values":
     assert(get_float(root, "pi") > 3.1)
     assert(get_bool(root, "enabled"))
     assert_eq(get_string_or(root, "missing", "fallback"), "fallback")
+
+test "toml rejects an unterminated string":
+    dq := chr(34)
+    # a value string that runs off the end without a closing quote is invalid
+    assert(parse("k = " + dq + "unclosed") < 0)
+    # a quoted key with no closing quote is invalid
+    assert(parse(dq + "unclosed-key") < 0)
+    # the well-formed value still parses
+    assert(parse("k = " + dq + "ok" + dq) >= 0)
 
 test "toml parses tables and arrays":
     doc := "[server]" + chr(10) + "host = " + chr(34) + "localhost" + chr(34) + chr(10) + "ports = [8000, 9000]"

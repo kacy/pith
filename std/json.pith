@@ -583,9 +583,13 @@ fn parse_string_raw() -> String:
         if get_char_at(parser_position) == chr(92):
             parser_position = parser_position + 1
         parser_position = parser_position + 1
+    if parser_position >= parser_input.len():
+        # ran off the end without a closing quote — a truncated body is not
+        # valid json, so reject it rather than accept the partial string.
+        parser_error = true
+        return ""
     val := parser_input.substring(start, parser_position)
-    if parser_position < parser_input.len():
-        parser_position = parser_position + 1
+    parser_position = parser_position + 1
     return val
 
 # Main recursive value parser - handles all JSON types.
@@ -1534,6 +1538,15 @@ test "json parses object fields":
     assert(object_get_bool(root, "active"))
     assert(object_has(root, "name"))
     assert_eq(object_get_string_or(root, "missing", "fallback"), "fallback")
+
+test "json rejects an unterminated string":
+    lb := chr(123)
+    dq := chr(34)
+    # a truncated body that runs off the end mid-string must not parse as valid
+    assert(parse(lb + dq + "a" + dq + ":" + dq + "unclosed") < 0)
+    assert(parse(dq + "bare-unclosed") < 0)
+    # the well-formed counterpart still parses
+    assert(parse(dq + "ok" + dq) >= 0)
 
 test "json parses arrays and primitive values":
     arr := parse("[42,3.5,false,null," + chr(34) + "ok" + chr(34) + "]")

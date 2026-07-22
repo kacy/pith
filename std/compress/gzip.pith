@@ -118,6 +118,7 @@ fn gzip_parse_header_at(data: Bytes, base: Int) -> Int!:
 
 fn gzip_compress_result(data: Bytes) -> Bytes!:
     out := bytes.buffer_with_capacity(10 + data.len() + 5 + 8)
+    defer out.free()
     gzip_write_header(out)!
     out.write(deflate.deflate(data)!)!
     gzip_write_u32_le(out, checksum.crc32(data))!
@@ -143,6 +144,7 @@ pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
     if data.len() < 18:
         fail gzip_invalid()
     out := bytes.buffer()
+    errdefer out.free()
     mut pos := 0
     while pos < data.len():
         start := gzip_parse_header_at(data, pos)!
@@ -204,6 +206,7 @@ test "gzip decompress is bounded against a bomb":
     # 64k of one byte compresses tiny but expands well past a small cap;
     # decompress_bounded must refuse it rather than allocate the full output.
     big := bytes.buffer_with_capacity(65536)
+    defer big.free()
     mut i := 0
     while i < 65536:
         big.write_byte(65)!
@@ -219,6 +222,7 @@ test "gzip handles empty large and file round trips":
     assert(empty_roundtrip.is_empty())
 
     large := bytes.buffer_with_capacity(66000)
+    defer large.free()
     mut i := 0
     while i < 66000:
         large.write_byte(65)!

@@ -102,6 +102,7 @@ fn hash3(a: Int, b: Int, c: Int) -> Int:
 # bytes cost 9 bits for half the alphabet)
 fn deflate_stored(data: Bytes) -> Bytes!:
     out := bytes.buffer_with_capacity(data.len() + 16)
+    errdefer out.free()
     mut offset := 0
     mut wrote_any := false
     while offset < data.len() or not wrote_any:
@@ -199,6 +200,7 @@ fn deflate_huffman(data: Bytes) -> Bytes!:
     write_literal(w, 256)
     bw_flush(w)
     buf := bytes.buffer_with_capacity(w.out.len())
+    errdefer buf.free()
     for b in w.out:
         buf.write_byte(b)!
     return buf.take_bytes()

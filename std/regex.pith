@@ -303,7 +303,16 @@ fn parse_class(c: Compiler):
     c_emit(c, OP_CLASS, add_class(c, ranges, negate), 0)
 
 ## compile a pattern; errors carry the offending position.
+# a pattern is usually dev-controlled, but a server that compiles a user-
+# supplied one must not be crashable by it: the parser recurses per group
+# nesting (deep nesting overflows the native stack) and quantifier handling is
+# superlinear in the pattern length. cap the length so both stay well below the
+# danger zone — real patterns are far shorter than this.
+MAX_PATTERN_LEN := 4096
+
 pub fn compile(pattern: String) -> Regex!:
+    if pattern.len() > MAX_PATTERN_LEN:
+        fail "regex: pattern exceeds maximum length"
     mut insts: List[Inst] := []
     mut classes: List[ClassDef] := []
     c := Compiler(pattern, 0, insts, classes, 1, "")
@@ -550,3 +559,9 @@ test "replace_all handles every match, no match, and vowels":
 test "compile rejects unclosed constructs":
     assert(compile("(abc").is_err)
     assert(compile("[a-z").is_err)
+
+test "compile rejects an oversized pattern":
+    # a pattern past the length cap is refused before it can overflow the stack
+    # (deep nesting) or run the superlinear quantifier path.
+    assert(compile("a".repeat(MAX_PATTERN_LEN + 1)).is_err)
+    assert(compile("a".repeat(16)).is_ok)

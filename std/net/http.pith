@@ -1681,17 +1681,34 @@ impl HttpResponse:
     fn to_string() -> String!:
         return self.to_bytes()!.to_string_utf8()
 
+# CR, LF, and NUL have no place in a header name or value; left in, a handler
+# that reflects untrusted input (a redirect Location, an echoed id, a request
+# header bounced back) could inject headers or split the response. strip them on
+# the way out so a crafted value degrades to a harmless single-line header. the
+# common case — no control bytes — returns the string untouched.
+fn strip_header_controls(text: String) -> String:
+    if text.index_of(chr(13)) < 0 and text.index_of(chr(10)) < 0 and text.index_of(chr(0)) < 0:
+        return text
+    out := bytes.buffer()
+    mut i := 0
+    while i < text.len():
+        b := ord(text[i])
+        if b != 13 and b != 10 and b != 0:
+            out.write_byte(b) catch 0
+        i = i + 1
+    return out.take_bytes().to_string_utf8() catch ""
+
 fn response_head_bytes(response: HttpResponse, content_length: Int, use_chunked: Bool) -> Bytes!:
     crlf := chr(13) + chr(10)
     mut head := status_line(response.status)
     if response.content_type != "":
-        head = head + ct_header(response.content_type)
+        head = head + ct_header(strip_header_controls(response.content_type))
     for key in response.headers:
         if header_key_matches(key, "Content-Type") or header_key_matches(key, "Content-Length") or header_key_matches(key, "Set-Cookie") or header_key_matches(key, "Transfer-Encoding"):
             continue
-        head = head + key + ": " + response.headers[key] + crlf
+        head = head + strip_header_controls(key) + ": " + strip_header_controls(response.headers[key]) + crlf
     for line in response.set_cookie_headers:
-        head = head + "Set-Cookie: " + line + crlf
+        head = head + "Set-Cookie: " + strip_header_controls(line) + crlf
     if use_chunked:
         head = head + "Transfer-Encoding: chunked" + crlf
     else:
@@ -3041,6 +3058,16 @@ test "http builds and parses responses":
     assert(parsed.is_success())
     assert_eq(parsed.header_value("content-type"), "text/plain")
     assert_eq(parsed.body_text()!, "created")
+
+test "http strips control characters from response headers":
+    # a handler that reflects untrusted input into a header value must not be
+    # able to inject a second header or split the response with CR/LF.
+    crlf := chr(13) + chr(10)
+    resp := text(200, "ok").header("X-Echo", "value" + crlf + "Injected: evil")
+    payload := resp.to_string()!
+    # no injected header line survives; the value collapses onto one line
+    assert(not payload.contains(crlf + "Injected:"))
+    assert(payload.contains("X-Echo: valueInjected: evil"))
 
 test "http accepts zero content length":
     crlf := chr(13) + chr(10)

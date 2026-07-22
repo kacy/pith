@@ -171,11 +171,13 @@ fn read_dynamic_huffmans(r: BitReader) -> HuffmanPair!:
         i = i + 1
     return HuffmanPair(huffman_from_lengths(lit_lengths), huffman_from_lengths(dist_lengths))
 
-fn inflate_block(r: BitReader, out: List[Int], lit: Huffman, dist: Huffman) -> Bool!:
+fn inflate_block(r: BitReader, out: ByteBuffer, lit: Huffman, dist: Huffman, max_output: Int) -> Bool!:
     while true:
         sym := huffman_decode(r, lit)!
         if sym < 256:
-            out.push(sym)
+            if out.len() >= max_output:
+                fail "inflate: output exceeds maximum size"
+            out.write_byte(sym)!
         elif sym == 256:
             return true
         else:
@@ -190,7 +192,9 @@ fn inflate_block(r: BitReader, out: List[Int], lit: Huffman, dist: Huffman) -> B
                 fail "inflate: distance beyond output"
             mut src := out.len() - distance
             while length > 0:
-                out.push(out[src])
+                if out.len() >= max_output:
+                    fail "inflate: output exceeds maximum size"
+                out.write_byte(out.get(src))!
                 src = src + 1
                 length = length - 1
     return true
@@ -201,16 +205,35 @@ pub struct InflateResult:
     payload: Bytes
     next_pos: Int
 
+## a default ceiling on inflate output. a deflate back-reference emits up to
+## 258 bytes per symbol, so a tiny stream can expand without bound — without a
+## cap a ~400 kb "bomb" exhausts memory and kills the process. callers that
+## legitimately decompress larger data pass an explicit limit via the
+## `*_bounded` variants.
+pub DEFAULT_MAX_OUTPUT := 268435456
+
 ## decompress a raw deflate stream starting at `start`; bad streams
-## fail with a message naming what was malformed.
+## fail with a message naming what was malformed. output is capped at
+## `DEFAULT_MAX_OUTPUT` — use `inflate_bounded` for a different limit.
 pub fn inflate(data: Bytes, start: Int) -> Bytes!:
     return inflate_with_end(data, start)!.payload
+
+## inflate with an explicit output ceiling; fails once the decoded size
+## would exceed `max_output`.
+pub fn inflate_bounded(data: Bytes, start: Int, max_output: Int) -> Bytes!:
+    return inflate_with_end_bounded(data, start, max_output)!.payload
 
 ## inflate, also reporting the byte position just past the stream —
 ## a partly consumed final byte counts as consumed.
 pub fn inflate_with_end(data: Bytes, start: Int) -> InflateResult!:
+    return inflate_with_end_bounded(data, start, DEFAULT_MAX_OUTPUT)!
+
+## inflate_with_end with an explicit output ceiling. output accumulates in a
+## byte buffer (one byte per position, not a boxed list element), so peak
+## memory tracks the decoded size rather than a multiple of it.
+pub fn inflate_with_end_bounded(data: Bytes, start: Int, max_output: Int) -> InflateResult!:
     r := BitReader(data, start, 0)
-    mut out: List[Int] := []
+    out := bytes.buffer()
     mut final_block := false
     while not final_block:
         final_block = br_read_bits(r, 1)! == 1
@@ -226,20 +249,19 @@ pub fn inflate_with_end(data: Bytes, start: Int) -> InflateResult!:
             r.pos = r.pos + 4
             mut i := 0
             while i < block_len:
-                out.push(bytes.get(data, r.pos + i))
+                if out.len() >= max_output:
+                    fail "inflate: output exceeds maximum size"
+                out.write_byte(bytes.get(data, r.pos + i))!
                 i = i + 1
             r.pos = r.pos + block_len
         elif btype == 1:
-            inflate_block(r, out, fixed_literal_huffman(), fixed_distance_huffman())!
+            inflate_block(r, out, fixed_literal_huffman(), fixed_distance_huffman(), max_output)!
         elif btype == 2:
             trees := read_dynamic_huffmans(r)!
-            inflate_block(r, out, trees.lit, trees.dist)!
+            inflate_block(r, out, trees.lit, trees.dist, max_output)!
         else:
             fail "inflate: reserved block type"
     mut end_pos := r.pos
     if r.bit > 0:
         end_pos = end_pos + 1
-    buf := bytes.buffer_with_capacity(out.len())
-    for b in out:
-        buf.write_byte(b)!
-    return InflateResult(buf.take_bytes(), end_pos)
+    return InflateResult(out.take_bytes(), end_pos)

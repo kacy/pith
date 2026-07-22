@@ -8,12 +8,12 @@ fn main() -> String!:
     path := "/tmp/pith_bytes_example.bin"
 
     out := fs.create(path)!
+    defer out.close()
     print("wrote: {out.write_all_bytes(payload)!}")
-    out.close()
 
     file := fs.open(path)!
+    defer file.close()
     raw := file.read_all_bytes()!
-    file.close()
     fs.remove(path)
 
     decoded := bytes.decode_utf8(raw)

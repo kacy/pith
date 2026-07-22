@@ -30,12 +30,12 @@ fn main() -> Int!:
     print("checked fail: {checked_fail.is_err}")
 
     child := process.command("head").args(["-c", "5"]).start()!
+    defer child.close()
     child.stdin().write_all("abcdef")!
     streamed := child.stdout().read_all()!
     child_exit := child.wait()
     print("streamed: {streamed}")
     print("child exit: {child_exit}")
-    child.close()
 
     shell_command := "printf shell-ok"
     shell_output := process.output_shell(shell_command)!

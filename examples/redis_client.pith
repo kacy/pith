@@ -13,12 +13,12 @@ import std.redis as redis
 # sends them in a fixed order, so canned replies are enough.
 fn fake_redis(port: Int, replies: List[String]) -> Int!:
     server := tcp_listen("127.0.0.1", port)!
+    defer tcp_close(server)
     conn := tcp_accept(server)!
+    defer tcp_close(conn)
     for reply in replies:
         request := tcp_read(conn, 4096)!
         tcp_write(conn, reply)!
-    tcp_close(conn)
-    tcp_close(server)
     return 0
 
 fn main() -> Int!:
@@ -28,6 +28,7 @@ fn main() -> Int!:
     sleep(200)
 
     c := redis.connect("127.0.0.1", port)!
+    defer c.close()
     print("ping: {c.ping()!}")
     print("set: {c.set("greeting", "hello")!}")
     print("get: {c.get("greeting")!}")
@@ -36,7 +37,6 @@ fn main() -> Int!:
     print("exists: {c.exists("greeting")!}")
     print("keys: {c.keys("*")!.len()}")
     print("del: {c.del("greeting")!}")
-    c.close()
 
     await server
     return 0

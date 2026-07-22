@@ -2,11 +2,11 @@
 
 fn server(port: Int) -> String!:
     server_fd := tcp_listen("127.0.0.1", port)!
+    defer tcp_close(server_fd)
     client_fd := tcp_accept(server_fd)!
+    defer tcp_close(client_fd)
     msg := tcp_read(client_fd, 1024)!
     tcp_write(client_fd, msg)!
-    tcp_close(client_fd)
-    tcp_close(server_fd)
     return ""
 
 fn run() -> String!:
@@ -23,10 +23,10 @@ fn run() -> String!:
 
     # connect and exchange data
     connection_fd := tcp_connect("127.0.0.1", port)!
+    defer tcp_close(connection_fd)
     tcp_write(connection_fd, "hello from pith")!
     response := tcp_read(connection_fd, 1024)!
     print("echo response: {response}")
-    tcp_close(connection_fd)
 
     await server_task
     return ""

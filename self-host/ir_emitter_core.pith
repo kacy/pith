@@ -106,12 +106,13 @@ mut ir_rc_local_kinds: List[String] := []
 # tuple locals (a `T!`/`T?` bound to a name) release only their 3-slot shell at
 # cleanup by default, which leaks the owned payload at slot 8 (and the error at
 # slot 16). these two lists track, per function, the tuple locals whose EVERY use
-# is a flag check (`.is_ok`/`.is_err`/`== none`) — locals nobody ever extracts a
-# value from, and therefore the payload's sole owner. for those the cleanup path
-# releases the live payload before freeing the shell. a local with any other use
-# (`.ok`, `!`, `catch`, passed to a call, returned, bound, matched, iterated, ...)
-# is left out and keeps the shell-only behavior, which may leak but can never
-# double-free. see ir_tuple_use_is_whitelisted for why `.ok` is excluded.
+# is a flag check (`.is_ok`/`.is_err`/`== none`) or a borrowing `.ok`/`.err`
+# read — uses that leave the tuple holding the count it was built with, so the
+# cleanup path is the payload's only releaser. for those the cleanup releases
+# the live payload before freeing the shell. a local with any other use (`!`,
+# `catch`, `unwrap_or`, passed to a call, returned, bound, matched, iterated,
+# ...) is left out and keeps the shell-only behavior, which may still leak but
+# can never double-free. see ir_tuple_use_is_whitelisted.
 mut ir_tuple_local_tid: Map[String, Int] := {} # tuple local name -> producing expr's type id
 mut ir_tuple_cascade_names: List[String] := [] # tuple locals whose payload is safe to cascade
 
@@ -764,26 +765,35 @@ fn ir_tuple_record_tid(name: String, val_idx: Int):
         return
     ir_tuple_local_tid.insert(name, tid)
 
-# true when `parent` uses its child ident `name` in a way that cannot hand the
-# payload to anyone: a flag check, which only reads slot 0. that is deliberately
-# the whole whitelist — a local nobody ever extracts from is unambiguously the
-# payload's sole owner, so releasing it at cleanup is safe by construction.
+# true when `parent` uses its child ident `name` in a way that leaves the tuple
+# holding the count it was built with, so the cleanup path is the only thing
+# that ever releases the payload:
 #
-# `.ok`/`.err` reads look safe too (they retain, so the tuple keeps its own
-# count) but are NOT accepted: whitelisting them made
-# tests/cases/test_http2_tls_roundtrip fail valgrind with a use-after-free.
-# actually freeing the ok payload, where it used to leak, exposed something in
-# the http2 path outliving it. that is a latent ownership bug the leak was
-# hiding; until it is understood, `.ok` stays out.
+#   - a flag check, which only reads slot 0 and never touches the payload;
+#   - a `.ok`/`.err` read, which loads slot 8 / slot 16 as a BORROW. where the
+#     value escapes (`b := r.ok`, `return r.ok`) the emitter retains right after
+#     the field load, so the consumer holds its own count; where it does not
+#     (`f(r.ok)`, `r.ok.len()`) nothing is retained and nothing is released.
+#     either way the tuple's own count survives the read.
+#
+# nothing on this list releases the shell, so a local whose every use is one of
+# them is unambiguously the payload's sole owner at cleanup.
+#
+# `.ok` was excluded when the cascade first landed because whitelisting it made
+# tests/cases/test_http2_tls_roundtrip fail valgrind. that turned out to be a
+# separate ownership bug the leak had been hiding — a channel `try_send` handed
+# its value to another task without taking a count — and is fixed.
 fn ir_tuple_use_is_whitelisted(parent: Node, name: String) -> Bool:
     if parent.kind == "field_access":
-        # the ident must be the receiver, and the field a flag read
+        # the ident must be the receiver, and the field a flag or payload read
         if parent.children.len() == 0:
             return false
         recv := get_node(parent.children[0])
         if not (recv.kind == "ident" and recv.value == name):
             return false
         f := parent.value
+        if f == "ok" or f == "err":
+            return true
         return f == "is_ok" or f == "is_err" or f == "is_some" or f == "is_none"
     if parent.kind == "binary" and (parent.value == "eq" or parent.value == "neq"):
         # `name == none` / `name != none`: only reads the flag, never releases
@@ -798,11 +808,38 @@ fn ir_tuple_use_is_whitelisted(parent: Node, name: String) -> Bool:
         return (a_is_name and b_is_none) or (b_is_name and a_is_none)
     return false
 
+# true when ident `name` appears anywhere under `idx`. used where a whole
+# subtree disqualifies a local no matter how the name is spelled there: an
+# assignment target, or a lambda body, both of which the surrounding walk would
+# otherwise wave through on the strength of a read-shaped `.ok`.
+fn ir_subtree_mentions_ident(idx: Int, name: String) -> Bool:
+    node := get_node(idx)
+    if node.kind == "ident" and node.value == name:
+        return true
+    for child_idx in node.children:
+        if ir_subtree_mentions_ident(child_idx, name):
+            return true
+    return false
+
 # walk the subtree: every occurrence of ident `name` must appear as the child of
 # a whitelisted parent. any other appearance (bound, returned, passed, unwrapped,
 # matched, iterated, ...) makes cascade unsafe and returns false.
 fn ir_tuple_uses_all_safe(idx: Int, name: String) -> Bool:
     node := get_node(idx)
+    # a lambda that mentions the local captures the three-slot shell and retains
+    # only that, never the payload behind it. the closure can outlive this
+    # frame, and then a `.ok` through the captured shell reads memory the
+    # cascade already dropped. capture is not an extraction the walk below can
+    # see, so rule the local out for the whole lambda.
+    if node.kind == "lambda":
+        return not ir_subtree_mentions_ident(idx, name)
+    # the whitelist covers `.ok`/`.err` as READS. on the left of an `=` the same
+    # syntax is a write into the tuple, which would replace the payload the
+    # cascade expects to own, so any mention of the name in an assignment target
+    # rules the local out.
+    if node.kind == "assignment" and node.children.len() > 0:
+        if ir_subtree_mentions_ident(node.children[0], name):
+            return false
     for child_idx in node.children:
         child := get_node(child_idx)
         if child.kind == "ident" and child.value == name:

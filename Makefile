@@ -994,7 +994,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_http1_tls_fallback \
 	tests/cases/test_protobuf_roundtrip tests/cases/test_module_ctor_heap_field \
 	tests/cases/test_catch_heap_no_leak tests/cases/test_list_struct_no_leak \
-	tests/cases/test_optional_temp_release
+	tests/cases/test_optional_temp_release \
+	tests/cases/test_result_ok_reclaim
 
 memcheck: build
 	@echo "--- memcheck (valgrind, curated) ---"

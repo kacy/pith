@@ -1,0 +1,131 @@
+# chan_fanout — a channel coordination benchmark. four producer tasks
+# push messages into one bounded channel and four consumer tasks drain
+# it, mixing each message into a running sum. the work per message is
+# two lcg rounds, small on purpose: what is being measured is the cost
+# of the handoff, not the arithmetic.
+#
+# the sum is taken modulo a prime, so it does not depend on which
+# consumer saw which message. every language in this benchmark family
+# (go, rust, zig) produces the same checksum from the same message
+# stream — that equality is the proof they do the same work.
+#
+# it also reports peak rss from /proc/self/status. with a bounded
+# channel and a fixed task count that number should not move when the
+# message count goes up; if it does, something is retained per message.
+#
+#   pith build bench/chan_fanout.pith
+#   ./bench/chan_fanout 1000000              # os-thread backend
+#   PITH_GREEN=1 ./bench/chan_fanout 1000000 # green backend
+
+import std.fs as fs
+
+PRODUCERS := 4
+CONSUMERS := 4
+CAPACITY := 256
+MOD := 1000000007
+
+fn messages_from_args() -> Int:
+    argv := args()
+    if argv.len() > 1:
+        parsed := parse_int(argv[1])
+        if parsed.is_ok and parsed.ok > 0:
+            return parsed.ok
+    return 1000000
+
+# two rounds of a 31-bit lcg (posix constants), masked so it never
+# overflows and every language reproduces it exactly.
+fn mix(value: Int) -> Int:
+    mut x := (value * 1103515245 + 12345) % 2147483648
+    x = (x * 1103515245 + 12345) % 2147483648
+    return x
+
+# each producer owns a disjoint slice of the id space, so the set of
+# messages is the same no matter how the tasks interleave.
+fn producer(jobs: Channel[Int], id: Int, per: Int) -> Int:
+    mut i := 0
+    while i < per:
+        jobs.send(id * per + i)
+        i = i + 1
+    return per
+
+# drain until the channel is closed and empty, then report how many
+# messages this consumer saw and return its partial sum.
+fn consumer(jobs: Channel[Int], counts: Channel[Int]) -> Int:
+    mut partial := 0
+    mut seen := 0
+    while true:
+        if let value = jobs.recv():
+            partial = (partial + mix(value)) % MOD
+            seen = seen + 1
+        else:
+            break
+    counts.send(seen)
+    return partial
+
+fn peak_rss_kb() -> Int:
+    status := fs.read("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            digits := line.replace("VmHWM:", "").replace("kB", "").trim()
+            parsed := parse_int(digits)
+            if parsed.is_ok:
+                return parsed.ok
+    return 0
+
+fn main() -> Int!:
+    requested := messages_from_args()
+    per := requested / PRODUCERS
+    messages := per * PRODUCERS
+
+    jobs := Channel[Int](CAPACITY)
+    counts := Channel[Int](CONSUMERS)
+
+    start := time()
+
+    # consumers start first and block on recv until work shows up.
+    mut consumers: List[Task[Int]] := []
+    mut c := 0
+    while c < CONSUMERS:
+        consumers.push(spawn consumer(jobs, counts))
+        c = c + 1
+
+    mut producers: List[Task[Int]] := []
+    mut p := 0
+    while p < PRODUCERS:
+        producers.push(spawn producer(jobs, p, per))
+        p = p + 1
+
+    mut sent := 0
+    for t in producers:
+        sent = sent + await t
+    jobs.close()
+
+    mut checksum := 0
+    for t in consumers:
+        partial := await t
+        checksum = (checksum + partial) % MOD
+
+    mut received := 0
+    mut k := 0
+    while k < CONSUMERS:
+        received = received + counts.recv().unwrap_or(0)
+        k = k + 1
+
+    elapsed := time() - start
+    mut rate := 0
+    if elapsed > 0:
+        rate = messages * 1000 / elapsed
+
+    peak := peak_rss_kb()
+
+    print("chan fanout benchmark")
+    print("messages={messages}")
+    print("producers={PRODUCERS}")
+    print("consumers={CONSUMERS}")
+    print("sent={sent}")
+    print("received={received}")
+    print("elapsed_ms={elapsed}")
+    print("rate_per_sec={rate}")
+    print("peak_rss_kb={peak}")
+    print("checksum={checksum}")
+    return 0

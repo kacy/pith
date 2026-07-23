@@ -1,0 +1,103 @@
+# a `T!`/`T?` local whose every use is a flag probe or a `.ok`/`.err` read
+# releases its payload at cleanup instead of leaking it. the reads are borrows
+# that retain where the value escapes, so the local keeps its own count and the
+# cleanup is the sole releaser.
+#
+# this case is about what must NOT break when that fires: every extraction the
+# whitelist refuses has to keep the shell-only release, and a closure that
+# captures the local has to keep reading live memory. run under `make memcheck`
+# — the printed total only catches a behavior regression, valgrind catches the
+# double-free.
+import std.bytes as bytes
+
+struct Box:
+    v: String
+
+fn text(i: Int) -> String!:
+    if i < 0:
+        fail "negative-" + i.to_string()
+    return "value-" + i.to_string()
+
+fn blob(i: Int) -> Bytes!:
+    if i < 0:
+        fail "neg"
+    return bytes.from_string_utf8("blob-" + i.to_string())
+
+fn boxed(i: Int) -> Box!:
+    if i < 0:
+        fail "neg"
+    return Box("boxed-" + i.to_string())
+
+fn maybe(i: Int) -> String?:
+    if i % 3 == 0:
+        return none
+    return "maybe-" + i.to_string()
+
+# every use is whitelisted: a probe plus `.ok` reads of three payload kinds
+fn probe_then_read(i: Int) -> Int:
+    r := text(i)
+    if r.is_err:
+        return 0
+    b := blob(i)
+    if b.is_err:
+        return 0
+    x := boxed(i)
+    if x.is_err:
+        return 0
+    return r.ok.len() + b.ok.len() + x.ok.v.len()
+
+# the error side: `.err` is a payload read too
+fn read_err(i: Int) -> Int:
+    r := text(i)
+    if r.is_ok:
+        return 0
+    message := r.err
+    return message.len()
+
+# `.ok` escaping the frame as a return value, and into containers
+fn escapes(i: Int) -> Int:
+    r := text(i)
+    if r.is_err:
+        return 0
+    mut names: List[String] := []
+    names.push(r.ok)
+    mut index: Map[String, String] := {}
+    index.insert("k", r.ok)
+    return names.len() + index.len() + r.ok.len()
+
+# a closure capturing the local takes the shell without taking the payload, so
+# this local must stay on the shell-only release even though `.ok` is a read
+fn captured(i: Int) -> Int:
+    r := text(i)
+    read := fn() => r.ok.len()
+    return read()
+
+# a result parameter is a borrow: the caller owns the payload
+fn borrows(r: String!) -> Int:
+    if r.is_err:
+        return 0
+    return r.ok.len()
+
+# the extraction forms the whitelist refuses, all in one place
+fn extractions(i: Int) -> Int:
+    a := text(i) catch "fallback"
+    b := text(i).unwrap_or("fallback")
+    mut n := a.len() + b.len()
+    o := maybe(i)
+    if let v = o:
+        n = n + v.len()
+    return n
+
+fn main() -> Int:
+    mut total := 0
+    mut i := 0
+    while i < 300:
+        total = total + probe_then_read(i)
+        total = total + read_err(0 - i - 1)
+        total = total + escapes(i)
+        total = total + captured(i)
+        total = total + borrows(text(i))
+        total = total + extractions(i)
+        i = i + 1
+    print("total " + total.to_string())
+    return 0

@@ -820,7 +820,10 @@ fn ir_tuple_cascade_scan(body_idx: Int):
         mut kind := "string"
         if i < ir_rc_local_kinds.len():
             kind = ir_rc_local_kinds[i]
-        if kind == "tuple" and ir_tuple_local_tid.contains_key(name):
+        # a param is a borrow: the caller owns the payload and the prologue only
+        # retains the shell, so cascading one would over-release. skip anything
+        # already in ir_var_regs, which at this point holds exactly the params.
+        if kind == "tuple" and ir_tuple_local_tid.contains_key(name) and not ir_var_regs.contains_key(name):
             tid := ir_tuple_local_tid[name]
             if tid >= 0 and ir_tuple_local_has_rc_payload(tid) and ir_tuple_uses_all_safe(body_idx, name):
                 ir_tuple_cascade_names.push(name)

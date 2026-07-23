@@ -1676,7 +1676,14 @@ impl HttpResponse:
         return parse_json_or_fail(self.body_text()!)
 
     fn to_bytes() -> Bytes!:
-        header_bytes := response_head_bytes(self, self.body.len(), false)!
+        return self.to_bytes_conn("")
+
+    # serialize with an explicit Connection value written into the head, without
+    # copying the response first. this is the keep-alive server path: it lets the
+    # loop keep a connection open (or close it) per request while the handler's
+    # `HttpResponse` is serialized exactly once and never rebuilt.
+    fn to_bytes_conn(connection: String) -> Bytes!:
+        header_bytes := response_head_bytes_conn(self, self.body.len(), false, connection)!
         buf := bytes.buffer_with_capacity(header_bytes.len() + self.body.len())
         errdefer buf.free()
         buf.write(header_bytes)!
@@ -1705,12 +1712,26 @@ fn strip_header_controls(text: String) -> String:
     return out.take_bytes().to_string_utf8() catch ""
 
 fn response_head_bytes(response: HttpResponse, content_length: Int, use_chunked: Bool) -> Bytes!:
+    return response_head_bytes_conn(response, content_length, use_chunked, "")!
+
+# serialize a response head with an explicit Connection value. `connection` is
+# how a keep-alive server names the disposition of the connection *without*
+# rebuilding the response to carry a Connection header — passing "keep-alive" or
+# "close" here writes exactly that line and drops any Connection the response's
+# own header map holds, so the caller decides keep-alive per request with no
+# per-request `HttpResponse` copy. an empty `connection` keeps the standalone
+# behavior: honor a Connection the handler set, else default to close.
+fn response_head_bytes_conn(response: HttpResponse, content_length: Int, use_chunked: Bool, connection: String) -> Bytes!:
     crlf := chr(13) + chr(10)
     mut head := status_line(response.status)
     if response.content_type != "":
         head = head + ct_header(strip_header_controls(response.content_type))
     for key in response.headers:
         if header_key_matches(key, "Content-Type") or header_key_matches(key, "Content-Length") or header_key_matches(key, "Set-Cookie") or header_key_matches(key, "Transfer-Encoding"):
+            continue
+        # when the caller supplies the Connection value, we write it once below;
+        # skip any Connection the response map carries so it is not duplicated.
+        if connection != "" and header_key_matches(key, "Connection"):
             continue
         head = head + strip_header_controls(key) + ": " + strip_header_controls(response.headers[key]) + crlf
     for line in response.set_cookie_headers:
@@ -1719,7 +1740,9 @@ fn response_head_bytes(response: HttpResponse, content_length: Int, use_chunked:
         head = head + "Transfer-Encoding: chunked" + crlf
     else:
         head = head + "Content-Length: " + content_length.to_string() + crlf
-    if header_lookup(response.headers, "Connection") == "":
+    if connection != "":
+        head = head + "Connection: " + strip_header_controls(connection) + crlf
+    elif header_lookup(response.headers, "Connection") == "":
         head = head + "Connection: close" + crlf
     return bytes.from_string_utf8(head + crlf)
 
@@ -1800,6 +1823,21 @@ fn request_prefers_close(req: HttpRequestBytes) -> Bool:
 
 fn response_connection_value(resp: HttpResponse) -> String:
     return resp.header_value("Connection").to_lower()
+
+# decide the Connection header value for one keep-alive exchange, as a string the
+# serializer writes directly. this is the leak-free replacement for
+# `response_for_connection` + `response_closes_connection`: it makes the same
+# decision (the request's preference wins; then a Connection the handler set;
+# otherwise keep-alive) but returns a value instead of a rebuilt response, so the
+# serve loop never copies the handler's `HttpResponse` per request. the caller
+# closes the connection when this is "close" (case-insensitively).
+fn connection_value_for(req: HttpRequestBytes, resp: HttpResponse) -> String:
+    if request_prefers_close(req):
+        return "close"
+    existing := resp.header_value("Connection")
+    if existing != "":
+        return existing
+    return "keep-alive"
 
 fn response_for_connection(req: HttpRequestBytes, resp: HttpResponse) -> HttpResponse:
     if request_prefers_close(req):
@@ -1949,7 +1987,14 @@ pub fn read_request_bytes_into(fd: Int, writer: BufferedBytesWriter) -> Streamed
 
 # sends one structured response through a buffered writer.
 pub fn send_buffered(writer: BufferedBytesWriter, response: HttpResponse) -> Int!:
-    payload := response.to_bytes()!
+    return send_buffered_conn(writer, response, "")
+
+# sends a response through a buffered writer with an explicit Connection value.
+# the keep-alive serve loops use this so they can keep or close a connection per
+# request without rebuilding the handler's response — an empty `connection`
+# reproduces `send_buffered` exactly.
+pub fn send_buffered_conn(writer: BufferedBytesWriter, response: HttpResponse, connection: String) -> Int!:
+    payload := response.to_bytes_conn(connection)!
     written := writer.write_all_bytes(payload)!
     writer.flush()!
     return written
@@ -2873,9 +2918,10 @@ pub fn serve_connection(reader: BufferedBytesReader, writer: BufferedBytesWriter
         req := req_result.ok
         if req.head.is_empty() and req.method_text == "":
             return total
-        resp := response_for_connection(req, handler(req))
-        total = total + send_buffered(writer, resp)!
-        if response_closes_connection(req, resp):
+        resp := handler(req)
+        connection := connection_value_for(req, resp)
+        total = total + send_buffered_conn(writer, resp, connection)!
+        if connection.to_lower() == "close":
             return total
 
 # serves one request from a client fd and closes the connection after writing the response.
@@ -2974,9 +3020,10 @@ pub fn serve_connection_tls(conn: tls.Conn, handler: fn(HttpRequestBytes) -> Htt
         req := req_result.ok
         if req.head.is_empty() and req.method_text == "":
             return total
-        resp := response_for_connection(req, handler(req))
-        total = total + conn.write_all_bytes(resp.to_bytes()!)!
-        if response_closes_connection(req, resp):
+        resp := handler(req)
+        connection := connection_value_for(req, resp)
+        total = total + conn.write_all_bytes(resp.to_bytes_conn(connection)!)!
+        if connection.to_lower() == "close":
             return total
 
 # accepts one client from a listener fd and serves exactly one request.
@@ -3230,6 +3277,60 @@ test "http serves keep-alive connections":
     assert(payload.contains("Connection: close"))
     assert(payload.contains(chr(13) + chr(10) + chr(13) + chr(10) + "/one"))
     assert(payload.contains(chr(13) + chr(10) + chr(13) + chr(10) + "/two"))
+
+test "http keep-alive serialization writes Connection without rebuilding the response":
+    crlf := chr(13) + chr(10)
+    # to_bytes_conn writes the disposition into the head directly, exactly once.
+    ka := text(200, "hi").to_bytes_conn("keep-alive")!.to_string_utf8()!
+    assert(ka.contains("Connection: keep-alive"))
+    assert(not ka.contains("Connection: close"))
+    cl := text(200, "hi").to_bytes_conn("close")!.to_string_utf8()!
+    assert(cl.contains("Connection: close"))
+    # a response that already carries a Connection header does not get a
+    # duplicate: the caller's value is authoritative and the map's is dropped.
+    forced := text(200, "hi").keep_alive().to_bytes_conn("close")!.to_string_utf8()!
+    assert(forced.contains("Connection: close"))
+    assert(not forced.contains("Connection: keep-alive"))
+
+test "http connection_value_for decides keep-alive per request":
+    crlf := chr(13) + chr(10)
+    plain := read_request_buffered_bytes(io.bytes_reader(bytes.from_string_utf8("GET /a HTTP/1.1" + crlf + "Host: x" + crlf + crlf)).buffered_chunked(8))!
+    assert_eq(connection_value_for(plain, text(200, "a")).to_lower(), "keep-alive")
+    asked_close := read_request_buffered_bytes(io.bytes_reader(bytes.from_string_utf8("GET /a HTTP/1.1" + crlf + "Connection: close" + crlf + crlf)).buffered_chunked(8))!
+    assert_eq(connection_value_for(asked_close, text(200, "a")).to_lower(), "close")
+    # a handler that set its own Connection is respected over the default.
+    assert_eq(connection_value_for(plain, text(200, "a").close_connection()).to_lower(), "close")
+
+test "http keep-alive serve loop reuses one connection byte-for-byte":
+    crlf := chr(13) + chr(10)
+    first := get_request("example.test", 80, "/one").keep_alive().to_bytes()!
+    second := get_request("example.test", 80, "/two").close_connection().to_bytes()!
+    input := bytes.buffer()
+    input.write(first)!
+    input.write(second)!
+    output := bytes.buffer()
+    reader := io.bytes_reader(input.bytes()).buffered_chunked(5)
+    writer := output.buffered_chunked(6)
+
+    # mirror serve_connection's rewritten body: no per-request response rebuild.
+    req_one := read_request_buffered_bytes(reader)!
+    resp_one := text(200, req_one.path_text)
+    conn_one := connection_value_for(req_one, resp_one)
+    mut written := send_buffered_conn(writer, resp_one, conn_one)!
+    req_two := read_request_buffered_bytes(reader)!
+    resp_two := text(200, req_two.path_text)
+    conn_two := connection_value_for(req_two, resp_two)
+    written = written + send_buffered_conn(writer, resp_two, conn_two)!
+    payload := output.bytes().to_string_utf8()!
+
+    assert_eq(written, output.bytes().len())
+    # first request asked to keep alive, second asked to close.
+    assert_eq(conn_one.to_lower(), "keep-alive")
+    assert_eq(conn_two.to_lower(), "close")
+    assert(payload.contains("Connection: keep-alive"))
+    assert(payload.contains("Connection: close"))
+    assert(payload.contains(crlf + crlf + "/one"))
+    assert(payload.contains(crlf + crlf + "/two"))
 
 test "http reads sequential responses from one reader":
     first := text(200, "one").keep_alive().to_bytes()!

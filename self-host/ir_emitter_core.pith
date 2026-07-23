@@ -103,6 +103,18 @@ mut ir_closure_return_kinds: Map[String, String] := {}
 mut ir_string_locals: List[String] := []
 mut ir_rc_local_kinds: List[String] := []
 
+# tuple locals (a `T!`/`T?` bound to a name) release only their 3-slot shell at
+# cleanup by default, which leaks the owned payload at slot 8 (and the error at
+# slot 16). these two lists track, per function, the tuple locals whose EVERY
+# use is provably safe to cascade — a `.ok`/`.err` read (which retains) or a
+# flag check (`.is_ok`/`.is_err`/`== none`, which only reads a field). for those
+# the cleanup path additionally releases the live payload before freeing the
+# shell. a local with any other use (`!`, `catch`, passed to a call, returned,
+# bound, matched, iterated, ...) is left out — it keeps the shell-only behavior,
+# which may leak but can never double-free. see ir_tuple_cascade_scan.
+mut ir_tuple_local_tid: Map[String, Int] := {}   # tuple local name -> producing expr's type id
+mut ir_tuple_cascade_names: List[String] := []    # tuple locals whose payload is safe to cascade
+
 # --- module globals collected during the prepass ---
 
 # --- type and symbol metadata copied from the checker ---
@@ -110,6 +122,7 @@ mut ir_rc_local_kinds: List[String] := []
 mut ir_local_struct_names: List[String] := [] # structs declared by this module
 mut ir_dtor_memo: Map[String, Int] := {} # 1 needs dtor, 2 no/undecided
 mut ir_tuple_dtor_sigs: List[String] := [] # rc-element signatures seen this module
+mut ir_tuple_cascade_sigs: List[String] := [] # (ok,err) payload signatures needing a cascade helper
 
 mut ir_func_result_ok_kinds: Map[String, String] := {}
 # `threadlocal` module globals: name -> a process-unique slot id, and name ->
@@ -206,6 +219,7 @@ fn ir_reset_type_state():
     ir_local_struct_names = []
     ir_dtor_memo = {}
     ir_tuple_dtor_sigs = []
+    ir_tuple_cascade_sigs = []
     ir_struct_names.clear()
     ir_struct_field_lookup.clear()
     ir_struct_field_index_lookup.clear()
@@ -737,6 +751,181 @@ fn ir_defer_emit_for_loop_jump():
     if ir_defer_loop_base_stack.len() > 0:
         ir_defer_emit_through(ir_defer_loop_base_stack[ir_defer_loop_base_stack.len() - 1], false)
 
+# record the producing result/optional type id for a tuple local. a rebind to a
+# tuple of a different type (tid) can't pick one payload shape, so it is marked
+# conflicting (-1) and never becomes cascade-eligible — a safe under-fix.
+fn ir_tuple_record_tid(name: String, val_idx: Int):
+    tid := c_get_expr_type(val_idx)
+    if tid < 0:
+        return
+    if ir_tuple_local_tid.contains_key(name):
+        if ir_tuple_local_tid[name] != tid:
+            ir_tuple_local_tid.insert(name, 0 - 1)
+        return
+    ir_tuple_local_tid.insert(name, tid)
+
+# true when `parent` uses its child ident `name` in a way that leaves the tuple's
+# own count on the payload intact — a `.ok`/`.err` read (which retains a copy) or
+# a flag check (which only reads slot 0). every such use is safe to cascade after.
+fn ir_tuple_use_is_whitelisted(parent: Node, name: String) -> Bool:
+    if parent.kind == "field_access":
+        # the ident must be the receiver, and the field one of the safe reads
+        if parent.children.len() == 0:
+            return false
+        recv := get_node(parent.children[0])
+        if not (recv.kind == "ident" and recv.value == name):
+            return false
+        f := parent.value
+        return f == "ok" or f == "err" or f == "is_ok" or f == "is_err" or f == "is_some" or f == "is_none"
+    if parent.kind == "binary" and (parent.value == "eq" or parent.value == "neq"):
+        # `name == none` / `name != none`: only reads the flag, never releases
+        if parent.children.len() < 2:
+            return false
+        a := get_node(parent.children[0])
+        b := get_node(parent.children[1])
+        a_is_name := a.kind == "ident" and a.value == name
+        b_is_name := b.kind == "ident" and b.value == name
+        a_is_none := a.kind == "none_lit" or a.kind == "none"
+        b_is_none := b.kind == "none_lit" or b.kind == "none"
+        return (a_is_name and b_is_none) or (b_is_name and a_is_none)
+    return false
+
+# walk the subtree: every occurrence of ident `name` must appear as the child of
+# a whitelisted parent. any other appearance (bound, returned, passed, unwrapped,
+# matched, iterated, ...) makes cascade unsafe and returns false.
+fn ir_tuple_uses_all_safe(idx: Int, name: String) -> Bool:
+    node := get_node(idx)
+    for child_idx in node.children:
+        child := get_node(child_idx)
+        if child.kind == "ident" and child.value == name:
+            if not ir_tuple_use_is_whitelisted(node, name):
+                return false
+            # a whitelisted parent consumes this ident safely; its sibling
+            # children are still visited by the loop below
+        else:
+            if not ir_tuple_uses_all_safe(child_idx, name):
+                return false
+    return true
+
+# after prologue tracking is finalized, decide which tuple locals may cascade:
+# a known result/optional type with an rc payload to release, and every use in
+# the body provably safe. anything unknown stays shell-only (leak, never UAF).
+fn ir_tuple_cascade_scan(body_idx: Int):
+    ir_tuple_cascade_names = []
+    if body_idx < 0:
+        return
+    mut i := 0
+    while i < ir_string_locals.len():
+        name := ir_string_locals[i]
+        mut kind := "string"
+        if i < ir_rc_local_kinds.len():
+            kind = ir_rc_local_kinds[i]
+        if kind == "tuple" and ir_tuple_local_tid.contains_key(name):
+            tid := ir_tuple_local_tid[name]
+            if tid >= 0 and ir_tuple_local_has_rc_payload(tid) and ir_tuple_uses_all_safe(body_idx, name):
+                ir_tuple_cascade_names.push(name)
+        i = i + 1
+
+# true when a result/optional type holds an rc payload worth cascading: either
+# slot (ok/value or err) carries a heap value. all-scalar tuples cascade nothing,
+# so they stay on the cheaper shell-only path.
+fn ir_tuple_local_has_rc_payload(tid: Int) -> Bool:
+    info := get_type_info(tid)
+    if info.kind == "result":
+        if ir_rc_kind(ir_result_field_kind(tid, "ok")).len() > 0:
+            return true
+        return ir_rc_kind(ir_result_field_kind(tid, "err")).len() > 0
+    if info.kind == "optional" and info.inner >= 0:
+        return ir_rc_kind(ir_type_from_tid(info.inner)).len() > 0
+    return false
+
+# the ok/value payload kind (slot 8) and error payload kind (slot 16) a tuple
+# local's cascade must release, packed as two ir_tuple_elem_code chars. an
+# optional has no error slot, so its second code is always "0".
+fn ir_tuple_cascade_signature(tid: Int) -> String:
+    info := get_type_info(tid)
+    if info.kind == "result":
+        ok_code := ir_tuple_elem_code(ir_rc_kind(ir_result_field_kind(tid, "ok")))
+        err_code := ir_tuple_elem_code(ir_rc_kind(ir_result_field_kind(tid, "err")))
+        return ok_code + err_code
+    if info.kind == "optional" and info.inner >= 0:
+        return ir_tuple_elem_code(ir_rc_kind(ir_type_from_tid(info.inner))) + "0"
+    return "00"
+
+# module-suffixed so each module carries its own copy, exactly like the tuple
+# and struct destructors — no cross-module references, no name clashes.
+fn ir_tuple_cascade_helper_name(sig: String) -> String:
+    return "__tuple_cascade_" + sig + "_m" + ir_module_count.to_string()
+
+# release a tracked local at cleanup / reassignment. a cascade-eligible tuple
+# local additionally drops its owned payload before the shell is freed; every
+# other local keeps the plain shell/handle release.
+#
+# the cascade is a CALL to a generated helper rather than inline branches on
+# purpose: an inline brif would split the caller's basic block, and registers
+# defined before the release (the freshly built value in a rebind, the return
+# value at an exit edge) are still read after it. a single call keeps the
+# surrounding block intact.
+fn ir_rc_release_local(r: Int, kind: String, name: String):
+    if kind == "tuple" and ir_tuple_cascade_names.contains(name):
+        tid := ir_tuple_local_tid[name]
+        info := get_type_info(tid)
+        if info.kind == "result" or info.kind == "optional":
+            sig := ir_tuple_cascade_signature(tid)
+            if not ir_tuple_cascade_sigs.contains(sig):
+                ir_tuple_cascade_sigs.push(sig)
+            ir_emit_call1(ir_reg(), ir_tuple_cascade_helper_name(sig), "void", r)
+            return
+    ir_rc_release_reg(r, kind)
+
+# one helper per (ok, err) payload signature used this module. each releases the
+# live payload of a result/optional tuple — slot 8 when the flag is set, slot 16
+# otherwise — and then frees the shell. a null shell short-circuits to a no-op,
+# which is what an unassigned local (early return before its bind) or the first
+# loop iteration's zero-stored previous value hands in.
+fn ir_emit_tuple_cascade_helpers():
+    for sig in ir_tuple_cascade_sigs:
+        ok_kind := ir_tuple_dtor_code_kind(sig.substring(0, 1))
+        err_kind := ir_tuple_dtor_code_kind(sig.substring(1, 2))
+        ir_emit_func_header(ir_tuple_cascade_helper_name(sig), 1, "void")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        live_r := ir_reg()
+        ir_emit("neq " + live_r.to_string() + " " + pr.to_string() + " " + zero_r.to_string())
+        live_l := ir_label()
+        done_l := ir_label()
+        ir_emit("brif " + live_r.to_string() + " " + live_l + " " + done_l)
+        ir_emit_label(live_l)
+        flag_r := ir_reg()
+        ir_emit("field " + flag_r.to_string() + " " + pr.to_string() + " 0 bool is_ok")
+        ok_l := ir_label()
+        err_l := ir_label()
+        rel_l := ir_label()
+        ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+        ir_emit_label(ok_l)
+        if ok_kind.len() > 0:
+            ok_r := ir_reg()
+            ir_emit("field " + ok_r.to_string() + " " + pr.to_string() + " 8 unknown ok")
+            ir_rc_release_reg(ok_r, ok_kind)
+        ir_emit("jmp " + rel_l)
+        ir_emit_label(err_l)
+        if err_kind.len() > 0:
+            err_r := ir_reg()
+            ir_emit("field " + err_r.to_string() + " " + pr.to_string() + " 16 unknown err")
+            ir_rc_release_reg(err_r, err_kind)
+        ir_emit("jmp " + rel_l)
+        ir_emit_label(rel_l)
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", pr)
+        ir_emit("jmp " + done_l)
+        ir_emit_label(done_l)
+        ret_r := ir_reg()
+        ir_emit("iconst " + ret_r.to_string() + " 0")
+        ir_emit("ret " + ret_r.to_string())
+        ir_emit("endfunc")
+
 fn ir_emit_string_cleanup(exclude: String):
     mut i := 0
     while i < ir_string_locals.len():
@@ -747,7 +936,7 @@ fn ir_emit_string_cleanup(exclude: String):
         if name != exclude and ir_rc_release_enabled(kind):
             r := ir_reg()
             ir_emit_name_load(r, name)
-            ir_rc_release_reg(r, kind)
+            ir_rc_release_local(r, kind, name)
         i = i + 1
 
 # pre-pass: names of string-typed binds anywhere in the body. an
@@ -839,6 +1028,10 @@ fn ir_collect_string_bind_names(idx: Int, names: List[String], poisoned: List[St
                         poisoned.push(parts.name)
                 else:
                     ir_rc_track_local(parts.name, kind)
+                # remember the producing result/optional type so the cleanup path
+                # can cascade-release the payload (only for cascade-eligible locals)
+                if kind == "tuple" and parts.val_idx >= 0:
+                    ir_tuple_record_tid(parts.name, parts.val_idx)
             elif not poisoned.contains(parts.name):
                 # bound with a non-rc (or unknown) type somewhere: same rule.
                 poisoned.push(parts.name)
@@ -909,6 +1102,9 @@ fn ir_emit_string_prologue(body_idx: Int):
             pi = pi + 1
         ir_string_locals = kept
         ir_rc_local_kinds = kept_kinds
+    # with the final tracked set known, decide which tuple locals may cascade
+    # their payload at cleanup (all uses provably safe); the rest stay shell-only
+    ir_tuple_cascade_scan(body_idx)
     mut i := 0
     while i < ir_string_locals.len():
         name := ir_string_locals[i]
@@ -4101,8 +4297,12 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_types := ir_copy_var_types(ir_var_types)
     saved_string_locals := ir_string_locals
     saved_rc_kinds := ir_rc_local_kinds
+    saved_tuple_tids := ir_tuple_local_tid
+    saved_tuple_cascade := ir_tuple_cascade_names
     ir_string_locals = []
     ir_rc_local_kinds = []
+    ir_tuple_local_tid = {}
+    ir_tuple_cascade_names = []
     ir_reset_lambda_emit_state()
     ir_emit_func_header(lambda_name, parts.params.len() + 1, "unknown")
     ir_emit_lambda_hidden_param()
@@ -4113,6 +4313,8 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
     ir_string_locals = saved_string_locals
     ir_rc_local_kinds = saved_rc_kinds
+    ir_tuple_local_tid = saved_tuple_tids
+    ir_tuple_cascade_names = saved_tuple_cascade
     # return closure handle and fill captures
     r := ir_reg()
     ir_emit("closure_ref " + r.to_string() + " " + lambda_name)
@@ -4912,7 +5114,10 @@ fn ir_emit_bind_stmt(node: Node):
         if tracked and bind_target != "tuple" and ir_string_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:
-            ir_rc_release_reg(old_r, bind_kind)
+            # a loop rebinding a cascade-eligible tuple local must cascade the
+            # OLD value's payload here, not just its shell — this is where the
+            # per-iteration leak lives.
+            ir_rc_release_local(old_r, bind_kind, name)
         ir_var_regs.insert(name, r)
         ir_emit_name_store(name, r)
         if not ir_var_types.contains_key(name):
@@ -4940,7 +5145,7 @@ fn ir_emit_assign_stmt(node: Node):
         if legacy_kind.len() > 0 and legacy_target != "tuple" and ir_string_expr_is_borrowed(node.children[0]):
             ir_rc_retain_reg(r, legacy_kind)
         if old_r >= 0:
-            ir_rc_release_reg(old_r, legacy_kind)
+            ir_rc_release_local(old_r, legacy_kind, name)
         ir_var_regs.insert(name, r)
         ir_emit_name_store(name, r)
 
@@ -5945,6 +6150,8 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_map_value_types = {}
     ir_string_locals = []
     ir_rc_local_kinds = []
+    ir_tuple_local_tid = {}
+    ir_tuple_cascade_names = []
     # defers are function-scoped: start each function with empty scope stacks
     ir_defer_nodes = []
     ir_defer_is_err = []
@@ -6679,6 +6886,9 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # are where such constructions (and their attaches) are recorded.
     ir_emit_generic_instance_dtors()
     ir_append_lambda_bodies()
+    # tuple cascade helpers last of all: every body (top level, specializations,
+    # generic instance dtors and lambdas) has registered its signatures by now.
+    ir_emit_tuple_cascade_helpers()
 
 # Walk every impl_decl in the current root and register specialization name
 # entries into ir_impl_method_specializations without emitting bodies yet.

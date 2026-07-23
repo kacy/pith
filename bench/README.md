@@ -263,6 +263,101 @@ built; the strong run grows without bound. `PITH_PERF_STATS=1` prints the
 underlying struct alloc/free counts — balanced for the weak variant,
 alloc-heavy with almost no frees for the strong one.
 
+## channel fan-out benchmark (concurrency)
+
+`bench/chan_fanout.*` is the concurrency counterpart to the batch
+benchmarks here. four producer tasks push messages into one bounded
+channel (capacity 256) and four consumer tasks drain it. the work per
+message is two lcg rounds, kept small on purpose so the handoff
+dominates the arithmetic — the handoff is the thing being measured.
+
+each consumer folds its messages into a partial sum modulo a prime and
+the partials are added at the end, so the total does not depend on which
+consumer saw which message. all four implementations print the same
+`checksum=90815792` at one million messages — that equality is the
+honesty check, the same one `event_ledger` uses. each also reports how
+many messages it sent and received, and its peak rss read from
+`/proc/self/status`.
+
+each language does this its own way: pith `spawn` and `Channel[Int]`, go
+goroutines and a buffered channel, rust std threads and
+`mpsc::sync_channel`, zig `std.Thread` over a hand-written mutex/condvar
+ring buffer (zig's std has no channel). rust's mpsc is single-consumer,
+so its receiver sits behind an `Arc<Mutex<..>>` — the std-only way to
+fan one channel out to several consumers, and part of what its number
+includes.
+
+run it:
+
+```
+bench/chan_fanout_bench.sh 1000000 9   # messages, trials
+```
+
+which builds all four, checks that every run of every implementation
+agrees on the checksum, and prints the medians. or build and run one
+directly:
+
+```
+pith build bench/chan_fanout.pith && ./bench/chan_fanout 1000000
+PITH_GREEN=1 ./bench/chan_fanout 1000000
+go build -o bench/chan_fanout_go bench/chan_fanout.go
+rustc -O -o bench/chan_fanout_rust bench/chan_fanout.rs
+zig build-exe -O ReleaseFast -femit-bin=bench/chan_fanout_zig bench/chan_fanout.zig
+```
+
+one million messages, median of 9 trials on this 2-core machine, run
+with nothing else on it. eight tasks on two cores is oversubscribed on
+purpose, and equally so for all four:
+
+| lang | ms | messages/sec | peak rss |
+|---|---:|---:|---:|
+| pith (os threads) | 622 | 1.6 m | 3.0 mb |
+| pith (`PITH_GREEN=1`) | 766 | 1.3 m | 2.8 mb |
+| go | 72 | 13.9 m | 2.0 mb |
+| rust | 74 | 13.5 m | 2.4 mb |
+| zig | 222 | 4.5 m | 2.7 mb |
+
+the whole table was taken three times. pith, go, and rust repeat within
+a couple of percent (619-622, 71-72, 74-77); the green backend ranged
+766-833 and zig 222-278, so read those two as approximate.
+
+pith loses this one, and not narrowly. at 622ms it is about 8.6x go and
+8.4x rust, and 2.8x zig's hand-rolled queue. per message that is ~620ns
+for a send plus a receive where go spends ~72ns. this is
+goroutines-and-channels territory and go wins it on merit.
+
+the green backend does not rescue it: at the default worker count it is
+*slower* than os threads. the shape is why — eight tasks that
+mostly block on one shared channel spread across two workers, so the
+handoffs cross workers and wake the peer instead of staying in
+userspace. pinning it with `PITH_GREEN_WORKERS=1` gives 578ms, the best
+pith number here, which matches what the green docs say about locality.
+that is a tuning knob the other three do not have, so it is not in the
+table.
+
+context switches over the same run (`perf stat -e context-switches`) say
+the kernel is not the whole story:
+
+| | pith | pith green | go | rust | zig |
+|---|---:|---:|---:|---:|---:|
+| context switches | 17.4k | 30.9k | 204 | 5.7k | 32.8k |
+
+zig takes twice pith's context switches and still finishes 2.8x sooner,
+so the cost is in pith's per-operation channel work, not only in the
+blocking. go's 204 is its scheduler keeping the handoff in userspace,
+which is exactly the thing the green backend is meant to do and does not
+yet do well at this shape.
+
+memory is the one column where pith is fine. everything holds flat: 4x
+the messages moves peak rss by under 100 kb in every implementation, so
+nothing is retained per message on any of them. pith's 3.0 mb against
+go's 2.0 mb is runtime baseline, not growth.
+
+zig's timing is by far the noisiest of the four, 104-371ms across nine
+runs — probably the plain `signal` on a shared condvar, which wakes
+whichever consumer the kernel feels like. the median is stable enough to
+compare, but read any single zig run with suspicion.
+
 ## std pipeline benchmark
 
 `bench/std_pipeline.*` is a batteries-included data pipeline benchmark. it
@@ -274,10 +369,16 @@ running it:
 
 ```
 ./self-host/pith_main build bench/std_pipeline.pith
-env GOCACHE=/tmp/pith-go-cache go build -o bench/std_pipeline_go bench/std_pipeline.go
+go build -o bench/std_pipeline_go bench/std_pipeline.go
 cargo build --release --manifest-path bench/std_pipeline_rust/Cargo.toml
-env GOCACHE=/tmp/pith-go-cache go run bench/std_pipeline_bench.go 50000 5
+go run bench/std_pipeline_bench.go 50000 5
 ```
+
+these used to pin `GOCACHE=/tmp/pith-go-cache`. don't: `/tmp` is a tmpfs
+on the machine these numbers come from, so that puts a build cache in ram
+and takes it away from the thing being measured — enough of it, and the
+oom killer starts taking builds out mid-run. go's default cache is on
+disk, which is what you want.
 
 latest measured results on this machine, using the median of 5 trials:
 

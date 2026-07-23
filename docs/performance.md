@@ -23,6 +23,12 @@ reference cycles refcounting alone can't. json struct decode stays faster
 than go's reflection decode — a flat struct of required scalars decodes
 in a single pass, filled straight into the struct.
 
+the newest table, `bench/chan_fanout` (2026-07-23), is the one pith
+loses outright: pushing a million messages through a channel between
+eight tasks takes 622ms against go's 72ms. the batch benchmarks measure
+compute, and pith is competitive there; coordination is a different
+story and the number is below.
+
 the comparators drift a few percent between days; within a table they
 are comparable. go 1.24.4 (net/http, encoding/*); rust either a pinned
 crate set (std_pipeline) or a tiny hand-rolled scanner (catalog), read
@@ -237,6 +243,32 @@ os-thread backend still keeps a record per task it has run, so its rss
 still grows with the total (the closure release lands there too, but the
 slot does not); giving that slab the same reclamation is a tracked
 follow-up, and until then this bound is a green-only property.
+
+`bench/chan_fanout` — the same fan-out shape with cross-language
+comparators: four producer tasks push one million messages through a
+bounded channel (capacity 256) and four consumer tasks drain them,
+folding each into an order-independent sum. all four languages print the
+same checksum. 2026-07-23, median of 9 on this 2-core box:
+
+| | pith | pith green | go | rust | zig |
+|---|---:|---:|---:|---:|---:|
+| total | 622ms | 766ms | **72ms** | 74ms | 222ms |
+| peak rss | 3.0 mb | 2.8 mb | 2.0 mb | 2.4 mb | 2.7 mb |
+
+pith is last here by a wide margin — 8.6x go, 8.4x rust, 2.8x zig's
+hand-written mutex/condvar queue — and the green backend at its default
+worker count makes it worse, not better. eight tasks that all block on
+one shared channel land on both workers, so each handoff wakes the peer
+instead of staying in userspace; `PITH_GREEN_WORKERS=1` pins them
+together and gives 578ms, the best pith number of the set, which is the
+locality effect described in docs/concurrency.md. context switches over
+the run are 17.4k os-thread, 30.9k green, 204 for go, 5.7k rust, 32.8k
+zig — zig takes twice pith's switches and still finishes 2.8x sooner, so
+the gap is the per-operation cost of pith's channel, not only the
+blocking. memory is the one column that holds: 4x the messages moves
+peak rss by under 100 kb everywhere, so nothing is retained per message.
+the table was taken three times; pith, go, and rust repeat within a
+couple of percent, green (766-833ms) and zig (222-278ms) drift more.
 
 **result and optional locals** — a `T!` or `T?` bound to a name lowers to a
 three-slot heap value: a flag, the payload, and the error. releasing one
@@ -660,8 +692,12 @@ for i in 1 2 3 4 5; do ./bench/closure_error 200000; done
 ./target/release/pith build bench/green_fanout.pith       # per-task memory under fan-out
 PITH_GREEN=1 ./bench/green_fanout 200000                  # green: flat rss; drop the flag to see os-thread grow
 PITH_GREEN=1 ./bench/green_fanout 500000                  # peak rss should barely move
+bench/chan_fanout_bench.sh 1000000 9                      # channels, four languages, checksum-checked
 ```
 
 go and rust counterparts build per `bench/README.md`; `closure_error`
 builds with `go build -o bench/closure_error_go bench/closure_error.go`
 and `rustc -O bench/closure_error.rs -o bench/closure_error_rust`.
+`chan_fanout_bench.sh` builds its own four (pith, go, rustc, zig) and
+refuses to print a table unless every run agrees on the checksum; it
+measures pith twice, once per backend.

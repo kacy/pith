@@ -1,0 +1,43 @@
+# a `for x in <fresh iterable>:` loop releases its iterable at the loop's
+# normal end label, but an early `return` from inside the loop leaves the
+# function before reaching that label. before the fix the iterable — a split
+# result or a map's keys() list — leaked on every early-return exit. the fix
+# releases every open loop's iterable at the function exit edges, so this must
+# stay both leak-free and free of a double-free (the loop that completes
+# normally still releases once, at its end label). it lives in the memcheck set
+# so the release can never regress into a double-free.
+
+# early return out of a loop over a fresh split result
+fn first_field(query: String) -> String:
+    for part in query.split("&"):
+        if part.starts_with("id"):
+            return part
+    return ""
+
+# early return out of a loop over a map's keys()
+fn lookup(headers: Map[String, String], name: String) -> String:
+    for key in headers:
+        if key == name:
+            return headers[key]
+    return ""
+
+# nested loops with a return from the inner one: both iterables must release
+fn nested(rows: String) -> String:
+    for row in rows.split(";"):
+        for cell in row.split(","):
+            if cell == "hit":
+                return row
+    return ""
+
+fn main():
+    mut headers: Map[String, String] := {}
+    headers.insert("host", "example.com")
+    headers.insert("id", "matched")
+    mut i := 0
+    mut acc := 0
+    while i < 200:
+        acc = acc + first_field("a=1&id=42&b=2").len()
+        acc = acc + lookup(headers, "id").len()
+        acc = acc + nested("x,y;p,hit,q;z").len()
+        i = i + 1
+    print("loop-iter early return: acc {acc}")

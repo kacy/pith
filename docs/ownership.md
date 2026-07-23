@@ -113,13 +113,15 @@ gaps, all bounded leaks rather than dangling pointers:
   it holds, the same as a struct.
 - **a result or optional bound to a name can leak its payload.** `T!` and
   `T?` lower to a three-slot value, and releasing one frees those slots
-  without dropping the payload they own. a local that is only *probed* —
-  `.is_ok`, `.is_err`, `== none` — now releases its payload, because a
-  value nobody extracted has exactly one owner. one whose value is read
-  out with `.ok` still leaks: the read retains, so cascading balances on
-  paper, but it turns the leak into a real free and there is code that
-  outlives the payload. writing `x := call()!` avoids the whole question —
-  `!` hands the count to you rather than leaving it in the tuple.
+  without dropping the payload they own. a local whose every use is a
+  probe (`.is_ok`, `.is_err`, `== none`) or a payload read (`.ok`, `.err`)
+  now releases its payload: a probe never touches it, and a read borrows,
+  taking a fresh count only where the value escapes. either way the local
+  is still the last owner. any other use leaks as before — passed to a
+  call, returned whole, consumed by `catch` or `unwrap_or`, bound by
+  `if let`, or captured by a closure, which takes the shell and not the
+  payload. writing `x := call()!` avoids the whole question — `!` hands
+  the count to you rather than leaving it in the tuple.
 
 none of these produce a dangling pointer; the discipline trades a
 bounded leak for that guarantee.

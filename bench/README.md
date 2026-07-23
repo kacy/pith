@@ -369,10 +369,16 @@ running it:
 
 ```
 ./self-host/pith_main build bench/std_pipeline.pith
-env GOCACHE=/tmp/pith-go-cache go build -o bench/std_pipeline_go bench/std_pipeline.go
+go build -o bench/std_pipeline_go bench/std_pipeline.go
 cargo build --release --manifest-path bench/std_pipeline_rust/Cargo.toml
-env GOCACHE=/tmp/pith-go-cache go run bench/std_pipeline_bench.go 50000 5
+go run bench/std_pipeline_bench.go 50000 5
 ```
+
+these used to pin `GOCACHE=/tmp/pith-go-cache`. don't: `/tmp` is a tmpfs
+on the machine these numbers come from, so that puts a build cache in ram
+and takes it away from the thing being measured — enough of it, and the
+oom killer starts taking builds out mid-run. go's default cache is on
+disk, which is what you want.
 
 latest measured results on this machine, using the median of 5 trials:
 

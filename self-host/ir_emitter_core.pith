@@ -3915,6 +3915,18 @@ fn ir_emit_select_expr(node: Node) -> Int:
     ir_emit("load " + r.to_string() + " " + result_temp)
     return r
 
+# a channel send hands the value to whoever receives it, on another task and
+# usually after the sender's frame is gone. both forms transfer ownership, so
+# both need the same count: try_send used to be missing here, which let a
+# borrowed value (`ch.try_send(wire.ok)`) reach the receiver with no count of
+# its own and an owned temporary be released the moment the call returned.
+# a send that fails leaves the extra count behind — a bounded leak, and the
+# same trade already accepted for the blocking form.
+fn ir_is_channel_send_name(emit_name: String) -> Bool:
+    if emit_name == "send" or emit_name == "pith_channel_send":
+        return true
+    return emit_name == "try_send" or emit_name == "pith_channel_try_send"
+
 # --- method call dispatch ---
 fn ir_emit_method_call(idx: Int) -> Int:
     node := get_node(idx)
@@ -4115,7 +4127,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
     # compensation retain, and the argument-release skip (ownership
     # transfers into the container at that position)
     mut store_value_pos := 0 - 1
-    if emit_name == "send" or emit_name == "pith_channel_send" or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
+    if ir_is_channel_send_name(emit_name) or emit_name == "push" or emit_name == "pith_list_push_value" or emit_name == "__list_push":
         store_value_pos = 0
     elif emit_name == "insert" or emit_name == "map_insert" or emit_name == "map_insert_ikey" or emit_name == "set" or emit_name == "pith_list_set_value":
         store_value_pos = 1
@@ -4132,7 +4144,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
             if value_expr >= 0:
                 store_kind := ir_rc_kind(ir_infer_type(value_expr))
                 mut compensate := false
-                if emit_name == "send" or emit_name == "pith_channel_send":
+                if ir_is_channel_send_name(emit_name):
                     compensate = store_kind.len() > 0
                 elif store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "bytes" or store_kind == "struct":
                     compensate = true

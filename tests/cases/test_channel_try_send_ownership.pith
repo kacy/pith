@@ -1,0 +1,43 @@
+# try_send transfers ownership of a heap value to the receiving task, exactly
+# like the blocking send. the emitter used to handle only send, so a try_send
+# left the receiver holding a value with no count of its own — the sender either
+# released an owned temporary the moment the call returned, or (for a borrowed
+# value) never took a count at all. both dangle once the sender's frame is gone.
+#
+# this is how std.net.http2's send_goaway queues its frame, and it showed up as
+# a use-after-free in the writer task under valgrind. run under `make memcheck`.
+import std.bytes as bytes
+
+# read everything the sender queued and report the total length. touching the
+# bytes here is the point: a released payload would be read after free.
+fn drain(ch: Channel[Bytes]) -> Int:
+    mut total := 0
+    while true:
+        opt := ch.recv()
+        if opt == none:
+            return total
+        total = total + opt.unwrap_or(bytes.empty()).len()
+    return total
+
+# a Bytes! whose payload reaches the channel through a `.ok` read — the shape
+# that produced the http/2 failure.
+fn wrapped(text: String) -> Bytes!:
+    return bytes.from_string_utf8(text)
+
+fn main() -> Int!:
+    ch := Channel[Bytes](8)
+    reader := spawn drain(ch)
+
+    # an owned temporary handed straight to try_send
+    ch.try_send(bytes.from_string_utf8("0123456789abcdef"))
+
+    # a borrowed payload read out of a result local
+    wire := wrapped("fedcba9876543210")
+    if not wire.is_err:
+        ch.try_send(wire.ok)
+
+    ch.close()
+    total := await reader
+    assert(total == 32)
+    print("try_send handed over 32 bytes intact")
+    return 0

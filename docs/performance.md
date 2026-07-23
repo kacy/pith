@@ -238,6 +238,31 @@ still grows with the total (the closure release lands there too, but the
 slot does not); giving that slab the same reclamation is a tracked
 follow-up, and until then this bound is a green-only property.
 
+**result and optional locals** — a `T!` or `T?` bound to a name lowers to a
+three-slot heap value: a flag, the payload, and the error. releasing one
+freed only those three slots, so the payload it owned was never dropped. a
+loop that binds a fallible call a million times grew to ~295 mb; the same
+loop written `x := call()!` stayed flat, because `!` hands the payload's
+count to the caller instead of leaving it in the tuple.
+
+a local now releases that payload when every use of it is provably safe —
+today that means the flag reads (`.is_ok`, `.is_err`, `== none`), where the
+value is never handed to anyone and the local is unambiguously its sole
+owner:
+
+| 1m iterations | before | after |
+|---|---:|---:|
+| optional local, probed with `== none` | 295 mb | **2.5 mb** |
+| result local, probed with `.is_err` | 295 mb | **2.7 mb** |
+| result local read through `.ok` | 295 mb | 295 mb (unchanged) |
+
+reading the value through `.ok` is deliberately left alone. cascading there
+balances on paper — the read does retain — but it turns a leak into a real
+free, and valgrind caught an http/2 case reading that memory afterwards: a
+block freed on the main thread and then read from a spawned task. the leak
+had been hiding an ownership bug elsewhere. an under-fix that leaks is
+strictly better than a use-after-free, so `.ok` waits until that is sorted.
+
 `bench/std_pipeline` — 50k records: csv read/write, transform, json,
 gzip:
 
@@ -347,14 +372,31 @@ this 2-core machine:
 | | go | pith threaded |
 |---|---|---|
 | req/s | ~31,600 | **16,800** |
-| rss | flat ~13 mb | +0.8 kb/req |
+| rss | flat ~13 mb | +2.8 kb/req |
 
 2026-07-15 rerun (20s, `wrk -t2 -c8`): the threaded server — one spawned
 os thread per connection — sustains ~16,800 req/s on this 2-core machine,
-a bit over half go's ~31,600. go's netpoller stays well ahead. the
-residual growth is down to ~0.8 kb/request (from ~1.3–1.6 earlier), a
-real per-request leak in the request path that is still unfixed —
-throughput is steady but rss climbs under sustained load.
+a bit over half go's ~31,600. go's netpoller stays well ahead.
+
+the per-request growth was long recorded here as ~0.8 kb; a 2026-07-23
+re-measurement puts it at **~2.8 kb/request** (218 mb over 78k requests),
+so the earlier figure understated it. that growth now has a name: a
+result-typed local leaks its payload. `serve_connection` reads each
+request as
+
+```
+req_result := read_request_buffered_bytes(reader)
+...
+req := req_result.ok
+```
+
+and a `T!` local bound this way is released as a bare three-slot shell —
+the payload it owns is never dropped. every request leaks its whole
+`HttpRequestBytes`. it is a compiler-level ownership gap, not anything in
+the server code, and it is only partly closed (see the reclamation entry
+above): a result/optional local that is merely *probed* now reclaims, but
+one whose value is read through `.ok` still leaks. throughput is steady;
+rss climbs under sustained load until that is finished.
 
 build times: go cold 25.0s / warm 0.1s; pith compiles the benchmark
 in 2.1s every time, and the entire self-hosted compiler in under 7s.

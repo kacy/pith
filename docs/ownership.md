@@ -111,6 +111,15 @@ gaps, all bounded leaks rather than dangling pointers:
   and errs toward the leak. tuples themselves are fully reclaimed:
   a tuple frees its box at the last count and releases any heap value
   it holds, the same as a struct.
+- **a result or optional bound to a name can leak its payload.** `T!` and
+  `T?` lower to a three-slot value, and releasing one frees those slots
+  without dropping the payload they own. a local that is only *probed* —
+  `.is_ok`, `.is_err`, `== none` — now releases its payload, because a
+  value nobody extracted has exactly one owner. one whose value is read
+  out with `.ok` still leaks: the read retains, so cascading balances on
+  paper, but it turns the leak into a real free and there is code that
+  outlives the payload. writing `x := call()!` avoids the whole question —
+  `!` hands the count to you rather than leaving it in the tuple.
 
 none of these produce a dangling pointer; the discipline trades a
 bounded leak for that guarantee.

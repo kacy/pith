@@ -412,34 +412,43 @@ this 2-core machine:
 | | go | pith threaded |
 |---|---|---|
 | req/s | ~31,600 | **16,800** |
-| rss | flat ~13 mb | +0.22 kb/req |
+| rss | flat ~13 mb | flat (~1 b/req) |
 
 2026-07-15 rerun (20s, `wrk -t2 -c8`): the threaded server — one spawned
 os thread per connection — sustains ~16,800 req/s on this 2-core machine,
 a bit over half go's ~31,600. go's netpoller stays well ahead.
 
 the per-request growth was long recorded here as ~0.8 kb, then remeasured
-on 2026-07-23 at **~2.8 kb/request** (670 mb over 234k requests, `wrk -t2
--c8` for 15s, twice). that growth had a name: a result-typed local leaked
-its payload. `serve_connection` reads each request as
+2026-07-23 at **~2.8 kb/request** (twice, `wrk -t2 -c8` for 15s), and now
+sits **flat** — ~200 kb total over 190k+ requests, so about a byte each,
+which is noise.
+
+getting there took two goes, and the first was a wrong turn worth
+recording. the growth was first blamed on a result-typed local:
+`serve_connection` reads each request as `req_result := read_...` then
+`req := req_result.ok`, and such a `T!` local was being released as a bare
+three-slot shell that never dropped its payload. that is a real bug, fixed
+(the reclamation entry above), but fixing it barely moved the server —
+remeasured after it, the server still grew ~2.8 kb/request. the request
+object was not the leak.
+
+the actual cause was a `for` loop leaking its iterable on an early return.
+`serve_connection` and the header helpers it calls do things like
 
 ```
-req_result := read_request_buffered_bytes(reader)
-...
-req := req_result.ok
+for part in query.split("&"):
+    if ...:
+        return part          # skips the loop's end-of-scope release
 ```
 
-and a `T!` local bound this way was released as a bare three-slot shell,
-so the payload it owned was never dropped. every request leaked its whole
-`HttpRequestBytes`. it was a compiler-level ownership gap, not anything in
-the server code.
-
-the reclamation entry above now covers `.ok` and `.err` reads, which is
-exactly this shape, and the same benchmark drops to **~0.22 kb/request**:
-57 mb over 258k requests, and the same per-request figure over a 30s run,
-so what is left grows linearly and is not warm-up. twelve times less, not
-zero — rss still climbs under sustained load, and the rest has some other
-cause.
+and a loop over a fresh iterable — a `split` result, a map's `keys()` list —
+released that iterable only at the loop's normal end label. an early
+`return`/`fail`/`!` from inside the body left the function without reaching
+it, leaking the list and everything it held. two such sites on the request
+path (the query split and a `for key in headers` lookup) accounted for
+essentially the whole 2.8 kb. releasing open loops' iterables at the
+function exit edges closes it, and the server holds flat under sustained
+load.
 
 build times: go cold 25.0s / warm 0.1s; pith compiles the benchmark
 in 2.1s every time, and the entire self-hosted compiler in under 7s.

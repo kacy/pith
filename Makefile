@@ -984,6 +984,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_closure_lifecycle tests/cases/test_error_path_cleanup \
 	tests/cases/test_defer_leak tests/cases/test_errdefer_leak \
 	tests/cases/test_atomic_context tests/cases/test_tuple_ownership \
+	tests/cases/test_channel_try_send_ownership \
 	tests/cases/test_struct_closure_field tests/cases/test_generic_struct_field_dtor \
 	tests/cases/test_iterator_drain tests/cases/test_method_fresh_string_return \
 	tests/cases/test_lazy_adapter_pipeline tests/cases/test_named_local_adapter_chain \

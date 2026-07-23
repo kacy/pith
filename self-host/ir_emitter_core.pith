@@ -105,13 +105,13 @@ mut ir_rc_local_kinds: List[String] := []
 
 # tuple locals (a `T!`/`T?` bound to a name) release only their 3-slot shell at
 # cleanup by default, which leaks the owned payload at slot 8 (and the error at
-# slot 16). these two lists track, per function, the tuple locals whose EVERY
-# use is provably safe to cascade — a `.ok`/`.err` read (which retains) or a
-# flag check (`.is_ok`/`.is_err`/`== none`, which only reads a field). for those
-# the cleanup path additionally releases the live payload before freeing the
-# shell. a local with any other use (`!`, `catch`, passed to a call, returned,
-# bound, matched, iterated, ...) is left out — it keeps the shell-only behavior,
-# which may leak but can never double-free. see ir_tuple_cascade_scan.
+# slot 16). these two lists track, per function, the tuple locals whose EVERY use
+# is a flag check (`.is_ok`/`.is_err`/`== none`) — locals nobody ever extracts a
+# value from, and therefore the payload's sole owner. for those the cleanup path
+# releases the live payload before freeing the shell. a local with any other use
+# (`.ok`, `!`, `catch`, passed to a call, returned, bound, matched, iterated, ...)
+# is left out and keeps the shell-only behavior, which may leak but can never
+# double-free. see ir_tuple_use_is_whitelisted for why `.ok` is excluded.
 mut ir_tuple_local_tid: Map[String, Int] := {}   # tuple local name -> producing expr's type id
 mut ir_tuple_cascade_names: List[String] := []    # tuple locals whose payload is safe to cascade
 
@@ -764,12 +764,20 @@ fn ir_tuple_record_tid(name: String, val_idx: Int):
         return
     ir_tuple_local_tid.insert(name, tid)
 
-# true when `parent` uses its child ident `name` in a way that leaves the tuple's
-# own count on the payload intact — a `.ok`/`.err` read (which retains a copy) or
-# a flag check (which only reads slot 0). every such use is safe to cascade after.
+# true when `parent` uses its child ident `name` in a way that cannot hand the
+# payload to anyone: a flag check, which only reads slot 0. that is deliberately
+# the whole whitelist — a local nobody ever extracts from is unambiguously the
+# payload's sole owner, so releasing it at cleanup is safe by construction.
+#
+# `.ok`/`.err` reads look safe too (they retain, so the tuple keeps its own
+# count) but are NOT accepted: whitelisting them made
+# tests/cases/test_http2_tls_roundtrip fail valgrind with a use-after-free.
+# actually freeing the ok payload, where it used to leak, exposed something in
+# the http2 path outliving it. that is a latent ownership bug the leak was
+# hiding; until it is understood, `.ok` stays out.
 fn ir_tuple_use_is_whitelisted(parent: Node, name: String) -> Bool:
     if parent.kind == "field_access":
-        # the ident must be the receiver, and the field one of the safe reads
+        # the ident must be the receiver, and the field a flag read
         if parent.children.len() == 0:
             return false
         recv := get_node(parent.children[0])
